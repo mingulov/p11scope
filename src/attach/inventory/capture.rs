@@ -83,6 +83,7 @@ use super::activation::{
 };
 use super::callers::{CallerRowFault, CallerUseCursor, CallerUseIo};
 use super::{AttachBackend, PreparedInventory, Scope};
+pub(crate) use crate::attach::selected_detailed::baseline::CallerImageObservation;
 use crate::capacity::{CallerBudget, InventoryBudget};
 use crate::discovery::identity::{PinnedObjectId, RetainedInventoryTarget};
 use crate::discovery::inventory_attach_set::{
@@ -2321,13 +2322,7 @@ impl InventoryCapture {
             crate::semantics_edge::resources::SemanticResourceRefusal,
         >,
     ) -> Result<crate::attach::selected_detailed::baseline::PromotionBaselineBatch> {
-        ensure!(!self.book.stopping, "Inventory is stopping");
-        self.book.promotion_baseline_generation = self
-            .book
-            .promotion_baseline_generation
-            .checked_add(1)
-            .context("Inventory baseline query generation exhausted")?;
-        let generation = self.book.promotion_baseline_generation;
+        let generation = self.next_image_query_generation()?;
         match &mut self.state {
             CaptureState::Prepared(prepared) => crate::attach::selected_detailed::baseline::query(
                 &mut prepared.ebpf,
@@ -2352,6 +2347,48 @@ impl InventoryCapture {
                 bail!("Inventory native owner is unavailable for a baseline")
             }
         }
+    }
+
+    /// One genuine identity-only endpoint sample under the same exclusive
+    /// native owner/generation as promotion baselines. No Presentation or
+    /// permission-bearing receipt is involved. Metadata workers never receive
+    /// a mutable query handle and must already name an admitted NativeExact row.
+    pub(crate) fn observe_caller_image(
+        &mut self,
+        original: &Arc<PidPin>,
+        window: ReadWindow,
+    ) -> Result<CallerImageObservation> {
+        let generation = self.next_image_query_generation()?;
+        match &mut self.state {
+            CaptureState::Prepared(prepared) => {
+                crate::attach::selected_detailed::baseline::observe_caller_image(
+                    &mut prepared.ebpf,
+                    self.book.domain,
+                    generation,
+                    original,
+                    window,
+                )
+            }
+            CaptureState::Active(active) => active.state_mut().observe_caller_image(
+                self.book.domain,
+                generation,
+                original,
+                window,
+            ),
+            CaptureState::Failed { .. } | CaptureState::Moving => {
+                bail!("Inventory native owner is unavailable for caller image observation")
+            }
+        }
+    }
+
+    fn next_image_query_generation(&mut self) -> Result<u64> {
+        ensure!(!self.book.stopping, "Inventory is stopping");
+        self.book.promotion_baseline_generation = self
+            .book
+            .promotion_baseline_generation
+            .checked_add(1)
+            .context("Inventory image query generation exhausted")?;
+        Ok(self.book.promotion_baseline_generation)
     }
 
     /// The pidfd-keyed TASK_COOKIE answer for `pin` in this domain.

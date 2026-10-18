@@ -14,6 +14,10 @@ use aya::maps::{Array, HashMap};
 use std::os::fd::AsFd as _;
 use std::sync::Arc;
 
+#[path = "caller_image.rs"]
+mod caller_image;
+pub(crate) use caller_image::{CallerImageObservation, observe_caller_image};
+
 #[repr(C)]
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 struct Request {
@@ -244,23 +248,10 @@ pub(crate) fn query(
     window: ReadWindow,
     reserve: impl FnOnce(usize) -> std::result::Result<ResourceLease, SemanticResourceRefusal>,
 ) -> Result<PromotionBaselineBatch> {
-    use super::super::image_query::{
-        check_deadline, conservative_deadline, read_iterator, task_link,
-    };
-    ensure!(
-        generation != 0 && !targets.is_empty() && targets.len() <= window.max_rows().min(1024),
-        "baseline window/capacity/generation refused"
-    );
-    ensure!(
-        crate::pidns::numbering().agrees(),
-        "baseline PID numbering disagrees"
-    );
-    check_deadline(window.deadline())
-        .map_err(|error| anyhow::anyhow!("baseline deadline: {error:?}"))?;
+    validate_query_window(generation, targets.len(), window)?;
     ensure!(capture.get() != 0, "baseline capture is invalid");
     let storage = reserve(requested_bytes(targets.len()).context("baseline storage overflow")?)
         .map_err(|_| anyhow::anyhow!("baseline shared storage refused"))?;
-    let mut seen = std::collections::BTreeSet::new();
     for target in targets {
         let pin = &target.original;
         ensure!(
@@ -276,6 +267,68 @@ pub(crate) fn query(
                     && caller.lifecycle == CallerLifecycle::Mapped),
             "baseline target does not belong to exact candidate frame"
         );
+    }
+    let images = query_native(
+        ebpf,
+        generation,
+        targets.len(),
+        |slot| &targets[slot].original,
+        window,
+    )?;
+    let mut rows = Vec::with_capacity(targets.len());
+    for (target, image) in targets.iter().zip(images) {
+        rows.push(ImageRow {
+            caller: target.caller,
+            incarnation: target.incarnation,
+            original: PidPin::downgrade_shared(&target.original)
+                .context("baseline original custody charge unavailable")?,
+            cookie: image.cookie,
+            exec_id: image.exec_id,
+        });
+    }
+    super::super::image_query::check_deadline(window.deadline())
+        .map_err(|error| anyhow::anyhow!("baseline deadline: {error:?}"))?;
+    Ok(PromotionBaselineBatch {
+        capture,
+        presentation,
+        core: KernelBaselineBatch {
+            domain,
+            generation,
+            rows,
+        },
+        _storage: storage,
+    })
+}
+
+fn validate_query_window(generation: u64, count: usize, window: ReadWindow) -> Result<()> {
+    ensure!(
+        generation != 0 && count != 0 && count <= window.max_rows().min(1024),
+        "baseline window/capacity/generation refused"
+    );
+    super::super::image_query::check_deadline(window.deadline())
+        .map_err(|error| anyhow::anyhow!("baseline deadline: {error:?}"))
+}
+
+/// Shared native acquisition only: no Presentation, promotion request, caller
+/// admission or mutable object escapes this exclusive Inventory operation.
+fn query_native<'a>(
+    ebpf: &mut aya::Ebpf,
+    generation: u64,
+    count: usize,
+    original_at: impl Fn(usize) -> &'a Arc<PidPin>,
+    window: ReadWindow,
+) -> Result<Vec<super::wire::BaselineImage>> {
+    use super::super::image_query::{
+        check_deadline, conservative_deadline, read_iterator, task_link,
+    };
+    validate_query_window(generation, count, window)?;
+    ensure!(
+        crate::pidns::numbering().agrees(),
+        "baseline PID numbering disagrees"
+    );
+    let mut seen = std::collections::BTreeSet::new();
+    for slot in 0..count {
+        let pin = original_at(slot);
         ensure!(
             seen.insert(pin.pid()),
             "baseline original pins contain duplicate TGIDs"
@@ -311,8 +364,8 @@ pub(crate) fn query(
     for key in old {
         requests.remove(&key)?;
     }
-    for (slot, target) in targets.iter().enumerate() {
-        let pin = &target.original;
+    for slot in 0..count {
+        let pin = original_at(slot);
         requests.insert(
             pin.pid(),
             Request {
@@ -323,8 +376,8 @@ pub(crate) fn query(
             1,
         )?;
     }
-    for (slot, target) in targets.iter().enumerate() {
-        let pin = &target.original;
+    for slot in 0..count {
+        let pin = original_at(slot);
         ensure!(
             requests.get(&pin.pid(), 0)?
                 == Request {
@@ -340,7 +393,7 @@ pub(crate) fn query(
         deadline_ns: conservative_deadline(window.deadline())
             .map_err(|error| anyhow::anyhow!("baseline deadline: {error:?}"))?,
         visit_limit: 65536,
-        count: targets.len() as u64,
+        count: count as u64,
         ..Control::default()
     };
     let mut ctl: Array<_, Control> = Array::try_from(
@@ -358,21 +411,17 @@ pub(crate) fn query(
     let program = ebpf.program("p11_inventory_image_baseline").unwrap().fd()?;
     let link = task_link(
         program.as_fd(),
-        if targets.len() == 1 && pidfd_selector {
-            Some(targets[0].original.pidfd()?)
+        if count == 1 && pidfd_selector {
+            Some(original_at(0).pidfd()?)
         } else {
             None
         },
     )
     .map_err(|error| anyhow::anyhow!("baseline original-pidfd iterator link: {error:?}"))?;
     let iterator = super::super::identity_iter::iter_create(link.as_fd())?;
-    let bytes = read_iterator(
-        iterator.as_fd(),
-        window.deadline(),
-        (targets.len() + 1) * 40,
-    )
-    .map_err(|error| anyhow::anyhow!("baseline stream: {error:?}"))?;
-    let parsed = super::wire::parse_baseline(&bytes, generation, targets.len(), 65536)
+    let bytes = read_iterator(iterator.as_fd(), window.deadline(), (count + 1) * 40)
+        .map_err(|error| anyhow::anyhow!("baseline stream: {error:?}"))?;
+    let parsed = super::wire::parse_baseline(&bytes, generation, count, 65536)
         .context("baseline requires exact identity slots and END")?;
     let ctl: Array<_, Control> = Array::try_from(ebpf.map("INV_BASELINE_CTL").unwrap())?;
     let done = ctl.get(&0, 0)?;
@@ -386,9 +435,8 @@ pub(crate) fn query(
             && done.visits == parsed.visits,
         "baseline completion readback differs"
     );
-    let mut rows = Vec::with_capacity(targets.len());
-    for (target, image) in targets.iter().zip(parsed.images) {
-        let pin = &target.original;
+    for (slot, image) in parsed.images.iter().enumerate() {
+        let pin = original_at(slot);
         ensure!(
             !pin.original_exited().map_err(anyhow::Error::msg)?,
             "baseline original process exited during query"
@@ -398,27 +446,10 @@ pub(crate) fn query(
             super::super::InstanceMaps { ebpf }.cookie(pin.pidfd()?)? == Some(image.cookie),
             "baseline differs from original retained pidfd storage"
         );
-        rows.push(ImageRow {
-            caller: target.caller,
-            incarnation: target.incarnation,
-            original: PidPin::downgrade_shared(pin)
-                .context("baseline original custody charge unavailable")?,
-            cookie: image.cookie,
-            exec_id: image.exec_id,
-        });
     }
     check_deadline(window.deadline())
         .map_err(|error| anyhow::anyhow!("baseline deadline: {error:?}"))?;
-    Ok(PromotionBaselineBatch {
-        capture,
-        presentation,
-        core: KernelBaselineBatch {
-            domain,
-            generation,
-            rows,
-        },
-        _storage: storage,
-    })
+    Ok(parsed.images)
 }
 
 #[cfg(test)]

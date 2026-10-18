@@ -335,3 +335,20 @@ ceiling and the original10-second command bound. It never allocates the whole
 symbol table. A larger-than16MiB healthy table, overlong line, oversized extent
 and duplicate reporter are regression controls; these are symbol-reader facts,
 not an installed probe positive.
+
+`capture_inventory_pair.py` prepares real saved-input diff origins through the
+actual Inventory CLI. It uses the original ten-call prebuilt fixture twice and
+captures only A's first five entries in each independent window. A complete
+committed armed/mapped edge releases `ready`; a complete committed actual count5
+triggers SIGINT. The original remaining five calls and every mapping/topology
+handshake finish after observer reap, with the original independent ten-call
+ledger oracle. It keeps actual native JSON stdout/file parity, loss/retirement,
+image/provider and held-path checks. New output is required. Its bound is30s to
+the native milestone and the existing60s graceful observer stop, with owned
+failure cleanup. Invoke with absolute `--binary`, `--prebuilt`, `--out` and exact
+`--source-revision` in the authorized lane; no compilation occurs. Then pass its
+`before/snapshot.json` and `after/snapshot.json` to the existing
+`tests/fixtures/cross-command-drive.py --binary ... --before ... --after ...`.
+The five-entry ledger control is physical-entry evidence; this path claims
+neither semantic API counting nor continuity across these independent windows.
+Source controls pass; the new capture adapter needs its actual installed run.

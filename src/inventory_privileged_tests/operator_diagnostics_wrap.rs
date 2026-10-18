@@ -187,6 +187,70 @@ fn check_native_ledger(workload: &WrapWorkload) -> Result<()> {
     )
 }
 
+fn check_native_target_mapping(
+    targets: &[&serde_json::Value],
+    expected: p11scope_manifest::maps::ObjectKey,
+    length: u64,
+) -> Result<()> {
+    ensure!(
+        targets.iter().all(|row| {
+            row["ino"] == expected.inode
+                && row["dev_major"] == expected.device.major
+                && row["dev_minor"] == expected.device.minor
+                && row["offset"].as_u64().is_some_and(|offset| offset < length)
+        }),
+        "native ledger targets differ from held-FD kernel maps key {expected:?}: {targets:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn operator_diagnostics_native_target_mapping_uses_kernel_maps_key() -> Result<()> {
+    use p11scope_manifest::identity::{UnboundedProbeBudget, kernel_maps_key_for};
+    use std::os::unix::fs::MetadataExt;
+    let mut file = tempfile::tempfile()?;
+    file.write_all(&[0u8; 64])?;
+    let metadata = file.metadata()?;
+    let expected = kernel_maps_key_for(&file, &mut UnboundedProbeBudget)
+        .context("actual held-FD kernel maps key")?;
+    let rows: Vec<_> = (0..32)
+        .map(|offset| {
+            serde_json::json!({
+        "dev_major":expected.device.major,"dev_minor":expected.device.minor,
+        "ino":expected.inode,"offset":offset})
+        })
+        .collect();
+    let refs: Vec<_> = rows.iter().collect();
+    check_native_target_mapping(&refs, expected, metadata.len())?;
+    for field in ["dev_major", "dev_minor", "ino", "offset"] {
+        let mut changed = rows.clone();
+        changed[0][field] = if field == "offset" {
+            metadata.len()
+        } else {
+            changed[0][field].as_u64().context("identity field")? + 1
+        }
+        .into();
+        let changed_refs: Vec<_> = changed.iter().collect();
+        ensure!(
+            check_native_target_mapping(&changed_refs, expected, metadata.len()).is_err(),
+            "foreign native target field accepted: {field}"
+        );
+    }
+    let stat_device = p11scope_manifest::maps::Device {
+        major: u64::from(libc::major(metadata.dev())),
+        minor: u64::from(libc::minor(metadata.dev())),
+    };
+    if stat_device != expected.device {
+        let wrong_domain = p11scope_manifest::maps::ObjectKey {
+            device: stat_device,
+            inode: expected.inode,
+        };
+        ensure!(check_native_target_mapping(&refs, wrong_domain, metadata.len()).is_err());
+    }
+    eprintln!("G21_NATIVE_TARGET_KEY maps={expected:?} stat_device={stat_device:?}");
+    Ok(())
+}
+
 fn check_native_schedule(workload: &WrapWorkload, schedule: &[(&str, u64)]) -> Result<()> {
     let rows = jsonl_records(&workload.dir.path().join("calls.jsonl"))?;
     let identity = rows.first().context("native identity missing")?;
@@ -210,18 +274,15 @@ fn check_native_schedule(workload: &WrapWorkload, schedule: &[(&str, u64)]) -> R
         .collect();
     ensure!(targets.len() == 32 && slots == (4..36).collect() && addresses.len() == 32);
     let common_file = std::fs::File::open(workload.dir.path().join("libdemotion-common.so"))?;
-    let mapped = crate::discovery::identity::self_mapped_identity(&common_file)
-        .map_err(anyhow::Error::msg)?;
-    let common = common_file.metadata()?;
-    use std::os::unix::fs::MetadataExt;
-    ensure!(targets.iter().all(|row| {
-        row["ino"] == common.ino()
-            && row["dev_major"] == u64::from(libc::major(mapped.dev))
-            && row["dev_minor"] == u64::from(libc::minor(mapped.dev))
-            && row["offset"]
-                .as_u64()
-                .is_some_and(|offset| offset < common.len())
-    }));
+    // The native fixture reports lexical /proc/maps device identity. A
+    // map_files stat (self_mapped_identity) is the separate opened-file domain
+    // and can have a different per-subvolume device on Btrfs.
+    let mapped = p11scope_manifest::identity::kernel_maps_key_for(
+        &common_file,
+        &mut p11scope_manifest::identity::UnboundedProbeBudget,
+    )
+    .context("held common fixture kernel maps key")?;
+    check_native_target_mapping(&targets, mapped, common_file.metadata()?.len())?;
     let calls: Vec<_> = rows.iter().filter(|row| row["kind"] == "call").collect();
     ensure!(
         calls.len() as u64

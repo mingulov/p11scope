@@ -319,3 +319,12 @@ activation: readable marker agreement, no signal, main blocked after handler
 only, wrong ELF/process/thread, delayed observation and repeated signals. Kernel
 permission/PMU/symbol/clock/loss blockers keep the response unqualified. Cleanup,
 pressure, output content and identity-settlement requirements remain separate.
+
+The native ledger's target device is the lexical `/proc/maps` device. Its Rust
+postcheck uses `p11scope_manifest::identity::kernel_maps_key_for` on the held
+common-fixture FD, rather than the separate `map_files` stat device. A real
+Btrfs short-probe attempt exposed this distinction after completing its native
+milestones; that failed attempt remains a failure. The separate loaded-file
+custody checks still compare opened `map_files` identities like for like. The
+normal regression exercises an actual held-FD mapping and rejects foreign
+device/inode/offset facts; no capture admission guard is changed.

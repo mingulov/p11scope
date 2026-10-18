@@ -324,6 +324,11 @@ pub(crate) struct PromotionControl {
     /// accepted status update, which implies runtime custody).
     taken: bool,
     note: Option<PromotionNote>,
+    /// Irreversible shutdown latch: the terminal run stopped (restore).
+    /// Closes future request/enable/take admission. Transferred work
+    /// still awaits its genuine runtime disposal; only untaken work
+    /// ends synchronously.
+    run_stopped: bool,
 }
 
 impl PromotionControl {
@@ -338,6 +343,7 @@ impl PromotionControl {
             state: PromotionState::Idle,
             taken: false,
             note: None,
+            run_stopped: false,
         }
     }
 
@@ -373,6 +379,9 @@ impl PromotionControl {
     /// a repeat of the in-flight pair is [`Duplicate`](PromotionRefusal::Duplicate),
     /// and a repeat of the active pair is [`AlreadyDetailed`](PromotionRefusal::AlreadyDetailed).
     /// Terminal states accept a fresh serial; the exhausted counter refuses.
+    /// After the run stopped, every request refuses with
+    /// [`ScopeEnded`](PromotionRefusal::ScopeEnded): the parent run is
+    /// closed, even when no work is outstanding.
     pub(crate) fn request(
         &mut self,
         view: ViewRevision,
@@ -380,6 +389,9 @@ impl PromotionControl {
     ) -> Result<RequestId, PromotionRefusal> {
         if !self.enabled {
             return Err(PromotionRefusal::Disabled);
+        }
+        if self.run_stopped {
+            return Err(PromotionRefusal::ScopeEnded);
         }
         let same_pair = self.outstanding.is_some_and(|ticket| ticket.pair == pair);
         match self.state {
@@ -442,19 +454,34 @@ impl PromotionControl {
         }
     }
 
-    /// The run stopped: outstanding work ends honestly as run-stopped
-    /// without waiting for a runtime that is gone. Returns true when it
-    /// ended outstanding work.
+    /// The terminal run stopped (restore): request stop and close
+    /// admission. Restoring termios/output never certifies that runtime
+    /// owners disposed their work — in the real driver the Retiring
+    /// callback restores BEFORE the native lane stops — so transferred
+    /// work stays `Stopping` until its genuine matching disposal
+    /// confirms the end. Only a request the runtime never took ends
+    /// synchronously. Sets the irreversible shutdown latch: future
+    /// request/enable/take refuse. Idempotent: a second call changes
+    /// nothing. Returns true when this call newly closed the run with
+    /// outstanding work (ended sync or requested stop).
     pub(crate) fn note_run_stopped(&mut self) -> bool {
+        if self.run_stopped {
+            return false;
+        }
+        self.run_stopped = true;
         match self.state {
             PromotionState::Idle | PromotionState::Refused(_) | PromotionState::Ended(_) => false,
+            PromotionState::Queued if !self.taken => {
+                self.taken = true;
+                self.state = PromotionState::Ended(PromotionEnd::RunStopped);
+                true
+            }
             PromotionState::Queued
             | PromotionState::Preparing
             | PromotionState::Validating
             | PromotionState::Active
             | PromotionState::Stopping => {
-                self.taken = true;
-                self.state = PromotionState::Ended(PromotionEnd::RunStopped);
+                self.state = PromotionState::Stopping;
                 true
             }
         }
@@ -470,8 +497,13 @@ impl PromotionControl {
 #[cfg_attr(not(test), allow(dead_code))] // STAGED (DR37): the runtime owner drives enable/take/set_status; the UI key paths run today.
 impl PromotionControl {
     /// Bind the control to one capture run. Idempotent for the same
-    /// capture; a different capture never silently rebinds.
+    /// capture; a different capture never silently rebinds. After the
+    /// run stopped, every enable refuses (even the same capture): the
+    /// shutdown latch is irreversible.
     pub(crate) fn enable(&mut self, capture: CaptureId) -> bool {
+        if self.run_stopped {
+            return false;
+        }
         if !self.enabled {
             self.enabled = true;
             self.capture = Some(capture);
@@ -482,8 +514,13 @@ impl PromotionControl {
 
     /// Yield the pending request ticket at most once. A second take
     /// (or a take after the runtime already reported on the request)
-    /// yields nothing and never duplicates custody.
+    /// yields nothing and never duplicates custody. After the run
+    /// stopped, every take refuses: untaken work already ended
+    /// synchronously and transferred work awaits its own disposal.
     pub(crate) fn take_ticket(&mut self) -> Option<RequestTicket> {
+        if self.run_stopped {
+            return None;
+        }
         if self.taken {
             return None;
         }
@@ -977,9 +1014,9 @@ mod tests {
     }
 
     #[test]
-    fn run_stop_ends_outstanding_work() {
+    fn run_stop_ends_untaken_work_synchronously() {
         let mut control = enabled_control();
-        control
+        let id = control
             .request(ViewRevision::new(1), pair(1, 2))
             .expect("request queues");
         assert!(control.note_run_stopped());
@@ -987,19 +1024,51 @@ mod tests {
             control.state(),
             PromotionState::Ended(PromotionEnd::RunStopped)
         );
+        // Untaken work never reaches the runtime, even on a later poll.
         assert_eq!(control.take_ticket(), None);
+        // History is preserved: the ended ticket is still the same one.
+        assert_eq!(control.outstanding().map(|ticket| ticket.id), Some(id));
+        // Idempotent: a second stop changes nothing.
+        assert!(!control.note_run_stopped());
+        assert_eq!(
+            control.state(),
+            PromotionState::Ended(PromotionEnd::RunStopped)
+        );
     }
 
     #[test]
-    fn run_stop_idle_or_terminal_is_noop() {
+    fn run_stop_idle_latches_without_changing_state() {
         let mut control = enabled_control();
         assert!(!control.note_run_stopped());
         assert_eq!(control.state(), PromotionState::Idle);
+        // The latch is set even with no work: future admission refuses.
+        assert_eq!(
+            control.request(ViewRevision::new(1), pair(1, 2)),
+            Err(PromotionRefusal::ScopeEnded)
+        );
+        assert!(!control.enable(CaptureId::new(7)));
+        assert_eq!(control.take_ticket(), None);
+        assert!(!control.note_run_stopped());
+        assert_eq!(control.state(), PromotionState::Idle);
+    }
+
+    #[test]
+    fn run_stop_terminal_latches_without_changing_state() {
+        let mut control = enabled_control();
         control
             .request(ViewRevision::new(1), pair(1, 2))
             .expect("request queues");
         assert_eq!(control.cancel(), PromotionCancel::Cancelled);
         assert!(!control.note_run_stopped());
+        assert_eq!(
+            control.state(),
+            PromotionState::Ended(PromotionEnd::Cancelled)
+        );
+        // The terminal history is preserved, not replaced by RunStopped.
+        assert_eq!(
+            control.request(ViewRevision::new(2), pair(3, 4)),
+            Err(PromotionRefusal::ScopeEnded)
+        );
     }
 
     #[test]
@@ -1171,5 +1240,129 @@ mod tests {
             PromotionStatusUpdate::new(RequestId::new(1), PromotionOutcome::Preparing).request,
             RequestId::new(1)
         );
+    }
+
+    #[test]
+    fn run_stop_taken_queued_requests_stopping_with_same_ticket() {
+        let mut control = enabled_control();
+        let id = control
+            .request(ViewRevision::new(1), pair(1, 2))
+            .expect("request queues");
+        control.take_ticket().expect("runtime takes it");
+        assert!(control.note_run_stopped());
+        assert_eq!(control.state(), PromotionState::Stopping);
+        let ticket = control.outstanding().expect("history preserved");
+        assert_eq!((ticket.id, ticket.pair), (id, pair(1, 2)));
+        // No second custody after the stop was requested.
+        assert_eq!(control.take_ticket(), None);
+        // Idempotent: the pending cleanup is not erased.
+        assert!(!control.note_run_stopped());
+        assert_eq!(control.state(), PromotionState::Stopping);
+        assert_eq!(control.outstanding().map(|ticket| ticket.id), Some(id));
+    }
+
+    #[test]
+    fn run_stop_preparing_requests_stopping_with_same_ticket() {
+        let mut control = enabled_control();
+        let id = control
+            .request(ViewRevision::new(1), pair(1, 2))
+            .expect("request queues");
+        control.take_ticket().expect("runtime takes it");
+        assert_eq!(
+            control.set_status(PromotionStatusUpdate::new(id, PromotionOutcome::Preparing)),
+            Some(PromotionState::Preparing)
+        );
+        assert!(control.note_run_stopped());
+        assert_eq!(control.state(), PromotionState::Stopping);
+        assert_eq!(control.outstanding().map(|ticket| ticket.id), Some(id));
+        assert!(!control.note_run_stopped());
+        assert_eq!(control.state(), PromotionState::Stopping);
+    }
+
+    #[test]
+    fn run_stop_active_requests_stopping_with_same_ticket() {
+        let mut control = enabled_control();
+        let id = control
+            .request(ViewRevision::new(1), pair(1, 2))
+            .expect("request queues");
+        control.take_ticket().expect("runtime takes it");
+        assert_eq!(
+            control.set_status(PromotionStatusUpdate::new(
+                id,
+                PromotionOutcome::Active { pair: pair(1, 2) }
+            )),
+            Some(PromotionState::Active)
+        );
+        assert!(control.note_run_stopped());
+        assert_eq!(control.state(), PromotionState::Stopping);
+        assert_eq!(control.outstanding().map(|ticket| ticket.id), Some(id));
+    }
+
+    #[test]
+    fn late_active_after_run_stop_cannot_revive() {
+        let mut control = enabled_control();
+        let id = control
+            .request(ViewRevision::new(1), pair(1, 2))
+            .expect("request queues");
+        control.take_ticket().expect("runtime takes it");
+        assert!(control.note_run_stopped());
+        assert_eq!(
+            control.set_status(PromotionStatusUpdate::new(
+                id,
+                PromotionOutcome::Active { pair: pair(1, 2) }
+            )),
+            None
+        );
+        assert_eq!(control.state(), PromotionState::Stopping);
+    }
+
+    #[test]
+    fn genuine_disposal_after_run_stop_ends_exactly_once() {
+        let mut control = enabled_control();
+        let id = control
+            .request(ViewRevision::new(1), pair(1, 2))
+            .expect("request queues");
+        control.take_ticket().expect("runtime takes it");
+        assert!(control.note_run_stopped());
+        assert_eq!(
+            control.set_status(PromotionStatusUpdate::new(
+                id,
+                PromotionOutcome::Ended {
+                    reason: PromotionEnd::Cancelled
+                }
+            )),
+            Some(PromotionState::Ended(PromotionEnd::Cancelled))
+        );
+        // Exactly once: a repeated end is not re-recorded.
+        assert_eq!(
+            control.set_status(PromotionStatusUpdate::new(
+                id,
+                PromotionOutcome::Ended {
+                    reason: PromotionEnd::Cancelled
+                }
+            )),
+            None
+        );
+        assert_eq!(
+            control.state(),
+            PromotionState::Ended(PromotionEnd::Cancelled)
+        );
+    }
+
+    #[test]
+    fn run_stop_latch_refuses_request_enable_and_take() {
+        let mut control = enabled_control();
+        control
+            .request(ViewRevision::new(1), pair(1, 2))
+            .expect("request queues");
+        assert!(control.note_run_stopped());
+        assert_eq!(
+            control.request(ViewRevision::new(2), pair(3, 4)),
+            Err(PromotionRefusal::ScopeEnded)
+        );
+        assert!(!control.enable(CaptureId::new(7)));
+        assert!(!control.enable(CaptureId::new(9)));
+        assert_eq!(control.capture(), Some(CaptureId::new(7)));
+        assert_eq!(control.take_ticket(), None);
     }
 }

@@ -2310,9 +2310,17 @@ impl InventoryCapture {
     /// run at a time. Render/key callbacks never acquire these kernel facts.
     pub(crate) fn query_promotion_baselines(
         &mut self,
-        pins: &[Arc<PidPin>],
+        capture: crate::inventory_promotion::CaptureId,
+        presentation: Arc<crate::inventory_present::Presentation>,
+        targets: &[crate::attach::selected_detailed::baseline::BaselineTarget],
         window: ReadWindow,
-    ) -> Result<crate::attach::selected_detailed::baseline::KernelBaselineBatch> {
+        reserve: impl FnOnce(
+            usize,
+        ) -> std::result::Result<
+            crate::semantics_edge::resources::ResourceLease,
+            crate::semantics_edge::resources::SemanticResourceRefusal,
+        >,
+    ) -> Result<crate::attach::selected_detailed::baseline::PromotionBaselineBatch> {
         ensure!(!self.book.stopping, "Inventory is stopping");
         self.book.promotion_baseline_generation = self
             .book
@@ -2325,14 +2333,20 @@ impl InventoryCapture {
                 &mut prepared.ebpf,
                 self.book.domain,
                 generation,
-                pins,
+                capture,
+                presentation,
+                targets,
                 window,
+                reserve,
             ),
             CaptureState::Active(active) => active.state_mut().query_promotion_baselines(
                 self.book.domain,
                 generation,
-                pins,
+                capture,
+                presentation,
+                targets,
                 window,
+                reserve,
             ),
             CaptureState::Failed { .. } | CaptureState::Moving => {
                 bail!("Inventory native owner is unavailable for a baseline")

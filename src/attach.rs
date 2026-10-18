@@ -6299,6 +6299,26 @@ impl Session {
         Ok((consumer, table))
     }
 
+    /// Borrow the one retained cursor, its frozen decode rows and live fault
+    /// maps together. These disjoint borrows add no drain or admission authority.
+    /// The selected Joint caller must refuse a missing attested decode table.
+    #[allow(dead_code)] // N1 collection bridge is staged until its real grants exist.
+    pub(crate) fn joint_collection_io(
+        &mut self,
+    ) -> Result<(
+        &mut events::OwnedDrain,
+        Option<&ObjectRows>,
+        InstanceMaps<'_>,
+    )> {
+        self.ensure_events_consumer()?;
+        let consumer = self
+            .events_consumer
+            .as_mut()
+            .context("retained EVENTS consumer vanished after creation")?;
+        let table = self.object_decode.as_ref().map(ObjectDecodeTable::rows);
+        Ok((consumer, table, InstanceMaps { ebpf: &self.ebpf }))
+    }
+
     /// Borrow the EVENTS map descriptor for readiness waits. The idle
     /// wait polls this fd (wake on data or timeout); draining still
     /// goes through `event_drain`, the single consumer.

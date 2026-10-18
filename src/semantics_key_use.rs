@@ -256,14 +256,12 @@ impl JointStaging {
     }
 
     pub(crate) fn accepts_seal(&self, seal: &SealSuccess) -> bool {
-        self.mode == FeedMode::Joint && self.selected_domain == Some(seal.prefix.domain())
+        self.selected_domain == Some(seal.prefix.domain())
     }
 
     pub(crate) fn accepts_failure(&self, failure: &SealFailure) -> bool {
-        self.mode == FeedMode::Joint
-            && self
-                .selected_domain
-                .is_some_and(|domain| failure.affects_domain(domain))
+        self.selected_domain
+            .is_some_and(|domain| failure.affects_domain(domain))
     }
 
     pub(crate) fn mode(&self) -> FeedMode {
@@ -415,6 +413,11 @@ impl JointStaging {
         }
         // Ledger contact flushes pended releases first (C4).
         self.flush_pending_releases(ledger);
+        // Matching old-domain contact may release already-owned charges,
+        // but a degraded feed never consumes semantic evidence again.
+        if self.mode != FeedMode::Joint {
+            return (SealApplyOutcome::Held, 0);
+        }
         // Qualified invalidations apply even when the quantum cannot
         // replay (N3): holding S1 replay must never hold
         // already-applied object invalidations. Runs before every
@@ -528,6 +531,11 @@ impl JointStaging {
         }
         // Ledger contact flushes pended releases first (C4).
         self.flush_pending_releases(ledger);
+        // Matching old-domain contact may release already-owned charges,
+        // but a degraded feed never consumes semantic evidence again.
+        if self.mode != FeedMode::Joint {
+            return (FailureApplyOutcome::Ignored, 0);
+        }
         match disposition_of(failure.gap) {
             SealFailureDisposition::Retry => {
                 // Transient waits keep staging, but never swallow

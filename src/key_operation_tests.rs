@@ -565,6 +565,8 @@ struct JointScene {
     thread: u64,
     sequence: u64,
     admission_sequence: u64,
+    /// Exact pre-admission wire input indexed by its returned H0 identity.
+    paired_begins: BTreeMap<u64, [u8; 224]>,
 }
 
 impl JointScene {
@@ -589,6 +591,7 @@ impl JointScene {
             thread: 1,
             sequence: 0,
             admission_sequence: 0,
+            paired_begins: BTreeMap::new(),
         }
     }
 
@@ -775,7 +778,7 @@ fn attest_and_stage(
 fn attest_and_ingest(scene: &mut JointScene, call: &ShapedS1) {
     let admitted = admit_call_input(scene, call);
     scene.adapter.attest_key(&admitted).expect("call attests");
-    ingest_call(scene, call);
+    ingest_call(scene, call, admitted.h0_ordinal());
 }
 
 /// One explicit paired native/Event input before routed admission.
@@ -787,9 +790,11 @@ fn admit_call_input(scene: &mut JointScene, call: &ShapedS1) -> AdmittedInstance
     let p11scope_ebpf_common::object_journal::JournalRecord::End(end) = record else {
         panic!("END input")
     };
-    scene
+    let admitted = scene
         .fixture
-        .admit_original_event(call.name, end.payload_base().event)
+        .admit_original_event(call.name, end.payload_base().event);
+    scene.paired_begins.insert(admitted.h0_ordinal(), begin);
+    admitted
 }
 
 fn begin_for_call(scene: &JointScene, call: &ShapedS1, sequence: u64) -> [u8; 224] {
@@ -829,9 +834,21 @@ fn end_for_call(begin: &[u8; 224], call: &ShapedS1) -> [u8; 632] {
 }
 
 /// Ingest the paired call's native records in their original order.
-fn ingest_call(scene: &mut JointScene, call: &ShapedS1) {
-    scene.sequence = (scene.sequence + 1).max(scene.admission_sequence);
-    let begin = begin_for_call(scene, call, scene.sequence);
+fn ingest_call(scene: &mut JointScene, call: &ShapedS1, position: u64) {
+    let begin = scene
+        .paired_begins
+        .remove(&position)
+        .expect("original paired BEGIN for this exact H0 admission");
+    let p11scope_ebpf_common::object_journal::JournalRecord::Begin(native) =
+        decode_journal_record(&begin, &scene.descriptors).expect("paired BEGIN")
+    else {
+        panic!("BEGIN input")
+    };
+    assert_eq!(
+        native.descriptor() - 1,
+        crate::kinds::function_id(call.name).unwrap()
+    );
+    scene.sequence = scene.sequence.max(native.sequence());
     assert_eq!(
         scene.ingest(&begin),
         JournalDisposition::BeginAdmitted,
@@ -856,7 +873,7 @@ fn prepare_call(
     call: &ShapedS1,
 ) -> (SemanticCall, u64) {
     let (facts, position) = attest_and_stage(scene, staging, call);
-    ingest_call(scene, call);
+    ingest_call(scene, call, position);
     (facts, position)
 }
 
@@ -1035,14 +1052,8 @@ fn key_operation_single_feed_exactly_once() {
 fn key_operation_fallback_and_history_loss() {
     let instance =
         crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
-    // --- Proof-only refusal: a foreign proof mismatches, H3 is clean. ---
+    // --- Proof-only refusal: the own birth proof mismatches, H3 is clean. ---
     let mut scene = JointScene::new();
-    let mut foreign = JointScene::new();
-    let foreign_admitted = foreign.fixture.admit_function("C_SignInit");
-    let foreign_proof = foreign
-        .adapter
-        .attest_key(&foreign_admitted)
-        .expect("foreign key attests");
     let bootstrap = scene.bootstrap();
     let mut staging = JointStaging::select_joint(Some(&bootstrap));
     let mut joint = EdgeSemantics::default();
@@ -1054,12 +1065,14 @@ fn key_operation_fallback_and_history_loss() {
     for call in sign_flow().into_iter().take(3) {
         staged_facts.push(prepare_call(&mut scene, &mut staging, &call).0);
     }
-    // Seal under the foreign proof: genuine mismatch, no loss fenced.
+    // Seal under an invalid own birth proof: no loss is fenced.
     scene.install_closure();
-    let foreign_bootstrap = BootstrapReceipt::scripted(
-        foreign_proof,
+    // Own established domain, deliberately invalid birth cut: a proof
+    // refusal scopes fallback here; a foreign request must remain inert.
+    let refused_bootstrap = BootstrapReceipt::scripted(
+        scene.proof,
         BirthKind::ExecMarker,
-        0,
+        u64::MAX,
         scene.fixture.attachment().generation(),
     );
     let frontier = scene.adapter.consumed_frontier();
@@ -1071,7 +1084,7 @@ fn key_operation_fallback_and_history_loss() {
         H3DispositionEvidence::scripted_clean(scene.adapter.consumed_through_for_test()),
         scene.fixture.attachment().generation(),
     );
-    let fresh = SessionBirthEvidence::scripted_for_receipt(&foreign_bootstrap);
+    let fresh = SessionBirthEvidence::scripted_for_receipt(&refused_bootstrap);
     let cell = SteadyFaultCell(7);
     let mut births = ScriptedBirthSource::once(fresh);
     let failure = scene
@@ -1079,12 +1092,12 @@ fn key_operation_fallback_and_history_loss() {
         .seal(
             &mut scene.model,
             &audit,
-            &foreign_bootstrap,
+            &refused_bootstrap,
             frontier,
             &mut births,
             &cell,
         )
-        .expect_err("foreign proof mismatches");
+        .expect_err("own birth proof mismatches");
     assert_eq!(failure.gap, JournalGap::BootstrapMismatch);
 
     // Without a complete H3 stream the fallback holds: pending work
@@ -1458,12 +1471,6 @@ fn key_operation_joint_retry_and_degraded_inert() {
 
     // --- H3's own loss barrier degrades through the fallback gap. ---
     let mut scene = JointScene::new();
-    let mut foreign = JointScene::new();
-    let foreign_admitted = foreign.fixture.admit_function("C_SignInit");
-    let foreign_proof = foreign
-        .adapter
-        .attest_key(&foreign_admitted)
-        .expect("foreign key attests");
     let bootstrap = scene.bootstrap();
     let mut staging = JointStaging::select_joint(Some(&bootstrap));
     let mut joint = EdgeSemantics::default();
@@ -1473,10 +1480,12 @@ fn key_operation_joint_retry_and_degraded_inert() {
         prepare_call(&mut scene, &mut staging, &call);
     }
     scene.install_closure();
-    let foreign_bootstrap = BootstrapReceipt::scripted(
-        foreign_proof,
+    // Own established domain, deliberately invalid birth cut: a proof
+    // refusal scopes fallback here; a foreign request must remain inert.
+    let refused_bootstrap = BootstrapReceipt::scripted(
+        scene.proof,
         BirthKind::ExecMarker,
-        0,
+        u64::MAX,
         scene.fixture.attachment().generation(),
     );
     let frontier = scene.adapter.consumed_frontier();
@@ -1488,7 +1497,7 @@ fn key_operation_joint_retry_and_degraded_inert() {
         H3DispositionEvidence::scripted_clean(scene.adapter.consumed_through_for_test()),
         scene.fixture.attachment().generation(),
     );
-    let fresh = SessionBirthEvidence::scripted_for_receipt(&foreign_bootstrap);
+    let fresh = SessionBirthEvidence::scripted_for_receipt(&refused_bootstrap);
     let cell = SteadyFaultCell(7);
     let mut births = ScriptedBirthSource::once(fresh);
     let failure = scene
@@ -1496,12 +1505,12 @@ fn key_operation_joint_retry_and_degraded_inert() {
         .seal(
             &mut scene.model,
             &audit,
-            &foreign_bootstrap,
+            &refused_bootstrap,
             frontier,
             &mut births,
             &cell,
         )
-        .expect_err("foreign proof mismatches");
+        .expect_err("own birth proof mismatches");
     assert_eq!(failure.gap, JournalGap::BootstrapMismatch);
     let mut loss_source = ScriptedH3Source::once(H3DispositionEvidence::scripted_loss(5));
     let (outcome, refused) = staging.apply_failure(
@@ -2501,12 +2510,6 @@ fn key_operation_s1_matrix_through_both_feeds() {
     // Fallback preserves S1 without inventing object facts: the
     // model snapshot is identical across the fallback replay.
     let mut scene = JointScene::new();
-    let mut foreign = JointScene::new();
-    let foreign_admitted = foreign.fixture.admit_function("C_SignInit");
-    let foreign_proof = foreign
-        .adapter
-        .attest_key(&foreign_admitted)
-        .expect("foreign key attests");
     let bootstrap = scene.bootstrap();
     let mut staging = JointStaging::select_joint(Some(&bootstrap));
     let mut joint = EdgeSemantics::default();
@@ -2538,10 +2541,12 @@ fn key_operation_s1_matrix_through_both_feeds() {
         staged_facts.push(attest_and_stage(&mut scene, &mut staging, call).0);
     }
     scene.install_closure();
-    let foreign_bootstrap = BootstrapReceipt::scripted(
-        foreign_proof,
+    // Own established domain, deliberately invalid birth cut: a proof
+    // refusal scopes fallback here; a foreign request must remain inert.
+    let refused_bootstrap = BootstrapReceipt::scripted(
+        scene.proof,
         BirthKind::ExecMarker,
-        0,
+        u64::MAX,
         scene.fixture.attachment().generation(),
     );
     let frontier = scene.adapter.consumed_frontier();
@@ -2553,7 +2558,7 @@ fn key_operation_s1_matrix_through_both_feeds() {
         H3DispositionEvidence::scripted_clean(scene.adapter.consumed_through_for_test()),
         scene.fixture.attachment().generation(),
     );
-    let fresh = SessionBirthEvidence::scripted_for_receipt(&foreign_bootstrap);
+    let fresh = SessionBirthEvidence::scripted_for_receipt(&refused_bootstrap);
     let cell = SteadyFaultCell(7);
     let mut births = ScriptedBirthSource::once(fresh);
     let failure = scene
@@ -2561,12 +2566,12 @@ fn key_operation_s1_matrix_through_both_feeds() {
         .seal(
             &mut scene.model,
             &audit,
-            &foreign_bootstrap,
+            &refused_bootstrap,
             frontier,
             &mut births,
             &cell,
         )
-        .expect_err("foreign proof mismatches");
+        .expect_err("own birth proof mismatches");
     let mut clean = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
     let (outcome, _) = staging.apply_failure(
         &failure,
@@ -5142,7 +5147,7 @@ fn key_operation_c2_foreign_namespace_registry_delivery_keeps_projection() {
         own.observe(&key, position, facts);
         own.registry
             .publish_with_ledger(own.scene.adapter.ledger_mut());
-        ingest_call(&mut own.scene, &sign);
+        ingest_call(&mut own.scene, &sign, position);
         let before = own.registry.joint_observations(9);
         let staged = own.scene.adapter.ledger().staged();
         let mut foreign = JointScene::new();
@@ -6519,7 +6524,7 @@ fn key_operation_g29_delivery_equivalence_matrix() {
         guarded
             .registry
             .publish_with_ledger(guarded.scene.adapter.ledger_mut());
-        ingest_call(&mut guarded.scene, shape);
+        ingest_call(&mut guarded.scene, shape, position);
         let seal = guarded.scene.seal().expect("quantum seals");
         assert_eq!(
             guarded.registry.deliver_joint_seal(
@@ -8925,7 +8930,7 @@ impl GuardedScene {
         self.observe(key, position, facts);
         self.registry
             .publish_with_ledger(self.scene.adapter.ledger_mut());
-        ingest_call(&mut self.scene, shape);
+        ingest_call(&mut self.scene, shape, position);
         let seal = self.scene.seal().expect("quantum seals");
         assert_eq!(seal.prefix.settled().len(), 1, "{}", shape.name);
         self.registry.deliver_joint_seal(
@@ -8996,8 +9001,8 @@ fn key_operation_joint_staging_charges_shared_ledger() {
     let (_, joint_id) = guarded.register(1);
 
     let shape = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
-    let (facts, position) = guarded.admit_shape(&shape);
-    guarded.observe(&joint_key, position, facts);
+    let (facts, init_position) = guarded.admit_shape(&shape);
+    guarded.observe(&joint_key, init_position, facts);
     guarded
         .registry
         .publish_with_ledger(guarded.scene.adapter.ledger_mut());
@@ -9063,7 +9068,7 @@ fn key_operation_joint_staging_charges_shared_ledger() {
     );
     // The next ledger contact flushes the pended release.
     let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
-    ingest_call(&mut guarded.scene, &init);
+    ingest_call(&mut guarded.scene, &init, init_position);
     let seal = guarded.scene.seal().expect("init quantum seals");
     assert_eq!(
         guarded.registry.deliver_joint_seal(
@@ -9162,7 +9167,7 @@ fn key_operation_joint_seal_delivery_replays_and_populates_capture() {
         guarded
             .registry
             .publish_with_ledger(guarded.scene.adapter.ledger_mut());
-        ingest_call(&mut guarded.scene, shape);
+        ingest_call(&mut guarded.scene, shape, position);
         let seal = guarded.scene.seal().expect("single-call quantum seals");
         let outcome = guarded.registry.deliver_joint_seal(
             joint_id,
@@ -9240,7 +9245,7 @@ fn key_operation_joint_failure_delivery_retains_projection() {
     guarded
         .registry
         .publish_with_ledger(guarded.scene.adapter.ledger_mut());
-    ingest_call(&mut guarded.scene, &shape);
+    ingest_call(&mut guarded.scene, &shape, position);
     let failure = guarded
         .scene
         .seal_with_fault(7, 8)
@@ -9353,7 +9358,7 @@ fn key_operation_n14_joint_replay_reserves_resources() {
     guarded
         .registry
         .publish_with_ledger(guarded.scene.adapter.ledger_mut());
-    ingest_call(&mut guarded.scene, &shape);
+    ingest_call(&mut guarded.scene, &shape, position);
     let seal = guarded.scene.seal().expect("init quantum seals");
     let before = guarded.registry.semantic_resource_snapshot().charged_bytes;
     let outcome = guarded.registry.deliver_joint_seal(
@@ -9392,7 +9397,7 @@ fn key_operation_n14_small_budget_refuses_n_plus_one() {
         probe
             .registry
             .publish_with_ledger(probe.scene.adapter.ledger_mut());
-        ingest_call(&mut probe.scene, &shape);
+        ingest_call(&mut probe.scene, &shape, position);
         let seal = probe.scene.seal().expect("probe quantum seals");
         let before = probe.registry.semantic_resource_snapshot().charged_bytes;
         assert_eq!(
@@ -9529,7 +9534,7 @@ fn key_operation_n14_fallback_replay_reserves_and_disposes_on_refusal() {
         probe
             .registry
             .publish_with_ledger(probe.scene.adapter.ledger_mut());
-        ingest_call(&mut probe.scene, &shape);
+        ingest_call(&mut probe.scene, &shape, position);
         let seal = probe.scene.seal().expect("probe quantum seals");
         let before = probe.registry.semantic_resource_snapshot().charged_bytes;
         assert_eq!(
@@ -9692,6 +9697,7 @@ fn first_fallback_accounting(capacity: bool, invalidate: bool, retire: bool) {
     g.drive_s1only(&sibling, &init);
     let (facts, pos) = g.admit_shape(&init);
     g.observe(&key, pos, facts);
+    let init_position = pos;
     g.registry.publish_with_ledger(g.scene.adapter.ledger_mut());
     assert_eq!(g.scene.adapter.ledger().staged(), 1);
     if capacity {
@@ -9774,7 +9780,7 @@ fn first_fallback_accounting(capacity: bool, invalidate: bool, retire: bool) {
         "eligible shared charges returned"
     );
     if !invalidate {
-        ingest_call(&mut g.scene, &init);
+        ingest_call(&mut g.scene, &init, init_position);
         let seal = g.scene.seal().expect("the delayed original Init seals");
         assert_eq!(
             g.registry
@@ -10006,7 +10012,7 @@ fn key_operation_c4_full_fallback_preserves_order() {
     // first: the byte pool is shared (N1c), so the freeze that forced
     // staging refusal would also refuse the late begin.
     guarded.scene.adapter.ledger_mut().set_byte_limit(u64::MAX);
-    ingest_call(&mut guarded.scene, &init);
+    ingest_call(&mut guarded.scene, &init, init_pos);
     let seal = guarded.scene.seal().expect("init quantum seals");
     assert_eq!(
         guarded.registry.deliver_joint_seal(
@@ -10170,7 +10176,56 @@ fn key_operation_c4_missing_ledger_falls_back_in_order() {
         1,
         "ledger-less releases pend, never leak silently"
     );
-    ingest_call(&mut guarded.scene, &init);
+    let before = guarded.registry.joint_observations(7);
+    let mut foreign = JointScene::new();
+    let foreign_receipt = foreign.bootstrap();
+    let mut foreign_staging = JointStaging::select_joint(Some(&foreign_receipt));
+    prepare_call(&mut foreign, &mut foreign_staging, &init);
+    let foreign_seal = foreign
+        .seal()
+        .expect("foreign namespace seals its own input");
+    assert_eq!(
+        guarded.registry.deliver_joint_seal(
+            joint_id,
+            &foreign_seal,
+            &foreign.model,
+            guarded.scene.adapter.ledger_mut()
+        ),
+        SealApplyOutcome::Held
+    );
+    assert_eq!(
+        guarded.scene.adapter.ledger().staged(),
+        1,
+        "foreign success cannot release owned deferred charges"
+    );
+    let failure = foreign
+        .seal_with_fault(7, 8)
+        .expect_err("foreign loss is adapter-minted");
+    let mut finalizer = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    assert_eq!(
+        guarded.registry.deliver_joint_failure(
+            joint_id,
+            &failure,
+            &mut finalizer,
+            &foreign.model,
+            guarded.scene.adapter.ledger_mut()
+        ),
+        FailureApplyOutcome::Ignored
+    );
+    assert_eq!(
+        guarded.scene.adapter.ledger().staged(),
+        1,
+        "foreign failure cannot release owned deferred charges"
+    );
+    assert_eq!(guarded.registry.joint_observations(7), before);
+    assert!(matches!(
+        crate::semantics_objects::journal::H3EvidenceSource::take_h3_disposition(&mut finalizer),
+        H3DispositionEvidence::Clean {
+            staged_max: u64::MAX,
+            pending_floor: None
+        }
+    ));
+    ingest_call(&mut guarded.scene, &init, init_pos);
     let seal = guarded.scene.seal().expect("init quantum seals");
     assert_eq!(
         guarded.registry.deliver_joint_seal(
@@ -10185,6 +10240,11 @@ fn key_operation_c4_missing_ledger_falls_back_in_order() {
         guarded.scene.adapter.ledger().staged(),
         0,
         "ledger contact flushes"
+    );
+    assert_eq!(
+        guarded.registry.joint_observations(7),
+        before,
+        "reclamation never re-enables semantic consumption or projection"
     );
 }
 
@@ -10326,7 +10386,7 @@ fn key_operation_c5_loss_disposes_staged_and_bars_late_delivery() {
     );
     // Late seal for the disposed call: inert, no live machine below
     // the barrier.
-    ingest_call(&mut guarded.scene, &init);
+    ingest_call(&mut guarded.scene, &init, staged_at);
     let seal = guarded.scene.seal().expect("init quantum seals");
     assert_eq!(
         guarded.registry.deliver_joint_seal(
@@ -10489,7 +10549,7 @@ fn key_operation_c5_above_barrier_survives_and_retirement_disposes() {
     );
     // A's seal mismatches B's head (distinct sessions) and holds;
     // B's seal replays its own head.
-    ingest_call(&mut guarded.scene, &init_a);
+    ingest_call(&mut guarded.scene, &init_a, pos_a);
     let seal_a = guarded.scene.seal().expect("A quantum seals");
     assert_eq!(
         guarded.registry.deliver_joint_seal(
@@ -10501,7 +10561,7 @@ fn key_operation_c5_above_barrier_survives_and_retirement_disposes() {
         SealApplyOutcome::Held,
         "disposed calls never replay against later heads"
     );
-    ingest_call(&mut guarded.scene, &init_b);
+    ingest_call(&mut guarded.scene, &init_b, pos_b);
     let seal_b = guarded.scene.seal().expect("B quantum seals");
     assert_eq!(
         guarded.registry.deliver_joint_seal(
@@ -10540,7 +10600,7 @@ fn key_operation_c5_above_barrier_survives_and_retirement_disposes() {
         0,
         "retirement disposes the owned queue"
     );
-    ingest_call(&mut guarded.scene, &init_a);
+    ingest_call(&mut guarded.scene, &init_a, pos_c);
     let seal_c = guarded.scene.seal().expect("C quantum seals");
     assert_eq!(
         guarded.registry.deliver_joint_seal(

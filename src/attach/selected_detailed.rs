@@ -5,6 +5,120 @@
 #[cfg(test)]
 mod native_tests;
 
+#[cfg(test)]
+mod activation_tests {
+    use super::*;
+    use std::os::fd::FromRawFd as _;
+    use std::os::unix::fs::FileExt as _;
+
+    fn state_cell(initial: u64) -> (StateControl, std::fs::File) {
+        // SAFETY: valid NUL-terminated name, no pointers escape the syscall.
+        let fd =
+            unsafe { libc::memfd_create(c"p11scope-selected-state".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+        // SAFETY: memfd_create returned a fresh owned descriptor.
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let page =
+            usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).expect("page size");
+        file.set_len(page as u64).expect("size state backing");
+        file.write_at(&initial.to_le_bytes(), 0)
+            .expect("seed state");
+        let control = StateControl::new(file.as_fd()).expect("wrap state fd");
+        (control, file)
+    }
+
+    fn load(file: &std::fs::File) -> u64 {
+        let mut word = [0u8; 8];
+        file.read_at(&mut word, 0).expect("read state");
+        u64::from_le_bytes(word)
+    }
+
+    #[test]
+    fn active_value_matches_bpf_gate() {
+        // The BPF gate (crates/ebpf/native/selected_detailed.h) admits
+        // capture only at SELECTED_ACTIVE == 2; the C host test pins the
+        // 1->2 CAS there. This pins the userspace mirror.
+        assert_eq!(ACTIVE, 2);
+        assert_eq!(CLOSED, 1);
+        assert_eq!(TERMINAL, 3);
+    }
+
+    #[test]
+    fn activation_wins_only_from_closed() {
+        let (control, file) = state_cell(CLOSED);
+        control.activate().expect("closed activates");
+        assert_eq!(load(&file), ACTIVE);
+        control.active().expect("active readback");
+        assert!(control.closed().is_err());
+        assert!(control.activate().is_err(), "second activation loses");
+        assert_eq!(load(&file), ACTIVE);
+    }
+
+    #[test]
+    fn activation_refuses_zero_and_terminal_without_mutation() {
+        for initial in [0, TERMINAL, 99] {
+            let (control, file) = state_cell(initial);
+            assert!(control.activate().is_err());
+            assert_eq!(load(&file), initial);
+            assert!(control.active().is_err());
+        }
+    }
+
+    #[test]
+    fn close_after_active_reaches_terminal() {
+        let (control, file) = state_cell(CLOSED);
+        control.activate().expect("closed activates");
+        control.close().expect("close active");
+        assert_eq!(load(&file), TERMINAL);
+        control.terminal().expect("terminal readback");
+        assert!(control.activate().is_err());
+        control.close().expect("close is idempotent");
+        assert_eq!(load(&file), TERMINAL);
+    }
+
+    #[test]
+    fn activation_race_never_manufactures_state() {
+        for _ in 0..32 {
+            let (control, file) = state_cell(CLOSED);
+            let control = std::sync::Arc::new(control);
+            // At most one winner per round; the loser refused honestly.
+            std::thread::scope(|scope| {
+                let worker = std::sync::Arc::clone(&control);
+                let activated = scope.spawn(move || worker.activate().is_ok());
+                control.close().expect("racy close");
+                activated.join().expect("join racy activation")
+            });
+            let final_word = load(&file);
+            assert!(
+                final_word == ACTIVE || final_word == TERMINAL,
+                "unexpected state {final_word}"
+            );
+            // Settlement is one-way from here.
+            control.close().expect("settle");
+            assert_eq!(load(&file), TERMINAL);
+        }
+    }
+
+    #[test]
+    fn selection_activation_requires_bound_original() {
+        let (state, file) = state_cell(CLOSED);
+        let selection = NativeSelection {
+            state,
+            target: SelectedTarget::default(),
+            original: None,
+            parent: None,
+        };
+        let error = selection
+            .activate()
+            .expect_err("unbound activation refuses");
+        assert!(
+            format!("{error:#}").contains("without bound original custody"),
+            "unexpected refusal: {error:#}"
+        );
+        assert_eq!(load(&file), CLOSED);
+    }
+}
+
 pub(crate) mod baseline;
 mod failure;
 mod lifecycle;
@@ -44,6 +158,9 @@ use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const CLOSED: u64 = 1;
+// Mirrors SELECTED_ACTIVE in crates/ebpf/native/selected_detailed.h. The BPF
+// gate admits capture only in this state; keep the values in lockstep.
+const ACTIVE: u64 = 2;
 const TERMINAL: u64 = 3;
 
 /// An owned fd moves safely with Session. Atomic mappings are short lived and
@@ -93,13 +210,38 @@ impl StateControl {
     fn close(&self) -> Result<()> {
         self.with_cell(|cell| {
             let _ = cell.compare_exchange(CLOSED, TERMINAL, Ordering::SeqCst, Ordering::SeqCst);
-            let _ = cell.compare_exchange(2, TERMINAL, Ordering::SeqCst, Ordering::SeqCst);
+            let _ = cell.compare_exchange(ACTIVE, TERMINAL, Ordering::SeqCst, Ordering::SeqCst);
         })
+    }
+    /// The sole CLOSED->ACTIVE activation CAS. Only a still-closed cell
+    /// wins; a concurrent close (or a second activation) loses honestly
+    /// instead of manufacturing an ACTIVE state.
+    fn activate(&self) -> Result<()> {
+        self.with_cell(|cell| {
+            cell.compare_exchange(CLOSED, ACTIVE, Ordering::SeqCst, Ordering::SeqCst)
+        })?
+        .map(|_| ())
+        .map_err(|_| anyhow::anyhow!("selected preparation is no longer closed"))
+    }
+    fn active(&self) -> Result<()> {
+        ensure!(
+            self.with_cell(|cell| cell.load(Ordering::SeqCst))? == ACTIVE,
+            "selected preparation is not active"
+        );
+        Ok(())
+    }
+    fn terminal(&self) -> Result<()> {
+        ensure!(
+            self.with_cell(|cell| cell.load(Ordering::SeqCst))? == TERMINAL,
+            "selected native gate has not reached terminal"
+        );
+        Ok(())
     }
 }
 
-/// Native control stays inside its original Session. This is NOT a final
-/// activation proof and deliberately has no activation method yet.
+/// Native control stays inside its original Session. Activation performs
+/// only the native CLOSED->ACTIVE CAS; the joint promotion proof that
+/// authorizes calling it lives outside this owner.
 pub(super) struct NativeSelection {
     state: StateControl,
     target: SelectedTarget,
@@ -190,6 +332,27 @@ impl NativeSelection {
     }
     pub(super) fn require_closed(&self) -> Result<()> {
         self.state.closed()
+    }
+    /// Run the native activation CAS. The caller must hold the joint
+    /// promotion proof; native checks only its own custody (the bound
+    /// original) and the CLOSED precondition the CAS itself enforces.
+    /// A lost race against close refuses instead of activating.
+    pub(super) fn activate(&self) -> Result<()> {
+        let original = self
+            .original
+            .as_ref()
+            .context("selected activation without bound original custody")?;
+        ensure!(
+            !original.original_exited().map_err(anyhow::Error::msg)?,
+            "selected original process exited"
+        );
+        self.state.activate()
+    }
+    pub(super) fn require_active(&self) -> Result<()> {
+        self.state.active()
+    }
+    pub(super) fn require_terminal(&self) -> Result<()> {
+        self.state.terminal()
     }
     pub(super) fn complete_identity(
         &mut self,

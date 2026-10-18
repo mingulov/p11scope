@@ -3283,9 +3283,18 @@ mod tests {
         let mut build_id = String::with_capacity(128);
         build_id.push_str("a-real-owned-build-id");
         target.entry.build_id = Some(build_id);
-        for with_build_id in [true, false] {
-            if !with_build_id {
-                target.entry.build_id = None;
+        for allocation_case in 0..3 {
+            match allocation_case {
+                1 => target.entry.build_id = None,
+                2 => {
+                    // Tiny fresh allocations also exercise the pinned clone
+                    // bound; these strings are allocation inputs, not proof.
+                    target.entry.raw.path = "r".to_owned();
+                    target.entry.path = "p".to_owned();
+                    target.entry.sha256 = "s".to_owned();
+                    target.entry.build_id = Some("b".to_owned());
+                }
+                _ => {}
             }
             let charge = target.retained_copy_allocation_charge().unwrap();
             let copy = target.share();

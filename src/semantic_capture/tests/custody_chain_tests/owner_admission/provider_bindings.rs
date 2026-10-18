@@ -279,12 +279,15 @@ fn prepared_provider_actual_layout_keeps_4096_ordinary_associations_representabl
         .semantic_resource_snapshot();
     assert_eq!(reserved.charged_bytes, snapshot.charged_bytes + bytes);
     println!(
-        "actual provider={} align={} slot={} prepared={} lease={} copy={} population_reservation={}",
+        "actual provider={} align={} slot={} prepared={} lease={} caller_test={} copy={} population_reservation={}",
         std::mem::size_of::<SemanticProviderTarget>(),
         std::mem::align_of::<SemanticProviderTarget>(),
         slot,
         std::mem::size_of::<PreparedSemanticAdmission>(),
         std::mem::size_of::<ResourceLease>(),
+        std::mem::size_of::<
+            crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding,
+        >(),
         copy,
         bytes
     );
@@ -333,6 +336,20 @@ fn prepared_provider_copy_reserves_shared_pool_before_retention_and_retries() {
     assert_eq!(refused.charged_bytes, before.charged_bytes);
     assert_eq!(refused.peak_charged_bytes, before.peak_charged_bytes);
     assert_eq!(refused.refused, before.refused + 1);
+    assert!(
+        fixture
+            .scene
+            .coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .any(|gap| {
+                gap.caller == Some(fixture.scene.caller())
+                    && gap.subject.contains("provider file 0")
+                    && gap.reason == "provider_storage_refused"
+            }),
+        "copy refusal identifies the particular requested provider"
+    );
     let original = fixture
         .scene
         .h0
@@ -369,6 +386,26 @@ fn prepared_provider_count_and_capacity_refusals_preserve_a_then_retry() {
         .registry()
         .semantic_resource_snapshot();
     assert_eq!(fixture.admit(1), Err(SemanticBindingRefusal::Capacity));
+    let module_b = fixture
+        .scene
+        .coordinator
+        .registry()
+        .module_id_for(&fixture.modules[1])
+        .unwrap();
+    assert!(
+        fixture
+            .scene
+            .coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .any(|gap| {
+                gap.caller == Some(fixture.scene.caller())
+                    && gap.module == Some(module_b)
+                    && gap.reason == "capacity"
+            }),
+        "B's association refusal is visible independently of retained A"
+    );
     assert_eq!(
         fixture
             .scene

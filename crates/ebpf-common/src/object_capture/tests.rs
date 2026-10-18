@@ -4714,3 +4714,38 @@ fn streamed_actual_get_arguments_missing_is_uninspected_and_zero_is_empty() {
         }
     }
 }
+
+#[test]
+fn streamed_attribute_stride_matches_wide_arithmetic_at_overflow_boundaries() {
+    for (layout, stride) in [(LinuxLayout::Lp64, 24u64), (LinuxLayout::Ilp32, 12u64)] {
+        let limit = u64::MAX / stride;
+        for count in [0, 1, 7, 8, 9, limit - 1, limit, limit + 1, u64::MAX] {
+            // Independent widened arithmetic stays host-test-only. Production
+            // must preserve this result without generating a wide BPF multiply.
+            let expected = u128::from(count) * u128::from(stride);
+            let expected = if expected <= u128::from(u64::MAX) {
+                Some(expected as u64)
+            } else {
+                None
+            };
+            assert_eq!(attribute_table_span(count, layout), expected);
+            for base in [0, 1, 0x4000, u64::MAX - 23, u64::MAX] {
+                let wide = u128::from(base) + u128::from(count) * u128::from(stride);
+                let last = wide + u128::from(stride) - 1;
+                let max = if layout == LinuxLayout::Lp64 {
+                    u128::from(u64::MAX)
+                } else {
+                    u128::from(u32::MAX)
+                };
+                let expected = if wide != 0 && last <= max {
+                    let slot = wide as u64;
+                    let w = layout.word_bytes() as u64;
+                    Some((slot, slot + w, slot + 2 * w))
+                } else {
+                    None
+                };
+                assert_eq!(attribute_header_addresses(base, count, layout), expected);
+            }
+        }
+    }
+}

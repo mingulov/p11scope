@@ -395,3 +395,21 @@ unreaped main zombie no longer exposes `/proc/PID/exe`. Local controls use a rea
 live worker plus wrong TGID/TID/birth/directory and exited-worker twins, without
 attaching perf. This API is preparation only: no worker or handler-blocked
 acceptance cell is activated by these source changes.
+
+`readiness-write-gate.c` is a negative-only preload, separate from every healthy
+reporter control. It forwards real main-thread stderr `write`/`writev` bytes
+first, recognizes only a complete positive readiness line, and then waits on
+private nonblocking control/fact descriptors. It preserves write results/errno,
+marks the inherited gate descriptors close-on-exec, and temporarily blocks
+SIGINT only between `ppoll` calls. Each `ppoll` atomically restores the original
+mask while waiting, so a signal cannot slip between gate entry and arming. The
+original mask is restored on every exit. The gate releases on one `R` byte or
+returns an error fact at its fixed15s bound. Its entered/interrupted/released
+facts report actual main PID/TID and CLOCK_MONOTONIC; none is an ACK.
+
+The unprivileged `readiness-gate-fixture.c` controls complete, split, writev and
+real partial4096-byte nonblocking pipe writes, plus prefix/zero-probe/wrong-FD/
+wrong-thread refusals. They check unchanged bytes, original errno/mask and
+continued gating after actual handler delivery. These fixtures do not substitute
+for the source-matched product callback/perf/marker negative or its150ms absence
+interval. No product preload control is activated by this preparation alone.

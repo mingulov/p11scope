@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Oracle mutations and genuine fd controls, never installed acceptance."""
 import copy
+import fcntl
 import io
 import json
 import os
@@ -12,6 +13,8 @@ import sys
 import time
 from pathlib import Path
 import runpy
+import select
+import signal
 import unittest
 from unittest import mock
 
@@ -658,6 +661,91 @@ class ReporterProbeTests(unittest.TestCase):
             for fd in (exe, task, main_task):
                 if fd is not None:
                     os.close(fd)
+
+
+class ReadinessGateTests(unittest.TestCase):
+    def test_actual_preload_gates_only_complete_forwarded_main_stderr_and_restores_errno_mask(self):
+        line = b'p11scope: capturing: 136 probe(s) attached; stop with Ctrl-C\n'
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            preload, fixture = root / 'gate.so', root / 'fixture'
+            for source, target, flags in (
+                    ('readiness-write-gate.c', preload, ['-shared', '-fPIC']),
+                    ('readiness-gate-fixture.c', fixture, ['-pthread'])):
+                result = subprocess.run(['cc', '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror',
+                    *flags, str(ROOT / 'tests/fixtures/operator-output' / source), '-o', str(target)],
+                    capture_output=True, text=True, timeout=20)
+                self.assertEqual(result.returncode, 0, result.stderr)
+            for mode in ('whole', 'split', 'writev', 'partial', 'wrongfd', 'wrongtid', 'prefix', 'zero'):
+                with self.subTest(mode=mode):
+                    control, release = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+                    facts, notify = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+                    stderr_read, stderr_write = os.pipe2(os.O_CLOEXEC)
+                    fcntl.fcntl(stderr_write, fcntl.F_SETPIPE_SZ, 4096)
+                    os.set_blocking(stderr_write, False)
+                    env = dict(os.environ, LD_PRELOAD=str(preload),
+                        P11SCOPE_TEST_GATE_CONTROL_FD=str(control), P11SCOPE_TEST_GATE_FACT_FD=str(notify))
+                    child = subprocess.Popen([str(fixture), mode], env=env, pass_fds=(control, notify),
+                        stdout=subprocess.PIPE, stderr=stderr_write)
+                    for fd in (control, notify, stderr_write):
+                        os.close(fd)
+                    stderr = bytearray()
+                    def drain():
+                        while payload := os.read(stderr_read, 4096):
+                            stderr.extend(payload)
+                    reader = threading.Thread(target=drain)
+                    reader.start()
+                    def fact():
+                        self.assertTrue(select.select([facts], [], [], 3)[0], 'bounded gate fact missing')
+                        payload = os.read(facts, 4096)
+                        self.assertTrue(payload.endswith(b'\n'), payload)
+                        row = json.loads(payload)
+                        self.assertEqual((row['pid'], row['tid'], row['clock']),
+                                         (child.pid, child.pid, 'CLOCK_MONOTONIC'))
+                        return row
+                    try:
+                        gated = mode in ('whole', 'split', 'writev', 'partial')
+                        if gated:
+                            entered = fact()
+                            self.assertEqual(entered['kind'], 'entered')
+                            sent = time.monotonic_ns()
+                            os.kill(child.pid, signal.SIGINT)
+                            interrupted = fact()
+                            self.assertEqual(interrupted['kind'], 'interrupted')
+                            self.assertLessEqual(entered['t_ns'], sent)
+                            self.assertGreaterEqual(interrupted['t_ns'], sent)
+                            self.assertIsNone(child.poll(), 'main must remain gated after handler delivery')
+                            released = time.monotonic_ns()
+                            os.write(release, b'R')
+                            consumed = fact()
+                            self.assertEqual(consumed['kind'], 'released')
+                            self.assertGreaterEqual(consumed['t_ns'], released)
+                        output, _ = child.communicate(timeout=3)
+                        self.assertEqual(child.returncode, 0, bytes(stderr))
+                        reader.join(timeout=3)
+                        self.assertFalse(reader.is_alive())
+                        if not gated:
+                            self.assertEqual(os.read(facts, 4096), b'', 'prefix/foreign write must not gate')
+                        result = json.loads(output.splitlines()[-1])
+                        self.assertEqual(result['handled'], int(gated))
+                        self.assertEqual(result['errno'], 33)
+                        self.assertEqual(result['sigint_blocked'], 0)
+                        self.assertEqual(result['gate_cloexec'], 1)
+                        expected = b'\n' * 4090 + line if mode == 'partial' else line
+                        if mode == 'wrongfd': expected = b''
+                        elif mode == 'prefix': expected = line[:20]
+                        elif mode == 'zero': expected = line.replace(b'136', b'0')
+                        self.assertEqual(bytes(stderr), expected, 'interposer must forward exact real bytes')
+                        self.assertEqual(result['first_write'], 4096 if mode == 'partial' else 0)
+                    finally:
+                        if child.poll() is None:
+                            os.write(release, b'R')
+                            child.terminate()
+                            child.wait(timeout=3)
+                        reader.join(timeout=3)
+                        child.stdout.close()
+                        for fd in (release, facts, stderr_read):
+                            os.close(fd)
 
 
 class InventorySavedCaptureTests(unittest.TestCase):

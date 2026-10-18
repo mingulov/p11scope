@@ -77,7 +77,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     pub(crate) fn session_h3_finalizer<'session>(
         &'session mut self,
         producers: &'session SessionDrainProducers,
-    ) -> Result<SessionH3Finalizer<'session>, SemanticRefusal> {
+    ) -> Result<super::SessionH3Finalizer<'session>, SemanticRefusal> {
         let state = self
             .semantic_finalizer
             .get_or_insert_with(|| SessionFinalizerState::new(producers.native_domain()));

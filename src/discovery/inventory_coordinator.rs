@@ -196,7 +196,7 @@ struct PendingExecSuccessor<Pin> {
     old: CallerId,
     old_incarnation: u32,
     pid: u32,
-    custody: Pin,
+    custody: crate::discovery::caller_registry::SharedCallerPin<Pin>,
     /// The exact H0 Arc, when the ended incarnation had accepted Detailed
     /// custody. It moves with the physical handoff and grants nothing alone.
     semantic: Option<semantics::SemanticHandoffCustody>,
@@ -413,7 +413,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         registry_limits: RegistryLimits,
         endpoint_budget: InventoryBudget,
     ) -> Result<Self> {
-        let mut adapter = CallerAdapter::new(source);
+        let registry = CallerRegistry::new(registry_limits);
+        let mut adapter = CallerAdapter::new(source, registry.semantic_storage_reserver());
         // One caller budget, enforced where incarnations are minted; the
         // registry's caller cap stands behind it as a backstop.
         adapter.set_max_callers(registry_limits.max_callers);
@@ -421,7 +422,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             engine: Engine::inventory(inventory_config(endpoint_budget)?, scope, hooks, hints)?,
             semantic_inputs: semantics::SemanticInputs::new(Vec::new()),
             adapter,
-            registry: CallerRegistry::new(registry_limits),
+            registry,
             attach_set: InventoryAttachSet::new(endpoint_budget),
             pending_targets: TargetDelta::default(),
             capture: None,
@@ -6462,13 +6463,13 @@ pub(crate) mod tests {
         .unwrap()
     }
 
-    /// The source still holds a real OS pin, but owner-handle duplication is
-    /// refused. This models a full FD table without changing process limits.
-    struct RefusingSemanticCloneSource {
+    /// The source holds real OS custody but refuses to share it with a first
+    /// Detailed owner. Known H0 custody must remain independently reusable.
+    struct RefusingSharedCustodySource {
         attempted: std::rc::Rc<Cell<usize>>,
     }
 
-    impl ProcessSource for RefusingSemanticCloneSource {
+    impl ProcessSource for RefusingSharedCustodySource {
         type Pin = crate::process::PidPin;
 
         fn open(&mut self, pid: u32) -> Result<Self::Pin, String> {
@@ -6486,7 +6487,10 @@ pub(crate) mod tests {
         fn gone(&self, pid: u32) -> bool {
             OsProcessSource.gone(pid)
         }
-        fn semantic_custody(&self, _pin: &Self::Pin) -> Option<crate::process::PidPin> {
+        fn shared_semantic_custody(
+            &self,
+            _pin: &Arc<Self::Pin>,
+        ) -> Option<Arc<crate::process::PidPin>> {
             self.attempted.set(self.attempted.get() + 1);
             None
         }
@@ -6499,14 +6503,14 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn known_semantic_custody_survives_clone_refusal_but_first_admission_does_not() {
+    fn known_semantic_custody_survives_shared_source_refusal_but_first_admission_does_not() {
         let pid = std::process::id();
         let attempted = std::rc::Rc::new(Cell::new(0));
         let mut coordinator = InventoryCoordinator::new(
             Scope::Pid(pid),
             HookRegistry::builtin(),
             Vec::new(),
-            RefusingSemanticCloneSource {
+            RefusingSharedCustodySource {
                 attempted: attempted.clone(),
             },
             RegistryLimits::default_limits(),
@@ -6522,7 +6526,7 @@ pub(crate) mod tests {
             coordinator
                 .prepare_legacy_semantic_candidate(caller, domain)
                 .is_none(),
-            "first owner admission requires an actual duplicated handle"
+            "first owner admission requires actual shared original custody"
         );
         assert_eq!(attempted.get(), 1);
 
@@ -6554,7 +6558,11 @@ pub(crate) mod tests {
             .prepare_legacy_semantic_candidate(caller, domain)
             .expect("known original owner custody must not need a second pidfd");
         assert!(Arc::ptr_eq(&candidate.pin(), &original));
-        assert_eq!(attempted.get(), 1, "known custody must skip duplication");
+        assert_eq!(
+            attempted.get(),
+            1,
+            "known custody must skip another custody acquisition"
+        );
     }
 
     /// Heap-built cgroup-scope coordinator over `dir` (H6 slice 2
@@ -16205,13 +16213,16 @@ pub(crate) mod tests {
         let divergent = std::rc::Rc::new(Cell::new(false));
         let mut inner = crate::discovery::caller_registry::tests::ScriptedSource::default();
         inner.spawn_matching_process(pid);
-        let pin = inner.open(pid).expect("the scripted member opens");
         let source = CountingSource {
             inner,
             identity_reads: std::rc::Rc::clone(&identity_reads),
             divergent: std::rc::Rc::clone(&divergent),
         };
-        let mut adapter = CallerAdapter::new(source);
+        let registry = CallerRegistry::new(RegistryLimits::default_limits());
+        let mut adapter = CallerAdapter::new(source, registry.semantic_storage_reserver());
+        let old = adapter.admit(pid, ImageAuthority::ScanPinned, 1).unwrap();
+        let (_, pin) = adapter.retire_for_exec_handoff(old, 2).unwrap();
+        identity_reads.set(0);
         divergent.set(true);
         let (id, admitted) = adapter
             .commit_handoff_caller(pid, pin, permit, verified.clone(), 3_000, &mut || {

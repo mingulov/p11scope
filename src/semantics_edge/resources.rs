@@ -147,6 +147,17 @@ pub(crate) struct SemanticResourcePool {
     shared: Arc<Mutex<SharedPool>>,
 }
 
+/// A reservation handle on the registry's existing pool, never a new budget.
+pub(crate) struct SemanticResourceReserver {
+    shared: Arc<Mutex<SharedPool>>,
+}
+
+impl SemanticResourceReserver {
+    pub(crate) fn reserve(&self, bytes: usize) -> Result<ResourceLease, SemanticResourceRefusal> {
+        ResourceLease::acquire(&self.shared, bytes)
+    }
+}
+
 impl Default for SemanticResourcePool {
     fn default() -> Self {
         Self::new(SEMANTIC_RESOURCE_LIMIT)
@@ -154,6 +165,25 @@ impl Default for SemanticResourcePool {
 }
 
 impl SemanticResourcePool {
+    pub(crate) fn reserver(&self) -> SemanticResourceReserver {
+        SemanticResourceReserver {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reference_set_limit(&self, limit: usize) {
+        let mut state = self
+            .shared
+            .lock()
+            .expect("resource locks never hold callbacks");
+        assert!(
+            limit >= state.charged,
+            "a test limit cannot discard existing charges"
+        );
+        state.limit = limit;
+    }
+
     fn new(limit: usize) -> Self {
         assert!(limit >= SEMANTIC_TRANSITION_SCRATCH);
         Self {

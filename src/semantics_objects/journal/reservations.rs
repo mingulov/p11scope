@@ -100,6 +100,13 @@ impl<C> ReservationTable<C> {
         self.slots[at].as_ref()?.aliases[0]
     }
 
+    pub(super) fn member_bytes(&self, role: Role, key: RoleKey) -> Option<usize> {
+        let at = self.key_slot(role, key)?;
+        self.slots[at].as_ref()?.roles[role.index()]
+            .as_ref()
+            .map(|member| member.bytes)
+    }
+
     pub(super) fn release_role(&mut self, role: Role) {
         for slot in &mut self.slots {
             let Some(operation) = slot.as_mut() else {

@@ -393,6 +393,27 @@ mod tests {
         assert_eq!(after.peak_charged_bytes, baseline.peak_charged_bytes);
         assert_eq!(after.refused, baseline.refused + 1);
     }
+
+    #[test]
+    fn promotion_capacity_reserves_supported_history_before_commit() {
+        let registry = CallerRegistry::new(RegistryLimits::default_limits());
+        let mut capacity = PromotionInstallCapacity::reserve(&registry).unwrap();
+        assert!(
+            capacity.admission_images.capacity() >= MAX_INSTANCES,
+            "distinct completed callers retain their history; one current binding does not bound that history to one caller"
+        );
+        let (_, allocations, bytes) = crate::test_alloc::count_allocs_during(|| {
+            capacity
+                .admission_images
+                .try_reserve(MAX_INSTANCES)
+                .unwrap();
+        });
+        assert_eq!(
+            (allocations, bytes),
+            (0, 0),
+            "all supported history storage must already be paid before commit"
+        );
+    }
 }
 
 pub(super) fn consume<Source: ProcessSource>(

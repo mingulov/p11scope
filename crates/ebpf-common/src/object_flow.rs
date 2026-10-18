@@ -173,42 +173,88 @@ pub fn adapter_attributes_entry(
         }
         return true;
     }
+    capture_request_pairs(
+        side,
+        row,
+        layout,
+        fetch_arg,
+        &mut read_word,
+        &mut read_bytes,
+    );
+    true
+}
+
+// The actual scalar request-pair body is separate from the shipping gate so
+// host spies can exercise its acquisition and alias sequencing while capture
+// remains disabled. It is called only after descriptor/custody validation.
+#[inline(always)]
+pub(crate) fn capture_request_pairs(
+    side: &mut ObjectStart,
+    row: &ObjectDescriptorWire,
+    layout: LinuxLayout,
+    fetch_arg: &mut impl FnMut(u8) -> Option<u64>,
+    mut read_word: impl FnMut(u64) -> Result<u64, ()>,
+    mut read_bytes: impl FnMut(u64, &mut [u8]) -> Result<(), ()>,
+) {
     // Derive requires accepted entry evidence before any template access
     // (the same finite guard as result-pointer retention).
     if row.action == OBJECT_ACTION_DERIVE && side.derive == OBJECT_DERIVE_UNAVAILABLE {
-        return true;
+        return;
     }
-    let mut pair0: Option<(u64, u64)> = None;
-    let mut accumulated = 0u32;
-    let mut p = 0;
-    while p < 2 {
-        let (ptr_arg, count_arg) = (row.template_args[2 * p], row.template_args[2 * p + 1]);
-        if ptr_arg == ARG_NONE || count_arg == ARG_NONE {
-            p += 1;
-            continue;
+    let present0 = row.template_args[0] != ARG_NONE && row.template_args[1] != ARG_NONE;
+    let present1 = row.template_args[2] != ARG_NONE && row.template_args[3] != ARG_NONE;
+    // Both actual pairs precede either inspection. Keep failed acquisition
+    // distinct from an absent pair and from a successfully acquired count0.
+    let pair0 = if present0 {
+        let ptr = fetch_arg(row.template_args[0]);
+        let count = fetch_arg(row.template_args[1]);
+        ptr.zip(count)
+    } else {
+        None
+    };
+    let pair1 = if present1 {
+        let ptr = fetch_arg(row.template_args[2]);
+        let count = fetch_arg(row.template_args[3]);
+        ptr.zip(count)
+    } else {
+        None
+    };
+    if (present0 && pair0.is_none()) || (present1 && pair1.is_none()) {
+        // An unavailable peer has no proven span. Refuse all present lists
+        // before any target read instead of silently granting the other pair.
+        if present0 {
+            side.requested[0].flags = OBJECT_ATTR_LIST_UNINSPECTED;
         }
-        let template_ptr = fetch_arg(ptr_arg).unwrap_or(0);
-        let count = fetch_arg(count_arg).unwrap_or(0);
-        let peer = if p == 0 { None } else { pair0 };
-        let contributed = production_inspect_request_template(
-            template_ptr,
+        if present1 {
+            side.requested[1].flags = OBJECT_ATTR_LIST_UNINSPECTED;
+        }
+        side.flags |= object_flag::ARG_READ_FAILURE as u16;
+        return;
+    }
+    let mut accumulated = 0;
+    if let Some((ptr, count)) = pair0 {
+        accumulated |= production_inspect_request_template(
+            ptr,
             count,
-            peer,
+            pair1,
             layout,
-            &mut side.requested[p],
+            &mut side.requested[0],
             &mut read_word,
             &mut read_bytes,
         );
-        accumulated |= contributed;
-        if p == 0 {
-            pair0 = Some((template_ptr, count));
-        }
-        p += 1;
     }
-    if accumulated != 0 {
-        side.flags |= accumulated as u16;
+    if let Some((ptr, count)) = pair1 {
+        accumulated |= production_inspect_request_template(
+            ptr,
+            count,
+            pair0,
+            layout,
+            &mut side.requested[1],
+            &mut read_word,
+            &mut read_bytes,
+        );
     }
-    true
+    side.flags |= accumulated as u16;
 }
 
 // Per-slot return gates for the unrolled fill below. Always inlined

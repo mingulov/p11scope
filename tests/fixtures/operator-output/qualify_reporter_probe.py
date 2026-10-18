@@ -26,6 +26,16 @@ def json_rows(reader):
     return [json.loads(line) for line in reader.lines]
 
 
+def observer_diagnostics(reader, *, no_signal=False):
+    # A zombie can still have bytes pending in this independent reader. EOF
+    # completion is bounded and does not reap/release original observer custody.
+    reader.finish()
+    payload = ''.join(reader.lines).encode()
+    if no_signal and b'p11scope: cancel:' in payload:
+        raise ValueError('no-signal observer reported cancellation')
+    return payload
+
+
 def check_zero(records, expected):
     if ([row.get('kind') for row in records] != ['ready', 'final']
             or any(row.get('mode') != 'perf_uprobe' for row in records)):
@@ -142,6 +152,7 @@ def cell(args, name, directory, env, binary, provider, caller_pin, helper, manif
             # unreaped child retain custody until the helper's final counters.
             if observer.popen.returncode is not None:
                 raise ValueError('observer was reaped before probe reconciliation')
+            observer_diagnostics(errors, no_signal=name == 'none')
             if witness:
                 witness.popen.stdin.write('stop\n')
                 witness.popen.stdin.flush()
@@ -153,8 +164,6 @@ def cell(args, name, directory, env, binary, provider, caller_pin, helper, manif
                 receipt['probe_records'] = rows
                 if name == 'none':
                     receipt.update(check_zero(rows, expected))
-                    if b'p11scope: cancel:' in ''.join(errors.lines).encode():
-                        raise ValueError('no-signal observer reported cancellation')
                 elif name == 'delayed':
                     PROBE['validate_binding'](rows, expected)
                     if (len(rows) != 3 or rows[1].get('t_ns', 0) < receipt['continued_ns']

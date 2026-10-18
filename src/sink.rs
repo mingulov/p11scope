@@ -444,8 +444,22 @@ impl<W: Write + AsRawFd> Write for SinkWriter<W> {
         if self.buf.len() >= SINK_BUFFER_BYTES {
             self.flush_bounded()?;
         }
-        self.buf.extend_from_slice(bytes);
-        Ok(bytes.len())
+        // Bounded partial write: accept only the free prefix so one large
+        // frame never grows the buffer past the ceiling. `write_all`
+        // retries the remainder, flushing full buffers in order; a flush
+        // that drops or errors preserves its accounting and buffer.
+        let free = SINK_BUFFER_BYTES.saturating_sub(self.buf.len());
+        if free == 0 {
+            // Unreachable with the current flush (success empties the
+            // buffer), but never report a 0-write for non-empty input.
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "sink buffer still full after flush",
+            ));
+        }
+        let accepted = free.min(bytes.len());
+        self.buf.extend_from_slice(&bytes[..accepted]);
+        Ok(accepted)
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -546,28 +560,24 @@ mod tests {
     #[test]
     fn writes_past_the_cap_flush_through_a_live_reader() {
         let (writer, mut reader) = pair();
-        reader.set_nonblocking(true).unwrap();
         let mut sink = SinkWriter::new(writer).unwrap();
         sink.begin_tick(Duration::from_secs(30));
 
         let chunk = vec![9u8; SINK_BUFFER_BYTES * 3];
+        let expected_len = chunk.len();
+        // A live reader drains concurrently: a bounded writer cannot promise
+        // that the socket buffers an entire multi-batch frame before reading.
+        let reader_thread = std::thread::spawn(move || {
+            reader
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut got = vec![0u8; expected_len];
+            reader.read_exact(&mut got).unwrap();
+            got
+        });
         sink.write_all(&chunk).unwrap();
         sink.flush().unwrap();
-
-        let mut got = Vec::new();
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while got.len() < chunk.len() {
-            assert!(std::time::Instant::now() < deadline, "reader starved");
-            let mut buf = vec![0u8; 65536];
-            match reader.read(&mut buf) {
-                Ok(0) => std::thread::sleep(Duration::from_millis(1)),
-                Ok(n) => got.extend_from_slice(&buf[..n]),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                Err(error) => panic!("reader failed: {error}"),
-            }
-        }
+        let got = reader_thread.join().unwrap();
         assert_eq!(got, chunk);
         assert_eq!(sink.take_drops(), SinkDrops::default());
     }
@@ -908,5 +918,218 @@ mod tests {
 
         assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
         assert_eq!(sink.take_drops(), SinkDrops::default());
+    }
+
+    /// PA-14: a single write larger than the ceiling must not grow the
+    /// buffer past `SINK_BUFFER_BYTES`. Bounded partial writes accept only
+    /// the free prefix; the remainder follows via `write_all` with byte
+    /// order preserved to a ready reader.
+    #[test]
+    fn single_write_larger_than_ceiling_is_partial_and_bounded() {
+        let (writer, reader) = pair();
+        let mut sink = SinkWriter::new(writer).unwrap();
+        sink.begin_tick(Duration::from_secs(30));
+        let len = SINK_BUFFER_BYTES + 32768;
+        let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+
+        let accepted = sink.write(&payload).unwrap();
+        assert_eq!(
+            accepted, SINK_BUFFER_BYTES,
+            "oversize write must fill only the ceiling"
+        );
+        assert!(accepted < payload.len());
+        assert!(
+            sink.buf.len() <= SINK_BUFFER_BYTES,
+            "buffer grew past ceiling: {}",
+            sink.buf.len()
+        );
+
+        let reader_thread = std::thread::spawn(move || {
+            let mut reader = reader;
+            reader
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut got = vec![0u8; len];
+            reader.read_exact(&mut got).unwrap();
+            got
+        });
+        sink.write_all(&payload[accepted..]).unwrap();
+        sink.flush().unwrap();
+        let got = reader_thread.join().unwrap();
+        assert_eq!(got, payload);
+        assert_eq!(sink.take_drops(), SinkDrops::default());
+    }
+
+    /// PA-14 healthy twin: the same large frame via `write_all` reaches a
+    /// ready reader whole, in order, without drops.
+    #[test]
+    fn write_all_twin_delivers_same_large_frame_losslessly() {
+        let (writer, reader) = pair();
+        let mut sink = SinkWriter::new(writer).unwrap();
+        sink.begin_tick(Duration::from_secs(30));
+        let len = SINK_BUFFER_BYTES + 32768;
+        let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+
+        let reader_thread = std::thread::spawn(move || -> io::Result<Vec<u8>> {
+            let mut reader = reader;
+            reader.set_read_timeout(Some(Duration::from_secs(5)))?;
+            let mut got = vec![0u8; len];
+            reader.read_exact(&mut got)?;
+            Ok(got)
+        });
+        sink.write_all(&payload).unwrap();
+        sink.flush().unwrap();
+        let got = reader_thread.join().unwrap().unwrap();
+        assert_eq!(got, payload);
+        assert_eq!(sink.take_drops(), SinkDrops::default());
+    }
+
+    /// PA-14: when the buffer is partly full, `write` reports only the
+    /// free space instead of growing past the ceiling.
+    #[test]
+    fn write_reports_free_space_when_buffer_partly_full() {
+        let (writer, _reader) = pair();
+        let mut sink = SinkWriter::new(writer).unwrap();
+        sink.begin_tick(Duration::from_secs(30));
+
+        let prefix = vec![1u8; 1000];
+        assert_eq!(sink.write(&prefix).unwrap(), 1000);
+
+        let payload = vec![2u8; SINK_BUFFER_BYTES];
+        let accepted = sink.write(&payload).unwrap();
+        assert_eq!(accepted, SINK_BUFFER_BYTES - 1000);
+        assert_eq!(sink.buf.len(), SINK_BUFFER_BYTES);
+    }
+
+    /// PA-14: a multi-chunk `write_all` stays bounded before the final
+    /// flush and still delivers every byte in order to a draining reader.
+    #[test]
+    fn large_multi_chunk_write_all_stays_bounded_and_ordered() {
+        let (writer, reader) = pair();
+        let mut sink = SinkWriter::new(writer).unwrap();
+        sink.begin_tick(Duration::from_secs(30));
+        let len = SINK_BUFFER_BYTES * 3 + 12345;
+        let payload: Vec<u8> = (0..len).map(|i| ((i * 31) % 256) as u8).collect();
+
+        let reader_thread = std::thread::spawn(move || -> io::Result<Vec<u8>> {
+            let mut reader = reader;
+            reader.set_read_timeout(Some(Duration::from_secs(10)))?;
+            let mut got = vec![0u8; len];
+            reader.read_exact(&mut got)?;
+            Ok(got)
+        });
+        sink.write_all(&payload).unwrap();
+        assert!(
+            sink.buf.len() <= SINK_BUFFER_BYTES,
+            "buffered {} past ceiling after write_all",
+            sink.buf.len()
+        );
+        sink.flush().unwrap();
+        let got = reader_thread.join().unwrap().unwrap();
+        assert_eq!(got, payload);
+        assert_eq!(sink.take_drops(), SinkDrops::default());
+    }
+
+    /// PA-14: a stalled large offer sheds with a finite buffer: every
+    /// offered byte is counted as dropped, none is held past the flush.
+    #[test]
+    fn stalled_large_write_sheds_with_finite_buffer() {
+        let (writer, _reader) = pair();
+        let mut filler = writer.try_clone().unwrap();
+        filler.set_nonblocking(true).unwrap();
+        let chunk = vec![7u8; 65536];
+        while filler.write(&chunk).is_ok() {}
+        drop(filler);
+
+        let mut sink = SinkWriter::new(writer).unwrap();
+        sink.begin_tick(Duration::ZERO);
+        let len = SINK_BUFFER_BYTES * 2 + 1000;
+        let payload = vec![8u8; len];
+
+        let start = Instant::now();
+        sink.write_all(&payload).unwrap();
+        assert!(
+            sink.buf.len() <= SINK_BUFFER_BYTES,
+            "stalled write buffered {} past ceiling",
+            sink.buf.len()
+        );
+        sink.flush().unwrap();
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "stalled large write blocked {elapsed:?}"
+        );
+        let drops = sink.take_drops();
+        assert_eq!(drops.dropped_bytes, len as u64);
+        assert!(drops.timeouts >= 1);
+        assert!(sink.buf.is_empty());
+    }
+
+    /// PA-14: a cancelled large offer sheds promptly with a finite buffer.
+    #[test]
+    fn cancelled_large_write_sheds_promptly_with_finite_buffer() {
+        let (writer, _reader) = pair();
+        let mut filler = writer.try_clone().unwrap();
+        filler.set_nonblocking(true).unwrap();
+        let chunk = vec![7u8; 65536];
+        while filler.write(&chunk).is_ok() {}
+        drop(filler);
+
+        let cancel = Arc::new(AtomicBool::new(true));
+        let mut sink = SinkWriter::new(writer).unwrap();
+        sink.set_cancel_flag(Arc::clone(&cancel));
+        sink.begin_tick(Duration::from_millis(250));
+        let len = SINK_BUFFER_BYTES * 2 + 1000;
+        let payload = vec![8u8; len];
+
+        let start = Instant::now();
+        sink.write_all(&payload).unwrap();
+        assert!(
+            sink.buf.len() <= SINK_BUFFER_BYTES,
+            "cancelled write buffered {} past ceiling",
+            sink.buf.len()
+        );
+        sink.flush().unwrap();
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(150),
+            "cancelled large write took {elapsed:?}"
+        );
+        let drops = sink.take_drops();
+        assert_eq!(drops.dropped_bytes, len as u64);
+        assert!(drops.timeouts >= 1);
+        assert!(sink.buf.is_empty());
+    }
+
+    /// PA-14: a large offer to a dead peer is a transport error, not a
+    /// drop, and the retained buffer stays within the ceiling.
+    #[test]
+    fn large_write_to_dead_peer_is_error_not_drop_with_bounded_buffer() {
+        let (writer, reader) = pair();
+        drop(reader);
+        let mut sink = SinkWriter::new(writer).unwrap();
+        sink.begin_tick(Duration::from_millis(250));
+        let len = SINK_BUFFER_BYTES + 1000;
+        let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+
+        let accepted = sink.write(&payload).unwrap();
+        assert_eq!(accepted, SINK_BUFFER_BYTES);
+        assert_eq!(sink.buf.len(), SINK_BUFFER_BYTES);
+
+        let error = sink.write(&payload[accepted..]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(sink.take_drops(), SinkDrops::default());
+        assert!(sink.buf.len() <= SINK_BUFFER_BYTES);
+
+        let (writer, reader) = pair();
+        drop(reader);
+        let mut sink = SinkWriter::new(writer).unwrap();
+        sink.begin_tick(Duration::from_millis(250));
+        let error = sink.write_all(&payload).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(sink.take_drops(), SinkDrops::default());
+        assert!(sink.buf.len() <= SINK_BUFFER_BYTES);
     }
 }

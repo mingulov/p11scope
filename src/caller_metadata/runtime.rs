@@ -124,16 +124,28 @@ struct FrameRows {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct MetadataFrame {
     rows: Option<Arc<FrameRows>>,
-    refused_revision: Option<u64>,
+    refusal: Option<(MetadataReason, u64)>,
     pub(crate) summary: MetadataSummary,
 }
 impl MetadataFrame {
+    pub(crate) fn unavailable(reason: MetadataReason) -> Self {
+        Self {
+            rows: None,
+            refusal: Some((reason, 0)),
+            summary: MetadataSummary {
+                enabled: true,
+                budget_refusals: 1,
+                ..MetadataSummary::default()
+            },
+        }
+    }
+
     pub(crate) fn contains(&self, caller: CallerId) -> bool {
         self.rows.as_ref().is_some_and(|rows| {
             rows.rows
                 .binary_search_by_key(&caller, |row| row.caller)
                 .is_ok()
-        })
+        }) || (self.refusal.is_some() && (caller.0 as usize) < self.summary.unknown)
     }
 
     /// Off has no table, allocations, reads, or caller metadata field.
@@ -141,11 +153,8 @@ impl MetadataFrame {
         if !self.summary.enabled {
             return None;
         }
-        if let Some(revision) = self.refused_revision {
-            return Some(CallerMetadata::unknown(
-                MetadataReason::LookupLimit,
-                revision,
-            ));
+        if let Some((reason, revision)) = self.refusal {
+            return Some(CallerMetadata::unknown(reason, revision));
         }
         Some(
             self.rows
@@ -235,7 +244,7 @@ impl MetadataRuntime {
         // this owner and its fixed table/worker-slot bookkeeping.
         let bytes = MAX_CALLER_METADATA_RECORDS * size_of::<Option<Slot>>()
             + ALLOCATION_PADDING
-            + size_of::<Self>();
+            + job::owner_storage_bytes();
         let storage = MemoryCharge::reserve(&budget, bytes)?;
         let mut slots = Vec::with_capacity(MAX_CALLER_METADATA_RECORDS);
         slots.resize(MAX_CALLER_METADATA_RECORDS, None);
@@ -293,7 +302,10 @@ impl MetadataRuntime {
                 Some(slot) => {
                     if slot.caller.retired || caller.retired {
                         slot.metadata = slot.metadata.to_historical();
-                    } else if slot.caller.image.is_some() && slot.caller.image != caller.image {
+                    } else if !self.stopped
+                        && slot.caller.image.is_some()
+                        && slot.caller.image != caller.image
+                    {
                         slot.metadata = CallerMetadata::unknown(
                             if caller.image.is_none() {
                                 MetadataReason::IdentityUnavailable
@@ -486,7 +498,7 @@ impl MetadataRuntime {
             summary.unknown = count;
             return MetadataFrame {
                 rows: None,
-                refused_revision: Some(self.summary.started),
+                refusal: Some((MetadataReason::LookupLimit, self.summary.started)),
                 summary,
             };
         };
@@ -525,7 +537,7 @@ impl MetadataRuntime {
         }
         MetadataFrame {
             rows: Some(rows),
-            refused_revision: None,
+            refusal: None,
             summary,
         }
     }

@@ -34,11 +34,14 @@ MAPS = {name: checker.map_def(*shape) for name, shape in {
     "USAGE_EVIDENCE": (6, 4, 8, 3), "ENDPOINT_OBJECT": (2, 4, 8, 1, 128),
     "CALLER_USE": (1, 24, 40, 1), "CALLER_EVIDENCE": (6, 4, 8, 4),
     "TASK_COOKIE": (29, 4, 8, 0, 1), "COOKIE_CTL": (2, 4, 40, 1),
+    "INV_BASELINE_REQUESTS": (1, 4, 16, 1024, 129),
+    "INV_BASELINE_CTL": (2, 4, 56, 1),
 }.items()}
 PROGRAMS = {"p11_usage_entry_lp64", "p11_usage_entry_ia32", "dl_debug_state",
             "function_list_entry", "function_list_return", "interface_list_entry",
             "interface_list_return", "interface_list_worker", "interface_entry",
-            "interface_return", "sched_process_exec", "sched_process_exit"}
+            "interface_return", "sched_process_exec", "sched_process_exit",
+            "p11_inventory_image_baseline"}
 SYMBOLS = {"p11_owner_lease", "p11_owner_refund", "p11_read_ia32_arg", "p11_exec_dumpability",
            "p11_link_current_identity"}
 MASK = (1 << 64) - 1
@@ -75,11 +78,14 @@ class CallerManifestTests(unittest.TestCase):
         for root in PROGRAMS:
             with self.subTest(missing=root), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(RuntimeError):
                 checker.validate_inventory("inventory-callers", MAPS, PROGRAMS - {root}, SYMBOLS)
-        for root in ("p11_entry", "p11_return", "task_newtask", "iterator"):
+        for root in ("p11_entry", "p11_return", "task_newtask", "iterator",
+                     "p11_selected_bootstrap", "p11_selected_cgroup_migrate"):
             with self.subTest(extra=root), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(RuntimeError):
                 checker.validate_inventory("inventory-callers", MAPS, PROGRAMS | {root}, SYMBOLS)
         for name in ("START", "EVENTS", "ROOT_CTL", "p11_link_emit_fork", "p11_link_fork_allowed",
-                     "p11_root_current_exit", "p11_owner_start_get", "p11_link_task_identity"):
+                     "p11_root_current_exit", "p11_owner_start_get", "p11_link_task_identity",
+                     "SELECTED_DETAILED", "SELECTED_DETAILED_STATE", "SELECTED_BOOTSTRAP_CTL",
+                     "p11_selected_current_allowed", "p11_selected_invalidate_tgid"):
             with self.subTest(symbol=name), self.assertRaises(RuntimeError):
                 checker.validate_inventory("inventory-callers", MAPS, PROGRAMS, SYMBOLS | {name})
         with self.assertRaises(RuntimeError):

@@ -1037,10 +1037,12 @@ def scalar_scope_flags_contract(disassembly):
     require(len(insns) == len(patterns)
             and all(re.fullmatch(pattern, text) for (_, text), pattern in zip(insns, patterns)),
             "scalar scope flags own-stack/full64/discriminant effects")
+    authority = [candidate for candidate in blocks
+                 if re.fullmatch(r"_RNv[0-9A-Za-z]+_13p11scope_ebpf10scope_auth", candidate)]
     calls = [(pc, target) for caller, _, pc, target in D.internal_call_targets(split[".text"])
              if caller == name]
-    require(len(calls) == 1 and calls[0][0] == insns[2][0]
-            and calls[0][1].endswith("scope_auth") and calls[0][1] in blocks,
+    require(len(authority) == 1 and len(calls) == 1 and calls[0][0] == insns[2][0]
+            and calls[0][1] == authority[0],
             "scalar scope flags one actual scope_auth callee")
     require(D.relative_target(insns[5][0], insns[5][1]) == insns[7][0],
             "scalar scope flags zero-refusal branch")

@@ -35,6 +35,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod cancellation;
+use cancellation::CaptureCancellation;
+
 #[cfg(test)]
 mod root_fence_runtime;
 
@@ -4225,8 +4228,35 @@ fn cancel_marker(signal: Option<libc::c_int>, ticks: u64) -> String {
     )
 }
 
-fn report_capture_cancel(signal: Option<libc::c_int>, ticks: u64) {
-    eprintln!("{}", cancel_marker(signal, ticks));
+#[derive(Clone, Copy)]
+enum CancellationPhase {
+    Capture,
+    Finalization,
+}
+
+/// The real main-thread acknowledgement seam. Keep it outlined so an
+/// independently owned probe can observe entry even when stderr is blocked.
+/// Signal handlers only set atomics; a capture poll calls this once.
+#[inline(never)]
+fn report_capture_cancel(signal: libc::c_int, ticks: u64, phase: CancellationPhase) {
+    let marker = match phase {
+        CancellationPhase::Capture => cancel_marker(Some(signal), ticks),
+        CancellationPhase::Finalization => format!(
+            "p11scope: cancel: signal {signal} observed during finalization after {ticks} ticks"
+        ),
+    };
+    let _ = crate::sink::try_stderr_line(&marker);
+}
+
+fn observe_capture_cancel(
+    interrupted: &SignalState,
+    cancellation: &CaptureCancellation,
+    ticks: u64,
+    phase: CancellationPhase,
+) {
+    if let Some(signal) = cancellation.observe(interrupted.first_signal()) {
+        report_capture_cancel(signal, ticks, phase);
+    }
 }
 
 /// The loop-end marker for a target that exited mid-capture: the
@@ -4457,7 +4487,9 @@ pub(crate) const POST_Q_RECORD_REASON: &str =
 /// named reason. The terminal evidence is already PARTIAL via the kept
 /// unproven marker; the reason says which ring broke quiescence.
 fn report_post_q_record(ring: &str) {
-    eprintln!("p11scope: terminal {ring} drain: {POST_Q_RECORD_REASON}");
+    let _ = crate::sink::try_stderr_line(&format!(
+        "p11scope: terminal {ring} drain: {POST_Q_RECORD_REASON}"
+    ));
 }
 
 /// Routes one ring's post-Q result into the terminal evidence: the named
@@ -4503,7 +4535,7 @@ fn quiescence_unproven_line(waited: Duration, in_flight: u64) -> String {
 /// report-schema change: a `stop_quiescence` report field belongs to a
 /// later task.
 fn report_quiescence_unproven(waited: Duration, in_flight: u64) {
-    eprintln!("{}", quiescence_unproven_line(waited, in_flight));
+    let _ = crate::sink::try_stderr_line(&quiescence_unproven_line(waited, in_flight));
 }
 
 fn finish_capture_with<C, T>(
@@ -4585,6 +4617,7 @@ fn capture_profile(
     // Opened by the caller before the attach; published by `commit()` only
     // once the final report is written.
     let has_output = output.is_some();
+    let cancellation = CaptureCancellation::default();
     let live_display = LiveDisplay::for_stdout();
     let mut stdout_sink = crate::sink::stdout_sink()?;
     stdout_sink.set_cancel_flag(interrupted.cancel_flag());
@@ -4718,6 +4751,11 @@ fn capture_profile(
         ticks += 1;
         let tick_start = Instant::now();
         let elapsed = clock.elapsed();
+        if interrupted.interrupted() {
+            session.stop_gate().request_stop();
+            observe_capture_cancel(interrupted, &cancellation, ticks, CancellationPhase::Capture);
+            break Ok(CaptureEnd::Signal);
+        }
         // One frame-clock read decides this tick's whole frame (F-T8-1).
         let tick_frame = profile_frame_decisions(|| last_frame.elapsed(), drain);
         let tick = {
@@ -4795,13 +4833,20 @@ fn capture_profile(
                     );
                     Ok((plan_changed, paused, context.0.plan()))
                 },
-                |context| capture_end(
-                    context.0,
-                    context.2.as_deref(),
-                    interrupted,
-                    elapsed,
-                    duration,
-                ),
+                |context| {
+                    let end = capture_end(
+                        context.0,
+                        context.2.as_deref(),
+                        interrupted,
+                        elapsed,
+                        duration,
+                    )?;
+                    if end == Some(CaptureEnd::Signal) {
+                        context.1.stop_gate().request_stop();
+                        observe_capture_cancel(interrupted, &cancellation, ticks, CancellationPhase::Capture);
+                    }
+                    Ok(end)
+                },
                 |context, consumers| {
                     if profile {
                         *consumers.malformed_records += drain_events(
@@ -4948,11 +4993,26 @@ fn capture_profile(
     // waits, drains and snapshots) and emit the existing stop marker as
     // the acknowledgement, adjacent to the request.
     session.stop_gate().request_stop();
-    if matches!(loop_result, Ok(CaptureEnd::Signal)) {
-        report_capture_cancel(interrupted.first_signal(), ticks);
-    }
+    observe_capture_cancel(
+        interrupted,
+        &cancellation,
+        ticks,
+        if matches!(loop_result, Ok(CaptureEnd::Signal)) {
+            CancellationPhase::Capture
+        } else {
+            CancellationPhase::Finalization
+        },
+    );
+    let poll_terminal_cancellation = || {
+        observe_capture_cancel(
+            interrupted,
+            &cancellation,
+            ticks,
+            CancellationPhase::Finalization,
+        );
+    };
     if matches!(loop_result, Ok(CaptureEnd::TargetExit)) {
-        eprintln!("{}", target_exit_marker(ticks));
+        let _ = crate::sink::try_stderr_line(&target_exit_marker(ticks));
     }
     // Authoritative loop-end stamp (T2, G-14): one clock read beside the
     // loss sampling, with the loop's real ending (an Err result is an
@@ -4988,6 +5048,7 @@ fn capture_profile(
     // loop's real end, then detach): a bare `?` here would skip both and
     // SIGKILL a child `--duration` should hand back alive.
     let quiesce_outcome = match (|| -> Result<QuiesceOutcome> {
+        poll_terminal_cancellation();
         let mut service_error: Option<anyhow::Error> = None;
         // Items the ticks staged left the ring first: they lead the batch.
         let (mut staged_records, mut staged_malformed) =
@@ -5002,6 +5063,7 @@ fn capture_profile(
             STOP_QUIESCE_BUDGET,
             if profile {
                 Some(|events_drain: &mut crate::events::OwnedDrain| {
+                    poll_terminal_cancellation();
                     if service_error.is_some() {
                         return;
                     }
@@ -5024,6 +5086,7 @@ fn capture_profile(
                 None
             },
             |discovery_drain: &mut crate::events::OwnedDiscoveryDrain| {
+                poll_terminal_cancellation();
                 if quiesce_overflow {
                     return;
                 }
@@ -5042,6 +5105,7 @@ fn capture_profile(
             },
             Instant::now,
         )?;
+        poll_terminal_cancellation();
         if let Some(error) = service_error {
             return Err(error);
         }
@@ -5064,7 +5128,11 @@ fn capture_profile(
         if quiesce_overflow {
             engine.note_quiesced_discovery_overflow();
         }
-        if engine.apply_quiesced_discovery(session, staged_records, staged_malformed)? {
+        poll_terminal_cancellation();
+        let discovery_result =
+            engine.apply_quiesced_discovery(session, staged_records, staged_malformed);
+        poll_terminal_cancellation();
+        if discovery_result? {
             let plan = engine.plan();
             state.sync_plan(plan);
         }
@@ -5072,6 +5140,7 @@ fn capture_profile(
     })() {
         Ok(outcome) => outcome,
         Err(error) => {
+            poll_terminal_cancellation();
             let mut settle_context = (&mut *engine, &mut *session, &mut owned);
             return Err(finish_quiesce_error(
                 error,
@@ -5120,12 +5189,16 @@ fn capture_profile(
                         &live_display,
                         &uretprobe_override,
                         capture_tracking_degraded,
+                        &poll_terminal_cancellation,
                     )
                     .map(|_| ())
                 },
                 |context| {
                     context.1.detach_producers_driven(
-                        || interrupted.sigint_deliveries() >= 2,
+                        || {
+                            poll_terminal_cancellation();
+                            interrupted.sigint_deliveries() >= 2
+                        },
                         &mut std::io::stderr(),
                     )
                 },
@@ -5138,6 +5211,7 @@ fn capture_profile(
         &mut finish_context,
         loop_result,
         |context, result| {
+            poll_terminal_cancellation();
             finish_capture_loop(
                 result,
                 context.0,
@@ -5147,8 +5221,12 @@ fn capture_profile(
             )
         },
         |context| {
+            poll_terminal_cancellation();
             context.1.detach_producers_driven(
-                || interrupted.sigint_deliveries() >= 2,
+                || {
+                    poll_terminal_cancellation();
+                    interrupted.sigint_deliveries() >= 2
+                },
                 &mut std::io::stderr(),
             )
         },
@@ -5177,6 +5255,7 @@ fn capture_profile(
                 |context: &mut ProfileTerminalContext<'_, '_, '_, '_, '_, '_, '_>,
                  consumers: &mut CaptureConsumers<'_>,
                  quiesced| {
+                    poll_terminal_cancellation();
                     let phase_start = Instant::now();
                     let mut post_q_discovery = false;
                     let plan_changed = match quiesced {
@@ -5201,6 +5280,7 @@ fn capture_profile(
                     Ok((plan_changed, context.0.plan()))
                 },
                 |context, consumers| {
+                    poll_terminal_cancellation();
                     if profile {
                         (
                             drain_original_root_events(
@@ -5224,6 +5304,7 @@ fn capture_profile(
                     }
                 },
                 |context, consumers| {
+                    poll_terminal_cancellation();
                     context.3.begin_tick(crate::sink::SINK_TICK_BUDGET);
                     let mut post_q_record = false;
                     if profile {
@@ -5250,6 +5331,7 @@ fn capture_profile(
                     Ok(())
                 },
                 |context, consumers| {
+                    poll_terminal_cancellation();
                     run_terminal(
                         context,
                         consumers,
@@ -5264,6 +5346,7 @@ fn capture_profile(
                         &live_display,
                         &uretprobe_override,
                         capture_tracking_degraded,
+                        &poll_terminal_cancellation,
                     )
                 },
             )
@@ -5291,11 +5374,14 @@ fn capture_profile(
         live_display: &LiveDisplay,
         uretprobe_override: &Option<render::UretprobeOverride>,
         capture_tracking_degraded: bool,
+        poll_terminal_cancellation: &impl Fn(),
     ) -> Result<render::Evidence> {
+        poll_terminal_cancellation();
         context.3.begin_tick(crate::sink::SINK_TICK_BUDGET);
         let maps_start = Instant::now();
         let reports = metrics::read(context.1, context.0.plan())?;
         let mut kernel_evidence = metrics::kernel_evidence(context.1)?;
+        poll_terminal_cancellation();
         if !profile {
             kernel_evidence.ring_loss = 0;
         }
@@ -5392,8 +5478,10 @@ fn capture_profile(
             profile,
         );
         let summary = timing_summary_line(&ev.scheduling);
-        eprintln!("{summary}");
+        poll_terminal_cancellation();
+        let _ = crate::sink::try_stderr_line(&summary);
 
+        poll_terminal_cancellation();
         if let Some(mut out_file) = context.5.take() {
             let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease")
                 .unwrap_or_default()
@@ -5420,8 +5508,11 @@ fn capture_profile(
             } else {
                 render::json(&reports, &ev, &capture)
             };
+            poll_terminal_cancellation();
             write_json_report(out_file.file(), &j)?;
+            poll_terminal_cancellation();
             out_file.commit().map_err(anyhow::Error::msg)?;
+            poll_terminal_cancellation();
         }
         Ok(ev)
     }
@@ -5463,6 +5554,7 @@ fn capture_trace(
     resource_start: crate::timing::ResourceSample,
 ) -> Result<render::Evidence> {
     let trace_limit = resolve_trace_max_events(max_events);
+    let cancellation = CaptureCancellation::default();
     let mut remaining = Some(trace_limit);
     // A line stream, not a published artifact: opened by the caller before the
     // attach, then appended to as lines arrive. Only now, with the session
@@ -5565,6 +5657,11 @@ fn capture_trace(
         ticks += 1;
         let tick_start = Instant::now();
         let elapsed = clock.elapsed();
+        if interrupted.interrupted() {
+            session.stop_gate().request_stop();
+            observe_capture_cancel(interrupted, &cancellation, ticks, CancellationPhase::Capture);
+            break Ok(CaptureEnd::Signal);
+        }
         // Fresh every tick: only this tick's backlog pass may
         // schedule a zero sleep below.
         scheduling.note_discovery_backlog(false);
@@ -5652,13 +5749,20 @@ fn capture_trace(
                         .add_phase(SchedulingPhase::Discovery, phase_start.elapsed());
                     Ok((plan_changed, paused, context.0.plan()))
                 },
-                |context| capture_end(
-                    context.0,
-                    context.2.as_deref(),
-                    interrupted,
-                    elapsed,
-                    duration,
-                ),
+                |context| {
+                    let end = capture_end(
+                        context.0,
+                        context.2.as_deref(),
+                        interrupted,
+                        elapsed,
+                        duration,
+                    )?;
+                    if end == Some(CaptureEnd::Signal) {
+                        context.1.stop_gate().request_stop();
+                        observe_capture_cancel(interrupted, &cancellation, ticks, CancellationPhase::Capture);
+                    }
+                    Ok(end)
+                },
                 |context, consumers| {
                     *consumers.malformed_records += drain_trace_events(
                         context.1,
@@ -5767,6 +5871,24 @@ fn capture_trace(
     // the acknowledgement, adjacent to the request.
     let stop_started = Instant::now();
     session.stop_gate().request_stop();
+    observe_capture_cancel(
+        interrupted,
+        &cancellation,
+        ticks,
+        if matches!(loop_result, Ok(CaptureEnd::Signal)) {
+            CancellationPhase::Capture
+        } else {
+            CancellationPhase::Finalization
+        },
+    );
+    let poll_terminal_cancellation = || {
+        observe_capture_cancel(
+            interrupted,
+            &cancellation,
+            ticks,
+            CancellationPhase::Finalization,
+        );
+    };
     let mut terminal = None;
     begin_trace_identity_stop(
         engine,
@@ -5775,11 +5897,8 @@ fn capture_trace(
         &mut terminal,
         STOP_QUIESCE_BUDGET.saturating_sub(stop_started.elapsed()),
     );
-    if matches!(loop_result, Ok(CaptureEnd::Signal)) {
-        report_capture_cancel(interrupted.first_signal(), ticks);
-    }
     if matches!(loop_result, Ok(CaptureEnd::TargetExit)) {
-        eprintln!("{}", target_exit_marker(ticks));
+        let _ = crate::sink::try_stderr_line(&target_exit_marker(ticks));
     }
 
     // Authoritative loop-end stamp (T2, G-14): one clock read beside the
@@ -5810,6 +5929,7 @@ fn capture_trace(
     // loop's real end, then detach): a bare `?` here would skip both and
     // SIGKILL a child `--duration` should hand back alive.
     let quiesce_outcome = match (|| -> Result<QuiesceOutcome> {
+        poll_terminal_cancellation();
         let mut service_error: Option<anyhow::Error> = None;
         // Items the ticks staged left the ring first: they lead the batch.
         let (mut staged_records, mut staged_malformed) =
@@ -5823,6 +5943,7 @@ fn capture_trace(
         let stop_state = session.quiesce_terminal(
             STOP_QUIESCE_BUDGET,
             Some(|events_drain: &mut crate::events::OwnedDrain| {
+                poll_terminal_cancellation();
                 if service_error.is_some() {
                     return;
                 }
@@ -5852,6 +5973,7 @@ fn capture_trace(
                 collect_sink_drops(stdout, &mut scheduling, &mut None, Instant::now());
             }),
             |discovery_drain: &mut crate::events::OwnedDiscoveryDrain| {
+                poll_terminal_cancellation();
                 if quiesce_overflow {
                     return;
                 }
@@ -5870,6 +5992,7 @@ fn capture_trace(
             },
             Instant::now,
         )?;
+        poll_terminal_cancellation();
         if let Some(error) = service_error {
             return Err(error);
         }
@@ -5888,7 +6011,11 @@ fn capture_trace(
         if quiesce_overflow {
             engine.note_quiesced_discovery_overflow();
         }
-        if engine.apply_quiesced_discovery(session, staged_records, staged_malformed)? {
+        poll_terminal_cancellation();
+        let discovery_result =
+            engine.apply_quiesced_discovery(session, staged_records, staged_malformed);
+        poll_terminal_cancellation();
+        if discovery_result? {
             let plan = engine.plan();
             state.sync_plan(plan);
             tracer.sync_plan(plan);
@@ -5898,6 +6025,7 @@ fn capture_trace(
     })() {
         Ok(outcome) => outcome,
         Err(error) => {
+            poll_terminal_cancellation();
             let mut settle_context = (&mut *engine, &mut *session, &mut owned);
             return Err(finish_quiesce_error(
                 error,
@@ -5913,7 +6041,10 @@ fn capture_trace(
                 |_| Ok(()),
                 |context| {
                     context.1.detach_producers_driven(
-                        || interrupted.sigint_deliveries() >= 2,
+                        || {
+                            poll_terminal_cancellation();
+                            interrupted.sigint_deliveries() >= 2
+                        },
                         &mut std::io::stderr(),
                     )
                 },
@@ -5926,6 +6057,7 @@ fn capture_trace(
         &mut finish_context,
         loop_result,
         |context, result| {
+            poll_terminal_cancellation();
             finish_capture_loop(
                 result,
                 context.0,
@@ -5935,12 +6067,17 @@ fn capture_trace(
             )
         },
         |context| {
+            poll_terminal_cancellation();
             context.1.detach_producers_driven(
-                || interrupted.sigint_deliveries() >= 2,
+                || {
+                    poll_terminal_cancellation();
+                    interrupted.sigint_deliveries() >= 2
+                },
                 &mut std::io::stderr(),
             )
         },
         |context, end, _detached| {
+            poll_terminal_cancellation();
             let mut terminal_context = (
                 &mut *context.0,
                 &mut *context.1,
@@ -5968,6 +6105,7 @@ fn capture_trace(
                 |context: &mut TraceTickContext<'_, '_, '_, '_, '_, '_, '_, '_, '_, '_>,
                  consumers: &mut CaptureConsumers<'_>,
                  quiesced| {
+                    poll_terminal_cancellation();
                     let phase_start = Instant::now();
                     let mut post_q_discovery = false;
                     let plan_changed = match quiesced {
@@ -5993,6 +6131,7 @@ fn capture_trace(
                     Ok((plan_changed, context.0.plan()))
                 },
                 |context, consumers| {
+                    poll_terminal_cancellation();
                     context.5.begin_tick(crate::sink::SINK_TICK_BUDGET);
                     let mut root_write_error = None;
                     let root_result = drain_original_root_events(
@@ -6025,6 +6164,7 @@ fn capture_trace(
                     (root_result, root_write_error)
                 },
                 |context, consumers| {
+                    poll_terminal_cancellation();
                     context.5.begin_tick(crate::sink::SINK_TICK_BUDGET);
                     let mut post_q_record = false;
                     *consumers.malformed_records += drain_trace_events(
@@ -6057,6 +6197,7 @@ fn capture_trace(
                     Ok(())
                 },
                 |context, consumers| {
+                    poll_terminal_cancellation();
                     context.5.begin_tick(crate::sink::SINK_TICK_BUDGET);
                     context
                         .0
@@ -6152,10 +6293,10 @@ fn capture_trace(
                     evidence.apply_stop_quiescence(consumers.stop_quiescence);
                     evidence.settle_terminal(true);
                     if *consumers.malformed_records > 0 {
-                        eprintln!(
+                        let _ = crate::sink::try_stderr_line(&format!(
                             "p11scope: {} malformed ring-buffer records discarded this capture",
                             *consumers.malformed_records
-                        );
+                        ));
                     }
                     emit_trace_terminal_accounted(
                         &mut evidence,
@@ -6193,7 +6334,8 @@ fn capture_trace(
                         );
                     });
                     let summary = timing_summary_line(&evidence.scheduling);
-                    eprintln!("{summary}");
+                    poll_terminal_cancellation();
+                    let _ = crate::sink::try_stderr_line(&summary);
                     Ok(evidence)
                 },
             )
@@ -6427,12 +6569,12 @@ fn collect_sink_drops(
     acc.note_sink_drops(&drops);
     if sink_note_due(&drops, *last_note, now) {
         *last_note = Some(now);
-        eprintln!(
+        let _ = crate::sink::try_stderr_line(&format!(
             "p11scope: stdout stalled; dropped {} bytes in {} flush timeouts (policy {})",
             drops.dropped_bytes,
             drops.timeouts,
             crate::render::SINK_POLICY_BOUNDED_WAIT_DROP,
-        );
+        ));
     }
 }
 

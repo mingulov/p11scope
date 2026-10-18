@@ -73,6 +73,8 @@ pub(crate) use inventory::EXPECTED_INVENTORY_DISCOVERY_BYTES;
 #[allow(unused_imports)]
 pub(crate) use inventory::PreparedInventory;
 pub(crate) use inventory::capture;
+#[allow(dead_code)] // Closed preparation; activation waits for the reviewed runtime proof.
+pub(crate) mod selected_detailed;
 mod stop_gate;
 pub(crate) use stop_gate::{StopGate, stop_gate_map_data, validate_stop_gate};
 // Task 3 Stage A: the readers are consumed by the Task 6 native seam

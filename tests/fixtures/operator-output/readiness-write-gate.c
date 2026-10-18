@@ -116,7 +116,9 @@ static int readiness(void) {
 }
 
 static void forwarded(int fd, const void *data, size_t length) {
-    if (consumed || fd != STDERR_FILENO || syscall(SYS_gettid) != getpid()) return;
+    /* Check thread ownership before touching any main-only parser state. */
+    if (fd != STDERR_FILENO || syscall(SYS_gettid) != getpid()) return;
+    if (consumed) return;
     const unsigned char *bytes = data;
     for (size_t i = 0; i < length; ++i) {
         if (used < sizeof(line)) line[used++] = (char)bytes[i];

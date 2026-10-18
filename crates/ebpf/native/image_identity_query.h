@@ -35,4 +35,5 @@ _Static_assert(sizeof(struct image_query_request) == 24, "image request ABI");
 _Static_assert(sizeof(struct image_query_control) == 56, "image query control ABI");
 _Static_assert(sizeof(struct image_query_row) == 40, "image row ABI");
 u32 p11_image_entry(u64 tgid, u64 cookie, u64 exec_id);
+u32 p11_image_selected_seed(u64 tgid, u64 cookie, u64 exec_id);
 #endif

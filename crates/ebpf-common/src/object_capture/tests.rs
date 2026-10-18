@@ -4276,3 +4276,189 @@ fn streamed_get_partial_result_corpus_matches_reference() {
         }
     }
 }
+
+#[test]
+fn streamed_actual_pair_body_checks_peer_before_either_value_read() {
+    use crate::object_wire::{canonical_object_wire, ObjectStart};
+    for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+        let w = layout.word_bytes() as u64;
+        for mode in 0..4 {
+            let target = fresh(w);
+            // Mode0 checks shared values; mode1 aliases pair1's value with
+            // pair0's header; mode2 makes
+            // pair1's length inexact; mode3 aliases pair0's value with pair1's
+            // inspected header (use Token for a distinguishable byte read).
+            prog_attr(
+                &target,
+                0x4000,
+                0,
+                w,
+                if mode == 3 { SEL_TOKEN } else { SEL_CLASS },
+                if mode == 3 { 0x6000 } else { 0x8000 },
+                if mode == 3 { 1 } else { w },
+            );
+            prog_attr(
+                &target,
+                0x6000,
+                0,
+                w,
+                if mode == 1 { SEL_TOKEN } else { SEL_CLASS },
+                if mode == 1 { 0x4000 } else { 0x8000 },
+                if mode == 1 {
+                    1
+                } else if mode == 2 {
+                    w + 1
+                } else {
+                    w
+                },
+            );
+            target.borrow_mut().set_word(0x8000, 3);
+            target.borrow_mut().set_bytes(0x6000, &[1]);
+            let row = canonical_object_wire(fid("C_GenerateKeyPair"));
+            let mut side = ObjectStart::default();
+            let mut fetches = std::vec::Vec::new();
+            let mut fetch = |arg| {
+                fetches.push(arg);
+                Some(if arg == row.template_args[0] {
+                    0x4000
+                } else if arg == row.template_args[2] {
+                    0x6000
+                } else {
+                    1
+                })
+            };
+            let (r, b) = readers(&target);
+            crate::object_flow::capture_request_pairs(&mut side, &row, layout, &mut fetch, r, b);
+            assert_eq!(fetches, row.template_args);
+            assert_eq!(
+                side.requested[0].cells[0].status,
+                if mode == 1 { ast::VALUE } else { ast::ALIAS }
+            );
+            if mode < 2 {
+                assert_eq!(side.requested[1].cells[0].status, ast::ALIAS);
+            }
+            if mode == 2 {
+                assert_eq!(side.requested[1].cells[0].status, ast::INVALID_LENGTH);
+            }
+            if mode < 3 && mode != 1 {
+                assert_no_read_of(&target, 0x8000);
+            } else {
+                assert_no_bytes_reads(&target);
+            }
+        }
+    }
+}
+
+#[test]
+fn streamed_actual_pair_body_distinguishes_failed_argument_from_empty() {
+    use crate::object_wire::{canonical_object_wire, ObjectStart};
+    for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+        let w = layout.word_bytes() as u64;
+        let row = canonical_object_wire(fid("C_GenerateKeyPair"));
+        for failed in row.template_args {
+            let target = fresh(w);
+            prog_attr(&target, 0x4000, 0, w, SEL_CLASS, 0x8000, w);
+            prog_attr(&target, 0x6000, 0, w, SEL_CLASS, 0x9000, w);
+            target.borrow_mut().set_word(0x8000, 3);
+            target.borrow_mut().set_word(0x9000, 3);
+            let mut side = ObjectStart::default();
+            let mut fetch = |arg| {
+                if arg == failed {
+                    None
+                } else {
+                    Some(if arg == row.template_args[0] {
+                        0x4000
+                    } else if arg == row.template_args[2] {
+                        0x6000
+                    } else {
+                        1
+                    })
+                }
+            };
+            let (r, b) = readers(&target);
+            crate::object_flow::capture_request_pairs(&mut side, &row, layout, &mut fetch, r, b);
+            assert_eq!(
+                target.borrow().log_len,
+                0,
+                "unknown peer span cannot authorize any value"
+            );
+            assert_ne!(side.flags & ofl::ARG_READ_FAILURE as u16, 0);
+            for out in side.requested {
+                assert_eq!(out.flags, alf::UNINSPECTED);
+                assert_eq!(out.inspected, 0);
+            }
+        }
+        let target = fresh(w);
+        let mut side = ObjectStart::default();
+        let mut fetch = |arg| {
+            Some(if arg == row.template_args[0] {
+                0x4000
+            } else if arg == row.template_args[2] {
+                0x6000
+            } else {
+                0
+            })
+        };
+        let (r, b) = readers(&target);
+        crate::object_flow::capture_request_pairs(&mut side, &row, layout, &mut fetch, r, b);
+        assert_eq!(side.flags, 0);
+        assert_eq!(target.borrow().log_len, 0);
+        for out in side.requested {
+            assert_eq!(out.flags, 0);
+            assert_eq!(out.inspected, 0);
+        }
+    }
+}
+
+#[test]
+fn streamed_actual_pair_body_disjoint_and_refused_derives_are_unchanged() {
+    use crate::object_wire::{canonical_object_wire, ObjectStart, OBJECT_DERIVE_UNAVAILABLE};
+    for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+        let w = layout.word_bytes() as u64;
+        let target = fresh(w);
+        prog_attr(&target, 0x4000, 0, w, SEL_CLASS, 0x8000, w);
+        prog_attr(&target, 0x6000, 0, w, SEL_CLASS, 0x9000, w);
+        target.borrow_mut().set_word(0x8000, 3);
+        target.borrow_mut().set_word(0x9000, 4);
+        let row = canonical_object_wire(fid("C_GenerateKeyPair"));
+        let mut side = ObjectStart::default();
+        let mut fetch = |arg| {
+            Some(if arg == row.template_args[0] {
+                0x4000
+            } else if arg == row.template_args[2] {
+                0x6000
+            } else {
+                1
+            })
+        };
+        let (r, b) = readers(&target);
+        crate::object_flow::capture_request_pairs(&mut side, &row, layout, &mut fetch, r, b);
+        assert_eq!(side.requested[0].cells[0].status, ast::VALUE);
+        assert_eq!(side.requested[0].cells[0].value, 3);
+        assert_eq!(side.requested[1].cells[0].status, ast::VALUE);
+        assert_eq!(side.requested[1].cells[0].value, 4);
+        for name in ["C_DeriveKey", "C_SetAttributeValue"] {
+            let target = fresh(w);
+            let row = canonical_object_wire(fid(name));
+            let mut side = ObjectStart {
+                derive: OBJECT_DERIVE_UNAVAILABLE,
+                ..Default::default()
+            };
+            let mut acquired = 0;
+            let (r, b) = readers(&target);
+            crate::object_flow::capture_request_pairs(
+                &mut side,
+                &row,
+                layout,
+                &mut |_| {
+                    acquired += 1;
+                    Some(0x4000)
+                },
+                r,
+                b,
+            );
+            assert_eq!(acquired, 0);
+            assert_eq!(target.borrow().log_len, 0);
+        }
+    }
+}

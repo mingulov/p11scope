@@ -15,6 +15,13 @@ fn prepare_owner(
 ) -> (SemanticAdmissionCandidate, PreparedSemanticAdmission) {
     scene.prepare_without_cookie();
     scene.observe_entry();
+    prepare_owner_after_catalog(scene, refuse_provider_storage)
+}
+
+fn prepare_owner_after_catalog(
+    scene: &mut AdmissionScene,
+    refuse_provider_storage: bool,
+) -> (SemanticAdmissionCandidate, PreparedSemanticAdmission) {
     let caller = scene.caller();
     let lane = scene.lane.as_mut().unwrap();
     let candidate = scene
@@ -52,6 +59,38 @@ fn prepare_owner(
     assert_eq!(scene.coordinator.semantic_bindings().len(), 0);
     assert_eq!(scene.coordinator.registry().instances().count(), 0);
     (candidate, prepared)
+}
+
+#[test]
+fn promotion_stage_first_candidate_rejects_divergent_h0_original_arc() {
+    let mut scene = AdmissionScene::new(Selection::Pid);
+    scene.prepare_without_cookie();
+    scene.observe_entry();
+    let (images, divergent) = scene.refresh_direct();
+    assert_eq!(images, vec![image(7)]);
+    let original = scene
+        .coordinator
+        .adapter()
+        .shared_semantic_custody(scene.caller())
+        .unwrap();
+    assert!(!Arc::ptr_eq(&original, &divergent));
+    let (candidate, prepared) = prepare_owner_after_catalog(&mut scene, false);
+    assert!(Arc::ptr_eq(&candidate.pin(), &original));
+    let (receipt, result) = scene
+        .coordinator
+        .consume_semantic_admission(candidate, prepared, None);
+    assert!(
+        Arc::ptr_eq(receipt.original_pin(), &divergent),
+        "the real H0 refresh retains its already accepted allocation"
+    );
+    assert_eq!(
+        result,
+        Err(SemanticBindingRefusal::ImageUnproven(
+            crate::discovery::native_binding::UnboundReason::ExecAmbiguous
+        )),
+        "an independently accepted same-PID H0 allocation cannot replace Inventory's original Arc"
+    );
+    assert_eq!(scene.coordinator.semantic_bindings().len(), 0);
 }
 
 #[test]

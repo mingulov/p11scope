@@ -1460,6 +1460,17 @@ impl SemanticCapture {
         Ok(report)
     }
 
+    // RED scaffold for the absent retained collection leaf. It deliberately
+    // follows today's independent collector until the real seam tests fail.
+    #[cfg(test)]
+    fn tick_collected_with(
+        &mut self,
+        io: &mut impl CaptureIo,
+        _quantum: &mut crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+    ) -> anyhow::Result<TickReport> {
+        self.tick_with(io)
+    }
+
     fn tick_with_inner(&mut self, io: &mut impl CaptureIo) -> anyhow::Result<TickReport> {
         anyhow::ensure!(
             io.domain() == Some(self.router.domain()),
@@ -1703,6 +1714,7 @@ impl SemanticCapture {
     pub(crate) fn stop(&mut self) -> TickReport {
         let mut report = TickReport::default();
         if self.stopped {
+            self.stamp_disposition(&mut report);
             return report;
         }
         self.stopped = true;
@@ -1716,6 +1728,7 @@ impl SemanticCapture {
             self.expire(image, &mut report);
         }
         self.jobs.clear();
+        self.stamp_disposition(&mut report);
         report
     }
 }
@@ -2693,15 +2706,31 @@ mod tests {
     impl ScriptIo {
         fn new(domain: NativeDomainId) -> Self {
             let path = std::env::current_exe().unwrap();
+            Self::with_paths(domain, &path, std::path::Path::new("/usr/bin/true"))
+        }
+
+        fn small(domain: NativeDomainId) -> Self {
+            Self::with_paths(
+                domain,
+                std::path::Path::new("/usr/bin/true"),
+                std::path::Path::new("/usr/bin/false"),
+            )
+        }
+
+        fn with_paths(
+            domain: NativeDomainId,
+            path: &std::path::Path,
+            sibling_path: &std::path::Path,
+        ) -> Self {
             let pins = crate::discovery::identity::test_fixture::real_scan_pin(
-                &path,
+                path,
                 None,
                 1,
                 "held-test-image",
             );
             let watched = pins.retain_inventory_target(PinnedObjectId(0)).unwrap();
             let sibling = crate::discovery::identity::test_fixture::real_scan_pin(
-                std::path::Path::new("/usr/bin/true"),
+                sibling_path,
                 None,
                 2,
                 "held-sibling-image",
@@ -3375,6 +3404,125 @@ mod tests {
         assert!(repeated.outcomes().is_empty());
         assert_eq!(repeated.allocated_below(), capture.next_token);
         assert_eq!(capture.next_token, before + 1);
+    }
+
+    fn retained_joint_quantum(
+        io: &mut ScriptIo,
+    ) -> (
+        crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+        crate::events::EventDrain<crate::events::ScriptedRecords>,
+        crate::semantics_edge::resources::SemanticResourcePool,
+    ) {
+        use crate::events::{EventDrain, EventsDomain, ScriptedRecords, record_bytes};
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        use crate::semantics_objects::journal::joint_driver::RawJointQuantum;
+        struct Fault;
+        impl crate::semantics_objects::journal::FaultEpoch for Fault {
+            fn fault_epoch(
+                &self,
+            ) -> Result<u64, crate::semantics_objects::journal::FaultReadError> {
+                Ok(0)
+            }
+        }
+        let records: Vec<_> = io
+            .records
+            .drain(..)
+            .map(|record| record_bytes(&record.base))
+            .collect();
+        let limit = records.len();
+        let events = EventsDomain::test_standin(0xef01);
+        let producers = crate::attach::SessionDrainProducers::test_pair(io.domain, events.clone());
+        let mut drain = EventDrain::over_domain(
+            ScriptedRecords::records(
+                records
+                    .into_iter()
+                    .chain([crate::events::event_bytes(&Default::default())]),
+                limit,
+            ),
+            events,
+        );
+        let pool = SemanticResourcePool::default();
+        let quantum = RawJointQuantum::collect(
+            &mut drain,
+            &p11scope_ebpf_common::object_wire::publish_object_descriptors(),
+            limit,
+            &Fault,
+            &producers,
+            |bytes| pool.reserve(bytes),
+        )
+        .unwrap_or_else(|reason| panic!("actual retained ordinary collection: {reason:?}"));
+        (quantum, drain, pool)
+    }
+
+    #[test]
+    fn joint_collected_leaf_routes_original_records_without_second_collection() {
+        let mut io = ScriptIo::small(NativeDomainId::mint());
+        let mut capture = capture(&io);
+        io.semantic_call("C_SignInit", 0, 0);
+        io.semantic_call("C_Sign", 0, 0);
+        let (mut quantum, drain, pool) = retained_joint_quantum(&mut io);
+        let held = pool.snapshot().charged_bytes;
+        // Today's collect leaf would consume this unrelated record. The new
+        // leaf must leave it queued and route only the original cursor values.
+        io.semantic_call("C_Sign", 1, 0);
+        let report = capture.tick_collected_with(&mut io, &mut quantum).unwrap();
+        assert_eq!(report.calls().count(), 2);
+        assert!(report.calls().all(|call| {
+            call.endpoint().unwrap().file_slot == 0 && matches!(call.route(), Route::Joined(_))
+        }));
+        assert_eq!(
+            report.calls().map(RoutedCall::position).collect::<Vec<_>>(),
+            vec![Some(1), Some(2)]
+        );
+        assert_eq!(report.allocated_below(), capture.next_token);
+        assert_eq!(io.records.len(), 1);
+        assert_eq!(drain.source().remaining(), 1);
+        assert_eq!(pool.snapshot().charged_bytes, held);
+    }
+
+    fn joint_collected_pending_case(expire: bool) {
+        let mut io = ScriptIo::small(NativeDomainId::mint());
+        let mut capture = capture(&io);
+        capture.limits.scans = 0;
+        io.semantic_call("C_SignInit", 0, 0);
+        let (mut quantum, drain, pool) = retained_joint_quantum(&mut io);
+        let held = pool.snapshot().charged_bytes;
+        let pending = capture.tick_collected_with(&mut io, &mut quantum).unwrap();
+        assert_eq!(capture.awaiting.len(), 1);
+        assert_eq!(pending.awaiting_floor(), Some(1));
+        assert_eq!(pending.allocated_below(), 2);
+        assert_eq!(pending.calls().count(), 0);
+        capture.limits.scans = 1;
+        io.semantic_call("C_Sign", 1, 0);
+        if expire {
+            io.now += capture.limits.pending_for;
+        }
+        let resolved = capture.tick_collected_with(&mut io, &mut quantum).unwrap();
+        assert!(capture.awaiting.is_empty());
+        assert_eq!(resolved.calls().count(), 1);
+        let call = resolved.calls().next().unwrap();
+        assert_eq!(call.position(), Some(1));
+        assert_eq!(call.endpoint().unwrap().file_slot, 0);
+        if expire {
+            assert_eq!(call.route(), Route::Unknown(UnknownReason::Unobserved));
+        } else {
+            assert!(matches!(call.route(), Route::Joined(_)));
+        }
+        assert_eq!(resolved.awaiting_floor(), None);
+        assert_eq!(resolved.allocated_below(), 2);
+        assert_eq!(io.records.len(), 1);
+        assert_eq!(drain.source().remaining(), 1);
+        assert_eq!(pool.snapshot().charged_bytes, held);
+    }
+
+    #[test]
+    fn joint_collected_leaf_pending_success_keeps_original_quantum() {
+        joint_collected_pending_case(false);
+    }
+
+    #[test]
+    fn joint_collected_leaf_pending_timeout_keeps_original_quantum() {
+        joint_collected_pending_case(true);
     }
 
     #[test]

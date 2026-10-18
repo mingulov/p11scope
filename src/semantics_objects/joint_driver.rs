@@ -12,8 +12,9 @@ use crate::attach::SessionDrainProducers;
 use crate::attach::capture::NativeDomainId;
 use crate::events::{DecodedEventRecord, EventDrain, LIVE_POLL_QUANTUM, RecordSource};
 use crate::semantics_edge::resources::{
-    OWNED_ALLOCATION_PADDING, ResourceLease, SemanticResourceRefusal,
+    OWNED_ALLOCATION_PADDING, ResourceLease, SemanticResourceRefusal, SemanticResourceReserver,
 };
+use crate::semantics_objects::ObjectSemantics;
 use p11scope_ebpf_common::MAX_DESCRIPTORS;
 use p11scope_ebpf_common::object_journal::{JournalRecord, ValidatedJournalBegin};
 use p11scope_ebpf_common::object_wire::ObjectDescriptorWire;
@@ -54,6 +55,68 @@ impl JointResourceOrigin {
 impl std::fmt::Debug for JointResourceOrigin {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("JointResourceOrigin(<private>)")
+    }
+}
+
+/// One capture's joint owner: the capture's single object model (with its
+/// retained history) plus the SAME move-only reservation ledger every
+/// publication borrows.
+///
+/// Staged H8 opens, model pending calls, staged H9 payloads and prospective
+/// key associations all take tickets from this one ledger, parked or
+/// active: the byte limit and census see every role together, so a release
+/// on one path frees allowance on the others and pended releases flush at
+/// every ledger-bearing publication. Move-only: parked/active transfer
+/// moves the whole owner by value, so no second model or ledger can exist
+/// for one capture. The staged H3 seal tick borrows the model;
+/// publications borrow the ledger. Gating transfer on genuine stopped-A
+/// completion is a separate carry; no transfer runs here.
+pub(crate) struct JointCaptureOwner {
+    model: ObjectSemantics,
+    ledger: StagingLedger,
+}
+
+impl JointCaptureOwner {
+    /// Build the capture's owner over the registry's existing pool: the
+    /// model uses policy limits and the ledger takes the pool's reserver.
+    /// The ledger's table storage stays lazy: the first charge reserves
+    /// it before allocating, so construction itself never refuses.
+    pub(crate) fn new(reserver: SemanticResourceReserver) -> Self {
+        Self {
+            model: ObjectSemantics::new(),
+            ledger: StagingLedger::with_resources(reserver),
+        }
+    }
+
+    /// The capture's one reservation ledger (read side).
+    #[cfg_attr(not(test), allow(dead_code))] // Projection-side reads arrive with the seal tick.
+    pub(crate) fn ledger(&self) -> &StagingLedger {
+        &self.ledger
+    }
+
+    /// The capture's one reservation ledger (charge side): every
+    /// ledger-bearing publication borrows this, never a second ledger.
+    pub(crate) fn ledger_mut(&mut self) -> &mut StagingLedger {
+        &mut self.ledger
+    }
+
+    /// The capture's one object model, with its retained history (read
+    /// side): seal delivery and projection borrow this identity.
+    #[cfg_attr(not(test), allow(dead_code))] // Seal delivery borrows the owner once the tick lands.
+    pub(crate) fn model(&self) -> &ObjectSemantics {
+        &self.model
+    }
+
+    /// The capture's one object model (seal-tick side).
+    #[cfg_attr(not(test), allow(dead_code))] // The staged seal tick owns the model's write side.
+    pub(crate) fn model_mut(&mut self) -> &mut ObjectSemantics {
+        &mut self.model
+    }
+}
+
+impl std::fmt::Debug for JointCaptureOwner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("JointCaptureOwner(<retained>)")
     }
 }
 

@@ -235,6 +235,11 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// Every H0-position-bearing finalizer field belongs to one Session.
     /// A different live lane cannot consume, overwrite or acknowledge it.
     semantic_finalizer: Option<semantics::SessionFinalizerState>,
+    /// The capture's joint owner: the one object model (with its retained
+    /// history) plus the SAME move-only reservation ledger every
+    /// publication below borrows. Parked/active transfer moves the whole
+    /// owner; no second model or ledger exists for one capture.
+    joint_capture: crate::semantics_objects::journal::joint_driver::JointCaptureOwner,
     /// Optional hints retain only their own identity-qualified source state.
     /// They do not supply Inventory, H0 or Detailed admission authority.
     caller_metadata: Option<crate::caller_metadata::runtime::job::MetadataLane>,
@@ -401,6 +406,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         endpoint_budget: InventoryBudget,
     ) -> Result<Self> {
         let registry = CallerRegistry::new(registry_limits);
+        let joint_capture = crate::semantics_objects::journal::joint_driver::JointCaptureOwner::new(
+            registry.semantic_storage_reserver(),
+        );
         let mut adapter = CallerAdapter::new(source, registry.semantic_storage_reserver());
         // One caller budget, enforced where incarnations are minted; the
         // registry's caller cap stands behind it as a backstop.
@@ -416,6 +424,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             binder: NativeBinder::new(BinderLimits::default()),
             semantic_bindings: semantics::SemanticBindingSet::new(),
             semantic_finalizer: None,
+            joint_capture,
             caller_metadata: None,
             refused_semantic_domains: HashSet::new(),
             pending_adjudication: BTreeMap::new(),
@@ -971,6 +980,16 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
 
     pub(crate) fn registry(&self) -> &CallerRegistry {
         &self.registry
+    }
+
+    /// The capture's joint owner (read side): tests assert the SAME
+    /// ledger a commit borrowed. Production borrows the field
+    /// directly at publication; the staged seal tick takes the model.
+    #[cfg(test)]
+    pub(crate) fn joint_capture(
+        &self,
+    ) -> &crate::semantics_objects::journal::joint_driver::JointCaptureOwner {
+        &self.joint_capture
     }
 
     /// Stages one scope-level gap (no caller, module or PID) that
@@ -5628,8 +5647,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // Keep the original handles through this actual publication call.
         let registry_applied = if let Some(recorder) = &mut self.diagnostics {
             let adapter = &self.adapter;
-            self.registry
-                .publish_with_count_observer(Some(&mut |count: CountPublication| {
+            self.registry.publish_with_count_observer(
+                Some(&mut |count: CountPublication| {
                     let mut record = DiagnosticRecord::new(DiagnosticKind::Publication);
                     record.caller = Some(count.caller.0);
                     if let Some(caller) = adapter.record(count.caller) {
@@ -5644,9 +5663,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     record.reason = Some(DiagnosticReason::ContextUnavailable);
                     record.context_unavailable = true;
                     recorder.record(record);
-                }))
+                }),
+                self.joint_capture.ledger_mut(),
+            )
         } else {
-            self.registry.publish()
+            self.registry
+                .publish_with_ledger(self.joint_capture.ledger_mut())
         };
         self.finalize_pending_counts();
         if let Some((collection, _)) = publishing_cgroup {

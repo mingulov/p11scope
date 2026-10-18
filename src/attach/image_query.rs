@@ -725,7 +725,6 @@ impl Drop for CoverageControl {
 #[cfg(test)]
 mod coverage_control_send_tests {
     use super::*;
-    use std::os::fd::{AsRawFd as _, FromRawFd as _};
     use std::os::unix::fs::MetadataExt as _;
     use std::sync::atomic::{AtomicU64, Ordering};
 

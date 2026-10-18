@@ -165,6 +165,18 @@ Use the identical independently issued schedule with diagnostics disabled and
 enabled, compare primary per-edge/API/count/loss facts, and report measured cost
 separately. Fixture/runtime changes and installed execution remain open.
 
+## Short startup-fence probe inputs
+
+The same four prebuilt files also support an explicit `probe` workload mode:
+exactly three A-only rounds,32real entry calls each, then an ordinary successful
+stop. Provider B is never loaded and no shared/fence/proof phase is invented.
+The independent native helper can check it with
+`check_fixture(directory, counted=3, shared=1, probe=True)`. Its result explicitly
+reports one physical caller/object pair,96calls and three complete per-round
+ACKs. Missing calls, foreign physical targets, wrong phases and unacknowledged
+rounds fail. This native check establishes fixture behavior, not BPF attribution
+or a startup-fence result; the short installed diagnostic probe is separate.
+
 ## Paired default-ring useful wrap
 
 The current common-ELF fixture is **not acceptance ready**. Its first installed

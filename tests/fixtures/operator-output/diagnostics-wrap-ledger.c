@@ -92,8 +92,10 @@ static int number(const char *text,unsigned long bound,unsigned long *out) {
 }
 int main(int argc,char **argv) {
     unsigned long milliseconds,counted,shared;
-    if(argc!=10||!nonce_valid(argv[6])||number(argv[7],900000,&milliseconds)||
+    if((argc!=10&&argc!=11)||!nonce_valid(argv[6])||number(argv[7],900000,&milliseconds)||
        number(argv[8],400,&counted)||number(argv[9],258,&shared))return 2;
+    int probe=argc==11;
+    if(probe&&(strcmp(argv[10],"probe")||counted!=3||shared!=1))return 2;
     uint64_t now;
     if(clock_ns(&now)||now>UINT64_MAX-milliseconds*1000000)return 1;
     deadline_ns=now+milliseconds*1000000;
@@ -122,6 +124,7 @@ int main(int argc,char **argv) {
     if(wrap_ack("ready",0))goto cleanup;
     for(unsigned round=1;round<=counted;round++)
         if(wait_command("count")||wrap_calls(&a,"a",round)||wrap_ack("a-done",round))goto cleanup;
+    if(probe) { if(wait_command("stop"))goto cleanup; goto complete; }
     if(wait_command("load-b")||wrap_acquire(argv[2],&b)||same(a.root,b.root))goto cleanup;
     for(unsigned i=0;i<SLOT_COUNT;i++) {
         Physical target;
@@ -135,6 +138,7 @@ int main(int argc,char **argv) {
     if(mapped(a.root)!=0||mapped(b.root)!=1||mapped(targets[0])!=1||wrap_ack("a-unmapped",0))goto cleanup;
     if(wait_command("fence")||wrap_calls(&b,"fence",1)||wrap_ack("fence-done",1)||
        wait_command("proof")||wrap_calls(&b,"proof",1)||wrap_ack("final-calls",1)||wait_command("stop"))goto cleanup;
+complete:
     if(wrap_row("{\"kind\":\"complete\",\"complete\":true,\"calls\":%" PRIu64 "}",calls)||wrap_ack("done",0))goto cleanup;
     terminal_written=1; result=0;
 cleanup:

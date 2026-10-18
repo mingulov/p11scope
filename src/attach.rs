@@ -80,6 +80,7 @@ mod stop_gate;
 pub(crate) use stop_gate::{StopGate, stop_gate_map_data, validate_stop_gate};
 // Task 3 Stage A: the readers are consumed by the Task 6 native seam
 // (`stage_native`, DR-T3A-1) and today by the privileged instance gates.
+pub(crate) mod host_btf;
 #[allow(dead_code)]
 pub(crate) mod image_query;
 #[allow(dead_code)]
@@ -4416,15 +4417,18 @@ impl Session {
         // `--ring-bytes` resizes the EVENTS ringbuf at load (aya rounds to a
         // page-sized power of two like libbpf); omission resolves to the
         // baked-in default, which is a no-op override of the ELF value.
-        let btf =
-            Btf::from_sys_fs().context("loading required vmlinux BTF for typed task_newtask")?;
+        // The required vmlinux BTF parse populates the process-wide
+        // host_btf cache, so no budgeted job tick pays the cold sysfs
+        // re-read, parse, or selector scan.
+        let host =
+            host_btf::shared().context("loading required vmlinux BTF for typed task_newtask")?;
         let domain = if policy.wants_instance_hooks() {
             Some(capture::NativeDomainId::try_mint()?)
         } else {
             None
         };
         let mut ebpf = load_capture_object_with_images(
-            &btf,
+            host.btf(),
             crate::run::resolve_ring_bytes(ring_bytes),
             discovery_ring_bytes(scope),
             policy.wants_instance_hooks(),
@@ -4549,7 +4553,7 @@ impl Session {
                             .program_mut(prog_name)
                             .context("program task_newtask missing from object")?
                             .try_into()?;
-                        prog.load("task_newtask", &btf)
+                        prog.load("task_newtask", host.btf())
                             .context("loading required typed task_newtask")?;
                     } else {
                         let prog: &mut UProbe = ebpf
@@ -4567,11 +4571,12 @@ impl Session {
                 }
                 SessionPreparation::LoadImagePrograms => {
                     if selected.is_some() {
-                        selected_detailed::load_bootstrap(&mut ebpf, &btf)?;
+                        selected_detailed::load_bootstrap(&mut ebpf, host.btf())?;
                     }
                     let query_refusal = match domain {
                         Some(domain) => {
-                            match image_query::ImageQueryOwner::load(&mut ebpf, &btf, domain) {
+                            match image_query::ImageQueryOwner::load(&mut ebpf, host.btf(), domain)
+                            {
                                 Ok(owner) => {
                                     image_query = Some(owner);
                                     None
@@ -4583,7 +4588,7 @@ impl Session {
                     };
                     prepared_instance = Some(InstanceTracking::prepare(
                         &mut ebpf,
-                        &btf,
+                        host.btf(),
                         policy,
                         query_refusal,
                     ));

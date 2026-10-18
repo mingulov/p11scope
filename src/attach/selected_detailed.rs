@@ -278,10 +278,7 @@ fn bootstrap(
         map.get(&0, 0)? == control,
         "selected bootstrap request readback differs"
     );
-    let btf = aya::Btf::from_sys_fs()?;
-    let pidfd_selector = btf
-        .id_by_type_name_kind("bpf_iter_attach_task", aya_obj::btf::BtfKind::Func)
-        .is_ok();
+    let pidfd_selector = super::host_btf::shared()?.supports_pidfd_iter_selector();
     let program = session
         .ebpf
         .program("p11_selected_bootstrap")

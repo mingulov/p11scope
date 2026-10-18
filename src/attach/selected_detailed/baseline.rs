@@ -340,14 +340,14 @@ fn query_native<'a>(
             "baseline original process exited"
         );
     }
-    let btf = aya::Btf::from_sys_fs()?;
+    let host = super::super::host_btf::shared()?;
     let program: &mut aya::programs::Iter = ebpf
         .program_mut("p11_inventory_image_baseline")
         .context("Inventory image baseline program unavailable")?
         .try_into()?;
     if program.fd().is_err() {
         program
-            .load("task", &btf)
+            .load("task", host.btf())
             .context("loading explicit Inventory image baseline iterator")?;
     }
     let mut requests: HashMap<_, u32, Request> = HashMap::try_from(
@@ -405,9 +405,7 @@ fn query_native<'a>(
         ctl.get(&0, 0)? == control,
         "baseline control readback differs"
     );
-    let pidfd_selector = btf
-        .id_by_type_name_kind("bpf_iter_attach_task", aya_obj::btf::BtfKind::Func)
-        .is_ok();
+    let pidfd_selector = host.supports_pidfd_iter_selector();
     let program = ebpf.program("p11_inventory_image_baseline").unwrap().fd()?;
     let link = task_link(
         program.as_fd(),

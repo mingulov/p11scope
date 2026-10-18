@@ -11,7 +11,7 @@ use crate::process::PidPin;
 use anyhow::{Context as _, Result, bail, ensure};
 use aya::maps::{Array, Map, MapData, MapType};
 use aya::programs::{ProbeKind, Program, RawTracePoint, UProbe};
-use aya::{Btf, Ebpf, EbpfLoader};
+use aya::{Ebpf, EbpfLoader};
 #[cfg(not(p11scope_small_discovery_ring))]
 use p11scope_ebpf_common::INVENTORY_DISCOVERY_BYTES;
 use p11scope_ebpf_common::{
@@ -152,7 +152,11 @@ impl PreparedInventory {
                 bail!("Inventory PID custody supplied for a non-PID scope")
             }
         };
-        let btf = Btf::from_sys_fs().context("loading required vmlinux BTF for Inventory")?;
+        // The required vmlinux BTF parse populates the process-wide
+        // host_btf cache, so no budgeted job tick pays the cold sysfs
+        // re-read, parse, or selector scan.
+        let host =
+            super::host_btf::shared().context("loading required vmlinux BTF for Inventory")?;
         let state = PreparingInventory {
             ebpf: None,
             discovery_domain: None,
@@ -164,7 +168,7 @@ impl PreparedInventory {
                     // and is not a policy for growing or renewing sessions.
                     let mut loader = EbpfLoader::new();
                     loader
-                        .btf(Some(&btf))
+                        .btf(Some(host.btf()))
                         .allow_unsupported_maps()
                         .map_max_entries("USAGE", capacity.get());
                     let bytes = match flavor {

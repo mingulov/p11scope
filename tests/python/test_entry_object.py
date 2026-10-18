@@ -86,6 +86,75 @@ def mutate(disassembly, function, pc, old, new, internal_call=False):
 
 
 class EntryObjectTests(unittest.TestCase):
+    def test_seeded_start_caller_contract(self):
+        for variant, disassembly in OBJECTS.items():
+            with self.subTest(variant=variant):
+                reports = CHECKER["seeded_start_contract"](disassembly)
+                self.assertIn("p11_entry", reports)
+                memset_name, memset_insns = instructions(variant, "memset")
+                zero_store, zero_text = next((pc, text) for pc, text in memset_insns
+                                            if text == "*(u8 *)(r5 + 0x0) = w2")
+                with self.assertRaisesRegex(RuntimeError, "memset byte-loop summary"):
+                    CHECKER["seeded_start_contract"](mutate(disassembly, memset_name, zero_store,
+                        zero_text, "*(u8 *)(r5 + 0x0) = w1"))
+                for name, report in reports.items():
+                    _, insns = instructions(variant, name)
+                    texts = dict(insns)
+                    split = CHECKER["sections"](disassembly)
+                    calls = CHECKER["D"].internal_call_targets(split["uprobe"] + "\n" + split[".text"])
+                    consumer = CHECKER["_SeedCaller"]("uprobe", name,
+                        CHECKER["D"].function_blocks(split["uprobe"])[name],
+                        {pc: target for caller, _, pc, target in calls if caller == name})
+                    facts = consumer.facts()
+                    mutations = []
+                    begin = report["constructor"]
+                    seed_arg = next((pc, text) for pc, text in reversed(insns)
+                                    if pc < begin and re.match(r"r2 (=|\+=) ", text))
+                    mutations.append((seed_arg[0], seed_arg[1], "r2 = r1", "key/seed"))
+                    aggregate_arg = next((pc, text) for pc, text in reversed(insns)
+                                         if pc < report["aggregate"] and re.match(r"r2 (=|\+=) ", text))
+                    mutations.append((aggregate_arg[0], aggregate_arg[1], "r2 = 0x0", "original scalar timestamp"))
+                    for pc, text in insns:
+                        store = CHECKER["STORE"].fullmatch(text)
+                        if not store or pc >= begin:
+                            continue
+                        width, base, sign, offset, source = store.groups()
+                        pointer = CHECKER["address"](facts.get(pc, {}), base, sign, offset)
+                        if pointer == ("stack", report["key"]+12) and width == "32":
+                            mutations.append((pc, text, text.rsplit(" = ", 1)[0]+" = 0x1", "owner key/padding"))
+                        if pointer == ("stack", report["seed"]) and width == "64":
+                            mutations.append((pc, text, text.rsplit(" = ", 1)[0]+" = 0x1", "original timestamp"))
+                    self.assertEqual(sum(reason == "owner key/padding" for _, _, _, reason in mutations), 1)
+                    self.assertEqual(sum(reason == "original timestamp" for _, _, _, reason in mutations), 1)
+                    for field in ("identity_guard", "cookie_guard", "null_guard"):
+                        pc = report[field]
+                        mutations.append((pc, texts[pc], "goto +0x0", "guard|refusal"))
+                    identity_call = next(pc for pc, target in consumer.calls.items() if target == "p11_link_current_identity")
+                    image_arg = next((pc, text) for pc, text in reversed(insns)
+                                     if pc < identity_call and text.startswith("r1 = "))
+                    mutations.append((image_arg[0], image_arg[1], "r1 = r10", "current image words"))
+                    zero_call = max(pc for pc, target in consumer.calls.items() if target == "memset" and pc < identity_call)
+                    for register, replacement, reason in (("r3", "0x10", "marker"), ("r2", "0x1", "marker")):
+                        pc, text = next((pc, text) for pc, text in reversed(insns)
+                                        if pc < zero_call and text.startswith(register+" = "))
+                        mutations.append((pc, text, register+" = "+replacement, reason))
+                    for pc, old, new, reason in mutations:
+                        with self.subTest(function=name, mutation=reason, pc=pc):
+                            with self.assertRaisesRegex(RuntimeError, "(?:seeded|aggregate) START.*("+reason+")"):
+                                CHECKER["seeded_start_contract"](mutate(disassembly, name, pc, old, new))
+                    # Turn a real pre-construction policy-mask instruction into
+                    # a genuine user-read helper. Seed fields and guards survive;
+                    # only the private-read boundary must reject this mutation.
+                    marker_call = next(pc for pc, target in consumer.calls.items() if target.endswith("object_marker_for"))
+                    pc, old = next((pc, text) for pc, text in reversed(insns)
+                                   if report["witness"] < pc < marker_call and re.fullmatch(r"r\d+ &= 0x4", text))
+                    changed = mutate(disassembly, name, pc, old, "call 0x70")
+                    pattern = rf"(?m)(^\s*{pc}:\s+)[0-9a-f]{{2}} [0-9a-f]{{2}}(?= )([^\n]*\tcall 0x70)"
+                    changed, count = re.subn(pattern, r"\g<1>85 00\g<2>", changed)
+                    self.assertEqual(count, 1)
+                    with self.assertRaisesRegex(RuntimeError, "private read before construction"):
+                        CHECKER["seeded_start_contract"](changed)
+
     def test_ia32_span_rejection_edge_is_causal(self):
         for variant in OBJECTS:
             name, insns = instructions(variant, "p11_read_ia32_arg")
@@ -840,10 +909,19 @@ class EntryObjectTests(unittest.TestCase):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--default-object", required=True, type=Path)
-    parser.add_argument("--unsafe-object", required=True, type=Path)
+    parser.add_argument("--default-object", type=Path)
+    parser.add_argument("--seeded-object", type=Path)
+    parser.add_argument("--unsafe-object", type=Path)
     args, remaining = parser.parse_known_args()
-    for variant, path in (("default", args.default_object), ("unsafe", args.unsafe_object)):
+    if args.seeded_object:
+        if args.default_object or args.unsafe_object or remaining != ["EntryObjectTests.test_seeded_start_caller_contract"]:
+            parser.error("--seeded-object requires exactly the seeded START caller test")
+        selected = (("seeded", args.seeded_object),)
+    else:
+        if not args.default_object or not args.unsafe_object:
+            parser.error("supply both --default-object and --unsafe-object")
+        selected = (("default", args.default_object), ("unsafe", args.unsafe_object))
+    for variant, path in selected:
         OBJECT_BYTES[variant] = path.read_bytes()
         OBJECTS[variant] = subprocess.run(
             ["llvm-objdump", "-dr", "--print-imm-hex", str(path)],

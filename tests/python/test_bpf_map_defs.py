@@ -401,6 +401,10 @@ class MapDefsTests(unittest.TestCase):
         func = btf.types[func_id]
         fb = elf.sections[".BTF"][0][4] + func[6]
         other = next(i for i, s in enumerate(elf.symbols) if s[0] == "p11_owner_start_get")
+        seeded = next(i for i, s in enumerate(elf.symbols) if s[0] == "p11_owner_start_begin")
+        seeded_at = sb + seeded * 24
+        seeded_name = struct.unpack_from("<I", body, seeded_at)[0]
+        seeded_func = next(n for n in btf.types[1:] if n[:2] == (12, "p11_owner_start_begin"))
         global_owner_helpers = {"p11_owner_lease", "p11_owner_refund"}
         exported = {
             name: next(i for i, s in enumerate(elf.symbols) if s[0] == name)
@@ -453,7 +457,24 @@ class MapDefsTests(unittest.TestCase):
             remove_calls.extend((row[4] + i, "H", 0xb7) for i in range(0, len(code), 8)
                                 if code[i:i+2] == b"\x85\x10")
         self.assertEqual(len(remove_calls), 4)
+        seeded_calls = []
+        seeded_row, seeded_code = elf.sections["tp_btf/task_newtask"]
+        for key, symbol in bodies.items():
+            if key[0] != elf.indices["tp_btf/task_newtask"]:
+                continue
+            for address in range(symbol[4], symbol[4] + symbol[5], 8):
+                relocation = call_relocations.get((key[0], address))
+                if relocation:
+                    kind, target = relocation
+                    immediate = struct.unpack_from("<i", seeded_code, address + 4)[0]
+                    if kind == 10 and (target[3], target[4] + (immediate + 1) * 8) == (elf.symbols[seeded][3], elf.symbols[seeded][4]):
+                        seeded_calls.append((seeded_row[4] + address, "H", 0xb7))
+        self.assertEqual(len(seeded_calls), 1)
         cases = {
+            "seeded_missing": ([(elf.sections[".strtab"][0][4] + seeded_name, "B", 0)], "missing required owner"),
+            "seeded_public": ([(seeded_at + 4, "B", 0x12)], "owner.*LOCAL"),
+            "seeded_btf_global": ([(elf.sections[".BTF"][0][4] + seeded_func[6] + 4, "I", (12 << 24) | 1)], "owner.*STATIC"),
+            "seeded_uncalled": (seeded_calls, "no reachable call boundary"),
             "public": ([(at + 4, "B", 0x12)], "owner.*LOCAL"),
             "hidden_only": ([(at + 5, "B", 2)], "owner.*LOCAL"),
             "public_healthy": ([(sb + healthy * 24 + 4, "B", 0x12)], "owner.*LOCAL"),

@@ -651,6 +651,90 @@ __attribute__((noinline)) long p11_owner_start_insert(const struct owner_start_k
     return rc;
 }
 
+/* Construct START directly in owned map storage. The zero source is larger
+ * than START, but the START map's fixed value size copies exactly 288 bytes.
+ * Final timestamp/image/marker precede subordinate allocation, so every
+ * checked side query sees the original immutable binding. The pointer never
+ * escapes an incomplete or rolled-back transaction. */
+static __always_inline void *begin_owned_start(const struct owner_start_key *key,
+                                               const struct call_start_seed *seed,
+                                               u64 aggregate_ts, u32 aggregate)
+{
+    struct owner_control *ctl = control();
+    struct thread_owner *owner = get_owner(ctl, 1);
+    u32 zero_key = 0;
+    const volatile u64 *zero;
+    unsigned char *value;
+    long rc;
+    if (!owner)
+        return (void *)0;
+    if (!start_key_valid(owner, key) || (!aggregate && (!seed || !seed->task_cookie))) {
+        count(&ctl->admission_failures);
+        release_empty(ctl, owner);
+        return (void *)0;
+    }
+    if (owner->start_count >= P11SCOPE_OWNER_SLOT_BOUND) {
+        count(&ctl->admission_failures);
+        remove_start(ctl, owner, key);
+        return (void *)0;
+    }
+    zero = owner_map_lookup(&OBJECT_ZERO, &zero_key);
+    if (!zero) {
+        bookkeeping(ctl, OWNER_OBJECT_MISMATCH);
+        release_empty(ctl, owner);
+        return (void *)0;
+    }
+    for (u32 i = 0; i < OBJECT_START_WORDS; i++) {
+        if (zero[i]) {
+            bookkeeping(ctl, OWNER_OBJECT_MISMATCH);
+            release_empty(ctl, owner);
+            return (void *)0;
+        }
+    }
+    owner->start_count++;
+    rc = owner_map_update(&START, key, (const void *)zero, 1);
+    if (rc) {
+        owner->start_count--;
+        count(&ctl->admission_failures);
+        /* Preserve the existing physical-owner NOEXIST ambiguity rule. */
+        if (owner_map_lookup(&START, key))
+            remove_start(ctl, owner, key);
+        release_empty(ctl, owner);
+        return (void *)0;
+    }
+    value = owner_map_lookup(&START, key);
+    if (!value) {
+        /* This transaction owns the newly inserted key even if readback
+         * failed. Failed deletion keeps count/lease for teardown retry. */
+        object_rollback_insert(ctl, owner, key);
+        bookkeeping(ctl, OWNER_START_ROW_MISSING);
+        return (void *)0;
+    }
+    *(u64 *)(value + OBJECT_CALL_START_TS_OFF) = aggregate ? aggregate_ts : seed->ts_ns;
+    if (!aggregate) {
+        *(u64 *)(value + OBJECT_CALL_START_IMAGE_OFF) = seed->task_cookie;
+        *(u64 *)(value + OBJECT_CALL_START_IMAGE_OFF + 8) = seed->exec_id;
+        *(u64 *)(value + OBJECT_CALL_START_MARKER_OFF) = seed->object_required;
+        if (object_side_alloc(ctl, owner, key, value))
+            return (void *)0;
+    }
+    return value;
+}
+
+__attribute__((noinline)) void *p11_owner_start_begin(const struct owner_start_key *key,
+                                                     const struct call_start_seed *seed)
+{
+    return begin_owned_start(key, seed, 0, 0);
+}
+
+/* Aggregate has no image or semantic marker. Its fixed scalar wrapper shares
+ * accounting/rollback but never mints identity or allocates a side row. */
+__attribute__((noinline)) u32 p11_owner_start_aggregate(const struct owner_start_key *key,
+                                                       u64 timestamp)
+{
+    return begin_owned_start(key, (void *)0, timestamp, 1) != (void *)0;
+}
+
 /* Validated live subordinate row, or NULL. This query validates but records
  * nothing itself, so a following retire is never blocked by the query's own
  * poison (only the shared owner lookup may record lookup failure, as on all

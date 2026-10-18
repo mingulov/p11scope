@@ -6545,47 +6545,63 @@ fn instance_epoch_native_hooks_localize_globalize_and_fault_exactly() {
 fn call_start_initializer_is_straight_line_and_caller_owned() {
     let source = read("crates/ebpf/src/main.rs");
     assert!(source.contains("#[inline(always)]\nfn record_aggregate_start("));
-    let initializer = between(
-        &source,
-        "// CALL_START_INITIALIZER_BEGIN",
-        "// CALL_START_INITIALIZER_END",
-    );
-    assert_eq!(
-        initializer
-            .matches("core::ptr::write_volatile(words.add(")
-            .count(),
-        36,
-        "CallStart's full 288 bytes need 36 explicit qword stores"
-    );
-    assert!(
-        !initializer.contains("for "),
-        "initializer must stay loop-free"
-    );
-    for index in 0..36 {
-        assert!(
-            initializer.contains(&format!(
-                "core::ptr::write_volatile(words.add({index}), 0u64);"
-            )),
-            "initializer misses qword {index}"
-        );
-    }
-
+    assert!(!source.contains("fn zero_call_start("));
     let aggregate = between(
         &source,
         "fn record_aggregate_start(",
-        "#[inline(always)]\nfn p11_entry_impl",
+        "/// The probed runtime address:",
     );
     let normal = between(
         &source,
         "fn p11_entry_impl<",
         "#[uretprobe]\npub fn p11_return",
     );
-    for caller in [aggregate, normal] {
-        assert!(caller.contains("MaybeUninit::<CallStart>::uninit()"));
-        assert!(caller.contains("zero_call_start(&mut storage)"));
-        assert!(caller.contains("storage.assume_init_mut()"));
-        assert!(!caller.contains("CallStart::default()"));
-        assert!(!caller.contains("let mut start = CallStart {"));
+    assert!(aggregate.contains("p11_owner_start_aggregate(key, helpers::bpf_ktime_get_ns())"));
+    assert_eq!(aggregate.matches("helpers::bpf_ktime_get_ns()").count(), 1);
+    assert!(!aggregate.contains("CallStart"));
+    assert!(!normal.contains("MaybeUninit::<CallStart>::uninit()"));
+    assert!(normal.contains("p11_owner_start_begin(&key, &seed)"));
+    assert_eq!(normal.matches("helpers::bpf_ktime_get_ns()").count(), 1);
+    // Native full-byte comparisons cover all288 bytes including padding:
+    // aggregate is zero except timestamp; normal binds its immutable seed.
+    // Failure/rollback controls exercise these actual production constructors.
+    let directory = tempfile::tempdir().expect("seeded START constructor fixture");
+    let binary = directory.path().join("seeded-start");
+    let compile = Command::new("clang-18")
+        .args([
+            "-O2",
+            "-g",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-pthread",
+            "-I",
+            "crates/ebpf/native",
+            "tests/fixtures/task-owner/helper_tests.c",
+            "-o",
+        ])
+        .arg(&binary)
+        .output()
+        .expect("compile actual native constructor");
+    assert!(
+        compile.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    for case in [
+        "object_seeded_start_construction",
+        "object_seeded_start_failures",
+        "object_aggregate_start_construction",
+    ] {
+        let run = Command::new(&binary)
+            .arg(case)
+            .output()
+            .expect("run constructor control");
+        assert!(
+            run.status.success(),
+            "{case}: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
     }
     for default in [
         "start.session = SESSION_NONE;",

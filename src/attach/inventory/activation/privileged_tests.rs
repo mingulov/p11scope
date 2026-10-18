@@ -50,7 +50,8 @@ pub(in crate::attach::inventory) struct OwnedFixture {
 }
 
 /// Largest owned-fixture endpoint count: the biggest controller-owned live
-/// selector N (L-T7-5 boundary at 8192; covers L-T7-3 4097 and L-T7-4 6530).
+/// selector N (L-T7-5 boundary at 8192; includes L-T7-3 4097, the historical
+/// L-T7-4 6530 control, and the actual private positive at 6531).
 /// The Inventory path is parametric in N (budget to u32 capacity to
 /// `map_max_entries`), so this fixture bound — not a map or plan limit — is
 /// what admits those cells. Anything larger is unowned and stays refused.
@@ -5895,6 +5896,8 @@ inventory_sweep_test!(
 // N is profile-independent, so these run on the default profile only. Each
 // cell calls every admitted ID and requires the exact all-ID positive set;
 // the controller checks the FD/link preflight (ordinary T7 math test) first.
+// Keep 6530 as the historical motivating control and 6531 as the actual
+// private Inventory capacity-positive selector.
 #[cfg(not(feature = "wide-detailed-2112"))]
 inventory_sweep_test!(privileged_t7_inventory_n576_lp64, 576, "inventory-t7-n576");
 #[cfg(not(feature = "wide-detailed-2112"))]
@@ -5914,6 +5917,12 @@ inventory_sweep_test!(
     privileged_t7_inventory_n6530_lp64,
     6530,
     "inventory-t7-n6530"
+);
+#[cfg(not(feature = "wide-detailed-2112"))]
+inventory_sweep_test!(
+    privileged_t7_inventory_n6531_lp64,
+    6531,
+    "inventory-t7-n6531"
 );
 /// T7 L-T7-5 boundary cell: the sweep plus an explicit out-of-envelope
 /// refusal branch. The preflight gate samples live FD occupancy against

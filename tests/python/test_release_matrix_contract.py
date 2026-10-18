@@ -20,6 +20,7 @@ RUNNER = ROOT / "scripts/qualify-release-matrix.sh"
 LIB_A = "attach::inventory::activation::privileged_tests::privileged_t7_inventory_n4097_lp64"
 LIB_B = "attach::inventory::activation::privileged_tests::privileged_t7_inventory_n6530_lp64"
 LIB_C = "attach::inventory::activation::privileged_tests::privileged_t7_inventory_n8192_boundary_lp64"
+LIB_D = "attach::inventory::activation::privileged_tests::privileged_t7_inventory_n6531_lp64"
 PID_TEST = "tests::the_pid_filter_probe_reaches_the_kernel"
 CLASSIC_MULTI = "attach::inventory::activation::privileged_tests::privileged_classic_pid_scope_forced_multi_names_the_target_or_refuses_lp64"
 CAPTURE_MULTI = "attach::inventory::capture::privileged_tests::privileged_inventory_capture_multi_pid_scope_excludes_foreign_and_reused_pid_lp64"
@@ -89,9 +90,9 @@ class MatrixContract(unittest.TestCase):
             (self.bins / name).write_text("controlled candidate " + name)
         self.candidate = candidate_receipt(self.bins, self.base / "candidate-build.json")
         self.listing = self.base / "ignored.txt"
-        self.listing.write_text(f"{LIB_A}: test\n{LIB_B}: test\n{LIB_C}: test\n\n3 tests, 0 benchmarks\n")
+        self.listing.write_text(f"{LIB_A}: test\n{LIB_B}: test\n{LIB_D}: test\n{LIB_C}: test\n\n4 tests, 0 benchmarks\n")
         self.curation = self.base / "curation.txt"
-        self.curation.write_text(f"default (0)\nlong (3, --include-long only)\n{LIB_A}\n{LIB_B}\n{LIB_C}\nskipped (0)\nverify: curation matches the binary (3 tests)\n")
+        self.curation.write_text(f"default (0)\nlong (4, --include-long only)\n{LIB_A}\n{LIB_B}\n{LIB_D}\n{LIB_C}\nskipped (0)\nverify: curation matches the binary (4 tests)\n")
         self.bm_list = self.base / "bpf-list.txt"
         self.bm_list.write_text(f"{PID_TEST}: test\n1 test, 0 benchmarks\n")
         self.contract = self.stage / "contract.json"
@@ -777,7 +778,7 @@ class Registration(unittest.TestCase):
     def test_dry_run_has_all_seven_lanes_mt12_and_exact_breadth_names(self):
         result = command(str(RUNNER), "--dry-run")
         self.assertEqual(result.returncode, 0, result.stderr)
-        for literal in ("5.15.221", "6.1.188", "6.6.157", "6.8.0-142", "6.12.111", "7.2.6", "host", "THREADS=12", LIB_A, LIB_B, LIB_C, "unready"):
+        for literal in ("5.15.221", "6.1.188", "6.6.157", "6.8.0-142", "6.12.111", "7.2.6", "host", "THREADS=12", LIB_A, LIB_B, LIB_D, LIB_C, "unready"):
             with self.subTest(literal=literal):
                 self.assertIn(literal, result.stdout)
 

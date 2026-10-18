@@ -603,6 +603,27 @@ const VISIT_LIMIT: u64 = 65_536;
 pub(super) struct CoverageControl {
     address: std::ptr::NonNull<std::sync::atomic::AtomicU64>,
 }
+
+// SAFETY: this owner uniquely retains one process-wide, page-aligned mmap;
+// moving the owner does not move that mapping. It has no Clone or raw-pointer
+// export, and cell() returns only an owner-borrowed aligned AtomicU64 reference.
+// Every access (including the kernel's shared-map updates) is atomic. A borrow
+// cannot outlive the owner or coexist with moving/dropping it. Drop is unique,
+// fails the cell before unmapping, and has no thread affinity. This permits an
+// owned CLOSED Session handoff, not shared access: deliberately no Sync impl.
+unsafe impl Send for CoverageControl {}
+
+// Compile the actual production owners, not the test lane's intentionally
+// non-Send injected I/O. Any later non-Send field must fail here, rather than
+// widening an unsafe implementation to Session or a selected wrapper.
+#[cfg(not(test))]
+const _: fn() = || {
+    fn require_send<T: Send>() {}
+    require_send::<super::Session>();
+    require_send::<super::selected_detailed::PreparedSelectedSession>();
+    require_send::<crate::inventory_semantics::selected::ProvisionalSelectedLane>();
+};
+
 impl CoverageControl {
     pub(super) fn new(ebpf: &aya::Ebpf) -> anyhow::Result<Self> {
         use anyhow::{Context as _, ensure};
@@ -698,6 +719,145 @@ impl Drop for CoverageControl {
         self.fail();
         // SAFETY: exactly the retained page mapping created in new.
         unsafe { libc::munmap(self.address.as_ptr().cast(), 4096) };
+    }
+}
+
+#[cfg(test)]
+mod coverage_control_send_tests {
+    use super::*;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::fs::MetadataExt as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A separate alias remains mapped while the real CoverageControl moves
+    /// and drops. Neither the pointer nor a borrowed reference to its mapping
+    /// is sent to the other thread; only the actual owner crosses that edge.
+    struct Observer(std::ptr::NonNull<AtomicU64>);
+
+    impl Observer {
+        fn cell(&self) -> &AtomicU64 {
+            // SAFETY: this separately owned page stays mapped through self;
+            // offset3 is the same aligned atomic cell as the production owner.
+            unsafe { &*self.0.as_ptr().add(3) }
+        }
+    }
+
+    impl Drop for Observer {
+        fn drop(&mut self) {
+            // SAFETY: this is exactly the separate mapping retained by self.
+            assert_eq!(unsafe { libc::munmap(self.0.as_ptr().cast(), 4096) }, 0);
+        }
+    }
+
+    fn shared_mapping() -> (CoverageControl, Observer, std::fs::File) {
+        // SAFETY: valid NUL-terminated name, no pointers escape the syscall.
+        let fd =
+            unsafe { libc::memfd_create(c"p11scope-coverage-move".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+        // SAFETY: memfd_create returned a fresh owned descriptor.
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        file.set_len(4096).unwrap();
+        let map = || {
+            // SAFETY: a page-sized shared mapping of this retained file; each
+            // successful result is assigned exactly one unmapping owner below.
+            let page = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    4096,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    file.as_raw_fd(),
+                    0,
+                )
+            };
+            assert_ne!(page, libc::MAP_FAILED);
+            assert_eq!((page as usize) % std::mem::align_of::<AtomicU64>(), 0);
+            std::ptr::NonNull::new(page.cast::<AtomicU64>()).unwrap()
+        };
+        (CoverageControl { address: map() }, Observer(map()), file)
+    }
+
+    #[test]
+    fn coverage_control_send_moves_real_mapping_without_relocation() {
+        let owner = CoverageControl::test_owner(false);
+        let address = owner.address.as_ptr() as usize;
+        let owner = std::thread::spawn(move || {
+            assert_eq!(owner.address.as_ptr() as usize, address);
+            assert!(!owner.enabled());
+            owner.enable().unwrap();
+            assert!(owner.enabled());
+            owner
+        })
+        .join()
+        .unwrap();
+        assert_eq!(owner.address.as_ptr() as usize, address);
+        assert!(
+            owner.enabled(),
+            "the same real atomic mapping returned to its driver"
+        );
+    }
+
+    #[test]
+    fn coverage_control_send_keeps_external_failure_sticky() {
+        let (owner, observer, _file) = shared_mapping();
+        let (ready, enabled) = std::sync::mpsc::sync_channel(0);
+        let (resume, failed) = std::sync::mpsc::sync_channel(0);
+        let worker = std::thread::spawn(move || {
+            owner.enable().unwrap();
+            ready.send(()).unwrap();
+            failed.recv().unwrap();
+            assert!(!owner.enabled());
+            assert!(
+                owner.enable().is_err(),
+                "Failed cannot re-enable after a move"
+            );
+            owner.fail();
+            owner
+        });
+        enabled.recv().unwrap();
+        assert_eq!(observer.cell().load(Ordering::SeqCst), 1);
+        // This actual shared alias performs the same atomic invalidation as an
+        // independent map writer; no scripted success or state replacement.
+        fail_coverage_with(observer.cell(), || {});
+        resume.send(()).unwrap();
+        let owner = worker.join().unwrap();
+        assert!(!owner.enabled());
+        assert_eq!(observer.cell().load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn coverage_control_send_drop_fails_then_unmaps_only_owned_alias() {
+        let (owner, observer, file) = shared_mapping();
+        let original_address = owner.address.as_ptr() as usize;
+        let inode = file.metadata().unwrap().ino().to_string();
+        owner.enable().unwrap();
+        std::thread::spawn(move || drop(owner)).join().unwrap();
+        assert_eq!(
+            observer.cell().load(Ordering::SeqCst),
+            2,
+            "the real Drop failed shared coverage before releasing its own mapping"
+        );
+        // Match this private memfd's inode as well as the original address:
+        // another test may legitimately reuse the unmapped address meanwhile.
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+        assert!(
+            !maps.lines().any(|line| {
+                let mut fields = line.split_whitespace();
+                let range = fields.next().unwrap();
+                let start = usize::from_str_radix(range.split_once('-').unwrap().0, 16).unwrap();
+                let own_file = fields
+                    .nth(3)
+                    .is_some_and(|mapped_inode| mapped_inode == inode)
+                    && line.contains("/memfd:p11scope-coverage-move");
+                start == original_address && own_file
+            }),
+            "the moved owner must unmap its original alias exactly once"
+        );
+        assert_eq!(
+            observer.cell().load(Ordering::SeqCst),
+            2,
+            "a separate retained alias remains valid after owner Drop"
+        );
     }
 }
 

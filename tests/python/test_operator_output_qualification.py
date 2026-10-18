@@ -4,6 +4,7 @@ import copy
 import json
 import os
 import subprocess
+import tempfile
 import sys
 import time
 from pathlib import Path
@@ -13,6 +14,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 ORACLE = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/oracle.py'))
 HARNESS = runpy.run_path(str(ROOT / 'scripts/qualify-operator-output.py'))
+DEMOTION = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/prepare-demotion.py'))
 
 
 def fixture():
@@ -166,6 +168,21 @@ class OracleTests(unittest.TestCase):
                                               self.ledger, self.receipt)['pass'])
 
 
+class PrebuiltDemotionControls(unittest.TestCase):
+    def test_actual_four_file_fixture_executes_ledger_and_refuses_overwrite(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            directory = Path(scratch) / 'payload'
+            result = DEMOTION['build'](directory)
+            self.assertEqual(result['topology_check'], dict(calls=10,
+                phases=dict(a=5, shared=2, fence=1, proof=2), successful_calls=6, error_calls=4))
+            self.assertEqual({row['name'] for row in result['inputs']}, set(DEMOTION['NAMES']))
+            before = {path.name: path.read_bytes() for path in directory.iterdir()}
+            with self.assertRaises(FileExistsError):
+                DEMOTION['build'](directory)
+            self.assertEqual(before, {path.name: path.read_bytes() for path in directory.iterdir()})
+            self.assertEqual(len(before), 4, 'topology control must clean its own temporary files')
+
+
 class FdControls(unittest.TestCase):
     def test_real_writer_stalls_and_drain_counts_exact_bytes(self):
         pipe = HARNESS['OutputPipe']()
@@ -214,7 +231,6 @@ class FdControls(unittest.TestCase):
             pipe.close()
 
     def test_regular_file_limit_is_real_failed_io_not_authoritative_trace(self):
-        import tempfile
         with tempfile.TemporaryFile() as output:
             result = subprocess.run([sys.executable, '-I', '-c',
                 'import os; os.write(1,b"X"*65536); os.write(1,b"Y")'],

@@ -87,3 +87,45 @@ Run output is temporary debugging material. The summary distinguishes PASS,
 FAIL and NOT_RUN; every unqualified requested cell makes the command nonzero.
 Nothing here qualifies G21 diagnostics wrap/cost, installed saved-inventory diff,
 named trace or DR37 promotion. Those have separate controlled workloads.
+
+## Prebuilt G21 demotion inputs
+
+On the development build host, the following prepares four small artifacts from
+unchanged `tests/fixtures/public-cli/demotion-ledger.c` and executes their native
+phase/ledger/topology controls without an observer or privilege:
+
+```sh
+TMPDIR=/var/tmp/p11scope-ws-tmp python3 -I \
+  tests/fixtures/operator-output/prepare-demotion.py \
+  --out /var/tmp/p11scope-ws-tmp/NEW_G21_INPUTS
+```
+
+The helper requires a new output directory, builds common/A/B/workload with the
+same flags as `DemotionWorkload::spawn`, and prints temporary arrival-check
+SHA256 values to stdout. It checks10 real calls (5A,2shared,1fence,2proof;
+6successful and4argument-error returns), distinct provider roots, one physical
+shared body and actual A-unmapped/B-retained topology. Temporary FIFO/ledger
+controls are removed; the four needed prebuilt inputs remain. Neither these
+native acknowledgements nor that ledger claim observer admission/coverage.
+
+The current Rust test always compiles these artifacts at runtime. The proposed
+small test-only interface is `P11SCOPE_DEMOTION_PREBUILT_DIR=/absolute/directory`:
+copy those four regular files into the test's existing private directory, then
+reuse unchanged FIFO, mapping, callback and ledger assertions. That interface
+is **not implemented** by this helper. The Rust owner must authorize and add it
+before the existing test is usable on prebuilt-only Fedora. No SoftHSM path
+change is needed for this owned demotion fixture.
+
+The current fixture permits one ten-call transition and caps64calls/256rows/
+110seconds; it cannot produce live default-capacity diagnostic ring wrap. A
+subsequent workload must create useful actual native reads/decisions rather
+than call the recorder directly. Exceptional records include Withheld/Pending/
+Rejected decisions as well as ownership transitions. One candidate is32physical
+targets with distinct table pairs: ledger a changed count per pair and observed
+pass, drive counted then shared-withheld phases until ordinary and exceptional
+produced totals exceed24,576 and8,192, and finish with verified B recovery.
+Actual record counts and truthful recent-history/reference status must be
+checked after export; guessed records-per-call cannot satisfy either threshold.
+Use the identical independently issued schedule with diagnostics disabled and
+enabled, compare primary per-edge/API/count/loss facts, and report measured cost
+separately. Fixture/runtime changes and installed execution remain open.

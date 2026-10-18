@@ -430,6 +430,43 @@ class ManifestControls(unittest.TestCase):
                 provider_pin.close()
 
 
+class CancellationMarkerTests(unittest.TestCase):
+    def test_only_sent_first_signal_gets_one_conservative_arrival_timestamp(self):
+        receipt = dict(signals=[], cancellation_ack_ns=None)
+        line = b'p11scope: cancel: signal 2 observed during finalization after 3 ticks\n'
+        record = HARNESS['record_cancellation_marker']
+        with mock.patch.object(record.__globals__['time'], 'monotonic_ns', side_effect=[700, 900]):
+            record(receipt, line)
+            self.assertIsNone(receipt['cancellation_ack_ns'])
+            receipt['signals'].append(dict(signal='SIGINT', t_ns=600))
+            record(receipt, line[:-1])
+            self.assertIsNone(receipt['cancellation_ack_ns'])
+            record(receipt, line)
+            self.assertEqual(receipt['cancellation_ack_ns'], 700)
+            self.assertEqual(receipt['cancellation_ack']['phase'], 'finalization')
+            record(receipt, line)
+            self.assertEqual(receipt['cancellation_ack_ns'], 700, 'final drain must retain earlier arrival bound')
+            with self.assertRaises(ValueError):
+                record(receipt, line + line)
+
+    def test_complete_live_and_late_first_signal_markers(self):
+        for phase, line in (
+                ('capture', b'p11scope: cancel: loop exited on signal 2 after 7 ticks\n'),
+                ('finalization', b'p11scope: cancel: signal 2 observed during finalization after 7 ticks\n')):
+            with self.subTest(phase=phase):
+                self.assertEqual(HARNESS['cancellation_marker'](b'other diagnostic\n' + line, 2),
+                                 dict(signal=2, ticks=7, phase=phase, channel='readable_stderr'))
+                self.assertIsNone(HARNESS['cancellation_marker'](line[:-1], 2), 'partial line is not an ACK')
+                with self.assertRaises(ValueError):
+                    HARNESS['cancellation_marker'](line, 15)
+                with self.assertRaises(ValueError):
+                    HARNESS['cancellation_marker'](line + line, 2)
+        for data in (b'', b'noise p11scope: cancel: loop exited on signal 2 after 7 ticks\n',
+                     b'p11scope: cancel: loop exited on signal 2 after -1 ticks\n',
+                     b'p11scope: cancel: signal 2 observed in worker after 7 ticks\n'):
+            self.assertIsNone(HARNESS['cancellation_marker'](data, 2))
+
+
 class FdControls(unittest.TestCase):
     def test_atomic_writer_stalls_before_pipe_byte_capacity_is_full(self):
         pipe = HARNESS['OutputPipe']()

@@ -786,6 +786,30 @@ class InventorySavedCaptureTests(unittest.TestCase):
 
 
 class ReporterControlAdapterTests(unittest.TestCase):
+    def test_partial_gate_pipe_acquisition_remains_owned_on_second_pipe_failure(self):
+        negative = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/negative_reporter_controls.py'))
+        pipe2, descriptors = os.pipe2, []
+        calls = 0
+        def fail_second(flags):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError('owned second-pipe failure')
+            return pipe2(flags)
+        try:
+            with mock.patch.object(negative['gate_pipes'].__globals__['os'], 'pipe2', fail_second):
+                with self.assertRaisesRegex(OSError, 'second-pipe'):
+                    negative['gate_pipes'](descriptors)
+            self.assertEqual(len(descriptors), 2)
+            for fd in descriptors:
+                os.fstat(fd)
+        finally:
+            for fd in descriptors:
+                os.close(fd)
+        for fd in descriptors:
+            with self.assertRaises(OSError):
+                os.fstat(fd)
+
     def test_negative_adapter_shares_original_entrypoint_signal_custody(self):
         base = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/qualify_reporter_probe.py'))
         negative = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/negative_reporter_controls.py'),

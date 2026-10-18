@@ -128,6 +128,15 @@ def send_main_sigint(observer):
     return dict(signal='SIGINT', t_ns=stamp, delivery='tgkill_original_main')
 
 
+def gate_pipes(descriptors):
+    with NATIVE.cleanup_section():
+        control, release = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+        descriptors.extend((control, release))
+        facts, notify = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+        descriptors.extend((facts, notify))
+    return control, release, facts, notify
+
+
 def cell(args, name, directory, env, binary, provider, caller_pin, helper, manifest, resolved, gate_pin):
     if name not in BASE['NEGATIVE_CELLS']:
         raise ValueError('unsupported finite negative cell')
@@ -153,25 +162,30 @@ def cell(args, name, directory, env, binary, provider, caller_pin, helper, manif
         if name == 'handlerblocked':
             if gate_pin is None:
                 raise ValueError('handler negative requires explicit held prebuilt readiness gate')
-            control, release = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
-            facts, notify = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
-            descriptors.extend((control, release, facts, notify))
+            control, release, facts, notify = gate_pipes(descriptors)
             os.set_blocking(facts, True)
             observer_env.update(LD_PRELOAD=str(gate_pin.path),
                 P11SCOPE_TEST_GATE_CONTROL_FD=str(control), P11SCOPE_TEST_GATE_FACT_FD=str(notify))
             inherited = (control, notify)
-            gate_reader = NATIVE.Reader(os.fdopen(facts, 'r'), directory / 'gate.jsonl')
-            descriptors.remove(facts)
-            readers.append(gate_reader)
+            with NATIVE.cleanup_section():
+                stream = os.fdopen(facts, 'r')
+                descriptors.remove(facts)
+                try:
+                    gate_reader = NATIVE.Reader(stream, directory / 'gate.jsonl')
+                except BaseException:
+                    stream.close()
+                    raise
+                readers.append(gate_reader)
         with (directory / 'trace.stdout').open('wb') as output:
             observer = NATIVE.spawn_owned(owners,
                 [str(binary.path), 'trace', '--pid', str(caller.pid), '--module', str(provider.path),
                  *HARNESS['manifest_arguments']([manifest], provider), '--duration', '6s',
                  '-o', str(directory / 'trace.txt')], 0, stdin=subprocess.DEVNULL, stdout=output,
                 stderr=subprocess.PIPE, text=True, env=observer_env, pass_fds=inherited, start_new_session=True)
-            for fd in inherited:
-                os.close(fd)
-                descriptors.remove(fd)
+            with NATIVE.cleanup_section():
+                for fd in inherited:
+                    os.close(fd)
+                    descriptors.remove(fd)
             receipt['observer_image'] = binary.image_receipt(dict(image=0), observer)
             errors = NATIVE.Reader(observer.popen.stderr, directory / 'observer.stderr')
             readers.append(errors)
@@ -189,7 +203,8 @@ def cell(args, name, directory, env, binary, provider, caller_pin, helper, manif
                 secondary_expected = PROBE['expected_witness'](binary, observer, PROBE['resolve_role'](binary, 'callback'))
             else:
                 NATIVE.wait_capture_started(errors)
-                worker = Worker(observer)
+                with NATIVE.cleanup_section():
+                    worker = Worker(observer)
                 secondary_expected = dict(expected, tid=worker.tid, start_time=worker.identity['start_time'])
                 worker.verify()
             secondary = start_probe(owners, readers, directory, 'secondary', helper, binary, observer, secondary_expected)

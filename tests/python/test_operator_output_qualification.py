@@ -875,6 +875,7 @@ class ReporterControlAdapterTests(unittest.TestCase):
                              signals, 160000600, diagnostics)['late_reporter_rejected'])
         for mutation in ('missing-callback', 'missing-eintr', 'foreign-gate', 'gate-clock',
                          'before-delivery', 'early-release', 'reporter-before-consumption',
+                         'pre-release-reporter', 'foreign-callback-ip',
                          'lost-callback', 'multiplex-reporter', 'callback-as-ack', 'bool-time'):
             r, c, g, release = copy.deepcopy(reporter), copy.deepcopy(callback), copy.deepcopy(gates), 160000600
             if mutation == 'missing-callback': c.pop(1)
@@ -884,6 +885,8 @@ class ReporterControlAdapterTests(unittest.TestCase):
             elif mutation == 'before-delivery': g[1]['t_ns'] = 699
             elif mutation == 'early-release': release = 149000600
             elif mutation == 'reporter-before-consumption': r[1]['t_ns'] = 160000699
+            elif mutation == 'pre-release-reporter': r[1]['t_ns'] = 160000599
+            elif mutation == 'foreign-callback-ip': c[1]['ip'] += 1
             elif mutation == 'lost-callback': c[2]['lost'] = 1
             elif mutation == 'multiplex-reporter': r[2]['time_running'] -= 1
             elif mutation == 'callback-as-ack': r = copy.deepcopy(c)

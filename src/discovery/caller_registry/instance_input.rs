@@ -655,6 +655,12 @@ impl CallerRegistry {
             .map(|record| record.feed.mode())
     }
 
+    /// Inspect accounting without granting publication authority.
+    #[cfg(test)]
+    pub(crate) fn keyuse_for_test(&self) -> &crate::semantics_key_use::KeyUseReducer {
+        &self.joint_keyuse
+    }
+
     /// Joint calls reduced S1Only-direct for lack of H8 staging.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn joint_direct_fallback(&self) -> u64 {
@@ -738,9 +744,9 @@ impl CallerRegistry {
         outcome
     }
 
-    /// Post-delivery bookkeeping: feeds leaving Joint release the
-    /// effects-tee guard; evidence that arrived under Joint
-    /// authority refreshes the retained H8 projection for capture.
+    /// Post-delivery bookkeeping: decrement the current Joint count
+    /// for feeds leaving that mode, and retain delivered Joint evidence
+    /// as the H8 projection for capture.
     #[cfg_attr(not(test), allow(dead_code))]
     fn after_joint_delivery(
         &mut self,
@@ -959,6 +965,7 @@ impl CallerRegistry {
         let feed = JointStaging::select_joint(installed.as_ref());
         if feed.mode() == FeedMode::Joint {
             self.joint_feeds = self.joint_feeds.saturating_add(1);
+            self.joint_accounting = true;
         }
         self.instance_state.records.insert(
             id,
@@ -1140,24 +1147,11 @@ impl CallerRegistry {
                 .semantics = Some(reducer);
             self.instance_state.occupied += 1;
         }
-        // Guarded H9 arm: while no Joint feed exists anywhere AND
-        // no Joint evidence was retained, the reduction below is
-        // today's plain S1Only path, untouched. Once Joint evidence
-        // exists (the retained H8 projection capture commits from),
-        // every S1 reduction tees effects into the shared key-use
-        // reducer — including after the final feed leaves Joint (N15):
-        // retained opens still need their ordinary S1 terminals, and
-        // recording definite S1 outcomes invents no object authority.
-        let joint_path = {
-            let state = self
-                .instance_state
-                .semantics
-                .get(&id)
-                .expect("retained edge");
-            state.feed.mode() == FeedMode::Joint
-                || self.joint_feeds > 0
-                || self.key_projection.is_some()
-        };
+        // Once a Joint feed activates capture-wide accounting, every
+        // S1 reduction keeps teeing its effects, including after an
+        // ordered fallback before the first seal/failure delivery.
+        // The latch carries no object or publication authority.
+        let joint_path = self.joint_accounting;
         let refused = if joint_path {
             self.reduce_with_joint_path(id, &input, ledger.as_deref_mut())
         } else {
@@ -1203,8 +1197,8 @@ impl CallerRegistry {
     /// effects into the shared key-use reducer. When staging cannot
     /// hold the order (Full, missing ledger, unsealable with queued
     /// calls), queued calls fall back in order first (C4) — reducing
-    /// a later fact direct would overtake them. Unreached while no
-    /// Joint feed exists and no Joint evidence was retained.
+    /// a later fact direct would overtake them. Unreached before the
+    /// first Joint registration activates capture-wide accounting.
     fn reduce_with_joint_path(
         &mut self,
         id: RegistryInstanceId,
@@ -1324,8 +1318,9 @@ impl CallerRegistry {
     }
 
     /// Ordered fallback for one Joint feed (C4): replay queued calls
-    /// S1-direct in original order, degrade to S1Only, release the
-    /// Joint-feeds guard. Returns fallback per-edge bound refusals.
+    /// S1-direct in original order, degrade to S1Only, decrement the
+    /// Joint count. Capture-wide accounting stays active for terminals.
+    /// Returns fallback per-edge bound refusals.
     fn fallback_joint_for_order(
         &mut self,
         id: RegistryInstanceId,
@@ -1393,12 +1388,7 @@ impl CallerRegistry {
         // Joint accounting is active for this feed's S1 (same latch
         // as the reduce path): its starts teed, so its loss
         // terminals must tee too — else opens stick active (C5).
-        let joint_accounting = {
-            let state = &self.instance_state.semantics[&id];
-            state.feed.mode() == FeedMode::Joint
-                || self.joint_feeds > 0
-                || self.key_projection.is_some()
-        };
+        let joint_accounting = self.joint_accounting;
         let state = self
             .instance_state
             .semantics
@@ -1656,15 +1646,16 @@ impl CallerRegistry {
         }
     }
 
-    /// Flush every feed's pended ledger releases (C4/C5): called at
-    /// the end of ledger-bearing publishes, before publication.
-    pub(super) fn flush_staging_releases(
+    /// Flush eligible payload and association releases at each shared
+    /// ledger contact, before new admissions and before publication.
+    pub(super) fn flush_joint_releases(
         &mut self,
         ledger: &mut crate::semantics_objects::journal::StagingLedger,
     ) {
         for record in self.instance_state.semantics.values_mut() {
             record.feed.flush_pending_releases(ledger);
         }
+        self.joint_keyuse.flush_pending_shared_releases(ledger);
     }
 
     #[cfg(test)]

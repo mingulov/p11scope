@@ -2312,17 +2312,21 @@ pub(crate) struct CallerRegistry {
     /// instance limit.
     joint_grants:
         HashMap<instance_input::InstanceKey, crate::semantics_objects::journal::BootstrapReceipt>,
-    /// Capture-wide key-use reducer (guarded H9 path): fed only
-    /// while a Joint feed exists; S1Only siblings contribute
-    /// unknown-key facts.
+    /// Capture-wide key-use reducer (guarded H9 path): once Joint
+    /// accounting starts, S1Only siblings and later terminals keep
+    /// contributing facts for the rest of the capture.
     joint_keyuse: crate::semantics_key_use::KeyUseReducer,
-    /// Prospective-association fallback ledger (N1c): mints the
-    /// key-use opens of ledger-less publishes (S1Only unit scenes),
-    /// so every open holds a ticket somewhere. Shared scenes pass
-    /// the shared owner and never touch this.
+    /// Prospective-association fallback ledger (N1c): ledger-less
+    /// publications charge their key-use opens here; ledger-bearing
+    /// publications use the supplied shared owner. Each association
+    /// returns its ticket to the owner which minted it.
     assoc_fallback: crate::semantics_objects::journal::StagingLedger,
-    /// Joint-mode feeds: the effects-tee guard (mutation side).
+    /// Current Joint-mode feeds; feeds may permanently fall back.
     joint_feeds: usize,
+    /// Capture-lifetime accounting latch, set by a true Joint
+    /// registration. Independent of object publication authority:
+    /// ordered fallback can create opens before any seal arrives.
+    joint_accounting: bool,
     /// Last H8 projection retained at seal/failure delivery: capture
     /// commits from it; `None` names `bootstrap_unavailable`.
     key_projection: Option<crate::semantics_objects::ObjectProjection>,
@@ -2389,6 +2393,7 @@ impl CallerRegistry {
             joint_keyuse: crate::semantics_key_use::KeyUseReducer::new(),
             assoc_fallback: crate::semantics_objects::journal::StagingLedger::new(),
             joint_feeds: 0,
+            joint_accounting: false,
             key_projection: None,
             joint_direct_fallback: 0,
         }
@@ -3179,6 +3184,12 @@ impl CallerRegistry {
         mut observer: Option<&mut dyn FnMut(CountPublication)>,
         mut ledger: Option<&mut crate::semantics_objects::journal::StagingLedger>,
     ) -> usize {
+        // Return eligible shared charges before staging new calls:
+        // an association ended without its ledger must not cause a
+        // false capacity refusal at the next ledger contact.
+        if let Some(ledger) = ledger.as_deref_mut() {
+            self.flush_joint_releases(ledger);
+        }
         let staged = std::mem::take(&mut self.staged);
         let applied = staged.len();
         // Per-pass activity starts quiet: advances below set it.
@@ -3216,11 +3227,10 @@ impl CallerRegistry {
                 observer.as_mut().expect("enabled count observer")(count);
             }
         }
-        // Ledger-bearing publishes settle pended staging releases
-        // (C4/C5 loss and ledger-less fallback disposal) before
-        // publication; plain publishes leave them pended.
+        // Settle both staged-payload and association releases before
+        // publication, even when this publish had no new effects.
         if let Some(ledger) = ledger {
-            self.flush_staging_releases(ledger);
+            self.flush_joint_releases(ledger);
         }
         self.reconcile_initial_semantic_coverage();
         self.facts_revision = self.facts_revision.saturating_add(1);

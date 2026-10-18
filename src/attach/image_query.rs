@@ -231,7 +231,7 @@ impl ImageQueryOwner {
     }
 }
 
-fn check_deadline(deadline: Instant) -> Result<(), ImageQueryRefusal> {
+pub(super) fn check_deadline(deadline: Instant) -> Result<(), ImageQueryRefusal> {
     if Instant::now() >= deadline {
         Err(ImageQueryRefusal::Deadline)
     } else {
@@ -241,7 +241,7 @@ fn check_deadline(deadline: Instant) -> Result<(), ImageQueryRefusal> {
 
 /// The CLOCK sample precedes the remaining-Instant sample: adding that later
 /// remaining duration to the earlier clock cannot extend the original budget.
-fn conservative_deadline(deadline: Instant) -> Result<u64, ImageQueryRefusal> {
+pub(super) fn conservative_deadline(deadline: Instant) -> Result<u64, ImageQueryRefusal> {
     let clock = super::monotonic_ns().ok_or(ImageQueryRefusal::Deadline)?;
     let remaining = deadline
         .checked_duration_since(Instant::now())
@@ -251,7 +251,7 @@ fn conservative_deadline(deadline: Instant) -> Result<u64, ImageQueryRefusal> {
         .ok_or(ImageQueryRefusal::Deadline)
 }
 
-fn task_link(
+pub(super) fn task_link(
     program: BorrowedFd<'_>,
     pidfd: Option<BorrowedFd<'_>>,
 ) -> Result<OwnedFd, ImageQueryRefusal> {
@@ -290,7 +290,7 @@ fn task_link(
     Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
 }
 
-fn read_iterator(
+pub(super) fn read_iterator(
     fd: BorrowedFd<'_>,
     deadline: Instant,
     max_bytes: usize,

@@ -275,11 +275,10 @@ def pin_provider(path):
 
 
 def _retained_identity(info):
-    # Device, inode and size only. Timestamps are excluded: unlinking the
-    # pathname (a replacement that the held FD survives) updates ctime
-    # without changing bytes, and content is re-hashed below.
+    # Unlinking a pathname updates ctime, so exclude that field while
+    # retaining mtime to reject edits whose original bytes were restored.
     return ([os.major(info.st_dev), os.minor(info.st_dev)],
-            info.st_ino, info.st_size)
+            info.st_ino, info.st_size, info.st_mtime_ns)
 
 
 def _revalidate_fd(fd, pin):
@@ -287,7 +286,7 @@ def _revalidate_fd(fd, pin):
     current = os.fstat(fd)
     wanted = pin["file_identity"]
     if _retained_identity(current) != (wanted["dev"], wanted["ino"],
-                                       wanted["size"]):
+                                       wanted["size"], wanted["mtime_ns"]):
         raise LedgerError("provider changed during workload")
     expected = wanted["size"]
     digest = hashlib.sha256()
@@ -304,6 +303,9 @@ def _revalidate_fd(fd, pin):
         raise LedgerError("provider changed during workload")
     if digest.hexdigest() != pin["sha256"]:
         raise LedgerError("provider content changed during workload")
+    if _retained_identity(os.fstat(fd)) != (
+            wanted["dev"], wanted["ino"], wanted["size"], wanted["mtime_ns"]):
+        raise LedgerError("provider changed during workload revalidation")
 
 
 def _check_pin_shape(pin):
@@ -485,7 +487,8 @@ def run_lifetimes(*, cell, lifetimes, provider, driver, output):
         for label in range(1, lifetimes + 1):
             wanted = pin["file_identity"]
             if _retained_identity(os.fstat(provider_fd)) != (
-                    wanted["dev"], wanted["ino"], wanted["size"]):
+                    wanted["dev"], wanted["ino"], wanted["size"],
+                    wanted["mtime_ns"]):
                 raise LedgerError("provider changed during workload")
             # Held custody: the Popen handle (never a bare PID) owns signals
             # and reaping. The row pid must equal this held child's pid.

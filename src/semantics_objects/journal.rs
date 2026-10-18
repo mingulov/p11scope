@@ -2120,9 +2120,6 @@ impl JournalAuditReceipt {
         if self.counter_error {
             return Err(JournalGap::CounterUnprovable);
         }
-        if self.resource_refused {
-            return Err(JournalGap::ResourceUnavailable);
-        }
         if self.malformed_delta != 0 {
             return Err(JournalGap::Malformed);
         }
@@ -2162,6 +2159,12 @@ impl JournalAuditReceipt {
                     return Err(JournalGap::H3Pending);
                 }
             }
+        }
+        // Resource-only refusal may fall back through a complete H3 stream.
+        // It must never downgrade genuine native loss or H3 exhaustion/loss
+        // into fallback, nor consume a route-pending quantum as complete.
+        if self.resource_refused {
+            return Err(JournalGap::ResourceUnavailable);
         }
         if self.closure_generation != current_closure {
             return Err(JournalGap::ClosureStale);
@@ -4735,6 +4738,110 @@ pub(crate) mod tests {
     pub(crate) const FLAGS: u64 = 0x7070_7070_7070_7070;
     pub(crate) const ENTRY_NS: u64 = 0x3030_3030_3030_3030;
     const ENTRY_IP: u64 = 0x4040_4040_4040_4040;
+
+    fn resource_audit(h3: H3DispositionEvidence) -> JournalAuditReceipt {
+        JournalAuditReceipt {
+            fault_before: 7,
+            fault_after: 7,
+            fault_error: None,
+            malformed_delta: 0,
+            discarded_delta: 0,
+            counter_error: false,
+            resource_refused: true,
+            h3,
+            h0_below: 8,
+            closure_generation: 1,
+            drain_domain: None,
+        }
+    }
+
+    #[test]
+    fn object_journal_resource_audit_never_masks_actual_loss_or_exhaustion() {
+        use crate::semantics_key_use::{SealFailureDisposition, disposition_of};
+        let clean = || H3DispositionEvidence::Clean {
+            staged_max: 7,
+            pending_floor: None,
+        };
+        for resource_refused in [false, true] {
+            for (h3, seal_epoch, expected) in [
+                (clean(), Ok(8), JournalGap::FaultChanged),
+                (
+                    clean(),
+                    Err(FaultReadError::Unreadable),
+                    JournalGap::FaultUnreadable,
+                ),
+                (
+                    clean(),
+                    Err(FaultReadError::Saturated),
+                    JournalGap::FaultSaturated,
+                ),
+                (
+                    H3DispositionEvidence::StagedLoss { barrier: 7 },
+                    Ok(7),
+                    JournalGap::H3Loss,
+                ),
+                (
+                    H3DispositionEvidence::Exhausted,
+                    Ok(7),
+                    JournalGap::H3Exhausted,
+                ),
+            ] {
+                let mut audit = resource_audit(h3);
+                audit.resource_refused = resource_refused;
+                assert_eq!(audit.check(None, 0, 1, &seal_epoch), Err(expected));
+                assert_eq!(
+                    disposition_of(expected),
+                    SealFailureDisposition::HistoryLoss
+                );
+            }
+            for expected in [
+                JournalGap::Malformed,
+                JournalGap::Discarded,
+                JournalGap::CounterUnprovable,
+            ] {
+                let mut audit = resource_audit(clean());
+                audit.resource_refused = resource_refused;
+                match expected {
+                    JournalGap::Malformed => audit.malformed_delta = 1,
+                    JournalGap::Discarded => audit.discarded_delta = 1,
+                    JournalGap::CounterUnprovable => audit.counter_error = true,
+                    _ => unreachable!(),
+                }
+                assert_eq!(audit.check(None, 0, 1, &Ok(7)), Err(expected));
+                assert_eq!(
+                    disposition_of(expected),
+                    SealFailureDisposition::HistoryLoss
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn object_journal_resource_audit_fallback_requires_complete_h3() {
+        use crate::semantics_key_use::{SealFailureDisposition, disposition_of};
+        let clean = resource_audit(H3DispositionEvidence::Clean {
+            staged_max: 7,
+            pending_floor: None,
+        });
+        let reason = clean.check(None, 0, 1, &Ok(7)).unwrap_err();
+        assert_eq!(reason, JournalGap::ResourceUnavailable);
+        assert_eq!(disposition_of(reason), SealFailureDisposition::Fallback);
+        for h3 in [
+            H3DispositionEvidence::Clean {
+                staged_max: 6,
+                pending_floor: None,
+            },
+            H3DispositionEvidence::Clean {
+                staged_max: 7,
+                pending_floor: Some(7),
+            },
+        ] {
+            let pending = resource_audit(h3);
+            let reason = pending.check(None, 0, 1, &Ok(7)).unwrap_err();
+            assert_eq!(reason, JournalGap::H3Pending);
+            assert_eq!(disposition_of(reason), SealFailureDisposition::Retry);
+        }
+    }
 
     fn put_u16(bytes: &mut [u8], offset: usize, value: u16) {
         bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());

@@ -12,9 +12,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             if !self.exit_clocks_comparable {
                 self.binder.invalidate_metadata_clock();
             }
-            self.caller_metadata = Some(MetadataLane::try_new(epoch).map_err(|reason| {
-                anyhow::anyhow!("caller metadata initialization refused: {reason:?}")
-            })?);
+            self.caller_metadata =
+                Some(MetadataLane::try_new(epoch).unwrap_or_else(MetadataLane::unavailable));
         }
         Ok(())
     }

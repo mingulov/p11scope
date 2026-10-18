@@ -45,8 +45,8 @@ actual product sink timeouts. A4096-byte atomic write can stall behind a169-byte
 prefix in the4096-byte pipe; byte occupancy need not equal capacity. The harness
 retains that writer only as a readiness witness, closes it at bounded observer
 completion, and measures cleanup without waiting for EOF. The independent
-regression proves a real child blocked at this partial occupancy and completes
-it by draining the pipe; an empty/nonstalled pipe cannot qualify pressure.
+regression proves an actual atomic write returns EAGAIN at this partial occupancy
+and succeeds after draining the pipe; an empty/nonstalled pipe cannot qualify pressure.
 
 The actual observer's held map FDs are inspected through `/proc/PID/fdinfo` and
 `bpftool -j map show id`; EVENTS must really be a ringbuf with the selected

@@ -1149,6 +1149,16 @@ impl ObjectSemantics {
         self.state.begin_with_effects(origin, ledger)
     }
 
+    fn begin_with_resource(
+        &mut self,
+        origin: OriginFact,
+        ledger: &mut journal::StagingLedger,
+        resource: &journal::ExistingReservation,
+    ) -> (Result<CallToken, ObjectGap>, ObjectEffects) {
+        self.state
+            .begin_with_resource(origin, ledger, Some(resource))
+    }
+
     /// Stage one matched completion privately; publishes no object claim.
     pub(crate) fn complete(
         &mut self,

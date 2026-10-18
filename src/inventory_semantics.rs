@@ -2630,6 +2630,7 @@ mod terminal_drain_tests {
                     let routed = RoutedCall::scripted(
                         self.domain,
                         crate::events::DecodedEventRecord {
+                            joint_resource: None,
                             base: crate::semantic_capture::event_record_with_routing(
                                 Event {
                                     slot: 0,

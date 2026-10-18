@@ -141,7 +141,8 @@ pub(crate) fn disposition_of(gap: JournalGap) -> SealFailureDisposition {
         | H3Loss | H3Exhausted | Discarded => HistoryLoss,
         H3Pending | BoundNotReady | FrontierRegression => Retry,
         ModelRefused | BootstrapMismatch | ClosureStale | DomainTainted | ImageTainted
-        | DomainEnded | AdapterInvalidated | Stopped | DrainMismatch | CutExhausted => Fallback,
+        | DomainEnded | AdapterInvalidated | Stopped | DrainMismatch | CutExhausted
+        | ResourceUnavailable => Fallback,
     }
 }
 
@@ -152,6 +153,8 @@ struct StagedCall {
     facts: SemanticCall,
     origin: EffectOrigin,
     position: u64,
+    resource_native: Option<crate::attach::capture::NativeDomainId>,
+    resource_origin: Option<crate::semantics_objects::journal::StagedResourceOrigin>,
 }
 
 impl StagedCall {
@@ -162,6 +165,15 @@ impl StagedCall {
         size_of::<Self>() as u64
             + self.facts.function.capacity() as u64
             + self.origin.function.capacity() as u64
+    }
+
+    fn release(self, ledger: &mut crate::semantics_objects::journal::StagingLedger) {
+        let (native, position, bytes) = (self.resource_native, self.position, self.charged_bytes());
+        drop(self);
+        match native {
+            Some(native) => ledger.release_collected(native, position),
+            None => ledger.release(position, bytes),
+        }
     }
 }
 
@@ -202,7 +214,7 @@ pub(crate) struct JointStaging {
     /// (C4): flushed on the next ledger contact. At most one
     /// fallback per feed (feeds never re-enter Joint), so bounded by
     /// [`JOINT_STAGING_CAPACITY`].
-    pending_releases: Vec<(u64, u64)>,
+    pending_releases: Vec<(Option<crate::attach::capture::NativeDomainId>, u64, u64)>,
 }
 
 impl std::fmt::Debug for JointStaging {
@@ -337,6 +349,32 @@ impl JointStaging {
         position: u64,
         ledger: &mut crate::semantics_objects::journal::StagingLedger,
     ) -> Result<(), StagingRefusal> {
+        self.stage_inner(facts, origin, position, None, None, ledger)
+    }
+
+    #[allow(clippy::too_many_arguments)] // Opaque resource provenance accompanies the existing admitted payload.
+    pub(crate) fn stage_collected(
+        &mut self,
+        facts: SemanticCall,
+        origin: EffectOrigin,
+        position: u64,
+        native: crate::attach::capture::NativeDomainId,
+        resource: Option<crate::semantics_objects::journal::joint_driver::JointResourceOrigin>,
+        ledger: &mut crate::semantics_objects::journal::StagingLedger,
+    ) -> Result<(), StagingRefusal> {
+        self.stage_inner(facts, origin, position, Some(native), resource, ledger)
+    }
+
+    #[allow(clippy::too_many_arguments)] // Marked legacy fixtures and the collected path share all replay checks.
+    fn stage_inner(
+        &mut self,
+        facts: SemanticCall,
+        origin: EffectOrigin,
+        position: u64,
+        native: Option<crate::attach::capture::NativeDomainId>,
+        resource: Option<crate::semantics_objects::journal::joint_driver::JointResourceOrigin>,
+        ledger: &mut crate::semantics_objects::journal::StagingLedger,
+    ) -> Result<(), StagingRefusal> {
         // Ledger contact flushes pended releases first (C4).
         self.flush_pending_releases(ledger);
         if self.mode != FeedMode::Joint {
@@ -361,20 +399,28 @@ impl JointStaging {
         if self.staged.len() >= JOINT_STAGING_CAPACITY {
             return Err(StagingRefusal::Full);
         }
-        let staged = StagedCall {
+        let mut staged = StagedCall {
             facts,
             origin,
             position,
+            resource_native: native,
+            resource_origin: None,
         };
-        ledger
-            .charge(position, staged.charged_bytes())
-            .map_err(|refusal| {
-                use crate::semantics_objects::journal::LedgerRefusal::*;
-                match refusal {
-                    Full => StagingRefusal::Full,
-                    ReplayRefused => StagingRefusal::ReplayRefused,
-                }
-            })?;
+        let charged = match native {
+            Some(native) => ledger
+                .charge_collected(native, position, staged.charged_bytes(), resource.as_ref())
+                .map(Some),
+            None => ledger
+                .charge(position, staged.charged_bytes())
+                .map(|_| None),
+        };
+        staged.resource_origin = charged.map_err(|refusal| {
+            use crate::semantics_objects::journal::LedgerRefusal::*;
+            match refusal {
+                Full => StagingRefusal::Full,
+                ReplayRefused => StagingRefusal::ReplayRefused,
+            }
+        })?;
         self.staged.push_back(staged);
         Ok(())
     }
@@ -468,36 +514,45 @@ impl JointStaging {
         }
         self.mark_consumed(settled[0].ticket);
         let head = self.staged.pop_front().expect("head verified above");
-        ledger.release(head.position, head.charged_bytes());
         self.frontier = self.frontier.max(head.position);
         let receipts = keyuse.receipts_for_call(seal, &settled[0], model, head.position);
         // The seal's retirements already applied above (H9 §66),
         // before this replay: a terminal the replay emits can never
         // complete a binding this seal just unproved.
-        let mut tee = KeyUseTee {
-            outer: sink,
-            keyuse,
-            instance,
-            shared: Some(&mut *ledger),
-            fallback: assoc_fallback,
+        let outcome = {
+            let mut tee = KeyUseTee {
+                outer: sink,
+                keyuse,
+                instance,
+                shared: Some(&mut *ledger),
+                fallback: assoc_fallback,
+                source: head.resource_origin.as_ref(),
+            };
+            match reducer.observe_joint_with_resources(
+                &head.facts,
+                &head.origin,
+                &receipts,
+                &mut tee,
+            ) {
+                Ok(refused) => {
+                    self.reduced = self.reduced.saturating_add(1);
+                    (SealApplyOutcome::ReplayedOne, refused)
+                }
+                Err(_) => {
+                    // H3 resource refusal (N14): the S1 growth doesn't
+                    // fit. Invalidate live S1 with terminals teed (opens
+                    // close as Unknown, like S1Only exhaustion), dispose
+                    // the un-replayable head as history (claim already
+                    // consumed above), and keep
+                    // the feed Joint for later seals.
+                    reducer.invalidate_with_effects(&mut tee);
+                    self.history_disposed = self.history_disposed.saturating_add(1);
+                    (SealApplyOutcome::ResourceRefused, 0)
+                }
+            }
         };
-        match reducer.observe_joint_with_resources(&head.facts, &head.origin, &receipts, &mut tee) {
-            Ok(refused) => {
-                self.reduced = self.reduced.saturating_add(1);
-                (SealApplyOutcome::ReplayedOne, refused)
-            }
-            Err(_) => {
-                // H3 resource refusal (N14): the S1 growth doesn't
-                // fit. Invalidate live S1 with terminals teed (opens
-                // close as Unknown, like S1Only exhaustion), dispose
-                // the un-replayable head as history (ticket already
-                // released, claim already consumed above), and keep
-                // the feed Joint for later seals.
-                reducer.invalidate_with_effects(&mut tee);
-                self.history_disposed = self.history_disposed.saturating_add(1);
-                (SealApplyOutcome::ResourceRefused, 0)
-            }
-        }
+        head.release(ledger);
+        outcome
     }
 
     /// Apply one seal failure: real loss invalidates live operation
@@ -624,8 +679,11 @@ impl JointStaging {
         &mut self,
         ledger: &mut crate::semantics_objects::journal::StagingLedger,
     ) {
-        for (ticket, bytes) in self.pending_releases.drain(..) {
-            ledger.release(ticket, bytes);
+        for (native, ticket, bytes) in self.pending_releases.drain(..) {
+            match native {
+                Some(native) => ledger.release_collected(native, ticket),
+                None => ledger.release(ticket, bytes),
+            }
         }
     }
 
@@ -648,8 +706,10 @@ impl JointStaging {
             }
             let head = self.staged.pop_front().expect("front verified above");
             let bytes = head.charged_bytes();
-            self.release_or_pend(ledger.as_deref_mut(), head.position, bytes);
-            self.frontier = self.frontier.max(head.position);
+            let (position, native) = (head.position, head.resource_native);
+            drop(head);
+            self.release_or_pend(ledger.as_deref_mut(), position, bytes, native);
+            self.frontier = self.frontier.max(position);
             self.history_disposed = self.history_disposed.saturating_add(1);
             disposed += 1;
         }
@@ -663,10 +723,14 @@ impl JointStaging {
         ledger: Option<&mut crate::semantics_objects::journal::StagingLedger>,
         position: u64,
         bytes: u64,
+        native: Option<crate::attach::capture::NativeDomainId>,
     ) {
         match ledger {
-            Some(ledger) => ledger.release(position, bytes),
-            None => self.pending_releases.push((position, bytes)),
+            Some(ledger) => match native {
+                Some(native) => ledger.release_collected(native, position),
+                None => ledger.release(position, bytes),
+            },
+            None => self.pending_releases.push((native, position, bytes)),
         }
     }
 
@@ -717,6 +781,7 @@ impl JointStaging {
             instance,
             shared,
             fallback,
+            source: None,
         };
         reducer.invalidate_with_effects(&mut tee);
     }
@@ -735,7 +800,9 @@ impl JointStaging {
         while let Some(call) = self.staged.pop_front() {
             let bytes = call.charged_bytes();
             let position = call.position;
-            self.release_or_pend(ledger.as_deref_mut(), position, bytes);
+            let native = call.resource_native;
+            drop(call);
+            self.release_or_pend(ledger.as_deref_mut(), position, bytes, native);
             self.frontier = self.frontier.max(position);
             self.history_disposed = self.history_disposed.saturating_add(1);
             disposed += 1;
@@ -766,27 +833,37 @@ impl JointStaging {
         while let Some(head) = self.staged.pop_front() {
             let bytes = head.charged_bytes();
             let position = head.position;
-            self.release_or_pend(ledger.as_deref_mut(), position, bytes);
+            let native = head.resource_native;
             self.frontier = self.frontier.max(position);
-            let mut tee = KeyUseTee {
-                outer: &mut *sink,
-                keyuse: &mut *keyuse,
-                instance,
-                shared: ledger.as_deref_mut(),
-                fallback: assoc_fallback.as_deref_mut(),
+            let failed = {
+                let mut tee = KeyUseTee {
+                    outer: &mut *sink,
+                    keyuse: &mut *keyuse,
+                    instance,
+                    shared: ledger.as_deref_mut(),
+                    fallback: assoc_fallback.as_deref_mut(),
+                    source: head.resource_origin.as_ref(),
+                };
+                match reducer.observe_joint_with_resources(&head.facts, &head.origin, &[], &mut tee)
+                {
+                    Ok(head_refused) => {
+                        refused = refused.saturating_add(head_refused);
+                        self.reduced = self.reduced.saturating_add(1);
+                        replayed += 1;
+                        false
+                    }
+                    Err(_) => {
+                        reducer.invalidate_with_effects(&mut tee);
+                        self.history_disposed = self.history_disposed.saturating_add(1);
+                        true
+                    }
+                }
             };
-            match reducer.observe_joint_with_resources(&head.facts, &head.origin, &[], &mut tee) {
-                Ok(head_refused) => {
-                    refused = refused.saturating_add(head_refused);
-                    self.reduced = self.reduced.saturating_add(1);
-                    replayed += 1;
-                }
-                Err(_) => {
-                    reducer.invalidate_with_effects(&mut tee);
-                    self.history_disposed = self.history_disposed.saturating_add(1);
-                    self.drain_staged(ledger);
-                    break;
-                }
+            drop(head);
+            self.release_or_pend(ledger.as_deref_mut(), position, bytes, native);
+            if failed {
+                self.drain_staged(ledger);
+                break;
             }
         }
         (replayed, refused)
@@ -1313,8 +1390,19 @@ impl KeyUseReducer {
         &mut self,
         instance: RegistryInstanceId,
         effect: &OperationEffect,
+        shared: Option<&mut crate::semantics_objects::journal::StagingLedger>,
+        fallback: Option<&mut crate::semantics_objects::journal::StagingLedger>,
+    ) {
+        self.observe_effect_from_stage(instance, effect, shared, fallback, None);
+    }
+
+    fn observe_effect_from_stage(
+        &mut self,
+        instance: RegistryInstanceId,
+        effect: &OperationEffect,
         mut shared: Option<&mut crate::semantics_objects::journal::StagingLedger>,
         mut fallback: Option<&mut crate::semantics_objects::journal::StagingLedger>,
+        source: Option<&crate::semantics_objects::journal::StagedResourceOrigin>,
     ) {
         // Ledger contact flushes pended shared releases first (N1c,
         // C4-style): tickets closed while the shared ledger was
@@ -1362,7 +1450,10 @@ impl KeyUseReducer {
                 };
                 let assoc_bytes = size_of::<OpenKeyUse>() as u64
                     + (resolved.len() * size_of::<OpenAssoc>()) as u64;
-                let ticket = match ledger.mint_keyassoc(assoc_bytes) {
+                let ticket = match ledger.mint_keyassoc_from_stage(
+                    assoc_bytes,
+                    if ticket_shared { source } else { None },
+                ) {
                     Ok(ticket) => ticket,
                     Err(_) => {
                         self.refuse(key, instance, category, origin.ts_ns);
@@ -1408,21 +1499,22 @@ impl KeyUseReducer {
             } => {
                 let key = (instance, *id);
                 if let Some(open) = self.open.remove(&key) {
+                    let (ticket, ticket_shared) = (open.ticket, open.ticket_shared);
+                    self.close_open(open, *outcome);
                     // The ticket returns to its minting ledger; a
                     // shared ticket closed without shared contact
                     // pends for the next one (flushed above), never
                     // leaks.
-                    if open.ticket_shared {
+                    if ticket_shared {
                         match shared {
-                            Some(ledger) => ledger.release_keyassoc(open.ticket),
-                            None => self.pending_shared_releases.push(open.ticket),
+                            Some(ledger) => ledger.release_keyassoc(ticket),
+                            None => self.pending_shared_releases.push(ticket),
                         }
                     } else if let Some(ledger) = fallback {
-                        ledger.release_keyassoc(open.ticket);
+                        ledger.release_keyassoc(ticket);
                     } else {
                         debug_assert!(false, "fallback ticket needs its ledger");
                     }
-                    self.close_open(open, *outcome);
                     return;
                 }
                 if let Some(refused) = self.refused.remove(&key) {
@@ -1855,6 +1947,7 @@ pub(crate) struct KeyUseTee<'a, S: OperationSink> {
     /// present, else the scene fallback; ends release to the minter.
     shared: Option<&'a mut crate::semantics_objects::journal::StagingLedger>,
     fallback: Option<&'a mut crate::semantics_objects::journal::StagingLedger>,
+    source: Option<&'a crate::semantics_objects::journal::StagedResourceOrigin>,
 }
 
 impl<'a, S: OperationSink> KeyUseTee<'a, S> {
@@ -1874,6 +1967,7 @@ impl<'a, S: OperationSink> KeyUseTee<'a, S> {
             instance,
             shared,
             fallback,
+            source: None,
         }
     }
 }
@@ -1882,11 +1976,12 @@ impl<S: OperationSink> OperationSink for KeyUseTee<'_, S> {
     const WANTS_EFFECTS: bool = true;
 
     fn emit(&mut self, effect: OperationEffect) {
-        self.keyuse.observe_effect(
+        self.keyuse.observe_effect_from_stage(
             self.instance,
             &effect,
             self.shared.as_deref_mut(),
             self.fallback.as_deref_mut(),
+            self.source,
         );
         self.outer.emit(effect);
     }

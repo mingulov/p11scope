@@ -294,7 +294,8 @@ pub(crate) const MAX_UNSETTLED_STAGED: usize = 1_024;
 
 #[path = "journal/ledger.rs"]
 mod ledger;
-pub(crate) use ledger::{LedgerRefusal, StagingLedger};
+pub(in crate::semantics_objects) use ledger::ExistingReservation;
+pub(crate) use ledger::{LedgerRefusal, StagedResourceOrigin, StagingLedger};
 
 // ---------------------------------------------------------------------------
 // Sealed primitives: only the adapter mints these
@@ -545,6 +546,9 @@ pub(crate) enum JournalGap {
     /// A cumulative reader counter regressed or saturated; the lost
     /// history bound cannot be established from this audit.
     CounterUnprovable,
+    /// Resource custody could not retain an original invocation or a
+    /// required physical role. This is separate from malformed wire/loss.
+    ResourceUnavailable,
     H3Pending,
     H3Loss,
     AdapterInvalidated,
@@ -622,6 +626,8 @@ struct OpenEntry {
     converted_ticket: Option<CallToken>,
     converted_for: Option<JournalDomainKey>,
     end_converted: bool,
+    /// Resource-only lineage from this exact retained native invocation.
+    raw_resource: Option<ledger::ExistingReservation>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -742,6 +748,9 @@ pub(crate) struct JournalAdapter {
     /// associations all take tickets from this ledger. H9 borrows
     /// it per call through [`ledger`](Self::ledger_mut).
     ledger: StagingLedger,
+    /// Frozen resource-custody Session pair. This binds no semantic drain,
+    /// closure, key, birth or H0 authority; those retain their real minters.
+    resource_producers: Option<crate::attach::SessionDrainProducers>,
 }
 
 impl JournalAdapter {
@@ -773,6 +782,7 @@ impl JournalAdapter {
             stopped: false,
             closure_generation: 0,
             ledger,
+            resource_producers: None,
         }
     }
 
@@ -785,6 +795,39 @@ impl JournalAdapter {
     /// the key-use reducer borrow it per call.
     pub(crate) fn ledger_mut(&mut self) -> &mut StagingLedger {
         &mut self.ledger
+    }
+
+    /// Remove actual retained values before refunding their physical role.
+    /// The fixed ledger bounds this scan; collecting keys never allocates.
+    fn remove_open_where(&mut self, mut remove: impl FnMut(&JournalNativeKey, &OpenEntry) -> bool) {
+        let mut keys = [(0, 0); MAX_UNSETTLED_STAGED];
+        let mut count = 0;
+        for (key, entry) in &self.open {
+            if remove(key, entry) {
+                keys[count] = *key;
+                count += 1;
+            }
+        }
+        for key in &keys[..count] {
+            let ordinal = self.open.remove(key).expect("retained key").begin_ordinal;
+            self.ledger.release_h8open(ordinal);
+        }
+    }
+
+    fn bind_resource_producers(
+        &mut self,
+        producers: &crate::attach::SessionDrainProducers,
+    ) -> bool {
+        match &self.resource_producers {
+            Some(retained) => {
+                retained.native_domain() == producers.native_domain()
+                    && retained.events_id() == producers.events_id()
+            }
+            None => {
+                self.resource_producers = Some(producers.clone());
+                true
+            }
+        }
     }
 
     /// The current consumption frontier: the highest ordinal consumed, in
@@ -810,6 +853,14 @@ impl JournalAdapter {
     /// corroborate an open key's synchronous return; journal records match
     /// terminally against retained wire truth.
     pub(crate) fn ingest_any(&mut self, item: JournalIngestItem) -> JournalDisposition {
+        self.ingest_any_from_raw(item, None)
+    }
+
+    fn ingest_any_from_raw(
+        &mut self,
+        item: JournalIngestItem,
+        resource: Option<ledger::ExistingReservation>,
+    ) -> JournalDisposition {
         let Some(next) = self.consumed_through.checked_add(1) else {
             self.invalidated = true;
             return JournalDisposition::Refused;
@@ -866,7 +917,14 @@ impl JournalAdapter {
         }
         match item {
             JournalIngestItem::Journal(record) => {
-                self.ingest(AuditedJournalRecord::collected(ordinal, record))
+                if let JournalRecord::Begin(begin) = record
+                    && !self.stopped
+                    && !self.invalidated
+                {
+                    self.ingest_begin(next, begin, resource)
+                } else {
+                    self.ingest(AuditedJournalRecord::collected(ordinal, record))
+                }
             }
             JournalIngestItem::Ordinary(decoded) => self.ingest_ordinary(next, &decoded.base.event),
         }
@@ -913,7 +971,7 @@ impl JournalAdapter {
             return JournalDisposition::Refused;
         }
         match record.record {
-            JournalRecord::Begin(begin) => self.ingest_begin(record.ordinal.0, begin),
+            JournalRecord::Begin(begin) => self.ingest_begin(record.ordinal.0, begin, None),
             JournalRecord::End(end) => self.ingest_end(record.ordinal.0, end),
             JournalRecord::Abandon(abandon) => self.ingest_abandon(record.ordinal.0, abandon),
         }
@@ -923,7 +981,12 @@ impl JournalAdapter {
         (begin.image_cookie(), begin.image_exec())
     }
 
-    fn ingest_begin(&mut self, ordinal: u64, begin: ValidatedJournalBegin) -> JournalDisposition {
+    fn ingest_begin(
+        &mut self,
+        ordinal: u64,
+        begin: ValidatedJournalBegin,
+        resource: Option<ledger::ExistingReservation>,
+    ) -> JournalDisposition {
         let key = (begin.thread(), begin.sequence());
         let image = Self::image_of_begin(&begin);
         if self.is_tainted(image) {
@@ -987,11 +1050,17 @@ impl JournalAdapter {
         // One shared reservation owner (N1c): the open begin takes
         // its ticket before it lands. A full shared census refuses
         // exactly like a full open table.
-        if self
-            .ledger
-            .charge_h8open(ordinal, size_of::<OpenEntry>() as u64)
-            .is_err()
-        {
+        let charged = match &resource {
+            Some(reservation) => self.ledger.charge_h8open_from_raw(
+                ordinal,
+                size_of::<OpenEntry>() as u64,
+                reservation,
+            ),
+            None => self
+                .ledger
+                .charge_h8open(ordinal, size_of::<OpenEntry>() as u64),
+        };
+        if charged.is_err() {
             return self.refuse_begin(ordinal, &begin, image);
         }
         self.open.insert(
@@ -1008,6 +1077,7 @@ impl JournalAdapter {
                 converted_ticket: None,
                 converted_for: None,
                 end_converted: false,
+                raw_resource: resource,
             },
         );
         JournalDisposition::BeginAdmitted
@@ -1210,14 +1280,7 @@ impl JournalAdapter {
         } else {
             self.tainted_images.insert(image);
         }
-        let ledger = &mut self.ledger;
-        self.open.retain(|_, entry| {
-            let keep = entry.image != image;
-            if !keep {
-                ledger.release_h8open(entry.begin_ordinal);
-            }
-            keep
-        });
+        self.remove_open_where(|_, entry| entry.image == image);
         self.refused.retain(|refused| refused.image != image);
     }
 }
@@ -1922,6 +1985,7 @@ pub(crate) struct JournalAuditReceipt {
     malformed_delta: u64,
     discarded_delta: u64,
     counter_error: bool,
+    resource_refused: bool,
     h3: H3DispositionEvidence,
     h0_below: u64,
     closure_generation: u64,
@@ -1940,6 +2004,7 @@ pub(crate) struct JournalCollection {
     pub(crate) malformed_delta: u64,
     pub(crate) discarded_delta: u64,
     pub(crate) counter_error: bool,
+    pub(crate) resource_refused: bool,
     pub(crate) fault_before: u64,
     pub(crate) fault_after: u64,
     pub(crate) fault_error: Option<FaultReadError>,
@@ -1965,6 +2030,7 @@ impl JournalAuditReceipt {
             malformed_delta: collection.malformed_delta,
             discarded_delta: collection.discarded_delta,
             counter_error: collection.counter_error,
+            resource_refused: collection.resource_refused,
             h3: source.take_h3_disposition(),
             h0_below: collection.h0_allocated_below,
             closure_generation,
@@ -2013,6 +2079,7 @@ impl JournalAuditReceipt {
             malformed_delta,
             discarded_delta: 0,
             counter_error: false,
+            resource_refused: false,
             h3,
             h0_below,
             closure_generation,
@@ -2052,6 +2119,9 @@ impl JournalAuditReceipt {
         }
         if self.counter_error {
             return Err(JournalGap::CounterUnprovable);
+        }
+        if self.resource_refused {
+            return Err(JournalGap::ResourceUnavailable);
         }
         if self.malformed_delta != 0 {
             return Err(JournalGap::Malformed);
@@ -3177,6 +3247,7 @@ impl JournalAdapter {
                 | JournalGap::FaultUnreadable
                 | JournalGap::Malformed
                 | JournalGap::CounterUnprovable
+                | JournalGap::ResourceUnavailable
                 | JournalGap::Discarded
                 | JournalGap::H3Loss => {
                     // Irreversible refusals first: staged unbounded
@@ -3667,8 +3738,8 @@ impl JournalAdapter {
     /// explicitly lost, so later proof resumes at or above the fence
     /// instead of silently skipping it.
     fn void_staged(&mut self) {
-        self.ledger.release_all_h8open();
         self.open.clear();
+        self.ledger.release_all_h8open();
         self.refused.clear();
         self.claims.clear();
         self.claim_counts = 0;
@@ -3782,14 +3853,7 @@ impl JournalAdapter {
                 })
                 .map(|(native, _)| *native)
                 .collect();
-            let ledger = &mut self.ledger;
-            self.open.retain(|native, entry| {
-                let keep = !drop.contains(native);
-                if !keep {
-                    ledger.release_h8open(entry.begin_ordinal);
-                }
-                keep
-            });
+            self.remove_open_where(|native, _| drop.contains(native));
             let mut kept = Vec::with_capacity(self.refused.len());
             for refused in self.refused.iter() {
                 if !self.refused_converts_here(key, &live, refused) {
@@ -4045,13 +4109,19 @@ impl JournalAdapter {
             let origin = origin_of(domain, entry.begin_ordinal, ticket, &entry.begin);
             let function = entry.function;
             let call_key = CallKey::sealed(ticket);
-            // N1c transfer: the call's ticket migrates from the H8
-            // open population to the model pending population across
-            // this begin. Release-then-charge, so a full census still
-            // converts; a failed begin restores the open ticket below.
-            let begin_ordinal = entry.begin_ordinal;
-            self.ledger.release_h8open(begin_ordinal);
-            let (admitted, begin_effects) = model.begin_with_effects(origin, &mut self.ledger);
+            // C2 already established attribution above. The pending model
+            // copy adds its own physical charge to this exact retained H8
+            // operation. Keep the OpenEntry's charge until actual removal.
+            let Some(resource) = self.ledger.h8_reservation(entry.begin_ordinal) else {
+                return Err(SealFailure {
+                    gap: JournalGap::ResourceUnavailable,
+                    effects,
+                    h3_voided: None,
+                    scope: SealFailureScope::Unqualified,
+                });
+            };
+            let (admitted, begin_effects) =
+                model.begin_with_resource(origin, &mut self.ledger, &resource);
             effects.effects.extend(begin_effects.effects);
             match admitted {
                 Ok(token) => {
@@ -4075,14 +4145,8 @@ impl JournalAdapter {
                 }
                 Err(_) => {
                     self.keys.get_mut(&key).expect("sealed key").tainted = true;
-                    // The open entry stays unconverted, so its ticket
-                    // returns. Restoration cannot fail: the census only
-                    // shrank since the release above (a failed begin
-                    // charges nothing).
-                    let restored = self
-                        .ledger
-                        .charge_h8open(begin_ordinal, size_of::<OpenEntry>() as u64);
-                    debug_assert!(restored.is_ok(), "released ticket restores");
+                    // The unconverted OpenEntry still owns its original
+                    // role/charge; refusal never erased or recreated it.
                     return Err(SealFailure {
                         gap: JournalGap::ModelRefused,
                         effects,
@@ -4286,22 +4350,14 @@ impl JournalAdapter {
         let Some(watermark) = watermark else {
             return;
         };
-        let ledger = &mut self.ledger;
-        self.open.retain(|_, entry| {
+        self.remove_open_where(|_, entry| {
             if entry.converted_for != Some(key) {
-                return true;
+                return false;
             }
-            let drop = entry
+            entry
                 .abandon
                 .is_some_and(|staged| staged.ordinal <= frontier)
-                || entry.end.is_some_and(|staged| staged.ordinal <= watermark);
-            // Converted entries already migrated their ticket to the
-            // model at conversion; release is idempotent, so unmigrated
-            // drops release here and migrated ones no-op.
-            if drop {
-                ledger.release_h8open(entry.begin_ordinal);
-            }
-            !drop
+                || entry.end.is_some_and(|staged| staged.ordinal <= watermark)
         });
     }
 
@@ -4359,6 +4415,7 @@ impl JournalAdapter {
                 malformed_delta: 0,
                 discarded_delta: 0,
                 counter_error: false,
+                resource_refused: false,
                 fault_before,
                 fault_after: fault_before,
                 fault_error,
@@ -4375,6 +4432,7 @@ impl JournalAdapter {
                     malformed_delta: 0,
                     discarded_delta: 0,
                     counter_error: false,
+                    resource_refused: false,
                     fault_before: 0,
                     fault_after: 0,
                     fault_error: Some(error),
@@ -4430,6 +4488,7 @@ impl JournalAdapter {
             malformed_delta: drain.malformed().saturating_sub(malformed_before),
             discarded_delta: drain.discarded().saturating_sub(discarded_before),
             counter_error: false,
+            resource_refused: false,
             fault_before,
             fault_after,
             fault_error,
@@ -4466,8 +4525,8 @@ impl JournalAdapter {
             effects.effects.extend(applied.effects);
             self.keys.get_mut(&key).expect("stopped key").refused = true;
         }
-        self.ledger.release_all_h8open();
         self.open.clear();
+        self.ledger.release_all_h8open();
         self.refused.clear();
         effects
     }
@@ -4573,6 +4632,57 @@ where
             self.fault,
             h0_allocated_below,
         );
+        self.seal_collection(collection, observed, bootstrap, births)
+    }
+
+    /// Seal the SAME previously collected quantum after genuine H0/H3
+    /// disposition. This path never polls EVENTS, accepts no scalar H0
+    /// watermark and leaves a pending/foreign quantum owned by the caller.
+    pub(crate) fn tick_collected(
+        &mut self,
+        retained: &mut Option<joint_driver::RawJointQuantum>,
+        bootstrap: &BootstrapReceipt,
+        admitted: &AdmittedInstanceCall,
+        births: &mut impl BirthEvidenceSource,
+    ) -> Result<SealSuccess, SealFailure> {
+        let Some(raw) = retained.as_ref() else {
+            return Err(self.adapter.failure(JournalGap::BoundNotReady));
+        };
+        if let Err(refusal) = raw.ready_for_ingest(self.adapter, self.producers) {
+            let gap = if refusal == joint_driver::RawQuantumRefusal::H0Undelivered {
+                JournalGap::H3Pending
+            } else {
+                JournalGap::DrainMismatch
+            };
+            return Err(self.adapter.failure(gap));
+        }
+        let grant = SessionDrainGrant::observe(self.producers, admitted)
+            .map_err(|_| self.adapter.failure(JournalGap::DrainMismatch))?;
+        self.adapter
+            .bind_session_drain(&grant)
+            .map_err(|_| self.adapter.failure(JournalGap::DrainMismatch))?;
+        let observed = self.attachment.generation();
+        let _ = self
+            .adapter
+            .install_closure_grant(&SessionClosureGrant::observe(self.attachment));
+        let raw = retained.take().expect("checked retained quantum");
+        let collection = match raw.ingest(self.adapter, self.producers, &grant) {
+            Ok(collection) => collection,
+            Err((raw, _)) => {
+                *retained = Some(raw);
+                return Err(self.adapter.failure(JournalGap::DrainMismatch));
+            }
+        };
+        self.seal_collection(collection, observed, bootstrap, births)
+    }
+
+    fn seal_collection(
+        &mut self,
+        collection: JournalCollection,
+        observed: u64,
+        bootstrap: &BootstrapReceipt,
+        births: &mut impl BirthEvidenceSource,
+    ) -> Result<SealSuccess, SealFailure> {
         let audit = JournalAuditReceipt::collect(&collection, self.finalizer, observed);
         let frontier = self.adapter.consumed_frontier();
         let outcome = self
@@ -5571,6 +5681,7 @@ pub(crate) mod tests {
             let routed = RoutedCall::scripted(
                 self.domain,
                 crate::events::DecodedEventRecord {
+                    joint_resource: None,
                     base: crate::semantic_capture::event_record_with_routing(event, stamp, 0x2200),
                     object: None,
                 },
@@ -5903,6 +6014,7 @@ pub(crate) mod tests {
 
         fn ingest_ordinary(&mut self, event: Event) -> JournalDisposition {
             let decoded = crate::events::DecodedEventRecord {
+                joint_resource: None,
                 base: crate::semantic_capture::event_record_with_routing(
                     event,
                     InstanceStamp::default(),

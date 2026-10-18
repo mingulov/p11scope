@@ -187,6 +187,10 @@ pub(crate) fn decode_discovery(bytes: &[u8]) -> Option<DiscoveryRecord> {
 pub(crate) struct DecodedEventRecord {
     pub(crate) base: EventRecord,
     pub(crate) object: Option<ValidatedObjectCall>,
+    /// Resource-only lineage from the same original journal END. Ordinary
+    /// decoding never constructs it, and routing grants it no authority.
+    pub(crate) joint_resource:
+        Option<crate::semantics_objects::journal::joint_driver::JointResourceOrigin>,
 }
 
 /// Decode the exact 368/608-byte forms atomically; the extended form is
@@ -198,7 +202,11 @@ pub(crate) fn decode_object_record(
     descriptors: &[ObjectDescriptorWire; MAX_DESCRIPTORS as usize],
 ) -> Option<DecodedEventRecord> {
     if bytes.len() == size_of::<EventRecord>() {
-        return decode_record(bytes).map(|base| DecodedEventRecord { base, object: None });
+        return decode_record(bytes).map(|base| DecodedEventRecord {
+            base,
+            object: None,
+            joint_resource: None,
+        });
     }
     if bytes.len() != size_of::<EventRecord>() + OBJECT_TAIL_BYTES {
         return None;
@@ -218,6 +226,7 @@ pub(crate) fn decode_object_record(
     Some(DecodedEventRecord {
         base,
         object: Some(object),
+        joint_resource: None,
     })
 }
 
@@ -245,8 +254,11 @@ pub(crate) fn project_journal_end_payload(
 ) -> Option<DecodedEventRecord> {
     let payload = end.payload_bytes();
     if end.tail_absent() {
-        decode_record(&payload[..size_of::<EventRecord>()])
-            .map(|base| DecodedEventRecord { base, object: None })
+        decode_record(&payload[..size_of::<EventRecord>()]).map(|base| DecodedEventRecord {
+            base,
+            object: None,
+            joint_resource: None,
+        })
     } else {
         decode_object_record(&payload, descriptors)
     }

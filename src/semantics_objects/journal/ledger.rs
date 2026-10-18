@@ -6,6 +6,36 @@ use super::reservations::{Refusal, ReservationId, ReservationTable, Role, RoleKe
 use crate::semantics_edge::resources::{
     OWNED_ALLOCATION_PADDING, ResourceLease, SEMANTIC_RESOURCE_LIMIT, SemanticResourceReserver,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_LEDGER_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct LedgerGeneration(u64);
+
+/// Resource provenance only. The private constructor retains the ledger's
+/// nonrecycled generation as well as its private operation ID.
+#[derive(Clone, Copy)]
+pub(in crate::semantics_objects) struct ExistingReservation {
+    generation: LedgerGeneration,
+    id: ReservationId,
+    raw_key: Option<RoleKey>,
+}
+
+impl std::fmt::Debug for ExistingReservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ExistingReservation(<private>)")
+    }
+}
+
+/// Returned only by a successful actual H9 membership insertion. A replay
+/// may use it to prepay the association copy before the staged copy drops.
+#[derive(Clone, Copy)]
+pub(crate) struct StagedResourceOrigin {
+    generation: LedgerGeneration,
+    id: ReservationId,
+    key: RoleKey,
+}
 
 /// One capture's move-only resource owner. The fixed table is paid before its
 /// first allocation; each role also retains its own actual pool lease. Legacy
@@ -17,6 +47,8 @@ pub(crate) struct StagingLedger {
     reserver: Option<SemanticResourceReserver>,
     table_storage: Option<ResourceLease>,
     next_keyassoc: u64,
+    next_raw: u64,
+    generation: Option<LedgerGeneration>,
     byte_limit: u64,
 }
 
@@ -60,6 +92,13 @@ impl StagingLedger {
             reserver,
             table_storage: None,
             next_keyassoc: 0,
+            next_raw: 0,
+            generation: NEXT_LEDGER_GENERATION
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+                    last.checked_add(1)
+                })
+                .ok()
+                .map(|last| LedgerGeneration(last + 1)),
             byte_limit: SEMANTIC_RESOURCE_LIMIT as u64,
         }
     }
@@ -139,6 +178,83 @@ impl StagingLedger {
             .map_err(Into::into)
     }
 
+    pub(super) fn reserve_raw(
+        &mut self,
+        producers: &crate::attach::SessionDrainProducers,
+    ) -> Result<ExistingReservation, LedgerRefusal> {
+        let generation = self.generation.ok_or(LedgerRefusal::Full)?;
+        let next = self.next_raw.checked_add(1).ok_or(LedgerRefusal::Full)?;
+        let raw_key = RoleKey {
+            namespace: producers.native_domain().journal_tag(),
+            value: next,
+        };
+        let id = self.charge_role(Role::Raw, raw_key, None, 0)?;
+        self.next_raw = next;
+        Ok(ExistingReservation {
+            generation,
+            id,
+            raw_key: Some(raw_key),
+        })
+    }
+
+    pub(super) fn matches_reservation(&self, reservation: &ExistingReservation) -> bool {
+        self.generation == Some(reservation.generation)
+    }
+
+    pub(super) fn generation(&self) -> Option<LedgerGeneration> {
+        self.generation
+    }
+
+    pub(super) fn release_raw(&mut self, reservation: &ExistingReservation) {
+        if self.matches_reservation(reservation)
+            && let Some(key) = reservation.raw_key
+        {
+            self.release_role(Role::Raw, key);
+        }
+    }
+
+    fn checked_existing(
+        &self,
+        reservation: &ExistingReservation,
+    ) -> Result<ReservationId, LedgerRefusal> {
+        self.matches_reservation(reservation)
+            .then_some(reservation.id)
+            .ok_or(LedgerRefusal::ReplayRefused)
+    }
+
+    pub(super) fn charge_h8open_from_raw(
+        &mut self,
+        ordinal: u64,
+        bytes: u64,
+        reservation: &ExistingReservation,
+    ) -> Result<(), LedgerRefusal> {
+        let id = self.checked_existing(reservation)?;
+        self.charge_role(Role::H8Open, Self::key(ordinal), Some(id), bytes)
+            .map(|_| ())
+    }
+
+    pub(super) fn h8_reservation(&self, ordinal: u64) -> Option<ExistingReservation> {
+        Some(ExistingReservation {
+            generation: self.generation?,
+            id: self
+                .table
+                .as_ref()?
+                .reservation(Role::H8Open, Self::key(ordinal))?,
+            raw_key: None,
+        })
+    }
+
+    pub(in crate::semantics_objects) fn charge_model_from_open(
+        &mut self,
+        token: u64,
+        bytes: u64,
+        reservation: &ExistingReservation,
+    ) -> Result<(), LedgerRefusal> {
+        let id = self.checked_existing(reservation)?;
+        self.charge_role(Role::Model, Self::key(token), Some(id), bytes)
+            .map(|_| ())
+    }
+
     fn release_role(&mut self, role: Role, key: RoleKey) {
         if let Some(table) = self.table.as_mut() {
             drop(table.release(role, key));
@@ -148,6 +264,49 @@ impl StagingLedger {
     pub(crate) fn charge(&mut self, ticket: u64, bytes: u64) -> Result<(), LedgerRefusal> {
         self.charge_role(Role::H9Staged, Self::key(ticket), None, bytes)
             .map(|_| ())
+    }
+
+    pub(crate) fn charge_collected(
+        &mut self,
+        native: crate::attach::capture::NativeDomainId,
+        ticket: u64,
+        bytes: u64,
+        origin: Option<&super::joint_driver::JointResourceOrigin>,
+    ) -> Result<StagedResourceOrigin, LedgerRefusal> {
+        let generation = self.generation.ok_or(LedgerRefusal::Full)?;
+        let existing = match origin {
+            Some(origin) => {
+                if !origin.matches_native(native) {
+                    return Err(LedgerRefusal::ReplayRefused);
+                }
+                Some(self.checked_existing(origin.reservation())?)
+            }
+            None => None,
+        };
+        let key = RoleKey {
+            namespace: native.journal_tag(),
+            value: ticket,
+        };
+        self.charge_role(Role::H9Staged, key, existing, bytes)
+            .map(|id| StagedResourceOrigin {
+                generation,
+                id,
+                key,
+            })
+    }
+
+    pub(crate) fn release_collected(
+        &mut self,
+        native: crate::attach::capture::NativeDomainId,
+        ticket: u64,
+    ) {
+        self.release_role(
+            Role::H9Staged,
+            RoleKey {
+                namespace: native.journal_tag(),
+                value: ticket,
+            },
+        );
     }
 
     pub(crate) fn release(&mut self, ticket: u64, _bytes: u64) {
@@ -179,11 +338,34 @@ impl StagingLedger {
     }
 
     pub(crate) fn mint_keyassoc(&mut self, bytes: u64) -> Result<u64, LedgerRefusal> {
+        self.mint_keyassoc_from_stage(bytes, None)
+    }
+
+    pub(crate) fn mint_keyassoc_from_stage(
+        &mut self,
+        bytes: u64,
+        source: Option<&StagedResourceOrigin>,
+    ) -> Result<u64, LedgerRefusal> {
+        let existing = match source {
+            Some(source) => {
+                if self.generation != Some(source.generation)
+                    || self
+                        .table
+                        .as_ref()
+                        .and_then(|table| table.reservation(Role::H9Staged, source.key))
+                        != Some(source.id)
+                {
+                    return Err(LedgerRefusal::ReplayRefused);
+                }
+                Some(source.id)
+            }
+            None => None,
+        };
         let ticket = self
             .next_keyassoc
             .checked_add(1)
             .ok_or(LedgerRefusal::Full)?;
-        self.charge_role(Role::Association, Self::key(ticket), None, bytes)?;
+        self.charge_role(Role::Association, Self::key(ticket), existing, bytes)?;
         self.next_keyassoc = ticket;
         Ok(ticket)
     }

@@ -50,12 +50,21 @@ typedef struct { CK_VERSION version; void *functions[104]; } Table;
 #endif
 
 #if PRIVACY_FIXTURE
+/* Closed H7 canary sessions only. All other function-table fixtures keep
+ * their original no-write CKR_OK behavior. */
+static CK_RV object_canary_rv(const char *index, CK_ULONG session) {
+    if (strcmp(index, "24") == 0 && session >= 0x701 && session <= 0x705) {
+        static const CK_RV results[] = {17, 18, 0x150, 5, 1};
+        return results[session - 0x701];
+    }
+    return CKR_OK;
+}
 #define TEN_ARGS CK_ULONG a0, CK_ULONG a1, CK_ULONG a2, CK_ULONG a3, CK_ULONG a4, CK_ULONG a5, CK_ULONG a6, CK_ULONG a7, CK_ULONG a8, CK_ULONG a9
 #define S(n) static CK_RV s##n(TEN_ARGS) { \
     (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; \
     (void)a6; (void)a7; (void)a8; (void)a9; \
     if (PRIVACY_BLOCKS) sleep(60); \
-    return CKR_OK; \
+    return object_canary_rv(#n, a0); \
 }
 #else
 #define S(n) static CK_RV s##n(void) { return CKR_OK; }

@@ -774,7 +774,7 @@ def decode_object_tail(tail):
         check_list(result_list, "result")
     else:
         assert result_list == bytes(36), "non-Get result list"
-    if index in OBJECT_TEMPLATE_INDICES:
+    if index in OBJECT_TEMPLATE_INDICES and action != 11:
         assert not (requested[0] == bytes(36)), \
             "template family with unmarked all-zero first request list"
     return {"index": index, "action": action, "layout": layout, "flags": flags}
@@ -930,36 +930,54 @@ OBJECT_INPUT_PRESETS = {
 OBJECT_BLOCKED_WORKERS = (
     (20, 0x501, 21, 1), (59, 0x502, 60, 4), (27, 0x503, 28, 10), (24, 0x504, 25, 11),
 )
+OBJECT_GET_RVS = ((0x701, 17, 2), (0x702, 18, 3), (0x703, 336, 1),
+                  (0x704, 5, None), (0x705, 1, None))
 
 
 def object_ledger_entries(workload_log):
-    """The independent call/result/readiness ledger, exactly 25 for 25."""
+    """25 named functions plus five actual Get partial/error/cancel returns."""
     lines = [line.removeprefix("P11SCOPE_OBJECT ")
              for line in Path(workload_log).read_text().splitlines()
              if line.startswith("P11SCOPE_OBJECT ")]
-    assert len(lines) == 25, f"object ledger has {len(lines)} entries, expected 25"
+    assert len(lines) == 30, f"object ledger has {len(lines)} entries, expected 30"
     entries = [json.loads(line) for line in lines]
-    assert [(entry["index"], entry["name"]) for entry in entries] == list(OBJECT_LEDGER)
+    assert [(entry["index"], entry["name"]) for entry in entries] == \
+        list(OBJECT_LEDGER) + [(24, "C_GetAttributeValue")] * 5
     for position, entry in enumerate(entries):
         assert set(entry) == {"index", "name", "session", "rv", "ready"}, entry
-        assert (entry["session"], entry["rv"], entry["ready"]) == (0x601 + position, 0, 1), entry
+        session, rv = ((0x601 + position, 0) if position < 25
+                       else OBJECT_GET_RVS[position - 25][:2])
+        assert (entry["session"], entry["rv"], entry["ready"]) == (session, rv, 1), entry
     return entries
 
 
 def assert_object_completion_records(raw_records, lane, workload_pid):
-    """All 25 named calls completed as validated 608-byte CALL records."""
-    assert len(raw_records) == 25, f"{lane}: {len(raw_records)} records, expected 25"
+    """All 30 actual calls completed as validated finite 608-byte CALL records."""
+    assert len(raw_records) == 30, f"{lane}: {len(raw_records)} records, expected 30"
     events = [decode_event(raw) for raw in raw_records]
     assert all(len(event["raw"]) == OBJECT_EVENT_SIZE for event in events), lane
     assert all(event["pid_tgid"] >> 32 == workload_pid for event in events)
     assert all(event["event_type"] == 0 for event in events)
     by_session = {event["session"]: event for event in events}
-    assert set(by_session) == {0x601 + position for position in range(25)}, \
+    assert set(by_session) == ({0x601 + position for position in range(25)} |
+                              {entry[0] for entry in OBJECT_GET_RVS}), \
         {hex(session) for session in by_session}
     for position, (ordinal, name) in enumerate(OBJECT_LEDGER):
         tail = by_session[0x601 + position]["object"]
         assert tail["index"] == ordinal + 1, (name, tail)
+        assert tail["layout"] == (2 if lane == "object-ia32" else 1), (name, "target width")
         raw_tail = by_session[0x601 + position]["raw"][EVENT_SIZE:]
+        assert u64(by_session[0x601 + position]["raw"], 64) == 0, (name, "RV")
+        zero_list = bytes(36)
+        public = object_canary_attributes((4, 16, 1, 32, 2048, 1))
+        private = object_canary_attributes((2, 3, 0, 24, 4096, 2))
+        creation = ordinal in {20, 21, 58, 59, 61, 62}
+        assert raw_tail[128:164] == (public if creation else zero_list), \
+            (name, "requested0 six fields/absence")
+        assert raw_tail[164:200] == (private if ordinal == 59 else zero_list), \
+            (name, "pair separation/absent requested1")
+        assert raw_tail[200:236] == (public if ordinal == 24 else zero_list), \
+            (name, "Get six results/absence")
         if ordinal in OBJECT_RESULT_PRESETS:
             for slot, preset in enumerate(OBJECT_RESULT_PRESETS[ordinal]):
                 status = raw_tail[114 + slot]
@@ -975,6 +993,24 @@ def assert_object_completion_records(raw_records, lane, workload_pid):
             status = raw_tail[112 + slot]
             word = struct.unpack_from("<Q", raw_tail, 16 + 8 * slot)[0]
             assert (status, word) == (1, preset), (name, slot, status, hex(word))
+    for session, rv, curve in OBJECT_GET_RVS:
+        event = by_session[session]
+        assert u64(event["raw"], 64) == rv, (session, "Get RV")
+        assert event["object"] == {"index": 25, "action": 11,
+                                   "layout": 2 if lane == "object-ia32" else 1, "flags": 0}
+        tail = event["raw"][EVENT_SIZE:]
+        assert tail[128:200] == bytes(72), (session, "Get has no requested values")
+        expected = (object_canary_attributes((4, 16, 1, 32, 2048, curve)) if curve is not None
+                    else bytes(32) + bytes((0, 16, 0, 0)))
+        assert tail[200:236] == expected, (session, "accepted Get results or unread refusal")
+        assert (tail[112], u64(tail, 16)) == (1, 0x224), (session, "Get input")
+
+
+def object_canary_attributes(values):
+    """Independent expected finite bytes for six selected plus two forbidden slots."""
+    return (b"".join(struct.pack("<BBH", kind, 1, value)
+                     for kind, value in enumerate(values, 1))
+            + bytes(8) + bytes((8, 1, 0, 0)))
 
 
 def decode_object_start(raw):
@@ -1001,11 +1037,11 @@ def assert_object_starts(completed_manifest, blocked_manifest, completed_log,
     """H7 slice D object-cell oracle: ledger, 608-byte records, stopped
     offsets, sentinel absence and post-return cleanup."""
     entries = object_ledger_entries(completed_log)
-    assert [entry["index"] for entry in entries] == [index for index, _ in OBJECT_LEDGER]
+    assert [entry["index"] for entry in entries] == [index for index, _ in OBJECT_LEDGER] + [24] * 5
     # Completed phase: 25 validated 608-byte records; side storage empty.
     completed_events = ring_raw_records(completed_manifest, "object-completed")
     assert_object_completion_records(
-        completed_events, "object-completed", completed_pid)
+        completed_events, "object-ia32" if target_bits == 32 else "object-lp64", completed_pid)
     completed_side = manifest_map(completed_manifest, "OBJECT_START")
     assert read_json(completed_side["file"]) == [], "completed OBJECT_START not empty"
     # Blocked phase: four parked calls at exact offsets; nothing emitted.
@@ -1036,10 +1072,12 @@ def assert_object_starts(completed_manifest, blocked_manifest, completed_log,
 
 def assert_object_side_rows(side_rows, starts, pointers, target_bits):
     layout = 1 if target_bits == 64 else 2
-    assert set(pointers) == {"template", "out_create", "out_pub", "out_priv",
-                             "found", "found_count"}, pointers
-    assert all(type(pointer) is int and pointer > 0 for pointer in pointers.values())
-    assert len(set(pointers.values())) == 6, pointers
+    assert set(pointers) == {"template", "peer_template", "out_create", "out_pub", "out_priv",
+                             "found", "found_count", "get_values"}
+    assert isinstance(pointers["get_values"], list) and len(pointers["get_values"]) == 6
+    words = [value for name, value in pointers.items() if name != "get_values"] + pointers["get_values"]
+    assert all(type(pointer) is int and 0 < pointer < 1 << target_bits for pointer in words)
+    assert len(set(words)) == 13, "fixture pointers must own disjoint starting addresses"
     assert len(side_rows) == 4, len(side_rows)
     expect = {session: (index, action) for _, session, index, action in OBJECT_BLOCKED_WORKERS}
     seen = set()
@@ -1054,32 +1092,31 @@ def assert_object_side_rows(side_rows, starts, pointers, target_bits):
         assert (row["layout"], row["action"], row["derive"], row["phase"]) == (
             layout, action, 0, 2), (hex(session), row["layout"], row["action"])
         assert row["image"]["task_cookie"] != 0 and row["entry_ns"] != 0
-        assert row["flags"] == 0 and row["get_inspected"] == 0 and row["reserved"] == 0
-        assert row["slots"] == bytes(256), hex(session)
-        assert row["requested"] == [bytes(36), bytes(36)], hex(session)
-        assert row["get_template_base"] == 0 and row["inspected_header_end"] == 0
-        # Neighbor and public positions stay zero: the same nonzero word
-        # anywhere here fails the cell, no blanket exemption.
+        # Build the exact allowed row. Only the existing image/entry clock
+        # controls vary. Every pointer/capacity exception below has its exact
+        # field, width and value; all neighbors/padding must still be zero.
+        allowed = bytearray(432)
+        allowed[:24] = row["raw"][:24]
+        struct.pack_into("<I4B", allowed, 24, index, layout, action, 0, 2)
         if session == 0x501:
-            assert row["inputs"] == (0, 0) and row["input_statuses"] == (0, 0)
-            assert row["result_ptrs"] == (pointers["out_create"], 0)
-            assert row["result_statuses"] == (0, 0)
-            assert row["find_capacity"] == 0 and row["find_count_ptr"] == 0
+            struct.pack_into("<Q", allowed, 48, pointers["out_create"])
+            allowed[352:388] = object_canary_attributes((4, 16, 1, 32, 2048, 1))
         elif session == 0x502:
-            assert row["inputs"] == (0, 0) and row["input_statuses"] == (0, 0)
-            assert row["result_ptrs"] == (pointers["out_pub"], pointers["out_priv"])
-            assert row["result_statuses"] == (0, 0)
-            assert row["find_capacity"] == 0 and row["find_count_ptr"] == 0
+            struct.pack_into("<QQ", allowed, 48, pointers["out_pub"], pointers["out_priv"])
+            allowed[352:388] = object_canary_attributes((4, 16, 1, 32, 2048, 1))
+            allowed[388:424] = object_canary_attributes((2, 3, 0, 24, 4096, 2))
         elif session == 0x503:
-            assert row["inputs"] == (0, 0) and row["input_statuses"] == (0, 0)
-            assert row["result_ptrs"] == (pointers["found"], 0)
-            assert row["result_statuses"] == (0, 0)
-            assert row["find_capacity"] == 8 and row["find_count_ptr"] == pointers["found_count"]
+            struct.pack_into("<Q", allowed, 48, pointers["found"])
+            struct.pack_into("<QQ", allowed, 80, 8, pointers["found_count"])
         else:
-            assert row["inputs"] == (0x224, 0) and row["input_statuses"] == (1, 0)
-            assert row["result_ptrs"] == (0, 0)
-            assert row["result_statuses"] == (0, 0)
-            assert row["find_capacity"] == 0 and row["find_count_ptr"] == 0
+            width = target_bits // 8
+            struct.pack_into("<Q", allowed, 32, 0x224)
+            struct.pack_into("<QQ", allowed, 64, pointers["template"], pointers["template"] + 24 * width)
+            allowed[424], allowed[430] = 1, 8
+            for slot, (pointer, capacity) in enumerate(zip(pointers["get_values"], (width, width, 1, width, width, 10))):
+                struct.pack_into("<QQQBBB5x", allowed, 96 + 32 * slot,
+                                 pointer, capacity, 0, slot + 1, slot, 0)
+        assert row["raw"] == bytes(allowed), (hex(session), "side row field/zero-neighbor mismatch")
 
 
 def ring_raw_records(manifest, lane):

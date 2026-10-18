@@ -18,6 +18,9 @@ struct WrapWorkload {
 }
 impl WrapWorkload {
     fn spawn() -> Result<Self> {
+        Self::spawn_profile(false)
+    }
+    fn spawn_profile(probe: bool) -> Result<Self> {
         use std::os::unix::fs::OpenOptionsExt;
         let source = std::env::var_os("P11SCOPE_DIAGNOSTICS_WRAP_PREBUILT_DIR")
             .context("supply the controller-verified prebuilt32-body fixture directory")?;
@@ -40,7 +43,17 @@ impl WrapWorkload {
                 fifo.clone(),
                 dir.path().join("calls.jsonl"),
             ])
-            .args(["0123456789abcdef0123456789abcdef", "900000", "400", "258"])
+            .args(if probe {
+                vec![
+                    "0123456789abcdef0123456789abcdef",
+                    "90000",
+                    "3",
+                    "1",
+                    "probe",
+                ]
+            } else {
+                vec!["0123456789abcdef0123456789abcdef", "900000", "400", "258"]
+            })
             .stdin(Stdio::null())
             .stdout(std::fs::File::create(&out)?)
             .stderr(std::fs::File::create(dir.path().join("workload.err"))?)
@@ -163,6 +176,18 @@ impl PassView {
 }
 
 fn check_native_ledger(workload: &WrapWorkload) -> Result<()> {
+    check_native_schedule(
+        workload,
+        &[
+            ("a", COUNTED),
+            ("shared", SHARED),
+            ("fence", 1),
+            ("proof", 1),
+        ],
+    )
+}
+
+fn check_native_schedule(workload: &WrapWorkload, schedule: &[(&str, u64)]) -> Result<()> {
     let rows = jsonl_records(&workload.dir.path().join("calls.jsonl"))?;
     let identity = rows.first().context("native identity missing")?;
     ensure!(identity["kind"] == "identity" && identity["pid"] == workload.process.pid());
@@ -198,19 +223,19 @@ fn check_native_ledger(workload: &WrapWorkload) -> Result<()> {
                 .is_some_and(|offset| offset < common.len())
     }));
     let calls: Vec<_> = rows.iter().filter(|row| row["kind"] == "call").collect();
-    ensure!(calls.len() as u64 == (COUNTED + SHARED + 2) * TARGETS);
-    let schedule = [
-        ("a", COUNTED),
-        ("shared", SHARED),
-        ("fence", 1),
-        ("proof", 1),
-    ];
+    ensure!(
+        calls.len() as u64
+            == schedule
+                .iter()
+                .map(|(_, rounds)| rounds * TARGETS)
+                .sum::<u64>()
+    );
     let acknowledgements = jsonl_records(&workload.process.out)?;
     let mut sequence = 0usize;
     let mut previous = identity["ready_ns"]
         .as_u64()
         .context("native ready clock")?;
-    for (phase, rounds) in schedule {
+    for (phase, rounds) in schedule.iter().copied() {
         let event = match phase {
             "a" => "a-done",
             "shared" => "shared-done",
@@ -1065,5 +1090,439 @@ fn privileged_native_lane_pid_diagnostics_wrap_and_primary_parity_lp64() -> Resu
         disabled == enabled,
         "diagnostics changed primary count/coverage/loss facts: off={disabled}, on={enabled}"
     );
+    Ok(())
+}
+
+/// Validate the small probe's actual dispositions independently of its progress
+/// predicates. Offset diversity is not pair diversity: this fixture has ONE pair.
+fn check_startup_probe_records(
+    records: &[serde_json::Value],
+    public_count: u64,
+    pid: u32,
+    module: &serde_json::Value,
+    calls: &[(u64, u64)],
+) -> Result<serde_json::Value> {
+    ensure!(calls.len() == 3);
+    let header = records.first().context("startup diagnostics header")?;
+    let footer = records.last().context("startup diagnostics footer")?;
+    ensure!(
+        header["kind"] == "header"
+            && header["scope"] == "pid"
+            && header["mode"] == "native"
+            && header["pid_filter"] == pid
+    );
+    ensure!(
+        header["limits"]["ordinary_records"] == 24576
+            && header["limits"]["exceptional_records"] == 8192
+    );
+    ensure!(
+        footer["kind"] == "footer"
+            && footer["diagnostics_complete"] == true
+            && footer["counter_overflow"] == false
+            && footer["sequence_exhausted"] == false
+            && footer["oversized_records"] == 0
+            && footer["records_written"] == records.len() as u64 - 2
+    );
+    let kinds = footer["kinds"]
+        .as_array()
+        .context("startup kind counters")?;
+    ensure!(
+        kinds.len() == 5
+            && kinds
+                .iter()
+                .all(|kind| kind["evicted"] == 0 && kind["filtered"] == 0 && kind["omitted"] == 0)
+    );
+    let names = [
+        "count_observation",
+        "ownership_transition",
+        "count_decision",
+        "publication",
+        "capture_health",
+    ];
+    let mut observed = [0u64; 5];
+    let mut previous = 0;
+    for row in &records[1..records.len() - 1] {
+        let index = names
+            .iter()
+            .position(|name| row["kind"] == *name)
+            .context("unknown short-probe record kind")?;
+        observed[index] += 1;
+        let sequence = row["seq"].as_u64().context("probe record sequence")?;
+        ensure!(sequence > previous);
+        previous = sequence;
+    }
+    for (kind, retained) in kinds.iter().zip(observed) {
+        let keys: BTreeSet<_> = kind
+            .as_object()
+            .context("probe kind counters object")?
+            .keys()
+            .map(String::as_str)
+            .collect();
+        ensure!(keys == BTreeSet::from(["produced", "retained", "evicted", "filtered", "omitted"]));
+        ensure!(
+            kind["retained"] == retained && kind["produced"] == retained,
+            "short-probe footer must reconcile to each actual kind"
+        );
+    }
+    let observations: Vec<_> = records
+        .iter()
+        .filter(|row| {
+            row["kind"] == "count_observation" && row["absolute"].as_u64().is_some_and(|n| n > 0)
+        })
+        .collect();
+    ensure!(
+        observations.len() == 3,
+        "probe needs exactly three changing native observations"
+    );
+    let pair = observations[0]["pair"].as_str().context("probe pair")?;
+    let pairs: BTreeSet<_> = records
+        .iter()
+        .filter_map(|row| row["pair"].as_str())
+        .collect();
+    ensure!(
+        pairs == BTreeSet::from([pair]),
+        "32 offsets must remain one physical pair"
+    );
+    for (index, row) in observations.iter().enumerate() {
+        ensure!(row["pid"] == pid && row["absolute"] == (index as u64 + 1) * 32);
+        let pre = row["pre"].as_u64().context("actual read PRE")?;
+        let post = row["post"].as_u64().context("actual read POST")?;
+        ensure!(
+            calls[index].1 <= pre && pre <= post,
+            "the quiescent native round must finish before the actual read PRE"
+        );
+        if index + 1 < calls.len() {
+            ensure!(
+                post < calls[index + 1].0,
+                "next issued round must follow actual prior read"
+            );
+        }
+    }
+    let placed = |absolute: u64, base: u64| -> Vec<&serde_json::Value> {
+        records
+            .iter()
+            .filter(|row| {
+                row["kind"] == "publication"
+                    && row["decision"] == "placed"
+                    && row["pair"] == pair
+                    && row["module_id"] == *module
+                    && row["absolute"] == absolute
+                    && row["base"] == base
+                    && row["staged"] == 32
+                    && row["reason"] == "sole_owner"
+                    && row["observation_ref"]["seq"]
+                        == observations[(absolute / 32 - 1) as usize]["seq"]
+                    && row["observation_ref"]["status"] == "retained"
+            })
+            .collect()
+    };
+    ensure!(
+        placed(32, 0).len() == 1,
+        "first32 must remain actual published history"
+    );
+    let fences: Vec<_> = records
+        .iter()
+        .filter(|row| row["decision"] == "withheld" && row["pair"] == pair)
+        .collect();
+    let path = if public_count == 96 {
+        ensure!(
+            fences.is_empty() && placed(64, 32).len() == 1 && placed(96, 64).len() == 1,
+            "ordinary path must place all three32-call advances"
+        );
+        "ordinary"
+    } else {
+        ensure!(
+            public_count == 64 && fences.len() == 1,
+            "only exact ordinary96 or startup-fence64 is a qualified probe result"
+        );
+        let fence = fences[0];
+        ensure!(
+            fence["reason"] == "awaiting_fence"
+                && fence["after"] == 32
+                && fence["through"] == 64
+                && fence["absolute"] == 64,
+            "the second32 calls require an explicit actual startup fence disposition"
+        );
+        ensure!(
+            placed(64, 32).is_empty(),
+            "withheld second round cannot also be placed"
+        );
+        let recovered = placed(96, 64);
+        ensure!(recovered.len() == 1 && recovered[0]["edge_total"] == 64);
+        ensure!(
+            fence["observation_ref"]["seq"] == observations[1]["seq"]
+                && fence["observation_ref"]["status"] == "retained"
+                && recovered[0]["observation_ref"]["seq"] == observations[2]["seq"]
+                && recovered[0]["observation_ref"]["status"] == "retained"
+                && recovered[0]["baseline_pre"] == observations[1]["pre"]
+                && recovered[0]["baseline_post"] == observations[1]["post"],
+            "recovery must retain the genuine second-read fence and third observation"
+        );
+        "startup_fence"
+    };
+    Ok(
+        serde_json::json!({"path":path,"physical_pairs":1,"calls":96,
+        "published":public_count,"withheld":96-public_count,
+        "observations":observations,"fences":fences}),
+    )
+}
+
+/// Short actual native control before any revised long wrap schedule. The two
+/// accepted paths are distinguished by real dispositions, never by elapsed sleep.
+#[test]
+#[ignore = "root-owned BPF lane; source-matched prebuilt3-round probe, bounded90s"]
+fn privileged_native_lane_pid_diagnostics_three_round_startup_probe_lp64() -> Result<()> {
+    let mut workload = WrapWorkload::spawn_profile(true)?;
+    workload.check_mapping("provider-A.so")?;
+    workload.check_mapping("libdemotion-common.so")?;
+    let pid = workload.process.pid();
+    let events = workload.dir.path().join("probe-events.jsonl");
+    let diagnostics = workload.dir.path().join("probe-diagnostics.jsonl");
+    let started = Instant::now();
+    let state = Cell::new(0u8);
+    let fenced = Cell::new(false);
+    let first_mapping = Cell::new(0u64);
+    let view = RefCell::new(PassView::default());
+    let failure = RefCell::new(None::<anyhow::Error>);
+    let stop = || {
+        let advance = || -> Result<bool> {
+            ensure!(
+                started.elapsed() < Duration::from_secs(90),
+                "startup probe exceeded90s at phase{}",
+                state.get()
+            );
+            if state.get() == 4 {
+                return Ok(true);
+            }
+            let mut view = view.borrow_mut();
+            if !view.refresh(&events, pid)? {
+                return Ok(false);
+            }
+            let a = view.a.as_ref();
+            let count = a.and_then(|edge| edge["entries"]["count"].as_u64());
+            let exact_second_gap = view
+                .gaps
+                .iter()
+                .any(|reason| reason.contains("absolute count range (32, 64]"));
+            match state.get() {
+                0 if a.is_some_and(|edge| {
+                    edge["capture"] == "armed" && edge["presence"] == "mapped"
+                }) =>
+                {
+                    workload.command("ready", "ready", 0)?;
+                    workload.command("count", "a-done", 1)?;
+                    state.set(1);
+                }
+                1 if count == Some(32) => {
+                    first_mapping.set(
+                        a.unwrap()["mapping"]["last_seen_ns"]
+                            .as_u64()
+                            .context("first published mapping clock")?,
+                    );
+                    workload.command("count", "a-done", 2)?;
+                    state.set(2);
+                }
+                2 if count == Some(64) || exact_second_gap => {
+                    fenced.set(exact_second_gap);
+                    workload.command("count", "a-done", 3)?;
+                    state.set(3);
+                }
+                3 if count == Some(if fenced.get() { 64 } else { 96 }) => state.set(4),
+                _ => {}
+            }
+            Ok(state.get() == 4)
+        };
+        match advance() {
+            Ok(done) => done,
+            Err(error) => {
+                *failure.borrow_mut() = Some(error);
+                true
+            }
+        }
+    };
+    let mut stdout = Vec::new();
+    let code = run_with_terminal_diagnostics(
+        InspectScope::Pid(pid),
+        &[],
+        &HookRegistry::builtin(),
+        true,
+        None,
+        None,
+        Some(Duration::from_secs(90)),
+        None,
+        false,
+        Some(&events),
+        None,
+        None,
+        CaptureMode::Native,
+        crate::attach::BackendSelection::Auto,
+        None,
+        &stop,
+        &|| {},
+        false,
+        &mut WriterStdout(&mut stdout),
+        &DashboardIo::stdio(),
+        DiagnosticRequest {
+            path: Some(&diagnostics),
+            pid_filter: Some(pid),
+            second_signal: &|| false,
+        },
+        None,
+    )?;
+    if let Some(error) = failure.into_inner() {
+        return Err(error);
+    }
+    ensure!(
+        code == 0 && state.get() == 4,
+        "short probe failed without complete actual milestones"
+    );
+    workload.command("stop", "done", 0)?;
+    ensure!(workload.process.child.wait()?.success());
+    check_native_schedule(&workload, &[("a", 3)])?;
+    let ledger = jsonl_records(&workload.dir.path().join("calls.jsonl"))?;
+    let mut intervals = Vec::new();
+    for round in 1..=3 {
+        let calls: Vec<_> = ledger
+            .iter()
+            .filter(|row| row["kind"] == "call" && row["phase"] == "a" && row["round"] == round)
+            .collect();
+        ensure!(calls.len() == 32);
+        intervals.push((
+            calls[0]["before_call_ns"].as_u64().context("first entry")?,
+            calls[31]["after_return_ns"]
+                .as_u64()
+                .context("last return")?,
+        ));
+    }
+    let document: serde_json::Value = serde_json::from_slice(&stdout)?;
+    let observation = &document["observation"];
+    ensure!(
+        observation["lane"] == "native"
+            && observation["retirement"] == "closed"
+            && observation["settlement"] == "unsettled"
+            && !ab_lifecycle_loss_detected(&document)
+    );
+    for field in ["ring_loss", "malformed", "failed_quanta"] {
+        ensure!(observation["lifecycle"][field] == 0);
+    }
+    ensure!(observation["native_witnesses"]["integrity"] == 0);
+    let edges = doc_edges(&document, pid);
+    ensure!(edges.len() == 1 && edges[0]["presence"] == "mapped");
+    let module = &edges[0]["module"];
+    let public = edges[0]["entries"]["count"]
+        .as_u64()
+        .context("final A count")?;
+    let mut bytes = Vec::new();
+    std::fs::File::open(&diagnostics)?
+        .take(64 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)?;
+    ensure!(bytes.len() <= 64 * 1024 * 1024);
+    let records = bytes
+        .split(|b| *b == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(serde_json::from_slice)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let facts = check_startup_probe_records(&records, public, pid, module, &intervals)?;
+    ensure!((facts["path"] == "startup_fence") == fenced.get());
+    eprintln!(
+        "G21_STARTUP_PROBE elapsed_ms={} first_public_mapping_last_seen_ns={} facts={facts}",
+        started.elapsed().as_millis(),
+        first_mapping.get()
+    );
+    Ok(())
+}
+
+fn startup_probe_validator_fixture(fenced: bool) -> Vec<serde_json::Value> {
+    let mut rows = vec![
+        serde_json::json!({"kind":"header","scope":"pid","mode":"native",
+        "pid_filter":123,"limits":{"ordinary_records":24576,"exceptional_records":8192}}),
+    ];
+    for round in 1..=3u64 {
+        let absolute = round * 32;
+        let seq = round * 2 - 1;
+        rows.push(
+            serde_json::json!({"kind":"count_observation","pid":123,"pair":"p0",
+            "seq":seq,"absolute":absolute,"pre":round*40+70,"post":round*40+80}),
+        );
+        if fenced && round == 2 {
+            rows.push(
+                serde_json::json!({"kind":"count_decision","decision":"withheld",
+                "pair":"p0","seq":seq+1,"reason":"awaiting_fence","after":32,
+                "through":64,"absolute":64,"observation_ref":{"seq":seq,"status":"retained"}}),
+            );
+        } else {
+            rows.push(
+                serde_json::json!({"kind":"publication","decision":"placed","reason":"sole_owner",
+                "pair":"p0","seq":seq+1,"module_id":"mA","absolute":absolute,"base":absolute-32,
+                "staged":32,"edge_total":if fenced && round==3 {64} else {absolute},
+                "observation_ref":{"seq":seq,"status":"retained"},
+                "baseline_pre":150,"baseline_post":160}),
+            );
+        }
+    }
+    let names = [
+        "count_observation",
+        "ownership_transition",
+        "count_decision",
+        "publication",
+        "capture_health",
+    ];
+    let kinds: Vec<_> = names.iter().map(|name| {
+        let count = rows.iter().filter(|row| row["kind"] == *name).count();
+        serde_json::json!({"produced":count,"retained":count,"evicted":0,"filtered":0,"omitted":0})
+    }).collect();
+    rows.push(
+        serde_json::json!({"kind":"footer","diagnostics_complete":true,
+        "counter_overflow":false,"sequence_exhausted":false,"oversized_records":0,
+        "records_written":6,"kinds":kinds}),
+    );
+    rows
+}
+
+#[test]
+fn operator_diagnostics_three_round_probe_checks_fence_and_physical_pair() -> Result<()> {
+    let calls = [(90, 110), (130, 150), (170, 190)];
+    let module = serde_json::json!("mA");
+    let ordinary = startup_probe_validator_fixture(false);
+    let fenced = startup_probe_validator_fixture(true);
+    ensure!(
+        check_startup_probe_records(&ordinary, 96, 123, &module, &calls)?["path"] == "ordinary"
+    );
+    ensure!(
+        check_startup_probe_records(&fenced, 64, 123, &module, &calls)?["path"] == "startup_fence"
+    );
+    for change in [
+        "second_pair",
+        "wrong_absolute",
+        "false_fence_reason",
+        "false_fence_range",
+        "missing_recovery",
+        "wrong_baseline",
+        "wrong_reference",
+        "wrong_primary",
+        "raw_before_call",
+        "kind_counter_lie",
+        "read_starts_before_return",
+    ] {
+        let mut changed = fenced.clone();
+        let mut primary = 64;
+        match change {
+            "second_pair" => changed[3]["pair"] = "p1".into(),
+            "wrong_absolute" => changed[3]["absolute"] = 2.into(),
+            "false_fence_reason" => changed[4]["reason"] = "identity_changed".into(),
+            "false_fence_range" => changed[4]["after"] = 0.into(),
+            "missing_recovery" => changed[6]["decision"] = "staged".into(),
+            "wrong_baseline" => changed[6]["baseline_post"] = 159.into(),
+            "wrong_reference" => changed[4]["observation_ref"]["seq"] = 1.into(),
+            "wrong_primary" => primary = 96,
+            "raw_before_call" => changed[5]["post"] = 180.into(),
+            "read_starts_before_return" => changed[1]["pre"] = 109.into(),
+            _ => changed[7]["kinds"][0]["retained"] = 2.into(),
+        }
+        ensure!(
+            check_startup_probe_records(&changed, primary, 123, &module, &calls).is_err(),
+            "false startup-fence evidence accepted: {change}"
+        );
+    }
     Ok(())
 }

@@ -308,7 +308,7 @@ class NativeWrapControls(unittest.TestCase):
             self.assertEqual(facts['physical_pairs'], 1)
             self.assertEqual(facts['phase_calls'], {'a': 96})
             self.assertEqual([r['round'] for r in observed['acks'] if r['event'] == 'a-done'], [1, 2, 3])
-            for mutation in ('missing_third_call', 'foreign_pair', 'shared_call', 'unacked_round'):
+            for mutation in ('missing_third_call', 'foreign_pair', 'shared_call', 'unacked_round', 'unexpected_b_ack'):
                 with self.subTest(mutation=mutation):
                     changed = copy.deepcopy(observed)
                     calls = [r for r in changed['rows'] if r['kind'] == 'call']
@@ -318,9 +318,11 @@ class NativeWrapControls(unittest.TestCase):
                         next(r for r in changed['rows'] if r['kind'] == 'target')['ino'] += 1
                     elif mutation == 'shared_call':
                         calls[-1]['phase'] = 'shared'
-                    else:
+                    elif mutation == 'unacked_round':
                         changed['acks'] = [r for r in changed['acks']
                                            if not (r['event'] == 'a-done' and r['round'] == 3)]
+                    else:
+                        changed['acks'].insert(-1, dict(event='b-ready', round=0, calls=96, t=1))
                     with self.assertRaises(ValueError):
                         validate(changed)
 
@@ -330,6 +332,8 @@ class NativeWrapControls(unittest.TestCase):
             prepared = WRAP['build'](directory)
             self.assertEqual(prepared['native_check']['calls'], 192)
             self.assertEqual(prepared['native_check']['targets'], 32)
+            self.assertEqual(prepared['probe_check']['calls'], 96)
+            self.assertEqual(prepared['probe_check']['physical_pairs'], 1)
             observed = WRAP['execute_fixture'](directory, 1, 1)
             def validate(value):
                 return WRAP['check_ledger'](**value, directory=directory, counted=1, shared=1)

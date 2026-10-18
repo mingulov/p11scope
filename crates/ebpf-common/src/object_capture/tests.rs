@@ -4420,6 +4420,7 @@ fn streamed_actual_pair_body_disjoint_and_refused_derives_are_unchanged() {
         prog_attr(&target, 0x6000, 0, w, SEL_CLASS, 0x9000, w);
         target.borrow_mut().set_word(0x8000, 3);
         target.borrow_mut().set_word(0x9000, 4);
+        target.borrow_mut().set_word(0x4000 + 3 * w, 0x11);
         let row = canonical_object_wire(fid("C_GenerateKeyPair"));
         let mut side = ObjectStart::default();
         let mut fetch = |arg| {
@@ -4427,6 +4428,8 @@ fn streamed_actual_pair_body_disjoint_and_refused_derives_are_unchanged() {
                 0x4000
             } else if arg == row.template_args[2] {
                 0x6000
+            } else if arg == row.template_args[1] {
+                2
             } else {
                 1
             })
@@ -4437,6 +4440,8 @@ fn streamed_actual_pair_body_disjoint_and_refused_derives_are_unchanged() {
         assert_eq!(side.requested[0].cells[0].value, 3);
         assert_eq!(side.requested[1].cells[0].status, ast::VALUE);
         assert_eq!(side.requested[1].cells[0].value, 4);
+        assert_no_read_of(&target, 0x4000 + 4 * w);
+        assert_no_read_of(&target, 0x4000 + 5 * w);
         for name in ["C_DeriveKey", "C_SetAttributeValue"] {
             let target = fresh(w);
             let row = canonical_object_wire(fid(name));
@@ -4459,6 +4464,253 @@ fn streamed_actual_pair_body_disjoint_and_refused_derives_are_unchanged() {
             );
             assert_eq!(acquired, 0);
             assert_eq!(target.borrow().log_len, 0);
+        }
+    }
+}
+
+#[test]
+fn return_gate_exact_finite_roundtrip_and_all_unknown_bits_refuse() {
+    use crate::object_flow::{decode_return_gate, encode_return_gate};
+    for (layout, code) in [(LinuxLayout::Lp64, 1), (LinuxLayout::Ilp32, 2)] {
+        for joined in [false, true] {
+            let gate = code | if joined { 4 } else { 0 };
+            assert_eq!(encode_return_gate(layout, joined), gate);
+            assert_eq!(decode_return_gate(gate), Some((layout, joined)));
+        }
+        for bit in 3..32 {
+            assert_eq!(decode_return_gate(code | 4 | (1 << bit)), None);
+        }
+    }
+    for gate in [0, 3, 4, 7, u32::MAX] {
+        assert_eq!(decode_return_gate(gate), None);
+    }
+}
+
+#[test]
+fn return_gate_actual_fill_keeps_full_width_and_continuity_authority() {
+    use crate::object_flow::adapter_fill_return_control;
+    use crate::object_wire::{canonical_object_wire, ObjectStart};
+    let row = canonical_object_wire(fid("C_DeriveKey"));
+    let descriptor = row.function + 1;
+    for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+        let good_gate = if layout == LinuxLayout::Lp64 { 5 } else { 6 };
+        for gate in [0, 3, 4, 7]
+            .into_iter()
+            .chain((3..32).map(|bit| good_gate | (1 << bit)))
+        {
+            let target = fresh(layout.word_bytes() as u64);
+            let mut side = ObjectStart {
+                phase: 2,
+                descriptor_index: descriptor,
+                derive: 1,
+                result_ptrs: [0x8000, 0],
+                ..Default::default()
+            };
+            assert!(!adapter_fill_return_control(
+                Some(&mut side),
+                descriptor,
+                Some(&row),
+                0,
+                capture::MECHANISM_VALUE,
+                0x21,
+                gate,
+                word_reader(&target)
+            ));
+            assert_eq!(target.borrow().log_len, 0);
+            assert_eq!(side.phase, 2);
+        }
+        for (gate, rv, status, mech, filled, reads) in [
+            (good_gate, 0, capture::MECHANISM_VALUE, 0x21, true, 1),
+            (good_gate & !4, 0, capture::MECHANISM_VALUE, 0x21, false, 0),
+            (good_gate | 8, 0, capture::MECHANISM_VALUE, 0x21, false, 0),
+            (
+                good_gate,
+                1u64 << 32,
+                capture::MECHANISM_VALUE,
+                0x21,
+                true,
+                0,
+            ),
+            (
+                good_gate,
+                0,
+                capture::MECHANISM_VALUE,
+                (1u64 << 32) | 0x21,
+                true,
+                0,
+            ),
+            (
+                good_gate,
+                0,
+                (1u32 << 16) | capture::MECHANISM_VALUE,
+                0x21,
+                true,
+                0,
+            ),
+        ] {
+            let target = fresh(layout.word_bytes() as u64);
+            target.borrow_mut().set_word(0x8000, 0x1234);
+            let mut side = ObjectStart {
+                phase: 2,
+                descriptor_index: descriptor,
+                derive: 1,
+                result_ptrs: [0x8000, 0],
+                ..Default::default()
+            };
+            assert_eq!(
+                adapter_fill_return_control(
+                    Some(&mut side),
+                    descriptor,
+                    Some(&row),
+                    rv,
+                    status,
+                    mech,
+                    gate,
+                    word_reader(&target)
+                ),
+                filled
+            );
+            assert_eq!(target.borrow().log_len, reads);
+            assert_eq!(side.phase, if filled { 3 } else { 2 });
+            if reads == 1 {
+                assert_eq!(side.result_ptrs[0], 0x1234);
+                assert_eq!(side.result_statuses[0], hst::VALUE);
+            }
+        }
+    }
+}
+
+#[test]
+fn return_gate_actual_emitters_refuse_unknown_bits_and_unjoined_without_reads() {
+    use crate::object_flow::{adapter_emit_find_control, adapter_emit_get_control};
+    use crate::object_wire::{canonical_object_wire, ObjectCallWire, ObjectStart};
+    for name in ["C_FindObjects", "C_GetAttributeValue"] {
+        let row = canonical_object_wire(fid(name));
+        let descriptor = row.function + 1;
+        let side = ObjectStart {
+            phase: 3,
+            descriptor_index: descriptor,
+            find_capacity: 1,
+            find_count_ptr: 0x9000,
+            result_ptrs: [0x8000, 0],
+            ..Default::default()
+        };
+        let mut invalid = std::vec![1, 2, 0, 3, 4, 7, u32::MAX];
+        for bit in 3..32 {
+            invalid.push(5 | (1 << bit));
+            invalid.push(6 | (1 << bit));
+        }
+        for gate in invalid {
+            let target = fresh_lp64();
+            let (r, b) = readers(&target);
+            let mut tail = ObjectCallWire::default();
+            let ok = unsafe {
+                if name == "C_FindObjects" {
+                    adapter_emit_find_control(
+                        &mut tail,
+                        Some(&side),
+                        descriptor,
+                        Some(&row),
+                        0,
+                        gate,
+                        r,
+                    )
+                } else {
+                    adapter_emit_get_control(
+                        &mut tail,
+                        Some(&side),
+                        descriptor,
+                        Some(&row),
+                        0,
+                        gate,
+                        r,
+                        b,
+                    )
+                }
+            };
+            assert!(!ok);
+            assert_eq!(target.borrow().log_len, 0);
+        }
+        let target = fresh_lp64();
+        target.borrow_mut().set_word(0x9000, 1);
+        target.borrow_mut().set_word(0x8000, 0x1234);
+        let (r, b) = readers(&target);
+        let mut tail = ObjectCallWire::default();
+        assert!(unsafe {
+            if name == "C_FindObjects" {
+                adapter_emit_find_control(&mut tail, Some(&side), descriptor, Some(&row), 0, 5, r)
+            } else {
+                adapter_emit_get_control(&mut tail, Some(&side), descriptor, Some(&row), 0, 5, r, b)
+            }
+        });
+        if name == "C_FindObjects" {
+            assert_eq!(tail.find_handles[0], 0x1234);
+            assert_eq!(tail.find_len, 1);
+        }
+    }
+}
+
+#[test]
+fn streamed_actual_get_arguments_missing_is_uninspected_and_zero_is_empty() {
+    use crate::object_flow::{capture_get_template, production_capture_get_return};
+    use crate::object_wire::{canonical_object_wire, ObjectAttributeListWire, ObjectStart};
+    let row = canonical_object_wire(fid("C_GetAttributeValue"));
+    for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+        let w = layout.word_bytes() as u64;
+        for missing in [Some(row.template_args[0]), Some(row.template_args[1]), None] {
+            let target = fresh(w);
+            prog_attr(&target, 0x4000, 0, w, SEL_CLASS, 0x8000, w);
+            let mut side = ObjectStart::default();
+            // Reuse must clear stale retained pointers before marking failed args.
+            side.slots[0].kind = ak::CLASS;
+            side.slots[0].value_ptr = 0xdead;
+            side.get_inspected = 1;
+            let mut fetch = |arg| {
+                if missing == Some(arg) {
+                    None
+                } else {
+                    Some(if arg == row.template_args[0] {
+                        0x4000
+                    } else if missing.is_none() {
+                        0
+                    } else {
+                        1
+                    })
+                }
+            };
+            capture_get_template(&mut side, &row, layout, &mut fetch, word_reader(&target));
+            assert_eq!(target.borrow().log_len, 0);
+            assert_eq!(side.get_inspected, 0);
+            assert_eq!(side.slots[0].value_ptr, 0);
+            let mut out = ObjectAttributeListWire::default();
+            let (r, b) = readers(&target);
+            production_capture_get_return(
+                &side,
+                0,
+                ReturnAuthority::AUTHORIZED,
+                layout,
+                &mut out,
+                r,
+                b,
+            );
+            assert_eq!(
+                out.flags,
+                if missing.is_some() {
+                    alf::UNINSPECTED
+                } else {
+                    0
+                }
+            );
+            assert_eq!(out.inspected, 0);
+            assert_eq!(target.borrow().log_len, 0);
+            assert_eq!(
+                side.flags & ofl::ARG_READ_FAILURE as u16,
+                if missing.is_some() {
+                    ofl::ARG_READ_FAILURE as u16
+                } else {
+                    0
+                }
+            );
         }
     }
 }

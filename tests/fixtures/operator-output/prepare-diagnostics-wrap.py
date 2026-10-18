@@ -50,6 +50,15 @@ def check_ledger(rows, acks, nonce, pid, directory, counted, shared, probe=False
     schedule = [('a', index) for index in range(1, counted + 1)]
     if not probe:
         schedule += [('shared', index) for index in range(1, shared + 1)] + [('fence', 1), ('proof', 1)]
+    expected_acks = [('prepared', 0), ('ready', 0)] + [
+        ('a-done', index) for index in range(1, counted + 1)]
+    if not probe:
+        expected_acks += [('b-ready', 0)] + [
+            ('shared-done', index) for index in range(1, shared + 1)] + [
+            ('a-unmapped', 0), ('fence-done', 1), ('final-calls', 1)]
+    expected_acks.append(('done', 0))
+    if [(row['event'], row['round']) for row in acks] != expected_acks:
+        raise ValueError('actual native ACK sequence differs from the independent command schedule')
     expected = [(phase, index, slot) for phase, index in schedule for slot in range(4, 36)]
     if [(row['phase'], row['round'], row['slot']) for row in calls] != expected:
         raise ValueError('actual per-slot call ledger differs from independently issued schedule')
@@ -157,6 +166,7 @@ def build(directory, cc='cc'):
     if sources != {str(path.relative_to(ROOT)): digest(path) for path in (SOURCE, BASE_SOURCE)}:
         raise ValueError('fixture source changed while building')
     return dict(sources=sources, native_check=check_fixture(directory),
+                probe_check=check_fixture(directory, counted=3, shared=1, probe=True),
                 inputs=[dict(name=name, size=(directory / name).stat().st_size,
                              sha256=digest(directory / name)) for name in NAMES],
                 qualification='unprivileged physical-entry topology/ledger only; no observer/BPF/wrap')

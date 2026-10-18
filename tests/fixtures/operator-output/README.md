@@ -177,6 +177,20 @@ ACKs. Missing calls, foreign physical targets, wrong phases and unacknowledged
 rounds fail. This native check establishes fixture behavior, not BPF attribution
 or a startup-fence result; the short installed diagnostic probe is separate.
 
+The new ignored selector is
+`inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_pid_diagnostics_three_round_startup_probe_lp64`.
+It uses the same absolute `P11SCOPE_DIAGNOSTICS_WRAP_PREBUILT_DIR` input seam,
+with freshly source-matched probe-capable C inputs, default1s production cadence
+and a90s bound. Actual committed A32 triggers round2; actual A64 or an exact
+(32,64] public refusal triggers round3. The terminal oracle accepts only genuine
+ordinary A96, or A64 with an explicit32-call AwaitingFence disposition and the
+third32 placed from base64. Both raw observation and exact retained-reference
+checks are required. Each C round must finish before its next read PRE; that
+read's POST must precede the next issued round. The probe exposes actual
+read/decision facts, not a private checkpoint value. Compilation/installed
+execution of this new selector remains separate from its native helper and
+standalone validator checks; do not run the old long gate as a substitute.
+
 ## Paired default-ring useful wrap
 
 The current common-ELF fixture is **not acceptance ready**. Its first installed

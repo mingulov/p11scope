@@ -67,7 +67,7 @@ def internal_callee_instruction(variant, fragment):
     return f"call {pc - 1:#x}"
 
 
-def mutate(disassembly, function, pc, old, new, internal_call=False):
+def mutate(disassembly, function, pc, old, new, internal_call=False, helper_call=False):
     """Change exactly one decoded instruction, retaining its actual-object origin."""
     symbols = list(re.finditer(r"(?m)^[0-9a-f]+ <([^>]+)>:$", disassembly))
     matches = [i for i, symbol in enumerate(symbols) if symbol[1] == function]
@@ -78,8 +78,16 @@ def mutate(disassembly, function, pc, old, new, internal_call=False):
     end = symbols[index + 1].start() if index + 1 < len(symbols) else len(disassembly)
     block = disassembly[start:end]
     pattern = rf"(?m)(^\s*{pc}:[^\n]*\t)({re.escape(old)})(\s*(?:<[^>]+>)?$)"
-    changed, count = re.subn(pattern, lambda m: (m[1].replace("85 00 ", "85 10 ")
-        if internal_call else m[1]) + new + m[3], block)
+    def replacement(match):
+        prefix = match[1]
+        if internal_call or helper_call:
+            opcode = "85 10" if internal_call else "85 00"
+            prefix, count = re.subn(r"(^\s*\d+:\s+)[0-9a-f]{2} [0-9a-f]{2}",
+                lambda found: found[1]+opcode, prefix)
+            if count != 1:
+                raise AssertionError("mutation did not select one instruction opcode")
+        return prefix+new+match[3]
+    changed, count = re.subn(pattern, replacement, block)
     if count != 1 or changed == block:
         raise AssertionError(f"mutation did not change {function}:{pc}: {old!r}")
     return disassembly[:start] + changed + disassembly[end:]
@@ -91,6 +99,21 @@ class EntryObjectTests(unittest.TestCase):
             with self.subTest(variant=variant):
                 reports = CHECKER["seeded_start_contract"](disassembly)
                 self.assertIn("p11_entry", reports)
+                scalar = CHECKER["scalar_scope_flags_contract"](disassembly)
+                if scalar is not None:
+                    _, scalar_insns = instructions(variant, scalar)
+                    # Each mutant changes actual emitted wrapper instructions;
+                    # unknown/private callees and malformed summaries stay closed.
+                    for index, replacement in [(0, "r1 = r2"), (2, "call 0x70"),
+                            (3, "r0 = *(u32 *)(r10 - 0x18)"),
+                            (5, "if r1 == 0x0 goto +0x1"), (6, "r0 = 0x1")]:
+                        pc, old = scalar_insns[index]
+                        with self.subTest(scalar_mutation=index):
+                            with self.assertRaisesRegex(RuntimeError, "scalar scope flags"):
+                                CHECKER["seeded_start_contract"](mutate(disassembly, scalar, pc, old, replacement))
+                    pc, old = scalar_insns[6]
+                    with self.assertRaisesRegex(RuntimeError, "scalar scope flags"):
+                        CHECKER["seeded_start_contract"](mutate(disassembly, scalar, pc, old, scalar_insns[2][1]))
                 memset_name, memset_insns = instructions(variant, "memset")
                 zero_store, zero_text = next((pc, text) for pc, text in memset_insns
                                             if text == "*(u8 *)(r5 + 0x0) = w2")
@@ -106,6 +129,11 @@ class EntryObjectTests(unittest.TestCase):
                         CHECKER["D"].function_blocks(split["uprobe"])[name],
                         {pc: target for caller, _, pc, target in calls if caller == name})
                     facts = consumer.facts()
+                    if scalar is not None:
+                        pc = next(pc for pc, target in consumer.calls.items() if target == scalar)
+                        with self.assertRaisesRegex(RuntimeError, "one scalar scope call"):
+                            CHECKER["seeded_start_contract"](mutate(disassembly, name, pc,
+                                texts[pc], "r0 = 0x1"))
                     mutations = []
                     begin = report["constructor"]
                     seed_arg = next((pc, text) for pc, text in reversed(insns)
@@ -148,10 +176,7 @@ class EntryObjectTests(unittest.TestCase):
                     marker_call = next(pc for pc, target in consumer.calls.items() if target.endswith("object_marker_for"))
                     pc, old = next((pc, text) for pc, text in reversed(insns)
                                    if report["witness"] < pc < marker_call and re.fullmatch(r"r\d+ &= 0x4", text))
-                    changed = mutate(disassembly, name, pc, old, "call 0x70")
-                    pattern = rf"(?m)(^\s*{pc}:\s+)[0-9a-f]{{2}} [0-9a-f]{{2}}(?= )([^\n]*\tcall 0x70)"
-                    changed, count = re.subn(pattern, r"\g<1>85 00\g<2>", changed)
-                    self.assertEqual(count, 1)
+                    changed = mutate(disassembly, name, pc, old, "call 0x70", helper_call=True)
                     with self.assertRaisesRegex(RuntimeError, "private read before construction"):
                         CHECKER["seeded_start_contract"](changed)
 

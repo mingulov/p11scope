@@ -3359,6 +3359,25 @@ mod tests {
     }
 
     #[test]
+    fn terminal_stop_report_carries_actual_h0_watermark() {
+        let mut capture =
+            SemanticCapture::in_domain(NativeDomainId::mint(), TickLimits::default()).unwrap();
+        let before = capture.next_token;
+        let report = capture.stop();
+        assert_eq!(report.outcomes().len(), 1);
+        assert_eq!(report.outcomes()[0].position(), Some(before));
+        assert_eq!(capture.next_token, before + 1);
+        assert_eq!(report.allocated_below(), capture.next_token);
+        assert_eq!(report.awaiting_floor(), None);
+        assert!(!report.exhausted());
+
+        let repeated = capture.stop();
+        assert!(repeated.outcomes().is_empty());
+        assert_eq!(repeated.allocated_below(), capture.next_token);
+        assert_eq!(capture.next_token, before + 1);
+    }
+
+    #[test]
     fn merge_stash_records_shed_floor_and_exhaustion() {
         // C5: merged-overflow sheds record their minimum position; a
         // shed outcome without a position records exhaustion.

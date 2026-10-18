@@ -91,6 +91,15 @@ def drain(fd, into):
     return False
 
 
+def capture_readiness(stdout, stderr, events, *, without_report, dashboard):
+    return (b'"started"' in events
+            or without_report and (
+                b"p11scope: pass 0:" in stderr
+                or b"p11scope: pass 0:" in stdout
+                or dashboard and b"p11scope inventory" in stdout
+            ))
+
+
 def writer_wait(pid):
     """Observe an owned classic observer waiting in write(fd1) or poll.
 
@@ -219,11 +228,11 @@ def run_cell(args, root, label, *, json_output=True, first_signal=None,
                 if now >= next_read and drain(read_fd, stdout):
                     reader_times.append(now)
                     next_read = now + (0.04 if large else 0)
-            if events.exists() and b'"started"' in events.read_bytes():
-                capture_ready = True
-            if without_report and (b"p11scope: pass 0:" in stderr or b"p11scope: pass 0:" in stdout
-                                   or dashboard and b"p11scope inventory" in stdout):
-                capture_ready = True
+            event_bytes = events.read_bytes() if events.exists() else b""
+            capture_ready = capture_ready or capture_readiness(
+                stdout, stderr, event_bytes, without_report=without_report,
+                dashboard=dashboard,
+            )
             if capture_ready and tty and not stopped:
                 if dashboard and b"p11scope inventory" not in stdout:
                     time.sleep(0.01)
@@ -314,6 +323,11 @@ def run_cell(args, root, label, *, json_output=True, first_signal=None,
             if not changed:
                 break
         stdout = stdout[seed:]
+        event_bytes = events.read_bytes() if events.exists() else b""
+        capture_ready = capture_ready or capture_readiness(
+            stdout, stderr, event_bytes, without_report=without_report,
+            dashboard=dashboard,
+        )
         if dashboard or shared:
             start = stdout.find(b"{\n")
             stdout_payload = stdout[start:] if start >= 0 else b""

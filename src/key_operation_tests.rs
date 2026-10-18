@@ -10263,6 +10263,94 @@ fn key_operation_c4_full_fallback_preserves_order() {
     );
 }
 
+/// A resource-backed legacy head keeps staged custody through replay: its
+/// staged charge holds a real lease, so the byte limit still sees it while
+/// the replayed open mints its association as a separate reservation
+/// (source `None`, zero credit). At staged + assoc − 1 the mint refuses —
+/// the open lands refused while S1 still replays the head. Releasing the
+/// staged charge before replay would free the allowance and let the mint
+/// succeed, refunding a live reservation early.
+#[test]
+fn key_operation_resource_backed_legacy_replay_holds_staged_custody() {
+    use crate::semantics_edge::resources::SemanticResourcePool;
+
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
+    let mut scene = JointScene::new();
+    let receipt = scene.bootstrap();
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let admitted = admit_call_input(&mut scene, &init);
+    scene.adapter.attest_key(&admitted).expect("call attests");
+    let facts = admitted.s1_facts().clone();
+    let origin = EffectOrigin::from(&facts);
+    let position = admitted.h0_ordinal();
+
+    // Calibrate the replayed association bytes on a scratch reserver-less
+    // ledger at full limit: the scratch mint always succeeds, so the
+    // leftover charge is exactly one association.
+    let assoc = {
+        let mut scratch = StagingLedger::new();
+        let mut staging = JointStaging::select_joint(Some(&receipt));
+        staging
+            .stage(facts.clone(), origin.clone(), position, &mut scratch)
+            .expect("scratch stages");
+        let mut reducer = EdgeSemantics::default();
+        let mut keyuse = KeyUseReducer::new();
+        let mut sink = Vec::new();
+        let (replayed, _) = staging.ordered_fallback(
+            &mut reducer,
+            &mut keyuse,
+            instance,
+            &mut sink,
+            Some(&mut scratch),
+            None,
+        );
+        assert_eq!(replayed, 1, "scratch replays the head");
+        assert_eq!(
+            keyuse.open().len(),
+            1,
+            "scratch mint succeeds at full limit"
+        );
+        scratch.charged_bytes()
+    };
+    assert!(assoc > 0, "the replayed association charges bytes");
+
+    // The same legacy payload (no collection provenance) on a
+    // resource-backed ledger: its staged charge holds a real lease.
+    let pool = SemanticResourcePool::default();
+    let mut ledger = StagingLedger::with_resources(pool.reserver());
+    let mut staging = JointStaging::select_joint(Some(&receipt));
+    staging
+        .stage(facts.clone(), origin.clone(), position, &mut ledger)
+        .expect("resource-backed head stages");
+    let staged = ledger.charged_bytes();
+    assert!(staged > 0, "the staged head charges bytes");
+    ledger.set_byte_limit(staged + assoc - 1);
+
+    let mut reducer = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    let (replayed, _) = staging.ordered_fallback(
+        &mut reducer,
+        &mut keyuse,
+        instance,
+        &mut sink,
+        Some(&mut ledger),
+        None,
+    );
+    assert_eq!(replayed, 1, "the head still replays through S1");
+    assert_eq!(reducer.started(), 1, "S1 owns the replayed start");
+    assert!(
+        keyuse.open().is_empty(),
+        "custody held: staged + assoc exceeds the limit, so the replayed mint refuses"
+    );
+    assert_eq!(
+        keyuse.refused_opens().len(),
+        1,
+        "the refused open stays tracked for its terminal"
+    );
+}
+
 /// C4: staging N/N+1 falls back in order. 1,024 Creates stage; the
 /// 1,025th refuses Full, replaying all 1,024 in order before its own
 /// direct reduction. S1 matches the direct twin exactly.

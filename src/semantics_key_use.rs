@@ -501,9 +501,11 @@ impl JointStaging {
         // custody: release the staged charge before replay so the
         // replayed open can mint its association at a byte limit
         // (same N15 capacity order as fallback replay). Collected
-        // heads — and legacy heads on a resource-backed ledger, whose
-        // staged charge holds a real lease — hold custody through
-        // replay: the assoc mint joins the live staged reservation.
+        // heads hold custody through replay: the assoc mint joins
+        // the live staged reservation. Legacy heads on a
+        // resource-backed ledger keep the same order — their staged
+        // charge holds a real lease — but mint separately: source
+        // `None` takes no credit and joins nothing.
         let legacy = head.resource_origin.is_none();
         let early_release = legacy && !ledger.has_reserver();
         if early_release {
@@ -836,11 +838,14 @@ impl JointStaging {
             // resource custody: release the staged charge before
             // replay so the replayed open can mint its association
             // at a byte limit (N15 capacity fallback). Collected
-            // heads — and legacy heads on a resource-backed ledger,
-            // whose staged charge holds a real lease — hold custody
-            // through replay: the assoc mint joins the live staged
-            // reservation. A ledger-less fallback still releases
-            // legacy heads early (nothing live to hold).
+            // heads hold custody through replay: the assoc mint
+            // joins the live staged reservation. Legacy heads on a
+            // resource-backed ledger keep the same order — their
+            // staged charge holds a real lease — but mint
+            // separately: source `None` takes no credit and joins
+            // nothing. A ledger-less fallback still queues the
+            // legacy release early (the unavailable ledger may
+            // still hold the lease; nothing is refunded here).
             let legacy = head.resource_origin.is_none();
             let early_release = legacy && !ledger.as_ref().is_some_and(|held| held.has_reserver());
             if early_release {

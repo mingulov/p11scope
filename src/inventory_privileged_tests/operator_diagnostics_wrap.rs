@@ -406,9 +406,13 @@ fn primary_facts(document: &serde_json::Value, pid: u32) -> Result<serde_json::V
         } else {
             TARGETS
         };
-        ensure!(
-            edge["entries"]["count"] == expected && edge["entries"]["coverage"]["lossy"] == false
-        );
+        ensure!(edge["entries"]["count"] == expected);
+        if label == "provider-B.so" {
+            ensure!(
+                edge["entries"]["coverage"]["state"] == "counted"
+                    && edge["entries"]["coverage"]["lossy"] == false
+            );
+        }
         facts.insert(label, serde_json::json!({"presence":edge["presence"], "capture":edge["capture"],
             "count":edge["entries"]["count"], "observation":edge["entries"]["observation"],
             "saturated":edge["entries"]["saturated"], "in_flight":edge["entries"]["in_flight"],

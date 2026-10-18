@@ -5130,7 +5130,7 @@ pub(crate) mod tests {
     #[test]
     fn shared_process_custody_refuses_before_any_arc_allocation() {
         use std::os::fd::AsRawFd as _;
-        let registry = CallerRegistry::new(RegistryLimits::default_limits());
+        let mut registry = CallerRegistry::new(RegistryLimits::default_limits());
         let reserve = registry.semantic_storage_reserver();
         let before = registry.semantic_resource_snapshot().charged_bytes;
         registry.reference_semantic_resource_limit(before);

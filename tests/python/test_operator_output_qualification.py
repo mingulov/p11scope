@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[2]
 ORACLE = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/oracle.py'))
 HARNESS = runpy.run_path(str(ROOT / 'scripts/qualify-operator-output.py'))
 DEMOTION = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/prepare-demotion.py'))
+WRAP = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/prepare-diagnostics-wrap.py'))
 
 
 def fixture():
@@ -285,6 +286,41 @@ class PrebuiltDemotionControls(unittest.TestCase):
                 DEMOTION['build'](directory)
             self.assertEqual(before, {path.name: path.read_bytes() for path in directory.iterdir()})
             self.assertEqual(len(before), 4, 'topology control must clean its own temporary files')
+
+
+class NativeWrapControls(unittest.TestCase):
+    def test_actual32_body_topology_and_independent_schedule_mutations(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            directory = Path(scratch) / 'payload'
+            prepared = WRAP['build'](directory)
+            self.assertEqual(prepared['native_check']['calls'], 192)
+            self.assertEqual(prepared['native_check']['targets'], 32)
+            observed = WRAP['execute_fixture'](directory, 1, 1)
+            def validate(value):
+                return WRAP['check_ledger'](**value, directory=directory, counted=1, shared=1)
+            self.assertEqual(validate(observed)['calls'], 128)
+            for change in ('missing', 'duplicate', 'wrongslot', 'clock', 'return', 'target', 'ack', 'earlyack'):
+                with self.subTest(change=change):
+                    value = copy.deepcopy(observed)
+                    calls = [row for row in value['rows'] if row['kind'] == 'call']
+                    if change == 'missing':
+                        value['rows'].remove(calls[0])
+                    elif change == 'duplicate':
+                        value['rows'].append(dict(calls[0]))
+                    elif change == 'wrongslot':
+                        calls[0]['slot'] = 99
+                    elif change == 'clock':
+                        calls[0]['after_return_ns'] = calls[0]['before_call_ns']
+                    elif change == 'return':
+                        calls[0]['return_status'] = 7
+                    elif change == 'target':
+                        value['rows'][1]['ino'] += 1
+                    elif change == 'ack':
+                        value['acks'].append(dict(value['acks'][2]))
+                    else:
+                        value['acks'][2]['t'] = calls[0]['before_call_ns']
+                    with self.assertRaises(ValueError):
+                        validate(value)
 
 
 class FdControls(unittest.TestCase):

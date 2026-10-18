@@ -15,6 +15,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
+#[cfg(test)]
+#[path = "job_test_support.rs"]
+pub(crate) mod test_support;
+
 struct Request {
     ticket: JobTicket,
     original: Arc<PidPin>,
@@ -389,6 +393,7 @@ mod tests {
 
     #[test]
     fn startup_busy_worker_keeps_inventory_and_public_unknown_frame() {
+        let _worker = test_support::worker_lock();
         use crate::discovery::caller_registry::RegistryLimits;
         use crate::discovery::inventory_workload::{Harness, ScaleSpec};
         use crate::inventory_event_identity::IdentityIndex;

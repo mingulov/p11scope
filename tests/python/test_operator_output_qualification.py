@@ -19,13 +19,23 @@ DEMOTION = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/prepare-dem
 
 def fixture():
     ledger = [dict(kind='call', pid=123, tid=123, fn='C_GenerateRandom', rv=0,
-                   phase='e17', t0=200 + i, t1=201 + i) for i in range(3)]
+                   phase='e17', image=0, scope='selected', t0=200 + i, t1=201 + i) for i in range(3)]
     receipt = dict(issued_calls=3, pid=123, ready_ns=100, workload_complete_ns=300,
                    observer_rc=0, sink='file', cancel='none', source_revision='a' * 40,
                    cleanup_seconds=0.3, terminal_observed_alive=False,
                    ring_requested='4K', ring_actual_bytes=4096,
                    signals=[], cancellation_ack_ns=None, stdout_stalled=False,
                    trace_file_error=None, watchdog=False)
+    image = dict(kind='image', image=0, pid=123, start_time=9, path='/owned/caller',
+                 dev=1, ino=2, mtime_ns=3, pid_namespace=4, time_namespace=5)
+    provider = dict(dev=[8, 1], ino=42, sha256='b' * 64,
+                    mapping=dict(dev=[8, 1], ino=42), file_identity=dict(size=4096))
+    receipt.update(image=dict(image), provider_before=copy.deepcopy(provider),
+                   provider_after=copy.deepcopy(provider))
+    ledger = [image, dict(kind='target', image=0, fn='C_GenerateRandom',
+                         dev=[8, 1], ino=42, file_offset=32),
+              dict(kind='ready', image=0, t=50), *ledger,
+              dict(kind='ack', image=0, phase='e17', t=250)]
     evidence = dict(event_loss=0, malformed_records=0, unmatched_returns=0,
                     scheduling=dict(sink_dropped_bytes=0, sink_timeouts=0))
     counts = dict(stats_entered=3, stats_returned=3, raw_calls=3)
@@ -68,8 +78,8 @@ class OracleTests(unittest.TestCase):
         self.receipt.update(sink='slowpipe', stdout_stalled=True)
         self.evidence['scheduling']['sink_dropped_bytes'] = 17
         trace = render(self.counts, self.evidence)
-        self.assertTrue(self.check(stdout=trace[:-17])['pass'])
-        self.assertFalse(self.check(stdout=trace[:-16])['pass'])
+        self.assertTrue(self.check(stdout=trace[17:])['pass'])
+        self.assertFalse(self.check(stdout=trace[16:])['pass'])
 
     def test_equal_size_stdout_corruption_is_rejected_without_loss(self):
         trace = render(self.counts, self.evidence)
@@ -92,15 +102,71 @@ class OracleTests(unittest.TestCase):
                 elif change == 'issued':
                     receipt['issued_calls'] += 1
                 elif change == 'failed':
-                    ledger[0]['rv'] = 1
+                    ledger[3]['rv'] = 1
                 elif change == 'prefix':
-                    ledger[0]['t0'] = 1
+                    ledger[3]['t0'] = 1
                 elif change == 'wrongpid':
-                    ledger[0]['pid'] += 1
+                    ledger[3]['pid'] += 1
                 else:
-                    ledger[0]['fn'] = 'C_GetInfo'
+                    ledger[3]['fn'] = 'C_GetInfo'
                 trace = render(self.counts, self.evidence)
                 self.assertFalse(ORACLE['evaluate'](trace, trace, ledger, receipt)['pass'])
+
+    def test_image_provider_scope_and_ack_mutations_are_rejected(self):
+        for change in ('noimage', 'image', 'targetdev', 'targetino', 'targetimage',
+                       'targetoffset', 'noack', 'foreignack', 'duplicateack',
+                       'earlyack', 'lateack', 'scope', 'callimage', 'noready', 'duplicateimage'):
+            with self.subTest(change=change):
+                ledger, receipt = copy.deepcopy(self.ledger), copy.deepcopy(self.receipt)
+                if change == 'noimage':
+                    ledger.pop(0)
+                elif change == 'image':
+                    ledger[0]['path'] = '/wrong/caller'
+                elif change == 'targetdev':
+                    ledger[1]['dev'] = [1, 2]
+                elif change == 'targetino':
+                    ledger[1]['ino'] += 1
+                elif change == 'targetimage':
+                    ledger[1]['image'] = 99
+                elif change == 'targetoffset':
+                    ledger[1]['file_offset'] = 99999
+                elif change == 'noack':
+                    ledger.pop()
+                elif change == 'foreignack':
+                    ledger[-1]['image'] = 99
+                elif change == 'duplicateack':
+                    ledger.append(dict(ledger[-1]))
+                elif change == 'earlyack':
+                    ledger[-1]['t'] = 200
+                elif change == 'lateack':
+                    ledger[-1]['t'] = 301
+                elif change == 'scope':
+                    ledger[3]['scope'] = 'outside'
+                elif change == 'callimage':
+                    ledger[3]['image'] = 99
+                elif change == 'noready':
+                    ledger.pop(2)
+                else:
+                    ledger.append(dict(ledger[0]))
+                trace = render(self.counts, self.evidence)
+                self.assertFalse(ORACLE['evaluate'](trace, trace, ledger, receipt)['pass'])
+
+    def test_lossy_same_size_corruption_and_reordering_are_rejected(self):
+        self.receipt.update(sink='slowpipe', stdout_stalled=True)
+        self.evidence['scheduling']['sink_dropped_bytes'] = 17
+        trace = render(self.counts, self.evidence)
+        for damaged in (b'X' * (len(trace) - 17), trace[:-17][::-1]):
+            self.assertFalse(self.check(stdout=damaged)['pass'])
+
+    def test_lossy_stdout_terminal_may_have_only_prior_sink_totals(self):
+        self.receipt.update(sink='slowpipe', stdout_stalled=True)
+        stdout_ev = copy.deepcopy(self.evidence)
+        stdout_ev['scheduling']['sink_dropped_bytes'] = 0
+        stdout = render(self.counts, stdout_ev)[20:]
+        # Final file counter includes both dropped ordinary bytes and its own
+        # decimal-width difference from the earlier stdout terminal snapshot.
+        self.evidence['scheduling']['sink_dropped_bytes'] = 21
+        self.assertTrue(self.check(stdout=stdout)['pass'])
 
     def test_wrong_aggregate_raw_or_duplicate_terminal_rejected(self):
         for field in self.counts:
@@ -166,6 +232,44 @@ class OracleTests(unittest.TestCase):
         for prefix in (b'unexpected private data\n', b'LOST 1 events\n'):
             self.assertFalse(ORACLE['evaluate'](prefix + trace, trace,
                                               self.ledger, self.receipt)['pass'])
+
+
+class BoundedInputAndProviderControls(unittest.TestCase):
+    def test_file_limit_is_enforced_before_retaining_oversized_input(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            path = Path(scratch) / 'output'
+            path.write_bytes(b'X' * 1000000)
+            with self.assertRaisesRegex(ValueError, 'memory bound'):
+                HARNESS['bounded_read'](path, 31)
+            path.write_bytes(b'X' * 31)
+            self.assertEqual(HARNESS['bounded_read'](path, 31), b'X' * 31)
+
+    def test_stable_held_original_does_not_bind_a_replaced_loaded_path(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            path, replacement = root / 'provider', root / 'replacement'
+            path.write_bytes(b'A' * 4096)
+            replacement.write_bytes(b'B' * 4096)
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                path.rename(root / 'held-original')
+                replacement.rename(path)
+                before = HARNESS['PIN_PROVIDER'](fd)
+                foreign_fd = os.open(path, os.O_RDONLY)
+                try:
+                    loaded = HARNESS['PIN_PROVIDER'](foreign_fd)
+                finally:
+                    os.close(foreign_fd)
+                self.assertEqual(before, HARNESS['PIN_PROVIDER'](fd))
+                ledger, receipt, evidence, counts = fixture()
+                receipt.update(provider_before=before, provider_after=copy.deepcopy(before))
+                ledger[1].update(dev=loaded['dev'], ino=loaded['ino'])
+                trace = render(counts, evidence)
+                result = ORACLE['evaluate'](trace, trace, ledger, receipt)
+                self.assertFalse(result['pass'])
+                self.assertTrue(any('mapped held provider' in error for error in result['errors']))
+            finally:
+                os.close(fd)
 
 
 class PrebuiltDemotionControls(unittest.TestCase):

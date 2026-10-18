@@ -12740,6 +12740,58 @@ pub(crate) mod tests {
         }
     }
 
+    /// The owner's disjoint split wires the staged seal tick: the
+    /// adapter/model pair from `parts()` is exactly what `wire` takes.
+    /// Construction alone compiles here; the tick itself stays gated
+    /// (no `tick`/`tick_collected` call).
+    #[test]
+    fn joint_capture_owner_parts_wire_the_seal_tick_without_ticking() {
+        use super::joint_driver::JointCaptureOwner;
+        use crate::semantics_edge::resources::SemanticResourcePool;
+
+        struct WiredOnlyFinalizer;
+        impl H3EvidenceSource for WiredOnlyFinalizer {
+            fn take_h3_disposition(&mut self) -> H3DispositionEvidence {
+                H3DispositionEvidence::genesis()
+            }
+        }
+        impl H3FinalizerPort for WiredOnlyFinalizer {
+            fn acknowledge_h3_void(&mut self, _acknowledgement: H3VoidAcknowledgement) {
+                unreachable!("wired but never ticked");
+            }
+        }
+
+        let mut scene = Scene::new(image_default());
+        let producers = scene.producers();
+        let mut drain = crate::events::EventDrain::over_test_domain(
+            crate::events::ScriptedRecords::records([], 0),
+            7,
+        );
+        let fault = ScriptedFaultCell::steady(7);
+        let mut finalizer = WiredOnlyFinalizer;
+        let pool = SemanticResourcePool::default();
+        let mut owner = JointCaptureOwner::new(JournalLimits::policy(), pool.reserver());
+        {
+            let (adapter, model) = owner.parts();
+            let tick = JointSealTick::wire(
+                adapter,
+                model,
+                &mut drain,
+                &scene.descriptors,
+                &fault,
+                &mut finalizer,
+                scene.fixture.attachment(),
+                &producers,
+            );
+            drop(tick);
+        }
+        assert_eq!(
+            owner.ledger().census(),
+            0,
+            "wiring borrows without charging or ticking"
+        );
+    }
+
     #[test]
     fn object_journal_joint_tick_forwards_void_report() {
         // C3: the production tick forwards the seal's void report to

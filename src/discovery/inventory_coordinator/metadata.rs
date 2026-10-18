@@ -21,7 +21,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         now_ns: u64,
     ) {
         if let Some(metadata) = self.caller_metadata.as_mut() {
-            metadata.tick(&self.adapter, now_ns, observe);
+            metadata.tick(&self.adapter, &self.binder, now_ns, observe);
         }
     }
 
@@ -35,7 +35,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         if let Some(metadata) = self.caller_metadata.as_mut() {
             // Publication can precede the first service tick. Account every
             // current/retired row without starting native or proc I/O here.
-            metadata.synchronize(&self.adapter, now_ns);
+            metadata.synchronize(&self.adapter, &self.binder, now_ns);
         }
     }
 

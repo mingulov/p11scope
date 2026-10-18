@@ -33,8 +33,9 @@ use p11scope_ebpf_common::INVENTORY_DISCOVERY_BYTES;
 use p11scope_ebpf_common::object_capture::{handle_status, object_flag, validate_target_span};
 #[cfg(not(feature = "inventory-only"))]
 use p11scope_ebpf_common::object_flow::{
-    adapter_attributes_entry, adapter_derive_entry, adapter_emit_find, adapter_emit_get_attributes,
-    adapter_fill_return, adapter_tail_fill, continuity_joins, emission_finalize,
+    adapter_attributes_entry, adapter_derive_entry, adapter_emit_find_control,
+    adapter_emit_get_control, adapter_fill_return_control, adapter_tail_fill, continuity_joins,
+    decode_return_gate, emission_finalize, encode_return_gate,
 };
 #[cfg(not(feature = "inventory-only"))]
 use p11scope_ebpf_common::object_wire::{
@@ -2951,21 +2952,23 @@ fn object_entry_attributes(
 // retained pointers and advances READY to RETURNING. Sequencing lives in
 // the shared `adapter_fill_return` (slot gates included), executed by host
 // tests with injected readers; this wrapper only binds BPF-local state.
-// `joined` is the root's continuity verdict, enforced again inside.
+// `gate` carries layout and the explicit root continuity verdict; full-width
+// RV and mechanism scalars remain separate. Five parameters fit BPF registers.
 #[cfg(not(feature = "inventory-only"))]
 #[inline(never)]
 fn object_fill_return(
-    ctx: &RetProbeContext,
     side: Option<&mut ObjectStart>,
-    layout: LinuxLayout,
+    rv: u64,
     mech_status: u32,
     mech: u64,
-    joined: bool,
+    gate: u32,
 ) -> bool {
-    let rv = normalize_target_word(ctx.ret(), layout);
+    let Some((layout, _)) = decode_return_gate(gate) else {
+        return false;
+    };
     let descriptor = side.as_ref().map_or(0, |s| s.descriptor_index);
     let row = OBJECT_DESCRIPTORS.get(descriptor);
-    adapter_fill_return(side, descriptor, row, rv, layout, mech_status, mech, joined, |addr| {
+    adapter_fill_return_control(side, descriptor, row, rv, mech_status, mech, gate, |addr| {
         read_word(addr, layout)
     })
 }
@@ -2998,17 +3001,16 @@ fn object_emit_find(
     tail: *mut ObjectCallWire,
     side: Option<&ObjectStart>,
     descriptor: u32,
-    layout: LinuxLayout,
     rv: u64,
-    joined: bool,
+    gate: u32,
 ) -> bool {
-    // BPF-local: the descriptor lookup plus the probe word reader. All
-    // sequencing lives in the shared adapter, executed by host tests with
-    // injected readers. `joined` is the root's continuity verdict.
+    let Some((layout, _)) = decode_return_gate(gate) else {
+        return false;
+    };
     let row = OBJECT_DESCRIPTORS.get(descriptor);
     // SAFETY: `tail` is the exclusively owned reserved tail by contract.
     unsafe {
-        adapter_emit_find(tail, side, descriptor, row, layout, rv, joined, |addr| {
+        adapter_emit_find_control(tail, side, descriptor, row, rv, gate, |addr| {
             read_word(addr, layout)
         })
     }
@@ -3027,24 +3029,22 @@ fn object_emit_get_attributes(
     tail: *mut ObjectCallWire,
     side: Option<&ObjectStart>,
     descriptor: u32,
-    layout: LinuxLayout,
     rv: u64,
-    joined: bool,
+    gate: u32,
 ) -> bool {
-    // BPF-local: the descriptor lookup plus the probe word/byte readers. All
-    // sequencing lives in the shared adapter, executed by host tests with
-    // injected readers. `joined` is the root's continuity verdict.
+    let Some((layout, _)) = decode_return_gate(gate) else {
+        return false;
+    };
     let row = OBJECT_DESCRIPTORS.get(descriptor);
     // SAFETY: `tail` is the exclusively owned reserved tail by contract.
     unsafe {
-        adapter_emit_get_attributes(
+        adapter_emit_get_control(
             tail,
             side,
             descriptor,
             row,
-            layout,
             rv,
-            joined,
+            gate,
             |addr| read_word(addr, layout),
             |addr, buf| read_bytes_user(addr, buf, layout),
         )
@@ -3706,12 +3706,11 @@ fn p11_return_impl(ctx: RetProbeContext) -> u32 {
         let tail = unsafe { core::ptr::addr_of_mut!((*raw).object) };
         let ready = unsafe { p11_object_side_get(&key, descriptor, 1).as_mut() };
         let filled = object_fill_return(
-            &ctx,
             ready,
-            layout,
+            rv,
             capture_flags & capture::MECHANISM_MASK,
             mechanism,
-            joined,
+            encode_return_gate(layout, joined),
         );
         // Each emission level re-queries its side row like the entry
         // adapters: the helpers stay leaf-flat (no nested native query)
@@ -3721,8 +3720,20 @@ fn p11_return_impl(ctx: RetProbeContext) -> u32 {
         let find_side = unsafe { p11_object_side_get(&key, descriptor, 0).as_ref() };
         let get_side = unsafe { p11_object_side_get(&key, descriptor, 0).as_ref() };
         let emitted = tailed
-            && object_emit_find(tail, find_side, descriptor, layout, rv, joined)
-            && object_emit_get_attributes(tail, get_side, descriptor, layout, rv, joined);
+            && object_emit_find(
+                tail,
+                find_side,
+                descriptor,
+                rv,
+                encode_return_gate(layout, joined),
+            )
+            && object_emit_get_attributes(
+                tail,
+                get_side,
+                descriptor,
+                rv,
+                encode_return_gate(layout, joined),
+            );
         // Submit the completed ring record only after successful
         // removal; otherwise discard it and fault. H7-E2: the shared
         // cleanup decision evaluates the retirement independently of

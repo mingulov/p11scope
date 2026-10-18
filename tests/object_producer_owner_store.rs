@@ -289,6 +289,13 @@ fn object_producer_compiled_frames_are_bounded() {
 }
 
 #[test]
+fn object_producer_compiled_function_abis_fit_five_registers() {
+    let directory = tempfile::tempdir().expect("temporary actual BPF ABI check");
+    let object = embedded_object(directory.path());
+    println!("{}", run_object_checker(&object, "function-abis"));
+}
+
+#[test]
 fn object_producer_sweep_path_within_jump_budget() {
     // Both teardown sweeps run 512 slots per cleanup; every per-slot
     // branch multiplies into the kernel jump budget (live 8193-jump
@@ -535,6 +542,26 @@ def check_leaves(data, report):
     return leaves
 
 
+def check_function_abis(data, report):
+    elf = checker.Elf(data)
+    btf = checker.Btf(elf.sections['.BTF'][1])
+    functions = [node for node in btf.types[1:] if node[0] == 12]
+    assert functions, 'missing emitted BTF functions'
+    names = {node[1] for node in functions}
+    expected = {'object_fill_return', 'object_emit_find', 'object_emit_get_attributes'}
+    assert expected <= names, f'missing actual return wrappers: {expected - names}'
+    over = []
+    for node in functions:
+        proto = btf.types[node[2]]
+        assert proto[0] == 13, f'{node[1]} missing emitted FUNC_PROTO'
+        if proto[3] > 5:
+            over.append((node[1], proto[3]))
+        if node[1] in expected:
+            report.append(f'BPF ABI {node[1]}: {proto[3]} arguments')
+    assert not over, f'emitted BPF functions exceed five-register ABI: {over}'
+    report.append(f'BPF ABI: all {len(functions)} emitted functions <=5 arguments')
+
+
 def check_roots(data, report):
     elf, raws, offsets, bodies, relocations = bodies_and_relocations(data)
     roots = sorted(key for key, symbol in bodies.items()
@@ -640,6 +667,8 @@ def main():
     report = []
     if mode == 'frames':
         check_frames(data, report)
+    elif mode == 'function-abis':
+        check_function_abis(data, report)
     elif mode == 'return-fault':
         check_return_fault(data, report)
     elif mode == 'exec-exit-fault':

@@ -2014,6 +2014,10 @@ pub fn capture_get_return_into(
     if !return_accepts_get_results(rv) || !authority.is_authorized() {
         return 0;
     }
+    if side.flags & crate::object_wire::GET_ENTRY_UNINSPECTED != 0 {
+        out.flags = attr_list_flag::UNINSPECTED;
+        return 0;
+    }
     let n = side.get_inspected.min(8);
     out.inspected = n;
     out.flags = ((side.flags & GET_ENTRY_FLAGS_MASK) >> GET_ENTRY_FLAGS_SHIFT) as u8;

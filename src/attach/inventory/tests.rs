@@ -11,6 +11,50 @@ fn capacity(value: u32) -> NonZeroU32 {
     NonZeroU32::new(value).unwrap()
 }
 
+#[test]
+fn inventory_freeze_owner_metadata_matches_both_embedded_flavors() {
+    for bytes in [
+        crate::EBPF_INVENTORY_OBJECT,
+        crate::EBPF_INVENTORY_CALLERS_OBJECT,
+    ] {
+        let object = aya_obj::Object::parse(bytes).unwrap();
+        let owner = object.maps.get("THREAD_OWNER").unwrap();
+        let actual = map_metadata(
+            MapType::TaskStorage,
+            owner.key_size(),
+            owner.value_size(),
+            owner.max_entries(),
+            owner.map_flags(),
+        );
+        assert_eq!(actual.value_size, 544);
+        validate_inventory_owner_freeze_metadata(actual).unwrap();
+        for changed in [
+            ExactMapMetadata {
+                map_type: MapType::Hash,
+                ..actual
+            },
+            ExactMapMetadata {
+                key_size: actual.key_size + 1,
+                ..actual
+            },
+            ExactMapMetadata {
+                value_size: 560,
+                ..actual
+            },
+            ExactMapMetadata {
+                max_entries: actual.max_entries + 1,
+                ..actual
+            },
+            ExactMapMetadata {
+                flags: actual.flags ^ 1,
+                ..actual
+            },
+        ] {
+            assert!(validate_inventory_owner_freeze_metadata(changed).is_err());
+        }
+    }
+}
+
 fn map_fixture(n: u32) -> BTreeMap<String, (InventoryMapKind, ExactMapMetadata)> {
     use InventoryMapKind as K;
     [

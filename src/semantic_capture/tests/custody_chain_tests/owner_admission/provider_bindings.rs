@@ -7,6 +7,7 @@ use super::*;
 struct ProviderScene {
     scene: AdmissionScene,
     modules: Vec<ModuleKey>,
+    physical_a_file: u32,
     last_copy_charge: Option<usize>,
 }
 
@@ -74,6 +75,22 @@ impl ProviderScene {
                 )
             })
             .collect::<Vec<_>>();
+        let physical_a_file = lane
+            .subset()
+            .required()
+            .keys()
+            .position(|object| {
+                lane.subset()
+                    .pins()
+                    .pinned()
+                    .find(|pin| pin.id == *object)
+                    .is_some_and(|pin| {
+                        std::path::Path::new(pin.path).file_name()
+                            == Some(std::ffi::OsStr::new("scoped-provider.so"))
+                    })
+            })
+            .expect("fixture labels the original physical file independently of slot order")
+            as u32;
         assert_eq!(modules.len(), 2);
         assert_ne!(
             modules[0], modules[1],
@@ -114,6 +131,7 @@ impl ProviderScene {
                 _attestations: held._dir,
             },
             modules,
+            physical_a_file,
             last_copy_charge: None,
         };
         fixture.scene.prepare_without_cookie();
@@ -598,23 +616,29 @@ fn prepared_wrong_physical_provider_preserves_a() {
 #[test]
 fn prepared_providers_share_original_process_custody_in_both_orders() {
     for reverse in [false, true] {
-        let mut fixture = ProviderScene::new(reverse);
-        let first = u32::from(reverse);
-        let second = 1 - first;
-        assert_eq!(fixture.admit(first), Ok(()));
-        let original = fixture.pin();
-        let second = fixture.admit(second);
-        assert!(Arc::ptr_eq(&original, &fixture.pin()));
-        assert!(
-            fixture.scene.h0.0.borrow().accepted >= 2,
-            "both provider scans minted genuine H0 receipts"
-        );
-        assert_eq!(second, Ok(()), "B must join the same accepted caller");
-        fixture.publish();
-        assert_eq!(fixture.scene.coordinator.registry().instances().count(), 2);
-        assert_eq!(fixture.admit(0), Ok(()));
-        assert_eq!(fixture.admit(1), Ok(()));
-        assert!(Arc::ptr_eq(&original, &fixture.pin()));
+        for physical_a_first in [true, false] {
+            let mut fixture = ProviderScene::new(reverse);
+            let first = if physical_a_first {
+                fixture.physical_a_file
+            } else {
+                1 - fixture.physical_a_file
+            };
+            let second = 1 - first;
+            assert_eq!(fixture.admit(first), Ok(()));
+            let original = fixture.pin();
+            let second = fixture.admit(second);
+            assert!(Arc::ptr_eq(&original, &fixture.pin()));
+            assert!(
+                fixture.scene.h0.0.borrow().accepted >= 2,
+                "both provider scans minted genuine H0 receipts"
+            );
+            assert_eq!(second, Ok(()), "B must join the same accepted caller");
+            fixture.publish();
+            assert_eq!(fixture.scene.coordinator.registry().instances().count(), 2);
+            assert_eq!(fixture.admit(0), Ok(()));
+            assert_eq!(fixture.admit(1), Ok(()));
+            assert!(Arc::ptr_eq(&original, &fixture.pin()));
+        }
     }
 }
 

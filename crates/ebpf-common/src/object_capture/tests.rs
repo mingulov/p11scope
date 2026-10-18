@@ -4973,3 +4973,55 @@ fn streamed_stable_recheck_preserves_read_order_and_failure_priority() {
         }
     }
 }
+
+#[test]
+fn streamed_alias_header_failures_keep_all_selected_reads() {
+    for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+        let w = layout.word_bytes() as u64;
+        for (other_ptr, other_len, overlaps) in [
+            (0x8000, 16, true),
+            (0, 16, false),
+            (0x9000, 16, false),
+            (u64::MAX, 16, false),
+            (0x8000, 0, false),
+            (0x7ff8, 9, true),
+        ] {
+            for failed in 0..4 {
+                let target = fresh(w);
+                prog_attr(&target, 0x4000, 0, w, SEL_TOKEN, other_ptr, other_len);
+                if failed & 1 != 0 {
+                    target.borrow_mut().set_fail(0x4000 + w);
+                }
+                if failed & 2 != 0 {
+                    target.borrow_mut().set_fail(0x4000 + 2 * w);
+                }
+                let (alias, flags) = request_alias_scan(
+                    0x4000,
+                    1,
+                    u64::MAX,
+                    0x8000,
+                    8,
+                    layout,
+                    &mut word_reader(&target),
+                );
+                assert_eq!(alias, failed == 0 && overlaps);
+                assert_eq!(
+                    flags,
+                    if failed == 0 {
+                        0
+                    } else {
+                        alf::HEADER_READ_FAILURE
+                    }
+                );
+                assert_eq!(
+                    target.borrow().log(),
+                    &[
+                        (READ_WORD, 0x4000, w),
+                        (READ_WORD, 0x4000 + w, w),
+                        (READ_WORD, 0x4000 + 2 * w, w),
+                    ]
+                );
+            }
+        }
+    }
+}

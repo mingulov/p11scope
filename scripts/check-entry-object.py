@@ -1015,6 +1015,38 @@ class _SeedCaller(Consumer):
         return state
 
 
+def scalar_scope_flags_contract(disassembly):
+    """Summarize only the actual scalar wrapper's own-stack/full-word effects.
+
+    The real authority body remains scope_auth. This eight-instruction
+    wrapper supplies its own 32-byte output, returns flags64 on Some and zero
+    on None, and cannot write a caller's seed or perform a target read.
+    """
+    split = sections(disassembly)
+    blocks = D.function_blocks(split.get(".text", ""))
+    names = [name for name in blocks if name.endswith("scope_flags_word")]
+    require(len(names) <= 1, "scalar scope flags wrapper inventory")
+    if not names:
+        return None  # Earlier objects call the already-modeled authority directly.
+    name = names[0]
+    insns = D.instructions(blocks[name])
+    patterns = (r"r1 = r10", r"r1 \+= -0x20", r"call -?0x[0-9a-f]+",
+                r"r0 = \*\(u64 \*\)\(r10 - 0x18\)",
+                r"r1 = \*\(u64 \*\)\(r10 - 0x20\)",
+                r"if r1 != 0x0 goto .*", r"r0 = 0x0", r"exit")
+    require(len(insns) == len(patterns)
+            and all(re.fullmatch(pattern, text) for (_, text), pattern in zip(insns, patterns)),
+            "scalar scope flags own-stack/full64/discriminant effects")
+    calls = [(pc, target) for caller, _, pc, target in D.internal_call_targets(split[".text"])
+             if caller == name]
+    require(len(calls) == 1 and calls[0][0] == insns[2][0]
+            and calls[0][1].endswith("scope_auth") and calls[0][1] in blocks,
+            "scalar scope flags one actual scope_auth callee")
+    require(D.relative_target(insns[5][0], insns[5][1]) == insns[7][0],
+            "scalar scope flags zero-refusal branch")
+    return name
+
+
 def seeded_start_contract(disassembly):
     """Actual ordinary-entry key/immutable-seed wiring, independent of old pins.
 
@@ -1022,6 +1054,7 @@ def seeded_start_contract(disassembly):
     contracts, not summarized as a second owner algorithm here. This proves
     caller provenance and refusal edges; it is not kernel verifier acceptance.
     """
+    scalar_scope = scalar_scope_flags_contract(disassembly)
     split = sections(disassembly)
     require(".text" in split and "uprobe" in split, "seeded START missing sections")
     blocks = D.function_blocks(split[".text"])
@@ -1041,6 +1074,9 @@ def seeded_start_contract(disassembly):
         if not name.startswith("p11_entry") or name == "p11_entry_template_second":
             continue
         consumer = _SeedCaller("uprobe", name, lines, {pc: target for caller, _, pc, target in calls if caller == name})
+        if scalar_scope is not None:
+            require(sum(target == scalar_scope for target in consumer.calls.values()) == 1,
+                    name + ": seeded START one scalar scope call")
         begins = [pc for pc, target in consumer.calls.items() if target == "p11_owner_start_begin"]
         require(len(begins) == 1, name + ": seeded START constructor inventory")
         begin = begins[0]
@@ -1089,7 +1125,8 @@ def seeded_start_contract(disassembly):
         for pc in can_reach_begin:
             target = consumer.calls.get(pc, "")
             require(not target or target in ("memset", "p11_link_current_identity", "p11_instance_entry")
-                    or target.endswith(("scope_auth", "object_marker_for")),
+                    or target.endswith(("scope_auth", "object_marker_for"))
+                    or (scalar_scope is not None and target == scalar_scope),
                     name + ": seeded START unknown pre-construction callee effects")
             require(pc not in consumer.helper or consumer.text[pc] in
                     ("call 0x1", "call 0x5", "call 0xc", "call 0xe", "call 0xae"),

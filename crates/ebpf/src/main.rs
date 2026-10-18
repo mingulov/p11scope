@@ -33,9 +33,9 @@ use p11scope_ebpf_common::INVENTORY_DISCOVERY_BYTES;
 use p11scope_ebpf_common::object_capture::{handle_status, object_flag, validate_target_span};
 #[cfg(not(feature = "inventory-only"))]
 use p11scope_ebpf_common::object_flow::{
-    adapter_attributes_entry, adapter_derive_entry, adapter_emit_find_control,
+    ReturnEventFacts, adapter_attributes_entry, adapter_derive_entry, adapter_emit_find_control,
     adapter_emit_get_control, adapter_fill_return_control, adapter_tail_fill, continuity_joins,
-    decode_return_gate, emission_finalize, encode_return_gate,
+    decode_return_gate, emission_finalize, encode_return_gate, fill_call_event,
 };
 #[cfg(not(feature = "inventory-only"))]
 use p11scope_ebpf_common::object_wire::{
@@ -404,7 +404,6 @@ fn read_word_pair(address: u64, layout: LinuxLayout) -> Result<[u64; 2], ()> {
 }
 
 const _: [(); 288] = [(); core::mem::size_of::<CallStart>()];
-
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -2899,7 +2898,9 @@ fn object_entry_find(
     let capacity = if row.find_capacity_arg == ARG_NONE {
         0
     } else {
-        arg_u64(ctx, row.find_capacity_arg, layout).ok().unwrap_or(0)
+        arg_u64(ctx, row.find_capacity_arg, layout)
+            .ok()
+            .unwrap_or(0)
     };
     let count_ptr = if row.find_count_arg == ARG_NONE {
         0
@@ -3457,12 +3458,12 @@ fn p11_return_impl(ctx: RetProbeContext) -> u32 {
     if slot >= MAX_SLOTS {
         return 0;
     }
-    let key = StartKey {
-        pid_tgid: helpers::bpf_get_current_pid_tgid(),
-        slot,
-        _pad: 0,
-    };
     let Some(flags) = scope_flags() else {
+        let key = StartKey {
+            pid_tgid: helpers::bpf_get_current_pid_tgid(),
+            slot,
+            _pad: 0,
+        };
         // Entry-time scope owns this pairing record. If a task migrates out
         // of a selected cgroup mid-call, clean it up without emitting an
         // out-of-scope event and disclose the lost completion.
@@ -3476,66 +3477,47 @@ fn p11_return_impl(ctx: RetProbeContext) -> u32 {
         }
         return 0;
     };
+    let key = StartKey {
+        pid_tgid: helpers::bpf_get_current_pid_tgid(),
+        slot,
+        _pad: 0,
+    };
     let Some(layout) = ret_probe_layout(&ctx) else {
         owned_start_discard(&key);
         bump_evidence(EVIDENCE_ABI_REFUSALS);
         return 0;
     };
-    // No start entry means the entry probe filtered this call out (or the
-    // process was already inside the function at attach time). Either way
-    // there is nothing to attribute. The row is copied: the drain below
-    // deletes it, and the event is built from the copy afterwards.
-    let Some(&start) = owned_start_get(&key) else {
+    // Dispatch under the same physical owner. No START reference crosses
+    // an outlined call: the object branch receives only a raw live pointer.
+    let start = unsafe { p11_owner_start_get(&key, 0) };
+    if start.is_null() {
         return 0;
-    };
-    if start.object_required == 0 {
-        if owned_start_remove(&key, true).is_err() {
-            // Removal failure is capture loss (a contradicted subordinate
-            // row fails here too): disclose it and invalidate the audit.
-            unsafe { p11_object_fault() };
-            bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
-            return 0;
-        }
-    } else {
-        // Slice D activation: query the validated side row and require
-        // ready phase, attached-descriptor and retained-ABI agreement.
-        // The drain retire moves after emission below: the side row must
-        // stay alive while the 608-byte record is reserved and filled.
-        // Query plus retire stays the drain (a monolithic native drain
-        // nests too deep for return's 512-byte call-chain budget; see
-        // object_producer_compiled_frames_are_bounded). Any failure
-        // discards the record: no ring reservation, no facts.
-        let layout_code = match layout {
-            LinuxLayout::Lp64 => u32::from(OBJECT_LAYOUT_LP64),
-            LinuxLayout::Ilp32 => u32::from(OBJECT_LAYOUT_ILP32),
-        };
-        let descriptor = cookie_descriptor(cookie_of(&ctx));
-        let ready = unsafe { p11_object_side_get(&key, descriptor, 1).as_ref() };
-        if ready.is_none() {
-            // H7-E2: every refusal retires identifiable owned state
-            // through the checked removal before returning; the fault
-            // below fires whether or not the retire settles.
-            let _ = owned_start_remove(&key, true);
-            unsafe { p11_object_fault() };
-            bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
-            return 0;
-        }
-        let side = unsafe { p11_object_side_get(&key, descriptor, 0).as_ref() };
-        let agreed = side.is_some_and(|row| {
-            row.descriptor_index == descriptor
-                && (row.layout == 0 || u32::from(row.layout) == layout_code)
-        });
-        if !agreed {
-            // H7-E2: retire before returning, as on every refusal arm.
-            let _ = owned_start_remove(&key, true);
-            unsafe { p11_object_fault() };
-            bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
-            return 0;
-        }
     }
+    if unsafe { (*start).object_required } == 0 {
+        ordinary_return(ctx, &key, start, flags, layout)
+    } else {
+        object_return(ctx, &key, start, flags, layout)
+    }
+}
 
+#[cfg(not(feature = "inventory-only"))]
+#[derive(Clone, Copy)]
+struct ReturnAccounting {
+    now: u64,
+    delta: u64,
+    rv: u64,
+}
+
+#[cfg(not(feature = "inventory-only"))]
+#[inline(always)]
+fn account_return(
+    ctx: &RetProbeContext,
+    slot: u32,
+    entry_ns: u64,
+    layout: LinuxLayout,
+) -> ReturnAccounting {
     let now = unsafe { helpers::bpf_ktime_get_ns() };
-    let delta = now.saturating_sub(start.ts_ns);
+    let delta = now.saturating_sub(entry_ns);
     let rv = normalize_target_word(ctx.ret(), layout);
 
     if let Some(stats) = STATS.get_ptr_mut(slot) {
@@ -3564,38 +3546,23 @@ fn p11_return_impl(ctx: RetProbeContext) -> u32 {
         bump_evidence(EVIDENCE_RV_UPDATE_FAILURES);
     }
 
-    if flags & FLAG_POLICY_AGGREGATE != 0 {
-        // Aggregate records nothing: retire the object side row (its
-        // retire moved after emission) before the early return.
-        if start.object_required != 0 && owned_start_remove(&key, true).is_err() {
-            unsafe { p11_object_fault() };
-            bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
-        }
-        return 0;
-    }
+    ReturnAccounting { now, delta, rv }
+}
 
-    // Physical ownership and successful settlement above guard aggregate pairing.
-    // Image equality additionally guards retained semantic pointer reads.
-    let mut image = ImageIdentity::default();
-    if unsafe { p11_link_current_identity(&mut image) } != 1
-        || !image_pair_matches(start.image, image)
-    {
-        // H7-E2: image refusal retires held object calls with a fault;
-        // ordinary calls were already retired above and keep their
-        // accounting-only refusal.
-        if start.object_required != 0 {
-            let _ = owned_start_remove(&key, true);
-            unsafe { p11_object_fault() };
-        }
-        bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
-        return 0;
-    }
-
-    let semantics = semantics_of(&ctx);
+#[cfg(not(feature = "inventory-only"))]
+#[inline(always)]
+fn capture_return_facts(
+    ctx: &RetProbeContext,
+    start: &CallStart,
+    flags: u64,
+    layout: LinuxLayout,
+    accounting: ReturnAccounting,
+) -> ReturnEventFacts {
+    let semantics = semantics_of(ctx);
     let mut mechanism = start.mechanism;
     let mut capture_flags = start.capture;
     if flags & FLAG_POLICY_ALLOWLISTED != 0
-        && return_allows_mechanism(rv)
+        && return_allows_mechanism(accounting.rv)
         && start.mechanism_ptr != 0
     {
         match read_word(start.mechanism_ptr, layout) {
@@ -3616,7 +3583,7 @@ fn p11_return_impl(ctx: RetProbeContext) -> u32 {
     let mut session = start.session;
     if semantics.lifecycle == lifecycle::OPEN_SESSION
         && start.out_ptr != 0
-        && (rv == 0 || rv == 0x204)
+        && (accounting.rv == 0 || accounting.rv == 0x204)
     {
         // C_OpenSession wrote the handle by now. Only trust it on success.
         match read_word(start.out_ptr, layout) {
@@ -3625,7 +3592,7 @@ fn p11_return_impl(ctx: RetProbeContext) -> u32 {
         }
     }
     let mut async_value = start.async_value;
-    if rv == 0 && start.out_ptr != 0 && semantics.lifecycle == lifecycle::ASYNC_GET_ID {
+    if accounting.rv == 0 && start.out_ptr != 0 && semantics.lifecycle == lifecycle::ASYNC_GET_ID {
         match read_word(start.out_ptr, layout) {
             Ok(value) => async_value = value,
             Err(_) => {
@@ -3635,136 +3602,218 @@ fn p11_return_impl(ctx: RetProbeContext) -> u32 {
         }
     }
 
-    let ev = Event {
-        ts_ns: now,
-        duration_ns: delta,
+    ReturnEventFacts {
+        ts_ns: accounting.now,
+        duration_ns: accounting.delta,
+        rv: accounting.rv,
+        mechanism,
+        session,
+        async_value,
+        capture_flags,
         pid_tgid: helpers::bpf_get_current_pid_tgid(),
         cgroup_id: unsafe { helpers::bpf_get_current_cgroup_id() },
-        session,
-        slot_id: start.slot_id,
-        mechanism,
-        flags: start.flags,
-        rv,
-        p0: start.p0,
-        p1: start.p1,
-        p2: start.p2,
-        async_value,
-        slot,
-        target_function: start.target_function,
-        user_type: start.user_type,
-        shape: start.shape,
-        attr_types: start.attr_types,
-        attr_count: start.attr_count,
-        attr_total: start.attr_total,
-        attr_bools: start.attr_bools,
-        attr_bools_seen: start.attr_bools_seen,
-        attr_types1: start.attr_types1,
-        attr_count1: start.attr_count1,
-        attr_total1: start.attr_total1,
-        attr_bools1: start.attr_bools1,
-        attr_bools_seen1: start.attr_bools_seen1,
-        capture: capture_flags,
-        event_type: event_type::CALL,
-        image: start.image,
-        child_image: ImageIdentity::default(),
         root_affiliation: unsafe { p11_root_current_tag() },
-    };
-    if start.object_required != 0 {
-        // Slice D emission: reserve the complete 608-byte record BEFORE
-        // any result/attribute read. Reservation failure performs no new
-        // reads: disclose loss, clean ownership, keep the aggregate
-        // return/RV accounting recorded above, and return.
-        let descriptor = cookie_descriptor(cookie_of(&ctx));
-        let rv = normalize_target_word(ctx.ret(), layout);
-        let Some(mut entry) = EVENTS.reserve::<ObjectEventRecord>(0) else {
-            if owned_start_remove(&key, true).is_err() {
-                unsafe { p11_object_fault() };
-            }
-            bump_evidence(EVIDENCE_RING_LOSS);
-            return 0;
-        };
-        // H7-E1: populate in place under ownership with the base event
-        // and its continuity landing in the reserved record FIRST, then
-        // the join gate before any object result read, then (with the S1
-        // return-time mechanism evidence the return body just captured)
-        // the result fills and tail sections. Any refusal discards: no
-        // facts. A found continuity entry is not a join: only the full
-        // stamp predicate authorizes result/Find/attribute reads.
-        let raw = entry.as_mut_ptr();
-        unsafe {
-            core::ptr::write(core::ptr::addr_of_mut!((*raw).base.event), ev);
-            let _ = p11_instance_return(&key, core::ptr::addr_of_mut!((*raw).base.continuity));
-        }
-        let joined = unsafe { continuity_joins(&(*raw).base.continuity) };
-        if !joined {
-            let _ = owned_start_remove(&key, true);
-            unsafe { p11_object_fault() };
-            entry.discard(0);
-            bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
-            return 0;
-        }
-        let tail = unsafe { core::ptr::addr_of_mut!((*raw).object) };
-        let ready = unsafe { p11_object_side_get(&key, descriptor, 1).as_mut() };
-        let filled = object_fill_return(
-            ready,
-            rv,
-            capture_flags & capture::MECHANISM_MASK,
-            mechanism,
-            encode_return_gate(layout, joined),
-        );
-        // Each emission level re-queries its side row like the entry
-        // adapters: the helpers stay leaf-flat (no nested native query)
-        // so their 64-byte frames fit the 512-byte return chain.
-        let tail_side = unsafe { p11_object_side_get(&key, descriptor, 0).as_ref() };
-        let tailed = filled && object_tail_fill(tail, tail_side, descriptor);
-        let find_side = unsafe { p11_object_side_get(&key, descriptor, 0).as_ref() };
-        let get_side = unsafe { p11_object_side_get(&key, descriptor, 0).as_ref() };
-        let emitted = tailed
-            && object_emit_find(
-                tail,
-                find_side,
-                descriptor,
-                rv,
-                encode_return_gate(layout, joined),
-            )
-            && object_emit_get_attributes(
-                tail,
-                get_side,
-                descriptor,
-                rv,
-                encode_return_gate(layout, joined),
-            );
-        // Submit the completed ring record only after successful
-        // removal; otherwise discard it and fault. H7-E2: the shared
-        // cleanup decision evaluates the retirement independently of
-        // emission success, so a failed fill/emission still retires owned
-        // state and no read runs after either failure.
-        let outcome = emission_finalize(emitted, || owned_start_remove(&key, true).is_ok());
-        if !outcome.submitted {
-            unsafe { p11_object_fault() };
-            entry.discard(0);
-            bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
-            return 0;
-        }
-        entry.submit(0);
+    }
+}
+
+#[cfg(not(feature = "inventory-only"))]
+#[inline(never)]
+fn ordinary_return(
+    ctx: RetProbeContext,
+    key: &StartKey,
+    start: *const CallStart,
+    flags: u64,
+    layout: LinuxLayout,
+) -> u32 {
+    let ctx = &ctx;
+    let key = *key;
+    // Preserve the ordinary snapshot and checked early retirement. The copy
+    // is the only START data used after removal; no map reference survives.
+    let start = unsafe { *start };
+    if owned_start_remove(&key, true).is_err() {
+        unsafe { p11_object_fault() };
+        bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
         return 0;
     }
+    let accounting = account_return(ctx, key.slot, start.ts_ns, layout);
+    if flags & FLAG_POLICY_AGGREGATE != 0 {
+        return 0;
+    }
+    let mut image = ImageIdentity::default();
+    if unsafe { p11_link_current_identity(&mut image) } != 1
+        || !image_pair_matches(start.image, image)
+    {
+        bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
+        return 0;
+    }
+    let facts = capture_return_facts(ctx, &start, flags, layout, accounting);
     match EVENTS.reserve::<EventRecord>(0) {
         Some(mut e) => {
             let raw = e.as_mut_ptr();
-            // SAFETY: `raw` is the reserved, exclusively owned record. The
-            // event is written as before; the native return half then fills
-            // every byte of the private continuity tail in place.
             unsafe {
-                core::ptr::write(core::ptr::addr_of_mut!((*raw).event), ev);
+                fill_call_event(
+                    core::ptr::addr_of_mut!((*raw).event),
+                    &start,
+                    key.slot,
+                    &facts,
+                );
                 let _ = p11_instance_return(&key, core::ptr::addr_of_mut!((*raw).continuity));
             }
             e.submit(0);
         }
-        None => {
-            bump_evidence(EVIDENCE_RING_LOSS);
-        }
+        None => bump_evidence(EVIDENCE_RING_LOSS),
     }
+    0
+}
+
+#[cfg(not(feature = "inventory-only"))]
+#[inline(never)]
+fn object_return(
+    ctx: RetProbeContext,
+    key: &StartKey,
+    start: *const CallStart,
+    flags: u64,
+    layout: LinuxLayout,
+) -> u32 {
+    let ctx = &ctx;
+    let key = *key;
+    // Slice D activation: query the validated side row and require
+    // ready phase, attached-descriptor and retained-ABI agreement.
+    // The drain retire moves after emission below: the side row must
+    // stay alive while the 608-byte record is reserved and filled.
+    // Query plus retire stays the drain (a monolithic native drain
+    // nests too deep for return's 512-byte call-chain budget; see
+    // object_producer_compiled_frames_are_bounded). Any failure
+    // discards the record: no ring reservation, no facts.
+    let layout_code = match layout {
+        LinuxLayout::Lp64 => u32::from(OBJECT_LAYOUT_LP64),
+        LinuxLayout::Ilp32 => u32::from(OBJECT_LAYOUT_ILP32),
+    };
+    let descriptor = cookie_descriptor(cookie_of(ctx));
+    let ready = unsafe { p11_object_side_get(&key, descriptor, 1).as_ref() };
+    if ready.is_none() {
+        // H7-E2: every refusal retires identifiable owned state
+        // through the checked removal before returning; the fault
+        // below fires whether or not the retire settles.
+        let _ = owned_start_remove(&key, true);
+        unsafe { p11_object_fault() };
+        bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
+        return 0;
+    }
+    let side = unsafe { p11_object_side_get(&key, descriptor, 0).as_ref() };
+    let agreed = side.is_some_and(|row| {
+        row.descriptor_index == descriptor
+            && (row.layout == 0 || u32::from(row.layout) == layout_code)
+    });
+    if !agreed {
+        // H7-E2: retire before returning, as on every refusal arm.
+        let _ = owned_start_remove(&key, true);
+        unsafe { p11_object_fault() };
+        bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
+        return 0;
+    }
+    let accounting = account_return(ctx, key.slot, unsafe { (*start).ts_ns }, layout);
+    if flags & FLAG_POLICY_AGGREGATE != 0 {
+        if owned_start_remove(&key, true).is_err() {
+            unsafe { p11_object_fault() };
+            bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
+        }
+        return 0;
+    }
+    let mut image = ImageIdentity::default();
+    if unsafe { p11_link_current_identity(&mut image) } != 1
+        || !image_pair_matches(unsafe { (*start).image }, image)
+    {
+        let _ = owned_start_remove(&key, true);
+        unsafe { p11_object_fault() };
+        bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
+        return 0;
+    }
+    // This short immutable borrow ends before reservation/native continuity
+    // or side-row helpers. All retained START reads finish before removal.
+    let facts = unsafe { capture_return_facts(ctx, &*start, flags, layout, accounting) };
+    // Slice D emission: reserve the complete 608-byte record BEFORE
+    // any result/attribute read. Reservation failure performs no new
+    // reads: disclose loss, clean ownership, keep the aggregate
+    // return/RV accounting recorded above, and return.
+    let descriptor = cookie_descriptor(cookie_of(ctx));
+    let rv = accounting.rv;
+    let Some(mut entry) = EVENTS.reserve::<ObjectEventRecord>(0) else {
+        if owned_start_remove(&key, true).is_err() {
+            unsafe { p11_object_fault() };
+        }
+        bump_evidence(EVIDENCE_RING_LOSS);
+        return 0;
+    };
+    // H7-E1: populate in place under ownership with the base event
+    // and its continuity landing in the reserved record FIRST, then
+    // the join gate before any object result read, then (with the S1
+    // return-time mechanism evidence the return body just captured)
+    // the result fills and tail sections. Any refusal discards: no
+    // facts. A found continuity entry is not a join: only the full
+    // stamp predicate authorizes result/Find/attribute reads.
+    let raw = entry.as_mut_ptr();
+    unsafe {
+        fill_call_event(
+            core::ptr::addr_of_mut!((*raw).base.event),
+            &*start,
+            key.slot,
+            &facts,
+        );
+        let _ = p11_instance_return(&key, core::ptr::addr_of_mut!((*raw).base.continuity));
+    }
+    let joined = unsafe { continuity_joins(&(*raw).base.continuity) };
+    if !joined {
+        let _ = owned_start_remove(&key, true);
+        unsafe { p11_object_fault() };
+        entry.discard(0);
+        bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
+        return 0;
+    }
+    let tail = unsafe { core::ptr::addr_of_mut!((*raw).object) };
+    let ready = unsafe { p11_object_side_get(&key, descriptor, 1).as_mut() };
+    let filled = object_fill_return(
+        ready,
+        rv,
+        facts.capture_flags & capture::MECHANISM_MASK,
+        facts.mechanism,
+        encode_return_gate(layout, joined),
+    );
+    // Each emission level re-queries its side row like the entry
+    // adapters: the helpers stay leaf-flat (no nested native query)
+    // and their measured frames count in the complete 512-byte chain.
+    let tail_side = unsafe { p11_object_side_get(&key, descriptor, 0).as_ref() };
+    let tailed = filled && object_tail_fill(tail, tail_side, descriptor);
+    let find_side = unsafe { p11_object_side_get(&key, descriptor, 0).as_ref() };
+    let get_side = unsafe { p11_object_side_get(&key, descriptor, 0).as_ref() };
+    let emitted = tailed
+        && object_emit_find(
+            tail,
+            find_side,
+            descriptor,
+            rv,
+            encode_return_gate(layout, joined),
+        )
+        && object_emit_get_attributes(
+            tail,
+            get_side,
+            descriptor,
+            rv,
+            encode_return_gate(layout, joined),
+        );
+    // Submit the completed ring record only after successful
+    // removal; otherwise discard it and fault. H7-E2: the shared
+    // cleanup decision evaluates the retirement independently of
+    // emission success, so a failed fill/emission still retires owned
+    // state and no read runs after either failure.
+    let outcome = emission_finalize(emitted, || owned_start_remove(&key, true).is_ok());
+    if !outcome.submitted {
+        unsafe { p11_object_fault() };
+        entry.discard(0);
+        bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
+        return 0;
+    }
+    entry.submit(0);
     0
 }
 

@@ -4791,3 +4791,185 @@ fn streamed_get_retained_index_boundary_refuses_before_target_reads() {
         }
     }
 }
+
+#[test]
+fn completed_event_in_place_initializes_all_bytes_from_owned_facts() {
+    use crate::object_flow::{fill_call_event, ReturnEventFacts};
+    use crate::{CallStart, Event, ImageIdentity};
+    let start = CallStart {
+        ts_ns: 900,
+        session: 2,
+        slot_id: 3,
+        mechanism: 4,
+        mechanism_ptr: u64::MAX,
+        flags: 5,
+        out_ptr: u64::MAX - 1,
+        user_type: 6,
+        shape: 7,
+        p0: 8,
+        p1: 9,
+        p2: 10,
+        async_value: 11,
+        attr_types: [12, 13, 14, 15, 16, 17, 18, 19],
+        attr_count: 20,
+        attr_total: 21,
+        attr_bools: 22,
+        attr_bools_seen: 23,
+        attr_types1: [24, 25, 26, 27, 28, 29, 30, 31],
+        attr_count1: 32,
+        attr_total1: 33,
+        attr_bools1: 34,
+        attr_bools_seen1: 35,
+        capture: 36,
+        target_function: 37,
+        object_required: u64::MAX - 2,
+        image: ImageIdentity {
+            task_cookie: 38,
+            exec_id: 39,
+        },
+    };
+    for word in [0, 0x1_0000_0001, u64::MAX] {
+        let facts = ReturnEventFacts {
+            ts_ns: word,
+            duration_ns: word.wrapping_sub(1),
+            rv: word.wrapping_sub(2),
+            mechanism: word.wrapping_sub(3),
+            session: word.wrapping_sub(4),
+            async_value: word.wrapping_sub(5),
+            capture_flags: 0x8000_0041,
+            pid_tgid: word.wrapping_sub(6),
+            cgroup_id: word.wrapping_sub(7),
+            root_affiliation: word.wrapping_sub(8),
+        };
+        let expected = Event {
+            ts_ns: facts.ts_ns,
+            duration_ns: facts.duration_ns,
+            pid_tgid: facts.pid_tgid,
+            cgroup_id: facts.cgroup_id,
+            session: facts.session,
+            slot_id: 3,
+            mechanism: facts.mechanism,
+            flags: 5,
+            rv: facts.rv,
+            p0: 8,
+            p1: 9,
+            p2: 10,
+            async_value: facts.async_value,
+            slot: 40,
+            target_function: 37,
+            user_type: 6,
+            shape: 7,
+            attr_types: [12, 13, 14, 15, 16, 17, 18, 19],
+            attr_count: 20,
+            attr_total: 21,
+            attr_bools: 22,
+            attr_bools_seen: 23,
+            attr_types1: [24, 25, 26, 27, 28, 29, 30, 31],
+            attr_count1: 32,
+            attr_total1: 33,
+            attr_bools1: 34,
+            attr_bools_seen1: 35,
+            capture: facts.capture_flags,
+            event_type: crate::event_type::CALL,
+            image: ImageIdentity {
+                task_cookie: 38,
+                exec_id: 39,
+            },
+            child_image: ImageIdentity {
+                task_cookie: 0,
+                exec_id: 0,
+            },
+            root_affiliation: facts.root_affiliation,
+        };
+        for poison in [0xA5, 0x5A] {
+            let mut actual = core::mem::MaybeUninit::<Event>::uninit();
+            // All Event fields are integer scalars/arrays. The frozen Event
+            // has no padding; compare all328 bytes, including zero child image.
+            unsafe {
+                core::ptr::write_bytes(
+                    actual.as_mut_ptr().cast::<u8>(),
+                    poison,
+                    core::mem::size_of::<Event>(),
+                );
+                fill_call_event(actual.as_mut_ptr(), &start, 40, &facts);
+                let actual = core::slice::from_raw_parts(
+                    actual.as_ptr().cast::<u8>(),
+                    core::mem::size_of::<Event>(),
+                );
+                let expected = core::slice::from_raw_parts(
+                    (&expected as *const Event).cast::<u8>(),
+                    core::mem::size_of::<Event>(),
+                );
+                assert_eq!(actual.len(), 328);
+                assert_eq!(actual, expected, "word={word} poison={poison}");
+            }
+        }
+    }
+}
+
+#[test]
+fn streamed_stable_recheck_preserves_read_order_and_failure_priority() {
+    for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+        let w = layout.word_bytes() as u64;
+        for failed in 0u8..8 {
+            for changed in 0u8..8 {
+                let target = fresh(w);
+                prog_attr(&target, 0x4000, 0, w, SEL_CLASS, 0x8000, w);
+                target.borrow_mut().set_word(0x8000, 3);
+                let mut out = crate::object_wire::ObjectAttributeWire::default();
+                let flags = stable_attribute_cell(
+                    0x4000,
+                    0,
+                    object_policy::SafeAttributeKind::Class,
+                    0x8000,
+                    w,
+                    layout,
+                    &mut out,
+                    &mut |addr| {
+                        let original = target.borrow_mut().read_word(addr);
+                        let Some(index) = [0x4000, 0x4000 + w, 0x4000 + 2 * w]
+                            .iter()
+                            .position(|candidate| *candidate == addr)
+                        else {
+                            return original;
+                        };
+                        if failed & (1 << index) != 0 {
+                            Err(())
+                        } else if changed & (1 << index) != 0 {
+                            Ok([SEL_KEYTYPE, 0x9000, w + 1][index])
+                        } else {
+                            original
+                        }
+                    },
+                    &mut |addr, bytes| target.borrow_mut().read_bytes(addr, bytes),
+                );
+                let expected = if failed != 0 {
+                    ast::UNREADABLE
+                } else if changed != 0 {
+                    ast::CHANGED
+                } else {
+                    ast::VALUE
+                };
+                assert_eq!(out.status, expected, "failed={failed} changed={changed}");
+                assert_eq!(out.value, if expected == ast::VALUE { 3 } else { 0 });
+                assert_eq!(
+                    flags,
+                    if expected == ast::CHANGED {
+                        ofl::CHANGED_METADATA
+                    } else {
+                        0
+                    }
+                );
+                assert_eq!(
+                    target.borrow().log(),
+                    &[
+                        (READ_WORD, 0x8000, w),
+                        (READ_WORD, 0x4000, w),
+                        (READ_WORD, 0x4000 + w, w),
+                        (READ_WORD, 0x4000 + 2 * w, w),
+                    ]
+                );
+            }
+        }
+    }
+}

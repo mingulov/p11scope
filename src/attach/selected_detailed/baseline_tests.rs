@@ -219,8 +219,13 @@ fn promotion_baseline_replacement_pin_and_different_batch_refuse() {
 #[test]
 fn promotion_baseline_storage_follows_batch_and_paired_weak_lifetime() {
     let pool = SemanticResourcePool::default();
+    let initial = pool.snapshot().charged_bytes;
     let pin = original(&pool);
     let before = pool.snapshot().charged_bytes;
+    assert_eq!(
+        before,
+        initial + crate::process::CustodyCharge::requested_bytes::<PidPin>(0).unwrap()
+    );
     let frame = frame(&pin);
     let batch = batch(&pool, &pin, frame, 0);
     assert_eq!(
@@ -233,8 +238,15 @@ fn promotion_baseline_storage_follows_batch_and_paired_weak_lifetime() {
         before + requested_bytes(1).unwrap()
     );
     drop(batch);
-    assert_eq!(pool.snapshot().charged_bytes, 0);
-    let small = SemanticResourcePool::reference_limit(1);
+    assert_eq!(pool.snapshot().charged_bytes, initial);
+    let small = SemanticResourcePool::reference_limit(
+        crate::semantics_edge::resources::SEMANTIC_TRANSITION_SCRATCH,
+    );
+    let no_headroom = small.snapshot();
+    assert_eq!(no_headroom.charged_bytes, no_headroom.limit_bytes);
     assert!(small.reserve(requested_bytes(1).unwrap()).is_err());
-    assert_eq!(small.snapshot().charged_bytes, 0);
+    let refused = small.snapshot();
+    assert_eq!(refused.charged_bytes, no_headroom.charged_bytes);
+    assert_eq!(refused.peak_charged_bytes, no_headroom.peak_charged_bytes);
+    assert_eq!(refused.refused, no_headroom.refused + 1);
 }

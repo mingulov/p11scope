@@ -537,6 +537,10 @@ fn cross_cookie_successor_replay_keeps_delayed_calls_historical() {
 #[test]
 fn rapid_cross_cookie_handoffs_keep_custody_when_middle_never_scans() {
     let mut scene = admitted_scene(Selection::Pid);
+    // Setup can re-prove the bound provider on each pass; the two Inventory
+    // handoffs below must add NO Detailed owner receipt to that live baseline.
+    let accepted_before_handoffs = scene.h0.0.borrow().accepted;
+    assert!(accepted_before_handoffs > 0);
     let pid = scene.child.id();
     let first = scene.caller();
     let original = scene
@@ -557,7 +561,7 @@ fn rapid_cross_cookie_handoffs_keep_custody_when_middle_never_scans() {
     };
     let middle = retained_handoff(&mut scene, &mut inventory, middle_image);
     assert!(scene.coordinator.semantic_bindings().get(middle).is_none());
-    assert_eq!(scene.h0.0.borrow().accepted, 1);
+    assert_eq!(scene.h0.0.borrow().accepted, accepted_before_handoffs);
     // The proving row was unbound. A later Inventory wave binds the actual
     // middle incarnation before its next exec; no Detailed pass/scan runs.
     assert!(witness_wave(&mut scene, &mut inventory, middle_image, now_ns()).is_empty());
@@ -573,7 +577,7 @@ fn rapid_cross_cookie_handoffs_keep_custody_when_middle_never_scans() {
     assert!(scene.coordinator.adapter().record(middle).unwrap().retired);
     assert_eq!(
         scene.h0.0.borrow().accepted,
-        1,
+        accepted_before_handoffs,
         "the middle image never entered H0"
     );
     let before = physical_counts(&scene);

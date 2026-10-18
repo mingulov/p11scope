@@ -1627,10 +1627,15 @@ fn owner_admission_bound_scope_after_expiry_separates_loss_episodes() {
         .get(scene.caller())
         .unwrap()
         .pin();
+    // Already-bound providers are re-proved on later passes. Count the
+    // receipts caused by this loss episode, independently of setup refreshes.
+    let accepted_before_loss = scene.h0.0.borrow().accepted;
+    assert!(accepted_before_loss > 0);
     let collected = scene.collect();
     std::fs::write(&membership, "").unwrap();
     scene.apply(collected);
-    assert_eq!(scene.h0.0.borrow().accepted, 1);
+    assert_eq!(scene.h0.0.borrow().accepted, accepted_before_loss + 1);
+    let accepted_after_loss = scene.h0.0.borrow().accepted;
     assert_eq!(scene.h0.0.borrow().capture.continuity_cuts(), 1);
     assert!(
         !scene
@@ -1644,7 +1649,7 @@ fn owner_admission_bound_scope_after_expiry_separates_loss_episodes() {
         scene.pass();
     }
     assert_eq!(scene.h0.0.borrow().capture.continuity_cuts(), 1);
-    assert_eq!(scene.h0.0.borrow().accepted, 1);
+    assert_eq!(scene.h0.0.borrow().accepted, accepted_after_loss);
 
     std::fs::write(&membership, format!("{pid}\n")).unwrap();
     scene.h0.0.borrow_mut().after_refresh = Some(Box::new(|owned| {
@@ -1654,11 +1659,12 @@ fn owner_admission_bound_scope_after_expiry_separates_loss_episodes() {
     }));
     for _ in 0..3 {
         scene.pass();
-        if scene.h0.0.borrow().accepted > 1 {
+        if scene.h0.0.borrow().accepted > accepted_after_loss {
             break;
         }
     }
-    assert_eq!(scene.h0.0.borrow().accepted, 2);
+    assert_eq!(scene.h0.0.borrow().accepted, accepted_after_loss + 1);
+    let accepted_after_expiry = scene.h0.0.borrow().accepted;
     assert_eq!(
         scene.h0.0.borrow().last_validation_refusal,
         Some(CurrentReceiptRefusal::Deadline)
@@ -1705,7 +1711,7 @@ fn owner_admission_bound_scope_after_expiry_separates_loss_episodes() {
         std::fs::write(leave, "").unwrap();
     }));
     scene.pass();
-    assert_eq!(scene.h0.0.borrow().accepted, 3);
+    assert_eq!(scene.h0.0.borrow().accepted, accepted_after_expiry + 1);
     assert_eq!(scene.coordinator.semantic_bindings().len(), 1);
     assert_eq!(unread.borrow().as_ref().unwrap().len(), 2);
     let after_second_loss = scene.h0.0.borrow().capture.continuity_cuts();

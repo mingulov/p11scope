@@ -34,13 +34,81 @@ struct Completion {
 /// running job on the output thread. Production budgets also span owners.
 static WORK: WorkSlot<Completion, MemoryCharge> = WorkSlot::new();
 
+pub(super) fn owner_storage_bytes() -> usize {
+    size_of::<MetadataLane>() + size_of::<WorkSlot<Completion, MemoryCharge>>()
+}
+
+/// Enrichment failure never disables the caller/provider capture. An
+/// unavailable lane retains only a finite mode/reason/census, no table or job.
 pub(crate) struct MetadataLane {
+    active: Option<ActiveMetadataLane>,
+    unavailable: MetadataFrame,
+}
+impl MetadataLane {
+    pub(crate) fn try_new(epoch: u64) -> Result<Self, MetadataReason> {
+        Ok(Self {
+            active: Some(ActiveMetadataLane::try_new(epoch)?),
+            unavailable: MetadataFrame::default(),
+        })
+    }
+    pub(crate) fn unavailable(reason: MetadataReason) -> Self {
+        Self {
+            active: None,
+            unavailable: MetadataFrame::unavailable(reason),
+        }
+    }
+    pub(crate) fn synchronize<Source: ProcessSource>(
+        &mut self,
+        adapter: &CallerAdapter<Source>,
+        binder: &NativeBinder,
+        now_ns: u64,
+    ) {
+        if let Some(active) = self.active.as_mut() {
+            active.synchronize(adapter, binder, now_ns);
+        } else {
+            self.unavailable.summary.unknown = adapter.len();
+        }
+    }
+    pub(crate) fn tick<Source: ProcessSource>(
+        &mut self,
+        adapter: &CallerAdapter<Source>,
+        binder: &NativeBinder,
+        now_ns: u64,
+        observe: impl FnMut(&Arc<PidPin>, ReadWindow) -> anyhow::Result<CallerImageObservation>,
+    ) {
+        if let Some(active) = self.active.as_mut() {
+            active.tick(adapter, binder, now_ns, observe);
+        } else {
+            self.unavailable.summary.unknown = adapter.len();
+        }
+    }
+    pub(crate) fn stop(&mut self) {
+        if let Some(active) = self.active.as_mut() {
+            active.stop();
+        }
+    }
+    pub(crate) fn invalidate(&mut self) {
+        if let Some(active) = self.active.as_mut() {
+            active.invalidate();
+        }
+    }
+    pub(crate) fn idle(&self) -> bool {
+        self.active.as_ref().is_none_or(ActiveMetadataLane::idle)
+    }
+    pub(crate) fn frame(&self) -> MetadataFrame {
+        self.active
+            .as_ref()
+            .map_or_else(|| self.unavailable.clone(), ActiveMetadataLane::frame)
+    }
+}
+
+struct ActiveMetadataLane {
     runtime: MetadataRuntime,
     worker: WorkOwner<'static, Completion, MemoryCharge>,
     active: Option<JobTicket>,
     stopped: bool,
 }
-impl MetadataLane {
+impl ActiveMetadataLane {
     pub(crate) fn try_new(epoch: u64) -> Result<Self, MetadataReason> {
         if epoch == 0 {
             return Err(MetadataReason::IdentityUnavailable);
@@ -274,7 +342,7 @@ impl MetadataLane {
             .frame_at(crate::discovery::caller_registry::now_ns())
     }
 }
-impl Drop for MetadataLane {
+impl Drop for ActiveMetadataLane {
     fn drop(&mut self) {
         self.stop();
     }
@@ -318,6 +386,124 @@ fn sample_original(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_busy_worker_keeps_inventory_and_public_unknown_frame() {
+        use crate::discovery::caller_registry::RegistryLimits;
+        use crate::discovery::inventory_workload::{Harness, ScaleSpec};
+        use crate::inventory_event_identity::IdentityIndex;
+        use crate::inventory_events::EventWriter;
+        use crate::inventory_present::Presentation;
+        use std::io::{Read as _, Seek as _};
+
+        fn population(first_pid: u32) -> Harness {
+            let mut harness = Harness::new(RegistryLimits::default_limits()).unwrap();
+            harness.stage_scale(&ScaleSpec {
+                name: "metadata-startup",
+                callers: 2,
+                modules: 1,
+                edges_per_caller: 1,
+                endpoints_per_module: 4,
+                first_pid,
+            });
+            harness.commit();
+            harness
+        }
+
+        let mut healthy = population(92_000);
+        healthy
+            .coordinator_mut()
+            .enable_caller_metadata(41)
+            .unwrap();
+        let mut reads = 0;
+        healthy.coordinator_mut().service_caller_metadata(
+            |_, _| {
+                reads += 1;
+                anyhow::bail!("unbound callers must not start native metadata reads")
+            },
+            10,
+        );
+        let healthy_frame = healthy.coordinator().metadata_frame();
+        assert!(healthy_frame.summary.enabled);
+        assert!(healthy_frame.summary.retained_bytes > 0);
+        assert_eq!(healthy_frame.summary.unknown, 2);
+        assert_eq!(reads, 0);
+        assert_eq!(
+            healthy_frame
+                .metadata(healthy.coordinator().adapter().records().next().unwrap().id)
+                .unwrap()
+                .reason,
+            Some(MetadataReason::IdentityUnavailable)
+        );
+        assert!(
+            WORK.claim().is_err(),
+            "healthy capture owns the actual worker slot"
+        );
+
+        let mut refused = population(93_000);
+        let before = crate::inventory::render_json_from_presentation(&Presentation::capture(
+            refused.coordinator(),
+            "workload",
+            1,
+            2,
+            1,
+        ));
+        assert!(before["callers"][0].get("metadata").is_none());
+        refused
+            .coordinator_mut()
+            .enable_caller_metadata(42)
+            .unwrap();
+        refused.coordinator_mut().service_caller_metadata(
+            |_, _| {
+                reads += 1;
+                anyhow::bail!("unavailable lane must not perform native metadata reads")
+            },
+            20,
+        );
+        assert_eq!(reads, 0);
+        let view = Presentation::capture(refused.coordinator(), "workload", 1, 2, 1);
+        assert_eq!(view.caller_metadata.summary.unknown, 2);
+        assert_eq!(view.caller_metadata.summary.budget_refusals, 1);
+        assert_eq!(view.caller_metadata.summary.retained_bytes, 0);
+        let json = crate::inventory::render_json_from_presentation(&view);
+        assert_eq!(json["caller_metadata"]["mode"], "cgroup");
+        assert_eq!(json["budgets"], before["budgets"]);
+        assert_eq!(json["edges"], before["edges"]);
+        assert_eq!(json["callers"].as_array().unwrap().len(), 2);
+        let identities = IdentityIndex::new(&view);
+        for (caller, row) in view.callers.iter().zip(json["callers"].as_array().unwrap()) {
+            assert_eq!(row["metadata"]["status"], "unknown");
+            assert_eq!(row["metadata"]["reason"], "lookup_limit");
+            assert_eq!(
+                row["metadata"],
+                identities.caller_context(caller.id)["metadata"]
+            );
+        }
+
+        let file = tempfile::tempfile().unwrap();
+        let mut reader = file.try_clone().unwrap();
+        let mut writer = EventWriter::anonymous_test_sink(file);
+        let mut emitter = crate::caller_metadata::consumer::MetadataEmitter::default();
+        assert_eq!(emitter.emit(&mut writer, &view, 20, false).unwrap(), 2);
+        assert_eq!(emitter.emit(&mut writer, &view, 30, false).unwrap(), 0);
+        reader.rewind().unwrap();
+        let mut bytes = String::new();
+        reader.read_to_string(&mut bytes).unwrap();
+        let records: Vec<serde_json::Value> = bytes
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 2);
+        for (record, row) in records.iter().zip(json["callers"].as_array().unwrap()) {
+            assert_eq!(record["kind"], "caller_metadata_changed");
+            assert_eq!(record["event"]["metadata"], row["metadata"]);
+        }
+        refused.coordinator_mut().stop_caller_metadata();
+        drop(healthy);
+        let mut next = MetadataLane::try_new(43).unwrap();
+        assert!(next.idle(), "stopped idle owner releases the actual slot");
+        next.stop();
+    }
 
     #[test]
     fn actual_retained_worker_sample_and_cancel_deadline_twins() {

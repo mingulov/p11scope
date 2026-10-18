@@ -1029,25 +1029,28 @@ fn pin_root_refusals_retire() {
             "{arm} must fault visibly"
         );
     }
-    // Image refusal retires object calls with a fault; ordinary calls
-    // keep their existing accounting-only refusal.
-    let image_at = returned
-        .find("image_pair_matches(start.image, image)")
-        .expect("return must keep its image refusal");
-    let image_end = returned[image_at..]
+    // The object branch alone owns late retirement; ordinary returns
+    // already retired before accounting and cannot delete twice.
+    let object = &returned[returned.find("fn object_return(").expect("object branch")..];
+    let image_at = object
+        .find("image_pair_matches(unsafe { (*start).image }, image)")
+        .expect("object return must retain its live START image refusal");
+    let image_end = object[image_at..]
         .find("EVIDENCE_SEMANTIC_CAPTURE_FAILURES")
         .expect("image arm books its loss");
-    let image_body = &returned[image_at..image_at + image_end];
-    for marker in [
-        "start.object_required != 0",
-        "owned_start_remove(&key, true)",
-        "p11_object_fault()",
-    ] {
+    let image_body = &object[image_at..image_at + image_end];
+    for marker in ["owned_start_remove(&key, true)", "p11_object_fault()"] {
         assert!(
             image_body.contains(marker),
-            "the image arm must retire object calls: missing {marker}"
+            "object image refusal must {marker}"
         );
     }
+    let ordinary = source_between(returned, "fn ordinary_return(", "fn object_return(");
+    assert_eq!(
+        ordinary.matches("owned_start_remove(&key, true)").count(),
+        1,
+        "ordinary retirement happens once before accounting"
+    );
     // Emission cleanup is the shared production decision: the root
     // calls `emission_finalize` exactly once with the checked removal,
     // then gates on its verdict. No inline retirement may remain for a

@@ -2,6 +2,7 @@
 //! Private endpoint image facts for bounded caller-context sampling. They never
 //! establish caller admission, scope, provider permission or promotion readiness.
 use super::{NativeDomainId, PidPin, ReadWindow};
+use crate::attach::capture::DomainCookie;
 use anyhow::{Context as _, Result};
 use std::sync::Arc;
 
@@ -34,6 +35,16 @@ impl CallerImageObservation {
             && other.matches_original_and_image(&self.original, self.cookie, self.exec_id)
             && self.generation != 0
     }
+
+    pub(crate) fn matches_binding(
+        &self,
+        original: &Arc<PidPin>,
+        image: DomainCookie,
+        full_exec_id: u64,
+    ) -> bool {
+        image == DomainCookie::new(self.domain, self.cookie)
+            && self.matches_original_and_image(original, self.cookie, full_exec_id)
+    }
 }
 
 impl std::fmt::Debug for CallerImageObservation {
@@ -43,7 +54,7 @@ impl std::fmt::Debug for CallerImageObservation {
 }
 
 /// Exclusive facade calls bracket the metadata worker. A later observation can
-/// confirm a previously admitted NativeExact image, never upgrade ScanPinned.
+/// confirm an independently proven native image, never upgrade ScanPinned.
 pub(crate) fn observe_caller_image(
     ebpf: &mut aya::Ebpf,
     domain: NativeDomainId,

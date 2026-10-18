@@ -51,6 +51,13 @@ fn caller_image_observation_binds_original_cookie_and_full_exec_including_zero()
     for exec_id in [0, 0x8000_0000_0000_0001] {
         let image = observation(domain, &pin, 1, 17, exec_id);
         assert!(image.matches_original_and_image(&pin, 17, exec_id));
+        assert!(image.matches_binding(&pin, DomainCookie::new(domain, 17), exec_id));
+        assert!(!image.matches_binding(
+            &pin,
+            DomainCookie::new(NativeDomainId::mint(), 17),
+            exec_id
+        ));
+        assert!(!image.matches_binding(&pin, DomainCookie::new(domain, 18), exec_id));
         assert!(!image.matches_original_and_image(&pin, 18, exec_id));
         assert!(!image.matches_original_and_image(&pin, 17, exec_id ^ 1));
         assert!(!image.matches_original_and_image(&pin, 17, exec_id ^ (1 << 63)));
@@ -71,6 +78,7 @@ fn caller_image_observation_rejects_foreign_domain_original_cookie_and_exec() {
     let domain = NativeDomainId::mint();
     let image = observation(domain, &pin, 1, 17, 0);
     assert!(!image.matches_original_and_image(&replacement, 17, 0));
+    assert!(!image.matches_binding(&replacement, DomainCookie::new(domain, 17), 0));
     for other in [
         observation(NativeDomainId::mint(), &pin, 2, 17, 0),
         observation(domain, &replacement, 2, 17, 0),

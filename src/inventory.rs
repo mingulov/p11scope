@@ -517,6 +517,7 @@ pub fn run(
     diagnostics_pid: Option<u32>,
     identity_backend: crate::cli::IdentityBackendSelection,
     identity_backend_explicit: bool,
+    caller_metadata: crate::cli::CallerMetadataMode,
 ) -> Result<i32> {
     if !manifests.is_empty() && capture == CaptureMode::Scan {
         anyhow::bail!("--manifest requires --capture auto or native");
@@ -553,6 +554,7 @@ pub fn run(
         capture,
         attach_backend,
         identity,
+        caller_metadata == crate::cli::CallerMetadataMode::Cgroup,
         &|| stop.stopped(),
         &|| stop.exit_on_next_signal(),
         stdout_tty,
@@ -761,6 +763,7 @@ fn run_with_terminal_diagnostics(
         capture,
         attach_backend,
         identity,
+        false,
         stop,
         outputs_attempted,
         stdout_tty,
@@ -792,6 +795,7 @@ fn run_with_terminal_budget(
     capture: CaptureMode,
     attach_backend: crate::attach::BackendSelection,
     identity: Option<crate::cli::IdentityBackendSelection>,
+    caller_metadata: bool,
     stop: &dyn Fn() -> bool,
     outputs_attempted: &dyn Fn(),
     stdout_tty: bool,
@@ -903,6 +907,9 @@ fn run_with_terminal_budget(
         registry_limits(max_gaps),
         endpoint_budget,
     )?;
+    if caller_metadata {
+        coordinator.enable_caller_metadata(started_ns)?;
+    }
     coordinator.set_semantic_manifests(manifests.to_vec());
     // F4 (review): a document with no `exact` flag still says, as a
     // scope-level gap, that /proc PIDs are not the kernel's here.
@@ -1980,7 +1987,21 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
         self.semantic_staged = staged;
     }
 
+    fn on_native_service(
+        &mut self,
+        mut capture: Option<&mut dyn crate::inventory_capture::CaptureLane<PidPin>>,
+    ) {
+        self.coordinator.service_caller_metadata(
+            |original, window| match capture.as_mut() {
+                Some(capture) => capture.observe_caller_image(original, window),
+                None => Err(anyhow::anyhow!("caller image observation unavailable")),
+            },
+            now_ns(),
+        );
+    }
+
     fn on_stop_requested(&mut self) {
+        self.coordinator.stop_caller_metadata();
         if let Some(observer) = self
             .cgroup
             .as_ref()

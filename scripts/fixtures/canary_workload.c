@@ -81,6 +81,9 @@ typedef struct {
 #define CKA_VERIFY 0x0000010aUL
 #define CKA_DERIVE 0x0000010cUL
 #define CKA_EXTRACTABLE 0x00000162UL
+#define CKA_MODULUS_BITS 0x00000121UL
+#define CKA_VALUE_LEN 0x00000161UL
+#define CKA_EC_PARAMS 0x00000180UL
 
 #define CKO_SECRET_KEY 0x00000004UL
 #define CKK_GENERIC_SECRET 0x00000010UL
@@ -827,20 +830,47 @@ static int run_faults(void *module, const char *ready, const char *gate)
  * independent call/result/readiness ledger the object oracle replays
  * against ring records and stopped side rows. */
 static int object_call(void **functions, unsigned index, const char *name,
-                       CK_ULONG session, const CK_ULONG args[10])
+                       CK_ULONG session, CK_RV expected_rv, const CK_ULONG args[10])
 {
     CK_RV rv = ((fn10)functions[index])(args[0], args[1], args[2], args[3], args[4],
                                        args[5], args[6], args[7], args[8], args[9]);
     printf("P11SCOPE_OBJECT {\"index\":%u,\"name\":\"%s\",\"session\":%lu,"
            "\"rv\":%lu,\"ready\":%d}\n",
-           index, name, session, rv, rv == CKR_OK);
-    return rv == 0 ? 0 : 1;
+           index, name, session, rv, rv == expected_rv);
+    return rv == expected_rv ? 0 : 1;
 }
 
 #define OBJECT_CALL(index, name, session, ...) do { \
-    failures += object_call(functions, (index), (name), (session), \
+    failures += object_call(functions, (index), (name), (session), CKR_OK, \
                             (CK_ULONG[10]){__VA_ARGS__}); \
 } while (0)
+
+/* Six distinct selected spans and two forbidden neighbors fill the exact
+ * eight-header read budget. Pair templates own separate values as well as
+ * separate headers, so their finite observations cannot alias each other. */
+struct object_values {
+    CK_ULONG cls, keytype, value_len, modulus_bits;
+    CK_BYTE token;
+};
+static const CK_BYTE object_p256[] = {6, 8, 0x2a, 0x86, 0x48, 0xce, 0x3d, 3, 1, 7};
+static const CK_BYTE object_p384[] = {6, 5, 0x2b, 0x81, 4, 0, 0x22};
+static const CK_BYTE object_p521[] = {6, 5, 0x2b, 0x81, 4, 0, 0x23};
+
+static void object_template(CK_ATTRIBUTE attrs[8], struct object_values *values,
+                            const CK_BYTE *curve, size_t curve_size)
+{
+    CK_ATTRIBUTE selected[8] = {
+        {CKA_CLASS, &values->cls, sizeof(values->cls)},
+        {CKA_KEY_TYPE, &values->keytype, sizeof(values->keytype)},
+        {CKA_TOKEN, &values->token, sizeof(values->token)},
+        {CKA_VALUE_LEN, &values->value_len, sizeof(values->value_len)},
+        {CKA_MODULUS_BITS, &values->modulus_bits, sizeof(values->modulus_bits)},
+        {CKA_EC_PARAMS, (void *)curve, curve_size},
+        {CKA_VALUE, (void *)SENT_OBJECT, sizeof(SENT_OBJECT) - 1},
+        {CKA_LABEL, (void *)SENT_LABEL, sizeof(SENT_LABEL) - 1},
+    };
+    memcpy(attrs, selected, sizeof(selected));
+}
 
 static int run_object(void *module, const char *ready, const char *gate,
                       const char *done, const char *finish)
@@ -851,13 +881,11 @@ static int run_object(void *module, const char *ready, const char *gate,
                                     done ? &leader : NULL) != 0) return 1;
     int failures = 0;
     CK_ULONG session = 0x601;
-    CK_ULONG cls = CKO_SECRET_KEY, keytype = CKK_GENERIC_SECRET;
-    CK_ATTRIBUTE ordinary[] = {
-        {CKA_CLASS, &cls, sizeof(cls)},
-        {CKA_KEY_TYPE, &keytype, sizeof(keytype)},
-        {CKA_VALUE, (void *)SENT_OBJECT, sizeof(SENT_OBJECT) - 1},
-        {CKA_LABEL, (void *)SENT_LABEL, sizeof(SENT_LABEL) - 1},
-    };
+    struct object_values public_values = {4, 16, 32, 2048, 1};
+    struct object_values private_values = {2, 3, 24, 4096, 0};
+    CK_ATTRIBUTE ordinary[8], peer[8];
+    object_template(ordinary, &public_values, object_p256, sizeof(object_p256));
+    object_template(peer, &private_values, object_p384, sizeof(object_p384));
     CK_ULONG ordinary_count = sizeof(ordinary) / sizeof(ordinary[0]);
     /* Preset result words: the fixture never writes results, so the
      * emitted VALUE words must equal these ledgered presets exactly. */
@@ -901,7 +929,7 @@ static int run_object(void *module, const char *ready, const char *gate,
                 ptr(&session_mech), ptr(ordinary), ordinary_count, ptr(&outg));
     OBJECT_CALL(I_GenerateKeyPair, "C_GenerateKeyPair", session + 15, session + 15,
                 ptr(&session_mech), ptr(ordinary), ordinary_count,
-                ptr(ordinary), ordinary_count, ptr(&outp0), ptr(&outp1));
+                ptr(peer), ordinary_count, ptr(&outp0), ptr(&outp1));
     OBJECT_CALL(I_WrapKey, "C_WrapKey", session + 16, session + 16,
                 ptr(&session_mech), 0x260, 0x261, ptr(SENT_OBJECT), ptr(&get_size));
     OBJECT_CALL(I_UnwrapKey, "C_UnwrapKey", session + 17, session + 17,
@@ -922,7 +950,21 @@ static int run_object(void *module, const char *ready, const char *gate,
     OBJECT_CALL(I_VerifySignatureInit, "C_VerifySignatureInit", session + 24, session + 24,
                 ptr(&session_mech), 0x294);
 
-    printf("canary_workload object: %s\n", failures == 0 ? "all calls CKR_OK" : "FAILED");
+    /* The controlled provider returns the actual partial/error/cancel RV.
+     * Get requests keep capacity headers only; result values are observed
+     * separately on the three approved partial RVs, never on errors/cancel. */
+    const CK_RV get_rvs[] = {17, 18, 0x150, 5, 1};
+    for (size_t i = 0; i < sizeof(get_rvs) / sizeof(get_rvs[0]); i++) {
+        const CK_BYTE *curve = i == 0 ? object_p384 : i == 1 ? object_p521 : object_p256;
+        size_t curve_size = i == 0 ? sizeof(object_p384) : i == 1 ? sizeof(object_p521) : sizeof(object_p256);
+        object_template(ordinary, &public_values, curve, curve_size);
+        CK_ULONG get_session = 0x701 + i;
+        failures += object_call(functions, I_GetAttributeValue, "C_GetAttributeValue",
+                                get_session, get_rvs[i],
+                                (CK_ULONG[10]){get_session, 0x224, ptr(ordinary), ordinary_count});
+    }
+
+    printf("canary_workload object: %s\n", failures == 0 ? "all calls match expected RV" : "FAILED");
     int output_failed = fflush(stdout) != 0;
     if (ferror(stdout)) output_failed = 1;
     if (done) {
@@ -941,11 +983,11 @@ static int run_object_blocked(void *module, const char *ready, const char *gate)
 {
     void **functions = matrix_functions(module);
     if (!functions) return 1;
-    CK_ULONG cls = CKO_SECRET_KEY;
-    CK_ATTRIBUTE ordinary[] = {
-        {CKA_CLASS, &cls, sizeof(cls)},
-        {CKA_VALUE, (void *)SENT_OBJECT, sizeof(SENT_OBJECT) - 1},
-    };
+    struct object_values public_values = {4, 16, 32, 2048, 1};
+    struct object_values private_values = {2, 3, 24, 4096, 0};
+    CK_ATTRIBUTE ordinary[8], peer[8];
+    object_template(ordinary, &public_values, object_p256, sizeof(object_p256));
+    object_template(peer, &private_values, object_p384, sizeof(object_p384));
     CK_ULONG ordinary_count = sizeof(ordinary) / sizeof(ordinary[0]);
     CK_ULONG out_create = 0, out_pub = 0, out_priv = 0;
     CK_ULONG found[8] = {0};
@@ -955,16 +997,19 @@ static int run_object_blocked(void *module, const char *ready, const char *gate)
          .args = {0x501, ptr(ordinary), ordinary_count, ptr(&out_create)}},
         {.function = (fn10)functions[I_GenerateKeyPair],
          .args = {0x502, 0, ptr(ordinary), ordinary_count,
-                  ptr(ordinary), ordinary_count, ptr(&out_pub), ptr(&out_priv)}},
+                  ptr(peer), ordinary_count, ptr(&out_pub), ptr(&out_priv)}},
         {.function = (fn10)functions[I_FindObjects],
          .args = {0x503, ptr(found), 8, ptr(&found_count)}},
         {.function = (fn10)functions[I_GetAttributeValue],
          .args = {0x504, 0x224, ptr(ordinary), ordinary_count}},
     };
-    printf("P11SCOPE_OBJECT_POINTERS {\"template\":%lu,\"out_create\":%lu,"
-           "\"out_pub\":%lu,\"out_priv\":%lu,\"found\":%lu,\"found_count\":%lu}\n",
-           ptr(ordinary), ptr(&out_create), ptr(&out_pub), ptr(&out_priv),
-           ptr(found), ptr(&found_count));
+    printf("P11SCOPE_OBJECT_POINTERS {\"template\":%lu,\"peer_template\":%lu,\"out_create\":%lu,"
+           "\"out_pub\":%lu,\"out_priv\":%lu,\"found\":%lu,\"found_count\":%lu,"
+           "\"get_values\":[%lu,%lu,%lu,%lu,%lu,%lu]}\n",
+           ptr(ordinary), ptr(peer), ptr(&out_create), ptr(&out_pub), ptr(&out_priv),
+           ptr(found), ptr(&found_count), ptr(&public_values.cls), ptr(&public_values.keytype),
+           ptr(&public_values.token), ptr(&public_values.value_len), ptr(&public_values.modulus_bits),
+           ptr(object_p256));
     fflush(stdout);
     return run_concurrent(calls, sizeof(calls) / sizeof(calls[0]), "blocked object subset",
                           "object-blocked", ready, gate);

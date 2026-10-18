@@ -3,6 +3,8 @@
 """Unprivileged coordinator probes with injected BPF acquisition boundaries."""
 import copy
 import contextlib
+import ctypes
+import errno
 import io
 import json
 import os
@@ -1077,6 +1079,56 @@ def owned_case(pid, directory, case, program, provider):
 
 
 class StoppedCanaryCaptureTests(unittest.TestCase):
+    def test_retained_object_scrub_requires_q_before_reading_hash(self):
+        # Kernel reads are the injected external boundary. The real LiveMaps
+        # method still selects its retained FDs, interprets Q and fails closed.
+        for word, populated, refused in ((0, False, True), (1, False, True),
+                                         ((1 << 63) | 1, False, True),
+                                         (1 << 63, True, True), (1 << 63, False, False)):
+            with self.subTest(word=word, populated=populated):
+                source = object.__new__(capture.LiveMaps)
+                source.fd_by_id = {41: 141, 42: 142}
+                maps = [{'id': 41, 'name': 'STOP_GATE'}, {'id': 42, 'name': 'OBJECT_START'}]
+                commands = []
+                def syscall(number, command, attr, size):
+                    fd, _, key, value, _ = capture.dumper.BPF_ATTR_MAP_ELEM.unpack(ctypes.string_at(attr, size))
+                    commands.append((command, fd))
+                    if command == 1:
+                        self.assertEqual(fd, 141)
+                        ctypes.memmove(value, struct.pack('<Q', word), 8)
+                        return 0
+                    self.assertEqual((command, fd, key), (4, 142, 0))
+                    ctypes.set_errno(0 if populated else errno.ENOENT)
+                    return 0 if populated else -1
+                with patch.object(capture.ctypes, 'CDLL', return_value=SimpleNamespace(syscall=syscall)):
+                    if refused:
+                        with self.assertRaises(capture.CaptureError):
+                            source.verify_object_scrub(maps, time.monotonic() + 2)
+                    else:
+                        source.verify_object_scrub(maps, time.monotonic() + 2)
+                self.assertEqual(commands, [(1, 141)] + ([(4, 142)] if word == 1 << 63 else []))
+
+    def test_object_blocked_dispatch_uses_exact_object_rows_and_zero_neighbors(self):
+        objects = load_path(ROOT / 'tests/python/test_canary_object.py', 'object_fixtures')
+        fixture = objects.ObjectSideRowTests('test_blocked_offsets_match')
+        starts, rows = fixture.blocked_fixture()
+        ordinary = {'START': [{'key': objects.tok(key), 'value': objects.tok(objects.start_row(
+                        starts[capture.evidence.u64(key, 0) & 0xffffffff]['session'],
+                        {0x501: 22, 0x502: 61, 0x503: 29, 0x504: 26}[
+                            starts[capture.evidence.u64(key, 0) & 0xffffffff]['session']]))}
+                    for key, _ in rows],
+                    'OBJECT_START': [{'key': objects.tok(key), 'value': objects.tok(row['raw'])}
+                                     for key, row in rows], 'EVIDENCE': []}
+        config = SimpleNamespace(workload_mode='object-blocked', target_bits=64)
+        text = lambda: 'P11SCOPE_OBJECT_POINTERS ' + json.dumps(fixture.POINTERS)
+        capture.assert_blocked_semantics(config, ordinary, list(starts.values()), text)
+        for worker, offset in ((0, 96), (1, 426), (2, 352), (3, 120), (3, 431)):
+            bad = copy.deepcopy(ordinary)
+            current = int(bad['OBJECT_START'][worker]['value'][offset], 16)
+            bad['OBJECT_START'][worker]['value'][offset] = f'0x{current ^ 1:02x}'
+            with self.subTest(worker=worker, offset=offset), self.assertRaises(AssertionError):
+                capture.assert_blocked_semantics(config, bad, list(starts.values()), text)
+
     def test_observer_may_start_worker_before_capture_ready(self):
         self.probe('startup_threads')
 

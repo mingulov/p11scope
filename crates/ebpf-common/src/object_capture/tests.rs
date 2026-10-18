@@ -4749,3 +4749,45 @@ fn streamed_attribute_stride_matches_wide_arithmetic_at_overflow_boundaries() {
         }
     }
 }
+
+#[test]
+fn streamed_get_retained_index_boundary_refuses_before_target_reads() {
+    use crate::object_wire::{ObjectAttributeListWire, ObjectStart};
+    for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+        let w = layout.word_bytes() as u64;
+        for index in [0u8, 8, 255] {
+            let target = fresh(w);
+            prog_attr(&target, 0x4000, 0, w, SEL_CLASS, 0x8000, w);
+            target.borrow_mut().set_word(0x8000, 3);
+            let mut side = ObjectStart {
+                get_template_base: 0x4000,
+                inspected_header_end: 0x4000 + 8 * 3 * w,
+                get_inspected: 255,
+                ..Default::default()
+            };
+            side.slots[0].kind = ak::CLASS;
+            side.slots[0].slot_index = index;
+            side.slots[0].value_ptr = 0x8000;
+            side.slots[0].entry_capacity = w;
+            let mut out = ObjectAttributeListWire::default();
+            let (r, b) = readers(&target);
+            crate::object_flow::production_capture_get_return(
+                &side,
+                CKR_OK,
+                ReturnAuthority::AUTHORIZED,
+                layout,
+                &mut out,
+                r,
+                b,
+            );
+            assert_eq!(out.inspected, 8);
+            if index == 0 {
+                assert_eq!(out.cells[0].status, ast::VALUE);
+                assert_eq!(out.cells[0].value, 3);
+            } else {
+                assert_eq!(target.borrow().log_len, 0);
+                assert!(out.cells == [ObjectAttributeWire::default(); 8]);
+            }
+        }
+    }
+}

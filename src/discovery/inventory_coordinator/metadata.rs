@@ -37,6 +37,20 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
     }
 
+    /// Drain only the already owned worker after fencing new work. A true
+    /// result means its actual JoinHandle has completed; dropping the lane
+    /// while false keeps the helper's static owner and memory charge.
+    pub(crate) fn poll_caller_metadata_stop(&mut self, now_ns: u64) -> bool {
+        let Some(metadata) = self.caller_metadata.as_mut() else {
+            return true;
+        };
+        metadata.stop();
+        metadata.tick(&self.adapter, &self.binder, now_ns, |_, _| {
+            Err(anyhow::anyhow!("caller metadata is stopping"))
+        });
+        metadata.idle()
+    }
+
     pub(super) fn synchronize_caller_metadata(&mut self, now_ns: u64) {
         if let Some(metadata) = self.caller_metadata.as_mut() {
             // Publication can precede the first service tick. Account every

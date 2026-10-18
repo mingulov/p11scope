@@ -105,7 +105,7 @@ DEFAULT_LIB_TESTS = (
 
 BREADTH = tuple("attach::inventory::activation::privileged_tests::" + name for name in (
     "privileged_t7_inventory_n4097_lp64", "privileged_t7_inventory_n6530_lp64",
-    "privileged_t7_inventory_n8192_boundary_lp64"))
+    "privileged_t7_inventory_n6531_lp64", "privileged_t7_inventory_n8192_boundary_lp64"))
 # G01/R7: the 8192 boundary cell deliberately succeeds while refusing
 # the envelope. Only its exact refusal marker or its exact all-ID
 # positive evidence classifies it; test success alone never does.

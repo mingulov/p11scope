@@ -2588,11 +2588,24 @@ pub(crate) struct Display {
     /// per run; while disabled it tracks nothing and renders nothing.
     promoter: Promoter,
     /// Next view revision to assign at frame install (serials from 1,
-    /// saturating rather than wrapping past the maximum).
+    /// checked: [`ViewRevision::EXHAUSTED`] is never issued and closes
+    /// promotion authority once reached).
     next_view_revision: u64,
-    /// Revision assigned to `last_frame` (0 while no frame was shown).
+    /// Revision assigned to the candidate `last_frame` (0 while no
+    /// frame was installed). A candidate is offered/coalesced, not yet
+    /// viewed: only a wholly-written frame commits below.
     last_view_revision: ViewRevision,
     last_frame: Option<DisplayFrame>,
+    /// Last wholly-written interactive frame: the immutable promotion
+    /// authority. Committed only when the terminal took the frame
+    /// whole; any shed/cut clears it until a full repaint. Requests
+    /// bind this triple, never the candidate above.
+    viewed_presentation: Option<Arc<Presentation>>,
+    viewed_revision: ViewRevision,
+    viewed_pair: Option<PromotionPair>,
+    /// View serials exhausted: no unique revision left, promotion
+    /// refuses even on full writes.
+    view_exhausted: bool,
     last_viewport: Viewport,
     next_redraw: std::time::Instant,
     quit: std::rc::Rc<std::cell::Cell<bool>>,
@@ -2654,6 +2667,10 @@ impl Display {
             next_view_revision: 1,
             last_view_revision: ViewRevision::new(0),
             last_frame: None,
+            viewed_presentation: None,
+            viewed_revision: ViewRevision::new(0),
+            viewed_pair: None,
+            view_exhausted: false,
             last_viewport: Viewport {
                 width: 80,
                 height: 24,
@@ -2860,6 +2877,14 @@ impl Display {
             self.quit.set(true);
             return;
         }
+        // Only a wholly-written frame commits promotion authority. Any
+        // shed or cut clears it until a full repaint: a candidate that
+        // never reached the terminal is never the viewed frame.
+        if self.writer.last_frame_written() {
+            self.commit_viewed_frame();
+        } else {
+            self.clear_viewed_frame();
+        }
         let account = self.writer.account();
         if account.frames_shed > self.shed_announced && self.writer.last_frame_written() {
             self.tail.push(&format!(
@@ -2911,12 +2936,51 @@ impl Display {
         }
     }
 
-    /// Assign the next view revision to the just-installed frame.
-    /// Serials start at 1 (0 means no frame shown) and saturate rather
-    /// than wrap.
+    /// Assign the next view revision to the just-installed
+    /// candidate frame. Serials start at 1 (0 means no frame
+    /// installed) and are checked: [`ViewRevision::EXHAUSTED`] is never
+    /// issued. Once the counter reaches it, promotion authority closes
+    /// honestly — the frame still renders, but requests refuse with
+    /// `Exhausted` and no two frames ever share one supposedly unique
+    /// revision.
     fn install_view_revision(&mut self) {
+        if self.view_exhausted {
+            return;
+        }
+        if self.next_view_revision == ViewRevision::EXHAUSTED {
+            self.view_exhausted = true;
+            self.clear_viewed_frame();
+            return;
+        }
         self.last_view_revision = ViewRevision::new(self.next_view_revision);
-        self.next_view_revision = self.next_view_revision.saturating_add(1);
+        // Safe: `next_view_revision < EXHAUSTED == u64::MAX` here.
+        self.next_view_revision += 1;
+    }
+
+    /// Commit the candidate as the viewed promotion authority after
+    /// the terminal took the frame whole: the exact immutable `Arc`,
+    /// its revision and the cursor shown on that frame. Never called
+    /// for a shed or cut frame.
+    fn commit_viewed_frame(&mut self) {
+        if self.view_exhausted {
+            return;
+        }
+        let Some(frame) = self.last_frame.as_ref() else {
+            return;
+        };
+        self.viewed_presentation = Some(Arc::clone(&frame.presentation));
+        self.viewed_revision = self.last_view_revision;
+        self.viewed_pair = self.state.promotion.selected;
+    }
+
+    /// Clear promotion authority after any shed or cut: the candidate
+    /// never reached the terminal whole, so no request may bind it.
+    /// The next full repaint recommits. The cursor selection itself is
+    /// preserved for that repaint; only the authority clears.
+    fn clear_viewed_frame(&mut self) {
+        self.viewed_presentation = None;
+        self.viewed_revision = ViewRevision::new(0);
+        self.viewed_pair = None;
     }
 
     /// Keep the promotion cursor on its pair by identity across a new
@@ -2952,31 +3016,41 @@ impl Display {
         self.state.promotion = self.promoter.snapshot(selected);
     }
 
-    /// `d` on an edge page: request Detailed capture for the selected
-    /// displayed pair. No frame or no selection means no request (an
-    /// honest sticky note, never a guessed pair); a selection that
-    /// raced a redraw clears instead of promoting another row. The
-    /// request retains the actual displayed frame `Arc` plus the
-    /// capture/view serials — expected identities for the runtime,
-    /// never authority.
+    /// `d` on an edge page: request Detailed capture for the pair
+    /// of the last wholly-written frame. Only that immutable viewed
+    /// triple (presentation `Arc`, revision, cursor) carries authority;
+    /// a merely offered/coalesced candidate, a shed/cut frame or an
+    /// exhausted view serial refuses honestly until a full repaint.
+    /// No selection means `NoSelection`; a selection that raced a
+    /// redraw clears instead of promoting another row. The request
+    /// retains the viewed frame `Arc` plus capture/view serials —
+    /// expected identities for the runtime, never authority.
     fn promotion_request_key(&mut self) {
-        let selected = self.state.promotion.selected;
+        if self.view_exhausted && self.promoter.enabled() {
+            self.promoter.set_note(Some(PromotionNote::Exhausted));
+            self.sync_promotion_snapshot();
+            return;
+        }
         let capture = self.promoter.capture();
-        let displayed = self
-            .last_frame
-            .as_ref()
-            .map(|frame| Arc::clone(&frame.presentation));
+        let displayed = self.viewed_presentation.as_ref().map(Arc::clone);
+        let selected = self.viewed_pair;
         let (Some(selected), Some(capture), Some(presentation)) = (selected, capture, displayed)
         else {
-            if self.last_frame.is_some() && selected.is_none() && self.promoter.enabled() {
-                self.promoter.set_note(Some(PromotionNote::NoSelection));
+            if self.promoter.enabled() {
+                if self.viewed_presentation.is_some() && self.viewed_pair.is_none() {
+                    self.promoter.set_note(Some(PromotionNote::NoSelection));
+                } else if self.last_frame.is_some() {
+                    // A candidate exists but no frame reached the
+                    // terminal whole (shed/cut): the view is stale.
+                    self.promoter.set_note(Some(PromotionNote::StaleSelection));
+                }
                 self.sync_promotion_snapshot();
             }
             return;
         };
         let view = Arc::new(PromotionView::new(
             capture,
-            self.last_view_revision,
+            self.viewed_revision,
             presentation,
         ));
         let caller = CallerId(selected.caller());
@@ -3028,8 +3102,10 @@ impl Display {
         if std::mem::replace(&mut self.restored, true) {
             return;
         }
-        // Outstanding promotion work ends honestly with the run: the
-        // runtime is gone, so nothing waits for its confirmation.
+        // Terminal restore requests promotion stop and latches shutdown;
+        // it never certifies runtime disposal. Untaken work ends here;
+        // transferred work stays Stopping until its genuine matching
+        // completion (the Retiring callback restores BEFORE native stop).
         self.promoter.note_run_stopped();
         self.note_gap(std::time::Instant::now());
         self.last_tick = None;
@@ -3120,8 +3196,9 @@ impl Display {
     /// the run's capture identity. Default dashboard behavior
     /// (read-only keys, no cursor, no status line) remains until the
     /// runtime/CLI calls this; repeating with the same capture is a
-    /// no-op, and a different capture never silently rebinds. Returns
-    /// whether the control is bound to `capture` afterwards.
+    /// no-op, and a different capture never silently rebinds. After
+    /// the run stopped, every enable refuses. Returns whether the
+    /// control is bound to `capture` afterwards.
     pub(crate) fn promotion_enable(&mut self, capture: CaptureId) -> bool {
         let bound = self.promoter.enable(capture);
         if bound && self.state.promotion.selected.is_none() {
@@ -3141,8 +3218,9 @@ impl Display {
         self.promoter.take_request()
     }
 
-    /// Apply a runtime outcome for the outstanding request. Returns the
-    /// new state, or `None` for a stale/foreign/illegal update (state
+    /// Apply a capture-qualified runtime outcome for the outstanding
+    /// request (built from the runtime's held request). Returns the new
+    /// state, or `None` for a stale/foreign/illegal update (state
     /// unchanged). In particular `Active` is recorded only from a
     /// genuine runtime activation result, never from UI state. The
     /// driver must record each terminal transition it observes in the
@@ -3157,9 +3235,10 @@ impl Display {
         applied
     }
 
-    /// Poll the visible promotion state — notably UI-requested
-    /// `Stopping` and run-stopped ends the driver did not initiate, so
-    /// the driver can wind down work it already took.
+    /// Poll the visible promotion state — notably UI- or
+    /// restore-requested `Stopping` the driver did not initiate, so
+    /// the driver can wind down work it already took and confirm the
+    /// genuine end.
     pub(crate) fn promotion_state(&self) -> PromotionState {
         self.promoter.state()
     }

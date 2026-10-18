@@ -4106,6 +4106,7 @@ mod tests {
                     None,
                     crate::cli::IdentityBackendSelection::Auto,
                     false,
+                    crate::cli::CallerMetadataMode::None,
                 )
                 .unwrap_err();
                 assert!(

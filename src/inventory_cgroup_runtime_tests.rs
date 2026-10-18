@@ -652,6 +652,7 @@ fn run_public_selection(
         },
         crate::attach::BackendSelection::Auto,
         None,
+        false,
         &|| false,
         &|| {},
         false,

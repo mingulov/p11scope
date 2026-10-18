@@ -37,12 +37,17 @@ name and must be runnable. A missing name, static skip, duplicate or ambiguous
 substring match fails before execution.
 
 The selected privileged suite contains registered default names and these
-three long breadth gates. The runner receives `--include-long` and each full
+four long breadth gates. The runner receives `--include-long` and each full
 name; it does not select every long test:
 
 - `attach::inventory::activation::privileged_tests::privileged_t7_inventory_n4097_lp64`
 - `attach::inventory::activation::privileged_tests::privileged_t7_inventory_n6530_lp64`
+- `attach::inventory::activation::privileged_tests::privileged_t7_inventory_n6531_lp64`
 - `attach::inventory::activation::privileged_tests::privileged_t7_inventory_n8192_boundary_lp64`
+
+The 6530 selector remains the historical motivating control; its prior
+receipts do not establish the newly registered 6531 positive. Registration
+does not record execution or qualification for any cell.
 
 `attach::instance_tests::privileged_instance_continuity_experiment_softhsm` and
 `attach::inventory::activation::privileged_tests::privileged_bench_overhead_detailed_calls`

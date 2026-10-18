@@ -478,6 +478,27 @@ class ReporterProbeTests(unittest.TestCase):
                 result = self.decode(payload, 1 if name == 'backward-head' else 0, head)
                 self.assertNotEqual(result.returncode, 0, 'invalid evidence must not become an ACK')
 
+    def test_symbol_reader_streams_a_large_table_with_bounded_lines_and_extent(self):
+        module = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/reporter_probe.py'))
+        with tempfile.TemporaryFile() as output:
+            chunk = b'unrelated_symbol t 1 1\n' * 1024
+            for _ in range(800):
+                output.write(chunk)
+            output.write(b'p11scope::run::report_capture_cancel t 1234 160\n')
+            self.assertGreater(output.tell(), 16 * 1024 * 1024)
+            self.assertEqual(module['read_reporter_symbols'](output), [0x1234])
+            output.write(b'p11scope::run::report_capture_cancel t 5678 160\n')
+            with self.assertRaises(ValueError):
+                module['read_reporter_symbols'](output)
+            output.seek(0)
+            output.truncate()
+            output.write(b'x' * 65537 + b'\n')
+            with self.assertRaises(ValueError):
+                module['read_reporter_symbols'](output)
+            output.truncate(64 * 1024 * 1024 + 1)
+            with self.assertRaises(ValueError):
+                module['read_reporter_symbols'](output)
+
     def test_actual_elf_symbol_resolution_and_offset_reject_foreign_surfaces(self):
         module = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/reporter_probe.py'))
         source = self.root / 'reporter.c'

@@ -52,6 +52,25 @@ def verify_path(pin):
         raise ValueError('actual candidate pathname differs from held executable')
 
 
+def read_reporter_symbols(output):
+    output.seek(0, os.SEEK_END)
+    if output.tell() > 64 * 1024 * 1024:
+        raise ValueError('actual candidate symbol table exceeds bounded disk extent')
+    output.seek(0)
+    matches = []
+    pattern = re.compile(r'^' + re.escape(SYMBOL) + r'(?:::h[0-9a-f]{16})? [tT] ([0-9a-fA-F]+)(?: [0-9a-fA-F]+)?$')
+    while line := output.readline(65537):
+        if len(line) > 65536:
+            raise ValueError('actual candidate symbol line exceeds bounded input')
+        if match := pattern.fullmatch(line.decode('utf-8', errors='strict').rstrip('\n')):
+            matches.append(int(match[1], 16))
+            if len(matches) > 1:
+                raise ValueError('actual outlined reporter symbol is ambiguous')
+    if len(matches) != 1:
+        raise ValueError('exact actual outlined reporter symbol is absent')
+    return matches
+
+
 def resolve_reporter(pin):
     verify_path(pin)
     # Disk-backed nm output, bounded before reading into memory. Symbol names
@@ -60,17 +79,9 @@ def resolve_reporter(pin):
         result = subprocess.run(['nm', '--demangle=rust', '--defined-only', '--format=posix',
                                  f'/proc/self/fd/{pin.fd}'], pass_fds=(pin.fd,),
                                 stdout=output, stderr=errors, timeout=10)
-        if result.returncode or output.tell() > 16 * 1024 * 1024:
-            raise ValueError('actual candidate symbol table is unavailable or exceeds bound')
-        output.seek(0)
-        symbols = output.read().decode('utf-8', errors='strict')
-    matches = []
-    pattern = re.compile(r'^' + re.escape(SYMBOL) + r'(?:::h[0-9a-f]{16})? [tT] ([0-9a-fA-F]+)(?: [0-9a-fA-F]+)?$')
-    for line in symbols.splitlines():
-        if match := pattern.fullmatch(line):
-            matches.append(int(match[1], 16))
-    if len(matches) != 1:
-        raise ValueError('exact actual outlined reporter symbol is absent or ambiguous')
+        if result.returncode:
+            raise ValueError('actual candidate symbol table is unavailable')
+        matches = read_reporter_symbols(output)
     offset = symbol_file_offset(pin.fd, matches[0])
     verify_path(pin)
     return dict(symbol=SYMBOL, virtual_address=matches[0], file_offset=offset,

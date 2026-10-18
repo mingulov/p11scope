@@ -328,3 +328,10 @@ milestones; that failed attempt remains a failure. The separate loaded-file
 custody checks still compare opened `map_files` identities like for like. The
 normal regression exercises an actual held-FD mapping and rejects foreign
 device/inode/offset facts; no capture admission guard is changed.
+
+Actual batch8's demangled symbol table is about28.5MB. Symbol resolution streams
+that disk-backed output one bounded64KiB line at a time, with a64MiB disk-input
+ceiling and the original10-second command bound. It never allocates the whole
+symbol table. A larger-than16MiB healthy table, overlong line, oversized extent
+and duplicate reporter are regression controls; these are symbol-reader facts,
+not an installed probe positive.

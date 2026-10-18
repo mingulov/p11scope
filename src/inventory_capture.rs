@@ -360,6 +360,15 @@ pub(crate) use crate::attach::multi_functional_probe;
 /// own; `begin_stop` and `poll_retirement` hide the typestate moves.
 pub(crate) trait CaptureLane<Pin>: NativeIdentity<Pin> {
     fn domain(&self) -> NativeDomainId;
+    /// One serialized identity-only metadata observation through the retained
+    /// capture owner. This grants no Detailed or semantic admission authority.
+    fn observe_caller_image(
+        &mut self,
+        _original: &std::sync::Arc<PidPin>,
+        _window: ReadWindow,
+    ) -> Result<crate::attach::capture::CallerImageObservation> {
+        Err(anyhow!("caller image observation unavailable"))
+    }
     /// The attach backend and how it was chosen.
     fn backend(&self) -> LaneBackend {
         LaneBackend::singles()
@@ -1277,6 +1286,10 @@ pub(crate) trait PassDriver<Pin> {
     fn finish_pass(&mut self, _report: &mut PassReport) -> Result<()> {
         Ok(())
     }
+    /// Service optional jobs with the sole retained native capture. The loop
+    /// calls this after ring service and before the display tick. Absent native
+    /// capture stays explicit; callers cannot create a second query owner.
+    fn on_native_service(&mut self, _capture: Option<&mut dyn CaptureLane<Pin>>) {}
     /// Once per service tick, after the lane's own service (C5.3: the
     /// interactive dashboard draws here). It must return within a small
     /// bound: it shares the tick.
@@ -1537,6 +1550,10 @@ where
                     if let Some(lane) = lane.as_mut() {
                         lane.collecting_tick();
                     }
+                    driver.on_native_service(
+                        lane.as_mut()
+                            .map(|lane| &mut lane.capture as &mut dyn CaptureLane<Pin>),
+                    );
                     driver.on_tick();
                     if let Some(control) = &control {
                         latch_collection_stop(control, clock);
@@ -1646,6 +1663,10 @@ where
                     if let Some(lane) = lane.as_mut() {
                         lane.tick(driver.host());
                     }
+                    driver.on_native_service(
+                        lane.as_mut()
+                            .map(|lane| &mut lane.capture as &mut dyn CaptureLane<Pin>),
+                    );
                     driver.on_tick();
                     if let Some(control) = &control {
                         latch_collection_stop(control, clock);
@@ -1809,6 +1830,17 @@ impl NativeIdentity<PidPin> for FacadeLane {
 impl CaptureLane<PidPin> for FacadeLane {
     fn domain(&self) -> NativeDomainId {
         self.domain
+    }
+
+    fn observe_caller_image(
+        &mut self,
+        original: &std::sync::Arc<PidPin>,
+        window: ReadWindow,
+    ) -> Result<crate::attach::capture::CallerImageObservation> {
+        match &mut self.state {
+            FacadeState::Active(capture) => capture.observe_caller_image(original, window),
+            _ => Err(anyhow!("caller image observation unavailable")),
+        }
     }
 
     fn backend(&self) -> LaneBackend {

@@ -290,10 +290,9 @@ impl PromotionInstallCapacity {
     fn requested_bytes() -> Option<usize> {
         std::mem::size_of::<SemanticCallerBinding>()
             .checked_add(capacity::one_map_request::<CallerId, usize>()?)?
-            .checked_add(capacity::one_map_request::<
-                CallerId,
-                SemanticAdmissionHistory,
-            >()?)
+            .checked_add(capacity::map_request::<CallerId, SemanticAdmissionHistory>(
+                MAX_INSTANCES,
+            )?)
     }
 
     pub(super) fn reserve(registry: &CallerRegistry) -> Result<Self, SemanticBindingRefusal> {
@@ -316,14 +315,14 @@ impl PromotionInstallCapacity {
             .try_reserve(1)
             .map_err(|_| SemanticBindingRefusal::Capacity)?;
         admission_images
-            .try_reserve(1)
+            .try_reserve(MAX_INSTANCES)
             .map_err(|_| SemanticBindingRefusal::Capacity)?;
         assert_eq!(bindings.capacity(), 1, "pinned initial Vec layout changed");
         assert_eq!(index.capacity(), 3, "pinned initial index layout changed");
         assert_eq!(
             admission_images.capacity(),
-            3,
-            "pinned initial history layout changed"
+            7_168,
+            "pinned supported-history layout changed"
         );
         Ok(Self {
             bindings,
@@ -355,7 +354,7 @@ mod tests {
         assert_eq!(bytes, PromotionInstallCapacity::requested_bytes().unwrap());
         assert_eq!(capacity.bindings.capacity(), 1);
         assert_eq!(capacity.index.capacity(), 3);
-        assert_eq!(capacity.admission_images.capacity(), 3);
+        assert_eq!(capacity.admission_images.capacity(), 7_168);
         let charged = registry.semantic_resource_snapshot().charged_bytes;
         assert_eq!(
             charged,

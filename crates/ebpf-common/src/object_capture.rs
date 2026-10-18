@@ -1690,8 +1690,19 @@ fn request_alias_scan(
             {
                 match read_word(sel_addr) {
                     Ok(sel) if safe_attribute_kind(sel).is_some() => {
-                        match (read_word(ptr_addr), read_word(len_addr)) {
-                            (Ok(other_ptr), Ok(other_len)) => {
+                        let other_ptr = match read_word(ptr_addr) {
+                            Ok(value) => value,
+                            Err(()) => {
+                                // Preserve the selected header's length read
+                                // even when its pointer word is unreadable.
+                                let _ = read_word(len_addr);
+                                flags |= attr_list_flag::HEADER_READ_FAILURE;
+                                j += 1;
+                                continue;
+                            }
+                        };
+                        match read_word(len_addr) {
+                            Ok(other_len) => {
                                 if other_ptr != 0
                                     && other_len != 0
                                     && validate_target_span(other_ptr, other_len, layout).is_some()
@@ -1700,7 +1711,7 @@ fn request_alias_scan(
                                     alias = true;
                                 }
                             }
-                            _ => flags |= attr_list_flag::HEADER_READ_FAILURE,
+                            Err(()) => flags |= attr_list_flag::HEADER_READ_FAILURE,
                         }
                     }
                     Err(()) => flags |= attr_list_flag::HEADER_READ_FAILURE,

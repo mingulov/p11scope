@@ -13134,3 +13134,42 @@ fn instance_entry_ip_and_stamps_have_no_rendering_consumers() {
         "the rendering sentinel regression must stay in place"
     );
 }
+
+#[test]
+fn verifier_headroom_probe_unprivileged_controls_fail_closed() {
+    let _guard = NATIVE_SUITE_GATE.lock().unwrap();
+    let temporary = std::env::var_os("TMPDIR").unwrap_or_else(|| "/var/tmp/p11scope-ws-tmp".into());
+    let directory = tempfile::tempdir_in(temporary).expect("owned verifier probe build directory");
+    let output = directory.path().join("verifier-probe");
+    let built = run_ok(
+        "python3",
+        &[
+            "-I",
+            "scripts/measure-verifier-headroom.py",
+            "build",
+            output.to_str().unwrap(),
+        ],
+    );
+    assert!(built.contains("stats/BTF refusal controls and native syscall ABI PASS"));
+    assert!(built.contains("actual shared-preload syscall forwarding PASS"));
+    let probe = output.join("verifier-stats-probe.so");
+    let checked = run_ok(
+        "python3",
+        &[
+            "-I",
+            "scripts/measure-verifier-headroom.py",
+            "self-test",
+            "--probe",
+            probe.to_str().unwrap(),
+        ],
+    );
+    for marker in [
+        "default/diagnostic boundary positives, 46 refusal controls PASS",
+        "empty observer: refused; owned child reaped",
+        "failed observer: refused; owned child reaped",
+        "timeout observer: refused; owned child reaped",
+        "descendant-fd observer: refused; owned child reaped",
+    ] {
+        assert!(checked.contains(marker), "headroom checks omitted {marker}");
+    }
+}

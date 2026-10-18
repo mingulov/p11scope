@@ -36,6 +36,25 @@ static struct { int fd; uint32_t id; unsigned char *bytes; size_t length; } btfs
 static size_t btf_total;
 static _Atomic uint64_t emitted_rows;
 static _Atomic uint64_t write_failures;
+static pid_t probe_owner = -1;
+
+__attribute__((constructor))
+static void bind_observer(void)
+{
+    int saved = errno;
+    const char *inherited = getenv("P11SCOPE_VERIFIER_STATS_OWNER_PID");
+    if (!inherited && getenv("P11SCOPE_VERIFIER_STATS_FD")) {
+        char owner[32];
+        snprintf(owner, sizeof(owner), "%ld", (long)getpid());
+        if (setenv("P11SCOPE_VERIFIER_STATS_OWNER_PID", owner, 0) == 0) probe_owner = getpid();
+    } else if (inherited && *inherited) {
+        char *end;
+        errno = 0;
+        long owner = strtol(inherited, &end, 10);
+        if (!errno && !*end && owner > 0 && owner == getpid()) probe_owner = getpid();
+    }
+    errno = saved;
+}
 
 /* Do not read nonexistent C varargs. This is the same native register shuffle
  * as libc's syscall entry: arg6 remains the original caller's stack word.
@@ -70,6 +89,10 @@ static long raw_bpf(unsigned cmd, const void *attr, unsigned size)
 
 static int output_fd(void)
 {
+    /* Workloads/helpers inherit the preload environment across fork/exec, but
+     * pre-exec cleanup can close and reuse this FD number. Never instrument or
+     * write through it from a descendant, including a freshly exec'd one. */
+    if (probe_owner != getpid()) return -1;
     const char *text = getenv("P11SCOPE_VERIFIER_STATS_FD");
     if (!text || !*text) return -1;
     char *end;
@@ -345,8 +368,11 @@ long p11scope_verifier_bpf(long number, unsigned cmd, const union bpf_attr *attr
 #include <assert.h>
 #include <fcntl.h>
 #include <sys/mman.h>
-int main(void)
+#include <sys/stat.h>
+#include <sys/wait.h>
+int main(int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "--descendant") == 0) return 0;
 #ifndef PROBE_FORWARD_ONLY
     uint64_t a, b;
     const char *good = "verification time 17 usec\nstack depth 192+264\nprocessed 950000 insns (limit 1000000) max_states_per_insn 1\n";
@@ -396,6 +422,27 @@ int main(void)
     assert(page != MAP_FAILED && *(char *)page == 'Z');
     assert(munmap(page, 4096) == 0 && close(fd) == 0);
     assert(syscall(0x7fffffff) == -1 && errno == ENOSYS);
+    const char *out = getenv("P11SCOPE_VERIFIER_STATS_FD");
+    if (out) {
+        char *end;
+        long log_fd = strtol(out, &end, 10);
+        assert(!*end && log_fd >= 3 && log_fd <= 1048576);
+        int target = memfd_create("verifier-probe-descendant", 0);
+        assert(target >= 0 && target != log_fd);
+        pid_t child = fork(); assert(child >= 0);
+        if (!child) {
+            assert(dup2(target, (int)log_fd) == log_fd);
+            assert(close(target) == 0);
+            execl("/proc/self/exe", "probe-descendant", "--descendant", (char *)NULL);
+            _exit(125);
+        }
+        int status;
+        assert(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        struct stat observed;
+        assert(fstat(target, &observed) == 0 && observed.st_size == 0);
+        assert(close(target) == 0);
+        puts("verifier probe: descendant exec and reused FD remain byte-empty PASS");
+    }
 #ifdef PROBE_FORWARD_ONLY
     puts("verifier probe: actual shared-preload syscall forwarding PASS");
 #else

@@ -184,14 +184,11 @@ pub(crate) struct PromotionAdmissionReservation {
 impl PromotionAdmissionReservation {
     pub(super) fn reserve(
         registry: &CallerRegistry,
-        candidate: &SemanticAdmissionCandidate,
+        caller: CallerId,
+        domain: NativeDomainId,
+        pin: Arc<PidPin>,
+        path_bytes: usize,
     ) -> Result<Self, SemanticBindingRefusal> {
-        let path_bytes = candidate
-            .generation
-            .exe
-            .as_ref()
-            .and_then(|exe| exe.path.as_ref())
-            .map_or(0, String::len);
         // Both candidate and cloned history can coexist through validation;
         // include their inline owner storage and both executable-path copies.
         let charge = std::mem::size_of::<StagedPromotionAdmission>()
@@ -208,15 +205,15 @@ impl PromotionAdmissionReservation {
             .reserve_semantic_storage(charge)
             .map_err(|_| SemanticBindingRefusal::Capacity)?;
         Ok(Self {
-            caller: candidate.caller,
-            domain: candidate.domain,
-            pin: candidate.pin.clone(),
+            caller,
+            domain,
+            pin,
             path_bytes,
             storage,
         })
     }
 
-    fn matches(&self, candidate: &SemanticAdmissionCandidate) -> bool {
+    pub(super) fn matches(&self, candidate: &SemanticAdmissionCandidate) -> bool {
         self.caller == candidate.caller
             && self.domain == candidate.domain
             && Arc::ptr_eq(&self.pin, &candidate.pin)

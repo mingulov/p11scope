@@ -32,14 +32,10 @@ fn prepare_owner_after_catalog(
 ) {
     let caller = scene.caller();
     let lane = scene.lane.as_mut().unwrap();
-    let candidate = scene
+    let (candidate, reservation) = scene
         .coordinator
-        .prepare_legacy_semantic_candidate(caller, lane.domain())
+        .prepare_legacy_promotion_candidate(caller, lane.domain())
         .expect("the actual catalog retains the original eligible caller");
-    let reservation = scene
-        .coordinator
-        .reserve_promotion_admission(&candidate)
-        .unwrap();
     let pin = lane.subset().pins().pinned().next().unwrap();
     let module = ModuleKey::physical(
         pin.key.device.major,
@@ -185,17 +181,17 @@ fn promotion_stage_refused_provider_leaves_no_global_admission_history() {
 fn promotion_stage_budget_refuses_before_copy_or_owner_scan() {
     let mut scene = AdmissionScene::new(Selection::Pid);
     scene.prepare_without_cookie();
-    let candidate = scene
-        .coordinator
-        .prepare_legacy_semantic_candidate(scene.caller(), scene.lane.as_ref().unwrap().domain())
-        .unwrap();
+    let caller = scene.caller();
+    let domain = scene.lane.as_ref().unwrap().domain();
     let baseline = scene.coordinator.registry().semantic_resource_snapshot();
     scene
         .coordinator
         .registry_mut()
         .reference_semantic_resource_limit(baseline.charged_bytes);
     let (result, allocations, bytes) = crate::test_alloc::count_allocs_during(|| {
-        scene.coordinator.reserve_promotion_admission(&candidate)
+        scene
+            .coordinator
+            .prepare_legacy_promotion_candidate(caller, domain)
     });
     assert!(matches!(result, Err(SemanticBindingRefusal::Capacity)));
     assert_eq!((allocations, bytes), (0, 0));

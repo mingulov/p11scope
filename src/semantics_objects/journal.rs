@@ -719,6 +719,9 @@ pub(crate) enum JournalGap {
     FaultUnreadable,
     FaultSaturated,
     Malformed,
+    /// A cumulative reader counter regressed or saturated; the lost
+    /// history bound cannot be established from this audit.
+    CounterUnprovable,
     H3Pending,
     H3Loss,
     AdapterInvalidated,
@@ -2059,6 +2062,7 @@ pub(crate) struct JournalAuditReceipt {
     fault_error: Option<FaultReadError>,
     malformed_delta: u64,
     discarded_delta: u64,
+    counter_error: bool,
     h3: H3DispositionEvidence,
     h0_below: u64,
     closure_generation: u64,
@@ -2076,6 +2080,7 @@ pub(crate) struct JournalCollection {
     pub(crate) ordinary: u64,
     pub(crate) malformed_delta: u64,
     pub(crate) discarded_delta: u64,
+    pub(crate) counter_error: bool,
     pub(crate) fault_before: u64,
     pub(crate) fault_after: u64,
     pub(crate) fault_error: Option<FaultReadError>,
@@ -2100,6 +2105,7 @@ impl JournalAuditReceipt {
             fault_error: collection.fault_error,
             malformed_delta: collection.malformed_delta,
             discarded_delta: collection.discarded_delta,
+            counter_error: collection.counter_error,
             h3: source.take_h3_disposition(),
             h0_below: collection.h0_allocated_below,
             closure_generation,
@@ -2147,6 +2153,7 @@ impl JournalAuditReceipt {
             fault_error,
             malformed_delta,
             discarded_delta: 0,
+            counter_error: false,
             h3,
             h0_below,
             closure_generation,
@@ -2183,6 +2190,9 @@ impl JournalAuditReceipt {
         // within one.
         if last_fault.is_some_and(|last| self.fault_before != last) {
             return Err(JournalGap::FaultChanged);
+        }
+        if self.counter_error {
+            return Err(JournalGap::CounterUnprovable);
         }
         if self.malformed_delta != 0 {
             return Err(JournalGap::Malformed);
@@ -3307,6 +3317,7 @@ impl JournalAdapter {
                 JournalGap::FaultChanged
                 | JournalGap::FaultUnreadable
                 | JournalGap::Malformed
+                | JournalGap::CounterUnprovable
                 | JournalGap::Discarded
                 | JournalGap::H3Loss => {
                     // Irreversible refusals first: staged unbounded
@@ -4488,6 +4499,7 @@ impl JournalAdapter {
                 ordinary: 0,
                 malformed_delta: 0,
                 discarded_delta: 0,
+                counter_error: false,
                 fault_before,
                 fault_after: fault_before,
                 fault_error,
@@ -4503,6 +4515,7 @@ impl JournalAdapter {
                     ordinary: 0,
                     malformed_delta: 0,
                     discarded_delta: 0,
+                    counter_error: false,
                     fault_before: 0,
                     fault_after: 0,
                     fault_error: Some(error),
@@ -4557,6 +4570,7 @@ impl JournalAdapter {
             ordinary,
             malformed_delta: drain.malformed().saturating_sub(malformed_before),
             discarded_delta: drain.discarded().saturating_sub(discarded_before),
+            counter_error: false,
             fault_before,
             fault_after,
             fault_error,

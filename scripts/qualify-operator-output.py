@@ -135,7 +135,7 @@ def cell(args, label, directory, env, binary, provider, caller_pin):
                    signals=[], cancellation_ack_ns=None, terminal_observed_alive=False,
                    stdout_stalled=False, stderr_blocked=args.control == 'blocked-stderr',
                    trace_file_error=None, watchdog=False, control=args.control)
-    observer = caller = holder = None
+    observer = caller = None
     stdout_file = None
     errors = bytearray()
     trace_path = directory / 'trace.txt'
@@ -175,7 +175,7 @@ def cell(args, label, directory, env, binary, provider, caller_pin):
         if args.control == 'child-held-stdout':
             if pipe is None:
                 raise ValueError('child-held-stdout requires a slowpipe cell')
-            holder = NATIVE.spawn_owned(owners,
+            NATIVE.spawn_owned(owners,
                 [sys.executable, '-I', '-c', 'import time; time.sleep(90)'], 0,
                 stdin=subprocess.DEVNULL, stdout=pipe.write_fd,
                 stderr=subprocess.DEVNULL, start_new_session=True)

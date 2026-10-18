@@ -13,6 +13,7 @@ Run via the registered runner:
 """
 
 import copy
+import hashlib
 import io
 import json
 import os
@@ -518,6 +519,66 @@ class InstalledJudgeTests(unittest.TestCase):
                 (verdict["pass"], verdict["qualification"]), (False, "failed"))
 
 
+class BoundedTextTests(unittest.TestCase):
+    def test_stale_stat_growth_is_refused(self):
+        # Regression: a stale size-1 stat for a 1 KiB file with limit 16
+        # must refuse; the helper reads the held FD with limit+1, never a
+        # stale stat plus unbounded read.
+        with tempfile.TemporaryDirectory(
+                prefix="p11scope-loader-bounded-") as raw:
+            path = Path(raw) / "evidence.txt"
+            path.write_text("A" * 1024, encoding="utf-8")
+            original = Path.stat
+
+            def stale_stat(self, *args, **kwargs):
+                info = original(self, *args, **kwargs)
+                if str(self) == str(path):
+                    class Stale:
+                        st_mode = info.st_mode
+                        st_size = 1
+                    return Stale()
+                return info
+
+            Path.stat = stale_stat
+            try:
+                with self.assertRaises(ORACLE.JudgeFail):
+                    ORACLE.read_bounded_text(str(path), 16)
+            finally:
+                Path.stat = original
+
+    def test_actual_overflow_is_refused_without_stale_stat(self):
+        with tempfile.TemporaryDirectory(
+                prefix="p11scope-loader-bounded-") as raw:
+            path = Path(raw) / "big.txt"
+            path.write_text("B" * 1024, encoding="utf-8")
+            with self.assertRaises(ORACLE.JudgeFail):
+                ORACLE.read_bounded_text(str(path), 16)
+
+    def test_bounded_utf8_succeeds(self):
+        # Healthy twin: bounded UTF-8 (including multibyte) within limit.
+        with tempfile.TemporaryDirectory(
+                prefix="p11scope-loader-bounded-") as raw:
+            path = Path(raw) / "healthy.txt"
+            text = "hello héllo 🌐"
+            path.write_text(text, encoding="utf-8")
+            self.assertEqual(
+                ORACLE.read_bounded_text(str(path), 64), text)
+            exact = Path(raw) / "exact.txt"
+            exact.write_bytes(b"x" * 16)
+            self.assertEqual(
+                ORACLE.read_bounded_text(str(exact), 16), "x" * 16)
+            over = Path(raw) / "over.txt"
+            over.write_bytes(b"y" * 17)
+            with self.assertRaises(ORACLE.JudgeFail):
+                ORACLE.read_bounded_text(str(over), 16)
+
+    def test_nonregular_is_refused(self):
+        with tempfile.TemporaryDirectory(
+                prefix="p11scope-loader-bounded-") as raw:
+            with self.assertRaises(ORACLE.JudgeFail):
+                ORACLE.read_bounded_text(raw, 16)
+
+
 class FixtureWorkloadTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -672,6 +733,83 @@ class FixtureWorkloadTests(unittest.TestCase):
                           '"signature"', '"payload"', '"secret"',
                           "fixture-secret"):
             self.assertNotIn(forbidden, text)
+
+    def test_same_inode_append_is_refused(self):
+        # Regression: a wrapper appends one NUL byte (same inode) before
+        # exec of the real driver. Held-FD revalidation must refuse; an
+        # accepted ledger with a stale SHA is the bug.
+        work = self.directory / "mutate-append"
+        work.mkdir(exist_ok=True)
+        provider = work / "provider.so"
+        shutil.copy2(self.provider, provider)
+        before = provider.stat()
+        wrapper = work / "append.sh"
+        wrapper.write_text(
+            f'#!/bin/sh\nprintf "\\0" >> "$1"\n'
+            f'exec "{self.driver}" "$@"\n', encoding="utf-8")
+        wrapper.chmod(0o755)
+        output = work / "ledger.jsonl"
+        with self.assertRaises(ORACLE.LedgerError):
+            ORACLE.run_lifetimes(
+                cell="g16", lifetimes=1, provider=str(provider),
+                driver=str(wrapper), output=str(output))
+        self.assertFalse(output.exists())
+        after = provider.stat()
+        self.assertEqual(after.st_ino, before.st_ino)
+        self.assertEqual(after.st_size, before.st_size + 1)
+
+    def test_passthrough_wrapper_succeeds_with_fd(self):
+        # Healthy twin: the same wrapper seam without mutation succeeds,
+        # and the ledger hash matches the current provider bytes.
+        work = self.directory / "passthrough-fd"
+        work.mkdir(exist_ok=True)
+        provider = work / "provider.so"
+        shutil.copy2(self.provider, provider)
+        wrapper = work / "pass.sh"
+        wrapper.write_text(f'#!/bin/sh\nexec "{self.driver}" "$@"\n',
+                           encoding="utf-8")
+        wrapper.chmod(0o755)
+        output = work / "ledger.jsonl"
+        summary = ORACLE.run_lifetimes(
+            cell="g16", lifetimes=1, provider=str(provider),
+            driver=str(wrapper), output=str(output))
+        self.assertEqual(summary["lifetimes"], 1)
+        current = hashlib.sha256(provider.read_bytes()).hexdigest()
+        self.assertEqual(summary["provider"]["sha256"], current)
+        rows = ORACLE.read_jsonl(io.StringIO(output.read_text(encoding="utf-8")))
+        ORACLE.validate_ledger(rows, "g16", 1)
+        self.assertEqual(rows[1]["provider_ino"], provider.stat().st_ino)
+
+    def test_path_replacement_retains_fd_authority(self):
+        # Coverage: the wrapper replaces the provider pathname (different
+        # inode, invalid bytes) before exec. FD-backed exec must still run
+        # the held bytes; the ledger matches the original hash, never the
+        # replacement. Reopening the pathname would accept new bytes.
+        work = self.directory / "replace-path"
+        work.mkdir(exist_ok=True)
+        provider = work / "provider.so"
+        shutil.copy2(self.provider, provider)
+        orig_sha = hashlib.sha256(provider.read_bytes()).hexdigest()
+        orig_ino = provider.stat().st_ino
+        replacement = work / "replacement.so"
+        replacement.write_bytes(b"not-an-elf" * 100)
+        repl_sha = hashlib.sha256(replacement.read_bytes()).hexdigest()
+        self.assertNotEqual(orig_sha, repl_sha)
+        wrapper = work / "replace.sh"
+        wrapper.write_text(
+            f'#!/bin/sh\ncp "{replacement}" "{provider}.tmp-new"\n'
+            f'mv "{provider}.tmp-new" "{provider}"\n'
+            f'exec "{self.driver}" "$@"\n', encoding="utf-8")
+        wrapper.chmod(0o755)
+        output = work / "ledger.jsonl"
+        summary = ORACLE.run_lifetimes(
+            cell="g16", lifetimes=1, provider=str(provider),
+            driver=str(wrapper), output=str(output))
+        self.assertEqual(summary["provider"]["sha256"], orig_sha)
+        rows = ORACLE.read_jsonl(io.StringIO(output.read_text(encoding="utf-8")))
+        ORACLE.validate_ledger(rows, "g16", 1)
+        self.assertEqual(rows[1]["provider_ino"], orig_ino)
+        self.assertNotEqual(provider.stat().st_ino, orig_ino)
 
 
 if __name__ == "__main__":

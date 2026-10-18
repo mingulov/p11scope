@@ -448,6 +448,7 @@ fn prepared_provider_copy_reserves_shared_pool_before_retention_and_retries() {
     assert_eq!(refused.charged_bytes, before.charged_bytes);
     assert_eq!(refused.peak_charged_bytes, before.peak_charged_bytes);
     assert_eq!(refused.refused, before.refused + 1);
+    fixture.scene.coordinator.commit_batch(false).unwrap();
     assert!(
         fixture
             .scene
@@ -498,6 +499,7 @@ fn prepared_provider_count_and_capacity_refusals_preserve_a_then_retry() {
         .registry()
         .semantic_resource_snapshot();
     assert_eq!(fixture.admit(1), Err(SemanticBindingRefusal::Capacity));
+    fixture.scene.coordinator.commit_batch(false).unwrap();
     let module_b = fixture
         .scene
         .coordinator

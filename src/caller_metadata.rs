@@ -401,22 +401,29 @@ fn parse_k8s_cgroupfs(components: &[&[u8]], start: usize) -> Option<PodCandidate
 }
 
 fn parse_k8s_systemd(components: &[&[u8]], start: usize) -> Option<PodCandidate> {
-    if components.get(start).copied() != Some(&b"kubepods.slice"[..]) {
-        return None;
-    }
-    let mut pod_index = start + 1;
-    let qos = match components.get(pod_index).copied() {
-        Some(b"kubepods-burstable.slice") => {
+    let (stem, mut pod_index): (&[u8], usize) = match components.get(start).copied()? {
+        b"kubepods.slice" => (b"kubepods", start + 1),
+        b"kubelet.slice"
+            if components.get(start + 1).copied() == Some(b"kubelet-kubepods.slice") =>
+        {
+            (b"kubelet-kubepods", start + 2)
+        }
+        _ => return None,
+    };
+    let qos = match (stem, components.get(pod_index).copied()) {
+        (b"kubepods", Some(b"kubepods-burstable.slice"))
+        | (b"kubelet-kubepods", Some(b"kubelet-kubepods-burstable.slice")) => {
             pod_index += 1;
             Some(b"burstable".as_slice())
         }
-        Some(b"kubepods-besteffort.slice") => {
+        (b"kubepods", Some(b"kubepods-besteffort.slice"))
+        | (b"kubelet-kubepods", Some(b"kubelet-kubepods-besteffort.slice")) => {
             pod_index += 1;
             Some(b"besteffort".as_slice())
         }
         _ => None,
     };
-    let pod_uid = parse_systemd_pod_component(components.get(pod_index).copied()?, qos)?;
+    let pod_uid = parse_systemd_pod_component(components.get(pod_index).copied()?, stem, qos)?;
     let runtime_index = pod_index + 1;
     let hint = parse_runtime_unit(components.get(runtime_index).copied()?)?;
     let container = ContainerCandidate {
@@ -437,14 +444,19 @@ fn parse_pod_component(component: &[u8]) -> Option<PodUid> {
     parse_pod_uid(component.strip_prefix(b"pod")?)
 }
 
-fn parse_systemd_pod_component(component: &[u8], qos: Option<&[u8]>) -> Option<PodUid> {
-    let prefix: &[u8] = match qos {
-        Some(qos) if qos == b"burstable" => b"kubepods-burstable-pod",
-        Some(qos) if qos == b"besteffort" => b"kubepods-besteffort-pod",
+fn parse_systemd_pod_component(
+    component: &[u8],
+    stem: &[u8],
+    qos: Option<&[u8]>,
+) -> Option<PodUid> {
+    let suffix = component.strip_prefix(stem)?.strip_prefix(b"-")?;
+    let uid = match qos {
+        Some(b"burstable") => suffix.strip_prefix(b"burstable-pod")?,
+        Some(b"besteffort") => suffix.strip_prefix(b"besteffort-pod")?,
         Some(_) => return None,
-        None => b"kubepods-pod",
-    };
-    let uid = component.strip_prefix(prefix)?.strip_suffix(b".slice")?;
+        None => suffix.strip_prefix(b"pod")?,
+    }
+    .strip_suffix(b".slice")?;
     let mut normalized = [0; 36];
     if uid.len() != 36
         || ![8, 13, 18, 23].iter().all(|i| uid[*i] == b'_')
@@ -579,6 +591,61 @@ mod tests {
             assert_eq!(parsed.status, ParseStatus::Recognized, "{path}");
             assert_eq!(parsed.container.unwrap().runtime, RuntimeHint::CriO);
             assert_eq!(parsed.pod.unwrap().uid.as_str(), uid);
+        }
+    }
+
+    #[test]
+    fn recognizes_exact_kubelet_systemd_stem_for_all_qos_levels() {
+        let uid = "12345678-1234-abcd-9876-1234567890ab";
+        let id = "d".repeat(64);
+        let systemd_uid = uid.replace('-', "_");
+        for qos in [None, Some("burstable"), Some("besteffort")] {
+            let qos_unit = qos
+                .map(|qos| format!("kubelet-kubepods-{qos}.slice/"))
+                .unwrap_or_default();
+            let qos_pod = qos.map(|qos| format!("-{qos}")).unwrap_or_default();
+            let path = format!(
+                "kubelet.slice/kubelet-kubepods.slice/{qos_unit}kubelet-kubepods{qos_pod}-pod{systemd_uid}.slice/cri-containerd-{id}.scope"
+            );
+            let parsed = parse_cgroup_membership(&membership(&path));
+            assert_eq!(
+                parsed.pod.map(|pod| pod.uid.as_str().to_owned()),
+                Some(uid.to_owned()),
+                "{path}"
+            );
+            assert_eq!(parsed.container.unwrap().runtime, RuntimeHint::Containerd);
+        }
+    }
+
+    #[test]
+    fn mismatched_kubelet_roots_qos_or_stems_never_create_pod_hints() {
+        let uid = "12345678_1234_abcd_9876_1234567890ab";
+        let id = "d".repeat(64);
+        for path in [
+            format!(
+                "kubelet-kubepods.slice/kubelet-kubepods-pod{uid}.slice/cri-containerd-{id}.scope"
+            ),
+            format!(
+                "other.slice/kubelet-kubepods.slice/kubelet-kubepods-pod{uid}.slice/cri-containerd-{id}.scope"
+            ),
+            format!(
+                "kubelet.slice/kubelet-kubepods.slice/kubepods-pod{uid}.slice/cri-containerd-{id}.scope"
+            ),
+            format!(
+                "kubelet.slice/kubelet-kubepods.slice/kubelet-kubepods-burstable.slice/kubelet-kubepods-besteffort-pod{uid}.slice/cri-containerd-{id}.scope"
+            ),
+            format!("kubepods.slice/kubelet-kubepods-pod{uid}.slice/cri-containerd-{id}.scope"),
+            format!(
+                "kubelet.slice/kubelet-kubepods.slice/kubelet-kubepods-pod12345678-1234-abcd-9876-1234567890ab.slice/cri-containerd-{id}.scope"
+            ),
+        ] {
+            let parsed = parse_cgroup_membership(&membership(&path));
+            assert_eq!(parsed.pod, None, "{path}");
+            assert_eq!(
+                parsed.container.unwrap().id.as_str(),
+                id,
+                "independent exact runtime hint remains finite"
+            );
         }
     }
 

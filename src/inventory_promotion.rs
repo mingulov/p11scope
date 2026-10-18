@@ -34,8 +34,8 @@ pub(crate) use state::{
     CaptureId, PromotionCancel, PromotionControl, PromotionNote, PromotionPair, PromotionRefusal,
     PromotionState, PromotionStatusUpdate, RequestId, ViewRevision,
 };
+// STAGED (DR37): named by tests today; the runtime owner names them from taken requests.
 #[cfg_attr(not(test), allow(unused_imports))]
-// STAGED (DR37): runtime status producers use these variants.
 pub(crate) use state::{PromotionEnd, PromotionOutcome};
 
 use crate::discovery::caller_registry::{CallerId, ModuleId};
@@ -137,6 +137,13 @@ impl PromotionRequest {
 
     pub(crate) fn provider(&self) -> ModuleId {
         self.provider
+    }
+
+    /// Build a capture-qualified status update from this exact held
+    /// request. The runtime calls this on the request it owns; it
+    /// never substitutes a global last request.
+    pub(crate) fn status_update(&self, outcome: PromotionOutcome) -> PromotionStatusUpdate {
+        PromotionStatusUpdate::new(self.viewed.capture, self.id, outcome)
     }
 }
 

@@ -180,6 +180,124 @@ fn object_producer_missing_side_state_faults_before_return() {
 }
 
 #[test]
+fn object_producer_scalar_scope_flags_preserve_authority_discriminant() {
+    use p11scope_ebpf_common::{
+        FLAG_CGROUP_FILTER, FLAG_PAUSE_ENABLED, FLAG_PID_FILTER, FLAG_POLICY_AGGREGATE,
+        FLAG_POLICY_ALLOWLISTED, FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA, FLAG_SYSTEM_FILTER,
+        valid_config,
+    };
+    let source = std::fs::read_to_string("crates/ebpf/src/main.rs").expect("BPF scope source");
+    let word = source_between(&source, "fn scope_flags_word() -> u64 {", "\n}\n");
+    let option = source_between(&source, "fn scope_flags() -> Option<u64> {", "\n}\n");
+    assert_eq!(
+        word.matches("scope_auth()").count(),
+        1,
+        "one real authority query"
+    );
+    assert_eq!(
+        option.matches("scope_flags_word()").count(),
+        1,
+        "one scalar query"
+    );
+    let auth = source_between(
+        &source,
+        "fn scope_auth() -> Option<ScopeAuth> {",
+        "fn scope_flags_word()",
+    );
+    assert!(auth.find("valid_config(flags)").unwrap() < auth.find("Some(ScopeAuth").unwrap());
+    let mut valid = Vec::new();
+    for scope in [FLAG_PID_FILTER, FLAG_CGROUP_FILTER, FLAG_SYSTEM_FILTER] {
+        for policy in [
+            FLAG_POLICY_ALLOWLISTED,
+            FLAG_POLICY_AGGREGATE,
+            FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA,
+        ] {
+            valid.push(scope | policy);
+            if scope == FLAG_PID_FILTER {
+                valid.push(scope | policy | FLAG_PAUSE_ENABLED);
+            }
+        }
+    }
+    // Independent finite configuration oracle, including every unknown bit.
+    assert!(!valid_config(0));
+    for flags in (0..512).chain((9..64).map(|bit| (1u64 << bit) | valid[0])) {
+        assert_eq!(
+            valid_config(flags),
+            valid.contains(&flags),
+            "flags={flags:#x}"
+        );
+    }
+    assert!(valid.iter().all(|flags| *flags != 0));
+    let fields = source_between(&source, "struct ScopeAuth {", "\n}\n");
+    let mut harness =
+        String::from("#![allow(dead_code)]\n#[derive(Clone, Copy)]\nstruct ScopeAuth {");
+    harness.push_str(fields);
+    harness.push_str("\n}\nfn scope_flags_word() -> u64 {");
+    harness.push_str(word);
+    harness.push_str("\n}\nfn scope_flags() -> Option<u64> {");
+    harness.push_str(option);
+    harness.push_str("\n}\n");
+    harness.push_str(
+        &r#"
+use std::sync::{Mutex, atomic::{AtomicUsize, Ordering}};
+static AUTH: Mutex<Option<ScopeAuth>> = Mutex::new(None);
+static CALLS: AtomicUsize = AtomicUsize::new(0);
+fn scope_auth() -> Option<ScopeAuth> {
+    CALLS.fetch_add(1, Ordering::SeqCst);
+    *AUTH.lock().unwrap()
+}
+fn set(flags: Option<u64>) {
+    *AUTH.lock().unwrap() = flags.map(|flags| ScopeAuth {
+        flags, tgid: 73, _pad: 0, generation_token: u64::MAX,
+    });
+    CALLS.store(0, Ordering::SeqCst);
+}
+fn main() {
+    set(None);
+    assert_eq!(scope_flags_word(), 0);
+    assert_eq!(CALLS.load(Ordering::SeqCst), 1);
+    set(None);
+    assert_eq!(scope_flags(), None);
+    assert_eq!(CALLS.load(Ordering::SeqCst), 1);
+    for flags in __VALID__.into_iter().chain([0, 1u64 << 63, u64::MAX]) {
+        // Synthetic high words test representation only; real scope_auth
+        // refuses them through valid_config before returning a receipt.
+        set(Some(flags));
+        assert_eq!(scope_flags_word(), flags);
+        assert_eq!(CALLS.load(Ordering::SeqCst), 1);
+        set(Some(flags));
+        assert_eq!(scope_flags(), if flags == 0 { None } else { Some(flags) });
+        assert_eq!(CALLS.load(Ordering::SeqCst), 1);
+    }
+}
+"#
+        .replace("__VALID__", &format!("{valid:?}")),
+    );
+    let directory = tempfile::tempdir().expect("actual scalar scope wrapper fixture");
+    let input = directory.path().join("scope.rs");
+    let binary = directory.path().join("scope");
+    std::fs::write(&input, harness).expect("write actual wrapper bodies");
+    let output = Command::new("rustc")
+        .args(["+1.98.1", "--edition=2024"])
+        .arg(&input)
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .expect("compile actual wrappers");
+    assert!(
+        output.status.success(),
+        "scope wrappers: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        Command::new(binary)
+            .status()
+            .expect("run actual wrappers")
+            .success()
+    );
+}
+
+#[test]
 fn object_producer_return_branches_preserve_owned_lifetimes() {
     let source = std::fs::read_to_string("crates/ebpf/src/main.rs").expect("BPF return source");
     let dispatch = source_between(

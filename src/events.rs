@@ -2698,6 +2698,42 @@ mod tests {
         assert_eq!(drain.malformed(), u64::MAX);
     }
 
+    #[test]
+    fn dispatched_raw_malformed_saturation_is_counter_unprovable() {
+        struct Fault;
+        impl crate::semantics_objects::journal::FaultEpoch for Fault {
+            fn fault_epoch(
+                &self,
+            ) -> Result<u64, crate::semantics_objects::journal::FaultReadError> {
+                Ok(7)
+            }
+        }
+        let events = EventsDomain::test_standin(46);
+        let producers = crate::attach::SessionDrainProducers::test_pair(
+            crate::attach::capture::NativeDomainId::mint(),
+            events.clone(),
+        );
+        let mut drain = EventDrain::over_domain(ScriptedRecords::records([], 0), events);
+        drain.malformed = u64::MAX;
+        let pool = crate::semantics_edge::resources::SemanticResourcePool::default();
+        let quantum = crate::semantics_objects::journal::joint_driver::RawJointQuantum::collect(
+            &mut drain,
+            &p11scope_ebpf_common::object_wire::publish_object_descriptors(),
+            4,
+            &Fault,
+            &producers,
+            |bytes| pool.reserve(bytes),
+        )
+        .unwrap();
+        let (records, failed) = quantum.h0_input(producers.native_domain(), 1_024).unwrap();
+        assert!(records.is_empty());
+        assert!(
+            failed,
+            "a saturated malformed counter cannot certify an empty clean poll"
+        );
+        assert_eq!(drain.malformed(), u64::MAX);
+    }
+
     /// One record past the quantum, then a record the poll must never take.
     #[test]
     fn poll_stops_at_its_quantum_and_reports_the_backlog() {

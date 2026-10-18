@@ -912,36 +912,126 @@ struct DemotionWorkload {
     dir: tempfile::TempDir,
 }
 
+const DEMOTION_PREBUILT_FILES: [&str; 4] = [
+    "libdemotion-common.so",
+    "provider-A.so",
+    "provider-B.so",
+    "workload",
+];
+
+/// Explicit test-only opt-in. A bad payload refuses; it never falls back to a
+/// local build on a host whose selected test route requires prebuilt inputs.
+fn copy_demotion_prebuilt(source: &Path, destination: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    ensure!(
+        source.is_absolute(),
+        "prebuilt demotion directory must be absolute"
+    );
+    let mut inputs = Vec::new();
+    for name in DEMOTION_PREBUILT_FILES {
+        let path = source.join(name);
+        let metadata = std::fs::symlink_metadata(&path)
+            .with_context(|| format!("reading prebuilt demotion input {}", path.display()))?;
+        ensure!(
+            metadata.file_type().is_file(),
+            "prebuilt demotion input must be a regular nonsymlink file: {}",
+            path.display()
+        );
+        ensure!(
+            name != "workload" || metadata.permissions().mode() & 0o111 != 0,
+            "prebuilt demotion workload must be executable"
+        );
+        inputs.push((path, name, metadata.permissions()));
+    }
+    // Validate all four before making the test's private execution copies.
+    for (path, name, permissions) in inputs {
+        let target = destination.join(name);
+        std::fs::copy(&path, &target)
+            .with_context(|| format!("copying prebuilt demotion input {}", path.display()))?;
+        std::fs::set_permissions(target, permissions)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn demotion_prebuilt_copies_exact_inputs_and_executable_permissions() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let source = tempfile::tempdir()?;
+    let destination = tempfile::tempdir()?;
+    for name in DEMOTION_PREBUILT_FILES {
+        let path = source.path().join(name);
+        std::fs::write(&path, name.as_bytes())?;
+        let mode = if name == "workload" { 0o750 } else { 0o640 };
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+    }
+    copy_demotion_prebuilt(source.path(), destination.path())?;
+    for name in DEMOTION_PREBUILT_FILES {
+        let path = destination.path().join(name);
+        ensure!(std::fs::read(&path)? == name.as_bytes());
+        let mode = if name == "workload" { 0o750 } else { 0o640 };
+        ensure!(std::fs::metadata(path)?.permissions().mode() & 0o777 == mode);
+    }
+    Ok(())
+}
+
+#[test]
+fn demotion_prebuilt_refuses_relative_missing_symlink_and_nonregular_inputs() -> Result<()> {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let source = tempfile::tempdir()?;
+    let destination = tempfile::tempdir()?;
+    ensure!(copy_demotion_prebuilt(Path::new("relative"), destination.path()).is_err());
+    ensure!(copy_demotion_prebuilt(source.path(), destination.path()).is_err());
+    for name in DEMOTION_PREBUILT_FILES {
+        std::fs::write(source.path().join(name), name)?;
+    }
+    ensure!(copy_demotion_prebuilt(source.path(), destination.path()).is_err());
+    let workload = source.path().join("workload");
+    std::fs::set_permissions(&workload, std::fs::Permissions::from_mode(0o750))?;
+    let provider = source.path().join("provider-A.so");
+    std::fs::remove_file(&provider)?;
+    symlink(source.path().join("provider-B.so"), &provider)?;
+    ensure!(copy_demotion_prebuilt(source.path(), destination.path()).is_err());
+    std::fs::remove_file(&provider)?;
+    std::fs::create_dir(&provider)?;
+    ensure!(copy_demotion_prebuilt(source.path(), destination.path()).is_err());
+    ensure!(std::fs::read_dir(destination.path())?.next().is_none());
+    Ok(())
+}
+
 impl DemotionWorkload {
     fn spawn() -> Result<Self> {
         use std::os::unix::fs::OpenOptionsExt;
         let dir = tempfile::tempdir()?;
-        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/public-cli/demotion-ledger.c");
-        for (name, mode) in [
-            ("libdemotion-common.so", Some("DEMOTION_COMMON")),
-            ("provider-A.so", Some("DEMOTION_PROVIDER_A")),
-            ("provider-B.so", Some("DEMOTION_PROVIDER_B")),
-            ("workload", None),
-        ] {
-            let mut command = Command::new("cc");
-            command.args(["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"]);
-            if let Some(mode) = mode {
-                command.args(["-shared", "-fPIC"]).arg(format!("-D{mode}"));
-            } else {
-                command.arg("-DDEMOTION_PHASED_LEDGER");
+        if let Some(prebuilt) = std::env::var_os("P11SCOPE_DEMOTION_PREBUILT_DIR") {
+            copy_demotion_prebuilt(Path::new(&prebuilt), dir.path())?;
+        } else {
+            let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/public-cli/demotion-ledger.c");
+            for (name, mode) in [
+                ("libdemotion-common.so", Some("DEMOTION_COMMON")),
+                ("provider-A.so", Some("DEMOTION_PROVIDER_A")),
+                ("provider-B.so", Some("DEMOTION_PROVIDER_B")),
+                ("workload", None),
+            ] {
+                let mut command = Command::new("cc");
+                command.args(["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"]);
+                if let Some(mode) = mode {
+                    command.args(["-shared", "-fPIC"]).arg(format!("-D{mode}"));
+                } else {
+                    command.arg("-DDEMOTION_PHASED_LEDGER");
+                }
+                command.arg(&source).arg("-o").arg(dir.path().join(name));
+                if mode.is_some_and(|mode| mode != "DEMOTION_COMMON") {
+                    command.arg("-L").arg(dir.path()).args([
+                        "-ldemotion-common",
+                        "-Wl,-rpath,$ORIGIN",
+                        "-Wl,-z,defs",
+                    ]);
+                } else if mode.is_none() {
+                    command.arg("-ldl");
+                }
+                ensure!(command.status()?.success(), "building {name} failed");
             }
-            command.arg(&source).arg("-o").arg(dir.path().join(name));
-            if mode.is_some_and(|mode| mode != "DEMOTION_COMMON") {
-                command.arg("-L").arg(dir.path()).args([
-                    "-ldemotion-common",
-                    "-Wl,-rpath,$ORIGIN",
-                    "-Wl,-z,defs",
-                ]);
-            } else if mode.is_none() {
-                command.arg("-ldl");
-            }
-            ensure!(command.status()?.success(), "building {name} failed");
         }
         let fifo = dir.path().join("control");
         ensure!(

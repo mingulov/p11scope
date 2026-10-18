@@ -37,6 +37,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod cancellation;
 use cancellation::CaptureCancellation;
+mod diagnostics;
+use diagnostics::terminal_diagnostics;
 
 #[cfg(test)]
 mod root_fence_runtime;
@@ -2880,8 +2882,10 @@ fn finish_capture_error(
         Some(owned) => owned.finish(engine, session, CaptureEnd::Error, signals),
         None => Ok(()),
     };
-    let detach = session
-        .detach_producers_driven(|| signals.sigint_deliveries() >= 2, &mut std::io::stderr());
+    let detach = session.detach_producers_driven(
+        || signals.sigint_deliveries() >= 2,
+        terminal_diagnostics().as_mut(),
+    );
     combine_capture_failure(error, finish, detach)
 }
 
@@ -3107,7 +3111,7 @@ fn run_owned_inner(args: &RunArgs, stop: Arc<SignalState>) -> Result<OwnedRunOut
                 || {
                     session.detach_producers_driven(
                         || stop.sigint_deliveries() >= 2,
-                        &mut std::io::stderr(),
+                        terminal_diagnostics().as_mut(),
                     )
                 },
                 || {
@@ -5194,13 +5198,15 @@ fn capture_profile(
                     .map(|_| ())
                 },
                 |context| {
-                    context.1.detach_producers_driven(
+                    let result = context.1.detach_producers_driven(
                         || {
                             poll_terminal_cancellation();
                             interrupted.sigint_deliveries() >= 2
                         },
-                        &mut std::io::stderr(),
-                    )
+                        terminal_diagnostics().as_mut(),
+                    );
+                    poll_terminal_cancellation();
+                    result
                 },
             ));
         }
@@ -5222,13 +5228,15 @@ fn capture_profile(
         },
         |context| {
             poll_terminal_cancellation();
-            context.1.detach_producers_driven(
+            let result = context.1.detach_producers_driven(
                 || {
                     poll_terminal_cancellation();
                     interrupted.sigint_deliveries() >= 2
                 },
-                &mut std::io::stderr(),
-            )
+                terminal_diagnostics().as_mut(),
+            );
+            poll_terminal_cancellation();
+            result
         },
         |context, _end, _detached| {
             let mut terminal_context = (
@@ -5251,7 +5259,7 @@ fn capture_profile(
                 &mut terminal_context,
                 &mut consumers,
                 quiesced,
-                &mut std::io::stderr(),
+                terminal_diagnostics().as_mut(),
                 |context: &mut ProfileTerminalContext<'_, '_, '_, '_, '_, '_, '_>,
                  consumers: &mut CaptureConsumers<'_>,
                  quiesced| {
@@ -6040,13 +6048,15 @@ fn capture_trace(
                 // trace abandon contract asks for its own terminal line.
                 |_| Ok(()),
                 |context| {
-                    context.1.detach_producers_driven(
+                    let result = context.1.detach_producers_driven(
                         || {
                             poll_terminal_cancellation();
                             interrupted.sigint_deliveries() >= 2
                         },
-                        &mut std::io::stderr(),
-                    )
+                        terminal_diagnostics().as_mut(),
+                    );
+                    poll_terminal_cancellation();
+                    result
                 },
             ));
         }
@@ -6068,13 +6078,15 @@ fn capture_trace(
         },
         |context| {
             poll_terminal_cancellation();
-            context.1.detach_producers_driven(
+            let result = context.1.detach_producers_driven(
                 || {
                     poll_terminal_cancellation();
                     interrupted.sigint_deliveries() >= 2
                 },
-                &mut std::io::stderr(),
-            )
+                terminal_diagnostics().as_mut(),
+            );
+            poll_terminal_cancellation();
+            result
         },
         |context, end, _detached| {
             poll_terminal_cancellation();
@@ -6101,7 +6113,7 @@ fn capture_trace(
                 &mut terminal_context,
                 &mut consumers,
                 quiesced,
-                &mut std::io::stderr(),
+                terminal_diagnostics().as_mut(),
                 |context: &mut TraceTickContext<'_, '_, '_, '_, '_, '_, '_, '_, '_, '_>,
                  consumers: &mut CaptureConsumers<'_>,
                  quiesced| {

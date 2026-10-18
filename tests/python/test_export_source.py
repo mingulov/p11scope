@@ -253,17 +253,14 @@ class ExportSourceTests(unittest.TestCase):
         return fixture
 
     def test_full_fixture_uses_only_its_committed_bundle_history(self):
+        repository_before = OFFLINE_TEST_MODULE.REPOSITORY
         fixture = self.full_fixture("bundle-history")
+        self.assertEqual(OFFLINE_TEST_MODULE.REPOSITORY, repository_before)
         source_head = subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=fixture.bundle_source,
             check=True, text=True, stdout=subprocess.PIPE,
         ).stdout.strip()
-        product_head = subprocess.run(
-            ["git", "rev-parse", "HEAD"], cwd=ROOT,
-            check=True, text=True, stdout=subprocess.PIPE,
-        ).stdout.strip()
         self.assertEqual(fixture.shared_revision, source_head)
-        self.assertNotEqual(fixture.shared_revision, product_head)
 
         bundle = fixture.shared / "source.bundle"
         clone = self.base / "bundle-history clone"

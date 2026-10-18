@@ -103,6 +103,12 @@ impl StagingLedger {
         }
     }
 
+    /// Whether staged charges hold real pool leases: a resource-backed
+    /// ledger keeps every live staged charge through replay.
+    pub(crate) fn has_reserver(&self) -> bool {
+        self.reserver.is_some()
+    }
+
     pub(crate) fn prepare_capacity(&mut self) -> Result<(), LedgerRefusal> {
         if self.table.is_some() {
             return Ok(());
@@ -353,6 +359,7 @@ impl StagingLedger {
         self.mint_keyassoc_from_stage(bytes, None)
     }
 
+    /// `Some`-source callers must release the staged member right after the mint.
     pub(crate) fn mint_keyassoc_from_stage(
         &mut self,
         bytes: u64,

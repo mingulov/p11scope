@@ -31,10 +31,12 @@
 mod state;
 
 pub(crate) use state::{
-    CaptureId, PromotionCancel, PromotionControl, PromotionEnd, PromotionNote, PromotionOutcome,
-    PromotionPair, PromotionRefusal, PromotionState, PromotionStatusUpdate, RequestId,
-    RequestTicket, ViewRevision,
+    CaptureId, PromotionCancel, PromotionControl, PromotionNote, PromotionPair, PromotionRefusal,
+    PromotionState, PromotionStatusUpdate, RequestId, ViewRevision,
 };
+#[cfg_attr(not(test), allow(unused_imports))]
+// STAGED (DR37): runtime status producers use these variants.
+pub(crate) use state::{PromotionEnd, PromotionOutcome};
 
 use crate::discovery::caller_registry::{CallerId, ModuleId};
 use crate::inventory_present::Presentation;

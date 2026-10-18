@@ -1704,6 +1704,7 @@ fn d3_divergent_fixture_displays_at_80x14_with_honest_budgets() {
             scroll: index,
             detail: DetailPage::Evidence,
             gap_line: 0,
+            ..DashboardState::new()
         };
         let bytes = render_frame(
             &frame,
@@ -1803,6 +1804,7 @@ fn d3_divergent_fixture_displays_at_80x14_with_honest_budgets() {
             scroll: index,
             detail: DetailPage::Gaps,
             gap_line: 0,
+            ..DashboardState::new()
         };
         let bytes = render_frame(
             &frame,
@@ -1944,6 +1946,7 @@ fn d3_refused_caller_gap_without_edge_matches_all_outputs() {
                 scroll: 0,
                 detail: DetailPage::Gaps,
                 gap_line: 0,
+                ..DashboardState::new()
             },
         );
         let page = String::from_utf8_lossy(&bytes);
@@ -2648,6 +2651,7 @@ fn assert_four_way_semantic_agreement(document: &serde_json::Value, presentation
             scroll: 0,
             detail: DetailPage::Gaps,
             gap_line: 0,
+            ..DashboardState::new()
         },
     );
     let gaps_page = String::from_utf8_lossy(&gaps_bytes);

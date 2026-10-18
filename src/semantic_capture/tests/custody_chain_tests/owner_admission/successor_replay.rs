@@ -61,6 +61,7 @@ impl DeferredCalls {
         while drain.poll_records(Some(quantum), |record| {
             decoded.push(record_bytes(&record));
             owned.io.held.script.records.push_back(DecodedEventRecord {
+                joint_resource: None,
                 base: record,
                 object: None,
             });

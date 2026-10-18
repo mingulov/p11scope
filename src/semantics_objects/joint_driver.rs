@@ -3,7 +3,11 @@
 //!
 //! Raw custody is not admission, bootstrap or drain-binding authority.
 
-use super::{FaultEpoch, FaultReadError, JournalCollection, JournalIngestItem};
+use super::ledger::{ExistingReservation, LedgerGeneration};
+use super::{
+    FaultEpoch, FaultReadError, JournalAdapter, JournalCollection, JournalIngestItem,
+    JournalNativeKey, OpenEntry, SessionDrainGrant, StagingLedger, end_agrees_with_begin,
+};
 use crate::attach::SessionDrainProducers;
 use crate::attach::capture::NativeDomainId;
 use crate::events::{DecodedEventRecord, EventDrain, LIVE_POLL_QUANTUM, RecordSource};
@@ -11,14 +15,67 @@ use crate::semantics_edge::resources::{
     OWNED_ALLOCATION_PADDING, ResourceLease, SemanticResourceRefusal,
 };
 use p11scope_ebpf_common::MAX_DESCRIPTORS;
+use p11scope_ebpf_common::object_journal::{JournalRecord, ValidatedJournalBegin};
 use p11scope_ebpf_common::object_wire::ObjectDescriptorWire;
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::ops::ControlFlow;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_RAW_QUANTUM: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RawQuantumIdentity(u64);
+
+/// Immutable resource provenance from the actual retained END projection.
+/// It grants no attribution, H0 position, admission, birth or seal authority.
+/// Only the collector below constructs one after pairing the actual decoded
+/// END with its retained original BEGIN under one Session/native/EVENTS tuple.
+#[derive(Clone, Copy)]
+pub(crate) struct JointResourceOrigin {
+    reservation: ExistingReservation,
+    native: NativeDomainId,
+    events: u64,
+    invocation: (u64, u64),
+}
+
+impl JointResourceOrigin {
+    pub(crate) fn matches_native(&self, native: NativeDomainId) -> bool {
+        self.native == native
+    }
+    pub(super) fn reservation(&self) -> &ExistingReservation {
+        &self.reservation
+    }
+    pub(super) fn matches_producers(&self, producers: &SessionDrainProducers) -> bool {
+        self.native == producers.native_domain() && self.events == producers.events_id()
+    }
+}
+
+impl std::fmt::Debug for JointResourceOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("JointResourceOrigin(<private>)")
+    }
+}
+
+struct RawInvocation {
+    begin: ValidatedJournalBegin,
+    reservation: ExistingReservation,
+    terminal: bool,
+    poisoned: bool,
+    owns_raw: bool,
+}
+
+type ResourceContext<'a> = (
+    &'a mut StagingLedger,
+    &'a BTreeMap<JournalNativeKey, OpenEntry>,
+    &'a SessionDrainProducers,
+);
 
 /// One bounded original poll. Neither the wire buffer nor its audit establishes
 /// key, birth, drain-binding or H3 authority. The charge remains owned until the
 /// complete quantum (including H0's physical ordinary copy) is disposed.
 pub(crate) struct RawJointQuantum {
+    identity: RawQuantumIdentity,
     ordered: Vec<JournalIngestItem>,
     ordinary: Vec<DecodedEventRecord>,
     audit: JournalCollection,
@@ -32,6 +89,10 @@ pub(crate) struct RawJointQuantum {
     h0_delivered: usize,
     completed_delivered: bool,
     h0_pending: bool,
+    h0_reported: bool,
+    invocations: Vec<RawInvocation>,
+    ledger_generation: Option<LedgerGeneration>,
+    resource_refused: bool,
     _charge: ResourceLease,
 }
 
@@ -42,21 +103,27 @@ pub(crate) enum RawQuantumRefusal {
     ForeignDescriptors,
     ForeignDrain,
     ForeignCapture,
+    ForeignLedger,
+    DrainUnbound,
+    H0Undelivered,
+    IdentityExhausted,
     InvalidLimit,
     Resource(SemanticResourceRefusal),
+    Ledger(super::LedgerRefusal),
     Allocation,
     Fault(FaultReadError),
 }
 
 impl RawJointQuantum {
     fn storage_bytes(limit: usize) -> usize {
-        // All three arrays coexist. reserve_exact requests capacity once;
+        // All four arrays coexist. reserve_exact requests capacity once;
         // callbacks never grow them. Include each allocation's padding.
         limit
             * (size_of::<JournalIngestItem>()
                 + size_of::<DecodedEventRecord>()
                 + size_of::<usize>())
-            + 3 * OWNED_ALLOCATION_PADDING
+            + limit.min(super::MAX_UNSETTLED_STAGED) * size_of::<RawInvocation>()
+            + 4 * OWNED_ALLOCATION_PADDING
             + size_of::<Self>()
     }
 
@@ -66,6 +133,29 @@ impl RawJointQuantum {
 
     pub(crate) fn pending_h0_records(&self) -> usize {
         self.ordinary.len()
+    }
+
+    pub(super) fn ready_for_ingest(
+        &self,
+        adapter: &JournalAdapter,
+        producers: &SessionDrainProducers,
+    ) -> Result<(), RawQuantumRefusal> {
+        if !self.matches_producers(producers)
+            || !adapter.resource_producers.as_ref().is_some_and(|retained| {
+                retained.native_domain() == producers.native_domain()
+                    && retained.events_id() == producers.events_id()
+            })
+        {
+            return Err(RawQuantumRefusal::ForeignCapture);
+        }
+        if self.ledger_generation.is_none() || self.ledger_generation != adapter.ledger.generation()
+        {
+            return Err(RawQuantumRefusal::ForeignLedger);
+        }
+        if !self.h0_reported || !self.ordinary.is_empty() || self.h0_pending {
+            return Err(RawQuantumRefusal::H0Undelivered);
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -116,15 +206,27 @@ impl RawJointQuantum {
     /// Only the actual collected-leaf capture stamps this opaque report. It
     /// has processed the borrowed inputs, so retain their wire mapping while
     /// clearing their delivery buffer without releasing its capacity.
-    pub(crate) fn note_h0_report(&mut self, report: &crate::semantic_capture::TickReport) {
+    pub(crate) fn h0_identity(&self) -> RawQuantumIdentity {
+        self.identity
+    }
+
+    pub(crate) fn note_h0_report(
+        &mut self,
+        report: crate::semantic_capture::CollectedH0Disposition,
+    ) -> Result<(), RawQuantumRefusal> {
+        let (allocated_below, pending) = report
+            .for_quantum(self.identity, self.native)
+            .ok_or(RawQuantumRefusal::ForeignCapture)?;
+        self.h0_reported = true;
         self.h0_delivered += self.ordinary.len();
         self.completed_delivered |= self
             .ordinary
             .iter()
             .any(|record| record.base.event.event_type == p11scope_ebpf_common::event_type::CALL);
         self.ordinary.clear();
-        self.audit.h0_allocated_below = report.allocated_below();
-        self.h0_pending = report.awaiting_floor().is_some();
+        self.audit.h0_allocated_below = allocated_below;
+        self.h0_pending = pending;
+        Ok(())
     }
 
     fn observe_fault(
@@ -182,6 +284,7 @@ impl RawJointQuantum {
     /// Continue the SAME allocation before completed-call H0 delivery. Work
     /// is bounded independently from total custody, including failed decode
     /// attempts. A full quantum refuses without asking the cursor for N+1.
+    #[cfg(test)]
     pub(crate) fn continue_collect<S: RecordSource>(
         &mut self,
         drain: &mut EventDrain<S>,
@@ -189,6 +292,45 @@ impl RawJointQuantum {
         work: usize,
         fault: &impl FaultEpoch,
         producers: &SessionDrainProducers,
+    ) -> Result<crate::events::DispatchPoll, RawQuantumRefusal> {
+        self.continue_collect_inner(drain, descriptors, work, fault, producers, None)
+    }
+
+    pub(crate) fn continue_collect_with_adapter<S: RecordSource>(
+        &mut self,
+        drain: &mut EventDrain<S>,
+        descriptors: &[ObjectDescriptorWire; MAX_DESCRIPTORS as usize],
+        work: usize,
+        fault: &impl FaultEpoch,
+        producers: &SessionDrainProducers,
+        adapter: &mut JournalAdapter,
+    ) -> Result<crate::events::DispatchPoll, RawQuantumRefusal> {
+        if self.ledger_generation.is_none() || self.ledger_generation != adapter.ledger.generation()
+        {
+            return Err(RawQuantumRefusal::ForeignLedger);
+        }
+        if !adapter.bind_resource_producers(producers) {
+            return Err(RawQuantumRefusal::ForeignCapture);
+        }
+        self.continue_collect_inner(
+            drain,
+            descriptors,
+            work,
+            fault,
+            producers,
+            Some((&mut adapter.ledger, &adapter.open, producers)),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // Existing cursor plus its one retained resource owner.
+    fn continue_collect_inner<S: RecordSource>(
+        &mut self,
+        drain: &mut EventDrain<S>,
+        descriptors: &[ObjectDescriptorWire; MAX_DESCRIPTORS as usize],
+        work: usize,
+        fault: &impl FaultEpoch,
+        producers: &SessionDrainProducers,
+        resources: Option<ResourceContext<'_>>,
     ) -> Result<crate::events::DispatchPoll, RawQuantumRefusal> {
         if !self.matches_producers(producers) {
             return Err(RawQuantumRefusal::ForeignCapture);
@@ -216,6 +358,7 @@ impl RawJointQuantum {
             descriptors,
             work.min(self.capacity - self.attempted),
             fault,
+            resources,
         ))
     }
 
@@ -225,10 +368,13 @@ impl RawJointQuantum {
         descriptors: &[ObjectDescriptorWire; MAX_DESCRIPTORS as usize],
         work: usize,
         fault: &impl FaultEpoch,
+        mut resources: Option<ResourceContext<'_>>,
     ) -> crate::events::DispatchPoll {
         let ordered = RefCell::new(&mut self.ordered);
         let ordinary = RefCell::new(&mut self.ordinary);
         let h0_origins = RefCell::new(&mut self.h0_origins);
+        let invocations = &mut self.invocations;
+        let resource_refused = &mut self.resource_refused;
         let journal_count = Cell::new(0u64);
         let ordinary_wire_count = Cell::new(0u64);
         let poll = drain.poll_dispatched_quantum(
@@ -246,12 +392,23 @@ impl RawJointQuantum {
             },
             |record| {
                 let index = ordered.borrow().len();
-                if let p11scope_ebpf_common::object_journal::JournalRecord::End(end) = &record {
+                let resource = resources.as_mut().and_then(|(ledger, open, producers)| {
+                    Self::resource_for_record(
+                        &record,
+                        invocations,
+                        ledger,
+                        open,
+                        producers,
+                        resource_refused,
+                    )
+                });
+                if let JournalRecord::End(end) = &record {
                     // Dispatch already validated and observed this completed
                     // payload. Its H0 copy is not a second wire item or tap.
-                    if let Some(completed) =
+                    if let Some(mut completed) =
                         crate::events::project_journal_end_payload(end, descriptors)
                     {
+                        completed.joint_resource = resource;
                         h0_origins.borrow_mut().push(index);
                         ordinary.borrow_mut().push(completed);
                     }
@@ -271,11 +428,162 @@ impl RawJointQuantum {
         poll
     }
 
+    fn resource_for_record(
+        record: &JournalRecord,
+        invocations: &mut Vec<RawInvocation>,
+        ledger: &mut StagingLedger,
+        open: &BTreeMap<JournalNativeKey, OpenEntry>,
+        producers: &SessionDrainProducers,
+        refused: &mut bool,
+    ) -> Option<JointResourceOrigin> {
+        let key = match record {
+            JournalRecord::Begin(begin) => (begin.thread(), begin.sequence()),
+            JournalRecord::End(end) => (end.thread(), end.sequence()),
+            JournalRecord::Abandon(abandon) => (abandon.thread(), abandon.sequence()),
+        };
+        let current = invocations
+            .iter()
+            .position(|entry| (entry.begin.thread(), entry.begin.sequence()) == key);
+        if let JournalRecord::Begin(begin) = record {
+            if let Some(at) = current {
+                invocations[at].poisoned = true;
+                *refused = true;
+                return None;
+            }
+            // A retained BEGIN is an original observation, never permission
+            // to merge a newly presented duplicate with that observation.
+            if open.contains_key(&key) || invocations.len() == invocations.capacity() {
+                *refused = true;
+                return None;
+            }
+            match ledger.reserve_raw(producers) {
+                Ok(reservation) => invocations.push(RawInvocation {
+                    begin: *begin,
+                    reservation,
+                    terminal: false,
+                    poisoned: false,
+                    owns_raw: true,
+                }),
+                Err(_) => *refused = true,
+            }
+            return None;
+        }
+        let at = match current {
+            Some(at) => at,
+            None => {
+                let Some(entry) = open.get(&key) else {
+                    *refused = true;
+                    return None;
+                };
+                let Some(reservation) = entry.raw_resource else {
+                    *refused = true;
+                    return None;
+                };
+                if entry.end.is_some()
+                    || entry.abandon.is_some()
+                    || entry.corroborated_return.is_some()
+                    || invocations.len() == invocations.capacity()
+                    || !ledger.matches_reservation(&reservation)
+                {
+                    *refused = true;
+                    return None;
+                }
+                invocations.push(RawInvocation {
+                    begin: entry.begin,
+                    reservation,
+                    terminal: false,
+                    poisoned: false,
+                    owns_raw: false,
+                });
+                invocations.len() - 1
+            }
+        };
+        let entry = &mut invocations[at];
+        if entry.terminal || entry.poisoned || !ledger.matches_reservation(&entry.reservation) {
+            *refused = true;
+            entry.poisoned = true;
+            return None;
+        }
+        entry.terminal = true;
+        let JournalRecord::End(end) = record else {
+            return None;
+        };
+        if entry.begin.no_end() || !end_agrees_with_begin(&entry.begin, end) {
+            *refused = true;
+            entry.poisoned = true;
+            return None;
+        }
+        Some(JointResourceOrigin {
+            reservation: entry.reservation,
+            native: producers.native_domain(),
+            events: producers.events_id(),
+            invocation: key,
+        })
+    }
+
+    /// Consume the original wire sequence once after actual H0 disposition.
+    /// Resource custody alone never binds a drain: the caller must first mint
+    /// and bind the existing admission-based grant from these SAME producers.
+    /// Refusal returns the unchanged owner, including all paid buffers.
+    pub(super) fn ingest(
+        self,
+        adapter: &mut JournalAdapter,
+        producers: &SessionDrainProducers,
+        grant: &SessionDrainGrant,
+    ) -> Result<JournalCollection, (Self, RawQuantumRefusal)> {
+        let refusal = if let Err(refusal) = self.ready_for_ingest(adapter, producers) {
+            Some(refusal)
+        } else if grant.domain_tag != producers.native_domain().journal_tag()
+            || grant.events_id != producers.events_id()
+            || adapter.drain_pins.get(&grant.domain_tag) != Some(&grant.events_id)
+        {
+            Some(RawQuantumRefusal::DrainUnbound)
+        } else {
+            None
+        };
+        if let Some(refusal) = refusal {
+            return Err((self, refusal));
+        }
+        for item in &self.ordered {
+            let resource = match item {
+                JournalIngestItem::Journal(JournalRecord::Begin(begin)) => self
+                    .invocations
+                    .iter()
+                    .find(|entry| entry.owns_raw && entry.begin.bytes() == begin.bytes())
+                    .map(|entry| entry.reservation),
+                _ => None,
+            };
+            adapter.ingest_any_from_raw(*item, resource);
+        }
+        // Preserve IDs on the stack, then actually drop every physical raw
+        // copy before removing Raw memberships. The quantum's lease is last.
+        let mut releases = [None; super::MAX_UNSETTLED_STAGED];
+        for (slot, entry) in releases.iter_mut().zip(&self.invocations) {
+            if entry.owns_raw {
+                *slot = Some(entry.reservation);
+            }
+        }
+        let audit = JournalCollection {
+            resource_refused: self.resource_refused,
+            ..self.audit
+        };
+        drop(self.ordered);
+        drop(self.ordinary);
+        drop(self.h0_origins);
+        drop(self.invocations);
+        for reservation in releases.iter().flatten() {
+            adapter.ledger.release_raw(reservation);
+        }
+        drop(self._charge);
+        Ok(audit)
+    }
+
     /// Collect validated original records through the actual retained cursor.
     /// Reserve both arrays from the capture's existing pool BEFORE allocation,
     /// fault reads or polling. Refusal leaves the cursor untouched. Comparing
     /// the retained producer pair here establishes only wire custody: the
     /// existing admission-based SessionDrainGrant remains necessary for ingest.
+    #[cfg(test)]
     pub(crate) fn collect<S: RecordSource>(
         drain: &mut EventDrain<S>,
         descriptors: &[ObjectDescriptorWire; MAX_DESCRIPTORS as usize],
@@ -284,16 +592,70 @@ impl RawJointQuantum {
         producers: &SessionDrainProducers,
         reserve: impl FnOnce(usize) -> Result<ResourceLease, SemanticResourceRefusal>,
     ) -> Result<Self, RawQuantumRefusal> {
+        Self::collect_inner(drain, descriptors, limit, fault, producers, reserve, None)
+    }
+
+    #[allow(clippy::too_many_arguments)] // One retained cursor, pool and resource owner, no second handle.
+    pub(crate) fn collect_with_adapter<S: RecordSource>(
+        drain: &mut EventDrain<S>,
+        descriptors: &[ObjectDescriptorWire; MAX_DESCRIPTORS as usize],
+        limit: usize,
+        fault: &impl FaultEpoch,
+        producers: &SessionDrainProducers,
+        reserve: impl FnOnce(usize) -> Result<ResourceLease, SemanticResourceRefusal>,
+        adapter: &mut JournalAdapter,
+    ) -> Result<Self, RawQuantumRefusal> {
+        if drain.domain_id() != producers.events_id() {
+            return Err(RawQuantumRefusal::ForeignDrain);
+        }
+        if !adapter.bind_resource_producers(producers) {
+            return Err(RawQuantumRefusal::ForeignCapture);
+        }
+        if adapter.ledger.generation().is_none() {
+            return Err(RawQuantumRefusal::ForeignLedger);
+        }
+        adapter
+            .ledger
+            .prepare_capacity()
+            .map_err(RawQuantumRefusal::Ledger)?;
+        Self::collect_inner(
+            drain,
+            descriptors,
+            limit,
+            fault,
+            producers,
+            reserve,
+            Some((&mut adapter.ledger, &adapter.open, producers)),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // Common allocation path for the marked legacy fixture and actual owner.
+    fn collect_inner<S: RecordSource>(
+        drain: &mut EventDrain<S>,
+        descriptors: &[ObjectDescriptorWire; MAX_DESCRIPTORS as usize],
+        limit: usize,
+        fault: &impl FaultEpoch,
+        producers: &SessionDrainProducers,
+        reserve: impl FnOnce(usize) -> Result<ResourceLease, SemanticResourceRefusal>,
+        resources: Option<ResourceContext<'_>>,
+    ) -> Result<Self, RawQuantumRefusal> {
         if drain.domain_id() != producers.events_id() {
             return Err(RawQuantumRefusal::ForeignDrain);
         }
         if !(1..=LIVE_POLL_QUANTUM).contains(&limit) {
             return Err(RawQuantumRefusal::InvalidLimit);
         }
+        let identity = NEXT_RAW_QUANTUM
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+                last.checked_add(1)
+            })
+            .map(|last| RawQuantumIdentity(last + 1))
+            .map_err(|_| RawQuantumRefusal::IdentityExhausted)?;
         let charge = reserve(Self::storage_bytes(limit)).map_err(RawQuantumRefusal::Resource)?;
         let mut ordered = Vec::new();
         let mut ordinary = Vec::new();
         let mut h0_origins = Vec::new();
+        let mut invocations = Vec::new();
         ordered
             .try_reserve_exact(limit)
             .map_err(|_| RawQuantumRefusal::Allocation)?;
@@ -303,11 +665,15 @@ impl RawJointQuantum {
         h0_origins
             .try_reserve_exact(limit)
             .map_err(|_| RawQuantumRefusal::Allocation)?;
+        invocations
+            .try_reserve_exact(limit.min(super::MAX_UNSETTLED_STAGED))
+            .map_err(|_| RawQuantumRefusal::Allocation)?;
         // Capacity is the requested allocation, not an advisory callback
         // limit. Refuse an allocator over-reservation before touching EVENTS.
         if ordered.capacity() != limit
             || ordinary.capacity() != limit
             || h0_origins.capacity() != limit
+            || invocations.capacity() != limit.min(super::MAX_UNSETTLED_STAGED)
         {
             return Err(RawQuantumRefusal::Allocation);
         }
@@ -323,6 +689,7 @@ impl RawJointQuantum {
             malformed_delta: 0,
             discarded_delta: 0,
             counter_error: malformed_seen == u64::MAX || discarded_seen == u64::MAX,
+            resource_refused: false,
             fault_before,
             fault_after: fault_before,
             fault_error: None,
@@ -330,6 +697,7 @@ impl RawJointQuantum {
             h0_allocated_below: 0,
         };
         let mut retained = Self {
+            identity,
             ordered,
             ordinary,
             audit,
@@ -343,9 +711,15 @@ impl RawJointQuantum {
             h0_delivered: 0,
             completed_delivered: false,
             h0_pending: false,
+            h0_reported: false,
+            invocations,
+            ledger_generation: resources
+                .as_ref()
+                .and_then(|(ledger, _, _)| ledger.generation()),
+            resource_refused: false,
             _charge: charge,
         };
-        retained.poll_slice(drain, descriptors, limit.min(1_024), fault);
+        retained.poll_slice(drain, descriptors, limit.min(1_024), fault, resources);
         Ok(retained)
     }
 }
@@ -385,6 +759,337 @@ mod tests {
         fn next_record(&mut self) -> Option<impl std::ops::Deref<Target = [u8]> + '_> {
             self.0.borrow_mut().pop_front()
         }
+    }
+
+    fn resource_adapter(pool: &SemanticResourcePool) -> JournalAdapter {
+        JournalAdapter::with_ledger(
+            crate::semantics_objects::journal::JournalLimits::default(),
+            StagingLedger::with_resources(pool.reserver()),
+        )
+    }
+
+    #[test]
+    fn joint_resource_1024_original_origins_share_all_five_roles_without_growth() {
+        use crate::semantics_objects::journal::tests::{
+            ENTRY_NS, begin_bytes, end_bytes_absent, function_id,
+        };
+        let rows = publish_object_descriptors();
+        let begins: Vec<_> = (1..=1_024)
+            .map(|thread| begin_bytes(thread, 1, function_id("C_Sign"), 0))
+            .collect();
+        let records = begins.iter().map(|begin| begin.to_vec()).chain(
+            begins
+                .iter()
+                .map(|begin| end_bytes_absent(begin, 0, ENTRY_NS + 100).to_vec()),
+        );
+        let events = EventsDomain::test_standin(0xf101);
+        let retained = producers(&events);
+        let mut drain = EventDrain::over_domain(ScriptedRecords::records(records, 2_048), events);
+        let pool = SemanticResourcePool::default();
+        let mut adapter = resource_adapter(&pool);
+        let fault = SteadyFault(Cell::new(None));
+        let mut quantum = RawJointQuantum::collect_with_adapter(
+            &mut drain,
+            &rows,
+            4_096,
+            &fault,
+            &retained,
+            |bytes| pool.reserve(bytes),
+            &mut adapter,
+        )
+        .unwrap();
+        assert_eq!(adapter.ledger.census(), 1_024);
+        let (poll, allocations, _) = crate::test_alloc::count_allocs_during(|| {
+            quantum
+                .continue_collect_with_adapter(
+                    &mut drain,
+                    &rows,
+                    1_024,
+                    &fault,
+                    &retained,
+                    &mut adapter,
+                )
+                .unwrap()
+        });
+        assert_eq!(poll.attempted, 1_024);
+        assert_eq!(allocations, 0);
+        assert!(!quantum.resource_refused);
+        let ((), allocations, _) = crate::test_alloc::count_allocs_during(|| {
+            for (index, completed) in quantum.ordinary.iter().enumerate() {
+                let origin = completed
+                    .joint_resource
+                    .as_ref()
+                    .expect("same original END");
+                assert!(origin.matches_producers(&retained));
+                assert_eq!(origin.invocation, (index as u64 + 1, 1));
+                let ticket = index as u64 + 1;
+                adapter
+                    .ledger
+                    .charge_h8open_from_raw(ticket, 100, origin.reservation())
+                    .unwrap();
+                let h8 = adapter.ledger.h8_reservation(ticket).unwrap();
+                adapter
+                    .ledger
+                    .charge_model_from_open(ticket, 200, &h8)
+                    .unwrap();
+                let staged = adapter
+                    .ledger
+                    .charge_collected(retained.native_domain(), ticket, 300, Some(origin))
+                    .unwrap();
+                adapter
+                    .ledger
+                    .mint_keyassoc_from_stage(400, Some(&staged))
+                    .unwrap();
+            }
+        });
+        assert_eq!(allocations, 0);
+        assert_eq!(adapter.ledger.census(), 1_024);
+        assert_eq!(adapter.ledger.staged(), 1_024);
+        assert_eq!(quantum.audit.ingested, 2_048);
+        assert_eq!(quantum.audit.ordinary, 0);
+        assert_eq!(drain.source().remaining(), 0);
+        // This is actual collector + actual pool/role bookkeeping. It does
+        // not pretend to run H0 admission, C2, model/container allocation or
+        // native Session completion; those retain separate positive gates.
+    }
+
+    #[test]
+    fn joint_resource_1025_refuses_before_member_allocation_and_preserves_wire_audit() {
+        use crate::semantics_objects::journal::tests::{
+            ENTRY_NS, begin_bytes, end_bytes_absent, function_id,
+        };
+        let rows = publish_object_descriptors();
+        let begins: Vec<_> = (1..=1_025)
+            .map(|thread| begin_bytes(thread, 1, function_id("C_Sign"), 0))
+            .collect();
+        let records = begins.iter().map(|begin| begin.to_vec()).chain(
+            begins[..1_024]
+                .iter()
+                .map(|begin| end_bytes_absent(begin, 0, ENTRY_NS + 100).to_vec()),
+        );
+        let events = EventsDomain::test_standin(0xf102);
+        let retained = producers(&events);
+        let mut drain = EventDrain::over_domain(ScriptedRecords::records(records, 2_049), events);
+        let pool = SemanticResourcePool::default();
+        let mut adapter = resource_adapter(&pool);
+        let fault = SteadyFault(Cell::new(None));
+        let mut quantum = RawJointQuantum::collect_with_adapter(
+            &mut drain,
+            &rows,
+            4_096,
+            &fault,
+            &retained,
+            |bytes| pool.reserve(bytes),
+            &mut adapter,
+        )
+        .unwrap();
+        let (_, allocations, _) = crate::test_alloc::count_allocs_during(|| {
+            quantum
+                .continue_collect_with_adapter(
+                    &mut drain,
+                    &rows,
+                    1_024,
+                    &fault,
+                    &retained,
+                    &mut adapter,
+                )
+                .unwrap();
+            quantum
+                .continue_collect_with_adapter(
+                    &mut drain,
+                    &rows,
+                    1,
+                    &fault,
+                    &retained,
+                    &mut adapter,
+                )
+                .unwrap();
+        });
+        assert_eq!(allocations, 0);
+        assert!(quantum.resource_refused);
+        assert_eq!(adapter.ledger.census(), 1_024);
+        assert_eq!(quantum.ordinary.len(), 1_024);
+        assert_eq!(quantum.audit.ingested, 2_049);
+        assert_eq!(quantum.audit.ordinary, 0);
+        assert_eq!(quantum.audit.malformed_delta, 0);
+        assert_eq!(quantum.audit.discarded_delta, 0);
+        assert!(!quantum.audit.counter_error);
+        assert_eq!(drain.source().remaining(), 0);
+    }
+
+    #[test]
+    fn joint_resource_duplicate_and_mismatched_terminals_mint_no_additional_origin() {
+        use crate::semantics_objects::journal::tests::{
+            ENTRY_NS, begin_bytes, end_bytes_absent, function_id,
+        };
+        let rows = publish_object_descriptors();
+        for mismatch in [false, true] {
+            let mut begin = begin_bytes(1, 1, function_id("C_Sign"), 0);
+            let end = end_bytes_absent(&begin, 0, ENTRY_NS + 100);
+            if mismatch {
+                // Keep two independently valid records, but change the
+                // original BEGIN's repeated session evidence.
+                begin[80..88].copy_from_slice(&7u64.to_le_bytes());
+            }
+            let events = EventsDomain::test_standin(0xf103);
+            let retained = producers(&events);
+            let mut drain = EventDrain::over_domain(
+                ScriptedRecords::records([begin.to_vec(), end.to_vec(), end.to_vec()], 3),
+                events,
+            );
+            let pool = SemanticResourcePool::default();
+            let mut adapter = resource_adapter(&pool);
+            let quantum = RawJointQuantum::collect_with_adapter(
+                &mut drain,
+                &rows,
+                4,
+                &SteadyFault(Cell::new(None)),
+                &retained,
+                |bytes| pool.reserve(bytes),
+                &mut adapter,
+            )
+            .unwrap();
+            assert!(quantum.resource_refused);
+            assert_eq!(quantum.ordinary.len(), 2);
+            assert_eq!(quantum.ordinary[0].joint_resource.is_some(), !mismatch);
+            assert!(quantum.ordinary[1].joint_resource.is_none());
+            assert_eq!(adapter.ledger.census(), 1);
+            assert_eq!(quantum.audit.malformed_delta, 0);
+        }
+    }
+
+    #[test]
+    fn joint_resource_foreign_session_events_and_ledger_refuse_before_mutation() {
+        use crate::semantics_objects::journal::tests::{
+            ENTRY_NS, begin_bytes, end_bytes_absent, function_id,
+        };
+        let rows = publish_object_descriptors();
+        let begin = begin_bytes(1, 1, function_id("C_Sign"), 0);
+        let end = end_bytes_absent(&begin, 0, ENTRY_NS + 100);
+        let events = EventsDomain::test_standin(0xf104);
+        let retained = producers(&events);
+        let mut drain = EventDrain::over_domain(
+            ScriptedRecords::records([begin.to_vec(), end.to_vec()], 2),
+            events.clone(),
+        );
+        let pool = SemanticResourcePool::default();
+        let mut adapter = resource_adapter(&pool);
+        let fault = SteadyFault(Cell::new(None));
+        let mut quantum = RawJointQuantum::collect_with_adapter(
+            &mut drain,
+            &rows,
+            4,
+            &fault,
+            &retained,
+            |bytes| pool.reserve(bytes),
+            &mut adapter,
+        )
+        .unwrap();
+        let origin = quantum.ordinary[0].joint_resource.unwrap();
+        for foreign in [
+            SessionDrainProducers::test_pair(NativeDomainId::mint(), events),
+            SessionDrainProducers::test_pair(
+                retained.native_domain(),
+                EventsDomain::test_standin(0xf105),
+            ),
+        ] {
+            let before = pool.snapshot().charged_bytes;
+            let (result, allocations, _) = crate::test_alloc::count_allocs_during(|| {
+                quantum.continue_collect_with_adapter(
+                    &mut drain,
+                    &rows,
+                    1,
+                    &fault,
+                    &foreign,
+                    &mut adapter,
+                )
+            });
+            assert_eq!(result, Err(RawQuantumRefusal::ForeignCapture));
+            assert_eq!(allocations, 0);
+            assert_eq!(pool.snapshot().charged_bytes, before);
+            assert_eq!(adapter.ledger.census(), 1);
+        }
+        let mut other = resource_adapter(&pool);
+        let (result, allocations, _) = crate::test_alloc::count_allocs_during(|| {
+            other
+                .ledger
+                .charge_collected(retained.native_domain(), 1, 1, Some(&origin))
+        });
+        assert!(matches!(
+            result,
+            Err(super::super::LedgerRefusal::ReplayRefused)
+        ));
+        assert_eq!(allocations, 0);
+        assert_eq!(other.ledger.census(), 0);
+        assert_eq!(quantum.audit.ingested, 2);
+        assert!(!quantum.h0_reported);
+        assert_eq!(
+            quantum.ready_for_ingest(&adapter, &retained),
+            Err(RawQuantumRefusal::H0Undelivered)
+        );
+    }
+
+    #[test]
+    fn joint_resource_original_open_preserves_lineage_across_raw_quanta() {
+        use crate::semantics_objects::journal::tests::{
+            ENTRY_NS, begin_bytes, end_bytes_absent, function_id,
+        };
+        let rows = publish_object_descriptors();
+        let begin = begin_bytes(1, 1, function_id("C_Sign"), 0);
+        let end = end_bytes_absent(&begin, 0, ENTRY_NS + 100);
+        let events = EventsDomain::test_standin(0xf106);
+        let retained = producers(&events);
+        let pool = SemanticResourcePool::default();
+        let mut adapter = resource_adapter(&pool);
+        let fault = SteadyFault(Cell::new(None));
+        let mut start_drain = EventDrain::over_domain(
+            ScriptedRecords::records([begin.to_vec()], 1),
+            events.clone(),
+        );
+        let start = RawJointQuantum::collect_with_adapter(
+            &mut start_drain,
+            &rows,
+            4,
+            &fault,
+            &retained,
+            |bytes| pool.reserve(bytes),
+            &mut adapter,
+        )
+        .unwrap();
+        let reservation = start.invocations[0].reservation;
+        // Exercise resource custody only at the actual original ingest
+        // helper. No H0 watermark, grant, bootstrap or seal is fabricated.
+        assert_eq!(
+            adapter.ingest_any_from_raw(start.ordered[0], Some(reservation)),
+            super::super::JournalDisposition::BeginAdmitted
+        );
+        drop(start);
+        adapter.ledger.release_raw(&reservation);
+        assert_eq!(adapter.ledger.census(), 1);
+        let mut end_drain =
+            EventDrain::over_domain(ScriptedRecords::records([end.to_vec()], 1), events);
+        let end = RawJointQuantum::collect_with_adapter(
+            &mut end_drain,
+            &rows,
+            4,
+            &fault,
+            &retained,
+            |bytes| pool.reserve(bytes),
+            &mut adapter,
+        )
+        .unwrap();
+        let origin = end.ordinary[0]
+            .joint_resource
+            .as_ref()
+            .expect("retained original BEGIN");
+        assert!(origin.matches_producers(&retained));
+        assert!(!end.resource_refused);
+        adapter
+            .ledger
+            .charge_collected(retained.native_domain(), 1, 10, Some(origin))
+            .unwrap();
+        assert_eq!(adapter.ledger.census(), 1);
+        assert_eq!(adapter.ledger.staged(), 1);
     }
 
     #[test]

@@ -1046,7 +1046,7 @@ def scalar_scope_flags_contract(disassembly):
         if text == "r1 = *(u64 *)(r10 - 0x20)": role = "tag"
         elif text == "r0 = *(u64 *)(r10 - 0x18)": role = "flags"
         elif text == "r0 = 0x0": role = "zero"
-        elif re.fullmatch(r"if r1 (==|!=) 0x0 goto .*", text): role = "guard"
+        elif re.fullmatch(r"if r1 (==|!=) 0x[01] goto .*", text): role = "guard"
         elif text == "exit": role = "exit"
         elif re.fullmatch(r"goto .*", text): role = "jump"
         else: raise RuntimeError("scalar scope flags unknown/full64/discriminant effect")
@@ -1064,13 +1064,16 @@ def scalar_scope_flags_contract(disassembly):
             "scalar scope flags initialized discriminant")
     target = D.relative_target(guard, texts[guard])
     other = next(edge for edge in graph[guard] if edge != target)
-    some, absent = (target, other) if " != " in texts[guard] else (other, target)
+    condition = re.fullmatch(r"if r1 (==|!=) 0x([01]) goto .*", texts[guard])
+    some_taken = (condition[2] == "1") == (condition[1] == "==")
+    some, absent = (target, other) if some_taken else (other, target)
     require(flags in D.reachable(graph, [some]) and end in D.reachable(graph, [absent])
             and flags not in D.reachable(graph, [entry], blocked={guard})
             and flags not in D.reachable(graph, [absent])
             and end not in D.reachable(graph, [some], blocked={flags}),
             "scalar scope flags payload load before discriminant/refusal")
-    require(end not in D.reachable(graph, [absent], blocked={zero})
+    require((guard not in D.reachable(graph, [entry], blocked={zero})
+             or end not in D.reachable(graph, [absent], blocked={zero}))
             and zero not in D.reachable(graph, [flags])
             and end in D.reachable(graph, [flags]),
             "scalar scope flags zero-refusal/fullword return")

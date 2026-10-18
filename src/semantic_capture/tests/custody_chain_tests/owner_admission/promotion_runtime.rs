@@ -5,6 +5,107 @@
 use super::*;
 
 #[test]
+fn promotion_runtime_scoped_preparation_reuses_original_inventory_pin() {
+    let mut scene = AdmissionScene::new(Selection::Cgroup);
+    scene.prepare_without_cookie();
+    let caller = scene.caller();
+    let mut collection = scene
+        .coordinator
+        .cgroup_collector(
+            std::mem::take(&mut scene.continuation),
+            CgroupWalkLimits::default(),
+            scene.control.clone(),
+            None,
+        )
+        .unwrap()();
+    let preparation = collection.preparation(scene.child.id()).unwrap();
+    let prepared = scene
+        .coordinator
+        .adapter_mut()
+        .prepare_scoped_caller(&preparation)
+        .map_err(|failure| failure.reason)
+        .unwrap();
+    let candidate = scene
+        .coordinator
+        .prepare_scoped_semantic_candidate(&prepared, scene.lane.as_ref().unwrap().domain())
+        .unwrap();
+    assert!(std::ptr::eq(
+        candidate.pin().as_ref(),
+        scene
+            .coordinator
+            .adapter()
+            .semantic_custody_ref(caller)
+            .unwrap()
+    ));
+    let mut requested = BTreeSet::new();
+    requested.insert(scene.child.id());
+    collection.sample_end(&requested);
+    let permit = collection.permit(scene.child.id()).unwrap();
+    scene.control.cancel();
+    assert!(
+        scene
+            .coordinator
+            .adapter_mut()
+            .commit_scoped_caller(prepared, permit, 20, &mut || Some(21))
+            .is_err(),
+        "an expired real scope permit cannot commit even with the original shared Arc"
+    );
+    assert_eq!(
+        scene.coordinator.adapter().live_id(scene.child.id()),
+        Some(caller)
+    );
+    assert_eq!(scene.coordinator.semantic_bindings().len(), 0);
+}
+
+#[test]
+fn promotion_runtime_new_scoped_caller_moves_prepared_original_pin() {
+    let mut scene = AdmissionScene::new(Selection::Cgroup);
+    let mut collection = scene
+        .coordinator
+        .cgroup_collector(
+            CgroupWalkState::default(),
+            CgroupWalkLimits::default(),
+            scene.control.clone(),
+            None,
+        )
+        .unwrap()();
+    let preparation = collection.preparation(scene.child.id()).unwrap();
+    let prepared = scene
+        .coordinator
+        .adapter_mut()
+        .prepare_scoped_caller(&preparation)
+        .map_err(|failure| failure.reason)
+        .unwrap();
+    assert!(prepared.existing().is_none());
+    let original = scene
+        .coordinator
+        .adapter()
+        .scoped_shared_semantic_custody(&prepared)
+        .unwrap();
+    let weak = PidPin::downgrade_shared(&original).unwrap();
+    let mut requested = BTreeSet::new();
+    requested.insert(scene.child.id());
+    collection.sample_end(&requested);
+    let permit = collection.permit(scene.child.id()).unwrap();
+    let (caller, admitted) = scene
+        .coordinator
+        .adapter_mut()
+        .commit_scoped_caller(prepared, permit, 20, &mut || Some(21))
+        .map_err(|failure| failure.reason)
+        .unwrap();
+    assert!(admitted);
+    let tracked = scene
+        .coordinator
+        .adapter()
+        .shared_semantic_custody(caller)
+        .unwrap();
+    assert!(Arc::ptr_eq(&original, &tracked));
+    assert!(weak.matches_original(&tracked));
+    assert_eq!(scene.coordinator.semantic_bindings().len(), 0);
+    assert_eq!(scene.h0.0.borrow().accepted, 0);
+}
+
+#[test]
 fn promotion_runtime_pid_candidate_shares_original_inventory_pin() {
     assert_first_candidate_shares_original(Selection::Pid);
 }

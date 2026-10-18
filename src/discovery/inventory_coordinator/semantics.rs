@@ -322,7 +322,7 @@ fn prepare_retained_subset(engine: &Engine, inputs: &RetainedInputs) -> SubsetPr
 }
 
 /// One accepted semantic caller: its physical provider associations bound to
-/// the original retained caller custody (one stable duplicated pidfd Arc)
+/// the original retained caller custody (one original shared pidfd Arc)
 /// and this Detailed domain's fresh full image. Move-only coordinator
 /// proof: private fields, redacted Debug, no Clone/Default/from_parts.
 /// Equal numeric cookies from other producers never satisfy this binding:
@@ -1044,7 +1044,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         scope: AdmissionScope,
         domain: NativeDomainId,
         required_generation: Option<&crate::inspect_system::MemberGeneration>,
-        duplicate_first_custody: impl FnOnce() -> Option<PidPin>,
+        share_first_custody: impl FnOnce() -> Option<Arc<PidPin>>,
     ) -> Option<SemanticAdmissionCandidate> {
         let record = self.adapter.record(caller)?;
         if record.retired
@@ -1078,18 +1078,17 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let pin = if let Some(expected) = &expected_pin {
             expected.clone()
         } else {
-            // Only the first accepted owner needs a new independent handle.
-            // A known H0 Arc has already retained custody, and a failed
-            // duplicate must never veto its exact reuse.
-            let duplicate = duplicate_first_custody()?;
-            if duplicate.pid() != pin.pid()
-                || duplicate.start_time() != pin.start_time()
-                || !duplicate.still_the_same()
+            // First admission shares Inventory's original allocation. Known
+            // H0 custody remains the exact same Arc across retries.
+            let shared = share_first_custody()?;
+            if shared.pid() != pin.pid()
+                || shared.start_time() != pin.start_time()
+                || !shared.still_the_same()
                 || !pin.still_the_same()
             {
                 return None;
             }
-            Arc::new(duplicate)
+            shared
         };
         Some(SemanticAdmissionCandidate {
             caller,
@@ -1118,7 +1117,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             return None;
         }
         self.seal_semantic_candidate(caller, pin, scope, domain, None, || {
-            self.adapter.semantic_custody(caller)
+            self.adapter.shared_semantic_custody(caller)
         })
     }
 
@@ -1135,7 +1134,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             AdmissionScope::Cgroup,
             domain,
             Some(prepared.generation()),
-            || self.adapter.scoped_semantic_custody(prepared),
+            || self.adapter.scoped_shared_semantic_custody(prepared),
         )
     }
 

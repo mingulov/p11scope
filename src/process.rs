@@ -3,10 +3,14 @@
 
 use crate::discovery::scan::{CaptureWorkBudget, read_mountinfo};
 use crate::semantics::ProcessKey;
+use crate::semantics_edge::resources::{
+    OWNED_ALLOCATION_PADDING, ResourceLease, SemanticResourceRefusal, SemanticResourceReserver,
+};
 #[cfg(test)]
 use std::collections::BTreeMap;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::sync::{Arc, Weak};
 
 pub(crate) const MAX_TRACKED: usize = 16_384;
 #[cfg(test)]
@@ -663,6 +667,7 @@ pub(crate) fn reused_process_view_for_test(
         .map_err(|error| format!("cannot build reused-pid test view: {error}"))?
         .wrapping_add(1);
     view.pin = PidPin {
+        shared_charge: None,
         pid,
         pidfd: None,
         start_time: Some(retained),
@@ -677,6 +682,7 @@ pub(crate) fn unprovable_process_view_for_test(
 ) -> Result<ProcessView, String> {
     let mut view = ProcessView::open(id, pid)?;
     view.pin = PidPin {
+        shared_charge: None,
         pid,
         pidfd: None,
         start_time: None,
@@ -698,6 +704,7 @@ pub(crate) fn start_time_pinned_process_view_for_test(
     let retained = process_start_time(pid)
         .map_err(|error| format!("cannot build start-time-pinned test view: {error}"))?;
     view.pin = PidPin {
+        shared_charge: None,
         pid,
         pidfd: None,
         start_time: Some(retained),
@@ -720,6 +727,74 @@ pub struct PidPin {
     pid: u32,
     pidfd: Option<OwnedFd>,
     start_time: Option<u64>,
+    shared_charge: Option<Arc<CustodyCharge>>,
+}
+
+/// Accounting only. The same peer follows all strong process custody and every
+/// paired weak view; it cannot establish process or semantic authority.
+pub(crate) struct CustodyCharge {
+    _storage: ResourceLease,
+}
+
+impl CustodyCharge {
+    fn arc_bytes<T>() -> Option<usize> {
+        // Pinned alloc::sync::ArcInner is repr(C, align(2)), two atomic usize
+        // counters then data. Match its header.extend(data).pad_to_align().
+        std::alloc::Layout::new::<[std::sync::atomic::AtomicUsize; 2]>()
+            .extend(std::alloc::Layout::new::<T>())
+            .ok()
+            .map(|(layout, _)| layout.pad_to_align().size())
+    }
+
+    pub(crate) fn requested_bytes<Pin>(inline_bytes: usize) -> Option<usize> {
+        Self::arc_bytes::<Pin>()?
+            .checked_add(Self::arc_bytes::<Self>()?)?
+            .checked_add(2 * OWNED_ALLOCATION_PADDING)?
+            .checked_add(inline_bytes)
+    }
+
+    pub(crate) fn reserve<Pin>(
+        reserve: &SemanticResourceReserver,
+        inline_bytes: usize,
+    ) -> Result<Arc<Self>, SemanticResourceRefusal> {
+        let bytes = Self::requested_bytes::<Pin>(inline_bytes).unwrap_or(usize::MAX);
+        // No Arc allocation precedes this reservation.
+        let storage = reserve.reserve(bytes)?;
+        Ok(Arc::new(Self { _storage: storage }))
+    }
+}
+
+/// A weak process identity paired with the charge for its still-live allocation.
+/// Field order matters: release the Weak allocation before refunding its lease.
+pub(crate) struct WeakProcessCustody {
+    original: Weak<PidPin>,
+    _charge: Arc<CustodyCharge>,
+}
+
+impl WeakProcessCustody {
+    pub(crate) fn matches_original(&self, original: &Arc<PidPin>) -> bool {
+        self.original
+            .upgrade()
+            .is_some_and(|held| Arc::ptr_eq(&held, original))
+    }
+}
+
+impl PidPin {
+    pub(crate) fn install_shared_custody_charge(&mut self, charge: Arc<CustodyCharge>) {
+        assert!(
+            self.shared_charge.is_none(),
+            "original custody is charged exactly once"
+        );
+        self.shared_charge = Some(charge);
+    }
+
+    pub(crate) fn downgrade_shared(original: &Arc<Self>) -> Option<WeakProcessCustody> {
+        let charge = Arc::clone(original.shared_charge.as_ref()?);
+        Some(WeakProcessCustody {
+            original: Arc::downgrade(original),
+            _charge: charge,
+        })
+    }
 }
 
 /// Acquisition seam shared by the strict proc owner and its race regressions.
@@ -1050,6 +1125,7 @@ impl PidPin {
             pid: self.pid,
             pidfd,
             start_time: self.start_time,
+            shared_charge: None,
         })
     }
 }
@@ -1091,6 +1167,7 @@ impl PidPin {
             pid,
             pidfd,
             start_time,
+            shared_charge: None,
         })
     }
 
@@ -1100,6 +1177,7 @@ impl PidPin {
             pid,
             pidfd: None,
             start_time: Some(1),
+            shared_charge: None,
         }
     }
 
@@ -1630,6 +1708,7 @@ mod tests {
         assert_eq!(status.signal(), Some(libc::SIGTERM));
 
         let fallback = PidPin {
+            shared_charge: None,
             pid: std::process::id(),
             pidfd: None,
             start_time: process_start_time(std::process::id()).ok(),

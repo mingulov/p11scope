@@ -25,7 +25,9 @@ use instance_input::{
 };
 
 use crate::discovery::native_binding::{BindingCensus, UnboundReason};
+use crate::process::CustodyCharge;
 use crate::process::{PidPin, generation_gone, process_is_zombie, process_start_time};
+use crate::semantics_edge::resources::{SemanticResourceRefusal, SemanticResourceReserver};
 use crate::semantics_edge::{EdgeSemantics, SemanticCall};
 use anyhow::{Result, anyhow, bail};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -165,14 +167,14 @@ pub(crate) trait ProcessSource {
     /// the generation is dead even though `/proc` still parses — so a
     /// dead-but-unreaped target retires instead of re-admitting.
     fn gone(&self, pid: u32) -> bool;
-    /// Duplicate already owned process custody for the Detailed owner. A
-    /// source without real pidfd custody cannot bootstrap semantic authority.
-    fn semantic_custody(&self, _pin: &Self::Pin) -> Option<PidPin> {
+    /// Share original custody only when the source can prove its concrete type.
+    /// Scripted sources do not gain process authority from an Arc wrapper.
+    fn shared_semantic_custody(&self, _pin: &Arc<Self::Pin>) -> Option<Arc<PidPin>> {
         None
     }
+    fn install_shared_custody_charge(&self, _pin: &mut Self::Pin, _charge: &Arc<CustodyCharge>) {}
     /// Inspect held process custody without duplicating its pidfd. A known
-    /// Detailed Arc can be reused after this check; only first admission
-    /// needs `semantic_custody` to acquire an independent owner handle.
+    /// Detailed Arc can be reused after this check without a pidfd duplicate.
     fn semantic_custody_ref<'pin>(&self, _pin: &'pin Self::Pin) -> Option<&'pin PidPin> {
         None
     }
@@ -221,8 +223,12 @@ impl ProcessSource for OsProcessSource {
     fn gone(&self, pid: u32) -> bool {
         generation_gone(pid) || process_is_zombie(pid)
     }
-    fn semantic_custody(&self, pin: &PidPin) -> Option<PidPin> {
-        pin.try_clone().ok()
+    fn shared_semantic_custody(&self, pin: &Arc<PidPin>) -> Option<Arc<PidPin>> {
+        Some(Arc::clone(pin))
+    }
+
+    fn install_shared_custody_charge(&self, pin: &mut PidPin, charge: &Arc<CustodyCharge>) {
+        pin.install_shared_custody_charge(Arc::clone(charge));
     }
 
     fn semantic_custody_ref<'pin>(&self, pin: &'pin PidPin) -> Option<&'pin PidPin> {
@@ -273,9 +279,47 @@ enum SuccessorAdmission {
 const NATIVE_EXEC_REASON: &str = "a later image of the same task was witnessed natively (its exec \
      sequence advanced under its task cookie, or its leader task changed under the held pidfd)";
 
+/// Moves original custody and its accounting together through every handoff.
+/// The OS pin embeds the same peer for bare H0/history Arc holders. Drop the
+/// pin first, then its peer; neither source identity nor charge is retagged.
+pub(crate) struct SharedCallerPin<Pin> {
+    pin: Arc<Pin>,
+    charge: Arc<CustodyCharge>,
+}
+
+impl<Pin> std::ops::Deref for SharedCallerPin<Pin> {
+    type Target = Pin;
+    fn deref(&self) -> &Pin {
+        &self.pin
+    }
+}
+
+impl<Pin> SharedCallerPin<Pin> {
+    fn new<Source: ProcessSource<Pin = Pin>>(
+        mut pin: Pin,
+        source: &Source,
+        reserve: &SemanticResourceReserver,
+    ) -> Result<Self, SemanticResourceRefusal> {
+        // Cover inline tracked/prepared overlap as well as both heap Arcs.
+        let charge = CustodyCharge::reserve::<Pin>(reserve, 2 * std::mem::size_of::<Self>())?;
+        source.install_shared_custody_charge(&mut pin, &charge);
+        Ok(Self {
+            pin: Arc::new(pin),
+            charge,
+        })
+    }
+
+    fn share(&self) -> Self {
+        Self {
+            pin: Arc::clone(&self.pin),
+            charge: Arc::clone(&self.charge),
+        }
+    }
+}
+
 struct TrackedCaller<Pin> {
     record: CallerRecord,
-    pin: Option<Pin>,
+    pin: Option<SharedCallerPin<Pin>>,
 }
 
 /// Tracks caller incarnations: admission, exit/exec/reuse retirement with
@@ -283,6 +327,7 @@ struct TrackedCaller<Pin> {
 /// never rewritten and IDs are never reused.
 pub(crate) struct CallerAdapter<Source: ProcessSource> {
     source: Source,
+    custody_reserver: SemanticResourceReserver,
     next_id: u32,
     incarnations: BTreeMap<u32, u32>,
     callers: BTreeMap<CallerId, TrackedCaller<Source::Pin>>,
@@ -303,11 +348,24 @@ pub(crate) struct AdmitFailure {
     pub(crate) budget: Option<BudgetRefusal>,
 }
 
+impl AdmitFailure {
+    fn custody_storage(refusal: SemanticResourceRefusal) -> Self {
+        Self {
+            reason: "original process custody storage refused before allocation".into(),
+            budget: Some(BudgetRefusal {
+                resource: "semantic_bytes",
+                limit: refusal.limit_bytes,
+                requested: refusal.requested_bytes,
+            }),
+        }
+    }
+}
+
 /// A fresh source pin and identity reads, still without an admitted ID.
 /// Only a borrowed cgroup transaction permit can commit it.
 pub(crate) struct PreparedScopedCaller<Pin> {
     pid: u32,
-    pin: Pin,
+    pin: SharedCallerPin<Pin>,
     generation: crate::inspect_system::MemberGeneration,
     existing: Option<CallerId>,
 }
@@ -324,11 +382,11 @@ impl<Pin> PreparedScopedCaller<Pin> {
 impl<Source: ProcessSource> CallerAdapter<Source> {
     /// Never reopen the PID: this is the source pin enclosed by the original
     /// scoped preparation, before the collection's final sample.
-    pub(crate) fn scoped_semantic_custody(
+    pub(crate) fn scoped_shared_semantic_custody(
         &self,
         prepared: &PreparedScopedCaller<Source::Pin>,
-    ) -> Option<PidPin> {
-        self.source.semantic_custody(&prepared.pin)
+    ) -> Option<Arc<PidPin>> {
+        self.source.shared_semantic_custody(&prepared.pin.pin)
     }
 
     pub(crate) fn scoped_semantic_custody_ref<'pin>(
@@ -338,12 +396,13 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         self.source.semantic_custody_ref(&prepared.pin)
     }
 
-    pub(crate) fn semantic_custody(&self, caller: CallerId) -> Option<PidPin> {
+    pub(crate) fn shared_semantic_custody(&self, caller: CallerId) -> Option<Arc<PidPin>> {
         let tracked = self.callers.get(&caller)?;
         if tracked.record.retired || self.live_id(tracked.record.pid) != Some(caller) {
             return None;
         }
-        self.source.semantic_custody(tracked.pin.as_ref()?)
+        self.source
+            .shared_semantic_custody(&tracked.pin.as_ref()?.pin)
     }
 
     pub(crate) fn semantic_custody_ref(&self, caller: CallerId) -> Option<&PidPin> {
@@ -353,9 +412,10 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         }
         self.source.semantic_custody_ref(tracked.pin.as_ref()?)
     }
-    pub(crate) fn new(source: Source) -> Self {
+    pub(crate) fn new(source: Source, custody_reserver: SemanticResourceReserver) -> Self {
         Self {
             source,
+            custody_reserver,
             next_id: 0,
             incarnations: BTreeMap::new(),
             callers: BTreeMap::new(),
@@ -444,7 +504,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
     /// binder queries a task cookie through (Task 6 C4).
     pub(crate) fn live_pin(&self, pid: u32) -> Option<(&CallerRecord, &Source::Pin)> {
         let tracked = self.callers.get(self.live_by_pid.get(&pid)?)?;
-        Some((&tracked.record, tracked.pin.as_ref()?))
+        Some((&tracked.record, &**tracked.pin.as_ref()?))
     }
 
     fn mint(&mut self) -> Result<CallerId> {
@@ -490,6 +550,8 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         }
         let start_time = self.source.start_time(pid);
         let exe = self.source.exe_identity(pid);
+        let pin = SharedCallerPin::new(pin, &self.source, &self.custody_reserver)
+            .map_err(|_| anyhow!("original process custody storage refused before allocation"))?;
         let id = self.mint()?;
         let incarnation = self.incarnations.get(&pid).copied().unwrap_or(0);
         self.incarnations.insert(pid, incarnation.saturating_add(1));
@@ -532,10 +594,21 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
             ));
         }
         let pid = preparation.pid();
-        let pin = self
-            .source
-            .open(pid)
-            .map_err(|_| failed("cgroup caller source pin unavailable"))?;
+        let existing = self.live_id(pid);
+        let pin = if let Some(id) = existing {
+            self.callers
+                .get(&id)
+                .and_then(|tracked| tracked.pin.as_ref())
+                .ok_or_else(|| failed("retained cgroup caller custody unavailable"))?
+                .share()
+        } else {
+            let pin = self
+                .source
+                .open(pid)
+                .map_err(|_| failed("cgroup caller source pin unavailable"))?;
+            SharedCallerPin::new(pin, &self.source, &self.custody_reserver)
+                .map_err(AdmitFailure::custody_storage)?
+        };
         let generation = crate::inspect_system::MemberGeneration {
             start_time: self.source.start_time(pid),
             exe: self.source.exe_identity(pid),
@@ -548,7 +621,6 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
                 "cgroup caller source generation or image changed before final sampling",
             ));
         }
-        let existing = self.live_id(pid);
         if let Some(id) = existing {
             let record = self.record(id).expect("live caller retains its record");
             if record.start_time != generation.start_time || record.exe != generation.exe {
@@ -680,7 +752,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
     pub(crate) fn commit_handoff_caller(
         &mut self,
         pid: u32,
-        pin: Source::Pin,
+        pin: SharedCallerPin<Source::Pin>,
         permit: crate::inspect_system::inventory_cgroup::CgroupAdmissionPermit<'_>,
         generation: crate::inspect_system::MemberGeneration,
         now_ns: u64,
@@ -929,7 +1001,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         &mut self,
         id: CallerId,
         now_ns: u64,
-    ) -> Option<(u32, Source::Pin)> {
+    ) -> Option<(u32, SharedCallerPin<Source::Pin>)> {
         let pid = self
             .callers
             .get(&id)
@@ -955,7 +1027,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
     pub(crate) fn admit_retained_successor(
         &mut self,
         pid: u32,
-        pin: Source::Pin,
+        pin: SharedCallerPin<Source::Pin>,
         authority: ImageAuthority,
         now_ns: u64,
         detected: &mut dyn FnMut() -> Option<u64>,
@@ -972,7 +1044,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
     fn commit_retained_successor(
         &mut self,
         pid: u32,
-        pin: Option<Source::Pin>,
+        pin: Option<SharedCallerPin<Source::Pin>>,
         authority: ImageAuthority,
         now_ns: u64,
         detected: &mut dyn FnMut() -> Option<u64>,
@@ -2337,6 +2409,10 @@ pub(crate) struct CallerRegistry {
 }
 
 impl CallerRegistry {
+    pub(crate) fn semantic_storage_reserver(&self) -> SemanticResourceReserver {
+        self.semantic_resources.reserver()
+    }
+
     /// Provider copies and their retained containers share the reducers' one
     /// capture-wide pool. The move-only lease follows the actual allocation.
     pub(crate) fn reserve_semantic_storage(
@@ -2361,8 +2437,7 @@ impl CallerRegistry {
             self.semantic_occupied + self.instance_semantic_occupied(),
             0
         );
-        self.semantic_resources =
-            crate::semantics_edge::resources::SemanticResourcePool::reference_limit(limit);
+        self.semantic_resources.reference_set_limit(limit);
     }
 
     pub(crate) fn new(limits: RegistryLimits) -> Self {
@@ -5013,9 +5088,149 @@ pub(crate) mod tests {
 
     const AUTHORITY: ImageAuthority = ImageAuthority::ScanPinned;
 
+    #[test]
+    fn shared_process_custody_factory_charges_actual_arc_allocations() {
+        let registry = CallerRegistry::new(RegistryLimits::default_limits());
+        let reserve = registry.semantic_storage_reserver();
+        let before = registry.semantic_resource_snapshot().charged_bytes;
+        let pin = PidPin::open(std::process::id()).unwrap();
+        let inline = 2 * std::mem::size_of::<SharedCallerPin<PidPin>>();
+        let requested = CustodyCharge::requested_bytes::<PidPin>(inline).unwrap();
+        let (held, allocations, allocated_bytes) = crate::test_alloc::count_allocs_during(|| {
+            SharedCallerPin::new(pin, &OsProcessSource, &reserve).unwrap()
+        });
+        assert_eq!(allocations, 2, "the original pin and its charge peer");
+        assert_eq!(
+            allocated_bytes
+                + 2 * crate::semantics_edge::resources::OWNED_ALLOCATION_PADDING
+                + inline,
+            requested
+        );
+        assert_eq!(
+            registry.semantic_resource_snapshot().charged_bytes,
+            before + requested
+        );
+        let original = OsProcessSource.shared_semantic_custody(&held.pin).unwrap();
+        let (shared, sharing_allocations, sharing_bytes) =
+            crate::test_alloc::count_allocs_during(|| held.share());
+        assert_eq!((sharing_allocations, sharing_bytes), (0, 0));
+        assert!(Arc::ptr_eq(&original, &shared.pin));
+        eprintln!(
+            "actual shared custody: PidPin={} wrapper={} peer={} heap={} charge={}",
+            std::mem::size_of::<PidPin>(),
+            std::mem::size_of::<SharedCallerPin<PidPin>>(),
+            std::mem::size_of::<CustodyCharge>(),
+            allocated_bytes,
+            requested
+        );
+        drop((original, shared, held));
+        assert_eq!(registry.semantic_resource_snapshot().charged_bytes, before);
+    }
+
+    #[test]
+    fn shared_process_custody_refuses_before_any_arc_allocation() {
+        use std::os::fd::AsRawFd as _;
+        let registry = CallerRegistry::new(RegistryLimits::default_limits());
+        let reserve = registry.semantic_storage_reserver();
+        let before = registry.semantic_resource_snapshot().charged_bytes;
+        registry.reference_semantic_resource_limit(before);
+        let pin = PidPin::open(std::process::id()).unwrap();
+        let fd = pin.pidfd().unwrap().as_raw_fd();
+        let (result, allocations, bytes) = crate::test_alloc::count_allocs_during(|| {
+            SharedCallerPin::new(pin, &OsProcessSource, &reserve)
+        });
+        assert!(result.is_err());
+        assert_eq!((allocations, bytes), (0, 0));
+        // SAFETY: query only; the just-failed owned preparation closed this FD.
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
+        );
+        assert_eq!(registry.semantic_resource_snapshot().charged_bytes, before);
+    }
+
+    #[test]
+    fn shared_process_custody_strong_and_paired_weak_lifetimes() {
+        use std::os::fd::AsRawFd as _;
+        let registry = CallerRegistry::new(RegistryLimits::default_limits());
+        let before = registry.semantic_resource_snapshot().charged_bytes;
+        let held = SharedCallerPin::new(
+            PidPin::open(std::process::id()).unwrap(),
+            &OsProcessSource,
+            &registry.semantic_storage_reserver(),
+        )
+        .unwrap();
+        let original = OsProcessSource.shared_semantic_custody(&held.pin).unwrap();
+        let second = Arc::clone(&original);
+        let weak = PidPin::downgrade_shared(&original).unwrap();
+        let weak_second = PidPin::downgrade_shared(&original).unwrap();
+        let fd = original.pidfd().unwrap().as_raw_fd();
+        assert!(weak.matches_original(&original));
+        let charged = registry.semantic_resource_snapshot().charged_bytes;
+        drop(held);
+        drop(original);
+        assert!(weak.matches_original(&second));
+        assert_eq!(registry.semantic_resource_snapshot().charged_bytes, charged);
+        drop(second);
+        // SAFETY: query only, with no intervening FD acquisition after drop.
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
+        );
+        assert_eq!(
+            registry.semantic_resource_snapshot().charged_bytes,
+            charged,
+            "paired Weak retains the memory charge, never the pidfd"
+        );
+        let replacement = Arc::new(PidPin::open(std::process::id()).unwrap());
+        assert!(!weak.matches_original(&replacement));
+        assert!(
+            PidPin::downgrade_shared(&replacement).is_none(),
+            "an uncharged Arc is not displayed original custody"
+        );
+        drop(weak);
+        assert_eq!(registry.semantic_resource_snapshot().charged_bytes, charged);
+        drop(weak_second);
+        assert_eq!(registry.semantic_resource_snapshot().charged_bytes, before);
+    }
+
+    #[test]
+    fn shared_process_custody_weak_drop_first_and_independent_duplicate() {
+        use std::os::fd::AsRawFd as _;
+        let registry = CallerRegistry::new(RegistryLimits::default_limits());
+        let before = registry.semantic_resource_snapshot().charged_bytes;
+        let held = SharedCallerPin::new(
+            PidPin::open(std::process::id()).unwrap(),
+            &OsProcessSource,
+            &registry.semantic_storage_reserver(),
+        )
+        .unwrap();
+        let original = OsProcessSource.shared_semantic_custody(&held.pin).unwrap();
+        let duplicate = Arc::new(original.try_clone().unwrap());
+        assert_ne!(
+            original.pidfd().unwrap().as_raw_fd(),
+            duplicate.pidfd().unwrap().as_raw_fd()
+        );
+        assert!(
+            PidPin::downgrade_shared(&duplicate).is_none(),
+            "a duplicated FD never inherits original allocation accounting"
+        );
+        let weak = PidPin::downgrade_shared(&original).unwrap();
+        drop(weak);
+        assert!(registry.semantic_resource_snapshot().charged_bytes > before);
+        drop((held, original));
+        assert_eq!(registry.semantic_resource_snapshot().charged_bytes, before);
+        assert!(duplicate.still_the_same());
+    }
+
     fn adapter() -> (ScriptedSource, CallerAdapter<ScriptedSource>) {
         let source = ScriptedSource::default();
-        let adapter = CallerAdapter::new(source.clone());
+        let adapter = CallerAdapter::new(
+            source.clone(),
+            CallerRegistry::new(RegistryLimits::default_limits()).semantic_storage_reserver(),
+        );
         (source, adapter)
     }
 
@@ -5270,7 +5485,10 @@ pub(crate) mod tests {
         assert!(!generation_gone(pid));
         let source = OsProcessSource;
         assert!(source.gone(pid));
-        let mut adapter = CallerAdapter::new(OsProcessSource);
+        let mut adapter = CallerAdapter::new(
+            OsProcessSource,
+            CallerRegistry::new(RegistryLimits::default_limits()).semantic_storage_reserver(),
+        );
         let error = adapter.admit(pid, AUTHORITY, 10).unwrap_err();
         assert!(
             format!("{error:#}").contains("no live process"),

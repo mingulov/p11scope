@@ -294,6 +294,66 @@ fn check_wrap_records(
             && footer["sequence_exhausted"] == false
             && footer["oversized_records"] == 0
     );
+    const KIND_NAMES: [&str; 5] = [
+        "count_observation",
+        "ownership_transition",
+        "count_decision",
+        "publication",
+        "capture_health",
+    ];
+    let mut observed = [0u64; 5];
+    let mut occupancy = [0u64; 2];
+    for row in &records[1..records.len() - 1] {
+        let name = row["kind"]
+            .as_str()
+            .context("diagnostic row kind missing")?;
+        let index = KIND_NAMES
+            .iter()
+            .position(|known| *known == name)
+            .context("unknown diagnostic row kind")?;
+        observed[index] += 1;
+        ensure!(
+            row["decision"].is_null()
+                || matches!(
+                    row["decision"].as_str(),
+                    Some("staged" | "placed" | "rejected" | "withheld" | "pending")
+                ),
+            "unknown diagnostic decision"
+        );
+        let exceptional = matches!(name, "ownership_transition" | "capture_health")
+            || matches!(
+                row["decision"].as_str(),
+                Some("rejected" | "withheld" | "pending")
+            );
+        occupancy[usize::from(exceptional)] += 1;
+    }
+    ensure!(
+        occupancy[0] <= 24576 && occupancy[1] <= 8192,
+        "retained default ring capacity exceeded"
+    );
+    ensure!(
+        observed.iter().sum::<u64>()
+            == footer["records_written"]
+                .as_u64()
+                .context("export row count")?
+    );
+    for (index, kind) in kinds.iter().enumerate() {
+        let keys: BTreeSet<_> = kind
+            .as_object()
+            .context("kind counters must be an object")?
+            .keys()
+            .map(String::as_str)
+            .collect();
+        ensure!(
+            keys == BTreeSet::from(["produced", "retained", "evicted", "filtered", "omitted"]),
+            "unexpected footer counter vocabulary/order"
+        );
+        ensure!(
+            kind["retained"].as_u64() == Some(observed[index]),
+            "footer retained count differs from actual {} rows",
+            KIND_NAMES[index]
+        );
+    }
     for kind in kinds {
         let total = |name: &str| kind[name].as_u64().context("diagnostic kind counter");
         ensure!(
@@ -316,6 +376,10 @@ fn check_wrap_records(
     ensure!(
         ordinary_evicted > 0 && exceptional_evicted > 0,
         "both default rings must actually wrap"
+    );
+    ensure!(
+        occupancy == [24576, 8192],
+        "wrapped default rings must retain their complete capacities without omissions"
     );
     let produced: u64 = kinds
         .iter()
@@ -380,47 +444,155 @@ fn check_wrap_records(
     Ok(())
 }
 
+fn time_shape(value: &serde_json::Value, field: &str) -> Result<bool> {
+    let stamp = value
+        .get(field)
+        .with_context(|| format!("missing temporal field {field}"))?;
+    ensure!(
+        stamp.is_null() || stamp.as_u64().is_some(),
+        "invalid temporal field {field}"
+    );
+    Ok(!stamp.is_null())
+}
+
 fn primary_facts(document: &serde_json::Value, pid: u32) -> Result<serde_json::Value> {
-    ensure!(document["observation"]["lane"] == "native" && !ab_lifecycle_loss_detected(document));
+    let observation = &document["observation"];
+    ensure!(
+        observation["lane"] == "native"
+            && observation["settlement"] == "unsettled"
+            && observation["retirement"] == "closed"
+            && !ab_lifecycle_loss_detected(document),
+        "expected loss-free native observation, closed retirement and explicitly unsettled capture"
+    );
+    let lifecycle = &observation["lifecycle"];
+    for field in ["ring_loss", "malformed", "failed_quanta"] {
+        ensure!(
+            lifecycle[field].as_u64() == Some(0),
+            "lifecycle failure or unavailable counter: {field}"
+        );
+    }
+    ensure!(
+        lifecycle["records"].as_u64().is_some() && lifecycle["recovery_rescans"].as_u64().is_some()
+    );
+    let witnesses = &observation["native_witnesses"];
+    ensure!(witnesses["integrity"].as_u64() == Some(0) && witnesses["pending"].as_u64().is_some());
+    let reasons = witnesses["unbound_reasons"]
+        .as_object()
+        .context("native unbound reasons missing")?;
+    ensure!(reasons.values().all(|count| count.as_u64().is_some()));
+    for field in ["ambiguous", "unresolved"] {
+        ensure!(witnesses["placement"][field].as_u64().is_some());
+    }
+    let callers = document["callers"].as_array().context("primary callers")?;
+    ensure!(
+        callers.len() == 1
+            && callers[0]["pid"] == pid
+            && callers[0]["lifecycle"] == "mapped"
+            && callers[0]["retired"] == false
+    );
+    let caller = &callers[0];
     let edges = doc_edges(document, pid);
     ensure!(edges.len() == 2);
     let modules = document["modules"].as_array().context("primary modules")?;
     let mut facts = BTreeMap::new();
+    let mut module_ids = BTreeSet::new();
     for edge in edges {
-        let module = modules
+        let matching: Vec<_> = modules
             .iter()
-            .find(|module| module["id"] == edge["module"])
-            .context("edge module")?;
-        let label = ["provider-A.so", "provider-B.so"]
+            .filter(|module| module["id"] == edge["module"])
+            .collect();
+        ensure!(matching.len() == 1, "edge module must be unique");
+        let module = matching[0];
+        ensure!(module_ids.insert(edge["module"].as_str().context("module ID")?.to_owned()));
+        let labels: Vec<_> = ["provider-A.so", "provider-B.so"]
             .into_iter()
-            .find(|suffix| {
+            .filter(|suffix| {
                 module["paths"].as_array().is_some_and(|paths| {
                     paths
                         .iter()
                         .any(|path| path.as_str().is_some_and(|path| path.ends_with(suffix)))
                 })
             })
-            .context("owned module label")?;
-        let expected = if label == "provider-A.so" {
-            COUNTED * TARGETS
-        } else {
-            TARGETS
-        };
-        ensure!(edge["entries"]["count"] == expected);
-        if label == "provider-B.so" {
-            ensure!(
-                edge["entries"]["coverage"]["state"] == "counted"
-                    && edge["entries"]["coverage"]["lossy"] == false
-            );
+            .collect();
+        ensure!(
+            labels.len() == 1,
+            "owned module must identify exactly one expected provider"
+        );
+        let label = labels[0];
+        let a = label == "provider-A.so";
+        let expected = if a { COUNTED * TARGETS } else { TARGETS };
+        let entries = &edge["entries"];
+        let coverage = &entries["coverage"];
+        ensure!(
+            entries["count"] == expected
+                && entries["observation"] == "observed"
+                && entries["saturated"] == false
+                && entries["in_flight"] == false
+                && entries["cap"].as_u64().is_some()
+        );
+        let expected_presence = if a { "unloaded" } else { "mapped" };
+        let expected_capture = if a { "retired" } else { "armed" };
+        ensure!(
+            edge["presence"] == expected_presence
+                && edge["capture"] == expected_capture
+                && module["lifecycle"] == expected_presence
+        );
+        ensure!(module["unloaded_observed"].is_boolean());
+        let state = coverage["state"].as_str().context("coverage state")?;
+        ensure!(matches!(
+            state,
+            "counted" | "witnessed" | "watched_no_use" | "unknown"
+        ));
+        ensure!(
+            coverage.get("reason").is_some()
+                && coverage.get("detail").is_some()
+                && coverage.get("lossy").is_some()
+        );
+        ensure!(
+            (coverage["reason"].is_null() || coverage["reason"].is_string())
+                && (coverage["detail"].is_null() || coverage["detail"].is_string())
+                && (coverage["lossy"].is_null() || coverage["lossy"].is_boolean())
+        );
+        ensure!(
+            coverage["reason"] != "loss" && coverage["lossy"] != true,
+            "a genuine observation loss cannot qualify useful-count parity"
+        );
+        if !a {
+            ensure!(state == "counted" && coverage["lossy"] == false);
         }
-        facts.insert(label, serde_json::json!({"presence":edge["presence"], "capture":edge["capture"],
-            "count":edge["entries"]["count"], "observation":edge["entries"]["observation"],
-            "saturated":edge["entries"]["saturated"], "in_flight":edge["entries"]["in_flight"],
-            "cap":edge["entries"]["cap"],
-            "coverage_state":edge["entries"]["coverage"]["state"], "lossy":edge["entries"]["coverage"]["lossy"]}));
+        let coverage_facts = serde_json::json!({"state":coverage["state"],
+            "lossy":coverage["lossy"],"reason":coverage["reason"],"detail":coverage["detail"],
+            "has_since":time_shape(coverage,"since_ns")?,"has_until":time_shape(coverage,"until_ns")?,
+            "has_first":time_shape(coverage,"first_ns")?});
+        let mapping = &edge["mapping"];
+        let value = serde_json::json!({"presence":edge["presence"],"capture":edge["capture"],
+            "mapping_state":mapping["state"],"mapping_evidence":mapping["evidence"],
+            "mapping_reason":mapping["reason"],"mapping_interruptions":mapping["interruptions"],
+            "has_mapping_first":time_shape(mapping,"first_seen_ns")?,"has_mapping_last":time_shape(mapping,"last_seen_ns")?,
+            "count":entries["count"],"observation":entries["observation"],"saturated":entries["saturated"],
+            "in_flight":entries["in_flight"],"cap":entries["cap"],
+            "has_entry_first":time_shape(entries,"first_seen_ns")?,"has_entry_last":time_shape(entries,"last_seen_ns")?,
+            "coverage":coverage_facts,"module_lifecycle":module["lifecycle"],
+            "module_unloaded_observed":module["unloaded_observed"]});
+        ensure!(
+            facts.insert(label, value).is_none(),
+            "duplicate provider label"
+        );
     }
+    ensure!(
+        facts.len() == 2
+            && facts.contains_key("provider-A.so")
+            && facts.contains_key("provider-B.so")
+    );
     Ok(
-        serde_json::json!({"edges":facts,"lane":document["observation"]["lane"],"settlement":document["observation"]["settlement"]}),
+        serde_json::json!({"edges":facts,"lane":observation["lane"],"settlement":observation["settlement"],
+        "retirement":observation["retirement"],"caller_lifecycle":caller["lifecycle"],
+        "caller_lifecycle_reason":caller["lifecycle_reason"],"caller_retired":caller["retired"],
+        "lifecycle_failures":{"ring_loss":lifecycle["ring_loss"],"malformed":lifecycle["malformed"],
+            "failed_quanta":lifecycle["failed_quanta"],"recovery_rescans":lifecycle["recovery_rescans"]},
+        "native_failure_facts":{"integrity":witnesses["integrity"],"pending":witnesses["pending"],
+            "unbound_reasons":witnesses["unbound_reasons"],"ambiguous":witnesses["placement"]["ambiguous"],
+            "unresolved":witnesses["placement"]["unresolved"]}}),
     )
 }
 
@@ -609,6 +781,259 @@ fn run_wrap(enabled: bool) -> Result<serde_json::Value> {
         stdout.len()
     );
     Ok(facts)
+}
+
+/// Host-only validator documents. These do not constitute installed capture or
+/// wrap evidence; the ignored gate always reads the actual product output.
+fn primary_validator_fixture(pid: u32, shift: u64) -> serde_json::Value {
+    let caller = format!("c{shift}");
+    let a = format!("m{}", shift + 1);
+    let b = format!("m{}", shift + 2);
+    let edge = |module: &str, is_a: bool| {
+        serde_json::json!({
+            "caller":caller,"module":module,
+            "presence":if is_a {"unloaded"} else {"mapped"},
+            "capture":if is_a {"retired"} else {"armed"},
+            "mapping":{"state":if is_a {"ended"} else {"mapped"},"evidence":"deep_scan", "reason":null,
+                "interruptions":0,"first_seen_ns":100+shift,"last_seen_ns":200+shift},
+            "entries":{"count":if is_a {COUNTED*TARGETS} else {TARGETS},"saturated":false,
+                "cap":u64::MAX,"in_flight":false,"observation":"observed",
+                "first_seen_ns":120+shift,"last_seen_ns":180+shift,
+                "coverage":{"state":if is_a {"unknown"} else {"counted"},
+                    "reason":if is_a {serde_json::json!("not_attached")} else {serde_json::Value::Null},
+                    "detail":null,"lossy":if is_a {serde_json::Value::Null} else {serde_json::json!(false)},
+                    "since_ns":if is_a {serde_json::Value::Null} else {serde_json::json!(110+shift)},
+                    "until_ns":null,"first_ns":null}}
+        })
+    };
+    serde_json::json!({
+        "observation":{"lane":"native","settlement":"unsettled","retirement":"closed",
+            "lifecycle":{"records":shift+10,"ring_loss":0,"malformed":0,"failed_quanta":0,"recovery_rescans":0},
+            "native_witnesses":{"rows":shift+20,"bound":shift+20,"unbound":0,"pending":0,"integrity":0,
+                "unbound_reasons":{},"placement":{"edge":shift+20,"module":0,"ambiguous":0,"unresolved":0}}},
+        "callers":[{"id":caller,"pid":pid,"lifecycle":"mapped","retired":false,"lifecycle_reason":null}],
+        "modules":[{"id":a,"paths":["/owned/provider-A.so"],"lifecycle":"unloaded","unloaded_observed":true},
+            {"id":b,"paths":["/owned/provider-B.so"],"lifecycle":"mapped","unloaded_observed":false}],
+        "edges":[edge(&a,true),edge(&b,false)],"gaps":[]
+    })
+}
+
+#[test]
+fn operator_diagnostics_wrap_primary_validator_preserves_meaningful_facts() -> Result<()> {
+    let healthy = primary_validator_fixture(123, 0);
+    let expected = primary_facts(&healthy, 123)?;
+    ensure!(
+        expected == primary_facts(&primary_validator_fixture(456, 500), 456)?,
+        "only identities, actual times and benign record totals may normalize"
+    );
+    for change in [
+        "reason",
+        "detail",
+        "temporal_shape",
+        "recovery_rescans",
+        "unbound_reason",
+        "caller_reason",
+    ] {
+        let mut altered = healthy.clone();
+        match change {
+            "reason" => {
+                altered["edges"][0]["entries"]["coverage"]["reason"] =
+                    "retired_before_coverage".into()
+            }
+            "detail" => {
+                altered["edges"][0]["entries"]["coverage"]["detail"] =
+                    "changed unknown context".into()
+            }
+            "temporal_shape" => altered["edges"][0]["entries"]["coverage"]["until_ns"] = 300.into(),
+            "recovery_rescans" => {
+                altered["observation"]["lifecycle"]["recovery_rescans"] = 1.into()
+            }
+            "unbound_reason" => {
+                altered["observation"]["native_witnesses"]["unbound_reasons"]["cookie_unavailable"] =
+                    1.into()
+            }
+            _ => altered["callers"][0]["lifecycle_reason"] = "changed caller context".into(),
+        }
+        ensure!(
+            primary_facts(&altered, 123)? != expected,
+            "discarded meaningful primary fact: {change}"
+        );
+    }
+    for change in [
+        "retirement",
+        "missing_settlement",
+        "malformed",
+        "failed_quanta",
+        "ring_loss",
+        "integrity",
+        "duplicate_label",
+        "missing_label",
+        "duplicate_module",
+        "count",
+        "presence",
+        "capture",
+        "loss",
+        "lossy",
+    ] {
+        let mut altered = healthy.clone();
+        match change {
+            "retirement" => altered["observation"]["retirement"] = "unsettled".into(),
+            "missing_settlement" => {
+                altered["observation"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("settlement");
+            }
+            "malformed" | "failed_quanta" | "ring_loss" => {
+                altered["observation"]["lifecycle"][change] = 1.into()
+            }
+            "integrity" => altered["observation"]["native_witnesses"]["integrity"] = 1.into(),
+            "duplicate_label" => {
+                let mut duplicate = altered["edges"][0].clone();
+                duplicate["module"] = altered["modules"][1]["id"].clone();
+                altered["edges"][1] = duplicate;
+                altered["modules"][1]["paths"] = serde_json::json!(["/owned/provider-A.so"]);
+                altered["modules"][1]["lifecycle"] = "unloaded".into();
+                altered["modules"][1]["unloaded_observed"] = true.into();
+            }
+            "missing_label" => {
+                altered["modules"][1]["paths"] = serde_json::json!(["/owned/other.so"])
+            }
+            "duplicate_module" => {
+                let duplicate = altered["modules"][0]["id"].clone();
+                altered["modules"][1]["id"] = duplicate;
+            }
+            "count" => altered["edges"][0]["entries"]["count"] = 1.into(),
+            "presence" => altered["edges"][0]["presence"] = "mapped".into(),
+            "capture" => altered["edges"][0]["capture"] = "armed".into(),
+            "loss" => altered["edges"][0]["entries"]["coverage"]["reason"] = "loss".into(),
+            _ => altered["edges"][1]["entries"]["coverage"]["lossy"] = true.into(),
+        }
+        ensure!(
+            primary_facts(&altered, 123).is_err(),
+            "invalid primary capture accepted: {change}"
+        );
+    }
+    Ok(())
+}
+
+fn seal_validator_fixture(records: &mut [serde_json::Value]) -> u64 {
+    let last = records.len() - 1;
+    records[last]["records_written"] = ((last - 1) as u64).into();
+    loop {
+        let bytes = records
+            .iter()
+            .map(|row| serde_json::to_vec(row).unwrap().len() as u64 + 1)
+            .sum::<u64>();
+        if records[last]["bytes_written"] == bytes {
+            return bytes;
+        }
+        records[last]["bytes_written"] = bytes.into();
+    }
+}
+
+fn diagnostic_validator_fixture() -> (Vec<serde_json::Value>, u64) {
+    let mut records = vec![
+        serde_json::json!({"kind":"header","scope":"pid","mode":"native","pid_filter":123,
+        "limits":{"ordinary_records":24576,"exceptional_records":8192,"heap_bytes":8*1024*1024}}),
+    ];
+    let mut sequence = 100u64;
+    let mut push = |mut row: serde_json::Value| {
+        row["seq"] = sequence.into();
+        sequence += 1;
+        records.push(row);
+    };
+    for _ in 0..24543 {
+        push(serde_json::json!({"kind":"count_observation"}));
+    }
+    push(serde_json::json!({"kind":"ownership_transition"}));
+    push(serde_json::json!({"kind":"capture_health"}));
+    push(serde_json::json!({"kind":"publication"}));
+    for index in 0..8190 {
+        let mut row = serde_json::json!({"kind":"count_decision","decision":"withheld"});
+        if index < 32 {
+            row["pair"] = format!("p{index}").into();
+            row["reason"] = "awaiting_fence".into();
+            row["after"] = (COUNTED + SHARED).into();
+            row["through"] = (COUNTED + SHARED + 1).into();
+        }
+        push(row);
+    }
+    for index in 0..32 {
+        push(
+            serde_json::json!({"kind":"publication","decision":"placed","module_id":"mB",
+        "pair":format!("p{index}"),"base":COUNTED+SHARED+1,"absolute":COUNTED+SHARED+2,"staged":1,
+        "transition_ref":{"seq":1,"status":"not_retained"},"history_complete":false}),
+        );
+    }
+    let retained = [24543u64, 1, 8190, 33, 1];
+    let evicted = [1u64, 1, 0, 0, 0];
+    let kinds: Vec<_> = retained.into_iter().zip(evicted).map(|(retained,evicted)|
+        serde_json::json!({"produced":retained+evicted,"retained":retained,"evicted":evicted,"filtered":0,"omitted":0})).collect();
+    records.push(serde_json::json!({"kind":"footer","diagnostics_complete":true,"kinds":kinds,
+        "counter_overflow":false,"sequence_exhausted":false,"oversized_records":0,"records_written":0,"bytes_written":0}));
+    let bytes = seal_validator_fixture(&mut records);
+    (records, bytes)
+}
+
+#[test]
+fn operator_diagnostics_wrap_retained_validator_checks_actual_rows() -> Result<()> {
+    let (healthy, bytes) = diagnostic_validator_fixture();
+    check_wrap_records(&healthy, bytes, &serde_json::json!("mB"), 123)?;
+    for change in [
+        "remove_row",
+        "retained_lie",
+        "swap_entries",
+        "duplicate_entry",
+        "extra_kind_label",
+        "unknown_kind",
+        "capacity",
+        "retained_reference",
+        "not_retained_reference",
+        "missing_pair",
+    ] {
+        let mut altered = healthy.clone();
+        let last = altered.len() - 1;
+        match change {
+            "remove_row" => {
+                altered.remove(1);
+            }
+            "retained_lie" => {
+                altered[last]["kinds"][0]["retained"] = 24544.into();
+                altered[last]["kinds"][0]["produced"] = 24545.into();
+            }
+            "swap_entries" => altered[last]["kinds"].as_array_mut().unwrap().swap(0, 1),
+            "duplicate_entry" => {
+                let duplicate = altered[last]["kinds"][0].clone();
+                altered[last]["kinds"][1] = duplicate;
+            }
+            "extra_kind_label" => altered[last]["kinds"][0]["kind"] = "count_observation".into(),
+            "unknown_kind" => altered[1]["kind"] = "invented_record".into(),
+            "capacity" => {
+                let row = altered
+                    .iter_mut()
+                    .rfind(|row| row["kind"] == "count_decision")
+                    .unwrap();
+                row["kind"] = "count_observation".into();
+                row["decision"] = serde_json::Value::Null;
+                altered[last]["kinds"][0]["retained"] = 24544.into();
+                altered[last]["kinds"][0]["produced"] = 24545.into();
+                altered[last]["kinds"][2]["retained"] = 8189.into();
+                altered[last]["kinds"][2]["produced"] = 8189.into();
+            }
+            "retained_reference" => {
+                altered[last - 1]["transition_ref"]["status"] = "retained".into()
+            }
+            "not_retained_reference" => altered[last - 1]["transition_ref"]["seq"] = 100.into(),
+            _ => altered[last - 1]["pair"] = "p0".into(),
+        }
+        let bytes = seal_validator_fixture(&mut altered);
+        ensure!(
+            check_wrap_records(&altered, bytes, &serde_json::json!("mB"), 123).is_err(),
+            "retained-output corruption passed: {change}"
+        );
+    }
+    Ok(())
 }
 
 #[test]

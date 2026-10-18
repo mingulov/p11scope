@@ -142,4 +142,38 @@ mod tests {
         assert_eq!(coordinator.metadata_frame().summary.retained_bytes, before);
         assert!(coordinator.poll_caller_metadata_stop(4));
     }
+
+    #[test]
+    fn caller_metadata_stop_finalization_returns_with_charged_worker_pending() {
+        let _serial = worker_lock();
+        let mut coordinator = coordinator();
+        coordinator.enable_caller_metadata(1).unwrap();
+        let before = coordinator.metadata_frame().summary.retained_bytes;
+        let held = coordinator
+            .caller_metadata
+            .as_mut()
+            .unwrap()
+            .hold_worker_for_test();
+        let retained = coordinator.metadata_frame().summary.retained_bytes;
+        assert!(retained > before);
+        let started = Instant::now();
+        crate::inventory::finish_caller_metadata_cleanup_for_test(&mut coordinator, &|| false);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(!coordinator.poll_caller_metadata_stop(2));
+        assert_eq!(
+            coordinator.metadata_frame().summary.retained_bytes,
+            retained
+        );
+        assert!(held.cancelled());
+        held.release();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !coordinator.poll_caller_metadata_stop(3) {
+            assert!(
+                Instant::now() < deadline,
+                "pending worker was not joined after release"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(coordinator.metadata_frame().summary.retained_bytes, before);
+    }
 }

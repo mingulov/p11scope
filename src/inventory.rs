@@ -1184,12 +1184,21 @@ fn finish_caller_metadata_cleanup(
     // Outputs have already been attempted. Join the cancelled optional job
     // through its real owner; another operator signal leaves owned custody
     // in the helper's process-lifetime slot rather than detaching its thread.
+    let deadline = Instant::now() + Duration::from_millis(100);
     while !coordinator.poll_caller_metadata_stop(now_ns()) {
-        if second_signal() {
+        if second_signal() || Instant::now() >= deadline {
             return;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[cfg(test)]
+pub(crate) fn finish_caller_metadata_cleanup_for_test(
+    coordinator: &mut InventoryCoordinator<OsProcessSource>,
+    second_signal: &dyn Fn() -> bool,
+) {
+    finish_caller_metadata_cleanup(coordinator, second_signal);
 }
 
 fn finish_semantic_native_cleanup(

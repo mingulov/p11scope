@@ -14,10 +14,10 @@ use crate::scope::inventory_cgroup::{CgroupWalkLimits, CgroupWalkState, Collecti
 
 #[path = "owner_admission/initial_coverage.rs"]
 mod initial_coverage;
-#[path = "owner_admission/provider_bindings.rs"]
-mod provider_bindings;
 #[path = "owner_admission/promotion_runtime.rs"]
 mod promotion_runtime;
+#[path = "owner_admission/provider_bindings.rs"]
+mod provider_bindings;
 #[path = "owner_admission/successor_replay.rs"]
 mod successor_replay;
 

@@ -425,3 +425,26 @@ actual prompt main reporter plus matching marker; the normal main validator
 must reject the worker identity. Their healthy/mutation documents are validator
 controls, not installed negatives. Actual adapters and source-reviewed execution
 remain required before dependent blocked-stderr acceptance.
+
+`qualify_reporter_probe.py --cells handlerblocked --readiness-gate /absolute/gate.so`
+and `--cells wrongworker` select the new adapters explicitly; the default six
+controls are unchanged. Supply the same candidate/provider/caller/helper/manifest,
+ordinary uid/gid, exact source and fresh output directory as above. Build the
+gate with the development-host C compiler (`-shared -fPIC`) and verify its
+arrival alongside the actual helper before use. A baseline preload or gate
+environment is refused. No preload is applied to healthy or wrong-worker
+observers or to the ordinary provider caller.
+
+The handler adapter holds and checks the actual preload executable mapping,
+waits for complete readiness and gate entry, enables both finite role probes,
+performs20 real caller-ledger GenerateRandom calls, and sends SIGINT with
+`tgkill(original_tgid, original_main_tid, SIGINT)`. It releases only after the
+actual EINTR fact and150ms interval, then retains original observer custody
+through complete stderr EOF and both final kernel counters. The worker adapter
+holds one original live task directory, enables both main and worker probes,
+and reconciles the worker promptly after actual main reporter progress while
+that same worker is still alive. Missing/exited workers are failures, with no
+replacement/retry. All timeout/error cleanup releases a negative gate before
+waiting for or signalling the observer. These are newly prepared adapters;
+source review and actual same-candidate controls remain required. Summary
+`remaining` retains every causal control not actually passed in that invocation.

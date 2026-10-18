@@ -14,6 +14,7 @@ use crate::inventory_semantics::{AttestedSubset, LaneCoverage, LaneNegative};
 use crate::semantic_capture::{Endpoint, InvalidationScope, RoutedCall};
 use crate::semantics_edge::{EdgeSemantics, EffectOrigin, NoSink, SemanticCall};
 use crate::semantics_key_use::{FeedMode, JointStaging, KeyUseTee, StagingRefusal};
+use crate::semantics_objects::journal::joint_driver::JointResourceOrigin;
 use p11scope_ebpf_common::object_wire::ValidatedObjectCall;
 use p11scope_ebpf_common::{Event, ImageIdentity, SlotSemantics};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -96,6 +97,7 @@ impl AdmittedInstanceCall {
             permission: ReductionPermission::CurrentContinuity,
             journal_invocation: None,
             object: None,
+            joint_resource: None,
         }
     }
 }
@@ -232,6 +234,9 @@ pub(crate) struct AdmittedInstanceCall {
     /// slot descriptor at admission and dropped on mismatch. H9 consumes
     /// it; no public object projection exists here.
     object: Option<ValidatedObjectCall>,
+    /// Opaque bookkeeping carried from the same original END. It is never
+    /// consulted to decide admission, coverage or semantic attribution.
+    joint_resource: Option<JointResourceOrigin>,
 }
 
 impl fmt::Debug for AdmittedInstanceCall {
@@ -1274,10 +1279,12 @@ impl CallerRegistry {
                         .semantics
                         .get_mut(&id)
                         .expect("retained edge");
-                    match state.feed.stage(
+                    match state.feed.stage_collected(
                         input.facts.clone(),
                         origin,
                         input.position.ordinal,
+                        input.position.domain,
+                        input.joint_resource,
                         &mut *ledger,
                     ) {
                         Ok(()) => StageAction::Staged,
@@ -1737,6 +1744,7 @@ pub(crate) struct CallEvidence {
     /// Slice D: the private validated object tail moved out of the owned
     /// routed call. No raw-value Debug: the redacted `Debug` below stays.
     object: Option<ValidatedObjectCall>,
+    joint_resource: Option<JointResourceOrigin>,
 }
 
 impl std::fmt::Debug for CallEvidence {
@@ -1757,6 +1765,7 @@ impl CallEvidence {
         let image = call.image();
         let endpoint = call.endpoint();
         let event = call.record().event;
+        let joint_resource = call.joint_resource();
         let object = call.into_object_tail();
         Some(Self {
             domain,
@@ -1766,6 +1775,7 @@ impl CallEvidence {
             endpoint,
             event,
             object,
+            joint_resource,
         })
     }
 
@@ -1793,6 +1803,7 @@ impl CallEvidence {
             endpoint,
             event,
             object: None,
+            joint_resource: None,
         }
     }
 
@@ -2001,6 +2012,9 @@ pub(crate) fn admit_call_from_evidence(
         permission,
         journal_invocation: JournalInvocationIdentity::from_event(&evidence.event),
         object,
+        joint_resource: evidence
+            .joint_resource
+            .filter(|origin| origin.matches_native(evidence.domain)),
     })
 }
 
@@ -2283,6 +2297,7 @@ mod reference {
             ),
             journal_invocation: None,
             object: None,
+            joint_resource: None,
         }
     }
     pub(crate) enum Scope {

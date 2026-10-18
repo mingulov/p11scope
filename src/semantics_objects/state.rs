@@ -632,8 +632,17 @@ impl ModelState {
         origin: OriginFact,
         ledger: &mut super::journal::StagingLedger,
     ) -> (Result<CallToken, ObjectGap>, ObjectEffects) {
+        self.begin_with_resource(origin, ledger, None)
+    }
+
+    pub(super) fn begin_with_resource(
+        &mut self,
+        origin: OriginFact,
+        ledger: &mut super::journal::StagingLedger,
+        resource: Option<&super::journal::ExistingReservation>,
+    ) -> (Result<CallToken, ObjectGap>, ObjectEffects) {
         let (domain, cut) = (origin.domain, origin.cut.0);
-        let (result, mut effects) = self.admit_with_effects(origin, ledger);
+        let (result, mut effects) = self.admit_with_effects(origin, ledger, resource);
         match result {
             Err(reason @ (ObjectGap::ClosedFrontier | ObjectGap::MalformedFact)) => {
                 // Unrepresentable history: a begin the model can no longer
@@ -658,6 +667,7 @@ impl ModelState {
         &mut self,
         origin: OriginFact,
         ledger: &mut super::journal::StagingLedger,
+        resource: Option<&super::journal::ExistingReservation>,
     ) -> (Result<CallToken, ObjectGap>, ObjectEffects) {
         let domain = origin.domain;
         let refused = |reason: ObjectGap| (Err(reason), ObjectEffects::default());
@@ -703,10 +713,13 @@ impl ModelState {
         // call takes its ticket before the token is consumed, so a
         // refusal burns no token. A full shared census refuses
         // exactly like a full pending table.
-        if ledger
-            .charge_model(next, size_of::<PendingCall>() as u64)
-            .is_err()
-        {
+        let charged = match resource {
+            Some(resource) => {
+                ledger.charge_model_from_open(next, size_of::<PendingCall>() as u64, resource)
+            }
+            None => ledger.charge_model(next, size_of::<PendingCall>() as u64),
+        };
+        if charged.is_err() {
             let effects = self.refuse_unrepresented(domain, cut, ledger);
             return (Err(ObjectGap::PendingCapacity), effects);
         }

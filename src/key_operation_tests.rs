@@ -616,6 +616,7 @@ impl JointScene {
 
     fn ingest_ordinary(&mut self, event: Event) -> JournalDisposition {
         let decoded = crate::events::DecodedEventRecord {
+            joint_resource: None,
             base: crate::semantic_capture::event_record_with_routing(
                 event,
                 InstanceStamp::default(),

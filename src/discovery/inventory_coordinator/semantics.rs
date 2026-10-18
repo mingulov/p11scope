@@ -2678,6 +2678,7 @@ mod finalizer_history_tests {
         let routed = RoutedCall::scripted(
             detailed,
             crate::events::DecodedEventRecord {
+                joint_resource: None,
                 base: crate::semantic_capture::event_record_with_routing(
                     Event {
                         slot: init_slot,

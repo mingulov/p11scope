@@ -251,6 +251,13 @@ impl RoutedCall {
     pub(crate) fn record(&self) -> &EventRecord {
         &self.decoded.base
     }
+    pub(crate) fn joint_resource(
+        &self,
+    ) -> Option<crate::semantics_objects::journal::joint_driver::JointResourceOrigin> {
+        self.decoded
+            .joint_resource
+            .filter(|origin| origin.matches_native(self.domain))
+    }
     /// Move-only tail handoff to the sole consuming runtime adapter
     /// (`CallEvidence::from_routed`): no borrower observes the tail.
     pub(crate) fn into_object_tail(self) -> Option<ValidatedObjectCall> {
@@ -419,6 +426,28 @@ pub(crate) struct TickReport {
     shed_floor: Option<u64>,
     exhausted: bool,
 }
+
+/// Move-only acknowledgement minted only after the real collected leaf ran
+/// all H0 routing and stamped its actual allocation watermark. The retained
+/// raw quantum checks the exact identity before applying any scalar.
+pub(crate) struct CollectedH0Disposition {
+    quantum: crate::semantics_objects::journal::joint_driver::RawQuantumIdentity,
+    native: NativeDomainId,
+    allocated_below: u64,
+    pending: bool,
+}
+
+impl CollectedH0Disposition {
+    pub(crate) fn for_quantum(
+        self,
+        quantum: crate::semantics_objects::journal::joint_driver::RawQuantumIdentity,
+        native: NativeDomainId,
+    ) -> Option<(u64, bool)> {
+        (self.quantum == quantum && self.native == native && self.allocated_below != 0)
+            .then_some((self.allocated_below, self.pending))
+    }
+}
+
 impl TickReport {
     /// Tests-only report: finalizer and terminal tests script batches
     /// that only the audited collect→audit→route path mints. Production
@@ -657,6 +686,7 @@ impl CaptureIo for SessionIo<'_> {
             None => {
                 drain.poll_records(Some(limit), |record| {
                     records.push(DecodedEventRecord {
+                        joint_resource: None,
                         base: record,
                         object: None,
                     });
@@ -1499,7 +1529,14 @@ impl SemanticCapture {
         };
         let mut report = self.tick_with_inner(io, Some((records, status)))?;
         self.stamp_disposition(&mut report);
-        quantum.note_h0_report(&report);
+        quantum
+            .note_h0_report(CollectedH0Disposition {
+                quantum: quantum.h0_identity(),
+                native: self.router.domain(),
+                allocated_below: report.allocated_below(),
+                pending: report.awaiting_floor().is_some(),
+            })
+            .map_err(|reason| anyhow::anyhow!("retained semantic disposition: {reason:?}"))?;
         Ok(report)
     }
 
@@ -2832,6 +2869,7 @@ mod tests {
                 global: 0,
             };
             self.records.push_back(DecodedEventRecord {
+                joint_resource: None,
                 base: EventRecord {
                     event: p11scope_ebpf_common::Event {
                         event_type: event_type::CALL,
@@ -3369,6 +3407,7 @@ mod tests {
             TickOutcome::Call(RoutedCall::scripted(
                 domain,
                 DecodedEventRecord {
+                    joint_resource: None,
                     base: event_record_with_routing(
                         p11scope_ebpf_common::Event::default(),
                         stamp,
@@ -3718,6 +3757,7 @@ mod tests {
             TickOutcome::Call(RoutedCall::scripted(
                 domain,
                 DecodedEventRecord {
+                    joint_resource: None,
                     base: event_record_with_routing(
                         p11scope_ebpf_common::Event::default(),
                         stamp,
@@ -3993,6 +4033,7 @@ mod tests {
         prime(&mut capture, &mut io);
         io.call(1, 0);
         io.records.push_back(DecodedEventRecord {
+            joint_resource: None,
             base: EventRecord {
                 event: p11scope_ebpf_common::Event {
                     event_type: u32::MAX,
@@ -4306,6 +4347,7 @@ mod tests {
             let mut io = ScriptIo::new(NativeDomainId::mint());
             let mut capture = capture(&io);
             io.records.push_back(DecodedEventRecord {
+                joint_resource: None,
                 base: EventRecord {
                     event: p11scope_ebpf_common::Event {
                         event_type: u32::MAX,

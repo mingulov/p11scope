@@ -5,7 +5,12 @@ fn caller(id: u32) -> MetadataCaller {
     MetadataCaller {
         id: CallerId(id),
         incarnation: 0,
-        image: Some((u64::from(id) + 1, 0x8000_0000_0000_0001)),
+        image: Some(BinderMetadataKey::for_test(
+            CallerId(id),
+            0,
+            u64::from(id) + 1,
+            0x8000_0000_0000_0001,
+        )),
         retired: false,
     }
 }
@@ -75,7 +80,7 @@ fn start_window_and_refresh_target_are_independent_finite_limits() {
 }
 
 #[test]
-fn no_scan_authority_upgrade_and_zero_exec_is_a_valid_native_image() {
+fn no_unbound_image_upgrade_and_zero_exec_is_a_valid_native_image() {
     let mut runtime = MetadataRuntime::new(7);
     runtime.synchronize(
         [
@@ -84,7 +89,7 @@ fn no_scan_authority_upgrade_and_zero_exec_is_a_valid_native_image() {
                 ..caller(0)
             },
             MetadataCaller {
-                image: Some((2, 0)),
+                image: Some(BinderMetadataKey::for_test(CallerId(1), 0, 2, 0)),
                 ..caller(1)
             },
         ],
@@ -117,7 +122,7 @@ fn completion_checks_capture_incarnation_sequence_fence_stop_and_current_image()
             2 => completion.sequence += 1,
             3 => runtime.invalidate(),
             4 => runtime.stop(),
-            5 => current.image = Some((1, 1)), // high64-bit change must matter
+            5 => current.image = Some(BinderMetadataKey::for_test(CallerId(0), 0, 1, 1)), // high64-bit change must matter
             6 => {
                 current.retired = true;
                 runtime.synchronize([current], 10);

@@ -9,6 +9,7 @@ use crate::attach::capture::{CallerImageObservation, ReadWindow};
 use crate::caller_metadata::acquisition::UncommittedSample;
 use crate::caller_metadata::presentation::MetadataReason;
 use crate::discovery::caller_registry::{CallerAdapter, ProcessSource};
+use crate::discovery::native_binding::{BinderMetadataImage, NativeBinder};
 use crate::process::PidPin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,6 +18,7 @@ use std::time::Instant;
 struct Request {
     ticket: JobTicket,
     original: Arc<PidPin>,
+    expected: BinderMetadataImage,
     deadline: Instant,
 }
 struct Completion {
@@ -56,9 +58,11 @@ impl MetadataLane {
     pub(crate) fn synchronize<Source: ProcessSource>(
         &mut self,
         adapter: &CallerAdapter<Source>,
+        binder: &NativeBinder,
         now_ns: u64,
     ) {
-        self.runtime.synchronize(adapter.metadata_callers(), now_ns);
+        self.runtime
+            .synchronize(adapter.metadata_callers(binder), now_ns);
     }
 
     /// Called only at the serial native service seam. The observation closure
@@ -67,10 +71,12 @@ impl MetadataLane {
     pub(crate) fn tick<Source: ProcessSource>(
         &mut self,
         adapter: &CallerAdapter<Source>,
+        binder: &NativeBinder,
         now_ns: u64,
         mut observe: impl FnMut(&Arc<PidPin>, ReadWindow) -> anyhow::Result<CallerImageObservation>,
     ) {
-        self.runtime.synchronize(adapter.metadata_callers(), now_ns);
+        self.runtime
+            .synchronize(adapter.metadata_callers(binder), now_ns);
         if let Some((result, _storage)) = self.worker.poll_retained() {
             let active = self.active.take();
             match result {
@@ -79,7 +85,7 @@ impl MetadataLane {
                         self.runtime.refuse(ticket, MetadataReason::ReadFailed);
                     }
                 }
-                Ok(completion) => self.complete(completion, adapter, &mut observe),
+                Ok(completion) => self.complete(completion, adapter, binder, &mut observe),
             }
         }
         if self.stopped || !self.worker.idle() || self.active.is_some() {
@@ -88,7 +94,7 @@ impl MetadataLane {
         let Some(ticket) = self.runtime.next(now_ns) else {
             return;
         };
-        let target = match adapter.metadata_target(ticket.caller.id) {
+        let target = match adapter.metadata_target(binder, ticket.caller.id) {
             Ok(target) if target.caller == ticket.caller => target,
             _ => {
                 self.runtime
@@ -104,6 +110,7 @@ impl MetadataLane {
         let request = Request {
             ticket,
             original: target.original,
+            expected: target.expected,
             deadline: anchor + JOB_BUDGET,
         };
         // The complete retained job, completion and fixed slot/flag wrappers
@@ -183,6 +190,7 @@ impl MetadataLane {
         &mut self,
         completion: Completion,
         adapter: &CallerAdapter<Source>,
+        binder: &NativeBinder,
         observe: &mut impl FnMut(&Arc<PidPin>, ReadWindow) -> anyhow::Result<CallerImageObservation>,
     ) {
         let Completion {
@@ -192,7 +200,7 @@ impl MetadataLane {
             started_ns,
             ended_ns,
         } = completion;
-        let current = adapter.metadata_target(request.ticket.caller.id);
+        let current = adapter.metadata_target(binder, request.ticket.caller.id);
         let same = current.as_ref().is_ok_and(|target| {
             target.caller == request.ticket.caller
                 && Arc::ptr_eq(&target.original, &request.original)
@@ -273,9 +281,9 @@ impl Drop for MetadataLane {
 }
 
 fn matches_expected(observation: &CallerImageObservation, request: &Request) -> bool {
-    request.ticket.caller.image.is_some_and(|(cookie, exec)| {
-        observation.matches_original_and_image(&request.original, cookie, exec)
-    })
+    request
+        .expected
+        .matches_observation(&request.original, observation)
 }
 
 /// This returns UNCOMMITTED private metadata. Only complete(), with the real

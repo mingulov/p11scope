@@ -50,6 +50,7 @@ pub(crate) struct PromotionView {
     capture: CaptureId,
     revision: ViewRevision,
     presentation: Arc<Presentation>,
+    baseline: Option<Arc<crate::attach::selected_detailed::baseline::PromotionBaselineBatch>>,
 }
 
 impl PromotionView {
@@ -62,7 +63,37 @@ impl PromotionView {
             capture,
             revision,
             presentation,
+            baseline: None,
         }
+    }
+
+    /// Pair a newly written view with the immutable pre-view native batch.
+    /// No setter can retrofit an already displayed/requested view.
+    #[cfg_attr(not(test), allow(dead_code))] // Candidate/full-write pairing is wired by the capture-loop owner.
+    pub(crate) fn with_baseline(
+        capture: CaptureId,
+        revision: ViewRevision,
+        presentation: Arc<Presentation>,
+        baseline: Arc<crate::attach::selected_detailed::baseline::PromotionBaselineBatch>,
+    ) -> Option<Self> {
+        if revision.get() == 0
+            || revision.get() == ViewRevision::EXHAUSTED
+            || !baseline.matches_view(capture, &presentation)
+        {
+            return None;
+        }
+        Some(Self {
+            capture,
+            revision,
+            presentation,
+            baseline: Some(baseline),
+        })
+    }
+
+    pub(crate) fn baseline(
+        &self,
+    ) -> Option<&Arc<crate::attach::selected_detailed::baseline::PromotionBaselineBatch>> {
+        self.baseline.as_ref()
     }
 
     /// Whether the exact pair occurs in the immutable viewed frame.

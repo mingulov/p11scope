@@ -975,15 +975,26 @@ impl InventoryState {
         &mut self,
         domain: crate::attach::capture::NativeDomainId,
         generation: u64,
-        pins: &[std::sync::Arc<PidPin>],
+        capture: crate::inventory_promotion::CaptureId,
+        presentation: std::sync::Arc<crate::inventory_present::Presentation>,
+        targets: &[crate::attach::selected_detailed::baseline::BaselineTarget],
         window: crate::attach::capture::ReadWindow,
-    ) -> Result<crate::attach::selected_detailed::baseline::KernelBaselineBatch> {
+        reserve: impl FnOnce(
+            usize,
+        ) -> std::result::Result<
+            crate::semantics_edge::resources::ResourceLease,
+            crate::semantics_edge::resources::SemanticResourceRefusal,
+        >,
+    ) -> Result<crate::attach::selected_detailed::baseline::PromotionBaselineBatch> {
         crate::attach::selected_detailed::baseline::query(
             &mut self.prepared.ebpf,
             domain,
             generation,
-            pins,
+            capture,
+            presentation,
+            targets,
             window,
+            reserve,
         )
     }
 

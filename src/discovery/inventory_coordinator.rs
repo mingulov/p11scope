@@ -16211,7 +16211,7 @@ pub(crate) mod tests {
         // handoff still commits its verified generation, reading nothing.
         let identity_reads = std::rc::Rc::new(Cell::new(0));
         let divergent = std::rc::Rc::new(Cell::new(false));
-        let mut inner = crate::discovery::caller_registry::tests::ScriptedSource::default();
+        let inner = crate::discovery::caller_registry::tests::ScriptedSource::default();
         inner.spawn_matching_process(pid);
         let source = CountingSource {
             inner,

@@ -268,17 +268,27 @@ fn fence_gap_repeats(gaps: &[GapEvidence], caller: &str) -> u64 {
     range_gap_repeats(gaps, caller, COUNTED + SHARED, COUNTED + SHARED + 1)
 }
 
-/// Expected published A-edge total after `round` issued A rounds with `k`
-/// startup-fenced pairs (each fenced pair permanently withholds its round-2
-/// unit advance).
+/// Expected published A-edge projection after `round` issued A rounds with
+/// `k` startup-fenced pairs (Sol pinned trajectory). The edge is
+/// max-accepting with per-(caller, module) overlap merge, not a per-pair
+/// sum: ordinary reads 1, 2, 3 after rounds 1-3 and 400 after round 400;
+/// all-32-fenced reads 1, 1, 2 and 399. Only `k == 0` and `k == 32` are
+/// valid dispositions; anything else is rejected by the caller, never by
+/// a silently interpolated value here.
 fn expected_a(round: u64, k: u64) -> u64 {
-    round * TARGETS - k
+    if k == 0 {
+        round
+    } else if round <= 1 {
+        1
+    } else {
+        round - 1
+    }
 }
 
 /// Validate one observed A-phase round against caller-bound gap evidence.
 /// Returns the validated fence count `k`. Round 1 never fences; round 2
 /// establishes `k` (0 ordinary, 32 fenced); later rounds require exact
-/// 32-increments with stable `k`.
+/// 1-increments of the max-accepting projection with stable `k`.
 fn check_startup_round(
     round: u64,
     observed_a: u64,
@@ -317,7 +327,7 @@ fn check_startup_round(
     );
     ensure!(
         observed_a == expected_a(round, k),
-        "round-{round} A={observed_a} breaks the 32-increment chain (k={k})"
+        "round-{round} A={observed_a} breaks the pinned projection chain (k={k})"
     );
     Ok(k)
 }
@@ -860,7 +870,11 @@ fn primary_facts(document: &serde_json::Value, pid: u32, k: u64) -> Result<serde
         );
         let label = labels[0];
         let a = label == "provider-A.so";
-        let expected = if a { COUNTED * TARGETS - k } else { TARGETS };
+        // Pinned edge projections (Sol): A is the max-accepting 400/399,
+        // B is exactly 1 (32 overlapping proof units published together).
+        // Per-pair physical sums (12,800; 21,120; staged 32) are reconciled
+        // separately from the schedule plus ledger, never from this edge.
+        let expected = if a { expected_a(COUNTED, k) } else { 1 };
         let entries = &edge["entries"];
         let coverage = &entries["coverage"];
         ensure!(
@@ -1124,8 +1138,12 @@ fn run_wrap(enabled: bool) -> Result<(serde_json::Value, u64)> {
                         a_count == Some(expected_a(COUNTED, k)),
                         "A history changed during proof: A={a_count:?} k={k}"
                     );
-                    if b_count == Some(TARGETS) {
-                        eprintln!("G21_WRAP_ROUND enabled={enabled} phase=proof done B=32 k={k}");
+                    // B is exactly 1: the 32 terminal proofs overlap in one
+                    // publication. The batching premise is asserted on the
+                    // exported Publication records (edge_total == 1 on all
+                    // 32); a split recovery would project 2..32 instead.
+                    if b_count == Some(1) {
+                        eprintln!("G21_WRAP_ROUND enabled={enabled} phase=proof done B=1 k={k}");
                         state.set((7, 0));
                     } else {
                         ensure!(
@@ -1211,7 +1229,7 @@ fn run_wrap(enabled: bool) -> Result<(serde_json::Value, u64)> {
     if enabled {
         let b = doc_edges(&document, pid)
             .into_iter()
-            .find(|edge| edge["entries"]["count"] == TARGETS)
+            .find(|edge| edge["entries"]["count"] == 1)
             .context("recovered B edge")?;
         let length = std::fs::metadata(&diagnostics)?.len();
         let mut bytes = Vec::new();
@@ -1229,12 +1247,13 @@ fn run_wrap(enabled: bool) -> Result<(serde_json::Value, u64)> {
         ensure!(!diagnostics.exists());
     }
     eprintln!(
-        "G21_PAIRED enabled={enabled} elapsed_ms={} calls={} A={} B={} k={k} withheld={} stdout_bytes={}",
+        "G21_PAIRED enabled={enabled} elapsed_ms={} calls={} A={} B={} k={k} eligible_a={} withheld={} stdout_bytes={}",
         start.elapsed().as_millis(),
         (COUNTED + SHARED + 2) * TARGETS,
+        expected_a(COUNTED, k),
+        1,
         COUNTED * TARGETS - k,
-        TARGETS,
-        (SHARED + 1) * TARGETS,
+        (SHARED + 1) * TARGETS + k,
         stdout.len()
     );
     Ok((facts, k))
@@ -1277,7 +1296,7 @@ fn fixture_edge_json_k(
         mapping_first_seen_ns: 100 + shift,
         mapping_last_seen_ns: 200 + shift,
         mapping_interruptions: 0,
-        entry_count: if is_a { COUNTED * TARGETS - k } else { TARGETS },
+        entry_count: if is_a { expected_a(COUNTED, k) } else { 1 },
         entry_saturated: false,
         entry_first_seen_ns: Some(120 + shift),
         entry_last_seen_ns: Some(180 + shift),
@@ -1338,7 +1357,8 @@ fn primary_validator_fixture_k(pid: u32, shift: u64, k: u64) -> serde_json::Valu
 }
 
 /// Primary facts with a validated startup disposition `k`: A must read
-/// exactly `12800 - k` (each fenced pair permanently withholds one unit).
+/// exactly the pinned edge (`expected_a(400, k)`, 400 ordinary or 399
+/// fenced) and B must read exactly 1.
 fn primary_facts_k(document: &serde_json::Value, pid: u32, k: u64) -> Result<serde_json::Value> {
     primary_facts(document, pid, k)
 }
@@ -1894,13 +1914,13 @@ fn check_startup_probe_records(
         );
     }
     ensure!(
-        public_count == 96 - k,
-        "only exact ordinary96 or startup-fence64 is a qualified probe result"
+        public_count == expected_a(3, k),
+        "only the exact pinned probe projection (ordinary 3, startup-fence 2) is qualified"
     );
     let path = if k == 0 { "ordinary" } else { "startup_fence" };
     Ok(
         serde_json::json!({"path":path,"physical_pairs":32,"calls":96,
-        "published":public_count,"withheld":96-public_count,"fenced_pairs":k,
+        "published":public_count,"withheld":k,"fenced_pairs":k,
         "observations":observations,"fences":fences}),
     )
 }

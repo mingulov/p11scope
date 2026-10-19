@@ -472,10 +472,11 @@ class BrowserCells(unittest.TestCase):
 
         The fake profiler prints its readiness marker after
         ``marker_delay`` seconds; the grace period is 2s, so a long
-        delay means the marker never arrives. Returns the flow's
-        ``started`` dict and the CellError raised (None when the cell
-        ran). Uses a fake Playwright module and a fake profiler
-        process: stdlib only.
+        delay means the marker never arrives. Target liveness is valid
+        synthetic liveness, so readiness is the only possible failure
+        source. Returns the flow's ``started`` dict and the CellError
+        raised (None when the cell ran). Uses a fake Playwright module
+        and a fake profiler process: stdlib only.
         """
         import subprocess as stdlib_subprocess
 
@@ -573,6 +574,7 @@ class BrowserCells(unittest.TestCase):
                                       "playwright.sync_api": fake_sync}), \
                 patch("subprocess.Popen", FakePopen), \
                 patch.object(cells, "main_browser_pid", return_value=os.getpid()), \
+                patch.object(cells, "_target_liveness", return_value=(True, True)), \
                 patch.object(cells, "p11scope_bin", return_value=Path("/fake/p11scope")):
             try:
                 cells.attach_drive(

@@ -1502,6 +1502,19 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         Ok(live)
     }
 
+    /// DR37 wind-down gate: whether the domain's finalizer namespace
+    /// still holds unpublished work (a staged quantum or an
+    /// undischarged drop shadow) that needs its validating lane. The
+    /// wind-down keeps the lane until this clears; retire refuses
+    /// while it holds.
+    #[cfg_attr(not(test), allow(dead_code))] // STAGED (DR37): called by the driver wind-down.
+    pub(crate) fn joint_domain_has_pending_work(&self, domain: NativeDomainId) -> bool {
+        self.semantic_finalizer.as_ref().is_some_and(|state| {
+            state.domain == domain
+                && (state.pending_semantic.is_some() || state.pending_drop.is_some())
+        })
+    }
+
     /// Retire one genuinely completed domain for the next (D5): the
     /// native completion names the live finalizer namespace, which
     /// must be quiescent (no staged quantum, no pending drop);

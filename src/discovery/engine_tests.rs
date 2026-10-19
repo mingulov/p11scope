@@ -29758,6 +29758,40 @@ fn a_polled_process_that_exits_before_its_rescan_leaves_no_pending_poll() {
     );
 }
 
+/// Lane-A: optional polls wait while the enumeration holds an unserved
+/// event-driven newcomer (pending refresh, no view yet) — queued polls
+/// would only consume the capacity pressure is trying to free — and resume
+/// once every enumerated pending pid has a view. Twins: without the
+/// newcomer both views poll, and with only unenumerated EXEC backlog polls
+/// proceed fairly (see the neighboring optional-polling tests).
+#[test]
+fn optional_polling_waits_while_enumerated_newcomers_are_unserved() {
+    let sleeps = e06_spawn_sleeps(3);
+    let mut pids: Vec<u32> = sleeps.iter().map(|sleep| sleep.pid()).collect();
+    pids.sort_unstable();
+    let (mut engine, _scope) = engine_over_cgroup_naming(&pids[..2]);
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    refresh_inventory_once(&mut engine);
+    assert_eq!(engine.views.len(), 2);
+    let newcomer = pids[2];
+    assert!(engine.request_refresh_consumed(newcomer, Some(1_000)));
+
+    engine.queue_polling_rescans(&pids);
+    assert!(
+        engine.polled_pids.is_empty(),
+        "polls wait for the unserved newcomer"
+    );
+    assert_eq!(engine.polling_rescans_queued, 0);
+
+    engine.refresh_requested.remove(&newcomer);
+    engine.queue_polling_rescans(&pids);
+    assert_eq!(
+        engine.polled_pids.len(),
+        2,
+        "polls resume once newcomers are served"
+    );
+}
+
 /// F1: a polled view cannot be evicted before its rescan — the queued
 /// refresh makes it unevictable — so exploratory eviction can never strand
 /// (or orphan) a pending poll. The poll survives the eviction attempt and

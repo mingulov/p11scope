@@ -18942,12 +18942,27 @@ impl Engine {
     /// requested pids are skipped, so event-driven work is never
     /// double-queued. Polling can only add coverage (its targets hold
     /// nothing), never flap owned modules — owned views rely on
-    /// event-driven refresh instead. `pids` must be sorted ascending.
+    /// event-driven refresh instead. While the enumeration holds unserved
+    /// event-driven newcomers (pending refresh, no view yet) polls wait
+    /// entirely (Lane-A): queued polls would only consume the capacity
+    /// pressure is trying to free — map entries, scan quantum, and
+    /// evictable victims. `pids` must be sorted ascending.
     fn queue_polling_rescans(&mut self, pids: &[u32]) {
         // H5 pressure: a service pass services already-accepted requests; it
         // never queues optional polls, which would only consume the capacity
         // it is trying to free (and set a frame deferral at a full map).
         if self.pressure_service_active {
+            return;
+        }
+        // Lane-A: the same rationale for pressured ticks. Silent like the
+        // pass check: rationing while newcomers are unserved, not overflow.
+        // Unenumerated queue entries (stale or foreign EXECs) never block
+        // polls; only members of this enumeration do.
+        let known: BTreeSet<u32> = self.views.iter().map(ProcessView::pid).collect();
+        if pids
+            .iter()
+            .any(|pid| self.refresh_requested.contains_key(pid) && !known.contains(pid))
+        {
             return;
         }
         let mut polling = 0;

@@ -1471,6 +1471,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// genuine disposal; nothing half-installs. The proof is
     /// consumed by the install it authorized.
     #[cfg_attr(not(test), allow(dead_code))] // STAGED (DR37): called by the driver on install.
+    #[allow(clippy::result_large_err)] // DR37: cold path returning the refused parts for genuine disposal.
     pub(crate) fn install_selected_lane(
         &mut self,
         proof: SelectedActivationProof,
@@ -1496,7 +1497,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let live = lane
             .into_live_lane(&proof)
             .expect("proof matches the held lane");
-        drop(proof);
+        // The proof authorized exactly this install; its scope ends
+        // here with the entry.
         Ok(live)
     }
 

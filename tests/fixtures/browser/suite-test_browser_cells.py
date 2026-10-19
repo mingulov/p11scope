@@ -1,0 +1,229 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""G33 browser application cells: real Firefox/Chromium PKCS#11 traffic.
+
+Installed-gate suite (proposed RUN entry, self-skipping): each test drives
+a fresh browser profile against a controlled SoftHSM provider and asserts
+the observed attributions end to end beside independent TLS-layer ground
+truth. On hosts without the gate prerequisites (P11SCOPE_BIN, passwordless
+sudo, Playwright browsers, SoftHSM tooling) every test skips naming what
+is missing; hosted CI therefore stays quiet and T11 runs the positives on
+a qualified installed host.
+
+Harness: tests/fixtures/browser/ (cells, flows, oracle, servers, profiles).
+"""
+
+import functools
+import json
+import shutil
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "tests" / "fixtures" / "browser"))
+
+import cells
+import flows
+import oracle
+import softhsm
+import tls_server
+
+#: Chromium stabilizers: background fetches must not trigger first NSS use
+#: (their timing races the observation window and their traffic is not flow
+#: evidence); stabilized, plain flows deterministically never map the module.
+CHROMIUM_STABLE_ARGS = (
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--disable-sync",
+    "--disable-background-networking",
+    "--disable-component-update",
+    "--disable-default-apps",
+    "--no-service-autorun",
+)
+
+#: Firefox equivalent: background activity stabilized out so floored calls
+#: are flow-caused (unstabilized runs see ~2x the FindObjects traffic).
+FIREFOX_STABLE_PREFS = {
+    "app.update.disabledForTesting": True,
+    "app.normandy.enabled": False,
+    "browser.safebrowsing.malware.enabled": False,
+    "browser.safebrowsing.phishing.enabled": False,
+    "browser.safebrowsing.downloads.enabled": False,
+    "datareporting.policy.dataSubmissionEnabled": False,
+    "toolkit.telemetry.enabled": False,
+    "extensions.update.enabled": False,
+    "network.prefetch-next": False,
+}
+
+ATTACH_DURATION = 45
+RUN_DURATION = 90
+EARNED_VERDICTS = ("attribution_only", "concrete_gap")
+
+
+def gate(test):
+    """Skip unless every gate prerequisite for the cell holds."""
+
+    @functools.wraps(test)
+    def wrapper(self):
+        try:
+            cells.preflight()
+        except (cells.CellError, RuntimeError) as exc:
+            self.skipTest(f"browser gate prerequisite missing: {exc}")
+        return test(self)
+
+    return wrapper
+
+
+class BrowserCells(unittest.TestCase):
+    maxDiff = 4096
+
+    def setUp(self):
+        self.work = Path(tempfile.mkdtemp(prefix="g33-browser-"))
+        self.addCleanup(shutil.rmtree, self.work, True)
+
+    def seed(self, label="G33-Browser"):
+        """Fresh SoftHSM store with a client credential; returns (store, cred)."""
+        store = softhsm.SoftHSMStore(self.work / "softhsm")
+        cred = softhsm.generate_client_credential(self.work / "cred")
+        store.seed_client_token(label, cred)
+        return store, cred
+
+    def check_report(self, result, store, floors=None, zero=False, attached=None):
+        """Common oracle: schema, identity, counts, loss, earned verdict.
+
+        ``attached`` pins the probe state: True (hooked the mapped module),
+        False (never hooked — the module stayed unmapped), None (either).
+        """
+        report = oracle.load_report(result.report_path)
+        counts = oracle.module_counts(report, oracle.sha256_of(store.lib))
+        failures = []
+        failures += oracle.check_no_event_loss(report)
+        if zero:
+            failures += oracle.check_zero_counts(counts)
+        else:
+            failures += oracle.check_min_counts(counts, floors or {})
+        if attached is True:
+            failures += oracle.check_attached(report)
+        elif attached is False:
+            hooked = report["evidence"].get("attached_probes", 0) or 0
+            if hooked != 0:
+                failures.append(f"attached_probes={hooked}, want 0 (module never maps)")
+        failures += oracle.check_verdict(report, EARNED_VERDICTS)
+        if failures:
+            detail = {
+                "failures": failures,
+                "counts": counts,
+                "evidence": {
+                    key: report["evidence"].get(key)
+                    for key in ("completeness", "verdict_detail", "event_loss",
+                                "attached_probes", "active_slots", "gap_classes")
+                },
+                "flow": result.flow,
+                "observer_stderr": result.observer_stderr_tail,
+            }
+            self.fail(f"{result.name} failed:\n{json.dumps(detail, indent=1)[:3000]}")
+        return report
+
+    @gate
+    def test_ff_startup_observes_nss_store_traffic(self):
+        """FF-STARTUP: Firefox HTTPS visit; NSS store enumeration observed."""
+        store, _cred = self.seed()
+        key, cert = tls_server.make_server_credential(self.work / "srv")
+        with tls_server.FlowServer(cert=cert, key=key) as flow:
+            result = cells.attach_drive(
+                "FF-STARTUP", "firefox", self.work / "cell", flow.url,
+                flows.make_visit(flow.url), store.lib,
+                register_module=store.lib, browser_env=store.env,
+                duration_seconds=ATTACH_DURATION, attach_grace_seconds=5,
+                extra_prefs=FIREFOX_STABLE_PREFS)
+            self.assertGreaterEqual(flow.requests_served, 1, "flow server saw no request")
+        self.assertEqual(result.flow.get("profiler_exit"), 0)
+        self.assertEqual(result.flow.get("http_status"), 200)
+        self.assertIn("g33-flow-ok", result.flow.get("body_excerpt", ""))
+        self.assertTrue(result.flow.get("mapped_at_end"), "module unmapped?!")
+        self.check_report(result, store, oracle.FF_STARTUP_FLOORS, attached=True)
+
+    @gate
+    def test_cr_plain_never_touches_the_token(self):
+        """CR-PLAIN: Chromium ignores registered providers for validation."""
+        store, _cred = self.seed()
+        key, cert = tls_server.make_server_credential(self.work / "srv")
+        with tls_server.FlowServer(cert=cert, key=key) as flow:
+            result = cells.attach_drive(
+                "CR-PLAIN", "chromium", self.work / "cell", flow.url,
+                flows.make_visit(flow.url), store.lib,
+                register_module=store.lib, browser_env=store.env,
+                duration_seconds=ATTACH_DURATION, attach_grace_seconds=5,
+                extra_browser_args=CHROMIUM_STABLE_ARGS)
+            self.assertGreaterEqual(flow.requests_served, 1, "flow server saw no request")
+        self.assertEqual(result.flow.get("profiler_exit"), 0)
+        self.assertEqual(result.flow.get("http_status"), 200)
+        self.assertFalse(result.flow.get("mapped_at_end"), "module mapped?!")
+        self.check_report(result, store, zero=True, attached=False)
+
+    @gate
+    def test_ff_nomod_observes_nothing(self):
+        """FF-NOMOD: unregistered provider; the browser maps nothing, zero rows."""
+        store, _cred = self.seed()
+        with tls_server.FlowServer(use_tls=False) as flow:
+            result = cells.run_direct(
+                "FF-NOMOD", "firefox", self.work / "cell", flow.url,
+                observe_module=store.lib, register_module=None,
+                browser_env=store.env, duration_seconds=RUN_DURATION)
+            self.assertGreaterEqual(flow.requests_served, 1, "flow server saw no request")
+        self.assertEqual(result.flow.get("observer_exit"), 0)
+        self.assertGreater(result.screenshot_bytes, 0, "no screenshot bytes")
+        self.check_report(result, store, zero=True, attached=False)
+
+    @gate
+    def test_ff_pinbound_never_logs_in_or_signs(self):
+        """FF-PINBOUND: CERT_REQUIRED; selection races, login never happens."""
+        store, cred = self.seed()
+        key, cert = tls_server.make_server_credential(self.work / "srv")
+        with tls_server.FlowServer(cert=cert, key=key, require_client_cert=True,
+                                   client_ca=cred.cert_pem) as flow:
+            result = cells.attach_drive(
+                "FF-PINBOUND", "firefox", self.work / "cell", flow.url,
+                flows.make_client_cert_visit(flow.url), store.lib,
+                register_module=store.lib, browser_env=store.env,
+                duration_seconds=ATTACH_DURATION, attach_grace_seconds=5,
+                extra_prefs=FIREFOX_STABLE_PREFS)
+            self.assertGreaterEqual(flow.connections, 1, "browser never connected")
+            self.assertEqual(flow.requests_served, 0, "request served without a cert?")
+            self.assertEqual(flow.client_certs_presented, 0, "client cert presented?!")
+        self.assertEqual(result.flow.get("profiler_exit"), 0)
+        self.assertFalse(result.flow.get("loaded", True), "client-cert flow loaded?!")
+        self.assertTrue(result.flow.get("mapped_at_end"), "module unmapped?!")
+        # Selection enumeration races the prompt failure (x0 or x16 across
+        # runs), so no count is pinned; login and signing never happen.
+        report = self.check_report(result, store, attached=True)
+        counts = oracle.module_counts(report, oracle.sha256_of(store.lib))
+        absent = oracle.check_absent(counts, ("C_Login", "C_Sign"))
+        self.assertEqual(absent, [], f"PIN boundary crossed: {absent}")
+
+    @gate
+    def test_cr_pinbound_stalls_before_any_token_use(self):
+        """CR-PINBOUND: CERT_REQUIRED; no selection without interactive login."""
+        store, cred = self.seed()
+        key, cert = tls_server.make_server_credential(self.work / "srv")
+        with tls_server.FlowServer(cert=cert, key=key, require_client_cert=True,
+                                   client_ca=cred.cert_pem) as flow:
+            result = cells.attach_drive(
+                "CR-PINBOUND", "chromium", self.work / "cell", flow.url,
+                flows.make_client_cert_visit(flow.url), store.lib,
+                register_module=store.lib, browser_env=store.env,
+                duration_seconds=ATTACH_DURATION, attach_grace_seconds=5,
+                extra_browser_args=CHROMIUM_STABLE_ARGS,
+                auto_select_cert=False)
+            self.assertGreaterEqual(flow.connections, 1, "browser never connected")
+            self.assertEqual(flow.requests_served, 0, "request served without a cert?")
+            self.assertEqual(flow.client_certs_presented, 0, "client cert presented?!")
+        self.assertEqual(result.flow.get("profiler_exit"), 0)
+        self.assertFalse(result.flow.get("loaded", True), "client-cert flow loaded?!")
+        self.assertFalse(result.flow.get("mapped_at_end"), "module mapped?!")
+        self.check_report(result, store, zero=True, attached=False)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

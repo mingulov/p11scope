@@ -366,3 +366,17 @@ fn completion_binds_minting_events_domain() {
     assert!(completion.binds_events(&EventsDomain::test_standin(11)));
     assert!(!completion.binds_events(&EventsDomain::test_standin(12)));
 }
+
+#[test]
+fn completion_minter_manufactures_nothing_for_unknown_domain() {
+    // DR37 A→B: the production minter polls genuine disposal only.
+    // An unknown domain (nothing wound down) polls pending — never a
+    // manufactured completion.
+    use crate::inventory_promotion::lifecycle::NativeCompletionSource as _;
+    let mut minter = super::NativeCompletionMinter::new();
+    let domain = crate::attach::capture::NativeDomainId::try_mint().expect("mint domain");
+    assert!(
+        minter.poll_completion(domain).is_none(),
+        "an unknown domain polls pending"
+    );
+}

@@ -1,7 +1,6 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! DR37 selected-lane lifecycle: the activation proof, the preparation
 //! worker service and the native-authority boundaries.
-#![cfg_attr(not(test), allow(dead_code))] // STAGED (DR37): reached once the driver polls the service.
 //!
 //! Decision record (joint DR37/H8 implementer; rationale beside each
 //! binding site):
@@ -60,7 +59,11 @@ use crate::attach::selected_detailed::{
     PreparedSelectedSession, SelectedConstructionPermit, SelectedPreparationFailure,
 };
 use crate::attach::{BackendSelection, Scope, Session};
+#[cfg(test)]
+use crate::discovery::caller_registry::{CallerId, MappingEvidence, ModuleId, UseCoverage};
 use crate::discovery::engine::inventory_coordinator::semantics::PromotionInstallCapacity;
+#[cfg(test)]
+use crate::inventory_present::Presentation;
 use crate::inventory_semantics::AttestedSubset;
 use crate::inventory_semantics::selected::ProvisionalSelectedLane;
 use p11scope_ebpf_common::ImageIdentity;
@@ -78,6 +81,7 @@ pub(crate) struct SelectedActivationBinding {
 }
 
 impl SelectedActivationBinding {
+    #[cfg_attr(not(test), allow(dead_code))] // STAGED (DR37): read by tests and the native minter.
     pub(crate) fn new(domain: NativeDomainId, generation: u64, image: ImageIdentity) -> Self {
         Self {
             domain,
@@ -97,14 +101,17 @@ impl SelectedActivationBinding {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // STAGED (DR37): read by tests and the native minter.
     pub(crate) fn domain(self) -> NativeDomainId {
         self.domain
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // STAGED (DR37): read by tests and the native minter.
     pub(crate) fn generation(self) -> u64 {
         self.generation
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // STAGED (DR37): read by tests and the native minter.
     pub(crate) fn image(self) -> ImageIdentity {
         self.image
     }
@@ -120,8 +127,16 @@ pub(crate) struct NativeCasReceipt {
 }
 
 impl NativeCasReceipt {
-    pub(crate) fn binding(&self) -> SelectedActivationBinding {
-        self.binding
+    /// Production mint, called only by a [`NativeActivationSource`]
+    /// implementation immediately after its genuine `CLOSED -> ACTIVE`
+    /// CAS with readback. The type cannot name the native-only
+    /// caller; the trust chain carries it instead: the resolver
+    /// (native-owned) supplies the service's source, so only a
+    /// native implementation's receipts reach the proof mint in
+    /// production. Test doubles script instead and never run live.
+    #[cfg_attr(not(test), allow(dead_code))] // STAGED (DR37): called by the native minter.
+    pub(crate) fn minted(binding: SelectedActivationBinding) -> Self {
+        Self { binding }
     }
 
     pub(crate) fn matches(&self, binding: SelectedActivationBinding) -> bool {
@@ -146,6 +161,7 @@ impl std::fmt::Debug for NativeCasReceipt {
 /// maps every variant to `PromotionRefusal::ActivationFailed`; the
 /// variants stay distinct so native tests pin the state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))] // STAGED (DR37): constructed by the native minter.
 pub(crate) enum NativeActivationRefusal {
     /// The state cell was not `CLOSED` (already active, terminal, or
     /// never published): the CAS ran and failed closed.
@@ -179,6 +195,17 @@ pub(crate) struct SessionNativeCompletion {
 }
 
 impl SessionNativeCompletion {
+    /// Production mint, called only by a [`NativeCompletionSource`]
+    /// implementation after its genuine disposal proof (Q/drain
+    /// bounds, object-start scrub, joined producer detach). Same
+    /// trust chain as [`NativeCasReceipt::minted`]: only the
+    /// native-owned source's completions reach the retire entry in
+    /// production.
+    #[cfg_attr(not(test), allow(dead_code))] // STAGED (DR37): called by the native minter.
+    pub(crate) fn completed(domain: NativeDomainId) -> Self {
+        Self { domain }
+    }
+
     pub(crate) fn domain(&self) -> NativeDomainId {
         self.domain
     }
@@ -220,6 +247,11 @@ pub(crate) enum ProofMintRefusal {
 /// validation plus a matching native receipt; consumed by value by
 /// the coordinator install entry. No `Clone`, no numeric constructor.
 pub(crate) struct SelectedActivationProof {
+    // STAGED (DR37): the audit link from proof to taken request. No
+    // current reader: the single-flight Installing state already
+    // holds the request, so no keying is needed. The unification
+    // wave records this link in finalizer history at install.
+    #[allow(dead_code)]
     request: RequestId,
     pair: PromotionPair,
     binding: SelectedActivationBinding,
@@ -247,22 +279,16 @@ impl SelectedActivationProof {
         })
     }
 
-    pub(crate) fn request(&self) -> RequestId {
-        self.request
-    }
-
     pub(crate) fn pair(&self) -> PromotionPair {
         self.pair
     }
 
-    pub(crate) fn binding(&self) -> SelectedActivationBinding {
-        self.binding
-    }
-
     /// Whether this proof authorizes installing a lane with this
-    /// binding. The install entry calls this before moving anything.
+    /// binding: the minted binding must name the lane, and the
+    /// retained receipt must confirm the lane independently. The
+    /// install entry calls this before moving anything.
     pub(crate) fn matches_lane(&self, lane: SelectedActivationBinding) -> bool {
-        self.binding == lane
+        self.binding == lane && self.cas.matches(lane)
     }
 }
 
@@ -410,6 +436,21 @@ pub(crate) struct PendingInstall {
 }
 
 impl PendingInstall {
+    /// Rebuild a handoff from its genuine parts (driver install
+    /// refusal path): the parts are unforgeable values, so the only
+    /// constructible handoffs are real ones.
+    pub(crate) fn from_parts(
+        proof: SelectedActivationProof,
+        lane: ProvisionalSelectedLane,
+        capacity: PromotionInstallCapacity,
+    ) -> Self {
+        Self {
+            proof,
+            lane,
+            capacity,
+        }
+    }
+
     pub(crate) fn into_parts(
         self,
     ) -> (
@@ -483,6 +524,21 @@ impl std::fmt::Debug for DisposingOutcome {
 enum UnprovedOwner {
     Preparation(SelectedPreparationFailure),
     Lane(ProvisionalSelectedLane),
+}
+
+impl std::fmt::Debug for UnprovedOwner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // Retained for process lifetime as the non-retry record;
+            // formatted only for diagnostics.
+            Self::Preparation(failure) => f
+                .debug_tuple("UnprovedOwner::Preparation")
+                .field(&failure.semantic_refusal())
+                .field(&failure.cleanup_status())
+                .finish(),
+            Self::Lane(lane) => f.debug_tuple("UnprovedOwner::Lane").field(lane).finish(),
+        }
+    }
 }
 
 enum ServiceState {
@@ -898,6 +954,138 @@ fn settle_outcome_best_effort(outcome: PreparationOutcome) {
     }
 }
 
+/// Tests-only one-edge view (capture 11, revision 3, pair c3/m5)
+/// for queueing promotion requests through a live Display or Promoter.
+#[cfg(test)]
+pub(crate) fn scripted_promotion_view_for_test() -> std::sync::Arc<super::PromotionView> {
+    use crate::discovery::caller_registry::MappingState;
+    use crate::inventory_present::{
+        Activity, BudgetView, Capture, EdgeSemanticsView, EdgeView, Presence,
+    };
+    let edge = EdgeView {
+        caller: CallerId(3),
+        module: ModuleId(5),
+        mapping: MappingState::Mapped,
+        mapping_reason: None,
+        mapping_evidence: MappingEvidence::DeepScan,
+        mapping_first_seen_ns: 0,
+        mapping_last_seen_ns: 0,
+        mapping_interruptions: 0,
+        entry_count: 0,
+        entry_saturated: false,
+        entry_first_seen_ns: None,
+        entry_last_seen_ns: None,
+        entry_in_flight: false,
+        entry_observation: "",
+        coverage: UseCoverage::Counted {
+            since_ns: 0,
+            lossy: false,
+        },
+        presence: Presence::Mapped,
+        capture: Capture::Armed,
+        activity: Activity::Quiet,
+        semantics: EdgeSemanticsView {
+            label: "",
+            mechanisms: Vec::new(),
+            operations: None,
+        },
+    };
+    let presentation = Presentation {
+        scope_label: String::new(),
+        started_ns: 0,
+        ended_ns: 0,
+        passes: 0,
+        usage_feed: false,
+        native_witnesses: crate::discovery::native_binding::BindingCensus {
+            rows: 0,
+            bound: 0,
+            unbound: std::collections::BTreeMap::new(),
+            pending: 0,
+            integrity: 0,
+        },
+        witness_placement: crate::discovery::caller_registry::WitnessPlacement {
+            edge: 0,
+            module: 0,
+            ambiguous: 0,
+            unresolved: 0,
+        },
+        caller_metadata: crate::caller_metadata::runtime::MetadataFrame::default(),
+        callers: Vec::new(),
+        modules: Vec::new(),
+        edges: vec![edge],
+        instances: Vec::new(),
+        semantic_edges: Vec::new(),
+        gaps: Vec::new(),
+        gaps_suppressed: 0,
+        budgets: BudgetView {
+            callers_limit: 0,
+            callers_occupied: 0,
+            callers_refused: 0,
+            modules_limit: 0,
+            modules_occupied: 0,
+            modules_refused: 0,
+            edges_limit: 0,
+            edges_occupied: 0,
+            edges_refused: 0,
+            endpoints_limit: 0,
+            endpoints_occupied: 0,
+            endpoints_refused: 0,
+            inventory_endpoints_limit: 0,
+            inventory_endpoints_occupied: 0,
+            inventory_endpoints_refused: 0,
+            inventory_modules_limit: 0,
+            inventory_modules_occupied: 0,
+            inventory_modules_refused: 0,
+            counters_observed: 0,
+            counters_saturated: 0,
+            semantic_limit: 0,
+            semantic_occupied: 0,
+            semantic_unknown_edges: 0,
+            semantic_refused: 0,
+            instances_limit: 0,
+            instances_occupied: 0,
+            instances_refused: 0,
+            instance_semantic_occupied: 0,
+            instance_semantic_unknown_edges: 0,
+            instance_semantic_refused: 0,
+            instance_negative_limit: 0,
+            instance_negative_occupied: 0,
+            instance_negative_refused: 0,
+            instance_negative_exhausted: false,
+            instance_semantic_resources: crate::inventory_present::SemanticResourceView::default(),
+            retained_limit: 0,
+            retained: 0,
+            retained_suppressed: 0,
+            preadmission: None,
+        },
+        semantic_capture: crate::inventory_semantics::SemanticCaptureSummary::default(),
+        object_observations: crate::key_operation_projection::ObjectObservations::unavailable(
+            0,
+            "bootstrap_unavailable",
+        ),
+    };
+    std::sync::Arc::new(super::PromotionView::new(
+        super::CaptureId::new(11),
+        super::ViewRevision::new(3),
+        std::sync::Arc::new(presentation),
+    ))
+}
+
+/// Tests-only taken request over the scripted view, with its live
+/// promoter for applying the service status updates.
+#[cfg(test)]
+pub(crate) fn taken_request_for_test() -> (super::Promoter, PromotionRequest) {
+    use crate::discovery::caller_registry::{CallerId, ModuleId};
+    let mut promoter = super::Promoter::new();
+    assert!(promoter.enable(super::CaptureId::new(11)));
+    let view = scripted_promotion_view_for_test();
+    promoter
+        .request(std::sync::Arc::clone(&view), CallerId(3), ModuleId(5))
+        .expect("exact pair queues");
+    let request = promoter.take_request().expect("mailbox holds it");
+    (promoter, request)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -919,130 +1107,6 @@ mod tests {
 
     fn binding() -> SelectedActivationBinding {
         SelectedActivationBinding::new(domain(), 7, image(71, 72))
-    }
-
-    /// One taken request over a minimal one-edge view, with its live
-    /// promoter for applying the service's status updates.
-    fn taken_request() -> (super::super::Promoter, PromotionRequest) {
-        use crate::discovery::caller_registry::MappingState;
-        use crate::inventory_present::{
-            Activity, BudgetView, Capture, EdgeSemanticsView, EdgeView, Presence,
-        };
-        let edge = EdgeView {
-            caller: CallerId(3),
-            module: ModuleId(5),
-            mapping: MappingState::Mapped,
-            mapping_reason: None,
-            mapping_evidence: MappingEvidence::DeepScan,
-            mapping_first_seen_ns: 0,
-            mapping_last_seen_ns: 0,
-            mapping_interruptions: 0,
-            entry_count: 0,
-            entry_saturated: false,
-            entry_first_seen_ns: None,
-            entry_last_seen_ns: None,
-            entry_in_flight: false,
-            entry_observation: "",
-            coverage: UseCoverage::Counted {
-                since_ns: 0,
-                lossy: false,
-            },
-            presence: Presence::Mapped,
-            capture: Capture::Armed,
-            activity: Activity::Quiet,
-            semantics: EdgeSemanticsView {
-                label: "",
-                mechanisms: Vec::new(),
-                operations: None,
-            },
-        };
-        let presentation = Presentation {
-            scope_label: String::new(),
-            started_ns: 0,
-            ended_ns: 0,
-            passes: 0,
-            usage_feed: false,
-            native_witnesses: crate::discovery::native_binding::BindingCensus {
-                rows: 0,
-                bound: 0,
-                unbound: std::collections::BTreeMap::new(),
-                pending: 0,
-                integrity: 0,
-            },
-            witness_placement: crate::discovery::caller_registry::WitnessPlacement {
-                edge: 0,
-                module: 0,
-                ambiguous: 0,
-                unresolved: 0,
-            },
-            caller_metadata: crate::caller_metadata::runtime::MetadataFrame::default(),
-            callers: Vec::new(),
-            modules: Vec::new(),
-            edges: vec![edge],
-            instances: Vec::new(),
-            semantic_edges: Vec::new(),
-            gaps: Vec::new(),
-            gaps_suppressed: 0,
-            budgets: BudgetView {
-                callers_limit: 0,
-                callers_occupied: 0,
-                callers_refused: 0,
-                modules_limit: 0,
-                modules_occupied: 0,
-                modules_refused: 0,
-                edges_limit: 0,
-                edges_occupied: 0,
-                edges_refused: 0,
-                endpoints_limit: 0,
-                endpoints_occupied: 0,
-                endpoints_refused: 0,
-                inventory_endpoints_limit: 0,
-                inventory_endpoints_occupied: 0,
-                inventory_endpoints_refused: 0,
-                inventory_modules_limit: 0,
-                inventory_modules_occupied: 0,
-                inventory_modules_refused: 0,
-                counters_observed: 0,
-                counters_saturated: 0,
-                semantic_limit: 0,
-                semantic_occupied: 0,
-                semantic_unknown_edges: 0,
-                semantic_refused: 0,
-                instances_limit: 0,
-                instances_occupied: 0,
-                instances_refused: 0,
-                instance_semantic_occupied: 0,
-                instance_semantic_unknown_edges: 0,
-                instance_semantic_refused: 0,
-                instance_negative_limit: 0,
-                instance_negative_occupied: 0,
-                instance_negative_refused: 0,
-                instance_negative_exhausted: false,
-                instance_semantic_resources:
-                    crate::inventory_present::SemanticResourceView::default(),
-                retained_limit: 0,
-                retained: 0,
-                retained_suppressed: 0,
-                preadmission: None,
-            },
-            semantic_capture: crate::inventory_semantics::SemanticCaptureSummary::default(),
-            object_observations: crate::key_operation_projection::ObjectObservations::unavailable(
-                0,
-                "bootstrap_unavailable",
-            ),
-        };
-        let mut promoter = super::super::Promoter::new();
-        assert!(promoter.enable(super::super::CaptureId::new(11)));
-        let view = Arc::new(super::super::PromotionView::new(
-            super::super::CaptureId::new(11),
-            super::super::ViewRevision::new(3),
-            Arc::new(presentation),
-        ));
-        promoter
-            .request(Arc::clone(&view), CallerId(3), ModuleId(5))
-            .expect("exact pair queues");
-        let request = promoter.take_request().expect("mailbox holds it");
-        (promoter, request)
     }
 
     fn capacity() -> PromotionInstallCapacity {
@@ -1117,19 +1181,19 @@ mod tests {
 
     #[test]
     fn proof_mint_binds_request_pair_and_binding() {
-        let (_promoter, request) = taken_request();
+        let (_promoter, request) = taken_request_for_test();
         let lane = binding();
         let proof = SelectedActivationProof::mint(&request, lane, NativeCasReceipt::scripted(lane))
             .expect("matching receipt mints");
-        assert_eq!(proof.request(), request.id());
         assert_eq!(proof.pair(), PromotionPair::new(3, 5));
-        assert_eq!(proof.binding(), lane);
         assert!(proof.matches_lane(lane));
+        let other = SelectedActivationBinding::new(lane.domain(), lane.generation(), image(9, 9));
+        assert!(!proof.matches_lane(other));
     }
 
     #[test]
     fn proof_mint_refuses_foreign_stale_and_mismatched_receipts() {
-        let (_promoter, request) = taken_request();
+        let (_promoter, request) = taken_request_for_test();
         let lane = binding();
         let foreign = SelectedActivationBinding::new(domain(), lane.generation(), lane.image());
         let stale =
@@ -1153,8 +1217,8 @@ mod tests {
 
     #[test]
     fn second_start_while_busy_refuses_and_keeps_first() {
-        let (_promoter, first) = taken_request();
-        let (_promoter, second) = taken_request();
+        let (_promoter, first) = taken_request_for_test();
+        let (_promoter, second) = taken_request_for_test();
         let mut service = SelectedLifecycleService::new();
         let (gate, release) = std::sync::mpsc::channel::<()>();
         service
@@ -1183,7 +1247,7 @@ mod tests {
 
     #[test]
     fn failed_job_disposes_and_reports_preparation_failed() {
-        let (mut promoter, request) = taken_request();
+        let (mut promoter, request) = taken_request_for_test();
         let mut service = SelectedLifecycleService::new();
         service
             .start(request, capacity(), stub_source(None).0, || {
@@ -1205,7 +1269,7 @@ mod tests {
 
     #[test]
     fn worker_panic_reports_preparation_failed_without_installing() {
-        let (mut promoter, request) = taken_request();
+        let (mut promoter, request) = taken_request_for_test();
         let mut service = SelectedLifecycleService::new();
         service
             .start(
@@ -1230,7 +1294,7 @@ mod tests {
 
     #[test]
     fn cancel_before_delivery_skips_cas_and_confirms_cancelled() {
-        let (mut promoter, request) = taken_request();
+        let (mut promoter, request) = taken_request_for_test();
         let mut service = SelectedLifecycleService::new();
         let (gate, release) = std::sync::mpsc::channel::<()>();
         let (source, calls) = stub_source(None);

@@ -3224,6 +3224,29 @@ impl Display {
     /// (or a poll after the runtime already reported on the request)
     /// yields nothing; accepted work is never overwritten by a later
     /// keypress (that keypress reports busy instead).
+    /// Tests-only request injection: the same promoter path the
+    /// promotion key handler drives, minus UI selection.
+    #[cfg(test)]
+    pub(crate) fn queue_promotion_request_for_test(
+        &mut self,
+        view: Arc<PromotionView>,
+        caller: CallerId,
+        provider: ModuleId,
+    ) -> Result<crate::inventory_promotion::RequestId, PromotionRequestError> {
+        let id = self.promoter.request(view, caller, provider)?;
+        self.sync_promotion_snapshot();
+        Ok(id)
+    }
+
+    /// Tests-only cancel: the same promoter path the cancel key
+    /// handler drives.
+    #[cfg(test)]
+    pub(crate) fn cancel_promotion_for_test(&mut self) -> PromotionCancel {
+        let cancel = self.promoter.cancel();
+        self.sync_promotion_snapshot();
+        cancel
+    }
+
     pub(crate) fn take_promotion_request(&mut self) -> Option<PromotionRequest> {
         self.promoter.take_request()
     }

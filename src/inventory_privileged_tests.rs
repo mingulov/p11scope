@@ -390,6 +390,11 @@ fn drive<L: CaptureLane<PidPin>>(
         display: None,
         semantic: None,
         semantic_staged: false,
+        lifecycle: crate::inventory_promotion::lifecycle::SelectedLifecycleService::new(),
+        completion_source: None,
+        pending_install: None,
+        installed_promotion: None,
+        retiring: None,
         identity: None,
     };
     let stop = Cell::new(false);
@@ -2539,6 +2544,11 @@ fn privileged_native_lane_sigint_during_extend_lp64() -> Result<()> {
         display: None,
         semantic: None,
         semantic_staged: false,
+        lifecycle: crate::inventory_promotion::lifecycle::SelectedLifecycleService::new(),
+        completion_source: None,
+        pending_install: None,
+        installed_promotion: None,
+        retiring: None,
         identity: None,
     };
     let stop = || flag.stopped();

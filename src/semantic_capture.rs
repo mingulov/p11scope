@@ -5807,5 +5807,153 @@ mod tests {
                 );
             }
         }
+
+        /// Prompt commitment retains no batches across quanta: the SAME
+        /// 2600-record population drains through the production committing
+        /// drain over 4 vs 16 serviced quanta. The population mixes 2400
+        /// completing file-0 Init/Sign pairs at zero fault (genuine
+        /// completions, so the run is not vacuous), 100 max-stamp-fault
+        /// file-0 calls (fault outcomes on the completing path), and 100
+        /// max-fault file-1 calls held in `awaiting` across every quantum
+        /// (failed scans never resolve). At the 1024-record tick limit the
+        /// population commits as exactly 3 batches (1024/1024/552) in both
+        /// runs; the extra 12 empty quanta retain nothing — live requested
+        /// bytes, pool charges and completed operations are identical,
+        /// proving serviced quanta never accumulate batches.
+        #[test]
+        fn prompt_drain_many_quanta_retain_no_batches() {
+            struct Run {
+                live_bytes: usize,
+                peak_bytes: usize,
+                cumulative_requested_bytes: usize,
+                allocation_requests: usize,
+                pool_charged_delta: usize,
+                completed: u64,
+            }
+
+            let mut runs = Vec::new();
+            for quanta in [4usize, 16usize] {
+                let image = ImageIdentity {
+                    task_cookie: 7,
+                    exec_id: 1,
+                };
+                let mut fixture = bound_lane_scene(image);
+                let domain = fixture.lane.domain();
+                let mut h0 = H0TestIo::new(domain);
+                h0.io.output_image = Some(image);
+                // Held calls: file-1 scans fail, so these stay in
+                // `awaiting` across every serviced quantum, at max fault.
+                h0.io.fail_file = Some(1);
+                for index in 0..100 {
+                    let name = if index % 2 == 0 {
+                        "C_SignInit"
+                    } else {
+                        "C_Sign"
+                    };
+                    h0.io.semantic_call(name, 1, u32::MAX);
+                    h0.io.records.back_mut().unwrap().base.event.image = image;
+                }
+                // Max-fault outcomes on the completing path.
+                for index in 0..100 {
+                    let name = if index % 2 == 0 {
+                        "C_SignInit"
+                    } else {
+                        "C_Sign"
+                    };
+                    h0.io.semantic_call(name, 0, u32::MAX);
+                    h0.io.records.back_mut().unwrap().base.event.image = image;
+                }
+                // Genuine completions at zero fault: 1200 Init/Sign pairs.
+                for index in 0..2400 {
+                    let name = if index % 2 == 0 {
+                        "C_SignInit"
+                    } else {
+                        "C_Sign"
+                    };
+                    h0.io.semantic_call(name, 0, 0);
+                    h0.io.records.back_mut().unwrap().base.event.image = image;
+                }
+                // 16 quanta age 1.6s: inside the 2s receipt window, so
+                // prompt commits validate fresh in both runs.
+                h0.tick_advance = Duration::from_millis(100);
+                h0.quiesce_after = quanta;
+                fixture.lane.install_test_io(Box::new(h0));
+                let pool_before = fixture
+                    .scene
+                    .coordinator
+                    .registry()
+                    .semantic_resource_snapshot();
+                let (summary, peak, allocs, requested) =
+                    crate::test_alloc::counted_peak_during(|| {
+                        fixture.lane.run_semantic_drain_committing(
+                            &mut fixture.scene.coordinator,
+                            &[],
+                            Instant::now,
+                        )
+                    });
+                assert!(!peak.incomplete, "quanta={quanta}: peak tracked");
+                assert!(summary.quiesced, "quanta={quanta}: quiesces");
+                assert_eq!(
+                    summary.drain_batches, 3,
+                    "quanta={quanta}: 2600 records commit as 3 batches"
+                );
+                let pool_after = fixture
+                    .scene
+                    .coordinator
+                    .registry()
+                    .semantic_resource_snapshot();
+                let rows = operation_edge_rows(&fixture.scene);
+                assert_eq!(rows.len(), 1, "quanta={quanta}: one edge row");
+                let completed = rows[0].4;
+                assert!(
+                    completed > 0,
+                    "quanta={quanta}: genuine pairs complete; the run is not vacuous"
+                );
+                runs.push((
+                    quanta,
+                    Run {
+                        live_bytes: peak.live_bytes,
+                        peak_bytes: peak.peak_bytes,
+                        cumulative_requested_bytes: requested,
+                        allocation_requests: allocs,
+                        pool_charged_delta: pool_after
+                            .charged_bytes
+                            .saturating_sub(pool_before.charged_bytes),
+                        completed,
+                    },
+                ));
+            }
+            let (short_quanta, short) = &runs[0];
+            let (long_quanta, long) = &runs[1];
+            assert_eq!(
+                (long.live_bytes, long.pool_charged_delta, long.completed),
+                (short.live_bytes, short.pool_charged_delta, short.completed),
+                "the extra {} serviced quanta retain nothing",
+                long_quanta - short_quanta
+            );
+            assert!(
+                long.peak_bytes >= long.live_bytes
+                    && long.cumulative_requested_bytes >= long.peak_bytes,
+                "peak labels order: cumulative >= peak >= live"
+            );
+            for (quanta, run) in &runs {
+                println!(
+                    "H3_MEM_PROMPT_DRAIN {{\"quanta\": {quanta}, \
+                     \"drain_batches\": 3, \
+                     \"peak_live_retained_bytes\": {}, \
+                     \"peak_transient_bytes\": {}, \
+                     \"cumulative_requested_bytes\": {}, \
+                     \"allocation_requests\": {}, \
+                     \"pool_charged_delta_bytes\": {}, \
+                     \"completed\": {}}}",
+                    run.live_bytes,
+                    run.peak_bytes - run.live_bytes,
+                    run.cumulative_requested_bytes,
+                    run.allocation_requests,
+                    run.pool_charged_delta,
+                    run.completed,
+                );
+            }
+        }
     }
 }

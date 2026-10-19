@@ -35516,6 +35516,455 @@ fn pressure_attempt_rotation_is_finite_and_keeps_serials() {
     );
 }
 
+/// Lane-A capacity (live256 stall), healthy twin: a pressure service pass
+/// for a viewless selected pid at a full view cap evicts exactly one
+/// exploratory view — never a pending-refresh, shielded, selected, or owner
+/// view — admits the selected pid, and completes its request with a genuine
+/// rescan, rearm and publication. Without the eviction the pass fails at
+/// view allocation and the episode rules every entry out without an attempt
+/// while the pending rotation suppresses the reconcile that could free a
+/// slot.
+#[test]
+fn pressure_service_pass_evicts_exploratory_view_to_admit_selected_at_capacity() {
+    let (mut fixture, mut engine, _armed, _record, mut session) = armed_seed_route(1);
+    engine.frame_work_budget_ns = u64::MAX;
+    engine.max_scan_pids = 2;
+    let seed_pid = engine.views[0].pid();
+    let seed_view = engine.views[0].id();
+    let selected = fixture.spawn_peer();
+    wait_peer_mapped(selected, "seed-provider.so");
+    assert!(
+        selected < 4_000_000 && selected != seed_pid,
+        "pid-order selection needs the live peer below the fake range"
+    );
+    // Retarget the pid scope at the viewless selected pid: the selected
+    // transaction serves it only when the scope enumerates it.
+    engine.scope = Scope::Pid(selected);
+    // The cap filler: a provider-free sleeper, exploratory by construction.
+    let mut sleeper = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("spawn ambient sleeper");
+    let ambient = sleeper.id();
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(1), ambient).unwrap());
+    engine.next_view_id = 2;
+    assert_eq!(engine.views.len(), engine.max_scan_pids);
+    assert!(
+        engine.exploratory_evictable(ProcessViewId(1)),
+        "the sleeper starts evictable"
+    );
+    // Full request map: the live selected request plus fabricated fillers
+    // above every real pid.
+    assert!(engine.request_refresh_consumed(selected, Some(1_200)));
+    for offset in 0..255u32 {
+        assert!(
+            engine.request_refresh_consumed(4_000_000 + offset, Some(2_000 + u64::from(offset)))
+        );
+    }
+    assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+    // Park a fresh head at the full map: one opportunity must serve the
+    // selected request through eviction, admission, rescan and rearm.
+    session.refuse_preflights([false, false]);
+    let scans_before = engine.deep_scans;
+    let arms_before = engine.loader_arms();
+    let mut records = vec![refresh_exec(6_000_000u32)];
+    let mut collect = Engine::collect_discovery_records;
+    engine
+        .process_discovery_records(
+            &mut session,
+            &mut records,
+            &mut PendingViewRetirements::new(),
+            &mut true,
+            &mut collect,
+            &mut PauseClosure::new(true),
+        )
+        .expect("the pass keeps the batch alive");
+    assert!(records.is_empty(), "the head waits parked while the pass serves");
+    assert_eq!(
+        engine.pressure_service_passes, 1,
+        "exactly one service pass ran"
+    );
+    assert_eq!(
+        engine.pressure_attempts, 1,
+        "the pass ran a real attempt instead of ruling the viewless selection out"
+    );
+    assert!(
+        !engine.refresh_requested.contains_key(&selected),
+        "the pass completes the selected request"
+    );
+    assert_eq!(
+        engine.exploratory_evictions, 1,
+        "the pass evicted exactly one exploratory view"
+    );
+    assert!(
+        !engine.views.iter().any(|view| view.pid() == ambient),
+        "the sleeper view is gone"
+    );
+    let selected_view = engine
+        .views
+        .iter()
+        .find(|view| view.pid() == selected)
+        .expect("the selected pid is admitted")
+        .id();
+    assert!(
+        !engine
+            .loader_registry
+            .ids_for_view(selected_view)
+            .is_empty(),
+        "the completion really rearmed"
+    );
+    assert!(
+        !session.attached_slots.is_empty(),
+        "the completion really published"
+    );
+    assert!(
+        engine.deep_scans > scans_before,
+        "the completion really rescanned"
+    );
+    assert!(
+        engine.loader_arms() > arms_before,
+        "the completion really armed"
+    );
+    // The seed obligation survives identical: the eviction touched only the
+    // explorer.
+    let seed_live = engine
+        .views
+        .iter()
+        .find(|view| view.id() == seed_view)
+        .expect("the seed view survives");
+    assert!(seed_live.still_the_same(), "the seed stays live");
+    assert!(
+        !engine.loader_registry.ids_for_view(seed_view).is_empty(),
+        "the seed context survives"
+    );
+    // The freed slot dispatches the parked head with zero loss.
+    assert!(
+        engine.pending_discovery_records.is_empty(),
+        "no re-park: the slot freed"
+    );
+    assert!(
+        engine.pressure_episode.is_none(),
+        "the episode ends with the freed slot"
+    );
+    assert!(
+        !engine.pressure_rotation_pending,
+        "no rotation outlives the freed slot"
+    );
+    assert!(
+        engine.refresh_requested.contains_key(&6_000_000u32),
+        "the head dispatches into the freed slot"
+    );
+    assert_eq!(
+        engine.discovery_truncated, 0,
+        "zero loss: no refusal anywhere"
+    );
+    let _ = sleeper.kill();
+    let _ = sleeper.wait();
+}
+
+/// Lane-A fail-closed twin: with no evictable view at a full cap, the
+/// service pass rules the viewless selection out without an attempt, evicts
+/// nothing, and leaves every request, serial, view, scan and arm untouched
+/// while the head waits parked. The capacity fix must preserve this when no
+/// clean victim exists.
+#[test]
+fn pressure_service_pass_without_evictable_view_rules_out_without_attempt() {
+    let (mut fixture, mut engine, _armed, _record, mut session) = armed_seed_route(1);
+    engine.frame_work_budget_ns = u64::MAX;
+    engine.max_scan_pids = 2;
+    let seed_view = engine.views[0].id();
+    let selected = fixture.spawn_peer();
+    wait_peer_mapped(selected, "seed-provider.so");
+    assert!(selected < 4_000_000);
+    engine.scope = Scope::Pid(selected);
+    // The cap filler carries scan evidence (dirty), so the classifier never
+    // offers it: no victim exists anywhere. Dirty-state surgery, not a
+    // helper-attached context: a context that bypassed the candidate
+    // pipeline would be healed mid-pass (missing-context rescan and rearm),
+    // which is exactly the ambient noise this twin excludes.
+    let mut sleeper = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("spawn dirty filler");
+    let filler = sleeper.id();
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(1), filler).unwrap());
+    engine.next_view_id = 2;
+    engine.exploratory_dirty.insert(ProcessViewId(1));
+    assert_eq!(engine.views.len(), engine.max_scan_pids);
+    assert!(
+        !engine.exploratory_evictable(ProcessViewId(1)),
+        "the evidence-holding filler is not evictable"
+    );
+    assert!(engine.request_refresh_consumed(selected, Some(1_200)));
+    for offset in 0..255u32 {
+        assert!(
+            engine.request_refresh_consumed(4_000_000 + offset, Some(2_000 + u64::from(offset)))
+        );
+    }
+    assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+    let serial_before = engine.refresh_requested[&selected].serial;
+    let scans_before = engine.deep_scans;
+    let arms_before = engine.loader_arms();
+    session.refuse_preflights([false, false]);
+    let mut records = vec![refresh_exec(6_000_000u32)];
+    let mut collect = Engine::collect_discovery_records;
+    engine
+        .process_discovery_records(
+            &mut session,
+            &mut records,
+            &mut PendingViewRetirements::new(),
+            &mut true,
+            &mut collect,
+            &mut PauseClosure::new(true),
+        )
+        .expect("the ruled-out pass keeps the batch alive");
+    assert!(records.is_empty(), "the head waits parked");
+    assert_eq!(
+        engine.pressure_service_passes, 1,
+        "one pass ran"
+    );
+    assert_eq!(
+        engine.pressure_attempts, 0,
+        "no attempt without a victim"
+    );
+    assert_eq!(engine.exploratory_evictions, 0, "nothing evicted");
+    assert_eq!(engine.views.len(), 2, "no view admitted, none removed");
+    for view in &engine.views {
+        assert!(view.still_the_same(), "every view stays live");
+    }
+    assert!(
+        !engine.loader_registry.ids_for_view(seed_view).is_empty(),
+        "the seed context survives"
+    );
+    assert_eq!(
+        engine.refresh_requested[&selected].serial, serial_before,
+        "the ruled-out request keeps its serial"
+    );
+    assert!(
+        engine
+            .pressure_episode
+            .as_ref()
+            .is_some_and(|episode| episode.ruled_out.contains(&selected)),
+        "the unserviceable selection is ruled out"
+    );
+    assert_eq!(engine.deep_scans, scans_before, "no scan ran");
+    assert_eq!(engine.loader_arms(), arms_before, "no arm ran");
+    assert_eq!(
+        engine.pending_discovery_records.len(),
+        1,
+        "the head re-parks"
+    );
+    assert!(engine.pressure_rotation_pending, "rotation continues");
+    assert_eq!(
+        engine.discovery_truncated, 0,
+        "ruled out is not refused"
+    );
+    let _ = sleeper.kill();
+    let _ = sleeper.wait();
+}
+
+/// Lane-A shield twin: the classifier alone would evict the parked head's
+/// exploratory view, but the parked-prefix shield forbids it, so a pass with
+/// no other victim rules out without an attempt and evicts nothing.
+#[test]
+fn pressure_service_pass_never_evicts_parked_head_view() {
+    let (mut fixture, mut engine, _armed, _record, mut session) = armed_seed_route(1);
+    engine.frame_work_budget_ns = u64::MAX;
+    engine.max_scan_pids = 2;
+    let selected = fixture.spawn_peer();
+    wait_peer_mapped(selected, "seed-provider.so");
+    assert!(selected < 4_000_000);
+    engine.scope = Scope::Pid(selected);
+    // The cap filler is exploratory AND the parked head's own view: only the
+    // shield stands between it and eviction.
+    let mut headpeer = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("spawn head peer");
+    let head_pid = headpeer.id();
+    assert!(head_pid != selected);
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(1), head_pid).unwrap());
+    engine.next_view_id = 2;
+    assert!(
+        engine.exploratory_evictable(ProcessViewId(1)),
+        "the classifier alone would evict the head view"
+    );
+    assert!(engine.request_refresh_consumed(selected, Some(1_200)));
+    for offset in 0..255u32 {
+        assert!(
+            engine.request_refresh_consumed(4_000_000 + offset, Some(2_000 + u64::from(offset)))
+        );
+    }
+    assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+    // The parked prefix protects the head pid: the shield covers exactly
+    // the in-pass window where the classifier is blind to the parked record
+    // (it sits in the pass-local prefix, not the pending queue).
+    let setup_protection = engine.pressure_protection_for(&[refresh_exec(head_pid)], &[]);
+    assert!(
+        setup_protection.pids.contains(&head_pid),
+        "the parked head is protected"
+    );
+    session.refuse_preflights([false, false]);
+    let mut records = vec![refresh_exec(head_pid)];
+    let mut collect = Engine::collect_discovery_records;
+    engine
+        .process_discovery_records(
+            &mut session,
+            &mut records,
+            &mut PendingViewRetirements::new(),
+            &mut true,
+            &mut collect,
+            &mut PauseClosure::new(true),
+        )
+        .expect("the shielded pass keeps the batch alive");
+    assert_eq!(
+        engine.pressure_service_passes, 1,
+        "the matched head parked and ran one pass"
+    );
+    assert_eq!(
+        engine.pressure_attempts, 0,
+        "the shielded victim blocks the attempt"
+    );
+    assert_eq!(
+        engine.exploratory_evictions, 0,
+        "the shielded view survives"
+    );
+    // No post-pass classifier check: the re-parked head record sits in the
+    // pending queue now, so the queued-record exclusion covers the view in
+    // this window by design. The shield covered the in-pass window, where
+    // the record was pass-local and the classifier was blind to it.
+    let head_live = engine
+        .views
+        .iter()
+        .find(|view| view.pid() == head_pid)
+        .expect("the head view survives");
+    assert!(head_live.still_the_same(), "the head stays live");
+    assert!(
+        engine.refresh_requested.contains_key(&selected),
+        "the ruled-out request is retained"
+    );
+    assert_eq!(
+        engine.pending_discovery_records.len(),
+        1,
+        "the head re-parks"
+    );
+    assert_eq!(
+        engine.discovery_truncated, 0,
+        "ruled out is not refused"
+    );
+    let _ = headpeer.kill();
+    let _ = headpeer.wait();
+}
+
+/// Lane-A P3, healthy twin: at a full view cap with no evictable view, an
+/// ordinary tick completes a pending provider-free newcomer without
+/// admitting any view — a generation-pinned probationary scan proves
+/// provider-freedom — instead of deferring it forever. Views, tickets and
+/// obligations are untouched; the scan is charged.
+#[test]
+fn probationary_probe_completes_provider_free_newcomer_at_capacity() {
+    let (mut fixture, mut engine, _armed, _record, _session) = armed_seed_route(1);
+    engine.frame_work_budget_ns = u64::MAX;
+    engine.max_scan_pids = 2;
+    // Dirty-state surgery for the cap filler (see the fail-closed twin):
+    // evidence-holding and never evictable, with no helper-attached
+    // context that the tick would heal with its own scan.
+    let filler = fixture.spawn_peer();
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(1), filler).unwrap());
+    engine.next_view_id = 2;
+    engine.exploratory_dirty.insert(ProcessViewId(1));
+    let seed_pid = engine.views[0].pid();
+    let mut head = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("spawn provider-free newcomer");
+    let head_pid = head.id();
+    // Cgroup scope naming exactly the retained pids plus the viewless
+    // newcomer: hermetic enumeration, over-cap ticks, no retirements.
+    let dir = tempfile::tempdir().expect("a scope directory");
+    let listing = format!("{seed_pid}\n{filler}\n{head_pid}\n");
+    std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
+    engine.scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
+    engine.module_hints = vec![fixture._dir.path().join("seed-provider.so")];
+    assert_eq!(engine.views.len(), engine.max_scan_pids);
+    assert!(
+        !engine.exploratory_evictable(ProcessViewId(1)),
+        "no victim: the seed is armed, the filler holds evidence"
+    );
+    assert!(engine.request_refresh_consumed(head_pid, Some(1_200)));
+    let scans_before = engine.deep_scans;
+    refresh_inventory_once(&mut engine);
+    assert!(
+        !engine.refresh_requested.contains_key(&head_pid),
+        "the provider-free newcomer completes without a view"
+    );
+    assert_eq!(engine.views.len(), 2, "no view admitted, none removed");
+    for view in &engine.views {
+        assert!(view.still_the_same(), "every view stays live");
+    }
+    assert!(
+        engine.deep_scans > scans_before,
+        "the probationary scan is charged"
+    );
+    assert_eq!(engine.exploratory_evictions, 0, "nothing evicted");
+    assert_eq!(
+        engine.discovery_truncated, 0,
+        "completion is not loss"
+    );
+    let _ = head.kill();
+    let _ = head.wait();
+}
+
+/// Lane-A P3, fail-closed twin: the same tick must NOT viewless-complete a
+/// pending newcomer whose probationary scan finds a provider — it stays
+/// queued for a real view and arm. The probe ran (charged scan) and refused.
+#[test]
+fn probationary_probe_keeps_provider_bearing_newcomer_queued_at_capacity() {
+    let (mut fixture, mut engine, _armed, _record, _session) = armed_seed_route(1);
+    engine.frame_work_budget_ns = u64::MAX;
+    engine.max_scan_pids = 2;
+    // Dirty-state surgery for the cap filler (see the fail-closed twin).
+    let filler = fixture.spawn_peer();
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(1), filler).unwrap());
+    engine.next_view_id = 2;
+    engine.exploratory_dirty.insert(ProcessViewId(1));
+    let seed_pid = engine.views[0].pid();
+    let provider = fixture.spawn_peer();
+    wait_peer_mapped(provider, "seed-provider.so");
+    let dir = tempfile::tempdir().expect("a scope directory");
+    let listing = format!("{seed_pid}\n{filler}\n{provider}\n");
+    std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
+    engine.scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
+    engine.module_hints = vec![fixture._dir.path().join("seed-provider.so")];
+    assert_eq!(engine.views.len(), engine.max_scan_pids);
+    assert!(engine.request_refresh_consumed(provider, Some(1_200)));
+    let scans_before = engine.deep_scans;
+    refresh_inventory_once(&mut engine);
+    assert!(
+        engine.refresh_requested.contains_key(&provider),
+        "the provider-bearing newcomer stays queued for a real view"
+    );
+    assert!(
+        engine.deep_scans > scans_before,
+        "the probe ran and found the provider"
+    );
+    assert_eq!(engine.views.len(), 2, "no view admitted, none removed");
+    assert_eq!(
+        engine.discovery_truncated, 0,
+        "queued is not loss"
+    );
+}
+
 /// H5 zero-quantum: a service pass that cannot attempt any scan defers
 /// every request with serials and ages intact and refuses the head once;
 /// a later pass with a working clock services it.

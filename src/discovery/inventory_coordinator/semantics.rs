@@ -10,13 +10,18 @@ mod promotion;
 #[cfg(test)]
 use crate::discovery::caller_registry::OsProcessSource;
 use crate::discovery::caller_registry::instance_input::{
-    CallEvidence, CallStanding, ConversionRefusal, InstanceReason, admit_call_from_evidence,
-    admit_registration_from_coverage, finalize_invalidation, tail_loss_from_negative,
+    AdmittedInstanceCall, CallEvidence, CallStanding, ConversionRefusal, InstanceReason,
+    admit_call_from_evidence, admit_registration_from_coverage, finalize_invalidation,
+    tail_loss_from_negative,
 };
+use crate::discovery::caller_registry::{CallerLifecycle, ModuleLifecycle};
 use crate::discovery::instances::{MAX_INSTANCES, MAX_PENDING};
 #[cfg(test)]
 use crate::discovery::native_binding::CallerLookup;
-use crate::inventory_semantics::{LaneNegative, SemanticRefusal};
+use crate::inventory_promotion::lifecycle::{SelectedActivationProof, SessionNativeCompletion};
+use crate::inventory_promotion::{PromotionPair, PromotionRefusal};
+use crate::inventory_semantics::selected::ProvisionalSelectedLane;
+use crate::inventory_semantics::{AttestedSemanticLane, LaneNegative, SemanticRefusal};
 use crate::inventory_semantics::{PreparedSemanticAdmission, SemanticProviderTarget};
 use crate::process::PidPin;
 use crate::semantic_capture::{
@@ -605,6 +610,13 @@ pub(crate) struct SemanticBindingSet {
     /// Accepted receipts that could not retain canonical custody (for example
     /// a divergent H0 Arc or a full history) remain refusal-only for later execs.
     refused_successors: HashMap<CallerId, PublishedSemanticSuccessor>,
+    /// The installed promotion capacity's storage charge (D5/1D): the
+    /// pre-reserved destination collections installed below hold
+    /// real allocations, so their lease moves here and lives as
+    /// long as they do. Dropping the lease while the storage is
+    /// alive would refund live bytes (transient underaccounting);
+    /// the install replaces collections before replacing the lease.
+    install_lease: Option<ResourceLease>,
 }
 
 /// Accepted-scan history is negative-only: its image can forbid a later join,
@@ -669,7 +681,88 @@ impl SemanticBindingSet {
             admission_images: HashMap::new(),
             successors: HashMap::new(),
             refused_successors: HashMap::new(),
+            install_lease: None,
         }
+    }
+
+    /// Install pre-reserved destination storage for a newly promoted
+    /// domain (DR37 allocation-free install): the capacity's paid
+    /// collections become this set's bindings, index and supported
+    /// history, and its storage lease moves into `install_lease`.
+    /// The set must be empty: any retained entries (however
+    /// domain-keyed) refuse with the capacity unconsumed and the set
+    /// untouched, so no other domain's entries are ever dropped by an
+    /// install. Successor maps are not swapped (retire clears the old
+    /// domain's; other domains' are preserved in place). Zero
+    /// allocations: field moves only.
+    #[cfg_attr(not(test), allow(dead_code))] // STAGED (DR37): called by install_selected_lane.
+    pub(crate) fn install_capacity(
+        &mut self,
+        capacity: PromotionInstallCapacity,
+    ) -> Result<(), PromotionInstallCapacity> {
+        if self.bindings.is_empty() && self.index.is_empty() && self.admission_images.is_empty() {
+            let (bindings, index, admission_images, storage) = capacity.into_storage();
+            // Drop replaced (empty) collections before replacing the
+            // lease: live bytes stay accounted until freed.
+            self.bindings = bindings;
+            self.index = index;
+            self.admission_images = admission_images;
+            self.cursor = 0;
+            self.refresh_cursor = None;
+            self.install_lease = Some(storage);
+            Ok(())
+        } else {
+            Err(capacity)
+        }
+    }
+
+    /// Retire one completed domain's entries (DR37 A→B): bindings,
+    /// refusal-only history and successor reservations keyed to the
+    /// domain are removed; every other domain's entries are
+    /// preserved. Returns the removed caller ids so the coordinator
+    /// can clear their transient tail markers too. The index is
+    /// rebuilt (positions shift) and cursors clamped; installed
+    /// storage keeps its lease (the maps stay installed with holes
+    /// until the next install replaces them).
+    #[cfg_attr(not(test), allow(dead_code))] // STAGED (DR37): called by retire_joint_domain.
+    pub(crate) fn retire_domain(&mut self, domain: NativeDomainId) -> Vec<CallerId> {
+        let mut removed = BTreeSet::new();
+        for binding in &self.bindings {
+            if binding.domain() == domain {
+                removed.insert(binding.caller());
+            }
+        }
+        for (caller, history) in &self.admission_images {
+            if history.domain == domain {
+                removed.insert(*caller);
+            }
+        }
+        for (caller, successor) in self.successors.iter().chain(&self.refused_successors) {
+            if successor.custody.domain == domain {
+                removed.insert(*caller);
+            }
+        }
+        if !removed.is_empty() {
+            self.bindings.retain(|binding| binding.domain() != domain);
+            self.index.clear();
+            for (at, binding) in self.bindings.iter().enumerate() {
+                self.index.insert(binding.caller(), at);
+            }
+            self.admission_images
+                .retain(|_, history| history.domain != domain);
+            self.successors
+                .retain(|_, successor| successor.custody.domain != domain);
+            self.refused_successors
+                .retain(|_, successor| successor.custody.domain != domain);
+            self.cursor = self.cursor.min(self.bindings.len());
+            if self
+                .refresh_cursor
+                .is_some_and(|(caller, _)| removed.contains(&caller))
+            {
+                self.refresh_cursor = None;
+            }
+        }
+        removed.into_iter().collect()
     }
 
     #[cfg(test)]
@@ -985,6 +1078,45 @@ pub(crate) struct SemanticRefreshAttempt {
     pub(crate) module: Option<ModuleKey>,
 }
 
+/// Why a proof-gated lane install refused. Every variant returns the
+/// lane and capacity uninstalled; nothing half-installs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SelectedInstallRefusal {
+    /// The proof names another binding than the held lane.
+    BindingMismatch,
+    /// The binding set still holds entries: install never drops
+    /// another domain's state.
+    BindingsOccupied,
+}
+
+/// A refused install, with full restitution: the uninstalled lane
+/// (for genuine disposal) and the unconsumed capacity (refunded by
+/// drop), plus the finite reason.
+pub(crate) struct SelectedInstallFailure {
+    pub(crate) lane: ProvisionalSelectedLane,
+    pub(crate) capacity: PromotionInstallCapacity,
+    pub(crate) reason: SelectedInstallRefusal,
+}
+
+impl std::fmt::Debug for SelectedInstallFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SelectedInstallFailure")
+            .field("reason", &self.reason)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Why a domain retire refused. Every variant leaves the live
+/// namespace untouched: pending work stays live, and a foreign
+/// completion retires nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JointRetireRefusal {
+    /// The completion names no live finalizer namespace.
+    NotLiveDomain,
+    /// A quantum or drop is still staged: drain first, then retire.
+    PendingWork,
+}
+
 impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// Four exact mapped attested pairs, including every failed refresh.
     /// Selection scans bounded retained catalogs without allocating a caller
@@ -1265,6 +1397,159 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         &self,
     ) -> Result<PromotionInstallCapacity, SemanticBindingRefusal> {
         PromotionInstallCapacity::reserve(&self.registry)
+    }
+
+    /// Re-validate a taken promotion pair against live coordinator
+    /// state (D10): the caller still known and unretired, its
+    /// identity continuous with the resolved original, the provider
+    /// module still loaded, and the caller/provider edge still
+    /// mapped. Returns the live provider key for the subset's
+    /// `proves_provider_module` check. An early filter only: unknown
+    /// lifecycle evidence passes here, and the native permit
+    /// validation stays the authority downstream.
+    #[cfg_attr(not(test), allow(dead_code))] // STAGED (DR37): called by the driver before start.
+    pub(crate) fn validate_selected_pair_liveness(
+        &self,
+        pair: PromotionPair,
+        original: &Arc<PidPin>,
+    ) -> Result<ModuleKey, PromotionRefusal> {
+        let caller = CallerId(pair.caller());
+        let provider = ModuleId(pair.provider());
+        let Some(record) = self.adapter.record(caller) else {
+            return Err(PromotionRefusal::UnknownCaller);
+        };
+        if record.retired
+            || matches!(
+                record.lifecycle,
+                CallerLifecycle::Exited | CallerLifecycle::ExecRetired
+            )
+        {
+            return Err(PromotionRefusal::CallerRetired);
+        }
+        if record.pid != original.pid()
+            || record
+                .start_time
+                .is_some_and(|started| Some(started) != original.start_time())
+        {
+            return Err(PromotionRefusal::CallerChanged);
+        }
+        let Some(module) = self.registry.module(provider) else {
+            return Err(PromotionRefusal::ProviderUnloaded);
+        };
+        if module.lifecycle == ModuleLifecycle::Unloaded || module.unloaded_observed {
+            return Err(PromotionRefusal::ProviderUnloaded);
+        }
+        let paired = self
+            .registry
+            .edge(caller, provider)
+            .is_some_and(|edge| edge.mapping == MappingState::Mapped);
+        if !paired {
+            return Err(PromotionRefusal::ProviderChanged);
+        }
+        Ok(module.key.clone())
+    }
+
+    /// The seal grant's association proof (D9): the namespace's first
+    /// admitted call, borrowed for the per-quantum mint. `None`
+    /// before the first admission finalizes: the seal then refuses,
+    /// honestly without a grant.
+    #[cfg_attr(not(test), allow(dead_code))] // STAGED (DR37/H8): called by the joint seal driver.
+    pub(crate) fn seal_admission(&self) -> Option<&AdmittedInstanceCall> {
+        self.semantic_finalizer
+            .as_ref()
+            .and_then(|state| state.seal_admission.as_ref())
+    }
+
+    /// Install a proof-gated promoted lane (DR37): the proof must
+    /// name exactly the lane's binding (checked before any
+    /// mutation), the pre-reserved capacity becomes the binding
+    /// set's destination storage (refused when occupied, set
+    /// untouched), and the sealed lane converts to live. Any
+    /// refusal returns the lane and capacity uninstalled for
+    /// genuine disposal; nothing half-installs. The proof is
+    /// consumed by the install it authorized.
+    #[cfg_attr(not(test), allow(dead_code))] // STAGED (DR37): called by the driver on install.
+    pub(crate) fn install_selected_lane(
+        &mut self,
+        proof: SelectedActivationProof,
+        lane: ProvisionalSelectedLane,
+        capacity: PromotionInstallCapacity,
+    ) -> Result<AttestedSemanticLane, SelectedInstallFailure> {
+        if !proof.matches_lane(lane.activation_binding()) {
+            return Err(SelectedInstallFailure {
+                lane,
+                capacity,
+                reason: SelectedInstallRefusal::BindingMismatch,
+            });
+        }
+        if let Err(capacity) = self.semantic_bindings.install_capacity(capacity) {
+            return Err(SelectedInstallFailure {
+                lane,
+                capacity,
+                reason: SelectedInstallRefusal::BindingsOccupied,
+            });
+        }
+        let live = lane
+            .into_live_lane(&proof)
+            .expect("proof matches the held lane");
+        drop(proof);
+        Ok(live)
+    }
+
+    /// Retire one genuinely completed domain for the next (D5): the
+    /// native completion names the live finalizer namespace, which
+    /// must be quiescent (no staged quantum, no pending drop);
+    /// pending work refuses and the namespace stays live. Retire
+    /// removes the domain's bindings, refusal-only history and
+    /// successor reservations (other domains' entries preserved),
+    /// clears its tail markers, drops the finalizer namespace
+    /// (including its seal admission: no cross-domain grant reuse),
+    /// refuses the domain permanently, and `mem::replace`s the joint
+    /// owner with a fresh one (the old ledger's exact charges refund
+    /// by drop; no counter resets). Adapter positions are
+    /// stream/Session-local and correctly restart; global counters
+    /// never reset.
+    ///
+    /// GATED-SEAL carry: `h3_pending` evidence drops with the
+    /// namespace while joint seals are gated (no seal coverage
+    /// exists to preserve). The unification wave must require
+    /// seal-drained evidence before retire.
+    #[cfg_attr(not(test), allow(dead_code))] // STAGED (DR37): called by the driver on completion.
+    pub(crate) fn retire_joint_domain(
+        &mut self,
+        completion: SessionNativeCompletion,
+    ) -> Result<(), JointRetireRefusal> {
+        let domain = completion.domain();
+        let live = self
+            .semantic_finalizer
+            .as_ref()
+            .is_some_and(|state| state.domain == domain);
+        if !live {
+            return Err(JointRetireRefusal::NotLiveDomain);
+        }
+        let quiescent = self
+            .semantic_finalizer
+            .as_ref()
+            .is_some_and(|state| state.pending_semantic.is_none() && state.pending_drop.is_none());
+        if !quiescent {
+            return Err(JointRetireRefusal::PendingWork);
+        }
+        let removed = self.semantic_bindings.retire_domain(domain);
+        self.proven_images
+            .retain(|(image_domain, _), _| *image_domain != domain);
+        for caller in &removed {
+            self.tail_uncertain.remove(caller);
+            self.complete_scanned.remove(caller);
+            self.pending_adjudication.remove(caller);
+        }
+        self.semantic_finalizer = None;
+        self.refused_semantic_domains.insert(domain);
+        self.joint_capture =
+            crate::semantics_objects::journal::joint_driver::JointCaptureOwner::new(
+                crate::semantics_objects::journal::JournalLimits::policy(),
+                self.registry.semantic_storage_reserver(),
+            );
+        Ok(())
     }
 
     /// Run the ordinary consumer against fixed private storage. No registry
@@ -2184,9 +2469,18 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 )
             })
             .collect();
+        let mut first_admitted = None;
         for (caller, token, result) in staged {
             match result {
-                Ok(input) => self.registry.observe_instance_semantic(input),
+                Ok(input) => {
+                    // D9: retain the quantum's first admission for the
+                    // seal grant's association proof. The staged
+                    // mutation below still consumes the original.
+                    if first_admitted.is_none() {
+                        first_admitted = Some(input.clone());
+                    }
+                    self.registry.observe_instance_semantic(input);
+                }
                 Err(reason) => {
                     // A refused call never stages and never retries: its
                     // position sheds rather than vanishing.
@@ -2206,6 +2500,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .as_mut()
             .expect("finalization retains the matching Session namespace");
         debug_assert_eq!(state.domain, lane.domain());
+        // D9: first-ever admission per namespace; a set proof is the
+        // Session-stable association, never refreshed per quantum.
+        if state.seal_admission.is_none() {
+            state.seal_admission = first_admitted;
+        }
         if let Some((floor, exhausted)) = state.pending_drop.take() {
             shed_min = Some(shed_min.map_or(floor, |at| at.min(floor)));
             unpositioned = unpositioned || exhausted;
@@ -3074,5 +3373,453 @@ mod finalizer_history_tests {
             ),
             "foreign dropped work must not insert numeric loss into A's finalizer namespace: {fresh:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod promotion_lifecycle_tests {
+    //! DR37 coordinator entries: pair liveness re-validates a taken
+    //! pair against the live registry, install consumes a
+    //! proof-gated lane plus pre-reserved capacity, and retire
+    //! disposes a genuinely completed domain before the joint owner
+    //! is replaced. The subset-shape precheck is pure (see the
+    //! lifecycle module); the baseline agreement reuses the tested
+    //! `matches_request`.
+    use super::*;
+    use crate::attach::Scope;
+    use crate::attach::capture::NativeDomainId;
+    use crate::discovery::caller_registry::{
+        ImageAuthority, ModuleKey, OsProcessSource, RegistryLimits,
+    };
+    use crate::discovery::hooks::HookRegistry;
+    use crate::inventory_promotion::lifecycle::SessionNativeCompletion;
+    use crate::inventory_promotion::{PromotionPair, PromotionRefusal};
+    use crate::inventory_semantics::SemanticBatch;
+    use p11scope_ebpf_common::ImageIdentity;
+    use std::collections::BTreeSet;
+
+    fn image() -> ImageIdentity {
+        ImageIdentity {
+            task_cookie: 41,
+            exec_id: 42,
+        }
+    }
+
+    fn pin() -> Arc<PidPin> {
+        Arc::new(PidPin::open(std::process::id()).expect("the test process pins itself"))
+    }
+
+    fn domain() -> NativeDomainId {
+        NativeDomainId::try_mint().expect("test domain mints")
+    }
+
+    fn module_key(ino: u64) -> ModuleKey {
+        ModuleKey::physical(8, 1, ino, Some(format!("sha-{ino}")), "/lib/x.so")
+    }
+
+    fn binding(caller: u32, dom: NativeDomainId) -> SemanticCallerBinding {
+        SemanticCallerBinding::scripted(
+            CallerId(caller),
+            module_key(100 + caller as u64),
+            dom,
+            image(),
+            pin(),
+        )
+    }
+
+    fn coordinator() -> InventoryCoordinator<OsProcessSource> {
+        InventoryCoordinator::new(
+            Scope::Pid(std::process::id()),
+            HookRegistry::builtin(),
+            Vec::new(),
+            OsProcessSource,
+            RegistryLimits::default_limits(),
+        )
+        .expect("test coordinator builds")
+    }
+
+    fn charged(coordinator: &InventoryCoordinator<OsProcessSource>) -> usize {
+        coordinator
+            .registry
+            .semantic_resource_snapshot()
+            .charged_bytes
+    }
+
+    #[test]
+    fn install_capacity_into_empty_set_moves_storage_and_lease() {
+        let mut coordinator = coordinator();
+        let before = charged(&coordinator);
+        let capacity = coordinator
+            .reserve_promotion_install()
+            .expect("capacity reserves");
+        let reserved = charged(&coordinator);
+        assert!(
+            reserved > before,
+            "the reservation charges before install: {before} -> {reserved}"
+        );
+        coordinator.semantic_bindings.cursor = 5;
+        coordinator
+            .semantic_bindings
+            .install_capacity(capacity)
+            .expect("empty set installs");
+        let set = &coordinator.semantic_bindings;
+        assert_eq!(set.bindings.capacity(), 1);
+        assert_eq!(set.index.capacity(), 3);
+        // 7168, not MAX_INSTANCES: hashbrown bucket rounding, matching
+        // the reservation-side assertion.
+        assert_eq!(set.admission_images.capacity(), 7168);
+        assert_eq!(set.cursor, 0, "install resets the fair-turn cursor");
+        assert!(set.refresh_cursor.is_none());
+        assert!(
+            set.install_lease.is_some(),
+            "the storage lease moves with the storage"
+        );
+        assert_eq!(
+            charged(&coordinator),
+            reserved,
+            "install moves the charge, never duplicates or refunds it"
+        );
+    }
+
+    #[test]
+    fn install_capacity_refuses_occupied_set_untouched() {
+        let mut coordinator = coordinator();
+        coordinator
+            .semantic_bindings
+            .insert_for_test(binding(7, domain()))
+            .expect("scripted binding inserts");
+        let before = charged(&coordinator);
+        let capacity = coordinator
+            .reserve_promotion_install()
+            .expect("capacity reserves");
+        let reserved = charged(&coordinator);
+        let returned = coordinator
+            .semantic_bindings
+            .install_capacity(capacity)
+            .expect_err("occupied set refuses");
+        assert_eq!(coordinator.semantic_bindings.len(), 1);
+        assert!(
+            coordinator.semantic_bindings.get(CallerId(7)).is_some(),
+            "refused install keeps the retained binding"
+        );
+        assert!(coordinator.semantic_bindings.install_lease.is_none());
+        drop(returned);
+        assert_eq!(
+            charged(&coordinator),
+            before,
+            "the refused capacity refunds by drop: {reserved} -> {}",
+            charged(&coordinator)
+        );
+    }
+
+    #[test]
+    fn install_capacity_charges_zero_allocations() {
+        let mut coordinator = coordinator();
+        let capacity = coordinator
+            .reserve_promotion_install()
+            .expect("capacity reserves");
+        let (installed, allocs, bytes) = crate::test_alloc::count_allocs_during(|| {
+            coordinator.semantic_bindings.install_capacity(capacity)
+        });
+        installed.expect("empty set installs");
+        assert_eq!(
+            (allocs, bytes),
+            (0, 0),
+            "install moves storage, never grows"
+        );
+    }
+
+    #[test]
+    fn retire_domain_removes_only_the_retired_domain() {
+        let mut set = SemanticBindingSet::new();
+        let a = domain();
+        let b = domain();
+        set.insert_for_test(binding(1, a)).unwrap();
+        set.insert_for_test(binding(2, a)).unwrap();
+        set.insert_for_test(binding(3, b)).unwrap();
+        set.admission_images.insert(
+            CallerId(1),
+            SemanticAdmissionHistory {
+                domain: a,
+                image: image(),
+                incarnation: 1,
+                generation: crate::inspect_system::MemberGeneration {
+                    start_time: None,
+                    exe: None,
+                },
+                pin: pin(),
+                initial_scope_cut: false,
+                pending_gap: None,
+            },
+        );
+        set.admission_images.insert(
+            CallerId(3),
+            SemanticAdmissionHistory {
+                domain: b,
+                image: image(),
+                incarnation: 1,
+                generation: crate::inspect_system::MemberGeneration {
+                    start_time: None,
+                    exe: None,
+                },
+                pin: pin(),
+                initial_scope_cut: false,
+                pending_gap: None,
+            },
+        );
+        let removed = set.retire_domain(a);
+        assert_eq!(removed, vec![CallerId(1), CallerId(2)]);
+        assert_eq!(set.len(), 1);
+        assert!(set.get(CallerId(3)).is_some(), "B's binding survives");
+        assert_eq!(set.index.get(&CallerId(3)), Some(&0), "index rebuilt");
+        assert!(!set.admission_images.contains_key(&CallerId(1)));
+        assert!(set.admission_images.contains_key(&CallerId(3)));
+        assert!(set.retire_domain(a).is_empty(), "second retire is a no-op");
+    }
+
+    #[test]
+    fn retire_joint_domain_refuses_foreign_completion() {
+        let mut coordinator = coordinator();
+        let before = charged(&coordinator);
+        let err = coordinator
+            .retire_joint_domain(SessionNativeCompletion::scripted(domain()))
+            .expect_err("nothing live retires nothing");
+        assert_eq!(err, JointRetireRefusal::NotLiveDomain);
+        assert!(coordinator.semantic_finalizer.is_none());
+        assert!(coordinator.refused_semantic_domains.is_empty());
+        assert_eq!(charged(&coordinator), before);
+    }
+
+    #[test]
+    fn retire_joint_domain_refuses_pending_work() {
+        let mut coordinator = coordinator();
+        let a = domain();
+        let mut finalizer = SessionFinalizerState::new(a);
+        finalizer.pending_drop = Some((7, false));
+        coordinator.semantic_finalizer = Some(finalizer);
+        let err = coordinator
+            .retire_joint_domain(SessionNativeCompletion::scripted(a))
+            .expect_err("pending work stays live");
+        assert_eq!(err, JointRetireRefusal::PendingWork);
+        let state = coordinator.semantic_finalizer.as_ref().expect("kept");
+        assert_eq!(state.pending_drop, Some((7, false)));
+        assert!(coordinator.refused_semantic_domains.is_empty());
+    }
+
+    #[test]
+    fn retire_joint_domain_retires_namespace_and_replaces_owner() {
+        let mut coordinator = coordinator();
+        let a = domain();
+        let b = domain();
+        coordinator.semantic_finalizer = Some(SessionFinalizerState::new(a));
+        coordinator
+            .semantic_bindings
+            .insert_for_test(binding(1, a))
+            .unwrap();
+        coordinator
+            .semantic_bindings
+            .insert_for_test(binding(3, b))
+            .unwrap();
+        coordinator.proven_images.insert((a, 9), 9);
+        coordinator.proven_images.insert((b, 9), 9);
+        coordinator.tail_uncertain.insert(CallerId(1));
+        coordinator.complete_scanned.insert(CallerId(1));
+        let clean = charged(&coordinator);
+        coordinator
+            .joint_capture
+            .ledger_mut()
+            .charge_h8open(0, 100)
+            .expect("old ledger charges");
+        let dirty = charged(&coordinator);
+        assert!(
+            dirty > clean,
+            "the old ledger holds charges: {clean} -> {dirty}"
+        );
+        coordinator
+            .retire_joint_domain(SessionNativeCompletion::scripted(a))
+            .expect("quiescent A retires");
+        assert!(coordinator.semantic_finalizer.is_none());
+        assert!(coordinator.refused_semantic_domains.contains(&a));
+        assert!(coordinator.semantic_bindings.get(CallerId(1)).is_none());
+        assert!(coordinator.semantic_bindings.get(CallerId(3)).is_some());
+        assert!(!coordinator.proven_images.contains_key(&(a, 9)));
+        assert!(coordinator.proven_images.contains_key(&(b, 9)));
+        assert!(!coordinator.tail_uncertain.contains(&CallerId(1)));
+        assert!(!coordinator.complete_scanned.contains(&CallerId(1)));
+        assert_eq!(
+            charged(&coordinator),
+            clean,
+            "the replaced owner's exact charges refund, nothing else moves"
+        );
+        // A stays refused; B stages into the fresh namespace.
+        coordinator.stage_semantic_batch(SemanticBatch::scripted(a, Vec::new(), 1));
+        assert!(
+            coordinator
+                .semantic_finalizer
+                .as_ref()
+                .is_none_or(|state| state.pending_semantic.is_none()),
+            "A never stages again"
+        );
+        coordinator.stage_semantic_batch(SemanticBatch::scripted(b, Vec::new(), 2));
+        assert!(
+            coordinator
+                .semantic_finalizer
+                .as_ref()
+                .is_some_and(|state| state.domain == b && state.pending_semantic.is_some()),
+            "B stages into a fresh namespace"
+        );
+    }
+
+    /// Admit the test process itself through the real adapter path
+    /// (/proc reads, no fixtures): reconcile, apply, then resolve.
+    fn admit_self(coordinator: &mut InventoryCoordinator<OsProcessSource>) -> CallerId {
+        let pid = std::process::id();
+        let observed = BTreeSet::from([pid]);
+        let events = coordinator.adapter_mut().reconcile(
+            &observed,
+            &mut |_| ImageAuthority::ScanPinned,
+            100,
+        );
+        coordinator.apply_reconcile_events(&events, 100);
+        coordinator
+            .adapter()
+            .live_id(pid)
+            .expect("the live test process admits")
+    }
+
+    fn liveness_pair(caller: CallerId, module: ModuleId) -> PromotionPair {
+        PromotionPair::new(caller.0, module.0)
+    }
+
+    #[test]
+    fn pair_liveness_refuses_unknown_caller() {
+        let coordinator = coordinator();
+        let err = coordinator
+            .validate_selected_pair_liveness(liveness_pair(CallerId(999), ModuleId(999)), &pin())
+            .expect_err("unknown caller refuses");
+        assert_eq!(err, PromotionRefusal::UnknownCaller);
+    }
+
+    #[test]
+    fn pair_liveness_accepts_mapped_pair_with_continuous_pin() {
+        let mut coordinator = coordinator();
+        let caller = admit_self(&mut coordinator);
+        let key = module_key(777);
+        let module = coordinator
+            .registry_mut()
+            .scripted_module_edge(key.clone(), caller);
+        let live = coordinator
+            .validate_selected_pair_liveness(liveness_pair(caller, module), &pin())
+            .expect("mapped pair with its own pin validates");
+        assert_eq!(
+            live, key,
+            "the live provider key returns for the subset proof"
+        );
+        let record = coordinator.adapter().record(caller).expect("record");
+        assert!(
+            record.start_time.is_some(),
+            "real admission observes start-time: the continuity check ran, not skipped"
+        );
+    }
+
+    /// A spawned sleeper, reaped on drop: the retired-caller twin
+    /// needs a genuine exit, which reconcile detects and retires.
+    struct LiveChild(std::process::Child);
+
+    impl LiveChild {
+        fn spawn() -> Self {
+            Self(
+                std::process::Command::new("sleep")
+                    .arg("120")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .spawn()
+                    .expect("sleep spawns"),
+            )
+        }
+
+        fn pid(&self) -> u32 {
+            self.0.id()
+        }
+
+        fn kill_and_wait(&mut self) {
+            self.0.kill().expect("sleeper dies");
+            self.0.wait().expect("sleeper reaped");
+        }
+    }
+
+    impl Drop for LiveChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    fn pair_liveness_refuses_retired_caller() {
+        let mut child = LiveChild::spawn();
+        let mut coordinator = coordinator();
+        let observed = BTreeSet::from([child.pid()]);
+        let events = coordinator.adapter_mut().reconcile(
+            &observed,
+            &mut |_| ImageAuthority::ScanPinned,
+            100,
+        );
+        coordinator.apply_reconcile_events(&events, 100);
+        let caller = coordinator
+            .adapter()
+            .live_id(child.pid())
+            .expect("the live child admits");
+        child.kill_and_wait();
+        let events = coordinator.adapter_mut().reconcile(
+            &BTreeSet::new(),
+            &mut |_| ImageAuthority::ScanPinned,
+            200,
+        );
+        coordinator.apply_reconcile_events(&events, 200);
+        let record = coordinator.adapter().record(caller).expect("record kept");
+        assert!(record.retired, "reconcile retires the exited child");
+        let err = coordinator
+            .validate_selected_pair_liveness(liveness_pair(caller, ModuleId(999)), &pin())
+            .expect_err("retired caller refuses");
+        assert_eq!(err, PromotionRefusal::CallerRetired);
+    }
+
+    #[test]
+    fn pair_liveness_refuses_changed_caller() {
+        let mut coordinator = coordinator();
+        let caller = admit_self(&mut coordinator);
+        let parent = std::os::unix::process::parent_id();
+        assert_ne!(parent, std::process::id(), "test has a distinct parent");
+        let parent_pin = Arc::new(PidPin::open(parent).expect("parent pins"));
+        let err = coordinator
+            .validate_selected_pair_liveness(liveness_pair(caller, ModuleId(999)), &parent_pin)
+            .expect_err("another pid's pin refuses");
+        assert_eq!(err, PromotionRefusal::CallerChanged);
+    }
+
+    #[test]
+    fn pair_liveness_refuses_unloaded_provider() {
+        let mut coordinator = coordinator();
+        let caller = admit_self(&mut coordinator);
+        let err = coordinator
+            .validate_selected_pair_liveness(liveness_pair(caller, ModuleId(999)), &pin())
+            .expect_err("unknown module refuses");
+        assert_eq!(err, PromotionRefusal::ProviderUnloaded);
+    }
+
+    #[test]
+    fn pair_liveness_refuses_changed_provider() {
+        let mut coordinator = coordinator();
+        let caller = admit_self(&mut coordinator);
+        // A live module edged to another caller: the provider exists
+        // but is no longer this caller's pair.
+        let module = coordinator
+            .registry_mut()
+            .scripted_module_edge(module_key(778), CallerId(999));
+        let err = coordinator
+            .validate_selected_pair_liveness(liveness_pair(caller, module), &pin())
+            .expect_err("unpaired live module refuses");
+        assert_eq!(err, PromotionRefusal::ProviderChanged);
     }
 }

@@ -116,6 +116,7 @@ fn clock(stop: &dyn Fn() -> bool) -> LoopClock<'_> {
     LoopClock {
         deadline: None,
         stop,
+        now: &Instant::now,
         interval: Duration::ZERO,
         tick: Duration::from_millis(1),
         collection_tick: Duration::from_millis(1),

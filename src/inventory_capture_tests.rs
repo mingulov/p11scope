@@ -876,6 +876,7 @@ fn run_ticking(
     let clock = LoopClock {
         deadline: Some(Instant::now() + Duration::from_secs(600)),
         stop: &stop,
+        now: &Instant::now,
         interval: Duration::ZERO,
         tick: Duration::from_millis(1),
         collection_tick,
@@ -1007,6 +1008,7 @@ fn mid_apply_cancellation_skips_extension_and_successor_mint_but_preserves_appli
     let clock = LoopClock {
         deadline: Some(Instant::now() + Duration::from_secs(600)),
         stop: &stop,
+        now: &Instant::now,
         interval: Duration::ZERO,
         tick: Duration::from_millis(1),
         collection_tick: NO_COLLECTION_TICK,
@@ -1202,6 +1204,7 @@ fn a_rising_count_reads_recently_observed_at_its_own_pass_publication() {
     let clock = LoopClock {
         deadline: Some(Instant::now() + Duration::from_secs(600)),
         stop: &stop,
+        now: &Instant::now,
         interval: Duration::ZERO,
         tick: Duration::from_millis(1),
         collection_tick: NO_COLLECTION_TICK,
@@ -1345,6 +1348,7 @@ fn a_stop_requested_during_startup_runs_zero_passes() {
     let clock = LoopClock {
         deadline: Some(Instant::now() + Duration::from_secs(600)),
         stop: &|| true,
+        now: &Instant::now,
         interval: Duration::from_secs(600),
         tick: Duration::from_millis(1),
         collection_tick: NO_COLLECTION_TICK,
@@ -1715,6 +1719,7 @@ fn failed_pass_publication_retains_native_stop_for_final_sinks() {
     let clock = LoopClock {
         deadline: None,
         stop: &|| false,
+        now: &Instant::now,
         interval: Duration::ZERO,
         tick: Duration::from_millis(1),
         collection_tick: NO_COLLECTION_TICK,
@@ -1797,6 +1802,7 @@ fn failed_pass_application_still_reads_terminal_state_and_keeps_first_error() {
     let clock = LoopClock {
         deadline: None,
         stop: &|| false,
+        now: &Instant::now,
         interval: Duration::ZERO,
         tick: Duration::from_millis(1),
         collection_tick: NO_COLLECTION_TICK,
@@ -1853,6 +1859,7 @@ fn zero_pass_prologue_failure_still_finishes_terminal_reads() {
     let clock = LoopClock {
         deadline: None,
         stop: &|| false,
+        now: &Instant::now,
         interval: Duration::ZERO,
         tick: Duration::from_millis(1),
         collection_tick: NO_COLLECTION_TICK,
@@ -1966,6 +1973,7 @@ fn stop_event_failure_keeps_native_cleanup_report_and_stdout() {
     let clock = LoopClock {
         deadline: None,
         stop: &stop,
+        now: &Instant::now,
         interval: Duration::ZERO,
         tick: Duration::from_millis(1),
         collection_tick: NO_COLLECTION_TICK,
@@ -2176,6 +2184,7 @@ fn native_output_boundary_control(
     let clock = LoopClock {
         deadline: (!key_stop && before == 0).then(Instant::now),
         stop: &stop,
+        now: &Instant::now,
         interval: Duration::ZERO,
         tick: Duration::from_millis(1),
         collection_tick: NO_COLLECTION_TICK,
@@ -2408,6 +2417,7 @@ fn a_refused_activation_hands_back_the_capture_and_forgets_coverage() {
     let clock = LoopClock {
         deadline: None,
         stop: &|| false,
+        now: &Instant::now,
         interval: Duration::ZERO,
         tick: Duration::from_millis(1),
         collection_tick: NO_COLLECTION_TICK,
@@ -2428,6 +2438,7 @@ fn the_scan_lane_makes_no_native_call() {
     let clock = LoopClock {
         deadline: None,
         stop: &|| false,
+        now: &Instant::now,
         interval: Duration::ZERO,
         tick: Duration::from_millis(1),
         collection_tick: NO_COLLECTION_TICK,
@@ -2460,6 +2471,7 @@ fn ticks_between_passes_stage_each_discovery_quantum() {
     let clock = LoopClock {
         deadline: Some(Instant::now() + Duration::from_secs(600)),
         stop: &stop,
+        now: &Instant::now,
         interval: Duration::from_millis(40),
         tick: Duration::from_millis(5),
         collection_tick: NO_COLLECTION_TICK,
@@ -2515,6 +2527,7 @@ fn the_display_ticks_after_each_lane_service_without_reordering_it() {
     let clock = LoopClock {
         deadline: Some(Instant::now() + Duration::from_secs(600)),
         stop: &stop,
+        now: &Instant::now,
         interval: Duration::from_millis(40),
         tick: Duration::from_millis(5),
         collection_tick: NO_COLLECTION_TICK,
@@ -2594,6 +2607,7 @@ fn the_display_ticks_in_the_scan_lane_too() {
     let clock = LoopClock {
         deadline: Some(Instant::now() + Duration::from_secs(600)),
         stop: &stop,
+        now: &Instant::now,
         interval: Duration::from_millis(30),
         tick: Duration::from_millis(5),
         collection_tick: NO_COLLECTION_TICK,
@@ -2686,6 +2700,7 @@ fn native_jobs_receive_explicit_unavailability_in_scan_ticks() {
     let clock = LoopClock {
         deadline: Some(Instant::now() + Duration::from_secs(600)),
         stop: &stop,
+        now: &Instant::now,
         interval: Duration::from_millis(30),
         tick: Duration::from_millis(5),
         collection_tick: NO_COLLECTION_TICK,
@@ -2799,6 +2814,7 @@ fn a_lossy_start_never_claims_a_watch() {
     let clock = LoopClock {
         deadline: Some(Instant::now() + Duration::from_secs(600)),
         stop: &stop,
+        now: &Instant::now,
         interval: Duration::ZERO,
         tick: Duration::from_millis(1),
         collection_tick: NO_COLLECTION_TICK,
@@ -3021,6 +3037,7 @@ fn run_clocked(
     let clock = LoopClock {
         deadline: Some(Instant::now() + deadline),
         stop: &stop,
+        now: &Instant::now,
         interval,
         tick: Duration::from_millis(1),
         collection_tick: NO_COLLECTION_TICK,
@@ -3564,6 +3581,7 @@ mod scan_terminal_accounting_tests {
         LoopClock {
             deadline: None,
             stop,
+            now: &Instant::now,
             interval: Duration::ZERO,
             tick: Duration::from_millis(1),
             collection_tick: NO_COLLECTION_TICK,

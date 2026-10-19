@@ -8316,16 +8316,23 @@ fn automatic_exec_recovery_budget_failure_and_stop_are_finite() {
         let clock = LoopClock {
             deadline: None,
             stop: &stop,
+            now: &std::time::Instant::now,
             interval: std::time::Duration::from_secs(60),
             tick: std::time::Duration::from_millis(10),
             collection_tick: std::time::Duration::from_millis(10),
         };
+        let mut stop_publications = 0;
         let outcome = run_classic_finalizing(
             &mut driver,
             None::<NativeLane<H6NoLane>>,
             &clock,
             None,
-            &mut |_, _: Publish<'_>| Ok(()),
+            &mut |_, point| {
+                if matches!(point, Publish::Stop { .. }) {
+                    stop_publications += 1;
+                }
+                Ok(())
+            },
         );
         assert!(outcome.error.is_none());
         assert!(outcome.stopped.is_none());
@@ -8334,7 +8341,14 @@ fn automatic_exec_recovery_budget_failure_and_stop_are_finite() {
             driver.applies, 0,
             "no apply, so no attach or successor work"
         );
-        assert_eq!(driver.commits, 0, "no commit without a pass");
+        assert_eq!(
+            driver.commits, 1,
+            "only the zero-pass diagnostic gap publishes"
+        );
+        assert_eq!(
+            stop_publications, 1,
+            "the diagnostic gap streams under one terminal marker"
+        );
         assert_eq!(
             driver.host.stops, 1,
             "the latch stops the host exactly once"

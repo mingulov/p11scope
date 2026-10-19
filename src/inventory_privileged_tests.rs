@@ -402,6 +402,7 @@ fn drive<L: CaptureLane<PidPin>>(
     let clock = LoopClock {
         deadline,
         stop: &stop_now,
+        now: &Instant::now,
         interval: Duration::from_millis(300),
         tick: SERVICE_TICK,
         collection_tick: SERVICE_TICK,
@@ -2555,6 +2556,7 @@ fn privileged_native_lane_sigint_during_extend_lp64() -> Result<()> {
     let clock = LoopClock {
         deadline,
         stop: &stop,
+        now: &Instant::now,
         interval: POLL_INTERVAL,
         tick: SERVICE_TICK,
         collection_tick: SERVICE_TICK,

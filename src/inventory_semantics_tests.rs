@@ -241,7 +241,11 @@ impl ProviderFixture {
             _ => panic!("3.2 is a full standard interface"),
         };
         let mut offset = self.offsets[0] + 200;
-        for index in 0..6 {
+        // Past Detailed capacity in both profiles: each surface carries
+        // every 3.2 interface field (104), so 6 surfaces claim 627 past
+        // the default 512, and 22 claim 2,291 past the wide 2,112.
+        let extra_surfaces = p11scope_ebpf_common::MAX_SLOTS as usize / fields.len() + 2;
+        for index in 0..extra_surfaces {
             let functions = fields
                 .iter()
                 .map(|name| {

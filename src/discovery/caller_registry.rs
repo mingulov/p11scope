@@ -7309,6 +7309,115 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn thirty_two_first_installs_on_one_edge_yield_one() {
+        // G21 (Sol oracle correction): base == 0 dispatches to the maximum
+        // install, so 32 first sightings at one unit produce A=1, not 32.
+        // Only the first sight sets recency.
+        let mut registry = registry();
+        let keys = mapped(
+            &mut registry,
+            CallerId(0),
+            &[("/lib/a.so", 11, AdmissionState::Admitted)],
+        );
+        for pair in 0..32 {
+            registry.note_counted_use(CallerId(0), &keys[0], 1, 100, 200 + pair, 0);
+        }
+        registry.publish();
+        let edge = edge_of(&registry, CallerId(0), &keys[0]);
+        assert_eq!(edge.entry_count, 1);
+        assert_eq!(edge.entry_first_seen_ns, Some(100));
+        assert_eq!(edge.entry_last_seen_ns, Some(200));
+    }
+
+    #[test]
+    fn overlapping_demoted_growth_contributes_one_unit() {
+        // G21: demoted growth merges overlapping numeric intervals per
+        // (caller, module), so 32 identical (1,2] segments in one
+        // publication add one unit, not 32.
+        let mut registry = registry();
+        let keys = mapped(
+            &mut registry,
+            CallerId(0),
+            &[("/lib/a.so", 11, AdmissionState::Admitted)],
+        );
+        registry.note_counted_use(CallerId(0), &keys[0], 1, 100, 200, 0);
+        registry.publish();
+        assert_eq!(edge_of(&registry, CallerId(0), &keys[0]).entry_count, 1);
+        for pair in 0..32 {
+            registry.note_counted_use(CallerId(0), &keys[0], 1, 300 + pair, 400 + pair, 1);
+        }
+        registry.publish();
+        let edge = edge_of(&registry, CallerId(0), &keys[0]);
+        assert_eq!(edge.entry_count, 2);
+    }
+
+    #[test]
+    fn disjoint_demoted_growth_accumulates() {
+        // G21: disjoint segments in one publication (a mid-publish rebase)
+        // all accumulate: (1,2] plus (2,3] on an edge at 1 yields 3.
+        let mut registry = registry();
+        let keys = mapped(
+            &mut registry,
+            CallerId(0),
+            &[("/lib/a.so", 11, AdmissionState::Admitted)],
+        );
+        registry.note_counted_use(CallerId(0), &keys[0], 1, 100, 200, 0);
+        registry.publish();
+        registry.note_counted_use(CallerId(0), &keys[0], 1, 300, 400, 1);
+        registry.note_counted_use(CallerId(0), &keys[0], 1, 310, 410, 2);
+        registry.publish();
+        let edge = edge_of(&registry, CallerId(0), &keys[0]);
+        assert_eq!(edge.entry_count, 3);
+    }
+
+    #[test]
+    fn repeated_first_sight_rereads_change_nothing() {
+        // G21: equal-or-less re-reads change nothing, even across 32 pairs
+        // and repeated publications: no count growth, no recency shift.
+        let mut registry = registry();
+        let keys = mapped(
+            &mut registry,
+            CallerId(0),
+            &[("/lib/a.so", 11, AdmissionState::Admitted)],
+        );
+        for pair in 0..32 {
+            registry.note_counted_use(CallerId(0), &keys[0], 1, 100, 200 + pair, 0);
+        }
+        registry.publish();
+        for pair in 0..32 {
+            registry.note_counted_use(CallerId(0), &keys[0], 1, 100, 500 + pair, 0);
+        }
+        registry.publish();
+        let edge = edge_of(&registry, CallerId(0), &keys[0]);
+        assert_eq!(edge.entry_count, 1);
+        assert_eq!(edge.entry_last_seen_ns, Some(200));
+    }
+
+    #[test]
+    fn split_proof_publications_increment_per_proof_bearing_publish() {
+        // G21 publication recurrence: 32 terminal proofs (659,660] staged
+        // together yield B=1 (overlap). Split across N proof-bearing
+        // publications they yield B=N, one unit per publication — never a
+        // loose range.
+        for (batches, expected) in [(vec![32], 1), (vec![16, 16], 2), (vec![1; 32], 32)] {
+            let mut registry = registry();
+            let keys = mapped(
+                &mut registry,
+                CallerId(0),
+                &[("/lib/b.so", 12, AdmissionState::Admitted)],
+            );
+            for batch in batches {
+                for _ in 0..batch {
+                    registry.note_counted_use(CallerId(0), &keys[0], 1, 900, 910, 659);
+                }
+                registry.publish();
+            }
+            let edge = edge_of(&registry, CallerId(0), &keys[0]);
+            assert_eq!(edge.entry_count, expected);
+        }
+    }
+
+    #[test]
     fn counted_use_saturates_at_the_edge_cap() {
         let mut registry = registry();
         let keys = mapped(

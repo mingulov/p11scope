@@ -13277,9 +13277,44 @@ fn instance_entry_ip_and_stamps_have_no_rendering_consumers() {
     );
 }
 
+/// The native-suite gate must not misattribute a second failure after a
+/// first: every holder takes the lock poison-tolerantly. The static half
+/// pins the spelling; the live half really poisons the shared gate and
+/// proves it still opens. The poison persists for the rest of the binary,
+/// which is harmless — all four holders recover the same way.
+#[test]
+fn native_suite_gate_survives_a_poisoned_holder() {
+    // Static half: no bare `lock().unwrap()` on the gate (the pre-fix
+    // shape that turned the h6 native-suite timeout into a verifier
+    // misattribution). Spelled dynamically so this pin cannot match
+    // itself.
+    let source = read("tests/artifact_contracts.rs");
+    let bare = ["NATIVE_SUITE_GATE", ".lock().", "unwrap()"].concat();
+    assert!(
+        !source.contains(&bare),
+        "a holder takes the native-suite gate with a bare unwrap"
+    );
+    // Live half: really poison the shared gate, then recover it the way
+    // every holder does. Expected-panic noise from the poisoner thread.
+    let poisoner = std::thread::spawn(|| {
+        let _held = NATIVE_SUITE_GATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        panic!("poison the shared native-suite gate");
+    });
+    assert!(poisoner.join().is_err(), "the gate poisoner must panic");
+    let _guard = NATIVE_SUITE_GATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+}
+
 #[test]
 fn verifier_headroom_probe_unprivileged_controls_fail_closed() {
-    let _guard = NATIVE_SUITE_GATE.lock().unwrap();
+    // Like every other native suite: tolerate a poisoned gate so one
+    // suite's failure cannot misattribute this probe's result.
+    let _guard = NATIVE_SUITE_GATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let temporary = std::env::var_os("TMPDIR").unwrap_or_else(|| "/var/tmp/p11scope-ws-tmp".into());
     let directory = tempfile::tempdir_in(temporary).expect("owned verifier probe build directory");
     let output = directory.path().join("verifier-probe");

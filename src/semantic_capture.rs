@@ -5033,6 +5033,24 @@ mod tests {
             )
         }
 
+        /// H0 engagement observed through substituted lane I/O:
+        /// serviced tick count, deepest `awaiting` occupancy on any
+        /// tick, cumulative scan file attempts, and cumulative
+        /// FaultEra-routed calls. Shared by handle so a drain test
+        /// can prove its fault setup engaged after the lane owns the
+        /// I/O. Scalar folds, never per-tick vectors: the instrument
+        /// allocates nothing run-length-dependent inside a measured
+        /// drain, so prompt-drain no-accumulation equalities still
+        /// compare the drain, not the instrument. Recording only; H0
+        /// decisions never read it.
+        #[derive(Default)]
+        struct H0Engagement {
+            ticks: usize,
+            awaiting_max: usize,
+            attempted_files: Vec<u32>,
+            faultera_total: usize,
+        }
+
         /// Tests-only substituted H0 I/O behind a lane: the real H0
         /// decisions (refresh/tick/validate/stop) through `ScriptIo`,
         /// with the production stash/merge/batch helpers. Installed
@@ -5042,6 +5060,8 @@ mod tests {
             capture: SemanticCapture,
             io: ScriptIo,
             stash: RefreshReceiptStash,
+            engagement: std::rc::Rc<std::cell::RefCell<H0Engagement>>,
+            attempted_drained: usize,
             last_refresh_deadline: Option<Instant>,
             /// Clock advance applied at the start of every tick:
             /// quiescence tests age receipts per serviced quantum.
@@ -5063,6 +5083,8 @@ mod tests {
                     capture,
                     io,
                     stash: RefreshReceiptStash::new(),
+                    engagement: std::rc::Rc::new(std::cell::RefCell::new(H0Engagement::default())),
+                    attempted_drained: 0,
                     last_refresh_deadline: None,
                     tick_advance: Duration::ZERO,
                     shed: 0,
@@ -5089,6 +5111,22 @@ mod tests {
                     .capture
                     .tick_with(&mut self.io)
                     .map_err(|_| SemanticRefusal::Unavailable)?;
+                {
+                    let mut engagement = self.engagement.borrow_mut();
+                    engagement.ticks += 1;
+                    engagement.awaiting_max =
+                        engagement.awaiting_max.max(self.capture.awaiting.len());
+                    engagement.attempted_files.extend(
+                        self.io.attempted_files[self.attempted_drained..]
+                            .iter()
+                            .copied(),
+                    );
+                    self.attempted_drained = self.io.attempted_files.len();
+                    engagement.faultera_total += report
+                        .calls()
+                        .filter(|call| call.route() == Route::Unknown(UnknownReason::FaultEra))
+                        .count();
+                }
                 self.shed = self
                     .shed
                     .saturating_add(merge_stash_into_report(&mut self.stash, &mut report));
@@ -5814,10 +5852,15 @@ mod tests {
         /// completing file-0 Init/Sign pairs at zero fault (genuine
         /// completions, so the run is not vacuous), 100 max-stamp-fault
         /// file-0 calls (fault outcomes on the completing path), and 100
-        /// max-fault file-1 calls held in `awaiting` across every quantum
-        /// (failed scans never resolve). At the 1024-record tick limit the
-        /// population commits as exactly 3 batches (1024/1024/552) in both
-        /// runs; the extra 12 empty quanta retain nothing — live requested
+        /// max-stamp-fault file-1 calls. Stamp fault routes before scan
+        /// queueing, so both fault cohorts resolve as FaultEra outcomes
+        /// on the collecting ticks: nothing parks in `awaiting`, and the
+        /// configured file-1 scan fault is never attempted. The
+        /// engagement asserts pin this disposition (200 FaultEra routes,
+        /// completing-path scans only) so the coverage claim stays
+        /// honest. At the 1024-record tick limit the population
+        /// commits as exactly 3 batches (1024/1024/552) in both runs;
+        /// the extra 12 empty quanta retain nothing — live requested
         /// bytes, pool charges and completed operations are identical,
         /// proving serviced quanta never accumulate batches.
         #[test]
@@ -5877,6 +5920,7 @@ mod tests {
                 // prompt commits validate fresh in both runs.
                 h0.tick_advance = Duration::from_millis(100);
                 h0.quiesce_after = quanta;
+                let engagement = h0.engagement.clone();
                 fixture.lane.install_test_io(Box::new(h0));
                 let pool_before = fixture
                     .scene
@@ -5904,10 +5948,41 @@ mod tests {
                     .semantic_resource_snapshot();
                 let rows = operation_edge_rows(&fixture.scene);
                 assert_eq!(rows.len(), 1, "quanta={quanta}: one edge row");
+                let started = rows[0].3;
                 let completed = rows[0].4;
                 assert!(
                     completed > 0,
                     "quanta={quanta}: genuine pairs complete; the run is not vacuous"
+                );
+                // Fault engagement: both max-stamp cohorts
+                // fault-route through the real router (200 FaultEra
+                // outcomes, all on the collecting ticks), while scans
+                // run only on the completing file-0 path (one per
+                // collecting tick). Stamp fault routes before scan
+                // queueing, so the configured file-1 scan fault is
+                // never attempted and nothing parks in `awaiting` —
+                // the disposition below pins what the fault setup
+                // really covers, not just what it configures.
+                let engagement = engagement.borrow();
+                println!(
+                    "H3_MEM_PROMPT_DRAIN_ENGAGEMENT {{\"quanta\": {quanta}, \
+                     \"started\": {started}, \"completed\": {completed}, \
+                     \"ticks\": {}, \"awaiting_max\": {}, \
+                     \"attempted_files\": {:?}, \
+                     \"faultera_total\": {}}}",
+                    engagement.ticks,
+                    engagement.awaiting_max,
+                    engagement.attempted_files,
+                    engagement.faultera_total,
+                );
+                assert_eq!(
+                    engagement.faultera_total, 200,
+                    "quanta={quanta}: both max-stamp cohorts fault-route"
+                );
+                assert_eq!(
+                    engagement.attempted_files,
+                    vec![0, 0, 0],
+                    "quanta={quanta}: scans run only on the completing path"
                 );
                 runs.push((
                     quanta,

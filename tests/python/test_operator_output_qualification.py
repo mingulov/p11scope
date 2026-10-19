@@ -937,7 +937,8 @@ class ReporterControlAdapterTests(unittest.TestCase):
                          'slow-delivery', 'pre-signal-delivery', 'premature-main', 'prompt-main',
                          'early-release', 'early-gate-release', 'interrupted-main', 'late-entered',
                          'foreign-gate', 'gate-clock', 'missing-marker', 'multiplex', 'main-signal',
-                         'bool-counter'):
+                         'bool-counter', 'worker-ready-missing', 'worker-ready-post-signal',
+                         'main-ready-post-signal', 'signal-wrong-tid', 'signal-missing-tid'):
             c, w, r, g, e, sent, release = (copy.deepcopy(callback), copy.deepcopy(worker),
                 copy.deepcopy(reporter), copy.deepcopy(gates), dict(worker_expected),
                 copy.deepcopy(signals), 160000600)
@@ -968,6 +969,11 @@ class ReporterControlAdapterTests(unittest.TestCase):
             elif mutation == 'missing-marker': marker = b''
             elif mutation == 'multiplex': r[2]['time_running'] -= 1
             elif mutation == 'main-signal': sent[0].pop('delivery')
+            elif mutation == 'worker-ready-missing': w[0].pop('t_ns')
+            elif mutation == 'worker-ready-post-signal': w[0]['t_ns'] = 601
+            elif mutation == 'main-ready-post-signal': r[0]['t_ns'] = 601
+            elif mutation == 'signal-wrong-tid': sent[0]['tid'] = 999
+            elif mutation == 'signal-missing-tid': sent[0].pop('tid')
             else: w[1]['kernel_count'] = False
             ce = dict(callback_expected)
             if mutation == 'callback-role-expected': ce['role'] = ce_role

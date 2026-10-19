@@ -93,9 +93,11 @@ def validate_worker_negative(callback, callback_expected, worker, worker_expecte
         raise ValueError('missing or foreign actual main gate entry/release facts')
     entered, released = gates[0].get('t_ns'), gates[1].get('t_ns')
     sent, delivered, observed = signals[0].get('t_ns'), callback[1].get('t_ns'), reporter[1].get('t_ns')
+    ready = [worker[0].get('t_ns'), callback[0].get('t_ns'), reporter[0].get('t_ns')]
     if (any(type(stamp) is not int or not 0 < stamp < 2**64
-            for stamp in [entered, released, sent, delivered, observed, release_ns])
+            for stamp in [entered, released, sent, delivered, observed, release_ns, *ready])
             or not entered <= sent <= delivered <= released
+            or not max(ready) <= sent
             or released - sent < 150_000_000 or release_ns - sent < 150_000_000
             or not release_ns <= released <= observed):
         raise ValueError('worker delivery/main gating/release/late entry interval is unproved')

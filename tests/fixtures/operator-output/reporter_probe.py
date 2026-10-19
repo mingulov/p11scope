@@ -207,7 +207,8 @@ def validate_worker_delivery(records, expected, signals):
         raise ValueError('lost/multiplexed/unreconciled kernel worker delivery evidence')
     if (not isinstance(signals, (list, tuple)) or len(signals) != 1 or not isinstance(signals[0], dict)
             or signals[0].get('signal') != 'SIGINT'
-            or signals[0].get('delivery') != 'tgkill_original_worker'):
+            or signals[0].get('delivery') != 'tgkill_original_worker'
+            or signals[0].get('tid') != expected['tid']):
         raise ValueError('no independently sent finite worker-targeted first signal')
     times = [ready.get('t_ns'), signals[0].get('t_ns'), event.get('t_ns')]
     if (any(type(value) is not int or not 0 < value < 2**64 for value in times)

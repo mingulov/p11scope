@@ -12,10 +12,10 @@ index 1888f509..b6f09f3e 100755
      ("test_canary_evidence.py", ["--target-bits", "32"]),
 diff --git a/tests/python/test_browser_cells.py b/tests/python/test_browser_cells.py
 new file mode 100644
-index 00000000..80e34d4e
+index 00000000..549d2597
 --- /dev/null
 +++ b/tests/python/test_browser_cells.py
-@@ -0,0 +1,457 @@
+@@ -0,0 +1,505 @@
 +# SPDX-License-Identifier: GPL-3.0-or-later
 +"""G33 browser application cells: real Firefox/Chromium PKCS#11 traffic.
 +
@@ -32,6 +32,7 @@ index 00000000..80e34d4e
 +
 +import functools
 +import json
++import os
 +import shutil
 +import sys
 +import tempfile
@@ -118,6 +119,22 @@ index 00000000..80e34d4e
 +            cells.preflight()
 +        except (cells.CellError, RuntimeError) as exc:
 +            self.skipTest(f"browser gate prerequisite missing: {exc}")
++        return test(self)
++
++    return wrapper
++
++
++def needs_chromium(test):
++    """Skip unless Playwright and its Chromium build are present (no sudo)."""
++
++    @functools.wraps(test)
++    def wrapper(self):
++        try:
++            import playwright  # noqa: F401
++            from profiles import chromium_binary
++            chromium_binary()
++        except (ImportError, RuntimeError) as exc:
++            self.skipTest(f"chromium witness prerequisite missing: {exc}")
 +        return test(self)
 +
 +    return wrapper
@@ -340,6 +357,37 @@ index 00000000..80e34d4e
 +        path = self.work / f"{name}-report.json"
 +        path.write_text(json.dumps(doc))
 +        return cells.CellResult(name, path)
++
++    @needs_chromium
++    def test_chromium_uses_fresh_home_nss_db(self):
++        """P2-1 twin: the launched browser's NSS DB must live in the fresh HOME."""
++        from playwright.sync_api import sync_playwright
++        real_home = os.environ.get("HOME")
++        caller_home = self.work / "caller-home"
++        caller_home.mkdir()
++        cell_work = self.work / "cell"
++        try:
++            os.environ["HOME"] = str(caller_home)
++            with sync_playwright() as pw:
++                context, _match, fresh_home = cells.launch_browser_context(
++                    pw, "chromium", cell_work,
++                    register_module=Path("/probe-test/libsoft-test.so"))
++                try:
++                    used = cells.wait_for_nss_db(fresh_home, timeout_seconds=15.0)
++                finally:
++                    context.close()
++        finally:
++            if real_home is None:
++                os.environ.pop("HOME", None)
++            else:
++                os.environ["HOME"] = real_home
++        self.assertIsNotNone(used, "no NSS database appeared under the fresh HOME")
++        assert used is not None
++        pkcs11 = used / "pkcs11.txt"
++        self.assertTrue(pkcs11.exists(), f"our pkcs11.txt is not in the used DB dir {used}")
++        self.assertIn("/probe-test/libsoft-test.so", pkcs11.read_text())
++        strays = [p for p in (caller_home / ".pki", caller_home / ".local") if p.exists()]
++        self.assertEqual(strays, [], f"browser NSS state leaked into caller HOME: {strays}")
 +
 +    def test_oracle_builder_healthy_accepted(self):
 +        """Guard: the twin builder's healthy doc passes the common oracle."""

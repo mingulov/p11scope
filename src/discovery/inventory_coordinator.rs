@@ -1015,8 +1015,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     }
 
     /// Stages one scope-level gap (no caller, module or PID) that
-    /// publishes with the next pass: the run-wide PID-numbering mismatch
-    /// (`pidns::numbering_gap`, review F4) is the only producer.
+    /// publishes with the next commit: the run-wide PID-numbering
+    /// mismatch (`pidns::numbering_gap`, review F4), capture failures,
+    /// and the zero-pass stop diagnostic all ride this path.
     pub(crate) fn note_scope_gap(&mut self, subject: String, reason: String) {
         self.registry.record_gap(RegistryGap {
             caller: None,

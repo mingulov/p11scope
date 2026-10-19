@@ -165,6 +165,7 @@ fn workload_fd_worker() {
         "churn" => run_churn_storm(),
         "shutdown" => interrupt_shutdown(),
         "rss" => workload_rss_worker(),
+        "h3-combined" => h3_combined_workload(),
         // Owned-pidfd accounting runs here, in a private process: the
         // census observes /proc/self/fd, which a concurrent lib test
         // can pollute with its own pidfds for our sleepers (a census
@@ -2340,6 +2341,413 @@ fn injected_workloads_stay_within_rss_bound() {
     assert!(
         hwm < INJECTION_RSS_BOUND_BYTES,
         "injection battery peak RSS {hwm} bytes stays within {INJECTION_RSS_BOUND_BYTES}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// C-H3: one isolated RSS cell for the H3 combined workload.
+// ---------------------------------------------------------------------------
+
+/// Stated peak-RSS bound for the H3 combined workload cell
+/// (sparse-4096 instances plus churned mechanisms/presentations,
+/// pending/replay, and H7–H9 output) in one isolated process. Same
+/// empirical 256 MiB gate as the injection battery, as its own const
+/// so the two gates evolve independently. Never a production cap.
+const H3_COMBINED_RSS_BOUND_BYTES: u64 = 256 << 20;
+
+/// H3 combined workload: the representative retained population in one
+/// isolated worker — sparse 4096 instances with completed reducers,
+/// two churn passes with fresh mechanisms and fresh presentations,
+/// pending calls held then joined, and the H7–H9 output path (emitter
+/// pass, JSON value, serialized buffer, joint observations). Prints
+/// its peak RSS; the parent asserts the bound.
+fn h3_combined_workload() {
+    use crate::discovery::caller_registry::instance_input as instance;
+    use crate::semantics_edge::SemanticCall;
+
+    const RSA_PSS: u64 = 0x000d;
+    const AES_GCM: u64 = 0x1087;
+
+    fn init(function: &str, session: u64, mechanism: u64, ts_ns: u64) -> SemanticCall {
+        use p11scope_ebpf_common::capture;
+        SemanticCall {
+            function: function.into(),
+            session,
+            mechanism,
+            capture: capture::MECHANISM_VALUE | capture::OUTPUT_NON_NULL,
+            ts_ns,
+            ..SemanticCall::default()
+        }
+    }
+
+    fn op(function: &str, session: u64, ts_ns: u64) -> SemanticCall {
+        use p11scope_ebpf_common::capture;
+        SemanticCall {
+            function: function.into(),
+            session,
+            capture: capture::MECHANISM_NONE | capture::OUTPUT_NON_NULL,
+            ts_ns,
+            ..SemanticCall::default()
+        }
+    }
+
+    // Phase A: sparse 4096 — one caller, one module, N registered
+    // instances each with a sparse completed reducer (Init + Op).
+    let mut h = harness();
+    h.stage_scale(&ScaleSpec {
+        name: "h3-combined",
+        callers: 1,
+        modules: 1,
+        edges_per_caller: 1,
+        endpoints_per_module: 1,
+        first_pid: 9200,
+    });
+    h.commit();
+    let caller = h
+        .coordinator()
+        .adapter()
+        .live_id(9200)
+        .expect("live caller");
+    let module = ModuleKey::physical(8, 1, 100_000, Some("sha000000".into()), "/scale/m0.so");
+    let domain = crate::attach::capture::NativeDomainId::mint();
+    let keys: Vec<_> = (0..4096)
+        .map(|index| {
+            instance::key(
+                domain,
+                ImageIdentity {
+                    task_cookie: 1000 + index as u64,
+                    exec_id: 0,
+                },
+                crate::discovery::instances::InstanceId::from_raw(index as u64 + 1),
+                module.clone(),
+            )
+        })
+        .collect();
+    for key in &keys {
+        h.coordinator_mut()
+            .registry_mut()
+            .note_instance(instance::registration(key.clone(), caller, 100, None));
+    }
+    h.commit();
+    assert_eq!(h.coordinator().registry().instances().count(), 4096);
+    for quantum in keys.chunks(512) {
+        for key in quantum {
+            h.coordinator_mut()
+                .registry_mut()
+                .observe_instance_semantic(instance::call(
+                    key.clone(),
+                    caller,
+                    instance::position(domain, 1),
+                    init("C_SignInit", 1, RSA_PSS, 101),
+                    None,
+                ));
+            h.coordinator_mut()
+                .registry_mut()
+                .observe_instance_semantic(instance::call(
+                    key.clone(),
+                    caller,
+                    instance::position(domain, 2),
+                    op("C_Sign", 1, 102),
+                    None,
+                ));
+        }
+        h.commit();
+    }
+    assert_eq!(
+        h.coordinator().registry().instance_semantic_occupied(),
+        4096
+    );
+    // Phase B: churn — two passes with fresh mechanisms, each with a
+    // fresh retained presentation (old+new generations stay live).
+    let mut presentations = vec![crate::inventory_present::Presentation::capture(
+        h.coordinator(),
+        "h3-combined",
+        0,
+        105,
+        1,
+    )];
+    for round in 0..2 {
+        for quantum in keys.chunks(512) {
+            for key in quantum {
+                h.coordinator_mut()
+                    .registry_mut()
+                    .observe_instance_semantic(instance::call(
+                        key.clone(),
+                        caller,
+                        instance::position(domain, 3 + round * 2),
+                        init("C_EncryptInit", 2, AES_GCM, 110 + round * 10),
+                        None,
+                    ));
+                h.coordinator_mut()
+                    .registry_mut()
+                    .observe_instance_semantic(instance::call(
+                        key.clone(),
+                        caller,
+                        instance::position(domain, 4 + round * 2),
+                        op("C_Encrypt", 2, 111 + round * 10),
+                        None,
+                    ));
+            }
+            h.commit();
+        }
+        presentations.push(crate::inventory_present::Presentation::capture(
+            h.coordinator(),
+            "h3-combined",
+            0,
+            120 + round * 10,
+            2 + round,
+        ));
+    }
+    for presentation in &presentations {
+        assert_eq!(presentation.instances.len(), 4096);
+        assert_eq!(presentation.semantic_edges.len(), 4096);
+    }
+    // Phase C: pending/replay — PENDING multi-part calls held across
+    // a commit (live pending occupancy proves the hold is real), then
+    // joined; completions move only after the join. The pending count
+    // sizes to measured pool headroom (a quarter of it at a generous
+    // 8 KiB per async fact, floored at 32): the combined load must
+    // leave room for pending traffic, and the floor fails loudly if
+    // charge drift ever eats that headroom.
+    let pool_after_churn = h.coordinator().registry().semantic_resource_snapshot();
+    let headroom = pool_after_churn
+        .limit_bytes
+        .saturating_sub(pool_after_churn.charged_bytes);
+    // A quarter of headroom at 16 KiB per key for the full
+    // open/hold/detach/complete cycle, floored at 32 meaningful
+    // keys; the asserts below fail loudly if charge drift ever
+    // eats that headroom.
+    let pending_n = (headroom / 4 / 16384).clamp(32, 512);
+    println!(
+        "H3_C_HEADROOM {{\"charged\": {}, \"limit\": {}, \"pending_n\": {pending_n}}}",
+        pool_after_churn.charged_bytes, pool_after_churn.limit_bytes
+    );
+    let completed_before: u64 = h
+        .coordinator()
+        .registry()
+        .instance_semantic_edges()
+        .filter_map(|row| row.semantics.as_ref().map(|s| s.completed()))
+        .sum();
+    // Proven async shape (d1_async_pending_flow_completes): an init
+    // starts the operation, the PENDING op queues against that live
+    // machine, and AsyncComplete replays it to completion. (GetID
+    // detach needs an explicitly opened session and its own pool
+    // headroom; the probe's occupancy asserts already pin detached
+    // accounting, so the cell keeps the completion cycle.)
+    for key in keys.iter().take(pending_n) {
+        h.coordinator_mut()
+            .registry_mut()
+            .observe_instance_semantic(instance::call(
+                key.clone(),
+                caller,
+                instance::position(domain, 7),
+                init("C_SignInit", 7, RSA_PSS, 129),
+                None,
+            ));
+        h.coordinator_mut()
+            .registry_mut()
+            .observe_instance_semantic(instance::call(
+                key.clone(),
+                caller,
+                instance::position(domain, 8),
+                SemanticCall {
+                    rv: pkcs11_types::CkRv::PENDING.0,
+                    ..op("C_Sign", 7, 130)
+                },
+                None,
+            ));
+    }
+    h.commit();
+    let completed_held: u64 = h
+        .coordinator()
+        .registry()
+        .instance_semantic_edges()
+        .filter_map(|row| row.semantics.as_ref().map(|s| s.completed()))
+        .sum();
+    assert_eq!(
+        completed_held, completed_before,
+        "pending calls hold without completing"
+    );
+    let (pending_held, pending_edges, detached_held, dropped_sum, orphans_sum): (
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+    ) = h
+        .coordinator()
+        .registry()
+        .instance_semantic_edges()
+        .filter_map(|row| row.semantics.as_ref())
+        .map(|s| {
+            let usage = s.resource_usage();
+            (
+                usage.pending_calls as u64,
+                u64::from(usage.pending_calls > 0),
+                usage.detached_calls as u64,
+                s.dropped(),
+                s.orphans(),
+            )
+        })
+        .fold((0, 0, 0, 0, 0), |acc, x| {
+            (
+                acc.0 + x.0,
+                acc.1 + x.1,
+                acc.2 + x.2,
+                acc.3 + x.3,
+                acc.4 + x.4,
+            )
+        });
+    println!(
+        "H3_C_DIAG pending={pending_held} pending_edges={pending_edges} \
+         detached={detached_held} dropped={dropped_sum} orphans={orphans_sum}"
+    );
+    let lossy_edges = h
+        .coordinator()
+        .registry()
+        .instance_semantic_edges()
+        .filter(|row| row.lossy)
+        .count();
+    let historical_sum: u64 = h
+        .coordinator()
+        .registry()
+        .instance_semantic_edges()
+        .map(|row| row.historical_only_returns)
+        .sum();
+    let gaps: std::collections::BTreeMap<String, usize> =
+        h.coordinator().registry().gaps().iter().fold(
+            std::collections::BTreeMap::new(),
+            |mut acc, gap| {
+                *acc.entry(format!("{}:{}", gap.subject, gap.reason))
+                    .or_insert(0) += 1;
+                acc
+            },
+        );
+    println!(
+        "H3_C_DIAG2 lossy_edges={lossy_edges} historical_only={historical_sum} \
+         semantic_refused={} gaps={gaps:?}",
+        h.coordinator().registry().instance_semantic_refused(),
+    );
+    assert_eq!(
+        pending_held, pending_n as u64,
+        "every sized pending call holds live"
+    );
+    assert_eq!(lossy_edges, 0, "no refusal invalidates the cell");
+    assert_eq!(
+        h.coordinator().registry().instance_semantic_refused(),
+        0,
+        "the sized cell refuses nothing"
+    );
+    for key in keys.iter().take(pending_n) {
+        h.coordinator_mut()
+            .registry_mut()
+            .observe_instance_semantic(instance::call(
+                key.clone(),
+                caller,
+                instance::position(domain, 9),
+                SemanticCall {
+                    target_function: crate::kinds::function_id("C_Sign").unwrap(),
+                    async_value: 91,
+                    ..op("C_AsyncComplete", 7, 131)
+                },
+                None,
+            ));
+    }
+    h.commit();
+    let pending_left: u64 = h
+        .coordinator()
+        .registry()
+        .instance_semantic_edges()
+        .filter_map(|row| {
+            row.semantics
+                .as_ref()
+                .map(|s| s.resource_usage().pending_calls as u64)
+        })
+        .sum();
+    assert_eq!(pending_left, 0, "every hold replays to completion");
+    let (detached_left, orphans_after, failed_after): (u64, u64, u64) = h
+        .coordinator()
+        .registry()
+        .instance_semantic_edges()
+        .filter_map(|row| row.semantics.as_ref())
+        .map(|s| {
+            (
+                s.resource_usage().detached_calls as u64,
+                s.orphans(),
+                s.failed(),
+            )
+        })
+        .fold((0, 0, 0), |acc, x| (acc.0 + x.0, acc.1 + x.1, acc.2 + x.2));
+    println!(
+        "H3_C_DIAG3 detached_left={detached_left} orphans={orphans_after} \
+         failed={failed_after} refused={} lossy={}",
+        h.coordinator().registry().instance_semantic_refused(),
+        h.coordinator()
+            .registry()
+            .instance_semantic_edges()
+            .filter(|row| row.lossy)
+            .count(),
+    );
+    let completed_joined: u64 = h
+        .coordinator()
+        .registry()
+        .instance_semantic_edges()
+        .filter_map(|row| row.semantics.as_ref().map(|s| s.completed()))
+        .sum();
+    assert_eq!(
+        completed_joined,
+        completed_held + pending_n as u64,
+        "every detached async completes exactly once"
+    );
+    // Phase D: H7–H9 output — emitter pass, JSON value, serialized
+    // buffer, and joint observations over the saturated population.
+    let presentation = presentations.last().unwrap();
+    let limit = presentation.budgets.instances_limit;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(
+        dir.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
+    let path = dir.path().join("h3-combined.jsonl");
+    let mut writer = crate::inventory_events::EventWriter::create(&path, 1 << 30, 5).unwrap();
+    let mut emitter = crate::inventory_events::InstanceEmitter::new();
+    let emission = emitter
+        .emit(
+            &mut writer,
+            &presentation.instances,
+            &presentation.semantic_edges,
+            limit,
+            140,
+        )
+        .unwrap();
+    assert_eq!(
+        emission.instance_emitted + emission.edge_emitted,
+        crate::inventory_events::INSTANCE_EVENTS_PER_PASS,
+        "the saturated pass fills the quota"
+    );
+    let document = crate::inventory::render_json_from_presentation(presentation);
+    assert_eq!(document["instances"].as_array().unwrap().len(), 4096);
+    let serialized = serde_json::to_vec(&document).unwrap();
+    assert!(!serialized.is_empty());
+    let observations = h.coordinator().registry().joint_observations(1);
+    std::hint::black_box((observations, serialized, presentations, keys));
+    println!("WORKLOAD_RSS_HWM_BYTES {}", peak_rss_bytes());
+}
+
+#[test]
+fn h3_combined_workload_stays_within_rss_bound() {
+    let output = run_workload_worker("h3-combined", std::time::Duration::from_secs(120));
+    assert_workload_worker_reaped(output.pid);
+    let stdout = output.result.expect("the H3 combined worker runs green");
+    let hwm: u64 = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("WORKLOAD_RSS_HWM_BYTES ")?.parse().ok())
+        .expect("the worker prints its peak RSS");
+    println!("H3_COMBINED_RSS_HWM_BYTES {hwm}");
+    assert!(
+        hwm < H3_COMBINED_RSS_BOUND_BYTES,
+        "H3 combined peak RSS {hwm} bytes stays within {H3_COMBINED_RSS_BOUND_BYTES}"
     );
 }
 

@@ -1,10 +1,15 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Physical entry-count fixture, not semantic/API or full ABI qualification.
- * Two 2.40 tables share32 real CK_RV(void) bodies at slots4..35. The caller
- * invokes those exact fixture types. No argument/payload reads are requested.
- * Modes: DEMOTION_COMMON, DEMOTION_PROVIDER_A/B, or workload (default).
- * Workload: A B COMMON FIFO LEDGER NONCE DEADLINE_MS COUNTED_ROUNDS SHARED_ROUNDS.
- * Commands: ready, count xN, load-b, shared xM, unload-a, fence, proof, stop.
+ * Two 2.40 tables share32 real CK_RV(void) bodies at slots4..35, one body
+ * per distinct physical object (libdemotion-common-00..31.so): 32 offsets
+ * in one file are one pair, so each slot body lives in its own file to
+ * make32 genuine physical count pairs. The caller invokes those exact
+ * fixture types. No argument/payload reads are requested.
+ * Modes: DEMOTION_COMMON (once per body, with -DCOMMON_BODY and -DCOMMON_FIRST
+ * for slot4 only), DEMOTION_PROVIDER_A/B, or workload (default).
+ * Workload: A B COMMON_DIR FIFO LEDGER NONCE DEADLINE_MS COUNTED_ROUNDS SHARED_ROUNDS.
+ * COMMON_DIR holds libdemotion-common-00..31.so. Commands: ready, count xN,
+ * load-b, shared xM, unload-a, fence, proof, stop.
  * Each issued round requires a subsequent actual observer pass in the live
  * test; native ACKs alone establish no observer admission/counting facts.
  */
@@ -17,9 +22,13 @@ _Static_assert(sizeof(void *) == 8 && sizeof(CK_RV) == 8, "LP64 only");
 _Static_assert(offsetof(FunctionList, slot) == 8, "CK_VERSION LP64 alignment");
 #define SLOTS(X) X(4) X(5) X(6) X(7) X(8) X(9) X(10) X(11) X(12) X(13) X(14) X(15) X(16) X(17) X(18) X(19) X(20) X(21) X(22) X(23) X(24) X(25) X(26) X(27) X(28) X(29) X(30) X(31) X(32) X(33) X(34) X(35)
 #ifdef DEMOTION_COMMON
+#ifndef COMMON_BODY
+#error One body per object: compile with -DCOMMON_BODY=diagnostics_slot_N
+#endif
+#ifdef COMMON_FIRST
 CK_RV demotion_initialize(void *argument) { return argument ? 7 : 0; }
-#define BODY(n) __attribute__((noinline, noclone)) CK_RV diagnostics_slot_##n(void) { return 0; }
-SLOTS(BODY)
+#endif
+__attribute__((noinline, noclone)) CK_RV COMMON_BODY(void) { return 0; }
 #else
 extern CK_RV demotion_initialize(void *);
 #define DECLARE(n) extern CK_RV diagnostics_slot_##n(void);
@@ -45,9 +54,10 @@ CK_RV C_GetFunctionList(void **out) { if (!out) return 7; *out = &table; return 
 #define FIRST_SLOT 4
 #define SLOT_COUNT 32
 static Physical targets[SLOT_COUNT];
+static void *common_handles[SLOT_COUNT];
 
 static int wrap_row(const char *fmt, ...) {
-    char buf[2048]; va_list ap; va_start(ap,fmt);
+    char buf[4096]; va_list ap; va_start(ap,fmt);
     int n=vsnprintf(buf,sizeof buf,fmt,ap); va_end(ap);
     if(n<0||(size_t)n>=sizeof buf||ledger_lines>=65536||ledger_bytes+(size_t)n+1>16*1024*1024)return -1;
     buf[n++]='\n'; if(write_all(ledger,buf,(size_t)n))return -1;
@@ -102,21 +112,34 @@ int main(int argc,char **argv) {
     struct sigaction sa={.sa_handler=on_signal}; sigemptyset(&sa.sa_mask);
     if(sigaction(SIGTERM,&sa,NULL)||sigaction(SIGINT,&sa,NULL))return 1;
     sa.sa_handler=SIG_IGN; if(sigaction(SIGPIPE,&sa,NULL))return 1;
-    int result=1; struct stat fifo_stat,exe_stat,common_stat;
-    char exe_hash[65],common_hash[65]; uint64_t start;
+    int result=1; struct stat fifo_stat,exe_stat,dir_stat,common_stats[SLOT_COUNT];
+    char exe_hash[65],common_hashes[SLOT_COUNT][65]; uint64_t start;
     control=open(argv[4],O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_NOFOLLOW);
     if(control<0||fstat(control,&fifo_stat)||!S_ISFIFO(fifo_stat.st_mode)||fifo_stat.st_uid!=getuid())goto cleanup;
     ledger=open(argv[5],O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW,0600); if(ledger<0)goto cleanup;
-    common_handle=dlopen(argv[3],RTLD_NOW|RTLD_LOCAL);
-    if(!common_handle||dlsym(common_handle,"C_GetFunctionList")||wrap_acquire(argv[1],&a))goto cleanup;
-    if(digest("/proc/self/exe",exe_hash,&exe_stat)||digest(argv[3],common_hash,&common_stat)||start_ticks(&start))goto cleanup;
+    if(stat(argv[3],&dir_stat)||!S_ISDIR(dir_stat.st_mode)||dir_stat.st_uid!=getuid())goto cleanup;
     for(unsigned i=0;i<SLOT_COUNT;i++) {
-        if(physical(a.table->slot[FIRST_SLOT+i],1,&targets[i])||targets[i].ino!=(uint64_t)common_stat.st_ino)goto cleanup;
+        char path[4112]; int n=snprintf(path,sizeof path,"%s/libdemotion-common-%02u.so",argv[3],i);
+        if(n<0||(size_t)n>=sizeof path)goto cleanup;
+        common_handles[i]=dlopen(path,RTLD_NOW|RTLD_LOCAL);
+        if(!common_handles[i]||dlsym(common_handles[i],"C_GetFunctionList"))goto cleanup;
+        if(digest(path,common_hashes[i],&common_stats[i]))goto cleanup;
+    }
+    if(wrap_acquire(argv[1],&a))goto cleanup;
+    if(digest("/proc/self/exe",exe_hash,&exe_stat)||start_ticks(&start))goto cleanup;
+    for(unsigned i=0;i<SLOT_COUNT;i++) {
+        if(physical(a.table->slot[FIRST_SLOT+i],1,&targets[i])||targets[i].ino!=(uint64_t)common_stats[i].st_ino)goto cleanup;
         for(unsigned j=0;j<i;j++)if(same(targets[i],targets[j]))goto cleanup;
     }
     if(wrap_ack("prepared",0)||wait_command("ready")||clock_ns(&now))goto cleanup;
-    if(wrap_row("{\"kind\":\"identity\",\"nonce\":\"%s\",\"pid\":%d,\"start_ticks\":%" PRIu64 ",\"exe_sha256\":\"%s\",\"common_sha256\":\"%s\",\"ready_ns\":%" PRIu64 "}",
-                argv[6],getpid(),start,exe_hash,common_hash,now))goto cleanup;
+    char hash_list[32*70]; size_t hash_used=0;
+    for(unsigned i=0;i<SLOT_COUNT;i++) {
+        int n=snprintf(hash_list+hash_used,sizeof hash_list-hash_used,"%s\"%s\"",i?",":"",common_hashes[i]);
+        if(n<0||(size_t)n>=sizeof hash_list-hash_used)goto cleanup;
+        hash_used+=(size_t)n;
+    }
+    if(wrap_row("{\"kind\":\"identity\",\"nonce\":\"%s\",\"pid\":%d,\"start_ticks\":%" PRIu64 ",\"exe_sha256\":\"%s\",\"common_sha256\":[%s],\"ready_ns\":%" PRIu64 "}",
+                argv[6],getpid(),start,exe_hash,hash_list,now))goto cleanup;
     identity_written=1;
     for(unsigned i=0;i<SLOT_COUNT;i++)
         if(wrap_row("{\"kind\":\"target\",\"slot\":%u,\"dev_major\":%u,\"dev_minor\":%u,\"ino\":%" PRIu64 ",\"offset\":%" PRIu64 "}",
@@ -135,7 +158,9 @@ int main(int argc,char **argv) {
         if(wait_command("shared")||wrap_calls(&b,"shared",round)||wrap_ack("shared-done",round))goto cleanup;
     if(wait_command("unload-a")||dlclose(a.handle))goto cleanup;
     a.handle=NULL; a.table=NULL;
-    if(mapped(a.root)!=0||mapped(b.root)!=1||mapped(targets[0])!=1||wrap_ack("a-unmapped",0))goto cleanup;
+    if(mapped(a.root)!=0||mapped(b.root)!=1)goto cleanup;
+    for(unsigned i=0;i<SLOT_COUNT;i++)if(mapped(targets[i])!=1)goto cleanup;
+    if(wrap_ack("a-unmapped",0))goto cleanup;
     if(wait_command("fence")||wrap_calls(&b,"fence",1)||wrap_ack("fence-done",1)||
        wait_command("proof")||wrap_calls(&b,"proof",1)||wrap_ack("final-calls",1)||wait_command("stop"))goto cleanup;
 complete:
@@ -148,7 +173,7 @@ cleanup:
     }
     if(a.handle&&dlclose(a.handle))result=1;
     if(b.handle&&dlclose(b.handle))result=1;
-    if(common_handle&&dlclose(common_handle))result=1;
+    for(unsigned i=0;i<SLOT_COUNT;i++)if(common_handles[i]&&dlclose(common_handles[i]))result=1;
     if(control>=0&&close(control))result=1;
     if(ledger>=0&&close(ledger))result=1;
     return result;

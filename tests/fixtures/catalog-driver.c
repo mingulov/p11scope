@@ -23,9 +23,11 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -261,6 +263,16 @@ static void usage(const char *argv0)
 
 int main(int argc, char **argv)
 {
+    /* An orphaned fixture must neither wedge shared coordination nor
+     * linger: a SIGSTOPped child outlives an aborted observer (its
+     * Drop never runs), still holding every inherited fd — including
+     * the cargo-lane lock, which flock(1) holds without CLOEXEC by
+     * design. Die with the observer even while stopped; a parent
+     * already gone (reparented before this ran) exits at once; every
+     * fd past stdio closes, so no survivor can ever hold the lock. */
+    prctl(PR_SET_PDEATHSIG, SIGKILL);
+    if (getppid() == 1) return 0;
+    for (int fd = 3; fd < 65536; fd++) close(fd);
     const char *ready_path = NULL;
     int call = 0;
     long sleep_secs = 300;

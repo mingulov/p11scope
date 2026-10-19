@@ -853,3 +853,251 @@ fn privileged_inventory_capture_stop_before_activation_repolls_custody_lp64() ->
     eprintln!("C5_2_STOP_BEFORE_ACTIVATION custody=held,held,lost");
     Ok(())
 }
+
+/// Manifest for an owned fixture provider: real pinning plus the 2.40
+/// legacy table with C_SignInit/C_Sign at the fixture's first two
+/// owned entry offsets (the same endpoints the attach set absorbed).
+/// Returns the written manifest path and the live module key.
+fn fixture_provider_manifest(
+    fixture: &OwnedFixture,
+) -> Result<(
+    std::path::PathBuf,
+    crate::discovery::caller_registry::ModuleKey,
+)> {
+    use anyhow::Context as _;
+    use p11scope_manifest::identity::{inspect_file, mapping_file_key, open_object};
+    use p11scope_manifest::manifest::*;
+    let file = open_object(&fixture.path).map_err(anyhow::Error::msg)?;
+    let inspected = inspect_file(&file).map_err(anyhow::Error::msg)?;
+    let mapping = mapping_file_key(&file).map_err(anyhow::Error::msg)?;
+    ensure!(
+        fixture.plan.slots.len() >= 2,
+        "the fixture owns at least two entry offsets"
+    );
+    let offsets = [
+        fixture.plan.slots[0].file_offset,
+        fixture.plan.slots[1].file_offset,
+    ];
+    let functions = match pkcs11_module::tables_for(pkcs11_module::Surface::LegacyFunctionList {
+        version: cryptoki_sys::CK_VERSION {
+            major: 2,
+            minor: 40,
+        },
+    }) {
+        pkcs11_module::TableSet::Walk(spans) => spans
+            .iter()
+            .flat_map(|span| span.fields())
+            .map(|field| {
+                let resolution = match field.name {
+                    "C_SignInit" => Resolution::Resolved {
+                        object: 0,
+                        file_offset: offsets[0],
+                    },
+                    "C_Sign" => Resolution::Resolved {
+                        object: 0,
+                        file_offset: offsets[1],
+                    },
+                    _ => Resolution::NullPointer,
+                };
+                FunctionRecord {
+                    name: field.name.into(),
+                    resolution,
+                }
+            })
+            .collect(),
+        _ => anyhow::bail!("2.40 is a full standard table"),
+    };
+    let path = fixture.path.to_str().context("fixture path")?.to_string();
+    let manifest = Manifest {
+        schema: SCHEMA.into(),
+        module_path: path.clone(),
+        objects: vec![ObjectRecord {
+            id: 0,
+            path: path.clone(),
+            identity: inspected.identity.clone(),
+        }],
+        provenance_objects: vec![ProvenanceObject {
+            path,
+            device_major: mapping.device_major,
+            device_minor: mapping.device_minor,
+            inode: mapping.inode,
+            identity: inspected.identity,
+        }],
+        interface_list: Acquisition::Absent,
+        surfaces: vec![SurfaceRecord {
+            source: SurfaceSource::LegacyFunctionList,
+            acquisition: Acquisition::Ok,
+            version: Some(Version {
+                major: 2,
+                minor: 40,
+            }),
+            walk: WalkOutcome::Full,
+            functions,
+        }],
+        vendor_interfaces: Vec::new(),
+        alias_groups: Vec::new(),
+        selection_evidence: Default::default(),
+    };
+    ensure!(
+        crate::manifest_input::validate_structure(&manifest).is_empty(),
+        "the fixture manifest is well-formed"
+    );
+    let pinning = crate::discovery::identity::pin_manifest_objects_deferred(&manifest)
+        .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+    ensure!(pinning.stale.is_empty(), "the fixture provider is pinned");
+    let pin = pinning
+        .pins
+        .pinned()
+        .next()
+        .context("the fixture pins one object")?;
+    let key = crate::discovery::caller_registry::ModuleKey::physical(
+        pin.key.device.major,
+        pin.key.device.minor,
+        pin.key.inode,
+        Some(pin.sha256.to_owned()),
+        pin.path,
+    );
+    let manifest_path = fixture.path.with_extension("dr37.json");
+    std::fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;
+    Ok((manifest_path, key))
+}
+
+/// DR37 native Ready positive (V4, privileged): one live fixture
+/// holder under a real Inventory capture flows through the
+/// production resolver, worker preparation over a genuine selected
+/// Session, the native CAS, proof-gated install, wind-down, the
+/// genuine completion mint and retire — the full A→B the staged
+/// suites pin with doubles. Root BPF lane, serial. The counted calls
+/// mint the holder's task cookie in the live maps before the pre-view
+/// baseline runs; every later stage polls its production path with a
+/// wall-clock bound and fails with the stalled state.
+#[test]
+#[ignore = "privileged DR37 full loop: root BPF lane over an owned fixture provider with live calls, serial"]
+fn privileged_dr37_selected_promotion_full_loop() -> Result<()> {
+    use anyhow::Context as _;
+    use std::time::Duration;
+    // The fixture provider plus its attach-set endpoints (proven
+    // harness): the manifest below names the same entry offsets.
+    let fixture = OwnedFixture::build_n(false, 4)?;
+    let mut set = InventoryAttachSet::new(budget(N));
+    let delta = absorb(&mut set, &[&fixture]);
+    // The live holder under a real capture (proven harness).
+    let mut holder = fixture.spawn()?;
+    let pid = holder.child.id();
+    let pin = PidPin::open(pid).map_err(anyhow::Error::msg)?;
+    let mut capture = prepare(CaptureScope::Pid(pin))?;
+    let receipt = capture.extend(delta, &set, extend_window());
+    ensure!(
+        receipt.attached.len() == 4 && receipt.refused.is_none(),
+        "{receipt:?}"
+    );
+    // Counted calls (proven): the cookie the baseline readback needs.
+    holder.calls(0, 2)?;
+    let (rows, _) = read_sweep(&mut |window| capture.read_witnesses(window))?;
+    ensure!(
+        rows.len() == 1 && rows[0].host_tgid == pid,
+        "no witnessed call: {rows:?}"
+    );
+    // The coordinator, manifest, admission and edge: the holder enters
+    // through the real reconcile path (live /proc reads); the module
+    // edge keys the real fixture file identity.
+    let (manifest_path, key) = fixture_provider_manifest(&fixture)?;
+    let mut coordinator =
+        crate::discovery::engine::inventory_coordinator::InventoryCoordinator::new(
+            crate::attach::Scope::Pid(pid),
+            crate::discovery::hooks::HookRegistry::builtin(),
+            Vec::new(),
+            crate::discovery::caller_registry::OsProcessSource,
+            crate::discovery::caller_registry::RegistryLimits::default_limits(),
+        )?;
+    coordinator.set_semantic_manifests(vec![manifest_path]);
+    let started_ns = crate::attach::monotonic_ns().context("monotonic clock")?;
+    let observed = std::collections::BTreeSet::from([pid]);
+    let events = coordinator.adapter_mut().reconcile(
+        &observed,
+        &mut |_| crate::discovery::caller_registry::ImageAuthority::ScanPinned,
+        started_ns,
+    );
+    coordinator.apply_reconcile_events(&events, started_ns);
+    let caller = coordinator
+        .adapter()
+        .live_id(pid)
+        .context("the holder admits")?;
+    let module = coordinator.registry_mut().scripted_module_edge(key, caller);
+    let incarnation = coordinator
+        .adapter()
+        .record(caller)
+        .context("the holder record")?
+        .incarnation;
+    let original = coordinator
+        .adapter()
+        .shared_semantic_custody(caller)
+        .context("the holder custody")?;
+    // The pre-view baseline over the live maps, with a bounded settle
+    // for the freshly minted cookie.
+    let capture_id = crate::inventory_promotion::CaptureId::new(11);
+    let presentation = std::sync::Arc::new(crate::inventory_present::Presentation::capture(
+        &coordinator,
+        "pid",
+        started_ns,
+        crate::attach::monotonic_ns().context("monotonic clock")?,
+        1,
+    ));
+    let targets = [crate::attach::selected_detailed::baseline::BaselineTarget {
+        caller,
+        incarnation,
+        original: original.clone(),
+    }];
+    let baseline_deadline = Instant::now() + Duration::from_secs(60);
+    let batch = loop {
+        let window = ReadWindow::new(8, baseline_deadline)?;
+        match capture.query_promotion_baselines(
+            capture_id,
+            presentation.clone(),
+            &targets,
+            window,
+            |bytes| coordinator.registry().reserve_semantic_storage(bytes),
+        ) {
+            Ok(batch) => break batch,
+            Err(error) => {
+                if Instant::now() < baseline_deadline {
+                    std::thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+                anyhow::bail!("no pre-view baseline within 60s: {error:#}");
+            }
+        }
+    };
+    // The qualified view through the real driver loop to Active and
+    // back through cancel, wind-down, the genuine completion mint and
+    // retire.
+    let view = crate::inventory_promotion::PromotionView::with_baseline(
+        capture_id,
+        crate::inventory_promotion::ViewRevision::new(1),
+        presentation.clone(),
+        std::sync::Arc::new(batch),
+    )
+    .context("the baseline pairs with its viewed frame")?;
+    let (pair, domain) = crate::inventory::classic_promotion_full_loop_for_test(
+        &mut coordinator,
+        &crate::attach::Scope::Pid(pid),
+        view,
+        caller,
+        module,
+        Duration::from_secs(180),
+        Duration::from_secs(120),
+    );
+    ensure!(
+        pair.caller() == caller.0 && pair.provider() == module.0,
+        "the wrong pair installed: {pair:?}"
+    );
+    eprintln!("DR37_FULL_LOOP pair={pair:?} domain={domain:?} holder={pid}");
+    holder.finish()?;
+    let retired = stop(capture)?;
+    ensure!(
+        retired.cleanup().failures.is_empty(),
+        "{:?}",
+        retired.cleanup()
+    );
+    Ok(())
+}

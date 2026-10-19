@@ -1631,6 +1631,153 @@ pub(crate) fn classic_semantic_stop_for_test(
     driver.semantic.take().unwrap()
 }
 
+/// Drive one promotion request through the real driver loop to Active
+/// and back through cancel, wind-down and retire (DR37 privileged
+/// loop): queue on a headless display, tick until the lane installs
+/// via the production path (resolve, worker preparation, native CAS,
+/// proof), cancel, then tick until the domain retires through the
+/// genuine completion mint. Returns the installed pair plus the
+/// retired domain. Bounds are wall-clock; expiry panics with the
+/// stalled state. The caller supplies the qualified view (with a
+/// genuine pre-view baseline) and pair; everything downstream runs
+/// production code.
+#[cfg(test)]
+pub(crate) fn classic_promotion_full_loop_for_test(
+    coordinator: &mut InventoryCoordinator<OsProcessSource>,
+    scope: &crate::attach::Scope,
+    view: crate::inventory_promotion::PromotionView,
+    caller: crate::discovery::caller_registry::CallerId,
+    provider: crate::discovery::caller_registry::ModuleId,
+    active_within: Duration,
+    retire_within: Duration,
+) -> (
+    crate::inventory_promotion::PromotionPair,
+    crate::attach::capture::NativeDomainId,
+) {
+    use crate::inventory_promotion::PromotionState;
+    use std::os::fd::AsRawFd as _;
+    let null = std::fs::File::open("/dev/null").expect("/dev/null opens");
+    let io = DashboardIo {
+        output: null.as_raw_fd(),
+        input: None,
+        account: None,
+        stderr_fd: 2,
+        stderr: StderrRoute::Leave,
+    };
+    let mut display = Display::open(&io, "test").expect("headless display opens");
+    let capture = view.capture();
+    assert!(
+        display.promotion_enable(capture),
+        "promotion enables for the viewed capture"
+    );
+    display
+        .queue_promotion_request_for_test(std::sync::Arc::new(view), caller, provider)
+        .expect("the qualified pair queues");
+    let mut driver = ClassicDriver {
+        coordinator,
+        inventory_scope: None,
+        scope: scope.into(),
+        cgroup: None,
+        max_scan_pids: None,
+        guard: UnavailableImageGuard,
+        deadline: None,
+        attach_backend: crate::attach::BackendSelection::Auto,
+        identity: None,
+        display: Some(display),
+        semantic: None,
+        semantic_staged: false,
+        lifecycle: crate::inventory_promotion::lifecycle::SelectedLifecycleService::new(),
+        completion_source: Some(Box::new(crate::attach::NativeCompletionMinter::new())),
+        pending_install: None,
+        installed_promotion: None,
+        retiring: None,
+    };
+    let started = Instant::now();
+    loop {
+        driver.on_tick();
+        match driver.display.as_ref().expect("display").promotion_state() {
+            PromotionState::Active => break,
+            PromotionState::Refused(refusal) => panic!(
+                "live promotion refused: {refusal:?}; gaps: {:?}",
+                scope_gaps_for_test(&mut driver),
+            ),
+            PromotionState::Ended(reason) => panic!(
+                "live promotion ended before install: {reason:?}; gaps: {:?}",
+                scope_gaps_for_test(&mut driver),
+            ),
+            other => {
+                assert!(
+                    started.elapsed() < active_within,
+                    "live promotion stalled before install: {other:?}; gaps: {:?}",
+                    scope_gaps_for_test(&mut driver),
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+    let pair = driver
+        .installed_promotion
+        .as_ref()
+        .expect("an Active display has an installed promotion")
+        .pair;
+    // The installed domain, read before teardown: wind-down and retire
+    // can complete in the same tick the cancel lands, so inferring it
+    // from the retiring slot afterwards races. Exit below implies the
+    // wind-down recorded and retired exactly this domain.
+    let installed_domain = driver.semantic.as_ref().map(|lane| lane.domain());
+    assert_eq!(
+        pair.caller(),
+        caller.0,
+        "the installed pair names the request"
+    );
+    assert_eq!(
+        pair.provider(),
+        provider.0,
+        "the installed pair names the request"
+    );
+    driver
+        .display
+        .as_mut()
+        .expect("display")
+        .cancel_promotion_for_test();
+    let stopping = Instant::now();
+    loop {
+        driver.on_tick();
+        if driver.installed_promotion.is_none()
+            && driver.retiring.is_none()
+            && driver.lifecycle.is_idle()
+        {
+            break;
+        }
+        assert!(
+            stopping.elapsed() < retire_within,
+            "live promotion stalled before retire: installed={:?} retiring={:?} idle={}; gaps: {:?}",
+            driver.installed_promotion.is_some(),
+            driver.retiring.as_ref().map(|retiring| retiring.domain),
+            driver.lifecycle.is_idle(),
+            scope_gaps_for_test(&mut driver),
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    (
+        pair,
+        installed_domain.expect("an Active promotion installed a lane"),
+    )
+}
+
+/// Drain the coordinator's scope gaps for a test failure message.
+#[cfg(test)]
+fn scope_gaps_for_test(driver: &mut ClassicDriver<'_>) -> Vec<(String, String)> {
+    driver.coordinator.registry_mut().publish();
+    driver
+        .coordinator
+        .registry()
+        .gaps()
+        .iter()
+        .map(|gap| (gap.subject.clone(), gap.reason.clone()))
+        .collect()
+}
+
 impl ClassicDriver<'_> {
     /// A pass warning: stderr on the classic path; under the dashboard
     /// (which must never scribble beside its screen) the log tail, kept

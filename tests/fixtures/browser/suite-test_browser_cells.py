@@ -1031,6 +1031,10 @@ class BrowserCells(unittest.TestCase):
         # Zero-length record fails closed.
         self.assertEqual(
             tls_server.client_hello_status(b"\x16\x03\x01\x00\x00"), "not_hello")
+        # Zero-length ClientHello body is not a hello.
+        self.assertEqual(
+            tls_server.client_hello_status(b"\x16\x03\x01\x00\x04" + b"\x01\x00\x00\x00"),
+            "not_hello")
         # Fragmented hello across two records still proves completion.
         frag = (b"\x16\x03\x01\x00\x08" + b"\x01\x00\x00\x0a" + b"\x00" * 4
                 + b"\x16\x03\x01\x00\x06" + b"\x00" * 6)

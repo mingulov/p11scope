@@ -11580,6 +11580,349 @@ fn joint_capture_owner_ledger_1025th_charge_refuses_without_allocating() {
     );
 }
 
+/// Below-prepay Joint staging refusal through the owner commit path:
+/// a generous twin stages one Joint observation (measuring the
+/// staged bytes and the once-only table prepay), an S1Only twin
+/// under capture-wide accounting measures the direct-commit pool
+/// delta and its owner-ledger assoc bytes, and the refusal twin —
+/// pool pinned pre-registration to exactly the direct commit's
+/// non-prepay need, provably below the table prepay — commits the
+/// same observation gracefully through `commit_batch`: Full fires
+/// exactly once at the stage, ordered fallback reduces S1-direct,
+/// and the assoc mint refuses into a refused key-use row. The
+/// owner ledger bears no trace (census, staged and charged bytes
+/// all zero), the pool moves exactly the non-prepay delta (both
+/// refused ledger contacts moved zero pool bytes), and S1 reduces
+/// identically to the direct twin.
+#[test]
+fn joint_capture_owner_commit_batch_below_prepay_refuses_full_gracefully() {
+    use crate::discovery::caller_registry::OsProcessSource;
+    use crate::discovery::engine::inventory_coordinator::InventoryCoordinator;
+    use crate::semantics_edge::resources::{OWNED_ALLOCATION_PADDING, REDUCER_BASE_CHARGE};
+
+    struct Pipeline {
+        coordinator: InventoryCoordinator<OsProcessSource>,
+        scene: JointScene,
+        caller: CallerId,
+        domain: NativeDomainId,
+        module: ModuleKey,
+    }
+
+    impl Pipeline {
+        fn new() -> Self {
+            let mut coordinator = InventoryCoordinator::new(
+                crate::attach::Scope::Pid(std::process::id()),
+                crate::discovery::hooks::HookRegistry::builtin(),
+                Vec::new(),
+                OsProcessSource,
+                RegistryLimits::new(16, 16, 16, 1024, 1024, 16).expect("generous limits"),
+            )
+            .expect("coordinator builds");
+            let scene = JointScene::new();
+            let module = ModuleKey::Physical {
+                dev_major: 1,
+                dev_minor: 2,
+                ino: 3,
+                sha256: None,
+            };
+            let caller = CallerId(7);
+            let domain = NativeDomainId::try_mint().expect("fresh domain");
+            coordinator
+                .registry_mut()
+                .scripted_module_edge(module.clone(), caller);
+            Self {
+                coordinator,
+                scene,
+                caller,
+                domain,
+                module,
+            }
+        }
+
+        fn register(
+            &mut self,
+            joint: bool,
+            cookie: u64,
+            router: u64,
+            id: RegistryInstanceId,
+        ) -> InstanceKey {
+            let key = InstanceKey::scripted(
+                self.domain,
+                ImageIdentity {
+                    task_cookie: cookie,
+                    exec_id: 1,
+                },
+                InstanceId::from_raw(router),
+                self.module.clone(),
+            );
+            {
+                let registry = self.coordinator.registry_mut();
+                if joint {
+                    let bootstrap = self.scene.bootstrap();
+                    assert!(
+                        registry.install_joint_receipt(key.clone(), bootstrap),
+                        "the receipt install fits the instance bound"
+                    );
+                }
+                registry.note_instance(AdmittedInstance::scripted(key.clone(), self.caller));
+            }
+            self.coordinator
+                .commit_batch(false)
+                .expect("registration commits");
+            assert_eq!(
+                self.coordinator.registry().feed_mode_for_test(id),
+                Some(if joint {
+                    FeedMode::Joint
+                } else {
+                    FeedMode::S1Only
+                }),
+                "registration selects the intended feed"
+            );
+            key
+        }
+
+        fn admit(&mut self, session: Option<u64>) -> (SemanticCall, u64) {
+            let mut shape = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+            shape.session = session;
+            let admitted = admit_call_input(&mut self.scene, &shape);
+            self.scene
+                .adapter
+                .attest_key(&admitted)
+                .expect("call attests");
+            (admitted.s1_facts().clone(), admitted.h0_ordinal())
+        }
+
+        fn observe(&mut self, key: &InstanceKey, facts: SemanticCall, position: u64) {
+            self.coordinator.registry_mut().observe_instance_semantic(
+                AdmittedInstanceCall::scripted(key.clone(), self.caller, position, facts),
+            );
+        }
+
+        fn reducer(&self, id: RegistryInstanceId) -> &EdgeSemantics {
+            self.coordinator
+                .registry()
+                .instance_semantic_edges()
+                .find(|record| record.id == id)
+                .expect("edge retained")
+                .semantics
+                .as_ref()
+                .expect("reducer materialized")
+        }
+
+        fn pool_charged(&self) -> usize {
+            self.coordinator
+                .registry()
+                .semantic_resource_snapshot()
+                .charged_bytes
+        }
+    }
+
+    fn shape_of(facts: &SemanticCall) -> (String, u64, u64, u64, u32, u64) {
+        (
+            facts.function.clone(),
+            facts.rv,
+            facts.session,
+            facts.mechanism,
+            facts.capture,
+            facts.ts_ns,
+        )
+    }
+
+    // Healthy twin: generous pool; the observation stages.
+    let mut healthy = Pipeline::new();
+    let healthy_id = RegistryInstanceId::from_raw(0);
+    let healthy_base = healthy.pool_charged();
+    let healthy_key = healthy.register(true, 101, 1, healthy_id);
+    let healthy_reg = healthy.pool_charged();
+    let registration_delta = healthy_reg - healthy_base;
+    assert_eq!(
+        registration_delta, 0,
+        "registration stages no pool bytes; the reducer base lands at first reduction"
+    );
+    let (h_facts, h_pos) = healthy.admit(Some(SESSION));
+    // S1Only twin under capture-wide accounting: a silent Joint
+    // latch plus the direct feed.
+    let mut s1 = Pipeline::new();
+    s1.register(true, 201, 11, RegistryInstanceId::from_raw(0));
+    let s1_id = RegistryInstanceId::from_raw(1);
+    let s1_key = s1.register(false, 102, 2, s1_id);
+    let (s1_facts, s1_pos) = s1.admit(Some(SESSION));
+    // Refusal twin: admitted early for lockstep; pinned and
+    // registered after the twins measure its headroom.
+    let mut refusal = Pipeline::new();
+    let (r_facts, r_pos) = refusal.admit(Some(SESSION));
+    assert_eq!(s1_pos, h_pos, "lockstep admissions agree");
+    assert_eq!(r_pos, h_pos, "lockstep admissions agree");
+    assert_eq!(shape_of(&h_facts), shape_of(&s1_facts), "lockstep facts agree");
+    assert_eq!(shape_of(&h_facts), shape_of(&r_facts), "lockstep facts agree");
+    healthy.observe(&healthy_key, h_facts, h_pos);
+    healthy
+        .coordinator
+        .commit_batch(false)
+        .expect("healthy observation commits");
+    assert_eq!(healthy.coordinator.joint_capture().ledger().staged(), 1);
+    assert_eq!(healthy.coordinator.joint_capture().ledger().census(), 1);
+    let staged_bytes = healthy.coordinator.joint_capture().ledger().charged_bytes();
+    assert!(staged_bytes > 0, "the staged call charges owner bytes");
+    let staged_delta = healthy.pool_charged() - healthy_reg;
+    let table_prepay =
+        staged_delta - REDUCER_BASE_CHARGE - (staged_bytes as usize + OWNED_ALLOCATION_PADDING);
+    assert!(table_prepay > 0, "the first stage prepays the owner table");
+    s1.observe(&s1_key, s1_facts, s1_pos);
+    let s1_pre = s1.pool_charged();
+    let s1_observations_before = s1.coordinator.registry().joint_observations(7);
+    let ((), s1_peak, s1_allocs, s1_requested) = crate::test_alloc::counted_peak_during(|| {
+        s1.coordinator
+            .commit_batch(false)
+            .expect("direct observation commits");
+    });
+    assert!(!s1_peak.incomplete);
+    let s1_pool_delta = s1.pool_charged() - s1_pre;
+    // The direct commit mints its key-use assoc into the shared
+    // owner ledger, prepaying the same table the stage would: the
+    // refusal pin must clear the reducer base plus transition
+    // growth while sitting below the prepay the assoc took here.
+    let s1_assoc_bytes = s1.coordinator.joint_capture().ledger().charged_bytes();
+    assert!(s1_assoc_bytes > 0, "the direct commit mints its assoc");
+    assert_eq!(s1.coordinator.joint_capture().ledger().census(), 1);
+    let s1_keyuse = s1.coordinator.registry().keyuse_for_test();
+    assert_eq!(s1_keyuse.open().len(), 1, "the assoc opens live");
+    assert_eq!(s1_keyuse.refused_opens().len(), 0);
+    let headroom =
+        s1_pool_delta - table_prepay - (s1_assoc_bytes as usize + OWNED_ALLOCATION_PADDING);
+    assert!(headroom > 0, "the direct commit needs non-prepay pool");
+    assert!(
+        headroom < table_prepay,
+        "the pinned headroom sits below the table prepay"
+    );
+    let refusal_base = refusal.pool_charged();
+    refusal
+        .coordinator
+        .registry_mut()
+        .reference_semantic_resource_limit(refusal_base + registration_delta + headroom);
+    let refusal_id = RegistryInstanceId::from_raw(0);
+    let refusal_key = refusal.register(true, 101, 1, refusal_id);
+    let refusal_reg = refusal.pool_charged();
+    assert_eq!(
+        refusal_reg - refusal_base,
+        registration_delta,
+        "twin registration replays exactly"
+    );
+    refusal.observe(&refusal_key, r_facts, r_pos);
+    let r_pre = refusal.pool_charged();
+    assert_eq!(
+        r_pre, refusal_reg,
+        "observe stages no pool bytes before the commit"
+    );
+    let r_observations_before = refusal.coordinator.registry().joint_observations(7);
+    assert_eq!(
+        r_observations_before, s1_observations_before,
+        "no seal delivered: both twins start unavailable, never invented"
+    );
+    let refused_before = refusal
+        .coordinator
+        .registry()
+        .semantic_resource_snapshot()
+        .refused;
+    let ((), r_peak, r_allocs, r_requested) = crate::test_alloc::counted_peak_during(|| {
+        refusal
+            .coordinator
+            .commit_batch(false)
+            .expect("the refused stage commits gracefully");
+    });
+    assert!(!r_peak.incomplete);
+    let r_post = refusal.pool_charged();
+    let refused_after = refusal
+        .coordinator
+        .registry()
+        .semantic_resource_snapshot()
+        .refused;
+    println!(
+        "H3_MEM_BELOW_PREPAY {{\"registration_delta\": {registration_delta}, \
+         \"staged_bytes\": {staged_bytes}, \"table_prepay\": {table_prepay}, \
+         \"s1_pool_delta\": {s1_pool_delta}, \"s1_assoc_bytes\": {s1_assoc_bytes}, \
+         \"s1_allocs\": {s1_allocs}, \"s1_requested\": {s1_requested}, \
+         \"s1_live\": {}, \"headroom\": {headroom}, \
+         \"r_pool_delta\": {}, \"r_allocs\": {r_allocs}, \
+         \"r_requested\": {r_requested}, \"r_live\": {}, \
+         \"refused_delta\": {}, \"fallback\": {}, \"census\": {}, \
+         \"staged\": {}, \"charged\": {}}}",
+        s1_peak.live_bytes,
+        r_post - r_pre,
+        r_peak.live_bytes,
+        refused_after - refused_before,
+        refusal.coordinator.registry().joint_direct_fallback(),
+        refusal.coordinator.joint_capture().ledger().census(),
+        refusal.coordinator.joint_capture().ledger().staged(),
+        refusal.coordinator.joint_capture().ledger().charged_bytes(),
+    );
+    assert_eq!(
+        refusal.coordinator.registry().joint_direct_fallback(),
+        1,
+        "Full fires exactly once at the staging refusal point"
+    );
+    assert_eq!(
+        refusal
+            .coordinator
+            .registry()
+            .feed_mode_for_test(refusal_id),
+        Some(FeedMode::S1Only),
+        "ordered fallback degrades the feed to S1Only"
+    );
+    assert_eq!(
+        refusal.coordinator.joint_capture().ledger().census(),
+        0,
+        "the refused stage holds no census"
+    );
+    assert_eq!(
+        refusal.coordinator.joint_capture().ledger().staged(),
+        0,
+        "the refused stage holds no staged roles"
+    );
+    assert_eq!(
+        refusal.coordinator.joint_capture().ledger().charged_bytes(),
+        0,
+        "the refused ledger contacts charge no bytes"
+    );
+    assert_eq!(
+        r_post - r_pre,
+        headroom,
+        "the refused commit moves exactly the non-prepay delta"
+    );
+    assert_eq!(
+        refused_after - refused_before,
+        2,
+        "the stage and the assoc mint each refuse the prepay once"
+    );
+    assert_s1_equal(refusal.reducer(refusal_id), s1.reducer(s1_id));
+    assert_eq!(
+        refusal.reducer(refusal_id).calls(),
+        1,
+        "the fallback reduces the refused call S1-direct"
+    );
+    let r_keyuse = refusal.coordinator.registry().keyuse_for_test();
+    assert_eq!(
+        r_keyuse.open().len(),
+        0,
+        "the refused assoc opens nothing live"
+    );
+    assert_eq!(
+        r_keyuse.refused_opens().len(),
+        1,
+        "the refused assoc lands exactly one refused row"
+    );
+    assert_eq!(
+        refusal.coordinator.registry().joint_observations(7),
+        r_observations_before,
+        "the fallback invents no object facts"
+    );
+    assert_eq!(
+        s1.coordinator.registry().joint_observations(7),
+        s1_observations_before,
+        "the direct twin invents no object facts either"
+    );
+}
+
 /// Mixed H8-open census via adapter ingest, with N15 at capacity: 1000
 /// H8Open charges plus 24 genuine adapter-collected raw quants (each
 /// joined by its staged payload) fill the owner's 1024 census with

@@ -23,9 +23,12 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/prctl.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -255,18 +258,35 @@ static int controlled(const char *ready_path, const char *ledger, long seconds, 
 
 static void usage(const char *argv0)
 {
-    fprintf(stderr, "usage: %s --ready <file> [--call] [--sleep <secs>] <provider.so>...\n",
+    fprintf(stderr, "usage: %s --ready <file> [--call] [--sleep <secs>] [--die-with-parent <ppid>] <provider.so>...\n",
             argv0);
 }
 
 int main(int argc, char **argv)
 {
+    /* Fixture fd hygiene is unconditional: no spawned driver may carry
+     * observer fds past stdio — notably the cargo-lane lock, which
+     * flock(1) holds without CLOEXEC by design and which a surviving
+     * driver would wedge via the shared open file description. The
+     * driver takes no inherited descriptor in any mode (providers open
+     * O_CLOEXEC by path, control polls stdin, ready/ledger files open
+     * by path), and mapping ground truth reads /proc, never this
+     * table — so scrubbing first is safe for every spawner. */
+    {
+        long cap = 1 << 20;
+        struct rlimit lim;
+        if (getrlimit(RLIMIT_NOFILE, &lim) == 0 && lim.rlim_cur < (rlim_t)cap)
+            cap = (long)lim.rlim_cur;
+        for (int fd = 3; fd < cap; fd++) close(fd);
+    }
     const char *ready_path = NULL;
     int call = 0;
     long sleep_secs = 300;
     int first_so = 0;
     const char *ledger = NULL;
     int control = 0;
+    int owned = 0;
+    pid_t owned_ppid = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--ready") == 0) {
@@ -292,6 +312,19 @@ int main(int argc, char **argv)
                 usage(argv[0]);
                 return 2;
             }
+        } else if (strcmp(argv[i], "--die-with-parent") == 0) {
+            if (++i >= argc) {
+                usage(argv[0]);
+                return 2;
+            }
+            char *end = NULL;
+            long ppid = strtol(argv[i], &end, 10);
+            if (end == argv[i] || *end != '\0' || ppid <= 0 || ppid > INT_MAX) {
+                usage(argv[0]);
+                return 2;
+            }
+            owned = 1;
+            owned_ppid = (pid_t)ppid;
         } else if (first_so == 0) {
             first_so = i;
         }
@@ -299,6 +332,19 @@ int main(int argc, char **argv)
     if (ready_path == NULL || first_so == 0) {
         usage(argv[0]);
         return 2;
+    }
+    if (owned) {
+        /* Explicitly-owned fixtures only: die with the observer even
+         * while SIGSTOPped, so an aborted run cannot strand a stopped
+         * child on shared coordination. Ground-truth fixtures (the
+         * identity sweeps) omit the flag and keep sleeping for
+         * post-observer /proc verification. The adoption check
+         * compares against the expected owner: a live subreaper may
+         * adopt before this runs, so testing for init alone misses
+         * it, and the death signal never fires for a death that
+         * predates registration. */
+        prctl(PR_SET_PDEATHSIG, SIGKILL);
+        if (getppid() != owned_ppid) return 0;
     }
     if (ledger || control) {
         if (!ledger || !control || !call) return 2;

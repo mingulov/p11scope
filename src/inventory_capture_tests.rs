@@ -3410,3 +3410,306 @@ mod backend_selection {
         );
     }
 }
+
+/// Sol P2 residual: a scan-only zero-pass stop streams its diagnostic
+/// gap under a terminal `final` marker, so the consumer's
+/// AGREE-GAP-ACCOUNTING check (`sum(pass_committed.new_gaps)` equals the
+/// streamed `gap_recorded` count) passes through the real finalizer: the
+/// real loop, a real coordinator, the real per-commit emitters and the
+/// real `finish_output` — not a unit seam.
+mod scan_terminal_accounting_tests {
+    use super::*;
+    use crate::inventory::{
+        EventLogState, StreamState, emit_pass_events, emit_stop_events, finish_output,
+        start_event_log,
+    };
+    use crate::inventory_events::EventWriter;
+    use crate::inventory_output::{FinalStdout, StdoutResult};
+    use crate::inventory_present::Presentation;
+
+    const SCOPE: &str = "s";
+
+    struct DiscardStdout;
+    impl FinalStdout for DiscardStdout {
+        fn begin_finalization(&mut self) {}
+        fn write_document(&mut self, bytes: &[u8]) -> StdoutResult {
+            Ok(bytes.len())
+        }
+    }
+
+    /// The production classic stream wiring (minus stderr progress
+    /// lines): the real prologue, the real per-commit emitters on
+    /// publication, the real `finish_output`.
+    struct StreamRun {
+        _dir: tempfile::TempDir,
+        path: PathBuf,
+        stream: EventLogState,
+        state: StreamState,
+        started_ns: u64,
+    }
+
+    impl StreamRun {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("events.jsonl");
+            let writer = EventWriter::create(&path, 1 << 20, 5).unwrap();
+            Self {
+                _dir: dir,
+                path,
+                stream: EventLogState::new(Some(writer)),
+                state: StreamState::new(),
+                started_ns: now_ns(),
+            }
+        }
+
+        fn publish(&mut self, scene: &mut Scene, point: Publish<'_>) {
+            let started_ns = self.started_ns;
+            let error = match point {
+                Publish::Pass { report, now_ns } => {
+                    self.stream.attempt("pass publication", |writer| {
+                        let presentation = Presentation::capture(
+                            &scene.coordinator,
+                            SCOPE,
+                            started_ns,
+                            now_ns,
+                            scene.coordinator.passes(),
+                        );
+                        emit_pass_events(writer, &mut self.state, report, &presentation, now_ns)
+                    })
+                }
+                Publish::Retiring { .. } => None,
+                Publish::Stop { events, now_ns } => {
+                    self.stream.attempt("stop publication", |writer| {
+                        let presentation = Presentation::capture(
+                            &scene.coordinator,
+                            SCOPE,
+                            started_ns,
+                            now_ns,
+                            scene.coordinator.passes(),
+                        );
+                        emit_stop_events(
+                            writer,
+                            &mut self.state,
+                            events,
+                            scene.coordinator.passes(),
+                            &presentation,
+                            now_ns,
+                        )
+                    })
+                }
+            };
+            assert!(error.is_none(), "publication streams: {error:?}");
+        }
+
+        fn finish(mut self, scene: &mut Scene) -> Vec<serde_json::Value> {
+            let ended_ns = now_ns();
+            let presentation = Presentation::capture(
+                &scene.coordinator,
+                SCOPE,
+                self.started_ns,
+                ended_ns,
+                scene.coordinator.passes(),
+            );
+            let outcome = finish_output(
+                None,
+                &mut self.stream,
+                &mut self.state,
+                &presentation,
+                false,
+                true,
+                &mut DiscardStdout,
+                None,
+                None,
+            );
+            assert!(
+                outcome.failures().is_empty(),
+                "final sinks confirm: {:?}",
+                outcome.failures()
+            );
+            assert_eq!(outcome.event_log_confirmed(), Some(true));
+            std::fs::read_to_string(&self.path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect()
+        }
+    }
+
+    fn kinds(lines: &[serde_json::Value]) -> Vec<&str> {
+        lines
+            .iter()
+            .map(|line| line["kind"].as_str().unwrap())
+            .collect()
+    }
+
+    /// The consumer's AGREE-GAP-ACCOUNTING check verbatim: the markers'
+    /// `new_gaps` sums to the streamed `gap_recorded` count.
+    fn assert_gap_accounting(lines: &[serde_json::Value]) {
+        let streamed = lines
+            .iter()
+            .filter(|line| line["kind"] == "gap_recorded")
+            .count() as u64;
+        let accounted: u64 = lines
+            .iter()
+            .filter(|line| line["kind"] == "pass_committed")
+            .map(|line| line["event"]["new_gaps"].as_u64().unwrap())
+            .sum();
+        assert_eq!(
+            accounted, streamed,
+            "new_gaps sums to the streamed gaps: {lines:?}"
+        );
+    }
+
+    fn scan_clock(stop: &dyn Fn() -> bool) -> LoopClock<'_> {
+        LoopClock {
+            deadline: None,
+            stop,
+            interval: Duration::ZERO,
+            tick: Duration::from_millis(1),
+            collection_tick: NO_COLLECTION_TICK,
+        }
+    }
+
+    #[test]
+    fn scan_only_zero_pass_stop_streams_its_gap_under_a_terminal_marker() {
+        let log = Log::default();
+        let mut scene = Scene::new(&log);
+        let mut run = StreamRun::new();
+        let initial_error =
+            start_event_log(&mut run.stream, &scene.coordinator, SCOPE, run.started_ns);
+        assert!(initial_error.is_none());
+        // A pre-requested stop: the zero-pass shape with no timing.
+        let stop = || true;
+        let clock = scan_clock(&stop);
+        let outcome = run_classic_finalizing(
+            &mut scene,
+            None::<NativeLane<ScriptedLane>>,
+            &clock,
+            initial_error,
+            &mut |scene, point| {
+                run.publish(scene, point);
+                Ok(())
+            },
+        );
+        assert!(outcome.error.is_none(), "exit 0 is preserved");
+        assert!(outcome.stopped.is_none());
+        assert!(outcome.zero_pass.is_some(), "a zero-pass stop is reported");
+        let lines = run.finish(&mut scene);
+        let kinds = kinds(&lines);
+        assert_eq!(kinds.first(), Some(&"started"));
+        assert_eq!(kinds.last(), Some(&"ended"));
+        let gaps: Vec<&serde_json::Value> = lines
+            .iter()
+            .filter(|line| line["kind"] == "gap_recorded")
+            .collect();
+        assert_eq!(gaps.len(), 1, "{lines:?}");
+        assert_eq!(gaps[0]["event"]["subject"], ZERO_PASS_GAP_SUBJECT);
+        let markers: Vec<&serde_json::Value> = lines
+            .iter()
+            .filter(|line| line["kind"] == "pass_committed")
+            .collect();
+        assert_eq!(markers.len(), 1, "{lines:?}");
+        let marker = &markers[0]["event"];
+        assert_eq!(marker["final"], true, "terminal, not a scan pass");
+        assert_eq!(marker["pass"], 0);
+        assert_eq!(marker["scanned"], 0, "no completed pass is claimed");
+        assert_eq!(marker["new_gaps"], 1);
+        assert_eq!(
+            marker["totals"],
+            serde_json::json!({"callers": 0, "modules": 0, "edges": 0}),
+            "nothing was admitted: {marker}"
+        );
+        assert_gap_accounting(&lines);
+    }
+
+    #[test]
+    fn scan_snapshot_streams_its_pass_without_a_terminal_marker() {
+        // The healthy twin: an in-budget scan pass streams under its own
+        // pass marker, with no diagnostic gap and no terminal marker.
+        let log = Log::default();
+        let mut scene = Scene::new(&log);
+        let mut run = StreamRun::new();
+        let initial_error =
+            start_event_log(&mut run.stream, &scene.coordinator, SCOPE, run.started_ns);
+        assert!(initial_error.is_none());
+        let stop = || false;
+        let clock = scan_clock(&stop);
+        let outcome = run_classic_finalizing(
+            &mut scene,
+            None::<NativeLane<ScriptedLane>>,
+            &clock,
+            initial_error,
+            &mut |scene, point| {
+                run.publish(scene, point);
+                Ok(())
+            },
+        );
+        assert!(outcome.error.is_none());
+        assert!(outcome.zero_pass.is_none(), "no zero-pass stop happened");
+        let lines = run.finish(&mut scene);
+        let markers: Vec<&serde_json::Value> = lines
+            .iter()
+            .filter(|line| line["kind"] == "pass_committed")
+            .collect();
+        assert_eq!(markers.len(), 1, "{lines:?}");
+        assert!(
+            markers[0]["event"].get("final").is_none(),
+            "a scan pass carries no terminal flag: {}",
+            markers[0]["event"]
+        );
+        assert!(
+            !lines.iter().any(|line| line["kind"] == "gap_recorded"
+                && line["event"]["subject"] == ZERO_PASS_GAP_SUBJECT),
+            "no diagnostic gap fires in budget: {lines:?}"
+        );
+        assert_gap_accounting(&lines);
+    }
+
+    #[test]
+    fn native_zero_pass_stop_streams_its_gap_under_a_terminal_marker() {
+        // The native control: the pre-existing terminal path already
+        // accounts the diagnostic gap; the same harness proves it.
+        let log = Log::default();
+        let mut scene = Scene::new(&log);
+        let lane = ScriptedLane::new(&log);
+        let started = NativeLane::start(lane, &mut scene, windows(), None)
+            .map_err(|(_, reason)| reason)
+            .unwrap();
+        let mut run = StreamRun::new();
+        let initial_error =
+            start_event_log(&mut run.stream, &scene.coordinator, SCOPE, run.started_ns);
+        assert!(initial_error.is_none());
+        let stop = || true;
+        let clock = scan_clock(&stop);
+        let outcome = run_classic_finalizing(
+            &mut scene,
+            Some(started),
+            &clock,
+            initial_error,
+            &mut |scene, point| {
+                run.publish(scene, point);
+                Ok(())
+            },
+        );
+        assert!(outcome.error.is_none(), "exit 0 is preserved");
+        assert!(outcome.stopped.is_some(), "the owned stop still drains");
+        assert!(outcome.zero_pass.is_some(), "a zero-pass stop is reported");
+        let lines = run.finish(&mut scene);
+        let gaps: Vec<&serde_json::Value> = lines
+            .iter()
+            .filter(|line| line["kind"] == "gap_recorded")
+            .collect();
+        assert!(
+            gaps.iter()
+                .any(|gap| gap["event"]["subject"] == ZERO_PASS_GAP_SUBJECT),
+            "the diagnostic gap streams: {lines:?}"
+        );
+        let markers: Vec<&serde_json::Value> = lines
+            .iter()
+            .filter(|line| line["kind"] == "pass_committed")
+            .collect();
+        assert_eq!(markers.len(), 1, "{lines:?}");
+        assert_eq!(markers[0]["event"]["final"], true);
+        assert_gap_accounting(&lines);
+    }
+}

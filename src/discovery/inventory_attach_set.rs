@@ -1964,7 +1964,16 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let big = provider(&dir, "big.so", "provider-big");
         let pins = pass_pins(&[(&big, "sha-big")]);
-        let modules = [module(&pins, &big, &offsets(600))];
+        // Past Detailed capacity in both profiles: 600 clears the
+        // default 512 slots, while the wide profile's 2,112 slots need
+        // a bigger module. Both stay under the 4,096-endpoint inventory
+        // budget below.
+        let endpoints = if cfg!(feature = "wide-detailed-2112") {
+            2200u64
+        } else {
+            600u64
+        };
+        let modules = [module(&pins, &big, &offsets(endpoints))];
 
         let detailed = lower(&modules, &pins, AdmissionPolicy::detailed());
         assert_eq!(detailed.refused_modules().count(), 1);
@@ -1973,15 +1982,15 @@ pub(crate) mod tests {
         let mut set = InventoryAttachSet::new(budget(4096));
         let policy = AdmissionPolicy::Inventory(set.budget());
         let outcome = set.absorb(&lower(&modules, &pins, policy), &pins);
-        assert_eq!(outcome.delta.endpoints.len(), 600);
+        assert_eq!(outcome.delta.endpoints.len(), endpoints as usize);
         assert_eq!(
             outcome.delta.endpoints.last().map(|endpoint| endpoint.id.0),
-            Some(599)
+            Some((endpoints - 1) as u32)
         );
         assert_eq!(
             outcome.verdicts.get(&module_key(&big, "sha-big")),
             Some(&AttachVerdict::Admitted {
-                endpoints: 600,
+                endpoints: endpoints as usize,
                 reasons: vec![]
             })
         );

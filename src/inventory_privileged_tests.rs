@@ -2562,6 +2562,9 @@ fn privileged_native_lane_sigint_during_extend_lp64() -> Result<()> {
     let began = Instant::now();
     let stopped = run_classic(&mut driver, Some(lane), &clock, &mut |_, _| Ok(()))?
         .context("a native run stops its lane")?;
+    // The run is over: end the driver's coordinator borrow before the
+    // direct coordinator reads below (its Drop would extend it).
+    drop(driver);
     let elapsed = began.elapsed();
     ensure!(stopped.summary.passes == 1, "{:?}", stopped.summary);
     ensure!(coordinator.passes() == 1);

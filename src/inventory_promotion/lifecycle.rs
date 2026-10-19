@@ -529,6 +529,9 @@ impl std::fmt::Debug for DisposingOutcome {
 enum UnprovedOwner {
     Preparation(SelectedPreparationFailure),
     Lane(ProvisionalSelectedLane),
+    /// A delivered worker outcome the service never handled (dropped
+    /// past the stop budget): retained whole, never retried.
+    Outcome(PreparationOutcome),
 }
 
 impl std::fmt::Debug for UnprovedOwner {
@@ -542,8 +545,28 @@ impl std::fmt::Debug for UnprovedOwner {
                 .field(&failure.cleanup_status())
                 .finish(),
             Self::Lane(lane) => f.debug_tuple("UnprovedOwner::Lane").field(lane).finish(),
+            Self::Outcome(outcome) => f
+                .debug_tuple("UnprovedOwner::Outcome")
+                .field(outcome)
+                .finish(),
         }
     }
+}
+
+/// Process-lifetime custody for unresolved native owners: a dropped
+/// service (or driver) retains its unproved owners, its queued worker
+/// outcome and any disposal in flight instead of destroying them.
+/// Retention is by `mem::forget` (the `release_terminal_owner`
+/// precedent): nothing here needs `Send`, and the forgotten owners
+/// live until process exit. Tests observe retention through the
+/// counter; production never reads it.
+#[cfg(test)]
+static CUSTODY_RETAINED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn retain_for_process_exit<T>(owner: T) {
+    #[cfg(test)]
+    CUSTODY_RETAINED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    std::mem::forget(owner);
 }
 
 #[allow(clippy::large_enum_variant)] // DR37: one state per service; the payloads move once per promotion.
@@ -905,11 +928,72 @@ impl SelectedLifecycleService {
         };
         Ok(())
     }
+
+    /// Retain one unresolved lane for process lifetime: the
+    /// driver-drop path for a held handoff the service would not take
+    /// back.
+    pub(crate) fn retain_lane_for_process_exit(lane: ProvisionalSelectedLane) {
+        retain_for_process_exit(UnprovedOwner::Lane(lane));
+    }
+
+    /// How many unresolved owners reached process-lifetime custody in
+    /// this process: the retention twins diff around their own drop.
+    #[cfg(test)]
+    pub(crate) fn custody_retained_for_test() -> usize {
+        CUSTODY_RETAINED.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 impl Default for SelectedLifecycleService {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for SelectedLifecycleService {
+    /// Teardown retention: unproved owners, a queued worker outcome
+    /// and any disposal in flight move to process-lifetime custody
+    /// instead of dying with the service. Never blocks, never joins:
+    /// a live worker is detached and its late send lands in the
+    /// retained channel; a dead worker's handle detaches.
+    fn drop(&mut self) {
+        for owner in std::mem::take(&mut self.unproved) {
+            retain_for_process_exit(owner);
+        }
+        let state = std::mem::replace(&mut self.state, ServiceState::Idle);
+        match state {
+            ServiceState::Preparing {
+                outcome, worker, ..
+            } => {
+                // Detach first: no join on any teardown path.
+                drop(worker);
+                match outcome.try_recv() {
+                    Ok(delivered) => {
+                        retain_for_process_exit(UnprovedOwner::Outcome(delivered));
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        // The worker died without delivering: nothing
+                        // was ever retained, nothing to keep.
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        // The worker is still live: retain the channel
+                        // itself so its late send lands in custody
+                        // instead of dying with the receiver. The
+                        // detached worker then exits on its own.
+                        retain_for_process_exit(outcome);
+                    }
+                }
+            }
+            ServiceState::Disposing { outcome, .. } => {
+                retain_for_process_exit(match outcome {
+                    DisposingOutcome::Preparation(failure) => UnprovedOwner::Preparation(failure),
+                    DisposingOutcome::Lane(lane) => UnprovedOwner::Lane(lane),
+                });
+            }
+            // Idle holds nothing; Installing already handed its parts
+            // to the driver, which reclaims them on its own drop.
+            ServiceState::Idle | ServiceState::Installing { .. } => {}
+        }
     }
 }
 
@@ -1421,6 +1505,78 @@ mod tests {
             ))
         );
         assert!(service.is_idle());
+    }
+
+    #[test]
+    fn dropped_service_retains_unproved_owner_for_process_exit() {
+        let before = SelectedLifecycleService::custody_retained_for_test();
+        let (mut promoter, request) = taken_request_for_test();
+        let mut service = SelectedLifecycleService::new();
+        service
+            .start(request, capacity(), stub_source(None).0, || {
+                PreparationOutcome::Failed(SelectedPreparationFailure::scripted_unproved())
+            })
+            .expect("start runs");
+        let event = poll_until(&mut service, Duration::from_secs(5)).expect("terminal event");
+        let LifecycleEvent::Status(update) = event else {
+            panic!("unproved job must not install");
+        };
+        assert_eq!(
+            promoter.set_status(update),
+            Some(super::super::PromotionState::Refused(
+                PromotionRefusal::PreparationFailed
+            ))
+        );
+        assert!(service.is_idle());
+        drop(service);
+        assert!(
+            SelectedLifecycleService::custody_retained_for_test() > before,
+            "the unproved owner survives the service"
+        );
+    }
+
+    #[test]
+    fn dropped_service_retains_queued_outcome_for_process_exit() {
+        let before = SelectedLifecycleService::custody_retained_for_test();
+        let (_promoter, request) = taken_request_for_test();
+        let mut service = SelectedLifecycleService::new();
+        service
+            .start(request, capacity(), stub_source(None).0, || {
+                PreparationOutcome::Failed(SelectedPreparationFailure::scripted_settled())
+            })
+            .expect("start runs");
+        // Drop without polling: a delivered outcome is retained whole,
+        // and a still-running worker's channel is retained so its late
+        // send lands in custody. Either way the count grows; the drop
+        // itself never blocks and never joins.
+        std::thread::sleep(Duration::from_millis(100));
+        drop(service);
+        assert!(
+            SelectedLifecycleService::custody_retained_for_test() > before,
+            "the queued outcome or its channel survives the service"
+        );
+    }
+
+    #[test]
+    fn dropped_service_retains_live_worker_channel_for_process_exit() {
+        let before = SelectedLifecycleService::custody_retained_for_test();
+        let (_promoter, request) = taken_request_for_test();
+        let mut service = SelectedLifecycleService::new();
+        let (gate, release) = std::sync::mpsc::channel::<()>();
+        service
+            .start(request, capacity(), stub_source(None).0, move || {
+                release.recv().expect("test releases the worker");
+                PreparationOutcome::Failed(SelectedPreparationFailure::scripted_settled())
+            })
+            .expect("start runs");
+        // Drop while the worker still runs: no delivery, no join, no
+        // hang — the channel itself is retained for the late send.
+        drop(service);
+        assert!(
+            SelectedLifecycleService::custody_retained_for_test() > before,
+            "the live worker's channel survives the service"
+        );
+        gate.send(()).expect("the detached worker still exits");
     }
 
     #[test]

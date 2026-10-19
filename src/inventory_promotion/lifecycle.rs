@@ -1365,6 +1365,32 @@ mod tests {
 
     /// Poll until an event or the bound; tests fail loudly past it
     /// instead of hanging on a wedged worker.
+    /// A destruction probe: the twin's liveness token moves into
+    /// the worker job and then into the built failure, so the twin's
+    /// `Weak` observes that specific owner's survival — alive while
+    /// retained, dead once destroyed. Never a recorded marker.
+    fn liveness_probe() -> (Arc<()>, std::sync::Weak<()>) {
+        let probe = Arc::new(());
+        let weak = Arc::downgrade(&probe);
+        (probe, weak)
+    }
+
+    /// Wait for the probe to die: destruction past a detached worker
+    /// is asynchronous, so the negative control polls instead of
+    /// asserting on a single racy read.
+    fn wait_for_destruction(weak: &std::sync::Weak<()>, bound: Duration) -> bool {
+        let deadline = Instant::now() + bound;
+        loop {
+            if weak.upgrade().is_none() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     fn poll_until(
         service: &mut SelectedLifecycleService,
         bound: Duration,
@@ -1617,13 +1643,15 @@ mod tests {
     #[test]
     fn dropped_service_retains_unproved_owner_for_process_exit() {
         let id = SelectedLifecycleService::next_custody_test_id_for_test();
+        let (probe, weak) = liveness_probe();
         let (mut promoter, request) = taken_request_for_test();
         let mut service = SelectedLifecycleService::new();
         service
             .start(request, capacity(), stub_source(None).0, move || {
-                PreparationOutcome::Failed(SelectedPreparationFailure::scripted_unproved_with_id(
-                    id,
-                ))
+                PreparationOutcome::Failed(
+                    SelectedPreparationFailure::scripted_unproved_with_id(id)
+                        .with_liveness_probe(probe),
+                )
             })
             .expect("start runs");
         let event = poll_until(&mut service, Duration::from_secs(5)).expect("terminal event");
@@ -1642,18 +1670,68 @@ mod tests {
             SelectedLifecycleService::custody_retained_ids_for_test().contains(&id),
             "this twin's unproved owner survives the service: {id}"
         );
+        assert!(
+            weak.upgrade().is_some(),
+            "the destruction probe survives: the specific owner was retained, not just recorded"
+        );
+    }
+
+    #[test]
+    fn dropped_service_without_retention_destroys_unproved_owner() {
+        // Negative control: retention disabled (recording still
+        // runs), so the marker still records while the probe must
+        // observe destruction. Passes only if the probe is sensitive
+        // to the owner's actual fate.
+        let id = SelectedLifecycleService::next_custody_test_id_for_test();
+        let (probe, weak) = liveness_probe();
+        let (mut promoter, request) = taken_request_for_test();
+        let mut service = SelectedLifecycleService::new();
+        service
+            .start(request, capacity(), stub_source(None).0, move || {
+                PreparationOutcome::Failed(
+                    SelectedPreparationFailure::scripted_unproved_with_id(id)
+                        .with_liveness_probe(probe),
+                )
+            })
+            .expect("start runs");
+        let event = poll_until(&mut service, Duration::from_secs(5)).expect("terminal event");
+        let LifecycleEvent::Status(update) = event else {
+            panic!("unproved job must not install");
+        };
+        assert_eq!(
+            promoter.set_status(update),
+            Some(super::super::PromotionState::Refused(
+                PromotionRefusal::PreparationFailed
+            ))
+        );
+        assert!(service.is_idle());
+        service.disable_retention_for_test();
+        drop(service);
+        assert!(
+            SelectedLifecycleService::custody_retained_ids_for_test().contains(&id),
+            "recording still runs with retention disabled: the marker alone cannot tell"
+        );
+        assert!(
+            weak.upgrade().is_none(),
+            "the probe dies: without retention the owner is destroyed"
+        );
     }
 
     #[test]
     fn dropped_service_retains_queued_outcome_for_process_exit() {
         let outcome_id = SelectedLifecycleService::next_custody_test_id_for_test();
+        let (probe, weak) = liveness_probe();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
         let (_promoter, request) = taken_request_for_test();
         let mut service = SelectedLifecycleService::new();
         service
             .start(request, capacity(), stub_source(None).0, move || {
-                PreparationOutcome::Failed(SelectedPreparationFailure::scripted_settled_with_id(
-                    outcome_id,
-                ))
+                let outcome = PreparationOutcome::Failed(
+                    SelectedPreparationFailure::scripted_settled_with_id(outcome_id)
+                        .with_liveness_probe(probe),
+                );
+                let _ = done_tx.send(());
+                outcome
             })
             .expect("start runs");
         let channel_id = service
@@ -1670,17 +1748,78 @@ mod tests {
             retained.contains(&outcome_id) || retained.contains(&channel_id),
             "this twin's queued outcome ({outcome_id}) or its channel ({channel_id}) survives"
         );
+        // The probe observes the specific outcome surviving — whether
+        // retained directly (delivered) or through the retained
+        // channel (late send). The job-done rendez-vous plus a
+        // settle window rules out observing a job that has not run
+        // yet: past that window a broken retention would already
+        // have settled and destroyed the outcome.
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the job builds its outcome");
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            weak.upgrade().is_some(),
+            "the destruction probe survives: the specific outcome was retained, not just recorded"
+        );
+    }
+
+    #[test]
+    fn dropped_service_without_retention_destroys_queued_outcome() {
+        // Negative control: retention disabled (recording still
+        // runs). A delivered outcome drops in teardown; a late send
+        // fails into the settle-and-drop path. Either way the probe
+        // must observe destruction.
+        let outcome_id = SelectedLifecycleService::next_custody_test_id_for_test();
+        let (probe, weak) = liveness_probe();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let (_promoter, request) = taken_request_for_test();
+        let mut service = SelectedLifecycleService::new();
+        service
+            .start(request, capacity(), stub_source(None).0, move || {
+                let outcome = PreparationOutcome::Failed(
+                    SelectedPreparationFailure::scripted_settled_with_id(outcome_id)
+                        .with_liveness_probe(probe),
+                );
+                let _ = done_tx.send(());
+                outcome
+            })
+            .expect("start runs");
+        let channel_id = service
+            .preparing_channel_id_for_test()
+            .expect("preparing holds its channel");
+        std::thread::sleep(Duration::from_millis(100));
+        service.disable_retention_for_test();
+        drop(service);
+        let retained = SelectedLifecycleService::custody_retained_ids_for_test();
+        assert!(
+            retained.contains(&outcome_id) || retained.contains(&channel_id),
+            "recording still runs with retention disabled: the marker alone cannot tell"
+        );
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the job builds its outcome");
+        assert!(
+            wait_for_destruction(&weak, Duration::from_secs(5)),
+            "the probe dies: without retention the queued outcome is destroyed"
+        );
     }
 
     #[test]
     fn dropped_service_retains_live_worker_channel_for_process_exit() {
+        let (probe, weak) = liveness_probe();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
         let (_promoter, request) = taken_request_for_test();
         let mut service = SelectedLifecycleService::new();
         let (gate, release) = std::sync::mpsc::channel::<()>();
         service
             .start(request, capacity(), stub_source(None).0, move || {
                 release.recv().expect("test releases the worker");
-                PreparationOutcome::Failed(SelectedPreparationFailure::scripted_settled())
+                let outcome = PreparationOutcome::Failed(
+                    SelectedPreparationFailure::scripted_settled().with_liveness_probe(probe),
+                );
+                let _ = done_tx.send(());
+                outcome
             })
             .expect("start runs");
         let channel_id = service
@@ -1693,7 +1832,59 @@ mod tests {
             SelectedLifecycleService::custody_retained_ids_for_test().contains(&channel_id),
             "this twin's live worker channel survives the service: {channel_id}"
         );
+        // End-to-end channel liveness: the released worker's late
+        // send must land in the retained channel instead of failing
+        // into the settle-and-drop path. The probe rides the outcome
+        // through the real channel — no marker.
         gate.send(()).expect("the detached worker still exits");
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the worker builds its outcome");
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            weak.upgrade().is_some(),
+            "the late send lands in the retained channel: the outcome survives"
+        );
+    }
+
+    #[test]
+    fn dropped_service_without_retention_drops_late_send() {
+        // Negative control: the channel drops with the service, so
+        // the released worker's late send fails into the
+        // settle-and-drop path and the probe must observe the
+        // outcome's destruction.
+        let (probe, weak) = liveness_probe();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let (_promoter, request) = taken_request_for_test();
+        let mut service = SelectedLifecycleService::new();
+        let (gate, release) = std::sync::mpsc::channel::<()>();
+        service
+            .start(request, capacity(), stub_source(None).0, move || {
+                release.recv().expect("test releases the worker");
+                let outcome = PreparationOutcome::Failed(
+                    SelectedPreparationFailure::scripted_settled().with_liveness_probe(probe),
+                );
+                let _ = done_tx.send(());
+                outcome
+            })
+            .expect("start runs");
+        let channel_id = service
+            .preparing_channel_id_for_test()
+            .expect("preparing holds its channel");
+        service.disable_retention_for_test();
+        drop(service);
+        assert!(
+            SelectedLifecycleService::custody_retained_ids_for_test().contains(&channel_id),
+            "recording still runs with retention disabled: the marker alone cannot tell"
+        );
+        gate.send(()).expect("the detached worker still exits");
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the worker builds its outcome");
+        assert!(
+            wait_for_destruction(&weak, Duration::from_secs(5)),
+            "the probe dies: without retention the late send fails and the outcome is destroyed"
+        );
     }
 
     #[test]

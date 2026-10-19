@@ -127,6 +127,12 @@ fn inventory_test_poll_interval_is_scoped_and_thread_local() {
 /// Receipt-bearing batches publish during the tick that stages them.
 const STAGED_SEMANTIC_MAX_AGE: Duration = Duration::from_secs(1);
 
+/// Bound for promotion-cancel native cleanup on the tick path (the
+/// metadata/service 100ms teardown precedent): an unsettled cleanup
+/// is interrupted and its whole owner retained for process exit
+/// through the existing forget path, never waited out indefinitely.
+const CANCEL_CLEANUP_BUDGET: Duration = Duration::from_millis(100);
+
 struct DiagnosticRequest<'a> {
     path: Option<&'a Path>,
     pid_filter: Option<u32>,
@@ -1975,24 +1981,59 @@ impl ClassicDriver<'_> {
     }
 
     /// Wind down the promotion-installed lane after an operator
-    /// cancel: request stop, run the same synchronous terminal
-    /// sequence as the stop path (a cancel stalls the tick like a
-    /// stop does), finish native cleanup, record the domain for
-    /// completion-polled retire, and confirm the genuine end.
-    /// Manifest lanes are not promotion-managed and never wind down
-    /// here.
+    /// cancel: request stop and run the terminal sequence (whose
+    /// drain is time-budgeted, never indefinite), then — once the
+    /// Finish genuinely publishes with no pending semantic work left
+    /// — release the lane, finish native cleanup under a bounded
+    /// cancel budget, record the domain for completion-polled
+    /// retire, and confirm the genuine end. Until publication
+    /// completes the validating lane and its staged evidence stay:
+    /// removing them would orphan pending work that no later
+    /// publication could discharge. Manifest lanes are not
+    /// promotion-managed and never wind down here.
     fn wind_down_installed_promotion(&mut self, end: crate::inventory_promotion::PromotionEnd) {
         use crate::inventory_promotion::{PromotionOutcome, PromotionStatusUpdate};
-        let Some(installed) = self.installed_promotion.take() else {
+        let Some(installed) = self.installed_promotion else {
             return;
         };
         if let Some(lane) = self.semantic.as_mut() {
             lane.request_semantic_stop();
         }
         self.run_semantic_terminal_sequence();
+        // A staged batch that has not published yet retries through
+        // the kept lane at the staleness cadence, like the tick's
+        // staged commit: never gap-spamming, never dropping.
+        if self.semantic_staged && self.semantic.is_some() {
+            let stale = self
+                .semantic
+                .as_ref()
+                .and_then(|lane| lane.staged_semantic_age())
+                .is_some_and(|age| age >= STAGED_SEMANTIC_MAX_AGE);
+            if stale && let Err(error) = self.commit(false) {
+                self.coordinator.note_scope_gap(
+                    "semantic terminal commit failed".into(),
+                    format!("{error:#}"),
+                );
+                if let Some(lane) = self.semantic.as_mut() {
+                    lane.note_semantic_staged();
+                }
+            }
+        }
         let domain = self.semantic.as_ref().map(|lane| lane.domain());
+        let published = !self.semantic_staged
+            && domain.is_none_or(|domain| !self.coordinator.joint_domain_has_pending_work(domain));
+        if !published {
+            // Terminal publication is incomplete: keep the validating
+            // lane and its staged evidence; the next tick retries.
+            // Nothing is confirmed and nothing retires yet.
+            return;
+        }
+        self.installed_promotion = None;
         let lane = self.semantic.take();
-        if let Err(error) = finish_semantic_native_cleanup(lane, &|| false) {
+        let cleanup_deadline = Instant::now() + CANCEL_CLEANUP_BUDGET;
+        if let Err(error) =
+            finish_semantic_native_cleanup(lane, &|| Instant::now() >= cleanup_deadline)
+        {
             self.coordinator.note_scope_gap(
                 "selected lane native cleanup failed".into(),
                 format!("{error:#}"),
@@ -7916,6 +7957,190 @@ mod promotion_driver_tests {
         }
     }
 
+    /// Scripted terminal cleanup beneath the wind-down stub: the
+    /// predicate observes interruption.
+    type WindDownCleanup = Box<dyn FnMut(&dyn Fn() -> bool) -> anyhow::Result<()>>;
+
+    /// Minimal substituted lane I/O for wind-down tests: quiescent,
+    /// quiet ticks, an empty Finish. Cleanup behavior is scripted per
+    /// test; receipt validation honestly refuses (no batch here
+    /// carries receipts).
+    struct WindDownIo {
+        cleanup: WindDownCleanup,
+    }
+
+    impl WindDownIo {
+        fn completing() -> Self {
+            Self {
+                cleanup: Box::new(|_| Ok(())),
+            }
+        }
+
+        fn hanging() -> Self {
+            // Native cleanup that never settles on its own: it must
+            // observe interruption instead of hanging the tick.
+            Self {
+                cleanup: Box::new(|second_signal| {
+                    while !second_signal() {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(anyhow::anyhow!("scripted cleanup observed interruption"))
+                }),
+            }
+        }
+    }
+
+    impl crate::inventory_semantics::LaneTestIo for WindDownIo {
+        fn finish_terminal_cleanup(
+            &mut self,
+            second_signal: &dyn Fn() -> bool,
+            _out: &mut dyn std::io::Write,
+        ) -> anyhow::Result<()> {
+            (self.cleanup)(second_signal)
+        }
+
+        fn validate_current(
+            &mut self,
+            _receipt: &crate::semantic_capture::CurrentPartitionReceipt,
+            _report: &mut crate::semantic_capture::TickReport,
+        ) -> Result<(), crate::semantic_capture::CurrentReceiptRefusal> {
+            Err(crate::semantic_capture::CurrentReceiptRefusal::Attachment)
+        }
+
+        fn tick(
+            &mut self,
+            domain: crate::attach::capture::NativeDomainId,
+        ) -> Result<
+            crate::inventory_semantics::SemanticBatch,
+            crate::inventory_semantics::SemanticRefusal,
+        > {
+            Ok(crate::inventory_semantics::SemanticBatch::scripted(
+                domain,
+                Vec::new(),
+                0,
+            ))
+        }
+
+        fn refresh(
+            &mut self,
+            pin: std::sync::Arc<PidPin>,
+            _slot: u32,
+        ) -> Result<
+            (
+                Vec<p11scope_ebpf_common::ImageIdentity>,
+                std::sync::Arc<PidPin>,
+            ),
+            crate::inventory_semantics::SemanticRefusal,
+        > {
+            Ok((Vec::new(), pin))
+        }
+
+        fn has_pending_evidence(&self) -> bool {
+            false
+        }
+
+        fn finish(
+            &mut self,
+            domain: crate::attach::capture::NativeDomainId,
+        ) -> crate::inventory_semantics::SemanticBatch {
+            crate::inventory_semantics::SemanticBatch::scripted(domain, Vec::new(), 0)
+        }
+
+        fn quiescent(&mut self) -> bool {
+            true
+        }
+
+        fn positions(&mut self) -> Option<[(usize, usize); 2]> {
+            Some([(0, 0), (0, 0)])
+        }
+
+        fn drain_events_to(
+            &mut self,
+            _stop: usize,
+            _quantum: usize,
+        ) -> crate::inventory_semantics::LaneDrainOutcome {
+            crate::inventory_semantics::LaneDrainOutcome::default()
+        }
+
+        fn drain_discovery_to(
+            &mut self,
+            _stop: usize,
+            _quantum: usize,
+        ) -> crate::inventory_semantics::LaneDrainOutcome {
+            crate::inventory_semantics::LaneDrainOutcome::default()
+        }
+    }
+
+    /// A shell lane carrying the wind-down stub: the subset is only
+    /// ever carried (empty batches stage nothing provable), so a
+    /// single-slot envelope suffices.
+    fn wind_down_lane(io: WindDownIo) -> crate::inventory_semantics::AttestedSemanticLane {
+        use crate::discovery::identity::PinnedObjectId;
+        let slot = crate::plan::Slot {
+            index: 0,
+            descriptor_index: crate::kinds::function_id("C_SignInit").unwrap() + 1,
+            object: PinnedObjectId(0),
+            object_path: "/stub-provider.so".into(),
+            file_offset: 0x1200,
+            names: vec!["C_SignInit".into()],
+            aliased: false,
+            semantics: crate::kinds::descriptor("C_SignInit").unwrap(),
+            semantic_authorized: true,
+            semantic_ambiguous: false,
+            fork_safe: true,
+            module_ids: vec![crate::plan::ModuleId(0)],
+        };
+        let subset =
+            crate::discovery::engine::inventory_coordinator::semantics::AttestedSubset::scripted(
+                crate::plan::AttachPlan::from_slots(vec![slot]),
+                crate::discovery::identity::PinnedObjects::empty(),
+                std::collections::BTreeMap::from([(
+                    PinnedObjectId(0),
+                    std::collections::BTreeSet::from([0]),
+                )]),
+            );
+        let mut lane = crate::inventory_semantics::AttestedSemanticLane::start(
+            subset,
+            &Scope::Pid(std::process::id()),
+            crate::attach::BackendSelection::Auto,
+        )
+        .expect("shell lane starts");
+        lane.install_test_io(Box::new(io));
+        lane
+    }
+
+    /// Record a promotion-installed lane on the driver: queue and
+    /// cancel a request (the display observes `Stopping`), then note
+    /// the install the wind-down confirms. Returns the lane domain.
+    fn install_promotion_for_wind_down(
+        driver: &mut ClassicDriver<'_>,
+    ) -> crate::attach::capture::NativeDomainId {
+        use crate::inventory_promotion::lifecycle::scripted_promotion_view_for_test;
+        let display = driver.display.as_mut().expect("display");
+        assert!(display.promotion_enable(CaptureId::new(11)));
+        display
+            .queue_promotion_request_for_test(
+                scripted_promotion_view_for_test(),
+                CallerId(3),
+                ModuleId(5),
+            )
+            .expect("exact pair queues");
+        let taken = display.take_promotion_request().expect("mailbox holds it");
+        display.cancel_promotion_for_test();
+        assert_eq!(
+            display.promotion_state(),
+            PromotionState::Stopping,
+            "cancel parks the control in Stopping"
+        );
+        let domain = driver.semantic.as_ref().expect("lane").domain();
+        driver.installed_promotion = Some(InstalledPromotion {
+            capture: CaptureId::new(11),
+            request: taken.id(),
+            pair: crate::inventory_promotion::PromotionPair::new(3, 5),
+        });
+        domain
+    }
+
     /// Publish staged mutations, then read the committed gaps:
     /// gap records stage and apply at publication, like production.
     fn gaps(driver: &mut ClassicDriver<'_>) -> Vec<(String, String)> {
@@ -8127,6 +8352,89 @@ mod promotion_driver_tests {
             driver.retiring_domain(),
             None,
             "the retained proof retires once the work drains"
+        );
+    }
+
+    #[test]
+    fn failed_finish_publication_keeps_lane_until_published() {
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.semantic = Some(wind_down_lane(WindDownIo::completing()));
+        let domain = install_promotion_for_wind_down(&mut driver);
+        FAIL_TERMINAL_PUBLICATION.with(|fail| fail.set(true));
+        driver.wind_down_installed_promotion(PromotionEnd::Cancelled);
+        assert!(
+            !FAIL_TERMINAL_PUBLICATION.with(|fail| fail.get()),
+            "the refusal hit the real terminal commit boundary"
+        );
+        assert!(
+            driver.semantic.is_some(),
+            "the validating lane stays until terminal publication completes"
+        );
+        assert!(
+            driver.installed_promotion.is_some(),
+            "no end is confirmed before publication"
+        );
+        assert!(
+            driver.semantic_staged,
+            "the unpublished Finish stays staged"
+        );
+        assert_eq!(
+            driver.retiring_domain(),
+            None,
+            "nothing retires before publication"
+        );
+        // The retry publishes through the kept lane and the wind-down
+        // completes: lane released, domain retiring, end confirmed,
+        // and no evidence orphaned without its validator.
+        driver
+            .semantic
+            .as_mut()
+            .expect("lane")
+            .age_staged_for_test(Instant::now() - Duration::from_secs(5));
+        driver.wind_down_installed_promotion(PromotionEnd::Cancelled);
+        assert!(driver.semantic.is_none(), "publication releases the lane");
+        assert!(driver.installed_promotion.is_none());
+        assert_eq!(driver.retiring_domain(), Some(domain));
+        assert_eq!(
+            driver.display.as_ref().expect("display").promotion_state(),
+            PromotionState::Ended(PromotionEnd::Cancelled)
+        );
+        assert!(
+            gaps(&mut driver)
+                .iter()
+                .all(|(subject, _)| subject != "semantic batch dropped without lane authority"),
+            "no evidence orphaned: {:?}",
+            gaps(&mut driver)
+        );
+    }
+
+    #[test]
+    fn wind_down_bounds_native_cleanup_on_cancel() {
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.semantic = Some(wind_down_lane(WindDownIo::hanging()));
+        let domain = install_promotion_for_wind_down(&mut driver);
+        let start = Instant::now();
+        driver.wind_down_installed_promotion(PromotionEnd::Cancelled);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "cancel never waits indefinitely on native cleanup: {elapsed:?}"
+        );
+        assert_eq!(
+            driver.display.as_ref().expect("display").promotion_state(),
+            PromotionState::Ended(PromotionEnd::Cancelled)
+        );
+        assert_eq!(driver.retiring_domain(), Some(domain));
+        assert!(
+            gaps(&mut driver)
+                .iter()
+                .any(|(subject, _)| subject == "selected lane native cleanup failed"),
+            "the interrupted cleanup is recorded honestly: {:?}",
+            gaps(&mut driver)
         );
     }
 

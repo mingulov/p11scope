@@ -12,10 +12,10 @@ index 1888f509..b6f09f3e 100755
      ("test_canary_evidence.py", ["--target-bits", "32"]),
 diff --git a/tests/python/test_browser_cells.py b/tests/python/test_browser_cells.py
 new file mode 100644
-index 00000000..e2d0c520
+index 00000000..4f6fb88a
 --- /dev/null
 +++ b/tests/python/test_browser_cells.py
-@@ -0,0 +1,926 @@
+@@ -0,0 +1,995 @@
 +# SPDX-License-Identifier: GPL-3.0-or-later
 +"""G33 browser application cells: real Firefox/Chromium PKCS#11 traffic.
 +
@@ -124,10 +124,10 @@ index 00000000..e2d0c520
 +    return (
 +        f"connections={server.connections} requests={server.requests_served} "
 +        f"certs={server.client_certs_presented} ok={server.handshakes_ok} "
-+        f"spoke={server.spoke_tls} empty={server.empty_certs} "
-+        f"stalls={server.selection_stalls} alerts={server.client_cert_alerts} "
-+        f"abandoned={server.abandoned} failures={server.handshake_failures} "
-+        f"errors={server.handshake_errors}")
++        f"spoke={server.spoke_tls} hello={server.client_hello_complete} "
++        f"empty={server.empty_certs} stalls={server.selection_stalls} "
++        f"alerts={server.client_cert_alerts} abandoned={server.abandoned} "
++        f"failures={server.handshake_failures} errors={server.handshake_errors}")
 +
 +
 +#: Installed mode: set P11SCOPE_BROWSER_STRICT=1 on a qualified installed
@@ -246,14 +246,16 @@ index 00000000..e2d0c520
 +    def assert_pinbound_stall(self, label, facts, server):
 +        """The CERT_REQUIRED flow stalled at the PIN boundary (P2-2).
 +
-+        Requires a token-selection witness — an empty certificate, a
-+        spoke-TLS stall, or a hung navigation with TLS-speaking peers —
-+        with no successful handshake, no presented cert, no served
-+        request, no protocol failure, and a TLS-flow (not crashed or
-+        never-launched) browser outcome. Client cert alerts and abandoned
-+        transports are tolerated but never sufficient: alerts are
-+        ambiguous (selection refusal vs server-cert rejection) and
-+        abandons carry no selection information.
++        Requires affirmative selection progress on the stalled
++        connection: a complete ClientHello plus a token-selection
++        witness — an empty certificate or a post-hello stall — with no
++        successful handshake, no presented cert, no served request, no
++        protocol failure, and a TLS-flow (not crashed or never-launched)
++        browser outcome. Client cert alerts and abandoned transports are
++        tolerated but never sufficient: alerts are ambiguous (selection
++        refusal vs server-cert rejection) and abandons carry no
++        selection information. A navigation timeout alone proves nothing
++        about selection and is never a witness.
 +        """
 +        outcomes = _stall_outcomes(server)
 +        self.assertGreaterEqual(server.connections, 1, f"{label}: browser never connected")
@@ -265,12 +267,14 @@ index 00000000..e2d0c520
 +                         f"{label}: handshake succeeded?! [{outcomes}]")
 +        self.assertEqual(server.handshake_failures, 0,
 +                         f"{label}: unrelated TLS failure {server.handshake_errors} [{outcomes}]")
-+        hung = flows.is_navigation_timeout(facts.get("error")) and server.spoke_tls >= 1
-+        witness = server.empty_certs + server.selection_stalls + (1 if hung else 0)
++        self.assertGreaterEqual(
++            server.client_hello_complete, 1,
++            f"{label}: no complete ClientHello (selection never began) [{outcomes}]")
++        witness = server.empty_certs + server.selection_stalls
 +        self.assertGreaterEqual(
 +            witness, 1,
 +            f"{label}: no token-selection witness "
-+            f"(need empty-cert, spoke-stall, or hung-with-spoke) [{outcomes}]")
++            f"(need empty-cert or post-hello stall) [{outcomes}]")
 +        self.assertNotIn("flow_error", facts,
 +                         f"{label}: flow setup failed: {facts.get('flow_error')}")
 +        self.assertFalse(facts.get("loaded", True),
@@ -773,7 +777,8 @@ index 00000000..e2d0c520
 +    def test_pinbound_rig_healthy_accepted(self):
 +        """Guard: the rig passes with a boundary witness (no over-reject)."""
 +        self._pinbound_rig(
-+            self._pinbound_stats(empty_certs=1, abandoned=0), self._pinbound_facts())
++            self._pinbound_stats(empty_certs=1, abandoned=0, client_hello_complete=1),
++            self._pinbound_facts())
 +
 +    def test_handshake_classifier_buckets(self):
 +        """Unit: every wrap failure lands in its documented outcome bucket."""
@@ -872,6 +877,7 @@ index 00000000..e2d0c520
 +            # The client's error precedes the server-side note; await it.
 +            await_outcome(flow)
 +            self.assertEqual((flow.connections, flow.spoke_tls, flow.empty_certs), (1, 1, 1))
++            self.assertEqual(flow.client_hello_complete, 1)
 +            self.assertEqual(flow.requests_served, 0)
 +            self.assertEqual(flow.client_certs_presented, 0)
 +            self.assertEqual(flow.handshake_failures, 0)
@@ -885,6 +891,7 @@ index 00000000..e2d0c520
 +            self.assertEqual(flow.connections, 1)
 +            self.assertEqual(flow.handshake_failures, 1)
 +            self.assertEqual(flow.spoke_tls, 0)
++            self.assertEqual(flow.client_hello_complete, 0)
 +            self.assertTrue(flow.handshake_errors)
 +        # Connect and vanish without a byte: abandoned, never a failure.
 +        with tls_server.FlowServer(cert=cert, key=key, require_client_cert=True,
@@ -893,6 +900,7 @@ index 00000000..e2d0c520
 +            await_outcome(flow)
 +            self.assertEqual((flow.connections, flow.abandoned, flow.handshake_failures),
 +                             (1, 1, 0))
++            self.assertEqual(flow.client_hello_complete, 0)
 +        # Presented client cert: counted at handshake time, request or not.
 +        with tls_server.FlowServer(cert=cert, key=key, require_client_cert=True,
 +                                   client_ca=cred.cert_pem) as flow:
@@ -901,6 +909,7 @@ index 00000000..e2d0c520
 +                self.assertIn(b"g33-flow-ok", read_all(peer))
 +            self.assertEqual((flow.handshakes_ok, flow.client_certs_presented,
 +                              flow.requests_served), (1, 1, 1))
++            self.assertEqual(flow.client_hello_complete, 1)
 +        # Plain server: ordinary visit, no client cert involved.
 +        with tls_server.FlowServer(cert=cert, key=key) as flow:
 +            with tls_client(flow.port) as peer:
@@ -908,6 +917,7 @@ index 00000000..e2d0c520
 +                self.assertIn(b"g33-flow-ok", read_all(peer))
 +            self.assertEqual((flow.handshakes_ok, flow.client_certs_presented,
 +                              flow.requests_served), (1, 0, 1))
++            self.assertEqual(flow.client_hello_complete, 1)
 +
 +    def test_flow_server_partial_client_hello_is_abandoned(self):
 +        """P2-2 twin: a partial ClientHello plus silence is abandoned, not a stall.
@@ -937,7 +947,66 @@ index 00000000..e2d0c520
 +            self.assertEqual(flow.selection_stalls, 0,
 +                             "partial ClientHello counted as a selection stall")
 +            self.assertEqual(flow.abandoned, 1)
++            self.assertEqual(flow.client_hello_complete, 0)
 +            self.assertEqual(flow.handshake_failures, 0)
++
++    def test_flow_server_complete_client_hello_then_silence_stalls(self):
++        """Guard: a complete ClientHello plus silence still stalls (no over-reject).
++
++        A real ClientHello goes out over a non-blocking socket whose
++        handshake is never driven again; the server must see the
++        finished first flight and count the ensuing silence as a
++        selection stall.
++        """
++        if shutil.which("openssl") is None:
++            self.skipTest("openssl missing")
++        key, cert = tls_server.make_server_credential(self.work / "srv")
++        with tls_server.FlowServer(cert=cert, key=key, require_client_cert=True,
++                                   client_ca=cert) as flow:
++            flow.HANDSHAKE_TIMEOUT = 3.0
++            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
++            context.check_hostname = False
++            context.verify_mode = ssl.CERT_NONE
++            raw = socket.create_connection(("127.0.0.1", flow.port))
++            raw.setblocking(False)
++            peer = context.wrap_socket(raw, server_hostname="127.0.0.1",
++                                       do_handshake_on_connect=False)
++            try:
++                with self.assertRaises((ssl.SSLWantReadError, ssl.SSLWantWriteError)):
++                    peer.do_handshake()
++                deadline = time.monotonic() + 10
++                while (flow.selection_stalls + flow.abandoned
++                       + flow.handshake_failures == 0
++                       and time.monotonic() < deadline):
++                    time.sleep(0.05)
++            finally:
++                peer.close()
++            self.assertEqual((flow.connections, flow.spoke_tls,
++                              flow.client_hello_complete), (1, 1, 1))
++            self.assertEqual(flow.selection_stalls, 1)
++            self.assertEqual(flow.abandoned, 0)
++            self.assertEqual(flow.handshake_failures, 0)
++
++    def test_client_hello_parser_buckets(self):
++        """Unit: the ClientHello proof parser buckets its inputs."""
++        hello = b"\x16\x03\x01\x00\x0c" + b"\x01\x00\x00\x08" + b"\x00" * 8
++        self.assertEqual(tls_server.client_hello_status(b""), "need_more")
++        self.assertEqual(tls_server.client_hello_status(b"\x16\x03"), "need_more")
++        self.assertEqual(tls_server.client_hello_status(b"GARBAGE"), "non_tls")
++        self.assertEqual(
++            tls_server.client_hello_status(b"\x16\x03\x01\x00\x10" + b"\x00" * 4),
++            "need_more")
++        self.assertEqual(tls_server.client_hello_status(hello), "complete")
++        # Complete first record, wrong handshake type: not a hello.
++        not_hello = b"\x16\x03\x03\x00\x0c" + b"\x02\x00\x00\x08" + b"\x00" * 8
++        self.assertEqual(tls_server.client_hello_status(not_hello), "not_hello")
++        # Zero-length record fails closed.
++        self.assertEqual(
++            tls_server.client_hello_status(b"\x16\x03\x01\x00\x00"), "not_hello")
++        # Fragmented hello across two records still proves completion.
++        frag = (b"\x16\x03\x01\x00\x08" + b"\x01\x00\x00\x0a" + b"\x00" * 4
++                + b"\x16\x03\x01\x00\x06" + b"\x00" * 6)
++        self.assertEqual(tls_server.client_hello_status(frag), "complete")
 +
 +
 +if __name__ == "__main__":

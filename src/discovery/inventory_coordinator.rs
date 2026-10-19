@@ -9186,6 +9186,101 @@ exit 0
     }
 
     #[test]
+    fn rust_parent_death_kills_owned_fixture_without_c_flag() {
+        // Rust-path parent-death twin: the driver runs WITHOUT
+        // --die-with-parent, so only the PR_SET_PDEATHSIG armed by
+        // OwnedStoppedChild::harden_spawn (which survives exec) can
+        // kill it; the C path cannot mask a removed Rust
+        // registration. A helper thread performs the hardened spawn
+        // and the SIGSTOP handshake, proves the fixture live and
+        // stopped, then exits: the death signal fires for the dead
+        // spawner thread even though the test process lives on
+        // (spawn() returns only after exec, so the registration runs
+        // strictly before the thread can exit — no arm-vs-exit race).
+        // The twin then observes the zombie (Z) — a state only death
+        // produces — before reaping through the retained handle.
+        // Fails if the Rust registration is removed: the orphan stays
+        // stopped.
+        use crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild;
+        let dir = tempfile::tempdir().unwrap();
+        let (provider, driver) = build_scoped_pair(dir.path());
+        let ready = dir.path().join("ready");
+        let helper = std::thread::spawn(move || {
+            let child = OwnedStoppedChild::spawn_stopped(
+                std::process::Command::new(&driver)
+                    .arg("--ready")
+                    .arg(&ready)
+                    .arg("--call")
+                    .arg(&provider)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null()),
+                |pid| {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    while !ready.exists() {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "rust-owned driver did not finish startup"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    // SAFETY: pid names the child retained by spawn_stopped.
+                    assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGSTOP) }, 0);
+                },
+            );
+            // Live AND stopped before the thread exits: SIGSTOP
+            // delivery is async, so poll for T.
+            let pid = child.id();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if proc_state(pid) == Some('T') {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "rust-owned fixture never reached stopped state: pid {pid}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            // The thread exits with the live stopped child retained:
+            // the death signal fires for the dead spawner thread.
+            child
+        });
+        let child = helper
+            .join()
+            .expect("helper thread completes the hardened spawn");
+        let pid = child.id();
+        // Dead, not surviving: poll for the zombie the retained
+        // handle has not reaped yet, so death stays distinguishable
+        // from a lingering stop.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match proc_state(pid) {
+                Some('Z') => break,
+                state => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "rust-owned fixture survived its spawner thread: pid {pid} state {state:?}"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
+        drop(child);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if proc_state(pid).is_none() {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "rust-owned fixture not reaped after death: pid {pid}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
     fn ground_truth_fixture_survives_observer_exit() {
         // Scoped-policy twin: a fixture WITHOUT --die-with-parent must
         // outlive its observer, so post-observer /proc verification keeps

@@ -220,6 +220,9 @@ attach::inventory::activation::privileged_tests::privileged_t7_inventory_n8192_b
 # (~22 min total) and the controller-verified prebuilt32-body fixture.
 # Required acceptance is scheduled explicitly, outside the default short lane.
 inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_pid_diagnostics_wrap_and_primary_parity_lp64
+# G21 cell 3: the same paired schedule under unfiltered system capture
+# (same fixture/seam, owned-caller validators, strict off/on parity).
+inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_system_diagnostics_wrap_and_primary_parity_lp64
 )
 
 # Static skips: external fixture/driver/env the script cannot provide.

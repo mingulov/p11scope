@@ -60,17 +60,61 @@ def check_zero(records, expected):
     return _check_zero(records, expected, main_thread=True)
 
 
-def validate_worker_negative(worker, worker_expected, reporter, expected, signals, diagnostics):
-    """A live same-process worker attachment must miss genuine main progress."""
+def validate_worker_negative(callback, callback_expected, worker, worker_expected,
+                             reporter, expected, gates, signals, release_ns, diagnostics):
+    """Worker delivery while main is gated; neither delivery nor late entry is an ACK.
+
+    The redesigned wrongworker control: main is held behind the readiness
+    gate, one tgkill-targeted worker runs only the signal-handler closure,
+    and main reports only after release. This requires prompt genuine worker
+    delivery (<=100ms), exact entered/released main gate facts with main
+    gated >=150ms past the signal, zero worker reporter events with positive
+    enabled==running counters, and a real late main reporter entry. Both the
+    worker delivery and the late main entry must fail the prompt-ACK
+    validator: handler delivery, a non-main TID and the callback symbol are
+    never an acknowledgement. Callback/gate timestamps never select an ACK.
+    """
     facts = _check_zero(worker, worker_expected, main_thread=False)
     if (any(worker_expected.get(key) != expected.get(key)
             for key in ('pid', 'dev', 'ino', 'file_offset', 'ip'))
             or worker_expected['tid'] == expected['pid']):
         raise ValueError('worker probe does not belong to the same candidate process/reporter')
-    PROBE['validate_witness'](reporter, expected, signals)
-    if (type(worker[0].get('t_ns')) is not int or not 0 < worker[0]['t_ns'] <= signals[0]['t_ns']
-            or HARNESS['cancellation_marker'](diagnostics, int(signal.Signals[signals[0]['signal']])) is None):
-        raise ValueError('worker negative lacks pre-signal readiness and genuine main readable progress')
+    if (any(callback_expected.get(key) != worker_expected.get(key)
+            for key in ('pid', 'tid', 'start_time', 'dev', 'ino'))
+            or callback_expected.get('role') != 'callback'
+            or callback_expected['file_offset'] == worker_expected['file_offset']):
+        raise ValueError('worker probes are not distinct roles on the same pinned worker')
+    delivery = PROBE['validate_worker_delivery'](callback, callback_expected, signals)
+    if (not isinstance(gates, (list, tuple)) or len(gates) != 2
+            or any(not isinstance(row, dict) for row in gates)
+            or [row.get('kind') for row in gates] != ['entered', 'released']
+            or any(row.get('pid') != expected['pid'] or row.get('tid') != expected['tid']
+                   or row.get('clock') != 'CLOCK_MONOTONIC' for row in gates)):
+        raise ValueError('missing or foreign actual main gate entry/release facts')
+    entered, released = gates[0].get('t_ns'), gates[1].get('t_ns')
+    sent, delivered, observed = signals[0].get('t_ns'), callback[1].get('t_ns'), reporter[1].get('t_ns')
+    if (any(type(stamp) is not int or not 0 < stamp < 2**64
+            for stamp in [entered, released, sent, delivered, observed, release_ns])
+            or not entered <= sent <= delivered <= released
+            or released - sent < 150_000_000 or release_ns - sent < 150_000_000
+            or not release_ns <= released <= observed):
+        raise ValueError('worker delivery/main gating/release/late entry interval is unproved')
+    PROBE['validate_binding'](reporter, expected)
+    if HARNESS['cancellation_marker'](diagnostics, 2) is None:
+        raise ValueError('late real main entry lacks complete matching readable marker')
+    try:
+        PROBE['validate_witness'](reporter, expected, signals)
+    except ValueError as error:
+        if 'missed<100ms' not in str(error):
+            raise
+    else:
+        raise ValueError('late main entry was accepted as prompt acknowledgement')
+    try:
+        PROBE['validate_witness'](callback, callback_expected, signals)
+    except ValueError:
+        pass
+    else:
+        raise ValueError('worker delivery was accepted as prompt acknowledgement')
     try:
         check_zero(worker, worker_expected)
     except ValueError:
@@ -78,7 +122,8 @@ def validate_worker_negative(worker, worker_expected, reporter, expected, signal
     else:
         raise ValueError('ordinary main validator accepted worker identity')
     return dict(worker_samples=facts['no_signal_samples'], worker_kernel_count=0,
-                genuine_main_observation_ns=reporter[1]['t_ns'])
+                worker_delivery_ns=delivery['delivery_ns'],
+                late_main_observation_ns=observed)
 
 
 def validate_handler_blocked(reporter, expected, callback, callback_expected, gates,
@@ -313,11 +358,11 @@ def main():
             or any(name not in CELLS + NEGATIVE_CELLS for name in names) or len(set(names)) != len(names)
             or any(not getattr(args, name).is_absolute() for name in ('binary', 'provider', 'caller', 'reporter_probe', 'manifest', 'out'))):
         parser.error('requires root, ordinary caller uid/gid, exact source, bounded unique cells and absolute paths')
-    if (('handlerblocked' in names) != (args.readiness_gate is not None)
+    if ((any(name in NEGATIVE_CELLS for name in names)) != (args.readiness_gate is not None)
             or args.readiness_gate is not None and not args.readiness_gate.is_absolute()
             or os.environ.get('LD_PRELOAD')
             or any(key.startswith('P11SCOPE_TEST_GATE_') for key in os.environ)):
-        parser.error('select handlerblocked exactly when supplying an absolute gate; baseline environment must contain no preload/gate')
+        parser.error('select a negative cell exactly when supplying an absolute gate; baseline environment must contain no preload/gate')
     os.umask(0o022)
     args.out.mkdir(mode=0o755)
     work = args.out / 'workload'

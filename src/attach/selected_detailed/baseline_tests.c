@@ -14,11 +14,11 @@ static struct baseline_row rows[3];
 static unsigned int row_count;
 static void *lookup(void *map, const void *key)
 {
-    if (map == &INV_BASELINE_REQUESTS) {
+    if (map == &INV_BASELINE_RQ) {
         assert(*(const u32 *)key == 400); return unknown ? NULL : &request;
     }
     assert(*(const u32 *)key == 0);
-    if (map == &INV_BASELINE_CTL) return &ctl;
+    if (map == &INV_BASELINE_CT) return &ctl;
     if (map == &COOKIE_CTL) return &cookie_ctl;
     assert(0); return NULL;
 }

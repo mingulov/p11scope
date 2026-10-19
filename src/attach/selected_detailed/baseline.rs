@@ -351,7 +351,7 @@ fn query_native<'a>(
             .context("loading explicit Inventory image baseline iterator")?;
     }
     let mut requests: HashMap<_, u32, Request> = HashMap::try_from(
-        ebpf.map_mut("INV_BASELINE_REQUESTS")
+        ebpf.map_mut("INV_BASELINE_RQ")
             .context("baseline requests map")?,
     )?;
     let old = requests
@@ -397,7 +397,7 @@ fn query_native<'a>(
         ..Control::default()
     };
     let mut ctl: Array<_, Control> = Array::try_from(
-        ebpf.map_mut("INV_BASELINE_CTL")
+        ebpf.map_mut("INV_BASELINE_CT")
             .context("baseline control map")?,
     )?;
     ctl.set(0, control, 0)?;
@@ -421,7 +421,7 @@ fn query_native<'a>(
         .map_err(|error| anyhow::anyhow!("baseline stream: {error:?}"))?;
     let parsed = super::wire::parse_baseline(&bytes, generation, count, 65536)
         .context("baseline requires exact identity slots and END")?;
-    let ctl: Array<_, Control> = Array::try_from(ebpf.map("INV_BASELINE_CTL").unwrap())?;
+    let ctl: Array<_, Control> = Array::try_from(ebpf.map("INV_BASELINE_CT").unwrap())?;
     let done = ctl.get(&0, 0)?;
     ensure!(
         done.generation == control.generation

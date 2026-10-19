@@ -143,16 +143,8 @@ fn map_fixture() -> BTreeMap<String, (InventoryMapKind, ExactMapMetadata)> {
             1,
         ),
         ("COOKIE_CTL", K::Array, MapType::Array, 4, 40, 1, 0),
-        (
-            "INV_BASELINE_REQUESTS",
-            K::Hash,
-            MapType::Hash,
-            4,
-            16,
-            1024,
-            129,
-        ),
-        ("INV_BASELINE_CTL", K::Array, MapType::Array, 4, 56, 1, 0),
+        ("INV_BASELINE_RQ", K::Hash, MapType::Hash, 4, 16, 1024, 129),
+        ("INV_BASELINE_CT", K::Array, MapType::Array, 4, 56, 1, 0),
     ]
     .into_iter()
     .map(
@@ -193,8 +185,8 @@ fn caller_map_contract_refuses_missing_extra_and_each_new_metadata_mutation() {
         "CALLER_EVIDENCE",
         "TASK_COOKIE",
         "COOKIE_CTL",
-        "INV_BASELINE_REQUESTS",
-        "INV_BASELINE_CTL",
+        "INV_BASELINE_RQ",
+        "INV_BASELINE_CT",
     ] {
         let mut missing = original.clone();
         missing.remove(name);

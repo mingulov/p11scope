@@ -9,20 +9,20 @@ struct {
     __uint(max_entries, 1);
     __type(key, u32);
     __type(value, struct selected_target);
-} SELECTED_DETAILED SEC(".maps");
+} SELECTED_DETAIL SEC(".maps");
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(map_flags, 1024); /* mmapable atomic lifecycle word */
     __uint(max_entries, 1);
     __type(key, u32);
     __type(value, u64);
-} SELECTED_DETAILED_STATE SEC(".maps");
+} SELECTED_DSTATE SEC(".maps");
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 1);
     __type(key, u32);
     __type(value, struct selected_bootstrap_control);
-} SELECTED_BOOTSTRAP_CTL SEC(".maps");
+} SELECTED_BCTL SEC(".maps");
 extern unsigned char TASK_COOKIE;
 extern unsigned char INSTANCE_GEN;
 static void *(*selected_lookup)(void *, const void *) = (void *)1;
@@ -49,7 +49,7 @@ static __always_inline void selected_close(u64 *cell)
 __attribute__((noinline)) u32 p11_selected_current_allowed(u32 parent_allowed, u32 tgid)
 {
     u32 key = 0;
-    const struct selected_target *target = selected_lookup(&SELECTED_DETAILED, &key);
+    const struct selected_target *target = selected_lookup(&SELECTED_DETAIL, &key);
     if (!target)
         return 0;
     /* Immutable ordinary mode is the ONLY eager bypass. State zero cannot
@@ -58,7 +58,7 @@ __attribute__((noinline)) u32 p11_selected_current_allowed(u32 parent_allowed, u
         return parent_allowed != 0;
     if (target->mode != SELECTED_MODE || !target->tgid)
         return 0;
-    u64 *state = selected_lookup(&SELECTED_DETAILED_STATE, &key);
+    u64 *state = selected_lookup(&SELECTED_DSTATE, &key);
     if (!state || selected_state(state) != SELECTED_ACTIVE || tgid != target->tgid)
         return 0;
     key = IMG_GEN_COVERAGE;
@@ -84,10 +84,10 @@ __attribute__((noinline)) u32 p11_selected_current_allowed(u32 parent_allowed, u
 __attribute__((noinline)) u32 p11_selected_invalidate_tgid(u32 tgid)
 {
     u32 key = 0;
-    const struct selected_target *target = selected_lookup(&SELECTED_DETAILED, &key);
+    const struct selected_target *target = selected_lookup(&SELECTED_DETAIL, &key);
     if (!target || target->mode != SELECTED_MODE || !tgid || target->tgid != tgid)
         return 0;
-    u64 *state = selected_lookup(&SELECTED_DETAILED_STATE, &key);
+    u64 *state = selected_lookup(&SELECTED_DSTATE, &key);
     if (state)
         selected_close(state);
     return 1;
@@ -99,7 +99,7 @@ SEC("fentry/cgroup_migrate")
 int p11_selected_cgroup_migrate(u64 *ctx)
 {
     u32 key = 0;
-    const struct selected_target *target = selected_lookup(&SELECTED_DETAILED, &key);
+    const struct selected_target *target = selected_lookup(&SELECTED_DETAIL, &key);
     if (!target || target->mode != SELECTED_MODE || target->parent_kind != SELECTED_PARENT_CGROUP)
         return 0;
     struct task_struct *subject = (void *)ctx[0];
@@ -113,8 +113,8 @@ struct selected_iter_task { struct selected_iter_meta *meta; struct task_struct 
 __attribute__((noinline)) u32 p11_selected_bootstrap_allowed(u32 tgid)
 {
     u32 zero = 0;
-    const struct selected_target *target = selected_lookup(&SELECTED_DETAILED, &zero);
-    u64 *state = selected_lookup(&SELECTED_DETAILED_STATE, &zero);
+    const struct selected_target *target = selected_lookup(&SELECTED_DETAIL, &zero);
+    u64 *state = selected_lookup(&SELECTED_DSTATE, &zero);
     u32 coverage_key = IMG_GEN_COVERAGE;
     u64 *coverage = selected_lookup(&INSTANCE_GEN, &coverage_key);
     return target && target->mode == SELECTED_MODE && target->tgid == tgid &&
@@ -125,8 +125,8 @@ SEC("iter/task")
 int p11_selected_bootstrap(struct selected_iter_task *ctx)
 {
     u32 zero = 0;
-    const struct selected_target *target = selected_lookup(&SELECTED_DETAILED, &zero);
-    struct selected_bootstrap_control *ctl = selected_lookup(&SELECTED_BOOTSTRAP_CTL, &zero);
+    const struct selected_target *target = selected_lookup(&SELECTED_DETAIL, &zero);
+    struct selected_bootstrap_control *ctl = selected_lookup(&SELECTED_BCTL, &zero);
     if (!ctl || !ctx || !ctx->meta || !ctx->meta->seq)
         return 1;
     if (!target || !p11_selected_bootstrap_allowed(target->tgid) ||

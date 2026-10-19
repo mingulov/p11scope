@@ -3410,8 +3410,8 @@ mod tests {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(1099511628211);
         }
-        assert_eq!(USAGE.len(), 6302);
-        assert_eq!(hash, 0xfed448e4052076d3);
+        assert_eq!(USAGE.len(), 6398);
+        assert_eq!(hash, 0x6a8633ab05c948c6);
         assert_eq!(HelpTopic::Global.text(), USAGE);
     }
 

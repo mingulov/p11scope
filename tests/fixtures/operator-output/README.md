@@ -167,12 +167,12 @@ separately. Fixture/runtime changes and installed execution remain open.
 
 ## Short startup-fence probe inputs
 
-The same four prebuilt files also support an explicit `probe` workload mode:
+The same35prebuilt files also support an explicit `probe` workload mode:
 exactly three A-only rounds,32real entry calls each, then an ordinary successful
 stop. Provider B is never loaded and no shared/fence/proof phase is invented.
 The independent native helper can check it with
 `check_fixture(directory, counted=3, shared=1, probe=True)`. Its result explicitly
-reports one physical caller/object pair,96calls and three complete per-round
+reports32physical caller/object pairs,96calls and three complete per-round
 ACKs. Missing calls, foreign physical targets, wrong phases and unacknowledged
 rounds fail. This native check establishes fixture behavior, not BPF attribution
 or a startup-fence result; the short installed diagnostic probe is separate.
@@ -181,10 +181,11 @@ The new ignored selector is
 `inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_pid_diagnostics_three_round_startup_probe_lp64`.
 It uses the same absolute `P11SCOPE_DIAGNOSTICS_WRAP_PREBUILT_DIR` input seam,
 with freshly source-matched probe-capable C inputs, default1s production cadence
-and a90s bound. Actual committed A32 triggers round2; actual A64 or an exact
-(32,64] public refusal triggers round3. The terminal oracle accepts only genuine
-ordinary A96, or A64 with an explicit32-call AwaitingFence disposition and the
-third32 placed from base64. Both raw observation and exact retained-reference
+and a90s bound. Actual committed A32 triggers round2; actual A64, or A32 with
+the exact caller-bound per-pair (1,2] startup-fence gap on all32pairs, triggers
+round3. The terminal oracle accepts only genuine ordinary A96, or A64 with an
+explicit per-pair AwaitingFence disposition and the third unit placed from
+base2 on every pair. Both raw observation and exact retained-reference
 checks are required. Each C round must finish before its next read PRE; that
 read's POST must precede the next issued round. The probe exposes actual
 read/decision facts, not a private checkpoint value. Compilation/installed
@@ -193,15 +194,14 @@ standalone validator checks; do not run the old long gate as a substitute.
 
 ## Paired default-ring useful wrap
 
-The current common-ELF fixture is **not acceptance ready**. Its first installed
-run stopped at the original900-second bound after two32-call rounds: the native
-counter reached64 while the public A count remained32, with the second range
-withheld for unproven current physical ownership. The startup-fence explanation
-is under investigation; production ownership guards must remain intact.
-Separately, a caller/object pair excludes function offset, so32entry bodies in
-one common ELF do not establish32diagnostic pairs. The schedule and pair/wrap
-predicates below describe the intended cell and need revision before another
-long run. The original ten-call installed control is independent.
+The wrap oracle tolerates the supported startup fence (Sol ORACLE ruling):
+round 2 accepts A64, or A32 with the exact caller-bound (1,2] gap; round 3
+then requires A96 ordinary or A64 fenced, with exact32-increments after.
+The validated disposition (k of32pairs fenced) carries into final A12800-k
+expectations and paired comparison. A caller/object pair excludes function
+offset, so the fixture provides one slot body per distinct physical object
+(`libdemotion-common-00..31.so`):32genuine pairs, each advancing one unit
+per round. The original ten-call installed control is independent.
 
 A separately selected short pilot,
 `privileged_native_lane_pid_diagnostics_three_round_accelerated_pilot_lp64`,
@@ -217,11 +217,12 @@ pilot before choosing any longer one-pair schedule; no guessed per-call record
 multiplier or arbitrary900s expectation is an acceptance fact.
 
 The new `diagnostics-wrap-ledger.c` physical entry-count fixture uses one PID,
-two2.40 tables and one common ELF with32 distinct real entry bodies at slots4–35.
-Those bodies have the exact fixture type `CK_RV(void)` and return0. This tests
-physical entry counting/ownership; it does not qualify PKCS#11 semantics, API
-behavior or the104-slot ABI. Review its table alignment through the matching
-real manifest before live execution. The original ten-call control remains.
+two2.40 tables and32common ELFs with one distinct real entry body each at
+slots4–35. Those bodies have the exact fixture type `CK_RV(void)` and return0.
+This tests physical entry counting/ownership; it does not qualify PKCS#11
+semantics, API behavior or the104-slot ABI. Review its table alignment through
+the matching real manifest before live execution. The original ten-call
+control remains.
 
 Build/check on the development host:
 
@@ -232,26 +233,29 @@ TMPDIR=/var/tmp/p11scope-ws-tmp python3 -I \
 ```
 
 The helper reuses the original C clock/VMA/hash/FIFO helpers, disables compiler
-identical-function folding, verifies32distinct physical targets against an
-independently mapped common FD, and runs192real calls over a small schedule.
-Its missing/duplicate/wrong-slot/clock/return/target/ACK controls are fixture
-oracle checks. They do not qualify diagnostics or BPF ring wrap.
+identical-function folding, verifies32distinct physical targets each against
+its independently mapped common FD, and runs192real calls over a small
+schedule. Its missing/duplicate/wrong-slot/clock/return/target/ACK controls
+are fixture oracle checks. They do not qualify diagnostics or BPF ring wrap.
 
 The ignored Rust selector is
 `inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_pid_diagnostics_wrap_and_primary_parity_lp64`.
 Supply `P11SCOPE_DIAGNOSTICS_WRAP_PREBUILT_DIR` pointing at the controller-verified
-four-file payload; no runtime compilation fallback exists. Match the prebuilt
+35-file payload; no runtime compilation fallback exists. Match the prebuilt
 Rust test binary/source and arrival hashes, hold the authorized host lane, and
 use disk TMPDIR. A compiled test and the failed installed attempt do not qualify
 the intended cell.
 
 Each disabled/enabled run issues exactly400counted rounds,258shared rounds,
 then one fence and one proof round, each32per-slot calls. Native ACKs and an
-independent per-slot ledger bind all21120calls. Each next round waits for an
-actual committed production count or withheld-range milestone; load-B remains
+independent per-slot ledger bind all21120calls. Each next counted round waits
+for an actual committed production count milestone validated against
+caller-bound gap evidence; each shared round consumes one observer pass with
+ambiguity-disclosure checkpoints at power-of-two rounds; load-B remains
 inside the existing observer callback between passes. Expected primary totals
-are A12800, B32 and8288withheld entries. Actual32Bplacements and their selected
-withheld fence prefixes must remain useful in the exported diagnostics.
+are A12800-k (k validated fenced pairs), B32 and8288withheld entries. Actual
+32Bplacements and their selected withheld fence prefixes must remain useful in
+the exported diagnostics.
 
 Both default rings must really evict: CountObservation eviction proves the
 ordinary ring filled, and OwnershipTransition/CaptureHealth eviction proves

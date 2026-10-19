@@ -18,7 +18,8 @@ import uuid
 ROOT = Path(__file__).resolve().parents[3]
 SOURCE = Path(__file__).resolve().with_name('diagnostics-wrap-ledger.c')
 BASE_SOURCE = ROOT / 'tests/fixtures/public-cli/demotion-ledger.c'
-NAMES = ('libdemotion-common.so', 'provider-A.so', 'provider-B.so', 'workload')
+COMMON_NAMES = tuple(f'libdemotion-common-{index:02d}.so' for index in range(32))
+NAMES = COMMON_NAMES + ('provider-A.so', 'provider-B.so', 'workload')
 PIN = runpy.run_path(str(ROOT / 'scripts/mapped-provider-pin.py'))['pin_fd']
 
 
@@ -28,22 +29,30 @@ def digest(path):
 
 def check_ledger(rows, acks, nonce, pid, directory, counted, shared, probe=False):
     identity = rows[0]
+    commons = [directory / name for name in COMMON_NAMES]
+    digests = [digest(path) for path in commons]
     if (identity.get('kind') != 'identity' or identity['nonce'] != nonce
             or identity['pid'] != pid or identity['exe_sha256'] != digest(directory / 'workload')
-            or identity['common_sha256'] != digest(directory / 'libdemotion-common.so')):
+            or identity['common_sha256'] != digests):
         raise ValueError('native fixture identity differs from independently launched inputs')
-    fd = os.open(directory / 'libdemotion-common.so', os.O_RDONLY)
-    try:
-        common = PIN(fd)
-    finally:
-        os.close(fd)
+    pins = []
+    for path in commons:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            pins.append(PIN(fd))
+        finally:
+            os.close(fd)
+    if len({(pin['dev'][0], pin['dev'][1], pin['ino']) for pin in pins}) != 32:
+        raise ValueError('native fixture commons are not32 distinct physical objects')
     targets = [row for row in rows if row.get('kind') == 'target']
-    if (len(targets) != 32 or {row['slot'] for row in targets} != set(range(4, 36))
-            or len({row['offset'] for row in targets}) != 32
-            or any([row['dev_major'], row['dev_minor']] != common['dev']
-                   or row['ino'] != common['ino'] or not 0 <= row['offset'] < common['file_identity']['size']
-                   for row in targets)):
+    if len(targets) != 32 or {row['slot'] for row in targets} != set(range(4, 36)):
         raise ValueError('native fixture lacks32 distinct physically bound shared entry bodies')
+    for row in targets:
+        pin = pins[row['slot'] - 4]
+        if ([row['dev_major'], row['dev_minor']] != pin['dev']
+                or row['ino'] != pin['ino']
+                or not 0 <= row['offset'] < pin['file_identity']['size']):
+            raise ValueError('native fixture lacks32 distinct physically bound shared entry bodies')
     calls = [row for row in rows if row.get('kind') == 'call']
     if probe and (counted != 3 or shared != 1):
         raise ValueError('startup probe requires exactly three A rounds')
@@ -77,7 +86,7 @@ def check_ledger(rows, acks, nonce, pid, directory, counted, shared, probe=False
         if (len(matches) != 1 or matches[0]['calls'] != ordinal * 32
                 or calls[ordinal * 32 - 1]['after_return_ns'] > matches[0]['t']):
             raise ValueError('native phase ACK differs from its actual complete32slot round')
-    return dict(calls=len(expected), targets=32, physical_pairs=1, counted_rounds=counted,
+    return dict(calls=len(expected), targets=32, physical_pairs=32, counted_rounds=counted,
                 shared_rounds=0 if probe else shared,
                 phase_calls=dict(Counter(row['phase'] for row in calls)))
 
@@ -90,7 +99,7 @@ def execute_fixture(directory, counted=2, shared=2, probe=False):
         nonce = uuid.uuid4().hex
         child = subprocess.Popen([str(directory / 'workload'),
             str(directory / 'provider-A.so'), str(directory / 'provider-B.so'),
-            str(directory / 'libdemotion-common.so'), str(fifo), str(ledger), nonce,
+            str(directory), str(fifo), str(ledger), nonce,
             '10000', str(counted), str(shared), *(['probe'] if probe else [])], stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
         updates, acks = queue.Queue(), []
@@ -151,18 +160,29 @@ def check_fixture(directory, counted=2, shared=2, probe=False):
 def build(directory, cc='cc'):
     sources = {str(path.relative_to(ROOT)): digest(path) for path in (SOURCE, BASE_SOURCE)}
     directory.mkdir(mode=0o700)
-    for name, mode in zip(NAMES, ('DEMOTION_COMMON', 'DEMOTION_PROVIDER_A', 'DEMOTION_PROVIDER_B', None)):
-        command = [cc, '-std=c11', '-O2', '-fno-ipa-icf', '-Wall', '-Wextra', '-Werror']
-        if mode:
-            command += ['-shared', '-fPIC', '-D' + mode]
+    base = [cc, '-std=c11', '-O2', '-fno-ipa-icf', '-Wall', '-Wextra', '-Werror']
+    for index, name in enumerate(COMMON_NAMES):
+        command = base + ['-shared', '-fPIC', '-DDEMOTION_COMMON',
+                          f'-DCOMMON_BODY=diagnostics_slot_{4 + index}']
+        if index == 0:
+            command += ['-DCOMMON_FIRST']
         command += [str(SOURCE), '-o', str(directory / name)]
-        if mode and mode != 'DEMOTION_COMMON':
-            command += ['-L' + str(directory), '-ldemotion-common', '-Wl,-rpath,$ORIGIN', '-Wl,-z,defs']
-        elif mode is None:
-            command += ['-ldl']
         result = subprocess.run(command, capture_output=True, timeout=30)
         if result.returncode:
             raise ValueError('owned fixture compile failed: ' + result.stderr.decode('utf-8', 'replace'))
+    common_libs = [f'-ldemotion-common-{index:02d}' for index in range(32)]
+    for name, mode in (('provider-A.so', 'DEMOTION_PROVIDER_A'),
+                       ('provider-B.so', 'DEMOTION_PROVIDER_B')):
+        command = base + ['-shared', '-fPIC', '-D' + mode, str(SOURCE),
+                          '-o', str(directory / name), '-L' + str(directory),
+                          *common_libs, '-Wl,-rpath,$ORIGIN', '-Wl,-z,defs']
+        result = subprocess.run(command, capture_output=True, timeout=30)
+        if result.returncode:
+            raise ValueError('owned fixture compile failed: ' + result.stderr.decode('utf-8', 'replace'))
+    command = base + [str(SOURCE), '-o', str(directory / 'workload'), '-ldl']
+    result = subprocess.run(command, capture_output=True, timeout=30)
+    if result.returncode:
+        raise ValueError('owned fixture compile failed: ' + result.stderr.decode('utf-8', 'replace'))
     if sources != {str(path.relative_to(ROOT)): digest(path) for path in (SOURCE, BASE_SOURCE)}:
         raise ValueError('fixture source changed while building')
     return dict(sources=sources, native_check=check_fixture(directory),

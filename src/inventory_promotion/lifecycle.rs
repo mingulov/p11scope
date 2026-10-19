@@ -134,7 +134,6 @@ impl NativeCasReceipt {
     /// (native-owned) supplies the service's source, so only a
     /// native implementation's receipts reach the proof mint in
     /// production. Test doubles script instead and never run live.
-    #[allow(dead_code)] // STAGED (DR37): called by the native minter; tests script instead and never run live.
     pub(crate) fn minted(binding: SelectedActivationBinding) -> Self {
         Self { binding }
     }
@@ -161,10 +160,11 @@ impl std::fmt::Debug for NativeCasReceipt {
 /// maps every variant to `PromotionRefusal::ActivationFailed`; the
 /// variants stay distinct so native tests pin the state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // STAGED (DR37): constructed by the native minter; tests never mint native refusals.
 pub(crate) enum NativeActivationRefusal {
     /// The state cell was not `CLOSED` (already active, terminal, or
-    /// never published): the CAS ran and failed closed.
+    /// never published): the CAS ran and failed closed. Custody gates
+    /// (unbound or exited original) refuse before the CAS through the
+    /// same variant: no receipt mints either way.
     NotClosed,
     /// The live native owner disagrees with the expected binding.
     BindingMismatch,

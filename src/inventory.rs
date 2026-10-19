@@ -1044,6 +1044,11 @@ fn run_with_terminal_budget(
         display: None,
         semantic,
         semantic_staged: false,
+        lifecycle: crate::inventory_promotion::lifecycle::SelectedLifecycleService::new(),
+        completion_source: None,
+        pending_install: None,
+        installed_promotion: None,
+        retiring: None,
         identity: identity_shared.clone(),
     };
     let clock = LoopClock {
@@ -1412,6 +1417,15 @@ impl CgroupDriverState {
 }
 
 /// The classic loop's pass side over the production coordinator.
+/// The promotion that installed the live slot lane: the capture and
+/// request the end confirmation names, and the exact pair installed.
+#[derive(Debug, Clone, Copy)]
+struct InstalledPromotion {
+    capture: crate::inventory_promotion::CaptureId,
+    request: crate::inventory_promotion::RequestId,
+    pair: crate::inventory_promotion::PromotionPair,
+}
+
 struct ClassicDriver<'a> {
     coordinator: &'a mut InventoryCoordinator<OsProcessSource>,
     inventory_scope: Option<InventoryScope>,
@@ -1434,6 +1448,25 @@ struct ClassicDriver<'a> {
     /// one ordinary collection quantum is owned at a time, so later
     /// ticks in the same pass stay quiet instead of backpressuring.
     semantic_staged: bool,
+    /// DR37 selected-lane lifecycle: the single-flight preparation
+    /// worker service, polled every tick. Idle without promotion.
+    lifecycle: crate::inventory_promotion::lifecycle::SelectedLifecycleService,
+    /// The native completion minter (DR37 A→B): polled for a wound-down
+    /// domain's genuine disposal. `None` until the native lane lands
+    /// it; without it, retiring domains hold (never forced).
+    completion_source:
+        Option<Box<dyn crate::inventory_promotion::lifecycle::NativeCompletionSource>>,
+    /// A proof-gated install handoff awaiting a free slot and a
+    /// retired predecessor. Held across ticks; cancelled work is
+    /// reclaimed into the service for genuine disposal, never dropped.
+    pending_install: Option<crate::inventory_promotion::lifecycle::PendingInstall>,
+    /// The promotion that installed the live slot lane, for
+    /// operator-cancel wind-down and genuine end confirmation.
+    installed_promotion: Option<InstalledPromotion>,
+    /// A wound-down domain whose coordinator namespace still retires:
+    /// its completion is polled every tick and the namespace retires
+    /// before any held install runs.
+    retiring: Option<crate::attach::capture::NativeDomainId>,
 }
 
 /// Exercise the production driver tick with substituted lane I/O.
@@ -1454,6 +1487,11 @@ pub(crate) fn classic_semantic_tick_for_test(
         display: None,
         semantic: Some(lane),
         semantic_staged: false,
+        lifecycle: crate::inventory_promotion::lifecycle::SelectedLifecycleService::new(),
+        completion_source: None,
+        pending_install: None,
+        installed_promotion: None,
+        retiring: None,
     };
     driver.on_tick();
     driver.semantic.take().unwrap()
@@ -1482,6 +1520,11 @@ pub(crate) fn classic_semantic_pass_for_test(
         display: None,
         semantic: Some(lane),
         semantic_staged: false,
+        lifecycle: crate::inventory_promotion::lifecycle::SelectedLifecycleService::new(),
+        completion_source: None,
+        pending_install: None,
+        installed_promotion: None,
+        retiring: None,
     };
     let report = driver.apply(collected, identity, now_ns()).unwrap();
     driver.commit(report.engine_changed).unwrap();
@@ -1529,6 +1572,11 @@ pub(crate) fn classic_semantic_stop_for_test(
         display: None,
         semantic: Some(lane),
         semantic_staged: false,
+        lifecycle: crate::inventory_promotion::lifecycle::SelectedLifecycleService::new(),
+        completion_source: None,
+        pending_install: None,
+        installed_promotion: None,
+        retiring: None,
     };
     driver.on_stop_requested();
     // Repeated stop hooks cannot submit the same native owners again.
@@ -1631,6 +1679,343 @@ impl ClassicDriver<'_> {
                 ),
             }
         }
+    }
+
+    /// DR37 promotion polling, every tick after the display tick:
+    /// stopping observations, one service event, held-install drive,
+    /// eager retire, then new takes. Displayless runs skip the
+    /// display legs but still poll the service, installs and retire.
+    fn poll_promotion(&mut self) {
+        use crate::inventory_promotion::{PromotionEnd, PromotionState};
+        let stopping = self
+            .display
+            .as_ref()
+            .is_some_and(|display| display.promotion_state() == PromotionState::Stopping);
+        if stopping {
+            self.lifecycle.note_cancel(PromotionEnd::Cancelled);
+            self.reclaim_pending_install(PromotionEnd::Cancelled);
+            self.wind_down_installed_promotion(PromotionEnd::Cancelled);
+        }
+        let mut sink = std::io::sink();
+        if let Some(event) = self.lifecycle.poll(&mut sink) {
+            self.apply_lifecycle_event(event);
+        }
+        self.drive_pending_install();
+        self.poll_retiring_domain();
+        self.take_promotion_work();
+    }
+
+    /// Apply one lifecycle event: statuses go to the mailbox (stale
+    /// or foreign updates apply to nothing there) with every terminal
+    /// transition recorded in the bounded report path; install
+    /// handoffs park until the slot is free and the predecessor
+    /// retired.
+    fn apply_lifecycle_event(
+        &mut self,
+        event: crate::inventory_promotion::lifecycle::LifecycleEvent,
+    ) {
+        use crate::inventory_promotion::PromotionOutcome;
+        use crate::inventory_promotion::lifecycle::LifecycleEvent;
+        match event {
+            LifecycleEvent::Status(update) => {
+                let gap = match update.outcome {
+                    PromotionOutcome::Refused { reason } => {
+                        Some(("selected promotion refused", reason.label().to_string()))
+                    }
+                    PromotionOutcome::Ended { reason } => {
+                        Some(("selected promotion ended", reason.label().to_string()))
+                    }
+                    _ => None,
+                };
+                if let Some(display) = self.display.as_mut() {
+                    display.set_promotion_status(update);
+                }
+                if let Some((subject, reason)) = gap {
+                    self.coordinator.note_scope_gap(subject.into(), reason);
+                }
+            }
+            LifecycleEvent::Install(pending) => {
+                debug_assert!(
+                    self.pending_install.is_none(),
+                    "the service is single-flight: one handoff at a time"
+                );
+                self.pending_install = Some(pending);
+            }
+        }
+    }
+
+    /// Drive a held install handoff: install now when the slot is
+    /// free and no predecessor retires, retire-then-install when a
+    /// completion proves the predecessor done, hold otherwise. An
+    /// occupied slot never auto-displaces: displacing a live lane
+    /// (today always the manifest lane, since the control refuses
+    /// takes while a promotion is active) awaits the operator
+    /// displacement policy at unification; the handoff waits,
+    /// cancellable, and the live lane keeps serving.
+    fn drive_pending_install(&mut self) {
+        if self.pending_install.is_none() {
+            return;
+        }
+        if self.semantic.is_some() {
+            return;
+        }
+        if self.retiring.is_some() && !self.poll_retiring_domain() {
+            return;
+        }
+        let pending = self
+            .pending_install
+            .take()
+            .expect("held handoff checked above");
+        let pair = pending.pair();
+        let (proof, lane, capacity) = pending.into_parts();
+        match self
+            .coordinator
+            .install_selected_lane(proof, lane, capacity)
+        {
+            Ok(live) => {
+                self.semantic = Some(live);
+                if let Some(update) = self.lifecycle.note_installed() {
+                    self.installed_promotion = Some(InstalledPromotion {
+                        capture: update.capture,
+                        request: update.request,
+                        pair,
+                    });
+                    if let Some(display) = self.display.as_mut() {
+                        display.set_promotion_status(update);
+                    }
+                }
+            }
+            Err(failure) => {
+                use crate::inventory_promotion::lifecycle::PendingInstall;
+                let reason = format!("{:?}", failure.reason);
+                let pending =
+                    PendingInstall::from_parts(failure.proof, failure.lane, failure.capacity);
+                if self.lifecycle.reclaim_install(pending, None).is_err() {
+                    debug_assert!(false, "install implies an outstanding handoff");
+                }
+                self.coordinator
+                    .note_scope_gap("selected promotion install refused".into(), reason);
+            }
+        }
+    }
+
+    /// Poll a wound-down domain's genuine completion; retire on
+    /// proof. Returns false while retirement still pends. No minter
+    /// (or unquiesced work) holds the namespace, never forces it; a
+    /// namespace that never staged clears quietly.
+    fn poll_retiring_domain(&mut self) -> bool {
+        use crate::discovery::engine::inventory_coordinator::semantics::JointRetireRefusal;
+        let Some(domain) = self.retiring else {
+            return true;
+        };
+        let Some(source) = self.completion_source.as_mut() else {
+            return false;
+        };
+        let Some(completion) = source.poll_completion(domain) else {
+            return false;
+        };
+        match self.coordinator.retire_joint_domain(completion) {
+            Ok(()) => {
+                self.retiring = None;
+                true
+            }
+            Err(JointRetireRefusal::NotLiveDomain) => {
+                self.retiring = None;
+                true
+            }
+            Err(JointRetireRefusal::PendingWork) => false,
+        }
+    }
+
+    /// Take one queued request: reserve install capacity, resolve the
+    /// preparation bundle, run the three pre-start gates (subset
+    /// shape, baseline agreement, live pair liveness plus the subset
+    /// proof over the live provider key), then start the worker and
+    /// report preparing. Every refusal reports through the mailbox
+    /// and the bounded report path; the reservation refunds by drop.
+    fn take_promotion_work(&mut self) {
+        use crate::inventory_promotion::PromotionRefusal;
+        use crate::inventory_promotion::lifecycle::validate_subset_shape;
+        if !self.lifecycle.is_idle() || self.pending_install.is_some() {
+            return;
+        }
+        let Some(display) = self.display.as_mut() else {
+            return;
+        };
+        let Some(request) = display.take_promotion_request() else {
+            return;
+        };
+        let capacity = match self.coordinator.reserve_promotion_install() {
+            Ok(capacity) => capacity,
+            Err(_) => {
+                self.refuse_promotion_request(&request, PromotionRefusal::Capacity);
+                return;
+            }
+        };
+        let (bundle, source) = match self.resolve_preparation_job(&request) {
+            Ok(resolved) => resolved,
+            Err(reason) => {
+                drop(capacity);
+                self.refuse_promotion_request(&request, reason);
+                return;
+            }
+        };
+        if let Err(reason) = validate_subset_shape(bundle.convert_subset()) {
+            drop(capacity);
+            self.refuse_promotion_request(&request, reason);
+            return;
+        }
+        if !bundle.baseline.matches_request(&request) {
+            drop(capacity);
+            self.refuse_promotion_request(&request, PromotionRefusal::StaleView);
+            return;
+        }
+        let pair = crate::inventory_promotion::PromotionPair::new(
+            request.caller().0,
+            request.provider().0,
+        );
+        let key = match self
+            .coordinator
+            .validate_selected_pair_liveness(pair, &bundle.original)
+        {
+            Ok(key) => key,
+            Err(reason) => {
+                drop(capacity);
+                self.refuse_promotion_request(&request, reason);
+                return;
+            }
+        };
+        let proved = bundle
+            .convert_subset()
+            .required()
+            .keys()
+            .next()
+            .is_some_and(|object| {
+                bundle
+                    .convert_subset()
+                    .proves_provider_module(*object, &key)
+            });
+        if !proved {
+            drop(capacity);
+            self.refuse_promotion_request(&request, PromotionRefusal::ProviderChanged);
+            return;
+        }
+        let update = request.status_update(crate::inventory_promotion::PromotionOutcome::Preparing);
+        self.lifecycle
+            .start(request, capacity, source, || bundle.prepare())
+            .expect("take requires an idle service");
+        if let Some(display) = self.display.as_mut() {
+            display.set_promotion_status(update);
+        }
+    }
+
+    /// Report one refusal through the mailbox and the bounded report
+    /// path. Stale or foreign updates apply to nothing; the gap
+    /// still records the genuine refusal.
+    fn refuse_promotion_request(
+        &mut self,
+        request: &crate::inventory_promotion::PromotionRequest,
+        reason: crate::inventory_promotion::PromotionRefusal,
+    ) {
+        let update =
+            request.status_update(crate::inventory_promotion::PromotionOutcome::Refused { reason });
+        if let Some(display) = self.display.as_mut() {
+            display.set_promotion_status(update);
+        }
+        self.coordinator.note_scope_gap(
+            "selected promotion refused".into(),
+            reason.label().to_string(),
+        );
+    }
+
+    /// Reclaim a held install handoff into the service for genuine
+    /// disposal. A handoff the service will not take back (never:
+    /// install implies outstanding) parks again rather than stranding
+    /// the lane.
+    fn reclaim_pending_install(&mut self, end: crate::inventory_promotion::PromotionEnd) {
+        let Some(pending) = self.pending_install.take() else {
+            return;
+        };
+        if let Err(pending) = self.lifecycle.reclaim_install(pending, Some(end)) {
+            self.pending_install = Some(pending);
+        }
+    }
+
+    /// Wind down the promotion-installed lane after an operator
+    /// cancel: request stop, run the same synchronous terminal
+    /// sequence as the stop path (a cancel stalls the tick like a
+    /// stop does), finish native cleanup, record the domain for
+    /// completion-polled retire, and confirm the genuine end.
+    /// Manifest lanes are not promotion-managed and never wind down
+    /// here.
+    fn wind_down_installed_promotion(&mut self, end: crate::inventory_promotion::PromotionEnd) {
+        use crate::inventory_promotion::{PromotionOutcome, PromotionStatusUpdate};
+        let Some(installed) = self.installed_promotion.take() else {
+            return;
+        };
+        if let Some(lane) = self.semantic.as_mut() {
+            lane.request_semantic_stop();
+        }
+        self.run_semantic_terminal_sequence();
+        let domain = self.semantic.as_ref().map(|lane| lane.domain());
+        let lane = self.semantic.take();
+        if let Err(error) = finish_semantic_native_cleanup(lane, &|| false) {
+            self.coordinator.note_scope_gap(
+                "selected lane native cleanup failed".into(),
+                format!("{error:#}"),
+            );
+        }
+        if let Some(domain) = domain {
+            self.retiring = Some(domain);
+        }
+        let update = PromotionStatusUpdate::new(
+            installed.capture,
+            installed.request,
+            PromotionOutcome::Ended { reason: end },
+        );
+        if let Some(display) = self.display.as_mut() {
+            display.set_promotion_status(update);
+        }
+        self.coordinator.note_scope_gap(
+            "selected promotion ended".into(),
+            format!(
+                "{} for c{} m{}",
+                end.label(),
+                installed.pair.caller(),
+                installed.pair.provider()
+            ),
+        );
+    }
+
+    /// Install the native completion minter (DR37 A→B). Run setup
+    /// calls this once the native lane lands its source; until then
+    /// the field stays `None` and retiring domains hold.
+    #[cfg_attr(not(test), allow(dead_code))] // STAGED (DR37): called by run setup at unification.
+    fn set_completion_source(
+        &mut self,
+        source: Box<dyn crate::inventory_promotion::lifecycle::NativeCompletionSource>,
+    ) {
+        self.completion_source = Some(source);
+    }
+
+    /// Resolve one taken request into its preparation bundle plus the
+    /// native CAS source (DR37 resolver seam). Unimplemented: no
+    /// manifest-permission lookup maps a clicked pair to an attested
+    /// subset yet, so every take honestly refuses
+    /// `ManifestUnavailable` and no worker ever starts from the
+    /// driver. The lifecycle service, install and retire paths are
+    /// live behind this seam and tested through it.
+    fn resolve_preparation_job(
+        &self,
+        _request: &crate::inventory_promotion::PromotionRequest,
+    ) -> Result<
+        (
+            crate::inventory_promotion::lifecycle::PreparationBundle,
+            Box<dyn crate::inventory_promotion::lifecycle::NativeActivationSource>,
+        ),
+        crate::inventory_promotion::PromotionRefusal,
+    > {
+        Err(crate::inventory_promotion::PromotionRefusal::ManifestUnavailable)
     }
 }
 
@@ -1954,6 +2339,7 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
         if let Some(display) = self.display.as_mut() {
             display.tick();
         }
+        self.poll_promotion();
         // Bound the wait for staged evidence even when collection runs
         // long. Failed commits retry at the next staleness deadline
         // instead of gap-spamming.
@@ -2044,6 +2430,33 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
         // receipt window, so evidence must finalize here instead of
         // after it. The post-retirement hook below is then a no-op.
         self.run_semantic_terminal_sequence();
+        // DR37: cancel promotion work and reclaim held installs, then
+        // drain the service bounded (100ms, the metadata precedent)
+        // without installing: teardown never starts new lanes.
+        self.lifecycle
+            .note_cancel(crate::inventory_promotion::PromotionEnd::RunStopped);
+        self.reclaim_pending_install(crate::inventory_promotion::PromotionEnd::RunStopped);
+        let deadline = Instant::now() + Duration::from_millis(100);
+        loop {
+            if self.lifecycle.is_idle() && self.pending_install.is_none() {
+                break;
+            }
+            let mut sink = std::io::sink();
+            match self.lifecycle.poll(&mut sink) {
+                Some(event) => {
+                    self.apply_lifecycle_event(event);
+                    self.reclaim_pending_install(
+                        crate::inventory_promotion::PromotionEnd::RunStopped,
+                    );
+                }
+                None => {
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
     }
 
     fn on_lane_stopped(&mut self) {
@@ -2991,6 +3404,11 @@ fn run_dashboard(
         display: Some(display),
         semantic,
         semantic_staged: false,
+        lifecycle: crate::inventory_promotion::lifecycle::SelectedLifecycleService::new(),
+        completion_source: None,
+        pending_install: None,
+        installed_promotion: None,
+        retiring: None,
         identity: identity_shared.clone(),
     };
     let ending = || stop() || quit.get();
@@ -7187,6 +7605,11 @@ mod tests {
                 display: None,
                 semantic: Some(scene.lane),
                 semantic_staged: false,
+                lifecycle: crate::inventory_promotion::lifecycle::SelectedLifecycleService::new(),
+                completion_source: None,
+                pending_install: None,
+                installed_promotion: None,
+                retiring: None,
             };
             // The first tick stages; a fresh staged batch stays staged
             // across further ticks instead of committing early.
@@ -7266,6 +7689,11 @@ mod tests {
                 display: None,
                 semantic: Some(scene.lane),
                 semantic_staged: true,
+                lifecycle: crate::inventory_promotion::lifecycle::SelectedLifecycleService::new(),
+                completion_source: None,
+                pending_install: None,
+                installed_promotion: None,
+                retiring: None,
             };
             assert!(driver.semantic_staged, "one quantum stages");
             assert_eq!(driver.coordinator.registry().instances().count(), 0);
@@ -7312,3 +7740,354 @@ mod diagnostics_runtime_tests;
 #[cfg(test)]
 #[path = "inventory_cgroup_runtime_tests.rs"]
 mod cgroup_runtime_tests;
+
+#[cfg(test)]
+mod promotion_driver_tests {
+    //! DR37 driver wiring: takes refuse honestly behind the resolver
+    //! seam, service statuses apply to the mailbox with gap records,
+    //! operator cancel winds work down to a confirmed end, retiring
+    //! domains poll the completion minter, and the stop path drains
+    //! bounded without installing.
+    use super::*;
+    use crate::discovery::caller_registry::{CallerId, ModuleId, OsProcessSource, RegistryLimits};
+    use crate::discovery::hooks::HookRegistry;
+    use crate::inventory_dashboard::{DashboardIo, StderrRoute};
+    use crate::inventory_promotion::lifecycle::{
+        NativeActivationRefusal, NativeActivationSource, NativeCasReceipt, NativeCompletionSource,
+        PreparationOutcome, SelectedActivationBinding, SessionNativeCompletion,
+    };
+    use crate::inventory_promotion::{CaptureId, PromotionEnd, PromotionRefusal, PromotionState};
+    use std::os::fd::AsRawFd as _;
+    use std::time::{Duration, Instant};
+
+    fn coordinator() -> InventoryCoordinator<OsProcessSource> {
+        InventoryCoordinator::new(
+            Scope::Pid(std::process::id()),
+            HookRegistry::builtin(),
+            Vec::new(),
+            OsProcessSource,
+            RegistryLimits::default_limits(),
+        )
+        .expect("test coordinator builds")
+    }
+
+    /// A headless display: frames go to /dev/null, no keys, stderr
+    /// left alone. The file stays alive with the display.
+    struct HeadlessDisplay {
+        _null: std::fs::File,
+        display: Display,
+    }
+
+    fn headless_display() -> HeadlessDisplay {
+        let null = std::fs::File::open("/dev/null").expect("/dev/null opens");
+        let io = DashboardIo {
+            output: null.as_raw_fd(),
+            input: None,
+            account: None,
+            stderr_fd: 2,
+            stderr: StderrRoute::Leave,
+        };
+        let display = Display::open(&io, "test").expect("headless display opens");
+        HeadlessDisplay {
+            _null: null,
+            display,
+        }
+    }
+
+    fn driver_with_display<'a>(
+        coordinator: &'a mut InventoryCoordinator<OsProcessSource>,
+        display: Display,
+    ) -> ClassicDriver<'a> {
+        ClassicDriver {
+            coordinator,
+            inventory_scope: None,
+            scope: InventoryRunScope::Pid(std::process::id()),
+            cgroup: None,
+            max_scan_pids: None,
+            guard: UnavailableImageGuard,
+            deadline: None,
+            identity: None,
+            display: Some(display),
+            semantic: None,
+            semantic_staged: false,
+            lifecycle: crate::inventory_promotion::lifecycle::SelectedLifecycleService::new(),
+            completion_source: None,
+            pending_install: None,
+            installed_promotion: None,
+            retiring: None,
+        }
+    }
+
+    fn queue_request(display: &mut Display) {
+        use crate::inventory_promotion::lifecycle::scripted_promotion_view_for_test;
+        assert!(display.promotion_enable(CaptureId::new(11)));
+        display
+            .queue_promotion_request_for_test(
+                scripted_promotion_view_for_test(),
+                CallerId(3),
+                ModuleId(5),
+            )
+            .expect("exact pair queues");
+    }
+
+    struct StubActivationSource;
+
+    impl NativeActivationSource for StubActivationSource {
+        fn activate(
+            &mut self,
+            _session: &crate::attach::Session,
+            expected: &SelectedActivationBinding,
+        ) -> Result<NativeCasReceipt, NativeActivationRefusal> {
+            Ok(NativeCasReceipt::scripted(*expected))
+        }
+    }
+
+    struct StubCompletionSource(Option<SessionNativeCompletion>);
+
+    impl NativeCompletionSource for StubCompletionSource {
+        fn poll_completion(
+            &mut self,
+            _domain: crate::attach::capture::NativeDomainId,
+        ) -> Option<SessionNativeCompletion> {
+            self.0.take()
+        }
+    }
+
+    /// Publish staged mutations, then read the committed gaps:
+    /// gap records stage and apply at publication, like production.
+    fn gaps(driver: &mut ClassicDriver<'_>) -> Vec<(String, String)> {
+        driver.coordinator.registry_mut().publish();
+        driver
+            .coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .map(|gap| (gap.subject.clone(), gap.reason.clone()))
+            .collect()
+    }
+
+    fn tick_until_idle(driver: &mut ClassicDriver<'_>) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            driver.on_tick();
+            if driver.lifecycle.is_idle() {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "driver did not settle the service within the bound"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn take_refuses_manifest_unavailable_and_records_gap() {
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        queue_request(driver.display.as_mut().expect("display"));
+        driver.on_tick();
+        assert_eq!(
+            driver.display.as_ref().expect("display").promotion_state(),
+            PromotionState::Refused(PromotionRefusal::ManifestUnavailable),
+            "takes refuse honestly behind the resolver seam"
+        );
+        assert!(
+            gaps(&mut driver)
+                .iter()
+                .any(|(subject, reason)| subject == "selected promotion refused"
+                    && reason == PromotionRefusal::ManifestUnavailable.label()),
+            "terminal refusal records a gap: {:?}",
+            gaps(&mut driver)
+        );
+        assert!(driver.lifecycle.is_idle());
+        assert!(driver.pending_install.is_none());
+    }
+
+    #[test]
+    fn service_status_applies_to_display_and_gaps() {
+        use crate::attach::selected_detailed::SelectedPreparationFailure;
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        queue_request(driver.display.as_mut().expect("display"));
+        let request = driver
+            .display
+            .as_mut()
+            .expect("display")
+            .take_promotion_request()
+            .expect("mailbox holds it");
+        let capacity = driver
+            .coordinator
+            .reserve_promotion_install()
+            .expect("capacity reserves");
+        driver
+            .lifecycle
+            .start(request, capacity, Box::new(StubActivationSource), || {
+                PreparationOutcome::Failed(SelectedPreparationFailure::scripted_settled())
+            })
+            .expect("service starts");
+        tick_until_idle(&mut driver);
+        assert_eq!(
+            driver.display.as_ref().expect("display").promotion_state(),
+            PromotionState::Refused(PromotionRefusal::PreparationFailed)
+        );
+        assert!(
+            gaps(&mut driver)
+                .iter()
+                .any(|(subject, _)| subject == "selected promotion refused"),
+            "terminal status records a gap: {:?}",
+            gaps(&mut driver)
+        );
+    }
+
+    #[test]
+    fn stopping_cancels_service_work_and_confirms_cancelled() {
+        use crate::attach::selected_detailed::SelectedPreparationFailure;
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        queue_request(driver.display.as_mut().expect("display"));
+        let request = driver
+            .display
+            .as_mut()
+            .expect("display")
+            .take_promotion_request()
+            .expect("mailbox holds it");
+        let capacity = driver
+            .coordinator
+            .reserve_promotion_install()
+            .expect("capacity reserves");
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        driver
+            .lifecycle
+            .start(
+                request,
+                capacity,
+                Box::new(StubActivationSource),
+                move || {
+                    gate.recv().expect("test releases the worker");
+                    PreparationOutcome::Failed(SelectedPreparationFailure::scripted_settled())
+                },
+            )
+            .expect("service starts");
+        driver
+            .display
+            .as_mut()
+            .expect("display")
+            .cancel_promotion_for_test();
+        assert_eq!(
+            driver.display.as_ref().expect("display").promotion_state(),
+            PromotionState::Stopping
+        );
+        release.send(()).expect("test releases the worker");
+        tick_until_idle(&mut driver);
+        assert_eq!(
+            driver.display.as_ref().expect("display").promotion_state(),
+            PromotionState::Ended(PromotionEnd::Cancelled)
+        );
+        assert!(
+            gaps(&mut driver)
+                .iter()
+                .any(|(subject, reason)| subject == "selected promotion ended"
+                    && reason == PromotionEnd::Cancelled.label()),
+            "confirmed end records a gap: {:?}",
+            gaps(&mut driver)
+        );
+    }
+
+    #[test]
+    fn eager_retire_polls_completion_source() {
+        use crate::attach::capture::NativeDomainId;
+        use crate::inventory_semantics::SemanticBatch;
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let domain = NativeDomainId::try_mint().expect("domain mints");
+        // A live namespace, quiesced through the real drain path.
+        driver
+            .coordinator
+            .stage_semantic_batch(SemanticBatch::scripted(domain, Vec::new(), 1));
+        driver.coordinator.finalize_semantic_batches(None);
+        driver.retiring = Some(domain);
+        // Without a minter the namespace holds, never forced.
+        driver.on_tick();
+        assert_eq!(driver.retiring, Some(domain));
+        driver.completion_source = Some(Box::new(StubCompletionSource(Some(
+            SessionNativeCompletion::scripted(domain),
+        ))));
+        driver.on_tick();
+        assert_eq!(driver.retiring, None, "proven completion retires");
+        // The domain stays refused: staging it again is audited.
+        driver
+            .coordinator
+            .stage_semantic_batch(SemanticBatch::scripted(domain, Vec::new(), 2));
+        assert!(
+            gaps(&mut driver)
+                .iter()
+                .any(|(subject, _)| subject == "semantic batch refused for an ended domain"),
+            "retired domain refuses through the audited path: {:?}",
+            gaps(&mut driver)
+        );
+    }
+
+    #[test]
+    fn stop_drains_service_without_installing() {
+        use crate::attach::selected_detailed::SelectedPreparationFailure;
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        queue_request(driver.display.as_mut().expect("display"));
+        let request = driver
+            .display
+            .as_mut()
+            .expect("display")
+            .take_promotion_request()
+            .expect("mailbox holds it");
+        let capacity = driver
+            .coordinator
+            .reserve_promotion_install()
+            .expect("capacity reserves");
+        driver
+            .lifecycle
+            .start(request, capacity, Box::new(StubActivationSource), || {
+                PreparationOutcome::Failed(SelectedPreparationFailure::scripted_settled())
+            })
+            .expect("service starts");
+        driver.on_stop_requested();
+        assert!(driver.lifecycle.is_idle());
+        assert!(driver.pending_install.is_none());
+        assert!(driver.semantic.is_none(), "teardown never installs");
+        assert_eq!(
+            driver.display.as_ref().expect("display").promotion_state(),
+            PromotionState::Ended(PromotionEnd::RunStopped)
+        );
+    }
+
+    #[test]
+    fn quiet_tick_without_display_is_noop() {
+        let mut coordinator = coordinator();
+        let mut driver = ClassicDriver {
+            coordinator: &mut coordinator,
+            inventory_scope: None,
+            scope: InventoryRunScope::Pid(std::process::id()),
+            cgroup: None,
+            max_scan_pids: None,
+            guard: UnavailableImageGuard,
+            deadline: None,
+            identity: None,
+            display: None,
+            semantic: None,
+            semantic_staged: false,
+            lifecycle: crate::inventory_promotion::lifecycle::SelectedLifecycleService::new(),
+            completion_source: None,
+            pending_install: None,
+            installed_promotion: None,
+            retiring: None,
+        };
+        driver.on_tick();
+        assert!(driver.lifecycle.is_idle());
+        assert!(gaps(&mut driver).is_empty(), "quiet tick records nothing");
+    }
+}

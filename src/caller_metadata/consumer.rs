@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! Pure consumers of the one immutable metadata frame. No acquisition here.
 
 use super::presentation::CallerMetadata;

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! Owned32-body physical entry-count gate. No semantic/API/104-slot claim.
 //! Prebuilt-only, paired normal/default diagnostics; no recorder injection.
 use super::*;

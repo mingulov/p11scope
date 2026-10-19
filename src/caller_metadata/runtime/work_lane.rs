@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! One owned cancellable blocking job. A dropped capture never detaches it.
 
 use std::sync::atomic::{AtomicBool, Ordering};

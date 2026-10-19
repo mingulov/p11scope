@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! Retained-[`ProcPin`](super::ProcPin) backend for caller cgroup sampling.
 //!
 //! This backend borrows already-held custody — the caller's [`ProcPin`] over

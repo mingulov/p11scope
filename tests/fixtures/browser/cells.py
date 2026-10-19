@@ -255,6 +255,67 @@ def attach_drive(name: str, browser: str, workdir: Path, flow_url: str,
         os.environ.update(saved_env)
 
 
+def launch_browser_context(pw, browser: str, workdir: Path, *,
+                           register_module: Path | None = None,
+                           extra_browser_args: tuple[str, ...] = (),
+                           extra_prefs: dict | None = None,
+                           flow_url: str = "",
+                           auto_select_cert: bool = True):
+    """Launch a persistent Playwright context on a fresh profile.
+
+    Returns ``(context, match, profile_path)``: the context, the
+    command-line match resolving the main browser PID, and the fresh
+    Firefox profile (or Chromium HOME) carrying the registration.
+    """
+    if browser == "firefox":
+        ff_prefs = {"security.default_personal_cert": "Select Automatically"}
+        ff_prefs.update(extra_prefs or {})
+        profile = FirefoxProfile.create(
+            workdir / "ffprofile", module_lib=register_module,
+            prefs=ff_prefs)
+        context = pw.firefox.launch_persistent_context(
+            str(profile.path), headless=True, ignore_https_errors=True,
+            args=list(extra_browser_args))
+        return context, str(profile.path), profile.path
+    elif browser == "chromium":
+        home = ChromiumHome.create(workdir / "home", module_lib=register_module).path
+        os.environ["HOME"] = str(home)
+        cr_args = list(extra_browser_args)
+        if auto_select_cert:
+            cr_args.append(f"--auto-select-certificate-for-urls={flow_url}")
+        context = pw.chromium.launch_persistent_context(
+            str(workdir / "crprofile"), channel="chromium",
+            headless=True, ignore_https_errors=True,
+            args=cr_args)
+        return context, str(workdir / "crprofile"), home
+    raise CellError(f"unknown browser: {browser}")
+
+
+#: NSS shared-database locations Chromium may open under its HOME: the
+#: legacy ``.pki/nssdb`` (used when pre-created, as the harness does) and
+#: the ``.local/share/pki/nssdb`` fallback.
+NSS_DB_CANDIDATES = (".pki/nssdb", ".local/share/pki/nssdb")
+
+
+def wait_for_nss_db(fresh_home: Path, timeout_seconds: float = 15.0) -> Path | None:
+    """Poll ``fresh_home`` for a Chromium-created NSS database; return its dir.
+
+    Chromium initializes NSS eagerly at startup, creating ``cert9.db`` /
+    ``key4.db`` in exactly one shared-DB dir under its effective HOME.
+    Whichever dir gains a database proves which HOME the browser used; the
+    caller additionally requires its own ``pkcs11.txt`` to be the one in
+    that dir. Returns None on timeout.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        for candidate in NSS_DB_CANDIDATES:
+            dbdir = fresh_home / candidate
+            if (dbdir / "cert9.db").exists() or (dbdir / "key4.db").exists():
+                return dbdir
+        time.sleep(0.2)
+    return None
+
+
 def _attach_drive_inner(name, browser, workdir, flow_url, flow, observe_module,
                         register_module, duration_seconds, attach_grace_seconds,
                         wait_for_map, extra_browser_args,
@@ -266,29 +327,10 @@ def _attach_drive_inner(name, browser, workdir, flow_url, flow, observe_module,
     from playwright.sync_api import sync_playwright  # noqa: PLC0415
 
     with sync_playwright() as pw:
-        if browser == "firefox":
-            ff_prefs = {"security.default_personal_cert": "Select Automatically"}
-            ff_prefs.update(extra_prefs)
-            profile = FirefoxProfile.create(
-                workdir / "ffprofile", module_lib=register_module,
-                prefs=ff_prefs)
-            context = pw.firefox.launch_persistent_context(
-                str(profile.path), headless=True, ignore_https_errors=True,
-                args=list(extra_browser_args))
-            match = str(profile.path)
-        elif browser == "chromium":
-            home = ChromiumHome.create(workdir / "home", module_lib=register_module).path
-            os.environ["HOME"] = str(home)
-            cr_args = list(extra_browser_args)
-            if auto_select_cert:
-                cr_args.append(f"--auto-select-certificate-for-urls={flow_url}")
-            context = pw.chromium.launch_persistent_context(
-                str(workdir / "crprofile"), channel="chromium",
-                headless=True, ignore_https_errors=True,
-                args=cr_args)
-            match = str(workdir / "crprofile")
-        else:
-            raise CellError(f"unknown browser: {browser}")
+        context, match, _profile = launch_browser_context(
+            pw, browser, workdir, register_module=register_module,
+            extra_browser_args=tuple(extra_browser_args), extra_prefs=extra_prefs,
+            flow_url=flow_url, auto_select_cert=auto_select_cert)
         try:
             pid = main_browser_pid(match, browser)
             if wait_for_map and not wait_for_mapping(pid, wait_for_map):

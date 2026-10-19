@@ -14,6 +14,7 @@ Harness: tests/fixtures/browser/ (cells, flows, oracle, servers, profiles).
 
 import functools
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -100,6 +101,22 @@ def gate(test):
             cells.preflight()
         except (cells.CellError, RuntimeError) as exc:
             self.skipTest(f"browser gate prerequisite missing: {exc}")
+        return test(self)
+
+    return wrapper
+
+
+def needs_chromium(test):
+    """Skip unless Playwright and its Chromium build are present (no sudo)."""
+
+    @functools.wraps(test)
+    def wrapper(self):
+        try:
+            import playwright  # noqa: F401
+            from profiles import chromium_binary
+            chromium_binary()
+        except (ImportError, RuntimeError) as exc:
+            self.skipTest(f"chromium witness prerequisite missing: {exc}")
         return test(self)
 
     return wrapper
@@ -322,6 +339,37 @@ class BrowserCells(unittest.TestCase):
         path = self.work / f"{name}-report.json"
         path.write_text(json.dumps(doc))
         return cells.CellResult(name, path)
+
+    @needs_chromium
+    def test_chromium_uses_fresh_home_nss_db(self):
+        """P2-1 twin: the launched browser's NSS DB must live in the fresh HOME."""
+        from playwright.sync_api import sync_playwright
+        real_home = os.environ.get("HOME")
+        caller_home = self.work / "caller-home"
+        caller_home.mkdir()
+        cell_work = self.work / "cell"
+        try:
+            os.environ["HOME"] = str(caller_home)
+            with sync_playwright() as pw:
+                context, _match, fresh_home = cells.launch_browser_context(
+                    pw, "chromium", cell_work,
+                    register_module=Path("/probe-test/libsoft-test.so"))
+                try:
+                    used = cells.wait_for_nss_db(fresh_home, timeout_seconds=15.0)
+                finally:
+                    context.close()
+        finally:
+            if real_home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = real_home
+        self.assertIsNotNone(used, "no NSS database appeared under the fresh HOME")
+        assert used is not None
+        pkcs11 = used / "pkcs11.txt"
+        self.assertTrue(pkcs11.exists(), f"our pkcs11.txt is not in the used DB dir {used}")
+        self.assertIn("/probe-test/libsoft-test.so", pkcs11.read_text())
+        strays = [p for p in (caller_home / ".pki", caller_home / ".local") if p.exists()]
+        self.assertEqual(strays, [], f"browser NSS state leaked into caller HOME: {strays}")
 
     def test_oracle_builder_healthy_accepted(self):
         """Guard: the twin builder's healthy doc passes the common oracle."""

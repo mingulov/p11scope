@@ -1528,7 +1528,10 @@ pub(crate) enum Publish<'a> {
         links: usize,
         budget: Duration,
     },
-    /// The native stop's commit: the events it staged.
+    /// The terminal commit: the native stop's commit with the events it
+    /// staged, or a scan-only zero-pass stop's diagnostic commit with no
+    /// events. Both stream under a `final` pass marker with zero scan
+    /// counts, so gap accounting still sums without claiming a pass.
     Stop {
         events: &'a [CallerEvent],
         now_ns: u64,
@@ -1850,6 +1853,21 @@ where
         // failure: exit 0 is preserved.
         if error.is_some() || zero_pass.is_some() {
             let _ = driver.commit(false);
+        }
+        if zero_pass.is_some() {
+            // Terminal accounting for the diagnostic gap: it streams
+            // under this final marker (zero scan counts, `final: true`),
+            // so `new_gaps` still sums to every streamed gap without
+            // claiming a completed pass. Best-effort like the commit
+            // above: a failed terminal publication must not flip
+            // F9-success exit 0. Error runs keep their markerless shape.
+            let _ = publish(
+                driver,
+                Publish::Stop {
+                    events: &[],
+                    now_ns: now_ns(),
+                },
+            );
         }
         return ClassicOutcome {
             stopped: None,
@@ -2386,19 +2404,22 @@ mod stop_latch_tests {
     }
 
     #[test]
-    fn pre_requested_stop_runs_zero_passes_with_no_apply_or_commit() {
+    fn pre_requested_stop_reports_zero_passes_under_a_terminal_marker() {
         let mut driver = F9Driver::new();
         let stop = || true;
         let clock = probe_clock(&stop);
         let mut pass_publications = 0;
+        let mut stop_publications = 0;
         let outcome = run_classic_finalizing(
             &mut driver,
             None::<NativeLane<F9Lane>>,
             &clock,
             None,
             &mut |_, point| {
-                if matches!(point, Publish::Pass { .. }) {
-                    pass_publications += 1;
+                match point {
+                    Publish::Pass { .. } => pass_publications += 1,
+                    Publish::Stop { .. } => stop_publications += 1,
+                    Publish::Retiring { .. } => {}
                 }
                 Ok(())
             },
@@ -2416,27 +2437,34 @@ mod stop_latch_tests {
         );
         assert_eq!(pass_publications, 0, "no pass was published");
         assert_eq!(
+            stop_publications, 1,
+            "the diagnostic gap streams under one terminal marker"
+        );
+        assert_eq!(
             driver.host.stops, 1,
             "the latch stops the host exactly once"
         );
     }
 
     #[test]
-    fn mid_pass_stop_skips_apply_and_commit() {
+    fn mid_pass_stop_discards_the_collection_under_a_terminal_marker() {
         let mut driver = F9Driver::new();
         let stop_flag = Rc::new(Cell::new(false));
         driver.arm_stop_on_collect = Some(Rc::clone(&stop_flag));
         let stop = || stop_flag.get();
         let clock = probe_clock(&stop);
         let mut pass_publications = 0;
+        let mut stop_publications = 0;
         let outcome = run_classic_finalizing(
             &mut driver,
             None::<NativeLane<F9Lane>>,
             &clock,
             None,
             &mut |_, point| {
-                if matches!(point, Publish::Pass { .. }) {
-                    pass_publications += 1;
+                match point {
+                    Publish::Pass { .. } => pass_publications += 1,
+                    Publish::Stop { .. } => stop_publications += 1,
+                    Publish::Retiring { .. } => {}
                 }
                 Ok(())
             },
@@ -2454,6 +2482,10 @@ mod stop_latch_tests {
         );
         assert_eq!(pass_publications, 0, "no pass was published");
         assert_eq!(
+            stop_publications, 1,
+            "the diagnostic gap streams under one terminal marker"
+        );
+        assert_eq!(
             driver.host.stops, 1,
             "the latch stops the host exactly once"
         );
@@ -2466,14 +2498,17 @@ mod stop_latch_tests {
         let stop = move || applied.get() >= 1;
         let clock = probe_clock(&stop);
         let mut pass_publications = 0;
+        let mut stop_publications = 0;
         let outcome = run_classic_finalizing(
             &mut driver,
             None::<NativeLane<F9Lane>>,
             &clock,
             None,
             &mut |_, point| {
-                if matches!(point, Publish::Pass { .. }) {
-                    pass_publications += 1;
+                match point {
+                    Publish::Pass { .. } => pass_publications += 1,
+                    Publish::Stop { .. } => stop_publications += 1,
+                    Publish::Retiring { .. } => {}
                 }
                 Ok(())
             },
@@ -2483,6 +2518,10 @@ mod stop_latch_tests {
         assert_eq!(driver.applies, 1, "the completed pass still applies");
         assert_eq!(driver.commits, 1, "the completed pass still commits");
         assert_eq!(pass_publications, 1, "the completed pass is published");
+        assert_eq!(
+            stop_publications, 0,
+            "a completed scan pass needs no terminal marker"
+        );
         assert_eq!(driver.host.stops, 1, "the host stops exactly once");
     }
 
@@ -2563,7 +2602,7 @@ mod stop_latch_tests {
     }
 
     #[test]
-    fn passed_deadline_runs_zero_passes_with_no_apply_or_commit() {
+    fn passed_deadline_reports_zero_passes_under_a_terminal_marker() {
         let mut driver = F9Driver::new();
         let stop = || false;
         let clock = LoopClock {
@@ -2574,14 +2613,17 @@ mod stop_latch_tests {
             collection_tick: Duration::from_millis(10),
         };
         let mut pass_publications = 0;
+        let mut stop_publications = 0;
         let outcome = run_classic_finalizing(
             &mut driver,
             None::<NativeLane<F9Lane>>,
             &clock,
             None,
             &mut |_, point| {
-                if matches!(point, Publish::Pass { .. }) {
-                    pass_publications += 1;
+                match point {
+                    Publish::Pass { .. } => pass_publications += 1,
+                    Publish::Stop { .. } => stop_publications += 1,
+                    Publish::Retiring { .. } => {}
                 }
                 Ok(())
             },
@@ -2598,6 +2640,10 @@ mod stop_latch_tests {
             "only the zero-pass diagnostic gap publishes"
         );
         assert_eq!(pass_publications, 0, "no pass was published");
+        assert_eq!(
+            stop_publications, 1,
+            "the diagnostic gap streams under one terminal marker"
+        );
         assert_eq!(
             driver.host.stops, 1,
             "the latch stops the host exactly once"
@@ -2731,14 +2777,17 @@ mod stop_latch_tests {
             collection_tick: Duration::from_millis(10),
         };
         let mut pass_publications = 0;
+        let mut stop_publications = 0;
         let outcome = run_classic_finalizing(
             &mut driver,
             None::<NativeLane<F9Lane>>,
             &clock,
             None,
             &mut |_, point| {
-                if matches!(point, Publish::Pass { .. }) {
-                    pass_publications += 1;
+                match point {
+                    Publish::Pass { .. } => pass_publications += 1,
+                    Publish::Stop { .. } => stop_publications += 1,
+                    Publish::Retiring { .. } => {}
                 }
                 Ok(())
             },
@@ -2752,6 +2801,10 @@ mod stop_latch_tests {
             "only the zero-pass diagnostic gap publishes"
         );
         assert_eq!(pass_publications, 0, "no pass was published");
+        assert_eq!(
+            stop_publications, 1,
+            "the diagnostic gap streams under one terminal marker"
+        );
         assert_eq!(
             driver.host.stops, 1,
             "the latch stops the host exactly once"
@@ -2791,20 +2844,27 @@ mod stop_latch_tests {
         let stop = || false;
         let clock = probe_clock(&stop);
         let mut pass_publications = 0;
+        let mut stop_publications = 0;
         let outcome = run_classic_finalizing(
             &mut driver,
             None::<NativeLane<F9Lane>>,
             &clock,
             None,
             &mut |_, point| {
-                if matches!(point, Publish::Pass { .. }) {
-                    pass_publications += 1;
+                match point {
+                    Publish::Pass { .. } => pass_publications += 1,
+                    Publish::Stop { .. } => stop_publications += 1,
+                    Publish::Retiring { .. } => {}
                 }
                 Ok(())
             },
         );
         assert!(outcome.error.is_none());
         assert_eq!(pass_publications, 1, "the snapshot pass is published");
+        assert_eq!(
+            stop_publications, 0,
+            "a completed snapshot needs no terminal marker"
+        );
         assert_eq!(driver.applies, 1);
         assert!(outcome.zero_pass.is_none(), "no zero-pass stop happened");
         assert!(driver.host.gaps.is_empty(), "{:?}", driver.host.gaps);
@@ -2816,14 +2876,17 @@ mod stop_latch_tests {
         let stop = || true;
         let clock = probe_clock(&stop);
         let mut pass_publications = 0;
+        let mut stop_publications = 0;
         let outcome = run_classic_finalizing(
             &mut driver,
             None::<NativeLane<F9Lane>>,
             &clock,
             None,
             &mut |_, point| {
-                if matches!(point, Publish::Pass { .. }) {
-                    pass_publications += 1;
+                match point {
+                    Publish::Pass { .. } => pass_publications += 1,
+                    Publish::Stop { .. } => stop_publications += 1,
+                    Publish::Retiring { .. } => {}
                 }
                 Ok(())
             },
@@ -2836,6 +2899,10 @@ mod stop_latch_tests {
             "only the zero-pass diagnostic gap publishes"
         );
         assert_eq!(pass_publications, 0, "no pass was published");
+        assert_eq!(
+            stop_publications, 1,
+            "the diagnostic gap streams under one terminal marker"
+        );
         let zero = outcome.zero_pass.expect("a zero-pass stop is reported");
         assert_eq!(zero.cause, ZeroPassCause::OperatorStop);
         assert_eq!(zero.discarded, 0);
@@ -2858,14 +2925,24 @@ mod stop_latch_tests {
         let mut driver = F9Driver::new();
         let stop = || false;
         let clock = probe_clock(&stop);
+        let mut stop_publications = 0;
         let outcome = run_classic_finalizing(
             &mut driver,
             None::<NativeLane<F9Lane>>,
             &clock,
             Some(anyhow!("started append failure")),
-            &mut |_, _| Ok(()),
+            &mut |_, point| {
+                if matches!(point, Publish::Stop { .. }) {
+                    stop_publications += 1;
+                }
+                Ok(())
+            },
         );
         assert!(outcome.error.is_some());
+        assert_eq!(
+            stop_publications, 0,
+            "error runs keep their markerless shape"
+        );
         assert!(outcome.zero_pass.is_none(), "errors keep no zero-pass note");
         assert_eq!(driver.host.gaps.len(), 1, "{:?}", driver.host.gaps);
         assert_eq!(driver.host.gaps[0].0, "inventory capture failed");
@@ -2889,14 +2966,17 @@ mod stop_latch_tests {
             collection_tick: Duration::from_millis(10),
         };
         let mut pass_publications = 0;
+        let mut stop_publications = 0;
         let outcome = run_classic_finalizing(
             &mut driver,
             None::<NativeLane<F9Lane>>,
             &clock,
             None,
             &mut |_, point| {
-                if matches!(point, Publish::Pass { .. }) {
-                    pass_publications += 1;
+                match point {
+                    Publish::Pass { .. } => pass_publications += 1,
+                    Publish::Stop { .. } => stop_publications += 1,
+                    Publish::Retiring { .. } => {}
                 }
                 Ok(())
             },
@@ -2905,6 +2985,7 @@ mod stop_latch_tests {
         assert_eq!(driver.collects, 2, "pass-1 collection ran, then discarded");
         assert_eq!(driver.applies, 1, "only the completed pass applies");
         assert_eq!(pass_publications, 1, "the completed pass is published");
+        assert_eq!(stop_publications, 0, "a trailing discard stays silent");
         assert!(
             outcome.zero_pass.is_none(),
             "a trailing discard stays silent"

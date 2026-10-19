@@ -6425,34 +6425,6 @@ pub(crate) mod demotion_retirement_producer_tests {
         pub(crate) fn spawn_stopped(command: &mut Command, after_spawn: impl FnOnce(u32)) -> Self {
             // The child reaches its readiness handshake after dynamic startup.
             // A confirmed SIGSTOP then holds its maps stable during the scan.
-            //
-            // Abort-proof the spawn itself: Drop reaps on every unwind
-            // path, but an aborted observer (SIGABRT/SIGKILL) runs no
-            // teardown, orphaning its SIGSTOPped child with every
-            // inherited fd — including the cargo-lane lock, which
-            // flock(1) holds without CLOEXEC by design and which the
-            // orphan then wedges via the shared open file description.
-            // The child therefore dies with its observer even while
-            // stopped (a parent already gone exits before exec), and
-            // scrubs every fd past stdio. Async-signal-safe syscalls
-            // only; the bounded loop costs milliseconds.
-            use std::os::unix::process::CommandExt;
-            // SAFETY: the hook runs after fork before exec; its body
-            // uses async-signal-safe syscalls only (prctl, getppid,
-            // _exit, close), closes child fds only, allocates nothing
-            // and touches no parent memory.
-            unsafe {
-                command.pre_exec(|| {
-                    libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong);
-                    if libc::getppid() == 1 {
-                        libc::_exit(127);
-                    }
-                    for fd in 3..65536 {
-                        libc::close(fd);
-                    }
-                    Ok(())
-                });
-            }
             let mut owned = Self(Some(command.spawn().unwrap()));
             after_spawn(owned.id());
             let pid = owned.id() as libc::pid_t;

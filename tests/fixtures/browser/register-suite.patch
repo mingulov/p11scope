@@ -12,10 +12,10 @@ index 1888f509..b6f09f3e 100755
      ("test_canary_evidence.py", ["--target-bits", "32"]),
 diff --git a/tests/python/test_browser_cells.py b/tests/python/test_browser_cells.py
 new file mode 100644
-index 00000000..7a71ad90
+index 00000000..e2d0c520
 --- /dev/null
 +++ b/tests/python/test_browser_cells.py
-@@ -0,0 +1,861 @@
+@@ -0,0 +1,926 @@
 +# SPDX-License-Identifier: GPL-3.0-or-later
 +"""G33 browser application cells: real Firefox/Chromium PKCS#11 traffic.
 +
@@ -717,7 +717,8 @@ index 00000000..7a71ad90
 +        """
 +        stats = {
 +            "connections": 1, "requests_served": 0, "client_certs_presented": 0,
-+            "handshakes_ok": 0, "spoke_tls": 1, "empty_certs": 0,
++            "handshakes_ok": 0, "spoke_tls": 1, "client_hello_complete": 0,
++            "empty_certs": 0,
 +            "selection_stalls": 0, "client_cert_alerts": 0, "abandoned": 1,
 +            "handshake_failures": 0, "handshake_errors": [],
 +        }
@@ -730,10 +731,44 @@ index 00000000..7a71ad90
 +        return {"flow": "client_cert_visit", "loaded": False,
 +                "error": "SSLError: TLS protocol mismatch before certificate selection"}
 +
++    @staticmethod
++    def _pinbound_timeout_facts():
++        """Synthetic hung client-cert visit (navigation timeout, nothing selected)."""
++        return {"flow": "client_cert_visit", "loaded": False,
++                "error": "TimeoutError: Page.goto: Timeout 20000ms exceeded."}
++
 +    def test_pinbound_rejects_preselection_failure(self):
 +        """P2-2 twin: a pre-selection protocol failure must fail the cell."""
 +        with self.assertRaises(AssertionError):
 +            self._pinbound_rig(self._pinbound_stats(), self._pinbound_facts())
++
++    def test_pinbound_rejects_partial_client_hello_stall(self):
++        """P2-2 twin: a stall without a complete ClientHello must fail the cell.
++
++        A bare TLS first byte plus a timeout is not a selection stall:
++        nothing proves ClientHello completed or the CertificateRequest
++        flight went out (Sol residual shape 1).
++        """
++        stats = self._pinbound_stats(selection_stalls=1, abandoned=0,
++                                     client_hello_complete=0)
++        with self.assertRaises(AssertionError):
++            self._pinbound_rig(stats, self._pinbound_timeout_facts())
++
++    def test_pinbound_rejects_abandoned_with_navigation_timeout(self):
++        """P2-2 twin: abandonment plus a hung navigation must fail the cell.
++
++        Every connection vanished pre-selection; the navigation timeout
++        is context, never a selection witness (Sol residual shape 2).
++        """
++        with self.assertRaises(AssertionError):
++            self._pinbound_rig(self._pinbound_stats(), self._pinbound_timeout_facts())
++
++    def test_pinbound_rig_stall_accepted(self):
++        """Guard: a hello-backed stall still passes (no over-reject)."""
++        self._pinbound_rig(
++            self._pinbound_stats(selection_stalls=1, abandoned=0,
++                                 client_hello_complete=1),
++            self._pinbound_timeout_facts())
 +
 +    def test_pinbound_rig_healthy_accepted(self):
 +        """Guard: the rig passes with a boundary witness (no over-reject)."""
@@ -873,6 +908,36 @@ index 00000000..7a71ad90
 +                self.assertIn(b"g33-flow-ok", read_all(peer))
 +            self.assertEqual((flow.handshakes_ok, flow.client_certs_presented,
 +                              flow.requests_served), (1, 0, 1))
++
++    def test_flow_server_partial_client_hello_is_abandoned(self):
++        """P2-2 twin: a partial ClientHello plus silence is abandoned, not a stall.
++
++        Sends a TLS record header promising more bytes than arrive, then
++        holds the connection open past a short handshake deadline: the
++        server must not count a selection stall without a complete
++        ClientHello. Stdlib sockets only.
++        """
++        if shutil.which("openssl") is None:
++            self.skipTest("openssl missing")
++        key, cert = tls_server.make_server_credential(self.work / "srv")
++        with tls_server.FlowServer(cert=cert, key=key, require_client_cert=True,
++                                   client_ca=cert) as flow:
++            flow.HANDSHAKE_TIMEOUT = 2.0
++            raw = socket.create_connection(("127.0.0.1", flow.port))
++            try:
++                raw.sendall(b"\x16\x03\x01\x00\x10" + b"\x00" * 4)
++                deadline = time.monotonic() + 10
++                while (flow.abandoned + flow.selection_stalls
++                       + flow.handshake_failures == 0
++                       and time.monotonic() < deadline):
++                    time.sleep(0.05)
++            finally:
++                raw.close()
++            self.assertEqual(flow.connections, 1)
++            self.assertEqual(flow.selection_stalls, 0,
++                             "partial ClientHello counted as a selection stall")
++            self.assertEqual(flow.abandoned, 1)
++            self.assertEqual(flow.handshake_failures, 0)
 +
 +
 +if __name__ == "__main__":

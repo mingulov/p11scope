@@ -2,24 +2,61 @@
 """Local TLS/HTTP flow servers for the G33 browser cells.
 
 The servers are the cells' independent ground truth: they record what the
-browser actually did at the TLS layer (connections, presented client
-certificates, requests served) so the oracle never infers PKCS#11 use from
-a successful page load alone. All listeners bind 127.0.0.1 on ephemeral
-ports; certificates are short-lived and confined to the cell workdir.
+browser actually did at the TLS layer (connections, per-connection
+handshake outcomes, presented client certificates, requests served) so the
+oracle never infers PKCS#11 use from a successful page load alone. All
+listeners bind 127.0.0.1 on ephemeral ports; certificates are short-lived
+and confined to the cell workdir.
 """
 
 from __future__ import annotations
 
 import http.server
+import socket
 import ssl
 import subprocess
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 
 class TLSError(RuntimeError):
     """A flow server could not start."""
+
+
+#: First byte of a TLS handshake record: a ClientHello always opens one,
+#: so a peeked first byte distinguishes TLS speakers from garbage.
+TLS_HANDSHAKE_FIRST_BYTE = 0x16
+
+
+def classify_handshake_error(exc: BaseException) -> str:
+    """Bucket a failed server-side ``wrap_socket`` into an outcome.
+
+    Returns ``"empty_cert"`` (the client completed the handshake with an
+    empty certificate: selection reached, nothing offered), ``"cert_alert"``
+    (the client refused with certificate_unknown: ambiguous between a
+    selection refusal and a server-cert rejection, so tolerated but never
+    a witness), ``"stall"`` (a TLS-speaking peer never finished: stuck at
+    selection), ``"abandoned"`` (the peer went away mid-handshake: EOF or
+    reset, carrying no selection information), or ``"failure"`` (an
+    unrelated protocol failure: garbage, version/decipher errors, or any
+    other alert). Only reached for peers the peek already saw speak TLS.
+    """
+    upper = f"{type(exc).__name__}: {exc}".upper()
+    if "PEER_DID_NOT_RETURN_A_CERTIFICATE" in upper or "PEER DID NOT RETURN A CERTIFICATE" in upper:
+        return "empty_cert"
+    if "CERTIFICATE_UNKNOWN" in upper:
+        return "cert_alert"
+    if "ALERT" in upper:
+        return "failure"
+    if isinstance(exc, TimeoutError):
+        return "stall"
+    if isinstance(exc, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)):
+        return "abandoned"
+    if "EOF" in upper:
+        return "abandoned"
+    return "failure"
 
 
 def make_server_credential(workdir: Path, common_name: str = "127.0.0.1") -> tuple[Path, Path]:
@@ -51,6 +88,17 @@ class FlowServer:
     to (the harness passes the self-signed client cert itself).
     ``use_tls=False`` serves plain HTTP (no cert/key needed); CERT_REQUIRED
     is meaningless there and refused.
+
+    TLS ground truth per connection: ``connections`` (accepts),
+    ``spoke_tls`` (peers that sent a TLS ClientHello), ``handshakes_ok``
+    (completed handshakes), ``client_certs_presented`` (peer cert seen at
+    handshake time, independent of requests), ``empty_certs`` (full
+    handshake with an empty client certificate), ``selection_stalls``
+    (TLS-speaking peers that never finished), ``client_cert_alerts``
+    (certificate_unknown refusals: tolerated, never a witness),
+    ``abandoned`` (peers that went away without selection information:
+    EOF, reset, or silence), ``handshake_failures`` with the first
+    ``handshake_errors`` (unrelated protocol failures).
     """
 
     cert: Path | None = None
@@ -61,8 +109,46 @@ class FlowServer:
     connections: int = 0
     requests_served: int = 0
     client_certs_presented: int = 0
+    handshakes_ok: int = 0
+    spoke_tls: int = 0
+    empty_certs: int = 0
+    selection_stalls: int = 0
+    client_cert_alerts: int = 0
+    abandoned: int = 0
+    handshake_failures: int = 0
+    handshake_errors: list[str] = field(default_factory=list)
     _httpd: http.server.HTTPServer | None = field(default=None, init=False, repr=False)
     _thread: threading.Thread | None = field(default=None, init=False, repr=False)
+
+    def note_handshake(self, outcome: str, detail: str) -> None:
+        """Record one failed-handshake classification (see the classifier)."""
+        if outcome == "empty_cert":
+            self.empty_certs += 1
+        elif outcome == "cert_alert":
+            self.client_cert_alerts += 1
+        elif outcome == "stall":
+            self.selection_stalls += 1
+        elif outcome == "abandoned":
+            self.abandoned += 1
+        else:
+            self.handshake_failures += 1
+            if len(self.handshake_errors) < 3:
+                self.handshake_errors.append(f"{outcome}: {detail}"[:200])
+
+    def note_handshake_ok(self, tls_conn: ssl.SSLSocket) -> None:
+        """Record one completed handshake, counting a presented peer cert.
+
+        The peer certificate is read at handshake time, independently of
+        any later HTTP request: a presented cert counts even when no
+        request is ever served.
+        """
+        self.handshakes_ok += 1
+        try:
+            peer = tls_conn.getpeercert(binary_form=True)
+        except Exception:
+            peer = None
+        if peer:
+            self.client_certs_presented += 1
 
     @property
     def port(self) -> int:
@@ -75,8 +161,9 @@ class FlowServer:
         scheme = "https" if self.use_tls else "http"
         return f"{scheme}://127.0.0.1:{self.port}/"
 
-    #: Bound for one connection's TLS handshake; a stalled peer must never
-    #: wedge the acceptor (a wrapped listener would block inside accept()).
+    #: Bound for one connection's TLS handshake (peek plus wrap); a stalled
+    #: peer must never wedge the acceptor (a wrapped listener would block
+    #: inside accept()).
     HANDSHAKE_TIMEOUT = 15.0
 
     def __enter__(self) -> "FlowServer":
@@ -90,13 +177,10 @@ class FlowServer:
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):  # noqa: N802 - BaseHTTPRequestHandler naming
-                try:
-                    peer = self.connection.getpeercert(binary_form=True)
-                except Exception:
-                    peer = None
+                # Presented certs are counted at handshake time (a served
+                # request without a handshake is impossible, but a
+                # handshake without a request is the PINBOUND norm).
                 server.requests_served += 1
-                if peer:
-                    server.client_certs_presented += 1
                 body = b"g33-flow-ok"
                 self.send_response(200)
                 self.send_header("Content-Length", str(len(body)))
@@ -130,13 +214,46 @@ class FlowServer:
                 server.connections += 1
                 if context is None:
                     return conn, client_address
+                # Peek before wrapping: the first byte proves whether the
+                # peer engaged in TLS at all, and peeking never consumes,
+                # so the handshake below proceeds undisturbed.
+                deadline = time.monotonic() + server.HANDSHAKE_TIMEOUT
                 conn.settimeout(server.HANDSHAKE_TIMEOUT)
                 try:
+                    head = conn.recv(5, socket.MSG_PEEK)
+                except TimeoutError:
+                    server.note_handshake("abandoned", "silent: no bytes before the deadline")
+                    conn.close()
+                    raise
+                except OSError as exc:
+                    server.note_handshake("abandoned", f"peek {type(exc).__name__}: {exc}"[:160])
+                    conn.close()
+                    raise
+                if not head:
+                    server.note_handshake("abandoned", "peer closed before sending bytes")
+                    conn.close()
+                    raise ConnectionError("peer closed before sending TLS bytes")
+                if head[0] != TLS_HANDSHAKE_FIRST_BYTE:
+                    server.note_handshake("failure", f"non-TLS first byte {head[0]:#04x}")
+                    conn.close()
+                    raise ValueError(f"peer spoke non-TLS bytes: {bytes(head[:5])!r}")
+                server.spoke_tls += 1
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    server.note_handshake("stall", "deadline exhausted by the peek")
+                    conn.close()
+                    raise TimeoutError("TLS handshake deadline exhausted by the peek")
+                conn.settimeout(remaining)
+                try:
                     tls_conn = context.wrap_socket(conn, server_side=True)
-                except (OSError, ValueError):
+                except (OSError, ValueError) as exc:
+                    server.note_handshake(
+                        classify_handshake_error(exc),
+                        f"{type(exc).__name__}: {exc}"[:160])
                     conn.close()
                     raise
                 tls_conn.settimeout(None)
+                server.note_handshake_ok(tls_conn)
                 return tls_conn, client_address
 
         try:

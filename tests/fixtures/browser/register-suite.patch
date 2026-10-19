@@ -12,10 +12,10 @@ index 1888f509..b6f09f3e 100755
      ("test_canary_evidence.py", ["--target-bits", "32"]),
 diff --git a/tests/python/test_browser_cells.py b/tests/python/test_browser_cells.py
 new file mode 100644
-index 00000000..33058faf
+index 00000000..59ddd66e
 --- /dev/null
 +++ b/tests/python/test_browser_cells.py
-@@ -0,0 +1,519 @@
+@@ -0,0 +1,703 @@
 +# SPDX-License-Identifier: GPL-3.0-or-later
 +"""G33 browser application cells: real Firefox/Chromium PKCS#11 traffic.
 +
@@ -34,8 +34,11 @@ index 00000000..33058faf
 +import json
 +import os
 +import shutil
++import socket
++import ssl
 +import sys
 +import tempfile
++import time
 +import unittest
 +from pathlib import Path
 +from types import SimpleNamespace
@@ -112,6 +115,17 @@ index 00000000..33058faf
 +#: Private-token operations no PINBOUND flow may ever reach: login plus
 +#: signing setup and signing (init and one-shot share the boundary).
 +_PINBOUND_ABSENT = ("C_Login", "C_SignInit", "C_Sign")
++
++
++def _stall_outcomes(server) -> str:
++    """One-line handshake summary for PINBOUND failure messages."""
++    return (
++        f"connections={server.connections} requests={server.requests_served} "
++        f"certs={server.client_certs_presented} ok={server.handshakes_ok} "
++        f"spoke={server.spoke_tls} empty={server.empty_certs} "
++        f"stalls={server.selection_stalls} alerts={server.client_cert_alerts} "
++        f"abandoned={server.abandoned} failures={server.handshake_failures} "
++        f"errors={server.handshake_errors}")
 +
 +
 +def gate(test):
@@ -208,6 +222,43 @@ index 00000000..33058faf
 +            self.fail(f"{result.name} failed:\n{json.dumps(detail, indent=1)[:3000]}")
 +        return report
 +
++    def assert_pinbound_stall(self, label, facts, server):
++        """The CERT_REQUIRED flow stalled at the PIN boundary (P2-2).
++
++        Requires a token-selection witness — an empty certificate, a
++        spoke-TLS stall, or a hung navigation with TLS-speaking peers —
++        with no successful handshake, no presented cert, no served
++        request, no protocol failure, and a TLS-flow (not crashed or
++        never-launched) browser outcome. Client cert alerts and abandoned
++        transports are tolerated but never sufficient: alerts are
++        ambiguous (selection refusal vs server-cert rejection) and
++        abandons carry no selection information.
++        """
++        outcomes = _stall_outcomes(server)
++        self.assertGreaterEqual(server.connections, 1, f"{label}: browser never connected")
++        self.assertEqual(server.requests_served, 0,
++                         f"{label}: request served without a cert? [{outcomes}]")
++        self.assertEqual(server.client_certs_presented, 0,
++                         f"{label}: client cert presented?! [{outcomes}]")
++        self.assertEqual(server.handshakes_ok, 0,
++                         f"{label}: handshake succeeded?! [{outcomes}]")
++        self.assertEqual(server.handshake_failures, 0,
++                         f"{label}: unrelated TLS failure {server.handshake_errors} [{outcomes}]")
++        hung = flows.is_navigation_timeout(facts.get("error")) and server.spoke_tls >= 1
++        witness = server.empty_certs + server.selection_stalls + (1 if hung else 0)
++        self.assertGreaterEqual(
++            witness, 1,
++            f"{label}: no token-selection witness "
++            f"(need empty-cert, spoke-stall, or hung-with-spoke) [{outcomes}]")
++        self.assertNotIn("flow_error", facts,
++                         f"{label}: flow setup failed: {facts.get('flow_error')}")
++        self.assertFalse(facts.get("loaded", True),
++                         f"{label}: client-cert flow loaded?! [{outcomes}]")
++        kind = flows.classify_client_cert_error(facts.get("error"))
++        self.assertNotEqual(kind, "unrelated",
++                            f"{label}: browser never produced a TLS outcome: "
++                            f"{facts.get('error')!r} [{outcomes}]")
++
 +    @gate
 +    def test_ff_startup_observes_nss_store_traffic(self):
 +        """FF-STARTUP: Firefox HTTPS visit; NSS store enumeration observed."""
@@ -282,11 +333,8 @@ index 00000000..33058faf
 +                duration_seconds=ATTACH_DURATION, attach_grace_seconds=5,
 +                wait_for_map=(store.lib.name,),
 +                extra_prefs=FIREFOX_STABLE_PREFS)
-+            self.assertGreaterEqual(flow.connections, 1, "browser never connected")
-+            self.assertEqual(flow.requests_served, 0, "request served without a cert?")
-+            self.assertEqual(flow.client_certs_presented, 0, "client cert presented?!")
++            self.assert_pinbound_stall("FF-PINBOUND", result.flow, flow)
 +        self.assertEqual(result.flow.get("profiler_exit"), 0)
-+        self.assertFalse(result.flow.get("loaded", True), "client-cert flow loaded?!")
 +        self.assertTrue(result.flow.get("profile_module_registered"),
 +                        "profile lost its registration?!")
 +        self.assertTrue(result.flow.get("mapped_at_end"), "module unmapped?!")
@@ -311,11 +359,8 @@ index 00000000..33058faf
 +                wait_for_map=(store.lib.name,),
 +                extra_browser_args=CHROMIUM_STABLE_ARGS,
 +                auto_select_cert=False)
-+            self.assertGreaterEqual(flow.connections, 1, "browser never connected")
-+            self.assertEqual(flow.requests_served, 0, "request served without a cert?")
-+            self.assertEqual(flow.client_certs_presented, 0, "client cert presented?!")
++            self.assert_pinbound_stall("CR-PINBOUND", result.flow, flow)
 +        self.assertEqual(result.flow.get("profiler_exit"), 0)
-+        self.assertFalse(result.flow.get("loaded", True), "client-cert flow loaded?!")
 +        self.assertTrue(result.flow.get("nss_db_dir"), "no NSS registration witness?!")
 +        self.assertTrue(result.flow.get("mapped_at_end"), "module unmapped?!")
 +        # Selection enumerates stably (x5 on every run) but the
@@ -507,11 +552,15 @@ index 00000000..33058faf
 +
 +    @staticmethod
 +    def _pinbound_stats(**overrides):
-+        """Synthetic CERT_REQUIRED server stats; hostile (witness-free) by default."""
++        """Synthetic CERT_REQUIRED server stats; hostile (witness-free) by default.
++
++        The hostile shape spoke TLS and vanished pre-selection with no
++        recorded failure, so only the witness rule can reject it.
++        """
 +        stats = {
 +            "connections": 1, "requests_served": 0, "client_certs_presented": 0,
-+            "handshakes_ok": 0, "empty_certs": 0, "selection_stalls": 0,
-+            "client_cert_alerts": 0, "abandoned": 0,
++            "handshakes_ok": 0, "spoke_tls": 1, "empty_certs": 0,
++            "selection_stalls": 0, "client_cert_alerts": 0, "abandoned": 1,
 +            "handshake_failures": 0, "handshake_errors": [],
 +        }
 +        stats.update(overrides)
@@ -530,7 +579,142 @@ index 00000000..33058faf
 +
 +    def test_pinbound_rig_healthy_accepted(self):
 +        """Guard: the rig passes with a boundary witness (no over-reject)."""
-+        self._pinbound_rig(self._pinbound_stats(empty_certs=1), self._pinbound_facts())
++        self._pinbound_rig(
++            self._pinbound_stats(empty_certs=1, abandoned=0), self._pinbound_facts())
++
++    def test_handshake_classifier_buckets(self):
++        """Unit: every wrap failure lands in its documented outcome bucket."""
++        cases = {
++            "empty_cert": [
++                ssl.SSLError("[SSL: PEER_DID_NOT_RETURN_A_CERTIFICATE] peer did not return a certificate"),
++            ],
++            "cert_alert": [
++                ssl.SSLError("[SSL: SSLV3_ALERT_CERTIFICATE_UNKNOWN] ssl/tls alert certificate unknown"),
++            ],
++            "failure": [
++                ssl.SSLError("[SSL: WRONG_VERSION_NUMBER] wrong version number"),
++                ssl.SSLError("[SSL: TLSV1_ALERT_HANDSHAKE_FAILURE] tlsv1 alert handshake failure"),
++                ValueError("peer spoke non-TLS bytes"),
++            ],
++            "stall": [TimeoutError("The handshake operation timed out")],
++            "abandoned": [
++                ssl.SSLEOFError("[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol"),
++                ConnectionResetError("peer reset"),
++            ],
++        }
++        for want, errors in cases.items():
++            for exc in errors:
++                self.assertEqual(tls_server.classify_handshake_error(exc), want, repr(exc))
++
++    def test_client_cert_error_kinds(self):
++        """Unit: TLS-flow failures classify apart from unrelated ones."""
++        tls_flow = [
++            "Error: Page.goto: net::ERR_BAD_SSL_CLIENT_AUTH_CERT at https://127.0.0.1:1/",
++            "Error: Page.goto: net::ERR_SOCKET_NOT_CONNECTED at https://127.0.0.1:1/",
++            "Error: Page.goto: SSL_ERROR_UNKNOWN",
++            "TimeoutError: Page.goto: Timeout 20000ms exceeded.",
++            "SSLError: TLS protocol mismatch before certificate selection",
++        ]
++        for error in tls_flow:
++            self.assertEqual(flows.classify_client_cert_error(error), "tls_flow", error)
++        unrelated = [
++            "Error: Executable doesn't exist at /none",
++            "Error: Target crashed",
++            "Error: Browser has been closed",
++            "Error: Page.goto: net::ERR_CONNECTION_REFUSED at https://127.0.0.1:1/",
++            "Error: Page.goto: net::ERR_ADDRESS_UNREACHABLE at https://127.0.0.1:1/",
++            None,
++            "",
++        ]
++        for error in unrelated:
++            self.assertEqual(flows.classify_client_cert_error(error), "unrelated", repr(error))
++        self.assertTrue(flows.is_navigation_timeout("TimeoutError: Page.goto: Timeout 20000ms exceeded."))
++        self.assertFalse(flows.is_navigation_timeout("Error: Page.goto: SSL_ERROR_UNKNOWN"))
++        self.assertFalse(flows.is_navigation_timeout(None))
++
++    def test_flow_server_records_handshake_outcomes(self):
++        """Unit: the server records outcomes independently of HTTP requests."""
++        if shutil.which("openssl") is None:
++            self.skipTest("openssl missing")
++
++        key, cert = tls_server.make_server_credential(self.work / "srv")
++        cred = softhsm.generate_client_credential(self.work / "cred")
++
++        def tls_client(port, cert_pair=None):
++            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
++            context.check_hostname = False
++            context.verify_mode = ssl.CERT_NONE
++            if cert_pair is not None:
++                context.load_cert_chain(str(cert_pair[0]), str(cert_pair[1]))
++            raw = socket.create_connection(("127.0.0.1", port))
++            return context.wrap_socket(raw, server_hostname="127.0.0.1")
++
++        def await_outcome(flow):
++            deadline = time.monotonic() + 10
++            while (flow.handshakes_ok + flow.empty_certs + flow.selection_stalls
++                   + flow.client_cert_alerts + flow.abandoned
++                   + flow.handshake_failures == 0 and time.monotonic() < deadline):
++                time.sleep(0.05)
++
++        def read_all(peer):
++            chunks = []
++            while True:
++                try:
++                    data = peer.recv(4096)
++                except Exception:
++                    break
++                if not data:
++                    break
++                chunks.append(data)
++            return b"".join(chunks)
++
++        # CERT_REQUIRED with no client cert: selection reached, nothing offered.
++        with tls_server.FlowServer(cert=cert, key=key, require_client_cert=True,
++                                   client_ca=cert) as flow:
++            with tls_client(flow.port) as peer:
++                # The server aborts the cert-less handshake; the recorded
++                # outcome below is the assert, not the client-side error.
++                with self.assertRaises(Exception):
++                    peer.recv(1)
++            # The client's error precedes the server-side note; await it.
++            await_outcome(flow)
++            self.assertEqual((flow.connections, flow.spoke_tls, flow.empty_certs), (1, 1, 1))
++            self.assertEqual(flow.requests_served, 0)
++            self.assertEqual(flow.client_certs_presented, 0)
++            self.assertEqual(flow.handshake_failures, 0)
++        # Garbage before any TLS: an unrelated protocol failure.
++        with tls_server.FlowServer(cert=cert, key=key, require_client_cert=True,
++                                   client_ca=cert) as flow:
++            raw = socket.create_connection(("127.0.0.1", flow.port))
++            raw.sendall(b"GARBAGE-NOT-TLS")
++            raw.close()
++            await_outcome(flow)
++            self.assertEqual(flow.connections, 1)
++            self.assertEqual(flow.handshake_failures, 1)
++            self.assertEqual(flow.spoke_tls, 0)
++            self.assertTrue(flow.handshake_errors)
++        # Connect and vanish without a byte: abandoned, never a failure.
++        with tls_server.FlowServer(cert=cert, key=key, require_client_cert=True,
++                                   client_ca=cert) as flow:
++            socket.create_connection(("127.0.0.1", flow.port)).close()
++            await_outcome(flow)
++            self.assertEqual((flow.connections, flow.abandoned, flow.handshake_failures),
++                             (1, 1, 0))
++        # Presented client cert: counted at handshake time, request or not.
++        with tls_server.FlowServer(cert=cert, key=key, require_client_cert=True,
++                                   client_ca=cred.cert_pem) as flow:
++            with tls_client(flow.port, (cred.cert_pem, cred.key_pem)) as peer:
++                peer.sendall(b"GET / HTTP/1.0\r\n\r\n")
++                self.assertIn(b"g33-flow-ok", read_all(peer))
++            self.assertEqual((flow.handshakes_ok, flow.client_certs_presented,
++                              flow.requests_served), (1, 1, 1))
++        # Plain server: ordinary visit, no client cert involved.
++        with tls_server.FlowServer(cert=cert, key=key) as flow:
++            with tls_client(flow.port) as peer:
++                peer.sendall(b"GET / HTTP/1.0\r\n\r\n")
++                self.assertIn(b"g33-flow-ok", read_all(peer))
++            self.assertEqual((flow.handshakes_ok, flow.client_certs_presented,
++                              flow.requests_served), (1, 0, 1))
 +
 +
 +if __name__ == "__main__":

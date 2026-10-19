@@ -1753,6 +1753,17 @@ fn operator_diagnostics_wrap_reads_only_new_complete_lines() -> Result<()> {
     Ok(())
 }
 
+/// Strict paired off/on comparison (Sol). STUB: always fails until the
+/// strict-parity rework lands.
+fn check_paired_parity(
+    _disabled: &serde_json::Value,
+    _dk: u64,
+    _enabled: &serde_json::Value,
+    _ek: u64,
+) -> Result<()> {
+    bail!("paired-parity stub: strict comparison not implemented")
+}
+
 #[test]
 #[ignore = "root-owned BPF lane; prebuilt32-object fixture, paired default-ring wrap (~22min)"]
 fn privileged_native_lane_pid_diagnostics_wrap_and_primary_parity_lp64() -> Result<()> {
@@ -2694,6 +2705,59 @@ fn operator_diagnostics_wrap_twin_primary_facts_rejects_wrong_b() -> Result<()> 
             );
         }
     }
+    Ok(())
+}
+
+#[test]
+fn operator_diagnostics_wrap_twin_paired_parity_matched_pass() -> Result<()> {
+    // Identical owned primary facts under the same validated disposition
+    // pass, including across runs (identities and times normalize inside
+    // primary_facts, never by count replacement here).
+    for k in [0, 32] {
+        let leg = primary_facts_k(&primary_validator_fixture_k(123, 0, k), 123, k)?;
+        check_paired_parity(&leg, k, &leg.clone(), k)?;
+    }
+    let off = primary_facts_k(&primary_validator_fixture_k(123, 0, 0), 123, 0)?;
+    let on = primary_facts_k(&primary_validator_fixture_k(456, 500, 0), 456, 0)?;
+    check_paired_parity(&off, 0, &on, 0)?;
+    Ok(())
+}
+
+#[test]
+fn operator_diagnostics_wrap_twin_paired_parity_disposition_mismatch_fail() -> Result<()> {
+    // Different legitimate dispositions each pass their own oracle but do
+    // not prove literal count equality: dk != ek must FAIL, never
+    // normalize into agreement.
+    let ordinary = primary_facts_k(&primary_validator_fixture_k(123, 0, 0), 123, 0)?;
+    let fenced = primary_facts_k(&primary_validator_fixture_k(123, 0, 32), 123, 32)?;
+    ensure!(check_paired_parity(&ordinary, 0, &fenced, 32).is_err());
+    ensure!(check_paired_parity(&fenced, 32, &ordinary, 0).is_err());
+    Ok(())
+}
+
+#[test]
+fn operator_diagnostics_wrap_twin_paired_parity_altered_primary_fail() -> Result<()> {
+    // Altering any owned primary count fails, even where a normalized
+    // comparison would still pass; a leg contradicting its own validated
+    // disposition fails before comparison.
+    let off = primary_facts_k(&primary_validator_fixture_k(123, 0, 0), 123, 0)?;
+    for (edge, count) in [
+        ("provider-A.so", 399),
+        ("provider-A.so", 401),
+        ("provider-B.so", 0),
+        ("provider-B.so", 2),
+    ] {
+        let mut on = off.clone();
+        on["edges"][edge]["count"] = serde_json::json!(count);
+        ensure!(
+            check_paired_parity(&off, 0, &on, 0).is_err(),
+            "altered primary accepted: {edge}={count}"
+        );
+    }
+    let mut bad = off.clone();
+    bad["edges"]["provider-A.so"]["count"] = serde_json::json!(399);
+    ensure!(check_paired_parity(&bad, 0, &off, 0).is_err());
+    ensure!(check_paired_parity(&off, 0, &bad, 0).is_err());
     Ok(())
 }
 

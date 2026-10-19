@@ -17,6 +17,11 @@ pub(crate) struct SelectedPreparationFailure {
     reason: SemanticRefusal,
     diagnostic: anyhow::Error,
     status: SelectedCleanupStatus,
+    /// Tests-only retention identity: the custody twin tags its own
+    /// failure so the assertion observes that specific owner surviving,
+    /// never a shared counter another test could satisfy.
+    #[cfg(test)]
+    test_id: Option<u64>,
 }
 impl SelectedPreparationFailure {
     /// Called only before the first producer exists, after the failed local
@@ -27,6 +32,8 @@ impl SelectedPreparationFailure {
             reason: SemanticRefusal::Attachment,
             diagnostic,
             status: SelectedCleanupStatus::Settled,
+            #[cfg(test)]
+            test_id: None,
         }
     }
 
@@ -36,6 +43,8 @@ impl SelectedPreparationFailure {
             reason: SemanticRefusal::Attachment,
             diagnostic,
             status: SelectedCleanupStatus::Pending,
+            #[cfg(test)]
+            test_id: None,
         }
     }
 
@@ -47,6 +56,8 @@ impl SelectedPreparationFailure {
             reason,
             diagnostic: anyhow::anyhow!("selected provisional construction refused: {reason}"),
             status: SelectedCleanupStatus::Pending,
+            #[cfg(test)]
+            test_id: None,
         }
     }
 
@@ -71,7 +82,36 @@ impl SelectedPreparationFailure {
             reason: SemanticRefusal::Attachment,
             diagnostic: anyhow::anyhow!("scripted unproved preparation failure"),
             status: SelectedCleanupStatus::Unproved,
+            test_id: None,
         }
+    }
+
+    /// Tests-only tagged failures for the custody twins: the same
+    /// settled/unproved shapes carrying the twin's own retention
+    /// identity. Untagged scripted failures (above) record nothing.
+    #[cfg(test)]
+    pub(crate) fn scripted_settled_with_id(test_id: u64) -> Self {
+        let mut failure = Self::scripted_settled();
+        failure.test_id = Some(test_id);
+        failure
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scripted_unproved_with_id(test_id: u64) -> Self {
+        let mut failure = Self {
+            session: None,
+            reason: SemanticRefusal::Attachment,
+            diagnostic: anyhow::anyhow!("scripted unproved preparation failure"),
+            status: SelectedCleanupStatus::Unproved,
+            test_id: None,
+        };
+        failure.test_id = Some(test_id);
+        failure
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retention_test_id(&self) -> Option<u64> {
+        self.test_id
     }
 
     pub(crate) fn semantic_refusal(&self) -> SemanticRefusal {

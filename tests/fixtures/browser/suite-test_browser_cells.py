@@ -441,11 +441,15 @@ class BrowserCells(unittest.TestCase):
         """P2-1 twin: the launched browser's NSS DB must live in the fresh HOME."""
         from playwright.sync_api import sync_playwright
         real_home = os.environ.get("HOME")
+        real_xdg_cache = os.environ.get("XDG_CACHE_HOME")
         caller_home = self.work / "caller-home"
         caller_home.mkdir()
         cell_work = self.work / "cell"
         try:
             os.environ["HOME"] = str(caller_home)
+            # Hermetic cache environment: the browser-cache location must
+            # not ride ambient variables past the HOME change.
+            os.environ.pop("XDG_CACHE_HOME", None)
             with sync_playwright() as pw:
                 context, _match, fresh_home = cells.launch_browser_context(
                     pw, "chromium", cell_work,
@@ -459,6 +463,10 @@ class BrowserCells(unittest.TestCase):
                 os.environ.pop("HOME", None)
             else:
                 os.environ["HOME"] = real_home
+            if real_xdg_cache is None:
+                os.environ.pop("XDG_CACHE_HOME", None)
+            else:
+                os.environ["XDG_CACHE_HOME"] = real_xdg_cache
         self.assertIsNotNone(used, "no NSS database appeared under the fresh HOME")
         assert used is not None
         pkcs11 = used / "pkcs11.txt"

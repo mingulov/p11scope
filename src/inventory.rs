@@ -133,6 +133,14 @@ const STAGED_SEMANTIC_MAX_AGE: Duration = Duration::from_secs(1);
 /// through the existing forget path, never waited out indefinitely.
 const CANCEL_CLEANUP_BUDGET: Duration = Duration::from_millis(100);
 
+/// Selected preparation quantum (DR37 resolver): bounds the bootstrap
+/// queries plus one joined fallback settle for a single original.
+/// Generous over healthy preparation (sub-second queries, a
+/// seconds-long settle); BPF loads run outside this window like the
+/// manifest lane. Expiry fails closed through the existing
+/// preparation checks, never a hang.
+const SELECTED_PREPARATION_WINDOW: Duration = Duration::from_secs(30);
+
 struct DiagnosticRequest<'a> {
     path: Option<&'a Path>,
     pid_filter: Option<u32>,
@@ -994,6 +1002,7 @@ fn run_with_terminal_budget(
                         max_scan_pids,
                         duration,
                         json,
+                        attach_backend,
                     },
                     coordinator,
                     lane,
@@ -1048,6 +1057,7 @@ fn run_with_terminal_budget(
         max_scan_pids,
         guard: UnavailableImageGuard,
         deadline,
+        attach_backend,
         display: None,
         semantic,
         semantic_staged: false,
@@ -1477,6 +1487,9 @@ struct ClassicDriver<'a> {
     max_scan_pids: Option<usize>,
     guard: UnavailableImageGuard,
     deadline: Option<Instant>,
+    /// The operator's `--attach-backend`: selected preparation honors
+    /// the same backend selection as the manifest lane.
+    attach_backend: crate::attach::BackendSelection,
     /// D3d capture-owned identity state (`--system` only): shared with
     /// each collection job, read for the final document after the loop.
     identity: Option<crate::inspect_system::IdentityShared>,
@@ -1527,6 +1540,7 @@ pub(crate) fn classic_semantic_tick_for_test(
         max_scan_pids: None,
         guard: UnavailableImageGuard,
         deadline: None,
+        attach_backend: crate::attach::BackendSelection::Auto,
         identity: None,
         display: None,
         semantic: Some(lane),
@@ -1560,6 +1574,7 @@ pub(crate) fn classic_semantic_pass_for_test(
         max_scan_pids: None,
         guard: UnavailableImageGuard,
         deadline: None,
+        attach_backend: crate::attach::BackendSelection::Auto,
         identity: None,
         display: None,
         semantic: Some(lane),
@@ -1612,6 +1627,7 @@ pub(crate) fn classic_semantic_stop_for_test(
         max_scan_pids: None,
         guard: UnavailableImageGuard,
         deadline: None,
+        attach_backend: crate::attach::BackendSelection::Auto,
         identity: None,
         display: None,
         semantic: Some(lane),
@@ -2101,15 +2117,17 @@ impl ClassicDriver<'_> {
     }
 
     /// Resolve one taken request into its preparation bundle plus the
-    /// native CAS source (DR37 resolver seam). Unimplemented: no
-    /// manifest-permission lookup maps a clicked pair to an attested
-    /// subset yet, so every take honestly refuses
-    /// `ManifestUnavailable` and no worker ever starts from the
-    /// driver. The lifecycle service, install and retire paths are
-    /// live behind this seam and tested through it.
+    /// native CAS source (DR37 resolver): the qualified parent scope,
+    /// a live run window, the clicked provider's attested subset
+    /// minted twice over the same retained sources, the caller's
+    /// original custody, and the pre-view baseline the viewed frame
+    /// carries. Every missing input fails closed on its own axis;
+    /// permission is checked before custody and baseline, so an
+    /// uncovered pair reports no manifest permission even when the
+    /// caller or view would also refuse.
     fn resolve_preparation_job(
-        &self,
-        _request: &crate::inventory_promotion::PromotionRequest,
+        &mut self,
+        request: &crate::inventory_promotion::PromotionRequest,
     ) -> Result<
         (
             crate::inventory_promotion::lifecycle::PreparationBundle,
@@ -2117,7 +2135,67 @@ impl ClassicDriver<'_> {
         ),
         crate::inventory_promotion::PromotionRefusal,
     > {
-        Err(crate::inventory_promotion::PromotionRefusal::ManifestUnavailable)
+        use crate::inventory_promotion::PromotionRefusal;
+        // Selected preparation supports PID and system parents; cgroup
+        // migration is unqualified (the native owner refuses it), so
+        // resolve fails closed before loading any BPF.
+        let parent = match self.scope {
+            InventoryRunScope::Pid(pid) => Scope::Pid(pid),
+            InventoryRunScope::System => Scope::System,
+            InventoryRunScope::Cgroup => return Err(PromotionRefusal::ScopeEnded),
+        };
+        // A dead run takes no new preparation: starting BPF loads for
+        // it wastes seconds and can never install.
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err(PromotionRefusal::ScopeEnded);
+        }
+        // One preparation quantum: a single original bounds the rows;
+        // the deadline bounds the bootstrap queries plus one joined
+        // fallback settle. BPF loads run outside this window, like the
+        // manifest lane; run-end cancel still wins via the service.
+        let window = crate::attach::capture::ReadWindow::new(
+            1,
+            Instant::now() + SELECTED_PREPARATION_WINDOW,
+        )
+        .map_err(|_| PromotionRefusal::ScopeEnded)?;
+        // Manifest permission for the clicked provider, minted twice:
+        // the attach seal consumes one mint, the other stays the
+        // conversion envelope.
+        let attach = self
+            .coordinator
+            .prepare_selected_subset(request.provider())?;
+        let convert = self
+            .coordinator
+            .prepare_selected_subset(request.provider())?;
+        let (original, incarnation) = self
+            .coordinator
+            .prepare_selected_caller_custody(request.caller())?;
+        // Pre-view agreement: the request's immutable viewed frame
+        // must carry the genuine acquisition batch for this original.
+        let baseline = request
+            .viewed()
+            .baseline()
+            .ok_or(PromotionRefusal::StaleView)
+            .and_then(|batch| {
+                batch
+                    .for_request(request, &original, incarnation)
+                    .map_err(|_| PromotionRefusal::StaleView)
+            })?;
+        Ok((
+            crate::inventory_promotion::lifecycle::PreparationBundle {
+                attach,
+                convert,
+                baseline,
+                original,
+                parent,
+                backend: self.attach_backend,
+                window,
+            },
+            Box::new(crate::attach::selected_detailed::NativeActivationMinter::new()),
+        ))
     }
 }
 
@@ -3377,6 +3455,7 @@ struct DashboardRun {
     max_scan_pids: Option<usize>,
     duration: Option<Duration>,
     json: bool,
+    attach_backend: crate::attach::BackendSelection,
 }
 
 /// The event stream's view of a pass: the classic cumulative window, on
@@ -3508,6 +3587,7 @@ fn run_dashboard(
         max_scan_pids,
         duration,
         json,
+        attach_backend,
     } = run;
     let quit = display.quit_flag();
     let mut stream_state = StreamState::new();
@@ -3527,6 +3607,7 @@ fn run_dashboard(
         max_scan_pids,
         guard: UnavailableImageGuard,
         deadline,
+        attach_backend,
         display: Some(display),
         semantic,
         semantic_staged: false,
@@ -7732,6 +7813,7 @@ mod tests {
                 max_scan_pids: None,
                 guard: UnavailableImageGuard,
                 deadline: None,
+                attach_backend: crate::attach::BackendSelection::Auto,
                 identity: None,
                 display: None,
                 semantic: Some(scene.lane),
@@ -7816,6 +7898,7 @@ mod tests {
                 max_scan_pids: None,
                 guard: UnavailableImageGuard,
                 deadline: None,
+                attach_backend: crate::attach::BackendSelection::Auto,
                 identity: None,
                 display: None,
                 semantic: Some(scene.lane),
@@ -7937,6 +8020,7 @@ mod promotion_driver_tests {
             max_scan_pids: None,
             guard: UnavailableImageGuard,
             deadline: None,
+            attach_backend: crate::attach::BackendSelection::Auto,
             identity: None,
             display: Some(display),
             semantic: None,
@@ -8291,7 +8375,10 @@ mod promotion_driver_tests {
     }
 
     #[test]
-    fn take_refuses_manifest_unavailable_and_records_gap() {
+    fn take_refuses_unloaded_provider_and_records_gap() {
+        // The scripted pair names module 5, which a fresh coordinator
+        // never saw: the resolver reports the provider axis, not a
+        // blanket manifest refusal.
         let mut coordinator = coordinator();
         let headless = headless_display();
         let mut driver = driver_with_display(&mut coordinator, headless.display);
@@ -8299,8 +8386,46 @@ mod promotion_driver_tests {
         driver.on_tick();
         assert_eq!(
             driver.display.as_ref().expect("display").promotion_state(),
-            PromotionState::Refused(PromotionRefusal::ManifestUnavailable),
+            PromotionState::Refused(PromotionRefusal::ProviderUnloaded),
             "takes refuse honestly behind the resolver seam"
+        );
+        assert!(
+            gaps(&mut driver)
+                .iter()
+                .any(|(subject, reason)| subject == "selected promotion refused"
+                    && reason == PromotionRefusal::ProviderUnloaded.label()),
+            "terminal refusal records a gap: {:?}",
+            gaps(&mut driver)
+        );
+        assert!(driver.lifecycle.is_idle());
+        assert!(driver.pending_install.is_none());
+    }
+
+    #[test]
+    fn take_refuses_without_manifest_permission_and_records_gap() {
+        // Module 5 is live with a physical key, but no manifest was
+        // ever retained: no permission covers the pair, and no worker
+        // starts.
+        use crate::discovery::caller_registry::ModuleKey;
+        let mut coordinator = coordinator();
+        for ino in 100..106 {
+            coordinator.registry_mut().scripted_module_edge(
+                ModuleKey::physical(8, 1, ino, Some(format!("sha-{ino}")), "/lib/x.so"),
+                CallerId(3),
+            );
+        }
+        assert!(
+            coordinator.registry().module(ModuleId(5)).is_some(),
+            "the scripted provider exists for the permission lookup"
+        );
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        queue_request(driver.display.as_mut().expect("display"));
+        driver.on_tick();
+        assert_eq!(
+            driver.display.as_ref().expect("display").promotion_state(),
+            PromotionState::Refused(PromotionRefusal::ManifestUnavailable),
+            "an uncovered pair refuses on the permission axis"
         );
         assert!(
             gaps(&mut driver)
@@ -8309,6 +8434,44 @@ mod promotion_driver_tests {
                     && reason == PromotionRefusal::ManifestUnavailable.label()),
             "terminal refusal records a gap: {:?}",
             gaps(&mut driver)
+        );
+        assert!(driver.lifecycle.is_idle());
+        assert!(driver.pending_install.is_none());
+    }
+
+    #[test]
+    fn take_refuses_when_parent_scope_is_cgroup() {
+        // Selected cgroup preparation is unqualified: the resolver
+        // fails closed before loading any BPF.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.scope = InventoryRunScope::Cgroup;
+        queue_request(driver.display.as_mut().expect("display"));
+        driver.on_tick();
+        assert_eq!(
+            driver.display.as_ref().expect("display").promotion_state(),
+            PromotionState::Refused(PromotionRefusal::ScopeEnded),
+            "an unqualified parent scope refuses"
+        );
+        assert!(driver.lifecycle.is_idle());
+        assert!(driver.pending_install.is_none());
+    }
+
+    #[test]
+    fn take_refuses_when_run_deadline_passed() {
+        // Starting BPF preparation for a dead run can never install:
+        // the resolver refuses instead of wasting the load.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.deadline = Some(Instant::now() - Duration::from_secs(1));
+        queue_request(driver.display.as_mut().expect("display"));
+        driver.on_tick();
+        assert_eq!(
+            driver.display.as_ref().expect("display").promotion_state(),
+            PromotionState::Refused(PromotionRefusal::ScopeEnded),
+            "an expired run refuses new preparation"
         );
         assert!(driver.lifecycle.is_idle());
         assert!(driver.pending_install.is_none());
@@ -8945,6 +9108,7 @@ mod promotion_driver_tests {
             max_scan_pids: None,
             guard: UnavailableImageGuard,
             deadline: None,
+            attach_backend: crate::attach::BackendSelection::Auto,
             identity: None,
             display: None,
             semantic: None,

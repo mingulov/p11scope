@@ -44,6 +44,7 @@ impl<'a> ObservedDriver<'a> {
                 max_scan_pids: None,
                 guard: UnavailableImageGuard,
                 deadline: None,
+                attach_backend: crate::attach::BackendSelection::Auto,
                 display: None,
                 semantic: None,
                 semantic_staged: false,

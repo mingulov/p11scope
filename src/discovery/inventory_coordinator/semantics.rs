@@ -146,6 +146,37 @@ impl AttestedSubset {
     }
 }
 
+/// Find the retained provider object a live module key names, over the
+/// merged post-acceptance pins (the same id space the subset carries:
+/// matching pre-merge input pins would name the wrong objects).
+/// Mirrors [`AttestedSubset::proves_provider_module`]: physical device
+/// identity plus the retained whole-file digest. Paths and matching
+/// content in another inode cannot supply this association.
+fn provider_object_for_key(pins: &PinnedObjects, module: &ModuleKey) -> Option<PinnedObjectId> {
+    let ModuleKey::Physical {
+        dev_major,
+        dev_minor,
+        ino,
+        sha256: Some(sha256),
+    } = module
+    else {
+        return None;
+    };
+    if sha256.is_empty() {
+        return None;
+    }
+    pins.pinned()
+        .find(|pin| {
+            pin.sha256 == sha256
+                && pins.raw_keys_for(pin.id).iter().any(|key| {
+                    key.device.major == *dev_major
+                        && key.device.minor == *dev_minor
+                        && key.inode == *ino
+                })
+        })
+        .map(|pin| pin.id)
+}
+
 pub(crate) struct SubsetPreparation {
     pub(crate) subset: Option<AttestedSubset>,
     pub(crate) refusals: Vec<SemanticRefusal>,
@@ -173,7 +204,15 @@ impl SemanticInputs {
     }
 
     pub(crate) fn prepare(&mut self, engine: &Engine) -> SubsetPreparation {
-        let retained = self.retained.get_or_insert_with(|| {
+        let retained = self.retained_or_load(engine);
+        prepare_retained_subset(engine, retained)
+    }
+
+    /// The memoized retained inputs, loaded once from the operator
+    /// paths. Shared by the full mint and the selected restriction so
+    /// both read the same retained files.
+    fn retained_or_load(&mut self, engine: &Engine) -> &RetainedInputs {
+        self.retained.get_or_insert_with(|| {
             let mut inputs = Vec::new();
             let mut refusals = Vec::new();
             let mut budget = CaptureWorkBudget::default();
@@ -203,8 +242,7 @@ impl SemanticInputs {
                 refusals,
                 requested: !self.paths.is_empty(),
             }
-        });
-        prepare_retained_subset(engine, retained)
+        })
     }
 }
 
@@ -216,12 +254,27 @@ pub(crate) fn prepare_attested_subset(engine: &Engine, paths: &[PathBuf]) -> Sub
 }
 
 fn prepare_retained_subset(engine: &Engine, inputs: &RetainedInputs) -> SubsetPreparation {
+    build_subset_from_accepted(engine, accept_retained_inputs(engine, inputs), None)
+}
+
+/// Manifests accepted against the retained scan, before claims: the
+/// merged pin union (the id space the subset carries), the attested
+/// manifests, the accepted provider objects and the refusals so far.
+struct AcceptedRetainedInputs {
+    pins: PinnedObjects,
+    manifests: Vec<Manifest>,
+    accepted: BTreeSet<PinnedObjectId>,
+    refusals: Vec<SemanticRefusal>,
+    requested: bool,
+}
+
+fn accept_retained_inputs(engine: &Engine, inputs: &RetainedInputs) -> AcceptedRetainedInputs {
     // This Inventory owner does not admit live Detailed selection claims.
     // Enabling that Engine path also requires incorporating its retained
     // claims/table latches here before preparing fresh semantic authority.
     let mut pins = engine.pinned.clone();
     let mut manifests = engine.manifests.clone();
-    let mut accepted_paths = Vec::new();
+    let mut accepted = BTreeSet::new();
     let mut refusals = inputs.refusals.clone();
     let scanned: Vec<_> = engine
         .modules
@@ -229,7 +282,7 @@ fn prepare_retained_subset(engine: &Engine, inputs: &RetainedInputs) -> SubsetPr
         .map(|module| module.scanned.clone())
         .collect();
     for input in &inputs.inputs {
-        let accepted = (|| -> Result<_> {
+        let outcome = (|| -> Result<_> {
             let mut manifest = input.manifest.clone();
             let manifest_pins = &input.pins;
             // Scan fallback preserves counts but cannot attest a stale object.
@@ -274,17 +327,45 @@ fn prepare_retained_subset(engine: &Engine, inputs: &RetainedInputs) -> SubsetPr
                 .context("manifest provider unavailable")?;
             Ok((manifest, candidate, provider))
         })();
-        match accepted {
+        match outcome {
             Ok((manifest, candidate, provider)) => {
                 pins = candidate;
                 manifests.push(manifest);
-                accepted_paths.push(provider);
+                accepted.insert(provider);
             }
             Err(_) => refusals.push(SemanticRefusal::ManifestInput),
         }
     }
-    if accepted_paths.is_empty() {
-        if !inputs.requested {
+    AcceptedRetainedInputs {
+        pins,
+        manifests,
+        accepted,
+        refusals,
+        requested: inputs.requested,
+    }
+}
+
+/// Build the attested subset over accepted manifests: claims, the
+/// rival-aware plan and the complete-provider selection, optionally
+/// intersected with one clicked provider. `None` restriction is the
+/// full mint, unchanged; `Some` restriction covers exactly the named
+/// providers with identical claims, degraded handling and descriptor
+/// decisions — a partition of the full closure, never a narrower
+/// re-plan that could ignore rival claims.
+fn build_subset_from_accepted(
+    engine: &Engine,
+    accepted: AcceptedRetainedInputs,
+    restrict: Option<&BTreeSet<PinnedObjectId>>,
+) -> SubsetPreparation {
+    let AcceptedRetainedInputs {
+        pins,
+        manifests,
+        accepted,
+        mut refusals,
+        requested,
+    } = accepted;
+    if accepted.is_empty() {
+        if !requested {
             refusals.push(SemanticRefusal::Unattested);
         }
         return SubsetPreparation {
@@ -301,7 +382,7 @@ fn prepare_retained_subset(engine: &Engine, inputs: &RetainedInputs) -> SubsetPr
         plan::AdmissionScope::Named,
     );
     let mut selected = BTreeSet::new();
-    for provider in accepted_paths.into_iter().collect::<BTreeSet<_>>() {
+    for provider in accepted {
         let complete = claims
             .providers
             .get(&provider)
@@ -330,6 +411,13 @@ fn prepare_retained_subset(engine: &Engine, inputs: &RetainedInputs) -> SubsetPr
         } else {
             refusals.push(SemanticRefusal::IncompleteProvider);
         }
+    }
+    // A restriction intersects after completeness: an incomplete or
+    // uncovered clicked provider yields no subset, never a partial
+    // one. Complete-but-unselected providers stay silent (they are
+    // neither incomplete nor selected).
+    if let Some(only) = restrict {
+        selected.retain(|provider| only.contains(provider));
     }
     let selected_plan = if selected.is_empty() {
         None
@@ -1450,6 +1538,67 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             return Err(PromotionRefusal::ProviderChanged);
         }
         Ok(module.key.clone())
+    }
+
+    /// Mint the attested subset for one clicked provider (DR37
+    /// resolver): the live module's physical key names exactly one
+    /// retained provider object, and the restricted subset covers it
+    /// with the same rival-aware plan build as the full mint. An
+    /// unknown or unloaded module reports the provider axis; an
+    /// uncovered, incomplete or non-physical provider reports no
+    /// manifest permission. The resolver mints twice for the
+    /// attach/convert pair; both share the retained envelope.
+    pub(crate) fn prepare_selected_subset(
+        &mut self,
+        provider: ModuleId,
+    ) -> Result<AttestedSubset, PromotionRefusal> {
+        let module = self.registry.module(provider).filter(|module| {
+            module.lifecycle != ModuleLifecycle::Unloaded && !module.unloaded_observed
+        });
+        let Some(module) = module else {
+            return Err(PromotionRefusal::ProviderUnloaded);
+        };
+        let key = module.key.clone();
+        let accepted = accept_retained_inputs(
+            &self.engine,
+            self.semantic_inputs.retained_or_load(&self.engine),
+        );
+        let object = provider_object_for_key(&accepted.pins, &key)
+            .ok_or(PromotionRefusal::ManifestUnavailable)?;
+        let restrict = BTreeSet::from([object]);
+        build_subset_from_accepted(&self.engine, accepted, Some(&restrict))
+            .subset
+            .ok_or(PromotionRefusal::ManifestUnavailable)
+    }
+
+    /// Establish one taken request's original custody (DR37 resolver):
+    /// the shared pidfd Arc plus the live incarnation the pre-view
+    /// baseline binds. The record must exist, be unretired with a live
+    /// lifecycle, and still hold shared custody; anything else fails
+    /// closed. No continuity comparison happens here: this custody IS
+    /// the expectation the downstream liveness re-check compares the
+    /// live record against.
+    pub(crate) fn prepare_selected_caller_custody(
+        &self,
+        caller: CallerId,
+    ) -> Result<(Arc<PidPin>, u32), PromotionRefusal> {
+        let record = self
+            .adapter
+            .record(caller)
+            .ok_or(PromotionRefusal::UnknownCaller)?;
+        if record.retired
+            || matches!(
+                record.lifecycle,
+                CallerLifecycle::Exited | CallerLifecycle::ExecRetired
+            )
+        {
+            return Err(PromotionRefusal::CallerRetired);
+        }
+        let pin = self
+            .adapter
+            .shared_semantic_custody(caller)
+            .ok_or(PromotionRefusal::UnknownCaller)?;
+        Ok((pin, record.incarnation))
     }
 
     /// The seal grant's association proof (D9): the namespace's first
@@ -3985,5 +4134,282 @@ mod promotion_lifecycle_tests {
             .validate_selected_pair_liveness(liveness_pair(caller, module), &pin())
             .expect_err("unpaired live module refuses");
         assert_eq!(err, PromotionRefusal::ProviderChanged);
+    }
+
+    /// DR37 resolver-permission twins: the selected subset mints the
+    /// rival-aware full plan, then covers exactly the clicked provider.
+    /// Two real provider fixtures (two manifests, two pinned files)
+    /// prove the restriction partitions the full closure instead of
+    /// rebuilding a narrower plan.
+    struct SelectedProviderFixture {
+        dir: tempfile::TempDir,
+        manifest: p11scope_manifest::manifest::Manifest,
+        pins: crate::discovery::identity::PinnedObjects,
+    }
+
+    impl SelectedProviderFixture {
+        fn new() -> Self {
+            use p11scope_manifest::identity::{inspect_file, mapping_file_key, open_object};
+            use p11scope_manifest::manifest::*;
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("provider.so");
+            std::fs::copy("/bin/true", &path).unwrap();
+            let file = open_object(&path).unwrap();
+            let inspected = inspect_file(&file).unwrap();
+            let mapping = mapping_file_key(&file).unwrap();
+            let start = inspected
+                .executable_ranges
+                .iter()
+                .find(|(a, b)| b - a > 2)
+                .unwrap()
+                .0;
+            let offsets = [start, start + 1];
+            let functions =
+                match pkcs11_module::tables_for(pkcs11_module::Surface::LegacyFunctionList {
+                    version: cryptoki_sys::CK_VERSION {
+                        major: 2,
+                        minor: 40,
+                    },
+                }) {
+                    pkcs11_module::TableSet::Walk(spans) => spans
+                        .iter()
+                        .flat_map(|span| span.fields())
+                        .map(|field| {
+                            let resolution = match field.name {
+                                "C_SignInit" => Resolution::Resolved {
+                                    object: 0,
+                                    file_offset: offsets[0],
+                                },
+                                "C_Sign" => Resolution::Resolved {
+                                    object: 0,
+                                    file_offset: offsets[1],
+                                },
+                                _ => Resolution::NullPointer,
+                            };
+                            FunctionRecord {
+                                name: field.name.into(),
+                                resolution,
+                            }
+                        })
+                        .collect(),
+                    _ => panic!("2.40 is a full standard table"),
+                };
+            let path = path.to_str().unwrap().to_string();
+            let manifest = Manifest {
+                schema: SCHEMA.into(),
+                module_path: path.clone(),
+                objects: vec![ObjectRecord {
+                    id: 0,
+                    path: path.clone(),
+                    identity: inspected.identity.clone(),
+                }],
+                provenance_objects: vec![ProvenanceObject {
+                    path,
+                    device_major: mapping.device_major,
+                    device_minor: mapping.device_minor,
+                    inode: mapping.inode,
+                    identity: inspected.identity,
+                }],
+                interface_list: Acquisition::Absent,
+                surfaces: vec![SurfaceRecord {
+                    source: SurfaceSource::LegacyFunctionList,
+                    acquisition: Acquisition::Ok,
+                    version: Some(Version {
+                        major: 2,
+                        minor: 40,
+                    }),
+                    walk: WalkOutcome::Full,
+                    functions,
+                }],
+                vendor_interfaces: Vec::new(),
+                alias_groups: Vec::new(),
+                selection_evidence: Default::default(),
+            };
+            assert!(crate::manifest_input::validate_structure(&manifest).is_empty());
+            let pinning =
+                crate::discovery::identity::pin_manifest_objects_deferred(&manifest).unwrap();
+            assert!(pinning.stale.is_empty());
+            assert_eq!(pinning.pins.pinned().count(), 1);
+            Self {
+                dir,
+                manifest,
+                pins: pinning.pins,
+            }
+        }
+
+        fn write_manifest(&self, name: &str) -> std::path::PathBuf {
+            let path = self.dir.path().join(name);
+            std::fs::write(&path, serde_json::to_vec(&self.manifest).unwrap()).unwrap();
+            path
+        }
+
+        fn module_key(&self) -> ModuleKey {
+            let pin = self.pins.pinned().next().expect("fixture pins one object");
+            ModuleKey::physical(
+                pin.key.device.major,
+                pin.key.device.minor,
+                pin.key.inode,
+                Some(pin.sha256.to_owned()),
+                pin.path,
+            )
+        }
+    }
+
+    #[test]
+    fn selected_subset_partitions_the_rival_aware_plan() {
+        let first = SelectedProviderFixture::new();
+        let second = SelectedProviderFixture::new();
+        let key_a = first.module_key();
+        let key_b = second.module_key();
+        assert_ne!(key_a, key_b, "two fixtures pin distinct provider files");
+        let mut coordinator = coordinator();
+        coordinator.set_semantic_manifests(vec![
+            first.write_manifest("a.json"),
+            second.write_manifest("b.json"),
+        ]);
+        let caller = admit_self(&mut coordinator);
+        let module_a = coordinator
+            .registry_mut()
+            .scripted_module_edge(key_a.clone(), caller);
+        let module_b = coordinator
+            .registry_mut()
+            .scripted_module_edge(key_b.clone(), caller);
+        // The full mint covers both providers...
+        let full = coordinator
+            .prepare_semantic_subset()
+            .subset
+            .expect("both manifests attest");
+        assert_eq!(
+            full.required().len(),
+            2,
+            "the full closure covers both providers"
+        );
+        // ...and each restriction partitions it exactly.
+        let only_a = coordinator
+            .prepare_selected_subset(module_a)
+            .expect("clicked provider A mints");
+        let only_b = coordinator
+            .prepare_selected_subset(module_b)
+            .expect("clicked provider B mints");
+        assert_eq!(only_a.required().len(), 1);
+        assert_eq!(only_b.required().len(), 1);
+        let object_a = *only_a.required().keys().next().unwrap();
+        let object_b = *only_b.required().keys().next().unwrap();
+        assert_ne!(object_a, object_b);
+        assert!(only_a.proves_provider_module(object_a, &key_a));
+        assert!(only_b.proves_provider_module(object_b, &key_b));
+        assert!(
+            !only_a.proves_provider_module(object_a, &key_b),
+            "the foreign key proves nothing here"
+        );
+        // Slot closure partitions the rival-aware plan: same endpoints,
+        // no overlap, nothing invented.
+        let endpoints = |subset: &AttestedSubset| {
+            subset
+                .plan()
+                .slots
+                .iter()
+                .map(|slot| (slot.object, slot.file_offset))
+                .collect::<BTreeSet<_>>()
+        };
+        let all = endpoints(&full);
+        let part_a = endpoints(&only_a);
+        let part_b = endpoints(&only_b);
+        assert_eq!(part_a.intersection(&part_b).count(), 0);
+        assert_eq!(part_a.union(&part_b).copied().collect::<BTreeSet<_>>(), all);
+        // Double mints share the retained envelope, like lane startup.
+        let again_a = coordinator
+            .prepare_selected_subset(module_a)
+            .expect("second mint");
+        assert!(only_a.same_retained_envelope(&again_a));
+    }
+
+    #[test]
+    fn selected_subset_refuses_uncovered_and_unloaded_providers() {
+        let fixture = SelectedProviderFixture::new();
+        let mut coordinator = coordinator();
+        coordinator.set_semantic_manifests(vec![fixture.write_manifest("a.json")]);
+        let caller = admit_self(&mut coordinator);
+        // A live module whose key no retained manifest pins: no
+        // permission covers the pair.
+        let foreign = coordinator
+            .registry_mut()
+            .scripted_module_edge(module_key(999), caller);
+        let err = coordinator
+            .prepare_selected_subset(foreign)
+            .expect_err("uncovered provider refuses");
+        assert_eq!(err, PromotionRefusal::ManifestUnavailable);
+        // An unknown module never reaches the permission lookup.
+        let err = coordinator
+            .prepare_selected_subset(ModuleId(999))
+            .expect_err("unknown module refuses");
+        assert_eq!(err, PromotionRefusal::ProviderUnloaded);
+        // Neither does a non-physical module key: retained
+        // permissions are physical-file-keyed.
+        let unidentified = coordinator
+            .registry_mut()
+            .scripted_module_edge(ModuleKey::physical(0, 0, 0, None, "/nowhere/x.so"), caller);
+        let err = coordinator
+            .prepare_selected_subset(unidentified)
+            .expect_err("non-physical key refuses");
+        assert_eq!(err, PromotionRefusal::ManifestUnavailable);
+    }
+
+    #[test]
+    fn selected_custody_establishes_live_original() {
+        let mut coordinator = coordinator();
+        let caller = admit_self(&mut coordinator);
+        let (original, incarnation) = coordinator
+            .prepare_selected_caller_custody(caller)
+            .expect("live caller establishes custody");
+        assert_eq!(original.pid(), std::process::id());
+        let record = coordinator.adapter().record(caller).expect("record");
+        assert_eq!(incarnation, record.incarnation);
+        assert!(
+            !original.original_exited().expect("exit reads"),
+            "the established original is live"
+        );
+    }
+
+    #[test]
+    fn selected_custody_refuses_unknown_and_retired() {
+        let mut coordinator = coordinator();
+        let err = coordinator
+            .prepare_selected_caller_custody(CallerId(999))
+            .err()
+            .expect("unknown caller refuses");
+        assert_eq!(err, PromotionRefusal::UnknownCaller);
+        let mut child = LiveChild::spawn();
+        let observed = BTreeSet::from([child.pid()]);
+        let events = coordinator.adapter_mut().reconcile(
+            &observed,
+            &mut |_| ImageAuthority::ScanPinned,
+            100,
+        );
+        coordinator.apply_reconcile_events(&events, 100);
+        let caller = coordinator
+            .adapter()
+            .live_id(child.pid())
+            .expect("the live child admits");
+        child.kill_and_wait();
+        let events = coordinator.adapter_mut().reconcile(
+            &BTreeSet::new(),
+            &mut |_| ImageAuthority::ScanPinned,
+            200,
+        );
+        coordinator.apply_reconcile_events(&events, 200);
+        assert!(
+            coordinator
+                .adapter()
+                .record(caller)
+                .expect("record kept")
+                .retired,
+            "reconcile retires the exited child"
+        );
+        let err = coordinator
+            .prepare_selected_caller_custody(caller)
+            .err()
+            .expect("retired caller refuses");
+        assert_eq!(err, PromotionRefusal::CallerRetired);
     }
 }

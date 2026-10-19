@@ -1061,6 +1061,7 @@ fn run_with_terminal_budget(
     let clock = LoopClock {
         deadline,
         stop,
+        now: &Instant::now,
         #[cfg(not(test))]
         interval: POLL_INTERVAL,
         #[cfg(test)]
@@ -3540,6 +3541,7 @@ fn run_dashboard(
     let clock = LoopClock {
         deadline: Some(deadline.unwrap_or_else(unbounded_dashboard_deadline)),
         stop: &ending,
+        now: &Instant::now,
         interval: RESCAN_INTERVAL,
         tick: SERVICE_TICK,
         collection_tick: SERVICE_TICK,

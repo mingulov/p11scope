@@ -1134,6 +1134,10 @@ pub(crate) fn retire_refused<Pin, L: CaptureLane<Pin>>(capture: &mut L, budget: 
 pub(crate) struct LoopClock<'a> {
     pub deadline: Option<Instant>,
     pub stop: &'a dyn Fn() -> bool,
+    /// The clock deadline reads use: `Instant::now` in production;
+    /// tests inject a controlled clock so expiry-during-collection is
+    /// established by the fixture, never raced on the wall clock.
+    pub now: &'a dyn Fn() -> Instant,
     /// From one pass's end to the next pass's start.
     pub interval: Duration,
     pub tick: Duration,
@@ -1142,8 +1146,11 @@ pub(crate) struct LoopClock<'a> {
 }
 
 impl LoopClock<'_> {
+    fn now(&self) -> Instant {
+        (self.now)()
+    }
     fn ending(&self) -> bool {
-        (self.stop)() || self.deadline.is_none_or(|end| Instant::now() >= end)
+        (self.stop)() || self.deadline.is_none_or(|end| self.now() >= end)
     }
     /// A stop the loop must honor before new work: an operator stop or a
     /// passed deadline. Unlike `ending`, no deadline reads as "run the
@@ -1158,7 +1165,7 @@ impl LoopClock<'_> {
     fn stop_cause(&self) -> Option<ZeroPassCause> {
         if (self.stop)() {
             Some(ZeroPassCause::OperatorStop)
-        } else if self.deadline.is_some_and(|end| Instant::now() >= end) {
+        } else if self.deadline.is_some_and(|end| self.now() >= end) {
             Some(ZeroPassCause::Deadline)
         } else {
             None
@@ -2150,6 +2157,8 @@ mod stop_latch_tests {
     use crate::discovery::inventory_attach_set::AttachObjectId;
     use std::cell::Cell;
     use std::rc::Rc;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     struct F9Pin;
     struct F9Targets;
@@ -2219,9 +2228,10 @@ mod stop_latch_tests {
         commits: usize,
         applied: Rc<Cell<usize>>,
         arm_stop_on_collect: Option<Rc<Cell<bool>>>,
-        /// The worker collection waits for this instant before
-        /// returning, so a test deadline crosses mid-collection.
-        collect_wait_until: Option<Instant>,
+        /// Runs first inside the worker collection (which joins before
+        /// the loop's post-collection gate), so a test can advance its
+        /// controlled clock deterministically mid-collection.
+        on_collect: Option<Arc<dyn Fn() + Send + Sync>>,
         /// Mirrors `collects` for stop closures that arm on a later pass.
         collect_count: Option<Rc<Cell<usize>>>,
     }
@@ -2234,7 +2244,7 @@ mod stop_latch_tests {
                 commits: 0,
                 applied: Rc::new(Cell::new(0)),
                 arm_stop_on_collect: None,
-                collect_wait_until: None,
+                on_collect: None,
                 collect_count: None,
             }
         }
@@ -2265,12 +2275,10 @@ mod stop_latch_tests {
             if let Some(arm) = &self.arm_stop_on_collect {
                 arm.set(true);
             }
-            let wait_until = self.collect_wait_until;
+            let on_collect = self.on_collect.clone();
             CollectJob::Legacy(Box::new(move || {
-                if let Some(until) = wait_until {
-                    while Instant::now() < until {
-                        std::thread::sleep(Duration::from_millis(1));
-                    }
+                if let Some(hook) = &on_collect {
+                    hook();
                 }
                 Err(anyhow!("no collection in the stop-latch probe"))
             }))
@@ -2397,6 +2405,7 @@ mod stop_latch_tests {
         LoopClock {
             deadline: None,
             stop,
+            now: &Instant::now,
             interval: Duration::from_secs(60),
             tick: Duration::from_millis(10),
             collection_tick: Duration::from_millis(10),
@@ -2608,6 +2617,7 @@ mod stop_latch_tests {
         let clock = LoopClock {
             deadline: Some(Instant::now() - Duration::from_secs(1)),
             stop: &stop,
+            now: &Instant::now,
             interval: Duration::from_secs(60),
             tick: Duration::from_millis(10),
             collection_tick: Duration::from_millis(10),
@@ -2714,6 +2724,7 @@ mod stop_latch_tests {
         let clock = LoopClock {
             deadline: Some(Instant::now() + Duration::from_secs(60)),
             stop: &stop,
+            now: &Instant::now,
             interval: Duration::from_secs(60),
             tick: Duration::from_millis(1),
             collection_tick: Duration::from_millis(10),
@@ -2763,15 +2774,29 @@ mod stop_latch_tests {
     #[test]
     fn deadline_during_pass0_collection_reports_zero_pass_gap_and_line() {
         // The G30 shape: pass-0 collection outlasts the deadline, so the
-        // completed collection is discarded with no apply/commit — but the
-        // run now says so (gap + line), still exiting 0.
+        // completed collection is discarded with no apply — but the run
+        // now says so (gap + line), still exiting 0. The loop clock is
+        // controlled: it reads before the deadline until the collection
+        // itself advances it past, so expiry-during-collection is
+        // established by construction. The pre-pass gate runs before the
+        // collector starts (program order, one thread) and the worker is
+        // the clock's only writer, so the gate cannot observe expiry; the
+        // worker joins before the post-collection gate, so that gate
+        // always does — on every schedule, with no sleeps.
         let mut driver = F9Driver::new();
-        let deadline = Instant::now() + Duration::from_millis(150);
-        driver.collect_wait_until = Some(deadline);
+        let base = Instant::now();
+        let since_base_ms = Arc::new(AtomicU64::new(0));
+        driver.on_collect = Some({
+            let since_base_ms = Arc::clone(&since_base_ms);
+            Arc::new(move || since_base_ms.store(200, Ordering::SeqCst))
+        });
+        let now_ms = Arc::clone(&since_base_ms);
+        let now = move || base + Duration::from_millis(now_ms.load(Ordering::SeqCst));
         let stop = || false;
         let clock = LoopClock {
-            deadline: Some(deadline),
+            deadline: Some(base + Duration::from_millis(150)),
             stop: &stop,
+            now: &now,
             interval: Duration::from_secs(60),
             tick: Duration::from_millis(10),
             collection_tick: Duration::from_millis(10),
@@ -2961,6 +2986,7 @@ mod stop_latch_tests {
         let clock = LoopClock {
             deadline: Some(Instant::now() + Duration::from_secs(600)),
             stop: &stop,
+            now: &Instant::now,
             interval: Duration::from_millis(1),
             tick: Duration::from_millis(1),
             collection_tick: Duration::from_millis(10),

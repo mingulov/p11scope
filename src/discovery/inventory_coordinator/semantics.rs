@@ -1525,7 +1525,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// must be quiescent (no staged quantum, and no pending drop
     /// unless the domain is already permanently refused, whose
     /// terminal shadow disposes with the namespace without restoring
-    /// positives); other pending work refuses and the namespace stays
+    /// positives); refused batches publish their terminal negatives
+    /// at refusal, so existing claims are already unknown by
+    /// disposal. Other pending work refuses and the namespace stays
     /// live. Every refusal hands the completion back with the reason:
     /// the source delivers once, so a retryable refusal preserves the
     /// authority required to retry. Retire removes the domain's bindings,
@@ -1879,7 +1881,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     .into(),
                 budget: None,
             });
-            self.record_semantic_drop(&batch);
+            self.publish_refused_batch_negatives(batch);
             return;
         }
         let state = self
@@ -1944,6 +1946,78 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     pub(crate) fn acknowledge_h3_void(&mut self, voided_below: u64) {
         if let Some(state) = &mut self.semantic_finalizer {
             state.h3_acked_below = state.h3_acked_below.max(voided_below);
+        }
+    }
+
+    /// Publish one refused domain's terminal negatives without
+    /// positives: capture loss must terminate existing operation claims
+    /// as unknown before their validating namespace is disposed.
+    /// Refusing future positives never discharges existing negatives,
+    /// so a refused batch still stages its lane facts and H0
+    /// invalidations through the same negative legs as normal
+    /// finalization — with no receipt validation, no coverages
+    /// (narrow exact retirements degrade to loss, never a silent
+    /// revival), no calls and no registrations. The batch's drop
+    /// shadow still records for H3 accounting.
+    fn publish_refused_batch_negatives(
+        &mut self,
+        batch: crate::inventory_semantics::SemanticBatch,
+    ) {
+        self.record_semantic_drop(&batch);
+        let domain = batch.domain();
+        let (outcomes, _current, negatives) = batch.into_parts();
+        for negative in &negatives {
+            match tail_loss_from_negative(domain, negative) {
+                Some(Ok(loss)) => {
+                    self.registry.note_instance_semantic_loss(loss);
+                }
+                Some(Err(reason)) => self.conversion_gap(None, reason),
+                None => {
+                    let LaneNegative::CollectionRefused { reason } = negative else {
+                        continue;
+                    };
+                    self.registry.record_gap(RegistryGap {
+                        caller: None,
+                        module: None,
+                        pid: None,
+                        subject: "semantic collection refused".into(),
+                        reason: reason.code().into(),
+                        budget: None,
+                    });
+                }
+            }
+        }
+        for outcome in outcomes {
+            let TickOutcome::Invalidation(invalidation) = outcome else {
+                // Calls and non-call records carry no negative: refused
+                // positives never stage.
+                continue;
+            };
+            let image = match invalidation.scope() {
+                InvalidationScope::ImageRetired(image) => Some(*image),
+                InvalidationScope::File { image, .. } => Some(*image),
+                InvalidationScope::InstancesRetired { image, .. } => Some(*image),
+                _ => None,
+            };
+            let binding =
+                image.and_then(|image| self.semantic_bindings.find_by_image(domain, image));
+            match finalize_invalidation(
+                invalidation.scope(),
+                invalidation.position(),
+                domain,
+                binding,
+                &[],
+            ) {
+                Ok((losses, retirements)) => {
+                    for loss in losses {
+                        self.registry.note_instance_semantic_loss(loss);
+                    }
+                    for retirement in retirements {
+                        self.registry.retire_instance(retirement);
+                    }
+                }
+                Err(reason) => self.conversion_gap(None, reason),
+            }
         }
     }
 
@@ -2230,7 +2304,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     .into(),
                 budget: None,
             });
-            self.record_semantic_drop(&batch);
+            self.publish_refused_batch_negatives(batch);
             return;
         }
         if domain != lane.domain() {

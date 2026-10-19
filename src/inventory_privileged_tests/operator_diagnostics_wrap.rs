@@ -1466,7 +1466,7 @@ fn operator_diagnostics_wrap_fixture_edges_match_snapshot_renderer_shape() -> Re
         mapping_first_seen_ns: 100,
         mapping_last_seen_ns: 200,
         mapping_interruptions: 0,
-        entry_count: TARGETS,
+        entry_count: 1,
         entry_saturated: false,
         entry_first_seen_ns: Some(120),
         entry_last_seen_ns: Some(180),
@@ -2184,9 +2184,9 @@ fn operator_diagnostics_three_round_probe_checks_fence_and_physical_pair() -> Re
     let module = serde_json::json!("mA");
     let ordinary = startup_probe_validator_fixture(false);
     let fenced = startup_probe_validator_fixture(true);
-    let ordinary_facts = check_startup_probe_records(&ordinary, 96, 123, &module, &calls, 0)?;
+    let ordinary_facts = check_startup_probe_records(&ordinary, 3, 123, &module, &calls, 0)?;
     ensure!(ordinary_facts["path"] == "ordinary" && ordinary_facts["fenced_pairs"] == 0);
-    let fenced_facts = check_startup_probe_records(&fenced, 64, 123, &module, &calls, 32)?;
+    let fenced_facts = check_startup_probe_records(&fenced, 2, 123, &module, &calls, 32)?;
     ensure!(fenced_facts["path"] == "startup_fence" && fenced_facts["fenced_pairs"] == 32);
     // Round-grouped layout: header 0; round 1 rows 1..64; round 2 rows
     // 65..128 (first fence at 66); round 3 rows 129..192 (first recovery
@@ -2206,7 +2206,7 @@ fn operator_diagnostics_three_round_probe_checks_fence_and_physical_pair() -> Re
         "read_starts_before_return",
     ] {
         let mut changed = fenced.clone();
-        let mut primary = 64;
+        let mut primary = 2;
         let mut k = 32;
         match change {
             "second_pair" => changed[1]["pair"] = "p32".into(),
@@ -2216,7 +2216,7 @@ fn operator_diagnostics_three_round_probe_checks_fence_and_physical_pair() -> Re
             "missing_recovery" => changed[130]["decision"] = "staged".into(),
             "wrong_baseline" => changed[130]["baseline_post"] = 159.into(),
             "wrong_reference" => changed[66]["observation_ref"]["seq"] = 1.into(),
-            "wrong_primary" => primary = 96,
+            "wrong_primary" => primary = 3,
             "wrong_k" => k = 0,
             "raw_before_call" => changed[65]["post"] = 180.into(),
             "read_starts_before_return" => changed[1]["pre"] = 109.into(),
@@ -2264,43 +2264,54 @@ fn operator_diagnostics_wrap_twin_startup_ordinary_pass() -> Result<()> {
     ensure!(retirement_range("absolute count range (2, 1] (0 unattributed calls)") == None);
     let gaps: Vec<GapEvidence> = Vec::new();
     ensure!(startup_fence_repeats(&gaps, "c0") == 0);
-    ensure!(expected_a(1, 0) == 32 && expected_a(2, 0) == 64 && expected_a(3, 0) == 96);
-    ensure!(expected_a(400, 0) == 12800);
-    ensure!(check_startup_round(1, 32, &gaps, "c0", None)? == 0);
-    ensure!(check_startup_round(2, 64, &gaps, "c0", Some(0))? == 0);
-    ensure!(check_startup_round(3, 96, &gaps, "c0", Some(0))? == 0);
-    ensure!(check_startup_round(400, 12800, &gaps, "c0", Some(0))? == 0);
+    // Pinned max-accepting trajectory (Sol): ordinary A is 1, 2, 3 after
+    // rounds 1-3 and 400 after round 400 — never 32 per round.
+    ensure!(expected_a(1, 0) == 1 && expected_a(2, 0) == 2 && expected_a(3, 0) == 3);
+    ensure!(expected_a(400, 0) == 400);
+    ensure!(check_startup_round(1, 1, &gaps, "c0", None)? == 0);
+    ensure!(check_startup_round(2, 2, &gaps, "c0", Some(0))? == 0);
+    ensure!(check_startup_round(3, 3, &gaps, "c0", Some(0))? == 0);
+    ensure!(check_startup_round(400, 400, &gaps, "c0", Some(0))? == 0);
     Ok(())
 }
 
 #[test]
 fn operator_diagnostics_wrap_twin_startup_fenced_pass() -> Result<()> {
-    // Fenced path (Sol correction 1): exact (1, 2] gap bound to this caller,
-    // round 3 at 64 alongside the ordinary twin's 96.
+    // Fenced path (Sol pinned trajectory): exact (1, 2] gap bound to this
+    // caller on all 32 pairs; A reads 1, 1, 2 after rounds 1-3 and 399
+    // after round 400, alongside the ordinary twin's 1, 2, 3 and 400.
     let gaps = vec![twin_startup_gap("c0", 32)];
     ensure!(startup_fence_repeats(&gaps, "c0") == 32);
-    ensure!(expected_a(2, 32) == 32 && expected_a(3, 32) == 64);
-    ensure!(expected_a(400, 32) == 12768);
+    ensure!(expected_a(2, 32) == 1 && expected_a(3, 32) == 2);
+    ensure!(expected_a(400, 32) == 399);
     let no_gap: Vec<GapEvidence> = Vec::new();
-    ensure!(check_startup_round(1, 32, &no_gap, "c0", None)? == 0);
-    ensure!(check_startup_round(2, 32, &gaps, "c0", Some(0))? == 32);
-    ensure!(check_startup_round(3, 64, &gaps, "c0", Some(32))? == 32);
-    ensure!(check_startup_round(4, 96, &gaps, "c0", Some(32))? == 32);
-    ensure!(check_startup_round(400, 12768, &gaps, "c0", Some(32))? == 32);
+    ensure!(check_startup_round(1, 1, &no_gap, "c0", None)? == 0);
+    ensure!(check_startup_round(2, 1, &gaps, "c0", Some(0))? == 32);
+    ensure!(check_startup_round(3, 2, &gaps, "c0", Some(32))? == 32);
+    ensure!(check_startup_round(4, 3, &gaps, "c0", Some(32))? == 32);
+    ensure!(check_startup_round(400, 399, &gaps, "c0", Some(32))? == 32);
     Ok(())
 }
 
 #[test]
 fn operator_diagnostics_wrap_twin_startup_underdelivery_fail() -> Result<()> {
-    // Valid startup gap but under-delivered round 3 (aggregate absolute 95,
-    // public 63 instead of 96/64) must FAIL; so must any other deficit.
+    // Valid startup gap but a wrong round-3 edge (1 or 3 instead of the
+    // pinned 2) must FAIL; so must any other deficit or surplus, and the
+    // old summed values (64/96/12768/12800) must FAIL as over-delivery.
     let gaps = vec![twin_startup_gap("c0", 32)];
-    ensure!(check_startup_round(3, 63, &gaps, "c0", Some(32)).is_err());
-    ensure!(check_startup_round(3, 65, &gaps, "c0", Some(32)).is_err());
-    ensure!(check_startup_round(3, 95, &[], "c0", Some(0)).is_err());
-    ensure!(check_startup_round(2, 31, &gaps, "c0", Some(0)).is_err());
-    ensure!(check_startup_round(400, 12767, &gaps, "c0", Some(32)).is_err());
-    ensure!(check_startup_round(400, 12799, &[], "c0", Some(0)).is_err());
+    ensure!(check_startup_round(3, 1, &gaps, "c0", Some(32)).is_err());
+    ensure!(check_startup_round(3, 3, &gaps, "c0", Some(32)).is_err());
+    ensure!(check_startup_round(3, 2, &[], "c0", Some(0)).is_err());
+    ensure!(check_startup_round(3, 4, &[], "c0", Some(0)).is_err());
+    ensure!(check_startup_round(3, 64, &gaps, "c0", Some(32)).is_err());
+    ensure!(check_startup_round(3, 96, &[], "c0", Some(0)).is_err());
+    ensure!(check_startup_round(2, 0, &gaps, "c0", Some(0)).is_err());
+    ensure!(check_startup_round(2, 2, &gaps, "c0", Some(0)).is_err());
+    ensure!(check_startup_round(400, 398, &gaps, "c0", Some(32)).is_err());
+    ensure!(check_startup_round(400, 400, &gaps, "c0", Some(32)).is_err());
+    ensure!(check_startup_round(400, 399, &[], "c0", Some(0)).is_err());
+    ensure!(check_startup_round(400, 12768, &gaps, "c0", Some(32)).is_err());
+    ensure!(check_startup_round(400, 12800, &[], "c0", Some(0)).is_err());
     Ok(())
 }
 
@@ -2309,8 +2320,8 @@ fn operator_diagnostics_wrap_twin_startup_missing_gap_fail() -> Result<()> {
     // A short round-2 count with no gap evidence must FAIL (never inferred).
     let gaps: Vec<GapEvidence> = Vec::new();
     ensure!(startup_fence_repeats(&gaps, "c0") == 0);
-    ensure!(check_startup_round(2, 32, &gaps, "c0", Some(0)).is_err());
-    ensure!(check_startup_round(2, 64, &gaps, "c0", Some(0))? == 0);
+    ensure!(check_startup_round(2, 1, &gaps, "c0", Some(0)).is_err());
+    ensure!(check_startup_round(2, 2, &gaps, "c0", Some(0))? == 0);
     Ok(())
 }
 
@@ -2320,11 +2331,11 @@ fn operator_diagnostics_wrap_twin_startup_misbound_gap_fail() -> Result<()> {
     // caller's fence evidence and must FAIL alongside the short count.
     let foreign = vec![twin_startup_gap("c9", 32)];
     ensure!(startup_fence_repeats(&foreign, "c0") == 0);
-    ensure!(check_startup_round(2, 32, &foreign, "c0", Some(0)).is_err());
+    ensure!(check_startup_round(2, 1, &foreign, "c0", Some(0)).is_err());
     let mut unbound = twin_startup_gap("c0", 32);
     unbound.caller = None;
     ensure!(startup_fence_repeats(&[unbound], "c0") == 0);
-    ensure!(check_startup_round(2, 32, &[twin_startup_gap("c9", 32)], "c0", Some(0)).is_err());
+    ensure!(check_startup_round(2, 1, &[twin_startup_gap("c9", 32)], "c0", Some(0)).is_err());
     // A gap with the wrong subject is not fence evidence either.
     let mut wrong_subject = twin_startup_gap("c0", 32);
     wrong_subject.subject = "native witness without mapping evidence".to_owned();
@@ -2339,14 +2350,14 @@ fn operator_diagnostics_wrap_twin_startup_wrong_range_fail() -> Result<()> {
     let mut wrong_range = twin_startup_gap("c0", 32);
     wrong_range.reason = wrong_range.reason.replace("(1, 2]", "(0, 2]");
     ensure!(startup_fence_repeats(&[wrong_range.clone()], "c0") == 0);
-    ensure!(check_startup_round(2, 32, &[wrong_range], "c0", Some(0)).is_err());
+    ensure!(check_startup_round(2, 1, &[wrong_range], "c0", Some(0)).is_err());
     let partial = vec![twin_startup_gap("c0", 16)];
-    ensure!(check_startup_round(2, 48, &partial, "c0", Some(0)).is_err());
-    ensure!(check_startup_round(2, 32, &partial, "c0", Some(0)).is_err());
+    ensure!(check_startup_round(2, 1, &partial, "c0", Some(0)).is_err());
+    ensure!(check_startup_round(2, 2, &partial, "c0", Some(0)).is_err());
     // Unstable fence count between rounds must FAIL.
     let full = vec![twin_startup_gap("c0", 32)];
-    ensure!(check_startup_round(3, 64, &full, "c0", Some(0)).is_err());
-    ensure!(check_startup_round(3, 96, &full, "c0", Some(32)).is_err());
+    ensure!(check_startup_round(3, 2, &full, "c0", Some(0)).is_err());
+    ensure!(check_startup_round(3, 3, &full, "c0", Some(32)).is_err());
     Ok(())
 }
 
@@ -2555,14 +2566,14 @@ fn replay_gap_repeats(rows: &[serde_json::Value]) -> Vec<GapEvidence> {
 #[test]
 fn operator_diagnostics_wrap_twin_primary_facts_disposition() -> Result<()> {
     // The validated startup disposition carries into final primary facts:
-    // A reads exactly 12800 - k. A fenced twin (gap + 64 at round 3) ends
-    // at 12768; the ordinary twin ends at 12800.
+    // A reads exactly the pinned edge (400 ordinary, 399 fenced) and B
+    // reads exactly 1 (32 overlapping proof units published together).
     let ordinary = primary_facts_k(&primary_validator_fixture_k(123, 0, 0), 123, 0)?;
-    ensure!(ordinary["edges"]["provider-A.so"]["count"] == 12800);
-    ensure!(ordinary["edges"]["provider-B.so"]["count"] == 32);
+    ensure!(ordinary["edges"]["provider-A.so"]["count"] == 400);
+    ensure!(ordinary["edges"]["provider-B.so"]["count"] == 1);
     let fenced = primary_facts_k(&primary_validator_fixture_k(123, 0, 32), 123, 32)?;
-    ensure!(fenced["edges"]["provider-A.so"]["count"] == 12768);
-    ensure!(fenced["edges"]["provider-B.so"]["count"] == 32);
+    ensure!(fenced["edges"]["provider-A.so"]["count"] == 399);
+    ensure!(fenced["edges"]["provider-B.so"]["count"] == 1);
     // Crossed dispositions fail: neither leg may borrow the other's count.
     ensure!(primary_facts_k(&primary_validator_fixture_k(123, 0, 32), 123, 0).is_err());
     ensure!(primary_facts_k(&primary_validator_fixture_k(123, 0, 0), 123, 32).is_err());
@@ -2588,7 +2599,7 @@ fn operator_diagnostics_wrap_twin_passview_gap_evidence() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("events.jsonl");
     let edge_a = serde_json::json!({"kind":"edge_observed","event":{
-        "entries":{"count":32},"presence":"mapped","capture":"armed",
+        "entries":{"count":1},"presence":"mapped","capture":"armed",
         "identity_context":{"caller":{"id":"c0","pid":123},
             "module":{"id":"m1","path":"/owned/provider-A.so"}}}});
     let gap = serde_json::json!({"kind":"gap_recorded","event":{

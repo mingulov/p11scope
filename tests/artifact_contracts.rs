@@ -6441,6 +6441,17 @@ print('one checked callback task survives helper calls; three mutations refuse')
     );
 }
 
+/// The inlined native image/stamp helper stays within three 32-byte stack
+/// quanta (96 bytes): its intended code — the same-current-task provenance
+/// gate plus the selected-session seed split — occupies the third quantum
+/// (actual depth 72), past the earlier two-quantum budget. The
+/// kernel-meaningful invariant is the combined root-plus-helper fit in 512
+/// bytes, asserted below against the actual roots (currently 288) and
+/// independently by the call-chain frame test; the per-helper budget keeps
+/// the helper from eating the roots' room (implied root budget 416 against
+/// an actual 192). Mutation controls refuse the first byte past each budget
+/// (97, and the tightest root overflow 417 against a budgeted helper) plus
+/// any nested native call.
 #[test]
 fn image_entry_native_frame_fits_the_compiled_caller_budget() {
     let directory = tempfile::tempdir().expect("temporary image entry stack contract");
@@ -6480,7 +6491,7 @@ def verify(data):
                 offsets.append((row[4] + symbol[4] + index * 8 + 4, -immediate))
         return max((depth for _, depth in offsets), default=0), offsets, insns
     helper_depth, helper_offsets, insns = frame(helper)
-    assert helper_depth <= 64, f'native image/stamp frame {helper_depth} exceeds64'
+    assert helper_depth <= 96, f'native image/stamp frame {helper_depth} exceeds96'
     assert not any((op, reg) == (0x85, 0x10) for op, reg, _, _ in insns), 'nested native call'
     roots = [symbol for name, symbol in symbols.items()
              if name == 'p11_entry' or name.startswith('p11_entry_')]
@@ -6493,7 +6504,7 @@ def verify(data):
 data = Path(sys.argv[1]).read_bytes()
 helper, helper_offsets, root, root_offsets = verify(data)
 # Mutate actual emitted addressing/call instructions; each regression must refuse.
-for offsets, depth in [(helper_offsets, 65), (root_offsets, 449)]:
+for offsets, depth in [(helper_offsets, 97), (root_offsets, 417)]:
     bad = bytearray(data)
     at, _ = max(offsets, key=lambda pair: pair[1])
     struct.pack_into('<h' if at % 8 == 2 else '<i', bad, at, -depth)

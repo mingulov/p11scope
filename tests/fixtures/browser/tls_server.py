@@ -30,7 +30,8 @@ class TLSError(RuntimeError):
 TLS_HANDSHAKE_FIRST_BYTE = 0x16
 
 #: Cap for one peeked ClientHello flight: a real first flight is ~0.5-2KB
-#: in one record; anything past the cap fails closed as incomplete.
+#: in one record; a hello not provable within the cap fails closed as
+#: incomplete.
 MAX_HELLO_PEEK = 65536
 
 
@@ -67,6 +68,8 @@ def client_hello_status(buf: bytes) -> str:
             if len(payload) < 4 or payload[0] != 0x01:  # handshake type client_hello
                 return "not_hello"
             need = int.from_bytes(payload[1:4], "big")
+            if need == 0:
+                return "not_hello"
             have = len(payload) - 4
             first = False
         else:

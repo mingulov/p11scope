@@ -12,10 +12,10 @@ index 1888f509..b6f09f3e 100755
      ("test_canary_evidence.py", ["--target-bits", "32"]),
 diff --git a/tests/python/test_browser_cells.py b/tests/python/test_browser_cells.py
 new file mode 100644
-index 00000000..03009f2f
+index 00000000..f59de221
 --- /dev/null
 +++ b/tests/python/test_browser_cells.py
-@@ -0,0 +1,1095 @@
+@@ -0,0 +1,1099 @@
 +# SPDX-License-Identifier: GPL-3.0-or-later
 +"""G33 browser application cells: real Firefox/Chromium PKCS#11 traffic.
 +
@@ -1049,6 +1049,10 @@ index 00000000..03009f2f
 +        # Zero-length record fails closed.
 +        self.assertEqual(
 +            tls_server.client_hello_status(b"\x16\x03\x01\x00\x00"), "not_hello")
++        # Zero-length ClientHello body is not a hello.
++        self.assertEqual(
++            tls_server.client_hello_status(b"\x16\x03\x01\x00\x04" + b"\x01\x00\x00\x00"),
++            "not_hello")
 +        # Fragmented hello across two records still proves completion.
 +        frag = (b"\x16\x03\x01\x00\x08" + b"\x01\x00\x00\x0a" + b"\x00" * 4
 +                + b"\x16\x03\x01\x00\x06" + b"\x00" * 6)

@@ -827,6 +827,118 @@ ring/map pressure and stop cleanup, through the `object-lp64` /
 `object-ia32` canary cells. Any new read site, broader set, longer
 retention or public projection needs a new explicit review.
 
+## H7-E4 attribute capture (2026-10-20)
+
+**Status: IMPLEMENTED in reviewed v0.4 development source (`3cd49af4`
+on `feat/v040-h7e4-attributes`); Sol landing review and installed
+qualification (H7-E5 live cells) remain before release use, and no
+public object field is enabled.** This amendment records the reviewed
+attribute read sites, retention and honesty rules for the qualified
+lane only, and supersedes slice D's no-inspection paragraph and
+measured-stop paragraph for that lane. Every other section keeps its
+own status; v1/v2 bytes are unchanged. Lane, admission and layouts are
+unchanged: the operator-attested allowlisted Detailed lane, 608-byte
+records only against the receipt-bound frozen table, and the
+16/32/36/240/432/608 B layouts.
+
+Reviewed read sites (each under the required-object marker, the exact
+frozen descriptor row, the accepted LP64/ia32 ABI, the live START owner
+and, for return reads, the joined entry/return continuity):
+
+- Entry creation-template inspection (BPF `object_entry_attributes`,
+  shared `inspect_request_template_into`): selector-first reads of at
+  most eight slots per authorized pair (two pairs per call), bounded
+  header-rescan alias checks against own and peer spans, one value read
+  per eligible selected slot and a stable header recheck before
+  publishing. Inspected lists land in the side row's request lists;
+  refused or acquisition-failed pairs keep the honest UNINSPECTED
+  marking. Unknown and excluded selectors authorize no pointer/length
+  reads. C6 full-width/high-bit vectors refuse before narrowing.
+- Get entry header retention (same level, shared
+  `capture_get_entry_into`): at most eight selected headers retained
+  into the side row's Get fields (base, header end, slots, inspected
+  count); entry-list flags use private side bits 8-11, masked out of
+  every public tail copy.
+- Get return establishment (BPF `object_emit_get_attributes`, shared
+  `capture_get_return_into`): accepted return values only
+  (`CKR_OK`/`CKR_ATTRIBUTE_SENSITIVE`/`CKR_ATTRIBUTE_TYPE_INVALID`/
+  `CKR_BUFFER_TOO_SMALL`), unchanged full-width selector/pointer,
+  width-correct unavailable sentinel, returned length within retained
+  entry capacity, span validation, retained-capacity alias checks, one
+  value read and a header recheck per slot. Results stream into the
+  reserved tail's result list; conflicting duplicates stay separate
+  cells. Failed acquisition keeps the UNINSPECTED marking with zero
+  reads.
+- Refused Derive authorizes no template access: present pairs carry
+  the UNINSPECTED marking (no fetch, no read, no result association),
+  matching the oracle's `[None, None]` authorization. Accepted Derive
+  inspects through the same creation protocol after the exact
+  four-member mechanism membership and arg-5 retention.
+
+No new read authority is introduced: every value read above was already
+an approved v3 row (template pointer/count, selector, value pointer,
+entry capacity/returned length, the six finite values); E4 activates
+the BPF execution of those rows through the qualified shared protocol.
+Retention is unchanged (one 432 B side row per in-flight required
+call, scrubbed and deleted on every terminal path; the 240 B tail
+rides the completed 608 B CALL record and is dropped unread at
+registry apply). The closed six-field vocabulary, requested/result
+separation and no-promotion rules are unchanged.
+
+Honesty rules: an inspected list carries PRESENT plus its inspected
+count and finite cells; a never-inspected authorized list carries the
+UNINSPECTED marker only; descriptor-absent pairs and non-Get result
+lists stay all-zero. An inspected count-0 template is a valid
+inspected-empty list (inspection ran; zero slots is the true fact),
+which the current Python canary oracle's template-family non-zero
+rule does not yet distinguish from a never-inspected list; the
+canary workload uses six-slot templates, and E5's ledger-aware
+oracle refinement owns that distinction.
+
+Measured budgets (default object at `3cd49af4`, rustc 1.98.1; frames
+gate `object_producer_compiled_frames_are_bounded` green):
+
+- Entry object path: 512 B exactly (root 192 + attributes level 264
+  rounded to 288 + ia32 reader 32). Zero headroom: any entry-path
+  growth breaks the gate. The attributes level holds 4,652 static
+  instructions (inlined bounded scan; no nested BPF call besides the
+  arg reader and map-row memsets).
+- Return object path via Get emission: 416 B (root 32 + branch 160 +
+  emission level 208 rounded to 224; 1,467 static instructions).
+  Fill/tail/Find levels unchanged (64/32/64 rounded).
+- Exec/exit roots unchanged (128 B chains). Maps unchanged
+  (`OBJECT_START` 16/432/16,384; `OBJECT_DESCRIPTORS` 4/16/105
+  frozen; `OBJECT_ZERO` 4/432/1). Ring records stay 616 B with
+  header for object CALLs; the 4 MiB ring and all caps unchanged.
+- Small-state, small-ring and wide flavors change capacity consts
+  only (identical entry/return code, same frames). Diagnostic
+  (`unsafe-unvalidated-metadata`) template roots project to 512 B
+  exactly (root 192 + the same 288 level + 32); the release matrix
+  remeasures on its own build.
+- Read cost per established attribute (single slot, identical
+  LP64/ia32): scalar kinds 7 word-reads on request, 10 on Get;
+  token/EC 6/9 word-reads plus one 1/7/10-byte read. Full
+  eight-slot six-field call: 220 word + 4 byte-reads (request),
+  76 word + 4 byte-reads (Get entry+return).
+
+Host qualification at `3cd49af4`: G05
+`object_attributes_real_adapter_six_fields` and
+`object_attributes_refuse_before_unsafe_read` green on LP64/ia32
+(all six fields VALUE through the production adapters, pair
+separation, no promotion, selector-first silence, finite
+rejections, Set no-read); wired-marking/entry twins green
+(acquisition-failure, refused/accepted Derive, truncation
+privacy); owner-store, adapters, activation,
+`p11scope-ebpf-common` and named frame/budget contracts green;
+fmt and clippy-touched clean; kernel 7.0.0-38 verifier smoke
+ACCEPTS the object load-only (no attach; not the 5.15
+headroom cell). Live qualification remains E5's: owned LP64/ia32
+producer positives with nonempty six-attribute facts, the selected
+5.15 verifier/live ABI cell with >=5% processed-instruction
+headroom, v1/v2 privacy regressions, count-only/aggregate no-read
+twins, partial failures, ring/map pressure and stop cleanup
+through the `object-lp64` / `object-ia32` canary cells.
+
 ## DR04 caller metadata (2026-10-18)
 
 **Status: opt-in implementation contract; installed qualification remains

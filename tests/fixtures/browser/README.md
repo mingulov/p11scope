@@ -75,24 +75,29 @@ inside the 105 ms navigation window, all on the main browser PID).
 | Cell | Mode | Flow | Asserts |
 | --- | --- | --- | --- |
 | FF-STARTUP | attach-drive | HTTPS visit | `C_FindObjects*` ≥ 1, `C_GetSessionInfo` ≥ 1 (typ. x26), page 200, no loss |
-| CR-PLAIN | attach-drive | HTTPS visit, registered | zero calls, module never maps, page 200 |
+| CR-PLAIN | attach-drive | HTTPS visit, registered | `C_FindObjects*` x5 floored, no `C_Login`/`C_Sign*`, page 200, NSS witness |
 | FF-NOMOD | run-direct, http | screenshot, unregistered | zero calls, exit 0, PNG bytes |
-| FF-PINBOUND | attach-drive | `CERT_REQUIRED` visit | hang, no `C_Login`/`C_Sign` ever, server saw no cert |
-| CR-PINBOUND | attach-drive, no auto-select | `CERT_REQUIRED` visit | zero calls (never maps), not loaded, server saw no cert |
+| FF-PINBOUND | attach-drive | `CERT_REQUIRED` visit | stall (fast-fail or hang), no `C_Login`/`C_SignInit`/`C_Sign` ever |
+| CR-PINBOUND | attach-drive, no auto-select | `CERT_REQUIRED` visit | selection x5 floored, no login/sign, stall, not loaded |
 
 What the catalog proves:
 
 - FF-STARTUP is the healthy positive: real NSS store enumeration,
   observed and attributed to the Firefox main process.
 - FF-PINBOUND pins the PIN boundary amid racy selection: the module is
-  mapped and armed, the flow hangs with no cert presented, and `C_Login`
-  / `C_Sign` never happen — while selection enumeration itself races the
-  prompt failure (x0 or x16 across runs, both inside the handshake second;
-  trace-timed) and is therefore unpinned.
-- CR-PLAIN/CR-PINBOUND characterize Chromium: it never maps a registered
-  external provider for any flow-related reason headless (server
-  validation and client selection alike); the zero is corroborated by
-  the end-of-cell mapping check, not just by empty counts.
+  mapped and armed, the flow stalls (fast-fail with an empty
+  certificate, or hang to the navigation timeout) with no cert
+  presented, and `C_Login` / `C_SignInit` / `C_Sign` never happen —
+  while selection enumeration itself races the prompt failure (x0 or
+  x16 across runs, both inside the handshake second; trace-timed) and
+  is therefore unpinned.
+- CR-PLAIN/CR-PINBOUND characterize Chromium with the provider mapped
+  and reachable: plain validation enumerates (stable x5) without any
+  private-token operation, and the `CERT_REQUIRED` visit enumerates
+  then stalls at the interactive-PIN boundary (fast-fail or hang, both
+  handshake-witnessed) with login and signing never happening. The
+  fresh-HOME NSS witness proves the registration was effective before
+  any absence is interpreted.
 - FF-NOMOD is the absence twin through the owned-child (`run`) path.
 
 ## Calibrated boundaries (do not "fix" in the harness)

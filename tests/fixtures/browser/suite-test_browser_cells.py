@@ -32,9 +32,9 @@ import oracle
 import softhsm
 import tls_server
 
-#: Chromium stabilizers: background fetches must not trigger first NSS use
-#: (their timing races the observation window and their traffic is not flow
-#: evidence); stabilized, plain flows deterministically never map the module.
+#: Chromium stabilizers: background fetches must not perturb the token
+#: traffic shape (their timing races the observation window); stabilized
+#: cells deterministically enumerate x5 without private-token use.
 CHROMIUM_STABLE_ARGS = (
     "--no-first-run",
     "--no-default-browser-check",
@@ -90,6 +90,10 @@ _GAPS_NEVER_MAPPED_RUN = _GAPS_NEVER_MAPPED | frozenset({
 #: discovery gap, so concrete_gap only.
 _VERDICTS_ATTACHED = ("attribution_only", "concrete_gap")
 _VERDICTS_NEVER_MAPPED = ("concrete_gap",)
+
+#: Private-token operations no PINBOUND flow may ever reach: login plus
+#: signing setup and signing (init and one-shot share the boundary).
+_PINBOUND_ABSENT = ("C_Login", "C_SignInit", "C_Sign")
 
 
 def gate(test):
@@ -197,18 +201,21 @@ class BrowserCells(unittest.TestCase):
                 flows.make_visit(flow.url), store.lib,
                 register_module=store.lib, browser_env=store.env,
                 duration_seconds=ATTACH_DURATION, attach_grace_seconds=5,
+                wait_for_map=(store.lib.name,),
                 extra_prefs=FIREFOX_STABLE_PREFS)
             self.assertGreaterEqual(flow.requests_served, 1, "flow server saw no request")
         self.assertEqual(result.flow.get("profiler_exit"), 0)
         self.assertEqual(result.flow.get("http_status"), 200)
         self.assertIn("g33-flow-ok", result.flow.get("body_excerpt", ""))
+        self.assertTrue(result.flow.get("profile_module_registered"),
+                        "profile lost its registration?!")
         self.assertTrue(result.flow.get("mapped_at_end"), "module unmapped?!")
         self.check_report(result, store, oracle.FF_STARTUP_FLOORS, attached=True,
                           allowed_gaps=_GAPS_ATTACHED_FLOOR)
 
     @gate
-    def test_cr_plain_never_touches_the_token(self):
-        """CR-PLAIN: Chromium ignores registered providers for validation."""
+    def test_cr_plain_validates_without_private_token_use(self):
+        """CR-PLAIN: Chromium validates with the provider mapped; no private use."""
         store, _cred = self.seed()
         key, cert = tls_server.make_server_credential(self.work / "srv")
         with tls_server.FlowServer(cert=cert, key=key) as flow:
@@ -217,14 +224,15 @@ class BrowserCells(unittest.TestCase):
                 flows.make_visit(flow.url), store.lib,
                 register_module=store.lib, browser_env=store.env,
                 duration_seconds=ATTACH_DURATION, attach_grace_seconds=5,
+                wait_for_map=(store.lib.name,),
                 extra_browser_args=CHROMIUM_STABLE_ARGS)
             self.assertGreaterEqual(flow.requests_served, 1, "flow server saw no request")
         self.assertEqual(result.flow.get("profiler_exit"), 0)
         self.assertEqual(result.flow.get("http_status"), 200)
-        self.assertFalse(result.flow.get("mapped_at_end"), "module mapped?!")
-        self.check_report(result, store, zero=True, attached=False,
-                          allowed_gaps=_GAPS_NEVER_MAPPED,
-                          allowed_verdicts=_VERDICTS_NEVER_MAPPED)
+        self.assertTrue(result.flow.get("nss_db_dir"), "no NSS registration witness?!")
+        self.assertTrue(result.flow.get("mapped_at_end"), "module unmapped?!")
+        self.check_report(result, store, oracle.CR_ENUMERATION_FLOORS, attached=True,
+                          allowed_gaps=_GAPS_ATTACHED_ABSENT, absent=_PINBOUND_ABSENT)
 
     @gate
     def test_ff_nomod_observes_nothing(self):
@@ -254,22 +262,25 @@ class BrowserCells(unittest.TestCase):
                 flows.make_client_cert_visit(flow.url), store.lib,
                 register_module=store.lib, browser_env=store.env,
                 duration_seconds=ATTACH_DURATION, attach_grace_seconds=5,
+                wait_for_map=(store.lib.name,),
                 extra_prefs=FIREFOX_STABLE_PREFS)
             self.assertGreaterEqual(flow.connections, 1, "browser never connected")
             self.assertEqual(flow.requests_served, 0, "request served without a cert?")
             self.assertEqual(flow.client_certs_presented, 0, "client cert presented?!")
         self.assertEqual(result.flow.get("profiler_exit"), 0)
         self.assertFalse(result.flow.get("loaded", True), "client-cert flow loaded?!")
+        self.assertTrue(result.flow.get("profile_module_registered"),
+                        "profile lost its registration?!")
         self.assertTrue(result.flow.get("mapped_at_end"), "module unmapped?!")
         # Selection enumeration races the prompt failure (x0 or x16 across
         # runs), so no count is pinned; login and signing never happen.
         self.check_report(result, store, attached=True,
                           allowed_gaps=_GAPS_ATTACHED_ABSENT,
-                          absent=("C_Login", "C_SignInit", "C_Sign"))
+                          absent=_PINBOUND_ABSENT)
 
     @gate
-    def test_cr_pinbound_stalls_before_any_token_use(self):
-        """CR-PINBOUND: CERT_REQUIRED; no selection without interactive login."""
+    def test_cr_pinbound_stalls_before_login_or_signing(self):
+        """CR-PINBOUND: CERT_REQUIRED; selection enumerates, login never happens."""
         store, cred = self.seed()
         key, cert = tls_server.make_server_credential(self.work / "srv")
         with tls_server.FlowServer(cert=cert, key=key, require_client_cert=True,
@@ -279,6 +290,7 @@ class BrowserCells(unittest.TestCase):
                 flows.make_client_cert_visit(flow.url), store.lib,
                 register_module=store.lib, browser_env=store.env,
                 duration_seconds=ATTACH_DURATION, attach_grace_seconds=5,
+                wait_for_map=(store.lib.name,),
                 extra_browser_args=CHROMIUM_STABLE_ARGS,
                 auto_select_cert=False)
             self.assertGreaterEqual(flow.connections, 1, "browser never connected")
@@ -286,10 +298,12 @@ class BrowserCells(unittest.TestCase):
             self.assertEqual(flow.client_certs_presented, 0, "client cert presented?!")
         self.assertEqual(result.flow.get("profiler_exit"), 0)
         self.assertFalse(result.flow.get("loaded", True), "client-cert flow loaded?!")
-        self.assertFalse(result.flow.get("mapped_at_end"), "module mapped?!")
-        self.check_report(result, store, zero=True, attached=False,
-                          allowed_gaps=_GAPS_NEVER_MAPPED,
-                          allowed_verdicts=_VERDICTS_NEVER_MAPPED)
+        self.assertTrue(result.flow.get("nss_db_dir"), "no NSS registration witness?!")
+        self.assertTrue(result.flow.get("mapped_at_end"), "module unmapped?!")
+        # Selection enumerates stably (x5 on every run) but the
+        # interactive-PIN boundary holds: login and signing never happen.
+        self.check_report(result, store, oracle.CR_ENUMERATION_FLOORS, attached=True,
+                          allowed_gaps=_GAPS_ATTACHED_ABSENT, absent=_PINBOUND_ABSENT)
 
     # -- Unprivileged counterexample twins (P2-2/P2-3; run everywhere) --
     #

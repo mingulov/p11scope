@@ -416,6 +416,20 @@ EXACT_PROGRAM_SECTIONS = {
 
 SELECTED_GLOBAL_HELPERS = frozenset({"p11_selected_current_allowed"})
 CALLER_PROGRAM_SECTIONS = {"p11_inventory_image_baseline": "iter/task"}
+SELECTED_PROGRAMS = {"p11_selected_bootstrap", "p11_selected_cgroup_migrate"}
+SELECTED_MAPS = frozenset({"SELECTED_DETAILED", "SELECTED_DETAILED_STATE", "SELECTED_BOOTSTRAP_CTL"})
+
+
+def has_selected(names):
+    """True when an object participates in the selected contract.
+
+    Decoder fixtures predate the selected gate and carry neither its
+    code nor its maps; shipped Detailed objects always carry both
+    (still pinned by the frozen inventory). Presence selects enforcement,
+    the same way owner/exec/ia32 validators skip objects that lack
+    their subsystem.
+    """
+    return any(name.startswith("p11_selected_") or name in SELECTED_MAPS for name in names)
 
 DIAGNOSTIC_GLOBAL_HELPERS = frozenset({
     "p11_decode_params",
@@ -455,8 +469,13 @@ def validate_private_helpers(elf, prefix, required, optional, label,
         if not size or value % 8 or size % 8 or value + size > len(elf.sections[".text"][1]):
             raise RuntimeError(f"{label} helper {name} has invalid/empty body")
     # Stage A hooks link into Detailed objects only; inventory flavors keep
-    # file-level semantics without them (as task_newtask).
+    # file-level semantics without them (as task_newtask). Selected programs
+    # are required only of objects that participate in the selected contract;
+    # decoder fixtures predate that gate.
+    selected = has_selected(symbol[0] for symbol in elf.symbols)
     for name, location in EXACT_PROGRAM_SECTIONS.items():
+        if name in SELECTED_PROGRAMS and not selected:
+            continue
         if inventory and name in ("task_newtask", "p11_inst_vma_map",
                                   "p11_inst_vma_unmap", "p11_inst_vma_copy",
                                   "p11_image_exec_release", "p11_image_query",
@@ -1436,7 +1455,10 @@ def validate_selected_leaf(elf):
 
     This is own-frame/footprint evidence, not a kernel verifier or proof that
     every parent-scope branch calls it. Root reachability is checked separately.
+    Objects without any selected symbol predate the gate and skip it.
     """
+    if not has_selected(symbol[0] for symbol in elf.symbols):
+        return None
     names = [symbol for symbol in elf.symbols if symbol[0] == "p11_selected_current_allowed"]
     if len(names) != 1:
         raise RuntimeError("selected gate requires one actual native helper")
@@ -1593,7 +1615,10 @@ def classify(records, sections, allowed_text_globals=frozenset(), *, inventory=F
     # Generic fixtures need no production helpers. A production hook or helper
     # selects the complete exact export contract, independent of program counts.
     if not inventory and (programs & EXACT_PROGRAM_SECTIONS.keys() or helpers & REQUIRED_GLOBAL_HELPERS):
-        missing = (REQUIRED_GLOBAL_HELPERS | SELECTED_GLOBAL_HELPERS) - helpers
+        required = set(REQUIRED_GLOBAL_HELPERS)
+        if programs & SELECTED_PROGRAMS:
+            required |= SELECTED_GLOBAL_HELPERS
+        missing = required - helpers
         if missing:
             raise RuntimeError(f"missing required .text helpers: {sorted(missing)}")
     return programs
@@ -1719,7 +1744,6 @@ INVENTORY_MAPS = {name: SAFE_MAPS[name] for name in (
     "USAGE_CONFIG": map_def(2, 4, 8, 1, 128),
     "USAGE_EVIDENCE": map_def(6, 4, 8, 3),
 }
-SELECTED_PROGRAMS = {"p11_selected_bootstrap", "p11_selected_cgroup_migrate"}
 INVENTORY_PROGRAMS = (SAFE_PROGRAMS - {"p11_entry", "p11_return", "task_newtask"}
                       - INSTANCE_PROGRAMS - SELECTED_PROGRAMS) | {
     "p11_usage_entry_lp64", "p11_usage_entry_ia32",

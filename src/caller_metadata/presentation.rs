@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! Rendering-safe, fixed-size caller metadata values (DR04 display projection).
 //!
 //! This module owns only the public-value shape: finite statuses, reasons,

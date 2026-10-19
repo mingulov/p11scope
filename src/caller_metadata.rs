@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! Bounded, private parsing of cgroup-v2 membership paths into display-only hints.
 //!
 //! This module performs no I/O. The input path is borrowed only for the duration

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! Bounded two-read acquisition of cgroup membership for caller metadata.
 //!
 //! This engine performs no process I/O itself: a narrow [`MembershipSource`]

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! Display-only access to already-admitted original process custody.
 
 use super::{CallerAdapter, CallerId, CallerLifecycle, ProcessSource};

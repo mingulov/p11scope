@@ -467,16 +467,18 @@ class BrowserCells(unittest.TestCase):
         strays = [p for p in (caller_home / ".pki", caller_home / ".local") if p.exists()]
         self.assertEqual(strays, [], f"browser NSS state leaked into caller HOME: {strays}")
 
-    def test_navigation_waits_for_capture_readiness(self):
-        """P2-4 twin: navigation must not start before capture readiness.
+    def _run_readiness_probe(self, marker_delay):
+        """Run attach_drive against a scripted profiler; return (started, error).
 
-        The scripted profiler never prints its readiness marker inside the
-        grace period; the flow must never run and the cell must fail. Uses
-        a fake Playwright module and a fake profiler process: stdlib only.
+        The fake profiler prints its readiness marker after
+        ``marker_delay`` seconds; the grace period is 2s, so a long
+        delay means the marker never arrives. Returns the flow's
+        ``started`` dict and the CellError raised (None when the cell
+        ran). Uses a fake Playwright module and a fake profiler
+        process: stdlib only.
         """
         import subprocess as stdlib_subprocess
 
-        marker_delay = 30.0
         started: dict = {}
 
         class FakePipe:
@@ -572,13 +574,36 @@ class BrowserCells(unittest.TestCase):
                 patch("subprocess.Popen", FakePopen), \
                 patch.object(cells, "main_browser_pid", return_value=os.getpid()), \
                 patch.object(cells, "p11scope_bin", return_value=Path("/fake/p11scope")):
-            with self.assertRaises(cells.CellError):
+            try:
                 cells.attach_drive(
                     "TWIN-READY", "firefox", self.work / "cell", "https://127.0.0.1:1/",
                     flow, Path("definitely-not-mapped-xyz.so"),
                     duration_seconds=5, attach_grace_seconds=2)
+            except cells.CellError as exc:
+                return started, exc
+            return started, None
+
+    def test_navigation_waits_for_capture_readiness(self):
+        """P2-4 twin: navigation must not start before capture readiness.
+
+        The scripted profiler never prints its readiness marker inside
+        the grace period; the flow must never run and the cell must fail
+        with a readiness-specific error.
+        """
+        started, error = self._run_readiness_probe(marker_delay=30.0)
+        self.assertIsNotNone(error, "cell passed without capture readiness")
+        assert error is not None
+        self.assertIn("never became ready", str(error),
+                      f"cell failed for the wrong reason: {error}")
         self.assertFalse(started.get("ran", False),
                          "navigation started before capture readiness")
+
+    def test_capture_readiness_marker_arrives_runs_flow(self):
+        """Control: when the marker arrives promptly, navigation runs."""
+        started, error = self._run_readiness_probe(marker_delay=0.1)
+        self.assertIsNone(error, f"marker arrived yet the cell failed: {error}")
+        self.assertTrue(started.get("ran", False),
+                        "navigation never ran after capture readiness")
 
     def test_capture_ready_parsing(self):
         """Unit: the readiness marker parses to its attached-probe count."""

@@ -8,7 +8,8 @@
 # readable, so sweep proof requires the observer to be an ancestor of
 # every fixture it confirms. After the exec the helper IS the observer;
 # the drivers keep sleeping (reparented) until the test kills them by
-# the pids in the READY files.
+# the pids in the READY files: never pass them --die-with-parent, the
+# test reads their live mappings only after the observer exits.
 #
 # Fixture sets (INV_SET, required):
 #   sweep   H1/H2/H3 map P1 (ledgered holders), C maps the byte-identical

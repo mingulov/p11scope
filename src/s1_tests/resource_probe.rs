@@ -89,6 +89,12 @@ fn measure_classified<T>(
     (value, peak, stage)
 }
 
+/// One scripted caller (`ScriptedSource` pin `(u32, u64)`) holds this many
+/// pool bytes as its process-custody lease since 234d2a32: arc pin (32) +
+/// arc charge (32) + 2*pad (64) + inline (32). Exact-capacity reference
+/// limits and pristine-pool pins must cover live custody (see a05babfe).
+const ONE_CALLER_CUSTODY_BYTES: usize = 160;
+
 /// Classify an unbounded `measure` stage in place. No live/peak split
 /// exists here — the 8192-block tracker would overflow on a 4096-row
 /// tree — so retained is labeled as the allocator heap-delta estimate it
@@ -132,6 +138,7 @@ fn native_semantic_resource_projection_agrees_and_freezes() {
         + 4 * 24
         + OWNED_ALLOCATION_PADDING;
     let limit = SEMANTIC_TRANSITION_SCRATCH
+        + ONE_CALLER_CUSTODY_BYTES
         + 2 * REDUCER_BASE_CHARGE
         + historical
         + OPEN_BINDING_CHARGE
@@ -331,7 +338,10 @@ fn native_semantic_resource_projection_agrees_and_freezes() {
     let current = &after["budgets"]["instance_semantic_resources"];
     assert_eq!(
         current["charged_bytes"],
-        SEMANTIC_TRANSITION_SCRATCH + 2 * REDUCER_BASE_CHARGE + historical
+        SEMANTIC_TRANSITION_SCRATCH
+            + ONE_CALLER_CUSTODY_BYTES
+            + 2 * REDUCER_BASE_CHARGE
+            + historical
     );
     assert_eq!(current["peak_charged_bytes"], limit);
     assert_eq!(current["refused"], 1);
@@ -361,8 +371,14 @@ fn native_semantic_resource_projection_agrees_and_freezes() {
     ));
     let budget = &empty["budgets"]["instance_semantic_resources"];
     assert_eq!(budget["limit_bytes"], SEMANTIC_RESOURCE_LIMIT);
-    assert_eq!(budget["charged_bytes"], SEMANTIC_TRANSITION_SCRATCH);
-    assert_eq!(budget["peak_charged_bytes"], SEMANTIC_TRANSITION_SCRATCH);
+    assert_eq!(
+        budget["charged_bytes"],
+        SEMANTIC_TRANSITION_SCRATCH + ONE_CALLER_CUSTODY_BYTES
+    );
+    assert_eq!(
+        budget["peak_charged_bytes"],
+        SEMANTIC_TRANSITION_SCRATCH + ONE_CALLER_CUSTODY_BYTES
+    );
     assert_eq!(budget["refused"], 0);
     assert_eq!(budget["occupancy"].as_object().unwrap().len(), 15);
     assert!(
@@ -385,7 +401,10 @@ fn native_semantic_resource_legacy_and_instance_share_one_pool() {
     h.coordinator_mut()
         .registry_mut()
         .reference_semantic_resource_limit(
-            SEMANTIC_TRANSITION_SCRATCH + 2 * REDUCER_BASE_CHARGE + 2 * ACTIVE_MACHINE_CHARGE,
+            SEMANTIC_TRANSITION_SCRATCH
+                + ONE_CALLER_CUSTODY_BYTES
+                + 2 * REDUCER_BASE_CHARGE
+                + 2 * ACTIVE_MACHINE_CHARGE,
         );
     let unknown = SemanticCall {
         capture: capture::MECHANISM_UNREADABLE,
@@ -726,13 +745,16 @@ fn native_semantic_resource_final_types_pinned() {
     );
     // H7 slice D: TickOutcome::Call and RoutedCall carry the decoded
     // envelope with its optional 240 B validated object tail inline
-    // (+248 each, measured 680 on Rust 1.98.1 x86-64 Linux). The pins
-    // keep catching any further drift before SYSTEM activation.
-    assert_eq!(size_of::<crate::semantic_capture::TickOutcome>(), 680);
+    // (+248 each, measured 680 on Rust 1.98.1 x86-64 Linux); the
+    // same-wire joint custody series adds the 72 B resource-only
+    // `joint_resource` lineage to the envelope (97b4fb38), measured
+    // 752. The pins keep catching any further drift before SYSTEM
+    // activation.
+    assert_eq!(size_of::<crate::semantic_capture::TickOutcome>(), 752);
     // TickReport carries the H0 disposition watermarks C5 requires
     // (allocated floor, awaiting/shed floors, exhaustion: +48 B).
     assert_eq!(size_of::<crate::semantic_capture::TickReport>(), 160);
-    assert_eq!(size_of::<crate::semantic_capture::RoutedCall>(), 680);
+    assert_eq!(size_of::<crate::semantic_capture::RoutedCall>(), 752);
     // H6 retains the calibrated mapped-file identity in the watched target.
     assert_eq!(
         size_of::<crate::semantic_capture::CurrentPartitionReceipt>(),
@@ -753,8 +775,10 @@ fn native_semantic_resource_final_types_pinned() {
     // H9 (T4): +224 B for the one immutable operation/key projection
     // (`object_observations`): revision, status, six row vectors and
     // budgets. One snapshot per pass; heap rows stay empty while the
-    // publication is unavailable (production today).
-    assert_eq!(size_of::<crate::inventory_present::Presentation>(), 1048);
+    // publication is unavailable (production today). DR04 opt-in caller
+    // context adds the 120 B shared `caller_metadata` frame (bedcbbf6),
+    // measured 1168.
+    assert_eq!(size_of::<crate::inventory_present::Presentation>(), 1168);
     // Supporting payload: RoutedCall carries one EventRecord.
     assert_eq!(size_of::<p11scope_ebpf_common::EventRecord>(), 368);
     // Existing bounds the N/N+1 populations use.

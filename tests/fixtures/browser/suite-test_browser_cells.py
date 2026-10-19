@@ -1040,7 +1040,6 @@ class BrowserCells(unittest.TestCase):
                 + b"\x16\x03\x01\x00\x06" + b"\x00" * 6)
         self.assertEqual(tls_server.client_hello_status(frag), "complete")
 
-
     def _installed_copy(self):
         """Install this suite source into a scratch tests/python layout."""
         root = self.work / "strict-probe"

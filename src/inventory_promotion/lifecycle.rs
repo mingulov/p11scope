@@ -188,8 +188,10 @@ pub(crate) trait NativeActivationSource: Send {
 /// move-only: only the native [`NativeCompletionSource`]
 /// implementation mints production completions, after genuine
 /// disposal; tests script them. Consumed by value by
-/// `InventoryCoordinator::retire_joint_domain`; a second retire with
-/// the same completion is a compile-time move error.
+/// `InventoryCoordinator::retire_joint_domain`, which hands it back
+/// with every refusal: the source delivers once, so the driver
+/// retains the returned proof across retryable attempts instead of
+/// re-polling.
 pub(crate) struct SessionNativeCompletion {
     domain: NativeDomainId,
 }

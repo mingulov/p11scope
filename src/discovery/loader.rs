@@ -104,7 +104,11 @@ impl PreparedLoaderContext {
 }
 
 pub(crate) struct LoaderRegistry {
-    contexts: [Option<LoaderContext>; MAX_LOADER_CONTEXTS],
+    /// Heap slot table: 256 entries (~43 KiB) that must never sit in a
+    /// construction frame. `Engine`/`InventoryCoordinator` move by value
+    /// through deep `new` chains on small stacks, and every by-value
+    /// copy would carry this table.
+    contexts: Box<[Option<LoaderContext>; MAX_LOADER_CONTEXTS]>,
     allocated: usize,
     discovery_truncated: u64,
     context_failures: u64,
@@ -112,8 +116,15 @@ pub(crate) struct LoaderRegistry {
 
 impl Default for LoaderRegistry {
     fn default() -> Self {
+        // Fill on the heap: `Box::new(from_fn(..))` would still build the
+        // table on this frame before moving it into the box.
+        let contexts: Box<[Option<LoaderContext>; MAX_LOADER_CONTEXTS]> =
+            vec![Option::<LoaderContext>::None; MAX_LOADER_CONTEXTS]
+                .into_boxed_slice()
+                .try_into()
+                .expect("loader slot table holds exactly MAX_LOADER_CONTEXTS entries");
         Self {
-            contexts: std::array::from_fn(|_| None),
+            contexts,
             allocated: 0,
             discovery_truncated: 0,
             context_failures: 0,

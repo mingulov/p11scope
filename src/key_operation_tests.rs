@@ -11753,8 +11753,16 @@ fn joint_capture_owner_commit_batch_below_prepay_refuses_full_gracefully() {
     let (r_facts, r_pos) = refusal.admit(Some(SESSION));
     assert_eq!(s1_pos, h_pos, "lockstep admissions agree");
     assert_eq!(r_pos, h_pos, "lockstep admissions agree");
-    assert_eq!(shape_of(&h_facts), shape_of(&s1_facts), "lockstep facts agree");
-    assert_eq!(shape_of(&h_facts), shape_of(&r_facts), "lockstep facts agree");
+    assert_eq!(
+        shape_of(&h_facts),
+        shape_of(&s1_facts),
+        "lockstep facts agree"
+    );
+    assert_eq!(
+        shape_of(&h_facts),
+        shape_of(&r_facts),
+        "lockstep facts agree"
+    );
     healthy.observe(&healthy_key, h_facts, h_pos);
     healthy
         .coordinator

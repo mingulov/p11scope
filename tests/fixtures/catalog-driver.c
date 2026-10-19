@@ -19,6 +19,7 @@
  * --call surface failed, 5 the ready file could not be written.
  */
 #define _POSIX_C_SOURCE 200809L
+#include <dirent.h>
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -28,7 +29,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
-#include <sys/resource.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -273,11 +273,27 @@ int main(int argc, char **argv)
      * by path), and mapping ground truth reads /proc, never this
      * table — so scrubbing first is safe for every spawner. */
     {
-        long cap = 1 << 20;
-        struct rlimit lim;
-        if (getrlimit(RLIMIT_NOFILE, &lim) == 0 && lim.rlim_cur < (rlim_t)cap)
-            cap = (long)lim.rlim_cur;
-        for (int fd = 3; fd < cap; fd++) close(fd);
+        /* Existing descriptors survive RLIMIT_NOFILE lowering, so an
+         * rlimit-bounded sweep misses fds above a lowered soft limit.
+         * Enumerate the live table instead; without /proc, sweep a
+         * fixed cap regardless of the limit (test fixtures never
+         * approach a million fds). */
+        DIR *live = opendir("/proc/self/fd");
+        if (live != NULL) {
+            int self = dirfd(live);
+            struct dirent *entry;
+            while ((entry = readdir(live)) != NULL) {
+                char *end = NULL;
+                long fd = strtol(entry->d_name, &end, 10);
+                if (end == entry->d_name || *end != '\0' || fd < 3 ||
+                    fd > INT_MAX || (int)fd == self)
+                    continue;
+                close((int)fd);
+            }
+            closedir(live);
+        } else {
+            for (int fd = 3; fd < (1 << 20); fd++) close(fd);
+        }
     }
     const char *ready_path = NULL;
     int call = 0;

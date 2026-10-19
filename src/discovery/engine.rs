@@ -22656,6 +22656,10 @@ mod trace_system_seed_tests;
 pub(crate) mod publication_tests;
 
 #[cfg(test)]
+#[path = "pressure_native_tests.rs"]
+pub(crate) mod pressure_native_tests;
+
+#[cfg(test)]
 mod reexec_diagnostic_evaluation_tests {
     use super::session_fixture::ScriptedSession;
     use super::*;

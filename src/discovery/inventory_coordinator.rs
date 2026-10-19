@@ -9023,15 +9023,30 @@ pub(crate) mod tests {
         (provider, driver)
     }
 
-    /// Choreographed abortable observer: spawns the driver, records its
-    /// pid, waits for readiness, optionally SIGSTOPs it, stages the sync
-    /// file, then waits for the twin's release before exiting.
+    /// Builds the isolated orphan reaper for the orphan-policy twins.
+    fn build_orphan_reaper(dir: &std::path::Path) -> PathBuf {
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        gcc(
+            dir,
+            "orphan-reaper",
+            &manifest.join("tests/fixtures/orphan-reaper.c"),
+            &["-O2", "-Wall", "-Wextra", "-Werror"],
+            &[],
+        )
+    }
+
+    /// Choreographed abortable observer: records its own pid, spawns
+    /// the driver, records the driver pid, waits for readiness,
+    /// optionally SIGSTOPs it, stages the sync file, then waits for
+    /// the twin's release before exiting.
     /// Positional args: driver ready provider pidfile sync go log
-    /// owned(1/0) dostop(1/0). Owned drivers get `--die-with-parent $$`
-    /// so the shell is their expected owner. The bounded waits and the
-    /// short driver sleep keep a failed twin from leaking sleepers.
+    /// owned(1/0) dostop(1/0) shellpid. Owned drivers get
+    /// `--die-with-parent $$` so the shell is their expected owner. The
+    /// bounded waits and the short driver sleep keep a failed twin from
+    /// leaking sleepers.
     const ORPHAN_CHOREOGRAPHY: &str = r#"
-DRIVER=$1; READY=$2; PROVIDER=$3; PIDFILE=$4; SYNC=$5; GO=$6; LOG=$7; OWNED=$8; DOSTOP=$9
+DRIVER=$1; READY=$2; PROVIDER=$3; PIDFILE=$4; SYNC=$5; GO=$6; LOG=$7; OWNED=$8; DOSTOP=$9; SHELLPID=${10}
+echo $$ > "$SHELLPID"
 if [ "$OWNED" = 1 ]; then
   "$DRIVER" --die-with-parent $$ --sleep 60 --ready "$READY" --call "$PROVIDER" </dev/null >"$LOG" 2>&1 &
 else
@@ -9076,21 +9091,44 @@ exit 0
         after.split_whitespace().nth(1)?.parse().ok()
     }
 
-    /// Spawns the choreographed observer; returns the guarded shell plus
-    /// the staged paths (pidfile, sync, go, log).
+    /// A choreographed observer run under the isolated helper reaper:
+    /// the reaper (the twin's direct child) adopts and reaps the
+    /// orphaned driver, so disappearance never depends on PID 1 or an
+    /// unrelated subreaper.
+    struct OrphanTwin {
+        reaper: ChildReaper,
+        pidfile: PathBuf,
+        sync: PathBuf,
+        go: PathBuf,
+        log: PathBuf,
+        shell: PathBuf,
+        reaped: PathBuf,
+        reaper_log: PathBuf,
+    }
+
+    /// Spawns the choreographed observer under the helper reaper.
     fn spawn_orphan_observer(
         dir: &std::path::Path,
+        reaper: &std::path::Path,
         driver: &std::path::Path,
         provider: &std::path::Path,
         owned: &str,
         dostop: &str,
-    ) -> (ChildReaper, PathBuf, PathBuf, PathBuf, PathBuf) {
+    ) -> OrphanTwin {
         let ready = dir.join("ready");
         let pidfile = dir.join("driver.pid");
         let sync = dir.join("sync");
         let go = dir.join("go");
         let log = dir.join("driver.log");
-        let shell = std::process::Command::new("/bin/sh")
+        let shell = dir.join("shell.pid");
+        let reaped = dir.join("reaped");
+        let reaper_log = dir.join("reaper.log");
+        let reaper_stderr = std::fs::File::create(&reaper_log).unwrap();
+        let child = std::process::Command::new(reaper)
+            .arg(&pidfile)
+            .arg(&reaped)
+            .arg("--")
+            .arg("/bin/sh")
             .arg("-c")
             .arg(ORPHAN_CHOREOGRAPHY)
             .arg("orphan-observer")
@@ -9103,12 +9141,22 @@ exit 0
             .arg(&log)
             .arg(owned)
             .arg(dostop)
+            .arg(&shell)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::from(reaper_stderr))
             .spawn()
             .unwrap();
-        (ChildReaper(shell), pidfile, sync, go, log)
+        OrphanTwin {
+            reaper: ChildReaper(child),
+            pidfile,
+            sync,
+            go,
+            log,
+            shell,
+            reaped,
+            reaper_log,
+        }
     }
 
     #[test]
@@ -9116,30 +9164,29 @@ exit 0
         // Anti-orphan regression: an EXPLICITLY-OWNED fixture dies with
         // its observer even while SIGSTOPped, instead of lingering
         // stopped on shared coordination. The twin orphans a real
-        // driver through a choreographed shell (no OwnedStoppedChild:
-        // nothing reaps it): the shell waits for driver readiness,
+        // driver through a choreographed shell under the isolated
+        // helper reaper: the shell waits for driver readiness,
         // SIGSTOPs the driver, then waits for the twin's release. The
         // twin first proves the fixture is LIVE and STOPPED (state T —
         // the startup orphan guard only runs before readiness, so a
         // stopped driver proves the guard passed and the stop landed),
-        // releases the shell, and asserts the pid is reaped within
-        // seconds — reading /proc state so a lingering zombie cannot
-        // masquerade as survival. Fails pre-fix with the orphan still
-        // stopped.
+        // releases the shell, and asserts the helper reaped the pid —
+        // reading /proc state so a lingering zombie cannot masquerade
+        // as survival. Fails pre-fix with the orphan still stopped.
         let dir = tempfile::tempdir().unwrap();
         let (provider, driver) = build_scoped_pair(dir.path());
-        let (mut sh, pidfile, sync, go, log) =
-            spawn_orphan_observer(dir.path(), &driver, &provider, "1", "1");
+        let reaper = build_orphan_reaper(dir.path());
+        let mut twin = spawn_orphan_observer(dir.path(), &reaper, &driver, &provider, "1", "1");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-        while !sync.exists() {
+        while !twin.sync.exists() {
             assert!(
                 std::time::Instant::now() < deadline,
                 "observer never staged the stopped fixture: {}",
-                std::fs::read_to_string(&log).unwrap_or_default()
+                std::fs::read_to_string(&twin.log).unwrap_or_default()
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        let pid: u32 = std::fs::read_to_string(&pidfile)
+        let pid: u32 = std::fs::read_to_string(&twin.pidfile)
             .unwrap()
             .trim()
             .parse()
@@ -9159,9 +9206,22 @@ exit 0
         }
         // SAFETY: kill(pid, 0) only probes existence; T proves liveness.
         assert_eq!(unsafe { libc::kill(pid as libc::pid_t, 0) }, 0);
-        std::fs::write(&go, b"go").unwrap();
-        let status = sh.0.wait().unwrap();
-        assert!(status.success(), "choreographed observer exits cleanly");
+        std::fs::write(&twin.go, b"go").unwrap();
+        let status = twin.reaper.0.wait().unwrap();
+        assert!(
+            status.success(),
+            "helper reaper reaps the orphaned owned fixture: {}",
+            std::fs::read_to_string(&twin.reaper_log).unwrap_or_default()
+        );
+        // The report proves THIS helper did the reaping — not PID 1 or
+        // an unrelated subreaper — and that the death signal (not an
+        // exit) killed the stopped fixture.
+        let report = std::fs::read_to_string(&twin.reaped).unwrap();
+        assert_eq!(
+            report,
+            format!("REAPED {pid} signal=9\n"),
+            "the helper reaped the signal-killed fixture"
+        );
         // Reaped, not merely dead: poll /proc disappearance, reporting
         // the last state so survival (T/R/S) and unreaped death (Z)
         // stay distinguishable.
@@ -9287,33 +9347,52 @@ exit 0
         // working (the identity sweeps read holders' live mappings AFTER
         // the observer exits). Same choreography as the owned twin, but
         // unowned and unstopped: after the shell exits, the twin proves
-        // the driver was orphaned (reparented away from the dead shell),
-        // is alive, and still serves mapping ground truth — then reaps
-        // it. Fails if parent-death handling ever goes unconditional.
+        // the driver was orphaned (adopted by the helper reaper), is
+        // alive, and still serves mapping ground truth — then the
+        // helper reaps it after the twin's SIGKILL. Fails if
+        // parent-death handling ever goes unconditional.
         let dir = tempfile::tempdir().unwrap();
         let (provider, driver) = build_scoped_pair(dir.path());
-        let (mut sh, pidfile, sync, go, log) =
-            spawn_orphan_observer(dir.path(), &driver, &provider, "0", "0");
-        let observer = sh.0.id();
+        let reaper = build_orphan_reaper(dir.path());
+        let mut twin = spawn_orphan_observer(dir.path(), &reaper, &driver, &provider, "0", "0");
+        let helper = twin.reaper.0.id();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-        while !sync.exists() {
+        while !twin.sync.exists() {
             assert!(
                 std::time::Instant::now() < deadline,
                 "observer never staged the fixture: {}",
-                std::fs::read_to_string(&log).unwrap_or_default()
+                std::fs::read_to_string(&twin.log).unwrap_or_default()
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        let pid: u32 = std::fs::read_to_string(&pidfile)
+        let pid: u32 = std::fs::read_to_string(&twin.pidfile)
             .unwrap()
             .trim()
             .parse()
             .unwrap();
         // SAFETY: kill(pid, 0) only probes existence.
         assert_eq!(unsafe { libc::kill(pid as libc::pid_t, 0) }, 0);
-        std::fs::write(&go, b"go").unwrap();
-        let status = sh.0.wait().unwrap();
-        assert!(status.success(), "choreographed observer exits cleanly");
+        std::fs::write(&twin.go, b"go").unwrap();
+        // The shell exits on release while the helper reaper stays
+        // alive waiting for the driver: wait for the shell pid itself
+        // to vanish (the reaper waitpids it promptly).
+        let shell: u32 = std::fs::read_to_string(&twin.shell)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if proc_state(shell).is_none() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "observer shell never exited after release: {}",
+                std::fs::read_to_string(&twin.log).unwrap_or_default()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         // A death signal would land in milliseconds; two seconds of
         // survival proves the policy stayed scoped.
         std::thread::sleep(std::time::Duration::from_secs(2));
@@ -9323,9 +9402,10 @@ exit 0
             "ground-truth fixture survives its observer: pid {pid} state {state:?}"
         );
         let ppid = proc_ppid(pid);
-        assert!(
-            ppid.is_some() && ppid != Some(observer),
-            "fixture reparented after observer exit: ppid {ppid:?} observer {observer}"
+        assert_eq!(
+            ppid,
+            Some(helper),
+            "fixture adopted by the helper reaper after observer exit: ppid {ppid:?} helper {helper}"
         );
         let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).unwrap();
         assert!(
@@ -9336,6 +9416,18 @@ exit 0
         unsafe {
             libc::kill(pid as libc::pid_t, libc::SIGKILL);
         }
+        let status = twin.reaper.0.wait().unwrap();
+        assert!(
+            status.success(),
+            "helper reaper reaps the ground-truth fixture: {}",
+            std::fs::read_to_string(&twin.reaper_log).unwrap_or_default()
+        );
+        let report = std::fs::read_to_string(&twin.reaped).unwrap();
+        assert_eq!(
+            report,
+            format!("REAPED {pid} signal=9\n"),
+            "the helper reaped the signal-killed fixture"
+        );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             if proc_state(pid).is_none() {

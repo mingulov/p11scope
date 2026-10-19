@@ -554,6 +554,11 @@ enum ServiceState {
         capacity: PromotionInstallCapacity,
         source: Box<dyn NativeActivationSource>,
         outcome: std::sync::mpsc::Receiver<PreparationOutcome>,
+        /// The worker thread. Dropped (detached, never joined) once
+        /// its message is reaped: delivery ends the worker's role,
+        /// and no tick waits out thread termination — not even
+        /// behind `is_finished`, which goes true before thread-local
+        /// destruction runs while `join` waits for it.
         worker: Option<std::thread::JoinHandle<()>>,
         /// Cancel/stop was requested while the worker ran: the CAS is
         /// skipped and the outcome is disposed, never installed.
@@ -669,11 +674,14 @@ impl SelectedLifecycleService {
 
     /// Poll once (driver tick): reap a delivered worker outcome, run
     /// the CAS + mint for a sealed lane, advance joined disposal, and
-    /// emit at most one event. Disposal diagnostics sink here; the
-    /// terminal report path carries the finite reason.
+    /// emit at most one event. Never blocks on the worker: a reaped
+    /// delivery detaches its thread (delivery ends the worker's role;
+    /// the thread exits on its own) and handles the outcome at once.
+    /// Disposal diagnostics sink here; the terminal report path
+    /// carries the finite reason.
     pub(crate) fn poll(&mut self, out: &mut dyn std::io::Write) -> Option<LifecycleEvent> {
         // Reap a delivery first, without holding state borrows across
-        // the join and the outcome handling below.
+        // the detach and the outcome handling below.
         let delivery: Option<Option<PreparationOutcome>> = match &mut self.state {
             ServiceState::Preparing { outcome, .. } => Some(match outcome.try_recv() {
                 Err(std::sync::mpsc::TryRecvError::Empty) => return None,
@@ -683,33 +691,37 @@ impl SelectedLifecycleService {
             _ => None,
         };
         if let Some(delivery) = delivery {
-            let worker = match &mut self.state {
-                ServiceState::Preparing { worker, .. } => worker.take(),
-                _ => unreachable!("delivery implies preparing"),
+            let ServiceState::Preparing {
+                request,
+                capacity,
+                source,
+                worker,
+                cancel,
+                ..
+            } = std::mem::replace(&mut self.state, ServiceState::Idle)
+            else {
+                unreachable!("delivery implies preparing");
             };
-            if let Some(worker) = worker {
-                let _ = worker.join();
-            }
+            // Detach, never join: the message (or the sender's death)
+            // is the complete handoff. Joining here would wait out
+            // thread termination on the tick; the detached thread
+            // exits on its own and the OS reclaims it. A panicked
+            // worker still reports through the panic hook exactly as
+            // before; its payload was never read.
+            drop(worker);
             return match delivery {
                 // The worker died without delivering (panic or
                 // abort): nothing retained, nothing installed.
                 None => {
-                    let ServiceState::Preparing { request, .. } =
-                        std::mem::replace(&mut self.state, ServiceState::Idle)
-                    else {
-                        unreachable!("delivery implies preparing");
-                    };
+                    drop(capacity);
+                    drop(source);
                     let update = request.status_update(PromotionOutcome::Refused {
                         reason: PromotionRefusal::PreparationFailed,
                     });
                     Some(LifecycleEvent::Status(update))
                 }
                 Some(delivered) => {
-                    let cancel = match &self.state {
-                        ServiceState::Preparing { cancel, .. } => *cancel,
-                        _ => unreachable!("delivery implies preparing"),
-                    };
-                    self.outcome_received(delivered, cancel)
+                    self.outcome_received(request, capacity, source, delivered, cancel)
                 }
             };
         }
@@ -753,24 +765,19 @@ impl SelectedLifecycleService {
         }
     }
 
-    /// Handle a delivered worker outcome: join done, worker reaped.
-    /// Cancel wins over install: a cancelled outcome is disposed and
-    /// ends, never CASed. Otherwise a sealed lane runs the native CAS
-    /// plus proof mint and hands to the driver for install.
+    /// Handle a delivered worker outcome: worker detached, parts
+    /// reaped. Cancel wins over install: a cancelled outcome is
+    /// disposed and ends, never CASed. Otherwise a sealed lane runs
+    /// the native CAS plus proof mint and hands to the driver for
+    /// install.
     fn outcome_received(
         &mut self,
+        request: PromotionRequest,
+        capacity: PromotionInstallCapacity,
+        mut source: Box<dyn NativeActivationSource>,
         delivered: PreparationOutcome,
         cancel: Option<PromotionEnd>,
     ) -> Option<LifecycleEvent> {
-        let ServiceState::Preparing {
-            request,
-            capacity,
-            mut source,
-            ..
-        } = std::mem::replace(&mut self.state, ServiceState::Idle)
-        else {
-            unreachable!("outcome_received runs only while preparing");
-        };
         // Convert eagerly, even on cancel: the conversion is
         // tick-safe validation, and its refusal retains the Session
         // in the same failure owner the disposal poll drains.
@@ -1357,6 +1364,63 @@ mod tests {
             validate_subset_shape(&scripted_subset(&[(3, 7), (5, 9)])),
             Err(PromotionRefusal::EndpointAmbiguous)
         );
+    }
+
+    /// A thread-exit lag: dropped at worker termination, after the
+    /// outcome send. Models delivery preceding termination: the tick
+    /// must reap the message without waiting out thread exit.
+    struct ExitLag;
+    impl Drop for ExitLag {
+        fn drop(&mut self) {
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    }
+
+    #[test]
+    fn poll_reaps_delivery_without_joining_a_live_worker() {
+        thread_local! {
+            static EXIT_LAG: std::cell::RefCell<Option<ExitLag>> =
+                const { std::cell::RefCell::new(None) };
+        }
+        let (mut promoter, request) = taken_request_for_test();
+        let mut service = SelectedLifecycleService::new();
+        service
+            .start(request, capacity(), stub_source(None).0, || {
+                EXIT_LAG.with(|slot| *slot.borrow_mut() = Some(ExitLag));
+                PreparationOutcome::Failed(SelectedPreparationFailure::scripted_settled())
+            })
+            .expect("start runs");
+        // No single poll waits out thread termination, even the one
+        // that reaps the delivered outcome; the genuine terminal
+        // status arrives from the detached delivery while the worker
+        // still exits.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let event = loop {
+            let tick = Instant::now();
+            let mut sink = std::io::sink();
+            if let Some(event) = service.poll(&mut sink) {
+                break event;
+            }
+            assert!(
+                tick.elapsed() < Duration::from_millis(100),
+                "no single poll joins a live worker"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "service emitted no event within the bound"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        let LifecycleEvent::Status(update) = event else {
+            panic!("failed job must not install");
+        };
+        assert_eq!(
+            promoter.set_status(update),
+            Some(super::super::PromotionState::Refused(
+                PromotionRefusal::PreparationFailed
+            ))
+        );
+        assert!(service.is_idle());
     }
 
     #[test]

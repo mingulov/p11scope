@@ -430,6 +430,119 @@ class BrowserCells(unittest.TestCase):
         strays = [p for p in (caller_home / ".pki", caller_home / ".local") if p.exists()]
         self.assertEqual(strays, [], f"browser NSS state leaked into caller HOME: {strays}")
 
+    def test_navigation_waits_for_capture_readiness(self):
+        """P2-4 twin: navigation must not start before capture readiness.
+
+        The scripted profiler never prints its readiness marker inside the
+        grace period; the flow must never run and the cell must fail. Uses
+        a fake Playwright module and a fake profiler process: stdlib only.
+        """
+        import subprocess as stdlib_subprocess
+
+        marker_delay = 30.0
+        started: dict = {}
+
+        class FakePipe:
+            def __init__(self, script):
+                self._script = list(script)
+                self._start = time.monotonic()
+                self._closed = False
+                self.text = "".join(line for _, line in script)
+
+            def readline(self):
+                while self._script and not self._closed:
+                    delay, line = self._script[0]
+                    if time.monotonic() - self._start >= delay:
+                        return self._script.pop(0)[1]
+                    time.sleep(0.02)
+                return ""
+
+            def close(self):
+                self._closed = True
+
+        class FakePopen:
+            def __init__(self, argv, **kwargs):
+                self.argv = argv
+                self._finished = False
+                self.returncode = None
+                self.stderr = FakePipe([
+                    (0.1, "p11scope: loader readiness: 1 active hook(s)\n"),
+                    (marker_delay,
+                     "p11scope: capturing: 136 probe(s) attached; stop with Ctrl-C\n"),
+                ])
+                self.stdout = FakePipe([])
+
+            def poll(self):
+                return 0 if self._finished else None
+
+            def _finish(self):
+                self._finished = True
+                self.stderr.close()
+                self.stdout.close()
+                self.returncode = 0
+                return 0
+
+            def wait(self, timeout=None):
+                if self._finished:
+                    return 0
+                raise stdlib_subprocess.TimeoutExpired(self.argv, timeout)
+
+            def communicate(self, timeout=None):
+                self._finish()
+                return ("", self.stderr.text)
+
+            def kill(self):
+                self._finish()
+
+        class FakePage:
+            pass
+
+        class FakeContext:
+            def __init__(self):
+                self.pages = [FakePage()]
+
+            def new_page(self):
+                page = FakePage()
+                self.pages.append(page)
+                return page
+
+            def close(self):
+                pass
+
+        class FakeBrowserType:
+            def launch_persistent_context(self, *args, **kwargs):
+                return FakeContext()
+
+        class FakePlaywright:
+            def __init__(self):
+                self.firefox = FakeBrowserType()
+                self.chromium = FakeBrowserType()
+
+        class FakePWContext:
+            def __enter__(self):
+                return FakePlaywright()
+
+            def __exit__(self, *args):
+                return False
+
+        def flow(page, context):
+            started["ran"] = True
+            return {}
+
+        fake_sync = SimpleNamespace(sync_playwright=lambda: FakePWContext())
+        with patch.dict(sys.modules, {"playwright": SimpleNamespace(),
+                                      "playwright.sync_api": fake_sync}), \
+                patch("subprocess.Popen", FakePopen), \
+                patch.object(cells, "main_browser_pid", return_value=os.getpid()), \
+                patch.object(cells, "p11scope_bin", return_value=Path("/fake/p11scope")):
+            with self.assertRaises(cells.CellError):
+                cells.attach_drive(
+                    "TWIN-READY", "firefox", self.work / "cell", "https://127.0.0.1:1/",
+                    flow, Path("definitely-not-mapped-xyz.so"),
+                    duration_seconds=5, attach_grace_seconds=2)
+        self.assertFalse(started.get("ran", False),
+                         "navigation started before capture readiness")
+
     def test_oracle_builder_healthy_accepted(self):
         """Guard: the twin builder's healthy doc passes the common oracle."""
         sha = "0" * 64

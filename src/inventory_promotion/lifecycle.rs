@@ -333,6 +333,7 @@ impl std::fmt::Debug for PreparationBundle {
 /// retained failure owner, whose cleanup the service polls to a
 /// joined receipt. Both variants are `Send` in every build: no H0 and
 /// no substituted test I/O cross the worker boundary.
+#[allow(clippy::large_enum_variant)] // DR37: single-flight worker handoff, moved once per promotion; sizes are native-owned.
 pub(crate) enum PreparationOutcome {
     Ready(PreparedSelectedWork),
     Failed(SelectedPreparationFailure),
@@ -352,6 +353,7 @@ impl PreparedSelectedWork {
     /// Run the sanctioned one-way conversion into the sealed
     /// provisional lane. A refusal retains its Session in the failure
     /// owner for joined cleanup.
+    #[allow(clippy::result_large_err)] // DR37: cold path returning the retained native owner for joined disposal.
     fn into_provisional_lane(self) -> Result<ProvisionalSelectedLane, SelectedPreparationFailure> {
         self.prepared.into_provisional_lane(self.convert)
     }
@@ -404,6 +406,7 @@ impl PreparationBundle {
 /// updates return `None` there) and records every terminal transition
 /// in the normal bounded report path; it installs through the
 /// coordinator install entry, which consumes the proof.
+#[allow(clippy::large_enum_variant)] // DR37: single-flight driver handoff, moved once per promotion; sizes are native-owned.
 pub(crate) enum LifecycleEvent {
     Status(PromotionStatusUpdate),
     Install(PendingInstall),
@@ -506,6 +509,7 @@ impl TerminalDisposition {
 /// An outcome whose native owner still needs joined disposal: either
 /// the worker's retained failure or a sealed lane that must never
 /// install (cancelled, or CAS/mint/install refused).
+#[allow(clippy::large_enum_variant)] // DR37: single retained owner per preparation; sizes are native-owned.
 enum DisposingOutcome {
     Preparation(SelectedPreparationFailure),
     Lane(ProvisionalSelectedLane),
@@ -521,6 +525,7 @@ impl std::fmt::Debug for DisposingOutcome {
 /// lifetime, never retried (mirrors `SelectedPreparationFailure`'s
 /// `Unproved`: neither an empty collection nor `Drop` proves
 /// settlement).
+#[allow(clippy::large_enum_variant)] // DR37: one retained record per unproved owner; sizes are native-owned.
 enum UnprovedOwner {
     Preparation(SelectedPreparationFailure),
     Lane(ProvisionalSelectedLane),
@@ -541,6 +546,7 @@ impl std::fmt::Debug for UnprovedOwner {
     }
 }
 
+#[allow(clippy::large_enum_variant)] // DR37: one state per service; the payloads move once per promotion.
 enum ServiceState {
     Idle,
     Preparing {
@@ -861,6 +867,7 @@ impl SelectedLifecycleService {
     /// install entry refused): reclaim the handoff for genuine lane
     /// disposal. `end` selects the terminal status once disposal
     /// settles; `None` reports `ActivationFailed`.
+    #[allow(clippy::result_large_err)] // DR37: cold path returning the handoff for disposal, never in a loop.
     pub(crate) fn reclaim_install(
         &mut self,
         pending: PendingInstall,
@@ -874,12 +881,11 @@ impl SelectedLifecycleService {
         else {
             unreachable!("installing checked above");
         };
-        let (proof, lane, capacity) = pending.into_parts();
+        let (_proof, lane, capacity) = pending.into_parts();
         // The proof authorizes exactly the install it just failed;
-        // dropping it consumes that authorization, and dropping the
-        // capacity refunds its precharge. The lane still needs joined
-        // disposal below.
-        drop(proof);
+        // its scope ends here unconsumed, and dropping the capacity
+        // refunds its precharge. The lane still needs joined disposal
+        // below.
         drop(capacity);
         let terminal = match end {
             Some(end) => TerminalDisposition::Ended(end),

@@ -115,6 +115,7 @@ impl ProvisionalSelectedLane {
     /// disposal) returns the lane uninstalled for genuine disposal;
     /// nothing half-installs.
     #[cfg_attr(not(test), allow(dead_code))] // STAGED (DR37): called by the lifecycle service.
+    #[allow(clippy::result_large_err)] // DR37: cold path returning the refused lane for genuine disposal.
     pub(crate) fn into_live_lane(
         self,
         proof: &crate::inventory_promotion::lifecycle::SelectedActivationProof,

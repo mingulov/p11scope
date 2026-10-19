@@ -56,6 +56,19 @@ def render(counts, evidence, rows=3):
             + json.dumps(evidence) + '\n').encode()
 
 
+def wait_task_sleep(pid, tid, seconds=5):
+    """Wait until a test thread is actually asleep, then let it settle."""
+    deadline = time.monotonic() + seconds
+    while True:
+        state = Path(f'/proc/{pid}/task/{tid}/status').read_text()
+        if '\nState:\tS' in state or '\nState:\tD' in state:
+            time.sleep(0.02)
+            return
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f'test thread {tid} never reached sleep')
+        time.sleep(0.001)
+
+
 class OracleTests(unittest.TestCase):
     def setUp(self):
         self.ledger, self.receipt, self.evidence, self.counts = fixture()
@@ -607,6 +620,64 @@ class ReporterProbeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             module['read_reporter_symbols'](io.BytesIO(b'arbitrary_symbol t 12 10\n'), 'arbitrary')
 
+    def test_prompt_worker_delivery_proves_delivery_without_acknowledgement(self):
+        module = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/reporter_probe.py'))
+        expected = dict(role='callback', pid=123, tid=124, start_time=10, dev=2,
+                        ino=3, file_offset=100, ip=0x1250)
+        rows = [dict(kind='ready', mode='perf_uprobe', clock='CLOCK_MONOTONIC', t_ns=400,
+                     **{key: value for key, value in expected.items() if key != 'ip'}),
+                dict(kind='callback', mode='perf_uprobe', pid=123, tid=124, ip=0x1250, t_ns=700),
+                dict(kind='final', mode='perf_uprobe', samples=1, lost=0, kernel_count=1,
+                     time_enabled=500, time_running=500)]
+        signals = [dict(signal='SIGINT', t_ns=600, delivery='tgkill_original_worker', tid=124)]
+        self.assertEqual(module['validate_worker_delivery'](rows, expected, signals)['delivery_ns'], 700)
+        for mutation in ('main-tid', 'reporter-role', 'callback-kind', 'foreign-ip', 'lost',
+                         'kernel-count', 'zero-enabled', 'multiplex', 'duplicate', 'pre-signal',
+                         'slow', 'not-ready', 'process-signal', 'wrong-signal', 'bool-enabled',
+                         'foreign-ready'):
+            changed, sent = copy.deepcopy(rows), copy.deepcopy(signals)
+            if mutation == 'main-tid':
+                changed[1]['tid'] = 123
+            elif mutation == 'reporter-role':
+                changed[1]['kind'] = 'reporter'
+            elif mutation == 'callback-kind':
+                changed[0]['role'] = 'reporter'
+            elif mutation == 'foreign-ip':
+                changed[1]['ip'] += 1
+            elif mutation == 'lost':
+                changed[2]['lost'] = 1
+            elif mutation == 'kernel-count':
+                changed[2]['kernel_count'] = 2
+            elif mutation == 'zero-enabled':
+                changed[2].update(time_enabled=0, time_running=0)
+            elif mutation == 'multiplex':
+                changed[2]['time_running'] = 499
+            elif mutation == 'duplicate':
+                changed.insert(2, copy.deepcopy(changed[1]))
+            elif mutation == 'pre-signal':
+                changed[1]['t_ns'] = 599
+            elif mutation == 'slow':
+                changed[1]['t_ns'] = 100000600
+            elif mutation == 'not-ready':
+                changed[0]['t_ns'] = 601
+            elif mutation == 'process-signal':
+                sent[0].pop('delivery')
+            elif mutation == 'wrong-signal':
+                sent[0]['signal'] = 'SIGTERM'
+            elif mutation == 'bool-enabled':
+                changed[2].update(time_enabled=True, time_running=True)
+            else:
+                changed[0]['tid'] += 1
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                module['validate_worker_delivery'](changed, expected, sent)
+        main_rows = copy.deepcopy(rows)
+        for row in main_rows[:2]:
+            row['tid'] = 123
+        with self.assertRaises(ValueError):
+            module['validate_worker_delivery'](main_rows, dict(expected, tid=123), signals)
+        with self.assertRaises(ValueError):
+            module['validate_witness'](rows, expected, signals)
+
     def test_live_mode_refuses_a_foreign_executable_before_attaching(self):
         fd = os.open(self.probe, os.O_RDONLY)
         try:
@@ -834,36 +905,75 @@ class ReporterControlAdapterTests(unittest.TestCase):
             self.assertIs(negative['NATIVE'].spawn_owned.__globals__['_active_signals'],
                           base['NATIVE'].spawn_owned.__globals__['_active_signals'])
 
-    def test_worker_negative_requires_genuine_main_progress_same_process_and_zero_events(self):
+    def test_worker_delivery_negative_requires_gated_main_prompt_delivery_and_late_entry(self):
         module = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/qualify_reporter_probe.py'))
         expected = dict(role='reporter', pid=123, tid=123, start_time=9, dev=2,
                         ino=3, file_offset=80, ip=0x1234)
         worker_expected = dict(expected, tid=124, start_time=10)
+        callback_expected = dict(worker_expected, role='callback', file_offset=100, ip=0x1250)
         def ready(binding):
             return dict(kind='ready', mode='perf_uprobe', clock='CLOCK_MONOTONIC', t_ns=400,
                 **{key: value for key, value in binding.items() if key != 'ip'})
-        final = dict(kind='final', mode='perf_uprobe', samples=1, lost=0, kernel_count=1,
-                     time_enabled=500, time_running=500)
+        def final(samples):
+            return dict(kind='final', mode='perf_uprobe', samples=samples, lost=0, kernel_count=samples,
+                        time_enabled=500, time_running=500)
+        callback = [ready(callback_expected), dict(kind='callback', mode='perf_uprobe',
+            pid=123, tid=124, ip=0x1250, t_ns=700), final(1)]
+        worker = [ready(worker_expected), final(0)]
         reporter = [ready(expected), dict(kind='reporter', mode='perf_uprobe',
-            pid=123, tid=123, ip=0x1234, t_ns=700), final]
-        worker = [ready(worker_expected), dict(final, samples=0, kernel_count=0)]
-        signals, diagnostics = [dict(signal='SIGINT', t_ns=600)], b'p11scope: cancel: loop exited on signal 2 after 2 ticks\n'
+            pid=123, tid=123, ip=0x1234, t_ns=160000800), final(1)]
+        gates = [dict(kind=kind, pid=123, tid=123, clock='CLOCK_MONOTONIC', t_ns=stamp)
+                 for kind, stamp in [('entered', 200), ('released', 160000700)]]
+        signals = [dict(signal='SIGINT', t_ns=600, delivery='tgkill_original_worker', tid=124)]
+        diagnostics = b'p11scope: cancel: loop exited on signal 2 after 2 ticks\n'
         call = module['validate_worker_negative']
-        self.assertEqual(call(worker, worker_expected, reporter, expected, signals, diagnostics)['worker_samples'], 0)
-        for mutation in ('main-target', 'foreign-process', 'foreign-candidate', 'late-ready',
-                         'worker-event', 'loss', 'no-main', 'missing-marker', 'bool-counter'):
-            w, r, e, marker = copy.deepcopy(worker), copy.deepcopy(reporter), dict(worker_expected), diagnostics
-            if mutation == 'main-target': e['tid'] = w[0]['tid'] = 123
+        verdict = call(callback, callback_expected, worker, worker_expected, reporter,
+                       expected, gates, signals, 160000600, diagnostics)
+        self.assertEqual((verdict['worker_samples'], verdict['worker_delivery_ns'],
+                          verdict['late_main_observation_ns']), (0, 700, 160000800))
+        for mutation in ('worker-on-main', 'foreign-process', 'foreign-candidate', 'callback-wrong-task',
+                         'callback-main-kind', 'callback-role-expected', 'shared-offset', 'zero-enabled-worker',
+                         'zero-enabled-callback', 'loss-worker', 'loss-callback', 'worker-event',
+                         'slow-delivery', 'pre-signal-delivery', 'premature-main', 'prompt-main',
+                         'early-release', 'early-gate-release', 'interrupted-main', 'late-entered',
+                         'foreign-gate', 'gate-clock', 'missing-marker', 'multiplex', 'main-signal',
+                         'bool-counter'):
+            c, w, r, g, e, sent, release = (copy.deepcopy(callback), copy.deepcopy(worker),
+                copy.deepcopy(reporter), copy.deepcopy(gates), dict(worker_expected),
+                copy.deepcopy(signals), 160000600)
+            marker = diagnostics
+            if mutation == 'worker-on-main': e['tid'] = w[0]['tid'] = 123
             elif mutation == 'foreign-process': e['pid'] = w[0]['pid'] = 456
             elif mutation == 'foreign-candidate': e['ino'] = w[0]['ino'] = 999
-            elif mutation == 'late-ready': w[0]['t_ns'] = 601
+            elif mutation == 'callback-wrong-task': c[1]['tid'] = 125
+            elif mutation == 'callback-main-kind': c[1]['kind'] = 'reporter'
+            elif mutation == 'callback-role-expected': ce_role = 'reporter'
+            elif mutation == 'shared-offset': ce_offset = 80
+            elif mutation == 'zero-enabled-worker': w[1].update(time_enabled=0, time_running=0)
+            elif mutation == 'zero-enabled-callback': c[2].update(time_enabled=0, time_running=0)
+            elif mutation == 'loss-worker': w[1]['lost'] = 1
+            elif mutation == 'loss-callback': c[2]['lost'] = 1
             elif mutation == 'worker-event': w[1].update(samples=1, kernel_count=1)
-            elif mutation == 'loss': w[1]['lost'] = 1
-            elif mutation == 'no-main': r.pop(1)
+            elif mutation == 'slow-delivery': c[1]['t_ns'] = 100000600
+            elif mutation == 'pre-signal-delivery': c[1]['t_ns'] = 599
+            elif mutation == 'premature-main': r[1]['t_ns'] = 160000599
+            elif mutation == 'prompt-main': r[1]['t_ns'] = 700
+            elif mutation == 'early-release': release = 149000600
+            elif mutation == 'early-gate-release': g[1]['t_ns'] = 149000700
+            elif mutation == 'interrupted-main':
+                g.insert(1, dict(kind='interrupted', pid=123, tid=123, clock='CLOCK_MONOTONIC', t_ns=800))
+            elif mutation == 'late-entered': g[0]['t_ns'] = 601
+            elif mutation == 'foreign-gate': g[1]['tid'] += 1
+            elif mutation == 'gate-clock': g[1]['clock'] = 'CLOCK_REALTIME'
             elif mutation == 'missing-marker': marker = b''
+            elif mutation == 'multiplex': r[2]['time_running'] -= 1
+            elif mutation == 'main-signal': sent[0].pop('delivery')
             else: w[1]['kernel_count'] = False
+            ce = dict(callback_expected)
+            if mutation == 'callback-role-expected': ce['role'] = ce_role
+            if mutation == 'shared-offset': ce['file_offset'] = ce_offset
             with self.subTest(mutation=mutation), self.assertRaises(ValueError):
-                call(w, e, r, expected, signals, marker)
+                call(c, ce, w, e, r, expected, g, sent, release, marker)
 
     def test_handler_blocked_oracle_requires_actual_delivery_gate_and_late_reporter(self):
         module = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/qualify_reporter_probe.py'))
@@ -907,6 +1017,228 @@ class ReporterControlAdapterTests(unittest.TestCase):
                 call(r, expected, c, callback_expected, g, signals, release, diagnostics)
         with self.assertRaises(ValueError):
             call(reporter, expected, callback, callback_expected, gates, signals, 160000600, diagnostics[:-1])
+
+    def test_parked_tripwire_pins_refusal_and_flips_loudly(self):
+        negative = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/negative_reporter_controls.py'))
+        call = negative['check_tripwire_refusal']
+        healthy = dict(tid=124, rc=2, ready_tid=124, kinds=['ready'], delta_ns=0,
+                       stderr='reporter-probe: kernel event/sample/loss/enabled counters disagree\n')
+        self.assertTrue(call(dict(healthy))['refused'])
+        for mutation in ('reconciled', 'wrong-rc', 'sampled', 'finalized', 'wrong-stderr',
+                         'scheduled', 'clock-regressed', 'wrong-task', 'unmeasured'):
+            raw = dict(healthy)
+            if mutation == 'reconciled':
+                raw.update(rc=0, kinds=['ready', 'final'])
+            elif mutation == 'wrong-rc':
+                raw['rc'] = 1
+            elif mutation == 'sampled':
+                raw['kinds'] = ['ready', 'reporter']
+            elif mutation == 'finalized':
+                raw['kinds'] = ['ready', 'final']
+            elif mutation == 'wrong-stderr':
+                raw['stderr'] = 'reporter-probe: bounded probe expired before owned stop\n'
+            elif mutation == 'scheduled':
+                raw['delta_ns'] = 12000
+            elif mutation == 'clock-regressed':
+                raw['delta_ns'] = -5
+            elif mutation == 'wrong-task':
+                raw['ready_tid'] = 125
+            else:
+                raw['delta_ns'] = None
+            with self.subTest(mutation=mutation):
+                try:
+                    call(raw)
+                except ValueError as error:
+                    self.assertIn('tripwire flipped', str(error))
+                    self.assertEqual(error.tripwire_evidence['tid'], 124)
+                else:
+                    self.fail(f'tripwire flip was not refused: {mutation}')
+
+    def test_task_runtime_reads_actual_schedstat_nanoseconds(self):
+        negative = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/negative_reporter_controls.py'))
+        main_tid = threading.get_native_id()
+        first = negative['read_task_runtime'](os.getpid(), main_tid)
+        self.assertIs(type(first), int)
+        self.assertGreaterEqual(first, 0)
+        stop = threading.Event()
+        def spin():
+            while not stop.is_set():
+                pass
+        spinner = threading.Thread(target=spin)
+        spinner.start()
+        try:
+            before = negative['read_task_runtime'](os.getpid(), spinner.native_id)
+            time.sleep(0.05)
+            after = negative['read_task_runtime'](os.getpid(), spinner.native_id)
+        finally:
+            stop.set()
+            spinner.join(timeout=5)
+        self.assertGreater(after, before)
+        with self.assertRaises(OSError):
+            negative['read_task_runtime'](os.getpid(), 1 << 30)
+
+    def test_tripwire_delta_distinguishes_parked_from_scheduled_thread(self):
+        negative = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/negative_reporter_controls.py'))
+        stop, gate, parked_ready = threading.Event(), threading.Event(), threading.Event()
+        def spin():
+            while not stop.is_set():
+                pass
+        def park():
+            parked_ready.set()
+            gate.wait(30)
+        spinner, parked = threading.Thread(target=spin), threading.Thread(target=park)
+        parked.start()
+        self.assertTrue(parked_ready.wait(5))
+        wait_task_sleep(os.getpid(), parked.native_id)
+        spinner.start()
+        try:
+            pid, main_tid = os.getpid(), threading.get_native_id()
+            before = negative['snapshot_worker_runtimes'](pid, main_tid)
+            self.assertIn(spinner.native_id, before)
+            self.assertIn(parked.native_id, before)
+            self.assertNotIn(main_tid, before)
+            time.sleep(0.05)
+            after = negative['snapshot_worker_runtimes'](pid, main_tid)
+            self.assertGreater(after[spinner.native_id] - before[spinner.native_id], 0)
+            self.assertEqual(after[parked.native_id] - before[parked.native_id], 0)
+        finally:
+            stop.set()
+            gate.set()
+            spinner.join(timeout=5)
+            parked.join(timeout=5)
+
+    def test_worker_pin_selects_lowest_unblocked_task_and_refuses_blocked_field(self):
+        negative = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/negative_reporter_controls.py'))
+        gate, ready = threading.Event(), threading.Event()
+        blocked_gate, blocked_ready = threading.Event(), threading.Event()
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.sigemptyset.argtypes = (ctypes.c_void_p,)
+        libc.sigemptyset.restype = ctypes.c_int
+        libc.sigaddset.argtypes = (ctypes.c_void_p, ctypes.c_int)
+        libc.sigaddset.restype = ctypes.c_int
+        libc.pthread_sigmask.argtypes = (ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+        libc.pthread_sigmask.restype = ctypes.c_int
+        def park():
+            ready.set()
+            gate.wait(30)
+        def park_blocked():
+            mask = (ctypes.c_ulong * 16)()
+            libc.sigemptyset(mask)
+            libc.sigaddset(mask, 2)
+            if libc.pthread_sigmask(0, mask, None):
+                raise OSError(ctypes.get_errno(), 'test pthread_sigmask failed')
+            blocked_ready.set()
+            blocked_gate.wait(30)
+        first, second = threading.Thread(target=park), threading.Thread(target=park_blocked)
+        first.start()
+        self.assertTrue(ready.wait(5))
+        wait_task_sleep(os.getpid(), first.native_id)
+        second.start()
+        worker = None
+        try:
+            self.assertTrue(blocked_ready.wait(5))
+            wait_task_sleep(os.getpid(), second.native_id)
+            pid = os.getpid()
+            blocked, caught = negative['read_sig_disposition'](pid, second.native_id)
+            self.assertTrue(blocked & 0x2, 'blocked test thread must actually block SIGINT')
+            observer = mock.Mock()
+            observer.pid = pid
+            chosen, evidence = negative['select_worker_tid'](observer)
+            self.assertEqual(chosen, first.native_id)
+            self.assertTrue(evidence['tasks'][first.native_id]['selectable'])
+            self.assertFalse(evidence['tasks'][second.native_id]['selectable'])
+            worker = negative['Worker'](observer, chosen)
+            self.assertEqual(worker.tid, first.native_id)
+            self.assertIn('blocked', worker.sigint)
+            worker.verify()
+            with self.assertRaisesRegex(ValueError, 'cannot receive targeted SIGINT'):
+                negative['Worker'](observer, second.native_id)
+        finally:
+            gate.set()
+            blocked_gate.set()
+            first.join(timeout=5)
+            second.join(timeout=5)
+            if worker is not None:
+                worker.close()
+
+    def test_worker_pin_refuses_a_fully_blocked_field_with_evidence(self):
+        negative = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/negative_reporter_controls.py'))
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.sigemptyset.argtypes = (ctypes.c_void_p,)
+        libc.sigemptyset.restype = ctypes.c_int
+        libc.sigaddset.argtypes = (ctypes.c_void_p, ctypes.c_int)
+        libc.sigaddset.restype = ctypes.c_int
+        libc.pthread_sigmask.argtypes = (ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+        libc.pthread_sigmask.restype = ctypes.c_int
+        gate, ready = threading.Event(), threading.Event()
+        def park_blocked():
+            mask = (ctypes.c_ulong * 16)()
+            libc.sigemptyset(mask)
+            libc.sigaddset(mask, 2)
+            if libc.pthread_sigmask(0, mask, None):
+                raise OSError(ctypes.get_errno(), 'test pthread_sigmask failed')
+            ready.set()
+            gate.wait(30)
+        only = threading.Thread(target=park_blocked)
+        only.start()
+        try:
+            self.assertTrue(ready.wait(5))
+            wait_task_sleep(os.getpid(), only.native_id)
+            observer = mock.Mock()
+            observer.pid = os.getpid()
+            # Other test-runner threads may exist; pin the refusal to the
+            # blocked thread by presenting a one-entry task listing.
+            blocked, _ = negative['read_sig_disposition'](observer.pid, only.native_id)
+            self.assertTrue(blocked & 0x2)
+            entry = mock.Mock()
+            entry.name = str(only.native_id)
+            with mock.patch.object(negative['Path'], 'iterdir', return_value=iter([entry])):
+                try:
+                    negative['select_worker_tid'](observer)
+                except ValueError as error:
+                    self.assertIn('no live worker with unblocked SIGINT', str(error))
+                    self.assertFalse(error.disposition_evidence['tasks'][only.native_id]['selectable'])
+                else:
+                    self.fail('fully blocked field was not refused')
+        finally:
+            gate.set()
+            only.join(timeout=5)
+
+    def test_worker_bind_refuses_main_exited_and_non_task_targets(self):
+        negative = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/negative_reporter_controls.py'))
+        observer = mock.Mock()
+        observer.pid = os.getpid()
+        for bad in (observer.pid, 0, -3, True, 1 << 30):
+            with self.subTest(target=bad), self.assertRaises(ValueError):
+                negative['Worker'](observer, bad)
+
+    def test_pinned_worker_verify_fails_after_exit(self):
+        negative = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/negative_reporter_controls.py'))
+        gate, ready = threading.Event(), threading.Event()
+        def park():
+            ready.set()
+            gate.wait(30)
+        thread = threading.Thread(target=park)
+        thread.start()
+        worker = None
+        try:
+            self.assertTrue(ready.wait(5))
+            wait_task_sleep(os.getpid(), thread.native_id)
+            observer = mock.Mock()
+            observer.pid = os.getpid()
+            worker = negative['Worker'](observer, thread.native_id)
+            worker.verify()
+            gate.set()
+            thread.join(timeout=5)
+            with self.assertRaises((OSError, ValueError)):
+                worker.verify()
+        finally:
+            gate.set()
+            thread.join(timeout=5)
+            if worker is not None:
+                worker.close()
 
     def test_no_signal_absence_waits_for_actual_delayed_reader_after_child_exit(self):
         module = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/qualify_reporter_probe.py'))

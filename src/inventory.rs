@@ -8624,6 +8624,208 @@ mod promotion_driver_tests {
     }
 
     #[test]
+    fn refused_finish_terminates_open_operations_before_shadow_disposal() {
+        // The open-operation twin of the nonempty-uncertainty flow: an
+        // admitted instance holds an open operation when its Finish
+        // fails and the cut refuses the domain. Refusing future
+        // positives must not strand existing claims: the refused
+        // Finish still publishes its Stopped negative, ending the
+        // open operation unknown before the shadow/namespace dispose.
+        // Fails pre-fix with the namespace disposed while claims stay
+        // clean.
+        use crate::discovery::caller_registry::instance_input::{
+            InstanceLifecycle, InstanceReason, call as instance_call, key as instance_key,
+            position as instance_position, registration as instance_registration,
+        };
+        use crate::discovery::caller_registry::{AdmissionState, ModuleInfo, ModuleKey};
+        use crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding;
+        use crate::discovery::instances::InstanceId;
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.semantic = Some(wind_down_lane(WindDownIo::nonempty_completing()));
+        let domain = install_promotion_for_wind_down(&mut driver);
+        // Admit one instance with an open operation before the
+        // terminal sequence: mapping, binding, registration, then a
+        // current Init call.
+        let caller = CallerId(9);
+        let image = ImageIdentity {
+            task_cookie: 41,
+            exec_id: 42,
+        };
+        let pid = std::process::id();
+        let module = ModuleKey::physical(8, 1, 100, Some("sha-100".into()), "/lib/x.so");
+        driver.coordinator.registry_mut().note_mapping(
+            caller,
+            pid,
+            ModuleInfo {
+                path: "/lib/x.so".into(),
+                key: module.clone(),
+                double_loaded: false,
+                build_id: None,
+                identity_source: Some("twin".into()),
+                admission: AdmissionState::Admitted,
+                admission_class: Some("exact".into()),
+                admission_endpoints: Some(1),
+                admission_reasons: Vec::new(),
+            },
+            60,
+        );
+        driver.coordinator.registry_mut().publish();
+        let pin = std::sync::Arc::new(PidPin::test_proc_only(pid));
+        driver
+            .coordinator
+            .semantic_bindings_mut()
+            .insert_for_test(SemanticCallerBinding::scripted(
+                caller,
+                module.clone(),
+                domain,
+                image,
+                pin,
+            ))
+            .expect("open-operation caller binds");
+        let key = instance_key(domain, image, InstanceId::from_raw(1), module);
+        driver
+            .coordinator
+            .registry_mut()
+            .note_instance(instance_registration(key.clone(), caller, 100, None));
+        driver.coordinator.registry_mut().publish();
+        let facts = crate::semantics_edge::SemanticCall {
+            function: "C_SignInit".into(),
+            session: 7,
+            mechanism: 0x000d,
+            capture: p11scope_ebpf_common::capture::MECHANISM_VALUE
+                | p11scope_ebpf_common::capture::OUTPUT_NON_NULL,
+            ts_ns: 110,
+            ..Default::default()
+        };
+        driver
+            .coordinator
+            .registry_mut()
+            .observe_instance_semantic(instance_call(
+                key,
+                caller,
+                instance_position(domain, 1),
+                facts,
+                None,
+            ));
+        driver.coordinator.registry_mut().publish();
+        let (lossy, started, completed, unknown, state) = {
+            let registry = driver.coordinator.registry();
+            let edge = registry
+                .instance_semantic_edges()
+                .next()
+                .expect("one admitted edge");
+            let semantics = edge.semantics.as_ref().expect("open operation reduces");
+            (
+                edge.lossy,
+                semantics.started(),
+                semantics.completed(),
+                semantics.unknown(),
+                registry.instances().next().expect("one instance").state,
+            )
+        };
+        assert!(
+            !lossy && started == 1 && completed == 0 && unknown == 0,
+            "the operation opens clean: lossy={lossy} started={started} completed={completed} unknown={unknown}"
+        );
+        assert_eq!(state, InstanceLifecycle::Observed);
+        // The terminal sequence: the Finish fails, then physical
+        // uncertainty refuses its cut and ends the domain.
+        FAIL_TERMINAL_PUBLICATION.with(|fail| fail.set(true));
+        driver.wind_down_installed_promotion(PromotionEnd::Cancelled);
+        assert!(
+            driver.semantic.is_some() && driver.semantic_staged,
+            "the failed Finish stays staged behind its lane"
+        );
+        driver.coordinator.reference_prove_image(domain, image);
+        driver.coordinator.reference_mark_tail(caller);
+        driver.semantic.as_mut().expect("lane").fail_cut_once();
+        driver
+            .semantic
+            .as_mut()
+            .expect("lane")
+            .age_staged_for_test(Instant::now() - Duration::from_secs(5));
+        driver.wind_down_installed_promotion(PromotionEnd::Cancelled);
+        assert!(
+            driver.semantic.is_none(),
+            "terminal loss disposes: the lane releases despite the refused cut"
+        );
+        let subjects: Vec<String> = gaps(&mut driver)
+            .iter()
+            .map(|(subject, _)| subject.clone())
+            .collect();
+        assert!(
+            subjects
+                .iter()
+                .any(|subject| subject == "semantic batch refused for an ended domain"),
+            "the nonempty Finish refuses through the audited path: {subjects:?}"
+        );
+        // The refused Stopped still terminates existing claims: the
+        // open operation ends unknown while the namespace still stands.
+        let (lossy, stopped, started, completed, unknown, state) = {
+            let registry = driver.coordinator.registry();
+            let edge = registry
+                .instance_semantic_edges()
+                .next()
+                .expect("one admitted edge");
+            let semantics = edge.semantics.as_ref().expect("reduced operation stands");
+            (
+                edge.lossy,
+                edge.reasons.contains(&InstanceReason::CaptureStopped),
+                semantics.started(),
+                semantics.completed(),
+                semantics.unknown(),
+                registry.instances().next().expect("one instance").state,
+            )
+        };
+        assert!(
+            lossy && stopped,
+            "the refused Finish publishes its Stopped negative: lossy={lossy} stopped={stopped}"
+        );
+        assert!(
+            started == 1 && completed == 0 && unknown == 1,
+            "the open operation ends unknown, never silently completed: started={started} completed={completed} unknown={unknown}"
+        );
+        assert_eq!(
+            state,
+            InstanceLifecycle::Uncertain,
+            "the claim is unknown before its namespace disposes"
+        );
+        // The retire then disposes the refused shadow without
+        // restoring positives — over claims already unknown.
+        driver.completion_source = Some(Box::new(StubCompletionSource(Some(
+            SessionNativeCompletion::scripted(domain),
+        ))));
+        driver.on_tick();
+        assert_eq!(
+            driver.retiring_domain(),
+            None,
+            "the refused shadow retires instead of stranding"
+        );
+        let (lossy, unknown, state) = {
+            let registry = driver.coordinator.registry();
+            let edge = registry
+                .instance_semantic_edges()
+                .next()
+                .expect("one admitted edge");
+            (
+                edge.lossy,
+                edge.semantics
+                    .as_ref()
+                    .expect("reduced operation stands")
+                    .unknown(),
+                registry.instances().next().expect("one instance").state,
+            )
+        };
+        assert!(
+            lossy && unknown == 1 && state == InstanceLifecycle::Uncertain,
+            "disposal never revives terminated claims: lossy={lossy} unknown={unknown} state={}",
+            state.label()
+        );
+    }
+
+    #[test]
     fn wind_down_bounds_native_cleanup_on_cancel() {
         let mut coordinator = coordinator();
         let headless = headless_display();

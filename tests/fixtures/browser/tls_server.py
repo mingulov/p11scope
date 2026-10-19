@@ -42,17 +42,18 @@ def client_hello_status(buf: bytes) -> str:
     ``"need_more"`` (consistent so far, more bytes needed), ``"non_tls"``
     (the first byte is not a handshake record), or ``"not_hello"`` (a
     complete first record that is not a ClientHello, or a zero-length
-    record). A handshake fragmented across records is followed; only the
-    first handshake message must be a ClientHello.
+    record). A handshake fragmented across records is followed,
+    including a 4-byte handshake header split across records (OpenSSL
+    accepts it); only the first handshake message must be a ClientHello.
     """
     if not buf:
         return "need_more"
     if buf[0] != TLS_HANDSHAKE_FIRST_BYTE:
         return "non_tls"
     offset = 0
-    first = True
-    need = 0
+    need: int | None = None
     have = 0
+    header = b""
     while True:
         if len(buf) < offset + 5:
             return "need_more"
@@ -64,35 +65,41 @@ def client_hello_status(buf: bytes) -> str:
         if len(buf) < offset + 5 + rec_len:
             return "need_more"
         payload = buf[offset + 5:offset + 5 + rec_len]
-        if first:
-            if len(payload) < 4 or payload[0] != 0x01:  # handshake type client_hello
+        if need is None:
+            header += payload
+            if len(header) < 4:
+                offset += 5 + rec_len
+                continue
+            if header[0] != 0x01:  # handshake type client_hello
                 return "not_hello"
-            need = int.from_bytes(payload[1:4], "big")
+            need = int.from_bytes(header[1:4], "big")
             if need == 0:
                 return "not_hello"
-            have = len(payload) - 4
-            first = False
+            have = len(header) - 4
         else:
             have += len(payload)
         offset += 5 + rec_len
-        if have >= need:
+        if need is not None and have >= need:
             return "complete"
 
 
-def classify_handshake_error(exc: BaseException) -> str:
+def classify_handshake_error(exc: BaseException, *, cert_request_seen: bool = False) -> str:
     """Bucket a failed server-side ``wrap_socket`` into an outcome.
 
     Returns ``"empty_cert"`` (the client completed the handshake with an
     empty certificate: selection reached, nothing offered), ``"cert_alert"``
     (the client refused with certificate_unknown: ambiguous between a
     selection refusal and a server-cert rejection, so tolerated but never
-    a witness), ``"stall"`` (a peer that sent a complete ClientHello never
-    finished: stuck at selection, after the server's CertificateRequest
-    flight), ``"abandoned"`` (the peer went away mid-handshake: EOF or
-    reset, carrying no selection information), or ``"failure"`` (an
-    unrelated protocol failure: garbage, version/decipher errors, or any
-    other alert). Only called after a complete ClientHello: peek-phase
-    timeouts are abandoned, never stalls.
+    a witness), ``"stall"`` (a peer that sent a complete ClientHello and
+    saw the server's outbound CertificateRequest never finished: stuck
+    at selection), ``"abandoned"`` (the peer went away mid-handshake: EOF,
+    reset, silence, or a timeout before CertificateRequest, carrying no
+    selection information), or ``"failure"`` (an unrelated protocol
+    failure: garbage, version/decipher errors, or any other alert). Only
+    called after a complete ClientHello: peek-phase timeouts are
+    abandoned, never stalls, as are post-hello timeouts without
+    affirmative CertificateRequest progress on the same connection
+    (for example HelloRetryRequest waiting for ClientHello2).
     """
     upper = f"{type(exc).__name__}: {exc}".upper()
     if "PEER_DID_NOT_RETURN_A_CERTIFICATE" in upper or "PEER DID NOT RETURN A CERTIFICATE" in upper:
@@ -102,7 +109,7 @@ def classify_handshake_error(exc: BaseException) -> str:
     if "ALERT" in upper:
         return "failure"
     if isinstance(exc, TimeoutError):
-        return "stall"
+        return "stall" if cert_request_seen else "abandoned"
     if isinstance(exc, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)):
         return "abandoned"
     if "EOF" in upper:
@@ -144,14 +151,18 @@ class FlowServer:
     ``spoke_tls`` (peers whose first byte opened a handshake record:
     diagnostic only, never a witness), ``client_hello_complete`` (peers
     that buffered a complete ClientHello: selection could begin),
+    ``cert_requests_sent`` (connections where the server's outbound
+    CertificateRequest flight was observed: selection began),
     ``handshakes_ok`` (completed handshakes), ``client_certs_presented``
     (peer cert seen at handshake time, independent of requests),
     ``empty_certs`` (full handshake with an empty client certificate),
-    ``selection_stalls`` (complete-hello peers that never finished: stuck
-    at selection), ``client_cert_alerts`` (certificate_unknown refusals:
-    tolerated, never a witness), ``abandoned`` (peers that went away
-    without selection information: EOF, reset, silence, or an incomplete
-    ClientHello), ``handshake_failures`` with the first
+    ``selection_stalls`` (peers that saw CertificateRequest and never
+    finished: stuck at selection), ``client_cert_alerts``
+    (certificate_unknown refusals: tolerated, never a witness),
+    ``abandoned`` (peers that went away without selection information:
+    EOF, reset, silence, an incomplete ClientHello, or a timeout before
+    CertificateRequest such as HelloRetryRequest waiting for
+    ClientHello2), ``handshake_failures`` with the first
     ``handshake_errors`` (unrelated protocol failures).
     """
 
@@ -166,6 +177,7 @@ class FlowServer:
     handshakes_ok: int = 0
     spoke_tls: int = 0
     client_hello_complete: int = 0
+    cert_requests_sent: int = 0
     empty_certs: int = 0
     selection_stalls: int = 0
     client_cert_alerts: int = 0
@@ -258,6 +270,32 @@ class FlowServer:
             except Exception as exc:
                 raise TLSError(f"TLS setup failed: {exc}") from exc
 
+        # Per-connection CertificateRequest witness: TLS 1.3 can answer a
+        # complete ClientHello with HelloRetryRequest and wait for
+        # ClientHello2 without ever sending CertificateRequest (RFC 8446
+        # Fig.2). A timeout proves selection only when this connection
+        # observed an outbound CertificateRequest. The message callback
+        # runs synchronously inside the wrapping thread, so thread-local
+        # state ties the witness to its connection.
+        tls_progress: threading.local = threading.local()
+
+        def _note_tls_message(conn, direction, version, content_type, msg_type, data):
+            try:
+                if (str(direction) == "write"
+                        and int(content_type) == 22
+                        and int(msg_type) == 13):
+                    tls_progress.cert_request_seen = True
+            except Exception:
+                pass
+
+        if context is not None:
+            try:
+                context._msg_callback = _note_tls_message  # noqa: SLF001 - ground-truth hook
+            except Exception:
+                # No callback support: fail closed (timeouts never
+                # become stalls without affirmative proof).
+                pass
+
         # Plain listener, TLS per connection: accept() itself never blocks
         # on handshake bytes, and a stalled peer fails one connection, not
         # the acceptor. Threaded so one slow flow cannot stall another.
@@ -327,17 +365,25 @@ class FlowServer:
                     conn.close()
                     raise TimeoutError("TLS handshake deadline exhausted after the ClientHello")
                 conn.settimeout(remaining)
+                tls_progress.cert_request_seen = False
                 try:
                     tls_conn = context.wrap_socket(conn, server_side=True)
                 except (OSError, ValueError) as exc:
-                    # Only reached after a complete ClientHello, so a
-                    # timeout here means the peer went silent after the
-                    # server's CertificateRequest flight: selection began.
+                    # Only reached after a complete ClientHello. A timeout
+                    # is a selection stall only when this connection
+                    # observed its outbound CertificateRequest; without
+                    # that (for example HRR waiting for ClientHello2) it
+                    # is pre-selection abandonment.
+                    cert_seen = bool(getattr(tls_progress, "cert_request_seen", False))
+                    if cert_seen:
+                        server.cert_requests_sent += 1
                     server.note_handshake(
-                        classify_handshake_error(exc),
+                        classify_handshake_error(exc, cert_request_seen=cert_seen),
                         f"{type(exc).__name__}: {exc}"[:160])
                     conn.close()
                     raise
+                if bool(getattr(tls_progress, "cert_request_seen", False)):
+                    server.cert_requests_sent += 1
                 tls_conn.settimeout(None)
                 server.note_handshake_ok(tls_conn)
                 return tls_conn, client_address

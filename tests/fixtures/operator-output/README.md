@@ -250,6 +250,17 @@ Rust test binary/source and arrival hashes, hold the authorized host lane, and
 use disk TMPDIR. A compiled test and the failed installed attempt do not qualify
 the intended cell.
 
+The bounded system wrap pair (cell 3) reuses the same schedule, fixture seam
+and pinned A/B expectations under unfiltered system capture through
+`inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_system_diagnostics_wrap_and_primary_parity_lp64`,
+registered as a long cell in `scripts/run-privileged-lib-tests.sh`. Its export
+validator requires a system header with an explicit null PID filter, owned-only
+rows, and terminal pairs bound to the live-observed owned caller; its primary
+validator admits the owned caller exactly once and rejects any foreign edge on
+an owned module. Foreign-only presence is allowed, but any foreign diagnostic
+record fails the cell, so run it on a quiet host. The same paired off/on
+parity (one validated disposition, exact owned facts) applies.
+
 Each disabled/enabled run issues exactly400counted rounds,258shared rounds,
 then one fence and one proof round, each32per-slot calls. Native ACKs and an
 independent per-slot ledger bind all21120calls. Each next counted round waits

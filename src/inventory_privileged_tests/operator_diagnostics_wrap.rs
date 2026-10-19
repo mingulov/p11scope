@@ -856,6 +856,22 @@ fn check_wrap_records(
     Ok(())
 }
 
+/// Validate a bounded-system wrap export (cell 3): header `scope:
+/// "system"` with an explicit null PID filter, every pid-bearing row
+/// owned, and the terminal pairs bound to the live-observed owned
+/// caller. Otherwise the full PID wrap contract applies unchanged.
+/// STUB: always fails until the system export validator lands.
+fn check_wrap_records_system(
+    records: &[serde_json::Value],
+    bytes: u64,
+    b_module: &serde_json::Value,
+    owned_pid: u32,
+    owned_caller: &str,
+) -> Result<()> {
+    let _ = (records, bytes, b_module, owned_pid, owned_caller);
+    bail!("wrap-scope stub: system export validator not implemented")
+}
+
 fn time_shape(value: &serde_json::Value, field: &str) -> Result<bool> {
     let stamp = value
         .get(field)
@@ -1016,6 +1032,20 @@ fn primary_facts(document: &serde_json::Value, pid: u32, k: u64) -> Result<serde
     )
 }
 
+/// Extract owned primary facts from a bounded-system capture (cell 3):
+/// the owned caller exactly once with the pinned A/B edges, and no
+/// foreign caller borrowing an owned module. Foreign-only activity is
+/// system-capture honesty, never owned evidence.
+/// STUB: always fails until the system primary validator lands.
+fn primary_facts_system(
+    document: &serde_json::Value,
+    owned_pid: u32,
+    k: u64,
+) -> Result<serde_json::Value> {
+    let _ = (document, owned_pid, k);
+    bail!("wrap-scope stub: system primary validator not implemented")
+}
+
 /// Post-run exact gap verification on the complete event stream (the
 /// pre-`ended` flush makes repeats exact): startup `(1,2]` repeats must
 /// equal the live-validated `k`, both sharers' ambiguity disclosures must
@@ -1047,6 +1077,59 @@ fn verify_final_gaps(
         "G21_WRAP_GAPS caller={caller} k={k} startup={startup} ambiguity={expected} fence={fence}"
     );
     Ok(())
+}
+
+/// G21 wrap cell shape: the PID wrap pair (cell 2) filters diagnostics
+/// to the owned workload; the bounded system wrap pair (cell 3) captures
+/// system-wide without a diagnostics PID filter, and the validators scope
+/// every owned-population check to the owned caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WrapCell {
+    Pid,
+    System,
+}
+
+/// Validated wrap capture scope: a PID leg always carries the owned PID
+/// as its diagnostics filter; a system leg is always unfiltered
+/// (`pid_filter: None`, header `scope: "system"`, `pid_filter: null`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WrapScope {
+    Pid { pid: u32 },
+    System { owned_pid: u32 },
+}
+
+impl WrapScope {
+    /// Select the validated wrap scope for one capture leg. The owned
+    /// workload PID anchors both shapes: a PID leg must filter to exactly
+    /// it, and a system leg must carry no filter at all. Anything else —
+    /// a PID-shaped filter on a system leg, a missing/mismatched filter
+    /// on a PID leg, or a zero owner — is refused, never normalized.
+    /// STUB: always fails until the system-wrap selector lands.
+    fn select(scope: InspectScope, pid_filter: Option<u32>, owned_pid: u32) -> Result<Self> {
+        let _ = (scope, pid_filter, owned_pid);
+        bail!("wrap-scope stub: selector not implemented")
+    }
+
+    fn owned_pid(&self) -> u32 {
+        match *self {
+            WrapScope::Pid { pid } => pid,
+            WrapScope::System { owned_pid } => owned_pid,
+        }
+    }
+}
+
+impl WrapCell {
+    /// Resolve this cell to its validated capture scope for the owned
+    /// workload PID. The PID cell filters diagnostics to the owner; the
+    /// system cell captures unfiltered.
+    fn scope(&self, owned_pid: u32) -> Result<WrapScope> {
+        match self {
+            WrapCell::Pid => {
+                WrapScope::select(InspectScope::Pid(owned_pid), Some(owned_pid), owned_pid)
+            }
+            WrapCell::System => WrapScope::select(InspectScope::System, None, owned_pid),
+        }
+    }
 }
 
 fn run_wrap(enabled: bool) -> Result<(serde_json::Value, u64)> {
@@ -3084,5 +3167,310 @@ fn operator_diagnostics_wrap_twin_wrap_prebuilt_copies_35_files() -> Result<()> 
     std::fs::remove_file(source.path().join(&files[0]))?;
     ensure!(copy_wrap_prebuilt(source.path(), tempfile::tempdir()?.path()).is_err());
     ensure!(copy_wrap_prebuilt(Path::new("relative"), destination.path()).is_err());
+    Ok(())
+}
+
+/// Twin helper: the PID validator export re-headed to `scope: "system"`
+/// with an explicit null filter, every non-health row stamped with the
+/// owned PID and caller, and the footer resealed. Production stamps
+/// caller identity (with the adapter PID) on every non-health record and
+/// leaves global health rows pid-less.
+fn diagnostic_validator_fixture_system(
+    owned_pid: u32,
+    caller: &str,
+) -> (Vec<serde_json::Value>, u64) {
+    let (mut records, _) = diagnostic_validator_fixture();
+    let last = records.len() - 1;
+    records[0]["scope"] = serde_json::json!("system");
+    records[0]["pid_filter"] = serde_json::Value::Null;
+    for row in records.iter_mut().take(last).skip(1) {
+        if row["kind"] == "capture_health" {
+            row.as_object_mut().unwrap().remove("pid");
+        } else {
+            row["pid"] = serde_json::json!(owned_pid);
+            row["caller"] = serde_json::json!(caller);
+        }
+    }
+    let bytes = seal_validator_fixture(&mut records);
+    (records, bytes)
+}
+
+/// Twin helper: indexes of the placed terminal-proof publications.
+fn twin_system_proof_positions(records: &[serde_json::Value]) -> Vec<usize> {
+    records
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row["kind"] == "publication" && row["decision"] == "placed")
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// Twin helper: the PID primary document plus one idle foreign caller
+/// with a foreign-only module and edge. System capture honestly
+/// observes the machine; foreign-only activity must not disturb the
+/// owned population or borrow owned modules.
+fn primary_validator_fixture_system(owned_pid: u32, shift: u64, k: u64) -> serde_json::Value {
+    use crate::discovery::caller_registry::{CallerId, ModuleId};
+    let mut document = primary_validator_fixture_k(owned_pid, shift, k);
+    let caller = CallerId(shift as u32 + 100);
+    let module = ModuleId(shift as u32 + 101);
+    document["callers"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "id": caller.label(), "pid": 999, "lifecycle": "mapped",
+            "retired": false, "lifecycle_reason": null,
+        }));
+    document["modules"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "id": module.label(), "paths": ["/foreign/other.so"],
+            "lifecycle": "mapped", "unloaded_observed": false,
+        }));
+    document["edges"]
+        .as_array_mut()
+        .unwrap()
+        .push(fixture_edge_json(caller, module, shift + 700, false));
+    document
+}
+
+#[test]
+fn operator_diagnostics_wrap_twin_system_scope_pid_pass() -> Result<()> {
+    // The PID cell filters diagnostics to exactly the owned workload.
+    ensure!(
+        WrapScope::select(InspectScope::Pid(123), Some(123), 123)? == WrapScope::Pid { pid: 123 }
+    );
+    ensure!(WrapCell::Pid.scope(123)? == WrapScope::Pid { pid: 123 });
+    ensure!(WrapScope::Pid { pid: 123 }.owned_pid() == 123);
+    Ok(())
+}
+
+#[test]
+fn operator_diagnostics_wrap_twin_system_scope_system_pass() -> Result<()> {
+    // The system cell captures unfiltered and anchors on the owned PID.
+    let scope = WrapScope::select(InspectScope::System, None, 123)?;
+    ensure!(scope == WrapScope::System { owned_pid: 123 });
+    ensure!(scope.owned_pid() == 123);
+    ensure!(WrapCell::System.scope(123)? == WrapScope::System { owned_pid: 123 });
+    Ok(())
+}
+
+#[test]
+fn operator_diagnostics_wrap_twin_system_scope_rejects_pid_shaped_input() -> Result<()> {
+    // A system leg must never carry a PID filter, and a PID scope never
+    // validates as a system scope.
+    ensure!(WrapScope::select(InspectScope::System, Some(123), 123).is_err());
+    ensure!(WrapScope::select(InspectScope::System, Some(456), 123).is_err());
+    ensure!(
+        WrapScope::select(InspectScope::Pid(123), Some(123), 123)?
+            != WrapScope::System { owned_pid: 123 }
+    );
+    Ok(())
+}
+
+#[test]
+fn operator_diagnostics_wrap_twin_system_scope_rejects_mismatched_filter() -> Result<()> {
+    // A PID leg needs its exact filter; a zero owner is no process.
+    ensure!(WrapScope::select(InspectScope::Pid(123), None, 123).is_err());
+    ensure!(WrapScope::select(InspectScope::Pid(123), Some(456), 123).is_err());
+    ensure!(WrapScope::select(InspectScope::Pid(123), Some(123), 456).is_err());
+    ensure!(WrapScope::select(InspectScope::System, None, 0).is_err());
+    ensure!(WrapScope::select(InspectScope::Pid(0), Some(0), 0).is_err());
+    Ok(())
+}
+
+#[test]
+fn operator_diagnostics_wrap_twin_system_export_pass() -> Result<()> {
+    // The healthy system export validates: system header, explicit null
+    // filter, owned rows, terminal pairs on the owned caller, both rings
+    // wrapped.
+    let (records, bytes) = diagnostic_validator_fixture_system(123, "c0");
+    ensure!(twin_system_proof_positions(&records).len() == 32);
+    check_wrap_records_system(&records, bytes, &serde_json::json!("mB"), 123, "c0")?;
+    Ok(())
+}
+
+#[test]
+fn operator_diagnostics_wrap_twin_system_export_rejects_pid_shaped_header() -> Result<()> {
+    // A PID-shaped header never validates as a system export: neither
+    // scope pid, nor any present filter, nor a missing filter key, nor a
+    // non-native mode.
+    let (mut pid_scope, _) = diagnostic_validator_fixture_system(123, "c0");
+    pid_scope[0]["scope"] = serde_json::json!("pid");
+    pid_scope[0]["pid_filter"] = serde_json::json!(123);
+    let bytes = seal_validator_fixture(&mut pid_scope);
+    ensure!(
+        check_wrap_records_system(&pid_scope, bytes, &serde_json::json!("mB"), 123, "c0").is_err()
+    );
+    let (mut filtered, _) = diagnostic_validator_fixture_system(123, "c0");
+    filtered[0]["pid_filter"] = serde_json::json!(123);
+    let bytes = seal_validator_fixture(&mut filtered);
+    ensure!(
+        check_wrap_records_system(&filtered, bytes, &serde_json::json!("mB"), 123, "c0").is_err()
+    );
+    let (mut missing, _) = diagnostic_validator_fixture_system(123, "c0");
+    missing[0].as_object_mut().unwrap().remove("pid_filter");
+    let bytes = seal_validator_fixture(&mut missing);
+    ensure!(
+        check_wrap_records_system(&missing, bytes, &serde_json::json!("mB"), 123, "c0").is_err()
+    );
+    let (mut mode, _) = diagnostic_validator_fixture_system(123, "c0");
+    mode[0]["mode"] = serde_json::json!("auto");
+    let bytes = seal_validator_fixture(&mut mode);
+    ensure!(check_wrap_records_system(&mode, bytes, &serde_json::json!("mB"), 123, "c0").is_err());
+    Ok(())
+}
+
+#[test]
+fn operator_diagnostics_wrap_twin_system_export_rejects_foreign_pid() -> Result<()> {
+    // Owned-caller validation: any pid-bearing row outside the owned PID
+    // fails — on ordinary rows and on terminal proofs alike — as does a
+    // missing PID on a non-health row or a PID on the global health row.
+    let module = serde_json::json!("mB");
+    let (records, _) = diagnostic_validator_fixture_system(123, "c0");
+    let proofs = twin_system_proof_positions(&records);
+    ensure!(proofs.len() == 32);
+    let mut foreign_row = records.clone();
+    foreign_row[1]["pid"] = serde_json::json!(999);
+    let bytes = seal_validator_fixture(&mut foreign_row);
+    ensure!(check_wrap_records_system(&foreign_row, bytes, &module, 123, "c0").is_err());
+    let mut foreign_proof = records.clone();
+    foreign_proof[proofs[0]]["pid"] = serde_json::json!(999);
+    let bytes = seal_validator_fixture(&mut foreign_proof);
+    ensure!(check_wrap_records_system(&foreign_proof, bytes, &module, 123, "c0").is_err());
+    let mut missing_pid = records.clone();
+    missing_pid[1].as_object_mut().unwrap().remove("pid");
+    let bytes = seal_validator_fixture(&mut missing_pid);
+    ensure!(check_wrap_records_system(&missing_pid, bytes, &module, 123, "c0").is_err());
+    let health = records
+        .iter()
+        .position(|row| row["kind"] == "capture_health")
+        .context("health row")?;
+    let mut health_pid = records.clone();
+    health_pid[health]["pid"] = serde_json::json!(123);
+    let bytes = seal_validator_fixture(&mut health_pid);
+    ensure!(check_wrap_records_system(&health_pid, bytes, &module, 123, "c0").is_err());
+    Ok(())
+}
+
+#[test]
+fn operator_diagnostics_wrap_twin_system_export_rejects_foreign_caller() -> Result<()> {
+    // Terminal proofs must bind the live-observed owned caller id: a
+    // consistently foreign caller fails the owned pin even with the owned
+    // PID, while the matching pin passes the same export.
+    let module = serde_json::json!("mB");
+    let (foreign, bytes) = diagnostic_validator_fixture_system(123, "c9");
+    ensure!(check_wrap_records_system(&foreign, bytes, &module, 123, "c0").is_err());
+    check_wrap_records_system(&foreign, bytes, &module, 123, "c9")?;
+    // A single foreign proof among owned ones fails on consistency too.
+    let (mut mixed, _) = diagnostic_validator_fixture_system(123, "c0");
+    let proofs = twin_system_proof_positions(&mixed);
+    ensure!(proofs.len() == 32);
+    mixed[proofs[0]]["caller"] = serde_json::json!("c9");
+    let bytes = seal_validator_fixture(&mut mixed);
+    ensure!(check_wrap_records_system(&mixed, bytes, &module, 123, "c0").is_err());
+    Ok(())
+}
+
+#[test]
+fn operator_diagnostics_wrap_twin_system_export_requires_wrap_properties() -> Result<()> {
+    // The system validator inherits every fail-closed wrap property:
+    // single-publication proofs, retained references, advancing
+    // recovery windows, and a real both-ring wrap.
+    let module = serde_json::json!("mB");
+    let (records, _) = diagnostic_validator_fixture_system(123, "c0");
+    let proofs = twin_system_proof_positions(&records);
+    ensure!(proofs.len() == 32);
+    for change in [
+        "split_publication",
+        "lost_reference",
+        "stale_window",
+        "one_ring_wrap",
+    ] {
+        let mut altered = records.clone();
+        match change {
+            "split_publication" => {
+                for index in proofs.iter() {
+                    altered[*index]["edge_total"] = serde_json::json!(2);
+                }
+            }
+            "lost_reference" => {
+                altered[proofs[0]]["observation_ref"]["status"] = serde_json::json!("not_retained");
+            }
+            "stale_window" => {
+                altered[proofs[0]]["baseline_post"] = altered[proofs[0]]["pre"].clone();
+            }
+            _ => {
+                let last = altered.len() - 1;
+                altered[last]["kinds"][1]["evicted"] = serde_json::json!(0);
+                altered[last]["kinds"][1]["produced"] = serde_json::json!(1);
+            }
+        }
+        let bytes = seal_validator_fixture(&mut altered);
+        ensure!(
+            check_wrap_records_system(&altered, bytes, &module, 123, "c0").is_err(),
+            "broken wrap property accepted: {change}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn operator_diagnostics_wrap_twin_system_primary_pass() -> Result<()> {
+    // The pinned A/B projections apply unchanged under system capture,
+    // and the owned facts equal the PID validator's on the same
+    // population — foreign-only presence changes nothing.
+    for k in [0, 32] {
+        let facts = primary_facts_system(&primary_validator_fixture_system(123, 0, k), 123, k)?;
+        ensure!(facts["edges"]["provider-A.so"]["count"] == expected_a(COUNTED, k));
+        ensure!(facts["edges"]["provider-B.so"]["count"] == 1);
+        let pid_facts = primary_facts(&primary_validator_fixture_k(123, 0, k), 123, k)?;
+        ensure!(facts == pid_facts);
+    }
+    Ok(())
+}
+
+#[test]
+fn operator_diagnostics_wrap_twin_system_primary_rejects_foreign_caller() -> Result<()> {
+    // Owned-caller validation: a foreign caller borrowing an owned
+    // module fails, as do a missing or duplicated owned caller.
+    let mut borrowed = primary_validator_fixture_system(123, 0, 0);
+    borrowed["edges"][2]["module"] = borrowed["modules"][1]["id"].clone();
+    ensure!(primary_facts_system(&borrowed, 123, 0).is_err());
+    let mut missing = primary_validator_fixture_system(123, 0, 0);
+    missing["callers"].as_array_mut().unwrap().remove(0);
+    ensure!(primary_facts_system(&missing, 123, 0).is_err());
+    let mut duplicated = primary_validator_fixture_system(123, 0, 0);
+    let owned_entry = duplicated["callers"][0].clone();
+    duplicated["callers"]
+        .as_array_mut()
+        .unwrap()
+        .push(owned_entry);
+    ensure!(primary_facts_system(&duplicated, 123, 0).is_err());
+    Ok(())
+}
+
+#[test]
+fn operator_diagnostics_wrap_twin_system_primary_rejects_wrong_counts() -> Result<()> {
+    // The pinned edge projections bind under system capture too.
+    let mut wrong_a = primary_validator_fixture_system(123, 0, 0);
+    wrong_a["edges"][0]["entries"]["count"] = serde_json::json!(399);
+    ensure!(primary_facts_system(&wrong_a, 123, 0).is_err());
+    let mut wrong_b = primary_validator_fixture_system(123, 0, 32);
+    wrong_b["edges"][1]["entries"]["count"] = serde_json::json!(2);
+    ensure!(primary_facts_system(&wrong_b, 123, 32).is_err());
+    Ok(())
+}
+
+#[test]
+fn operator_diagnostics_wrap_twin_system_paired_parity_dispositions() -> Result<()> {
+    // System owned facts flow through the strict paired comparison:
+    // matched legs pass across runs, differing dispositions fail.
+    let off = primary_facts_system(&primary_validator_fixture_system(123, 0, 0), 123, 0)?;
+    let on = primary_facts_system(&primary_validator_fixture_system(456, 500, 0), 456, 0)?;
+    check_paired_parity(&off, 0, &on, 0)?;
+    let fenced = primary_facts_system(&primary_validator_fixture_system(123, 0, 32), 123, 32)?;
+    ensure!(check_paired_parity(&off, 0, &fenced, 32).is_err());
     Ok(())
 }

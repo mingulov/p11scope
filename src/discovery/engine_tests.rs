@@ -35581,7 +35581,10 @@ fn pressure_service_pass_evicts_exploratory_view_to_admit_selected_at_capacity()
             &mut PauseClosure::new(true),
         )
         .expect("the pass keeps the batch alive");
-    assert!(records.is_empty(), "the head waits parked while the pass serves");
+    assert!(
+        records.is_empty(),
+        "the head waits parked while the pass serves"
+    );
     assert_eq!(
         engine.pressure_service_passes, 1,
         "exactly one service pass ran"
@@ -35665,12 +35668,13 @@ fn pressure_service_pass_evicts_exploratory_view_to_admit_selected_at_capacity()
 }
 
 /// Lane-A fail-closed twin: with no evictable view at a full cap, the
-/// service pass rules the viewless selection out without an attempt, evicts
-/// nothing, and leaves every request, serial, view, scan and arm untouched
+/// service pass runs only its refusing probationary probe — the probe scan
+/// counts as the pass's attempt — then rules the viewless selection out,
+/// evicts nothing, and leaves every request, serial, view and arm untouched
 /// while the head waits parked. The capacity fix must preserve this when no
 /// clean victim exists.
 #[test]
-fn pressure_service_pass_without_evictable_view_rules_out_without_attempt() {
+fn pressure_service_pass_without_evictable_view_rules_out_after_refusing_probe() {
     let (mut fixture, mut engine, _armed, _record, mut session) = armed_seed_route(1);
     engine.frame_work_budget_ns = u64::MAX;
     engine.max_scan_pids = 2;
@@ -35723,13 +35727,14 @@ fn pressure_service_pass_without_evictable_view_rules_out_without_attempt() {
         )
         .expect("the ruled-out pass keeps the batch alive");
     assert!(records.is_empty(), "the head waits parked");
+    assert_eq!(engine.pressure_service_passes, 1, "one pass ran");
     assert_eq!(
-        engine.pressure_service_passes, 1,
-        "one pass ran"
+        engine.pressure_attempts, 1,
+        "the refusing probe scan is the pass's attempt"
     );
     assert_eq!(
-        engine.pressure_attempts, 0,
-        "no attempt without a victim"
+        engine.probationary_completions, 0,
+        "a provider found never completes viewlessly"
     );
     assert_eq!(engine.exploratory_evictions, 0, "nothing evicted");
     assert_eq!(engine.views.len(), 2, "no view admitted, none removed");
@@ -35751,7 +35756,11 @@ fn pressure_service_pass_without_evictable_view_rules_out_without_attempt() {
             .is_some_and(|episode| episode.ruled_out.contains(&selected)),
         "the unserviceable selection is ruled out"
     );
-    assert_eq!(engine.deep_scans, scans_before, "no scan ran");
+    assert_eq!(
+        engine.deep_scans,
+        scans_before + 1,
+        "exactly the refusing probe scanned"
+    );
     assert_eq!(engine.loader_arms(), arms_before, "no arm ran");
     assert_eq!(
         engine.pending_discovery_records.len(),
@@ -35759,17 +35768,14 @@ fn pressure_service_pass_without_evictable_view_rules_out_without_attempt() {
         "the head re-parks"
     );
     assert!(engine.pressure_rotation_pending, "rotation continues");
-    assert_eq!(
-        engine.discovery_truncated, 0,
-        "ruled out is not refused"
-    );
+    assert_eq!(engine.discovery_truncated, 0, "ruled out is not refused");
     let _ = sleeper.kill();
     let _ = sleeper.wait();
 }
 
 /// Lane-A shield twin: the classifier alone would evict the parked head's
 /// exploratory view, but the parked-prefix shield forbids it, so a pass with
-/// no other victim rules out without an attempt and evicts nothing.
+/// no other victim runs only its refusing probe and evicts nothing.
 #[test]
 fn pressure_service_pass_never_evicts_parked_head_view() {
     let (mut fixture, mut engine, _armed, _record, mut session) = armed_seed_route(1);
@@ -35828,8 +35834,12 @@ fn pressure_service_pass_never_evicts_parked_head_view() {
         "the matched head parked and ran one pass"
     );
     assert_eq!(
-        engine.pressure_attempts, 0,
-        "the shielded victim blocks the attempt"
+        engine.pressure_attempts, 1,
+        "the shield blocks eviction; the refusing probe is the attempt"
+    );
+    assert_eq!(
+        engine.probationary_completions, 0,
+        "a provider found never completes viewlessly"
     );
     assert_eq!(
         engine.exploratory_evictions, 0,
@@ -35854,10 +35864,7 @@ fn pressure_service_pass_never_evicts_parked_head_view() {
         1,
         "the head re-parks"
     );
-    assert_eq!(
-        engine.discovery_truncated, 0,
-        "ruled out is not refused"
-    );
+    assert_eq!(engine.discovery_truncated, 0, "ruled out is not refused");
     let _ = headpeer.kill();
     let _ = headpeer.wait();
 }
@@ -35914,11 +35921,12 @@ fn probationary_probe_completes_provider_free_newcomer_at_capacity() {
         engine.deep_scans > scans_before,
         "the probationary scan is charged"
     );
-    assert_eq!(engine.exploratory_evictions, 0, "nothing evicted");
     assert_eq!(
-        engine.discovery_truncated, 0,
-        "completion is not loss"
+        engine.probationary_completions, 1,
+        "exactly one viewless completion"
     );
+    assert_eq!(engine.exploratory_evictions, 0, "nothing evicted");
+    assert_eq!(engine.discovery_truncated, 0, "completion is not loss");
     let _ = head.kill();
     let _ = head.wait();
 }
@@ -35958,11 +35966,61 @@ fn probationary_probe_keeps_provider_bearing_newcomer_queued_at_capacity() {
         engine.deep_scans > scans_before,
         "the probe ran and found the provider"
     );
-    assert_eq!(engine.views.len(), 2, "no view admitted, none removed");
     assert_eq!(
-        engine.discovery_truncated, 0,
-        "queued is not loss"
+        engine.probationary_completions, 0,
+        "a provider found never completes viewlessly"
     );
+    assert_eq!(engine.views.len(), 2, "no view admitted, none removed");
+    assert_eq!(engine.discovery_truncated, 0, "queued is not loss");
+}
+
+/// Lane-A P3, cancellation twin: a refused scan proves nothing. With an
+/// expired budget the probationary probe runs, refuses, and the pending
+/// provider-free newcomer stays queued for relief. Fail-closed under
+/// cancellation: only a complete scan completes viewlessly.
+#[test]
+fn probationary_probe_refuses_without_a_complete_scan() {
+    let (mut fixture, mut engine, _armed, _record, _session) = armed_seed_route(1);
+    engine.frame_work_budget_ns = u64::MAX;
+    engine.max_scan_pids = 2;
+    // Dirty-state surgery for the cap filler (see the fail-closed twin).
+    let filler = fixture.spawn_peer();
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(1), filler).unwrap());
+    engine.next_view_id = 2;
+    engine.exploratory_dirty.insert(ProcessViewId(1));
+    let seed_pid = engine.views[0].pid();
+    let mut head = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("spawn provider-free newcomer");
+    let head_pid = head.id();
+    let dir = tempfile::tempdir().expect("a scope directory");
+    let listing = format!("{seed_pid}\n{filler}\n{head_pid}\n");
+    std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
+    engine.scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
+    engine.module_hints = vec![fixture._dir.path().join("seed-provider.so")];
+    assert_eq!(engine.views.len(), engine.max_scan_pids);
+    engine.budget.set_deadline(Some(0));
+    assert!(engine.request_refresh_consumed(head_pid, Some(1_200)));
+    let scans_before = engine.deep_scans;
+    refresh_inventory_once(&mut engine);
+    assert!(
+        engine.refresh_requested.contains_key(&head_pid),
+        "a refused probe retains the request"
+    );
+    assert!(
+        engine.deep_scans > scans_before,
+        "the probe ran and refused"
+    );
+    assert_eq!(
+        engine.probationary_completions, 0,
+        "refusal never completes viewlessly"
+    );
+    assert_eq!(engine.views.len(), 2, "no view admitted, none removed");
+    let _ = head.kill();
+    let _ = head.wait();
 }
 
 /// H5 zero-quantum: a service pass that cannot attempt any scan defers

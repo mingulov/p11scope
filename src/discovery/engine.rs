@@ -569,6 +569,10 @@ pub struct Engine {
     loader_arms: u64,
     /// Cumulative exploratory views evicted by rotation.
     exploratory_evictions: u64,
+    /// Cumulative pending newcomers completed without a view by the
+    /// probationary probe (Lane-A P3): provider-freedom proven by a
+    /// generation-pinned scan, no slot consumed, nothing fabricated.
+    probationary_completions: u64,
     #[cfg(test)]
     loader_memory_scan_attempts: usize,
     #[cfg(test)]
@@ -8535,6 +8539,7 @@ impl Engine {
             deep_scans: 0,
             loader_arms: 0,
             exploratory_evictions: 0,
+            probationary_completions: 0,
             #[cfg(test)]
             loader_memory_scan_attempts: 0,
             #[cfg(test)]
@@ -9877,6 +9882,30 @@ impl Engine {
             .checked_add(1)
             .ok_or_else(|| anyhow!("process view ID space exhausted"))?;
         Ok(id)
+    }
+
+    /// Allocates a view ID for a newcomer admission, making room for a
+    /// pressure-selected pid when the capture sits at view capacity
+    /// (Lane-A P1). A selected transaction serves only its selected pid:
+    /// when no ID is free it evicts exactly one guarded exploratory view
+    /// and retries once. Ordinary ticks never evict here; without a victim
+    /// the request defers exactly as before (fail-closed).
+    fn allocate_view_id_for_newcomer(&mut self, pid: u32) -> Result<ProcessViewId> {
+        match self.allocate_view_id() {
+            Ok(id) => Ok(id),
+            Err(error) => {
+                if !self
+                    .pressure_selected
+                    .is_some_and(|selected| selected.pid == pid)
+                {
+                    return Err(error);
+                }
+                if !self.evict_one_exploratory_for_selected(pid) {
+                    return Err(error);
+                }
+                self.allocate_view_id()
+            }
+        }
     }
 
     fn release_view_id(&mut self, id: ProcessViewId) {
@@ -19056,6 +19085,40 @@ impl Engine {
         );
     }
 
+    /// The lowest-pid exploratory view available to a newcomer admission
+    /// for `selected` (Lane-A): evictable by the classifier — no evidence,
+    /// no contexts, no claims, no queued work and in particular no pending
+    /// refresh — outside the parked-prefix shield, and neither the
+    /// newcomer's pid nor its request owner's view. Under block-all
+    /// protection the shield covers every pid, so no victim exists. The
+    /// selected transaction evicts it (P1); the probationary probe runs
+    /// only where it finds none (P3, the last resort).
+    fn find_evictable_victim_for_selected(&self, selected: u32) -> Option<ProcessViewId> {
+        let owner = self
+            .refresh_requested
+            .get(&selected)
+            .and_then(|request| request.owner);
+        self.exploratory_evictable_views().into_iter().find(|id| {
+            let Some(view) = self.views.iter().find(|view| view.id() == *id) else {
+                return false;
+            };
+            if view.pid() == selected || Some(*id) == owner {
+                return false;
+            }
+            !self.pressure_view_shielded(view.pid())
+        })
+    }
+
+    /// Evicts the lowest-pid exploratory view available to a selected
+    /// transaction (Lane-A P1) and reports whether a slot freed.
+    fn evict_one_exploratory_for_selected(&mut self, selected: u32) -> bool {
+        let Some(victim) = self.find_evictable_victim_for_selected(selected) else {
+            return false;
+        };
+        self.evict_exploratory_views(&BTreeSet::from([victim]));
+        true
+    }
+
     /// Over-cap candidate selection without a full maps sweep (Task 3.1b).
     /// Ordinary passes serve event-driven refresh requests plus a
     /// fairness-rotation window over unscanned pids — no maps reads, so no
@@ -19267,13 +19330,64 @@ impl Engine {
         select_rotation_candidates(&pool, free_slots, &stale)
     }
 
+    /// Sentinel view ID for probationary scans (Lane-A P3): never
+    /// allocated (the ID space ends at `max_scan_pids`), so a probationary
+    /// view consumes no capture slot and registers nowhere. Only its
+    /// scan-result emptiness is ever read; modules, pins and the ID itself
+    /// are discarded.
+    const PROBATIONARY_VIEW_ID: ProcessViewId = ProcessViewId(u32::MAX);
+
+    /// Probationary provider probe for a pending newcomer with no view slot
+    /// and no evictable view anywhere (Lane-A P3, the last resort). Opens
+    /// the pid under the sentinel ID — a generation pin that consumes no
+    /// capture slot — runs the standard newcomer scan through it, and
+    /// reports whether a complete scan proved provider-freedom. The caller
+    /// viewless-completes a proven-free request; a provider found, a
+    /// refused/partial/truncated scan, an unreadable maps snapshot, an
+    /// exited generation, or an exhausted budget all report unproven and
+    /// the request defers exactly as before. Budgeted and charged as a deep
+    /// scan; later EXECs renew the request's serial, so a torn read can
+    /// never complete another generation's work. Returns the verdict plus
+    /// the scan's skips.
+    fn probe_newcomer_provider_free(&mut self, pid: u32) -> (bool, Vec<Skipped>) {
+        let view = match ProcessView::open(Self::PROBATIONARY_VIEW_ID, pid) {
+            Ok(view) => view,
+            Err(_) => return (false, Vec::new()),
+        };
+        if !view.still_the_same() {
+            return (false, Vec::new());
+        }
+        let broad_admit = self.broad_admit;
+        let (scan_result, counters) = Self::scan_retained_view(
+            &view,
+            &self.module_hints,
+            &self.hooks,
+            &mut self.budget,
+            broad_admit,
+            &mut self.stage_timings,
+        );
+        self.deep_scans = self.deep_scans.saturating_add(1);
+        let skipped = self.absorb_scan_counters(counters);
+        match scan_result {
+            // The completeness flag is load-bearing: a refused, partial or
+            // truncated scan yields empty modules without proving anything.
+            Ok((modules, _pins, complete)) => (complete && modules.is_empty(), skipped),
+            Err(_) => (false, skipped),
+        }
+    }
+
     /// Admits one tick's newcomer window: opens, scans, and stages each
     /// admitted pid as an inventory new view. The tick quantum stops
     /// admissions before another scan — the current pid and the rest defer
-    /// with their requests retained, never dropped. Returns the staged new
-    /// views, the pids to keep queued (failures and deferrals alike), and
-    /// the tick's skips. Extracted verbatim from the inventory tick so an
-    /// injected clock can expire mid-path; production behavior is unchanged.
+    /// with their requests retained, never dropped. At view capacity a
+    /// pressure-selected pid evicts one guarded exploratory view and
+    /// retries (Lane-A P1); as the last resort, a still-unhoused pending
+    /// newcomer with no evictable view anywhere completes without a view
+    /// when a complete probationary scan proves provider-freedom (Lane-A
+    /// P3). Returns the staged new views, the pids to keep queued
+    /// (failures and deferrals alike), and the tick's skips. Extracted
+    /// verbatim from the inventory tick so an injected clock can expire
+    /// mid-path; production behavior is unchanged.
     fn admit_inventory_new_views(
         &mut self,
         admitted: Vec<u32>,
@@ -19297,9 +19411,29 @@ impl Engine {
                 });
                 break;
             }
-            let id = match self.allocate_view_id() {
+            let id = match self.allocate_view_id_for_newcomer(pid) {
                 Ok(id) => id,
                 Err(_) => {
+                    // Lane-A P3: no slot even after the selected
+                    // transaction's single eviction (or outside one). The
+                    // probe is the last resort: it runs only for a pending
+                    // newcomer with no evictable view anywhere — where
+                    // ordinary relief cannot free a slot — and completes
+                    // only provider-freedom a complete scan proved.
+                    // Rotation candidates and unproven pids defer as before.
+                    if self.refresh_requested.contains_key(&pid)
+                        && self.find_evictable_victim_for_selected(pid).is_none()
+                    {
+                        let (provider_free, probe_skips) = self.probe_newcomer_provider_free(pid);
+                        skipped.extend(probe_skips);
+                        self.scheduler.note_new_view_attempt(pid);
+                        if provider_free {
+                            self.newcomer_first_seen.remove(&pid);
+                            self.probationary_completions =
+                                self.probationary_completions.saturating_add(1);
+                            continue;
+                        }
+                    }
                     skipped.push(Skipped {
                         subject: "process view".into(),
                         reason: format!(
@@ -19546,6 +19680,9 @@ impl Engine {
             // round, no over-cap reconcile turn, no sweep: the pass neither
             // reads maps beyond this enumeration nor advances any scheduler
             // cursor of its own (H1 accounting is checkpointed around it).
+            // At view capacity the selected pid still makes its own room —
+            // one guarded exploratory eviction, else a probationary probe —
+            // both scoped to the selection inside newcomer admission.
             if pids.contains(&selected.pid) {
                 BTreeSet::from([selected.pid])
             } else {
@@ -19691,7 +19828,17 @@ impl Engine {
         // consume the same first window forever and starve later processes.
         // Deferred requests and their explicit evidence are retained.
         let max_new_views = self.scheduler.max_new_views_per_tick();
-        let mut new_pids = self.scheduler.new_view_order(&new_pids).into_iter();
+        let mut new_pids = if self.views.len() >= self.max_scan_pids {
+            // Lane-A P2a: view slots are scarce, so event-driven newcomers
+            // sort ahead of rotation candidates for whatever frees up. With
+            // free slots the plain pid order stands (fairness pins).
+            let pending: BTreeSet<u32> = serviced_requests.keys().copied().collect();
+            self.scheduler
+                .new_view_order_pending_first(&new_pids, &pending)
+                .into_iter()
+        } else {
+            self.scheduler.new_view_order(&new_pids).into_iter()
+        };
         let admitted: Vec<u32> = new_pids.by_ref().take(max_new_views).collect();
         let deferred: Vec<u32> = new_pids.collect();
         // Arrival marks in processing order (first diff wins; the admitted

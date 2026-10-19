@@ -387,8 +387,9 @@ impl EventLogState {
     }
 }
 
-/// The event prologue shared by classic and dashboard startup.
-fn start_event_log<Source: ProcessSource>(
+/// The event prologue shared by classic and dashboard startup. Shared
+/// with the loop-regression harness, which opens the real prologue.
+pub(crate) fn start_event_log<Source: ProcessSource>(
     stream: &mut EventLogState,
     coordinator: &InventoryCoordinator<Source>,
     scope_label: &str,
@@ -3218,8 +3219,9 @@ fn add_unbound_rows(
 /// Append one committed pass to the event stream: caller turnover,
 /// every new gap verbatim, then the pass marker with this pass's loss
 /// accounting. A refused capture produces stream gaps identical in
-/// meaning to snapshot gaps (same subject/reason/budget).
-fn emit_pass_events(
+/// meaning to snapshot gaps (same subject/reason/budget). Shared with
+/// the loop-regression harness, which streams through the real emitters.
+pub(crate) fn emit_pass_events(
     writer: &mut EventWriter,
     state: &mut StreamState,
     report: &PassReport,

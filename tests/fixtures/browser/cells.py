@@ -273,20 +273,24 @@ def launch_browser_context(pw, browser: str, workdir: Path, *,
         profile = FirefoxProfile.create(
             workdir / "ffprofile", module_lib=register_module,
             prefs=ff_prefs)
+        # Explicit environment: the Playwright driver keeps the environment
+        # it inherited at startup, so anything set afterwards (notably the
+        # fresh Chromium HOME below) must ride `env=` to reach the browser.
         context = pw.firefox.launch_persistent_context(
             str(profile.path), headless=True, ignore_https_errors=True,
-            args=list(extra_browser_args))
+            args=list(extra_browser_args), env=dict(os.environ))
         return context, str(profile.path), profile.path
     elif browser == "chromium":
         home = ChromiumHome.create(workdir / "home", module_lib=register_module).path
-        os.environ["HOME"] = str(home)
+        browser_env = dict(os.environ)
+        browser_env["HOME"] = str(home)
         cr_args = list(extra_browser_args)
         if auto_select_cert:
             cr_args.append(f"--auto-select-certificate-for-urls={flow_url}")
         context = pw.chromium.launch_persistent_context(
             str(workdir / "crprofile"), channel="chromium",
             headless=True, ignore_https_errors=True,
-            args=cr_args)
+            args=cr_args, env=browser_env)
         return context, str(workdir / "crprofile"), home
     raise CellError(f"unknown browser: {browser}")
 
@@ -327,10 +331,35 @@ def _attach_drive_inner(name, browser, workdir, flow_url, flow, observe_module,
     from playwright.sync_api import sync_playwright  # noqa: PLC0415
 
     with sync_playwright() as pw:
-        context, match, _profile = launch_browser_context(
+        context, match, profile_path = launch_browser_context(
             pw, browser, workdir, register_module=register_module,
             extra_browser_args=tuple(extra_browser_args), extra_prefs=extra_prefs,
             flow_url=flow_url, auto_select_cert=auto_select_cert)
+        launch_facts: dict = {}
+        if browser == "chromium":
+            # Registration-effective witness (P2-1): no absence below may
+            # be interpreted until the browser's own NSS database proves
+            # it runs under the fresh HOME with our registration visible.
+            nss_db_dir = wait_for_nss_db(profile_path)
+            if nss_db_dir is None:
+                context.close()
+                raise CellError(
+                    f"chromium never initialized NSS under fresh HOME "
+                    f"{profile_path} in 15s (registration not effective)")
+            if register_module is not None:
+                try:
+                    listed = (nss_db_dir / "pkcs11.txt").read_text()
+                except OSError:
+                    listed = ""
+                if str(register_module) not in listed:
+                    context.close()
+                    raise CellError(
+                        f"chromium NSS DB {nss_db_dir} does not list "
+                        f"{register_module} (registration not effective)")
+            launch_facts["nss_db_dir"] = str(nss_db_dir)
+        else:
+            launch_facts["profile_module_registered"] = (
+                (profile_path / "pkcs11.txt").exists())
         try:
             pid = main_browser_pid(match, browser)
             if wait_for_map and not wait_for_mapping(pid, wait_for_map):
@@ -371,6 +400,7 @@ def _attach_drive_inner(name, browser, workdir, flow_url, flow, observe_module,
     return CellResult(
         name=name, report_path=report,
         flow={"profiler_exit": profiler_exit, "flow_url": flow_url,
-              "browser_pid": pid, "mapped_at_end": mapped_at_end, **facts},
+              "browser_pid": pid, "mapped_at_end": mapped_at_end,
+              **launch_facts, **facts},
         observer_stderr_tail=_tail(stderr),
     )

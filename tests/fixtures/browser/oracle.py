@@ -266,6 +266,14 @@ FF_STARTUP_FLOORS = {
     "C_FindObjectsFinal": 1,
     "C_GetSessionInfo": 1,
 }
-# There are deliberately no PINBOUND floors: both browsers stall at the
-# interactive-PIN boundary before any token use (FF-PINBOUND pins the
-# mapped-and-armed zero; CR-PINBOUND the never-mapped zero).
+# Chromium enumerates the registered provider stably (x5/x5/x5 on every
+# run, both flows): the token is demonstrably reachable while private
+# operations stay absent.
+CR_ENUMERATION_FLOORS = {
+    "C_FindObjectsInit": 1,
+    "C_FindObjects": 1,
+    "C_FindObjectsFinal": 1,
+}
+# There are deliberately no FF-PINBOUND floors: Firefox stalls at the
+# interactive-PIN boundary with racy selection enumeration (x0 or x16
+# across runs), so only the login/signing absences are pinned.

@@ -14,17 +14,24 @@ late owner and a genuine fresh head after the retained prefix").
 ## Files
 
 - `driver.c`: ledgered provider-bearing child. `driver PROVIDER MODE REPEAT
-  GATEFILE` with `MODE` in `{retain, late}`. Drives the three publication
-  surfaces (`C_GetFunctionList`, `C_GetInterfaceList`, `C_GetInterface`)
-  `REPEAT` times after the gate releases, then holds the mapping until
-  SIGTERM/SIGINT. Emits `TARGET` (own-maps physical join),
-  `READY pid=N`, and `LEDGER` lines on stdout in the same shape as
-  `tests/fixtures/public-cli/gated.c`.
+  GATEFILE [GATE2 REPEAT2]` with `MODE` in `{retain, late}`. Drives the
+  three publication surfaces (`C_GetFunctionList`, `C_GetInterfaceList`,
+  `C_GetInterface`) `REPEAT` times after the gate releases, then holds
+  the mapping until SIGTERM/SIGINT. With `GATE2`, a second burst of
+  `REPEAT2` per surface follows the second gate for post-admission
+  (old/new) independent calls. Emits `TARGET` (own-maps physical join),
+  `READY pid=N`, and one `LEDGER` per burst (`"burst":1|2`, each counting
+  exactly its own burst) on stdout in the same shape as
+  `tests/fixtures/public-cli/gated.c`. The first burst also warms the
+  provider tables: the observer plans attach slots only from populated
+  tables, so discovery before the first release sees modules with zero
+  slots (cold tables), never coverage.
 - `static-head.c`: provider-free genuine fresh-EXEC head.
   `static-head GATEFILE` emits `READY`/`LEDGER` and holds until
   SIGTERM/SIGINT. No dlopen, no provider, no TARGET lines.
 - `check.sh`: isolated unprivileged self-check (build plus a small
-  retain+late+head smoke with ledger validation and cleanup proof).
+  retain+late+head smoke with ledger validation, a two-burst second-gate
+  smoke, and cleanup proof).
 
 ## Build
 
@@ -46,21 +53,27 @@ does, never from the LEDGER self-report alone.
 ## Live256 construction recipe (for the owned live lane)
 
 1. Start the observer capture first (installed candidate, System scope).
-2. Spawn 255 `retain` children on the early provider behind the gate.
-   Wait for 255 `READY` lines; each child is one sustained retained
-   provider-bearing context (one loader ticket each: tickets 1..255).
-3. Spawn the `late` child on the late provider behind the same gate and
+2. Spawn 255 `retain` children on the early provider behind gate 1 (with
+   gate 2 armed for the post-admission burst). Wait for 255 `READY`
+   lines; each child is one sustained retained provider-bearing context
+   (one loader ticket each: tickets 1..255).
+3. Spawn the `late` child on the late provider behind the same gates and
    wait for its `READY`. Its request queues without a loader ticket;
    queueing mints no context (`exec_binding: None` at queue time).
-4. Spawn `static-head` last and wait for its `READY`. Its genuine kernel
-   EXEC record is the fresh head after the retained prefix (request key
-   256). It maps no provider, so servicing it arms nothing.
-5. Release the gate. The children burst, ledger, and hold; the observer
-   runs the pressure episode: selected service performs the nonempty
-   late-provider rescan, physical publication and loader rearm (ticket
-   256), then admits the original head into the freed request slot while
-   preserving unrelated ages/serials and FIFO.
-6. SIGTERM every owned child, verify each exit code, verify each PID is
+4. Spawn `static-head` last (after a hook-clock separation) and wait for
+   its `READY`. Its genuine kernel EXEC record is the fresh head after
+   the retained prefix (request key 256). It maps no provider, so
+   servicing it arms nothing.
+5. Release gate 1. The children run burst 1, ledger (`"burst":1`), and
+   hold; the warm tables let the observer rescan and publish. The
+   observer collects the 257 genuine EXECs, runs the pressure episode
+   (selected service performs the nonempty late-provider rescan,
+   physical publication and loader rearm (ticket 256)), then admits the
+   original head into the freed request slot while preserving unrelated
+   ages/serials and FIFO.
+6. Release gate 2. The provider children run burst 2 and ledger
+   (`"burst":2`): post-admission independent calls.
+7. SIGTERM every owned child, verify each exit code, verify each PID is
    reaped, and remove the work directory.
 
 Ticket budget for the genuine positive sequence: 255 (retained) + 1 (late

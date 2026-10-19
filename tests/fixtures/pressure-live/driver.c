@@ -4,7 +4,7 @@
  * builds and runs unprivileged without any capture, and no runner consumes it
  * until the controller wires the live cell. See README.md beside it.
  *
- * usage: driver PROVIDER MODE REPEAT GATEFILE
+ * usage: driver PROVIDER MODE REPEAT GATEFILE [GATE2 REPEAT2]
  *   PROVIDER  absolute path of the provider .so to dlopen and drive
  *   MODE      retain (sustained prefix) or late (eligible late owner);
  *             behavior is identical; the mode is recorded in LEDGER so the
@@ -12,6 +12,8 @@
  *   REPEAT    burst size: each present publication surface is called REPEAT
  *             times after the gate releases
  *   GATEFILE  gate path ("-" = no gate: burst immediately, ledger, exit)
+ *   GATE2     optional second gate for a post-admission burst (old/new
+ *             independent calls); REPEAT2 sizes it like REPEAT
  *
  * Protocol (stdout; same TARGET/READY/LEDGER shape as
  * tests/fixtures/public-cli/gated.c so the same join logic applies):
@@ -20,14 +22,17 @@
  *     own executable VMA (independent physical-target evidence)
  *   READY pid=N
  *   LEDGER {"schema":"p11scope/pressure-live-ledger/v1","pid":N,
- *     "mode":"retain"|"late","complete":bool,
+ *     "mode":"retain"|"late","burst":1|2,"complete":bool,
  *     "functions":[{"name":...,"attempts":A,"successful":S}...]}
+ *     one LEDGER per burst (burst 1 always; burst 2 only with GATE2),
+ *     each counting exactly its own burst's real calls
  *
  * Gated children hold their mapping until SIGTERM/SIGINT, then dlclose and
- * exit 0 only when every attempt succeeded. C_GetFunctionList is required;
- * C_GetInterfaceList/C_GetInterface are optional (attempted and ledgered
- * honestly when present, absent from TARGET/LEDGER when not). Nothing here
- * fabricates activity: attempts and successes are counted from real calls.
+ * exit 0 only when every attempt of every burst succeeded. C_GetFunctionList
+ * is required; C_GetInterfaceList/C_GetInterface are optional (attempted
+ * and ledgered honestly when present, absent from TARGET/LEDGER when not).
+ * Nothing here fabricates activity: attempts and successes are counted
+ * from real calls.
  */
 #define _GNU_SOURCE
 #include <dlfcn.h>
@@ -93,9 +98,69 @@ static int wait_for_gate(const char *gate) {
     return stop ? 1 : 0;
 }
 
+static long parse_repeat(const char *text, const char *name) {
+    char *end = NULL;
+    long value = strtol(text, &end, 10);
+    if (end == text || *end != '\0' || value < 0 || value > 1000000) {
+        fprintf(stderr, "driver: %s must be 0..1000000\n", name);
+        return -1;
+    }
+    return value;
+}
+
+/* One burst: call every present surface REPEAT times and ledger exactly
+ * this burst. Returns 0 when every attempt succeeded and the burst ran
+ * to completion, 1 otherwise. */
+static int run_burst(long repeat, int burst, const char *mode,
+                     fn_function_list get_function_list,
+                     fn_interface_list get_interface_list,
+                     fn_interface get_interface) {
+    unsigned long done_function_list = 0, ok_function_list = 0;
+    unsigned long done_interface_list = 0, ok_interface_list = 0;
+    unsigned long done_interface = 0, ok_interface = 0;
+    long done = 0;
+    for (long i = 0; i < repeat && !stop; i++, done++) {
+        void *table = NULL;
+        done_function_list++;
+        ok_function_list += get_function_list(&table) == 0 && table != NULL;
+        if (get_interface_list) {
+            CK_INTERFACE ifaces[17];
+            CK_ULONG count = 17;
+            done_interface_list++;
+            ok_interface_list += get_interface_list(ifaces, &count) == 0;
+        }
+        if (get_interface) {
+            void *iface = NULL;
+            done_interface++;
+            ok_interface += get_interface(NULL, NULL, &iface, 0) == 0 && iface != NULL;
+        }
+    }
+    int complete = !stop && done == repeat;
+
+    printf("LEDGER {\"schema\":\"p11scope/pressure-live-ledger/v1\",\"pid\":%d,"
+           "\"mode\":\"%s\",\"burst\":%d,\"complete\":%s,\"functions\":[",
+           (int)getpid(), mode, burst, complete ? "true" : "false");
+    printf("{\"name\":\"C_GetFunctionList\",\"attempts\":%lu,\"successful\":%lu}",
+           done_function_list, ok_function_list);
+    if (get_interface_list) {
+        printf(",{\"name\":\"C_GetInterfaceList\",\"attempts\":%lu,\"successful\":%lu}",
+               done_interface_list, ok_interface_list);
+    }
+    if (get_interface) {
+        printf(",{\"name\":\"C_GetInterface\",\"attempts\":%lu,\"successful\":%lu}",
+               done_interface, ok_interface);
+    }
+    printf("]}\n");
+    fflush(stdout);
+
+    unsigned long bad = (done_function_list - ok_function_list) +
+        (done_interface_list - ok_interface_list) + (done_interface - ok_interface);
+    return (bad || !complete) ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
-    if (argc != 5) {
-        fprintf(stderr, "usage: driver PROVIDER MODE REPEAT GATEFILE\n");
+    if (argc != 5 && argc != 7) {
+        fprintf(stderr, "usage: driver PROVIDER MODE REPEAT GATEFILE [GATE2 REPEAT2]\n");
         return 2;
     }
     const char *provider = argv[1];
@@ -104,11 +169,18 @@ int main(int argc, char **argv) {
         fprintf(stderr, "driver: MODE must be retain or late\n");
         return 2;
     }
-    char *end = NULL;
-    long repeat = strtol(argv[3], &end, 10);
-    if (end == argv[3] || *end != '\0' || repeat < 0 || repeat > 1000000) {
-        fprintf(stderr, "driver: REPEAT must be 0..1000000\n");
+    long repeat = parse_repeat(argv[3], "REPEAT");
+    if (repeat < 0) {
         return 2;
+    }
+    long repeat2 = 0;
+    const char *gate2 = NULL;
+    if (argc == 7) {
+        gate2 = argv[5];
+        repeat2 = parse_repeat(argv[6], "REPEAT2");
+        if (repeat2 < 0) {
+            return 2;
+        }
     }
     const char *gate = argv[4];
     int gated = strcmp(gate, "-") != 0;
@@ -147,51 +219,23 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    unsigned long done_function_list = 0, ok_function_list = 0;
-    unsigned long done_interface_list = 0, ok_interface_list = 0;
-    unsigned long done_interface = 0, ok_interface = 0;
-    long done = 0;
-    for (long i = 0; i < repeat && !stop; i++, done++) {
-        void *table = NULL;
-        done_function_list++;
-        ok_function_list += get_function_list(&table) == 0 && table != NULL;
-        if (get_interface_list) {
-            CK_INTERFACE ifaces[17];
-            CK_ULONG count = 17;
-            done_interface_list++;
-            ok_interface_list += get_interface_list(ifaces, &count) == 0;
+    int rc = run_burst(repeat, 1, mode, get_function_list, get_interface_list, get_interface);
+    if (gate2 != NULL && !stop) {
+        if (wait_for_gate(gate2)) {
+            dlclose(handle);
+            return 1;
         }
-        if (get_interface) {
-            void *iface = NULL;
-            done_interface++;
-            ok_interface += get_interface(NULL, NULL, &iface, 0) == 0 && iface != NULL;
-        }
+        rc |= run_burst(repeat2, 2, mode, get_function_list, get_interface_list, get_interface);
     }
-    int complete = !stop && done == repeat;
 
-    printf("LEDGER {\"schema\":\"p11scope/pressure-live-ledger/v1\",\"pid\":%d,"
-           "\"mode\":\"%s\",\"complete\":%s,\"functions\":[",
-           (int)getpid(), mode, complete ? "true" : "false");
-    printf("{\"name\":\"C_GetFunctionList\",\"attempts\":%lu,\"successful\":%lu}",
-           done_function_list, ok_function_list);
-    if (get_interface_list) {
-        printf(",{\"name\":\"C_GetInterfaceList\",\"attempts\":%lu,\"successful\":%lu}",
-               done_interface_list, ok_interface_list);
-    }
-    if (get_interface) {
-        printf(",{\"name\":\"C_GetInterface\",\"attempts\":%lu,\"successful\":%lu}",
-               done_interface, ok_interface);
-    }
-    printf("]}\n");
-    fflush(stdout);
-
-    unsigned long bad = (done_function_list - ok_function_list) +
-        (done_interface_list - ok_interface_list) + (done_interface - ok_interface);
     if (gated) {
         while (!stop) {
             pause();
         }
     }
     dlclose(handle);
-    return (bad || !complete) ? 1 : 0;
+    /* A SIGTERM that lands during the hold (after clean bursts) still
+     * exits 0: only burst failures count. An interrupted burst already
+     * failed its own ledger above. */
+    return rc ? 1 : 0;
 }

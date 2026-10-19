@@ -1036,5 +1036,43 @@ class BrowserCells(unittest.TestCase):
         self.assertEqual(tls_server.client_hello_status(frag), "complete")
 
 
+    def _installed_copy(self):
+        """Install this suite source into a scratch tests/python layout."""
+        root = self.work / "strict-probe"
+        target = root / "tests" / "python" / "test_browser_cells.py"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(Path(__file__).read_text())
+        fixtures = root / "tests" / "fixtures"
+        fixtures.mkdir(parents=True, exist_ok=True)
+        link = fixtures / "browser"
+        if not link.exists():
+            link.symlink_to(Path(cells.__file__).resolve().parent)
+        return target
+
+    def test_strict_mode_rejects_empty_selection(self):
+        """P3 twin: strict installed mode must fail an empty selection."""
+        import subprocess as stdlib_subprocess
+
+        target = self._installed_copy()
+        base = dict(os.environ)
+        base.pop("P11SCOPE_BROWSER_STRICT", None)
+        strict = dict(base, P11SCOPE_BROWSER_STRICT="1")
+        empty = [sys.executable, "-I", str(target), "-k", "definitely_no_such_test_zzz"]
+        strict_run = stdlib_subprocess.run(
+            empty, capture_output=True, text=True, check=False, env=strict, timeout=120)
+        self.assertNotEqual(
+            strict_run.returncode, 0, "strict mode accepted an empty selection")
+        self.assertIn("empty selection", strict_run.stderr)
+        plain_run = stdlib_subprocess.run(
+            empty, capture_output=True, text=True, check=False, env=base, timeout=120)
+        self.assertEqual(plain_run.returncode, 0,
+                         f"self-skipping default must accept it: {plain_run.stderr[-500:]}")
+        picked = stdlib_subprocess.run(
+            [sys.executable, "-I", str(target), "-k", "test_capture_ready_parsing"],
+            capture_output=True, text=True, check=False, env=strict, timeout=120)
+        self.assertEqual(picked.returncode, 0,
+                         f"strict nonempty selection must pass: {picked.stderr[-500:]}")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

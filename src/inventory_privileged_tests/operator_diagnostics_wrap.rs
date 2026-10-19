@@ -1287,12 +1287,24 @@ impl WrapCell {
 }
 
 fn run_wrap(enabled: bool) -> Result<(serde_json::Value, u64)> {
+    run_wrap_cell(enabled, WrapCell::Pid)
+}
+
+fn run_wrap_system(enabled: bool) -> Result<(serde_json::Value, u64)> {
+    run_wrap_cell(enabled, WrapCell::System)
+}
+
+/// One wrap leg under the given cell: the identical issued schedule,
+/// milestone driver and owned-population checks; only the capture scope
+/// (PID-filtered vs unfiltered system) and its validators differ.
+fn run_wrap_cell(enabled: bool, cell: WrapCell) -> Result<(serde_json::Value, u64)> {
     let mut workload = WrapWorkload::spawn()?;
     workload.check_mapping("provider-A.so")?;
     workload.check_commons()?;
     let events = workload.dir.path().join("events.jsonl");
     let diagnostics = workload.dir.path().join("diagnostics.jsonl");
     let pid = workload.process.pid();
+    let scope = cell.scope(pid)?;
     let start = Instant::now();
     let state = Cell::new((0u8, 0u64));
     let fence_k = Cell::new(0u64);
@@ -1469,7 +1481,7 @@ fn run_wrap(enabled: bool) -> Result<(serde_json::Value, u64)> {
     };
     let mut stdout = Vec::new();
     let code = run_with_terminal_diagnostics(
-        InspectScope::Pid(pid),
+        scope.inspect_scope(),
         &[],
         &HookRegistry::builtin(),
         true,
@@ -1491,7 +1503,7 @@ fn run_wrap(enabled: bool) -> Result<(serde_json::Value, u64)> {
         &DashboardIo::stdio(),
         DiagnosticRequest {
             path: enabled.then_some(diagnostics.as_path()),
-            pid_filter: Some(pid),
+            pid_filter: scope.diagnostics_pid_filter(),
             second_signal: &|| false,
         },
         None,
@@ -1528,7 +1540,10 @@ fn run_wrap(enabled: bool) -> Result<(serde_json::Value, u64)> {
         )?;
     }
     let document: serde_json::Value = serde_json::from_slice(&stdout)?;
-    let facts = primary_facts(&document, pid, k)?;
+    let facts = match scope {
+        WrapScope::Pid { pid } => primary_facts(&document, pid, k)?,
+        WrapScope::System { owned_pid } => primary_facts_system(&document, owned_pid, k)?,
+    };
     if enabled {
         let b = doc_edges(&document, pid)
             .into_iter()
@@ -1545,7 +1560,23 @@ fn run_wrap(enabled: bool) -> Result<(serde_json::Value, u64)> {
             .filter(|line| !line.is_empty())
             .map(serde_json::from_slice)
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        check_wrap_records(&records, length, &b["module"], pid)?;
+        match scope {
+            WrapScope::Pid { pid } => check_wrap_records(&records, length, &b["module"], pid)?,
+            WrapScope::System { owned_pid } => {
+                let owned_caller = view
+                    .borrow()
+                    .caller_id
+                    .clone()
+                    .context("owned caller id never observed")?;
+                check_wrap_records_system(
+                    &records,
+                    length,
+                    &b["module"],
+                    owned_pid,
+                    &owned_caller,
+                )?;
+            }
+        }
     } else {
         ensure!(!diagnostics.exists());
     }
@@ -2026,6 +2057,17 @@ fn check_paired_parity(
 fn privileged_native_lane_pid_diagnostics_wrap_and_primary_parity_lp64() -> Result<()> {
     let (disabled, dk) = run_wrap(false)?;
     let (enabled, ek) = run_wrap(true)?;
+    check_paired_parity(&disabled, dk, &enabled, ek)
+}
+
+/// Bounded system wrap pair (cell 3): the identical 32-object schedule
+/// under unfiltered system capture, with owned-caller validators and
+/// the same strict paired off/on parity.
+#[test]
+#[ignore = "root-owned BPF lane; prebuilt32-object fixture, bounded system default-ring wrap pair (~22min+)"]
+fn privileged_native_lane_system_diagnostics_wrap_and_primary_parity_lp64() -> Result<()> {
+    let (disabled, dk) = run_wrap_system(false)?;
+    let (enabled, ek) = run_wrap_system(true)?;
     check_paired_parity(&disabled, dk, &enabled, ek)
 }
 

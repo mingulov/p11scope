@@ -5178,7 +5178,21 @@ fn immutable_policy_maps() {
     );
     assert_eq!(definitions["CGROUP_FILTER"][FLAGS], 0);
     assert_eq!(definitions["TAIL_CALLS"][FLAGS], 0);
-    assert!(!definitions.contains_key("ATTR_BOOL_BITS"));
+    if cfg!(feature = "unsafe-unvalidated-metadata") {
+        // docs/privacy/allowlist-v1.md: the policy-boolean lookup is
+        // "Unsafe diagnostic only", so the diagnostic object carries
+        // ATTR_BOOL_BITS — still immutable like every other policy map.
+        assert!(
+            definitions.contains_key("ATTR_BOOL_BITS"),
+            "diagnostic object misses unsafe-only map ATTR_BOOL_BITS"
+        );
+        assert_eq!(
+            definitions["ATTR_BOOL_BITS"][FLAGS], BPF_F_RDONLY_PROG,
+            "ATTR_BOOL_BITS"
+        );
+    } else {
+        assert!(!definitions.contains_key("ATTR_BOOL_BITS"));
+    }
     for name in [
         "STATS",
         "START",
@@ -7294,11 +7308,22 @@ fn policy_specific_ebpf() {
     assert_eq!(definitions["ASYNC_FUNCTIONS"][KEY_SIZE], 32);
     assert_eq!(definitions["TAIL_CALLS"][0], 3);
     assert_eq!(definitions["TAIL_CALLS"][3], 2);
+    // docs/privacy/allowlist-v1.md: the template decoders are "Unsafe
+    // diagnostic only" and "absent from the default release BPF object",
+    // so the diagnostic object carries these maps and symbols instead.
+    let diagnostic = cfg!(feature = "unsafe-unvalidated-metadata");
     for unsafe_map in ["ATTR_BOOL_BITS", "PAIR_CALLS"] {
-        assert!(
-            !definitions.contains_key(unsafe_map),
-            "default object contains unsafe-only map {unsafe_map}"
-        );
+        if diagnostic {
+            assert!(
+                definitions.contains_key(unsafe_map),
+                "diagnostic object misses unsafe-only map {unsafe_map}"
+            );
+        } else {
+            assert!(
+                !definitions.contains_key(unsafe_map),
+                "default object contains unsafe-only map {unsafe_map}"
+            );
+        }
     }
     for unsafe_symbol in [
         "p11_entry_template",
@@ -7308,10 +7333,17 @@ fn policy_specific_ebpf() {
         "walk_template",
         "decode_params",
     ] {
-        assert!(
-            !symbols.contains(unsafe_symbol),
-            "default object contains unsafe-only symbol {unsafe_symbol}"
-        );
+        if diagnostic {
+            assert!(
+                symbols.contains(unsafe_symbol),
+                "diagnostic object misses unsafe-only symbol {unsafe_symbol}"
+            );
+        } else {
+            assert!(
+                !symbols.contains(unsafe_symbol),
+                "default object contains unsafe-only symbol {unsafe_symbol}"
+            );
+        }
     }
 }
 

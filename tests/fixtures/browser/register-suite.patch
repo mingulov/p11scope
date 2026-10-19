@@ -12,10 +12,10 @@ index 1888f509..b6f09f3e 100755
      ("test_canary_evidence.py", ["--target-bits", "32"]),
 diff --git a/tests/python/test_browser_cells.py b/tests/python/test_browser_cells.py
 new file mode 100644
-index 00000000..65d757ad
+index 00000000..7a71ad90
 --- /dev/null
 +++ b/tests/python/test_browser_cells.py
-@@ -0,0 +1,840 @@
+@@ -0,0 +1,861 @@
 +# SPDX-License-Identifier: GPL-3.0-or-later
 +"""G33 browser application cells: real Firefox/Chromium PKCS#11 traffic.
 +
@@ -25,7 +25,8 @@ index 00000000..65d757ad
 +truth. On hosts without the gate prerequisites (P11SCOPE_BIN, passwordless
 +sudo, Playwright browsers, SoftHSM tooling) every test skips naming what
 +is missing; hosted CI therefore stays quiet and T11 runs the positives on
-+a qualified installed host.
++a qualified installed host with P11SCOPE_BROWSER_STRICT=1, which turns
++prerequisite skips into failures. Single-browser hosts run their subset.
 +
 +Harness: tests/fixtures/browser/ (cells, flows, oracle, servers, profiles).
 +"""
@@ -54,8 +55,8 @@ index 00000000..65d757ad
 +import tls_server
 +
 +#: Chromium stabilizers: background fetches must not perturb the token
-+#: traffic shape (their timing races the observation window); stabilized
-+#: cells deterministically enumerate x5 without private-token use.
++#: traffic shape (their timing races the observation window); the
++#: calibrated shape is x5 enumeration without private-token use.
 +CHROMIUM_STABLE_ARGS = (
 +    "--no-first-run",
 +    "--no-default-browser-check",
@@ -66,8 +67,9 @@ index 00000000..65d757ad
 +    "--no-service-autorun",
 +)
 +
-+#: Firefox equivalent: background activity stabilized out so floored calls
-+#: are flow-caused (unstabilized runs see ~2x the FindObjects traffic).
++#: Firefox equivalent: background activity stabilized out during
++#: calibration so the floored shape is flow-caused (unstabilized runs see
++#: ~2x the FindObjects traffic).
 +FIREFOX_STABLE_PREFS = {
 +    "app.update.disabledForTesting": True,
 +    "app.normandy.enabled": False,
@@ -128,18 +130,34 @@ index 00000000..65d757ad
 +        f"errors={server.handshake_errors}")
 +
 +
-+def gate(test):
-+    """Skip unless every gate prerequisite for the cell holds."""
++#: Installed mode: set P11SCOPE_BROWSER_STRICT=1 on a qualified installed
++#: host (T11) to turn prerequisite skips into failures, requiring the
++#: expected cells to execute. Unset keeps the self-skipping hosted default.
++STRICT = os.environ.get("P11SCOPE_BROWSER_STRICT") == "1"
 +
-+    @functools.wraps(test)
-+    def wrapper(self):
-+        try:
-+            cells.preflight()
-+        except (cells.CellError, RuntimeError) as exc:
-+            self.skipTest(f"browser gate prerequisite missing: {exc}")
-+        return test(self)
 +
-+    return wrapper
++def gate(browser):
++    """Skip unless every gate prerequisite for the ``browser`` cell holds.
++
++    In strict installed mode a missing prerequisite fails instead of
++    skipping, so the expected cells must execute.
++    """
++
++    def decorator(test):
++        @functools.wraps(test)
++        def wrapper(self):
++            try:
++                cells.preflight(browser)
++            except (cells.CellError, RuntimeError) as exc:
++                if STRICT:
++                    raise AssertionError(
++                        f"strict installed mode requires this cell: {exc}") from exc
++                self.skipTest(f"browser gate prerequisite missing: {exc}")
++            return test(self)
++
++        return wrapper
++
++    return decorator
 +
 +
 +def needs_chromium(test):
@@ -152,6 +170,9 @@ index 00000000..65d757ad
 +            from profiles import chromium_binary
 +            chromium_binary()
 +        except (ImportError, RuntimeError) as exc:
++            if STRICT:
++                raise AssertionError(
++                    f"strict installed mode requires this twin: {exc}") from exc
 +            self.skipTest(f"chromium witness prerequisite missing: {exc}")
 +        return test(self)
 +
@@ -259,7 +280,7 @@ index 00000000..65d757ad
 +                            f"{label}: browser never produced a TLS outcome: "
 +                            f"{facts.get('error')!r} [{outcomes}]")
 +
-+    @gate
++    @gate("firefox")
 +    def test_ff_startup_observes_nss_store_traffic(self):
 +        """FF-STARTUP: Firefox HTTPS visit; NSS store enumeration observed."""
 +        store, _cred = self.seed()
@@ -285,7 +306,7 @@ index 00000000..65d757ad
 +        self.check_report(result, store, oracle.FF_STARTUP_FLOORS, attached=True,
 +                          allowed_gaps=_GAPS_ATTACHED_FLOOR)
 +
-+    @gate
++    @gate("chromium")
 +    def test_cr_plain_validates_without_private_token_use(self):
 +        """CR-PLAIN: Chromium validates with the provider mapped; no private use."""
 +        store, _cred = self.seed()
@@ -309,7 +330,7 @@ index 00000000..65d757ad
 +        self.check_report(result, store, oracle.CR_ENUMERATION_FLOORS, attached=True,
 +                          allowed_gaps=_GAPS_ATTACHED_ABSENT, absent=_PINBOUND_ABSENT)
 +
-+    @gate
++    @gate("firefox")
 +    def test_ff_nomod_observes_nothing(self):
 +        """FF-NOMOD: unregistered provider; the browser maps nothing, zero rows."""
 +        store, _cred = self.seed()
@@ -325,7 +346,7 @@ index 00000000..65d757ad
 +                          allowed_gaps=_GAPS_NEVER_MAPPED_RUN,
 +                          allowed_verdicts=_VERDICTS_NEVER_MAPPED)
 +
-+    @gate
++    @gate("firefox")
 +    def test_ff_pinbound_never_logs_in_or_signs(self):
 +        """FF-PINBOUND: CERT_REQUIRED; selection races, login never happens."""
 +        store, cred = self.seed()
@@ -353,7 +374,7 @@ index 00000000..65d757ad
 +                          allowed_gaps=_GAPS_ATTACHED_ABSENT,
 +                          absent=_PINBOUND_ABSENT)
 +
-+    @gate
++    @gate("chromium")
 +    def test_cr_pinbound_stalls_before_login_or_signing(self):
 +        """CR-PINBOUND: CERT_REQUIRED; selection enumerates, login never happens."""
 +        store, cred = self.seed()

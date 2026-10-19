@@ -243,8 +243,29 @@ impl DiscoveryScheduler {
     /// Rotate sorted newcomers past the last attempted process, even if that
     /// attempt could not retain or scan it. Successful admission alone cannot
     /// advance fairness when lower PIDs remain unreadable on every tick.
+    /// Production admission uses this while view slots are free and
+    /// `new_view_order_pending_first` once they are scarce.
     pub(crate) fn new_view_order(&self, pids: &[u32]) -> Vec<u32> {
         Self::rotated_after(pids, self.new_view_cursor)
+    }
+
+    /// Newcomer order with event-driven priority (Lane-A P2a): pids holding
+    /// queued refresh requests first, then rotation candidates, each class
+    /// rotated after the cursor. Ordinary ticks serve event-driven work
+    /// before exploratory rotation by design; without the priority, freed
+    /// view slots refill with ascending ambient candidates while pending
+    /// newcomers starve. The pending class drains, so rotation is delayed,
+    /// never starved. `pids` must be sorted ascending.
+    pub(crate) fn new_view_order_pending_first(
+        &self,
+        pids: &[u32],
+        pending: &BTreeSet<u32>,
+    ) -> Vec<u32> {
+        let (queued, exploratory): (Vec<u32>, Vec<u32>) =
+            pids.iter().copied().partition(|pid| pending.contains(pid));
+        let mut ordered = Self::rotated_after(&queued, self.new_view_cursor);
+        ordered.extend(Self::rotated_after(&exploratory, self.new_view_cursor));
+        ordered
     }
 
     /// Called only after the tick's time and capacity checks permit an attempt.
@@ -551,6 +572,30 @@ mod tests {
         let pids = [1, 2, 3];
         let exclude = BTreeSet::new();
         assert!(DiscoveryScheduler::rotation_window(&pids, &exclude, 0).is_empty());
+    }
+
+    /// Lane-A P2a: the admission window serves pending-request newcomers
+    /// before rotation candidates, with cursor fairness inside each class.
+    #[test]
+    fn pending_requests_sort_before_rotation_candidates() {
+        let scheduler = DiscoveryScheduler::new();
+        let pending: BTreeSet<u32> = [7, 3].into_iter().collect();
+        assert_eq!(
+            scheduler.new_view_order_pending_first(&[1, 3, 5, 7, 9], &pending),
+            vec![3, 7, 1, 5, 9]
+        );
+        // No pending: identical to the plain rotation order.
+        assert_eq!(
+            scheduler.new_view_order_pending_first(&[1, 3, 5], &BTreeSet::new()),
+            scheduler.new_view_order(&[1, 3, 5])
+        );
+        // The cursor rotates inside each class independently.
+        let mut rotated = DiscoveryScheduler::new();
+        rotated.note_new_view_attempt(5);
+        assert_eq!(
+            rotated.new_view_order_pending_first(&[1, 3, 5, 7, 9], &pending),
+            vec![7, 3, 9, 1, 5]
+        );
     }
 
     /// A fairness checkpoint covers every H1 accounting cursor: after

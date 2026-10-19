@@ -2517,6 +2517,16 @@ fn h3_combined_workload() {
     // open/hold/detach/complete cycle, floored at 32 meaningful
     // keys; the asserts below fail loudly if charge drift ever
     // eats that headroom.
+    //
+    // Owner capacity note (2026-10-19, both advisors agree): the ~365 KiB
+    // margin under this synthetic ceiling load is thin but held, and the
+    // floor below is the tripwire — no capacity decision now, 64 MiB stays.
+    // Flip to a capacity decision if: (1) the floor trips with refused>0 or
+    // lossy>0 on the pinned load; (2) any production-shaped (non-synthetic)
+    // load refuses S1; (3) margin drops below the pending-32 cost (~512 KiB).
+    // On flip: per-charge diet/admission tightening first, envelope raise
+    // second. Never assert retained_sum against the S1 pool (it mixes
+    // unapproved H9-side heaps).
     let pending_n = (headroom / 4 / 16384).clamp(32, 512);
     println!(
         "H3_C_HEADROOM {{\"charged\": {}, \"limit\": {}, \"pending_n\": {pending_n}}}",

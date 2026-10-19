@@ -2381,18 +2381,26 @@ fn operator_diagnostics_wrap_twin_startup_wrong_range_fail() -> Result<()> {
     Ok(())
 }
 
-/// Twin helper: terminal proof/fence records for 32 distinct pairs.
+/// Twin helper: terminal proof/fence records for 32 distinct pairs, with
+/// the full retained boundary premise: caller identity, fence absolute,
+/// single-publication edge_total, retained observation refs and a strictly
+/// later recovery window (fence POST 7010 < proof PRE 7020).
 fn twin_terminal_records() -> Vec<serde_json::Value> {
     let mut records = Vec::new();
     for index in 0..32 {
         records.push(
             serde_json::json!({"kind":"count_decision","decision":"withheld",
             "pair":format!("p{index}"),"reason":"awaiting_fence",
-            "after":658,"through":659}),
+            "after":658,"through":659,"absolute":659,
+            "caller":"c0","pre":7000,"post":7010,
+            "observation_ref":{"seq":1000+index,"status":"retained"}}),
         );
         records.push(serde_json::json!({"kind":"publication","decision":"placed",
             "module_id":"mB","pair":format!("p{index}"),
-            "base":659,"absolute":660,"staged":1}));
+            "base":659,"absolute":660,"staged":1,"edge_total":1,
+            "caller":"c0","pre":7020,"post":7030,
+            "baseline_pre":7000,"baseline_post":7010,
+            "observation_ref":{"seq":2000+index,"status":"retained"}}));
     }
     records
 }
@@ -2439,6 +2447,178 @@ fn operator_diagnostics_wrap_twin_terminal_single_pair_rejected() -> Result<()> 
     // Wrong module rejected.
     let other_module = twin_terminal_records();
     ensure!(check_terminal_pairs(&other_module, &serde_json::json!("mA")).is_err());
+    Ok(())
+}
+
+#[test]
+fn operator_diagnostics_wrap_twin_terminal_requires_single_publication() -> Result<()> {
+    // The B=1 projection is sound only if all 32 proofs overlap in one
+    // publication (edge_total == 1 on every proof). A split recovery
+    // (edge_total 2) or a missing projection must FAIL.
+    let mut split = twin_terminal_records();
+    for row in split.iter_mut().skip(1).step_by(2) {
+        row["edge_total"] = serde_json::json!(2);
+    }
+    // skip(1).step_by(2) hits odd indices (proofs): verify the premise.
+    ensure!(split[1]["edge_total"] == 2 && split[3]["edge_total"] == 2);
+    ensure!(split[0].get("edge_total").is_none());
+    ensure!(check_terminal_pairs(&split, &serde_json::json!("mB")).is_err());
+    let mut missing = twin_terminal_records();
+    for row in missing.iter_mut().skip(1).step_by(2) {
+        row.as_object_mut().unwrap().remove("edge_total");
+    }
+    ensure!(missing[1].get("edge_total").is_none());
+    ensure!(check_terminal_pairs(&missing, &serde_json::json!("mB")).is_err());
+    Ok(())
+}
+
+#[test]
+fn operator_diagnostics_wrap_twin_terminal_requires_retained_refs() -> Result<()> {
+    // Retained boundary observations must back every fence and proof: a
+    // lost or missing observation ref must FAIL, never pass silently.
+    let mut lost_proof = twin_terminal_records();
+    lost_proof[1]["observation_ref"]["status"] = serde_json::json!("not_retained");
+    ensure!(check_terminal_pairs(&lost_proof, &serde_json::json!("mB")).is_err());
+    let mut lost_fence = twin_terminal_records();
+    lost_fence[0]["observation_ref"]["status"] = serde_json::json!("not_retained");
+    ensure!(check_terminal_pairs(&lost_fence, &serde_json::json!("mB")).is_err());
+    let mut missing = twin_terminal_records();
+    missing[1].as_object_mut().unwrap().remove("observation_ref");
+    ensure!(check_terminal_pairs(&missing, &serde_json::json!("mB")).is_err());
+    Ok(())
+}
+
+#[test]
+fn operator_diagnostics_wrap_twin_terminal_requires_later_recovery() -> Result<()> {
+    // Recovery needs a strictly later advancing read: the proof window
+    // must open after the fence window closes (baseline_post < pre).
+    let mut simultaneous = twin_terminal_records();
+    simultaneous[1]["baseline_post"] = serde_json::json!(7020);
+    ensure!(check_terminal_pairs(&simultaneous, &serde_json::json!("mB")).is_err());
+    let mut backwards = twin_terminal_records();
+    backwards[1]["baseline_post"] = serde_json::json!(7035);
+    ensure!(check_terminal_pairs(&backwards, &serde_json::json!("mB")).is_err());
+    let mut missing = twin_terminal_records();
+    missing[1].as_object_mut().unwrap().remove("baseline_post");
+    ensure!(check_terminal_pairs(&missing, &serde_json::json!("mB")).is_err());
+    Ok(())
+}
+
+#[test]
+fn operator_diagnostics_wrap_twin_terminal_rejects_overlapping_placement() -> Result<()> {
+    // No B placement may overlap a withheld fence interval: a (658,660]
+    // double-placement on p0 must FAIL even though the exact proof exists.
+    let mut doubled = twin_terminal_records();
+    doubled.push(serde_json::json!({"kind":"publication","decision":"placed",
+        "module_id":"mB","pair":"p0","base":658,"absolute":660,"staged":2,
+        "edge_total":2,"caller":"c0","pre":7020,"post":7030,
+        "baseline_pre":7000,"baseline_post":7010,
+        "observation_ref":{"seq":2000,"status":"retained"}}));
+    ensure!(check_terminal_pairs(&doubled, &serde_json::json!("mB")).is_err());
+    Ok(())
+}
+
+#[test]
+fn operator_diagnostics_wrap_twin_terminal_rejects_extra_b_placement() -> Result<()> {
+    // B must carry exactly the 32 proofs: any extra placement, even outside
+    // the fence interval, must FAIL (early or foreign attribution).
+    let mut extra = twin_terminal_records();
+    extra.push(serde_json::json!({"kind":"publication","decision":"placed",
+        "module_id":"mB","pair":"p0","base":660,"absolute":661,"staged":1,
+        "edge_total":2,"caller":"c0","pre":7040,"post":7050,
+        "baseline_pre":7020,"baseline_post":7030,
+        "observation_ref":{"seq":2000,"status":"retained"}}));
+    ensure!(check_terminal_pairs(&extra, &serde_json::json!("mB")).is_err());
+    Ok(())
+}
+
+#[test]
+fn operator_diagnostics_wrap_twin_terminal_requires_caller_identity() -> Result<()> {
+    // All 32 fences and proofs must share one caller: a foreign proof and
+    // a fence with the wrong absolute must FAIL.
+    let mut foreign = twin_terminal_records();
+    foreign[1]["caller"] = serde_json::json!("c9");
+    ensure!(check_terminal_pairs(&foreign, &serde_json::json!("mB")).is_err());
+    let mut wrong_absolute = twin_terminal_records();
+    wrong_absolute[0]["absolute"] = serde_json::json!(660);
+    ensure!(check_terminal_pairs(&wrong_absolute, &serde_json::json!("mB")).is_err());
+    Ok(())
+}
+
+#[test]
+fn operator_diagnostics_wrap_twin_terminal_rejects_compensating_absolutes() -> Result<()> {
+    // Per-pair exactness, not aggregate sums: one proof at 659 and another
+    // at 661 keeps the 21,120 sum but must FAIL.
+    let mut compensating = twin_terminal_records();
+    compensating[1]["absolute"] = serde_json::json!(659);
+    compensating[3]["absolute"] = serde_json::json!(661);
+    ensure!(check_terminal_pairs(&compensating, &serde_json::json!("mB")).is_err());
+    Ok(())
+}
+
+#[test]
+fn operator_diagnostics_wrap_twin_one_ring_wrap_fails() -> Result<()> {
+    // Both default rings must really wrap: an export with ordinary
+    // evictions but zero exceptional evictions must FAIL.
+    let (mut healthy, _) = diagnostic_validator_fixture();
+    let last = healthy.len() - 1;
+    healthy[last]["kinds"][1]["evicted"] = serde_json::json!(0);
+    healthy[last]["kinds"][1]["produced"] = serde_json::json!(1);
+    let bytes = seal_validator_fixture(&mut healthy);
+    ensure!(check_wrap_records(&healthy, bytes, &serde_json::json!("mB"), 123).is_err());
+    Ok(())
+}
+
+#[test]
+fn operator_diagnostics_wrap_twin_probe_double_placed_fence_fails() -> Result<()> {
+    // A fenced pair's withheld second unit cannot also be placed: adding a
+    // placed (2,1) publication alongside the p0 fence must FAIL.
+    let calls = [(90, 110), (130, 150), (170, 190)];
+    let module = serde_json::json!("mA");
+    let mut fenced = startup_probe_validator_fixture(true);
+    let obs_seq = fenced
+        .iter()
+        .find(|row| {
+            row["kind"] == "count_observation" && row["pair"] == "p0" && row["absolute"] == 2
+        })
+        .and_then(|row| row["seq"].as_u64())
+        .context("p0 second observation")?;
+    let footer = fenced.pop().context("probe footer")?;
+    let max_seq = fenced
+        .iter()
+        .filter_map(|row| row["seq"].as_u64())
+        .max()
+        .context("max probe seq")?;
+    fenced.push(serde_json::json!({"kind":"publication","decision":"placed","reason":"sole_owner",
+        "pair":"p0","seq":max_seq+1,"module_id":"mA","absolute":2,"base":1,
+        "staged":1,"observation_ref":{"seq":obs_seq,"status":"retained"},
+        "baseline_pre":150,"baseline_post":160}));
+    let mut footer = footer;
+    footer["records_written"] = serde_json::json!(fenced.len() as u64 - 1);
+    // Publication is kinds[3] (count_observation, ownership_transition,
+    // count_decision, publication, capture_health).
+    let before = footer["kinds"][3]["retained"].as_u64().context("pub retained")?;
+    footer["kinds"][3]["retained"] = serde_json::json!(before + 1);
+    footer["kinds"][3]["produced"] = serde_json::json!(before + 1);
+    fenced.push(footer);
+    ensure!(check_startup_probe_records(&fenced, 2, 123, &module, &calls, 32).is_err());
+    Ok(())
+}
+
+#[test]
+fn operator_diagnostics_wrap_twin_primary_facts_rejects_wrong_b() -> Result<()> {
+    // B is exactly 1 (32 overlapping proofs in one publication): 0, 2 and
+    // the old summed 32 must FAIL under both dispositions.
+    for k in [0, 32] {
+        for wrong in [0, 2, 32] {
+            let mut altered = primary_validator_fixture_k(123, 0, k);
+            altered["edges"][1]["entries"]["count"] = serde_json::json!(wrong);
+            ensure!(
+                primary_facts_k(&altered, 123, k).is_err(),
+                "wrong B accepted: k={k} B={wrong}"
+            );
+        }
+    }
     Ok(())
 }
 

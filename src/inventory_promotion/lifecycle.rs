@@ -560,14 +560,25 @@ impl std::fmt::Debug for UnprovedOwner {
 /// outcome and any disposal in flight instead of destroying them.
 /// Retention is by `mem::forget` (the `release_terminal_owner`
 /// precedent): nothing here needs `Send`, and the forgotten owners
-/// live until process exit. Tests observe retention through the
-/// counter; production never reads it.
+/// live until process exit. Tests observe retention through specific
+/// identities (tagged failures, retained channels), never a shared
+/// counter parallel tests could satisfy for each other; production
+/// never reads them.
 #[cfg(test)]
-static CUSTODY_RETAINED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static CUSTODY_RETAINED_IDS: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+static NEXT_CUSTODY_TEST_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+#[cfg(test)]
+fn record_retained_id(id: u64) {
+    CUSTODY_RETAINED_IDS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .push(id);
+}
 
 fn retain_for_process_exit<T>(owner: T) {
-    #[cfg(test)]
-    CUSTODY_RETAINED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     std::mem::forget(owner);
 }
 
@@ -588,6 +599,11 @@ enum ServiceState {
         /// Cancel/stop was requested while the worker ran: the CAS is
         /// skipped and the outcome is disposed, never installed.
         cancel: Option<PromotionEnd>,
+        /// Tests-only retention identity for the worker channel: the
+        /// live-worker twin observes this specific channel surviving,
+        /// never a shared counter.
+        #[cfg(test)]
+        channel_id: u64,
     },
     Disposing {
         request: PromotionRequest,
@@ -656,6 +672,8 @@ impl SelectedLifecycleService {
                 settle_outcome_best_effort(returned.0);
             }
         });
+        #[cfg(test)]
+        let channel_id = NEXT_CUSTODY_TEST_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.state = ServiceState::Preparing {
             request,
             capacity,
@@ -663,6 +681,8 @@ impl SelectedLifecycleService {
             outcome: rx,
             worker: Some(worker),
             cancel: None,
+            #[cfg(test)]
+            channel_id,
         };
         Ok(())
     }
@@ -938,11 +958,45 @@ impl SelectedLifecycleService {
         retain_for_process_exit(UnprovedOwner::Lane(lane));
     }
 
-    /// How many unresolved owners reached process-lifetime custody in
-    /// this process: the retention twins diff around their own drop.
+    /// Mint one custody-twin identity: each twin tags its own failure
+    /// (or observes its own channel), so parallel twins can never
+    /// satisfy each other.
     #[cfg(test)]
-    pub(crate) fn custody_retained_for_test() -> usize {
-        CUSTODY_RETAINED.load(std::sync::atomic::Ordering::SeqCst)
+    pub(crate) fn next_custody_test_id_for_test() -> u64 {
+        NEXT_CUSTODY_TEST_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The identities that reached process-lifetime custody in this
+    /// process: twins assert their own identity is present, never a
+    /// shared counter increase.
+    #[cfg(test)]
+    pub(crate) fn custody_retained_ids_for_test() -> Vec<u64> {
+        CUSTODY_RETAINED_IDS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    /// The live worker channel's retention identity, while preparing:
+    /// the channel twins observe this specific channel surviving.
+    #[cfg(test)]
+    pub(crate) fn preparing_channel_id_for_test(&self) -> Option<u64> {
+        match &self.state {
+            ServiceState::Preparing { channel_id, .. } => Some(*channel_id),
+            _ => None,
+        }
+    }
+}
+
+/// Tests-only retention identity for an unproved owner: tagged
+/// failures carry their twin's id; lanes and ready outcomes record
+/// nothing (no custody twin tags them).
+#[cfg(test)]
+fn unproved_owner_test_id(owner: &UnprovedOwner) -> Option<u64> {
+    match owner {
+        UnprovedOwner::Preparation(failure) => failure.retention_test_id(),
+        UnprovedOwner::Outcome(PreparationOutcome::Failed(failure)) => failure.retention_test_id(),
+        UnprovedOwner::Outcome(PreparationOutcome::Ready(_)) | UnprovedOwner::Lane(_) => None,
     }
 }
 
@@ -959,7 +1013,16 @@ impl Drop for SelectedLifecycleService {
     /// a live worker is detached and its late send lands in the
     /// retained channel; a dead worker's handle detaches.
     fn drop(&mut self) {
+        #[cfg(test)]
+        let preparing_channel_id = match &self.state {
+            ServiceState::Preparing { channel_id, .. } => Some(*channel_id),
+            _ => None,
+        };
         for owner in std::mem::take(&mut self.unproved) {
+            #[cfg(test)]
+            if let Some(id) = unproved_owner_test_id(&owner) {
+                record_retained_id(id);
+            }
             retain_for_process_exit(owner);
         }
         let state = std::mem::replace(&mut self.state, ServiceState::Idle);
@@ -971,6 +1034,12 @@ impl Drop for SelectedLifecycleService {
                 drop(worker);
                 match outcome.try_recv() {
                     Ok(delivered) => {
+                        #[cfg(test)]
+                        if let PreparationOutcome::Failed(failure) = &delivered
+                            && let Some(id) = failure.retention_test_id()
+                        {
+                            record_retained_id(id);
+                        }
                         retain_for_process_exit(UnprovedOwner::Outcome(delivered));
                     }
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -982,15 +1051,24 @@ impl Drop for SelectedLifecycleService {
                         // itself so its late send lands in custody
                         // instead of dying with the receiver. The
                         // detached worker then exits on its own.
+                        #[cfg(test)]
+                        if let Some(id) = preparing_channel_id {
+                            record_retained_id(id);
+                        }
                         retain_for_process_exit(outcome);
                     }
                 }
             }
             ServiceState::Disposing { outcome, .. } => {
-                retain_for_process_exit(match outcome {
+                let owner = match outcome {
                     DisposingOutcome::Preparation(failure) => UnprovedOwner::Preparation(failure),
                     DisposingOutcome::Lane(lane) => UnprovedOwner::Lane(lane),
-                });
+                };
+                #[cfg(test)]
+                if let Some(id) = unproved_owner_test_id(&owner) {
+                    record_retained_id(id);
+                }
+                retain_for_process_exit(owner);
             }
             // Idle holds nothing; Installing already handed its parts
             // to the driver, which reclaims them on its own drop.
@@ -1511,12 +1589,14 @@ mod tests {
 
     #[test]
     fn dropped_service_retains_unproved_owner_for_process_exit() {
-        let before = SelectedLifecycleService::custody_retained_for_test();
+        let id = SelectedLifecycleService::next_custody_test_id_for_test();
         let (mut promoter, request) = taken_request_for_test();
         let mut service = SelectedLifecycleService::new();
         service
-            .start(request, capacity(), stub_source(None).0, || {
-                PreparationOutcome::Failed(SelectedPreparationFailure::scripted_unproved())
+            .start(request, capacity(), stub_source(None).0, move || {
+                PreparationOutcome::Failed(SelectedPreparationFailure::scripted_unproved_with_id(
+                    id,
+                ))
             })
             .expect("start runs");
         let event = poll_until(&mut service, Duration::from_secs(5)).expect("terminal event");
@@ -1532,36 +1612,41 @@ mod tests {
         assert!(service.is_idle());
         drop(service);
         assert!(
-            SelectedLifecycleService::custody_retained_for_test() > before,
-            "the unproved owner survives the service"
+            SelectedLifecycleService::custody_retained_ids_for_test().contains(&id),
+            "this twin's unproved owner survives the service: {id}"
         );
     }
 
     #[test]
     fn dropped_service_retains_queued_outcome_for_process_exit() {
-        let before = SelectedLifecycleService::custody_retained_for_test();
+        let outcome_id = SelectedLifecycleService::next_custody_test_id_for_test();
         let (_promoter, request) = taken_request_for_test();
         let mut service = SelectedLifecycleService::new();
         service
-            .start(request, capacity(), stub_source(None).0, || {
-                PreparationOutcome::Failed(SelectedPreparationFailure::scripted_settled())
+            .start(request, capacity(), stub_source(None).0, move || {
+                PreparationOutcome::Failed(SelectedPreparationFailure::scripted_settled_with_id(
+                    outcome_id,
+                ))
             })
             .expect("start runs");
+        let channel_id = service
+            .preparing_channel_id_for_test()
+            .expect("preparing holds its channel");
         // Drop without polling: a delivered outcome is retained whole,
         // and a still-running worker's channel is retained so its late
-        // send lands in custody. Either way the count grows; the drop
-        // itself never blocks and never joins.
+        // send lands in custody. Either way this twin's own identity
+        // survives; the drop itself never blocks and never joins.
         std::thread::sleep(Duration::from_millis(100));
         drop(service);
+        let retained = SelectedLifecycleService::custody_retained_ids_for_test();
         assert!(
-            SelectedLifecycleService::custody_retained_for_test() > before,
-            "the queued outcome or its channel survives the service"
+            retained.contains(&outcome_id) || retained.contains(&channel_id),
+            "this twin's queued outcome ({outcome_id}) or its channel ({channel_id}) survives"
         );
     }
 
     #[test]
     fn dropped_service_retains_live_worker_channel_for_process_exit() {
-        let before = SelectedLifecycleService::custody_retained_for_test();
         let (_promoter, request) = taken_request_for_test();
         let mut service = SelectedLifecycleService::new();
         let (gate, release) = std::sync::mpsc::channel::<()>();
@@ -1571,12 +1656,15 @@ mod tests {
                 PreparationOutcome::Failed(SelectedPreparationFailure::scripted_settled())
             })
             .expect("start runs");
+        let channel_id = service
+            .preparing_channel_id_for_test()
+            .expect("preparing holds its channel");
         // Drop while the worker still runs: no delivery, no join, no
-        // hang — the channel itself is retained for the late send.
+        // hang — this twin's own channel is retained for the late send.
         drop(service);
         assert!(
-            SelectedLifecycleService::custody_retained_for_test() > before,
-            "the live worker's channel survives the service"
+            SelectedLifecycleService::custody_retained_ids_for_test().contains(&channel_id),
+            "this twin's live worker channel survives the service: {channel_id}"
         );
         gate.send(()).expect("the detached worker still exits");
     }

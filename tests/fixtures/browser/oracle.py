@@ -12,6 +12,10 @@ event loss, probes attached) rather than by ``COMPLETE``: scan-path
 captures without operator manifests report ``PARTIAL`` with
 ``attribution_only`` (counts exact, names withheld) or ``concrete_gap``
 (window caveats), and the oracle pins which one each cell earned.
+Observation gaps are allowlisted per cell (only causes that provably do
+not affect the asserted property), kernel capture failures fail every
+cell, and absence checks count entered-but-unreturned calls and refuse
+unattributed rows.
 """
 
 from __future__ import annotations
@@ -49,11 +53,14 @@ def sha256_of(path: Path) -> str:
 
 
 def module_counts(report: dict[str, Any], module_sha: str) -> dict[str, int]:
-    """Sum ``calls`` per function name for rows attached into ``module_sha``.
+    """Sum completed ``calls`` per function name for rows into ``module_sha``.
 
     Rows are matched by the pinned object identity
     (``target.object.sha256``), never by name alone; a retired-and-reattached
-    target contributes one row per cell, so counts sum across rows.
+    target contributes one row per cell, so counts sum across rows. Rows no
+    authorized source named (``["unknown"]``, empty, or missing names) are
+    bucketed under ``"unknown"`` so unattributed activity can never hide
+    behind a missing label.
     """
     counts: dict[str, int] = {}
     for row in report.get("functions", []):
@@ -62,9 +69,28 @@ def module_counts(report: dict[str, Any], module_sha: str) -> dict[str, int]:
         if obj.get("sha256") != module_sha:
             continue
         calls = row.get("calls") or 0
-        for name in row.get("names", []):
+        for name in row.get("names") or ["unknown"]:
             counts[name] = counts.get(name, 0) + calls
     return counts
+
+
+def module_open_entries(report: dict[str, Any], module_sha: str) -> dict[str, int]:
+    """Sum ``in_flight`` (entries minus returns) per name for ``module_sha``.
+
+    Same row matching and ``"unknown"`` bucketing as module_counts.
+    Absence checks read this beside the return counts: an entered call
+    happened even when its return never arrived.
+    """
+    opened: dict[str, int] = {}
+    for row in report.get("functions", []):
+        target = row.get("target") or {}
+        obj = target.get("object") or {}
+        if obj.get("sha256") != module_sha:
+            continue
+        entries = row.get("in_flight") or 0
+        for name in row.get("names") or ["unknown"]:
+            opened[name] = opened.get(name, 0) + entries
+    return opened
 
 
 def evidence(report: dict[str, Any]) -> dict[str, Any]:
@@ -100,22 +126,123 @@ def check_min_counts(counts: dict[str, int], floors: dict[str, int]) -> list[str
     return failures
 
 
-def check_zero_counts(counts: dict[str, int]) -> list[str]:
-    """No calls were observed for the module (absence twin)."""
+def check_zero_counts(counts: dict[str, int],
+                      open_entries: dict[str, int] | None = None) -> list[str]:
+    """No calls or open entries were observed for the module (absence twin)."""
     failures = []
-    total = sum(counts.values())
+    returned = sum(counts.values())
+    opened = sum((open_entries or {}).values())
+    total = returned + opened
     if total != 0:
-        failures.append(f"observed {total} calls for an unregistered module: {counts}")
+        failures.append(
+            f"observed {total} calls/entries, want 0 "
+            f"(returned={returned} open={opened} counts={counts})")
     return failures
 
 
-def check_absent(counts: dict[str, int], names: tuple[str, ...]) -> list[str]:
-    """Named functions were never called (boundary pins amid noisy traffic)."""
+def check_absent(counts: dict[str, int], names: tuple[str, ...],
+                 open_entries: dict[str, int] | None = None) -> list[str]:
+    """Named functions were never called (boundary pins amid noisy traffic).
+
+    ``open_entries`` (from module_open_entries) counts entered-but-unreturned
+    calls per name; an in-flight forbidden call crossed the boundary even
+    though it never returned. Rows no authorized source named (the
+    ``"unknown"`` bucket, returned or open) fail every absence: a forbidden
+    call could be hiding in unattributed activity.
+    """
     failures = []
+    opened = open_entries or {}
     for name in names:
         observed = counts.get(name, 0)
         if observed != 0:
             failures.append(f"{name}: observed {observed}, want 0 (boundary crossed?)")
+        entered = opened.get(name, 0)
+        if entered != 0:
+            failures.append(
+                f"{name}: {entered} entered but unreturned "
+                f"(in-flight at end) (boundary crossed?)")
+    unattributed = counts.get("unknown", 0) + opened.get("unknown", 0)
+    if unattributed != 0:
+        failures.append(
+            f"unknown: {unattributed} unattributed calls/entries hide "
+            f"{list(names)} (absence unprovable)")
+    return failures
+
+
+def check_observation_gaps(report: dict[str, Any], allowed) -> list[str]:
+    """Every observation gap cause is explicitly allowed for this cell.
+
+    ``allowed`` names the causes that provably do not affect the cell's
+    asserted property (per-cell table in the suite); any other cause fails.
+    A missing ``gap_classes.observation`` block fails closed: coverage that
+    cannot be verified is not coverage.
+    """
+    failures = []
+    classes = evidence(report).get("gap_classes")
+    if not isinstance(classes, dict) or "observation" not in classes:
+        return ["gap_classes.observation missing: cannot verify observation coverage"]
+    observation = classes["observation"] or {}
+    causes = observation.get("causes") or []
+    allowed_set = set(allowed)
+    for cause in causes:
+        if cause not in allowed_set:
+            failures.append(
+                f"observation gap cause {cause!r} not allowed for this cell "
+                f"(allowed: {sorted(allowed_set)})")
+    return failures
+
+
+def check_capture_intact(report: dict[str, Any]) -> list[str]:
+    """No kernel capture failure truncated or refused the observation.
+
+    A halted capture (owner poison), refused owner admissions, unavailable
+    identities, or root affiliation failures mean calls after some moment
+    were never counted; the cell's window is void for floors and absences
+    alike. Healthy runs keep every counter at zero. A missing
+    ``kernel_control`` block fails closed (v3 always carries it).
+    """
+    failures = []
+    control = evidence(report).get("kernel_control")
+    if not isinstance(control, dict):
+        return ["kernel_control missing: cannot verify capture integrity"]
+    if control.get("capture_halted"):
+        failures.append(
+            f"capture_halted with owner_poison={control.get('owner_poison')}: "
+            f"calls after the halt were never counted")
+    for key in ("owner_admission_failures", "identity_unavailable"):
+        value = control.get(key) or 0
+        if value != 0:
+            failures.append(
+                f"kernel_control.{key}={value}, want 0 (refused/lost call accounting)")
+    refused = control.get("root_affiliation_failures") or []
+    if refused:
+        failures.append(
+            f"kernel_control.root_affiliation_failures={refused}: "
+            f"discovery attribution incomplete")
+    return failures
+
+
+#: Skipped-record reasons that carry no coverage gap: NULL table entries
+#: (never callable) and discovery subjects skipped because the module was
+#: never mapped (the structural never-mapped shape).
+STRUCTURAL_SKIPPED_REASONS = frozenset({"null pointer", "discovery unavailable"})
+
+
+def check_skipped_structural(report: dict[str, Any]) -> list[str]:
+    """Every skipped record is structural, never a detach-coverage gap.
+
+    Static detach history retains observation loss through the ``skipped``
+    cause even after exact pairs reattach: calls during the gap may be
+    missing. Never-mapped cells allow the ``skipped`` cause only when every
+    record is structural (checked here, beside the cause allowance).
+    """
+    failures = []
+    for record in evidence(report).get("skipped") or []:
+        reason = (record or {}).get("reason")
+        if reason not in STRUCTURAL_SKIPPED_REASONS:
+            failures.append(
+                f"skipped record {(record or {}).get('name')!r} reason {reason!r}: "
+                f"possible coverage gap, want structural only")
     return failures
 
 

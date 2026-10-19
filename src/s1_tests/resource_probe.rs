@@ -11,6 +11,108 @@ use crate::discovery::caller_registry::instance_input::{
 use crate::semantics_edge::resource_tests::{Memory, measure, run_child};
 use std::mem::size_of;
 
+/// H3-MEM measurement classification: five disjoint labels over one stage,
+/// so verdicts never conflate requested bytes with process RSS again.
+/// - `peak_live_retained_bytes`: requested bytes still live at stage end
+///   (bounded peak-tracker stages only).
+/// - `peak_transient_bytes`: peak minus live — temporaries freed inside
+///   the stage (bounded stages only).
+/// - `cumulative_requested_bytes`: every request summed, temporaries and
+///   realloc destinations included; always covers the peak.
+/// - `allocator_and_fixture_rss_bytes`: whole-process peak RSS — the test
+///   binary baseline plus every fixture — never a requested-bytes input.
+/// - `kernel_map_payload_bytes`: mmap-reserved bytes after the stage (the
+///   large-request path); retained heap is the allocator delta, not a sum.
+/// Shared borrows (`Arc` clones) request nothing; only physical copies and
+/// owned nodes (BTree, buffers, sorts' scratch) count. In-place sorts and
+/// the churn rounds' fresh presentations are inside measured stages, so the
+/// labels cover old+new presentations, emitter indexes and encoding buffers.
+fn classify_small_stage(
+    name: &str,
+    peak: &crate::test_alloc::RequestedAllocationPeak,
+    allocation_requests: usize,
+    cumulative_requested_bytes: usize,
+    before: Memory,
+    after: Memory,
+) -> serde_json::Value {
+    assert!(
+        !peak.incomplete,
+        "{name}: peak tracker overflowed; use unbounded `measure`"
+    );
+    assert!(
+        peak.live_bytes <= peak.peak_bytes,
+        "{name}: live {} exceeds peak {}",
+        peak.live_bytes,
+        peak.peak_bytes
+    );
+    assert!(
+        peak.peak_bytes <= cumulative_requested_bytes,
+        "{name}: peak {} exceeds cumulative requested {cumulative_requested_bytes}",
+        peak.peak_bytes
+    );
+    let before_json = before.json();
+    let after_json = after.json();
+    serde_json::json!({
+        "stage": name,
+        "classification": {
+            "peak_live_retained_bytes": peak.live_bytes,
+            "peak_transient_bytes": peak.peak_bytes - peak.live_bytes,
+            "cumulative_requested_bytes": cumulative_requested_bytes,
+            "allocation_requests": allocation_requests,
+            "realloc_overlap_bytes": peak.realloc_overlap_bytes,
+            "allocator_heap_used_delta_bytes": after_json["glibc_heap_used_bytes"].as_u64().unwrap() as i128
+                - before_json["glibc_heap_used_bytes"].as_u64().unwrap() as i128,
+            "allocator_mmap_reserved_delta_bytes": after_json["glibc_mmap_reserved_bytes"].as_u64().unwrap() as i128
+                - before_json["glibc_mmap_reserved_bytes"].as_u64().unwrap() as i128,
+            "allocator_and_fixture_rss_bytes": after_json["process_peak_rss_bytes"],
+            "kernel_map_payload_bytes": after_json["glibc_mmap_reserved_bytes"],
+        },
+    })
+}
+
+/// One bounded stage under both instruments plus process snapshots: the
+/// value, its peak report (for the existing live/peak assertions), and a
+/// stage object carrying the five classification labels.
+fn measure_classified<T>(
+    name: &str,
+    run: impl FnOnce() -> T,
+) -> (
+    T,
+    crate::test_alloc::RequestedAllocationPeak,
+    serde_json::Value,
+) {
+    let before = Memory::read();
+    let (value, peak, allocs, requested) = crate::test_alloc::counted_peak_during(run);
+    let after = Memory::read();
+    let stage = classify_small_stage(name, &peak, allocs, requested, before, after);
+    (value, peak, stage)
+}
+
+/// Classify an unbounded `measure` stage in place. No live/peak split
+/// exists here — the 8192-block tracker would overflow on a 4096-row
+/// tree — so retained is labeled as the allocator heap-delta estimate it
+/// is, never as requested-live. Returns nothing; the stage keeps its
+/// existing keys and gains `classification`.
+fn classify_large_stage(stage: &mut serde_json::Value) {
+    let requested = stage["requested_allocation_bytes"].as_u64().unwrap();
+    let heap_delta = stage["delta"]["glibc_heap_used_delta_bytes"]
+        .as_i64()
+        .unwrap();
+    let mmap_delta = stage["delta"]["glibc_mmap_reserved_delta_bytes"]
+        .as_i64()
+        .unwrap();
+    stage["classification"] = serde_json::json!({
+        "peak_live_retained_bytes": serde_json::Value::Null,
+        "peak_live_retained_note": "unbounded stage: no live/peak split; retained is the heap-delta estimate below",
+        "peak_transient_bytes": serde_json::Value::Null,
+        "cumulative_requested_bytes": requested,
+        "retained_heap_delta_estimate_bytes": heap_delta.max(0),
+        "allocator_mmap_reserved_delta_bytes": mmap_delta,
+        "allocator_and_fixture_rss_bytes": stage["after"]["process_peak_rss_bytes"],
+        "kernel_map_payload_bytes": stage["after"]["glibc_mmap_reserved_bytes"],
+    });
+}
+
 #[test]
 fn native_semantic_resource_projection_agrees_and_freezes() {
     use crate::semantics_edge::resources::*;
@@ -675,32 +777,33 @@ fn native_semantic_resource_batch_n_and_n_plus_one() {
 
     // Sparse: one empty batch. No heap for empty vectors.
     let domain = NativeDomainId::mint();
-    let (sparse, sparse_peak) = crate::test_alloc::requested_peak_during(|| {
+    let (sparse, sparse_peak, sparse_stage) = measure_classified("sparse_batch", || {
         SemanticBatch::scripted(domain, Vec::new(), 100)
     });
     assert!(!sparse_peak.incomplete);
     assert_eq!(sparse.into_parts().2.len(), 0);
     // Saturated negatives N=64: mixed variants, both fit the same 16-byte slot.
     // The vector is built inside the armed closure so its heap counts.
-    let (saturated, saturated_peak) = crate::test_alloc::requested_peak_during(|| {
-        let negatives: Vec<LaneNegative> = (0..MAX_LANE_NEGATIVES as u64)
-            .map(|ordinal| {
-                if ordinal % 2 == 0 {
-                    LaneNegative::CutBarrier { ordinal }
-                } else {
-                    LaneNegative::CollectionRefused {
-                        reason: if ordinal % 4 == 1 {
-                            LaneCollectionRefusal::Backpressure
-                        } else {
-                            LaneCollectionRefusal::CollectionFailed
-                        },
+    let (saturated, saturated_peak, saturated_stage) =
+        measure_classified("saturated_64_negatives", || {
+            let negatives: Vec<LaneNegative> = (0..MAX_LANE_NEGATIVES as u64)
+                .map(|ordinal| {
+                    if ordinal % 2 == 0 {
+                        LaneNegative::CutBarrier { ordinal }
+                    } else {
+                        LaneNegative::CollectionRefused {
+                            reason: if ordinal % 4 == 1 {
+                                LaneCollectionRefusal::Backpressure
+                            } else {
+                                LaneCollectionRefusal::CollectionFailed
+                            },
+                        }
                     }
-                }
-            })
-            .collect();
-        assert_eq!(negatives.len(), 64);
-        SemanticBatch::scripted(domain, negatives, 200)
-    });
+                })
+                .collect();
+            assert_eq!(negatives.len(), 64);
+            SemanticBatch::scripted(domain, negatives, 200)
+        });
     assert!(!saturated_peak.incomplete);
     assert_eq!(saturated.into_parts().2.len(), MAX_LANE_NEGATIVES);
     // N+1=65 negatives refuses; the batch is never constructed.
@@ -715,7 +818,7 @@ fn native_semantic_resource_batch_n_and_n_plus_one() {
         "65 negatives must refuse"
     );
     // Terminal staging N=33 batches, then N+1 sheds exactly one.
-    let (mut stage, stage_peak) = crate::test_alloc::requested_peak_during(|| {
+    let (mut stage, stage_peak, empty_stage) = measure_classified("terminal_33_empty", || {
         let mut stage = TerminalBatchStage::new();
         for marker in 0..TERMINAL_STAGED_BATCH_CAP as u64 {
             stage.push(SemanticBatch::scripted(domain, Vec::new(), marker));
@@ -729,7 +832,7 @@ fn native_semantic_resource_batch_n_and_n_plus_one() {
     assert_eq!(stage.len(), TERMINAL_STAGED_BATCH_CAP);
     assert_eq!(stage.shed(), 1);
     // Churn: 100 batches through the bounded stage; length stays capped.
-    let (churned, churn_peak) = crate::test_alloc::requested_peak_during(|| {
+    let (churned, churn_peak, churn_stage) = measure_classified("terminal_churn_100", || {
         let mut stage = TerminalBatchStage::new();
         for marker in 0..100 {
             stage.push(SemanticBatch::scripted(domain, Vec::new(), marker));
@@ -740,18 +843,19 @@ fn native_semantic_resource_batch_n_and_n_plus_one() {
     assert_eq!(churned.len(), TERMINAL_STAGED_BATCH_CAP);
     assert_eq!(churned.shed(), 100 - TERMINAL_STAGED_BATCH_CAP);
     // Saturated terminal: 33 batches each carrying 64 negatives.
-    let (full_stage, full_peak) = crate::test_alloc::requested_peak_during(|| {
-        let mut stage = TerminalBatchStage::new();
-        for batch in 0..TERMINAL_STAGED_BATCH_CAP as u64 {
-            let negatives: Vec<LaneNegative> = (0..MAX_LANE_NEGATIVES as u64)
-                .map(|ordinal| LaneNegative::CutBarrier {
-                    ordinal: batch * 1_000 + ordinal,
-                })
-                .collect();
-            stage.push(SemanticBatch::scripted(domain, negatives, batch));
-        }
-        stage
-    });
+    let (full_stage, full_peak, full_classified) =
+        measure_classified("terminal_33_saturated", || {
+            let mut stage = TerminalBatchStage::new();
+            for batch in 0..TERMINAL_STAGED_BATCH_CAP as u64 {
+                let negatives: Vec<LaneNegative> = (0..MAX_LANE_NEGATIVES as u64)
+                    .map(|ordinal| LaneNegative::CutBarrier {
+                        ordinal: batch * 1_000 + ordinal,
+                    })
+                    .collect();
+                stage.push(SemanticBatch::scripted(domain, negatives, batch));
+            }
+            stage
+        });
     assert!(!full_peak.incomplete);
     assert_eq!(full_stage.len(), TERMINAL_STAGED_BATCH_CAP);
     // Computed (not heap-measured) worst cases from pinned sizes: outcomes
@@ -770,11 +874,16 @@ fn native_semantic_resource_batch_n_and_n_plus_one() {
             "terminal_n": TERMINAL_STAGED_BATCH_CAP, "terminal_n_plus_one": TERMINAL_STAGED_BATCH_CAP + 1,
             "churn_batches": 100},
         "measured_peaks": {
-            "sparse_batch": {"live_bytes": sparse_peak.live_bytes, "peak_bytes": sparse_peak.peak_bytes},
-            "saturated_64_negatives": {"live_bytes": saturated_peak.live_bytes, "peak_bytes": saturated_peak.peak_bytes},
-            "terminal_33_empty": {"live_bytes": stage_peak.live_bytes, "peak_bytes": stage_peak.peak_bytes},
-            "terminal_churn_100": {"live_bytes": churn_peak.live_bytes, "peak_bytes": churn_peak.peak_bytes},
-            "terminal_33_saturated": {"live_bytes": full_peak.live_bytes, "peak_bytes": full_peak.peak_bytes},
+            "sparse_batch": {"live_bytes": sparse_peak.live_bytes, "peak_bytes": sparse_peak.peak_bytes,
+                "classification": sparse_stage["classification"]},
+            "saturated_64_negatives": {"live_bytes": saturated_peak.live_bytes, "peak_bytes": saturated_peak.peak_bytes,
+                "classification": saturated_stage["classification"]},
+            "terminal_33_empty": {"live_bytes": stage_peak.live_bytes, "peak_bytes": stage_peak.peak_bytes,
+                "classification": empty_stage["classification"]},
+            "terminal_churn_100": {"live_bytes": churn_peak.live_bytes, "peak_bytes": churn_peak.peak_bytes,
+                "classification": churn_stage["classification"]},
+            "terminal_33_saturated": {"live_bytes": full_peak.live_bytes, "peak_bytes": full_peak.peak_bytes,
+                "classification": full_classified["classification"]},
         },
         "computed_heap": {"defensive_4096_batch_bytes": defensive_batch_heap,
             "reachable_tick_batch_bytes": reachable_batch_heap,
@@ -783,6 +892,46 @@ fn native_semantic_resource_batch_n_and_n_plus_one() {
     });
     println!("S1_RESOURCE_ROW {row}");
     std::hint::black_box((full_stage, churned));
+}
+
+/// Classification ground rules, pinned where a violation would silently
+/// inflate every stage label: a shared borrow (`Arc::clone`) requests
+/// nothing, a physical copy charges exactly its owned bytes with no
+/// transient, and an in-place sort requests nothing.
+#[test]
+fn native_semantic_resource_borrow_copy_and_sort_classification() {
+    use crate::inventory_semantics::{LaneNegative, MAX_LANE_NEGATIVES};
+
+    let negatives: Vec<LaneNegative> = (0..MAX_LANE_NEGATIVES as u64)
+        .map(|ordinal| LaneNegative::CutBarrier { ordinal })
+        .collect();
+    let shared = std::sync::Arc::new(negatives);
+    let (borrowed, borrow_peak, _, borrow_requested) =
+        crate::test_alloc::counted_peak_during(|| std::sync::Arc::clone(&shared));
+    assert!(!borrow_peak.incomplete);
+    assert_eq!((borrow_peak.live_bytes, borrow_peak.peak_bytes), (0, 0));
+    assert_eq!(borrow_requested, 0, "a shared borrow requests nothing");
+    std::hint::black_box(borrowed);
+    let (copied, copy_peak, _, copy_requested) =
+        crate::test_alloc::counted_peak_during(|| (*shared).clone());
+    assert!(!copy_peak.incomplete);
+    let owned = MAX_LANE_NEGATIVES * size_of::<LaneNegative>();
+    assert_eq!((copy_peak.live_bytes, copy_peak.peak_bytes), (owned, owned));
+    assert_eq!(copy_peak.peak_bytes - copy_peak.live_bytes, 0);
+    assert_eq!(
+        copy_requested, owned,
+        "a physical copy charges its bytes once"
+    );
+    // In-place sorts (presentation capture, negative ledgers) run inside
+    // measured stages and request nothing of their own.
+    let mut order: Vec<u64> = (0..1024).rev().collect();
+    let (_, sort_peak, _, sort_requested) =
+        crate::test_alloc::counted_peak_during(|| order.sort_unstable());
+    assert!(!sort_peak.incomplete);
+    assert_eq!((sort_peak.live_bytes, sort_peak.peak_bytes), (0, 0));
+    assert_eq!(sort_requested, 0);
+    assert!(order.windows(2).all(|pair| pair[0] <= pair[1]));
+    std::hint::black_box((shared, copied));
 }
 
 #[test]
@@ -899,7 +1048,14 @@ fn native_semantic_resource_final_probe_child() {
     emit_stage["deferred"] = serde_json::json!(deferred);
     emit_stage["tracked"] = serde_json::json!(emitter.tracked());
     let mut stages = vec![presentation_stage, emit_stage];
+    for stage in &mut stages {
+        classify_large_stage(stage);
+    }
     // Churn: two more passes with fresh calls; tracking stays bounded.
+    // Each round's fresh presentation is its own measured generation (in a
+    // separate array, so the pool-cover indices over `stages` below stay
+    // put): old+new presentations are both classified, never conflated.
+    let mut presentation_generations = Vec::new();
     if kind == "churn" || kind == "combined" {
         for round in 0..2 {
             for quantum in keys.chunks(512) {
@@ -923,13 +1079,18 @@ fn native_semantic_resource_final_probe_child() {
                 }
                 h.commit();
             }
-            let presentation = Presentation::capture(
-                h.coordinator(),
-                "final-probe",
-                0,
-                120 + round * 10,
-                2 + round,
-            );
+            let (presentation, mut generation_stage) =
+                measure(&format!("churn_presentation_{round}"), || {
+                    Presentation::capture(
+                        h.coordinator(),
+                        "final-probe",
+                        0,
+                        120 + round * 10,
+                        2 + round,
+                    )
+                });
+            classify_large_stage(&mut generation_stage);
+            presentation_generations.push(generation_stage);
             let (_, mut pass_stage) = measure(&format!("emitter_churn_pass_{round}"), || {
                 emitter
                     .emit(
@@ -943,6 +1104,7 @@ fn native_semantic_resource_final_probe_child() {
             });
             assert_eq!(emitter.tracked(), population);
             pass_stage["tracked"] = serde_json::json!(emitter.tracked());
+            classify_large_stage(&mut pass_stage);
             stages.push(pass_stage);
             std::hint::black_box(presentation);
         }
@@ -951,28 +1113,31 @@ fn native_semantic_resource_final_probe_child() {
     // saturated population, plus the terminal batch envelope.
     let mut combined_peaks = serde_json::json!({});
     if kind == "combined" {
-        let (document, document_stage) = measure("json_value_from_same_presentation", || {
+        let (document, mut document_stage) = measure("json_value_from_same_presentation", || {
             crate::inventory::render_json_from_presentation(&presentation)
         });
         assert_eq!(document["instances"].as_array().unwrap().len(), population);
-        let (serialized, serialize_stage) = measure("serialized_json_buffer", || {
+        classify_large_stage(&mut document_stage);
+        let (serialized, mut serialize_stage) = measure("serialized_json_buffer", || {
             serde_json::to_vec(&document).unwrap()
         });
-        let (terminal, terminal_peak) = crate::test_alloc::requested_peak_during(|| {
-            use crate::inventory_semantics::{
-                LaneNegative, SemanticBatch, TERMINAL_STAGED_BATCH_CAP, TerminalBatchStage,
-            };
-            let mut stage = TerminalBatchStage::new();
-            for batch in 0..TERMINAL_STAGED_BATCH_CAP as u64 {
-                let negatives: Vec<LaneNegative> = (0..64)
-                    .map(|ordinal| LaneNegative::CutBarrier {
-                        ordinal: batch * 1_000 + ordinal,
-                    })
-                    .collect();
-                stage.push(SemanticBatch::scripted(domain, negatives, batch));
-            }
-            stage
-        });
+        classify_large_stage(&mut serialize_stage);
+        let (terminal, terminal_peak, terminal_stage) =
+            measure_classified("terminal_33_saturated", || {
+                use crate::inventory_semantics::{
+                    LaneNegative, SemanticBatch, TERMINAL_STAGED_BATCH_CAP, TerminalBatchStage,
+                };
+                let mut stage = TerminalBatchStage::new();
+                for batch in 0..TERMINAL_STAGED_BATCH_CAP as u64 {
+                    let negatives: Vec<LaneNegative> = (0..64)
+                        .map(|ordinal| LaneNegative::CutBarrier {
+                            ordinal: batch * 1_000 + ordinal,
+                        })
+                        .collect();
+                    stage.push(SemanticBatch::scripted(domain, negatives, batch));
+                }
+                stage
+            });
         assert!(!terminal_peak.incomplete);
         assert_eq!(
             terminal.len(),
@@ -993,7 +1158,8 @@ fn native_semantic_resource_final_probe_child() {
         stages.push(document_stage);
         stages.push(serialize_stage);
         stages.push(serde_json::json!({"stage": "terminal_33_saturated",
-            "live_bytes": terminal_peak.live_bytes, "peak_bytes": terminal_peak.peak_bytes}));
+            "live_bytes": terminal_peak.live_bytes, "peak_bytes": terminal_peak.peak_bytes,
+            "classification": terminal_stage["classification"]}));
         // Pool-cover verdict: sparse-saturated reducer charges plus measured
         // heap deltas (retained) and requested sums (conservative) vs 64 MiB.
         // JSON/presentation/emit are all over the sparse population (one
@@ -1032,7 +1198,8 @@ fn native_semantic_resource_final_probe_child() {
         "profile": profile, "instances": population,
         "reducer_charged_bytes": charged.charged_bytes,
         "reducer_limit_bytes": charged.limit_bytes,
-        "stages": stages, "combined": combined_peaks,
+        "stages": stages, "presentation_generations": presentation_generations,
+        "combined": combined_peaks,
         "after_measurement": memory.json(),
         "actual_type_sizes": {
             "SemanticBatch": size_of::<crate::inventory_semantics::SemanticBatch>(),

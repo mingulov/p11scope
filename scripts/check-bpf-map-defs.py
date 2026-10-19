@@ -417,7 +417,7 @@ EXACT_PROGRAM_SECTIONS = {
 SELECTED_GLOBAL_HELPERS = frozenset({"p11_selected_current_allowed"})
 CALLER_PROGRAM_SECTIONS = {"p11_inventory_image_baseline": "iter/task"}
 SELECTED_PROGRAMS = {"p11_selected_bootstrap", "p11_selected_cgroup_migrate"}
-SELECTED_MAPS = frozenset({"SELECTED_DETAILED", "SELECTED_DETAILED_STATE", "SELECTED_BOOTSTRAP_CTL"})
+SELECTED_MAPS = frozenset({"SELECTED_DETAIL", "SELECTED_DSTATE", "SELECTED_BCTL"})
 
 
 def has_selected(names):

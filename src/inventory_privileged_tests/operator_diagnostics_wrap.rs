@@ -1051,6 +1051,47 @@ fn operator_diagnostics_wrap_primary_validator_preserves_meaningful_facts() -> R
     Ok(())
 }
 
+#[test]
+fn operator_diagnostics_wrap_fixture_edges_match_snapshot_renderer_shape() -> Result<()> {
+    // Meta-fix for the G21 oracle failure: pin the snapshot/event shape
+    // contract both ways so the host fixture can never again invent
+    // event-only keys the renderer does not emit.
+    use crate::discovery::caller_registry::{CallerId, ModuleId};
+    let rendered = fixture_edge_json(CallerId(0), ModuleId(1), 0, false);
+    let renderer_keys: BTreeSet<&str> = rendered
+        .as_object()
+        .context("renderer edge object")?
+        .keys()
+        .map(String::as_str)
+        .collect();
+    for key in ["caller", "module", "mapping", "entries"] {
+        ensure!(
+            renderer_keys.contains(key),
+            "renderer dropped oracle-read key: {key}"
+        );
+    }
+    for key in ["presence", "capture"] {
+        ensure!(
+            !renderer_keys.contains(key),
+            "renderer leaks event-only key: {key}"
+        );
+    }
+    for shift in [0, 500] {
+        let fixture = primary_validator_fixture(123, shift);
+        let edges = fixture["edges"].as_array().context("fixture edges")?;
+        ensure!(edges.len() == 2);
+        for edge in edges {
+            for key in edge.as_object().context("fixture edge object")?.keys() {
+                ensure!(
+                    renderer_keys.contains(key.as_str()),
+                    "fixture edge key diverged from renderer shape: {key}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn seal_validator_fixture(records: &mut [serde_json::Value]) -> u64 {
     let last = records.len() - 1;
     records[last]["records_written"] = ((last - 1) as u64).into();

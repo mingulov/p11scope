@@ -1089,10 +1089,12 @@ pub(crate) enum SelectedInstallRefusal {
     BindingsOccupied,
 }
 
-/// A refused install, with full restitution: the uninstalled lane
-/// (for genuine disposal) and the unconsumed capacity (refunded by
-/// drop), plus the finite reason.
+/// A refused install, with full restitution: the proof that
+/// authorized only the failed attempt, the uninstalled lane (for
+/// genuine disposal) and the unconsumed capacity (refunded by drop),
+/// plus the finite reason.
 pub(crate) struct SelectedInstallFailure {
+    pub(crate) proof: SelectedActivationProof,
     pub(crate) lane: ProvisionalSelectedLane,
     pub(crate) capacity: PromotionInstallCapacity,
     pub(crate) reason: SelectedInstallRefusal,
@@ -1477,6 +1479,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     ) -> Result<AttestedSemanticLane, SelectedInstallFailure> {
         if !proof.matches_lane(lane.activation_binding()) {
             return Err(SelectedInstallFailure {
+                proof,
                 lane,
                 capacity,
                 reason: SelectedInstallRefusal::BindingMismatch,
@@ -1484,6 +1487,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
         if let Err(capacity) = self.semantic_bindings.install_capacity(capacity) {
             return Err(SelectedInstallFailure {
+                proof,
                 lane,
                 capacity,
                 reason: SelectedInstallRefusal::BindingsOccupied,

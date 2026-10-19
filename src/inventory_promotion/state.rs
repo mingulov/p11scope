@@ -135,6 +135,8 @@ pub(crate) enum PromotionRefusal {
     PreparationFailed,
     /// Activation failed.
     ActivationFailed,
+    /// Install capacity reservation refused (resource pressure).
+    Capacity,
 }
 
 impl PromotionRefusal {
@@ -159,6 +161,7 @@ impl PromotionRefusal {
             Self::ScopeEnded => "parent scope ended",
             Self::PreparationFailed => "preparation failed",
             Self::ActivationFailed => "activation failed",
+            Self::Capacity => "install capacity unavailable",
         }
     }
 }

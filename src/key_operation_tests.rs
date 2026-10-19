@@ -11653,7 +11653,7 @@ fn joint_capture_owner_mixed_census_with_n15_at_capacity() {
                 .h0_input(producers.native_domain(), 2)
                 .expect("the completed quantum lends its H0 input");
             h0.iter()
-                .find_map(|record| record.joint_resource.clone())
+                .find_map(|record| record.joint_resource)
                 .expect("the completed END projects a genuine adapter origin")
         };
         let staged = owner
@@ -11767,7 +11767,7 @@ fn joint_capture_owner_seal_replay_resource_refusal_disposes_head_keeps_joint() 
                 RegistryLimits::new(16, 16, 16, 1024, 1024, 16).expect("generous limits"),
             )
             .expect("coordinator builds");
-            let mut scene = JointScene::new();
+            let scene = JointScene::new();
             let bootstrap = scene.bootstrap();
             let module = ModuleKey::Physical {
                 dev_major: 1,

@@ -23,6 +23,7 @@ use std::mem::size_of;
 ///   binary baseline plus every fixture — never a requested-bytes input.
 /// - `kernel_map_payload_bytes`: mmap-reserved bytes after the stage (the
 ///   large-request path); retained heap is the allocator delta, not a sum.
+///
 /// Shared borrows (`Arc` clones) request nothing; only physical copies and
 /// owned nodes (BTree, buffers, sorts' scratch) count. In-place sorts and
 /// the churn rounds' fresh presentations are inside measured stages, so the

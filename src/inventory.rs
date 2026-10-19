@@ -1426,6 +1426,23 @@ struct InstalledPromotion {
     pair: crate::inventory_promotion::PromotionPair,
 }
 
+/// A wound-down domain whose coordinator namespace still retires. The
+/// completion minter delivers once, so a proof spent on a refused
+/// attempt is retained here for the retry, never re-polled.
+struct RetiringDomain {
+    domain: crate::attach::capture::NativeDomainId,
+    completion: Option<crate::inventory_promotion::lifecycle::SessionNativeCompletion>,
+}
+
+impl RetiringDomain {
+    fn wound_down(domain: crate::attach::capture::NativeDomainId) -> Self {
+        Self {
+            domain,
+            completion: None,
+        }
+    }
+}
+
 struct ClassicDriver<'a> {
     coordinator: &'a mut InventoryCoordinator<OsProcessSource>,
     inventory_scope: Option<InventoryScope>,
@@ -1464,9 +1481,10 @@ struct ClassicDriver<'a> {
     /// operator-cancel wind-down and genuine end confirmation.
     installed_promotion: Option<InstalledPromotion>,
     /// A wound-down domain whose coordinator namespace still retires:
-    /// its completion is polled every tick and the namespace retires
-    /// before any held install runs.
-    retiring: Option<crate::attach::capture::NativeDomainId>,
+    /// its completion is polled every tick (a refused proof is
+    /// retained for the retry) and the namespace retires before any
+    /// held install runs.
+    retiring: Option<RetiringDomain>,
 }
 
 /// Exercise the production driver tick with substituted lane I/O.
@@ -1802,28 +1820,43 @@ impl ClassicDriver<'_> {
     /// Poll a wound-down domain's genuine completion; retire on
     /// proof. Returns false while retirement still pends. No minter
     /// (or unquiesced work) holds the namespace, never forces it; a
-    /// namespace that never staged clears quietly.
+    /// namespace that never staged clears quietly. A proof refused
+    /// for pending work is retained for the next attempt: the minter
+    /// delivers once, so the retry reuses it instead of re-polling.
     fn poll_retiring_domain(&mut self) -> bool {
         use crate::discovery::engine::inventory_coordinator::semantics::JointRetireRefusal;
-        let Some(domain) = self.retiring else {
+        let Some(retiring) = self.retiring.as_mut() else {
             return true;
         };
-        let Some(source) = self.completion_source.as_mut() else {
-            return false;
-        };
-        let Some(completion) = source.poll_completion(domain) else {
-            return false;
+        let domain = retiring.domain;
+        let completion = match retiring.completion.take() {
+            Some(retained) => retained,
+            None => {
+                let Some(source) = self.completion_source.as_mut() else {
+                    return false;
+                };
+                let Some(minted) = source.poll_completion(domain) else {
+                    return false;
+                };
+                minted
+            }
         };
         match self.coordinator.retire_joint_domain(completion) {
             Ok(()) => {
                 self.retiring = None;
                 true
             }
-            Err(JointRetireRefusal::NotLiveDomain) => {
+            Err((_, JointRetireRefusal::NotLiveDomain)) => {
                 self.retiring = None;
                 true
             }
-            Err(JointRetireRefusal::PendingWork) => false,
+            Err((completion, JointRetireRefusal::PendingWork)) => {
+                self.retiring
+                    .as_mut()
+                    .expect("retiring checked above")
+                    .completion = Some(completion);
+                false
+            }
         }
     }
 
@@ -1966,7 +1999,7 @@ impl ClassicDriver<'_> {
             );
         }
         if let Some(domain) = domain {
-            self.retiring = Some(domain);
+            self.retiring = Some(RetiringDomain::wound_down(domain));
         }
         let update = PromotionStatusUpdate::new(
             installed.capture,
@@ -1985,6 +2018,13 @@ impl ClassicDriver<'_> {
                 installed.pair.provider()
             ),
         );
+    }
+
+    /// The domain currently retiring, if any: tests assert through
+    /// this instead of the retained proof.
+    #[cfg(test)]
+    fn retiring_domain(&self) -> Option<crate::attach::capture::NativeDomainId> {
+        self.retiring.as_ref().map(|retiring| retiring.domain)
     }
 
     /// Install the native completion minter (DR37 A→B). Run setup
@@ -8033,15 +8073,15 @@ mod promotion_driver_tests {
             .coordinator
             .stage_semantic_batch(SemanticBatch::scripted(domain, Vec::new(), 1));
         driver.coordinator.finalize_semantic_batches(None);
-        driver.retiring = Some(domain);
+        driver.retiring = Some(RetiringDomain::wound_down(domain));
         // Without a minter the namespace holds, never forced.
         driver.on_tick();
-        assert_eq!(driver.retiring, Some(domain));
+        assert_eq!(driver.retiring_domain(), Some(domain));
         driver.completion_source = Some(Box::new(StubCompletionSource(Some(
             SessionNativeCompletion::scripted(domain),
         ))));
         driver.on_tick();
-        assert_eq!(driver.retiring, None, "proven completion retires");
+        assert_eq!(driver.retiring_domain(), None, "proven completion retires");
         // The domain stays refused: staging it again is audited.
         driver
             .coordinator
@@ -8052,6 +8092,41 @@ mod promotion_driver_tests {
                 .any(|(subject, _)| subject == "semantic batch refused for an ended domain"),
             "retired domain refuses through the audited path: {:?}",
             gaps(&mut driver)
+        );
+    }
+
+    #[test]
+    fn refused_retire_preserves_completion_across_attempts() {
+        use crate::attach::capture::NativeDomainId;
+        use crate::inventory_semantics::SemanticBatch;
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let domain = NativeDomainId::try_mint().expect("domain mints");
+        // Pending work holds the first retire attempt; the minter
+        // delivers its proof once, so the retry must reuse the
+        // retained completion, never a second delivery.
+        driver
+            .coordinator
+            .stage_semantic_batch(SemanticBatch::scripted(domain, Vec::new(), 1));
+        driver.retiring = Some(RetiringDomain::wound_down(domain));
+        driver.completion_source = Some(Box::new(StubCompletionSource(Some(
+            SessionNativeCompletion::scripted(domain),
+        ))));
+        driver.on_tick();
+        assert_eq!(
+            driver.retiring_domain(),
+            Some(domain),
+            "pending work holds retirement"
+        );
+        // Drain the pending work through the audited path; the empty
+        // batch leaves no drop shadow, so the namespace quiesces.
+        driver.coordinator.finalize_semantic_batches(None);
+        driver.on_tick();
+        assert_eq!(
+            driver.retiring_domain(),
+            None,
+            "the retained proof retires once the work drains"
         );
     }
 

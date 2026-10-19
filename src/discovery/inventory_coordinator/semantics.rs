@@ -1505,16 +1505,18 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// Retire one genuinely completed domain for the next (D5): the
     /// native completion names the live finalizer namespace, which
     /// must be quiescent (no staged quantum, no pending drop);
-    /// pending work refuses and the namespace stays live. Retire
-    /// removes the domain's bindings, refusal-only history and
-    /// successor reservations (other domains' entries preserved),
-    /// clears its tail markers, drops the finalizer namespace
-    /// (including its seal admission: no cross-domain grant reuse),
-    /// refuses the domain permanently, and `mem::replace`s the joint
-    /// owner with a fresh one (the old ledger's exact charges refund
-    /// by drop; no counter resets). Adapter positions are
-    /// stream/Session-local and correctly restart; global counters
-    /// never reset.
+    /// pending work refuses and the namespace stays live. Every
+    /// refusal hands the completion back with the reason: the source
+    /// delivers once, so a retryable refusal preserves the authority
+    /// required to retry. Retire removes the domain's bindings,
+    /// refusal-only history and successor reservations (other
+    /// domains' entries preserved), clears its tail markers, drops
+    /// the finalizer namespace (including its seal admission: no
+    /// cross-domain grant reuse), refuses the domain permanently, and
+    /// `mem::replace`s the joint owner with a fresh one (the old
+    /// ledger's exact charges refund by drop; no counter resets).
+    /// Adapter positions are stream/Session-local and correctly
+    /// restart; global counters never reset.
     ///
     /// GATED-SEAL carry: `h3_pending` evidence drops with the
     /// namespace while joint seals are gated (no seal coverage
@@ -1524,21 +1526,21 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     pub(crate) fn retire_joint_domain(
         &mut self,
         completion: SessionNativeCompletion,
-    ) -> Result<(), JointRetireRefusal> {
+    ) -> Result<(), (SessionNativeCompletion, JointRetireRefusal)> {
         let domain = completion.domain();
         let live = self
             .semantic_finalizer
             .as_ref()
             .is_some_and(|state| state.domain == domain);
         if !live {
-            return Err(JointRetireRefusal::NotLiveDomain);
+            return Err((completion, JointRetireRefusal::NotLiveDomain));
         }
         let quiescent = self
             .semantic_finalizer
             .as_ref()
             .is_some_and(|state| state.pending_semantic.is_none() && state.pending_drop.is_none());
         if !quiescent {
-            return Err(JointRetireRefusal::PendingWork);
+            return Err((completion, JointRetireRefusal::PendingWork));
         }
         let removed = self.semantic_bindings.retire_domain(domain);
         self.proven_images
@@ -3586,11 +3588,13 @@ mod promotion_lifecycle_tests {
     #[test]
     fn retire_joint_domain_refuses_foreign_completion() {
         let mut coordinator = coordinator();
+        let foreign = domain();
         let before = charged(&coordinator);
-        let err = coordinator
-            .retire_joint_domain(SessionNativeCompletion::scripted(domain()))
+        let (completion, err) = coordinator
+            .retire_joint_domain(SessionNativeCompletion::scripted(foreign))
             .expect_err("nothing live retires nothing");
         assert_eq!(err, JointRetireRefusal::NotLiveDomain);
+        assert_eq!(completion.domain(), foreign);
         assert!(coordinator.semantic_finalizer.is_none());
         assert!(coordinator.refused_semantic_domains.is_empty());
         assert_eq!(charged(&coordinator), before);
@@ -3603,10 +3607,11 @@ mod promotion_lifecycle_tests {
         let mut finalizer = SessionFinalizerState::new(a);
         finalizer.pending_drop = Some((7, false));
         coordinator.semantic_finalizer = Some(finalizer);
-        let err = coordinator
+        let (completion, err) = coordinator
             .retire_joint_domain(SessionNativeCompletion::scripted(a))
             .expect_err("pending work stays live");
         assert_eq!(err, JointRetireRefusal::PendingWork);
+        assert_eq!(completion.domain(), a, "the refusal hands the proof back");
         let state = coordinator.semantic_finalizer.as_ref().expect("kept");
         assert_eq!(state.pending_drop, Some((7, false)));
         assert!(coordinator.refused_semantic_domains.is_empty());

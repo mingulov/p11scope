@@ -173,6 +173,50 @@ def validate_callback_binding(records, expected):
     return _validate_binding(records, expected, 'callback')
 
 
+def validate_worker_delivery(records, expected, signals):
+    """Prompt genuine delivery on one live same-process worker; never an ACK.
+
+    The worker runs only the install_stop_flag handler closure after a
+    targeted tgkill; it never reaches the main-thread reporter. This proves
+    the delivery happened (worker identity, prompt timing, zero loss and
+    positive enabled==running kernel counters) without qualifying it as a
+    cancellation acknowledgement. The ACK validator stays main-only.
+    """
+    if (not isinstance(records, (list, tuple)) or len(records) != 3
+            or any(not isinstance(row, dict) for row in records)
+            or expected.get('role') != 'callback'
+            or [row.get('kind') for row in records] != ['ready', 'callback', 'final']):
+        raise ValueError('need exactly one actual ready/callback/final worker delivery witness')
+    ready, event, final = records
+    if any(row.get('mode') != 'perf_uprobe' for row in records):
+        raise ValueError('fixture evidence cannot qualify live worker delivery')
+    if ready.get('clock') != 'CLOCK_MONOTONIC' or ready.get('role') != 'callback':
+        raise ValueError('worker delivery timestamp clock is not the signal-send clock')
+    for key in ('pid', 'tid', 'start_time', 'dev', 'ino', 'file_offset'):
+        if type(ready.get(key)) is not int or ready[key] < 0 or ready[key] != expected[key]:
+            raise ValueError('worker delivery readiness differs from pinned original worker/callback')
+    if (any(type(event.get(key)) is not int or event[key] <= 0 for key in ('pid', 'tid', 'ip'))
+            or event.get('pid') != expected['pid'] or event.get('tid') != expected['tid']
+            or event.get('ip') != expected['ip'] or expected['pid'] == expected['tid']):
+        raise ValueError('foreign worker delivery IP/process/thread')
+    if (any(type(final.get(key)) is not int or not 0 <= final[key] < 2**64
+                for key in ('lost', 'samples', 'kernel_count', 'time_enabled', 'time_running'))
+            or final.get('lost') != 0 or final.get('samples') != 1 or final.get('kernel_count') != 1
+            or final['time_enabled'] <= 0
+            or final['time_enabled'] != final.get('time_running')):
+        raise ValueError('lost/multiplexed/unreconciled kernel worker delivery evidence')
+    if (not isinstance(signals, (list, tuple)) or len(signals) != 1 or not isinstance(signals[0], dict)
+            or signals[0].get('signal') != 'SIGINT'
+            or signals[0].get('delivery') != 'tgkill_original_worker'):
+        raise ValueError('no independently sent finite worker-targeted first signal')
+    times = [ready.get('t_ns'), signals[0].get('t_ns'), event.get('t_ns')]
+    if (any(type(value) is not int or not 0 < value < 2**64 for value in times)
+            or not times[0] <= times[1] <= times[2] or times[2] - times[1] >= 100_000_000):
+        raise ValueError('worker probe was not ready or genuine worker delivery missed<100ms')
+    return dict(delivery_ns=event['t_ns'], channel='owned_perf_worker_callback',
+                delivery_response_seconds=(times[2] - times[1]) / 1e9)
+
+
 def validate_witness(records, expected, signals):
     """Validate retained actual perf facts; caller also owns pressure/custody.
 

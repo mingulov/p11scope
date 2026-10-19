@@ -419,21 +419,26 @@ probe envelopes, exact entered/interrupted/released gate facts, same candidate
 and main thread, one SIGINT, ready-before-send ordering, at least150ms before
 parent release, and reporter entry at/after actual gate release consumption. A
 complete matching readable marker remains required. The normal ACK validator
-must refuse the late reporter. `validate_worker_negative` requires a ready
-distinct worker in the same candidate process, zero worker events/loss and an
-actual prompt main reporter plus matching marker; the normal main validator
-must reject the worker identity. Their healthy/mutation documents are validator
+must refuse the late reporter. The redesigned `validate_worker_negative`
+requires a prompt genuine worker callback (delivery-only, at most100ms after a
+worker-targeted `tgkill`), exact entered/released main gate facts with main
+gated at least150ms past the signal, zero worker reporter events with positive
+equal enabled/running counters, and a real late main reporter entry after
+release plus matching marker. Both the worker delivery and the late main entry
+must fail the prompt-ACK validator, and the ordinary main zero validator must
+reject the worker identity. Their healthy/mutation documents are validator
 controls, not installed negatives. Actual adapters and source-reviewed execution
 remain required before dependent blocked-stderr acceptance.
 
 `qualify_reporter_probe.py --cells handlerblocked --readiness-gate /absolute/gate.so`
-and `--cells wrongworker` select the new adapters explicitly; the default six
-controls are unchanged. Supply the same candidate/provider/caller/helper/manifest,
-ordinary uid/gid, exact source and fresh output directory as above. Build the
-gate with the development-host C compiler (`-shared -fPIC`) and verify its
-arrival alongside the actual helper before use. A baseline preload or gate
-environment is refused. No preload is applied to healthy or wrong-worker
-observers or to the ordinary provider caller.
+and `--cells wrongworker --readiness-gate /absolute/gate.so` select the new
+adapters explicitly; the default six controls are unchanged, and a negative
+cell is selected exactly when the gate is supplied. Supply the same
+candidate/provider/caller/helper/manifest, ordinary uid/gid, exact source and
+fresh output directory as above. Build the gate with the development-host C
+compiler (`-shared -fPIC`) and verify its arrival alongside the actual helper
+before use. A baseline preload or gate environment is refused. No preload is
+applied to healthy observers or to the ordinary provider caller.
 
 The handler adapter holds and checks the actual preload executable mapping,
 waits for complete readiness and gate entry, enables both finite role probes,
@@ -441,10 +446,26 @@ performs20 real caller-ledger GenerateRandom calls, and sends SIGINT with
 `tgkill(original_tgid, original_main_tid, SIGINT)`. It releases only after the
 actual EINTR fact and150ms interval, then retains original observer custody
 through complete stderr EOF and both final kernel counters. The worker adapter
-holds one original live task directory, enables both main and worker probes,
-and reconciles the worker promptly after actual main reporter progress while
-that same worker is still alive. Missing/exited workers are failures, with no
-replacement/retry. All timeout/error cleanup releases a negative gate before
-waiting for or signalling the observer. These are newly prepared adapters;
-source review and actual same-candidate controls remain required. Summary
-`remaining` retains every causal control not actually passed in that invocation.
+anchors on same-process worker delivery instead of worker-side acknowledgement:
+it holds main behind the readiness gate, issues ten genuine paced stimulus
+calls (span-checked to cover at least400ms) plus a100ms settle so the pin sees
+a quiesced observer, and pins the lowest-tid live non-main task with SIGINT
+unblocked and caught, recording per-task disposition evidence. A parked-shape
+tripwire then attaches a pre-signal reporter probe to the pinned worker and
+requires the helper refusal (`kernel event/sample/loss/enabled counters
+disagree`), zero samples and zero on-CPU delta; if a future product rethreading
+schedules that worker, the tripwire flips loudly instead of silently passing.
+Three probes attach (callback-on-worker, reporter-on-worker, reporter-on-main),
+one `tgkill(original_tgid, worker_tid, SIGINT)` is sent, and the worker callback
+must arrive within100ms while main stays gated at least150ms with no EINTR
+fact. Both worker probes reconcile promptly while the pinned worker is still
+alive; main is released, and its real reporter entry after release is required.
+Mask, identity, lifetime and symbol failures refuse the cell, as do missing or
+exited workers, with no replacement/retry. Receipt fields carry the anchor:
+`worker_disposition`, `worker_sigint`, `tripwire`, `expected_callback`,
+`expected_worker`, `callback_records`, `worker_records`, `worker_delivery_ns`
+and the late `late_main_observation_ns`. All timeout/error cleanup releases a
+negative gate before waiting for or signalling the observer. These are newly
+prepared adapters; source review and actual same-candidate controls remain
+required. Summary `remaining` retains every causal control not actually passed
+in that invocation.

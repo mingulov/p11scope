@@ -487,10 +487,7 @@ mod tests {
     /// jitter (see [`DRAINING_READER_MAX_STALL_MS`]).
     fn assert_lossless_drain(drops: SinkDrops) {
         assert_eq!(drops.timeouts, 0, "draining reader timed out: {drops:?}");
-        assert_eq!(
-            drops.dropped_bytes, 0,
-            "draining reader dropped: {drops:?}"
-        );
+        assert_eq!(drops.dropped_bytes, 0, "draining reader dropped: {drops:?}");
         assert!(
             drops.stall_ms <= DRAINING_READER_MAX_STALL_MS,
             "draining stall {} ms exceeds {DRAINING_READER_MAX_STALL_MS} ms: {drops:?}",

@@ -233,14 +233,17 @@ class BrowserCells(unittest.TestCase):
 
         Requires affirmative selection progress on the stalled
         connection: a complete ClientHello plus a token-selection
-        witness — an empty certificate or a post-hello stall — with no
-        successful handshake, no presented cert, no served request, no
-        protocol failure, and a TLS-flow (not crashed or never-launched)
-        browser outcome. Client cert alerts and abandoned transports are
-        tolerated but never sufficient: alerts are ambiguous (selection
-        refusal vs server-cert rejection) and abandons carry no
-        selection information. A navigation timeout alone proves nothing
-        about selection and is never a witness.
+        witness — an empty certificate or a CertificateRequest-backed
+        stall — with no successful handshake, no presented cert, no
+        served request, no protocol failure, and a TLS-flow (not crashed
+        or never-launched) browser outcome. A stall counts only when the
+        same connection observed the server's outbound CertificateRequest
+        (a complete hello alone can yield HelloRetryRequest waiting for
+        ClientHello2, which is pre-selection). Client cert alerts and
+        abandoned transports are tolerated but never sufficient: alerts
+        are ambiguous (selection refusal vs server-cert rejection) and
+        abandons carry no selection information. A navigation timeout
+        alone proves nothing about selection and is never a witness.
         """
         outcomes = _stall_outcomes(server)
         self.assertGreaterEqual(server.connections, 1, f"{label}: browser never connected")
@@ -255,11 +258,16 @@ class BrowserCells(unittest.TestCase):
         self.assertGreaterEqual(
             server.client_hello_complete, 1,
             f"{label}: no complete ClientHello (selection never began) [{outcomes}]")
+        if server.selection_stalls:
+            self.assertGreaterEqual(
+                getattr(server, "cert_requests_sent", 0), 1,
+                f"{label}: stall without outbound CertificateRequest "
+                f"(selection never began) [{outcomes}]")
         witness = server.empty_certs + server.selection_stalls
         self.assertGreaterEqual(
             witness, 1,
             f"{label}: no token-selection witness "
-            f"(need empty-cert or post-hello stall) [{outcomes}]")
+            f"(need empty-cert or CertificateRequest-backed stall) [{outcomes}]")
         self.assertNotIn("flow_error", facts,
                          f"{label}: flow setup failed: {facts.get('flow_error')}")
         self.assertFalse(facts.get("loaded", True),
@@ -837,7 +845,6 @@ class BrowserCells(unittest.TestCase):
                 ssl.SSLError("[SSL: TLSV1_ALERT_HANDSHAKE_FAILURE] tlsv1 alert handshake failure"),
                 ValueError("peer spoke non-TLS bytes"),
             ],
-            "stall": [TimeoutError("The handshake operation timed out")],
             "abandoned": [
                 ssl.SSLEOFError("[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol"),
                 ConnectionResetError("peer reset"),
@@ -846,6 +853,19 @@ class BrowserCells(unittest.TestCase):
         for want, errors in cases.items():
             for exc in errors:
                 self.assertEqual(tls_server.classify_handshake_error(exc), want, repr(exc))
+        # A timeout is a selection stall only with affirmative outbound
+        # CertificateRequest progress on the same connection; without it
+        # (for example HRR waiting for ClientHello2) it is abandonment.
+        timeout = TimeoutError("The handshake operation timed out")
+        self.assertEqual(
+            tls_server.classify_handshake_error(timeout, cert_request_seen=True),
+            "stall", repr(timeout))
+        self.assertEqual(
+            tls_server.classify_handshake_error(timeout, cert_request_seen=False),
+            "abandoned", repr(timeout))
+        self.assertEqual(
+            tls_server.classify_handshake_error(timeout), "abandoned",
+            "timeouts fail closed without CertificateRequest proof")
 
     def test_client_cert_error_kinds(self):
         """Unit: TLS-flow failures classify apart from unrelated ones."""
@@ -921,6 +941,7 @@ class BrowserCells(unittest.TestCase):
             await_outcome(flow)
             self.assertEqual((flow.connections, flow.spoke_tls, flow.empty_certs), (1, 1, 1))
             self.assertEqual(flow.client_hello_complete, 1)
+            self.assertEqual(flow.cert_requests_sent, 1)
             self.assertEqual(flow.requests_served, 0)
             self.assertEqual(flow.client_certs_presented, 0)
             self.assertEqual(flow.handshake_failures, 0)
@@ -935,6 +956,7 @@ class BrowserCells(unittest.TestCase):
             self.assertEqual(flow.handshake_failures, 1)
             self.assertEqual(flow.spoke_tls, 0)
             self.assertEqual(flow.client_hello_complete, 0)
+            self.assertEqual(flow.cert_requests_sent, 0)
             self.assertTrue(flow.handshake_errors)
         # Connect and vanish without a byte: abandoned, never a failure.
         with tls_server.FlowServer(cert=cert, key=key, require_client_cert=True,
@@ -944,6 +966,7 @@ class BrowserCells(unittest.TestCase):
             self.assertEqual((flow.connections, flow.abandoned, flow.handshake_failures),
                              (1, 1, 0))
             self.assertEqual(flow.client_hello_complete, 0)
+            self.assertEqual(flow.cert_requests_sent, 0)
         # Presented client cert: counted at handshake time, request or not.
         with tls_server.FlowServer(cert=cert, key=key, require_client_cert=True,
                                    client_ca=cred.cert_pem) as flow:
@@ -953,6 +976,7 @@ class BrowserCells(unittest.TestCase):
             self.assertEqual((flow.handshakes_ok, flow.client_certs_presented,
                               flow.requests_served), (1, 1, 1))
             self.assertEqual(flow.client_hello_complete, 1)
+            self.assertEqual(flow.cert_requests_sent, 1)
         # Plain server: ordinary visit, no client cert involved.
         with tls_server.FlowServer(cert=cert, key=key) as flow:
             with tls_client(flow.port) as peer:
@@ -961,6 +985,7 @@ class BrowserCells(unittest.TestCase):
             self.assertEqual((flow.handshakes_ok, flow.client_certs_presented,
                               flow.requests_served), (1, 0, 1))
             self.assertEqual(flow.client_hello_complete, 1)
+            self.assertEqual(flow.cert_requests_sent, 0)
 
     def test_flow_server_partial_client_hello_is_abandoned(self):
         """P2-2 twin: a partial ClientHello plus silence is abandoned, not a stall.
@@ -991,15 +1016,16 @@ class BrowserCells(unittest.TestCase):
                              "partial ClientHello counted as a selection stall")
             self.assertEqual(flow.abandoned, 1)
             self.assertEqual(flow.client_hello_complete, 0)
+            self.assertEqual(flow.cert_requests_sent, 0)
             self.assertEqual(flow.handshake_failures, 0)
 
     def test_flow_server_complete_client_hello_then_silence_stalls(self):
-        """Guard: a complete ClientHello plus silence still stalls (no over-reject).
+        """Guard: a CertificateRequest followed by silence still stalls.
 
         A real ClientHello goes out over a non-blocking socket whose
         handshake is never driven again; the server must see the
-        finished first flight and count the ensuing silence as a
-        selection stall.
+        finished first flight, emit CertificateRequest, and count the
+        ensuing silence as a selection stall.
         """
         if shutil.which("openssl") is None:
             self.skipTest("openssl missing")
@@ -1026,6 +1052,7 @@ class BrowserCells(unittest.TestCase):
                 peer.close()
             self.assertEqual((flow.connections, flow.spoke_tls,
                               flow.client_hello_complete), (1, 1, 1))
+            self.assertEqual(flow.cert_requests_sent, 1)
             self.assertEqual(flow.selection_stalls, 1)
             self.assertEqual(flow.abandoned, 0)
             self.assertEqual(flow.handshake_failures, 0)
@@ -1107,7 +1134,7 @@ class BrowserCells(unittest.TestCase):
                 raw.close()
             self.assertEqual(flow.connections, 1)
             self.assertEqual(flow.client_hello_complete, 1)
-            self.assertEqual(getattr(flow, "cert_requests_sent", 0), 0,
+            self.assertEqual(flow.cert_requests_sent, 0,
                              "HRR flight must not send CertificateRequest")
             self.assertEqual(flow.selection_stalls, 0,
                              "HRR wait without CertificateRequest counted as a selection stall")
@@ -1145,7 +1172,7 @@ class BrowserCells(unittest.TestCase):
             finally:
                 raw.close()
             self.assertEqual((flow.connections, flow.client_hello_complete), (1, 1))
-            self.assertEqual(getattr(flow, "cert_requests_sent", 0), 1)
+            self.assertEqual(flow.cert_requests_sent, 1)
             self.assertEqual(flow.selection_stalls, 1)
             self.assertEqual(flow.abandoned, 0)
             self.assertEqual(flow.handshake_failures, 0)

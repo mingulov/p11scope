@@ -61,16 +61,24 @@ if sudo needs a password.
 - Headless operation is mandatory (no display on gate hosts). The
   browser-automation skill's visible-browser default is overridden by the
   environment; every flow runs headless.
+- FF-NOMOD's absence rests on the provider being unregistered: the fresh
+  profile carries no `pkcs11.txt`, and gate hosts must not register
+  SoftHSM in any browser-visible NSS database. Any such confound fails
+  the cell loudly (calls observed), never silently.
 
 ## Cell catalog (v1)
 
 All cells use a fresh profile, a freshly seeded SoftHSM token, and
 loopback flow servers. Floors are minimums; browsers may call more.
 Background network activity is stabilized out of every cell (Chromium
-flags, Firefox prefs), so every asserted call is flow-caused — this was
-verified per cell by comparing stabilized against unstabilized runs and,
-for FF-STARTUP, by trace-timestamp correlation (the 79-call burst lands
+flags, Firefox prefs). Stabilization was verified per cell during
+calibration by comparing stabilized against unstabilized runs and, for
+FF-STARTUP, by trace-timestamp correlation (the 79-call burst lands
 inside the 105 ms navigation window, all on the main browser PID).
+Per-run, the cells reproduce the calibrated shape (floors sit far below
+typical counts); that is calibration evidence, not a per-run causal
+proof — no idle control or per-call activity ledger runs inside the
+gate cells.
 
 | Cell | Mode | Flow | Asserts |
 | --- | --- | --- | --- |
@@ -154,11 +162,13 @@ python3 -I scripts/run-python-suites.py --check
 
 The patch proposes `RUN` with self-skip: on hosts without `P11SCOPE_BIN`,
 passwordless sudo, Playwright browsers, or SoftHSM tooling, every test
-skips with its missing prerequisite named. T11 runs the positives on a
-qualified installed host with `TMPDIR` on big disk:
+skips with its missing prerequisite named. Single-browser hosts run
+their subset. T11 runs the positives on a qualified installed host with
+`TMPDIR` on big disk and strict mode (missing prerequisites fail
+instead of skipping, so the expected cells must execute):
 
 ```sh
-TMPDIR=/var/tmp/p11scope-ws-tmp python3 -I scripts/run-python-suites.py test_browser_cells.py
+TMPDIR=/var/tmp/p11scope-ws-tmp P11SCOPE_BROWSER_STRICT=1 python3 -I scripts/run-python-suites.py test_browser_cells.py
 ```
 
 ## Reproducing a cell by hand

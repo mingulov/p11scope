@@ -50,8 +50,14 @@ def check_sudo() -> None:
         raise CellError("`sudo -n true` failed: browser cells need passwordless sudo for p11scope")
 
 
-def preflight() -> Path:
-    """Check every cell prerequisite; return the product binary path."""
+def preflight(browser: str | None = None) -> Path:
+    """Check cell prerequisites; return the product binary path.
+
+    ``browser`` limits the browser-binary check to one browser so
+    single-browser hosts run their subset instead of skipping every cell.
+    """
+    if browser not in (None, "firefox", "chromium"):
+        raise CellError(f"unknown browser: {browser}")
     binary = p11scope_bin()
     check_sudo()
     for tool in ("softhsm2-util", "pkcs11-tool", "openssl", "pgrep"):
@@ -61,8 +67,10 @@ def preflight() -> Path:
         import playwright  # noqa: F401
     except ImportError as exc:
         raise CellError("python playwright is not installed (`pip install playwright`)") from exc
-    firefox_binary()
-    chromium_binary()
+    if browser is None or browser == "firefox":
+        firefox_binary()
+    if browser is None or browser == "chromium":
+        chromium_binary()
     return binary
 
 

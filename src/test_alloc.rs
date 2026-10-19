@@ -263,6 +263,36 @@ impl Drop for AllocationProbeGuard {
     }
 }
 
+/// Run `run` under BOTH the cumulative counter and the live/peak tracker
+/// at once. The two instruments are independent thread flags feeding off
+/// the same allocator entry points, so one armed scope driving both is
+/// not nesting — it is one run, two readouts. Returns the value, the
+/// peak report, and the cumulative `(requests, requested_bytes)`. Small
+/// stages only: the peak report still goes incomplete past 8192 tracked
+/// blocks, while the cumulative counts stay exact.
+pub(crate) fn counted_peak_during<T>(
+    run: impl FnOnce() -> T,
+) -> (T, RequestedAllocationPeak, usize, usize) {
+    assert!(
+        !ARMED.get() && !PEAK_ARMED.get(),
+        "allocation probes cannot nest"
+    );
+    ALLOCS.set(0);
+    ALLOC_BYTES.set(0);
+    PEAK.with(|tracker| tracker.borrow_mut().reset());
+    PEAK_INCOMPLETE.set(false);
+    ARMED.set(true);
+    PEAK_ARMED.set(true);
+    let count = AllocationProbeGuard(false);
+    let peak = AllocationProbeGuard(true);
+    let value = run();
+    drop(peak);
+    drop(count);
+    let mut result = PEAK.with(|tracker| tracker.borrow().result);
+    result.incomplete |= PEAK_INCOMPLETE.get();
+    (value, result, ALLOCS.get(), ALLOC_BYTES.get())
+}
+
 /// Track bounded requested-live storage and a separate conservative realloc
 /// overlap peak on this thread. The caller must reject an incomplete report
 /// and check `live_bytes/live_blocks` after expected temporary cleanup.
@@ -443,5 +473,37 @@ mod tests {
         });
         assert_eq!(allocs, 3, "alloc_zeroed, alloc and realloc each count");
         assert_eq!(bytes, 100 + 10 + 1000);
+    }
+
+    #[test]
+    fn counted_peak_reports_both_instruments_from_one_run() {
+        let (kept, peak, allocs, bytes) = super::counted_peak_during(|| {
+            let temporary = std::hint::black_box(vec![0u8; 100]);
+            let mut grown = std::hint::black_box(Vec::<u8>::with_capacity(10));
+            grown.resize(1000, 1);
+            drop(temporary);
+            grown
+        });
+        assert!(!peak.incomplete);
+        assert_eq!((peak.live_bytes, peak.live_blocks), (1000, 1));
+        assert_eq!(peak.peak_bytes, 1100);
+        assert_eq!(allocs, 3, "alloc_zeroed, alloc and realloc each count");
+        assert_eq!(bytes, 100 + 10 + 1000);
+        assert!(
+            peak.peak_bytes <= bytes,
+            "cumulative requests cover every live byte"
+        );
+        std::hint::black_box(kept);
+        // The combined scope still refuses nesting and disarms on unwind.
+        let panic = std::panic::catch_unwind(|| {
+            super::counted_peak_during(|| super::count_allocs_during(|| ()));
+        });
+        assert!(panic.is_err());
+        assert!(!ARMED.get() && !PEAK_ARMED.get());
+        let panic = std::panic::catch_unwind(|| {
+            super::counted_peak_during(|| panic!("exercise combined probe guards"));
+        });
+        assert!(panic.is_err());
+        assert!(!ARMED.get() && !PEAK_ARMED.get());
     }
 }

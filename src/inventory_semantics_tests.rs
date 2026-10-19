@@ -5225,7 +5225,8 @@ fn native_semantic_one_cursor_and_independent_producers() {
         "instance calls never feed the legacy physical reducer"
     );
 
-    // A foreign batch refuses loudly through the audited path: no
+    // A foreign batch refuses loudly through the audited path: the
+    // retained Session's namespace rejects it at staging, so no
     // positives, no disturbance, broad counts intact.
     let foreign = crate::attach::capture::NativeDomainId::mint();
     conv.scene
@@ -5234,9 +5235,9 @@ fn native_semantic_one_cursor_and_independent_producers() {
     conv.commit_with_lane();
     assert!(
         conv.gap_pairs().contains(&(
-            "semantic batch refused for a foreign domain".into(),
-            "the batch names another lane domain; it was dropped through the audited path \
-             without staging"
+            "semantic batch refused for another Session".into(),
+            "the retained Session has not completed; another domain cannot stage or change \
+             its finalizer namespace"
                 .into()
         )),
         "foreign batches refuse loudly, got {:?}",

@@ -1104,16 +1104,40 @@ impl WrapScope {
     /// it, and a system leg must carry no filter at all. Anything else —
     /// a PID-shaped filter on a system leg, a missing/mismatched filter
     /// on a PID leg, or a zero owner — is refused, never normalized.
-    /// STUB: always fails until the system-wrap selector lands.
     fn select(scope: InspectScope, pid_filter: Option<u32>, owned_pid: u32) -> Result<Self> {
-        let _ = (scope, pid_filter, owned_pid);
-        bail!("wrap-scope stub: selector not implemented")
+        ensure!(owned_pid != 0, "the wrap owner must be a real process");
+        match (scope, pid_filter) {
+            (InspectScope::Pid(pid), Some(filter)) if pid == filter && pid == owned_pid => {
+                Ok(WrapScope::Pid { pid })
+            }
+            (InspectScope::System, None) => Ok(WrapScope::System { owned_pid }),
+            (InspectScope::System, Some(_)) => {
+                bail!("system wrap is unfiltered: a PID-shaped filter changes the cell")
+            }
+            (InspectScope::Pid(_), _) => {
+                bail!("PID wrap must filter to exactly the owned workload")
+            }
+        }
     }
 
     fn owned_pid(&self) -> u32 {
         match *self {
             WrapScope::Pid { pid } => pid,
             WrapScope::System { owned_pid } => owned_pid,
+        }
+    }
+
+    fn inspect_scope(&self) -> InspectScope {
+        match *self {
+            WrapScope::Pid { pid } => InspectScope::Pid(pid),
+            WrapScope::System { .. } => InspectScope::System,
+        }
+    }
+
+    fn diagnostics_pid_filter(&self) -> Option<u32> {
+        match *self {
+            WrapScope::Pid { pid } => Some(pid),
+            WrapScope::System { .. } => None,
         }
     }
 }
@@ -3472,5 +3496,19 @@ fn operator_diagnostics_wrap_twin_system_paired_parity_dispositions() -> Result<
     check_paired_parity(&off, 0, &on, 0)?;
     let fenced = primary_facts_system(&primary_validator_fixture_system(123, 0, 32), 123, 32)?;
     ensure!(check_paired_parity(&off, 0, &fenced, 32).is_err());
+    Ok(())
+}
+
+#[test]
+fn operator_diagnostics_wrap_twin_system_scope_round_trip() -> Result<()> {
+    // A validated scope reproduces its capture inputs exactly: the PID
+    // leg scopes and filters to the owner, the system leg scopes wide
+    // with no filter.
+    let pid = WrapScope::select(InspectScope::Pid(123), Some(123), 123)?;
+    ensure!(pid.inspect_scope() == InspectScope::Pid(123));
+    ensure!(pid.diagnostics_pid_filter() == Some(123));
+    let system = WrapScope::select(InspectScope::System, None, 123)?;
+    ensure!(system.inspect_scope() == InspectScope::System);
+    ensure!(system.diagnostics_pid_filter().is_none());
     Ok(())
 }

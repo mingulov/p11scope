@@ -63,12 +63,28 @@ def hook_contract(main, identity):
     if ("p11_root_current_exit" in function(main, "sched_process_exec")
             or "p11_root_current_exit" in function(main, "sched_process_exec_impl")):
         raise AssertionError("exec must retain affiliation")
-    if ("p11_root_current_exit" in function(main, "p11_return")
-            or "p11_root_current_exit" in function(main, "p11_return_impl")):
-        raise AssertionError("return must retain affiliation")
-    call = function(main, "p11_return_impl")
-    if call.index("image_pair_matches") > call.index("p11_root_current_tag"):
-        raise AssertionError("CALL tag must follow image guard")
+    for site in ("p11_return", "p11_return_impl", "ordinary_return",
+                 "object_return", "capture_return_facts"):
+        if "p11_root_current_exit" in function(main, site):
+            raise AssertionError("return must retain affiliation")
+    impl = function(main, "p11_return_impl")
+    for branch in ("ordinary_return", "object_return"):
+        if impl.count(branch + "(") != 1:
+            raise AssertionError(f"return must dispatch once to {branch}")
+    if ("image_pair_matches" in impl or "p11_root_current_tag" in impl
+            or "capture_return_facts" in impl):
+        raise AssertionError("return dispatch must not inline the image guard or CALL tag")
+    facts = function(main, "capture_return_facts")
+    if facts.count("p11_root_current_tag") != 1:
+        raise AssertionError("CALL tag must live exactly once in capture_return_facts")
+    for branch in ("ordinary_return", "object_return"):
+        body = function(main, branch)
+        if body.count("image_pair_matches") != 1:
+            raise AssertionError(f"{branch} must carry exactly one image guard")
+        if body.count("capture_return_facts(") != 1:
+            raise AssertionError(f"{branch} must capture CALL facts exactly once")
+        if body.index("image_pair_matches") > body.index("capture_return_facts("):
+            raise AssertionError("CALL tag must follow image guard")
     fork = function(main, "p11_link_emit_fork")
     if "root_affiliation: unsafe { p11_root_current_tag() }" not in fork:
         raise AssertionError("FORK must tag only the emitting parent")
@@ -125,6 +141,27 @@ class RootAffiliationTests(unittest.TestCase):
             main.replace("pub fn sched_process_exec(_ctx: RawTracePointContext) -> u32 {\n"
                          "    if !stop_gate_enter() {\n        return 0;\n    }\n",
                          "pub fn sched_process_exec(_ctx: RawTracePointContext) -> u32 {\n", 1),
+        ]
+        ordinary = function(main, "ordinary_return")
+        guard = ("    let mut image = ImageIdentity::default();\n"
+                 "    if unsafe { p11_link_current_identity(&mut image) } != 1\n"
+                 "        || !image_pair_matches(start.image, image)\n"
+                 "    {\n"
+                 "        bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);\n"
+                 "        return 0;\n"
+                 "    }\n")
+        facts_line = ("    let facts = capture_return_facts(ctx, &start, flags, layout, accounting);\n")
+        swapped = ordinary.replace(guard + facts_line, facts_line + guard, 1)
+        self.assertNotEqual(swapped, ordinary, "guard/facts swap must apply")
+        mutants += [
+            main.replace("        ordinary_return(ctx, &key, start, flags, layout)\n",
+                         "        object_return(ctx, &key, start, flags, layout)\n", 1),
+            main.replace("        object_return(ctx, &key, start, flags, layout)\n",
+                         "        ordinary_return(ctx, &key, start, flags, layout)\n", 1),
+            main.replace(ordinary, swapped, 1),
+            main.replace("        || !image_pair_matches(start.image, image)\n", "", 1),
+            main.replace("        || !image_pair_matches(unsafe { (*start).image }, image)\n", "", 1),
+            main.replace("        root_affiliation: unsafe { p11_root_current_tag() },\n", "", 1),
         ]
         for mutant in mutants:
             self.assertNotEqual(mutant, main, "mutation must change the tested source")

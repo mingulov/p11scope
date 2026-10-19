@@ -257,8 +257,10 @@ def check_verdict(report: dict[str, Any], allowed: tuple[str, ...]) -> list[str]
 
 # Floor tables, calibrated on the dev host (Playwright Firefox 157 /
 # Chromium 156, SoftHSM 2.6.1) with background network activity stabilized
-# out, so every floored call is flow-caused. Floors sit far below typical
-# counts (FF-STARTUP sees C_FindObjects x26) so version drift adds calls
+# out during calibration (stabilized-vs-unstabilized comparison plus
+# trace-timestamp correlation for FF-STARTUP). Per-run floors reproduce
+# the calibrated flow-caused shape and sit far below typical counts
+# (FF-STARTUP sees C_FindObjects x26), so version drift adds calls
 # without breaking the cell; only silence fails.
 FF_STARTUP_FLOORS = {
     "C_FindObjectsInit": 1,

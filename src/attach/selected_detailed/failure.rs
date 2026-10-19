@@ -22,6 +22,13 @@ pub(crate) struct SelectedPreparationFailure {
     /// never a shared counter another test could satisfy.
     #[cfg(test)]
     test_id: Option<u64>,
+    /// Tests-only destruction probe: the custody twin's liveness
+    /// token, owned by this failure. A retained (forgotten) failure
+    /// keeps it alive; a destroyed failure drops it. The twin holds
+    /// only a `Weak`, so it observes this specific owner's survival —
+    /// never a recorded marker.
+    #[cfg(test)]
+    liveness: Option<std::sync::Arc<()>>,
 }
 impl SelectedPreparationFailure {
     /// Called only before the first producer exists, after the failed local
@@ -34,6 +41,8 @@ impl SelectedPreparationFailure {
             status: SelectedCleanupStatus::Settled,
             #[cfg(test)]
             test_id: None,
+            #[cfg(test)]
+            liveness: None,
         }
     }
 
@@ -45,6 +54,8 @@ impl SelectedPreparationFailure {
             status: SelectedCleanupStatus::Pending,
             #[cfg(test)]
             test_id: None,
+            #[cfg(test)]
+            liveness: None,
         }
     }
 
@@ -58,6 +69,8 @@ impl SelectedPreparationFailure {
             status: SelectedCleanupStatus::Pending,
             #[cfg(test)]
             test_id: None,
+            #[cfg(test)]
+            liveness: None,
         }
     }
 
@@ -83,6 +96,7 @@ impl SelectedPreparationFailure {
             diagnostic: anyhow::anyhow!("scripted unproved preparation failure"),
             status: SelectedCleanupStatus::Unproved,
             test_id: None,
+            liveness: None,
         }
     }
 
@@ -104,9 +118,19 @@ impl SelectedPreparationFailure {
             diagnostic: anyhow::anyhow!("scripted unproved preparation failure"),
             status: SelectedCleanupStatus::Unproved,
             test_id: None,
+            liveness: None,
         };
         failure.test_id = Some(test_id);
         failure
+    }
+
+    /// Tests-only destruction probe: this failure takes ownership of
+    /// the twin's liveness token, so the twin's `Weak` observes this
+    /// specific owner's survival — never a recorded marker.
+    #[cfg(test)]
+    pub(crate) fn with_liveness_probe(mut self, probe: std::sync::Arc<()>) -> Self {
+        self.liveness = Some(probe);
+        self
     }
 
     #[cfg(test)]

@@ -631,6 +631,11 @@ enum ServiceState {
 pub(crate) struct SelectedLifecycleService {
     state: ServiceState,
     unproved: Vec<UnprovedOwner>,
+    /// Tests-only negative control: disable retention itself while
+    /// recording still runs, so the destruction probe must observe
+    /// the owner die. Production always retains.
+    #[cfg(test)]
+    retention_disabled: bool,
 }
 
 impl SelectedLifecycleService {
@@ -638,7 +643,29 @@ impl SelectedLifecycleService {
         Self {
             state: ServiceState::Idle,
             unproved: Vec::new(),
+            #[cfg(test)]
+            retention_disabled: false,
         }
+    }
+
+    /// Tests-only negative control: disable retention itself (not
+    /// recording) so the twin's destruction probe must observe the
+    /// owner die.
+    #[cfg(test)]
+    pub(crate) fn disable_retention_for_test(&mut self) {
+        self.retention_disabled = true;
+    }
+
+    /// Process-lifetime custody for one teardown owner. Production
+    /// always retains; tests disable retention for the negative
+    /// control above.
+    fn retain_custody<T>(&self, owner: T) {
+        #[cfg(test)]
+        if self.retention_disabled {
+            drop(owner);
+            return;
+        }
+        retain_for_process_exit(owner);
     }
 
     pub(crate) fn is_idle(&self) -> bool {
@@ -1023,7 +1050,7 @@ impl Drop for SelectedLifecycleService {
             if let Some(id) = unproved_owner_test_id(&owner) {
                 record_retained_id(id);
             }
-            retain_for_process_exit(owner);
+            self.retain_custody(owner);
         }
         let state = std::mem::replace(&mut self.state, ServiceState::Idle);
         match state {
@@ -1040,7 +1067,7 @@ impl Drop for SelectedLifecycleService {
                         {
                             record_retained_id(id);
                         }
-                        retain_for_process_exit(UnprovedOwner::Outcome(delivered));
+                        self.retain_custody(UnprovedOwner::Outcome(delivered));
                     }
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                         // The worker died without delivering: nothing
@@ -1055,7 +1082,7 @@ impl Drop for SelectedLifecycleService {
                         if let Some(id) = preparing_channel_id {
                             record_retained_id(id);
                         }
-                        retain_for_process_exit(outcome);
+                        self.retain_custody(outcome);
                     }
                 }
             }
@@ -1068,7 +1095,7 @@ impl Drop for SelectedLifecycleService {
                 if let Some(id) = unproved_owner_test_id(&owner) {
                     record_retained_id(id);
                 }
-                retain_for_process_exit(owner);
+                self.retain_custody(owner);
             }
             // Idle holds nothing; Installing already handed its parts
             // to the driver, which reclaims them on its own drop.

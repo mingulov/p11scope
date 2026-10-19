@@ -44,11 +44,11 @@ pub(super) fn validate_caller_maps(
     let mut expected = inventory_maps(n);
     expected.extend([
         (
-            "INV_BASELINE_REQUESTS",
+            "INV_BASELINE_RQ",
             (K::Hash, map_metadata(MapType::Hash, 4, 16, 1024, 129)),
         ),
         (
-            "INV_BASELINE_CTL",
+            "INV_BASELINE_CT",
             (K::Array, map_metadata(MapType::Array, 4, 56, 1, 0)),
         ),
         (

@@ -22,9 +22,9 @@ static void *lookup(void *map, const void *key)
     if (map == &IMAGE_CONTINUITY) return have_continuity ? &continuity : NULL;
     if (map == &IMAGE_TGID_INDEX) return have_index ? &index_cookie : NULL;
     assert(*(const u32 *)key == 0);
-    if (map == &SELECTED_DETAILED) return &target;
-    if (map == &SELECTED_DETAILED_STATE) return &flags;
-    if (map == &SELECTED_BOOTSTRAP_CTL) return &ctl;
+    if (map == &SELECTED_DETAIL) return &target;
+    if (map == &SELECTED_DSTATE) return &flags;
+    if (map == &SELECTED_BCTL) return &ctl;
     if (map == &COOKIE_CTL) return &cookie_ctl;
     if (map == &CONFIG) { static u64 policy = 1ULL << 2; return &policy; }
     assert(0); return NULL;

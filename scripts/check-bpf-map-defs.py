@@ -1440,9 +1440,9 @@ def validate_inventory_caller_entry_reachability(elf):
             or roots[0][3] != elf.indices.get("iter/task")):
         raise RuntimeError("caller inventory requires exact GLOBAL DEFAULT baseline iterator")
     seen, maps, helpers, _ = walk(roots[0][3:5],
-        {"INV_BASELINE_REQUESTS", "INV_BASELINE_CTL", "TASK_COOKIE", "COOKIE_CTL"},
+        {"INV_BASELINE_RQ", "INV_BASELINE_CT", "TASK_COOKIE", "COOKIE_CTL"},
         {1, 5, 127, 156})
-    if (maps != {"INV_BASELINE_REQUESTS", "INV_BASELINE_CTL", "TASK_COOKIE", "COOKIE_CTL"}
+    if (maps != {"INV_BASELINE_RQ", "INV_BASELINE_CT", "TASK_COOKIE", "COOKIE_CTL"}
             or helpers != {1, 5, 127, 156}):
         raise RuntimeError("caller baseline iterator requires exact identity-only dependency footprint")
     reports["p11_inventory_image_baseline"] = {
@@ -1474,7 +1474,7 @@ def validate_selected_leaf(elf):
                 address, info = struct.unpack_from("<QQ", raw, at)
                 relocations[address] = (info & 0xffffffff, elf.symbols[info >> 32])
     maps, helpers, frame = set(), set(), 0
-    allowed_maps = {"SELECTED_DETAILED", "SELECTED_DETAILED_STATE", "INSTANCE_GEN", "TASK_COOKIE"}
+    allowed_maps = {"SELECTED_DETAIL", "SELECTED_DSTATE", "INSTANCE_GEN", "TASK_COOKIE"}
     for at in range(0, len(body), 8):
         op, registers, offset, immediate = struct.unpack_from("<BBhi", body, at)
         if op & 7 in (1, 2, 3) and offset < 0:
@@ -1679,9 +1679,9 @@ SAFE_MAPS = {
         "IMAGE_TGID_INDEX": (1, 8, 8, 16_384, 17),
         "IMAGE_QUERY_REQUESTS": (1, 8, 24, 1_024, 129),
         "IMAGE_QUERY_CTL": (2, 4, 56, 1),
-        "SELECTED_DETAILED": (2, 4, 32, 1, 128),
-        "SELECTED_DETAILED_STATE": (2, 4, 8, 1, 1024),
-        "SELECTED_BOOTSTRAP_CTL": (2, 4, 48, 1),
+        "SELECTED_DETAIL": (2, 4, 32, 1, 128),
+        "SELECTED_DSTATE": (2, 4, 8, 1, 1024),
+        "SELECTED_BCTL": (2, 4, 48, 1),
         "INSTANCE_CALIB": (2, 4, 40, 1),
         "INSTANCE_COUNT": (2, 4, 80, 1),
         "INSTANCE_START": (9, 16, 24, 16_384),
@@ -1755,8 +1755,8 @@ INVENTORY_FORBIDDEN_MAPS = {
     "INSTANCE_GEN", "INSTANCE_CALIB", "INSTANCE_COUNT", "INSTANCE_START",
     "IMAGE_CONTINUITY", "IMAGE_TGID_INDEX", "IMAGE_QUERY_REQUESTS", "IMAGE_QUERY_CTL",
     "OBJECT_START", "OBJECT_DESCRIPTORS", "OBJECT_ZERO",
-    "SELECTED_DETAILED", "SELECTED_DETAILED_STATE", "SELECTED_BOOTSTRAP_CTL",
-    "INV_BASELINE_REQUESTS", "INV_BASELINE_CTL",
+    "SELECTED_DETAIL", "SELECTED_DSTATE", "SELECTED_BCTL",
+    "INV_BASELINE_RQ", "INV_BASELINE_CT",
 }
 INVENTORY_CALLER_MAPS = INVENTORY_MAPS | {
     "ENDPOINT_OBJECT": map_def(2, 4, 8, 1, 128),
@@ -1764,8 +1764,8 @@ INVENTORY_CALLER_MAPS = INVENTORY_MAPS | {
     "CALLER_EVIDENCE": map_def(6, 4, 8, 4),
     "TASK_COOKIE": SAFE_MAPS["TASK_COOKIE"],
     "COOKIE_CTL": SAFE_MAPS["COOKIE_CTL"],
-    "INV_BASELINE_REQUESTS": map_def(1, 4, 16, 1024, 129),
-    "INV_BASELINE_CTL": map_def(2, 4, 56, 1),
+    "INV_BASELINE_RQ": map_def(1, 4, 16, 1024, 129),
+    "INV_BASELINE_CT": map_def(2, 4, 56, 1),
 }
 INVENTORY_CALLER_PROGRAMS = INVENTORY_PROGRAMS | {"p11_inventory_image_baseline"}
 
@@ -1826,7 +1826,7 @@ def validate_inventory(variant, maps, programs, symbols):
     callers = variant.startswith("inventory-callers")
     if inventory:
         allowed = {"TASK_COOKIE", "COOKIE_CTL", "p11_link_current_identity",
-                   "INV_BASELINE_REQUESTS", "INV_BASELINE_CTL",
+                   "INV_BASELINE_RQ", "INV_BASELINE_CT",
                    "p11_inventory_image_baseline"} if callers else set()
         forbidden = {name for name in symbols if name not in allowed and
                      (name in INVENTORY_FORBIDDEN_MAPS

@@ -346,6 +346,17 @@ fn check_terminal_pairs(
     records: &[serde_json::Value],
     b_module: &serde_json::Value,
 ) -> Result<(u64, u64, u64)> {
+    check_terminal_pairs_as(records, b_module, None)
+}
+
+/// `check_terminal_pairs` with the terminal caller identity pinned to
+/// the live-observed owned caller (system cell). `None` keeps the
+/// single-caller consistency check unpinned (PID cell).
+fn check_terminal_pairs_as(
+    records: &[serde_json::Value],
+    b_module: &serde_json::Value,
+    expected_caller: Option<&str>,
+) -> Result<(u64, u64, u64)> {
     let mut placements = BTreeSet::new();
     let mut proof_abs_sum = 0u64;
     let mut staged_sum = 0u64;
@@ -441,6 +452,12 @@ fn check_terminal_pairs(
             && staged_sum == 32,
         "terminal sums differ from per-pair 659/660/1: fence={fence_abs_sum} proof={proof_abs_sum} staged={staged_sum}"
     );
+    if let Some(expected) = expected_caller {
+        ensure!(
+            caller.as_deref() == Some(expected),
+            "terminal pairs bind caller {caller:?}, not the owned {expected}"
+        );
+    }
     Ok((fence_abs_sum, proof_abs_sum, staged_sum))
 }
 
@@ -687,6 +704,22 @@ fn check_wrap_records(
     pid: u32,
 ) -> Result<()> {
     let header = records.first().context("diagnostic header missing")?;
+    ensure!(header["scope"] == "pid" && header["mode"] == "native" && header["pid_filter"] == pid);
+    check_wrap_records_core(records, bytes, b_module, None)
+}
+
+/// Scope-free wrap-export contract: envelope, limits, both-ring wrap,
+/// footer reconciliation, truthful references and the terminal pairs.
+/// The caller pins the scope header first; `expected_caller` pins the
+/// terminal caller identity (system cell) or leaves the single-caller
+/// consistency check unpinned (PID cell).
+fn check_wrap_records_core(
+    records: &[serde_json::Value],
+    bytes: u64,
+    b_module: &serde_json::Value,
+    expected_caller: Option<&str>,
+) -> Result<()> {
+    let header = records.first().context("diagnostic header missing")?;
     let footer = records.last().context("diagnostic footer missing")?;
     ensure!(
         header["kind"] == "header"
@@ -707,7 +740,6 @@ fn check_wrap_records(
             && footer["bytes_written"] == bytes
             && footer["records_written"] == records.len() as u64 - 2
     );
-    ensure!(header["scope"] == "pid" && header["mode"] == "native" && header["pid_filter"] == pid);
     let kinds = footer["kinds"]
         .as_array()
         .context("diagnostic kind totals missing")?;
@@ -842,7 +874,8 @@ fn check_wrap_records(
             }
         }
     }
-    let (fence_sum, proof_sum, staged_sum) = check_terminal_pairs(records, b_module)?;
+    let (fence_sum, proof_sum, staged_sum) =
+        check_terminal_pairs_as(records, b_module, expected_caller)?;
     ensure!(
         missing_context,
         "wrapped export needs truthful lost-history context"
@@ -860,7 +893,9 @@ fn check_wrap_records(
 /// "system"` with an explicit null PID filter, every pid-bearing row
 /// owned, and the terminal pairs bound to the live-observed owned
 /// caller. Otherwise the full PID wrap contract applies unchanged.
-/// STUB: always fails until the system export validator lands.
+/// Production stamps caller identity (with the adapter PID) on every
+/// non-health record and leaves global health rows pid-less, so any
+/// foreign or pid-less data row fails closed here.
 fn check_wrap_records_system(
     records: &[serde_json::Value],
     bytes: u64,
@@ -868,8 +903,28 @@ fn check_wrap_records_system(
     owned_pid: u32,
     owned_caller: &str,
 ) -> Result<()> {
-    let _ = (records, bytes, b_module, owned_pid, owned_caller);
-    bail!("wrap-scope stub: system export validator not implemented")
+    let header = records.first().context("diagnostic header missing")?;
+    ensure!(
+        header["kind"] == "header"
+            && header["scope"] == "system"
+            && header["mode"] == "native"
+            && header.get("pid_filter") == Some(&serde_json::Value::Null),
+        "system wrap needs an unfiltered native system header: {header}"
+    );
+    for row in &records[1..records.len() - 1] {
+        if row["kind"] == "capture_health" {
+            ensure!(
+                row["pid"].is_null(),
+                "global health row carries a pid: {row}"
+            );
+        } else {
+            ensure!(
+                row["pid"] == owned_pid,
+                "system export carries a non-owned row: {row}"
+            );
+        }
+    }
+    check_wrap_records_core(records, bytes, b_module, Some(owned_caller))
 }
 
 fn time_shape(value: &serde_json::Value, field: &str) -> Result<bool> {

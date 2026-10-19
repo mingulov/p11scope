@@ -1338,6 +1338,10 @@ pub struct Session {
     /// Terminal transfer and settlement belong to this exact Session. An
     /// interrupted/failed drive can never infer success from empty links.
     producer_detach: OwnedProducerDetach,
+    /// Sticky native-completion mint refusal: set once a mint attempt
+    /// fails after its terminal poll consumed records, after which the
+    /// Session can never mint (see [`NativeCompletionMint`]).
+    native_completion_mint: NativeCompletionMint,
     /// H7 slice D: receipt-bound object rows for 608-byte decode, frozen
     /// by `Session::start_attested` only. `None` everywhere else keeps
     /// those lanes 368-byte-only.
@@ -2207,14 +2211,7 @@ impl SessionNativeCompletion {
         events_id: u64,
     ) -> Result<Self> {
         Self::join_gates(detach_complete, quiescent)?;
-        anyhow::ensure!(
-            !backlog,
-            "native completion refused: terminal drain left backlog past its bound"
-        );
-        anyhow::ensure!(
-            !head_pending,
-            "native completion refused: EVENTS head reserved but uncommitted"
-        );
+        Self::refuse_drain_verdict(backlog, head_pending)?;
         Ok(Self {
             terminal_events,
             terminal_malformed,
@@ -2264,6 +2261,58 @@ impl SessionNativeCompletion {
     /// contract).
     pub(crate) fn binds_events(&self, domain: &events::EventsDomain) -> bool {
         self.events_id == domain.id()
+    }
+
+    /// Refuse a terminal poll verdict that already proves the mint
+    /// cannot join: backlog past the bound, or a reserved-but-
+    /// uncommitted EVENTS head. The pre-scrub fail-fast in
+    /// [`Session::mint_native_completion`] and the end adjudication in
+    /// `from_joined_evidence` share this one check, so the two can never
+    /// drift — and a known-bad verdict refuses before the scrub, whose
+    /// error can therefore neither run on doomed evidence nor preempt
+    /// the by-name diagnostic.
+    fn refuse_drain_verdict(backlog: bool, head_pending: bool) -> Result<()> {
+        anyhow::ensure!(
+            !backlog,
+            "native completion refused: terminal drain left backlog past its bound"
+        );
+        anyhow::ensure!(
+            !head_pending,
+            "native completion refused: EVENTS head reserved but uncommitted"
+        );
+        Ok(())
+    }
+}
+
+/// Sticky refusal for the native completion mint: once an attempt fails
+/// after its terminal poll consumed records, the Session can never mint
+/// again — a retry would drain only the leftover tail and mint over the
+/// consumed prefix the refusal ate (65,537 queued: attempt 1 eats 65,536
+/// and refuses for backlog; attempt 2 would mint terminal_events=1 over
+/// the forgotten attempt 1). Pre-consumption refusals — the admission
+/// and join gates, the selected gate, consumer setup — ate nothing and
+/// leave the mint admissible.
+#[derive(Default)]
+struct NativeCompletionMint {
+    failed_after_consumption: bool,
+}
+
+impl NativeCompletionMint {
+    /// Fail-fast admission at the top of the mint, before the terminal
+    /// poll: a Session poisoned by a destructive mint failure refuses
+    /// without consuming anything further.
+    fn admit(&self) -> Result<()> {
+        anyhow::ensure!(
+            !self.failed_after_consumption,
+            "native completion refused: a prior mint attempt failed after consuming terminal evidence"
+        );
+        Ok(())
+    }
+
+    /// Record a failure after the terminal poll consumed: the mint is
+    /// terminally refused for this Session.
+    fn record_destructive_failure(&mut self) {
+        self.failed_after_consumption = true;
     }
 }
 
@@ -4858,6 +4907,7 @@ impl Session {
                 instance: InstanceTracking::default(),
                 cleanup_worker: Some(CleanupWorker::pre_start()),
                 producer_detach: OwnedProducerDetach::NotStarted,
+                native_completion_mint: NativeCompletionMint::default(),
                 object_decode: None,
                 #[cfg(feature = "h6-reexec-diagnostic")]
                 reexec_diagnostic: None,
@@ -6268,17 +6318,24 @@ impl Session {
     }
 
     /// Mint the native-owned terminal completion after the terminal
-    /// sequence. Gates, in order: the producer detach worker joined
-    /// (Complete, never an observed empty link set) and the stop gate
-    /// still proves Q — both enforced fail-fast before the terminal poll,
-    /// so a refused mint consumes nothing — then the selected gate (when
-    /// present) reads back TERMINAL, one explicitly bounded terminal
-    /// EVENTS poll leaves no backlog and no reserved-but-uncommitted
-    /// head, and the OBJECT_START scrub completes. The end adjudication
+    /// sequence. Gates, in order: no prior destructive mint failure (a
+    /// poisoned Session refuses before its poll, consuming nothing
+    /// further), the producer detach worker joined (Complete, never an
+    /// observed empty link set) and the stop gate still proves Q — both
+    /// enforced fail-fast before the terminal poll, so a refused mint
+    /// consumes nothing — then the selected gate (when present) reads
+    /// back TERMINAL, one explicitly bounded terminal EVENTS poll runs,
+    /// its known drain failures (backlog past the bound, reserved-but-
+    /// uncommitted head) refuse before the scrub — so a failing scrub can
+    /// neither run on doomed evidence nor preempt the by-name diagnostic
+    /// — and the OBJECT_START scrub completes. The end adjudication
     /// re-checks the join gates with the post-poll Q read as defense in
-    /// depth. Any failure refuses: no partial completion exists.
+    /// depth. Any post-poll failure poisons the mint: the poll ate a
+    /// prefix a retry can never see again, so the refused Session can
+    /// never mint afterwards. No partial completion exists.
     #[allow(dead_code)] // No joint consumer until the promotion lane wires DR37 1C/1F.
     pub(crate) fn mint_native_completion(&mut self) -> Result<SessionNativeCompletion> {
+        self.native_completion_mint.admit()?;
         let detach_complete = matches!(self.producer_detach, OwnedProducerDetach::Complete);
         let quiescent = self.stop_gate.quiescent();
         // Fail fast before the terminal poll consumes anything: a refused
@@ -6301,9 +6358,17 @@ impl Session {
                 .context("retained EVENTS consumer vanished after creation")?;
             terminal_poll_verdict(consumer)
         };
+        // Reject known drain failures BEFORE scrubbing: the verdict
+        // already proves the mint cannot join. The refusal poisons the
+        // mint — the poll consumed a prefix no retry can recover — and
+        // the by-name diagnostic survives, never preempted by a scrub
+        // that must not run on doomed evidence.
+        SessionNativeCompletion::refuse_drain_verdict(verdict.backlog, verdict.head_pending)
+            .inspect_err(|_| self.native_completion_mint.record_destructive_failure())?;
         let scrubbed_objects = object_stop::scrub_after_quiescence(&mut self.ebpf, &self.stop_gate)
+            .inspect_err(|_| self.native_completion_mint.record_destructive_failure())
             .context("scrubbing object START for native completion")?;
-        SessionNativeCompletion::from_joined_evidence(
+        let completion = SessionNativeCompletion::from_joined_evidence(
             detach_complete,
             quiescent && self.stop_gate.quiescent(),
             verdict.backlog,
@@ -6314,7 +6379,11 @@ impl Session {
             self.detach_wall_ms,
             selected_terminal,
             self.events_domain.id(),
-        )
+        );
+        // The end adjudication re-checks the join gates with the post-poll
+        // Q read: a refusal here still follows a consuming poll, so it
+        // poisons the mint like any destructive failure.
+        completion.inspect_err(|_| self.native_completion_mint.record_destructive_failure())
     }
 
     fn take_cleanup_worker(&mut self) -> Result<CleanupWorker> {

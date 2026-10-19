@@ -4,12 +4,13 @@
 //! reserved-but-uncommitted head, and the minting Session's retained
 //! EVENTS identity. The live Session observation wiring mints through the
 //! same constructor after the same fail-fast gates.
+use super::NativeCompletionMint;
 use super::SessionNativeCompletion;
 use super::stopped_attachment_admission;
 use super::terminal_poll_verdict;
 use crate::events::{
-    EventDrain, EventsDomain, PendingHeadRecords, ScriptedRecords, event_drain_positions,
-    events_head_pending, poll_events_to_position,
+    EventDrain, EventsDomain, PendingHeadRecords, ScriptedRecords, TERMINAL_DRAIN_BOUND,
+    event_drain_positions, events_head_pending, poll_events_to_position,
 };
 use p11scope_ebpf_common::Event;
 use std::ops::ControlFlow;
@@ -222,6 +223,119 @@ fn refused_mint_leaves_backlog_whole_for_retry() {
     assert_eq!(
         after.consumer, after.producer,
         "the retry drained the whole backlog: no split for a later mint"
+    );
+}
+
+#[test]
+fn post_drain_backlog_refusal_poisons_the_retry() {
+    // 65,537 queued valid records, through the mint's real helpers in
+    // the mint's order. Attempt 1's terminal poll eats the 65,536-record
+    // bound and reports backlog; the pre-scrub refusal fires before any
+    // scrub and poisons the mint. Attempt 2 refuses at admission without
+    // polling — the leftover tail is never drained, never minted as
+    // terminal_events=1 over the forgotten attempt 1.
+    let mut drain = EventDrain::over(ScriptedRecords::events(
+        (0..=TERMINAL_DRAIN_BOUND).map(|_| sample_event()),
+        TERMINAL_DRAIN_BOUND + 1,
+    ));
+    let mut mint = NativeCompletionMint::default();
+    mint.admit().expect("first attempt admitted");
+    let verdict = terminal_poll_verdict(&mut drain);
+    assert!(verdict.backlog, "the bound-exceeded drain reports backlog");
+    assert_eq!(verdict.terminal_events, TERMINAL_DRAIN_BOUND as u64);
+    assert_eq!(verdict.terminal_malformed, 0);
+    assert!(
+        verdict.head_pending,
+        "the leftover tail also shows as a pending head"
+    );
+    let error =
+        SessionNativeCompletion::refuse_drain_verdict(verdict.backlog, verdict.head_pending)
+            .expect_err("known drain failure refuses before the scrub");
+    assert!(
+        format!("{error:#}").contains("backlog"),
+        "the backlog refusal keeps its name and priority: {error:#}"
+    );
+    mint.record_destructive_failure();
+    // Attempt 2 refuses at admission: the consumer never moves, the tail
+    // stays queued, nothing mints.
+    let before = event_drain_positions(&drain);
+    let error = mint.admit().expect_err("poisoned mint refuses the retry");
+    assert!(
+        format!("{error:#}").contains("prior mint attempt"),
+        "unexpected refusal: {error:#}"
+    );
+    assert_eq!(
+        event_drain_positions(&drain).consumer,
+        before.consumer,
+        "terminal refusal consumes nothing further"
+    );
+    assert_eq!(drain.source().remaining(), 1);
+    // The hole being closed, pinned: without the poison, the retry's
+    // verdict would mint terminal_events=1 over forgotten attempt 1.
+    let retry = terminal_poll_verdict(&mut drain);
+    assert!(!retry.backlog);
+    assert_eq!(retry.terminal_events, 1);
+}
+
+#[test]
+fn bound_exact_drain_refusal_poisons_the_clean_retry() {
+    // The boundary twin: exactly the bound queued. Attempt 1 eats all
+    // 65,536 and still reports backlog (the quantum was reached); the
+    // pre-scrub refusal poisons the mint, so the retry cannot mint the
+    // clean zero-event completion its empty verdict would otherwise allow.
+    let mut drain = EventDrain::over(ScriptedRecords::events(
+        (0..TERMINAL_DRAIN_BOUND).map(|_| sample_event()),
+        TERMINAL_DRAIN_BOUND,
+    ));
+    let mut mint = NativeCompletionMint::default();
+    mint.admit().expect("first attempt admitted");
+    let verdict = terminal_poll_verdict(&mut drain);
+    assert!(
+        verdict.backlog,
+        "the quantum-reached drain reports backlog even with nothing left"
+    );
+    assert_eq!(verdict.terminal_events, TERMINAL_DRAIN_BOUND as u64);
+    assert!(
+        !verdict.head_pending,
+        "every record consumed, positions meet"
+    );
+    let error =
+        SessionNativeCompletion::refuse_drain_verdict(verdict.backlog, verdict.head_pending)
+            .expect_err("known drain failure refuses before the scrub");
+    assert!(
+        format!("{error:#}").contains("backlog"),
+        "unexpected refusal: {error:#}"
+    );
+    mint.record_destructive_failure();
+    let before = event_drain_positions(&drain);
+    let error = mint.admit().expect_err("poisoned mint refuses the retry");
+    assert!(
+        format!("{error:#}").contains("prior mint attempt"),
+        "unexpected refusal: {error:#}"
+    );
+    assert_eq!(
+        event_drain_positions(&drain).consumer,
+        before.consumer,
+        "terminal refusal consumes nothing further"
+    );
+    assert_eq!(drain.source().remaining(), 0);
+    // The hole being closed, pinned: without the poison, the retry's
+    // empty verdict would mint the clean zero-event completion.
+    let retry = terminal_poll_verdict(&mut drain);
+    assert!(!retry.backlog);
+    assert!(!retry.head_pending);
+    assert_eq!(retry.terminal_events, 0);
+}
+
+#[test]
+fn reserved_head_refuses_before_scrub_by_name() {
+    // The pre-scrub check refuses a reserved head by its own name — the
+    // diagnostic a scrub error used to preempt when adjudication ran last.
+    let error = SessionNativeCompletion::refuse_drain_verdict(false, true)
+        .expect_err("reserved head refuses before the scrub");
+    assert!(
+        format!("{error:#}").contains("reserved but uncommitted"),
+        "unexpected refusal: {error:#}"
     );
 }
 

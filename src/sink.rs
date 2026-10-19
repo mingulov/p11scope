@@ -474,6 +474,49 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::time::Duration;
 
+    /// Stall bound for the draining-reader tests. The writer must block
+    /// until the reader drains, so `stall_ms` measures scheduling
+    /// jitter, not loss: exact-0 fails under load (28 ms max across the
+    /// feature-combo matrix, 2 ms in a full default run, 1 flake in 55
+    /// isolated runs). 100 ms is ~3.5x the max observed yet 50x under
+    /// the tests' own 5 s reader timeout.
+    const DRAINING_READER_MAX_STALL_MS: u64 = 100;
+
+    /// Lossless delivery to a draining reader: every byte arrives, no
+    /// timeout, no drop, and the poll wait stays within scheduling
+    /// jitter (see [`DRAINING_READER_MAX_STALL_MS`]).
+    fn assert_lossless_drain(drops: SinkDrops) {
+        assert_eq!(drops.timeouts, 0, "draining reader timed out: {drops:?}");
+        assert_eq!(
+            drops.dropped_bytes, 0,
+            "draining reader dropped: {drops:?}"
+        );
+        assert!(
+            drops.stall_ms <= DRAINING_READER_MAX_STALL_MS,
+            "draining stall {} ms exceeds {DRAINING_READER_MAX_STALL_MS} ms: {drops:?}",
+            drops.stall_ms
+        );
+    }
+
+    #[test]
+    fn lossless_drain_bound_bites_one_past_the_pinned_ceiling() {
+        // Pins the ceiling: a bump needs a new measurement note on the const.
+        assert_eq!(DRAINING_READER_MAX_STALL_MS, 100);
+        let over = SinkDrops {
+            timeouts: 0,
+            dropped_bytes: 0,
+            stall_ms: 101,
+        };
+        // Expected-panic noise: the hook is process-global, so no swap.
+        let caught = std::panic::catch_unwind(|| assert_lossless_drain(over));
+        assert!(caught.is_err(), "a 101 ms stall must fail the drain bound");
+        assert_lossless_drain(SinkDrops {
+            timeouts: 0,
+            dropped_bytes: 0,
+            stall_ms: 100,
+        });
+    }
+
     #[test]
     fn diagnostic_line_reaches_a_ready_reader_without_waiting() {
         let (writer, mut reader) = pair();
@@ -579,7 +622,7 @@ mod tests {
         sink.flush().unwrap();
         let got = reader_thread.join().unwrap();
         assert_eq!(got, chunk);
-        assert_eq!(sink.take_drops(), SinkDrops::default());
+        assert_lossless_drain(sink.take_drops());
     }
 
     #[test]
@@ -957,7 +1000,7 @@ mod tests {
         sink.flush().unwrap();
         let got = reader_thread.join().unwrap();
         assert_eq!(got, payload);
-        assert_eq!(sink.take_drops(), SinkDrops::default());
+        assert_lossless_drain(sink.take_drops());
     }
 
     /// PA-14 healthy twin: the same large frame via `write_all` reaches a
@@ -981,7 +1024,7 @@ mod tests {
         sink.flush().unwrap();
         let got = reader_thread.join().unwrap().unwrap();
         assert_eq!(got, payload);
-        assert_eq!(sink.take_drops(), SinkDrops::default());
+        assert_lossless_drain(sink.take_drops());
     }
 
     /// PA-14: when the buffer is partly full, `write` reports only the
@@ -1027,7 +1070,7 @@ mod tests {
         sink.flush().unwrap();
         let got = reader_thread.join().unwrap().unwrap();
         assert_eq!(got, payload);
-        assert_eq!(sink.take_drops(), SinkDrops::default());
+        assert_lossless_drain(sink.take_drops());
     }
 
     /// PA-14: a stalled large offer sheds with a finite buffer: every

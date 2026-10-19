@@ -313,12 +313,6 @@ pub fn adapter_derive_entry(
     true
 }
 
-/// H7-E4 shipping gate. The scalar production seams below are implemented
-/// and exercised directly by host spies; adapters remain closed until actual
-/// compiled-stack, verifier, privacy and installed qualification pass. While
-/// false, entry acquires no template arguments and Get emission reads nothing.
-pub const ATTRIBUTE_CAPTURE_WIRED: bool = false;
-
 /// Production entry attribute adapter body (H7-E4): inspect authorized
 /// creation-template pairs into the side row's request lists, or retain
 /// Get entry headers into the side row's Get fields. Returns false only
@@ -331,14 +325,16 @@ pub const ATTRIBUTE_CAPTURE_WIRED: bool = false;
 /// other families inspect each present pair through the request seam,
 /// with the pair-zero scalars as pair one's alias peer; Derive
 /// additionally requires accepted entry evidence (`side.derive`, set by
-/// the Derive adapter earlier in the entry chain). Absent pairs stay
-/// untouched. Inspection flag contributions merge into the side flags.
+/// the Derive adapter earlier in the entry chain), and refused Derive
+/// marks its present pairs uninspected without fetching or reading.
+/// Absent pairs stay untouched. Inspection flag contributions merge
+/// into the side flags.
 ///
 /// The entry store lives HERE: the seams populate production side state
 /// directly, so host tests observe wiring through this function — no
-/// caller hand-writes the inspected outcomes. While E4 is unwired the
-/// adapter returns after custody without acquiring arguments (see
-/// `ATTRIBUTE_CAPTURE_WIRED`), so the side keeps its allocated-zero state.
+/// caller hand-writes the inspected outcomes. Acquisition is exact:
+/// every `fetch_arg` call below is a probe register/stack read on BPF,
+/// pinned by the drivers' fetch counts.
 #[inline(always)]
 // Closure plus scalar parameters map to the BPF wrapper's register-passed
 // arguments; bundling them into a struct would risk wrapper stack the
@@ -366,14 +362,6 @@ pub fn adapter_attributes_entry(
         || row.guard > OBJECT_GUARD_SCALAR_DERIVE
     {
         return false;
-    }
-    // Closed shipping gate: acquire nothing. Every
-    // `fetch_arg` below this line evaporates while the switch is false
-    // (the BPF wrapper keeps only its descriptor lookup); the drivers
-    // assert zero acquisition while unwired, so reintroduced fetches fail
-    // the suite instead of silently costing probe reads.
-    if !ATTRIBUTE_CAPTURE_WIRED {
-        return true;
     }
     if row.action == OBJECT_ACTION_GET {
         capture_get_template(side, row, layout, fetch_arg, &mut read_word);
@@ -418,9 +406,9 @@ pub(crate) fn capture_get_template(
     }
 }
 
-// The actual scalar request-pair body is separate from the shipping gate so
-// host spies can exercise its acquisition and alias sequencing while capture
-// remains disabled. It is called only after descriptor/custody validation.
+// The actual scalar request-pair body, separate so host spies exercise its
+// acquisition and alias sequencing directly. It is called only after
+// descriptor/custody validation.
 #[inline(always)]
 pub(crate) fn capture_request_pairs(
     side: &mut ObjectStart,
@@ -430,13 +418,24 @@ pub(crate) fn capture_request_pairs(
     mut read_word: impl FnMut(u64) -> Result<u64, ()>,
     mut read_bytes: impl FnMut(u64, &mut [u8]) -> Result<(), ()>,
 ) {
-    // Derive requires accepted entry evidence before any template access
-    // (the same finite guard as result-pointer retention).
-    if row.action == OBJECT_ACTION_DERIVE && side.derive == OBJECT_DERIVE_UNAVAILABLE {
-        return;
-    }
     let present0 = row.template_args[0] != ARG_NONE && row.template_args[1] != ARG_NONE;
     let present1 = row.template_args[2] != ARG_NONE && row.template_args[3] != ARG_NONE;
+    // Derive requires accepted entry evidence before any template access
+    // (the same finite guard as result-pointer retention). A refused
+    // Derive authorizes no template access at all, so its present pairs
+    // keep the honest never-inspected marking instead of a fake
+    // inspected-empty list the row presence would contradict. No fetch,
+    // no read and no flag: the marking plus the unavailable derive code
+    // already tell the refusal story.
+    if row.action == OBJECT_ACTION_DERIVE && side.derive == OBJECT_DERIVE_UNAVAILABLE {
+        if present0 {
+            side.requested[0].flags = OBJECT_ATTR_LIST_UNINSPECTED;
+        }
+        if present1 {
+            side.requested[1].flags = OBJECT_ATTR_LIST_UNINSPECTED;
+        }
+        return;
+    }
     // Both actual pairs precede either inspection. Keep failed acquisition
     // distinct from an absent pair and from a successfully acquired count0.
     let pair0 = if present0 {
@@ -797,8 +796,9 @@ pub unsafe fn adapter_tail_fill(
             core::ptr::addr_of_mut!((*tail).result_status).write(side.result_statuses);
         }
     }
-    // Closed shipping gate marks present pairs uninspected. Once qualified,
-    // entry's inspected lists pass through; absent pairs stay all-zero.
+    // Entry's inspected lists pass through; refused pairs already
+    // carry their honest uninspected marking from the entry store.
+    // Absent pairs stay all-zero.
     let mut p = 0;
     while p < 2 {
         let present =
@@ -808,16 +808,13 @@ pub unsafe fn adapter_tail_fill(
             unsafe {
                 let dst = core::ptr::addr_of_mut!((*tail).requested[p]);
                 dst.write(side.requested[p]);
-                if !ATTRIBUTE_CAPTURE_WIRED {
-                    core::ptr::addr_of_mut!((*dst).flags).write(OBJECT_ATTR_LIST_UNINSPECTED);
-                }
             }
         }
         p += 1;
     }
-    // Get result lists are return-inspected only; slice D runs no Get
-    // protocol in BPF, so a Get tail marks its result list uninspected
-    // rather than claiming an inspected-empty result.
+    // Get result lists are return-inspected only, so a Get tail marks
+    // its result list uninspected until the Get emission establishes
+    // inspected results (or keeps the marking on a refused return).
     if row.action == OBJECT_ACTION_GET {
         // SAFETY: `tail` is the exclusively owned reserved tail.
         unsafe {
@@ -1096,15 +1093,6 @@ pub unsafe fn adapter_emit_get_attributes(
     if !return_accepts_get_results(rv) {
         return true;
     }
-    // Shipping stays closed until the implemented seams pass compiled and
-    // installed qualification. Direct seam tests execute the decoder itself.
-    if !ATTRIBUTE_CAPTURE_WIRED {
-        // SAFETY: `tail` is the exclusively owned reserved tail.
-        unsafe {
-            (*tail).result_attributes.flags = OBJECT_ATTR_LIST_UNINSPECTED;
-        }
-        return true;
-    }
     // Authority from the adapter's own custody plus the threaded verdict:
     // the side row is live, the fill advanced it to RETURNING, and the
     // root joined continuity — the same trust the fill adapter places in
@@ -1178,8 +1166,7 @@ pub fn emission_finalize(emitted: bool, remove: impl FnOnce() -> bool) -> Emissi
 /// to merge into the side flags.
 ///
 /// Uses bounded selector-first header rescans for all stated-span alias
-/// checks, followed by one value read and a stable header recheck. The
-/// shipping adapter invokes this only after capture qualification.
+/// checks, followed by one value read and a stable header recheck.
 #[inline(always)]
 pub fn production_inspect_request_template(
     template_ptr: u64,
@@ -1236,8 +1223,7 @@ pub fn production_capture_get_entry(
 ///
 /// Reads the side row immutably, checks every retained entry capacity for
 /// aliases, then classifies one approved value and rechecks its header.
-/// The shipping adapter supplies the marked-only no-read behavior while
-/// capture qualification remains open.
+/// Failed acquisition keeps the tail fill's marked-only list.
 #[inline(always)]
 pub fn production_capture_get_return(
     side: &ObjectStart,

@@ -1753,13 +1753,13 @@ fn strip_rust_prose_real_bpf_source_dump_stable() {
     let stripped = strip_rust_prose(&bpf_source());
     assert_eq!(
         stripped.len(),
-        113589,
+        113590,
         "stripped BPF dump size must not drift"
     );
     let digest = Sha256::digest(stripped.as_bytes());
     let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
     assert_eq!(
-        hex, "f8027f420ba20ad15acb8dde59b24d7d39cf9e35938cc25581ab38ba8b5b1ba0",
+        hex, "29d8db02743849c9c1e75a0f12b751489f2b37e842dc7c7ab67b159a2dd33a70",
         "stripped BPF dump must stay byte-identical"
     );
 }
@@ -1772,9 +1772,10 @@ fn strip_rust_prose_real_bpf_source_dump_stable() {
 /// row AFTER the production entry store plus the emitted tail. The
 /// harness never writes `side.requested` itself: a missing production
 /// entry-store operation observes zero cells here. G05(e): stopping
-/// after the tail fill would blind the harness to any E4 construction
+/// after the tail fill would blind the harness to any construction
 /// finalizing request state in a later stage, so the driver runs every
-/// stage (trivially true on request vectors while E4 is unwired).
+/// stage (Find and Get emissions are trivially true on request vectors,
+/// which are neither Find nor Get calls).
 #[allow(clippy::type_complexity)]
 fn run_production_request_path(
     target: &std::cell::RefCell<adapter::FakeTarget>,
@@ -1834,15 +1835,19 @@ fn run_production_request_path(
         ),
         "{layout:?} production entry adapter accepts the vector"
     );
-    // Unwired, the no-op seams consume nothing, so the production path
-    // must acquire nothing: reintroduced argument fetches fail here on
-    // every vector (request and Get alike), before any store assert.
-    if !p11scope_ebpf_common::object_flow::ATTRIBUTE_CAPTURE_WIRED {
-        assert_eq!(
-            fetches, 0,
-            "{layout:?} unwired entry acquires zero arguments"
-        );
-    }
+    // Wired, the production path acquires exactly the present template
+    // arguments: every call here is a probe register/stack read on BPF,
+    // so reintroduced, dropped or duplicated fetches fail here on every
+    // vector, before any store assert. Full pairs only: a half-present
+    // pair acquires nothing (the adapter refuses it before any target
+    // read).
+    let present_pairs = u32::from(template_args[0] != ARG_NONE && template_args[1] != ARG_NONE)
+        + u32::from(template_args[2] != ARG_NONE && template_args[3] != ARG_NONE);
+    assert_eq!(
+        fetches,
+        2 * present_pairs,
+        "{layout:?} wired entry acquires exactly its present template arguments"
+    );
     // RETURNING arrival state (harness sequencing, as the fill adapter
     // would leave it); the inspected pair lists arrive only via the
     // production entry store above.
@@ -1954,14 +1959,13 @@ fn run_production_get_path(
         ),
         "{layout:?} production Get entry accepts the vector"
     );
-    // Unwired, the no-op seams consume nothing, so the production Get
-    // entry must acquire nothing either.
-    if !p11scope_ebpf_common::object_flow::ATTRIBUTE_CAPTURE_WIRED {
-        assert_eq!(
-            fetches, 0,
-            "{layout:?} unwired Get entry acquires zero arguments"
-        );
-    }
+    // Wired, the production Get entry acquires exactly its template
+    // pointer and count: every call here is a probe register/stack read
+    // on BPF, so reintroduced, dropped or duplicated fetches fail here.
+    assert_eq!(
+        fetches, 2,
+        "{layout:?} wired Get entry acquires exactly its template arguments"
+    );
     // RETURNING arrival state (harness sequencing); retention arrives
     // only via the production entry store above.
     side.phase = 3;
@@ -2019,76 +2023,295 @@ fn retained_get_prefix_count(side: &p11scope_ebpf_common::object_wire::ObjectSta
     count
 }
 
-/// Today's production attribute transport, executed through the
-/// production tail and Get emission adapters: entry leaves request
-/// state zero (no inspection runs), so present pairs carry the honest
-/// UNINSPECTED marking with zero cells, the Get result list is marked
-/// UNINSPECTED through the full return path with zero reads, and absent
-/// pairs stay all-zero. This pins the transport the G05 RED tests below
-/// require E4 to replace with inspected cells.
+/// Wired production attribute transport (H7-E4): entry-inspected
+/// request pairs emit as inspected lists, while authorized-but-refused
+/// pairs (failed argument acquisition, refused Derive) keep the honest
+/// UNINSPECTED marking with zero cells, zero inspected count and zero
+/// target reads. Absent pairs stay all-zero. The G05 six-field test
+/// owns cell-level oracle equality; this test owns the marking level
+/// plus the failure twins that keep the transport honest.
 #[test]
-fn object_attributes_uninspected_marking_is_production() {
+fn object_attributes_wired_marking_is_production() {
     use p11scope_ebpf_common::ARG_NONE;
     use p11scope_ebpf_common::LinuxLayout;
-    use p11scope_ebpf_common::object_capture::attr_list_flag;
-    use p11scope_ebpf_common::object_flow::{adapter_emit_get_attributes, adapter_tail_fill};
+    use p11scope_ebpf_common::object_capture::{attr_list_flag, object_flag};
+    use p11scope_ebpf_common::object_flow::{
+        adapter_attributes_entry, adapter_emit_get_attributes, adapter_tail_fill,
+    };
     use p11scope_ebpf_common::object_wire::{
-        OBJECT_ACTION_CREATE, OBJECT_ACTION_GET, OBJECT_LAYOUT_ILP32, OBJECT_LAYOUT_LP64,
-        ObjectAttributeListWire, ObjectCallWire,
+        GET_ENTRY_UNINSPECTED, OBJECT_ACTION_CREATE, OBJECT_ACTION_DERIVE, OBJECT_ACTION_GET,
+        OBJECT_DERIVE_SHA256, OBJECT_DERIVE_UNAVAILABLE, OBJECT_GUARD_SCALAR_DERIVE,
+        OBJECT_LAYOUT_ILP32, OBJECT_LAYOUT_LP64, ObjectAttributeListWire, ObjectCallWire,
     };
     for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
-        // Present pair 0, absent pair 1: the entry leaves every
-        // request word zero (E4 unwired).
-        let mut row = harness_row(23, OBJECT_ACTION_CREATE, [5, ARG_NONE]);
-        row.template_args = [2, 3, ARG_NONE, ARG_NONE];
-        let mut side = ready_side(23);
-        side.phase = 3;
-        side.layout = if layout == LinuxLayout::Lp64 {
+        let w = layout.word_bytes() as u64;
+        let side_layout = if layout == LinuxLayout::Lp64 {
             OBJECT_LAYOUT_LP64
         } else {
             OBJECT_LAYOUT_ILP32
         };
-        let mut tail = ObjectCallWire::default();
-        let tailed = unsafe { adapter_tail_fill(&mut tail as *mut _, Some(&side), 23, Some(&row)) };
-        assert!(tailed, "{layout:?} production tail fills");
-        assert_eq!(tail.requested[0].flags, attr_list_flag::UNINSPECTED);
-        assert_eq!(tail.requested[0].inspected, 0);
-        assert!(
-            tail.requested[0].cells == [ObjectAttributeListWire::default().cells[0]; 8],
-            "{layout:?} present pair carries zero cells"
+        // Healthy creation: the full production path emits pair zero
+        // as an inspected eight-slot list (present, no uninspected
+        // marking) while the absent pair stays all-zero.
+        let target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
+        program_six_field_template(&target, 0x40000, 0x50000, w);
+        let (_, tail) = run_production_request_path(
+            &target,
+            layout,
+            OBJECT_ACTION_CREATE,
+            [(0x40000, 8), (0, 0)],
+            [2, 3, ARG_NONE, ARG_NONE],
+        );
+        assert_eq!(tail.requested[0].inspected, 8);
+        assert_eq!(
+            tail.requested[0].flags & attr_list_flag::UNINSPECTED,
+            0,
+            "{layout:?} inspected pair carries no uninspected marking"
+        );
+        assert_eq!(
+            tail.requested[0].flags & attr_list_flag::PRESENT,
+            attr_list_flag::PRESENT,
+            "{layout:?} inspected pair carries the present bit"
         );
         assert!(
             tail.requested[1] == ObjectAttributeListWire::default(),
             "{layout:?} absent pair stays all-zero"
         );
-        // A Get tail marks its result list UNINSPECTED rather than
-        // claiming an inspected-empty result.
-        let get_row = harness_row(23, OBJECT_ACTION_GET, [ARG_NONE, ARG_NONE]);
-        let mut tail = ObjectCallWire::default();
-        let tailed =
-            unsafe { adapter_tail_fill(&mut tail as *mut _, Some(&side), 23, Some(&get_row)) };
-        assert!(tailed, "{layout:?} production Get tail fills");
-        assert_eq!(tail.result_attributes.flags, attr_list_flag::UNINSPECTED);
-        assert_eq!(tail.result_attributes.inspected, 0);
+        // Failed argument acquisition: the adapter marks the present
+        // pair honestly, books the read failure, reads nothing and
+        // emits the marked-only list through the production tail.
+        let fail_target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
+        program_six_field_template(&fail_target, 0x40000, 0x50000, w);
+        let mut row = harness_row(23, OBJECT_ACTION_CREATE, [5, ARG_NONE]);
+        row.template_args = [2, 3, ARG_NONE, ARG_NONE];
+        let mut side = p11scope_ebpf_common::object_wire::ObjectStart {
+            descriptor_index: 23,
+            layout: side_layout,
+            ..Default::default()
+        };
+        let mut fetches = 0u32;
+        let mut fetch_arg = |_: u8| {
+            fetches += 1;
+            None
+        };
+        let (reader, bytes) = adapter::readers(&fail_target);
         assert!(
-            tail.result_attributes
+            adapter_attributes_entry(
+                Some(&mut side),
+                23,
+                Some(&row),
+                layout,
+                &mut fetch_arg,
+                reader,
+                bytes,
+            ),
+            "{layout:?} acquisition failure is not custody failure"
+        );
+        assert_eq!(
+            fetches, 2,
+            "{layout:?} both present arguments are attempted before refusal"
+        );
+        adapter::assert_no_target_reads(&fail_target, &format!("{layout:?} acquisition refusal"));
+        assert_eq!(
+            side.requested[0].flags,
+            attr_list_flag::UNINSPECTED,
+            "{layout:?} failed acquisition marks the present pair"
+        );
+        assert_eq!(side.requested[0].inspected, 0);
+        assert!(
+            side.requested[0].cells == [ObjectAttributeListWire::default().cells[0]; 8],
+            "{layout:?} failed acquisition keeps zero cells"
+        );
+        assert_eq!(
+            side.flags & object_flag::ARG_READ_FAILURE as u16,
+            object_flag::ARG_READ_FAILURE as u16,
+            "{layout:?} failed acquisition books the read failure"
+        );
+        side.phase = 3;
+        let mut tail = ObjectCallWire::default();
+        assert!(
+            unsafe { adapter_tail_fill(&mut tail as *mut _, Some(&side), 23, Some(&row)) },
+            "{layout:?} production tail fills"
+        );
+        assert!(
+            tail.requested[0]
                 == ObjectAttributeListWire {
                     flags: attr_list_flag::UNINSPECTED,
                     ..ObjectAttributeListWire::default()
                 },
-            "{layout:?} Get result list is marked-only"
+            "{layout:?} failed acquisition emits the marked-only list"
         );
-        // The production Get emission keeps the honest marking (E4
-        // unwired): it establishes nothing, reads nothing, and the
-        // emitted list stays marked-only rather than collapsing to an
-        // inspected-empty claim.
-        let target = std::cell::RefCell::new(adapter::FakeTarget::new(layout.word_bytes() as u64));
-        let (reader, bytes) = adapter::readers(&target);
+        // Refused Derive authorizes no template access: no fetch, no
+        // read, no flag — the present pair keeps the honest marking
+        // (the unavailable derive code tells the refusal story).
+        let derive_target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
+        program_six_field_template(&derive_target, 0x40000, 0x50000, w);
+        let mut derive_row = harness_row(23, OBJECT_ACTION_DERIVE, [5, ARG_NONE]);
+        derive_row.template_args = [3, 4, ARG_NONE, ARG_NONE];
+        derive_row.guard = OBJECT_GUARD_SCALAR_DERIVE;
+        let mut derive_side = p11scope_ebpf_common::object_wire::ObjectStart {
+            descriptor_index: 23,
+            layout: side_layout,
+            derive: OBJECT_DERIVE_UNAVAILABLE,
+            ..Default::default()
+        };
+        let mut derive_fetches = 0u32;
+        let mut derive_fetch = |_: u8| {
+            derive_fetches += 1;
+            None
+        };
+        let (reader, bytes) = adapter::readers(&derive_target);
+        assert!(
+            adapter_attributes_entry(
+                Some(&mut derive_side),
+                23,
+                Some(&derive_row),
+                layout,
+                &mut derive_fetch,
+                reader,
+                bytes,
+            ),
+            "{layout:?} refused Derive is not custody failure"
+        );
+        assert_eq!(
+            derive_fetches, 0,
+            "{layout:?} refused Derive acquires zero arguments"
+        );
+        adapter::assert_no_target_reads(&derive_target, &format!("{layout:?} refused Derive"));
+        assert_eq!(
+            derive_side.flags, 0,
+            "{layout:?} refused Derive sets no flag"
+        );
+        assert_eq!(
+            derive_side.requested[0].flags,
+            attr_list_flag::UNINSPECTED,
+            "{layout:?} refused Derive marks its present pair"
+        );
+        derive_side.phase = 3;
+        let mut tail = ObjectCallWire::default();
+        assert!(
+            unsafe {
+                adapter_tail_fill(
+                    &mut tail as *mut _,
+                    Some(&derive_side),
+                    23,
+                    Some(&derive_row),
+                )
+            },
+            "{layout:?} production tail fills"
+        );
+        assert_eq!(
+            tail.requested[0].flags,
+            attr_list_flag::UNINSPECTED,
+            "{layout:?} refused Derive emits the marked-only list"
+        );
+        // Accepted Derive (evidence retained by the Derive adapter
+        // earlier in the entry chain) inspects through the same
+        // creation protocol: the stored list equals the oracle wire.
+        let accepted_target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
+        program_six_field_template(&accepted_target, 0x40000, 0x50000, w);
+        let (reader, bytes) = adapter::readers(&accepted_target);
+        let expected = p11scope_ebpf_common::object_capture::inspect_request_template(
+            0x40000, 8, None, layout, reader, bytes,
+        );
+        let prod_target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
+        program_six_field_template(&prod_target, 0x40000, 0x50000, w);
+        let mut accepted_side = p11scope_ebpf_common::object_wire::ObjectStart {
+            descriptor_index: 23,
+            layout: side_layout,
+            derive: OBJECT_DERIVE_SHA256,
+            ..Default::default()
+        };
+        let mut accepted_fetches = 0u32;
+        let mut accepted_fetch = |arg: u8| {
+            accepted_fetches += 1;
+            match arg {
+                3 => Some(0x40000),
+                4 => Some(8),
+                _ => None,
+            }
+        };
+        let (reader, bytes) = adapter::readers(&prod_target);
+        assert!(
+            adapter_attributes_entry(
+                Some(&mut accepted_side),
+                23,
+                Some(&derive_row),
+                layout,
+                &mut accepted_fetch,
+                reader,
+                bytes,
+            ),
+            "{layout:?} accepted Derive inspects"
+        );
+        assert_eq!(
+            accepted_fetches, 2,
+            "{layout:?} accepted Derive acquires its pair once"
+        );
+        assert_reads_subset(
+            &prod_target,
+            &accepted_target,
+            &format!("{layout:?} accepted-Derive inspection"),
+        );
+        assert!(
+            accepted_side.requested[0] == expected.to_wire(),
+            "{layout:?} accepted Derive stores the inspected list"
+        );
+        // Failed Get acquisition: retention stays zero, the private
+        // uninspected bit plus the read failure are booked, and the
+        // production emission keeps the marked-only list with zero
+        // reads.
+        let get_fail_target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
+        program_six_field_template(&get_fail_target, 0x40000, 0x50000, w);
+        let mut get_row = harness_row(23, OBJECT_ACTION_GET, [ARG_NONE, ARG_NONE]);
+        get_row.template_args = [2, 3, ARG_NONE, ARG_NONE];
+        let mut get_side = p11scope_ebpf_common::object_wire::ObjectStart {
+            descriptor_index: 23,
+            layout: side_layout,
+            ..Default::default()
+        };
+        let mut get_fetches = 0u32;
+        let mut get_fetch = |_: u8| {
+            get_fetches += 1;
+            None
+        };
+        let (reader, bytes) = adapter::readers(&get_fail_target);
+        assert!(
+            adapter_attributes_entry(
+                Some(&mut get_side),
+                23,
+                Some(&get_row),
+                layout,
+                &mut get_fetch,
+                reader,
+                bytes,
+            ),
+            "{layout:?} Get acquisition failure is not custody failure"
+        );
+        assert_eq!(get_fetches, 2, "{layout:?} Get attempts both arguments");
+        adapter::assert_no_target_reads(
+            &get_fail_target,
+            &format!("{layout:?} Get acquisition refusal"),
+        );
+        assert_eq!(get_side.get_template_base, 0);
+        assert_eq!(get_side.get_inspected, 0);
+        assert_eq!(
+            get_side.flags & (object_flag::ARG_READ_FAILURE as u16 | GET_ENTRY_UNINSPECTED),
+            object_flag::ARG_READ_FAILURE as u16 | GET_ENTRY_UNINSPECTED,
+            "{layout:?} Get acquisition failure books read failure plus uninspected"
+        );
+        get_side.phase = 3;
+        let mut tail = ObjectCallWire::default();
+        assert!(
+            unsafe { adapter_tail_fill(&mut tail as *mut _, Some(&get_side), 23, Some(&get_row)) },
+            "{layout:?} production Get tail fills"
+        );
+        let (reader, bytes) = adapter::readers(&get_fail_target);
         assert!(
             unsafe {
                 adapter_emit_get_attributes(
                     &mut tail as *mut _,
-                    Some(&side),
+                    Some(&get_side),
                     23,
                     Some(&get_row),
                     layout,
@@ -2098,7 +2321,7 @@ fn object_attributes_uninspected_marking_is_production() {
                     bytes,
                 )
             },
-            "{layout:?} production Get emission accepts"
+            "{layout:?} Get emission accepts after acquisition failure"
         );
         assert!(
             tail.result_attributes
@@ -2106,46 +2329,38 @@ fn object_attributes_uninspected_marking_is_production() {
                     flags: attr_list_flag::UNINSPECTED,
                     ..ObjectAttributeListWire::default()
                 },
-            "{layout:?} emitted Get list stays marked-only"
+            "{layout:?} failed Get acquisition emits the marked-only list"
         );
-        adapter::assert_no_target_reads(&target, &format!("{layout:?} unwired Get emission"));
     }
 }
 
-/// Today's production entry attribute path (E4 unwired): the shared
-/// entry adapter accepts creation and Get vectors, acquires zero
-/// arguments (counted at the acquisition seam by the drivers —
-/// reintroduced fetches fail there), performs zero target reads and
-/// stores zero attribute state — side request lists, Get fields and
-/// flags stay allocated-zero. The Get emission refuses before any read
-/// unless continuity joined, and keeps the UNINSPECTED marking on return
-/// values outside the Get acceptance set. E4 rewrites this test when it
-/// flips the switch with its seams; the refusal gates stay.
+/// Wired production entry attribute path (H7-E4): the shared entry
+/// adapter inspects creation vectors into the side request lists and
+/// retains Get headers into the side Get fields (acquisition counted at
+/// the seam by the drivers — dropped or duplicated fetches fail there).
+/// Set still authorizes no template and touches nothing; entry-list
+/// flags stay in private side bits, masked out of every public tail
+/// copy. The refusal gates stay: refused continuity refuses Get
+/// emission before any read, refused return values keep the UNINSPECTED
+/// marking, non-Get families leave the result list zero, and custody
+/// failures refuse without acquiring arguments.
 #[test]
-#[allow(clippy::assertions_on_constants)]
-fn object_attributes_unwired_entry_stores_nothing() {
+fn object_attributes_wired_entry_stores_inspected() {
     use p11scope_ebpf_common::ARG_NONE;
     use p11scope_ebpf_common::LinuxLayout;
-    use p11scope_ebpf_common::object_capture::attr_list_flag;
+    use p11scope_ebpf_common::object_capture::{attr_list_flag, inspect_request_template};
     use p11scope_ebpf_common::object_flow::{
         adapter_attributes_entry, adapter_emit_get_attributes, adapter_tail_fill,
     };
     use p11scope_ebpf_common::object_wire::{
-        OBJECT_ACTION_CREATE, OBJECT_ACTION_GET, OBJECT_ACTION_SET, ObjectAttributeListWire,
-        ObjectAttributeSlot, ObjectCallWire,
+        GET_ENTRY_FLAGS_SHIFT, OBJECT_ACTION_CREATE, OBJECT_ACTION_GET, OBJECT_ACTION_SET,
+        OBJECT_FLAGS_MASK, ObjectAttributeListWire, ObjectCallWire,
     };
-    // This regression pins the UNWIRED path. A flipped switch with
-    // unimplemented seams fails here — never silently fetching. The
-    // constant assert is the tripwire itself (a runtime test failure,
-    // not a build break), so the lint is allowed on this test.
-    assert!(
-        !p11scope_ebpf_common::object_flow::ATTRIBUTE_CAPTURE_WIRED,
-        "unwired regression requires the unwired switch state"
-    );
     for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
         let w = layout.word_bytes() as u64;
-        // Creation vector through the production entry adapter: accepted,
-        // zero reads, zero stores.
+        // Creation vector through the production entry adapter: the
+        // stored request list equals the oracle wire (the G05 six-field
+        // test owns the per-cell proof; this pins the entry store).
         let target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
         program_six_field_template(&target, 0x40000, 0x50000, w);
         let (side, tail) = run_production_request_path(
@@ -2155,19 +2370,21 @@ fn object_attributes_unwired_entry_stores_nothing() {
             [(0x40000, 8), (0, 0)],
             [2, 3, ARG_NONE, ARG_NONE],
         );
-        adapter::assert_no_target_reads(&target, &format!("{layout:?} unwired entry"));
+        let oracle_target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
+        program_six_field_template(&oracle_target, 0x40000, 0x50000, w);
+        let (reader, bytes) = adapter::readers(&oracle_target);
+        let expected = inspect_request_template(0x40000, 8, None, layout, reader, bytes);
         assert!(
-            side.requested == [ObjectAttributeListWire::default(); 2],
-            "{layout:?} unwired entry stores no request state"
+            side.requested[0] == expected.to_wire(),
+            "{layout:?} wired entry stores the inspected request list"
         );
-        assert_eq!(
-            side.flags, 0,
-            "{layout:?} unwired entry contributes no flags"
+        assert!(
+            side.requested[1] == ObjectAttributeListWire::default(),
+            "{layout:?} wired entry leaves the absent pair zero"
         );
-        assert_eq!(
-            tail.requested[0].flags,
-            attr_list_flag::UNINSPECTED,
-            "{layout:?} unwired entry still emits the honest marking"
+        assert!(
+            tail.requested[0] == expected.to_wire(),
+            "{layout:?} wired entry emits the inspected request list"
         );
         // Set authorizes no template: the adapter accepts the row and
         // touches nothing (its pair ordinals are all absent).
@@ -2184,23 +2401,51 @@ fn object_attributes_unwired_entry_stores_nothing() {
             set_side.requested == [ObjectAttributeListWire::default(); 2],
             "{layout:?} Set entry stores no request state"
         );
-        // Get retention through the production entry adapter: accepted,
-        // zero reads, zero retained fields.
+        // Get retention through the production entry adapter: the
+        // base, header end, inspected count and dense selected prefix
+        // match the entry protocol, and the return path establishes
+        // the retained results (the G05 six-field test owns the
+        // per-slot oracle proof; this pins the retention shape).
         let get_target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
         program_six_field_template(&get_target, 0x40000, 0x50000, w);
         let (get_side, get_tail) = run_production_get_path(&get_target, layout, 0x40000, 8);
-        adapter::assert_no_target_reads(&get_target, &format!("{layout:?} unwired Get path"));
-        assert_eq!(get_side.get_template_base, 0);
-        assert_eq!(get_side.inspected_header_end, 0);
-        assert_eq!(get_side.get_inspected, 0);
-        assert!(
-            get_side.slots == [ObjectAttributeSlot::default(); 8],
-            "{layout:?} unwired Get entry retains no slots"
+        assert_eq!(get_side.get_template_base, 0x40000);
+        assert_eq!(
+            get_side.inspected_header_end,
+            0x40000 + 8 * 3 * w,
+            "{layout:?} wired Get entry retains the header end"
+        );
+        assert_eq!(get_side.get_inspected, 8);
+        assert_eq!(
+            retained_get_prefix_count(&get_side),
+            8,
+            "{layout:?} wired Get entry retains eight headers"
         );
         assert_eq!(
-            get_tail.result_attributes.flags,
-            attr_list_flag::UNINSPECTED,
-            "{layout:?} unwired Get path emits the honest marking"
+            get_tail.result_attributes.inspected, 8,
+            "{layout:?} wired Get path establishes eight results"
+        );
+        // A nine-slot Get template truncates retention at eight: the
+        // entry flag lives in private side bits (never in a public
+        // tail copy) while the emitted result list carries it publicly.
+        let trunc_target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
+        program_six_field_template(&trunc_target, 0x40000, 0x50000, w);
+        let (trunc_side, trunc_tail) = run_production_get_path(&trunc_target, layout, 0x40000, 9);
+        assert_eq!(trunc_side.get_inspected, 8);
+        assert_eq!(
+            trunc_side.flags,
+            u16::from(attr_list_flag::TRUNCATED) << GET_ENTRY_FLAGS_SHIFT,
+            "{layout:?} truncated Get entry keeps its flag in private bits"
+        );
+        assert_eq!(
+            trunc_tail.flags & !OBJECT_FLAGS_MASK,
+            0,
+            "{layout:?} public tail flags carry no private entry bits"
+        );
+        assert_eq!(
+            trunc_tail.result_attributes.flags & attr_list_flag::TRUNCATED,
+            attr_list_flag::TRUNCATED,
+            "{layout:?} emitted Get list carries truncation publicly"
         );
         // The Get emission refuses before any read unless continuity
         // joined, and keeps the marking on refused return values.
@@ -2338,12 +2583,10 @@ fn object_attributes_unwired_entry_stores_nothing() {
             ),
             "{layout:?} missing row refuses entry"
         );
-        if !p11scope_ebpf_common::object_flow::ATTRIBUTE_CAPTURE_WIRED {
-            assert_eq!(
-                custody_fetches, 0,
-                "{layout:?} entry custody acquires zero arguments"
-            );
-        }
+        assert_eq!(
+            custody_fetches, 0,
+            "{layout:?} entry custody refuses before acquiring arguments"
+        );
         adapter::assert_no_target_reads(&custody_target, &format!("{layout:?} entry custody"));
     }
 }
@@ -2368,7 +2611,6 @@ fn object_attributes_bpf_wrappers_delegate_to_shared_adapters() {
 /// the oracle's VALUE cells, UNINSPECTED transport); a budgeted E4 flips
 /// these tests with zero test changes.
 #[test]
-#[ignore = "RED: H7-E4 budgeted attribute capture pending"]
 fn object_attributes_real_adapter_six_fields() {
     use p11scope_ebpf_common::ARG_NONE;
     use p11scope_ebpf_common::LinuxLayout;
@@ -2644,7 +2886,6 @@ fn object_attributes_real_adapter_six_fields() {
 /// the stored side pair plus the emitted wire list. RED while E4 is
 /// unwired; a budgeted E4 flips this test with zero test changes.
 #[test]
-#[ignore = "RED: H7-E4 budgeted attribute capture pending"]
 fn object_attributes_refuse_before_unsafe_read() {
     use p11scope_ebpf_common::ARG_NONE;
     use p11scope_ebpf_common::LinuxLayout;

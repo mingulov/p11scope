@@ -322,7 +322,10 @@ fn assert_abi_routing_identity_contract(attach: &str, example: &str) -> Result<(
 }
 
 fn assert_start_owner_seam(ebpf: &str, owner: &str) -> Result<(), String> {
-    let wrappers = contract_section(ebpf, "unsafe extern \"C\" {", "fn store_start(")?;
+    // The Rust-side store_start insert wrapper is gone (START rows are
+    // constructed natively now); record_aggregate_start directly follows
+    // the wrapper cluster, so it bounds the same section.
+    let wrappers = contract_section(ebpf, "unsafe extern \"C\" {", "fn record_aggregate_start(")?;
     for marker in [
         "p11_owner_start_get(key, 0)",
         "p11_owner_start_get(key, 1)",
@@ -369,7 +372,9 @@ fn assert_start_owner_seam(ebpf: &str, owner: &str) -> Result<(), String> {
 }
 
 fn assert_discovery_owner_seam(ebpf: &str, owner: &str) -> Result<(), String> {
-    let wrappers = contract_section(ebpf, "unsafe extern \"C\" {", "fn store_start(")?;
+    // Same rebounded wrapper section as the START seam above: the
+    // store_start insert wrapper was deleted with native construction.
+    let wrappers = contract_section(ebpf, "unsafe extern \"C\" {", "fn record_aggregate_start(")?;
     for marker in [
         "p11_owner_discovery_get(key, u32::from(required))",
         "p11_owner_discovery_insert(key, state, flags)",
@@ -1350,6 +1355,7 @@ fn assert_static_descriptor_cookie_contract(
     attach: &str,
     ebpf: &str,
     owner: &str,
+    flow: &str,
 ) -> Result<(), String> {
     const COOKIE: &str = "cookie: Some(attach_cookie(slot.index, slot.descriptor_index)),";
 
@@ -1452,7 +1458,7 @@ fn assert_static_descriptor_cookie_contract(
     let template_second = contract_section(
         ebpf,
         "pub fn p11_entry_template_second(ctx: ProbeContext) -> u32 {",
-        "fn store_start",
+        "fn record_aggregate_start(",
     )?;
     for (marker, contract) in [
         ("let slot = slot_of(&ctx);", "template-second low-word slot"),
@@ -1500,7 +1506,7 @@ fn assert_static_descriptor_cookie_contract(
             "let key = StartKey {\n        pid_tgid: helpers::bpf_get_current_pid_tgid(),\n        slot,\n        _pad: 0,\n    };",
             "return START slot",
         ),
-        ("owned_start_get(&key)", "return START lookup"),
+        ("p11_owner_start_get(&key, 0)", "return START lookup"),
         ("owned_start_remove(&key, true)", "return START removal"),
         ("STATS.get_ptr_mut(slot)", "return STATS slot"),
         (
@@ -1508,14 +1514,34 @@ fn assert_static_descriptor_cookie_contract(
             "return RV_COUNTS slot",
         ),
         ("rv_count_add(&rk)", "return RV_COUNTS update"),
-        ("\n        slot,\n        target_function:", "Event.slot"),
         (
-            "let semantics = semantics_of(&ctx);",
+            "(*raw).event),\n                    &start,\n                    key.slot,\n                    &facts,",
+            "ordinary Event.slot",
+        ),
+        (
+            "(*raw).base.event),\n            &*start,\n            key.slot,\n            &facts,",
+            "object Event.slot",
+        ),
+        (
+            "let semantics = semantics_of(ctx);",
             "return descriptor consumer",
         ),
     ] {
         require_contract_marker(returned, marker, contract)?;
     }
+    // Both return branches build their facts through the shared outlined
+    // consumer above: dropping either call would bypass descriptor
+    // semantics for that branch's emission.
+    if returned.matches("capture_return_facts(ctx,").count() != 2 {
+        return Err("both return branches must consume descriptor facts".into());
+    }
+    // fill_call_event stores its slot parameter into Event.slot: the sink
+    // half of the call-site slot markers above.
+    require_contract_marker(
+        flow,
+        "core::ptr::write(core::ptr::addr_of_mut!((*out).slot), slot);",
+        "Event.slot sink",
+    )?;
 
     // The RV_COUNTS row for that cookie slot is counted exactly: an existing
     // row takes an in-place atomic add, a missing one is created only with
@@ -5188,11 +5214,12 @@ fn frozen_policy_inventory_matches_embedded_object() {
     // Stage A plus image continuity: four additional private maps, one
     // pre-mm hook and one same-object task iterator. H7 slice B adds the
     // three subordinate-custody maps (OBJECT_START, OBJECT_DESCRIPTORS,
-    // OBJECT_ZERO) with no new programs.
+    // OBJECT_ZERO) with no new programs. Selected detailed adds the
+    // three SELECTED_* maps and the bootstrap/cgroup-migrate programs.
     let (maps, programs) = if cfg!(feature = "unsafe-unvalidated-metadata") {
-        (41, 23)
+        (44, 25)
     } else {
-        (39, 18)
+        (42, 20)
     };
     let report = run_ok(
         "python3",
@@ -5305,8 +5332,9 @@ fn descriptor_cookie_and_consumers_source_guard_rejects_contract_regressions() {
     let attach = read("src/attach.rs");
     let ebpf = read("crates/ebpf/src/main.rs");
     let owner = read("crates/ebpf/native/task_owner.c");
+    let flow = read("crates/ebpf-common/src/object_flow.rs");
 
-    assert_static_descriptor_cookie_contract(&attach, &ebpf, &owner).unwrap();
+    assert_static_descriptor_cookie_contract(&attach, &ebpf, &owner, &flow).unwrap();
     let remove_start = owner
         .find("p11_owner_start_remove(const struct owner_start_key *key, u32 required)")
         .expect("native START remover must exist");
@@ -5326,7 +5354,8 @@ fn descriptor_cookie_and_consumers_source_guard_rejects_contract_regressions() {
         );
         let changed_owner = format!("{}{}", &owner[..remove_start], changed_remove);
         assert!(
-            assert_static_descriptor_cookie_contract(&attach, &ebpf, &changed_owner).is_err(),
+            assert_static_descriptor_cookie_contract(&attach, &ebpf, &changed_owner, &flow)
+                .is_err(),
             "native START remover must reject {reason}"
         );
     }
@@ -5336,7 +5365,7 @@ fn descriptor_cookie_and_consumers_source_guard_rejects_contract_regressions() {
         1,
     );
     assert!(
-        assert_static_descriptor_cookie_contract(&attach, &ebpf, &skipped_start_retirement)
+        assert_static_descriptor_cookie_contract(&attach, &ebpf, &skipped_start_retirement, &flow)
             .is_err(),
         "the native START remover must call the ownership-aware retirement helper"
     );
@@ -5346,7 +5375,7 @@ fn descriptor_cookie_and_consumers_source_guard_rejects_contract_regressions() {
         1,
     );
     assert!(
-        assert_static_descriptor_cookie_contract(&dropped_return_descriptor, &ebpf, &owner)
+        assert_static_descriptor_cookie_contract(&dropped_return_descriptor, &ebpf, &owner, &flow)
             .is_err(),
         "the return attach site must carry the descriptor word"
     );
@@ -5361,7 +5390,7 @@ fn descriptor_cookie_and_consumers_source_guard_rejects_contract_regressions() {
         "RV_COUNTS overwrite mutation must change the source"
     );
     assert!(
-        assert_static_descriptor_cookie_contract(&attach, &overwrite, &owner).is_err(),
+        assert_static_descriptor_cookie_contract(&attach, &overwrite, &owner, &flow).is_err(),
         "an RV_COUNTS create that may overwrite a concurrent row must be rejected"
     );
     let high_word_stats = ebpf.replacen(
@@ -5370,14 +5399,15 @@ fn descriptor_cookie_and_consumers_source_guard_rejects_contract_regressions() {
         1,
     );
     assert!(
-        assert_static_descriptor_cookie_contract(&attach, &high_word_stats, &owner).is_err(),
+        assert_static_descriptor_cookie_contract(&attach, &high_word_stats, &owner, &flow).is_err(),
         "a slot consumer must not use the descriptor word"
     );
 
     let no_count_only_fallback =
         ebpf.replacen(".unwrap_or(SlotSemantics::COUNT_ONLY)", ".unwrap()", 1);
     assert!(
-        assert_static_descriptor_cookie_contract(&attach, &no_count_only_fallback, &owner).is_err(),
+        assert_static_descriptor_cookie_contract(&attach, &no_count_only_fallback, &owner, &flow)
+            .is_err(),
         "a missing descriptor must remain count-only"
     );
 
@@ -5385,9 +5415,9 @@ fn descriptor_cookie_and_consumers_source_guard_rejects_contract_regressions() {
         .find("pub fn p11_entry_template_second(ctx: ProbeContext) -> u32 {")
         .expect("template-second entry must exist");
     let template_second_end = ebpf[template_second_start..]
-        .find("fn store_start(")
+        .find("fn record_aggregate_start(")
         .map(|offset| template_second_start + offset)
-        .expect("template-second entry must end before store_start");
+        .expect("template-second entry must end before record_aggregate_start");
     let template_second = &ebpf[template_second_start..template_second_end];
     let low_word_slot = "        slot,\n        _pad: 0,";
     assert_eq!(
@@ -5421,10 +5451,16 @@ fn descriptor_cookie_and_consumers_source_guard_rejects_contract_regressions() {
                 &attach,
                 &template_second_high_word_slot,
                 &owner,
+                &flow,
             )
             .is_err(),
-            assert_static_descriptor_cookie_contract(&attach, &bypassed_primary_semantics, &owner,)
-                .is_err(),
+            assert_static_descriptor_cookie_contract(
+                &attach,
+                &bypassed_primary_semantics,
+                &owner,
+                &flow,
+            )
+            .is_err(),
         ],
         [true, true],
         "the template-tail slot and every descriptor consumer must use the shared cookie path"
@@ -12010,12 +12046,48 @@ fn aggregate_policy_returns_before_both_events_reserves() {
         gate < reserve,
         "aggregate gate must precede the return-path EVENTS reserve"
     );
-    // H7 slice D: the gate retires the object side row (map delete plus
-    // fault/evidence counters, never an EVENTS submit) before the early
-    // return. The exact-text pin keeps failing on any added submit site.
+    // H7 slice D: each return branch gates aggregate policy before any
+    // submit. ordinary_return retires its START row before its early
+    // return (no side row exists there); object_return retires through
+    // the checked removal inside the gate, since dispatch guarantees an
+    // object call there. The exact-text pins keep failing on any added
+    // submit site.
+    let ordinary = between(&ebpf, "fn ordinary_return(", "fn object_return(");
+    let ordinary_retire = ordinary
+        .find("if owned_start_remove(&key, true).is_err()")
+        .expect("ordinary return must retire before its aggregate gate");
+    let ordinary_gate = ordinary
+        .find("if flags & FLAG_POLICY_AGGREGATE != 0")
+        .expect("ordinary return must gate aggregate policy");
+    let ordinary_reserve = ordinary
+        .find("EVENTS.reserve::<EventRecord>(0)")
+        .expect("ordinary return must hold its EVENTS reserve");
     assert!(
-        returned.contains("if flags & FLAG_POLICY_AGGREGATE != 0 {\n        // Aggregate records nothing: retire the object side row (its\n        // retire moved after emission) before the early return.\n        if start.object_required != 0 && owned_start_remove(&key, true).is_err() {\n            unsafe { p11_object_fault() };\n            bump_evidence(EVIDENCE_UNMATCHED_RETURNS);\n        }\n        return 0;\n    }"),
-        "aggregate gate must return before any submit"
+        ordinary_retire < ordinary_gate && ordinary_gate < ordinary_reserve,
+        "ordinary aggregate gate must retire, then return before any submit"
+    );
+    assert!(
+        ordinary.contains("if flags & FLAG_POLICY_AGGREGATE != 0 {\n        return 0;\n    }"),
+        "ordinary aggregate gate must return before any submit"
+    );
+    let object = between(
+        &ebpf,
+        "fn object_return(",
+        "pub extern \"C\" fn p11_link_fork_allowed",
+    );
+    let object_gate = object
+        .find("if flags & FLAG_POLICY_AGGREGATE != 0")
+        .expect("object return must gate aggregate policy");
+    let object_reserve = object
+        .find("EVENTS.reserve::<ObjectEventRecord>(0)")
+        .expect("object return must hold its EVENTS reserve");
+    assert!(
+        object_gate < object_reserve,
+        "object aggregate gate must return before any submit"
+    );
+    assert!(
+        object.contains("if flags & FLAG_POLICY_AGGREGATE != 0 {\n        if owned_start_remove(&key, true).is_err() {\n            unsafe { p11_object_fault() };\n            bump_evidence(EVIDENCE_UNMATCHED_RETURNS);\n        }\n        return 0;\n    }"),
+        "object aggregate gate must retire, then return before any submit"
     );
 
     let allowed = between(

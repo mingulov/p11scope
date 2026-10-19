@@ -83,10 +83,10 @@ gate cells.
 | Cell | Mode | Flow | Asserts |
 | --- | --- | --- | --- |
 | FF-STARTUP | attach-drive | HTTPS visit | `C_FindObjects*` ≥ 1, `C_GetSessionInfo` ≥ 1 (typ. x26), page 200, no loss |
-| CR-PLAIN | attach-drive | HTTPS visit, registered | `C_FindObjects*` x5 floored, no `C_Login`/`C_Sign*`, page 200, NSS witness |
+| CR-PLAIN | attach-drive | HTTPS visit, registered | `C_FindObjects*` ≥1; calibrated x5, no `C_Login`/`C_Sign*`, page 200, NSS witness |
 | FF-NOMOD | run-direct, http | screenshot, unregistered | zero calls, exit 0, PNG bytes |
 | FF-PINBOUND | attach-drive | `CERT_REQUIRED` visit | stall (fast-fail or hang), no `C_Login`/`C_SignInit`/`C_Sign` ever |
-| CR-PINBOUND | attach-drive, no auto-select | `CERT_REQUIRED` visit | selection x5 floored, no login/sign, stall, not loaded |
+| CR-PINBOUND | attach-drive, no auto-select | `CERT_REQUIRED` visit | selection ≥1; calibrated x5, no login/sign, stall, not loaded |
 
 What the catalog proves:
 

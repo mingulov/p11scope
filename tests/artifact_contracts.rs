@@ -1144,7 +1144,7 @@ fn assert_live_discovery_host_contract(
         (
             "SessionPreparation::SelectScope",
             "SessionPreparation::LoadProgram",
-            "uprobe_scope = match scope",
+            "uprobe_scope = if let Some(pin) = selected",
         ),
         (
             "SessionPreparation::LoadProgram(prog_name)",
@@ -1169,6 +1169,27 @@ fn assert_live_discovery_host_contract(
     ] {
         let arm = contract_section(start_inner, step, next)?;
         require_contract_marker(arm, operation, "session preparation operation")?;
+    }
+    // A closed selected session pins the probe scope to its owned process;
+    // without a selection the scope match below stays the fallback.
+    let select_scope = contract_section(
+        start_inner,
+        "SessionPreparation::SelectScope",
+        "SessionPreparation::LoadProgram",
+    )?;
+    for (marker, contract) in [
+        ("NonZeroU32::new(pin.pid())", "selected-process scope pin"),
+        ("match scope", "unselected scope fallback"),
+        (
+            "Scope::Pid(pid) => UProbeScope::OneProcess",
+            "pid scope fallback",
+        ),
+        (
+            "Scope::Cgroup { .. } | Scope::System => UProbeScope::AllProcesses",
+            "cgroup/system scope fallback",
+        ),
+    ] {
+        require_contract_marker(select_scope, marker, contract)?;
     }
     let dynamic_loader = contract_section(
         attach,
@@ -5550,6 +5571,12 @@ fn live_discovery_host_contract_is_opaque_fixed_purpose_and_owned_child_only() {
     assert_rejects_attach_mutation(
         &missing_worker_readback,
         "TAIL_CALLS worker readback must be required",
+    );
+    let unpinned_selected_scope =
+        attach.replacen("NonZeroU32::new(pin.pid())", "NonZeroU32::new(0)", 1);
+    assert_rejects_attach_mutation(
+        &unpinned_selected_scope,
+        "selected scope must come from the owned-process pin",
     );
     let worker_attach = attach.replacen(
         "attach(program, slot, slot_attach_point(slot))",

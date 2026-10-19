@@ -7977,17 +7977,29 @@ mod promotion_driver_tests {
     type WindDownCleanup = Box<dyn FnMut(&dyn Fn() -> bool) -> anyhow::Result<()>>;
 
     /// Minimal substituted lane I/O for wind-down tests: quiescent,
-    /// quiet ticks, an empty Finish. Cleanup behavior is scripted per
-    /// test; receipt validation honestly refuses (no batch here
-    /// carries receipts).
+    /// quiet ticks, an empty Finish unless `nonempty_finish` scripts a
+    /// Stopped position. Cleanup behavior is scripted per test; receipt
+    /// validation honestly refuses (no batch here carries receipts).
     struct WindDownIo {
         cleanup: WindDownCleanup,
+        nonempty_finish: bool,
     }
 
     impl WindDownIo {
         fn completing() -> Self {
             Self {
                 cleanup: Box::new(|_| Ok(())),
+                nonempty_finish: false,
+            }
+        }
+
+        /// A completing cleanup beneath a nonempty Finish (Stopped at
+        /// 7): the uncertainty twin's terminal loss, which must stay
+        /// disposable without restoring positives.
+        fn nonempty_completing() -> Self {
+            Self {
+                cleanup: Box::new(|_| Ok(())),
+                nonempty_finish: true,
             }
         }
 
@@ -8001,6 +8013,7 @@ mod promotion_driver_tests {
                     }
                     Err(anyhow::anyhow!("scripted cleanup observed interruption"))
                 }),
+                nonempty_finish: false,
             }
         }
 
@@ -8045,6 +8058,7 @@ mod promotion_driver_tests {
                     )
                     .map_err(|error| anyhow::anyhow!("real stuck cleanup: {error:#}"))
                 }),
+                nonempty_finish: false,
             }
         }
     }
@@ -8119,7 +8133,26 @@ mod promotion_driver_tests {
             &mut self,
             domain: crate::attach::capture::NativeDomainId,
         ) -> crate::inventory_semantics::SemanticBatch {
-            crate::inventory_semantics::SemanticBatch::scripted(domain, Vec::new(), 0)
+            if self.nonempty_finish {
+                use crate::semantic_capture::{
+                    Invalidation, InvalidationScope, TickOutcome, TickReport,
+                };
+                let outcome = TickOutcome::Invalidation(Invalidation::scripted(
+                    domain,
+                    InvalidationScope::Stopped,
+                    Some(7),
+                ));
+                let report = TickReport::scripted(vec![outcome], Vec::new());
+                crate::inventory_semantics::SemanticBatch::from_tick_report(
+                    domain,
+                    report,
+                    Vec::new(),
+                    0,
+                )
+                .expect("scripted nonempty Finish respects lane bounds")
+            } else {
+                crate::inventory_semantics::SemanticBatch::scripted(domain, Vec::new(), 0)
+            }
         }
 
         fn quiescent(&mut self) -> bool {
@@ -8483,6 +8516,110 @@ mod promotion_driver_tests {
                 .all(|(subject, _)| subject != "semantic batch dropped without lane authority"),
             "no evidence orphaned: {:?}",
             gaps(&mut driver)
+        );
+    }
+
+    #[test]
+    fn failed_nonempty_finish_with_uncertainty_still_winds_down() {
+        // The nonempty-uncertainty twin: after a failed Finish (H0
+        // finished), physical uncertainty refuses its cut, ends the
+        // domain, and turns the nonempty Finish into a drop shadow.
+        // Terminal loss must stay disposable without restoring
+        // positives: the wind-down completes and the retire disposes.
+        // Fails pre-fix stranded in Stopping with the lane kept.
+        use crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding;
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.semantic = Some(wind_down_lane(WindDownIo::nonempty_completing()));
+        let domain = install_promotion_for_wind_down(&mut driver);
+        FAIL_TERMINAL_PUBLICATION.with(|fail| fail.set(true));
+        driver.wind_down_installed_promotion(PromotionEnd::Cancelled);
+        assert!(
+            driver.semantic.is_some() && driver.semantic_staged,
+            "the failed Finish stays staged behind its lane"
+        );
+        assert!(
+            driver.semantic.as_ref().expect("lane").is_finished(),
+            "H0 finished before the retry"
+        );
+        // Physical uncertainty arrives before the retry: a bound,
+        // proven caller turns tail-uncertain, and the finished H0
+        // refuses its cut.
+        let caller = CallerId(9);
+        let image = ImageIdentity {
+            task_cookie: 41,
+            exec_id: 42,
+        };
+        let pin = std::sync::Arc::new(PidPin::test_proc_only(std::process::id()));
+        let module = crate::discovery::caller_registry::ModuleKey::physical(
+            8,
+            1,
+            100,
+            Some("sha-100".into()),
+            "/lib/x.so",
+        );
+        driver
+            .coordinator
+            .semantic_bindings_mut()
+            .insert_for_test(SemanticCallerBinding::scripted(
+                caller, module, domain, image, pin,
+            ))
+            .expect("uncertain caller binds");
+        driver.coordinator.reference_prove_image(domain, image);
+        driver.coordinator.reference_mark_tail(caller);
+        driver.semantic.as_mut().expect("lane").fail_cut_once();
+        driver
+            .semantic
+            .as_mut()
+            .expect("lane")
+            .age_staged_for_test(Instant::now() - Duration::from_secs(5));
+        driver.wind_down_installed_promotion(PromotionEnd::Cancelled);
+        assert!(
+            driver.semantic.is_none(),
+            "terminal loss disposes: the lane releases despite the refused cut"
+        );
+        assert!(driver.installed_promotion.is_none());
+        assert_eq!(driver.retiring_domain(), Some(domain));
+        assert_eq!(
+            driver.display.as_ref().expect("display").promotion_state(),
+            PromotionState::Ended(PromotionEnd::Cancelled)
+        );
+        let subjects: Vec<String> = gaps(&mut driver)
+            .iter()
+            .map(|(subject, _)| subject.clone())
+            .collect();
+        assert!(
+            subjects
+                .iter()
+                .any(|subject| subject == "semantic authority ended for domain"),
+            "the failed cut ends the domain loudly: {subjects:?}"
+        );
+        assert!(
+            subjects
+                .iter()
+                .any(|subject| subject == "semantic batch refused for an ended domain"),
+            "the nonempty Finish refuses through the audited path: {subjects:?}"
+        );
+        // The retire disposes the refused shadow without restoring
+        // positives: the proof retires, and the domain still refuses.
+        driver.completion_source = Some(Box::new(StubCompletionSource(Some(
+            SessionNativeCompletion::scripted(domain),
+        ))));
+        driver.on_tick();
+        assert_eq!(
+            driver.retiring_domain(),
+            None,
+            "the refused shadow retires instead of stranding"
+        );
+        driver.coordinator.stage_semantic_batch(
+            crate::inventory_semantics::SemanticBatch::scripted(domain, Vec::new(), 3),
+        );
+        assert!(
+            gaps(&mut driver)
+                .iter()
+                .any(|(subject, _)| subject == "semantic batch refused for an ended domain"),
+            "no positive authority returns: {subjects:?}"
         );
     }
 

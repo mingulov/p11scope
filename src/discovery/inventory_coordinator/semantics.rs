@@ -1503,25 +1503,32 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     }
 
     /// DR37 wind-down gate: whether the domain's finalizer namespace
-    /// still holds unpublished work (a staged quantum or an
-    /// undischarged drop shadow) that needs its validating lane. The
-    /// wind-down keeps the lane until this clears; retire refuses
-    /// while it holds.
+    /// still holds unpublished work that needs its validating lane. A
+    /// staged quantum always needs the lane (it still requires its
+    /// audited finalization/drop). A drop shadow needs the lane only
+    /// while the domain stays live: once the domain is permanently
+    /// refused, its terminal loss is disposable without restoring
+    /// positives, so the wind-down releases the lane and the retire
+    /// below disposes the shadow with the namespace.
     #[cfg_attr(not(test), allow(dead_code))] // STAGED (DR37): called by the driver wind-down.
     pub(crate) fn joint_domain_has_pending_work(&self, domain: NativeDomainId) -> bool {
         self.semantic_finalizer.as_ref().is_some_and(|state| {
             state.domain == domain
-                && (state.pending_semantic.is_some() || state.pending_drop.is_some())
+                && (state.pending_semantic.is_some()
+                    || (state.pending_drop.is_some()
+                        && !self.refused_semantic_domains.contains(&domain)))
         })
     }
 
     /// Retire one genuinely completed domain for the next (D5): the
     /// native completion names the live finalizer namespace, which
-    /// must be quiescent (no staged quantum, no pending drop);
-    /// pending work refuses and the namespace stays live. Every
-    /// refusal hands the completion back with the reason: the source
-    /// delivers once, so a retryable refusal preserves the authority
-    /// required to retry. Retire removes the domain's bindings,
+    /// must be quiescent (no staged quantum, and no pending drop
+    /// unless the domain is already permanently refused, whose
+    /// terminal shadow disposes with the namespace without restoring
+    /// positives); other pending work refuses and the namespace stays
+    /// live. Every refusal hands the completion back with the reason:
+    /// the source delivers once, so a retryable refusal preserves the
+    /// authority required to retry. Retire removes the domain's bindings,
     /// refusal-only history and successor reservations (other
     /// domains' entries preserved), clears its tail markers, drops
     /// the finalizer namespace (including its seal admission: no
@@ -1548,10 +1555,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         if !live {
             return Err((completion, JointRetireRefusal::NotLiveDomain));
         }
-        let quiescent = self
-            .semantic_finalizer
-            .as_ref()
-            .is_some_and(|state| state.pending_semantic.is_none() && state.pending_drop.is_none());
+        let quiescent = self.semantic_finalizer.as_ref().is_some_and(|state| {
+            state.pending_semantic.is_none()
+                && (state.pending_drop.is_none() || self.refused_semantic_domains.contains(&domain))
+        });
         if !quiescent {
             return Err((completion, JointRetireRefusal::PendingWork));
         }
@@ -3628,6 +3635,63 @@ mod promotion_lifecycle_tests {
         let state = coordinator.semantic_finalizer.as_ref().expect("kept");
         assert_eq!(state.pending_drop, Some((7, false)));
         assert!(coordinator.refused_semantic_domains.is_empty());
+    }
+
+    #[test]
+    fn retire_joint_domain_disposes_refused_drop_shadow_without_positives() {
+        // Terminal loss stays disposable: a refused domain's drop
+        // shadow retires instead of stranding, without restoring
+        // positives. Fails pre-fix refusing PendingWork forever.
+        let mut coordinator = coordinator();
+        let a = domain();
+        let mut finalizer = SessionFinalizerState::new(a);
+        finalizer.pending_drop = Some((7, false));
+        coordinator.semantic_finalizer = Some(finalizer);
+        coordinator.refused_semantic_domains.insert(a);
+        assert!(
+            !coordinator.joint_domain_has_pending_work(a),
+            "a refused shadow needs no lane"
+        );
+        coordinator
+            .retire_joint_domain(SessionNativeCompletion::scripted(a))
+            .expect("the refused shadow disposes");
+        assert!(coordinator.semantic_finalizer.is_none());
+        assert!(coordinator.refused_semantic_domains.contains(&a));
+        coordinator.stage_semantic_batch(crate::inventory_semantics::SemanticBatch::scripted(
+            a,
+            Vec::new(),
+            1,
+        ));
+        assert!(
+            coordinator.semantic_finalizer.is_none(),
+            "no positive authority returns"
+        );
+    }
+
+    #[test]
+    fn retire_joint_domain_still_holds_staged_quantum_when_refused() {
+        // Staged quanta still need their audited drop before disposal,
+        // even for refused domains: only the terminal shadow is
+        // disposable, never an unpublished batch.
+        let mut coordinator = coordinator();
+        let a = domain();
+        let mut finalizer = SessionFinalizerState::new(a);
+        finalizer.pending_semantic = Some(crate::inventory_semantics::SemanticBatch::scripted(
+            a,
+            Vec::new(),
+            1,
+        ));
+        coordinator.semantic_finalizer = Some(finalizer);
+        coordinator.refused_semantic_domains.insert(a);
+        assert!(
+            coordinator.joint_domain_has_pending_work(a),
+            "a staged quantum still needs its lane"
+        );
+        let (completion, err) = coordinator
+            .retire_joint_domain(SessionNativeCompletion::scripted(a))
+            .expect_err("an unpublished batch stays live");
+        assert_eq!(err, JointRetireRefusal::PendingWork);
+        assert_eq!(completion.domain(), a);
     }
 
     #[test]

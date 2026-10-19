@@ -8,13 +8,13 @@ struct {
     __uint(max_entries, BASELINE_QUERY_LIMIT);
     __type(key, u32);
     __type(value, struct baseline_request);
-} INV_BASELINE_REQUESTS SEC(".maps");
+} INV_BASELINE_RQ SEC(".maps");
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 1);
     __type(key, u32);
     __type(value, struct baseline_control);
-} INV_BASELINE_CTL SEC(".maps");
+} INV_BASELINE_CT SEC(".maps");
 extern unsigned char TASK_COOKIE;
 static void *(*baseline_lookup)(void *, const void *) = (void *)1;
 static u64 (*baseline_ktime)(void) = (void *)5;
@@ -25,7 +25,7 @@ SEC("iter/task")
 int p11_inventory_image_baseline(struct baseline_iter *ctx)
 {
     u32 zero = 0;
-    struct baseline_control *ctl = baseline_lookup(&INV_BASELINE_CTL, &zero);
+    struct baseline_control *ctl = baseline_lookup(&INV_BASELINE_CT, &zero);
     if (!ctl || !ctx || !ctx->meta || !ctx->meta->seq)
         return 1;
     if (!ctl->generation || !ctl->count || ctl->count > BASELINE_QUERY_LIMIT ||
@@ -50,7 +50,7 @@ int p11_inventory_image_baseline(struct baseline_iter *ctx)
     if (task->tgid <= 0 || task->group_leader != task)
         return 0;
     u32 tgid = (u32)task->tgid;
-    const struct baseline_request *request = baseline_lookup(&INV_BASELINE_REQUESTS, &tgid);
+    const struct baseline_request *request = baseline_lookup(&INV_BASELINE_RQ, &tgid);
     if (!request || request->generation != ctl->generation || request->tgid != tgid || request->slot >= ctl->count)
         return 0;
     if (ctl->emitted >= ctl->count) {

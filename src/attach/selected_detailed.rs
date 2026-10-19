@@ -136,9 +136,9 @@ unsafe impl aya::Pod for BootstrapControl {}
 pub(super) fn validate_maps(ebpf: &aya::Ebpf) -> anyhow::Result<()> {
     use anyhow::Context as _;
     for (name, size, flags) in [
-        ("SELECTED_DETAILED", 32, super::BPF_F_RDONLY_PROG),
-        ("SELECTED_DETAILED_STATE", 8, super::BPF_F_MMAPABLE),
-        ("SELECTED_BOOTSTRAP_CTL", 48, 0),
+        ("SELECTED_DETAIL", 32, super::BPF_F_RDONLY_PROG),
+        ("SELECTED_DSTATE", 8, super::BPF_F_MMAPABLE),
+        ("SELECTED_BCTL", 48, 0),
     ] {
         let data =
             super::policy_map_data(name, ebpf.map(name).with_context(|| format!("{name} map"))?)?;
@@ -259,8 +259,7 @@ impl NativeSelection {
         validate_maps(ebpf)?;
         let target_map = || -> Result<Array<_, SelectedTarget>> {
             Ok(Array::try_from(
-                ebpf.map("SELECTED_DETAILED")
-                    .context("selected target map")?,
+                ebpf.map("SELECTED_DETAIL").context("selected target map")?,
             )?)
         };
         ensure!(
@@ -268,7 +267,7 @@ impl NativeSelection {
             "selected target was not zero before links"
         );
         let ctl: Array<_, BootstrapControl> = Array::try_from(
-            ebpf.map("SELECTED_BOOTSTRAP_CTL")
+            ebpf.map("SELECTED_BCTL")
                 .context("selected bootstrap map")?,
         )?;
         ensure!(
@@ -276,9 +275,8 @@ impl NativeSelection {
             "selected bootstrap was not zero before links"
         );
         let data = super::policy_map_data(
-            "SELECTED_DETAILED_STATE",
-            ebpf.map("SELECTED_DETAILED_STATE")
-                .context("selected state map")?,
+            "SELECTED_DSTATE",
+            ebpf.map("SELECTED_DSTATE").context("selected state map")?,
         )?;
         let state = StateControl::new(data.fd().as_fd())?;
         ensure!(
@@ -286,7 +284,7 @@ impl NativeSelection {
             "selected state was not zero before links"
         );
         let Some(pin) = selected else {
-            super::freeze_map("SELECTED_DETAILED", ebpf.map("SELECTED_DETAILED").unwrap())?;
+            super::freeze_map("SELECTED_DETAIL", ebpf.map("SELECTED_DETAIL").unwrap())?;
             return Ok(None);
         };
         pin.pidfd()
@@ -313,7 +311,7 @@ impl NativeSelection {
             ..SelectedTarget::default()
         };
         let mut map: Array<_, SelectedTarget> =
-            Array::try_from(ebpf.map_mut("SELECTED_DETAILED").unwrap())?;
+            Array::try_from(ebpf.map_mut("SELECTED_DETAIL").unwrap())?;
         map.set(0, target, 0)?;
         ensure!(
             map.get(&0, 0)? == target,
@@ -367,7 +365,7 @@ impl NativeSelection {
         self.target.cookie = image.task_cookie;
         self.target.exec_id = image.exec_id;
         let mut map: Array<_, SelectedTarget> = Array::try_from(
-            ebpf.map_mut("SELECTED_DETAILED")
+            ebpf.map_mut("SELECTED_DETAIL")
                 .context("selected target map")?,
         )?;
         map.set(0, self.target, 0)?;
@@ -375,7 +373,7 @@ impl NativeSelection {
             map.get(&0, 0)? == self.target,
             "selected full identity readback differs"
         );
-        super::freeze_map("SELECTED_DETAILED", ebpf.map("SELECTED_DETAILED").unwrap())?;
+        super::freeze_map("SELECTED_DETAIL", ebpf.map("SELECTED_DETAIL").unwrap())?;
         self.state.closed()
     }
     pub(super) fn close(&self) -> Result<()> {
@@ -433,7 +431,7 @@ fn bootstrap(
     let mut map: Array<_, BootstrapControl> = Array::try_from(
         session
             .ebpf
-            .map_mut("SELECTED_BOOTSTRAP_CTL")
+            .map_mut("SELECTED_BCTL")
             .context("selected bootstrap map")?,
     )?;
     map.set(0, control, 0)?;
@@ -464,7 +462,7 @@ fn bootstrap(
     let map: Array<_, BootstrapControl> = Array::try_from(
         session
             .ebpf
-            .map("SELECTED_BOOTSTRAP_CTL")
+            .map("SELECTED_BCTL")
             .context("selected bootstrap map")?,
     )?;
     let done = map.get(&0, 0)?;
@@ -614,7 +612,7 @@ impl SelectedConstructionPermit {
         let map: Array<_, SelectedTarget> = Array::try_from(
             session
                 .ebpf
-                .map("SELECTED_DETAILED")
+                .map("SELECTED_DETAIL")
                 .context("selected target map")?,
         )?;
         ensure!(

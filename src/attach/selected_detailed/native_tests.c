@@ -19,9 +19,9 @@ static void *lookup(void *map, const void *key)
 {
     if (map == &INSTANCE_GEN) { assert(*(const u32 *)key == 3); return &coverage; }
     assert(*(const u32 *)key == 0);
-    if (map == &SELECTED_DETAILED)
+    if (map == &SELECTED_DETAIL)
         return missing_target ? NULL : &target;
-    if (map == &SELECTED_DETAILED_STATE)
+    if (map == &SELECTED_DSTATE)
         return missing_state ? NULL : &state;
     assert(0); return NULL;
 }

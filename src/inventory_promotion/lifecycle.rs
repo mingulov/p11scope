@@ -203,7 +203,6 @@ impl SessionNativeCompletion {
     /// trust chain as [`NativeCasReceipt::minted`]: only the
     /// native-owned source's completions reach the retire entry in
     /// production.
-    #[allow(dead_code)] // STAGED (DR37): called by the native minter; tests script completions instead.
     pub(crate) fn completed(domain: NativeDomainId) -> Self {
         Self { domain }
     }
@@ -233,6 +232,12 @@ impl std::fmt::Debug for SessionNativeCompletion {
 /// resets history and never recycles a ticket.
 pub(crate) trait NativeCompletionSource: Send {
     fn poll_completion(&mut self, domain: NativeDomainId) -> Option<SessionNativeCompletion>;
+    /// Accept one wound-down domain's live Session for polled
+    /// completion. The driver calls this once per wind-down, after the
+    /// terminal sequence drove producer detach; the minter attempts
+    /// the genuine mint on each poll and drops the spent Session
+    /// after a successful mint. Unknown domains still poll `None`.
+    fn note_wound_down(&mut self, domain: NativeDomainId, session: Session);
 }
 
 /// Why proof minting refused. Every variant leaves the lane

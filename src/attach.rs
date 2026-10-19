@@ -2159,7 +2159,7 @@ impl SessionDrainProducers {
 /// a completion past its Session's lifetime — the retained FD pins the
 /// kernel map ID against reuse only while that history survives, and
 /// only within that lifetime is the binding meaningful.
-#[allow(dead_code)] // No joint consumer until the promotion lane wires DR37 1C/1F.
+#[allow(dead_code)] // The completion minter consumes the mint; per-field evidence reads stay test-pinned.
 #[derive(Debug)]
 pub(crate) struct SessionNativeCompletion {
     terminal_events: u64,
@@ -2170,7 +2170,7 @@ pub(crate) struct SessionNativeCompletion {
     events_id: u64,
 }
 
-#[allow(dead_code)] // No joint consumer until the promotion lane wires DR37 1C/1F.
+#[allow(dead_code)] // The completion minter consumes the mint; the evidence getters stay test-pinned.
 impl SessionNativeCompletion {
     /// The join gates both ends of the mint enforce: the fail-fast at the
     /// top of [`Session::mint_native_completion`] (before the terminal
@@ -2316,6 +2316,49 @@ impl NativeCompletionMint {
     }
 }
 
+/// The production native completion minter (DR37 D4/A→B): owns
+/// wound-down Sessions and mints one lifecycle completion per
+/// genuinely disposed domain. Each poll attempts the held Session's
+/// own terminal proof (joined detach, proven quiescence,
+/// backlog-free terminal drain, object-start scrub); unmet gates
+/// poll `None` and the namespace holds, never forced. A minted
+/// Session is spent (its terminal evidence consumed) and drops with
+/// its maps; a domain/Session pairing that disagrees drops closed
+/// instead of retiring the wrong namespace.
+#[derive(Default)]
+pub(crate) struct NativeCompletionMinter {
+    pending: std::collections::HashMap<capture::NativeDomainId, Session>,
+}
+
+impl NativeCompletionMinter {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl crate::inventory_promotion::lifecycle::NativeCompletionSource for NativeCompletionMinter {
+    fn poll_completion(
+        &mut self,
+        domain: capture::NativeDomainId,
+    ) -> Option<crate::inventory_promotion::lifecycle::SessionNativeCompletion> {
+        let session = self.pending.get_mut(&domain)?;
+        if session.native_domain() != Some(domain) {
+            // The driver mislabeled this pairing: drop the Session
+            // closed rather than retire the wrong namespace. The
+            // namespace holds, honestly unproven.
+            self.pending.remove(&domain);
+            return None;
+        }
+        session.mint_native_completion().ok()?;
+        self.pending.remove(&domain);
+        Some(crate::inventory_promotion::lifecycle::SessionNativeCompletion::completed(domain))
+    }
+
+    fn note_wound_down(&mut self, domain: capture::NativeDomainId, session: Session) {
+        self.pending.insert(domain, session);
+    }
+}
+
 /// The completion mint's bounded terminal EVENTS poll over the retained
 /// consumer: counts consumed records and the malformed delta, and reports
 /// `backlog` when the poll stopped with records queued, plus a separate
@@ -2324,7 +2367,6 @@ impl NativeCompletionMint {
 /// that Pending head to `None`, so positions are the verdict, per
 /// `events_head_pending`). Generic over the source so tests pin the exact
 /// verdict the mint consumes.
-#[allow(dead_code)] // No joint consumer until the promotion lane wires DR37 1C/1F.
 struct TerminalPollVerdict {
     backlog: bool,
     head_pending: bool,
@@ -2332,7 +2374,6 @@ struct TerminalPollVerdict {
     terminal_malformed: u64,
 }
 
-#[allow(dead_code)] // No joint consumer until the promotion lane wires DR37 1C/1F.
 fn terminal_poll_verdict<S>(drain: &mut events::EventDrain<S>) -> TerminalPollVerdict
 where
     S: events::RecordSource + events::BoundedRecordSource,
@@ -6333,7 +6374,6 @@ impl Session {
     /// depth. Any post-poll failure poisons the mint: the poll ate a
     /// prefix a retry can never see again, so the refused Session can
     /// never mint afterwards. No partial completion exists.
-    #[allow(dead_code)] // No joint consumer until the promotion lane wires DR37 1C/1F.
     pub(crate) fn mint_native_completion(&mut self) -> Result<SessionNativeCompletion> {
         self.native_completion_mint.admit()?;
         let detach_complete = matches!(self.producer_detach, OwnedProducerDetach::Complete);

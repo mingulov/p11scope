@@ -323,7 +323,7 @@ class NativeWrapControls(unittest.TestCase):
                                             counted=3, shared=1, probe=True)
             facts = validate(observed)
             self.assertEqual(facts['calls'], 96)
-            self.assertEqual(facts['physical_pairs'], 1)
+            self.assertEqual(facts['physical_pairs'], 32)
             self.assertEqual(facts['phase_calls'], {'a': 96})
             self.assertEqual([r['round'] for r in observed['acks'] if r['event'] == 'a-done'], [1, 2, 3])
             for mutation in ('missing_third_call', 'foreign_pair', 'shared_call', 'unacked_round', 'unexpected_b_ack'):
@@ -351,7 +351,7 @@ class NativeWrapControls(unittest.TestCase):
             self.assertEqual(prepared['native_check']['calls'], 192)
             self.assertEqual(prepared['native_check']['targets'], 32)
             self.assertEqual(prepared['probe_check']['calls'], 96)
-            self.assertEqual(prepared['probe_check']['physical_pairs'], 1)
+            self.assertEqual(prepared['probe_check']['physical_pairs'], 32)
             observed = WRAP['execute_fixture'](directory, 1, 1)
             def validate(value):
                 return WRAP['check_ledger'](**value, directory=directory, counted=1, shared=1)

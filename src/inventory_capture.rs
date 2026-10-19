@@ -1149,8 +1149,94 @@ impl LoopClock<'_> {
     /// passed deadline. Unlike `ending`, no deadline reads as "run the
     /// single snapshot pass", not as "already ended" (F9).
     fn stop_requested(&self) -> bool {
-        (self.stop)() || self.deadline.is_some_and(|end| Instant::now() >= end)
+        self.stop_cause().is_some()
     }
+    /// The honor-before-new-work stop with its cause, for the latches
+    /// whose outcome the zero-pass diagnostic reports. Same query count
+    /// as `stop_requested` (one stop read, then the deadline only when
+    /// no stop is pending): the stop callback may be stateful.
+    fn stop_cause(&self) -> Option<ZeroPassCause> {
+        if (self.stop)() {
+            Some(ZeroPassCause::OperatorStop)
+        } else if self.deadline.is_some_and(|end| Instant::now() >= end) {
+            Some(ZeroPassCause::Deadline)
+        } else {
+            None
+        }
+    }
+}
+
+/// Why a zero-pass run stopped: the latched F9 cause, recorded at the
+/// latch and never re-queried post-loop (the stop callback may be
+/// stateful; the collection control's sticky latch is re-readable).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ZeroPassCause {
+    OperatorStop,
+    Deadline,
+}
+
+/// The subject of the scope gap a run that ends with zero completed
+/// passes stages: the F9-success case reads as what it is instead of
+/// staying silent (exit 0 and schemas unchanged).
+pub(crate) const ZERO_PASS_GAP_SUBJECT: &str = "no complete collection pass";
+
+/// A run that ended with zero completed passes by stop/deadline (not
+/// error): the latched cause, how many completed collections were
+/// discarded past the stop, and the loop's elapsed time. Both the
+/// document gap and the stderr line render from this one value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ZeroPassStop {
+    pub(crate) cause: ZeroPassCause,
+    pub(crate) discarded: u64,
+    pub(crate) elapsed: Duration,
+}
+
+impl ZeroPassStop {
+    fn event(&self) -> &'static str {
+        match (self.cause, self.discarded > 0) {
+            (ZeroPassCause::Deadline, true) => "deadline exceeded during pass-0 collection",
+            (ZeroPassCause::OperatorStop, true) => "operator stop during pass-0 collection",
+            (ZeroPassCause::Deadline, false) => "deadline already passed before pass 0 started",
+            (ZeroPassCause::OperatorStop, false) => "operator stop requested before pass 0 started",
+        }
+    }
+    fn outcome(&self) -> String {
+        if self.discarded == 0 {
+            "no collection ran".to_string()
+        } else if self.discarded == 1 {
+            "1 completed collection discarded".to_string()
+        } else {
+            format!("{} completed collections discarded", self.discarded)
+        }
+    }
+    /// The gap reason: cause plus numbers (elapsed, discards).
+    pub(crate) fn gap_reason(&self) -> String {
+        if self.discarded > 0 {
+            format!(
+                "{} ({} elapsed); {}",
+                self.event(),
+                elapsed_secs_2dp(self.elapsed),
+                self.outcome()
+            )
+        } else {
+            format!("{}; {}", self.event(), self.outcome())
+        }
+    }
+    /// The stderr line: grep-able, informational, never a success claim
+    /// and never an error word (a zero-pass stop is F9-success).
+    pub(crate) fn stderr_line(&self) -> String {
+        format!(
+            "p11scope: stopped with 0 completed passes ({}; {})",
+            self.event(),
+            self.outcome()
+        )
+    }
+}
+
+/// Elapsed time as `7.16s`: seconds with two decimals, for the
+/// zero-pass gap reason.
+fn elapsed_secs_2dp(elapsed: Duration) -> String {
+    format!("{}.{:02}s", elapsed.as_secs(), elapsed.subsec_millis() / 10)
 }
 
 /// One pass's collection, owned (C5.7): it reads the scope through its own
@@ -1460,6 +1546,10 @@ pub(crate) enum Publish<'a> {
 pub(crate) struct ClassicOutcome<L> {
     pub(crate) stopped: Option<Stopped<L>>,
     pub(crate) error: Option<anyhow::Error>,
+    /// `Some` exactly when the run ended with zero completed passes by
+    /// stop/deadline (not error): the finalizer emits one stderr line
+    /// from it beside the staged scope gap.
+    pub(crate) zero_pass: Option<ZeroPassStop>,
 }
 
 /// Compatibility adapter for existing scripted successful-loop controls.
@@ -1495,10 +1585,16 @@ where
     // A PID/System stop latched in-loop (F9): the post-loop host gate is
     // then skipped, so the host still stops exactly once per run.
     let mut stop_latched = false;
+    // The zero-pass diagnostic's inputs, hoisted out of the loop body:
+    // completed passes, the first latch's cause, completed collections
+    // discarded past the stop, and the loop's start time.
+    let mut passes: u64 = 0;
+    let mut stop_cause: Option<ZeroPassCause> = None;
+    let mut discarded_collections: u64 = 0;
+    let loop_start = Instant::now();
     let running = match initial_error {
         Some(error) => Err(error),
         None => (|| -> Result<()> {
-            let mut passes: u64 = 0;
             let mut rescan = false;
             loop {
                 let control = driver.collection_control();
@@ -1528,7 +1624,10 @@ where
                 // control to latch, so the loop gates the host itself
                 // (F9) and runs zero passes — the old legacy behavior
                 // always ran pass 0.
-                if control.is_none() && clock.stop_requested() {
+                if control.is_none()
+                    && let Some(cause) = clock.stop_cause()
+                {
+                    stop_cause.get_or_insert(cause);
                     driver.host().stop_coordinator();
                     stop_latched = true;
                     break;
@@ -1562,11 +1661,17 @@ where
                 if let Some(control) = &control {
                     latch_collection_stop(control, clock);
                 }
-                if control.is_none() && clock.stop_requested() {
+                if control.is_none()
+                    && let Some(cause) = clock.stop_cause()
+                {
                     // The stop landed mid-pass: gate the host before
                     // apply/commit, so nothing collected after the stop is
                     // applied, attached, or minted a successor (F9). The
-                    // owned stop drain still runs after the loop.
+                    // owned stop drain still runs after the loop. The
+                    // completed collection is discarded; the diagnostic
+                    // counts it when no pass completed.
+                    stop_cause.get_or_insert(cause);
+                    discarded_collections += 1;
                     driver.host().stop_coordinator();
                     stop_latched = true;
                     break;
@@ -1697,14 +1802,59 @@ where
     if !stop_latched {
         driver.host().stop_coordinator();
     }
+    // A silent F9 zero-pass stop now reads as what it is: one scope gap
+    // here plus one stderr line from the outcome at the finalizer — both
+    // informational, exit 0 and schemas unchanged. Error runs keep only
+    // their failure gap, and a trailing discard after published passes
+    // stays silent. Covers the scan-only return below and both
+    // cancelled-startup branches (scoped reads the control's sticky
+    // latch; the stop callback itself is never re-queried).
+    let zero_pass = if error.is_none() && passes == 0 {
+        let elapsed = loop_start.elapsed();
+        if stop_latched {
+            stop_cause.map(|cause| ZeroPassStop {
+                cause,
+                discarded: discarded_collections,
+                elapsed,
+            })
+        } else if let Some(control) = driver.collection_control()
+            && let Err(stop) = control.check()
+        {
+            Some(ZeroPassStop {
+                cause: match stop {
+                    crate::scope::inventory_cgroup::CollectionStop::OperatorStop => {
+                        ZeroPassCause::OperatorStop
+                    }
+                    crate::scope::inventory_cgroup::CollectionStop::Deadline => {
+                        ZeroPassCause::Deadline
+                    }
+                },
+                discarded: discarded_collections,
+                elapsed,
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    if let Some(zero) = &zero_pass {
+        driver
+            .host()
+            .note_scope_gap(ZERO_PASS_GAP_SUBJECT.into(), zero.gap_reason());
+    }
     let Some(lane) = lane else {
-        // Publish the failure gap without repeating the failed scan/pass.
-        if error.is_some() {
+        // Publish the failure gap (or the zero-pass diagnostic gap)
+        // without repeating the failed scan/pass. A failed publication
+        // commit must not turn the informational diagnostic into a run
+        // failure: exit 0 is preserved.
+        if error.is_some() || zero_pass.is_some() {
             let _ = driver.commit(false);
         }
         return ClassicOutcome {
             stopped: None,
             error,
+            zero_pass,
         };
     };
     if let Err(next) = publish(
@@ -1752,6 +1902,7 @@ where
     ClassicOutcome {
         stopped: Some(stopped),
         error,
+        zero_pass,
     }
 }
 
@@ -1996,6 +2147,7 @@ mod stop_latch_tests {
         targets: F9Targets,
         stop_calls: Option<Rc<Cell<u64>>>,
         stage_marks: Vec<(u64, usize)>,
+        gaps: Vec<(String, String)>,
     }
     impl F9Host {
         fn new() -> Self {
@@ -2005,6 +2157,7 @@ mod stop_latch_tests {
                 targets: F9Targets,
                 stop_calls: None,
                 stage_marks: Vec::new(),
+                gaps: Vec::new(),
             }
         }
     }
@@ -2032,7 +2185,9 @@ mod stop_latch_tests {
         }
         fn end_capture_coverage(&mut self, _at_ns: u64) {}
         fn note_native_lane(&mut self) {}
-        fn note_scope_gap(&mut self, _subject: String, _reason: String) {}
+        fn note_scope_gap(&mut self, subject: String, reason: String) {
+            self.gaps.push((subject, reason));
+        }
         fn note_refresh_loss(&mut self, _reason: String) {}
         fn stop_coordinator(&mut self) {
             self.stops += 1;
@@ -2046,6 +2201,11 @@ mod stop_latch_tests {
         commits: usize,
         applied: Rc<Cell<usize>>,
         arm_stop_on_collect: Option<Rc<Cell<bool>>>,
+        /// The worker collection waits for this instant before
+        /// returning, so a test deadline crosses mid-collection.
+        collect_wait_until: Option<Instant>,
+        /// Mirrors `collects` for stop closures that arm on a later pass.
+        collect_count: Option<Rc<Cell<usize>>>,
     }
     impl F9Driver {
         fn new() -> Self {
@@ -2056,6 +2216,8 @@ mod stop_latch_tests {
                 commits: 0,
                 applied: Rc::new(Cell::new(0)),
                 arm_stop_on_collect: None,
+                collect_wait_until: None,
+                collect_count: None,
             }
         }
         fn report(&self) -> PassReport {
@@ -2079,10 +2241,19 @@ mod stop_latch_tests {
         }
         fn collector(&mut self) -> CollectJob {
             self.collects += 1;
+            if let Some(count) = &self.collect_count {
+                count.set(self.collects);
+            }
             if let Some(arm) = &self.arm_stop_on_collect {
                 arm.set(true);
             }
-            CollectJob::Legacy(Box::new(|| {
+            let wait_until = self.collect_wait_until;
+            CollectJob::Legacy(Box::new(move || {
+                if let Some(until) = wait_until {
+                    while Instant::now() < until {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
                 Err(anyhow!("no collection in the stop-latch probe"))
             }))
         }
@@ -2239,7 +2410,10 @@ mod stop_latch_tests {
             driver.applies, 0,
             "no apply, so no attach or successor work"
         );
-        assert_eq!(driver.commits, 0, "no commit without a pass");
+        assert_eq!(
+            driver.commits, 1,
+            "only the zero-pass diagnostic gap publishes"
+        );
         assert_eq!(pass_publications, 0, "no pass was published");
         assert_eq!(
             driver.host.stops, 1,
@@ -2274,7 +2448,10 @@ mod stop_latch_tests {
             driver.applies, 0,
             "no apply after the stop, so no successor is minted"
         );
-        assert_eq!(driver.commits, 0, "no commit after the stop");
+        assert_eq!(
+            driver.commits, 1,
+            "only the zero-pass diagnostic gap publishes"
+        );
         assert_eq!(pass_publications, 0, "no pass was published");
         assert_eq!(
             driver.host.stops, 1,
@@ -2416,7 +2593,10 @@ mod stop_latch_tests {
             driver.applies, 0,
             "no apply, so no attach or successor work"
         );
-        assert_eq!(driver.commits, 0, "no commit without a pass");
+        assert_eq!(
+            driver.commits, 1,
+            "only the zero-pass diagnostic gap publishes"
+        );
         assert_eq!(pass_publications, 0, "no pass was published");
         assert_eq!(
             driver.host.stops, 1,
@@ -2532,5 +2712,204 @@ mod stop_latch_tests {
             driver.host.stage_marks
         );
         assert_eq!(stopped.capture.begin_stops, 1, "retirement still begins");
+    }
+
+    #[test]
+    fn deadline_during_pass0_collection_reports_zero_pass_gap_and_line() {
+        // The G30 shape: pass-0 collection outlasts the deadline, so the
+        // completed collection is discarded with no apply/commit — but the
+        // run now says so (gap + line), still exiting 0.
+        let mut driver = F9Driver::new();
+        let deadline = Instant::now() + Duration::from_millis(150);
+        driver.collect_wait_until = Some(deadline);
+        let stop = || false;
+        let clock = LoopClock {
+            deadline: Some(deadline),
+            stop: &stop,
+            interval: Duration::from_secs(60),
+            tick: Duration::from_millis(10),
+            collection_tick: Duration::from_millis(10),
+        };
+        let mut pass_publications = 0;
+        let outcome = run_classic_finalizing(
+            &mut driver,
+            None::<NativeLane<F9Lane>>,
+            &clock,
+            None,
+            &mut |_, point| {
+                if matches!(point, Publish::Pass { .. }) {
+                    pass_publications += 1;
+                }
+                Ok(())
+            },
+        );
+        assert!(outcome.error.is_none(), "exit 0 is preserved");
+        assert!(outcome.stopped.is_none());
+        assert_eq!(driver.collects, 1, "the pass-0 collection already ran");
+        assert_eq!(driver.applies, 0, "no apply after the deadline");
+        assert_eq!(
+            driver.commits, 1,
+            "only the zero-pass diagnostic gap publishes"
+        );
+        assert_eq!(pass_publications, 0, "no pass was published");
+        assert_eq!(
+            driver.host.stops, 1,
+            "the latch stops the host exactly once"
+        );
+        let zero = outcome.zero_pass.expect("a zero-pass stop is reported");
+        assert_eq!(zero.cause, ZeroPassCause::Deadline);
+        assert_eq!(zero.discarded, 1);
+        assert_eq!(driver.host.gaps.len(), 1, "{:?}", driver.host.gaps);
+        let (subject, reason) = &driver.host.gaps[0];
+        assert_eq!(subject, ZERO_PASS_GAP_SUBJECT);
+        assert!(
+            reason.contains("deadline exceeded during pass-0 collection"),
+            "{reason:?}"
+        );
+        assert!(
+            reason.contains("1 completed collection discarded"),
+            "{reason:?}"
+        );
+        assert!(reason.contains("elapsed"), "{reason:?}");
+        let line = zero.stderr_line();
+        assert_eq!(
+            line,
+            "p11scope: stopped with 0 completed passes (deadline exceeded during \
+             pass-0 collection; 1 completed collection discarded)"
+        );
+        assert!(
+            !line.to_lowercase().contains("success"),
+            "no success claims on stderr: {line:?}"
+        );
+    }
+
+    #[test]
+    fn in_budget_run_stages_no_zero_pass_gap() {
+        // Snapshot shape: no deadline, no stop — the single pass completes
+        // and no diagnostic fires.
+        let mut driver = F9Driver::new();
+        let stop = || false;
+        let clock = probe_clock(&stop);
+        let mut pass_publications = 0;
+        let outcome = run_classic_finalizing(
+            &mut driver,
+            None::<NativeLane<F9Lane>>,
+            &clock,
+            None,
+            &mut |_, point| {
+                if matches!(point, Publish::Pass { .. }) {
+                    pass_publications += 1;
+                }
+                Ok(())
+            },
+        );
+        assert!(outcome.error.is_none());
+        assert_eq!(pass_publications, 1, "the snapshot pass is published");
+        assert_eq!(driver.applies, 1);
+        assert!(outcome.zero_pass.is_none(), "no zero-pass stop happened");
+        assert!(driver.host.gaps.is_empty(), "{:?}", driver.host.gaps);
+    }
+
+    #[test]
+    fn pre_requested_stop_reports_zero_pass_gap_with_stop_cause() {
+        let mut driver = F9Driver::new();
+        let stop = || true;
+        let clock = probe_clock(&stop);
+        let mut pass_publications = 0;
+        let outcome = run_classic_finalizing(
+            &mut driver,
+            None::<NativeLane<F9Lane>>,
+            &clock,
+            None,
+            &mut |_, point| {
+                if matches!(point, Publish::Pass { .. }) {
+                    pass_publications += 1;
+                }
+                Ok(())
+            },
+        );
+        assert!(outcome.error.is_none(), "exit 0 is preserved");
+        assert_eq!(driver.collects, 0, "no new scan after a pre-requested stop");
+        assert_eq!(driver.applies, 0);
+        assert_eq!(
+            driver.commits, 1,
+            "only the zero-pass diagnostic gap publishes"
+        );
+        assert_eq!(pass_publications, 0, "no pass was published");
+        let zero = outcome.zero_pass.expect("a zero-pass stop is reported");
+        assert_eq!(zero.cause, ZeroPassCause::OperatorStop);
+        assert_eq!(zero.discarded, 0);
+        assert_eq!(
+            driver.host.gaps,
+            vec![(
+                ZERO_PASS_GAP_SUBJECT.to_string(),
+                "operator stop requested before pass 0 started; no collection ran".to_string()
+            )],
+        );
+        assert_eq!(
+            zero.stderr_line(),
+            "p11scope: stopped with 0 completed passes (operator stop requested before \
+             pass 0 started; no collection ran)"
+        );
+    }
+
+    #[test]
+    fn initial_error_keeps_only_the_failure_gap() {
+        let mut driver = F9Driver::new();
+        let stop = || false;
+        let clock = probe_clock(&stop);
+        let outcome = run_classic_finalizing(
+            &mut driver,
+            None::<NativeLane<F9Lane>>,
+            &clock,
+            Some(anyhow!("started append failure")),
+            &mut |_, _| Ok(()),
+        );
+        assert!(outcome.error.is_some());
+        assert!(outcome.zero_pass.is_none(), "errors keep no zero-pass note");
+        assert_eq!(driver.host.gaps.len(), 1, "{:?}", driver.host.gaps);
+        assert_eq!(driver.host.gaps[0].0, "inventory capture failed");
+    }
+
+    #[test]
+    fn mid_pass_discard_after_a_published_pass_stays_silent() {
+        // The ordinary trailing discard: pass 0 publishes, then the stop
+        // lands during pass-1 collection. Results exist, so no gap and no
+        // line — only true zero-pass runs report.
+        let mut driver = F9Driver::new();
+        let count = Rc::new(Cell::new(0usize));
+        driver.collect_count = Some(Rc::clone(&count));
+        let stop_count = Rc::clone(&count);
+        let stop = move || stop_count.get() >= 2;
+        let clock = LoopClock {
+            deadline: Some(Instant::now() + Duration::from_secs(600)),
+            stop: &stop,
+            interval: Duration::from_millis(1),
+            tick: Duration::from_millis(1),
+            collection_tick: Duration::from_millis(10),
+        };
+        let mut pass_publications = 0;
+        let outcome = run_classic_finalizing(
+            &mut driver,
+            None::<NativeLane<F9Lane>>,
+            &clock,
+            None,
+            &mut |_, point| {
+                if matches!(point, Publish::Pass { .. }) {
+                    pass_publications += 1;
+                }
+                Ok(())
+            },
+        );
+        assert!(outcome.error.is_none());
+        assert_eq!(driver.collects, 2, "pass-1 collection ran, then discarded");
+        assert_eq!(driver.applies, 1, "only the completed pass applies");
+        assert_eq!(pass_publications, 1, "the completed pass is published");
+        assert!(
+            outcome.zero_pass.is_none(),
+            "a trailing discard stays silent"
+        );
+        assert!(driver.host.gaps.is_empty(), "{:?}", driver.host.gaps);
+        assert_eq!(driver.host.stops, 1, "the host stops exactly once");
     }
 }

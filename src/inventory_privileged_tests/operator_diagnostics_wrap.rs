@@ -939,6 +939,87 @@ fn time_shape(value: &serde_json::Value, field: &str) -> Result<bool> {
 }
 
 fn primary_facts(document: &serde_json::Value, pid: u32, k: u64) -> Result<serde_json::Value> {
+    let caller = primary_pid_caller(document, pid)?;
+    Ok(primary_facts_core(document, pid, k, caller)?.0)
+}
+
+/// PID capture admits exactly the owned workload: one caller entry, the
+/// owned PID, mapped and unretired.
+fn primary_pid_caller(document: &serde_json::Value, pid: u32) -> Result<&serde_json::Value> {
+    let callers = document["callers"].as_array().context("primary callers")?;
+    ensure!(
+        callers.len() == 1
+            && callers[0]["pid"] == pid
+            && callers[0]["lifecycle"] == "mapped"
+            && callers[0]["retired"] == false
+    );
+    Ok(&callers[0])
+}
+
+/// System capture admits the machine: the owned caller must appear
+/// exactly once, mapped and unretired. Foreign-only presence is allowed
+/// here; borrowing owned modules is rejected separately.
+fn primary_system_caller(
+    document: &serde_json::Value,
+    owned_pid: u32,
+) -> Result<&serde_json::Value> {
+    let callers = document["callers"].as_array().context("primary callers")?;
+    let owned: Vec<_> = callers
+        .iter()
+        .filter(|caller| caller["pid"] == owned_pid)
+        .collect();
+    ensure!(
+        owned.len() == 1,
+        "system capture must admit the owned caller exactly once: pid={owned_pid}"
+    );
+    ensure!(
+        owned[0]["lifecycle"] == "mapped" && owned[0]["retired"] == false,
+        "owned caller is not an active mapping: {}",
+        owned[0]["id"]
+    );
+    Ok(owned[0])
+}
+
+/// No foreign caller may carry an edge on an owned module: the fixture
+/// providers exist only in the owned workload, so any such edge is
+/// misattribution, never system-capture honesty.
+fn check_owned_module_exclusivity(
+    document: &serde_json::Value,
+    owned_pid: u32,
+    owned_modules: &BTreeSet<String>,
+) -> Result<()> {
+    let owned_ids: BTreeSet<&str> = document["callers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|caller| caller["pid"] == owned_pid)
+        .filter_map(|caller| caller["id"].as_str())
+        .collect();
+    for edge in document["edges"].as_array().into_iter().flatten() {
+        if edge["module"]
+            .as_str()
+            .is_some_and(|module| owned_modules.contains(module))
+        {
+            ensure!(
+                edge["caller"]
+                    .as_str()
+                    .is_some_and(|id| owned_ids.contains(id)),
+                "foreign caller borrows an owned module edge: {edge}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Shared owned-population core: loss-free native observation plus the
+/// pinned A/B edges for the validated caller. Returns the primary facts
+/// with the owned module ids for exclusivity checks.
+fn primary_facts_core(
+    document: &serde_json::Value,
+    pid: u32,
+    k: u64,
+    caller: &serde_json::Value,
+) -> Result<(serde_json::Value, BTreeSet<String>)> {
     ensure!(
         k == 0 || k == TARGETS,
         "startup disposition is all pairs or none: k={k}"
@@ -970,14 +1051,6 @@ fn primary_facts(document: &serde_json::Value, pid: u32, k: u64) -> Result<serde
     for field in ["ambiguous", "unresolved"] {
         ensure!(witnesses["placement"][field].as_u64().is_some());
     }
-    let callers = document["callers"].as_array().context("primary callers")?;
-    ensure!(
-        callers.len() == 1
-            && callers[0]["pid"] == pid
-            && callers[0]["lifecycle"] == "mapped"
-            && callers[0]["retired"] == false
-    );
-    let caller = &callers[0];
     let edges = doc_edges(document, pid);
     ensure!(edges.len() == 2);
     let modules = document["modules"].as_array().context("primary modules")?;
@@ -1075,7 +1148,7 @@ fn primary_facts(document: &serde_json::Value, pid: u32, k: u64) -> Result<serde
             && facts.contains_key("provider-A.so")
             && facts.contains_key("provider-B.so")
     );
-    Ok(
+    Ok((
         serde_json::json!({"edges":facts,"lane":observation["lane"],"settlement":observation["settlement"],
         "retirement":observation["retirement"],"caller_lifecycle":caller["lifecycle"],
         "caller_lifecycle_reason":caller["lifecycle_reason"],"caller_retired":caller["retired"],
@@ -1084,21 +1157,23 @@ fn primary_facts(document: &serde_json::Value, pid: u32, k: u64) -> Result<serde
         "native_failure_facts":{"integrity":witnesses["integrity"],"pending":witnesses["pending"],
             "unbound_reasons":witnesses["unbound_reasons"],"ambiguous":witnesses["placement"]["ambiguous"],
             "unresolved":witnesses["placement"]["unresolved"]}}),
-    )
+        module_ids,
+    ))
 }
 
 /// Extract owned primary facts from a bounded-system capture (cell 3):
 /// the owned caller exactly once with the pinned A/B edges, and no
 /// foreign caller borrowing an owned module. Foreign-only activity is
 /// system-capture honesty, never owned evidence.
-/// STUB: always fails until the system primary validator lands.
 fn primary_facts_system(
     document: &serde_json::Value,
     owned_pid: u32,
     k: u64,
 ) -> Result<serde_json::Value> {
-    let _ = (document, owned_pid, k);
-    bail!("wrap-scope stub: system primary validator not implemented")
+    let caller = primary_system_caller(document, owned_pid)?;
+    let (facts, modules) = primary_facts_core(document, owned_pid, k, caller)?;
+    check_owned_module_exclusivity(document, owned_pid, &modules)?;
+    Ok(facts)
 }
 
 /// Post-run exact gap verification on the complete event stream (the

@@ -8751,18 +8751,12 @@ mod promotion_driver_tests {
             driver.semantic.is_none(),
             "terminal loss disposes: the lane releases despite the refused cut"
         );
-        let subjects: Vec<String> = gaps(&mut driver)
-            .iter()
-            .map(|(subject, _)| subject.clone())
-            .collect();
-        assert!(
-            subjects
-                .iter()
-                .any(|subject| subject == "semantic batch refused for an ended domain"),
-            "the nonempty Finish refuses through the audited path: {subjects:?}"
-        );
         // The refused Stopped still terminates existing claims: the
         // open operation ends unknown while the namespace still stands.
+        // This state check runs BEFORE gaps(): that helper publishes
+        // staged mutations, so the twin must observe the production
+        // publication order — never perform the publication whose
+        // ordering it verifies.
         let (lossy, stopped, started, completed, unknown, state) = {
             let registry = driver.coordinator.registry();
             let edge = registry
@@ -8791,6 +8785,16 @@ mod promotion_driver_tests {
             state,
             InstanceLifecycle::Uncertain,
             "the claim is unknown before its namespace disposes"
+        );
+        let subjects: Vec<String> = gaps(&mut driver)
+            .iter()
+            .map(|(subject, _)| subject.clone())
+            .collect();
+        assert!(
+            subjects
+                .iter()
+                .any(|subject| subject == "semantic batch refused for an ended domain"),
+            "the nonempty Finish refuses through the audited path: {subjects:?}"
         );
         // The retire then disposes the refused shadow without
         // restoring positives — over claims already unknown.

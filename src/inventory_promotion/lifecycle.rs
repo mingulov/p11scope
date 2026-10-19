@@ -636,6 +636,14 @@ pub(crate) struct SelectedLifecycleService {
     /// the owner die. Production always retains.
     #[cfg(test)]
     retention_disabled: bool,
+    /// Tests-only post-send rendezvous: the next `start` moves this
+    /// sender into its worker, which signals after its outcome send
+    /// resolves (delivered, or settled after a failed late send),
+    /// so retention twins check survival after
+    /// delivery/destruction — never on a naked sleep past the
+    /// job's own pre-send signal.
+    #[cfg(test)]
+    post_send_hook: Option<std::sync::mpsc::Sender<()>>,
 }
 
 impl SelectedLifecycleService {
@@ -645,6 +653,8 @@ impl SelectedLifecycleService {
             unproved: Vec::new(),
             #[cfg(test)]
             retention_disabled: false,
+            #[cfg(test)]
+            post_send_hook: None,
         }
     }
 
@@ -654,6 +664,17 @@ impl SelectedLifecycleService {
     #[cfg(test)]
     pub(crate) fn disable_retention_for_test(&mut self) {
         self.retention_disabled = true;
+    }
+
+    /// Arm the post-send rendezvous for the next `start`: the
+    /// worker signals the returned receiver after its outcome send
+    /// resolves. Consumed by `start`; a refused start keeps the
+    /// armed hook for the next attempt.
+    #[cfg(test)]
+    pub(crate) fn observe_post_send_for_test(&mut self) -> std::sync::mpsc::Receiver<()> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.post_send_hook = Some(tx);
+        rx
     }
 
     /// Process-lifetime custody for one teardown owner. Production
@@ -688,6 +709,8 @@ impl SelectedLifecycleService {
         if !self.is_idle() {
             return Err(PromotionRefusal::Busy);
         }
+        #[cfg(test)]
+        let post_send_hook = self.post_send_hook.take();
         let (tx, rx) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
             let outcome = job();
@@ -697,6 +720,13 @@ impl SelectedLifecycleService {
                 // effort instead of dropping a live native owner.
                 // Best effort only: teardown already gave up polling.
                 settle_outcome_best_effort(returned.0);
+            }
+            // Tests-only: the send resolved (delivered, or settled
+            // after the late send failed), so a twin waiting here
+            // observes survival after delivery/destruction.
+            #[cfg(test)]
+            if let Some(hook) = post_send_hook {
+                let _ = hook.send(());
             }
         });
         #[cfg(test)]
@@ -1724,6 +1754,7 @@ mod tests {
         let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
         let (_promoter, request) = taken_request_for_test();
         let mut service = SelectedLifecycleService::new();
+        let sent_rx = service.observe_post_send_for_test();
         service
             .start(request, capacity(), stub_source(None).0, move || {
                 let outcome = PreparationOutcome::Failed(
@@ -1750,14 +1781,18 @@ mod tests {
         );
         // The probe observes the specific outcome surviving — whether
         // retained directly (delivered) or through the retained
-        // channel (late send). The job-done rendez-vous plus a
-        // settle window rules out observing a job that has not run
-        // yet: past that window a broken retention would already
-        // have settled and destroyed the outcome.
+        // channel (late send). The job-done signal fires before the
+        // wrapper's outcome send, so the twin also waits on the
+        // post-send rendezvous: past it a descheduled worker no
+        // longer owns the probe, and a broken retention would
+        // already have settled and destroyed the outcome. No naked
+        // sleep gates the survival check.
         done_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("the job builds its outcome");
-        std::thread::sleep(Duration::from_millis(200));
+        sent_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the wrapper's outcome send resolves");
         assert!(
             weak.upgrade().is_some(),
             "the destruction probe survives: the specific outcome was retained, not just recorded"
@@ -1811,6 +1846,7 @@ mod tests {
         let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
         let (_promoter, request) = taken_request_for_test();
         let mut service = SelectedLifecycleService::new();
+        let sent_rx = service.observe_post_send_for_test();
         let (gate, release) = std::sync::mpsc::channel::<()>();
         service
             .start(request, capacity(), stub_source(None).0, move || {
@@ -1835,12 +1871,17 @@ mod tests {
         // End-to-end channel liveness: the released worker's late
         // send must land in the retained channel instead of failing
         // into the settle-and-drop path. The probe rides the outcome
-        // through the real channel — no marker.
+        // through the real channel — no marker. The job-done signal
+        // fires before the wrapper's outcome send, so the twin waits
+        // on the post-send rendezvous instead of a naked sleep: past
+        // it a descheduled worker no longer owns the probe.
         gate.send(()).expect("the detached worker still exits");
         done_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("the worker builds its outcome");
-        std::thread::sleep(Duration::from_millis(200));
+        sent_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the wrapper's outcome send resolves");
         assert!(
             weak.upgrade().is_some(),
             "the late send lands in the retained channel: the outcome survives"

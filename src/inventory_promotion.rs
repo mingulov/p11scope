@@ -34,6 +34,17 @@ pub(crate) use state::{
     CaptureId, PromotionCancel, PromotionControl, PromotionNote, PromotionPair, PromotionRefusal,
     PromotionState, PromotionStatusUpdate, RequestId, ViewRevision,
 };
+
+pub(crate) mod lifecycle;
+// STAGED (DR37): the driver names these from taken requests; until its
+// wiring lands the re-export is unused.
+#[allow(unused_imports)]
+pub(crate) use lifecycle::{
+    LifecycleEvent, NativeActivationRefusal, NativeActivationSource, NativeCasReceipt,
+    NativeCompletionSource, PendingInstall, PreparationBundle, PreparationOutcome,
+    ProofMintRefusal, SelectedActivationBinding, SelectedActivationProof, SelectedLifecycleService,
+    SessionNativeCompletion, validate_subset_shape,
+};
 // STAGED (DR37): named by tests today; the runtime owner names them from taken requests.
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use state::{PromotionEnd, PromotionOutcome};

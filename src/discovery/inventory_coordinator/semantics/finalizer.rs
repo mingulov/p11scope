@@ -15,6 +15,15 @@ pub(in crate::discovery::engine::inventory_coordinator) struct SessionFinalizerS
     pub(super) h3_pending: Option<H3DispositionEvidence>,
     pub(super) h3_acked_below: u64,
     pub(super) pending_drop: Option<(u64, bool)>,
+    /// The namespace's first admitted call (D9): the seal grant's
+    /// association proof, set once at finalize, borrowed (never
+    /// taken) by each seal mint. The grant proves the
+    /// Session-stable domain↔EVENTS association, so one proof
+    /// serves every quantum including quiet ones; per-quantum
+    /// freshness comes from the retained quantum's own bindings.
+    /// Dropped with the namespace at retire: no cross-domain reuse.
+    pub(super) seal_admission:
+        Option<crate::discovery::caller_registry::instance_input::AdmittedInstanceCall>,
 }
 
 impl SessionFinalizerState {
@@ -27,6 +36,7 @@ impl SessionFinalizerState {
             h3_pending: None,
             h3_acked_below: 0,
             pending_drop: None,
+            seal_admission: None,
         }
     }
 

@@ -8807,6 +8807,202 @@ pub(crate) mod tests {
         );
     }
 
+    /// (marker_min, lowered_soft) for the lowered-limit twins: a high
+    /// marker placed above the lowered soft limit, derived from the
+    /// current limit so the twins run wherever the suite runs (the
+    /// typical soft limit is 1024, giving marker 512 under limit 256).
+    fn lowered_limit_pair() -> (libc::c_int, libc::rlim_t) {
+        let mut current = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit only writes the owned struct.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut current) },
+            0
+        );
+        assert!(
+            current.rlim_cur >= 48,
+            "the suite needs headroom above a lowered fd limit"
+        );
+        let marker = current.rlim_cur.saturating_sub(8).min(512) as libc::c_int;
+        (marker, marker as libc::rlim_t / 2)
+    }
+
+    /// Duplicates `file` onto a descriptor at or above `min_fd` with
+    /// CLOEXEC cleared (mimicking flock(1)'s lock fd). Must run
+    /// BEFORE the soft limit drops: new fds cannot be created above
+    /// it, while existing ones survive the lowering — the gap under
+    /// test.
+    fn dup_high_marker(file: &std::fs::File, min_fd: libc::c_int) -> std::os::fd::OwnedFd {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        // SAFETY: fcntl names our own open marker and returns a fresh
+        // owned fd, which FromRawFd then owns exactly once.
+        let high = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, min_fd) };
+        assert!(
+            high >= min_fd,
+            "the marker must sit above the lowered soft limit"
+        );
+        assert_eq!(unsafe { libc::fcntl(high, libc::F_SETFD, 0) }, 0);
+        unsafe { std::os::fd::OwnedFd::from_raw_fd(high) }
+    }
+
+    /// Guards a temporarily lowered soft RLIMIT_NOFILE, restoring the
+    /// saved limit on demand and on drop (the drop path never panics,
+    /// so a failing twin cannot abort the harness during unwinding).
+    struct LoweredFdLimit {
+        saved: libc::rlimit,
+        restored: bool,
+    }
+
+    impl LoweredFdLimit {
+        fn lower_to(soft: libc::rlim_t) -> Self {
+            let mut saved = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // SAFETY: getrlimit/setrlimit only read and write the
+            // owned structs; the soft limit is lowered, never raised
+            // past the retained hard limit.
+            assert_eq!(
+                unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut saved) },
+                0
+            );
+            assert!(
+                saved.rlim_cur > soft,
+                "the lowered limit must sit below the current one"
+            );
+            let lowered = libc::rlimit {
+                rlim_cur: soft,
+                rlim_max: saved.rlim_max,
+            };
+            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lowered) }, 0);
+            Self {
+                saved,
+                restored: false,
+            }
+        }
+
+        fn restore(&mut self) {
+            if !self.restored {
+                // SAFETY: the saved limit was read from this process
+                // and only ever lowers-then-restores the soft ceiling.
+                assert_eq!(
+                    unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &self.saved) },
+                    0
+                );
+                self.restored = true;
+            }
+        }
+    }
+
+    impl Drop for LoweredFdLimit {
+        fn drop(&mut self) {
+            if !self.restored {
+                // SAFETY: as in restore; errors are ignored so a
+                // panic cannot turn into an abort here.
+                let _ = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &self.saved) };
+                self.restored = true;
+            }
+        }
+    }
+
+    #[test]
+    fn rust_spawn_scrubs_fds_above_lowered_limit() {
+        // Lowered-limit twin for the Rust pre-exec scrub: a marker fd
+        // opened BEFORE the soft limit drops survives the lowering,
+        // and an rlimit-bounded sweep then misses it. The shell
+        // fixture performs no scrub of its own, so only
+        // OwnedStoppedChild::harden_spawn stands between the marker
+        // and the child. Fails pre-fix with the marker inherited.
+        use crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild;
+        use std::os::fd::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let probe = dir.path().join("high-marker");
+        std::fs::write(&probe, b"marker").unwrap();
+        let held = std::fs::File::open(&probe).unwrap();
+        let (marker_min, lowered) = lowered_limit_pair();
+        let high = dup_high_marker(&held, marker_min);
+        let target = std::fs::read_link(format!("/proc/self/fd/{}", high.as_raw_fd())).unwrap();
+        let mut limit = LoweredFdLimit::lower_to(lowered);
+        // The child's table is fixed at spawn, so the suite's limit
+        // is restored inside the handshake: concurrent tests never
+        // observe the lowered ceiling.
+        let child = OwnedStoppedChild::spawn_stopped(
+            std::process::Command::new("/bin/sh")
+                .args(["-c", "kill -STOP $$; exit 99"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null()),
+            |_pid| limit.restore(),
+        );
+        drop(limit);
+        // A stopped child still answers /proc: compare file targets,
+        // never bare numbers (the child's own fds may reuse them).
+        let mut leaked = Vec::new();
+        for entry in std::fs::read_dir(format!("/proc/{}/fd", child.id())).unwrap() {
+            if std::fs::read_link(entry.unwrap().path()).unwrap() == target {
+                leaked.push(target.clone());
+            }
+        }
+        assert!(
+            leaked.is_empty(),
+            "high marker fd leaked past the Rust scrub: {leaked:?}"
+        );
+    }
+
+    #[test]
+    fn catalog_driver_scrubs_fds_above_lowered_limit() {
+        // Lowered-limit twin for the C startup scrub: the driver is
+        // spawned WITHOUT the Rust hardening, so only its own live
+        // table sweep stands between the high marker and the fixture.
+        // Fails pre-fix with the marker inherited.
+        use std::os::fd::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let (provider, driver) = build_scoped_pair(dir.path());
+        let probe = dir.path().join("high-marker");
+        std::fs::write(&probe, b"marker").unwrap();
+        let held = std::fs::File::open(&probe).unwrap();
+        let (marker_min, lowered) = lowered_limit_pair();
+        let high = dup_high_marker(&held, marker_min);
+        let target = std::fs::read_link(format!("/proc/self/fd/{}", high.as_raw_fd())).unwrap();
+        let ready = dir.path().join("ready");
+        let mut limit = LoweredFdLimit::lower_to(lowered);
+        // The driver inherits the lowered limit at fork; restoring
+        // the suite's limit right after spawn cannot reopen what its
+        // startup sweep already decided.
+        let child = std::process::Command::new(&driver)
+            .arg("--ready")
+            .arg(&ready)
+            .arg("--call")
+            .arg(&provider)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        limit.restore();
+        let child = ChildReaper(child);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "unhardened driver did not finish startup"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let mut leaked = Vec::new();
+        for entry in std::fs::read_dir(format!("/proc/{}/fd", child.0.id())).unwrap() {
+            if std::fs::read_link(entry.unwrap().path()).unwrap() == target {
+                leaked.push(target.clone());
+            }
+        }
+        assert!(
+            leaked.is_empty(),
+            "high marker fd leaked past the C scrub: {leaked:?}"
+        );
+    }
+
     /// Builds the scoped provider/driver pair for the orphan-policy twins.
     fn build_scoped_pair(dir: &std::path::Path) -> (PathBuf, PathBuf) {
         let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

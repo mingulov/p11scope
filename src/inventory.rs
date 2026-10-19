@@ -2019,6 +2019,29 @@ impl ClassicDriver<'_> {
     }
 }
 
+impl Drop for ClassicDriver<'_> {
+    /// Teardown retention: a held install handoff reclaims into the
+    /// service for genuine disposal, and the service's own drop
+    /// retains it for process lifetime. A handoff the service will
+    /// not take back (unreachable: install implies outstanding)
+    /// retains its lane directly rather than stranding it.
+    fn drop(&mut self) {
+        let Some(pending) = self.pending_install.take() else {
+            return;
+        };
+        if let Err(pending) = self.lifecycle.reclaim_install(
+            pending,
+            Some(crate::inventory_promotion::PromotionEnd::RunStopped),
+        ) {
+            let (_proof, lane, capacity) = pending.into_parts();
+            drop(capacity);
+            crate::inventory_promotion::lifecycle::SelectedLifecycleService::retain_lane_for_process_exit(
+                lane,
+            );
+        }
+    }
+}
+
 fn commit_semantic_finish(
     coordinator: &mut InventoryCoordinator<OsProcessSource>,
     lane: &mut crate::inventory_semantics::AttestedSemanticLane,

@@ -999,6 +999,21 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         &self.joint_capture
     }
 
+    /// Deliver one H8 seal to an instance's Joint feed through the
+    /// capture owner's ledger: the test-side seal tick, borrowing the
+    /// registry and the owner disjointly exactly like publication.
+    /// Production has no grants until the joint seal tick lands.
+    #[cfg(test)]
+    pub(crate) fn deliver_joint_seal_through_owner(
+        &mut self,
+        id: crate::discovery::caller_registry::instance_input::RegistryInstanceId,
+        seal: &crate::semantics_objects::journal::SealSuccess,
+        model: &crate::semantics_objects::ObjectSemantics,
+    ) -> crate::semantics_key_use::SealApplyOutcome {
+        let ledger = self.joint_capture.ledger_mut();
+        self.registry.deliver_joint_seal(id, seal, model, ledger)
+    }
+
     /// Stages one scope-level gap (no caller, module or PID) that
     /// publishes with the next pass: the run-wide PID-numbering mismatch
     /// (`pidns::numbering_gap`, review F4) is the only producer.

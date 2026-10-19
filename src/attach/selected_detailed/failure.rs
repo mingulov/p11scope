@@ -50,6 +50,16 @@ impl SelectedPreparationFailure {
         }
     }
 
+    /// Tests-only settled failure: the exact pre-producer state
+    /// (`before_links`: no Session, cleanup already settled), so the
+    /// DR37 service's disposal polling and terminal statuses run
+    /// without native maps. Production failures always retain or
+    /// settle real owners.
+    #[cfg(test)]
+    pub(crate) fn scripted_settled() -> Self {
+        Self::before_links(anyhow::anyhow!("scripted pre-link preparation failure"))
+    }
+
     pub(crate) fn semantic_refusal(&self) -> SemanticRefusal {
         self.reason
     }

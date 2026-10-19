@@ -191,7 +191,7 @@ pub(crate) struct AdmittedInstance {
     boundary: Option<SemanticPosition>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum ReductionPermission {
     CurrentContinuity,
     HistoricalOnly(InstanceReason),
@@ -223,6 +223,11 @@ impl JournalInvocationIdentity {
     }
 }
 
+/// Clone: the H8 finalizer retains the namespace's first admitted call
+/// as the seal grant's association proof (D9); the staged registry
+/// mutation consumes the original. Same quantum, same genuine
+/// admission; the seal only reads its binding.
+#[derive(Clone)]
 pub(crate) struct AdmittedInstanceCall {
     key: InstanceKey,
     caller: CallerId,

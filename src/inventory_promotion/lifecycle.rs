@@ -1,0 +1,1302 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
+//! DR37 selected-lane lifecycle: the activation proof, the preparation
+//! worker service and the native-authority boundaries.
+#![cfg_attr(not(test), allow(dead_code))] // STAGED (DR37): reached once the driver polls the service.
+//!
+//! Decision record (joint DR37/H8 implementer; rationale beside each
+//! binding site):
+//!
+//! * D1 seal gate: no unification flag. [`JointSealTick`](crate::semantics_objects::journal::JointSealTick)
+//!   keeps `allow(dead_code)` + test-only driving until a live-loop
+//!   caller exists; a flag nobody sets would be dead scaffolding.
+//! * D2 worker model: one worker thread per preparation (this service),
+//!   polled from the driver tick. Preparation does blocking BPF loads
+//!   and 10ms sleep loops (`selected_detailed.rs` fallback poll), so a
+//!   tick state machine cannot host it. Precedent: `MetadataLane`
+//!   (`service_caller_metadata` + bounded join in
+//!   `finish_caller_metadata_cleanup`).
+//! * D3 activation CAS: `2 == ACTIVE` holds by implication
+//!   (`StateControl::close` CASes `2 -> TERMINAL`), but the joint lane
+//!   authors neither the constant nor the CAS: the native owner owns
+//!   the state machine single-authored. This module defines only the
+//!   receipt ([`NativeCasReceipt`]) and the minter interface
+//!   ([`NativeActivationSource`]) the joint service consumes.
+//! * D4 completion minter: the native owner (Q/drain bounds, scrub,
+//!   joined detach). This module defines the opaque
+//!   [`SessionNativeCompletion`] and [`NativeCompletionSource`]; the
+//!   native lane implements the minter.
+//! * D5 A->B transfer: `mem::replace` of the coordinator's
+//!   `joint_capture` field with a fresh owner, never an in-place
+//!   reset. The single proof-gated entry is
+//!   `InventoryCoordinator::retire_joint_domain`.
+//! * D10 validation: new narrow checks, not `consume_semantic_admission`:
+//!   per-pair request re-validation is a different shape from
+//!   per-caller admission, and reuse would manufacture
+//!   candidate/prepared values. The driver composes three genuine
+//!   pre-start gates: [`validate_subset_shape`] (pure: the bundle's
+//!   conversion envelope names exactly one provider object),
+//!   `PromotionImageBaseline::matches_request` (pre-tested bundle
+//!   agreement), and the coordinator's
+//!   `validate_selected_pair_liveness` (live registry re-check
+//!   returning the provider key for the subset's
+//!   `proves_provider_module`). The native permit validation stays
+//!   the authority downstream.
+//!
+//! Genuine behavior only: the worker runs the real closed
+//! preparation (via [`PreparationBundle::prepare`]); the sealed
+//! conversion runs on the consuming thread through the sanctioned
+//! one-way handoff; failures dispose through the real joined-cleanup
+//! polls; no status `Active` is emitted without a genuine coordinator
+//! install; no completion is manufactured.
+
+use super::PromotionRequest;
+use super::state::{
+    PromotionEnd, PromotionOutcome, PromotionPair, PromotionRefusal, PromotionStatusUpdate,
+    RequestId,
+};
+use crate::attach::capture::NativeDomainId;
+use crate::attach::selected_detailed::baseline::PromotionImageBaseline;
+use crate::attach::selected_detailed::{
+    PreparedSelectedSession, SelectedConstructionPermit, SelectedPreparationFailure,
+};
+use crate::attach::{BackendSelection, Scope, Session};
+use crate::discovery::engine::inventory_coordinator::semantics::PromotionInstallCapacity;
+use crate::inventory_semantics::AttestedSubset;
+use crate::inventory_semantics::selected::ProvisionalSelectedLane;
+use p11scope_ebpf_common::ImageIdentity;
+use std::sync::Arc;
+
+/// The agreement point between the native permit, the CAS receipt and
+/// the activation proof: the exact native domain, attachment
+/// generation and frozen image the activation binds. `Copy`: values,
+/// never authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SelectedActivationBinding {
+    domain: NativeDomainId,
+    generation: u64,
+    image: ImageIdentity,
+}
+
+impl SelectedActivationBinding {
+    pub(crate) fn new(domain: NativeDomainId, generation: u64, image: ImageIdentity) -> Self {
+        Self {
+            domain,
+            generation,
+            image,
+        }
+    }
+
+    /// Read the binding off a live construction permit. The permit's
+    /// own `validate` remains the authority; this only projects the
+    /// agreed values for receipt/proof matching.
+    pub(crate) fn of_permit(permit: &SelectedConstructionPermit) -> Self {
+        Self {
+            domain: permit.domain(),
+            generation: permit.generation(),
+            image: permit.image(),
+        }
+    }
+
+    pub(crate) fn domain(self) -> NativeDomainId {
+        self.domain
+    }
+
+    pub(crate) fn generation(self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) fn image(self) -> ImageIdentity {
+        self.image
+    }
+}
+
+/// The native owner's activation receipt: proves the selected
+/// `CLOSED -> ACTIVE` CAS ran exactly once for this binding, with
+/// readback. Opaque and move-only (no `Clone`, no numeric
+/// constructor): only the native [`NativeActivationSource`]
+/// implementation mints production receipts; tests script them.
+pub(crate) struct NativeCasReceipt {
+    binding: SelectedActivationBinding,
+}
+
+impl NativeCasReceipt {
+    pub(crate) fn binding(&self) -> SelectedActivationBinding {
+        self.binding
+    }
+
+    pub(crate) fn matches(&self, binding: SelectedActivationBinding) -> bool {
+        self.binding == binding
+    }
+
+    /// Tests-only receipt: the binding checks run without native maps.
+    /// Production construction stays inside the native minter.
+    #[cfg(test)]
+    pub(crate) fn scripted(binding: SelectedActivationBinding) -> Self {
+        Self { binding }
+    }
+}
+
+impl std::fmt::Debug for NativeCasReceipt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("NativeCasReceipt(<retained>)")
+    }
+}
+
+/// Why the native activation CAS minted nothing. The joint service
+/// maps every variant to `PromotionRefusal::ActivationFailed`; the
+/// variants stay distinct so native tests pin the state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativeActivationRefusal {
+    /// The state cell was not `CLOSED` (already active, terminal, or
+    /// never published): the CAS ran and failed closed.
+    NotClosed,
+    /// The live native owner disagrees with the expected binding.
+    BindingMismatch,
+}
+
+/// The exact interface the joint service needs from the native
+/// activation minter (D3). The native lane implements this in attach
+/// code, where the `SELECTED_DETAILED_STATE` cell lives: exactly one
+/// `CLOSED -> ACTIVE` CAS with readback per accepted request, after
+/// validation, before install. Failure mints nothing.
+pub(crate) trait NativeActivationSource: Send {
+    fn activate(
+        &mut self,
+        session: &Session,
+        expected: &SelectedActivationBinding,
+    ) -> Result<NativeCasReceipt, NativeActivationRefusal>;
+}
+
+/// The native owner's domain-completion proof: Q/drain bounds proved,
+/// object-start scrubbed, producer detach really joined. Opaque and
+/// move-only: only the native [`NativeCompletionSource`]
+/// implementation mints production completions, after genuine
+/// disposal; tests script them. Consumed by value by
+/// `InventoryCoordinator::retire_joint_domain`; a second retire with
+/// the same completion is a compile-time move error.
+pub(crate) struct SessionNativeCompletion {
+    domain: NativeDomainId,
+}
+
+impl SessionNativeCompletion {
+    pub(crate) fn domain(&self) -> NativeDomainId {
+        self.domain
+    }
+
+    /// Tests-only completion: retire-gate checks run without native
+    /// disposal. Production construction stays in the native minter.
+    #[cfg(test)]
+    pub(crate) fn scripted(domain: NativeDomainId) -> Self {
+        Self { domain }
+    }
+}
+
+impl std::fmt::Debug for SessionNativeCompletion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SessionNativeCompletion(<retained>)")
+    }
+}
+
+/// The exact interface the joint driver needs from the native
+/// completion minter (D4): poll whether one domain's native disposal
+/// genuinely completed. `None` means pending (or unknown): the driver
+/// holds B and polls again; it never manufactures a completion, never
+/// resets history and never recycles a ticket.
+pub(crate) trait NativeCompletionSource: Send {
+    fn poll_completion(&mut self, domain: NativeDomainId) -> Option<SessionNativeCompletion>;
+}
+
+/// Why proof minting refused. Every variant leaves the lane
+/// uninstalled and the capacity refunded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProofMintRefusal {
+    /// The CAS receipt names another binding than the prepared lane.
+    CasMismatch,
+}
+
+/// The move-only activation proof: the outstanding request, the exact
+/// pair it promotes, the agreed native binding and the consumed CAS
+/// receipt. Minted only by [`SelectedActivationProof::mint`] after
+/// validation plus a matching native receipt; consumed by value by
+/// the coordinator install entry. No `Clone`, no numeric constructor.
+pub(crate) struct SelectedActivationProof {
+    request: RequestId,
+    pair: PromotionPair,
+    binding: SelectedActivationBinding,
+    cas: NativeCasReceipt,
+}
+
+impl SelectedActivationProof {
+    /// Mint the proof for a taken request over a prepared lane: the
+    /// receipt must name exactly the lane's binding (domain,
+    /// generation and image). A foreign, stale or mismatched receipt
+    /// refuses with nothing installed.
+    pub(crate) fn mint(
+        request: &PromotionRequest,
+        lane: SelectedActivationBinding,
+        cas: NativeCasReceipt,
+    ) -> Result<Self, ProofMintRefusal> {
+        if !cas.matches(lane) {
+            return Err(ProofMintRefusal::CasMismatch);
+        }
+        Ok(Self {
+            request: request.id(),
+            pair: PromotionPair::new(request.caller().0, request.provider().0),
+            binding: lane,
+            cas,
+        })
+    }
+
+    pub(crate) fn request(&self) -> RequestId {
+        self.request
+    }
+
+    pub(crate) fn pair(&self) -> PromotionPair {
+        self.pair
+    }
+
+    pub(crate) fn binding(&self) -> SelectedActivationBinding {
+        self.binding
+    }
+
+    /// Whether this proof authorizes installing a lane with this
+    /// binding. The install entry calls this before moving anything.
+    pub(crate) fn matches_lane(&self, lane: SelectedActivationBinding) -> bool {
+        self.binding == lane
+    }
+}
+
+impl std::fmt::Debug for SelectedActivationProof {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SelectedActivationProof")
+            .field("request", &self.request)
+            .field("pair", &self.pair)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The resolved preparation inputs for one taken request: two subset
+/// mints from the same retained sources (`attach` seals the Session
+/// attachment and is consumed by the seal; `convert` stays the lane's
+/// conversion envelope), the pre-view image baseline, the original
+/// custody, the parent scope, the backend selection and the read
+/// window. Built by the pair resolver (carry: manifest permission
+/// lookup per clicked pair); the driver validates the bundle against
+/// the request, then the worker consumes it.
+pub(crate) struct PreparationBundle {
+    pub(crate) attach: AttestedSubset,
+    pub(crate) convert: AttestedSubset,
+    pub(crate) baseline: PromotionImageBaseline,
+    pub(crate) original: Arc<crate::process::PidPin>,
+    pub(crate) parent: Scope,
+    pub(crate) backend: BackendSelection,
+    pub(crate) window: crate::attach::capture::ReadWindow,
+}
+
+impl std::fmt::Debug for PreparationBundle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PreparationBundle(<retained>)")
+    }
+}
+
+/// What one preparation produced. `Ready` carries the genuine
+/// closed preparation plus the conversion envelope; the sealed
+/// conversion (`into_provisional_lane`) runs on the consuming thread,
+/// which is tick-safe (pure H0 init plus fast map-read checks) and
+/// keeps the one-way handoff intact. `Failed` carries the real
+/// retained failure owner, whose cleanup the service polls to a
+/// joined receipt. Both variants are `Send` in every build: no H0 and
+/// no substituted test I/O cross the worker boundary.
+pub(crate) enum PreparationOutcome {
+    Ready(PreparedSelectedWork),
+    Failed(SelectedPreparationFailure),
+}
+
+/// The worker's sealed product: the closed preparation (Session,
+/// attachment and permit, no H0 yet) plus the conversion envelope.
+/// The consumer converts exactly once via the sanctioned one-way
+/// handoff; this type offers no parts, no callbacks and no session
+/// access of its own.
+pub(crate) struct PreparedSelectedWork {
+    prepared: PreparedSelectedSession,
+    convert: AttestedSubset,
+}
+
+impl PreparedSelectedWork {
+    /// Run the sanctioned one-way conversion into the sealed
+    /// provisional lane. A refusal retains its Session in the failure
+    /// owner for joined cleanup.
+    fn into_provisional_lane(self) -> Result<ProvisionalSelectedLane, SelectedPreparationFailure> {
+        self.prepared.into_provisional_lane(self.convert)
+    }
+}
+
+impl std::fmt::Debug for PreparationOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ready(_) => f.write_str("PreparationOutcome::Ready(<retained>)"),
+            Self::Failed(failure) => f
+                .debug_tuple("PreparationOutcome::Failed")
+                .field(&failure.semantic_refusal())
+                .field(&failure.cleanup_status())
+                .finish(),
+        }
+    }
+}
+
+impl PreparationBundle {
+    /// Run the real closed preparation on the worker: session start,
+    /// bootstrap, identity completion and attachment seal (which
+    /// validates the permit against the live owner internally). The
+    /// sealed conversion runs consumer-side (see
+    /// [`PreparationOutcome`]).
+    pub(crate) fn prepare(self) -> PreparationOutcome {
+        let convert = self.convert;
+        match PreparedSelectedSession::prepare(
+            self.attach,
+            self.baseline,
+            self.original,
+            self.parent,
+            self.backend,
+            self.window,
+        ) {
+            Ok(prepared) => PreparationOutcome::Ready(PreparedSelectedWork { prepared, convert }),
+            Err(failure) => PreparationOutcome::Failed(failure),
+        }
+    }
+
+    /// The conversion envelope the driver validates against the taken
+    /// request before the worker consumes the bundle.
+    pub(crate) fn convert_subset(&self) -> &AttestedSubset {
+        &self.convert
+    }
+}
+
+/// One lifecycle event for the driver: a validated status update to
+/// apply to the mailbox, or a proof-gated install handoff. The driver
+/// applies statuses through `set_promotion_status` (stale/foreign
+/// updates return `None` there) and records every terminal transition
+/// in the normal bounded report path; it installs through the
+/// coordinator install entry, which consumes the proof.
+pub(crate) enum LifecycleEvent {
+    Status(PromotionStatusUpdate),
+    Install(PendingInstall),
+}
+
+impl std::fmt::Debug for LifecycleEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Status(outcome) => f
+                .debug_tuple("LifecycleEvent::Status")
+                .field(outcome)
+                .finish(),
+            Self::Install(pending) => f
+                .debug_tuple("LifecycleEvent::Install")
+                .field(pending)
+                .finish(),
+        }
+    }
+}
+
+/// A proof-gated install handoff held by the driver while the slot is
+/// occupied: the minted proof, the sealed lane and the pre-reserved
+/// capacity. Opaque: the driver either installs it (consuming all
+/// three through the coordinator entry) or reclaims it into the
+/// service for genuine disposal; it can neither split nor forge one.
+pub(crate) struct PendingInstall {
+    proof: SelectedActivationProof,
+    lane: ProvisionalSelectedLane,
+    capacity: PromotionInstallCapacity,
+}
+
+impl PendingInstall {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        SelectedActivationProof,
+        ProvisionalSelectedLane,
+        PromotionInstallCapacity,
+    ) {
+        (self.proof, self.lane, self.capacity)
+    }
+
+    pub(crate) fn pair(&self) -> PromotionPair {
+        self.proof.pair()
+    }
+}
+
+impl std::fmt::Debug for PendingInstall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingInstall")
+            .field("proof", &self.proof)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Pre-start gate (D10): the bundle's conversion envelope must name
+/// exactly one required provider object, matching what the native
+/// conversion accepts. Empty coverage means no manifest permission
+/// covers the pair; several means the selected endpoints are
+/// ambiguous. Pure: no coordinator state, no native I/O.
+pub(crate) fn validate_subset_shape(subset: &AttestedSubset) -> Result<(), PromotionRefusal> {
+    match subset.required().len() {
+        0 => Err(PromotionRefusal::ManifestUnavailable),
+        1 => Ok(()),
+        _ => Err(PromotionRefusal::EndpointAmbiguous),
+    }
+}
+
+/// How a disposing outcome ends once its cleanup settles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalDisposition {
+    Refused(PromotionRefusal),
+    Ended(PromotionEnd),
+}
+
+impl TerminalDisposition {
+    fn into_outcome(self) -> PromotionOutcome {
+        match self {
+            Self::Refused(reason) => PromotionOutcome::Refused { reason },
+            Self::Ended(reason) => PromotionOutcome::Ended { reason },
+        }
+    }
+}
+
+/// An outcome whose native owner still needs joined disposal: either
+/// the worker's retained failure or a sealed lane that must never
+/// install (cancelled, or CAS/mint/install refused).
+enum DisposingOutcome {
+    Preparation(SelectedPreparationFailure),
+    Lane(ProvisionalSelectedLane),
+}
+
+impl std::fmt::Debug for DisposingOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DisposingOutcome(<retained>)")
+    }
+}
+
+/// A native owner whose cleanup proved nothing: retained for process
+/// lifetime, never retried (mirrors `SelectedPreparationFailure`'s
+/// `Unproved`: neither an empty collection nor `Drop` proves
+/// settlement).
+enum UnprovedOwner {
+    Preparation(SelectedPreparationFailure),
+    Lane(ProvisionalSelectedLane),
+}
+
+enum ServiceState {
+    Idle,
+    Preparing {
+        request: PromotionRequest,
+        capacity: PromotionInstallCapacity,
+        source: Box<dyn NativeActivationSource>,
+        outcome: std::sync::mpsc::Receiver<PreparationOutcome>,
+        worker: Option<std::thread::JoinHandle<()>>,
+        /// Cancel/stop was requested while the worker ran: the CAS is
+        /// skipped and the outcome is disposed, never installed.
+        cancel: Option<PromotionEnd>,
+    },
+    Disposing {
+        request: PromotionRequest,
+        outcome: DisposingOutcome,
+        terminal: TerminalDisposition,
+    },
+    /// The install handoff is in driver hands. The driver confirms
+    /// with [`SelectedLifecycleService::note_installed`] or reclaims
+    /// with [`SelectedLifecycleService::reclaim_install`].
+    Installing {
+        request: PromotionRequest,
+    },
+}
+
+/// The DR37 preparation worker service (D2): one worker thread per
+/// preparation, polled from the driver tick. Single-flight: a second
+/// `start` while busy refuses with [`PromotionRefusal::Busy`].
+///
+/// State flow: `Idle -> Preparing -> Installing -> Idle`, with
+/// `Disposing` between any refused/cancelled outcome and its terminal
+/// status. Every terminal status is emitted exactly once, from the
+/// held request, after genuine disposal; `Active` is emitted only via
+/// `note_installed`, after the driver reports a genuine coordinator
+/// install.
+pub(crate) struct SelectedLifecycleService {
+    state: ServiceState,
+    unproved: Vec<UnprovedOwner>,
+}
+
+impl SelectedLifecycleService {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: ServiceState::Idle,
+            unproved: Vec::new(),
+        }
+    }
+
+    pub(crate) fn is_idle(&self) -> bool {
+        matches!(self.state, ServiceState::Idle)
+    }
+
+    /// Start preparing one taken request on the worker thread. The
+    /// capacity was reserved before the CAS (it refunds by drop on
+    /// every refused path); the source mints the native CAS receipt
+    /// after the worker delivers a closed preparation and the sealed
+    /// conversion runs consumer-side. Refuses `Busy` unless idle:
+    /// preparations never overlap.
+    pub(crate) fn start(
+        &mut self,
+        request: PromotionRequest,
+        capacity: PromotionInstallCapacity,
+        source: Box<dyn NativeActivationSource>,
+        job: impl FnOnce() -> PreparationOutcome + Send + 'static,
+    ) -> Result<(), PromotionRefusal> {
+        if !self.is_idle() {
+            return Err(PromotionRefusal::Busy);
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let outcome = job();
+            if let Err(returned) = tx.send(outcome) {
+                // The service is gone (process teardown past the
+                // stop bound): settle in-worker on a bounded best
+                // effort instead of dropping a live native owner.
+                // Best effort only: teardown already gave up polling.
+                settle_outcome_best_effort(returned.0);
+            }
+        });
+        self.state = ServiceState::Preparing {
+            request,
+            capacity,
+            source,
+            outcome: rx,
+            worker: Some(worker),
+            cancel: None,
+        };
+        Ok(())
+    }
+
+    /// Operator cancel or run stop while work is outstanding. A
+    /// preparing worker runs to its genuine end (blocking native work
+    /// cannot be killed), then its outcome is disposed and the end
+    /// confirmed; nothing installs after this call.
+    pub(crate) fn note_cancel(&mut self, end: PromotionEnd) {
+        match &mut self.state {
+            ServiceState::Preparing { cancel, .. } => {
+                *cancel = Some(match (*cancel, end) {
+                    (Some(PromotionEnd::RunStopped), _) | (_, PromotionEnd::RunStopped) => {
+                        PromotionEnd::RunStopped
+                    }
+                    _ => PromotionEnd::Cancelled,
+                });
+            }
+            ServiceState::Disposing { terminal, .. } => {
+                *terminal = match (*terminal, end) {
+                    (TerminalDisposition::Ended(PromotionEnd::RunStopped), _)
+                    | (_, PromotionEnd::RunStopped) => {
+                        TerminalDisposition::Ended(PromotionEnd::RunStopped)
+                    }
+                    _ => TerminalDisposition::Ended(PromotionEnd::Cancelled),
+                };
+            }
+            // Idle holds nothing; Installing already handed the
+            // proof, lane and capacity to the driver, which observes
+            // the stop/cancel itself and reclaims for disposal.
+            ServiceState::Idle | ServiceState::Installing { .. } => {}
+        }
+    }
+
+    /// Poll once (driver tick): reap a delivered worker outcome, run
+    /// the CAS + mint for a sealed lane, advance joined disposal, and
+    /// emit at most one event. Disposal diagnostics sink here; the
+    /// terminal report path carries the finite reason.
+    pub(crate) fn poll(&mut self, out: &mut dyn std::io::Write) -> Option<LifecycleEvent> {
+        // Reap a delivery first, without holding state borrows across
+        // the join and the outcome handling below.
+        let delivery: Option<Option<PreparationOutcome>> = match &mut self.state {
+            ServiceState::Preparing { outcome, .. } => Some(match outcome.try_recv() {
+                Err(std::sync::mpsc::TryRecvError::Empty) => return None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
+                Ok(delivered) => Some(delivered),
+            }),
+            _ => None,
+        };
+        if let Some(delivery) = delivery {
+            let worker = match &mut self.state {
+                ServiceState::Preparing { worker, .. } => worker.take(),
+                _ => unreachable!("delivery implies preparing"),
+            };
+            if let Some(worker) = worker {
+                let _ = worker.join();
+            }
+            return match delivery {
+                // The worker died without delivering (panic or
+                // abort): nothing retained, nothing installed.
+                None => {
+                    let ServiceState::Preparing { request, .. } =
+                        std::mem::replace(&mut self.state, ServiceState::Idle)
+                    else {
+                        unreachable!("delivery implies preparing");
+                    };
+                    let update = request.status_update(PromotionOutcome::Refused {
+                        reason: PromotionRefusal::PreparationFailed,
+                    });
+                    Some(LifecycleEvent::Status(update))
+                }
+                Some(delivered) => {
+                    let cancel = match &self.state {
+                        ServiceState::Preparing { cancel, .. } => *cancel,
+                        _ => unreachable!("delivery implies preparing"),
+                    };
+                    self.outcome_received(delivered, cancel)
+                }
+            };
+        }
+        match &mut self.state {
+            ServiceState::Idle
+            | ServiceState::Installing { .. }
+            | ServiceState::Preparing { .. } => None,
+            ServiceState::Disposing {
+                request,
+                outcome,
+                terminal,
+            } => {
+                let status = match outcome {
+                    DisposingOutcome::Preparation(failure) => failure.poll_cleanup(out),
+                    DisposingOutcome::Lane(lane) => lane.poll_dispose(out),
+                };
+                match status {
+                    crate::attach::selected_detailed::SelectedCleanupStatus::Pending => None,
+                    crate::attach::selected_detailed::SelectedCleanupStatus::Settled => {
+                        let update = request.status_update(terminal.into_outcome());
+                        self.state = ServiceState::Idle;
+                        Some(LifecycleEvent::Status(update))
+                    }
+                    crate::attach::selected_detailed::SelectedCleanupStatus::Unproved => {
+                        // Retain for process lifetime, never retry;
+                        // the terminal status still reports honestly.
+                        let update = request.status_update(terminal.into_outcome());
+                        let old = std::mem::replace(&mut self.state, ServiceState::Idle);
+                        if let ServiceState::Disposing { outcome, .. } = old {
+                            self.unproved.push(match outcome {
+                                DisposingOutcome::Preparation(failure) => {
+                                    UnprovedOwner::Preparation(failure)
+                                }
+                                DisposingOutcome::Lane(lane) => UnprovedOwner::Lane(lane),
+                            });
+                        }
+                        Some(LifecycleEvent::Status(update))
+                    }
+                }
+            }
+        }
+    }
+
+    /// Handle a delivered worker outcome: join done, worker reaped.
+    /// Cancel wins over install: a cancelled outcome is disposed and
+    /// ends, never CASed. Otherwise a sealed lane runs the native CAS
+    /// plus proof mint and hands to the driver for install.
+    fn outcome_received(
+        &mut self,
+        delivered: PreparationOutcome,
+        cancel: Option<PromotionEnd>,
+    ) -> Option<LifecycleEvent> {
+        let ServiceState::Preparing {
+            request,
+            capacity,
+            mut source,
+            ..
+        } = std::mem::replace(&mut self.state, ServiceState::Idle)
+        else {
+            unreachable!("outcome_received runs only while preparing");
+        };
+        // Convert eagerly, even on cancel: the conversion is
+        // tick-safe validation, and its refusal retains the Session
+        // in the same failure owner the disposal poll drains.
+        let converted = match delivered {
+            PreparationOutcome::Ready(work) => work
+                .into_provisional_lane()
+                .map_err(DisposingOutcome::Preparation),
+            PreparationOutcome::Failed(failure) => Err(DisposingOutcome::Preparation(failure)),
+        };
+        if let Some(end) = cancel {
+            drop(capacity);
+            self.state = ServiceState::Disposing {
+                request,
+                outcome: match converted {
+                    Ok(lane) => DisposingOutcome::Lane(lane),
+                    Err(outcome) => outcome,
+                },
+                terminal: TerminalDisposition::Ended(end),
+            };
+            return None;
+        }
+        match converted {
+            Err(outcome) => {
+                drop(capacity);
+                self.state = ServiceState::Disposing {
+                    request,
+                    outcome,
+                    terminal: TerminalDisposition::Refused(PromotionRefusal::PreparationFailed),
+                };
+                None
+            }
+            Ok(lane) => {
+                let binding = lane.activation_binding();
+                let receipt = match lane
+                    .live_session()
+                    .map(|session| source.activate(session, &binding))
+                {
+                    Some(Ok(receipt)) => receipt,
+                    _ => {
+                        drop(capacity);
+                        self.state = ServiceState::Disposing {
+                            request,
+                            outcome: DisposingOutcome::Lane(lane),
+                            terminal: TerminalDisposition::Refused(
+                                PromotionRefusal::ActivationFailed,
+                            ),
+                        };
+                        return None;
+                    }
+                };
+                match SelectedActivationProof::mint(&request, binding, receipt) {
+                    Ok(proof) => {
+                        self.state = ServiceState::Installing { request };
+                        Some(LifecycleEvent::Install(PendingInstall {
+                            proof,
+                            lane,
+                            capacity,
+                        }))
+                    }
+                    Err(_) => {
+                        drop(capacity);
+                        self.state = ServiceState::Disposing {
+                            request,
+                            outcome: DisposingOutcome::Lane(lane),
+                            terminal: TerminalDisposition::Refused(
+                                PromotionRefusal::ActivationFailed,
+                            ),
+                        };
+                        None
+                    }
+                }
+            }
+        }
+    }
+
+    /// The driver installed the handoff through the coordinator entry:
+    /// confirm `Active` for the exact requested pair, from the held
+    /// request. Returns `None` unless an install is outstanding.
+    pub(crate) fn note_installed(&mut self) -> Option<PromotionStatusUpdate> {
+        match std::mem::replace(&mut self.state, ServiceState::Idle) {
+            ServiceState::Installing { request } => {
+                Some(request.status_update(PromotionOutcome::Active {
+                    pair: PromotionPair::new(request.caller().0, request.provider().0),
+                }))
+            }
+            other => {
+                self.state = other;
+                None
+            }
+        }
+    }
+
+    /// The driver could not install (cancelled while held, or the
+    /// install entry refused): reclaim the handoff for genuine lane
+    /// disposal. `end` selects the terminal status once disposal
+    /// settles; `None` reports `ActivationFailed`.
+    pub(crate) fn reclaim_install(
+        &mut self,
+        pending: PendingInstall,
+        end: Option<PromotionEnd>,
+    ) -> Result<(), PendingInstall> {
+        if !matches!(self.state, ServiceState::Installing { .. }) {
+            return Err(pending);
+        }
+        let ServiceState::Installing { request } =
+            std::mem::replace(&mut self.state, ServiceState::Idle)
+        else {
+            unreachable!("installing checked above");
+        };
+        let (proof, lane, capacity) = pending.into_parts();
+        // The proof authorizes exactly the install it just failed;
+        // dropping it consumes that authorization, and dropping the
+        // capacity refunds its precharge. The lane still needs joined
+        // disposal below.
+        drop(proof);
+        drop(capacity);
+        let terminal = match end {
+            Some(end) => TerminalDisposition::Ended(end),
+            None => TerminalDisposition::Refused(PromotionRefusal::ActivationFailed),
+        };
+        self.state = ServiceState::Disposing {
+            request,
+            outcome: DisposingOutcome::Lane(lane),
+            terminal,
+        };
+        Ok(())
+    }
+}
+
+impl Default for SelectedLifecycleService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// The worker thread moves the job in and the outcome out: both must
+// be Send in every build. This guard fails future !Send regressions
+// (including test-only fields) at compile time.
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<PreparationBundle>();
+    assert_send::<PreparationOutcome>();
+    assert_send::<PreparedSelectedWork>();
+    assert_send::<crate::attach::Session>();
+    assert_send::<crate::attach::selected_detailed::SelectedPreparationFailure>();
+    assert_send::<PromotionRequest>();
+    assert_send::<PromotionInstallCapacity>();
+    assert_send::<NativeCasReceipt>();
+};
+
+/// Teardown-only best effort: the service stopped polling (process
+/// teardown past the stop bound), so the worker settles its own
+/// outcome before exiting instead of dropping a live native owner.
+/// Bounded (100 x 10ms, the preparation sleep precedent): whatever is
+/// still pending at the bound is dropped at thread exit, which is the
+/// documented teardown fate, not a polled path.
+fn settle_outcome_best_effort(outcome: PreparationOutcome) {
+    use crate::attach::selected_detailed::SelectedCleanupStatus;
+    let mut sink = std::io::sink();
+    match outcome {
+        PreparationOutcome::Ready(work) => match work.into_provisional_lane() {
+            Ok(mut lane) => {
+                for _ in 0..100 {
+                    if lane.poll_dispose(&mut sink) != SelectedCleanupStatus::Pending {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+            Err(mut failure) => {
+                for _ in 0..100 {
+                    if failure.poll_cleanup(&mut sink) != SelectedCleanupStatus::Pending {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        },
+        PreparationOutcome::Failed(mut failure) => {
+            for _ in 0..100 {
+                if failure.poll_cleanup(&mut sink) != SelectedCleanupStatus::Pending {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::discovery::caller_registry::{CallerId, MappingEvidence, ModuleId, UseCoverage};
+    use crate::inventory_present::Presentation;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    fn domain() -> NativeDomainId {
+        NativeDomainId::try_mint().expect("test domain mints")
+    }
+
+    fn image(cookie: u64, exec: u64) -> ImageIdentity {
+        ImageIdentity {
+            task_cookie: cookie,
+            exec_id: exec,
+        }
+    }
+
+    fn binding() -> SelectedActivationBinding {
+        SelectedActivationBinding::new(domain(), 7, image(71, 72))
+    }
+
+    /// One taken request over a minimal one-edge view, with its live
+    /// promoter for applying the service's status updates.
+    fn taken_request() -> (super::super::Promoter, PromotionRequest) {
+        use crate::discovery::caller_registry::MappingState;
+        use crate::inventory_present::{
+            Activity, BudgetView, Capture, EdgeSemanticsView, EdgeView, Presence,
+        };
+        let edge = EdgeView {
+            caller: CallerId(3),
+            module: ModuleId(5),
+            mapping: MappingState::Mapped,
+            mapping_reason: None,
+            mapping_evidence: MappingEvidence::DeepScan,
+            mapping_first_seen_ns: 0,
+            mapping_last_seen_ns: 0,
+            mapping_interruptions: 0,
+            entry_count: 0,
+            entry_saturated: false,
+            entry_first_seen_ns: None,
+            entry_last_seen_ns: None,
+            entry_in_flight: false,
+            entry_observation: "",
+            coverage: UseCoverage::Counted {
+                since_ns: 0,
+                lossy: false,
+            },
+            presence: Presence::Mapped,
+            capture: Capture::Armed,
+            activity: Activity::Quiet,
+            semantics: EdgeSemanticsView {
+                label: "",
+                mechanisms: Vec::new(),
+                operations: None,
+            },
+        };
+        let presentation = Presentation {
+            scope_label: String::new(),
+            started_ns: 0,
+            ended_ns: 0,
+            passes: 0,
+            usage_feed: false,
+            native_witnesses: crate::discovery::native_binding::BindingCensus {
+                rows: 0,
+                bound: 0,
+                unbound: std::collections::BTreeMap::new(),
+                pending: 0,
+                integrity: 0,
+            },
+            witness_placement: crate::discovery::caller_registry::WitnessPlacement {
+                edge: 0,
+                module: 0,
+                ambiguous: 0,
+                unresolved: 0,
+            },
+            caller_metadata: crate::caller_metadata::runtime::MetadataFrame::default(),
+            callers: Vec::new(),
+            modules: Vec::new(),
+            edges: vec![edge],
+            instances: Vec::new(),
+            semantic_edges: Vec::new(),
+            gaps: Vec::new(),
+            gaps_suppressed: 0,
+            budgets: BudgetView {
+                callers_limit: 0,
+                callers_occupied: 0,
+                callers_refused: 0,
+                modules_limit: 0,
+                modules_occupied: 0,
+                modules_refused: 0,
+                edges_limit: 0,
+                edges_occupied: 0,
+                edges_refused: 0,
+                endpoints_limit: 0,
+                endpoints_occupied: 0,
+                endpoints_refused: 0,
+                inventory_endpoints_limit: 0,
+                inventory_endpoints_occupied: 0,
+                inventory_endpoints_refused: 0,
+                inventory_modules_limit: 0,
+                inventory_modules_occupied: 0,
+                inventory_modules_refused: 0,
+                counters_observed: 0,
+                counters_saturated: 0,
+                semantic_limit: 0,
+                semantic_occupied: 0,
+                semantic_unknown_edges: 0,
+                semantic_refused: 0,
+                instances_limit: 0,
+                instances_occupied: 0,
+                instances_refused: 0,
+                instance_semantic_occupied: 0,
+                instance_semantic_unknown_edges: 0,
+                instance_semantic_refused: 0,
+                instance_negative_limit: 0,
+                instance_negative_occupied: 0,
+                instance_negative_refused: 0,
+                instance_negative_exhausted: false,
+                instance_semantic_resources:
+                    crate::inventory_present::SemanticResourceView::default(),
+                retained_limit: 0,
+                retained: 0,
+                retained_suppressed: 0,
+                preadmission: None,
+            },
+            semantic_capture: crate::inventory_semantics::SemanticCaptureSummary::default(),
+            object_observations: crate::key_operation_projection::ObjectObservations::unavailable(
+                0,
+                "bootstrap_unavailable",
+            ),
+        };
+        let mut promoter = super::super::Promoter::new();
+        assert!(promoter.enable(super::super::CaptureId::new(11)));
+        let view = Arc::new(super::super::PromotionView::new(
+            super::super::CaptureId::new(11),
+            super::super::ViewRevision::new(3),
+            Arc::new(presentation),
+        ));
+        promoter
+            .request(Arc::clone(&view), CallerId(3), ModuleId(5))
+            .expect("exact pair queues");
+        let request = promoter.take_request().expect("mailbox holds it");
+        (promoter, request)
+    }
+
+    fn capacity() -> PromotionInstallCapacity {
+        let coordinator =
+            crate::discovery::engine::inventory_coordinator::InventoryCoordinator::new(
+                crate::attach::Scope::Pid(std::process::id()),
+                crate::discovery::hooks::HookRegistry::builtin(),
+                Vec::new(),
+                crate::discovery::caller_registry::OsProcessSource,
+                crate::discovery::caller_registry::RegistryLimits::default_limits(),
+            )
+            .expect("test coordinator builds");
+        coordinator
+            .reserve_promotion_install()
+            .expect("test capacity reserves")
+    }
+
+    /// Scripted CAS source: mints for the expected binding, or refuses
+    /// on command. Records calls through a shared counter so tests pin
+    /// CAS-skipped-on-cancel.
+    struct StubSource {
+        refuse: Option<NativeActivationRefusal>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl NativeActivationSource for StubSource {
+        fn activate(
+            &mut self,
+            _session: &Session,
+            expected: &SelectedActivationBinding,
+        ) -> Result<NativeCasReceipt, NativeActivationRefusal> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(refusal) = self.refuse {
+                return Err(refusal);
+            }
+            Ok(NativeCasReceipt::scripted(*expected))
+        }
+    }
+
+    fn stub_source(
+        refuse: Option<NativeActivationRefusal>,
+    ) -> (Box<StubSource>, Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        (
+            Box::new(StubSource {
+                refuse,
+                calls: Arc::clone(&calls),
+            }),
+            calls,
+        )
+    }
+
+    /// Poll until an event or the bound; tests fail loudly past it
+    /// instead of hanging on a wedged worker.
+    fn poll_until(
+        service: &mut SelectedLifecycleService,
+        bound: Duration,
+    ) -> Option<LifecycleEvent> {
+        let deadline = Instant::now() + bound;
+        let mut sink = std::io::sink();
+        loop {
+            if let Some(event) = service.poll(&mut sink) {
+                return Some(event);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "service emitted no event within the bound"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn proof_mint_binds_request_pair_and_binding() {
+        let (_promoter, request) = taken_request();
+        let lane = binding();
+        let proof = SelectedActivationProof::mint(&request, lane, NativeCasReceipt::scripted(lane))
+            .expect("matching receipt mints");
+        assert_eq!(proof.request(), request.id());
+        assert_eq!(proof.pair(), PromotionPair::new(3, 5));
+        assert_eq!(proof.binding(), lane);
+        assert!(proof.matches_lane(lane));
+    }
+
+    #[test]
+    fn proof_mint_refuses_foreign_stale_and_mismatched_receipts() {
+        let (_promoter, request) = taken_request();
+        let lane = binding();
+        let foreign = SelectedActivationBinding::new(domain(), lane.generation(), lane.image());
+        let stale =
+            SelectedActivationBinding::new(lane.domain(), lane.generation() + 1, lane.image());
+        let mismatched =
+            SelectedActivationBinding::new(lane.domain(), lane.generation(), image(9, 9));
+        for wrong in [foreign, stale, mismatched] {
+            assert_eq!(
+                SelectedActivationProof::mint(&request, lane, NativeCasReceipt::scripted(wrong))
+                    .unwrap_err(),
+                ProofMintRefusal::CasMismatch
+            );
+            assert!(!NativeCasReceipt::scripted(wrong).matches(lane));
+        }
+        assert!(
+            !SelectedActivationProof::mint(&request, lane, NativeCasReceipt::scripted(lane))
+                .expect("matching receipt mints")
+                .matches_lane(foreign)
+        );
+    }
+
+    #[test]
+    fn second_start_while_busy_refuses_and_keeps_first() {
+        let (_promoter, first) = taken_request();
+        let (_promoter, second) = taken_request();
+        let mut service = SelectedLifecycleService::new();
+        let (gate, release) = std::sync::mpsc::channel::<()>();
+        service
+            .start(first, capacity(), stub_source(None).0, move || {
+                release.recv().expect("test releases the worker");
+                PreparationOutcome::Failed(SelectedPreparationFailure::scripted_settled())
+            })
+            .expect("first start runs");
+        assert!(!service.is_idle());
+        assert_eq!(
+            service
+                .start(second, capacity(), stub_source(None).0, || {
+                    PreparationOutcome::Failed(SelectedPreparationFailure::scripted_settled())
+                })
+                .unwrap_err(),
+            PromotionRefusal::Busy
+        );
+        gate.send(()).expect("test releases the worker");
+        let event = poll_until(&mut service, Duration::from_secs(5)).expect("terminal event");
+        assert!(
+            matches!(event, LifecycleEvent::Status(_)),
+            "failed job ends refused, never installing"
+        );
+        assert!(service.is_idle());
+    }
+
+    #[test]
+    fn failed_job_disposes_and_reports_preparation_failed() {
+        let (mut promoter, request) = taken_request();
+        let mut service = SelectedLifecycleService::new();
+        service
+            .start(request, capacity(), stub_source(None).0, || {
+                PreparationOutcome::Failed(SelectedPreparationFailure::scripted_settled())
+            })
+            .expect("start runs");
+        let event = poll_until(&mut service, Duration::from_secs(5)).expect("terminal event");
+        let LifecycleEvent::Status(update) = event else {
+            panic!("failed job must not install");
+        };
+        assert_eq!(
+            promoter.set_status(update),
+            Some(super::super::PromotionState::Refused(
+                PromotionRefusal::PreparationFailed
+            ))
+        );
+        assert!(service.is_idle());
+    }
+
+    #[test]
+    fn worker_panic_reports_preparation_failed_without_installing() {
+        let (mut promoter, request) = taken_request();
+        let mut service = SelectedLifecycleService::new();
+        service
+            .start(
+                request,
+                capacity(),
+                stub_source(None).0,
+                || -> PreparationOutcome { panic!("scripted worker panic") },
+            )
+            .expect("start runs");
+        let event = poll_until(&mut service, Duration::from_secs(5)).expect("terminal event");
+        let LifecycleEvent::Status(update) = event else {
+            panic!("panicked worker must not install");
+        };
+        assert_eq!(
+            promoter.set_status(update),
+            Some(super::super::PromotionState::Refused(
+                PromotionRefusal::PreparationFailed
+            ))
+        );
+        assert!(service.is_idle());
+    }
+
+    #[test]
+    fn cancel_before_delivery_skips_cas_and_confirms_cancelled() {
+        let (mut promoter, request) = taken_request();
+        let mut service = SelectedLifecycleService::new();
+        let (gate, release) = std::sync::mpsc::channel::<()>();
+        let (source, calls) = stub_source(None);
+        service
+            .start(request, capacity(), source, move || {
+                release.recv().expect("test releases the worker");
+                PreparationOutcome::Failed(SelectedPreparationFailure::scripted_settled())
+            })
+            .expect("start runs");
+        service.note_cancel(PromotionEnd::Cancelled);
+        gate.send(()).expect("test releases the worker");
+        let event = poll_until(&mut service, Duration::from_secs(5)).expect("terminal event");
+        let LifecycleEvent::Status(update) = event else {
+            panic!("cancelled job must not install");
+        };
+        assert_eq!(
+            promoter.set_status(update),
+            Some(super::super::PromotionState::Ended(PromotionEnd::Cancelled))
+        );
+        assert!(service.is_idle());
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no activation CAS runs after cancellation was requested"
+        );
+    }
+
+    fn scripted_subset(objects: &[(u32, u32)]) -> AttestedSubset {
+        use crate::discovery::identity::PinnedObjectId;
+        use std::collections::{BTreeMap, BTreeSet};
+        let required: BTreeMap<PinnedObjectId, BTreeSet<u32>> = objects
+            .iter()
+            .map(|(object, slot)| (PinnedObjectId(*object), BTreeSet::from([*slot])))
+            .collect();
+        AttestedSubset::scripted(
+            crate::plan::AttachPlan::from_slots(Vec::new()),
+            crate::discovery::identity::PinnedObjects::empty(),
+            required,
+        )
+    }
+
+    #[test]
+    fn subset_shape_accepts_exactly_one_required_object() {
+        assert_eq!(validate_subset_shape(&scripted_subset(&[(3, 7)])), Ok(()));
+    }
+
+    #[test]
+    fn subset_shape_refuses_empty_and_ambiguous_coverage() {
+        assert_eq!(
+            validate_subset_shape(&scripted_subset(&[])),
+            Err(PromotionRefusal::ManifestUnavailable)
+        );
+        assert_eq!(
+            validate_subset_shape(&scripted_subset(&[(3, 7), (5, 9)])),
+            Err(PromotionRefusal::EndpointAmbiguous)
+        );
+    }
+
+    #[test]
+    fn quiet_service_polls_none_and_confirms_nothing() {
+        let mut service = SelectedLifecycleService::new();
+        assert!(service.is_idle());
+        let mut sink = std::io::sink();
+        assert!(service.poll(&mut sink).is_none());
+        assert!(service.note_installed().is_none());
+        service.note_cancel(PromotionEnd::Cancelled);
+        assert!(service.poll(&mut sink).is_none());
+    }
+}

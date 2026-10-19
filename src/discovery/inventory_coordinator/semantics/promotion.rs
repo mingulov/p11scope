@@ -333,6 +333,30 @@ impl PromotionInstallCapacity {
     }
 }
 
+impl PromotionInstallCapacity {
+    /// Unpack the paid destination storage for set installation: the
+    /// bindings vector, the caller index, the supported-history map
+    /// and the storage lease that must outlive them. Only
+    /// `SemanticBindingSet::install_capacity` calls this, moving the
+    /// lease with the storage so live bytes stay charged.
+    pub(super) fn into_storage(
+        self,
+    ) -> (
+        Vec<SemanticCallerBinding>,
+        HashMap<CallerId, usize>,
+        HashMap<CallerId, SemanticAdmissionHistory>,
+        ResourceLease,
+    ) {
+        let Self {
+            bindings,
+            index,
+            admission_images,
+            storage,
+        } = self;
+        (bindings, index, admission_images, storage)
+    }
+}
+
 impl std::fmt::Debug for PromotionInstallCapacity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("PromotionInstallCapacity(<reserved>)")

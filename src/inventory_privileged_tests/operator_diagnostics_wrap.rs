@@ -332,10 +332,16 @@ fn check_startup_round(
     Ok(k)
 }
 
-/// Validate the terminal fence/proof pair set: 32 distinct pairs, each with
-/// a fence `(658, 659]` withheld prefix and a proof placement
-/// (base 659, absolute 660, staged 1) on the recovered B module.
-/// Returns aggregate (fence-absolute sum, proof-absolute sum, staged sum).
+/// Validate the terminal fence/proof pair set: 32 distinct pairs under one
+/// caller, each with a fence `(658, 659]` withheld prefix (absolute 659,
+/// retained observation) and a proof placement (base 659, absolute 660,
+/// staged 1) on the recovered B module. Every proof must project
+/// `edge_total == 1` (the single-publication batching premise behind B=1;
+/// a split recovery projects 2..32) and recover through a strictly later
+/// read (`baseline_post < pre`). No B placement may overlap a withheld
+/// interval, and B must carry exactly the 32 proofs (no early/foreign
+/// attribution). Returns aggregate (fence-absolute sum, proof-absolute sum,
+/// staged sum) after asserting the exact 21,088/21,120/32 reconciliation.
 fn check_terminal_pairs(
     records: &[serde_json::Value],
     b_module: &serde_json::Value,
@@ -345,15 +351,55 @@ fn check_terminal_pairs(
     let mut staged_sum = 0u64;
     let mut fence = BTreeSet::new();
     let mut fence_abs_sum = 0u64;
+    let mut caller: Option<String> = None;
+    let mut b_placements = 0u64;
     for row in records {
+        if row["kind"] == "publication"
+            && row["decision"] == "placed"
+            && row["module_id"] == *b_module
+        {
+            b_placements += 1;
+            let base = row["base"].as_u64().unwrap_or(u64::MAX);
+            let absolute = row["absolute"].as_u64().unwrap_or(0);
+            let is_proof_shape = base == COUNTED + SHARED + 1
+                && absolute == COUNTED + SHARED + 2
+                && row["staged"] == 1;
+            if !is_proof_shape
+                && base < COUNTED + SHARED + 1
+                && absolute > COUNTED + SHARED
+            {
+                bail!("B placement overlaps the withheld fence interval: {row}");
+            }
+        }
         if row["kind"] == "publication"
             && row["decision"] == "placed"
             && row["module_id"] == *b_module
             && row["base"] == COUNTED + SHARED + 1
             && row["absolute"] == COUNTED + SHARED + 2
             && row["staged"] == 1
+            && row["edge_total"] == 1
+            && row["observation_ref"]["status"] == "retained"
+            && row["observation_ref"]["seq"].as_u64().is_some()
         {
+            let (Some(baseline_post), Some(pre)) = (
+                row["baseline_post"].as_u64(),
+                row["pre"].as_u64(),
+            ) else {
+                bail!("proof lacks a genuine recovery window: {row}");
+            };
+            ensure!(
+                baseline_post < pre,
+                "proof recovery is not strictly later than its fence: {row}"
+            );
             let pair = row["pair"].as_str().context("placed pair")?.to_owned();
+            let row_caller = row["caller"].as_str().context("placed caller")?.to_owned();
+            match &caller {
+                None => caller = Some(row_caller),
+                Some(expected) => ensure!(
+                    expected == &row_caller,
+                    "terminal proofs span callers: {expected} vs {row_caller}"
+                ),
+            }
             if placements.insert(pair) {
                 proof_abs_sum += row["absolute"].as_u64().context("proof absolute")?;
                 staged_sum += row["staged"].as_u64().context("proof staged")?;
@@ -364,16 +410,37 @@ fn check_terminal_pairs(
             && row["reason"] == "awaiting_fence"
             && row["after"] == COUNTED + SHARED
             && row["through"] == COUNTED + SHARED + 1
+            && row["absolute"] == COUNTED + SHARED + 1
+            && row["observation_ref"]["status"] == "retained"
+            && row["observation_ref"]["seq"].as_u64().is_some()
         {
             let pair = row["pair"].as_str().context("withheld pair")?.to_owned();
+            let row_caller = row["caller"].as_str().context("withheld caller")?.to_owned();
+            match &caller {
+                None => caller = Some(row_caller),
+                Some(expected) => ensure!(
+                    expected == &row_caller,
+                    "terminal fence spans callers: {expected} vs {row_caller}"
+                ),
+            }
             if fence.insert(pair) {
                 fence_abs_sum += row["through"].as_u64().context("fence through")?;
             }
         }
     }
     ensure!(
+        b_placements == 32,
+        "B must carry exactly the 32 terminal proofs, found {b_placements} placements"
+    );
+    ensure!(
         placements.len() == 32 && fence == placements,
         "all32 real pairs need recent withheld-prefix/recovery on B"
+    );
+    ensure!(
+        fence_abs_sum == 32 * (COUNTED + SHARED + 1)
+            && proof_abs_sum == 32 * (COUNTED + SHARED + 2)
+            && staged_sum == 32,
+        "terminal sums differ from per-pair 659/660/1: fence={fence_abs_sum} proof={proof_abs_sum} staged={staged_sum}"
     );
     Ok((fence_abs_sum, proof_abs_sum, staged_sum))
 }
@@ -1578,6 +1645,11 @@ fn diagnostic_validator_fixture() -> (Vec<serde_json::Value>, u64) {
             row["reason"] = "awaiting_fence".into();
             row["after"] = (COUNTED + SHARED).into();
             row["through"] = (COUNTED + SHARED + 1).into();
+            row["absolute"] = (COUNTED + SHARED + 1).into();
+            row["caller"] = "c0".into();
+            row["pre"] = 7000.into();
+            row["post"] = 7010.into();
+            row["observation_ref"] = serde_json::json!({"seq":24642,"status":"retained"});
         }
         push(row);
     }
@@ -1585,6 +1657,9 @@ fn diagnostic_validator_fixture() -> (Vec<serde_json::Value>, u64) {
         push(
             serde_json::json!({"kind":"publication","decision":"placed","module_id":"mB",
         "pair":format!("p{index}"),"base":COUNTED+SHARED+1,"absolute":COUNTED+SHARED+2,"staged":1,
+        "edge_total":1,"caller":"c0","pre":7020,"post":7030,
+        "baseline_pre":7000,"baseline_post":7010,
+        "observation_ref":{"seq":24642,"status":"retained"},
         "transition_ref":{"seq":1,"status":"not_retained"},"history_complete":false}),
         );
     }

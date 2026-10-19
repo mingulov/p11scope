@@ -164,7 +164,18 @@ attach::lifecycle_tests::exec_tests::privileged_detailed_failed_nonleader_exec_p
 attach::lifecycle_tests::exec_tests::privileged_detailed_nonleader_exec_cleans_old_tid_before_same_session_rebind
 attach::lifecycle_tests::privileged_detailed_nonleader_exit_preserves_same_slot_sibling_start
 attach::lifecycle_tests::privileged_detailed_nonleader_exit_reclaims_start_and_preserves_leader
+# Object-stop scrub cells over actual native OBJECT_START/STOP_GATE map
+# definitions (owned maps only, each well under a second): scrub after
+# quiescence, refusal without proven Q, and no false success on a frozen map.
+attach::object_stop::tests::object_stop_scrubs_real_retained_map_after_q
+attach::object_stop::tests::object_stop_refuses_real_unproven_q_without_mutation
+attach::object_stop::tests::object_stop_reports_real_scrub_failure
 discovery::confirm_shards::tests::privileged_sharded_confirmation_equals_the_serial_production_probe
+# T8 FIRST live control: quiet window arms nothing, then a 3-child owned
+# probe spends exactly tickets 1..=3 with zero loss (short; needs root,
+# host vmlinux BTF, gcc-built fixtures, and a quiet window — any ambient
+# EXEC refuses the cell, so run it on a controlled host).
+discovery::engine::pressure_native_tests::pressure_live_ticket_spend_control_refuses_ambient
 discovery::engine::publication_tests::broad_p11kit_admission_arithmetic
 discovery::inventory_workload::tests::privileged_inventory_attach_projection_n4097
 discovery::inventory_workload::tests::privileged_inventory_attach_projection_n6530
@@ -223,6 +234,11 @@ inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_p
 # G21 cell 3: the same paired schedule under unfiltered system capture
 # (same fixture/seam, owned-caller validators, strict off/on parity).
 inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_system_diagnostics_wrap_and_primary_parity_lp64
+# G21 live short controls: the source-matched 3-round startup probe and the
+# real 3-round accelerated-cadence pilot (bounded 90 s each, same
+# prebuilt32-object fixture/seam as the wrap pair they calibrate).
+inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_pid_diagnostics_three_round_startup_probe_lp64
+inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_pid_diagnostics_three_round_accelerated_pilot_lp64
 )
 
 # Static skips: external fixture/driver/env the script cannot provide.
@@ -245,6 +261,10 @@ inventory::privileged_tests::privileged_identity_kernel_multipass_reuse_lp64
 s1_tests::resource_probe::native_semantic_resource_final_probe
 s1_tests::resource_probe::native_semantic_resource_registry_probe
 semantics_edge::resource_tests::native_semantic_resource_probe
+# T8 live256 episodes: documented known-failing repros (see reasons); they
+# re-enter the runnable campaign once the lane-A runtime fix lands.
+discovery::engine::pressure_native_tests::pressure_live256_genuine_episode_admits_late_then_head
+discovery::engine::pressure_native_tests::pressure_live256_all_blocked_twin_refuses_once
 )
 SKIP_REASONS=(
 "needs punch-hole support under TMPDIR (btrfs/ext4/xfs; tmpfs refuses); no BPF-independent probe: run by hand as root: TMPDIR=<hole-capable dir> <binary> --exact <path> --ignored"
@@ -265,6 +285,8 @@ SKIP_REASONS=(
 "requires explicit controller-granted host measurement; spawns bounded child probes for the final multi-profile large4096 registry measurement, so schedule under a separate authorized measurement plan"
 "requires explicit controller-granted host measurement; spawns bounded child probes for the multi-profile large4096 registry measurement, so schedule under a separate authorized measurement plan"
 "requires explicit controller-granted host measurement; spawns bounded reducer-profile probes with at most 32 edges per profile, so schedule under a separate authorized measurement plan"
+"known-failing repro (doc Known limit 2026-10-19: lane-A runtime does not converge, the rotation stalls); rerun by hand as root after the runtime fix: <binary> --exact <path> --ignored --test-threads=1 --nocapture"
+"known-failing repro (doc Known limit: same lane-A view-capacity stall, post-settle refusal asserts unreachable until the runtime fix); rerun by hand as root after the runtime fix: <binary> --exact <path> --ignored --test-threads=1 --nocapture"
 )
 
 usage() {

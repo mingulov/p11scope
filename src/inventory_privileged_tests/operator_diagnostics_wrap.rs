@@ -1056,8 +1056,44 @@ fn operator_diagnostics_wrap_fixture_edges_match_snapshot_renderer_shape() -> Re
     // Meta-fix for the G21 oracle failure: pin the snapshot/event shape
     // contract both ways so the host fixture can never again invent
     // event-only keys the renderer does not emit.
-    use crate::discovery::caller_registry::{CallerId, ModuleId};
-    let rendered = fixture_edge_json(CallerId(0), ModuleId(1), 0, false);
+    //
+    // The reference MUST come straight from production edge_json on an
+    // independently built EdgeView, never via fixture_edge_json (which also
+    // builds the fixture side below): anything invented inside that helper
+    // would otherwise pass on both sides. The construction duplication is
+    // deliberate independence, not dead weight.
+    use crate::discovery::caller_registry::{
+        CallerId, MappingEvidence, MappingState, ModuleId, SEMANTIC_UNKNOWN, UseCoverage,
+    };
+    use crate::inventory_present::{Activity, Capture, EdgeSemanticsView, EdgeView, Presence};
+    let rendered = crate::inventory::edge_json(&EdgeView {
+        caller: CallerId(0),
+        module: ModuleId(1),
+        mapping: MappingState::Mapped,
+        mapping_reason: None,
+        mapping_evidence: MappingEvidence::DeepScan,
+        mapping_first_seen_ns: 100,
+        mapping_last_seen_ns: 200,
+        mapping_interruptions: 0,
+        entry_count: TARGETS,
+        entry_saturated: false,
+        entry_first_seen_ns: Some(120),
+        entry_last_seen_ns: Some(180),
+        entry_in_flight: false,
+        entry_observation: "observed",
+        coverage: UseCoverage::Counted {
+            since_ns: 110,
+            lossy: false,
+        },
+        presence: Presence::Mapped,
+        capture: Capture::Armed,
+        activity: Activity::RecentlyObserved,
+        semantics: EdgeSemanticsView {
+            label: SEMANTIC_UNKNOWN,
+            mechanisms: Vec::new(),
+            operations: None,
+        },
+    });
     let renderer_keys: BTreeSet<&str> = rendered
         .as_object()
         .context("renderer edge object")?

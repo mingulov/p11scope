@@ -476,10 +476,17 @@ fn object_producer_compiled_frames_are_bounded() {
     let object = embedded_object(directory.path());
     // Printed, not just carried in the assert message: with --nocapture this
     // is the map-allocation and frame/instruction measurement record.
-    let mode = if cfg!(feature = "unsafe-unvalidated-metadata") {
-        "frames-diagnostic"
-    } else {
-        "frames"
+    // The checker validates the object against the frozen inventory for
+    // its exact profile: capacity (wide or default) crossed with
+    // metadata (diagnostic or plain).
+    let mode = match (
+        cfg!(feature = "wide-detailed-2112"),
+        cfg!(feature = "unsafe-unvalidated-metadata"),
+    ) {
+        (true, true) => "frames-wide-diagnostic",
+        (true, false) => "frames-wide",
+        (false, true) => "frames-diagnostic",
+        (false, false) => "frames",
     };
     let report = run_object_checker(&object, mode);
     println!("{report}");
@@ -654,13 +661,18 @@ def longest_chain(raws, bodies, relocations, offsets, root):
     return visit(root, ())
 
 
-def check_maps(report, diagnostic=False):
+def check_maps(report, diagnostic=False, wide=False):
     allowed = checker.DIAGNOSTIC_GLOBAL_HELPERS if diagnostic else frozenset()
     maps, programs, symbols = checker.inspect(sys.argv[1], allowed)
-    if diagnostic:
+    variant = None
+    if diagnostic or wide:
         # Explicit feature mode: allow only its exact decoder helpers, then
-        # require the entire frozen diagnostic map/program/symbol inventory.
-        checker.validate_inventory('diagnostic', maps, programs, symbols)
+        # require the entire frozen map/program/symbol inventory for the
+        # exact capacity/metadata profile. Plain 'frames' keeps its
+        # object-relative checks below with no frozen comparison.
+        variant = ('wide-' if wide else '') + ('diagnostic' if diagnostic else 'default')
+    if variant:
+        checker.validate_inventory(variant, maps, programs, symbols)
     for name in ('OBJECT_START', 'OBJECT_DESCRIPTORS', 'OBJECT_ZERO'):
         assert name in maps, f'missing owned map {name}'
     start = maps['OBJECT_START']
@@ -804,8 +816,8 @@ def fault_calls_to(data, root_name):
     return calls
 
 
-def check_frames(data, report, diagnostic=False):
-    check_maps(report, diagnostic)
+def check_frames(data, report, diagnostic=False, wide=False):
+    check_maps(report, diagnostic, wide)
     leaves = check_leaves(data, report)
     check_roots(data, report)
 
@@ -888,8 +900,8 @@ def main():
     data = Path(sys.argv[1]).read_bytes()
     mode = sys.argv[2]
     report = []
-    if mode in ('frames', 'frames-diagnostic'):
-        check_frames(data, report, diagnostic=mode == 'frames-diagnostic')
+    if mode in ('frames', 'frames-diagnostic', 'frames-wide', 'frames-wide-diagnostic'):
+        check_frames(data, report, diagnostic='diagnostic' in mode, wide='wide' in mode)
     elif mode == 'function-abis':
         check_function_abis(data, report)
     elif mode == 'return-fault':

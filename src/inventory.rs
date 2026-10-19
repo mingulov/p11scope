@@ -1124,6 +1124,7 @@ fn run_with_terminal_budget(
     );
     let stopped = running.stopped;
     let capture_error = running.error;
+    let zero_pass = running.zero_pass;
     let semantic_summary = driver.semantic_summary();
     // Both owners stay alive through the final commit, the immutable
     // presentation and every sink attempt; the lane releases after
@@ -1133,6 +1134,9 @@ fn run_with_terminal_budget(
     begin_scan_stdout(stdout, stopped.is_some());
     if let Some(stopped) = &stopped {
         inventory_diagnostic(&stop_line(&stopped.summary));
+    }
+    if let Some(zero) = &zero_pass {
+        inventory_diagnostic(&zero.stderr_line());
     }
     let ended_ns = now_ns();
     let passes = coordinator.passes();
@@ -3616,6 +3620,7 @@ fn run_dashboard(
     );
     let stopped = running.stopped;
     let capture_error = running.error;
+    let zero_pass = running.zero_pass;
     begin_scan_stdout(stdout, stopped.is_some());
     let mut display = driver
         .display
@@ -3628,6 +3633,9 @@ fn run_dashboard(
     let failure = display.take_failure();
     if let Some(stopped) = &stopped {
         display.notice(&stop_line(&stopped.summary));
+    }
+    if let Some(zero) = &zero_pass {
+        display.notice(&zero.stderr_line());
     }
     let passes = coordinator.passes();
     let ended_ns = now_ns();

@@ -941,6 +941,55 @@ impl AttestedSemanticLane {
         release_terminal_owner(live, result)
     }
 
+    /// Release a promotion-installed lane into its wound-down Session
+    /// for completion-polled retire (DR37 A→B). Consumes the lane like
+    /// the terminal cleanup: drives the owned producer detach to its
+    /// joined receipt under the caller's bound, then hands the live
+    /// Session (detach joined, selection terminal, stop requested) to
+    /// the completion minter, which proves genuine disposal on poll.
+    /// Memory-only lane state (H0 capture, attachment, stash) drops
+    /// here; only the Session needs joined disposal. A shell lane has
+    /// no native session and yields `None` without a gap: nothing
+    /// native ran, so nothing needs proving. Failure retains the whole
+    /// owner for process exit through the existing forget path, like
+    /// the terminal cleanup.
+    pub(crate) fn into_wound_down_session(
+        mut self,
+        second_signal: &dyn Fn() -> bool,
+        out: &mut dyn std::io::Write,
+    ) -> anyhow::Result<Option<Session>> {
+        #[cfg(test)]
+        if let Some(mut io) = self.test_io.take() {
+            // Mirror the terminal cleanup's substituted verdict, then
+            // yield no native session: substituted lanes never ran one.
+            let result = if self.test_finished {
+                io.finish_terminal_cleanup(second_signal, out)
+            } else {
+                Err(anyhow::anyhow!("Detailed cleanup preceded H0 Finish"))
+            };
+            release_terminal_owner(io, result)?;
+            return Ok(None);
+        }
+        let Some(mut live) = self.live.take() else {
+            return Ok(None);
+        };
+        let result = if live.finished {
+            // A failed Finish publication withheld early start; the
+            // wind-down still drives the owned detach before handing
+            // the Session to the minter.
+            live.session.begin_owned_producer_detach().and_then(|()| {
+                live.session
+                    .finish_owned_producer_detach_driven(second_signal, out)
+            })
+        } else {
+            Err(anyhow::anyhow!("Detailed cleanup preceded H0 Finish"))
+        };
+        match result {
+            Ok(()) => Ok(Some(live.session)),
+            Err(error) => release_terminal_owner(live, Err(error)).map(|()| None),
+        }
+    }
+
     /// One H0 collect→audit→route quantum over the bound callers' stable
     /// custody Arcs. The only producer of lane call batches; a gated,
     /// finished or shell lane refuses instead of inventing calls.

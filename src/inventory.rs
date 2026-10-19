@@ -1068,6 +1068,7 @@ fn run_with_terminal_budget(
         retiring: None,
         identity: identity_shared.clone(),
     };
+    driver.set_completion_source(Box::new(crate::attach::NativeCompletionMinter::new()));
     let clock = LoopClock {
         deadline,
         stop,
@@ -1234,20 +1235,6 @@ fn finish_semantic_native_cleanup(
 ) -> Result<()> {
     lane.map_or(Ok(()), |lane| {
         lane.finish_owned_terminal_cleanup(second_signal, &mut std::io::stderr())
-    })
-}
-
-/// Cancel-path native cleanup: diagnostics bypass stderr so a blocked
-/// terminal/pipe cannot hold the tick past its budget. The outcome
-/// still reports honestly through the gap path; the truly-blocked
-/// stderr positive stays unqualified and this path does not depend on
-/// it. Terminal teardown keeps stderr above.
-fn finish_semantic_native_cleanup_quiet(
-    lane: Option<crate::inventory_semantics::AttestedSemanticLane>,
-    second_signal: &dyn Fn() -> bool,
-) -> Result<()> {
-    lane.map_or(Ok(()), |lane| {
-        lane.finish_owned_terminal_cleanup(second_signal, &mut std::io::sink())
     })
 }
 
@@ -2068,13 +2055,33 @@ impl ClassicDriver<'_> {
         self.installed_promotion = None;
         let lane = self.semantic.take();
         let cleanup_deadline = Instant::now() + CANCEL_CLEANUP_BUDGET;
-        if let Err(error) =
-            finish_semantic_native_cleanup_quiet(lane, &|| Instant::now() >= cleanup_deadline)
-        {
-            self.coordinator.note_scope_gap(
-                "selected lane native cleanup failed".into(),
-                format!("{error:#}"),
-            );
+        // Release the lane into its wound-down Session for
+        // completion-polled retire: the minter proves genuine disposal
+        // on poll. Without an installed minter the joined Session
+        // drops normally (detach joined, selection terminal) and the
+        // namespace holds, exactly as before the minter landed.
+        // Diagnostics bypass stderr past the screen, like the cancel
+        // path before it: a blocked terminal cannot hold the tick past
+        // its budget, and the outcome still reports through gaps.
+        let wound_down = lane.map(|lane| {
+            lane.into_wound_down_session(
+                &|| Instant::now() >= cleanup_deadline,
+                &mut std::io::sink(),
+            )
+        });
+        match wound_down {
+            None | Some(Ok(None)) => {}
+            Some(Ok(Some(session))) => {
+                if let (Some(source), Some(domain)) = (self.completion_source.as_mut(), domain) {
+                    source.note_wound_down(domain, session);
+                }
+            }
+            Some(Err(error)) => {
+                self.coordinator.note_scope_gap(
+                    "selected lane native cleanup failed".into(),
+                    format!("{error:#}"),
+                );
+            }
         }
         if let Some(domain) = domain {
             self.retiring = Some(RetiringDomain::wound_down(domain));
@@ -2108,7 +2115,6 @@ impl ClassicDriver<'_> {
     /// Install the native completion minter (DR37 A→B). Run setup
     /// calls this once the native lane lands its source; until then
     /// the field stays `None` and retiring domains hold.
-    #[allow(dead_code)] // STAGED (DR37): called by run setup at unification; tests script completions instead.
     fn set_completion_source(
         &mut self,
         source: Box<dyn crate::inventory_promotion::lifecycle::NativeCompletionSource>,
@@ -3618,6 +3624,7 @@ fn run_dashboard(
         retiring: None,
         identity: identity_shared.clone(),
     };
+    driver.set_completion_source(Box::new(crate::attach::NativeCompletionMinter::new()));
     let ending = || stop() || quit.get();
     let clock = LoopClock {
         deadline: Some(deadline.unwrap_or_else(unbounded_dashboard_deadline)),
@@ -8065,6 +8072,15 @@ mod promotion_driver_tests {
             _domain: crate::attach::capture::NativeDomainId,
         ) -> Option<SessionNativeCompletion> {
             self.0.take()
+        }
+
+        fn note_wound_down(
+            &mut self,
+            _domain: crate::attach::capture::NativeDomainId,
+            _session: crate::attach::Session,
+        ) {
+            // Driver twins deliver scripted completions directly and
+            // never wind down a live Session.
         }
     }
 

@@ -8359,3 +8359,24 @@ fn automatic_exec_recovery_budget_failure_and_stop_are_finite() {
         );
     }
 }
+
+#[test]
+fn wound_down_shell_lane_yields_no_native_session() {
+    // DR37 A→B: a shell lane never owned a native Session, so its
+    // wind-down yields nothing to prove — without a gap and without
+    // touching BPF.
+    let fixture = ProviderFixture::new();
+    let lane = AttestedSemanticLane::start(
+        fixture.subset(),
+        &crate::attach::Scope::Pid(std::process::id()),
+        crate::attach::BackendSelection::Auto,
+    )
+    .expect("shell lane starts");
+    let session = lane
+        .into_wound_down_session(&|| false, &mut std::io::sink())
+        .expect("shell lane winds down");
+    assert!(
+        session.is_none(),
+        "a shell lane owns no native session to prove"
+    );
+}

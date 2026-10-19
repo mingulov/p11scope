@@ -12743,7 +12743,8 @@ pub(crate) mod tests {
     /// The owner's disjoint split wires the staged seal tick: the
     /// adapter/model pair from `parts()` is exactly what `wire` takes.
     /// Construction alone compiles here; the tick itself stays gated
-    /// (no `tick`/`tick_collected` call).
+    /// (no `tick`/`tick_collected` call). The read/write model borrows
+    /// share that same model identity.
     #[test]
     fn joint_capture_owner_parts_wire_the_seal_tick_without_ticking() {
         use super::joint_driver::JointCaptureOwner;
@@ -12761,7 +12762,7 @@ pub(crate) mod tests {
             }
         }
 
-        let mut scene = Scene::new(image_default());
+        let scene = Scene::new(image_default());
         let producers = scene.producers();
         let mut drain = crate::events::EventDrain::over_test_domain(
             crate::events::ScriptedRecords::records([], 0),
@@ -12773,7 +12774,7 @@ pub(crate) mod tests {
         let mut owner = JointCaptureOwner::new(JournalLimits::policy(), pool.reserver());
         {
             let (adapter, model) = owner.parts();
-            let tick = JointSealTick::wire(
+            let _tick = JointSealTick::wire(
                 adapter,
                 model,
                 &mut drain,
@@ -12783,12 +12784,29 @@ pub(crate) mod tests {
                 scene.fixture.attachment(),
                 &producers,
             );
-            drop(tick);
         }
         assert_eq!(
             owner.ledger().census(),
             0,
             "wiring borrows without charging or ticking"
+        );
+        let model_via_parts = {
+            let (_, model) = owner.parts();
+            std::ptr::from_ref(&*model)
+        };
+        assert_eq!(
+            model_via_parts,
+            std::ptr::from_ref(owner.model()),
+            "parts() and model() borrow the capture's one model"
+        );
+        let model_mut_via_parts = {
+            let (_, model) = owner.parts();
+            std::ptr::from_mut(&mut *model)
+        };
+        assert_eq!(
+            model_mut_via_parts,
+            std::ptr::from_mut(owner.model_mut()),
+            "parts() and model_mut() lend the capture's one model"
         );
     }
 

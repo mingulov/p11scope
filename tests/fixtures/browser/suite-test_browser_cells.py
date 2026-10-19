@@ -440,16 +440,22 @@ class BrowserCells(unittest.TestCase):
     def test_chromium_uses_fresh_home_nss_db(self):
         """P2-1 twin: the launched browser's NSS DB must live in the fresh HOME."""
         from playwright.sync_api import sync_playwright
+        from profiles import playwright_cache
         real_home = os.environ.get("HOME")
         real_xdg_cache = os.environ.get("XDG_CACHE_HOME")
+        real_browsers_path = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+        pinned_cache = playwright_cache()
         caller_home = self.work / "caller-home"
         caller_home.mkdir()
         cell_work = self.work / "cell"
         try:
             os.environ["HOME"] = str(caller_home)
             # Hermetic cache environment: the browser-cache location must
-            # not ride ambient variables past the HOME change.
+            # not ride ambient variables past the HOME change. Pin the
+            # pre-change cache explicitly so launch cannot fail on cache
+            # resolution before NSS isolation is tested.
             os.environ.pop("XDG_CACHE_HOME", None)
+            os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(pinned_cache)
             with sync_playwright() as pw:
                 context, _match, fresh_home = cells.launch_browser_context(
                     pw, "chromium", cell_work,
@@ -467,6 +473,10 @@ class BrowserCells(unittest.TestCase):
                 os.environ.pop("XDG_CACHE_HOME", None)
             else:
                 os.environ["XDG_CACHE_HOME"] = real_xdg_cache
+            if real_browsers_path is None:
+                os.environ.pop("PLAYWRIGHT_BROWSERS_PATH", None)
+            else:
+                os.environ["PLAYWRIGHT_BROWSERS_PATH"] = real_browsers_path
         self.assertIsNotNone(used, "no NSS database appeared under the fresh HOME")
         assert used is not None
         pkcs11 = used / "pkcs11.txt"

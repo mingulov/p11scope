@@ -134,7 +134,7 @@ impl NativeCasReceipt {
     /// (native-owned) supplies the service's source, so only a
     /// native implementation's receipts reach the proof mint in
     /// production. Test doubles script instead and never run live.
-    #[cfg_attr(not(test), allow(dead_code))] // STAGED (DR37): called by the native minter.
+    #[allow(dead_code)] // STAGED (DR37): called by the native minter; tests script instead and never run live.
     pub(crate) fn minted(binding: SelectedActivationBinding) -> Self {
         Self { binding }
     }
@@ -161,7 +161,7 @@ impl std::fmt::Debug for NativeCasReceipt {
 /// maps every variant to `PromotionRefusal::ActivationFailed`; the
 /// variants stay distinct so native tests pin the state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))] // STAGED (DR37): constructed by the native minter.
+#[allow(dead_code)] // STAGED (DR37): constructed by the native minter; tests never mint native refusals.
 pub(crate) enum NativeActivationRefusal {
     /// The state cell was not `CLOSED` (already active, terminal, or
     /// never published): the CAS ran and failed closed.
@@ -203,7 +203,7 @@ impl SessionNativeCompletion {
     /// trust chain as [`NativeCasReceipt::minted`]: only the
     /// native-owned source's completions reach the retire entry in
     /// production.
-    #[cfg_attr(not(test), allow(dead_code))] // STAGED (DR37): called by the native minter.
+    #[allow(dead_code)] // STAGED (DR37): called by the native minter; tests script completions instead.
     pub(crate) fn completed(domain: NativeDomainId) -> Self {
         Self { domain }
     }
@@ -1323,8 +1323,6 @@ pub(crate) fn taken_request_for_test() -> (super::Promoter, PromotionRequest) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::discovery::caller_registry::{CallerId, MappingEvidence, ModuleId, UseCoverage};
-    use crate::inventory_present::Presentation;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 

@@ -2086,7 +2086,7 @@ impl ClassicDriver<'_> {
     /// Install the native completion minter (DR37 A→B). Run setup
     /// calls this once the native lane lands its source; until then
     /// the field stays `None` and retiring domains hold.
-    #[cfg_attr(not(test), allow(dead_code))] // STAGED (DR37): called by run setup at unification.
+    #[allow(dead_code)] // STAGED (DR37): called by run setup at unification; tests script completions instead.
     fn set_completion_source(
         &mut self,
         source: Box<dyn crate::inventory_promotion::lifecycle::NativeCompletionSource>,

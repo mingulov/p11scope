@@ -8052,9 +8052,28 @@ mod tests {
     fn shared_scope_admits_a_corroborated_multi_table_provider_ahead_of_closure_arrays() {
         let open = MAX_SLOTS as usize - shared_scope_reserve(MAX_SLOTS as usize);
         // The closure array fits on its own but not beside the provider.
-        let closure = provider_with_tables(82, P11_KIT, 5, 64, false);
-        assert_eq!(5 * 64 + 6 * 11, 386);
-        assert!((5 * 64..386).contains(&open), "the margin the test needs");
+        // Wide profile: the open pool grows to 1,584, so the closure
+        // carries more entries per table; the table count stays below
+        // the provider's, keeping the within-class order under test.
+        let entries = if cfg!(feature = "wide-detailed-2112") {
+            310
+        } else {
+            64
+        };
+        let closure = provider_with_tables(82, P11_KIT, 5, entries, false);
+        let combined = 5 * entries + 6 * 11;
+        assert_eq!(
+            combined,
+            if cfg!(feature = "wide-detailed-2112") {
+                1616
+            } else {
+                386
+            }
+        );
+        assert!(
+            (5 * entries..combined).contains(&open),
+            "the margin the test needs"
+        );
         let nss = provider_with_linked_tables(83, "/opt/nss-softokn.so", 6, 11);
         for modules in [&[nss.clone(), closure.clone()], &[closure, nss]] {
             let plan = scoped_plan(modules, AdmissionScope::Shared);

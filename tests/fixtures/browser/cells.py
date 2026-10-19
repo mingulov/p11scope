@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -220,6 +221,129 @@ def wait_for_mapping(pid: int, needles: tuple[str, ...], timeout_seconds: float 
     return False
 
 
+def _parse_capture_ready(line: str) -> int | None:
+    """Parse ``p11scope: capturing: N probe(s) attached``; None otherwise."""
+    prefix = "p11scope: capturing: "
+    if not line.startswith(prefix):
+        return None
+    try:
+        return int(line[len(prefix):].split(" probe(s) attached", 1)[0])
+    except ValueError:
+        return None
+
+
+class _ProfilerSession:
+    """A running profiler with capture-readiness detection over stderr.
+
+    Two daemon threads drain stdout (discarded, as before) and stderr
+    (kept for the tail); the stderr thread watches for the
+    ``p11scope: capturing:`` marker the observer prints once probes are
+    attached and the capture loop starts. Navigation must only begin
+    after ``wait_for_ready`` returns.
+    """
+
+    def __init__(self, argv: list[str]) -> None:
+        self._proc = subprocess.Popen(
+            argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self._stderr_lines: list[str] = []
+        self._lock = threading.Lock()
+        self._ready = threading.Event()
+        self._attached: int | None = None
+        self._stdout_thread = threading.Thread(target=self._drain_stdout, daemon=True)
+        self._stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
+        self._stdout_thread.start()
+        self._stderr_thread.start()
+
+    def _drain_stdout(self) -> None:
+        assert self._proc.stdout is not None
+        while self._proc.stdout.readline():
+            pass
+        self._proc.stdout.close()
+
+    def _drain_stderr(self) -> None:
+        assert self._proc.stderr is not None
+        while True:
+            line = self._proc.stderr.readline()
+            if not line:
+                break
+            with self._lock:
+                self._stderr_lines.append(line)
+                if self._attached is None:
+                    parsed = _parse_capture_ready(line.rstrip("\n"))
+                    if parsed is not None:
+                        self._attached = parsed
+                        self._ready.set()
+        self._proc.stderr.close()
+
+    def wait_for_ready(self, timeout_seconds: float) -> int:
+        """Block until the capture marker arrives; return attached probes.
+
+        Raises CellError when the profiler exits first or the marker
+        never arrives inside the grace period (the profiler is killed).
+        """
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            if self._ready.wait(0.05):
+                with self._lock:
+                    assert self._attached is not None
+                    return self._attached
+            if self._proc.poll() is not None:
+                raise CellError(
+                    f"profiler exited (rc={self._proc.returncode}) before capture "
+                    f"readiness: {_tail(self.stderr_text())}")
+        self._proc.kill()
+        raise CellError(
+            f"profiler never became ready within {timeout_seconds:g}s "
+            f"(no `p11scope: capturing:` marker): {_tail(self.stderr_text())}")
+
+    def poll(self):
+        """The profiler's exit code, or None while it runs."""
+        return self._proc.poll()
+
+    def stderr_text(self) -> str:
+        """Stderr collected so far."""
+        with self._lock:
+            return "".join(self._stderr_lines)
+
+    def finish(self, timeout_seconds: float) -> tuple[int | None, str]:
+        """Wait for profiler exit (killing on timeout); join the drains."""
+        try:
+            returncode = self._proc.wait(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            self._proc.kill()
+            returncode = self._proc.wait(timeout=10)
+        self._stderr_thread.join(timeout=10)
+        self._stdout_thread.join(timeout=10)
+        return returncode, self.stderr_text()
+
+
+def _target_liveness(pid: int, match: str) -> tuple[bool, bool]:
+    """(alive, identity_ok) for the browser main process.
+
+    ``identity_ok`` requires the live PID's command line to still contain
+    the launch match, so a reused PID is never mistaken for the target.
+    """
+    try:
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ")
+    except (FileNotFoundError, PermissionError):
+        return False, False
+    return True, match.encode() in cmdline
+
+
+def _require_liveness(pid: int, match: str, profiler: _ProfilerSession, when: str) -> None:
+    """Fail the cell unless the observer and the browser target are alive."""
+    if profiler.poll() is not None:
+        raise CellError(
+            f"profiler exited (rc={profiler.poll()}) {when}: "
+            f"{_tail(profiler.stderr_text())}")
+    alive, identity_ok = _target_liveness(pid, match)
+    if not alive:
+        raise CellError(f"browser target pid {pid} disappeared {when}")
+    if not identity_ok:
+        raise CellError(
+            f"browser target pid {pid} no longer matches {match!r} {when} (PID reused?)")
+
+
 def attach_drive(name: str, browser: str, workdir: Path, flow_url: str,
                  flow, observe_module: Path, register_module: Path | None = None,
                  browser_env: dict | None = None,
@@ -228,19 +352,26 @@ def attach_drive(name: str, browser: str, workdir: Path, flow_url: str,
                  wait_for_map: tuple[str, ...] | None = None,
                  extra_browser_args: tuple[str, ...] = (),
                  auto_select_cert: bool = True,
-                 extra_prefs: dict | None = None) -> CellResult:
+                 extra_prefs: dict | None = None,
+                 expect_attached: bool | None = None) -> CellResult:
     """Drive ``flow(page, context)`` under ``p11scope profile --pid``.
 
     ``flow`` is a Playwright callable returning a JSON-able fact dict. The
     profiler observes ``observe_module`` and starts first
-    (duration-bounded); the flow runs after the attach grace so early flow
-    traffic is inside the window. ``register_module`` is the provider
-    registered in the fresh profile (`None` leaves the profile without one,
-    for absence twins). ``browser_env`` (notably ``SOFTHSM2_CONF``) is
-    applied to this process so the Playwright-launched browser inherits it.
-    ``wait_for_map`` names ``/proc/PID/maps`` substrings (e.g. the module
-    file name) the profiler waits for before starting, so its opening scan
-    sees the module.
+    (duration-bounded); the flow runs only after the profiler prints its
+    capture-readiness marker (``attach_grace_seconds`` bounds the wait),
+    so early flow traffic is inside the window. ``register_module`` is the
+    provider registered in the fresh profile (`None` leaves the profile
+    without one, for absence twins). ``browser_env`` (notably
+    ``SOFTHSM2_CONF``) is applied to this process so the Playwright-launched
+    browser inherits it. ``wait_for_map`` names ``/proc/PID/maps``
+    substrings (e.g. the module file name) the profiler waits for before
+    starting, so its opening scan sees the module. ``expect_attached``
+    pins the probe state the readiness marker must show: True (the scan
+    hooked the mapped module), False (nothing attached — the module
+    stayed unmapped), None (either). The ``mapped_at_end`` fact is None
+    (not False) when the target is gone: disappearance is distinct from
+    non-mapping.
     """
     saved_env = dict(os.environ)
     os.environ.update(browser_env or {})
@@ -249,7 +380,7 @@ def attach_drive(name: str, browser: str, workdir: Path, flow_url: str,
             name, browser, workdir, flow_url, flow, observe_module,
             register_module, duration_seconds, attach_grace_seconds,
             wait_for_map, extra_browser_args, auto_select_cert,
-            extra_prefs or {})
+            extra_prefs or {}, expect_attached)
     finally:
         os.environ.clear()
         os.environ.update(saved_env)
@@ -323,7 +454,7 @@ def wait_for_nss_db(fresh_home: Path, timeout_seconds: float = 15.0) -> Path | N
 def _attach_drive_inner(name, browser, workdir, flow_url, flow, observe_module,
                         register_module, duration_seconds, attach_grace_seconds,
                         wait_for_map, extra_browser_args,
-                        auto_select_cert, extra_prefs) -> CellResult:
+                        auto_select_cert, extra_prefs, expect_attached) -> CellResult:
     """``attach_drive`` body with the environment already applied."""
     _trusted_dir(workdir)
     report = workdir / "observed-profile.json"
@@ -366,34 +497,37 @@ def _attach_drive_inner(name, browser, workdir, flow_url, flow, observe_module,
                 context.close()
                 raise CellError(
                     f"{browser} pid {pid} never mapped {wait_for_map} in 20s")
-            profiler = subprocess.Popen(
+            profiler = _ProfilerSession(
                 ["sudo", "-n", str(p11scope_bin()), "profile", "--pid", str(pid),
                  "--module", str(observe_module), "--duration", str(duration_seconds),
-                 "-o", str(report)],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            )
+                 "-o", str(report)])
             try:
-                time.sleep(attach_grace_seconds)
-                if profiler.poll() is not None:
-                    _, stderr = profiler.communicate(timeout=10)
-                    raise CellError(f"profiler exited early: {_tail(stderr)}")
+                ready_attached = profiler.wait_for_ready(attach_grace_seconds)
+                if expect_attached is True and ready_attached < 1:
+                    raise CellError(
+                        f"profiler ready with 0 probes attached "
+                        f"(module {observe_module} expected mapped)")
+                if expect_attached is False and ready_attached != 0:
+                    raise CellError(
+                        f"profiler attached {ready_attached} probes "
+                        f"(module {observe_module} expected unmapped)")
+                _require_liveness(pid, match, profiler, "before navigation")
                 page = context.pages[0] if context.pages else context.new_page()
                 try:
                     facts = flow(page, context)
                 except Exception as exc:  # noqa: BLE001 - flow failure is cell evidence
                     facts = {"flow_error": f"{type(exc).__name__}: {exc}".split("\n")[0]}
+                _require_liveness(pid, match, profiler, "after the flow")
             finally:
+                profiler_exit, stderr = profiler.finish(duration_seconds + 60)
+            alive, identity_ok = _target_liveness(pid, match)
+            maps_text = ""
+            if alive:
                 try:
-                    _, stderr = profiler.communicate(timeout=duration_seconds + 60)
-                except subprocess.TimeoutExpired:
-                    profiler.kill()
-                    _, stderr = profiler.communicate(timeout=10)
-            profiler_exit = profiler.returncode
-            try:
-                maps_text = Path(f"/proc/{pid}/maps").read_text()
-            except FileNotFoundError:
-                maps_text = ""
-            mapped_at_end = Path(observe_module).name in maps_text
+                    maps_text = Path(f"/proc/{pid}/maps").read_text()
+                except FileNotFoundError:
+                    alive, identity_ok = False, False
+            mapped_at_end = Path(observe_module).name in maps_text if alive else None
         finally:
             context.close()
     _reown_report(report)
@@ -401,6 +535,7 @@ def _attach_drive_inner(name, browser, workdir, flow_url, flow, observe_module,
         name=name, report_path=report,
         flow={"profiler_exit": profiler_exit, "flow_url": flow_url,
               "browser_pid": pid, "mapped_at_end": mapped_at_end,
+              "target_alive": alive, "target_identity": identity_ok,
               **launch_facts, **facts},
         observer_stderr_tail=_tail(stderr),
     )

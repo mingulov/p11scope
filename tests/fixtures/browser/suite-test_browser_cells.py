@@ -184,7 +184,7 @@ class BrowserCells(unittest.TestCase):
         elif attached is False:
             hooked = report["evidence"].get("attached_probes", 0) or 0
             if hooked != 0:
-                failures.append(f"attached_probes={hooked}, want 0 (module never maps)")
+                failures.append(f"attached_probes={hooked}, want 0 (module never hooked)")
         if absent:
             failures += oracle.check_absent(counts, absent, opened)
         failures += oracle.check_verdict(report, allowed_verdicts)
@@ -253,13 +253,16 @@ class BrowserCells(unittest.TestCase):
                 register_module=store.lib, browser_env=store.env,
                 duration_seconds=ATTACH_DURATION, attach_grace_seconds=5,
                 wait_for_map=(store.lib.name,),
-                extra_prefs=FIREFOX_STABLE_PREFS)
+                extra_prefs=FIREFOX_STABLE_PREFS,
+                expect_attached=True)
             self.assertGreaterEqual(flow.requests_served, 1, "flow server saw no request")
         self.assertEqual(result.flow.get("profiler_exit"), 0)
         self.assertEqual(result.flow.get("http_status"), 200)
         self.assertIn("g33-flow-ok", result.flow.get("body_excerpt", ""))
         self.assertTrue(result.flow.get("profile_module_registered"),
                         "profile lost its registration?!")
+        self.assertTrue(result.flow.get("target_alive"), "browser target disappeared?!")
+        self.assertTrue(result.flow.get("target_identity"), "browser target PID reused?!")
         self.assertTrue(result.flow.get("mapped_at_end"), "module unmapped?!")
         self.check_report(result, store, oracle.FF_STARTUP_FLOORS, attached=True,
                           allowed_gaps=_GAPS_ATTACHED_FLOOR)
@@ -276,11 +279,14 @@ class BrowserCells(unittest.TestCase):
                 register_module=store.lib, browser_env=store.env,
                 duration_seconds=ATTACH_DURATION, attach_grace_seconds=5,
                 wait_for_map=(store.lib.name,),
-                extra_browser_args=CHROMIUM_STABLE_ARGS)
+                extra_browser_args=CHROMIUM_STABLE_ARGS,
+                expect_attached=True)
             self.assertGreaterEqual(flow.requests_served, 1, "flow server saw no request")
         self.assertEqual(result.flow.get("profiler_exit"), 0)
         self.assertEqual(result.flow.get("http_status"), 200)
         self.assertTrue(result.flow.get("nss_db_dir"), "no NSS registration witness?!")
+        self.assertTrue(result.flow.get("target_alive"), "browser target disappeared?!")
+        self.assertTrue(result.flow.get("target_identity"), "browser target PID reused?!")
         self.assertTrue(result.flow.get("mapped_at_end"), "module unmapped?!")
         self.check_report(result, store, oracle.CR_ENUMERATION_FLOORS, attached=True,
                           allowed_gaps=_GAPS_ATTACHED_ABSENT, absent=_PINBOUND_ABSENT)
@@ -314,11 +320,14 @@ class BrowserCells(unittest.TestCase):
                 register_module=store.lib, browser_env=store.env,
                 duration_seconds=ATTACH_DURATION, attach_grace_seconds=5,
                 wait_for_map=(store.lib.name,),
-                extra_prefs=FIREFOX_STABLE_PREFS)
+                extra_prefs=FIREFOX_STABLE_PREFS,
+                expect_attached=True)
             self.assert_pinbound_stall("FF-PINBOUND", result.flow, flow)
         self.assertEqual(result.flow.get("profiler_exit"), 0)
         self.assertTrue(result.flow.get("profile_module_registered"),
                         "profile lost its registration?!")
+        self.assertTrue(result.flow.get("target_alive"), "browser target disappeared?!")
+        self.assertTrue(result.flow.get("target_identity"), "browser target PID reused?!")
         self.assertTrue(result.flow.get("mapped_at_end"), "module unmapped?!")
         # Selection enumeration races the prompt failure (x0 or x16 across
         # runs), so no count is pinned; login and signing never happen.
@@ -340,10 +349,13 @@ class BrowserCells(unittest.TestCase):
                 duration_seconds=ATTACH_DURATION, attach_grace_seconds=5,
                 wait_for_map=(store.lib.name,),
                 extra_browser_args=CHROMIUM_STABLE_ARGS,
-                auto_select_cert=False)
+                auto_select_cert=False,
+                expect_attached=True)
             self.assert_pinbound_stall("CR-PINBOUND", result.flow, flow)
         self.assertEqual(result.flow.get("profiler_exit"), 0)
         self.assertTrue(result.flow.get("nss_db_dir"), "no NSS registration witness?!")
+        self.assertTrue(result.flow.get("target_alive"), "browser target disappeared?!")
+        self.assertTrue(result.flow.get("target_identity"), "browser target PID reused?!")
         self.assertTrue(result.flow.get("mapped_at_end"), "module unmapped?!")
         # Selection enumerates stably (x5 on every run) but the
         # interactive-PIN boundary holds: login and signing never happen.
@@ -542,6 +554,18 @@ class BrowserCells(unittest.TestCase):
                     duration_seconds=5, attach_grace_seconds=2)
         self.assertFalse(started.get("ran", False),
                          "navigation started before capture readiness")
+
+    def test_capture_ready_parsing(self):
+        """Unit: the readiness marker parses to its attached-probe count."""
+        self.assertEqual(
+            cells._parse_capture_ready(
+                "p11scope: capturing: 136 probe(s) attached; stop with Ctrl-C"), 136)
+        self.assertEqual(
+            cells._parse_capture_ready(
+                "p11scope: capturing: 0 probe(s) attached; stop with Ctrl-C"), 0)
+        self.assertIsNone(cells._parse_capture_ready(
+            "p11scope: loader readiness: 1 active hook(s)"))
+        self.assertIsNone(cells._parse_capture_ready("unrelated line"))
 
     def test_oracle_builder_healthy_accepted(self):
         """Guard: the twin builder's healthy doc passes the common oracle."""

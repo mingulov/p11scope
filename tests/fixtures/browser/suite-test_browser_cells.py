@@ -60,7 +60,35 @@ FIREFOX_STABLE_PREFS = {
 
 ATTACH_DURATION = 45
 RUN_DURATION = 90
-EARNED_VERDICTS = ("attribution_only", "concrete_gap")
+
+#: Observation gap causes each cell kind provably tolerates (P2-3).
+#: Floors are lower-bound robust (gaps can only hide calls, never invent
+#: them), so floor cells additionally tolerate in-flight entries at
+#: shutdown. Absence cells tolerate only discovery/window timing gaps for
+#: the already-attached module: in-flight entries, detach gaps, attach
+#: failures, event loss, and kernel halts would each hide exactly the
+#: forbidden calls, so none is allowed.
+_GAPS_ATTACHED_FLOOR = frozenset({
+    "loader_discovery", "unprotected_live_windows", "in_flight_at_end",
+})
+_GAPS_ATTACHED_ABSENT = frozenset({
+    "loader_discovery", "unprotected_live_windows",
+})
+#: Never-mapped cells: the structural discovery/slots/skipped shape (no
+#: module, no slots, discovery subject skipped). Detach history would hide
+#: behind the same cause, so the skipped records must all be structural
+#: (checked separately); run-mode adds spawn-window caveats.
+_GAPS_NEVER_MAPPED = frozenset({"discovery", "slots", "skipped"})
+_GAPS_NEVER_MAPPED_RUN = _GAPS_NEVER_MAPPED | frozenset({
+    "unprotected_live_windows", "pause_partial", "loader_discovery",
+})
+
+#: Verdict details each cell kind earned: attached cells read
+#: attribution_only when observation is exact, concrete_gap behind loader
+#: or window timing; never-mapped cells always carry the structural
+#: discovery gap, so concrete_gap only.
+_VERDICTS_ATTACHED = ("attribution_only", "concrete_gap")
+_VERDICTS_NEVER_MAPPED = ("concrete_gap",)
 
 
 def gate(test):
@@ -91,18 +119,29 @@ class BrowserCells(unittest.TestCase):
         store.seed_client_token(label, cred)
         return store, cred
 
-    def check_report(self, result, store, floors=None, zero=False, attached=None):
-        """Common oracle: schema, identity, counts, loss, earned verdict.
+    def check_report(self, result, store, floors=None, zero=False, attached=None,
+                     allowed_gaps=(), allowed_verdicts=_VERDICTS_ATTACHED, absent=None):
+        """Common oracle: schema, identity, counts, loss, gaps, earned verdict.
 
         ``attached`` pins the probe state: True (hooked the mapped module),
         False (never hooked — the module stayed unmapped), None (either).
+        ``allowed_gaps`` names the observation gap causes that provably do
+        not affect this cell's asserted property (per-cell table above);
+        every other cause fails. ``allowed_verdicts`` pins the verdict
+        details the cell earned. ``absent`` names functions that must never
+        have been called (returns, open entries, and unattributed rows).
         """
         report = oracle.load_report(result.report_path)
-        counts = oracle.module_counts(report, oracle.sha256_of(store.lib))
+        module_sha = oracle.sha256_of(store.lib)
+        counts = oracle.module_counts(report, module_sha)
+        opened = oracle.module_open_entries(report, module_sha)
         failures = []
         failures += oracle.check_no_event_loss(report)
+        failures += oracle.check_capture_intact(report)
+        failures += oracle.check_observation_gaps(report, allowed_gaps)
+        failures += oracle.check_skipped_structural(report)
         if zero:
-            failures += oracle.check_zero_counts(counts)
+            failures += oracle.check_zero_counts(counts, opened)
         else:
             failures += oracle.check_min_counts(counts, floors or {})
         if attached is True:
@@ -111,11 +150,14 @@ class BrowserCells(unittest.TestCase):
             hooked = report["evidence"].get("attached_probes", 0) or 0
             if hooked != 0:
                 failures.append(f"attached_probes={hooked}, want 0 (module never maps)")
-        failures += oracle.check_verdict(report, EARNED_VERDICTS)
+        if absent:
+            failures += oracle.check_absent(counts, absent, opened)
+        failures += oracle.check_verdict(report, allowed_verdicts)
         if failures:
             detail = {
                 "failures": failures,
                 "counts": counts,
+                "open_entries": opened,
                 "evidence": {
                     key: report["evidence"].get(key)
                     for key in ("completeness", "verdict_detail", "event_loss",
@@ -144,7 +186,8 @@ class BrowserCells(unittest.TestCase):
         self.assertEqual(result.flow.get("http_status"), 200)
         self.assertIn("g33-flow-ok", result.flow.get("body_excerpt", ""))
         self.assertTrue(result.flow.get("mapped_at_end"), "module unmapped?!")
-        self.check_report(result, store, oracle.FF_STARTUP_FLOORS, attached=True)
+        self.check_report(result, store, oracle.FF_STARTUP_FLOORS, attached=True,
+                          allowed_gaps=_GAPS_ATTACHED_FLOOR)
 
     @gate
     def test_cr_plain_never_touches_the_token(self):
@@ -162,7 +205,9 @@ class BrowserCells(unittest.TestCase):
         self.assertEqual(result.flow.get("profiler_exit"), 0)
         self.assertEqual(result.flow.get("http_status"), 200)
         self.assertFalse(result.flow.get("mapped_at_end"), "module mapped?!")
-        self.check_report(result, store, zero=True, attached=False)
+        self.check_report(result, store, zero=True, attached=False,
+                          allowed_gaps=_GAPS_NEVER_MAPPED,
+                          allowed_verdicts=_VERDICTS_NEVER_MAPPED)
 
     @gate
     def test_ff_nomod_observes_nothing(self):
@@ -176,7 +221,9 @@ class BrowserCells(unittest.TestCase):
             self.assertGreaterEqual(flow.requests_served, 1, "flow server saw no request")
         self.assertEqual(result.flow.get("observer_exit"), 0)
         self.assertGreater(result.screenshot_bytes, 0, "no screenshot bytes")
-        self.check_report(result, store, zero=True, attached=False)
+        self.check_report(result, store, zero=True, attached=False,
+                          allowed_gaps=_GAPS_NEVER_MAPPED_RUN,
+                          allowed_verdicts=_VERDICTS_NEVER_MAPPED)
 
     @gate
     def test_ff_pinbound_never_logs_in_or_signs(self):
@@ -199,10 +246,9 @@ class BrowserCells(unittest.TestCase):
         self.assertTrue(result.flow.get("mapped_at_end"), "module unmapped?!")
         # Selection enumeration races the prompt failure (x0 or x16 across
         # runs), so no count is pinned; login and signing never happen.
-        report = self.check_report(result, store, attached=True)
-        counts = oracle.module_counts(report, oracle.sha256_of(store.lib))
-        absent = oracle.check_absent(counts, ("C_Login", "C_Sign"))
-        self.assertEqual(absent, [], f"PIN boundary crossed: {absent}")
+        self.check_report(result, store, attached=True,
+                          allowed_gaps=_GAPS_ATTACHED_ABSENT,
+                          absent=("C_Login", "C_SignInit", "C_Sign"))
 
     @gate
     def test_cr_pinbound_stalls_before_any_token_use(self):
@@ -224,7 +270,9 @@ class BrowserCells(unittest.TestCase):
         self.assertEqual(result.flow.get("profiler_exit"), 0)
         self.assertFalse(result.flow.get("loaded", True), "client-cert flow loaded?!")
         self.assertFalse(result.flow.get("mapped_at_end"), "module mapped?!")
-        self.check_report(result, store, zero=True, attached=False)
+        self.check_report(result, store, zero=True, attached=False,
+                          allowed_gaps=_GAPS_NEVER_MAPPED,
+                          allowed_verdicts=_VERDICTS_NEVER_MAPPED)
 
     # -- Unprivileged counterexample twins (P2-2/P2-3; run everywhere) --
     #

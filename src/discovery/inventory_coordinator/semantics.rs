@@ -696,6 +696,7 @@ impl SemanticBindingSet {
     /// domain's; other domains' are preserved in place). Zero
     /// allocations: field moves only.
     #[cfg_attr(not(test), allow(dead_code))] // STAGED (DR37): called by install_selected_lane.
+    #[allow(clippy::result_large_err)] // DR37: cold path returning the refused capacity for genuine disposal.
     pub(crate) fn install_capacity(
         &mut self,
         capacity: PromotionInstallCapacity,

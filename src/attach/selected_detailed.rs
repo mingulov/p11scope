@@ -117,6 +117,185 @@ mod activation_tests {
         );
         assert_eq!(load(&file), CLOSED);
     }
+
+    /// DR37 native-minter twins: the production [`NativeActivationSource`]
+    /// core mints only for a bound, live, still-closed selection whose
+    /// domain and image name the expected binding, with readback. The
+    /// state cell is a real mmapable fd (the `StateControl` mapping
+    /// path), the original is a real pinned process, the CAS is the
+    /// genuine `CLOSED -> ACTIVE` exchange: only BPF publication itself
+    /// is absent.
+    fn minter_target(cookie: u64, exec_id: u64) -> SelectedTarget {
+        SelectedTarget {
+            mode: 1,
+            tgid: std::process::id(),
+            cookie,
+            exec_id,
+            parent_kind: 1,
+        }
+    }
+
+    fn minter_selection(
+        initial: u64,
+        target: SelectedTarget,
+        original: Option<std::sync::Arc<crate::process::PidPin>>,
+    ) -> (NativeSelection, std::fs::File) {
+        let (state, file) = state_cell(initial);
+        (
+            NativeSelection {
+                state,
+                target,
+                original,
+                parent: None,
+            },
+            file,
+        )
+    }
+
+    fn minter_binding(
+        domain: crate::attach::capture::NativeDomainId,
+        cookie: u64,
+        exec_id: u64,
+    ) -> crate::inventory_promotion::lifecycle::SelectedActivationBinding {
+        crate::inventory_promotion::lifecycle::SelectedActivationBinding::new(
+            domain,
+            7,
+            p11scope_ebpf_common::ImageIdentity {
+                task_cookie: cookie,
+                exec_id,
+            },
+        )
+    }
+
+    fn live_original() -> std::sync::Arc<crate::process::PidPin> {
+        std::sync::Arc::new(
+            crate::process::PidPin::open(std::process::id()).expect("the test process pins itself"),
+        )
+    }
+
+    #[test]
+    fn minter_activates_bound_closed_selection_with_readback() {
+        let domain = crate::attach::capture::NativeDomainId::try_mint().expect("mint domain");
+        let (selection, file) =
+            minter_selection(CLOSED, minter_target(9, 10), Some(live_original()));
+        let expected = minter_binding(domain, 9, 10);
+        let receipt = activate_native_selection(Some(&selection), Some(domain), &expected)
+            .expect("bound closed selection activates");
+        assert!(
+            receipt.matches(expected),
+            "the minted receipt names the activated binding"
+        );
+        assert_eq!(load(&file), ACTIVE);
+        // Exactly once: the second CAS loses honestly instead of
+        // manufacturing a second receipt.
+        assert!(
+            matches!(
+                activate_native_selection(Some(&selection), Some(domain), &expected),
+                Err(NativeActivationRefusal::NotClosed)
+            ),
+            "a second activation loses"
+        );
+        assert_eq!(load(&file), ACTIVE);
+    }
+
+    #[test]
+    fn minter_refuses_foreign_binding_without_mutation() {
+        let domain = crate::attach::capture::NativeDomainId::try_mint().expect("mint domain");
+        let foreign = crate::attach::capture::NativeDomainId::try_mint().expect("mint domain");
+        assert_ne!(domain, foreign);
+        for expected in [
+            minter_binding(foreign, 9, 10),
+            minter_binding(domain, 11, 10),
+            minter_binding(domain, 9, 12),
+        ] {
+            let (selection, file) =
+                minter_selection(CLOSED, minter_target(9, 10), Some(live_original()));
+            assert!(
+                matches!(
+                    activate_native_selection(Some(&selection), Some(domain), &expected),
+                    Err(NativeActivationRefusal::BindingMismatch)
+                ),
+                "foreign binding refuses"
+            );
+            assert_eq!(load(&file), CLOSED);
+        }
+        // No domain at all (no image owner published) disagrees too.
+        let (selection, file) =
+            minter_selection(CLOSED, minter_target(9, 10), Some(live_original()));
+        assert!(
+            matches!(
+                activate_native_selection(Some(&selection), None, &minter_binding(domain, 9, 10)),
+                Err(NativeActivationRefusal::BindingMismatch)
+            ),
+            "missing domain refuses"
+        );
+        assert_eq!(load(&file), CLOSED);
+    }
+
+    #[test]
+    fn minter_refuses_unpublished_and_settled_cells_without_mutation() {
+        let domain = crate::attach::capture::NativeDomainId::try_mint().expect("mint domain");
+        let expected = minter_binding(domain, 9, 10);
+        // Never published: no selection exists.
+        assert!(
+            matches!(
+                activate_native_selection(None, Some(domain), &expected),
+                Err(NativeActivationRefusal::NotClosed)
+            ),
+            "unpublished selection refuses"
+        );
+        // Already active or terminal: the CAS precondition is gone.
+        for initial in [ACTIVE, TERMINAL, 0, 99] {
+            let (selection, file) =
+                minter_selection(initial, minter_target(9, 10), Some(live_original()));
+            assert!(
+                matches!(
+                    activate_native_selection(Some(&selection), Some(domain), &expected),
+                    Err(NativeActivationRefusal::NotClosed)
+                ),
+                "non-closed cell refuses"
+            );
+            assert_eq!(load(&file), initial);
+        }
+    }
+
+    #[test]
+    fn minter_refuses_dead_original_without_mutation() {
+        let domain = crate::attach::capture::NativeDomainId::try_mint().expect("mint domain");
+        let expected = minter_binding(domain, 9, 10);
+        // A child pinned live, then reaped: the pid cannot be reused
+        // before the wait, so the pin names exactly the exited child.
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn a short-lived child");
+        let pid = child.id();
+        let pin = crate::process::PidPin::open(pid).expect("pin the live child");
+        assert!(child.wait().expect("reap the child").success());
+        assert!(
+            pin.original_exited().expect("exit reads"),
+            "the reaped child reads exited"
+        );
+        let target = SelectedTarget {
+            mode: 1,
+            tgid: pid,
+            cookie: 9,
+            exec_id: 10,
+            parent_kind: 1,
+        };
+        let (selection, file) = minter_selection(CLOSED, target, Some(std::sync::Arc::new(pin)));
+        // Unbound custody refuses the same closed way.
+        let (unbound, unbound_file) = minter_selection(CLOSED, minter_target(9, 10), None);
+        for (selection, file) in [(&selection, &file), (&unbound, &unbound_file)] {
+            assert!(
+                matches!(
+                    activate_native_selection(Some(selection), Some(domain), &expected),
+                    Err(NativeActivationRefusal::NotClosed)
+                ),
+                "dead or missing original refuses"
+            );
+            assert_eq!(load(file), CLOSED);
+        }
+    }
 }
 
 pub(crate) mod baseline;
@@ -151,6 +330,9 @@ pub(super) fn validate_maps(ebpf: &aya::Ebpf) -> anyhow::Result<()> {
     Ok(())
 }
 
+use crate::inventory_promotion::lifecycle::{
+    NativeActivationRefusal, NativeActivationSource, NativeCasReceipt, SelectedActivationBinding,
+};
 use anyhow::{Context as _, Result, bail, ensure};
 use aya::maps::Array;
 use p11scope_ebpf_common::ImageIdentity;
@@ -384,6 +566,68 @@ impl Drop for NativeSelection {
     fn drop(&mut self) {
         let _ = self.state.close();
     }
+}
+
+/// The production native activation minter (DR37 D3): runs exactly one
+/// `CLOSED -> ACTIVE` CAS with readback per accepted request and mints
+/// the receipt the joint proof consumes. Stateless: the Session owns
+/// the cell, the binding owns the expectation; this only proves they
+/// agree before exchanging. The resolver supplies this as the joint
+/// service's source, which is the trust chain the receipt relies on.
+#[derive(Debug, Default)]
+pub(crate) struct NativeActivationMinter;
+
+impl NativeActivationMinter {
+    pub(crate) fn new() -> Self {
+        Self
+    }
+}
+
+impl NativeActivationSource for NativeActivationMinter {
+    fn activate(
+        &mut self,
+        session: &super::Session,
+        expected: &SelectedActivationBinding,
+    ) -> Result<NativeCasReceipt, NativeActivationRefusal> {
+        activate_native_selection(
+            session.native_selection.as_ref(),
+            session.native_domain(),
+            expected,
+        )
+    }
+}
+
+/// The minter core, over the exact native parts. No selection was never
+/// published; a domain or image disagreement names another binding;
+/// otherwise the genuine CAS runs with readback. Custody gates (unbound
+/// or exited original) refuse closed through the same variant: no
+/// receipt mints, which is the fail-closed property the joint service
+/// needs. The seal generation is not a native-cell value: the sealed
+/// conversion proved it against this same owner
+/// (`SelectedConstructionPermit::validate`), and the proof mint
+/// re-checks the lane binding downstream.
+fn activate_native_selection(
+    selection: Option<&NativeSelection>,
+    domain: Option<super::capture::NativeDomainId>,
+    expected: &SelectedActivationBinding,
+) -> Result<NativeCasReceipt, NativeActivationRefusal> {
+    let Some(selection) = selection else {
+        return Err(NativeActivationRefusal::NotClosed);
+    };
+    if domain != Some(expected.domain())
+        || selection.target.cookie != expected.image().task_cookie
+        || selection.target.exec_id != expected.image().exec_id
+    {
+        return Err(NativeActivationRefusal::BindingMismatch);
+    }
+    selection
+        .activate()
+        .map_err(|_| NativeActivationRefusal::NotClosed)?;
+    selection
+        .state
+        .active()
+        .map_err(|_| NativeActivationRefusal::NotClosed)?;
+    Ok(NativeCasReceipt::minted(*expected))
 }
 
 pub(super) fn load_bootstrap(ebpf: &mut aya::Ebpf, btf: &aya::Btf) -> Result<()> {

@@ -8730,6 +8730,148 @@ pub(crate) mod tests {
         )
     }
 
+    #[test]
+    fn scoped_driver_child_inherits_no_observer_fds() {
+        // Anti-wedge regression: a SIGSTOPped fixture orphaned by an
+        // aborted run must hold no observer fd — notably the
+        // cargo-lane lock, which flock(1) holds without CLOEXEC by
+        // design and which an inheriting orphan wedges via the shared
+        // open file description. The twin holds two marker fds with
+        // CLOEXEC cleared (mimicking the lock fd) across the real
+        // spawn, then asserts the stopped child's table carries
+        // neither file. Fails pre-fix with both markers inherited.
+        use std::os::fd::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let provider = gcc(
+            dir.path(),
+            "scoped-provider.so",
+            &manifest.join("crates/discover/tests/fixture/version_matrix.c"),
+            &["-shared", "-fPIC", "-DLEGACY_MINOR=40"],
+            &[],
+        );
+        gcc(
+            dir.path(),
+            "scoped-driver",
+            &manifest.join("tests/fixtures/catalog-driver.c"),
+            &["-O2", "-Wall", "-Wextra", "-Werror"],
+            &["-ldl"],
+        );
+        let held_a = std::fs::File::open(&provider).unwrap();
+        let held_b = std::fs::File::open(dir.path().join("scoped-driver")).unwrap();
+        let mut markers = Vec::new();
+        for held in [&held_a, &held_b] {
+            let fd = held.as_raw_fd();
+            assert!(fd >= 3, "markers stand past stdio");
+            // SAFETY: fd names our own open marker; clearing CLOEXEC
+            // mimics flock(1)'s lock fd across exec.
+            assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFD, 0) }, 0);
+            markers.push(std::fs::read_link(format!("/proc/self/fd/{fd}")).unwrap());
+        }
+        let ready = dir.path().join("ready");
+        let child = crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild::spawn_stopped(
+            std::process::Command::new(dir.path().join("scoped-driver"))
+                .arg("--ready")
+                .arg(&ready)
+                .arg("--call")
+                .arg(&provider)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null()),
+            |pid| {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !ready.exists() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "owned provider child did not finish startup"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                // SAFETY: pid names the child retained by spawn_stopped.
+                assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGSTOP) }, 0);
+            },
+        );
+        // A stopped child still answers /proc: compare file targets,
+        // never bare numbers (the child's own fds may reuse them).
+        let mut leaked = Vec::new();
+        for entry in std::fs::read_dir(format!("/proc/{}/fd", child.id())).unwrap() {
+            let target = std::fs::read_link(entry.unwrap().path()).unwrap();
+            if markers.contains(&target) {
+                leaked.push(target);
+            }
+        }
+        assert!(
+            leaked.is_empty(),
+            "the fixture inherits no observer fds, leaked: {leaked:?}"
+        );
+    }
+
+    #[test]
+    fn scoped_driver_dies_with_aborted_observer() {
+        // Anti-orphan regression: the fixture dies with its observer
+        // even while SIGSTOPped, instead of lingering stopped under
+        // init. The twin orphans a real driver through an exiting
+        // shell (no OwnedStoppedChild: nothing reaps it) and asserts
+        // the driver pid is gone within seconds, not sleeping its
+        // 300s. The sibling twin above proves this same binary starts
+        // correctly, so a missing pid means the death signal worked.
+        // Fails pre-fix with the orphaned driver still sleeping.
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let provider = gcc(
+            dir.path(),
+            "scoped-provider.so",
+            &manifest.join("crates/discover/tests/fixture/version_matrix.c"),
+            &["-shared", "-fPIC", "-DLEGACY_MINOR=40"],
+            &[],
+        );
+        gcc(
+            dir.path(),
+            "scoped-driver",
+            &manifest.join("tests/fixtures/catalog-driver.c"),
+            &["-O2", "-Wall", "-Wextra", "-Werror"],
+            &["-ldl"],
+        );
+        let ready = dir.path().join("ready");
+        let pidfile = dir.path().join("driver.pid");
+        let mut sh = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!(
+                "{} --ready {} --call {} & echo $! > {}",
+                dir.path().join("scoped-driver").display(),
+                ready.display(),
+                provider.display(),
+                pidfile.display()
+            ))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        sh.wait().unwrap();
+        let pid: u32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            // SAFETY: kill(pid, 0) only probes existence.
+            let alive = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
+            if !alive {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                // SAFETY: pid names only the twin's orphaned driver.
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                }
+                panic!("orphaned fixture still lives 5s after its observer died: {pid}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     struct ReturningLivenessSource {
         control: CollectionControl,
         armed: std::rc::Rc<std::cell::Cell<bool>>,

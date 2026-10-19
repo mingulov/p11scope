@@ -6422,9 +6422,69 @@ pub(crate) mod demotion_retirement_producer_tests {
             Self::spawn_stopped(Command::new("/bin/sh").args(["-c", command]), |_| {})
         }
 
+        /// Abort-proof an explicitly-owned fixture spawn: the child dies
+        /// with its observer even while SIGSTOPped, and keeps no
+        /// inherited fd past stdio.
+        ///
+        /// Drop reaps on every unwind path, but an aborted observer
+        /// (SIGABRT/SIGKILL) runs no teardown, orphaning its stopped
+        /// child with every inherited fd — including the cargo-lane
+        /// lock, which flock(1) holds without CLOEXEC by design and
+        /// which the orphan then wedges via the shared open file
+        /// description. The hook therefore arms a parent-death SIGKILL
+        /// (a parent already gone exits before exec) and scrubs every
+        /// fd past stdio that would survive the exec. Async-signal-safe
+        /// syscalls only; the bounded loop costs milliseconds.
+        pub(crate) fn harden_spawn(command: &mut Command) {
+            use std::os::unix::process::CommandExt;
+            // The orphan check compares against the owner at fork: a
+            // live subreaper may adopt the child before the hook runs,
+            // so testing for init alone misses live adoption, and the
+            // death signal never fires for a death that predates it.
+            let owner = std::process::id();
+            // SAFETY: the hook runs after fork before exec; its body
+            // uses async-signal-safe syscalls only (prctl, getppid,
+            // getrlimit, fcntl, close, _exit), closes child fds only,
+            // allocates nothing and touches no parent memory. stdio is
+            // already dup2ed onto 0..3 before hooks run, so the sweep
+            // cannot break redirection; CLOEXEC-marked fds stay open
+            // because that set carries Rust's spawn-error channel, whose
+            // EOF the parent reads as exec success — closing it would
+            // turn an exec failure into a bogus Ok child. CLOEXEC fds
+            // vanish at exec anyway, so keeping them leaks nothing.
+            unsafe {
+                command.pre_exec(move || {
+                    libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong);
+                    if libc::getppid() != owner as libc::pid_t {
+                        libc::_exit(127);
+                    }
+                    // No fd at or past RLIMIT_NOFILE can be open; the
+                    // clamp keeps a raised ceiling from turning the
+                    // sweep into a long loop (test fixtures never
+                    // approach a million fds).
+                    let mut ceiling: libc::rlim_t = 65536;
+                    let mut limit = libc::rlimit {
+                        rlim_cur: 0,
+                        rlim_max: 0,
+                    };
+                    if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 {
+                        ceiling = limit.rlim_cur.clamp(3, 1 << 20);
+                    }
+                    for fd in 3..ceiling as libc::c_int {
+                        let flags = libc::fcntl(fd, libc::F_GETFD);
+                        if flags >= 0 && (flags & libc::FD_CLOEXEC) == 0 {
+                            libc::close(fd);
+                        }
+                    }
+                    Ok(())
+                });
+            }
+        }
+
         pub(crate) fn spawn_stopped(command: &mut Command, after_spawn: impl FnOnce(u32)) -> Self {
             // The child reaches its readiness handshake after dynamic startup.
             // A confirmed SIGSTOP then holds its maps stable during the scan.
+            Self::harden_spawn(command);
             let mut owned = Self(Some(command.spawn().unwrap()));
             after_spawn(owned.id());
             let pid = owned.id() as libc::pid_t;

@@ -6444,7 +6444,7 @@ pub(crate) mod demotion_retirement_producer_tests {
             let owner = std::process::id();
             // SAFETY: the hook runs after fork before exec; its body
             // uses async-signal-safe syscalls only (prctl, getppid,
-            // getrlimit, fcntl, close, _exit), closes child fds only,
+            // close_range, fcntl, close, _exit), closes child fds only,
             // allocates nothing and touches no parent memory. stdio is
             // already dup2ed onto 0..3 before hooks run, so the sweep
             // cannot break redirection; CLOEXEC-marked fds stay open
@@ -6458,22 +6458,27 @@ pub(crate) mod demotion_retirement_producer_tests {
                     if libc::getppid() != owner as libc::pid_t {
                         libc::_exit(127);
                     }
-                    // No fd at or past RLIMIT_NOFILE can be open; the
-                    // clamp keeps a raised ceiling from turning the
-                    // sweep into a long loop (test fixtures never
-                    // approach a million fds).
-                    let mut ceiling: libc::rlim_t = 65536;
-                    let mut limit = libc::rlimit {
-                        rlim_cur: 0,
-                        rlim_max: 0,
-                    };
-                    if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 {
-                        ceiling = limit.rlim_cur.clamp(3, 1 << 20);
-                    }
-                    for fd in 3..ceiling as libc::c_int {
-                        let flags = libc::fcntl(fd, libc::F_GETFD);
-                        if flags >= 0 && (flags & libc::FD_CLOEXEC) == 0 {
-                            libc::close(fd);
+                    // Existing fds survive RLIMIT_NOFILE lowering,
+                    // so an rlimit-bounded sweep misses descriptors
+                    // above a lowered soft limit. close_range covers
+                    // the whole table; CLOEXEC (not close) keeps
+                    // Rust's already-CLOEXEC spawn-error channel
+                    // intact, and every marked fd vanishes at exec.
+                    if libc::close_range(
+                        3,
+                        libc::c_uint::MAX,
+                        libc::CLOSE_RANGE_CLOEXEC as libc::c_int,
+                    ) != 0
+                    {
+                        // Pre-5.9 kernels: sweep a fixed cap
+                        // regardless of the limit, still preserving
+                        // CLOEXEC fds (test fixtures never approach
+                        // a million fds).
+                        for fd in 3..(1 << 20) {
+                            let flags = libc::fcntl(fd, libc::F_GETFD);
+                            if flags >= 0 && (flags & libc::FD_CLOEXEC) == 0 {
+                                libc::close(fd);
+                            }
                         }
                     }
                     Ok(())

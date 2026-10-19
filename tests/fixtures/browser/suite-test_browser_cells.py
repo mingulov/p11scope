@@ -114,7 +114,8 @@ def _stall_outcomes(server) -> str:
 
 #: Installed mode: set P11SCOPE_BROWSER_STRICT=1 on a qualified installed
 #: host (T11) to turn prerequisite skips into failures, requiring the
-#: expected cells to execute. Unset keeps the self-skipping hosted default.
+#: expected cells to execute; an empty selection fails outright. Unset
+#: keeps the self-skipping hosted default.
 STRICT = os.environ.get("P11SCOPE_BROWSER_STRICT") == "1"
 
 
@@ -1060,13 +1061,16 @@ class BrowserCells(unittest.TestCase):
         empty = [sys.executable, "-I", str(target), "-k", "definitely_no_such_test_zzz"]
         strict_run = stdlib_subprocess.run(
             empty, capture_output=True, text=True, check=False, env=strict, timeout=120)
-        self.assertNotEqual(
-            strict_run.returncode, 0, "strict mode accepted an empty selection")
+        self.assertEqual(
+            strict_run.returncode, 2,
+            f"strict mode must fail an empty selection explicitly: {strict_run.stderr[-500:]}")
         self.assertIn("empty selection", strict_run.stderr)
         plain_run = stdlib_subprocess.run(
             empty, capture_output=True, text=True, check=False, env=base, timeout=120)
-        self.assertEqual(plain_run.returncode, 0,
-                         f"self-skipping default must accept it: {plain_run.stderr[-500:]}")
+        # The self-skipping default keeps native unittest exit behavior
+        # (version-defined for empty selections); it just never raises
+        # the strict failure.
+        self.assertNotIn("empty selection", plain_run.stderr)
         picked = stdlib_subprocess.run(
             [sys.executable, "-I", str(target), "-k", "test_capture_ready_parsing"],
             capture_output=True, text=True, check=False, env=strict, timeout=120)
@@ -1075,4 +1079,17 @@ class BrowserCells(unittest.TestCase):
 
 
 if __name__ == "__main__":
+    # Expected-cell execution guard: in strict installed mode the suite
+    # must actually run selected cells — an empty selection (a filter
+    # matching nothing, a typo'd name) fails instead of succeeding
+    # silently. Nonempty subsets stay legal for single-focus runs. The
+    # self-skipping default keeps native unittest exit behavior.
+    if STRICT:
+        _program = unittest.main(verbosity=2, exit=False)
+        _result = _program.result
+        if _result.testsRun == 0:
+            print("strict installed mode requires selected cells to execute "
+                  "(empty selection)", file=sys.stderr)
+            sys.exit(2)
+        sys.exit(0 if _result.wasSuccessful() else 1)
     unittest.main(verbosity=2)

@@ -1753,15 +1753,36 @@ fn operator_diagnostics_wrap_reads_only_new_complete_lines() -> Result<()> {
     Ok(())
 }
 
-/// Strict paired off/on comparison (Sol). STUB: always fails until the
-/// strict-parity rework lands.
+/// Strict paired off/on comparison (Sol): both legs run the identical
+/// deterministic issued schedule with milestone gating (the matched
+/// prelude), so they must validate the same startup disposition and their
+/// owned primary facts must compare exactly equal. No count replacement:
+/// replacing both A counts before comparison proves conditional agreement
+/// only, and different legitimate dispositions each pass their own oracle
+/// without proving literal count equality. Expected counts come from the
+/// issued schedule plus observed startup gaps, never from reported
+/// diagnostics.
 fn check_paired_parity(
-    _disabled: &serde_json::Value,
-    _dk: u64,
-    _enabled: &serde_json::Value,
-    _ek: u64,
+    disabled: &serde_json::Value,
+    dk: u64,
+    enabled: &serde_json::Value,
+    ek: u64,
 ) -> Result<()> {
-    bail!("paired-parity stub: strict comparison not implemented")
+    ensure!(
+        disabled["edges"]["provider-A.so"]["count"] == expected_a(COUNTED, dk)
+            && enabled["edges"]["provider-A.so"]["count"] == expected_a(COUNTED, ek),
+        "leg A contradicts its validated disposition: dk={dk} ek={ek}"
+    );
+    ensure!(
+        dk == ek,
+        "paired legs disagree on startup disposition: dk={dk} ek={ek}"
+    );
+    ensure!(
+        disabled == enabled,
+        "diagnostics changed primary count/coverage/loss facts: off={disabled}, on={enabled}, dk={dk}, ek={ek}"
+    );
+    eprintln!("G21_PARITY dk={dk} ek={ek} match=true");
+    Ok(())
 }
 
 #[test]
@@ -1769,26 +1790,7 @@ fn check_paired_parity(
 fn privileged_native_lane_pid_diagnostics_wrap_and_primary_parity_lp64() -> Result<()> {
     let (disabled, dk) = run_wrap(false)?;
     let (enabled, ek) = run_wrap(true)?;
-    // Each leg already validated its own A == 12800-k against caller-bound
-    // gap evidence; the paired comparison preserves (never erases) the two
-    // independently validated dispositions by normalizing each A by its own
-    // k. Expected counts come from the issued schedule plus observed startup
-    // gaps, never from reported diagnostics.
-    ensure!(
-        disabled["edges"]["provider-A.so"]["count"] == COUNTED * TARGETS - dk
-            && enabled["edges"]["provider-A.so"]["count"] == COUNTED * TARGETS - ek,
-        "leg A contradicts its validated disposition: dk={dk} ek={ek}"
-    );
-    let mut d_norm = disabled.clone();
-    let mut e_norm = enabled.clone();
-    d_norm["edges"]["provider-A.so"]["count"] = serde_json::json!(COUNTED * TARGETS);
-    e_norm["edges"]["provider-A.so"]["count"] = serde_json::json!(COUNTED * TARGETS);
-    ensure!(
-        d_norm == e_norm,
-        "diagnostics changed primary count/coverage/loss facts: off={disabled}, on={enabled}, dk={dk}, ek={ek}"
-    );
-    eprintln!("G21_PARITY dk={dk} ek={ek} match=true");
-    Ok(())
+    check_paired_parity(&disabled, dk, &enabled, ek)
 }
 
 /// Validate the small probe's actual dispositions independently of its progress

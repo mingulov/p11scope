@@ -128,11 +128,14 @@ What the catalog proves:
 6. **Verdicts are `PARTIAL`, honestly.** Scan-path captures without
    operator manifests report `attribution_only` (counts exact) or
    `concrete_gap` (window caveats: loader races, unconfirmed pause,
-   never-mapped modules). The oracle pins the earned verdict per cell and
-   asserts zero event loss; it never requires `COMPLETE`. Trace-mode
-   executable labels stay `Unknown` on these short captures (privacy
-   sampling); profile cells anchor attribution via scope PID plus module
-   identity instead.
+   never-mapped modules). The oracle pins the earned verdict per cell,
+   allowlists the observation gap causes each cell tolerates (only causes
+   that provably do not affect its asserted property), rejects halted or
+   refused captures everywhere, and asserts zero event loss; it never
+   requires `COMPLETE`. Absence checks count entered-but-unreturned
+   calls and refuse unattributed rows. Trace-mode executable labels stay
+   `Unknown` on these short captures (privacy sampling); profile cells
+   anchor attribution via scope PID plus module identity instead.
 
 ## Registration
 

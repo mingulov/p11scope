@@ -616,12 +616,13 @@ fn primary_facts(document: &serde_json::Value, pid: u32) -> Result<serde_json::V
                 && entries["in_flight"] == false
                 && entries["cap"].as_u64().is_some()
         );
-        let expected_presence = if a { "unloaded" } else { "mapped" };
-        let expected_capture = if a { "retired" } else { "armed" };
+        // Snapshot edges carry mapping/module lifecycle, never the
+        // event-only `presence`/`capture` presentation states.
+        let expected_mapping = if a { "ended" } else { "mapped" };
+        let expected_lifecycle = if a { "unloaded" } else { "mapped" };
         ensure!(
-            edge["presence"] == expected_presence
-                && edge["capture"] == expected_capture
-                && module["lifecycle"] == expected_presence
+            edge["mapping"]["state"] == expected_mapping
+                && module["lifecycle"] == expected_lifecycle
         );
         ensure!(module["unloaded_observed"].is_boolean());
         let state = coverage["state"].as_str().context("coverage state")?;
@@ -651,8 +652,7 @@ fn primary_facts(document: &serde_json::Value, pid: u32) -> Result<serde_json::V
             "has_since":time_shape(coverage,"since_ns")?,"has_until":time_shape(coverage,"until_ns")?,
             "has_first":time_shape(coverage,"first_ns")?});
         let mapping = &edge["mapping"];
-        let value = serde_json::json!({"presence":edge["presence"],"capture":edge["capture"],
-            "mapping_state":mapping["state"],"mapping_evidence":mapping["evidence"],
+        let value = serde_json::json!({"mapping_state":mapping["state"],"mapping_evidence":mapping["evidence"],
             "mapping_reason":mapping["reason"],"mapping_interruptions":mapping["interruptions"],
             "has_mapping_first":time_shape(mapping,"first_seen_ns")?,"has_mapping_last":time_shape(mapping,"last_seen_ns")?,
             "count":entries["count"],"observation":entries["observation"],"saturated":entries["saturated"],
@@ -869,38 +869,86 @@ fn run_wrap(enabled: bool) -> Result<serde_json::Value> {
     Ok(facts)
 }
 
+/// One wrap-pair edge rendered through the actual snapshot serializer, so
+/// the host fixture cannot drift from installed output again (the G21
+/// oracle failure: the old fixture invented event-only `presence`/
+/// `capture` keys the renderer never emits).
+fn fixture_edge_json(
+    caller: crate::discovery::caller_registry::CallerId,
+    module: crate::discovery::caller_registry::ModuleId,
+    shift: u64,
+    is_a: bool,
+) -> serde_json::Value {
+    use crate::discovery::caller_registry::{
+        MappingEvidence, MappingState, SEMANTIC_UNKNOWN, UnknownReason, UseCoverage,
+    };
+    use crate::inventory_present::{Activity, Capture, EdgeSemanticsView, EdgeView, Presence};
+    crate::inventory::edge_json(&EdgeView {
+        caller,
+        module,
+        mapping: if is_a {
+            MappingState::Ended
+        } else {
+            MappingState::Mapped
+        },
+        mapping_reason: None,
+        mapping_evidence: MappingEvidence::DeepScan,
+        mapping_first_seen_ns: 100 + shift,
+        mapping_last_seen_ns: 200 + shift,
+        mapping_interruptions: 0,
+        entry_count: if is_a { COUNTED * TARGETS } else { TARGETS },
+        entry_saturated: false,
+        entry_first_seen_ns: Some(120 + shift),
+        entry_last_seen_ns: Some(180 + shift),
+        entry_in_flight: false,
+        entry_observation: "observed",
+        coverage: if is_a {
+            UseCoverage::Unknown(UnknownReason::NotAttached)
+        } else {
+            UseCoverage::Counted {
+                since_ns: 110 + shift,
+                lossy: false,
+            }
+        },
+        presence: if is_a {
+            Presence::Unloaded
+        } else {
+            Presence::Mapped
+        },
+        capture: if is_a {
+            Capture::Retired
+        } else {
+            Capture::Armed
+        },
+        activity: if is_a {
+            Activity::Unknown
+        } else {
+            Activity::RecentlyObserved
+        },
+        semantics: EdgeSemanticsView {
+            label: SEMANTIC_UNKNOWN,
+            mechanisms: Vec::new(),
+            operations: None,
+        },
+    })
+}
+
 /// Host-only validator documents. These do not constitute installed capture or
 /// wrap evidence; the ignored gate always reads the actual product output.
 fn primary_validator_fixture(pid: u32, shift: u64) -> serde_json::Value {
-    let caller = format!("c{shift}");
-    let a = format!("m{}", shift + 1);
-    let b = format!("m{}", shift + 2);
-    let edge = |module: &str, is_a: bool| {
-        serde_json::json!({
-            "caller":caller,"module":module,
-            "presence":if is_a {"unloaded"} else {"mapped"},
-            "capture":if is_a {"retired"} else {"armed"},
-            "mapping":{"state":if is_a {"ended"} else {"mapped"},"evidence":"deep_scan", "reason":null,
-                "interruptions":0,"first_seen_ns":100+shift,"last_seen_ns":200+shift},
-            "entries":{"count":if is_a {COUNTED*TARGETS} else {TARGETS},"saturated":false,
-                "cap":u64::MAX,"in_flight":false,"observation":"observed",
-                "first_seen_ns":120+shift,"last_seen_ns":180+shift,
-                "coverage":{"state":if is_a {"unknown"} else {"counted"},
-                    "reason":if is_a {serde_json::json!("not_attached")} else {serde_json::Value::Null},
-                    "detail":null,"lossy":if is_a {serde_json::Value::Null} else {serde_json::json!(false)},
-                    "since_ns":if is_a {serde_json::Value::Null} else {serde_json::json!(110+shift)},
-                    "until_ns":null,"first_ns":null}}
-        })
-    };
+    use crate::discovery::caller_registry::{CallerId, ModuleId};
+    let caller = CallerId(shift as u32);
+    let a = ModuleId(shift as u32 + 1);
+    let b = ModuleId(shift as u32 + 2);
     serde_json::json!({
         "observation":{"lane":"native","settlement":"unsettled","retirement":"closed",
             "lifecycle":{"records":shift+10,"ring_loss":0,"malformed":0,"failed_quanta":0,"recovery_rescans":0},
             "native_witnesses":{"rows":shift+20,"bound":shift+20,"unbound":0,"pending":0,"integrity":0,
                 "unbound_reasons":{},"placement":{"edge":shift+20,"module":0,"ambiguous":0,"unresolved":0}}},
-        "callers":[{"id":caller,"pid":pid,"lifecycle":"mapped","retired":false,"lifecycle_reason":null}],
-        "modules":[{"id":a,"paths":["/owned/provider-A.so"],"lifecycle":"unloaded","unloaded_observed":true},
-            {"id":b,"paths":["/owned/provider-B.so"],"lifecycle":"mapped","unloaded_observed":false}],
-        "edges":[edge(&a,true),edge(&b,false)],"gaps":[]
+        "callers":[{"id":caller.label(),"pid":pid,"lifecycle":"mapped","retired":false,"lifecycle_reason":null}],
+        "modules":[{"id":a.label(),"paths":["/owned/provider-A.so"],"lifecycle":"unloaded","unloaded_observed":true},
+            {"id":b.label(),"paths":["/owned/provider-B.so"],"lifecycle":"mapped","unloaded_observed":false}],
+        "edges":[fixture_edge_json(caller,a,shift,true),fixture_edge_json(caller,b,shift,false)],"gaps":[]
     })
 }
 
@@ -956,8 +1004,8 @@ fn operator_diagnostics_wrap_primary_validator_preserves_meaningful_facts() -> R
         "missing_label",
         "duplicate_module",
         "count",
-        "presence",
-        "capture",
+        "mapping_state",
+        "module_lifecycle",
         "loss",
         "lossy",
     ] {
@@ -990,8 +1038,8 @@ fn operator_diagnostics_wrap_primary_validator_preserves_meaningful_facts() -> R
                 altered["modules"][1]["id"] = duplicate;
             }
             "count" => altered["edges"][0]["entries"]["count"] = 1.into(),
-            "presence" => altered["edges"][0]["presence"] = "mapped".into(),
-            "capture" => altered["edges"][0]["capture"] = "armed".into(),
+            "mapping_state" => altered["edges"][0]["mapping"]["state"] = "mapped".into(),
+            "module_lifecycle" => altered["modules"][0]["lifecycle"] = "mapped".into(),
             "loss" => altered["edges"][0]["entries"]["coverage"]["reason"] = "loss".into(),
             _ => altered["edges"][1]["entries"]["coverage"]["lossy"] = true.into(),
         }
@@ -1468,7 +1516,7 @@ fn privileged_native_lane_pid_diagnostics_three_round_startup_probe_lp64() -> Re
     }
     ensure!(observation["native_witnesses"]["integrity"] == 0);
     let edges = doc_edges(&document, pid);
-    if edges.len() != 1 || edges[0]["presence"] != "mapped" {
+    if edges.len() != 1 || edges[0]["mapping"]["state"] != "mapped" {
         // The private fixture directory is removed on return. Keep bounded
         // actual output in the failing test log before rejecting its shape;
         // these diagnostics never replace the acceptance predicate below.
@@ -1497,7 +1545,7 @@ fn privileged_native_lane_pid_diagnostics_three_round_startup_probe_lp64() -> Re
         }
     }
     ensure!(
-        edges.len() == 1 && edges[0]["presence"] == "mapped",
+        edges.len() == 1 && edges[0]["mapping"]["state"] == "mapped",
         "actual final caller edge shape differs from the probe's one mapped provider"
     );
     let module = &edges[0]["module"];

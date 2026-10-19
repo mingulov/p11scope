@@ -29,6 +29,52 @@ class TLSError(RuntimeError):
 #: so a peeked first byte distinguishes TLS speakers from garbage.
 TLS_HANDSHAKE_FIRST_BYTE = 0x16
 
+#: Cap for one peeked ClientHello flight: a real first flight is ~0.5-2KB
+#: in one record; anything past the cap fails closed as incomplete.
+MAX_HELLO_PEEK = 65536
+
+
+def client_hello_status(buf: bytes) -> str:
+    """Classify buffered handshake bytes for the ClientHello proof.
+
+    Returns ``"complete"`` (a full ClientHello is buffered),
+    ``"need_more"`` (consistent so far, more bytes needed), ``"non_tls"``
+    (the first byte is not a handshake record), or ``"not_hello"`` (a
+    complete first record that is not a ClientHello, or a zero-length
+    record). A handshake fragmented across records is followed; only the
+    first handshake message must be a ClientHello.
+    """
+    if not buf:
+        return "need_more"
+    if buf[0] != TLS_HANDSHAKE_FIRST_BYTE:
+        return "non_tls"
+    offset = 0
+    first = True
+    need = 0
+    have = 0
+    while True:
+        if len(buf) < offset + 5:
+            return "need_more"
+        if buf[offset] != TLS_HANDSHAKE_FIRST_BYTE:
+            return "not_hello"
+        rec_len = int.from_bytes(buf[offset + 3:offset + 5], "big")
+        if rec_len == 0:
+            return "not_hello"
+        if len(buf) < offset + 5 + rec_len:
+            return "need_more"
+        payload = buf[offset + 5:offset + 5 + rec_len]
+        if first:
+            if len(payload) < 4 or payload[0] != 0x01:  # handshake type client_hello
+                return "not_hello"
+            need = int.from_bytes(payload[1:4], "big")
+            have = len(payload) - 4
+            first = False
+        else:
+            have += len(payload)
+        offset += 5 + rec_len
+        if have >= need:
+            return "complete"
+
 
 def classify_handshake_error(exc: BaseException) -> str:
     """Bucket a failed server-side ``wrap_socket`` into an outcome.
@@ -37,11 +83,13 @@ def classify_handshake_error(exc: BaseException) -> str:
     empty certificate: selection reached, nothing offered), ``"cert_alert"``
     (the client refused with certificate_unknown: ambiguous between a
     selection refusal and a server-cert rejection, so tolerated but never
-    a witness), ``"stall"`` (a TLS-speaking peer never finished: stuck at
-    selection), ``"abandoned"`` (the peer went away mid-handshake: EOF or
+    a witness), ``"stall"`` (a peer that sent a complete ClientHello never
+    finished: stuck at selection, after the server's CertificateRequest
+    flight), ``"abandoned"`` (the peer went away mid-handshake: EOF or
     reset, carrying no selection information), or ``"failure"`` (an
     unrelated protocol failure: garbage, version/decipher errors, or any
-    other alert). Only reached for peers the peek already saw speak TLS.
+    other alert). Only called after a complete ClientHello: peek-phase
+    timeouts are abandoned, never stalls.
     """
     upper = f"{type(exc).__name__}: {exc}".upper()
     if "PEER_DID_NOT_RETURN_A_CERTIFICATE" in upper or "PEER DID NOT RETURN A CERTIFICATE" in upper:
@@ -90,14 +138,17 @@ class FlowServer:
     is meaningless there and refused.
 
     TLS ground truth per connection: ``connections`` (accepts),
-    ``spoke_tls`` (peers that sent a TLS ClientHello), ``handshakes_ok``
-    (completed handshakes), ``client_certs_presented`` (peer cert seen at
-    handshake time, independent of requests), ``empty_certs`` (full
-    handshake with an empty client certificate), ``selection_stalls``
-    (TLS-speaking peers that never finished), ``client_cert_alerts``
-    (certificate_unknown refusals: tolerated, never a witness),
-    ``abandoned`` (peers that went away without selection information:
-    EOF, reset, or silence), ``handshake_failures`` with the first
+    ``spoke_tls`` (peers whose first byte opened a handshake record:
+    diagnostic only, never a witness), ``client_hello_complete`` (peers
+    that buffered a complete ClientHello: selection could begin),
+    ``handshakes_ok`` (completed handshakes), ``client_certs_presented``
+    (peer cert seen at handshake time, independent of requests),
+    ``empty_certs`` (full handshake with an empty client certificate),
+    ``selection_stalls`` (complete-hello peers that never finished: stuck
+    at selection), ``client_cert_alerts`` (certificate_unknown refusals:
+    tolerated, never a witness), ``abandoned`` (peers that went away
+    without selection information: EOF, reset, silence, or an incomplete
+    ClientHello), ``handshake_failures`` with the first
     ``handshake_errors`` (unrelated protocol failures).
     """
 
@@ -111,6 +162,7 @@ class FlowServer:
     client_certs_presented: int = 0
     handshakes_ok: int = 0
     spoke_tls: int = 0
+    client_hello_complete: int = 0
     empty_certs: int = 0
     selection_stalls: int = 0
     client_cert_alerts: int = 0
@@ -214,39 +266,70 @@ class FlowServer:
                 server.connections += 1
                 if context is None:
                     return conn, client_address
-                # Peek before wrapping: the first byte proves whether the
-                # peer engaged in TLS at all, and peeking never consumes,
-                # so the handshake below proceeds undisturbed.
+                # Peek before wrapping: a complete ClientHello proves the
+                # peer reached the selection boundary, and peeking never
+                # consumes, so the handshake below proceeds undisturbed.
+                # Anything less (silence, close, reset, or an unfinished
+                # first flight) carries no selection information.
                 deadline = time.monotonic() + server.HANDSHAKE_TIMEOUT
                 conn.settimeout(server.HANDSHAKE_TIMEOUT)
-                try:
-                    head = conn.recv(5, socket.MSG_PEEK)
-                except TimeoutError:
-                    server.note_handshake("abandoned", "silent: no bytes before the deadline")
+                buf = b""
+                status = "need_more"
+                while status == "need_more":
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    conn.settimeout(remaining)
+                    try:
+                        chunk = conn.recv(MAX_HELLO_PEEK, socket.MSG_PEEK)
+                    except TimeoutError:
+                        break
+                    except OSError as exc:
+                        server.note_handshake("abandoned", f"peek {type(exc).__name__}: {exc}"[:160])
+                        conn.close()
+                        raise
+                    if not chunk:
+                        server.note_handshake("abandoned", "peer closed before sending bytes")
+                        conn.close()
+                        raise ConnectionError("peer closed before sending TLS bytes")
+                    if len(chunk) == len(buf):
+                        time.sleep(0.02)  # no new bytes yet; avoid spinning
+                        continue
+                    buf = chunk
+                    status = client_hello_status(buf)
+                if status == "need_more":
+                    if buf[:1] == bytes((TLS_HANDSHAKE_FIRST_BYTE,)):
+                        server.spoke_tls += 1
+                    server.note_handshake(
+                        "abandoned",
+                        f"incomplete ClientHello: {len(buf)} bytes before the deadline")
                     conn.close()
-                    raise
-                except OSError as exc:
-                    server.note_handshake("abandoned", f"peek {type(exc).__name__}: {exc}"[:160])
+                    raise TimeoutError("TLS ClientHello never completed before the deadline")
+                if status == "non_tls":
+                    server.note_handshake("failure", f"non-TLS first byte {buf[0]:#04x}")
                     conn.close()
-                    raise
-                if not head:
-                    server.note_handshake("abandoned", "peer closed before sending bytes")
-                    conn.close()
-                    raise ConnectionError("peer closed before sending TLS bytes")
-                if head[0] != TLS_HANDSHAKE_FIRST_BYTE:
-                    server.note_handshake("failure", f"non-TLS first byte {head[0]:#04x}")
-                    conn.close()
-                    raise ValueError(f"peer spoke non-TLS bytes: {bytes(head[:5])!r}")
+                    raise ValueError(f"peer spoke non-TLS bytes: {bytes(buf[:5])!r}")
                 server.spoke_tls += 1
+                if status == "not_hello":
+                    server.note_handshake("failure", "TLS first record is not a ClientHello")
+                    conn.close()
+                    raise ValueError("peer spoke TLS but not a ClientHello first")
+                server.client_hello_complete += 1
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    server.note_handshake("stall", "deadline exhausted by the peek")
+                    # The hello finished exactly at the deadline: the
+                    # server flight never went out, so selection never
+                    # began — no witness without that proof.
+                    server.note_handshake("abandoned", "deadline exhausted before the wrap")
                     conn.close()
-                    raise TimeoutError("TLS handshake deadline exhausted by the peek")
+                    raise TimeoutError("TLS handshake deadline exhausted after the ClientHello")
                 conn.settimeout(remaining)
                 try:
                     tls_conn = context.wrap_socket(conn, server_side=True)
                 except (OSError, ValueError) as exc:
+                    # Only reached after a complete ClientHello, so a
+                    # timeout here means the peer went silent after the
+                    # server's CertificateRequest flight: selection began.
                     server.note_handshake(
                         classify_handshake_error(exc),
                         f"{type(exc).__name__}: {exc}"[:160])

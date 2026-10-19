@@ -60,6 +60,20 @@ impl SelectedPreparationFailure {
         Self::before_links(anyhow::anyhow!("scripted pre-link preparation failure"))
     }
 
+    /// Tests-only unproved failure: cleanup that proved nothing, so
+    /// the DR37 service's process-lifetime retention runs without
+    /// native maps. Production unproved owners always retain real
+    /// Sessions.
+    #[cfg(test)]
+    pub(crate) fn scripted_unproved() -> Self {
+        Self {
+            session: None,
+            reason: SemanticRefusal::Attachment,
+            diagnostic: anyhow::anyhow!("scripted unproved preparation failure"),
+            status: SelectedCleanupStatus::Unproved,
+        }
+    }
+
     pub(crate) fn semantic_refusal(&self) -> SemanticRefusal {
         self.reason
     }

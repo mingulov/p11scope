@@ -1221,6 +1221,20 @@ fn finish_semantic_native_cleanup(
     })
 }
 
+/// Cancel-path native cleanup: diagnostics bypass stderr so a blocked
+/// terminal/pipe cannot hold the tick past its budget. The outcome
+/// still reports honestly through the gap path; the truly-blocked
+/// stderr positive stays unqualified and this path does not depend on
+/// it. Terminal teardown keeps stderr above.
+fn finish_semantic_native_cleanup_quiet(
+    lane: Option<crate::inventory_semantics::AttestedSemanticLane>,
+    second_signal: &dyn Fn() -> bool,
+) -> Result<()> {
+    lane.map_or(Ok(()), |lane| {
+        lane.finish_owned_terminal_cleanup(second_signal, &mut std::io::sink())
+    })
+}
+
 fn combine_semantic_terminal_errors(
     primary: Option<anyhow::Error>,
     cleanup: Result<()>,
@@ -1985,8 +1999,9 @@ impl ClassicDriver<'_> {
     /// drain is time-budgeted, never indefinite), then — once the
     /// Finish genuinely publishes with no pending semantic work left
     /// — release the lane, finish native cleanup under a bounded
-    /// cancel budget, record the domain for completion-polled
-    /// retire, and confirm the genuine end. Until publication
+    /// cancel budget with diagnostics bypassed past stderr, record
+    /// the domain for completion-polled retire, and confirm the
+    /// genuine end. Until publication
     /// completes the validating lane and its staged evidence stay:
     /// removing them would orphan pending work that no later
     /// publication could discharge. Manifest lanes are not
@@ -2032,7 +2047,7 @@ impl ClassicDriver<'_> {
         let lane = self.semantic.take();
         let cleanup_deadline = Instant::now() + CANCEL_CLEANUP_BUDGET;
         if let Err(error) =
-            finish_semantic_native_cleanup(lane, &|| Instant::now() >= cleanup_deadline)
+            finish_semantic_native_cleanup_quiet(lane, &|| Instant::now() >= cleanup_deadline)
         {
             self.coordinator.note_scope_gap(
                 "selected lane native cleanup failed".into(),
@@ -7988,6 +8003,67 @@ mod promotion_driver_tests {
                 }),
             }
         }
+
+        /// Real stuck native cleanup beneath the wind-down stub: a
+        /// genuine hanging worker driven through the production
+        /// 1 s detach path with sluggish diagnostics, plumbed to the
+        /// wind-down expiry. Fails pre-fix at ~1 s; the 10 ms mock
+        /// above cannot see the real cadence.
+        fn real_stuck() -> Self {
+            Self {
+                cleanup: Box::new(|second_signal| {
+                    use crate::attach::{CleanupWorker, DetachOrder, OwnedLink, ProducerProgram};
+                    let worker = CleanupWorker::pre_start_with(
+                        Box::new(|payload: &mut Option<OwnedLink>, _role: ProducerProgram| {
+                            std::thread::sleep(Duration::from_secs(5));
+                            let _ = payload.take();
+                            Ok(())
+                        }),
+                        std::sync::Arc::new(|| Duration::ZERO),
+                    );
+                    worker.submit(
+                        vec![
+                            (
+                                OwnedLink::Multi(Vec::new()),
+                                ProducerProgram::UProbe("p11_entry"),
+                            ),
+                            (
+                                OwnedLink::Multi(Vec::new()),
+                                ProducerProgram::UProbe("p11_return"),
+                            ),
+                        ],
+                        std::sync::Arc::default(),
+                        DetachOrder,
+                    );
+                    let mut slow = SlowWindDownWriter {
+                        delay: Duration::from_millis(10),
+                    };
+                    crate::attach::drive_owned_producer_detach_for_test(
+                        worker,
+                        second_signal,
+                        &mut slow,
+                    )
+                    .map_err(|error| anyhow::anyhow!("real stuck cleanup: {error:#}"))
+                }),
+            }
+        }
+    }
+
+    /// Sluggish diagnostics for the real-stuck wind-down twin: every
+    /// write sleeps, simulating slow stderr without blocking forever.
+    struct SlowWindDownWriter {
+        delay: Duration,
+    }
+
+    impl std::io::Write for SlowWindDownWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            std::thread::sleep(self.delay);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
     impl crate::inventory_semantics::LaneTestIo for WindDownIo {
@@ -8421,7 +8497,7 @@ mod promotion_driver_tests {
         driver.wind_down_installed_promotion(PromotionEnd::Cancelled);
         let elapsed = start.elapsed();
         assert!(
-            elapsed < Duration::from_secs(10),
+            elapsed < Duration::from_secs(1),
             "cancel never waits indefinitely on native cleanup: {elapsed:?}"
         );
         assert_eq!(
@@ -8434,6 +8510,38 @@ mod promotion_driver_tests {
                 .iter()
                 .any(|(subject, _)| subject == "selected lane native cleanup failed"),
             "the interrupted cleanup is recorded honestly: {:?}",
+            gaps(&mut driver)
+        );
+    }
+
+    #[test]
+    fn wind_down_with_real_cleanup_polling_returns_within_budget() {
+        // The real-cadence twin: stuck close + sluggish diagnostics
+        // through the production 1 s detach path, plumbed to the
+        // wind-down expiry. Fails pre-fix at ~1 s; the 10 ms mock
+        // cannot see it.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.semantic = Some(wind_down_lane(WindDownIo::real_stuck()));
+        let domain = install_promotion_for_wind_down(&mut driver);
+        let start = Instant::now();
+        driver.wind_down_installed_promotion(PromotionEnd::Cancelled);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "cancel must return within its tick budget on the real detach path: {elapsed:?}"
+        );
+        assert_eq!(
+            driver.display.as_ref().expect("display").promotion_state(),
+            PromotionState::Ended(PromotionEnd::Cancelled)
+        );
+        assert_eq!(driver.retiring_domain(), Some(domain));
+        assert!(
+            gaps(&mut driver)
+                .iter()
+                .any(|(subject, _)| subject == "selected lane native cleanup failed"),
+            "the interrupted real cleanup is recorded honestly: {:?}",
             gaps(&mut driver)
         );
     }

@@ -928,6 +928,27 @@ fn write_progress_line(out: &mut dyn Write, progress: &CleanupProgress) {
 /// without a busy spin).
 const FIRST_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// Expiry re-check granularity inside one printed cadence: long
+/// `poll_interval` sleeps are sliced so a stuck close still observes
+/// cancellation within ~10 ms instead of after a full second. Printing
+/// stays about once per `poll_interval`; only the sleep is sliced.
+const EXPIRY_POLL_SLICE: Duration = Duration::from_millis(10);
+
+/// Sleep `total` in interruptible slices, returning early once the
+/// worker settles or the expiry predicate fires. Completion still wins
+/// at the top of the loop; this only shortens the sleep.
+fn sleep_interruptibly(total: Duration, worker: &CleanupWorker, second_signal: &impl Fn() -> bool) {
+    let mut remaining = total;
+    while remaining > Duration::ZERO {
+        let nap = remaining.min(EXPIRY_POLL_SLICE);
+        std::thread::sleep(nap);
+        remaining = remaining.saturating_sub(nap);
+        if worker.is_done() || second_signal() {
+            return;
+        }
+    }
+}
+
 /// Print a progress line about once per `poll_interval` until the worker
 /// joins, then a final completed/incomplete line rendered from the join
 /// receipt. The first pass polls without printing after a short sleep,
@@ -937,7 +958,8 @@ const FIRST_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// completed cleanup as incomplete. A second signal while closes are
 /// still unsettled prints the progress and "cleanup incomplete" and
 /// returns `Interrupted`; the caller exits and the kernel finishes the
-/// remaining closes at exit.
+/// remaining closes at exit. Sleeps are sliced so expiry is observed
+/// within ~10 ms even under the 1 s production cadence.
 pub(crate) fn drive_cleanup(
     mut worker: CleanupWorker,
     second_signal: impl Fn() -> bool,
@@ -980,10 +1002,14 @@ pub(crate) fn drive_cleanup(
             // printing rather than taxing every capture the full cadence.
             // Later passes print about once per `poll_interval`.
             first_poll = false;
-            std::thread::sleep(poll_interval.min(FIRST_POLL_INTERVAL));
+            sleep_interruptibly(
+                poll_interval.min(FIRST_POLL_INTERVAL),
+                &worker,
+                &second_signal,
+            );
         } else {
             write_progress_line(out, &worker.progress());
-            std::thread::sleep(poll_interval);
+            sleep_interruptibly(poll_interval, &worker, &second_signal);
         }
     }
 }
@@ -1491,6 +1517,118 @@ mod tests {
             (2..=6).contains(&progress_lines),
             "about one line per 100 ms over ~450 ms, got {progress_lines} in: {text}"
         );
+    }
+
+    /// DR37 cancel budget: a stuck close under the real 1 s printed
+    /// cadence must still observe a 100 ms expiry within the tick
+    /// budget, not after a full second sleep. Fails pre-fix at ~1 s.
+    #[test]
+    fn cancel_budget_with_real_polling_interrupts_within_budget() {
+        let worker = CleanupWorker::pre_start_with(
+            legacy_test_closer(Box::new(|_link, _| {
+                std::thread::sleep(Duration::from_secs(5));
+                Ok(())
+            })),
+            scripted_clock(Arc::new(Mutex::new(Duration::ZERO))),
+        );
+        worker.submit(
+            vec![
+                multi(ProducerProgram::UProbe("p11_entry")),
+                multi(ProducerProgram::UProbe("p11_return")),
+            ],
+            Arc::default(),
+            DetachOrder,
+        );
+        let start = std::time::Instant::now();
+        let mut out = Vec::new();
+        let exit = drive_cleanup(
+            worker,
+            move || start.elapsed() >= Duration::from_millis(100),
+            &mut out,
+            Duration::from_secs(1),
+        );
+        let elapsed = start.elapsed();
+        match exit {
+            CleanupExit::Interrupted(progress) => {
+                assert_eq!(progress.total, 2, "{progress:?}");
+                assert!(
+                    progress.released + progress.uncertain < progress.total,
+                    "the stuck close must still be unsettled: {progress:?}"
+                );
+            }
+            CleanupExit::Completed(_) => {
+                panic!("a stuck close past the cancel budget must interrupt, not complete");
+            }
+        }
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "cancel must return within its tick budget under the real 1 s cadence, took {elapsed:?}"
+        );
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("cleanup incomplete"), "got: {text}");
+    }
+
+    /// A writer that sleeps on every write, simulating sluggish
+    /// stderr without blocking forever (the truly-blocked positive
+    /// stays unqualified; the cancel path bypasses stderr entirely).
+    struct SlowWriter {
+        inner: Vec<u8>,
+        delay: Duration,
+    }
+
+    impl Write for SlowWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            std::thread::sleep(self.delay);
+            self.inner.write(buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    /// DR37 cancel budget with sluggish diagnostics: slow stderr
+    /// writes plus a stuck close under the real 1 s cadence must
+    /// still interrupt within the tick budget. Fails pre-fix at ~1 s.
+    #[test]
+    fn cancel_budget_with_slow_stderr_still_interrupts_within_budget() {
+        let worker = CleanupWorker::pre_start_with(
+            legacy_test_closer(Box::new(|_link, _| {
+                std::thread::sleep(Duration::from_secs(5));
+                Ok(())
+            })),
+            scripted_clock(Arc::new(Mutex::new(Duration::ZERO))),
+        );
+        worker.submit(
+            vec![
+                multi(ProducerProgram::UProbe("p11_entry")),
+                multi(ProducerProgram::UProbe("p11_return")),
+            ],
+            Arc::default(),
+            DetachOrder,
+        );
+        let start = std::time::Instant::now();
+        let mut out = SlowWriter {
+            inner: Vec::new(),
+            delay: Duration::from_millis(10),
+        };
+        let exit = drive_cleanup(
+            worker,
+            move || start.elapsed() >= Duration::from_millis(100),
+            &mut out,
+            Duration::from_secs(1),
+        );
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(exit, CleanupExit::Interrupted(_)),
+            "a stuck close past the cancel budget must interrupt despite slow diagnostics"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "cancel must stay bounded with slow stderr under the real cadence, took {elapsed:?}"
+        );
+        let text = String::from_utf8(out.inner).unwrap();
+        assert!(text.contains("cleanup incomplete"), "got: {text}");
     }
 }
 

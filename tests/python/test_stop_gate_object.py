@@ -478,15 +478,33 @@ class StopGate(unittest.TestCase):
             and facts.get(pc, {}).get('r' + match.group(2), (None, None))[:2] == ('cell', map_name)
         ]
 
+    @staticmethod
+    def return_branch(disassembly, suffix):
+        """Resolve one outlined return branch (.text) by Rust name suffix.
+
+        The return path is split into ordinary/object branches; their
+        symbols are mangled, so match the stable suffix exactly once, like
+        the object-custody fault checker does.
+        """
+        blocks = C.D.function_blocks(C.ENTRY.sections(disassembly)['.text'])
+        names = [name for name in blocks if suffix in name]
+        assert len(names) == 1, (suffix, names)
+        return names[0]
+
     def test_counter_cells_must_be_atomic(self):
         """Per-CPU counters are updated only by non-fetch atomic adds: a plain
         writeback of any STATS/EVIDENCE/COUNTERS cell, a fetch-form add, or an
-        RV_COUNTS row created without BPF_NOEXIST is rejected."""
+        RV_COUNTS row created without BPF_NOEXIST is rejected. The return
+        path's STATS/RV_COUNTS accounting lives in its outlined
+        ordinary/object branches; each branch is pinned separately."""
         for variant, disassembly in self.objects:
-            for section, function, map_name in (('uretprobe', 'p11_return', 'STATS'),
-                                                ('uretprobe', 'p11_return', 'EVIDENCE'),
-                                                ('uprobe', 'p11_entry', 'STATS'),
-                                                ('uprobe', 'dl_debug_state', 'COUNTERS')):
+            branches = [self.return_branch(disassembly, suffix)
+                        for suffix in ('ordinary_return', 'object_return')]
+            cases = [('uretprobe', 'p11_return', 'EVIDENCE'),
+                     ('uprobe', 'p11_entry', 'STATS'),
+                     ('uprobe', 'dl_debug_state', 'COUNTERS')]
+            cases += [('.text', branch, 'STATS') for branch in branches]
+            for section, function, map_name in cases:
                 with self.subTest(variant=variant, function=function, map=map_name):
                     _, _, _, sites = self.counter_sites(disassembly, section, function, map_name)
                     self.assertTrue(sites, (function, map_name))
@@ -507,17 +525,18 @@ class StopGate(unittest.TestCase):
                                 f'|on a {map_name} counter cell)'):
                             C.check_decoded(bad, variant)
                     print(f'verified {variant} {function} {map_name}: {len(sites)} atomic counter sites')
-            with self.subTest(variant=variant, map='RV_COUNTS'):
-                lines, facts, insns, _ = self.counter_sites(disassembly, 'uretprobe', 'p11_return', 'RV_COUNTS')
-                creates = [pc for pc, text in insns
-                           if text == 'call 0x2' and facts.get(pc, {}).get('r1') == ('map', 'RV_COUNTS')]
-                self.assertEqual(len(creates), 1)
-                definition = max(at for at, text in insns if at < creates[0] and text == 'r4 = 0x1')
-                self.assertFalse(any(re.fullmatch(r'[rw]4 = .*', text) for at, text in insns
-                                     if definition < at < creates[0]))
-                bad = replace_decoded(disassembly, 'p11_return', definition, 'r4 = 0x1', 'r4 = 0x0')
-                self.reject(bad, variant, 'RV_COUNTS row created without BPF_NOEXIST')
-                print(f'verified {variant} RV_COUNTS NOEXIST creation')
+            for branch in branches:
+                with self.subTest(variant=variant, branch=branch, map='RV_COUNTS'):
+                    lines, facts, insns, _ = self.counter_sites(disassembly, '.text', branch, 'RV_COUNTS')
+                    creates = [pc for pc, text in insns
+                               if text == 'call 0x2' and facts.get(pc, {}).get('r1') == ('map', 'RV_COUNTS')]
+                    self.assertEqual(len(creates), 1)
+                    definition = max(at for at, text in insns if at < creates[0] and text == 'r4 = 0x1')
+                    self.assertFalse(any(re.fullmatch(r'[rw]4 = .*', text) for at, text in insns
+                                         if definition < at < creates[0]))
+                    bad = replace_decoded(disassembly, branch, definition, 'r4 = 0x1', 'r4 = 0x0')
+                    self.reject(bad, variant, 'RV_COUNTS row created without BPF_NOEXIST')
+                    print(f'verified {variant} {branch} RV_COUNTS NOEXIST creation')
 
     @staticmethod
     def flip_delta(analysis, pc, sign):

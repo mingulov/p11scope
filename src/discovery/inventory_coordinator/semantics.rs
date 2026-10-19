@@ -1456,7 +1456,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// admitted call, borrowed for the per-quantum mint. `None`
     /// before the first admission finalizes: the seal then refuses,
     /// honestly without a grant.
-    #[cfg_attr(not(test), allow(dead_code))] // STAGED (DR37/H8): called by the joint seal driver.
+    #[allow(dead_code)] // STAGED (DR37/H8): called by the joint seal driver; no test seals yet.
     pub(crate) fn seal_admission(&self) -> Option<&AdmittedInstanceCall> {
         self.semantic_finalizer
             .as_ref()
@@ -3616,6 +3616,7 @@ mod promotion_lifecycle_tests {
     }
 
     #[test]
+    #[allow(clippy::result_large_err)] // The closure must return the real install result, large Err included.
     fn install_capacity_charges_zero_allocations() {
         let mut coordinator = coordinator();
         let capacity = coordinator

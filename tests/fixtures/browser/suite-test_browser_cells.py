@@ -19,6 +19,8 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tests" / "fixtures" / "browser"))
@@ -223,6 +225,184 @@ class BrowserCells(unittest.TestCase):
         self.assertFalse(result.flow.get("loaded", True), "client-cert flow loaded?!")
         self.assertFalse(result.flow.get("mapped_at_end"), "module mapped?!")
         self.check_report(result, store, zero=True, attached=False)
+
+    # -- Unprivileged counterexample twins (P2-2/P2-3; run everywhere) --
+    #
+    # Each twin drives a real seam (the common oracle, a named predicate,
+    # or the decorated FF-PINBOUND test with a synthetic server) with a
+    # hostile input the oracle must reject. They use hand-built v3
+    # documents, never the release checker's fixtures.
+
+    @staticmethod
+    def _twin_row(names, calls, sha, in_flight=0):
+        """One functions[] row attached to the fake module ``sha``."""
+        return {
+            "names": list(names),
+            "calls": calls,
+            "in_flight": in_flight,
+            "target": {"object": {"dev": 1, "ino": 2, "sha256": sha},
+                       "file_offset": 0},
+        }
+
+    @staticmethod
+    def _twin_evidence(**overrides):
+        """Healthy evidence block; ``overrides`` plant the hostile input."""
+        evidence = {
+            "event_loss": 0,
+            "attached_probes": 2,
+            "verdict_detail": "attribution_only",
+            "gap_classes": {
+                "observation": {"status": "exact", "causes": []},
+            },
+            "kernel_control": {
+                "capture_halted": False,
+                "owner_poison": [],
+                "owner_admission_failures": 0,
+                "identity_unavailable": 0,
+                "root_affiliation_failures": [],
+            },
+            "skipped": [],
+            "attach_failures": [],
+            "in_flight_at_end": 0,
+        }
+        evidence.update(overrides)
+        return evidence
+
+    def _twin_result(self, name, rows, evidence):
+        """Write a twin v3 document and wrap it in a CellResult."""
+        doc = {"schema": oracle.SCHEMA, "functions": rows, "evidence": evidence}
+        path = self.work / f"{name}-report.json"
+        path.write_text(json.dumps(doc))
+        return cells.CellResult(name, path)
+
+    def test_oracle_builder_healthy_accepted(self):
+        """Guard: the twin builder's healthy doc passes the common oracle."""
+        sha = "0" * 64
+        store = SimpleNamespace(lib=Path("/not-opened/provider.so"))
+        rows = [self._twin_row(["C_FindObjects"], 3, sha)]
+        result = self._twin_result("TWIN-HEALTHY", rows, self._twin_evidence())
+        with patch.object(oracle, "sha256_of", return_value=sha):
+            self.check_report(result, store, {"C_FindObjects": 1}, attached=True)
+
+    def test_oracle_rejects_halted_capture(self):
+        """P2-3 twin: a halted capture fails even when floors are met."""
+        sha = "0" * 64
+        store = SimpleNamespace(lib=Path("/not-opened/provider.so"))
+        rows = [self._twin_row(["C_FindObjects"], 3, sha)]
+        evidence = self._twin_evidence(
+            verdict_detail="concrete_gap",
+            gap_classes={"observation": {"status": "lossy", "causes": ["kernel_control"]}},
+            kernel_control={"capture_halted": True, "owner_poison": ["refund_failed"],
+                            "owner_admission_failures": 0, "identity_unavailable": 0,
+                            "root_affiliation_failures": []},
+        )
+        result = self._twin_result("TWIN-HALTED", rows, evidence)
+        with patch.object(oracle, "sha256_of", return_value=sha):
+            with self.assertRaises(AssertionError):
+                self.check_report(result, store, {"C_FindObjects": 1}, attached=True)
+
+    def test_oracle_rejects_inflight_absence_gap(self):
+        """P2-3 twin: entered-but-unreturned C_Login/C_Sign are not absent."""
+        sha = "0" * 64
+        store = SimpleNamespace(lib=Path("/not-opened/provider.so"))
+        rows = [self._twin_row(["C_Login"], 0, sha, in_flight=1),
+                self._twin_row(["C_Sign"], 0, sha, in_flight=1)]
+        evidence = self._twin_evidence(
+            verdict_detail="concrete_gap",
+            gap_classes={"observation": {"status": "lossy", "causes": ["in_flight_at_end"]}},
+            in_flight_at_end=2,
+        )
+        result = self._twin_result("TWIN-INFLIGHT", rows, evidence)
+        with patch.object(oracle, "sha256_of", return_value=sha):
+            with self.assertRaises(AssertionError):
+                self.check_report(result, store, attached=True)
+
+    def test_zero_counts_reject_inflight_entries(self):
+        """P2-3 twin: returns-only zero counting must not accept open entries.
+
+        Deliberately inconsistent document (rows show in-flight entries the
+        evidence block omits): the row-level count must reject regardless.
+        """
+        sha = "0" * 64
+        store = SimpleNamespace(lib=Path("/not-opened/provider.so"))
+        rows = [self._twin_row(["C_Login"], 0, sha, in_flight=1),
+                self._twin_row(["C_Sign"], 0, sha, in_flight=1)]
+        result = self._twin_result("TWIN-OPEN-ROWS", rows, self._twin_evidence())
+        with patch.object(oracle, "sha256_of", return_value=sha):
+            with self.assertRaises(AssertionError):
+                self.check_report(result, store, zero=True, attached=True)
+
+    def test_oracle_rejects_attach_failures(self):
+        """P2-3 twin: failed attachments fail even when some probes hooked."""
+        sha = "0" * 64
+        store = SimpleNamespace(lib=Path("/not-opened/provider.so"))
+        rows = [self._twin_row(["C_FindObjects"], 3, sha)]
+        evidence = self._twin_evidence(
+            verdict_detail="concrete_gap",
+            gap_classes={"observation": {"status": "lossy", "causes": ["attach_failures"]}},
+            attach_failures=[{"slot": 7, "reason": "uprobe_link_failed"}],
+        )
+        result = self._twin_result("TWIN-ATTACH", rows, evidence)
+        with patch.object(oracle, "sha256_of", return_value=sha):
+            with self.assertRaises(AssertionError):
+                self.check_report(result, store, {"C_FindObjects": 1}, attached=True)
+
+    def test_oracle_rejects_unattributed_activity(self):
+        """P2-3 twin: [unknown]-row activity fails named-absence checks."""
+        counts = {"C_FindObjects": 5, "unknown": 3}
+        self.assertNotEqual(oracle.check_absent(counts, ("C_Login",)), [])
+
+    def _pinbound_rig(self, server_stats, facts):
+        """Run the real FF-PINBOUND test against synthetic server/flow facts."""
+        sha = "0" * 64
+        store = SimpleNamespace(lib=Path("/not-opened/provider.so"), env={})
+        rows = [self._twin_row(["C_FindObjects"], 3, sha)]
+        result = self._twin_result("FF-PINBOUND", rows, self._twin_evidence())
+        result.flow.update({
+            "profiler_exit": 0, "mapped_at_end": True,
+            "target_alive": True, "target_identity": True,
+            "profile_module_registered": True, **facts,
+        })
+        server = SimpleNamespace(url="https://127.0.0.1:1/", **server_stats)
+        entered = MagicMock()
+        entered.__enter__.return_value = server
+        case = BrowserCells("test_ff_pinbound_never_logs_in_or_signs")
+        case.work = self.work
+        case.seed = lambda *a: (store, SimpleNamespace(cert_pem=Path("/not-opened/client.pem")))
+        with patch.object(cells, "preflight", return_value=None), \
+                patch.object(cells, "attach_drive", return_value=result), \
+                patch.object(tls_server, "make_server_credential",
+                             return_value=(Path("/not-opened/key"), Path("/not-opened/cert"))), \
+                patch.object(tls_server, "FlowServer", return_value=entered), \
+                patch.object(oracle, "sha256_of", return_value=sha):
+            case.test_ff_pinbound_never_logs_in_or_signs()
+
+    @staticmethod
+    def _pinbound_stats(**overrides):
+        """Synthetic CERT_REQUIRED server stats; hostile (witness-free) by default."""
+        stats = {
+            "connections": 1, "requests_served": 0, "client_certs_presented": 0,
+            "handshakes_ok": 0, "empty_certs": 0, "selection_stalls": 0,
+            "client_cert_alerts": 0, "abandoned": 0,
+            "handshake_failures": 0, "handshake_errors": [],
+        }
+        stats.update(overrides)
+        return stats
+
+    @staticmethod
+    def _pinbound_facts():
+        """Synthetic failed client-cert visit (TLS failure before selection)."""
+        return {"flow": "client_cert_visit", "loaded": False,
+                "error": "SSLError: TLS protocol mismatch before certificate selection"}
+
+    def test_pinbound_rejects_preselection_failure(self):
+        """P2-2 twin: a pre-selection protocol failure must fail the cell."""
+        with self.assertRaises(AssertionError):
+            self._pinbound_rig(self._pinbound_stats(), self._pinbound_facts())
+
+    def test_pinbound_rig_healthy_accepted(self):
+        """Guard: the rig passes with a boundary witness (no over-reject)."""
+        self._pinbound_rig(self._pinbound_stats(empty_certs=1), self._pinbound_facts())
 
 
 if __name__ == "__main__":

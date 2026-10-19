@@ -181,9 +181,9 @@ The new ignored selector is
 `inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_pid_diagnostics_three_round_startup_probe_lp64`.
 It uses the same absolute `P11SCOPE_DIAGNOSTICS_WRAP_PREBUILT_DIR` input seam,
 with freshly source-matched probe-capable C inputs, default1s production cadence
-and a90s bound. Actual committed A32 triggers round2; actual A64, or A32 with
+and a90s bound. Actual committed A1 triggers round2; actual A2, or A1 with
 the exact caller-bound per-pair (1,2] startup-fence gap on all32pairs, triggers
-round3. The terminal oracle accepts only genuine ordinary A96, or A64 with an
+round3. The terminal oracle accepts only genuine ordinary A3, or A2 with an
 explicit per-pair AwaitingFence disposition and the third unit placed from
 base2 on every pair. Both raw observation and exact retained-reference
 checks are required. Each C round must finish before its next read PRE; that
@@ -194,11 +194,15 @@ standalone validator checks; do not run the old long gate as a substitute.
 
 ## Paired default-ring useful wrap
 
-The wrap oracle tolerates the supported startup fence (Sol ORACLE ruling):
-round 2 accepts A64, or A32 with the exact caller-bound (1,2] gap; round 3
-then requires A96 ordinary or A64 fenced, with exact32-increments after.
-The validated disposition (k of32pairs fenced) carries into final A12800-k
-expectations and paired comparison. A caller/object pair excludes function
+The wrap oracle pins the max-accepting edge projection (Sol ORACLE ruling):
+ordinary A reads 1, 2, 3 after rounds 1-3 and 400 after round 400;
+all-32-fenced reads 1, 1, 2 and 399, with exact1-increments after. The
+validated disposition (k of32pairs fenced) carries into final A400/399
+expectations and strict paired comparison: both legs must share one
+disposition and compare exactly equal, with no count replacement.
+Per-pair physical reconciliation stays separate from the edge: eligible A
+growth 12,800-k, withheld 8,288+k, terminal proof 660/base 659/staged 1
+per pair with staged sum 32. A caller/object pair excludes function
 offset, so the fixture provides one slot body per distinct physical object
 (`libdemotion-common-00..31.so`):32genuine pairs, each advancing one unit
 per round. The original ten-call installed control is independent.
@@ -252,10 +256,14 @@ independent per-slot ledger bind all21120calls. Each next counted round waits
 for an actual committed production count milestone validated against
 caller-bound gap evidence; each shared round consumes one observer pass with
 ambiguity-disclosure checkpoints at power-of-two rounds; load-B remains
-inside the existing observer callback between passes. Expected primary totals
-are A12800-k (k validated fenced pairs), B32 and8288withheld entries. Actual
-32Bplacements and their selected withheld fence prefixes must remain useful in
-the exported diagnostics.
+inside the existing observer callback between passes. Expected primary edge
+projections are A400 ordinary / 399 fenced (k validated fenced pairs) and B1
+(32 overlapping proofs in one publication). Per-pair physical reconciliation
+from the schedule plus ledger gives 12,800-k eligible A growth, 8,256
+shared-withheld, 32 fence-withheld and staged sum 32: 8,288+k withheld
+entries over 21,120 physical calls. Actual32Bplacements (each edge_total 1,
+proving the single-publication batching) and their selected withheld fence
+prefixes must remain useful in the exported diagnostics.
 
 Both default rings must really evict: CountObservation eviction proves the
 ordinary ring filled, and OwnershipTransition/CaptureHealth eviction proves
@@ -269,9 +277,10 @@ must cover all32distinct pairs. Partial/unrun/failed cells cannot pass.
 Run the same independent schedule with diagnostics disabled/enabled and compare
 primary count, entry observation, saturation/inflight, capture, presence,
 coverage/loss and settlement facts after normalizing run-local IDs/timestamps.
-Each run has an explicit900s bound; the pair is approximately22minutes at the
-current one-second pass cadence. Report actual runtime/output bytes. Controlled
-RSS/CPU/performance cost is a separate T10 gate.
+Both legs must validate the same startup disposition; counts compare exactly
+with no replacement. Each run has an explicit900s bound; the pair is
+approximately22minutes at the current one-second pass cadence. Report actual
+runtime/output bytes. Controlled RSS/CPU/performance cost is a separate T10 gate.
 
 Readable stderr accepts either complete once-only main-control-thread marker:
 `p11scope: cancel: loop exited on signal N after T ticks` or the truthful late

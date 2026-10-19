@@ -364,10 +364,7 @@ fn check_terminal_pairs(
             let is_proof_shape = base == COUNTED + SHARED + 1
                 && absolute == COUNTED + SHARED + 2
                 && row["staged"] == 1;
-            if !is_proof_shape
-                && base < COUNTED + SHARED + 1
-                && absolute > COUNTED + SHARED
-            {
+            if !is_proof_shape && base < COUNTED + SHARED + 1 && absolute > COUNTED + SHARED {
                 bail!("B placement overlaps the withheld fence interval: {row}");
             }
         }
@@ -381,10 +378,9 @@ fn check_terminal_pairs(
             && row["observation_ref"]["status"] == "retained"
             && row["observation_ref"]["seq"].as_u64().is_some()
         {
-            let (Some(baseline_post), Some(pre)) = (
-                row["baseline_post"].as_u64(),
-                row["pre"].as_u64(),
-            ) else {
+            let (Some(baseline_post), Some(pre)) =
+                (row["baseline_post"].as_u64(), row["pre"].as_u64())
+            else {
                 bail!("proof lacks a genuine recovery window: {row}");
             };
             ensure!(
@@ -415,7 +411,10 @@ fn check_terminal_pairs(
             && row["observation_ref"]["seq"].as_u64().is_some()
         {
             let pair = row["pair"].as_str().context("withheld pair")?.to_owned();
-            let row_caller = row["caller"].as_str().context("withheld caller")?.to_owned();
+            let row_caller = row["caller"]
+                .as_str()
+                .context("withheld caller")?
+                .to_owned();
             match &caller {
                 None => caller = Some(row_caller),
                 Some(expected) => ensure!(
@@ -2571,7 +2570,10 @@ fn operator_diagnostics_wrap_twin_terminal_requires_retained_refs() -> Result<()
     lost_fence[0]["observation_ref"]["status"] = serde_json::json!("not_retained");
     ensure!(check_terminal_pairs(&lost_fence, &serde_json::json!("mB")).is_err());
     let mut missing = twin_terminal_records();
-    missing[1].as_object_mut().unwrap().remove("observation_ref");
+    missing[1]
+        .as_object_mut()
+        .unwrap()
+        .remove("observation_ref");
     ensure!(check_terminal_pairs(&missing, &serde_json::json!("mB")).is_err());
     Ok(())
 }
@@ -2677,15 +2679,19 @@ fn operator_diagnostics_wrap_twin_probe_double_placed_fence_fails() -> Result<()
         .filter_map(|row| row["seq"].as_u64())
         .max()
         .context("max probe seq")?;
-    fenced.push(serde_json::json!({"kind":"publication","decision":"placed","reason":"sole_owner",
+    fenced.push(
+        serde_json::json!({"kind":"publication","decision":"placed","reason":"sole_owner",
         "pair":"p0","seq":max_seq+1,"module_id":"mA","absolute":2,"base":1,
         "staged":1,"observation_ref":{"seq":obs_seq,"status":"retained"},
-        "baseline_pre":150,"baseline_post":160}));
+        "baseline_pre":150,"baseline_post":160}),
+    );
     let mut footer = footer;
     footer["records_written"] = serde_json::json!(fenced.len() as u64 - 1);
     // Publication is kinds[3] (count_observation, ownership_transition,
     // count_decision, publication, capture_health).
-    let before = footer["kinds"][3]["retained"].as_u64().context("pub retained")?;
+    let before = footer["kinds"][3]["retained"]
+        .as_u64()
+        .context("pub retained")?;
     footer["kinds"][3]["retained"] = serde_json::json!(before + 1);
     footer["kinds"][3]["produced"] = serde_json::json!(before + 1);
     fenced.push(footer);

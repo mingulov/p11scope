@@ -307,11 +307,13 @@ class FlowServer:
                 server.connections += 1
                 if context is None:
                     return conn, client_address
-                # Peek before wrapping: a complete ClientHello proves the
-                # peer reached the selection boundary, and peeking never
-                # consumes, so the handshake below proceeds undisturbed.
-                # Anything less (silence, close, reset, or an unfinished
-                # first flight) carries no selection information.
+                # Peek before wrapping: ClientHello completion permits
+                # wrapping, and peeking never consumes, so the handshake
+                # below proceeds undisturbed. Completion alone does not
+                # prove selection progress; the later CertificateRequest
+                # callback establishes that. Anything less (silence, close,
+                # reset, or an unfinished first flight) carries no
+                # selection information.
                 deadline = time.monotonic() + server.HANDSHAKE_TIMEOUT
                 conn.settimeout(server.HANDSHAKE_TIMEOUT)
                 buf = b""

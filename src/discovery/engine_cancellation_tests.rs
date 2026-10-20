@@ -4,15 +4,35 @@
 use super::*;
 
 #[test]
-fn named_generation_loss_keeps_enqueue_witness_after_later_cancellation() {
+fn named_contradicted_loss_report_defers_without_bail() {
     let (_fixture, mut engine, mut session) = continuity_route();
     let view = engine.views[0].id();
-    let pid = engine.views[0].pid();
+    assert!(
+        engine.views[0].still_the_same(),
+        "precondition: the fixture child is a live current generation"
+    );
+    // E17 midfinal correction: a loss report the retained pin contradicts
+    // (it re-reads Current for this live child) is declined with a partial
+    // mark — never recorded as fatal sticky loss — even when cancellation
+    // subsequently closes mutation. Recording it bailed the terminal drain
+    // with zero COUNT/EVIDENCE records for a healthy capture.
     let mut pending = PendingViewRetirements::new();
-    // An existing loss must remain a loss even when the next retained-pin
-    // observation is Current and cancellation subsequently closes mutation.
-    let enqueue_line = line!() + 1;
     engine.queue_retirement(view, RetirementCause::GenerationLost, &mut pending);
+    assert!(
+        pending.is_empty(),
+        "a declined report queues nothing: {pending:?}"
+    );
+    assert!(
+        !engine.retirement_intents.contains_key(&view),
+        "a declined report records no intent: {:?}",
+        engine.retirement_intents
+    );
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| skip.reason
+            == "a stale generation report was contradicted or unprovable on pin recheck; retirement deferred"),
+        "the deferral is marked: {:?}",
+        engine.counters.object_skips
+    );
     engine.set_cancel_flag(Arc::new(std::sync::atomic::AtomicBool::new(true)));
     session
         .pid_continuity
@@ -20,30 +40,39 @@ fn named_generation_loss_keeps_enqueue_witness_after_later_cancellation() {
         .unwrap()
         .borrow_mut()
         .stop_word = p11scope_ebpf_common::STOP_GATE_STOP;
+    engine
+        .apply_quiesced_discovery(&mut session, Vec::new(), 0)
+        .expect("a contradicted report must not abort the batch");
+    assert!(
+        !engine
+            .retirement_intents
+            .values()
+            .any(|cause| *cause == RetirementCause::GenerationLost),
+        "no loss is invented: {:?}",
+        engine.retirement_intents
+    );
+    assert_eq!(engine.views.len(), 1, "the live view stays retained");
+    assert!(!engine.expected_target_exit());
+}
+
+#[test]
+fn recorded_named_loss_still_fails_closed() {
+    let (_fixture, mut engine, mut session) = continuity_route();
+    let view = engine.views[0].id();
+    // Defense in depth: if a loss intent is ever recorded (no production
+    // queue path records one without positive evidence anymore), the
+    // named capture still fails closed instead of publishing over it.
+    engine
+        .retirement_intents
+        .insert(view, RetirementCause::GenerationLost);
     let error = engine
         .apply_quiesced_discovery(&mut session, Vec::new(), 0)
         .unwrap_err()
         .to_string();
-    assert!(error.contains("the named process generation changed during live discovery"));
     assert!(
-        error.contains(&format!("view={} pid={pid}", view.0)),
+        error.contains("the named process generation changed during live discovery"),
         "{error}"
     );
-    assert!(
-        error.contains(&format!("enqueue_line={enqueue_line}")),
-        "{error}"
-    );
-    assert!(
-        error.contains("incoming=GenerationLost previous=None"),
-        "{error}"
-    );
-    assert!(error.contains("original=Current"), "{error}");
-    assert!(error.contains("cancel_at_enqueue=false"), "{error}");
-    assert!(
-        error.contains("cancel_now=true mutation_stopped=true"),
-        "{error}"
-    );
-    assert!(!engine.expected_target_exit());
 }
 
 #[test]

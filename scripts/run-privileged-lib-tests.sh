@@ -254,6 +254,10 @@ inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_s
 # prebuilt32-object fixture/seam as the wrap pair they calibrate).
 inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_pid_diagnostics_three_round_startup_probe_lp64
 inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_pid_diagnostics_three_round_accelerated_pilot_lp64
+# S cadence lanes: env-driven gate interval probe + default-pinned cost/control
+# (declared-cadence split; same fixture/seam as the short controls).
+inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_pid_diagnostics_three_round_gate_cadence_probe_lp64
+inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_pid_diagnostics_three_round_default_cadence_control_lp64
 )
 
 # Static skips: external fixture/driver/env the script cannot provide.

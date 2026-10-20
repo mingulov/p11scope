@@ -498,6 +498,7 @@ jobs:
           UNRUN: scripts/system-scope-receipt.py (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           UNRUN: scripts/system-scope-sample.py (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           UNRUN: scripts/system-scope-supervisor.py (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
+          UNRUN: scripts/system-scope-soak.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           UNRUN: scripts/task-1.6-lane-a.py (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/tsprobe.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/lane-build-release-oracle-1.py (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
@@ -628,6 +629,7 @@ jobs:
       - run: python3 -I scripts/measure-c5-analysis.py --self-test
       - run: python3 -I scripts/qualify-e16-surfaces.py --self-test
       - run: python3 -I scripts/ci-test-partition.py --self-test
+      - run: python3 -I scripts/system-scope-soak-oracle.py --self-test
       - run: scripts/verify-inspect-doctor.sh
       - run: scripts/verify-attach-e2e.sh --diagnose-skips
       # Every tests/python suite (F-62): the runner checks that each file is

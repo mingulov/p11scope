@@ -3479,6 +3479,101 @@ fn pty_promotion_baseline_demand_requires_caller_coverage() {
 }
 
 #[test]
+fn pty_promotion_baseline_failures_stay_quiet_per_frame_caller() {
+    // P2: failure bookkeeping is per-frame membership, not just the
+    // latest pair — fail A, fail B, back to A stays quiet.
+    let mut terminal = PromoPty::open();
+    assert!(terminal.display.promotion_enable(CaptureId::new(5)));
+    terminal.display.offer(varied_presentation());
+    terminal.display.tick();
+    terminal.shown(b"promotion: idle; selected");
+    let first = terminal
+        .display
+        .state
+        .promotion
+        .selected
+        .expect("the first frame selects a pair");
+    let (_, _, pair_a) = terminal
+        .display
+        .baseline_demand()
+        .expect("the viewed pair lacks a batch");
+    assert_eq!(pair_a, first);
+    terminal.display.note_baseline_failed(pair_a);
+    assert!(
+        terminal.display.baseline_demand().is_none(),
+        "failed caller A stays quiet"
+    );
+    let mut second = first;
+    for _ in 0..13 {
+        if second.caller() != first.caller() {
+            break;
+        }
+        terminal.key(b"j");
+        second = terminal
+            .display
+            .state
+            .promotion
+            .selected
+            .expect("the cursor survives scrolling");
+    }
+    assert_ne!(
+        second.caller(),
+        first.caller(),
+        "the frame shows another caller"
+    );
+    let (_, _, pair_b) = terminal
+        .display
+        .baseline_demand()
+        .expect("another caller still attempts after A's failure");
+    assert_eq!(pair_b, second);
+    terminal.display.note_baseline_failed(pair_b);
+    assert!(
+        terminal.display.baseline_demand().is_none(),
+        "failed caller B stays quiet"
+    );
+    // Back to A within the same frame: still quiet (membership, not
+    // latest-only).
+    let mut back = second;
+    for _ in 0..13 {
+        if back == first {
+            break;
+        }
+        terminal.key(b"k");
+        back = terminal
+            .display
+            .state
+            .promotion
+            .selected
+            .expect("the cursor survives scrolling");
+    }
+    assert_eq!(back, first, "the cursor returns to the first pair");
+    assert!(
+        terminal.display.baseline_demand().is_none(),
+        "returning to failed caller A stays quiet within the frame"
+    );
+    // Boundedness: 30 more distinct failures keep A quiet (32
+    // entries fit), the 31st evicts stalest-first so A re-arms
+    // instead of growing the record without bound.
+    for index in 0..30 {
+        terminal
+            .display
+            .note_baseline_failed(PromotionPair::new(1000 + index, 0));
+    }
+    assert!(
+        terminal.display.baseline_demand().is_none(),
+        "32 failed callers still fit the per-frame record"
+    );
+    terminal
+        .display
+        .note_baseline_failed(PromotionPair::new(2000, 0));
+    assert!(
+        terminal.display.baseline_demand().is_some(),
+        "past the bound the stalest caller re-arms"
+    );
+    terminal.display.restore();
+}
+
+#[test]
 fn pty_promotion_baseline_twins() {
     // No batch: the request stays unqualified (existing behavior), and
     // demand persists for the scheduler.

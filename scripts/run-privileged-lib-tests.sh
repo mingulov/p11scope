@@ -154,6 +154,10 @@ attach::inventory::capture::privileged_tests::privileged_inventory_capture_stop_
 # Task 6 C5.2: a PID capture stopped before activation keeps its pin, and
 # its retiring and retired reads re-poll custody (held, then lost).
 attach::inventory::capture::privileged_tests::privileged_inventory_capture_stop_before_activation_repolls_custody_lp64
+# DR37 native Ready positive: the live selected loop (resolver, worker
+# preparation, native CAS, install, wind-down, completion mint, retire)
+# over a real capture. Root BPF lane, serial, about 7-8 s.
+attach::inventory::capture::privileged_tests::privileged_dr37_selected_promotion_full_loop
 attach::inventory::privileged_tests::privileged_inventory_caller_preparation_faults_release_exact_resources
 attach::inventory::privileged_tests::privileged_inventory_caller_preparation_freezes_native_maps_and_publishes_binding
 attach::inventory::privileged_tests::privileged_inventory_preparation_failure_releases_owned_resources

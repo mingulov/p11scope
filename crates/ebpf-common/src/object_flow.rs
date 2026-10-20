@@ -1278,13 +1278,15 @@ mod tests {
     /// plus the live 1M-kernel load, never this host suite.
     #[test]
     fn default_build_wires_attribute_capture() {
-        assert!(
-            ATTRIBUTE_CAPTURE_WIRED,
-            "default build must wire FULL attribute capture"
-        );
-        assert!(
-            !cfg!(feature = "stub-object-attributes"),
-            "host tests never run stubbed"
-        );
+        const {
+            assert!(
+                ATTRIBUTE_CAPTURE_WIRED,
+                "default build must wire FULL attribute capture"
+            );
+            assert!(
+                !cfg!(feature = "stub-object-attributes"),
+                "host tests never run stubbed"
+            );
+        }
     }
 }

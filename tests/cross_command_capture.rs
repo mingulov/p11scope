@@ -71,6 +71,7 @@ fn evidence() -> Evidence {
         interface_selection: InterfaceSelection::default(),
         attach_mechanisms: vec![],
         attach_backend: Default::default(),
+        object_capture: render::ObjectCaptureEvidence::for_build(false),
         pid_descendant_gaps: 0,
         multi_rebuild_gaps: 0,
         unprotected_live_windows: 0,

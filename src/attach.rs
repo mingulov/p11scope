@@ -3961,7 +3961,6 @@ pub(crate) fn embedded_object_is_stubbed() -> bool {
 /// Whether a raw errno is the kernel verifier's budget refusal: E2BIG is
 /// what BPF_PROG_LOAD returns when the program exceeds the complexity
 /// limit. Every other errno keeps its own meaning.
-#[cfg(test)]
 pub(crate) fn is_verifier_budget_errno(errno: Option<i32>) -> bool {
     errno == Some(libc::E2BIG)
 }
@@ -3970,7 +3969,6 @@ pub(crate) fn is_verifier_budget_errno(errno: Option<i32>) -> bool {
 /// BPF program-load refusal on verifier budget (E2BIG from BPF_PROG_LOAD).
 /// Permission, map-policy, identity and malformed-object failures — and
 /// every non-load error — return false and keep their own errors.
-#[cfg(test)]
 pub(crate) fn is_verifier_budget_refusal(error: &aya::programs::ProgramError) -> bool {
     match error {
         aya::programs::ProgramError::LoadError { io_error, .. } => {
@@ -7208,6 +7206,15 @@ impl Session {
     /// Why an `auto` session runs per-offset links, else `None`.
     pub(crate) fn backend_fallback(&self) -> Option<&str> {
         self.backend_fallback.as_deref()
+    }
+
+    /// Object-attribute capture availability in this build (P0-only ship
+    /// vehicle): build scope, so every session of this binary reports the
+    /// same status. Stubbed (v0.4.0) builds disclaim attribute coverage;
+    /// FULL builds report available. The consistency test pins this
+    /// against the probed embedded bytes in every flavor.
+    pub(crate) fn object_capture_evidence() -> crate::render::ObjectCaptureEvidence {
+        crate::render::ObjectCaptureEvidence::for_build(cfg!(feature = "stub-object-attributes"))
     }
 
     /// Under PID scope, what keeps other processes out of the static
@@ -12656,6 +12663,21 @@ mod tests {
             source.contains("DiscoveryStage::poll_discovery("),
             "readiness polls through the shared predicate"
         );
+    }
+
+    /// Forced-refusal / no-spurious-degrade control: the session's
+    /// object-capture status agrees with the embedded bytes' probed
+    /// flavor, in every build. A stubbed build that claimed available —
+    /// or a FULL build that claimed unavailable — fails here.
+    #[test]
+    fn session_object_capture_status_matches_bytes() {
+        let status = super::Session::object_capture_evidence();
+        assert_eq!(status.available, !super::embedded_object_is_stubbed());
+        if status.available {
+            assert_eq!(status.reason, None);
+        } else {
+            assert_eq!(status.reason, Some("not_enabled"));
+        }
     }
 
     /// P0-only ship vehicle: the embedded Detailed object carries

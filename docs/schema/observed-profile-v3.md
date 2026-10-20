@@ -142,6 +142,15 @@ functional probes, never by the kernel version:
 
 A PID-scoped uprobe-multi link never names pid 0.
 
+`object_capture` is always present in both v3 lanes and says whether this
+build captures object attributes (build scope, identical for every capture
+of the binary). It never gates the verdict — P0 scope is complete when P0
+facts are complete; this disclaims attribute coverage instead of claiming it:
+- `available`: boolean; `false` in v0.4.0 stub builds, `true` in FULL builds.
+- `reason`: finite machine reason when unavailable, else `null`. The one
+  v0.4.0 reason is `not_enabled`: the stub feature compiled attribute
+  capture out.
+
 `pid_descendant_gaps` and `multi_rebuild_gaps` are saturating u64 counts.
 `pid_descendant_gaps` is zero for exact PID scope because process-creation
 tracking is not attached there. For cgroup scope it counts destination-

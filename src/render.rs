@@ -409,6 +409,42 @@ impl Default for AttachBackendEvidence {
     }
 }
 
+/// Object-attribute capture availability (P0-only ship vehicle): build
+/// scope, identical for every capture of this binary. Stubbed (v0.4.0)
+/// builds report `available: false` with the finite `not_enabled`
+/// reason; FULL builds report `available: true`. Never gates the
+/// verdict — P0 scope is complete when P0 facts are complete; this
+/// disclaims attribute coverage instead of claiming it.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct ObjectCaptureEvidence {
+    /// Whether this build captures object attributes.
+    pub available: bool,
+    /// Finite machine reason when unavailable, else `None`.
+    pub reason: Option<&'static str>,
+}
+
+impl ObjectCaptureEvidence {
+    /// The one v0.4.0 unavailability reason: the stub feature compiled
+    /// attribute capture out.
+    pub const NOT_ENABLED: &'static str = "not_enabled";
+
+    /// Structured status for a build flavor: `stubbed` names the
+    /// `stub-object-attributes` feature state.
+    pub const fn for_build(stubbed: bool) -> Self {
+        if stubbed {
+            Self {
+                available: false,
+                reason: Some(Self::NOT_ENABLED),
+            }
+        } else {
+            Self {
+                available: true,
+                reason: None,
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, PartialEq)]
 pub struct InterfaceSelection {
     pub providers: Vec<SelectionProvider>,
@@ -827,6 +863,9 @@ pub struct Evidence {
     #[serde(skip)]
     pub attach_mechanisms: Vec<&'static str>,
     pub attach_backend: AttachBackendEvidence,
+    /// Object-attribute capture availability in this build (P0-only ship
+    /// vehicle): always present, queryable, never inferred from absence.
+    pub object_capture: ObjectCaptureEvidence,
     #[serde(skip)]
     pub pid_descendant_gaps: u64,
     #[serde(skip)]
@@ -2715,6 +2754,7 @@ pub(crate) mod tests {
             interface_selection: InterfaceSelection::default(),
             attach_mechanisms: vec![],
             attach_backend: Default::default(),
+            object_capture: ObjectCaptureEvidence::for_build(false),
             pid_descendant_gaps: 0,
             multi_rebuild_gaps: 0,
             unprotected_live_windows: 0,
@@ -2867,6 +2907,43 @@ pub(crate) mod tests {
             let document = json(&reports_fixture(), &ev, &capture);
             assert_eq!(document["evidence"]["attach_backend"], expected);
         }
+    }
+
+    /// P0-only ship vehicle: the build flavor maps to a structured
+    /// availability status, both directions. Stubbed builds disclaim
+    /// attribute coverage with the finite `not_enabled` reason; FULL
+    /// builds report available with no reason.
+    #[test]
+    fn object_capture_status_for_build_both_directions() {
+        let stubbed = ObjectCaptureEvidence::for_build(true);
+        assert!(!stubbed.available);
+        assert_eq!(stubbed.reason, Some("not_enabled"));
+        let wired = ObjectCaptureEvidence::for_build(false);
+        assert!(wired.available);
+        assert_eq!(wired.reason, None);
+    }
+
+    /// The profile document carries object-capture status as structured
+    /// evidence, both directions; the production builder wires the
+    /// session source (pinned alongside, since fixtures pin FULL).
+    #[test]
+    fn profile_carries_object_capture_status() {
+        for stubbed in [false, true] {
+            let mut ev = evidence();
+            ev.object_capture = ObjectCaptureEvidence::for_build(stubbed);
+            let document = json(&reports_fixture(), &ev, &capture_fixture());
+            let expected = if stubbed {
+                serde_json::json!({"available": false, "reason": "not_enabled"})
+            } else {
+                serde_json::json!({"available": true, "reason": null})
+            };
+            assert_eq!(document["evidence"]["object_capture"], expected);
+        }
+        let source = include_str!("run.rs");
+        assert!(
+            source.contains("object_capture: crate::attach::Session::object_capture_evidence(),"),
+            "evidence_for must wire the session status"
+        );
     }
 
     #[test]

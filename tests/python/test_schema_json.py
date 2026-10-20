@@ -83,6 +83,42 @@ class SchemaOracleAgreement(unittest.TestCase):
                 with self.assertRaises(AssertionError):
                     CHECKER["exact_metrics_schema"](invalid)
 
+    def test_current_metrics_requires_object_capture_but_historical_shape_excludes_it(self):
+        current = self.metrics_document()
+        self.assertEqual(current["evidence"].get("object_capture"),
+                         {"available": True, "reason": None})
+        CHECKER["exact_metrics_schema"](current)
+        missing = copy.deepcopy(current)
+        missing["evidence"].pop("object_capture")
+        with self.assertRaises(AssertionError):
+            CHECKER["exact_metrics_schema"](missing)
+        historical = CHECKER["document_fixture"](
+            CHECKER["evidence_fixture"]({}), schema=CHECKER["HISTORICAL_METRICS_SCHEMA"],
+            mode="metrics", privacy="aggregate-only")
+        self.assertNotIn("object_capture", historical["evidence"])
+        CHECKER["exact_historical_metrics_schema"](historical)
+        historical["evidence"]["object_capture"] = current["evidence"]["object_capture"]
+        with self.assertRaises(AssertionError):
+            CHECKER["exact_historical_metrics_schema"](historical)
+
+    def test_object_capture_shape_twins(self):
+        document = self.metrics_document()
+        for value in ({"available": True, "reason": None},
+                      {"available": False, "reason": "not_enabled"}):
+            with self.subTest(value=value):
+                valid = copy.deepcopy(document)
+                valid["evidence"]["object_capture"] = value
+                CHECKER["exact_metrics_schema"](valid)
+        for value in ({"available": True, "reason": "not_enabled"},
+                      {"available": False, "reason": None},
+                      {"available": "yes", "reason": None},
+                      {"available": True}):
+            with self.subTest(value=value):
+                invalid = copy.deepcopy(document)
+                invalid["evidence"]["object_capture"] = value
+                with self.assertRaises(AssertionError):
+                    CHECKER["exact_metrics_schema"](invalid)
+
     def test_evidence_keys_match_oracle_closed_sets(self):
         """Schema evidence properties are exactly the oracle's closed key
         universe: base keys + profile-only keys + run-only child flag."""

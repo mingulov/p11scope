@@ -392,9 +392,9 @@ def main():
             results.append(result)
             print(json.dumps(result), flush=True)
         passed = {row['cell'] for row in results if row['control_pass']}
-        summary = dict(source_revision=args.source_revision, controls=results,
+        summary = dict(source_revision=args.source_revision, candidate=pins[0].metadata(), controls=results,
             remaining=[name for name in CELLS + NEGATIVE_CELLS if name not in passed]
-                + ['complete blocked-stderr E17 pressure/content/cleanup oracles'],
+                + ['blocked-stderr E17 cell execution on this candidate (qualify-operator-output.py --control blocked-stderr)'],
             qualification='owned reporter controls only; no blocked-stderr or full E17 acceptance')
         (args.out / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
         return 0 if all(row['control_pass'] for row in results) else 1

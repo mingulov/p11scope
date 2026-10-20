@@ -22,8 +22,9 @@ DEFAULT_LIB_TESTS = (
     'attach::identity_iter::tests::whole_system_run_covers_all_children',
     'attach::identity_iter::tests::wronly_anchor_fds_refuse_reads_with_eperm',
     # G23 5.15 identity-denial cell: real BTF named-fix refusal through
-    # the production sink with zero bpf() syscalls; lane-classified
-    # (denial required on 5.15, eligible elsewhere).
+    # the production sink with zero bpf() calls through the instrumented
+    # identity-iterator wrapper; lane-classified (denial required on
+    # 5.15, eligible elsewhere).
     'inspect_system::privileged_tests::privileged_identity_515_denial_is_disclosed',
     'attach::instance_tests::privileged_instance_attach_during_reload_loop_has_zero_false_joins',
     'attach::instance_tests::privileged_instance_exec_renews_the_instance',
@@ -418,8 +419,9 @@ def denial_outcome(text, lane):
 
     Exactly one well-formed marker classifies; the 5.15 lane requires
     the denied branch (real BTF named-fix refusal with zero bpf()
-    syscalls and the disclosed fallback), every other lane requires
-    the eligible branch. Test success alone never classifies.
+    calls through the instrumented wrapper and the disclosed
+    fallback), every other lane requires the eligible branch. Test
+    success alone never classifies.
     """
     markers = re.findall(r"(?:^|\.\.\. )IDENTITY_515_DENIAL ([^\n]*)$", text, re.M)
     require(text.count("IDENTITY_515_DENIAL") == len(markers), "malformed denial marker")
@@ -429,9 +431,12 @@ def denial_outcome(text, lane):
         r"IDENTITY_515_DENIAL outcome=denied reason=kernel_fix_missing "
         r"mm_present=false attach=(?:true|false) tasktype=(?:true|false) "
         r"bpf_delta=0 scan_bytes=[1-9][0-9]* fallback=kernel_fix_missing", line)
+    # Eligible needs at least one pid_fd witness: check_kernel_identity_btf
+    # returns Ok only when attach OR tasktype holds, so attach=false with
+    # tasktype=false is unemittable on Ok and must not classify.
     eligible = re.fullmatch(
         r"IDENTITY_515_DENIAL outcome=eligible mm_present=true "
-        r"attach=(?:true|false) tasktype=(?:true|false) "
+        r"(?:attach=true tasktype=(?:true|false)|attach=false tasktype=true) "
         r"bpf_delta=0 scan_bytes=[1-9][0-9]* sink=ok", line)
     if lane == "5.15.221":
         require(denied is not None, "5.15 lane requires the real denied refusal marker")

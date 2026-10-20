@@ -235,6 +235,39 @@ class MatrixContract(unittest.TestCase):
         row = next(r for r in json.loads(result.stdout)["rows"] if r["id"] == "lib:" + DENIAL)
         self.assertEqual(row["qualification"], "positive-coverage")
 
+    def test_denial_cell_single_witness_eligible_branches_judge_positive_off_515(self):
+        # Honest Ok needs at least one pid_fd witness (attach OR
+        # tasktype); both single-witness shapes must still classify
+        # positive-coverage.
+        for label, marker in (
+                ("attach-only", ELIGIBLE_MARKER.replace("attach=true tasktype=true",
+                                                        "attach=true tasktype=false")),
+                ("tasktype-only", ELIGIBLE_MARKER.replace("attach=true tasktype=true",
+                                                          "attach=false tasktype=true"))):
+            with self.subTest(label=label):
+                fresh = self.base / ("eligible-honest-" + label)
+                shutil.copytree(self.stage, fresh)
+                stage, contract = self.stage, self.contract
+                self.stage, self.contract = fresh, fresh / "contract.json"
+                try:
+                    self.selected_log(DENIAL, marker)
+                    result = self.judge()
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    row = next(r for r in json.loads(result.stdout)["rows"]
+                               if r["id"] == "lib:" + DENIAL)
+                    self.assertEqual(row["qualification"], "positive-coverage")
+                finally:
+                    self.stage, self.contract = stage, contract
+
+    def test_denial_cell_witnessless_eligible_forgery_is_rejected_off_515(self):
+        # check_kernel_identity_btf returns Ok only when attach OR tasktype
+        # holds, so attach=false/tasktype=false is unemittable on Ok: a
+        # judge that accepts it would bless a forged eligible marker.
+        witnessless = ELIGIBLE_MARKER.replace("attach=true tasktype=true",
+                                              "attach=false tasktype=false")
+        self.selected_log(DENIAL, witnessless)
+        self.reject()
+
     def test_each_multi_test_uses_its_own_refusal_not_later_positive_probe(self):
         for name, tag in ((CLASSIC_MULTI, "CLASSIC_PID_SCOPE selection=multi"),
                           (CAPTURE_MULTI, "C3_PID_SCOPE backend=Multi"),

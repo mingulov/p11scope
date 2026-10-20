@@ -94,6 +94,7 @@ RUN = [
     ("test_system_scope_measure_launch.py", []),
     ("test_system_scope_receipt.py", []),
     ("test_system_scope_sample.py", []),
+    ("test_system_scope_soak.py", []),
     ("test_system_test_manifest.py", []),
     ("test_t7_campaign.py", []),
 ]

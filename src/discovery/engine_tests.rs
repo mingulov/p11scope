@@ -42105,3 +42105,46 @@ fn midfinal_reused_pid_ends_capture_without_generation_loss() {
         engine.retirement_intents
     );
 }
+
+/// Midfinal residual P1: a positive exit proof must survive a later pin
+/// observation failure. Scripted `Ok(true) → Err`: the first observation
+/// proves exit, the second read fails. The retirement must stay
+/// `ExpectedRemoval` — never recorded as fatal loss — and the failed
+/// re-read must never be consulted.
+#[test]
+fn midfinal_residual_first_exit_proof_survives_later_probe_failure() {
+    let (_fixture, mut engine, _session) = continuity_route();
+    let view = engine.views[0].id();
+    engine.pin_probe_script.borrow_mut().extend([
+        PinProbeAnswer::Exited(Ok(true)),
+        PinProbeAnswer::Exited(Err("simulated stat failure after exit proof".to_string())),
+    ]);
+    let mut pending = PendingViewRetirements::new();
+    engine.queue_retirement(view, RetirementCause::GenerationLost, &mut pending);
+    assert_eq!(
+        pending.get(&view),
+        Some(&RetirementCause::ExpectedRemoval),
+        "the proven exit retires as an expected end: {pending:?}"
+    );
+    assert_eq!(
+        engine.retirement_intents.get(&view),
+        Some(&RetirementCause::ExpectedRemoval),
+        "the proven exit records no loss: {:?}",
+        engine.retirement_intents
+    );
+    assert!(
+        !engine
+            .retirement_intents
+            .values()
+            .any(|cause| *cause == RetirementCause::GenerationLost),
+        "no loss is invented: {:?}",
+        engine.retirement_intents
+    );
+    assert_eq!(
+        engine.pin_probe_script.borrow().len(),
+        1,
+        "the failed re-read is never consulted: {:?}",
+        engine.pin_probe_script.borrow()
+    );
+}
+

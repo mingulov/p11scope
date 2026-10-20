@@ -380,3 +380,37 @@ fn completion_minter_manufactures_nothing_for_unknown_domain() {
         "an unknown domain polls pending"
     );
 }
+
+#[test]
+fn completion_minter_preserves_first_failure_bounded_and_take_once() {
+    // A failed mint must not vanish into `None`: the minter keeps
+    // the first failure, truncated to its bound, until the driver
+    // takes it once for the gap path.
+    use crate::inventory_promotion::lifecycle::NativeCompletionSource as _;
+    let mut minter = super::NativeCompletionMinter::new();
+    assert!(
+        minter.take_first_failure().is_none(),
+        "a fresh minter reports no failure"
+    );
+    minter.record_first_failure("detach never joined".to_owned());
+    minter.record_first_failure("a later failure must not displace the first".to_owned());
+    assert_eq!(
+        minter.take_first_failure().as_deref(),
+        Some("detach never joined"),
+        "the first failure survives until taken"
+    );
+    assert!(
+        minter.take_first_failure().is_none(),
+        "the diagnostic reports once, never gap-spamming"
+    );
+    let oversized = "x".repeat(super::COMPLETION_FIRST_FAILURE_MAX + 64);
+    minter.record_first_failure(oversized);
+    let taken = minter
+        .take_first_failure()
+        .expect("an oversized failure still records");
+    assert_eq!(
+        taken.len(),
+        super::COMPLETION_FIRST_FAILURE_MAX,
+        "the preserved failure stays bounded"
+    );
+}

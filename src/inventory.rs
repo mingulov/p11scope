@@ -2012,6 +2012,13 @@ impl ClassicDriver<'_> {
                     return false;
                 };
                 let Some(minted) = source.poll_completion(domain) else {
+                    // A failed mint holds the namespace but reports
+                    // its preserved cause once through the gap path;
+                    // a merely pending poll takes nothing.
+                    if let Some(failure) = source.take_first_failure() {
+                        self.coordinator
+                            .note_scope_gap("selected promotion completion failed".into(), failure);
+                    }
                     return false;
                 };
                 minted
@@ -8231,6 +8238,33 @@ mod promotion_driver_tests {
         }
     }
 
+    /// A completion source whose mint failed: polls pending like the
+    /// production minter after a failed mint, with the preserved
+    /// first failure available once for the gap path.
+    struct FailingCompletionSource {
+        failure: Option<String>,
+    }
+
+    impl NativeCompletionSource for FailingCompletionSource {
+        fn poll_completion(
+            &mut self,
+            _domain: crate::attach::capture::NativeDomainId,
+        ) -> Option<SessionNativeCompletion> {
+            None
+        }
+
+        fn note_wound_down(
+            &mut self,
+            _domain: crate::attach::capture::NativeDomainId,
+            _session: crate::attach::Session,
+        ) {
+        }
+
+        fn take_first_failure(&mut self) -> Option<String> {
+            self.failure.take()
+        }
+    }
+
     /// Scripted terminal cleanup beneath the wind-down stub: the
     /// predicate observes interruption.
     type WindDownCleanup = Box<dyn FnMut(&dyn Fn() -> bool) -> anyhow::Result<()>>;
@@ -8800,6 +8834,63 @@ mod promotion_driver_tests {
             driver.retiring_domain(),
             None,
             "the retained proof retires once the work drains"
+        );
+    }
+
+    #[test]
+    fn failed_completion_mint_reports_once_and_holds_retirement() {
+        use crate::attach::capture::NativeDomainId;
+        use crate::inventory_semantics::SemanticBatch;
+        // A failed mint must surface its cause without retiring the
+        // namespace: one gap, take-once, and the domain still held.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let domain = NativeDomainId::try_mint().expect("domain mints");
+        driver
+            .coordinator
+            .stage_semantic_batch(SemanticBatch::scripted(domain, Vec::new(), 1));
+        driver.coordinator.finalize_semantic_batches(None);
+        driver.retiring = Some(RetiringDomain::wound_down(domain));
+        driver.completion_source = Some(Box::new(FailingCompletionSource {
+            failure: Some("detach never joined".to_owned()),
+        }));
+        driver.on_tick();
+        assert_eq!(
+            driver.retiring_domain(),
+            Some(domain),
+            "a failed mint holds the namespace"
+        );
+        let failures: Vec<(String, String)> = gaps(&mut driver)
+            .into_iter()
+            .filter(|(subject, _)| subject == "selected promotion completion failed")
+            .collect();
+        assert_eq!(
+            failures.len(),
+            1,
+            "the first failure reports exactly once: {:?}",
+            gaps(&mut driver)
+        );
+        assert!(
+            failures[0].1.contains("detach never joined"),
+            "the gap carries the mint cause: {:?}",
+            failures[0].1
+        );
+        // A second tick reports nothing further: take-once, never
+        // gap-spam, and the namespace still held.
+        driver.on_tick();
+        assert_eq!(
+            driver.retiring_domain(),
+            Some(domain),
+            "the namespace still holds after the report"
+        );
+        assert_eq!(
+            gaps(&mut driver)
+                .iter()
+                .filter(|(subject, _)| subject == "selected promotion completion failed")
+                .count(),
+            1,
+            "no duplicate gap on later ticks"
         );
     }
 

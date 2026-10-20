@@ -43166,3 +43166,264 @@ fn midfinal_res2_proven_generation_retries_failed_endpoint() {
     );
     child_a.reap().expect("reap the child");
 }
+
+/// Midfinal round-3 residual, item A fixture: one table on the shared
+/// provider object (`/provider.so`) with entries at `offsets`, owned by
+/// `view`. Both peers describe the SAME provider file; they differ only in
+/// which endpoints their tables contain.
+fn midfinal_res3_provider_module(view: ProcessViewId, offsets: &[u64]) -> ReconciledModule {
+    let key = ObjectKey {
+        device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+        inode: 42,
+    };
+    let object = PinnedObjectId(100);
+    ReconciledModule {
+        exports: Default::default(),
+        object,
+        entry_objects: vec![offsets.iter().map(|_| object).collect()],
+        scanned: ScannedModule {
+            mapped_identity: None,
+            double_loaded: false,
+            view,
+            mount_namespace: current_mount_namespace(),
+            key,
+            path: "/provider.so".into(),
+            decoder_abi: Some(ElfAbi::Lp64),
+            exports: vec!["C_GetFunctionList".into()],
+            tables: vec![ScannedTable {
+                version: (2, 40),
+                walk: "full",
+                entries: offsets
+                    .iter()
+                    .map(|offset| ScannedEntry {
+                        name: "C_Sign",
+                        object: key,
+                        object_path: "/provider.so".into(),
+                        file_offset: *offset,
+                    })
+                    .collect(),
+                null_entries: vec![],
+                unpinned: vec![],
+                address: 0x7000,
+                file_offset: Some(0),
+                live_return: false,
+                manifest_supported: false,
+            }],
+            interfaces: vec![],
+        },
+    }
+}
+
+/// Midfinal round-3 residual, item A (Sol re-re-review): the withholding
+/// filter must key ownership by contribution to the EXACT endpoint, not by
+/// provider object. Declined view A contributes inactive endpoint E; healthy
+/// view B scans the same provider but has no table containing E. The planner
+/// merges both into one provider module, but B's provider-level scan must
+/// not make E eligible: E is withheld for a proven generation while the
+/// shared endpoint F stays attached.
+#[test]
+fn midfinal_res3_tableless_provider_peer_does_not_authorize_retry() {
+    const E_OFF: u64 = 0x10;
+    const F_OFF: u64 = 0x20;
+    let object = PinnedObjectId(100);
+    let view_a = ProcessViewId(0);
+    let view_b = ProcessViewId(1);
+    let module_a = midfinal_res3_provider_module(view_a, &[E_OFF, F_OFF]);
+    let module_b = midfinal_res3_provider_module(view_b, &[F_OFF]);
+    let mut baseline = plan::build_from_reconciled_modules(&[module_a.clone(), module_b.clone()]);
+    assert_eq!(
+        baseline.modules.len(),
+        1,
+        "premise: the planner merges one provider object into one module"
+    );
+    let retry_index = baseline
+        .slots
+        .iter()
+        .find(|slot| slot.object == object && slot.file_offset == E_OFF)
+        .expect("premise: the provider plans endpoint E")
+        .index;
+    let shared_index = baseline
+        .slots
+        .iter()
+        .find(|slot| slot.object == object && slot.file_offset == F_OFF)
+        .expect("premise: the provider plans the shared endpoint F")
+        .index;
+    baseline.deactivate(retry_index);
+    assert!(
+        !baseline.is_active(retry_index),
+        "premise: the failed endpoint is inactive"
+    );
+    let scope_dir = tempfile::tempdir().expect("a scope directory");
+    e06_write_listing(scope_dir.path(), &[]);
+    let scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
+    let mut engine = Engine::discover(
+        &e06_cgroup_args(scope_dir.path(), vec![], Some(16)),
+        &scope,
+        None,
+    )
+    .expect("an empty cgroup still captures");
+    engine.plan = baseline;
+    let rebuilt = plan::build_from_reconciled_modules(&[module_a.clone(), module_b.clone()]);
+    let mut candidate_plan = engine.plan.clone();
+    let delta = candidate_plan
+        .extend_exact_with_stable_module_ids(rebuilt)
+        .expect("the failed endpoint rebuilds");
+    assert_eq!(
+        delta
+            .new
+            .iter()
+            .map(|slot| (slot.object, slot.file_offset))
+            .collect::<Vec<_>>(),
+        [(object, E_OFF)],
+        "premise: the failed endpoint rebuilds as delta.new"
+    );
+    let mut candidate = LiveCandidate {
+        pinned: PinnedObjects::empty(),
+        modules: vec![module_a, module_b],
+        plan: candidate_plan,
+        delta,
+        views: [view_a, view_b].into_iter().collect(),
+        corroboration: Vec::new(),
+        manifest_fallbacks: Vec::new(),
+        selection_claims: BTreeMap::new(),
+        selection_tables: BTreeMap::new(),
+        selection_admission: None,
+        manifest_selection_admissions: Vec::new(),
+        manifest_inventory_slots: BTreeMap::new(),
+        loader_plan_proof: None,
+        exec_preservations: Vec::new(),
+        exec_completions: Vec::new(),
+    };
+    let declined: BTreeSet<ProcessViewId> = [view_a].into_iter().collect();
+    engine.withhold_declined_retry_targets(&mut candidate, &declined);
+    assert!(
+        candidate.delta.new.is_empty(),
+        "B's provider-level scan must not qualify E: delta.new still holds {:?}",
+        candidate
+            .delta
+            .new
+            .iter()
+            .map(|slot| (slot.object, slot.file_offset))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        candidate
+            .plan
+            .slots
+            .iter()
+            .filter(|slot| {
+                slot.object == object
+                    && slot.file_offset == E_OFF
+                    && candidate.plan.is_active(slot.index)
+            })
+            .count(),
+        0,
+        "the declined view's endpoint does not reattach on a tableless peer's scan"
+    );
+    assert!(
+        candidate.plan.is_active(shared_index),
+        "the shared endpoint both views contribute stays attached"
+    );
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.reason.contains("withheld for a proven generation")),
+        "the withhold is marked: {:?}",
+        engine.counters.object_skips
+    );
+}
+
+/// Midfinal round-3 residual, item A positive twin: the same retry attaches
+/// when the healthy peer proves the EXACT target. View B's table contains E,
+/// so B's contribution qualifies the endpoint and the delta is untouched.
+#[test]
+fn midfinal_res3_exact_target_contribution_from_healthy_peer_attaches() {
+    const E_OFF: u64 = 0x10;
+    const F_OFF: u64 = 0x20;
+    let object = PinnedObjectId(100);
+    let view_a = ProcessViewId(0);
+    let view_b = ProcessViewId(1);
+    let module_a = midfinal_res3_provider_module(view_a, &[E_OFF, F_OFF]);
+    let module_b = midfinal_res3_provider_module(view_b, &[E_OFF, F_OFF]);
+    let mut baseline = plan::build_from_reconciled_modules(&[module_a.clone(), module_b.clone()]);
+    assert_eq!(
+        baseline.modules.len(),
+        1,
+        "premise: the planner merges one provider object into one module"
+    );
+    let retry_index = baseline
+        .slots
+        .iter()
+        .find(|slot| slot.object == object && slot.file_offset == E_OFF)
+        .expect("premise: the provider plans endpoint E")
+        .index;
+    baseline.deactivate(retry_index);
+    assert!(
+        !baseline.is_active(retry_index),
+        "premise: the failed endpoint is inactive"
+    );
+    let scope_dir = tempfile::tempdir().expect("a scope directory");
+    e06_write_listing(scope_dir.path(), &[]);
+    let scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
+    let mut engine = Engine::discover(
+        &e06_cgroup_args(scope_dir.path(), vec![], Some(16)),
+        &scope,
+        None,
+    )
+    .expect("an empty cgroup still captures");
+    engine.plan = baseline;
+    let rebuilt = plan::build_from_reconciled_modules(&[module_a.clone(), module_b.clone()]);
+    let mut candidate_plan = engine.plan.clone();
+    let delta = candidate_plan
+        .extend_exact_with_stable_module_ids(rebuilt)
+        .expect("the failed endpoint rebuilds");
+    assert_eq!(
+        delta
+            .new
+            .iter()
+            .map(|slot| (slot.object, slot.file_offset))
+            .collect::<Vec<_>>(),
+        [(object, E_OFF)],
+        "premise: the failed endpoint rebuilds as delta.new"
+    );
+    let mut candidate = LiveCandidate {
+        pinned: PinnedObjects::empty(),
+        modules: vec![module_a, module_b],
+        plan: candidate_plan,
+        delta,
+        views: [view_a, view_b].into_iter().collect(),
+        corroboration: Vec::new(),
+        manifest_fallbacks: Vec::new(),
+        selection_claims: BTreeMap::new(),
+        selection_tables: BTreeMap::new(),
+        selection_admission: None,
+        manifest_selection_admissions: Vec::new(),
+        manifest_inventory_slots: BTreeMap::new(),
+        loader_plan_proof: None,
+        exec_preservations: Vec::new(),
+        exec_completions: Vec::new(),
+    };
+    let declined: BTreeSet<ProcessViewId> = [view_a].into_iter().collect();
+    engine.withhold_declined_retry_targets(&mut candidate, &declined);
+    assert_eq!(
+        candidate
+            .delta
+            .new
+            .iter()
+            .map(|slot| (slot.object, slot.file_offset))
+            .collect::<Vec<_>>(),
+        [(object, E_OFF)],
+        "a proven exact-target contribution still attaches"
+    );
+    assert!(
+        !engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.reason.contains("withheld for a proven generation")),
+        "no withhold is marked when a healthy peer proves the target: {:?}",
+        engine.counters.object_skips
+    );
+}

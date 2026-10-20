@@ -127,6 +127,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=P11SCOPE_SMALL_DISCOVERY_RING");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_UNSAFE_UNVALIDATED_METADATA");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_WIDE_DETAILED_2112");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_STUB_OBJECT_ATTRIBUTES");
     println!("cargo:rerun-if-env-changed=P11SCOPE_PREPARED_BPF_CARGO");
     println!("cargo:rerun-if-env-changed=P11SCOPE_PREPARED_BPF_RUSTC");
     // The identity build resolves clang-18 via PATH and records the hit.
@@ -151,6 +152,7 @@ fn main() {
         println!("cargo:rustc-cfg=p11scope_small_discovery_ring");
     }
     let wide_detailed = env::var_os("CARGO_FEATURE_WIDE_DETAILED_2112").is_some();
+    let stub_object_attributes = env::var_os("CARGO_FEATURE_STUB_OBJECT_ATTRIBUTES").is_some();
 
     for flavor in [
         BpfFlavor::Detailed,
@@ -163,6 +165,7 @@ fn main() {
             small_state_maps,
             small_discovery_ring,
             wide_detailed,
+            stub_object_attributes,
         );
     }
     // The identity flavor is a standalone clang invocation, not a fourth
@@ -194,6 +197,7 @@ fn build_variant(
     small_state_maps: bool,
     small_discovery_ring: bool,
     wide_detailed: bool,
+    stub_object_attributes: bool,
 ) {
     let inventory = !matches!(flavor, BpfFlavor::Detailed);
     let manifest_dir =
@@ -324,6 +328,12 @@ fn build_variant(
         BpfFlavor::Detailed => {}
         BpfFlavor::InventoryGlobal => features.push("inventory-only"),
         BpfFlavor::InventoryCallers => features.push("inventory-callers"),
+    }
+    // P0-only ship vehicle: the Detailed object alone carries attribute
+    // adapters, so only it takes the stub feature. Inventory flavors
+    // compile the adapters out and are unaffected either way.
+    if stub_object_attributes && matches!(flavor, BpfFlavor::Detailed) {
+        features.push("stub-object-attributes");
     }
     if small_ring && !inventory {
         features.push("small-ring");

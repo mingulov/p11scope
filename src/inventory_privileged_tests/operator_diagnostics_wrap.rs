@@ -163,9 +163,41 @@ fn provider_index(path: &str, side: char) -> Option<u32> {
     (u64::from(index) < TARGETS).then_some(index)
 }
 
+/// Rotated event-segment sequence numbers (`events.jsonl.N`) present next
+/// to the live file, ascending. The engine names rotations sequentially
+/// and never rewrites a rotated segment, so each is read whole exactly once.
+fn rotated_segment_seqs(live: &Path) -> Vec<u64> {
+    let live_name = live
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let mut seqs = Vec::new();
+    let Some(parent) = live.parent() else {
+        return seqs;
+    };
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return seqs;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(suffix) = name
+            .strip_prefix(live_name)
+            .and_then(|rest| rest.strip_prefix('.'))
+        else {
+            continue;
+        };
+        if let Ok(seq) = suffix.parse::<u64>() {
+            seqs.push(seq);
+        }
+    }
+    seqs.sort_unstable();
+    seqs
+}
+
 #[derive(Default)]
 struct PassView {
-    offset: u64,
+    consumed_segments: BTreeSet<u64>,
+    last_seq: Option<u64>,
     a: BTreeMap<u32, serde_json::Value>,
     b: BTreeMap<u32, serde_json::Value>,
     evidence: Vec<GapEvidence>,
@@ -217,9 +249,48 @@ impl PassView {
         (side.len(), counts.first().copied(), counts.last().copied())
     }
     fn refresh(&mut self, path: &Path, pid: u32) -> Result<bool> {
-        let rows = new_lines(path, &mut self.offset)?;
+        // Rotation-aware delta: whole not-yet-consumed rotated segments
+        // plus the whole live file (bounded ~1MB by rotation), merged by
+        // global sequence. No byte offsets: already-seen rows (live content
+        // re-read after its rotation) drop out by sequence, and a sequence
+        // gap (evidence evicted before reading) fails loudly instead of
+        // validating on a partial stream.
+        let live_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_owned();
+        let mut fresh = Vec::new();
+        for seq in rotated_segment_seqs(path) {
+            if self.consumed_segments.contains(&seq) {
+                continue;
+            }
+            let segment = path.with_file_name(format!("{live_name}.{seq}"));
+            let mut from_start = 0;
+            fresh.extend(new_lines(&segment, &mut from_start)?);
+            self.consumed_segments.insert(seq);
+        }
+        let mut from_start = 0;
+        fresh.extend(new_lines(path, &mut from_start)?);
+        fresh.sort_by_key(|row| row["seq"].as_u64().unwrap_or(u64::MAX));
+        let mut rows = Vec::new();
+        for row in fresh {
+            let seq = row["seq"].as_u64().context("event sequence number")?;
+            match self.last_seq {
+                None => rows.push((seq, row)),
+                Some(last) if seq <= last => continue,
+                Some(_) => rows.push((seq, row)),
+            }
+        }
+        if let (Some(last), Some((first, _))) = (self.last_seq, rows.first()) {
+            ensure!(
+                *first <= last + 1,
+                "event evidence evicted before reading: last seq {last}, next seq {first}"
+            );
+        }
         let mut moved = false;
-        for row in &rows {
+        for (seq, row) in &rows {
+            self.last_seq = Some(self.last_seq.map_or(*seq, |last| last.max(*seq)));
             let event = &row["event"];
             if row["kind"] == "edge_observed" && event["identity_context"]["caller"]["pid"] == pid {
                 if let Some(id) = event["identity_context"]["caller"]["id"].as_str() {
@@ -286,12 +357,12 @@ impl PassView {
         // re-affirm instead of double-issuing.
         self.commits += rows
             .iter()
-            .filter(|row| row["kind"] == "pass_committed")
+            .filter(|(_, row)| row["kind"] == "pass_committed")
             .count() as u64;
         Ok(moved
             || rows
                 .last()
-                .is_some_and(|row| row["kind"] == "pass_committed"))
+                .is_some_and(|(_, row)| row["kind"] == "pass_committed"))
     }
 }
 
@@ -1441,13 +1512,16 @@ fn primary_facts_system(
     Ok(facts)
 }
 
-/// Post-run exact gap verification on the complete event stream (the
+/// Post-run exact gap verification on the live-accumulated evidence (the
 /// pre-`ended` flush makes repeats exact): startup `(1,2]` repeats must
 /// equal the live-validated `k`, each of the 64 sharer modules' ambiguity
 /// disclosures must total exactly `SHARED`, and the fence `(658,659]`
-/// repeats must be 32.
+/// repeats must be 32. Live accumulation — not a post-run file replay —
+/// because rotated segments beyond retention are evicted: the refresh loop
+/// observes every gap record exactly once (a sequence gap fails loudly),
+/// so its evidence is the complete exact record including the flush rows.
 fn verify_final_gaps(
-    rows: &[serde_json::Value],
+    gaps: &[GapEvidence],
     caller: &str,
     modules_a: &[String],
     modules_b: &[String],
@@ -1457,20 +1531,19 @@ fn verify_final_gaps(
         modules_a.len() == TARGETS as usize && modules_b.len() == TARGETS as usize,
         "need all64 sharer module ids"
     );
-    let gaps = replay_gap_repeats(rows);
-    let startup = startup_fence_repeats(&gaps, caller);
+    let startup = startup_fence_repeats(gaps, caller);
     ensure!(
         startup == k,
         "final startup-fence repeats {startup} != live k={k}"
     );
     for module in modules_a.iter().chain(modules_b.iter()) {
-        let repeats = ambiguity_repeats(&gaps, module);
+        let repeats = ambiguity_repeats(gaps, module);
         ensure!(
             repeats == SHARED,
             "final ambiguity disclosures for {module}: {repeats} != {SHARED}"
         );
     }
-    let fence = fence_gap_repeats(&gaps, caller);
+    let fence = fence_gap_repeats(gaps, caller);
     ensure!(fence == TARGETS, "final fence repeats {fence} != 32");
     eprintln!(
         "G21_WRAP_GAPS caller={caller} k={k} startup={startup} ambiguity={SHARED} fence={fence}"
@@ -1877,8 +1950,10 @@ fn run_wrap_cell(enabled: bool, cell: WrapCell) -> Result<(serde_json::Value, u6
     workload.command("stop", "done", 0)?;
     ensure!(workload.process.child.wait()?.success());
     check_native_ledger(&workload)?;
-    let mut event_offset = view.borrow().offset;
-    let terminal_events = new_lines(&events, &mut event_offset)?;
+    // The `ended` row is the run's last write, so it always sits in the
+    // live file (rotations only move earlier rows aside).
+    let mut from_start = 0;
+    let terminal_events = new_lines(&events, &mut from_start)?;
     ensure!(
         terminal_events
             .last()
@@ -1886,11 +1961,10 @@ fn run_wrap_cell(enabled: bool, cell: WrapCell) -> Result<(serde_json::Value, u6
         "public event stream lacks terminal end"
     );
     let k = fence_k.get();
-    let full_stream = jsonl_records(&events)?;
     {
         let view = view.borrow();
         verify_final_gaps(
-            &full_stream,
+            &view.evidence,
             view.caller_id.as_deref().unwrap_or_default(),
             &view
                 .modules_a()
@@ -2408,10 +2482,10 @@ fn operator_diagnostics_wrap_refresh_triggers_on_view_change() -> Result<()> {
     // rows and its commit marker) must still validate, never skip.
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("events");
-    let edge = "{\"kind\":\"edge_observed\",\"event\":{\"identity_context\":{\"caller\":{\"pid\":7,\"id\":\"c0\"},\"module\":{\"path\":\"/x/provider-A-07.so\",\"id\":\"m7\"}},\"entries\":{\"count\":4}}}\n";
-    let gap = "{\"kind\":\"gap_recorded\",\"event\":{\"caller\":\"c0\",\"subject\":\"s\",\"reason\":\"r\"}}\n";
-    let commit = "{\"kind\":\"pass_committed\",\"event\":{}}\n";
-    let other = "{\"kind\":\"caller_event\",\"event\":{}}\n";
+    let edge = "{\"seq\":0,\"kind\":\"edge_observed\",\"event\":{\"identity_context\":{\"caller\":{\"pid\":7,\"id\":\"c0\"},\"module\":{\"path\":\"/x/provider-A-07.so\",\"id\":\"m7\"}},\"entries\":{\"count\":4}}}\n";
+    let gap = "{\"seq\":0,\"kind\":\"gap_recorded\",\"event\":{\"caller\":\"c0\",\"subject\":\"s\",\"reason\":\"r\"}}\n";
+    let commit = "{\"seq\":0,\"kind\":\"pass_committed\",\"event\":{}}\n";
+    let other = "{\"seq\":0,\"kind\":\"caller_event\",\"event\":{}}\n";
     // Edge-only batch: view moved (A edge + caller), no commit yet.
     let mut view = PassView::default();
     std::fs::write(&path, edge)?;
@@ -4068,17 +4142,18 @@ fn operator_diagnostics_wrap_twin_passview_gap_evidence() -> Result<()> {
     // stream-tracked repeats), never bare reason strings.
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("events.jsonl");
-    let edge_a = serde_json::json!({"kind":"edge_observed","event":{
+    let edge_a = serde_json::json!({"seq":0,"kind":"edge_observed","event":{
         "entries":{"count":1},"presence":"mapped","capture":"armed",
         "identity_context":{"caller":{"id":"c0","pid":123},
             "module":{"id":"m1","path":"/owned/provider-A-01.so"}}}});
-    let gap = serde_json::json!({"kind":"gap_recorded","event":{
+    let gap = serde_json::json!({"seq":1,"kind":"gap_recorded","event":{
         "index":0,"caller":"c0","module":null,"pid":null,
         "subject":"rejected demoted count",
         "reason":"the current physical owner is not proven for absolute count range (1, 2] (1 unattributed calls); x",
         "budget":null}});
-    let repeated = serde_json::json!({"kind":"gap_repeated","event":{"index":0,"repeats":32}});
-    let committed = serde_json::json!({"kind":"pass_committed","event":{"pass":1}});
+    let repeated =
+        serde_json::json!({"seq":2,"kind":"gap_repeated","event":{"index":0,"repeats":32}});
+    let committed = serde_json::json!({"seq":3,"kind":"pass_committed","event":{"pass":1}});
     std::fs::write(&path, format!("{edge_a}\n{gap}\n{repeated}\n{committed}\n"))?;
     let mut view = PassView::default();
     ensure!(view.refresh(&path, 123)?);
@@ -4103,12 +4178,12 @@ fn operator_diagnostics_wrap_twin_passview_gap_evidence() -> Result<()> {
     writeln!(
         file,
         "{}",
-        serde_json::json!({"kind":"gap_repeated","event":{"index":9,"repeats":99}})
+        serde_json::json!({"seq":4,"kind":"gap_repeated","event":{"index":9,"repeats":99}})
     )?;
     writeln!(
         file,
         "{}",
-        serde_json::json!({"kind":"pass_committed","event":{"pass":3}})
+        serde_json::json!({"seq":5,"kind":"pass_committed","event":{"pass":3}})
     )?;
     ensure!(view.refresh(&path, 123)?);
     ensure!(view.evidence.len() == 1 && view.evidence[0].repeats == 32);
@@ -4219,54 +4294,115 @@ fn twin_final_gap_rows(
 fn operator_diagnostics_wrap_twin_verify_final_gaps() -> Result<()> {
     let modules_a: Vec<String> = (0..32).map(|index| format!("mA-{index:02}")).collect();
     let modules_b: Vec<String> = (0..32).map(|index| format!("mB-{index:02}")).collect();
-    verify_final_gaps(
-        &twin_final_gap_rows(&modules_a, &modules_b, 32, 32),
-        "c0",
-        &modules_a,
-        &modules_b,
-        32,
-    )?;
-    verify_final_gaps(
-        &twin_final_gap_rows(&modules_a, &modules_b, 0, 32),
-        "c0",
-        &modules_a,
-        &modules_b,
-        0,
-    )?;
+    // The validator takes the live-accumulated evidence (replayed here from
+    // fixture rows): rotated segments beyond retention are evicted, so a
+    // post-run file replay would be incomplete.
+    let exact = |startup: u64, fence: u64| {
+        replay_gap_repeats(&twin_final_gap_rows(&modules_a, &modules_b, startup, fence))
+    };
+    verify_final_gaps(&exact(32, 32), "c0", &modules_a, &modules_b, 32)?;
+    verify_final_gaps(&exact(0, 32), "c0", &modules_a, &modules_b, 0)?;
     // Wrong startup, fence, or one module's ambiguity fails.
-    ensure!(
-        verify_final_gaps(
-            &twin_final_gap_rows(&modules_a, &modules_b, 0, 32),
-            "c0",
-            &modules_a,
-            &modules_b,
-            32
-        )
-        .is_err()
-    );
-    ensure!(
-        verify_final_gaps(
-            &twin_final_gap_rows(&modules_a, &modules_b, 32, 31),
-            "c0",
-            &modules_a,
-            &modules_b,
-            32
-        )
-        .is_err()
-    );
+    ensure!(verify_final_gaps(&exact(0, 32), "c0", &modules_a, &modules_b, 32).is_err());
+    ensure!(verify_final_gaps(&exact(32, 31), "c0", &modules_a, &modules_b, 32).is_err());
     let mut short = twin_final_gap_rows(&modules_a, &modules_b, 32, 32);
     short[3]["event"]["repeats"] = serde_json::json!(SHARED - 1);
-    ensure!(verify_final_gaps(&short, "c0", &modules_a, &modules_b, 32).is_err());
     ensure!(
         verify_final_gaps(
-            &twin_final_gap_rows(&modules_a, &modules_b, 32, 32),
+            &replay_gap_repeats(&short),
             "c0",
-            &modules_a[..31],
+            &modules_a,
             &modules_b,
             32
         )
         .is_err()
     );
+    ensure!(verify_final_gaps(&exact(32, 32), "c0", &modules_a[..31], &modules_b, 32).is_err());
+    Ok(())
+}
+
+#[test]
+fn operator_diagnostics_wrap_twin_refresh_follows_rotation() -> Result<()> {
+    // A mid-run rotation (live renamed to events.jsonl.1, fresh live with a
+    // marker) loses no rows and duplicates none: the merge is by global
+    // sequence, so live content re-read from its rotated segment drops out.
+    let dir = tempfile::tempdir()?;
+    let live = dir.path().join("events.jsonl");
+    let edge = |seq: u64, count: u64| {
+        format!(
+            "{}\n",
+            serde_json::json!({"seq":seq,"kind":"edge_observed","event":{
+                "identity_context":{"caller":{"pid":7,"id":"c0"},
+                    "module":{"path":"/x/provider-A-07.so","id":"m7"}},
+                "entries":{"count":count}}})
+        )
+    };
+    let commit = |seq: u64| {
+        format!(
+            "{}\n",
+            serde_json::json!({"seq":seq,"kind":"pass_committed","event":{}})
+        )
+    };
+    std::fs::write(&live, format!("{}{}", edge(0, 1), commit(1)))?;
+    let mut view = PassView::default();
+    ensure!(view.refresh(&live, 7)?);
+    ensure!(view.last_seq == Some(1));
+    ensure!(view.commits == 1);
+    // Rotate: live content moves to events.jsonl.1; the new live starts
+    // with the marker (higher seq, written first) plus fresh rows.
+    std::fs::rename(&live, dir.path().join("events.jsonl.1"))?;
+    std::fs::write(
+        &live,
+        format!(
+            "{}\n{}{}",
+            serde_json::json!({"seq":3,"kind":"rotated","event":{}}),
+            edge(2, 2),
+            commit(4)
+        ),
+    )?;
+    ensure!(view.refresh(&live, 7)?);
+    ensure!(view.last_seq == Some(4));
+    ensure!(view.commits == 2);
+    ensure!(
+        view.a
+            .get(&7)
+            .and_then(|edge| edge["entries"]["count"].as_u64())
+            == Some(2)
+    );
+    // A second rotation is followed the same way; eviction of the consumed
+    // first segment is harmless.
+    std::fs::rename(&live, dir.path().join("events.jsonl.2"))?;
+    std::fs::remove_file(dir.path().join("events.jsonl.1"))?;
+    std::fs::write(&live, format!("{}{}", edge(5, 3), commit(6)))?;
+    ensure!(view.refresh(&live, 7)?);
+    ensure!(view.last_seq == Some(6));
+    ensure!(view.commits == 3);
+    ensure!(
+        view.a
+            .get(&7)
+            .and_then(|edge| edge["entries"]["count"].as_u64())
+            == Some(3)
+    );
+    Ok(())
+}
+
+#[test]
+fn operator_diagnostics_wrap_twin_refresh_rejects_eviction_hole() -> Result<()> {
+    // Evidence evicted before reading (a sequence gap) fails loudly instead
+    // of validating on a partial stream.
+    let dir = tempfile::tempdir()?;
+    let live = dir.path().join("events.jsonl");
+    std::fs::write(
+        &live,
+        "{\"seq\":0,\"kind\":\"pass_committed\",\"event\":{}}\n",
+    )?;
+    let mut view = PassView::default();
+    ensure!(view.refresh(&live, 7)?);
+    std::fs::write(
+        &live,
+        "{\"seq\":0,\"kind\":\"pass_committed\",\"event\":{}}\n{\"seq\":5,\"kind\":\"pass_committed\",\"event\":{}}\n",
+    )?;
+    ensure!(view.refresh(&live, 7).is_err());
     Ok(())
 }
 

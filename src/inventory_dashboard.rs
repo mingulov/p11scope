@@ -25,6 +25,7 @@
 //! Hand-rolled ANSI handles scrolling and resize; unicode-width measures
 //! display cells without adding a terminal widget framework.
 
+use crate::attach::selected_detailed::baseline::PromotionBaselineBatch;
 use crate::discovery::caller_registry::{CallerId, ModuleId};
 use crate::inventory_present::Presentation;
 use crate::inventory_promotion::{
@@ -2609,6 +2610,15 @@ pub(crate) struct Display {
     viewed_presentation: Option<Arc<Presentation>>,
     viewed_revision: ViewRevision,
     viewed_pair: Option<PromotionPair>,
+    /// The latest pre-view baseline batch the driver acquired: `d`
+    /// pairs the request with it when (and only when) it names the
+    /// exact viewed frame. A stale arrival never pairs and never
+    /// blocks a fresh attempt.
+    latest_baseline: Option<Arc<PromotionBaselineBatch>>,
+    /// The viewed frame/pair whose last acquisition attempt failed:
+    /// demand for it stays quiet until a new frame commits or the
+    /// cursor moves, bounding retries to one per frame/pair.
+    baseline_missed: Option<(ViewRevision, PromotionPair)>,
     /// View serials exhausted: no unique revision left, promotion
     /// refuses even on full writes.
     view_exhausted: bool,
@@ -2676,6 +2686,8 @@ impl Display {
             viewed_presentation: None,
             viewed_revision: ViewRevision::new(0),
             viewed_pair: None,
+            latest_baseline: None,
+            baseline_missed: None,
             view_exhausted: false,
             last_viewport: Viewport {
                 width: 80,
@@ -3058,11 +3070,17 @@ impl Display {
             }
             return;
         };
-        let view = Arc::new(PromotionView::new(
-            capture,
-            self.viewed_revision,
-            presentation,
-        ));
+        // Pair the retained batch when (and only when) it names this
+        // exact viewed frame; otherwise the request stays unqualified
+        // and the resolver refuses it as a stale view, honestly.
+        let view = Arc::new(match self.latest_baseline.clone() {
+            Some(batch) if batch.matches_view(capture, &presentation) => {
+                let fallback = Arc::clone(&presentation);
+                PromotionView::with_baseline(capture, self.viewed_revision, presentation, batch)
+                    .unwrap_or_else(|| PromotionView::new(capture, self.viewed_revision, fallback))
+            }
+            _ => PromotionView::new(capture, self.viewed_revision, presentation),
+        });
         let caller = CallerId(selected.caller());
         let provider = ModuleId(selected.provider());
         match self.promoter.request(view, caller, provider) {
@@ -3281,6 +3299,51 @@ impl Display {
     /// genuine end.
     pub(crate) fn promotion_state(&self) -> PromotionState {
         self.promoter.state()
+    }
+
+    /// The viewed frame plus cursor pair still needing a pre-view
+    /// baseline, if any: `Some` only while enabled, a frame was
+    /// wholly written with a cursor pair on it, no retained batch
+    /// pairs with that frame, and the last attempt for it did not
+    /// fail. The driver acquires through the capture and hands the
+    /// batch back via [`Display::note_baseline_batch`]; a failed
+    /// attempt is recorded via [`Display::note_baseline_failed`] so
+    /// it retries only for a new frame/pair.
+    #[cfg_attr(not(test), allow(dead_code))] // STAGED (DR37): the capture-service scheduler names this; tests drive it today.
+    pub(crate) fn baseline_demand(&self) -> Option<(CaptureId, Arc<Presentation>, PromotionPair)> {
+        let capture = self.promoter.capture()?;
+        let presentation = self.viewed_presentation.as_ref().map(Arc::clone)?;
+        let pair = self.viewed_pair?;
+        if self
+            .latest_baseline
+            .as_ref()
+            .is_some_and(|batch| batch.matches_view(capture, &presentation))
+        {
+            return None;
+        }
+        if self.baseline_missed == Some((self.viewed_revision, pair)) {
+            return None;
+        }
+        Some((capture, presentation, pair))
+    }
+
+    /// Retain the latest acquired pre-view batch. A stale arrival
+    /// (for an older frame) simply never pairs: `matches_view` guards
+    /// every use, and the next demand still schedules a fresh attempt.
+    #[cfg_attr(not(test), allow(dead_code))] // STAGED (DR37): the capture-service scheduler names this; tests drive it today.
+    pub(crate) fn note_baseline_batch(&mut self, batch: Arc<PromotionBaselineBatch>) {
+        self.latest_baseline = Some(batch);
+        self.baseline_missed = None;
+    }
+
+    /// Record a failed acquisition attempt for the current viewed
+    /// frame/pair: demand for it stays quiet until a new frame commits
+    /// or the cursor moves, bounding retries to one per frame/pair.
+    #[cfg_attr(not(test), allow(dead_code))] // STAGED (DR37): the capture-service scheduler names this; tests drive it today.
+    pub(crate) fn note_baseline_failed(&mut self) {
+        if let Some(pair) = self.viewed_pair {
+            self.baseline_missed = Some((self.viewed_revision, pair));
+        }
     }
 }
 

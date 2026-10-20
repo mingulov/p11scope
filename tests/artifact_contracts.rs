@@ -5157,6 +5157,227 @@ fn attach_pod_refuses_bad_arguments() {
     }
 }
 
+/// F1 (Sol-full): `scripts/attach-pod.sh` must resolve the pod cgroup through
+/// the shared kubelet-anchored resolver, never first-match-anywhere. A foreign
+/// subtree with a colliding scope name is created FIRST so an unanchored
+/// traversal meets it first (the hijack shape); the wrapper must still select
+/// exactly the UID-bound kubelet pod cgroup, report the decoy, and refuse
+/// ambiguity and absence loudly. The healthy twin (no decoy) proves the
+/// harness and the normal path. Driven end to end with stub kubectl/timeout/
+/// sudo/observer against a fabricated `P11SCOPE_CGROUP_ROOT`; a stub `find`
+/// remaps the legacy hardcoded `/sys/fs/cgroup` lookup onto the fixture so a
+/// first-match-anywhere regression fails by selecting the foreign scope.
+/// Needs no cluster, no sudo and no privileges; the script refuses root
+/// callers, so there is no drivable positive as root.
+#[test]
+fn attach_pod_selects_only_the_validated_pod_cgroup() {
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("attach-pod scope selection needs a non-root caller (the script refuses root)");
+        return;
+    }
+    const CID: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const UID: &str = "0123abcd-4567-89ef-0123-456789abcdef";
+    const OTHER_UID: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    let work = tempfile::tempdir().expect("create attach-pod scope fixture");
+    let stub = work.path().join("stub");
+    let cg = work.path().join("cg");
+    let argv_path = work.path().join("argv");
+    fs::create_dir(&stub).expect("create stub bin directory");
+    let scope_name = format!("cri-containerd-{CID}.scope");
+    // The foreign subtree is created first so an unanchored traversal meets it
+    // first, exactly the hijack shape.
+    let foreign_scope = cg.join("aaa-foreign.slice").join(&scope_name);
+    let real_pod = cg
+        .join("kubepods.slice")
+        .join(format!("kubepods-pod{}.slice", UID.replace('-', "_")));
+    fs::create_dir_all(&foreign_scope).expect("create foreign decoy scope");
+    fs::create_dir_all(real_pod.join(&scope_name)).expect("create real pod scope");
+    fs::write(cg.join("cgroup.controllers"), "").expect("write cgroup v2 sentinel");
+
+    let real_find = String::from_utf8(
+        Command::new("sh")
+            .args(["-c", "command -v find"])
+            .output()
+            .expect("locate the real find")
+            .stdout,
+    )
+    .expect("real find path is UTF-8");
+    let real_find = real_find.trim().to_string();
+    assert!(
+        !real_find.is_empty() && !real_find.contains([' ', '\'', '\n']),
+        "unsafe real find path: {real_find:?}"
+    );
+    let write_stub = |name: &str, body: &str| {
+        let path = stub.join(name);
+        fs::write(&path, format!("#!/bin/sh\n{body}")).expect("write scope stub");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+            .expect("make scope stub executable");
+    };
+    write_stub(
+        "timeout",
+        r#"while [ $# -gt 0 ]; do
+    case $1 in
+        --signal=*|--kill-after=*) shift ;;
+        --signal|--kill-after) shift 2 ;;
+        -*) shift ;;
+        *) break ;;
+    esac
+done
+shift
+exec "$@"
+"#,
+    );
+    write_stub(
+        "sudo",
+        r#"[ "${1-}" = "-n" ] && shift
+exec "$@"
+"#,
+    );
+    // The legacy lookup hardcodes /sys/fs/cgroup; remap it onto the fixture so
+    // a first-match-anywhere regression selects the foreign scope instead of
+    // failing on absence. The resolver passes $CGROUP_ROOT (never the literal
+    // /sys/fs/cgroup), so this stub passes its calls through untouched.
+    write_stub(
+        "find",
+        &format!(
+            r#"if [ "${{1-}}" = /sys/fs/cgroup ]; then shift; exec {real_find} "$P11SCOPE_CGROUP_ROOT" "$@"; fi
+exec {real_find} "$@"
+"#
+        ),
+    );
+    write_stub(
+        "kubectl",
+        r#"case " $* " in
+    *"containerStatuses[0].name"*) printf '%s' "good-name" ;;
+    *"metadata.uid"*) printf '%s' "$FETCH_UID" ;;
+    *"containerID"*) printf '%s' "containerd://$FETCH_CID" ;;
+esac
+"#,
+    );
+    write_stub(
+        "observer",
+        r#"printf '%s\n' "$@" > "$OBSERVER_ARGV"
+exit 0
+"#,
+    );
+    let stub_path = format!(
+        "{}:{}",
+        stub.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let run = |fetch_uid: &str| {
+        let _ = fs::remove_file(&argv_path);
+        Command::new("sh")
+            .args([
+                "scripts/attach-pod.sh",
+                "--pod",
+                "good",
+                "--namespace",
+                "default",
+                "--",
+                "--mode",
+                "metrics",
+            ])
+            .env("PATH", &stub_path)
+            .env("P11SCOPE_OBSERVER", stub.join("observer"))
+            .env("P11SCOPE_CGROUP_ROOT", &cg)
+            .env("FETCH_UID", fetch_uid)
+            .env("FETCH_CID", CID)
+            .env("OBSERVER_ARGV", &argv_path)
+            .output()
+            .expect("run attach-pod.sh")
+    };
+    let selected_cgroup = || {
+        let argv = fs::read_to_string(&argv_path).expect("observer must record its argv");
+        let argv: Vec<&str> = argv.lines().collect();
+        let position = argv
+            .iter()
+            .position(|line| *line == "--cgroup")
+            .expect("observer argv has no --cgroup");
+        argv.get(position + 1).expect("--cgroup value").to_string()
+    };
+    let log_of = |output: &std::process::Output| {
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    };
+
+    // Hijack refused: the foreign decoy is reported and ignored, and the
+    // wrapper selects exactly the UID-bound kubelet pod cgroup.
+    let hijacked = run(UID);
+    let log = log_of(&hijacked);
+    assert!(
+        hijacked.status.success(),
+        "a foreign decoy must not block the real pod: {log}"
+    );
+    let selected = selected_cgroup();
+    assert!(
+        !selected.contains("aaa-foreign"),
+        "the foreign scope hijacked the observation: {selected}"
+    );
+    assert_eq!(
+        selected,
+        real_pod.display().to_string(),
+        "the wrapper must select the validated pod cgroup"
+    );
+    assert!(
+        log.contains("ignored 1 match"),
+        "the foreign decoy was not reported: {log}"
+    );
+
+    // Healthy twin: with no decoy the same single match is selected.
+    fs::remove_dir_all(cg.join("aaa-foreign.slice")).expect("remove the foreign decoy");
+    let healthy = run(UID);
+    let log = log_of(&healthy);
+    assert!(
+        healthy.status.success(),
+        "the single valid match must be selected: {log}"
+    );
+    assert_eq!(
+        selected_cgroup(),
+        real_pod.display().to_string(),
+        "the healthy twin must select the same pod cgroup"
+    );
+
+    // Ambiguity refused: the requested UID itself matching two valid kubelet
+    // pod cgroups is never guessed.
+    let ambiguous_pod = cg
+        .join("kubelet.slice/kubelet-kubepods.slice")
+        .join(format!(
+            "kubelet-kubepods-pod{}.slice",
+            UID.replace('-', "_")
+        ));
+    fs::create_dir_all(ambiguous_pod.join(&scope_name)).expect("create the ambiguous pod");
+    let ambiguous = run(UID);
+    let log = log_of(&ambiguous);
+    assert_eq!(
+        ambiguous.status.code(),
+        Some(1),
+        "an ambiguous container id must be refused: {log}"
+    );
+    assert!(
+        log.contains("refusing"),
+        "the ambiguous match was not refused loudly: {log}"
+    );
+
+    // Absence refused: the same container id under pods carrying other UIDs is
+    // not the requested pod.
+    let missing = run(OTHER_UID);
+    let log = log_of(&missing);
+    assert_eq!(
+        missing.status.code(),
+        Some(1),
+        "a uid mismatch must be refused: {log}"
+    );
+    assert!(
+        log.contains("could not locate the pod cgroup"),
+        "the uid mismatch was not refused as absent: {log}"
+    );
+}
+
 #[test]
 fn immutable_policy_maps() {
     const BPF_F_RDONLY_PROG: u32 = 1 << 7;

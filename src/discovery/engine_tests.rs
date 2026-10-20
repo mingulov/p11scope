@@ -42612,9 +42612,12 @@ fn midfinal_residual_deferred_inventory_keeps_cgroup_view_until_proven_exit() {
         )
         .expect("the deferring tick applies");
     assert!(
-        engine.counters.object_skips.iter().any(|skip| skip.subject
-            == "live discovery generation"
-            && skip.reason.contains("contradicted or unprovable")),
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.subject == "live discovery generation"
+                && skip.reason.contains("contradicted or unprovable")),
         "the deferral is marked: {:?}",
         engine.counters.object_skips
     );

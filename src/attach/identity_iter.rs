@@ -808,10 +808,12 @@ const _: () = assert!(std::mem::offset_of!(MapInfoPrefix, value_size) == 12);
 const _: () = assert!(std::mem::offset_of!(MapInfoPrefix, max_entries) == 16);
 const _: () = assert!(std::mem::offset_of!(MapInfoPrefix, map_flags) == 20);
 
-/// Test-visible count of `bpf()` wrapper entries (attempted syscalls,
-/// counted before dispatch so failures count too). The 5.15 denial
-/// cell asserts the selection/deny path issues zero; a liveness ping
-/// proves the counter moves on a real syscall. Zero product effect:
+/// Test-visible count of this module's `bpf()` wrapper entries
+/// (attempted syscalls, counted before dispatch so failures count
+/// too). The 5.15 denial cell asserts the selection/deny path issues
+/// zero through this wrapper; a liveness ping proves the counter
+/// moves on a real syscall. Scope is this wrapper only: aya and the
+/// other raw `bpf()` sites bypass this counter. Zero product effect:
 /// compiled out of non-test builds.
 #[cfg(test)]
 static BPF_CALL_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -828,7 +830,8 @@ fn bpf(cmd: u32, attr: *mut std::ffi::c_void, size: usize) -> io::Result<i32> {
     }
 }
 
-/// Test seam: attempted `bpf()` syscalls so far in this process.
+/// Test seam: attempted `bpf()` syscalls through this module's
+/// wrapper so far (other `bpf()` sites bypass this counter).
 #[cfg(test)]
 pub(crate) fn test_bpf_call_count() -> u64 {
     BPF_CALL_COUNT.load(std::sync::atomic::Ordering::Relaxed)
@@ -1528,8 +1531,9 @@ pub fn read_vmlinux_btf() -> Result<Vec<u8>, KernelDeny> {
 
 /// Deny before load: read vmlinux BTF and run the §6.1 items 2–4 checks.
 /// Callers must run this before any loader or BPF call and refuse on
-/// `Err` — the 5.15 guest cell proves the refusal happens with zero
-/// `bpf()` syscalls issued. Returns the scanned bytes on success.
+/// `Err` — the 5.15 guest cell proves the refusal issues zero `bpf()`
+/// calls through this module's instrumented wrapper. Returns the
+/// scanned bytes on success.
 pub fn ensure_kernel_identity_btf() -> Result<Vec<u8>, KernelDeny> {
     let raw = read_vmlinux_btf()?;
     check_kernel_identity_btf(&raw)?;

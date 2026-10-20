@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Build/check owned32-body physical-count fixtures on a dev host, not Fedora."""
+"""Build/check owned32-pair indexed physical-count fixtures on a dev host, not Fedora."""
 import argparse
 from collections import Counter
 import hashlib
@@ -19,7 +19,9 @@ ROOT = Path(__file__).resolve().parents[3]
 SOURCE = Path(__file__).resolve().with_name('diagnostics-wrap-ledger.c')
 BASE_SOURCE = ROOT / 'tests/fixtures/public-cli/demotion-ledger.c'
 COMMON_NAMES = tuple(f'libdemotion-common-{index:02d}.so' for index in range(32))
-NAMES = COMMON_NAMES + ('provider-A.so', 'provider-B.so', 'workload')
+PROVIDER_A_NAMES = tuple(f'provider-A-{index:02d}.so' for index in range(32))
+PROVIDER_B_NAMES = tuple(f'provider-B-{index:02d}.so' for index in range(32))
+NAMES = COMMON_NAMES + PROVIDER_A_NAMES + PROVIDER_B_NAMES + ('workload',)
 PIN = runpy.run_path(str(ROOT / 'scripts/mapped-provider-pin.py'))['pin_fd']
 
 
@@ -31,9 +33,13 @@ def check_ledger(rows, acks, nonce, pid, directory, counted, shared, probe=False
     identity = rows[0]
     commons = [directory / name for name in COMMON_NAMES]
     digests = [digest(path) for path in commons]
+    providers_a = [digest(directory / name) for name in PROVIDER_A_NAMES]
+    providers_b = [digest(directory / name) for name in PROVIDER_B_NAMES]
     if (identity.get('kind') != 'identity' or identity['nonce'] != nonce
             or identity['pid'] != pid or identity['exe_sha256'] != digest(directory / 'workload')
-            or identity['common_sha256'] != digests):
+            or identity['common_sha256'] != digests
+            or identity['provider_a_sha256'] != providers_a
+            or identity['provider_b_sha256'] != providers_b):
         raise ValueError('native fixture identity differs from independently launched inputs')
     pins = []
     for path in commons:
@@ -98,7 +104,6 @@ def execute_fixture(directory, counted=2, shared=2, probe=False):
         os.mkfifo(fifo, 0o600)
         nonce = uuid.uuid4().hex
         child = subprocess.Popen([str(directory / 'workload'),
-            str(directory / 'provider-A.so'), str(directory / 'provider-B.so'),
             str(directory), str(fifo), str(ledger), nonce,
             '10000', str(counted), str(shared), *(['probe'] if probe else [])], stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
@@ -157,36 +162,73 @@ def check_fixture(directory, counted=2, shared=2, probe=False):
     return check_ledger(**observed, directory=directory, counted=counted, shared=shared, probe=probe)
 
 
+def check_topology(directory):
+    """Each A_i/B_i links exactly its own common-i counted object.
+
+    The workload proves the live binding at runtime (sparse single-slot
+    acquire plus per-index physical equality); this independently proves
+    the built linkage: provider i must need common-i's soname and its
+    own slot body symbol, and no other common soname or slot body. No
+    common object may export a provider root.
+    """
+    providers = list(PROVIDER_A_NAMES + PROVIDER_B_NAMES)
+    images = {name: (directory / name).read_bytes() for name in providers}
+    if len({digest(directory / name) for name in providers}) != 64:
+        raise ValueError('indexed providers are not64 distinct objects')
+    for side in 'AB':
+        for index in range(32):
+            name = f'provider-{side}-{index:02d}.so'
+            image = images[name]
+            own_soname = f'libdemotion-common-{index:02d}.so'.encode()
+            own_body = f'diagnostics_slot_{4 + index}'.encode()
+            if own_soname not in image or own_body not in image:
+                raise ValueError(f'{name} lacks its own common-{index:02d} linkage')
+            for other in range(32):
+                if other == index:
+                    continue
+                if f'libdemotion-common-{other:02d}.so'.encode() in image:
+                    raise ValueError(f'{name} reconnects through common-{other:02d}')
+                if f'diagnostics_slot_{4 + other}'.encode() in image:
+                    raise ValueError(f'{name} carries a foreign counted body')
+    for name in COMMON_NAMES:
+        image = (directory / name).read_bytes()
+        if b'C_GetFunctionList' in image:
+            raise ValueError(f'{name} exports a provider root')
+    return dict(indexed_pairs=32, providers=64, distinct_provider_objects=64)
+
+
 def build(directory, cc='cc'):
     sources = {str(path.relative_to(ROOT)): digest(path) for path in (SOURCE, BASE_SOURCE)}
     directory.mkdir(mode=0o700)
     base = [cc, '-std=c11', '-O2', '-fno-ipa-icf', '-Wall', '-Wextra', '-Werror']
     for index, name in enumerate(COMMON_NAMES):
         command = base + ['-shared', '-fPIC', '-DDEMOTION_COMMON',
-                          f'-DCOMMON_BODY=diagnostics_slot_{4 + index}']
-        if index == 0:
-            command += ['-DCOMMON_FIRST']
-        command += [str(SOURCE), '-o', str(directory / name)]
+                          f'-DCOMMON_BODY=diagnostics_slot_{4 + index}',
+                          str(SOURCE), '-o', str(directory / name)]
         result = subprocess.run(command, capture_output=True, timeout=30)
         if result.returncode:
             raise ValueError('owned fixture compile failed: ' + result.stderr.decode('utf-8', 'replace'))
-    common_libs = [f'-ldemotion-common-{index:02d}' for index in range(32)]
-    for name, mode in (('provider-A.so', 'DEMOTION_PROVIDER_A'),
-                       ('provider-B.so', 'DEMOTION_PROVIDER_B')):
-        command = base + ['-shared', '-fPIC', '-D' + mode, str(SOURCE),
-                          '-o', str(directory / name), '-L' + str(directory),
-                          *common_libs, '-Wl,-rpath,$ORIGIN', '-Wl,-z,defs']
-        result = subprocess.run(command, capture_output=True, timeout=30)
-        if result.returncode:
-            raise ValueError('owned fixture compile failed: ' + result.stderr.decode('utf-8', 'replace'))
+    for index in range(32):
+        for name, mode in ((f'provider-A-{index:02d}.so', 'DEMOTION_PROVIDER_A'),
+                           (f'provider-B-{index:02d}.so', 'DEMOTION_PROVIDER_B')):
+            command = base + ['-shared', '-fPIC', '-D' + mode,
+                              f'-DPROVIDER_SLOT={4 + index}', str(SOURCE),
+                              '-o', str(directory / name), '-L' + str(directory),
+                              f'-ldemotion-common-{index:02d}',
+                              '-Wl,-rpath,$ORIGIN', '-Wl,-z,defs']
+            result = subprocess.run(command, capture_output=True, timeout=30)
+            if result.returncode:
+                raise ValueError('owned fixture compile failed: ' + result.stderr.decode('utf-8', 'replace'))
     command = base + [str(SOURCE), '-o', str(directory / 'workload'), '-ldl']
     result = subprocess.run(command, capture_output=True, timeout=30)
     if result.returncode:
         raise ValueError('owned fixture compile failed: ' + result.stderr.decode('utf-8', 'replace'))
     if sources != {str(path.relative_to(ROOT)): digest(path) for path in (SOURCE, BASE_SOURCE)}:
         raise ValueError('fixture source changed while building')
+    topology = check_topology(directory)
     return dict(sources=sources, native_check=check_fixture(directory),
                 probe_check=check_fixture(directory, counted=3, shared=1, probe=True),
+                topology_check=topology,
                 inputs=[dict(name=name, size=(directory / name).stat().st_size,
                              sha256=digest(directory / name)) for name in NAMES],
                 qualification='unprivileged physical-entry topology/ledger only; no observer/BPF/wrap')

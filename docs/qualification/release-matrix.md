@@ -102,11 +102,15 @@ subset excludes these strict eligible-kernel gates:
 
 The underlying eligibility authority is the BTF named-fix check, including
 `bpf_iter_seq_task_vma_info.mm`, rather than a version-derived attach rule.
-`identity:5.15-denied` remains a distinct required, unready refusal assertion:
-no existing executable guest selector proves it. Pure denial fixtures do not
-prove live guest refusal. Its nonqualifying result prevents a 5.15 contract
-from becoming a positive completion claim. The real anchor-map handle test
-remains selected.
+`identity:5.15-denied` is a distinct required refusal assertion bound to the
+executable selector
+`inspect_system::privileged_tests::privileged_identity_515_denial_is_disclosed`:
+the real BTF named-fix refusal through the production sink with zero `bpf()`
+syscalls and the disclosed `kernel_fix_missing` fallback. Pure denial
+fixtures do not prove live guest refusal. The judge mirrors the executed
+selector's strict lane classification (denial required on 5.15, eligible
+elsewhere); test success alone never classifies. The real anchor-map handle
+test remains selected.
 
 ## Receipts and results
 

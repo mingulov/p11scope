@@ -808,7 +808,17 @@ const _: () = assert!(std::mem::offset_of!(MapInfoPrefix, value_size) == 12);
 const _: () = assert!(std::mem::offset_of!(MapInfoPrefix, max_entries) == 16);
 const _: () = assert!(std::mem::offset_of!(MapInfoPrefix, map_flags) == 20);
 
+/// Test-visible count of `bpf()` wrapper entries (attempted syscalls,
+/// counted before dispatch so failures count too). The 5.15 denial
+/// cell asserts the selection/deny path issues zero; a liveness ping
+/// proves the counter moves on a real syscall. Zero product effect:
+/// compiled out of non-test builds.
+#[cfg(test)]
+static BPF_CALL_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn bpf(cmd: u32, attr: *mut std::ffi::c_void, size: usize) -> io::Result<i32> {
+    #[cfg(test)]
+    BPF_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // SAFETY: raw bpf() with a caller-sized attr; exactly what libbpf does.
     let ret = unsafe { libc::syscall(libc::SYS_bpf, cmd as libc::c_long, attr, size) };
     if ret < 0 {
@@ -816,6 +826,12 @@ fn bpf(cmd: u32, attr: *mut std::ffi::c_void, size: usize) -> io::Result<i32> {
     } else {
         Ok(ret as i32)
     }
+}
+
+/// Test seam: attempted `bpf()` syscalls so far in this process.
+#[cfg(test)]
+pub(crate) fn test_bpf_call_count() -> u64 {
+    BPF_CALL_COUNT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Encode the `iter_info` selector for a task_vma link: `None` is the
@@ -6756,6 +6772,28 @@ mod tests {
         assert!(
             AnchorMaps::delete(null.as_fd(), &1u64.to_ne_bytes()).is_err(),
             "map delete on /dev/null must fail"
+        );
+    }
+
+    /// The `bpf()` observation seam moves on a real syscall: one
+    /// invalid-command probe (EINVAL before any privilege check, no
+    /// side effects) advances the counter. `>`, not `== before + 1`:
+    /// sibling tests may issue their own failing probes on other
+    /// threads; exactness is pinned by the single-test privileged
+    /// denial cell instead.
+    #[test]
+    fn bpf_call_counter_observes_real_syscalls() {
+        let before = test_bpf_call_count();
+        let error =
+            bpf(u32::MAX, std::ptr::null_mut(), 0).expect_err("an invalid bpf() command must fail");
+        assert_eq!(
+            error.raw_os_error(),
+            Some(libc::EINVAL),
+            "the probe must fail closed with EINVAL"
+        );
+        assert!(
+            test_bpf_call_count() > before,
+            "the seam must observe the attempted syscall"
         );
     }
 

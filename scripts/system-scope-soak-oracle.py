@@ -364,7 +364,15 @@ GATE_FUNCTIONS = {
 
 def evaluate(directory):
     """Run every gate; malformed evidence fails the gate that reads it."""
-    evidence = Evidence(directory)
+    try:
+        evidence = Evidence(directory)
+    except (OracleError, OSError) as error:
+        gates = {name: {"pass": False, "detail": f"evidence load failed: {error}"}
+                 for name in GATES}
+        return {"schema": VERDICT_SCHEMA, "cell_id": None, "mode": None,
+                "verdict": "FAIL", "require_duration_s": None,
+                "window_s": None, "gates": gates,
+                "evidence_dir": str(Path(directory))}
     gates = {}
     for name in GATES:
         try:
@@ -443,14 +451,15 @@ def build_receipt(directory, verdict, *, dry_run=False):
         if name == "verdict":
             relative = "verdict.json"
             path = evidence.directory / relative
+            require(path.is_file(), "the verdict itself must be hashed evidence")
         else:
             try:
                 relative = evidence.artifact(name)
             except OracleError:
                 continue
             path = evidence.directory / relative
-        if not path.is_file():
-            continue
+            if not path.is_file():
+                continue
         artifact_hashes[name] = {"path": relative, "sha256": sha256_file(path)}
         evidence_paths.append(relative)
     require(artifact_hashes and evidence_paths, "receipt needs hashed evidence")
@@ -833,6 +842,14 @@ def run_self_test():
             check("red/no-receipt-on-fail", False, "receipt built for FAIL")
         except OracleError:
             check("red/no-receipt-on-fail", True)
+        # Unreadable evidence yields an all-red verdict, never an oracle crash.
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        empty_verdict = evaluate(empty)
+        check("red/evidence-load-fails-verdict",
+              empty_verdict["verdict"] == "FAIL"
+              and all(not gate["pass"] for gate in empty_verdict["gates"].values()),
+              json.dumps(empty_verdict["gates"]))
     if failures:
         print(f"self-test: {len(failures)} failing legs: {', '.join(failures)}",
               file=sys.stderr)

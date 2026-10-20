@@ -1064,25 +1064,6 @@ impl SemanticCapture {
         anyhow::ensure!(targets.len() <= MAX_PENDING, "semantic target capacity");
         self.tick_with(&mut SessionIo { session, targets })
     }
-    /// Route the original retained quantum through all existing Session I/O
-    /// and H0 decisions, replacing only the ring collection leaf.
-    pub(crate) fn tick_collected(
-        &mut self,
-        session: &mut Session,
-        targets: &[Arc<PidPin>],
-        quantum: &mut crate::semantics_objects::journal::joint_driver::RawJointQuantum,
-    ) -> anyhow::Result<TickReport> {
-        anyhow::ensure!(targets.len() <= MAX_PENDING, "semantic target capacity");
-        let producers = session
-            .drain_producers()
-            .ok_or_else(|| anyhow::anyhow!("semantic Session has no retained native domain"))?;
-        anyhow::ensure!(
-            quantum.matches_producers(&producers),
-            "foreign retained quantum"
-        );
-        self.tick_collected_with(&mut SessionIo { session, targets }, quantum)
-    }
-
     /// One bounded no-call refresh through the same owned Session, endpoint
     /// and original pin. The freshly selected image comes only from the seal.
     pub(crate) fn refresh(

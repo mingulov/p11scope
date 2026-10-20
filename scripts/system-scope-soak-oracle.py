@@ -17,7 +17,8 @@ evidence) and, where the dry-run seam reaches, by short-horizon trials:
 - workload_continuity: every expected epoch fired with exact call
   counts on increasing timestamps spanning the window.
 - loss_accounting: pid-scope exactness (observed == workload truth)
-  with a complete loss-counter universe.
+  with a complete loss-counter universe from the canonical evidence
+  oracle (an embedded-fallback counter source fails).
 - resource_accounting: the sampler trace spans the window without
   stalls, with peaks recorded.
 - clean_exit: observer, sampler and workload all exited 0.
@@ -46,6 +47,9 @@ RUN_SCHEMA = "p11scope/soak-run/v1"
 VERDICT_SCHEMA = "p11scope/soak-verdict/v1"
 RECEIPT_SCHEMA = "p11scope/test-execution/v1"
 RECORD_SCHEMA = "p11scope/system-scope-measurement/v1"
+# The only counter universe the loss gate trusts: records whose counters
+# came from anywhere else (notably measure.py's embedded-fallback) fail.
+CANONICAL_COUNTERS_SOURCE = "check-capture-evidence.py:COUNTERS"
 MAPPING_SCHEMA = "p11scope/workload-mapping-receipt/v1"
 BEHAVIOR = "continuous-owned-workload"
 DRY_BEHAVIOR = "dry-run-loopback"
@@ -140,10 +144,12 @@ class Evidence:
     def __init__(self, directory):
         self.directory = Path(directory)
         self.run = load_json(self.directory / "run.json")
+        require(isinstance(self.run, dict), "run.json must be a JSON object")
         require(self.run.get("schema") == RUN_SCHEMA, "run.json schema mismatch")
         self.artifacts = self.run.get("artifacts")
         require(isinstance(self.artifacts, dict), "run.json artifacts must be an object")
         self.record = load_json(self.directory / self.artifact("record"))
+        require(isinstance(self.record, dict), "record.json must be a JSON object")
 
     def artifact(self, name):
         relative = strict_str(self.artifacts.get(name), f"artifact {name}")
@@ -223,7 +229,7 @@ def gate_ownership(evidence):
         identities = metadata["workload_module_identity"]
         require(isinstance(identities, list) and identities, "no workload module identity")
         claimed = hex64(identities[0].get("sha256"), "receipted module sha256")
-    except (KeyError, TypeError) as error:
+    except (KeyError, TypeError, AttributeError) as error:
         raise OracleError(f"receipt metadata shape is invalid: {error}") from error
     actual = sha256_file(copy_path)
     if actual != claimed:
@@ -279,6 +285,10 @@ def gate_loss_accounting(evidence):
         return False, f"workload truth does not equal observed calls: {joined.get('match_note')}"
     block = record.get("evidence")
     require(isinstance(block, dict), "record evidence must be an object")
+    source = block.get("counters_source")
+    require(source == CANONICAL_COUNTERS_SOURCE,
+            "record counters_source must be the canonical evidence oracle, "
+            f"not {source!r}")
     counters = block.get("counters")
     require(isinstance(counters, dict) and counters, "record counters must be a nonempty object")
     missing = sorted(name for name, value in counters.items() if value is None)
@@ -368,7 +378,9 @@ def evaluate(directory):
     """Run every gate; malformed evidence fails the gate that reads it."""
     try:
         evidence = Evidence(directory)
-    except (OracleError, OSError) as error:
+    except (OracleError, OSError, AttributeError) as error:
+        # Non-dict evidence shapes are evidence failures, not oracle
+        # crashes: every gate goes red inside a structured FAIL verdict.
         gates = {name: {"pass": False, "detail": f"evidence load failed: {error}"}
                  for name in GATES}
         return {"schema": VERDICT_SCHEMA, "cell_id": None, "mode": None,
@@ -380,7 +392,7 @@ def evaluate(directory):
         try:
             passed, detail = GATE_FUNCTIONS[name](evidence)
             gates[name] = {"pass": bool(passed), "detail": str(detail)}
-        except OracleError as error:
+        except (OracleError, AttributeError) as error:
             gates[name] = {"pass": False, "detail": f"invalid evidence: {error}"}
     timing = evidence.run.get("timing")
     if not isinstance(timing, dict):
@@ -524,7 +536,7 @@ def main(argv):
             return 1
         print(f"soak {verdict['cell_id']}: PASS", flush=True)
         return 0
-    except (OracleError, OSError, KeyError, TypeError) as error:
+    except (OracleError, OSError, KeyError, TypeError, AttributeError) as error:
         print(f"soak oracle refused: {error}", file=sys.stderr)
         return 1
 
@@ -584,13 +596,17 @@ def make_synthetic_evidence(root, *, mode="live", require_duration_s=1800,
     (root / "samples.jsonl").write_text(
         "\n".join(json.dumps(row) for row in samples) + "\n", encoding="utf-8")
     counters = {"event_loss": 0, "pending_at_end": 0, "malformed_records": 0}
+    # The synthetic counters stand in for the canonical universe under
+    # --self-test, so the control carries the canonical source pin; the
+    # embedded-fallback red leg below proves any other source fails.
     record = {"schema": RECORD_SCHEMA,
               "condition": {"scope": "pid", "mode": "metrics"},
               "truth_vs_observed": {
                   "truth": {"C_GenerateRandom": total_calls},
                   "observed": {"C_GenerateRandom": total_calls},
                   "counts_match": True, "match_note": "synthetic exact"},
-              "evidence": {"counters": counters, "counters_source": "synthetic"},
+              "evidence": {"counters": counters,
+                           "counters_source": CANONICAL_COUNTERS_SOURCE},
               "observer": {"samples": len(samples), "rss_max_bytes": 51_000_000,
                            "fds_max": 40}}
     (root / "record.json").write_text(json.dumps(record), encoding="utf-8")
@@ -779,6 +795,11 @@ def run_self_test():
                     target / "record.json",
                     lambda record: record["evidence"]["counters"].update(
                         {"event_loss": None})))
+        red_leg(control, "loss-embedded-fallback", "loss_accounting",
+                lambda target: rewrite_json(
+                    target / "record.json",
+                    lambda record: record["evidence"].update(
+                        {"counters_source": "embedded-fallback"})))
 
         def gap_samples(target):
             path = target / "samples.jsonl"
@@ -854,6 +875,20 @@ def run_self_test():
               empty_verdict["verdict"] == "FAIL"
               and all(not gate["pass"] for gate in empty_verdict["gates"].values()),
               json.dumps(empty_verdict["gates"]))
+        # Non-dict run/record shapes fail as structured all-red verdicts,
+        # never as AttributeError tracebacks without a verdict.
+        for leg, filename in (("shape-nondict-run", "run.json"),
+                              ("shape-nondict-record", "record.json")):
+            def replace_with_list(target, name=filename):
+                (target / name).write_text("[1, 2]", encoding="utf-8")
+
+            target = mutate_copy(control, leg, replace_with_list)
+            shape_verdict = evaluate(target)
+            check(f"red/{leg}",
+                  shape_verdict["verdict"] == "FAIL"
+                  and all(not gate["pass"]
+                          for gate in shape_verdict["gates"].values()),
+                  json.dumps(shape_verdict["gates"]))
     if failures:
         print(f"self-test: {len(failures)} failing legs: {', '.join(failures)}",
               file=sys.stderr)

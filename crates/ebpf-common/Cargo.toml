@@ -16,6 +16,10 @@ small-ring = []
 small-state-maps = []
 # Shrinks only the private live-discovery ring for its induced-gap test.
 small-discovery-ring = []
+# Shuts the H7-E4 attribute gate: entry acquires no template arguments
+# and Get emission reads nothing (the v0.4 P0 fallback object). Host
+# builds never enable this; FULL stays wired everywhere else.
+stub-object-attributes = []
 
 [dependencies]
 aya = { version = "=0.14.0", optional = true }

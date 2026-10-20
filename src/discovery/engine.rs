@@ -16944,16 +16944,46 @@ impl Engine {
     /// pin that proves the original exited names the ordinary leader-exit
     /// transition, so the capture ends instead of failing — the `LEADER_EXIT`
     /// record is still in the ring when the pidfd is already readable, and a
-    /// short-lived target loses that race almost every time. Loss stays loss
-    /// whenever exit cannot be proven, and an already-recorded loss stays
-    /// sticky: only the incoming cause is reclassified.
+    /// short-lived target loses that race almost every time. A loss report
+    /// the pin contradicts (it re-reads Current) or cannot judge (its
+    /// observation failed, or no view is retained) is declined with a
+    /// partial mark — never recorded, never sticky — and the next pass
+    /// re-checks: a real exit is persistent, so deferral cannot hide one,
+    /// while recording loss without positive evidence of change aborted
+    /// live captures (E17 midfinal: an unprovable pin for a live caller
+    /// skipped every terminal COUNT/EVIDENCE record). An already-recorded
+    /// loss stays sticky: only the incoming cause is reclassified.
     #[track_caller]
     fn queue_retirement(
         &mut self,
         view: ProcessViewId,
-        cause: RetirementCause,
+        mut cause: RetirementCause,
         pending_views: &mut PendingViewRetirements,
     ) {
+        // A declined report has no side effects at all: re-verify before
+        // clearing exec state, merging causes, or settling loader scans.
+        if cause == RetirementCause::GenerationLost && !self.original_exited(view) {
+            let state = self
+                .views
+                .iter()
+                .find(|candidate| candidate.id() == view)
+                .map(|retained| retained.original_generation_state());
+            match state {
+                Some(Ok(OriginalGenerationState::Current)) | Some(Err(_)) | None => {
+                    self.mark_partial(
+                        "live discovery generation",
+                        "a stale generation report was contradicted or unprovable on pin recheck; retirement deferred",
+                    );
+                    return;
+                }
+                // The exit/reuse won the race after the stale report (or
+                // after the first exit check): retire as an expected end,
+                // mapped directly without a third pin read.
+                Some(Ok(OriginalGenerationState::Exited | OriginalGenerationState::Reused)) => {
+                    cause = RetirementCause::ExpectedRemoval;
+                }
+            }
+        }
         if self
             .owned_initial_exec
             .is_some_and(|initial| initial.view == view)
@@ -19651,15 +19681,23 @@ impl Engine {
             }
             if !stale.is_empty() {
                 self.queue_stale_views(&stale, pending_views);
-                let _ = self.process_discovery_records(
-                    session,
-                    records,
-                    pending_views,
-                    additions_allowed,
-                    collect,
-                    closure,
-                )?;
-                bail!("the named process generation changed during capture");
+                // Queueing declines contradicted/unprovable reports
+                // (deferred with a partial mark, never lost); only an
+                // actually recorded loss fails the named capture.
+                let loss_recorded = stale.iter().any(|view| {
+                    self.retirement_intents.get(view) == Some(&RetirementCause::GenerationLost)
+                });
+                if loss_recorded {
+                    let _ = self.process_discovery_records(
+                        session,
+                        records,
+                        pending_views,
+                        additions_allowed,
+                        collect,
+                        closure,
+                    )?;
+                    bail!("the named process generation changed during capture");
+                }
             }
             if self.views.is_empty() {
                 bail!("the named process generation is no longer retained");

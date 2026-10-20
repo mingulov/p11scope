@@ -398,6 +398,10 @@ impl EventWriter {
     /// record covers the deleted file's own lines PLUS the earlier
     /// evictions its inner records had covered — the chain re-covers
     /// transitively, so no loss drops silently however deep it runs.
+    /// The cumulative footer totals, though, take only the deleted
+    /// file's OWN lines/bytes: the covered counts were already added
+    /// when those earlier files were deleted, and adding them again
+    /// would count every covered line twice (Sol F5).
     fn enforce_retention(&mut self) -> Result<(), String> {
         while self.retained.len() + 1 > self.max_files {
             let Some(oldest) = self.retained.pop_front() else {
@@ -407,8 +411,8 @@ impl EventWriter {
             remove_retained_file(&victim)?;
             let total_events = oldest.events.saturating_add(oldest.covered_events);
             let total_bytes = oldest.bytes.saturating_add(oldest.covered_bytes);
-            self.evicted_events = self.evicted_events.saturating_add(total_events);
-            self.evicted_bytes = self.evicted_bytes.saturating_add(total_bytes);
+            self.evicted_events = self.evicted_events.saturating_add(oldest.events);
+            self.evicted_bytes = self.evicted_bytes.saturating_add(oldest.bytes);
             self.live_covered_events = self.live_covered_events.saturating_add(total_events);
             self.live_covered_bytes = self.live_covered_bytes.saturating_add(total_bytes);
             let payload = serde_json::json!({

@@ -2295,7 +2295,7 @@ impl ClassicDriver<'_> {
         let parent = match self.scope {
             InventoryRunScope::Pid(pid) => Scope::Pid(pid),
             InventoryRunScope::System => Scope::System,
-            InventoryRunScope::Cgroup => return Err(PromotionRefusal::ScopeEnded),
+            InventoryRunScope::Cgroup => return Err(PromotionRefusal::ScopeUnsupported),
         };
         // A dead run takes no new preparation: starting BPF loads for
         // it wastes seconds and can never install.
@@ -8605,7 +8605,8 @@ mod promotion_driver_tests {
     #[test]
     fn take_refuses_when_parent_scope_is_cgroup() {
         // Selected cgroup preparation is unqualified: the resolver
-        // fails closed before loading any BPF.
+        // fails closed before loading any BPF, and names the live
+        // scope unsupported instead of misreporting it ended.
         let mut coordinator = coordinator();
         let headless = headless_display();
         let mut driver = driver_with_display(&mut coordinator, headless.display);
@@ -8614,7 +8615,7 @@ mod promotion_driver_tests {
         driver.on_tick();
         assert_eq!(
             driver.display.as_ref().expect("display").promotion_state(),
-            PromotionState::Refused(PromotionRefusal::ScopeEnded),
+            PromotionState::Refused(PromotionRefusal::ScopeUnsupported),
             "an unqualified parent scope refuses"
         );
         assert!(driver.lifecycle.is_idle());

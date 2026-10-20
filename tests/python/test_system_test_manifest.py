@@ -10,6 +10,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 VERIFY = runpy.run_path(str(ROOT / "scripts/verify-system-test-manifest.py"))
+RUNNER = runpy.run_path(str(ROOT / "scripts/run-python-suites.py"))
 
 
 # Independently pinned bounded-scope population: literal identities, never
@@ -369,6 +370,73 @@ class ManifestTests(unittest.TestCase):
                 self.row["outcome"] = outcome
                 with self.assertRaisesRegex(ValueError, "required cell"):
                     self.verify()
+
+    def reseed_selector(self, declared, executed):
+        """Rewrite the passing row's selector pair and rehash its receipt.
+
+        `declared` is the row's test_ids; `executed` is the receipt's
+        executed_test_ids, or None to drop the key (an unattested run).
+        """
+        self.row["test_ids"] = list(declared)
+        path = self.root / self.row["receipt"]
+        receipt = json.loads(path.read_text())
+        receipt["test_ids"] = list(declared)
+        if executed is None:
+            receipt.pop("executed_test_ids", None)
+        else:
+            receipt["executed_test_ids"] = list(executed)
+        path.write_text(json.dumps(receipt))
+        self.row["receipt_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+
+    def test_required_positive_rejects_skipped_selector(self):
+        # G34: a skipped selector must never pass a positive-required row.
+        # Zero-match, partial/ignored-live, reordered, foreign (a refusal
+        # or private result promoted to positive), duplicated and missing
+        # executions all fail; duplicate declarations fail too. The rest
+        # of the G34 battery stays pinned by its owning suites: deleted
+        # cells by test_missing_mandatory_row_is_rejected..., refusal and
+        # soak shape by test_refusal_is_distinct_from_capture and
+        # test_soak_requires_installed_artifact_and_actual_duration,
+        # None==None counts, omitted rounds and scrambled ABBA by
+        # count_overhead_rejects_missing_counts_and_rounds, and the
+        # release-matrix executed-ID legs by test_release_matrix_contract.
+        first = self.row["test_ids"][0]
+        second = self.row["id"] + "::second"
+        declared = [first, second]
+        legs = [
+            ("zero-match executes nothing", declared, [], "executed test"),
+            ("ignored-live selector drops one", declared, [first], "executed test"),
+            ("reordered execution is not exact", declared, [second, first], "executed test"),
+            ("foreign refusal promoted to positive", declared,
+             ["refusal-instead-of-" + second], "executed test"),
+            ("duplicated execution is not exact", declared,
+             [first, second, second], "executed test"),
+            ("unattested run drops the key", declared, None, "executed test"),
+        ]
+        for name, want_declared, want_executed, message in legs:
+            with self.subTest(selector=name):
+                self.reseed_selector(want_declared, want_executed)
+                with self.assertRaisesRegex(ValueError, message):
+                    self.verify()
+        with self.subTest(selector="duplicate declaration"):
+            self.reseed_selector([first, first], [first, first])
+            with self.assertRaisesRegex(ValueError, "duplicate test"):
+                self.verify()
+        # The control still passes: exact executed == declared verifies.
+        self.reseed_selector(declared, declared)
+        self.assertEqual(self.verify()["passed"], 8)
+        # A disabled registered suite is a skipped suite selector: the
+        # file stays on disk but leaves every registry list, so --check
+        # must fail instead of silently passing without it.
+        self.assertEqual(RUNNER["check"](ROOT), [])
+        present = RUNNER["present_suites"](ROOT)
+        run = [entry for entry in RUNNER["RUN"]
+               if entry[0] != "test_system_test_manifest.py"]
+        problems = RUNNER["registry_problems"](
+            present, run, RUNNER["DRIVEN"], RUNNER["EXCLUDED"],
+            RUNNER["read_driver"](ROOT))
+        self.assertTrue(any("test_system_test_manifest.py is not registered" in problem
+                            for problem in problems), problems)
 
     def test_wrong_kernel_and_failed_exit_are_rejected(self):
         self.change_receipt(kernel_profile="different")

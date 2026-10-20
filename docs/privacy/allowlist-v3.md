@@ -903,9 +903,12 @@ gate `object_producer_compiled_frames_are_bounded` green):
   growth breaks the gate. The attributes level holds 4,652 static
   instructions (inlined bounded scan; no nested BPF call besides the
   arg reader and map-row memsets).
-- Return object path via Get emission: 416 B (root 32 + branch 160 +
-  emission level 208 rounded to 224; 1,467 static instructions).
-  Fill/tail/Find levels unchanged (64/32/64 rounded).
+- Return object path via Get emission: 448 B (root 32 + branch 160 +
+  emission level 208 rounded to 224 + the emitted
+  `object_emit_get_attributes` -> `memset` edge, 32 minimum;
+  1,467 static instructions in the emission level). Still within
+  the 512 B budget. Fill/tail/Find levels unchanged (64/32/64
+  rounded).
 - Exec/exit roots unchanged (128 B chains). Maps unchanged
   (`OBJECT_START` 16/432/16,384; `OBJECT_DESCRIPTORS` 4/16/105
   frozen; `OBJECT_ZERO` 4/432/1). Ring records stay 616 B with

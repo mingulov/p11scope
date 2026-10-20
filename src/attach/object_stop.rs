@@ -97,7 +97,10 @@ mod tests {
         Ok(MapData::create(definition, name, None)?)
     }
 
-    fn fixture() -> Result<(Map, Map, StopGate, HashMap<MapData, [u8; 16], [u8; 432]>)> {
+    /// Pinned OBJECT_START/STOP_GATE scratch for the quiescence tests.
+    type StopFixture = (Map, Map, StopGate, HashMap<MapData, [u8; 16], [u8; 432]>);
+
+    fn fixture() -> Result<StopFixture> {
         let data = create_map("OBJECT_START", 2)?;
         let retained = MapData::from_fd(data.fd().as_fd().try_clone_to_owned()?)?;
         let object = Map::HashMap(data);

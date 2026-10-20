@@ -3970,19 +3970,14 @@ pub(crate) fn is_verifier_budget_errno(errno: Option<i32>) -> bool {
 /// BPF program-load refusal on verifier budget (E2BIG from BPF_PROG_LOAD).
 /// Permission, map-policy, identity and malformed-object failures — and
 /// every non-load error — return false and keep their own errors.
-/// (aya keeps the LoadError fields private, so the errno is read back
-/// through the documented io-error source.)
 #[cfg(test)]
 pub(crate) fn is_verifier_budget_refusal(error: &aya::programs::ProgramError) -> bool {
-    if !matches!(error, aya::programs::ProgramError::LoadError { .. }) {
-        return false;
+    match error {
+        aya::programs::ProgramError::LoadError { io_error, .. } => {
+            is_verifier_budget_errno(io_error.raw_os_error())
+        }
+        _ => false,
     }
-    use std::error::Error as _;
-    let errno = error
-        .source()
-        .and_then(|source| source.downcast_ref::<std::io::Error>())
-        .and_then(|io| io.raw_os_error());
-    is_verifier_budget_errno(errno)
 }
 
 /// The DISCOVERY ring size this scope loads with.
@@ -12698,6 +12693,29 @@ mod tests {
         assert!(!super::is_verifier_budget_errno(None));
     }
 
+    /// Load-refusal detector on real error values, both directions: a
+    /// LoadError with E2BIG classifies; LoadErrors with other errnos —
+    /// and non-load errors — never do, whatever the verifier log says.
+    #[test]
+    fn verifier_budget_refusal_real_errors() {
+        fn load_error(errno: i32) -> aya::programs::ProgramError {
+            aya::programs::ProgramError::LoadError {
+                io_error: std::io::Error::from_raw_os_error(errno),
+                verifier_log: aya_obj::VerifierLog::new("verifier spew".to_string()),
+            }
+        }
+        assert!(super::is_verifier_budget_refusal(&load_error(libc::E2BIG)));
+        for errno in [libc::EINVAL, libc::EACCES, libc::EPERM] {
+            assert!(
+                !super::is_verifier_budget_refusal(&load_error(errno)),
+                "errno {errno} must not classify as a budget refusal"
+            );
+        }
+        assert!(!super::is_verifier_budget_refusal(
+            &aya::programs::ProgramError::NotLoaded
+        ));
+    }
+
     /// Load-refusal detector, live: a FULL root load either succeeds
     /// (bigger-limit kernels) or fails with a classified refusal. The
     /// classifier must agree with the real errno in both directions — a
@@ -12722,12 +12740,9 @@ mod tests {
         match program.load() {
             Ok(()) => println!("FULL p11_entry loads on this kernel"),
             Err(error) => {
-                use std::error::Error as _;
-                if matches!(error, aya::programs::ProgramError::LoadError { .. }) {
-                    let errno = error
-                        .source()
-                        .and_then(|source| source.downcast_ref::<std::io::Error>())
-                        .and_then(|io| io.raw_os_error())
+                if let aya::programs::ProgramError::LoadError { io_error, .. } = &error {
+                    let errno = io_error
+                        .raw_os_error()
                         .expect("a real LoadError carries the BPF_PROG_LOAD errno");
                     assert_eq!(
                         super::is_verifier_budget_refusal(&error),

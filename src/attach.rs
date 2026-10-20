@@ -2316,6 +2316,11 @@ impl NativeCompletionMint {
     }
 }
 
+/// Bound on the completion minter's preserved first mint failure:
+/// generous over one-line mint refusals, and the gap path reports
+/// each preserved failure exactly once.
+pub(crate) const COMPLETION_FIRST_FAILURE_MAX: usize = 512;
+
 /// The production native completion minter (DR37 D4/A→B): owns
 /// wound-down Sessions and mints one lifecycle completion per
 /// genuinely disposed domain. Each poll attempts the held Session's
@@ -2324,15 +2329,36 @@ impl NativeCompletionMint {
 /// poll `None` and the namespace holds, never forced. A minted
 /// Session is spent (its terminal evidence consumed) and drops with
 /// its maps; a domain/Session pairing that disagrees drops closed
-/// instead of retiring the wrong namespace.
+/// instead of retiring the wrong namespace. A failed mint polls
+/// `None` too, but its cause is preserved (first failure, bounded)
+/// for the driver's diagnostic take instead of vanishing.
 #[derive(Default)]
 pub(crate) struct NativeCompletionMinter {
     pending: std::collections::HashMap<capture::NativeDomainId, Session>,
+    first_failure: Option<String>,
 }
 
 impl NativeCompletionMinter {
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    /// Preserve a mint failure for the diagnostic take: first one
+    /// wins, truncated to [`COMPLETION_FIRST_FAILURE_MAX`] on a
+    /// character boundary. Later failures never displace it, so the
+    /// reported cause is always the original refusal.
+    fn record_first_failure(&mut self, mut failure: String) {
+        if self.first_failure.is_some() {
+            return;
+        }
+        if failure.len() > COMPLETION_FIRST_FAILURE_MAX {
+            let mut end = COMPLETION_FIRST_FAILURE_MAX;
+            while !failure.is_char_boundary(end) {
+                end -= 1;
+            }
+            failure.truncate(end);
+        }
+        self.first_failure = Some(failure);
     }
 }
 
@@ -2349,13 +2375,20 @@ impl crate::inventory_promotion::lifecycle::NativeCompletionSource for NativeCom
             self.pending.remove(&domain);
             return None;
         }
-        session.mint_native_completion().ok()?;
+        if let Err(error) = session.mint_native_completion() {
+            self.record_first_failure(format!("{error:#}"));
+            return None;
+        }
         self.pending.remove(&domain);
         Some(crate::inventory_promotion::lifecycle::SessionNativeCompletion::completed(domain))
     }
 
     fn note_wound_down(&mut self, domain: capture::NativeDomainId, session: Session) {
         self.pending.insert(domain, session);
+    }
+
+    fn take_first_failure(&mut self) -> Option<String> {
+        self.first_failure.take()
     }
 }
 

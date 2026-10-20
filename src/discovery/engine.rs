@@ -19768,11 +19768,16 @@ impl Engine {
                 self.queue_stale_views(&stale, pending_views);
                 // Queueing declines contradicted/unprovable reports
                 // (deferred with a partial mark, never lost); only an
-                // actually recorded loss fails the named capture.
+                // actually recorded loss fails the named capture. An exit
+                // that won the race after the initial check above queues
+                // an accepted expected removal here, and an empty-ring
+                // batch never reaches the record tail below — so settle
+                // whatever queueing accepted before returning, or a
+                // terminal drain finishes with the retirement queued.
                 let loss_recorded = stale.iter().any(|view| {
                     self.retirement_intents.get(view) == Some(&RetirementCause::GenerationLost)
                 });
-                if loss_recorded {
+                if !pending_views.is_empty() {
                     let _ = self.process_discovery_records(
                         session,
                         records,
@@ -19781,7 +19786,19 @@ impl Engine {
                         collect,
                         closure,
                     )?;
+                }
+                if loss_recorded {
                     bail!("the named process generation changed during capture");
+                }
+                if self.views.is_empty() {
+                    // Settling an accepted removal retired the last view:
+                    // when the exit finalized this is the ordinary end of
+                    // the capture, otherwise the next pass re-checks (a
+                    // parked record may still finalize it). Either way this
+                    // pass made its progress; the "no longer retained" bail
+                    // below stays reserved for views that vanished without
+                    // any retirement settling here.
+                    return Ok(false);
                 }
             }
             if self.views.is_empty() {

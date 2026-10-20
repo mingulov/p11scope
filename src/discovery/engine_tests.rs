@@ -42148,3 +42148,63 @@ fn midfinal_residual_first_exit_proof_survives_later_probe_failure() {
     );
 }
 
+/// Midfinal residual P2: a late proven exit must settle before an empty
+/// terminal batch returns. The exit lands after the initial expected-exit
+/// check, so the stale block maps it to `ExpectedRemoval`; with no refresh
+/// request and no records, the batch must still process the accepted
+/// removal instead of finishing with the retirement queued.
+#[test]
+fn midfinal_residual_late_proven_exit_settles_in_empty_terminal_batch() {
+    let (mut fixture, mut engine, mut session) = continuity_route();
+    let view = engine.views[0].id();
+    let historical_slots = engine.plan.active_slot_count();
+    assert!(historical_slots > 0);
+    // The child exits after this pass starts observing: the initial
+    // expected-exit check still misses it, the queue recheck proves it,
+    // and the settle re-read (a persistent exit) confirms it.
+    fixture.child.kill().unwrap();
+    fixture.child.wait().unwrap();
+    assert!(
+        !engine.views[0].still_the_same(),
+        "precondition: the reaped child reads stale"
+    );
+    engine.pin_probe_script.borrow_mut().extend([
+        PinProbeAnswer::Exited(Ok(false)),
+        PinProbeAnswer::Exited(Ok(false)),
+        PinProbeAnswer::State(Some(Ok(crate::process::OriginalGenerationState::Exited))),
+    ]);
+    engine
+        .apply_quiesced_discovery(&mut session, Vec::new(), 0)
+        .expect("a late proven exit settles without failing the batch");
+    assert!(
+        engine.pin_probe_script.borrow().is_empty(),
+        "the scripted race fired in order: {:?}",
+        engine.pin_probe_script.borrow()
+    );
+    assert!(
+        engine.expected_target_exit(),
+        "the late exit finalized: views={:?} intents={:?}",
+        engine.views.iter().map(ProcessView::id).collect::<Vec<_>>(),
+        engine.retirement_intents
+    );
+    assert!(
+        engine.views.iter().all(|retained| retained.id() != view),
+        "the retired view is gone"
+    );
+    assert!(
+        engine.retirement_intents.is_empty(),
+        "no retirement stays queued: {:?}",
+        engine.retirement_intents
+    );
+    assert!(
+        engine.pending_retirements.is_empty(),
+        "no retirement stays pending: {:?}",
+        engine.pending_retirements
+    );
+    assert_eq!(
+        engine.plan.active_slot_count(),
+        0,
+        "the ended target retired its slots"
+    );
+}
+

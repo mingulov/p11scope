@@ -4599,7 +4599,9 @@
       "expected_behavior": "continuous-owned-workload",
       "minimum_duration_s": 1800,
       "limitation": "Actual wall time with independent workload/loss and resource accounting required.",
-      "test_ids": [],
+      "test_ids": [
+        "soak.1800s::continuous-owned-workload"
+      ],
       "command": [],
       "artifact_hashes": {},
       "evidence_paths": [],
@@ -4624,7 +4626,9 @@
       "expected_behavior": "continuous-owned-workload",
       "minimum_duration_s": 14400,
       "limitation": "Actual wall time with independent workload/loss and resource accounting required.",
-      "test_ids": [],
+      "test_ids": [
+        "soak.14400s::continuous-owned-workload"
+      ],
       "command": [],
       "artifact_hashes": {},
       "evidence_paths": [],
@@ -4649,7 +4653,9 @@
       "expected_behavior": "continuous-owned-workload",
       "minimum_duration_s": 86400,
       "limitation": "Actual wall time with independent workload/loss and resource accounting required.",
-      "test_ids": [],
+      "test_ids": [
+        "soak.86400s::continuous-owned-workload"
+      ],
       "command": [],
       "artifact_hashes": {},
       "evidence_paths": [],

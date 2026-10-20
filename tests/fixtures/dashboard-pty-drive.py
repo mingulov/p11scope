@@ -359,14 +359,23 @@ def app_first_mode() -> int:
             excerpts.append(("48x12 recorded gap ledger", gaps))
             mark = len(output)
             os.write(master, b"\t")
-            complete_frame(mark, compact_height, lambda text: initial_range in text and "tab d x q quit" in text)
+            # DR37: the identity-held promotion cursor keeps the j-selected
+            # pair across the evidence/gaps detour (gaps keys never reselect
+            # the edge cursor), and the summary view follows it on tab-back
+            # (src/inventory_dashboard.rs: reselect_on_edge_entry; usage.md:
+            # `d` acts on the selected caller/provider pair).
+            complete_frame(mark, compact_height, lambda text: "summary 2-2/2" in text and "tab d x q quit" in text)
             mark = len(output)
             os.write(master, b"j")
+            # Still at the bottom: j clamps and the retained pair stays shown.
             complete_frame(mark, compact_height, lambda text: "summary 2-2/2" in text and "tab d x q quit" in text)
 
         mark = len(output)
         resize(80, 24)
-        enlarged = complete_frame(mark, 24, lambda text: "scroll 1/1" in text and "q quit" in text)
+        # DR37: the enabled full footer ("j/k scroll, tab details, d promote,
+        # x cancel, q quit") truncates past 80 columns, so "q quit" no longer
+        # renders; pin the DR37 keys instead (src/inventory_dashboard.rs:948).
+        enlarged = complete_frame(mark, 24, lambda text: "scroll 1/1" in text and "d promote" in text)
         assert f"app-first-driver [{caller_id}] -> {later_name} [{later_id}]" in enlarged, enlarged
         assert f"pid {pid} incarnation 0" in enlarged, enlarged
         assert "presence mapped | capture scan only | activity not covered" in enlarged, enlarged

@@ -175,6 +175,13 @@ attach::object_stop::tests::object_stop_scrubs_real_retained_map_after_q
 attach::object_stop::tests::object_stop_refuses_real_unproven_q_without_mutation
 attach::object_stop::tests::object_stop_reports_real_scrub_failure
 discovery::confirm_shards::tests::privileged_sharded_confirmation_equals_the_serial_production_probe
+# T8 twin fullness control: the identical phase-1 arming with an empty
+# request map admits the same head with zero loss, proving the twin's
+# refusal pins the full blocked map rather than the head. Expected
+# green on the fixed lane-A runtime (the pre-twin shape converges to
+# admitted-head under any working fix); the known-failing twin/episode
+# stay skipped below until the privileged campaign re-runs them.
+discovery::engine::pressure_native_tests::pressure_live256_unparked_head_control_admits
 # T8 FIRST live control: quiet window arms nothing, then a 3-child owned
 # probe spends exactly tickets 1..=3 with zero loss (short; needs root,
 # host vmlinux BTF, gcc-built fixtures, and a quiet window — any ambient

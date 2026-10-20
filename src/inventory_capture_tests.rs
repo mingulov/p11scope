@@ -2935,6 +2935,73 @@ fn collection_ticks_hold_at_most_the_record_bound() {
     assert_eq!(services(&log), 4);
 }
 
+/// C5.7 (Sol F4): a quiet capture's slow collection cannot grow the held
+/// batches without bound. Empty quanta charge zero records but each batch
+/// shell costs memory, so past the batch bound the ticks drain nothing
+/// (the ring keeps the rest) — otherwise every 10 ms tick would add one
+/// more batch shell for the whole collection.
+#[test]
+fn quiet_collection_holds_at_most_the_batch_bound() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    // `records_per_service` stays 0: a quiet capture drains empty quanta.
+    let lane = ScriptedLane::new(&log);
+    let mut started = NativeLane::start(lane, &mut scene, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    let bound = windows().held_batches;
+    for _ in 0..20_000 {
+        started.collecting_tick();
+        assert!(
+            started.held.len() <= bound,
+            "quiet collection holds {} batches",
+            started.held.len()
+        );
+    }
+    assert_eq!(
+        LaneWindows::PROVISIONAL.held_batches,
+        16_384,
+        "the shell budget pins the default"
+    );
+}
+
+/// C5.7 (Sol F4): the batch bound engages like the record bound — past
+/// it the ticks drain nothing (the ring keeps the rest, and the kernel
+/// counts what it cannot hold) — and staging with the pass frees it.
+#[test]
+fn collection_ticks_hold_at_most_the_batch_bound() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let lane = ScriptedLane::new(&log);
+    let windows = LaneWindows {
+        held_batches: 3,
+        ..windows()
+    };
+    let mut started = NativeLane::start(lane, &mut scene, windows, None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    for _ in 0..5 {
+        started.collecting_tick();
+        assert!(started.held.len() <= 3, "{}", started.held.len());
+    }
+    let services = |log: &Log| {
+        log.borrow()
+            .iter()
+            .filter(|entry| *entry == "service")
+            .count()
+    };
+    // Three empty quanta, then nothing: the ring keeps the rest.
+    assert_eq!(services(&log), 3);
+    assert_eq!(started.held.len(), 3);
+    assert_eq!(started.held_records, 0, "empty quanta charge zero records");
+    assert!(!entries(&log).contains(&"stage:lifecycle".to_string()));
+    started.after_pass(&mut scene);
+    assert_eq!(scene.staged_lifecycle.len(), 4, "three held, one serviced");
+    // Staging frees the bound.
+    started.collecting_tick();
+    assert_eq!(services(&log), 5);
+}
+
 /// C5.7: one collection tick drains quantum after quantum while each stops
 /// at its record bound (the ring still holds more), until the held bound
 /// stops it; the last quantum takes only the room left.

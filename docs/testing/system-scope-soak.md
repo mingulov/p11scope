@@ -92,7 +92,7 @@ short horizons:
 ```sh
 scripts/system-scope-soak.sh --cell soak.1800s --dry-run \
   --observer-stub scripts/fixtures/soak-observer-stub.py \
-  --horizon 8 --epoch-s 2 --epoch-calls 5 --pace-us 300000 \
+  --horizon 8 --epoch-s 2 --epoch-calls 5 --pace-us 350000 \
   --work /var/tmp/p11scope-ws-tmp/soak-trial-green
 ```
 

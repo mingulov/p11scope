@@ -30,9 +30,14 @@ import time
 from pathlib import Path
 
 
-def load_counters():
-    """Import the loss-counter universe so the stub report cannot drift."""
-    oracle = Path(__file__).resolve().parents[1] / "check-capture-evidence.py"
+def load_counters(oracle):
+    """Import the loss-counter universe so the stub report cannot drift.
+
+    The oracle path is explicit argv (the runner passes the repo script):
+    the stub runs from a private evidence copy, so resolving it from the
+    stub's own location would point at the evidence directory.
+    """
+    oracle = Path(oracle)
     spec = importlib.util.spec_from_file_location("check_capture_evidence", oracle)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -66,6 +71,8 @@ def main(argv):
     parser.add_argument("--mode", choices=["metrics"], required=True)
     parser.add_argument("--duration", type=int, required=True)
     parser.add_argument("-o", "--output", required=True)
+    parser.add_argument("--counter-oracle", required=True,
+                        help="path to scripts/check-capture-evidence.py")
     parser.add_argument("--loopback-log", default=None)
     parser.add_argument("--loopback-corrupt",
                         choices=["drop-counter", "wrong-count"], default=None)
@@ -99,7 +106,7 @@ def main(argv):
         time.sleep(min(remaining, 0.5))
     if args.no_report:
         return args.exit_code
-    counters = load_counters()
+    counters = load_counters(args.counter_oracle)
     truth, looped = ({}, False)
     if args.loopback_log is not None:
         truth, looped = read_truth(args.loopback_log)

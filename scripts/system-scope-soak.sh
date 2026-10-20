@@ -19,7 +19,7 @@
 # Dry-run wiring trial (unprivileged, short horizon, stub observer):
 #   scripts/system-scope-soak.sh --cell soak.1800s --dry-run \
 #     --observer-stub scripts/fixtures/soak-observer-stub.py \
-#     --horizon 8 --epoch-s 2 --epoch-calls 5 --pace-us 300000 \
+#     --horizon 8 --epoch-s 2 --epoch-calls 5 --pace-us 350000 \
 #     --work /var/tmp/p11scope-ws-tmp/wave12-soakrunner/trial-green
 #
 # Pre-free rule: this script never invokes cargo and performs no builds
@@ -83,7 +83,7 @@ while [ "$#" -gt 0 ]; do
         --stub-arg) STUB_ARGS="$STUB_ARGS $2"; shift 2 ;;
         --kernel-profile) KERNEL_PROFILE=$2; shift 2 ;;
         --test-id) TEST_ID=$2; shift 2 ;;
-        -h|--help) sed -n '2,40p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,43p' "$0"; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -464,6 +464,7 @@ else
     set -- python3 -I "$STUB_COPY" profile \
         --pid "$WTARGET_PID" --manifest "$WORK/manifest.json" \
         --mode metrics --duration "$HORIZON" -o "$WORK/report.json" \
+        --counter-oracle "$PWD/scripts/check-capture-evidence.py" \
         --loopback-log "$WORK/workload.log" $STUB_ARGS
 fi
 OBS_ARGV_JSON=$(python3 -I -c "import json,sys; print(json.dumps(sys.argv[1:]))" "$@")

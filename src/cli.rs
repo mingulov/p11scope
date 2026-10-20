@@ -159,9 +159,10 @@ pub struct InventoryArgs {
     pub duration: Option<Duration>,
     /// `-o`: write the JSON inventory document to this file (atomic).
     pub out: Option<PathBuf>,
-    /// `--dashboard`: live read-only dashboard on stdout when it is a
-    /// terminal (scrollable edge table, coverage header, log tail);
-    /// degraded honestly to snapshots/JSON on a pipe, never ANSI.
+    /// `--dashboard`: live dashboard on stdout when it is a terminal
+    /// (scrollable edge table, coverage header, log tail; `d` requests
+    /// Detailed capture for the selected pair, `x` cancels); degraded
+    /// honestly to snapshots/JSON on a pipe, never ANSI.
     pub dashboard: bool,
     /// `--event-log`: append the JSONL observation-event stream
     /// (`p11scope/inventory-events/v1`) to this file, with rotation.

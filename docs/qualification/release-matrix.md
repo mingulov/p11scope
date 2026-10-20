@@ -106,7 +106,9 @@ The underlying eligibility authority is the BTF named-fix check, including
 executable selector
 `inspect_system::privileged_tests::privileged_identity_515_denial_is_disclosed`:
 the real BTF named-fix refusal through the production sink with zero `bpf()`
-syscalls and the disclosed `kernel_fix_missing` fallback. Pure denial
+calls through the instrumented identity-iterator wrapper (the cell's counter
+covers only that wrapper, not aya or other raw `bpf()` sites) and the
+disclosed `kernel_fix_missing` fallback. Pure denial
 fixtures do not prove live guest refusal. The judge mirrors the executed
 selector's strict lane classification (denial required on 5.15, eligible
 elsewhere); test success alone never classifies. The real anchor-map handle

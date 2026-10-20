@@ -18963,10 +18963,11 @@ impl Engine {
     /// view scanning the same provider authorize an endpoint its tables
     /// never contained. Withheld targets leave the delta and stay
     /// deactivated (their keys leave the index), so the next proven tick
-    /// retries them through the ordinary path. A target with any live
-    /// provider — a non-declined reconciled view contributing the exact
-    /// endpoint, or no scanned provider at all (manifest-only) — is
-    /// untouched.
+    /// retries them through the ordinary path; newly allocated cells are
+    /// excised rather than kept, so repeated deferral ticks do not
+    /// consume lifetime slot capacity. A target with any live provider —
+    /// a non-declined reconciled view contributing the exact endpoint, or
+    /// no scanned provider at all (manifest-only) — is untouched.
     fn withhold_declined_retry_targets(
         &mut self,
         candidate: &mut LiveCandidate,
@@ -19015,6 +19016,33 @@ impl Engine {
             .retain(|slot| !withheld.contains(&slot.index));
         for index in &withheld {
             candidate.plan.deactivate(*index);
+        }
+        // A withheld `delta.new` cell was allocated by this candidate and
+        // never linked: excise it so repeated deferral ticks do not burn
+        // the capture-lifetime slot budget. Pre-existing (`replace`)
+        // cells stay deactivated in place; every withheld endpoint retries
+        // through the ordinary path on the next proven tick.
+        let old_to_new = candidate
+            .plan
+            .excise_unlinked_tail_cells(self.plan.slots.len(), &withheld);
+        for slot in candidate
+            .delta
+            .new
+            .iter_mut()
+            .chain(&mut candidate.delta.replace)
+            .chain(&mut candidate.delta.retire)
+        {
+            let new = old_to_new
+                .get(slot.index as usize)
+                .copied()
+                .unwrap_or(u32::MAX);
+            debug_assert!(
+                new != u32::MAX,
+                "a surviving delta slot is never an excised cell"
+            );
+            if new != u32::MAX {
+                slot.index = new;
+            }
         }
         self.mark_partial(
             "live discovery attach",

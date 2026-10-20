@@ -42938,6 +42938,11 @@ fn midfinal_res2_accepted_removal_retires_selection_derived_slots() {
 /// endpoint rebuilds as `delta.new`, but the deferral currency exemption
 /// must not let it attach without generation revalidation: the retry waits
 /// while the retained coverage commits unchanged.
+///
+/// Round-3 extension (item B): repeated deferral ticks must not leak slot
+/// allocations (the allocation count stays stable, not just the active
+/// set), and the same engine recovers after withholding — once the
+/// generation is proven, the retry attaches with capacity intact.
 #[test]
 fn midfinal_res2_declined_inventory_withholds_failed_endpoint_retry() {
     let dir = tempfile::tempdir().expect("a fixture directory");
@@ -42995,6 +43000,7 @@ fn midfinal_res2_declined_inventory_withholds_failed_endpoint_retry() {
         "precondition: the failed endpoint is inactive"
     );
     let active_before = engine.plan.active_slot_count();
+    let alloc_before = engine.plan.slots.len();
     let contexts_before = engine.loader_registry.ids_for_view(id_a);
     let position = engine
         .views
@@ -43015,9 +43021,9 @@ fn midfinal_res2_declined_inventory_withholds_failed_endpoint_retry() {
     let mut session = ScriptedSession::with_records([], 0);
     let mut collect: Box<DiscoveryCollector<'_>> = Box::new(Engine::collect_discovery_records);
     let mut tick_now = crate::attach::monotonic_ns;
-    engine
-        .refresh_inventory(
-            &mut session,
+    let mut run_tick = |engine: &mut Engine, session: &mut ScriptedSession| {
+        engine.refresh_inventory(
+            session,
             &mut true,
             &mut Vec::new(),
             &mut PendingViewRetirements::new(),
@@ -43025,7 +43031,8 @@ fn midfinal_res2_declined_inventory_withholds_failed_endpoint_retry() {
             &mut PauseClosure::new(true),
             &mut tick_now,
         )
-        .expect("the deferring tick applies");
+    };
+    run_tick(&mut engine, &mut session).expect("the deferring tick applies");
     assert!(
         engine
             .counters
@@ -43060,9 +43067,85 @@ fn midfinal_res2_declined_inventory_withholds_failed_endpoint_retry() {
         "the retained coverage commits unchanged"
     );
     assert_eq!(
+        engine.plan.slots.len(),
+        alloc_before,
+        "the withheld retry releases its cell instead of consuming lifetime capacity"
+    );
+    assert_eq!(
         engine.loader_registry.ids_for_view(id_a),
         contexts_before,
         "the deferred view keeps its loader contexts"
+    );
+    for tick in 2..=3 {
+        assert!(
+            engine.request_refresh(pid_a, None),
+            "tick {tick}: the refresh request is accepted"
+        );
+        run_tick(&mut engine, &mut session)
+            .unwrap_or_else(|error| panic!("tick {tick}: the deferring tick applies: {error:?}"));
+        assert!(
+            engine
+                .plan
+                .slots
+                .iter()
+                .filter(|slot| {
+                    slot.object == retry_key.0
+                        && slot.file_offset == retry_key.1
+                        && engine.plan.is_active(slot.index)
+                })
+                .count()
+                == 0,
+            "tick {tick}: the retry keeps waiting while the generation stays unproven"
+        );
+        assert_eq!(
+            engine.plan.active_slot_count(),
+            active_before,
+            "tick {tick}: the retained coverage commits unchanged"
+        );
+        assert_eq!(
+            engine.plan.slots.len(),
+            alloc_before,
+            "tick {tick}: repeated deferral ticks hold the allocation count stable"
+        );
+    }
+    let position = engine
+        .views
+        .iter()
+        .position(|view| view.id() == id_a)
+        .expect("the deferred view's retained position");
+    engine.views[position] =
+        ProcessView::open(id_a, pid_a).expect("a proven pin over the live child");
+    assert!(
+        engine.views[position].still_the_same(),
+        "the healed generation reads current"
+    );
+    assert!(
+        engine.request_refresh(pid_a, None),
+        "the recovery refresh request is accepted"
+    );
+    run_tick(&mut engine, &mut session).expect("the recovery tick applies");
+    assert!(
+        engine.views.iter().any(|retained| retained.id() == id_a),
+        "the proven view stays retained"
+    );
+    assert_eq!(
+        engine
+            .plan
+            .slots
+            .iter()
+            .filter(|slot| {
+                slot.object == retry_key.0
+                    && slot.file_offset == retry_key.1
+                    && engine.plan.is_active(slot.index)
+            })
+            .count(),
+        1,
+        "withholding recovers: the proven generation reattaches its failed endpoint"
+    );
+    assert_eq!(
+        engine.plan.slots.len(),
+        alloc_before + 1,
+        "the recovered retry consumes exactly one cell for one attached endpoint"
     );
     child_a.reap().expect("reap the child");
 }
@@ -43220,7 +43303,8 @@ fn midfinal_res3_provider_module(view: ProcessViewId, offsets: &[u64]) -> Reconc
 /// view B scans the same provider but has no table containing E. The planner
 /// merges both into one provider module, but B's provider-level scan must
 /// not make E eligible: E is withheld for a proven generation while the
-/// shared endpoint F stays attached.
+/// shared endpoint F stays attached. The withheld cell is released rather
+/// than leaked into lifetime slot capacity (item B).
 #[test]
 fn midfinal_res3_tableless_provider_peer_does_not_authorize_retry() {
     const E_OFF: u64 = 0x10;
@@ -43253,6 +43337,7 @@ fn midfinal_res3_tableless_provider_peer_does_not_authorize_retry() {
         !baseline.is_active(retry_index),
         "premise: the failed endpoint is inactive"
     );
+    let alloc_before = baseline.slots.len();
     let scope_dir = tempfile::tempdir().expect("a scope directory");
     e06_write_listing(scope_dir.path(), &[]);
     let scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
@@ -43333,6 +43418,11 @@ fn midfinal_res3_tableless_provider_peer_does_not_authorize_retry() {
         "the withhold is marked: {:?}",
         engine.counters.object_skips
     );
+    assert_eq!(
+        candidate.plan.slots.len(),
+        alloc_before,
+        "the withheld retry releases its allocated cell instead of consuming lifetime capacity"
+    );
 }
 
 /// Midfinal round-3 residual, item A positive twin: the same retry attaches
@@ -43364,6 +43454,7 @@ fn midfinal_res3_exact_target_contribution_from_healthy_peer_attaches() {
         !baseline.is_active(retry_index),
         "premise: the failed endpoint is inactive"
     );
+    let alloc_before = baseline.slots.len();
     let scope_dir = tempfile::tempdir().expect("a scope directory");
     e06_write_listing(scope_dir.path(), &[]);
     let scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
@@ -43425,5 +43516,10 @@ fn midfinal_res3_exact_target_contribution_from_healthy_peer_attaches() {
             .any(|skip| skip.reason.contains("withheld for a proven generation")),
         "no withhold is marked when a healthy peer proves the target: {:?}",
         engine.counters.object_skips
+    );
+    assert_eq!(
+        candidate.plan.slots.len(),
+        alloc_before + 1,
+        "the proven retry keeps exactly its one reallocated cell"
     );
 }

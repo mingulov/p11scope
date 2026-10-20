@@ -2999,10 +2999,12 @@ impl Display {
     /// its revision and the cursor shown on that frame. Never called
     /// for a shed or cut frame. This is also the ONLY join between
     /// an acquired baseline batch and displayed authority: a staged
-    /// batch naming this exact frame commits with this draw's
-    /// revision; a stale staged batch (another frame's, superseded
-    /// before its draw) drops here and never pairs. A new revision
-    /// closes the old frame's committed batch and attempt record.
+    /// batch naming this exact frame AND covering the committing
+    /// caller commits with this draw's revision. A frame-matching
+    /// batch for another caller stays staged; a stale staged batch
+    /// (another frame's, superseded before its draw) drops here and
+    /// never pairs. A new revision closes the old frame's committed
+    /// batch and attempt record.
     fn commit_viewed_frame(&mut self) {
         if self.view_exhausted {
             return;
@@ -3012,28 +3014,37 @@ impl Display {
         };
         let revision = self.last_view_revision;
         let presentation = Arc::clone(&frame.presentation);
-        if revision != self.viewed_revision {
-            self.committed_baseline = None;
-            self.baseline_missed = None;
-        }
-        let staged_matches = self.promoter.capture().is_some_and(|capture| {
-            self.pending_baseline
-                .as_ref()
-                .is_some_and(|(batch, _)| batch.matches_view(capture, &presentation))
-        });
-        if staged_matches {
-            let (batch, pair) = self.pending_baseline.take().expect("staged batch matched");
-            self.committed_baseline = Some((revision, batch, pair));
-        } else {
-            self.pending_baseline = None;
-        }
-        self.viewed_presentation = Some(presentation);
-        self.viewed_revision = revision;
-        self.viewed_pair = if self.state.detail == DetailPage::Gaps {
+        let committing = if self.state.detail == DetailPage::Gaps {
             None
         } else {
             self.state.promotion.selected
         };
+        if revision != self.viewed_revision {
+            self.committed_baseline = None;
+            self.baseline_missed = None;
+        }
+        // Promote the staged batch only when it names this frame AND
+        // covers the committing caller. A frame-matching batch for
+        // another caller stays staged (the cursor may return); any
+        // other staged batch names a superseded frame and drops.
+        let capture = self.promoter.capture();
+        match self.pending_baseline.take() {
+            Some((batch, covered))
+                if capture.is_some_and(|capture| batch.matches_view(capture, &presentation))
+                    && committing.is_some_and(|pair| pair.caller() == covered.caller()) =>
+            {
+                self.committed_baseline = Some((revision, batch, covered));
+            }
+            Some((batch, covered))
+                if capture.is_some_and(|capture| batch.matches_view(capture, &presentation)) =>
+            {
+                self.pending_baseline = Some((batch, covered));
+            }
+            _ => {}
+        }
+        self.viewed_presentation = Some(presentation);
+        self.viewed_revision = revision;
+        self.viewed_pair = committing;
     }
 
     /// Clear promotion authority after any shed or cut: the candidate
@@ -3112,14 +3123,15 @@ impl Display {
             return;
         };
         // Pair the draw-committed batch when (and only when) it was
-        // committed with this exact viewed revision; otherwise the
-        // request stays unqualified and the resolver refuses it as a
-        // stale view, honestly. A staged batch never pairs here no
-        // matter how well it matches: only a draw joins a batch to
-        // displayed authority.
+        // committed with this exact viewed revision and covers the
+        // viewed caller; otherwise the request stays unqualified and
+        // the resolver refuses it as a stale view, honestly. A staged
+        // batch never pairs here no matter how well it matches: only
+        // a draw joins a batch to displayed authority.
         let view = Arc::new(match self.committed_baseline.clone() {
-            Some((revision, batch, _))
+            Some((revision, batch, covered))
                 if revision == self.viewed_revision
+                    && covered.caller() == selected.caller()
                     && batch.matches_view(capture, &presentation) =>
             {
                 let fallback = Arc::clone(&presentation);
@@ -3381,11 +3393,12 @@ impl Display {
 
     /// The candidate frame plus cursor pair still needing a pre-view
     /// baseline, if any: `Some` only while enabled, a candidate
-    /// carries the cursor, and no staged or committed batch names
-    /// that frame, and the last attempt for it did not fail. The
-    /// driver acquires through the capture and stages the batch via
-    /// [`Display::note_baseline_batch`] for the next draw to commit;
-    /// a failed attempt is recorded via
+    /// carries the cursor, no staged or committed batch covers that
+    /// frame AND the selected caller, and the last attempt for it
+    /// did not fail. One caller's batch never satisfies another
+    /// caller's demand. The driver acquires through the capture and
+    /// stages the batch via [`Display::note_baseline_batch`] for the
+    /// next draw to commit; a failed attempt is recorded via
     /// [`Display::note_baseline_failed`] so it retries only for a
     /// new frame/pair.
     pub(crate) fn baseline_demand(&self) -> Option<(CaptureId, Arc<Presentation>, PromotionPair)> {
@@ -3394,14 +3407,18 @@ impl Display {
         if self
             .pending_baseline
             .as_ref()
-            .is_some_and(|(batch, _)| batch.matches_view(capture, &frame))
+            .is_some_and(|(batch, covered)| {
+                covered.caller() == pair.caller() && batch.matches_view(capture, &frame)
+            })
         {
             return None;
         }
         if self
             .committed_baseline
             .as_ref()
-            .is_some_and(|(_, batch, _)| batch.matches_view(capture, &frame))
+            .is_some_and(|(_, batch, covered)| {
+                covered.caller() == pair.caller() && batch.matches_view(capture, &frame)
+            })
         {
             return None;
         }
@@ -3421,7 +3438,10 @@ impl Display {
     /// commit with its revision. Staging alone pairs nothing: `d`
     /// cannot see the batch until a draw commits it, so an arrival
     /// after a draw never retrofits the displayed revision. Records
-    /// the demanded pair the batch was acquired for. A stale staged
+    /// the demanded pair the batch was acquired for: the scheduler
+    /// acquires a single target, so that caller is the batch's
+    /// coverage for demand, commit and pairing (row truth itself is
+    /// re-verified downstream before preparation). A stale staged
     /// batch (another frame's) drops at the next draw and never
     /// pairs; demand for the committing frame persists meanwhile.
     pub(crate) fn note_baseline_batch(

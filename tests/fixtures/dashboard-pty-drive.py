@@ -319,7 +319,7 @@ def app_first_mode() -> int:
         resize(compact_width, compact_height)
         initial_range = "summary 1-2/2" if compact_width == 48 else "summary 1-1/2"
         compact = complete_frame(mark, compact_height, lambda text: "(minimal)" in text
-                                 and initial_range in text and "tab q quit" in text)
+                                 and initial_range in text and "tab d x q quit" in text)
         assert f"application app-first-driver [{caller_id}]" in compact, compact
         assert f"module {first_name} [{first_id}]" in compact, compact
         assert "Module mapped; activity not captured" in compact, compact
@@ -329,7 +329,7 @@ def app_first_mode() -> int:
 
         mark = len(output)
         os.write(master, b"j")
-        later = complete_frame(mark, compact_height, lambda text: "summary 2-2/2" in text and "tab q quit" in text)
+        later = complete_frame(mark, compact_height, lambda text: "summary 2-2/2" in text and "tab d x q quit" in text)
         assert f"application app-first-driver [{caller_id}]" in later, later
         assert f"module {later_name} [{later_id}]" in later, later
         assert f"module {first_name} [{first_id}]" not in later, later
@@ -359,10 +359,10 @@ def app_first_mode() -> int:
             excerpts.append(("48x12 recorded gap ledger", gaps))
             mark = len(output)
             os.write(master, b"\t")
-            complete_frame(mark, compact_height, lambda text: initial_range in text and "tab q quit" in text)
+            complete_frame(mark, compact_height, lambda text: initial_range in text and "tab d x q quit" in text)
             mark = len(output)
             os.write(master, b"j")
-            complete_frame(mark, compact_height, lambda text: "summary 2-2/2" in text and "tab q quit" in text)
+            complete_frame(mark, compact_height, lambda text: "summary 2-2/2" in text and "tab d x q quit" in text)
 
         mark = len(output)
         resize(80, 24)

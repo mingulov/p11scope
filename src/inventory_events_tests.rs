@@ -255,6 +255,111 @@ fn retention_eviction_is_accounted_not_silent() {
     }
 }
 
+/// Sol F5: the cumulative eviction totals count each deleted line once.
+/// Evicting a file whose records covered earlier evictions adds only the
+/// deleted file's OWN lines/bytes to the footer totals — the covered
+/// counts were already added when those earlier files were deleted —
+/// while the replacement coverage record still re-covers transitively
+/// (retained + covered == emitted keeps holding).
+#[test]
+fn cumulative_eviction_totals_count_each_deleted_line_once() {
+    let harness = refused_harness();
+    let (presentation, _) = presentation_for(&harness);
+    // `--event-max-files 1` evicts on every rotation; 2 keeps one
+    // rotation beside the live file. Both pin the same footer identity.
+    for max_files in [1usize, 2] {
+        let dir = private_tempdir();
+        let path = dir.path().join("events.jsonl");
+        let mut writer = EventWriter::create(&path, 8192, max_files).unwrap();
+        for i in 0..600u64 {
+            writer
+                .append("tick", serde_json::json!({"i": i}), 1000 + i)
+                .unwrap();
+        }
+        assert!(writer.rotations() >= 3, "rotations happened");
+        assert!(writer.evicted_events() > 0, "evictions happened");
+        // Top up to just past a rotation, so the live file holds only the
+        // marker and its eviction record: the `ended` line then fits
+        // without rotating, and the footer sees the final totals.
+        let rotations = writer.rotations();
+        for i in 600..6000u64 {
+            writer
+                .append("tick", serde_json::json!({"i": i}), 1000 + i)
+                .unwrap();
+            if writer.rotations() > rotations {
+                break;
+            }
+        }
+        assert!(writer.rotations() > rotations, "topped up past a rotation");
+        let payload = ended_payload(&presentation, 2_000_000, &writer);
+        let ended_len = writer.line_len("ended", &payload, 2_000_000);
+        assert!(
+            writer.live_bytes() + ended_len <= 8192,
+            "the ended line fits without rotating"
+        );
+        let rotations = writer.rotations();
+        writer.finish(payload, 2_000_000).unwrap();
+        assert_eq!(writer.rotations(), rotations, "finish appends in place");
+        let lines = read_stream(dir.path(), "events.jsonl");
+        let emitted: u64 = lines
+            .iter()
+            .map(|(_, line)| line["seq"].as_u64().unwrap())
+            .max()
+            .unwrap()
+            + 1;
+        let retained = lines.len() as u64;
+        // Transitive coverage is intact: every emission is retained once
+        // or covered once by a retained record.
+        let mut covered_events = 0u64;
+        let mut covered_bytes = 0u64;
+        for (_, line) in lines
+            .iter()
+            .filter(|(_, line)| line["kind"] == "retention_evicted")
+        {
+            covered_events += line["event"]["evicted_events"].as_u64().unwrap()
+                + line["event"]["covered_events"].as_u64().unwrap();
+            covered_bytes += line["event"]["evicted_bytes"].as_u64().unwrap()
+                + line["event"]["covered_bytes"].as_u64().unwrap();
+        }
+        assert_eq!(
+            retained + covered_events,
+            emitted,
+            "max_files={max_files}: every emission is retained or accounted"
+        );
+        // THE pin: the footer totals equal the TRUE deleted lines/bytes —
+        // emitted minus retained on disk — with no double count of the
+        // transitively covered earlier evictions.
+        assert_eq!(
+            writer.evicted_events(),
+            emitted - retained,
+            "max_files={max_files}: footer counts each deleted line once"
+        );
+        assert_eq!(
+            writer.evicted_bytes(),
+            covered_bytes,
+            "max_files={max_files}: footer counts each deleted byte once"
+        );
+        let ended = lines
+            .iter()
+            .find(|(_, line)| line["kind"] == "ended")
+            .unwrap_or_else(|| panic!("max_files={max_files}: the ended line is retained"));
+        assert_eq!(
+            ended.1["event"]["stream"]["evicted_events"]
+                .as_u64()
+                .unwrap(),
+            emitted - retained,
+            "max_files={max_files}: ended.stream pins the true deleted lines"
+        );
+        assert_eq!(
+            ended.1["event"]["stream"]["evicted_bytes"]
+                .as_u64()
+                .unwrap(),
+            covered_bytes,
+            "max_files={max_files}: ended.stream pins the true deleted bytes"
+        );
+    }
+}
+
 #[test]
 fn stream_privacy_bounds_match_snapshots_exactly() {
     let harness = refused_harness();

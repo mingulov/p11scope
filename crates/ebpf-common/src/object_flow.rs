@@ -313,6 +313,12 @@ pub fn adapter_derive_entry(
     true
 }
 
+/// H7-E4 shipping gate, now build-selected: the default build wires
+/// FULL attribute capture; only the `stub-object-attributes` BPF build
+/// (the v0.4 P0 fallback object) shuts it. While false, entry acquires
+/// no template arguments and Get emission reads nothing.
+pub const ATTRIBUTE_CAPTURE_WIRED: bool = !cfg!(feature = "stub-object-attributes");
+
 /// Production entry attribute adapter body (H7-E4): inspect authorized
 /// creation-template pairs into the side row's request lists, or retain
 /// Get entry headers into the side row's Get fields. Returns false only
@@ -1237,4 +1243,25 @@ pub fn production_capture_get_return(
     crate::object_capture::capture_get_return_into(
         side, rv, authority, layout, out, read_word, read_bytes,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// P0-degrade ship vehicle: the default build wires FULL object
+    /// attribute capture. Only the `stub-object-attributes` BPF build
+    /// shuts the gate; its qualification is the P0 artifact contract
+    /// plus the live 1M-kernel load, never this host suite.
+    #[test]
+    fn default_build_wires_attribute_capture() {
+        assert!(
+            ATTRIBUTE_CAPTURE_WIRED,
+            "default build must wire FULL attribute capture"
+        );
+        assert!(
+            !cfg!(feature = "stub-object-attributes"),
+            "host tests never run stubbed"
+        );
+    }
 }

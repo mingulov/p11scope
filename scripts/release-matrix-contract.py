@@ -73,6 +73,7 @@ DEFAULT_LIB_TESTS = (
     'attach::inventory::capture::privileged_tests::privileged_inventory_capture_pid_scope_leader_exit_probe_lp64',
     'attach::inventory::capture::privileged_tests::privileged_inventory_capture_stop_with_held_call_reports_unsettled_lp64',
     'attach::inventory::capture::privileged_tests::privileged_inventory_capture_stop_before_activation_repolls_custody_lp64',
+    'attach::inventory::capture::privileged_tests::privileged_dr37_selected_promotion_full_loop',
     'attach::inventory::privileged_tests::privileged_inventory_caller_preparation_faults_release_exact_resources',
     'attach::inventory::privileged_tests::privileged_inventory_caller_preparation_freezes_native_maps_and_publishes_binding',
     'attach::inventory::privileged_tests::privileged_inventory_preparation_failure_releases_owned_resources',

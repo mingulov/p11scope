@@ -14,6 +14,7 @@ use crate::discovery::engine::inventory::UnavailableImageGuard;
 use crate::discovery::hooks::HookRegistry;
 use crate::discovery::inventory_attach_set::AttachEndpoint;
 use crate::discovery::inventory_attach_set::tests as fx;
+use crate::discovery::inventory_workload::{Harness, ScaleSpec};
 use crate::discovery::native_binding::UnboundReason;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -3729,5 +3730,80 @@ mod scan_terminal_accounting_tests {
         assert_eq!(markers.len(), 1, "{lines:?}");
         assert_eq!(markers[0]["event"]["final"], true);
         assert_gap_accounting(&lines);
+    }
+}
+
+mod promotion_baseline_lane_tests {
+    //! DR37 baseline acquisition through the lane trait: lanes without
+    //! the inventory baseline program refuse honestly through the
+    //! default, and the facade refuses outside Active. Both through
+    //! `&mut dyn`, exactly as the scheduler calls them.
+    use super::*;
+
+    fn presented_frame() -> std::sync::Arc<crate::inventory_present::Presentation> {
+        let mut harness = Harness::new(RegistryLimits::default_limits()).unwrap();
+        harness.stage_scale(&ScaleSpec {
+            name: "baseline-lane",
+            callers: 1,
+            modules: 1,
+            edges_per_caller: 1,
+            endpoints_per_module: 1,
+            first_pid: 90_000,
+        });
+        harness.commit();
+        std::sync::Arc::new(crate::inventory_present::Presentation::capture(
+            harness.coordinator(),
+            "pid",
+            1,
+            2,
+            1,
+        ))
+    }
+
+    fn window() -> ReadWindow {
+        ReadWindow::new(1, Instant::now() + Duration::from_secs(1)).unwrap()
+    }
+
+    #[test]
+    fn scripted_lane_refuses_promotion_baselines_through_dyn() {
+        let (mut lane, _) = cgroup_runtime_lane();
+        let lane: &mut dyn CaptureLane<crate::process::PidPin> = &mut lane;
+        let error = lane
+            .query_promotion_baselines(
+                crate::inventory_promotion::CaptureId::new(7),
+                presented_frame(),
+                &[],
+                window(),
+                &mut |_| unreachable!("a refusing lane reserves nothing"),
+            )
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("unavailable"),
+            "honest refusal: {error:#}"
+        );
+    }
+
+    #[test]
+    fn facade_lane_outside_active_refuses_promotion_baselines() {
+        let mut facade = FacadeLane {
+            domain: NativeDomainId::mint(),
+            scope_coverage: CaptureScopeCoverage::System,
+            backend: LaneBackend::singles(),
+            state: FacadeState::Moving,
+        };
+        let lane: &mut dyn CaptureLane<crate::process::PidPin> = &mut facade;
+        let error = lane
+            .query_promotion_baselines(
+                crate::inventory_promotion::CaptureId::new(7),
+                presented_frame(),
+                &[],
+                window(),
+                &mut |_| unreachable!("a refusing lane reserves nothing"),
+            )
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("unavailable"),
+            "honest refusal: {error:#}"
+        );
     }
 }

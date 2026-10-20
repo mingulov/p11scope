@@ -198,7 +198,7 @@ separately. Fixture/runtime changes and installed execution remain open.
 
 ## Short startup-fence probe inputs
 
-The same35prebuilt files also support an explicit `probe` workload mode:
+The same97prebuilt files also support an explicit `probe` workload mode:
 exactly three A-only rounds,32real entry calls each, then an ordinary successful
 stop. Provider B is never loaded and no shared/fence/proof phase is invented.
 The independent native helper can check it with
@@ -225,18 +225,21 @@ standalone validator checks; do not run the old long gate as a substitute.
 
 ## Paired default-ring useful wrap
 
-The wrap oracle pins the max-accepting edge projection (Sol ORACLE ruling):
-ordinary A reads 1, 2, 3 after rounds 1-3 and 400 after round 400;
-all-32-fenced reads 1, 1, 2 and 399, with exact1-increments after. The
-validated disposition (k of32pairs fenced) carries into final A400/399
-expectations and strict paired comparison: both legs must share one
-disposition and compare exactly equal, with no count replacement.
-Per-pair physical reconciliation stays separate from the edge: eligible A
-growth 12,800-k, withheld 8,288+k, terminal proof 660/base 659/staged 1
-per pair with staged sum 32. A caller/object pair excludes function
-offset, so the fixture provides one slot body per distinct physical object
-(`libdemotion-common-00..31.so`):32genuine pairs, each advancing one unit
-per round. The original ten-call installed control is independent.
+The wrap oracle pins the per-edge projection (Sol round-3 ruling): each of
+the 32 A edges reads 1, 2, 3 after rounds 1-3 and 400 after round 400 on
+the ordinary path, or 1, 1, 2 and 399 all-32-fenced, with exact1-increments
+after; each B edge reads exactly 1 (its own pair's proof, with no batching
+premise). The validated disposition (k of32pairs fenced, all-or-none)
+carries into final per-edge expectations and strict paired comparison:
+both legs must share one disposition and compare exactly equal, with no
+count replacement. Totals are independently fixed at 12,800-k across A
+and 32 across B. Per-pair physical reconciliation stays separate from any
+one edge: eligible A growth 12,800-k, withheld 8,288+k, terminal proof
+660/base 659/staged 1 per pair with staged sum 32. A caller/object pair
+excludes function offset, so the fixture provides one slot body per
+distinct physical object (`libdemotion-common-00..31.so`):32genuine pairs,
+each advancing one unit per round on its own A/B provider pair. The
+original ten-call installed control is independent.
 
 A separately selected short pilot,
 `privileged_native_lane_pid_diagnostics_three_round_accelerated_pilot_lp64`,
@@ -252,12 +255,13 @@ pilot before choosing any longer one-pair schedule; no guessed per-call record
 multiplier or arbitrary900s expectation is an acceptance fact.
 
 The new `diagnostics-wrap-ledger.c` physical entry-count fixture uses one PID,
-two2.40 tables and32common ELFs with one distinct real entry body each at
-slots4–35. Those bodies have the exact fixture type `CK_RV(void)` and return0.
-This tests physical entry counting/ownership; it does not qualify PKCS#11
-semantics, API behavior or the104-slot ABI. Review its table alignment through
-the matching real manifest before live execution. The original ten-call
-control remains.
+32 indexed A/B2.40 table pairs and32common ELFs with one distinct real entry
+body each at slots4–35. Provider A_i/B_i carries exactly its own slot4+i body
+with local root/init helpers. Those bodies have the exact fixture type
+`CK_RV(void)` and return0. This tests physical entry counting/ownership; it
+does not qualify PKCS#11 semantics, API behavior or the104-slot ABI. Review
+its table alignment through the matching real manifest before live execution.
+The original ten-call control remains.
 
 Build/check on the development host:
 
@@ -269,14 +273,15 @@ TMPDIR=/var/tmp/p11scope-ws-tmp python3 -I \
 
 The helper reuses the original C clock/VMA/hash/FIFO helpers, disables compiler
 identical-function folding, verifies32distinct physical targets each against
-its independently mapped common FD, and runs192real calls over a small
+its independently mapped common FD, proves each indexed provider links exactly
+its own common object and no other, and runs192real calls over a small
 schedule. Its missing/duplicate/wrong-slot/clock/return/target/ACK controls
 are fixture oracle checks. They do not qualify diagnostics or BPF ring wrap.
 
 The ignored Rust selector is
 `inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_pid_diagnostics_wrap_and_primary_parity_lp64`.
 Supply `P11SCOPE_DIAGNOSTICS_WRAP_PREBUILT_DIR` pointing at the controller-verified
-35-file payload; no runtime compilation fallback exists. Match the prebuilt
+97-file payload; no runtime compilation fallback exists. Match the prebuilt
 Rust test binary/source and arrival hashes, hold the authorized host lane, and
 use disk TMPDIR. A compiled test and the failed installed attempt do not qualify
 the intended cell.
@@ -293,19 +298,20 @@ record fails the cell, so run it on a quiet host. The same paired off/on
 parity (one validated disposition, exact owned facts) applies.
 
 Each disabled/enabled run issues exactly400counted rounds,258shared rounds,
-then one fence and one proof round, each32per-slot calls. Native ACKs and an
-independent per-slot ledger bind all21120calls. Each next counted round waits
-for an actual committed production count milestone validated against
-caller-bound gap evidence; each shared round consumes one observer pass with
-ambiguity-disclosure checkpoints at power-of-two rounds; load-B remains
-inside the existing observer callback between passes. Expected primary edge
-projections are A400 ordinary / 399 fenced (k validated fenced pairs) and B1
-(32 overlapping proofs in one publication). Per-pair physical reconciliation
-from the schedule plus ledger gives 12,800-k eligible A growth, 8,256
-shared-withheld, 32 fence-withheld and staged sum 32: 8,288+k withheld
-entries over 21,120 physical calls. Actual32Bplacements (each edge_total 1,
-proving the single-publication batching) and their selected withheld fence
-prefixes must remain useful in the exported diagnostics.
+then one fence and one proof round, each32indexed calls (one per pair). Native
+ACKs and an independent per-slot ledger bind all21120calls. Each next counted
+round waits for all32A edges at the actual committed production count
+milestone validated against caller-bound gap evidence; each shared round
+consumes one observer pass with per-module ambiguity-disclosure checkpoints
+at power-of-two rounds; load-B remains inside the existing observer callback
+between passes. Expected primary edge projections are A400 ordinary / 399
+fenced per edge (k validated fenced pairs) and B1 per edge (each its own
+pair's proof). Per-pair physical reconciliation from the schedule plus ledger
+gives 12,800-k eligible A growth, 8,256 shared-withheld, 32 fence-withheld
+and staged sum 32: 8,288+k withheld entries over 21,120 physical calls.
+Actual32Bplacements (each edge_total 1 on its own pair edge) and their
+selected withheld fence prefixes must remain useful in the exported
+diagnostics.
 
 Both default rings must really evict: CountObservation eviction proves the
 ordinary ring filled, and OwnershipTransition/CaptureHealth eviction proves

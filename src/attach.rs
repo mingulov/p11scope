@@ -4670,7 +4670,7 @@ impl Session {
         session.links = activate_after_preparation_with(Ok(()), || {
             attach_lifecycle_with(
                 &mut session.ebpf,
-                |ebpf, program| Self::attach_lifecycle_program(ebpf, program),
+                Self::attach_lifecycle_program,
                 |ebpf, _, link| detach_registered_link(ebpf, link),
             )
         })?;

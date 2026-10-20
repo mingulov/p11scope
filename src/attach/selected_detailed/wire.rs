@@ -154,7 +154,7 @@ pub(super) fn parse_baseline(
     let mut images: Vec<Option<BaselineImage>> = (0..count).map(|_| None).collect();
     let mut cookies = std::collections::BTreeSet::new();
     let mut last_visit = 0;
-    for row in bytes[..count * 40].chunks_exact(40) {
+    for row in bytes[..count * 40].as_chunks::<40>().0 {
         let slot = half(row, 32) as usize;
         let cookie = word(row, 8);
         let visit = word(row, 24);

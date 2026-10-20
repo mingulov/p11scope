@@ -22,6 +22,7 @@
 //! path), so the cache cannot shadow a fixture. The tests below drive
 //! local cells with injected loaders and never touch the production cell.
 
+#[cfg(test)]
 use std::error::Error as _;
 use std::sync::{Arc, OnceLock};
 

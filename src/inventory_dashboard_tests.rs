@@ -5,6 +5,7 @@
 //! agreement, and the dashboard-on/off risk gate.
 
 use super::*;
+use crate::attach::selected_detailed::baseline::PromotionBaselineBatch;
 use crate::discovery::caller_registry::{
     AdmissionState, BudgetRefusal, CallerId, CoverageNote, ImageAuthority, ModuleId, ModuleInfo,
     ModuleKey, RegistryGap, RegistryLimits,
@@ -3317,6 +3318,114 @@ fn pty_promotion_d_requests_the_selected_displayed_pair() {
     terminal.key(b"d");
     terminal.shown(b"last key: busy");
     assert!(terminal.display.take_promotion_request().is_none());
+    terminal.display.restore();
+}
+
+#[test]
+fn pty_promotion_d_pairs_baseline_with_viewed_frame() {
+    let mut terminal = PromoPty::open();
+    assert!(terminal.display.promotion_enable(CaptureId::new(5)));
+    terminal.display.offer(varied_presentation());
+    terminal.display.tick();
+    terminal.shown(b"promotion: idle; selected");
+    let (capture, frame, _) = terminal
+        .display
+        .baseline_demand()
+        .expect("the viewed pair lacks a batch");
+    assert_eq!(capture, CaptureId::new(5));
+    let batch = PromotionBaselineBatch::scripted_for_test(capture, frame);
+    terminal.display.note_baseline_batch(Arc::clone(&batch));
+    assert!(
+        terminal.display.baseline_demand().is_none(),
+        "a paired batch clears demand"
+    );
+    terminal.key(b"d");
+    terminal.shown(b"promotion: request 1 queued");
+    let request = terminal
+        .display
+        .take_promotion_request()
+        .expect("d queues one request");
+    assert!(
+        request
+            .viewed()
+            .baseline()
+            .is_some_and(|held| Arc::ptr_eq(held, &batch)),
+        "d binds the viewed frame's batch"
+    );
+    terminal.display.restore();
+}
+
+#[test]
+fn pty_promotion_baseline_twins() {
+    // No batch: the request stays unqualified (existing behavior), and
+    // demand persists for the scheduler.
+    let mut terminal = PromoPty::open();
+    assert!(terminal.display.promotion_enable(CaptureId::new(5)));
+    terminal.display.offer(varied_presentation());
+    terminal.display.tick();
+    terminal.shown(b"promotion: idle; selected");
+    assert!(terminal.display.baseline_demand().is_some());
+    terminal.key(b"d");
+    terminal.shown(b"promotion: request 1 queued");
+    let request = terminal
+        .display
+        .take_promotion_request()
+        .expect("d queues one request");
+    assert!(request.viewed().baseline().is_none());
+    assert!(terminal.display.baseline_demand().is_some());
+    terminal.display.restore();
+
+    // A stale batch (another frame's) never pairs: the request falls
+    // back to unqualified, and demand persists.
+    let mut terminal = PromoPty::open();
+    assert!(terminal.display.promotion_enable(CaptureId::new(5)));
+    terminal.display.offer(varied_presentation());
+    terminal.display.tick();
+    terminal.shown(b"promotion: idle; selected");
+    let stale = PromotionBaselineBatch::scripted_for_test(
+        CaptureId::new(5),
+        Arc::new(varied_presentation()),
+    );
+    terminal.display.note_baseline_batch(stale);
+    assert!(terminal.display.baseline_demand().is_some());
+    terminal.key(b"d");
+    terminal.shown(b"promotion: request 1 queued");
+    let request = terminal
+        .display
+        .take_promotion_request()
+        .expect("d queues one request");
+    assert!(request.viewed().baseline().is_none());
+    terminal.display.restore();
+
+    // Demand gates: nothing while disabled, nothing before the first
+    // frame, and a failed attempt stays quiet until a new frame.
+    let mut terminal = PromoPty::open();
+    terminal.display.offer(varied_presentation());
+    terminal.display.tick();
+    assert!(terminal.display.baseline_demand().is_none());
+    assert!(terminal.display.promotion_enable(CaptureId::new(5)));
+    terminal.display.restore();
+    let mut terminal = PromoPty::open();
+    assert!(terminal.display.promotion_enable(CaptureId::new(5)));
+    assert!(terminal.display.baseline_demand().is_none());
+    terminal.display.offer(varied_presentation());
+    terminal.display.tick();
+    terminal.shown(b"promotion: idle; selected");
+    assert!(terminal.display.baseline_demand().is_some());
+    terminal.display.note_baseline_failed();
+    assert!(
+        terminal.display.baseline_demand().is_none(),
+        "a failed attempt stays quiet for its frame"
+    );
+    let mut newer = varied_presentation();
+    newer.passes += 1;
+    terminal.display.offer(newer);
+    terminal.repaint_now();
+    terminal.shown(b"promotion: idle");
+    assert!(
+        terminal.display.baseline_demand().is_some(),
+        "a new frame retries after a failure"
+    );
     terminal.display.restore();
 }
 

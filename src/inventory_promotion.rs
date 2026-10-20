@@ -80,7 +80,6 @@ impl PromotionView {
 
     /// Pair a newly written view with the immutable pre-view native batch.
     /// No setter can retrofit an already displayed/requested view.
-    #[cfg_attr(not(test), allow(dead_code))] // Candidate/full-write pairing is wired by the capture-loop owner.
     pub(crate) fn with_baseline(
         capture: CaptureId,
         revision: ViewRevision,

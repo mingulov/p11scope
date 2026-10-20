@@ -56,6 +56,10 @@ use p11scope_manifest::manifest::{
 use p11scope_manifest::maps::{Device, MapEntry, MapIndex, MappedPath, ObjectKey, Resolved};
 use pkcs11_module::{LinuxLayout, read_function_pointer};
 use std::cell::Cell;
+#[cfg(test)]
+use std::cell::RefCell;
+#[cfg(test)]
+use std::collections::VecDeque;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::num::NonZeroU64;
@@ -577,6 +581,12 @@ pub struct Engine {
     loader_memory_scan_attempts: usize,
     #[cfg(test)]
     loader_arm_scan_after_scan: Option<fn(&mut Engine)>,
+    /// Scripted pin-probe answers, consumed in order by the next matching
+    /// probe. Test-only: live pins re-observe the kernel on every call, so
+    /// a race between two reads (exit proof, then observation failure)
+    /// cannot be produced deterministically with live pins.
+    #[cfg(test)]
+    pin_probe_script: RefCell<VecDeque<PinProbeAnswer>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3082,6 +3092,17 @@ impl RetirementCause {
             (ExecRefresh, ExecRefresh) => ExecRefresh,
         }
     }
+}
+
+/// One scripted pin-probe answer for `pin_probe_script`, consumed in order
+/// by the next probe of the same kind. A probe that meets an answer of the
+/// other kind panics: the script no longer matches the code's observation
+/// sequence, which is a test bug, never a fallback to the live pin.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) enum PinProbeAnswer {
+    Exited(Result<bool, String>),
+    State(Option<Result<OriginalGenerationState, String>>),
 }
 
 pub(crate) struct DeferredDiscoveryItem {
@@ -8544,6 +8565,8 @@ impl Engine {
             loader_memory_scan_attempts: 0,
             #[cfg(test)]
             loader_arm_scan_after_scan: None,
+            #[cfg(test)]
+            pin_probe_script: RefCell::new(VecDeque::new()),
         }
     }
 
@@ -16951,8 +16974,11 @@ impl Engine {
     /// re-checks: a real exit is persistent, so deferral cannot hide one,
     /// while recording loss without positive evidence of change aborted
     /// live captures (E17 midfinal: an unprovable pin for a live caller
-    /// skipped every terminal COUNT/EVIDENCE record). An already-recorded
-    /// loss stays sticky: only the incoming cause is reclassified.
+    /// skipped every terminal COUNT/EVIDENCE record). The exit verdict is
+    /// observed once per call: a positive proof is reused below, so a later
+    /// observation failure cannot overwrite it with fatal loss. An
+    /// already-recorded loss stays sticky: only the incoming cause is
+    /// reclassified.
     #[track_caller]
     fn queue_retirement(
         &mut self,
@@ -16960,15 +16986,14 @@ impl Engine {
         mut cause: RetirementCause,
         pending_views: &mut PendingViewRetirements,
     ) {
+        // One exit observation per call: a positive proof below must
+        // survive a later observation failure instead of becoming fatal
+        // loss, so the merge reuses this verdict and never re-reads.
+        let proven_exited = cause == RetirementCause::GenerationLost && self.original_exited(view);
         // A declined report has no side effects at all: re-verify before
         // clearing exec state, merging causes, or settling loader scans.
-        if cause == RetirementCause::GenerationLost && !self.original_exited(view) {
-            let state = self
-                .views
-                .iter()
-                .find(|candidate| candidate.id() == view)
-                .map(|retained| retained.original_generation_state());
-            match state {
+        if cause == RetirementCause::GenerationLost && !proven_exited {
+            match self.retained_generation_state(view) {
                 Some(Ok(OriginalGenerationState::Current)) | Some(Err(_)) | None => {
                     self.mark_partial(
                         "live discovery generation",
@@ -16992,7 +17017,7 @@ impl Engine {
         }
         let incoming = cause;
         let previous = self.retirement_intents.get(&view).copied();
-        let cause = if cause == RetirementCause::GenerationLost && self.original_exited(view) {
+        let cause = if cause == RetirementCause::GenerationLost && proven_exited {
             RetirementCause::ExpectedRemoval
         } else {
             cause
@@ -17098,10 +17123,70 @@ impl Engine {
     /// A poll failure or a dropped view is not exit evidence and stays false,
     /// so an unprovable loss is never downgraded.
     fn original_exited(&self, view: ProcessViewId) -> bool {
+        #[cfg(test)]
+        if let Some(answer) = self.pop_pin_probe_exited() {
+            return answer == Ok(true);
+        }
         self.views
             .iter()
             .find(|candidate| candidate.id() == view)
             .is_some_and(|retained| retained.original_exited() == Ok(true))
+    }
+
+    /// The retained pin's generation verdict for `view`: `None` when no
+    /// view is retained. The one place `queue_retirement` re-verifies a
+    /// loss report, so tests script the race there instead of in the pin.
+    fn retained_generation_state(
+        &self,
+        view: ProcessViewId,
+    ) -> Option<Result<OriginalGenerationState, String>> {
+        #[cfg(test)]
+        if let Some(answer) = self.pop_pin_probe_state() {
+            return answer;
+        }
+        self.views
+            .iter()
+            .find(|candidate| candidate.id() == view)
+            .map(|retained| retained.original_generation_state())
+    }
+
+    /// Pops the next scripted exit answer, if the test armed one. A queued
+    /// answer of the other kind is a script/code desync and panics loudly.
+    #[cfg(test)]
+    fn pop_pin_probe_exited(&self) -> Option<Result<bool, String>> {
+        let mut script = self.pin_probe_script.borrow_mut();
+        match script.front() {
+            None => None,
+            Some(PinProbeAnswer::Exited(_)) => {
+                let Some(PinProbeAnswer::Exited(answer)) = script.pop_front() else {
+                    unreachable!("the front was just matched as Exited");
+                };
+                Some(answer)
+            }
+            Some(PinProbeAnswer::State(_)) => {
+                panic!("pin probe script desync: an exit probe met a queued state answer");
+            }
+        }
+    }
+
+    /// Pops the next scripted generation-state answer, if the test armed
+    /// one. A queued answer of the other kind is a script/code desync and
+    /// panics loudly.
+    #[cfg(test)]
+    fn pop_pin_probe_state(&self) -> Option<Option<Result<OriginalGenerationState, String>>> {
+        let mut script = self.pin_probe_script.borrow_mut();
+        match script.front() {
+            None => None,
+            Some(PinProbeAnswer::State(_)) => {
+                let Some(PinProbeAnswer::State(answer)) = script.pop_front() else {
+                    unreachable!("the front was just matched as State");
+                };
+                Some(answer)
+            }
+            Some(PinProbeAnswer::Exited(_)) => {
+                panic!("pin probe script desync: a state probe met a queued exit answer");
+            }
+        }
     }
 
     #[track_caller]

@@ -27,6 +27,8 @@ ROOT = Path(__file__).resolve().parents[1]
 NATIVE = SimpleNamespace(**runpy.run_path(str(ROOT / 'scripts/qualify-cgroup-trace.py')))
 PIN_PROVIDER = runpy.run_path(str(ROOT / 'scripts/mapped-provider-pin.py'))['pin_fd']
 ORACLE = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/oracle.py'))['evaluate']
+PROBE = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/reporter_probe.py'))
+BLOCKED = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/blocked_stderr.py'))
 RINGS = ('4K', '4M', '16M')
 SINKS = ('file', 'discard', 'slowpipe')
 STAGES = ('none', 'midcapture', 'midfinal')
@@ -74,18 +76,19 @@ class OutputPipe:
             self.close()
             raise
 
-    def full(self):
+    def buffered(self):
         count = array.array('i', [0])
         fcntl.ioctl(self.read_fd, termios.FIONREAD, count, True)
-        return count[0] >= self.capacity
+        return count[0]
+
+    def full(self):
+        return self.buffered() >= self.capacity
 
     def stalled(self):
         """Kernel write readiness, including atomic-write pressure below capacity."""
         if self.write_fd is None:
             raise ValueError('pressure witness requires the original owned write descriptor')
-        count = array.array('i', [0])
-        fcntl.ioctl(self.read_fd, termios.FIONREAD, count, True)
-        if not count[0]:
+        if not self.buffered():
             return False
         poll = select.poll()
         poll.register(self.write_fd, select.POLLOUT)
@@ -120,6 +123,22 @@ class OutputPipe:
             if fd is not None:
                 os.close(fd)
                 setattr(self, name, None)
+
+
+def probe_rows(reader):
+    return [json.loads(line) for line in reader.lines]
+
+
+def observer_exited(observer, retain_custody):
+    """Detect observer exit, optionally without reaping the original child.
+
+    A blocked-stderr cell reconciles the independent probe's kernel counters
+    before the observer is reaped, so its loop polls the held pidfd instead
+    of the reaping Popen handle. Ordinary cells keep the existing behavior.
+    """
+    if retain_custody:
+        return observer.wait_exit(0)
+    return observer.popen.poll() is not None
 
 
 def events_ring_capacity(pid):
@@ -201,7 +220,7 @@ def save(path, value):
     path.write_text(json.dumps(value, indent=2) + '\n')
 
 
-def cell(args, label, directory, env, binary, provider, caller_pin, manifests=()):
+def cell(args, label, directory, env, binary, provider, caller_pin, manifests=(), blocked=None):
     ring, sink, cancel = label.split('-')
     owners, readers, pipes = [], [], []
     receipt = dict(cell=label, source_revision=args.source_revision, sink=sink, cancel=cancel,
@@ -209,13 +228,30 @@ def cell(args, label, directory, env, binary, provider, caller_pin, manifests=()
                    workload_complete_ns=None, observer_rc=None, cleanup_seconds=None,
                    signals=[], cancellation_ack_ns=None, terminal_observed_alive=False,
                    stdout_stalled=False, stderr_blocked=args.control == 'blocked-stderr',
+                   stderr_stalled=False, stderr_buffered_bytes=0, stderr_release_ns=None,
+                   reporter_ack=None, reporter_kernel=None, observer_reaped_after_probe=False,
+                   reporter_controls=None, candidate_sha256=None,
                    trace_file_error=None, watchdog=False, control=args.control)
-    observer = caller = None
+    observer = caller = witness = witness_facts = witness_errors = expected = None
     stdout_file = None
     errors = bytearray()
     trace_path = directory / 'trace.txt'
     start = time.monotonic()
     try:
+        if receipt['stderr_blocked']:
+            if blocked is None or blocked.get('error'):
+                reason = blocked.get('error') if blocked else \
+                    'blocked-stderr needs its independent reporter channel and qualified dependencies'
+                result = dict(api_calls=None, events_lost=None,
+                              stdout_shed_bytes=None, stdout_delivered_bytes=None,
+                              cancellation_response_seconds=None,
+                              status='NOT_RUN', errors=[], unqualified=[reason])
+                result['pass'] = False
+                save(directory / 'receipt.json', receipt)
+                save(directory / 'result.json', result)
+                return result
+            receipt['candidate_sha256'] = binary.digest
+            receipt['reporter_controls'] = blocked['dependencies']
         receipt['provider_before'] = PIN_PROVIDER(provider.fd)
         manifest_argv = manifest_arguments(manifests, provider)
         receipt['discovery_mode'] = 'explicit-manifest' if manifests else 'scan-only'
@@ -258,6 +294,31 @@ def cell(args, label, directory, env, binary, provider, caller_pin, manifests=()
                 [sys.executable, '-I', '-c', 'import time; time.sleep(90)'], 0,
                 stdin=subprocess.DEVNULL, stdout=pipe.write_fd,
                 stderr=subprocess.DEVNULL, start_new_session=True)
+        if receipt['stderr_blocked']:
+            expected = PROBE['expected_witness'](binary, observer, blocked['resolved'])
+            receipt['expected_probe'] = expected
+            if any(observer.identity[key] != NATIVE.process_identity(os.getpid())[key]
+                   for key in ('pid_namespace', 'time_namespace')):
+                raise ValueError('observer differs from controller timestamp/namespace context')
+            witness = NATIVE.spawn_owned(owners,
+                [str(blocked['helper'].path), '--probe', str(binary.fd), str(observer.pid),
+                 str(observer.identity['start_time']), str(blocked['resolved']['file_offset']), '90000'],
+                0, pass_fds=(binary.fd,), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, start_new_session=True)
+            blocked['helper'].image_receipt(dict(image=0), witness)
+            witness_facts = NATIVE.Reader(witness.popen.stdout, directory / 'probe.jsonl')
+            witness_errors = NATIVE.Reader(witness.popen.stderr, directory / 'probe.stderr')
+            readers.extend((witness_facts, witness_errors))
+            witness_ready = witness_facts.wait(lambda reader: next((row for row in probe_rows(reader)
+                if row.get('kind') == 'ready'), None), seconds=5)
+            if (witness_ready.get('mode') != 'perf_uprobe' or witness_ready.get('clock') != 'CLOCK_MONOTONIC'
+                    or witness_ready.get('role') != 'reporter'
+                    or any(witness_ready.get(key) != expected[key]
+                           for key in ('pid', 'tid', 'start_time', 'dev', 'ino', 'file_offset'))):
+                raise ValueError('probe readiness does not bind the actual original observer')
+            for key in ('pid_namespace', 'time_namespace'):
+                if witness.identity[key] != observer.identity[key]:
+                    raise ValueError('independent helper clock/namespace differs from observer')
         # Keep the original stdout writer solely as the kernel POLLOUT
         # witness, closing it at bounded observer completion. Never wait EOF.
         # Parent keeps stderr writer only for the explicit blocked-stderr fill.
@@ -269,7 +330,7 @@ def cell(args, label, directory, env, binary, provider, caller_pin, manifests=()
         stop_started = None
         last_read = 0.0
         final_ns = None
-        while observer.popen.poll() is None:
+        while not observer_exited(observer, receipt['stderr_blocked']):
             now = time.monotonic()
             if now - start > 90:
                 receipt['watchdog'] = True
@@ -307,6 +368,14 @@ def cell(args, label, directory, env, binary, provider, caller_pin, manifests=()
                 if receipt['stdout_stalled'] and now - last_read > 0.05:
                     pipe.read(256)
                     last_read = now
+            if receipt['stderr_blocked'] and receipt['signals'] and stderr_pipe.write_fd is not None:
+                # Prove the independent ACK below was measured while stderr
+                # was actually blocked: positive buffered bytes plus kernel
+                # POLLOUT nonwritability on the original owned writer, seen
+                # while this loop still holds the live observer.
+                if stderr_pipe.stalled():
+                    receipt['stderr_stalled'] = True
+                    receipt['stderr_buffered_bytes'] = stderr_pipe.buffered()
             # Longrun is emitted only after loop end/request_stop in run.rs.
             # Buffered -o output cannot reliably reveal COUNT_EVIDENCE early.
             if b'p11scope: longrun:' in errors and final_ns is None:
@@ -330,17 +399,42 @@ def cell(args, label, directory, env, binary, provider, caller_pin, manifests=()
                 observer.send(signal.SIGTERM)
                 receipt['signals'].append(dict(signal='SIGTERM', t_ns=time.monotonic_ns()))
                 sent_more = True
-            if args.control == 'blocked-stderr' and receipt['signals'] and now - stop_started > 1:
-                # Release only for cleanup. This channel cannot qualify prompt
-                # acknowledgement while blocked, and the oracle states that.
+            if receipt['stderr_blocked'] and receipt['signals'] and now - stop_started > 1 \
+                    and stderr_pipe.write_fd is not None:
+                # Release only for cleanup. Prompt acknowledgement is measured
+                # through the independent probe while this channel stays blocked.
                 stderr_pipe.close_writer()
+                receipt['stderr_release_ns'] = time.monotonic_ns()
                 while stderr_pipe.read():
                     pass
             if stop_started is None and final_ns is not None:
                 stop_started = time.monotonic()
             time.sleep(0.001)
         exited = time.monotonic()
-        receipt['observer_rc'] = observer.popen.wait()
+        if receipt['stderr_blocked'] and receipt['stderr_release_ns'] is None:
+            receipt['stderr_release_ns'] = time.monotonic_ns()
+        if receipt['stderr_blocked']:
+            # The pidfd-gated loop above never reaped the original child; its
+            # pidfd and unreaped identity retain custody until the helper's
+            # final kernel counters reconcile.
+            if observer.popen.returncode is not None:
+                raise ValueError('observer was reaped before probe reconciliation')
+            witness.popen.stdin.write('stop\n')
+            witness.popen.stdin.flush()
+            if witness.popen.wait(timeout=5) != 0:
+                raise ValueError('actual external probe failed; its rows are unqualified')
+            witness_facts.finish()
+            witness_errors.finish()
+            rows = probe_rows(witness_facts)
+            witness_verdict = PROBE['validate_witness'](rows, expected, receipt['signals'])
+            receipt['reporter_ack'] = dict(channel=witness_verdict['channel'], ack_ns=witness_verdict['ack_ns'])
+            receipt['reporter_kernel'] = dict(samples=rows[2]['samples'],
+                                              kernel_count=rows[2]['kernel_count'], lost=rows[2]['lost'])
+            receipt['probe_records'] = rows
+            receipt['observer_rc'] = observer.popen.wait()
+            receipt['observer_reaped_after_probe'] = True
+        else:
+            receipt['observer_rc'] = observer.popen.wait()
         receipt['cleanup_seconds'] = exited - (stop_started if stop_started is not None else start)
         while stderr_pipe.read():
             pass
@@ -403,6 +497,76 @@ def cell(args, label, directory, env, binary, provider, caller_pin, manifests=()
                 stdout_file.close()
 
 
+def dry_run(args, names):
+    """Prove blocked-stderr wiring without privilege; spawn nothing, write nothing.
+
+    Pins every held input, binds the reporter-controls summary to this exact
+    source and candidate, resolves the actual reporter file offset, and runs
+    the real stderr pressure witness against a bounded pipe. Exit 0 prints a
+    JSON plan; any broken input exits 1 with a JSON error.
+    """
+    pins = []
+    try:
+        if (args.uid <= 0 or args.gid <= 0
+                or not re.fullmatch('[0-9a-f]{40}', args.source_revision)
+                or not 1 <= args.calls <= 10000 or not names or len(set(names)) != len(names)
+                or any(name not in CELLS for name in names)
+                or any(not getattr(args, name).is_absolute() for name in ('binary', 'provider', 'caller', 'out'))
+                or any(not path.is_absolute() for path in args.manifest)):
+            raise ValueError('requires ordinary workload uid/gid, exact source commit, bounded unique cells and absolute paths')
+        if (args.control == 'blocked-stderr') != (args.reporter_probe is not None and args.reporter_controls is not None):
+            raise ValueError('blocked-stderr needs exactly --reporter-probe and --reporter-controls; other controls take neither')
+        if args.reporter_probe is not None and (not args.reporter_probe.is_absolute() or not args.reporter_controls.is_absolute()):
+            raise ValueError('reporter inputs need absolute paths')
+        if args.control == 'child-held-stdout' and any('-slowpipe-' not in name for name in names):
+            raise ValueError('child-held-stdout requires only slowpipe cells')
+        if args.control in ('blocked-stderr', 'repeated-signals') and any(name.endswith('-none') for name in names):
+            raise ValueError('signal controls require a cancellation cell')
+        for path in (args.binary, args.provider, args.caller):
+            pins.append(NATIVE.FilePin(path))
+        manifests = [NATIVE.FilePin(path) for path in args.manifest]
+        pins.extend(manifests)
+        manifest_arguments(manifests, pins[1])
+        plan = dict(mode='dry_run', cells=names, control=args.control,
+                    source_revision=args.source_revision,
+                    inputs=[pin.metadata() for pin in pins])
+        if args.control == 'blocked-stderr':
+            helper = NATIVE.FilePin(args.reporter_probe)
+            pins.append(helper)
+            summary = BLOCKED['load_controls_summary'](args.reporter_controls)
+            dependencies = BLOCKED['check_dependencies'](summary, source_revision=args.source_revision,
+                                                         candidate_sha256=pins[0].digest)
+            resolved = PROBE['resolve_reporter'](pins[0])
+            pipe = OutputPipe()
+            try:
+                os.set_blocking(pipe.write_fd, False)
+                witnessed = os.write(pipe.write_fd, b'H' * 169)
+                try:
+                    os.write(pipe.write_fd, b'X' * 4096)
+                except BlockingIOError:
+                    stalled = pipe.stalled()
+                else:
+                    raise ValueError('stderr pressure witness did not stall below pipe capacity')
+                pressure = dict(stalled=stalled, buffered_bytes=pipe.buffered(), witnessed_write=witnessed)
+                if not pressure['stalled'] or pressure['buffered_bytes'] <= 0:
+                    raise ValueError('stderr pressure witness cannot prove kernel nonwritability')
+            finally:
+                pipe.close()
+            plan.update(reporter_probe=helper.metadata(), dependencies=dependencies,
+                        reporter_file_offset=resolved['file_offset'],
+                        probe_argv=['<reporter-probe>', '--probe', '<binary-fd>', '<pid>', '<birth>',
+                                    str(resolved['file_offset']), '90000'],
+                        pressure_selfcheck=pressure)
+        print(json.dumps(plan))
+        return 0
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        print(json.dumps(dict(mode='dry_run', error=str(error))), file=sys.stderr)
+        return 1
+    finally:
+        for pin in pins:
+            pin.close()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('binary', 'provider', 'caller', 'out'):
@@ -416,15 +580,27 @@ def main():
     parser.add_argument('--calls', type=int, default=4096)
     parser.add_argument('--control', choices=('ordinary', 'child-held-stdout', 'blocked-stderr',
                                              'file-limit', 'repeated-signals'), default='ordinary')
+    parser.add_argument('--reporter-probe', type=Path,
+                        help='verified prebuilt reporter-probe helper; required exactly for blocked-stderr')
+    parser.add_argument('--reporter-controls', type=Path,
+                        help='qualify_reporter_probe.py summary; required exactly for blocked-stderr')
+    parser.add_argument('--dry-run', action='store_true',
+                        help='validate wiring without privilege and spawn nothing')
     args = parser.parse_args()
     names = args.cells.split(',')
+    if args.dry_run:
+        return dry_run(args, names)
     if (os.geteuid() != 0 or args.uid <= 0 or args.gid <= 0
             or not re.fullmatch('[0-9a-f]{40}', args.source_revision)
             or not 1 <= args.calls <= 10000 or not names or len(set(names)) != len(names)
             or any(name not in CELLS for name in names)
             or any(not getattr(args, name).is_absolute() for name in ('binary', 'provider', 'caller', 'out'))
-            or any(not path.is_absolute() for path in args.manifest)):
+            or any(not path.is_absolute() for path in args.manifest)
+            or any(path is not None and not path.is_absolute()
+                   for path in (args.reporter_probe, args.reporter_controls))):
         parser.error('requires root, ordinary workload uid/gid, exact source commit, bounded unique cells and absolute paths')
+    if (args.control == 'blocked-stderr') != (args.reporter_probe is not None and args.reporter_controls is not None):
+        parser.error('blocked-stderr needs exactly --reporter-probe and --reporter-controls; other controls take neither')
     if args.control == 'child-held-stdout' and any('-slowpipe-' not in name for name in names):
         parser.error('child-held-stdout requires only slowpipe cells')
     if args.control in ('blocked-stderr', 'repeated-signals') and any(name.endswith('-none') for name in names):
@@ -441,19 +617,42 @@ def main():
         for path in args.manifest:
             manifests.append(NATIVE.FilePin(path))
         manifest_arguments(manifests, pins[1])
+        blocked = None
+        if args.control == 'blocked-stderr':
+            helper = NATIVE.FilePin(args.reporter_probe)
+            pins.append(helper)
+            try:
+                controls_summary = BLOCKED['load_controls_summary'](args.reporter_controls)
+                dependencies = BLOCKED['check_dependencies'](controls_summary,
+                    source_revision=args.source_revision, candidate_sha256=pins[0].digest)
+                resolved = PROBE['resolve_reporter'](pins[0])
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                blocked = {'error': str(error)}
+            else:
+                blocked = {'helper': helper, 'resolved': resolved, 'dependencies': dependencies}
         for name in names:
             directory = args.out / name
             directory.mkdir(mode=0o755)
             try:
-                result = cell(args, name, directory, env, *pins, manifests)
+                result = cell(args, name, directory, env, pins[0], pins[1], pins[2], manifests, blocked=blocked)
             except (OSError, ValueError, TimeoutError, subprocess.SubprocessError) as error:
                 result = {'pass': False, 'status': 'FAIL', 'errors': [str(error)]}
             results.append(dict(cell=name, **result))
             print(json.dumps(results[-1]), flush=True)
+        remaining = [result['cell'] for result in results if not result['pass']]
+        if blocked is not None and blocked.get('error'):
+            remaining.append(blocked['error'])
         save(args.out / 'summary.json', dict(source_revision=args.source_revision,
             kernel=os.uname().release, control=args.control,
             inputs=[pin.metadata() for pin in pins], manifests=[pin.metadata() for pin in manifests],
             discovery_mode='explicit-manifest' if manifests else 'scan-only', cells=results,
+            reporter_probe=pins[3].metadata() if blocked is not None else None,
+            reporter_dependencies=blocked.get('dependencies') if blocked else None,
+            reporter_error=blocked.get('error') if blocked else None,
+            remaining=remaining,
+            qualification=('blocked-stderr E17 with independent reporter acknowledgement'
+                           if args.control == 'blocked-stderr'
+                           else 'ordinary E17 output matrix; blocked-stderr needs --control blocked-stderr'),
             unexecuted=[name for name in CELLS if name not in names]))
         return 0 if all(result['pass'] for result in results) else 1
     finally:

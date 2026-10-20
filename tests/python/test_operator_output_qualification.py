@@ -1575,6 +1575,19 @@ class BlockedStderrHarnessTests(unittest.TestCase):
         finally:
             pipe.close()
 
+    def test_exit_detection_retains_unreaped_custody_only_for_blocked_cells(self):
+        observer = mock.Mock()
+        observer.wait_exit.return_value = True
+        observer.popen.poll.return_value = None
+        self.assertTrue(HARNESS['observer_exited'](observer, True))
+        observer.wait_exit.assert_called_once_with(0)
+        observer.popen.poll.assert_not_called()
+        observer.reset_mock()
+        observer.popen.poll.return_value = None
+        self.assertFalse(HARNESS['observer_exited'](observer, False))
+        observer.wait_exit.assert_not_called()
+        observer.popen.poll.assert_called_once_with()
+
     def test_dependency_failure_returns_not_run_without_spawning(self):
         with tempfile.TemporaryDirectory() as scratch:
             args = mock.Mock()

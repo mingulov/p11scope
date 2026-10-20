@@ -21,6 +21,10 @@ DEFAULT_LIB_TESTS = (
     'attach::identity_iter::tests::functional_probe_proves_hardlink_match_and_copy_none',
     'attach::identity_iter::tests::whole_system_run_covers_all_children',
     'attach::identity_iter::tests::wronly_anchor_fds_refuse_reads_with_eperm',
+    # G23 5.15 identity-denial cell: real BTF named-fix refusal through
+    # the production sink with zero bpf() syscalls; lane-classified
+    # (denial required on 5.15, eligible elsewhere).
+    'inspect_system::privileged_tests::privileged_identity_515_denial_is_disclosed',
     'attach::instance_tests::privileged_instance_attach_during_reload_loop_has_zero_false_joins',
     'attach::instance_tests::privileged_instance_exec_renews_the_instance',
     'attach::instance_tests::privileged_instance_fork_without_exec_stays_consistent',
@@ -117,6 +121,8 @@ BOUNDARY_PHASES = ("preflight", "post_failure_classification")
 IDENTITY_POSITIVE = tuple("attach::identity_iter::tests::" + name for name in (
     "functional_probe_proves_hardlink_match_and_copy_none", "whole_system_run_covers_all_children",
     "wronly_anchor_fds_refuse_reads_with_eperm"))
+# G23: the executable 5.15 refusal selector, bound to identity:5.15-denied.
+DENIAL_515 = "inspect_system::privileged_tests::privileged_identity_515_denial_is_disclosed"
 OTHER_LONG = {
     "attach::instance_tests::privileged_instance_continuity_experiment_softhsm":
         "separately owned SoftHSM continuity duration/rate and mapping-operation lane",
@@ -204,7 +210,8 @@ def selection(lane, lib_tests=None, public_cells=None, scan=True):
     require(libs and all(isinstance(n, str) and n for n in libs), "empty lib selection")
     require(len(libs) == len(set(libs)), "duplicate selected lib ID")
     require(set(libs) <= set(DEFAULT_LIB_TESTS + BREADTH) | set(OTHER_LONG), "unknown exact lib selector")
-    require(lane != "5.15.221" or not set(libs) & set(IDENTITY_POSITIVE), "positive identity gate requires eligible BTF; 5.15 refusal selector is unready")
+    require(lane != "5.15.221" or not set(libs) & set(IDENTITY_POSITIVE), "positive identity gate requires eligible BTF")
+    require(lane != "5.15.221" or DENIAL_515 in libs, "5.15 lane requires the real BTF denial selector")
     require(publics and len(publics) == len(set(publics)) and set(publics) <= set(PUBLIC), "invalid public selection")
     ids = list(BASE_IDS) + (["inventory-scan"] if scan else [])
     ids += ["public:" + n for n in publics] + ["lib:" + n for n in libs]
@@ -219,7 +226,8 @@ def selection(lane, lib_tests=None, public_cells=None, scan=True):
             "lib_outcomes": {name: "own-positive-or-pid-filter-refusal" if name in MULTI_OUTCOMES else
                              "rate100-lossless-and-rate1000-disclosed" if name == CHURN else
                              "selected-admission-and-broad-no-spill-or-whole-module-refusal" if name == BROAD else
-                             "all-id-positive-or-envelope-refusal" if name == BOUNDARY else "exact-success"
+                             "all-id-positive-or-envelope-refusal" if name == BOUNDARY else
+                             "denial-with-zero-bpf-or-eligible-by-lane" if name == DENIAL_515 else "exact-success"
                              for name in libs},
             "lib_argv": ["--include-long", *libs],
             "pid_backend": {"proven": ["uprobe-multi", "kernel-pid+bpf"],
@@ -234,7 +242,8 @@ def selection(lane, lib_tests=None, public_cells=None, scan=True):
                             for substrate in ("btrfs", "overlay-6.1", "overlay-6.6", "overlay-6.8+", "ext4-inode-reuse")]
                 + [{"id": "long:" + n, "status": "selected" if n in libs else "not-selected",
                     "libtest": n, "prerequisites": reason} for n, reason in OTHER_LONG.items()]
-                + ([{"id": "identity:5.15-denied", "status": "unready", "libtest": None,
+                + ([{"id": "identity:5.15-denied", "status": "selected" if DENIAL_515 in libs else "not-selected",
+                     "libtest": DENIAL_515,
                      "prerequisites": "real BTF named-fix refusal selector; pure fixture denial tests do not prove this guest",
                      "excluded_positive_libtests": list(IDENTITY_POSITIVE)}] if lane == "5.15.221" else [])}
 
@@ -404,8 +413,37 @@ def launch_policy():
         require(not os.environ.get(name), "disallowed qualification tolerance: " + name)
 
 
-def lib_outcome(name, text):
+def denial_outcome(text, lane):
+    """Strict lane classification of the 5.15 identity-denial cell (G23).
+
+    Exactly one well-formed marker classifies; the 5.15 lane requires
+    the denied branch (real BTF named-fix refusal with zero bpf()
+    syscalls and the disclosed fallback), every other lane requires
+    the eligible branch. Test success alone never classifies.
+    """
+    markers = re.findall(r"(?:^|\.\.\. )IDENTITY_515_DENIAL ([^\n]*)$", text, re.M)
+    require(text.count("IDENTITY_515_DENIAL") == len(markers), "malformed denial marker")
+    require(len(markers) == 1, "missing/duplicate denial marker")
+    line = "IDENTITY_515_DENIAL " + markers[0]
+    denied = re.fullmatch(
+        r"IDENTITY_515_DENIAL outcome=denied reason=kernel_fix_missing "
+        r"mm_present=false attach=(?:true|false) tasktype=(?:true|false) "
+        r"bpf_delta=0 scan_bytes=[1-9][0-9]* fallback=kernel_fix_missing", line)
+    eligible = re.fullmatch(
+        r"IDENTITY_515_DENIAL outcome=eligible mm_present=true "
+        r"attach=(?:true|false) tasktype=(?:true|false) "
+        r"bpf_delta=0 scan_bytes=[1-9][0-9]* sink=ok", line)
+    if lane == "5.15.221":
+        require(denied is not None, "5.15 lane requires the real denied refusal marker")
+        return "expected-refusal", line
+    require(eligible is not None, "non-5.15 lane requires the eligible marker")
+    return "positive-coverage", line
+
+
+def lib_outcome(name, text, lane=None):
     require("LIFECYCLE_LOSS_REPORTED" not in text, "disallowed lifecycle loss tolerance: " + name)
+    if name == DENIAL_515:
+        return denial_outcome(text, lane)
     if name in MULTI_OUTCOMES:
         tag = MULTI_OUTCOMES[name]
         lines = re.findall(r"(?:^|\.\.\. )(" + re.escape(tag) + r"[^\n]*)", text, re.M)
@@ -598,10 +636,13 @@ def judge(stage, contract_path):
     for name in records:
         text = read("run/logs/" + name.rsplit("::", 1)[-1] + ".log")
         exact_test(text, name)
-        qualification, detail = lib_outcome(name, text)
+        qualification, detail = lib_outcome(name, text, contract["lane"])
         row("lib:" + name, qualification, detail)
     if contract["lane"] == "5.15.221":
-        row("identity:5.15-denied", "nonqualifying", "unready: no real executable guest refusal selector; not executed")
+        denial = [item for item in rows if item["id"] == "lib:" + DENIAL_515]
+        require(len(denial) == 1, "5.15 lane requires the executed denial selector")
+        row("identity:5.15-denied", denial[0]["qualification"],
+            "guest refusal disclosed: " + denial[0]["detail"])
     require(len(rows) == len(contract["required_ids"]) and {r["id"] for r in rows} == set(contract["required_ids"]), "missing/duplicate/unexpected required ID")
     nonqual = any(r["qualification"] == "nonqualifying" for r in rows)
     return {"schema": "p11scope/release-matrix-verdict/v1", "claim": contract["claim"], "lane": contract["lane"],

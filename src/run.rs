@@ -389,15 +389,43 @@ impl PreparedExecutable {
 }
 
 fn resolve_program(program: &OsStr) -> io::Result<PathBuf> {
+    resolve_program_in_path(program, std::env::var_os("PATH").as_deref())
+}
+
+/// PATH search over an injectable search path (production passes
+/// `$PATH`), so the search loop is testable without mutating the
+/// process environment. Like `execvp`, an earlier directory's readable
+/// but non-executable shadow is skipped for a later executable
+/// candidate (Sol-full F8). Descriptor pinning stays with the callers —
+/// they open the returned path and exec through the pinned fd — and the
+/// ELF guard stays in [`check_launch_file`]. When candidates exist but
+/// none is executable, the refusal keeps `PermissionDenied` (again like
+/// `execvp`); a name found nowhere is `NotFound`.
+fn resolve_program_in_path(program: &OsStr, path: Option<&OsStr>) -> io::Result<PathBuf> {
     if program.as_bytes().contains(&b'/') {
         return std::fs::canonicalize(program);
     }
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    for directory in std::env::split_paths(&path) {
+    let mut refused_for_mode = false;
+    for directory in std::env::split_paths(path.unwrap_or_default()) {
         let candidate = directory.join(program);
-        if candidate.is_file() {
-            return std::fs::canonicalize(candidate);
+        let metadata = match std::fs::metadata(&candidate) {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        if !metadata.is_file() {
+            continue;
         }
+        if metadata.mode() & 0o111 == 0 {
+            refused_for_mode = true;
+            continue;
+        }
+        return std::fs::canonicalize(candidate);
+    }
+    if refused_for_mode {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "owned command must be a regular executable file",
+        ));
     }
     Err(io::Error::from(io::ErrorKind::NotFound))
 }
@@ -11777,6 +11805,50 @@ mod tests {
             "{text}"
         );
         assert!(check_owned_target_runnable(std::ffi::OsStr::new("/bin/true")).is_ok());
+    }
+
+    /// Sol-full F8: an earlier PATH directory's readable but
+    /// non-executable shadow must not stop the search — resolution finds
+    /// the later executable (`execvp` semantics), and the ELF guard still
+    /// applies to the found candidate.
+    #[test]
+    fn path_search_skips_a_non_executable_shadow_for_the_later_executable() {
+        let shadow_dir = tempfile::tempdir().unwrap();
+        let shadow = shadow_dir.path().join("p11scope-shadowed-tool");
+        std::fs::write(&shadow, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&shadow, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let bin_dir = tempfile::tempdir().unwrap();
+        let tool = bin_dir.path().join("p11scope-shadowed-tool");
+        std::fs::copy("/bin/true", &tool).unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = std::env::join_paths([shadow_dir.path(), bin_dir.path()]).unwrap();
+        let resolved =
+            resolve_program_in_path(shadow.file_name().unwrap(), Some(path.as_os_str())).unwrap();
+        assert_eq!(resolved, std::fs::canonicalize(&tool).unwrap());
+        // Descriptor pinning and the ELF guard are unchanged: the found
+        // candidate still opens and passes the launch-file checks.
+        check_launch_file(&std::fs::File::open(&resolved).unwrap()).unwrap();
+    }
+
+    /// Sol-full F8 twin: with no executable candidate anywhere, a
+    /// shadowed name keeps the permission refusal (`execvp` reports
+    /// EACCES, not ENOENT), while a name found nowhere is `NotFound`.
+    #[test]
+    fn path_search_without_an_executable_candidate_keeps_the_permission_refusal() {
+        let shadow_dir = tempfile::tempdir().unwrap();
+        let shadow = shadow_dir.path().join("p11scope-shadow-only-tool");
+        std::fs::write(&shadow, "not executable\n").unwrap();
+        std::fs::set_permissions(&shadow, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let path = std::env::join_paths([shadow_dir.path()]).unwrap();
+        let error = resolve_program_in_path(shadow.file_name().unwrap(), Some(path.as_os_str()))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        let error = resolve_program_in_path(
+            std::ffi::OsStr::new("p11scope-definitely-absent-tool"),
+            Some(path.as_os_str()),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
     }
 
     fn run_args(pause: cli::PausePolicy, command: &[&str]) -> RunArgs {

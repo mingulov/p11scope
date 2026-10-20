@@ -369,6 +369,26 @@ pub(crate) trait CaptureLane<Pin>: NativeIdentity<Pin> {
     ) -> Result<crate::attach::capture::CallerImageObservation> {
         Err(anyhow!("caller image observation unavailable"))
     }
+    /// One pre-view baseline acquisition through the retained capture
+    /// owner, for the DR37 promotion scheduler. The default refuses:
+    /// lanes without the inventory baseline program cannot qualify
+    /// views. Object-safe: the reserve callback crosses as `&mut dyn`.
+    #[cfg_attr(not(test), allow(dead_code))] // STAGED (DR37): the capture-service scheduler names this; tests drive it today.
+    fn query_promotion_baselines(
+        &mut self,
+        _capture: crate::inventory_promotion::CaptureId,
+        _presentation: std::sync::Arc<crate::inventory_present::Presentation>,
+        _targets: &[crate::attach::selected_detailed::baseline::BaselineTarget],
+        _window: ReadWindow,
+        _reserve: &mut dyn FnMut(
+            usize,
+        ) -> std::result::Result<
+            crate::semantics_edge::resources::ResourceLease,
+            crate::semantics_edge::resources::SemanticResourceRefusal,
+        >,
+    ) -> Result<crate::attach::selected_detailed::baseline::PromotionBaselineBatch> {
+        Err(anyhow!("promotion baselines unavailable"))
+    }
     /// The attach backend and how it was chosen.
     fn backend(&self) -> LaneBackend {
         LaneBackend::singles()
@@ -2016,6 +2036,31 @@ impl CaptureLane<PidPin> for FacadeLane {
         match &mut self.state {
             FacadeState::Active(capture) => capture.observe_caller_image(original, window),
             _ => Err(anyhow!("caller image observation unavailable")),
+        }
+    }
+
+    fn query_promotion_baselines(
+        &mut self,
+        capture_id: crate::inventory_promotion::CaptureId,
+        presentation: std::sync::Arc<crate::inventory_present::Presentation>,
+        targets: &[crate::attach::selected_detailed::baseline::BaselineTarget],
+        window: ReadWindow,
+        reserve: &mut dyn FnMut(
+            usize,
+        ) -> std::result::Result<
+            crate::semantics_edge::resources::ResourceLease,
+            crate::semantics_edge::resources::SemanticResourceRefusal,
+        >,
+    ) -> Result<crate::attach::selected_detailed::baseline::PromotionBaselineBatch> {
+        match &mut self.state {
+            FacadeState::Active(capture) => capture.query_promotion_baselines(
+                capture_id,
+                presentation,
+                targets,
+                window,
+                |bytes| reserve(bytes),
+            ),
+            _ => Err(anyhow!("promotion baselines unavailable")),
         }
     }
 

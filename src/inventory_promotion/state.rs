@@ -131,6 +131,9 @@ pub(crate) enum PromotionRefusal {
     EndpointDependency,
     /// The parent scope ended before activation.
     ScopeEnded,
+    /// The parent scope kind is not qualified for selected
+    /// preparation (live but unsupported, never ended).
+    ScopeUnsupported,
     /// Preparation failed.
     PreparationFailed,
     /// Activation failed.
@@ -159,6 +162,7 @@ impl PromotionRefusal {
             Self::EndpointAmbiguous => "ambiguous endpoints",
             Self::EndpointDependency => "dependency endpoints outside closure",
             Self::ScopeEnded => "parent scope ended",
+            Self::ScopeUnsupported => "parent scope unsupported",
             Self::PreparationFailed => "preparation failed",
             Self::ActivationFailed => "activation failed",
             Self::Capacity => "install capacity unavailable",

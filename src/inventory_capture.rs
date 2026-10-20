@@ -373,7 +373,6 @@ pub(crate) trait CaptureLane<Pin>: NativeIdentity<Pin> {
     /// owner, for the DR37 promotion scheduler. The default refuses:
     /// lanes without the inventory baseline program cannot qualify
     /// views. Object-safe: the reserve callback crosses as `&mut dyn`.
-    #[cfg_attr(not(test), allow(dead_code))] // STAGED (DR37): the capture-service scheduler names this; tests drive it today.
     fn query_promotion_baselines(
         &mut self,
         _capture: crate::inventory_promotion::CaptureId,

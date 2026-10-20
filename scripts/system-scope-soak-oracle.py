@@ -277,7 +277,9 @@ def gate_loss_accounting(evidence):
     require(isinstance(joined, dict), "record truth_vs_observed must be an object")
     if joined.get("counts_match") is not True:
         return False, f"workload truth does not equal observed calls: {joined.get('match_note')}"
-    counters = (record.get("evidence") or {}).get("counters")
+    block = record.get("evidence")
+    require(isinstance(block, dict), "record evidence must be an object")
+    counters = block.get("counters")
     require(isinstance(counters, dict) and counters, "record counters must be a nonempty object")
     missing = sorted(name for name, value in counters.items() if value is None)
     if missing:
@@ -380,7 +382,9 @@ def evaluate(directory):
             gates[name] = {"pass": bool(passed), "detail": str(detail)}
         except OracleError as error:
             gates[name] = {"pass": False, "detail": f"invalid evidence: {error}"}
-    timing = evidence.run.get("timing", {})
+    timing = evidence.run.get("timing")
+    if not isinstance(timing, dict):
+        timing = {}
     start, end = timing.get("start_mono_ns"), timing.get("end_mono_ns")
     window_s = (end - start) / 1e9 if type(start) is int and type(end) is int else None
     verdict = "PASS" if all(gate["pass"] for gate in gates.values()) else "FAIL"

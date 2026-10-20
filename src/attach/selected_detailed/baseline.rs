@@ -89,17 +89,15 @@ impl PromotionBaselineBatch {
     /// Tests-only batch pairing `presentation` under `capture`:
     /// `matches_view` passes for that frame, but the batch carries no
     /// acquired rows, so `for_request` still refuses. Production
-    /// batches come only from [`query`].
+    /// batches come only from [`query`]. Returns the value, like
+    /// [`query`]; callers wrap it for the display.
     #[cfg(test)]
-    pub(crate) fn scripted_for_test(
-        capture: CaptureId,
-        presentation: Arc<Presentation>,
-    ) -> Arc<Self> {
+    pub(crate) fn scripted_for_test(capture: CaptureId, presentation: Arc<Presentation>) -> Self {
         let pool = crate::semantics_edge::resources::SemanticResourcePool::default();
         let storage = pool
             .reserve(requested_bytes(0).expect("an empty batch sizes"))
             .expect("the test pool reserves");
-        Arc::new(Self {
+        Self {
             capture,
             presentation,
             core: KernelBaselineBatch {
@@ -108,7 +106,7 @@ impl PromotionBaselineBatch {
                 rows: Vec::new(),
             },
             _storage: storage,
-        })
+        }
     }
 
     pub(crate) fn matches_view(

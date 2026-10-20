@@ -141,6 +141,12 @@ const CANCEL_CLEANUP_BUDGET: Duration = Duration::from_millis(100);
 /// preparation checks, never a hang.
 const SELECTED_PREPARATION_WINDOW: Duration = Duration::from_secs(30);
 
+/// One scheduled pre-view baseline acquisition's read window (DR37
+/// scheduler): the single-target query shares the service tick, like
+/// a metadata observation quantum (JOB_BUDGET). Expiry fails the one
+/// attempt, which retries only for a new frame/pair.
+const PROMOTION_BASELINE_WINDOW: Duration = Duration::from_millis(25);
+
 struct DiagnosticRequest<'a> {
     path: Option<&'a Path>,
     pid_filter: Option<u32>,
@@ -2287,6 +2293,74 @@ impl ClassicDriver<'_> {
         self.completion_source = Some(source);
     }
 
+    /// Schedule one pre-view baseline acquisition (DR37 ordinary
+    /// scheduling): while the display shows a viewed pair no batch
+    /// pairs with, acquire a single-target batch for that pair through
+    /// the retained capture and hand it back. At most one attempt per
+    /// frame/pair (failures stay quiet until a new frame or cursor);
+    /// scan-only runs (no capture), cgroup scope (the resolver refuses
+    /// it) and missing custody skip without native work. Called from
+    /// the capture-service hook, sharing the service tick.
+    fn schedule_promotion_baseline(
+        &mut self,
+        capture: Option<&mut dyn crate::inventory_capture::CaptureLane<crate::process::PidPin>>,
+    ) {
+        let demand = match self.display.as_ref() {
+            Some(display) => display.baseline_demand(),
+            None => None,
+        };
+        let Some((capture_id, frame, pair)) = demand else {
+            return;
+        };
+        // Selected preparation supports PID and system parents only;
+        // the resolver fails cgroup closed, so no acquisition starts
+        // for it.
+        if matches!(self.scope, InventoryRunScope::Cgroup) {
+            return;
+        }
+        let Some(lane) = capture else {
+            return;
+        };
+        let caller = crate::discovery::caller_registry::CallerId(pair.caller());
+        let (original, incarnation) = match self.coordinator.prepare_selected_caller_custody(caller)
+        {
+            Ok(custody) => custody,
+            Err(_) => return,
+        };
+        let window = match crate::attach::capture::ReadWindow::new(
+            1,
+            Instant::now() + PROMOTION_BASELINE_WINDOW,
+        ) {
+            Ok(window) => window,
+            Err(_) => return,
+        };
+        let target = crate::attach::selected_detailed::baseline::BaselineTarget {
+            caller,
+            incarnation,
+            original,
+        };
+        let registry = self.coordinator.registry();
+        let mut reserve = |bytes| registry.reserve_semantic_storage(bytes);
+        match lane.query_promotion_baselines(
+            capture_id,
+            frame,
+            std::slice::from_ref(&target),
+            window,
+            &mut reserve,
+        ) {
+            Ok(batch) => {
+                if let Some(display) = self.display.as_mut() {
+                    display.note_baseline_batch(std::sync::Arc::new(batch));
+                }
+            }
+            Err(_) => {
+                if let Some(display) = self.display.as_mut() {
+                    display.note_baseline_failed();
+                }
+            }
+        }
+    }
+
     /// Resolve one taken request into its preparation bundle plus the
     /// native CAS source (DR37 resolver): the qualified parent scope,
     /// a live run window, the clicked provider's attested subset
@@ -2783,6 +2857,7 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
             },
             now_ns(),
         );
+        self.schedule_promotion_baseline(capture);
     }
 
     fn on_stop_requested(&mut self) {
@@ -8141,15 +8216,27 @@ mod promotion_driver_tests {
     //! domains poll the completion minter, and the stop path drains
     //! bounded without installing.
     use super::*;
-    use crate::discovery::caller_registry::{CallerId, ModuleId, OsProcessSource, RegistryLimits};
+    use crate::attach::capture::{
+        CaptureScopeCoverage, CaptureTargets, CleanupSummary, CookieQuery, DiscoveryBatch,
+        ExtendReceipt, ExtendWindow, NativeDomainId, ReadWindow, WitnessBatch,
+    };
+    use crate::attach::selected_detailed::baseline::{BaselineTarget, PromotionBaselineBatch};
+    use crate::discovery::caller_registry::{
+        CallerId, ImageAuthority, ModuleId, ModuleKey, OsProcessSource, RegistryLimits,
+    };
     use crate::discovery::hooks::HookRegistry;
+    use crate::discovery::inventory_attach_set::TargetDelta;
+    use crate::inventory_capture::CaptureLane;
     use crate::inventory_dashboard::{DashboardIo, StderrRoute};
     use crate::inventory_promotion::lifecycle::{
         NativeActivationRefusal, NativeActivationSource, NativeCasReceipt, NativeCompletionSource,
         PreparationOutcome, SelectedActivationBinding, SessionNativeCompletion,
     };
     use crate::inventory_promotion::{CaptureId, PromotionEnd, PromotionRefusal, PromotionState};
+    use std::cell::{Cell, RefCell};
+    use std::collections::BTreeSet;
     use std::os::fd::AsRawFd as _;
+    use std::rc::Rc;
     use std::time::{Duration, Instant};
 
     fn coordinator() -> InventoryCoordinator<OsProcessSource> {
@@ -8635,6 +8722,317 @@ mod promotion_driver_tests {
                 .promotion_enabled(),
             "the refused rebind keeps the first capture"
         );
+    }
+
+    /// Scripted baseline lane: delegates every pass-service method to
+    /// an inner scripted lane and answers baseline acquisition from
+    /// the pairing-only test batch, recording calls and the demanded
+    /// (capture, caller).
+    struct BaselineStub<L> {
+        inner: L,
+        calls: Rc<Cell<usize>>,
+        fail: bool,
+        seen: Rc<RefCell<Vec<(CaptureId, CallerId)>>>,
+    }
+
+    impl<L: NativeIdentity<PidPin>> NativeIdentity<PidPin> for BaselineStub<L> {
+        fn owner_image(&mut self, pid: u32) -> Option<ImageIdentity> {
+            self.inner.owner_image(pid)
+        }
+
+        fn query_cookie(&mut self, domain: NativeDomainId, pin: &PidPin) -> CookieQuery {
+            self.inner.query_cookie(domain, pin)
+        }
+    }
+
+    impl<L: CaptureLane<PidPin>> CaptureLane<PidPin> for BaselineStub<L> {
+        fn domain(&self) -> NativeDomainId {
+            self.inner.domain()
+        }
+
+        fn scope_coverage(&self) -> CaptureScopeCoverage {
+            self.inner.scope_coverage()
+        }
+
+        fn extend(
+            &mut self,
+            delta: TargetDelta,
+            targets: &dyn CaptureTargets,
+            window: ExtendWindow,
+        ) -> ExtendReceipt {
+            self.inner.extend(delta, targets, window)
+        }
+
+        fn service_discovery(&mut self, window: ReadWindow) -> DiscoveryBatch {
+            self.inner.service_discovery(window)
+        }
+
+        fn read_witnesses(&mut self, window: ReadWindow) -> WitnessBatch {
+            self.inner.read_witnesses(window)
+        }
+
+        fn begin_stop(&mut self) {
+            self.inner.begin_stop()
+        }
+
+        fn poll_retirement(&mut self, deadline: Instant) -> Result<bool> {
+            self.inner.poll_retirement(deadline)
+        }
+
+        fn cleanup(&self) -> Option<CleanupSummary> {
+            self.inner.cleanup()
+        }
+
+        fn query_promotion_baselines(
+            &mut self,
+            capture: CaptureId,
+            presentation: std::sync::Arc<Presentation>,
+            targets: &[BaselineTarget],
+            window: ReadWindow,
+            _reserve: &mut dyn FnMut(
+                usize,
+            ) -> std::result::Result<
+                crate::semantics_edge::resources::ResourceLease,
+                crate::semantics_edge::resources::SemanticResourceRefusal,
+            >,
+        ) -> Result<PromotionBaselineBatch> {
+            self.calls.set(self.calls.get() + 1);
+            assert_eq!(
+                targets.len(),
+                1,
+                "the scheduler acquires one pair at a time"
+            );
+            assert_eq!(
+                window.max_rows(),
+                1,
+                "the scheduler bounds its read to one row"
+            );
+            self.seen.borrow_mut().push((capture, targets[0].caller));
+            if self.fail {
+                return Err(anyhow::anyhow!("scripted baseline failure"));
+            }
+            Ok(PromotionBaselineBatch::scripted_for_test(
+                capture,
+                presentation,
+            ))
+        }
+    }
+
+    fn baseline_stub<L>(
+        inner: L,
+        fail: bool,
+    ) -> (
+        BaselineStub<L>,
+        Rc<Cell<usize>>,
+        Rc<RefCell<Vec<(CaptureId, CallerId)>>>,
+    ) {
+        let calls = Rc::new(Cell::new(0));
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        (
+            BaselineStub {
+                inner,
+                calls: Rc::clone(&calls),
+                fail,
+                seen: Rc::clone(&seen),
+            },
+            calls,
+            seen,
+        )
+    }
+
+    /// A coordinator that admitted this process through the real
+    /// reconcile path, with a scripted provider edge for its caller:
+    /// custody is genuine, only the edge is scripted.
+    fn admitted_self_with_edge() -> (InventoryCoordinator<OsProcessSource>, CallerId) {
+        let mut coordinator = coordinator();
+        let pid = std::process::id();
+        let started_ns = crate::attach::monotonic_ns().expect("monotonic clock");
+        let observed = BTreeSet::from([pid]);
+        let events = coordinator.adapter_mut().reconcile(
+            &observed,
+            &mut |_| ImageAuthority::ScanPinned,
+            started_ns,
+        );
+        coordinator.apply_reconcile_events(&events, started_ns);
+        let caller = coordinator.adapter().live_id(pid).expect("self admits");
+        let key = ModuleKey::physical(
+            8,
+            1,
+            975_001,
+            Some("dr37sched".to_string()),
+            "/sched/provider.so",
+        );
+        coordinator.registry_mut().scripted_module_edge(key, caller);
+        (coordinator, caller)
+    }
+
+    /// A demanded frame: the coordinator admitted self with an edge,
+    /// so the captured presentation carries a cursor pair.
+    fn demanded_frame() -> (
+        InventoryCoordinator<OsProcessSource>,
+        Presentation,
+        CallerId,
+    ) {
+        let (coordinator, caller) = admitted_self_with_edge();
+        let started_ns = crate::attach::monotonic_ns().expect("monotonic clock");
+        let ended_ns = crate::attach::monotonic_ns().expect("monotonic clock");
+        let frame = Presentation::capture(&coordinator, "pid", started_ns, ended_ns, 1);
+        assert!(!frame.edges.is_empty(), "the edge scripts the cursor pair");
+        (coordinator, frame, caller)
+    }
+
+    /// Offer a frame and repaint past it: the headless terminal
+    /// takes every frame whole, so the repaint commits a viewed frame
+    /// with demand.
+    fn offer_and_tick(display: &mut Display, frame: Presentation) {
+        display.offer(frame);
+        display.repaint_for_test();
+        assert!(
+            display.baseline_demand().is_some(),
+            "the repaint commits a viewed frame with demand"
+        );
+    }
+
+    #[test]
+    fn native_service_schedules_baseline_for_viewed_pair() {
+        let (mut coordinator, frame, caller) = demanded_frame();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        assert!(driver.enable_run_promotion(CaptureId::new(7)));
+        offer_and_tick(driver.display.as_mut().expect("display"), frame);
+        let (inner, _) = crate::inventory_capture::tests::cgroup_runtime_lane();
+        let (mut stub, calls, seen) = baseline_stub(inner, false);
+        driver.on_native_service(Some(&mut stub));
+        assert_eq!(calls.get(), 1, "one demand schedules one acquisition");
+        assert_eq!(*seen.borrow(), vec![(CaptureId::new(7), caller)]);
+        assert!(
+            driver
+                .display
+                .as_ref()
+                .expect("display")
+                .baseline_demand()
+                .is_none(),
+            "the handed batch pairs with its frame"
+        );
+        // A paired frame schedules nothing more.
+        driver.on_native_service(Some(&mut stub));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn baseline_schedule_skips_while_disabled() {
+        let (mut coordinator, frame, _) = demanded_frame();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.display.as_mut().expect("display").offer(frame);
+        driver.display.as_mut().expect("display").tick();
+        let (inner, _) = crate::inventory_capture::tests::cgroup_runtime_lane();
+        let (mut stub, calls, _) = baseline_stub(inner, false);
+        driver.on_native_service(Some(&mut stub));
+        assert_eq!(calls.get(), 0, "disabled schedules nothing");
+    }
+
+    #[test]
+    fn baseline_schedule_skips_without_capture() {
+        let (mut coordinator, frame, _) = demanded_frame();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        assert!(driver.enable_run_promotion(CaptureId::new(7)));
+        offer_and_tick(driver.display.as_mut().expect("display"), frame);
+        driver.on_native_service(None);
+        assert!(
+            driver
+                .display
+                .as_ref()
+                .expect("display")
+                .baseline_demand()
+                .is_some(),
+            "a skipped demand persists for the next tick"
+        );
+    }
+
+    #[test]
+    fn baseline_schedule_skips_cgroup_scope() {
+        let (mut coordinator, frame, _) = demanded_frame();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.scope = InventoryRunScope::Cgroup;
+        assert!(driver.enable_run_promotion(CaptureId::new(7)));
+        offer_and_tick(driver.display.as_mut().expect("display"), frame);
+        let (inner, _) = crate::inventory_capture::tests::cgroup_runtime_lane();
+        let (mut stub, calls, _) = baseline_stub(inner, false);
+        driver.on_native_service(Some(&mut stub));
+        assert_eq!(calls.get(), 0, "cgroup schedules nothing");
+    }
+
+    #[test]
+    fn baseline_schedule_skips_headless() {
+        let (mut coordinator, _, _) = demanded_frame();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.display = None;
+        let (inner, _) = crate::inventory_capture::tests::cgroup_runtime_lane();
+        let (mut stub, calls, _) = baseline_stub(inner, false);
+        driver.on_native_service(Some(&mut stub));
+        assert_eq!(calls.get(), 0, "headless schedules nothing");
+    }
+
+    #[test]
+    fn baseline_schedule_skips_unknown_custody() {
+        let (other, frame, _) = demanded_frame();
+        drop(other);
+        let mut fresh = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut fresh, headless.display);
+        assert!(driver.enable_run_promotion(CaptureId::new(7)));
+        offer_and_tick(driver.display.as_mut().expect("display"), frame);
+        let (inner, _) = crate::inventory_capture::tests::cgroup_runtime_lane();
+        let (mut stub, calls, _) = baseline_stub(inner, false);
+        driver.on_native_service(Some(&mut stub));
+        assert_eq!(calls.get(), 0, "missing custody acquires nothing");
+        assert!(
+            driver
+                .display
+                .as_ref()
+                .expect("display")
+                .baseline_demand()
+                .is_some(),
+            "a skipped demand persists for the next tick"
+        );
+    }
+
+    #[test]
+    fn baseline_schedule_failure_retries_on_new_frame_only() {
+        let (mut coordinator, frame, _) = demanded_frame();
+        let second = Presentation::capture(
+            &coordinator,
+            "pid",
+            crate::attach::monotonic_ns().expect("monotonic clock"),
+            crate::attach::monotonic_ns().expect("monotonic clock"),
+            2,
+        );
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        assert!(driver.enable_run_promotion(CaptureId::new(7)));
+        offer_and_tick(driver.display.as_mut().expect("display"), frame);
+        let (inner, _) = crate::inventory_capture::tests::cgroup_runtime_lane();
+        let (mut stub, calls, _) = baseline_stub(inner, true);
+        driver.on_native_service(Some(&mut stub));
+        assert_eq!(calls.get(), 1, "the first attempt runs");
+        assert!(
+            driver
+                .display
+                .as_ref()
+                .expect("display")
+                .baseline_demand()
+                .is_none(),
+            "a failed attempt stays quiet for its frame"
+        );
+        driver.on_native_service(Some(&mut stub));
+        assert_eq!(calls.get(), 1, "no retry for the same frame");
+        offer_and_tick(driver.display.as_mut().expect("display"), second);
+        driver.on_native_service(Some(&mut stub));
+        assert_eq!(calls.get(), 2, "a new frame retries");
     }
 
     #[test]

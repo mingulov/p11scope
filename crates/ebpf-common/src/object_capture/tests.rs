@@ -3853,8 +3853,10 @@ fn streamed_get_entry_retains_selected_headers_and_failure_flags() {
         let mut reference = GetEntryState::default();
         let expected = capture_get_entry(0x4000, 9, layout, &mut reference, word_reader(&target));
         target.borrow_mut().log_len = 0;
-        let mut side = crate::object_wire::ObjectStart::default();
-        side.flags = ofl::PARTIAL_RESULT as u16;
+        let mut side = crate::object_wire::ObjectStart {
+            flags: ofl::PARTIAL_RESULT as u16,
+            ..Default::default()
+        };
         let actual = crate::object_flow::production_capture_get_entry(
             0x4000,
             9,

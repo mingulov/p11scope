@@ -3200,8 +3200,15 @@ impl Display {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // STAGED (DR37): the runtime owner drives enable/take/set_status/state; the UI key paths run today.
 impl Display {
+    /// Whether the runtime bound the promotion control to this run's
+    /// capture. Tests assert binding through this instead of the
+    /// retained control.
+    #[cfg(test)]
+    pub(crate) fn promotion_enabled(&self) -> bool {
+        self.promoter.enabled()
+    }
+
     /// Enable the DR37 promotion control for one capture run, bound to
     /// the run's capture identity. Default dashboard behavior
     /// (read-only keys, no cursor, no status line) remains until the

@@ -3333,7 +3333,7 @@ fn pty_promotion_d_pairs_baseline_with_viewed_frame() {
         .baseline_demand()
         .expect("the viewed pair lacks a batch");
     assert_eq!(capture, CaptureId::new(5));
-    let batch = PromotionBaselineBatch::scripted_for_test(capture, frame);
+    let batch = Arc::new(PromotionBaselineBatch::scripted_for_test(capture, frame));
     terminal.display.note_baseline_batch(Arc::clone(&batch));
     assert!(
         terminal.display.baseline_demand().is_none(),
@@ -3382,10 +3382,10 @@ fn pty_promotion_baseline_twins() {
     terminal.display.offer(varied_presentation());
     terminal.display.tick();
     terminal.shown(b"promotion: idle; selected");
-    let stale = PromotionBaselineBatch::scripted_for_test(
+    let stale = Arc::new(PromotionBaselineBatch::scripted_for_test(
         CaptureId::new(5),
         Arc::new(varied_presentation()),
-    );
+    ));
     terminal.display.note_baseline_batch(stale);
     assert!(terminal.display.baseline_demand().is_some());
     terminal.key(b"d");

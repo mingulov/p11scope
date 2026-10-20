@@ -3272,6 +3272,14 @@ impl Display {
         cancel
     }
 
+    /// Tests-only repaint: the same draw the coalesced cadence runs,
+    /// without waiting out the redraw interval.
+    #[cfg(test)]
+    pub(crate) fn repaint_for_test(&mut self) {
+        self.next_redraw = std::time::Instant::now();
+        self.tick();
+    }
+
     pub(crate) fn take_promotion_request(&mut self) -> Option<PromotionRequest> {
         self.promoter.take_request()
     }
@@ -3309,7 +3317,6 @@ impl Display {
     /// batch back via [`Display::note_baseline_batch`]; a failed
     /// attempt is recorded via [`Display::note_baseline_failed`] so
     /// it retries only for a new frame/pair.
-    #[cfg_attr(not(test), allow(dead_code))] // STAGED (DR37): the capture-service scheduler names this; tests drive it today.
     pub(crate) fn baseline_demand(&self) -> Option<(CaptureId, Arc<Presentation>, PromotionPair)> {
         let capture = self.promoter.capture()?;
         let presentation = self.viewed_presentation.as_ref().map(Arc::clone)?;
@@ -3330,7 +3337,6 @@ impl Display {
     /// Retain the latest acquired pre-view batch. A stale arrival
     /// (for an older frame) simply never pairs: `matches_view` guards
     /// every use, and the next demand still schedules a fresh attempt.
-    #[cfg_attr(not(test), allow(dead_code))] // STAGED (DR37): the capture-service scheduler names this; tests drive it today.
     pub(crate) fn note_baseline_batch(&mut self, batch: Arc<PromotionBaselineBatch>) {
         self.latest_baseline = Some(batch);
         self.baseline_missed = None;
@@ -3339,7 +3345,6 @@ impl Display {
     /// Record a failed acquisition attempt for the current viewed
     /// frame/pair: demand for it stays quiet until a new frame commits
     /// or the cursor moves, bounding retries to one per frame/pair.
-    #[cfg_attr(not(test), allow(dead_code))] // STAGED (DR37): the capture-service scheduler names this; tests drive it today.
     pub(crate) fn note_baseline_failed(&mut self) {
         if let Some(pair) = self.viewed_pair {
             self.baseline_missed = Some((self.viewed_revision, pair));

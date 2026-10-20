@@ -2361,9 +2361,8 @@ fn describe_shared_evidence(
         // `ambiguity_repeats`) is already counted above. Everything else
         // — other subjects, unbound/module-bound non-ambiguity gaps —
         // stays visible here, keyed precisely.
-        let is_caller_range = gap.subject == "rejected demoted count"
-            && gap.caller.is_some()
-            && gap.module.is_none();
+        let is_caller_range =
+            gap.subject == "rejected demoted count" && gap.caller.is_some() && gap.module.is_none();
         let is_ambiguity = gap.subject == "rejected demoted count"
             && gap.module.is_some()
             && gap.reason.contains("after sharing appeared");

@@ -215,9 +215,11 @@ impl PassView {
 }
 
 /// One observed `gap_recorded` identity plus its stream-tracked repeats.
-/// Repeats ride `gap_repeated` mid-run (power-of-two crossings only) and
-/// become exact at the pre-`ended` flush; the gate only relies on exact
-/// values (absence, or a reached power of two).
+/// Mid-run `gap_repeated` values are lower bounds (emitted at power-of-two
+/// crossings with the current cumulative count, so 19/21/26/29 all occur);
+/// the pre-`ended` flush makes the last value per index exact. Round-2
+/// validation goes through the startup gate, which treats mid-run values
+/// as bounds, never as finals.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GapEvidence {
     caller: Option<String>,
@@ -330,6 +332,117 @@ fn check_startup_round(
         "round-{round} A={observed_a} breaks the pinned projection chain (k={k})"
     );
     Ok(k)
+}
+
+/// Consecutive identical partial-k commits before the round-2 gate calls a
+/// genuine partial fence instead of a still-climbing lower bound. Live climbs
+/// finish in 2-4 passes with at most 1-pass pauses; 8 stalls fail loudly with
+/// the trajectory, never silently and never as a timeout.
+const FENCE_STALL_CAP: u32 = 8;
+
+/// Round-2 fence verdict from one `pass_committed` observation.
+enum StartupGateAction {
+    /// Not decided yet: stay in round 2, re-poll on the next commit.
+    Wait,
+    /// Fence count is final: run `check_startup_round` now.
+    Validate,
+    /// Same partial k too long: genuine partial fence, fail loudly.
+    Stalled { k: u64, trajectory: Vec<u64> },
+    /// A advanced past round 2 with no fence: impossible, fail loudly.
+    Overadvanced { a: u64 },
+}
+
+/// Round-2 fence gate. Mid-run `gap_repeated` values are lower bounds (the
+/// emitter reports the current cumulative count on power-of-two crossings),
+/// so the first non-stale sight of k cannot latch: 1/8/16/19/21/26 all
+/// precede 32 on healthy fenced runs. The gate is asymmetric because the
+/// bounds are: k == 32 validates immediately (a lower bound of 32 over 32
+/// pairs is exact, and the terminal exact replay backstops any over-count),
+/// while k == 0 needs the ordinary (A == 2) state on two consecutive commits
+/// (fence recordings can lag the edge). Partial counts wait out the climb;
+/// only a stalled partial fails, loudly with its trajectory. Round 1 never
+/// fences and rounds 3+ keep the immediate prior chain: the (1, 2] decision
+/// window is rounds 1-3, so later arrivals are prior-chain violations.
+struct StartupGate {
+    last: Option<(u64, u64)>,
+    runs: u32,
+    trajectory: Vec<u64>,
+}
+
+impl StartupGate {
+    fn new() -> Self {
+        Self {
+            last: None,
+            runs: 0,
+            trajectory: Vec::new(),
+        }
+    }
+
+    fn poll_round2(
+        &mut self,
+        observed_a: u64,
+        gaps: &[GapEvidence],
+        caller: &str,
+    ) -> StartupGateAction {
+        let k = startup_fence_repeats(gaps, caller);
+        self.trajectory.push(k);
+        if self.trajectory.len() > 24 {
+            self.trajectory.remove(0);
+        }
+        if k == TARGETS {
+            self.last = Some((observed_a, k));
+            self.runs = 1;
+            return StartupGateAction::Validate;
+        }
+        if k == 0 && observed_a > expected_a(2, 0) {
+            return StartupGateAction::Overadvanced { a: observed_a };
+        }
+        if self.last == Some((observed_a, k)) {
+            self.runs += 1;
+        } else {
+            self.last = Some((observed_a, k));
+            self.runs = 1;
+        }
+        if k == 0 {
+            if observed_a == expected_a(2, 0) && self.runs >= 2 {
+                StartupGateAction::Validate
+            } else {
+                StartupGateAction::Wait
+            }
+        } else if self.runs >= FENCE_STALL_CAP {
+            StartupGateAction::Stalled {
+                k,
+                trajectory: self.trajectory.clone(),
+            }
+        } else {
+            StartupGateAction::Wait
+        }
+    }
+}
+
+/// Round-2 readiness through the startup gate; every other round validates
+/// immediately. Returns false while the gate waits out a climbing lower
+/// bound; bails loudly on a stalled partial or an impossible advance.
+fn startup_round_ready(
+    gate: &RefCell<StartupGate>,
+    round: u64,
+    observed_a: u64,
+    evidence: &[GapEvidence],
+    caller: &str,
+) -> Result<bool> {
+    if round != 2 {
+        return Ok(true);
+    }
+    match gate.borrow_mut().poll_round2(observed_a, evidence, caller) {
+        StartupGateAction::Wait => Ok(false),
+        StartupGateAction::Validate => Ok(true),
+        StartupGateAction::Stalled { k, trajectory } => bail!(
+            "startup fence disposition stalled at partial k={k} (k trajectory: {trajectory:?})"
+        ),
+        StartupGateAction::Overadvanced { a } => {
+            bail!("round-2 A={a} advanced past the issued rounds with no fence evidence")
+        }
+    }
 }
 
 /// Validate the terminal fence/proof pair set: 32 distinct pairs under one
@@ -1310,12 +1423,16 @@ fn run_wrap_cell(enabled: bool, cell: WrapCell) -> Result<(serde_json::Value, u6
     let fence_k = Cell::new(0u64);
     let view = RefCell::new(PassView::default());
     let failure = RefCell::new(None::<anyhow::Error>);
+    let gate = RefCell::new(StartupGate::new());
     let stop = || {
         let advance = || -> Result<bool> {
+            if failure.borrow().is_some() {
+                return Ok(true);
+            }
             if start.elapsed() >= Duration::from_secs(RUN_SECONDS) {
                 let view = view.borrow();
                 bail!(
-                    "G21 wrap exceeded900s, phase={:?} k={} A={:?} B={:?} evidence={:?}",
+                    "G21 wrap exceeded900s, phase={:?} k={} A={:?} B={:?} gate_traj={:?} evidence={:?}",
                     state.get(),
                     fence_k.get(),
                     view.a
@@ -1324,6 +1441,7 @@ fn run_wrap_cell(enabled: bool, cell: WrapCell) -> Result<(serde_json::Value, u6
                     view.b
                         .as_ref()
                         .and_then(|edge| edge["entries"]["count"].as_u64()),
+                    gate.borrow().trajectory,
                     view.evidence,
                 );
             }
@@ -1365,7 +1483,8 @@ fn run_wrap_cell(enabled: bool, cell: WrapCell) -> Result<(serde_json::Value, u6
                         || round > 1
                             && count == expected_a(round - 1, fence_k.get())
                             && k_now == fence_k.get();
-                    if !stale {
+                    if !stale && startup_round_ready(&gate, round, count, &view.evidence, &caller)?
+                    {
                         let prior = if round == 1 {
                             None
                         } else {
@@ -1474,7 +1593,9 @@ fn run_wrap_cell(enabled: bool, cell: WrapCell) -> Result<(serde_json::Value, u6
         match advance() {
             Ok(done) => done,
             Err(error) => {
-                *failure.borrow_mut() = Some(error);
+                if failure.borrow().is_none() {
+                    *failure.borrow_mut() = Some(error);
+                }
                 true
             }
         }
@@ -2308,13 +2429,25 @@ fn privileged_native_lane_pid_diagnostics_three_round_startup_probe_lp64() -> Re
     let first_mapping = Cell::new(0u64);
     let view = RefCell::new(PassView::default());
     let failure = RefCell::new(None::<anyhow::Error>);
+    let gate = RefCell::new(StartupGate::new());
     let stop = || {
         let advance = || -> Result<bool> {
-            ensure!(
-                started.elapsed() < Duration::from_secs(90),
-                "startup probe exceeded90s at phase{}",
-                state.get()
-            );
+            if failure.borrow().is_some() {
+                return Ok(true);
+            }
+            if started.elapsed() >= Duration::from_secs(90) {
+                let view = view.borrow();
+                let caller = view.caller_id.clone().unwrap_or_default();
+                bail!(
+                    "startup probe exceeded90s at phase{} A={:?} k_now={} gate_traj={:?}",
+                    state.get(),
+                    view.a
+                        .as_ref()
+                        .and_then(|edge| edge["entries"]["count"].as_u64()),
+                    startup_fence_repeats(&view.evidence, &caller),
+                    gate.borrow().trajectory,
+                );
+            }
             if state.get() == 4 {
                 return Ok(true);
             }
@@ -2342,7 +2475,9 @@ fn privileged_native_lane_pid_diagnostics_three_round_startup_probe_lp64() -> Re
                         || round > 1
                             && observed == expected_a(round - 1, fence_k.get())
                             && k_now == fence_k.get();
-                    if !stale {
+                    if !stale
+                        && startup_round_ready(&gate, round, observed, &view.evidence, &caller)?
+                    {
                         let prior = if round == 1 {
                             None
                         } else {
@@ -2376,7 +2511,9 @@ fn privileged_native_lane_pid_diagnostics_three_round_startup_probe_lp64() -> Re
         match advance() {
             Ok(done) => done,
             Err(error) => {
-                *failure.borrow_mut() = Some(error);
+                if failure.borrow().is_none() {
+                    *failure.borrow_mut() = Some(error);
+                }
                 true
             }
         }
@@ -2744,6 +2881,101 @@ fn operator_diagnostics_wrap_twin_startup_wrong_range_fail() -> Result<()> {
     let full = vec![twin_startup_gap("c0", 32)];
     ensure!(check_startup_round(3, 2, &full, "c0", Some(0)).is_err());
     ensure!(check_startup_round(3, 3, &full, "c0", Some(32)).is_err());
+    Ok(())
+}
+
+#[test]
+fn operator_diagnostics_wrap_startup_gate_accepts_full_fence_immediately() -> Result<()> {
+    // A lower bound of 32 over 32 pairs is exact: first sight validates.
+    let gaps = vec![twin_startup_gap("c0", 32)];
+    let mut gate = StartupGate::new();
+    ensure!(matches!(
+        gate.poll_round2(1, &gaps, "c0"),
+        StartupGateAction::Validate
+    ));
+    Ok(())
+}
+
+#[test]
+fn operator_diagnostics_wrap_startup_gate_waits_out_partial_climb() -> Result<()> {
+    // Live wave12 probe-0 climb 1 -> 8 -> 21 -> 32: waits, then validates.
+    let mut gate = StartupGate::new();
+    for repeats in [1, 8, 21] {
+        let gaps = vec![twin_startup_gap("c0", repeats)];
+        ensure!(matches!(
+            gate.poll_round2(1, &gaps, "c0"),
+            StartupGateAction::Wait
+        ));
+    }
+    let gaps = vec![twin_startup_gap("c0", 32)];
+    ensure!(matches!(
+        gate.poll_round2(1, &gaps, "c0"),
+        StartupGateAction::Validate
+    ));
+    Ok(())
+}
+
+#[test]
+fn operator_diagnostics_wrap_startup_gate_requires_stable_ordinary() -> Result<()> {
+    // k == 0 validates only on the second consecutive ordinary commit;
+    // pre-observation (A == 1) and first-sight ordinary both wait.
+    let gaps: Vec<GapEvidence> = Vec::new();
+    let mut gate = StartupGate::new();
+    ensure!(matches!(
+        gate.poll_round2(1, &gaps, "c0"),
+        StartupGateAction::Wait
+    ));
+    ensure!(matches!(
+        gate.poll_round2(2, &gaps, "c0"),
+        StartupGateAction::Wait
+    ));
+    ensure!(matches!(
+        gate.poll_round2(2, &gaps, "c0"),
+        StartupGateAction::Validate
+    ));
+    Ok(())
+}
+
+#[test]
+fn operator_diagnostics_wrap_startup_gate_fails_stalled_partial_loud() -> Result<()> {
+    // A partial k frozen for FENCE_STALL_CAP commits is a genuine partial
+    // fence and fails loudly with its trajectory; flapping never trips it.
+    let gaps = vec![twin_startup_gap("c0", 16)];
+    let mut gate = StartupGate::new();
+    for _ in 0..FENCE_STALL_CAP - 1 {
+        ensure!(matches!(
+            gate.poll_round2(1, &gaps, "c0"),
+            StartupGateAction::Wait
+        ));
+    }
+    match gate.poll_round2(1, &gaps, "c0") {
+        StartupGateAction::Stalled { k, trajectory } => {
+            ensure!(k == 16);
+            ensure!(trajectory.len() == FENCE_STALL_CAP as usize);
+            ensure!(trajectory.iter().all(|seen| *seen == 16));
+        }
+        _ => bail!("a stalled partial fence must fail loudly"),
+    }
+    let mut flap = StartupGate::new();
+    for repeats in [16, 17, 16, 17, 16, 17, 16, 17, 16] {
+        let gaps = vec![twin_startup_gap("c0", repeats)];
+        ensure!(matches!(
+            flap.poll_round2(1, &gaps, "c0"),
+            StartupGateAction::Wait
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn operator_diagnostics_wrap_startup_gate_rejects_overadvanced_ordinary() -> Result<()> {
+    // A past round 2 with no fence is impossible (rounds are driver-issued).
+    let gaps: Vec<GapEvidence> = Vec::new();
+    let mut gate = StartupGate::new();
+    ensure!(matches!(
+        gate.poll_round2(3, &gaps, "c0"),
+        StartupGateAction::Overadvanced { a: 3 }
+    ));
     Ok(())
 }
 

@@ -2192,7 +2192,7 @@ pub fn capture(a: &CaptureArgs) -> Result<()> {
     let kind = a.kind;
     let policy = capture_policy(kind, a.metrics, a.unsafe_requested)?;
     if let Some(warning) = pid_namespace_preflight(&a.scope, crate::pidns::numbering())? {
-        eprintln!("{warning}");
+        emit_capture_diagnostic(&warning);
     }
     let (scope, named_view) = match &a.scope {
         ScopeArg::Pid(p) => {
@@ -2205,8 +2205,8 @@ pub fn capture(a: &CaptureArgs) -> Result<()> {
         ScopeArg::System => (Scope::System, None),
     };
     match (kind, a.duration) {
-        (Kind::Trace, None) => eprintln!("{}", no_duration_notice()),
-        (Kind::Profile, None) => eprintln!("{}", no_profile_duration_notice()),
+        (Kind::Trace, None) => emit_capture_diagnostic(&no_duration_notice()),
+        (Kind::Profile, None) => emit_capture_diagnostic(&no_profile_duration_notice()),
         _ => {}
     }
     warn_unsafe_policy(policy);
@@ -2244,7 +2244,7 @@ pub fn capture(a: &CaptureArgs) -> Result<()> {
     // Zero modules is not an error (spec §4.10): the capture still runs, still
     // writes its report, and says here how to find out why it found nothing.
     if engine.plan().modules.is_empty() {
-        eprintln!("{}", no_modules_hint(&a.scope));
+        emit_capture_diagnostic(&no_modules_hint(&a.scope));
     }
     let mut session = engine
         .start_session(policy, a.ring_bytes, a.attach_backend)
@@ -2271,11 +2271,11 @@ pub fn capture(a: &CaptureArgs) -> Result<()> {
     // confined targets for. Saying nothing here would leave the operator with
     // a capture whose calls are all in flight and no reason given.
     if accepted_uretprobe_risk && engine.expected_target_exit() {
-        eprintln!(
+        emit_capture_diagnostic(
             "p11scope: WARNING: the target exited during this capture, which attached uretprobes \
              to a syscall-confined target on a kernel measured to kill one for exactly that. \
              p11scope cannot read a non-child's exit status, so this is not proof — but calls \
-             left in flight with no returns are that death's fingerprint"
+             left in flight with no returns are that death's fingerprint",
         );
     }
     Ok(())
@@ -3255,14 +3255,14 @@ fn run_owned_inner(args: &RunArgs, stop: Arc<SignalState>) -> Result<OwnedRunOut
         && let Some(explanation) =
             uretprobe_hazard::describe_owned_child_death(code, evidence.attached_probes)
     {
-        eprintln!("p11scope: {explanation}");
+        emit_capture_diagnostic(&format!("p11scope: {explanation}"));
     }
     // A handed-back child is named on the terminal path (SYSPLAN residual
     // F-15): the evidence already carries `handoff_child_pid`, and the
     // operator reading stderr gets the same PID plus the handoff state.
     // Still exit 0 — a deliberate handoff is observer success.
     if owned.still_running {
-        eprintln!("{}", format_handoff_note(owned.pid));
+        emit_capture_diagnostic(&format_handoff_note(owned.pid));
     }
     Ok(OwnedRunOutcome {
         child_exit_code: owned.exit_code,
@@ -3286,10 +3286,10 @@ fn preflight_uretprobe_hazard(target: Option<u32>, overridden: bool) -> Result<O
     match uretprobe_hazard::evaluate(target, overridden) {
         uretprobe_hazard::Action::Proceed => Ok(None),
         uretprobe_hazard::Action::ProceedUnderOverride(reason) => {
-            eprintln!(
+            emit_capture_diagnostic(&format!(
                 "p11scope: WARNING: {reason}. Continuing because \
                  --allow-uretprobe-on-confined-target was given"
-            );
+            ));
             Ok(Some(reason.to_string()))
         }
         uretprobe_hazard::Action::Refuse(reason) => Err(anyhow!(
@@ -3350,6 +3350,16 @@ fn no_modules_hint(scope: &ScopeArg) -> String {
     }
 }
 
+/// Best-effort capture diagnostic on stderr through the bounded
+/// transport: a full pipe or stalled terminal never parks the capture
+/// thread, and a failed write is dropped, never panicked — diagnostic
+/// delivery never determines the exit status (Sol-full F3).
+/// Target-controlled bytes stay escaped by the caller at this
+/// terminal boundary, exactly as before.
+fn emit_capture_diagnostic(line: &str) {
+    let _ = crate::sink::try_stderr_line(line);
+}
+
 /// Prints every attach failure — shared by `profile` and `trace`, which
 /// each attach the same way. A capture that attached at least one probe
 /// still gets each per-slot failure printed (it is real evidence of a
@@ -3365,19 +3375,16 @@ fn no_modules_hint(scope: &ScopeArg) -> String {
 /// blocked by `perf_event_paranoid`).
 fn report_attach_failures(session: &Session) {
     for (idx, msg) in session.attach_failures() {
-        eprintln!("{}", format_attach_failure(*idx, msg));
+        emit_capture_diagnostic(&format_attach_failure(*idx, msg));
     }
     if session.attached_probes() == 0
         && let Some((_, first)) = session.attach_failures().first()
     {
-        eprintln!(
-            "{}",
-            format_total_attach_refusal(
-                session.attach_failures().len(),
-                session.attached_probes() + session.attach_failures().len(),
-                first
-            )
-        );
+        emit_capture_diagnostic(&format_total_attach_refusal(
+            session.attach_failures().len(),
+            session.attached_probes() + session.attach_failures().len(),
+            first,
+        ));
     }
 }
 
@@ -3425,9 +3432,9 @@ fn load_mech_shapes(state: &mut semantics::State) -> Result<()> {
 
 fn warn_unsafe_policy(policy: CapturePolicy) {
     if policy.uses_unsafe_decoders() {
-        eprintln!(
+        emit_capture_diagnostic(
             "p11scope: WARNING: unsafe-unvalidated-metadata follows caller-supplied pointer \
-             topology and is only for trusted, ABI-valid workloads"
+             topology and is only for trusted, ABI-valid workloads",
         );
     }
 }
@@ -4001,10 +4008,10 @@ fn retire_pause_policy(error: PauseError) -> Result<()> {
     }
     // The pause error chain can quote discovery-batch application failures,
     // which handle target-named records; escape at this terminal boundary too.
-    eprintln!(
+    emit_capture_diagnostic(&format!(
         "p11scope: pause: {}; the capture continues unpaused and reports pause: partial",
         render::escape_controls(&error.to_string())
-    );
+    ));
     Ok(())
 }
 
@@ -4770,10 +4777,10 @@ fn capture_profile(
     scheduling.note_loop_start(crate::attach::monotonic_ns());
     scheduling.sample_resource(crate::timing::ResourcePoint::Readiness);
     if let Some(line) = attach_fallback_line(session.backend_fallback()) {
-        eprintln!("{line}");
+        emit_capture_diagnostic(&line);
     }
-    eprintln!("{}", loader_readiness_line(active_loader_hooks));
-    eprintln!("{}", capture_ready_line(session.attached_probes()));
+    emit_capture_diagnostic(&loader_readiness_line(active_loader_hooks));
+    emit_capture_diagnostic(&capture_ready_line(session.attached_probes()));
     #[cfg(test)]
     crate::first_use_probe::loop_started(&session.events_domain(), scheduling.loop_start_mono_ns);
     #[rustfmt::skip]
@@ -5682,10 +5689,10 @@ fn capture_trace(
     scheduling.note_loop_start(crate::attach::monotonic_ns());
     scheduling.sample_resource(crate::timing::ResourcePoint::Readiness);
     if let Some(line) = attach_fallback_line(session.backend_fallback()) {
-        eprintln!("{line}");
+        emit_capture_diagnostic(&line);
     }
-    eprintln!("{}", loader_readiness_line(active_loader_hooks));
-    eprintln!("{}", capture_ready_line(session.attached_probes()));
+    emit_capture_diagnostic(&loader_readiness_line(active_loader_hooks));
+    emit_capture_diagnostic(&capture_ready_line(session.attached_probes()));
     #[rustfmt::skip]
     let loop_result = (|| -> Result<CaptureEnd> {
     loop {
@@ -14960,6 +14967,84 @@ mod tests {
         let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
         assert_eq!(production.matches("\\x1b[2J").count(), 1);
         assert_eq!(production.matches("live_display.frame_bytes(").count(), 2);
+    }
+
+    /// Sol-full F3: no production capture/discovery diagnostic may use a
+    /// blocking stderr write — a full pipe or stalled terminal would park
+    /// the capture thread while producers remain active. Every emission
+    /// routes through the bounded `emit_capture_diagnostic` helper, whose
+    /// transport the sink tests pin (shed-a-stalled-sink, closed-sink);
+    /// the delivery-independent exit status is covered end to end by
+    /// `tests/capture_stderr_delivery.rs`. The collection-spawn fallback
+    /// in `inventory_capture.rs` (whose tests live in another file and
+    /// cannot pin it) is pinned here too.
+    #[test]
+    fn capture_diagnostics_never_use_blocking_stderr_writes() {
+        let source = include_str!("run.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        assert!(
+            !production.contains("eprintln!"),
+            "production run.rs still has blocking stderr writes"
+        );
+        for (region, start, end) in [
+            (
+                "capture",
+                "pub fn capture(a: &CaptureArgs)",
+                "\nfn no_duration_notice",
+            ),
+            (
+                "run_owned_inner",
+                "fn run_owned_inner(",
+                "fn preflight_uretprobe_hazard(",
+            ),
+            (
+                "preflight_uretprobe_hazard",
+                "fn preflight_uretprobe_hazard(",
+                "fn pid_namespace_preflight(",
+            ),
+            (
+                "report_attach_failures",
+                "fn report_attach_failures(",
+                "fn format_attach_failure(",
+            ),
+            (
+                "warn_unsafe_policy",
+                "fn warn_unsafe_policy(",
+                "fn identify_tracked(",
+            ),
+            (
+                "retire_pause_policy",
+                "fn retire_pause_policy(",
+                "fn capture_end(",
+            ),
+            (
+                "capture_profile",
+                "fn capture_profile(",
+                "fn write_json_report",
+            ),
+            (
+                "capture_trace",
+                "fn capture_trace(",
+                "fn terminal_trace_count_line",
+            ),
+        ] {
+            let body = production
+                .split_once(start)
+                .unwrap_or_else(|| panic!("{region} moved"))
+                .1
+                .split_once(end)
+                .unwrap_or_else(|| panic!("{region} end moved"))
+                .0;
+            assert!(
+                body.contains("emit_capture_diagnostic("),
+                "{region} lost its bounded diagnostic emission"
+            );
+        }
+        let inventory = include_str!("inventory_capture.rs");
+        assert!(
+            !inventory.contains("eprintln!"),
+            "inventory_capture.rs still has a blocking stderr write"
+        );
     }
 
     #[test]

@@ -1469,10 +1469,10 @@ pub(crate) fn collect_off_thread<T: Send>(
         let worker = match spawned {
             Ok(worker) => worker,
             Err(error) => {
-                eprintln!(
+                let _ = crate::sink::try_stderr_line(&format!(
                     "p11scope: collecting this pass on the main thread (no worker thread: \
                      {error}); the lifecycle ring waits for it"
-                );
+                ));
                 let job = take(slot).expect("an unspawned worker never took the job");
                 return job();
             }

@@ -262,7 +262,8 @@ class PreparedReleaseDriverTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(record.read_text()), {
             "argv": ["build", "--locked", "--offline", "--release",
-                     "--no-default-features", "--target", "x86_64-unknown-linux-musl",
+                     "--no-default-features", "--features", "stub-object-attributes",
+                     "--target", "x86_64-unknown-linux-musl",
                      "--bin", "p11scope"],
             "cargo_target_dir": str(fixture.base / "official target with spaces"),
             "cargo": str(cargo.resolve()),

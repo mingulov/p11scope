@@ -6962,15 +6962,17 @@ mod privileged_tests {
     use std::os::fd::AsFd as _;
 
     /// The 5.15 identity-denial cell: the real BTF named-fix refusal,
-    /// disclosed through the production sink with zero `bpf()` syscalls.
+    /// disclosed through the production sink with zero `bpf()` calls through
+    /// the instrumented identity-iterator wrapper (that counter covers only
+    /// the wrapper, not aya or other raw `bpf()` sites).
     ///
     /// Dual-outcome by running kernel, never vacuous: on a kernel whose
     /// BTF lacks the `mm` fix (the 5.15 guest) the direct scan AND the
     /// live sink must agree on `FixMissing`, the production auto-selection
     /// path must stay userspace with `fallback: kernel_fix_missing`, and
-    /// the whole path must issue zero `bpf()` syscalls. On an eligible
+    /// the instrumented wrapper on the path must see zero `bpf()` calls. On an eligible
     /// kernel the scan AND the sink must agree on success with the same
-    /// zero-syscall selection. Any scan/sink disagreement, any unexpected
+    /// zero-call instrumented selection. Any scan/sink disagreement, any unexpected
     /// deny arm, or any missing BTF fails loudly: a fabricated or partial
     /// denial can never print the marker. The release contract classifies
     /// the marker per lane (denial required on 5.15, eligible elsewhere).
@@ -7016,7 +7018,7 @@ mod privileged_tests {
         assert_eq!(
             identity_iter::test_bpf_call_count() - before,
             0,
-            "selection must issue zero bpf() syscalls"
+            "selection must issue zero instrumented bpf() calls (identity-iterator wrapper only)"
         );
 
         match (&direct, sink) {
@@ -7085,7 +7087,8 @@ mod privileged_tests {
                     Err(deny) => format!("denied:{}", deny.label()),
                 };
                 panic!(
-                    "direct scan ({direct}) and live sink ({sink:?}) disagree: \
+                    "unexpected 5.15-cell arms (direct scan: {direct}, live sink: {sink:?}): \
+                     only agreed FixMissing denial or agreed eligible may print the marker; \
                      fabricated or partial denial"
                 );
             }

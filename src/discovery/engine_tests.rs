@@ -42714,3 +42714,220 @@ fn midfinal_residual_deferred_inventory_keeps_cgroup_view_until_proven_exit() {
         engine.retirement_intents
     );
 }
+
+/// Midfinal round-2 residual, item 1 (P1 remainder): a declined view must
+/// not lose selection-derived slots without an accepted removal. The final
+/// inventory rebuild drops selection claims/tables when the retained pin
+/// reads stale; their sole-owned endpoints then enter `delta.retire`, and
+/// the deferral currency exemption would let that reduced candidate commit.
+/// The decline decision must survive into the rebuild, so the deferred tick
+/// keeps claims, tables, contexts and slots.
+#[test]
+fn midfinal_res2_declined_inventory_keeps_selection_derived_slots() {
+    let (fixture, mut engine, mut session, binding) = attached_selection_route();
+    let pid = engine.views[0].pid();
+    let view = engine.views[0].id();
+    let provider = engine
+        .pinned
+        .owned_timing_key(binding.object)
+        .expect("the binding provider pins a timing key");
+    let table = selection_only_table(
+        &engine,
+        binding,
+        0x20,
+        &[("C_Initialize", 0x100)],
+        Vec::new(),
+    );
+    let result = SelectionRequest {
+        name: SelectionNameClass::ExactStandard,
+        version: SelectionVersionClass::V3_0,
+        flags: 0,
+    };
+    let (claims, tables, pending) = engine
+        .propose_selection_claim(&binding, provider, &table, &result)
+        .expect("the consistent selection claim is proposed");
+    let raw_modules = engine
+        .modules
+        .iter()
+        .map(|module| module.scanned.clone())
+        .collect();
+    let candidate = engine
+        .live_candidate_with_selection(engine.pinned.clone(), raw_modules, claims, tables, pending)
+        .expect("the selection candidate builds");
+    assert!(
+        engine
+            .apply_candidate(&mut session, candidate, &mut true, false, &[])
+            .expect("the selection candidate applies")
+            .accepted()
+    );
+    assert_eq!(
+        engine.selection_claims.len(),
+        1,
+        "precondition: the claim is admitted"
+    );
+    assert_eq!(
+        engine
+            .plan
+            .slots
+            .iter()
+            .filter(|slot| slot.file_offset == 0x100 && engine.plan.is_active(slot.index))
+            .count(),
+        1,
+        "precondition: the selection target holds one active slot"
+    );
+    let claims_before = engine.selection_claims.clone();
+    let tables_before = engine.selection_tables.clone();
+    let contexts_before = engine.loader_registry.ids_for_view(view);
+    assert!(
+        !contexts_before.is_empty(),
+        "precondition: the attached view owns loader contexts"
+    );
+    let slots_before = engine.plan.active_slot_count();
+
+    engine.views[0] = crate::process::unprovable_process_view_for_test(view, pid)
+        .expect("an unprovable pin over the live child");
+    assert!(
+        !engine.views[0].still_the_same(),
+        "precondition: the pin reads stale while the child lives"
+    );
+    assert!(
+        engine.request_refresh(pid, None),
+        "the refresh request is accepted"
+    );
+    apply_ordinary_batch(&mut engine, &mut session, Vec::new())
+        .expect("a deferred inventory tick never fails the capture");
+    assert!(
+        engine.views.iter().any(|retained| retained.id() == view),
+        "the deferred view stays retained"
+    );
+    assert_eq!(
+        engine.selection_claims, claims_before,
+        "the deferred view keeps its selection claims without an accepted removal"
+    );
+    assert_eq!(
+        engine.selection_tables, tables_before,
+        "the deferred view keeps its selection tables without an accepted removal"
+    );
+    assert_eq!(
+        engine.loader_registry.ids_for_view(view),
+        contexts_before,
+        "the deferred view keeps its loader contexts"
+    );
+    assert_eq!(
+        engine.plan.active_slot_count(),
+        slots_before,
+        "the deferred view keeps its slots"
+    );
+    assert!(
+        !engine
+            .retirement_intents
+            .values()
+            .any(|cause| *cause == RetirementCause::GenerationLost),
+        "a live generation is never loss: {:?}",
+        engine.retirement_intents
+    );
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.subject == "live discovery generation"
+                && skip.reason.contains("contradicted or unprovable")),
+        "the deferral is marked: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        engine.refresh_requested.is_empty(),
+        "the serviced request completes instead of sticking: {:?}",
+        engine.refresh_requested
+    );
+    drop(fixture);
+}
+
+/// Midfinal round-2 residual, item 1 positive twin: an accepted removal
+/// still retires selection-derived coverage through the same inventory
+/// path. A proven exit drops the view, its claims, tables, contexts and
+/// slots exactly once.
+#[test]
+fn midfinal_res2_accepted_removal_retires_selection_derived_slots() {
+    let (mut fixture, mut engine, mut session, binding) = attached_selection_route();
+    let view = engine.views[0].id();
+    let provider = engine
+        .pinned
+        .owned_timing_key(binding.object)
+        .expect("the binding provider pins a timing key");
+    let table = selection_only_table(
+        &engine,
+        binding,
+        0x20,
+        &[("C_Initialize", 0x100)],
+        Vec::new(),
+    );
+    let result = SelectionRequest {
+        name: SelectionNameClass::ExactStandard,
+        version: SelectionVersionClass::V3_0,
+        flags: 0,
+    };
+    let (claims, tables, pending) = engine
+        .propose_selection_claim(&binding, provider, &table, &result)
+        .expect("the consistent selection claim is proposed");
+    let raw_modules = engine
+        .modules
+        .iter()
+        .map(|module| module.scanned.clone())
+        .collect();
+    let candidate = engine
+        .live_candidate_with_selection(engine.pinned.clone(), raw_modules, claims, tables, pending)
+        .expect("the selection candidate builds");
+    assert!(
+        engine
+            .apply_candidate(&mut session, candidate, &mut true, false, &[])
+            .expect("the selection candidate applies")
+            .accepted()
+    );
+    assert_eq!(
+        engine.selection_claims.len(),
+        1,
+        "precondition: the claim is admitted"
+    );
+
+    fixture.child.kill().expect("kill the child");
+    fixture.child.wait().expect("reap the child");
+    assert!(
+        !engine.views[0].still_the_same(),
+        "precondition: the reaped child reads stale"
+    );
+    apply_ordinary_batch(&mut engine, &mut session, Vec::new())
+        .expect("a proven exit after selection ends gracefully");
+    assert!(
+        engine.expected_target_exit(),
+        "the exit finalized: {:?}",
+        engine.retirement_intents
+    );
+    assert!(
+        engine.views.iter().all(|retained| retained.id() != view),
+        "the exited view is gone"
+    );
+    assert!(
+        engine.selection_claims.is_empty(),
+        "the accepted removal retires the selection claims"
+    );
+    assert!(
+        engine.selection_tables.is_empty(),
+        "the accepted removal retires the selection tables"
+    );
+    assert!(
+        engine.loader_registry.ids_for_view(view).is_empty(),
+        "the exited view released its loader contexts"
+    );
+    assert_eq!(
+        engine.plan.active_slot_count(),
+        0,
+        "the ended target retired its slots"
+    );
+    assert!(
+        engine.retirement_intents.is_empty(),
+        "no retirement stays queued: {:?}",
+        engine.retirement_intents
+    );
+}

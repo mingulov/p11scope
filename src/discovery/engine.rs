@@ -11129,7 +11129,22 @@ impl Engine {
         raw_modules: Vec<ScannedModule>,
         skipped: Vec<Skipped>,
     ) -> Result<LiveCandidate> {
-        self.live_candidate_with_pending(pinned, raw_modules, skipped, None)
+        self.live_candidate_with_pending(pinned, raw_modules, skipped, None, &BTreeSet::new())
+    }
+
+    /// The inventory rebuild for a tick that declined some loss reports: a
+    /// declined view is retained but known-stale, so its selection claims
+    /// and tables survive the liveness filter below instead of dropping
+    /// (which would retire their sole-owned endpoints without an accepted
+    /// removal decision).
+    fn live_candidate_with_declined(
+        &mut self,
+        pinned: PinnedObjects,
+        raw_modules: Vec<ScannedModule>,
+        skipped: Vec<Skipped>,
+        declined: &BTreeSet<ProcessViewId>,
+    ) -> Result<LiveCandidate> {
+        self.live_candidate_with_pending(pinned, raw_modules, skipped, None, declined)
     }
 
     fn live_candidate_with_pending(
@@ -11138,6 +11153,7 @@ impl Engine {
         mut raw_modules: Vec<ScannedModule>,
         mut skipped: Vec<Skipped>,
         pending_selection: Option<&SelectionTableKey>,
+        declined: &BTreeSet<ProcessViewId>,
     ) -> Result<LiveCandidate> {
         self.loader_plan_cache = None;
         let merge_head_start = crate::attach::monotonic_ns();
@@ -11299,10 +11315,12 @@ impl Engine {
             let Some(binding) = self.selection_bindings.get(&key.binding_id) else {
                 return false;
             };
-            let live_view = self
-                .views
-                .iter()
-                .any(|view| view.id() == key.view && view.still_the_same());
+            // A declined view is retained but known-stale: its claims
+            // survive like a live view's, or the rebuild below retires
+            // their sole-owned endpoints with no accepted removal.
+            let live_view = self.views.iter().any(|view| {
+                view.id() == key.view && (declined.contains(&key.view) || view.still_the_same())
+            });
             let binding_live = binding.attached
                 && !binding.retired
                 && binding.context.get() == key.context
@@ -11333,15 +11351,14 @@ impl Engine {
         }
         let mut selection_tables = self.selection_tables.clone();
         selection_tables.retain(|key, _| {
-            self.views
-                .iter()
-                .any(|view| view.id() == key.view && view.still_the_same())
-                && modules.iter().any(|module| {
-                    module.scanned.view == key.view
-                        && pinned
-                            .owned_timing_key(module.object)
-                            .is_some_and(|provider| provider == key.provider)
-                })
+            self.views.iter().any(|view| {
+                view.id() == key.view && (declined.contains(&key.view) || view.still_the_same())
+            }) && modules.iter().any(|module| {
+                module.scanned.view == key.view
+                    && pinned
+                        .owned_timing_key(module.object)
+                        .is_some_and(|provider| provider == key.provider)
+            })
         });
         let active_selection_tables = selection_tables_from_claims(&selection_claims);
         for (key, table) in active_selection_tables {
@@ -14472,6 +14489,7 @@ impl Engine {
             raw_modules,
             Vec::new(),
             Some(&selection_admission.key),
+            &BTreeSet::new(),
         );
         self.selection_claims = old_claims;
         self.selection_tables = old_tables;
@@ -18848,6 +18866,7 @@ impl Engine {
         refreshed: &[(ProcessViewId, Vec<ScannedModule>, PinnedObjects)],
         new_views: &[(ProcessView, Vec<ScannedModule>, PinnedObjects)],
         mut skipped: Vec<Skipped>,
+        declined: &BTreeSet<ProcessViewId>,
     ) -> Result<LiveCandidate> {
         let assemble_start = crate::attach::monotonic_ns();
         let refreshed_ids: BTreeSet<_> = refreshed.iter().map(|(view, _, _)| *view).collect();
@@ -18882,7 +18901,8 @@ impl Engine {
             assemble_start,
             crate::attach::monotonic_ns(),
         );
-        let mut candidate = self.live_candidate(candidate_pins, raw_modules, skipped)?;
+        let mut candidate =
+            self.live_candidate_with_declined(candidate_pins, raw_modules, skipped, declined)?;
         candidate
             .views
             .extend(new_views.iter().map(|(view, _, _)| view.id()));
@@ -20098,7 +20118,15 @@ impl Engine {
                     None,
                 ]
             },
-            || self.inventory_candidate(&removed, &refreshed_scans, new_views, skipped.clone()),
+            || {
+                self.inventory_candidate(
+                    &removed,
+                    &refreshed_scans,
+                    new_views,
+                    skipped.clone(),
+                    &declined,
+                )
+            },
         )?;
         let admission_start = crate::attach::monotonic_ns();
         let admission = inventory_admission_observed(
@@ -20375,7 +20403,7 @@ impl Engine {
                     None,
                 ]
             },
-            || self.inventory_candidate(&removed, &refreshed_scans, new_views, skipped),
+            || self.inventory_candidate(&removed, &refreshed_scans, new_views, skipped, &declined),
         )?;
         // Declined views stay in the candidate's pins and modules (the
         // apply carries them over unchanged) but leave its currency set:
@@ -23073,12 +23101,12 @@ mod reexec_diagnostic_evaluation_tests {
                 || {
                     calls.set(calls.get() + 1);
                     before_operation.set(diag.last_record());
-                    engine.inventory_candidate(&removed, &[], &[], vec![])
+                    engine.inventory_candidate(&removed, &[], &[], vec![], &BTreeSet::new())
                 },
             )
             .unwrap();
             let control = Engine::empty()
-                .inventory_candidate(&removed, &[], &[], vec![])
+                .inventory_candidate(&removed, &[], &[], vec![], &BTreeSet::new())
                 .unwrap();
             assert_eq!(calls.get(), 1, "the real assembly must execute once");
             assert_eq!(
@@ -23181,7 +23209,7 @@ mod reexec_diagnostic_evaluation_tests {
                 let removed = BTreeSet::new();
                 let mut engine = Engine::empty();
                 let mut candidate = engine
-                    .inventory_candidate(&removed, &[], &[], vec![])
+                    .inventory_candidate(&removed, &[], &[], vec![], &BTreeSet::new())
                     .unwrap();
                 if stale {
                     candidate.views.insert(ProcessViewId(77));
@@ -23269,7 +23297,7 @@ mod reexec_diagnostic_evaluation_tests {
             },
             || {
                 calls.set(calls.get() + 1);
-                engine.inventory_candidate(&removed, &[], &[], vec![])
+                engine.inventory_candidate(&removed, &[], &[], vec![], &BTreeSet::new())
             },
         )
         .unwrap();

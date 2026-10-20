@@ -2057,7 +2057,7 @@ impl CaptureLane<PidPin> for FacadeLane {
                 presentation,
                 targets,
                 window,
-                |bytes| reserve(bytes),
+                reserve,
             ),
             _ => Err(anyhow!("promotion baselines unavailable")),
         }

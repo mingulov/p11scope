@@ -6944,3 +6944,164 @@ mod d3a_adapter_tests {
         }
     }
 }
+
+/// Privileged kernel-identity cells: real production checks against
+/// the running kernel (never fixtures), classified per release lane.
+#[cfg(test)]
+mod privileged_tests {
+    use super::{
+        IdentityBackend, IdentityBtf, IdentityChecks, IdentityNumbering, IdentityRunShared,
+        IdentityShared, IdentitySummary, IdentityUnavailable, LiveIdentityChecks, PassAttempt,
+        decide_pass_attempt,
+    };
+    use crate::attach::identity_iter::{
+        self, BTF_KIND_ENUM, BTF_KIND_FUNC, TASK_ITER_ATTACH_FUNC, TASK_ITER_TYPE_ENUM,
+        TASK_VMA_INFO_MM_MEMBER, TASK_VMA_INFO_STRUCT,
+    };
+    use crate::cli::IdentityBackendSelection;
+    use std::os::fd::AsFd as _;
+
+    /// The 5.15 identity-denial cell: the real BTF named-fix refusal,
+    /// disclosed through the production sink with zero `bpf()` syscalls.
+    ///
+    /// Dual-outcome by running kernel, never vacuous: on a kernel whose
+    /// BTF lacks the `mm` fix (the 5.15 guest) the direct scan AND the
+    /// live sink must agree on `FixMissing`, the production auto-selection
+    /// path must stay userspace with `fallback: kernel_fix_missing`, and
+    /// the whole path must issue zero `bpf()` syscalls. On an eligible
+    /// kernel the scan AND the sink must agree on success with the same
+    /// zero-syscall selection. Any scan/sink disagreement, any unexpected
+    /// deny arm, or any missing BTF fails loudly: a fabricated or partial
+    /// denial can never print the marker. The release contract classifies
+    /// the marker per lane (denial required on 5.15, eligible elsewhere).
+    /// Run as root with `--ignored`, one test per process.
+    #[test]
+    #[ignore = "privileged: real kernel BTF identity-denial disclosure; lane-classified"]
+    fn privileged_identity_515_denial_is_disclosed() {
+        // Real BTF of the RUNNING kernel: no fixtures, no release strings.
+        let raw = identity_iter::read_vmlinux_btf()
+            .expect("the denial cell needs the running kernel's BTF");
+        let scan_bytes = raw.len();
+        assert!(scan_bytes > 0, "empty BTF proves nothing");
+        let mm_present = identity_iter::btf_has_struct_member(
+            &raw,
+            TASK_VMA_INFO_STRUCT,
+            TASK_VMA_INFO_MM_MEMBER,
+        )
+        .expect("the named-fix fact must scan, not error");
+        let attach = identity_iter::btf_has_named_type(&raw, BTF_KIND_FUNC, TASK_ITER_ATTACH_FUNC)
+            .expect("the attach-func witness must scan, not error");
+        let tasktype = identity_iter::btf_has_named_type(&raw, BTF_KIND_ENUM, TASK_ITER_TYPE_ENUM)
+            .expect("the task-type witness must scan, not error");
+        let direct = identity_iter::check_kernel_identity_btf(&raw);
+
+        // The production auto-selection path with live checks. Numbering
+        // must agree: the cell needs an un-namespaced lane, and a
+        // numbering refusal must never masquerade as the BTF denial.
+        let before = identity_iter::test_bpf_call_count();
+        assert_eq!(
+            LiveIdentityChecks.numbering(),
+            IdentityNumbering::Agree,
+            "the cell needs an un-namespaced lane (numbering must agree)"
+        );
+        let sink = LiveIdentityChecks.btf();
+        let shared: IdentityShared = std::sync::Arc::new(std::sync::Mutex::new(
+            IdentityRunShared::new(IdentityBackendSelection::Auto, Box::new(LiveIdentityChecks)),
+        ));
+        let attempt = decide_pass_attempt(&shared, true);
+        let summary = shared
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .summary();
+        assert_eq!(
+            identity_iter::test_bpf_call_count() - before,
+            0,
+            "selection must issue zero bpf() syscalls"
+        );
+
+        match (&direct, sink) {
+            (Err(identity_iter::KernelDeny::FixMissing), IdentityBtf::FixMissing) => {
+                assert!(
+                    !mm_present,
+                    "a FixMissing denial requires the mm member absent"
+                );
+                assert!(
+                    matches!(attempt, PassAttempt::Userspace),
+                    "denial must stay on the userspace attempt"
+                );
+                assert_eq!(
+                    summary,
+                    IdentitySummary {
+                        backend: IdentityBackend::Userspace,
+                        fallback: Some("kernel_fix_missing".to_string()),
+                    },
+                    "denial must disclose the finite fallback label"
+                );
+                assert_eq!(
+                    IdentityUnavailable::from_kernel_deny(identity_iter::KernelDeny::FixMissing)
+                        .label(),
+                    "kernel_fix_missing"
+                );
+                assert_eq!(
+                    summary.json(),
+                    serde_json::json!({
+                        "backend": "userspace",
+                        "fallback": "kernel_fix_missing",
+                    }),
+                    "observation.identity carries backend + fallback only"
+                );
+                eprintln!(
+                    "IDENTITY_515_DENIAL outcome=denied reason=kernel_fix_missing \
+                     mm_present=false attach={attach} tasktype={tasktype} \
+                     bpf_delta=0 scan_bytes={scan_bytes} fallback=kernel_fix_missing"
+                );
+            }
+            (Ok(_), IdentityBtf::Ok) => {
+                assert!(
+                    mm_present,
+                    "an eligible scan requires the mm member present"
+                );
+                assert!(
+                    matches!(attempt, PassAttempt::Kernel { .. }),
+                    "eligibility must reach the kernel attempt"
+                );
+                assert_eq!(
+                    summary,
+                    IdentitySummary {
+                        backend: IdentityBackend::Userspace,
+                        fallback: None,
+                    },
+                    "unresolved auto selection discloses no fallback"
+                );
+                eprintln!(
+                    "IDENTITY_515_DENIAL outcome=eligible mm_present=true \
+                     attach={attach} tasktype={tasktype} bpf_delta=0 \
+                     scan_bytes={scan_bytes} sink=ok"
+                );
+            }
+            (direct, sink) => {
+                let direct = match direct {
+                    Ok(_) => "eligible".to_string(),
+                    Err(deny) => format!("denied:{}", deny.label()),
+                };
+                panic!(
+                    "direct scan ({direct}) and live sink ({sink:?}) disagree: \
+                     fabricated or partial denial"
+                );
+            }
+        }
+
+        // Seam-liveness control: one real failing probe advances the
+        // counter by exactly one (single-test process, no concurrency).
+        let null = std::fs::File::open("/dev/null").expect("open /dev/null");
+        assert!(
+            identity_iter::link_create_task_vma(null.as_fd(), None).is_err(),
+            "link create on /dev/null must fail"
+        );
+        assert_eq!(
+            identity_iter::test_bpf_call_count() - before,
+            1,
+            "the seam must observe exactly one attempted syscall"
+        );
+    }
+}

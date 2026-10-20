@@ -748,11 +748,15 @@ Limits that matter in pods:
   document
   (see `docs/schema/inventory-v1.md`) instead of the text summary; `-o
   <out.json>` writes that document atomically (and refuses `-o -`: the
-  report requires a file). `--dashboard` runs the live read-only
-  dashboard on stdout when it is a terminal (scrollable edge table with
+  report requires a file). `--dashboard` runs the live dashboard on
+  stdout when it is a terminal (scrollable edge table with
   presence/capture/activity states, coverage header, bounded log tail;
   `j`/`k` scroll, `tab` cycles summary/evidence/gaps, `q` quits, and
-  `--duration` bounds the run). At 40x10, the compact summary keeps an
+  `--duration` bounds the run). `d` requests Detailed capture for the
+  selected caller/provider pair and `x` cancels outstanding promotion
+  work; both need a fully drawn frame and refuse honestly (stale view,
+  busy, unsupported scope or scan-only run) without disturbing the
+  capture. At 40x10, the compact summary keeps an
   executable/module pair, their IDs and observation meaning visible;
   scrolling reaches later associations while totals still cover the whole
   capture. Enlarge the terminal to see the fuller state and evidence view.

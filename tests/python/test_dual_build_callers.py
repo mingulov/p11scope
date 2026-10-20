@@ -243,8 +243,9 @@ class DualBuildCallerTests(unittest.TestCase):
         if child.name == "verify-attach-e2e.sh":
             return [prefix + ["--release", "--workspace", "--target-dir", str(self.work / "build")]]
         rows = [
-            prefix + ["--release", "--workspace", "--target-dir", str(self.work / "default-build")],
-            prefix + ["--release", "--workspace", "--features", "unsafe-unvalidated-metadata",
+            prefix + ["--release", "--workspace", "--features", "stub-object-attributes",
+                      "--target-dir", str(self.work / "default-build")],
+            prefix + ["--release", "--workspace", "--features", "unsafe-unvalidated-metadata,stub-object-attributes",
                       "--target-dir", str(self.work / "feature-build")],
         ]
         if bits == 32:

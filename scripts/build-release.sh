@@ -750,6 +750,7 @@ RUSTC="$T4_TOOLCHAIN_RUSTC" \
 P11SCOPE_PREPARED_BPF_CARGO="$t4_nightly_cargo" \
 P11SCOPE_PREPARED_BPF_RUSTC="$t4_nightly_rustc" \
     "$T4_TOOLCHAIN_CARGO" build --locked --offline --release --no-default-features \
+        --features stub-object-attributes \
         --target x86_64-unknown-linux-musl --bin p11scope
 P11SCOPE_STATIC=$OFFICIAL_TARGET/x86_64-unknown-linux-musl/release/p11scope
 

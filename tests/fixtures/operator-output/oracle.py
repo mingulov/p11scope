@@ -8,6 +8,7 @@ import runpy
 
 ROOT = Path(__file__).resolve().parents[3]
 TRACE = runpy.run_path(str(ROOT / 'scripts/cgroup-trace-oracle.py'))
+BLOCKED = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/blocked_stderr.py'))
 LOSS = re.compile(r'LOST ([1-9][0-9]*) events')
 
 
@@ -173,7 +174,7 @@ def evaluate(trace, stdout, ledger, receipt):
             errors.append('unsignalled control received a signal')
         if cancel == 'midfinal' and not receipt['terminal_observed_alive']:
             unavailable.append('mid-final delivery window was not observed while observer lived')
-        if cancel != 'none':
+        if cancel != 'none' and not receipt.get('stderr_blocked'):
             if not receipt['signals']:
                 unavailable.append('requested signal was not delivered to a live owned observer')
             elif receipt['cancellation_ack_ns'] is None:
@@ -184,7 +185,11 @@ def evaluate(trace, stdout, ledger, receipt):
                 if not 0 <= latency < 0.1:
                     errors.append('observed cancellation acknowledgement missed the separate<100ms target')
         if receipt.get('stderr_blocked'):
-            unavailable.append('blocked stderr cannot measure acknowledgement through that same channel')
+            blocked_errors, blocked_unavailable, blocked_latency = BLOCKED['verdict'](receipt)
+            errors.extend(blocked_errors)
+            unavailable.extend(blocked_unavailable)
+            if blocked_latency is not None:
+                result['cancellation_response_seconds'] = blocked_latency
     except (ValueError, TypeError, KeyError, UnicodeError) as error:
         errors.append(f'invalid qualification input: {error}')
     result.pop('pass_')

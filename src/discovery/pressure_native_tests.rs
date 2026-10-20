@@ -37,6 +37,15 @@
 //!   separately declared all-blocked/N+1 twin: exactly one head refusal,
 //!   sticky loss, FIFO progress, and a batch no strict lossless verdict
 //!   can pass. No capacity reset.
+//! - `pressure_live256_unparked_head_control_admits` (privileged): the
+//!   twin's fullness control. The identical arming with an empty request
+//!   map admits the same head with zero loss, proving the refusal pins
+//!   the full blocked map rather than the head.
+//! - `pressure_all_blocked_fail_control_selects_eligible` (unprivileged,
+//!   deterministic): the twin's blockedness fail-control. The twin's exact
+//!   map shape minus the live contexts selects an eligible entry instead
+//!   of refusing, proving the refusal pins per-entry blockedness: break
+//!   the all-blocked precondition and the verdict flips.
 //!
 //! FIFO/ages/serials preservation *across service opportunities* stays
 //! pinned by the deterministic unit mechanism tests in `engine_tests.rs`
@@ -64,6 +73,7 @@ use crate::discovery::identity::PinnedObjectId;
 use crate::discovery::loader::{LoaderContextSpec, MAX_LOADER_CONTEXTS};
 use crate::discovery::scheduler::MAX_PENDING_REFRESH;
 use crate::process::ProcessView;
+use p11scope_ebpf_common::DISCOVERY_POINTERS;
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -1392,6 +1402,32 @@ fn assert_no_episode_loss(engine: &Engine, what: &str) {
 
 /// Resolve the live view position for an owned pid, fresh on every call
 /// (arming may reshape the view list, so positions never persist).
+/// One-line live census for the twin/control phase boundaries: total
+/// views, owned views, minted loader ids (count plus any missing from
+/// 1..=256), ambient views, queued retirements and exploratory evictions.
+fn twin_census(engine: &Engine, owned: &BTreeSet<u32>, tag: &str, what: &str) {
+    let minted = minted_ids(engine);
+    let missing: Vec<u16> = (1..=256).filter(|id| !minted.contains(id)).collect();
+    let owned_views = engine
+        .views
+        .iter()
+        .filter(|view| owned.contains(&view.pid()))
+        .count();
+    let ambient_views = engine.views.len().saturating_sub(owned_views);
+    println!(
+        "t8: {what}: census {tag}: views={} owned_views={} ambient_views={} minted={} missing={:?} retire_intents={} pending_retire={} explore_evict={} truncated={}",
+        engine.views.len(),
+        owned_views,
+        ambient_views,
+        minted.len(),
+        missing,
+        engine.retirement_intents.len(),
+        engine.pending_retirements.len(),
+        engine.exploratory_evictions,
+        engine.discovery_truncated
+    );
+}
+
 fn live_position(engine: &Engine, pid: u32, what: &str) -> usize {
     engine
         .views
@@ -2299,16 +2335,156 @@ fn pressure_live256_genuine_episode_admits_late_then_head() {
     );
 }
 
-/// The separately declared all-blocked/N+1 twin: 256 retained
-/// obligations plus a genuine fresh head must produce exactly one head
-/// refusal, sticky explicit loss, continued FIFO progress and a batch
-/// no strict lossless verdict can pass. No capacity reset: all 256
-/// contexts survive with their views live and no retirement queued.
+/// The all-blocked fail-control (deterministic, unprivileged): the
+/// twin's exact map shape — 256 consumed requests through the same
+/// `request_refresh_consumed` seam — minus the live contexts. With
+/// blocking broken (no view holds a loader context anywhere), the held
+/// head's episode must SELECT an eligible entry instead of ruling the
+/// snapshot out: the lowest-pid entry is selected, nothing is ruled out
+/// without an attempt, and no refusal is recorded. This proves the
+/// twin's refusal pins per-entry blockedness: make every entry eligible
+/// and the verdict flips from refuse-once to select. The mirror half
+/// (all entries ineligible, no selection, refused once) stays pinned by
+/// the deterministic unit twin and the live twin on genuine records.
+/// No capture runs here: selection reads only the request map, the view
+/// list and the loader registry, so an empty engine plus the seam-fed
+/// map is the whole precondition. The head record is synthesized (this
+/// is not the live path) and carries only the fields the episode and
+/// protection readers consult.
+#[test]
+fn pressure_all_blocked_fail_control_selects_eligible() {
+    const WHAT: &str = "t8-fail-control";
+    let mut engine = Engine::empty();
+    assert!(
+        engine.views.is_empty(),
+        "{WHAT}: the fail-control starts viewless"
+    );
+    assert!(
+        minted_ids(&engine).is_empty(),
+        "{WHAT}: the fail-control mints nothing"
+    );
+    for offset in 0..MAX_PENDING_REFRESH {
+        let pid = 4_000_000 + offset as u32;
+        assert!(
+            engine.request_refresh_consumed(pid, Some(1_000 + offset as u64)),
+            "{WHAT}: request {offset} consumes"
+        );
+    }
+    assert_eq!(
+        engine.refresh_requested.len(),
+        MAX_PENDING_REFRESH,
+        "{WHAT}: the map is full"
+    );
+    assert!(
+        engine
+            .refresh_requested
+            .values()
+            .all(|request| request.owner.is_none()),
+        "{WHAT}: every entry is ownerless (blocking broken)"
+    );
+    let head_pid = 6_000_000u32;
+    let head = QueuedDiscoveryRecord {
+        record: DiscoveryRecord {
+            hook_ts_ns: u64::MAX,
+            pid_tgid: (u64::from(head_pid) << 32) | u64::from(head_pid),
+            table_ptr: 0,
+            interface_flags: 0,
+            pointers: [0; DISCOVERY_POINTERS],
+            kind: DISCOVERY_KIND_EXEC,
+            case_id: 0,
+            interface_index: 0,
+            name_class: 0,
+            status_flags: 0,
+            usable_n: 0,
+            pointers_attempted: 0,
+            completed_prefix: 0,
+            version_major: 0,
+            version_minor: 0,
+            selection_version_class: 0,
+            reserved_zero: [0; 1],
+            symbol_id: 0,
+            announced_count: 0,
+            reserved_tail_zero: [0; 4],
+            send_signal_rc: 0,
+            return_rv: 0,
+            request_flags: 0,
+            binding_id: 0,
+        },
+        terminal_owner: None,
+        terminal_exports: Vec::new(),
+    };
+    engine.pressure_episode_begin(&head);
+    let episode = engine
+        .pressure_episode
+        .as_ref()
+        .expect("{WHAT}: the held head opens an episode");
+    assert_eq!(
+        episode.snapshot.len(),
+        MAX_PENDING_REFRESH,
+        "{WHAT}: the episode snapshots the full map"
+    );
+    let protection = engine.pressure_protection_for(std::slice::from_ref(&head), &[]);
+    assert!(
+        !protection.block_all,
+        "{WHAT}: a plain EXEC head narrows its protection"
+    );
+    let selection = engine
+        .pressure_select_next(&protection)
+        .expect("{WHAT}: an eligible entry is selected (blocking broken)");
+    assert_eq!(
+        selection.pid, 4_000_000,
+        "{WHAT}: selection takes the lowest eligible pid"
+    );
+    assert!(
+        engine
+            .pressure_episode
+            .as_ref()
+            .is_some_and(|episode| episode.ruled_out.is_empty()),
+        "{WHAT}: nothing is ruled out without an attempt"
+    );
+    assert_eq!(
+        engine.discovery_truncated, 0,
+        "{WHAT}: no refusal without all-blocked"
+    );
+    assert_eq!(
+        engine.newcomer_ages.dropped_unknown, 0,
+        "{WHAT}: no dropped newcomer without all-blocked"
+    );
+}
+
+/// The separately declared all-blocked/N+1 twin: a TRUE live
+/// all-blocked episode in two phases, mirroring the deterministic unit
+/// twin `pressure_all_blocked_fifo_refuses_once_then_advances` on genuine
+/// records. Phase 1 arms 256 retained obligations via burst 1 plus a full
+/// settle (exactly 256 arms, tickets 1..=256, zero loss; the map fills
+/// to exactly 256 owned keys with no 257th owned arrival). Phase 2 refills
+/// the request map through the same `request_refresh_consumed` seam the
+/// unit twin uses — the obligations are genuinely live (real pids, real
+/// views, real loader contexts from a real settled capture) — then parks
+/// a genuine fresh-EXEC head against the full blocked map. Every queued
+/// request is ineligible (its owner holds a live loader context), so the
+/// head is refused exactly once with sticky explicit loss, zero safe
+/// scans and zero selection attempts. No capacity reset at the refusal:
+/// all 256 contexts survive identical, views stay live, no retirements
+/// queued. The suffix then advances through ordinary service (FIFO
+/// progress): a bounded run of forced full ticks retires the serviced
+/// prefix, so minted contexts drain monotonically and scan work grows.
+/// Neither map convergence nor rearm is pinned there: at live-256 the
+/// post-retirement rescan systematically defers behind the tick quantum
+/// (the initial scan phase consumes it scan-until-expiry over the 256
+/// refreshed views, and retirement detaches add wall-time, so every
+/// refilled request is retained while its contexts retire), and rearm is
+/// additionally impossible because phase 1 spent the 256
+/// capture-lifetime loader IDs. Only progress and the sticky loss are
+/// pinned, so any strict lossless verdict over this batch must fail.
 /// Own episode, own capture, fresh ticket budget.
 ///
-/// Known limit: same lane-A view-capacity stall as the positive episode
-/// (identical pre-settle shape); the post-settle refusal asserts are
-/// unreachable until the runtime fix lands. Repro preserved.
+/// The pre-twin shape (257 genuine EXECs in one batch, head last) is NOT
+/// all-blocked: it converges to admitted-head under any working fix, so
+/// its refusal asserts encoded the lane-A stall. That shape is preserved
+/// as the `pressure_live256_unparked_head_control_admits` control, which
+/// proves the refusal pins the all-blocked precondition: without the full
+/// blocked map the same head is admitted with zero loss.
 #[test]
 #[ignore = "privileged: live BPF all-blocked negative twin; run as root with --ignored --test-threads=1 under the privileged lane"]
 fn pressure_live256_all_blocked_twin_refuses_once() {
@@ -2322,27 +2498,27 @@ fn pressure_live256_all_blocked_twin_refuses_once() {
     let hints = vec![fixtures.early.clone()];
     let (mut engine, mut session) = start_live_system_capture(hints, WHAT);
 
+    // Phase 1: 256 retained provider children, no head yet. Release 1
+    // warms every provider table (cold tables publish nothing) and ledgers
+    // the old independent calls.
     let mut population =
         Population::spawn_on(fixtures, 256, LIVE_REPEAT, false, false, Some(LIVE_REPEAT2));
     assert_eq!(population.children.len(), 256);
-    std::thread::sleep(Duration::from_millis(500));
-    let head_pid = population.spawn_head(WHAT);
-    let owned = population.pids();
-    assert_eq!(owned.len(), 257);
     assert_eq!(
         engine.loader_arms, 0,
         "{WHAT}: no arming before the first drain"
     );
-
-    // Release 1 first: burst 1 warms every provider table (cold tables
-    // publish nothing) and ledgers the old independent calls.
     population.release_and_wait_ledgers();
+    let owned: BTreeSet<u32> = population.pids();
+    assert_eq!(owned.len(), 256);
 
+    // Burst 1 must be pure-owned: any ambient EXEC would park against the
+    // filling map and spend work the armed checkpoint forbids.
     let serial_before = engine.last_refresh_serial;
     let (records, malformed, _) = engine
         .collect_frame_discovery(&mut session)
-        .unwrap_or_else(|error| panic!("{WHAT}: burst collect failed: {error:#}"));
-    assert_eq!(malformed, 0, "{WHAT}: the burst batch must be clean");
+        .unwrap_or_else(|error| panic!("{WHAT}: burst 1 collect failed: {error:#}"));
+    assert_eq!(malformed, 0, "{WHAT}: the burst 1 batch must be clean");
     let owned_execs: BTreeMap<u32, u64> = records
         .iter()
         .filter(|record| record.kind == DISCOVERY_KIND_EXEC && owned.contains(&record_pid(record)))
@@ -2356,23 +2532,195 @@ fn pressure_live256_all_blocked_twin_refuses_once() {
     let ambient_execs = ambient_exec_pids(&records, &owned);
     assert!(
         ambient_execs.is_empty(),
-        "{WHAT}: REFUSED: ambient EXECs in the burst batch ({ambient_execs:?}); rerun in a quiet window"
+        "{WHAT}: REFUSED: ambient EXECs in the burst 1 batch ({ambient_execs:?}); rerun in a quiet window"
     );
-    assert_eq!(
-        owned_execs[&head_pid],
-        *owned_execs.values().max().unwrap(),
-        "{WHAT}: REFUSED: the head EXEC is not last by hook clock; rerun"
+    println!(
+        "t8: {WHAT}: burst 1 collected: {} records, 256 owned EXECs",
+        records.len()
     );
 
     engine
         .apply_discovery_batch(&mut session, records, malformed)
-        .unwrap_or_else(|error| panic!("{WHAT}: burst apply failed: {error:#}"));
-    let settle = settle_live_episode(&mut engine, &mut session, &owned, WHAT);
-    population.release2_and_wait_ledgers(WHAT);
+        .unwrap_or_else(|error| panic!("{WHAT}: burst 1 apply failed: {error:#}"));
+    let settle1 = settle_live_episode(&mut engine, &mut session, &owned, WHAT);
+
+    // The armed checkpoint: 256 live obligations, exactly 256 arms, zero
+    // loss. Passes and attempts are observations only here: a provider-free
+    // ambient EXEC during the full-map window parks and is serviced
+    // without arming (the positive tolerates the same), so only the
+    // refusal's own deltas pin zero transactions/attempts.
+    assert_eq!(engine.loader_arms, 256, "{WHAT}: exactly 256 arm attempts");
+    assert_eq!(
+        minted_ids(&engine),
+        (1..=256).collect::<BTreeSet<_>>(),
+        "{WHAT}: tickets 1..=256"
+    );
+    assert_no_ambient_arms(&engine, &owned, WHAT);
+    assert_no_episode_loss(&engine, WHAT);
+    println!(
+        "t8: {WHAT}: armed checkpoint: passes={} attempts={} arms={} scans={}",
+        engine.pressure_service_passes,
+        engine.pressure_attempts,
+        engine.loader_arms,
+        engine.deep_scans
+    );
+    assert!(
+        engine.exec_rearm_views.is_empty(),
+        "{WHAT}: no rearm markers before the refusal"
+    );
+    assert!(
+        engine.retirement_intents.is_empty(),
+        "{WHAT}: arming queues no retirements"
+    );
+    let armed_views = engine
+        .views
+        .iter()
+        .filter(|view| owned.contains(&view.pid()))
+        .count();
+    assert_eq!(armed_views, 256, "{WHAT}: 256 live armed views");
+    for view in &engine.views {
+        if owned.contains(&view.pid()) {
+            assert!(
+                view.still_the_same(),
+                "{WHAT}: armed pid {} stays live",
+                view.pid()
+            );
+        }
+    }
+    let contexts_before: BTreeMap<u32, Vec<u16>> = engine
+        .views
+        .iter()
+        .filter(|view| owned.contains(&view.pid()))
+        .map(|view| {
+            (
+                view.pid(),
+                engine
+                    .loader_registry
+                    .ids_for_view(view.id())
+                    .iter()
+                    .map(|id| id.get())
+                    .collect(),
+            )
+        })
+        .collect();
+    assert_eq!(contexts_before.len(), 256, "{WHAT}: 256 armed obligations");
+    assert!(
+        contexts_before.values().all(|ids| ids.len() == 1),
+        "{WHAT}: one live obligation per armed pid"
+    );
+    twin_census(&engine, &owned, "armed", WHAT);
+
+    // One extra drain+service tick for lagging ambient: the refill needs
+    // an empty map, and an ambient request dispatched in the settle's last
+    // drain may still need one service. A lingering ambient request would
+    // either refuse an owned refill (corrupting the exactly-once refusal)
+    // or sit in the snapshot as an unblocked candidate (breaking
+    // all-blocked for real), so anything more than one tick of lag —
+    // residue or fresh loss — refuses the cell. No extended drain loop: on
+    // a noisy host extra drains only extend storm exposure.
     engine
-        .drain_discovery(&mut session)
-        .expect("post-admission drain");
-    let _post_settle = settle_live_episode(&mut engine, &mut session, &owned, WHAT);
+        .drain_discovery_shallow(&mut session, false)
+        .unwrap_or_else(|error| panic!("{WHAT}: lag drain failed: {error:#}"));
+    engine
+        .service_backlog_quantum(&mut session)
+        .unwrap_or_else(|error| panic!("{WHAT}: lag service failed: {error:#}"));
+    assert_eq!(
+        engine.discovery_truncated, 0,
+        "{WHAT}: REFUSED: fresh loss in the seam window (truncated={}); rerun in a quiet window",
+        engine.discovery_truncated
+    );
+    assert!(
+        engine.refresh_requested.is_empty(),
+        "{WHAT}: REFUSED: ambient residue in the map ({} keys: {:?}); rerun in a quiet window",
+        engine.refresh_requested.len(),
+        engine.refresh_requested.keys().take(8).collect::<Vec<_>>()
+    );
+    twin_census(&engine, &owned, "lagged", WHAT);
+
+    // Phase 2: refill the request map through the same consumed-request
+    // seam the unit twin uses. The obligations are genuinely live: real
+    // pids, real views, real loader contexts from the settled capture.
+    for pid in &owned {
+        assert!(
+            engine.request_refresh_consumed(*pid, crate::attach::monotonic_ns()),
+            "{WHAT}: request for armed pid {pid} consumes"
+        );
+    }
+    assert_eq!(
+        engine.refresh_requested.len(),
+        256,
+        "{WHAT}: the map is full of live obligations"
+    );
+
+    // The fresh head parks against the full blocked map. Its batch must
+    // hold no other request-creating arrival: at a full blocked map any
+    // unknown-pid consumed record would corrupt the exactly-once refusal.
+    let head_pid = population.spawn_head(WHAT);
+    let owned2 = population.pids();
+    assert_eq!(owned2.len(), 257);
+    let (head_records, head_malformed, _) = engine
+        .collect_frame_discovery(&mut session)
+        .unwrap_or_else(|error| panic!("{WHAT}: head collect failed: {error:#}"));
+    assert_eq!(head_malformed, 0, "{WHAT}: the head batch must be clean");
+    let head_execs: Vec<u64> = head_records
+        .iter()
+        .filter(|record| record.kind == DISCOVERY_KIND_EXEC && record_pid(record) == head_pid)
+        .map(|record| record.hook_ts_ns)
+        .collect();
+    assert_eq!(
+        head_execs.len(),
+        1,
+        "{WHAT}: the head produced exactly one genuine EXEC"
+    );
+    let head_ambient = ambient_exec_pids(&head_records, &owned2);
+    assert!(
+        head_ambient.is_empty(),
+        "{WHAT}: REFUSED: ambient EXECs in the head batch ({head_ambient:?}); rerun in a quiet window"
+    );
+    let foreign: BTreeSet<u32> = head_records
+        .iter()
+        .map(record_pid)
+        .filter(|pid| !owned2.contains(pid))
+        .collect();
+    assert!(
+        foreign.is_empty(),
+        "{WHAT}: REFUSED: foreign records in the head batch ({foreign:?}); rerun in a quiet window"
+    );
+    println!(
+        "t8: {WHAT}: head batch collected: {} records, head EXEC present",
+        head_records.len()
+    );
+
+    // Dispatch the head batch DIRECTLY through the production dispatch,
+    // exactly as the unit twin does: the apply wrapper's trailing
+    // inventory tick would begin FIFO service (retire churn) before the
+    // refusal is observed. No nested ring pull can run here: with
+    // every candidate blocked, no service pass runs to invoke the
+    // collector, so the batch in hand is the whole input.
+    let passes_before_dispatch = engine.pressure_service_passes;
+    let attempts_before_dispatch = engine.pressure_attempts;
+    let scans_before_dispatch = engine.deep_scans;
+    let mut queued: Vec<QueuedDiscoveryRecord> = head_records
+        .into_iter()
+        .map(|record| QueuedDiscoveryRecord {
+            record,
+            terminal_owner: None,
+            terminal_exports: Vec::new(),
+        })
+        .collect();
+    let mut collect = Engine::collect_discovery_records;
+    engine
+        .process_discovery_records(
+            &mut session,
+            &mut queued,
+            &mut PendingViewRetirements::new(),
+            &mut true,
+            &mut collect,
+            &mut PauseClosure::new(true),
+        )
+        .unwrap_or_else(|error| panic!("{WHAT}: head dispatch failed: {error:#}"));
+    assert!(queued.is_empty(), "{WHAT}: the head batch fully dispatches");
+    twin_census(&engine, &owned2, "dispatched", WHAT);
 
     // The twin predicates, mirroring the unit twin on genuine records.
     assert_eq!(
@@ -2398,19 +2746,46 @@ fn pressure_live256_all_blocked_twin_refuses_once() {
         engine.counters.object_skips
     );
     assert_eq!(
-        engine.pressure_attempts, 0,
+        engine.deep_scans, scans_before_dispatch,
+        "{WHAT}: the all-blocked refusal runs zero safe scans"
+    );
+    assert_eq!(
+        engine.pressure_attempts, attempts_before_dispatch,
         "{WHAT}: no selection was ever attempted"
     );
+    assert_eq!(
+        engine.pressure_service_passes, passes_before_dispatch,
+        "{WHAT}: the refusal runs no service transaction"
+    );
     // No capacity reset: every obligation survives identical.
-    assert_eq!(engine.loader_arms, 256, "{WHAT}: exactly 256 arm attempts");
     assert_eq!(
         minted_ids(&engine),
         (1..=256).collect::<BTreeSet<_>>(),
         "{WHAT}: all 256 contexts survive"
     );
-    assert_no_ambient_arms(&engine, &owned, WHAT);
+    let contexts_after: BTreeMap<u32, Vec<u16>> = engine
+        .views
+        .iter()
+        .filter(|view| owned.contains(&view.pid()))
+        .map(|view| {
+            (
+                view.pid(),
+                engine
+                    .loader_registry
+                    .ids_for_view(view.id())
+                    .iter()
+                    .map(|id| id.get())
+                    .collect(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        contexts_after, contexts_before,
+        "{WHAT}: all 256 live contexts survive the refusal identical"
+    );
+    assert_no_ambient_arms(&engine, &owned2, WHAT);
     for view in &engine.views {
-        if owned.contains(&view.pid()) && view.pid() != head_pid {
+        if owned.contains(&view.pid()) {
             assert!(
                 view.still_the_same(),
                 "{WHAT}: retained pid {} stays live",
@@ -2422,20 +2797,106 @@ fn pressure_live256_all_blocked_twin_refuses_once() {
         engine.retirement_intents.is_empty(),
         "{WHAT}: the blocked pass queues no retirements"
     );
+
+    // FIFO progress through ordinary service, driven deterministically:
+    // a bounded run of forced full ticks. The force flag only runs the
+    // production drain+tick when the ring is idle; the tick itself is
+    // ordinary service (enumerate, scan, retire, rescan, rearm), the same
+    // tick ambient bursts would trigger, minus storm-timing flakiness.
+    //
+    // Only progress and sticky loss are pinned here. The map is
+    // deliberately NOT pinned empty: at live-256 the post-retirement
+    // rescan systematically defers (the initial scan phase consumes the
+    // tick quantum scan-until-expiry over the 256 refreshed views, and
+    // retirement detaches add wall-time, so refilled requests are
+    // retained while their contexts retire), and rearm is additionally
+    // impossible because phase 1 spent the 256 capture-lifetime loader
+    // IDs. The deterministic unit twin drains because its harness never
+    // expires the quantum; requiring convergence here pinned an
+    // unachievable state (0 of 256 refilled requests completed in 137s
+    // of ambient settling while 170 contexts retired). Progress is the
+    // serviced prefix advancing: each running tick scans and retires its
+    // next quantum-bound prefix, so minted contexts drain monotonically
+    // and scan work grows.
+    let minted_before_suffix = minted_ids(&engine).len();
+    assert_eq!(
+        minted_before_suffix, 256,
+        "{WHAT}: the suffix starts with all 256 obligations live"
+    );
+    let scans_before_suffix = engine.deep_scans;
+    let mut minted_floor = minted_before_suffix;
+    for tick in 0..8u32 {
+        engine
+            .drain_discovery_shallow(&mut session, true)
+            .unwrap_or_else(|error| panic!("{WHAT}: suffix drain {tick} failed: {error:#}"));
+        engine
+            .service_backlog_quantum(&mut session)
+            .unwrap_or_else(|error| panic!("{WHAT}: suffix service {tick} failed: {error:#}"));
+        let minted_now = minted_ids(&engine).len();
+        assert!(
+            minted_now <= minted_floor,
+            "{WHAT}: service never un-retires (tick {tick}: {minted_now} > {minted_floor})"
+        );
+        minted_floor = minted_now;
+        println!(
+            "t8: {WHAT}: suffix tick {tick}: map={} minted={minted_now} scans={} truncated={} dropped={}",
+            engine.refresh_requested.len(),
+            engine.deep_scans,
+            engine.discovery_truncated,
+            engine.newcomer_ages.dropped_unknown
+        );
+    }
     assert!(
-        !engine
-            .refresh_requested
-            .keys()
-            .any(|pid| owned.contains(pid)),
-        "{WHAT}: the suffix advanced and serviced (FIFO progress)"
+        minted_floor < minted_before_suffix,
+        "{WHAT}: the suffix retired obligations through ordinary service (FIFO progress)"
+    );
+    assert!(
+        engine.deep_scans > scans_before_suffix,
+        "{WHAT}: the suffix performed scan work"
     );
     // The loss is sticky: later service never erases it, so any strict
-    // lossless verdict over this batch must fail.
-    assert_eq!(
-        engine.discovery_truncated, 1,
+    // lossless verdict over this batch must fail. The counts are lower
+    // bounds, not exact: ambient newcomers arriving during the suffix at
+    // the full blocked map are genuinely refused too, so a stormy host
+    // adds refusals past the head's one. The exact-once pin stands above,
+    // taken before the suffix ran.
+    assert!(
+        engine.discovery_truncated >= 1,
         "{WHAT}: the historical loss survives service"
     );
+    assert!(
+        engine.newcomer_ages.dropped_unknown >= 1,
+        "{WHAT}: the refused head keeps explicit dropped-age evidence"
+    );
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.subject == "live discovery refresh"
+                && skip.reason.contains("exceeded the bounded pending queue")),
+        "{WHAT}: the refusal's explicit loss entry persists: {:?}",
+        engine.counters.object_skips
+    );
+    assert_no_ambient_arms(&engine, &owned2, WHAT);
+    for view in &engine.views {
+        if owned2.contains(&view.pid()) {
+            assert!(
+                view.still_the_same(),
+                "{WHAT}: serviced pid {} stays live",
+                view.pid()
+            );
+        }
+    }
 
+    // Burst 2 ledgers post-admission independent calls; both bursts stay
+    // complete and honest per child. No convergence settle follows: the
+    // refilled map is not pinned empty (see the suffix above), so the
+    // post drain only pulls ring leftovers before the ledger join.
+    population.release2_and_wait_ledgers(WHAT);
+    engine
+        .drain_discovery(&mut session)
+        .expect("post-admission drain");
     for child in &population.children {
         if child.role == "head" {
             continue;
@@ -2454,14 +2915,268 @@ fn pressure_live256_all_blocked_twin_refuses_once() {
         );
     }
     let serial_delta = engine.last_refresh_serial.saturating_sub(serial_before);
+    let passes_end = engine.pressure_service_passes;
+    let attempts_end = engine.pressure_attempts;
+    let arms_end = engine.loader_arms;
     population.terminate_all(WHAT, &|_| 0);
     drop(session);
     drop(engine);
     let fds_end = fd_count();
     println!(
-        "t8: twin: PASS: 1 refusal, sticky loss, FIFO progress, 256 contexts survive; serial_delta={serial_delta} ticks={} inter_drain_max={:?} wall={:?} VmHWM={}KiB fds {fds_start}->{fds_end} cpu={} jiffies",
-        settle.ticks,
-        settle.inter_drain_max,
+        "t8: twin: PASS: 1 refusal, sticky loss, FIFO progress (minted 256->{minted_floor}), 256 contexts survive refusal; serial_delta={serial_delta} arm_ticks={} suffix_ticks=8 passes={passes_end} attempts={attempts_end} arms={arms_end} inter_drain_max={:?} wall={:?} VmHWM={}KiB fds {fds_start}->{fds_end} cpu={} jiffies",
+        settle1.ticks,
+        settle1.inter_drain_max,
+        wall_start.elapsed(),
+        vm_hwm_kb(),
+        self_cpu_jiffies().saturating_sub(cpu_start)
+    );
+}
+
+/// The unparked-head control for the all-blocked twin: the identical
+/// phase-1 arming (256 obligations, 256 arms, zero loss, never parked),
+/// but the fresh head arrives against an EMPTY map (no refilled
+/// requests), so it never parks, is never refused, and is admitted with
+/// zero loss while consuming no loader ticket (provider-free views stay
+/// unarmed). This control proves the twin's refusal pins the all-blocked
+/// precondition: break the full blocked map and the same head is
+/// admitted, not refused. Release 2, the post drain and the LEDGER checks
+/// match the twin (the control's small map additionally settles, which
+/// the twin's full map structurally cannot), so the request-map refill
+/// is the only variable.
+#[test]
+#[ignore = "privileged: live BPF unparked-head control; run as root with --ignored --test-threads=1 under the privileged lane"]
+fn pressure_live256_unparked_head_control_admits() {
+    const WHAT: &str = "t8-unparked";
+    assert_privileged_lane(WHAT);
+    let wall_start = Instant::now();
+    let cpu_start = self_cpu_jiffies();
+    let fds_start = fd_count();
+
+    let fixtures = FixtureBuild::compile_all("unparked");
+    let hints = vec![fixtures.early.clone()];
+    let (mut engine, mut session) = start_live_system_capture(hints, WHAT);
+
+    // Phase 1, identical to the twin: 256 retained provider children, no
+    // head yet; release 1 warms every provider table and ledgers burst 1.
+    let mut population =
+        Population::spawn_on(fixtures, 256, LIVE_REPEAT, false, false, Some(LIVE_REPEAT2));
+    assert_eq!(population.children.len(), 256);
+    assert_eq!(
+        engine.loader_arms, 0,
+        "{WHAT}: no arming before the first drain"
+    );
+    population.release_and_wait_ledgers();
+    let owned: BTreeSet<u32> = population.pids();
+    assert_eq!(owned.len(), 256);
+
+    let serial_before = engine.last_refresh_serial;
+    let (records, malformed, _) = engine
+        .collect_frame_discovery(&mut session)
+        .unwrap_or_else(|error| panic!("{WHAT}: burst 1 collect failed: {error:#}"));
+    assert_eq!(malformed, 0, "{WHAT}: the burst 1 batch must be clean");
+    let owned_execs: BTreeMap<u32, u64> = records
+        .iter()
+        .filter(|record| record.kind == DISCOVERY_KIND_EXEC && owned.contains(&record_pid(record)))
+        .map(|record| (record_pid(record), record.hook_ts_ns))
+        .collect();
+    assert_eq!(
+        owned_execs.len(),
+        owned.len(),
+        "{WHAT}: every owned pid produced a genuine EXEC"
+    );
+    let ambient_execs = ambient_exec_pids(&records, &owned);
+    assert!(
+        ambient_execs.is_empty(),
+        "{WHAT}: REFUSED: ambient EXECs in the burst 1 batch ({ambient_execs:?}); rerun in a quiet window"
+    );
+    println!(
+        "t8: {WHAT}: burst 1 collected: {} records, 256 owned EXECs",
+        records.len()
+    );
+
+    engine
+        .apply_discovery_batch(&mut session, records, malformed)
+        .unwrap_or_else(|error| panic!("{WHAT}: burst 1 apply failed: {error:#}"));
+    let settle1 = settle_live_episode(&mut engine, &mut session, &owned, WHAT);
+
+    // The same armed checkpoint as the twin. Passes and attempts are
+    // observations only: provider-free ambient parks without arming.
+    assert_eq!(engine.loader_arms, 256, "{WHAT}: exactly 256 arm attempts");
+    assert_eq!(
+        minted_ids(&engine),
+        (1..=256).collect::<BTreeSet<_>>(),
+        "{WHAT}: tickets 1..=256"
+    );
+    assert_no_ambient_arms(&engine, &owned, WHAT);
+    assert_no_episode_loss(&engine, WHAT);
+    println!(
+        "t8: {WHAT}: armed checkpoint: passes={} attempts={} arms={} scans={}",
+        engine.pressure_service_passes,
+        engine.pressure_attempts,
+        engine.loader_arms,
+        engine.deep_scans
+    );
+
+    // The broken precondition: no request-map refill, so the map stays
+    // empty and the head cannot park. One lag tick first, exactly as the
+    // twin does, so the refill step stays the only variable.
+    engine
+        .drain_discovery_shallow(&mut session, false)
+        .unwrap_or_else(|error| panic!("{WHAT}: lag drain failed: {error:#}"));
+    engine
+        .service_backlog_quantum(&mut session)
+        .unwrap_or_else(|error| panic!("{WHAT}: lag service failed: {error:#}"));
+    assert_eq!(
+        engine.discovery_truncated, 0,
+        "{WHAT}: REFUSED: fresh loss in the seam window (truncated={}); rerun in a quiet window",
+        engine.discovery_truncated
+    );
+    assert!(
+        engine.refresh_requested.is_empty(),
+        "{WHAT}: REFUSED: ambient residue in the map ({} keys: {:?}); rerun in a quiet window",
+        engine.refresh_requested.len(),
+        engine.refresh_requested.keys().take(8).collect::<Vec<_>>()
+    );
+
+    // The same fresh head against the empty map, under the same batch
+    // purity gates as the twin.
+    let head_pid = population.spawn_head(WHAT);
+    let owned2 = population.pids();
+    assert_eq!(owned2.len(), 257);
+    let (head_records, head_malformed, _) = engine
+        .collect_frame_discovery(&mut session)
+        .unwrap_or_else(|error| panic!("{WHAT}: head collect failed: {error:#}"));
+    assert_eq!(head_malformed, 0, "{WHAT}: the head batch must be clean");
+    let head_execs: Vec<u64> = head_records
+        .iter()
+        .filter(|record| record.kind == DISCOVERY_KIND_EXEC && record_pid(record) == head_pid)
+        .map(|record| record.hook_ts_ns)
+        .collect();
+    assert_eq!(
+        head_execs.len(),
+        1,
+        "{WHAT}: the head produced exactly one genuine EXEC"
+    );
+    let head_ambient = ambient_exec_pids(&head_records, &owned2);
+    assert!(
+        head_ambient.is_empty(),
+        "{WHAT}: REFUSED: ambient EXECs in the head batch ({head_ambient:?}); rerun in a quiet window"
+    );
+    let foreign: BTreeSet<u32> = head_records
+        .iter()
+        .map(record_pid)
+        .filter(|pid| !owned2.contains(pid))
+        .collect();
+    assert!(
+        foreign.is_empty(),
+        "{WHAT}: REFUSED: foreign records in the head batch ({foreign:?}); rerun in a quiet window"
+    );
+    println!(
+        "t8: {WHAT}: head batch collected: {} records, head EXEC present",
+        head_records.len()
+    );
+
+    // Dispatch directly, exactly as the twin does, so the request-map
+    // refill stays the only variable: an empty map consumes the head.
+    let mut queued: Vec<QueuedDiscoveryRecord> = head_records
+        .into_iter()
+        .map(|record| QueuedDiscoveryRecord {
+            record,
+            terminal_owner: None,
+            terminal_exports: Vec::new(),
+        })
+        .collect();
+    let mut collect = Engine::collect_discovery_records;
+    engine
+        .process_discovery_records(
+            &mut session,
+            &mut queued,
+            &mut PendingViewRetirements::new(),
+            &mut true,
+            &mut collect,
+            &mut PauseClosure::new(true),
+        )
+        .unwrap_or_else(|error| panic!("{WHAT}: head dispatch failed: {error:#}"));
+    assert!(queued.is_empty(), "{WHAT}: the head batch fully dispatches");
+
+    // The control predicates: the unparked head consumes a request and is
+    // never refused.
+    assert_eq!(
+        engine.discovery_truncated, 0,
+        "{WHAT}: the unparked head is not refused"
+    );
+    assert!(
+        engine.refresh_requested.contains_key(&head_pid),
+        "{WHAT}: the unparked head consumes a request"
+    );
+    assert_eq!(
+        engine.newcomer_ages.dropped_unknown, 0,
+        "{WHAT}: the unparked head drops nothing"
+    );
+
+    let settle2 = settle_live_episode(&mut engine, &mut session, &owned2, WHAT);
+    assert!(
+        !engine
+            .refresh_requested
+            .keys()
+            .any(|pid| owned2.contains(pid)),
+        "{WHAT}: the head request completes"
+    );
+    assert_no_episode_loss(&engine, WHAT);
+    assert_eq!(
+        engine.loader_arms, 256,
+        "{WHAT}: the admitted head consumes no loader ticket"
+    );
+    assert_eq!(
+        minted_ids(&engine),
+        (1..=256).collect::<BTreeSet<_>>(),
+        "{WHAT}: tickets still 1..=256"
+    );
+    // The admitted head holds no loader context on either genuine
+    // completion path: viewless (P3 probationary completion at full
+    // capacity, the expected path with 256 owned views resident) or an
+    // exploratory view. Either way no ticket was spent (arms still 256).
+    match engine.views.iter().find(|view| view.pid() == head_pid) {
+        None => println!("t8: {WHAT}: head completed viewlessly (P3 probationary, no ticket)"),
+        Some(view) => assert!(
+            engine.loader_registry.ids_for_view(view.id()).is_empty(),
+            "{WHAT}: the admitted head holds no loader context"
+        ),
+    }
+
+    population.release2_and_wait_ledgers(WHAT);
+    engine
+        .drain_discovery(&mut session)
+        .expect("post-admission drain");
+    let _post_settle = settle_live_episode(&mut engine, &mut session, &owned2, WHAT);
+    for child in &population.children {
+        if child.role == "head" {
+            continue;
+        }
+        let ledgers = parse_provider_ledgers(&child.log_text(), WHAT);
+        assert_eq!(
+            ledgers.len(),
+            2,
+            "{WHAT}: {} emits both bursts",
+            child.pid()
+        );
+        assert!(
+            ledgers.iter().all(|ledger| ledger.complete),
+            "{WHAT}: {} ledgers complete",
+            child.pid()
+        );
+    }
+    let serial_delta = engine.last_refresh_serial.saturating_sub(serial_before);
+    let passes_end = engine.pressure_service_passes;
+    let attempts_end = engine.pressure_attempts;
+    population.terminate_all(WHAT, &|_| 0);
+    drop(session);
+    drop(engine);
+    let fds_end = fd_count();
+    println!(
+        "t8: unparked: PASS: head admitted with zero loss, 256 tickets intact; serial_delta={serial_delta} arm_ticks={} admit_ticks={} passes={passes_end} attempts={attempts_end} wall={:?} VmHWM={}KiB fds {fds_start}->{fds_end} cpu={} jiffies",
+        settle1.ticks,
+        settle2.ticks,
         wall_start.elapsed(),
         vm_hwm_kb(),
         self_cpu_jiffies().saturating_sub(cpu_start)

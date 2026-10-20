@@ -71,11 +71,22 @@ measurement explicit; it does not close mid-final cancellation acceptance.
 Optional `--control` runs exercise child-held stdout, repeated signals, blocked
 stderr or a real64KiB file-size limit. Pipe completion drains available bytes
 after observer reap without waiting for EOF from the held child. A blocked
-stderr channel cannot prove its own prompt acknowledgement and remains
-unqualified. File-size failure is visible as a negative I/O control, never an
-authoritative saved trace. Regular-file kernel-blocking interruption has no
-claimed hard deadline. Repeated-signal controls require two actual deliveries
-to the original held observer; exit before the second delivery is NOT_RUN.
+stderr channel cannot prove its own prompt acknowledgement, so
+`--control blocked-stderr` measures it through the independent owned reporter
+probe instead: it requires `--reporter-probe` (verified prebuilt helper) and
+`--reporter-controls` (a `qualify_reporter_probe.py` summary), resolves the
+actual reporter offset from the held candidate, attaches before the workload,
+and accepts only a timely main-thread reporter entry with reconciled zero-loss
+kernel counters. The same-source, same-candidate `none`, `handlerblocked` and
+`wrongworker` controls must have actually passed; anything less stays NOT_RUN
+without spawning. Kernel stderr pressure (positive buffered bytes plus
+`POLLOUT` nonwritability on the original owned writer while the observer
+lives), full stdout pressure/content accounting and probe-before-reap cleanup
+are oracles, not waivers. File-size failure is visible as a negative I/O
+control, never an authoritative saved trace. Regular-file kernel-blocking
+interruption has no claimed hard deadline. Repeated-signal controls require
+two actual deliveries to the original held observer; exit before the second
+delivery is NOT_RUN.
 
 Run only after the controller schedules the host lane and supplies matching
 prebuilt observer and LP64 caller. On Fedora, read `~/AGENTS.md`, check load and
@@ -115,6 +126,26 @@ that provider. Never infer a passing capture from a zero-probe run.
 
 Omit `--cells` for all27 requested cells. Select ancillary controls explicitly,
 for example `--cells 4M-slowpipe-midcapture --control child-held-stdout`.
+A blocked-stderr cell adds its independent channel explicitly:
+
+```sh
+sudo -n python3 -I scripts/qualify-operator-output.py \
+  --binary /absolute/staged/p11scope \
+  --caller /absolute/staged/caller \
+  --provider /usr/lib64/pkcs11/libsofthsm2.so \
+  --source-revision EXACT_40_HEX_COMMIT --uid 1000 --gid 1000 \
+  --cells 4M-file-midcapture --control blocked-stderr \
+  --reporter-probe /absolute/staged/reporter-probe \
+  --reporter-controls /absolute/NEW_REPORTER_RUN/summary.json \
+  --out /home/user/p11scope-operator-ID/NEW_RUN
+```
+
+`--dry-run` proves the same wiring without privilege: it pins every held
+input, binds the controls summary to this exact source and candidate, resolves
+the actual reporter file offset and runs the real stderr pressure witness
+against a bounded pipe. It spawns nothing, writes nothing and exits nonzero
+with a JSON error on any broken input. Use it before scheduling the
+privileged lane; it does not replace installed execution.
 The16MiB file bound limits retained input memory: each file read requests at
 most LIMIT+1 bytes before rejecting oversize. It does not impose a disk quota.
 Run output is temporary debugging material. The summary distinguishes PASS,
@@ -302,12 +333,20 @@ records phase and channel. Arrival is a conservative upper bound on main-thread
 observation, distinct from handler delivery and cleanup completion. The late
 marker does not change the recorded capture-loop end reason. These parser
 controls do not qualify any new installed candidate or repair the remaining
-partial stdout terminal-content cells. Blocked stderr still needs the separately
-reviewed, candidate-bound external reporter witness and remains unqualified.
+partial stdout terminal-content cells. Blocked stderr now measures through the
+separately reviewed, candidate-bound external reporter witness wired into the
+E17 cell; installed execution of the witness, its negative dependencies and the
+blocked cell itself remains open.
 
-`reporter-probe.c` and `reporter_probe.py` prepare the independent blocked-stderr
-measurement. They are not yet activated by `qualify-operator-output.py` and do
-not change its unqualified blocked-stderr result. Build the small C helper on
+`reporter-probe.c` and `reporter_probe.py` supply the independent blocked-stderr
+measurement, and `qualify-operator-output.py --control blocked-stderr` activates
+it: the cell resolves the actual reporter offset from the held candidate,
+binds the runtime IP through the actual original observer's executable mapping,
+attaches the task-bound entry uprobe before the workload, and reconciles the
+bounded perf ring (exactly one timely main-thread sample, zero loss, equal
+enabled/running times) before the observer is reaped. The E17 loop detects
+exit through the held pidfd on this control so the unreaped child retains
+custody through that reconciliation. Build the small C helper on
 the development host with `cc -std=c11 -O2 -Wall -Wextra -Werror`, supply it as a
 verified prebuilt input, and keep its output in the owned disk task directory.
 Fedora must not compile it.
@@ -338,11 +377,16 @@ controls also compile a small unrelated ELF with the same symbol spelling and
 inspect its real PIE mapping to test resolution. They establish neither product
 reporter presence nor a kernel attachment positive. The source-restricted real
 reporter/first-signal binding (without guessing private Rust argument registers)
-still needs critical review and actual matching candidate controls before live
-activation: readable marker agreement, no signal, main blocked after handler
-only, wrong ELF/process/thread, delayed observation and repeated signals. Kernel
-permission/PMU/symbol/clock/loss blockers keep the response unqualified. Cleanup,
-pressure, output content and identity-settlement requirements remain separate.
+is covered by the matching-candidate controls in `qualify_reporter_probe.py`:
+readable marker agreement, no signal, main blocked after handler only, wrong
+ELF/process/thread, delayed observation and repeated signals. Of those, the
+no-signal absence, the wrong-worker delivery and the main-blocked-after-delivery
+negatives are hard blocked-stderr acceptance dependencies: the E17 cell refuses
+to spawn unless all three actually passed on this exact source and candidate.
+Kernel permission/PMU/symbol/clock/loss blockers keep the response unqualified.
+Cleanup, pressure, output content and identity-settlement requirements are
+separate oracles in `blocked_stderr.py`, applied without waiving any existing
+E17 check.
 
 The native ledger's target device is the lexical `/proc/maps` device. Its Rust
 postcheck uses `p11scope_manifest::identity::kernel_maps_key_for` on the held
@@ -392,10 +436,14 @@ loss controls remain separate from actual zero-loss kernel reconciliation.
 
 Invoke only with the authorized lane and explicit absolute inputs, ordinary
 `--uid/--gid`, exact `--source-revision` and a new `--out`. Source controls cover
-its no-signal oracle; actual helper/PMU observations still need execution. The
-adapter does not activate the blocked-stderr E17 cell. Main blocked after actual
-handler delivery, wrong actual worker thread and full blocked-stderr
-pressure/content/cleanup oracles remain explicit acceptance dependencies.
+its no-signal oracle; actual helper/PMU observations still need execution. Its
+summary carries the top-level candidate identity so the blocked-stderr E17 cell
+can bind the same bytes: `none`, `handlerblocked` and `wrongworker` must show
+actual passes there before that cell spawns. Main blocked after actual handler
+delivery and wrong actual worker thread therefore remain explicit acceptance
+dependencies with explicit unqualified status until their installed runs land;
+the blocked-stderr pressure/content/cleanup oracles themselves are implemented
+in `blocked_stderr.py` and wired into the E17 harness and oracle.
 
 Observer stderr is finished through the existing bounded Reader contract while
 the original child remains unreaped, before any no-signal absence or final probe
@@ -489,7 +537,8 @@ exited workers, with no replacement/retry. Receipt fields carry the anchor:
 `worker_disposition`, `worker_sigint`, `tripwire`, `expected_callback`,
 `expected_worker`, `callback_records`, `worker_records`, `worker_delivery_ns`
 and the late `late_main_observation_ns`. All timeout/error cleanup releases a
-negative gate before waiting for or signalling the observer. These are newly
-prepared adapters; source review and actual same-candidate controls remain
-required. Summary `remaining` retains every causal control not actually passed
-in that invocation.
+negative gate before waiting for or signalling the observer. These adapters
+still need source review and actual same-candidate execution before dependent
+blocked-stderr acceptance. Summary `remaining` retains every causal control not
+actually passed in that invocation, plus the still-open blocked-stderr E17 cell
+execution on the same candidate.

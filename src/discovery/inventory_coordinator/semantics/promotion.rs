@@ -82,6 +82,7 @@ impl AdmissionStorage for SemanticBindingSet {
 
 /// Fixed storage for one privately consumed caller. It never aliases the live
 /// binding/history maps and cannot retain another caller through this accessor.
+#[cfg_attr(not(test), allow(dead_code))] // Staged promotion storage: exercised via the promotion staging tests; no production driver wires it yet.
 struct SingleCallerStorage {
     caller: CallerId,
     binding: Option<SemanticCallerBinding>,
@@ -90,6 +91,7 @@ struct SingleCallerStorage {
     refused_successor: Option<PublishedSemanticSuccessor>,
 }
 
+#[cfg_attr(not(test), allow(dead_code))] // Staged promotion storage: exercised via the promotion staging tests; no production driver wires it yet.
 impl SingleCallerStorage {
     fn new(caller: CallerId) -> Self {
         Self {
@@ -173,14 +175,17 @@ impl AdmissionStorage for SingleCallerStorage {
 /// Resource reservation only: it grants no admission or activation authority.
 /// Acquired before owner preparation so a provider-copy refusal still has paid
 /// local storage for the real consumer's negative-first history.
+#[cfg_attr(not(test), allow(dead_code))] // Staged promotion storage: exercised via the promotion staging tests; no production driver wires it yet.
 pub(crate) struct PromotionAdmissionReservation {
     caller: CallerId,
     domain: NativeDomainId,
     pin: Arc<PidPin>,
     path_bytes: usize,
+    #[allow(dead_code)] // Held for its resource charge; dropped, never read.
     storage: ResourceLease,
 }
 
+#[cfg_attr(not(test), allow(dead_code))] // Staged promotion storage: exercised via the promotion staging tests; no production driver wires it yet.
 impl PromotionAdmissionReservation {
     pub(super) fn reserve(
         registry: &CallerRegistry,
@@ -230,13 +235,18 @@ impl PromotionAdmissionReservation {
 /// The original genuine receipt, accepted history, binding and refusal remain
 /// private. Finite result inspection does not export H0/registration authority.
 /// Dropping this value disposes only local custody; native cleanup is separate.
+#[cfg_attr(not(test), allow(dead_code))] // Staged promotion storage: exercised via the promotion staging tests; no production driver wires it yet.
 pub(crate) struct StagedPromotionAdmission {
+    #[allow(dead_code)] // Privately staged state; disposed with the stage, never read out.
     state: SingleCallerStorage,
+    #[allow(dead_code)] // Original receipt retained for custody; never read out.
     receipt: crate::semantic_capture::CurrentPartitionReceipt,
     result: Result<(), SemanticBindingRefusal>,
+    #[allow(dead_code)] // Paid reservation retained with the stage; never read out.
     reservation: PromotionAdmissionReservation,
 }
 
+#[cfg_attr(not(test), allow(dead_code))] // Staged promotion storage: exercised via the promotion staging tests; no production driver wires it yet.
 impl StagedPromotionAdmission {
     pub(super) fn consume<Source: ProcessSource>(
         adapter: &CallerAdapter<Source>,
@@ -360,82 +370,6 @@ impl PromotionInstallCapacity {
 impl std::fmt::Debug for PromotionInstallCapacity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("PromotionInstallCapacity(<reserved>)")
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn promotion_capacity_actual_admission_types_reserve_before_allocating() {
-        let registry = CallerRegistry::new(RegistryLimits::default_limits());
-        let before = registry.semantic_resource_snapshot().charged_bytes;
-        let (capacity, allocations, bytes) = crate::test_alloc::count_allocs_during(|| {
-            PromotionInstallCapacity::reserve(&registry).unwrap()
-        });
-        assert_eq!(allocations, 3);
-        assert_eq!(bytes, PromotionInstallCapacity::requested_bytes().unwrap());
-        assert_eq!(capacity.bindings.capacity(), 1);
-        assert_eq!(capacity.index.capacity(), 3);
-        assert_eq!(capacity.admission_images.capacity(), 7_168);
-        let charged = registry.semantic_resource_snapshot().charged_bytes;
-        assert_eq!(
-            charged,
-            before
-                + bytes
-                + 3 * OWNED_ALLOCATION_PADDING
-                + std::mem::size_of::<PromotionInstallCapacity>()
-        );
-        let (second, allocations, second_bytes) = crate::test_alloc::count_allocs_during(|| {
-            PromotionInstallCapacity::reserve(&registry).unwrap()
-        });
-        assert_eq!((allocations, second_bytes), (3, bytes));
-        assert_eq!(
-            registry.semantic_resource_snapshot().charged_bytes,
-            before + 2 * (charged - before),
-            "old and new physical storage retain independent charges"
-        );
-        drop(second);
-        assert_eq!(registry.semantic_resource_snapshot().charged_bytes, charged);
-        drop(capacity);
-        assert_eq!(registry.semantic_resource_snapshot().charged_bytes, before);
-    }
-
-    #[test]
-    fn promotion_capacity_budget_refuses_before_any_destination_allocation() {
-        let mut registry = CallerRegistry::new(RegistryLimits::default_limits());
-        let baseline = registry.semantic_resource_snapshot();
-        registry.reference_semantic_resource_limit(baseline.charged_bytes);
-        let (result, allocations, bytes) =
-            crate::test_alloc::count_allocs_during(|| PromotionInstallCapacity::reserve(&registry));
-        assert!(matches!(result, Err(SemanticBindingRefusal::Capacity)));
-        assert_eq!((allocations, bytes), (0, 0));
-        let after = registry.semantic_resource_snapshot();
-        assert_eq!(after.charged_bytes, baseline.charged_bytes);
-        assert_eq!(after.peak_charged_bytes, baseline.peak_charged_bytes);
-        assert_eq!(after.refused, baseline.refused + 1);
-    }
-
-    #[test]
-    fn promotion_capacity_reserves_supported_history_before_commit() {
-        let registry = CallerRegistry::new(RegistryLimits::default_limits());
-        let mut capacity = PromotionInstallCapacity::reserve(&registry).unwrap();
-        assert!(
-            capacity.admission_images.capacity() >= MAX_INSTANCES,
-            "distinct completed callers retain their history; one current binding does not bound that history to one caller"
-        );
-        let (_, allocations, bytes) = crate::test_alloc::count_allocs_during(|| {
-            capacity
-                .admission_images
-                .try_reserve(MAX_INSTANCES)
-                .unwrap();
-        });
-        assert_eq!(
-            (allocations, bytes),
-            (0, 0),
-            "all supported history storage must already be paid before commit"
-        );
     }
 }
 
@@ -627,13 +561,88 @@ fn consume_in_storage<Source: ProcessSource>(
             reference_module: None,
         })
     })();
-    if let Err(reason) = result {
-        if let Some(mut bridge) = bridge
-            && storage.history(caller).is_none()
-        {
-            bridge.custody.refuse(reason);
-            storage.insert_refused_successor(caller, bridge);
-        }
+    if let Err(reason) = result
+        && let Some(mut bridge) = bridge
+        && storage.history(caller).is_none()
+    {
+        bridge.custody.refuse(reason);
+        storage.insert_refused_successor(caller, bridge);
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn promotion_capacity_actual_admission_types_reserve_before_allocating() {
+        let registry = CallerRegistry::new(RegistryLimits::default_limits());
+        let before = registry.semantic_resource_snapshot().charged_bytes;
+        let (capacity, allocations, bytes) = crate::test_alloc::count_allocs_during(|| {
+            PromotionInstallCapacity::reserve(&registry).unwrap()
+        });
+        assert_eq!(allocations, 3);
+        assert_eq!(bytes, PromotionInstallCapacity::requested_bytes().unwrap());
+        assert_eq!(capacity.bindings.capacity(), 1);
+        assert_eq!(capacity.index.capacity(), 3);
+        assert_eq!(capacity.admission_images.capacity(), 7_168);
+        let charged = registry.semantic_resource_snapshot().charged_bytes;
+        assert_eq!(
+            charged,
+            before
+                + bytes
+                + 3 * OWNED_ALLOCATION_PADDING
+                + std::mem::size_of::<PromotionInstallCapacity>()
+        );
+        let (second, allocations, second_bytes) = crate::test_alloc::count_allocs_during(|| {
+            PromotionInstallCapacity::reserve(&registry).unwrap()
+        });
+        assert_eq!((allocations, second_bytes), (3, bytes));
+        assert_eq!(
+            registry.semantic_resource_snapshot().charged_bytes,
+            before + 2 * (charged - before),
+            "old and new physical storage retain independent charges"
+        );
+        drop(second);
+        assert_eq!(registry.semantic_resource_snapshot().charged_bytes, charged);
+        drop(capacity);
+        assert_eq!(registry.semantic_resource_snapshot().charged_bytes, before);
+    }
+
+    #[test]
+    fn promotion_capacity_budget_refuses_before_any_destination_allocation() {
+        let mut registry = CallerRegistry::new(RegistryLimits::default_limits());
+        let baseline = registry.semantic_resource_snapshot();
+        registry.reference_semantic_resource_limit(baseline.charged_bytes);
+        let (result, allocations, bytes) =
+            crate::test_alloc::count_allocs_during(|| PromotionInstallCapacity::reserve(&registry));
+        assert!(matches!(result, Err(SemanticBindingRefusal::Capacity)));
+        assert_eq!((allocations, bytes), (0, 0));
+        let after = registry.semantic_resource_snapshot();
+        assert_eq!(after.charged_bytes, baseline.charged_bytes);
+        assert_eq!(after.peak_charged_bytes, baseline.peak_charged_bytes);
+        assert_eq!(after.refused, baseline.refused + 1);
+    }
+
+    #[test]
+    fn promotion_capacity_reserves_supported_history_before_commit() {
+        let registry = CallerRegistry::new(RegistryLimits::default_limits());
+        let mut capacity = PromotionInstallCapacity::reserve(&registry).unwrap();
+        assert!(
+            capacity.admission_images.capacity() >= MAX_INSTANCES,
+            "distinct completed callers retain their history; one current binding does not bound that history to one caller"
+        );
+        let (_, allocations, bytes) = crate::test_alloc::count_allocs_during(|| {
+            capacity
+                .admission_images
+                .try_reserve(MAX_INSTANCES)
+                .unwrap();
+        });
+        assert_eq!(
+            (allocations, bytes),
+            (0, 0),
+            "all supported history storage must already be paid before commit"
+        );
+    }
 }

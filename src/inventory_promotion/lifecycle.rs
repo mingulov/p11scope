@@ -238,6 +238,14 @@ pub(crate) trait NativeCompletionSource: Send {
     /// the genuine mint on each poll and drops the spent Session
     /// after a successful mint. Unknown domains still poll `None`.
     fn note_wound_down(&mut self, domain: NativeDomainId, session: Session);
+    /// Take the minter's preserved first mint failure, if any, for
+    /// the bounded diagnostic path. Take-once: the driver reports
+    /// each failure exactly once while the namespace keeps holding.
+    /// Sources without a genuine mint (scripted test doubles) keep
+    /// the default `None`.
+    fn take_first_failure(&mut self) -> Option<String> {
+        None
+    }
 }
 
 /// Why proof minting refused. Every variant leaves the lane

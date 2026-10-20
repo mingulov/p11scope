@@ -79,6 +79,10 @@ attach::identity_iter::tests::anchor_maps_validate_real_handles
 attach::identity_iter::tests::functional_probe_proves_hardlink_match_and_copy_none
 attach::identity_iter::tests::whole_system_run_covers_all_children
 attach::identity_iter::tests::wronly_anchor_fds_refuse_reads_with_eperm
+# 5.15 identity-denial cell: real BTF named-fix refusal through the
+# production sink with zero bpf() syscalls; dual-outcome by running
+# kernel (denied on 5.15, eligible elsewhere), lane-classified.
+inspect_system::privileged_tests::privileged_identity_515_denial_is_disclosed
 attach::instance_tests::privileged_full_image_native_multi_query_and_scan_ia32
 attach::instance_tests::privileged_full_image_native_multi_query_and_scan_lp64
 attach::instance_tests::privileged_semantic_capture_multi_reload_and_rebound_successor

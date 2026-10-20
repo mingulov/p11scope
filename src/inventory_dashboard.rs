@@ -61,6 +61,11 @@ pub(crate) const LOG_TAIL_MAX_BYTES: usize = 8192;
 pub(crate) const LOG_LINE_MAX_CHARS: usize = 1024;
 /// In-cell truncation marker.
 pub(crate) const TRUNCATION_MARK: &str = "…";
+/// Distinct failed baseline callers remembered per candidate frame.
+/// Past this many, the stalest caller drops (a liveness valve, not
+/// unbounded growth): at most one acquisition per service tick can
+/// re-arm it.
+const BASELINE_MISSED_CALLERS_MAX: usize = 32;
 
 /// Truncate to `width` display cells on a character boundary, marking
 /// omitted content with `…`. Callers escape controls before layout.
@@ -2631,12 +2636,15 @@ pub(crate) struct Display {
     /// A shed/cut keeps it (the repaint restores it); a new revision
     /// clears it.
     committed_baseline: Option<(ViewRevision, Arc<PromotionBaselineBatch>, PromotionPair)>,
-    /// The candidate frame/pair whose last acquisition attempt
-    /// failed: demand for it stays quiet until a new frame arrives
-    /// or the cursor moves, bounding retries to one per frame/pair.
-    /// Keyed by frame identity (an offered frame has no revision
-    /// yet), never by revision.
-    baseline_missed: Option<(Arc<Presentation>, PromotionPair)>,
+    /// The candidate frame plus the callers whose acquisition
+    /// attempt already failed on it: demand for them stays quiet
+    /// until a new frame arrives, bounding retries to one attempt
+    /// per frame/caller (the acquisition unit — a provider switch
+    /// within the same caller does not re-arm). Bounded to
+    /// [`BASELINE_MISSED_CALLERS_MAX`] callers, stalest dropped
+    /// first. Keyed by frame identity (an offered frame has no
+    /// revision yet), never by revision.
+    baseline_missed: Option<(Arc<Presentation>, VecDeque<u32>)>,
     /// View serials exhausted: no unique revision left, promotion
     /// refuses even on full writes.
     view_exhausted: bool,
@@ -3400,7 +3408,7 @@ impl Display {
     /// stages the batch via [`Display::note_baseline_batch`] for the
     /// next draw to commit; a failed attempt is recorded via
     /// [`Display::note_baseline_failed`] so it retries only for a
-    /// new frame/pair.
+    /// new frame/caller.
     pub(crate) fn baseline_demand(&self) -> Option<(CaptureId, Arc<Presentation>, PromotionPair)> {
         let capture = self.promoter.capture()?;
         let (frame, pair) = self.baseline_candidate()?;
@@ -3425,8 +3433,8 @@ impl Display {
         if self
             .baseline_missed
             .as_ref()
-            .is_some_and(|(missed, missed_pair)| {
-                Arc::ptr_eq(missed, &frame) && *missed_pair == pair
+            .is_some_and(|(missed, callers)| {
+                Arc::ptr_eq(missed, &frame) && callers.contains(&pair.caller())
             })
         {
             return None;
@@ -3452,15 +3460,33 @@ impl Display {
         self.pending_baseline = Some((batch, pair));
     }
 
-    /// Record a failed acquisition attempt for the demanded pair on
-    /// the current candidate frame: demand for it stays quiet until
-    /// a new frame arrives or the cursor moves, bounding retries to
-    /// one per frame/pair.
+    /// Record a failed acquisition attempt for the demanded caller
+    /// on the current candidate frame: demand for it stays quiet
+    /// until a new frame arrives, bounding retries to one attempt
+    /// per frame/caller. Membership (not just the latest pair), so
+    /// A→B→A within one frame never re-arms A; bounded to
+    /// [`BASELINE_MISSED_CALLERS_MAX`] callers, stalest dropped
+    /// first.
     pub(crate) fn note_baseline_failed(&mut self, pair: PromotionPair) {
         let Some((frame, _)) = self.baseline_candidate() else {
             return;
         };
-        self.baseline_missed = Some((frame, pair));
+        let fresh = self
+            .baseline_missed
+            .as_ref()
+            .is_none_or(|(missed, _)| !Arc::ptr_eq(missed, &frame));
+        if fresh {
+            self.baseline_missed = Some((frame, VecDeque::new()));
+        }
+        let Some((_, callers)) = self.baseline_missed.as_mut() else {
+            return;
+        };
+        if !callers.contains(&pair.caller()) {
+            if callers.len() >= BASELINE_MISSED_CALLERS_MAX {
+                callers.pop_front();
+            }
+            callers.push_back(pair.caller());
+        }
     }
 }
 

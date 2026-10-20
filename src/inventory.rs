@@ -2300,11 +2300,11 @@ impl ClassicDriver<'_> {
     /// next draw, which commits it with that draw's revision. The
     /// service hook runs before the display tick, so a demand raised
     /// for a still-undrawn frame acquires ahead of its qualifying
-    /// draw. At most one attempt per frame/pair (failures stay quiet
-    /// until a new frame or cursor); scan-only runs (no capture),
-    /// cgroup scope (the resolver refuses it) and missing custody
-    /// skip without native work. Called from the capture-service
-    /// hook, sharing the service tick.
+    /// draw. At most one attempt per frame/caller (failures stay
+    /// quiet until a new frame or cursor); scan-only runs (no
+    /// capture), cgroup scope (the resolver refuses it) and missing
+    /// custody skip without native work. Called from the
+    /// capture-service hook, sharing the service tick.
     fn schedule_promotion_baseline(
         &mut self,
         capture: Option<&mut dyn crate::inventory_capture::CaptureLane<crate::process::PidPin>>,

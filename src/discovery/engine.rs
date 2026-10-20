@@ -18957,11 +18957,16 @@ impl Engine {
     /// candidate unchanged, and the currency exemption lets that unchanged
     /// coverage commit — but a previously failed endpoint retrying as
     /// `delta.new` (or `delta.replace`) must wait for a proven generation
-    /// instead of attaching behind the exemption. Withheld targets leave
-    /// the delta and stay deactivated (their keys leave the index), so the
-    /// next proven tick retries them through the ordinary path. A target
-    /// with any live provider — a non-declined reconciled view, or no
-    /// scanned provider at all (manifest-only) — is untouched.
+    /// instead of attaching behind the exemption. Ownership keys on
+    /// contribution to the EXACT endpoint: the planner merges one provider
+    /// object into one module, so an object-level check would let a healthy
+    /// view scanning the same provider authorize an endpoint its tables
+    /// never contained. Withheld targets leave the delta and stay
+    /// deactivated (their keys leave the index), so the next proven tick
+    /// retries them through the ordinary path. A target with any live
+    /// provider — a non-declined reconciled view contributing the exact
+    /// endpoint, or no scanned provider at all (manifest-only) — is
+    /// untouched.
     fn withhold_declined_retry_targets(
         &mut self,
         candidate: &mut LiveCandidate,
@@ -18970,31 +18975,24 @@ impl Engine {
         if declined.is_empty() {
             return;
         }
-        let mut object_providers: BTreeMap<PinnedObjectId, BTreeSet<ProcessViewId>> =
+        let mut exact_providers: BTreeMap<(PinnedObjectId, u64), BTreeSet<ProcessViewId>> =
             BTreeMap::new();
         for module in &candidate.modules {
-            object_providers
-                .entry(module.object)
-                .or_default()
-                .insert(module.scanned.view);
-        }
-        let module_objects: BTreeMap<plan::ModuleId, PinnedObjectId> = candidate
-            .plan
-            .modules
-            .iter()
-            .map(|module| (module.id, module.object))
-            .collect();
-        let solely_declined = |slot: &plan::Slot| {
-            let mut providers = BTreeSet::new();
-            for id in &slot.module_ids {
-                let Some(object) = module_objects.get(id) else {
-                    continue;
-                };
-                if let Some(views) = object_providers.get(object) {
-                    providers.extend(views.iter().copied());
+            for (table, objects) in module.scanned.tables.iter().zip(&module.entry_objects) {
+                for (entry, object) in table.entries.iter().zip(objects) {
+                    exact_providers
+                        .entry((*object, entry.file_offset))
+                        .or_default()
+                        .insert(module.scanned.view);
                 }
             }
-            !providers.is_empty() && providers.iter().all(|view| declined.contains(view))
+        }
+        let solely_declined = |slot: &plan::Slot| {
+            exact_providers
+                .get(&(slot.object, slot.file_offset))
+                .is_some_and(|providers| {
+                    !providers.is_empty() && providers.iter().all(|view| declined.contains(view))
+                })
         };
         let withheld: BTreeSet<u32> = candidate
             .delta

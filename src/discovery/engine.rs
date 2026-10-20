@@ -18952,6 +18952,78 @@ impl Engine {
         )
     }
 
+    /// Withholds fresh attach work a declined view solely owns. A declined
+    /// view is retained but unproven: its pins and modules ride the final
+    /// candidate unchanged, and the currency exemption lets that unchanged
+    /// coverage commit — but a previously failed endpoint retrying as
+    /// `delta.new` (or `delta.replace`) must wait for a proven generation
+    /// instead of attaching behind the exemption. Withheld targets leave
+    /// the delta and stay deactivated (their keys leave the index), so the
+    /// next proven tick retries them through the ordinary path. A target
+    /// with any live provider — a non-declined reconciled view, or no
+    /// scanned provider at all (manifest-only) — is untouched.
+    fn withhold_declined_retry_targets(
+        &mut self,
+        candidate: &mut LiveCandidate,
+        declined: &BTreeSet<ProcessViewId>,
+    ) {
+        if declined.is_empty() {
+            return;
+        }
+        let mut object_providers: BTreeMap<PinnedObjectId, BTreeSet<ProcessViewId>> =
+            BTreeMap::new();
+        for module in &candidate.modules {
+            object_providers
+                .entry(module.object)
+                .or_default()
+                .insert(module.scanned.view);
+        }
+        let module_objects: BTreeMap<plan::ModuleId, PinnedObjectId> = candidate
+            .plan
+            .modules
+            .iter()
+            .map(|module| (module.id, module.object))
+            .collect();
+        let solely_declined = |slot: &plan::Slot| {
+            let mut providers = BTreeSet::new();
+            for id in &slot.module_ids {
+                let Some(object) = module_objects.get(id) else {
+                    continue;
+                };
+                if let Some(views) = object_providers.get(object) {
+                    providers.extend(views.iter().copied());
+                }
+            }
+            !providers.is_empty() && providers.iter().all(|view| declined.contains(view))
+        };
+        let withheld: BTreeSet<u32> = candidate
+            .delta
+            .new
+            .iter()
+            .chain(&candidate.delta.replace)
+            .filter(|slot| solely_declined(slot))
+            .map(|slot| slot.index)
+            .collect();
+        if withheld.is_empty() {
+            return;
+        }
+        candidate
+            .delta
+            .new
+            .retain(|slot| !withheld.contains(&slot.index));
+        candidate
+            .delta
+            .replace
+            .retain(|slot| !withheld.contains(&slot.index));
+        for index in &withheld {
+            candidate.plan.deactivate(*index);
+        }
+        self.mark_partial(
+            "live discovery attach",
+            "a declined view's fresh attach targets were withheld for a proven generation",
+        );
+    }
+
     /// Marks the view dirty when a scan (or a live record application)
     /// observed modules for it. Every scan-result observation site calls
     /// this — initial discovery, refresh rescans, new-view admissions,
@@ -20419,6 +20491,10 @@ impl Engine {
         self.lower_registered_retries(session, &mut candidate);
         let lowered_exec_rearms =
             self.lower_exec_rearms(session, &mut candidate, &refreshed_ok, &serviced_requests);
+        // Declined views keep their retained coverage but mint no fresh
+        // links: withhold their sole-owned retries before admission, so the
+        // currency exemption below cannot attach them unproven.
+        self.withhold_declined_retry_targets(&mut candidate, &declined);
         let admission_start = crate::attach::monotonic_ns();
         let admission = inventory_admission_observed(
             session,

@@ -12,6 +12,8 @@ Run: python3 -I tests/python/test_system_scope_soak.py -v
 
 import importlib.util
 import json
+import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -22,6 +24,11 @@ ROOT = Path(__file__).resolve().parents[2]
 ORACLE = ROOT / "scripts" / "system-scope-soak-oracle.py"
 RUNNER = ROOT / "scripts" / "system-scope-soak.sh"
 FIXTURE = ROOT / "tests/fixtures/system-qualification/system-test-manifest.json"
+
+
+def is_executable(path):
+    """True when path carries execute bits and passes an X_OK access check."""
+    return bool(path.stat().st_mode & 0o111) and os.access(path, os.X_OK)
 
 EXPECTED_SOAK_SELECTORS = {
     "soak.1800s": ["soak.1800s::continuous-owned-workload"],
@@ -110,6 +117,31 @@ class SoakVehicleTests(unittest.TestCase):
             report = SOAK.verify_soak_receipt(VERIFY, root, receipt)
             self.assertEqual(report["verdict"], "STRUCTURE_VALID")
 
+    def test_malformed_evidence_shapes_emit_structured_fail_verdicts(self):
+        # Non-dict run/record shapes used to escape as AttributeError
+        # tracebacks with no verdict.json; the oracle must emit a
+        # structured all-red FAIL verdict and stay fail-closed on exit 1.
+        with tempfile.TemporaryDirectory(prefix="soak-suite-") as tmp:
+            for shape in ("run", "record"):
+                with self.subTest(shape=shape):
+                    root = SOAK.make_synthetic_evidence(Path(tmp) / shape)
+                    (root / f"{shape}.json").write_text("[1, 2]\n", encoding="utf-8")
+                    out = Path(tmp) / f"{shape}-verdict.json"
+                    result = subprocess.run(
+                        [sys.executable, "-I", str(ORACLE),
+                         "--evidence-dir", str(root),
+                         "--out-verdict", str(out)],
+                        capture_output=True, text=True, timeout=120, check=False)
+                    self.assertEqual(result.returncode, 1,
+                                     f"{shape}:\n{result.stdout}\n{result.stderr}")
+                    self.assertNotIn("Traceback", result.stderr)
+                    verdict = json.loads(out.read_text(encoding="utf-8"))
+                    self.assertEqual(verdict["schema"], SOAK.VERDICT_SCHEMA)
+                    self.assertEqual(verdict["verdict"], "FAIL")
+                    self.assertTrue(
+                        all(not gate["pass"] for gate in verdict["gates"].values()),
+                        verdict["gates"])
+
     def test_runner_carries_its_lock_lane_and_mode_discipline(self):
         source = RUNNER.read_text(encoding="utf-8")
         code = [line for line in source.splitlines()
@@ -140,6 +172,19 @@ class SoakVehicleTests(unittest.TestCase):
         self.assertIn("--out-verdict", text)
         self.assertIn("--out-receipt", text)
         self.assertIn("--dry-run-receipt", text)
+
+    def test_runner_stays_executable(self):
+        # The runner is executed, not sourced: a 644 regression must fail
+        # the suite. The check is proven against a 644 scratch copy, so the
+        # checked-in bit is never disturbed.
+        self.assertTrue(is_executable(RUNNER),
+                        f"{RUNNER} lost its executable bit")
+        with tempfile.TemporaryDirectory(prefix="soak-suite-") as tmp:
+            copy = Path(tmp) / "system-scope-soak.sh"
+            shutil.copy2(RUNNER, copy)
+            self.assertTrue(is_executable(copy), "scratch copy must start executable")
+            os.chmod(copy, 0o644)
+            self.assertFalse(is_executable(copy), "the check must catch a 644 runner")
 
     def test_runner_refuses_dirty_subject_and_bad_tuning(self):
         source = RUNNER.read_text(encoding="utf-8")

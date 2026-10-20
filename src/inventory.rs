@@ -2294,13 +2294,17 @@ impl ClassicDriver<'_> {
     }
 
     /// Schedule one pre-view baseline acquisition (DR37 ordinary
-    /// scheduling): while the display shows a viewed pair no batch
-    /// pairs with, acquire a single-target batch for that pair through
-    /// the retained capture and hand it back. At most one attempt per
-    /// frame/pair (failures stay quiet until a new frame or cursor);
-    /// scan-only runs (no capture), cgroup scope (the resolver refuses
-    /// it) and missing custody skip without native work. Called from
-    /// the capture-service hook, sharing the service tick.
+    /// scheduling): while the display's candidate frame carries a
+    /// cursor pair no batch names, acquire a single-target batch for
+    /// that pair through the retained capture and stage it for the
+    /// next draw, which commits it with that draw's revision. The
+    /// service hook runs before the display tick, so a demand raised
+    /// for a still-undrawn frame acquires ahead of its qualifying
+    /// draw. At most one attempt per frame/pair (failures stay quiet
+    /// until a new frame or cursor); scan-only runs (no capture),
+    /// cgroup scope (the resolver refuses it) and missing custody
+    /// skip without native work. Called from the capture-service
+    /// hook, sharing the service tick.
     fn schedule_promotion_baseline(
         &mut self,
         capture: Option<&mut dyn crate::inventory_capture::CaptureLane<crate::process::PidPin>>,
@@ -2346,12 +2350,12 @@ impl ClassicDriver<'_> {
         ) {
             Ok(batch) => {
                 if let Some(display) = self.display.as_mut() {
-                    display.note_baseline_batch(std::sync::Arc::new(batch));
+                    display.note_baseline_batch(std::sync::Arc::new(batch), pair);
                 }
             }
             Err(_) => {
                 if let Some(display) = self.display.as_mut() {
-                    display.note_baseline_failed();
+                    display.note_baseline_failed(pair);
                 }
             }
         }
@@ -8907,9 +8911,22 @@ mod promotion_driver_tests {
                 .expect("display")
                 .baseline_demand()
                 .is_none(),
-            "the handed batch pairs with its frame"
+            "the staged batch suppresses its own demand"
         );
-        // A paired frame schedules nothing more.
+        // A staged frame schedules nothing more, and only the repaint
+        // commits the staged batch with the draw's revision.
+        driver.on_native_service(Some(&mut stub));
+        assert_eq!(calls.get(), 1);
+        driver.display.as_mut().expect("display").repaint_for_test();
+        assert!(
+            driver
+                .display
+                .as_ref()
+                .expect("display")
+                .baseline_demand()
+                .is_none(),
+            "the committed batch satisfies demand"
+        );
         driver.on_native_service(Some(&mut stub));
         assert_eq!(calls.get(), 1);
     }

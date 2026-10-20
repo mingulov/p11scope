@@ -3328,16 +3328,26 @@ fn pty_promotion_d_pairs_baseline_with_viewed_frame() {
     terminal.display.offer(varied_presentation());
     terminal.display.tick();
     terminal.shown(b"promotion: idle; selected");
-    let (capture, frame, _) = terminal
+    let (capture, frame, pair) = terminal
         .display
         .baseline_demand()
         .expect("the viewed pair lacks a batch");
     assert_eq!(capture, CaptureId::new(5));
     let batch = Arc::new(PromotionBaselineBatch::scripted_for_test(capture, frame));
-    terminal.display.note_baseline_batch(Arc::clone(&batch));
+    terminal
+        .display
+        .note_baseline_batch(Arc::clone(&batch), pair);
     assert!(
         terminal.display.baseline_demand().is_none(),
-        "a paired batch clears demand"
+        "a staged batch suppresses its own demand"
+    );
+    // Only the repaint commits the staged batch with the draw's
+    // revision; `d` pairs it from there.
+    terminal.repaint_now();
+    terminal.shown(b"promotion: idle");
+    assert!(
+        terminal.display.baseline_demand().is_none(),
+        "the committed batch satisfies demand"
     );
     terminal.key(b"d");
     terminal.shown(b"promotion: request 1 queued");
@@ -3345,12 +3355,48 @@ fn pty_promotion_d_pairs_baseline_with_viewed_frame() {
         .display
         .take_promotion_request()
         .expect("d queues one request");
+    assert_eq!(request.viewed().revision().get(), 1);
     assert!(
         request
             .viewed()
             .baseline()
             .is_some_and(|held| Arc::ptr_eq(held, &batch)),
-        "d binds the viewed frame's batch"
+        "d binds the draw-committed batch"
+    );
+    terminal.display.restore();
+}
+
+#[test]
+fn pty_promotion_baseline_needs_a_draw_after_acquisition() {
+    // P1: a batch acquired after the draw must not retrofit the
+    // displayed revision — only a later draw commits it.
+    let mut terminal = PromoPty::open();
+    assert!(terminal.display.promotion_enable(CaptureId::new(5)));
+    terminal.display.offer(varied_presentation());
+    terminal.display.tick();
+    terminal.shown(b"promotion: idle; selected");
+    let (capture, frame, pair) = terminal
+        .display
+        .baseline_demand()
+        .expect("the viewed pair lacks a batch");
+    let batch = Arc::new(PromotionBaselineBatch::scripted_for_test(capture, frame));
+    terminal
+        .display
+        .note_baseline_batch(Arc::clone(&batch), pair);
+    assert!(
+        terminal.display.baseline_demand().is_none(),
+        "a staged batch suppresses its own demand"
+    );
+    // No repaint: `d` must not see the staged batch.
+    terminal.key(b"d");
+    terminal.shown(b"promotion: request 1 queued");
+    let request = terminal
+        .display
+        .take_promotion_request()
+        .expect("d queues one request");
+    assert!(
+        request.viewed().baseline().is_none(),
+        "a batch acquired after the draw joins no displayed authority before a repaint commits it"
     );
     terminal.display.restore();
 }
@@ -3382,11 +3428,15 @@ fn pty_promotion_baseline_twins() {
     terminal.display.offer(varied_presentation());
     terminal.display.tick();
     terminal.shown(b"promotion: idle; selected");
+    let (_, _, pair) = terminal
+        .display
+        .baseline_demand()
+        .expect("the viewed pair lacks a batch");
     let stale = Arc::new(PromotionBaselineBatch::scripted_for_test(
         CaptureId::new(5),
         Arc::new(varied_presentation()),
     ));
-    terminal.display.note_baseline_batch(stale);
+    terminal.display.note_baseline_batch(stale, pair);
     assert!(terminal.display.baseline_demand().is_some());
     terminal.key(b"d");
     terminal.shown(b"promotion: request 1 queued");
@@ -3395,6 +3445,11 @@ fn pty_promotion_baseline_twins() {
         .take_promotion_request()
         .expect("d queues one request");
     assert!(request.viewed().baseline().is_none());
+    // A repaint drops the stale staged batch instead of committing
+    // it: demand still persists for a fresh attempt.
+    terminal.repaint_now();
+    terminal.shown(b"promotion: request 1 queued");
+    assert!(terminal.display.baseline_demand().is_some());
     terminal.display.restore();
 
     // Demand gates: nothing while disabled, nothing before the first
@@ -3411,8 +3466,11 @@ fn pty_promotion_baseline_twins() {
     terminal.display.offer(varied_presentation());
     terminal.display.tick();
     terminal.shown(b"promotion: idle; selected");
-    assert!(terminal.display.baseline_demand().is_some());
-    terminal.display.note_baseline_failed();
+    let (_, _, pair) = terminal
+        .display
+        .baseline_demand()
+        .expect("the viewed pair lacks a batch");
+    terminal.display.note_baseline_failed(pair);
     assert!(
         terminal.display.baseline_demand().is_none(),
         "a failed attempt stays quiet for its frame"

@@ -1685,6 +1685,89 @@ impl AttachPlan {
             .count();
     }
 
+    /// Excises never-linked tail cells this candidate allocated past
+    /// `accepted` — the partial-withhold companion to
+    /// [`withdraw_unlinked_additions`](Self::withdraw_unlinked_additions),
+    /// which only takes back a wholly inactive tail. A withheld retry's
+    /// cell was allocated by this candidate and deactivated before any
+    /// link, so giving it back cannot strand a count; keeping it would
+    /// burn the capture-lifetime budget on every deferral tick. Only
+    /// cells at `accepted..` that are inactive are removed — active cells
+    /// and cells below `accepted` are never touched. Surviving tail cells
+    /// shift down with their indices, owners, and key/retirement
+    /// positions remapped. Returns the old-index → new-index map
+    /// (`u32::MAX` for excised cells) so the caller can remap detached
+    /// slot clones (delta entries).
+    pub(crate) fn excise_unlinked_tail_cells(
+        &mut self,
+        accepted: usize,
+        cells: &BTreeSet<u32>,
+    ) -> Vec<u32> {
+        let old_len = self.slots.len();
+        debug_assert_eq!(self.aggregate_owners.len(), old_len);
+        let remove: BTreeSet<usize> = cells
+            .iter()
+            .map(|cell| *cell as usize)
+            .filter(|position| {
+                *position >= accepted && *position < old_len && !self.is_active(*position as u32)
+            })
+            .collect();
+        let mut old_to_new = vec![u32::MAX; old_len];
+        if remove.is_empty() {
+            for (position, new) in old_to_new.iter_mut().enumerate() {
+                *new = position as u32;
+            }
+            return old_to_new;
+        }
+        let mut slots = Vec::with_capacity(old_len - remove.len());
+        for (position, mut slot) in self.slots.drain(..).enumerate() {
+            if remove.contains(&position) {
+                continue;
+            }
+            slot.index = slots.len() as u32;
+            old_to_new[position] = slot.index;
+            slots.push(slot);
+        }
+        let mut owners = Vec::with_capacity(old_len - remove.len());
+        for (position, owner) in self.aggregate_owners.drain(..).enumerate() {
+            if !remove.contains(&position) {
+                owners.push(owner);
+            }
+        }
+        debug_assert_eq!(slots.len(), owners.len());
+        self.slots = slots;
+        self.aggregate_owners = owners;
+        self.retired_slots = self
+            .retired_slots
+            .iter()
+            .filter_map(|position| {
+                let new = old_to_new.get(*position).copied().unwrap_or(u32::MAX);
+                (new != u32::MAX).then_some(new as usize)
+            })
+            .collect();
+        for position in self.slot_by_key.values_mut() {
+            let new = old_to_new.get(*position).copied().unwrap_or(u32::MAX);
+            debug_assert!(
+                new != u32::MAX,
+                "an excised cell must already have left the key index"
+            );
+            if new != u32::MAX {
+                *position = new as usize;
+            }
+        }
+        self.slot_by_key
+            .retain(|_, position| *position < self.slots.len());
+        let slot_by_key = &self.slot_by_key;
+        self.provisional_get_function_list
+            .retain(|key, _| slot_by_key.contains_key(key));
+        self.module_ambiguous = self
+            .aggregate_owners
+            .iter()
+            .filter(|owner| matches!(owner, AggregateOwner::Ambiguous))
+            .count();
+        old_to_new
+    }
+
     pub(crate) fn validate_slot_index(&self) -> Result<(), String> {
         if self.aggregate_owners.len() != self.slots.len() {
             return Err("aggregate-owner state does not match allocated slots".into());

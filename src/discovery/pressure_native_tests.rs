@@ -768,6 +768,27 @@ fn fd_count() -> usize {
         .unwrap_or(0)
 }
 
+/// Targets of this process's open descriptors rooted under `root` (the
+/// calling test's own fixture directory). A process-wide `/proc/self/fd`
+/// count is shared with parallel lib tests and cannot carry an absolute
+/// leak assert; sibling tests use their own tempdirs, so scoping to the
+/// owned dir excludes them by construction.
+fn owned_open_fds(root: &Path) -> Vec<String> {
+    let mut leaked = Vec::new();
+    let entries = match std::fs::read_dir("/proc/self/fd") {
+        Ok(entries) => entries,
+        Err(_) => return leaked,
+    };
+    for entry in entries.flatten() {
+        let target = std::fs::read_link(entry.path()).unwrap_or_default();
+        if target.starts_with(root) {
+            leaked.push(target.display().to_string());
+        }
+    }
+    leaked.sort();
+    leaked
+}
+
 fn vm_hwm_kb() -> u64 {
     std::fs::read_to_string("/proc/self/status")
         .unwrap_or_default()
@@ -969,11 +990,17 @@ fn test_live256_requires_every_owned_participant() {
         "{WHAT}: the head argv names no provider"
     );
 
+    // Canonicalize before terminate_all removes the dir: fd targets show
+    // resolved paths, and a still-open owned file would read back with a
+    // " (deleted)" suffix under this same root.
+    let fixture_root = std::fs::canonicalize(population.fixtures.dir.path())
+        .unwrap_or_else(|_| population.fixtures.dir.path().to_path_buf());
     population.terminate_all(WHAT, &|_| 0);
     let fds_end = fd_count();
+    let owned_leaked = owned_open_fds(&fixture_root);
     assert!(
-        fds_end <= fds_start + 4,
-        "{WHAT}: no descriptor leak: start={fds_start} end={fds_end}"
+        owned_leaked.is_empty(),
+        "{WHAT}: no owned descriptor leak: still open: {owned_leaked:?} (process fds {fds_start}->{fds_end} are shared with parallel tests)"
     );
     println!(
         "g18: every-participant: 255 ledgers exact, 2 removed cleanly, wall={:?} VmHWM={}KiB fds {fds_start}->{fds_end}",

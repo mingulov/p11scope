@@ -988,6 +988,7 @@ impl InventoryState {
     }
 
     /// Concrete pre-view identity operation; no mutable object escapes.
+    #[allow(clippy::too_many_arguments)] // Thin explicit-args forwarder mirroring baseline::query; bundling would churn both ends for no gain.
     pub(super) fn query_promotion_baselines(
         &mut self,
         domain: crate::attach::capture::NativeDomainId,

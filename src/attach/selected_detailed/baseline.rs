@@ -250,6 +250,7 @@ fn requested_bytes(rows: usize) -> Option<usize> {
         .checked_add(arc)?
         .checked_add(OWNED_ALLOCATION_PADDING)
 }
+#[allow(clippy::assertions_on_constants)] // Compile-time layout-budget guard; the literal sum pins the accounted allocation shape.
 const _: () = {
     assert!(std::mem::size_of::<ImageRow>() <= 64);
     // Full internal BTree nodes + padding: (16+11*K+12*8+32) each.
@@ -261,6 +262,7 @@ const _: () = {
 
 /// Called under the exclusive Inventory capture borrow, on explicit baseline
 /// work only. Loading the iterator is deferred so ordinary startup is unchanged.
+#[allow(clippy::too_many_arguments)] // The single exclusive-borrow native-query path keeps its facts expanded and explicit.
 pub(crate) fn query(
     ebpf: &mut aya::Ebpf,
     domain: NativeDomainId,

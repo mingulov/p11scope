@@ -753,10 +753,11 @@ Limits that matter in pods:
   presence/capture/activity states, coverage header, bounded log tail;
   `j`/`k` scroll, `tab` cycles summary/evidence/gaps, `q` quits, and
   `--duration` bounds the run). `d` requests Detailed capture for the
-  selected caller/provider pair and `x` cancels outstanding promotion
-  work; both need a fully drawn frame and refuse honestly (stale view,
-  busy, unsupported scope or scan-only run) without disturbing the
-  capture. At 40x10, the compact summary keeps an
+  selected caller/provider pair (it needs a fully drawn frame) and `x`
+  cancels outstanding promotion work; both keys are ignored on the gaps
+  page and refuse honestly (stale view, busy, unsupported scope or
+  scan-only run) without disturbing the capture. At 40x10, the compact
+  summary keeps an
   executable/module pair, their IDs and observation meaning visible;
   scrolling reaches later associations while totals still cover the whole
   capture. Enlarge the terminal to see the fuller state and evidence view.

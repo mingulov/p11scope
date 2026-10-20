@@ -27,6 +27,14 @@ CAPTURE_MULTI = "attach::inventory::capture::privileged_tests::privileged_invent
 LEADER_MULTI = "attach::inventory::capture::privileged_tests::privileged_inventory_capture_multi_pid_scope_leader_exit_probe_lp64"
 CHURN = "inventory::privileged_tests::privileged_native_lane_system_exec_churn_lp64"
 BROAD = "discovery::engine::publication_tests::broad_p11kit_admission_arithmetic"
+DENIAL = "inspect_system::privileged_tests::privileged_identity_515_denial_is_disclosed"
+# Format-exact with the cell's eprintln marker (see privileged_tests);
+# the real guest/host runs prove the binary prints exactly this shape.
+DENIED_MARKER = ("IDENTITY_515_DENIAL outcome=denied reason=kernel_fix_missing "
+                 "mm_present=false attach=false tasktype=false "
+                 "bpf_delta=0 scan_bytes=5277697 fallback=kernel_fix_missing")
+ELIGIBLE_MARKER = ("IDENTITY_515_DENIAL outcome=eligible mm_present=true "
+                   "attach=true tasktype=true bpf_delta=0 scan_bytes=7067009 sink=ok")
 PUBLIC = {
     "profile-pid": "owned-provider-counts", "metrics-pid": "owned-provider-counts",
     "mt-exact": "owned-provider-counts", "system": "owned-provider-counts",
@@ -166,6 +174,66 @@ class MatrixContract(unittest.TestCase):
         self.write("run/results.txt", f"PASS {name} rc=0 seconds=1 :: test result: ok. 1 passed\n")
         self.write("run/logs/" + name.split("::")[-1] + ".log", f"running 1 test\ntest {name} ... {diagnostic}\nok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n")
         self.seal()
+
+    def selected_log_515(self, diagnostic):
+        result = command(sys.executable, "-I", str(CHECKER), "--plan", "--lane", "5.15.221", "--lib-test", DENIAL)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        old = json.loads(self.contract.read_text())
+        core = json.loads(result.stdout)["execution"]
+        core.update({key: value for key, value in old.items() if key not in core})
+        self.write("inputs/ignored.txt", f"{DENIAL}: test\n")
+        self.write("inputs/curation.txt", f"default (1)\n{DENIAL}\nlong (0, --include-long only)\nskipped (0)\nverify: curation matches the binary (1 tests)\n")
+        for path in ("inputs/ignored.txt", "inputs/curation.txt"):
+            core["bindings"][path] = hashlib.sha256((self.stage / path).read_bytes()).hexdigest()
+        self.contract.write_text(json.dumps(core) + "\n")
+        self.write("uname.txt", "5.15.221\n")
+        self.write("run/results.txt", f"PASS {DENIAL} rc=0 seconds=1 :: test result: ok. 1 passed\n")
+        self.write("run/logs/" + DENIAL.split("::")[-1] + ".log", f"running 1 test\ntest {DENIAL} ... {diagnostic}\nok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n")
+        self.seal()
+
+    def test_denial_cell_denied_branch_judges_expected_refusal_on_515(self):
+        self.selected_log_515(DENIED_MARKER)
+        result = self.judge(shell=True)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        rows = {row["id"]: row for row in json.loads(result.stdout)["rows"]}
+        self.assertEqual(rows["lib:" + DENIAL]["qualification"], "expected-refusal")
+        identity = rows["identity:5.15-denied"]
+        self.assertEqual(identity["qualification"], "expected-refusal")
+        self.assertTrue(identity["detail"].startswith("guest refusal disclosed: " + DENIED_MARKER))
+
+    def test_denial_cell_fabricated_denial_is_rejected_on_515(self):
+        fabrications = {
+            "eligible branch on 5.15": ELIGIBLE_MARKER,
+            "nonzero bpf delta": DENIED_MARKER.replace("bpf_delta=0", "bpf_delta=1"),
+            "wrong reason": DENIED_MARKER.replace("reason=kernel_fix_missing", "reason=no_btf"),
+            "mm present": DENIED_MARKER.replace("mm_present=false", "mm_present=true"),
+            "empty scan": DENIED_MARKER.replace("scan_bytes=5277697", "scan_bytes=0"),
+            "extra token": DENIED_MARKER + " extra=1",
+            "duplicate marker": DENIED_MARKER + "\n" + DENIED_MARKER,
+            "missing marker": "no marker evidence",
+        }
+        for label, diagnostic in fabrications.items():
+            with self.subTest(label=label):
+                fresh = self.base / ("denial-red-" + label.replace(" ", "-"))
+                shutil.copytree(self.stage, fresh)
+                stage, contract = self.stage, self.contract
+                self.stage, self.contract = fresh, fresh / "contract.json"
+                try:
+                    self.selected_log_515(diagnostic)
+                    self.reject()
+                finally:
+                    self.stage, self.contract = stage, contract
+
+    def test_denial_cell_denied_marker_is_rejected_off_515(self):
+        self.selected_log(DENIAL, DENIED_MARKER)
+        self.reject()
+
+    def test_denial_cell_eligible_branch_judges_positive_off_515(self):
+        self.selected_log(DENIAL, ELIGIBLE_MARKER)
+        result = self.judge()
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        row = next(r for r in json.loads(result.stdout)["rows"] if r["id"] == "lib:" + DENIAL)
+        self.assertEqual(row["qualification"], "positive-coverage")
 
     def test_each_multi_test_uses_its_own_refusal_not_later_positive_probe(self):
         for name, tag in ((CLASSIC_MULTI, "CLASSIC_PID_SCOPE selection=multi"),
@@ -774,6 +842,23 @@ class Registration(unittest.TestCase):
         forbidden = "attach::identity_iter::tests::functional_probe_proves_hardlink_match_and_copy_none"
         self.assertNotIn(forbidden, execution["lib_tests"])
         self.assertTrue(any(r["id"] == "identity:5.15-denied" for r in execution["obligations"]))
+
+    def test_denied_identity_tier_selects_executable_libtest(self):
+        result = command(sys.executable, "-I", str(CHECKER), "--plan", "--lane", "5.15.221")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        execution = json.loads(result.stdout)["execution"]
+        self.assertIn(DENIAL, execution["lib_tests"])
+        self.assertIn("lib:" + DENIAL, execution["required_ids"])
+        obligation = next(r for r in execution["obligations"] if r["id"] == "identity:5.15-denied")
+        self.assertEqual(obligation["status"], "selected")
+        self.assertEqual(obligation["libtest"], DENIAL)
+        self.assertEqual(execution["lib_outcomes"][DENIAL], "denial-with-zero-bpf-or-eligible-by-lane")
+        result = command(sys.executable, "-I", str(CHECKER), "--plan", "--lane", "5.15.221",
+                         "--lib-test", LIB_A)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        result = command(sys.executable, "-I", str(CHECKER), "--plan", "--lane", "6.1.188")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(DENIAL, json.loads(result.stdout)["execution"]["lib_tests"])
 
     def test_dry_run_has_all_seven_lanes_mt12_and_exact_breadth_names(self):
         result = command(str(RUNNER), "--dry-run")

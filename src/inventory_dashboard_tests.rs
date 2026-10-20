@@ -3402,6 +3402,83 @@ fn pty_promotion_baseline_needs_a_draw_after_acquisition() {
 }
 
 #[test]
+fn pty_promotion_baseline_demand_requires_caller_coverage() {
+    // P2: one caller's batch must not suppress acquisition for other
+    // callers — demand is satisfied only with selected-caller
+    // coverage.
+    let mut terminal = PromoPty::open();
+    assert!(terminal.display.promotion_enable(CaptureId::new(5)));
+    terminal.display.offer(varied_presentation());
+    terminal.display.tick();
+    terminal.shown(b"promotion: idle; selected");
+    let first = terminal
+        .display
+        .state
+        .promotion
+        .selected
+        .expect("the first frame selects a pair");
+    let (capture, frame, pair) = terminal
+        .display
+        .baseline_demand()
+        .expect("the viewed pair lacks a batch");
+    assert_eq!(pair, first);
+    let batch_a = Arc::new(PromotionBaselineBatch::scripted_for_test(capture, frame));
+    terminal
+        .display
+        .note_baseline_batch(Arc::clone(&batch_a), pair);
+    terminal.repaint_now();
+    terminal.shown(b"promotion: idle");
+    assert!(terminal.display.baseline_demand().is_none());
+    // Scroll to another caller on the same frame: demand re-arms,
+    // the fresh batch commits, and `d` pairs it (not the old one).
+    let mut second = first;
+    for _ in 0..13 {
+        if second.caller() != first.caller() {
+            break;
+        }
+        terminal.key(b"j");
+        second = terminal
+            .display
+            .state
+            .promotion
+            .selected
+            .expect("the cursor survives scrolling");
+    }
+    assert_ne!(
+        second.caller(),
+        first.caller(),
+        "the frame shows another caller"
+    );
+    let (capture_b, frame_b, pair_b) = terminal
+        .display
+        .baseline_demand()
+        .expect("demand re-arms for the uncovered caller");
+    assert_eq!(pair_b, second);
+    let batch_b = Arc::new(PromotionBaselineBatch::scripted_for_test(
+        capture_b, frame_b,
+    ));
+    terminal
+        .display
+        .note_baseline_batch(Arc::clone(&batch_b), pair_b);
+    terminal.repaint_now();
+    terminal.shown(b"promotion: idle");
+    terminal.key(b"d");
+    terminal.shown(b"promotion: request 1 queued");
+    let request = terminal
+        .display
+        .take_promotion_request()
+        .expect("d queues one request");
+    assert!(
+        request
+            .viewed()
+            .baseline()
+            .is_some_and(|held| Arc::ptr_eq(held, &batch_b)),
+        "d binds the newly covered caller's batch"
+    );
+    terminal.display.restore();
+}
+
+#[test]
 fn pty_promotion_baseline_twins() {
     // No batch: the request stays unqualified (existing behavior), and
     // demand persists for the scheduler.

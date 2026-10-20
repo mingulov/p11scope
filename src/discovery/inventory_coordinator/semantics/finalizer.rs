@@ -9,6 +9,7 @@ use crate::semantics_objects::journal::{
 
 pub(in crate::discovery::engine::inventory_coordinator) struct SessionFinalizerState {
     pub(super) domain: NativeDomainId,
+    #[cfg_attr(not(test), allow(dead_code))] // Staged: tested only; no production seal path.
     producers: Option<SessionDrainProducers>,
     pub(super) pending_semantic: Option<SemanticBatch>,
     pub(super) h3_last: H3DispositionEvidence,
@@ -46,6 +47,7 @@ impl SessionFinalizerState {
             .unwrap_or_else(H3DispositionEvidence::genesis)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // Staged H3 finalizer path: exercised by the finalizer tests; no production seal path wires it yet.
     fn bind_producers(&mut self, producers: &SessionDrainProducers) -> bool {
         if self.domain != producers.native_domain() {
             return false;
@@ -84,6 +86,7 @@ impl H3FinalizerPort for SessionH3Finalizer<'_> {
 }
 
 impl<Source: ProcessSource> InventoryCoordinator<Source> {
+    #[cfg_attr(not(test), allow(dead_code))] // Staged H3 finalizer path: exercised by the H3 acknowledgement tests; no production seal path wires it yet.
     pub(crate) fn session_h3_finalizer<'session>(
         &'session mut self,
         producers: &'session SessionDrainProducers,

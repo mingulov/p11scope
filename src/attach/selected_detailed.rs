@@ -902,6 +902,7 @@ pub(crate) struct PreparedSelectedSession {
 impl PreparedSelectedSession {
     /// Caller must supply the pre-view receipt from the actual Inventory
     /// acquisition/binder. A later image query cannot construct that receipt.
+    #[allow(clippy::result_large_err)] // Cold preparation path: the failure retains the native owner for joined cleanup.
     pub(crate) fn prepare(
         subset: crate::inventory_semantics::AttestedSubset,
         baseline: baseline::PromotionImageBaseline,
@@ -985,6 +986,7 @@ impl PreparedSelectedSession {
 
     /// Concrete one-way handoff. This is deliberately not into_parts or a
     /// generic callback that could export a usable provisional Session/H0.
+    #[allow(clippy::result_large_err)] // Cold handoff: the failure retains the native owner for joined cleanup.
     pub(crate) fn into_provisional_lane(
         self,
         convert_subset: crate::inventory_semantics::AttestedSubset,
@@ -1004,6 +1006,7 @@ impl PreparedSelectedSession {
 /// Runs on the preparation worker. Auto can retry only after the failed Multi
 /// attempt's original worker has joined successfully. A deadline or uncertain
 /// close returns the same retained failure owner instead of starting Singles.
+#[allow(clippy::result_large_err)] // Cold preparation path: the failure retains the native owner for joined cleanup.
 fn start_selected(
     plan: &super::AttachPlan,
     objects: &crate::discovery::identity::PinnedObjects,
@@ -1073,6 +1076,7 @@ fn start_selected(
     Ok(session)
 }
 
+#[allow(clippy::result_large_err)] // Cold preparation path: the failure retains the native owner for joined cleanup.
 fn start_selected_attempt(
     plan: &super::AttachPlan,
     objects: &crate::discovery::identity::PinnedObjects,

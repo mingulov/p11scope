@@ -1410,6 +1410,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// Reserve before the SAME candidate factory clones generation identity.
     /// Looking up borrowed source facts and sharing the original Arc allocate
     /// no storage and grant no owner/provider authority.
+    #[cfg_attr(not(test), allow(dead_code))] // Staged promotion path: exercised by the promotion staging tests; no production driver wires it yet.
     pub(crate) fn prepare_legacy_promotion_candidate(
         &self,
         caller: CallerId,
@@ -1445,6 +1446,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         Ok((candidate, reservation))
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // Staged promotion path: exercised by the promotion staging tests; no production driver wires it yet.
     pub(crate) fn prepare_scoped_promotion_candidate(
         &self,
         prepared: &crate::discovery::caller_registry::PreparedScopedCaller<Source::Pin>,
@@ -1734,6 +1736,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
 
     /// Run the ordinary consumer against fixed private storage. No registry
     /// diagnostic, history, registration or binding is published by this call.
+    #[cfg_attr(not(test), allow(dead_code))] // Staged promotion path: exercised by the promotion staging tests; no production driver wires it yet.
     pub(crate) fn stage_promotion_admission(
         &self,
         reservation: PromotionAdmissionReservation,

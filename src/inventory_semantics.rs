@@ -760,6 +760,7 @@ impl AttestedSemanticLane {
     /// Share the real H0 construction with selected startup. A rejected owner
     /// returns its Session so selected preparation can retain and join cleanup.
     /// This private helper cannot extract a usable provisional lane for callers.
+    #[allow(clippy::result_large_err)] // Cold startup path: a rejected owner returns its Session for retained joined cleanup.
     fn from_live_owner(
         session: Session,
         attached: AttachedSemanticSet,

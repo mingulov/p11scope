@@ -32,7 +32,7 @@ use crate::semantics_objects::journal::{
 use crate::semantics_objects::{
     ObjectDomain, ObjectEffect, ObjectEffects, ObjectId, ObjectSemantics, SessionIncarnation,
 };
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::mem::size_of;
 
 /// At most 1,024 unsettled staged payloads per feed: one bound, two
@@ -320,6 +320,7 @@ impl JointStaging {
     /// payload's ticket and duplicate bytes charge to the shared H8
     /// ledger before the entry lands (refused staging never holds a
     /// ticket); replay, fallback and loss disposal release.
+    #[cfg_attr(not(test), allow(dead_code))] // Staged Joint path: exercised by the key-operation tests; production still reduces S1Only.
     pub(crate) fn stage(
         &mut self,
         facts: SemanticCall,
@@ -1404,6 +1405,7 @@ impl KeyUseReducer {
     /// close into the reserved buckets on end, complete atomically
     /// on direct. Terminals move within reserved buckets and fixed
     /// summaries and allocate nothing.
+    #[cfg_attr(not(test), allow(dead_code))] // Staged aggregation path: exercised by the key-operation tests; no production feed wires it yet.
     pub(crate) fn observe_effect(
         &mut self,
         instance: RegistryInstanceId,

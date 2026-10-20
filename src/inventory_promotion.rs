@@ -308,7 +308,6 @@ impl Default for Promoter {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // STAGED (DR37): the runtime owner drives enable/take/set_status/state; the UI key paths run today.
 impl Promoter {
     /// Bind the control to one capture run; see
     /// [`PromotionControl::enable`].

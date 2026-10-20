@@ -2266,6 +2266,17 @@ impl ClassicDriver<'_> {
         self.retiring.as_ref().map(|retiring| retiring.domain)
     }
 
+    /// Bind the dashboard's promotion control to this run's capture
+    /// (DR37 ordinary enable). Headless runs have no display and stay
+    /// unbound; a bound display keeps its capture (a second enable
+    /// never rebinds it). Returns whether the control is bound to
+    /// `capture` afterwards.
+    fn enable_run_promotion(&mut self, capture: crate::inventory_promotion::CaptureId) -> bool {
+        self.display
+            .as_mut()
+            .is_some_and(|display| display.promotion_enable(capture))
+    }
+
     /// Install the native completion minter (DR37 A→B). Run setup
     /// calls this once the native lane lands its source; until then
     /// the field stays `None` and retiring domains hold.
@@ -3779,6 +3790,12 @@ fn run_dashboard(
         identity: identity_shared.clone(),
     };
     driver.set_completion_source(Box::new(crate::attach::NativeCompletionMinter::new()));
+    // The run's promotion capture: the dashboard's DR37 control binds
+    // once per run. `started_ns` is nonzero on any live clock; the max
+    // closes the theoretical zero the baseline binder refuses.
+    driver.enable_run_promotion(crate::inventory_promotion::CaptureId::new(
+        started_ns.max(1),
+    ));
     let ending = || stop() || quit.get();
     let clock = LoopClock {
         deadline: Some(deadline.unwrap_or_else(unbounded_dashboard_deadline)),
@@ -8569,6 +8586,55 @@ mod promotion_driver_tests {
             );
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    #[test]
+    fn run_promotion_enable_binds_a_fresh_dashboard() {
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        assert!(
+            !driver
+                .display
+                .as_ref()
+                .expect("display")
+                .promotion_enabled(),
+            "a fresh dashboard starts unbound"
+        );
+        assert!(driver.enable_run_promotion(CaptureId::new(7)));
+        assert!(
+            driver
+                .display
+                .as_ref()
+                .expect("display")
+                .promotion_enabled(),
+            "the ordinary enable binds the run capture"
+        );
+    }
+
+    #[test]
+    fn run_promotion_enable_twins() {
+        // Headless runs have no display and stay unbound; a bound
+        // display keeps its capture (a foreign run never rebinds it).
+        let mut bare = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut bare, headless.display);
+        driver.display = None;
+        assert!(!driver.enable_run_promotion(CaptureId::new(7)));
+
+        let mut rebound = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut rebound, headless.display);
+        assert!(driver.enable_run_promotion(CaptureId::new(7)));
+        assert!(!driver.enable_run_promotion(CaptureId::new(9)));
+        assert!(
+            driver
+                .display
+                .as_ref()
+                .expect("display")
+                .promotion_enabled(),
+            "the refused rebind keeps the first capture"
+        );
     }
 
     #[test]

@@ -150,6 +150,7 @@ struct PassView {
     caller_id: Option<String>,
     module_a: Option<String>,
     module_b: Option<String>,
+    commits: u64,
 }
 impl PassView {
     fn refresh(&mut self, path: &Path, pid: u32) -> Result<bool> {
@@ -220,6 +221,10 @@ impl PassView {
         // pass's rows and its commit marker; every trigger re-checks the
         // current view through the stale/predicate gates, so extra triggers
         // re-affirm instead of double-issuing.
+        self.commits += rows
+            .iter()
+            .filter(|row| row["kind"] == "pass_committed")
+            .count() as u64;
         Ok(moved
             || rows
                 .last()
@@ -352,6 +357,39 @@ fn check_startup_round(
 /// finish in 2-4 passes with at most 1-pass pauses; 8 stalls fail loudly with
 /// the trajectory, never silently and never as a timeout.
 const FENCE_STALL_CAP: u32 = 8;
+
+/// Startup quiesce before round 2 (pid-leg round-4 wall harness). The wall
+/// mechanism: the rotation withholds round 2 as a startup fence (k=32),
+/// the suspended pairs resume through the budgeted rotation (round 3's
+/// placements trickle over many publications — the probe's drain proves
+/// it), and each growth-bearing publication re-adds its covered segment to
+/// the shared edge (pinned per-publication increment). Issuing round 4 on
+/// the first sight of A=2 therefore strands round-3 laggards on a stale
+/// base: they stage double-width (2,4] segments whose union install re-adds
+/// already held growth and jumps the edge 2->4 against the pinned 3. Live
+/// runs prove the fence is structural, not a race any settle wins: 21 s
+/// after round 1 still fenced, and 21 s before plus 20 s after round 1
+/// still fenced (k=32 both times). The quiesce plus the round-2 k=0 verdict
+/// below therefore serve as the fast loud harness (red in under a minute
+/// with the why, instead of the misleading round-4 chain error) and as the
+/// forward-compatible validation for a product-side fix. One-time startup
+/// settle only (~20 s plus the pre-round-1 hold below, of a 900 s budget);
+/// the per-round cadence and the R4 throughput arithmetic are untouched.
+/// The three-round probe keeps the immediate issue and owns the k=32
+/// coverage (32/32 fences, drained 3).
+const QUIESCE_MIN_WALL: Duration = Duration::from_secs(20);
+const QUIESCE_COMMITS: u64 = 8;
+
+/// Pre-round-1 quiesce: the ownership checkpoint stamped at round-1 staging
+/// decides the round-2 disposition, so a maturity wait was also tried
+/// before round 1 is issued. Live runs prove it insufficient as well (21 s
+/// of armed commits before round 1 still fenced): the fast pid ownership
+/// index completes between round-1 staging and the round-2 visit, so the
+/// round-2 growth mandatorily withholds by construction on this scope,
+/// while the slow system index completes after round 2 and dodges the
+/// fence. Kept as settle margin and as the negative-result harness.
+const PRE_QUIESCE_MIN_WALL: Duration = Duration::from_secs(20);
+const PRE_QUIESCE_COMMITS: u64 = 12;
 
 /// Round-2 fence verdict from one `pass_committed` observation.
 enum StartupGateAction {
@@ -1437,6 +1475,11 @@ fn run_wrap_cell(enabled: bool, cell: WrapCell) -> Result<(serde_json::Value, u6
     let view = RefCell::new(PassView::default());
     let failure = RefCell::new(None::<anyhow::Error>);
     let gate = RefCell::new(StartupGate::new());
+    let r1_elapsed = Cell::new(None::<Duration>);
+    let r1_commits = Cell::new(0u64);
+    let quiesce_logged = Cell::new(false);
+    let armed_elapsed = Cell::new(None::<Duration>);
+    let armed_commits = Cell::new(0u64);
     let stop = || {
         let advance = || -> Result<bool> {
             if failure.borrow().is_some() {
@@ -1478,7 +1521,37 @@ fn run_wrap_cell(enabled: bool, cell: WrapCell) -> Result<(serde_json::Value, u6
                 .as_ref()
                 .and_then(|edge| edge["entries"]["count"].as_u64());
             match state.get() {
-                (0, _) if armed(view.a.as_ref()) => {
+                (0, _) => {
+                    // Pre-round-1 quiesce: the ownership checkpoint that
+                    // decides the round-2 disposition (ordinary bypass vs
+                    // startup fence) is stamped at round-1 staging, from the
+                    // ownership index/caller readiness at that instant — a
+                    // post-round-1 hold comes too late (proven: 21 s after
+                    // round 1 still fenced). Hold round 1 until the engine
+                    // milestones show the same maturity the slow system leg
+                    // reaches naturally (~15 s to its round-1 staging): wall
+                    // floor plus quiet armed commits since first arming.
+                    if !armed(view.a.as_ref()) {
+                        return Ok(false);
+                    }
+                    if armed_elapsed.get().is_none() {
+                        armed_elapsed.set(Some(start.elapsed()));
+                        armed_commits.set(view.commits);
+                        eprintln!(
+                            "G21_WRAP_ROUND enabled={enabled} phase=a pre_quiesce started caller={caller}"
+                        );
+                    }
+                    let quiet = view.commits.saturating_sub(armed_commits.get());
+                    let waited = start
+                        .elapsed()
+                        .saturating_sub(armed_elapsed.get().unwrap_or_default());
+                    if waited < PRE_QUIESCE_MIN_WALL || quiet < PRE_QUIESCE_COMMITS {
+                        return Ok(false);
+                    }
+                    eprintln!(
+                        "G21_WRAP_ROUND enabled={enabled} phase=a pre_quiesce done waited_ms={} quiet_commits={quiet}",
+                        waited.as_millis()
+                    );
                     workload.command("ready", "ready", 0)?;
                     workload.command("count", "a-done", 1)?;
                     eprintln!(
@@ -1505,9 +1578,73 @@ fn run_wrap_cell(enabled: bool, cell: WrapCell) -> Result<(serde_json::Value, u6
                         };
                         let k = check_startup_round(round, count, &view.evidence, &caller, prior)?;
                         fence_k.set(k);
-                        if round <= 3 || round % 50 == 0 || round == COUNTED {
+                        // Round 1 re-validates on every trigger during the
+                        // quiesce below: log it once (first validation).
+                        let log_round = round != 1 || r1_elapsed.get().is_none();
+                        if log_round && (round <= 3 || round % 50 == 0 || round == COUNTED) {
                             eprintln!(
                                 "G21_WRAP_ROUND enabled={enabled} phase=a round={round} A={count} k={k}"
+                            );
+                        }
+                        if round == 1 {
+                            // Startup quiesce: round 1 re-validates on every
+                            // trigger (A=1/k=0 steady, nothing issued), which
+                            // doubles as the stability check — any deviation
+                            // fails above, never waits out. Hold round 2
+                            // until the count-ownership proof completes (wall
+                            // floor plus quiet commits since round 1).
+                            if r1_elapsed.get().is_none() {
+                                r1_elapsed.set(Some(start.elapsed()));
+                                r1_commits.set(view.commits);
+                                eprintln!(
+                                    "G21_WRAP_ROUND enabled={enabled} phase=a quiesce started A={count} k={k}"
+                                );
+                            }
+                            let quiet = view.commits.saturating_sub(r1_commits.get());
+                            let waited = start
+                                .elapsed()
+                                .saturating_sub(r1_elapsed.get().unwrap_or_default());
+                            if waited < QUIESCE_MIN_WALL || quiet < QUIESCE_COMMITS {
+                                if !quiesce_logged.get() && quiet >= QUIESCE_COMMITS {
+                                    quiesce_logged.set(true);
+                                    eprintln!(
+                                        "G21_WRAP_ROUND enabled={enabled} phase=a quiesce commits_quiet={quiet} waiting_wall"
+                                    );
+                                }
+                                return Ok(false);
+                            }
+                            eprintln!(
+                                "G21_WRAP_ROUND enabled={enabled} phase=a quiesce done waited_ms={} quiet_commits={quiet}",
+                                waited.as_millis()
+                            );
+                        }
+                        if round == 2 {
+                            // The full leg requires k=0: a fenced 400-round
+                            // pinned chain is structurally ungreenable
+                            // (suspended pairs resume through the budgeted
+                            // rotation over many publications, and each
+                            // growth-bearing publication re-adds its covered
+                            // segment to the shared edge, so the first
+                            // straddled round jumps +2 against the pinned
+                            // +1). The three-round probe owns the k=32
+                            // coverage. A fence here is the structural
+                            // pid-scope disposition (fast ownership index
+                            // completes before the round-2 visit, so the
+                            // first post-watermark growth mandatorily
+                            // withholds) — fail loudly with the evidence
+                            // instead of running into the misleading
+                            // round-4 chain error. Needs a product-side fix
+                            // (first-growth ordinary bypass) or a spec
+                            // decision, not a longer settle.
+                            ensure!(
+                                k == 0,
+                                "startup fence fired (k={k}): the pid-scope round-2 growth \
+                                 mandatorily withholds (fast ownership index completes before \
+                                 the round-2 visit), and the fenced full-leg chain cannot hold \
+                                 (rotation trickle plus union re-add jumps +2 at the first \
+                                 straddled round). Needs a product-side fix or spec decision: \
+                                 A={count} evidence={:?}",
+                                view.evidence
                             );
                         }
                         if round < COUNTED {

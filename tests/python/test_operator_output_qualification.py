@@ -2,6 +2,7 @@
 """Oracle mutations and genuine fd controls, never installed acceptance."""
 import copy
 import fcntl
+import hashlib
 import io
 import json
 import os
@@ -1435,6 +1436,232 @@ class FdControls(unittest.TestCase):
     def test_matrix_enumerates_exact_27_cells(self):
         self.assertEqual(len(HARNESS['CELLS']), 27)
         self.assertEqual(len(set(HARNESS['CELLS'])), 27)
+
+
+def blocked_fixture():
+    """A healthy blocked-stderr cell: independent ACK, pressure, custody, deps."""
+    ledger, receipt, evidence, counts = fixture()
+    receipt.update(cancel='midcapture', signals=[dict(signal='SIGINT', t_ns=400)],
+                   stderr_blocked=True, stderr_stalled=True, stderr_buffered_bytes=4096,
+                   stderr_release_ns=1_400_000_400,
+                   reporter_ack=dict(channel='owned_perf_reporter', ack_ns=50_000_400),
+                   reporter_kernel=dict(samples=1, kernel_count=1, lost=0),
+                   observer_reaped_after_probe=True,
+                   candidate_sha256='c' * 64,
+                   reporter_controls=dict(source_revision='a' * 40, candidate_sha256='c' * 64,
+                                          passed=['handlerblocked', 'none', 'wrongworker']))
+    return ledger, receipt, evidence, counts
+
+
+def blocked_summary(sha256, source='a' * 40):
+    cells = ['none', 'readable', 'repeated', 'delayed', 'wrongexe', 'wrongprocess',
+             'handlerblocked', 'wrongworker']
+    return dict(source_revision=source,
+                candidate=dict(path='/owned/p11scope', sha256=sha256),
+                controls=[dict(cell=name, control_pass=True,
+                               candidate=dict(path='/owned/p11scope', sha256=sha256))
+                          for name in cells],
+                remaining=['blocked-stderr E17 cell execution on this candidate'],
+                qualification='owned reporter controls only; no blocked-stderr or full E17 acceptance')
+
+
+class BlockedStderrOracleTests(unittest.TestCase):
+    def check(self, ledger, receipt, evidence, counts, stdout=None):
+        trace = render(counts, evidence)
+        return ORACLE['evaluate'](trace, trace if stdout is None else stdout, ledger, receipt)
+
+    def test_healthy_blocked_stderr_with_independent_ack_passes(self):
+        result = self.check(*blocked_fixture())
+        self.assertTrue(result['pass'], result)
+        self.assertEqual(result['status'], 'PASS')
+        self.assertEqual(result['cancellation_response_seconds'], 0.05)
+
+    def test_healthy_blocked_stderr_lossy_content_passes(self):
+        ledger, receipt, evidence, counts = blocked_fixture()
+        receipt.update(sink='slowpipe', stdout_stalled=True)
+        evidence['scheduling']['sink_timeouts'] = 1
+        evidence['scheduling']['sink_dropped_bytes'] = 17
+        trace = render(counts, evidence)
+        result = ORACLE['evaluate'](trace, trace[17:], ledger, receipt)
+        self.assertTrue(result['pass'], result)
+
+    def test_blocked_stderr_gates_fail_closed(self):
+        cases = {
+            # Missing measurement stays unqualified, never a pass.
+            'no-deps': ('NOT_RUN', lambda ledger, receipt, evidence, counts: receipt.pop('reporter_controls')),
+            'missing-dep': ('NOT_RUN', lambda ledger, receipt, evidence, counts: receipt['reporter_controls']['passed'].remove('none')),
+            'foreign-dep-source': ('NOT_RUN', lambda ledger, receipt, evidence, counts: receipt['reporter_controls'].update(source_revision='0' * 40)),
+            'foreign-dep-candidate': ('NOT_RUN', lambda ledger, receipt, evidence, counts: receipt['reporter_controls'].update(candidate_sha256='0' * 64)),
+            'no-ack': ('NOT_RUN', lambda ledger, receipt, evidence, counts: receipt.update(reporter_ack=None)),
+            # Corrupt or late evidence is a failure, never unqualified silence.
+            'same-channel': ('FAIL', lambda ledger, receipt, evidence, counts: receipt['reporter_ack'].update(channel='readable_stderr')),
+            'slow-ack': ('FAIL', lambda ledger, receipt, evidence, counts: receipt['reporter_ack'].update(ack_ns=100_000_400)),
+            'pre-signal-ack': ('FAIL', lambda ledger, receipt, evidence, counts: receipt['reporter_ack'].update(ack_ns=399)),
+            'kernel-loss': ('FAIL', lambda ledger, receipt, evidence, counts: receipt['reporter_kernel'].update(lost=1)),
+            'kernel-count': ('FAIL', lambda ledger, receipt, evidence, counts: receipt['reporter_kernel'].update(kernel_count=2)),
+            'no-pressure': ('FAIL', lambda ledger, receipt, evidence, counts: receipt.update(stderr_stalled=False)),
+            'zero-buffered': ('FAIL', lambda ledger, receipt, evidence, counts: receipt.update(stderr_buffered_bytes=0)),
+            'early-release': ('FAIL', lambda ledger, receipt, evidence, counts: receipt.update(stderr_release_ns=50_000_399)),
+            'reaped-before-probe': ('FAIL', lambda ledger, receipt, evidence, counts: receipt.update(observer_reaped_after_probe=False)),
+        }
+        for name, (status, mutate) in cases.items():
+            with self.subTest(gate=name):
+                ledger, receipt, evidence, counts = blocked_fixture()
+                mutate(ledger, receipt, evidence, counts)
+                result = self.check(ledger, receipt, evidence, counts)
+                self.assertFalse(result['pass'], result)
+                self.assertEqual(result['status'], status, result)
+
+    def test_blocked_stderr_does_not_waive_stdout_content(self):
+        ledger, receipt, evidence, counts = blocked_fixture()
+        trace = render(counts, evidence)
+        shed = ORACLE['evaluate'](trace, trace[1:], ledger, receipt)
+        self.assertFalse(shed['pass'])
+        self.assertEqual(shed['status'], 'FAIL', shed)
+        receipt.update(sink='slowpipe', stdout_stalled=True)
+        evidence['scheduling']['sink_timeouts'] = 1
+        evidence['scheduling']['sink_dropped_bytes'] = 17
+        trace = render(counts, evidence)
+        lossy = ORACLE['evaluate'](trace, b'X' * (len(trace) - 17), ledger, receipt)
+        self.assertFalse(lossy['pass'])
+        self.assertEqual(lossy['status'], 'NOT_RUN', lossy)
+
+
+class BlockedStderrDependencyTests(unittest.TestCase):
+    def test_controls_summary_binds_same_source_candidate_and_required_cells(self):
+        module = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/blocked_stderr.py'))
+        healthy = blocked_summary('c' * 64)
+        verdict = module['check_dependencies'](healthy, source_revision='a' * 40, candidate_sha256='c' * 64)
+        self.assertEqual(verdict['passed'], ['handlerblocked', 'none', 'wrongworker'])
+        for name, mutate, source, sha in (
+                ('missing-cell', lambda summary: summary['controls'].pop(0), 'a' * 40, 'c' * 64),
+                ('failed-cell', lambda summary: summary['controls'][0].update(control_pass=False), 'a' * 40, 'c' * 64),
+                ('foreign-source', lambda summary: None, '0' * 40, 'c' * 64),
+                ('foreign-candidate', lambda summary: None, 'a' * 40, '0' * 64),
+                ('mixed-control-candidate', lambda summary: summary['controls'][0]['candidate'].update(sha256='0' * 64), 'a' * 40, 'c' * 64),
+                ('malformed-control', lambda summary: summary['controls'].__setitem__(0, 'none'), 'a' * 40, 'c' * 64)):
+            with self.subTest(gate=name):
+                summary = blocked_summary('c' * 64)
+                mutate(summary)
+                with self.assertRaises(ValueError):
+                    module['check_dependencies'](summary, source_revision=source, candidate_sha256=sha)
+
+    def test_controls_summary_loader_rejects_oversize_and_malformed_inputs(self):
+        module = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/blocked_stderr.py'))
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            (root / 'healthy.json').write_text(json.dumps(blocked_summary('c' * 64)))
+            self.assertEqual(module['load_controls_summary'](root / 'healthy.json')['source_revision'], 'a' * 40)
+            (root / 'malformed.json').write_text('{')
+            (root / 'wrong-shape.json').write_text(json.dumps(['none']))
+            (root / 'oversize.json').write_bytes(b'{' + b'0' * (1024 * 1024) + b'}')
+            for name in ('malformed.json', 'wrong-shape.json', 'oversize.json', 'absent.json'):
+                with self.subTest(gate=name):
+                    with self.assertRaises((ValueError, OSError)):
+                        module['load_controls_summary'](root / name)
+
+
+class BlockedStderrHarnessTests(unittest.TestCase):
+    def test_stall_witness_reports_positive_buffered_bytes(self):
+        pipe = HARNESS['OutputPipe']()
+        try:
+            os.set_blocking(pipe.write_fd, False)
+            self.assertEqual(os.write(pipe.write_fd, b'H' * 169), 169)
+            self.assertEqual(pipe.buffered(), 169)
+            with self.assertRaises(BlockingIOError):
+                os.write(pipe.write_fd, b'X' * 4096)
+            self.assertTrue(pipe.stalled())
+            self.assertEqual(pipe.buffered(), 169)
+        finally:
+            pipe.close()
+
+    def test_dependency_failure_returns_not_run_without_spawning(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            args = mock.Mock()
+            args.control = 'blocked-stderr'
+            args.calls = 3
+            args.source_revision = 'a' * 40
+            pin = mock.Mock()
+            with mock.patch.object(HARNESS['NATIVE'], 'spawn_owned',
+                                   side_effect=AssertionError('must not spawn without qualified dependencies')):
+                result = HARNESS['cell'](args, '4M-file-midcapture', Path(scratch), {},
+                                         pin, pin, pin, blocked={'error': 'reporter dependency none not passed'})
+        self.assertFalse(result['pass'])
+        self.assertEqual(result['status'], 'NOT_RUN')
+        self.assertTrue(any('none' in line for line in result['unqualified']))
+
+
+class BlockedStderrDryRunTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.temporary = tempfile.TemporaryDirectory()
+        cls.root = Path(cls.temporary.name)
+        sources = cls.root / 'reporter.c'
+        sources.write_text('#include <unistd.h>\nvoid reporter(int) __asm__("_ZN8p11scope3run21report_capture_cancel17h0123456789abcdefE");\n'
+            '__attribute__((noinline,used)) void reporter(int x) { __asm__ volatile("" : : "r"(x)); }\n'
+            'int main(void) { reporter(2); return 0; }\n')
+        cls.binary = cls.root / 'candidate'
+        built = subprocess.run(['cc', '-O2', '-fPIE', '-pie', str(sources), '-o', str(cls.binary)],
+            capture_output=True, text=True, timeout=20)
+        if built.returncode:
+            cls.temporary.cleanup()
+            raise AssertionError(built.stderr)
+        cls.helper = cls.root / 'reporter-probe'
+        helper = subprocess.run(['cc', '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror',
+            str(ROOT / 'tests/fixtures/operator-output/reporter-probe.c'), '-o', str(cls.helper)],
+            capture_output=True, text=True, timeout=20)
+        if helper.returncode:
+            cls.temporary.cleanup()
+            raise AssertionError(helper.stderr)
+        for name in ('provider.so', 'caller'):
+            (cls.root / name).write_bytes(b'owned dry-run input ' + name.encode())
+        digest = hashlib.sha256(cls.binary.read_bytes()).hexdigest()
+        (cls.root / 'controls.json').write_text(json.dumps(blocked_summary(digest)))
+        cls.digest = digest
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.temporary.cleanup()
+
+    def dry_run(self, *extra):
+        out = self.root / f'plan-{time.monotonic_ns()}'
+        result = subprocess.run([sys.executable, '-I', str(ROOT / 'scripts/qualify-operator-output.py'),
+            '--dry-run', '--binary', str(self.binary), '--provider', str(self.root / 'provider.so'),
+            '--caller', str(self.root / 'caller'), '--reporter-probe', str(self.helper),
+            '--reporter-controls', str(self.root / 'controls.json'),
+            '--source-revision', 'a' * 40, '--uid', '1000', '--gid', '1000',
+            '--cells', '4M-file-midcapture', '--control', 'blocked-stderr',
+            '--out', str(out), *extra], capture_output=True, text=True, timeout=60)
+        return result, out
+
+    def test_dry_run_proves_blocked_stderr_wiring_without_privilege(self):
+        result, out = self.dry_run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plan = json.loads(result.stdout)
+        self.assertEqual(plan['mode'], 'dry_run')
+        self.assertEqual(plan['cells'], ['4M-file-midcapture'])
+        self.assertGreater(plan['reporter_file_offset'], 0)
+        self.assertEqual(plan['dependencies']['passed'], ['handlerblocked', 'none', 'wrongworker'])
+        self.assertTrue(plan['pressure_selfcheck']['stalled'])
+        self.assertGreater(plan['pressure_selfcheck']['buffered_bytes'], 0)
+        self.assertFalse(out.exists(), 'a dry run must not create its output directory')
+
+    def test_dry_run_refuses_each_broken_input(self):
+        foreign = self.root / 'foreign.json'
+        foreign.write_text(json.dumps(blocked_summary('0' * 64)))
+        for name, mutate in (
+                ('missing-probe', ['--reporter-probe', '/absent/probe']),
+                ('probe-for-ordinary', ['--control', 'ordinary']),
+                ('bad-summary', ['--reporter-controls', str(self.root / 'caller')]),
+                ('foreign-source', ['--source-revision', '0' * 40]),
+                ('foreign-candidate', ['--reporter-controls', str(foreign)]),
+                ('unresolvable-symbol', ['--binary', '/bin/true']),
+                ('uncancelled-cell', ['--cells', '4M-file-none'])):
+            with self.subTest(gate=name):
+                # argparse keeps the last repeated flag, so the appended
+                # override deterministically replaces the healthy value.
+                result, _ = self.dry_run(*mutate)
+                self.assertEqual(result.returncode, 1, result.stderr)
 
 
 if __name__ == '__main__':

@@ -34,7 +34,10 @@ requires the affected gates to run again on that new revision.
   `p11scope/inventory-diff/v1` (offline comparison),
   `p11scope/inventory-diagnostics/v1` (diagnostics), and
   `p11scope/inspect/v1` / `p11scope/inspect-system/v1` (inspection). Each is
-  defined under [docs/schema](docs/schema); the historical v2 profile
+  defined under [docs/schema](docs/schema) except `p11scope-manifest/5`,
+  whose contract is code in
+  [crates/manifest/src/manifest.rs](crates/manifest/src/manifest.rs)
+  (the `SCHEMA` constant and its writer); the historical v2 profile
   documents keep their old shape.
 
 ## 1. Freeze the candidate

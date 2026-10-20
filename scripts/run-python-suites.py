@@ -85,6 +85,7 @@ RUN = [
     ("test_python_suite_registry.py", []),
     ("test_release_matrix_contract.py", []),
     ("test_release_notices.py", []),
+    ("test_release_recipient.py", []),
     ("test_residual_gates.py", []),
     ("test_schema_json.py", []),
     ("test_skip_reason_vocabulary.py", []),

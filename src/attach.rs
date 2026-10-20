@@ -3958,6 +3958,33 @@ pub(crate) fn embedded_object_is_stubbed() -> bool {
     entry_stub
 }
 
+/// Whether a raw errno is the kernel verifier's budget refusal: E2BIG is
+/// what BPF_PROG_LOAD returns when the program exceeds the complexity
+/// limit. Every other errno keeps its own meaning.
+#[cfg(test)]
+pub(crate) fn is_verifier_budget_errno(errno: Option<i32>) -> bool {
+    errno == Some(libc::E2BIG)
+}
+
+/// Load-refusal detector for doctor/diagnostics: true only for a genuine
+/// BPF program-load refusal on verifier budget (E2BIG from BPF_PROG_LOAD).
+/// Permission, map-policy, identity and malformed-object failures — and
+/// every non-load error — return false and keep their own errors.
+/// (aya keeps the LoadError fields private, so the errno is read back
+/// through the documented io-error source.)
+#[cfg(test)]
+pub(crate) fn is_verifier_budget_refusal(error: &aya::programs::ProgramError) -> bool {
+    if !matches!(error, aya::programs::ProgramError::LoadError { .. }) {
+        return false;
+    }
+    use std::error::Error as _;
+    let errno = error
+        .source()
+        .and_then(|source| source.downcast_ref::<std::io::Error>())
+        .and_then(|io| io.raw_os_error());
+    is_verifier_budget_errno(errno)
+}
+
 /// The DISCOVERY ring size this scope loads with.
 /// The one loader configuration of the capture object, shared by capture
 /// sessions and the uretprobe-hazard self-probe (J-DOSSIER#28): vmlinux BTF
@@ -12650,10 +12677,78 @@ mod tests {
         );
     }
 
+    /// Load-refusal detector matrix: only the E2BIG budget errno
+    /// classifies; every other errno — and a missing errno — stays a
+    /// loud unrelated failure.
+    #[test]
+    fn verifier_budget_errno_matrix() {
+        assert!(super::is_verifier_budget_errno(Some(libc::E2BIG)));
+        for errno in [
+            libc::EINVAL,
+            libc::EACCES,
+            libc::EPERM,
+            libc::ENOMEM,
+            libc::EFAULT,
+        ] {
+            assert!(
+                !super::is_verifier_budget_errno(Some(errno)),
+                "errno {errno} must not classify as a budget refusal"
+            );
+        }
+        assert!(!super::is_verifier_budget_errno(None));
+    }
+
+    /// Load-refusal detector, live: a FULL root load either succeeds
+    /// (bigger-limit kernels) or fails with a classified refusal. The
+    /// classifier must agree with the real errno in both directions — a
+    /// misfire fails. Default builds only; featured builds pin the
+    /// stubbed load in `stubbed_roots_load`.
+    #[cfg(not(feature = "stub-object-attributes"))]
+    #[ignore = "root-owned BPF lane; FULL root load refusal is classified"]
+    #[test]
+    fn full_root_load_refusal_is_classified() {
+        let btf = aya::Btf::from_sys_fs().expect("vmlinux BTF for typed task storage");
+        let mut ebpf = super::load_capture_object(
+            &btf,
+            crate::run::resolve_ring_bytes(None),
+            p11scope_ebpf_common::DISCOVERY_BYTES,
+        )
+        .expect("FULL object parses and creates maps");
+        let program: &mut aya::programs::UProbe = ebpf
+            .program_mut("p11_entry")
+            .unwrap_or_else(|| panic!("FULL object missing p11_entry"))
+            .try_into()
+            .unwrap_or_else(|error| panic!("p11_entry is not a uprobe: {error}"));
+        match program.load() {
+            Ok(()) => println!("FULL p11_entry loads on this kernel"),
+            Err(error) => {
+                use std::error::Error as _;
+                if matches!(error, aya::programs::ProgramError::LoadError { .. }) {
+                    let errno = error
+                        .source()
+                        .and_then(|source| source.downcast_ref::<std::io::Error>())
+                        .and_then(|io| io.raw_os_error())
+                        .expect("a real LoadError carries the BPF_PROG_LOAD errno");
+                    assert_eq!(
+                        super::is_verifier_budget_refusal(&error),
+                        errno == libc::E2BIG,
+                        "classifier must agree with errno {errno} in both directions"
+                    );
+                    println!("FULL p11_entry refused: errno={errno}");
+                } else {
+                    assert!(
+                        !super::is_verifier_budget_refusal(&error),
+                        "non-load errors never classify: {error}"
+                    );
+                }
+            }
+        }
+    }
+
     /// P0-only ship vehicle, live: stub-featured bytes load both object
     /// roots on 1M-budget kernels, where FULL is refused with E2BIG.
-    /// Featured builds only; the default-build refusal control lands
-    /// with the classifier.
+    /// Featured builds only; the default-build refusal control is
+    /// `full_root_load_refusal_is_classified`.
     #[cfg(feature = "stub-object-attributes")]
     #[ignore = "root-owned BPF lane; stubbed p11_entry/p11_return load on 1M kernels"]
     #[test]

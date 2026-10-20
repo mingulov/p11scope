@@ -3012,7 +3012,11 @@ impl Display {
     /// batch for another caller stays staged; a stale staged batch
     /// (another frame's, superseded before its draw) drops here and
     /// never pairs. A new revision closes the old frame's committed
-    /// batch and attempt record.
+    /// batch and attempt record — but the comparison is against the
+    /// committing frame itself, not the transiently zeroed viewed
+    /// authority: a shed/cut clears that authority, and the repaint
+    /// of the same installed frame must keep the retained batch and
+    /// failure membership the frame earned.
     fn commit_viewed_frame(&mut self) {
         if self.view_exhausted {
             return;
@@ -3027,15 +3031,40 @@ impl Display {
         } else {
             self.state.promotion.selected
         };
+        let capture = self.promoter.capture();
         if revision != self.viewed_revision {
-            self.committed_baseline = None;
-            self.baseline_missed = None;
+            // Same installed frame (its revision, committed before
+            // the shed/cut zeroed viewed authority) with a batch
+            // still naming it: keep it, so recovery needs no new
+            // acquisition. Anything else is a superseded frame's.
+            let same_frame_batch =
+                self.committed_baseline
+                    .as_ref()
+                    .is_some_and(|(committed_revision, batch, _)| {
+                        *committed_revision == revision
+                            && capture
+                                .is_some_and(|capture| batch.matches_view(capture, &presentation))
+                    });
+            if !same_frame_batch {
+                self.committed_baseline = None;
+            }
+            // Same installed frame (an offered frame has no revision
+            // yet, so identity, not the revision, keys this): a
+            // failure recorded before the committing draw, or before
+            // a shed/cut, survives onto the frame it belongs to.
+            // Anything else is a superseded frame's record.
+            let same_frame_missed = self
+                .baseline_missed
+                .as_ref()
+                .is_some_and(|(missed, _)| Arc::ptr_eq(missed, &presentation));
+            if !same_frame_missed {
+                self.baseline_missed = None;
+            }
         }
         // Promote the staged batch only when it names this frame AND
         // covers the committing caller. A frame-matching batch for
         // another caller stays staged (the cursor may return); any
         // other staged batch names a superseded frame and drops.
-        let capture = self.promoter.capture();
         match self.pending_baseline.take() {
             Some((batch, covered))
                 if capture.is_some_and(|capture| batch.matches_view(capture, &presentation))

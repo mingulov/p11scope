@@ -51,6 +51,16 @@ T7_SELECTORS = {
     "T7.default.detailed_hot_slot_third_rv_lp64": ["attach::inventory::activation::privileged_tests::privileged_t7_detailed_hot_slot_third_rv_lp64"],
     "T7.wide.detailed_hot_slot_third_rv_lp64": ["attach::inventory::activation::privileged_tests::privileged_t7_detailed_hot_slot_third_rv_lp64"],
 }
+# Registered soak acceptance selectors: the generator seeds them so a
+# regeneration never silently drops concrete acceptance registration.
+# Rule: "soak.{duration}s" runs the soak vehicle
+# (scripts/system-scope-soak.sh) once against the installed artifact; the
+# selector names the continuous-owned-workload test the run executes.
+SOAK_SELECTORS = {
+    "soak.1800s": ["soak.1800s::continuous-owned-workload"],
+    "soak.14400s": ["soak.14400s::continuous-owned-workload"],
+    "soak.86400s": ["soak.86400s::continuous-owned-workload"],
+}
 
 
 def require(condition, message):
@@ -165,7 +175,8 @@ def catalog():
 def new_manifest():
     cells = []
     for identifier, policy in catalog().items():
-        cells.append({"id": identifier, **policy, "test_ids": list(T7_SELECTORS.get(identifier, [])),
+        seeded = T7_SELECTORS.get(identifier, SOAK_SELECTORS.get(identifier, []))
+        cells.append({"id": identifier, **policy, "test_ids": list(seeded),
                       "command": [], "artifact_hashes": {},
                       "evidence_paths": [], "outcome": "NOT_RUN", "receipt": None, "receipt_sha256": None})
     return {"schema": SCHEMA, "ledger_sha256": digest(LEDGER), "deferred_sha256": digest(DEFERRED),

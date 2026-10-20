@@ -61,8 +61,12 @@ timestamps covering 1800, 14400 or 86400 seconds respectively.
 Before qualification, expand those entries into concrete kernel/profile
 cells and register exact test bodies in the policy. An aggregate label
 cannot substitute for missing kernel tests. The seven static selectors
-are filled in the initial fixture; the remaining rows are not executable
-qualification until their concrete tests are registered.
+and the three soak selectors (`soak.{1800,14400,86400}s`,
+`::continuous-owned-workload`, run by `scripts/system-scope-soak.sh`
+against the installed artifact — see
+`docs/testing/system-scope-soak.md`) are filled in the initial fixture;
+the remaining rows are not executable qualification until their
+concrete tests are registered.
 
 This checks receipt consistency and artifact custody. It does not make an
 invented receipt true, validate every product oracle, or replace review of

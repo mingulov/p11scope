@@ -72,11 +72,14 @@ flock /var/tmp/p11scope-ws-tmp/privileged.lock \
 Defaults cover the cell: horizon 1800, require-duration 1800, 30
 epochs of 60 s, 570 calls per epoch at 100 ms pace (1710 s of paced
 calls, inside the 85%..97% tuning window the runner enforces). The
-tracked tree must be clean (the receipt pins revision and tree); the
-runner refuses when the cargo lane is busy at start, and the controller
-keeps heavy builds off the host until the window closes. Exit 0 means
-all seven gates passed and `receipt.json` is written; anything else
-names its red gates and writes no qualifying receipt.
+observer runs horizon + 60 s slack (1860 s): the receipt window opens
+at workload release, a fraction of a second after the observer's own
+duration starts, so the slack keeps the window safely above the floor.
+The tracked tree must be clean (the receipt pins revision and tree);
+the runner refuses when the cargo lane is busy at start, and the
+controller keeps heavy builds off the host until the window closes.
+Exit 0 means all seven gates passed and `receipt.json` is written;
+anything else names its red gates and writes no qualifying receipt.
 
 ## Dry-run trials
 
@@ -93,6 +96,7 @@ short horizons:
 scripts/system-scope-soak.sh --cell soak.1800s --dry-run \
   --observer-stub scripts/fixtures/soak-observer-stub.py \
   --horizon 8 --epoch-s 2 --epoch-calls 5 --pace-us 350000 \
+  --observer-slack-s 2 \
   --work /var/tmp/p11scope-ws-tmp/soak-trial-green
 ```
 

@@ -36,11 +36,15 @@
 # Tuning rule (fail-closed): the paced workload estimate must cover
 # 85%..97% of the horizon, so epochs provably span the window yet the
 # workload always finishes inside the capture. Epochs must divide the
-# horizon evenly. --require-duration (default: the horizon) is the
-# oracle's duration floor and is recorded in run.json; a short trial
-# receipt carries its short window and the verifier refuses it for the
-# 1800s cell. --stub-arg (repeatable, dry-run only) forwards extra stub
-# argv for red-leg trials and is recorded verbatim in run.json.
+# horizon evenly. The observer runs horizon + --observer-slack-s (the
+# receipt window opens at workload release, which lands a fraction of a
+# second after the observer's own duration starts; without slack the
+# window could fall just short of the floor). --require-duration
+# (default: the horizon) is the oracle's duration floor and is recorded
+# in run.json; a short trial receipt carries its short window and the
+# verifier refuses it for the 1800s cell. --stub-arg (repeatable,
+# dry-run only) forwards extra stub argv for red-leg trials and is
+# recorded verbatim in run.json.
 set -eu
 cd "$(dirname "$0")/.."
 . scripts/lib.sh
@@ -48,6 +52,7 @@ cd "$(dirname "$0")/.."
 CELL=
 HORIZON=
 REQUIRE_DURATION=
+OBSERVER_SLACK_S=60
 EPOCH_S=60
 EPOCH_CALLS=570
 PACE_US=100000
@@ -72,6 +77,7 @@ while [ "$#" -gt 0 ]; do
         --cell) CELL=$2; shift 2 ;;
         --horizon) HORIZON=$2; shift 2 ;;
         --require-duration) REQUIRE_DURATION=$2; shift 2 ;;
+        --observer-slack-s) OBSERVER_SLACK_S=$2; shift 2 ;;
         --epoch-s) EPOCH_S=$2; shift 2 ;;
         --epoch-calls) EPOCH_CALLS=$2; shift 2 ;;
         --pace-us) PACE_US=$2; shift 2 ;;
@@ -83,7 +89,7 @@ while [ "$#" -gt 0 ]; do
         --stub-arg) STUB_ARGS="$STUB_ARGS $2"; shift 2 ;;
         --kernel-profile) KERNEL_PROFILE=$2; shift 2 ;;
         --test-id) TEST_ID=$2; shift 2 ;;
-        -h|--help) sed -n '2,43p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,47p' "$0"; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -104,13 +110,16 @@ if [ -z "$REQUIRE_DURATION" ]; then REQUIRE_DURATION=$HORIZON; fi
 if [ -z "$TEST_ID" ]; then TEST_ID="$CELL::continuous-owned-workload"; fi
 case "$HORIZON" in *[!0-9]*|"") refuse "bad --horizon: $HORIZON" ;; esac
 case "$REQUIRE_DURATION" in *[!0-9]*|"") refuse "bad --require-duration: $REQUIRE_DURATION" ;; esac
+case "$OBSERVER_SLACK_S" in *[!0-9]*|"") refuse "bad --observer-slack-s: $OBSERVER_SLACK_S" ;; esac
 case "$EPOCH_S" in *[!0-9]*|"") refuse "bad --epoch-s: $EPOCH_S" ;; esac
 case "$EPOCH_CALLS" in *[!0-9]*|"") refuse "bad --epoch-calls: $EPOCH_CALLS" ;; esac
 case "$PACE_US" in *[!0-9]*|"") refuse "bad --pace-us: $PACE_US" ;; esac
 [ "$HORIZON" -ge 1 ] || refuse "bad --horizon: $HORIZON"
 [ "$REQUIRE_DURATION" -ge 1 ] || refuse "bad --require-duration: $REQUIRE_DURATION"
+[ "$OBSERVER_SLACK_S" -ge 1 ] || refuse "bad --observer-slack-s: $OBSERVER_SLACK_S"
 [ "$EPOCH_S" -ge 1 ] || refuse "bad --epoch-s: $EPOCH_S"
 [ "$EPOCH_CALLS" -ge 1 ] || refuse "bad --epoch-calls: $EPOCH_CALLS"
+OBSERVER_DURATION=$(( HORIZON + OBSERVER_SLACK_S ))
 [ "$(( HORIZON % EPOCH_S ))" -eq 0 ] || refuse "epochs do not divide the horizon: $HORIZON % $EPOCH_S"
 EPOCHS=$(( HORIZON / EPOCH_S ))
 N_CALLS=$(( EPOCHS * EPOCH_CALLS ))
@@ -461,14 +470,14 @@ if [ "$MODE" = live ]; then
     OBSERVER_SOURCE=$INSTALLED
     set -- "$INSTALLED_COPY" profile \
         --pid "$WTARGET_PID" --manifest "$WORK/manifest.json" \
-        --mode metrics --duration "$HORIZON" -o "$WORK/report.json"
+        --mode metrics --duration "$OBSERVER_DURATION" -o "$WORK/report.json"
 else
     OBSERVER_BIN=$STUB_COPY
     OBSERVER_SOURCE=$OBSERVER_STUB
     # shellcheck disable=SC2086
     set -- python3 -I "$STUB_COPY" profile \
         --pid "$WTARGET_PID" --manifest "$WORK/manifest.json" \
-        --mode metrics --duration "$HORIZON" -o "$WORK/report.json" \
+        --mode metrics --duration "$OBSERVER_DURATION" -o "$WORK/report.json" \
         --counter-oracle "$PWD/scripts/check-capture-evidence.py" \
         --loopback-log "$WORK/workload.log" $STUB_ARGS
 fi
@@ -576,7 +585,7 @@ WPID_STARTTIME=
 OBSERVER_TIMED_OUT=false
 OBSERVER_SIGNAL=null
 observer_wait_state=0
-owned_wait_supervisor_terminal "$SPID_RECEIPT" $(( HORIZON + 600 )) || \
+owned_wait_supervisor_terminal "$SPID_RECEIPT" $(( OBSERVER_DURATION + 600 )) || \
     observer_wait_state=$?
 case "$observer_wait_state" in
     0) ;;
@@ -656,7 +665,7 @@ cat > "$WORK/meta.json" <<EOF
   "git_tracked_clean": $GIT_TRACKED_CLEAN, "started_iso": "$HARNESS_START_ISO",
   "observer_exit": $OBS_RC, "observer_timed_out": $OBSERVER_TIMED_OUT,
   "observer_signal": $OBSERVER_SIGNAL_JSON},
- "condition": {"scope": "pid", "mode": "metrics", "duration_s": $HORIZON,
+ "condition": {"scope": "pid", "mode": "metrics", "duration_s": $OBSERVER_DURATION,
   "n_calls": $N_CALLS, "pace_us": $PACE_US, "seed": $SEED, "map_early": 0,
   "ring_bytes": "default", "drain_interval_ms": "default",
   "sink": "file", "gate": "frame",
@@ -695,6 +704,7 @@ cat "$WORK/summary.txt" || true
 # so quoting cannot corrupt it; every value here is recorded, including
 # the trial-only stub args and requirement overrides.
 export WORK CELL TEST_ID KERNEL_PROFILE MODE HORIZON REQUIRE_DURATION EPOCH_S EPOCH_CALLS
+export OBSERVER_SLACK_S OBSERVER_DURATION
 export PACE_US SEED EPOCHS N_CALLS GIT_REV GIT_TREE HARNESS_START_ISO HARNESS_ARGV_JSON
 export OBS_ARGV_JSON WORKLOAD_ARGV_JSON T_SPAWN T_GO T_EXIT
 export WTARGET_PID WTARGET_STARTTIME WORKLOAD_RC
@@ -743,6 +753,8 @@ run = {
     "mode": mode,
     "horizon_s": integer("HORIZON"),
     "require_duration_s": integer("REQUIRE_DURATION"),
+    "observer_slack_s": integer("OBSERVER_SLACK_S"),
+    "observer_duration_s": integer("OBSERVER_DURATION"),
     "epoch_s": integer("EPOCH_S"),
     "epoch_calls": integer("EPOCH_CALLS"),
     "expected_epochs": integer("EPOCHS"),

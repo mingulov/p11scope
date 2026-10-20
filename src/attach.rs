@@ -3921,6 +3921,43 @@ fn validate_runtime_map(
 /// `--ring-bytes` still sizes only EVENTS.
 pub(crate) const SHARED_SCOPE_DISCOVERY_BYTES: u32 = 2 * 1024 * 1024;
 
+/// P0-only ship vehicle: whether the embedded Detailed object carries
+/// stubbed attribute capture. Probes the two verifier-heavy adapter
+/// functions' compiled sizes: the stub folds each to tens of instructions
+/// (27/50 at the P0 receipt) while FULL wires thousands (4,624/1,467).
+/// Panics on a half-wired object or an ambiguous probe — a silent
+/// misread here would mislabel the shipped flavor. Test-only: production
+/// derives the build flavor from the feature flag, and the consistency
+/// test pins the two together.
+#[cfg(test)]
+pub(crate) fn embedded_object_is_stubbed() -> bool {
+    fn adapter_len(parsed: &aya_obj::Object, fragment: &str) -> usize {
+        let mut matches = parsed
+            .functions
+            .values()
+            .filter(|function| function.name.contains(fragment));
+        let function = matches
+            .next()
+            .unwrap_or_else(|| panic!("embedded Detailed object has no {fragment} function"));
+        assert!(
+            matches.next().is_none(),
+            "embedded Detailed object has several {fragment} functions"
+        );
+        function.instructions.len()
+    }
+    let parsed =
+        aya_obj::Object::parse(crate::EBPF_OBJECT).expect("embedded Detailed object parses");
+    let entry = adapter_len(&parsed, "object_entry_attributes");
+    let emit = adapter_len(&parsed, "object_emit_get_attributes");
+    let entry_stub = entry < 500;
+    let emit_stub = emit < 300;
+    assert!(
+        entry_stub == emit_stub,
+        "half-wired embedded object (entry {entry}, emit {emit} instructions)"
+    );
+    entry_stub
+}
+
 /// The DISCOVERY ring size this scope loads with.
 /// The one loader configuration of the capture object, shared by capture
 /// sessions and the uretprobe-hazard self-probe (J-DOSSIER#28): vmlinux BTF
@@ -12597,5 +12634,46 @@ mod tests {
             source.contains("DiscoveryStage::poll_discovery("),
             "readiness polls through the shared predicate"
         );
+    }
+
+    /// P0-only ship vehicle: the embedded Detailed object carries
+    /// stubbed attribute capture exactly when the `stub-object-attributes`
+    /// feature built it. Both directions: a silent unwire fails featured
+    /// builds, a silent stub fails default builds. The live load test
+    /// proves the stubbed bytes load where FULL is refused.
+    #[test]
+    fn embedded_object_stub_matches_feature() {
+        assert_eq!(
+            super::embedded_object_is_stubbed(),
+            cfg!(feature = "stub-object-attributes"),
+            "embedded Detailed bytes must follow the stub feature"
+        );
+    }
+
+    /// P0-only ship vehicle, live: stub-featured bytes load both object
+    /// roots on 1M-budget kernels, where FULL is refused with E2BIG.
+    /// Featured builds only; the default-build refusal control lands
+    /// with the classifier.
+    #[cfg(feature = "stub-object-attributes")]
+    #[ignore = "root-owned BPF lane; stubbed p11_entry/p11_return load on 1M kernels"]
+    #[test]
+    fn stubbed_roots_load() {
+        let btf = aya::Btf::from_sys_fs().expect("vmlinux BTF for typed task storage");
+        let mut ebpf = super::load_capture_object(
+            &btf,
+            crate::run::resolve_ring_bytes(None),
+            p11scope_ebpf_common::DISCOVERY_BYTES,
+        )
+        .expect("stubbed object parses and creates maps");
+        for root in ["p11_entry", "p11_return"] {
+            let program: &mut aya::programs::UProbe = ebpf
+                .program_mut(root)
+                .unwrap_or_else(|| panic!("stubbed object missing {root}"))
+                .try_into()
+                .unwrap_or_else(|error| panic!("{root} is not a uprobe: {error}"));
+            program
+                .load()
+                .unwrap_or_else(|error| panic!("stubbed {root} must load: {error}"));
+        }
     }
 }

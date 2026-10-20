@@ -15,6 +15,11 @@ path = "src/lib.rs"
 [features]
 unsafe-unvalidated-metadata = []
 wide-detailed-2112 = ["p11scope-ebpf-common/wide-detailed-2112"]
+# P0-only ship vehicle: build the Detailed object with the H7-E4
+# attribute gate shut (entry acquires nothing, Get emission reads
+# nothing). v0.4.0 release bytes carry this; FULL stays the default
+# for diet/qualification work.
+stub-object-attributes = []
 # Internal-only diagnostic: attribute every published discovery skip to the
 # site that raised it. Stderr only; the capture document is byte-identical
 # either way (src/discovery/attribution.rs).

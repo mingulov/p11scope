@@ -384,6 +384,7 @@ fn build_script_selects_tools_before_clang_and_declares_cache_inputs() {
     for declaration in [
         "cargo:rerun-if-env-changed=P11SCOPE_PREPARED_BPF_CARGO",
         "cargo:rerun-if-env-changed=P11SCOPE_PREPARED_BPF_RUSTC",
+        "cargo:rerun-if-env-changed=CARGO_FEATURE_STUB_OBJECT_ATTRIBUTES",
         "cargo:rerun-if-env-changed=LD_LIBRARY_PATH",
         "cargo:rerun-if-changed=build_support/bpf_tools.rs",
     ] {

@@ -340,7 +340,8 @@ pub const ATTRIBUTE_CAPTURE_WIRED: bool = !cfg!(feature = "stub-object-attribute
 /// directly, so host tests observe wiring through this function — no
 /// caller hand-writes the inspected outcomes. Acquisition is exact:
 /// every `fetch_arg` call below is a probe register/stack read on BPF,
-/// pinned by the drivers' fetch counts.
+/// pinned by the drivers' fetch counts. Under the `stub-object-attributes`
+/// build the gate below returns first and every fetch evaporates.
 #[inline(always)]
 // Closure plus scalar parameters map to the BPF wrapper's register-passed
 // arguments; bundling them into a struct would risk wrapper stack the
@@ -368,6 +369,13 @@ pub fn adapter_attributes_entry(
         || row.guard > OBJECT_GUARD_SCALAR_DERIVE
     {
         return false;
+    }
+    // Closed shipping gate: acquire nothing. Every `fetch_arg` below
+    // this line evaporates while the switch is false (the BPF wrapper
+    // keeps only its descriptor lookup); the side keeps its
+    // allocated-zero attribute state.
+    if !ATTRIBUTE_CAPTURE_WIRED {
+        return true;
     }
     if row.action == OBJECT_ACTION_GET {
         capture_get_template(side, row, layout, fetch_arg, &mut read_word);
@@ -804,7 +812,9 @@ pub unsafe fn adapter_tail_fill(
     }
     // Entry's inspected lists pass through; refused pairs already
     // carry their honest uninspected marking from the entry store.
-    // Absent pairs stay all-zero.
+    // Absent pairs stay all-zero. Under the stub build entry stored
+    // nothing, so present pairs are marked uninspected here rather
+    // than passing allocated-zero lists through as inspected.
     let mut p = 0;
     while p < 2 {
         let present =
@@ -814,6 +824,9 @@ pub unsafe fn adapter_tail_fill(
             unsafe {
                 let dst = core::ptr::addr_of_mut!((*tail).requested[p]);
                 dst.write(side.requested[p]);
+                if !ATTRIBUTE_CAPTURE_WIRED {
+                    core::ptr::addr_of_mut!((*dst).flags).write(OBJECT_ATTR_LIST_UNINSPECTED);
+                }
             }
         }
         p += 1;
@@ -1097,6 +1110,16 @@ pub unsafe fn adapter_emit_get_attributes(
         return true;
     }
     if !return_accepts_get_results(rv) {
+        return true;
+    }
+    // Shut gate: the stub build establishes no Get results; the tail
+    // keeps the UNINSPECTED marking the fill wrote. Direct seam tests
+    // execute the decoder itself.
+    if !ATTRIBUTE_CAPTURE_WIRED {
+        // SAFETY: `tail` is the exclusively owned reserved tail.
+        unsafe {
+            (*tail).result_attributes.flags = OBJECT_ATTR_LIST_UNINSPECTED;
+        }
         return true;
     }
     // Authority from the adapter's own custody plus the threaded verdict:

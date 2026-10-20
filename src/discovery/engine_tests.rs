@@ -3931,8 +3931,10 @@ fn batch_exit_dominates_exec_before_dead_pin_promotion() {
         "a proven exit is not a loss"
     );
 
-    // Loss that cannot be proven an exit stays loss: the live-loader attach
-    // postcheck route on a generation that is still running.
+    // E17 midfinal correction: a stale report for a generation that is
+    // still running is declined — the pin re-reads Current, so there is no
+    // positive evidence of change to record as loss. The deferral is marked
+    // and the next pass re-checks.
     let mut child = std::process::Command::new("sleep")
         .arg("30")
         .spawn()
@@ -3944,18 +3946,19 @@ fn batch_exit_dominates_exec_before_dead_pin_promotion() {
     engine.queue_stale_views(&[ProcessViewId(20)].into_iter().collect(), &mut pending);
     child.kill().unwrap();
     child.wait().unwrap();
-    assert_eq!(
-        pending.get(&ProcessViewId(20)),
-        Some(&RetirementCause::GenerationLost),
-        "a live generation that changed under us is genuine loss"
+    assert!(
+        pending.is_empty(),
+        "a contradicted report queues nothing: {pending:?}"
     );
     assert!(
         engine
             .counters
             .object_skips
             .iter()
-            .any(|skip| skip.subject == "live discovery generation"),
-        "genuine loss stays sticky and PARTIAL"
+            .any(|skip| skip.subject == "live discovery generation"
+                && skip.reason.contains("contradicted or unprovable")),
+        "the deferral is marked PARTIAL: {:?}",
+        engine.counters.object_skips
     );
 }
 
@@ -7722,7 +7725,7 @@ fn cgroup_walk_does_not_silently_drop_directory_entry_errors() {
 }
 
 #[test]
-fn retirement_intent_is_persistent_and_generation_loss_is_sticky() {
+fn retirement_intent_is_persistent_and_recorded_loss_is_sticky() {
     let view = ProcessView::open(ProcessViewId(15), std::process::id()).unwrap();
     let mut engine = lifecycle_discovered(vec![view]);
     let mut pending = PendingViewRetirements::new();
@@ -7737,6 +7740,9 @@ fn retirement_intent_is_persistent_and_generation_loss_is_sticky() {
         RetirementCause::ExpectedRemoval,
         &mut pending,
     );
+    // E17 midfinal correction: a loss report for this live view is
+    // declined (the pin re-reads Current), so it neither records nor
+    // merges — the ExpectedRemoval intent persists untouched.
     engine.queue_retirement(
         ProcessViewId(15),
         RetirementCause::GenerationLost,
@@ -7745,22 +7751,40 @@ fn retirement_intent_is_persistent_and_generation_loss_is_sticky() {
 
     assert_eq!(
         engine.retirement_intents.get(&ProcessViewId(15)),
+        Some(&RetirementCause::ExpectedRemoval)
+    );
+    assert_eq!(
+        pending.get(&ProcessViewId(15)),
+        Some(&RetirementCause::ExpectedRemoval)
+    );
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.subject == "live discovery generation"
+                && skip.reason.contains("contradicted or unprovable")),
+        "the deferral is marked: {:?}",
+        engine.counters.object_skips
+    );
+
+    // A recorded loss (inserted directly: no queue path records one
+    // without positive evidence anymore) stays sticky through later merges.
+    engine
+        .retirement_intents
+        .insert(ProcessViewId(15), RetirementCause::GenerationLost);
+    engine.queue_retirement(
+        ProcessViewId(15),
+        RetirementCause::ExpectedRemoval,
+        &mut pending,
+    );
+    assert_eq!(
+        engine.retirement_intents.get(&ProcessViewId(15)),
         Some(&RetirementCause::GenerationLost)
     );
     assert_eq!(
         pending.get(&ProcessViewId(15)),
         Some(&RetirementCause::GenerationLost)
-    );
-    assert!(engine.refresh_requested.contains_key(&std::process::id()));
-    assert_eq!(
-        engine
-            .counters
-            .object_skips
-            .iter()
-            .filter(|skip| skip.subject == "live discovery generation")
-            .count(),
-        1,
-        "the sticky loss is published once"
     );
 }
 
@@ -23247,7 +23271,8 @@ fn cgroup_retries_retire_one_original_view_each_time_and_publish_partial() {
 /// ambient exit and with no bound, and the dropped session's loss counters went
 /// with it. It now starts once and retires the stale view live, like any
 /// member that ends mid-capture: a provable exit is an expected removal (no
-/// loss), anything else a counted generation loss.
+/// loss); anything else defers with a partial mark until a later pass
+/// proves it, never recorded as loss without positive evidence of change.
 #[test]
 fn multi_process_start_retires_views_that_went_stale_during_attach_live() {
     let child = std::process::Command::new("sleep")
@@ -23304,10 +23329,13 @@ fn multi_process_start_retires_views_that_went_stale_during_attach_live() {
         Some(&RetirementCause::ExpectedRemoval),
         "a provable exit is the process ending"
     );
-    assert_eq!(
-        discovered.retirement_intents.get(&unprovable),
-        Some(&RetirementCause::GenerationLost),
-        "a generation whose end cannot be proven is a counted loss"
+    // E17 midfinal correction: a generation whose state cannot be proven
+    // is deferred with a partial mark, never recorded as loss — there is
+    // no positive evidence anything changed, and the live pass re-checks.
+    assert!(
+        !discovered.retirement_intents.contains_key(&unprovable),
+        "an unprovable generation records no intent: {:?}",
+        discovered.retirement_intents
     );
     assert!(!discovered.retirement_intents.contains_key(&kept));
     assert!(
@@ -23315,8 +23343,9 @@ fn multi_process_start_retires_views_that_went_stale_during_attach_live() {
             .counters
             .object_skips
             .iter()
-            .any(|skip| skip.subject == "live discovery generation"),
-        "the unprovable generation's loss is published: {:?}",
+            .any(|skip| skip.subject == "live discovery generation"
+                && skip.reason.contains("contradicted or unprovable")),
+        "the unprovable generation's deferral is published: {:?}",
         discovered.counters.object_skips
     );
 
@@ -37751,20 +37780,36 @@ fn automatic_exec_named_pid_end_receipt_refuses_replacement_endpoint_selection()
 }
 
 #[test]
-fn automatic_exec_named_pid_proven_exit_keeps_sticky_generation_loss() {
+fn automatic_exec_named_pid_spurious_report_then_proven_exit_ends_gracefully() {
+    // E17 midfinal correction: a loss report for a live generation is
+    // declined (nothing sticks), so a genuine exit afterwards ends the
+    // capture gracefully instead of failing on the earlier false report.
     let (mut fixture, mut engine, mut session) = continuity_route();
     let view = engine.views[0].id();
     let mut pending = PendingViewRetirements::new();
     engine.queue_retirement(view, RetirementCause::GenerationLost, &mut pending);
+    assert!(
+        pending.is_empty(),
+        "the spurious report queues nothing: {pending:?}"
+    );
+    assert!(
+        !engine.retirement_intents.contains_key(&view),
+        "the spurious report records no intent: {:?}",
+        engine.retirement_intents
+    );
     fixture.child.kill().unwrap();
     fixture.child.wait().unwrap();
-    assert!(apply_ordinary_batch(&mut engine, &mut session, Vec::new()).is_err());
-    assert!(engine.ended_pid_retirement.is_none());
-    assert!(!engine.expected_target_exit());
-    assert_eq!(session.physical_gap_summary().episodes, 1);
-    assert!(session.physical_gap_summary().open);
-    record_object_skips(&mut engine.plan, &engine.counters.object_skips);
-    assert_physical_gap_public_categories(&engine, &["static probe coverage gap incomplete"]);
+    apply_ordinary_batch(&mut engine, &mut session, Vec::new())
+        .expect("a proven exit after a declined report ends gracefully");
+    assert!(engine.expected_target_exit());
+    assert!(
+        !engine
+            .retirement_intents
+            .values()
+            .any(|cause| *cause == RetirementCause::GenerationLost),
+        "no loss is invented: {:?}",
+        engine.retirement_intents
+    );
 }
 
 fn cold_leader_exit_bound_route() -> (TabledSeedProvider, Engine, ScriptedSession, DiscoveryRecord)
@@ -42000,5 +42045,63 @@ fn global_retirement_failed_cleanup_preserves_detach_error_and_exact_slots() {
     assert_eq!(
         session.failed_cleanup_slot_indices,
         vec![vec![0, 1], vec![0, 1]]
+    );
+}
+
+/// E17 4M-file-midfinal: a live named generation whose pin observation is
+/// merely unprovable must never be declared lost. The 09fb cell reached
+/// all 4096 calls with the caller alive, then bailed the terminal drain
+/// with "the named process generation changed during live discovery" and
+/// emitted zero terminal COUNT/EVIDENCE records (observer rc 1).
+#[test]
+fn midfinal_unprovable_live_pin_is_not_generation_loss() {
+    let (fixture, mut engine, mut session) = continuity_route();
+    assert!(
+        engine.views[0].still_the_same(),
+        "precondition: the fixture child is a live current generation"
+    );
+    let pid = fixture.child.id();
+    let view = engine.views[0].id();
+    engine.views[0] = crate::process::unprovable_process_view_for_test(view, pid)
+        .expect("an unprovable pin over the live child");
+    assert!(
+        !engine.views[0].still_the_same(),
+        "precondition: the pin reads stale while the child lives"
+    );
+    apply_ordinary_batch(&mut engine, &mut session, Vec::new())
+        .expect("an unproven identity must not abort the batch");
+    assert!(
+        !engine
+            .retirement_intents
+            .values()
+            .any(|cause| *cause == RetirementCause::GenerationLost),
+        "a live generation is never loss: {:?}",
+        engine.retirement_intents
+    );
+    assert_eq!(engine.views.len(), 1, "the live view stays retained");
+}
+
+/// Guard: a genuinely reused pid still ends the named capture gracefully
+/// (expected removal), never as fatal generation loss.
+#[test]
+fn midfinal_reused_pid_ends_capture_without_generation_loss() {
+    let (_fixture, mut engine, mut session) = continuity_route();
+    let pid = engine.views[0].pid();
+    let view = engine.views[0].id();
+    engine.views[0] = crate::process::reused_process_view_for_test(view, pid)
+        .expect("a deterministic reused-pid view");
+    assert!(
+        !engine.views[0].still_the_same(),
+        "precondition: the reused start time reads stale"
+    );
+    apply_ordinary_batch(&mut engine, &mut session, Vec::new())
+        .expect("a reused pid ends the capture gracefully, not fatally");
+    assert!(
+        !engine
+            .retirement_intents
+            .values()
+            .any(|cause| *cause == RetirementCause::GenerationLost),
+        "reuse is an expected end, never loss: {:?}",
+        engine.retirement_intents
     );
 }

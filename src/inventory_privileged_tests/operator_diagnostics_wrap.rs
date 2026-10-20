@@ -2,8 +2,9 @@
 //! Owned32-pair indexed physical entry-count gate. No semantic/API/104-slot claim.
 //! Prebuilt-only, paired normal/default diagnostics; no recorder injection.
 use super::*;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Read, Seek, SeekFrom};
+use std::os::unix::fs::MetadataExt;
 
 const TARGETS: u64 = 32;
 const COUNTED: u64 = 400;
@@ -122,6 +123,13 @@ fn new_lines(path: &Path, offset: &mut u64) -> Result<Vec<serde_json::Value>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error.into()),
     };
+    new_lines_from(&mut file, offset)
+}
+
+/// Read newly complete JSONL lines from an already-open file. Split from
+/// [`new_lines`] so the live-file reader can fstat the same handle it reads
+/// (no rotate-between-stat-and-open window).
+fn new_lines_from(file: &mut std::fs::File, offset: &mut u64) -> Result<Vec<serde_json::Value>> {
     file.seek(SeekFrom::Start(*offset))?;
     let mut bytes = Vec::new();
     file.take(INPUT_LIMIT + 1).read_to_end(&mut bytes)?;
@@ -197,10 +205,14 @@ fn rotated_segment_seqs(live: &Path) -> Vec<u64> {
 #[derive(Default)]
 struct PassView {
     consumed_segments: BTreeSet<u64>,
+    segment_offsets: BTreeMap<u64, u64>,
+    live_offset: u64,
+    live_id: Option<(u64, u64)>,
     last_seq: Option<u64>,
     a: BTreeMap<u32, serde_json::Value>,
     b: BTreeMap<u32, serde_json::Value>,
     evidence: Vec<GapEvidence>,
+    evidence_index: HashMap<(Option<String>, Option<String>, String, String), usize>,
     caller_id: Option<String>,
     module_a: BTreeMap<u32, String>,
     module_b: BTreeMap<u32, String>,
@@ -249,12 +261,16 @@ impl PassView {
         (side.len(), counts.first().copied(), counts.last().copied())
     }
     fn refresh(&mut self, path: &Path, pid: u32) -> Result<bool> {
-        // Rotation-aware delta: whole not-yet-consumed rotated segments
-        // plus the whole live file (bounded ~1MB by rotation), merged by
-        // global sequence. No byte offsets: already-seen rows (live content
-        // re-read after its rotation) drop out by sequence, and a sequence
-        // gap (evidence evicted before reading) fails loudly instead of
-        // validating on a partial stream.
+        // Rotation-aware incremental delta: whole not-yet-consumed rotated
+        // segments (each read once, from its tracked offset) plus only the
+        // live file's new bytes since the last tick, merged by global
+        // sequence. Already-seen rows (live content re-read from its rotated
+        // segment) drop out by sequence, and a sequence gap (evidence evicted
+        // before reading) fails loudly instead of validating on a partial
+        // stream. The live byte offset resets when the file's identity
+        // changes (rotation replaced it) or it shrank (truncation); the
+        // identity is fstat'd on the read handle, so a rotate racing the
+        // tick cannot silently skip rows.
         let live_name = path
             .file_name()
             .and_then(|name| name.to_str())
@@ -266,12 +282,23 @@ impl PassView {
                 continue;
             }
             let segment = path.with_file_name(format!("{live_name}.{seq}"));
-            let mut from_start = 0;
-            fresh.extend(new_lines(&segment, &mut from_start)?);
+            let offset = self.segment_offsets.entry(seq).or_insert(0);
+            fresh.extend(new_lines(&segment, offset)?);
             self.consumed_segments.insert(seq);
         }
-        let mut from_start = 0;
-        fresh.extend(new_lines(path, &mut from_start)?);
+        match std::fs::File::open(path) {
+            Ok(mut live) => {
+                let meta = live.metadata()?;
+                let id = (meta.dev(), meta.ino());
+                if self.live_id != Some(id) || meta.len() < self.live_offset {
+                    self.live_offset = 0;
+                }
+                self.live_id = Some(id);
+                fresh.extend(new_lines_from(&mut live, &mut self.live_offset)?);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         fresh.sort_by_key(|row| row["seq"].as_u64().unwrap_or(u64::MAX));
         let mut rows = Vec::new();
         for row in fresh {
@@ -330,12 +357,14 @@ impl PassView {
                     reason: reason.to_owned(),
                     repeats: 1,
                 };
-                if !self.evidence.iter().any(|known| {
-                    known.caller == candidate.caller
-                        && known.module == candidate.module
-                        && known.subject == candidate.subject
-                        && known.reason == candidate.reason
-                }) {
+                let key = (
+                    candidate.caller.clone(),
+                    candidate.module.clone(),
+                    candidate.subject.clone(),
+                    candidate.reason.clone(),
+                );
+                if !self.evidence_index.contains_key(&key) {
+                    self.evidence_index.insert(key, self.evidence.len());
                     self.evidence.push(candidate);
                     moved = true;
                 }
@@ -4403,6 +4432,80 @@ fn operator_diagnostics_wrap_twin_refresh_rejects_eviction_hole() -> Result<()> 
         "{\"seq\":0,\"kind\":\"pass_committed\",\"event\":{}}\n{\"seq\":5,\"kind\":\"pass_committed\",\"event\":{}}\n",
     )?;
     ensure!(view.refresh(&live, 7).is_err());
+    Ok(())
+}
+
+#[test]
+fn operator_diagnostics_wrap_twin_refresh_incremental_live_offset() -> Result<()> {
+    // Incremental live reads: a quiet tick consumes no new bytes, a partial
+    // trailing line waits for its newline, and a replaced live file restarts
+    // from byte 0 even when the old offset lands exactly on a line boundary
+    // (identity reset, never a silent skip). A re-recorded gap identity with
+    // a fresh sequence stays deduplicated, exactly as the linear scan did.
+    let dir = tempfile::tempdir()?;
+    let live = dir.path().join("events.jsonl");
+    let commit = |seq: u64| {
+        format!(
+            "{}\n",
+            serde_json::json!({"seq":seq,"kind":"pass_committed","event":{}})
+        )
+    };
+    let gap = |seq: u64| {
+        format!(
+            "{}\n",
+            serde_json::json!({"seq":seq,"kind":"gap_recorded","event":{
+                "index":0,"caller":"c0","module":null,
+                "subject":"rejected demoted count","reason":"r"}})
+        )
+    };
+    std::fs::write(&live, format!("{}{}", commit(0), gap(1)))?;
+    let mut view = PassView::default();
+    ensure!(view.refresh(&live, 7)?);
+    ensure!(view.last_seq == Some(1));
+    ensure!(view.evidence.len() == 1 && view.evidence_index.len() == 1);
+    let len = std::fs::metadata(&live)?.len();
+    ensure!(view.live_offset == len);
+    // Quiet tick: no new bytes, no movement, stable offset.
+    ensure!(!view.refresh(&live, 7)?);
+    ensure!(view.live_offset == len && view.last_seq == Some(1));
+    // Partial trailing line: deferred, not parsed, offset held.
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new().append(true).open(&live)?;
+        let full = commit(2);
+        file.write_all(&full.as_bytes()[..full.len() - 1])?;
+    }
+    ensure!(!view.refresh(&live, 7)?);
+    ensure!(view.live_offset == len && view.last_seq == Some(1));
+    // Completing newline: the row lands exactly once.
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new().append(true).open(&live)?;
+        file.write_all(b"\n")?;
+    }
+    ensure!(view.refresh(&live, 7)?);
+    ensure!(view.last_seq == Some(2) && view.commits == 2);
+    // Replaced live file whose old offset is an exact line boundary: the
+    // identity change restarts from 0 instead of skipping the first row.
+    // (Rename, not remove+create, so the new live provably has a fresh
+    // inode; the rotated segment's rows drop out by sequence.)
+    let boundary = view.live_offset;
+    let mut pad = String::new();
+    let first = loop {
+        let row = serde_json::json!({"seq":3,"kind":"pass_committed","event":{"pad":pad}});
+        let line = format!("{row}\n");
+        if line.len() == boundary as usize {
+            break line;
+        }
+        ensure!(line.len() < boundary as usize, "pad overshoot");
+        pad.push('x');
+    };
+    std::fs::rename(&live, dir.path().join("events.jsonl.9"))?;
+    std::fs::write(&live, format!("{first}{}{}", gap(4), commit(5)))?;
+    ensure!(view.refresh(&live, 7)?);
+    ensure!(view.last_seq == Some(5));
+    ensure!(view.commits == 4);
+    ensure!(view.evidence.len() == 1 && view.evidence_index.len() == 1);
     Ok(())
 }
 

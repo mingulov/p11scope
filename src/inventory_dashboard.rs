@@ -218,6 +218,15 @@ impl DisplayHandoff {
         self.offered.fetch_add(1, Ordering::SeqCst);
     }
 
+    /// Clone the latest offered presentation without consuming it,
+    /// if any. Lets the promotion scheduler demand a pre-view
+    /// baseline for the still-undrawn frame; the draw installs and
+    /// commits it (or drops it coalesced) as usual.
+    pub(crate) fn peek_latest(&self) -> Option<Arc<Presentation>> {
+        let slot = self.slot.lock().expect("display handoff lock held");
+        slot.back().map(|frame| Arc::clone(&frame.presentation))
+    }
+
     /// Take the latest frame, if any (older queued frames shed with
     /// it — the renderer always shows the newest). Callers must
     /// release the handoff (this returns owned data) BEFORE writing
@@ -2610,15 +2619,24 @@ pub(crate) struct Display {
     viewed_presentation: Option<Arc<Presentation>>,
     viewed_revision: ViewRevision,
     viewed_pair: Option<PromotionPair>,
-    /// The latest pre-view baseline batch the driver acquired: `d`
-    /// pairs the request with it when (and only when) it names the
-    /// exact viewed frame. A stale arrival never pairs and never
-    /// blocks a fresh attempt.
-    latest_baseline: Option<Arc<PromotionBaselineBatch>>,
-    /// The viewed frame/pair whose last acquisition attempt failed:
-    /// demand for it stays quiet until a new frame commits or the
-    /// cursor moves, bounding retries to one per frame/pair.
-    baseline_missed: Option<(ViewRevision, PromotionPair)>,
+    /// The latest acquired pre-view batch, STAGED: named for a
+    /// candidate frame, never yet displayed authority. Only a draw
+    /// commits it (with that draw's revision); `d` never pairs it
+    /// directly, so a batch acquired after a draw cannot retrofit
+    /// the already-displayed revision. The pair records which
+    /// demand the batch was acquired for.
+    pending_baseline: Option<(Arc<PromotionBaselineBatch>, PromotionPair)>,
+    /// The staged batch a draw committed with its revision: the only
+    /// batch `d` may pair, and only for that same viewed revision.
+    /// A shed/cut keeps it (the repaint restores it); a new revision
+    /// clears it.
+    committed_baseline: Option<(ViewRevision, Arc<PromotionBaselineBatch>, PromotionPair)>,
+    /// The candidate frame/pair whose last acquisition attempt
+    /// failed: demand for it stays quiet until a new frame arrives
+    /// or the cursor moves, bounding retries to one per frame/pair.
+    /// Keyed by frame identity (an offered frame has no revision
+    /// yet), never by revision.
+    baseline_missed: Option<(Arc<Presentation>, PromotionPair)>,
     /// View serials exhausted: no unique revision left, promotion
     /// refuses even on full writes.
     view_exhausted: bool,
@@ -2686,7 +2704,8 @@ impl Display {
             viewed_presentation: None,
             viewed_revision: ViewRevision::new(0),
             viewed_pair: None,
-            latest_baseline: None,
+            pending_baseline: None,
+            committed_baseline: None,
             baseline_missed: None,
             view_exhausted: false,
             last_viewport: Viewport {
@@ -2978,7 +2997,12 @@ impl Display {
     /// Commit the candidate as the viewed promotion authority after
     /// the terminal took the frame whole: the exact immutable `Arc`,
     /// its revision and the cursor shown on that frame. Never called
-    /// for a shed or cut frame.
+    /// for a shed or cut frame. This is also the ONLY join between
+    /// an acquired baseline batch and displayed authority: a staged
+    /// batch naming this exact frame commits with this draw's
+    /// revision; a stale staged batch (another frame's, superseded
+    /// before its draw) drops here and never pairs. A new revision
+    /// closes the old frame's committed batch and attempt record.
     fn commit_viewed_frame(&mut self) {
         if self.view_exhausted {
             return;
@@ -2986,8 +3010,25 @@ impl Display {
         let Some(frame) = self.last_frame.as_ref() else {
             return;
         };
-        self.viewed_presentation = Some(Arc::clone(&frame.presentation));
-        self.viewed_revision = self.last_view_revision;
+        let revision = self.last_view_revision;
+        let presentation = Arc::clone(&frame.presentation);
+        if revision != self.viewed_revision {
+            self.committed_baseline = None;
+            self.baseline_missed = None;
+        }
+        let staged_matches = self.promoter.capture().is_some_and(|capture| {
+            self.pending_baseline
+                .as_ref()
+                .is_some_and(|(batch, _)| batch.matches_view(capture, &presentation))
+        });
+        if staged_matches {
+            let (batch, pair) = self.pending_baseline.take().expect("staged batch matched");
+            self.committed_baseline = Some((revision, batch, pair));
+        } else {
+            self.pending_baseline = None;
+        }
+        self.viewed_presentation = Some(presentation);
+        self.viewed_revision = revision;
         self.viewed_pair = if self.state.detail == DetailPage::Gaps {
             None
         } else {
@@ -3070,11 +3111,17 @@ impl Display {
             }
             return;
         };
-        // Pair the retained batch when (and only when) it names this
-        // exact viewed frame; otherwise the request stays unqualified
-        // and the resolver refuses it as a stale view, honestly.
-        let view = Arc::new(match self.latest_baseline.clone() {
-            Some(batch) if batch.matches_view(capture, &presentation) => {
+        // Pair the draw-committed batch when (and only when) it was
+        // committed with this exact viewed revision; otherwise the
+        // request stays unqualified and the resolver refuses it as a
+        // stale view, honestly. A staged batch never pairs here no
+        // matter how well it matches: only a draw joins a batch to
+        // displayed authority.
+        let view = Arc::new(match self.committed_baseline.clone() {
+            Some((revision, batch, _))
+                if revision == self.viewed_revision
+                    && batch.matches_view(capture, &presentation) =>
+            {
                 let fallback = Arc::clone(&presentation);
                 PromotionView::with_baseline(capture, self.viewed_revision, presentation, batch)
                     .unwrap_or_else(|| PromotionView::new(capture, self.viewed_revision, fallback))
@@ -3309,46 +3356,91 @@ impl Display {
         self.promoter.state()
     }
 
-    /// The viewed frame plus cursor pair still needing a pre-view
-    /// baseline, if any: `Some` only while enabled, a frame was
-    /// wholly written with a cursor pair on it, no retained batch
-    /// pairs with that frame, and the last attempt for it did not
-    /// fail. The driver acquires through the capture and hands the
-    /// batch back via [`Display::note_baseline_batch`]; a failed
-    /// attempt is recorded via [`Display::note_baseline_failed`] so
-    /// it retries only for a new frame/pair.
+    /// The newest frame the cursor can demand a pre-view baseline
+    /// for, with its pair: the offered-but-undrawn frame when the
+    /// cursor survives on it (so acquisition precedes the qualifying
+    /// draw), else the installed frame. `None` on the gaps page
+    /// (whose cursor is parked, not shown), before the first frame,
+    /// and whenever the cursor names no row of the candidate.
+    fn baseline_candidate(&self) -> Option<(Arc<Presentation>, PromotionPair)> {
+        if self.state.detail == DetailPage::Gaps {
+            return None;
+        }
+        let selected = self.state.promotion.selected?;
+        if let Some(offered) = self.handoff.peek_latest()
+            && index_of_pair(&offered, selected).is_some()
+        {
+            return Some((offered, selected));
+        }
+        let installed = self.last_frame.as_ref()?;
+        if index_of_pair(&installed.presentation, selected).is_some() {
+            return Some((Arc::clone(&installed.presentation), selected));
+        }
+        None
+    }
+
+    /// The candidate frame plus cursor pair still needing a pre-view
+    /// baseline, if any: `Some` only while enabled, a candidate
+    /// carries the cursor, and no staged or committed batch names
+    /// that frame, and the last attempt for it did not fail. The
+    /// driver acquires through the capture and stages the batch via
+    /// [`Display::note_baseline_batch`] for the next draw to commit;
+    /// a failed attempt is recorded via
+    /// [`Display::note_baseline_failed`] so it retries only for a
+    /// new frame/pair.
     pub(crate) fn baseline_demand(&self) -> Option<(CaptureId, Arc<Presentation>, PromotionPair)> {
         let capture = self.promoter.capture()?;
-        let presentation = self.viewed_presentation.as_ref().map(Arc::clone)?;
-        let pair = self.viewed_pair?;
+        let (frame, pair) = self.baseline_candidate()?;
         if self
-            .latest_baseline
+            .pending_baseline
             .as_ref()
-            .is_some_and(|batch| batch.matches_view(capture, &presentation))
+            .is_some_and(|(batch, _)| batch.matches_view(capture, &frame))
         {
             return None;
         }
-        if self.baseline_missed == Some((self.viewed_revision, pair)) {
+        if self
+            .committed_baseline
+            .as_ref()
+            .is_some_and(|(_, batch, _)| batch.matches_view(capture, &frame))
+        {
             return None;
         }
-        Some((capture, presentation, pair))
-    }
-
-    /// Retain the latest acquired pre-view batch. A stale arrival
-    /// (for an older frame) simply never pairs: `matches_view` guards
-    /// every use, and the next demand still schedules a fresh attempt.
-    pub(crate) fn note_baseline_batch(&mut self, batch: Arc<PromotionBaselineBatch>) {
-        self.latest_baseline = Some(batch);
-        self.baseline_missed = None;
-    }
-
-    /// Record a failed acquisition attempt for the current viewed
-    /// frame/pair: demand for it stays quiet until a new frame commits
-    /// or the cursor moves, bounding retries to one per frame/pair.
-    pub(crate) fn note_baseline_failed(&mut self) {
-        if let Some(pair) = self.viewed_pair {
-            self.baseline_missed = Some((self.viewed_revision, pair));
+        if self
+            .baseline_missed
+            .as_ref()
+            .is_some_and(|(missed, missed_pair)| {
+                Arc::ptr_eq(missed, &frame) && *missed_pair == pair
+            })
+        {
+            return None;
         }
+        Some((capture, frame, pair))
+    }
+
+    /// Stage the latest acquired pre-view batch for the next draw to
+    /// commit with its revision. Staging alone pairs nothing: `d`
+    /// cannot see the batch until a draw commits it, so an arrival
+    /// after a draw never retrofits the displayed revision. Records
+    /// the demanded pair the batch was acquired for. A stale staged
+    /// batch (another frame's) drops at the next draw and never
+    /// pairs; demand for the committing frame persists meanwhile.
+    pub(crate) fn note_baseline_batch(
+        &mut self,
+        batch: Arc<PromotionBaselineBatch>,
+        pair: PromotionPair,
+    ) {
+        self.pending_baseline = Some((batch, pair));
+    }
+
+    /// Record a failed acquisition attempt for the demanded pair on
+    /// the current candidate frame: demand for it stays quiet until
+    /// a new frame arrives or the cursor moves, bounding retries to
+    /// one per frame/pair.
+    pub(crate) fn note_baseline_failed(&mut self, pair: PromotionPair) {
+        let Some((frame, _)) = self.baseline_candidate() else {
+            return;
+        };
+        self.baseline_missed = Some((frame, pair));
     }
 }
 

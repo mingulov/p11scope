@@ -1855,6 +1855,7 @@ fn official_build_is_safe_only() {
         "P11SCOPE_PREPARED_BPF_CARGO=\"$t4_nightly_cargo\" \\",
         "P11SCOPE_PREPARED_BPF_RUSTC=\"$t4_nightly_rustc\" \\",
         "    \"$T4_TOOLCHAIN_CARGO\" build --locked --offline --release --no-default-features \\",
+        "        --features stub-object-attributes \\",
         "        --target x86_64-unknown-linux-musl --bin p11scope",
     ]
     .join("\n");
@@ -1886,6 +1887,39 @@ fn official_build_is_safe_only() {
     ] {
         assert!(official.contains(marker), "official build misses {marker}");
     }
+}
+
+/// P0-only ship vehicle: the official release bytes build with the
+/// attribute gate shut. v0.4.0 ships P0-only; FULL stays the default
+/// for diet/qualification work.
+#[test]
+fn official_build_is_p0_only() {
+    let release = read("scripts/build-release.sh");
+    let official = between(
+        &release,
+        "=== p11scope: isolated safe-only official static build ===",
+        "=== p11scope-discover: dynamic glibc + dynamic musl builds ===",
+    );
+    assert!(
+        official.contains("--features stub-object-attributes"),
+        "official build must shut the attribute gate"
+    );
+}
+
+/// P0-only ship vehicle: the privacy-canary lane builds P0 bytes in
+/// both lanes (safe-only and unsafe), so live canary qualification
+/// loads on 1M-budget kernels.
+#[test]
+fn canary_builds_are_p0_only() {
+    let canaries = read("scripts/verify-canaries.sh");
+    assert!(
+        canaries.contains("--release --workspace --features stub-object-attributes"),
+        "canary safe-only build must shut the attribute gate"
+    );
+    assert!(
+        canaries.contains("--features unsafe-unvalidated-metadata,stub-object-attributes"),
+        "canary unsafe build must shut the attribute gate"
+    );
 }
 
 #[test]

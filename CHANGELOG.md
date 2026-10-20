@@ -11,10 +11,16 @@ v0.4.0 development to date: `inventory --cgroup` scope, offline `inventory
 diff` comparison, inventory diagnostics, executable naming for trace and
 inspect output, opt-in caller cgroup metadata, explicit endpoint and
 identity-proof controls, and hardened final-output semantics. The
-object/attribute lane stays unpublished: finite attribute protocols are
-captured in the qualified Detailed lane with no public object field enabled
-(see [docs/privacy/allowlist-v3.md](docs/privacy/allowlist-v3.md)). Limits
-below live in [docs/known-limitations.md](docs/known-limitations.md).
+object-attribute capture is not enabled in v0.4.0: the release bytes
+build with the attribute gate shut (P0-only), so no BPF program reads
+object attributes. Every profile, metrics and trace document discloses
+this as structured evidence (`evidence.object_capture.available: false`,
+`reason: "not_enabled"`), and `p11scope doctor` names it in its
+`object-attribute capture` row. Counts, mechanisms and all other P0 facts
+are exact; only attribute semantics are withheld. FULL capture stays the
+default for diet/qualification work and returns when it fits the verifier
+budget (policy: [docs/privacy/allowlist-v3.md](docs/privacy/allowlist-v3.md)).
+Limits below live in [docs/known-limitations.md](docs/known-limitations.md).
 
 ### Added
 

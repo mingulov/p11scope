@@ -73,9 +73,10 @@ cleanup() {
 echo "=== build ==="
 rm -rf "$WORK/default-build" "$WORK/feature-build" "$WORK/helper-build"
 p11scope_product_build "$P11SCOPE_PRODUCT_BUILD_MODE" \
-    --release --workspace --target-dir "$WORK/default-build"
+    --release --workspace --features stub-object-attributes \
+    --target-dir "$WORK/default-build"
 p11scope_product_build "$P11SCOPE_PRODUCT_BUILD_MODE" \
-    --release --workspace --features unsafe-unvalidated-metadata \
+    --release --workspace --features unsafe-unvalidated-metadata,stub-object-attributes \
     --target-dir "$WORK/feature-build"
 P11SCOPE_DEFAULT="$WORK/default-build/release/p11scope"
 P11SCOPE_FEATURE="$WORK/feature-build/release/p11scope"

@@ -2352,9 +2352,16 @@ fn check_startup_probe_records(
             "first unit must remain actual published history on {pair}"
         );
     }
+    // Only the startup-fence disposition counts toward k: shutdown-frozen
+    // third units (withheld/capture_stopped) are drain residue, asserted
+    // absent below, never fence evidence.
     let fences: Vec<_> = records
         .iter()
-        .filter(|row| row["decision"] == "withheld")
+        .filter(|row| {
+            row["kind"] == "count_decision"
+                && row["decision"] == "withheld"
+                && row["reason"] == "awaiting_fence"
+        })
         .collect();
     ensure!(
         fences.len() as u64 == k,
@@ -2400,9 +2407,23 @@ fn check_startup_probe_records(
             "ordinary path must place all three unit advances on {pair}"
         );
     }
+    let frozen: Vec<_> = records
+        .iter()
+        .filter(|row| {
+            row["kind"] == "count_decision" && row["decision"] == "withheld" && row["absolute"] == 3
+        })
+        .collect();
     ensure!(
-        public_count == expected_a(3, k),
-        "only the exact pinned probe projection (ordinary 3, startup-fence 2) is qualified"
+        frozen.is_empty(),
+        "drain incomplete: {} third units still withheld at stop",
+        frozen.len()
+    );
+    // Terminal (post-drain) projection: all 32 pairs placed unit 3 on both
+    // paths, so the max-accepting edge reads 3. The mid-run round-3 value
+    // (ordinary 3, startup-fence 2) is pre-drain; the drain bridges them.
+    ensure!(
+        public_count == 3,
+        "only the exact drained probe projection (3 on both paths) is qualified"
     );
     let path = if k == 0 { "ordinary" } else { "startup_fence" };
     Ok(
@@ -2411,6 +2432,13 @@ fn check_startup_probe_records(
         "observations":observations,"fences":fences}),
     )
 }
+
+/// Post-recovery drain allowance (commit batches, ~1/pass): round-3
+/// placed(3,2) publications land at ~1/pass measured, so 32 need ~32
+/// passes after the edge first shows 3; 40 carries margin inside the 90 s
+/// budget. The terminal assertions (32/32 placed, public 3, zero frozen
+/// third units) prove the drain, never the allowance.
+const DRAIN_ALLOWANCE: u64 = 40;
 
 /// Short actual native control before any revised long wrap schedule. The two
 /// accepted paths are distinguished by real dispositions, never by elapsed sleep.
@@ -2430,6 +2458,8 @@ fn privileged_native_lane_pid_diagnostics_three_round_startup_probe_lp64() -> Re
     let view = RefCell::new(PassView::default());
     let failure = RefCell::new(None::<anyhow::Error>);
     let gate = RefCell::new(StartupGate::new());
+    let recovered = Cell::new(false);
+    let drain_passes = Cell::new(0u64);
     let stop = || {
         let advance = || -> Result<bool> {
             if failure.borrow().is_some() {
@@ -2448,7 +2478,7 @@ fn privileged_native_lane_pid_diagnostics_three_round_startup_probe_lp64() -> Re
                     gate.borrow().trajectory,
                 );
             }
-            if state.get() == 4 {
+            if state.get() == 5 {
                 return Ok(true);
             }
             let mut view = view.borrow_mut();
@@ -2500,13 +2530,54 @@ fn privileged_native_lane_pid_diagnostics_three_round_startup_probe_lp64() -> Re
                             workload.command("count", "a-done", round + 1)?;
                             state.set(awaiting + 1);
                         } else {
+                            // Round 3 observed pre-drain (A=2 fenced): enter
+                            // the recovery drain, not the terminal state.
                             state.set(4);
+                        }
+                    }
+                }
+                4 => {
+                    // Recovery drain: round-3 units were issued one pass
+                    // ago; their placed(3,2) publications land over the
+                    // following passes. Stopping at A=2 freezes most in
+                    // flight (withheld/capture_stopped) and leaves the edge
+                    // below its drained value. Wait for recovery to show
+                    // (edge 3) plus a bounded allowance so the terminal
+                    // export shows the drained state. Ordinary (k=0) has no
+                    // fence and no lag: stop at once.
+                    let observed = count.context("probe A edge count missing in drain")?;
+                    let k_now = startup_fence_repeats(&view.evidence, &caller);
+                    ensure!(
+                        k_now == fence_k.get(),
+                        "fence disposition moved during drain: k={k_now} validated={}",
+                        fence_k.get()
+                    );
+                    if fence_k.get() == 0 {
+                        state.set(5);
+                    } else {
+                        ensure!(
+                            observed == 2 || observed == 3,
+                            "drain edge left {{2, 3}}: A={observed}"
+                        );
+                        if observed == 3 && !recovered.get() {
+                            recovered.set(true);
+                            drain_passes.set(0);
+                        }
+                        if recovered.get() {
+                            drain_passes.set(drain_passes.get() + 1);
+                            eprintln!(
+                                "G21_STARTUP_PROBE_DRAIN A={observed} k={k_now} passes={}",
+                                drain_passes.get()
+                            );
+                            if drain_passes.get() >= DRAIN_ALLOWANCE {
+                                state.set(5);
+                            }
                         }
                     }
                 }
                 _ => {}
             }
-            Ok(state.get() == 4)
+            Ok(state.get() == 5)
         };
         match advance() {
             Ok(done) => done,
@@ -2551,7 +2622,7 @@ fn privileged_native_lane_pid_diagnostics_three_round_startup_probe_lp64() -> Re
         return Err(error);
     }
     ensure!(
-        code == 0 && state.get() == 4,
+        code == 0 && state.get() == 5,
         "short probe failed without complete actual milestones"
     );
     workload.command("stop", "done", 0)?;
@@ -2709,7 +2780,7 @@ fn operator_diagnostics_three_round_probe_checks_fence_and_physical_pair() -> Re
     let fenced = startup_probe_validator_fixture(true);
     let ordinary_facts = check_startup_probe_records(&ordinary, 3, 123, &module, &calls, 0)?;
     ensure!(ordinary_facts["path"] == "ordinary" && ordinary_facts["fenced_pairs"] == 0);
-    let fenced_facts = check_startup_probe_records(&fenced, 2, 123, &module, &calls, 32)?;
+    let fenced_facts = check_startup_probe_records(&fenced, 3, 123, &module, &calls, 32)?;
     ensure!(fenced_facts["path"] == "startup_fence" && fenced_facts["fenced_pairs"] == 32);
     // Round-grouped layout: header 0; round 1 rows 1..64; round 2 rows
     // 65..128 (first fence at 66); round 3 rows 129..192 (first recovery
@@ -2727,9 +2798,10 @@ fn operator_diagnostics_three_round_probe_checks_fence_and_physical_pair() -> Re
         "raw_before_call",
         "kind_counter_lie",
         "read_starts_before_return",
+        "fence_reason_stopped",
     ] {
         let mut changed = fenced.clone();
-        let mut primary = 2;
+        let mut primary = 3;
         let mut k = 32;
         match change {
             "second_pair" => changed[1]["pair"] = "p32".into(),
@@ -2739,10 +2811,11 @@ fn operator_diagnostics_three_round_probe_checks_fence_and_physical_pair() -> Re
             "missing_recovery" => changed[130]["decision"] = "staged".into(),
             "wrong_baseline" => changed[130]["baseline_post"] = 159.into(),
             "wrong_reference" => changed[66]["observation_ref"]["seq"] = 1.into(),
-            "wrong_primary" => primary = 3,
+            "wrong_primary" => primary = 2,
             "wrong_k" => k = 0,
             "raw_before_call" => changed[65]["post"] = 180.into(),
             "read_starts_before_return" => changed[1]["pre"] = 109.into(),
+            "fence_reason_stopped" => changed[66]["reason"] = "capture_stopped".into(),
             _ => changed[193]["kinds"][0]["retained"] = 95.into(),
         }
         ensure!(
@@ -3206,7 +3279,34 @@ fn operator_diagnostics_wrap_twin_probe_double_placed_fence_fails() -> Result<()
     footer["kinds"][3]["retained"] = serde_json::json!(before + 1);
     footer["kinds"][3]["produced"] = serde_json::json!(before + 1);
     fenced.push(footer);
-    ensure!(check_startup_probe_records(&fenced, 2, 123, &module, &calls, 32).is_err());
+    ensure!(check_startup_probe_records(&fenced, 3, 123, &module, &calls, 32).is_err());
+    Ok(())
+}
+
+#[test]
+fn operator_diagnostics_three_round_probe_rejects_frozen_third_unit() -> Result<()> {
+    // Pre-drain terminal shape (live: withheld third units alongside full
+    // recovery and an exact fence count) must fail drain-completeness even
+    // when every other assertion would pass.
+    let calls = [(90, 110), (130, 150), (170, 190)];
+    let module = serde_json::json!("mA");
+    let mut rows = startup_probe_validator_fixture(true);
+    let footer = rows.pop().context("probe footer")?;
+    rows.push(
+        serde_json::json!({"kind":"count_decision","decision":"withheld",
+        "pair":"p0","seq":1000,"reason":"capture_stopped","after":2,
+        "through":3,"absolute":3,
+        "observation_ref":{"seq":130,"status":"retained"}}),
+    );
+    let mut footer = footer;
+    footer["records_written"] = serde_json::json!(rows.len() as u64);
+    let before = footer["kinds"][2]["retained"]
+        .as_u64()
+        .context("decision retained")?;
+    footer["kinds"][2]["retained"] = serde_json::json!(before + 1);
+    footer["kinds"][2]["produced"] = serde_json::json!(before + 1);
+    rows.push(footer);
+    ensure!(check_startup_probe_records(&rows, 3, 123, &module, &calls, 32).is_err());
     Ok(())
 }
 

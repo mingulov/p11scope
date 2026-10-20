@@ -120,10 +120,10 @@ impl<T: Send + 'static, Guard: Send + 'static> WorkOwner<'_, T, Guard> {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.owner == Some(self.serial) {
-            if let Some(work) = &state.running {
-                work.cancelled.store(true, Ordering::Release);
-            }
+        if state.owner == Some(self.serial)
+            && let Some(work) = &state.running
+        {
+            work.cancelled.store(true, Ordering::Release);
         }
     }
     pub(crate) fn idle(&self) -> bool {

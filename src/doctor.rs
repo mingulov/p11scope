@@ -183,6 +183,7 @@ pub fn probe(pid: Option<u32>, cgroup: Option<&Path>) -> Vec<Check> {
         ),
         capabilities_check(),
         pid_namespace_check(crate::pidns::numbering(), pid.is_some()),
+        object_capture_check(),
     ];
     checks.extend(bpf_checks());
     let attach_preflight = attach_preflight_checks(pid, cgroup);
@@ -588,12 +589,17 @@ fn bounded_error_text(message: &str) -> String {
 fn format_preflight_error(mut error: &(dyn std::error::Error + 'static)) -> String {
     let mut context = Vec::new();
     let detail = loop {
-        if let Some(ProgramError::LoadError { verifier_log, .. }) =
+        if let Some(program @ ProgramError::LoadError { verifier_log, .. }) =
             error.downcast_ref::<ProgramError>()
         {
             // Never format LoadError itself: its Display includes the complete
-            // verifier log. Keep the independently bounded excerpt instead.
-            break bounded_verifier_diagnostic(&verifier_log.to_string());
+            // verifier log. Keep the independently bounded excerpt instead,
+            // naming a budget refusal for what it is.
+            let excerpt = bounded_verifier_diagnostic(&verifier_log.to_string());
+            if crate::attach::is_verifier_budget_refusal(program) {
+                break format!("verifier budget refused the program (E2BIG); {excerpt}");
+            }
+            break excerpt;
         }
         let Some(source) = error.source() else {
             break format_operation_error(error);
@@ -633,6 +639,23 @@ fn format_operation_error_with(
 
 fn format_operation_error(error: &(dyn std::error::Error + 'static)) -> String {
     format_operation_error_with(error, None, false, false)
+}
+
+/// Build scope, identical on every host: v0.4.0 stub builds do not
+/// capture object attributes (P0-only ship vehicle), so the row warns
+/// by design (a [`BUILD_LIMIT_ROWS`] member); FULL builds wire it.
+fn object_capture_check() -> Check {
+    if crate::attach::Session::object_capture_evidence().available {
+        Check {
+            name: "object-attribute capture".into(),
+            status: Status::Ok("enabled".into()),
+        }
+    } else {
+        Check {
+            name: "object-attribute capture".into(),
+            status: Status::Warn("not enabled in v0.4.0".into()),
+        }
+    }
 }
 
 fn capabilities_check() -> Check {
@@ -1575,10 +1598,11 @@ pub fn verdict(checks: &[Check]) -> i32 {
 /// No host can clear them, so `--extra-strict` — a host qualification —
 /// lists them without counting them (HIGH-5). Only these exact by-design
 /// values are exempt: any other value (a future catalog) counts as usual.
-const BUILD_LIMIT_ROWS: [(&str, &[&str]); 3] = [
+const BUILD_LIMIT_ROWS: [(&str, &[&str]); 4] = [
     ("loader timing (initial_set)", &["unproven", "none"]),
     ("loader timing (dlopen)", &["unproven", "none"]),
     ("run initial-set capture", &["none"]),
+    ("object-attribute capture", &["not enabled in v0.4.0"]),
 ];
 
 fn is_build_limit(check: &Check) -> bool {
@@ -2308,6 +2332,40 @@ mod tests {
         assert!(!diagnostic.contains('\u{fffd}'));
     }
 
+    /// The doctor names the build's object-capture scope: enabled in
+    /// FULL builds, a by-design warning in v0.4.0 stub builds that
+    /// extra-strict qualification excuses (no host can clear it).
+    #[test]
+    fn object_capture_check_matches_build() {
+        let check = object_capture_check();
+        assert_eq!(check.name, "object-attribute capture");
+        let status = crate::attach::Session::object_capture_evidence();
+        match status.available {
+            true => assert!(matches!(check.status, Status::Ok(_)), "{check:?}"),
+            false => {
+                assert!(matches!(check.status, Status::Warn(_)), "{check:?}");
+                assert!(is_build_limit(&check), "{check:?}");
+                let checks = vec![check];
+                assert!(extra_strict_violations(&checks).is_empty());
+            }
+        }
+    }
+
+    /// A budget refusal names its cause: E2BIG through preflight formats
+    /// as a verifier-budget refusal with the bounded log excerpt.
+    #[test]
+    fn preflight_budget_refusal_names_cause() {
+        let error = ProgramError::LoadError {
+            io_error: std::io::Error::from_raw_os_error(libc::E2BIG),
+            verifier_log: aya_obj::VerifierLog::new("BPF program is too large".to_string()),
+        };
+        let wrapped = anyhow::Error::new(error).context("loading p11_entry");
+        let rendered = format_preflight_error(wrapped.as_ref());
+        assert!(rendered.contains("verifier budget refused"), "{rendered}");
+        assert!(rendered.contains("E2BIG"), "{rendered}");
+        assert!(rendered.contains("BPF program is too large"), "{rendered}");
+    }
+
     #[test]
     fn wrapped_program_load_error_keeps_named_context_and_bounded_verifier_log() {
         let error = ProgramError::LoadError {
@@ -2350,9 +2408,9 @@ mod tests {
         }
         let checks = probe(None, None);
         // 13 host/target rows, eight §10.1 rows, three finite preflight rows,
-        // the cgroup version row, the uprobe-multi self-link row, and the
-        // PID namespace row.
-        assert_eq!(checks.len(), 27, "{checks:?}");
+        // the cgroup version row, the uprobe-multi self-link row, the PID
+        // namespace row, and the object-attribute capture build row.
+        assert_eq!(checks.len(), 28, "{checks:?}");
         // Never FAIL without --pid: a nested observer only warns here.
         assert!(!matches!(
             by_name_status(&checks, PID_NAMESPACE_ROW),

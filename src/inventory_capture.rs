@@ -114,6 +114,17 @@ pub(crate) struct LaneWindows {
     /// stop draining; the ring keeps the rest, and what it cannot hold is
     /// counted lost by the kernel, never dropped here.
     pub held_records: usize,
+    /// Discovery quanta (batch shells) the lane may hold alongside those
+    /// records. An empty quantum charges zero records but its shell still
+    /// costs memory, so without this bound a quiet capture's slow
+    /// collection would hold one more batch per tick without end (Sol
+    /// F4). Twice the record bound: record-carrying quanta number at most
+    /// `held_records` — each holds at least one record — so a record flow
+    /// still fills the record bound first; only zero-record-dominated
+    /// ticks stop here, under the same posture (the ring keeps the rest,
+    /// and what it cannot hold is counted lost by the kernel, never
+    /// dropped here). Staging with the pass frees both bounds.
+    pub held_batches: usize,
 }
 
 /// The longest stop waits for the probes to detach before it writes the
@@ -143,6 +154,10 @@ impl LaneWindows {
         // records): the ring keeps what this bound cannot hold, and what
         // it cannot hold is counted lost by the kernel.
         held_records: 8192,
+        // 16,384 batch shells (each about a hundred bytes: two stamps,
+        // flags, and an empty record vector): at most about 1.7 MiB
+        // beside the record bound, however long the collection runs.
+        held_batches: 16_384,
     };
 
     /// The stop's retirement budget for `load`.
@@ -805,14 +820,16 @@ impl<L> NativeLane<L> {
     /// order, for `after_pass`. Nothing reaches the host while the catalog
     /// is collected, so the coordinator sees every call in the order it
     /// saw when the ring was serviced only between passes; only the ring
-    /// empties sooner. At `held_records` the tick drains nothing more.
+    /// empties sooner. At `held_records` records or `held_batches`
+    /// batches the tick drains nothing more (the batch bound covers
+    /// empty quanta, which charge zero records but still cost a shell).
     pub(crate) fn collecting_tick<Pin>(&mut self)
     where
         L: CaptureLane<Pin>,
     {
         for _ in 0..self.windows.pass_quanta {
             let room = self.windows.held_records.saturating_sub(self.held_records);
-            if room == 0 {
+            if room == 0 || self.held.len() >= self.windows.held_batches {
                 return;
             }
             let batch = self.drain_within(self.windows.discovery_at_most(room));

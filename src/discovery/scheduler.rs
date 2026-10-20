@@ -33,9 +33,12 @@ pub(crate) const RECONCILE_QUANTUM_NS: u64 = 50_000_000;
 
 /// Exploratory rotation: at most this many provider-free views are evicted
 /// per reconcile pass to make room for rarity-selected newcomers. Ordinary
-/// passes never evict, so steady-state ticks displace nothing.
-/// Provisional — ratify by measurement.
-pub(crate) const MAX_EXPLORATORY_EVICTIONS_PER_PASS: usize = 8;
+/// passes never evict, so steady-state ticks displace nothing. Ratified by
+/// the live256 measurement (Lane-A): a genuine 256-newcomer burst needs 32
+/// relief rounds at 8-per-reconcile, which converges 231 of 256 owned views
+/// in 120s of tick time; 16 still displaces at most a sixteenth of a full
+/// capture per pass while settling the burst with margin.
+pub(crate) const MAX_EXPLORATORY_EVICTIONS_PER_PASS: usize = 16;
 
 /// Eviction cooldown: a pid evicted as exploratory is ineligible for
 /// re-selection for this many reconcile sweeps, so rotation walks forward

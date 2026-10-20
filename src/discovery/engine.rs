@@ -18895,6 +18895,7 @@ impl Engine {
         candidate: &LiveCandidate,
         removed: &BTreeSet<ProcessViewId>,
         new_views: &[(ProcessView, Vec<ScannedModule>, PinnedObjects)],
+        declined: &BTreeSet<ProcessViewId>,
     ) -> CandidateAdmission {
         let targets: Vec<_> = candidate
             .delta
@@ -18903,11 +18904,17 @@ impl Engine {
             .chain(&candidate.delta.replace)
             .cloned()
             .collect();
+        // Declined views are retained but known-stale: the preflight must
+        // not judge them as newly stale generations, or every deferral
+        // tick would trip the stale preflight below for certain. The
+        // candidate still carries their pins; only the currency check
+        // skips them.
         let mut required_views = candidate.views.clone();
+        required_views.retain(|view| !declined.contains(view));
         required_views.extend(
             self.views
                 .iter()
-                .filter(|view| !removed.contains(&view.id()))
+                .filter(|view| !removed.contains(&view.id()) && !declined.contains(&view.id()))
                 .map(ProcessView::id),
         );
         required_views.extend(new_views.iter().map(|(view, _, _)| view.id()));
@@ -19927,6 +19934,11 @@ impl Engine {
             })
             .collect();
         let mut removed: BTreeSet<_> = stale.union(&departed).copied().collect();
+        // Stale views whose loss report `queue_retirement` declines below:
+        // no accepted decision exists for them, so they stay fully
+        // retained and the final preflight does not judge them as newly
+        // stale. Empty until the queue call decides.
+        let mut declined: BTreeSet<ProcessViewId> = BTreeSet::new();
         let refreshed: BTreeSet<_> = retirement_causes
             .iter()
             .filter_map(|(view, (cause, _))| {
@@ -20070,7 +20082,8 @@ impl Engine {
                 });
             }
         }
-        let new_view_pids: BTreeSet<_> = new_views.iter().map(|(view, _, _)| view.pid()).collect();
+        let mut new_view_pids: BTreeSet<_> =
+            new_views.iter().map(|(view, _, _)| view.pid()).collect();
         let mut deferred_new_view_records = Vec::new();
         let mut refreshed_ok: BTreeSet<_> =
             refreshed_scans.iter().map(|(view, _, _)| *view).collect();
@@ -20099,7 +20112,11 @@ impl Engine {
                     None,
                 ]
             },
-            || self.inventory_candidate_admission(session, &candidate, &removed, new_views),
+            || {
+                self.inventory_candidate_admission(
+                    session, &candidate, &removed, new_views, &declined,
+                )
+            },
         );
         self.stage_timings.span(
             crate::timing::StageKind::Attach,
@@ -20187,8 +20204,50 @@ impl Engine {
         let mut failed_retirements = BTreeSet::new();
         let mut context_retirements = BTreeSet::new();
         let mut no_terminal_selection_handoffs = TerminalSelectionHandoffs::new();
-        let retirement_views: BTreeSet<_> = removed.union(&refreshed_ok).copied().collect();
+        let mut retirement_views: BTreeSet<_> = removed.union(&refreshed_ok).copied().collect();
         self.queue_inventory_retirements(&retirement_views, &stale, &departed, pending_views);
+        // Accepted decisions govern the removal sets: a stale view with no
+        // recorded intent was declined (a contradicted or unprovable
+        // report), so it stays fully retained — view, contexts, claims,
+        // slots — and the next pass re-checks. A sticky earlier intent
+        // still stands. Departed and refreshed views are never declined.
+        declined = stale
+            .iter()
+            .filter(|view| !self.retirement_intents.contains_key(*view))
+            .copied()
+            .collect();
+        if !declined.is_empty() {
+            removed.retain(|view| !declined.contains(view));
+            retirement_views.retain(|view| !declined.contains(view));
+            // The declined pids were excluded from `known_pids` above, so a
+            // newcomer may already wait for one: cull it (its ID returns to
+            // the pool) instead of shadowing the retained view with a
+            // duplicate. The serviced request still completes below.
+            let declined_pids: BTreeSet<u32> = declined
+                .iter()
+                .filter_map(|view| {
+                    self.views
+                        .iter()
+                        .find(|candidate| candidate.id() == *view)
+                        .map(ProcessView::pid)
+                })
+                .collect();
+            let mut culled = Vec::new();
+            new_views.retain(|(view, _, _)| {
+                let shadowed = declined_pids.contains(&view.pid());
+                if shadowed {
+                    culled.push(view.id());
+                }
+                !shadowed
+            });
+            for id in culled {
+                self.release_view_id(id);
+            }
+            // The culled newcomers never existed: forget their pids, or
+            // the tick below would defer their records and fail their
+            // serviced requests as if real admissions had stalled.
+            new_view_pids.retain(|pid| !declined_pids.contains(pid));
+        }
         for view in &retirement_views {
             // H5 pressure: a view the parked records name is never retired
             // by the direct path either; its request is retained for retry
@@ -20318,6 +20377,12 @@ impl Engine {
             },
             || self.inventory_candidate(&removed, &refreshed_scans, new_views, skipped),
         )?;
+        // Declined views stay in the candidate's pins and modules (the
+        // apply carries them over unchanged) but leave its currency set:
+        // the apply reads `candidate.views` raw for its admission,
+        // attach, and finalize staleness checks, and a known-stale
+        // deferral must not trip any of them.
+        candidate.views.retain(|view| !declined.contains(view));
         // Exec-refreshed views whose rescan re-accepted the same static
         // PID targets force them through detach/replace: PID-bound links may
         // be dead while still recorded as attached. Global file links remain
@@ -20338,7 +20403,11 @@ impl Engine {
                     None,
                 ]
             },
-            || self.inventory_candidate_admission(session, &candidate, &removed, new_views),
+            || {
+                self.inventory_candidate_admission(
+                    session, &candidate, &removed, new_views, &declined,
+                )
+            },
         );
         self.stage_timings.span(
             crate::timing::StageKind::Attach,
@@ -23122,6 +23191,7 @@ mod reexec_diagnostic_evaluation_tests {
                     &candidate,
                     &removed,
                     &[],
+                    &BTreeSet::new(),
                 );
                 let calls = Cell::new(0);
                 let admission = inventory_admission_observed(
@@ -23130,7 +23200,13 @@ mod reexec_diagnostic_evaluation_tests {
                     || [Some(0); 4],
                     || {
                         calls.set(calls.get() + 1);
-                        engine.inventory_candidate_admission(&session, &candidate, &removed, &[])
+                        engine.inventory_candidate_admission(
+                            &session,
+                            &candidate,
+                            &removed,
+                            &[],
+                            &BTreeSet::new(),
+                        )
                     },
                 );
                 assert_eq!(calls.get(), 1);
@@ -23206,7 +23282,13 @@ mod reexec_diagnostic_evaluation_tests {
             },
             || {
                 calls.set(calls.get() + 1);
-                engine.inventory_candidate_admission(&session, &candidate, &removed, &[])
+                engine.inventory_candidate_admission(
+                    &session,
+                    &candidate,
+                    &removed,
+                    &[],
+                    &BTreeSet::new(),
+                )
             },
         );
         assert_eq!(calls.get(), 2);

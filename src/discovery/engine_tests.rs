@@ -42208,3 +42208,506 @@ fn midfinal_residual_late_proven_exit_settles_in_empty_terminal_batch() {
     );
 }
 
+/// Midfinal residual P1: a declined loss report must govern the inventory
+/// removal sets. Named capture with a pending refresh and a live but
+/// unprovable pin: the deferral keeps the view, its claims, contexts and
+/// slots, and completes the request; a later proven exit retires exactly
+/// once.
+#[test]
+fn midfinal_residual_deferred_inventory_keeps_named_view_until_proven_exit() {
+    let (mut fixture, mut engine, mut session) = continuity_route();
+    let pid = fixture.child.id();
+    let view = engine.views[0].id();
+    let claims_before = engine
+        .pinned
+        .view_claims(view)
+        .expect("the attached view owns pinned claims")
+        .clone();
+    assert!(
+        !claims_before.pins.is_empty(),
+        "precondition: the claims pin objects"
+    );
+    let contexts_before = engine.loader_registry.ids_for_view(view);
+    assert!(
+        !contexts_before.is_empty(),
+        "precondition: the attached view owns loader contexts"
+    );
+    let slots_before = engine.plan.active_slot_count();
+    assert!(slots_before > 0, "precondition: the target holds slots");
+    engine.views[0] = crate::process::unprovable_process_view_for_test(view, pid)
+        .expect("an unprovable pin over the live child");
+    assert!(
+        !engine.views[0].still_the_same(),
+        "precondition: the pin reads stale while the child lives"
+    );
+    assert!(
+        engine.request_refresh(pid, None),
+        "the refresh request is accepted"
+    );
+    apply_ordinary_batch(&mut engine, &mut session, Vec::new())
+        .expect("a deferred inventory tick never fails the capture");
+    assert!(
+        engine.views.iter().any(|retained| retained.id() == view),
+        "the deferred view stays retained"
+    );
+    // Coverage, not multiplicity: every applied rebind appends a fresh
+    // module/entry pin layer without the inventory path's
+    // `reset_scan_pin_claims` (pre-existing, healthy ticks included), so
+    // pin multiplicity churns while the covered objects stay identical.
+    let claims_after = engine
+        .pinned
+        .view_claims(view)
+        .expect("the deferred view keeps its claims")
+        .clone();
+    assert_eq!(
+        claims_after.tables, claims_before.tables,
+        "the deferred view keeps its table claims"
+    );
+    assert_eq!(
+        claims_after.targets, claims_before.targets,
+        "the deferred view keeps its target claims"
+    );
+    assert_eq!(
+        claims_after.pins.iter().collect::<BTreeSet<_>>(),
+        claims_before.pins.iter().collect::<BTreeSet<_>>(),
+        "the deferred view keeps its pin coverage"
+    );
+    assert_eq!(
+        engine.loader_registry.ids_for_view(view),
+        contexts_before,
+        "the deferred view keeps its loader contexts"
+    );
+    assert_eq!(
+        engine.plan.active_slot_count(),
+        slots_before,
+        "the deferred view keeps its slots"
+    );
+    assert!(
+        !engine
+            .retirement_intents
+            .values()
+            .any(|cause| *cause == RetirementCause::GenerationLost),
+        "a live generation is never loss: {:?}",
+        engine.retirement_intents
+    );
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.subject == "live discovery generation"
+                && skip.reason.contains("contradicted or unprovable")),
+        "the deferral is marked: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        engine.refresh_requested.is_empty(),
+        "the serviced request completes instead of sticking: {:?}",
+        engine.refresh_requested
+    );
+
+    // A later proven exit retires exactly once, then the capture is quiet.
+    // The swap models transient recovery: production pins always carry a
+    // pidfd or a start time (`PidPin::open` refuses a doubly degraded
+    // pin), so a recovered pin proves the exit. The fully unprovable test
+    // pin cannot observe exit-after-reap (`None == None` reads current)
+    // and is only meaningful while the child lives; the same view ID
+    // keeps its claims and contexts across the swap.
+    engine.views[0] = ProcessView::open(view, pid).expect("the live child re-pins provably");
+    fixture.child.kill().unwrap();
+    fixture.child.wait().unwrap();
+    apply_ordinary_batch(&mut engine, &mut session, Vec::new())
+        .expect("a proven exit after deferral ends gracefully");
+    assert!(
+        engine.expected_target_exit(),
+        "the exit finalized: {:?}",
+        engine.retirement_intents
+    );
+    assert!(
+        engine.views.iter().all(|retained| retained.id() != view),
+        "the exited view is gone"
+    );
+    assert!(
+        engine.pinned.view_claims(view).is_none(),
+        "the exited view released its claims"
+    );
+    assert!(
+        engine.loader_registry.ids_for_view(view).is_empty(),
+        "the exited view released its loader contexts"
+    );
+    assert!(
+        engine.retirement_intents.is_empty(),
+        "no retirement stays queued: {:?}",
+        engine.retirement_intents
+    );
+    apply_ordinary_batch(&mut engine, &mut session, Vec::new())
+        .expect("the settled capture stays quiet");
+    assert!(
+        engine.retirement_intents.is_empty(),
+        "nothing re-queues after the single retirement: {:?}",
+        engine.retirement_intents
+    );
+}
+
+/// Midfinal residual P1, multi-process scope: a declined loss report must
+/// govern the inventory removal sets. A live system-scope view whose pin
+/// is unprovable keeps its view ID, claims, contexts and slots through
+/// the deferral tick (with no duplicate newcomer for its pid); a later
+/// proven exit retires exactly once.
+#[test]
+fn midfinal_residual_deferred_inventory_keeps_system_view_until_proven_exit() {
+    let dir = tempfile::tempdir().expect("a fixture directory");
+    let first = system_scope_build_fixture(dir.path(), "defer-first");
+    let driver = system_scope_build_driver(dir.path());
+    let cap = system_scope_live_process_count() + 256;
+
+    let mut child_a = system_scope_spawn_loaded(&driver, &first);
+    let pid_a = child_a.pid();
+    let mut engine = Engine::discover(
+        &system_args(vec![first.clone()], Some(cap)),
+        &Scope::System,
+        None,
+    )
+    .expect("system scope discovers the first child");
+    let id_a = engine
+        .views
+        .iter()
+        .find(|view| view.pid() == pid_a)
+        .expect("the first child is admitted")
+        .id();
+    let claims_before = engine
+        .pinned
+        .view_claims(id_a)
+        .expect("the first child owns pinned claims")
+        .clone();
+    assert!(
+        !claims_before.pins.is_empty(),
+        "precondition: the claims pin objects"
+    );
+    let contexts_before = engine.loader_registry.ids_for_view(id_a);
+    let slots_before = system_scope_slots_for(&engine, "defer-first.so");
+    assert!(
+        !slots_before.is_empty(),
+        "precondition: the provider contributes slots"
+    );
+    let position = engine
+        .views
+        .iter()
+        .position(|view| view.id() == id_a)
+        .expect("the first child's retained position");
+    engine.views[position] = crate::process::unprovable_process_view_for_test(id_a, pid_a)
+        .expect("an unprovable pin over the live child");
+    assert!(
+        !engine.views[position].still_the_same(),
+        "precondition: the pin reads stale while the child lives"
+    );
+
+    // A foreign process that exits mid-preflight makes a tick report `Ok`
+    // without queueing anything, so retry for the deferring tick like the
+    // capped-selection siblings do. A deterministically broken deferral
+    // never marks and still fails the assertions below. Request
+    // completion is asserted by the quiet-cgroup sibling: under parallel
+    // churn most system ticks bail to an early return before servicing
+    // requests, which would starve this loop regardless of the fix.
+    let mut session = ScriptedSession::with_records([], 0);
+    for _ in 0..25 {
+        let mut collect: Box<DiscoveryCollector<'_>> = Box::new(Engine::collect_discovery_records);
+        let mut tick_now = crate::attach::monotonic_ns;
+        engine
+            .refresh_inventory(
+                &mut session,
+                &mut true,
+                &mut Vec::new(),
+                &mut PendingViewRetirements::new(),
+                &mut *collect,
+                &mut PauseClosure::new(true),
+                &mut tick_now,
+            )
+            .expect("the deferring tick applies");
+        let marked = engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live discovery generation"
+                && skip.reason.contains("contradicted or unprovable")
+        });
+        if marked {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.subject == "live discovery generation"
+                && skip.reason.contains("contradicted or unprovable")),
+        "the deferral is marked: {:?}",
+        engine.counters.object_skips
+    );
+    let views_a: Vec<_> = engine
+        .views
+        .iter()
+        .filter(|view| view.pid() == pid_a)
+        .collect();
+    assert_eq!(
+        views_a.len(),
+        1,
+        "no duplicate newcomer shadows the deferred view"
+    );
+    assert_eq!(
+        views_a[0].id(),
+        id_a,
+        "the deferred view keeps its original view ID"
+    );
+    // Coverage, not multiplicity: every applied rebind appends a fresh
+    // module/entry pin layer without the inventory path's
+    // `reset_scan_pin_claims` (pre-existing, healthy ticks included), so
+    // pin multiplicity churns while the covered objects stay identical.
+    let claims_after = engine
+        .pinned
+        .view_claims(id_a)
+        .expect("the deferred view keeps its claims")
+        .clone();
+    assert_eq!(
+        claims_after.tables, claims_before.tables,
+        "the deferred view keeps its table claims"
+    );
+    assert_eq!(
+        claims_after.targets, claims_before.targets,
+        "the deferred view keeps its target claims"
+    );
+    assert_eq!(
+        claims_after.pins.iter().collect::<BTreeSet<_>>(),
+        claims_before.pins.iter().collect::<BTreeSet<_>>(),
+        "the deferred view keeps its pin coverage"
+    );
+    assert_eq!(
+        engine.loader_registry.ids_for_view(id_a),
+        contexts_before,
+        "the deferred view keeps its loader contexts"
+    );
+    assert_eq!(
+        system_scope_slots_for(&engine, "defer-first.so"),
+        slots_before,
+        "the deferred view keeps its attributed slots"
+    );
+    assert!(
+        !engine
+            .retirement_intents
+            .values()
+            .any(|cause| *cause == RetirementCause::GenerationLost),
+        "a live generation is never loss: {:?}",
+        engine.retirement_intents
+    );
+
+    // A later proven exit retires exactly once, then the capture is quiet.
+    child_a.reap().expect("reap the first child");
+    for _ in 0..25 {
+        if engine.views.iter().all(|view| view.id() != id_a) {
+            break;
+        }
+        let mut collect: Box<DiscoveryCollector<'_>> = Box::new(Engine::collect_discovery_records);
+        let mut tick_now = crate::attach::monotonic_ns;
+        engine
+            .refresh_inventory(
+                &mut session,
+                &mut true,
+                &mut Vec::new(),
+                &mut PendingViewRetirements::new(),
+                &mut *collect,
+                &mut PauseClosure::new(true),
+                &mut tick_now,
+            )
+            .expect("the retiring tick applies");
+    }
+    assert!(
+        engine.views.iter().all(|view| view.id() != id_a),
+        "the exited view is gone"
+    );
+    assert!(
+        engine.pinned.view_claims(id_a).is_none(),
+        "the exited view released its claims"
+    );
+    assert!(
+        engine.loader_registry.ids_for_view(id_a).is_empty(),
+        "the exited view released its loader contexts"
+    );
+    assert!(
+        !engine.retirement_intents.contains_key(&id_a),
+        "no retirement stays queued for the exited view: {:?}",
+        engine.retirement_intents
+    );
+}
+
+/// Midfinal residual P1, quiet cgroup scope: the same deferral contract
+/// as the system sibling, but deterministic. The cgroup lists only the
+/// fixture child, so no foreign churn can starve the tick: one tick
+/// defers, keeps everything, and completes the serviced request; after
+/// the child exits and the listing drops it (what the kernel does to
+/// `cgroup.procs`), the next tick retires it exactly once.
+#[test]
+fn midfinal_residual_deferred_inventory_keeps_cgroup_view_until_proven_exit() {
+    let dir = tempfile::tempdir().expect("a fixture directory");
+    let first = system_scope_build_fixture(dir.path(), "defer-cgroup");
+    let driver = system_scope_build_driver(dir.path());
+    let mut child_a = system_scope_spawn_loaded(&driver, &first);
+    let pid_a = child_a.pid();
+    let scope_dir = tempfile::tempdir().expect("a scope directory");
+    e06_write_listing(scope_dir.path(), &[pid_a]);
+    let scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
+    let mut engine = Engine::discover(
+        &e06_cgroup_args(scope_dir.path(), vec![first.clone()], Some(16)),
+        &scope,
+        None,
+    )
+    .expect("cgroup scope discovers the child");
+    let id_a = engine
+        .views
+        .iter()
+        .find(|view| view.pid() == pid_a)
+        .expect("the child is admitted")
+        .id();
+    let claims_before = engine
+        .pinned
+        .view_claims(id_a)
+        .expect("the child owns pinned claims")
+        .clone();
+    assert!(
+        !claims_before.pins.is_empty(),
+        "precondition: the claims pin objects"
+    );
+    let contexts_before = engine.loader_registry.ids_for_view(id_a);
+    let slots_before = system_scope_slots_for(&engine, "defer-cgroup.so");
+    assert!(
+        !slots_before.is_empty(),
+        "precondition: the provider contributes slots"
+    );
+    let position = engine
+        .views
+        .iter()
+        .position(|view| view.id() == id_a)
+        .expect("the child's retained position");
+    engine.views[position] = crate::process::unprovable_process_view_for_test(id_a, pid_a)
+        .expect("an unprovable pin over the live child");
+    assert!(
+        !engine.views[position].still_the_same(),
+        "precondition: the pin reads stale while the child lives"
+    );
+    assert!(
+        engine.request_refresh(pid_a, None),
+        "the refresh request is accepted"
+    );
+
+    let mut session = ScriptedSession::with_records([], 0);
+    let mut collect: Box<DiscoveryCollector<'_>> = Box::new(Engine::collect_discovery_records);
+    let mut tick_now = crate::attach::monotonic_ns;
+    engine
+        .refresh_inventory(
+            &mut session,
+            &mut true,
+            &mut Vec::new(),
+            &mut PendingViewRetirements::new(),
+            &mut *collect,
+            &mut PauseClosure::new(true),
+            &mut tick_now,
+        )
+        .expect("the deferring tick applies");
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| skip.subject
+            == "live discovery generation"
+            && skip.reason.contains("contradicted or unprovable")),
+        "the deferral is marked: {:?}",
+        engine.counters.object_skips
+    );
+    let views_a: Vec<_> = engine
+        .views
+        .iter()
+        .filter(|view| view.pid() == pid_a)
+        .collect();
+    assert_eq!(
+        views_a.len(),
+        1,
+        "no duplicate newcomer shadows the deferred view"
+    );
+    assert_eq!(
+        views_a[0].id(),
+        id_a,
+        "the deferred view keeps its original view ID"
+    );
+    // Coverage, not multiplicity: see the named sibling.
+    let claims_after = engine
+        .pinned
+        .view_claims(id_a)
+        .expect("the deferred view keeps its claims")
+        .clone();
+    assert_eq!(
+        claims_after.tables, claims_before.tables,
+        "the deferred view keeps its table claims"
+    );
+    assert_eq!(
+        claims_after.targets, claims_before.targets,
+        "the deferred view keeps its target claims"
+    );
+    assert_eq!(
+        claims_after.pins.iter().collect::<BTreeSet<_>>(),
+        claims_before.pins.iter().collect::<BTreeSet<_>>(),
+        "the deferred view keeps its pin coverage"
+    );
+    assert_eq!(
+        engine.loader_registry.ids_for_view(id_a),
+        contexts_before,
+        "the deferred view keeps its loader contexts"
+    );
+    assert_eq!(
+        system_scope_slots_for(&engine, "defer-cgroup.so"),
+        slots_before,
+        "the deferred view keeps its attributed slots"
+    );
+    assert!(
+        !engine
+            .retirement_intents
+            .values()
+            .any(|cause| *cause == RetirementCause::GenerationLost),
+        "a live generation is never loss: {:?}",
+        engine.retirement_intents
+    );
+    assert!(
+        !engine.refresh_requested.contains_key(&pid_a),
+        "the serviced request completes instead of sticking: {:?}",
+        engine.refresh_requested
+    );
+
+    // The child exits and the kernel drops it from the listing; the next
+    // tick observes the authoritative absence and retires it exactly once.
+    child_a.reap().expect("reap the child");
+    e06_write_listing(scope_dir.path(), &[]);
+    let mut collect: Box<DiscoveryCollector<'_>> = Box::new(Engine::collect_discovery_records);
+    let mut tick_now = crate::attach::monotonic_ns;
+    engine
+        .refresh_inventory(
+            &mut session,
+            &mut true,
+            &mut Vec::new(),
+            &mut PendingViewRetirements::new(),
+            &mut *collect,
+            &mut PauseClosure::new(true),
+            &mut tick_now,
+        )
+        .expect("the retiring tick applies");
+    assert!(
+        engine.views.iter().all(|view| view.id() != id_a),
+        "the exited view is gone"
+    );
+    assert!(
+        engine.pinned.view_claims(id_a).is_none(),
+        "the exited view released its claims"
+    );
+    assert!(
+        engine.loader_registry.ids_for_view(id_a).is_empty(),
+        "the exited view released its loader contexts"
+    );
+    assert!(
+        !engine.retirement_intents.contains_key(&id_a),
+        "no retirement stays queued for the exited view: {:?}",
+        engine.retirement_intents
+    );
+}

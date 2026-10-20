@@ -38,7 +38,8 @@
         "handoff_child_pid", "in_flight_at_end", "interface_list",
         "kernel_control",
         "loader_discovery", "malformed_records", "manifest_object_fallbacks",
-        "module_ambiguous", "module_unresolved_slots", "modules_skipped", "operation_state_imports",
+        "module_ambiguous", "module_unresolved_slots", "modules_skipped", "object_capture",
+        "operation_state_imports",
         "orphan_ops", "p11scope_env", "pause", "pause_attempts", "pid_namespace",
         "pause_confirmed", "pause_partial", "pending_at_end",
         "process_tracking_evictions", "process_tracking_failures",
@@ -551,6 +552,15 @@
             "selection": {"enum": ["auto", "multi", "singles"]},
             "fallback": {"type": ["string", "null"], "minLength": 1},
             "scope_filter": {"enum": ["kernel-pid+bpf", "perf-task+bpf", null]}
+          }
+        },
+        "object_capture": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["available", "reason"],
+          "properties": {
+            "available": {"type": "boolean"},
+            "reason": {"enum": ["not_enabled", null]}
           }
         },
         "pid_descendant_gaps": {"type": "integer", "minimum": 0},

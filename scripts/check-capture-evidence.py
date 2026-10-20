@@ -213,6 +213,8 @@ PROFILE_V3_FIELDS = {
     "pid_descendant_gaps", "multi_rebuild_gaps",
 }
 ATTACH_BACKEND_KEYS = {"selection", "fallback", "scope_filter"}
+OBJECT_CAPTURE_KEYS = {"available", "reason"}
+OBJECT_CAPTURE_REASONS = {None, "not_enabled"}
 ATTACH_SELECTIONS = {"auto", "multi", "singles"}
 SCOPE_FILTERS = {None, "kernel-pid+bpf", "perf-task+bpf"}
 RESIDUAL_EVIDENCE_KEYS = {
@@ -255,7 +257,7 @@ ROOT_FAILURE_REASONS = {
 # C_GetInterface result flags publish only this finite class, never the word.
 SELECTION_RESULT_FLAG_CLASSES = {"zero", "fork_safe", "other"}
 BASE_EVIDENCE_KEYS = set(COUNTERS) | {
-    "kernel_control", "attach_backend",
+    "kernel_control", "attach_backend", "object_capture",
     "authority", "discovery", "manifest_object_fallbacks", "modules_skipped",
     "scan_unavailable", "scan_ms", "table_entries", "slots", "active_slots",
     "attached_probes",
@@ -587,6 +589,19 @@ def exact_attach_backend(backend, mechanisms, document, *, terminal=False):
                 f"scope filter disagrees with the capture scope: {backend!r}")
 
 
+def exact_object_capture(status):
+    """P0-only ship vehicle: the closed build-scope disclosure. A stubbed
+    (v0.4.0) build disclaims attribute coverage with the finite
+    `not_enabled` reason; FULL builds report available with no reason."""
+    exact_keys(status, OBJECT_CAPTURE_KEYS, "object_capture")
+    require(isinstance(status["available"], bool),
+            f"invalid object capture availability: {status!r}")
+    require(status["reason"] in OBJECT_CAPTURE_REASONS,
+            f"invalid object capture reason: {status!r}")
+    require(status["available"] == (status["reason"] is None),
+            f"object capture availability disagrees with its reason: {status!r}")
+
+
 def exact_profile_v3_selection(document, *, terminal=False, run=False):
     """Validate the closed, bounded profile-v3 selection/privacy extension."""
     if not terminal:
@@ -720,6 +735,7 @@ def exact_profile_v3_selection(document, *, terminal=False, run=False):
         f"attach mechanisms disagree with attached probes: {mechanisms!r}",
     )
     exact_attach_backend(evidence["attach_backend"], mechanisms, document, terminal=terminal)
+    exact_object_capture(evidence["object_capture"])
     for field in ("pid_descendant_gaps", "multi_rebuild_gaps"):
         uint(evidence[field], U64_MAX, field)
     loss = (
@@ -774,6 +790,7 @@ def exact_evidence_keys(evidence, *, profile, terminal=False, child=False, histo
         wanted -= VERDICT_CLASS_KEYS
         wanted.discard("kernel_control")
         wanted.discard("attach_backend")
+        wanted.discard("object_capture")
     wanted |= PROFILE_V3_FIELDS if profile else set()
     if terminal:
         wanted |= TRACE_TERMINAL_KEYS
@@ -856,6 +873,7 @@ def exact_metrics_schema(document, *, run=False):
     # Metrics exposes the actual Session backend/filter without publishing
     # profile-only successful-link mechanisms or selection verdict authority.
     exact_attach_backend(document["evidence"]["attach_backend"], None, document)
+    exact_object_capture(document["evidence"]["object_capture"])
     exact_scheduling_evidence(document["evidence"])
     exact_kernel_control(document["evidence"])
     exact_task_uprobe_link_losses(document["evidence"])
@@ -3235,6 +3253,7 @@ def document_fixture(evidence, *, schema=PROFILE_SCHEMA, mode="profile", privacy
         evidence.setdefault("attach_backend", {
             "selection": "auto", "fallback": None, "scope_filter": "perf-task+bpf",
         })
+        evidence.setdefault("object_capture", {"available": True, "reason": None})
     if schema == PROFILE_SCHEMA:
         evidence.setdefault("interface_selection", {
             "providers": [], "standard_exports": [], "inventory_surfaces": [],
@@ -3248,6 +3267,7 @@ def document_fixture(evidence, *, schema=PROFILE_SCHEMA, mode="profile", privacy
             evidence.pop(field, None)
         if schema == HISTORICAL_METRICS_SCHEMA:
             evidence.pop("attach_backend", None)
+            evidence.pop("object_capture", None)
             evidence.pop("task_uprobe_link_losses", None)
             evidence.pop("abi_refusals", None)
             evidence.pop("semantic_history_drops", None)

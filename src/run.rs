@@ -7901,6 +7901,7 @@ fn evidence_for(
             Vec::new()
         },
         attach_backend,
+        object_capture: crate::attach::Session::object_capture_evidence(),
         pid_descendant_gaps,
         multi_rebuild_gaps: engine.multi_rebuild_gaps(),
         // Design §5.7: a live-learned attach key is protected only inside a

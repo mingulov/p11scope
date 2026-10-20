@@ -3574,6 +3574,158 @@ fn pty_promotion_baseline_failures_stay_quiet_per_frame_caller() {
 }
 
 #[test]
+fn pty_promotion_baseline_failure_before_commit_stays_quiet_on_same_frame() {
+    // P2b remainder: a failure recorded against the offered (not yet
+    // drawn) frame must survive that frame's own committing draw —
+    // the next service must not retry the same caller on it.
+    let mut terminal = PromoPty::open();
+    assert!(terminal.display.promotion_enable(CaptureId::new(5)));
+    terminal.display.offer(varied_presentation());
+    terminal.display.tick();
+    terminal.shown(b"promotion: idle; selected");
+    // A newer offer becomes the demand candidate while the old frame
+    // is still viewed; its acquisition fails before the draw.
+    terminal.display.offer(varied_presentation());
+    let offered = terminal
+        .display
+        .handoff
+        .peek_latest()
+        .expect("the newer frame is offered");
+    let (candidate, _) = terminal
+        .display
+        .baseline_candidate()
+        .expect("demand targets a candidate");
+    assert!(
+        Arc::ptr_eq(&candidate, &offered),
+        "demand targets the still-undrawn offered frame"
+    );
+    let (_, _, pair) = terminal
+        .display
+        .baseline_demand()
+        .expect("the offered frame lacks a batch");
+    terminal.display.note_baseline_failed(pair);
+    assert!(
+        terminal.display.baseline_demand().is_none(),
+        "the failed caller stays quiet on the offered frame"
+    );
+    terminal.repaint_now();
+    terminal.shown(b"promotion: idle");
+    assert_eq!(
+        terminal.display.viewed_revision.get(),
+        2,
+        "the offered frame committed"
+    );
+    assert!(
+        terminal.display.baseline_demand().is_none(),
+        "the committing draw preserves the frame's own failure"
+    );
+    terminal.display.restore();
+}
+
+#[test]
+fn pty_promotion_baseline_failure_survives_shed_recovery_on_same_frame() {
+    // P2b remainder: recovery after a shed/cut must not erase the
+    // frame's failure membership — the repainted frame retries
+    // nothing already failed on it.
+    let mut terminal = PromoPty::open();
+    assert!(terminal.display.promotion_enable(CaptureId::new(5)));
+    terminal.display.offer(varied_presentation());
+    terminal.display.tick();
+    terminal.shown(b"promotion: idle; selected");
+    let (_, _, pair) = terminal
+        .display
+        .baseline_demand()
+        .expect("the viewed pair lacks a batch");
+    terminal.display.note_baseline_failed(pair);
+    assert!(
+        terminal.display.baseline_demand().is_none(),
+        "the failed caller stays quiet"
+    );
+    fill(&terminal.pty);
+    terminal.repaint_now();
+    assert!(
+        terminal.display.viewed_presentation.is_none(),
+        "the shed clears viewed authority"
+    );
+    drain(&mut terminal.pty, Duration::from_millis(100));
+    terminal.repaint_now();
+    terminal.shown(b"promotion: idle; selected");
+    assert_eq!(
+        terminal.display.viewed_revision.get(),
+        1,
+        "recovery repaints the same installed frame"
+    );
+    assert!(
+        terminal.display.baseline_demand().is_none(),
+        "shed recovery preserves the frame's failure membership"
+    );
+    terminal.display.restore();
+}
+
+#[test]
+fn pty_promotion_committed_baseline_survives_shed_recovery() {
+    // A draw-committed baseline is retained for its installed frame:
+    // transient loss of viewed authority (shed/cut) must not
+    // invalidate it — the repaint of the same frame keeps `d`
+    // qualified without a new acquisition.
+    let mut terminal = PromoPty::open();
+    assert!(terminal.display.promotion_enable(CaptureId::new(5)));
+    terminal.display.offer(varied_presentation());
+    terminal.display.tick();
+    terminal.shown(b"promotion: idle; selected");
+    let (capture, frame, pair) = terminal
+        .display
+        .baseline_demand()
+        .expect("the viewed pair lacks a batch");
+    let batch = Arc::new(PromotionBaselineBatch::scripted_for_test(capture, frame));
+    terminal
+        .display
+        .note_baseline_batch(Arc::clone(&batch), pair);
+    terminal.repaint_now();
+    terminal.shown(b"promotion: idle");
+    assert!(
+        terminal.display.baseline_demand().is_none(),
+        "the committed batch satisfies demand"
+    );
+    fill(&terminal.pty);
+    terminal.repaint_now();
+    assert!(
+        terminal.display.viewed_presentation.is_none(),
+        "the shed clears viewed authority"
+    );
+    assert!(
+        terminal.display.baseline_demand().is_none(),
+        "before recovery the retained batch still suppresses acquisition"
+    );
+    drain(&mut terminal.pty, Duration::from_millis(100));
+    terminal.repaint_now();
+    terminal.shown(b"promotion: idle; selected");
+    assert_eq!(
+        terminal.display.viewed_revision.get(),
+        1,
+        "recovery repaints the same installed frame"
+    );
+    assert!(
+        terminal.display.baseline_demand().is_none(),
+        "the repainted frame needs no new acquisition"
+    );
+    terminal.key(b"d");
+    terminal.shown(b"promotion: request 1 queued");
+    let request = terminal
+        .display
+        .take_promotion_request()
+        .expect("d queues one request");
+    assert!(
+        request
+            .viewed()
+            .baseline()
+            .is_some_and(|held| Arc::ptr_eq(held, &batch)),
+        "d stays qualified with the retained batch after recovery"
+    );
+    terminal.display.restore();
+}
+
+#[test]
 fn pty_promotion_baseline_twins() {
     // No batch: the request stays unqualified (existing behavior), and
     // demand persists for the scheduler.

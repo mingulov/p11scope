@@ -42681,6 +42681,7 @@ fn midfinal_residual_deferred_inventory_keeps_cgroup_view_until_proven_exit() {
 
     // The child exits and the kernel drops it from the listing; the next
     // tick observes the authoritative absence and retires it exactly once.
+    // The four midfinal round-2 residual regressions follow this test.
     child_a.reap().expect("reap the child");
     e06_write_listing(scope_dir.path(), &[]);
     let mut collect: Box<DiscoveryCollector<'_>> = Box::new(Engine::collect_discovery_records);
@@ -42930,4 +42931,238 @@ fn midfinal_res2_accepted_removal_retires_selection_derived_slots() {
         "no retirement stays queued: {:?}",
         engine.retirement_intents
     );
+}
+
+/// Midfinal round-2 residual, item 2 (new P2): a declined view must not
+/// authorize fresh attachment retries. A previously failed (inactive)
+/// endpoint rebuilds as `delta.new`, but the deferral currency exemption
+/// must not let it attach without generation revalidation: the retry waits
+/// while the retained coverage commits unchanged.
+#[test]
+fn midfinal_res2_declined_inventory_withholds_failed_endpoint_retry() {
+    let dir = tempfile::tempdir().expect("a fixture directory");
+    let first = system_scope_build_fixture(dir.path(), "withhold-retry");
+    let driver = system_scope_build_driver(dir.path());
+    let mut child_a = system_scope_spawn_loaded(&driver, &first);
+    let pid_a = child_a.pid();
+    let scope_dir = tempfile::tempdir().expect("a scope directory");
+    e06_write_listing(scope_dir.path(), &[pid_a]);
+    let scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
+    let mut engine = Engine::discover(
+        &e06_cgroup_args(scope_dir.path(), vec![first.clone()], Some(16)),
+        &scope,
+        None,
+    )
+    .expect("cgroup scope discovers the child");
+    let id_a = engine
+        .views
+        .iter()
+        .find(|view| view.pid() == pid_a)
+        .expect("the child is admitted")
+        .id();
+    let module_id = engine
+        .plan()
+        .modules
+        .iter()
+        .find(|module| module.path.ends_with("withhold-retry.so"))
+        .expect("the plan names the provider")
+        .id;
+    let retry_key: (crate::discovery::identity::PinnedObjectId, u64) = {
+        let slot = engine
+            .plan()
+            .slots
+            .iter()
+            .find(|slot| {
+                slot.module_ids.as_slice() == [module_id] && engine.plan.is_active(slot.index)
+            })
+            .expect("the provider holds an active slot");
+        (slot.object, slot.file_offset)
+    };
+    let retry_index = engine
+        .plan()
+        .slots
+        .iter()
+        .find(|slot| {
+            slot.object == retry_key.0
+                && slot.file_offset == retry_key.1
+                && engine.plan.is_active(slot.index)
+        })
+        .expect("the retry target is active")
+        .index;
+    engine.plan.deactivate(retry_index);
+    assert!(
+        !engine.plan.is_active(retry_index),
+        "precondition: the failed endpoint is inactive"
+    );
+    let active_before = engine.plan.active_slot_count();
+    let contexts_before = engine.loader_registry.ids_for_view(id_a);
+    let position = engine
+        .views
+        .iter()
+        .position(|view| view.id() == id_a)
+        .expect("the child's retained position");
+    engine.views[position] = crate::process::unprovable_process_view_for_test(id_a, pid_a)
+        .expect("an unprovable pin over the live child");
+    assert!(
+        !engine.views[position].still_the_same(),
+        "precondition: the pin reads stale while the child lives"
+    );
+    assert!(
+        engine.request_refresh(pid_a, None),
+        "the refresh request is accepted"
+    );
+
+    let mut session = ScriptedSession::with_records([], 0);
+    let mut collect: Box<DiscoveryCollector<'_>> = Box::new(Engine::collect_discovery_records);
+    let mut tick_now = crate::attach::monotonic_ns;
+    engine
+        .refresh_inventory(
+            &mut session,
+            &mut true,
+            &mut Vec::new(),
+            &mut PendingViewRetirements::new(),
+            &mut *collect,
+            &mut PauseClosure::new(true),
+            &mut tick_now,
+        )
+        .expect("the deferring tick applies");
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.subject == "live discovery generation"
+                && skip.reason.contains("contradicted or unprovable")),
+        "the deferral is marked: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        engine.views.iter().any(|retained| retained.id() == id_a),
+        "the deferred view stays retained"
+    );
+    assert!(
+        engine
+            .plan
+            .slots
+            .iter()
+            .filter(|slot| {
+                slot.object == retry_key.0
+                    && slot.file_offset == retry_key.1
+                    && engine.plan.is_active(slot.index)
+            })
+            .count()
+            == 0,
+        "the declined view's failed endpoint does not reattach without a proven generation"
+    );
+    assert_eq!(
+        engine.plan.active_slot_count(),
+        active_before,
+        "the retained coverage commits unchanged"
+    );
+    assert_eq!(
+        engine.loader_registry.ids_for_view(id_a),
+        contexts_before,
+        "the deferred view keeps its loader contexts"
+    );
+    child_a.reap().expect("reap the child");
+}
+
+/// Midfinal round-2 residual, item 2 positive twin: the same failed
+/// endpoint retries through the same inventory path once its generation is
+/// proven. A healthy pin plus a refresh request reattaches the inactive
+/// endpoint instead of withholding it.
+#[test]
+fn midfinal_res2_proven_generation_retries_failed_endpoint() {
+    let dir = tempfile::tempdir().expect("a fixture directory");
+    let first = system_scope_build_fixture(dir.path(), "retry-proven");
+    let driver = system_scope_build_driver(dir.path());
+    let mut child_a = system_scope_spawn_loaded(&driver, &first);
+    let pid_a = child_a.pid();
+    let scope_dir = tempfile::tempdir().expect("a scope directory");
+    e06_write_listing(scope_dir.path(), &[pid_a]);
+    let scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
+    let mut engine = Engine::discover(
+        &e06_cgroup_args(scope_dir.path(), vec![first.clone()], Some(16)),
+        &scope,
+        None,
+    )
+    .expect("cgroup scope discovers the child");
+    let id_a = engine
+        .views
+        .iter()
+        .find(|view| view.pid() == pid_a)
+        .expect("the child is admitted")
+        .id();
+    let module_id = engine
+        .plan()
+        .modules
+        .iter()
+        .find(|module| module.path.ends_with("retry-proven.so"))
+        .expect("the plan names the provider")
+        .id;
+    let retry_key: (crate::discovery::identity::PinnedObjectId, u64) = {
+        let slot = engine
+            .plan()
+            .slots
+            .iter()
+            .find(|slot| {
+                slot.module_ids.as_slice() == [module_id] && engine.plan.is_active(slot.index)
+            })
+            .expect("the provider holds an active slot");
+        (slot.object, slot.file_offset)
+    };
+    let retry_index = engine
+        .plan()
+        .slots
+        .iter()
+        .find(|slot| {
+            slot.object == retry_key.0
+                && slot.file_offset == retry_key.1
+                && engine.plan.is_active(slot.index)
+        })
+        .expect("the retry target is active")
+        .index;
+    engine.plan.deactivate(retry_index);
+    assert!(
+        !engine.plan.is_active(retry_index),
+        "precondition: the failed endpoint is inactive"
+    );
+    assert!(
+        engine.request_refresh(pid_a, None),
+        "the refresh request is accepted"
+    );
+
+    let mut session = ScriptedSession::with_records([], 0);
+    let mut collect: Box<DiscoveryCollector<'_>> = Box::new(Engine::collect_discovery_records);
+    let mut tick_now = crate::attach::monotonic_ns;
+    engine
+        .refresh_inventory(
+            &mut session,
+            &mut true,
+            &mut Vec::new(),
+            &mut PendingViewRetirements::new(),
+            &mut *collect,
+            &mut PauseClosure::new(true),
+            &mut tick_now,
+        )
+        .expect("the retrying tick applies");
+    assert!(
+        engine.views.iter().any(|retained| retained.id() == id_a),
+        "the healthy view stays retained"
+    );
+    assert_eq!(
+        engine
+            .plan
+            .slots
+            .iter()
+            .filter(|slot| {
+                slot.object == retry_key.0
+                    && slot.file_offset == retry_key.1
+                    && engine.plan.is_active(slot.index)
+            })
+            .count(),
+        1,
+        "the proven generation reattaches its failed endpoint through the same path"
+    );
+    child_a.reap().expect("reap the child");
 }

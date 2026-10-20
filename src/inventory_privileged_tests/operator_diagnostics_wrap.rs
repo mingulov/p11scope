@@ -154,11 +154,13 @@ struct PassView {
 impl PassView {
     fn refresh(&mut self, path: &Path, pid: u32) -> Result<bool> {
         let rows = new_lines(path, &mut self.offset)?;
+        let mut moved = false;
         for row in &rows {
             let event = &row["event"];
             if row["kind"] == "edge_observed" && event["identity_context"]["caller"]["pid"] == pid {
                 if let Some(id) = event["identity_context"]["caller"]["id"].as_str() {
                     self.caller_id = Some(id.to_owned());
+                    moved = true;
                 }
                 if let Some(path) = event["identity_context"]["module"]["path"].as_str() {
                     let module = event["identity_context"]["module"]["id"]
@@ -166,12 +168,14 @@ impl PassView {
                         .map(str::to_owned);
                     if path.ends_with("provider-A.so") {
                         self.a = Some(event.clone());
+                        moved = true;
                         if module.is_some() {
                             self.module_a = module.clone();
                         }
                     }
                     if path.ends_with("provider-B.so") {
                         self.b = Some(event.clone());
+                        moved = true;
                         if module.is_some() {
                             self.module_b = module;
                         }
@@ -198,6 +202,7 @@ impl PassView {
                         && known.reason == candidate.reason
                 }) {
                     self.evidence.push(candidate);
+                    moved = true;
                 }
             }
             if row["kind"] == "gap_repeated"
@@ -206,11 +211,19 @@ impl PassView {
                 && let Some(known) = self.evidence.get_mut(index as usize)
             {
                 known.repeats = repeats;
+                moved = true;
             }
         }
-        Ok(rows
-            .last()
-            .is_some_and(|row| row["kind"] == "pass_committed"))
+        // Validation trigger: the trailing commit (a full pass landed) or
+        // any view-changing row (edge/gap evidence moved mid-pass). A
+        // commit-only gate skips validation when a read lands between a
+        // pass's rows and its commit marker; every trigger re-checks the
+        // current view through the stale/predicate gates, so extra triggers
+        // re-affirm instead of double-issuing.
+        Ok(moved
+            || rows
+                .last()
+                .is_some_and(|row| row["kind"] == "pass_committed"))
     }
 }
 
@@ -2138,6 +2151,45 @@ fn operator_diagnostics_wrap_reads_only_new_complete_lines() -> Result<()> {
     let rows = new_lines(&path, &mut offset)?;
     ensure!(rows.len() == 1 && rows[0]["kind"] == "pass_committed");
     ensure!(new_lines(&path, &mut offset)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn operator_diagnostics_wrap_refresh_triggers_on_view_change() -> Result<()> {
+    // The validation trigger is the trailing commit or any view-changing
+    // row: an edge-only or gap-only batch (a read landing between a pass's
+    // rows and its commit marker) must still validate, never skip.
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("events");
+    let edge = "{\"kind\":\"edge_observed\",\"event\":{\"identity_context\":{\"caller\":{\"pid\":7,\"id\":\"c0\"},\"module\":{\"path\":\"/x/provider-A.so\",\"id\":\"m0\"}},\"entries\":{\"count\":4}}}\n";
+    let gap = "{\"kind\":\"gap_recorded\",\"event\":{\"caller\":\"c0\",\"subject\":\"s\",\"reason\":\"r\"}}\n";
+    let commit = "{\"kind\":\"pass_committed\",\"event\":{}}\n";
+    let other = "{\"kind\":\"caller_event\",\"event\":{}}\n";
+    // Edge-only batch: view moved (A edge + caller), no commit yet.
+    let mut view = PassView::default();
+    std::fs::write(&path, edge)?;
+    ensure!(view.refresh(&path, 7)?);
+    ensure!(view.a.is_some() && view.caller_id.as_deref() == Some("c0"));
+    // Gap-only batch: evidence moved, no commit yet.
+    let mut view = PassView::default();
+    std::fs::write(&path, gap)?;
+    ensure!(view.refresh(&path, 7)?);
+    ensure!(view.evidence.len() == 1);
+    // Foreign-pid edge batch: view untouched, no commit, no trigger.
+    let mut view = PassView::default();
+    std::fs::write(&path, edge.replace("\"pid\":7", "\"pid\":8"))?;
+    ensure!(!view.refresh(&path, 7)?);
+    ensure!(view.a.is_none());
+    // Unrelated-kind batch: nothing moved, no trigger.
+    let mut view = PassView::default();
+    std::fs::write(&path, other)?;
+    ensure!(!view.refresh(&path, 7)?);
+    // Trailing commit still triggers on its own.
+    let mut view = PassView::default();
+    std::fs::write(&path, commit)?;
+    ensure!(view.refresh(&path, 7)?);
+    // Empty delta never triggers.
+    ensure!(!view.refresh(&path, 7)?);
     Ok(())
 }
 

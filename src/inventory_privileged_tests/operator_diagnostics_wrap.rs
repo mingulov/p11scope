@@ -4649,6 +4649,28 @@ fn privileged_native_lane_pid_diagnostics_three_round_accelerated_pilot_lp64() -
     )
 }
 
+/// S-lever gate lane: the same real 3-round probe at the gate-configured
+/// cadence (`P11SCOPE_G21_POLL_INTERVAL_MS`, unset = production default),
+/// through the same scoped override as the pilot. The run declares its
+/// cadence up front; any cost claim needs that cadence label.
+#[test]
+#[ignore = "root-owned BPF lane; real3-round gate-cadence probe, bounded90s"]
+fn privileged_native_lane_pid_diagnostics_three_round_gate_cadence_probe_lp64() -> Result<()> {
+    with_gate_poll_interval(privileged_native_lane_pid_diagnostics_three_round_startup_probe_lp64)?
+}
+
+/// Default-cadence cost/control lane (honest S split): the same probe pinned
+/// to the production cadence however the gate variable is set. Accelerated
+/// legs may qualify wrap; default CLI cost is measured here.
+#[test]
+#[ignore = "root-owned BPF lane; real3-round default-cadence control, bounded90s"]
+fn privileged_native_lane_pid_diagnostics_three_round_default_cadence_control_lp64() -> Result<()> {
+    with_gate_poll_interval_value(
+        None,
+        privileged_native_lane_pid_diagnostics_three_round_startup_probe_lp64,
+    )?
+}
+
 /// Twin helper: a caller-bound startup-fence gap `(1, 2]` with `repeats`.
 fn twin_startup_gap(caller: &str, repeats: u64) -> GapEvidence {
     GapEvidence {

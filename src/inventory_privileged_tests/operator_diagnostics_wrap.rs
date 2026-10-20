@@ -1,5 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
-//! Owned32-object physical entry-count gate. No semantic/API/104-slot claim.
+//! Owned32-pair indexed physical entry-count gate. No semantic/API/104-slot claim.
 //! Prebuilt-only, paired normal/default diagnostics; no recorder injection.
 use super::*;
 use std::collections::{BTreeMap, BTreeSet};
@@ -37,8 +37,6 @@ impl WrapWorkload {
         let out = dir.path().join("workload.out");
         let child = Command::new(dir.path().join("workload"))
             .args([
-                dir.path().join("provider-A.so"),
-                dir.path().join("provider-B.so"),
                 dir.path().to_path_buf(),
                 fifo.clone(),
                 dir.path().join("calls.jsonl"),
@@ -108,6 +106,12 @@ impl WrapWorkload {
         }
         Ok(())
     }
+    fn check_providers(&self, side: char) -> Result<()> {
+        for index in 0..32 {
+            self.check_mapping(&format!("provider-{side}-{index:02}.so"))?;
+        }
+        Ok(())
+    }
 }
 
 /// Read only newly complete JSONL lines. A partial last line remains at the old
@@ -141,18 +145,77 @@ fn new_lines(path: &Path, offset: &mut u64) -> Result<Vec<serde_json::Value>> {
     Ok(rows)
 }
 
+/// Parse the provider index from an owned module path. Only the exact
+/// indexed suffixes (`provider-A-%02d.so`, `provider-B-%02d.so`) identify a
+/// wrap edge; anything else is foreign to this gate.
+fn provider_index(path: &str, side: char) -> Option<u32> {
+    let file = path.rsplit('/').next().unwrap_or(path);
+    let prefix = if side == 'A' {
+        "provider-A-"
+    } else {
+        "provider-B-"
+    };
+    let index: u32 = file
+        .strip_prefix(prefix)?
+        .strip_suffix(".so")?
+        .parse()
+        .ok()?;
+    (u64::from(index) < TARGETS).then_some(index)
+}
+
 #[derive(Default)]
 struct PassView {
     offset: u64,
-    a: Option<serde_json::Value>,
-    b: Option<serde_json::Value>,
+    a: BTreeMap<u32, serde_json::Value>,
+    b: BTreeMap<u32, serde_json::Value>,
     evidence: Vec<GapEvidence>,
     caller_id: Option<String>,
-    module_a: Option<String>,
-    module_b: Option<String>,
+    module_a: BTreeMap<u32, String>,
+    module_b: BTreeMap<u32, String>,
     commits: u64,
 }
 impl PassView {
+    /// All 32 A-edge counts in index order, or `None` while any edge is
+    /// still unobserved. Milestones gate on the full set, never a prefix.
+    fn a_counts(&self) -> Option<Vec<u64>> {
+        (0..TARGETS as u32)
+            .map(|index| self.a.get(&index)?.get("entries")?.get("count")?.as_u64())
+            .collect()
+    }
+    /// All 32 B-edge counts in index order, or `None` while any edge is
+    /// still unobserved.
+    fn b_counts(&self) -> Option<Vec<u64>> {
+        (0..TARGETS as u32)
+            .map(|index| self.b.get(&index)?.get("entries")?.get("count")?.as_u64())
+            .collect()
+    }
+    /// All 32 A module ids in index order, or `None` while any is unknown.
+    fn modules_a(&self) -> Option<Vec<String>> {
+        (0..TARGETS as u32)
+            .map(|index| self.module_a.get(&index).cloned())
+            .collect()
+    }
+    /// All 32 B module ids in index order, or `None` while any is unknown.
+    fn modules_b(&self) -> Option<Vec<String>> {
+        (0..TARGETS as u32)
+            .map(|index| self.module_b.get(&index).cloned())
+            .collect()
+    }
+    fn side_armed(side: &BTreeMap<u32, serde_json::Value>) -> bool {
+        side.len() == TARGETS as usize
+            && side
+                .values()
+                .all(|edge| edge["capture"] == "armed" && edge["presence"] == "mapped")
+    }
+    /// (observed edges, min count, max count) for timeout diagnostics.
+    fn side_summary(side: &BTreeMap<u32, serde_json::Value>) -> (usize, Option<u64>, Option<u64>) {
+        let mut counts: Vec<u64> = side
+            .values()
+            .filter_map(|edge| edge["entries"]["count"].as_u64())
+            .collect();
+        counts.sort_unstable();
+        (side.len(), counts.first().copied(), counts.last().copied())
+    }
     fn refresh(&mut self, path: &Path, pid: u32) -> Result<bool> {
         let rows = new_lines(path, &mut self.offset)?;
         let mut moved = false;
@@ -167,18 +230,18 @@ impl PassView {
                     let module = event["identity_context"]["module"]["id"]
                         .as_str()
                         .map(str::to_owned);
-                    if path.ends_with("provider-A.so") {
-                        self.a = Some(event.clone());
+                    if let Some(index) = provider_index(path, 'A') {
+                        self.a.insert(index, event.clone());
                         moved = true;
-                        if module.is_some() {
-                            self.module_a = module.clone();
+                        if let Some(module) = module.clone() {
+                            self.module_a.insert(index, module);
                         }
                     }
-                    if path.ends_with("provider-B.so") {
-                        self.b = Some(event.clone());
+                    if let Some(index) = provider_index(path, 'B') {
+                        self.b.insert(index, event.clone());
                         moved = true;
-                        if module.is_some() {
-                            self.module_b = module;
+                        if let Some(module) = module {
+                            self.module_b.insert(index, module);
                         }
                     }
                 }
@@ -289,12 +352,12 @@ fn fence_gap_repeats(gaps: &[GapEvidence], caller: &str) -> u64 {
 }
 
 /// Expected published A-edge projection after `round` issued A rounds with
-/// `k` startup-fenced pairs (Sol pinned trajectory). The edge is
-/// max-accepting with per-(caller, module) overlap merge, not a per-pair
-/// sum: ordinary reads 1, 2, 3 after rounds 1-3 and 400 after round 400;
-/// all-32-fenced reads 1, 1, 2 and 399. Only `k == 0` and `k == 32` are
-/// valid dispositions; anything else is rejected by the caller, never by
-/// a silently interpolated value here.
+/// `k` startup-fenced pairs (Sol pinned trajectory), applied per edge: each
+/// pair's growth installs on its own A edge only, so every A edge reads the
+/// same ordinary/fenced value. Ordinary reads 1, 2, 3 after rounds 1-3 and
+/// 400 after round 400; all-32-fenced reads 1, 1, 2 and 399. Only `k == 0`
+/// and `k == 32` are valid dispositions; anything else is rejected by the
+/// caller, never by a silently interpolated value here.
 fn expected_a(round: u64, k: u64) -> u64 {
     if k == 0 {
         round
@@ -305,13 +368,15 @@ fn expected_a(round: u64, k: u64) -> u64 {
     }
 }
 
-/// Validate one observed A-phase round against caller-bound gap evidence.
-/// Returns the validated fence count `k`. Round 1 never fences; round 2
-/// establishes `k` (0 ordinary, 32 fenced); later rounds require exact
-/// 1-increments of the max-accepting projection with stable `k`.
+/// Validate one observed A-phase round against caller-bound gap evidence,
+/// across all 32 A edges. Every edge must read the pinned per-edge value:
+/// mixed milestones wait out in the driver, so anything non-unanimous here
+/// is a genuine divergence, never a transient. Returns the validated fence
+/// count `k`. Round 1 never fences; round 2 establishes `k` (0 ordinary, 32
+/// fenced); later rounds require exact 1-increments with stable `k`.
 fn check_startup_round(
     round: u64,
-    observed_a: u64,
+    observed_a: &[u64],
     gaps: &[GapEvidence],
     caller: &str,
     prior_k: Option<u64>,
@@ -320,12 +385,22 @@ fn check_startup_round(
         (1..=COUNTED).contains(&round),
         "A round out of range: {round}"
     );
+    ensure!(
+        observed_a.len() == TARGETS as usize,
+        "need all32 A edges, got {}",
+        observed_a.len()
+    );
+    ensure!(
+        observed_a.iter().all(|count| *count == observed_a[0]),
+        "A edges disagree at round-{round}: {observed_a:?}"
+    );
+    let observed = observed_a[0];
     let k = startup_fence_repeats(gaps, caller);
     if round == 1 {
         ensure!(prior_k.is_none(), "round 1 takes no prior disposition");
         ensure!(
-            k == 0 && observed_a == expected_a(1, 0),
-            "round 1 never fences: A={observed_a} k={k}"
+            k == 0 && observed == expected_a(1, 0),
+            "round 1 never fences: A={observed} k={k}"
         );
         return Ok(0);
     }
@@ -336,8 +411,8 @@ fn check_startup_round(
             "round 2 fences all pairs or none: k={k}"
         );
         ensure!(
-            observed_a == expected_a(2, k),
-            "round-2 A={observed_a} contradicts fence evidence k={k}"
+            observed == expected_a(2, k),
+            "round-2 A={observed} contradicts fence evidence k={k}"
         );
         return Ok(k);
     }
@@ -346,8 +421,8 @@ fn check_startup_round(
         "startup disposition changed mid-run: prior={prior_k:?} now={k}"
     );
     ensure!(
-        observed_a == expected_a(round, k),
-        "round-{round} A={observed_a} breaks the pinned projection chain (k={k})"
+        observed == expected_a(round, k),
+        "round-{round} A={observed} breaks the pinned projection chain (k={k})"
     );
     Ok(k)
 }
@@ -358,64 +433,33 @@ fn check_startup_round(
 /// the trajectory, never silently and never as a timeout.
 const FENCE_STALL_CAP: u32 = 8;
 
-/// Startup quiesce before round 2 (pid-leg round-4 wall harness). The wall
-/// mechanism: the rotation withholds round 2 as a startup fence (k=32),
-/// the suspended pairs resume through the budgeted rotation (round 3's
-/// placements trickle over many publications — the probe's drain proves
-/// it), and each growth-bearing publication re-adds its covered segment to
-/// the shared edge (pinned per-publication increment). Issuing round 4 on
-/// the first sight of A=2 therefore strands round-3 laggards on a stale
-/// base: they stage double-width (2,4] segments whose union install re-adds
-/// already held growth and jumps the edge 2->4 against the pinned 3. Live
-/// runs prove the fence is structural, not a race any settle wins: 21 s
-/// after round 1 still fenced, and 21 s before plus 20 s after round 1
-/// still fenced (k=32 both times). The quiesce plus the round-2 k=0 verdict
-/// below therefore serve as the fast loud harness (red in under a minute
-/// with the why, instead of the misleading round-4 chain error) and as the
-/// forward-compatible validation for a product-side fix. One-time startup
-/// settle only (~20 s plus the pre-round-1 hold below, of a 900 s budget);
-/// the per-round cadence and the R4 throughput arithmetic are untouched.
-/// The three-round probe keeps the immediate issue and owns the k=32
-/// coverage (32/32 fences, drained 3).
-const QUIESCE_MIN_WALL: Duration = Duration::from_secs(20);
-const QUIESCE_COMMITS: u64 = 8;
-
-/// Pre-round-1 quiesce: the ownership checkpoint stamped at round-1 staging
-/// decides the round-2 disposition, so a maturity wait was also tried
-/// before round 1 is issued. Live runs prove it insufficient as well (21 s
-/// of armed commits before round 1 still fenced): the fast pid ownership
-/// index completes between round-1 staging and the round-2 visit, so the
-/// round-2 growth mandatorily withholds by construction on this scope,
-/// while the slow system index completes after round 2 and dodges the
-/// fence. Kept as settle margin and as the negative-result harness.
-const PRE_QUIESCE_MIN_WALL: Duration = Duration::from_secs(20);
-const PRE_QUIESCE_COMMITS: u64 = 12;
-
-/// Round-2 fence verdict from one `pass_committed` observation.
+/// Round-2 fence verdict from one observation batch.
 enum StartupGateAction {
-    /// Not decided yet: stay in round 2, re-poll on the next commit.
+    /// Not decided yet: stay in round 2, re-poll on the next trigger.
     Wait,
     /// Fence count is final: run `check_startup_round` now.
     Validate,
     /// Same partial k too long: genuine partial fence, fail loudly.
     Stalled { k: u64, trajectory: Vec<u64> },
-    /// A advanced past round 2 with no fence: impossible, fail loudly.
+    /// An A edge advanced past round 2 with no fence: impossible, fail loudly.
     Overadvanced { a: u64 },
 }
 
-/// Round-2 fence gate. Mid-run `gap_repeated` values are lower bounds (the
-/// emitter reports the current cumulative count on power-of-two crossings),
-/// so the first non-stale sight of k cannot latch: 1/8/16/19/21/26 all
-/// precede 32 on healthy fenced runs. The gate is asymmetric because the
-/// bounds are: k == 32 validates immediately (a lower bound of 32 over 32
-/// pairs is exact, and the terminal exact replay backstops any over-count),
-/// while k == 0 needs the ordinary (A == 2) state on two consecutive commits
-/// (fence recordings can lag the edge). Partial counts wait out the climb;
-/// only a stalled partial fails, loudly with its trajectory. Round 1 never
-/// fences and rounds 3+ keep the immediate prior chain: the (1, 2] decision
-/// window is rounds 1-3, so later arrivals are prior-chain violations.
+/// Round-2 fence gate over all 32 A edges. Mid-run `gap_repeated` values
+/// are lower bounds (the emitter reports the current cumulative count on
+/// power-of-two crossings), so the first non-stale sight of k cannot latch:
+/// 1/8/16/19/21/26 all precede 32 on healthy fenced runs. The gate is
+/// asymmetric because the bounds are: k == 32 validates immediately (a
+/// lower bound of 32 over 32 pairs is exact, and the terminal exact replay
+/// backstops any over-count), while k == 0 needs the unanimous ordinary
+/// (all A == 2) state on two consecutive triggers (fence recordings can lag
+/// the edges, and mid-pass batches land edge-by-edge). Partial counts wait
+/// out the climb; only a stalled partial fails, loudly with its trajectory.
+/// Round 1 never fences and rounds 3+ keep the immediate prior chain: the
+/// (1, 2] decision window is rounds 1-3, so later arrivals are prior-chain
+/// violations.
 struct StartupGate {
-    last: Option<(u64, u64)>,
+    last: Option<(Vec<u64>, u64)>,
     runs: u32,
     trajectory: Vec<u64>,
 }
@@ -431,7 +475,7 @@ impl StartupGate {
 
     fn poll_round2(
         &mut self,
-        observed_a: u64,
+        observed_a: &[u64],
         gaps: &[GapEvidence],
         caller: &str,
     ) -> StartupGateAction {
@@ -440,22 +484,23 @@ impl StartupGate {
         if self.trajectory.len() > 24 {
             self.trajectory.remove(0);
         }
+        if observed_a.iter().any(|count| *count > expected_a(2, 0)) {
+            let max = observed_a.iter().max().copied().unwrap_or(0);
+            return StartupGateAction::Overadvanced { a: max };
+        }
         if k == TARGETS {
-            self.last = Some((observed_a, k));
+            self.last = Some((observed_a.to_vec(), k));
             self.runs = 1;
             return StartupGateAction::Validate;
         }
-        if k == 0 && observed_a > expected_a(2, 0) {
-            return StartupGateAction::Overadvanced { a: observed_a };
-        }
-        if self.last == Some((observed_a, k)) {
+        if self.last == Some((observed_a.to_vec(), k)) {
             self.runs += 1;
         } else {
-            self.last = Some((observed_a, k));
+            self.last = Some((observed_a.to_vec(), k));
             self.runs = 1;
         }
         if k == 0 {
-            if observed_a == expected_a(2, 0) && self.runs >= 2 {
+            if observed_a.iter().all(|count| *count == expected_a(2, 0)) && self.runs >= 2 {
                 StartupGateAction::Validate
             } else {
                 StartupGateAction::Wait
@@ -477,7 +522,7 @@ impl StartupGate {
 fn startup_round_ready(
     gate: &RefCell<StartupGate>,
     round: u64,
-    observed_a: u64,
+    observed_a: &[u64],
     evidence: &[GapEvidence],
     caller: &str,
 ) -> Result<bool> {
@@ -499,18 +544,20 @@ fn startup_round_ready(
 /// Validate the terminal fence/proof pair set: 32 distinct pairs under one
 /// caller, each with a fence `(658, 659]` withheld prefix (absolute 659,
 /// retained observation) and a proof placement (base 659, absolute 660,
-/// staged 1) on the recovered B module. Every proof must project
-/// `edge_total == 1` (the single-publication batching premise behind B=1;
-/// a split recovery projects 2..32) and recover through a strictly later
-/// read (`baseline_post < pre`). No B placement may overlap a withheld
-/// interval, and B must carry exactly the 32 proofs (no early/foreign
-/// attribution). Returns aggregate (fence-absolute sum, proof-absolute sum,
-/// staged sum) after asserting the exact 21,088/21,120/32 reconciliation.
+/// staged 1) on its own recovered B module. Every proof must project
+/// `edge_total == 1` on its own pair edge (partition-independent: each B
+/// edge carries exactly its pair's proof, with no batching premise) and
+/// recover through a strictly later read (`baseline_post < pre`). No B
+/// placement may overlap a withheld interval, and each B module must carry
+/// exactly its pair's proof (no early/foreign attribution, no shared
+/// recovery edge). Returns aggregate (fence-absolute sum, proof-absolute
+/// sum, staged sum) after asserting the exact 21,088/21,120/32
+/// reconciliation.
 fn check_terminal_pairs(
     records: &[serde_json::Value],
-    b_module: &serde_json::Value,
+    b_modules: &BTreeSet<String>,
 ) -> Result<(u64, u64, u64)> {
-    check_terminal_pairs_as(records, b_module, None)
+    check_terminal_pairs_as(records, b_modules, None)
 }
 
 /// `check_terminal_pairs` with the terminal caller identity pinned to
@@ -518,22 +565,31 @@ fn check_terminal_pairs(
 /// single-caller consistency check unpinned (PID cell).
 fn check_terminal_pairs_as(
     records: &[serde_json::Value],
-    b_module: &serde_json::Value,
+    b_modules: &BTreeSet<String>,
     expected_caller: Option<&str>,
 ) -> Result<(u64, u64, u64)> {
+    ensure!(
+        b_modules.len() == TARGETS as usize,
+        "need all32 B module ids, got {}",
+        b_modules.len()
+    );
     let mut placements = BTreeSet::new();
     let mut proof_abs_sum = 0u64;
     let mut staged_sum = 0u64;
+    let mut proof_modules = BTreeSet::new();
     let mut fence = BTreeSet::new();
     let mut fence_abs_sum = 0u64;
     let mut caller: Option<String> = None;
     let mut b_placements = 0u64;
+    let mut per_module = BTreeMap::new();
     for row in records {
-        if row["kind"] == "publication"
-            && row["decision"] == "placed"
-            && row["module_id"] == *b_module
-        {
+        let on_b = row["module_id"]
+            .as_str()
+            .is_some_and(|module| b_modules.contains(module));
+        if row["kind"] == "publication" && row["decision"] == "placed" && on_b {
             b_placements += 1;
+            let module = row["module_id"].as_str().unwrap_or_default().to_owned();
+            *per_module.entry(module).or_insert(0u64) += 1;
             let base = row["base"].as_u64().unwrap_or(u64::MAX);
             let absolute = row["absolute"].as_u64().unwrap_or(0);
             let is_proof_shape = base == COUNTED + SHARED + 1
@@ -545,7 +601,7 @@ fn check_terminal_pairs_as(
         }
         if row["kind"] == "publication"
             && row["decision"] == "placed"
-            && row["module_id"] == *b_module
+            && on_b
             && row["base"] == COUNTED + SHARED + 1
             && row["absolute"] == COUNTED + SHARED + 2
             && row["staged"] == 1
@@ -574,6 +630,12 @@ fn check_terminal_pairs_as(
             if placements.insert(pair) {
                 proof_abs_sum += row["absolute"].as_u64().context("proof absolute")?;
                 staged_sum += row["staged"].as_u64().context("proof staged")?;
+                proof_modules.insert(
+                    row["module_id"]
+                        .as_str()
+                        .context("proof module")?
+                        .to_owned(),
+                );
             }
         }
         if row["kind"] == "count_decision"
@@ -607,8 +669,16 @@ fn check_terminal_pairs_as(
         "B must carry exactly the 32 terminal proofs, found {b_placements} placements"
     );
     ensure!(
+        per_module.len() == TARGETS as usize && per_module.values().all(|count| *count == 1),
+        "each B module carries exactly its pair's proof: {per_module:?}"
+    );
+    ensure!(
         placements.len() == 32 && fence == placements,
         "all32 real pairs need recent withheld-prefix/recovery on B"
+    );
+    ensure!(
+        proof_modules == *b_modules,
+        "terminal proofs must span all32 B modules exactly once"
     );
     ensure!(
         fence_abs_sum == 32 * (COUNTED + SHARED + 1)
@@ -681,26 +751,31 @@ fn ambiguity_repeats(gaps: &[GapEvidence], module: &str) -> u64 {
 }
 
 /// Verify a shared-phase checkpoint: at power-of-two rounds the folded
-/// ambiguity gaps are mid-run exact and must read exactly `32*round` on
-/// both sharer modules. Between checkpoints any value passes (power-of-two
-/// lower bounds cannot gate); the pre-`ended` flush verifies the exact
-/// final 8256 retrospectively.
+/// ambiguity gaps are mid-run exact and must read exactly `round` on each
+/// of the 64 sharer modules (one pair per module, one disclosure per
+/// round). Between checkpoints any value passes (power-of-two lower bounds
+/// cannot gate); the pre-`ended` flush verifies the exact final 258 per
+/// module retrospectively.
 fn check_shared_checkpoint(
     round: u64,
     gaps: &[GapEvidence],
-    module_a: &str,
-    module_b: &str,
+    modules_a: &[String],
+    modules_b: &[String],
 ) -> Result<()> {
+    ensure!(
+        modules_a.len() == TARGETS as usize && modules_b.len() == TARGETS as usize,
+        "need all64 sharer module ids"
+    );
     if !round.is_power_of_two() {
         return Ok(());
     }
-    let expected = round * TARGETS;
-    let a = ambiguity_repeats(gaps, module_a);
-    let b = ambiguity_repeats(gaps, module_b);
-    ensure!(
-        a == expected && b == expected,
-        "shared round{round} needs exactly{expected} ambiguity disclosures per sharer (A={a} B={b})"
-    );
+    for module in modules_a.iter().chain(modules_b.iter()) {
+        let repeats = ambiguity_repeats(gaps, module);
+        ensure!(
+            repeats == round,
+            "shared round{round} needs exactly{round} ambiguity disclosures on {module}, found {repeats}"
+        );
+    }
     Ok(())
 }
 
@@ -864,12 +939,12 @@ fn check_native_schedule(workload: &WrapWorkload, schedule: &[(&str, u64)]) -> R
 fn check_wrap_records(
     records: &[serde_json::Value],
     bytes: u64,
-    b_module: &serde_json::Value,
+    b_modules: &BTreeSet<String>,
     pid: u32,
 ) -> Result<()> {
     let header = records.first().context("diagnostic header missing")?;
     ensure!(header["scope"] == "pid" && header["mode"] == "native" && header["pid_filter"] == pid);
-    check_wrap_records_core(records, bytes, b_module, None)
+    check_wrap_records_core(records, bytes, b_modules, None)
 }
 
 /// Scope-free wrap-export contract: envelope, limits, both-ring wrap,
@@ -880,7 +955,7 @@ fn check_wrap_records(
 fn check_wrap_records_core(
     records: &[serde_json::Value],
     bytes: u64,
-    b_module: &serde_json::Value,
+    b_modules: &BTreeSet<String>,
     expected_caller: Option<&str>,
 ) -> Result<()> {
     let header = records.first().context("diagnostic header missing")?;
@@ -1039,7 +1114,7 @@ fn check_wrap_records_core(
         }
     }
     let (fence_sum, proof_sum, staged_sum) =
-        check_terminal_pairs_as(records, b_module, expected_caller)?;
+        check_terminal_pairs_as(records, b_modules, expected_caller)?;
     ensure!(
         missing_context,
         "wrapped export needs truthful lost-history context"
@@ -1063,7 +1138,7 @@ fn check_wrap_records_core(
 fn check_wrap_records_system(
     records: &[serde_json::Value],
     bytes: u64,
-    b_module: &serde_json::Value,
+    b_modules: &BTreeSet<String>,
     owned_pid: u32,
     owned_caller: &str,
 ) -> Result<()> {
@@ -1088,7 +1163,7 @@ fn check_wrap_records_system(
             );
         }
     }
-    check_wrap_records_core(records, bytes, b_module, Some(owned_caller))
+    check_wrap_records_core(records, bytes, b_modules, Some(owned_caller))
 }
 
 fn time_shape(value: &serde_json::Value, field: &str) -> Result<bool> {
@@ -1175,9 +1250,33 @@ fn check_owned_module_exclusivity(
     Ok(())
 }
 
+/// Owned provider label from a module's paths: exactly one indexed
+/// `provider-A-%02d.so` / `provider-B-%02d.so` suffix match. Returns the
+/// label with whether it is an A-side provider.
+fn provider_label(module: &serde_json::Value) -> Result<(String, bool)> {
+    let mut labels = BTreeSet::new();
+    if let Some(paths) = module["paths"].as_array() {
+        for path in paths.iter().filter_map(|path| path.as_str()) {
+            for side in ['A', 'B'] {
+                if let Some(index) = provider_index(path, side) {
+                    labels.insert((format!("provider-{side}-{index:02}.so"), side == 'A'));
+                }
+            }
+        }
+    }
+    ensure!(
+        labels.len() == 1,
+        "owned module must identify exactly one expected indexed provider"
+    );
+    labels
+        .into_iter()
+        .next()
+        .context("indexed provider label")
+}
+
 /// Shared owned-population core: loss-free native observation plus the
-/// pinned A/B edges for the validated caller. Returns the primary facts
-/// with the owned module ids for exclusivity checks.
+/// pinned indexed A/B edges for the validated caller. Returns the primary
+/// facts with the owned module ids for exclusivity checks.
 fn primary_facts_core(
     document: &serde_json::Value,
     pid: u32,
@@ -1216,10 +1315,16 @@ fn primary_facts_core(
         ensure!(witnesses["placement"][field].as_u64().is_some());
     }
     let edges = doc_edges(document, pid);
-    ensure!(edges.len() == 2);
+    ensure!(
+        edges.len() == 2 * TARGETS as usize,
+        "need all64 owned edges, got {}",
+        edges.len()
+    );
     let modules = document["modules"].as_array().context("primary modules")?;
     let mut facts = BTreeMap::new();
     let mut module_ids = BTreeSet::new();
+    let mut a_sum = 0u64;
+    let mut b_sum = 0u64;
     for edge in edges {
         let matching: Vec<_> = modules
             .iter()
@@ -1228,26 +1333,11 @@ fn primary_facts_core(
         ensure!(matching.len() == 1, "edge module must be unique");
         let module = matching[0];
         ensure!(module_ids.insert(edge["module"].as_str().context("module ID")?.to_owned()));
-        let labels: Vec<_> = ["provider-A.so", "provider-B.so"]
-            .into_iter()
-            .filter(|suffix| {
-                module["paths"].as_array().is_some_and(|paths| {
-                    paths
-                        .iter()
-                        .any(|path| path.as_str().is_some_and(|path| path.ends_with(suffix)))
-                })
-            })
-            .collect();
-        ensure!(
-            labels.len() == 1,
-            "owned module must identify exactly one expected provider"
-        );
-        let label = labels[0];
-        let a = label == "provider-A.so";
-        // Pinned edge projections (Sol): A is the max-accepting 400/399,
-        // B is exactly 1 (32 overlapping proof units published together).
+        let (label, a) = provider_label(module)?;
+        // Pinned per-edge projections (Sol): each A edge is 400/399, each B
+        // edge is exactly 1 (its own pair's proof, partition-independent).
         // Per-pair physical sums (12,800; 21,120; staged 32) are reconciled
-        // separately from the schedule plus ledger, never from this edge.
+        // separately from the schedule plus ledger, never from one edge.
         let expected = if a { expected_a(COUNTED, k) } else { 1 };
         let entries = &edge["entries"];
         let coverage = &entries["coverage"];
@@ -1302,16 +1392,30 @@ fn primary_facts_core(
             "has_entry_first":time_shape(entries,"first_seen_ns")?,"has_entry_last":time_shape(entries,"last_seen_ns")?,
             "coverage":coverage_facts,"module_lifecycle":module["lifecycle"],
             "module_unloaded_observed":module["unloaded_observed"]});
+        if a {
+            a_sum += entries["count"].as_u64().context("A edge count")?;
+        } else {
+            b_sum += entries["count"].as_u64().context("B edge count")?;
+        }
         ensure!(
             facts.insert(label, value).is_none(),
             "duplicate provider label"
         );
     }
     ensure!(
-        facts.len() == 2
-            && facts.contains_key("provider-A.so")
-            && facts.contains_key("provider-B.so")
+        facts.len() == 2 * TARGETS as usize
+            && (0..TARGETS).all(|index| {
+                facts.contains_key(&format!("provider-A-{index:02}.so"))
+                    && facts.contains_key(&format!("provider-B-{index:02}.so"))
+            }),
+        "need one facts entry per indexed provider"
     );
+    // Independently fixed totals: 12,800-k across the A edges, 32 across B.
+    ensure!(
+        a_sum == TARGETS * expected_a(COUNTED, k),
+        "A total {a_sum} != 12,800-k (k={k})"
+    );
+    ensure!(b_sum == TARGETS, "B total {b_sum} != 32");
     Ok((
         serde_json::json!({"edges":facts,"lane":observation["lane"],"settlement":observation["settlement"],
         "retirement":observation["retirement"],"caller_lifecycle":caller["lifecycle"],
@@ -1342,35 +1446,74 @@ fn primary_facts_system(
 
 /// Post-run exact gap verification on the complete event stream (the
 /// pre-`ended` flush makes repeats exact): startup `(1,2]` repeats must
-/// equal the live-validated `k`, both sharers' ambiguity disclosures must
-/// total exactly `32*SHARED`, and the fence `(658,659]` repeats must be 32.
+/// equal the live-validated `k`, each of the 64 sharer modules' ambiguity
+/// disclosures must total exactly `SHARED`, and the fence `(658,659]`
+/// repeats must be 32.
 fn verify_final_gaps(
     rows: &[serde_json::Value],
     caller: &str,
-    module_a: &str,
-    module_b: &str,
+    modules_a: &[String],
+    modules_b: &[String],
     k: u64,
 ) -> Result<()> {
+    ensure!(
+        modules_a.len() == TARGETS as usize && modules_b.len() == TARGETS as usize,
+        "need all64 sharer module ids"
+    );
     let gaps = replay_gap_repeats(rows);
     let startup = startup_fence_repeats(&gaps, caller);
     ensure!(
         startup == k,
         "final startup-fence repeats {startup} != live k={k}"
     );
-    let expected = SHARED * TARGETS;
-    for module in [module_a, module_b] {
+    for module in modules_a.iter().chain(modules_b.iter()) {
         let repeats = ambiguity_repeats(&gaps, module);
         ensure!(
-            repeats == expected,
-            "final ambiguity disclosures for {module}: {repeats} != {expected}"
+            repeats == SHARED,
+            "final ambiguity disclosures for {module}: {repeats} != {SHARED}"
         );
     }
     let fence = fence_gap_repeats(&gaps, caller);
     ensure!(fence == TARGETS, "final fence repeats {fence} != 32");
     eprintln!(
-        "G21_WRAP_GAPS caller={caller} k={k} startup={startup} ambiguity={expected} fence={fence}"
+        "G21_WRAP_GAPS caller={caller} k={k} startup={startup} ambiguity={SHARED} fence={fence}"
     );
     Ok(())
+}
+
+/// The 32 owned B module ids from a primary document, matched by indexed
+/// provider path suffix. Independent of the count oracle: the export
+/// validator needs the module set even where counts already passed.
+fn wrap_b_modules(document: &serde_json::Value, pid: u32) -> Result<BTreeSet<String>> {
+    let modules = document["modules"].as_array().context("primary modules")?;
+    let mut found = BTreeMap::new();
+    for edge in doc_edges(document, pid) {
+        let matching: Vec<_> = modules
+            .iter()
+            .filter(|module| module["id"] == edge["module"])
+            .collect();
+        if matching.len() != 1 {
+            continue;
+        }
+        let module = matching[0];
+        let id = edge["module"]
+            .as_str()
+            .context("edge module id")?
+            .to_owned();
+        if let Some(paths) = module["paths"].as_array() {
+            for path in paths.iter().filter_map(|path| path.as_str()) {
+                if let Some(index) = provider_index(path, 'B') {
+                    found.insert(index, id.clone());
+                }
+            }
+        }
+    }
+    ensure!(
+        found.len() == TARGETS as usize,
+        "need all32 B edges in the primary document, found {}",
+        found.len()
+    );
+    Ok(found.into_values().collect())
 }
 
 /// G21 wrap cell shape: the PID wrap pair (cell 2) filters diagnostics
@@ -1463,7 +1606,7 @@ fn run_wrap_system(enabled: bool) -> Result<(serde_json::Value, u64)> {
 /// (PID-filtered vs unfiltered system) and its validators differ.
 fn run_wrap_cell(enabled: bool, cell: WrapCell) -> Result<(serde_json::Value, u64)> {
     let mut workload = WrapWorkload::spawn()?;
-    workload.check_mapping("provider-A.so")?;
+    workload.check_providers('A')?;
     workload.check_commons()?;
     let events = workload.dir.path().join("events.jsonl");
     let diagnostics = workload.dir.path().join("diagnostics.jsonl");
@@ -1475,11 +1618,6 @@ fn run_wrap_cell(enabled: bool, cell: WrapCell) -> Result<(serde_json::Value, u6
     let view = RefCell::new(PassView::default());
     let failure = RefCell::new(None::<anyhow::Error>);
     let gate = RefCell::new(StartupGate::new());
-    let r1_elapsed = Cell::new(None::<Duration>);
-    let r1_commits = Cell::new(0u64);
-    let quiesce_logged = Cell::new(false);
-    let armed_elapsed = Cell::new(None::<Duration>);
-    let armed_commits = Cell::new(0u64);
     let stop = || {
         let advance = || -> Result<bool> {
             if failure.borrow().is_some() {
@@ -1491,12 +1629,8 @@ fn run_wrap_cell(enabled: bool, cell: WrapCell) -> Result<(serde_json::Value, u6
                     "G21 wrap exceeded900s, phase={:?} k={} A={:?} B={:?} gate_traj={:?} evidence={:?}",
                     state.get(),
                     fence_k.get(),
-                    view.a
-                        .as_ref()
-                        .and_then(|edge| edge["entries"]["count"].as_u64()),
-                    view.b
-                        .as_ref()
-                        .and_then(|edge| edge["entries"]["count"].as_u64()),
+                    PassView::side_summary(&view.a),
+                    PassView::side_summary(&view.b),
                     gate.borrow().trajectory,
                     view.evidence,
                 );
@@ -1509,49 +1643,14 @@ fn run_wrap_cell(enabled: bool, cell: WrapCell) -> Result<(serde_json::Value, u6
                 return Ok(false);
             }
             let caller = view.caller_id.clone().unwrap_or_default();
-            let armed = |edge: Option<&serde_json::Value>| {
-                edge.is_some_and(|edge| edge["capture"] == "armed" && edge["presence"] == "mapped")
-            };
-            let a_count = view
-                .a
-                .as_ref()
-                .and_then(|edge| edge["entries"]["count"].as_u64());
-            let b_count = view
-                .b
-                .as_ref()
-                .and_then(|edge| edge["entries"]["count"].as_u64());
             match state.get() {
                 (0, _) => {
-                    // Pre-round-1 quiesce: the ownership checkpoint that
-                    // decides the round-2 disposition (ordinary bypass vs
-                    // startup fence) is stamped at round-1 staging, from the
-                    // ownership index/caller readiness at that instant — a
-                    // post-round-1 hold comes too late (proven: 21 s after
-                    // round 1 still fenced). Hold round 1 until the engine
-                    // milestones show the same maturity the slow system leg
-                    // reaches naturally (~15 s to its round-1 staging): wall
-                    // floor plus quiet armed commits since first arming.
-                    if !armed(view.a.as_ref()) {
+                    // Wait for all 32 A edges armed, then issue round 1.
+                    // Both startup dispositions are greenable under per-edge
+                    // arithmetic, so no settle dodges any fence.
+                    if !PassView::side_armed(&view.a) {
                         return Ok(false);
                     }
-                    if armed_elapsed.get().is_none() {
-                        armed_elapsed.set(Some(start.elapsed()));
-                        armed_commits.set(view.commits);
-                        eprintln!(
-                            "G21_WRAP_ROUND enabled={enabled} phase=a pre_quiesce started caller={caller}"
-                        );
-                    }
-                    let quiet = view.commits.saturating_sub(armed_commits.get());
-                    let waited = start
-                        .elapsed()
-                        .saturating_sub(armed_elapsed.get().unwrap_or_default());
-                    if waited < PRE_QUIESCE_MIN_WALL || quiet < PRE_QUIESCE_COMMITS {
-                        return Ok(false);
-                    }
-                    eprintln!(
-                        "G21_WRAP_ROUND enabled={enabled} phase=a pre_quiesce done waited_ms={} quiet_commits={quiet}",
-                        waited.as_millis()
-                    );
                     workload.command("ready", "ready", 0)?;
                     workload.command("count", "a-done", 1)?;
                     eprintln!(
@@ -1560,91 +1659,74 @@ fn run_wrap_cell(enabled: bool, cell: WrapCell) -> Result<(serde_json::Value, u6
                     state.set((1, 1));
                 }
                 (1, round) => {
-                    let count = a_count.context("A edge count missing in A phase")?;
+                    // Wait for all 32 A edges at each milestone; apply the
+                    // ordinary/fenced arithmetic per edge. Stale batches
+                    // still show the prior milestone on some edges with no
+                    // new gap evidence: wait. Anything outside the prior and
+                    // target milestones fails here, never stalls into the
+                    // timeout.
+                    let Some(counts) = view.a_counts() else {
+                        return Ok(false);
+                    };
                     let k_now = startup_fence_repeats(&view.evidence, &caller);
-                    // Stale passes still show the prior milestone with no new
-                    // gap evidence: wait. Anything else validates strictly
-                    // (deficits fail here, never stall into the timeout).
-                    let stale = round == 1 && count == 0 && k_now == 0
-                        || round > 1
-                            && count == expected_a(round - 1, fence_k.get())
-                            && k_now == fence_k.get();
-                    if !stale && startup_round_ready(&gate, round, count, &view.evidence, &caller)?
-                    {
+                    let prev = if round == 1 {
+                        0
+                    } else {
+                        expected_a(round - 1, fence_k.get())
+                    };
+                    if round == 2 {
+                        let stale =
+                            counts.iter().all(|count| *count == prev) && k_now == fence_k.get();
+                        if stale
+                            || !startup_round_ready(&gate, round, &counts, &view.evidence, &caller)?
+                        {
+                            return Ok(false);
+                        }
+                        let k = check_startup_round(
+                            round,
+                            &counts,
+                            &view.evidence,
+                            &caller,
+                            Some(fence_k.get()),
+                        )?;
+                        fence_k.set(k);
+                        eprintln!(
+                            "G21_WRAP_ROUND enabled={enabled} phase=a round=2 A={} k={k}",
+                            counts[0]
+                        );
+                        workload.command("count", "a-done", 3)?;
+                        state.set((1, 3));
+                    } else {
+                        let target = expected_a(round, fence_k.get());
+                        if !counts.iter().all(|count| *count == target) {
+                            ensure!(
+                                counts
+                                    .iter()
+                                    .all(|count| *count == prev || *count == target),
+                                "A edge left the issued rounds at round-{round}: {counts:?} k_now={k_now}"
+                            );
+                            if round == 1 {
+                                ensure!(k_now == 0, "round 1 fenced: k_now={k_now}");
+                            } else {
+                                ensure!(
+                                    k_now == fence_k.get(),
+                                    "startup disposition changed mid-run: k_now={k_now} validated={}",
+                                    fence_k.get()
+                                );
+                            }
+                            return Ok(false);
+                        }
                         let prior = if round == 1 {
                             None
                         } else {
                             Some(fence_k.get())
                         };
-                        let k = check_startup_round(round, count, &view.evidence, &caller, prior)?;
+                        let k =
+                            check_startup_round(round, &counts, &view.evidence, &caller, prior)?;
                         fence_k.set(k);
-                        // Round 1 re-validates on every trigger during the
-                        // quiesce below: log it once (first validation).
-                        let log_round = round != 1 || r1_elapsed.get().is_none();
-                        if log_round && (round <= 3 || round % 50 == 0 || round == COUNTED) {
+                        if round <= 3 || round % 50 == 0 || round == COUNTED {
                             eprintln!(
-                                "G21_WRAP_ROUND enabled={enabled} phase=a round={round} A={count} k={k}"
-                            );
-                        }
-                        if round == 1 {
-                            // Startup quiesce: round 1 re-validates on every
-                            // trigger (A=1/k=0 steady, nothing issued), which
-                            // doubles as the stability check — any deviation
-                            // fails above, never waits out. Hold round 2
-                            // until the count-ownership proof completes (wall
-                            // floor plus quiet commits since round 1).
-                            if r1_elapsed.get().is_none() {
-                                r1_elapsed.set(Some(start.elapsed()));
-                                r1_commits.set(view.commits);
-                                eprintln!(
-                                    "G21_WRAP_ROUND enabled={enabled} phase=a quiesce started A={count} k={k}"
-                                );
-                            }
-                            let quiet = view.commits.saturating_sub(r1_commits.get());
-                            let waited = start
-                                .elapsed()
-                                .saturating_sub(r1_elapsed.get().unwrap_or_default());
-                            if waited < QUIESCE_MIN_WALL || quiet < QUIESCE_COMMITS {
-                                if !quiesce_logged.get() && quiet >= QUIESCE_COMMITS {
-                                    quiesce_logged.set(true);
-                                    eprintln!(
-                                        "G21_WRAP_ROUND enabled={enabled} phase=a quiesce commits_quiet={quiet} waiting_wall"
-                                    );
-                                }
-                                return Ok(false);
-                            }
-                            eprintln!(
-                                "G21_WRAP_ROUND enabled={enabled} phase=a quiesce done waited_ms={} quiet_commits={quiet}",
-                                waited.as_millis()
-                            );
-                        }
-                        if round == 2 {
-                            // The full leg requires k=0: a fenced 400-round
-                            // pinned chain is structurally ungreenable
-                            // (suspended pairs resume through the budgeted
-                            // rotation over many publications, and each
-                            // growth-bearing publication re-adds its covered
-                            // segment to the shared edge, so the first
-                            // straddled round jumps +2 against the pinned
-                            // +1). The three-round probe owns the k=32
-                            // coverage. A fence here is the structural
-                            // pid-scope disposition (fast ownership index
-                            // completes before the round-2 visit, so the
-                            // first post-watermark growth mandatorily
-                            // withholds) — fail loudly with the evidence
-                            // instead of running into the misleading
-                            // round-4 chain error. Needs a product-side fix
-                            // (first-growth ordinary bypass) or a spec
-                            // decision, not a longer settle.
-                            ensure!(
-                                k == 0,
-                                "startup fence fired (k={k}): the pid-scope round-2 growth \
-                                 mandatorily withholds (fast ownership index completes before \
-                                 the round-2 visit), and the fenced full-leg chain cannot hold \
-                                 (rotation trickle plus union re-add jumps +2 at the first \
-                                 straddled round). Needs a product-side fix or spec decision: \
-                                 A={count} evidence={:?}",
-                                view.evidence
+                                "G21_WRAP_ROUND enabled={enabled} phase=a round={round} A={target} k={k}"
                             );
                         }
                         if round < COUNTED {
@@ -1652,15 +1734,15 @@ fn run_wrap_cell(enabled: bool, cell: WrapCell) -> Result<(serde_json::Value, u6
                             state.set((1, round + 1));
                         } else {
                             workload.command("load-b", "b-ready", 0)?;
-                            workload.check_mapping("provider-B.so")?;
+                            workload.check_providers('B')?;
                             eprintln!(
-                                "G21_WRAP_ROUND enabled={enabled} phase=a done A={count} k={k}"
+                                "G21_WRAP_ROUND enabled={enabled} phase=a done A={target} k={k}"
                             );
                             state.set((2, 0));
                         }
                     }
                 }
-                (2, _) if armed(view.b.as_ref()) => {
+                (2, _) if PassView::side_armed(&view.b) => {
                     workload.command("shared", "shared-done", 1)?;
                     eprintln!(
                         "G21_WRAP_ROUND enabled={enabled} phase=shared round=1 issued k={}",
@@ -1677,13 +1759,18 @@ fn run_wrap_cell(enabled: bool, cell: WrapCell) -> Result<(serde_json::Value, u6
                 // every pass.
                 (3, round) => {
                     let k = fence_k.get();
+                    let a_counts = view.a_counts().context("A edges missing in shared phase")?;
+                    let b_counts = view.b_counts().context("B edges missing in shared phase")?;
                     ensure!(
-                        a_count == Some(expected_a(COUNTED, k)) && b_count == Some(0),
-                        "shared calls escaped withholding: A={a_count:?} B={b_count:?} k={k}"
+                        a_counts
+                            .iter()
+                            .all(|count| *count == expected_a(COUNTED, k))
+                            && b_counts.iter().all(|count| *count == 0),
+                        "shared calls escaped withholding: A={a_counts:?} B={b_counts:?} k={k}"
                     );
-                    let module_a = view.module_a.clone().context("A module id missing")?;
-                    let module_b = view.module_b.clone().context("B module id missing")?;
-                    check_shared_checkpoint(round, &view.evidence, &module_a, &module_b)?;
+                    let modules_a = view.modules_a().context("A module ids missing")?;
+                    let modules_b = view.modules_b().context("B module ids missing")?;
+                    check_shared_checkpoint(round, &view.evidence, &modules_a, &modules_b)?;
                     if round < SHARED {
                         workload.command("shared", "shared-done", round + 1)?;
                         state.set((3, round + 1));
@@ -1696,19 +1783,18 @@ fn run_wrap_cell(enabled: bool, cell: WrapCell) -> Result<(serde_json::Value, u6
                     }
                 }
                 (4, _)
-                    if view
-                        .a
-                        .as_ref()
-                        .is_some_and(|edge| edge["presence"] == "unloaded") =>
+                    if view.a.len() == TARGETS as usize
+                        && view.a.values().all(|edge| edge["presence"] == "unloaded") =>
                 {
                     workload.command("fence", "fence-done", 1)?;
                     eprintln!("G21_WRAP_ROUND enabled={enabled} phase=fence issued");
                     state.set((5, 0));
                 }
                 (5, _) => {
+                    let b_counts = view.b_counts().context("B edges missing in fence phase")?;
                     ensure!(
-                        b_count == Some(0),
-                        "the fence was attributed: B={b_count:?}"
+                        b_counts.iter().all(|count| *count == 0),
+                        "the fence was attributed: B={b_counts:?}"
                     );
                     if fence_gap_repeats(&view.evidence, &caller) == TARGETS {
                         workload.command("proof", "final-calls", 1)?;
@@ -1718,21 +1804,25 @@ fn run_wrap_cell(enabled: bool, cell: WrapCell) -> Result<(serde_json::Value, u6
                 }
                 (6, _) => {
                     let k = fence_k.get();
+                    let a_counts = view.a_counts().context("A edges missing in proof phase")?;
+                    let b_counts = view.b_counts().context("B edges missing in proof phase")?;
                     ensure!(
-                        a_count == Some(expected_a(COUNTED, k)),
-                        "A history changed during proof: A={a_count:?} k={k}"
+                        a_counts
+                            .iter()
+                            .all(|count| *count == expected_a(COUNTED, k)),
+                        "A history changed during proof: A={a_counts:?} k={k}"
                     );
-                    // B is exactly 1: the 32 terminal proofs overlap in one
-                    // publication. The batching premise is asserted on the
-                    // exported Publication records (edge_total == 1 on all
-                    // 32); a split recovery would project 2..32 instead.
-                    if b_count == Some(1) {
-                        eprintln!("G21_WRAP_ROUND enabled={enabled} phase=proof done B=1 k={k}");
+                    // Each B edge reaches exactly 1 on its own pair's proof,
+                    // independently: edges arrive as their pair recovers, so
+                    // mixed 0/1 batches wait out. No batching premise — the
+                    // terminal validator pins one proof per B module instead.
+                    if b_counts.iter().all(|count| *count == 1) {
+                        eprintln!("G21_WRAP_ROUND enabled={enabled} phase=proof done B=1x32 k={k}");
                         state.set((7, 0));
                     } else {
                         ensure!(
-                            b_count == Some(0),
-                            "B recovered the wrong count: B={b_count:?}"
+                            b_counts.iter().all(|count| *count <= 1),
+                            "B recovered the wrong count: B={b_counts:?}"
                         );
                     }
                 }
@@ -1805,8 +1895,12 @@ fn run_wrap_cell(enabled: bool, cell: WrapCell) -> Result<(serde_json::Value, u6
         verify_final_gaps(
             &full_stream,
             view.caller_id.as_deref().unwrap_or_default(),
-            view.module_a.as_deref().unwrap_or_default(),
-            view.module_b.as_deref().unwrap_or_default(),
+            &view
+                .modules_a()
+                .context("A module ids missing at final gaps")?,
+            &view
+                .modules_b()
+                .context("B module ids missing at final gaps")?,
             k,
         )?;
     }
@@ -1816,10 +1910,7 @@ fn run_wrap_cell(enabled: bool, cell: WrapCell) -> Result<(serde_json::Value, u6
         WrapScope::System { owned_pid } => primary_facts_system(&document, owned_pid, k)?,
     };
     if enabled {
-        let b = doc_edges(&document, pid)
-            .into_iter()
-            .find(|edge| edge["entries"]["count"] == 1)
-            .context("recovered B edge")?;
+        let b_modules = wrap_b_modules(&document, pid)?;
         let length = std::fs::metadata(&diagnostics)?.len();
         let mut bytes = Vec::new();
         std::fs::File::open(&diagnostics)?
@@ -1832,31 +1923,25 @@ fn run_wrap_cell(enabled: bool, cell: WrapCell) -> Result<(serde_json::Value, u6
             .map(serde_json::from_slice)
             .collect::<std::result::Result<Vec<_>, _>>()?;
         match scope {
-            WrapScope::Pid { pid } => check_wrap_records(&records, length, &b["module"], pid)?,
+            WrapScope::Pid { pid } => check_wrap_records(&records, length, &b_modules, pid)?,
             WrapScope::System { owned_pid } => {
                 let owned_caller = view
                     .borrow()
                     .caller_id
                     .clone()
                     .context("owned caller id never observed")?;
-                check_wrap_records_system(
-                    &records,
-                    length,
-                    &b["module"],
-                    owned_pid,
-                    &owned_caller,
-                )?;
+                check_wrap_records_system(&records, length, &b_modules, owned_pid, &owned_caller)?;
             }
         }
     } else {
         ensure!(!diagnostics.exists());
     }
     eprintln!(
-        "G21_PAIRED enabled={enabled} elapsed_ms={} calls={} A={} B={} k={k} eligible_a={} withheld={} stdout_bytes={}",
+        "G21_PAIRED enabled={enabled} elapsed_ms={} calls={} A_total={} B_total={} k={k} eligible_a={} withheld={} stdout_bytes={}",
         start.elapsed().as_millis(),
         (COUNTED + SHARED + 2) * TARGETS,
-        expected_a(COUNTED, k),
-        1,
+        TARGETS * expected_a(COUNTED, k),
+        TARGETS,
         COUNTED * TARGETS - k,
         (SHARED + 1) * TARGETS + k,
         stdout.len()
@@ -1947,17 +2032,40 @@ fn primary_validator_fixture(pid: u32, shift: u64) -> serde_json::Value {
 fn primary_validator_fixture_k(pid: u32, shift: u64, k: u64) -> serde_json::Value {
     use crate::discovery::caller_registry::{CallerId, ModuleId};
     let caller = CallerId(shift as u32);
-    let a = ModuleId(shift as u32 + 1);
-    let b = ModuleId(shift as u32 + 2);
+    let mut modules = Vec::new();
+    let mut edges = Vec::new();
+    for index in 0..TARGETS as u32 {
+        let module = ModuleId(shift as u32 + 1 + index * 2);
+        modules.push(serde_json::json!({"id":module.label(),
+            "paths":[format!("/owned/provider-A-{index:02}.so")],
+            "lifecycle":"unloaded","unloaded_observed":true}));
+        edges.push(fixture_edge_json_k(
+            caller,
+            module,
+            shift + u64::from(index),
+            true,
+            k,
+        ));
+    }
+    for index in 0..TARGETS as u32 {
+        let module = ModuleId(shift as u32 + 2 + index * 2);
+        modules.push(serde_json::json!({"id":module.label(),
+            "paths":[format!("/owned/provider-B-{index:02}.so")],
+            "lifecycle":"mapped","unloaded_observed":false}));
+        edges.push(fixture_edge_json(
+            caller,
+            module,
+            shift + 100 + u64::from(index),
+            false,
+        ));
+    }
     serde_json::json!({
         "observation":{"lane":"native","settlement":"unsettled","retirement":"closed",
             "lifecycle":{"records":shift+10,"ring_loss":0,"malformed":0,"failed_quanta":0,"recovery_rescans":0},
             "native_witnesses":{"rows":shift+20,"bound":shift+20,"unbound":0,"pending":0,"integrity":0,
                 "unbound_reasons":{},"placement":{"edge":shift+20,"module":0,"ambiguous":0,"unresolved":0}}},
         "callers":[{"id":caller.label(),"pid":pid,"lifecycle":"mapped","retired":false,"lifecycle_reason":null}],
-        "modules":[{"id":a.label(),"paths":["/owned/provider-A.so"],"lifecycle":"unloaded","unloaded_observed":true},
-            {"id":b.label(),"paths":["/owned/provider-B.so"],"lifecycle":"mapped","unloaded_observed":false}],
-        "edges":[fixture_edge_json_k(caller,a,shift,true,k),fixture_edge_json(caller,b,shift,false)],"gaps":[]
+        "modules":modules,"edges":edges,"gaps":[]
     })
 }
 
@@ -2039,25 +2147,25 @@ fn operator_diagnostics_wrap_primary_validator_preserves_meaningful_facts() -> R
             }
             "integrity" => altered["observation"]["native_witnesses"]["integrity"] = 1.into(),
             "duplicate_label" => {
-                let mut duplicate = altered["edges"][0].clone();
-                duplicate["module"] = altered["modules"][1]["id"].clone();
-                altered["edges"][1] = duplicate;
-                altered["modules"][1]["paths"] = serde_json::json!(["/owned/provider-A.so"]);
-                altered["modules"][1]["lifecycle"] = "unloaded".into();
-                altered["modules"][1]["unloaded_observed"] = true.into();
+                let mut duplicate = altered["edges"][32].clone();
+                duplicate["module"] = altered["modules"][33]["id"].clone();
+                altered["edges"][33] = duplicate;
+                altered["modules"][33]["paths"] = serde_json::json!(["/owned/provider-B-00.so"]);
+                altered["modules"][33]["lifecycle"] = "mapped".into();
+                altered["modules"][33]["unloaded_observed"] = false.into();
             }
             "missing_label" => {
-                altered["modules"][1]["paths"] = serde_json::json!(["/owned/other.so"])
+                altered["modules"][33]["paths"] = serde_json::json!(["/owned/other.so"])
             }
             "duplicate_module" => {
-                let duplicate = altered["modules"][0]["id"].clone();
-                altered["modules"][1]["id"] = duplicate;
+                let duplicate = altered["modules"][32]["id"].clone();
+                altered["modules"][33]["id"] = duplicate;
             }
             "count" => altered["edges"][0]["entries"]["count"] = 1.into(),
             "mapping_state" => altered["edges"][0]["mapping"]["state"] = "mapped".into(),
             "module_lifecycle" => altered["modules"][0]["lifecycle"] = "mapped".into(),
             "loss" => altered["edges"][0]["entries"]["coverage"]["reason"] = "loss".into(),
-            _ => altered["edges"][1]["entries"]["coverage"]["lossy"] = true.into(),
+            _ => altered["edges"][32]["entries"]["coverage"]["lossy"] = true.into(),
         }
         ensure!(
             primary_facts(&altered, 123, 0).is_err(),
@@ -2131,7 +2239,7 @@ fn operator_diagnostics_wrap_fixture_edges_match_snapshot_renderer_shape() -> Re
     for shift in [0, 500] {
         let fixture = primary_validator_fixture(123, shift);
         let edges = fixture["edges"].as_array().context("fixture edges")?;
-        ensure!(edges.len() == 2);
+        ensure!(edges.len() == 2 * TARGETS as usize);
         for edge in edges {
             for key in edge.as_object().context("fixture edge object")?.keys() {
                 ensure!(
@@ -2193,7 +2301,7 @@ fn diagnostic_validator_fixture() -> (Vec<serde_json::Value>, u64) {
     }
     for index in 0..32 {
         push(
-            serde_json::json!({"kind":"publication","decision":"placed","module_id":"mB",
+            serde_json::json!({"kind":"publication","decision":"placed","module_id":format!("mB-{index:02}"),
         "pair":format!("p{index}"),"base":COUNTED+SHARED+1,"absolute":COUNTED+SHARED+2,"staged":1,
         "edge_total":1,"caller":"c0","pre":7020,"post":7030,
         "baseline_pre":7000,"baseline_post":7010,
@@ -2211,10 +2319,15 @@ fn diagnostic_validator_fixture() -> (Vec<serde_json::Value>, u64) {
     (records, bytes)
 }
 
+/// Twin helper: the 32 indexed B module ids `mB-00..31`.
+fn twin_b_modules() -> BTreeSet<String> {
+    (0..32).map(|index| format!("mB-{index:02}")).collect()
+}
+
 #[test]
 fn operator_diagnostics_wrap_retained_validator_checks_actual_rows() -> Result<()> {
     let (healthy, bytes) = diagnostic_validator_fixture();
-    check_wrap_records(&healthy, bytes, &serde_json::json!("mB"), 123)?;
+    check_wrap_records(&healthy, bytes, &twin_b_modules(), 123)?;
     for change in [
         "remove_row",
         "retained_lie",
@@ -2264,7 +2377,7 @@ fn operator_diagnostics_wrap_retained_validator_checks_actual_rows() -> Result<(
         }
         let bytes = seal_validator_fixture(&mut altered);
         ensure!(
-            check_wrap_records(&altered, bytes, &serde_json::json!("mB"), 123).is_err(),
+            check_wrap_records(&altered, bytes, &twin_b_modules(), 123).is_err(),
             "retained-output corruption passed: {change}"
         );
     }
@@ -2298,7 +2411,7 @@ fn operator_diagnostics_wrap_refresh_triggers_on_view_change() -> Result<()> {
     // rows and its commit marker) must still validate, never skip.
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("events");
-    let edge = "{\"kind\":\"edge_observed\",\"event\":{\"identity_context\":{\"caller\":{\"pid\":7,\"id\":\"c0\"},\"module\":{\"path\":\"/x/provider-A.so\",\"id\":\"m0\"}},\"entries\":{\"count\":4}}}\n";
+    let edge = "{\"kind\":\"edge_observed\",\"event\":{\"identity_context\":{\"caller\":{\"pid\":7,\"id\":\"c0\"},\"module\":{\"path\":\"/x/provider-A-07.so\",\"id\":\"m7\"}},\"entries\":{\"count\":4}}}\n";
     let gap = "{\"kind\":\"gap_recorded\",\"event\":{\"caller\":\"c0\",\"subject\":\"s\",\"reason\":\"r\"}}\n";
     let commit = "{\"kind\":\"pass_committed\",\"event\":{}}\n";
     let other = "{\"kind\":\"caller_event\",\"event\":{}}\n";
@@ -2306,7 +2419,8 @@ fn operator_diagnostics_wrap_refresh_triggers_on_view_change() -> Result<()> {
     let mut view = PassView::default();
     std::fs::write(&path, edge)?;
     ensure!(view.refresh(&path, 7)?);
-    ensure!(view.a.is_some() && view.caller_id.as_deref() == Some("c0"));
+    ensure!(view.a.contains_key(&7) && view.caller_id.as_deref() == Some("c0"));
+    ensure!(view.module_a.get(&7).is_some_and(|id| id == "m7"));
     // Gap-only batch: evidence moved, no commit yet.
     let mut view = PassView::default();
     std::fs::write(&path, gap)?;
@@ -2316,7 +2430,7 @@ fn operator_diagnostics_wrap_refresh_triggers_on_view_change() -> Result<()> {
     let mut view = PassView::default();
     std::fs::write(&path, edge.replace("\"pid\":7", "\"pid\":8"))?;
     ensure!(!view.refresh(&path, 7)?);
-    ensure!(view.a.is_none());
+    ensure!(view.a.is_empty());
     // Unrelated-kind batch: nothing moved, no trigger.
     let mut view = PassView::default();
     std::fs::write(&path, other)?;
@@ -2330,25 +2444,52 @@ fn operator_diagnostics_wrap_refresh_triggers_on_view_change() -> Result<()> {
     Ok(())
 }
 
+/// Sum of one side's 32 indexed edge counts in primary facts.
+fn facts_side_total(facts: &serde_json::Value, side: char) -> Result<u64> {
+    let mut total = 0u64;
+    for index in 0..TARGETS {
+        let label = format!("provider-{side}-{index:02}.so");
+        total += facts["edges"][label.as_str()]["count"]
+            .as_u64()
+            .with_context(|| format!("{label} count missing"))?;
+    }
+    Ok(total)
+}
+
 /// Strict paired off/on comparison (Sol): both legs run the identical
 /// deterministic issued schedule with milestone gating (the matched
 /// prelude), so they must validate the same startup disposition and their
 /// owned primary facts must compare exactly equal. No count replacement:
-/// replacing both A counts before comparison proves conditional agreement
-/// only, and different legitimate dispositions each pass their own oracle
-/// without proving literal count equality. Expected counts come from the
-/// issued schedule plus observed startup gaps, never from reported
-/// diagnostics.
+/// replacing counts before comparison proves conditional agreement only,
+/// and different legitimate dispositions each pass their own oracle without
+/// proving literal count equality. Expected counts come from the issued
+/// schedule plus observed startup gaps, never from reported diagnostics.
 fn check_paired_parity(
     disabled: &serde_json::Value,
     dk: u64,
     enabled: &serde_json::Value,
     ek: u64,
 ) -> Result<()> {
+    for index in 0..TARGETS {
+        let a_label = format!("provider-A-{index:02}.so");
+        let b_label = format!("provider-B-{index:02}.so");
+        ensure!(
+            disabled["edges"][a_label.as_str()]["count"] == expected_a(COUNTED, dk)
+                && enabled["edges"][a_label.as_str()]["count"] == expected_a(COUNTED, ek),
+            "leg A-{index:02} contradicts its validated disposition: dk={dk} ek={ek}"
+        );
+        ensure!(
+            disabled["edges"][b_label.as_str()]["count"] == 1
+                && enabled["edges"][b_label.as_str()]["count"] == 1,
+            "leg B-{index:02} is not exactly its pair's proof"
+        );
+    }
     ensure!(
-        disabled["edges"]["provider-A.so"]["count"] == expected_a(COUNTED, dk)
-            && enabled["edges"]["provider-A.so"]["count"] == expected_a(COUNTED, ek),
-        "leg A contradicts its validated disposition: dk={dk} ek={ek}"
+        facts_side_total(disabled, 'A')? == TARGETS * expected_a(COUNTED, dk)
+            && facts_side_total(enabled, 'A')? == TARGETS * expected_a(COUNTED, ek)
+            && facts_side_total(disabled, 'B')? == TARGETS
+            && facts_side_total(enabled, 'B')? == TARGETS,
+        "paired legs disagree with the fixed 12,800-k/32 totals: dk={dk} ek={ek}"
     );
     ensure!(
         dk == ek,
@@ -2383,16 +2524,27 @@ fn privileged_native_lane_system_diagnostics_wrap_and_primary_parity_lp64() -> R
 
 /// Validate the small probe's actual dispositions independently of its progress
 /// predicates: 32 genuinely distinct pairs, each advancing one unit per
-/// round, with exactly `k` fenced pairs withholding round 2.
+/// round on its own A module, with exactly `k` fenced pairs withholding
+/// round 2.
 fn check_startup_probe_records(
     records: &[serde_json::Value],
-    public_count: u64,
+    public_counts: &[u64],
     pid: u32,
-    module: &serde_json::Value,
+    modules: &BTreeSet<String>,
     calls: &[(u64, u64)],
     k: u64,
 ) -> Result<serde_json::Value> {
     ensure!(calls.len() == 3);
+    ensure!(
+        modules.len() == TARGETS as usize,
+        "probe needs all32 A module ids, got {}",
+        modules.len()
+    );
+    ensure!(
+        public_counts.len() == TARGETS as usize,
+        "probe needs all32 public A counts, got {}",
+        public_counts.len()
+    );
     ensure!(
         k == 0 || k == TARGETS,
         "probe disposition is all pairs or none: k={k}"
@@ -2524,7 +2676,9 @@ fn check_startup_probe_records(
                 row["kind"] == "publication"
                     && row["decision"] == "placed"
                     && row["pair"] == pair
-                    && row["module_id"] == *module
+                    && row["module_id"]
+                        .as_str()
+                        .is_some_and(|module| modules.contains(module))
                     && row["absolute"] == absolute
                     && row["base"] == base
                     && row["staged"] == 1
@@ -2535,6 +2689,31 @@ fn check_startup_probe_records(
             })
             .collect()
     };
+    // Exact pair/module correspondence: each pair's publications sit on
+    // exactly one A module, and the 32 pairs span all 32 A modules.
+    let mut pair_modules: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for row in records.iter().filter(|row| {
+        row["kind"] == "publication"
+            && row["decision"] == "placed"
+            && row["module_id"]
+                .as_str()
+                .is_some_and(|module| modules.contains(module))
+    }) {
+        let pair = row["pair"].as_str().context("probe publication pair")?;
+        let module = row["module_id"]
+            .as_str()
+            .context("probe publication module")?;
+        pair_modules.entry(pair).or_default().insert(module);
+    }
+    ensure!(
+        pair_modules.len() == TARGETS as usize && pair_modules.values().all(|ids| ids.len() == 1),
+        "each probe pair publishes on exactly one A module: {pair_modules:?}"
+    );
+    let used: BTreeSet<&str> = pair_modules.values().flatten().copied().collect();
+    ensure!(
+        used == modules.iter().map(String::as_str).collect::<BTreeSet<_>>(),
+        "probe pairs must span all32 A modules exactly once"
+    );
     for pair in pairs.iter() {
         ensure!(
             placed(pair, 1, 0).len() == 1,
@@ -2608,16 +2787,16 @@ fn check_startup_probe_records(
         frozen.len()
     );
     // Terminal (post-drain) projection: all 32 pairs placed unit 3 on both
-    // paths, so the max-accepting edge reads 3. The mid-run round-3 value
-    // (ordinary 3, startup-fence 2) is pre-drain; the drain bridges them.
+    // paths, so every A edge reads 3. The mid-run round-3 value (ordinary 3,
+    // startup-fence 2) is pre-drain; the drain bridges them.
     ensure!(
-        public_count == 3,
-        "only the exact drained probe projection (3 on both paths) is qualified"
+        public_counts.iter().all(|count| *count == 3),
+        "only the exact drained probe projection (3 on every edge, both paths) is qualified"
     );
     let path = if k == 0 { "ordinary" } else { "startup_fence" };
     Ok(
         serde_json::json!({"path":path,"physical_pairs":32,"calls":96,
-        "published":public_count,"withheld":k,"fenced_pairs":k,
+        "published":3,"withheld":k,"fenced_pairs":k,
         "observations":observations,"fences":fences}),
     )
 }
@@ -2635,7 +2814,7 @@ const DRAIN_ALLOWANCE: u64 = 40;
 #[ignore = "root-owned BPF lane; source-matched prebuilt3-round probe, bounded90s"]
 fn privileged_native_lane_pid_diagnostics_three_round_startup_probe_lp64() -> Result<()> {
     let mut workload = WrapWorkload::spawn_profile(true)?;
-    workload.check_mapping("provider-A.so")?;
+    workload.check_providers('A')?;
     workload.check_commons()?;
     let pid = workload.process.pid();
     let events = workload.dir.path().join("probe-events.jsonl");
@@ -2660,9 +2839,7 @@ fn privileged_native_lane_pid_diagnostics_three_round_startup_probe_lp64() -> Re
                 bail!(
                     "startup probe exceeded90s at phase{} A={:?} k_now={} gate_traj={:?}",
                     state.get(),
-                    view.a
-                        .as_ref()
-                        .and_then(|edge| edge["entries"]["count"].as_u64()),
+                    PassView::side_summary(&view.a),
                     startup_fence_repeats(&view.evidence, &caller),
                     gate.borrow().trajectory,
                 );
@@ -2675,45 +2852,69 @@ fn privileged_native_lane_pid_diagnostics_three_round_startup_probe_lp64() -> Re
                 return Ok(false);
             }
             let caller = view.caller_id.clone().unwrap_or_default();
-            let a = view.a.as_ref();
-            let count = a.and_then(|edge| edge["entries"]["count"].as_u64());
             match state.get() {
-                0 if a.is_some_and(|edge| {
-                    edge["capture"] == "armed" && edge["presence"] == "mapped"
-                }) =>
-                {
+                0 if PassView::side_armed(&view.a) => {
                     workload.command("ready", "ready", 0)?;
                     workload.command("count", "a-done", 1)?;
                     state.set(1);
                 }
                 awaiting @ 1..=3 => {
                     let round = u64::from(awaiting);
-                    let observed = count.context("probe A edge count missing")?;
+                    let Some(counts) = view.a_counts() else {
+                        return Ok(false);
+                    };
                     let k_now = startup_fence_repeats(&view.evidence, &caller);
-                    let stale = round == 1 && observed == 0 && k_now == 0
-                        || round > 1
-                            && observed == expected_a(round - 1, fence_k.get())
-                            && k_now == fence_k.get();
-                    if !stale
-                        && startup_round_ready(&gate, round, observed, &view.evidence, &caller)?
-                    {
+                    let prev = if round == 1 {
+                        0
+                    } else {
+                        expected_a(round - 1, fence_k.get())
+                    };
+                    let ready = if round == 2 {
+                        let stale =
+                            counts.iter().all(|count| *count == prev) && k_now == fence_k.get();
+                        !stale
+                            && startup_round_ready(&gate, round, &counts, &view.evidence, &caller)?
+                    } else {
+                        let target = expected_a(round, fence_k.get());
+                        if !counts.iter().all(|count| *count == target) {
+                            ensure!(
+                                counts
+                                    .iter()
+                                    .all(|count| *count == prev || *count == target),
+                                "probe A edge left the issued rounds at round-{round}: {counts:?}"
+                            );
+                            if round == 1 {
+                                ensure!(k_now == 0, "probe round 1 fenced: k_now={k_now}");
+                            } else {
+                                ensure!(
+                                    k_now == fence_k.get(),
+                                    "probe disposition changed mid-run: k_now={k_now}"
+                                );
+                            }
+                            return Ok(false);
+                        }
+                        true
+                    };
+                    if ready {
                         let prior = if round == 1 {
                             None
                         } else {
                             Some(fence_k.get())
                         };
                         let k =
-                            check_startup_round(round, observed, &view.evidence, &caller, prior)?;
+                            check_startup_round(round, &counts, &view.evidence, &caller, prior)?;
                         fence_k.set(k);
                         if round == 1 {
                             first_mapping.set(
-                                a.unwrap()["mapping"]["last_seen_ns"]
-                                    .as_u64()
+                                view.a
+                                    .get(&0)
+                                    .and_then(|edge| edge["mapping"]["last_seen_ns"].as_u64())
                                     .context("first published mapping clock")?,
                             );
                         }
                         eprintln!(
-                            "G21_STARTUP_PROBE_ROUND round={round} A={observed} k={k} caller={caller}"
+                            "G21_STARTUP_PROBE_ROUND round={round} A={} k={k} caller={caller}",
+                            counts[0]
                         );
                         if round < 3 {
                             workload.command("count", "a-done", round + 1)?;
@@ -2729,12 +2930,12 @@ fn privileged_native_lane_pid_diagnostics_three_round_startup_probe_lp64() -> Re
                     // Recovery drain: round-3 units were issued one pass
                     // ago; their placed(3,2) publications land over the
                     // following passes. Stopping at A=2 freezes most in
-                    // flight (withheld/capture_stopped) and leaves the edge
-                    // below its drained value. Wait for recovery to show
-                    // (edge 3) plus a bounded allowance so the terminal
+                    // flight (withheld/capture_stopped) and leaves the edges
+                    // below their drained value. Wait for recovery to show
+                    // (every edge 3) plus a bounded allowance so the terminal
                     // export shows the drained state. Ordinary (k=0) has no
                     // fence and no lag: stop at once.
-                    let observed = count.context("probe A edge count missing in drain")?;
+                    let counts = view.a_counts().context("probe A edges missing in drain")?;
                     let k_now = startup_fence_repeats(&view.evidence, &caller);
                     ensure!(
                         k_now == fence_k.get(),
@@ -2745,17 +2946,17 @@ fn privileged_native_lane_pid_diagnostics_three_round_startup_probe_lp64() -> Re
                         state.set(5);
                     } else {
                         ensure!(
-                            observed == 2 || observed == 3,
-                            "drain edge left {{2, 3}}: A={observed}"
+                            counts.iter().all(|count| *count == 2 || *count == 3),
+                            "drain edge left {{2, 3}}: A={counts:?}"
                         );
-                        if observed == 3 && !recovered.get() {
+                        if counts.iter().all(|count| *count == 3) && !recovered.get() {
                             recovered.set(true);
                             drain_passes.set(0);
                         }
                         if recovered.get() {
                             drain_passes.set(drain_passes.get() + 1);
                             eprintln!(
-                                "G21_STARTUP_PROBE_DRAIN A={observed} k={k_now} passes={}",
+                                "G21_STARTUP_PROBE_DRAIN A=3 k={k_now} passes={}",
                                 drain_passes.get()
                             );
                             if drain_passes.get() >= DRAIN_ALLOWANCE {
@@ -2845,7 +3046,11 @@ fn privileged_native_lane_pid_diagnostics_three_round_startup_probe_lp64() -> Re
     }
     ensure!(observation["native_witnesses"]["integrity"] == 0);
     let edges = doc_edges(&document, pid);
-    if edges.len() != 1 || edges[0]["mapping"]["state"] != "mapped" {
+    if edges.len() != TARGETS as usize
+        || edges
+            .iter()
+            .any(|edge| edge["mapping"]["state"] != "mapped")
+    {
         // The private fixture directory is removed on return. Keep bounded
         // actual output in the failing test log before rejecting its shape;
         // these diagnostics never replace the acceptance predicate below.
@@ -2874,13 +3079,24 @@ fn privileged_native_lane_pid_diagnostics_three_round_startup_probe_lp64() -> Re
         }
     }
     ensure!(
-        edges.len() == 1 && edges[0]["mapping"]["state"] == "mapped",
-        "actual final caller edge shape differs from the probe's one mapped provider"
+        edges.len() == TARGETS as usize
+            && edges
+                .iter()
+                .all(|edge| edge["mapping"]["state"] == "mapped"),
+        "actual final caller edge shape differs from the probe's 32 mapped providers"
     );
-    let module = &edges[0]["module"];
-    let public = edges[0]["entries"]["count"]
-        .as_u64()
-        .context("final A count")?;
+    let modules: BTreeSet<String> = edges
+        .iter()
+        .filter_map(|edge| edge["module"].as_str().map(str::to_owned))
+        .collect();
+    ensure!(
+        modules.len() == TARGETS as usize,
+        "probe needs 32 distinct A modules"
+    );
+    let mut public = Vec::new();
+    for edge in &edges {
+        public.push(edge["entries"]["count"].as_u64().context("final A count")?);
+    }
     let mut bytes = Vec::new();
     std::fs::File::open(&diagnostics)?
         .take(64 * 1024 * 1024 + 1)
@@ -2892,7 +3108,7 @@ fn privileged_native_lane_pid_diagnostics_three_round_startup_probe_lp64() -> Re
         .map(serde_json::from_slice)
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let k = fence_k.get();
-    let facts = check_startup_probe_records(&records, public, pid, module, &intervals, k)?;
+    let facts = check_startup_probe_records(&records, &public, pid, &modules, &intervals, k)?;
     ensure!(
         (facts["path"] == "startup_fence") == (k == TARGETS) && facts["fenced_pairs"] == k,
         "live gate k={k} contradicts diagnostic dispositions: {facts}"
@@ -2917,6 +3133,7 @@ fn startup_probe_validator_fixture(fenced: bool) -> Vec<serde_json::Value> {
     for round in 1..=3u64 {
         for pair in 0..32 {
             let name = format!("p{pair}");
+            let module = format!("mA-{pair:02}");
             seq += 1;
             let obs_seq = seq;
             rows.push(
@@ -2934,7 +3151,7 @@ fn startup_probe_validator_fixture(fenced: bool) -> Vec<serde_json::Value> {
             } else {
                 rows.push(
                     serde_json::json!({"kind":"publication","decision":"placed","reason":"sole_owner",
-                    "pair":name,"seq":seq,"module_id":"mA","absolute":round,"base":round-1,
+                    "pair":name,"seq":seq,"module_id":module,"absolute":round,"base":round-1,
                     "staged":1,"observation_ref":{"seq":obs_seq,"status":"retained"},
                     "baseline_pre":150,"baseline_post":160}),
                 );
@@ -2961,19 +3178,26 @@ fn startup_probe_validator_fixture(fenced: bool) -> Vec<serde_json::Value> {
     rows
 }
 
+/// Twin helper: the 32 indexed probe A module ids `mA-00..31`.
+fn twin_probe_modules() -> BTreeSet<String> {
+    (0..32).map(|index| format!("mA-{index:02}")).collect()
+}
+
 #[test]
 fn operator_diagnostics_three_round_probe_checks_fence_and_physical_pair() -> Result<()> {
     let calls = [(90, 110), (130, 150), (170, 190)];
-    let module = serde_json::json!("mA");
+    let modules = twin_probe_modules();
     let ordinary = startup_probe_validator_fixture(false);
     let fenced = startup_probe_validator_fixture(true);
-    let ordinary_facts = check_startup_probe_records(&ordinary, 3, 123, &module, &calls, 0)?;
+    let drained = vec![3u64; 32];
+    let ordinary_facts =
+        check_startup_probe_records(&ordinary, &drained, 123, &modules, &calls, 0)?;
     ensure!(ordinary_facts["path"] == "ordinary" && ordinary_facts["fenced_pairs"] == 0);
-    let fenced_facts = check_startup_probe_records(&fenced, 3, 123, &module, &calls, 32)?;
+    let fenced_facts = check_startup_probe_records(&fenced, &drained, 123, &modules, &calls, 32)?;
     ensure!(fenced_facts["path"] == "startup_fence" && fenced_facts["fenced_pairs"] == 32);
-    // Round-grouped layout: header 0; round 1 rows 1..64; round 2 rows
-    // 65..128 (first fence at 66); round 3 rows 129..192 (first recovery
-    // at 130); footer 193.
+    // Round-grouped layout: header 0; round 1 rows 1..64 (p0 obs/pub at
+    // 1/2, p1 pub at 4); round 2 rows 65..128 (first fence at 66); round 3
+    // rows 129..192 (first recovery at 130); footer 193.
     for change in [
         "second_pair",
         "wrong_absolute",
@@ -2988,9 +3212,11 @@ fn operator_diagnostics_three_round_probe_checks_fence_and_physical_pair() -> Re
         "kind_counter_lie",
         "read_starts_before_return",
         "fence_reason_stopped",
+        "shared_module",
+        "foreign_module",
     ] {
         let mut changed = fenced.clone();
-        let mut primary = 3;
+        let mut primary = vec![3u64; 32];
         let mut k = 32;
         match change {
             "second_pair" => changed[1]["pair"] = "p32".into(),
@@ -3000,15 +3226,17 @@ fn operator_diagnostics_three_round_probe_checks_fence_and_physical_pair() -> Re
             "missing_recovery" => changed[130]["decision"] = "staged".into(),
             "wrong_baseline" => changed[130]["baseline_post"] = 159.into(),
             "wrong_reference" => changed[66]["observation_ref"]["seq"] = 1.into(),
-            "wrong_primary" => primary = 2,
+            "wrong_primary" => primary[7] = 2,
             "wrong_k" => k = 0,
             "raw_before_call" => changed[65]["post"] = 180.into(),
             "read_starts_before_return" => changed[1]["pre"] = 109.into(),
             "fence_reason_stopped" => changed[66]["reason"] = "capture_stopped".into(),
+            "shared_module" => changed[4]["module_id"] = "mA-00".into(),
+            "foreign_module" => changed[2]["module_id"] = "mX".into(),
             _ => changed[193]["kinds"][0]["retained"] = 95.into(),
         }
         ensure!(
-            check_startup_probe_records(&changed, primary, 123, &module, &calls, k).is_err(),
+            check_startup_probe_records(&changed, &primary, 123, &modules, &calls, k).is_err(),
             "false startup-fence evidence accepted: {change}"
         );
     }
@@ -3038,6 +3266,11 @@ fn twin_startup_gap(caller: &str, repeats: u64) -> GapEvidence {
     }
 }
 
+/// Twin helper: all 32 A edges reading `count`.
+fn twin_edge_counts(count: u64) -> Vec<u64> {
+    vec![count; TARGETS as usize]
+}
+
 #[test]
 fn operator_diagnostics_wrap_twin_startup_ordinary_pass() -> Result<()> {
     ensure!(retirement_range("absolute count range (1, 2] (1 unattributed calls)") == Some((1, 2)));
@@ -3049,54 +3282,75 @@ fn operator_diagnostics_wrap_twin_startup_ordinary_pass() -> Result<()> {
     ensure!(retirement_range("absolute count range (2, 1] (0 unattributed calls)") == None);
     let gaps: Vec<GapEvidence> = Vec::new();
     ensure!(startup_fence_repeats(&gaps, "c0") == 0);
-    // Pinned max-accepting trajectory (Sol): ordinary A is 1, 2, 3 after
-    // rounds 1-3 and 400 after round 400 — never 32 per round.
+    // Pinned per-edge trajectory (Sol): every ordinary A edge reads 1, 2, 3
+    // after rounds 1-3 and 400 after round 400 — never 32 per round.
     ensure!(expected_a(1, 0) == 1 && expected_a(2, 0) == 2 && expected_a(3, 0) == 3);
     ensure!(expected_a(400, 0) == 400);
-    ensure!(check_startup_round(1, 1, &gaps, "c0", None)? == 0);
-    ensure!(check_startup_round(2, 2, &gaps, "c0", Some(0))? == 0);
-    ensure!(check_startup_round(3, 3, &gaps, "c0", Some(0))? == 0);
-    ensure!(check_startup_round(400, 400, &gaps, "c0", Some(0))? == 0);
+    ensure!(check_startup_round(1, &twin_edge_counts(1), &gaps, "c0", None)? == 0);
+    ensure!(check_startup_round(2, &twin_edge_counts(2), &gaps, "c0", Some(0))? == 0);
+    ensure!(check_startup_round(3, &twin_edge_counts(3), &gaps, "c0", Some(0))? == 0);
+    ensure!(check_startup_round(400, &twin_edge_counts(400), &gaps, "c0", Some(0))? == 0);
     Ok(())
 }
 
 #[test]
 fn operator_diagnostics_wrap_twin_startup_fenced_pass() -> Result<()> {
     // Fenced path (Sol pinned trajectory): exact (1, 2] gap bound to this
-    // caller on all 32 pairs; A reads 1, 1, 2 after rounds 1-3 and 399
-    // after round 400, alongside the ordinary twin's 1, 2, 3 and 400.
+    // caller on all 32 pairs; every A edge reads 1, 1, 2 after rounds 1-3
+    // and 399 after round 400, alongside the ordinary twin's 1, 2, 3/400.
     let gaps = vec![twin_startup_gap("c0", 32)];
     ensure!(startup_fence_repeats(&gaps, "c0") == 32);
     ensure!(expected_a(2, 32) == 1 && expected_a(3, 32) == 2);
     ensure!(expected_a(400, 32) == 399);
     let no_gap: Vec<GapEvidence> = Vec::new();
-    ensure!(check_startup_round(1, 1, &no_gap, "c0", None)? == 0);
-    ensure!(check_startup_round(2, 1, &gaps, "c0", Some(0))? == 32);
-    ensure!(check_startup_round(3, 2, &gaps, "c0", Some(32))? == 32);
-    ensure!(check_startup_round(4, 3, &gaps, "c0", Some(32))? == 32);
-    ensure!(check_startup_round(400, 399, &gaps, "c0", Some(32))? == 32);
+    ensure!(check_startup_round(1, &twin_edge_counts(1), &no_gap, "c0", None)? == 0);
+    ensure!(check_startup_round(2, &twin_edge_counts(1), &gaps, "c0", Some(0))? == 32);
+    ensure!(check_startup_round(3, &twin_edge_counts(2), &gaps, "c0", Some(32))? == 32);
+    ensure!(check_startup_round(4, &twin_edge_counts(3), &gaps, "c0", Some(32))? == 32);
+    ensure!(check_startup_round(400, &twin_edge_counts(399), &gaps, "c0", Some(32))? == 32);
     Ok(())
 }
 
 #[test]
 fn operator_diagnostics_wrap_twin_startup_underdelivery_fail() -> Result<()> {
-    // Valid startup gap but a wrong round-3 edge (1 or 3 instead of the
+    // Valid startup gap but wrong round-3 edges (1 or 3 instead of the
     // pinned 2) must FAIL; so must any other deficit or surplus, and the
     // old summed values (64/96/12768/12800) must FAIL as over-delivery.
     let gaps = vec![twin_startup_gap("c0", 32)];
-    ensure!(check_startup_round(3, 1, &gaps, "c0", Some(32)).is_err());
-    ensure!(check_startup_round(3, 3, &gaps, "c0", Some(32)).is_err());
-    ensure!(check_startup_round(3, 2, &[], "c0", Some(0)).is_err());
-    ensure!(check_startup_round(3, 4, &[], "c0", Some(0)).is_err());
-    ensure!(check_startup_round(3, 64, &gaps, "c0", Some(32)).is_err());
-    ensure!(check_startup_round(3, 96, &[], "c0", Some(0)).is_err());
-    ensure!(check_startup_round(2, 0, &gaps, "c0", Some(0)).is_err());
-    ensure!(check_startup_round(2, 2, &gaps, "c0", Some(0)).is_err());
-    ensure!(check_startup_round(400, 398, &gaps, "c0", Some(32)).is_err());
-    ensure!(check_startup_round(400, 400, &gaps, "c0", Some(32)).is_err());
-    ensure!(check_startup_round(400, 399, &[], "c0", Some(0)).is_err());
-    ensure!(check_startup_round(400, 12768, &gaps, "c0", Some(32)).is_err());
-    ensure!(check_startup_round(400, 12800, &[], "c0", Some(0)).is_err());
+    let empty: Vec<GapEvidence> = Vec::new();
+    for (round, count, gaps, prior) in [
+        (3, 1, &gaps, Some(32)),
+        (3, 3, &gaps, Some(32)),
+        (3, 2, &empty, Some(0)),
+        (3, 4, &empty, Some(0)),
+        (3, 64, &gaps, Some(32)),
+        (3, 96, &empty, Some(0)),
+        (2, 0, &gaps, Some(0)),
+        (2, 2, &gaps, Some(0)),
+        (400, 398, &gaps, Some(32)),
+        (400, 400, &gaps, Some(32)),
+        (400, 399, &empty, Some(0)),
+        (400, 12768, &gaps, Some(32)),
+        (400, 12800, &empty, Some(0)),
+    ] {
+        ensure!(
+            check_startup_round(round, &twin_edge_counts(count), gaps, "c0", prior).is_err(),
+            "wrong round-{round} edge accepted: {count}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn operator_diagnostics_wrap_twin_startup_mixed_edges_fail() -> Result<()> {
+    // Mixed milestones wait out in the driver, so anything non-unanimous
+    // here is a genuine divergence and must FAIL — as must a short vector.
+    let gaps: Vec<GapEvidence> = Vec::new();
+    let mut mixed = twin_edge_counts(2);
+    mixed[7] = 1;
+    ensure!(check_startup_round(2, &mixed, &gaps, "c0", Some(0)).is_err());
+    ensure!(check_startup_round(2, &twin_edge_counts(2)[..31], &gaps, "c0", Some(0)).is_err());
+    ensure!(check_startup_round(2, &[], &gaps, "c0", Some(0)).is_err());
     Ok(())
 }
 
@@ -3105,8 +3359,8 @@ fn operator_diagnostics_wrap_twin_startup_missing_gap_fail() -> Result<()> {
     // A short round-2 count with no gap evidence must FAIL (never inferred).
     let gaps: Vec<GapEvidence> = Vec::new();
     ensure!(startup_fence_repeats(&gaps, "c0") == 0);
-    ensure!(check_startup_round(2, 1, &gaps, "c0", Some(0)).is_err());
-    ensure!(check_startup_round(2, 2, &gaps, "c0", Some(0))? == 0);
+    ensure!(check_startup_round(2, &twin_edge_counts(1), &gaps, "c0", Some(0)).is_err());
+    ensure!(check_startup_round(2, &twin_edge_counts(2), &gaps, "c0", Some(0))? == 0);
     Ok(())
 }
 
@@ -3116,11 +3370,20 @@ fn operator_diagnostics_wrap_twin_startup_misbound_gap_fail() -> Result<()> {
     // caller's fence evidence and must FAIL alongside the short count.
     let foreign = vec![twin_startup_gap("c9", 32)];
     ensure!(startup_fence_repeats(&foreign, "c0") == 0);
-    ensure!(check_startup_round(2, 1, &foreign, "c0", Some(0)).is_err());
+    ensure!(check_startup_round(2, &twin_edge_counts(1), &foreign, "c0", Some(0)).is_err());
     let mut unbound = twin_startup_gap("c0", 32);
     unbound.caller = None;
     ensure!(startup_fence_repeats(&[unbound], "c0") == 0);
-    ensure!(check_startup_round(2, 1, &[twin_startup_gap("c9", 32)], "c0", Some(0)).is_err());
+    ensure!(
+        check_startup_round(
+            2,
+            &twin_edge_counts(1),
+            &[twin_startup_gap("c9", 32)],
+            "c0",
+            Some(0)
+        )
+        .is_err()
+    );
     // A gap with the wrong subject is not fence evidence either.
     let mut wrong_subject = twin_startup_gap("c0", 32);
     wrong_subject.subject = "native witness without mapping evidence".to_owned();
@@ -3135,14 +3398,14 @@ fn operator_diagnostics_wrap_twin_startup_wrong_range_fail() -> Result<()> {
     let mut wrong_range = twin_startup_gap("c0", 32);
     wrong_range.reason = wrong_range.reason.replace("(1, 2]", "(0, 2]");
     ensure!(startup_fence_repeats(&[wrong_range.clone()], "c0") == 0);
-    ensure!(check_startup_round(2, 1, &[wrong_range], "c0", Some(0)).is_err());
+    ensure!(check_startup_round(2, &twin_edge_counts(1), &[wrong_range], "c0", Some(0)).is_err());
     let partial = vec![twin_startup_gap("c0", 16)];
-    ensure!(check_startup_round(2, 1, &partial, "c0", Some(0)).is_err());
-    ensure!(check_startup_round(2, 2, &partial, "c0", Some(0)).is_err());
+    ensure!(check_startup_round(2, &twin_edge_counts(1), &partial, "c0", Some(0)).is_err());
+    ensure!(check_startup_round(2, &twin_edge_counts(2), &partial, "c0", Some(0)).is_err());
     // Unstable fence count between rounds must FAIL.
     let full = vec![twin_startup_gap("c0", 32)];
-    ensure!(check_startup_round(3, 2, &full, "c0", Some(0)).is_err());
-    ensure!(check_startup_round(3, 3, &full, "c0", Some(32)).is_err());
+    ensure!(check_startup_round(3, &twin_edge_counts(2), &full, "c0", Some(0)).is_err());
+    ensure!(check_startup_round(3, &twin_edge_counts(3), &full, "c0", Some(32)).is_err());
     Ok(())
 }
 
@@ -3152,7 +3415,7 @@ fn operator_diagnostics_wrap_startup_gate_accepts_full_fence_immediately() -> Re
     let gaps = vec![twin_startup_gap("c0", 32)];
     let mut gate = StartupGate::new();
     ensure!(matches!(
-        gate.poll_round2(1, &gaps, "c0"),
+        gate.poll_round2(&twin_edge_counts(1), &gaps, "c0"),
         StartupGateAction::Validate
     ));
     Ok(())
@@ -3165,13 +3428,13 @@ fn operator_diagnostics_wrap_startup_gate_waits_out_partial_climb() -> Result<()
     for repeats in [1, 8, 21] {
         let gaps = vec![twin_startup_gap("c0", repeats)];
         ensure!(matches!(
-            gate.poll_round2(1, &gaps, "c0"),
+            gate.poll_round2(&twin_edge_counts(1), &gaps, "c0"),
             StartupGateAction::Wait
         ));
     }
     let gaps = vec![twin_startup_gap("c0", 32)];
     ensure!(matches!(
-        gate.poll_round2(1, &gaps, "c0"),
+        gate.poll_round2(&twin_edge_counts(1), &gaps, "c0"),
         StartupGateAction::Validate
     ));
     Ok(())
@@ -3179,20 +3442,27 @@ fn operator_diagnostics_wrap_startup_gate_waits_out_partial_climb() -> Result<()
 
 #[test]
 fn operator_diagnostics_wrap_startup_gate_requires_stable_ordinary() -> Result<()> {
-    // k == 0 validates only on the second consecutive ordinary commit;
-    // pre-observation (A == 1) and first-sight ordinary both wait.
+    // k == 0 validates only on the second consecutive unanimous ordinary
+    // trigger; pre-observation (all A == 1), mixed mid-pass batches and
+    // first-sight ordinary all wait.
     let gaps: Vec<GapEvidence> = Vec::new();
     let mut gate = StartupGate::new();
     ensure!(matches!(
-        gate.poll_round2(1, &gaps, "c0"),
+        gate.poll_round2(&twin_edge_counts(1), &gaps, "c0"),
+        StartupGateAction::Wait
+    ));
+    let mut mixed = twin_edge_counts(2);
+    mixed[7] = 1;
+    ensure!(matches!(
+        gate.poll_round2(&mixed, &gaps, "c0"),
         StartupGateAction::Wait
     ));
     ensure!(matches!(
-        gate.poll_round2(2, &gaps, "c0"),
+        gate.poll_round2(&twin_edge_counts(2), &gaps, "c0"),
         StartupGateAction::Wait
     ));
     ensure!(matches!(
-        gate.poll_round2(2, &gaps, "c0"),
+        gate.poll_round2(&twin_edge_counts(2), &gaps, "c0"),
         StartupGateAction::Validate
     ));
     Ok(())
@@ -3200,17 +3470,17 @@ fn operator_diagnostics_wrap_startup_gate_requires_stable_ordinary() -> Result<(
 
 #[test]
 fn operator_diagnostics_wrap_startup_gate_fails_stalled_partial_loud() -> Result<()> {
-    // A partial k frozen for FENCE_STALL_CAP commits is a genuine partial
+    // A partial k frozen for FENCE_STALL_CAP triggers is a genuine partial
     // fence and fails loudly with its trajectory; flapping never trips it.
     let gaps = vec![twin_startup_gap("c0", 16)];
     let mut gate = StartupGate::new();
     for _ in 0..FENCE_STALL_CAP - 1 {
         ensure!(matches!(
-            gate.poll_round2(1, &gaps, "c0"),
+            gate.poll_round2(&twin_edge_counts(1), &gaps, "c0"),
             StartupGateAction::Wait
         ));
     }
-    match gate.poll_round2(1, &gaps, "c0") {
+    match gate.poll_round2(&twin_edge_counts(1), &gaps, "c0") {
         StartupGateAction::Stalled { k, trajectory } => {
             ensure!(k == 16);
             ensure!(trajectory.len() == FENCE_STALL_CAP as usize);
@@ -3222,7 +3492,7 @@ fn operator_diagnostics_wrap_startup_gate_fails_stalled_partial_loud() -> Result
     for repeats in [16, 17, 16, 17, 16, 17, 16, 17, 16] {
         let gaps = vec![twin_startup_gap("c0", repeats)];
         ensure!(matches!(
-            flap.poll_round2(1, &gaps, "c0"),
+            flap.poll_round2(&twin_edge_counts(1), &gaps, "c0"),
             StartupGateAction::Wait
         ));
     }
@@ -3231,19 +3501,89 @@ fn operator_diagnostics_wrap_startup_gate_fails_stalled_partial_loud() -> Result
 
 #[test]
 fn operator_diagnostics_wrap_startup_gate_rejects_overadvanced_ordinary() -> Result<()> {
-    // A past round 2 with no fence is impossible (rounds are driver-issued).
+    // Past round 2 with no fence is impossible (rounds are driver-issued),
+    // on one edge or all of them.
     let gaps: Vec<GapEvidence> = Vec::new();
     let mut gate = StartupGate::new();
     ensure!(matches!(
-        gate.poll_round2(3, &gaps, "c0"),
+        gate.poll_round2(&twin_edge_counts(3), &gaps, "c0"),
+        StartupGateAction::Overadvanced { a: 3 }
+    ));
+    let mut mixed = twin_edge_counts(2);
+    mixed[7] = 3;
+    ensure!(matches!(
+        gate.poll_round2(&mixed, &gaps, "c0"),
         StartupGateAction::Overadvanced { a: 3 }
     ));
     Ok(())
 }
 
+#[test]
+fn operator_diagnostics_wrap_twin_shared_edge_publication_partitioning() -> Result<()> {
+    // Sol round-3 retained behavior: the shared-edge publication recurrence,
+    // pinned deterministically on the real registry without live capture.
+    // One edge, observations supplied directly: initial edge 1; publish one
+    // recovered (2,3] segment -> 2; then publish another pair's (2,4]
+    // alongside (3,4] -> union width 2 over base 2 -> 4. The (2,3] portion
+    // was already held, so the stale-base union re-adds held growth: the
+    // live 2->4 jump against the pinned 3. An unchanged reread (zero
+    // growth) adds nothing, while restaged demoted segments re-add across
+    // publications (the merge is publication-local): the same two segments
+    // again -> 6. The indexed live gate avoids this recurrence by giving
+    // each pair its own edge; this test pins the recurrence itself so a
+    // shared-edge premise can never silently return.
+    use crate::discovery::caller_registry::{
+        AdmissionState, CallerId, CallerRegistry, ModuleInfo, ModuleKey, RegistryLimits,
+    };
+    let mut registry = CallerRegistry::new(RegistryLimits::default_limits());
+    let key = ModuleKey::physical(8, 1, 11, Some("sha0011".into()), "/lib/a.so");
+    registry.note_mapping(
+        CallerId(0),
+        50,
+        ModuleInfo {
+            path: "/lib/a.so".into(),
+            key: key.clone(),
+            double_loaded: false,
+            build_id: None,
+            identity_source: Some("mountinfo".into()),
+            admission: AdmissionState::Admitted,
+            admission_class: Some("exact".into()),
+            admission_endpoints: Some(3),
+            admission_reasons: Vec::new(),
+        },
+        100,
+    );
+    registry.publish();
+    let edge_count = |registry: &CallerRegistry| {
+        let id = registry.module_id_for(&key).expect("module retained");
+        registry
+            .edge(CallerId(0), id)
+            .expect("edge retained")
+            .entry_count
+    };
+    registry.note_counted_use(CallerId(0), &key, 1, 100, 200, 0);
+    registry.publish();
+    ensure!(edge_count(&registry) == 1);
+    registry.note_counted_use(CallerId(0), &key, 1, 300, 400, 2);
+    registry.publish();
+    ensure!(edge_count(&registry) == 2);
+    registry.note_counted_use(CallerId(0), &key, 2, 500, 600, 2);
+    registry.note_counted_use(CallerId(0), &key, 1, 510, 610, 3);
+    registry.publish();
+    ensure!(edge_count(&registry) == 4);
+    registry.note_counted_use(CallerId(0), &key, 0, 700, 800, 4);
+    registry.publish();
+    ensure!(edge_count(&registry) == 4);
+    registry.note_counted_use(CallerId(0), &key, 2, 900, 910, 2);
+    registry.note_counted_use(CallerId(0), &key, 1, 920, 930, 3);
+    registry.publish();
+    ensure!(edge_count(&registry) == 6);
+    Ok(())
+}
+
 /// Twin helper: terminal proof/fence records for 32 distinct pairs, with
 /// the full retained boundary premise: caller identity, fence absolute,
-/// single-publication edge_total, retained observation refs and a strictly
+/// per-edge edge_total, retained observation refs and a strictly
 /// later recovery window (fence POST 7010 < proof PRE 7020).
 fn twin_terminal_records() -> Vec<serde_json::Value> {
     let mut records = Vec::new();
@@ -3256,7 +3596,7 @@ fn twin_terminal_records() -> Vec<serde_json::Value> {
             "observation_ref":{"seq":1000+index,"status":"retained"}}),
         );
         records.push(serde_json::json!({"kind":"publication","decision":"placed",
-            "module_id":"mB","pair":format!("p{index}"),
+            "module_id":format!("mB-{index:02}"),"pair":format!("p{index}"),
             "base":659,"absolute":660,"staged":1,"edge_total":1,
             "caller":"c0","pre":7020,"post":7030,
             "baseline_pre":7000,"baseline_post":7010,
@@ -3271,8 +3611,7 @@ fn operator_diagnostics_wrap_twin_terminal_32pair_pass() -> Result<()> {
     // per-pair fence/proof 659/660/1; aggregates recover Sol's 21,088/21,120
     // fence/proof absolutes with staged growth 32.
     let records = twin_terminal_records();
-    let (fence_sum, proof_sum, staged_sum) =
-        check_terminal_pairs(&records, &serde_json::json!("mB"))?;
+    let (fence_sum, proof_sum, staged_sum) = check_terminal_pairs(&records, &twin_b_modules())?;
     ensure!(fence_sum == 21088 && proof_sum == 21120 && staged_sum == 32);
     Ok(())
 }
@@ -3287,34 +3626,46 @@ fn operator_diagnostics_wrap_twin_terminal_single_pair_rejected() -> Result<()> 
         serde_json::json!({"kind":"publication","decision":"placed",
             "module_id":"mB","pair":"p0","base":21088,"absolute":21120,"staged":32}),
     ];
-    ensure!(check_terminal_pairs(&single, &serde_json::json!("mB")).is_err());
+    ensure!(check_terminal_pairs(&single, &twin_b_modules()).is_err());
     // 31 pairs are not 32.
     let mut short = twin_terminal_records();
     short.truncate(62);
-    ensure!(check_terminal_pairs(&short, &serde_json::json!("mB")).is_err());
+    ensure!(check_terminal_pairs(&short, &twin_b_modules()).is_err());
     // Duplicated pair identity is not distinctness.
     let mut dup = twin_terminal_records();
     dup[62]["pair"] = serde_json::json!("p0");
     dup[63]["pair"] = serde_json::json!("p0");
-    ensure!(check_terminal_pairs(&dup, &serde_json::json!("mB")).is_err());
+    ensure!(check_terminal_pairs(&dup, &twin_b_modules()).is_err());
     // Wrong per-pair values rejected.
     let mut wrong = twin_terminal_records();
     wrong[1]["staged"] = serde_json::json!(2);
-    ensure!(check_terminal_pairs(&wrong, &serde_json::json!("mB")).is_err());
+    ensure!(check_terminal_pairs(&wrong, &twin_b_modules()).is_err());
     let mut wrong_base = twin_terminal_records();
     wrong_base[1]["base"] = serde_json::json!(658);
-    ensure!(check_terminal_pairs(&wrong_base, &serde_json::json!("mB")).is_err());
-    // Wrong module rejected.
+    ensure!(check_terminal_pairs(&wrong_base, &twin_b_modules()).is_err());
+    // Wrong module set rejected: proofs on mB-* never match an mA-* set.
     let other_module = twin_terminal_records();
-    ensure!(check_terminal_pairs(&other_module, &serde_json::json!("mA")).is_err());
+    let wrong_set: BTreeSet<String> = (0..32).map(|index| format!("mA-{index:02}")).collect();
+    ensure!(check_terminal_pairs(&other_module, &wrong_set).is_err());
     Ok(())
 }
 
 #[test]
-fn operator_diagnostics_wrap_twin_terminal_requires_single_publication() -> Result<()> {
-    // The B=1 projection is sound only if all 32 proofs overlap in one
-    // publication (edge_total == 1 on every proof). A split recovery
-    // (edge_total 2) or a missing projection must FAIL.
+fn operator_diagnostics_wrap_twin_terminal_requires_distinct_b_modules() -> Result<()> {
+    // Two pairs sharing one B module is the old collapsed topology and must
+    // FAIL: each B module carries exactly its pair's proof.
+    let mut shared = twin_terminal_records();
+    shared[3]["module_id"] = serde_json::json!("mB-00");
+    ensure!(check_terminal_pairs(&shared, &twin_b_modules()).is_err());
+    Ok(())
+}
+
+#[test]
+fn operator_diagnostics_wrap_twin_terminal_requires_unit_projection() -> Result<()> {
+    // Each B edge carries exactly its pair's proof, so every proof must
+    // project edge_total == 1 on its own edge (partition-independent: no
+    // batching premise). A wrong projection (edge_total 2) or a missing
+    // one must FAIL.
     let mut split = twin_terminal_records();
     for row in split.iter_mut().skip(1).step_by(2) {
         row["edge_total"] = serde_json::json!(2);
@@ -3322,13 +3673,13 @@ fn operator_diagnostics_wrap_twin_terminal_requires_single_publication() -> Resu
     // skip(1).step_by(2) hits odd indices (proofs): verify the premise.
     ensure!(split[1]["edge_total"] == 2 && split[3]["edge_total"] == 2);
     ensure!(split[0].get("edge_total").is_none());
-    ensure!(check_terminal_pairs(&split, &serde_json::json!("mB")).is_err());
+    ensure!(check_terminal_pairs(&split, &twin_b_modules()).is_err());
     let mut missing = twin_terminal_records();
     for row in missing.iter_mut().skip(1).step_by(2) {
         row.as_object_mut().unwrap().remove("edge_total");
     }
     ensure!(missing[1].get("edge_total").is_none());
-    ensure!(check_terminal_pairs(&missing, &serde_json::json!("mB")).is_err());
+    ensure!(check_terminal_pairs(&missing, &twin_b_modules()).is_err());
     Ok(())
 }
 
@@ -3338,16 +3689,16 @@ fn operator_diagnostics_wrap_twin_terminal_requires_retained_refs() -> Result<()
     // lost or missing observation ref must FAIL, never pass silently.
     let mut lost_proof = twin_terminal_records();
     lost_proof[1]["observation_ref"]["status"] = serde_json::json!("not_retained");
-    ensure!(check_terminal_pairs(&lost_proof, &serde_json::json!("mB")).is_err());
+    ensure!(check_terminal_pairs(&lost_proof, &twin_b_modules()).is_err());
     let mut lost_fence = twin_terminal_records();
     lost_fence[0]["observation_ref"]["status"] = serde_json::json!("not_retained");
-    ensure!(check_terminal_pairs(&lost_fence, &serde_json::json!("mB")).is_err());
+    ensure!(check_terminal_pairs(&lost_fence, &twin_b_modules()).is_err());
     let mut missing = twin_terminal_records();
     missing[1]
         .as_object_mut()
         .unwrap()
         .remove("observation_ref");
-    ensure!(check_terminal_pairs(&missing, &serde_json::json!("mB")).is_err());
+    ensure!(check_terminal_pairs(&missing, &twin_b_modules()).is_err());
     Ok(())
 }
 
@@ -3357,13 +3708,13 @@ fn operator_diagnostics_wrap_twin_terminal_requires_later_recovery() -> Result<(
     // must open after the fence window closes (baseline_post < pre).
     let mut simultaneous = twin_terminal_records();
     simultaneous[1]["baseline_post"] = serde_json::json!(7020);
-    ensure!(check_terminal_pairs(&simultaneous, &serde_json::json!("mB")).is_err());
+    ensure!(check_terminal_pairs(&simultaneous, &twin_b_modules()).is_err());
     let mut backwards = twin_terminal_records();
     backwards[1]["baseline_post"] = serde_json::json!(7035);
-    ensure!(check_terminal_pairs(&backwards, &serde_json::json!("mB")).is_err());
+    ensure!(check_terminal_pairs(&backwards, &twin_b_modules()).is_err());
     let mut missing = twin_terminal_records();
     missing[1].as_object_mut().unwrap().remove("baseline_post");
-    ensure!(check_terminal_pairs(&missing, &serde_json::json!("mB")).is_err());
+    ensure!(check_terminal_pairs(&missing, &twin_b_modules()).is_err());
     Ok(())
 }
 
@@ -3373,11 +3724,11 @@ fn operator_diagnostics_wrap_twin_terminal_rejects_overlapping_placement() -> Re
     // double-placement on p0 must FAIL even though the exact proof exists.
     let mut doubled = twin_terminal_records();
     doubled.push(serde_json::json!({"kind":"publication","decision":"placed",
-        "module_id":"mB","pair":"p0","base":658,"absolute":660,"staged":2,
+        "module_id":"mB-00","pair":"p0","base":658,"absolute":660,"staged":2,
         "edge_total":2,"caller":"c0","pre":7020,"post":7030,
         "baseline_pre":7000,"baseline_post":7010,
         "observation_ref":{"seq":2000,"status":"retained"}}));
-    ensure!(check_terminal_pairs(&doubled, &serde_json::json!("mB")).is_err());
+    ensure!(check_terminal_pairs(&doubled, &twin_b_modules()).is_err());
     Ok(())
 }
 
@@ -3387,11 +3738,11 @@ fn operator_diagnostics_wrap_twin_terminal_rejects_extra_b_placement() -> Result
     // the fence interval, must FAIL (early or foreign attribution).
     let mut extra = twin_terminal_records();
     extra.push(serde_json::json!({"kind":"publication","decision":"placed",
-        "module_id":"mB","pair":"p0","base":660,"absolute":661,"staged":1,
+        "module_id":"mB-00","pair":"p0","base":660,"absolute":661,"staged":1,
         "edge_total":2,"caller":"c0","pre":7040,"post":7050,
         "baseline_pre":7020,"baseline_post":7030,
         "observation_ref":{"seq":2000,"status":"retained"}}));
-    ensure!(check_terminal_pairs(&extra, &serde_json::json!("mB")).is_err());
+    ensure!(check_terminal_pairs(&extra, &twin_b_modules()).is_err());
     Ok(())
 }
 
@@ -3401,10 +3752,10 @@ fn operator_diagnostics_wrap_twin_terminal_requires_caller_identity() -> Result<
     // a fence with the wrong absolute must FAIL.
     let mut foreign = twin_terminal_records();
     foreign[1]["caller"] = serde_json::json!("c9");
-    ensure!(check_terminal_pairs(&foreign, &serde_json::json!("mB")).is_err());
+    ensure!(check_terminal_pairs(&foreign, &twin_b_modules()).is_err());
     let mut wrong_absolute = twin_terminal_records();
     wrong_absolute[0]["absolute"] = serde_json::json!(660);
-    ensure!(check_terminal_pairs(&wrong_absolute, &serde_json::json!("mB")).is_err());
+    ensure!(check_terminal_pairs(&wrong_absolute, &twin_b_modules()).is_err());
     Ok(())
 }
 
@@ -3415,7 +3766,7 @@ fn operator_diagnostics_wrap_twin_terminal_rejects_compensating_absolutes() -> R
     let mut compensating = twin_terminal_records();
     compensating[1]["absolute"] = serde_json::json!(659);
     compensating[3]["absolute"] = serde_json::json!(661);
-    ensure!(check_terminal_pairs(&compensating, &serde_json::json!("mB")).is_err());
+    ensure!(check_terminal_pairs(&compensating, &twin_b_modules()).is_err());
     Ok(())
 }
 
@@ -3428,7 +3779,7 @@ fn operator_diagnostics_wrap_twin_one_ring_wrap_fails() -> Result<()> {
     healthy[last]["kinds"][1]["evicted"] = serde_json::json!(0);
     healthy[last]["kinds"][1]["produced"] = serde_json::json!(1);
     let bytes = seal_validator_fixture(&mut healthy);
-    ensure!(check_wrap_records(&healthy, bytes, &serde_json::json!("mB"), 123).is_err());
+    ensure!(check_wrap_records(&healthy, bytes, &twin_b_modules(), 123).is_err());
     Ok(())
 }
 
@@ -3437,7 +3788,7 @@ fn operator_diagnostics_wrap_twin_probe_double_placed_fence_fails() -> Result<()
     // A fenced pair's withheld second unit cannot also be placed: adding a
     // placed (2,1) publication alongside the p0 fence must FAIL.
     let calls = [(90, 110), (130, 150), (170, 190)];
-    let module = serde_json::json!("mA");
+    let modules = twin_probe_modules();
     let mut fenced = startup_probe_validator_fixture(true);
     let obs_seq = fenced
         .iter()
@@ -3454,7 +3805,7 @@ fn operator_diagnostics_wrap_twin_probe_double_placed_fence_fails() -> Result<()
         .context("max probe seq")?;
     fenced.push(
         serde_json::json!({"kind":"publication","decision":"placed","reason":"sole_owner",
-        "pair":"p0","seq":max_seq+1,"module_id":"mA","absolute":2,"base":1,
+        "pair":"p0","seq":max_seq+1,"module_id":"mA-00","absolute":2,"base":1,
         "staged":1,"observation_ref":{"seq":obs_seq,"status":"retained"},
         "baseline_pre":150,"baseline_post":160}),
     );
@@ -3468,7 +3819,8 @@ fn operator_diagnostics_wrap_twin_probe_double_placed_fence_fails() -> Result<()
     footer["kinds"][3]["retained"] = serde_json::json!(before + 1);
     footer["kinds"][3]["produced"] = serde_json::json!(before + 1);
     fenced.push(footer);
-    ensure!(check_startup_probe_records(&fenced, 3, 123, &module, &calls, 32).is_err());
+    let drained = vec![3u64; 32];
+    ensure!(check_startup_probe_records(&fenced, &drained, 123, &modules, &calls, 32).is_err());
     Ok(())
 }
 
@@ -3478,7 +3830,7 @@ fn operator_diagnostics_three_round_probe_rejects_frozen_third_unit() -> Result<
     // recovery and an exact fence count) must fail drain-completeness even
     // when every other assertion would pass.
     let calls = [(90, 110), (130, 150), (170, 190)];
-    let module = serde_json::json!("mA");
+    let modules = twin_probe_modules();
     let mut rows = startup_probe_validator_fixture(true);
     let footer = rows.pop().context("probe footer")?;
     rows.push(
@@ -3495,22 +3847,25 @@ fn operator_diagnostics_three_round_probe_rejects_frozen_third_unit() -> Result<
     footer["kinds"][2]["retained"] = serde_json::json!(before + 1);
     footer["kinds"][2]["produced"] = serde_json::json!(before + 1);
     rows.push(footer);
-    ensure!(check_startup_probe_records(&rows, 3, 123, &module, &calls, 32).is_err());
+    let drained = vec![3u64; 32];
+    ensure!(check_startup_probe_records(&rows, &drained, 123, &modules, &calls, 32).is_err());
     Ok(())
 }
 
 #[test]
 fn operator_diagnostics_wrap_twin_primary_facts_rejects_wrong_b() -> Result<()> {
-    // B is exactly 1 (32 overlapping proofs in one publication): 0, 2 and
-    // the old summed 32 must FAIL under both dispositions.
+    // Each B edge is exactly 1 (its own pair's proof): 0, 2 and the old
+    // summed 32 must FAIL under both dispositions, on any B edge.
     for k in [0, 32] {
         for wrong in [0, 2, 32] {
-            let mut altered = primary_validator_fixture_k(123, 0, k);
-            altered["edges"][1]["entries"]["count"] = serde_json::json!(wrong);
-            ensure!(
-                primary_facts_k(&altered, 123, k).is_err(),
-                "wrong B accepted: k={k} B={wrong}"
-            );
+            for edge in [32, 63] {
+                let mut altered = primary_validator_fixture_k(123, 0, k);
+                altered["edges"][edge]["entries"]["count"] = serde_json::json!(wrong);
+                ensure!(
+                    primary_facts_k(&altered, 123, k).is_err(),
+                    "wrong B accepted: k={k} B={wrong} edge={edge}"
+                );
+            }
         }
     }
     Ok(())
@@ -3550,10 +3905,10 @@ fn operator_diagnostics_wrap_twin_paired_parity_altered_primary_fail() -> Result
     // disposition fails before comparison.
     let off = primary_facts_k(&primary_validator_fixture_k(123, 0, 0), 123, 0)?;
     for (edge, count) in [
-        ("provider-A.so", 399),
-        ("provider-A.so", 401),
-        ("provider-B.so", 0),
-        ("provider-B.so", 2),
+        ("provider-A-00.so", 399),
+        ("provider-A-31.so", 401),
+        ("provider-B-00.so", 0),
+        ("provider-B-31.so", 2),
     ] {
         let mut on = off.clone();
         on["edges"][edge]["count"] = serde_json::json!(count);
@@ -3563,7 +3918,7 @@ fn operator_diagnostics_wrap_twin_paired_parity_altered_primary_fail() -> Result
         );
     }
     let mut bad = off.clone();
-    bad["edges"]["provider-A.so"]["count"] = serde_json::json!(399);
+    bad["edges"]["provider-A-00.so"]["count"] = serde_json::json!(399);
     ensure!(check_paired_parity(&bad, 0, &off, 0).is_err());
     ensure!(check_paired_parity(&off, 0, &bad, 0).is_err());
     Ok(())
@@ -3641,41 +3996,36 @@ fn twin_ambiguity_gap(module: &str, repeats: u64) -> GapEvidence {
 
 #[test]
 fn operator_diagnostics_wrap_twin_shared_checkpoint() -> Result<()> {
-    let gaps = vec![twin_ambiguity_gap("m0", 128), twin_ambiguity_gap("m1", 128)];
-    ensure!(ambiguity_repeats(&gaps, "m0") == 128);
-    ensure!(ambiguity_repeats(&gaps, "m1") == 128);
-    ensure!(ambiguity_repeats(&gaps, "m2") == 0);
-    // Power-of-two rounds gate exactly.
-    check_shared_checkpoint(4, &gaps, "m0", "m1")?;
-    check_shared_checkpoint(
-        1,
-        &[twin_ambiguity_gap("m0", 32), twin_ambiguity_gap("m1", 32)],
-        "m0",
-        "m1",
-    )?;
-    // Short or asymmetric repeats fail at checkpoints.
-    ensure!(
-        check_shared_checkpoint(
-            4,
-            &[twin_ambiguity_gap("m0", 64), twin_ambiguity_gap("m1", 64)],
-            "m0",
-            "m1"
-        )
-        .is_err()
-    );
-    ensure!(check_shared_checkpoint(4, &[twin_ambiguity_gap("m0", 128)], "m0", "m1").is_err());
-    ensure!(
-        check_shared_checkpoint(
-            4,
-            &[twin_ambiguity_gap("m0", 128), twin_ambiguity_gap("m1", 64)],
-            "m0",
-            "m1"
-        )
-        .is_err()
-    );
+    let modules_a: Vec<String> = (0..32).map(|index| format!("mA-{index:02}")).collect();
+    let modules_b: Vec<String> = (0..32).map(|index| format!("mB-{index:02}")).collect();
+    let gaps_at = |repeats: u64| -> Vec<GapEvidence> {
+        modules_a
+            .iter()
+            .chain(modules_b.iter())
+            .map(|module| twin_ambiguity_gap(module, repeats))
+            .collect()
+    };
+    ensure!(ambiguity_repeats(&gaps_at(4), "mA-00") == 4);
+    ensure!(ambiguity_repeats(&gaps_at(4), "mB-31") == 4);
+    ensure!(ambiguity_repeats(&gaps_at(4), "mX") == 0);
+    // Power-of-two rounds gate every sharer module exactly at the round.
+    check_shared_checkpoint(4, &gaps_at(4), &modules_a, &modules_b)?;
+    check_shared_checkpoint(1, &gaps_at(1), &modules_a, &modules_b)?;
+    // Short repeats fail at checkpoints.
+    ensure!(check_shared_checkpoint(4, &gaps_at(2), &modules_a, &modules_b).is_err());
+    // One asymmetric module fails.
+    let mut asymmetric = gaps_at(4);
+    asymmetric[7].repeats = 2;
+    ensure!(check_shared_checkpoint(4, &asymmetric, &modules_a, &modules_b).is_err());
+    // One missing module fails.
+    let mut missing = gaps_at(4);
+    missing.remove(40);
+    ensure!(check_shared_checkpoint(4, &missing, &modules_a, &modules_b).is_err());
     // Non-power rounds pass through (mid-run lower bounds cannot gate).
-    check_shared_checkpoint(3, &gaps, "m0", "m1")?;
-    check_shared_checkpoint(258, &gaps, "m0", "m1")?;
+    check_shared_checkpoint(3, &gaps_at(0), &modules_a, &modules_b)?;
+    check_shared_checkpoint(258, &gaps_at(4), &modules_a, &modules_b)?;
+    // Short module lists fail before any checkpoint read.
+    ensure!(check_shared_checkpoint(4, &gaps_at(4), &modules_a[..31], &modules_b).is_err());
     Ok(())
 }
 
@@ -3713,14 +4063,22 @@ fn replay_gap_repeats(rows: &[serde_json::Value]) -> Vec<GapEvidence> {
 #[test]
 fn operator_diagnostics_wrap_twin_primary_facts_disposition() -> Result<()> {
     // The validated startup disposition carries into final primary facts:
-    // A reads exactly the pinned edge (400 ordinary, 399 fenced) and B
-    // reads exactly 1 (32 overlapping proof units published together).
+    // every A edge reads exactly the pinned per-edge value (400 ordinary,
+    // 399 fenced), every B edge reads exactly 1, and the totals are
+    // independently fixed at 12,800-k and 32.
     let ordinary = primary_facts_k(&primary_validator_fixture_k(123, 0, 0), 123, 0)?;
-    ensure!(ordinary["edges"]["provider-A.so"]["count"] == 400);
-    ensure!(ordinary["edges"]["provider-B.so"]["count"] == 1);
+    ensure!(ordinary["edges"]["provider-A-00.so"]["count"] == 400);
+    ensure!(ordinary["edges"]["provider-A-31.so"]["count"] == 400);
+    ensure!(ordinary["edges"]["provider-B-00.so"]["count"] == 1);
+    ensure!(ordinary["edges"]["provider-B-31.so"]["count"] == 1);
+    ensure!(facts_side_total(&ordinary, 'A')? == 12800);
+    ensure!(facts_side_total(&ordinary, 'B')? == 32);
     let fenced = primary_facts_k(&primary_validator_fixture_k(123, 0, 32), 123, 32)?;
-    ensure!(fenced["edges"]["provider-A.so"]["count"] == 399);
-    ensure!(fenced["edges"]["provider-B.so"]["count"] == 1);
+    ensure!(fenced["edges"]["provider-A-00.so"]["count"] == 399);
+    ensure!(fenced["edges"]["provider-A-31.so"]["count"] == 399);
+    ensure!(fenced["edges"]["provider-B-00.so"]["count"] == 1);
+    ensure!(facts_side_total(&fenced, 'A')? == 12768);
+    ensure!(facts_side_total(&fenced, 'B')? == 32);
     // Crossed dispositions fail: neither leg may borrow the other's count.
     ensure!(primary_facts_k(&primary_validator_fixture_k(123, 0, 32), 123, 0).is_err());
     ensure!(primary_facts_k(&primary_validator_fixture_k(123, 0, 0), 123, 32).is_err());
@@ -3730,7 +4088,7 @@ fn operator_diagnostics_wrap_twin_primary_facts_disposition() -> Result<()> {
         loss["observation"]["lifecycle"]["ring_loss"] = 1.into();
         ensure!(primary_facts_k(&loss, 123, k).is_err());
         let mut lossy = primary_validator_fixture_k(123, 0, k);
-        lossy["edges"][1]["entries"]["coverage"]["lossy"] = true.into();
+        lossy["edges"][32]["entries"]["coverage"]["lossy"] = true.into();
         ensure!(primary_facts_k(&lossy, 123, k).is_err());
         let mut integrity = primary_validator_fixture_k(123, 0, k);
         integrity["observation"]["native_witnesses"]["integrity"] = 1.into();
@@ -3748,7 +4106,7 @@ fn operator_diagnostics_wrap_twin_passview_gap_evidence() -> Result<()> {
     let edge_a = serde_json::json!({"kind":"edge_observed","event":{
         "entries":{"count":1},"presence":"mapped","capture":"armed",
         "identity_context":{"caller":{"id":"c0","pid":123},
-            "module":{"id":"m1","path":"/owned/provider-A.so"}}}});
+            "module":{"id":"m1","path":"/owned/provider-A-01.so"}}}});
     let gap = serde_json::json!({"kind":"gap_recorded","event":{
         "index":0,"caller":"c0","module":null,"pid":null,
         "subject":"rejected demoted count",
@@ -3759,9 +4117,11 @@ fn operator_diagnostics_wrap_twin_passview_gap_evidence() -> Result<()> {
     std::fs::write(&path, format!("{edge_a}\n{gap}\n{repeated}\n{committed}\n"))?;
     let mut view = PassView::default();
     ensure!(view.refresh(&path, 123)?);
-    ensure!(view.a.is_some());
+    ensure!(view.a.contains_key(&1));
     ensure!(view.caller_id.as_deref() == Some("c0"));
-    ensure!(view.module_a.as_deref() == Some("m1"));
+    ensure!(view.module_a.get(&1).is_some_and(|id| id == "m1"));
+    ensure!(view.a_counts().is_none());
+    ensure!(view.modules_a().is_none());
     ensure!(view.evidence.len() == 1);
     let observed = &view.evidence[0];
     ensure!(observed.caller.as_deref() == Some("c0"));
@@ -3813,16 +4173,146 @@ fn operator_diagnostics_wrap_twin_replay_gap_repeats() -> Result<()> {
     Ok(())
 }
 
-/// The wrap fixture's 35 prebuilt inputs: 32 distinct common objects plus
-/// the two providers and the workload driver.
+#[test]
+fn operator_diagnostics_wrap_twin_provider_index_parsing() -> Result<()> {
+    // Only exact indexed suffixes identify a wrap edge.
+    ensure!(provider_index("/tmp/x/provider-A-00.so", 'A') == Some(0));
+    ensure!(provider_index("/tmp/x/provider-A-31.so", 'A') == Some(31));
+    ensure!(provider_index("/tmp/x/provider-B-07.so", 'B') == Some(7));
+    ensure!(provider_index("provider-B-00.so", 'B') == Some(0));
+    ensure!(provider_index("/tmp/x/provider-A-07.so", 'B').is_none());
+    ensure!(provider_index("/tmp/x/provider-B-07.so", 'A').is_none());
+    ensure!(provider_index("/tmp/x/provider-A.so", 'A').is_none());
+    ensure!(provider_index("/tmp/x/provider-A-32.so", 'A').is_none());
+    ensure!(provider_index("/tmp/x/provider-A-7.so", 'A') == Some(7));
+    ensure!(provider_index("/tmp/x/other.so", 'A').is_none());
+    ensure!(provider_index("/tmp/x/provider-A-07.so.1", 'A').is_none());
+    Ok(())
+}
+
+#[test]
+fn operator_diagnostics_wrap_twin_wrap_b_modules() -> Result<()> {
+    // The export validator's B module set comes from the primary document
+    // by indexed suffix, independent of counts.
+    let document = primary_validator_fixture_k(123, 0, 0);
+    let found = wrap_b_modules(&document, 123)?;
+    ensure!(found.len() == 32);
+    let expected: BTreeSet<String> = document["modules"]
+        .as_array()
+        .context("fixture modules")?
+        .iter()
+        .filter(|module| {
+            module["paths"][0]
+                .as_str()
+                .is_some_and(|path| path.contains("provider-B-"))
+        })
+        .filter_map(|module| module["id"].as_str().map(str::to_owned))
+        .collect();
+    ensure!(found == expected);
+    // A missing B edge fails, as does a duplicated B index.
+    let mut short = document.clone();
+    short["modules"][33]["paths"] = serde_json::json!(["/owned/other.so"]);
+    ensure!(wrap_b_modules(&short, 123).is_err());
+    let mut dup = document.clone();
+    dup["modules"][34]["paths"] = serde_json::json!(["/owned/provider-B-01.so"]);
+    ensure!(wrap_b_modules(&dup, 123).is_err());
+    Ok(())
+}
+
+/// Twin helper: one exact final gap stream — startup k, SHARED ambiguity
+/// disclosures per sharer module, and the 32 terminal fences.
+fn twin_final_gap_rows(
+    modules_a: &[String],
+    modules_b: &[String],
+    startup: u64,
+    fence: u64,
+) -> Vec<serde_json::Value> {
+    let mut rows = vec![
+        serde_json::json!({"kind":"gap_recorded","event":{
+            "caller":"c0","module":null,"subject":"rejected demoted count",
+            "reason":"the current physical owner is not proven for absolute count range (1, 2] (1 unattributed calls); x"}}),
+        serde_json::json!({"kind":"gap_repeated","event":{"index":0,"repeats":startup}}),
+    ];
+    let mut index = 1u64;
+    for module in modules_a.iter().chain(modules_b.iter()) {
+        rows.push(serde_json::json!({"kind":"gap_recorded","event":{
+            "caller":null,"module":module,"subject":"rejected demoted count",
+            "reason":"a native witness endpoint is shared (re-resolved after sharing appeared)"}}));
+        rows.push(
+            serde_json::json!({"kind":"gap_repeated","event":{"index":index,"repeats":SHARED}}),
+        );
+        index += 1;
+    }
+    rows.push(serde_json::json!({"kind":"gap_recorded","event":{
+        "caller":"c0","module":null,"subject":"rejected demoted count",
+        "reason":"the current physical owner is not proven for absolute count range (658, 659] (1 unattributed calls); x"}}));
+    rows.push(serde_json::json!({"kind":"gap_repeated","event":{"index":index,"repeats":fence}}));
+    rows
+}
+
+#[test]
+fn operator_diagnostics_wrap_twin_verify_final_gaps() -> Result<()> {
+    let modules_a: Vec<String> = (0..32).map(|index| format!("mA-{index:02}")).collect();
+    let modules_b: Vec<String> = (0..32).map(|index| format!("mB-{index:02}")).collect();
+    verify_final_gaps(
+        &twin_final_gap_rows(&modules_a, &modules_b, 32, 32),
+        "c0",
+        &modules_a,
+        &modules_b,
+        32,
+    )?;
+    verify_final_gaps(
+        &twin_final_gap_rows(&modules_a, &modules_b, 0, 32),
+        "c0",
+        &modules_a,
+        &modules_b,
+        0,
+    )?;
+    // Wrong startup, fence, or one module's ambiguity fails.
+    ensure!(
+        verify_final_gaps(
+            &twin_final_gap_rows(&modules_a, &modules_b, 0, 32),
+            "c0",
+            &modules_a,
+            &modules_b,
+            32
+        )
+        .is_err()
+    );
+    ensure!(
+        verify_final_gaps(
+            &twin_final_gap_rows(&modules_a, &modules_b, 32, 31),
+            "c0",
+            &modules_a,
+            &modules_b,
+            32
+        )
+        .is_err()
+    );
+    let mut short = twin_final_gap_rows(&modules_a, &modules_b, 32, 32);
+    short[3]["event"]["repeats"] = serde_json::json!(SHARED - 1);
+    ensure!(verify_final_gaps(&short, "c0", &modules_a, &modules_b, 32).is_err());
+    ensure!(
+        verify_final_gaps(
+            &twin_final_gap_rows(&modules_a, &modules_b, 32, 32),
+            "c0",
+            &modules_a[..31],
+            &modules_b,
+            32
+        )
+        .is_err()
+    );
+    Ok(())
+}
+
+/// The wrap fixture's 97 prebuilt inputs: 32 distinct common objects plus
+/// the 64 indexed providers and the workload driver.
 fn wrap_prebuilt_files() -> Vec<String> {
     (0..32)
         .map(|index| format!("libdemotion-common-{index:02}.so"))
-        .chain([
-            "provider-A.so".to_owned(),
-            "provider-B.so".to_owned(),
-            "workload".to_owned(),
-        ])
+        .chain((0..32).map(|index| format!("provider-A-{index:02}.so")))
+        .chain((0..32).map(|index| format!("provider-B-{index:02}.so")))
+        .chain(["workload".to_owned()])
         .collect()
 }
 
@@ -3860,10 +4350,10 @@ fn copy_wrap_prebuilt(source: &Path, destination: &Path) -> Result<()> {
 }
 
 #[test]
-fn operator_diagnostics_wrap_twin_wrap_prebuilt_copies_35_files() -> Result<()> {
+fn operator_diagnostics_wrap_twin_wrap_prebuilt_copies_97_files() -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let files = wrap_prebuilt_files();
-    ensure!(files.len() == 35);
+    ensure!(files.len() == 97);
     let source = tempfile::tempdir()?;
     let destination = tempfile::tempdir()?;
     for name in &files {
@@ -4004,7 +4494,7 @@ fn operator_diagnostics_wrap_twin_system_export_pass() -> Result<()> {
     // wrapped.
     let (records, bytes) = diagnostic_validator_fixture_system(123, "c0");
     ensure!(twin_system_proof_positions(&records).len() == 32);
-    check_wrap_records_system(&records, bytes, &serde_json::json!("mB"), 123, "c0")?;
+    check_wrap_records_system(&records, bytes, &twin_b_modules(), 123, "c0")?;
     Ok(())
 }
 
@@ -4017,25 +4507,19 @@ fn operator_diagnostics_wrap_twin_system_export_rejects_pid_shaped_header() -> R
     pid_scope[0]["scope"] = serde_json::json!("pid");
     pid_scope[0]["pid_filter"] = serde_json::json!(123);
     let bytes = seal_validator_fixture(&mut pid_scope);
-    ensure!(
-        check_wrap_records_system(&pid_scope, bytes, &serde_json::json!("mB"), 123, "c0").is_err()
-    );
+    ensure!(check_wrap_records_system(&pid_scope, bytes, &twin_b_modules(), 123, "c0").is_err());
     let (mut filtered, _) = diagnostic_validator_fixture_system(123, "c0");
     filtered[0]["pid_filter"] = serde_json::json!(123);
     let bytes = seal_validator_fixture(&mut filtered);
-    ensure!(
-        check_wrap_records_system(&filtered, bytes, &serde_json::json!("mB"), 123, "c0").is_err()
-    );
+    ensure!(check_wrap_records_system(&filtered, bytes, &twin_b_modules(), 123, "c0").is_err());
     let (mut missing, _) = diagnostic_validator_fixture_system(123, "c0");
     missing[0].as_object_mut().unwrap().remove("pid_filter");
     let bytes = seal_validator_fixture(&mut missing);
-    ensure!(
-        check_wrap_records_system(&missing, bytes, &serde_json::json!("mB"), 123, "c0").is_err()
-    );
+    ensure!(check_wrap_records_system(&missing, bytes, &twin_b_modules(), 123, "c0").is_err());
     let (mut mode, _) = diagnostic_validator_fixture_system(123, "c0");
     mode[0]["mode"] = serde_json::json!("auto");
     let bytes = seal_validator_fixture(&mut mode);
-    ensure!(check_wrap_records_system(&mode, bytes, &serde_json::json!("mB"), 123, "c0").is_err());
+    ensure!(check_wrap_records_system(&mode, bytes, &twin_b_modules(), 123, "c0").is_err());
     Ok(())
 }
 
@@ -4044,22 +4528,22 @@ fn operator_diagnostics_wrap_twin_system_export_rejects_foreign_pid() -> Result<
     // Owned-caller validation: any pid-bearing row outside the owned PID
     // fails — on ordinary rows and on terminal proofs alike — as does a
     // missing PID on a non-health row or a PID on the global health row.
-    let module = serde_json::json!("mB");
+    let modules = twin_b_modules();
     let (records, _) = diagnostic_validator_fixture_system(123, "c0");
     let proofs = twin_system_proof_positions(&records);
     ensure!(proofs.len() == 32);
     let mut foreign_row = records.clone();
     foreign_row[1]["pid"] = serde_json::json!(999);
     let bytes = seal_validator_fixture(&mut foreign_row);
-    ensure!(check_wrap_records_system(&foreign_row, bytes, &module, 123, "c0").is_err());
+    ensure!(check_wrap_records_system(&foreign_row, bytes, &modules, 123, "c0").is_err());
     let mut foreign_proof = records.clone();
     foreign_proof[proofs[0]]["pid"] = serde_json::json!(999);
     let bytes = seal_validator_fixture(&mut foreign_proof);
-    ensure!(check_wrap_records_system(&foreign_proof, bytes, &module, 123, "c0").is_err());
+    ensure!(check_wrap_records_system(&foreign_proof, bytes, &modules, 123, "c0").is_err());
     let mut missing_pid = records.clone();
     missing_pid[1].as_object_mut().unwrap().remove("pid");
     let bytes = seal_validator_fixture(&mut missing_pid);
-    ensure!(check_wrap_records_system(&missing_pid, bytes, &module, 123, "c0").is_err());
+    ensure!(check_wrap_records_system(&missing_pid, bytes, &modules, 123, "c0").is_err());
     let health = records
         .iter()
         .position(|row| row["kind"] == "capture_health")
@@ -4067,7 +4551,7 @@ fn operator_diagnostics_wrap_twin_system_export_rejects_foreign_pid() -> Result<
     let mut health_pid = records.clone();
     health_pid[health]["pid"] = serde_json::json!(123);
     let bytes = seal_validator_fixture(&mut health_pid);
-    ensure!(check_wrap_records_system(&health_pid, bytes, &module, 123, "c0").is_err());
+    ensure!(check_wrap_records_system(&health_pid, bytes, &modules, 123, "c0").is_err());
     Ok(())
 }
 
@@ -4076,38 +4560,38 @@ fn operator_diagnostics_wrap_twin_system_export_rejects_foreign_caller() -> Resu
     // Terminal proofs must bind the live-observed owned caller id: a
     // consistently foreign caller fails the owned pin even with the owned
     // PID, while the matching pin passes the same export.
-    let module = serde_json::json!("mB");
+    let modules = twin_b_modules();
     let (foreign, bytes) = diagnostic_validator_fixture_system(123, "c9");
-    ensure!(check_wrap_records_system(&foreign, bytes, &module, 123, "c0").is_err());
-    check_wrap_records_system(&foreign, bytes, &module, 123, "c9")?;
+    ensure!(check_wrap_records_system(&foreign, bytes, &modules, 123, "c0").is_err());
+    check_wrap_records_system(&foreign, bytes, &modules, 123, "c9")?;
     // A single foreign proof among owned ones fails on consistency too.
     let (mut mixed, _) = diagnostic_validator_fixture_system(123, "c0");
     let proofs = twin_system_proof_positions(&mixed);
     ensure!(proofs.len() == 32);
     mixed[proofs[0]]["caller"] = serde_json::json!("c9");
     let bytes = seal_validator_fixture(&mut mixed);
-    ensure!(check_wrap_records_system(&mixed, bytes, &module, 123, "c0").is_err());
+    ensure!(check_wrap_records_system(&mixed, bytes, &modules, 123, "c0").is_err());
     Ok(())
 }
 
 #[test]
 fn operator_diagnostics_wrap_twin_system_export_requires_wrap_properties() -> Result<()> {
     // The system validator inherits every fail-closed wrap property:
-    // single-publication proofs, retained references, advancing
+    // unit per-edge proofs, retained references, advancing
     // recovery windows, and a real both-ring wrap.
-    let module = serde_json::json!("mB");
+    let modules = twin_b_modules();
     let (records, _) = diagnostic_validator_fixture_system(123, "c0");
     let proofs = twin_system_proof_positions(&records);
     ensure!(proofs.len() == 32);
     for change in [
-        "split_publication",
+        "wrong_projection",
         "lost_reference",
         "stale_window",
         "one_ring_wrap",
     ] {
         let mut altered = records.clone();
         match change {
-            "split_publication" => {
+            "wrong_projection" => {
                 for index in proofs.iter() {
                     altered[*index]["edge_total"] = serde_json::json!(2);
                 }
@@ -4126,7 +4610,7 @@ fn operator_diagnostics_wrap_twin_system_export_requires_wrap_properties() -> Re
         }
         let bytes = seal_validator_fixture(&mut altered);
         ensure!(
-            check_wrap_records_system(&altered, bytes, &module, 123, "c0").is_err(),
+            check_wrap_records_system(&altered, bytes, &modules, 123, "c0").is_err(),
             "broken wrap property accepted: {change}"
         );
     }
@@ -4140,8 +4624,10 @@ fn operator_diagnostics_wrap_twin_system_primary_pass() -> Result<()> {
     // population — foreign-only presence changes nothing.
     for k in [0, 32] {
         let facts = primary_facts_system(&primary_validator_fixture_system(123, 0, k), 123, k)?;
-        ensure!(facts["edges"]["provider-A.so"]["count"] == expected_a(COUNTED, k));
-        ensure!(facts["edges"]["provider-B.so"]["count"] == 1);
+        ensure!(facts["edges"]["provider-A-00.so"]["count"] == expected_a(COUNTED, k));
+        ensure!(facts["edges"]["provider-A-31.so"]["count"] == expected_a(COUNTED, k));
+        ensure!(facts["edges"]["provider-B-00.so"]["count"] == 1);
+        ensure!(facts["edges"]["provider-B-31.so"]["count"] == 1);
         let pid_facts = primary_facts(&primary_validator_fixture_k(123, 0, k), 123, k)?;
         ensure!(facts == pid_facts);
     }
@@ -4153,7 +4639,7 @@ fn operator_diagnostics_wrap_twin_system_primary_rejects_foreign_caller() -> Res
     // Owned-caller validation: a foreign caller borrowing an owned
     // module fails, as do a missing or duplicated owned caller.
     let mut borrowed = primary_validator_fixture_system(123, 0, 0);
-    borrowed["edges"][2]["module"] = borrowed["modules"][1]["id"].clone();
+    borrowed["edges"][64]["module"] = borrowed["modules"][33]["id"].clone();
     ensure!(primary_facts_system(&borrowed, 123, 0).is_err());
     let mut missing = primary_validator_fixture_system(123, 0, 0);
     missing["callers"].as_array_mut().unwrap().remove(0);
@@ -4175,7 +4661,7 @@ fn operator_diagnostics_wrap_twin_system_primary_rejects_wrong_counts() -> Resul
     wrong_a["edges"][0]["entries"]["count"] = serde_json::json!(399);
     ensure!(primary_facts_system(&wrong_a, 123, 0).is_err());
     let mut wrong_b = primary_validator_fixture_system(123, 0, 32);
-    wrong_b["edges"][1]["entries"]["count"] = serde_json::json!(2);
+    wrong_b["edges"][32]["entries"]["count"] = serde_json::json!(2);
     ensure!(primary_facts_system(&wrong_b, 123, 32).is_err());
     Ok(())
 }

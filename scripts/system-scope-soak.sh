@@ -247,6 +247,11 @@ if [ -n "$(git status --porcelain | grep -v '^??')" ]; then
 fi
 GIT_REV=$(git rev-parse HEAD)
 GIT_TREE=$(git rev-parse 'HEAD^{tree}')
+if [ -z "$(git status --porcelain)" ]; then GIT_CLEAN=true; else GIT_CLEAN=false; fi
+# Tracked-tree cleanliness is the binary-identity signal: untracked helper
+# scripts never affect the build, but a modified src/ file would. The
+# refusal above guarantees tracked-clean; record it honestly anyway.
+if [ -z "$(git status --porcelain | grep -v '^??')" ]; then GIT_TRACKED_CLEAN=true; else GIT_TRACKED_CLEAN=false; fi
 HARNESS_START_ISO=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
 mono_ns() {
@@ -647,7 +652,8 @@ fi
 
 WORKLOAD_ARGV_JSON=$(python3 -I -c "import json; print(json.dumps(['$WORK/workload', '$MODULE', '$N_CALLS', '$PACE_US', '0', '$WORK/ready', '$WORK/go', '$WORK/mapped', '$WORK/receipt-ready', '$EPOCH_CALLS']))")
 cat > "$WORK/meta.json" <<EOF
-{"harness": {"name": "system-scope-soak.sh", "git_rev": "$GIT_REV", "started_iso": "$HARNESS_START_ISO",
+{"harness": {"name": "system-scope-soak.sh", "git_rev": "$GIT_REV", "git_clean": $GIT_CLEAN,
+  "git_tracked_clean": $GIT_TRACKED_CLEAN, "started_iso": "$HARNESS_START_ISO",
   "observer_exit": $OBS_RC, "observer_timed_out": $OBSERVER_TIMED_OUT,
   "observer_signal": $OBSERVER_SIGNAL_JSON},
  "condition": {"scope": "pid", "mode": "metrics", "duration_s": $HORIZON,

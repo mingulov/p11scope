@@ -922,7 +922,14 @@ gate `object_producer_compiled_frames_are_bounded` green):
   LP64/ia32): scalar kinds 7 word-reads on request, 10 on Get;
   token/EC 6/9 word-reads plus one 1/7/10-byte read. Full
   eight-slot six-field call: 220 word + 4 byte-reads (request),
-  76 word + 4 byte-reads (Get entry+return).
+  76 word + 4 byte-reads (Get entry+return). These are
+  single-template protocol costs: they exclude argument
+  acquisition (two fetches per present pair, template pointer +
+  count; on ia32 each fetch additionally reads an argument word)
+  and, on request paths, the second template's peer rescans. A
+  full two-template capture of eight-slot six-field templates
+  costs 872 word-reads + 8 byte-reads; two all-scalar templates
+  reach 880 word-reads.
 
 Host qualification at `3cd49af4`: G05
 `object_attributes_real_adapter_six_fields` and

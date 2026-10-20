@@ -1,5 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
-//! U1 read-only dashboard: bounded views over unbounded captures.
+//! U1 dashboard: bounded views over unbounded captures, plus DR37 promotion keys.
 //!
 //! The renderer consumes IMMUTABLE [`Presentation`] snapshots through
 //! a BOUNDED [`DisplayHandoff`] and never holds capture/coordinator
@@ -8,11 +8,11 @@
 //! acceptable, losing capture facts is not. Narrowing the VIEW
 //! (scroll position) never narrows the totals shown.
 //!
-//! Read-only by default: scrolling and detail paging only — no
-//! filtering (U2), no capture control. When the runtime explicitly
-//! enables the DR37 promotion control, `d` requests Detailed capture
-//! for the selected caller/provider pair and `x` cancels; both keys
-//! are ignored while disabled, and the gaps page never requests.
+//! Scrolling and detail paging are always available — no filtering
+//! (U2). A dashboard run enables the DR37 promotion control: `d`
+//! requests Detailed capture for the selected caller/provider pair
+//! and `x` cancels; both keys are ignored on the gaps page, and the
+//! status line reports each request's honest outcome.
 //! ANSI stays on the
 //! terminal stream; JSON paths
 //! never see an escape byte. The log tail holds SANITIZED observer

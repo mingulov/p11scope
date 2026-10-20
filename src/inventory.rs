@@ -123,6 +123,145 @@ fn inventory_test_poll_interval_is_scoped_and_thread_local() {
     assert_eq!(inventory_test_poll_interval(), POLL_INTERVAL);
 }
 
+/// Gate-selected inter-pass cadence for G21 legs (S lever): integer
+/// milliseconds in `P11SCOPE_G21_POLL_INTERVAL_MS`, applied through the
+/// same scoped override as the pilot. Unset means the production default;
+/// the production `POLL_INTERVAL` itself is never changed by this knob.
+#[cfg(test)]
+const GATE_POLL_INTERVAL_ENV: &str = "P11SCOPE_G21_POLL_INTERVAL_MS";
+
+/// Parse a gate cadence value: `None` (unset) is exactly the production
+/// default. Anything else must be a positive integer millisecond count; an
+/// invalid value is a loud error naming the variable, never a silent
+/// fallback to a different cadence.
+#[cfg(test)]
+fn parse_gate_poll_interval(value: Option<&str>) -> Result<Duration> {
+    let Some(value) = value else {
+        return Ok(POLL_INTERVAL);
+    };
+    let millis: u64 = value.trim().parse().map_err(|_| {
+        anyhow::anyhow!(
+            "{GATE_POLL_INTERVAL_ENV}={value:?} is not a positive integer millisecond count"
+        )
+    })?;
+    if millis == 0 {
+        return Err(anyhow::anyhow!(
+            "{GATE_POLL_INTERVAL_ENV}={value:?} is not a positive integer millisecond count"
+        ));
+    }
+    Ok(Duration::from_millis(millis))
+}
+
+/// The honest-split declaration every gate run prints up front: the
+/// cadence it runs at, the production default beside it, and whether the
+/// two differ. Cost claims need this label.
+#[cfg(test)]
+fn declare_gate_poll_interval(source: &str, interval: Duration) -> String {
+    format!(
+        "G21_CADENCE_DECLARED cadence_ms={} default_ms={} accelerated={} source={source}",
+        interval.as_millis(),
+        POLL_INTERVAL.as_millis(),
+        interval != POLL_INTERVAL,
+    )
+}
+
+/// Run `action` at the gate-selected cadence, declaring it first. Split
+/// from the environment read so tests pin values without touching the
+/// process environment.
+#[cfg(test)]
+fn with_gate_poll_interval_value<T>(value: Option<&str>, action: impl FnOnce() -> T) -> Result<T> {
+    let interval = parse_gate_poll_interval(value)?;
+    let source = match value {
+        None => format!("default(unset {GATE_POLL_INTERVAL_ENV})"),
+        Some(set) => format!("{GATE_POLL_INTERVAL_ENV}={set}"),
+    };
+    eprintln!("{}", declare_gate_poll_interval(&source, interval));
+    Ok(with_inventory_test_poll_interval(interval, action))
+}
+
+/// Run `action` at the `P11SCOPE_G21_POLL_INTERVAL_MS` cadence (unset =
+/// production default), declaring it first.
+#[cfg(test)]
+fn with_gate_poll_interval<T>(action: impl FnOnce() -> T) -> Result<T> {
+    let value = std::env::var(GATE_POLL_INTERVAL_ENV).ok();
+    with_gate_poll_interval_value(value.as_deref(), action)
+}
+
+#[cfg(test)]
+#[test]
+fn gate_poll_interval_unset_is_production_default() {
+    // The S lever never moves the production cadence: an unset gate is
+    // exactly the 1s classic-loop interval.
+    assert_eq!(POLL_INTERVAL, Duration::from_secs(1));
+    assert_eq!(
+        parse_gate_poll_interval(None).unwrap(),
+        Duration::from_secs(1)
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn gate_poll_interval_parses_millis() {
+    assert_eq!(
+        parse_gate_poll_interval(Some("250")).unwrap(),
+        Duration::from_millis(250)
+    );
+    assert_eq!(
+        parse_gate_poll_interval(Some("10")).unwrap(),
+        Duration::from_millis(10)
+    );
+    assert_eq!(
+        parse_gate_poll_interval(Some("1000")).unwrap(),
+        POLL_INTERVAL
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn gate_poll_interval_rejects_invalid_loudly() {
+    for value in ["", "0", "-1", "abc", "1.5", "18446744073709551616"] {
+        let message = parse_gate_poll_interval(Some(value))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains(GATE_POLL_INTERVAL_ENV),
+            "invalid gate value {value:?} must name its variable: {message}"
+        );
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn gate_cadence_declaration_states_interval_and_default() {
+    let accelerated = declare_gate_poll_interval(
+        "P11SCOPE_G21_POLL_INTERVAL_MS=250",
+        Duration::from_millis(250),
+    );
+    assert!(
+        accelerated.contains("G21_CADENCE_DECLARED"),
+        "{accelerated}"
+    );
+    assert!(accelerated.contains("cadence_ms=250"), "{accelerated}");
+    assert!(accelerated.contains("default_ms=1000"), "{accelerated}");
+    assert!(accelerated.contains("accelerated=true"), "{accelerated}");
+    let control = declare_gate_poll_interval("default(unset)", POLL_INTERVAL);
+    assert!(control.contains("cadence_ms=1000"), "{control}");
+    assert!(control.contains("accelerated=false"), "{control}");
+}
+
+#[cfg(test)]
+#[test]
+fn gate_override_applies_configured_cadence_and_restores() {
+    let inside = with_gate_poll_interval_value(Some("250"), inventory_test_poll_interval).unwrap();
+    assert_eq!(inside, Duration::from_millis(250));
+    assert_eq!(inventory_test_poll_interval(), POLL_INTERVAL);
+    with_gate_poll_interval_value(None, || {
+        assert_eq!(inventory_test_poll_interval(), POLL_INTERVAL);
+    })
+    .unwrap();
+    assert!(with_gate_poll_interval_value(Some("0"), || {}).is_err());
+}
+
 /// Maximum wait for staged semantic evidence without current receipts.
 /// Receipt-bearing batches publish during the tick that stages them.
 const STAGED_SEMANTIC_MAX_AGE: Duration = Duration::from_secs(1);

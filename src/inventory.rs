@@ -2305,11 +2305,10 @@ impl ClassicDriver<'_> {
         &mut self,
         capture: Option<&mut dyn crate::inventory_capture::CaptureLane<crate::process::PidPin>>,
     ) {
-        let demand = match self.display.as_ref() {
-            Some(display) => display.baseline_demand(),
-            None => None,
+        let Some(display) = self.display.as_ref() else {
+            return;
         };
-        let Some((capture_id, frame, pair)) = demand else {
+        let Some((capture_id, frame, pair)) = display.baseline_demand() else {
             return;
         };
         // Selected preparation supports PID and system parents only;
@@ -2322,17 +2321,14 @@ impl ClassicDriver<'_> {
             return;
         };
         let caller = crate::discovery::caller_registry::CallerId(pair.caller());
-        let (original, incarnation) = match self.coordinator.prepare_selected_caller_custody(caller)
-        {
-            Ok(custody) => custody,
-            Err(_) => return,
+        let Ok((original, incarnation)) = self.coordinator.prepare_selected_caller_custody(caller)
+        else {
+            return;
         };
-        let window = match crate::attach::capture::ReadWindow::new(
-            1,
-            Instant::now() + PROMOTION_BASELINE_WINDOW,
-        ) {
-            Ok(window) => window,
-            Err(_) => return,
+        let Ok(window) =
+            crate::attach::capture::ReadWindow::new(1, Instant::now() + PROMOTION_BASELINE_WINDOW)
+        else {
+            return;
         };
         let target = crate::attach::selected_detailed::baseline::BaselineTarget {
             caller,
@@ -8728,11 +8724,14 @@ mod promotion_driver_tests {
     /// an inner scripted lane and answers baseline acquisition from
     /// the pairing-only test batch, recording calls and the demanded
     /// (capture, caller).
+    type BaselineCallCount = Rc<Cell<usize>>;
+    type BaselineSeenPairs = Rc<RefCell<Vec<(CaptureId, CallerId)>>>;
+
     struct BaselineStub<L> {
         inner: L,
-        calls: Rc<Cell<usize>>,
+        calls: BaselineCallCount,
         fail: bool,
-        seen: Rc<RefCell<Vec<(CaptureId, CallerId)>>>,
+        seen: BaselineSeenPairs,
     }
 
     impl<L: NativeIdentity<PidPin>> NativeIdentity<PidPin> for BaselineStub<L> {
@@ -8821,11 +8820,7 @@ mod promotion_driver_tests {
     fn baseline_stub<L>(
         inner: L,
         fail: bool,
-    ) -> (
-        BaselineStub<L>,
-        Rc<Cell<usize>>,
-        Rc<RefCell<Vec<(CaptureId, CallerId)>>>,
-    ) {
+    ) -> (BaselineStub<L>, BaselineCallCount, BaselineSeenPairs) {
         let calls = Rc::new(Cell::new(0));
         let seen = Rc::new(RefCell::new(Vec::new()));
         (

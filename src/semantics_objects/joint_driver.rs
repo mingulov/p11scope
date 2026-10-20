@@ -627,6 +627,7 @@ impl RawJointQuantum {
     /// Resource custody alone never binds a drain: the caller must first mint
     /// and bind the existing admission-based grant from these SAME producers.
     /// Refusal returns the unchanged owner, including all paid buffers.
+    #[allow(clippy::result_large_err)] // Cold refusal path: returns the unchanged owner with its paid buffers; boxing would churn the ownership contract.
     pub(super) fn ingest(
         self,
         adapter: &mut JournalAdapter,

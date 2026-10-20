@@ -20,6 +20,7 @@ pub(crate) struct ProvisionalSelectedLane {
 }
 
 impl ProvisionalSelectedLane {
+    #[allow(clippy::result_large_err)] // Cold conversion: the failure retains the native owner for joined cleanup.
     pub(crate) fn from_closed_native(
         session: Session,
         attached: AttachedSemanticSet,
@@ -56,6 +57,7 @@ impl ProvisionalSelectedLane {
         })
     }
 
+    #[allow(dead_code)] // STAGED: sealed-lane identity accessor for the lifecycle service, like its siblings; no test covers it yet.
     pub(crate) fn identity(&self) -> &SelectedSessionIdentity {
         self.permit.identity()
     }

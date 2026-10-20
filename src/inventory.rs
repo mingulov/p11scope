@@ -797,6 +797,138 @@ fn run_with_terminal_diagnostics(
     )
 }
 
+// A primary-destination validation must not add an unbounded directory walk.
+const PRIMARY_ALIAS_MAX_DIRECTORY_VISITS: usize = 4096;
+
+/// Sol-full F2: the report (`-o`) and the event stream finalize
+/// independently — the stream finishes, then the report commits over its
+/// destination. If both names reach one file (or the report lands in the
+/// event rotation namespace), the finished JSONL stream is destroyed while
+/// both sinks report success. Reject those collisions before either sink
+/// opens (the event open truncates), mirroring the diagnostics alias
+/// policy: lexical equality, normalized equality, existing-file identity,
+/// and the exact `<live>.<canonical-u64>` rotation namespace (see
+/// `inventory_events::rotated_path`). Both sinks refuse `..` and symlink
+/// ancestors at open, so a side that fails normalization is refused loudly
+/// by its own open below; only comparable sides can collide here. An
+/// unreadable check refuses loudly rather than risking a silent overwrite.
+fn validate_primary_destinations(report: Option<&Path>, event_log: Option<&Path>) -> Result<()> {
+    let (Some(report), Some(event_log)) = (report, event_log) else {
+        return Ok(());
+    };
+    if report == event_log {
+        return Err(primary_alias_conflict(report, "event-log", event_log));
+    }
+    let normalized_report = crate::output::normalize_output_path(report.to_path_buf()).ok();
+    let normalized_event = crate::output::normalize_output_path(event_log.to_path_buf()).ok();
+    if let (Some(normalized_report), Some(normalized_event)) =
+        (normalized_report.as_deref(), normalized_event.as_deref())
+    {
+        if normalized_report == normalized_event {
+            return Err(primary_alias_conflict(report, "event-log", event_log));
+        }
+        // rotated_path spells the basename through to_string_lossy, then adds
+        // the canonical decimal u64 sequence. Preserve that exact namespace.
+        let prefix = format!(
+            "{}.",
+            normalized_event.file_name().unwrap().to_string_lossy()
+        );
+        if normalized_report.parent() == normalized_event.parent()
+            && primary_rotation_name(normalized_report.file_name().unwrap(), &prefix)
+        {
+            return Err(primary_alias_conflict(
+                report,
+                "event-log rotation",
+                event_log,
+            ));
+        }
+    }
+    let report_identity = primary_existing_identity(report)?;
+    let event_identity = primary_existing_identity(event_log)?;
+    if let (Some(report_identity), Some(event_identity)) = (report_identity, event_identity)
+        && report_identity == event_identity
+    {
+        return Err(primary_alias_conflict(report, "event-log", event_log));
+    }
+    // A report hardlinked to an existing rotation is the namespace
+    // collision under an unrelated name; the commit would still replace a
+    // retained rotation. A missing parent holds no rotations; anything else
+    // unreadable refuses loudly.
+    if let (Some(identity), Some(live)) = (report_identity, normalized_event.as_deref()) {
+        let parent = live.parent().unwrap();
+        let prefix = format!("{}.", live.file_name().unwrap().to_string_lossy());
+        let entries = match std::fs::read_dir(parent) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "checking report {} against event-log rotations in {} failed: {error}",
+                    report.display(),
+                    parent.display()
+                ));
+            }
+        };
+        for (visits, entry) in entries.enumerate() {
+            if visits >= PRIMARY_ALIAS_MAX_DIRECTORY_VISITS {
+                return Err(anyhow::anyhow!(
+                    "checking report {} against event-log rotations in {} could not complete within {PRIMARY_ALIAS_MAX_DIRECTORY_VISITS} directory visits",
+                    report.display(),
+                    parent.display()
+                ));
+            }
+            let entry = entry.map_err(|error| {
+                anyhow::anyhow!(
+                    "checking report {} against event-log rotations in {} failed: {error}",
+                    report.display(),
+                    parent.display()
+                )
+            })?;
+            if primary_rotation_name(&entry.file_name(), &prefix)
+                && primary_existing_identity(&entry.path())? == Some(identity)
+            {
+                return Err(primary_alias_conflict(
+                    report,
+                    "event-log rotation",
+                    &entry.path(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Exact rotation-namespace spelling from `inventory_events::rotated_path`:
+/// `<live basename>.<canonical decimal u64>`. Keep in sync with the
+/// diagnostics alias check.
+fn primary_rotation_name(name: &std::ffi::OsStr, prefix: &str) -> bool {
+    let Some(number) = name.to_str().and_then(|name| name.strip_prefix(prefix)) else {
+        return false;
+    };
+    number
+        .parse::<u64>()
+        .is_ok_and(|sequence| sequence.to_string() == number)
+}
+
+fn primary_existing_identity(path: &Path) -> Result<Option<(u64, u64)>> {
+    use std::os::unix::fs::MetadataExt as _;
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(Some((metadata.dev(), metadata.ino()))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(anyhow::anyhow!(
+            "checking report/event-log destination aliases at {} failed: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn primary_alias_conflict(report: &Path, kind: &str, other: &Path) -> anyhow::Error {
+    anyhow::anyhow!(
+        "report {} aliases {kind} destination {}",
+        report.display(),
+        other.display()
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_with_terminal_budget(
     scope: impl Into<InventorySelection>,
@@ -883,6 +1015,12 @@ fn run_with_terminal_budget(
         }
         _ => None,
     };
+    // Sol-full F2: the report commits over its destination after the
+    // event stream finishes; colliding primaries would silently destroy the
+    // finished stream (or a retained rotation). Refuse them before the
+    // diagnostics setup and before either sink opens (the event open
+    // truncates).
+    validate_primary_destinations(out, event_log)?;
     let mut diagnostics = request
         .path
         .map(|path| DiagnosticsState::prepare(path, out, event_log))
@@ -5147,6 +5285,149 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    /// Sol-full F2: `-o` and `--event-log` naming one file must be refused
+    /// before either sink opens. The event open truncates, and finalization
+    /// would otherwise commit the snapshot over the finished JSONL stream
+    /// while both sinks report success.
+    #[test]
+    fn primary_output_collision_is_refused_before_either_sink_opens() {
+        let dir = private_tempdir();
+        let shared = dir.path().join("result.json");
+        std::fs::write(&shared, b"existing event log\n").unwrap();
+        let mut stdout = Vec::new();
+        let result = run_with_terminal_inner(
+            InspectScope::Pid(std::process::id()),
+            &[],
+            &HookRegistry::builtin(),
+            true,
+            None,
+            None,
+            None,
+            Some(&shared),
+            false,
+            Some(&shared),
+            None,
+            None,
+            CaptureMode::Scan,
+            crate::attach::BackendSelection::Auto,
+            &|| false,
+            &|| {},
+            false,
+            &mut WriterStdout(&mut stdout),
+            &DashboardIo::stdio(),
+            None,
+        );
+        assert_eq!(std::fs::read(&shared).unwrap(), b"existing event log\n");
+        assert!(
+            result.unwrap_err().to_string().contains("aliases"),
+            "same-path report/event destinations must be refused loudly"
+        );
+        assert!(stdout.is_empty());
+    }
+
+    /// Sol-full F2: a report inside the event rotation namespace
+    /// (`<live>.<seq>`) would replace a retained rotation at commit.
+    #[test]
+    fn primary_output_in_rotation_namespace_is_refused_before_event_creation() {
+        let dir = private_tempdir();
+        let events = dir.path().join("events.jsonl");
+        let report = dir.path().join("events.jsonl.1");
+        let mut stdout = Vec::new();
+        let result = run_with_terminal_inner(
+            InspectScope::Pid(std::process::id()),
+            &[],
+            &HookRegistry::builtin(),
+            true,
+            None,
+            None,
+            None,
+            Some(&report),
+            false,
+            Some(&events),
+            None,
+            None,
+            CaptureMode::Scan,
+            crate::attach::BackendSelection::Auto,
+            &|| false,
+            &|| {},
+            false,
+            &mut WriterStdout(&mut stdout),
+            &DashboardIo::stdio(),
+            None,
+        );
+        let message = result.unwrap_err().to_string();
+        assert!(
+            message.contains("rotation"),
+            "unexpected rotation-namespace refusal: {message}"
+        );
+        assert!(!events.exists(), "event stream must not be created");
+        assert!(!report.exists(), "report must not be created");
+        assert!(stdout.is_empty());
+    }
+
+    /// Sol-full F2: a report hardlinked to the live event file is the same
+    /// collision under distinct names; the pre-existing stream survives.
+    #[test]
+    fn primary_output_hardlink_alias_is_refused_without_truncation() {
+        let dir = private_tempdir();
+        let events = dir.path().join("events.jsonl");
+        let report = dir.path().join("report.json");
+        std::fs::write(&events, b"existing event log\n").unwrap();
+        std::fs::hard_link(&events, &report).unwrap();
+        let mut stdout = Vec::new();
+        let result = run_with_terminal_inner(
+            InspectScope::Pid(std::process::id()),
+            &[],
+            &HookRegistry::builtin(),
+            true,
+            None,
+            None,
+            None,
+            Some(&report),
+            false,
+            Some(&events),
+            None,
+            None,
+            CaptureMode::Scan,
+            crate::attach::BackendSelection::Auto,
+            &|| false,
+            &|| {},
+            false,
+            &mut WriterStdout(&mut stdout),
+            &DashboardIo::stdio(),
+            None,
+        );
+        assert_eq!(std::fs::read(&events).unwrap(), b"existing event log\n");
+        assert!(
+            result.unwrap_err().to_string().contains("aliases"),
+            "hardlinked report/event destinations must be refused loudly"
+        );
+        assert!(stdout.is_empty());
+    }
+
+    /// Sol-full F2 validator twins: normalized spellings and rotation names
+    /// collide without existing files; unrelated or absent destinations pass
+    /// and create nothing.
+    #[test]
+    fn primary_destination_aliases_reject_collisions_and_keep_unrelated() {
+        let dir = private_tempdir();
+        let events = dir.path().join("events.jsonl");
+        let report = dir.path().join("report.json");
+        validate_primary_destinations(Some(&report), Some(&events)).unwrap();
+        assert!(!events.exists() && !report.exists());
+        validate_primary_destinations(Some(&events), Some(&events)).unwrap_err();
+        let dotted = dir.path().join("./events.jsonl");
+        validate_primary_destinations(Some(&dotted), Some(&events)).unwrap_err();
+        let rotated = dir.path().join("events.jsonl.2");
+        validate_primary_destinations(Some(&rotated), Some(&events)).unwrap_err();
+        // A non-canonical suffix is outside the rotation namespace.
+        let padded = dir.path().join("events.jsonl.02");
+        validate_primary_destinations(Some(&padded), Some(&events)).unwrap();
+        validate_primary_destinations(None, Some(&events)).unwrap();
+        validate_primary_destinations(Some(&report), None).unwrap();
+        validate_primary_destinations(None, None).unwrap();
     }
 
     #[test]

@@ -5,6 +5,134 @@ All notable changes to p11scope are recorded here. Versions follow
 [Semantic Versioning](https://semver.org/). Report schema identifiers are
 versioned separately and are opaque, exact dispatch keys.
 
+## [Unreleased]
+
+v0.4.0 development to date: `inventory --cgroup` scope, offline `inventory
+diff` comparison, inventory diagnostics, executable naming for trace and
+inspect output, opt-in caller cgroup metadata, explicit endpoint and
+identity-proof controls, and hardened final-output semantics. The
+object/attribute lane stays unpublished: finite attribute protocols are
+captured in the qualified Detailed lane with no public object field enabled
+(see [docs/privacy/allowlist-v3.md](docs/privacy/allowlist-v3.md)). Limits
+below live in [docs/known-limitations.md](docs/known-limitations.md).
+
+### Added
+
+- `p11scope inventory --cgroup <path>` observes a cgroup subtree, including
+  descendants, across scan/auto/native and the existing output modes.
+  Discovery retains the selected root, requires initial PID numbering with
+  matching procfs, and reports bounded partial work as explicit gaps. Quiet
+  cgroup usage stays `unknown`: endpoint membership samples do not prove
+  continuous residency and cannot authorize `watched_no_use`. Scoped native
+  owner admission stays deferred, and public live cgroup qualification
+  remains a development gate. See
+  [docs/schema/inventory-v1.md](docs/schema/inventory-v1.md#cgroup-scope).
+- `p11scope inventory diff before.json after.json` compares two saved
+  inventory v1 snapshots as an ordinary user: no live process lookup, no
+  provider load, no capture privileges. Readable text groups observations
+  by recorded application path and module content; `--json` emits one
+  `p11scope/inventory-diff/v1` document and `-o` saves it atomically.
+  Counts stay separate per-window lower bounds (no deltas are inferred),
+  and absence never proves removal. See
+  [docs/schema/inventory-diff-v1.md](docs/schema/inventory-diff-v1.md) and
+  [docs/usage.md](docs/usage.md#offline-inventory-comparison).
+- `inventory --diagnostics <f.jsonl>` with optional `--diagnostics-pid <n>`
+  records a separate JSONL file explaining native count reads, ownership
+  changes, allocations and withheld growth (`--capture native` or `auto`;
+  explicit `scan` is refused). Two rolling buffers retain recent history
+  under fixed budgets; the footer reports spans, eviction, filtering and
+  settlement independently. Delivery is atomic and private (0600),
+  independent of the other final sinks. See
+  [docs/schema/inventory-diagnostics-v1.md](docs/schema/inventory-diagnostics-v1.md).
+- Trace rows carry an executable label when p11scope can establish which
+  process image made the call, else `Unknown executable` with the retained
+  PID/TID; previously printed rows are never renamed later. Cgroup traces
+  need calls on both sides of a validated sample, and installed cgroup
+  naming checks are still in progress. See the [trace privacy
+  contract](docs/privacy/allowlist-v3.md#trace-executable-labels-p5u-2026-10-09).
+- `inspect --pid --json` gains additive `application`/`application_status`
+  fields naming the observed executable (path, device, inode, mtime, start
+  time) or a finite reason when naming is withheld; text output shows the
+  same detail. Consumers that ignore unknown fields stay compatible. See
+  [docs/schema/inspect-v1.md](docs/schema/inspect-v1.md).
+- `inventory --caller-metadata=cgroup` opts in to finite sampled caller
+  context from the original retained process's cgroup membership
+  (canonical container IDs and pod UIDs as lexical hints, never proof of
+  orchestrator ownership). The default `none` opens no metadata files, and
+  a genuine native caller-use binding is required. Installed
+  multi-container/pod qualification remains open. See the [DR04
+  contract](docs/privacy/allowlist-v3.md#dr04-caller-metadata-2026-10-18).
+- `inventory --max-endpoints <n>` (1..=8192; 4096 when absent) selects the
+  capture-lifetime physical endpoint budget, reported in
+  `budgets.inventory_endpoints`; IDs are append-only and unloading a
+  provider never refunds capacity. The 8192 upper bound is a candidate
+  policy limit, not a measured release envelope.
+- `inventory --system --identity-backend auto|userspace|kernel` selects the
+  system-sweep identity proof backend, disclosed in
+  `observation.identity`. Explicit `kernel` validates numbering, BTF,
+  strict load and a functional probe before capture starts, or refuses
+  with a named reason before any capture output is created. An explicit
+  value under `--pid` or `--cgroup` is a usage error.
+- Repeatable `inventory --manifest <m.json>` retains explicit operator
+  inputs to prepare a separate attested Detailed subset under `--capture
+  auto` or `native` (`scan` plus a manifest is an argument error before
+  output files open). The inventory document and event stream carry the
+  additive instance projection (`instances[]`, `semantic_edges[]`,
+  `observation.semantic_capture`, `instance_observed` and
+  `semantic_edge_observed`); preparation alone does not activate positive
+  instance delivery.
+- The metrics lane now carries `attach_backend` like the profile lane
+  (selection disclosure only; metrics gains no selection verdict
+  authority), and static probe detach/reattach history is published
+  through `skipped` records with two fixed reasons. `edge_observed`
+  gains additive `identity_context`.
+- The dashboard scrolls with `j`/`k` and cycles summary/evidence/gaps
+  with `tab`. At small sizes a compact summary keeps one
+  executable/module pair visible; below the useful compact size the view
+  asks for a larger terminal.
+
+### Changed
+
+- Inventory text snapshots lead with an application/module overview:
+  detailed retained paths, identities, states and coverage follow. The
+  application label is the observed executable's basename (an interpreter
+  stays `python3`, `java`, ...); missing names read `Unknown executable`
+  or `Unknown module`; retired images say `Application executed a new
+  image` and exited callers say `Process exited`.
+- Final outputs are attempted independently. After `started`, a returned
+  event-log error retires that writer while observation continues to its
+  ordinary stop; the atomic `-o` commit and stdout are still attempted,
+  any returned sink error gives exit 1 with sink-specific diagnostics,
+  and `ended` is never fabricated or retried. On pipes, FIFOs and
+  terminals, five seconds without a positive write fails stdout with
+  exit 1; a later delivered stop signal cancels final output while the
+  signal already used to stop capture permits healthy output. The native
+  stop line now reads `p11scope: output attempts finished; ...`.
+- Stderr diagnostics run through a bounded sink: a stopped or closed
+  stderr sheds them instead of stalling capture, and delivery never
+  determines the exit status.
+- `p11scope-discover` prints expanded usage guidance and a `Manifest
+  written ...` stderr line naming the explicit `--manifest` attestation
+  the result still needs.
+
+### Fixed
+
+- A returned event-log error no longer loses the `-o` report (C5.4 I-4):
+  the writer retires, the independent report and stdout are attempted,
+  and each failed sink is identified. A readable `ended` alone still does
+  not confirm successful sync.
+- A run stopped with zero completed passes records a `no complete
+  collection pass` scope gap plus one informational stderr line instead
+  of exiting 0 with 0 passes, 0 callers and 0 gaps; exit 0, output
+  schemas and gap accounting are preserved.
+
+### Security
+
+- `inventory --cgroup` refuses with `pid-namespace-mismatch` when the
+  observer's PID namespace or `/proc` does not match, extending the
+  fail-closed PID-namespace handling to the new scope; the refusal
+  precedes report, event and diagnostic output creation.
+
 ## [0.3.0] - 2026-10-08
 
 Per-edge entry counts end to end (DR-02 closed): the native inventory lane

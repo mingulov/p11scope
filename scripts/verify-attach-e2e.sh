@@ -68,8 +68,13 @@ test -f "$MODULE" || { echo "SoftHSM2 not installed at $MODULE"; exit 1; }
 echo "=== build ==="
 rm -rf "$WORK/build"
 set -- --release --workspace --target-dir "$WORK/build"
+# P0-only v0.4.0: the FULL object exceeds the 1M-instruction verifier
+# budget, so the e2e lane builds P0 bytes (attribute gate shut), with
+# or without the skip-attribution diagnostic.
 if [ "$diagnose_skips" -eq 1 ]; then
-    set -- "$@" --features skip-attribution
+    set -- "$@" --features skip-attribution,stub-object-attributes
+else
+    set -- "$@" --features stub-object-attributes
 fi
 p11scope_product_build "$P11SCOPE_PRODUCT_BUILD_MODE" "$@"
 gcc -O0 -o "$WORK/harness" spike/harness.c -ldl

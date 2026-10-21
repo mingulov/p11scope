@@ -87,6 +87,10 @@ class ComparisonTests(unittest.TestCase):
         with self.assertRaises(self.driver.CheckError):
             self.driver.compare_objects(self.baseline, self.candidate)
 
+    def test_identical_objects_report_exact_verdicts(self):
+        self.assertEqual(self.driver.compare_objects(dict(self.baseline), dict(self.candidate)),
+                         {name: "exact" for name in NAMES})
+
     def test_helper_environment_owns_temporary_files_and_restores_ambient_state(self):
         previous = dict(os.environ)
         previous_directory = tempfile.tempdir
@@ -98,6 +102,173 @@ class ComparisonTests(unittest.TestCase):
                 self.assertEqual(Path(created).parent, private)
         self.assertEqual(dict(os.environ), previous)
         self.assertEqual(tempfile.tempdir, previous_directory)
+
+
+class CanonicalBtfTests(unittest.TestCase):
+    """The BTF-order fallback accepts permutations and nothing else.
+
+    The BTF emitter permutes type order between identical-input builds
+    (27-byte .BTF-only diffs observed on real objects). The fallback must
+    accept exactly that shape: identical sections, same .BTF size, same
+    string set, same sorted C dump, same line records, and func_info
+    differing only in type IDs. Synthetic minimal ELFs keep the cases
+    hermetic; the bpftool leg is injected (the real dump is exercised by
+    the unhappy-path and live fallen-back comparisons).
+    """
+
+    def setUp(self):
+        self.driver = load_path(SCRIPT)
+        self.temporary = tempfile.TemporaryDirectory(prefix="bpf-canonical-")
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+
+    @staticmethod
+    def elf(sections):
+        import struct
+        names = list(sections)
+        shstrtab = b"\x00"
+        offsets = {}
+        for name in names + [".shstrtab"]:
+            offsets[name] = len(shstrtab)
+            shstrtab += name.encode("ascii") + b"\x00"
+        blob = bytearray(b"\x7fELF\x02\x01\x01\x00" + b"\x00" * 8)
+        blob += struct.pack("<HHIQQQIHHHHHH", 1, 247, 1, 0, 0, 0, 0, 64, 0, 0, 64, 0, 0)
+        assert len(blob) == 64
+        bodies = {name: sections[name] for name in names}
+        bodies[".shstrtab"] = shstrtab
+        layout = {}
+        for name, body in bodies.items():
+            layout[name] = (len(blob), len(body))
+            blob += body
+        shoff = len(blob)
+        headers = [b"\x00" * 64]
+        for name in list(bodies):
+            offset, size = layout[name]
+            headers.append(struct.pack("<IIQQQQIIQQ", offsets[name], 1, 0, 0, offset, size,
+                                       0, 0, 1, 0))
+        shstrndx = len(headers) - 1
+        blob += b"".join(headers)
+        struct.pack_into("<Q", blob, 0x28, shoff)
+        struct.pack_into("<H", blob, 0x3C, len(headers))
+        struct.pack_into("<H", blob, 0x3E, shstrndx)
+        return bytes(blob)
+
+    @staticmethod
+    def btf(type_bytes, strings):
+        import struct
+        strtab = b"\x00" + b"\x00".join(strings) + b"\x00"
+        header = struct.pack("<HBBIIIII", 0xEB9F, 1, 0, 24, 0, len(type_bytes),
+                             len(type_bytes), len(strtab))
+        return header + type_bytes + strtab
+
+    @staticmethod
+    def btf_ext(func_records, line_bytes=b"line-bytes"):
+        import struct
+        func_area = struct.pack("<II", 0, len(func_records)) + b"".join(
+            struct.pack("<II", insn, type_id) for insn, type_id in func_records)
+        header = struct.pack("<HBBIIIII", 0xEB9F, 1, 0, 24, 0, len(func_area),
+                             len(func_area), len(line_bytes))
+        return header + func_area + line_bytes
+
+    def pair(self, left_sections, right_sections):
+        left = {name: self.root / f"baseline-{name}" for name in NAMES}
+        right = {name: self.root / f"candidate-{name}" for name in NAMES}
+        for name in NAMES:
+            left[name].write_bytes(self.elf(left_sections))
+            right[name].write_bytes(self.elf(right_sections))
+        return left, right
+
+    def test_permuted_btf_types_pass_with_btf_order_only_verdict(self):
+        btf_left = self.btf(b"AAAABBBB", [b"alpha", b"beta"])
+        btf_right = self.btf(b"BBBBAAAA", [b"alpha", b"beta"])
+        ext = self.btf_ext([(8, 3), (16, 4)])
+        sections = {".text": b"code", ".BTF": btf_left, ".BTF.ext": ext}
+        flipped = {".text": b"code", ".BTF": btf_right, ".BTF.ext": ext}
+        left, right = self.pair(sections, flipped)
+        dump = lambda path, name: "struct alpha;\nstruct beta;\n"  # noqa: E731
+        self.assertEqual(self.driver.compare_objects(left, right, dump_c=dump),
+                         {name: "btf-order-only" for name in NAMES})
+
+    def test_flipped_func_type_ids_fail_closed(self):
+        # .BTF.ext compares byte-exact: a flip reaching func-referenced
+        # types fails loudly instead of being silently normalized.
+        ext_left = self.btf_ext([(8, 3), (16, 4)])
+        ext_right = self.btf_ext([(8, 4), (16, 3)])
+        sections = {".text": b"code", ".BTF": self.btf(b"TTTT", [b"a"]),
+                    ".BTF.ext": ext_left}
+        flipped = {".text": b"code", ".BTF": self.btf(b"TTTT", [b"a"]),
+                   ".BTF.ext": ext_right}
+        left, right = self.pair(sections, flipped)
+        with self.assertRaisesRegex(self.driver.CheckError, NAMES[0]):
+            self.driver.compare_objects(left, right, dump_c=lambda path, name: "same")
+
+    def test_changed_section_byte_fails(self):
+        good = {".text": b"code", ".BTF": self.btf(b"TTTT", [b"a"]), ".BTF.ext": self.btf_ext([])}
+        bad = dict(good, **{".text": b"codf"})
+        left, right = self.pair(good, bad)
+        with self.assertRaisesRegex(self.driver.CheckError, NAMES[0]):
+            self.driver.compare_objects(left, right, dump_c=lambda path, name: "same")
+
+    def test_renamed_btf_string_fails(self):
+        good = {".text": b"code", ".BTF": self.btf(b"TTTT", [b"alpha"]),
+                ".BTF.ext": self.btf_ext([])}
+        renamed = {".text": b"code", ".BTF": self.btf(b"TTTT", [b"alphb"]),
+                   ".BTF.ext": self.btf_ext([])}
+        left, right = self.pair(good, renamed)
+        with self.assertRaisesRegex(self.driver.CheckError, NAMES[0]):
+            self.driver.compare_objects(left, right, dump_c=lambda path, name: "same")
+
+    def test_changed_c_dump_fails(self):
+        # Permuted type bytes force the fallback; only the C dump disagrees.
+        sections = {".text": b"code", ".BTF": self.btf(b"AAAABBBB", [b"a"]),
+                    ".BTF.ext": self.btf_ext([])}
+        flipped = {".text": b"code", ".BTF": self.btf(b"BBBBAAAA", [b"a"]),
+                   ".BTF.ext": self.btf_ext([])}
+        left, right = self.pair(sections, flipped)
+        def dump(path, name):
+            return "dump-a" if "baseline" in str(path) else "dump-b"
+        with self.assertRaisesRegex(self.driver.CheckError, NAMES[0]):
+            self.driver.compare_objects(left, right, dump_c=dump)
+
+    def test_changed_line_records_fail(self):
+        good = {".text": b"code", ".BTF": self.btf(b"TTTT", [b"a"]),
+                ".BTF.ext": self.btf_ext([], line_bytes=b"line-one")}
+        bad = {".text": b"code", ".BTF": self.btf(b"TTTT", [b"a"]),
+               ".BTF.ext": self.btf_ext([], line_bytes=b"line-two")}
+        left, right = self.pair(good, bad)
+        with self.assertRaisesRegex(self.driver.CheckError, NAMES[0]):
+            self.driver.compare_objects(left, right, dump_c=lambda path, name: "same")
+
+    def test_malformed_fallback_inputs_fail_closed(self):
+        good_btf = self.btf(b"TTTT", [b"a"])
+        good_ext = self.btf_ext([(8, 3)])
+        good = {".text": b"code", ".BTF": good_btf, ".BTF.ext": good_ext}
+        bad_magic = b"\x00\x00" + good_btf[2:]
+        truncated_ext = good_ext[:10]
+        for label, bad in [("btf-magic", dict(good, **{".BTF": bad_magic})),
+                           ("btf-size", dict(good, **{".BTF": good_btf + b"tail"})),
+                           ("ext-truncated", dict(good, **{".BTF.ext": truncated_ext})),
+                           ("ext-unpaired", {".text": b"code", ".BTF": good_btf})]:
+            with self.subTest(label=label):
+                left, right = self.pair(good, bad)
+                with self.assertRaisesRegex(self.driver.CheckError, NAMES[0]):
+                    self.driver.compare_objects(left, right, dump_c=lambda path, name: "same")
+        garbage = self.root / "garbage"
+        garbage.write_bytes(b"not an ELF object at all" + b"\x00" * 64)
+        left = dict(self.pair(good, good)[0])
+        right = dict(self.pair(good, good)[1])
+        right[NAMES[1]] = garbage
+        with self.assertRaisesRegex(self.driver.CheckError, NAMES[1]):
+            self.driver.compare_objects(left, right, dump_c=lambda path, name: "same")
+
+    def test_failing_dump_fails_closed_naming_the_object(self):
+        sections = {".text": b"code", ".BTF": self.btf(b"TTTT", [b"a"]),
+                    ".BTF.ext": self.btf_ext([])}
+        left, right = self.pair(sections, dict(sections, **{".text": b"codX"}))
+        def dump(path, name):
+            raise self.driver.CheckError("bpftool is required for BTF-order adjudication")
+        with self.assertRaisesRegex(self.driver.CheckError, NAMES[0]):
+            self.driver.compare_objects(left, right, dump_c=dump)
 
 
 class BuildDriverTests(unittest.TestCase):
@@ -122,7 +293,7 @@ class BuildDriverTests(unittest.TestCase):
                                 BPF_FIXTURE_LOG=str(self.root / "calls.jsonl"))
         fixture = ROOT / "tests/fixtures/bpf-noninterference/fake-tool.py"
         self.assertTrue(fixture.is_file(), "the fake command fixture is missing")
-        for name in ("cargo", "rustc", "rustup", "clang-18", "bpf-linker", "llvm-readelf", "dpkg-query"):
+        for name in ("cargo", "rustc", "rustup", "clang-18", "bpf-linker", "bpftool", "llvm-readelf", "dpkg-query"):
             shutil.copy2(fixture, self.bin / name)
             (self.bin / name).chmod(0o755)
         (self.repo / "scripts").mkdir()

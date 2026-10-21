@@ -351,7 +351,7 @@ jobs:
           fetch-depth: 0
       - run: rustup toolchain install "$(cat .release-rust-version)" --profile minimal
       - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
-      - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc libseccomp-dev llvm python3
+      - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc libseccomp-dev llvm python3 bpftool
       - run: cargo +"$(cat .release-rust-version)" install bpf-linker --version "$CI_TOOL_BPF_LINKER" --locked
       # Reviewed object-attribute protocols, scalar scope, selected
       # bootstrap and the P0 feature intentionally changed the default

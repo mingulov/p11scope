@@ -315,7 +315,7 @@ pub fn adapter_derive_entry(
 
 /// H7-E4 shipping gate, now build-selected: the default build wires
 /// FULL attribute capture; only the `stub-object-attributes` BPF build
-/// (the v0.4 P0 fallback object) shuts it. While false, entry acquires
+/// (the v0.4.0 P0-only object) shuts it. While false, entry acquires
 /// no template arguments and Get emission reads nothing.
 pub const ATTRIBUTE_CAPTURE_WIRED: bool = !cfg!(feature = "stub-object-attributes");
 
@@ -1272,7 +1272,7 @@ pub fn production_capture_get_return(
 mod tests {
     use super::*;
 
-    /// P0-degrade ship vehicle: the default build wires FULL object
+    /// P0-only ship vehicle: the default build wires FULL object
     /// attribute capture. Only the `stub-object-attributes` BPF build
     /// shuts the gate; its qualification is the P0 artifact contract
     /// plus the live 1M-kernel load, never this host suite.

@@ -68,6 +68,15 @@ MAP_TYPES = {1: 'hash', 2: 'array', 3: 'prog_array', 5: 'percpu_hash',
 # expects exactly the kernel's report. No other map or field is
 # narrowed: any other live value still fails.
 LIVE_IMAGE_MAP_FLAGS = {"IMAGE_CONTINUITY": 1, "IMAGE_TGID_INDEX": 1}
+# b992999b: `--mode metrics` selects CapturePolicy::AggregateOnly, which
+# wants no instance hooks, so the loader sizes these three IMAGE maps to
+# one entry (the image_query contract accepts count=1 when not full).
+# The pinned ELF policy still declares full sizes; the live comparison
+# below expects exactly the loader's size-1 report for these maps on
+# aggregate-only lanes. No other map, field, or lane is narrowed: any
+# other live value still fails.
+AGGREGATE_ONLY_SINGLETON_MAPS = frozenset({
+    "IMAGE_CONTINUITY", "IMAGE_TGID_INDEX", "IMAGE_QUERY_REQUESTS"})
 STOP_SECONDS = 30
 READY_SECONDS = 8
 RESUME_SECONDS = 5
@@ -428,7 +437,7 @@ class LiveMaps:
         maps = [dumper.normalize_map_metadata(dumper.one(self._json(
             ['bpftool', '-j', 'map', 'show', 'id', str(map_id)], deadline, bound=65536)), map_id)
                 for map_id in ids]
-        validate_inventory(maps, self.config.variant)
+        validate_inventory(maps, self.config.variant, self.config.privacy)
         group.snapshot(deadline)
         return sorted(maps, key=lambda item: item['name'])
 
@@ -525,7 +534,7 @@ class LiveMaps:
             raise CaptureError(issues) from None
 
 
-def validate_inventory(maps, variant):
+def validate_inventory(maps, variant, privacy='allowlisted'):
     expected = definitions.SAFE_MAPS if variant == 'default' else definitions.UNSAFE_MAPS
     require(isinstance(maps, list) and len(maps) == len(expected)
             and {item['name'] for item in maps} == set(expected)
@@ -534,8 +543,11 @@ def validate_inventory(maps, variant):
         dumper.snapshot_map_metadata(item)
         wanted = expected[item['name']]
         live_flags = LIVE_IMAGE_MAP_FLAGS.get(item['name'], wanted['flags'])
+        live_max = (1 if privacy == 'aggregate-only'
+                    and item['name'] in AGGREGATE_ONLY_SINGLETON_MAPS
+                    else wanted['max_entries'])
         require((item['type'], item['bytes_key'], item['bytes_value'], item['max_entries'], item['map_flags'])
-                == (MAP_TYPES[wanted['type']], wanted['key_size'], wanted['value_size'], wanted['max_entries'], live_flags),
+                == (MAP_TYPES[wanted['type']], wanted['key_size'], wanted['value_size'], live_max, live_flags),
                 f'map definition mismatch name={item["name"]}')
 
 

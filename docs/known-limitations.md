@@ -1,4 +1,27 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+# Known limitations (v0.4.0)
+
+v0.4.0 ships P0-only release bytes: object-attribute capture is not enabled
+(no BPF program reads object attributes). Every profile, metrics and trace
+document discloses this as structured evidence
+(`evidence.object_capture.available: false`, `reason: "not_enabled"`), and
+`p11scope doctor` names it in its `object-attribute capture` row. Counts,
+mechanisms and all other P0 facts are exact; only attribute semantics are
+withheld. FULL capture returns in v0.5.0 after E5 qualification.
+
+The G21 FULL-capture wrap legs (660 rounds in 900s, pid + system) are not
+qualified in v0.4.0: FULL is absent from the release bytes, and the legs
+also exceed their time budget on current throughput (correctness of the
+wrap accounting proven through 169 fenced rounds pre-split; throughput
+red at ~2.3 s/round vs 1.36 s needed). Owner waiver recorded with expiry
+at v0.5.0, when T/U throughput work, the shared-oracle rework and green
+legs land.
+
+The T9-full schema campaign is deferred to v0.5.0; v0.4.0 carries the v1
+schema family unchanged plus shipped-contract consumer checks.
+
+## Prior releases
+
 # Known limitations (v0.3.0)
 
 Inventory accepts `--max-endpoints` from 1 through 8192, with the unchanged

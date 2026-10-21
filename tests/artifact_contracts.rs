@@ -567,6 +567,7 @@ fn assert_hosted_bpf_noninterference(ci: &str) -> Result<(), String> {
         "rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src",
         "apt-get install -y clang-18 gcc libseccomp-dev llvm python3",
         "install bpf-linker --version \"$CI_TOOL_BPF_LINKER\" --locked",
+        "- name: Install packaged bpftool",
         "set -euo pipefail",
         "BASELINE=f1bc557e85119f8caa82160a083d2c095eb58ba4",
         "python3 -I scripts/check-bpf-noninterference.py \\",

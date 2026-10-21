@@ -329,6 +329,21 @@ ulimit -n 65536 || exit 1
 record_exit "$STAGE/version.log" version "$?"
 "$P" doctor > "$STAGE/doctor.log" 2>&1
 record_exit "$STAGE/doctor.log" doctor "$?"
+# Guest SoftHSM2 module: probe Debian, generic, then Fedora/RHEL paths and
+# export one MODULE for qualify-public-cli.sh, qualify-inventory-native.sh
+# and the backend probe below. A preset MODULE wins when it names a file.
+if [ -z "${MODULE:-}" ] || [ ! -f "$MODULE" ]; then
+  MODULE=""
+  for candidate in /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so /usr/lib/softhsm/libsofthsm2.so /usr/lib64/pkcs11/libsofthsm2.so; do
+    if [ -f "$candidate" ]; then MODULE=$candidate; break; fi
+  done
+  unset candidate
+fi
+if [ -z "$MODULE" ] || [ ! -f "$MODULE" ]; then
+  echo "SoftHSM2 module not found; probed /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so /usr/lib/softhsm/libsofthsm2.so /usr/lib64/pkcs11/libsofthsm2.so (set MODULE= to override)" >&2
+  exit 1
+fi
+export MODULE
 THREADS=12 "$R/scripts/qualify-public-cli.sh" "$P" "$WORK/qual/cells" > "$STAGE/qual.log" 2>&1
 record_exit "$STAGE/qual.log" qual "$?"
 [ ! -d "$WORK/qual/cells" ] || cp -r "$WORK/qual/cells" "$STAGE/cells"
@@ -354,8 +369,7 @@ record_exit "$STAGE/pidflt.log" pidflt "$?"
 # Auto PID and system routes are decided independently by functional probes.
 # These observations corroborate backend selection; counted coverage is supplied
 # by the separately ledgered public/native assertions above.
-MODULE=${MODULE:-/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so}
-[ -f "$MODULE" ] || MODULE=/usr/lib/softhsm/libsofthsm2.so
+# MODULE was detected and exported above for the qual scripts and this probe.
 backend_probe() {
   local scope=$1 gate=$WORK/backend/gate-$1 wl observer rc
   setpriv --reuid="$SUDO_UID" --regid="$SUDO_GID" --clear-groups \

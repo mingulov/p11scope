@@ -126,11 +126,14 @@ class EntryObjectTests(unittest.TestCase):
                         CHECKER["seeded_start_contract"](mutate(disassembly, scalar, zero_pc,
                             zero_text, scalar_insns[2][1]))
                 memset_name, memset_insns = instructions(variant, "memset")
+                # llvm-objdump 18 spells the stored sub-register `r2`, 21 spells
+                # the same bytes `w2`; the mutant must keep the local spelling.
+                sub = "r2" if any(text == "*(u8 *)(r5 + 0x0) = r2" for _, text in memset_insns) else "w2"
                 zero_store, zero_text = next((pc, text) for pc, text in memset_insns
-                                            if text == "*(u8 *)(r5 + 0x0) = w2")
+                                            if text == f"*(u8 *)(r5 + 0x0) = {sub}")
                 with self.assertRaisesRegex(RuntimeError, "memset byte-loop summary"):
                     CHECKER["seeded_start_contract"](mutate(disassembly, memset_name, zero_store,
-                        zero_text, "*(u8 *)(r5 + 0x0) = w1"))
+                        zero_text, f"*(u8 *)(r5 + 0x0) = {sub[0]}1"))
                 for name, report in reports.items():
                     _, insns = instructions(variant, name)
                     texts = dict(insns)

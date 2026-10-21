@@ -304,7 +304,9 @@ copy_tree_back() {
   local src=$1 dst=$2
   [ -d "$src" ] || { echo "copy-back source dir missing: $src" >&2; return 1; }
   mkdir -p "$dst" || return 1
-  cp -a "$src/." "$dst/" || return 1
+  # No -a: preserving ownership EPERMs on the 9p share (guest root maps to an
+  # unprivileged host user); the tree-sha comparison below seals contents.
+  cp -r "$src/." "$dst/" || return 1
   (cd "$src" && find . -type f -exec sha256sum {} + | LC_ALL=C sort) > "$LOCAL_OUT/tree-src.sums" || return 1
   (cd "$dst" && find . -type f -exec sha256sum {} + | LC_ALL=C sort) > "$LOCAL_OUT/tree-dst.sums" || return 1
   cmp -s "$LOCAL_OUT/tree-src.sums" "$LOCAL_OUT/tree-dst.sums" || { echo "copy-back tree bytes differ: $src -> $dst" >&2; return 1; }

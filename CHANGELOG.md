@@ -22,6 +22,11 @@ this as structured evidence (`evidence.object_capture.available: false`,
 are exact; only attribute semantics are withheld. FULL capture stays the
 default for diet/qualification work and returns when it fits the verifier
 budget (policy: [docs/privacy/allowlist-v3.md](docs/privacy/allowlist-v3.md)).
+Release qualification is narrowed for v0.4.0 (owner decision 2026-10-21):
+the privacy-canary phase asserts FULL attribute capture and cannot pass on
+P0 bytes, so this release waives it explicitly
+(`build-release.sh --waive-canaries`, recorded in the build receipt);
+P0-aware canaries and the full 7-lane matrix return in v0.5.0.
 Limits below live in [docs/known-limitations.md](docs/known-limitations.md).
 
 ### Added

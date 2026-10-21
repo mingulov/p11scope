@@ -1503,6 +1503,56 @@ class StoppedCanaryCaptureTests(unittest.TestCase):
                                     'map definition mismatch name=CONFIG'):
             capture.validate_inventory(maps, 'default')
 
+    def test_aggregate_only_inventory_expects_singleton_image_maps(self):
+        """Aggregate-only lanes load IMAGE maps at one entry, by contract.
+
+        `--mode metrics` selects CapturePolicy::AggregateOnly, which wants
+        no instance hooks, so the loader sizes IMAGE_CONTINUITY,
+        IMAGE_TGID_INDEX and IMAGE_QUERY_REQUESTS to max_entries=1
+        (src/attach.rs; the image_query contract accepts count=1). The
+        pinned ELF policy still declares full sizes; the live comparison
+        expects exactly the loader's size-1 report on aggregate-only
+        lanes. Any other size, any other field drift, or any other map's
+        drift still fails, and allowlisted lanes still require full sizes.
+        """
+        singletons = {"IMAGE_CONTINUITY", "IMAGE_TGID_INDEX", "IMAGE_QUERY_REQUESTS"}
+
+        def aggregate_inventory():
+            maps = self.live_inventory()
+            for item in maps:
+                if item['name'] in singletons:
+                    item['max_entries'] = 1
+            return maps
+
+        capture.validate_inventory(aggregate_inventory(), 'default', 'aggregate-only')
+        with self.assertRaisesRegex(capture.CaptureError,
+                                    'map definition mismatch name=IMAGE_CONTINUITY'):
+            capture.validate_inventory(aggregate_inventory(), 'default', 'allowlisted')
+        for name, full in (("IMAGE_CONTINUITY", 16384), ("IMAGE_TGID_INDEX", 16384),
+                           ("IMAGE_QUERY_REQUESTS", 1024)):
+            with self.subTest(name=name, size="full"):
+                maps = aggregate_inventory()
+                next(item for item in maps if item['name'] == name)['max_entries'] = full
+                with self.assertRaisesRegex(capture.CaptureError,
+                                            f'map definition mismatch name={name}'):
+                    capture.validate_inventory(maps, 'default', 'aggregate-only')
+            with self.subTest(name=name, size="two"):
+                maps = aggregate_inventory()
+                next(item for item in maps if item['name'] == name)['max_entries'] = 2
+                with self.assertRaisesRegex(capture.CaptureError,
+                                            f'map definition mismatch name={name}'):
+                    capture.validate_inventory(maps, 'default', 'aggregate-only')
+        maps = aggregate_inventory()
+        next(item for item in maps if item['name'] == "IMAGE_QUERY_REQUESTS")['bytes_value'] = 32
+        with self.assertRaisesRegex(capture.CaptureError,
+                                    'map definition mismatch name=IMAGE_QUERY_REQUESTS'):
+            capture.validate_inventory(maps, 'default', 'aggregate-only')
+        maps = aggregate_inventory()
+        next(item for item in maps if item['name'] == "CONFIG")['max_entries'] = 1
+        with self.assertRaisesRegex(capture.CaptureError,
+                                    'map definition mismatch name=CONFIG'):
+            capture.validate_inventory(maps, 'default', 'aggregate-only')
+
     def test_inventory_requires_the_exact_cgroup_filter_definition(self):
         """The checked-in ELF map list is the authority for CGROUP_FILTER too.
 

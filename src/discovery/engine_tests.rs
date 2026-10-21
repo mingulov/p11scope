@@ -7948,7 +7948,31 @@ fn wait_loaded_seed_peer(
         // The peer promises the same loaded state as the primary fixture.
         // Exe alone can switch before executable segments appear, and a
         // different initialized image (such as a launcher) is not this peer.
+        // Presence alone is not enough: a scan that beats the settling maps
+        // charges a transient extra line, so exact cross-peer work assertions
+        // flake under load. Require the full maps text to hold still across
+        // consecutive polls before the peer counts as ready.
         if image.as_ref().is_ok_and(|image| image == &runner) && runner_mapped && provider_mapped {
+            let mut stable = 0;
+            let mut previous = maps.unwrap_or_default();
+            while stable < 2 {
+                assert!(
+                    child.try_wait().unwrap().is_none(),
+                    "seed peer {pid} exited while its maps settled"
+                );
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "seed peer {pid} maps never settled: {previous:?}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                let current = std::fs::read_to_string(format!("/proc/{pid}/maps")).unwrap_or_default();
+                if current == previous {
+                    stable += 1;
+                } else {
+                    stable = 0;
+                    previous = current;
+                }
+            }
             return;
         }
         after_probe(child);

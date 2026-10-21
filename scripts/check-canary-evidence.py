@@ -1790,11 +1790,12 @@ def final_lane_artifacts(work, lane, surfaces, *, combined_log=False):
 
 
 def extract_object_attributes(argv):
-    """Strip one optional `--object-attributes` flag, selecting its mode.
+    """Strip optional `--object-attributes` flags, selecting their mode.
 
     Accepts `--object-attributes=MODE` and `--object-attributes MODE` in
-    any position; an unknown mode refuses. Absent flag keeps `present`,
-    today's FULL behavior.
+    any position; every occurrence is validated, so an earlier unknown
+    mode cannot be silently overwritten by a later one. Absent flag
+    keeps `present`, today's FULL behavior.
     """
     kept, mode = [], "present"
     index = 0
@@ -1805,8 +1806,10 @@ def extract_object_attributes(argv):
             if index >= len(argv):
                 raise ValueError("--object-attributes requires a mode")
             mode = argv[index]
+            set_object_attributes(mode)
         elif token.startswith("--object-attributes="):
             mode = token.removeprefix("--object-attributes=")
+            set_object_attributes(mode)
         else:
             kept.append(token)
         index += 1

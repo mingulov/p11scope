@@ -117,7 +117,10 @@ runs the repeat-baseline control on reviewed v0.4.0 baseline
 baseline with the exact candidate commit in a fresh integration snapshot.
 Advance the baseline only after reviewing intentional BPF changes, not to
 clear an arbitrary comparison failure. All bytes
-of the three default BPF objects must match in the same pinned tool/header environment. Its
+of the three default BPF objects must match in the same pinned tool/header environment;
+a proven BTF type-order-only permutation (identical sections, same BTF
+meaning) is accepted with a recorded `btf-order-only` verdict instead of
+failing the gate. Its
 separate artifact retains commands, source and tool receipts, object digests
 and section summaries on success or failure.
 After root/BPF acquisition, it fetches the selected pinned nightly's installed

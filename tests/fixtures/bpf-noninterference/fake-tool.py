@@ -49,6 +49,8 @@ elif tool == "dpkg-query":
     print("clang-18=1:18.1.8\nlinux-libc-dev=7.0\nlibc6-dev=2.43")
 elif tool == "llvm-readelf":
     print(".text PROGBITS .maps PROGBITS .BTF PROGBITS .debug_str PROGBITS")
+elif tool == "bpftool" and args == ["--version"]:
+    print("bpftool v7.7.0")
 elif tool == "cargo" and "metadata" in args:
     if not any((cwd / name).is_file() for name in ("prepared", "third-party/.prepare-dependencies.lock")):
         sys.exit("metadata before dependency preparation")

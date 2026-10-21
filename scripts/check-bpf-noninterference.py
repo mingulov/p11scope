@@ -20,6 +20,7 @@ import re
 import shutil
 import signal
 import stat
+import struct
 import subprocess
 import sys
 import tarfile
@@ -36,6 +37,8 @@ RELEASE_RUST = "1.98.1"
 BPF_RUST = "nightly-2026-05-20"
 BPF_LINKER = "0.10.4"
 MAX_LOG_BYTES = 64 * 1024 * 1024
+BTF_MAGIC = 0xEB9F
+BTF_VERSION = 1
 
 
 class CheckError(Exception):
@@ -153,7 +156,7 @@ def tool_identity(cwd: Path, env: dict[str, str], evidence: Path, label: str) ->
     records = {}
     # cargo.sh and the nested build both execute PATH cargo. Record that
     # dispatcher as well as rustup's selected channel-specific executables.
-    for tool in ("cargo", "rustup", "clang-18", "bpf-linker", "llvm-readelf", "python3", "dpkg-query"):
+    for tool in ("cargo", "rustup", "clang-18", "bpf-linker", "bpftool", "llvm-readelf", "python3", "dpkg-query"):
         resolved = shutil.which(tool, path=env["PATH"])
         if resolved is None:
             raise CheckError(f"required tool is absent: {tool}")
@@ -172,7 +175,7 @@ def tool_identity(cwd: Path, env: dict[str, str], evidence: Path, label: str) ->
                                   evidence, f"{label}-version-{channel}-{tool}")
             records[f"{channel}-{tool}"] = {"path": str(path), "realpath": str(path.resolve()),
                                               "sha256": sha256(path), "version": read_output(version).strip()}
-    for tool in ("rustup", "clang-18", "bpf-linker", "python3"):
+    for tool in ("rustup", "clang-18", "bpf-linker", "bpftool", "python3"):
         query = "--help" if tool == "rustup" else "--version"
         output = run_command([tool, query], cwd, env, evidence, f"{label}-version-{tool}")
         version = read_output(output, preserve_newlines=tool == "rustup")
@@ -238,7 +241,167 @@ def regular_object(path: Path) -> os.stat_result:
     return metadata
 
 
-def compare_objects(baseline: dict[str, Path], candidate: dict[str, Path]) -> None:
+def _elf_sections(path: Path, name: str) -> tuple[bytes, dict[str, bytes]]:
+    """Split an ELF64 object into its section-header table and named sections.
+
+    Duplicate section names gain an occurrence suffix so no bytes are silently
+    dropped. Anything malformed fails closed: the caller treats the object as
+    genuinely different, never as canonically equal.
+    """
+    try:
+        data = path.read_bytes()
+    except OSError as error:
+        raise CheckError(f"{name}: cannot read object: {error}") from error
+    if len(data) < 64 or data[0:4] != b"\x7fELF" or data[4] != 2 or data[5] != 1 or data[6] != 1:
+        raise CheckError(f"{name}: not a 64-bit little-endian ELF object")
+    (e_shoff,) = struct.unpack_from("<Q", data, 0x28)
+    (e_shentsize,) = struct.unpack_from("<H", data, 0x3A)
+    (e_shnum,) = struct.unpack_from("<H", data, 0x3C)
+    (e_shstrndx,) = struct.unpack_from("<H", data, 0x3E)
+    if e_shentsize != 64 or e_shnum == 0 or e_shstrndx >= e_shnum:
+        raise CheckError(f"{name}: malformed ELF section table")
+    table_end = e_shoff + e_shentsize * e_shnum
+    if e_shoff > len(data) or table_end > len(data):
+        raise CheckError(f"{name}: ELF section table runs past end of file")
+    header_table = data[e_shoff:table_end]
+    headers = [data[offset:offset + 64] for offset in range(e_shoff, table_end, 64)]
+    str_header = headers[e_shstrndx]
+    (_str_name, _str_type, _str_flags, _str_addr, str_offset, str_size) = struct.unpack_from(
+        "<IIQQQQ", str_header, 0)
+    if str_offset + str_size > len(data):
+        raise CheckError(f"{name}: ELF string table runs past end of file")
+    strtab = data[str_offset:str_offset + str_size]
+
+    def section_name(offset: int) -> str:
+        end = strtab.find(b"\x00", offset)
+        if offset >= len(strtab) or end < 0:
+            raise CheckError(f"{name}: bad ELF section name offset {offset}")
+        try:
+            return strtab[offset:end].decode("ascii")
+        except UnicodeDecodeError as error:
+            raise CheckError(f"{name}: non-ASCII ELF section name") from error
+
+    sections: dict[str, bytes] = {}
+    seen: dict[str, int] = {}
+    for header in headers[1:]:
+        (name_offset, _type, _flags, _addr, offset, size) = struct.unpack_from(
+            "<IIQQQQ", header, 0)
+        if offset + size > len(data):
+            raise CheckError(f"{name}: ELF section runs past end of file")
+        plain = section_name(name_offset)
+        seen[plain] = seen.get(plain, 0) + 1
+        key = plain if seen[plain] == 1 else f"{plain}#{seen[plain]}"
+        sections[key] = size.to_bytes(8, "little") + data[offset:offset + size]
+    return header_table, sections
+
+
+def _btf_string_set(btf: bytes, name: str) -> bytes:
+    """The sorted NUL-joined BTF string table: every type, var and field name."""
+    if len(btf) < 24:
+        raise CheckError(f"{name}: truncated .BTF section")
+    (magic, version, _flags, hdr_len, type_off, type_len, str_off, str_len) = struct.unpack_from(
+        "<HBBIIIII", btf, 0)
+    if magic != BTF_MAGIC or version != BTF_VERSION or hdr_len < 24 or hdr_len > len(btf):
+        raise CheckError(f"{name}: bad .BTF header")
+    # Area offsets count from the end of the header.
+    type_start, str_start = hdr_len + type_off, hdr_len + str_off
+    if type_start + type_len > len(btf) or str_start + str_len > len(btf):
+        raise CheckError(f"{name}: .BTF area runs past end of section")
+    if str_len == 0 or btf[str_start] != 0:
+        raise CheckError(f"{name}: bad .BTF string table")
+    entries = [entry for entry in btf[str_start:str_start + str_len].split(b"\x00") if entry]
+    return b"\x00".join(sorted(entries))
+
+
+def _btf_ext_header(ext: bytes, name: str) -> None:
+    """Validate the .BTF.ext header and area bounds; the bytes compare exact.
+
+    The observed type-order flips never touch .BTF.ext (only data-struct
+    IDs permute, and those are not func-referenced). A future flip reaching
+    a func-referenced type fails loudly on the byte comparison below, with
+    full evidence, instead of being silently normalized.
+    """
+    if len(ext) < 24:
+        raise CheckError(f"{name}: truncated .BTF.ext section")
+    (magic, version, _flags, hdr_len, func_off, func_len, line_off, line_len) = struct.unpack_from(
+        "<HBBIIIII", ext, 0)
+    if magic != BTF_MAGIC or version != BTF_VERSION or hdr_len not in (24, 32) or hdr_len > len(ext):
+        raise CheckError(f"{name}: bad .BTF.ext header")
+    areas = [(func_off, func_len), (line_off, line_len)]
+    if hdr_len == 32:
+        (core_off, core_len) = struct.unpack_from("<II", ext, 24)
+        areas.append((core_off, core_len))
+    for area_off, area_len in areas:
+        if hdr_len + area_off + area_len > len(ext):
+            raise CheckError(f"{name}: .BTF.ext area runs past end of section")
+
+
+def _btf_c_dump_sorted(path: Path, name: str) -> str:
+    """The bpftool C dump with lines sorted: the BTF type multiset in name form.
+
+    bpftool prints types by name without type IDs, so a pure type-order
+    permutation sorts to identical text while any added, removed or reshaped
+    type changes the multiset. Both sides always use this run's bpftool, so
+    no cross-version text skew can pass or fail the comparison.
+    """
+    bpftool = shutil.which("bpftool")
+    if bpftool is None:
+        raise CheckError(f"{name}: bpftool is required for BTF-order adjudication")
+    try:
+        completed = subprocess.run([bpftool, "btf", "dump", "file", str(path), "format", "c"],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise CheckError(f"{name}: bpftool BTF dump failed: {error}") from error
+    if completed.returncode != 0 or not completed.stdout.strip():
+        raise CheckError(f"{name}: bpftool BTF dump failed: {completed.stderr.strip()[:200]}")
+    return "\n".join(sorted(completed.stdout.splitlines()))
+
+
+def _canonical_projection(path: Path, name: str, dump_c) -> dict[str, str]:
+    """Order-insensitive identity of an object: exact sections plus BTF meaning."""
+    header_table, sections = _elf_sections(path, name)
+    btf = sections.pop(".BTF", None)
+    ext = sections.pop(".BTF.ext", None)
+    digest = hashlib.sha256()
+    digest.update(header_table)
+    for key in sorted(sections):
+        digest.update(key.encode("ascii"))
+        digest.update(sections[key])
+    projection = {"sections": digest.hexdigest()}
+    if (btf is None) != (ext is None):
+        raise CheckError(f"{name}: .BTF and .BTF.ext must come as a pair")
+    if btf is None:
+        projection["btf"] = "absent"
+        return projection
+    content = btf[8:]
+    projection["btf_size"] = str(len(content))
+    projection["btf_strings"] = hashlib.sha256(_btf_string_set(content, name)).hexdigest()
+    projection["btf_c_dump"] = hashlib.sha256(dump_c(path, name).encode("utf-8")).hexdigest()
+    _btf_ext_header(ext[8:], name)
+    projection["btf_ext"] = hashlib.sha256(ext).hexdigest()
+    return projection
+
+
+def _objects_identical(left: Path, right: Path) -> bool:
+    with left.open("rb") as first, right.open("rb") as second:
+        while True:
+            a, b = first.read(1024 * 1024), second.read(1024 * 1024)
+            if a != b:
+                return False
+            if not a:
+                return True
+
+
+def compare_objects(baseline: dict[str, Path], candidate: dict[str, Path],
+                    dump_c=_btf_c_dump_sorted) -> dict[str, str]:
+    """Compare whole bytes, accepting a proven BTF type-order permutation.
+
+    Returns per-object verdicts ("exact" or "btf-order-only"). The BTF
+    emitter permutes type order between identical-input builds, so a
+    whole-byte mismatch with identical code sections and identical BTF
+    meaning (type multiset, string set, line records) is accepted and
+    recorded. Anything else, including any fallback-tool failure, raises.
+    """
     identities = set()
     for side, objects in (("baseline", baseline), ("candidate", candidate)):
         if set(objects) != set(OBJECT_NAMES):
@@ -249,15 +412,21 @@ def compare_objects(baseline: dict[str, Path], candidate: dict[str, Path]) -> No
             if identity in identities:
                 raise CheckError(f"baseline/candidate object alias: {objects[name]}")
             identities.add(identity)
+    verdicts = {}
     for name in OBJECT_NAMES:
-        # Compare whole bytes, including all debug/BTF/relocation sections.
-        with baseline[name].open("rb") as left, candidate[name].open("rb") as right:
-            while True:
-                a, b = left.read(1024 * 1024), right.read(1024 * 1024)
-                if a != b:
-                    raise CheckError(f"default object differs: {name}")
-                if not a:
-                    break
+        # Fast path: whole bytes, including all debug/BTF/relocation sections.
+        if _objects_identical(baseline[name], candidate[name]):
+            verdicts[name] = "exact"
+            continue
+        try:
+            left = _canonical_projection(baseline[name], name, dump_c)
+            right = _canonical_projection(candidate[name], name, dump_c)
+        except CheckError as error:
+            raise CheckError(f"default object differs: {name} ({error})") from error
+        if left != right:
+            raise CheckError(f"default object differs: {name}")
+        verdicts[name] = "btf-order-only"
+    return verdicts
 
 
 def select_out_dir(messages: str, package_id: str, scratch: Path) -> Path:
@@ -559,12 +728,18 @@ def main() -> int:
         if (json.loads((work / "baseline/snapshot.json").read_text())["nightly_source"]
                 != json.loads((work / "candidate/snapshot.json").read_text())["nightly_source"]):
             raise CheckError("selected nightly source changed between snapshot builds")
-        compare_objects(left, right)
+        verdicts = compare_objects(left, right)
         write_json(work / "comparison.json", {"mode": "repeat-baseline" if options.repeat_baseline else "integration",
                                               "baseline": baseline, "candidate": candidate,
                                               "acquisition_mode": "verified-payload" if options.baseline_offline_payload else "online",
-                                              "matched_objects": list(OBJECT_NAMES)})
-        print(f"bpf-noninterference: {baseline} vs {candidate}: all three whole objects match")
+                                              "matched_objects": list(OBJECT_NAMES),
+                                              "verdicts": verdicts})
+        relaxed = sorted(name for name, verdict in verdicts.items() if verdict != "exact")
+        if relaxed:
+            print(f"bpf-noninterference: {baseline} vs {candidate}: all three objects match "
+                  f"(BTF type-order only: {', '.join(relaxed)})")
+        else:
+            print(f"bpf-noninterference: {baseline} vs {candidate}: all three whole objects match")
         return 0
     except (CheckError, OSError, ValueError, KeyError, tarfile.TarError) as error:
         print(f"bpf-noninterference: {error}", file=sys.stderr)

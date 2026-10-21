@@ -7965,7 +7965,8 @@ fn wait_loaded_seed_peer(
                     "seed peer {pid} maps never settled: {previous:?}"
                 );
                 std::thread::sleep(std::time::Duration::from_millis(1));
-                let current = std::fs::read_to_string(format!("/proc/{pid}/maps")).unwrap_or_default();
+                let current =
+                    std::fs::read_to_string(format!("/proc/{pid}/maps")).unwrap_or_default();
                 if current == previous {
                     stable += 1;
                 } else {

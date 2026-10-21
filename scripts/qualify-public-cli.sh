@@ -37,6 +37,22 @@ else
   READY_TICKS=1800; LEDGER_TICKS=600; EXIT_TICKS=1800
 fi
 mkdir -p "$OUT" && chmod 755 "$OUT" && OUT=$(realpath -e -- "$OUT") && cd "$OUT" || exit 64
+# Product -o writes go to guest-local storage: the 9p share breaks the
+# product's temp-file identity check (root writer vs share owner), so every
+# -o below targets LOCAL_OUT and copy_back restores a byte-identical file
+# where the oracle expects it. Never under $TMPDIR (the matrix points that
+# at the share); an explicit /tmp template keeps mktemp off it.
+LOCAL_OUT=$(mktemp -d /tmp/p11scope-cli-local.XXXXXXXX) || exit 65
+chmod 700 "$LOCAL_OUT" || exit 65
+copy_back() {
+  local src=$1 dst=$2 before after
+  [ -f "$src" ] || { echo "copy-back source missing: $src" >&2; return 1; }
+  before=$(sha256sum < "$src") || return 1
+  cp -f "$src" "$dst" || return 1
+  [ -f "$dst" ] || { echo "copy-back destination missing: $dst" >&2; return 1; }
+  after=$(sha256sum < "$dst") || return 1
+  [ "$before" = "$after" ] || { echo "copy-back bytes differ: $src -> $dst" >&2; return 1; }
+}
 : > results.jsonl
 # PID generations limit cleanup to children created in this invocation.
 declare -A CHILDREN
@@ -123,6 +139,7 @@ gated() {
   [ "$cell" = trace-pid ] && ext=txt
   rm -f -- "$gate" "$cell.$ext" "$cell.wl" "$cell.stderr" "$cell.stdout" "$cell.receipt.json"
   local before after gen='' readygen='' wl pp='' ready=0 capturing=0 released=0 observer_rc=125 workload_rc=125
+  local -a o_local=() o_share=()
   before=$(pin) || { result "$cell" 0 'provider pin failed' failed; return 1; }
   if [ "$cell" = mt-exact ]; then
     asuser "$fixture" "$MODULE" "$THREADS" 5 0 "$gate" > "$cell.wl" 2>&1 &
@@ -133,6 +150,20 @@ gated() {
   if waitfor "$cell.wl" "^READY pid=$wl$" "$wl" "$READY_TICKS"; then
     ready=1; readygen=$(generation "$wl")
     local args=("${@//@PID@/$wl}")
+    # Every product -o value moves to guest-local storage; a trailing bare
+    # -o is left for the product to refuse, exactly as before.
+    local idx=0
+    while [ "$idx" -lt "${#args[@]}" ]; do
+      if [ "${args[$idx]}" = "-o" ] && [ "$((idx + 1))" -lt "${#args[@]}" ]; then
+        o_share+=("${args[$((idx + 1))]}")
+        o_local+=("$LOCAL_OUT/$cell-o-${#o_share[@]}")
+        args[$((idx + 1))]="${o_local[$((${#o_local[@]} - 1))]}"
+        rm -f -- "${o_local[$((${#o_local[@]} - 1))]}"
+        idx=$((idx + 2))
+      else
+        idx=$((idx + 1))
+      fi
+    done
     "$P" "${args[@]}" > "$cell.stdout" 2> "$cell.stderr" & pp=$!; register "$pp" || true
     if waitfor "$cell.stderr" 'p11scope: capturing:' "$pp" "$READY_TICKS" && alive "$wl" && alive "$pp"; then
       capturing=1
@@ -145,6 +176,15 @@ gated() {
     fi
   fi
   if [ -n "$pp" ] && [ -n "${CHILDREN[$pp]:-}" ]; then terminate "$pp"; observer_rc=$LAST_EXIT; fi
+  # Restore the ledgered share paths byte-identically; a missing local file
+  # means the observer never published, which the oracle fails as before.
+  local copy_ok=1 pair
+  for pair in "${!o_local[@]}"; do
+    if [ -f "${o_local[$pair]}" ]; then
+      copy_back "${o_local[$pair]}" "${o_share[$pair]}" || copy_ok=0
+    fi
+  done
+  if [ "$copy_ok" != 1 ]; then result "$cell" 0 'copy-back failed' failed; return 1; fi
   if [ "$cell" = mt-exact ] && [ "$released" = 1 ]; then
     if finish "$wl" "$LEDGER_TICKS"; then workload_rc=$LAST_EXIT; else workload_rc=124; fi
   else
@@ -206,13 +246,14 @@ register_owned_descendants() {
   done
 }
 second_sigint() {
-  local pp child='' rc=125 custody=0 cleanup_ok=1 pid
-  rm -f sigint2.json second-child.pid
+  local pp child='' rc=125 custody=0 cleanup_ok=1 pid sig2_copy=1
+  local sig2_local=$LOCAL_OUT/sigint2.json
+  rm -f sigint2.json second-child.pid "$sig2_local"
   : > second-child.pid
   if [ "$CONTROL" = 0 ]; then chown "$RUNUID:$RUNGID" second-child.pid; fi
   chmod 600 second-child.pid
   # shellcheck disable=SC2016
-  env --default-signal=INT SUDO_UID="$RUNUID" SUDO_GID="$RUNGID" "$P" run -o "$OUT/sigint2.json" -- sh -c 'echo $$ > "$1"; trap "" INT TERM; exec sleep 60' sh "$OUT/second-child.pid" > sig2.stdout 2> sig2.stderr & pp=$!; register "$pp" || true
+  env --default-signal=INT SUDO_UID="$RUNUID" SUDO_GID="$RUNGID" "$P" run -o "$sig2_local" -- sh -c 'echo $$ > "$1"; trap "" INT TERM; exec sleep 60' sh "$OUT/second-child.pid" > sig2.stdout 2> sig2.stderr & pp=$!; register "$pp" || true
   if waitfor sig2.stderr 'p11scope: capturing:' "$pp" "$READY_TICKS" && await_signal_child second-child.pid "$pp"; then
     child=$CUSTODY_CHILD; custody=1
     sleep 1; kill -INT "$pp"; sleep 1; kill -INT "$pp"
@@ -226,7 +267,8 @@ second_sigint() {
   for pid in "${!CHILDREN[@]}"; do
     terminate "$pid" || cleanup_ok=0
   done
-  result second-sigint "$([ "$custody" = 1 ] && [ "$cleanup_ok" = 1 ] && [ "$rc" = 130 ] && grep -qa 'p11scope: cleanup incomplete' sig2.stderr && ! grep -qa panicked sig2.stderr && python3 -c 'import json; json.load(open("sigint2.json"))' 2>/dev/null && echo 1 || echo 0)" "rc=$rc child_custody=$custody child=${child:-unknown} cleanup_complete=$cleanup_ok"
+  if [ -f "$sig2_local" ]; then copy_back "$sig2_local" "$OUT/sigint2.json" || sig2_copy=0; fi
+  result second-sigint "$([ "$sig2_copy" = 1 ] && [ "$custody" = 1 ] && [ "$cleanup_ok" = 1 ] && [ "$rc" = 130 ] && grep -qa 'p11scope: cleanup incomplete' sig2.stderr && ! grep -qa panicked sig2.stderr && python3 -c 'import json; json.load(open("sigint2.json"))' 2>/dev/null && echo 1 || echo 0)" "rc=$rc child_custody=$custody child=${child:-unknown} cleanup_complete=$cleanup_ok"
 }
 if [ "$CONTROL" = 1 ]; then
   if [ "$CONTROL_KIND" = signal ]; then second_sigint
@@ -265,13 +307,17 @@ gated trace-pid pid "$GATED" trace --pid @PID@ --duration 12 -o "$OUT/trace-pid.
 # exists. A report or a successful child exit alone does not establish coverage.
 for cell in run-short run-cover; do
   n=3; [ "$cell" = run-cover ] && n=2000
-  rm -f -- "$cell.json" "$cell.wl" "$cell.stderr" "$cell.stdout"
+  run_local=$LOCAL_OUT/$cell.json
+  rm -f -- "$cell.json" "$cell.wl" "$cell.stderr" "$cell.stdout" "$run_local"
   before=$(pin) || before=null
-  SUDO_UID=$RUNUID SUDO_GID=$RUNGID "$P" run --pause auto -o "$OUT/$cell.json" -- "$GATED" "$MODULE" "$n" 0 - > "$cell.stdout" 2> "$cell.stderr" & pp=$!; register "$pp" || true
+  SUDO_UID=$RUNUID SUDO_GID=$RUNGID "$P" run --pause auto -o "$run_local" -- "$GATED" "$MODULE" "$n" 0 - > "$cell.stdout" 2> "$cell.stderr" & pp=$!; register "$pp" || true
   if finish "$pp" "$EXIT_TICKS"; then rc=$LAST_EXIT; else rc=124; fi
+  run_copy=1
+  if [ -f "$run_local" ]; then copy_back "$run_local" "$OUT/$cell.json" || run_copy=0; fi
   # run does not expose a separately authenticated fixture PID/exit/readiness
   # channel here. Validate the available smoke assertion without fabricating it.
-  if [ "$rc" = 0 ] && python3 - "$cell.json" <<'PY'
+  if [ "$run_copy" != 1 ]; then result "$cell" 0 "copy-back failed rc=$rc" failed
+  elif [ "$rc" = 0 ] && python3 - "$cell.json" <<'PY'
 import json,sys
 with open(sys.argv[1]) as f: d=json.load(f)
 assert d['schema']=='p11scope/observed-profile/v3'
@@ -283,10 +329,12 @@ gated mt-exact pid "$MT" profile --pid @PID@ --duration 25 -o "$OUT/mt-exact.jso
 gated system system "$GATED" profile --system --module "$MODULE" --duration 25 -o "$OUT/system.json"
 # Signal cells retain distinct expected exits; readiness is mandatory.
 rm -f sigint.json sig.gate
+sig_local=$LOCAL_OUT/sigint.json
+rm -f -- "$sig_local"
 asuser "$GATED" "$MODULE" 100000000 1000 "$OUT/sig.gate" > sig.wl 2>&1 & wl=$!; register "$wl" || true
 rc=125
 if waitfor sig.wl '^READY pid=' "$wl" "$READY_TICKS"; then
-  env --default-signal=INT "$P" profile --pid "$wl" --duration 120 -o "$OUT/sigint.json" > sig.stdout 2> sig.stderr & pp=$!; register "$pp" || true
+  env --default-signal=INT "$P" profile --pid "$wl" --duration 120 -o "$sig_local" > sig.stdout 2> sig.stderr & pp=$!; register "$pp" || true
   if waitfor sig.stderr 'p11scope: capturing:' "$pp" "$READY_TICKS" && alive "$wl"; then
     touch sig.gate; sleep 1; kill -INT "$pp"
     if finish "$pp" "$EXIT_TICKS"; then rc=$LAST_EXIT; else rc=124; fi
@@ -294,9 +342,13 @@ if waitfor sig.wl '^READY pid=' "$wl" "$READY_TICKS"; then
   [ -n "${CHILDREN[$pp]:-}" ] && terminate "$pp"
 fi
 terminate "$wl"
-result sigint "$([ "$rc" = 0 ] && python3 -c 'import json; json.load(open("sigint.json"))' 2>/dev/null && echo 1 || echo 0)" "rc=$rc"
+sig_copy=1
+if [ -f "$sig_local" ]; then copy_back "$sig_local" "$OUT/sigint.json" || sig_copy=0; fi
+result sigint "$([ "$sig_copy" = 1 ] && [ "$rc" = 0 ] && python3 -c 'import json; json.load(open("sigint.json"))' 2>/dev/null && echo 1 || echo 0)" "rc=$rc"
 second_sigint
 rm -f fifo; mkfifo fifo
+# The fifo -o path MUST stay on the share: this cell proves the product
+# refuses a FIFO target, so redirecting it guest-local would defeat the probe.
 asuser "$GATED" "$MODULE" 100000000 1000 - > fifo.wl 2>&1 & wl=$!; register "$wl" || true
 rc=125
 if waitfor fifo.wl '^READY pid=' "$wl" "$READY_TICKS"; then

@@ -565,19 +565,20 @@ FAKE_OBSERVER = '''#!/usr/bin/python3
 import hashlib,json,os,pathlib,signal,sys,time
 ''' + FAKE_MAPPING + '''
 out=pathlib.Path(sys.argv[sys.argv.index('-o')+1]); root=out.parent
-(root / 'observer.pid').write_text(str(os.getpid()))
+cell=os.environ['CONTROL_CELL']; croot=pathlib.Path(os.environ['CONTROL_OUT'])
+(croot / 'observer.pid').write_text(str(os.getpid()))
 mode=os.environ['CONTROL_MODE']
 if mode=='exits-before-ready': sys.exit(17)
 if mode=='ignore-term': signal.signal(signal.SIGTERM, signal.SIG_IGN)
 if mode in ('never-ready','stale-output','ignore-term'):
  while True: time.sleep(.02)
 print('p11scope: capturing: controlled',file=sys.stderr,flush=True)
-while not (root/(out.stem+'.gate')).exists(): time.sleep(.02)
+while not (croot/(cell+'.gate')).exists(): time.sleep(.02)
 time.sleep(.1)
 module=pathlib.Path(os.environ['MODULE']); dev,ino=mapped_identity(module)
 obj={'dev':dev,'ino':ino,'sha256':hashlib.sha256(module.read_bytes()).hexdigest()}
 names=['C_GenerateRandom','C_DigestInit','C_Digest','C_FindObjectsInit','C_FindObjects','C_FindObjectsFinal']
-if out.stem == 'mt-exact': names=names[:1]
+if cell == 'mt-exact': names=names[:1]
 report=json.loads(pathlib.Path(os.environ['CONTROL_REPORT']).read_text())
 report['functions']=report['functions'][:len(names)]
 report['evidence']['slots']=len(names)
@@ -591,8 +592,9 @@ out.write_text(json.dumps(report))
 FAKE_SIGNAL_PARENT = '''#!/usr/bin/python3
 import json,os,pathlib,signal,subprocess,sys,time
 out=pathlib.Path(sys.argv[sys.argv.index('-o')+1]);root=out.parent
+croot=pathlib.Path(os.environ['CONTROL_OUT'])
 self_stat=pathlib.Path('/proc/self/stat').read_text().rsplit(') ',1)[1].split()
-(root/'signal-parent.json').write_text(json.dumps({'pid':os.getpid(),'generation':int(self_stat[19])}))
+(croot/'signal-parent.json').write_text(json.dumps({'pid':os.getpid(),'generation':int(self_stat[19])}))
 received=0
 def interrupt(a,b):
  global received
@@ -608,7 +610,7 @@ if mode=='wrong-parent':
 else:
  child=subprocess.Popen(command,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
  stat=pathlib.Path('/proc/%d/stat'%child.pid).read_text().rsplit(') ',1)[1].split()
- (root/'actual-child.json').write_text(json.dumps({'pid':child.pid,'generation':int(stat[19])}))
+ (croot/'actual-child.json').write_text(json.dumps({'pid':child.pid,'generation':int(stat[19])}))
 while received<2: time.sleep(.02)
 out.write_text('{}')
 print('p11scope: cleanup incomplete',file=sys.stderr,flush=True)
@@ -622,7 +624,7 @@ class SignalCustodyTests(unittest.TestCase):
             tmp=Path(raw);observer=tmp/'observer';out=tmp/'out';out.mkdir()
             observer.write_text(FAKE_SIGNAL_PARENT);observer.chmod(0o700)
             sentinel=subprocess.Popen([sys.executable,'-I','-c','import time; time.sleep(20)'])
-            env=dict(os.environ,CONTROL_SIGNAL_MODE=mode,CONTROL_UNRELATED_PID=str(sentinel.pid),
+            env=dict(os.environ,CONTROL_SIGNAL_MODE=mode,CONTROL_UNRELATED_PID=str(sentinel.pid),CONTROL_OUT=str(out),
                      RUNUID=str(os.getuid()),RUNGID=str(os.getgid()))
             try:
                 args=['bash',str(SHELL),'--control-second-sigint',str(observer),str(out)]
@@ -679,7 +681,7 @@ class ShellControls(unittest.TestCase):
                 (out / "profile-pid.json").write_text(json.dumps(inputs()[0]))
                 (out / "profile-pid.wl").write_text("READY pid=123\n" + inputs()[1][-1])
             template=tmp / "report-template.json";template.write_text(json.dumps(inputs()[0]))
-            env = dict(os.environ, CONTROL_MODE=mode, CONTROL_CELL=cell, MODULE=str(module), ITERS="7", CONTROL_REPORT=str(template))
+            env = dict(os.environ, CONTROL_MODE=mode, CONTROL_CELL=cell, CONTROL_OUT=str(out), MODULE=str(module), ITERS="7", CONTROL_REPORT=str(template))
             sentinel = subprocess.Popen([sys.executable, "-I", "-c", "import time; time.sleep(20)"]) if unrelated else None
             try:
                 proc = subprocess.run(["bash", str(SHELL), "--control-gated", str(observer),

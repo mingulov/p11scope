@@ -23,6 +23,10 @@
 # and /var/tmp, so per-kernel stage dirs live under /home (STAGE_BASE) and are
 # passed as vng --rwdir; results are copied to OUT_BASE (under /var/tmp) with
 # summary.md at OUT_BASE/<rev>/summary.md and raw logs alongside.
+# Product -o writes and the native --base run on guest-local /tmp (an overlay
+# the guest owns) and are copied back byte-identically with sha checks;
+# guest /boot is likewise overlaid so inner.sh can install the staged lane
+# kernel config (host /boot is never written).
 # Privileged work is serialized under flock(LOCK); one guest runs at a time;
 # every guest is bounded by timeout; quiet-window file pauses before each guest.
 set -uo pipefail
@@ -246,12 +250,22 @@ print("\n".join(json.load(open(sys.argv[1]))["lib_tests"]))
 PYARGS
 ) || return 1
   mapfile -t selectors <<< "$names"
+  boot_info=$(python3 - "$stage/contract.json" <<'PYARGS'
+import json,shlex,sys
+guest=json.load(open(sys.argv[1])).get("guest_boot_config")
+print("GUEST_BOOT=%d" % (guest is not None))
+if guest is not None:
+    print("BOOT_SHA=%s" % shlex.quote(guest["sha256"]))
+    print("BOOT_OSRELEASE=%s" % shlex.quote(guest["osrelease"]))
+PYARGS
+) || return 1
   printf -v lib_command '%q ' "$REPO/scripts/run-privileged-lib-tests.sh" \
     "$stage/artifacts/p11scope-lib" "$stage/work/priv/run" --include-long "${selectors[@]}"
   {
     echo '#!/bin/bash'
     echo 'set -uo pipefail'
     printf 'STAGE=%q\nR=%q\n' "$stage" "$REPO"
+    printf '%s\n' "$boot_info"
     printf 'LIB_COMMAND=%q\n' "$lib_command"
     cat <<'INNER'
 P=$STAGE/artifacts/p11scope
@@ -271,7 +285,42 @@ chmod 0711 "$WORK" "$WORK/c8-native" "$WORK/c8-scan" || exit 1
 mkdir -p "$WORK/tmp"; chmod 0700 "$WORK/tmp" || exit 1
 export TMPDIR=$WORK/tmp
 umask 022
+# Guest-local private storage: the 9p share breaks product -o temp identity
+# and root-ownership checks, so -o outputs and the native --base live here
+# and are copied back byte-identically. Never under $TMPDIR (the share);
+# an explicit /tmp template keeps mktemp off it.
+LOCAL_OUT=$(mktemp -d /tmp/p11scope-matrix-local.XXXXXXXX) || exit 1
+chmod 700 "$LOCAL_OUT" || exit 1
+copy_back() {
+  local src=$1 dst=$2 before after
+  [ -f "$src" ] || { echo "copy-back source missing: $src" >&2; return 1; }
+  before=$(sha256sum < "$src") || return 1
+  cp -f "$src" "$dst" || return 1
+  [ -f "$dst" ] || { echo "copy-back destination missing: $dst" >&2; return 1; }
+  after=$(sha256sum < "$dst") || return 1
+  [ "$before" = "$after" ] || { echo "copy-back bytes differ: $src -> $dst" >&2; return 1; }
+}
+copy_tree_back() {
+  local src=$1 dst=$2
+  [ -d "$src" ] || { echo "copy-back source dir missing: $src" >&2; return 1; }
+  mkdir -p "$dst" || return 1
+  cp -a "$src/." "$dst/" || return 1
+  (cd "$src" && find . -type f -exec sha256sum {} + | LC_ALL=C sort) > "$LOCAL_OUT/tree-src.sums" || return 1
+  (cd "$dst" && find . -type f -exec sha256sum {} + | LC_ALL=C sort) > "$LOCAL_OUT/tree-dst.sums" || return 1
+  cmp -s "$LOCAL_OUT/tree-src.sums" "$LOCAL_OUT/tree-dst.sums" || { echo "copy-back tree bytes differ: $src -> $dst" >&2; return 1; }
+}
 uname -r > "$STAGE/uname.txt"
+# VNG lanes only: the product reads ONLY /boot/config-$(osrelease), which
+# vng guests lack; install the staged lane config (host keeps real /boot).
+# /boot is guest-writable via --overlay-rwdir (host /boot untouched).
+OSRELEASE=$(cat /proc/sys/kernel/osrelease) || exit 1
+[ -n "$OSRELEASE" ] || { echo 'guest osrelease unavailable' >&2; exit 1; }
+if [ "$GUEST_BOOT" = 1 ]; then
+  [ "$OSRELEASE" = "$BOOT_OSRELEASE" ] || { echo "guest osrelease $OSRELEASE does not match contract $BOOT_OSRELEASE" >&2; exit 1; }
+  BOOT_TARGET=/boot/config-$OSRELEASE
+  cp -f "$STAGE/inputs/boot-config" "$BOOT_TARGET" || exit 1
+  echo "$BOOT_SHA  $BOOT_TARGET" | sha256sum -c - || exit 1
+fi
 date -u +%Y-%m-%dT%H:%M:%SZ > "$STAGE/guest-start.txt"
 ulimit -n 65536 || exit 1
 "$P" --version > "$STAGE/version.log" 2>&1
@@ -281,11 +330,19 @@ record_exit "$STAGE/doctor.log" doctor "$?"
 THREADS=12 "$R/scripts/qualify-public-cli.sh" "$P" "$WORK/qual/cells" > "$STAGE/qual.log" 2>&1
 record_exit "$STAGE/qual.log" qual "$?"
 [ ! -d "$WORK/qual/cells" ] || cp -r "$WORK/qual/cells" "$STAGE/cells"
-"$R/scripts/qualify-inventory-native.sh" "$P" --lane native --base "$WORK/c8-native" > "$STAGE/inv-native.log" 2>&1
+# Sibling bases, not children of the 0700 LOCAL_OUT: the native script's
+# workloads run as RUNUID and must traverse into --base (0711: traverse
+# without listing, the script's own base convention).
+NATIVE_BASE=$(mktemp -d /tmp/p11scope-c8native.XXXXXXXX) || exit 1
+SCAN_BASE=$(mktemp -d /tmp/p11scope-c8scan.XXXXXXXX) || exit 1
+chmod 0711 "$NATIVE_BASE" "$SCAN_BASE" || exit 1
+"$R/scripts/qualify-inventory-native.sh" "$P" --lane native --base "$NATIVE_BASE" > "$STAGE/inv-native.log" 2>&1
 record_exit "$STAGE/inv-native.log" inv_native "$?"
+copy_tree_back "$NATIVE_BASE" "$WORK/c8-native" || exit 1
 cp -r "$WORK/c8-native" "$STAGE/c8-native" 2>/dev/null || true
-"$R/scripts/qualify-inventory-native.sh" "$P" --lane scan --base "$WORK/c8-scan" > "$STAGE/inv-scan.log" 2>&1
+"$R/scripts/qualify-inventory-native.sh" "$P" --lane scan --base "$SCAN_BASE" > "$STAGE/inv-scan.log" 2>&1
 record_exit "$STAGE/inv-scan.log" inv_scan "$?"
+copy_tree_back "$SCAN_BASE" "$WORK/c8-scan" || exit 1
 cp -r "$WORK/c8-scan" "$STAGE/c8-scan" 2>/dev/null || true
 (cd "$R" && eval "$LIB_COMMAND") > "$STAGE/priv.log" 2>&1
 record_exit "$STAGE/priv.log" priv "$?"
@@ -315,8 +372,10 @@ backend_probe() {
   fi
   local -a scope_args
   if [ "$scope" = pid ]; then scope_args=(--pid "$wl"); else scope_args=(--system); fi
+  local local_json=$LOCAL_OUT/backend-inv-$scope.json
+  rm -f -- "$local_json"
   "$P" inventory "${scope_args[@]}" --capture native --duration 10 \
-    -o "$WORK/backend/inv-$scope.json" > "$WORK/backend/inv-$scope.stdout" 2> "$WORK/backend/inv-$scope.stderr" &
+    -o "$local_json" > "$WORK/backend/inv-$scope.stdout" 2> "$WORK/backend/inv-$scope.stderr" &
   observer=$!
   local capture=0
   for _ in $(seq 300); do
@@ -329,6 +388,11 @@ backend_probe() {
     wait "$observer"; rc=$?
   else
     kill -TERM "$observer" 2>/dev/null || true; wait "$observer" 2>/dev/null || true; rc=1
+  fi
+  # A missing local file means the observer never published, failed as
+  # before; a failed restore is a harness failure, never silent success.
+  if [ -f "$local_json" ]; then
+    copy_back "$local_json" "$WORK/backend/inv-$scope.json" || { echo "backend $scope copy-back failed" >&2; rm -f -- "$WORK/backend/inv-$scope.json"; rc=1; }
   fi
   record_exit "$WORK/backend/inv-$scope.stderr" "inv_$scope" "$rc"
   kill -TERM "$wl" 2>/dev/null || true; wait "$wl" 2>/dev/null || true
@@ -496,7 +560,7 @@ run_one() {
   [ ! -e "$stage" ] && [ ! -e "$out" ] || { echo "refusing existing stage/output: $tag" >&2; return 1; }
   mkdir -p "$stage" "$out" || return 1
   chmod 0755 "$stage" "$out"
-  python3 -I "$CHECKER" --prepare "$stage" --lane "$lane" --bin-dir "$BIN_OUT" \
+  python3 -I "$CHECKER" --prepare "$stage" --lane "$lane" --kernel "$k" --bin-dir "$BIN_OUT" \
     --candidate-receipt "$CANDIDATE_RECEIPT" \
     --binary-list "$STAGE_REV/candidate-ignored.txt" --curation "$STAGE_REV/curation.txt" \
     --bpfmulti-list "$STAGE_REV/bpfmulti-list.txt" > "$stage/preparation.json" || return 1
@@ -509,8 +573,11 @@ run_one() {
       SUDO_UID="$(id -u)" SUDO_GID="$(id -g)" SUDO_USER="$(id -un)" \
       bash "$stage/inner.sh" > "$stage/vng-console.log" 2>&1
   else
+    # --overlay-rwdir /boot makes ONLY the guest's /boot writable (overlay
+    # upper on tmpfs, discarded at exit; host /boot untouched) so inner.sh
+    # can install the staged lane kernel config the product requires.
     flock "$LOCK" timeout -k 60 "$TIMEOUT" vng --run "$k" --user root --cpus 4 \
-      --memory 6G --rwdir "$stage" --exec "bash '$stage/inner.sh'" > "$stage/vng-console.log" 2>&1
+      --memory 6G --rwdir "$stage" --overlay-rwdir /boot --exec "bash '$stage/inner.sh'" > "$stage/vng-console.log" 2>&1
   fi
   vng_exit=$?
   end=$(date +%s); wall=$((end-start))

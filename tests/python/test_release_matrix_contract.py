@@ -90,6 +90,20 @@ class MatrixContract(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix="matrix-contract-")
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name)
+        # Controlled vng kernel cache: preparation resolves the lane config
+        # from $HOME, so tests point HOME at a fixture tree (restored after).
+        self.osrelease = "6.1.188-0601188-generic"
+        boot = self.base / "home/.cache/virtme-ng/v6.1.188/amd64/boot"
+        boot.mkdir(parents=True)
+        (boot / ("config-" + self.osrelease)).write_text("CONFIG_CONTROLLED_GUESTENV=y\n")
+        previous_home = os.environ.get("HOME")
+        os.environ["HOME"] = str(self.base / "home")
+        def restore_home():
+            if previous_home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = previous_home
+        self.addCleanup(restore_home)
         self.stage = self.base / "stage"
         self.stage.mkdir()
         self.bins = self.base / "bins"
@@ -105,14 +119,14 @@ class MatrixContract(unittest.TestCase):
         self.bm_list.write_text(f"{PID_TEST}: test\n1 test, 0 benchmarks\n")
         self.contract = self.stage / "contract.json"
         result = command(sys.executable, "-I", str(CHECKER), "--prepare", str(self.stage),
-                         "--lane", "6.1.188", "--bin-dir", str(self.bins),
+                         "--lane", "6.1.188", "--kernel", "v6.1.188", "--bin-dir", str(self.bins),
                          "--binary-list", str(self.listing), "--curation", str(self.curation),
                          "--bpfmulti-list", str(self.bm_list),
                          "--candidate-receipt", str(self.candidate),
                          "--lib-test", LIB_A, "--lib-test", LIB_B)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.run_id = json.loads(self.contract.read_text())["run_id"]
-        self.write("uname.txt", "6.1.188\n")
+        self.write("uname.txt", self.osrelease + "\n")
         self.log("version.log", "p11scope 0.4.0\n", "version", 0)
         self.log("doctor.log", "capability tier: T4\nuprobe-multi attach (own libc) .... ok self-link attached and detached\n", "doctor", 0)
         self.log("qual.log", "SUMMARY pass=10 fail=0 nonqualifying=3\n", "qual", 2)
@@ -186,7 +200,9 @@ class MatrixContract(unittest.TestCase):
         for path in ("inputs/ignored.txt", "inputs/curation.txt"):
             core["bindings"][path] = hashlib.sha256((self.stage / path).read_bytes()).hexdigest()
         self.contract.write_text(json.dumps(core) + "\n")
-        self.write("uname.txt", "5.15.221\n")
+        # The synthetic 5.15 contract carries the fixture boot binding, so
+        # the executed kernel must match the carried osrelease exactly.
+        self.write("uname.txt", core["expected_osrelease"] + "\n")
         self.write("run/results.txt", f"PASS {DENIAL} rc=0 seconds=1 :: test result: ok. 1 passed\n")
         self.write("run/logs/" + DENIAL.split("::")[-1] + ".log", f"running 1 test\ntest {DENIAL} ... {diagnostic}\nok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n")
         self.seal()
@@ -457,7 +473,7 @@ class MatrixContract(unittest.TestCase):
         stage = self.base / "clone-stage"
         receipt = candidate_receipt(self.bins, self.base / "clone-build.json", repo)
         result = command(sys.executable, "-I", str(repo / "scripts" / CHECKER.name), "--prepare", str(stage),
-                         "--lane", "host", "--bin-dir", str(self.bins), "--binary-list", str(self.listing),
+                         "--lane", "host", "--kernel", "host", "--bin-dir", str(self.bins), "--binary-list", str(self.listing),
                          "--curation", str(self.curation), "--bpfmulti-list", str(self.bm_list),
                          "--candidate-receipt", str(receipt), "--lib-test", LIB_A)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -496,7 +512,7 @@ class MatrixContract(unittest.TestCase):
 
     def test_prebuilt_candidate_without_build_root_receipt_is_refused(self):
         result = command(sys.executable, "-I", str(CHECKER), "--prepare", str(self.base / "no-build-receipt"),
-                         "--lane", "host", "--bin-dir", str(self.bins), "--binary-list", str(self.listing),
+                         "--lane", "host", "--kernel", "host", "--bin-dir", str(self.bins), "--binary-list", str(self.listing),
                          "--curation", str(self.curation), "--bpfmulti-list", str(self.bm_list), "--lib-test", LIB_A)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
 
@@ -509,7 +525,7 @@ class MatrixContract(unittest.TestCase):
             with self.subTest(mutation=mutation):
                 self.candidate.write_text(json.dumps(dict(original, **mutation)) + "\n")
                 result = command(sys.executable, "-I", str(CHECKER), "--prepare", str(self.base / ("invalid-build-" + str(index))),
-                                 "--lane", "host", "--bin-dir", str(self.bins), "--binary-list", str(self.listing),
+                                 "--lane", "host", "--kernel", "host", "--bin-dir", str(self.bins), "--binary-list", str(self.listing),
                                  "--curation", str(self.curation), "--bpfmulti-list", str(self.bm_list),
                                  "--candidate-receipt", str(self.candidate), "--lib-test", LIB_A)
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
@@ -523,7 +539,7 @@ class MatrixContract(unittest.TestCase):
         self.listing.write_text(CHURN + ": test\n")
         self.curation.write_text(f"default (1)\n{CHURN}\nlong (0, --include-long only)\nskipped (0)\nverify: curation matches the binary (1 tests)\n")
         stage = self.base / "compiled-root-stage"
-        result = command(sys.executable, "-I", str(CHECKER), "--prepare", str(stage), "--lane", "host",
+        result = command(sys.executable, "-I", str(CHECKER), "--prepare", str(stage), "--lane", "host", "--kernel", "host",
                          "--bin-dir", str(self.bins), "--binary-list", str(self.listing), "--curation", str(self.curation),
                          "--bpfmulti-list", str(self.bm_list), "--candidate-receipt", str(receipt), "--lib-test", CHURN)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -733,7 +749,7 @@ class MatrixContract(unittest.TestCase):
         stage = self.base / "guest-stage"
         receipt = candidate_receipt(self.bins, self.base / "guest-build.json", repo)
         result = command(sys.executable, "-I", str(repo / "scripts" / CHECKER.name), "--prepare", str(stage),
-                         "--lane", "host", "--bin-dir", str(self.bins), "--binary-list", str(self.listing),
+                         "--lane", "host", "--kernel", "host", "--bin-dir", str(self.bins), "--binary-list", str(self.listing),
                          "--curation", str(self.curation), "--bpfmulti-list", str(self.bm_list),
                          "--candidate-receipt", str(receipt),
                          "--lib-test", LIB_A, "--lib-test", LIB_B)
@@ -804,7 +820,185 @@ class MatrixContract(unittest.TestCase):
         self.seal(); self.reject()
 
     def test_wrong_kernel_lane_fails(self):
-        self.write("uname.txt", "6.6.157\n"); self.seal(); self.reject()
+        # Another lane, the short lane tag (never a real `uname -r`), and a
+        # tampered osrelease all fail: only the bound osrelease qualifies.
+        for uname in ("6.6.157\n", "6.1.188\n", self.osrelease + "-tampered\n"):
+            with self.subTest(uname=uname):
+                self.write("uname.txt", uname); self.seal(); self.reject()
+
+    def prepare_attempt(self, label, lane, kernel, extra=()):
+        stage = self.base / ("attempt-" + label)
+        argv = [sys.executable, "-I", str(CHECKER), "--prepare", str(stage),
+               "--lane", lane, "--bin-dir", str(self.bins),
+               "--binary-list", str(self.listing), "--curation", str(self.curation),
+               "--bpfmulti-list", str(self.bm_list),
+               "--candidate-receipt", str(self.candidate),
+               "--lib-test", LIB_A, "--lib-test", LIB_B]
+        if kernel is not None:
+            argv += ["--kernel", kernel]
+        return stage, command(*(argv + list(extra)))
+
+    def make_cache(self, tag, files):
+        boot = self.base / ("home/.cache/virtme-ng/" + tag + "/amd64/boot")
+        boot.mkdir(parents=True, exist_ok=True)
+        for name in files:
+            (boot / name).write_text("controlled " + name + "\n")
+        return boot
+
+    def test_prepare_stages_lane_boot_config_and_binds_osrelease(self):
+        contract = json.loads(self.contract.read_text())
+        guest = contract["guest_boot_config"]
+        self.assertEqual(guest["osrelease"], self.osrelease)
+        self.assertEqual(contract["expected_osrelease"], self.osrelease)
+        self.assertTrue(guest["source"].endswith("config-" + self.osrelease))
+        staged = self.stage / "inputs/boot-config"
+        self.assertEqual(staged.read_bytes(), (self.base / ("home/.cache/virtme-ng/v6.1.188/amd64/boot/config-" + self.osrelease)).read_bytes())
+        self.assertEqual(guest["sha256"], hashlib.sha256(staged.read_bytes()).hexdigest())
+        self.assertEqual(contract["bindings"]["inputs/boot-config"], guest["sha256"])
+
+    def test_prepare_refuses_unknown_kernel_layouts(self):
+        odd = self.base / "oddboot"; odd.mkdir()
+        (odd / "6.1.188").write_text("not a vmlinuz name\n")
+        empty = self.base / "emptyboot"; empty.mkdir()
+        (empty / "vmlinuz-6.1.188").write_text("controlled vmlinuz\n")
+        self.make_cache("v6.12.111", ["config-ambiguous-a", "config-ambiguous-b"])
+        self.make_cache("v7.2.6", ["vmlinuz-7.2.6-x"])
+        cases = (
+            ("missing-kernel", "6.1.188", None, "prepare requires --kernel"),
+            ("host-kernel-guest-lane", "6.1.188", "host", "guest lane requires a guest --kernel"),
+            ("guest-kernel-host-lane", "host", "v6.1.188", "host lane requires --kernel host"),
+            ("unresolved-alias", "6.1.188", "6.1", "kernel does not match lane"),
+            ("bogus", "6.1.188", "bogus", "kernel does not match lane"),
+            ("lane-mismatch", "6.1.188", "v6.6.157", "kernel does not match lane"),
+            ("missing-cache", "6.6.157", "v6.6.157", "missing vng kernel cache"),
+            ("ambiguous-config", "6.12.111", "v6.12.111", "missing/ambiguous lane kernel config"),
+            ("zero-config", "7.2.6", "v7.2.6", "missing/ambiguous lane kernel config"),
+            ("missing-vmlinuz", "6.1.188", "/nonexistent-xyz/boot/vmlinuz-6.1.188", "missing explicit lane vmlinuz"),
+            ("not-vmlinuz-name", "6.1.188", str(odd / "6.1.188"), "unknown explicit kernel layout"),
+            ("empty-bootdir", "6.1.188", str(empty / "vmlinuz-6.1.188"), "missing/ambiguous lane kernel config"),
+        )
+        for label, lane, kernel, message in cases:
+            with self.subTest(label=label):
+                _, result = self.prepare_attempt(label, lane, kernel)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(message, result.stdout)
+
+    def test_prepare_accepts_explicit_vmlinuz_lane(self):
+        boot = self.base / "fake68/boot"; boot.mkdir(parents=True)
+        (boot / "vmlinuz-6.8.0-142-generic").write_text("controlled vmlinuz\n")
+        (boot / "config-6.8.0-142-generic").write_text("CONFIG_CONTROLLED_68=y\n")
+        stage, result = self.prepare_attempt("explicit68", "6.8.0-142-generic", str(boot / "vmlinuz-6.8.0-142-generic"))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        contract = json.loads((stage / "contract.json").read_text())
+        self.assertEqual(contract["expected_osrelease"], "6.8.0-142-generic")
+        self.assertEqual(contract["guest_boot_config"]["osrelease"], "6.8.0-142-generic")
+        self.assertEqual((stage / "inputs/boot-config").read_text(), "CONFIG_CONTROLLED_68=y\n")
+
+    def test_host_prepare_stages_no_boot_config(self):
+        stage, result = self.prepare_attempt("hostboot", "host", "host")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        contract = json.loads((stage / "contract.json").read_text())
+        self.assertIsNone(contract["guest_boot_config"])
+        self.assertIsNone(contract["expected_osrelease"])
+        self.assertFalse((stage / "inputs/boot-config").exists())
+
+    def test_tampered_boot_binding_fails(self):
+        def tampered(label, mutate):
+            fresh = self.base / ("boot-red-" + label)
+            shutil.copytree(self.stage, fresh)
+            contract_path = fresh / "contract.json"
+            contract = json.loads(contract_path.read_text())
+            mutate(fresh, contract)
+            contract_path.write_text(json.dumps(contract) + "\n")
+            return fresh, contract_path
+        mutations = (
+            ("drop-binding", lambda fresh, contract: contract["bindings"].pop("inputs/boot-config"),
+             "missing staged guest boot config binding"),
+            ("sha-drift", lambda fresh, contract: contract["guest_boot_config"].update({"sha256": "0" * 64}),
+             "guest boot config binding drift"),
+            ("empty-osrelease", lambda fresh, contract: contract["guest_boot_config"].update({"osrelease": ""}),
+             "invalid guest boot osrelease"),
+            ("expected-drift", lambda fresh, contract: contract.update({"expected_osrelease": "tampered"}),
+             "guest osrelease binding drift"),
+            ("drop-guest", lambda fresh, contract: contract.update({"guest_boot_config": None}),
+             "missing guest boot config binding"),
+        )
+        for label, mutate, message in mutations:
+            with self.subTest(label=label):
+                fresh, contract_path = tampered(label, mutate)
+                verify = command(sys.executable, "-I", str(CHECKER), "--verify-inputs", str(fresh),
+                                 "--contract", str(contract_path))
+                self.assertEqual(verify.returncode, 1, verify.stdout + verify.stderr)
+                self.assertIn(message, verify.stdout)
+        with self.subTest(label="staged-bytes"):
+            fresh = self.base / "boot-red-staged-bytes"
+            shutil.copytree(self.stage, fresh)
+            (fresh / "inputs/boot-config").write_text("tampered bytes\n")
+            verify = command(sys.executable, "-I", str(CHECKER), "--verify-inputs", str(fresh),
+                             "--contract", str(fresh / "contract.json"))
+            self.assertEqual(verify.returncode, 1, verify.stdout + verify.stderr)
+            self.assertIn("stale artifact hash: inputs/boot-config", verify.stdout)
+
+    def test_inner_renders_guest_boot_install_for_guest_lane(self):
+        result = command(str(RUNNER), "--write-inner-stage", str(self.stage), "--contract", str(self.contract))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        text = (self.stage / "inner.sh").read_text()
+        self.assertIn("GUEST_BOOT=1", text)
+        self.assertIn("BOOT_OSRELEASE=" + self.osrelease, text)
+        self.assertIn('if [ "$GUEST_BOOT" = 1 ]; then', text)
+        self.assertIn('"$OSRELEASE" = "$BOOT_OSRELEASE"', text)
+        self.assertIn('cp -f "$STAGE/inputs/boot-config" "$BOOT_TARGET"', text)
+        self.assertIn("/boot/config-$OSRELEASE", text)
+        self.assertIn("sha256sum -c", text)
+
+    def test_inner_leaves_host_boot_untouched(self):
+        stage, result = self.prepare_attempt("hostinner", "host", "host")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        result = command(str(RUNNER), "--write-inner-stage", str(stage), "--contract", str(stage / "contract.json"))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        text = (stage / "inner.sh").read_text()
+        self.assertIn("GUEST_BOOT=0", text)
+        self.assertNotIn("BOOT_SHA=", text)
+        self.assertNotIn("BOOT_OSRELEASE=", text)
+
+    def test_inner_uses_guest_local_storage_for_outputs_and_native_base(self):
+        result = command(str(RUNNER), "--write-inner-stage", str(self.stage), "--contract", str(self.contract))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        text = (self.stage / "inner.sh").read_text()
+        for literal in ("mktemp -d /tmp/p11scope-matrix-local", "copy_back()", "copy_tree_back()",
+                        '-o "$local_json"', 'copy_back "$local_json" "$WORK/backend/inv-$scope.json"',
+                        "mktemp -d /tmp/p11scope-c8native", "mktemp -d /tmp/p11scope-c8scan",
+                        '--base "$NATIVE_BASE"', '--base "$SCAN_BASE"',
+                        'copy_tree_back "$NATIVE_BASE" "$WORK/c8-native"',
+                        'copy_tree_back "$SCAN_BASE" "$WORK/c8-scan"'):
+            with self.subTest(literal=literal):
+                self.assertIn(literal, text)
+        for stale in ('-o "$WORK/backend/inv-$scope.json"', '--base "$WORK/c8-native"', '--base "$WORK/c8-scan"'):
+            with self.subTest(stale=stale):
+                self.assertNotIn(stale, text)
+
+    def test_public_cli_redirects_product_outputs_but_not_the_fifo_probe(self):
+        text = (ROOT / "scripts/qualify-public-cli.sh").read_text()
+        for literal in ("mktemp -d /tmp/p11scope-cli-local", "copy_back()",
+                        "o_share+=(", 'args[$((idx + 1))]="${o_local[',
+                        '-o "$sig2_local"', '-o "$run_local"', '-o "$sig_local"',
+                        'copy_back "${o_local[$pair]}" "${o_share[$pair]}"',
+                        'copy_back "$sig2_local" "$OUT/sigint2.json"',
+                        'copy_back "$run_local" "$OUT/$cell.json"',
+                        'copy_back "$sig_local" "$OUT/sigint.json"'):
+            with self.subTest(literal=literal):
+                self.assertIn(literal, text)
+        # The refusal probe keeps its share FIFO target; the fixture builds
+        # keep their compiler outputs.
+        self.assertIn('-o "$OUT/fifo"', text)
+        self.assertIn('gcc -O1 -o "$FIX/gated"', text)
+        self.assertNotIn('-o "$OUT/sigint2.json"', text)
+        self.assertNotIn('-o "$OUT/sigint.json"', text)
+
+    def test_vng_guest_gets_boot_overlay_and_kernel_binding(self):
+        text = (ROOT / "scripts/qualify-release-matrix.sh").read_text()
+        self.assertIn("--overlay-rwdir /boot", text)
+        self.assertIn('--prepare "$stage" --lane "$lane" --kernel "$k"', text)
 
     def test_retained_public_artifact_is_hash_bound(self):
         self.write("cells/profile-pid.json", '{"controlled":"first"}\n')
@@ -833,7 +1027,7 @@ class MatrixContract(unittest.TestCase):
 
     def preparation_rejected(self):
         result = command(sys.executable, "-I", str(CHECKER), "--prepare", str(self.base / "invalid-stage"),
-                         "--lane", "6.1.188", "--bin-dir", str(self.bins),
+                         "--lane", "6.1.188", "--kernel", "v6.1.188", "--bin-dir", str(self.bins),
                          "--binary-list", str(self.listing), "--curation", str(self.curation),
                          "--bpfmulti-list", str(self.bm_list), "--candidate-receipt", str(self.candidate),
                          "--lib-test", LIB_A, "--lib-test", LIB_B)
@@ -842,7 +1036,7 @@ class MatrixContract(unittest.TestCase):
     def test_qualifying_selected_subset_may_pass_only_its_claim(self):
         fresh = self.base / "subset"
         result = command(sys.executable, "-I", str(CHECKER), "--prepare", str(fresh),
-                         "--lane", "6.1.188", "--bin-dir", str(self.bins),
+                         "--lane", "6.1.188", "--kernel", "v6.1.188", "--bin-dir", str(self.bins),
                          "--binary-list", str(self.listing), "--curation", str(self.curation),
                          "--bpfmulti-list", str(self.bm_list), "--lib-test", LIB_A,
                          "--candidate-receipt", str(self.candidate),

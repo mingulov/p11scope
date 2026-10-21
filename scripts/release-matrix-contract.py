@@ -304,12 +304,37 @@ def membership(stage, contract):
     require(PID_TEST in listed_names((stage / "inputs/bpfmulti-list.txt").read_text()), "missing exact PID-filter binary selector")
 
 
+def guest_boot_config(kernel):
+    """Resolve the lane kernel's config from the host vng cache (F3).
+
+    Version tags map to ~/.cache/virtme-ng/<tag>/amd64/boot/; an explicit
+    vmlinuz path resolves to its own directory. Exactly one config-*
+    file must exist; anything else is an unknown layout and refused.
+    Returns (config_path, osrelease).
+    """
+    if os.path.isabs(kernel):
+        vmlinuz = Path(kernel)
+        require(vmlinuz.is_file(), "missing explicit lane vmlinuz: " + kernel)
+        require(vmlinuz.name.startswith("vmlinuz-"), "unknown explicit kernel layout: " + kernel)
+        bootdir = vmlinuz.parent
+    else:
+        require(re.fullmatch(r"v\d+\.\d+\.\d+", kernel) is not None, "unknown lane kernel layout: " + kernel)
+        bootdir = Path.home() / ".cache/virtme-ng" / kernel / "amd64/boot"
+        require(bootdir.is_dir(), "missing vng kernel cache: " + str(bootdir))
+    configs = sorted(path for path in bootdir.iterdir() if path.is_file() and path.name.startswith("config-"))
+    require(len(configs) == 1, "missing/ambiguous lane kernel config in " + str(bootdir))
+    osrelease = configs[0].name.removeprefix("config-")
+    require(osrelease and "/" not in osrelease, "invalid lane kernel osrelease")
+    return configs[0], osrelease
+
+
 def prepare(args):
     stage = args.prepare.resolve()
     stage.mkdir(parents=True, exist_ok=True)
     require(not (stage / "contract.json").exists(), "refuse to overwrite an execution contract")
     core = selection(args.lane, args.lib_test, args.public_cell, not args.without_scan)
     core["run_id"] = uuid.uuid4().hex
+    require(args.kernel, "prepare requires --kernel")
     bindings = {}
     sources = {"inputs/ignored.txt": args.binary_list, "inputs/curation.txt": args.curation,
                "inputs/bpfmulti-list.txt": args.bpfmulti_list}
@@ -317,6 +342,16 @@ def prepare(args):
     require(args.candidate_receipt is not None, "prebuilt candidate requires a build-produced source-root receipt")
     candidate = validate_candidate(load(args.candidate_receipt), args.bin_dir / "p11scope-lib")
     sources["inputs/candidate-build.json"] = args.candidate_receipt
+    if core["lane"] == "host":
+        require(args.kernel == "host", "host lane requires --kernel host")
+        core["guest_boot_config"] = None
+        core["expected_osrelease"] = None
+    else:
+        require(args.kernel != "host", "guest lane requires a guest --kernel")
+        tag = os.path.basename(args.kernel).removeprefix("vmlinuz-")
+        require(tag.removeprefix("v") == core["lane"], "kernel does not match lane: " + args.kernel)
+        config_path, osrelease = guest_boot_config(args.kernel)
+        sources["inputs/boot-config"] = config_path
     for name in RUNTIME_SOURCES:
         sources["artifacts/lib-source/" + name] = Path(candidate["source_root"]) / name
     sources.update({"artifacts/" + name: args.bin_dir / name for name in
@@ -333,6 +368,10 @@ def prepare(args):
         shutil.copy2(origin, path)
         bindings[name] = sha(path)
     core["bindings"] = bindings
+    if core["lane"] != "host":
+        core["guest_boot_config"] = {"source": str(config_path), "sha256": bindings["inputs/boot-config"],
+                                     "osrelease": osrelease}
+        core["expected_osrelease"] = osrelease
     membership(stage, core)
     save(stage / "contract.json", core)
     print(json.dumps({"contract": str(stage / "contract.json"), "sha256": sha(stage / "contract.json")}))
@@ -556,6 +595,16 @@ def verify_inputs(stage, contract_path):
     candidate = validate_candidate(load(stage / "inputs/candidate-build.json"), stage / "artifacts/p11scope-lib")
     for name, digest in candidate["runtime_sources"].items():
         require(bindings["artifacts/lib-source/" + name] == digest, "compiled fixture snapshot does not match build receipt")
+    if contract["lane"] == "host":
+        require(contract.get("guest_boot_config") is None, "host lane must not stage a guest boot config")
+        require(contract.get("expected_osrelease") is None, "host lane must not bind a guest osrelease")
+    else:
+        require("inputs/boot-config" in bindings, "missing staged guest boot config binding")
+        guest = contract.get("guest_boot_config")
+        require(isinstance(guest, dict), "missing guest boot config binding")
+        require(guest.get("sha256") == bindings["inputs/boot-config"], "guest boot config binding drift")
+        require(isinstance(guest.get("osrelease"), str) and guest["osrelease"], "invalid guest boot osrelease")
+        require(contract.get("expected_osrelease") == guest["osrelease"], "guest osrelease binding drift")
     membership(stage, contract)
     return contract
 
@@ -571,7 +620,11 @@ def judge(stage, contract_path):
     for name, digest in hashes.items():
         require(sha(relative(stage, name)) == digest, "stale evidence hash: " + name)
     read = lambda name: relative(stage, name).read_text()
-    require(contract["lane"] == "host" or read("uname.txt").strip().removeprefix("v") == contract["lane"], "wrong executed kernel lane")
+    # Guest lanes pin the exact executed kernel: the short lane tag never
+    # equals a real `uname -r` (e.g. 5.15.221 vs 5.15.221-0515221-generic),
+    # so the judge matches the full osrelease bound at preparation.
+    require(contract["lane"] == "host" or read("uname.txt").strip() == contract["expected_osrelease"],
+            "wrong executed kernel lane")
     exits = {name: process_exit(read(path), name, contract["run_id"]) for path, name in EXITS.items()}
     if contract["include_scan"]:
         exits["inv_scan"] = process_exit(read("inv-scan.log"), "inv_scan", contract["run_id"])
@@ -673,6 +726,7 @@ def main(argv=None):
     modes.add_argument("--verify-launch-policy", action="store_true")
     parser.add_argument("--contract", type=Path)
     parser.add_argument("--lane", default="host")
+    parser.add_argument("--kernel", default=None)
     parser.add_argument("--lib-test", action="append")
     parser.add_argument("--public-cell", action="append")
     parser.add_argument("--without-scan", action="store_true")

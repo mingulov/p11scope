@@ -393,8 +393,12 @@ def shell_wait_failure(directory, mode):
     shell = (ROOT / 'scripts/verify-canaries.sh').read_text()
     def function(name):
         return shell.split(name + '() {', 1)[1].split('\n}\n', 1)[0].join((name + '() {', '\n}\n'))
+    attributes = [line.split('=', 1)[1] for line in shell.splitlines()
+                  if line.startswith('OBJECT_ATTRIBUTES=')]
+    assert len(attributes) == 1 and attributes[0] in ('present', 'absent'), attributes
     program = ('set -eu\nWORK=' + str(directory) + '\n'
         'WPID=\nWORKLOAD_STARTTIME=\nTARGET_BITS=64\n'
+        'OBJECT_ATTRIBUTES=' + attributes[0] + '\n'
         'P11SCOPE_DEFAULT=/bin/true\nP11SCOPE_FEATURE=/bin/true\n'
         'TASK_STORAGE_READER=/bin/true\nTASK_STORAGE_OBJECT=/bin/true\n'
         'process_starttime() { echo 1; }\n'
@@ -1654,6 +1658,37 @@ class StoppedCanaryCaptureTests(unittest.TestCase):
             external = capture.parse_args(base + ['--workload-pid', str(os.getpid()), '--generation', '1',
                                                    '--'] + config.observer_args)
             self.assertEqual(external.workload_origin, 'external')
+
+    def test_object_attributes_cli_defaults_present_and_refuses_unknown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = owned_config(os.getpid(), directory, 'ready_first', str(self.program), str(self.matrix))
+            base = []
+            for name in ('lane', 'variant', 'mode', 'privacy', 'workload_mode', 'out_dir', 'prefix',
+                         'ready', 'go', 'done', 'finish', 'observer_log', 'workload_log', 'reader', 'obj',
+                         'target_bits'):
+                base += ['--' + name.replace('_', '-'), str(getattr(config, name))]
+            default = capture.parse_args(base + ['--workload-origin', 'owned', '--'] + config.observer_args)
+            self.assertEqual(default.object_attributes, 'present')
+            stub = capture.parse_args(base + ['--workload-origin', 'owned', '--object-attributes', 'absent',
+                                              '--'] + config.observer_args)
+            self.assertEqual(stub.object_attributes, 'absent')
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as raised:
+                    capture.parse_args(base + ['--object-attributes', 'bogus', '--'] + config.observer_args)
+                self.assertEqual(raised.exception.code, 2)
+
+    def test_run_applies_object_attributes_to_evidence(self):
+        capture.evidence.set_object_attributes('present')
+        self.addCleanup(capture.evidence.set_object_attributes, 'present')
+        with tempfile.TemporaryDirectory() as directory:
+            config = config_for(os.getpid(), directory)
+            config.object_attributes = 'absent'
+            config.ready.write_bytes(b'stale READY')
+            with patch.object(c.Custody, 'launch') as launched:
+                with self.assertRaises(capture.CaptureError):
+                    capture.capture(config, FakeMaps(config))
+                launched.assert_not_called()
+            self.assertTrue(capture.evidence.object_attributes_absent())
 
     def test_profile_readiness_accepts_attach_complete_without_live_frame(self):
         # The live frame is TTY-only (src/run.rs LiveDisplay): on the canary's

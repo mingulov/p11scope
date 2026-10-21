@@ -896,6 +896,35 @@ def ring_raw_path(prefix, name):
     return Path(f"{prefix}.{name}.raw")
 
 
+# Object-attributes capture mode. `present` is the FULL build: inspected
+# six-field lists wherever the workload's templates authorize capture.
+# `absent` is the P0-only `stub-object-attributes` build: entry acquires
+# nothing, so stopped side rows keep allocated-zero attribute state, while
+# completion tails mark every descriptor-present pair UNINSPECTED at
+# emission (never an all-zero list passed off as inspected). Absent mode
+# flips ONLY the attribute-value expectations below; every count, shape,
+# ledger, ring, control-cell and roster assertion stays exactly as-is, so
+# an empty or unrun capture still refuses.
+OBJECT_ATTRIBUTE_MODES = ("present", "absent")
+_OBJECT_ATTRIBUTES = "present"
+# The honest never-inspected 36-byte list: 32 zero cells plus the
+# (inspected=0, flags=0x10) marker the tail validator accepts.
+OBJECT_ATTR_UNINSPECTED = bytes(32) + bytes((0, 0x10, 0, 0))
+
+
+def set_object_attributes(mode):
+    """Select the object-attributes capture mode; unknown modes refuse."""
+    global _OBJECT_ATTRIBUTES
+    if mode not in OBJECT_ATTRIBUTE_MODES:
+        raise ValueError(f"unknown object-attributes mode: {mode!r}")
+    _OBJECT_ATTRIBUTES = mode
+
+
+def object_attributes_absent():
+    """True when the stub build's zero/uninspected attribute bytes are expected."""
+    return _OBJECT_ATTRIBUTES == "absent"
+
+
 # H7 slice D object cell: every named function in workload ledger order
 # with its completion session. Sessions are 0x601 plus the ledger
 # position; the blocked phase parks (Create, Pair, Find, Get) at
@@ -971,6 +1000,10 @@ def assert_object_completion_records(raw_records, lane, workload_pid):
         zero_list = bytes(36)
         public = object_canary_attributes((4, 16, 1, 32, 2048, 1))
         private = object_canary_attributes((2, 3, 0, 24, 4096, 2))
+        if object_attributes_absent():
+            # The stub emits no inspected values: descriptor-present pairs
+            # carry the honest UNINSPECTED marking, absent pairs stay zero.
+            public = private = OBJECT_ATTR_UNINSPECTED
         creation = ordinal in {20, 21, 58, 59, 61, 62}
         assert raw_tail[128:164] == (public if creation else zero_list), \
             (name, "requested0 six fields/absence")
@@ -1000,8 +1033,13 @@ def assert_object_completion_records(raw_records, lane, workload_pid):
                                    "layout": 2 if lane == "object-ia32" else 1, "flags": 0}
         tail = event["raw"][EVENT_SIZE:]
         assert tail[128:200] == bytes(72), (session, "Get has no requested values")
-        expected = (object_canary_attributes((4, 16, 1, 32, 2048, curve)) if curve is not None
-                    else bytes(32) + bytes((0, 16, 0, 0)))
+        if object_attributes_absent():
+            # The stub establishes no Get results at any return value; the
+            # tail keeps the fill's UNINSPECTED marking on all five returns.
+            expected = OBJECT_ATTR_UNINSPECTED
+        else:
+            expected = (object_canary_attributes((4, 16, 1, 32, 2048, curve)) if curve is not None
+                        else bytes(32) + bytes((0, 16, 0, 0)))
         assert tail[200:236] == expected, (session, "accepted Get results or unread refusal")
         assert (tail[112], u64(tail, 16)) == (1, 0x224), (session, "Get input")
 
@@ -1098,24 +1136,32 @@ def assert_object_side_rows(side_rows, starts, pointers, target_bits):
         allowed = bytearray(432)
         allowed[:24] = row["raw"][:24]
         struct.pack_into("<I4B", allowed, 24, index, layout, action, 0, 2)
+        stub = object_attributes_absent()
         if session == 0x501:
             struct.pack_into("<Q", allowed, 48, pointers["out_create"])
-            allowed[352:388] = object_canary_attributes((4, 16, 1, 32, 2048, 1))
+            if not stub:
+                allowed[352:388] = object_canary_attributes((4, 16, 1, 32, 2048, 1))
         elif session == 0x502:
             struct.pack_into("<QQ", allowed, 48, pointers["out_pub"], pointers["out_priv"])
-            allowed[352:388] = object_canary_attributes((4, 16, 1, 32, 2048, 1))
-            allowed[388:424] = object_canary_attributes((2, 3, 0, 24, 4096, 2))
+            if not stub:
+                allowed[352:388] = object_canary_attributes((4, 16, 1, 32, 2048, 1))
+                allowed[388:424] = object_canary_attributes((2, 3, 0, 24, 4096, 2))
         elif session == 0x503:
             struct.pack_into("<Q", allowed, 48, pointers["found"])
             struct.pack_into("<QQ", allowed, 80, 8, pointers["found_count"])
         else:
             width = target_bits // 8
             struct.pack_into("<Q", allowed, 32, 0x224)
-            struct.pack_into("<QQ", allowed, 64, pointers["template"], pointers["template"] + 24 * width)
-            allowed[424], allowed[430] = 1, 8
-            for slot, (pointer, capacity) in enumerate(zip(pointers["get_values"], (width, width, 1, width, width, 10))):
-                struct.pack_into("<QQQBBB5x", allowed, 96 + 32 * slot,
-                                 pointer, capacity, 0, slot + 1, slot, 0)
+            allowed[424] = 1
+            # Scalar input capture is ungated and stays asserted; only Get
+            # attribute retention (template base, slots, inspected count)
+            # is stub-absent, so those placements run on FULL only.
+            if not stub:
+                struct.pack_into("<QQ", allowed, 64, pointers["template"], pointers["template"] + 24 * width)
+                allowed[430] = 8
+                for slot, (pointer, capacity) in enumerate(zip(pointers["get_values"], (width, width, 1, width, width, 10))):
+                    struct.pack_into("<QQQBBB5x", allowed, 96 + 32 * slot,
+                                     pointer, capacity, 0, slot + 1, slot, 0)
         assert row["raw"] == bytes(allowed), (hex(session), "side row field/zero-neighbor mismatch")
 
 
@@ -1733,10 +1779,45 @@ def final_lane_artifacts(work, lane, surfaces, *, combined_log=False):
     return paths
 
 
+def extract_object_attributes(argv):
+    """Strip one optional `--object-attributes` flag, selecting its mode.
+
+    Accepts `--object-attributes=MODE` and `--object-attributes MODE` in
+    any position; an unknown mode refuses. Absent flag keeps `present`,
+    today's FULL behavior.
+    """
+    kept, mode = [], "present"
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == "--object-attributes":
+            index += 1
+            if index >= len(argv):
+                raise ValueError("--object-attributes requires a mode")
+            mode = argv[index]
+        elif token.startswith("--object-attributes="):
+            mode = token.removeprefix("--object-attributes=")
+        else:
+            kept.append(token)
+        index += 1
+    set_object_attributes(mode)
+    return kept
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else list(argv)
     if not argv:
-        print("usage: check-canary-evidence.py MODE ... BITS", file=sys.stderr)
+        print("usage: check-canary-evidence.py [--object-attributes=MODE] MODE ... BITS",
+              file=sys.stderr)
+        return 2
+    try:
+        argv = extract_object_attributes(argv)
+    except ValueError as error:
+        print(error, file=sys.stderr)
+        return 2
+    if not argv:
+        print("usage: check-canary-evidence.py [--object-attributes=MODE] MODE ... BITS",
+              file=sys.stderr)
         return 2
     if argv == ["--self-test"]:
         argv.append("64")
@@ -1763,6 +1844,18 @@ def main(argv=None):
 
 
     if work == "--self-test":
+        if object_attributes_absent():
+            print("--self-test asserts FULL bytes; it runs in present mode only",
+                  file=sys.stderr)
+            return 2
+        try:
+            set_object_attributes("bogus")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("unknown object-attributes mode was accepted")
+        print("object-attributes mode gate: OK")
+
         def reject(label, action):
             try:
                 action()

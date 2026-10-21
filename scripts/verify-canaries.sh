@@ -18,10 +18,20 @@ case $TARGET_BITS in
     *) echo "P11SCOPE_CANARY_TARGET_BITS must be 32 or 64" >&2; exit 2 ;;
 esac
 
+# Both observer builds below carry stub-object-attributes, so every lane
+# oracle runs in absent mode: stopped side rows keep zero attribute state
+# and completion tails mark present pairs UNINSPECTED. A FULL build would
+# need present here to match its inspected values.
+OBJECT_ATTRIBUTES=absent
+
 assert_lanes() {
     case ${1-} in
-        --hostile-starts|--fault-starts|--object-starts)
+        --hostile-starts|--fault-starts)
             sudo python3 -I scripts/check-canary-evidence.py "$@" "$TARGET_BITS"
+            ;;
+        --object-starts)
+            sudo python3 -I scripts/check-canary-evidence.py \
+                --object-attributes="$OBJECT_ATTRIBUTES" "$@" "$TARGET_BITS"
             ;;
         *) python3 -I scripts/check-canary-evidence.py "$@" "$TARGET_BITS" ;;
     esac
@@ -198,6 +208,7 @@ run_lane() {
         *) [ "$kind" = metrics ] && lane_privacy=aggregate-only || lane_privacy=allowlisted ;;
     esac
     sudo python3 -I scripts/capture-stopped-canary.py \
+        --object-attributes "$OBJECT_ATTRIBUTES" \
         --lane "$lane" --variant "$lane_variant" --mode "$kind" --privacy "$lane_privacy" \
         --target-bits "$TARGET_BITS" --workload-mode matrix \
         --workload-pid "$WPID" --generation "$WORKLOAD_STARTTIME" \
@@ -294,6 +305,7 @@ run_start_lane() {
         *) start_variant=diagnostic ;;
     esac
     sudo python3 -I scripts/capture-stopped-canary.py \
+        --object-attributes "$OBJECT_ATTRIBUTES" \
         --lane "$start_lane" --variant "$start_variant" --mode profile --privacy "$start_privacy" \
         --target-bits "$TARGET_BITS" --workload-mode "$start_mode" \
         --workload-pid "$WPID" --generation "$WORKLOAD_STARTTIME" \
@@ -380,6 +392,7 @@ run_object_cell() {
     test -f "$WORK/$object_lane.ready" || { echo "$object_lane workload never became ready"; exit 1; }
     object_completed_pid=$WPID
     sudo python3 -I scripts/capture-stopped-canary.py \
+        --object-attributes "$OBJECT_ATTRIBUTES" \
         --lane "$object_lane" --variant default --mode profile --privacy allowlisted \
         --target-bits "$TARGET_BITS" --workload-mode object \
         --workload-pid "$WPID" --generation "$WORKLOAD_STARTTIME" \
@@ -433,6 +446,7 @@ run_object_cell() {
         exit 1
     }
     sudo python3 -I scripts/capture-stopped-canary.py \
+        --object-attributes "$OBJECT_ATTRIBUTES" \
         --lane "$object_blocked_lane" --variant default --mode profile --privacy allowlisted \
         --target-bits "$TARGET_BITS" --workload-mode object-blocked \
         --workload-pid "$WPID" --generation "$WORKLOAD_STARTTIME" \
@@ -498,6 +512,7 @@ run_owned_lane() {
         "$WORK/canary_workload" "$WORK/matrix-provider.so" matrix \
         "$WORK/$owned_lane.ready" "$WORK/$owned_lane.go" "$WORK/$owned_lane.done" "$WORK/$owned_lane.finish"
     sudo python3 -I scripts/capture-stopped-canary.py \
+        --object-attributes "$OBJECT_ATTRIBUTES" \
         --lane "$owned_lane" --variant "$owned_variant" --mode metrics --privacy aggregate-only \
         --target-bits "$TARGET_BITS" --workload-mode matrix --workload-origin owned \
         --out-dir "$WORK" --prefix "$WORK/$owned_lane" \

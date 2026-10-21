@@ -241,13 +241,27 @@ static void remember_btf(int fd, const union bpf_attr *attr, int out)
 
 static int statistics(const char *text, size_t length, uint64_t *processed, uint64_t *limit)
 {
-    const char *found = strstr(text, "processed ");
-    unsigned long long a, b;
-    int consumed = 0;
-    if (!found || found >= text + length ||
-        sscanf(found, "processed %llu insns (limit %llu)%n", &a, &b, &consumed) != 2 ||
-        consumed <= 0 || found + consumed > text + length || strstr(found + consumed, "processed ") ||
-        a == 0 || b == 0 || a > UINT32_MAX || b > UINT32_MAX) return -1;
+    /* Kernels through 7.0 print one summary line; 7.2 prepends an `insns
+     * processed A+B+...` phase-breakdown line that never parses as a
+     * summary. Accept exactly one parseable summary wherever it sits, so
+     * a doubled summary still fails closed. */
+    const char *end = text + length;
+    const char *cursor = text;
+    unsigned long long a = 0, b = 0;
+    int found = 0;
+    while (cursor < end) {
+        const char *hit = strstr(cursor, "processed ");
+        if (!hit || hit >= end) break;
+        unsigned long long x, y;
+        int consumed = 0;
+        if (sscanf(hit, "processed %llu insns (limit %llu)%n", &x, &y, &consumed) == 2 &&
+            consumed > 0 && hit + consumed <= end &&
+            x != 0 && y != 0 && x <= UINT32_MAX && y <= UINT32_MAX) {
+            a = x; b = y; found++;
+        }
+        cursor = hit + 1;
+    }
+    if (found != 1) return -1;
     *processed = a; *limit = b;
     return 0;
 }
@@ -377,6 +391,10 @@ int main(int argc, char **argv)
     uint64_t a, b;
     const char *good = "verification time 17 usec\nstack depth 192+264\nprocessed 950000 insns (limit 1000000) max_states_per_insn 1\n";
     assert(statistics(good, strlen(good), &a, &b) == 0 && a == 950000 && b == 1000000);
+    /* 7.2 prepends a phase-breakdown line that never parses as a summary;
+     * the classic summary line still carries the counts. */
+    const char *good72 = "verification time 223322 usec\nstack depth 192+32 max 272\ninsns processed 22116+54+292+941+448+27\nprocessed 23878 insns (limit 1000000) max_states_per_insn 14 total_states 1969 peak_states 1882 mark_read 0\n";
+    assert(statistics(good72, strlen(good72), &a, &b) == 0 && a == 23878 && b == 1000000);
     const char *bad[] = {"", "processed 0 insns (limit 1000000)", "processed 1 insns (limit 0)",
         "processed 4294967296 insns (limit 1000000)", "processed 1 insns (limit 1000000",
         "processed 1 insns (limit 1000000) processed 2 insns (limit 1000000)"};

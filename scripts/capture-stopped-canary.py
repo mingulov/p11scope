@@ -977,6 +977,7 @@ class Coordinator:
         owned = False
         try:
             validate_config(self.config)
+            evidence.set_object_attributes(getattr(self.config, 'object_attributes', 'present'))
             self.signals.enter()
             self.owner = custody.Custody(cleanup_seconds=RESUME_SECONDS)
             self.owner.__enter__()
@@ -1108,6 +1109,8 @@ def parse_args(argv):
                  'ready', 'go', 'done', 'finish', 'observer-log', 'workload-log', 'reader', 'obj'):
         parser.add_argument('--' + name, required=True)
     parser.add_argument('--workload-origin', choices=('external', 'owned'), default='external')
+    parser.add_argument('--object-attributes', choices=('present', 'absent'), default='present',
+                        help='FULL capture expects inspected values; the stub build expects zero/uninspected bytes')
     parser.add_argument('--target-bits', required=True, type=int)
     for name in ('workload-pid', 'generation'):
         parser.add_argument('--' + name, type=int)

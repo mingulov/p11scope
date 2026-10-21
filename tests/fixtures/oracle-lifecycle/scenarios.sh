@@ -96,12 +96,18 @@ wait-query-error)
     foreign=$1
     recording_launcher_active() { RECORDED_LAUNCHER_STATE=unknown; return 2; }
     process_matches_starttime() { return 1; }
-    timeout --signal=KILL 1s sleep 30 & child=$!
+    # Direct self-bounding children, never a timeout(1) supervisor: if TERM
+    # lands while timeout is inside fork() it exits without forwarding and
+    # the orphaned sleep holds the capture pipes for its full lifetime,
+    # tripping the harness guard (CI run 39644844840). A bare `sleep 1`
+    # bounds a bare-wait product regression identically (the 0.75 s elapsed
+    # budget still fails) with no grandchild and no signal forwarding.
+    sleep 1 & child=$!
     start=$(process_starttime "$child")
     if oracle_wait_child "$child" "$start" 2; then wait_rc=0; else wait_rc=$?; fi
     kill "$child" 2>/dev/null || :
     wait "$child" 2>/dev/null || :
-    timeout --signal=KILL 1s sleep 30 & child=$!
+    sleep 1 & child=$!
     start=$(process_starttime "$child")
     if oracle_reap_child "$child" "$start" 2; then reap_rc=0; else reap_rc=$?; fi
     kill "$child" 2>/dev/null || :

@@ -7,7 +7,9 @@ versioned separately and are opaque, exact dispatch keys.
 
 ## [Unreleased]
 
-v0.4.0 development to date: `inventory --cgroup` scope, offline `inventory
+## [0.4.0] - 2026-10-21
+
+v0.4.0: `inventory --cgroup` scope, offline `inventory
 diff` comparison, inventory diagnostics, executable naming for trace and
 inspect output, opt-in caller cgroup metadata, explicit endpoint and
 identity-proof controls, and hardened final-output semantics. The

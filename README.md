@@ -11,14 +11,14 @@ table (including stripped providers with no `C_*` symbols), attaches probes by
 file offset, and produces a versioned `observed-profile.json` for migration
 assessment and incident diagnostics.
 
-> **Status: v0.3.0**, adds per-edge entry counts end to end to `inventory`
-> (which module is used by whom, counts included: scan and native lanes,
-> JSON/JSONL/dashboard), load-instance continuity, and sharded discovery
-> across `doctor`, `inspect` (now `--system`), `profile`
-> (including `--mode metrics`), `trace` and `run`. Read the
-> [known limitations](CHANGELOG.md#known-limitations) and
-> [docs/known-limitations.md](docs/known-limitations.md) before relying on
-> a capture; `--system` is a preview. The [v0.3.0 GitHub release notes](https://github.com/mingulov/p11scope/releases/tag/v0.3.0)
+> **Status: v0.4.0**, adds `inventory --cgroup` scope, offline `inventory
+> diff` comparison, inventory diagnostics, executable naming for trace and
+> inspect output, and hardened final-output semantics across `doctor`,
+> `inspect`, `profile`, `trace` and `run`. Object-attribute capture is not
+> enabled in v0.4.0 (P0-only release bytes; disclosed as structured
+> evidence). Read the [known limitations](CHANGELOG.md#known-limitations)
+> and [docs/known-limitations.md](docs/known-limitations.md) before relying
+> on a capture; `--system` is a preview. The [v0.4.0 GitHub release notes](https://github.com/mingulov/p11scope/releases/tag/v0.4.0)
 > identify tagged-artifact qualification and hosted CI;
 > [CHANGELOG.md](CHANGELOG.md#qualification-of-this-release) preserves
 > revision-specific pre-release evidence.
@@ -40,7 +40,7 @@ known limitations, [Install](#install) to build and install it, and
 [docs/usage.md](docs/usage.md) for the full operator's guide (privileges,
 kernel floor, overhead, and the evidence/completeness model — every
 quantitative claim there cites the script that measured it).
-The v0.3.0 user-facing limits live in
+The v0.4.0 user-facing limits live in
 [docs/known-limitations.md](docs/known-limitations.md).
 
 Saved inventories can be compared offline with
@@ -106,8 +106,8 @@ assets and local release-mode builds.
 
 ## Install
 
-p11scope v0.3.0 is distributed through the
-[GitHub release](https://github.com/mingulov/p11scope/releases/tag/v0.3.0)
+p11scope v0.4.0 is distributed through the
+[GitHub release](https://github.com/mingulov/p11scope/releases/tag/v0.4.0)
 as a static x86-64 Linux observer bundle, optional glibc and musl discovery
 helper bundles, and a source export. Download `SHA256SUMS` with the bundle you
 choose. The release also provides `RELEASE.json` with curated provenance;

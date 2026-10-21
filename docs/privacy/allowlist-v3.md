@@ -747,8 +747,9 @@ scan limitation. These receipts provide no trace-event naming authority.
 ## Object producer activation (H7 slice D, 2026-10-14)
 
 **Status: IMPLEMENTED the reviewed finite producer; H8 journal/bootstrap
-and H9 model delivery remain open, and no public object field is
-enabled.** This amendment records the reviewed read sites, retention
+and H9 model delivery remain open, and no public object field carries
+observed data** (`object_observations` is emitted only as an explicit
+unavailable marker while H9 is open). This amendment records the reviewed read sites, retention
 and honesty rules for the activated lane only. Every other section
 keeps its own status; v1/v2 bytes are unchanged.
 

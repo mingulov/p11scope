@@ -1093,8 +1093,11 @@ def seeded_start_contract(disassembly):
     blocks = D.function_blocks(split[".text"])
     require("memset" in blocks, "seeded START missing memset")
     memset = D.instructions(blocks["memset"])
+    # llvm-objdump 18 prints the stored sub-register as `r2`; 21 prints the
+    # same instruction bytes as `w2`. Accept both spellings: the loop shape
+    # (8 instructions, byte store, bounds) is what the contract pins.
     patterns = (r"if r3 == 0x0 goto .*", r"r4 = 0x0", r"r5 = r1", r"r5 \+= r4",
-                r"\*\(u8 \*\)\(r5 \+ 0x0\) = w2", r"r4 \+= 0x1", r"if r3 > r4 goto .*", r"exit")
+                r"\*\(u8 \*\)\(r5 \+ 0x0\) = (?:w2|r2)", r"r4 \+= 0x1", r"if r3 > r4 goto .*", r"exit")
     require(len(memset) == len(patterns) and all(re.fullmatch(pattern, instruction) for (_, instruction), pattern in zip(memset, patterns)),
             "seeded START memset byte-loop summary changed")
     _, graph = D.instruction_graph(blocks["memset"])

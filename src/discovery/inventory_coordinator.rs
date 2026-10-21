@@ -8853,10 +8853,22 @@ pub(crate) mod tests {
     struct LoweredFdLimit {
         saved: libc::rlimit,
         restored: bool,
+        // Held for the whole lowered window: the soft limit is
+        // process-global, so two twins lowering at once corrupt each
+        // other's window (and every sibling's fd opens). The guard
+        // serializes all lowerings suite-wide.
+        _serial: std::sync::MutexGuard<'static, ()>,
     }
+
+    static LOWERED_FD_LIMIT_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     impl LoweredFdLimit {
         fn lower_to(soft: libc::rlim_t) -> Self {
+            // A poisoned mutex still yields its guard: a failed twin
+            // must not wedge the rest of the suite.
+            let serial = LOWERED_FD_LIMIT_SERIAL
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let mut saved = libc::rlimit {
                 rlim_cur: 0,
                 rlim_max: 0,
@@ -8880,6 +8892,7 @@ pub(crate) mod tests {
             Self {
                 saved,
                 restored: false,
+                _serial: serial,
             }
         }
 

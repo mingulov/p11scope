@@ -238,10 +238,12 @@ class DualBuildCallerTests(unittest.TestCase):
                               env=environment, text=True, stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE, timeout=10)
 
-    def expected(self, child, bits, prepared):
+    def expected(self, child, bits, prepared, diagnose=False):
         prefix = ["build", "--locked", "--offline"] if prepared else [f"+{RELEASE_RUST}", "build", "--locked"]
         if child.name == "verify-attach-e2e.sh":
-            return [prefix + ["--release", "--workspace", "--target-dir", str(self.work / "build")]]
+            features = "skip-attribution,stub-object-attributes" if diagnose else "stub-object-attributes"
+            return [prefix + ["--release", "--workspace", "--features", features,
+                              "--target-dir", str(self.work / "build")]]
         rows = [
             prefix + ["--release", "--workspace", "--features", "stub-object-attributes",
                       "--target-dir", str(self.work / "default-build")],
@@ -255,9 +257,7 @@ class DualBuildCallerTests(unittest.TestCase):
         return rows
 
     def assert_builds(self, child, bits, prepared, diagnose=False):
-        expected = self.expected(child, bits, prepared)
-        if diagnose:
-            expected[0].extend(["--features", "skip-attribution"])
+        expected = self.expected(child, bits, prepared, diagnose)
         self.configure([0] * (len(expected) - 1) + [83])
         result = self.run_child(child, bits, prepared,
                                 ("--diagnose-skips",) if diagnose else ())

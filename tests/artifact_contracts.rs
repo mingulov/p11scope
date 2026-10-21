@@ -1922,6 +1922,22 @@ fn canary_builds_are_p0_only() {
     );
 }
 
+/// P0-only ship vehicle: the attach-e2e lane builds P0 bytes (with or
+/// without the skip-attribution diagnostic), so live attach
+/// qualification loads on 1M-budget kernels.
+#[test]
+fn attach_e2e_build_is_p0_only() {
+    let attach = read("scripts/verify-attach-e2e.sh");
+    assert!(
+        attach.contains("--features stub-object-attributes"),
+        "attach e2e build must shut the attribute gate"
+    );
+    assert!(
+        attach.contains("--features skip-attribution,stub-object-attributes"),
+        "attach e2e diagnose build must shut the attribute gate"
+    );
+}
+
 #[test]
 fn receipt_receipt_lane14_release_work_is_private_and_single_owner() {
     let release = read("scripts/build-release.sh");

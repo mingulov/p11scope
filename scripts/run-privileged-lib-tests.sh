@@ -61,9 +61,11 @@
 #
 # Curation: default tests run normally, long tests only with --include-long,
 # and static skips require their documented external prerequisites, with a
-# reason. Both modes verify the curation against the binary's own
-# `--list --ignored` output and refuse on drift, so a new ignored test can
-# never be silently dropped and a renamed one can never silently pass.
+# reason. The feature-alternative load gates contribute exactly one member
+# per binary (default vs stub-object-attributes builds). Both modes verify
+# the curation against the binary's own `--list --ignored` output and refuse
+# on drift, so a new ignored test can never be silently dropped and a
+# renamed one can never silently pass.
 set -uo pipefail
 
 PROG=${0##*/}
@@ -234,6 +236,16 @@ inventory::privileged_tests::privileged_native_lane_system_many_endpoints_lp64
 inventory::privileged_tests::privileged_native_lane_dashboard_slow_pty_lp64
 )
 
+# Feature-alternative load gates: exactly one exists per binary. Default
+# builds carry the FULL refusal classifier; stub-object-attributes builds
+# carry the stubbed load pin. The drift check tolerates a curated-but-absent
+# member only when its complement is present in the binary; run mode
+# executes whichever member the binary has, as a default-campaign cell.
+ALTERNATIVE_TESTS=(
+attach::tests::full_root_load_refusal_is_classified
+attach::tests::stubbed_roots_load
+)
+
 # Long campaign cells: run only with --include-long.
 LONG_TESTS=(
 attach::instance_tests::privileged_instance_continuity_experiment_softhsm
@@ -253,6 +265,10 @@ inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_s
 # real 3-round accelerated-cadence pilot (bounded 90 s each, same
 # prebuilt32-object fixture/seam as the wrap pair they calibrate).
 inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_pid_diagnostics_three_round_startup_probe_lp64
+# G21 short full-transition pilot (C=32/S=4, PID cell, diagnostics
+# enabled; bounded 540 s): settling, gap shapes vs the oracle, and footer
+# production at default cadence. Makes no wrap claim.
+inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_pid_diagnostics_transition_pilot_lp64
 inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_pid_diagnostics_three_round_accelerated_pilot_lp64
 # S cadence lanes: env-driven gate interval probe + default-pinned cost/control
 # (declared-cadence split; same fixture/seam as the short controls).
@@ -330,6 +346,11 @@ binary_ignored_list() {
         | sort -u
 }
 
+# True when the binary's ignored set contains the exact full path.
+binary_has_ignored() {
+    binary_ignored_list "$1" | grep -qxF "$2"
+}
+
 # Compare curation against the binary. Prints drift details to stderr and
 # returns 1 on any mismatch, so new tests cannot be silently dropped.
 check_curation() {
@@ -344,11 +365,33 @@ check_curation() {
     fi
     {
         printf '%s\n' "${DEFAULT_TESTS[@]}"
+        printf '%s\n' "${ALTERNATIVE_TESTS[@]}"
         printf '%s\n' "${LONG_TESTS[@]}"
         printf '%s\n' "${SKIP_TESTS[@]}"
     } | sort -u >"$cur_list"
     missing_bin=$(comm -13 "$bin_list" "$cur_list" || true)
     missing_cur=$(comm -23 "$bin_list" "$cur_list" || true)
+    # Feature-alternative load gates: tolerate a curated-but-absent member
+    # only when exactly one of the pair is present in the binary. A removed
+    # or renamed member still fails: zero present keeps the absent member in
+    # missing_bin, and a renamed member lands in missing_cur, never tolerated.
+    if [ -n "$missing_bin" ]; then
+        local alt_present=0 aname rest=
+        for aname in "${ALTERNATIVE_TESTS[@]}"; do
+            if grep -qxF "$aname" "$bin_list"; then alt_present=$((alt_present+1)); fi
+        done
+        while IFS= read -r aname; do
+            [ -z "$aname" ] && continue
+            local is_alt=0 alt
+            for alt in "${ALTERNATIVE_TESTS[@]}"; do
+                [ "$aname" = "$alt" ] && is_alt=1
+            done
+            if [ "$is_alt" -eq 1 ] && [ "$alt_present" -eq 1 ]; then continue; fi
+            if [ -z "$rest" ]; then rest=$aname; else rest="$rest
+$aname"; fi
+        done <<<"$missing_bin"
+        missing_bin=$rest
+    fi
     rm -rf "$workdir"
     if [ -n "$missing_bin" ] || [ -n "$missing_cur" ]; then
         local -a names
@@ -387,6 +430,8 @@ list_mode() {
             *) echo "$name" ;;
         esac
     done
+    echo "alternative (exactly one per binary)"
+    printf '%s\n' "${ALTERNATIVE_TESTS[@]}"
     echo "long (${#LONG_TESTS[@]}, --include-long only)"
     printf '%s\n' "${LONG_TESTS[@]}"
     echo "skipped (${#SKIP_TESTS[@]})"
@@ -394,7 +439,7 @@ list_mode() {
         echo "${SKIP_TESTS[$i]} :: ${SKIP_REASONS[$i]}"
     done
     if check_curation "$bin"; then
-        echo "verify: curation matches the binary ($(( ${#DEFAULT_TESTS[@]} + ${#LONG_TESTS[@]} + ${#SKIP_TESTS[@]} )) tests)"
+        echo "verify: curation matches the binary ($(( ${#DEFAULT_TESTS[@]} + 1 + ${#LONG_TESTS[@]} + ${#SKIP_TESTS[@]} )) tests, one alternative)"
         return 0
     fi
     return 1
@@ -467,6 +512,12 @@ main() {
             selected_runnable+=("$name")
         fi
     done
+    # Feature-alternative load gate: run whichever member this binary has.
+    for name in "${ALTERNATIVE_TESTS[@]}"; do
+        if binary_has_ignored "$bin" "$name" && selected "$name"; then
+            selected_runnable+=("$name")
+        fi
+    done
     if [ "$include_long" -eq 1 ]; then
         for name in "${LONG_TESTS[@]}"; do
             if selected "$name"; then
@@ -482,7 +533,7 @@ main() {
     # Every SELECTOR must match at least one curated test.
     for arg in ${SELECTORS[@]+"${SELECTORS[@]}"}; do
         local matched=0 candidate
-        for candidate in "${DEFAULT_TESTS[@]}" "${LONG_TESTS[@]}" "${SKIP_TESTS[@]}"; do
+        for candidate in "${DEFAULT_TESTS[@]}" "${ALTERNATIVE_TESTS[@]}" "${LONG_TESTS[@]}" "${SKIP_TESTS[@]}"; do
             case $candidate in *"$arg"*) matched=1; break ;; esac
         done
         if [ "$matched" -eq 0 ]; then

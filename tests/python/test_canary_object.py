@@ -684,6 +684,32 @@ class ObjectAbsentModeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             evidence["extract_object_attributes"](["--object-attributes"])
 
+    def test_duplicate_modes_validate_every_occurrence(self):
+        # An earlier unknown mode must not be silently overwritten by a
+        # later valid one: every occurrence is validated.
+        with self.assertRaises(ValueError):
+            evidence["extract_object_attributes"](
+                ["--object-attributes=bogus", "--object-attributes=absent",
+                 "64"])
+        with self.assertRaises(ValueError):
+            evidence["extract_object_attributes"](
+                ["--object-attributes=", "--object-attributes=present",
+                 "64"])
+        with self.assertRaises(ValueError):
+            evidence["extract_object_attributes"](
+                ["--object-attributes", "bogus",
+                 "--object-attributes=absent", "64"])
+        with self.assertRaises(ValueError):
+            evidence["extract_object_attributes"](
+                ["--object-attributes=absent", "--object-attributes=bogus",
+                 "64"])
+        # Repeating a valid mode stays accepted and selects it.
+        kept = evidence["extract_object_attributes"](
+            ["--object-attributes=absent", "--object-attributes=absent",
+             "64"])
+        self.assertEqual(kept, ["64"])
+        self.assertTrue(evidence["object_attributes_absent"]())
+
     def test_absent_completion_replay_matches_stub(self):
         helper = ObjectRecordsTests("test_completion_replay_matches_ledger")
         evidence["set_object_attributes"]("absent")
@@ -735,6 +761,84 @@ class ObjectAbsentModeTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             evidence["assert_object_completion_records"](
                 [bytes(row) for row in bad_scalar], "object-lp64",
+                helper.COMPLETED_PID)
+
+    def test_absent_completion_refuses_unmarked_get_requested(self):
+        # Get returns keep the stub marking on pair zero with pair one
+        # absent; each half of that expectation bites independently.
+        helper = ObjectRecordsTests("test_completion_replay_matches_ledger")
+        evidence["set_object_attributes"]("absent")
+        stub = stub_completion_records(helper)
+        get_pos = 25
+        unmarked = [bytearray(row) for row in stub]
+        unmarked[get_pos][368 + 128:368 + 164] = bytes(36)
+        with self.assertRaises(AssertionError):
+            evidence["assert_object_completion_records"](
+                [bytes(row) for row in unmarked], "object-lp64",
+                helper.COMPLETED_PID)
+        marked_absent = [bytearray(row) for row in stub]
+        marked_absent[get_pos][368 + 164:368 + 200] = UNINSPECTED
+        with self.assertRaises(AssertionError):
+            evidence["assert_object_completion_records"](
+                [bytes(row) for row in marked_absent], "object-lp64",
+                helper.COMPLETED_PID)
+        leaked = [bytearray(row) for row in stub]
+        leaked[get_pos][368 + 128:368 + 164] = six_fields()
+        with self.assertRaises(AssertionError):
+            evidence["assert_object_completion_records"](
+                [bytes(row) for row in leaked], "object-lp64",
+                helper.COMPLETED_PID)
+
+    def test_absent_completion_refuses_unmarked_get_results(self):
+        # The stub establishes no Get results at any return value: the
+        # result list keeps the UNINSPECTED marking on all five returns
+        # and on the ledger Get.
+        helper = ObjectRecordsTests("test_completion_replay_matches_ledger")
+        evidence["set_object_attributes"]("absent")
+        stub = stub_completion_records(helper)
+        ledger = [ordinal for ordinal, _ in evidence["OBJECT_LEDGER"]]
+        get_pos, ledger_get = 25, ledger.index(24)
+        for position in (get_pos, ledger_get):
+            with self.subTest(position=position):
+                unmarked = [bytearray(row) for row in stub]
+                unmarked[position][368 + 200:368 + 236] = bytes(36)
+                with self.assertRaises(AssertionError):
+                    evidence["assert_object_completion_records"](
+                        [bytes(row) for row in unmarked], "object-lp64",
+                        helper.COMPLETED_PID)
+                leaked = [bytearray(row) for row in stub]
+                leaked[position][368 + 200:368 + 236] = six_fields()
+                with self.assertRaises(AssertionError):
+                    evidence["assert_object_completion_records"](
+                        [bytes(row) for row in leaked], "object-lp64",
+                        helper.COMPLETED_PID)
+
+    def test_absent_completion_refuses_pair_private_mutations(self):
+        # Pair separation survives the stub: the pair's private list is
+        # marked only for GenerateKeyPair and zero everywhere else.
+        helper = ObjectRecordsTests("test_completion_replay_matches_ledger")
+        evidence["set_object_attributes"]("absent")
+        stub = stub_completion_records(helper)
+        ledger = [ordinal for ordinal, _ in evidence["OBJECT_LEDGER"]]
+        pair_pos, create_pos = ledger.index(59), ledger.index(20)
+        unmarked = [bytearray(row) for row in stub]
+        unmarked[pair_pos][368 + 164:368 + 200] = bytes(36)
+        with self.assertRaises(AssertionError):
+            evidence["assert_object_completion_records"](
+                [bytes(row) for row in unmarked], "object-lp64",
+                helper.COMPLETED_PID)
+        marked_absent = [bytearray(row) for row in stub]
+        marked_absent[create_pos][368 + 164:368 + 200] = UNINSPECTED
+        with self.assertRaises(AssertionError):
+            evidence["assert_object_completion_records"](
+                [bytes(row) for row in marked_absent], "object-lp64",
+                helper.COMPLETED_PID)
+        leaked = [bytearray(row) for row in stub]
+        leaked[create_pos][368 + 164:368 + 200] = six_fields(
+            (2, 3, 0, 24, 4096, 2))
+        with self.assertRaises(AssertionError):
+            evidence["assert_object_completion_records"](
+                [bytes(row) for row in leaked], "object-lp64",
                 helper.COMPLETED_PID)
 
     def test_present_completion_refuses_stub_bytes(self):
@@ -790,6 +894,42 @@ class ObjectAbsentModeTests(unittest.TestCase):
             evidence["assert_object_side_rows"](
                 [(key, evidence["decode_object_start"](bytes(blob)))
                  for key, blob in grown], starts, side.POINTERS, 64)
+
+    def test_absent_side_rows_refuse_get_header_retention(self):
+        # The stub acquires no Get attributes at entry: template base,
+        # slots and inspected count stay zero on the Get side row, and
+        # retained FULL bytes refuse, whole or in part.
+        side = ObjectSideRowTests("test_blocked_offsets_match")
+        evidence["set_object_attributes"]("absent")
+        starts, full_rows = side.blocked_fixture()
+        get_row = full_rows[3][1]["raw"]
+        assert full_rows[3][1]["descriptor_index"] == 25
+        assert get_row[64:80] != bytes(16) and get_row[430] == 8
+        assert get_row[96:352] != bytes(256)
+        _starts, stub_rows = self._stub_fixture(side, 64)
+
+        def check(mutate):
+            grown = [(key, bytearray(row["raw"])) for key, row in stub_rows]
+            mutate(grown[3][1])
+            with self.assertRaises(AssertionError):
+                evidence["assert_object_side_rows"](
+                    [(key, evidence["decode_object_start"](bytes(blob)))
+                     for key, blob in grown], starts, side.POINTERS, 64)
+
+        def retain_all(blob):
+            blob[64:80] = get_row[64:80]
+            blob[96:352] = get_row[96:352]
+            blob[430] = 8
+
+        def retain_count(blob):
+            blob[430] = 8
+
+        def retain_template(blob):
+            blob[64:80] = get_row[64:80]
+
+        check(retain_all)
+        check(retain_count)
+        check(retain_template)
 
     def test_present_side_rows_refuse_stub_bytes(self):
         side = ObjectSideRowTests("test_blocked_offsets_match")

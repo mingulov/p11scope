@@ -3924,7 +3924,7 @@ pub(crate) const SHARED_SCOPE_DISCOVERY_BYTES: u32 = 2 * 1024 * 1024;
 /// P0-only ship vehicle: whether the embedded Detailed object carries
 /// stubbed attribute capture. Probes the two verifier-heavy adapter
 /// functions' compiled sizes: the stub folds each to tens of instructions
-/// (27/50 at the P0 receipt) while FULL wires thousands (4,624/1,467).
+/// (27/49 stubbed) while FULL wires thousands (4,652/1,467).
 /// Panics on a half-wired object or an ambiguous probe — a silent
 /// misread here would mislabel the shipped flavor. Test-only: production
 /// derives the build flavor from the feature flag, and the consistency
@@ -12758,7 +12758,7 @@ mod tests {
             .program_mut("p11_entry")
             .unwrap_or_else(|| panic!("FULL object missing p11_entry"))
             .try_into()
-            .unwrap_or_else(|error| panic!("p11_entry is not a uprobe: {error}"));
+            .unwrap_or_else(|error| panic!("p11_entry is not an uprobe: {error}"));
         match program.load() {
             Ok(()) => println!("FULL p11_entry loads on this kernel"),
             Err(error) => {
@@ -12802,7 +12802,7 @@ mod tests {
                 .program_mut(root)
                 .unwrap_or_else(|| panic!("stubbed object missing {root}"))
                 .try_into()
-                .unwrap_or_else(|error| panic!("{root} is not a uprobe: {error}"));
+                .unwrap_or_else(|error| panic!("{root} is not an uprobe: {error}"));
             program
                 .load()
                 .unwrap_or_else(|error| panic!("stubbed {root} must load: {error}"));

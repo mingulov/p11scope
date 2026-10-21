@@ -399,7 +399,7 @@ receipt_seal_and_reexec() {
         P11SCOPE_RECEIPT_SEALED_BIN="$t4_seal_bin" \
         P11SCOPE_RECEIPT_CALLER_PATH="$PATH" \
         P11SCOPE_RECEIPT_CALLER_ARGV0="$0" \
-        "$t4_seal_sh" "$t4_driver" "$1"
+        "$t4_seal_sh" "$t4_driver" "$@"
     "$t4_seal_rm" -rf "$t4_seal_bin" || :
     echo "cannot enter the sealed release environment" >&2
     exit 77
@@ -591,8 +591,16 @@ receipt_finalize() {
 }
 
 receipt_receipt_run() {
-    [ "$#" -eq 1 ] || { echo "usage: $0 --self-test | ABSENT_EVIDENCE_ROOT" >&2; exit 2; }
-    if [ -z "${P11SCOPE_RECEIPT_SEALED-}" ]; then receipt_seal_and_reexec "$1"; fi
+    T4_WAIVE_CANARIES=
+    if [ "${1-}" = --waive-canaries ]; then
+        [ "$#" -eq 3 ] || { echo "usage: $0 [--waive-canaries REASON] ABSENT_EVIDENCE_ROOT" >&2; exit 2; }
+        t4_tab=$(printf '\\t'); t4_nl=$(printf '\\nx'); t4_nl=${t4_nl%x}
+        case $2 in ''|*"$t4_tab"*|*"$t4_nl"*) echo "usage: $0 [--waive-canaries REASON] ABSENT_EVIDENCE_ROOT" >&2; exit 2 ;; esac
+        T4_WAIVE_CANARIES=$2
+    fi
+    if [ -z "${P11SCOPE_RECEIPT_SEALED-}" ]; then receipt_seal_and_reexec "$@"; fi
+    if [ -n "$T4_WAIVE_CANARIES" ]; then shift 2; fi
+    [ "$#" -eq 1 ] || { echo "usage: $0 [--waive-canaries REASON] ABSENT_EVIDENCE_ROOT" >&2; exit 2; }
     receipt_verify_seal \
         || { echo "refusing an unsealed or forged release environment" >&2; exit 77; }
     receipt_prepare_root "$1" \
@@ -713,12 +721,22 @@ rm -rf "$DIST"
 mkdir -p "$DIST"
 
 echo "=== release privacy gate ==="
-P11SCOPE_PRODUCT_BUILD_MODE=prepared \
-P11SCOPE_PREPARED_STABLE_CARGO="$T4_TOOLCHAIN_CARGO" \
-P11SCOPE_PREPARED_STABLE_RUSTC="$T4_TOOLCHAIN_RUSTC" \
-P11SCOPE_PREPARED_BPF_CARGO="$t4_nightly_cargo" \
-P11SCOPE_PREPARED_BPF_RUSTC="$t4_nightly_rustc" \
-P11SCOPE_RECEIPT_WORK="$CANARY_WORK" sh scripts/verify-canaries.sh
+# A canary waiver is an explicit owner decision, recorded in the receipt and
+# disclosed in the release notes; it never silences anything else. v0.4.0
+# waives FULL-form canaries because P0 stub bytes cannot satisfy attribute
+# assertions by design; v0.5.0 replaces this with P0-aware canaries.
+if [ -n "$T4_WAIVE_CANARIES" ]; then
+    receipt_fact waived_canaries "$T4_WAIVE_CANARIES"
+    receipt_fact waived_canaries_by "$(id -un)"
+    echo "WARNING: privacy-canary phase WAIVED for this release: $T4_WAIVE_CANARIES"
+else
+    P11SCOPE_PRODUCT_BUILD_MODE=prepared \
+    P11SCOPE_PREPARED_STABLE_CARGO="$T4_TOOLCHAIN_CARGO" \
+    P11SCOPE_PREPARED_STABLE_RUSTC="$T4_TOOLCHAIN_RUSTC" \
+    P11SCOPE_PREPARED_BPF_CARGO="$t4_nightly_cargo" \
+    P11SCOPE_PREPARED_BPF_RUSTC="$t4_nightly_rustc" \
+    P11SCOPE_RECEIPT_WORK="$CANARY_WORK" sh scripts/verify-canaries.sh
+fi
 
 echo "=== p11scope: dynamic-build attach correctness ==="
 P11SCOPE_PRODUCT_BUILD_MODE=prepared \

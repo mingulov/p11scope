@@ -9922,9 +9922,26 @@ fn hosted_pipeline_retains_the_job_log() {
         "if-no-files-found: error\n",
         "/actions/jobs/$JOB_ID/logs\"",
         "for attempt in ",
-        // Exactly one id per name: none means the list rotted, two would splice
-        // two ids into one URL.
-        r#"test "$(printf '%s\n' "$JOB_ID" | grep -c '^[0-9][0-9]*$')" = 1"#,
+        // The jobs-list fetch retries bounded (a transient 502 killed a real
+        // run's archive); selection stays exact-name and now fetches
+        // id+created_at pairs so a rerun's duplicate name stays separable.
+        "for list_attempt in 1 2 3; do",
+        r#"select(.name == \"$job\") | \"\(.id) \(.created_at)\""#,
+        // Retry exhaustion fails LOUD with the observed rows, never silent
+        // under bash -e.
+        r#"echo "job $job: no jobs-list entry after 3 attempts; last rows observed: [${JOB_ROWS:-none}]" >&2"#,
+        // grep -c exits 1 on zero matches, which under bash -e would kill the
+        // step silently, so the count carries `|| true` while the loud check
+        // below owns the failure.
+        r#"JOB_COUNT=$(printf '%s\n' "$JOB_ROWS" | grep -c '^[0-9][0-9]* ' || true)"#,
+        // After a rerun one name can list twice: keep the latest attempt
+        // (greatest created_at, greatest id breaking a tie) and exactly one
+        // id — never splice two ids into one URL.
+        r#"JOB_ID=$(printf '%s\n' "$JOB_ROWS" | grep '^[0-9][0-9]* ' | sort -k2,2 -k1,1n | tail -n 1 | cut -d' ' -f1)"#,
+        r#"echo "job $job: no numeric job id among rows: [$JOB_ROWS]" >&2"#,
+        // Every job echoes the archived id with the listed count/ids, so the
+        // next listing-shape surprise is diagnosable from the log itself.
+        r#"echo "job $job: archiving job id $JOB_ID ($JOB_COUNT listed: $JOB_IDS)""#,
         // Without this the loop's hardcoded exit number is load-bearing: shortening
         // the attempt list would fall through with the empty file `gh api` created.
         // A simple command, not an `&&` list: only this form aborts the step.

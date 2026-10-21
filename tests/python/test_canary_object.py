@@ -611,5 +611,207 @@ class ObjectDriftGuardTests(unittest.TestCase):
             self.assertIn(f'"{name}"', policy, name)
 
 
+UNINSPECTED = bytes(32) + bytes([0, 0x10, 0, 0])
+STUB_CREATION_ORDINALS = {20, 21, 58, 59, 61, 62}
+
+
+def stub_completion_records(helper):
+    """The FULL completion fixture with stub attribute bytes: present
+    pairs marked UNINSPECTED, absent pairs zero, scalars untouched."""
+    records = [bytearray(row) for row in helper.completion_records()]
+    for position, (ordinal, _name) in enumerate(evidence["OBJECT_LEDGER"]):
+        if ordinal in STUB_CREATION_ORDINALS:
+            assert records[position][368 + 128:368 + 164] == six_fields()
+            records[position][368 + 128:368 + 164] = UNINSPECTED
+        else:
+            assert records[position][368 + 128:368 + 164] == bytes(36)
+        if ordinal == 59:
+            records[position][368 + 164:368 + 200] = UNINSPECTED
+        else:
+            assert records[position][368 + 164:368 + 200] == bytes(36)
+        if ordinal == 24:
+            assert records[position][368 + 200:368 + 236] == six_fields()
+            records[position][368 + 200:368 + 236] = UNINSPECTED
+        else:
+            assert records[position][368 + 200:368 + 236] == bytes(36)
+    for position in range(25, 30):
+        records[position][368 + 200:368 + 236] = UNINSPECTED
+    assert [bytes(row) for row in records] != helper.completion_records()
+    return [bytes(row) for row in records]
+
+
+class ObjectAbsentModeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        evidence["initialize"](64)
+
+    def setUp(self):
+        evidence["set_object_attributes"]("present")
+
+    def tearDown(self):
+        evidence["set_object_attributes"]("present")
+
+    def test_unknown_mode_refuses(self):
+        with self.assertRaises(ValueError):
+            evidence["set_object_attributes"]("bogus")
+        with self.assertRaises(ValueError):
+            evidence["set_object_attributes"]("")
+        self.assertFalse(evidence["object_attributes_absent"]())
+
+    def test_cli_flag_forms(self):
+        kept = evidence["extract_object_attributes"](
+            ["--object-attributes=absent", "--object-starts", "x", "64"])
+        self.assertEqual(kept, ["--object-starts", "x", "64"])
+        self.assertTrue(evidence["object_attributes_absent"]())
+        evidence["set_object_attributes"]("present")
+        kept = evidence["extract_object_attributes"](
+            ["--object-starts", "--object-attributes", "absent", "x", "64"])
+        self.assertEqual(kept, ["--object-starts", "x", "64"])
+        self.assertTrue(evidence["object_attributes_absent"]())
+        evidence["set_object_attributes"]("present")
+        kept = evidence["extract_object_attributes"](["--object-starts", "x", "64"])
+        self.assertEqual(kept, ["--object-starts", "x", "64"])
+        self.assertFalse(evidence["object_attributes_absent"]())
+        with self.assertRaises(ValueError):
+            evidence["extract_object_attributes"](["--object-attributes=bogus", "64"])
+        with self.assertRaises(ValueError):
+            evidence["extract_object_attributes"](["--object-attributes"])
+
+    def test_absent_completion_replay_matches_stub(self):
+        helper = ObjectRecordsTests("test_completion_replay_matches_ledger")
+        evidence["set_object_attributes"]("absent")
+        evidence["assert_object_completion_records"](
+            stub_completion_records(helper), "object-lp64", helper.COMPLETED_PID)
+
+    def test_absent_completion_replay_keeps_the_selected_target_width(self):
+        helper = ObjectRecordsTests("test_completion_replay_matches_ledger")
+        records = [bytearray(row) for row in helper.completion_records(32)]
+        for position, (ordinal, _name) in enumerate(evidence["OBJECT_LEDGER"]):
+            if ordinal in STUB_CREATION_ORDINALS:
+                records[position][368 + 128:368 + 164] = UNINSPECTED
+            if ordinal == 59:
+                records[position][368 + 164:368 + 200] = UNINSPECTED
+            if ordinal == 24:
+                records[position][368 + 200:368 + 236] = UNINSPECTED
+        for position in range(25, 30):
+            records[position][368 + 200:368 + 236] = UNINSPECTED
+        evidence["set_object_attributes"]("absent")
+        evidence["assert_object_completion_records"](
+            [bytes(row) for row in records], "object-ia32", helper.COMPLETED_PID)
+
+    def test_absent_completion_refuses_full_values_and_unrun_capture(self):
+        helper = ObjectRecordsTests("test_completion_replay_matches_ledger")
+        evidence["set_object_attributes"]("absent")
+        full = helper.completion_records()
+        with self.assertRaises(AssertionError):
+            evidence["assert_object_completion_records"](
+                full, "object-lp64", helper.COMPLETED_PID)
+        stub = stub_completion_records(helper)
+        with self.assertRaises(AssertionError):
+            evidence["assert_object_completion_records"](
+                stub[:-1], "object-lp64", helper.COMPLETED_PID)
+        with self.assertRaises(AssertionError):
+            evidence["assert_object_completion_records"](
+                [], "object-lp64", helper.COMPLETED_PID)
+        # An unmarked creation list is not an honest stub outcome: emission
+        # must still have run and marked the present pair.
+        unmarked = [bytearray(row) for row in stub]
+        unmarked[0][368 + 128:368 + 164] = bytes(36)
+        with self.assertRaises(AssertionError):
+            evidence["assert_object_completion_records"](
+                [bytes(row) for row in unmarked], "object-lp64",
+                helper.COMPLETED_PID)
+        # Kept scalar assertions still bite in absent mode.
+        bad_scalar = [bytearray(row) for row in stub]
+        struct.pack_into("<Q", bad_scalar[0], 368 + 32, 0xDEAD)
+        with self.assertRaises(AssertionError):
+            evidence["assert_object_completion_records"](
+                [bytes(row) for row in bad_scalar], "object-lp64",
+                helper.COMPLETED_PID)
+
+    def test_present_completion_refuses_stub_bytes(self):
+        helper = ObjectRecordsTests("test_completion_replay_matches_ledger")
+        with self.assertRaises(AssertionError):
+            evidence["assert_object_completion_records"](
+                stub_completion_records(helper), "object-lp64",
+                helper.COMPLETED_PID)
+
+    def test_absent_side_rows_match_stub(self):
+        side = ObjectSideRowTests("test_blocked_offsets_match")
+        evidence["set_object_attributes"]("absent")
+        for width in (32, 64):
+            with self.subTest(width=width):
+                starts, rows = self._stub_fixture(side, width)
+                evidence["assert_object_side_rows"](rows, starts, side.POINTERS, width)
+
+    def _stub_row(self, raw, descriptor_index):
+        stub = bytearray(raw)
+        stub[352:424] = bytes(72)
+        if descriptor_index == 25:
+            stub[64:96] = bytes(32)
+            stub[96:352] = bytes(256)
+            stub[430] = 0
+        return bytes(stub)
+
+    def _stub_fixture(self, side, width):
+        starts, rows = side.blocked_fixture(width)
+        assert rows[0][1]["raw"][352:388] == six_fields()
+        assert rows[3][1]["descriptor_index"] == 25
+        assert rows[3][1]["raw"][430] == 8
+        return starts, [(key, evidence["decode_object_start"](
+            self._stub_row(row["raw"], row["descriptor_index"]))) for key, row in rows]
+
+    def test_absent_side_rows_refuse_full_values_and_leaks(self):
+        side = ObjectSideRowTests("test_blocked_offsets_match")
+        evidence["set_object_attributes"]("absent")
+        starts, rows = side.blocked_fixture()
+        with self.assertRaises(AssertionError):
+            evidence["assert_object_side_rows"](rows, starts, side.POINTERS, 64)
+        _starts, stub_rows = self._stub_fixture(side, 64)
+        # A leaking stub row (inspected values where zeros belong) refuses.
+        grown = [(key, bytearray(row["raw"])) for key, row in stub_rows]
+        grown[0][1][352:388] = six_fields()
+        with self.assertRaises(AssertionError):
+            evidence["assert_object_side_rows"](
+                [(key, evidence["decode_object_start"](bytes(blob)))
+                 for key, blob in grown], starts, side.POINTERS, 64)
+        # Kept scalar assertions still bite in absent mode.
+        grown = [(key, bytearray(row["raw"])) for key, row in stub_rows]
+        grown[0][1][48:56] = (0x1234).to_bytes(8, "little")
+        with self.assertRaises(AssertionError):
+            evidence["assert_object_side_rows"](
+                [(key, evidence["decode_object_start"](bytes(blob)))
+                 for key, blob in grown], starts, side.POINTERS, 64)
+
+    def test_present_side_rows_refuse_stub_bytes(self):
+        side = ObjectSideRowTests("test_blocked_offsets_match")
+        starts, _rows = side.blocked_fixture()
+        _starts, stub_rows = self._stub_fixture(side, 64)
+        with self.assertRaises(AssertionError):
+            evidence["assert_object_side_rows"](
+                stub_rows, starts, side.POINTERS, 64)
+
+    def test_absent_full_oracle_passes_on_stub_cell(self):
+        helper = ObjectRecordsTests("test_completion_replay_matches_ledger")
+        side = ObjectSideRowTests("test_blocked_offsets_match")
+        oracle = ObjectStartsOracleTests("test_full_oracle_passes")
+        starts, _rows = side.blocked_fixture()
+        _starts, stub_rows = self._stub_fixture(side, 64)
+        blocked_starts = [
+            (struct.pack("<QII", (side.BLOCKED_PID << 32) | tid, 3, 0),
+             start_row(start["session"],
+                       {0x501: 22, 0x502: 61, 0x503: 29, 0x504: 26}[start["session"]]))
+            for tid, start in sorted(starts.items())]
+        blocked_log = ("P11SCOPE_OBJECT_POINTERS "
+                       + json.dumps(side.POINTERS) + "\n")
+        evidence["set_object_attributes"]("absent")
+        with tempfile.TemporaryDirectory() as root:
+            args = oracle.write_cell(
+                root, stub_completion_records(helper), stub_rows,
+                blocked_starts, ledger_text(), blocked_log)
+            evidence["assert_object_starts"](*args, helper.COMPLETED_PID,
+                                             side.BLOCKED_PID, 64)
+
+
 if __name__ == "__main__":
     unittest.main()

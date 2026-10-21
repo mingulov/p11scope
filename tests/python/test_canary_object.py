@@ -96,6 +96,32 @@ class ObjectTailTests(unittest.TestCase):
         self.assertEqual(
             decoded, {"index": 21, "action": 1, "layout": 1, "flags": 0})
 
+    def test_find_section_matches_wire_offsets(self):
+        # ObjectCallWire (#[repr(C)], field order frozen since 6e9cc157
+        # and pinned by the object_wire offset tests): find_len@124,
+        # find_flags@125, find_valid@126, reserved1@127, reserved2@236..240.
+        # The oracle must decode the struct's own Find bytes.
+        tail = bytearray(valid_tail(index=28, action=evidence["OBJECT_FIND_ACTION"]))
+        for slot, preset in enumerate(evidence["OBJECT_FIND_PRESETS"]):
+            struct.pack_into("<Q", tail, 48 + 8 * slot, preset)
+            tail[116 + slot] = 1
+        tail[124], tail[126] = 8, 1
+        self.assertEqual(
+            evidence["decode_object_tail"](bytes(tail)),
+            {"index": 28, "action": evidence["OBJECT_FIND_ACTION"],
+             "layout": 1, "flags": 0})
+        # The swapped twin (validity read from the reserved1 pad) refuses.
+        swapped = bytearray(tail)
+        swapped[126], swapped[127] = 0, 1
+        with self.assertRaises(AssertionError):
+            evidence["decode_object_tail"](bytes(swapped))
+        # Every reserved byte rejects, mirroring validate_object_tail.
+        for offset in (127, 236, 237, 238, 239):
+            bad = bytearray(tail)
+            bad[offset] = 1
+            with self.subTest(offset=offset), self.assertRaises(AssertionError):
+                evidence["decode_object_tail"](bytes(bad))
+
     def test_tail_mutations_refuse(self):
         cases = []
         good = bytearray(valid_tail())
@@ -108,7 +134,7 @@ class ObjectTailTests(unittest.TestCase):
             cases.append((f"header@{offset}={value}", bytes(bad)))
         for offset, value in [
             (12, 0), (12, 3), (13, 0), (13, 13), (14, 5), (15, 1),
-            (126, 1), (239, 1),
+            (126, 1), (236, 1), (237, 1), (238, 1), (239, 1),
         ]:
             bad = bytearray(good)
             bad[offset] = value

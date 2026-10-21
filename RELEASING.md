@@ -112,8 +112,8 @@ one; a deduplicated run on the tag is green only because that covering run
 passed. A manual dispatch always runs the full matrix.
 
 `bpf-noninterference` follows `tests`, including when tests fail. It first
-runs the repeat-baseline control on reviewed full-image baseline
-`0c761a6408892d864983a52295562e91c6de2900` twice, then compares that
+runs the repeat-baseline control on reviewed v0.4.0 baseline
+`f1bc557e85119f8caa82160a083d2c095eb58ba4` twice, then compares that
 baseline with the exact candidate commit in a fresh integration snapshot.
 Advance the baseline only after reviewing intentional BPF changes, not to
 clear an arbitrary comparison failure. All bytes

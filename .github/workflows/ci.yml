@@ -679,10 +679,40 @@ jobs:
       - run: |
           mkdir "$RUNNER_TEMP/checks-logs"
           for job in $CHECK_JOBS; do
-            JOB_ID=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs" --jq ".jobs[] | select(.name == \"$job\") | .id")
-            # Exactly one job by that name: none means the list rotted, two
-            # would splice two ids into one URL.
-            test "$(printf '%s\n' "$JOB_ID" | grep -c '^[0-9][0-9]*$')" = 1
+            # The jobs list can flake (a transient 502 killed a real run's
+            # archive) or carry one name twice after a rerun, so fetch
+            # id+created_at pairs with the same bounded 3x5s retry the log
+            # fetch below uses, then pick the latest attempt.
+            JOB_ROWS=""
+            for list_attempt in 1 2 3; do
+              if JOB_ROWS=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs" --jq ".jobs[] | select(.name == \"$job\") | \"\(.id) \(.created_at)\""); then
+                if [ -n "$JOB_ROWS" ]; then
+                  break
+                fi
+                echo "job $job: jobs list has no entry for it (list attempt $list_attempt)" >&2
+              else
+                echo "job $job: jobs list fetch failed (list attempt $list_attempt)" >&2
+              fi
+              if [ "$list_attempt" = 3 ]; then
+                echo "job $job: no jobs-list entry after 3 attempts; last rows observed: [${JOB_ROWS:-none}]" >&2
+                exit 1
+              fi
+              sleep 5
+            done
+            # After a rerun the list can hold one name twice; keep the latest
+            # attempt (greatest created_at, greatest id breaking a tie), never
+            # splice two ids into one URL.
+            # grep -c exits 1 on zero matches, which under `bash -e` would
+            # kill this step silently, so `|| true` keeps the count while the
+            # loud check below owns the failure.
+            JOB_COUNT=$(printf '%s\n' "$JOB_ROWS" | grep -c '^[0-9][0-9]* ' || true)
+            JOB_IDS=$(printf '%s\n' "$JOB_ROWS" | grep '^[0-9][0-9]* ' | cut -d' ' -f1 | tr '\n' ' ')
+            JOB_ID=$(printf '%s\n' "$JOB_ROWS" | grep '^[0-9][0-9]* ' | sort -k2,2 -k1,1n | tail -n 1 | cut -d' ' -f1)
+            if [ -z "$JOB_ID" ]; then
+              echo "job $job: no numeric job id among rows: [$JOB_ROWS]" >&2
+              exit 1
+            fi
+            echo "job $job: archiving job id $JOB_ID ($JOB_COUNT listed: $JOB_IDS)"
             # .../jobs/<id>/logs answers 302 to blob storage and gh api follows it: a 302 in a
             # verbose trace is the success path, not a failure. It can also 404 for a short
             # window right after the job completes, while the log is finalized, hence the

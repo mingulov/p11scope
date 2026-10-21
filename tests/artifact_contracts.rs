@@ -1929,11 +1929,11 @@ fn canary_builds_are_p0_only() {
 fn attach_e2e_build_is_p0_only() {
     let attach = read("scripts/verify-attach-e2e.sh");
     assert!(
-        attach.contains("--features stub-object-attributes"),
+        attach.contains("e2e_features=\"stub-object-attributes\""),
         "attach e2e build must shut the attribute gate"
     );
     assert!(
-        attach.contains("--features skip-attribution,stub-object-attributes"),
+        attach.contains("e2e_features=\"skip-attribution,stub-object-attributes\""),
         "attach e2e diagnose build must shut the attribute gate"
     );
 }

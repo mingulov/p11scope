@@ -419,8 +419,18 @@ list_mode() {
     [ $# -eq 1 ] || { usage >&2; return 2; }
     bin=$1
     [ -x "$bin" ] || { echo "$PROG: not an executable test binary: $bin" >&2; return 1; }
-    echo "default (${#DEFAULT_TESTS[@]})"
-    for name in "${DEFAULT_TESTS[@]}"; do
+    # The receipt stays per-binary exact: resolve the feature-alternative
+    # load gate against this binary and list the present member (if any) as
+    # a default-campaign cell. The drift check below still refuses a binary
+    # with zero or two members.
+    default_all=("${DEFAULT_TESTS[@]}")
+    for name in "${ALTERNATIVE_TESTS[@]}"; do
+        if binary_has_ignored "$bin" "$name"; then
+            default_all+=("$name")
+        fi
+    done
+    echo "default (${#default_all[@]})"
+    for name in "${default_all[@]}"; do
         case $name in
             *_ia32) echo "$name :: preflight: host cc must compile -m32" ;;
             *broad_p11kit_admission_arithmetic)
@@ -430,8 +440,6 @@ list_mode() {
             *) echo "$name" ;;
         esac
     done
-    echo "alternative (exactly one per binary)"
-    printf '%s\n' "${ALTERNATIVE_TESTS[@]}"
     echo "long (${#LONG_TESTS[@]}, --include-long only)"
     printf '%s\n' "${LONG_TESTS[@]}"
     echo "skipped (${#SKIP_TESTS[@]})"
@@ -439,7 +447,7 @@ list_mode() {
         echo "${SKIP_TESTS[$i]} :: ${SKIP_REASONS[$i]}"
     done
     if check_curation "$bin"; then
-        echo "verify: curation matches the binary ($(( ${#DEFAULT_TESTS[@]} + 1 + ${#LONG_TESTS[@]} + ${#SKIP_TESTS[@]} )) tests, one alternative)"
+        echo "verify: curation matches the binary ($(( ${#default_all[@]} + ${#LONG_TESTS[@]} + ${#SKIP_TESTS[@]} )) tests)"
         return 0
     fi
     return 1

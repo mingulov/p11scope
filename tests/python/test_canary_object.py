@@ -623,6 +623,11 @@ def stub_completion_records(helper):
         if ordinal in STUB_CREATION_ORDINALS:
             assert records[position][368 + 128:368 + 164] == six_fields()
             records[position][368 + 128:368 + 164] = UNINSPECTED
+        elif ordinal == 24:
+            # Get's pair zero is descriptor-present (stub-marked) though
+            # FULL never request-inspects it.
+            assert records[position][368 + 128:368 + 164] == bytes(36)
+            records[position][368 + 128:368 + 164] = UNINSPECTED
         else:
             assert records[position][368 + 128:368 + 164] == bytes(36)
         if ordinal == 59:
@@ -635,6 +640,8 @@ def stub_completion_records(helper):
         else:
             assert records[position][368 + 200:368 + 236] == bytes(36)
     for position in range(25, 30):
+        assert records[position][368 + 128:368 + 200] == bytes(72)
+        records[position][368 + 128:368 + 164] = UNINSPECTED
         records[position][368 + 200:368 + 236] = UNINSPECTED
     assert [bytes(row) for row in records] != helper.completion_records()
     return [bytes(row) for row in records]
@@ -687,13 +694,14 @@ class ObjectAbsentModeTests(unittest.TestCase):
         helper = ObjectRecordsTests("test_completion_replay_matches_ledger")
         records = [bytearray(row) for row in helper.completion_records(32)]
         for position, (ordinal, _name) in enumerate(evidence["OBJECT_LEDGER"]):
-            if ordinal in STUB_CREATION_ORDINALS:
+            if ordinal in STUB_CREATION_ORDINALS or ordinal == 24:
                 records[position][368 + 128:368 + 164] = UNINSPECTED
             if ordinal == 59:
                 records[position][368 + 164:368 + 200] = UNINSPECTED
             if ordinal == 24:
                 records[position][368 + 200:368 + 236] = UNINSPECTED
         for position in range(25, 30):
+            records[position][368 + 128:368 + 164] = UNINSPECTED
             records[position][368 + 200:368 + 236] = UNINSPECTED
         evidence["set_object_attributes"]("absent")
         evidence["assert_object_completion_records"](

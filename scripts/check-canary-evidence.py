@@ -1003,9 +1003,13 @@ def assert_object_completion_records(raw_records, lane, workload_pid):
         if object_attributes_absent():
             # The stub emits no inspected values: descriptor-present pairs
             # carry the honest UNINSPECTED marking, absent pairs stay zero.
+            # Get's pair zero is present (marked here) though FULL never
+            # request-inspects it -- it stays zero there.
             public = private = OBJECT_ATTR_UNINSPECTED
-        creation = ordinal in {20, 21, 58, 59, 61, 62}
-        assert raw_tail[128:164] == (public if creation else zero_list), \
+        requested0_present = ordinal in {20, 21, 58, 59, 61, 62}
+        if object_attributes_absent() and ordinal == 24:
+            requested0_present = True
+        assert raw_tail[128:164] == (public if requested0_present else zero_list), \
             (name, "requested0 six fields/absence")
         assert raw_tail[164:200] == (private if ordinal == 59 else zero_list), \
             (name, "pair separation/absent requested1")
@@ -1032,7 +1036,13 @@ def assert_object_completion_records(raw_records, lane, workload_pid):
         assert event["object"] == {"index": 25, "action": 11,
                                    "layout": 2 if lane == "object-ia32" else 1, "flags": 0}
         tail = event["raw"][EVENT_SIZE:]
-        assert tail[128:200] == bytes(72), (session, "Get has no requested values")
+        if object_attributes_absent():
+            # Same present pair zero as the ledger Get: marked, with pair
+            # one absent.
+            assert tail[128:200] == OBJECT_ATTR_UNINSPECTED + bytes(36), \
+                (session, "Get requested pair marked, pair one absent")
+        else:
+            assert tail[128:200] == bytes(72), (session, "Get has no requested values")
         if object_attributes_absent():
             # The stub establishes no Get results at any return value; the
             # tail keeps the fill's UNINSPECTED marking on all five returns.

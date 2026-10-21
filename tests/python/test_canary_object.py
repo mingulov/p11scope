@@ -134,7 +134,7 @@ class ObjectTailTests(unittest.TestCase):
             cases.append((f"header@{offset}={value}", bytes(bad)))
         for offset, value in [
             (12, 0), (12, 3), (13, 0), (13, 13), (14, 5), (15, 1),
-            (126, 1), (236, 1), (237, 1), (238, 1), (239, 1),
+            (127, 1), (236, 1), (237, 1), (238, 1), (239, 1),
         ]:
             bad = bytearray(good)
             bad[offset] = value
@@ -153,7 +153,7 @@ class ObjectTailTests(unittest.TestCase):
         cases.append(("input status 11", bytes(bad)))
         # Find section: refused keeps no length, cells, or validity.
         bad = bytearray(good)
-        bad[127] = 1
+        bad[126] = 1
         cases.append(("non-Find valid flag", bytes(bad)))
         bad = bytearray(good)
         bad[48] = 1
@@ -331,7 +331,7 @@ class ObjectRecordsTests(unittest.TestCase):
                 for slot, preset in enumerate(evidence["OBJECT_FIND_PRESETS"]):
                     struct.pack_into("<Q", tail, 48 + 8 * slot, preset)
                     tail[116 + slot] = 1
-                tail[124], tail[127] = 8, 1
+                tail[124], tail[126] = 8, 1
             for slot, preset in enumerate(
                     evidence["OBJECT_INPUT_PRESETS"][ordinal]):
                 struct.pack_into("<Q", tail, 16 + 8 * slot, preset)

@@ -715,7 +715,7 @@ def decode_object_tail(tail):
     assert layout in (1, 2), layout
     assert 1 <= action <= OBJECT_ACTION_MAX, action
     assert entry_derive <= 4, entry_derive
-    assert tail[15] == 0 and tail[126] == 0 and tail[239] == 0, "tail padding"
+    assert tail[15] == 0 and tail[127] == 0 and tail[236:240] == bytes(4), "tail padding"
 
     def check_word(status, word, where):
         assert status <= 10, (where, status)
@@ -733,7 +733,7 @@ def decode_object_tail(tail):
     find_status = tail[116:124]
     for position in range(8):
         check_word(find_status[position], find_handles[position], f"find{position}")
-    find_len, find_flags, find_valid = tail[124], tail[125], tail[127]
+    find_len, find_flags, find_valid = tail[124], tail[125], tail[126]
     assert find_len <= 8 and find_flags & ~0x3F == 0 and find_valid <= 1
     if action == OBJECT_FIND_ACTION:
         assert not (find_valid == 0 and find_len != 0), "refused Find keeps no length"
@@ -984,7 +984,7 @@ def assert_object_completion_records(raw_records, lane, workload_pid):
                 word = struct.unpack_from("<Q", raw_tail, 32 + 8 * slot)[0]
                 assert (status, word) == (1, preset), (name, slot, status, hex(word))
         if ordinal == 27:
-            assert raw_tail[124] == 8 and raw_tail[127] == 1, "Find length/valid"
+            assert raw_tail[124] == 8 and raw_tail[126] == 1, "Find length/valid"
             for slot, preset in enumerate(OBJECT_FIND_PRESETS):
                 status = raw_tail[116 + slot]
                 word = struct.unpack_from("<Q", raw_tail, 48 + 8 * slot)[0]

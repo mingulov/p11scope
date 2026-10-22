@@ -420,6 +420,42 @@ class OfflineDependenciesTests(unittest.TestCase):
                 shared, _ = helper._locked_dependencies([REPOSITORY / relative])
                 self.assertEqual(recipe["shared_git"], shared)
 
+    def test_fixed_recipe_rejects_owned_workspace_and_preparation_drift(self):
+        # Exercise the real input binder without a payload, tools or a bundle of
+        # product history. Only the files that contribute to these hashes copy.
+        helper = load_module(HELPER, "owned_offline_dependency_inputs")
+        preparer = load_module(PREPARER, "owned_offline_dependency_preparer")
+        manifest = helper._strict_manifest(REPOSITORY, preparer)
+        recipe = helper._read_json(REPOSITORY / "third-party/offline-dependencies.json", "fixed recipe")
+        root = Path(self.temporary.name) / "owned inputs"
+        files = {"third-party/sources.json"}
+        for name in manifest["workspace_manifests"]:
+            files.update((name, str(Path(name).parent / "Cargo.lock")))
+        for record in manifest["packages"]:
+            files.update(record["patches"])
+        for name in files:
+            destination = root / name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes((REPOSITORY / name).read_bytes())
+        healthy = helper.check_fixed_recipe_inputs(root, recipe, manifest, preparer)
+        self.assertEqual(healthy["workspaces"], recipe["workspaces"])
+        self.assertEqual(healthy["preparation"], recipe["preparation"])
+        changes = [(name, "workspace lock or manifest input changed")
+                   for name in sorted(files) if name.endswith(("Cargo.toml", "Cargo.lock"))]
+        changes += [("third-party/sources.json", "sources manifest input changed"),
+                    (manifest["packages"][0]["patches"][0], "package recipe input changed")]
+        for name, error in changes:
+            with self.subTest(input=name):
+                path = root / name
+                original = path.read_bytes()
+                try:
+                    path.write_bytes(original + b"\n")
+                    with self.assertRaisesRegex(helper.OfflineDependencyError, error):
+                        helper.check_fixed_recipe_inputs(root, recipe, manifest, preparer)
+                finally:
+                    path.write_bytes(original)
+        self.assertEqual(helper.check_fixed_recipe_inputs(root, recipe, manifest, preparer), healthy)
+
     def test_assemble_runs_fixed_offline_resolver_and_produces_complete_payload(self):
         self.fixture.assemble()
         calls = [json.loads(line) for line in self.fixture.log.read_text().splitlines()]

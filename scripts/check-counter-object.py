@@ -568,13 +568,26 @@ class MemoryProof:
         elif operation == 0x50:
             if not taken:
                 low, high = max(low, immediate), min(high, immediate)
-        elif operation in (0x20, 0x30, 0xa0, 0xb0):
-            greater = operation in (0x20, 0x30)
-            inclusive = operation in (0x30, 0xb0)
-            if greater == taken:
-                low = max(low, immediate + (not inclusive))
+        elif operation == 0x20:  # unsigned greater than
+            if taken:
+                low = max(low, immediate + 1)
             else:
-                high = min(high, immediate - inclusive)
+                high = min(high, immediate)
+        elif operation == 0x30:  # unsigned greater than or equal
+            if taken:
+                low = max(low, immediate)
+            else:
+                high = min(high, immediate - 1)
+        elif operation == 0xa0:  # unsigned less than
+            if taken:
+                high = min(high, immediate - 1)
+            else:
+                low = max(low, immediate)
+        elif operation == 0xb0:  # unsigned less than or equal
+            if taken:
+                high = min(high, immediate)
+            else:
+                low = max(low, immediate + 1)
         if low > high:
             return False
         registers[destination] = scalar(low, high, left[1])
@@ -683,10 +696,24 @@ class MemoryProof:
                     comparison_left, comparison_right = narrowed(left, 32), narrowed(right, 32)
                     can_refine = bool(left and left[0] == "scalar" and left[3] <= 0xffffffff)
                 operation = self.branch(op, comparison_left, comparison_right, key, pc)
+                refined_register, refined_value = destination, comparison_left
+                bound = singleton(comparison_right)
+                refined_operation = operation
+                inverse = {0x10: 0x10, 0x50: 0x50, 0x20: 0xa0,
+                           0x30: 0xb0, 0xa0: 0x20, 0xb0: 0x30}
+                if (op & 8 and operation in inverse and bound is None
+                        and singleton(comparison_left) is not None
+                        and right and right[0] == "scalar"):
+                    # Reverse only the comparison operands, never the taken
+                    # edge. A JMP32 bound constrains the full source only
+                    # when its original value already fits that low word.
+                    refined_register, refined_value = source, comparison_right
+                    bound, refined_operation = singleton(comparison_left), inverse[operation]
+                    can_refine = op & 7 == 5 or right[3] <= 0xffffffff
                 for taken, target in ((True, pc + 1 + offset), (False, pc + 1)):
                     branch_registers = list(registers)
-                    if (not can_refine or self.refine(branch_registers, destination, comparison_left,
-                                                     singleton(comparison_right), operation, taken)):
+                    if (not can_refine or self.refine(branch_registers, refined_register, refined_value,
+                                                     bound, refined_operation, taken)):
                         enqueue(target, (branch_registers, dict(memory)))
                 continue
             else:

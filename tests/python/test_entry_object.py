@@ -78,6 +78,20 @@ def internal_contract(variant, name, disassembly=None):
     return CHECKER[name](blocks, calls)
 
 
+
+def entry_contract(variant, name, disassembly=None):
+    """Exercise final entry sinks without hiding behind an earlier contract."""
+    split = CHECKER["sections"](OBJECTS[variant] if disassembly is None else disassembly)
+    blocks = CHECKER["D"].function_blocks(split[".text"])
+    calls = {}
+    for caller, _, pc, target in CHECKER["D"].internal_call_targets(split["uprobe"]+"\n"+split[".text"]):
+        calls.setdefault(caller, {})[pc] = target
+    consumer = CHECKER["_SeedCaller"]("uprobe", name,
+        CHECKER["D"].function_blocks(split["uprobe"])[name], calls[name])
+    selectors = [0x33] if variant == "unsafe" and name == "p11_entry" else [0x23] if name == "p11_entry_ia32" else [0x23, 0x33]
+    return CHECKER["final_sink_contract"](consumer, variant, selectors, blocks, calls)
+
+
 def mutate(disassembly, function, pc, old, new, internal_call=False, helper_call=False):
     """Change exactly one decoded instruction, retaining its actual-object origin."""
     symbols = list(re.finditer(r"(?m)^[0-9a-f]+ <([^>]+)>:$", disassembly))
@@ -367,31 +381,52 @@ class EntryObjectTests(unittest.TestCase):
                 self.assertNotIn(scalar, callees)
 
     def test_final_scalar_sink_controls(self):
-        # Destinations come from CallStart, independently of the capture order.
-        default_store = after_call("default", "p11_entry", "capture_scalar", r"\*\(u64 \*\)\(r10 - 0x160\) = r1")
-        ia32_store = site("unsafe", "p11_entry_ia32", r"\*\(u64 \*\)\(r10 - 0x120\) = r0")
-        cases = [
-            ("default", "p11_entry", before_call("default", "p11_entry", "capture_scalar", r"r3 = r8"), "r3 = r9"),
-            ("default", "p11_entry", default_store, "r1 = r1"),
-            ("default", "p11_entry", default_store, "*(u64 *)(r10 - 0x158) = r1"),
-            ("default", "p11_entry", before_call("default", "p11_entry", "capture_scalar", r"r4 = r7"), "r4 = 0x1"),
-            ("unsafe", "p11_entry", site("unsafe", "p11_entry", r"if r7 s> 0x3 goto .*", 0), "if r8 s> 0x3 goto +0x57"),
-            ("unsafe", "p11_entry", site("unsafe", "p11_entry", r"r1 = \*\(u64 \*\)\(r6 \+ 0x70\)", 0), "r1 = *(u64 *)(r6 + 0x68)"),
-            ("unsafe", "p11_entry", site("unsafe", "p11_entry", r"\*\(u64 \*\)\(r10 - 0x128\) = r1", 3), "r1 = r1"),
-            ("unsafe", "p11_entry", site("unsafe", "p11_entry", r"r2 = 0x8", 0), "r2 = 0x4"),
-            ("unsafe", "p11_entry_ia32", before_call("unsafe", "p11_entry_ia32", "p11_read_ia32_arg", r"r2 = r8"), "r2 = r7"),
-            ("unsafe", "p11_entry_ia32", before_call("unsafe", "p11_entry_ia32", "p11_read_ia32_arg", r"r1 = .*"), "r1 = r10"),
-            ("unsafe", "p11_entry_ia32", call_site("unsafe", "p11_entry_ia32", "p11_read_ia32_arg"), "r0 = 0x0"),
-            ("unsafe", "p11_entry_ia32", ia32_store, "*(u64 *)(r10 - 0x120) = r1"),
-            ("unsafe", "p11_entry_ia32", ia32_store, "*(u64 *)(r10 - 0x118) = r0"),
-            ("unsafe", "p11_entry_ia32", ia32_store, "r0 = r0"),
-        ]
-        for variant, function, pc, new in cases:
-            with self.subTest(variant=variant, function=function, pc=pc):
-                insns = dict(CHECKER["D"].instructions(CHECKER["D"].function_blocks(OBJECTS[variant])[function]))
-                changed = mutate(OBJECTS[variant], function, pc, insns[pc], new)
-                with self.assertRaisesRegex(RuntimeError, "final-sink|scalar-read|layout"):
-                    CHECKER["contract"](changed, variant)
+        for variant in OBJECTS:
+            names = ["p11_entry"] if variant == "default" else ["p11_entry", "p11_entry_ia32",
+                "p11_entry_template", "p11_entry_template_pair", "p11_entry_template_types"]
+            for name in names:
+                entry_contract(variant, name)
+                _, insns = instructions(variant, name)
+                texts = dict(insns)
+                scalar = call_site(variant, name, "capture_scalar")
+                # Real caller context, descriptor index, ABI, START, Option
+                # destination, then the full-width finite F6 boundary.
+                args = {}
+                for register in ("r1", "r2", "r3", "r4", "r5"):
+                    args[register] = next((pc, text) for pc, text in reversed(insns)
+                        if pc < scalar and re.match("[rw]"+register[1:]+r" (=|\+=) ", text))
+                guard = site(variant, name, r"if r2 > r1 goto .*", 0)
+                sentinel = next((pc, text) for pc, text in insns if pc > guard and text == "r1 = -0x1")
+                init = next((pc, text) for pc, text in insns if text == "r1 = 0xffffffff ll")
+                user_payload = next((pc, text) for pc, text in reversed(insns)
+                    if pc < guard and re.fullmatch(r"r1 = \*\(u64 \*\)\(r10 - 0x[0-9a-f]+\)", text))
+                cases = [(args["r2"][0], "r2 = r10"), (args["r3"][0], "r3 = 0xff"),
+                         (args["r4"][0], "r4 = 0x2"), (args["r5"][0], "r5 = r10"),
+                         (args["r1"][0], "r1 = r6"),
+                         (guard, texts[guard].replace(" > ", " >= ")),
+                         (guard, "goto +0x0"), (sentinel[0], "r1 = 0x0"),
+                         (init[0], "r1 = 0x0")]
+                # A truncated payload can turn 0x100000002 into CKU_CONTEXT_SPECIFIC.
+                # IA32 legitimately produces only a zero-extended u32 payload.
+                if name != "p11_entry_ia32":
+                    cases.append((user_payload[0], user_payload[1].replace("u64", "u32")))
+                    cases.append((guard, re.sub(r"\br(\d+)\b", r"w\1", texts[guard])))
+                else:
+                    entry_contract(variant, name, mutate(OBJECTS[variant], name, guard, texts[guard],
+                        re.sub(r"\br(\d+)\b", r"w\1", texts[guard])))
+                for pc, new in cases:
+                    with self.subTest(variant=variant, function=name, pc=pc, mutation=new):
+                        with self.assertRaisesRegex(RuntimeError, "final-sink"):
+                            entry_contract(variant, name,
+                                mutate(OBJECTS[variant], name, pc, texts[pc], new))
+        # Exact interval complement includes every high-bit alias, not a sample
+        # set inferred from current emitted values.
+        entire = ((0, (1 << 64)-1),)
+        self.assertEqual(CHECKER["finite_intervals"](entire, "<", 3, True), ((0, 2),))
+        invalid = CHECKER["finite_intervals"](entire, "<", 3, False)
+        self.assertEqual(invalid, ((3, 3), (4, (1 << 64)-1)))
+        for value in (3, 0xffffffff, 1 << 32, (1 << 32)+1, (1 << 32)+2, (1 << 64)-1):
+            self.assertTrue(any(low <= value <= high for low, high in invalid))
 
     def test_mode_and_return_sink_controls(self):
         cases = [
@@ -515,21 +550,32 @@ class EntryObjectTests(unittest.TestCase):
                             self.assertIs(edges[nonzero_edge][("live", 77)], True)
 
     def test_proven_32bit_comparisons_and_shared_index_alias(self):
-        cases = [("default", "capture_scalar", site("default", "capture_scalar", r"if r4 == 0x0 goto .*")),
-                 ("default", "capture_scalar", site("default", "capture_scalar", r"if r1 == 0xff goto .*")),
-                 ("default", "capture_scalar", site("default", "capture_scalar", r"if r3 s> 0x2 goto .*")),
-                 ("unsafe", "capture_scalar", site("unsafe", "capture_scalar", r"r1 = r3", 0)),
-                 ("unsafe", "p11_entry_ia32", site("unsafe", "p11_entry_ia32", r"if r8 == 0xff goto .*")),
-                 ("unsafe", "p11_entry_ia32", site("unsafe", "p11_entry_ia32", r"if r0 == 0x0 goto \+0x1e")),
-                 ("unsafe", "p11_entry_ia32", site("unsafe", "p11_entry_ia32", r"if r0 > r1 goto .*"))]
-        for variant, suffix, pc in cases:
-            with self.subTest(variant=variant, function=suffix, pc=pc):
-                blocks = CHECKER["D"].function_blocks(OBJECTS[variant])
-                name = next(name for name in blocks if name.endswith(suffix))
-                old = dict(CHECKER["D"].instructions(blocks[name]))[pc]
-                new = re.sub(r"\br(\d+)\b", r"w\1", old)
-                changed = mutate(OBJECTS[variant], name, pc, old, new)
-                self.assertTrue(CHECKER["contract"](changed, variant)["verified"])
+        # Descriptor bytes and normalized IA32 user words may use JMP32;
+        # mixed register-copy spellings must still truncate their source.
+        for variant in OBJECTS:
+            entry_contract(variant, "p11_entry")
+            split = CHECKER["sections"](OBJECTS[variant])
+            lines = CHECKER["D"].function_blocks(split["uprobe"])["p11_entry"]
+            consumer = CHECKER["_OwnedCaller"]("uprobe", "p11_entry", lines, {})
+            proof = CHECKER["_OwnedSinkProof"](11, 0, True, ("owned", 7, 0))
+            pc = consumer.insns[0][0]
+            consumer.proof = proof
+            for copy in ("r1 = w6", "w1 = r6", "w1 = w6"):
+                with self.subTest(variant=variant, copy=copy):
+                    consumer.text[pc] = copy
+                    state = consumer.step(pc, {"r6": ("scalar", 11, 64)})
+                    self.assertEqual(state.get("r1"), ("scalar", 11, 32))
+            consumer.proof = None
+        self.assertEqual(CHECKER["finite_intervals"](((0, (1 << 64)-1),), "==", -1, True),
+                         (((1 << 64)-1, (1 << 64)-1),))
+        # The actual IA32 capture returns zero-extended u32 facts, so its
+        # finite classifier's comparison is a valid narrowed healthy twin.
+        name = "p11_entry_ia32"
+        _, insns = instructions("unsafe", name)
+        pc = site("unsafe", name, r"if r2 > r1 goto .*", 0)
+        old = dict(insns)[pc]
+        self.assertTrue(entry_contract("unsafe", name, mutate(OBJECTS["unsafe"], name, pc, old,
+            re.sub(r"\br(\d+)\b", r"w\1", old))))
 
     def test_async_callee_and_deleted_decoder_boundaries(self):
         blocks = CHECKER["D"].function_blocks(OBJECTS["unsafe"])
@@ -547,59 +593,38 @@ class EntryObjectTests(unittest.TestCase):
                     CHECKER["contract"](mutate(OBJECTS["unsafe"], name, pc, old, new), "unsafe")
 
     def test_each_final_role_store_cannot_disappear(self):
-        # Literal role stores from the independently inspected objects/layout.
-        cases = {
-            ('default', 'p11_entry'): [
-                site('default', 'p11_entry', '\\*\\(u64\\ \\*\\)\\(r10\\ \\-\\ 0x160\\)\\ =\\ r1', 2),
-                site('default', 'p11_entry', '\\*\\(u64\\ \\*\\)\\(r10\\ \\-\\ 0x158\\)\\ =\\ r1', 1),
-                site('default', 'p11_entry', '\\*\\(u64\\ \\*\\)\\(r10\\ \\-\\ 0x140\\)\\ =\\ r1', 1),
-                site('default', 'p11_entry', '\\*\\(u32\\ \\*\\)\\(r10\\ \\-\\ 0x130\\)\\ =\\ r1'),
-                site('default', 'p11_entry', '\\*\\(u64\\ \\*\\)\\(r10\\ \\-\\ 0x148\\)\\ =\\ r1', 2),
-                site('default', 'p11_entry', '\\*\\(u64\\ \\*\\)\\(r10\\ \\-\\ 0x138\\)\\ =\\ r1', 2),
-                site('default', 'p11_entry', '\\*\\(u32\\ \\*\\)\\(r10\\ \\-\\ 0x64\\)\\ =\\ r1'),
-                site('default', 'p11_entry', '\\*\\(u64\\ \\*\\)\\(r10\\ \\-\\ 0x110\\)\\ =\\ r1', 2),
-                site('default', 'p11_entry', '\\*\\(u64\\ \\*\\)\\(r10\\ \\-\\ 0x138\\)\\ =\\ r1', 3),
-            ],
-            ('unsafe', 'p11_entry'): [
-                site('unsafe', 'p11_entry', '\\*\\(u64\\ \\*\\)\\(r10\\ \\-\\ 0x128\\)\\ =\\ r1', 3),
-                site('unsafe', 'p11_entry', '\\*\\(u64\\ \\*\\)\\(r10\\ \\-\\ 0x120\\)\\ =\\ r1', 2),
-                site('unsafe', 'p11_entry', '\\*\\(u64\\ \\*\\)\\(r10\\ \\-\\ 0x108\\)\\ =\\ r1', 2),
-                site('unsafe', 'p11_entry', '\\*\\(u32\\ \\*\\)\\(r10\\ \\-\\ 0xf8\\)\\ =\\ r1'),
-                site('unsafe', 'p11_entry', '\\*\\(u64\\ \\*\\)\\(r10\\ \\-\\ 0x110\\)\\ =\\ r7'),
-                site('unsafe', 'p11_entry', '\\*\\(u64\\ \\*\\)\\(r10\\ \\-\\ 0x100\\)\\ =\\ r1', 2),
-                site('unsafe', 'p11_entry', '\\*\\(u64\\ \\*\\)\\(r10\\ \\-\\ 0xd8\\)\\ =\\ r1', 6),
-                site('unsafe', 'p11_entry', '\\*\\(u64\\ \\*\\)\\(r10\\ \\-\\ 0xd8\\)\\ =\\ r1', 2),
-                site('unsafe', 'p11_entry', '\\*\\(u64\\ \\*\\)\\(r10\\ \\-\\ 0xd8\\)\\ =\\ r1', 8),
-                site('unsafe', 'p11_entry', '\\*\\(u64\\ \\*\\)\\(r10\\ \\-\\ 0xd8\\)\\ =\\ r1', 4),
-                site('unsafe', 'p11_entry', '\\*\\(u64\\ \\*\\)\\(r10\\ \\-\\ 0xd8\\)\\ =\\ r1', 7),
-                site('unsafe', 'p11_entry', '\\*\\(u64\\ \\*\\)\\(r10\\ \\-\\ 0xd8\\)\\ =\\ r1', 3),
-                site('unsafe', 'p11_entry', '\\*\\(u64\\ \\*\\)\\(r10\\ \\-\\ 0xd8\\)\\ =\\ r1', 5),
-                site('unsafe', 'p11_entry', '\\*\\(u64\\ \\*\\)\\(r10\\ \\-\\ 0x100\\)\\ =\\ r1', 7),
-                site('unsafe', 'p11_entry', '\\*\\(u64\\ \\*\\)\\(r10\\ \\-\\ 0x100\\)\\ =\\ r1', 3),
-                site('unsafe', 'p11_entry', '\\*\\(u64\\ \\*\\)\\(r10\\ \\-\\ 0x100\\)\\ =\\ r1', 9),
-                site('unsafe', 'p11_entry', '\\*\\(u64\\ \\*\\)\\(r10\\ \\-\\ 0x100\\)\\ =\\ r1', 5),
-                site('unsafe', 'p11_entry', '\\*\\(u64\\ \\*\\)\\(r10\\ \\-\\ 0x100\\)\\ =\\ r1', 8),
-                site('unsafe', 'p11_entry', '\\*\\(u64\\ \\*\\)\\(r10\\ \\-\\ 0x100\\)\\ =\\ r1', 4),
-                site('unsafe', 'p11_entry', '\\*\\(u64\\ \\*\\)\\(r10\\ \\-\\ 0x100\\)\\ =\\ r1', 6),
-            ],
-            ('unsafe', 'p11_entry_ia32'): [
-                site('unsafe', 'p11_entry_ia32', '\\*\\(u64\\ \\*\\)\\(r10\\ \\-\\ 0x120\\)\\ =\\ r0'),
-                site('unsafe', 'p11_entry_ia32', '\\*\\(u64\\ \\*\\)\\(r10\\ \\-\\ 0x118\\)\\ =\\ r0'),
-                site('unsafe', 'p11_entry_ia32', '\\*\\(u64\\ \\*\\)\\(r10\\ \\-\\ 0x100\\)\\ =\\ r0'),
-                site('unsafe', 'p11_entry_ia32', '\\*\\(u32\\ \\*\\)\\(r10\\ \\-\\ 0xf0\\)\\ =\\ r0'),
-                site('unsafe', 'p11_entry_ia32', '\\*\\(u64\\ \\*\\)\\(r10\\ \\-\\ 0x108\\)\\ =\\ r0'),
-                site('unsafe', 'p11_entry_ia32', '\\*\\(u64\\ \\*\\)\\(r10\\ \\-\\ 0xf8\\)\\ =\\ r0', 0),
-                site('unsafe', 'p11_entry_ia32', '\\*\\(u64\\ \\*\\)\\(r10\\ \\-\\ 0xd0\\)\\ =\\ r0'),
-                site('unsafe', 'p11_entry_ia32', '\\*\\(u64\\ \\*\\)\\(r10\\ \\-\\ 0xf8\\)\\ =\\ r0', 1),
-            ],
-        }
-        for (variant, name), pcs in cases.items():
-            insns = dict(CHECKER["D"].instructions(CHECKER["D"].function_blocks(OBJECTS[variant])[name]))
-            for pc in pcs:
-                with self.subTest(variant=variant, function=name, pc=pc):
-                    self.assertTrue(insns[pc].startswith("*(u"))
-                    with self.assertRaisesRegex(RuntimeError, "final-sink"):
-                        CHECKER["contract"](mutate(OBJECTS[variant], name, pc, insns[pc], "r0 = r0"), variant)
+        # These are independently specified CallStart fields. Owned construction
+        # is not evidence that any semantic capture reached its destination.
+        expected = {6: (8, 8), 7: (0x10, 8), 10: (0x28, 8), 11: (0x38, 4),
+                    8: (0x20, 8), 9: (0x30, 8), "join": (0x58, 8), "get": (0x30, 8)}
+        for variant in OBJECTS:
+            names = ["p11_entry"] if variant == "default" else ["p11_entry", "p11_entry_ia32",
+                "p11_entry_template", "p11_entry_template_pair", "p11_entry_template_types"]
+            for name in names:
+                with self.subTest(variant=variant, function=name, control="healthy"):
+                    try:
+                        result = entry_contract(variant, name)
+                    except RuntimeError as error:
+                        self.fail("actual owned-START sink rejected: " + str(error))
+                    self.assertIn(11, result["roles"])
+                _, insns = instructions(variant, name)
+                calls = [pc for caller, _, pc, target in CHECKER["D"].internal_call_targets(OBJECTS[variant])
+                         if caller == name and target.endswith("capture_scalar")]
+                roles = (6, 7, 10, 11, 9, 8) + ((16, "join", "get") if name in ("p11_entry", "p11_entry_ia32") else (12, 13))
+                self.assertEqual(len(calls), len(roles))
+                for role, (offset, size) in expected.items():
+                    if role not in roles:
+                        continue
+                    call = calls[roles.index(role)]
+                    end = calls[roles.index(role)+1] if roles.index(role)+1 < len(calls) else insns[-1][0]+1
+                    stores = [(pc, text) for pc, text in insns if call < pc < end
+                              and re.fullmatch(rf"\*\(u{size*8} \*\)\(r[6-9] \+ {offset:#x}\) = [rw]\d+", text)]
+                    self.assertEqual(len(stores), 1, (name, role, stores))
+                    pc, old = stores[0]
+                    with self.subTest(variant=variant, function=name, role=role):
+                        with self.assertRaisesRegex(RuntimeError, "final-sink"):
+                            entry_contract(variant, name,
+                                mutate(OBJECTS[variant], name, pc, old, "r0 = r0"))
 
     def test_callee_scalar_reads_and_option_success(self):
         for variant in OBJECTS:
@@ -704,19 +729,29 @@ class EntryObjectTests(unittest.TestCase):
         self.assertTrue(CHECKER["contract"](restored, "default")["verified"])
 
     def test_unknown_postwrite_and_callee_start_clobber(self):
-        changed = mutate(OBJECTS["default"], "p11_entry", site('default', 'p11_entry', '\\*\\(u32\\ \\*\\)\\(r10\\ \\-\\ 0x68\\)\\ =\\ r4'),
-                         "*(u32 *)(r10 - 0x68) = r4", "*(u64 *)(r5 + 0x0) = r4")
-        with self.subTest(control="unknown postwrite"):
-            with self.assertRaisesRegex(RuntimeError, "final-sink"):
-                CHECKER["contract"](changed, "default")
         for variant in OBJECTS:
-            blocks = CHECKER["D"].function_blocks(OBJECTS[variant])
-            name = next(name for name in blocks if name.endswith("capture_scalar"))
-            with self.subTest(variant=variant):
-                changed = mutate(OBJECTS[variant], name, site(variant, name, r"\*\(u32 \*\)\(r5 \+ 0x100\) = r1"),
-                                 "*(u32 *)(r5 + 0x100) = r1", "*(u32 *)(r5 + 0x8) = r1")
+            entry_contract(variant, "p11_entry")
+            name, insns = instructions(variant, "p11_entry")
+            epilogue = next((pc, text) for pc, text in reversed(insns)
+                            if text == "r0 = 0x0")
+            # An unresolved call at the final live exit cannot inherit the
+            # field guarantees established before it, even with no pointer arg.
+            with self.subTest(variant=variant, control="unknown call"):
                 with self.assertRaisesRegex(RuntimeError, "final-sink"):
-                    CHECKER["contract"](changed, variant)
+                    entry_contract(variant, name, mutate(OBJECTS[variant], name, epilogue[0],
+                        epilogue[1], "call 0x123456", internal_call=True))
+            with self.subTest(variant=variant, control="unknown write"):
+                with self.assertRaisesRegex(RuntimeError, "final-sink"):
+                    entry_contract(variant, name, mutate(OBJECTS[variant], name, epilogue[0],
+                        epilogue[1], "*(u64 *)(r5 + 0x0) = r4"))
+            internal_contract(variant, "scalar_body_contract")
+            scalar, scalar_insns = instructions(variant, "capture_scalar")
+            pc, old = next((pc, text) for pc, text in scalar_insns
+                           if re.fullmatch(r"\*\(u32 \*\)\(r7 \+ 0x100\) = [rw]1", text))
+            with self.subTest(variant=variant, control="callee START clobber"):
+                with self.assertRaisesRegex(RuntimeError, "final-sink"):
+                    internal_contract(variant, "scalar_body_contract", mutate(OBJECTS[variant], scalar, pc,
+                        old, old.replace("+ 0x100", "+ 0x8")))
 
     def test_helper_invocation_without_success_path_is_insufficient(self):
         cases = [("unsafe", "p11_entry", site("unsafe", "p11_entry", r"if r0 != 0x0 goto \+0x3", 0), "goto +0x3")]
@@ -920,17 +955,25 @@ class EntryObjectTests(unittest.TestCase):
             CHECKER["contract"](changed, "default")
 
     def test_lifecycle_start_insert_bypass_is_rejected(self):
-        # The async lifecycle continuation must reach the semantic START
-        # insertion on every path; a direct exit after the lifecycle match is
-        # exactly the bypass the rule exists to catch.
-        _, insns = instructions("default", "p11_entry")
-        lifecycle = [p for p, t in insns if re.fullmatch(r"if r\d+ == 0xc goto .*", t)]
-        self.assertEqual(len(lifecycle), 1)
-        exit_pc = site("default", "p11_entry", "exit")
-        pc, old = next((p, t) for p, t in insns if p > lifecycle[0])
-        new = f"goto {exit_pc - pc - 1:+#x}"
-        with self.assertRaisesRegex(RuntimeError, "bypasses START insertion"):
-            CHECKER["contract"](mutate(OBJECTS["default"], "p11_entry", pc, old, new), "default")
+        # Construction is already committed. A semantic refusal must take its
+        # removal attempt and fault terminal; a live normal exit cannot mask it.
+        for variant in OBJECTS:
+            name = "p11_entry"
+            entry_contract(variant, name)
+            _, insns = instructions(variant, name)
+            texts = dict(insns)
+            fault = call_site(variant, name, "p11_object_fault")
+            remove = max(pc for caller, _, pc, target in CHECKER["D"].internal_call_targets(OBJECTS[variant])
+                         if caller == name and target == "p11_owner_start_remove" and pc < fault)
+            adapter = call_site(variant, name, "object_fill_entry")
+            guard, old = next((pc, text) for pc, text in insns if pc > adapter and text.startswith("if "))
+            exit_pc = site(variant, name, "exit")
+            cases = [(fault, "r0 = 0x0"), (remove, "r0 = 0x0"),
+                     (guard, f"goto {exit_pc-guard-1:+#x}")]
+            for pc, new in cases:
+                with self.subTest(variant=variant, pc=pc):
+                    with self.assertRaisesRegex(RuntimeError, "final-sink.*(terminal|refusal|removal|pending)"):
+                        entry_contract(variant, name, mutate(OBJECTS[variant], name, pc, texts[pc], new))
 
     def test_kernel_stack_opt_out_is_only_the_out_of_range_index(self):
         # Every uprobe program first tail-calls a program array (p11_entry:

@@ -132,6 +132,27 @@ def stack_read(state, pointer, size, offset=0):
     return None
 
 
+def capture_read(state, pointer, size, offset=0):
+    if pointer and pointer[0] == "owned":
+        for key, fact in state.items():
+            if (isinstance(key, tuple) and key[:3] == ("owned_word", pointer[1], pointer[2]+offset)
+                    and key[3] >= size):
+                return narrow(fact, size*8)
+        return None
+    return stack_read(state, pointer, size, offset)
+
+
+def capture_pointer(pointer, offset):
+    return ("owned", pointer[1], pointer[2]+offset) if pointer[0] == "owned" else ("stack", pointer[1]+offset)
+
+
+def forget_owned(state, owner=None, offset=0, size=0x1000):
+    for key in list(state):
+        if (isinstance(key, tuple) and key[0] == "owned_word" and (owner is None or key[1] == owner)
+                and key[2] < offset+size and offset < key[2]+key[3]):
+            del state[key]
+
+
 def sections(disassembly):
     parts = re.split(r"(?m)^Disassembly of section ([^:]+):\s*$", disassembly)
     return dict(zip(parts[1::2], parts[2::2]))
@@ -342,38 +363,6 @@ DESTINATIONS = {6: (8, 8), 7: (0x10, 8), 10: (0x28, 8),
                 11: (0x38, 4), 8: (0x20, 8), 9: (0x30, 8),
                 "join": (0x58, 8), "get": (0x30, 8), 16: (0x104, 4)}
 LP64_OFFSETS = (0x70, 0x68, 0x60, 0x58, 0x48, 0x40)
-LP64_READS = {
-    6: ([1188, 1063, 1192, 1156, 1190, 1151], 1169),
-    7: ([1243, 1199, 1247, 1210, 1245, 1205], 1223),
-    10: ([1298, 1255, 1302, 1267, 1300, 1262], 1280),
-    11: ([1359, 1313, 1363, 1328, 1361, 1319], 1341),
-    8: ([1704, 1570, 1382, 1470, 1395, 1475], 1424),
-    9: ([1466, 1478, 1375, 1468, 1389, 1473], 1409),
-    16: ([1564, 1580, 1527, 1566, 1533, 1568], 1546),
-    "join": ([1686, 1591, 1692, 1619, 1689, 1606], 1633),
-    "get": ([1695, 1599, 1701, 1641, 1698, 1613], 1655),
-}
-IA32_READS = {6: 1959, 7: 2048, 10: 2070, 11: 2096,
-              8: 2142, 9: 2120, 16: 2211, "join": 2240, "get": 2262}
-LP64_DISPATCH = {6: (1057,), 7: (1194,), 10: (1249,), 11: (1308,),
-                 8: (1366, 1377), 9: (1369, 1370), 16: (1492, 1522),
-                 "join": (1586,), "get": (1594,)}
-IA32_DISPATCH = {6: (1956,), 7: (2045,), 10: (2068,), 11: (2094,),
-                 8: (2116,), 9: (2118,), 16: (2180,), "join": (2237,), "get": (2259,)}
-SCALAR_CALLS = {
-    "default": {1067: 6, 1080: 7, 1093: 10, 1109: 11, 1195: 8,
-                1228: 9, 1285: 16, 1455: "join", 1469: "get"},
-    "p11_entry_template": {2546: 6, 2559: 7, 2571: 10, 2588: 11,
-                           2604: 9, 2696: 8, 2746: 12, 2757: 13},
-    "p11_entry_template_pair": {3062: 6, 3075: 7, 3087: 10, 3104: 11,
-                                3120: 9, 3212: 8, 3262: 12, 3273: 13},
-    "p11_entry_template_types": {3729: 6, 3742: 7, 3754: 10, 3771: 11,
-                                 3787: 9, 3879: 8, 3929: 12, 3940: 13},
-    "p11_entry_template_second": {3498: 14, 3510: 15},
-}
-SEMANTIC_INSERT = {"default": 1253, "p11_entry": 1497, "p11_entry_ia32": 2185,
-                   "p11_entry_template": 2789, "p11_entry_template_pair": 3305,
-                   "p11_entry_template_types": 3972}
 BYTE_DOMAIN = frozenset(range(256))
 # TAIL_CALLS_NO_PRIVATE_STACK_INDEX: an index no slot of TAIL_CALLS,
 # STACK_GUARD, or PAIR_CALLS has (always falls through).
@@ -481,7 +470,7 @@ class SinkProof:
         else:
             offset, size = DESTINATIONS[self.role]
             expected = ("selected", 16) if self.role == 16 else self.scalar(width=32 if size == 4 else (32 if self.abi else 64))
-            actual = stack_read(state, self.start, size, offset)
+            actual = capture_read(state, self.start, size, offset)
             require(actual == expected, self.fail(consumer, pc, f"successful capture lost at START+{offset:#x}: {actual}"))
         self.witnesses.add(pc)
 
@@ -540,7 +529,7 @@ class SinkProof:
                 state[("domain", pointer[2])] = BYTE_DOMAIN
             elif pointer == ("context", 0x98) and width == "64":
                 state[reg(dst)] = ("rsp", 64, 0)
-            elif pointer and pointer[0] == "owned" and before.get(("live", pointer[1])):
+            elif self.kind == "return" and pointer and pointer[0] == "owned" and before.get(("live", pointer[1])):
                 state[reg(dst)] = ("retained", pointer[2], int(width))
             elif pointer and pointer[0] == "function_value" and pointer[2] == 0 and width == "32" and before.get(("live", pointer[1])):
                 state[reg(dst)] = ("selected", 16)
@@ -564,7 +553,7 @@ class SinkProof:
             old, rhs = before.get(reg(dst)), value(before, src)
             fact = None
             if op == "=" and rhs:
-                fact = narrow(rhs, 32) if dst.startswith("w") else rhs
+                fact = narrow(rhs, 32) if dst.startswith("w") or src.startswith("w") else rhs
             elif op == "+=" and old == ("result", "map"):
                 # Offset selection within a BPF map value cannot turn its
                 # address space into the local frame's address space.
@@ -678,7 +667,8 @@ class SinkProof:
                               f"pointer={before.get('r1')} START={before.get('r2')}"))
                 # Conditional-success summary of the independently checked
                 # callee. Only its successful selection creates this obligation.
-                state[("stack", self.start[1]+0x104, 4)] = ("selected", 16)
+                state[("owned_word", self.start[1], self.start[2]+0x104, 4) if self.start[0] == "owned"
+                      else ("stack", self.start[1]+0x104, 4)] = ("selected", 16)
                 self.captured(state)
                 self.boundaries.add("async_name")
         if text == "call 0x72" and self.role == 16:
@@ -695,7 +685,7 @@ class SinkProof:
         if target == "p11_decode_params":
             require(self.kind == "entry" and self.mode != "second"
                     and before.get("r3") == ("constant", 4 if self.abi else 8)
-                    and before.get("r4") == ("stack", self.start[1]+0x40), error("layout/decoder word bytes or output"))
+                    and before.get("r4") == capture_pointer(self.start, 0x40), error("layout/decoder word bytes or output"))
             if self.role == 8:
                 require(before.get("r1") == self.scalar(8) and before.get(("nonnull",)) is True,
                         error("decoder mechanism field 8 pointer"))
@@ -703,8 +693,7 @@ class SinkProof:
         if target == "p11_walk_template" or target == "p11_walk_template_types":
             ordinary = target == "p11_walk_template"
             require((ordinary and self.mode in (1, 3, "second")) or (not ordinary and self.mode == 2), error("mode walker callee"))
-            destination = (("owned", self.start[1], 0xb0) if self.mode == "second"
-                           else ("stack", self.start[1]+0x60))
+            destination = capture_pointer(self.start, 0xb0 if self.mode == "second" else 0x60)
             require(before.get("r3") == ("constant", 4 if self.abi else 8)
                     and before.get("r4") == destination, error("mode walker word bytes/output/owned START"))
             if self.role == "template":
@@ -723,10 +712,11 @@ class SinkProof:
             # Which array each program may use is check-bpf-map-defs' rule.
             pass
         elif text == "call 0xc" and pc in consumer.helper:
-            require(self.mode == 3 and before.get(("inserted",)) is True
+            require(self.mode == 3 and (before.get(("inserted",)) is True
+                    or self.start[0] == "owned" and before.get(("live", self.start[1])))
                     and before.get("r1") == ("context", 0)
                     and before.get("r2") == ("map", "PAIR_CALLS")
-                    and before.get("r3") == ("constant", 0), error("mode pair tail needs successful insertion and slot 0"))
+                    and before.get("r3") == ("constant", 0), error("mode pair tail needs live START and slot 0"))
             self.boundaries.add("tail")
         if self.kind == "return" and pc in self.retained_sites:
             offset, lifecycle, abi = self.retained_sites[pc]
@@ -1083,6 +1073,206 @@ class _SeedCaller(Consumer):
         return state
 
 
+class _OwnedCaller(_SeedCaller):
+    """Track mutable START bytes separately from every local BPF frame.
+
+    These are caller API footprints, not claims about native transaction bodies.
+    Unknown aliases and callees erase the facts they might overwrite.
+    """
+    def transfer(self, pc, incoming):
+        state = super().transfer(pc, incoming)
+        text, target = self.text[pc], self.calls.get(pc, "")
+        if match := STORE.fullmatch(text):
+            width, base, sign, offset, src = match.groups()
+            pointer = address(incoming, base, sign, offset)
+            if pointer and pointer[0] == "owned":
+                size = int(width)//8
+                forget_owned(state, pointer[1], pointer[2], size)
+                fact = narrow(value(incoming, src), int(width))
+                if fact is not None:
+                    state[("owned_word", pointer[1], pointer[2], size)] = fact
+                    # A later adjacent u32 shape update may overlap the high
+                    # half of this initialized u64 without touching user_type.
+                    if size == 8 and fact[0] == "constant":
+                        for delta in (0, 4):
+                            state[("owned_word", pointer[1], pointer[2]+delta, 4)] = ("constant", (fact[1] >> (delta*8)) & 0xffffffff)
+            elif pointer is None and incoming.get("r"+base, (None,))[0] != "result":
+                forget_owned(state)
+        if match := LOAD.fullmatch(text):
+            pointer = address(incoming, match[3], match[4], match[5])
+            if pointer and pointer[0] == "owned":
+                fact = capture_read(incoming, pointer, int(match[2])//8)
+                state.pop(reg(match[1]), None)
+                if fact is not None:
+                    state[reg(match[1])] = fact
+        if "atomic" in text or "xchg" in text or text.startswith("lock "):
+            match = ATOMIC_POINTER.search(text) or EXCHANGE_POINTER.search(text)
+            pointer = address(incoming, *match.groups()[1:]) if match else None
+            if pointer and pointer[0] == "owned":
+                forget_owned(state, pointer[1], pointer[2], int(match[1])//8)
+            elif pointer is None and not (match and incoming.get("r"+match[2], (None,))[0] == "result"):
+                forget_owned(state)
+        if text.startswith("call "):
+            if not target and pc not in self.helper:
+                forget_owned(state)
+            if pc in self.helper:
+                if text in ("call 0x70", "call 0x72"):
+                    pointer, size = incoming.get("r1"), incoming.get("r2")
+                    if pointer and pointer[0] == "owned" and size and size[0] == "constant":
+                        forget_owned(state, pointer[1], pointer[2], size[1])
+                    elif not pointer or pointer[0] not in ("stack", "result"):
+                        forget_owned(state)
+                elif text not in ("call 0x1", "call 0x5", "call 0xc", "call 0xe", "call 0xae"):
+                    forget_owned(state)
+            if target.endswith("capture_scalar"):
+                pointer = incoming.get("r5")
+                if pointer and pointer[0] == "owned":
+                    forget_owned(state, pointer[1], pointer[2]+0x100, 4)
+            elif target.endswith("capture_async_target"):
+                pointer = incoming.get("r2")
+                if pointer and pointer[0] == "owned":
+                    forget_owned(state, pointer[1], pointer[2]+0x100, 8)
+            elif target in ("p11_decode_params", "p11_walk_template", "p11_walk_template_types"):
+                pointer = incoming.get("r4")
+                if pointer and pointer[0] == "owned":
+                    forget_owned(state, pointer[1], pointer[2], 24 if target == "p11_decode_params" else 80)
+            elif target == "p11_owner_start_get":
+                state["r0"] = ("owned", pc, 0)
+            elif target == "p11_owner_start_remove":
+                forget_owned(state)
+            elif target and not (target in ("memset", "p11_link_current_identity", "p11_instance_entry",
+                    "p11_owner_start_begin", "p11_owner_start_aggregate", "p11_object_side_get", "p11_object_fault")
+                    or any(target.endswith(suffix) for suffix in ("scope_auth", "scope_flags_word", "object_marker_for",
+                        "object_record_entry_abi", "object_fill_entry", "object_entry_derive", "object_entry_results",
+                        "object_entry_find", "object_entry_attributes"))):
+                forget_owned(state)
+        if match := re.fullmatch(r"(r\d+) \+= (-?0x[0-9a-f]+)", text):
+            fact = incoming.get(match[1])
+            if fact and fact[0] == "owned":
+                state[match[1]] = ("owned", fact[1], fact[2]+int(match[2],16))
+        if match := re.fullmatch(r"([rw]\d+) = (w\d+)", text):
+            state.pop(reg(match[1]), None)
+            fact = narrow(value(incoming, match[2]), 32)
+            if fact is not None:
+                state[reg(match[1])] = fact
+        return state
+
+
+def finite_intervals(intervals, op, constant, taken):
+    """Exact unsigned scalar partition; neither examples nor truncated aliases."""
+    constant &= (1 << 64)-1
+    result = []
+    for low, high in intervals:
+        cuts = sorted({low, high+1, max(low, min(high+1, constant)),
+                       max(low, min(high+1, constant+1))})
+        for begin, end in zip(cuts, cuts[1:]):
+            if begin < end and compare(begin, op, constant) == taken:
+                result.append((begin, end-1))
+    return tuple(result)
+
+
+class _OwnedSinkProof(SinkProof):
+    def partition(self, state):
+        intervals = state.get(("finite_values",))
+        finite = None
+        if intervals is not None:
+            finite = "mixed"
+            if all(high < 3 for _, high in intervals):
+                finite = "valid"
+            elif all(low >= 3 for low, _ in intervals):
+                finite = "invalid"
+        return super().partition(state) + (state.get(("live", self.start[1])),
+            state.get(("cleanup",)), state.get(("poisoned",)), state.get(("entry_pending",)),
+            state.get(("entry_refusal",)), finite)
+
+    @staticmethod
+    def join(previous, state):
+        merged = SinkProof.join(previous, state)
+        if previous is not None and ("finite_values",) in previous and ("finite_values",) in state:
+            merged[("finite_values",)] = tuple(sorted(set(previous[("finite_values",)]) | set(state[("finite_values",)])))
+        return merged
+
+    def captured(self, state):
+        super().captured(state)
+        if self.role == 11:
+            state[("finite_values",)] = ((0, (1 << (32 if self.abi else 64))-1),)
+
+    def check_sink(self, consumer, pc, state):
+        if state.get(("cleanup",)):
+            require(state.get(("poisoned",)), self.fail(consumer, pc, "removed START lacks terminal fault"))
+            return
+        require(not state.get(("entry_pending",)) and not state.get(("entry_refusal",)),
+                self.fail(consumer, pc, "entry refusal/pending adapter bypassed terminal cleanup"))
+        if not state.get(("live", self.start[1])):
+            require(not self.required(state), self.fail(consumer, pc, "capture lost owned START lifetime"))
+            return
+        if self.role == 11:
+            actual = capture_read(state, self.start, 4, 0x38)
+            intervals = state.get(("finite_values",))
+            if not state.get(("success",)):
+                require(actual == ("constant", 0xffffffff), self.fail(consumer, pc, "None lost USER_TYPE_NONE sentinel"))
+            else:
+                valid = intervals and all(high < 3 for _, high in intervals)
+                invalid = intervals and all(low >= 3 for low, _ in intervals)
+                require((valid and actual == self.scalar(width=32)) or (invalid and actual == ("constant", 0xffffffff)),
+                        self.fail(consumer, pc, "user type full-width finite classification lost"))
+                self.witnesses.add(pc)
+            return
+        super().check_sink(consumer, pc, state)
+
+    def transfer(self, consumer, pc, before, state):
+        text, target = consumer.text[pc], consumer.calls.get(pc, "")
+        memory = LOAD.fullmatch(text) or STORE.fullmatch(text)
+        if memory:
+            base, sign, offset = memory.groups()[2:5] if LOAD.fullmatch(text) else memory.groups()[1:4]
+            pointer = address(before, base, sign, offset)
+            if pointer and pointer[0] == "owned":
+                require(before.get(("live", pointer[1])), self.fail(consumer, pc, "START access outside owned lifetime"))
+        if target == "p11_owner_start_remove" and before.get(("live", self.start[1])):
+            state[("cleanup",)] = True
+        if any(target.endswith(suffix) for suffix in ("object_record_entry_abi", "object_fill_entry",
+                "object_entry_derive", "object_entry_results", "object_entry_find", "object_entry_attributes")):
+            require(not before.get(("entry_pending",)), self.fail(consumer, pc, "pending entry adapter result"))
+            state["r0"] = ("entry_adapter", pc)
+            state[("entry_pending",)] = pc
+        if target == "p11_object_fault":
+            require(not before.get(("live", self.start[1])), self.fail(consumer, pc, "terminal fault bypassed START removal attempt"))
+            if before.get(("cleanup",)):
+                state[("poisoned",)] = True
+        if text == "call 0xc" and before.get("r2") == ("map", "PAIR_CALLS"):
+            self.check_sink(consumer, pc, before)
+        return super().transfer(consumer, pc, before, state)
+
+    def edges(self, consumer, pc, before, after):
+        branch = BRANCH.fullmatch(consumer.text[pc])
+        for successor, state in super().edges(consumer, pc, before, after):
+            if branch:
+                left, right = value(before, branch[1]), value(before, branch[3])
+                zero_taken = zero_partition(left, branch[2], 64) if left and right == ("constant", 0) else None
+                if left and left[0] == "entry_adapter" and zero_taken is not None:
+                    require(branch[1].startswith("r"), self.fail(consumer, pc, "entry adapter result width"))
+                    state.pop(("entry_pending",), None)
+                    if (successor == D.relative_target(pc, consumer.text[pc])) == zero_taken:
+                        state[("entry_refusal",)] = True
+            if self.role == 11 and branch and before.get(("finite_values",)):
+                left, op, right = value(before, branch[1]), branch[2], value(before, branch[3])
+                scalar, constant = left, right
+                if left and left[0] == "constant" and right and right[0] == "scalar" and right[1] == 11:
+                    scalar, constant = right, left
+                    op = {">": "<", ">=": "<=", "<": ">", "<=": ">=", "==": "==", "!=": "!="}.get(op)
+                if scalar and scalar[0] == "scalar" and scalar[1] == 11 and constant and constant[0] == "constant":
+                    require(op is not None and not op.startswith("s") and (self.abi or scalar[2] == 64),
+                            self.fail(consumer, pc, "user type predicate narrowed full-width input"))
+                    width = 32 if branch[1].startswith("w") else 64
+                    boundary = constant[1] & ((1 << width)-1)
+                    intervals = finite_intervals(before[("finite_values",)], op, boundary,
+                        successor == D.relative_target(pc, consumer.text[pc]))
+                    if not intervals:
+                        continue
+                    state[("finite_values",)] = intervals
+            yield successor, state
+
+
 def scalar_scope_flags_contract(disassembly):
     """Summarize only the actual scalar wrapper's own-stack/full-word effects.
 
@@ -1273,49 +1463,32 @@ def seeded_start_contract(disassembly):
 
 def final_sink_contract(consumer, variant, selectors, internal_blocks, internal_calls):
     name = consumer.name
-    key = "default" if variant == "default" else name
     if name == "p11_return":
         return retained_contract(consumer, variant, selectors)
+    consumer = _OwnedCaller(consumer.section, name, consumer.lines, consumer.calls)
     mode = {"p11_entry_template": 1, "p11_entry_template_pair": 3,
             "p11_entry_template_types": 2, "p11_entry_template_second": "second"}.get(name, 0)
+    expected_roles = (14, 15) if mode == "second" else (6, 7, 10, 11, 9, 8) + ((16, "join", "get") if mode == 0 else (12, 13))
+    scalar_calls = sorted(pc for pc, target in consumer.calls.items() if target.endswith("capture_scalar"))
+    require(len(scalar_calls) == len(expected_roles), name + ": final-sink scalar-read inventory")
+    calls = dict(zip(scalar_calls, expected_roles))
+    constructors = [pc for pc, target in consumer.calls.items() if target == ("p11_owner_start_get" if mode == "second" else "p11_owner_start_begin")]
+    require(len(constructors) == 1, name + ": final-sink owned START constructor inventory")
+    start = ("owned", constructors[0], 0)
     if mode == 0:
-        # Capture failure must continue through the lifecycle match and START
-        # insertion, even though it creates no successful-scalar obligation.
-        lifecycle = [pc for pc, text in consumer.insns
-                     if re.fullmatch(r"if r\d+ == 0xc goto .*", text)]
-        require(len(lifecycle) == 1, name + ": async lifecycle continuation inventory")
-        capture = (next(pc for pc, role in SCALAR_CALLS["default"].items() if role == 16)
-                   if variant == "default" else LP64_DISPATCH[16][1]
-                   if name == "p11_entry" else IA32_READS[16])
+        lifecycle = [pc for pc, text in consumer.insns if re.fullmatch(r"if r\d+ == 0xc goto .*", text)]
+        require(len(lifecycle) == 1, name + ": final-sink async lifecycle continuation inventory")
+        capture = next(pc for pc, role in calls.items() if role == 16)
         exits = {pc for pc, text in consumer.insns if text == "exit"}
         require(not exits & D.reachable(consumer.graph, [capture], blocked={lifecycle[0]}),
-                name + ": async scalar failure bypasses lifecycle continuation")
-        require(not exits & D.reachable(consumer.graph, lifecycle, blocked={SEMANTIC_INSERT[key]}),
-                name + ": async lifecycle continuation bypasses START insertion")
-    if mode == "second":
-        owner_gets = [pc for pc, target in consumer.calls.items()
-                      if target == "p11_owner_start_get"]
-        require(len(owner_gets) == 1, name + ": retained START lookup inventory")
-        start = ("owned", owner_gets[0], 0)
-    else:
-        start = ("stack", -0x168 if variant == "default" else -0x130
-                 if name == "p11_entry" else -0x128)
+                name + ": final-sink async scalar failure bypasses lifecycle continuation")
     roles = ["template"] if mode == "second" else [6, 7, 10, 11, 8, 9]
     roles += [16, "join", "get"] if mode == 0 else ([] if mode == "second" else ["template"])
     for selector in selectors:
         abi = int(selector == 0x23)
         for present in (False, True):
             for role in roles:
-                reads, helpers = {}, {}
-                if variant == "unsafe" and name == "p11_entry" and role in LP64_READS:
-                    locations, helper = LP64_READS[role]
-                    reads = {pc: index for index, pc in enumerate(locations)}
-                    helpers = {helper: field_number(role)}
-                elif name == "p11_entry_ia32" and role in IA32_READS:
-                    helpers = {IA32_READS[role]: field_number(role)}
-                proof = SinkProof(role, abi, present, start, calls=SCALAR_CALLS.get(key),
-                                  reads=reads, helpers=helpers, insert=SEMANTIC_INSERT.get(key), mode=mode)
-                proof.dispatches = (LP64_DISPATCH if name == "p11_entry" else IA32_DISPATCH).get(role, ()) if variant == "unsafe" and name in ("p11_entry", "p11_entry_ia32") else ()
+                proof = _OwnedSinkProof(role, abi, present, start, calls=calls, mode=mode)
                 proof.decoder_required = variant == "unsafe" and role == 8
                 consumer.facts(proof=proof)
     return {"roles": roles, "mode": mode, "scenarios": len(selectors)*2}

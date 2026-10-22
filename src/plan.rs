@@ -7136,6 +7136,239 @@ mod tests {
         assert!(delta.retire.is_empty());
     }
 
+    fn counters_policy(endpoints: u64) -> AdmissionPolicy {
+        AdmissionPolicy::counters(crate::capacity::CounterBudget::new(endpoints).unwrap())
+    }
+
+    fn counters_plan(slots: Vec<Slot>, modules: Vec<ModuleSummary>, endpoints: u64) -> AttachPlan {
+        let mut plan =
+            AttachPlan::from_slots_with_policy(slots, counters_policy(endpoints)).unwrap();
+        plan.modules = modules;
+        plan.entries_seen = plan.slots.len();
+        plan
+    }
+
+    #[test]
+    fn counters_admits_a_complete_union_and_refuses_a_module_whole() {
+        let sources: Vec<_> = (0..3)
+            .map(|index| {
+                scanned_with(
+                    ObjectKey {
+                        device: TEST_OBJECT.device,
+                        inode: TEST_OBJECT.inode + index,
+                    },
+                    &format!("/opt/counter-{index}.so"),
+                    (0..4).map(|n| n * 8),
+                )
+            })
+            .collect();
+        let plan = build_from_test_sources_with_policy(&sources, &[], counters_policy(12));
+        assert_eq!(plan.slots.len(), 12);
+        assert!(plan.modules_skipped.is_empty());
+        assert_eq!(plan.admission_policy(), counters_policy(12));
+        assert!(plan.slots.iter().all(|slot| slot.descriptor_index == 0
+            && slot.semantics == SlotSemantics::COUNT_ONLY
+            && !slot.semantic_authorized));
+        assert!(plan.validate_slot_index().is_ok());
+
+        let refused = build_from_test_sources_with_policy(&sources, &[], counters_policy(4));
+        assert_eq!(refused.slots.len(), 4);
+        assert_eq!(refused.modules_skipped.len(), 2);
+        assert!(
+            refused
+                .slots
+                .iter()
+                .all(|slot| slot.object == refused.slots[0].object)
+        );
+        assert!(
+            refused
+                .modules_skipped
+                .iter()
+                .all(|skip| skip.reason.contains("counter endpoints"))
+        );
+        let none = build_from_test_sources_with_policy(&sources[..1], &[], counters_policy(3));
+        assert!(
+            none.slots.is_empty(),
+            "a refused provider leaves no partial union"
+        );
+        assert!(none.modules.is_empty());
+        assert_eq!(none.modules_skipped.len(), 1);
+
+        let all_tables = build_from_test_sources_with_policy(
+            &[scanned_with_heuristic_tables(64)],
+            &[],
+            counters_policy(64),
+        );
+        assert_eq!(all_tables.slots.len(), 64);
+        assert_eq!(all_tables.uncorroborated_candidates, 0);
+        let past_legacy_slots = build_from_test_sources_with_policy(
+            &[scanned_with(
+                TEST_OBJECT,
+                "/opt/counter-large.so",
+                (0..513).map(|index| index * 8),
+            )],
+            &[],
+            counters_policy(513),
+        );
+        assert_eq!(past_legacy_slots.slots.len(), 513);
+        assert_eq!(past_legacy_slots.slots[512].index, 512);
+        assert!(past_legacy_slots.modules_skipped.is_empty());
+
+        let rebuilt = refused.rebuild_from_sources(&sources, &[], &PinnedObjects::empty());
+        assert_eq!(rebuilt.admission_policy(), counters_policy(4));
+        let descriptor = crate::kinds::function_id("C_Sign").unwrap() + 1;
+        let error = AttachPlan::from_slots_with_policy(
+            vec![exact_slot(
+                0,
+                PinnedObjectId(7),
+                0x10,
+                descriptor,
+                vec![ModuleId(0)],
+            )],
+            counters_policy(1),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("counter") && error.contains("count-only"),
+            "{error}"
+        );
+
+        // These are the existing runtime factories. An absent explicit
+        // counter admission request keeps their previous policy selection.
+        let detailed = build_from_reconciled_modules(&sources);
+        assert_eq!(detailed.admission_policy(), AdmissionPolicy::Detailed);
+        let inventory = build_from_test_sources_with_policy(&sources, &[], inventory_policy(12));
+        assert_eq!(inventory.admission_policy(), inventory_policy(12));
+        assert_eq!(inventory.slots.len(), 12);
+    }
+
+    #[test]
+    fn counter_growth_preserves_allocated_positions_and_refuses_whole_module() {
+        let aliased = manifest_with(vec![resolved("C_Sign", 0x10), resolved("C_Verify", 0x10)]);
+        let mut other_inode = manifest_with(vec![resolved("C_Sign", 0x10)]);
+        assert_eq!(
+            aliased.provenance_objects[0].identity.sha256,
+            other_inode.provenance_objects[0].identity.sha256
+        );
+        other_inode.provenance_objects[0].inode = 99;
+        let initial =
+            build_from_test_sources_with_policy(&[], &[aliased, other_inode], counters_policy(3));
+        assert_eq!(
+            initial.slots.len(),
+            2,
+            "equal bytes do not merge different physical objects"
+        );
+        assert_eq!(
+            initial
+                .slots
+                .iter()
+                .map(AttachKey::of)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                AttachKey {
+                    object: PinnedObjectId(42),
+                    file_offset: 0x10
+                },
+                AttachKey {
+                    object: PinnedObjectId(99),
+                    file_offset: 0x10
+                },
+            ])
+        );
+        let alias = initial
+            .slots
+            .iter()
+            .find(|slot| slot.object == PinnedObjectId(42))
+            .unwrap();
+        assert_eq!(alias.names, ["C_Sign", "C_Verify"]);
+        assert!(alias.aliased);
+        let prefix: Vec<_> = initial
+            .slots
+            .iter()
+            .map(|slot| (slot.index, AttachKey::of(slot)))
+            .collect();
+        let mut plan = initial.clone();
+        let surviving = counters_plan(vec![initial.slots[0].clone()], initial.modules.clone(), 3);
+        let retired = plan.extend_exact(surviving).unwrap();
+        assert_eq!(retired.retire.len(), 1);
+        assert_eq!(retired.retire[0].index, 1);
+        assert!(!plan.is_active(1));
+        let appended = plan.extend_exact(initial.clone()).unwrap();
+        assert_eq!(appended.new.len(), 1);
+        assert_eq!(appended.new[0].index, 2);
+        assert_eq!(AttachKey::of(&appended.new[0]), prefix[1].1);
+        assert!(!plan.is_active(1));
+        assert!(plan.is_active(2));
+        assert_eq!(
+            plan.slots[..2]
+                .iter()
+                .map(|slot| (slot.index, AttachKey::of(slot)))
+                .collect::<Vec<_>>(),
+            prefix
+        );
+
+        let mut one_more = initial.slots.clone();
+        one_more.push(exact_slot(
+            2,
+            initial.slots[0].object,
+            0x1000,
+            0,
+            initial.slots[0].module_ids.clone(),
+        ));
+        let candidate = counters_plan(one_more, initial.modules.clone(), 3);
+        let before = plan.clone();
+        let error = plan.extend_exact(candidate).unwrap_err();
+        assert!(error.contains("counter endpoints"), "{error}");
+        assert_eq!(plan, before, "retired IDs cannot fund a partial extension");
+        for policy in [
+            counters_policy(4),
+            AdmissionPolicy::Detailed,
+            inventory_policy(3),
+        ] {
+            let mut mismatch =
+                AttachPlan::from_slots_with_policy(initial.slots.clone(), policy).unwrap();
+            mismatch.modules = initial.modules.clone();
+            let error = plan.extend_exact(mismatch).unwrap_err();
+            assert!(error.contains("admission policy"), "{error}");
+            assert_eq!(plan, before, "policy/budget mismatch must precede mutation");
+        }
+    }
+
+    #[test]
+    fn selection_table_capacity_refusal_names_the_counters_resource() {
+        let object = PinnedObjectId(7);
+        let allocated = counters_plan(
+            vec![exact_slot(0, object, 0x10, 0, vec![ModuleId(0)])],
+            vec![exact_module(0, object)],
+            2,
+        );
+        let mut rebuilt = counters_plan(vec![], allocated.modules.clone(), 2);
+        rebuilt
+            .add_selection_table(
+                &allocated,
+                ModuleId(0),
+                [selection_target(object, 0x20, "C_Encrypt")],
+            )
+            .unwrap();
+        assert_eq!(rebuilt.slots.len(), 1);
+        assert_eq!(rebuilt.slots[0].descriptor_index, 0);
+        assert_eq!(rebuilt.slots[0].semantics, SlotSemantics::COUNT_ONLY);
+        assert!(!rebuilt.slots[0].semantic_authorized);
+        let before = rebuilt.clone();
+        let error = rebuilt
+            .add_selection_table(
+                &allocated,
+                ModuleId(0),
+                [selection_target(object, 0x30, "C_Decrypt")],
+            )
+            .unwrap_err();
+        assert!(
+            error.contains("selection table needs 1 more of the 2 counter endpoints"),
+            "{error}"
+        );
+        assert_eq!(rebuilt, before, "a refused table leaves no prefix");
+    }
+
     #[test]
     fn inventory_admits_all_sixty_four_heuristic_tables_while_detailed_stays_k4() {
         let scanned = scanned_with_heuristic_tables(64);

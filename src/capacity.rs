@@ -2537,6 +2537,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn counter_budget_is_a_checked_endpoint_envelope() {
+        assert_eq!(MAX_COUNTER_ENDPOINT_LIMIT, 8_192);
+        for endpoints in [1, 64, 8_192] {
+            let budget = CounterBudget::new(endpoints).unwrap();
+            assert_eq!(budget.endpoint_limit(), endpoints);
+            assert!(budget.validate_count(endpoints as usize).is_ok());
+            let error = budget.validate_count(endpoints as usize + 1).unwrap_err();
+            assert!(
+                error.contains("counter") && error.contains("endpoints"),
+                "{error}"
+            );
+        }
+        for endpoints in [0, 8_193, u64::from(u32::MAX) + 1, u64::MAX] {
+            assert!(CounterBudget::new(endpoints).is_err());
+        }
+    }
+
+    #[test]
     fn inventory_endpoint_policy_checks_range_and_exact_payload() {
         let default = inventory_endpoint_budget(None).unwrap();
         assert_eq!(default.endpoint_limit(), 4096);

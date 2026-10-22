@@ -254,6 +254,29 @@ fn joint_prior_sealed_fixture_keeps_nonempty_original_two_domain_effects() {
         )
         .unwrap_or_else(|(_, reason)| panic!("original malformed collection: {reason:?}"));
     assert!(claim_and_finish(&mut fixture.scene, &ingested).is_empty());
+    let before_audit = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .model()
+        .project();
+    for object in &before.objects {
+        assert_eq!(
+            before_audit.object(object.id).unwrap().lifetime,
+            Lifetime::Live
+        );
+    }
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_h3_audit_state(),
+        (1, true)
+    );
     let frame = acquire(&mut fixture.scene, ingested, &fixture.attached, &BirthFault);
     let failure = frame
         .failure_for_test()
@@ -271,13 +294,96 @@ fn joint_prior_sealed_fixture_keeps_nonempty_original_two_domain_effects() {
         assert!(
             failure.effects.effects.iter().any(|effect| matches!(
                 effect,
-                ObjectEffect::Retired { object: affected, reason: ObjectGap::Loss }
+                ObjectEffect::Retired { object: affected, reason: ObjectGap::OutcomeLost }
                     if *affected == object.id
             )),
-            "both original registered domains retain their actual retirement effects"
+            "audit Voided must retain each original OutcomeLost retirement: {:?}",
+            failure.effects
+        );
+        assert_eq!(
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .joint_capture()
+                .model()
+                .project()
+                .object(object.id)
+                .unwrap()
+                .lifetime,
+            Lifetime::Retired(ObjectGap::OutcomeLost)
         );
     }
     assert!(!failure.effects.effects.is_empty());
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_h3_audit_state(),
+        (2, false)
+    );
+    let original_effects = failure.effects.clone();
+    fixture
+        .scene
+        .push(std::process::id(), 0, "C_CreateObject", 2);
+    let cut = fixture.scene.drain.consumption_cut().unwrap();
+    let reserve = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .semantic_storage_reserver();
+    let next = RawJointQuantum::collect_bounded_with_adapter(
+        &mut fixture.scene.drain,
+        &publish_object_descriptors(),
+        64,
+        None,
+        &BirthFault,
+        &fixture.scene.producers,
+        |bytes| reserve.reserve(bytes),
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture_mut()
+            .adapter_mut(),
+    );
+    assert!(matches!(
+        next,
+        Err(RawQuantumRefusal::Cut(
+            crate::semantics_objects::journal::BirthCutRefusal::Gap
+        ))
+    ));
+    assert!(
+        fixture
+            .scene
+            .drain
+            .consumption_cut()
+            .unwrap()
+            .same_boundary(&cut)
+    );
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .consumed_frontier()
+            == frame.frontier()
+    );
+    assert_eq!(failure.effects, original_effects);
+    assert!(
+        receipts
+            .iter()
+            .all(|receipt| failure.affects_domain(receipt.domain()))
+    );
     assert_eq!(
         fixture
             .scene

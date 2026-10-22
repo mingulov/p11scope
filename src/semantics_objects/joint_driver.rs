@@ -241,6 +241,7 @@ pub(crate) struct RawJointQuantum {
     ordinary: Vec<DecodedEventRecord>,
     audit: JournalCollection,
     native: NativeDomainId,
+    producers: SessionDrainProducers,
     descriptors: [ObjectDescriptorWire; MAX_DESCRIPTORS as usize],
     capacity: usize,
     attempted: usize,
@@ -440,7 +441,7 @@ impl RawJointQuantum {
     }
 
     pub(crate) fn matches_producers(&self, producers: &SessionDrainProducers) -> bool {
-        self.native == producers.native_domain() && self.audit.drain_domain == producers.events_id()
+        self.producers.same_producers(producers)
     }
 
     pub(crate) fn pending_h0_records(&self) -> usize {
@@ -453,10 +454,10 @@ impl RawJointQuantum {
         producers: &SessionDrainProducers,
     ) -> Result<(), RawQuantumRefusal> {
         if !self.matches_producers(producers)
-            || !adapter.resource_producers.as_ref().is_some_and(|retained| {
-                retained.native_domain() == producers.native_domain()
-                    && retained.events_id() == producers.events_id()
-            })
+            || !adapter
+                .resource_producers
+                .as_ref()
+                .is_some_and(|retained| retained.same_producers(producers))
         {
             return Err(RawQuantumRefusal::ForeignCapture);
         }
@@ -1177,6 +1178,7 @@ impl RawJointQuantum {
             ordinary,
             audit,
             native: producers.native_domain(),
+            producers: producers.clone(),
             descriptors: *descriptors,
             capacity: limit,
             attempted: 0,

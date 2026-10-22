@@ -110,7 +110,9 @@ impl CurrentPartitionReceipt {
     pub(crate) fn watched(&self) -> &RetainedInventoryTarget {
         &self.watched
     }
-    pub(crate) fn owned_ids_bytes(&self) -> Option<usize> {
+    /// Nested allocations owned by this receipt. Its inline holder and
+    /// shared file/export Arcs are accounted for by their existing owners.
+    pub(crate) fn owned_storage_bytes(&self) -> Option<usize> {
         let capacity = self.ids.capacity();
         capacity
             .checked_mul(std::mem::size_of::<InstanceId>())?
@@ -118,7 +120,8 @@ impl CurrentPartitionReceipt {
                 0
             } else {
                 crate::semantics_edge::resources::OWNED_ALLOCATION_PADDING
-            })
+            })?
+            .checked_add(self.watched.retained_copy_allocation_charge()?)
     }
     #[allow(clippy::result_large_err)] // Refusal returns the original receipt without allocating or discarding its custody.
     pub(crate) fn into_birth_candidate(mut self) -> Result<H0BirthCandidate, Self> {

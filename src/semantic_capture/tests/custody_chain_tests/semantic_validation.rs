@@ -951,18 +951,6 @@ fn joint_prepared_current_receipt_budget_includes_held_provider_allocations() {
             .prepared_semantic_batch()
             .is_none()
     );
-    assert!(
-        limited
-            .scene
-            .coordinator
-            .registry()
-            .gaps()
-            .iter()
-            .any(|gap| {
-                gap.subject == "semantic handoff storage refused"
-                    && gap.reason == "semantic_resource_capacity"
-            })
-    );
     assert!(!limited.scene.coordinator.stage_next_prepared_admission());
     assert!(
         !limited
@@ -989,6 +977,18 @@ fn joint_prepared_current_receipt_budget_includes_held_provider_allocations() {
         .coordinator
         .commit_batch_with_semantics(false, Some(&mut limited.lane))
         .unwrap();
+    assert!(
+        limited
+            .scene
+            .coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .any(|gap| {
+                gap.subject == "semantic handoff storage refused"
+                    && gap.reason == "semantic_resource_capacity"
+            })
+    );
     let rows = operation_edge_rows(&limited.scene);
     assert_eq!(rows.len(), 1);
     assert_eq!(

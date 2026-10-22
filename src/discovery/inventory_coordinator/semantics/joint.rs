@@ -130,7 +130,7 @@ impl PreparedSemanticBatch {
                 }
             }
             for receipt in &self.current {
-                bytes = bytes.checked_add(receipt.owned_ids_bytes()?)?;
+                bytes = bytes.checked_add(receipt.owned_storage_bytes()?)?;
             }
             Some(bytes)
         })();

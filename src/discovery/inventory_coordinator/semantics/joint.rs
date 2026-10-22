@@ -154,6 +154,15 @@ impl PreparedSemanticBatch {
         &self.current
     }
 
+    /// Test fixtures move the actual validated New receipts into the existing
+    /// birth verifier. No receipt or birth authority is copied or constructed.
+    #[cfg(test)]
+    pub(crate) fn take_current_for_birth_test(
+        &mut self,
+    ) -> Vec<crate::semantic_capture::CurrentPartitionReceipt> {
+        std::mem::take(&mut self.current)
+    }
+
     pub(crate) fn next_admission(&self) -> Option<&AdmittedInstanceCall> {
         self.entries[self.stage_cursor..]
             .iter()

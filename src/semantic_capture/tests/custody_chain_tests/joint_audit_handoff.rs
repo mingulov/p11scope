@@ -28,14 +28,14 @@ impl FaultEpoch for ReadFault {
     }
 }
 
-fn attachment(fixture: &mut JointScene) -> AttachedSemanticSet {
+pub(super) fn attachment(fixture: &mut JointScene) -> AttachedSemanticSet {
     fixture
         .attached
         .take()
         .expect("the actual separately minted attachment was sealed once")
 }
 
-fn claim_and_finish(
+pub(super) fn claim_and_finish(
     fixture: &mut JointScene,
     ingested: &IngestedRaw,
 ) -> Vec<(u64, JournalDomainProof)> {
@@ -95,7 +95,7 @@ fn claim_and_finish(
     claimed
 }
 
-fn acquire(
+pub(super) fn acquire(
     fixture: &mut JointScene,
     ingested: IngestedRaw,
     attached: &AttachedSemanticSet,

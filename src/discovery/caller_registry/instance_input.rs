@@ -77,6 +77,11 @@ impl AdmittedInstance {
 
 #[cfg(test)]
 impl AdmittedInstanceCall {
+    #[cfg(test)]
+    pub(crate) fn instance_key_for_test(&self) -> InstanceKey {
+        self.key.clone()
+    }
+
     /// Tests-only reference call (N1): a current-continuity call at
     /// `ordinal` carrying `facts`, for guarded-path tests.
     pub(crate) fn scripted(

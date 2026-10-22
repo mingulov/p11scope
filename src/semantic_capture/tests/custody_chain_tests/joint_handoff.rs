@@ -18,6 +18,8 @@ use p11scope_ebpf_common::object_wire::{OBJECT_ACTION_ACCESS, publish_object_des
 
 #[path = "joint_audit_handoff.rs"]
 mod audit_handoff;
+#[path = "joint_audit_fanout.rs"]
+mod fanout;
 
 struct JointScene {
     real: RealScene,
@@ -128,6 +130,11 @@ impl JointScene {
 
     fn bind(&mut self, pid: u32, image: ImageIdentity, files: &[u32]) -> CallerId {
         let caller = self.real.bind(pid, image, files[0] as usize);
+        self.admit_providers(pid, caller, files);
+        caller
+    }
+
+    fn admit_providers(&mut self, pid: u32, caller: CallerId, files: &[u32]) {
         for file in files {
             let candidate = self
                 .real
@@ -176,7 +183,6 @@ impl JointScene {
                 "the positive uses actual provider authority, not the legacy reference fallback"
             );
         }
-        caller
     }
 
     fn push(&mut self, pid: u32, file: u32, name: &str, sequence: u64) {
@@ -214,7 +220,14 @@ impl JointScene {
         begin[76..78].copy_from_slice(&((file + 1) as u16).to_le_bytes());
         begin[104..108].copy_from_slice(&slot.to_le_bytes());
         // The original END retains this START's exact physical interval.
-        let end = if init {
+        let end = if name == "C_CreateObject" {
+            end_bytes(
+                &begin,
+                p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE,
+                0,
+                sequence * 1_000 + 10,
+            )
+        } else if init {
             end_bytes(&begin, OBJECT_ACTION_ACCESS, 0, ENTRY_NS + 10)
         } else {
             end_bytes_absent(&begin, 0, ENTRY_NS + 10)
@@ -232,13 +245,28 @@ impl JointScene {
         count: usize,
         fault: &impl crate::semantics_objects::journal::FaultEpoch,
     ) -> RawJointQuantum {
+        let raw = self.collect_with_fault(fault);
+        assert_eq!(
+            raw.h0_input(self.real.lane.domain(), 64).unwrap().0.len(),
+            count
+        );
+        self.real.h0.0.borrow_mut().collected = Some(raw);
+        let batch = self.real.tick();
+        self.prepare_batch(batch, count);
+        self.real.h0.0.borrow_mut().collected.take().unwrap()
+    }
+
+    fn collect_with_fault(
+        &mut self,
+        fault: &impl crate::semantics_objects::journal::FaultEpoch,
+    ) -> RawJointQuantum {
         let reserve = self
             .real
             .scene
             .coordinator
             .registry()
             .semantic_storage_reserver();
-        let raw = RawJointQuantum::collect_bounded_with_adapter(
+        RawJointQuantum::collect_bounded_with_adapter(
             &mut self.drain,
             &publish_object_descriptors(),
             64,
@@ -252,13 +280,10 @@ impl JointScene {
                 .joint_capture_mut()
                 .adapter_mut(),
         )
-        .expect("actual persistent cursor collection");
-        assert_eq!(
-            raw.h0_input(self.real.lane.domain(), 64).unwrap().0.len(),
-            count
-        );
-        self.real.h0.0.borrow_mut().collected = Some(raw);
-        let batch = self.real.tick();
+        .expect("actual persistent cursor collection")
+    }
+
+    fn prepare_batch(&mut self, batch: SemanticBatch, count: usize) {
         assert_eq!(self.real.h0.0.borrow().last_calls.len(), count);
         self.real.scene.coordinator.stage_semantic_batch(batch);
         self.real
@@ -277,7 +302,6 @@ impl JointScene {
             count,
             "every physical original survived actual H0 and current receipt validation"
         );
-        self.real.h0.0.borrow_mut().collected.take().unwrap()
     }
 
     fn ingest(&mut self, raw: RawJointQuantum) -> (IngestedRaw, JournalDomainProof) {

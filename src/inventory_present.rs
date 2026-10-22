@@ -33,6 +33,7 @@ use crate::semantics_edge::resources::SemanticResourceSnapshot;
 use crate::semantics_edge::{EdgeEvidence, EdgeSemantics, S1Occupancy};
 
 mod render_index;
+pub(crate) use render_index::{PresentationRenderIndex, SemanticChildren};
 
 /// Trailing window for the dashboard display's "recently observed":
 /// an entry whose last-seen falls inside this window (of the frame's
@@ -524,6 +525,9 @@ pub(crate) struct Presentation {
     pub edges: Vec<EdgeView>,
     pub instances: Vec<InstanceView>,
     pub semantic_edges: Vec<InstanceSemanticView>,
+    /// Offsets into these immutable rows. A test fixture replacing rows must
+    /// rebuild this cache or reset it to the lossless linear default.
+    pub(crate) render_index: PresentationRenderIndex,
     pub gaps: Vec<GapView>,
     pub gaps_suppressed: u64,
     pub budgets: BudgetView,
@@ -729,7 +733,7 @@ impl Presentation {
                 semantics,
             });
         }
-        let instances = registry
+        let instances: Vec<InstanceView> = registry
             .instances()
             .map(|r| InstanceView {
                 id: r.id,
@@ -741,7 +745,7 @@ impl Presentation {
                 last_seen_ns: r.last_seen_ns,
             })
             .collect();
-        let semantic_edges = registry
+        let semantic_edges: Vec<InstanceSemanticView> = registry
             .instance_semantic_edges()
             .map(|r| {
                 let mut semantics = semantics_view(r.semantics.as_ref());
@@ -784,6 +788,7 @@ impl Presentation {
             .collect();
         let limits = registry.limits();
         let (observed_edges, saturated_edges) = registry.counter_census();
+        let render_index = PresentationRenderIndex::build(&instances, &semantic_edges);
         Self {
             scope_label: scope_label.to_string(),
             started_ns,
@@ -798,6 +803,7 @@ impl Presentation {
             edges,
             instances,
             semantic_edges,
+            render_index,
             gaps,
             gaps_suppressed: registry.gaps_suppressed(),
             semantic_capture: crate::inventory_semantics::SemanticCaptureSummary::default(),
@@ -863,6 +869,15 @@ impl Presentation {
                 preadmission: coordinator.preadmission_counters(),
             },
         }
+    }
+
+    pub(crate) fn semantic_children(
+        &self,
+        caller: CallerId,
+        module: ModuleId,
+    ) -> SemanticChildren<'_> {
+        self.render_index
+            .children(&self.instances, &self.semantic_edges, caller, module)
     }
 }
 

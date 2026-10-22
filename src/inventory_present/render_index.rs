@@ -1,6 +1,220 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! Bounded numeric-offset lookups within one immutable presentation.
 
+use super::{InstanceSemanticView, InstanceView};
+use crate::discovery::caller_registry::instance_input::MAX_REGISTRY_INSTANCES;
+use crate::discovery::caller_registry::{CallerId, ModuleId};
+use std::mem::size_of;
+use std::sync::Arc;
+
+const ALLOCATION_PADDING: usize = 32;
+const ARC_REQUEST_BYTES: usize = size_of::<SemanticIndex>() + 2 * size_of::<usize>();
+const MAX_INDEX_HEAP_BYTES: usize = MAX_REGISTRY_INSTANCES * size_of::<SemanticChildSlot>()
+    + ARC_REQUEST_BYTES
+    + 2 * ALLOCATION_PADDING;
+
+/// Optional optimization only: refusing its allocation retains linear reads
+/// of the complete captured views, with no capture-budget or evidence change.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PresentationRenderIndex {
+    indexed: Option<Arc<SemanticIndex>>,
+}
+
+#[derive(Debug)]
+struct SemanticIndex {
+    slots: Vec<SemanticChildSlot>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SemanticChildSlot {
+    pair: (CallerId, ModuleId),
+    semantic_row: usize,
+    instance_row: usize,
+}
+
+fn heap_envelope(capacity: usize) -> Option<usize> {
+    capacity
+        .checked_mul(size_of::<SemanticChildSlot>())?
+        .checked_add(ARC_REQUEST_BYTES)?
+        .checked_add(2 * ALLOCATION_PADDING)
+}
+
+impl PresentationRenderIndex {
+    pub(crate) fn build(
+        instances: &[InstanceView],
+        semantic_edges: &[InstanceSemanticView],
+    ) -> Self {
+        Self::build_checked(instances, semantic_edges, |_| true)
+    }
+
+    fn build_checked(
+        instances: &[InstanceView],
+        semantic_edges: &[InstanceSemanticView],
+        mut allow: impl FnMut(usize) -> bool,
+    ) -> Self {
+        if semantic_edges.is_empty()
+            || semantic_edges.len() > MAX_REGISTRY_INSTANCES
+            || instances.len() > MAX_REGISTRY_INSTANCES
+            || instances.windows(2).any(|pair| pair[0].id >= pair[1].id)
+        {
+            return Self::default();
+        }
+        let Some(requested) = semantic_edges
+            .len()
+            .checked_mul(size_of::<SemanticChildSlot>())
+        else {
+            return Self::default();
+        };
+        if !allow(requested) {
+            return Self::default();
+        }
+        let mut slots = Vec::new();
+        if slots.try_reserve_exact(semantic_edges.len()).is_err()
+            || slots.capacity() > MAX_REGISTRY_INSTANCES
+            || heap_envelope(slots.capacity()).is_none_or(|bytes| bytes > MAX_INDEX_HEAP_BYTES)
+        {
+            return Self::default();
+        }
+        for (semantic_row, child) in semantic_edges.iter().enumerate() {
+            let Ok(instance_row) = instances.binary_search_by_key(&child.instance, |row| row.id)
+            else {
+                return Self::default();
+            };
+            slots.push(SemanticChildSlot {
+                pair: (child.caller, child.module),
+                semantic_row,
+                instance_row,
+            });
+        }
+        // An unstable in-place sort needs no S-sized temporary. The original
+        // ordinal in the key keeps each pair's presentation order exact.
+        slots.sort_unstable_by_key(|slot| (slot.pair, slot.semantic_row));
+        if !allow(ARC_REQUEST_BYTES) {
+            return Self::default();
+        }
+        // This fixed small allocation uses ordinary Arc::new. Its real OOM
+        // behavior is the allocator's error path, not graceful cache refusal.
+        let result = Self {
+            indexed: Some(Arc::new(SemanticIndex { slots })),
+        };
+        debug_assert!(result.heap_bytes() <= MAX_INDEX_HEAP_BYTES);
+        result
+    }
+
+    #[cfg(test)]
+    fn build_with_allocation_check(
+        instances: &[InstanceView],
+        semantic_edges: &[InstanceSemanticView],
+        allow: impl FnMut(usize) -> bool,
+    ) -> Self {
+        Self::build_checked(instances, semantic_edges, allow)
+    }
+
+    /// Requested allocation envelope with per-allocation padding, not RSS.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.indexed.as_ref().map_or(0, |index| {
+            heap_envelope(index.slots.capacity())
+                .expect("index capacity was checked before ownership")
+        })
+    }
+
+    /// Slices belong to the indexed snapshot or an identically ordered clone;
+    /// Presentation's accessor keeps the offsets and captured rows together.
+    pub(crate) fn children<'a>(
+        &'a self,
+        instances: &'a [InstanceView],
+        semantic_edges: &'a [InstanceSemanticView],
+        caller: CallerId,
+        module: ModuleId,
+    ) -> SemanticChildren<'a> {
+        let pair = (caller, module);
+        let (source, remaining) = match &self.indexed {
+            Some(index) => {
+                let start = index.slots.partition_point(|slot| slot.pair < pair);
+                let end = index.slots.partition_point(|slot| slot.pair <= pair);
+                (
+                    ChildRows::Indexed(index.slots[start..end].iter()),
+                    end - start,
+                )
+            }
+            None => (
+                ChildRows::Linear {
+                    rows: semantic_edges.iter(),
+                    pair,
+                },
+                semantic_edges
+                    .iter()
+                    .filter(|row| (row.caller, row.module) == pair)
+                    .count(),
+            ),
+        };
+        SemanticChildren {
+            instances,
+            semantic_edges,
+            source,
+            remaining,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct SemanticChild<'a> {
+    pub(crate) semantic: &'a InstanceSemanticView,
+    pub(crate) instance: &'a InstanceView,
+}
+
+#[derive(Clone)]
+enum ChildRows<'a> {
+    Indexed(std::slice::Iter<'a, SemanticChildSlot>),
+    Linear {
+        rows: std::slice::Iter<'a, InstanceSemanticView>,
+        pair: (CallerId, ModuleId),
+    },
+}
+
+/// An O(1)-clone borrowed cursor. Fallback counts matches once at creation;
+/// advancing either mode allocates nothing and never drops a captured row.
+#[derive(Clone)]
+pub(crate) struct SemanticChildren<'a> {
+    instances: &'a [InstanceView],
+    semantic_edges: &'a [InstanceSemanticView],
+    source: ChildRows<'a>,
+    remaining: usize,
+}
+
+impl<'a> Iterator for SemanticChildren<'a> {
+    type Item = SemanticChild<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let child = match &mut self.source {
+            ChildRows::Indexed(slots) => {
+                let slot = slots.next()?;
+                SemanticChild {
+                    semantic: &self.semantic_edges[slot.semantic_row],
+                    instance: &self.instances[slot.instance_row],
+                }
+            }
+            ChildRows::Linear { rows, pair } => {
+                let semantic = rows.find(|row| (row.caller, row.module) == *pair)?;
+                let instance = self
+                    .instances
+                    .iter()
+                    .find(|row| row.id == semantic.instance)
+                    .expect("semantic instance resolves in presentation");
+                SemanticChild { semantic, instance }
+            }
+        };
+        self.remaining -= 1;
+        Some(child)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl ExactSizeIterator for SemanticChildren<'_> {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

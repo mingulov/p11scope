@@ -1262,6 +1262,7 @@ pub(crate) fn scripted_promotion_view_for_test() -> std::sync::Arc<super::Promot
         edges: vec![edge],
         instances: Vec::new(),
         semantic_edges: Vec::new(),
+        render_index: Default::default(),
         gaps: Vec::new(),
         gaps_suppressed: 0,
         budgets: BudgetView {

@@ -1111,15 +1111,22 @@ def _tail_trusted_facts(lines, calls, blocks):
             state.pop(register, None)
             if value is not None:
                 state[register] = value
-        elif (text.startswith("*(") or text.startswith("lock ")
-              or "cmpxchg_" in text or "atomic_fetch_" in text):
-            for key in list(state):
-                if isinstance(key, int):
-                    state.pop(key)
-            if match := re.match(r"[rw](\d+)\s", text):
-                state.pop("r" + match[1], None)
-        elif match := re.match(r"[rw](\d+)\s", text):
-            state.pop("r" + match[1], None)
+        elif (re.fullmatch(
+                r"if [rw]\d+ (?:==|!=|<=|>=|<|>|s<=|s>=|s<|s>|&) "
+                r"(?:[rw]\d+|-?0x[0-9a-f]+) goto [+-]0x[0-9a-f]+", text)
+              or re.fullmatch(r"goto [+-]0x[0-9a-f]+", text)
+              or text == "exit"):
+            pass
+        elif read := re.fullmatch(
+                r"([rw]\d+) = \*\(u(?:8|16|32|64) \*\)\(r\d+ [+-] 0x[0-9a-f]+\)", text):
+            state.pop("r" + read[1][1:], None)
+        elif arithmetic := re.fullmatch(
+                r"([rw]\d+) (?:=|\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>=|s>>=) "
+                r"(?:[rw]\d+|-?0x[0-9a-f]+)(?: ll)?", text):
+            state.pop("r" + arithmetic[1][1:], None)
+        else:
+            # Unrecognized forms may write memory or clobber implicit registers.
+            state.clear()
         for successor in graph[pc]:
             merged = (state if successor not in incoming else
                       {key: value for key, value in incoming[successor].items()

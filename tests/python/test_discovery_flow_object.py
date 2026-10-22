@@ -394,6 +394,11 @@ class DiscoveryFlow(unittest.TestCase):
                 direct = change_function(changed, 'interface_list_worker', partial_line,
                                          partial_line.replace('= w1', '= r1'))
                 self.reject(elf, direct, 'interface-name', 'tail')
+            with self.subTest(variant=variant, mutation='canonical-exchange-write'):
+                exchange = change_function(changed, 'interface_list_worker', partial_line,
+                                           partial_line.replace('*(u32 *)(r10 - 0x78) = w1',
+                                                                'r1 = xchg_64(r10 - 0x78, r1)'))
+                self.reject(elf, exchange, 'interface-name', 'tail')
             with self.subTest(variant=variant, mutation='pre-slice-partial-write'):
                 self.reject(elf, changed, 'interface-name', 'tail')
 
@@ -446,6 +451,10 @@ class DiscoveryFlow(unittest.TestCase):
             direct = bad.replace('*(u32 *)(r10 - 0x40) = w2',
                                  '*(u32 *)(r10 - 0x40) = r2', 1)
             self.assertFalse(C.D.interface_tail_contract(direct))
+        with self.subTest(mutation='canonical-exchange-write'):
+            exchange = bad.replace('*(u32 *)(r10 - 0x40) = w2',
+                                   'r2 = xchg_64(r10 - 0x40, r2)', 1)
+            self.assertFalse(C.D.interface_tail_contract(exchange))
         with self.subTest(mutation='partial-rhs-write'):
             self.assertFalse(C.D.interface_tail_contract(bad))
 
@@ -453,24 +462,40 @@ class DiscoveryFlow(unittest.TestCase):
         _, _, disassembly = self.objects[0]
         memset = C.D.function_blocks(C.sections(disassembly)['.text'])['memset']
 
-        def facts(destination, writer='call 0x0', target='memset'):
+        def facts(destination, writer='call 0x0', target='memset', observed='r9'):
             lines = [f'{pc:8}:\t{op}' for pc, op in enumerate((
                 'r2 = 0xffffff',
                 '*(u64 *)(r10 - 0x40) = r2',
                 'r1 = r10',
                 f'r1 += {destination}',
                 'r3 = 0x8',
+                'r8 = 0xffffff',
                 writer,
                 'r9 = *(u64 *)(r10 - 0x40)',
                 'exit',
             ))]
-            calls = [('fixture', 0, 5, target)] if target else []
-            return C.D._tail_trusted_facts(lines, calls, {'memset': memset})[7].get('r9')
+            calls = [('fixture', 0, 6, target)] if target else []
+            return C.D._tail_trusted_facts(lines, calls, {'memset': memset})[8].get(observed)
 
         self.assertEqual(facts('-0x20'), ('constant', 0xffffff))
         self.assertIsNone(facts('-0x40'))
+        self.assertEqual(facts('-0x20', writer='r2 &= 0xff', target=None), ('constant', 0xffffff))
+        self.assertEqual(facts('-0x20', writer='r2 = *(u32 *)(r10 - 0x20)', target=None),
+                         ('constant', 0xffffff))
+        self.assertEqual(facts('-0x20', writer='if r2 > 0x0 goto +0x0', target=None),
+                         ('constant', 0xffffff))
+        self.assertEqual(facts('-0x20', writer='*(u64 *)(r10 - 0x20) = r2', target=None),
+                         ('constant', 0xffffff))
+        self.assertEqual(facts('-0x20', writer='*(u64 *)(r10 - 0x40) = r3', target=None),
+                         ('constant', 0x8))
+        self.assertIsNone(facts('-0x20', writer='*(u32 *)(r10 - 0x40) = w2', target=None))
+        self.assertEqual(facts('-0x20', writer='call 0x1', target=None),
+                         ('constant', 0xffffff))
         self.assertIsNone(facts('-0x20', writer='call 0x7f', target=None))
         self.assertIsNone(facts('-0x20', writer='*(u32 *)(r7 - 0x0) = w2', target=None))
+        self.assertIsNone(facts('-0x20', writer='r2 = xchg_64(r10 - 0x40, r2)', target=None))
+        self.assertIsNone(facts('-0x20', writer='r2 = opaque_effect(r1)', target=None,
+                                observed='r8'))
 
     def test_current_tail_cannot_select_legacy_with_unrelated_markers(self):
         for variant, elf, disassembly in self.objects:

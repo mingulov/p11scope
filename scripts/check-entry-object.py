@@ -98,6 +98,30 @@ def narrow(fact, width):
         return None
     if fact[0] == "constant":
         return ("constant", fact[1] & ((1 << width) - 1))
+    if fact[0] == "finite":
+        return number_fact(n & ((1 << width)-1) for n in fact[1])
+    if fact[0] == "bits":
+        return ("bits", fact[1] & ((1 << width)-1))
+    if fact[0] == "packed":
+        return ("packed", fact[1], fact[2], fact[3] & ((1 << width)-1))
+    if fact[0] == "flag_or":
+        left, right = narrow(fact[1], width), narrow(fact[2], width)
+        if left is None or right is None:
+            return None
+        for old, added in ((left, right), (right, left)):
+            if old[0] == "list_flags":
+                projection, numbers = packed_projection(added), number_values(added)
+                if projection and projection[1] == "list" and projection[2] & ~4 == 0:
+                    return (*old[:3], old[3] | {projection[0]}, old[4])
+                if numbers is not None and all(n & ~0x1f == 0 for n in numbers):
+                    bits = old[4]
+                    for n in numbers: bits |= n
+                    return (*old[:4], bits)
+        return ("flag_or", left, right) if width > 8 else None
+    if fact[0] in ("list_flags", "contribution", "side_flags") and width >= 16:
+        return fact
+    if fact[0] == "list_flags" and width == 8:
+        return fact
     if width == 64 or fact[0] in ("field", "object_field"):
         return fact
     if width == 32:
@@ -156,6 +180,13 @@ def join_fact(left, right):
             return side_pointer(left[1], set(lhs) | set(rhs))
         if left[0] == right[0] == "result":
             return ("result", "map")
+        if left[0] == right[0] == "contribution":
+            return ("contribution", left[1] | right[1], left[2] | right[2])
+        if left[0] == right[0] == "list_flags" and left[1:3] == right[1:3]:
+            return ("list_flags", left[1], left[2], left[3] | right[3], left[4] | right[4])
+        for flags, zero in ((left, right), (right, left)):
+            if flags[0] == "contribution" and zero == ("constant", 0):
+                return flags
         for pointer, zero in ((left, right), (right, left)):
             if pointer[0] in ("owned", "side", "function_value") and pointer[2] == 0 and zero == ("constant", 0):
                 return pointer
@@ -241,6 +272,7 @@ class Consumer:
                      if kind == "64" for line, pc, _ in entries if line == index - 1}
         self.helper = {pc for _, pc, text in entries if text.startswith("85 00 ")}
         self.proof = None
+        self.cursor = None
 
     def label(self, pc):
         return f"{self.section}:{self.name}:{pc}"
@@ -470,6 +502,7 @@ class Consumer:
                         require(not incoming.get(node), self.label(pc) + ": final-sink loop exceeds eight visits or lacks proved progress")
                         continue
                     for state in incoming.get(node, {}).values():
+                        self.cursor = node
                         after = self.step(pc, state)
                         for successor, edge in proof.edges(self, pc, state, after):
                             partition = proof.partition(edge)
@@ -931,6 +964,7 @@ class SinkProof:
                         require(not fact or fact[0] in ("constant", "field", "object_field", "object_index", "object_function", "option", "argument_result", "low", "high", "selected")
                                 or fact[0] in ("scalar", "retained") and fact[2] == 32
                                 or fact[0] == "finite" and all(n <= 0xffffffff for n in fact[1])
+                                or fact[0] == "packed" and fact[3] <= 0xffffffff
                                 or fact == ("rsp", 32, 0),
                                 self.fail(consumer, pc, f"branch width 32 cannot refine full-width fact {fact}"))
                 taken = successor == D.relative_target(pc, text)
@@ -1638,8 +1672,18 @@ class _OwnedCaller(_SeedCaller):
                 state.pop(reg(match[1]), None)
                 if fact is not None:
                     state[reg(match[1])] = fact
-            elif pointer and pointer[0] == "side" and pointer[2] == 24 and match[2] == "32":
-                state[reg(match[1])] = ("object_index", pointer[1])
+            elif pointer and pointer[0] == "side":
+                if pointer[2] == 24 and match[2] == "32":
+                    state[reg(match[1])] = ("object_index", pointer[1])
+                elif pointer[2] in (385, 421) and match[2] == "8":
+                    pair = int(pointer[2] == 421)
+                    if incoming.get(("list_flags_safe", pointer[1], pair)):
+                        state[reg(match[1])] = ("list_flags", pointer[1], pair, frozenset(), 0)
+                elif pointer[2] == 428 and match[2] == "16":
+                    origins = frozenset(key[1] for key, fact in incoming.items()
+                        if isinstance(key, tuple) and key[0] == "contrib_published" and fact
+                        and incoming.get(("contrib_side", key[1])) == pointer[1])
+                    state[reg(match[1])] = ("side_flags", pointer[1], 0xfff, origins)
             elif pointer and pointer[0] == "object_descriptor":
                 if match[2] == "8" and 4 <= pointer[2] < 16:
                     state[reg(match[1])] = ("object_field", pointer[1], pointer[2])
@@ -1720,7 +1764,114 @@ class _OwnedCaller(_SeedCaller):
                     state[reg(match[1])] = ("object_result", left[1] | right[1])
                 elif (match[2], right) in (("&=", ("constant", 1)), ("|=", ("constant", 0))):
                     state[reg(match[1])] = left
+            if match[2] == "|=":
+                for old, added in ((left, right), (right, left)):
+                    if old and old[0] == "list_flags":
+                        projection = packed_projection(added)
+                        numbers = number_values(added)
+                        if projection and projection[1] == "list" and projection[2] & ~4 == 0:
+                            state[reg(match[1])] = (*old[:3], old[3] | {projection[0]}, old[4])
+                        elif added and added[0] == "packed" and added[2] == 32:
+                            # The caller ORs the complete upper word, then
+                            # stores u8. Retain that expression until the
+                            # actual store truncates it; never bless its high
+                            # object-flag bits as an eight-bit register value.
+                            state[reg(match[1])] = ("flag_or", old, added)
+                        elif numbers is not None and all(n & ~0x1f == 0 for n in numbers):
+                            bits = 0
+                            for n in numbers: bits |= n
+                            state[reg(match[1])] = (*old[:4], old[4] | bits)
+                        elif added and added[0] == "bits" and added[1] & ~0x1f == 0:
+                            state[reg(match[1])] = (*old[:4], old[4] | added[1])
+                    if old and old[0] == "side_flags":
+                        flags = contribution_value(added)
+                        numbers = number_values(added)
+                        if flags:
+                            state[reg(match[1])] = ("side_flags", old[1], old[2] | flags[2], old[3] | flags[1])
+                        elif numbers is not None and all(n & ~0xfff == 0 for n in numbers):
+                            bits = old[2]
+                            for n in numbers: bits |= n
+                            state[reg(match[1])] = ("side_flags", old[1], bits, old[3])
+                lhs, rhs = contribution_value(left), contribution_value(right)
+                if lhs is not None and rhs is not None and (left[0] != "constant" or right[0] != "constant"):
+                    state[reg(match[1])] = ("contribution", lhs[1] | rhs[1], lhs[2] | rhs[2])
+            elif left and left[0] == "side_flags" and right and right[0] == "constant":
+                state[reg(match[1])] = ("side_flags", left[1], left[2] & right[1],
+                                        left[3] if right[1] & 0x14 == 0x14 else frozenset())
+        if match := re.fullmatch(r"([rw]\d+) (<<=|>>=|&=) (-?0x[0-9a-f]+)", text):
+            fact = incoming.get(reg(match[1]))
+            amount = int(match[3], 16)
+            if fact and fact[0] == "packed":
+                shift, mask = fact[2:]
+                width = 32 if match[1].startswith("w") else 64
+                mask &= (1 << width)-1
+                if match[2] == "&=": mask &= amount
+                elif 0 <= amount < width:
+                    shift += amount if match[2] == ">>=" else -amount
+                    mask = mask >> amount if match[2] == ">>=" else (mask << amount) & ((1 << width)-1)
+                else:
+                    shift, mask = -1000, (1 << 64)-1
+                state[reg(match[1])] = (("packed", fact[1], shift, mask) if mask else ("constant", 0))
+            elif fact and fact[0] == "bits":
+                width = 32 if match[1].startswith("w") else 64
+                mask = fact[1] & ((1 << width)-1)
+                if match[2] == "&=": mask &= amount
+                elif 0 <= amount < (32 if match[1].startswith("w") else 64):
+                    mask = mask >> amount if match[2] == ">>=" else mask << amount
+                else: mask = (1 << 64)-1
+                state[reg(match[1])] = ("bits", mask & ((1 << width)-1))
         return state
+
+
+PACKED_FIELDS = {"kind": (0, 8), "status": (8, 8), "value": (16, 16),
+                 "list": (32, 8), "object": (40, 8)}
+
+
+def packed_projection(fact):
+    if not fact or fact[0] != "packed":
+        return None
+    for field, (shift, width) in PACKED_FIELDS.items():
+        if fact[2] == shift and fact[3] < 1 << width:
+            return fact[1], field, fact[3]
+    return None
+
+
+def packed_domain(state, token, field):
+    key = ("packed_domain", token, field)
+    if key in state:
+        return state[key]
+    mask = state.get(("packed_mask", token))
+    require(mask is not None, "request publication missing scalar return provenance")
+    shift, width = PACKED_FIELDS[field]
+    bits = (mask >> shift) & ((1 << width)-1)
+    if field == "value":
+        return frozenset({0, 1}) if bits else frozenset({0})
+    return frozenset(n for n in range(1 << width) if n & ~bits == 0)
+
+
+def packed_complete(state, fact, token, field):
+    projection = packed_projection(fact)
+    if not projection or projection[:2] != (token, field):
+        return False
+    possible = 0
+    domain = packed_domain(state, token, field)
+    if field == "value":
+        possible = ((state[("packed_mask", token)] >> 16) & 0xffff) if 1 in domain else 0
+    else:
+        for number in domain:
+            possible |= number
+    return possible & ~projection[2] == 0
+
+
+def contribution_value(fact):
+    projection = packed_projection(fact)
+    if projection and projection[1] == "object" and projection[2] & ~0x14 == 0:
+        return ("contribution", frozenset({projection[0]}), projection[2])
+    if fact and fact[0] == "contribution":
+        return fact
+    if fact == ("constant", 0):
+        return ("contribution", frozenset(), 0)
+    return None
 
 
 def finite_intervals(intervals, op, constant, taken):
@@ -1746,10 +1897,12 @@ class _OwnedSinkProof(SinkProof):
                 finite = "valid"
             elif all(low >= 3 for low, _ in intervals):
                 finite = "invalid"
+        frame = state.get(("publication_frame",))
+        publication = ((state.get("r0"), packed_domain(state, frame[0], "value")) if frame else None)
         return super().partition(state) + (state.get(("live", self.start[1])),
             state.get(("cleanup",)), state.get(("poisoned",)), state.get(("entry_pending",)),
             state.get(("entry_refusal",)), finite,
-            bool(state.get(("object_pair_ok", 0))), bool(state.get(("object_pair_ok", 1))))
+            bool(state.get(("object_pair_ok", 0))), bool(state.get(("object_pair_ok", 1))), publication)
 
     @staticmethod
     def join(previous, state):
@@ -1760,9 +1913,192 @@ class _OwnedSinkProof(SinkProof):
                     if (isinstance(origin, tuple) and origin and origin[0] in ("object_index", "object_optional_index")
                             and other == ("constant", 0) and predecessor.get(("side_absent", origin[1]))):
                         merged[key] = ("object_optional_index", origin[1])
+                if isinstance(key, tuple) and key[0] == "packed_domain":
+                    merged[key] = previous[key] | state[key]
+                left, right = previous[key], state[key]
+                joined = merged.get(key)
+                if (isinstance(left, tuple) and isinstance(right, tuple) and left and right
+                        and left[0] == right[0] == "list_flags" and left[1:3] == right[1:3]):
+                    origins = _OwnedSinkProof.flag_origin_join(previous, state, left[3], right[3], "list")
+                    merged[key] = (*left[:3], origins, left[4] | right[4])
+                if isinstance(joined, tuple) and joined and joined[0] == "contribution":
+                    lhs, rhs = contribution_value(left), contribution_value(right)
+                    if lhs is not None and rhs is not None:
+                        origins = _OwnedSinkProof.flag_origin_join(previous, state, lhs[1], rhs[1])
+                        merged[key] = ("contribution", origins, lhs[2] | rhs[2])
+                if (isinstance(left, tuple) and isinstance(right, tuple) and left and right
+                        and left[0] == right[0] == "side_flags" and left[1] == right[1]):
+                    origins = _OwnedSinkProof.flag_origin_join(previous, state, left[3], right[3])
+                    merged[key] = ("side_flags", left[1], left[2] | right[2], origins)
+            expected = {key[1] for predecessor in (previous, state) for key in predecessor
+                        if isinstance(key, tuple) and key[0] == "contrib_expected"}
+            for token in expected:
+                merged[("contrib_expected", token)] = True
+                sides = {predecessor.get(("contrib_side", token)) for predecessor in (previous, state)
+                         if predecessor.get(("contrib_expected", token))}
+                if len(sides) == 1:
+                    merged[("contrib_side", token)] = next(iter(sides))
+                if all(not predecessor.get(("contrib_expected", token)) or predecessor.get(("contrib_published", token))
+                       for predecessor in (previous, state)):
+                    merged[("contrib_published", token)] = True
+                else:
+                    merged.pop(("contrib_published", token), None)
+            cells = {key for predecessor in (previous, state) for key in predecessor
+                     if isinstance(key, tuple) and key[0] == "publication_cell"}
+            for key in cells:
+                sources = [predecessor[key] for predecessor in (previous, state) if key in predecessor]
+                require(len({source[0] for source in sources}) == 1, "request publication cell owner changed at join")
+                merged[key] = (sources[0][0], frozenset().union(*(source[1] for source in sources)))
+                if all(key not in predecessor or predecessor.get(("cell_live", key[1]))
+                       for predecessor in (previous, state)):
+                    merged[("cell_live", key[1])] = True
+                else:
+                    merged.pop(("cell_live", key[1]), None)
+            for key in previous.keys() | state.keys():
+                if isinstance(key, tuple) and key[0] in ("publication_list", "publication_list_lost"):
+                    merged[key] = True
         if previous is not None and ("finite_values",) in previous and ("finite_values",) in state:
             merged[("finite_values",)] = tuple(sorted(set(previous[("finite_values",)]) | set(state[("finite_values",)])))
         return merged
+
+    @staticmethod
+    def flag_origin_join(previous, state, left, right, field=None):
+        if field is not None:
+            return frozenset(token for token in left | right
+                if all(token in origins or ("packed_mask", token) in predecessor
+                       and packed_domain(predecessor, token, field) == {0}
+                       for predecessor, origins in ((previous, left), (state, right))))
+        active = {frame[0] for predecessor in (previous, state)
+                  if (frame := predecessor.get(("publication_frame",)))}
+        return frozenset(token for token in left | right
+            if all(token in origins or token not in active and not predecessor.get(("contrib_expected", token))
+                   for predecessor, origins in ((previous, left), (state, right))))
+
+    def begin_publication(self, consumer, pc, before, state, summary):
+        error = lambda message: self.fail(consumer, pc, "request publication " + message)
+        require(not before.get(("publication_frame",)), error("has a pending earlier cell"))
+        pointer, count, tags = before.get("r1"), before.get("r2"), number_values(before.get("r3"))
+        require(pointer and pointer[0] == "object_scalar" and pointer[2] in (8, 10)
+                and count == ("object_scalar", pointer[1], pointer[2]+1, 32 if self.abi else 64)
+                and pointer[3] == (32 if self.abi else 64), error("pair payload provenance"))
+        pair = (pointer[2]-8)//2
+        side = before.get(("object_table_side", pointer[1]))
+        owner = before.get(("side_owner", side))
+        require(owner is not None and before.get(("live", owner)) and before.get(("side_live", side))
+                and before.get(("object_descriptor_live", pointer[1])) and before.get(("object_pair_ok", pair)),
+                error("pair success/current owner lifetime"))
+        require(tags is not None and all(tag & ~0x307 == 0 and ((tag >> 8) & 1) == self.abi for tag in tags),
+                error("full-width tag/index/layout"))
+        peer = 1-pair
+        for tag in tags:
+            expected = (("object_scalar", pointer[1], 8+2*peer, 32 if self.abi else 64),
+                        ("object_scalar", pointer[1], 9+2*peer, 32 if self.abi else 64)) if tag & 512 else (("constant", 0), ("constant", 0))
+            require((before.get("r4"), before.get("r5")) == expected
+                    and (not tag & 512 or before.get(("object_pair_ok", peer))), error("peer pair/tag agreement"))
+        for key in list(state):
+            if isinstance(key, tuple) and key[0] in ("packed_mask", "packed_domain"):
+                del state[key]
+        token = (consumer.section, consumer.name, *(consumer.cursor or (pc, 0)))
+        mask = summary["return_bits"]
+        require(mask is not None and mask >> 48 == 0, error("closed callee return bits"))
+        state[("packed_mask", token)] = mask
+        state[("publication_frame",)] = (token, side, pair, frozenset(352+36*pair+4*(tag & 7) for tag in tags))
+        state[("publication_words",)] = frozenset()
+        state["r0"] = ("packed", token, 0, mask)
+
+    def publication_store(self, consumer, pc, before, state, pointer, size, source):
+        error = lambda message: self.fail(consumer, pc, "request publication " + message)
+        frame = before.get(("publication_frame",))
+        if pointer and pointer[0] == "side":
+            offsets = pointer[2] if isinstance(pointer[2], frozenset) else {pointer[2]}
+            overlaps = lambda base, width: any(n < base+width and base < n+size for n in offsets)
+            for key, cell in before.items():
+                if isinstance(key, tuple) and key[0] == "publication_cell" and cell[0] == pointer[1]:
+                    if any(overlaps(base, 4) for base in cell[1]):
+                        state.pop(("cell_live", key[1]), None)
+            for pair in (0, 1):
+                if overlaps(385+36*pair, 1):
+                    state.pop(("list_flags_safe", pointer[1], pair), None)
+                    # Every admitted later update uses the old byte plus the
+                    # next cell's checked flags. A separate writer cannot
+                    # manufacture an authentic snapshot of already lost bits.
+                    current = (frame and frame[1:3] == (pointer[1], pair)
+                               and offsets == {385+36*pair} and size == 1)
+                    if before.get(("publication_list", pointer[1], pair)) and not current:
+                        state[("publication_list_lost", pointer[1], pair)] = True
+            if overlaps(428, 2):
+                for key in list(state):
+                    if isinstance(key, tuple) and key[0] == "contrib_published" and state.get(("contrib_side", key[1])) == pointer[1]:
+                        state.pop(key, None)
+        if pointer and pointer[0] == "side" and pointer[2] in (385, 421) and size == 1:
+            pair = int(pointer[2] == 421)
+            values = number_values(source)
+            safe = ((values is not None and all(n & ~0x1f == 0 for n in values))
+                    or source and source[0] == "bits" and source[1] & ~0x1f == 0
+                    or source and source[0] == "list_flags" and source[1:3] == (pointer[1], pair))
+            state.pop(("list_flags_safe", pointer[1], pair), None)
+            if safe:
+                state[("list_flags_safe", pointer[1], pair)] = True
+        if pointer and pointer[0] == "side" and pointer[2] == 428 and size == 2:
+            values = number_values(source)
+            require((source and source[0] == "side_flags" and source[1] == pointer[1] and source[2] & ~0xfff == 0)
+                    or values is not None and all(n & ~0xfff == 0 for n in values),
+                    error("object/Get flags lost their bounded source"))
+            origins = source[3] if source and source[0] == "side_flags" else frozenset()
+            for key in list(state):
+                if isinstance(key, tuple) and key[0] == "contrib_expected" and state.get(("contrib_side", key[1])) == pointer[1]:
+                    state.pop(("contrib_published", key[1]), None)
+                    if key[1] in origins:
+                        state[("contrib_published", key[1])] = True
+        if not frame:
+            return
+        token, side, pair, cells = frame
+        refused = before.get("r0") == ("constant", 0)
+        words = before.get(("publication_words",), frozenset())
+        if pointer and pointer[0] == "side":
+            offsets = pointer[2] if isinstance(pointer[2], frozenset) else frozenset({pointer[2]})
+            field = next((field for field, delta, width in (("kind", 0, 1), ("status", 1, 1), ("value", 2, 2))
+                          if size == width and offsets == frozenset(n+delta for n in cells)), None)
+            if pointer[1] == side and field:
+                require(field not in words, error("duplicate cell field write"))
+                copied = packed_complete(before, source, token, field)
+                zero = source == ("constant", 0)
+                require(zero if refused else copied or zero and packed_domain(before, token, field) == {0},
+                        error("same-cell field wiring/refusal zero"))
+                state[("publication_words",)] = words | {field}
+                if state[("publication_words",)] == {"kind", "status", "value"}:
+                    state[("publication_cell", token)] = (side, cells)
+                    state[("cell_live", token)] = True
+                if state[("publication_words",)] == {"kind", "status", "value"} and not refused:
+                    kinds, statuses, values = (packed_domain(before, token, field) for field in ("kind", "status", "value"))
+                    require(kinds <= set(range(7)) and statuses <= set(range(11))
+                            and (1 not in values or 0 not in kinds and statuses == {1}),
+                            error("finite kind/status/value implication"))
+            elif pointer[1] == side and offsets == {385+36*pair} and size == 1:
+                require(words == {"kind", "status", "value"} and source and source[0] == "list_flags"
+                        and source[1:3] == (side, pair)
+                        and (source[4] & 4 if refused else token in source[3] or packed_domain(before, token, "list") == {0}),
+                        error("list flags do not preserve the old list plus this cell's finite flags"))
+                state[("publication_flags",)] = True
+                state[("publication_list", side, pair)] = True
+                if not refused and packed_domain(before, token, "object") != {0}:
+                    state[("contrib_expected", token)] = True
+                    state[("contrib_side", token)] = side
+            else:
+                require(False, error("cell/list write footprint"))
+        elif pointer and pointer[0] == "stack" and words == {"kind", "status", "value"} and before.get(("publication_flags",)):
+            flags = contribution_value(source)
+            if flags and ((token not in flags[1]) if refused else
+                          (token in flags[1] or packed_domain(before, token, "object") == {0})):
+                state[("publication_contribution",)] = True
+        self.finish_publication(state)
+
+    @staticmethod
+    def finish_publication(state):
+        if (state.get(("publication_words",)) == {"kind", "status", "value"}
+                and state.get(("publication_flags",)) and state.get(("publication_contribution",))):
+            for key in (("publication_frame",), ("publication_words",), ("publication_flags",), ("publication_contribution",)):
+                state.pop(key, None)
 
     def captured(self, state):
         super().captured(state)
@@ -1773,6 +2109,15 @@ class _OwnedSinkProof(SinkProof):
         if state.get(("cleanup",)):
             require(state.get(("poisoned",)), self.fail(consumer, pc, "removed START lacks terminal fault"))
             return
+        require(not state.get(("publication_frame",)), self.fail(consumer, pc, "request publication has pending cell/flags/contribution"))
+        require(all(state.get(("cell_live", key[1])) for key in state
+                    if isinstance(key, tuple) and key[0] == "publication_cell"),
+                self.fail(consumer, pc, "request publication cell overwritten before live exit"))
+        require(not any(isinstance(key, tuple) and key[0] == "publication_list_lost" for key in state),
+                self.fail(consumer, pc, "request publication list flags overwritten before live exit"))
+        require(all(state.get(("contrib_published", key[1])) for key in state
+                    if isinstance(key, tuple) and key[0] == "contrib_expected"),
+                self.fail(consumer, pc, "request publication contribution lost before side flags"))
         require(not state.get(("entry_pending",)) and not state.get(("entry_refusal",)),
                 self.fail(consumer, pc, "entry refusal/pending adapter bypassed terminal cleanup"))
         if not state.get(("live", self.start[1])):
@@ -1794,6 +2139,26 @@ class _OwnedSinkProof(SinkProof):
 
     def transfer(self, consumer, pc, before, state):
         text, target = consumer.text[pc], consumer.calls.get(pc, "")
+        if "atomic" in text or "xchg" in text or text.startswith("lock "):
+            match = ATOMIC_POINTER.search(text) or EXCHANGE_POINTER.search(text)
+            pointer = address(before, *match.groups()[1:]) if match else None
+            require(pointer and pointer[0] in ("stack", "owned")
+                    or match and before.get("r"+match[2], (None,))[0] == "result",
+                    self.fail(consumer, pc, "request publication unknown/side atomic output footprint"))
+        frame = before.get(("publication_frame",))
+        if frame and (match := re.fullmatch(r"([rw]\d+) \|= ([rw]\d+|-?0x[0-9a-f]+)", text)):
+            token = frame[0]
+            flags = contribution_value(state.get(reg(match[1])))
+            if flags is None:
+                left, right = contribution_value(before.get(reg(match[1]))), contribution_value(value(before, match[2]))
+                if left is not None and right is not None:
+                    flags = ("contribution", left[1] | right[1], left[2] | right[2])
+            if (before.get(("publication_words",)) == {"kind", "status", "value"}
+                    and before.get(("publication_flags",)) and flags
+                    and ((token not in flags[1]) if before.get("r0") == ("constant", 0)
+                         else token in flags[1] or packed_domain(before, token, "object") == {0})):
+                state[("publication_contribution",)] = True
+                self.finish_publication(state)
         if target in ("memset", "p11_link_current_identity"):
             pointer = before.get("r1")
             length = before.get("r3") if target == "memset" else ("constant", 16)
@@ -1853,10 +2218,10 @@ class _OwnedSinkProof(SinkProof):
                 private = {"owned", "side", "stack", "context", "event", "descriptor", "external_key", "result"}
                 require(all(not before.get("r"+str(i)) or before["r"+str(i)][0] not in private for i in range(1, 6)),
                         self.fail(consumer, pc, "closed scalar callee received a private pointer"))
-                # Refusing continuation checkpoint: closed callee effects do
-                # not establish the caller's finite unpack/publication gates.
-                require(target != "p11_request_cell", self.fail(consumer, pc,
-                        "request-cell finite unpack/publication remains unproved"))
+                if target == "p11_request_cell":
+                    self.begin_publication(consumer, pc, before, state, summary)
+                else:
+                    state["r0"] = ("bits", summary["return_bits"])
         memory = LOAD.fullmatch(text) or STORE.fullmatch(text)
         if memory:
             base, sign, offset = memory.groups()[2:5] if LOAD.fullmatch(text) else memory.groups()[1:4]
@@ -1886,6 +2251,9 @@ class _OwnedSinkProof(SinkProof):
                 require(LOAD.fullmatch(text) and ((memory[2] == "32" and pointer[2] == 0)
                         or (memory[2] == "8" and 4 <= pointer[2] < 16)),
                         self.fail(consumer, pc, "object descriptor readonly field width"))
+            if STORE.fullmatch(text):
+                self.publication_store(consumer, pc, before, state, pointer, int(memory[1])//8,
+                                       narrow(value(before, memory[5]), int(memory[1])))
         if target == "p11_object_side_get":
             identity, key = (consumer.section, consumer.name), before.get("r1")
             require(before.get(("live", self.start[1])) and key and key[0] == "stack"
@@ -1963,6 +2331,20 @@ class _OwnedSinkProof(SinkProof):
                     for pair in (0, 1):
                         if {origin[2] for origin in left[1]} == {8+2*pair, 9+2*pair}:
                             state[("object_pair_ok", pair)] = success
+                projection = packed_projection(left)
+                if projection and right and right[0] == "constant":
+                    token, field, mask = projection
+                    domain = packed_domain(before, token, field)
+                    if field == "value":
+                        complete = packed_complete(before, left, token, field)
+                        if complete and right[1] == 0 and branch[2] in ("==", "!=", ">", "<="):
+                            domain = frozenset(n for n in domain if compare(n, branch[2], 0) == taken)
+                    else:
+                        domain = frozenset(n for n in domain if compare(n & mask, branch[2], right[1],
+                                           32 if branch[1].startswith("w") else 64) == taken)
+                    if not domain:
+                        continue
+                    state[("packed_domain", token, field)] = domain
                 if left and left[0] == "entry_adapter" and zero_taken is not None:
                     require(branch[1].startswith("r"), self.fail(consumer, pc, "entry adapter result width"))
                     state.pop(("entry_pending",), None)

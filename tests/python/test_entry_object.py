@@ -152,6 +152,75 @@ def mechanism_guard(variant, name):
     return next((pc, text) for pc, text in reversed(insns) if pc < store and re.fullmatch(r"if r\d+ == 0x0 goto .*", text))
 
 
+def request_publication_case(variant, disassembly=None, initial_patch=None, post_write=None):
+    """Actual unpack CFG with the independently specified private row ABI.
+
+    This is one cell's publication seam, not a proof of the enclosing loop or
+    the producer's target-read policy. The complete contract checks those
+    caller paths and the actual closed-callee masks separately.
+    """
+    original, _, blocks, _ = consumer_case(variant, "p11_entry", disassembly)
+    split = CHECKER["sections"](OBJECTS[variant] if disassembly is None else disassembly)
+    internal_calls = {}
+    for caller, _, pc, target in CHECKER["D"].internal_call_targets(split[".text"]):
+        internal_calls.setdefault(caller, {})[pc] = target
+    consumer = CHECKER["_OwnedCaller"](original.section, original.name, original.lines, original.calls)
+    consumer.closed_callees = CHECKER["closed_entry_callees_contract"](blocks, internal_calls)
+    reference, _, _, _ = consumer_case(variant, "p11_entry")
+    start = next(pc for pc, target in reference.calls.items() if target == "p11_request_cell")
+    value_store = next(pc for pc, text in reference.insns if pc > start and re.fullmatch(r"\*\(u16 \*\).*", text))
+    end = next(pc for pc, text in reference.insns if pc > value_store and text.startswith("if "))
+    cell = "r"+CHECKER["STORE"].fullmatch(reference.text[value_store])[2]
+    flags_load = next(CHECKER["LOAD"].fullmatch(text) for pc, text in reference.insns
+                      if pc > value_store and re.fullmatch(r"w\d+ = \*\(u8 \*\)\(r\d+ \+ 0x181\)", text))
+    row = "r"+flags_load[3]
+    # Follow the actual accumulator into its final side.flags store. The unit
+    # seam executes one cell, so redirect its enclosing loop guard to that
+    # suffix; the full caller proof separately checks the real bounded loop.
+    suffix = next(pc for pc, text in reference.insns if pc > end and
+                  re.fullmatch(r"w\d+ = \*\(u16 \*\)\(r\d+ \+ 0x1ac\)", text))
+    last = next(pc for pc, text in reference.insns if pc > suffix and
+                re.fullmatch(r"\*\(u16 \*\)\(r\d+ \+ 0x1ac\) = w\d+", text))
+    stop = next(pc for pc, _ in reference.insns if pc > last)
+    consumer.text[end] = "goto +0x0"
+    consumer.text[stop] = "exit"
+    consumer.insns = [(pc, consumer.text[pc]) for pc, _ in consumer.insns
+                      if start <= pc <= end or suffix <= pc <= stop]
+    consumer.graph = {pc: ([suffix] if pc == end else [] if pc == stop else consumer.graph[pc])
+                      for pc, _ in consumer.insns}
+    proof = CHECKER["_OwnedSinkProof"](6, 0, True, ("owned", 77, 0))
+    initial = {"r1": ("object_scalar", 55, 8, 64), "r2": ("object_scalar", 55, 9, 64),
+        "r3": ("constant", 0), "r4": ("constant", 0), "r5": ("constant", 0),
+        "r10": ("stack", 0), row: ("side", 22, 0), cell: ("side", 22, 354),
+        ("object_table_side", 55): 22, ("object_descriptor_live", 55): True,
+        ("side_owner", 22): 77, ("side_live", 22): True, ("live", 77): True,
+        ("object_pair_ok", 0): True, ("list_flags_safe", 22, 0): True,
+        ("owned_word", 77, 8, 8): ("scalar", 6, 64), ("success",): True}
+    for _, text in consumer.insns:
+        match = CHECKER["LOAD"].fullmatch(text)
+        if match and match[3] == "10":
+            pointer = -int(match[5], 16) if match[4] == "-" else int(match[5], 16)
+            initial[("stack", pointer, int(match[2])//8)] = ("constant", 0)
+    # A previous cell's contribution makes the accumulator merge causal even
+    # on this one-cell slice: its earlier temporary holds only the new cell.
+    folded = max(pc for pc, text in reference.insns if value_store < pc < end
+                 and CHECKER["STORE"].fullmatch(text) and "(r10 " in text)
+    prior = next(CHECKER["LOAD"].fullmatch(text) for pc, text in reversed(reference.insns)
+                 if pc < folded and CHECKER["LOAD"].fullmatch(text) and "(r10 " in text)
+    previous = ("incoming-request-contribution", variant)
+    offset = int(prior[5], 16) * (-1 if prior[4] == "-" else 1)
+    initial[("stack", offset, int(prior[2])//8)] = ("contribution", frozenset({previous}), 0x14)
+    initial[("contrib_expected", previous)] = True
+    initial[("contrib_side", previous)] = 22
+    states = consumer.facts(initial | (initial_patch or {}), proof)
+    if post_write:
+        consumer.text[stop] = post_write.replace("SIDE", row)
+        consumer.proof = proof
+        for state in states[stop].values():
+            proof.check_sink(consumer, stop, consumer.step(stop, state))
+    return proof
+
+
 def consumer_names(variant):
     names = ["p11_entry", "p11_return", "ordinary_return", "object_return"]
     if variant == "unsafe":
@@ -187,6 +256,116 @@ def mutate(disassembly, function, pc, old, new, internal_call=False, helper_call
 
 
 class EntryObjectTests(unittest.TestCase):
+    def _assert_publication_joins(self):
+        for variant in OBJECTS:
+            original, _, _, _ = consumer_case(variant, "p11_entry")
+            token = ("publication-join", variant)
+            proof = CHECKER["_OwnedSinkProof"](6, 0, True, ("owned", 77, 0))
+            frame = {("publication_frame",): (token, 22, 0, frozenset({352})),
+                     ("packed_mask", token): (4 << 32) | (0x14 << 40) | 0xffffffff}
+            left = frame | {"r1": ("list_flags", 22, 0, frozenset({token}), 0)}
+            right = frame | {"r1": ("list_flags", 22, 0, frozenset(), 0)}
+            joined = proof.join(left, right)
+            with self.subTest(variant=variant, control="a live list-flags path cannot borrow another path's contribution"):
+                self.assertNotIn(token, joined["r1"][3])
+            right[("packed_domain", token, "list")] = frozenset({0})
+            joined = proof.join(left, right)
+            with self.subTest(variant=variant, control="a proved zero list contribution needs no origin certificate"):
+                self.assertIn(token, joined["r1"][3])
+
+            expected = {("contrib_expected", token): True, ("contrib_side", token): 22}
+            left = expected | {"r4": ("contribution", frozenset({token}), 0x14)}
+            lost = expected | {"r4": ("constant", 0)}
+            no_cell = {"r4": ("constant", 0)}
+            call = call_site(variant, "p11_entry", "p11_request_cell")
+            store, text = next((pc, text) for pc, text in original.insns if pc > call
+                and re.fullmatch(r"\*\(u16 \*\)\(r\d+ \+ 0x1ac\) = w\d+", text))
+            store_match = CHECKER["STORE"].fullmatch(text)
+            merge = next((pc, text) for pc, text in reversed(original.insns) if pc < store and " |= " in text)
+            merge_match = re.fullmatch(r"(r\d+) \|= (r\d+)", merge[1])
+            self.assertIsNotNone(merge_match)
+            for other, healthy in ((lost, False), (no_cell, True)):
+                joined = proof.join(left, other)
+                caller = CHECKER["_OwnedCaller"](original.section, original.name, original.lines, original.calls)
+                caller.proof = proof
+                state = joined | {"r"+store_match[2]: ("side", 22, 0),
+                    merge_match[1]: ("side_flags", 22, 0xfff, frozenset()), merge_match[2]: joined["r4"],
+                    ("side_owner", 22): 77, ("side_live", 22): True, ("live", 77): True,
+                    ("owned_word", 77, 8, 8): ("scalar", 6, 64), ("success",): True}
+                state = caller.step(merge[0], state)
+                state = caller.step(store, state)
+                with self.subTest(variant=variant, control="conditional contribution reaches actual side.flags", healthy=healthy):
+                    if healthy:
+                        proof.check_sink(caller, store, state)
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "request publication contribution lost"):
+                            proof.check_sink(caller, store, state)
+            caller.proof = None
+            for operation in ("w2 >>= 0x8", "w2 <<= 0x8"):
+                caller.text[store] = operation
+                with self.subTest(variant=variant, control="JMP32/ALU32 cannot retain discarded packed high bits", operation=operation):
+                    result = caller.step(store, {"r2": ("packed", token, 0, 1 << 40)})
+                    self.assertEqual(result["r2"], ("constant", 0))
+
+    def _assert_request_publication(self):
+        self._assert_publication_joins()
+        for variant in OBJECTS:
+            with self.subTest(variant=variant, control="actual finite unpack and same-cell publication"):
+                self.assertTrue(request_publication_case(variant).witnesses)
+            for write in ("*(u8 *)(SIDE + 0x160) = 0x0", "*(u8 *)(SIDE + 0x181) = 0x0",
+                          "*(u32 *)(SIDE + 0x1aa) = 0x0",
+                          "lock *(u32 *)(SIDE + 0x160) += r1"):
+                with self.subTest(variant=variant, control="published output cannot survive an overlapping writer", write=write), self.assertRaisesRegex(RuntimeError, "request publication"):
+                    request_publication_case(variant, post_write=write)
+            with self.subTest(variant=variant, control="disjoint side writes preserve published cells and flags"):
+                self.assertTrue(request_publication_case(variant,
+                    post_write="*(u8 *)(SIDE + 0x1a8) = 0x0").witnesses)
+            name, body = instructions(variant, "p11_entry")
+            call = call_site(variant, name, "p11_request_cell")
+            tail = [(pc, text) for pc, text in body if pc > call]
+            kind = next((pc, text) for pc, text in tail if re.fullmatch(r"if r1 > 0x6 goto .*", text))
+            status = next((pc, text) for pc, text in tail if re.fullmatch(r"if r2 > 0xa goto .*", text))
+            value = next((pc, text) for pc, text in tail if re.fullmatch(r"if r4 == 0x0 goto .*", text))
+            nonzero_kind = next((pc, text) for pc, text in tail if pc > value[0] and re.fullmatch(r"if r4 == 0x0 goto .*", text))
+            value_status = next((pc, text) for pc, text in tail if re.fullmatch(r"if r4 != 0x1 goto .*", text))
+            value_store = next((pc, text) for pc, text in tail if re.fullmatch(r"\*\(u16 \*\).*", text))
+            end = next(pc for pc, text in tail if pc > value_store[0] and text.startswith("if "))
+            stores = [(pc, text) for pc, text in tail if pc < end and CHECKER["STORE"].fullmatch(text)]
+            for pc, old, new in ((kind[0], kind[1], kind[1].replace("0x6", "0xff")),
+                    (status[0], status[1], status[1].replace("0xa", "0xff")),
+                    (nonzero_kind[0], nonzero_kind[1], nonzero_kind[1].replace("0x0", "0xff")),
+                    (value_status[0], value_status[1], value_status[1].replace("!= 0x1", "> 0xff")),
+                    (value_store[0], value_store[1], value_store[1].rsplit("=", 1)[0]+"= w0")):
+                with self.subTest(variant=variant, causal_mutant=new), self.assertRaisesRegex(RuntimeError, "request.*(finite|wiring|publication)"):
+                    request_publication_case(variant, mutate(OBJECTS[variant], name, pc, old, new))
+            with self.subTest(variant=variant, control="complete contract consumes the publication proof"), self.assertRaisesRegex(RuntimeError, "request publication"):
+                CHECKER["contract"](mutate(OBJECTS[variant], name, value_store[0], value_store[1],
+                    value_store[1].rsplit("=", 1)[0]+"= w0"), variant)
+            temporaries = [(pc, text) for pc, text in stores if "(r10 " in text]
+            for pc, old in stores:
+                if "(r10 " not in old or pc in (temporaries[0][0], temporaries[-1][0]):
+                    with self.subTest(variant=variant, control="publication contribution must survive", pc=pc), self.assertRaisesRegex(RuntimeError, "request.*publication"):
+                        request_publication_case(variant, mutate(OBJECTS[variant], name, pc, old, "r1 = r1"))
+            # A failed unpack precedes the valid temporary spill; the closed
+            # callee mask rules out its later invalid-object-flags arm. Leaving
+            # an earlier authentic OR contribution instead of writing zero is
+            # equivalent. The cell/list refusal writes above remain required.
+            self.assertEqual(len(temporaries), 3)
+            pc, old = temporaries[1]
+            with self.subTest(variant=variant, control="redundant refusal temporary is not an inventory obligation"):
+                self.assertTrue(request_publication_case(variant,
+                    mutate(OBJECTS[variant], name, pc, old, "r1 = r1")).witnesses)
+            equivalent = mutate(OBJECTS[variant], name, kind[0], kind[1], kind[1].replace("> 0x6", ">= 0x7"))
+            with self.subTest(variant=variant, control="equivalent finite comparison is not tied to an opcode"):
+                self.assertTrue(request_publication_case(variant, equivalent).witnesses)
+            for patch in ({"r3": ("constant", 1 << 32)}, {"r3": ("finite", frozenset({0, 1 << 32}))},
+                    {"r3": ("constant", 256)}, {"r3": ("constant", 8)},
+                    {"r1": ("object_candidate", (1, 55, 8, 64))},
+                    {"r2": ("object_scalar", 55, 8, 64)}, {("object_pair_ok", 0): False},
+                    {("live", 77): False}):
+                with self.subTest(variant=variant, control="call boundary needs real pair/full tag/lifetime", patch=patch), self.assertRaisesRegex(RuntimeError, "request.*(pair|tag|lifetime)"):
+                    request_publication_case(variant, initial_patch=patch)
+
     def _assert_inline_object_descriptor(self):
         for variant in OBJECTS:
             original, _, blocks, _ = consumer_case(variant, "p11_entry")
@@ -336,8 +515,8 @@ class EntryObjectTests(unittest.TestCase):
             caller.closed_callees = reports
             caller.proof = CHECKER["_OwnedSinkProof"](6, 0, True, ("owned", 77, 0))
             request = next(pc for pc, target in caller.calls.items() if target == "p11_request_cell")
-            with self.subTest(variant=variant, control="closed effects cannot qualify unfinished caller publication"):
-                with self.assertRaisesRegex(RuntimeError, "finite unpack/publication remains unproved"):
+            with self.subTest(variant=variant, control="closed effects alone cannot qualify a caller pair"):
+                with self.assertRaisesRegex(RuntimeError, "request.*(pair|publication)"):
                     caller.step(request, {"r"+str(i): ("constant", 0) for i in range(1, 6)})
             self.assertEqual(len(readers), 1)
             reader = readers[0]
@@ -1220,6 +1399,7 @@ class EntryObjectTests(unittest.TestCase):
         self._assert_closed_entry_callees()
         self._assert_inline_object_descriptor()
         self._assert_entry_known_writer_footprints()
+        self._assert_request_publication()
         for variant in OBJECTS:
             internal_contract(variant, "scalar_body_contract")
             cases = [

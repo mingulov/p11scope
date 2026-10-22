@@ -58,13 +58,16 @@ impl CanonicalFanoutScene {
         scene.prepare_batch(batch, 2);
         let raw = scene.real.h0.0.borrow_mut().collected.take().unwrap();
         let (ingested, _, grant) = scene.ingest_with_grant(raw);
-        let (admitted, current) = {
+        let admitted = {
             let (prepared, _) = scene.real.scene.coordinator.prepared_joint_parts().unwrap();
-            (
-                prepared.admissions().cloned().collect::<Vec<_>>(),
-                prepared.take_current_for_birth_test(),
-            )
+            prepared.admissions().cloned().collect::<Vec<_>>()
         };
+        let current = scene
+            .real
+            .scene
+            .coordinator
+            .take_prepared_current_for_birth_test()
+            .unwrap();
         assert_eq!(admitted.len(), 2);
         assert_eq!(current.len(), 2, "two actual collected New receipts");
         let claims = claim_and_finish(&mut scene, &ingested);

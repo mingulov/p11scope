@@ -154,15 +154,6 @@ impl PreparedSemanticBatch {
         &self.current
     }
 
-    /// Test fixtures move the actual validated New receipts into the existing
-    /// birth verifier. No receipt or birth authority is copied or constructed.
-    #[cfg(test)]
-    pub(crate) fn take_current_for_birth_test(
-        &mut self,
-    ) -> Vec<crate::semantic_capture::CurrentPartitionReceipt> {
-        std::mem::take(&mut self.current)
-    }
-
     pub(crate) fn next_admission(&self) -> Option<&AdmittedInstanceCall> {
         self.entries[self.stage_cursor..]
             .iter()
@@ -267,6 +258,19 @@ impl SessionFinalizerState {
 
 #[cfg_attr(not(test), allow(dead_code))] // Staged ports; no Joint lane uses them yet.
 impl<Source: ProcessSource> InventoryCoordinator<Source> {
+    /// Test fixtures move the actual validated New receipts from the owning
+    /// slot into the existing birth verifier. The production prepared view
+    /// remains read-only; no receipt or birth authority is copied or minted.
+    #[cfg(test)]
+    pub(crate) fn take_prepared_current_for_birth_test(
+        &mut self,
+    ) -> Option<Vec<crate::semantic_capture::CurrentPartitionReceipt>> {
+        match self.semantic_finalizer.as_mut()?.pending_semantic.as_mut()? {
+            PendingSemanticBatch::Prepared(batch) => Some(std::mem::take(&mut batch.current)),
+            PendingSemanticBatch::Collected(_) => None,
+        }
+    }
+
     pub(crate) fn prepared_semantic_batch(&self) -> Option<&PreparedSemanticBatch> {
         match self
             .semantic_finalizer

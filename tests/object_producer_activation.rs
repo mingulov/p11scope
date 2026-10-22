@@ -1740,6 +1740,23 @@ fn strip_rust_prose_lexes_every_prefix_and_edge() {
     assert_eq!(strip_rust_prose("/* adapter_attributes_entry("), "");
 }
 
+/// A pure policy test cannot detect a producer that still narrows the
+/// captured target word instead of using the full-width finite policy.
+#[test]
+fn login_user_type_capture_uses_full_width_finite_policy() {
+    let stripped = strip_rust_prose(&bpf_source());
+    let capture = source_between(
+        &stripped,
+        "if let Some(value) = capture_scalar(&ctx, semantics.user_type_arg, layout, start) {",
+        "if semantics.mechanism_arg != ARG_NONE {",
+    );
+    assert_eq!(
+        capture.split_whitespace().collect::<String>(),
+        "start.user_type=finite_login_user_type(value);}",
+        "the producer must classify the full captured user type before narrowing"
+    );
+}
+
 /// G05(b) round-5 stability: the stripped dump of the real BPF source
 /// is byte-identical before and after the lexer correction (baseline
 /// captured pre-fix: 114413 B, sha256 below). Re-baseline deliberately
@@ -1747,19 +1764,19 @@ fn strip_rust_prose_lexes_every_prefix_and_edge() {
 /// Re-baselined after the E4 outlined return branches, scalar scope flags,
 /// alias-header acquisition and Some-only flags load (safe eight-commit
 /// integration through 242ba841): 113589 B, measured with this actual lexer.
+/// Re-baselined again for full-width login user-type capture.
 #[test]
 fn strip_rust_prose_real_bpf_source_dump_stable() {
     use sha2::{Digest as _, Sha256};
     let stripped = strip_rust_prose(&bpf_source());
-    assert_eq!(
-        stripped.len(),
-        113590,
-        "stripped BPF dump size must not drift"
-    );
     let digest = Sha256::digest(stripped.as_bytes());
     let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
     assert_eq!(
-        hex, "29d8db02743849c9c1e75a0f12b751489f2b37e842dc7c7ab67b159a2dd33a70",
+        (stripped.len(), hex.as_str()),
+        (
+            113631,
+            "0889e995446010d7d4ed54c515fead03539068de9e516fb0dc2eb43faea5dad1"
+        ),
         "stripped BPF dump must stay byte-identical"
     );
 }

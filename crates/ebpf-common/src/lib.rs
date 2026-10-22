@@ -1134,6 +1134,17 @@ pub const SESSION_NONE: u64 = u64::MAX;
 pub const USER_TYPE_NONE: u32 = u32::MAX;
 pub const FUNCTION_NONE: u32 = u32::MAX;
 
+/// Preserve only exact CKU_SO, CKU_USER and CKU_CONTEXT_SPECIFIC values.
+/// Validate the complete target word before narrowing so an unknown LP64
+/// value cannot alias a recognized login type or its semantic exemption.
+#[inline(always)]
+pub const fn finite_login_user_type(raw: u64) -> u32 {
+    match raw {
+        0..=2 => raw as u32,
+        _ => USER_TYPE_NONE,
+    }
+}
+
 /// Longest published standard function name in the 3.2 table.
 pub const FUNCTION_NAME_MAX_BYTES: usize = 27;
 
@@ -2278,6 +2289,33 @@ mod tests {
         assert_ne!(MECH_NONE, 0x250);
         assert_ne!(USER_TYPE_NONE, 1);
         assert_ne!(SESSION_NONE, 0);
+    }
+
+    /// Narrowing before validation would turn an unknown LP64 user type
+    /// into an allowed login, including a context-specific login exemption.
+    #[test]
+    fn finite_login_user_type_checks_full_width_before_narrowing() {
+        for (raw, expected) in [
+            (0, 0),
+            (1, 1),
+            (2, 2),
+            (3, USER_TYPE_NONE),
+            (0x8000_0000, USER_TYPE_NONE),
+            (u32::MAX as u64, USER_TYPE_NONE),
+            (u64::MAX, USER_TYPE_NONE),
+        ] {
+            assert_eq!(finite_login_user_type(raw), expected, "user type {raw:#x}");
+        }
+        for bit in 32..64 {
+            for user_type in [0, 1, 2] {
+                let raw = (1u64 << bit) | user_type;
+                assert_eq!(
+                    finite_login_user_type(raw),
+                    USER_TYPE_NONE,
+                    "high-bit alias {raw:#x}"
+                );
+            }
+        }
     }
 
     /// Mutation caught: any field reorder, type-width change, or tail reuse

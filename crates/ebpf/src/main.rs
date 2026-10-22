@@ -72,11 +72,11 @@ use p11scope_ebpf_common::{
     classify_task_newtask, cookie_descriptor, cookie_slot, decode_export_attach_cookie,
     discovery_pause_coalesced, discovery_pause_enabled, discovery_state_take_failed,
     discovery_state_take_scope_lost, discovery_table_slots, discovery_usable_prefix,
-    discovery_version_class, event_type, image_pair_matches, interface_continuation_next,
-    interface_continuation_pack, interface_continuation_unpack, interface_flags_class, lifecycle,
-    normalize_target_word, read_ia32_arg_with, return_allows_mechanism, semantic_flags, shape,
-    stop_gate_admit_with, target_layout_from_cs, target_stack_arg_address, target_word_end,
-    valid_config, valid_loader_cookie,
+    discovery_version_class, event_type, finite_login_user_type, image_pair_matches,
+    interface_continuation_next, interface_continuation_pack, interface_continuation_unpack,
+    interface_flags_class, lifecycle, normalize_target_word, read_ia32_arg_with,
+    return_allows_mechanism, semantic_flags, shape, stop_gate_admit_with, target_layout_from_cs,
+    target_stack_arg_address, target_word_end, valid_config, valid_loader_cookie,
 };
 #[cfg(feature = "unsafe-unvalidated-metadata")]
 use p11scope_ebpf_common::{
@@ -3227,7 +3227,7 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContex
         }
     }
     if let Some(value) = capture_scalar(&ctx, semantics.user_type_arg, layout, start) {
-        start.user_type = value as u32;
+        start.user_type = finite_login_user_type(value);
     }
 
     if semantics.mechanism_arg != ARG_NONE {

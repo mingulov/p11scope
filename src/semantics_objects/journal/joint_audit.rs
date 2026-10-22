@@ -569,6 +569,22 @@ impl IngestedJointQuantum {
         self.original_failures()
     }
 
+    /// Borrow the actual consumer cursor and original spans. This observer
+    /// cannot advance work, construct evidence or qualify continuation.
+    #[cfg(test)]
+    pub(crate) fn negative_effects_complete_for_test(&self, domain: ObjectDomain) -> Option<bool> {
+        let consumer = self
+            .consumers
+            .iter()
+            .find(|consumer| consumer.target.bootstrap().domain() == domain)?;
+        let originals = self.failure_for(domain)?.originals;
+        Some(
+            originals[consumer.failure.slot..]
+                .iter()
+                .all(Option::is_none),
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn audit_for_test(&self) -> &JournalAuditReceipt {
         &self.audit

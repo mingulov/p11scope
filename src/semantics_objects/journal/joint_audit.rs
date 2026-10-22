@@ -608,6 +608,69 @@ impl IngestedJointQuantum {
         self.validate_owner(owner, producers)
     }
 
+    fn pending_raw_scope_contains(&self, domain: ObjectDomain) -> bool {
+        let Some(raw) = &self.raw_failure else {
+            return false;
+        };
+        let SealFailureScope::AffectedDomains(domains) = &raw.scope else {
+            return false;
+        };
+        domains.binary_search(&domain).is_ok()
+    }
+
+    /// This exception belongs only to the exact pending continuation below.
+    /// It neither makes a key live nor permits a new seal/fallback. The
+    /// original bulk negative captured this typed key-era before refusal.
+    fn pending_refused_proof(
+        &self,
+        adapter: &JournalAdapter,
+        key: super::JournalDomainKey,
+    ) -> Option<super::JournalDomainProof> {
+        let raw = self.raw_failure.as_ref()?;
+        if raw.gap != JournalGap::ImageTainted || raw.h3_voided.is_some() {
+            return None;
+        }
+        let state = adapter.keys.get(&key)?;
+        let proof = super::JournalDomainProof {
+            key,
+            era: state.era,
+        };
+        (state.refused
+            && state.tainted
+            && !state.era_ended
+            && adapter.is_tainted((key.cookie, key.exec))
+            && self.pending_raw_scope_contains(proof.domain()))
+        .then_some(proof)
+    }
+
+    fn pending_negative_delivered(
+        &self,
+        consumer: &FrameConsumer,
+        adapter: &JournalAdapter,
+    ) -> bool {
+        let proof = consumer.target.bootstrap().proof();
+        if self.pending_refused_proof(adapter, proof.key) != Some(proof)
+            || !matches!(
+                consumer.state,
+                ConsumerState::Pending | ConsumerState::Future
+            )
+            || consumer.failure.consumed != 0
+            || consumer.failure.suffix.is_some()
+            || consumer.failure.invalidated
+            || consumer.failure.resource_failed
+        {
+            return false;
+        }
+        let Some(audited) = self.failure_for(consumer.target.bootstrap().domain()) else {
+            return false;
+        };
+        // Same immutable owners as bounded delivery; empty originals still
+        // need their actual transition consumed, never a readiness bit alone.
+        audited.originals[consumer.failure.slot..]
+            .iter()
+            .all(Option::is_none)
+    }
+
     /// A truthful H3-pending audit is not a clean audit and cannot seal or
     /// replay. Only the live producer's original pending custody permits its
     /// immutable frame metadata to retire so the next H0 batch can arrive.
@@ -616,7 +679,7 @@ impl IngestedJointQuantum {
         ports: &JointPublicationPorts<'_>,
         lane: &crate::inventory_semantics::AttestedSemanticLane,
     ) -> bool {
-        let (_, owner, _, producers) = ports.read();
+        let (registry, owner, _, producers) = ports.read();
         let adapter = owner.adapter();
         let Some(failure) = &self.failure else {
             return false;
@@ -639,6 +702,17 @@ impl IngestedJointQuantum {
                 .last_fault
                 .is_some_and(|previous| previous != self.audit.fault_after)
             || !adapter.refused.is_empty()
+            || adapter.stopped
+            || adapter.invalidated
+            || self.active.is_some()
+            || self.original_failures().any(|failure| {
+                failure.h3_voided.is_some()
+                    || disposition_of(failure.gap) == SealFailureDisposition::HistoryLoss
+            })
+            || self
+                .raw_failure
+                .as_ref()
+                .is_some_and(|raw| raw.gap != JournalGap::ImageTainted)
         {
             return false;
         }
@@ -651,8 +725,49 @@ impl IngestedJointQuantum {
             ) {
                 return false;
             }
+            let mut verified_negative = 0usize;
+            for consumer in &self.consumers {
+                if !self.pending_raw_scope_contains(consumer.target.bootstrap().domain()) {
+                    continue;
+                }
+                if !self.pending_negative_delivered(consumer, adapter) {
+                    return false;
+                }
+                let Some(count) = registry.joint_staged_count(&consumer.target) else {
+                    return false;
+                };
+                // Visit the existing FIFO once; no target-vector lookup for
+                // each H8 claim and no copied admission/native index.
+                for index in 0..count {
+                    let Some((admission, native)) =
+                        registry.joint_staged_original_at(&consumer.target, index)
+                    else {
+                        return false;
+                    };
+                    let Some(entry) = adapter.open.get(&native) else {
+                        return false;
+                    };
+                    if adapter
+                        .completed_fallback_original(
+                            entry,
+                            &self.audit,
+                            consumer.target.bootstrap().proof().key,
+                            self.frontier,
+                            *staged_max,
+                            &consumer.target,
+                            registry,
+                        )
+                        .ok()
+                        != Some(Some(admission))
+                    {
+                        return false;
+                    }
+                    verified_negative += 1;
+                }
+            }
             let mut unclaimed = 0usize;
             let mut claimed = 0usize;
+            let mut refused_claimed = 0usize;
             for entry in adapter.open.values() {
                 let fingerprint = super::fingerprint_of_begin(&entry.begin);
                 let claimants = adapter.claims.get(&fingerprint);
@@ -690,8 +805,9 @@ impl IngestedJointQuantum {
                     let Some((key, claim)) = originals.next() else {
                         return false;
                     };
+                    let live = adapter.key_is_live(*key);
                     if originals.next().is_some()
-                        || !adapter.key_is_live(*key)
+                        || (!live && self.pending_refused_proof(adapter, *key).is_none())
                         || key.domain_tag != producers.native_domain().journal_tag()
                         || (key.cookie, key.exec) != entry.image
                         || claim.admission != origin.position()
@@ -705,6 +821,7 @@ impl IngestedJointQuantum {
                     {
                         return false;
                     }
+                    refused_claimed += usize::from(!live);
                     claimed += 1;
                 } else {
                     if !adapter.ledger.matches_unconverted_original(
@@ -720,7 +837,7 @@ impl IngestedJointQuantum {
             // A shared physical fingerprint cannot count one admission for
             // two opens. Refused/unrepresented or unmatched claims also stay
             // local; a numeric pending floor cannot forgive them.
-            if claimed != adapter.claim_counts {
+            if claimed != adapter.claim_counts || refused_claimed != verified_negative {
                 return false;
             }
             let mut covered = 0usize;
@@ -1177,8 +1294,26 @@ impl IngestedJointQuantum {
         if !self.pending_h3_is_owned(ports, lane) {
             return Err((self, RawQuantumRefusal::H3Undisposed));
         }
+        if !self.bound || self.active.is_some() || self.pending != 0 {
+            return Err((self, RawQuantumRefusal::DispositionMismatch));
+        }
+        // The exact continuation above qualified all negative consumers and
+        // original H8/H9 owners. They may remain Future only here; no generic
+        // finish, FellBack/LossDelivered state, or H3 void acknowledgement is
+        // manufactured for history still held by the live producer.
+        if self
+            .consumers
+            .iter()
+            .any(|consumer| consumer.state != ConsumerState::Future)
+        {
+            return Err((self, RawQuantumRefusal::DispositionMismatch));
+        }
         let fault_after = self.audit.fault_after;
-        let disposed = self.finish_frame_inner(ports)?;
+        let disposed = DisposedJointQuantum {
+            identity: self.identity(),
+            frontier: self.frontier,
+        };
+        drop(self); // Only frame buffers drop; physical originals retain their owners.
         // Zero eligible heads still require the same exact continuation and
         // native prefix. A refused finish must leave the baseline unchanged.
         let (_, owner, _, _, _) = ports.split();

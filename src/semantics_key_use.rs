@@ -349,6 +349,13 @@ impl JointStaging {
             .map(|head| (head.position, head.original_invocation))
     }
 
+    /// Borrow the existing FIFO by index during one continuation preflight;
+    /// no copied queue or scalar admission can create this native identity.
+    pub(crate) fn staged_original_at(&self, index: usize) -> Option<(u64, (u64, u64))> {
+        let original = self.staged.get(index)?;
+        Some((original.position, original.original_invocation?))
+    }
+
     /// Whether real loss ended this feed's object authority.
     pub(crate) fn degraded_loss(&self) -> bool {
         self.degraded_loss

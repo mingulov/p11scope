@@ -1601,6 +1601,9 @@ impl JournalAdapter {
                     .domain()
                 }),
         );
+        // The pending continuation checks this original union by typed domain
+        // without a target-vector scan for each retained physical claim.
+        domains.sort_unstable();
         let mut effects = ObjectEffects::default();
         let taints = &self.tainted_images;
         let overflow = self.taint_overflow;

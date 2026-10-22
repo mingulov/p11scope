@@ -803,6 +803,21 @@ impl CallerRegistry {
         record.feed.staged_head_original()
     }
 
+    pub(crate) fn joint_staged_original_at(
+        &self,
+        target: &JointFeedTarget,
+        index: usize,
+    ) -> Option<(u64, (u64, u64))> {
+        let record = self.instance_state.semantics.get(&target.id)?;
+        if record.caller != target.caller
+            || record.feed.mode() != FeedMode::Joint
+            || record.feed.selected_receipt()?.domain() != target.bootstrap.domain()
+        {
+            return None;
+        }
+        record.feed.staged_original_at(index)
+    }
+
     /// Tests-only feed-mode read (N1): the feed an instance's
     /// registration selected.
     #[cfg(test)]

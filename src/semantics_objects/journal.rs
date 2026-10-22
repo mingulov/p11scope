@@ -2084,9 +2084,9 @@ impl H3VoidAcknowledgement {
         &self,
         producers: &crate::attach::SessionDrainProducers,
     ) -> Option<u64> {
-        (self.producers.native_domain() == producers.native_domain()
-            && self.producers.events_id() == producers.events_id())
-        .then_some(self.voided_below)
+        self.producers
+            .same_producers(producers)
+            .then_some(self.voided_below)
     }
 
     #[cfg(test)]

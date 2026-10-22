@@ -31,7 +31,7 @@ use crate::semantics_objects::journal::{
     BootstrapReceipt, H3DispositionEvidence, JournalGap, SealFailure, SealSuccess, SealedCall,
 };
 use crate::semantics_objects::{
-    ObjectDomain, ObjectEffect, ObjectEffects, ObjectId, ObjectSemantics, SessionIncarnation,
+    ObjectEffect, ObjectEffects, ObjectId, ObjectSemantics, SessionIncarnation,
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::mem::size_of;

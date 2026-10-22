@@ -919,11 +919,10 @@ impl IngestedJointQuantum {
         self,
         ports: &mut JointPublicationPorts<'_>,
     ) -> Result<DisposedJointQuantum, (Self, RawQuantumRefusal)> {
-        if self.future != 0
-            && self
-                .failure
-                .as_ref()
-                .is_some_and(|failure| failure.gap == JournalGap::H3Pending)
+        if self
+            .failure
+            .as_ref()
+            .is_some_and(|failure| failure.gap == JournalGap::H3Pending)
         {
             return Err((self, RawQuantumRefusal::H3Undisposed));
         }
@@ -939,10 +938,16 @@ impl IngestedJointQuantum {
         if let Err(reason) = self.preflight(ports) {
             return Err((self, reason));
         }
-        if self.future == 0 || !self.pending_h3_is_owned(ports, lane) {
+        if !self.pending_h3_is_owned(ports, lane) {
             return Err((self, RawQuantumRefusal::H3Undisposed));
         }
-        self.finish_frame_inner(ports)
+        let fault_after = self.audit.fault_after;
+        let disposed = self.finish_frame_inner(ports)?;
+        // Zero eligible heads still require the same exact continuation and
+        // native prefix. A refused finish must leave the baseline unchanged.
+        let (_, owner, _, _, _) = ports.split();
+        owner.adapter_mut().last_fault = Some(fault_after);
+        Ok(disposed)
     }
 
     #[allow(clippy::result_large_err)] // Original frame returned on refusal.

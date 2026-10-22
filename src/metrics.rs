@@ -4,6 +4,11 @@
 //! (the lower bound of the containing bucket), which every renderer must
 //! state.
 
+// Staged private collector; Session acquisition and admission charging follow
+// separately. Existing readers and their public report layout stay unchanged.
+#[cfg_attr(not(test), allow(dead_code))]
+mod counter_collector;
+
 use crate::attach::Session;
 use crate::plan::{AttachPlan, ModuleId};
 use anyhow::{Context as _, Result};

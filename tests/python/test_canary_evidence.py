@@ -1896,7 +1896,9 @@ class StoppedPopulationTests(unittest.TestCase):
                 path = load_subject(TARGET_BITS).ring_raw_path(str(root / "case"), name)
                 content = b""
             else:
-                path = root / f"mapdump_{name}.bin"
+                # Match production: dump/refusal JSON, raw task-storage bytes.
+                suffix = ".bin" if item["type"] == "task_storage" else ".json"
+                path = root / f"mapdump_{name}{suffix}"
                 item["file"] = str(path)
                 if item["type"] == "task_storage":
                     content = b"".join(row["value"] for row in parsed if row["map_id"] == item["id"])
@@ -2915,6 +2917,46 @@ class FinalScannerSurfaceTests(unittest.TestCase):
                         subject.assert_final_artifact_privacy([path])
                 else:
                     subject.assert_final_artifact_privacy([path])
+
+    def test_published_start_json_byte_collision_preserves_identity_leak_detection(self):
+        subject = load_subject(TARGET_BITS)
+        fixture = StoppedPopulationTests("test_framed_records_bind_generations_for_future_coordinator")
+        # Controlled START key pid/tid words contain byte 0xfa without naming
+        # the private loader context_id 0xfa. Keep those bytes in every case.
+        pid, tid = 0x1FA01, 0x1FA02
+        self.assertNotIn(subject.LOADER_PAUSE_IDENTITIES["context_id"], (pid, tid))
+        key = struct.pack("<QII", (pid << 32) | tid, 3, 0)
+        marker = struct.pack("<Q", subject.LOADER_PAUSE_IDENTITIES["marker"])
+        loader = subject.LOADER_PAUSE_IDENTITIES["loader_path"].encode()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest, receipt, records, controls = fixture.fixture(root)
+            fixture.publish_fixture(root, manifest, receipt, records, controls)
+            item = next(row for row in manifest if row["name"] == "START")
+            path = Path(item["file"])
+            reference = root / "same-bytes.json"
+            for case, leaked in (("healthy-key-byte", b""), ("wide-identity", marker),
+                                 ("loader-path", loader)):
+                with self.subTest(case=case):
+                    value = leaked + bytes(subject.CALL_START_SIZE - len(leaked))
+                    content = json.dumps([{"key": [f"0x{byte:02x}" for byte in key],
+                                           "value": [f"0x{byte:02x}" for byte in value]}]).encode()
+                    self.assertIn(b'"0xfa"', content)
+                    path.write_bytes(content)
+                    reference.write_bytes(content)
+                    surface = next(row for row in receipt["surfaces"] if row["id"] == item["id"])
+                    surface.update(size=len(content), sha256=hashlib.sha256(content).hexdigest())
+                    (root / "snapshot.json").write_text(json.dumps(receipt))
+                    self.assertIn(path, fixture.check(root, manifest))
+                    if leaked:
+                        for scanned in (reference, path):
+                            with self.assertRaisesRegex(
+                                AssertionError, re.escape(f"loader/pause identity {leaked!r}")
+                            ):
+                                subject.assert_final_artifact_privacy([scanned])
+                    else:
+                        subject.assert_final_artifact_privacy([reference])
+                        subject.assert_final_artifact_privacy([path])
 
     def test_claimless_manifest_is_refused_in_every_lane(self):
         """A manifest claiming no snapshot must fail its lane, never pass it.

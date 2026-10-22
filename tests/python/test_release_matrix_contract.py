@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import runpy
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -499,6 +500,136 @@ class MatrixContract(unittest.TestCase):
                          "--lane", "host", "--bin-dir", str(self.bins), "--binary-list", str(self.listing),
                          "--curation", str(self.curation), "--bpfmulti-list", str(self.bm_list), "--lib-test", LIB_A)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+
+    def canary_inputs(self, mode="full", bits=64):
+        # Controlled parser input, never evidence of an actual native build.
+        bundle = self.base / f"canary inputs {mode} {bits}"
+        bundle.mkdir(exist_ok=True)
+        work = self.base / "disposable build work"
+        def elf(elf_class, machine, suffix=b""):
+            value = bytearray(20)
+            value[:6] = b"\x7fELF" + bytes((elf_class, 1))
+            struct.pack_into("<H", value, 18, machine)
+            return bytes(value) + suffix
+        target = (1, 3) if bits == 32 else (2, 62)
+        bpf = elf(2, 247, b"controlled detailed BPF " + mode.encode())
+        definitions = {
+            "p11scope": (elf(2, 62, bpf), "observer", work / "default-build/release/p11scope"),
+            "p11scope-discover": (elf(*target), "helper" if bits == 32 else "observer",
+                work / ("helper-build/i686-unknown-linux-gnu/release/p11scope-discover" if bits == 32 else "default-build/release/p11scope-discover")),
+            "default-ebpf": (bpf, "observer", work / "default-build/release/build/p11scope-owned/out/p11scope-ebpf"),
+            "canary_workload": (elf(*target), "workload", work / "canary_workload"),
+            "matrix-provider.so": (elf(*target), "matrix-provider", work / "matrix-provider.so"),
+            "privacy-provider.so": (elf(*target), "privacy-provider", work / "privacy-provider.so"),
+            "dump-task-storage": (elf(2, 62), "reader", work / "task-storage-reader/dump-task-storage"),
+            "dump-task-storage.bpf.o": (elf(2, 247, b"reader"), "reader", work / "task-storage-reader/dump-task-storage.bpf.o"),
+        }
+        artifacts = {}
+        for name, (content, role, origin) in definitions.items():
+            (bundle / name).write_bytes(content)
+            (bundle / name).chmod(0o644 if name.endswith((".so", ".bpf.o", "-ebpf")) else 0o755)
+            artifacts[name] = {"source": str(origin), "build": role, "sha256": hashlib.sha256(content).hexdigest()}
+        commands = [ ("observer", ["p11scope_product_build", "ordinary", "--release", "--workspace",
+            *(["--features", "stub-object-attributes"] if mode == "p0" else []),
+            "--target-dir", str(work / "default-build")]) ]
+        if bits == 32:
+            commands.append(("helper", ["p11scope_product_build", "ordinary", "--release", "-p", "p11scope-discover",
+                "--target", "i686-unknown-linux-gnu", "--target-dir", str(work / "helper-build")]))
+        commands.extend([
+            ("reader", ["scripts/build-task-storage-reader.sh", str(work / "task-storage-reader")]),
+            ("workload", ["gcc", f"-m{bits}", "-std=c11", "-O0", "-Wall", "-Wextra", "-o", str(work / "canary_workload"),
+                "scripts/fixtures/canary_workload.c", "-ldl", "-pthread"]),
+            ("matrix-provider", ["gcc", f"-m{bits}", "-shared", "-fPIC", "-Wall", "-Wextra", "-DPRIVACY_FIXTURE=1",
+                "-o", str(work / "matrix-provider.so"), "crates/discover/tests/fixture/version_matrix.c"]),
+            ("privacy-provider", ["gcc", f"-m{bits}", "-shared", "-fPIC", "-Wall", "-Wextra", "-DPRIVACY_FIXTURE=1", "-DPRIVACY_BLOCKS=1",
+                "-o", str(work / "privacy-provider.so"), "crates/discover/tests/fixture/version_matrix.c"]),
+        ])
+        sources = ("scripts/fixtures/canary_workload.c", "crates/discover/tests/fixture/version_matrix.c",
+                   "scripts/build-task-storage-reader.sh", "scripts/native/dump-task-storage.c", "scripts/native/dump-task-storage.bpf.c")
+        producer_sources = ("scripts/verify-canaries.sh", "scripts/product-build.sh", "scripts/cargo.sh",
+                            "scripts/release-matrix-contract.py", ".release-rust-version", "build.rs", "src/lib.rs")
+        facts = {"producer": "verify-canaries.sh --prepare-object-inputs", "source_root": str(ROOT),
+            "source_revision": "a" * 40, "source_tree": "b" * 40, "source_clean": True,
+            "capture_mode": mode, "target_bits": bits, "build_mode": "ordinary", "prepared_tools": {},
+            "release_rust": (ROOT / ".release-rust-version").read_text().strip(),
+            "build_environment": {name: None for name in ("P11SCOPE_SMALL_RING", "P11SCOPE_SMALL_STATE_MAPS",
+                "P11SCOPE_SMALL_DISCOVERY_RING", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS")},
+            "builds": [{"role": role, "argv": argv, "cwd": str(ROOT), "exit": 0} for role, argv in commands],
+            "artifacts": artifacts,
+            "runtime_sources": {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in sources},
+            "producer_sources": {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in producer_sources}}
+        (bundle / "canary-build.json").write_text(json.dumps(facts) + "\n")
+        return bundle, facts
+
+    def prepare_object_inputs(self, stage, cells):
+        argv = [sys.executable, "-I", str(CHECKER), "--prepare", str(stage), "--lane", "host",
+            "--bin-dir", str(self.bins), "--binary-list", str(self.listing), "--curation", str(self.curation),
+            "--bpfmulti-list", str(self.bm_list), "--candidate-receipt", str(self.candidate), "--lib-test", LIB_A]
+        for mode, bits, bundle in cells:
+            argv.extend(("--object-input", mode, str(bits), str(bundle)))
+        return command(*argv)
+
+    def test_object_inputs_bind_actual_build_mode_abi_and_sources(self):
+        for mode, bits in (("full", 32), ("full", 64), ("p0", 32), ("p0", 64)):
+            with self.subTest(mode=mode, bits=bits):
+                bundle, facts = self.canary_inputs(mode, bits)
+                stage = self.base / f"prepared {mode} {bits}"
+                result = self.prepare_object_inputs(stage, [(mode, bits, bundle)])
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                contract = json.loads((stage / "contract.json").read_text())
+                self.assertEqual(contract["object_cells"], [{"mode": mode, "target_bits": bits,
+                    "bundle": f"artifacts/canary/{mode}-{bits}",
+                    "required_ids": [f"object:{mode}:{bits}:complete", f"object:{mode}:{bits}:blocked"]}])
+                self.assertFalse(contract["full_stage5_ready"])
+                for name in ("scripts/lane-lib-oracle-1.py", "scripts/capture-stopped-canary.py",
+                             "scripts/fixtures/privacy-stack-workload.c"):
+                    self.assertIn("artifacts/source/" + name, contract["bindings"])
+                self.assertFalse((self.base / "disposable build work").exists())
+                verify = command(sys.executable, "-I", str(CHECKER), "--verify-inputs", str(stage),
+                    "--contract", str(stage / "contract.json"))
+                self.assertEqual(verify.returncode, 0, verify.stdout + verify.stderr)
+                missing = contract["bindings"].pop("artifacts/source/scripts/lane-lib-oracle-1.py")
+                (stage / "contract.json").write_text(json.dumps(contract))
+                self.assertEqual(command(sys.executable, "-I", str(CHECKER), "--verify-inputs", str(stage),
+                    "--contract", str(stage / "contract.json")).returncode, 1)
+                self.assertEqual(len(missing), 64)
+
+    def test_object_input_mutations_refuse_before_contract_publication(self):
+        bundle, original = self.canary_inputs()
+        original_payloads = {name: (bundle / name).read_bytes() for name in original["artifacts"]}
+        cases = ("missing", "untrusted", "symlink", "opposite_mode", "wrong_abi", "wrong_bpf", "mixed_bpf",
+                 "failed_build", "wrong_features", "stale_source", "source_tree", "declaration", "duplicate")
+        for case in cases:
+            with self.subTest(case=case):
+                for name, content in original_payloads.items():
+                    (bundle / name).unlink(missing_ok=True)
+                    (bundle / name).write_bytes(content)
+                    (bundle / name).chmod(0o644 if name.endswith((".so", ".bpf.o", "-ebpf")) else 0o755)
+                facts = json.loads(json.dumps(original))
+                if case == "missing": (bundle / "privacy-provider.so").unlink()
+                elif case == "untrusted": (bundle / "p11scope").chmod(0o777)
+                elif case == "symlink":
+                    (bundle / "p11scope").unlink(); (bundle / "p11scope").symlink_to("p11scope-discover")
+                elif case == "opposite_mode": facts["capture_mode"] = "p0"
+                elif case in ("wrong_abi", "wrong_bpf", "mixed_bpf"):
+                    name = "p11scope-discover" if case == "wrong_abi" else "default-ebpf"
+                    value = bytearray(original_payloads[name])
+                    if case == "wrong_abi": value[4] = 1; struct.pack_into("<H", value, 18, 3)
+                    elif case == "wrong_bpf": struct.pack_into("<H", value, 18, 62)
+                    else: value.extend(b"foreign object")
+                    (bundle / name).write_bytes(value)
+                    facts["artifacts"][name]["sha256"] = hashlib.sha256(value).hexdigest()
+                elif case == "failed_build": facts["builds"][0]["exit"] = 1
+                elif case == "wrong_features": facts["builds"][0]["argv"][2:2] = ["--features", "stub-object-attributes"]
+                elif case == "stale_source": facts["runtime_sources"]["scripts/fixtures/canary_workload.c"] = "0" * 64
+                elif case == "source_tree": facts["source_tree"] = "c" * 40
+                elif case == "declaration": facts["producer"] = "user-declaration"
+                (bundle / "canary-build.json").write_text(json.dumps(facts))
+                stage = self.base / ("rejected-" + case)
+                cells = [("full", 64, bundle)] * (2 if case == "duplicate" else 1)
+                result = self.prepare_object_inputs(stage, cells)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertFalse((stage / "contract.json").exists())
 
     def test_build_receipt_missing_mismatched_or_declared_provenance_fails(self):
         original = json.loads(self.candidate.read_text())

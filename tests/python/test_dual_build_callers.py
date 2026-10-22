@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Native ordinary/prepared build tests for attach and canary callers."""
 
+import hashlib
 import json
 import os
 from collections import Counter
@@ -365,6 +366,113 @@ class DualBuildCallerTests(unittest.TestCase):
             path.write_bytes(header)
             path.chmod(0o600 if name.endswith((".so", ".bpf.o", "-ebpf")) else 0o700)
         return inputs
+
+    def object_input_build_boundary(self):
+        # Only compiler processes are replaced. The real runner builds its
+        # command line, selects outputs, exports and validates the bundle.
+        for name in ("scripts/build-task-storage-reader.sh", "scripts/native/dump-task-storage.c",
+                     "scripts/native/dump-task-storage.bpf.c", "scripts/fixtures/canary_workload.c",
+                     "crates/discover/tests/fixture/version_matrix.c", "scripts/release-matrix-contract.py",
+                     "build.rs", "src/lib.rs"):
+            destination = self.repo / name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(ROOT / name, destination)
+        dispatch = r'''#!/usr/bin/python3
+import json, os, pathlib, struct, sys
+config = json.loads(pathlib.Path(os.environ["P11SCOPE_DUAL_BUILD_CONFIG"]).read_text())
+kind = pathlib.Path(sys.argv[0]).name
+if kind == "stable cargo": kind = "cargo"
+args = sys.argv[1:]
+with open(config["events"], "a") as stream:
+    stream.write(json.dumps({"kind": kind, "argv": args}) + "\n")
+if config.get("fail_kind") == kind: raise SystemExit(83)
+def elf(bits, machine, suffix=b""):
+    header = bytearray(20)
+    header[:6] = b"\x7fELF" + bytes((1 if bits == 32 else 2, 1))
+    struct.pack_into("<H", header, 18, machine)
+    return bytes(header) + suffix
+def write(path, content):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content); path.chmod(0o755)
+if kind == "cargo":
+    target = pathlib.Path(args[args.index("--target-dir") + 1])
+    if "--target" in args:
+        assert args[args.index("--target") + 1] == "i686-unknown-linux-gnu"
+        write(target / "i686-unknown-linux-gnu/release/p11scope-discover", elf(32, 3))
+    else:
+        mode = b"p0" if "stub-object-attributes" in args else b"full"
+        bpf = elf(64, 247, b"controlled detailed BPF " + mode)
+        write(target / "release/p11scope", elf(64, 62, b"observer " + bpf))
+        write(target / "release/p11scope-discover", elf(64, 62))
+        write(target / "release/build/p11scope-owned/out/p11scope-ebpf", bpf)
+elif kind in ("gcc", "cc", "clang-18"):
+    output = pathlib.Path(args[args.index("-o") + 1])
+    bits = 32 if "-m32" in args else 64
+    write(output, elf(bits, 247 if kind == "clang-18" else 3 if bits == 32 else 62,
+                      output.name.encode()))
+else:
+    raise SystemExit(97)
+'''
+        (self.bin / "dispatch.py").write_text(dispatch)
+        self.stable_cargo.write_text(dispatch)
+        for name in ("cc", "clang-18"):
+            (self.bin / name).symlink_to("dispatch.py")
+        subprocess.run(["git", "init", "-q", str(self.repo)], check=True)
+        subprocess.run(["git", "-C", str(self.repo), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(self.repo), "-c", "user.name=Fixture",
+                        "-c", "user.email=fixture@example.invalid", "commit", "-qm", "owned source"], check=True)
+        self.configure([])
+
+    def test_prepare_object_inputs_stops_before_privilege_and_capture(self):
+        self.object_input_build_boundary()
+        payloads = {"p11scope", "p11scope-discover", "canary_workload", "matrix-provider.so",
+                    "privacy-provider.so", "dump-task-storage", "dump-task-storage.bpf.o", "default-ebpf"}
+        revision = subprocess.check_output(["git", "-C", str(self.repo), "rev-parse", "HEAD"], text=True).strip()
+        for mode in ("full", "p0"):
+            for bits in (32, 64):
+                for prepared in (False, True):
+                    with self.subTest(mode=mode, bits=bits, prepared=prepared):
+                        output = self.base / f"export {mode} {bits} {prepared}"
+                        result = self.run_child(CHILDREN[1], bits, prepared,
+                            ("--capture-mode", mode, "--object-pilot", "--prepare-object-inputs", str(output)))
+                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                        self.assertEqual({path.name for path in output.iterdir()}, payloads | {"canary-build.json"})
+                        facts = json.loads((output / "canary-build.json").read_text())
+                        self.assertEqual(facts["source_revision"], revision)
+                        self.assertTrue(facts["source_clean"])
+                        self.assertEqual((facts["capture_mode"], facts["target_bits"]), (mode, bits))
+                        self.assertEqual(facts["build_mode"], "prepared" if prepared else "ordinary")
+                        self.assertEqual(set(facts["artifacts"]), payloads)
+                        self.assertEqual([step["role"] for step in facts["builds"]],
+                            ["observer", *(["helper"] if bits == 32 else []), "reader", "workload",
+                             "matrix-provider", "privacy-provider"])
+                        for name in payloads:
+                            self.assertEqual(facts["artifacts"][name]["sha256"],
+                                             hashlib.sha256((output / name).read_bytes()).hexdigest())
+                        cargo = [row["argv"] for row in self.rows() if row["kind"] == "cargo"]
+                        expected = self.expected(CHILDREN[1], bits, prepared, capture_mode=mode)
+                        self.assertEqual(cargo, [expected[0], *expected[2:]])
+                        self.assertEqual({row["kind"] for row in self.rows()}, {"cargo", "gcc", "cc", "clang-18", *([] if prepared else ["prepare"])})
+
+    def test_prepare_object_inputs_refuses_without_successful_build(self):
+        self.object_input_build_boundary()
+        output = self.base / "exported inputs"
+        for arguments in (("--prepare-object-inputs", str(output)),
+                          ("--object-pilot", "--prepare-object-inputs", "relative"),
+                          ("--object-pilot", "--prepare-object-inputs", str(output), "--self-test"),
+                          ("--object-pilot", "--prepare-object-inputs", str(output), "--prebuilt-dir", str(output)),
+                          ("--object-pilot", "--prepare-object-inputs", str(self.work / "inputs"))):
+            with self.subTest(arguments=arguments):
+                result = self.run_child(CHILDREN[1], arguments=arguments)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertFalse(self.events.exists())
+                self.assertFalse(output.exists())
+        config = json.loads(self.config.read_text()) | {"fail_kind": "cargo"}
+        self.config.write_text(json.dumps(config))
+        result = self.run_child(CHILDREN[1], arguments=("--object-pilot", "--prepare-object-inputs", str(output)))
+        self.assertEqual(result.returncode, 83, result.stdout + result.stderr)
+        self.assertFalse(output.exists())
+        self.assertEqual([row["kind"] for row in self.rows()], ["prepare", "cargo"])
 
     def canary_acquisition_boundary(self, *, stop=83):
         # Fake only external acquisition/checker commands. The actual runner

@@ -1214,6 +1214,9 @@ mod tests {
     use p11scope_ebpf_common::object_wire::publish_object_descriptors;
     use std::cell::Cell;
 
+    #[path = "raw_disposition_tests.rs"]
+    mod raw_disposition_tests;
+
     struct FaultProbe(Cell<u64>);
     impl FaultEpoch for FaultProbe {
         fn fault_epoch(&self) -> Result<u64, FaultReadError> {

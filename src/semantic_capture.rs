@@ -2458,6 +2458,14 @@ pub(crate) fn assert_actual_absence_birth_fixture() {
 }
 
 #[cfg(test)]
+pub(crate) fn deliver_collected_raw_for_resource_test(
+    raw: &mut crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+    domain: NativeDomainId,
+) -> TickReport {
+    tests::deliver_collected_raw_for_resource_test(raw, domain)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::attach::image_query::{CompleteEpochs, acquire_test_scan};
@@ -3714,6 +3722,19 @@ mod tests {
         SemanticCapture::in_domain(io.domain, TickLimits::default()).unwrap()
     }
 
+    // Only the role-bookkeeping tests use this substituted native I/O. The
+    // actual collected leaf stamps the report; it grants no admission/birth.
+    pub(super) fn deliver_collected_raw_for_resource_test(
+        raw: &mut crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+        domain: NativeDomainId,
+    ) -> TickReport {
+        let mut io = ScriptIo::small(domain);
+        let mut capture = capture(&io);
+        let report = capture.tick_collected_with(&mut io, raw).unwrap();
+        assert!(report.awaiting_floor().is_none());
+        report
+    }
+
     struct BirthFault;
     impl crate::semantics_objects::journal::FaultEpoch for BirthFault {
         fn fault_epoch(&self) -> Result<u64, crate::semantics_objects::journal::FaultReadError> {
@@ -4038,6 +4059,59 @@ mod tests {
                 .settled()
                 .len()
         }
+    }
+
+    #[test]
+    fn joint_ingested_raw_keeps_original_frontier_and_admission() {
+        use crate::semantics_objects::journal::SessionDrainGrant;
+        use crate::semantics_objects::journal::joint_driver::{IngestedRaw, RawQuantumRefusal};
+
+        let mut harness = JointBirthHarness::new();
+        harness.push_create(1);
+        let mut raw = harness.collect();
+        let (_, admitted) = harness.route(&mut raw);
+        harness.adapter.bind_admitted_key(&admitted).unwrap();
+        let grant = SessionDrainGrant::observe(&harness.producers, &admitted).unwrap();
+        harness.adapter.bind_session_drain(&grant).unwrap();
+        let ingested: IngestedRaw = raw
+            .ingest(&mut harness.adapter, &harness.producers, &grant)
+            .unwrap_or_else(|(_, reason)| panic!("actual raw ingest: {reason:?}"));
+        let first_frontier = harness.adapter.consumed_frontier();
+        assert!(ingested.matches_admission(&admitted));
+        assert!(ingested.frontier() == first_frontier);
+        assert_eq!(
+            ingested.validate_owner(&harness.adapter, &harness.producers),
+            Ok(())
+        );
+        let foreign = crate::attach::SessionDrainProducers::test_pair(
+            harness.producers.native_domain(),
+            crate::events::EventsDomain::test_standin(harness.producers.events_id()),
+        );
+        assert_eq!(
+            ingested.validate_owner(&harness.adapter, &foreign),
+            Err(RawQuantumRefusal::ForeignCapture)
+        );
+
+        harness.push_create(2);
+        let mut next_raw = harness.collect();
+        let (_, next_admitted) = harness.route(&mut next_raw);
+        assert!(
+            !ingested.matches_admission(&next_admitted),
+            "a later original from the same owner cannot borrow the earlier allocation's proof"
+        );
+        let next_ingested: IngestedRaw = next_raw
+            .ingest(&mut harness.adapter, &harness.producers, &grant)
+            .unwrap_or_else(|(_, reason)| panic!("next actual raw ingest: {reason:?}"));
+        assert!(next_ingested.matches_admission(&next_admitted));
+        assert!(ingested.frontier() == first_frontier);
+        assert_eq!(
+            ingested.validate_owner(&harness.adapter, &harness.producers),
+            Err(RawQuantumRefusal::StaleFrontier)
+        );
+        assert_eq!(
+            next_ingested.validate_owner(&harness.adapter, &harness.producers),
+            Ok(())
+        );
     }
 
     #[test]

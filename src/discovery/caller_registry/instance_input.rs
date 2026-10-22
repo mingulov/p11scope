@@ -77,24 +77,6 @@ impl AdmittedInstance {
 
 #[cfg(test)]
 impl AdmittedInstanceCall {
-    /// Nested allocations owned by the original admission, beyond its inline
-    /// Vec entry. Shared pins/origins add no copied allocation here.
-    pub(crate) fn owned_storage_bytes(&self) -> Option<usize> {
-        let module = match &self.key.module {
-            ModuleKey::Physical { sha256, .. } => sha256.as_ref().map_or(0, String::capacity),
-            ModuleKey::Unidentified { path } => path.capacity(),
-        };
-        [module, self.facts.function.capacity()]
-            .into_iter()
-            .try_fold(0usize, |bytes, capacity| {
-                bytes.checked_add(capacity)?.checked_add(if capacity == 0 {
-                    0
-                } else {
-                    crate::semantics_edge::resources::OWNED_ALLOCATION_PADDING
-                })
-            })
-    }
-
     /// Tests-only reference call (N1): a current-continuity call at
     /// `ordinal` carrying `facts`, for guarded-path tests.
     pub(crate) fn scripted(
@@ -279,6 +261,24 @@ impl fmt::Debug for AdmittedInstanceCall {
 }
 
 impl AdmittedInstanceCall {
+    /// Nested allocations owned by the original admission, beyond its inline
+    /// Vec entry. Shared pins/origins add no copied allocation here.
+    pub(crate) fn owned_storage_bytes(&self) -> Option<usize> {
+        let module = match &self.key.module {
+            ModuleKey::Physical { sha256, .. } => sha256.as_ref().map_or(0, String::capacity),
+            ModuleKey::Unidentified { path } => path.capacity(),
+        };
+        [module, self.facts.function.capacity()]
+            .into_iter()
+            .try_fold(0usize, |bytes, capacity| {
+                bytes.checked_add(capacity)?.checked_add(if capacity == 0 {
+                    0
+                } else {
+                    crate::semantics_edge::resources::OWNED_ALLOCATION_PADDING
+                })
+            })
+    }
+
     /// Journal domain binding (H8): the admitted call's exact native
     /// domain, image, router and caller for sealed incarnation minting.
     /// Only the journal child reads this; the values feed private model

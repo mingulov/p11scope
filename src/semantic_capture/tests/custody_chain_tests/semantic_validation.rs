@@ -637,7 +637,13 @@ impl RealScene {
             .script
             .records
             .drain(..)
-            .map(|record| crate::events::record_bytes(&record.base))
+            .map(|mut record| {
+                // Model a real main-thread return, including its nonzero
+                // thread identity and unsaturated physical call interval.
+                record.base.event.pid_tgid |= record.base.event.pid_tgid >> 32;
+                record.base.event.duration_ns = 1;
+                crate::events::record_bytes(&record.base)
+            })
             .collect();
         let events = crate::events::EventsDomain::test_standin(0xb201);
         let producers =

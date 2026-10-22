@@ -53,8 +53,7 @@ impl SessionFinalizerState {
             return false;
         }
         if let Some(retained) = &self.producers {
-            return retained.native_domain() == producers.native_domain()
-                && retained.events_id() == producers.events_id();
+            return retained.same_producers(producers);
         }
         self.producers = Some(producers.clone());
         true

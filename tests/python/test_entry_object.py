@@ -182,6 +182,97 @@ def mutate(disassembly, function, pc, old, new, internal_call=False, helper_call
 
 
 class EntryObjectTests(unittest.TestCase):
+    def test_bounded_entry_cycles_require_proved_progress(self):
+        for variant in OBJECTS:
+            name, insns = instructions(variant, "p11_entry")
+            texts = dict(insns)
+            guard = next(pc for pc, text in insns
+                         if re.fullmatch(r"if r2 != 0x20 goto -0x7", text))
+            head = guard-6
+            entry, exit_pc = head-2, guard+1
+            self.assertEqual(texts[entry], "r1 = 0x0")
+            self.assertEqual(texts[entry+1], "r2 = 0x0")
+            self.assertEqual(texts[guard-1], "r2 += 0x4")
+
+            def prove(disassembly, sink=-0x40):
+                # The actual emitted clear-eight CFG, with its caller state
+                # supplied at entry and a checked final sink at its exit.
+                parts = CHECKER["sections"](disassembly)
+                lines = CHECKER["D"].function_blocks(parts["uprobe"])[name]
+                consumer = CHECKER["Consumer"]("uprobe", name, lines, {})
+                consumer.insns = [(pc, text) for pc, text in consumer.insns if entry <= pc <= exit_pc]
+                consumer.graph = {pc: ([] if pc == exit_pc else consumer.graph[pc])
+                                  for pc, _ in consumer.insns}
+                consumer.text[exit_pc] = "exit"
+                proof = CHECKER["SinkProof"](6, 0, True, ("stack", sink))
+                consumer.facts({"r6": ("stack", -512), "r10": ("stack", 0),
+                    ("success",): True, ("stack", sink+8, 8): ("scalar", 6, 64)}, proof)
+                self.assertTrue(proof.witnesses)
+
+            for bound in ("0x20", "0x10"):
+                healthy = mutate(OBJECTS[variant], name, guard, texts[guard],
+                                 texts[guard].replace("0x20", bound)) if bound != "0x20" else OBJECTS[variant]
+                with self.subTest(variant=variant, control="proved bounded loop", bound=bound):
+                    prove(healthy)
+            for pc, new in ((entry+1, "r2 = r9"), (guard-1, "r2 += 0x0"),
+                            (guard, texts[guard].replace("0x20", "0x24")),
+                            (guard, f"if r2 != 0x20 goto {entry+1-guard-1:+#x}"),
+                            (guard, "if r2 != 0x20 goto -0x1")):
+                with self.subTest(variant=variant, mutant=new):
+                    with self.assertRaisesRegex(RuntimeError, "cyclic|loop"):
+                        prove(mutate(OBJECTS[variant], name, pc, texts[pc], new))
+            for sink in (-0xa8, -0x90):
+                with self.subTest(variant=variant, control="loop effects cannot skip first or last cells", sink=sink):
+                    with self.assertRaisesRegex(RuntimeError, "successful capture lost"):
+                        prove(OBJECTS[variant], sink)
+
+    def _assert_entry_side_query_requires_key_null_and_start_lifetime(self):
+        for variant in OBJECTS:
+            name, insns = instructions(variant, "p11_entry")
+            lines = CHECKER["D"].function_blocks(CHECKER["sections"](OBJECTS[variant])["uprobe"])[name]
+            query = call_site(variant, name, "p11_object_side_get", 4)
+            consumer = CHECKER["_OwnedCaller"]("uprobe", name, lines, {query: "p11_object_side_get"})
+            proof = CHECKER["_OwnedSinkProof"](6, 0, True, ("owned", 77, 0))
+            consumer.proof = proof
+            identity = ("uprobe", name)
+            key = {("stack", -64, 8): ("pid_tgid", identity),
+                   ("stack", -56, 4): ("low", identity), ("stack", -52, 4): ("constant", 0)}
+            state = {**key, "r1": ("stack", -64), "r2": ("constant", 5), "r3": ("constant", 0),
+                "r7": ("owned", 77, 0), "r10": ("stack", 0), ("live", 77): True,
+                ("success",): True, ("owned_word", 77, 8, 8): ("scalar", 6, 64),
+                ("stack", -128, 8): ("constant", 37)}
+            acquired = consumer.step(query, state)
+            alias, guard, store = (pc for pc, _ in insns if query < pc <= query+3)
+            consumer.text[alias] = "r8 = r0"
+            acquired = consumer.step(alias, acquired)
+            consumer.text[guard] = "if r8 != 0x0 goto +0x1"
+            consumer.graph[guard] = [guard+1, guard+2]
+            edges = dict(proof.edges(consumer, guard, acquired, acquired))
+            consumer.text[store] = "*(u32 *)(r8 + 0x40) = w7"
+            with self.subTest(variant=variant, control="nonnull private row writes preserve START and frame"):
+                written = consumer.step(store, edges[guard+2])
+                proof.check_sink(consumer, store, written)
+                self.assertEqual(written[("stack", -128, 8)], ("constant", 37))
+            nullable = proof.join(edges[guard+1], edges[guard+2])
+            with self.subTest(variant=variant, control="joined null remains nullable until a fresh full-width guard"):
+                with self.assertRaisesRegex(RuntimeError, "side.*nonnull"):
+                    consumer.step(store, nullable)
+                refined = dict(proof.edges(consumer, guard, nullable, nullable))[guard+2]
+                proof.check_sink(consumer, store, consumer.step(store, refined))
+            for candidate, control in ((edges[guard+1], "null side row"),
+                    ({key: val for key, val in edges[guard+2].items() if key != ("live", 77)}, "expired START")):
+                with self.subTest(variant=variant, control=control):
+                    with self.assertRaisesRegex(RuntimeError, "side.*(nonnull|lifetime)"):
+                        consumer.step(store, candidate)
+            for changed, control in (({("stack", -52, 4): ("constant", 1)}, "key padding"),
+                    ({("stack", -56, 4): ("low", ("uprobe", "foreign"))}, "foreign slot"),
+                    ({"r3": ("constant", 1)}, "wrong required flag"),
+                    ({"r2": ("owned", 77, 0)}, "pointer used as descriptor"),
+                    ({("live", 77): False}, "expired query")):
+                with self.subTest(variant=variant, control=control):
+                    with self.assertRaisesRegex(RuntimeError, "side query"):
+                        consumer.step(query, state | changed)
+
     def test_seeded_start_caller_contract(self):
         for variant, disassembly in OBJECTS.items():
             with self.subTest(variant=variant):
@@ -690,6 +781,7 @@ class EntryObjectTests(unittest.TestCase):
                     self.assertFalse(proof.required(edges[2]))
 
     def test_map_pointer_refinement_requires_zero_partition(self):
+        self._assert_entry_side_query_requires_key_null_and_start_lifetime()
         proof = CHECKER["SinkProof"](8, 0, True, ("stack", -0x128))
         for fact in (("descriptor", 77), ("owned", 77, 0), ("function_value", 77, 0)):
             for op in ("s>", ">=", "==", "!="):
@@ -775,7 +867,10 @@ class EntryObjectTests(unittest.TestCase):
                     snapshot_fact = ("constant", 2) if family == "entry" else ("retained", 0x38, 32)
                     self.assertEqual(consumer.step(load_pc, refined)["r0"], snapshot_fact)
             consumer.text[guard_pc] = "if r6 != 0x0 goto +0x1"
-            for predecessors in ((expired, snapshot_state), (snapshot_state, expired)):
+            null_snapshot = {key: (("constant", 0) if val == ("owned", 77, 0) else val)
+                             for key, val in snapshot_state.items() if key != ("live", 77)}
+            for predecessors in ((expired, snapshot_state), (snapshot_state, expired),
+                                 (expired, null_snapshot), (null_snapshot, expired)):
                 merged = proof.join(*predecessors)
                 refined = dict(proof.edges(consumer, guard_pc, merged, merged))[guard_pc+2]
                 with self.subTest(family=family, retired_first=predecessors[0] is expired,

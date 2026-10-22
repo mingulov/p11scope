@@ -85,11 +85,17 @@ def join_fact(left, right):
     """Must-join of one register/stack fact. Different map-helper lookups can
     join at one shared counter writeback (as in SinkProof's ("result",
     "map")): the joined pointer is still a map value disjoint from the local
-    frame; only which lookup produced it is forgotten."""
+    frame; only which lookup produced it is forgotten. An unrefined original
+    owner/side pointer is nullable, so joining its base with zero retains that
+    nullable token; it never supplies a live/non-null lifetime fact."""
     if left == right:
         return left
-    if left and right and left[0] == right[0] == "result":
-        return ("result", "map")
+    if isinstance(left, tuple) and left and isinstance(right, tuple) and right:
+        if left[0] == right[0] == "result":
+            return ("result", "map")
+        for pointer, zero in ((left, right), (right, left)):
+            if pointer[0] in ("owned", "side", "function_value") and pointer[2] == 0 and zero == ("constant", 0):
+                return pointer
     return None
 
 
@@ -309,6 +315,61 @@ class Consumer:
             state.pop(("event_slot",), None)
         return state
 
+    def proof_control_flow(self, start):
+        """Expand each cyclic component into at most eight proved visits.
+
+        Every backward edge within one component consumes a visit. Leaving a
+        component cannot reset it and return: the component graph is acyclic.
+        Overlapping/nested cycles share the same counter. A reachable ninth
+        visit is a refusal, not an omitted path or a successful truncation.
+        """
+        reachable = D.reachable(self.graph, [start])
+        reverse = {pc: [] for pc in reachable}
+        for pc in reachable:
+            for successor in self.graph[pc]:
+                reverse[successor].append(pc)
+        seen, order, pending = set(), [], [(start, False)]
+        while pending:
+            pc, finished = pending.pop()
+            if finished:
+                order.append(pc)
+            elif pc not in seen:
+                seen.add(pc)
+                pending.append((pc, True))
+                pending.extend((successor, False) for successor in self.graph[pc] if successor not in seen)
+        components, cyclic = {}, set()
+        for pc in reversed(order):
+            if pc in components:
+                continue
+            component, members, pending = pc, set(), [pc]
+            while pending:
+                current = pending.pop()
+                if current in components:
+                    continue
+                components[current] = component
+                members.add(current)
+                pending.extend(reverse[current])
+            if len(members) > 1 or pc in self.graph[pc]:
+                cyclic.add(component)
+        graph, edges, overflow, pending = {}, {}, set(), [(start, 0)]
+        while pending:
+            node = pending.pop()
+            if node in graph:
+                continue
+            pc, visit = node
+            graph[node], edges[node] = [], {}
+            if visit == 8:
+                overflow.add(node)
+                continue
+            for successor in self.graph[pc]:
+                same = components[successor] == components[pc]
+                next_visit = visit + int(successor <= pc) if same and components[pc] in cyclic else 0
+                edge = (successor, next_visit)
+                edges[node][successor] = edge
+                graph[node].append(edge)
+                pending.append(edge)
+        return graph, edges, overflow
+
     def facts(self, initial=None, proof=None):
         start = self.insns[0][0]
         initial = initial or {"r1": ("context", 0), "r10": ("stack", 0)}
@@ -316,30 +377,40 @@ class Consumer:
             # Topological worklist: validate only complete predecessor joins.
             # Success/lifecycle partitions belong to ONE role, never to all
             # combinations of captured arguments or machine states.
-            reachable = D.reachable(self.graph, [start])
-            degree = Counter(v for u in reachable for v in self.graph[u] if v in reachable)
-            pending = deque(pc for pc in reachable if not degree[pc])
+            graph, edges, overflow = self.proof_control_flow(start)
+            degree = Counter(v for successors in graph.values() for v in successors)
+            pending = deque(node for node in graph if not degree[node])
             order = []
             while pending:
-                pc = pending.popleft()
-                order.append(pc)
-                for successor in self.graph[pc]:
+                node = pending.popleft()
+                order.append(node)
+                for successor in graph[node]:
                     degree[successor] -= 1
                     if degree[successor] == 0:
                         pending.append(successor)
-            require(len(order) == len(reachable), self.name + ": final-sink cyclic CFG")
-            incoming = {start: {proof.partition(initial): initial}}
+            require(len(order) == len(graph), self.name + ": final-sink cyclic expansion")
+            incoming = {(start, 0): {proof.partition(initial): initial}}
             self.proof = proof
             try:
-                for pc in order:
-                    for state in incoming.get(pc, {}).values():
+                for node in order:
+                    pc, _ = node
+                    if node in overflow:
+                        require(not incoming.get(node), self.label(pc) + ": final-sink loop exceeds eight visits or lacks proved progress")
+                        continue
+                    for state in incoming.get(node, {}).values():
                         after = self.step(pc, state)
                         for successor, edge in proof.edges(self, pc, state, after):
                             partition = proof.partition(edge)
-                            previous = incoming.setdefault(successor, {}).get(partition)
-                            incoming[successor][partition] = proof.join(previous, edge)
+                            destination = edges[node][successor]
+                            previous = incoming.setdefault(destination, {}).get(partition)
+                            incoming[destination][partition] = proof.join(previous, edge)
                 proof.finish(self)
-                return incoming
+                result = {}
+                for (pc, _), partitions in incoming.items():
+                    for partition, state in partitions.items():
+                        previous = result.setdefault(pc, {}).get(partition)
+                        result[pc][partition] = proof.join(previous, state)
+                return result
             finally:
                 self.proof = None
         incoming = {start: initial}
@@ -431,7 +502,8 @@ class SinkProof:
     @staticmethod
     def join(previous, state):
         merged = state.copy() if previous is None else {
-            k: v for k, v in previous.items() if state.get(k) == v}
+            k: joined for k, v in previous.items()
+            if (joined := join_fact(v, state.get(k))) is not None}
         previous = previous or {}
         for key in previous.keys() & state.keys():
             if isinstance(key, tuple) and key[0] == "domain":
@@ -593,8 +665,8 @@ class SinkProof:
                         fact = ("rsp", 32, 0)
                     elif old[0] == "rsp" and op == "+=":
                         fact = ("rsp", old[1], old[2] + amount)
-                    elif old[0] == "owned" and op == "+=":
-                        fact = ("owned", old[1], old[2] + amount)
+                    elif old[0] in ("owned", "side") and op == "+=":
+                        fact = (old[0], old[1], old[2] + amount)
                 elif old == ("rsp", 32, 0) and rhs[0] == "stride" and op == "+=":
                     fact = ("arg_address", rhs)
             if fact is not None:
@@ -870,6 +942,13 @@ class SinkProof:
                             state.pop(("live", left[1]), None)
                         else:
                             state[("live", left[1])] = True
+                    else:
+                        for key, fact in list(state.items()):
+                            if fact == left:
+                                state[key] = ("constant", 0)
+                elif left and left[0] == "side" and zero_taken is not None:
+                    if taken != zero_taken:
+                        state[("side_live", left[1])] = True
                     else:
                         for key, fact in list(state.items()):
                             if fact == left:
@@ -1269,6 +1348,8 @@ class _OwnedCaller(_SeedCaller):
                 state["r0"] = ("owned", pc, 0)
             elif target == "p11_owner_start_remove":
                 forget_owned(state)
+            elif target == "p11_object_side_get":
+                state["r0"] = ("side", pc, 0)
             elif target and not (target in ("memset", "p11_link_current_identity", "p11_instance_entry",
                     "p11_owner_start_begin", "p11_owner_start_aggregate", "p11_object_side_get", "p11_object_fault")
                     or any(target.endswith(suffix) for suffix in ("scope_auth", "scope_flags_word", "object_marker_for",
@@ -1277,8 +1358,8 @@ class _OwnedCaller(_SeedCaller):
                 forget_owned(state)
         if match := re.fullmatch(r"(r\d+) \+= (-?0x[0-9a-f]+)", text):
             fact = incoming.get(match[1])
-            if fact and fact[0] == "owned":
-                state[match[1]] = ("owned", fact[1], fact[2]+int(match[2],16))
+            if fact and fact[0] in ("owned", "side"):
+                state[match[1]] = (fact[0], fact[1], fact[2]+int(match[2],16))
         if match := re.fullmatch(r"([rw]\d+) = (w\d+)", text):
             state.pop(reg(match[1]), None)
             fact = narrow(value(incoming, match[2]), 32)
@@ -1355,8 +1436,29 @@ class _OwnedSinkProof(SinkProof):
         if memory:
             base, sign, offset = memory.groups()[2:5] if LOAD.fullmatch(text) else memory.groups()[1:4]
             pointer = address(before, base, sign, offset)
+            require(before.get("r"+base) != ("constant", 0),
+                    self.fail(consumer, pc, "side memory access requires nonnull lifetime"))
             if pointer and pointer[0] == "owned":
                 require(before.get(("live", pointer[1])), self.fail(consumer, pc, "START access outside owned lifetime"))
+            if pointer and pointer[0] == "side":
+                owner = before.get(("side_owner", pointer[1]))
+                require(owner is not None and before.get(("live", owner)) and before.get(("side_live", pointer[1])),
+                        self.fail(consumer, pc, "side access requires nonnull current START lifetime"))
+                size = int(memory[2] if LOAD.fullmatch(text) else memory[1])//8
+                require(0 <= pointer[2] and pointer[2]+size <= 432,
+                        self.fail(consumer, pc, "side memory footprint outside the 432-byte row"))
+        if target == "p11_object_side_get":
+            identity, key = (consumer.section, consumer.name), before.get("r1")
+            require(before.get(("live", self.start[1])) and key and key[0] == "stack"
+                    and stack_read(before, key, 8) == ("pid_tgid", identity)
+                    and stack_read(before, key, 4, 8) == ("low", identity)
+                    and stack_read(before, key, 4, 12) == ("constant", 0)
+                    and before.get("r3") == ("constant", 0),
+                    self.fail(consumer, pc, "side query key/required flag/START lifetime"))
+            descriptor = before.get("r2")
+            require(not descriptor or descriptor[0] not in ("owned", "side", "stack", "context", "event", "descriptor", "external_key"),
+                    self.fail(consumer, pc, "side query descriptor is a private pointer"))
+            state[("side_owner", pc)] = self.start[1]
         if target == "p11_owner_start_remove" and before.get(("live", self.start[1])):
             state[("cleanup",)] = True
         if any(target.endswith(suffix) for suffix in ("object_record_entry_abi", "object_fill_entry",

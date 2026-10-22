@@ -1907,19 +1907,32 @@ fn official_build_is_p0_only() {
     );
 }
 
-/// P0-only ship vehicle: the privacy-canary lane builds P0 bytes in
-/// both lanes (safe-only and unsafe), so live canary qualification
-/// loads on 1M-budget kernels.
+/// Canary builds select FULL or P0 explicitly in both safe and diagnostic
+/// lanes. The release caller keeps its explicit P0 selection until FULL
+/// qualification completes. Behavioral argv/oracle controls live in the
+/// dual-build caller suite.
 #[test]
-fn canary_builds_are_p0_only() {
+fn canary_builds_bind_declared_capture_mode() {
     let canaries = read("scripts/verify-canaries.sh");
-    assert!(
-        canaries.contains("--release --workspace --features stub-object-attributes"),
-        "canary safe-only build must shut the attribute gate"
+    let builds = between(
+        &canaries,
+        "echo \"=== build ===\"",
+        "P11SCOPE_DEFAULT=\"$WORK/default-build/release/p11scope\"",
     );
+    for marker in [
+        "set -- --release --workspace",
+        "[ \"$CAPTURE_MODE\" != p0 ] || set -- \"$@\" --features stub-object-attributes",
+        "canary_features=unsafe-unvalidated-metadata",
+        "[ \"$CAPTURE_MODE\" != p0 ] || canary_features=$canary_features,stub-object-attributes",
+        "--release --workspace --features \"$canary_features\"",
+    ] {
+        assert!(
+            builds.contains(marker),
+            "canary capture-mode build misses {marker}"
+        );
+    }
     assert!(
-        canaries.contains("--features unsafe-unvalidated-metadata,stub-object-attributes"),
-        "canary unsafe build must shut the attribute gate"
+        read("scripts/build-release.sh").contains("scripts/verify-canaries.sh --capture-mode p0")
     );
 }
 

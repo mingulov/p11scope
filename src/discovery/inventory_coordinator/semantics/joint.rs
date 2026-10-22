@@ -265,7 +265,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     pub(crate) fn take_prepared_current_for_birth_test(
         &mut self,
     ) -> Option<Vec<crate::semantic_capture::CurrentPartitionReceipt>> {
-        match self.semantic_finalizer.as_mut()?.pending_semantic.as_mut()? {
+        match self
+            .semantic_finalizer
+            .as_mut()?
+            .pending_semantic
+            .as_mut()?
+        {
             PendingSemanticBatch::Prepared(batch) => Some(std::mem::take(&mut batch.current)),
             PendingSemanticBatch::Collected(_) => None,
         }

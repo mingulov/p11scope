@@ -363,7 +363,8 @@ class NativeWrapControls(unittest.TestCase):
             self.assertEqual(facts['physical_pairs'], 32)
             self.assertEqual(facts['phase_calls'], dict(a=32, shared=32, fence=32, proof=32))
             for mutation in ('missing', 'duplicate_pair', 'foreign_target', 'wrong_phase',
-                             'wrong_nonce', 'return', 'clock', 'early_ack', 'late_ack'):
+                             'wrong_nonce', 'return', 'clock', 'early_ack', 'late_ack',
+                             'late_b_ready', 'late_unmapped', 'wrong_control_calls'):
                 with self.subTest(mutation=mutation):
                     value = copy.deepcopy(original)
                     calls = [row for row in value['rows'] if row['kind'] == 'call']
@@ -385,9 +386,16 @@ class NativeWrapControls(unittest.TestCase):
                         shared[0]['after_return_ns'] = shared[0]['before_call_ns']
                     elif mutation == 'early_ack':
                         ack['t'] = shared[-1]['after_return_ns'] - 1
-                    else:
+                    elif mutation == 'late_ack':
                         next_call = next(row for row in calls if row['phase'] == 'fence')
                         ack['t'] = next_call['before_call_ns'] + 1
+                    elif mutation == 'late_b_ready':
+                        next(row for row in value['acks'] if row['event'] == 'b-ready')['t'] = shared[0]['before_call_ns'] + 1
+                    elif mutation == 'late_unmapped':
+                        first_fence = next(row for row in calls if row['phase'] == 'fence')
+                        next(row for row in value['acks'] if row['event'] == 'a-unmapped')['t'] = first_fence['before_call_ns'] + 1
+                    else:
+                        next(row for row in value['acks'] if row['event'] == 'b-ready')['calls'] += 1
                     with self.assertRaises(ValueError):
                         validate(value)
 

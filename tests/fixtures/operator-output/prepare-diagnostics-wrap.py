@@ -77,6 +77,16 @@ def check_ledger(rows, acks, nonce, pid, directory, counted, shared, probe=False
     expected = [(phase, index, slot) for phase, index in schedule for slot in range(4, 36)]
     if [(row['phase'], row['round'], row['slot']) for row in calls] != expected:
         raise ValueError('actual per-slot call ledger differs from independently issued schedule')
+    control_positions = {'prepared': 0, 'ready': 0, 'b-ready': counted * 32,
+                         'a-unmapped': (counted + shared) * 32, 'done': len(expected)}
+    for ack in acks:
+        if ack['event'] not in control_positions:
+            continue
+        position = control_positions[ack['event']]
+        if (ack['calls'] != position
+                or (position != 0 and ack['t'] < calls[position - 1]['after_return_ns'])
+                or (position < len(calls) and ack['t'] > calls[position]['before_call_ns'])):
+            raise ValueError('native topology/control ACK is outside its independently issued call boundary')
     previous = identity['ready_ns']
     for index, row in enumerate(calls, 1):
         if (row['sequence'] != index or row['return_status'] != 0

@@ -225,7 +225,7 @@ impl JointScene {
                 &begin,
                 p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE,
                 0,
-                sequence * 1_000 + 10,
+                ENTRY_NS + 10,
             )
         } else if init {
             end_bytes(&begin, OBJECT_ACTION_ACCESS, 0, ENTRY_NS + 10)

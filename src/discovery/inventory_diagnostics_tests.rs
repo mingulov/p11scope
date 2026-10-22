@@ -79,6 +79,136 @@ fn snapshot(scene: &Scene) -> RegistrySnapshot {
     )
 }
 
+/// Unmodified production output plus independently sampled registry milestones.
+/// Scene's real-identity seed issues1 then5; it does not pretend to issue five
+/// unit rounds. The live G21 fixture separately requires its32 unit trajectories.
+pub(crate) struct G21CountDiagnosticFixture {
+    pub(crate) records: Vec<Value>,
+    pub(crate) caller: String,
+    pub(crate) module_a: String,
+    pub(crate) module_b: Option<String>,
+    pub(crate) issued_a: Vec<u64>,
+    pub(crate) issued_after_a: Vec<u64>,
+    pub(crate) committed_a: Vec<(u64, u64)>,
+    pub(crate) committed_b: Vec<(u64, u64)>,
+}
+
+fn g21_committed_edge(scene: &Scene, suffix: &str) -> Option<(String, u64)> {
+    let registry = &scene.native.scene.coordinator.registry;
+    registry.edges_of(scene.caller).find_map(|edge| {
+        registry
+            .module(edge.module)
+            .filter(|module| module.paths.iter().any(|path| path.ends_with(suffix)))
+            .map(|_| (edge.module.label(), edge.entry_count))
+    })
+}
+
+type G21CountMilestones = Vec<(u64, u64)>;
+
+fn g21_drive_count_diagnostics(
+    scene: &mut Scene,
+    recovered: bool,
+) -> (G21CountMilestones, G21CountMilestones) {
+    let mut a = vec![(5, g21_committed_edge(scene, "a.so").unwrap().1)];
+    let mut b = Vec::new();
+    if recovered {
+        scene.observe(true, true, 200);
+        scene.count(6);
+        a.push((6, g21_committed_edge(scene, "a.so").unwrap().1));
+        b.push((6, g21_committed_edge(scene, "b.so").unwrap().1));
+        scene.observe(false, true, 300);
+        scene.count(7);
+        scene.horizons();
+        a.push((7, g21_committed_edge(scene, "a.so").unwrap().1));
+        b.push((7, g21_committed_edge(scene, "b.so").unwrap().1));
+        scene.count(8);
+        scene.horizons();
+        a.push((8, g21_committed_edge(scene, "a.so").unwrap().1));
+        b.push((8, g21_committed_edge(scene, "b.so").unwrap().1));
+    } else {
+        for absolute in [6, 7] {
+            scene.count(absolute);
+            a.push((absolute, g21_committed_edge(scene, "a.so").unwrap().1));
+        }
+    }
+    (a, b)
+}
+
+pub(crate) fn genuine_g21_count_diagnostics(recovered: bool) -> G21CountDiagnosticFixture {
+    let mut scene = Scene::placed_with_diagnostics(Some(DiagnosticConfig::default()));
+    let (committed_a, committed_b) = g21_drive_count_diagnostics(&mut scene, recovered);
+    G21CountDiagnosticFixture {
+        caller: scene.caller.label(),
+        module_a: g21_committed_edge(&scene, "a.so").unwrap().0,
+        module_b: g21_committed_edge(&scene, "b.so").map(|edge| edge.0),
+        issued_a: if recovered {
+            vec![1, 5]
+        } else {
+            vec![1, 5, 6, 7]
+        },
+        issued_after_a: if recovered { vec![6, 7, 8] } else { Vec::new() },
+        committed_a,
+        committed_b,
+        records: export(&mut scene),
+    }
+}
+
+#[test]
+fn genuine_ordinary_diagnostics_feed_g21_a_oracle() {
+    let actual = genuine_g21_count_diagnostics(false);
+    let mut disabled = Scene::placed();
+    let milestones = g21_drive_count_diagnostics(&mut disabled, false);
+    assert_eq!(
+        (&actual.committed_a, &actual.committed_b),
+        (&milestones.0, &milestones.1)
+    );
+    assert_eq!(actual.committed_a, vec![(5, 5), (6, 6), (7, 7)]);
+    for absolute in [6, 7] {
+        assert!(
+            actual
+                .records
+                .iter()
+                .any(|row| row["kind"] == "count_decision"
+                    && row["decision"] == "staged"
+                    && row["absolute"] == absolute
+                    && row["pair"].is_string()
+                    && row["module_id"] == actual.module_a)
+        );
+        assert!(actual.records.iter().any(|row| row["kind"] == "publication"
+            && row["edge_total"] == absolute
+            && row["module_id"] == actual.module_a
+            && row["pair"].is_null()
+            && row["decision"].is_null()
+            && row["absolute"].is_null()
+            && row["observation_ref"].is_null()
+            && row["context_unavailable"] == true));
+    }
+}
+
+#[test]
+fn genuine_recovered_diagnostics_feed_g21_a_oracle() {
+    let actual = genuine_g21_count_diagnostics(true);
+    let mut disabled = Scene::placed();
+    let milestones = g21_drive_count_diagnostics(&mut disabled, true);
+    assert_eq!(
+        (&actual.committed_a, &actual.committed_b),
+        (&milestones.0, &milestones.1)
+    );
+    assert_eq!(actual.committed_a, vec![(5, 5), (6, 5), (7, 5), (8, 5)]);
+    assert_eq!(actual.committed_b, vec![(6, 0), (7, 0), (8, 1)]);
+    let placed = actual
+        .records
+        .iter()
+        .find(|row| {
+            row["kind"] == "publication" && row["decision"] == "placed" && row["absolute"] == 8
+        })
+        .unwrap();
+    assert_eq!(placed["module_id"], actual.module_b.as_deref().unwrap());
+    assert_eq!(placed["staged"], 1);
+    assert!(placed["pair"].is_string());
+    assert_eq!(placed["observation_ref"]["status"], "retained");
+}
+
 fn recovered_schedule(scene: &mut Scene) {
     scene.observe(true, true, 200);
     scene.count(7);

@@ -19239,6 +19239,11 @@ mod demotion_retirement_tests;
 mod inventory_diagnostics_tests;
 
 #[cfg(test)]
+pub(crate) use inventory_diagnostics_tests::{
+    G21CountDiagnosticFixture, genuine_g21_count_diagnostics,
+};
+
+#[cfg(test)]
 mod continuity_clock_tests {
     use super::*;
     #[test]

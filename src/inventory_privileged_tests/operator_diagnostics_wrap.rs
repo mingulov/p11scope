@@ -989,10 +989,196 @@ fn check_terminal_pairs_as(
     check_terminal_pairs_schedule(records, b_modules, expected_caller, COUNTED, SHARED)
 }
 
+fn original_diagnostic_read(
+    by_seq: &BTreeMap<u64, &serde_json::Value>,
+    row: &serde_json::Value,
+    caller: &str,
+    require_caller: bool,
+) -> Result<(u64, u64)> {
+    ensure!(
+        row["caller"] == caller,
+        "decision has foreign caller: {row}"
+    );
+    ensure!(
+        row["observation_ref"]["status"] == "retained",
+        "original read is not retained: {row}"
+    );
+    let seq = row["seq"].as_u64().context("decision seq")?;
+    let observation_seq = row["observation_ref"]["seq"]
+        .as_u64()
+        .context("observation ref seq")?;
+    let observation = by_seq
+        .get(&observation_seq)
+        .context("referenced original read missing")?;
+    let pre = row["pre"].as_u64().context("read PRE")?;
+    let post = row["post"].as_u64().context("read POST")?;
+    ensure!(
+        observation_seq < seq
+            && observation["kind"] == "count_observation"
+            && observation["pair"] == row["pair"]
+            && observation["absolute"] == row["absolute"]
+            && observation["pre"] == pre
+            && observation["post"] == post
+            && pre <= post
+            && (observation["caller"] == caller
+                || !require_caller && observation["caller"].is_null()),
+        "decision substituted its original pair/caller/read: {row}"
+    );
+    Ok((pre, post))
+}
+
+/// Pair-bound staging establishes lineage and original reads. Ordinary Bound
+/// staging commits through a null-pair direct publication; pending staging
+/// commits through its actual placed/pending result. Neither shape supplies
+/// the expected count: issued absolutes and committed milestones do.
+fn check_a_count_lineage(
+    records: &[serde_json::Value],
+    by_seq: &BTreeMap<u64, &serde_json::Value>,
+    caller: &str,
+    module: &str,
+    issued: &[u64],
+    milestones: &[(u64, u64)],
+) -> Result<(String, BTreeMap<u64, (u64, u64)>)> {
+    let mut expected = BTreeMap::new();
+    let mut base = 0u64;
+    let mut total = 0u64;
+    for absolute in issued.iter().copied() {
+        ensure!(absolute > base, "issued A absolutes must advance");
+        let committed: Vec<_> = milestones
+            .iter()
+            .filter(|milestone| milestone.0 == absolute)
+            .collect();
+        ensure!(committed.len() <= 1, "duplicate committed A milestone");
+        let next_total = committed
+            .first()
+            .map_or(total + absolute - base, |milestone| milestone.1);
+        ensure!(next_total >= total, "committed A history regressed");
+        if next_total > total {
+            ensure!(
+                next_total - total == absolute - base,
+                "A milestone contradicts issued growth"
+            );
+            expected.insert(absolute, (base, absolute - base, next_total));
+        }
+        base = absolute;
+        total = next_total;
+    }
+    ensure!(
+        milestones.contains(&(base, total)),
+        "final A milestone must be independently sampled"
+    );
+    ensure!(
+        milestones
+            .iter()
+            .filter(|milestone| milestone.0 > base)
+            .all(|milestone| milestone.1 == total),
+        "A history changed after its issued phase"
+    );
+    let mut pair = None;
+    let mut stages = BTreeMap::new();
+    for row in records.iter().filter(|row| {
+        row["kind"] == "count_decision" && row["decision"] == "staged" && row["module_id"] == module
+    }) {
+        let absolute = row["absolute"].as_u64().context("A staged absolute")?;
+        let (base, growth, _) = expected.get(&absolute).context("unissued A stage")?;
+        let actual_pair = row["pair"].as_str().context("A staged pair")?;
+        let known = pair.get_or_insert_with(|| actual_pair.to_owned());
+        ensure!(
+            known.as_str() == actual_pair,
+            "one A module spans physical pairs"
+        );
+        ensure!(
+            row["base"] == *base
+                && row["staged"] == *growth
+                && row["after"] == *base
+                && row["through"] == absolute
+                && matches!(
+                    row["reason"].as_str(),
+                    Some("sole_owner" | "pending_publication")
+                ),
+            "A stage differs from issued growth: {row}"
+        );
+        original_diagnostic_read(by_seq, row, caller, false)?;
+        ensure!(stages.insert(absolute, row).is_none(), "duplicate A stage");
+    }
+    ensure!(stages.len() == expected.len(), "missing A stage");
+    let pair = pair.context("initial A pair lineage missing")?;
+    let mut finals = BTreeSet::new();
+    let mut intervals = BTreeMap::new();
+    for (absolute, (base, growth, total)) in &expected {
+        let stage = stages[absolute];
+        let seq = stage["seq"].as_u64().context("A stage seq")?;
+        let next_stage = stages
+            .range(absolute + 1..)
+            .next()
+            .and_then(|(_, row)| row["seq"].as_u64())
+            .unwrap_or(u64::MAX);
+        let direct = stage["reason"] == "sole_owner";
+        let commits: Vec<_> = records
+            .iter()
+            .filter(|row| {
+                row["kind"] == "publication"
+                    && row["caller"] == caller
+                    && row["module_id"] == module
+                    && row["base"] == *base
+                    && row["staged"] == *growth
+                    && row["edge_total"] == *total
+                    && row["seq"]
+                        .as_u64()
+                        .is_some_and(|at| seq < at && at < next_stage)
+                    && if direct {
+                        row["pair"].is_null()
+                            && row["decision"].is_null()
+                            && row["absolute"].is_null()
+                            && row["observation_ref"].is_null()
+                            && row["pre"].is_null()
+                            && row["post"].is_null()
+                            && row["reason"] == "context_unavailable"
+                            && row["context_unavailable"] == true
+                    } else {
+                        row["decision"] == "placed"
+                            && row["pair"] == pair
+                            && row["absolute"] == *absolute
+                            && !stage["pending"].is_null()
+                            && row["pending"] == stage["pending"]
+                            && row["observation_ref"] == stage["observation_ref"]
+                    }
+            })
+            .collect();
+        ensure!(
+            commits.len() == 1,
+            "A unit {absolute} needs exactly one genuine publication shape"
+        );
+        if !direct {
+            original_diagnostic_read(by_seq, commits[0], caller, false)?;
+        }
+        finals.insert(commits[0]["seq"].as_u64().context("A publication seq")?);
+        intervals.insert(
+            *absolute,
+            original_diagnostic_read(by_seq, stage, caller, false)?,
+        );
+    }
+    for row in records
+        .iter()
+        .filter(|row| row["kind"] == "publication" && row["module_id"] == module)
+    {
+        ensure!(
+            row["seq"].as_u64().is_some_and(|seq| finals.contains(&seq)),
+            "extra A publication: {row}"
+        );
+    }
+    Ok((pair, intervals))
+}
+
 /// Complete bounded-pilot proof, never an all-history claim after ring wrap.
 /// Expected units come from the independently checked native schedule; opaque
 /// diagnostic pairs acquire their indexed lineage from A, then must keep it
 /// through every shared unit, their original fence and the matching B proof.
+struct ACommittedMilestones {
+    k: u64,
+    rounds: Vec<(u64, Vec<u64>)>,
+}
+
 fn check_shared_pair_dispositions(
     records: &[serde_json::Value],
     caller: &str,
@@ -1000,13 +1186,25 @@ fn check_shared_pair_dispositions(
     modules_b: &[String],
     counted: u64,
     shared: u64,
-    k: u64,
+    committed: &ACommittedMilestones,
 ) -> Result<()> {
+    let k = committed.k;
     ensure!(
         (3..=COUNTED).contains(&counted) && (1..=SHARED).contains(&shared),
         "invalid bounded pair schedule C={counted} S={shared}"
     );
     ensure!(k == 0 || k == TARGETS, "invalid startup disposition k={k}");
+    ensure!(
+        committed.rounds.len() == counted as usize
+            && committed
+                .rounds
+                .iter()
+                .enumerate()
+                .all(|(index, (round, counts))| *round == index as u64 + 1
+                    && counts.len() == TARGETS as usize
+                    && counts.iter().all(|count| *count == expected_a(*round, k))),
+        "need every independent committed A milestone for the declared native schedule"
+    );
     let a_ids: BTreeSet<_> = modules_a.iter().cloned().collect();
     let b_ids: BTreeSet<_> = modules_b.iter().cloned().collect();
     ensure!(
@@ -1027,84 +1225,25 @@ fn check_shared_pair_dispositions(
             );
         }
     }
-    let read = |row: &serde_json::Value, require_caller: bool| -> Result<(u64, u64)> {
-        ensure!(
-            row["caller"] == caller,
-            "decision has foreign caller: {row}"
-        );
-        ensure!(
-            row["observation_ref"]["status"] == "retained",
-            "bounded read is not retained: {row}"
-        );
-        let seq = row["seq"].as_u64().context("decision seq")?;
-        let observation_seq = row["observation_ref"]["seq"]
-            .as_u64()
-            .context("observation ref seq")?;
-        let observation = by_seq
-            .get(&observation_seq)
-            .context("referenced original read missing")?;
-        let pre = row["pre"].as_u64().context("read PRE")?;
-        let post = row["post"].as_u64().context("read POST")?;
-        ensure!(
-            observation_seq < seq
-                && observation["kind"] == "count_observation"
-                && observation["pair"] == row["pair"]
-                && observation["absolute"] == row["absolute"]
-                && observation["pre"] == pre
-                && observation["post"] == post
-                && pre <= post
-                && (observation["caller"] == caller
-                    || !require_caller && observation["caller"].is_null()),
-            "decision does not retain its original pair/caller/read interval: {row}"
-        );
-        Ok((pre, post))
+    let read = |row: &serde_json::Value, require_caller: bool| {
+        original_diagnostic_read(&by_seq, row, caller, require_caller)
     };
     let mut pairs = BTreeMap::new();
-    let mut pair_for_index = vec![None; TARGETS as usize];
-    let mut a_units = vec![BTreeMap::new(); TARGETS as usize];
-    for row in records
-        .iter()
-        .filter(|row| row["kind"] == "publication" && row["decision"] == "placed")
-    {
-        let Some(index) = modules_a
+    let mut a_units = Vec::with_capacity(TARGETS as usize);
+    let issued: Vec<_> = (1..=counted).collect();
+    for (index, module) in modules_a.iter().enumerate() {
+        let milestones: Vec<_> = committed
+            .rounds
             .iter()
-            .position(|module| row["module_id"] == module.as_str())
-        else {
-            continue;
-        };
-        let pair = row["pair"].as_str().context("A pair")?.to_owned();
-        let known = pairs.entry(pair.clone()).or_insert(index);
-        ensure!(*known == index, "one physical pair spans A modules: {pair}");
-        let lineage = pair_for_index[index].get_or_insert(pair.clone());
+            .map(|(absolute, counts)| (*absolute, counts[index]))
+            .collect();
+        let (pair, units) =
+            check_a_count_lineage(records, &by_seq, caller, module, &issued, &milestones)?;
         ensure!(
-            *lineage == pair,
-            "A module has multiple physical pairs: {index}"
+            pairs.insert(pair, index).is_none(),
+            "physical pair spans indexed A modules"
         );
-        let absolute = row["absolute"].as_u64().context("A absolute")?;
-        ensure!(
-            (1..=counted).contains(&absolute)
-                && !(k == TARGETS && absolute == 2)
-                && row["base"] == absolute - 1
-                && row["staged"] == 1
-                && row["edge_total"] == expected_a(absolute, k),
-            "A placement differs from its issued unit: {row}"
-        );
-        let interval = read(row, false)?;
-        ensure!(
-            a_units[index].insert(absolute, interval).is_none(),
-            "duplicate A unit on pair {pair}"
-        );
-    }
-    ensure!(
-        pairs.len() == TARGETS as usize,
-        "need32 distinct A pair lineages"
-    );
-    for units in &a_units {
-        for absolute in 1..=counted {
-            if !(k == TARGETS && absolute == 2) {
-                ensure!(units.contains_key(&absolute), "missing A unit {absolute}");
-            }
-        }
+        a_units.push(units);
     }
     let mut observations = vec![BTreeMap::new(); TARGETS as usize];
     let mut startup = BTreeSet::new();
@@ -1499,10 +1638,11 @@ fn check_wrap_records(
     bytes: u64,
     b_modules: &BTreeSet<String>,
     pid: u32,
+    owned_caller: &str,
 ) -> Result<()> {
     let header = records.first().context("diagnostic header missing")?;
     ensure!(header["scope"] == "pid" && header["mode"] == "native" && header["pid_filter"] == pid);
-    check_wrap_records_core(records, bytes, b_modules, None)
+    check_wrap_records_core(records, bytes, b_modules, Some(owned_caller))
 }
 
 /// Scope-free wrap-export contract: envelope, limits, both-ring wrap,
@@ -1673,17 +1813,222 @@ fn check_wrap_records_core(
     }
     let (fence_sum, proof_sum, staged_sum) =
         check_terminal_pairs_as(records, b_modules, expected_caller)?;
+    let (shared_from, shared_through) =
+        check_retained_shared_suffix(records, b_modules, expected_caller, COUNTED, SHARED)?;
     ensure!(
         missing_context,
         "wrapped export needs truthful lost-history context"
     );
     eprintln!(
-        "G21_WRAP ordinary_produced_lower_bound={} exceptional_produced_lower_bound={} records={} fence_abs_sum={fence_sum} proof_abs_sum={proof_sum} staged_sum={staged_sum}",
+        "G21_WRAP ordinary_produced_lower_bound={} exceptional_produced_lower_bound={} records={} retained_shared=({shared_from},{shared_through}] fence_abs_sum={fence_sum} proof_abs_sum={proof_sum} staged_sum={staged_sum}",
         24576 + ordinary_evicted,
         8192 + exceptional_evicted,
         records.len() - 2
     );
     Ok(())
+}
+
+/// Validate the useful retained shared suffix against the same32 indexed B
+/// terminal pairs. The first retained shared unit may straddle either ring's
+/// eviction boundary. Every later unit through the independently issued final
+/// shared absolute must remain once per pair; only the common suffix with
+/// retained original reads is reported as proven. No lost prefix is rebuilt.
+fn check_retained_shared_suffix(
+    records: &[serde_json::Value],
+    b_modules: &BTreeSet<String>,
+    expected_caller: Option<&str>,
+    counted: u64,
+    shared: u64,
+) -> Result<(u64, u64)> {
+    ensure!(
+        (3..=COUNTED).contains(&counted) && (1..=SHARED).contains(&shared),
+        "invalid retained suffix schedule"
+    );
+    let end = counted + shared;
+    let by_seq: BTreeMap<_, _> = records
+        .iter()
+        .filter_map(|row| row["seq"].as_u64().map(|seq| (seq, row)))
+        .collect();
+    let terminal: Vec<_> = records
+        .iter()
+        .filter(|row| {
+            row["kind"] == "publication"
+                && row["decision"] == "placed"
+                && row["module_id"]
+                    .as_str()
+                    .is_some_and(|module| b_modules.contains(module))
+        })
+        .collect();
+    ensure!(
+        terminal.len() == TARGETS as usize && b_modules.len() == TARGETS as usize,
+        "need all32 indexed terminal pairs"
+    );
+    let caller = expected_caller
+        .or_else(|| terminal.first().and_then(|row| row["caller"].as_str()))
+        .context("terminal caller missing")?;
+    let mut pairs = BTreeSet::new();
+    for row in terminal {
+        ensure!(row["caller"] == caller, "foreign terminal caller");
+        ensure!(
+            pairs.insert(row["pair"].as_str().context("terminal pair")?),
+            "duplicate terminal pair"
+        );
+    }
+    let exceptional_cut = records
+        .iter()
+        .filter(|row| {
+            matches!(
+                row["kind"].as_str(),
+                Some("ownership_transition" | "capture_health")
+            ) || matches!(
+                row["decision"].as_str(),
+                Some("rejected" | "withheld" | "pending")
+            )
+        })
+        .filter_map(|row| row["seq"].as_u64())
+        .min()
+        .context("retained exceptional boundary missing")?;
+    let mut units: BTreeMap<&str, BTreeMap<u64, &serde_json::Value>> = BTreeMap::new();
+    for row in records
+        .iter()
+        .filter(|row| row["kind"] == "count_decision" && row["decision"] == "withheld")
+    {
+        let interval = row["after"].as_u64().zip(row["through"].as_u64());
+        let in_shared = interval.is_some_and(|(after, through)| after < end && through > counted);
+        if row["reason"] != "shared_owner" && !in_shared {
+            continue;
+        }
+        let pair = row["pair"].as_str().context("shared suffix pair")?;
+        let (after, through) = interval.context("shared suffix interval")?;
+        ensure!(
+            pairs.contains(pair)
+                && row["caller"] == caller
+                && row["module_id"].is_null()
+                && row["reason"] == "shared_owner"
+                && after >= counted
+                && after.checked_add(1) == Some(through)
+                && through <= end
+                && row["absolute"] == through,
+            "retained shared interval or lineage invalid: {row}"
+        );
+        let seq = row["seq"].as_u64().context("shared decision seq")?;
+        let reference = row["observation_ref"]["seq"]
+            .as_u64()
+            .context("shared original ref")?;
+        ensure!(
+            reference < seq,
+            "shared reference does not precede decision"
+        );
+        match row["observation_ref"]["status"].as_str() {
+            Some("retained") => {
+                original_diagnostic_read(&by_seq, row, caller, true)?;
+            }
+            Some("not_retained") => ensure!(
+                !by_seq.contains_key(&reference) && row["history_complete"] == false,
+                "lost shared original must remain explicitly unavailable"
+            ),
+            _ => bail!("shared original has no truthful retention status"),
+        }
+        ensure!(
+            units
+                .entry(pair)
+                .or_default()
+                .insert(through, row)
+                .is_none(),
+            "duplicate retained shared pair/unit"
+        );
+    }
+    let mut common_start = counted + 1;
+    let mut first_units = BTreeSet::new();
+    for pair in &pairs {
+        let held = units
+            .get(pair)
+            .context("terminal pair has no retained shared suffix")?;
+        let first = *held.first_key_value().context("empty shared suffix")?.0;
+        first_units.insert(first);
+        let mut retained_from = end + 1;
+        let mut seen_retained = false;
+        let mut previous_post = None;
+        for absolute in first..=end {
+            let row = held
+                .get(&absolute)
+                .context("hole in retained shared pair suffix")?;
+            let pre = row["pre"].as_u64().context("shared PRE")?;
+            let post = row["post"].as_u64().context("shared POST")?;
+            ensure!(
+                pre <= post && previous_post.is_none_or(|previous| previous < pre),
+                "retained shared read intervals overlap/reverse"
+            );
+            previous_post = Some(post);
+            if row["observation_ref"]["status"] == "retained" {
+                if !seen_retained {
+                    retained_from = absolute;
+                }
+                seen_retained = true;
+            } else {
+                ensure!(
+                    !seen_retained,
+                    "lost original inside a retained read suffix"
+                );
+            }
+        }
+        ensure!(
+            retained_from <= end,
+            "last issued shared unit lacks its retained original"
+        );
+        common_start = common_start.max(retained_from);
+        let fences: Vec<_> = records
+            .iter()
+            .filter(|row| {
+                row["kind"] == "count_decision"
+                    && row["decision"] == "withheld"
+                    && row["reason"] == "awaiting_fence"
+                    && row["pair"] == *pair
+                    && row["caller"] == caller
+                    && row["after"] == end
+                    && row["through"] == end + 1
+            })
+            .collect();
+        ensure!(
+            fences.len() == 1
+                && fences[0]["pre"]
+                    .as_u64()
+                    .is_some_and(|pre| previous_post.is_some_and(|post| post < pre)),
+            "shared suffix must precede its own unique terminal fence"
+        );
+    }
+    ensure!(
+        first_units.last().unwrap() - first_units.first().unwrap() <= 1,
+        "retained boundary spans more than one issued round"
+    );
+    // A retained read at/after the exceptional cut cannot lose its later
+    // withheld decision. Older reads may point into the genuinely lost prefix.
+    let mut observed = BTreeSet::new();
+    for row in records
+        .iter()
+        .filter(|row| row["kind"] == "count_observation")
+    {
+        let Some(absolute) = row["absolute"]
+            .as_u64()
+            .filter(|absolute| counted < *absolute && *absolute <= end)
+        else {
+            continue;
+        };
+        let pair = row["pair"].as_str().context("shared raw pair")?;
+        ensure!(
+            pairs.contains(pair) && row["caller"] == caller && observed.insert((pair, absolute)),
+            "foreign/duplicate shared raw unit"
+        );
+        if row["seq"].as_u64().context("shared raw seq")? >= exceptional_cut {
+            ensure!(
+                units
+                    .get(pair)
+                    .is_some_and(|held| held.contains_key(&absolute)),
+                "retained shared read lost its decision inside exceptional boundary"
+            );
+        }
+    }
+    Ok((common_start - 1, end))
 }
 
 /// Validate a bounded-system wrap export (cell 3): header `scope:
@@ -2507,14 +2852,16 @@ fn run_wrap_cell(enabled: bool, cell: WrapCell) -> Result<(serde_json::Value, u6
             .filter(|line| !line.is_empty())
             .map(serde_json::from_slice)
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        let owned_caller = view
+            .borrow()
+            .caller_id
+            .clone()
+            .context("owned caller id never observed")?;
         match scope {
-            WrapScope::Pid { pid } => check_wrap_records(&records, length, &b_modules, pid)?,
+            WrapScope::Pid { pid } => {
+                check_wrap_records(&records, length, &b_modules, pid, &owned_caller)?
+            }
             WrapScope::System { owned_pid } => {
-                let owned_caller = view
-                    .borrow()
-                    .caller_id
-                    .clone()
-                    .context("owned caller id never observed")?;
                 check_wrap_records_system(&records, length, &b_modules, owned_pid, &owned_caller)?;
             }
         }
@@ -2803,6 +3150,7 @@ fn run_transition_pilot(schedule: &WrapSchedule) -> Result<PilotReport> {
     let last_sample_turns = Cell::new(0u64);
     let pass_samples = RefCell::new(Vec::<PilotPassSample>::new());
     let round_samples = RefCell::new(Vec::<PilotRoundSample>::new());
+    let a_milestones = RefCell::new(Vec::new());
     let phase_enter_pass = Cell::new(0u64);
     let stop = || {
         let advance = || -> Result<bool> {
@@ -2899,6 +3247,7 @@ fn run_transition_pilot(schedule: &WrapSchedule) -> Result<PilotReport> {
                             counted,
                         )?;
                         fence_k.set(k);
+                        a_milestones.borrow_mut().push((round, counts.clone()));
                         pilot_note_round(&round_samples, "a-validated", 2, &start, passes, calls);
                         workload.command("count", "a-done", 3)?;
                         pilot_note_round(&round_samples, "a-issued", 3, &start, passes, calls);
@@ -2937,6 +3286,7 @@ fn run_transition_pilot(schedule: &WrapSchedule) -> Result<PilotReport> {
                             counted,
                         )?;
                         fence_k.set(k);
+                        a_milestones.borrow_mut().push((round, counts.clone()));
                         pilot_note_round(
                             &round_samples,
                             "a-validated",
@@ -3252,7 +3602,16 @@ fn run_transition_pilot(schedule: &WrapSchedule) -> Result<PilotReport> {
                 let length = std::fs::metadata(&diagnostics)?.len();
                 check_bounded_pilot_export(&records, length, pid)?;
                 check_shared_pair_dispositions(
-                    &records, caller, &modules_a, &modules_b, counted, shared, k,
+                    &records,
+                    caller,
+                    &modules_a,
+                    &modules_b,
+                    counted,
+                    shared,
+                    &ACommittedMilestones {
+                        k,
+                        rounds: a_milestones.borrow().clone(),
+                    },
                 )?;
                 let document: serde_json::Value = serde_json::from_slice(&stdout)?;
                 let primary_caller = primary_pid_caller(&document, pid)?;
@@ -4072,39 +4431,65 @@ fn diagnostic_validator_fixture() -> (Vec<serde_json::Value>, u64) {
     ];
     let mut sequence = 100u64;
     let mut push = |mut row: serde_json::Value| {
-        row["seq"] = sequence.into();
+        let seq = sequence;
+        row["seq"] = seq.into();
         sequence += 1;
         records.push(row);
+        seq
     };
-    for _ in 0..24543 {
-        push(serde_json::json!({"kind":"count_observation"}));
-    }
     push(serde_json::json!({"kind":"ownership_transition"}));
     push(serde_json::json!({"kind":"capture_health"}));
-    push(serde_json::json!({"kind":"publication"}));
-    for index in 0..8190 {
-        let mut row = serde_json::json!({"kind":"count_decision","decision":"withheld"});
-        if index < 32 {
-            row["pair"] = format!("p{index}").into();
-            row["reason"] = "awaiting_fence".into();
-            row["after"] = (COUNTED + SHARED).into();
-            row["through"] = (COUNTED + SHARED + 1).into();
-            row["absolute"] = (COUNTED + SHARED + 1).into();
-            row["caller"] = "c0".into();
-            row["pre"] = 7000.into();
-            row["post"] = 7010.into();
-            row["observation_ref"] = serde_json::json!({"seq":24642,"status":"retained"});
+    for _ in 0..8094 {
+        push(serde_json::json!({"kind":"count_decision","decision":"withheld"}));
+    }
+    // The oldest retained exceptional unit straddles the ordinary boundary:
+    // p0's original657 read(seq1) is genuinely absent; all658 reads remain.
+    for absolute in [COUNTED + SHARED - 1, COUNTED + SHARED] {
+        for index in 0..32 {
+            let pre = 6000 + 10 * (absolute - (COUNTED + SHARED - 1));
+            let lost = absolute == COUNTED + SHARED - 1 && index == 0;
+            let observation = if lost {
+                1
+            } else {
+                push(
+                    serde_json::json!({"kind":"count_observation","caller":"c0","pair":format!("p{index}"),
+                    "absolute":absolute,"pre":pre,"post":pre+1}),
+                )
+            };
+            push(
+                serde_json::json!({"kind":"count_decision","decision":"withheld","reason":"shared_owner",
+                "caller":"c0","pair":format!("p{index}"),"after":absolute-1,"through":absolute,"absolute":absolute,
+                "pre":pre,"post":pre+1,"observation_ref":{"seq":observation,"status":if lost {"not_retained"} else {"retained"}},
+                "history_complete":!lost}),
+            );
         }
-        push(row);
     }
     for index in 0..32 {
+        let observation = push(
+            serde_json::json!({"kind":"count_observation","caller":"c0","pair":format!("p{index}"),
+            "absolute":COUNTED+SHARED+1,"pre":7000,"post":7010}),
+        );
+        push(
+            serde_json::json!({"kind":"count_decision","decision":"withheld","reason":"awaiting_fence",
+            "caller":"c0","pair":format!("p{index}"),"after":COUNTED+SHARED,"through":COUNTED+SHARED+1,
+            "absolute":COUNTED+SHARED+1,"pre":7000,"post":7010,"observation_ref":{"seq":observation,"status":"retained"}}),
+        );
+    }
+    for _ in 0..24416 {
+        push(serde_json::json!({"kind":"count_observation"}));
+    }
+    push(serde_json::json!({"kind":"publication"}));
+    for index in 0..32 {
+        let observation = push(
+            serde_json::json!({"kind":"count_observation","caller":"c0","pair":format!("p{index}"),
+            "absolute":COUNTED+SHARED+2,"pre":7020,"post":7030}),
+        );
         push(
             serde_json::json!({"kind":"publication","decision":"placed","module_id":format!("mB-{index:02}"),
-        "pair":format!("p{index}"),"base":COUNTED+SHARED+1,"absolute":COUNTED+SHARED+2,"staged":1,
-        "edge_total":1,"caller":"c0","pre":7020,"post":7030,
-        "baseline_pre":7000,"baseline_post":7010,
-        "observation_ref":{"seq":24642,"status":"retained"},
-        "transition_ref":{"seq":1,"status":"not_retained"},"history_complete":false}),
+            "pair":format!("p{index}"),"base":COUNTED+SHARED+1,"absolute":COUNTED+SHARED+2,"staged":1,
+            "edge_total":1,"caller":"c0","pre":7020,"post":7030,"baseline_pre":7000,"baseline_post":7010,
+            "observation_ref":{"seq":observation,"status":"retained"},
+            "transition_ref":{"seq":2,"status":"not_retained"},"history_complete":false}),
         );
     }
     let retained = [24543u64, 1, 8190, 33, 1];
@@ -4125,7 +4510,7 @@ fn twin_b_modules() -> BTreeSet<String> {
 #[test]
 fn operator_diagnostics_wrap_retained_validator_checks_actual_rows() -> Result<()> {
     let (healthy, bytes) = diagnostic_validator_fixture();
-    check_wrap_records(&healthy, bytes, &twin_b_modules(), 123)?;
+    check_wrap_records(&healthy, bytes, &twin_b_modules(), 123, "c0")?;
     for change in [
         "remove_row",
         "retained_lie",
@@ -4175,8 +4560,79 @@ fn operator_diagnostics_wrap_retained_validator_checks_actual_rows() -> Result<(
         }
         let bytes = seal_validator_fixture(&mut altered);
         ensure!(
-            check_wrap_records(&altered, bytes, &twin_b_modules(), 123).is_err(),
+            check_wrap_records(&altered, bytes, &twin_b_modules(), 123, "c0").is_err(),
             "retained-output corruption passed: {change}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn operator_diagnostics_wrap_twin_full_shared_suffix_no_compensation() -> Result<()> {
+    let (exact, bytes) = diagnostic_validator_fixture();
+    check_wrap_records(&exact, bytes, &twin_b_modules(), 123, "c0")?;
+    // The boundary657 read of p0 is unavailable; only the common658 unit
+    // is proven with all original reads. No prior shared rounds are rebuilt.
+    ensure!(
+        check_retained_shared_suffix(&exact, &twin_b_modules(), Some("c0"), COUNTED, SHARED)?
+            == (COUNTED + SHARED - 1, COUNTED + SHARED)
+    );
+    let public: Vec<_> = (1..=SHARED)
+        .map(|round| twin_range_gap("c0", COUNTED + round - 1, COUNTED + round, TARGETS))
+        .collect();
+    check_retirement_shared_checkpoint(&public, "c0", COUNTED, SHARED)?;
+    for mutation in [
+        "duplicate_pair",
+        "missing_tail",
+        "missing_boundary_with_retained_read",
+        "range",
+        "caller",
+        "read_identity",
+    ] {
+        let mut changed = exact.clone();
+        let absolute = if mutation == "missing_boundary_with_retained_read" {
+            COUNTED + SHARED - 1
+        } else {
+            COUNTED + SHARED
+        };
+        let pair = if mutation == "missing_boundary_with_retained_read" {
+            "p1"
+        } else {
+            "p0"
+        };
+        let at = changed
+            .iter()
+            .position(|row| {
+                row["decision"] == "withheld"
+                    && row["reason"] == "shared_owner"
+                    && row["absolute"] == absolute
+                    && row["pair"] == pair
+            })
+            .unwrap();
+        match mutation {
+            "duplicate_pair" => changed[at]["pair"] = "p1".into(),
+            "missing_tail" | "missing_boundary_with_retained_read" => {
+                for field in ["reason", "pair", "after", "through", "absolute"] {
+                    changed[at][field] = serde_json::Value::Null;
+                }
+            }
+            "range" => changed[at]["after"] = (absolute - 2).into(),
+            "caller" => changed[at]["caller"] = "foreign".into(),
+            "read_identity" => {
+                let seq = changed[at]["observation_ref"]["seq"].clone();
+                let read = changed.iter_mut().find(|row| row["seq"] == seq).unwrap();
+                read["pair"] = "foreign".into();
+            }
+            _ => unreachable!(),
+        }
+        // Both the independent public multiplicity and the terminal32 pair
+        // proofs remain healthy. They cannot compensate for shared suffix loss.
+        check_retirement_shared_checkpoint(&public, "c0", COUNTED, SHARED)?;
+        check_terminal_pairs_as(&changed, &twin_b_modules(), Some("c0"))?;
+        let bytes = seal_validator_fixture(&mut changed);
+        ensure!(
+            check_wrap_records(&changed, bytes, &twin_b_modules(), 123, "c0").is_err(),
+            "full export accepted shared suffix compensation {mutation}"
         );
     }
     Ok(())
@@ -5576,7 +6032,7 @@ fn operator_diagnostics_wrap_twin_one_ring_wrap_fails() -> Result<()> {
     healthy[last]["kinds"][1]["evicted"] = serde_json::json!(0);
     healthy[last]["kinds"][1]["produced"] = serde_json::json!(1);
     let bytes = seal_validator_fixture(&mut healthy);
-    ensure!(check_wrap_records(&healthy, bytes, &twin_b_modules(), 123).is_err());
+    ensure!(check_wrap_records(&healthy, bytes, &twin_b_modules(), 123, "c0").is_err());
     Ok(())
 }
 
@@ -6218,9 +6674,9 @@ fn twin_shared_pair_records_as(k: u64) -> Vec<serde_json::Value> {
         for absolute in 1..=32 {
             records.push(serde_json::json!({"kind":"count_observation","seq":seq,
                 "caller":"c0","pair":pair,"absolute":absolute,"pre":1000+10*absolute,"post":1001+10*absolute}));
-            let mut decision = serde_json::json!({"kind":"publication","decision":"placed",
+            let mut decision = serde_json::json!({"kind":"count_decision","decision":"staged","reason":"sole_owner",
                 "seq":seq+1,"caller":"c0","pair":pair,"module_id":format!("mA-{index:02}"),
-                "base":absolute-1,"absolute":absolute,"staged":1,"edge_total":expected_a(absolute,k),
+                "base":absolute-1,"absolute":absolute,"staged":1,"after":absolute-1,"through":absolute,
                 "pre":1000+10*absolute,"post":1001+10*absolute,
                 "observation_ref":{"seq":seq,"status":"retained"}});
             if k == TARGETS && absolute == 2 {
@@ -6231,8 +6687,30 @@ fn twin_shared_pair_records_as(k: u64) -> Vec<serde_json::Value> {
                 decision["after"] = 1.into();
                 decision["through"] = 2.into();
             }
-            records.push(decision);
-            seq += 2;
+            if k == TARGETS && absolute == 2 {
+                records.push(decision);
+                seq += 2;
+            } else {
+                let publication = if k == TARGETS && absolute == 3 {
+                    decision["reason"] = "pending_publication".into();
+                    decision["pending"] = format!("h{seq}").into();
+                    let mut placed = decision.clone();
+                    placed["seq"] = (seq + 2).into();
+                    placed["kind"] = "publication".into();
+                    placed["decision"] = "placed".into();
+                    placed["reason"] = "sole_owner".into();
+                    placed["edge_total"] = expected_a(absolute, k).into();
+                    placed
+                } else {
+                    serde_json::json!({"kind":"publication","seq":seq+2,"caller":"c0",
+                        "module_id":format!("mA-{index:02}"),"pair":null,"decision":null,
+                        "base":absolute-1,"staged":1,"edge_total":expected_a(absolute,k),
+                        "reason":"context_unavailable","context_unavailable":true})
+                };
+                records.push(decision);
+                records.push(publication);
+                seq += 3;
+            }
         }
         for round in 1..=4 {
             let absolute = 32 + round;
@@ -6275,24 +6753,169 @@ fn twin_shared_pair_records_as(k: u64) -> Vec<serde_json::Value> {
 }
 
 #[test]
+fn operator_diagnostics_wrap_genuine_ordinary_a_lineage() -> Result<()> {
+    use crate::discovery::engine::inventory_coordinator::{
+        G21CountDiagnosticFixture, genuine_g21_count_diagnostics,
+    };
+    let actual: G21CountDiagnosticFixture = genuine_g21_count_diagnostics(false);
+    let by_seq = actual
+        .records
+        .iter()
+        .filter_map(|row| row["seq"].as_u64().map(|seq| (seq, row)))
+        .collect();
+    let (pair, reads) = check_a_count_lineage(
+        &actual.records,
+        &by_seq,
+        &actual.caller,
+        &actual.module_a,
+        &actual.issued_a,
+        &actual.committed_a,
+    )?;
+    ensure!(
+        reads.len() == 4
+            && !pair.is_empty()
+            && actual.module_b.is_none()
+            && actual.issued_after_a.is_empty()
+            && actual.committed_b.is_empty()
+    );
+    for mutation in [
+        "staging_pair",
+        "staging_read",
+        "direct_pair",
+        "direct_total",
+        "missing_direct",
+    ] {
+        let mut changed = actual.records.clone();
+        let stage = changed
+            .iter()
+            .position(|row| row["decision"] == "staged" && row["absolute"] == 6)
+            .unwrap();
+        let direct = changed
+            .iter()
+            .position(|row| row["kind"] == "publication" && row["edge_total"] == 6)
+            .unwrap();
+        match mutation {
+            "staging_pair" => changed[stage]["pair"] = "foreign".into(),
+            "staging_read" => changed[stage]["pre"] = 1.into(),
+            "direct_pair" => changed[direct]["pair"] = pair.clone().into(),
+            "direct_total" => changed[direct]["edge_total"] = 7.into(),
+            "missing_direct" => {
+                changed.remove(direct);
+            }
+            _ => unreachable!(),
+        }
+        let by_seq = changed
+            .iter()
+            .filter_map(|row| row["seq"].as_u64().map(|seq| (seq, row)))
+            .collect();
+        ensure!(
+            check_a_count_lineage(
+                &changed,
+                &by_seq,
+                &actual.caller,
+                &actual.module_a,
+                &actual.issued_a,
+                &actual.committed_a
+            )
+            .is_err(),
+            "accepted genuine A mutation {mutation}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn operator_diagnostics_wrap_genuine_recovered_a_lineage() -> Result<()> {
+    use crate::discovery::engine::inventory_coordinator::genuine_g21_count_diagnostics;
+    let actual = genuine_g21_count_diagnostics(true);
+    let by_seq = actual
+        .records
+        .iter()
+        .filter_map(|row| row["seq"].as_u64().map(|seq| (seq, row)))
+        .collect();
+    let (pair, _) = check_a_count_lineage(
+        &actual.records,
+        &by_seq,
+        &actual.caller,
+        &actual.module_a,
+        &actual.issued_a,
+        &actual.committed_a,
+    )?;
+    ensure!(actual.issued_after_a == [6, 7, 8] && actual.committed_b == [(6, 0), (7, 0), (8, 1)]);
+    let proof = actual
+        .records
+        .iter()
+        .find(|row| row["decision"] == "placed" && row["absolute"] == 8)
+        .context("genuine B proof")?;
+    ensure!(
+        proof["pair"] == pair
+            && proof["module_id"] == actual.module_b.as_deref().context("B module")?
+            && proof["edge_total"] == 1
+            && proof["base"] == 7
+            && proof["staged"] == 1
+    );
+    original_diagnostic_read(&by_seq, proof, &actual.caller, true)?;
+    Ok(())
+}
+
+#[test]
 fn operator_diagnostics_wrap_twin_shared_pairs_no_compensation() -> Result<()> {
     let exact = twin_shared_pair_records();
     let modules_a: Vec<String> = (0..32).map(|index| format!("mA-{index:02}")).collect();
     let modules_b: Vec<String> = (0..32).map(|index| format!("mB-{index:02}")).collect();
+    let committed = |k| ACommittedMilestones {
+        k,
+        rounds: (1..=32)
+            .map(|round| (round, vec![expected_a(round, k); 32]))
+            .collect(),
+    };
+    let ordinary_commits = committed(0);
+    let fenced_commits = committed(TARGETS);
     let check = |records: &[serde_json::Value]| {
-        check_shared_pair_dispositions(records, "c0", &modules_a, &modules_b, 32, 4, 0)
+        check_shared_pair_dispositions(
+            records,
+            "c0",
+            &modules_a,
+            &modules_b,
+            32,
+            4,
+            &ordinary_commits,
+        )
     };
     check(&exact)?;
+    let mut wrong_commit = committed(0);
+    wrong_commit.rounds[10].1[7] += 1;
+    ensure!(
+        check_shared_pair_dispositions(&exact, "c0", &modules_a, &modules_b, 32, 4, &wrong_commit)
+            .is_err(),
+        "diagnostic totals cannot replace an independent committed milestone"
+    );
     let mut fenced = twin_shared_pair_records_as(TARGETS);
-    check_shared_pair_dispositions(&fenced, "c0", &modules_a, &modules_b, 32, 4, TARGETS)?;
+    check_shared_pair_dispositions(
+        &fenced,
+        "c0",
+        &modules_a,
+        &modules_b,
+        32,
+        4,
+        &fenced_commits,
+    )?;
     let startup = fenced
         .iter_mut()
         .find(|row| row["reason"] == "awaiting_fence" && row["through"] == 2)
         .unwrap();
     startup["pair"] = "p1".into();
     ensure!(
-        check_shared_pair_dispositions(&fenced, "c0", &modules_a, &modules_b, 32, 4, TARGETS)
-            .is_err()
+        check_shared_pair_dispositions(
+            &fenced,
+            "c0",
+            &modules_a,
+            &modules_b,
+            32,
+            4,
+            &fenced_commits
+        )
+        .is_err()
     );
     for mutation in [
         "duplicate_pair",

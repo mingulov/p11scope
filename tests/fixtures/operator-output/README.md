@@ -325,6 +325,11 @@ physical pairs. A complete bounded pilot additionally checks each opaque pair's
 indexed A_i/B_i lineage, issued shared intervals once each, actual retained
 read references and PRE/POST intervals, original fence and later B proof.
 Duplicating one pair while omitting another fails even when totals agree.
+Ordinary A growth has a pair-bound staged decision followed by a direct
+publication with null pair/decision/read context. The oracle ties that stage
+to the independently committed A milestone through its unique module; it
+preserves those nulls. Pending recovery instead has its own correlated placed
+result. Real producer-export controls cover both paths.
 
 Before full measurement, the separately selected
 `inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_pid_diagnostics_transition_pilot_lp64`
@@ -343,6 +348,10 @@ evictions establish produced lower bounds of24576+ordinary-evicted and
 CountDecision totals as per-ring counters. All footer kind totals must reconcile,
 references must report retained/not-retained truthfully and recent B placement
 must cover all32distinct pairs. Partial/unrun/failed cells cannot pass.
+The full export also requires a shared-withheld suffix on those same terminal
+pairs through the last independently issued shared unit. A partially evicted
+first unit remains explicit, and only the common suffix with all original reads
+retained is reported as proven; lost earlier rounds are never reconstructed.
 
 Run the same independent schedule with diagnostics disabled/enabled and compare
 primary count, entry observation, saturation/inflight, capture, presence,

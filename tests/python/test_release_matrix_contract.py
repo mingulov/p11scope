@@ -627,6 +627,7 @@ class MatrixContract(unittest.TestCase):
 
     def prepare_object_inputs(self, stage, cells):
         argv = [sys.executable, "-I", str(CHECKER), "--prepare", str(stage), "--lane", "host", "--kernel", "host",
+            "--guest-work-root", str(self.base),
             "--bin-dir", str(self.bins), "--binary-list", str(self.listing), "--curation", str(self.curation),
             "--bpfmulti-list", str(self.bm_list), "--candidate-receipt", str(self.candidate), "--lib-test", LIB_A]
         for mode, bits, bundle in cells:
@@ -1029,7 +1030,9 @@ class MatrixContract(unittest.TestCase):
     def test_guest_disk_mount_lifetime_follows_child_and_output_completion(self):
         image, uuid, env = self.guest_disk_fixture()
         stage = self.prepare_disk_stage(image, uuid, env)
-        root = self.base / "disk-mount"
+        mounts = tempfile.TemporaryDirectory(prefix="matrix-guest-mount-", dir="/var/tmp")
+        self.addCleanup(mounts.cleanup)
+        root = Path(mounts.name) / "disk-mount"
         rc, events, output, detail = self.controlled_guest_disk(stage, root)
         self.assertEqual(rc, 7, detail)
         self.assertTrue(output)
@@ -1052,11 +1055,13 @@ class MatrixContract(unittest.TestCase):
     def test_guest_disk_refuses_wrong_devices_and_mount_targets_before_inner(self):
         image, uuid, env = self.guest_disk_fixture()
         stage = self.prepare_disk_stage(image, uuid, env)
+        mounts = tempfile.TemporaryDirectory(prefix="matrix-guest-mount-", dir="/var/tmp")
+        self.addCleanup(mounts.cleanup)
         for index, case in enumerate(("missing", "duplicate", "probe_error", "uuid", "type", "source", "new_source", "major", "device_mismatch",
                                      "mounted_type", "mount_failure", "protected", "overlap", "symlink", "nonempty", "untrusted",
                                      "not_guest", "nonroot", "kernel")):
             with self.subTest(case=case):
-                rc, events, output, detail = self.controlled_guest_disk(stage, self.base / ("mount-" + str(index)), case,
+                rc, events, output, detail = self.controlled_guest_disk(stage, Path(mounts.name) / ("mount-" + str(index)), case,
                                                                       mounted=case in ("source", "major", "device_mismatch", "uuid", "type", "duplicate", "mounted_type"))
                 self.assertEqual(rc, 1, detail)
                 self.assertFalse(output, detail)
@@ -1320,6 +1325,7 @@ class MatrixContract(unittest.TestCase):
         stage = self.base / "retained object stage"
         result = command(sys.executable, "-I", str(repo / "scripts" / CHECKER.name), "--prepare", str(stage),
             "--lane", "host", "--kernel", "host", "--bin-dir", str(self.bins), "--binary-list", str(self.listing),
+            "--guest-work-root", str(self.base),
             "--curation", str(self.curation), "--bpfmulti-list", str(self.bm_list), "--candidate-receipt", str(candidate),
             "--lib-test", LIB_A, *arguments)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

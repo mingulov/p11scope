@@ -1660,7 +1660,6 @@ impl JournalAdapter {
                     assert_eq!(claim.return_ns, original.return_ns);
                 }
                 let ordinal = entry.begin_ordinal;
-                drop(entry);
                 self.ledger.release_h8open(ordinal);
             }
         }

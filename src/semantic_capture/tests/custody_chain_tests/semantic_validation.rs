@@ -5,7 +5,7 @@
 use super::*;
 use crate::discovery::caller_registry::instance_input::{InstanceLifecycle, InstanceReason};
 use crate::discovery::engine::inventory_coordinator::semantics::{
-    AttestedSubset, engine_for_test, prepare_attested_subset,
+    AttestedSubset, SemanticInputs, engine_for_test,
 };
 use crate::discovery::identity::PinnedObjects;
 use p11scope_ebpf_common::capture;
@@ -30,6 +30,19 @@ impl HeldProviders {
     }
 
     fn with_functions(count: usize, resolved: &[&str]) -> Self {
+        Self::with_optional_attachment(count, resolved, false).0
+    }
+
+    fn with_attachment(count: usize, resolved: &[&str]) -> (Self, AttestedSubset) {
+        let (held, attachment) = Self::with_optional_attachment(count, resolved, true);
+        (held, attachment.unwrap())
+    }
+
+    fn with_optional_attachment(
+        count: usize,
+        resolved: &[&str],
+        attach: bool,
+    ) -> (Self, Option<AttestedSubset>) {
         let dir = tempfile::tempdir().unwrap();
         let mut providers = Vec::new();
         for index in 0..count {
@@ -37,7 +50,7 @@ impl HeldProviders {
             std::fs::copy("/usr/bin/true", &path).unwrap();
             providers.push(path);
         }
-        Self::from_paths_with_functions(dir, &providers, resolved)
+        Self::from_paths_with_optional_attachment(dir, &providers, resolved, attach)
     }
 
     fn from_paths(dir: tempfile::TempDir, providers: &[std::path::PathBuf]) -> Self {
@@ -49,6 +62,15 @@ impl HeldProviders {
         providers: &[std::path::PathBuf],
         resolved: &[&str],
     ) -> Self {
+        Self::from_paths_with_optional_attachment(dir, providers, resolved, false).0
+    }
+
+    fn from_paths_with_optional_attachment(
+        dir: tempfile::TempDir,
+        providers: &[std::path::PathBuf],
+        resolved: &[&str],
+        attach: bool,
+    ) -> (Self, Option<AttestedSubset>) {
         let count = providers.len();
         let mut paths = Vec::new();
         for (index, path) in providers.iter().enumerate() {
@@ -120,14 +142,25 @@ impl HeldProviders {
             paths.push(input);
         }
         let engine = engine_for_test(Vec::new(), Vec::new(), PinnedObjects::empty());
-        let prepared = prepare_attested_subset(&engine, &paths);
+        let mut inputs = SemanticInputs::new(paths);
+        let prepared = inputs.prepare(&engine);
         assert!(prepared.refusals.is_empty(), "{:?}", prepared.refusals);
         let subset = prepared
             .subset
             .expect("complete explicit provider attestations");
         assert_eq!(subset.required().len(), count);
         assert_eq!(subset.plan().slots.len(), count * resolved.len());
-        Self { _dir: dir, subset }
+        let attachment = attach.then(|| {
+            let prepared = inputs.prepare(&engine);
+            assert!(prepared.refusals.is_empty());
+            let attachment = prepared.subset.unwrap();
+            assert!(
+                subset.same_retained_envelope(&attachment),
+                "both actual mints retain the same opened provider allocations"
+            );
+            attachment
+        });
+        (Self { _dir: dir, subset }, attachment)
     }
 }
 

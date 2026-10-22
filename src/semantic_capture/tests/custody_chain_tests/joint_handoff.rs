@@ -23,6 +23,7 @@ struct JointScene {
     real: RealScene,
     producers: SessionDrainProducers,
     drain: EventDrain<ScriptedRecords>,
+    attached: Option<crate::attach::AttachedSemanticSet>,
 }
 
 /// Preserve the existing refusal/retry selector and its assertions, now with
@@ -89,16 +90,39 @@ pub(super) fn claim_refusal_and_staging_regression() {
 
 impl JointScene {
     fn new(providers: usize) -> Self {
-        let real = RealScene::from_held(HeldProviders::with_functions(
+        Self::from_held(
+            HeldProviders::with_functions(
+                providers,
+                &["C_SignInit", "C_SignUpdate", "C_SignFinal"],
+            ),
+            None,
+        )
+    }
+
+    fn for_audit(providers: usize) -> Self {
+        let (held, attached) = HeldProviders::with_attachment(
             providers,
             &["C_SignInit", "C_SignUpdate", "C_SignFinal"],
-        ));
+        );
+        Self::from_held(held, Some(attached))
+    }
+
+    fn from_held(held: HeldProviders, attach: Option<AttestedSubset>) -> Self {
+        let real = RealScene::from_held(held);
+        let attached = attach.map(|subset| {
+            crate::attach::seal_test_attachment(
+                subset,
+                real.lane.domain(),
+                real.lane.subset().pins(),
+            )
+        });
         let events = EventsDomain::test_standin(0xb301);
         let producers = SessionDrainProducers::test_pair(real.lane.domain(), events.clone());
         Self {
             real,
             producers,
             drain: EventDrain::over_domain(ScriptedRecords::records([], 64), events),
+            attached,
         }
     }
 

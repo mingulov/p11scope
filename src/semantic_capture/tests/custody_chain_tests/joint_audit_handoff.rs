@@ -28,12 +28,11 @@ impl FaultEpoch for ReadFault {
     }
 }
 
-fn attachment(fixture: &JointScene) -> AttachedSemanticSet {
-    crate::attach::seal_test_attachment(
-        fixture.real.lane.subset().clone(),
-        fixture.real.lane.domain(),
-        fixture.real.lane.subset().pins(),
-    )
+fn attachment(fixture: &mut JointScene) -> AttachedSemanticSet {
+    fixture
+        .attached
+        .take()
+        .expect("the actual separately minted attachment was sealed once")
 }
 
 fn claim_and_finish(
@@ -112,7 +111,7 @@ fn acquire(
 
 #[test]
 fn joint_audit_requires_every_original_disposed_before_one_h3_take() {
-    let mut fixture = JointScene::new(1);
+    let mut fixture = JointScene::for_audit(1);
     let pid = std::process::id();
     fixture.bind(pid, image(7), &[0]);
     fixture.push(pid, 0, "C_SignInit", 1);
@@ -120,7 +119,7 @@ fn joint_audit_requires_every_original_disposed_before_one_h3_take() {
     let identity = raw.h0_identity();
     let (mut ingested, proof) = fixture.ingest(raw);
     let frontier = ingested.frontier();
-    let attached = attachment(&fixture);
+    let attached = attachment(&mut fixture);
     let fault = ReadFault::new(0);
     for phase in 0..3 {
         let refusal = fixture.real.scene.coordinator.audit_ingested_quantum(
@@ -183,7 +182,7 @@ fn joint_audit_requires_every_original_disposed_before_one_h3_take() {
         .registry()
         .semantic_resource_snapshot();
     let frame = acquire(&mut fixture, ingested, &attached, &fault);
-    assert_eq!(frame.identity(), identity);
+    assert!(frame.identity() == identity);
     assert_eq!(frame.frontier(), frontier);
     assert!(frame.failure_for_test().is_none());
     assert_eq!(
@@ -233,14 +232,14 @@ fn joint_audit_requires_every_original_disposed_before_one_h3_take() {
 
 #[test]
 fn joint_audit_foreign_and_stale_raw_preserve_pending_h3_and_original() {
-    let mut fixture = JointScene::new(1);
+    let mut fixture = JointScene::for_audit(1);
     let pid = std::process::id();
     fixture.bind(pid, image(7), &[0]);
     fixture.push(pid, 0, "C_SignInit", 1);
     let raw = fixture.prepare(1);
     let (mut first, proof) = fixture.ingest(raw);
     claim_and_finish(&mut fixture, &first);
-    let attached = attachment(&fixture);
+    let attached = attachment(&mut fixture);
     let fault = ReadFault::new(0);
     let foreign = SessionDrainProducers::test_pair(
         fixture.producers.native_domain(),
@@ -290,7 +289,7 @@ fn joint_audit_foreign_and_stale_raw_preserve_pending_h3_and_original() {
         first = original;
     }
     let frame = acquire(&mut fixture, next, &attached, &fault);
-    assert_eq!(frame.identity(), identity);
+    assert!(frame.identity() == identity);
     assert!(frame.frontier() > first.frontier());
     assert_eq!(
         fixture.real.scene.coordinator.reference_h3_audit_state(),
@@ -311,14 +310,14 @@ fn joint_audit_foreign_and_stale_raw_preserve_pending_h3_and_original() {
 
 #[test]
 fn joint_audit_storage_refusal_precedes_take_and_global_mutation() {
-    let mut fixture = JointScene::new(1);
+    let mut fixture = JointScene::for_audit(1);
     let pid = std::process::id();
     fixture.bind(pid, image(7), &[0]);
     fixture.push(pid, 0, "C_SignInit", 1);
     let raw = fixture.prepare(1);
     let (ingested, proof) = fixture.ingest(raw);
     claim_and_finish(&mut fixture, &ingested);
-    let attached = attachment(&fixture);
+    let attached = attachment(&mut fixture);
     let fault = ReadFault::new(1);
     let before = fixture
         .real
@@ -373,7 +372,7 @@ fn joint_audit_storage_refusal_precedes_take_and_global_mutation() {
         .failure_for_test()
         .expect("actual seal-time fault changed");
     assert_eq!(failure.gap, JournalGap::FaultChanged);
-    assert!(failure.affects_domain(proof.domain()));
+    assert!(failure.affects_proof_for_test(&proof));
     fixture.assert_claims(&[]);
     assert_eq!(
         fixture.real.scene.coordinator.reference_h3_audit_state(),
@@ -384,7 +383,7 @@ fn joint_audit_storage_refusal_precedes_take_and_global_mutation() {
 #[test]
 fn joint_audit_no_head_fault_or_malformed_keeps_original_affected_domains() {
     for malformed in [false, true] {
-        let mut fixture = JointScene::new(2);
+        let mut fixture = JointScene::for_audit(2);
         let pid = std::process::id();
         fixture.bind(pid, image(7), &[0, 1]);
         fixture.push(pid, 0, "C_SignInit", 1);
@@ -398,7 +397,7 @@ fn joint_audit_no_head_fault_or_malformed_keeps_original_affected_domains() {
         assert_eq!(claims.len(), 2);
         assert_ne!(claims[0].1, claims[1].1);
         fixture.assert_claims(&claims);
-        let attached = attachment(&fixture);
+        let attached = attachment(&mut fixture);
         let fault = ReadFault::new(u64::from(!malformed));
         let frame = acquire(&mut fixture, ingested, &attached, &fault);
         let failure = frame
@@ -415,7 +414,7 @@ fn joint_audit_no_head_fault_or_malformed_keeps_original_affected_domains() {
         assert!(
             claims
                 .iter()
-                .all(|(_, proof)| failure.affects_domain(proof.domain()))
+                .all(|(_, proof)| failure.affects_proof_for_test(proof))
         );
         assert_eq!(failure.h3_voided, None);
         assert!(
@@ -441,14 +440,14 @@ fn joint_audit_no_head_fault_or_malformed_keeps_original_affected_domains() {
 
 #[test]
 fn joint_audit_no_head_clean_frame_establishes_cumulative_fault_baseline() {
-    let mut fixture = JointScene::new(1);
+    let mut fixture = JointScene::for_audit(1);
     let pid = std::process::id();
     fixture.bind(pid, image(7), &[0]);
     fixture.push(pid, 0, "C_SignInit", 1);
     let raw = fixture.prepare(1);
     let (first, _) = fixture.ingest(raw);
     claim_and_finish(&mut fixture, &first);
-    let attached = attachment(&fixture);
+    let attached = attachment(&mut fixture);
     let frame = acquire(&mut fixture, first, &attached, &ReadFault::new(0));
     assert!(frame.failure_for_test().is_none());
     drop(frame);

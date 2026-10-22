@@ -272,6 +272,7 @@ fn counter_artifact_mutations_are_causally_rejected() {
             "health_capacity",
             "start_capacity",
             "native_owner_slot_bound",
+            "owner_aggregate_linkage",
             "missing_start_entry",
             "missing_start_return_get",
             "missing_start_return_remove",

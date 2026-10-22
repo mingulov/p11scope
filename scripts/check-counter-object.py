@@ -32,6 +32,14 @@ FORBIDDEN_ENDPOINT_MAPS = {
     "EVENTS", "DESCRIPTORS", "MECH_SHAPE", "ATTR_BOOL_BITS", "ASYNC_FUNCTIONS",
     "TAIL_CALLS", "PAIR_CALLS",
 }
+# Aggregate-only endpoints construct START without semantic image/marker
+# seeding. This closed inventory keeps the same physical owner/lease and
+# discovery custody; Detailed's semantic start_begin requirement is separate.
+COUNTER_OWNER_HELPERS = frozenset({
+    "p11_owner_cleanup", "p11_owner_discovery_get", "p11_owner_discovery_insert",
+    "p11_owner_discovery_remove", "p11_owner_start_aggregate", "p11_owner_start_get",
+    "p11_owner_start_remove",
+})
 
 
 class CallGraph:
@@ -773,6 +781,13 @@ def transfer_controls():
     return report
 
 
+def validate_counter_owner_helpers(elf):
+    MAPS.validate_private_helpers(
+        elf, "p11_owner_", COUNTER_OWNER_HELPERS,
+        MAPS.OPTIONAL_LOCAL_OWNER_HELPERS, "counter owner",
+        MAPS.REQUIRED_GLOBAL_OWNER_HELPERS, "OWNER_CTL")
+
+
 def validate(body, mode):
     if mode not in STATS_BYTES:
         raise RuntimeError("unknown counter mode")
@@ -780,7 +795,7 @@ def validate(body, mode):
     maps, expected = counter_maps(graph, mode)
     if any(name.startswith((".rodata", ".data", ".bss")) for name in graph.elf.sections):
         raise RuntimeError("counter artifact carries global data")
-    MAPS.validate_owner_helpers(graph.elf)
+    validate_counter_owner_helpers(graph.elf)
     MAPS.validate_exec_helpers(graph.elf)
     MAPS.validate_classic_uprobe_kernel_stack(graph.elf)
     btf = MAPS.Btf(graph.elf.sections[".BTF"][1])
@@ -887,6 +902,20 @@ def map_mutant(body, graph, name, field, value):
     return bytes(changed)
 
 
+def owner_linkage_mutant(body, graph):
+    aggregate = [index for index, symbol in enumerate(graph.elf.symbols)
+                 if symbol[0] == "p11_owner_start_aggregate"]
+    if len(aggregate) != 1:
+        raise RuntimeError("counter owner-linkage mutant has no exact aggregate helper")
+    changed = bytearray(body)
+    # LOCAL pointer-taking native boundary must never become a GLOBAL
+    # independently verified subprogram. Change the actual ELF st_info.
+    changed[graph.elf.sections[".symtab"][0][4] + aggregate[0] * 24 + 4] = 0x12
+    if changed == body:
+        raise RuntimeError("counter owner-linkage mutant did not change actual bytes")
+    return bytes(changed)
+
+
 def causal_mutants(body, mode):
     controls = transfer_controls()
     _, (graph, _, owner, proofs) = validate(body, mode)
@@ -907,6 +936,7 @@ def causal_mutants(body, mode):
     instruction = graph.instructions[key][pc]
     mutants["native_owner_slot_bound"] = mutated_instruction(
         body, graph, key, pc, instruction[:3] + (immediate - 1,))
+    mutants["owner_aggregate_linkage"] = owner_linkage_mutant(body, graph)
 
     for label, root_name, callee in [
         ("missing_start_entry", "p11_entry", "p11_owner_start_aggregate"),

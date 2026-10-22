@@ -3750,6 +3750,7 @@ mod tests {
         adapter: JournalAdapter,
         drain: crate::events::EventDrain<crate::events::ScriptedRecords>,
         producers: crate::attach::SessionDrainProducers,
+        caller: Option<crate::discovery::caller_registry::CallerId>,
         rows: [p11scope_ebpf_common::object_wire::ObjectDescriptorWire;
             p11scope_ebpf_common::MAX_DESCRIPTORS as usize],
     }
@@ -3803,6 +3804,7 @@ mod tests {
                 adapter,
                 drain,
                 producers,
+                caller: None,
                 rows: p11scope_ebpf_common::object_wire::publish_object_descriptors(),
             }
         }
@@ -3844,9 +3846,12 @@ mod tests {
                 ENTRY_NS, begin_bytes, end_bytes, function_id,
             };
             let (slot, endpoint) = self.fixture.endpoint_for("C_CreateObject");
-            let mut begin = begin_bytes(1, sequence, function_id("C_CreateObject"), 0);
+            let thread = if self.caller.is_some() { 2 } else { 1 };
+            let mut begin = begin_bytes(thread, sequence, function_id("C_CreateObject"), 0);
             let pid = u64::from(self.io.pin.pid());
             begin[24..32].copy_from_slice(&((pid << 32) | pid).to_le_bytes());
+            begin[32..40].copy_from_slice(&self.io.current_image.task_cookie.to_le_bytes());
+            begin[40..48].copy_from_slice(&self.io.current_image.exec_id.to_le_bytes());
             begin[56..64].copy_from_slice(&(0x7000_0000 + endpoint.offset).to_le_bytes());
             begin[64..68].copy_from_slice(&self.io.local.to_le_bytes());
             begin[68..76].fill(0);
@@ -3885,7 +3890,7 @@ mod tests {
                     });
             let call = calls.next().expect("one actual completed call");
             assert!(calls.next().is_none());
-            let admitted = self.fixture.admit_collected(call);
+            let admitted = self.fixture.admit_collected_for(call, self.caller);
             (report, admitted)
         }
         fn ingest(
@@ -3958,7 +3963,7 @@ mod tests {
                     proof,
                     before,
                     after,
-                    self.fixture.binding(),
+                    self.fixture.binding_for_collected(self.caller),
                     self.fixture.attachment(),
                     slot,
                     &mut self.adapter,
@@ -3989,7 +3994,7 @@ mod tests {
                     candidate,
                     absence,
                     admitted,
-                    self.fixture.binding(),
+                    self.fixture.binding_for_collected(self.caller),
                     self.fixture.attachment(),
                     proof,
                     &self.adapter,
@@ -4012,6 +4017,7 @@ mod tests {
                 io: &'a mut ScriptIo,
                 capture: &'a SemanticCapture,
                 fixture: &'a crate::semantics_objects::journal::tests::AttestationFixture,
+                caller: Option<crate::discovery::caller_registry::CallerId>,
                 rows: &'a mut R,
             }
             impl<R: crate::attach::BirthRowReader> BirthEvidenceSource for Fresh<'_, R> {
@@ -4026,7 +4032,7 @@ mod tests {
                         self.rows,
                         self.capture,
                         self.fixture.attachment(),
-                        self.fixture.binding(),
+                        self.fixture.binding_for_collected(self.caller),
                     )
                 }
             }
@@ -4044,6 +4050,7 @@ mod tests {
                 io: &mut self.io,
                 capture: &self.capture,
                 fixture: &self.fixture,
+                caller: self.caller,
                 rows,
             };
             self.adapter
@@ -4181,6 +4188,111 @@ mod tests {
             "discarded object input cannot later acquire the old domain's authority"
         );
         assert_eq!(owner.ledger().census(), settled_census);
+    }
+
+    #[test]
+    fn joint_unlocalized_raw_loss_retains_all_sealed_domains_and_effects() {
+        use crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild;
+        use crate::semantics_objects::journal::joint_driver::{
+            JointCaptureOwner, RawDisposeReason, RawJointQuantum, RawQuantumRefusal,
+        };
+        use crate::semantics_objects::journal::tests::{NativeBirthRows, NativePublisher};
+        use crate::semantics_objects::journal::{BirthCutRefusal, JournalGap};
+        use crate::semantics_objects::{Lifetime, ObjectEffect, ObjectGap};
+
+        let child = OwnedStoppedChild::new();
+        let mut harness = JointBirthHarness::new();
+        let mut model = crate::semantics_objects::ObjectSemantics::new();
+        let publisher = NativePublisher::build();
+        let mut domains = Vec::new();
+        for second in [false, true] {
+            if second {
+                let image = ImageIdentity {
+                    task_cookie: 72,
+                    exec_id: 0,
+                };
+                let caller = harness.fixture.bind_collected_image(child.id(), image);
+                harness.caller = Some(caller);
+                harness.io.pin = harness.fixture.binding_for_collected(Some(caller)).pin();
+                harness.io.current_image = image;
+                harness.io.output_image = Some(image);
+            }
+            harness.push_create(1);
+            let mut raw = harness.collect();
+            let (report, admitted) = harness.route(&mut raw);
+            let (collection, proof) = harness.ingest(raw, &admitted);
+            let (row, control, _) =
+                publisher.publish_stamped(&["0", "0"], harness.fixture.attachment().generation());
+            let mut rows = NativeBirthRows { row, control };
+            let witness = harness.birth(report, &admitted, &proof, None, &mut rows);
+            domains.push(witness.receipt().domain());
+            assert_eq!(harness.seal(collection, &witness, &mut rows, &mut model), 1);
+        }
+        assert_ne!(domains[0], domains[1]);
+        let before = model.project();
+        assert_eq!(before.objects.len(), 2);
+        assert!(
+            before
+                .objects
+                .iter()
+                .all(|object| object.lifetime == Lifetime::Live)
+        );
+        harness.drain.source_mut().push_record(vec![1, 2, 3]);
+        let raw = harness.collect();
+        // A genuine later input stays behind the now-unprovable stream.
+        harness.push_create(2);
+        let cut = harness.drain.consumption_cut().unwrap();
+        let mut owner = JointCaptureOwner::from_existing_parts_for_test(harness.adapter, model);
+        let negative = raw
+            .dispose_without_ingest(
+                &mut owner,
+                &harness.producers,
+                RawDisposeReason::TerminalLoss,
+            )
+            .unwrap_or_else(|(_, reason)| panic!("actual malformed disposition: {reason:?}"));
+        let failure = negative.failure().unwrap();
+        assert_eq!(failure.gap, JournalGap::Malformed);
+        assert!(domains.iter().all(|domain| failure.affects_domain(*domain)));
+        for object in &before.objects {
+            assert!(
+                failure.effects.effects.iter().any(|effect| matches!(
+                    effect,
+                    ObjectEffect::Retired { object: affected, reason: ObjectGap::Loss }
+                        if *affected == object.id
+                )),
+                "every original domain's loss effects survive"
+            );
+            assert_eq!(
+                owner.model().project().object(object.id).unwrap().lifetime,
+                Lifetime::Retired(ObjectGap::Loss)
+            );
+        }
+        let effects = failure.effects.effects.len();
+        let frontier = negative.frontier();
+        let next = RawJointQuantum::collect_bounded_with_adapter(
+            &mut harness.drain,
+            &harness.rows,
+            4_096,
+            None,
+            &BirthFault,
+            &harness.producers,
+            |bytes| harness.pool.reserve(bytes),
+            owner.adapter_mut(),
+        );
+        assert!(matches!(
+            next,
+            Err(RawQuantumRefusal::Cut(BirthCutRefusal::Gap))
+        ));
+        assert!(
+            harness.drain.consumption_cut().unwrap().same_boundary(&cut),
+            "refusal cannot consume the queued original or heal the invalid stream"
+        );
+        assert!(owner.adapter().consumed_frontier() == frontier);
+        assert_eq!(failure.effects.effects.len(), effects);
+        assert!(
+            domains.iter().all(|domain| failure.affects_domain(*domain)),
+            "the negative retains its original union across later attempts"
+        );
     }
 
     #[test]

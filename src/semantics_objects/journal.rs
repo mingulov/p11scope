@@ -5917,18 +5917,44 @@ pub(crate) mod tests {
         }
 
         pub(crate) fn admit_collected(&mut self, call: RoutedCall) -> AdmittedInstanceCall {
+            self.admit_collected_for(call, None)
+        }
+
+        /// Admit against an existing genuinely bound caller, never a caller
+        /// number supplied as proof. Used by the two-image raw-loss fixture.
+        pub(crate) fn admit_collected_for(
+            &mut self,
+            call: RoutedCall,
+            caller: Option<crate::discovery::caller_registry::CallerId>,
+        ) -> AdmittedInstanceCall {
             self.next_token = self
                 .next_token
                 .max(call.position().expect("actual H0 position"));
             let evidence = CallEvidence::from_routed(call).expect("actual H0 joined call");
             admit_call_from_evidence(
                 evidence,
-                self.binding(),
+                self.binding_for_collected(caller),
                 self.subset.as_ref().expect("subset held"),
                 CallStanding::Historical(InstanceReason::SemanticLoss),
                 None,
             )
             .expect("actual collected call admits")
+        }
+
+        pub(crate) fn binding_for_collected(
+            &self,
+            caller: Option<crate::discovery::caller_registry::CallerId>,
+        ) -> &crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding
+        {
+            self.binding_for(caller.unwrap_or(self.primary))
+        }
+
+        pub(crate) fn bind_collected_image(
+            &mut self,
+            pid: u32,
+            image: ImageIdentity,
+        ) -> crate::discovery::caller_registry::CallerId {
+            self.bind_extra(pid, self.domain, image)
         }
 
         /// The happy-path binding, genuinely bound: read back from the

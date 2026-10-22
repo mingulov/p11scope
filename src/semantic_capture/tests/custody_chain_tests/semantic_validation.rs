@@ -14,6 +14,8 @@ use p11scope_manifest::manifest::*;
 use std::cell::RefCell;
 use std::rc::Rc;
 
+#[path = "joint_handoff.rs"]
+mod joint_handoff;
 #[path = "owner_admission.rs"]
 mod owner_admission;
 
@@ -24,6 +26,10 @@ struct HeldProviders {
 
 impl HeldProviders {
     fn new(count: usize) -> Self {
+        Self::with_functions(count, &["C_SignInit", "C_Sign"])
+    }
+
+    fn with_functions(count: usize, resolved: &[&str]) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let mut providers = Vec::new();
         for index in 0..count {
@@ -31,10 +37,18 @@ impl HeldProviders {
             std::fs::copy("/usr/bin/true", &path).unwrap();
             providers.push(path);
         }
-        Self::from_paths(dir, &providers)
+        Self::from_paths_with_functions(dir, &providers, resolved)
     }
 
     fn from_paths(dir: tempfile::TempDir, providers: &[std::path::PathBuf]) -> Self {
+        Self::from_paths_with_functions(dir, providers, &["C_SignInit", "C_Sign"])
+    }
+
+    fn from_paths_with_functions(
+        dir: tempfile::TempDir,
+        providers: &[std::path::PathBuf],
+        resolved: &[&str],
+    ) -> Self {
         let count = providers.len();
         let mut paths = Vec::new();
         for (index, path) in providers.iter().enumerate() {
@@ -44,9 +58,8 @@ impl HeldProviders {
             let executable = inspected
                 .executable_ranges
                 .iter()
-                .find(|(start, end)| end - start > 0x300)
+                .find(|(start, end)| end - start > (resolved.len() as u64 + 1) * 0x100)
                 .unwrap();
-            let offsets = [executable.0 + 0x100, executable.0 + 0x200];
             let functions =
                 match pkcs11_module::tables_for(pkcs11_module::Surface::LegacyFunctionList {
                     version: cryptoki_sys::CK_VERSION {
@@ -59,14 +72,10 @@ impl HeldProviders {
                         .flat_map(|span| span.fields())
                         .map(|field| FunctionRecord {
                             name: field.name.into(),
-                            resolution: match field.name {
-                                "C_SignInit" => Resolution::Resolved {
+                            resolution: match resolved.iter().position(|name| *name == field.name) {
+                                Some(at) => Resolution::Resolved {
                                     object: 0,
-                                    file_offset: offsets[0],
-                                },
-                                "C_Sign" => Resolution::Resolved {
-                                    object: 0,
-                                    file_offset: offsets[1],
+                                    file_offset: executable.0 + (at as u64 + 1) * 0x100,
                                 },
                                 _ => Resolution::NullPointer,
                             },
@@ -117,7 +126,7 @@ impl HeldProviders {
             .subset
             .expect("complete explicit provider attestations");
         assert_eq!(subset.required().len(), count);
-        assert_eq!(subset.plan().slots.len(), count * 2);
+        assert_eq!(subset.plan().slots.len(), count * resolved.len());
         Self { _dir: dir, subset }
     }
 }
@@ -543,7 +552,7 @@ impl RealScene {
     fn bind(&mut self, pid: u32, image: ImageIdentity, provider: usize) -> CallerId {
         SIGHT_NS.with(|clock| clock.set(1_005));
         let caller = self.scene.admit(pid, 50);
-        for (key, path) in &self.modules {
+        for (file, (key, path)) in self.modules.iter().enumerate() {
             self.scene.coordinator.registry_mut().note_mapping(
                 caller,
                 pid,
@@ -555,7 +564,18 @@ impl RealScene {
                     identity_source: Some("held-provider".into()),
                     admission: AdmissionState::Admitted,
                     admission_class: Some("exact".into()),
-                    admission_endpoints: Some(2),
+                    admission_endpoints: Some(
+                        self.h0
+                            .0
+                            .borrow()
+                            .io
+                            .endpoints
+                            .iter()
+                            .filter(|(_, _, endpoint)| endpoint.file_slot as usize == file)
+                            .count()
+                            .try_into()
+                            .unwrap(),
+                    ),
                     admission_reasons: Vec::new(),
                 },
                 60,

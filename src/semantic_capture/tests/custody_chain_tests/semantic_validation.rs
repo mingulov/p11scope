@@ -618,9 +618,7 @@ impl RealScene {
                             .endpoints
                             .iter()
                             .filter(|(_, _, endpoint)| endpoint.file_slot as usize == file)
-                            .count()
-                            .try_into()
-                            .unwrap(),
+                            .count(),
                     ),
                     admission_reasons: Vec::new(),
                 },

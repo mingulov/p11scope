@@ -19,6 +19,58 @@ struct CanonicalFanoutScene {
 }
 
 impl CanonicalFanoutScene {
+    /// Retain the actual collected New carried by a later stash merge. Its
+    /// original cut/subject, not the current quantum number, authorizes birth.
+    fn retain_collected_birth(
+        &mut self,
+        input: &crate::discovery::caller_registry::instance_input::AdmittedInstanceCall,
+        current: crate::semantic_capture::CurrentPartitionReceipt,
+        proof: crate::semantics_objects::journal::JournalDomainProof,
+    ) {
+        let candidate = current.into_birth_candidate().unwrap_or_else(|_| {
+            panic!("the original pending job must retain its actual collected New")
+        });
+        assert_eq!(candidate.receipt.image(), input.journal_binding().1);
+        let publisher = NativePublisher::build();
+        let (row, control, _) = publisher.publish_stamped(&["0", "0"], self.attached.generation());
+        let mut rows = NativeBirthRows { row, control };
+        let caller = input.journal_binding().3;
+        let witness = {
+            let mut h0 = self.scene.real.h0.0.borrow_mut();
+            let HeldH0 { capture, io, .. } = &mut *h0;
+            capture
+                .validate_birth_candidate(io, &candidate, false)
+                .unwrap();
+            capture
+                .finish_birth(
+                    candidate,
+                    None,
+                    input,
+                    self.scene
+                        .real
+                        .scene
+                        .coordinator
+                        .semantic_bindings()
+                        .get(caller)
+                        .unwrap(),
+                    &self.attached,
+                    &proof,
+                    self.scene.real.scene.coordinator.joint_capture().adapter(),
+                    &mut rows,
+                )
+                .expect("the retained actual New and original subject authorize birth")
+        };
+        assert!(
+            self.scene
+                .real
+                .scene
+                .coordinator
+                .registry_mut()
+                .install_joint_receipt(input.instance_key_for_test(), *witness.receipt(),)
+        );
+        self.births.push((caller, witness, rows));
+    }
+
     fn prior_sealed() -> Self {
         let (held, attached) = HeldProviders::with_attachment(
             1,
@@ -1785,4 +1837,399 @@ fn joint_future_end_disposes_frame_without_disposing_call() {
             "a future terminal wait never invents a loss void"
         );
     }
+}
+
+/// Catches treating truthful acquired H3Pending as a permanent local retry.
+/// The deferred call is an original collected END, resolved by its existing
+/// H0 scan job and retained in the real lane stash; B also keeps a real START.
+#[test]
+fn joint_pending_h3_stash_disposes_frame_and_claims_original_in_next_quantum() {
+    let mut fixture = CanonicalFanoutScene::prior_sealed();
+    let a = std::process::id();
+    let b = fixture._child.id();
+    let child_c = OwnedStoppedChild::new();
+    let c = child_c.id();
+    let c_image = ImageIdentity {
+        task_cookie: 73,
+        exec_id: 0,
+    };
+    let c_caller = fixture.scene.real.bind(c, c_image, 0);
+    let (begin_b, end_b) = fixture.scene.encoded(b, 0, "C_SignInit", 2);
+    fixture.scene.push(a, 0, "C_SignInit", 2);
+    fixture.scene.push(c, 0, "C_SignInit", 1);
+    fixture
+        .scene
+        .drain
+        .source_mut()
+        .push_record(begin_b.to_vec());
+    let mut raw = fixture.scene.collect_with_fault(&BirthFault);
+    let first = {
+        let mut h0 = fixture.scene.real.h0.0.borrow_mut();
+        let HeldH0 { capture, io, .. } = &mut *h0;
+        io.script.fail_cookie = Some(c_image.task_cookie);
+        let first = capture.tick_collected_with(io, &mut raw).unwrap();
+        assert_eq!(first.calls().count(), 1);
+        assert_eq!(first.awaiting_floor(), Some(4));
+        first
+    };
+    let first = SemanticBatch::from_tick_report(
+        fixture.scene.real.lane.domain(),
+        first,
+        Vec::new(),
+        now_ns(),
+    )
+    .unwrap();
+    {
+        let mut h0 = fixture.scene.real.h0.0.borrow_mut();
+        let HeldH0 {
+            capture, io, stash, ..
+        } = &mut *h0;
+        io.script.fail_cookie = None;
+        // The actual original scan job owns the q1 birth cut. An empty
+        // service of the SAME raw clears its actual pending disposition;
+        // every resulting call/receipt moves into the existing lane stash.
+        let mut completed = capture.tick_collected_with(io, &mut raw).unwrap();
+        assert_eq!(completed.calls().count(), 1);
+        assert_eq!(completed.awaiting_floor(), None);
+        assert_eq!(completed.allocated_below(), 5);
+        assert_eq!(completed.calls().next().unwrap().position(), Some(4));
+        assert_eq!(stash_refresh_report(stash, &mut completed).1, 0);
+        assert_eq!(stash.min_outcome_position(), Some(4));
+    }
+    let coordinator = &mut fixture.scene.real.scene.coordinator;
+    coordinator.stage_semantic_batch(first);
+    coordinator
+        .prepare_staged_semantic_batch(&mut fixture.scene.real.lane, None)
+        .unwrap();
+    assert_eq!(
+        coordinator
+            .prepared_semantic_batch()
+            .unwrap()
+            .admissions()
+            .count(),
+        1
+    );
+    let ingested = raw
+        .ingest(
+            coordinator.joint_capture_mut().adapter_mut(),
+            &fixture.scene.producers,
+            &fixture.grant,
+        )
+        .unwrap_or_else(|(_, reason)| {
+            panic!("the genuine same raw is now H0 disposed: {reason:?}")
+        });
+    assert_eq!(claim_and_finish(&mut fixture.scene, &ingested).len(), 1);
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .commit_batch_with_semantics(false, Some(&mut fixture.scene.real.lane))
+        .unwrap();
+    let mut q1 = acquire(&mut fixture.scene, ingested, &fixture.attached, &BirthFault);
+    assert_eq!(
+        q1.failure_for_test().unwrap().gap,
+        crate::semantics_objects::journal::JournalGap::H3Pending
+    );
+    assert!(matches!(
+        q1.audit_for_test().h3_for_test(),
+        H3DispositionEvidence::Clean {
+            staged_max: 3,
+            pending_floor: Some(4),
+        }
+    ));
+    let before_feeds = fixture.feeds();
+    let before_claims = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .invocation_claims_for_test();
+    assert_eq!(before_claims, (1, vec![3]));
+    let before_roles = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .ledger()
+        .roles_for_test();
+    assert_eq!(before_roles[..4], [0, 3, 0, 1]);
+    let before_starts = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .retained_starts_for_test();
+    assert_eq!(before_starts.len(), 3);
+    let start_b = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .retained_start_bytes_for_test((u64::from(b), 2))
+        .unwrap();
+    let h0 = fixture.scene.real.h0.clone();
+    let mut births = NativeFrameBirths {
+        h0: &h0,
+        attached: &fixture.attached,
+        retained: &mut fixture.births,
+        seen: Vec::new(),
+        unreadable: false,
+    };
+    {
+        let mut ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        q1.bind_targets(&ports).unwrap();
+        assert_eq!(
+            q1.seal_next(&mut ports, &mut births, &BirthFault),
+            Ok(QuantumSealProgress::AwaitFutureInput)
+        );
+        q1.finish_frame(&mut ports).unwrap_or_else(|(_, reason)| {
+            panic!("truthful producer-owned pending evidence must allow q2: {reason:?}")
+        });
+    }
+    drop(births);
+    assert_eq!(fixture.feeds(), before_feeds);
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .invocation_claims_for_test(),
+        before_claims
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .ledger()
+            .roles_for_test(),
+        before_roles
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .retained_starts_for_test(),
+        before_starts
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .retained_start_bytes_for_test((u64::from(b), 2)),
+        Some(start_b)
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_h3_acknowledged_below(),
+        0
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_h3_audit_state(),
+        (2, false)
+    );
+
+    // q2 receives B's exact END and merges C's original Call/New. H0 ordinal
+    // order is C=4, then B=5 even though the ring returns B before the merge.
+    fixture.scene.drain.source_mut().push_record(end_b.to_vec());
+    let raw = fixture.scene.collect_with_fault(&BirthFault);
+    fixture.scene.real.h0.0.borrow_mut().collected = Some(raw);
+    let batch = fixture.scene.real.tick();
+    fixture.scene.admit_providers(c, c_caller, &[0]);
+    fixture.scene.prepare_batch(batch, 2);
+    let admitted = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .prepared_semantic_batch()
+        .unwrap()
+        .admissions()
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        admitted
+            .iter()
+            .map(|input| input.h0_ordinal())
+            .collect::<Vec<_>>(),
+        [4, 5]
+    );
+    let current = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .take_prepared_current_for_birth_test()
+        .unwrap();
+    let current_c = current
+        .into_iter()
+        .find(|receipt| receipt.image() == c_image)
+        .unwrap();
+    let raw = fixture
+        .scene
+        .real
+        .h0
+        .0
+        .borrow_mut()
+        .collected
+        .take()
+        .unwrap();
+    let ingested = raw
+        .ingest(
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .joint_capture_mut()
+                .adapter_mut(),
+            &fixture.scene.producers,
+            &fixture.grant,
+        )
+        .unwrap_or_else(|(_, reason)| panic!("actual next raw: {reason:?}"));
+    let claims = claim_and_finish(&mut fixture.scene, &ingested);
+    assert_eq!(claims.iter().map(|(at, _)| *at).collect::<Vec<_>>(), [4, 5]);
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .invocation_claims_for_test(),
+        (3, vec![3, 4, 5])
+    );
+    fixture.retain_collected_birth(&admitted[0], current_c, claims[0].1);
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .commit_batch_with_semantics(false, Some(&mut fixture.scene.real.lane))
+        .unwrap();
+    let mut q2 = acquire(&mut fixture.scene, ingested, &fixture.attached, &BirthFault);
+    assert!(q2.failure_for_test().is_none());
+    let h0 = fixture.scene.real.h0.clone();
+    let mut births = NativeFrameBirths {
+        h0: &h0,
+        attached: &fixture.attached,
+        retained: &mut fixture.births,
+        seen: Vec::new(),
+        unreadable: false,
+    };
+    {
+        let mut ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        q2.bind_targets(&ports).unwrap();
+        for remaining in [2, 1, 0] {
+            assert_eq!(
+                q2.seal_next(&mut ports, &mut births, &BirthFault),
+                Ok(QuantumSealProgress::DeliveryReady)
+            );
+            assert_eq!(
+                q2.deliver_next(&mut ports),
+                Ok(if remaining == 0 {
+                    QuantumSealProgress::Complete
+                } else {
+                    QuantumSealProgress::LocalPending
+                })
+            );
+        }
+        q2.finish_frame(&mut ports)
+            .unwrap_or_else(|(_, reason)| panic!("originals settle once: {reason:?}"));
+    }
+    drop(births);
+    assert_eq!(
+        fixture.feeds().iter().map(|feed| feed.reduced).sum::<u64>(),
+        5
+    );
+    assert!(
+        fixture
+            .feeds()
+            .iter()
+            .all(|feed| feed.staged == 0 && !feed.degraded && !feed.fallback)
+    );
+    fixture.scene.assert_claims(&[]);
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .retained_starts_for_test()
+            .is_empty()
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .ledger()
+            .roles_for_test()[..4],
+        [0, 0, 0, 0]
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_h3_acknowledged_below(),
+        0
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_h3_audit_state(),
+        (3, false)
+    );
 }

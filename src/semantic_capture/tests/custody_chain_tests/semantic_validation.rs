@@ -345,6 +345,13 @@ impl CaptureIo for HeldIo {
         fence: u64,
         _: &dyn Fn() -> u64,
     ) -> Result<ImageScanProof, ImageQueryRefusal> {
+        // Substitute only the native scan leaf, as ScriptIo does. The
+        // router, original pending job and collected H0 origin remain real.
+        if self.script.fail_cookie == Some(job.image.task_cookie)
+            || self.script.fail_file == Some(job.endpoint.file_slot)
+        {
+            return Err(ImageQueryRefusal::Unstable);
+        }
         self.scan_proof(job.image, job.endpoint, fence)
     }
     fn scan_selected(

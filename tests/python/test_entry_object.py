@@ -873,25 +873,53 @@ class EntryObjectTests(unittest.TestCase):
                     CHECKER["contract"](changed, "default")
 
     def test_each_consumer_descriptor_fields_and_word(self):
-        discovery = CHECKER["D"]
-        for variant, disassembly in OBJECTS.items():
-            report = CHECKER["contract"](disassembly, variant)
-            blocks = discovery.function_blocks(disassembly)
-            for name, result in report["consumers"].items():
-                insns = discovery.instructions(blocks[name])
-                lookup = next(pc for pc, sink in result["sinks"] if sink == "DESCRIPTORS")
-                high = [(pc, text) for pc, text in insns if pc < lookup and text == "r0 >>= 0x20"][-1]
-                controls = [(high[0], high[1], "r0 <<= 0x20")]
-                for pc, text in insns:
-                    match = CHECKER["LOAD"].fullmatch(text)
-                    if lookup < pc < lookup + 32 and match and match[3] == "0":
-                        controls.append((pc, text, text.replace("+ 0x" + match[5], "+ 0xff")))
-                self.assertEqual(len(controls), 1 + len(result["descriptor_fields"]))
-                for pc, old, new in controls:
-                    with self.subTest(variant=variant, function=name, pc=pc):
-                        changed = mutate(disassembly, name, pc, old, new)
-                        with self.assertRaises(RuntimeError):
-                            CHECKER["contract"](changed, variant)
+        for variant in OBJECTS:
+            split = CHECKER["sections"](OBJECTS[variant])
+            all_calls = CHECKER["D"].internal_call_targets(split["uprobe"]+"\n"+split[".text"])
+            for section in ("uprobe", ".text"):
+                for name, lines in CHECKER["D"].function_blocks(split[section]).items():
+                    outlined = name.endswith(("ordinary_return", "object_return"))
+                    if not (name.startswith("p11_entry") or outlined):
+                        continue
+                    consumer = CHECKER["_ReturnCaller" if outlined else "_SeedCaller"](section, name, lines,
+                        {pc: target for caller, _, pc, target in all_calls if caller == name})
+                    initial = {"r1": ("context", 0), "r2": ("external_key", ("uretprobe", "p11_return"), 0),
+                        "r3": ("owned", 7, 0), "r4": ("scope_flags", ("uretprobe", "p11_return")),
+                        "r5": ("constant", 0), "r10": ("stack", 0)} if outlined else None
+                    facts = consumer.facts(initial)
+                    if outlined:
+                        for pc, text in consumer.insns:
+                            state = facts.get(pc, {})
+                            kind = state.get("r1")
+                            if pc in consumer.helper and text in ("call 0x1", "call 0x2") and kind in (
+                                    ("map", "DESCRIPTORS"), ("map", "STATS"), ("map", "RV_COUNTS")):
+                                with self.subTest(variant=variant, function=name, map=kind[1], pc=pc):
+                                    expected = "high" if kind[1] == "DESCRIPTORS" else "low"
+                                    self.assertEqual(CHECKER["stack_read"](state, state.get("r2"), 4),
+                                        (expected, ("uretprobe", "p11_return")))
+                    lookups = [pc for pc, text in consumer.insns if pc in consumer.helper and text == "call 0x1"
+                               and facts.get(pc, {}).get("r1") == ("map", "DESCRIPTORS")]
+                    groups = [{3}] if outlined else [{14, 15}] if name.endswith("template_second") else [
+                        {3, 6, 7, 8, 9, 10, 11} | ({12, 13} if "template" in name else {16, 17}), {5}]
+                    self.assertEqual(len(lookups), len(groups))
+                    for lookup, expected in zip(lookups, groups):
+                        with self.subTest(variant=variant, function=name, lookup=lookup, control="healthy"):
+                            try:
+                                fields = CHECKER["descriptor_contract"](consumer, facts, lookup)
+                            except RuntimeError as error:
+                                self.fail("actual descriptor materialization rejected: "+str(error))
+                            self.assertEqual(set(fields), expected)
+                        loads = [(pc, text) for pc, text in consumer.insns if (m := CHECKER["LOAD"].fullmatch(text))
+                            and (pointer := CHECKER["address"](facts.get(pc, {}), m[3], m[4], m[5]))
+                            and pointer[:2] == ("descriptor", lookup)]
+                        self.assertEqual(len(loads), len(expected))
+                        for pc, old in loads:
+                            with self.subTest(variant=variant, function=name, mutation=pc):
+                                changed = mutate(OBJECTS[variant], name, pc, old, old.replace("u8", "u16"))
+                                changed_lines = CHECKER["D"].function_blocks(changed)[name]
+                                mutant = type(consumer)(section, name, changed_lines, consumer.calls)
+                                with self.assertRaisesRegex(RuntimeError, "descriptor"):
+                                    CHECKER["descriptor_contract"](mutant, mutant.facts(initial), lookup)
 
     def test_diagnostic_specialization_and_template_cleanup(self):
         discovery = CHECKER["D"]

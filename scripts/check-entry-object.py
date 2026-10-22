@@ -1503,6 +1503,10 @@ class _ReturnCaller(_SeedCaller):
     def transfer(self, pc, incoming):
         state = super().transfer(pc, incoming)
         text, target = self.text[pc], self.calls.get(pc, "")
+        if pc in self.helper and text == "call 0xae" and incoming.get("r1") == ("context", 0):
+            state["r0"] = ("cookie", self.identity)
+        elif pc in self.helper and text == "call 0xe":
+            state["r0"] = ("pid_tgid", self.identity)
         if match := LOAD.fullmatch(text):
             pointer = address(incoming, match[3], match[4], match[5])
             fact = None
@@ -1740,7 +1744,9 @@ def retained_contract(consumer, variant, selectors, internal_blocks, internal_ca
                            "r3": ("owned", gets[0], 0), "r4": ("scope_flags", root.identity),
                            "r5": ("constant", abi), "r10": ("stack", 0), ("live", gets[0]): True}
                 body.facts(initial, proof=_ReturnProof(abi, present, gets[0], role, sites))
-        report[role] = {"function": body.name, "retained_reads": sorted(sites), "retirements": retires}
+        result = consumer_contract(body, variant, internal_blocks, initial, outlined=True)
+        result.update({"function": body.name, "retained_reads": sorted(sites), "retirements": retires})
+        report[role] = result
     return {"retained_offsets": [0x20, 0x30], "scenarios": len(selectors)*2, "outlined": report}
 
 
@@ -1766,14 +1772,26 @@ def descriptor_contract(consumer, facts, lookup):
             pointer = address(nonnull, match[3], match[4], match[5])
             require(pointer and pointer[:2] == ("descriptor", lookup) and match[2] == "8", consumer.label(pc) + ": descriptor field provenance")
             loads.add(pointer[2])
+        previous = nonnull
         nonnull = consumer.step(pc, nonnull)
-    expected = ({3} if consumer.name == "p11_return" else {14, 15}
-                if consumer.name == "p11_entry_template_second" else BASE_FIELDS | ({12, 13}
-                if "template" in consumer.name else {16, 17}))
+        if bit := re.fullmatch(r"([rw]\d+) &= 0x1", text):
+            if previous.get(reg(bit[1])) == ("field", 5):
+                nonnull[reg(bit[1])] = ("field_bit", 5, 1)
+    lookups = [pc for pc, text in consumer.insns if pc in consumer.helper and text == "call 0x1"
+               and facts.get(pc, {}).get("r1") == ("map", "DESCRIPTORS")]
+    if consumer.section == ".text" and consumer.name.endswith(("ordinary_return", "object_return")):
+        groups = [{3}]
+    elif consumer.name == "p11_entry_template_second":
+        groups = [{14, 15}]
+    else:
+        require(consumer.name.startswith("p11_entry"), consumer.name+": unexpected descriptor consumer")
+        groups = [BASE_FIELDS | ({12, 13} if "template" in consumer.name else {16, 17}), {5}]
+    require(len(lookups) == len(groups) and lookup in lookups, consumer.name+": descriptor lookup inventory")
+    expected = groups[lookups.index(lookup)]
     require(loads == expected, consumer.label(lookup) + f": descriptor fields {loads}, expected {expected}")
     carried = set()
     for key, fact in nonnull.items():
-        if fact[0] != "field":
+        if not isinstance(fact, tuple) or fact[0] not in ("field", "field_bit"):
             continue
         # Ignore a register temporary killed before its first subsequent use.
         if isinstance(key, str):
@@ -1815,7 +1833,7 @@ def abi_contract(consumer, facts, variant):
         target = consumer.calls.get(pc)
         if ((pc in consumer.helper and state.get("r1", (None, None))[0] == "map"
              and state["r1"][1] in ("STATS", "RV_COUNTS", "DESCRIPTORS", "EVENTS"))
-                or target in ("p11_owner_start_get", "p11_owner_start_insert")
+                or target in ("p11_owner_start_get", "p11_owner_start_begin")
                 or (target == "p11_owner_start_remove" and state.get("r2") == ("constant", 1))):
             observations.add(pc)
         match = LOAD.fullmatch(text)
@@ -1829,7 +1847,7 @@ def abi_contract(consumer, facts, variant):
         accepted = {0x33}
     if consumer.name == "p11_entry_ia32":
         accepted = {0x23}
-    for selector in (0, 0x23, 0x33):
+    for selector in (0, 0x23, 0x33, 0x100000023, 0x100000033):
         state = consumer.step(start, facts[start])
         state[reg(LOAD.fullmatch(consumer.text[start])[1])] = ("selector_case", selector)
         pending = [(consumer.graph[start][0], state, False, False, frozenset())]
@@ -1844,7 +1862,7 @@ def abi_contract(consumer, facts, variant):
             visited.add(signature)
             text, target = consumer.text[pc], consumer.calls.get(pc)
             map_name = state.get("r1")
-            admission = (text == "call 0x1" and map_name == ("map", "STATS")) or target in ("p11_owner_start_get", "p11_owner_start_insert")
+            admission = (text == "call 0x1" and map_name == ("map", "STATS")) or target in ("p11_owner_start_get", "p11_owner_start_begin")
             if admission:
                 require(selector in accepted and not refused, consumer.label(pc) + ": ABI refusal reaches admission")
                 admitted = True
@@ -1856,6 +1874,8 @@ def abi_contract(consumer, facts, variant):
                 require(cleaned and stack_read(state, state.get("r2"), 4) == ("constant", 8), consumer.label(pc) + ": ABI refusal evidence key/order")
                 require(D.counter_writeback_contract(consumer.lines, pc), consumer.label(pc) + ": ABI refusal counter update")
                 refused = True
+            elif target == "p11_object_fault":
+                require(cleaned, consumer.label(pc)+": ABI fault before cleanup")
             elif text == "call 0x1" and map_name == ("map", "STOP_GATE"):
                 # The stop-gate release epilogue: admitted paths stop at
                 # admission above and never reach it, so only refusal paths
@@ -1871,12 +1891,19 @@ def abi_contract(consumer, facts, variant):
                 continue
             after = consumer.step(pc, state)
             edges = consumer.graph[pc]
-            branch = re.fullmatch(r"if (r\d+) (==|!=) (-?0x[0-9a-f]+) goto [+-]0x[0-9a-f]+", text)
-            if branch and state.get(branch[1], (None,))[0] == "selector_case":
-                immediate = int(branch[3], 16)
-                require(immediate in (0x23, 0x33), consumer.label(pc) + ": unsupported selector comparison")
-                taken = (selector == immediate) == (branch[2] == "==")
-                edges = [D.relative_target(pc, text)] if taken else [e for e in edges if e != D.relative_target(pc, text)]
+            branch = BRANCH.fullmatch(text)
+            if branch:
+                left, right = value(state, branch[1]), value(state, branch[3])
+                taken = None
+                if left and left[0] == "selector_case" and right and right[0] == "constant":
+                    require(branch[1].startswith("r") and branch[2] in ("==", "!=") and right[1] in (0x23, 0x33),
+                            consumer.label(pc)+": unsupported selector comparison")
+                    taken = compare(selector, branch[2], right[1])
+                elif left and right and left[0] == right[0] == "constant":
+                    taken = compare(left[1], branch[2], right[1], 32 if branch[1].startswith("w") else 64)
+                if taken is not None:
+                    target = D.relative_target(pc, text)
+                    edges = [target] if taken else [edge for edge in edges if edge != target]
             for successor in edges:
                 pending.append((successor, after.copy(), cleaned, refused, ancestors | {pc}))
         require(admitted == (selector in accepted), consumer.name + ": selector acceptance differs")
@@ -1910,68 +1937,120 @@ def incoming_parameter_unused(lines, parameter):
 
 def operation_contract(consumer, facts, variant, internal_blocks):
     """Require distinct, reachable operations and their complete caller keys."""
-    identity = (consumer.section, consumer.name)
+    identity = getattr(consumer, "identity", (consumer.section, consumer.name))
     reachable = D.reachable(consumer.graph, [consumer.insns[0][0]])
-    owner, maps, keys, values, records = [], Counter(), set(), set(), []
+    owner, maps, keys, values, records = Counter(), Counter(), set(), set(), []
     for pc, text in consumer.insns:
-        state = facts.get(pc, {})
-        target = consumer.calls.get(pc, "")
+        state, target = facts.get(pc, {}), consumer.calls.get(pc, "")
         if target.startswith("p11_owner_start_"):
-            require(pc in reachable, consumer.label(pc) + ": unreachable START operation")
+            require(pc in reachable, consumer.label(pc)+": unreachable START operation")
             key = state.get("r1")
-            require(key and key[0] == "stack", consumer.label(pc) + ": START key address")
-            require(stack_read(state, key, 8) == ("pid_tgid", identity), consumer.label(pc) + ": START pid_tgid provenance")
-            require(stack_read(state, key, 4, 8) == ("low", identity), consumer.label(pc) + ": START slot provenance")
-            require(stack_read(state, key, 4, 12) == ("constant", 0), consumer.label(pc) + ": START zero padding")
+            require(key and key[0] == "stack", consumer.label(pc)+": START key address")
+            require(stack_read(state, key, 8) == ("pid_tgid", identity), consumer.label(pc)+": START pid_tgid provenance")
+            require(stack_read(state, key, 4, 8) == ("low", identity), consumer.label(pc)+": START slot provenance")
+            require(stack_read(state, key, 4, 12) == ("constant", 0), consumer.label(pc)+": START zero padding")
             keys.add(key)
-            operation = target.removeprefix("p11_owner_start_")
-            argument = state.get("r2")
-            if operation == "insert":
-                require(argument and argument[0] == "stack" and argument != key, consumer.label(pc) + ": START value address")
-                require(stack_read(state, argument, 8) == ("ktime_ns", identity), consumer.label(pc) + ": START value timestamp provenance")
+            operation, argument = target.removeprefix("p11_owner_start_"), state.get("r2")
+            if operation == "begin":
+                require(argument and argument[0] == "stack" and argument != key
+                        and stack_read(state, argument, 8) == ("ktime_ns", identity), consumer.label(pc)+": START immutable seed address/timestamp")
                 values.add(argument)
-                role = "insert"
+                role = "begin"
+            elif operation == "aggregate":
+                require(argument == ("ktime_ns", identity), consumer.label(pc)+": START aggregate scalar timestamp")
+                role = "aggregate"
             elif operation == "get" and variant == "default":
                 require(incoming_parameter_unused(internal_blocks[target], 2), "default START get retains an unexpected required argument")
                 role = "get0-specialized"
             else:
-                require(argument in (("constant", 0), ("constant", 1)), consumer.label(pc) + ": START required argument")
-                role = operation + str(argument[1])
-            owner.append(role)
-            records.append((pc, "START." + role))
+                require(operation in ("get", "remove") and argument in (("constant", 0), ("constant", 1)),
+                        consumer.label(pc)+": START required argument/operation")
+                role = operation+str(argument[1])
+            owner[role] += 1
+            records.append((pc, "START."+role))
         if pc in consumer.helper:
             name = state.get("r1", (None, None))
             if name[0] == "map" and name[1] in ("STATS", "RV_COUNTS", "DESCRIPTORS", "EVENTS"):
-                operation = (name[1], text)
-                require(pc in reachable, consumer.label(pc) + ": unreachable map operation")
-                maps[operation] += 1
-                records.append((pc, name[1] + "." + text))
-            if text == "call 0x84":
-                require(state.get("r1") == ("event", 0), consumer.label(pc) + ": submitted event address")
-                require(state.get(("event_slot",)) == ("low", identity), consumer.label(pc) + ": Event.slot corrupted before submit")
+                require(pc in reachable, consumer.label(pc)+": unreachable map operation")
+                maps[(name[1], text)] += 1
+                records.append((pc, name[1]+"."+text))
+            if text in ("call 0x84", "call 0x85"):
+                require(state.get("r1") == ("event", 0), consumer.label(pc)+": submitted/discarded event address")
+                if text == "call 0x84":
+                    require(state.get(("event_slot",)) == ("low", identity), consumer.label(pc)+": Event.slot corrupted before submit")
                 maps[("EVENTS", text)] += 1
-                records.append((pc, "EVENTS.submit"))
+                records.append((pc, "EVENTS."+("submit" if text == "call 0x84" else "discard")))
     name = consumer.name
-    if name == "p11_return":
-        expected_owner = ["remove0", "remove0", "get0-specialized" if variant == "default" else "get0", "remove1"]
+    outlined = consumer.section == ".text" and name.endswith(("ordinary_return", "object_return"))
+    if outlined:
+        expected_owner = Counter({"remove1": 7 if name.endswith("object_return") else 1})
+    elif name == "p11_return":
+        expected_owner = Counter({"remove0": 2, "get0-specialized" if variant == "default" else "get0": 1})
     elif name == "p11_entry_template_second":
-        expected_owner = ["remove0", "get1"]
+        expected_owner = Counter({"remove0": 1, "get1": 1})
     else:
-        expected_owner = ["remove0", "insert", "remove0", "insert"]
-        if variant == "unsafe" and name in ("p11_entry", "p11_entry_ia32"):
-            expected_owner.insert(1, "remove0")
-    expected_maps = Counter({("DESCRIPTORS", "call 0x1"): 1})
-    if name != "p11_entry_template_second":
+        strict = variant == "unsafe" and name in ("p11_entry", "p11_entry_ia32")
+        expected_owner = Counter({"begin": 1, "aggregate": 1, "remove0": 3 if strict else 2, "remove1": 1})
+    expected_maps = Counter()
+    if name != "p11_return":
+        expected_maps[("DESCRIPTORS", "call 0x1")] = 1 if outlined or name == "p11_entry_template_second" else 2
+    if name not in ("p11_return", "p11_entry_template_second"):
         expected_maps[("STATS", "call 0x1")] = 1
-    if name == "p11_return":
-        # RV_COUNTS: in-place lookup for the atomic add, one BPF_NOEXIST
-        # create, and the create-race retry lookup (every key is the cookie).
+    if outlined:
         expected_maps.update({("RV_COUNTS", "call 0x1"): 2, ("RV_COUNTS", "call 0x2"): 1,
                               ("EVENTS", "call 0x83"): 1, ("EVENTS", "call 0x84"): 1})
-    require(owner == expected_owner, name + f": START operation inventory {owner}, expected {expected_owner}")
-    require(maps == expected_maps, name + ": distinct map operation inventory differs")
-    require(len(keys) == 1 and len(values) == (1 if "insert" in expected_owner else 0), name + ": START operation key/value wiring differs")
+        if name.endswith("object_return"):
+            expected_maps[("EVENTS", "call 0x85")] = 1
+    require(owner == expected_owner, name+f": START operation inventory {owner}, expected {expected_owner}")
+    require(maps == expected_maps, name+f": distinct map operation inventory differs: {maps}")
+    require(len(keys) == 1 and len(values) == int("begin" in expected_owner), name+": START operation key/seed wiring differs")
     return records
+
+
+def consumer_contract(consumer, variant, internal_blocks, initial=None, outlined=False):
+    facts = consumer.facts(initial)
+    identity = getattr(consumer, "identity", (consumer.section, consumer.name))
+    sinks, descriptors, bounds = [], [], []
+    for pc, text in consumer.insns:
+        state, target = facts.get(pc, {}), consumer.calls.get(pc, "")
+        map_name = state.get("r1", (None, None))
+        if match := re.fullmatch(r"if ([rw]\d+) > 0x1ff goto [+-]0x[0-9a-f]+", text):
+            require(state.get(reg(match[1])) == ("low", identity), consumer.label(pc)+": slot bound uses cookie low word")
+            bounds.append(pc)
+        if pc in consumer.helper and text in ("call 0x1", "call 0x2") and map_name[0] == "map":
+            if map_name[1] in ("STATS", "RV_COUNTS", "DESCRIPTORS"):
+                word = "high" if map_name[1] == "DESCRIPTORS" else "low"
+                require(stack_read(state, state.get("r2"), 4) == (word, identity), consumer.label(pc)+": "+map_name[1]+" cookie key")
+                sinks.append((pc, map_name[1]))
+                if word == "high":
+                    descriptors.append(pc)
+        if target.startswith("p11_owner_start_"):
+            require(stack_read(state, state.get("r1"), 4, 8) == ("low", identity), consumer.label(pc)+": START slot cookie")
+            sinks.append((pc, "START"))
+        if match := STORE.fullmatch(text):
+            if address(state, match[2], match[3], match[4]) == ("event", 0x68):
+                require(match[1] == "32" and narrow(value(state, match[5]), 32) == ("low", identity), consumer.label(pc)+": Event.slot cookie")
+                sinks.append((pc, "Event.slot"))
+    required = {"START"} if consumer.name == "p11_return" else {"DESCRIPTORS", "START"}
+    if consumer.name not in ("p11_return", "p11_entry_template_second"):
+        required.add("STATS")
+    if outlined:
+        required |= {"RV_COUNTS", "Event.slot"}
+    require({sink for _, sink in sinks} == required, consumer.name+": sink inventory differs")
+    require(len(bounds) == (0 if outlined else 1), consumer.name+": slot bound inventory")
+    if bounds:
+        bound = bounds[0]
+        observation = {pc for pc, _ in sinks}
+        rejected = D.relative_target(bound, consumer.text[bound])
+        require(not observation & D.reachable(consumer.graph, [consumer.insns[0][0]], blocked={bound})
+                and not observation & D.reachable(consumer.graph, [rejected]), consumer.name+": slot bound refusal/bypass")
+    expected_descriptors = 0 if consumer.name == "p11_return" else 1 if outlined or consumer.name == "p11_entry_template_second" else 2
+    require(len(descriptors) == expected_descriptors, consumer.name+": descriptor lookup inventory")
+    fields = sorted({field for pc in descriptors for field in descriptor_contract(consumer, facts, pc)})
+    selectors = [] if outlined else abi_contract(consumer, facts, variant)
+    operations = operation_contract(consumer, facts, variant, internal_blocks)
+    return {"section": consumer.section, "sinks": sinks, "operations": operations,
+            "descriptor_fields": fields, "accepted_selectors": selectors}
 
 
 def contract(disassembly, variant):
@@ -1986,58 +2065,19 @@ def contract(disassembly, variant):
     expected = {"p11_entry", "p11_return"}
     if variant == "unsafe":
         expected |= {"p11_entry_ia32", "p11_entry_template", "p11_entry_template_pair", "p11_entry_template_second", "p11_entry_template_types"}
+    seeded_start_contract(disassembly)
     report = {}
     for section in ("uprobe", "uretprobe"):
-        require(section in split, "missing " + section)
-        # .text comes last so equal PCs in unrelated ELF sections cannot replace
-        # the relocation target table of the shared primitive.
-        calls = D.internal_call_targets(split[section] + "\n" + split[".text"])
+        require(section in split, "missing "+section)
+        calls = D.internal_call_targets(split[section]+"\n"+split[".text"])
         for name, lines in D.function_blocks(split[section]).items():
             if not (name.startswith("p11_entry") or name == "p11_return"):
                 continue
-            consumer = Consumer(section, name, lines, {pc: target for caller, _, pc, target in calls if caller == name})
-            facts = consumer.facts()
-            identity = (section, name)
-            sinks = []
-            descriptor = []
-            bounds = []
-            for pc, text in consumer.insns:
-                state = facts.get(pc, {})
-                target = consumer.calls.get(pc, "")
-                map_name = state.get("r1", (None, None))
-                if match := re.fullmatch(r"if (r\d+) > 0x1ff goto [+-]0x[0-9a-f]+", text):
-                    require(state.get(match[1]) == ("low", identity), consumer.label(pc) + ": slot bound uses cookie low word")
-                    bounds.append(pc)
-                if pc in consumer.helper and text in ("call 0x1", "call 0x2") and map_name[0] == "map":
-                    if map_name[1] in ("STATS", "RV_COUNTS", "DESCRIPTORS"):
-                        word = "high" if map_name[1] == "DESCRIPTORS" else "low"
-                        require(stack_read(state, state.get("r2"), 4) == (word, identity), consumer.label(pc) + ": " + map_name[1] + " cookie key")
-                        sinks.append((pc, map_name[1]))
-                        if word == "high":
-                            descriptor.append(pc)
-                if target.startswith("p11_owner_start_"):
-                    require(stack_read(state, state.get("r1"), 4, 8) == ("low", identity), consumer.label(pc) + ": START slot cookie")
-                    sinks.append((pc, "START"))
-                if match := STORE.fullmatch(text):
-                    pointer = address(state, match[2], match[3], match[4])
-                    if pointer == ("event", 0x68):
-                        require(match[1] == "32" and narrow(value(state, match[5]), 32) == ("low", identity), consumer.label(pc) + ": Event.slot cookie")
-                        sinks.append((pc, "Event.slot"))
-            required = {"DESCRIPTORS", "START"}
-            if name != "p11_entry_template_second":
-                required.add("STATS")
-            if name == "p11_return":
-                required |= {"RV_COUNTS", "Event.slot"}
-            require({sink for _, sink in sinks} == required, name + ": sink inventory differs")
-            require(len(bounds) == 1, name + ": slot bound inventory")
-            require(len(descriptor) == 1, name + ": descriptor lookup inventory")
-            fields = descriptor_contract(consumer, facts, descriptor[0])
-            selectors = abi_contract(consumer, facts, variant)
-            operations = operation_contract(consumer, facts, variant, internal_blocks)
-            final_sinks = final_sink_contract(consumer, variant, selectors, internal_blocks, internal_calls)
-            report[name] = {"section": section, "sinks": sinks, "operations": operations,
-                            "descriptor_fields": fields, "accepted_selectors": selectors,
-                            "final_sinks": final_sinks}
+            caller = _ReturnCaller if name == "p11_return" else _SeedCaller
+            consumer = caller(section, name, lines, {pc: target for caller, _, pc, target in calls if caller == name})
+            result = consumer_contract(consumer, variant, internal_blocks)
+            result["final_sinks"] = final_sink_contract(consumer, variant, result["accepted_selectors"], internal_blocks, internal_calls)
+            report[name] = result
     require(set(report) == expected, "consumer inventory differs")
     return {
         "schema": SCHEMA,

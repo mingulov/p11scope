@@ -1007,9 +1007,132 @@ def _tail_path_nodes(graph, start, end):
     return reachable(graph, [start]) & reachable(reverse, [end])
 
 
+def _tail_memset_range(lines, state):
+    """Return the exact caller-stack footprint of the reviewed byte loop."""
+    callee = instructions(lines)
+    byte_stores = [op for _, op in callee
+                   if re.fullmatch(r"\*\(u8 \*\)\(r5 \+ 0x0\) = [rw]2", op)]
+    if len(byte_stores) != 1:
+        return None
+    loop = _tail_lowering(callee, f"""
+        if r3 == 0x0 goto @done
+        r4 = 0x0
+        again:
+        r5 = r1
+        r5 += r4
+        {byte_stores[0]}
+        r4 += 0x1
+        if r3 > r4 goto @again
+        done:
+        exit
+        """)
+    pointer, length = state.get("r1"), state.get("r3")
+    if (loop != callee or not pointer or pointer[0] != "stack"
+            or not length or length[0] != "constant"
+            or length[1] < 0 or pointer[1] < -512 or pointer[1] + length[1] > 0):
+        return None
+    return pointer[1], length[1]
+
+
+def _tail_trusted_facts(lines, calls, blocks):
+    """Prove consumed constants/stack pointers through all caller CFG paths.
+
+    Unlike call_argument_facts, every stack write kills overlapping saved u64
+    facts, including wN, immediates and unknown aliases. Callee writes are
+    summarized before a later load can consume the saved value.
+    """
+    insns, graph = instruction_graph(lines)
+    if not insns:
+        return {}
+    texts = dict(insns)
+    targets = {pc: target for _, _, pc, target in calls}
+    incoming = {insns[0][0]: {"r10": ("stack", 0)}}
+    pending = [insns[0][0]]
+    while pending:
+        pc = pending.pop()
+        state = incoming[pc].copy()
+        text = texts[pc]
+        store = re.fullmatch(
+            r"\*\(u(8|16|32|64) \*\)\(r(\d+) ([+-]) 0x([0-9a-f]+)\) = ([rw]\d+|-?0x[0-9a-f]+)", text)
+        load = re.fullmatch(
+            r"(r\d+) = \*\(u64 \*\)\(r(\d+) ([+-]) 0x([0-9a-f]+)\)", text)
+        move = re.fullmatch(r"([rw]\d+) (=|\+=) (r\d+|-?0x[0-9a-f]+)(?: ll)?", text)
+        if store:
+            width, base, sign, offset, src = store.groups()
+            pointer = state.get("r" + base)
+            if pointer and pointer[0] == "stack":
+                address = pointer[1] + int(offset, 16) * (1 if sign == "+" else -1)
+                size = int(width) // 8
+                for key in list(state):
+                    if isinstance(key, int) and key < address + size and address < key + 8:
+                        state.pop(key)
+                if width == "64" and src.startswith("r") and src in state:
+                    state[address] = state[src]
+            else:
+                for key in list(state):
+                    if isinstance(key, int):
+                        state.pop(key)
+        elif text.startswith("call "):
+            target = targets.get(pc)
+            footprint = _tail_memset_range(blocks.get(target, ()), state) if target == "memset" else None
+            if footprint is not None:
+                address, size = footprint
+                for key in list(state):
+                    if isinstance(key, int) and key < address + size and address < key + 8:
+                        state.pop(key)
+            else:
+                preserves_stack = (target is None
+                                   and text in ("call 0x1", "call 0x3", "call 0xe", "call 0xae"))
+                if not preserves_stack:
+                    for key in list(state):
+                        if isinstance(key, int):
+                            state.pop(key)
+            for register in range(6):
+                state.pop("r" + str(register), None)
+        elif load:
+            dst, base, sign, offset = load.groups()
+            pointer = state.get("r" + base)
+            state.pop(dst, None)
+            if pointer and pointer[0] == "stack":
+                address = pointer[1] + int(offset, 16) * (1 if sign == "+" else -1)
+                if address in state:
+                    state[dst] = state[address]
+        elif move:
+            dst, op, src = move.groups()
+            register = "r" + dst[1:]
+            value = state.get(src) if src.startswith("r") else ("constant", int(src, 16))
+            if op == "+=":
+                previous = state.get(register)
+                value = ((previous[0], previous[1] + value[1])
+                         if previous and previous[0] in ("constant", "stack")
+                         and value and value[0] == "constant" else None)
+            if dst.startswith("w") and value:
+                value = ("constant", value[1] & 0xffffffff) if value[0] == "constant" else None
+            state.pop(register, None)
+            if value is not None:
+                state[register] = value
+        elif (text.startswith("*(") or text.startswith("lock ")
+              or "cmpxchg_" in text or "atomic_fetch_" in text):
+            for key in list(state):
+                if isinstance(key, int):
+                    state.pop(key)
+            if match := re.match(r"[rw](\d+)\s", text):
+                state.pop("r" + match[1], None)
+        elif match := re.match(r"[rw](\d+)\s", text):
+            state.pop("r" + match[1], None)
+        for successor in graph[pc]:
+            merged = (state if successor not in incoming else
+                      {key: value for key, value in incoming[successor].items()
+                       if state.get(key) == value})
+            if incoming.get(successor) != merged:
+                incoming[successor] = merged
+                pending.append(successor)
+    return incoming
+
+
 def _interface_index_slot_preserved(lines, graph, start, end, calls, blocks):
     """No overlapping or unproved writer may change the u64 index at -0x60."""
-    facts = call_argument_facts(lines)
+    facts = _tail_trusted_facts(lines, calls, blocks)
     targets = {pc: target for _, _, pc, target in calls}
     slot, size = -0x60, 8
     path = _tail_path_nodes(graph, start, end)
@@ -1018,48 +1141,21 @@ def _interface_index_slot_preserved(lines, graph, start, end, calls, blocks):
             continue
         state = facts.get(pc, {})
         store = re.fullmatch(
-            r"\*\(u(8|16|32|64) \*\)\(r(\d+) ([+-]) 0x([0-9a-f]+)\) = ([rw]\d+|-?0x[0-9a-f]+)",
+            r"\*\(u(8|16|32|64) \*\)\(r(\d+) ([+-]) 0x([0-9a-f]+)\) = (?:[rw]\d+|-?0x[0-9a-f]+)",
             text,
         )
         if store:
-            width, base, sign, offset, source = store.groups()
+            width, base, sign, offset = store.groups()
             pointer = state.get("r" + base)
             if not pointer or pointer[0] != "stack":
                 return False
             address = pointer[1] + int(offset, 16) * (1 if sign == "+" else -1)
             count = int(width) // 8
-            # call_argument_facts invalidates saved values only for rN stores.
-            # An unmodeled wN/immediate writer may leave a stale stack pointer
-            # that a later reload passes to the byte loop as its destination.
-            if (not source.startswith("r") and any(
-                isinstance(key, int) and key < address + count and address < key + 8
-                for key in state
-            )):
-                return False
         elif text.startswith("call "):
-            # Prove the callee's actual byte loop, not just its symbol name.
-            callee = instructions(blocks.get(targets.get(pc), []))
-            byte_stores = [op for _, op in callee
-                           if re.fullmatch(r"\*\(u8 \*\)\(r5 \+ 0x0\) = [rw]2", op)]
-            if len(byte_stores) != 1:
+            footprint = _tail_memset_range(blocks.get(targets.get(pc), ()), state)
+            if footprint is None:
                 return False
-            loop = _tail_lowering(callee, f"""
-                if r3 == 0x0 goto @done
-                r4 = 0x0
-                again:
-                r5 = r1
-                r5 += r4
-                {byte_stores[0]}
-                r4 += 0x1
-                if r3 > r4 goto @again
-                done:
-                exit
-                """)
-            pointer, length = state.get("r1"), state.get("r3")
-            if (loop != callee or not pointer or pointer[0] != "stack"
-                    or not length or length[0] != "constant"):
-                return False
-            address, count = pointer[1], length[1]
+            address, count = footprint
         elif (text.startswith(("if ", "goto ")) or text == "exit"
               or re.fullmatch(r"[rw]\d+ = \*\(u(?:8|16|32|64) \*\)\(r\d+ [+-] 0x[0-9a-f]+\)", text)
               or re.fullmatch(r"[rw]\d+ (?:=|\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>=|s>>=) (?:[rw]\d+|-?0x[0-9a-f]+)(?: ll)?", text)):
@@ -1148,7 +1244,7 @@ def _packed_interface_worker_contract(lines, get_pc, classifier_pc, calls, block
     return _interface_index_slot_preserved(lines, graph, index[-1][0], metadata[1][0], calls, blocks)
 
 
-def _legacy_owned_tail_value(lines, get_pcs, target, upper_bound=False):
+def _legacy_owned_tail_value(lines, get_pcs, target, upper_bound=False, calls=(), blocks=None):
     """Legacy +8 loads and bounds must use the actual direct getter result.
 
     A context load and an unrelated 24-bit constant cannot opt a current-format
@@ -1159,7 +1255,7 @@ def _legacy_owned_tail_value(lines, get_pcs, target, upper_bound=False):
     if not insns or not get_pcs:
         return False
     texts = dict(insns)
-    facts = call_argument_facts(lines)
+    facts = _tail_trusted_facts(lines, calls, blocks) if upper_bound else {}
     start = insns[0][0]
     candidates = []
     for index, (pc, text) in enumerate(insns[:-1]):
@@ -1291,7 +1387,10 @@ def interface_tail_contract(disassembly):
     legacy = (bool(return_gets)
               and discovery_arguments(disassembly, return_name, "get", 0)
               and _legacy_owned_tail_value(return_lines, return_gets, insert_pc)
-              and _legacy_owned_tail_value(worker_lines, reads, worker_classifier_calls[0][2], True))
+              and _legacy_owned_tail_value(
+                  worker_lines, reads, worker_classifier_calls[0][2], True,
+                  [call for call in calls if call[0] == worker_name], blocks,
+              ))
     if not (legacy or (
         _stack_interface_return_contract(return_lines, insert_pc)
         and _packed_interface_worker_contract(

@@ -361,6 +361,42 @@ class DiscoveryFlow(unittest.TestCase):
             with self.subTest(variant=variant, mutation='partial-pointer-clobber'):
                 self.reject(elf, bad, 'interface-name', 'tail')
 
+    def test_worker_pre_slice_saved_pointer_lifetime(self):
+        # Save -0x28 before the masked-index slice, then replace its low word
+        # with -0x60 before the later reload used as memset's destination.
+        changes = {
+            493: 'r1 = r10',
+            494: 'r1 += -0x28',
+            495: '*(u64 *)(r10 - 0x78) = r1',
+            496: 'r1 = r10',
+            497: 'r1 += -0x60',
+            498: '*(u32 *)(r10 - 0x78) = w1',
+            622: 'r1 = *(u64 *)(r10 - 0x78)',
+            623: 'r2 = 0x0',
+            624: 'r3 = 0x1a',
+        }
+        for variant, elf, disassembly in self.objects:
+            text = C.sections(disassembly)
+            _, lines = C.function(text['uretprobe'] + text['.text'], 'interface_list_worker', 'fixture')
+            ops = dict(C.D.instructions(lines))
+            self.assertTrue(C.check_decoded(elf, disassembly, 'interface-name'))
+            changed = disassembly
+            for pc, replacement in changes.items():
+                old, new = instruction_change(lines, (pc, ops[pc]), replacement)
+                changed = change_function(changed, 'interface_list_worker', old, new)
+            partial_line = next(line for line in changed.splitlines()
+                                if C.D.line_pc(line) == 498 and '*(u32 *)(r10 - 0x78) = w1' in line)
+            with self.subTest(variant=variant, control='no-overwrite'):
+                no_store = change_function(changed, 'interface_list_worker', partial_line,
+                                           partial_line.replace('*(u32 *)(r10 - 0x78) = w1', 'r1 = r1'))
+                self.assertTrue(C.check_decoded(elf, no_store, 'interface-name'))
+            with self.subTest(variant=variant, control='recognized-direct-store'):
+                direct = change_function(changed, 'interface_list_worker', partial_line,
+                                         partial_line.replace('= w1', '= r1'))
+                self.reject(elf, direct, 'interface-name', 'tail')
+            with self.subTest(variant=variant, mutation='pre-slice-partial-write'):
+                self.reject(elf, changed, 'interface-name', 'tail')
+
     def test_legacy_bound_follows_loaded_field(self):
         good = C.D._owned_disassembly()
         self.assertTrue(C.D.interface_tail_contract(good))
@@ -384,6 +420,57 @@ class DiscoveryFlow(unittest.TestCase):
         bad = change_function(with_pre_get, 'interface_list_worker', old, new)
         self.assertFalse(C.D.interface_tail_contract(bad))
         self.assertTrue(C.D.interface_tail_contract(with_pre_get))
+
+    def test_legacy_rhs_saved_constant_lifetime(self):
+        good = C.D._owned_disassembly()
+        self.assertTrue(C.D.interface_tail_contract(good))
+        lines = C.D.function_blocks(good)['interface_list_worker']
+        first, = [line for line in lines if C.D.line_pc(line) == 700]
+        prologue = ''.join(f'{pc:8}:\t{op}\n' for pc, op in (
+            (695, 'r2 = 0xffffff'),
+            (696, '*(u64 *)(r10 - 0x40) = r2'),
+            (697, 'r2 = 0xffffffff'),
+            (698, '*(u32 *)(r10 - 0x40) = w2'),
+            (699, 'r9 = *(u64 *)(r10 - 0x40)'),
+        ))
+        self.assertEqual(good.count(first), 1)
+        bad = good.replace(first, prologue + first, 1)
+        bad = change_function(bad, 'interface_list_worker',
+                              '     716:\tif r8 > 0xffffff goto +0x1c',
+                              '     716:\tif r8 > r9 goto +0x1c')
+        self.assertEqual(bad.count('*(u32 *)(r10 - 0x40) = w2'), 1)
+        with self.subTest(control='no-overwrite'):
+            no_store = bad.replace('*(u32 *)(r10 - 0x40) = w2', 'r2 = r2', 1)
+            self.assertTrue(C.D.interface_tail_contract(no_store))
+        with self.subTest(control='recognized-direct-store'):
+            direct = bad.replace('*(u32 *)(r10 - 0x40) = w2',
+                                 '*(u32 *)(r10 - 0x40) = r2', 1)
+            self.assertFalse(C.D.interface_tail_contract(direct))
+        with self.subTest(mutation='partial-rhs-write'):
+            self.assertFalse(C.D.interface_tail_contract(bad))
+
+    def test_tail_consumed_fact_memory_effects(self):
+        _, _, disassembly = self.objects[0]
+        memset = C.D.function_blocks(C.sections(disassembly)['.text'])['memset']
+
+        def facts(destination, writer='call 0x0', target='memset'):
+            lines = [f'{pc:8}:\t{op}' for pc, op in enumerate((
+                'r2 = 0xffffff',
+                '*(u64 *)(r10 - 0x40) = r2',
+                'r1 = r10',
+                f'r1 += {destination}',
+                'r3 = 0x8',
+                writer,
+                'r9 = *(u64 *)(r10 - 0x40)',
+                'exit',
+            ))]
+            calls = [('fixture', 0, 5, target)] if target else []
+            return C.D._tail_trusted_facts(lines, calls, {'memset': memset})[7].get('r9')
+
+        self.assertEqual(facts('-0x20'), ('constant', 0xffffff))
+        self.assertIsNone(facts('-0x40'))
+        self.assertIsNone(facts('-0x20', writer='call 0x7f', target=None))
+        self.assertIsNone(facts('-0x20', writer='*(u32 *)(r7 - 0x0) = w2', target=None))
 
     def test_current_tail_cannot_select_legacy_with_unrelated_markers(self):
         for variant, elf, disassembly in self.objects:

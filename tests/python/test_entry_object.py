@@ -104,6 +104,49 @@ def return_contract(variant, disassembly=None):
     return CHECKER["final_sink_contract"](root, variant, [0x23, 0x33], blocks, calls)
 
 
+
+def consumer_case(variant, suffix, disassembly=None):
+    split = CHECKER["sections"](OBJECTS[variant] if disassembly is None else disassembly)
+    matches = [(section, name, lines) for section in ("uprobe", "uretprobe", ".text")
+               for name, lines in CHECKER["D"].function_blocks(split[section]).items() if name.endswith(suffix)]
+    if len(matches) != 1:
+        raise AssertionError((suffix, len(matches)))
+    section, name, lines = matches[0]
+    text = split[section] + ("\n"+split[".text"] if section != ".text" else "")
+    calls = {pc: target for caller, _, pc, target in CHECKER["D"].internal_call_targets(text) if caller == name}
+    outlined = section == ".text" and name.endswith(("ordinary_return", "object_return"))
+    cls = CHECKER["_ReturnCaller"] if outlined or name == "p11_return" else CHECKER["_SeedCaller"]
+    initial = {"r1": ("context", 0), "r2": ("external_key", ("uretprobe", "p11_return"), 0),
+        "r3": ("owned", 7, 0), "r4": ("scope_flags", ("uretprobe", "p11_return")),
+        "r5": ("constant", 0), "r10": ("stack", 0)} if outlined else None
+    return cls(section, name, lines, calls), initial, CHECKER["D"].function_blocks(split[".text"]), outlined
+
+
+def consumer_contract(variant, suffix, disassembly=None):
+    consumer, initial, blocks, outlined = consumer_case(variant, suffix, disassembly)
+    return CHECKER["consumer_contract"](consumer, variant, blocks, initial, outlined)
+
+
+def entry_role_contract(variant, name, role, disassembly=None):
+    original, _, _, _ = consumer_case(variant, name, disassembly)
+    consumer = CHECKER["_OwnedCaller"](original.section, name, original.lines, original.calls)
+    calls = sorted(pc for pc, target in consumer.calls.items() if target.endswith("capture_scalar"))
+    if len(calls) != 9:
+        raise AssertionError((name, calls))
+    owner = next(pc for pc, target in consumer.calls.items() if target == "p11_owner_start_begin")
+    proof = CHECKER["_OwnedSinkProof"](role, int(name.endswith("ia32")), True, ("owned", owner, 0),
+        calls=dict(zip(calls, (6, 7, 10, 11, 9, 8, 16, "join", "get"))))
+    proof.decoder_required = variant == "unsafe" and role == 8
+    consumer.facts(proof=proof)
+    return proof
+
+
+def mechanism_guard(variant, name):
+    _, insns = instructions(variant, name)
+    store = next(pc for pc, text in insns if re.fullmatch(r"\*\(u64 \*\)\(r[6-9] \+ 0x20\) = r\d+", text))
+    return next((pc, text) for pc, text in reversed(insns) if pc < store and re.fullmatch(r"if r\d+ == 0x0 goto .*", text))
+
+
 def mutate(disassembly, function, pc, old, new, internal_call=False, helper_call=False):
     """Change exactly one decoded instruction, retaining its actual-object origin."""
     symbols = list(re.finditer(r"(?m)^[0-9a-f]+ <([^>]+)>:$", disassembly))
@@ -295,13 +338,20 @@ class EntryObjectTests(unittest.TestCase):
                 register_transfer=lambda pc, state: CHECKER["ia32_register_transfer"](changed[pc], state))
 
     def test_async_string_read_requires_genuine_helper_call_kind(self):
-        for variant, suffix in (("default", "p11_entry"), ("unsafe", "capture_async_target")):
-            name, _ = instructions(variant, suffix)
-            pc = site(variant, name, r"call 0x72")
-            changed = mutate(OBJECTS[variant], name, pc, "call 0x72", "call 0x72", internal_call=True)
-            with self.subTest(variant=variant):
-                with self.assertRaisesRegex(RuntimeError, "async.*(unresolved internal call|genuine helper)"):
-                    CHECKER["contract"](changed, variant)
+        # Select the owning proof so another role's unknown-call footprint
+        # cannot turn an unrelated rejection into apparent async coverage.
+        entry_role_contract("default", "p11_entry", 16)
+        name, _ = instructions("default", "p11_entry")
+        pc = site("default", name, r"call 0x72")
+        with self.assertRaisesRegex(RuntimeError, "async.*genuine helper"):
+            entry_role_contract("default", name, 16, mutate(OBJECTS["default"], name, pc,
+                "call 0x72", "call 0x72", internal_call=True))
+        internal_contract("unsafe", "scalar_body_contract")
+        name, _ = instructions("unsafe", "capture_async_target")
+        pc = site("unsafe", name, r"call 0x72")
+        with self.assertRaisesRegex(RuntimeError, "async.*(unresolved internal call|genuine helper)"):
+            internal_contract("unsafe", "scalar_body_contract", mutate(OBJECTS["unsafe"], name, pc,
+                "call 0x72", "call 0x72", internal_call=True))
 
     def test_global_ia32_reader_retains_stride_span_width_and_linkage(self):
         checker = runpy.run_path(str(Path(__file__).resolve().parents[2] / "scripts/check-bpf-map-defs.py"))
@@ -337,46 +387,41 @@ class EntryObjectTests(unittest.TestCase):
                     checker["validate_ia32_reader"](elf)
 
     def test_async_scalar_failure_preserves_lifecycle_continuation(self):
-        for variant, name, target in (("default", "p11_entry", "capture_scalar"),
-                                      ("unsafe", "p11_entry_ia32", "p11_read_ia32_arg")):
-            # The descriptor-selected async read follows all six base fields.
-            call = call_site(variant, name, target, 6)
+        for variant, name in (("default", "p11_entry"), ("unsafe", "p11_entry_ia32")):
+            entry_contract(variant, name)
+            call = call_site(variant, name, "capture_scalar", 6)
             _, insns = instructions(variant, name)
-            pc, old = next((p, t) for p, t in insns if p > call and t.startswith("if "))
+            pc, old = next((pc, text) for pc, text in insns if pc > call and text.startswith("if "))
             exit_pc = site(variant, name, "exit")
-            if variant == "default":
-                new = old.split(" goto ")[0] + f" goto {exit_pc - pc - 1:+#x}"
-            else:
-                # The sentinel failure is the comparison's fallthrough edge.
-                pc, old = next((p, t) for p, t in insns if p > pc)
-                new = f"goto {exit_pc - pc - 1:+#x}"
-            with self.subTest(variant=variant, pc=pc):
-                with self.assertRaisesRegex(RuntimeError, "async.*continuation"):
-                    CHECKER["contract"](mutate(OBJECTS[variant], name, pc, old, new), variant)
+            # Both Some and None must continue to the lifecycle match.
+            changed = mutate(OBJECTS[variant], name, pc, old,
+                old.split(" goto ")[0]+f" goto {exit_pc-pc-1:+#x}")
+            with self.subTest(variant=variant), self.assertRaisesRegex(RuntimeError, "async.*continuation"):
+                entry_contract(variant, name, changed)
 
     def test_pointer_only_async_boundary_mutations(self):
-        variant = "unsafe"
+        variant, entry = "unsafe", "p11_entry_ia32"
+        internal_contract(variant, "scalar_body_contract")
+        entry_role_contract(variant, entry, 16)
         name, insns = instructions(variant, "capture_async_target")
-        entry = "p11_entry_ia32"
-        cases = [
-            (entry, before_call(variant, entry, "capture_async_target", r"r1 = r0"), "r1 = r7"),
-            (entry, before_call(variant, entry, "capture_async_target", r"r2 \+= -0x128"), "r2 += -0x120"),
-            (name, site(variant, name, r"if r1 s> r0 goto .*"), "r0 = r0"),
-            (name, site(variant, name, r"if r0 s> 0x1c goto .*"), "r0 = r0"),
-        ]
+        cases = [(entry, before_call(variant, entry, "capture_async_target", r"r1 = .*"), "r1 = r10"),
+                 (entry, before_call(variant, entry, "capture_async_target", r"r2 = .*"), "r2 = r10"),
+                 (name, site(variant, name, r"if r1 s> r0 goto .*"), "r0 = r0"),
+                 (name, site(variant, name, r"if r0 s> 0x1c goto .*"), "r0 = r0")]
         for function, pc, new in cases:
-            with self.subTest(function=function, pc=pc):
-                old = dict(instructions(variant, function)[1])[pc]
-                with self.assertRaisesRegex(RuntimeError, "final-sink"):
-                    CHECKER["contract"](mutate(OBJECTS[variant], function, pc, old, new), variant)
-        # Redirect a real helper call to the actual scalar function. This
-        # negative control recreates the prohibited nested responsibility.
+            old = dict(instructions(variant, function)[1])[pc]
+            with self.subTest(function=function, pc=pc), self.assertRaisesRegex(RuntimeError, "final-sink"):
+                changed = mutate(OBJECTS[variant], function, pc, old, new)
+                if function == entry:
+                    entry_role_contract(variant, entry, 16, changed)
+                else:
+                    internal_contract(variant, "scalar_body_contract", changed)
         scalar, scalar_insns = instructions(variant, "capture_scalar")
         pc = site(variant, name, r"call 0x72")
         nested = mutate(OBJECTS[variant], name, pc, "call 0x72",
-                        f"call {scalar_insns[0][0] - pc - 1:#x}", internal_call=True)
+            f"call {scalar_insns[0][0]-pc-1:#x}", internal_call=True)
         with self.assertRaisesRegex(RuntimeError, "async callee reaches scalar/ia32 reader"):
-            CHECKER["contract"](nested, variant)
+            internal_contract(variant, "scalar_body_contract", nested)
 
     def test_async_target_does_not_nest_scalar_capture(self):
         for variant, disassembly in OBJECTS.items():
@@ -504,61 +549,63 @@ class EntryObjectTests(unittest.TestCase):
                                 return_contract(variant, mutate(OBJECTS[variant], name, pc, texts[pc], "r0 = 0x0"))
 
     def test_scalar_index_register_alias(self):
-        pc = before_call("default", "p11_entry", "capture_scalar", r"r3 = r8")
-        changed = mutate(OBJECTS["default"], "p11_entry", pc, "r3 = r8", "w3 = w8")
-        self.assertTrue(CHECKER["contract"](changed, "default")["verified"])
+        entry_contract("default", "p11_entry")
+        pc = before_call("default", "p11_entry", "capture_scalar", r"r3 = r9", 1)
+        changed = mutate(OBJECTS["default"], "p11_entry", pc, "r3 = r9", "w3 = w9")
+        self.assertTrue(entry_contract("default", "p11_entry", changed))
 
     def test_jmp32_cannot_prove_full_pointer_or_address(self):
-        # Low32(0x100000000) is zero. Low32(RSP32 + argument offset)
-        # can also fit the IA32 limit while the complete address overflows.
-        cases = [("default", "p11_entry", site('default', 'p11_entry', 'if\\ r1\\ ==\\ 0x0\\ goto\\ \\+0xe')),
-                 ("unsafe", "p11_entry", site("unsafe", "p11_entry", r"if r7 == 0x0 goto \+0xbd")),
-                 ("default", "capture_scalar", site("default", "capture_scalar", r"if r1 > r0 goto .*")),
-                 ("default", "capture_scalar", site("default", "capture_scalar", r"if r3 > -0x10 goto .*")),
-                 ("unsafe", "capture_scalar", site("unsafe", "capture_scalar", r"if r1 > r0 goto .*")),
-                 ("unsafe", "capture_scalar", site("unsafe", "capture_scalar", r"if r3 > -0x10 goto .*")),
-                 ("unsafe", "p11_entry_ia32", site("unsafe", "p11_entry_ia32", r"if r1 > r0 goto .*", 0))]
-        for variant, suffix, pc in cases:
-            with self.subTest(variant=variant, function=suffix, pc=pc):
-                blocks = CHECKER["D"].function_blocks(OBJECTS[variant])
-                name = next(name for name in blocks if name.endswith(suffix))
-                old = dict(CHECKER["D"].instructions(blocks[name]))[pc]
-                new = re.sub(r"\br(\d+)\b", r"w\1", old)
-                changed = mutate(OBJECTS[variant], name, pc, old, new)
-                with self.assertRaisesRegex(RuntimeError, "branch width 32.*full-width"):
-                    CHECKER["contract"](changed, variant)
+        for variant in OBJECTS:
+            entry_role_contract(variant, "p11_entry", 8)
+            pc, old = mechanism_guard(variant, "p11_entry")
+            with self.subTest(variant=variant, boundary="pointer"), self.assertRaisesRegex(RuntimeError, "branch width 32.*full-width"):
+                entry_role_contract(variant, "p11_entry", 8, mutate(OBJECTS[variant], "p11_entry", pc, old,
+                    re.sub(r"\br(\d+)\b", r"w\1", old)))
+            internal_contract(variant, "scalar_body_contract")
+            for suffix, pattern in (("arg_u64", r"if r3 > -0x9 goto .*"),
+                                    ("arg_u64", r"if r1 >= r3 goto .*"),
+                                    ("p11_read_ia32_arg", r"if r3 > r1 goto .*")):
+                name, insns = instructions(variant, suffix)
+                pc = site(variant, name, pattern)
+                old = dict(insns)[pc]
+                with self.subTest(variant=variant, boundary=suffix, pc=pc), self.assertRaisesRegex(RuntimeError, "full-width|ia32.*span"):
+                    internal_contract(variant, "scalar_body_contract", mutate(OBJECTS[variant], name, pc, old,
+                        re.sub(r"\br(\d+)\b", r"w\1", old)))
 
     def test_full_pointer_branch_restoration(self):
-        for variant, pc in (("default", site("default", "p11_entry", r"if r1 == 0x0 goto \+0xe")),
-                            ("unsafe", site("unsafe", "p11_entry", r"if r7 == 0x0 goto \+0xbd"))):
-            with self.subTest(variant=variant):
-                original = OBJECTS[variant]
-                old = dict(CHECKER["D"].instructions(CHECKER["D"].function_blocks(original)["p11_entry"]))[pc]
-                new = re.sub(r"\br(\d+)\b", r"w\1", old)
-                changed = mutate(original, "p11_entry", pc, old, new)
-                restored = mutate(changed, "p11_entry", pc, new, old)
-                self.assertEqual(restored, original)
-                self.assertTrue(CHECKER["contract"](restored, variant)["verified"])
+        for variant in OBJECTS:
+            pc, old = mechanism_guard(variant, "p11_entry")
+            new = re.sub(r"\br(\d+)\b", r"w\1", old)
+            changed = mutate(OBJECTS[variant], "p11_entry", pc, old, new)
+            with self.assertRaisesRegex(RuntimeError, "branch width 32.*full-width"):
+                entry_role_contract(variant, "p11_entry", 8, changed)
+            restored = mutate(changed, "p11_entry", pc, new, old)
+            self.assertEqual(restored, OBJECTS[variant])
+            self.assertTrue(entry_role_contract(variant, "p11_entry", 8, restored).witnesses)
 
     def test_signed_pointer_sink_causal_pair(self):
-        # Both layouts store signed-positive pointers. A u32 value 0x80000000
-        # is positive in JMP64 but negative in JMP32 and must not lose its sink.
-        for register in ("w0", "r0"):
-            with self.subTest(register=register):
-                changed = OBJECTS["unsafe"]
-                for pc, old, new in (
-                    (site("unsafe", "p11_entry_ia32", r"if r0 == 0x0 goto \+0x1e"), "if r0 == 0x0 goto +0x1e", f"if {register} s> 0x0 goto +0x1"),
-                    (site("unsafe", "p11_entry_ia32", r"\*\(u64 \*\)\(r10 - 0x108\) = r0"), "*(u64 *)(r10 - 0x108) = r0", "goto +0x1d"),
-                    (site("unsafe", "p11_entry_ia32", r"r9 &= 0x8"), "r9 &= 0x8", "*(u64 *)(r10 - 0x108) = r0"),
-                ):
-                    changed = mutate(changed, "p11_entry_ia32", pc, old, new)
-                if register == "w0":
-                    # Uncertain nonzero provenance can fail at the decoder
-                    # boundary before the final insertion is reached.
-                    with self.assertRaisesRegex(RuntimeError, r"final-sink 8: (decoder mechanism field 8 pointer|nonzero pointer predicate not proved|successful capture lost)"):
-                        CHECKER["contract"](changed, "unsafe")
+        name = "p11_entry_ia32"
+        entry_role_contract("unsafe", name, 8)
+        _, insns = instructions("unsafe", name)
+        guard, old = mechanism_guard("unsafe", name)
+        register = CHECKER["BRANCH"].fullmatch(old)[1]
+        original_null = CHECKER["D"].relative_target(guard, old)
+        store, store_text = next((pc, text) for pc, text in insns if pc > guard)
+        landing, landing_text = next((pc, text) for pc, text in insns if pc > store)
+        # Move the real store onto the signed-positive edge. The false edge
+        # retains the original null continuation. JMP64 is exact for u32;
+        # JMP32 loses the obligation for high-bit u32 values.
+        for spelling in ("r", "w"):
+            changed = mutate(OBJECTS["unsafe"], name, guard, old,
+                f"if {spelling+register[1:]} s> 0x0 goto {landing-guard-1:+#x}")
+            changed = mutate(changed, name, store, store_text, f"goto {original_null-store-1:+#x}")
+            changed = mutate(changed, name, landing, landing_text, store_text)
+            with self.subTest(width=spelling):
+                if spelling == "w":
+                    with self.assertRaisesRegex(RuntimeError, "nonzero pointer predicate|decoder mechanism field|successful capture lost"):
+                        entry_role_contract("unsafe", name, 8, changed)
                 else:
-                    self.assertTrue(CHECKER["contract"](changed, "unsafe")["verified"])
+                    self.assertTrue(entry_role_contract("unsafe", name, 8, changed).witnesses)
 
     def test_signed_u32_false_edge_keeps_sink_obligation(self):
         proof = CHECKER["SinkProof"](8, 1, True, ("stack", -0x128))
@@ -635,8 +682,8 @@ class EntryObjectTests(unittest.TestCase):
         async_name = next(name for name in blocks if name.endswith("capture_async_target"))
         cases = [(async_name, site("unsafe", async_name, r"r3 = r1"), "r3 = r7"),
                  (async_name, site("unsafe", async_name, r"r2 = 0x1d"), "r2 = 0x1c"),
-                 (async_name, site("unsafe", async_name, r"\*\(u32 \*\)\(r6 \+ 0x104\) = r1"), "r1 = r1"),
-                 (async_name, site("unsafe", async_name, r"\*\(u32 \*\)\(r6 \+ 0x104\) = r1"), "*(u32 *)(r6 + 0x100) = r1"),
+                 (async_name, site("unsafe", async_name, r"\*\(u32 \*\)\(r6 \+ 0x104\) = [rw]1"), "r1 = r1"),
+                 (async_name, site("unsafe", async_name, r"\*\(u32 \*\)\(r6 \+ 0x104\) = [rw]1"), "*(u32 *)(r6 + 0x100) = w1"),
                  ("p11_entry", call_site("unsafe", "p11_entry", "p11_decode_params"), "r0 = 0x0"),
                  ("p11_entry_template", call_site("unsafe", "p11_entry_template", "p11_decode_params"), "r0 = 0x0")]
         for name, pc, new in cases:

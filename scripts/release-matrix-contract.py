@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import pwd
 import re
+import runpy
 import shutil
 import stat
 import struct
@@ -469,7 +470,22 @@ def canary_commands(work, mode, bits, build_mode):
     return commands
 
 
+def original_build_source(root, name):
+    require(str(root.resolve(strict=True)) == str(root) and root.is_dir(), "invalid original build root")
+    return root / name
+
+
+def build_root(value):
+    require(isinstance(value, str) and Path(value).is_absolute() and str(Path(value)) == value
+            and ".." not in Path(value).parts, "invalid build source-root provenance")
+    return Path(value)
+
+
 def validate_canary_inputs(facts, bundle, candidate, input_uid=None):
+    return _validate_canary_inputs(facts, bundle, candidate, input_uid, original_build_source)
+
+
+def _validate_canary_inputs(facts, bundle, candidate, input_uid, source):
     fields = {"producer", "source_root", "source_revision", "source_tree", "source_clean", "capture_mode",
         "target_bits", "build_mode", "prepared_tools", "release_rust", "build_environment", "builds",
         "artifacts", "runtime_sources", "producer_sources"}
@@ -479,8 +495,7 @@ def validate_canary_inputs(facts, bundle, candidate, input_uid=None):
     for key in ("source_revision", "source_tree"):
         require(isinstance(facts[key], str) and re.fullmatch(r"[0-9a-f]{40}", facts[key])
                 and facts[key] == candidate.get(key), "canary/candidate build source mismatch: " + key)
-    root = Path(facts["source_root"])
-    require(root.is_absolute() and str(root.resolve(strict=True)) == str(root) and root.is_dir(), "invalid canary build root")
+    root = build_root(facts["source_root"])
     mode, bits, build_mode = facts["capture_mode"], facts["target_bits"], facts["build_mode"]
     require(mode in ("full", "p0") and type(bits) is int and bits in (32, 64)
             and build_mode in ("ordinary", "prepared"), "invalid canary build selection")
@@ -492,13 +507,13 @@ def validate_canary_inputs(facts, bundle, candidate, input_uid=None):
     require(isinstance(environment, dict) and set(environment) == set(CANARY_BUILD_ENV)
             and all(value is None or isinstance(value, str) and len(value) <= 8192 for value in environment.values()),
             "invalid canary build environment")
-    require(facts["release_rust"] == (root / ".release-rust-version").read_text().strip(), "canary release compiler changed")
+    require(facts["release_rust"] == source(root, ".release-rust-version").read_text().strip(), "canary release compiler changed")
     for key, expected in (("runtime_sources", CANARY_RUNTIME_SOURCES), ("producer_sources", CANARY_PRODUCER_SOURCES)):
         hashes = facts[key]
         require(isinstance(hashes, dict) and set(hashes) == set(expected), "missing canary source closure: " + key)
         for name, digest in hashes.items():
             require(isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest)
-                    and sha(root / name) == digest, "compiled canary source changed: " + name)
+                    and sha(source(root, name)) == digest, "compiled canary source changed: " + name)
     require(facts["runtime_sources"]["scripts/fixtures/canary_workload.c"] == sha(ROOT / "scripts/fixtures/canary_workload.c"),
             "compiled canary sentinel source differs from scanner input")
     artifacts = facts["artifacts"]
@@ -809,12 +824,15 @@ def expected_paths(contract):
         paths.add("inv-scan.log")
     for name in contract["lib_tests"]:
         paths.add("run/logs/" + name.rsplit("::", 1)[-1] + ".log")
+    for cell in contract["object_cells"]:
+        prefix = f'object/{cell["mode"]}-{cell["target_bits"]}/'
+        paths.update(prefix + name for name in ("run.log", "result.json"))
     return paths
 
 
 def evidence_paths(stage, contract):
     paths = expected_paths(contract)
-    for directory in ("cells", "run", "backend", "c8-native", "c8-scan"):
+    for directory in ("cells", "run", "backend", "c8-native", "c8-scan", "object"):
         for path in (stage / directory).rglob("*"):
             if path.is_file():
                 name = str(path.relative_to(stage))
@@ -852,11 +870,14 @@ def exact_test(text, name):
 
 
 def validate_candidate(receipt, lib):
+    return _validate_candidate(receipt, lib, original_build_source)
+
+
+def _validate_candidate(receipt, lib, source):
     require(isinstance(receipt, dict) and receipt.get("schema") == "p11scope/release-matrix-build/v1", "missing/invalid candidate build receipt")
     require(receipt.get("producer") == "cargo-build" and receipt.get("source_clean") is True,
             "candidate needs a clean actual Cargo build receipt, not a user declaration")
-    root = Path(receipt.get("source_root", ""))
-    require(root.is_absolute() and str(root.resolve()) == str(root) and root.is_dir(), "invalid compiled fixture source root")
+    root = build_root(receipt.get("source_root"))
     for key in ("source_revision", "source_tree"):
         require(isinstance(receipt.get(key), str) and re.fullmatch(r"[0-9a-f]{40}", receipt[key]), "missing exact build " + key)
     build = receipt.get("build", {})
@@ -869,7 +890,7 @@ def validate_candidate(receipt, lib):
     require(isinstance(sources, dict) and set(sources) == set(RUNTIME_SOURCES), "missing candidate runtime fixture closure")
     for name, digest in sources.items():
         require(isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest), "invalid candidate source hash")
-        require(sha(root / name) == digest, "compiled fixture source changed: " + name)
+        require(sha(source(root, name)) == digest, "compiled fixture source changed: " + name)
     return receipt
 
 
@@ -999,6 +1020,30 @@ def boundary_outcome(text):
 
 
 def verify_inputs(stage, contract_path):
+    return _verify_inputs(stage, contract_path, validate_candidate, validate_canary_inputs)
+
+
+def _verify_object_inputs(stage, contract_path):
+    # Only object dispatch selects retained sources. Full launch and judgment
+    # deliberately keep the compiled Rust fixtures' original-root preflight.
+    def retained(prefix):
+        def source(_root, name):
+            path = relative(stage, prefix + name)
+            require(path.is_file() and path == path.resolve(strict=True), "invalid retained source")
+            return path
+        return source
+    def candidate(receipt, lib):
+        return _validate_candidate(receipt, lib, retained("artifacts/lib-source/"))
+    def canary(facts, bundle, candidate_facts, uid):
+        key = f'{facts["capture_mode"]}-{facts["target_bits"]}'
+        return _validate_canary_inputs(facts, bundle, candidate_facts, uid,
+                                      retained(f"artifacts/canary-source/{key}/"))
+    contract = _verify_inputs(stage, contract_path, candidate, canary)
+    require(contract["object_cells"], "retained source resolver requires selected object cells")
+    return contract
+
+
+def _verify_inputs(stage, contract_path, candidate_validator, canary_validator):
     contract = load(contract_path)
     validate_contract(contract)
     bindings = contract.get("bindings")
@@ -1027,14 +1072,14 @@ def verify_inputs(stage, contract_path):
         if name.startswith("artifacts/source/"):
             require(sha(ROOT / name.removeprefix("artifacts/source/")) == digest, "runtime source changed: " + name)
     require(bindings["artifacts/source/scripts/release-matrix-contract.py"] == sha(Path(__file__)), "judge source changed from contract")
-    candidate = validate_candidate(load(stage / "inputs/candidate-build.json"), stage / "artifacts/p11scope-lib")
+    candidate = candidate_validator(load(stage / "inputs/candidate-build.json"), stage / "artifacts/p11scope-lib")
     # Root consumes files staged by the validated nonroot caller. Generic export
     # and prebuilt validation keep their original current-UID-only policy.
     input_uid = contract["run_identity"]["uid"]
     for cell in contract["object_cells"]:
         key = f'{cell["mode"]}-{cell["target_bits"]}'
-        facts = validate_canary_inputs(load_canary_facts(stage / f"inputs/canary-build/{key}.json", input_uid),
-                                       stage / cell["bundle"], candidate, input_uid)
+        facts = canary_validator(load_canary_facts(stage / f"inputs/canary-build/{key}.json", input_uid),
+                                 stage / cell["bundle"], candidate, input_uid)
         require((facts["capture_mode"], facts["target_bits"]) == (cell["mode"], cell["target_bits"]), "selected canary mode/ABI differs from build")
         for name, digest in (facts["runtime_sources"] | facts["producer_sources"]).items():
             require(bindings[f"artifacts/canary-source/{key}/{name}"] == digest, "compiled canary snapshot differs from build")
@@ -1044,9 +1089,220 @@ def verify_inputs(stage, contract_path):
     return contract
 
 
+def object_relative(name):
+    require(isinstance(name, str) and name.startswith("evidence/")
+            and str(Path(name)) == name and ".." not in Path(name).parts,
+            "invalid copied object path")
+    return name
+
+
+def object_file_set(directory):
+    require(directory.is_dir() and directory == directory.resolve(strict=True), "invalid object result directory")
+    names = set()
+    for path in directory.rglob("*"):
+        mode = path.lstat().st_mode
+        require(stat.S_ISREG(mode) or stat.S_ISDIR(mode), "special/symlink object output")
+        if stat.S_ISREG(mode): names.add(path.relative_to(directory).as_posix())
+    return names
+
+
+def object_closure(result, contract, cell, read):
+    """Check copied names and immutable receipt hashes without reopening guest paths."""
+    fields = {"run_id", "mode", "target_bits", "original_work_root", "runner_exit", "rows", "evidence_files"}
+    require(isinstance(result, dict) and set(result) == fields, "invalid object result fields")
+    mode, bits = cell["mode"], cell["target_bits"]
+    require(result["run_id"] == contract["run_id"] and result["mode"] == mode
+            and type(result["target_bits"]) is int and result["target_bits"] == bits,
+            "stale/wrong object result selection")
+    require(type(result["runner_exit"]) is int and result["runner_exit"] == 0, "object runner failed")
+    original = build_root(result["original_work_root"])
+    def copied(path):
+        path = build_root(path)
+        require(path != original and path.is_relative_to(original), "object reference escapes original work root")
+        return object_relative("evidence/" + path.relative_to(original).as_posix())
+    names = {"evidence/matrix-manifest.json", "evidence/privacy-manifest.json"}
+    lane = "object-ia32" if bits == 32 else "object-lp64"
+    rows = result["rows"]
+    require(isinstance(rows, list) and len(rows) == 2, "object result requires both exact siblings")
+    inventory = runpy.run_path(str(ROOT / "scripts/check-bpf-map-defs.py"))["SAFE_MAPS"]
+    for row, role, current in zip(rows, ("complete", "blocked"), (lane, lane + "-blocked")):
+        require(isinstance(row, dict) and set(row) == {"id", "lane", "manifest", "receipt"}, "invalid object row")
+        require(row["id"] == f"object:{mode}:{bits}:{role}" and row["lane"] == current
+                and row["manifest"] == f"evidence/mapdump_manifest_{current}.json", "wrong/duplicate object sibling")
+        manifest_name = object_relative(row["manifest"])
+        manifest = decode(read(manifest_name).decode())
+        require(isinstance(manifest, list) and all(isinstance(item, dict) for item in manifest)
+                and len(manifest) == len(inventory) and {item.get("name") for item in manifest} == set(inventory),
+                "object manifest lacks exact owned map inventory")
+        ids = [item.get("id") for item in manifest]
+        require(all(type(value) is int and value > 0 for value in ids) and len(set(ids)) == len(ids), "invalid/duplicate object map ID")
+        receipts = set()
+        surfaces = {}
+        for item in manifest:
+            snapshot = item.get("snapshot")
+            require(isinstance(snapshot, dict) and set(snapshot) == {"contract", "acquisition_id", "phase", "receipt"}
+                    and snapshot["contract"] == "p11scope/stopped-task-storage/v1" and snapshot["phase"] == "stopped"
+                    and isinstance(snapshot["acquisition_id"], str)
+                    and re.fullmatch(r"[0-9a-f]{32}", snapshot["acquisition_id"]), "invalid object stopped snapshot")
+            receipts.add((copied(snapshot["receipt"]), snapshot["acquisition_id"]))
+            name = (f"evidence/{current}.{item['name']}.raw" if item.get("type") == "ringbuf"
+                    else copied(item.get("file")))
+            require(name not in surfaces.values(), "aliased object map surface")
+            surfaces[item["id"]] = name
+        require(len(receipts) == 1, "conflicting object stopped receipts")
+        receipt_name, acquisition = next(iter(receipts))
+        require(object_relative(row["receipt"]) == receipt_name, "wrong object stopped receipt reference")
+        receipt = decode(read(receipt_name).decode())
+        require(isinstance(receipt, dict) and set(receipt) == {"contract", "acquisition_id", "phase", "lane",
+                "small_state", "expected", "before", "after", "surfaces"}
+                and receipt["contract"] == "p11scope/stopped-task-storage/v1" and receipt["phase"] == "stopped"
+                and receipt["acquisition_id"] == acquisition, "invalid object stopped receipt")
+        recorded = receipt["surfaces"]
+        require(isinstance(recorded, list) and all(isinstance(item, dict) for item in recorded)
+                and len(recorded) == len(surfaces) and {item.get("id") for item in recorded} == set(surfaces),
+                "object receipt surface set differs from manifest")
+        for item in recorded:
+            raw = read(surfaces[item["id"]])
+            require(item.get("acquisition_id") == acquisition and type(item.get("size")) is int
+                    and item["size"] == len(raw) and item.get("sha256") == hashlib.sha256(raw).hexdigest(),
+                    "object stopped surface bytes changed")
+        names.update(surfaces.values())
+        names.update((manifest_name, receipt_name, f"evidence/{current}.ready"))
+        names.update(f"evidence/{current}.{suffix}" for suffix in ("output", "observer.log", "workload.log"))
+    files = result["evidence_files"]
+    require(isinstance(files, list) and all(isinstance(name, str) for name in files)
+            and files == sorted(names), "missing/duplicate/unexpected object copied file")
+    for name in names: read(object_relative(name))
+    return names
+
+
+def object_rows(stage, contract):
+    root = stage / "object"
+    selected = {f'{cell["mode"]}-{cell["target_bits"]}' for cell in contract["object_cells"]}
+    require(not root.exists() or (root.is_dir() and not root.is_symlink()
+            and {path.name for path in root.iterdir()} == selected), "unexpected/missing object cell directory")
+    rows = []
+    for cell in contract["object_cells"]:
+        directory = root / f'{cell["mode"]}-{cell["target_bits"]}'
+        files = object_file_set(directory)
+        result = load(directory / "result.json")
+        names = object_closure(result, contract, cell, lambda name: relative(directory, name).read_bytes())
+        require(files == names | {"run.log", "result.json"}, "object result file closure differs from copied files")
+        log = (directory / "run.log").read_text()
+        for process in ("object_runner", "object_semantic", "object_final"):
+            require(process_exit(log, process, contract["run_id"]) == 0, "object checker/runner failed: " + process)
+        rows.extend({"id": row["id"], "pass": True, "qualification": "positive-coverage",
+                     "detail": "exact prebuilt sibling; guest semantic/final checkers exit0; closed stopped surfaces bound"}
+                    for row in result["rows"])
+    return rows
+
+
+def run_objects(stage, contract_path, work_root):
+    """Execute only the bound eight-input object pilots; never build an input."""
+    launch_policy()
+    if not load(contract_path).get("object_cells"):
+        verify_inputs(stage, contract_path)
+        require(not (stage / "object").exists(), "unselected object output exists")
+        return
+    contract = _verify_object_inputs(stage, contract_path)
+    account = validate_run_identity(contract["run_identity"])
+    def caller(*argv, **kwargs):
+        return subprocess.run(["runuser", "-u", account.pw_name, "--", *map(str, argv)], **kwargs)
+    for flag, expected in (("-u", account.pw_uid), ("-g", account.pw_gid)):
+        result = caller("id", flag, text=True, capture_output=True)
+        require(result.returncode == 0 and result.stdout.strip() == str(expected), "object runner effective identity mismatch")
+    require(caller("sudo", "-n", "true").returncode == 0, "object runner needs noninteractive sudo")
+    require(work_root is not None, "object work root required")
+    work_root = validate_guest_work_root(work_root, account.pw_uid)
+    require(work_root.stat().st_uid == account.pw_uid and not work_root.stat().st_mode & 0o077,
+            "object work root must be caller-owned and private")
+    require(not work_root.is_relative_to(stage) and not stage.is_relative_to(work_root), "object work/input trees overlap")
+    for name in contract["bindings"]:
+        require(caller("test", "-r", stage / name).returncode == 0, "object runner cannot read bound input")
+    output = stage / "object"
+    require(not output.exists() and not output.is_symlink(), "refuse existing object execution output")
+    output.mkdir()
+    source = stage / "artifacts/source"
+    for cell in contract["object_cells"]:
+        mode, bits = cell["mode"], cell["target_bits"]
+        key = f"{mode}-{bits}"
+        directory = output / key
+        directory.mkdir()
+        work = Path(tempfile.mkdtemp(prefix=key + "-", dir=work_root))
+        temporary = work / "tmp"
+        temporary.mkdir(mode=0o700)
+        os.chown(temporary, account.pw_uid, account.pw_gid)
+        os.chown(work, account.pw_uid, account.pw_gid)
+        log_path = directory / "run.log"
+        commands = []
+        with log_path.open("w") as log:
+            def checked(name, argv, as_caller=False):
+                if as_caller:
+                    result = caller(*argv, stdout=log, stderr=subprocess.STDOUT, cwd=source)
+                else:
+                    result = subprocess.run(list(map(str, argv)), stdout=log, stderr=subprocess.STDOUT, cwd=source)
+                log.write(f"{name}_exit={result.returncode}\n"); log.flush()
+                commands.append((name, result.returncode))
+                require(result.returncode == 0, "object command failed: " + name)
+            try:
+                checked("object_runner", ["env", f"P11SCOPE_CANARY_TARGET_BITS={bits}",
+                    f"P11SCOPE_RECEIPT_WORK={work}", f"TMPDIR={temporary}", source / "scripts/verify-canaries.sh",
+                    "--capture-mode", mode, "--prebuilt-dir", stage / cell["bundle"], "--object-pilot"], True)
+                lane = "object-ia32" if bits == 32 else "object-lp64"
+                pids = []
+                for current in (lane, lane + "-blocked"):
+                    roster = load(work / (current + ".ready"))
+                    pid = roster.get("pid")
+                    require(type(pid) is int and pid > 0, "object ready roster lacks actual workload PID")
+                    pids.append(pid)
+                attributes = "present" if mode == "full" else "absent"
+                checked("object_semantic", [sys.executable, "-I", source / "scripts/check-canary-evidence.py",
+                    "--object-attributes", attributes, "--object-starts", work / f"mapdump_manifest_{lane}.json",
+                    work / f"mapdump_manifest_{lane}-blocked.json", work / (lane + ".workload.log"),
+                    work / (lane + "-blocked.workload.log"), *pids, bits])
+                checked("object_final", [sys.executable, "-I", source / "scripts/check-canary-evidence.py",
+                    "--object-attributes", attributes, "--object-pilot", work, bits])
+            finally:
+                log.write(f'matrix_run={contract["run_id"]}\n')
+        require(commands == [("object_runner", 0), ("object_semantic", 0), ("object_final", 0)], "incomplete object command set")
+        # Keep original absolute-path receipts unchanged. The final checkers ran
+        # above while these guest-local paths existed; host judgment verifies
+        # the copied closure, hashes and bound command statuses.
+        checker = runpy.run_path(str(source / "scripts/check-canary-evidence.py"))
+        checker["initialize"](bits)
+        names = {"matrix-manifest.json", "privacy-manifest.json"}
+        rows = []
+        for role, current in (("complete", lane), ("blocked", lane + "-blocked")):
+            manifest_name = f"mapdump_manifest_{current}.json"
+            manifest = load(work / manifest_name)
+            receipt = build_root(manifest[0]["snapshot"]["receipt"])
+            require(receipt.is_relative_to(work), "object receipt escapes work")
+            rows.append({"id": f"object:{mode}:{bits}:{role}", "lane": current,
+                         "manifest": "evidence/" + manifest_name,
+                         "receipt": "evidence/" + receipt.relative_to(work).as_posix()})
+            surfaces = checker["assert_exact_owned_map_inventory"](work, current, checker["initialize"].__globals__["SAFE_MAPS"])
+            names.update(path.relative_to(work).as_posix() for path in checker["final_lane_artifacts"](work, current, surfaces))
+            names.add(current + ".ready")
+        result = {"run_id": contract["run_id"], "mode": mode, "target_bits": bits, "original_work_root": str(work),
+                  "runner_exit": 0, "rows": rows, "evidence_files": ["evidence/" + name for name in sorted(names)]}
+        def original(name):
+            path = work / object_relative(name).removeprefix("evidence/")
+            require(path == path.resolve(strict=True) and path.is_file(), "special/symlink original object output")
+            return path
+        object_closure(result, contract, cell, lambda name: original(name).read_bytes())
+        for name in result["evidence_files"]:
+            destination = relative(directory, name)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            copy_guest_file(original(name), destination)
+        _verify_object_inputs(stage, contract_path)
+        object_closure(result, contract, cell, lambda name: relative(directory, name).read_bytes())
+        require(object_file_set(directory) == set(result["evidence_files"]) | {"run.log"}, "object copy closure differs")
+        save(directory / "result.json", result)
+    object_rows(stage, contract)
+
+
 def judge(stage, contract_path):
     contract = verify_inputs(stage, contract_path)
-    require(not contract["object_cells"], "selected object execution is not activated; prepared inputs alone do not qualify")
     receipt = load(stage / "receipt.json")
     require(receipt.get("schema") == "p11scope/release-matrix-execution/v1", "unknown execution receipt")
     require(receipt.get("run_id") == contract["run_id"] and receipt.get("contract_sha256") == sha(contract_path), "stale execution/contract hash")
@@ -1133,6 +1389,7 @@ def judge(stage, contract_path):
         require(len(denial) == 1, "5.15 lane requires the executed denial selector")
         row("identity:5.15-denied", denial[0]["qualification"],
             "guest refusal disclosed: " + denial[0]["detail"])
+    rows.extend(object_rows(stage, contract))
     require(len(rows) == len(contract["required_ids"]) and {r["id"] for r in rows} == set(contract["required_ids"]), "missing/duplicate/unexpected required ID")
     nonqual = any(r["qualification"] == "nonqualifying" for r in rows)
     return {"schema": "p11scope/release-matrix-verdict/v1", "claim": contract["claim"], "lane": contract["lane"],
@@ -1165,6 +1422,7 @@ def main(argv=None):
     modes.add_argument("--verify-inputs", type=Path)
     modes.add_argument("--verify-launch-policy", action="store_true")
     modes.add_argument("--guest-environment", type=Path)
+    modes.add_argument("--run-objects", type=Path)
     modes.add_argument("--check-work-root", type=Path)
     modes.add_argument("--copy-file", nargs=2, type=Path, metavar=("SOURCE", "DESTINATION"))
     modes.add_argument("--copy-tree", nargs=3, metavar=("KIND", "SOURCE", "DESTINATION"))
@@ -1173,6 +1431,7 @@ def main(argv=None):
     parser.add_argument("--lane", default="host")
     parser.add_argument("--kernel")
     parser.add_argument("--guest-work-root", type=Path, default=Path("/var/tmp/p11scope-ws-tmp"))
+    parser.add_argument("--object-work-root", type=Path)
     parser.add_argument("--module")
     parser.add_argument("--lib-test", action="append")
     parser.add_argument("--public-cell", action="append")
@@ -1210,9 +1469,12 @@ def main(argv=None):
         if args.prepare:
             prepare(args)
             return 0
-        stage = (args.seal or args.judge or args.verify_inputs or args.guest_environment).resolve()
+        stage = (args.seal or args.judge or args.verify_inputs or args.guest_environment or args.run_objects).resolve()
         require(args.contract is not None, "--contract required")
         require(args.contract.resolve() == (stage / "contract.json").resolve(), "contract must be the execution copy inside stage")
+        if args.run_objects:
+            run_objects(stage, args.contract, args.object_work_root)
+            return 0
         if args.guest_environment:
             guest_environment(stage, args.contract)
             return 0

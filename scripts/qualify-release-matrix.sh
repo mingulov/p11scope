@@ -6,6 +6,7 @@
 #   qualify-release-matrix.sh --rev REV [--kernels "K1 K2..."] [options]
 #   qualify-release-matrix.sh --bin-dir DIR --rev REV [--kernels ...]
 #   qualify-release-matrix.sh --dry-run [--rev REV] [--kernels ...]
+#   --object-input full|p0 32|64 ABS_DIR selects one prebuilt object pair.
 #   qualify-release-matrix.sh --self-test   (hermetic: no vng, kernels or privilege; runs in hosted CI)
 #   qualify-release-matrix.sh --preflight   (this host: vng, kernel caches, stage and lock dirs)
 #
@@ -46,6 +47,7 @@ KERNELS_SUPPLIED=0
 JUDGE_STAGE=""
 WRITE_STAGE=""
 CONTRACT=""
+OBJECT_ARGS=()
 CHECKER=$REPO/scripts/release-matrix-contract.py
 
 usage() {
@@ -104,6 +106,9 @@ while [ $# -gt 0 ]; do
     --out-base) OUT_BASE=$2; shift 2 ;;
     --stage-base) STAGE_BASE=$2; shift 2 ;;
     --guest-work-root) GUEST_WORK_ROOT=$2; shift 2 ;;
+    --object-input)
+      [ "$#" -ge 4 ] || { echo '--object-input requires MODE BITS ABS_DIR' >&2; exit 2; }
+      OBJECT_ARGS+=(--object-input "$2" "$3" "$4"); shift 4 ;;
     --dry-run) DRY_RUN=1; shift ;;
     --self-test) SELF_TEST=1; shift ;;
     --preflight) PREFLIGHT=1; shift ;;
@@ -112,6 +117,13 @@ while [ $# -gt 0 ]; do
     *) POS_KERNELS+=("$1"); shift ;;
   esac
 done
+
+if [ "${#OBJECT_ARGS[@]}" -gt 0 ]; then
+  object_plan=$(python3 -I "$CHECKER" --plan --lane host "${OBJECT_ARGS[@]}") || {
+    printf '%s\n' "$object_plan"; exit 1;
+  }
+  unset object_plan
+fi
 
 if [ -n "$JUDGE_STAGE" ]; then
   [ -n "$CONTRACT" ] || { echo '--contract required' >&2; exit 1; }
@@ -166,8 +178,14 @@ print_plan() {
   for k in "${KERNELS[@]}"; do
     echo "  $k tag=$(tag_for_kernel "$k") PID=proof-dependent system=independent-functional-link-proof"
     lane=$(tag_for_kernel "$k"); lane=${lane#v}
-    python3 -I "$CHECKER" --plan --lane "$lane" || return 1
+    python3 -I "$CHECKER" --plan --lane "$lane" "${OBJECT_ARGS[@]}" || return 1
   done
+  if [ "${#OBJECT_ARGS[@]}" -gt 0 ]; then
+    for ((i=0; i<${#OBJECT_ARGS[@]}; i+=4)); do
+      printf 'object input mode=%s target_bits=%s directory=%s\n' \
+        "${OBJECT_ARGS[i+1]}" "${OBJECT_ARGS[i+2]}" "${OBJECT_ARGS[i+3]}"
+    done
+  fi
   echo "public contention: THREADS=12; libtest threads=1"
   echo "binaries: $([ -n "$BIN_DIR" ] && echo "bin-dir $BIN_DIR" || echo "build --rev $REV from $REPO")"
 }
@@ -249,6 +267,14 @@ PYARGS
 ) || return 1
   mapfile -t selectors <<< "$names"
   printf -v selector_words '%q ' "${selectors[@]}"
+  {
+    echo '#!/bin/bash'
+    echo 'set -eu'
+    printf 'STAGE=%q\n' "$stage"
+    echo '[ "$#" = 1 ] || exit 1'
+    echo 'exec python3 -I "$STAGE/artifacts/source/scripts/release-matrix-contract.py" --run-objects "$STAGE" --contract "$STAGE/contract.json" --object-work-root "$1"'
+  } > "$stage/object-inner.sh"
+  chmod 0755 "$stage/object-inner.sh"
   {
     echo '#!/bin/bash'
     echo 'set -uo pipefail'
@@ -368,6 +394,7 @@ if [ -x "$WORK/qual/cells/fix/gated" ] && [ -f "$MODULE" ]; then
   backend_probe sys || true
   python3 -I "$R/scripts/release-matrix-contract.py" --copy-tree plain "$WORK/backend" "$STAGE/backend" || exit 1
 fi
+bash "$STAGE/object-inner.sh" "$WORK/caller" || exit 1
 date -u +%Y-%m-%dT%H:%M:%SZ > "$STAGE/guest-end.txt"
 python3 -I "$R/scripts/release-matrix-contract.py" --seal "$STAGE" --contract "$STAGE/contract.json" --guest-exit 0 || exit 1
 python3 -I "$R/scripts/release-matrix-contract.py" --judge "$STAGE" --contract "$STAGE/contract.json" > "$STAGE/guest-verdict.json"
@@ -527,7 +554,7 @@ run_one() {
   python3 -I "$CHECKER" --prepare "$stage" --lane "$lane" --kernel "$k" --guest-work-root "$GUEST_WORK_ROOT" --bin-dir "$BIN_OUT" \
     --candidate-receipt "$CANDIDATE_RECEIPT" \
     --binary-list "$STAGE_REV/candidate-ignored.txt" --curation "$STAGE_REV/curation.txt" \
-    --bpfmulti-list "$STAGE_REV/bpfmulti-list.txt" > "$stage/preparation.json" || return 1
+    --bpfmulti-list "$STAGE_REV/bpfmulti-list.txt" "${OBJECT_ARGS[@]}" > "$stage/preparation.json" || return 1
   write_inner "$stage" || return 1
   wait_quiet
   start=$(date +%s)

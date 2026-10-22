@@ -1116,6 +1116,145 @@ class MatrixContract(unittest.TestCase):
                 self.assertIn("unknown external sudo operation", result.stderr)
         self.assertFalse(marker.exists())
 
+    def test_object_inventory_adapter_binds_staged_checker_tuple_path_and_bytes(self):
+        _, stage = self.retained_object_inputs()
+        contract_path = stage / "contract.json"
+        contract = json.loads(contract_path.read_text())
+        source = stage / "artifacts/source"
+        checker = source / "scripts/check-bpf-map-defs.py"
+        payload = stage / "artifacts/canary/full-64/default-ebpf"
+        original_payload = payload.read_bytes()
+        controls = self.base / "inventory adapter"; controls.mkdir()
+        config_path = controls / "control.json"
+        value = {"events": str(controls / "events.jsonl"), "source_root": str(source), "stage": str(stage),
+                 "failure": "", "inventory_inputs": [{"mode": "full", "target_bits": 64, "path": str(payload),
+                     "sha256": contract["bindings"][payload.relative_to(stage).as_posix()]}]}
+        config_path.write_text(json.dumps(value))
+        wrapper = controls / "python3"
+        wrapper.write_text("#!" + sys.executable + "\n" + OBJECT_EXTERNALS); wrapper.chmod(0o755)
+        env = os.environ.copy()
+        env.update(P11SCOPE_OBJECT_CONTROL=str(config_path), P11SCOPE_CANARY_TARGET_BITS="64")
+        argv = ["-I", "scripts/check-bpf-map-defs.py", "--inventory", "default", str(payload)]
+        def run(arguments, selected_env=env):
+            return subprocess.run([str(wrapper), *arguments], cwd=source, env=selected_env,
+                                  text=True, capture_output=True, timeout=5)
+        healthy = run(argv)
+        self.assertEqual(healthy.returncode, 0, healthy.stdout + healthy.stderr)
+        self.assertIn("controlled inventory preflight mode=full target_bits=64 exit=0", healthy.stdout)
+        self.assertNotIn("inventory default: maps=", healthy.stdout)
+        value["failure"] = "inventory"; config_path.write_text(json.dumps(value))
+        failed = run(argv)
+        self.assertEqual(failed.returncode, 42, failed.stdout + failed.stderr)
+        value["failure"] = ""; config_path.write_text(json.dumps(value))
+        foreign = controls / "foreign-ebpf"; foreign.write_bytes(original_payload)
+        for case in ("foreign_path", "wrong_variant", "extra_argument", "wrong_width", "changed_bytes",
+                     "changed_binding", "changed_checker", "foreign_checker", "symlink"):
+            with self.subTest(case=case):
+                arguments, selected_env = list(argv), env.copy()
+                before_checker = checker.read_bytes()
+                changed_contract = json.loads(json.dumps(contract))
+                if case == "foreign_path": arguments[-1] = str(foreign)
+                elif case == "wrong_variant": arguments[-2] = "diagnostic"
+                elif case == "extra_argument": arguments.append("extra")
+                elif case == "wrong_width": selected_env["P11SCOPE_CANARY_TARGET_BITS"] = "32"
+                elif case == "changed_bytes": payload.write_bytes(original_payload + b"changed")
+                elif case == "changed_binding":
+                    changed_contract["bindings"][payload.relative_to(stage).as_posix()] = "0" * 64
+                    contract_path.write_text(json.dumps(changed_contract))
+                elif case == "changed_checker": checker.write_bytes(before_checker + b"\n# altered staged checker\n")
+                elif case == "foreign_checker": arguments[1] = str(ROOT / "scripts/check-bpf-map-defs.py")
+                elif case == "symlink": payload.unlink(); payload.symlink_to(foreign)
+                refused = run(arguments, selected_env)
+                self.assertEqual(refused.returncode, 94, refused.stdout + refused.stderr)
+                self.assertIn("refused controlled inventory preflight", refused.stderr)
+                if payload.is_symlink(): payload.unlink()
+                payload.write_bytes(original_payload)
+                checker.write_bytes(before_checker)
+                contract_path.write_text(json.dumps(contract))
+        ordinary = run(["-I", "-c", "import sys; print('ordinary forward'); raise SystemExit(23)"])
+        self.assertEqual(ordinary.returncode, 23, ordinary.stdout + ordinary.stderr)
+        self.assertEqual(ordinary.stdout, "ordinary forward\n")
+        ordinary_data = run(["-I", "-c", "import sys; print(sys.argv[1]); raise SystemExit(23)", "check-bpf-map-defs.py"])
+        self.assertEqual(ordinary_data.returncode, 23, ordinary_data.stdout + ordinary_data.stderr)
+        self.assertEqual(ordinary_data.stdout, "check-bpf-map-defs.py\n")
+        child = subprocess.Popen([sys.executable, "-I", "-c", "import time; time.sleep(30)"])
+        try:
+            generation = Path(f"/proc/{child.pid}/stat").read_text().rsplit(") ", 1)[1].split()[19]
+            helper = source / "scripts/lane-lib-oracle-1.py"
+            signaled = run(["-I", str(helper), "TERM", str(child.pid), generation])
+            self.assertEqual(signaled.returncode, 0, signaled.stdout + signaled.stderr)
+            self.assertEqual(child.wait(timeout=5), -15)
+            self.assertFalse(Path(f"/proc/{child.pid}").exists())
+            rows = [json.loads(line) for line in Path(value["events"]).read_text().splitlines()]
+            terms = [row for row in rows if row["kind"] == "signal"]
+            self.assertEqual([(row["pid"], row["signal"]) for row in terms], [(child.pid, "TERM")])
+            self.assertEqual(terms[0]["helper"], str(helper))
+            self.assertEqual(hashlib.sha256(helper.read_bytes()).hexdigest(),
+                             contract["bindings"][helper.relative_to(stage).as_posix()])
+        finally:
+            if child.poll() is None: child.terminate()
+            child.wait(timeout=5)
+
+    def test_failed_object_acquisition_preflight_publishes_no_rows_or_workload(self):
+        # No native class setup/build: each failure is before any workload can
+        # execute, using the same actual generated shell and external adapter.
+        fixture = NativeObjectMatrix()
+        fixture.scene, fixture.base = self, self.base
+        _, stage, work, cwd, env, config_path = fixture.object_stage((("full", 64),), native_inputs=None)
+        for failure in ("refusal", "inventory"):
+            with self.subTest(failure=failure):
+                value = json.loads(config_path.read_text()); value["failure"] = failure
+                config_path.write_text(json.dumps(value))
+                result = fixture.dispatch(stage, work, cwd, env)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("controlled " + ("refusal acquisition" if failure == "refusal" else "inventory preflight"), result.stderr)
+                self.assertIn("object_runner_exit=42", result.stderr)
+                self.assertFalse(list((stage / "object").rglob("result.json")))
+                self.assertFalse(list(work.glob("*/object-*.ready")))
+                events = [json.loads(line) for line in Path(value["events"]).read_text().splitlines()]
+                self.assertFalse(any(row["kind"] in ("capture", "compiler", "signal") for row in events))
+                shutil.rmtree(stage / "object")
+
+    def test_object_wire_fixture_composition_passes_real_semantic_and_final_checkers(self):
+        # Serialized acquisition fixtures only: these PIDs are literal wire
+        # identities. Native dispatch/custody is a separate required control.
+        objects = runpy.run_path(str(ROOT / "tests/python/test_canary_object.py"))
+        templates = self.base / "wire templates"; templates.mkdir()
+        NativeObjectMatrix().acquisition_templates(templates)
+        acquire = self.base / "wire acquisition.py"; acquire.write_text(OBJECT_ACQUISITION)
+        config = self.base / "wire controls.json"
+        config.write_text(json.dumps({"templates": str(templates), "events": str(self.base / "wire events.jsonl"), "failure": ""}))
+        env = dict(os.environ, P11SCOPE_OBJECT_CONTROL=str(config))
+        for mode in ("full", "p0"):
+            for bits in (32, 64):
+                with self.subTest(mode=mode, bits=bits):
+                    work = self.base / f"wire {mode}-{bits}"; work.mkdir()
+                    lane = "object-ia32" if bits == 32 else "object-lp64"
+                    for blocked, pid in ((False, 4343), (True, 4242)):
+                        current = lane + ("-blocked" if blocked else "")
+                        roster = {"pid": pid, "tasks": [{"role": "worker", "call_index": index, "tid": 1001 + index}
+                                                       for index in range(4)]}
+                        (work / (current + ".ready")).write_text(json.dumps(roster))
+                        text = ("P11SCOPE_OBJECT_POINTERS " + json.dumps(objects["ObjectSideRowTests"].POINTERS) + "\n"
+                                if blocked else objects["ledger_text"]())
+                        (work / (current + ".workload.log")).write_text(text)
+                        (work / (current + ".done")).touch()
+                        argv = [sys.executable, "-I", str(acquire), "--lane", current, "--target-bits", str(bits),
+                            "--object-attributes", "present" if mode == "full" else "absent", "--out-dir", str(work),
+                            "--workload-pid", str(pid)]
+                        for flag, suffix in (("--ready", "ready"), ("--go", "go"), ("--done", "done"), ("--finish", "finish"),
+                                             ("--workload-log", "workload.log"), ("--observer-log", "observer.log")):
+                            argv.extend((flag, str(work / (current + "." + suffix))))
+                        result = subprocess.run(argv, env=env, text=True, capture_output=True, timeout=5)
+                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    checker = runpy.run_path(str(ROOT / "scripts/check-canary-evidence.py"))
+                    checker["initialize"](bits)
+                    checker["set_object_attributes"]("present" if mode == "full" else "absent")
+                    checker["assert_object_starts"](str(work / f"mapdump_manifest_{lane}.json"),
+                        str(work / f"mapdump_manifest_{lane}-blocked.json"), str(work / (lane + ".workload.log")),
+                        str(work / (lane + "-blocked.workload.log")), 4343, 4242, bits)
+                    checker["assert_object_pilot"](work, bits)
+
     def test_guest_root_verifies_bound_caller_owned_object_inputs(self):
         bundle, facts = self.canary_inputs()
         stage = self.base / "caller owned guest inputs"
@@ -1678,11 +1817,69 @@ class MatrixContract(unittest.TestCase):
 
 
 OBJECT_EXTERNALS = r'''
-import json, os, pathlib, pwd, sys
+import hashlib, json, os, pathlib, pwd, stat, sys
 config = json.loads(pathlib.Path(os.environ["P11SCOPE_OBJECT_CONTROL"]).read_text())
 kind, args = pathlib.Path(sys.argv[0]).name, sys.argv[1:]
 def record(row):
     with open(config["events"], "a") as stream: stream.write(json.dumps(row) + "\n")
+if kind == "python3":
+    def digest(path):
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            assert stat.S_ISREG(info.st_mode) and 0 < info.st_size <= 64 * 1024 * 1024
+            return hashlib.file_digest(stream, "sha256").hexdigest()
+    def bound_script(name):
+        stage = pathlib.Path(config["stage"])
+        source = pathlib.Path(config["source_root"])
+        script = pathlib.Path(args[1])
+        assert script.resolve(strict=True) == source / "scripts" / name
+        contract = json.loads((stage / "contract.json").read_text())
+        assert digest(script) == contract["bindings"][f"artifacts/source/scripts/{name}"]
+        return stage, script, contract
+    script_index = 1 if args[:1] == ["-I"] else 0
+    if len(args) > script_index and pathlib.Path(args[script_index]).name == "check-bpf-map-defs.py":
+        try:
+            assert len(args) == 5 and args[0] == "-I" and args[2:4] == ["--inventory", "default"]
+            stage, script, contract = bound_script("check-bpf-map-defs.py")
+            selected = [item for item in config["inventory_inputs"] if item["path"] == args[4]]
+            assert len(selected) == 1
+            selected = selected[0]
+            mode, bits = selected["mode"], selected["target_bits"]
+            assert mode in ("full", "p0") and type(bits) is int and bits in (32, 64)
+            assert os.environ.get("P11SCOPE_CANARY_TARGET_BITS") == str(bits)
+            cells = [cell for cell in contract["object_cells"] if (cell["mode"], cell["target_bits"]) == (mode, bits)]
+            assert len(cells) == 1
+            payload = stage / cells[0]["bundle"] / "default-ebpf"
+            assert str(payload) == args[4] and payload.resolve(strict=True) == payload
+            expected = selected["sha256"]
+            assert digest(payload) == expected == contract["bindings"][payload.relative_to(stage).as_posix()]
+            facts_path = stage / f"inputs/canary-build/{mode}-{bits}.json"
+            assert digest(facts_path) == contract["bindings"][facts_path.relative_to(stage).as_posix()]
+            facts = json.loads(facts_path.read_text())
+            assert (facts["capture_mode"], facts["target_bits"]) == (mode, bits)
+            assert facts["artifacts"]["default-ebpf"]["sha256"] == expected
+        except (AssertionError, OSError, KeyError, TypeError, ValueError):
+            print("refused controlled inventory preflight", file=sys.stderr)
+            raise SystemExit(94)
+        status = 42 if config["failure"] == "inventory" else 0
+        record({"kind": "inventory_preflight", "mode": mode, "target_bits": bits, "path": str(payload),
+                "sha256": expected, "fixture_controlled": True, "exit": status})
+        print(f"controlled inventory preflight mode={mode} target_bits={bits} exit={status}; no BPF validity claim")
+        raise SystemExit(status)
+    if len(args) >= 2 and pathlib.Path(args[1]).name == "lane-lib-oracle-1.py":
+        try:
+            assert args[0] == "-I" and len(args) in (5, 6)
+            stage, script, contract = bound_script("lane-lib-oracle-1.py")
+            body = args[2:]
+            assert body[0] in ("TERM", "KILL") and all(value.isdecimal() and int(value) > 0 for value in body[1:])
+        except (AssertionError, OSError, KeyError, TypeError, ValueError):
+            raise SystemExit(94)
+        record({"kind": "signal", "signal": body[0], "pid": int(body[1]), "generation": int(body[2]),
+                "real_uid": os.getuid(), "helper": str(script.resolve())})
+    # Everything else, including the real semantic/final scanners, keeps the
+    # original interpreter argv, standard streams, environment and status.
+    os.execv(sys.executable, [sys.executable, *args])
 if kind in ("gcc", "clang", "clang-18", "cargo", "rustc", "cc"):
     record({"kind": "compiler", "name": kind, "argv": args}); raise SystemExit(91)
 if kind == "findmnt": print("btrfs"); raise SystemExit(0)
@@ -1783,7 +1980,7 @@ else:
     starts, sides = [], []
     for index, pair in enumerate(wire["blocked"]):
         start, side = bytearray.fromhex(pair["start"]), bytearray.fromhex(pair["side"])
-        key = list(struct.pack("<QII", (pid << 32) | workers[index], 3, 0))
+        key = [f"0x{byte:02x}" for byte in struct.pack("<QII", (pid << 32) | workers[index], 3, 0)]
         if index == 0: struct.pack_into("<Q", side, 48, pointers["out_create"])
         elif index == 1: struct.pack_into("<QQ", side, 48, pointers["out_pub"], pointers["out_priv"])
         elif index == 2:
@@ -1795,8 +1992,8 @@ else:
         if attributes == "absent":
             side[352:424] = bytes(72)
             if index == 3: side[64:80] = bytes(16); side[96:352] = bytes(256); side[430] = 0
-        starts.append({"key": key, "value": list(start)})
-        sides.append({"key": key, "value": list(side)})
+        starts.append({"key": key, "value": [f"0x{byte:02x}" for byte in start]})
+        sides.append({"key": key, "value": [f"0x{byte:02x}" for byte in side]})
     pathlib.Path(item("START")["file"]).write_text(json.dumps(starts))
     pathlib.Path(item("OBJECT_START")["file"]).write_text(json.dumps(sides))
     if config["failure"] == "final":
@@ -1910,22 +2107,26 @@ int main(int argc, char **argv) {
                 capture["validate_canary"](lane, report, bits)
                 (root / (lane + ".output")).write_text(json.dumps(report))
 
-    def object_stage(self, cells):
-        repo, stage = self.scene.retained_object_inputs(cells, self.native)
+    def object_stage(self, cells, *, native_inputs):
+        repo, stage = self.scene.retained_object_inputs(cells, native_inputs)
         result = command(str(RUNNER), "--write-inner-stage", str(stage), "--contract", str(stage / "contract.json"))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         controls = self.base / "external controls"; controls.mkdir()
         self.acquisition_templates(controls)
         events = controls / "events.jsonl"
         config = controls / "control.json"
-        config.write_text(json.dumps({"events": str(events), "templates": str(controls),
-            "source_root": str(stage / "artifacts/source"), "work_root": str(self.base / "caller object work"), "failure": ""}))
+        bindings = json.loads((stage / "contract.json").read_text())["bindings"]
+        config.write_text(json.dumps({"events": str(events), "templates": str(controls), "stage": str(stage),
+            "source_root": str(stage / "artifacts/source"), "work_root": str(self.base / "caller object work"),
+            "inventory_inputs": [{"mode": mode, "target_bits": bits,
+                "path": str(stage / f"artifacts/canary/{mode}-{bits}/default-ebpf"),
+                "sha256": bindings[f"artifacts/canary/{mode}-{bits}/default-ebpf"]} for mode, bits in cells], "failure": ""}))
         acquire = controls / "acquire.py"
         acquire.write_text(OBJECT_ACQUISITION)
         dispatch = controls / "dispatch.py"
         dispatch.write_text("#!" + sys.executable + "\n" + OBJECT_EXTERNALS)
         dispatch.chmod(0o755)
-        for name in ("sudo", "runuser", "findmnt", "bpftool", "gcc", "clang", "clang-18", "cargo", "rustc", "cc"):
+        for name in ("python3", "sudo", "runuser", "findmnt", "bpftool", "gcc", "clang", "clang-18", "cargo", "rustc", "cc"):
             (controls / name).symlink_to(dispatch.name)
         work = self.base / "caller object work"; work.mkdir(mode=0o700)
         unrelated = self.base / "unrelated object cwd"; unrelated.mkdir()
@@ -1943,7 +2144,7 @@ int main(int argc, char **argv) {
 
     def test_generated_inner_runs_selected_prebuilt_object_pairs(self):
         cells = [(mode, bits) for mode in ("full", "p0") for bits in (32, 64)]
-        _, stage, work, cwd, env, config_path = self.object_stage(cells)
+        _, stage, work, cwd, env, config_path = self.object_stage(cells, native_inputs=self.native)
         bindings = json.loads((stage / "contract.json").read_text())["bindings"]
         before = {name: hashlib.sha256((stage / name).read_bytes()).hexdigest() for name in bindings}
         result = self.dispatch(stage, work, cwd, env)
@@ -1973,11 +2174,17 @@ int main(int argc, char **argv) {
         self.assertEqual(before, {name: hashlib.sha256((stage / name).read_bytes()).hexdigest() for name in bindings})
 
     def test_generated_inner_object_pair_uses_only_staged_sources(self):
-        repo, stage, work, cwd, env, config_path = self.object_stage((("full", 64),))
+        repo, stage, work, cwd, env, config_path = self.object_stage((("full", 64),), native_inputs=self.native)
         repo.rename(self.base / "unavailable native object source")
         self.assertFalse(repo.exists())
         result = self.dispatch(stage, work, cwd, env)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        events = [json.loads(line) for line in Path(json.loads(config_path.read_text())["events"]).read_text().splitlines()]
+        terms = [row for row in events if row["kind"] == "signal"]
+        self.assertEqual(len(terms), 1)
+        self.assertEqual(terms[0]["signal"], "TERM")
+        self.assertEqual(terms[0]["helper"], str(stage / "artifacts/source/scripts/lane-lib-oracle-1.py"))
+        self.assertFalse(Path(f'/proc/{terms[0]["pid"]}').exists(), "blocked child survived its actual143 wait")
         strict = subprocess.run([sys.executable, "-I", str(stage / "artifacts/source/scripts" / CHECKER.name),
             "--verify-inputs", str(stage), "--contract", str(stage / "contract.json")], cwd=cwd, env=env,
             text=True, capture_output=True, timeout=5)
@@ -1999,7 +2206,7 @@ int main(int argc, char **argv) {
                 self.assertFalse((stage / "object").exists(), "refusal reached object execution")
                 helper.write_bytes(helper_bytes)
                 contract_path.write_text(json.dumps(original))
-        for failure in ("acquisition", "semantic", "final"):
+        for failure in ("refusal", "inventory", "acquisition", "semantic", "final"):
             with self.subTest(failure=failure):
                 value = json.loads(config_path.read_text()); value["failure"] = failure
                 config_path.write_text(json.dumps(value))

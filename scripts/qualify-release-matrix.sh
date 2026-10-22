@@ -7,6 +7,7 @@
 #   qualify-release-matrix.sh --bin-dir DIR --rev REV [--kernels ...]
 #   qualify-release-matrix.sh --dry-run [--rev REV] [--kernels ...]
 #   --object-input full|p0 32|64 ABS_DIR selects one prebuilt object pair.
+#   --guest-disk ABS_IMAGE --guest-disk-uuid UUID uses an existing owned ext4 image.
 #   qualify-release-matrix.sh --self-test   (hermetic: no vng, kernels or privilege; runs in hosted CI)
 #   qualify-release-matrix.sh --preflight   (this host: vng, kernel caches, stage and lock dirs)
 #
@@ -48,6 +49,7 @@ JUDGE_STAGE=""
 WRITE_STAGE=""
 CONTRACT=""
 OBJECT_ARGS=()
+GUEST_DISK_ARGS=()
 CHECKER=$REPO/scripts/release-matrix-contract.py
 
 usage() {
@@ -106,6 +108,9 @@ while [ $# -gt 0 ]; do
     --out-base) OUT_BASE=$2; shift 2 ;;
     --stage-base) STAGE_BASE=$2; shift 2 ;;
     --guest-work-root) GUEST_WORK_ROOT=$2; shift 2 ;;
+    --guest-disk|--guest-disk-uuid)
+      [ "$#" -ge 2 ] && [ -n "$2" ] || { echo 'guest disk option requires a value' >&2; exit 2; }
+      GUEST_DISK_ARGS+=("$1" "$2"); shift 2 ;;
     --object-input)
       [ "$#" -ge 4 ] || { echo '--object-input requires MODE BITS ABS_DIR' >&2; exit 2; }
       OBJECT_ARGS+=(--object-input "$2" "$3" "$4"); shift 4 ;;
@@ -156,6 +161,14 @@ if [ "${#RESOLVED[@]}" -gt 0 ]; then
 fi
 if [ "$SELF_TEST" -eq 0 ] && [ "$PREFLIGHT" -eq 0 ] && [ -z "$WRITE_STAGE" ]; then
   [ "${#KERNELS[@]}" -gt 0 ] || { echo 'empty kernel resolved lane set' >&2; exit 1; }
+fi
+
+# Explicit disk prerequisites precede candidate builds and campaign mutations.
+if [ "${#GUEST_DISK_ARGS[@]}" -gt 0 ]; then
+  have_guest=0
+  for k in "${KERNELS[@]}"; do [ "$k" = host ] || have_guest=1; done
+  [ "$have_guest" -eq 1 ] || { echo 'guest disk requires at least one guest lane' >&2; exit 1; }
+  python3 -I "$CHECKER" --check-guest-disk "${GUEST_DISK_ARGS[@]}" || exit 1
 fi
 
 if [ -z "$REV" ] && [ -z "$BIN_DIR" ] && [ "$DRY_RUN" -eq 0 ] && [ "$SELF_TEST" -eq 0 ] && [ "$PREFLIGHT" -eq 0 ] && [ -z "$WRITE_STAGE" ]; then
@@ -551,10 +564,12 @@ run_one() {
   [ ! -e "$stage" ] && [ ! -e "$out" ] || { echo "refusing existing stage/output: $tag" >&2; return 1; }
   mkdir -p "$stage" "$out" || return 1
   chmod 0755 "$stage" "$out"
+  local -a disk_args=()
+  [ "$k" = host ] || disk_args=("${GUEST_DISK_ARGS[@]}")
   python3 -I "$CHECKER" --prepare "$stage" --lane "$lane" --kernel "$k" --guest-work-root "$GUEST_WORK_ROOT" --bin-dir "$BIN_OUT" \
     --candidate-receipt "$CANDIDATE_RECEIPT" \
     --binary-list "$STAGE_REV/candidate-ignored.txt" --curation "$STAGE_REV/curation.txt" \
-    --bpfmulti-list "$STAGE_REV/bpfmulti-list.txt" "${OBJECT_ARGS[@]}" > "$stage/preparation.json" || return 1
+    --bpfmulti-list "$STAGE_REV/bpfmulti-list.txt" "${OBJECT_ARGS[@]}" "${disk_args[@]}" > "$stage/preparation.json" || return 1
   write_inner "$stage" || return 1
   wait_quiet
   start=$(date +%s)
@@ -563,8 +578,8 @@ run_one() {
     flock "$LOCK" timeout -k 60 "$TIMEOUT" sudo -n env \
       bash "$stage/inner.sh" > "$stage/vng-console.log" 2>&1
   else
-    flock "$LOCK" timeout -k 60 "$TIMEOUT" vng --run "$k" --user root --cpus 4 \
-      --memory 6G --rwdir "$stage" --overlay-rwdir /boot --exec "bash '$stage/inner.sh'" > "$stage/vng-console.log" 2>&1
+    flock "$LOCK" timeout -k 60 "$TIMEOUT" python3 -I "$CHECKER" --launch-guest "$stage" \
+      --contract "$stage/contract.json" --kernel "$k" > "$stage/vng-console.log" 2>&1
   fi
   vng_exit=$?
   end=$(date +%s); wall=$((end-start))

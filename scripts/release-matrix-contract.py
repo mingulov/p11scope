@@ -10,6 +10,7 @@ from pathlib import Path
 import pwd
 import re
 import runpy
+import shlex
 import shutil
 import stat
 import struct
@@ -279,6 +280,189 @@ def validate_guest_work_root(path, runner_uid=None):
     with tempfile.TemporaryFile(dir=path) as probe:
         probe.write(b"p11scope guest disk preflight\n"); probe.flush(); os.fsync(probe.fileno())
     return path
+
+
+def validate_guest_disk_binding(disk):
+    require(isinstance(disk, dict) and set(disk) == {"path", "uuid", "fstype", "device", "inode", "size"},
+            "invalid guest disk binding")
+    path = disk["path"]
+    require(isinstance(path, str) and re.fullmatch(r"/[A-Za-z0-9_./-]+", path)
+            and str(Path(path)) == path and ".." not in Path(path).parts, "unsafe guest disk path")
+    require(isinstance(disk["uuid"], str) and str(uuid.UUID(disk["uuid"])) == disk["uuid"]
+            and disk["fstype"] == "ext4", "invalid guest disk UUID/type")
+    require(all(type(disk[key]) is int and disk[key] > 0 for key in ("device", "inode", "size")),
+            "invalid guest disk file identity")
+    return disk
+
+
+def probe_ext4(path, expected_uuid, allow_other=False):
+    result = subprocess.run(["blkid", "-p", "-o", "export", "--", str(path)], text=True, capture_output=True)
+    if allow_other and result.returncode == 2 and not result.stdout.strip() and not result.stderr.strip():
+        return False  # blkid's explicit no-filesystem result, not a probe error.
+    require(result.returncode == 0, "guest disk filesystem probe failed")
+    facts = {}
+    for line in result.stdout.splitlines():
+        key, sep, value = line.partition("=")
+        require(sep and key not in facts, "invalid guest disk filesystem probe")
+        facts[key] = value
+    require(facts.get("TYPE") or facts.get("PTTYPE"), "missing guest disk filesystem probe identity")
+    if allow_other and facts.get("UUID") != expected_uuid:
+        return False
+    require(facts.get("TYPE") == "ext4" and facts.get("UUID") == expected_uuid
+            and not {"PTTYPE", "PTUUID", "PART_ENTRY_UUID", "PART_ENTRY_SCHEME"} & facts.keys(),
+            "guest disk must be the selected unpartitioned ext4 UUID")
+    return True
+
+
+def guest_disk_input(image, filesystem_uuid):
+    require((image is None) == (filesystem_uuid is None), "guest disk requires paired image and UUID options")
+    if image is None:
+        return None
+    disk = {"path": str(image), "uuid": filesystem_uuid, "fstype": "ext4", "device": 1, "inode": 1, "size": 1}
+    validate_guest_disk_binding(disk)
+    image = Path(image)
+    require(image.is_file(), "guest disk must be an existing regular image")
+    require(image == image.resolve(strict=True), "guest disk path must be canonical without symlinks")
+    for path in (image, *image.parents):
+        info = path.stat()
+        require(info.st_uid in (0, os.getuid()) and (not info.st_mode & 0o022 or
+                (path != image and info.st_mode & stat.S_ISVTX)), "untrusted guest disk path/ancestor")
+    fd = os.open(image, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(fd)
+        require(stat.S_ISREG(info.st_mode) and info.st_size > 0, "guest disk must be an existing writable regular image")
+        disk.update(device=info.st_dev, inode=info.st_ino, size=info.st_size)
+        validate_guest_disk_binding(disk)
+        probe_ext4(image, filesystem_uuid)
+        loops = subprocess.run(["losetup", "--json", "--list", "--associated", str(image), "--output", "NAME"],
+                               text=True, capture_output=True)
+        loop_info = decode(loops.stdout)
+        require(loops.returncode == 0 and isinstance(loop_info, dict)
+                and loop_info.get("loopdevices") == [], "guest disk has a host loop association or cannot be checked")
+        mounted = subprocess.run(["findmnt", "-n", "-o", "SOURCE", "--source", str(image)], text=True, capture_output=True)
+        require(mounted.returncode == 1 and not mounted.stdout.strip(), "guest disk has a host mount association or cannot be checked")
+        after = image.stat()
+        require((after.st_dev, after.st_ino, after.st_size) == (info.st_dev, info.st_ino, info.st_size),
+                "guest disk changed during prerequisite checks")
+    finally:
+        os.close(fd)
+    return disk
+
+
+def launch_guest(stage, contract_path, kernel):
+    contract = verify_inputs(stage, contract_path)
+    require(contract["lane"] != "host" and kernel is not None, "guest launcher requires a guest kernel lane")
+    config, release = guest_boot_config(kernel)
+    require(release == contract["expected_osrelease"] and str(config) == contract["guest_boot_config"]["source"]
+            and sha(config) == contract["guest_boot_config"]["sha256"], "guest launcher kernel/config differs from contract")
+    argv = ["vng", "--run", kernel, "--user", contract["run_identity"]["user"], "--cpus", "4",
+            "--memory", "6G", "--rwdir", str(stage), "--overlay-rwdir", "/boot"]
+    disk = contract.get("guest_disk")
+    if disk is not None:
+        require(guest_disk_input(disk["path"], disk["uuid"]) == disk, "guest disk file identity changed before launch")
+        argv += ["--disk", disk["path"]]
+    argv += ["--exec", shlex.join(["sudo", "-n", "python3", "-I",
+        str(stage / "artifacts/source/scripts/release-matrix-contract.py"), "--run-guest-inner", str(stage),
+        "--contract", str(contract_path)])]
+    return subprocess.run(argv).returncode
+
+
+def mounted_filesystem(path):
+    result = subprocess.run(["findmnt", "--json", "-o", "TARGET,SOURCE,FSTYPE,MAJ:MIN", "--mountpoint", str(path)],
+                            text=True, capture_output=True)
+    if result.returncode == 1 and not result.stdout.strip():
+        return None
+    require(result.returncode == 0, "guest disk mount inspection failed")
+    rows = decode(result.stdout).get("filesystems")
+    require(isinstance(rows, list) and len(rows) == 1 and isinstance(rows[0], dict)
+            and rows[0].get("target") == str(path), "ambiguous guest disk mount")
+    return rows[0]
+
+
+def selected_guest_device(disk):
+    result = subprocess.run(["lsblk", "--json", "--paths", "--nodeps", "-o", "PATH,TYPE,MAJ:MIN"],
+                            text=True, capture_output=True)
+    require(result.returncode == 0, "guest disk device enumeration failed")
+    rows = decode(result.stdout).get("blockdevices")
+    require(isinstance(rows, list), "invalid guest disk device enumeration")
+    selected = []
+    for row in rows:
+        require(isinstance(row, dict), "invalid guest disk device")
+        if row.get("type") != "disk":
+            continue
+        path, number = row.get("path"), row.get("maj:min")
+        require(isinstance(path, str) and re.fullmatch(r"/dev/[A-Za-z0-9_./-]+", path)
+                and ".." not in Path(path).parts and isinstance(number, str) and re.fullmatch(r"[0-9]+:[0-9]+", number),
+                "invalid guest disk device identity")
+        info = Path(path).stat()
+        require(stat.S_ISBLK(info.st_mode) and number == f"{os.major(info.st_rdev)}:{os.minor(info.st_rdev)}",
+                "guest disk enumeration differs from actual block device")
+        if probe_ext4(path, disk["uuid"], allow_other=True):
+            selected.append({"path": path, "number": number, "device": info.st_rdev})
+    require(len(selected) == 1, "guest disk UUID/type must identify exactly one whole block device")
+    return selected[0]
+
+
+def verify_guest_disk_mount(root, device):
+    row = mounted_filesystem(root)
+    require(row is not None and row.get("fstype") == "ext4" and row.get("maj:min") == device["number"],
+            "guest disk mounted filesystem identity mismatch")
+    source = row.get("source")
+    require(isinstance(source, str) and re.fullmatch(r"/dev/[A-Za-z0-9_./-]+", source)
+            and ".." not in Path(source).parts, "invalid guest disk mount source")
+    info = Path(source).stat()
+    require(stat.S_ISBLK(info.st_mode) and info.st_rdev == device["device"] and root.stat().st_dev == device["device"],
+            "guest disk mount source/device mismatch")
+
+
+def mount_guest_work_disk(stage, contract):
+    # This explicit setup is confined to virtme's private guest /var/tmp.
+    guest_root, temporary = mounted_filesystem(Path("/")), mounted_filesystem(Path("/var/tmp"))
+    require(guest_root is not None and guest_root.get("fstype") in ("9p", "virtiofs")
+            and temporary is not None and temporary.get("fstype") == "tmpfs", "guest disk setup requires a virtme guest")
+    root = Path(contract["guest_work_root"])
+    require(root.is_relative_to("/var/tmp") and root != Path("/var/tmp")
+            and root == root.resolve() and not root.is_relative_to(stage) and not stage.is_relative_to(root),
+            "protected, overlapping or noncanonical guest disk mount target")
+    for parent in (root, *root.parents):
+        if not parent.exists():
+            continue
+        info = parent.stat()
+        require(parent.is_dir() and info.st_uid in (0, contract["run_identity"]["uid"])
+                and (not info.st_mode & 0o022 or (parent != root and info.st_mode & stat.S_ISVTX)),
+                "untrusted guest disk mount target/ancestor")
+    device = selected_guest_device(contract["guest_disk"])
+    root.mkdir(mode=0o755, parents=True, exist_ok=True)
+    existing = mounted_filesystem(root)
+    if existing is not None:
+        verify_guest_disk_mount(root, device)
+        return root, device, False
+    require(not any(root.iterdir()), "guest disk mount target contains unrelated files")
+    result = subprocess.run(["mount", "-t", "ext4", "-o", "rw,nodev,nosuid", "--", device["path"], str(root)],
+                            text=True, capture_output=True)
+    require(result.returncode == 0, "guest disk mount failed")
+    verify_guest_disk_mount(root, device)
+    return root, device, True
+
+
+def run_guest_inner(stage, contract_path):
+    contract = verify_inputs(stage, contract_path)
+    require(os.geteuid() == 0 and contract["lane"] != "host", "guest inner launcher requires root in a guest lane")
+    release = subprocess.run(["uname", "-r"], text=True, capture_output=True)
+    require(release.returncode == 0 and release.stdout.strip() == contract["expected_osrelease"], "wrong executed guest osrelease")
+    mounted, root, device = False, None, None
+    if contract.get("guest_disk") is not None:
+        root, device, mounted = mount_guest_work_disk(stage, contract)
+    try:
+        if root is not None:
+            validate_guest_work_root(root, contract["run_identity"]["uid"])
+        return subprocess.run(["bash", str(stage / "inner.sh")]).returncode
+    finally:
+        if mounted:
+            # Only our mount, after the synchronous inner and its output copies.
+            verify_guest_disk_mount(root, device)
+            result = subprocess.run(["umount", "--", str(root)], text=True, capture_output=True)
+            require(result.returncode == 0, "guest disk unmount failed")
 
 
 def copy_guest_file(source, destination):
@@ -685,6 +869,9 @@ def validate_contract(contract):
         require(contract.get(key) == value, "contract registration drift: " + key)
     require(isinstance(contract.get("run_id"), str) and re.fullmatch(r"[0-9a-f]{32}", contract["run_id"]), "invalid run binding")
     validate_run_identity(contract.get("run_identity"))
+    if contract.get("guest_disk") is not None:
+        require(contract["lane"] != "host", "host lane cannot use a guest disk")
+        validate_guest_disk_binding(contract["guest_disk"])
     work_root = contract.get("guest_work_root")
     require(isinstance(work_root, str) and Path(work_root).is_absolute() and str(Path(work_root)) == work_root,
             "invalid guest work-root binding")
@@ -752,6 +939,8 @@ def prepare(args):
     for _, _, bundle in cells:
         require(not stage.is_relative_to(bundle) and not bundle.is_relative_to(stage), "overlapping canary input/stage")
     require(args.kernel is not None, "prepare requires the actual selected --kernel")
+    disk = guest_disk_input(args.guest_disk, args.guest_disk_uuid)
+    require(args.lane != "host" or disk is None, "host lane cannot use a guest disk")
     if args.lane == "host":
         require(args.kernel == "host", "host lane requires host kernel")
         config, release = None, None
@@ -766,6 +955,7 @@ def prepare(args):
     core["run_id"] = uuid.uuid4().hex
     core["run_identity"] = identity
     core["guest_work_root"] = str(args.guest_work_root)
+    core["guest_disk"] = disk
     core["expected_osrelease"] = release
     core["guest_boot_config"] = None
     bindings = {}
@@ -1428,6 +1618,9 @@ def main(argv=None):
     modes.add_argument("--verify-inputs", type=Path)
     modes.add_argument("--verify-launch-policy", action="store_true")
     modes.add_argument("--guest-environment", type=Path)
+    modes.add_argument("--check-guest-disk", action="store_true")
+    modes.add_argument("--launch-guest", type=Path)
+    modes.add_argument("--run-guest-inner", type=Path)
     modes.add_argument("--run-objects", type=Path)
     modes.add_argument("--check-work-root", type=Path)
     modes.add_argument("--copy-file", nargs=2, type=Path, metavar=("SOURCE", "DESTINATION"))
@@ -1437,6 +1630,8 @@ def main(argv=None):
     parser.add_argument("--lane", default="host")
     parser.add_argument("--kernel")
     parser.add_argument("--guest-work-root", type=Path, default=Path("/var/tmp/p11scope-ws-tmp"))
+    parser.add_argument("--guest-disk")
+    parser.add_argument("--guest-disk-uuid")
     parser.add_argument("--object-work-root", type=Path)
     parser.add_argument("--module")
     parser.add_argument("--lib-test", action="append")
@@ -1453,6 +1648,9 @@ def main(argv=None):
     try:
         if args.verify_launch_policy:
             launch_policy()
+            return 0
+        if args.check_guest_disk:
+            print(json.dumps(guest_disk_input(args.guest_disk, args.guest_disk_uuid)))
             return 0
         if args.check_work_root:
             print(validate_guest_work_root(args.check_work_root))
@@ -1475,9 +1673,14 @@ def main(argv=None):
         if args.prepare:
             prepare(args)
             return 0
-        stage = (args.seal or args.judge or args.verify_inputs or args.guest_environment or args.run_objects).resolve()
+        stage = (args.seal or args.judge or args.verify_inputs or args.guest_environment or args.run_objects
+                 or args.launch_guest or args.run_guest_inner).resolve()
         require(args.contract is not None, "--contract required")
         require(args.contract.resolve() == (stage / "contract.json").resolve(), "contract must be the execution copy inside stage")
+        if args.launch_guest:
+            return launch_guest(stage, args.contract, args.kernel)
+        if args.run_guest_inner:
+            return run_guest_inner(stage, args.contract)
         if args.run_objects:
             run_objects(stage, args.contract, args.object_work_root)
             return 0

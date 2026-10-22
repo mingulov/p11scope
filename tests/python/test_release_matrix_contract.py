@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Exercise actual matrix preparation, judge and production shell seams."""
 import json
+import contextlib
 import hashlib
+import io
 import os
 import pwd
 from pathlib import Path
@@ -794,6 +796,272 @@ class MatrixContract(unittest.TestCase):
                             with mock.patch.object(shutil, "disk_usage", return_value=shutil._ntuple_diskusage(1, 1, 0)): validate(path)
                         else: validate(path)
                     root.chmod(0o711)
+
+    def guest_disk_fixture(self):
+        # Synthetic regular input only: no filesystem is created or mounted.
+        image = self.base / "guest-work.raw"
+        image.write_bytes(b"controlled preformatted disk input")
+        tools = self.base / "disk-tools"; tools.mkdir()
+        uuid = "12345678-1234-4234-9234-123456789abc"
+        scripts = {
+            "blkid": "import os,sys\nprint('TYPE='+os.environ.get('CONTROL_DISK_TYPE','ext4'))\nprint('UUID='+os.environ.get('CONTROL_DISK_UUID','" + uuid + "'))\nif os.environ.get('CONTROL_PARTITION'): print('PTTYPE=gpt')\nsys.exit(int(os.environ.get('CONTROL_PROBE_EXIT','0')))\n",
+            "losetup": "import json,os\nprint(json.dumps({'loopdevices':[{'name':'/dev/loop0'}] if os.environ.get('CONTROL_HOST_LOOP') else []}))\n",
+            "findmnt": "import os,sys\nassert '--source' in sys.argv\nif os.environ.get('CONTROL_HOST_MOUNT'): print(sys.argv[-1]);sys.exit(0)\nsys.exit(1)\n",
+            "vng": "import json,os,sys\nopen(os.environ['CONTROL_VNG_LOG'],'w').write(json.dumps(sys.argv[1:]))\nsys.exit(int(os.environ.get('CONTROL_VNG_EXIT','0')))\n",
+        }
+        for name, body in scripts.items():
+            path = tools / name; path.write_text("#!/usr/bin/python3\n" + body); path.chmod(0o755)
+        for name in ("mise", "cargo", "mount", "umount", "sudo"):
+            path = tools / name
+            path.write_text("#!/bin/sh\nprintf '%s\\n' invoked >> \"$CONTROL_FORBIDDEN\"\nexit 89\n")
+            path.chmod(0o755)
+        env = os.environ.copy()
+        env.update(PATH=str(tools) + ":" + env["PATH"], CONTROL_VNG_LOG=str(self.base / "vng-argv.json"),
+                   CONTROL_FORBIDDEN=str(self.base / "forbidden-command"))
+        return image, uuid, env
+
+    def prepare_disk_stage(self, image, uuid, env):
+        stage = self.base / "disk-stage"
+        result = subprocess.run([sys.executable, "-I", str(CHECKER), "--prepare", str(stage),
+            "--lane", "6.1.188", "--kernel", str(self.kernel), "--guest-disk", str(image),
+            "--guest-disk-uuid", uuid, "--bin-dir", str(self.bins), "--binary-list", str(self.listing),
+            "--curation", str(self.curation), "--bpfmulti-list", str(self.bm_list),
+            "--candidate-receipt", str(self.candidate), "--lib-test", LIB_A, "--lib-test", LIB_B],
+            cwd=ROOT, text=True, capture_output=True, env=env, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return stage
+
+    def test_outer_guest_disk_prerequisites_precede_build_and_stage(self):
+        image, uuid, env = self.guest_disk_fixture()
+        stage, out = self.base / "new-stage", self.base / "new-out"
+        args = [str(RUNNER), "--rev", "HEAD", "--kernels", "6.6", "--stage-base", str(stage),
+                "--out-base", str(out), "--guest-disk", str(image), "--guest-disk-uuid", uuid]
+        healthy = subprocess.run([*args, "--dry-run"], cwd=ROOT, env=env, text=True, capture_output=True, timeout=20)
+        self.assertEqual(healthy.returncode, 0, healthy.stdout + healthy.stderr)
+        for case in ("missing", "directory", "symlink", "writable", "uuid", "type", "partition", "probe", "loop", "mounted", "unsafe", "unpaired", "uuid_only", "host"):
+            with self.subTest(case=case):
+                current, selected = env.copy(), args.copy()
+                path = image
+                if case == "missing": path = self.base / "absent.raw"
+                elif case == "directory": path = self.base
+                elif case == "symlink":
+                    path = self.base / "disk-alias.raw"; path.symlink_to(image)
+                elif case == "writable": image.chmod(0o666)
+                elif case == "uuid": current["CONTROL_DISK_UUID"] = "87654321-1234-4234-9234-123456789abc"
+                elif case == "type": current["CONTROL_DISK_TYPE"] = "xfs"
+                elif case == "partition": current["CONTROL_PARTITION"] = "1"
+                elif case == "probe": current["CONTROL_PROBE_EXIT"] = "2"
+                elif case == "loop": current["CONTROL_HOST_LOOP"] = "1"
+                elif case == "mounted": current["CONTROL_HOST_MOUNT"] = "1"
+                elif case == "unsafe": path = self.base / "unsafe$(touch-forbidden).raw"
+                elif case == "unpaired": selected = selected[:-2]
+                elif case == "uuid_only": selected = selected[:-4] + ["--guest-disk-uuid", uuid]
+                elif case == "host": selected[selected.index("--kernels") + 1] = "host"
+                if "--guest-disk" in selected: selected[selected.index("--guest-disk") + 1] = str(path)
+                result = subprocess.run(selected, cwd=ROOT, env=current, text=True, capture_output=True, timeout=20)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("guest disk", result.stdout + result.stderr)
+                self.assertFalse(stage.exists()); self.assertFalse(out.exists())
+                self.assertFalse(Path(env["CONTROL_FORBIDDEN"]).exists())
+                image.chmod(0o644)
+
+    def test_guest_disk_rejects_unsafe_paths_and_untrusted_ancestors(self):
+        image, uuid, env = self.guest_disk_fixture()
+        for name in ("a b", "a'b", 'a"b', "a$b", "a`b", "a*b", "a?b", "a[b", "a;b", "a&b", "a|b", "a=b", "a,b", "a\\b", "a\nb"):
+            with self.subTest(name=name):
+                result = subprocess.run([sys.executable, "-I", str(CHECKER), "--check-guest-disk", "--guest-disk",
+                                         str(self.base / name), "--guest-disk-uuid", uuid],
+                                        cwd=ROOT, env=env, text=True, capture_output=True, timeout=20)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("unsafe guest disk path", result.stdout)
+        parent = self.base / "untrusted-parent"; parent.mkdir(); parent.chmod(0o777)
+        moved = parent / image.name; image.replace(moved)
+        result = subprocess.run([sys.executable, "-I", str(CHECKER), "--check-guest-disk", "--guest-disk",
+                                 str(moved), "--guest-disk-uuid", uuid],
+                                cwd=ROOT, env=env, text=True, capture_output=True, timeout=20)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("untrusted guest disk", result.stdout)
+
+    def test_guest_disk_binding_rechecked_before_bound_nonroot_launch(self):
+        image, uuid, env = self.guest_disk_fixture()
+        stage = self.prepare_disk_stage(image, uuid, env)
+        contract = json.loads((stage / "contract.json").read_text())
+        info = image.stat()
+        self.assertEqual(contract["guest_disk"], {"path": str(image), "uuid": uuid, "fstype": "ext4",
+                         "device": info.st_dev, "inode": info.st_ino, "size": info.st_size})
+        args = [sys.executable, "-I", str(CHECKER), "--launch-guest", str(stage),
+                "--contract", str(stage / "contract.json"), "--kernel", str(self.kernel)]
+        # Filesystem writes change image contents, not the bound file identity.
+        image.write_bytes(b"x" * info.st_size)
+        result = subprocess.run(args, cwd=ROOT, env=env, text=True, capture_output=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        argv = json.loads(Path(env["CONTROL_VNG_LOG"]).read_text())
+        self.assertEqual(argv[argv.index("--user") + 1], pwd.getpwuid(os.getuid()).pw_name)
+        self.assertEqual(argv[argv.index("--disk") + 1], str(image))
+        execution = argv[argv.index("--exec") + 1]
+        self.assertTrue(execution.startswith("sudo -n "), execution)
+        self.assertIn("--run-guest-inner", execution)
+        Path(env["CONTROL_VNG_LOG"]).unlink()
+        replacement = self.base / "replacement.raw"; replacement.write_bytes(image.read_bytes()); replacement.replace(image)
+        result = subprocess.run(args, cwd=ROOT, env=env, text=True, capture_output=True, timeout=20)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertFalse(Path(env["CONTROL_VNG_LOG"]).exists())
+
+    def test_mixed_matrix_disk_options_never_change_host_dispatch(self):
+        image, uuid, env = self.guest_disk_fixture()
+        names = list(CHECKER_MOD["DEFAULT_LIB_TESTS"] + CHECKER_MOD["BREADTH"])
+        self.listing.write_text("".join(name + ": test\n" for name in names))
+        self.curation.write_text(f"default ({len(names)})\n" + "\n".join(names) +
+                                f"\nlong (0)\nskipped (0)\nverify: curation matches the binary ({len(names)} tests)\n")
+        stages, outputs = self.base / "mixed-stages", self.base / "mixed-outputs"
+        stages.mkdir(); outputs.mkdir()
+        for source, name in ((self.listing, "candidate-ignored.txt"), (self.curation, "curation.txt"), (self.bm_list, "bpfmulti-list.txt")):
+            shutil.copyfile(source, stages / name)
+        tools = Path(env["PATH"].split(":", 1)[0])
+        (tools / "flock").write_text("#!/usr/bin/python3\nimport subprocess,sys\nsys.exit(subprocess.run(sys.argv[2:]).returncode)\n")
+        (tools / "flock").chmod(0o755)
+        (tools / "sudo").write_text("#!/usr/bin/python3\nimport json,os,sys\na=sys.argv[1:]\nif a[:2]==['-n','chown']: sys.exit(0)\nopen(os.environ['CONTROL_HOST_ARGS'],'w').write(json.dumps(a))\nsys.exit(1)\n")
+        env.update(CONTROL_VNG_EXIT="1", CONTROL_HOST_ARGS=str(self.base / "host-argv.json"))
+        # Execute the production dispatch function with real contract preparation;
+        # external launchers stop before any guest or privileged inner executes.
+        body = RUNNER.read_text().split("run_one() {", 1)[1].split("\noverall=", 1)[0]
+        import shlex
+        words = {"CHECKER": CHECKER, "REPO": ROOT, "STAGE_REV": stages, "OUT_REV": outputs,
+                 "BIN_OUT": self.bins, "CANDIDATE_RECEIPT": self.candidate, "LOCK": self.base / "unused-lock",
+                 "GUEST_WORK_ROOT": self.base / "unused-work", "SUMMARY": outputs / "summary.md"}
+        script = "set -uo pipefail\n" + "".join(key + "=" + shlex.quote(str(value)) + "\n" for key, value in words.items())
+        script += "TIMEOUT=10\nOBJECT_ARGS=()\nGUEST_DISK_ARGS=(--guest-disk " + shlex.quote(str(image)) + " --guest-disk-uuid " + uuid + ")\n"
+        script += "tag_for_kernel() { basename \"$1\" | sed 's/vmlinuz-//'; }\nwait_quiet() { :; }\n"
+        script += "write_inner() { " + shlex.quote(str(RUNNER)) + " --write-inner-stage \"$1\" --contract \"$1/contract.json\"; }\n"
+        script += "run_one() {" + body + "\nrun_one " + shlex.quote(str(self.kernel)) + " || :\nrun_one host || :\n"
+        result = subprocess.run(["bash", "-c", script], cwd=ROOT, env=env, text=True, capture_output=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        guest = json.loads((stages / "6.1.188/contract.json").read_text())
+        host = json.loads((stages / "host/contract.json").read_text())
+        self.assertEqual(guest["guest_disk"]["uuid"], uuid)
+        self.assertIsNone(host["guest_disk"])
+        host_argv = json.loads(Path(env["CONTROL_HOST_ARGS"]).read_text())
+        self.assertEqual(host_argv, ["-n", "env", "bash", str(stages / "host/inner.sh")])
+        argv = json.loads(Path(env["CONTROL_VNG_LOG"]).read_text())
+        self.assertEqual(argv[argv.index("--disk") + 1], str(image))
+
+    def controlled_guest_disk(self, stage, root, case="healthy", mounted=False):
+        contract = json.loads((stage / "contract.json").read_text())
+        contract["guest_work_root"] = str(root)
+        if case == "protected": contract["guest_work_root"] = "/etc"
+        elif case == "overlap": contract["guest_work_root"] = str(stage / "artifacts")
+        elif case == "symlink":
+            link = self.base / "mount-alias"; link.symlink_to(root); contract["guest_work_root"] = str(link)
+        (stage / "contract.json").write_text(json.dumps(contract))
+        output = stage / "child-output"
+        output.unlink(missing_ok=True)
+        (stage / "inner.sh").write_text("#!/bin/bash\nprintf 'completed outputs' > '" + str(output) + "'\nexit 7\n")
+        root.mkdir(exist_ok=True)
+        if case == "nonempty": (root / "foreign").write_text("unrelated data")
+        if case == "untrusted": root.chmod(0o777)
+        events = []
+        state = {"mounted": mounted}
+        real_run, real_stat = subprocess.run, Path.stat
+        def device_stat(path, *args, **kwargs):
+            if str(path) in ("/dev/c2disk", "/dev/c2other"):
+                return mock.Mock(st_mode=stat.S_IFBLK | 0o600,
+                                 st_rdev=os.makedev(252, 0 if str(path) == "/dev/c2disk" else 1))
+            info = real_stat(path, *args, **kwargs)
+            if path == root and state["mounted"]:
+                fields = list(info); fields[2] = os.makedev(252, 1 if case == "device_mismatch" else 0)
+                return os.stat_result(fields)
+            return info
+        def external(argv, **kwargs):
+            argv = list(map(str, argv))
+            def done(rc=0, stdout=""): return subprocess.CompletedProcess(argv, rc, stdout, "")
+            if argv[0] == "uname": return done(stdout="foreign\n" if case == "kernel" else "6.1.188\n")
+            if argv[0] == "lsblk":
+                rows = [{"path": "/dev/c2disk", "type": "disk", "maj:min": "252:0"}]
+                if case == "missing": rows = []
+                elif case in ("duplicate", "probe_error", "empty_other", "other_uuid"):
+                    rows += [{"path": "/dev/c2other", "type": "disk", "maj:min": "252:1"}]
+                return done(stdout=json.dumps({"blockdevices": rows}))
+            if argv[0] == "blkid":
+                if case == "probe_error" and argv[-1] == "/dev/c2other": return done(1)
+                if case == "empty_other" and argv[-1] == "/dev/c2other": return done(2)
+                other_uuid = case == "uuid" or (case == "other_uuid" and argv[-1] == "/dev/c2other")
+                uuid = "87654321-1234-4234-9234-123456789abc" if other_uuid else contract["guest_disk"]["uuid"]
+                return done(stdout="TYPE=" + ("xfs" if case == "type" else "ext4") + "\nUUID=" + uuid + "\n")
+            if argv[0] == "findmnt":
+                if "-n" in argv: return done(stdout="ext4\n")
+                target = argv[-1]
+                if target == "/":
+                    row = {"target": "/", "source": "/dev/root", "fstype": "btrfs" if case == "not_guest" else "9p", "maj:min": "0:1"}
+                elif target == "/var/tmp":
+                    row = {"target": "/var/tmp", "source": "tmpfs", "fstype": "tmpfs", "maj:min": "0:2"}
+                elif not state["mounted"]: return done(1)
+                else:
+                    row = {"target": target, "source": "/dev/c2other" if case in ("source", "new_source") else "/dev/c2disk",
+                           "fstype": "xfs" if case == "mounted_type" else "ext4", "maj:min": "252:1" if case == "major" else "252:0"}
+                return done(stdout=json.dumps({"filesystems": [row]}))
+            if argv[0] == "mount":
+                events.append("mount")
+                if case == "mount_failure": return done(1)
+                self.assertIn("/dev/c2disk", argv); self.assertEqual(argv[-1], str(root))
+                state["mounted"] = True; return done()
+            if argv[0] == "umount":
+                self.assertEqual(argv[-1], str(root))
+                events.append("umount")
+                if case == "unmount_failure": return done(1)
+                state["mounted"] = False; return done()
+            if argv[:1] == ["bash"]:
+                events.append("child")
+                result = real_run(argv, **kwargs)
+                self.assertEqual(output.read_text(), "completed outputs")
+                events.append("outputs_complete")
+                return result
+            self.fail("unexpected external command: " + repr(argv))
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(Path, "stat", device_stat), mock.patch.object(subprocess, "run", side_effect=external), \
+                mock.patch.object(os, "geteuid", return_value=1000 if case == "nonroot" else 0), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            try:
+                rc = CHECKER_MOD["main"](["--run-guest-inner", str(stage), "--contract", str(stage / "contract.json")])
+            except SystemExit as error:
+                rc = error.code
+        return rc, events, output.exists(), stdout.getvalue() + stderr.getvalue()
+
+    def test_guest_disk_mount_lifetime_follows_child_and_output_completion(self):
+        image, uuid, env = self.guest_disk_fixture()
+        stage = self.prepare_disk_stage(image, uuid, env)
+        root = self.base / "disk-mount"
+        rc, events, output, detail = self.controlled_guest_disk(stage, root)
+        self.assertEqual(rc, 7, detail)
+        self.assertTrue(output)
+        self.assertEqual(events, ["mount", "child", "outputs_complete", "umount"])
+        for case in ("empty_other", "other_uuid"):
+            with self.subTest(case=case):
+                rc, events, output, detail = self.controlled_guest_disk(stage, root, case)
+                self.assertEqual(rc, 7, detail)
+                self.assertTrue(output)
+                self.assertEqual(events, ["mount", "child", "outputs_complete", "umount"])
+        rc, events, output, detail = self.controlled_guest_disk(stage, root, mounted=True)
+        self.assertEqual(rc, 7, detail)
+        self.assertTrue(output)
+        self.assertEqual(events, ["child", "outputs_complete"])
+        rc, events, output, detail = self.controlled_guest_disk(stage, root, "unmount_failure")
+        self.assertEqual(rc, 1, detail)
+        self.assertTrue(output)
+        self.assertEqual(events, ["mount", "child", "outputs_complete", "umount"])
+
+    def test_guest_disk_refuses_wrong_devices_and_mount_targets_before_inner(self):
+        image, uuid, env = self.guest_disk_fixture()
+        stage = self.prepare_disk_stage(image, uuid, env)
+        for index, case in enumerate(("missing", "duplicate", "probe_error", "uuid", "type", "source", "new_source", "major", "device_mismatch",
+                                     "mounted_type", "mount_failure", "protected", "overlap", "symlink", "nonempty", "untrusted",
+                                     "not_guest", "nonroot", "kernel")):
+            with self.subTest(case=case):
+                rc, events, output, detail = self.controlled_guest_disk(stage, self.base / ("mount-" + str(index)), case,
+                                                                      mounted=case in ("source", "major", "device_mismatch", "uuid", "type", "duplicate", "mounted_type"))
+                self.assertEqual(rc, 1, detail)
+                self.assertFalse(output, detail)
+                self.assertNotIn("child", events)
+                self.assertNotIn("umount", events, "must not unmount an unrelated or preexisting mount")
 
     def test_module_discovery_preserves_explicit_elf_and_refuses_missing_or_wrong_abi(self):
         select = CHECKER_MOD["select_module"]
@@ -1774,11 +2042,23 @@ class MatrixContract(unittest.TestCase):
         self.assertFalse((stage / "cells/fifo").exists())
 
     def test_vng_guest_gets_boot_overlay_and_kernel_binding(self):
-        body = RUNNER.read_text().split("run_one() {", 1)[1].split("\noverall=", 1)[0]
-        self.assertIn('--kernel "$k" --guest-work-root "$GUEST_WORK_ROOT"', body)
-        host, guest = body.split('if [ "$k" = host ]; then', 1)[1].split("\n  else\n", 1)
-        self.assertNotIn("--overlay-rwdir", host)
-        self.assertIn('--rwdir "$stage" --overlay-rwdir /boot', guest)
+        _, _, env = self.guest_disk_fixture()
+        stage, prepared = self.prepare_guest_attempt("vng-stage", kernel=self.kernel)
+        self.assertEqual(prepared.returncode, 0, prepared.stdout + prepared.stderr)
+        args = [sys.executable, "-I", str(CHECKER), "--launch-guest", str(stage),
+                "--contract", str(stage / "contract.json"), "--kernel", str(self.kernel)]
+        result = subprocess.run(args, cwd=ROOT, env=env, text=True, capture_output=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        argv = json.loads(Path(env["CONTROL_VNG_LOG"]).read_text())
+        self.assertEqual(argv[argv.index("--run") + 1], str(self.kernel))
+        self.assertEqual(argv[argv.index("--rwdir") + 1], str(stage))
+        self.assertEqual(argv[argv.index("--overlay-rwdir") + 1], "/boot")
+        self.assertNotIn("--disk", argv)
+        Path(env["CONTROL_VNG_LOG"]).unlink()
+        (self.base / "config-6.1.188").write_text("changed boot input\n")
+        result = subprocess.run(args, cwd=ROOT, env=env, text=True, capture_output=True, timeout=20)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertFalse(Path(env["CONTROL_VNG_LOG"]).exists())
 
     def test_generated_guest_refuses_bad_identity_sudo_storage_and_kernel_before_workloads(self):
         stage, boot, run, env = self.generated_guest("6.1.188")

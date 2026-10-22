@@ -27,6 +27,30 @@ Omitting the kernel selection uses all seven lanes. An explicitly empty
 positional lane, empty `--kernels` value or empty resolved selection fails
 before campaign directory creation, candidate enumeration or workloads.
 
+Guest storage must be supplied deliberately. The paired options
+`--guest-disk ABS_IMAGE --guest-disk-uuid UUID` attach an existing, exclusively
+owned, writable, unpartitioned ext4 image. Its canonical path may contain only
+ASCII letters, digits, `/`, `.`, `_` and `-`; its ancestors must be trusted.
+UUID/type and absence of detected host loop/mount associations are checked
+before builds or campaign setup, and file device/inode/path/size are rechecked
+before launch. The runner creates no image, formats nothing and mounts nothing
+on the host. The existing privileged lane and QEMU's exclusive image access
+must be respected by every user of the image. No image hash, copy or archive is
+made. Disk options apply only to guest lanes in a mixed run; host-only use fails.
+
+With those options, the guest selects exactly one actual block device with the
+bound UUID/type and mounts it at the canonical, trusted `--guest-work-root`
+below guest `/var/tmp`. Protected, overlapping, symlinked and unrelated nonempty
+targets fail. Both an existing mount and a new mount must match the selected
+device's major/minor number and source. Only a mount created by this invocation
+is unmounted, after the inner process and output copies finish. Without disk
+options, suitable already-mounted guest storage remains an external prerequisite;
+9p, virtiofs and tmpfs still fail the work-root validator. Vng starts as the
+contract's actual nonroot account and elevates its inner command with `sudo -n`;
+the inner still verifies root, the real account and that account's passwordless
+sudo. Cached configuration/module checks do not prove device appearance,
+mounting, account policy or installed qualification; those need a real guest run.
+
 ## Exact selection and capability
 
 Each candidate supplies its own `p11scope-lib --list --ignored` output, the

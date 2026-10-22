@@ -5171,310 +5171,20 @@ fn key_operation_joint_batch_bounded_loss_keeps_exact_admission_head() {
     }
 }
 
-/// Catches a late S1Only provider pinning a Joint sibling's raw head forever,
-/// tainting only the first image, or erasing A's reservation before H9 joins it.
-#[test]
-fn key_operation_s1only_sibling_raw_reaches_terminal() {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SiblingLossMoment {
+    None,
+    BeforeProofRefusal,
+    AfterProofRefusal,
+}
+
+fn exercise_s1only_sibling_raw(sibling_first: bool, loss_moment: SiblingLossMoment) {
     use crate::semantics_key_use::FeedMode;
-    for sibling_first in [false, true] {
-        let mut fixture = CanonicalFanoutScene::prior_sealed_with_providers(2);
-        let targets = fixture
-            .scene
-            .real
-            .scene
-            .coordinator
-            .registry()
-            .joint_feed_targets()
-            .collect::<Vec<_>>();
-        assert_eq!(targets.len(), 2);
-        let before = fixture.feeds();
-        let before_model = fixture
-            .scene
-            .real
-            .scene
-            .coordinator
-            .joint_capture()
-            .model()
-            .project();
-        let mut subjects = Vec::new();
-        for target in &targets {
-            let pid = fixture
-                .scene
-                .real
-                .scene
-                .coordinator
-                .semantic_bindings()
-                .get(target.caller())
-                .unwrap()
-                .pin()
-                .pid();
-            fixture.scene.admit_providers(pid, target.caller(), &[1]);
-            subjects.push((target.caller(), pid));
-        }
-        let mut b_returns = Vec::new();
-        for (offset, function) in ["C_SignInit", "C_SignUpdate", "C_SignFinal"]
-            .into_iter()
-            .enumerate()
-        {
-            for (caller, pid) in &subjects {
-                for (within, file) in if sibling_first { [1, 0] } else { [0, 1] }
-                    .into_iter()
-                    .enumerate()
-                {
-                    let (begin, end) = fixture.scene.encoded(
-                        *pid,
-                        file,
-                        function,
-                        2 + offset as u64 * 2 + within as u64,
-                    );
-                    // Same image/session/mechanism and input handle; only
-                    // actual provider/slot and original invocation differ.
-                    if file == 1 {
-                        b_returns
-                            .push((*caller, u64::from_le_bytes(end[24..32].try_into().unwrap())));
-                    }
-                    fixture.scene.drain.source_mut().push_record(begin.to_vec());
-                    fixture.scene.drain.source_mut().push_record(end.to_vec());
-                }
-            }
-        }
-        let raw = fixture.scene.prepare(12);
-        let inputs: Vec<_> = fixture
-            .scene
-            .real
-            .scene
-            .coordinator
-            .prepared_semantic_batch()
-            .unwrap()
-            .admissions()
-            .map(|input| {
-                (
-                    input.h0_ordinal(),
-                    input.journal_binding().3,
-                    input.s1_facts().ts_ns,
-                    input.collected_origin().unwrap(),
-                )
-            })
-            .collect();
-        assert_eq!(inputs.len(), 12);
-        let b_ordinals = inputs
-            .iter()
-            .filter(|input| b_returns.contains(&(input.1, input.2)))
-            .map(|input| input.0)
-            .collect::<Vec<_>>();
-        assert_eq!(b_ordinals.len(), 6);
-        let b_originals = subjects
-            .iter()
-            .map(|(caller, _)| {
-                fixture
-                    .scene
-                    .real
-                    .scene
-                    .coordinator
-                    .prepared_semantic_batch()
-                    .unwrap()
-                    .admissions()
-                    .find(|input| {
-                        input.journal_binding().3 == *caller
-                            && b_ordinals.contains(&input.h0_ordinal())
-                    })
-                    .unwrap()
-                    .clone()
-            })
-            .collect::<Vec<_>>();
-        let mut ingested = raw
-            .ingest(
-                fixture
-                    .scene
-                    .real
-                    .scene
-                    .coordinator
-                    .joint_capture_mut()
-                    .adapter_mut(),
-                &fixture.scene.producers,
-                &fixture.grant,
-            )
-            .unwrap_or_else(|(_, reason)| panic!("original sibling raw: {reason:?}"));
-        let coordinator = &mut fixture.scene.real.scene.coordinator;
-        let mut claims = Vec::new();
-        while let Some((ordinal, result)) = coordinator
-            .claim_next_prepared_admission(&fixture.scene.producers, &ingested)
-            .unwrap()
-        {
-            if b_ordinals.contains(&ordinal) {
-                assert_eq!(
-                    result,
-                    Err(crate::semantics_objects::journal::AttestationRefusal::ImageSealed),
-                    "a genuinely late provider never upgrades the already-sealed image"
-                );
-            } else {
-                assert!(result.is_ok());
-            }
-            claims.push(ordinal);
-        }
-        assert_eq!(
-            claims,
-            inputs.iter().map(|input| input.0).collect::<Vec<_>>()
-        );
-        assert_eq!(
-            coordinator
-                .joint_capture()
-                .adapter()
-                .invocation_claims_for_test()
-                .0,
-            6
-        );
-        let starts = coordinator
-            .joint_capture()
-            .adapter()
-            .retained_starts_for_test();
-        let exact_claims = coordinator
-            .joint_capture()
-            .adapter()
-            .invocation_claims_for_test();
-        let exact_roles = coordinator.joint_capture().ledger().roles_for_test();
-        let foreign = SessionDrainProducers::test_pair(
-            fixture.scene.producers.native_domain(),
-            EventsDomain::test_standin(fixture.scene.producers.events_id()),
-        );
-        assert_eq!(
-            coordinator.stage_next_prepared_admission_with_disposition(&foreign, &mut ingested),
-            Err(RawQuantumRefusal::ForeignCapture)
-        );
-        assert_eq!(
-            coordinator
-                .joint_capture()
-                .adapter()
-                .retained_starts_for_test(),
-            starts
-        );
-        assert_eq!(
-            coordinator
-                .joint_capture()
-                .adapter()
-                .invocation_claims_for_test(),
-            exact_claims
-        );
-        assert_eq!(
-            coordinator.joint_capture().ledger().roles_for_test(),
-            exact_roles
-        );
-        assert_eq!(
-            coordinator
-                .prepared_semantic_batch()
-                .unwrap()
-                .admissions()
-                .map(|input| (
-                    input.h0_ordinal(),
-                    input.journal_binding().3,
-                    input.s1_facts().ts_ns,
-                    input.collected_origin().unwrap()
-                ))
-                .collect::<Vec<_>>(),
-            inputs,
-            "foreign allocation cannot mark, stage or substitute any original"
-        );
-        let mut staged = 0;
-        while coordinator
-            .stage_next_prepared_admission_with_disposition(&fixture.scene.producers, &mut ingested)
-            .unwrap()
-        {
-            staged += 1;
-        }
-        assert_eq!(staged, 12);
-        assert_eq!(
-            coordinator
-                .joint_capture()
-                .adapter()
-                .retained_starts_for_test(),
-            starts,
-            "negative association is retained before physical disposal"
-        );
-        assert_eq!(
-            coordinator
-                .joint_capture()
-                .adapter()
-                .invocation_claims_for_test(),
-            exact_claims
-        );
-        assert_eq!(coordinator.joint_capture().model().project(), before_model);
-        assert_eq!(
-            coordinator
-                .prepared_semantic_batch()
-                .unwrap()
-                .admissions()
-                .count(),
-            0
-        );
-        assert!(coordinator.finish_prepared_semantic_batch(&fixture.scene.real.lane));
-        coordinator
-            .commit_batch_with_semantics(false, Some(&mut fixture.scene.real.lane))
-            .unwrap();
-        assert_eq!(
-            coordinator.joint_capture().ledger().roles_for_test()[..4],
-            [0, 12, 0, 6],
-            "marking negative originals must not erase A's source reservation before H9 joins it"
-        );
-        for target in &targets {
-            let a = coordinator
-                .registry()
-                .instance_semantic_edges()
-                .find(|record| record.id == target.id())
-                .unwrap();
-            assert_eq!((a.feed.staged_len(), a.feed.reduced()), (3, 1));
-            assert_eq!(
-                a.semantics.as_ref().unwrap().calls(),
-                1,
-                "A has not escaped through direct fallback"
-            );
-        }
-        let b_ids = coordinator
-            .registry()
-            .instance_semantic_edges()
-            .filter(|record| {
-                subjects.iter().any(|subject| subject.0 == record.caller)
-                    && !targets.iter().any(|target| target.id() == record.id)
-            })
-            .map(|record| record.id)
-            .collect::<Vec<_>>();
-        assert_eq!(b_ids.len(), 2);
-        for id in &b_ids {
-            assert_eq!(
-                coordinator.registry().feed_mode_for_test(*id),
-                Some(FeedMode::S1Only)
-            );
-        }
-        for id in &b_ids {
-            assert_eq!(fixture.s1_counts(*id), (3, 1, 1, 0, 0));
-        }
-        let mut frame = acquire(&mut fixture.scene, ingested, &fixture.attached, &BirthFault);
-        let failure = frame
-            .failure_for_test()
-            .expect("the original unowned sibling effects must be disclosed");
-        assert!(
-            targets
-                .iter()
-                .all(|target| failure.affects_domain(target.bootstrap().domain())),
-            "the second image's original negative cannot be lost behind the first"
-        );
-        for object in &before_model.objects {
-            assert!(failure.effects.effects.iter().any(|effect| matches!(effect,
-                ObjectEffect::Retired { object: retired, .. } if *retired == object.id)));
-            assert_ne!(
-                fixture
-                    .scene
-                    .real
-                    .scene
-                    .coordinator
-                    .joint_capture()
-                    .model()
-                    .project()
-                    .object(object.id)
-                    .unwrap()
-                    .lifetime,
-                Lifetime::Live
-            );
-        }
+    let fault = FrameFault::clean();
+    let mut fixture = CanonicalFanoutScene::prior_sealed_with_providers(2);
+    if loss_moment != SiblingLossMoment::None {
+        fixture.push_two("C_SignInit", 2);
+        let mut prior = fixture.audited(2, 2, &BirthFault);
         {
             let ports = fixture
                 .scene
@@ -5483,87 +5193,406 @@ fn key_operation_s1only_sibling_raw_reaches_terminal() {
                 .coordinator
                 .joint_frame_ports(&fixture.scene.producers)
                 .unwrap();
-            frame.bind_targets(&ports).unwrap();
+            prior.bind_targets(&ports).unwrap();
         }
-        fixture.finish_bounded_batch(frame, false);
-        for target in &targets {
-            let feed = fixture
-                .feeds()
+        fixture.finish_bounded_batch(prior, false);
+        for feed in fixture.feeds() {
+            assert_eq!(
+                fixture.s1_counts(feed.id),
+                (2, 1, 0, 0, 1),
+                "retain one genuine live S1 operation before overlapping original loss effects"
+            );
+        }
+    }
+    let targets = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .joint_feed_targets()
+        .collect::<Vec<_>>();
+    assert_eq!(targets.len(), 2);
+    let before = fixture.feeds();
+    let before_model = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .model()
+        .project();
+    let mut subjects = Vec::new();
+    for target in &targets {
+        let pid = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .semantic_bindings()
+            .get(target.caller())
+            .unwrap()
+            .pin()
+            .pid();
+        fixture.scene.admit_providers(pid, target.caller(), &[1]);
+        subjects.push((target.caller(), pid));
+    }
+    let mut b_returns = Vec::new();
+    for (offset, function) in ["C_SignInit", "C_SignUpdate", "C_SignFinal"]
+        .into_iter()
+        .enumerate()
+    {
+        for (caller, pid) in &subjects {
+            for (within, file) in if sibling_first { [1, 0] } else { [0, 1] }
                 .into_iter()
-                .find(|feed| feed.id == target.id())
-                .unwrap();
-            let original = before.iter().find(|feed| feed.id == target.id()).unwrap();
-            assert_eq!(
-                feed.reduced - original.reduced + feed.disposed - original.disposed,
-                3
-            );
-            assert_eq!(feed.staged, 0);
-            assert!(
-                feed.fallback || feed.degraded,
-                "loss/refusal remains explicit"
-            );
+                .enumerate()
+            {
+                let (begin, end) = fixture.scene.encoded(
+                    *pid,
+                    file,
+                    function,
+                    (if loss_moment == SiblingLossMoment::None {
+                        2
+                    } else {
+                        4
+                    }) + offset as u64 * 2
+                        + within as u64,
+                );
+                // Same image/session/mechanism and input handle; only
+                // actual provider/slot and original invocation differ.
+                if file == 1 {
+                    b_returns.push((*caller, u64::from_le_bytes(end[24..32].try_into().unwrap())));
+                }
+                fixture.scene.drain.source_mut().push_record(begin.to_vec());
+                fixture.scene.drain.source_mut().push_record(end.to_vec());
+            }
         }
-        for id in &b_ids {
-            assert_eq!(
-                fixture.s1_counts(*id),
-                (3, 1, 1, 0, 0),
-                "direct S1 cannot replay during negative disposal"
-            );
-            assert_eq!(
-                fixture
-                    .scene
-                    .real
-                    .scene
-                    .coordinator
-                    .registry()
-                    .feed_mode_for_test(*id),
-                Some(FeedMode::S1Only)
-            );
-        }
-        assert!(
+    }
+    if loss_moment == SiblingLossMoment::BeforeProofRefusal {
+        fault.epoch.set(1);
+    }
+    let raw = fixture.scene.prepare_with_fault(12, &fault);
+    let inputs: Vec<_> = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .prepared_semantic_batch()
+        .unwrap()
+        .admissions()
+        .map(|input| {
+            (
+                input.h0_ordinal(),
+                input.journal_binding().3,
+                input.s1_facts().ts_ns,
+                input.collected_origin().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(inputs.len(), 12);
+    let b_ordinals = inputs
+        .iter()
+        .filter(|input| b_returns.contains(&(input.1, input.2)))
+        .map(|input| input.0)
+        .collect::<Vec<_>>();
+    assert_eq!(b_ordinals.len(), 6);
+    let b_originals = subjects
+        .iter()
+        .map(|(caller, _)| {
             fixture
                 .scene
                 .real
                 .scene
                 .coordinator
-                .registry()
-                .keyuse_for_test()
-                .aggregates()
-                .is_empty(),
-            "neither colliding provider receives object proof after disclosed loss"
-        );
-        let roles = fixture
-            .scene
-            .real
-            .scene
-            .coordinator
-            .joint_capture()
-            .ledger()
-            .roles_for_test();
-        for original in &b_originals {
+                .prepared_semantic_batch()
+                .unwrap()
+                .admissions()
+                .find(|input| {
+                    input.journal_binding().3 == *caller && b_ordinals.contains(&input.h0_ordinal())
+                })
+                .unwrap()
+                .clone()
+        })
+        .collect::<Vec<_>>();
+    let mut ingested = raw
+        .ingest(
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .joint_capture_mut()
+                .adapter_mut(),
+            &fixture.scene.producers,
+            &fixture.grant,
+        )
+        .unwrap_or_else(|(_, reason)| panic!("original sibling raw: {reason:?}"));
+    let coordinator = &mut fixture.scene.real.scene.coordinator;
+    let mut claims = Vec::new();
+    while let Some((ordinal, result)) = coordinator
+        .claim_next_prepared_admission(&fixture.scene.producers, &ingested)
+        .unwrap()
+    {
+        if b_ordinals.contains(&ordinal) {
             assert_eq!(
-                fixture
-                    .scene
-                    .real
-                    .scene
-                    .coordinator
-                    .joint_capture_mut()
-                    .adapter_mut()
-                    .bind_admitted_key(original),
-                Err(crate::semantics_objects::journal::AttestationRefusal::ImageTainted),
-                "a later original/quiet cut cannot heal the unowned affecting image"
+                result,
+                Err(crate::semantics_objects::journal::AttestationRefusal::ImageSealed),
+                "a genuinely late provider never upgrades the already-sealed image"
             );
+        } else {
+            assert!(result.is_ok());
         }
+        claims.push(ordinal);
+    }
+    assert_eq!(
+        claims,
+        inputs.iter().map(|input| input.0).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        coordinator
+            .joint_capture()
+            .adapter()
+            .invocation_claims_for_test()
+            .0,
+        6
+    );
+    if loss_moment == SiblingLossMoment::AfterProofRefusal {
+        fault.epoch.set(1);
+    }
+    let starts = coordinator
+        .joint_capture()
+        .adapter()
+        .retained_starts_for_test();
+    let exact_claims = coordinator
+        .joint_capture()
+        .adapter()
+        .invocation_claims_for_test();
+    let exact_roles = coordinator.joint_capture().ledger().roles_for_test();
+    let foreign = SessionDrainProducers::test_pair(
+        fixture.scene.producers.native_domain(),
+        EventsDomain::test_standin(fixture.scene.producers.events_id()),
+    );
+    assert_eq!(
+        coordinator.stage_next_prepared_admission_with_disposition(&foreign, &mut ingested),
+        Err(RawQuantumRefusal::ForeignCapture)
+    );
+    assert_eq!(
+        coordinator
+            .joint_capture()
+            .adapter()
+            .retained_starts_for_test(),
+        starts
+    );
+    assert_eq!(
+        coordinator
+            .joint_capture()
+            .adapter()
+            .invocation_claims_for_test(),
+        exact_claims
+    );
+    assert_eq!(
+        coordinator.joint_capture().ledger().roles_for_test(),
+        exact_roles
+    );
+    assert_eq!(
+        coordinator
+            .prepared_semantic_batch()
+            .unwrap()
+            .admissions()
+            .map(|input| (
+                input.h0_ordinal(),
+                input.journal_binding().3,
+                input.s1_facts().ts_ns,
+                input.collected_origin().unwrap()
+            ))
+            .collect::<Vec<_>>(),
+        inputs,
+        "foreign allocation cannot mark, stage or substitute any original"
+    );
+    let mut staged = 0;
+    while coordinator
+        .stage_next_prepared_admission_with_disposition(&fixture.scene.producers, &mut ingested)
+        .unwrap()
+    {
+        staged += 1;
+    }
+    assert_eq!(staged, 12);
+    assert_eq!(
+        coordinator
+            .joint_capture()
+            .adapter()
+            .retained_starts_for_test(),
+        starts,
+        "negative association is retained before physical disposal"
+    );
+    assert_eq!(
+        coordinator
+            .joint_capture()
+            .adapter()
+            .invocation_claims_for_test(),
+        exact_claims
+    );
+    assert_eq!(coordinator.joint_capture().model().project(), before_model);
+    assert_eq!(
+        coordinator
+            .prepared_semantic_batch()
+            .unwrap()
+            .admissions()
+            .count(),
+        0
+    );
+    assert!(coordinator.finish_prepared_semantic_batch(&fixture.scene.real.lane));
+    coordinator
+        .commit_batch_with_semantics(false, Some(&mut fixture.scene.real.lane))
+        .unwrap();
+    assert_eq!(
+        coordinator.joint_capture().ledger().roles_for_test()[..4],
+        [0, 12, 0, 6],
+        "marking negative originals must not erase A's source reservation before H9 joins it"
+    );
+    for target in &targets {
+        let a = coordinator
+            .registry()
+            .instance_semantic_edges()
+            .find(|record| record.id == target.id())
+            .unwrap();
+        let prior = before
+            .iter()
+            .find(|feed| feed.id == target.id())
+            .unwrap()
+            .reduced;
+        assert_eq!((a.feed.staged_len(), a.feed.reduced()), (3, prior));
         assert_eq!(
+            a.semantics.as_ref().unwrap().calls(),
+            prior,
+            "A has not escaped through direct fallback"
+        );
+    }
+    let b_ids = coordinator
+        .registry()
+        .instance_semantic_edges()
+        .filter(|record| {
+            subjects.iter().any(|subject| subject.0 == record.caller)
+                && !targets.iter().any(|target| target.id() == record.id)
+        })
+        .map(|record| record.id)
+        .collect::<Vec<_>>();
+    assert_eq!(b_ids.len(), 2);
+    for id in &b_ids {
+        assert_eq!(
+            coordinator.registry().feed_mode_for_test(*id),
+            Some(FeedMode::S1Only)
+        );
+    }
+    for id in &b_ids {
+        assert_eq!(fixture.s1_counts(*id), (3, 1, 1, 0, 0));
+    }
+    let mut frame = acquire(&mut fixture.scene, ingested, &fixture.attached, &fault);
+    use crate::semantics_objects::journal::JournalGap;
+    let failures = frame.original_failures_for_test().collect::<Vec<_>>();
+    assert!(
+        failures
+            .iter()
+            .any(|failure| failure.gap == JournalGap::ImageTainted),
+        "retain the original bulk sibling refusal, including its own scope/effects"
+    );
+    let failure = frame
+        .failure_for_test()
+        .expect("the original unowned sibling effects must be disclosed");
+    if loss_moment != SiblingLossMoment::None {
+        assert_eq!(
+            failures.len(),
+            2,
+            "one bulk sibling result and the actual audit result"
+        );
+        assert!(
+            failures
+                .iter()
+                .any(|failure| failure.gap == JournalGap::FaultChanged)
+        );
+        assert_eq!(
+            failure.gap,
+            JournalGap::FaultChanged,
+            "a proof-only first reason cannot certify clean fallback across actual loss"
+        );
+    }
+    assert!(
+        targets
+            .iter()
+            .all(|target| failure.affects_domain(target.bootstrap().domain())),
+        "the second image's original negative cannot be lost behind the first"
+    );
+    for object in &before_model.objects {
+        assert!(failures.iter().any(|failure| {
+            failure.effects.effects.iter().any(|effect| {
+                matches!(effect,
+            ObjectEffect::Retired { object: retired, .. } if *retired == object.id)
+            })
+        }));
+        assert_ne!(
             fixture
                 .scene
                 .real
                 .scene
                 .coordinator
                 .joint_capture()
-                .ledger()
-                .roles_for_test(),
-            roles
+                .model()
+                .project()
+                .object(object.id)
+                .unwrap()
+                .lifetime,
+            Lifetime::Live
+        );
+    }
+    {
+        let ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        frame.bind_targets(&ports).unwrap();
+    }
+    fixture.finish_bounded_batch(frame, false);
+    for target in &targets {
+        let feed = fixture
+            .feeds()
+            .into_iter()
+            .find(|feed| feed.id == target.id())
+            .unwrap();
+        let original = before.iter().find(|feed| feed.id == target.id()).unwrap();
+        assert_eq!(
+            feed.reduced - original.reduced + feed.disposed - original.disposed,
+            3
+        );
+        assert_eq!(feed.staged, 0);
+        assert!(
+            feed.fallback || feed.degraded,
+            "loss/refusal remains explicit"
+        );
+        if loss_moment != SiblingLossMoment::None {
+            assert!(
+                feed.degraded && !feed.fallback,
+                "actual loss dominates proof refusal in either order"
+            );
+            assert_eq!(
+                feed.reduced, original.reduced,
+                "no clean S1 fallback after native loss"
+            );
+            assert_eq!(feed.disposed - original.disposed, 3);
+            assert_eq!(
+                fixture.s1_counts(target.id()),
+                (2, 1, 0, 1, 0),
+                "both original loss buffers end the one existing operation exactly once"
+            );
+        }
+    }
+    for id in &b_ids {
+        assert_eq!(
+            fixture.s1_counts(*id),
+            (3, 1, 1, 0, 0),
+            "direct S1 cannot replay during negative disposal"
         );
         assert_eq!(
             fixture
@@ -5571,8 +5600,94 @@ fn key_operation_s1only_sibling_raw_reaches_terminal() {
                 .real
                 .scene
                 .coordinator
-                .reference_h3_audit_state(),
-            (2, false)
+                .registry()
+                .feed_mode_for_test(*id),
+            Some(FeedMode::S1Only)
         );
+    }
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .keyuse_for_test()
+            .aggregates()
+            .is_empty(),
+        "neither colliding provider receives object proof after disclosed loss"
+    );
+    let roles = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .ledger()
+        .roles_for_test();
+    for original in &b_originals {
+        assert_eq!(
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .joint_capture_mut()
+                .adapter_mut()
+                .bind_admitted_key(original),
+            Err(crate::semantics_objects::journal::AttestationRefusal::ImageTainted),
+            "a later original/quiet cut cannot heal the unowned affecting image"
+        );
+    }
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .ledger()
+            .roles_for_test(),
+        roles
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_h3_audit_state(),
+        (
+            if loss_moment == SiblingLossMoment::None {
+                2
+            } else {
+                3
+            },
+            false
+        )
+    );
+}
+
+/// Catches a late S1Only provider pinning a Joint sibling's raw head forever,
+/// tainting only the first image, or erasing A's reservation before H9 joins it.
+#[test]
+fn key_operation_s1only_sibling_raw_reaches_terminal() {
+    for sibling_first in [false, true] {
+        exercise_s1only_sibling_raw(sibling_first, SiblingLossMoment::None);
+    }
+}
+
+/// A real moved native prefix is loss regardless of whether its collection
+/// predates the ImageSealed refusal or it moves after that genuine refusal.
+/// Both original causes/effect buffers remain owned; neither manufactures H3.
+#[test]
+fn key_operation_s1only_sibling_mixed_loss_overrides_proof_refusal() {
+    for sibling_first in [false, true] {
+        for moment in [
+            SiblingLossMoment::BeforeProofRefusal,
+            SiblingLossMoment::AfterProofRefusal,
+        ] {
+            exercise_s1only_sibling_raw(sibling_first, moment);
+        }
     }
 }

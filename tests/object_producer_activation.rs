@@ -39,6 +39,238 @@ fn embedded_object(directory: &Path) -> PathBuf {
     object
 }
 
+const COUNTER_ARTIFACT_MODES: [(&str, &str, u64, u64); 3] = [
+    ("counts", "p11scope-ebpf-counter-counts", 24, 12_288),
+    ("timestamps", "p11scope-ebpf-counter-timestamps", 40, 20_480),
+    ("latency", "p11scope-ebpf-counter-latency", 296, 151_552),
+];
+
+fn counter_artifacts_enabled() -> bool {
+    match env!("P11SCOPE_COUNTER_ARTIFACTS_ENABLED") {
+        "0" => false,
+        "1" => true,
+        other => panic!("invalid private counter artifact selection {other:?}"),
+    }
+}
+
+fn counter_artifact_path(name: &str) -> PathBuf {
+    Path::new(env!("OUT_DIR"))
+        .join("counter-artifacts")
+        .join(name)
+}
+
+fn counter_artifact_check(mode: &str, object: &Path, mutants: bool) -> std::process::Output {
+    let mut command = Command::new("python3");
+    command
+        .arg("-I")
+        .arg("scripts/check-counter-object.py")
+        .arg("--mode")
+        .arg(mode);
+    if mutants {
+        command.arg("--self-test-mutants");
+    }
+    command
+        .arg(object)
+        .output()
+        .expect("run actual counter object checker")
+}
+
+/// The ordinary build remains the existing three selectable objects. A
+/// disabled build publishes an empty counter set even if an earlier opt-in
+/// left disposable output files in that build directory.
+#[test]
+fn counter_artifact_build_selection_matches_emitted_contract() {
+    let requested = match option_env!("P11SCOPE_COUNTER_ARTIFACTS") {
+        None | Some("0") => false,
+        Some("1") => true,
+        other => panic!("malformed private counter artifact request {other:?}"),
+    };
+    assert_eq!(counter_artifacts_enabled(), requested);
+    assert_eq!(
+        env!("P11SCOPE_COUNTER_ARTIFACTS_OUTPUTS"),
+        if requested {
+            "counts,timestamps,latency"
+        } else {
+            ""
+        },
+        "the emitted set must follow this compilation, not stale files"
+    );
+    for (name, embedded) in [
+        ("p11scope-ebpf", p11scope::EBPF_OBJECT),
+        ("p11scope-ebpf-inventory", p11scope::EBPF_INVENTORY_OBJECT),
+        (
+            "p11scope-ebpf-inventory-callers",
+            p11scope::EBPF_INVENTORY_CALLERS_OBJECT,
+        ),
+    ] {
+        let body = std::fs::read(Path::new(env!("OUT_DIR")).join(name)).unwrap();
+        assert_eq!(
+            body.as_slice(),
+            embedded,
+            "ordinary object changed selection: {name}"
+        );
+    }
+    assert!(
+        Path::new(env!("OUT_DIR"))
+            .join("p11scope-ebpf-identity")
+            .is_file()
+    );
+
+    if requested {
+        let mut bodies = Vec::new();
+        for (_, name, _, _) in COUNTER_ARTIFACT_MODES {
+            let body = std::fs::read(counter_artifact_path(name)).unwrap();
+            assert_ne!(
+                body,
+                p11scope::EBPF_OBJECT,
+                "counter mode selected Detailed bytes"
+            );
+            assert!(
+                !bodies.contains(&body),
+                "two counter modes share their object"
+            );
+            bodies.push(body);
+        }
+    } else {
+        let directory = tempfile::tempdir().unwrap();
+        let ordinary = embedded_object(directory.path());
+        for mode in ["counts", "timestamps", "latency"] {
+            let result = counter_artifact_check(mode, &ordinary, false);
+            assert_eq!(
+                result.status.code(),
+                Some(2),
+                "ordinary object passed as {mode}"
+            );
+            assert!(String::from_utf8_lossy(&result.stderr).contains("counter object refused"));
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires P11SCOPE_COUNTER_ARTIFACTS=1 in its own build configuration"]
+fn counter_artifact_modes_have_exact_maps_and_root_work() {
+    assert!(
+        counter_artifacts_enabled(),
+        "explicit counter artifact build required"
+    );
+    for (mode, name, value_bytes, stats_bytes) in COUNTER_ARTIFACT_MODES {
+        let path = counter_artifact_path(name);
+        let output = counter_artifact_check(mode, &path, false);
+        assert!(
+            output.status.success(),
+            "{mode}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["schema"], "p11scope-counter-object/v3");
+        assert_eq!(report["mode"], mode);
+        assert_eq!(report["native_owner_slot_bound"], 512);
+        for (map, kind, key, value, maximum) in [
+            ("STATS", 6, 4, value_bytes, 512),
+            ("RV_COUNTS", 5, 16, 8, 4_096),
+            ("COUNTER_HEALTH", 6, 4, 8, 2),
+            (
+                "START",
+                1,
+                16,
+                std::mem::size_of::<p11scope_ebpf_common::CallStart>() as u64,
+                16_384,
+            ),
+        ] {
+            assert_eq!(report["maps"][map]["type"], kind, "{mode} {map}");
+            assert_eq!(report["maps"][map]["key_size"], key, "{mode} {map}");
+            assert_eq!(report["maps"][map]["value_size"], value, "{mode} {map}");
+            assert_eq!(report["maps"][map]["max_entries"], maximum, "{mode} {map}");
+        }
+        assert_eq!(
+            report["payload_per_possible_cpu_bytes"]["STATS"],
+            stats_bytes
+        );
+        assert_eq!(
+            report["payload_per_possible_cpu_bytes"]["RV_COUNTS"],
+            32_768
+        );
+        assert_eq!(
+            report["payload_per_possible_cpu_bytes"]["COUNTER_HEALTH"],
+            16
+        );
+        for root in ["p11_entry", "p11_return"] {
+            let work = &report["endpoint_timing"][root];
+            assert_eq!(
+                work["clocks"].as_array().unwrap().is_empty(),
+                mode == "counts"
+            );
+            assert_eq!(
+                work["histogram_work"],
+                mode == "latency" && root == "p11_return"
+            );
+        }
+        for (wrong_mode, _, _, _) in COUNTER_ARTIFACT_MODES {
+            if wrong_mode == mode {
+                continue;
+            }
+            let wrong = counter_artifact_check(wrong_mode, &path, false);
+            assert_eq!(
+                wrong.status.code(),
+                Some(2),
+                "{mode} accepted as {wrong_mode}"
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires P11SCOPE_COUNTER_ARTIFACTS=1 in its own build configuration"]
+fn counter_artifact_mutations_are_causally_rejected() {
+    assert!(
+        counter_artifacts_enabled(),
+        "explicit counter artifact build required"
+    );
+    for (mode, name, _, _) in COUNTER_ARTIFACT_MODES {
+        let output = counter_artifact_check(mode, &counter_artifact_path(name), true);
+        assert!(
+            output.status.success(),
+            "{mode}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["mode"], mode);
+        for mutant in [
+            "stats_value_size",
+            "stats_endpoint_limit",
+            "rv_key_size",
+            "rv_capacity",
+            "health_value_size",
+            "health_capacity",
+            "start_capacity",
+            "native_owner_slot_bound",
+            "missing_start_entry",
+            "missing_start_return_get",
+            "missing_start_return_remove",
+            "semantic_helper",
+            "event_helper",
+            "unknown_call",
+            "stats_out_of_bounds",
+            "health_saturated_writer",
+            "health_contended_writer",
+        ] {
+            assert_eq!(report["mutants"][mutant], "refused", "{mode} {mutant}");
+        }
+        let timing_mutant = if mode == "counts" {
+            "endpoint_clock"
+        } else {
+            "missing_clock"
+        };
+        assert_eq!(report["mutants"][timing_mutant], "refused", "{mode}");
+        let histogram_mutant = if mode == "latency" {
+            "missing_histogram_write"
+        } else {
+            "histogram_access"
+        };
+        assert_eq!(report["mutants"][histogram_mutant], "refused", "{mode}");
+    }
+}
+
 /// Precondition (a): pair slot-1 keeps a raw retained pointer with ABSENT
 /// status while slot-0 VALUE is pre-cross-check. Emission recomputes
 /// alias/duplicate/partial from the retained pointers; it never trusts

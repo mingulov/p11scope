@@ -1071,7 +1071,8 @@ class SinkProof:
                                 state[key] = ("constant", 0)
                 elif left and left[0] == "side" and zero_taken is not None:
                     if taken != zero_taken:
-                        state[("side_live", left[1])] = True
+                        if left[2] == 0:
+                            state[("side_live", left[1])] = True
                     else:
                         for key, fact in list(state.items()):
                             if fact == left:
@@ -2296,7 +2297,7 @@ class _OwnedSinkProof(SinkProof):
                         for key, fact in list(state.items()):
                             if fact == left:
                                 state[key] = ("constant", 0)
-                if left and left[0] == "side" and zero_taken is not None:
+                if left and left[0] == "side" and left[2] == 0 and zero_taken is not None:
                     if taken == zero_taken:
                         state[("side_absent", left[1])] = True
                         state.pop(("side_live", left[1]), None)

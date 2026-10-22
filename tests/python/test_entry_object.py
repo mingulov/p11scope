@@ -629,6 +629,45 @@ class EntryObjectTests(unittest.TestCase):
                     consumer.step(store, nullable)
                 refined = dict(proof.edges(consumer, guard, nullable, nullable))[guard+2]
                 proof.check_sink(consumer, store, consumer.step(store, refined))
+            read, read_text = next((pc, text) for pc, text in insns if pc > query
+                                   and re.fullmatch(r"w9 = \*\(u32 \*\)\(r\d+ \+ 0x18\)", text))
+            read_reg = "r" + CHECKER["LOAD"].fullmatch(read_text)[3]
+            def read_side(state):
+                if read_reg != "r8":
+                    consumer.text[alias] = f"{read_reg} = r8"
+                    state = consumer.step(alias, state)
+                return consumer.step(read, state)
+            with self.subTest(variant=variant, control="base guard permits the emitted side-row read"):
+                self.assertIs(refined[("side_live", query)], True)
+                self.assertEqual(read_side(refined)["r9"], ("object_index", query))
+            consumer.text[alias] = "r8 += 0x8"
+            interior = consumer.step(alias, nullable)
+            self.assertEqual(interior["r8"], ("side", query, 8))
+            with self.subTest(variant=variant, control="interior nonzero cannot establish nullable row lifetime"):
+                nonzero = dict(proof.edges(consumer, guard, interior, interior))[guard+2]
+                with self.assertRaisesRegex(RuntimeError, "side access requires nonnull current START lifetime"):
+                    read_side(nonzero)
+            consumer.text[alias] = "r8 += 0x8"
+            proved_interior = consumer.step(alias, refined)
+            for successor, branch_state in proof.edges(consumer, guard, proved_interior, proved_interior):
+                with self.subTest(variant=variant, control="interior predicate retains proved base lifetime",
+                                  nonzero=successor == guard+2):
+                    self.assertIs(branch_state.get(("side_live", query)), True)
+                    self.assertNotIn(("side_absent", query), branch_state)
+                    if successor == guard+1:
+                        consumer.text[alias] = "r8 = r0"
+                        branch_state = consumer.step(alias, branch_state)
+                        self.assertEqual(branch_state["r8"], ("side", query, 0))
+                    read_side(branch_state)
+            consumer.text[alias] = "r8 += 0x8"
+            mixed = proof.join(nullable, consumer.step(alias, nullable))
+            self.assertEqual(mixed["r8"], ("side", query, frozenset({0, 8})))
+            mixed_edges = dict(proof.edges(consumer, guard, mixed, mixed))
+            with self.subTest(variant=variant, control="mixed base and interior offsets cannot establish lifetime"):
+                self.assertNotIn(("side_live", query), mixed_edges[guard+2])
+                self.assertNotIn(("side_absent", query), mixed_edges[guard+1])
+                with self.assertRaisesRegex(RuntimeError, "side access requires nonnull current START lifetime"):
+                    read_side(mixed_edges[guard+2])
             for candidate, control in ((edges[guard+1], "null side row"),
                     ({key: val for key, val in edges[guard+2].items() if key != ("live", 77)}, "expired START")):
                 with self.subTest(variant=variant, control=control):

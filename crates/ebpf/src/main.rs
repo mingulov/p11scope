@@ -32,8 +32,9 @@ use p11scope_ebpf_common::INVENTORY_DISCOVERY_BYTES;
 #[cfg(not(feature = "inventory-only"))]
 use p11scope_ebpf_common::object_capture::{
     alias_capacity_core, alias_scan_core, decode_alias_capacity_layout, decode_alias_skip_layout,
-    decode_stable_kind_layout, handle_status, object_flag, pack_alias_scan, pack_stable_cell,
-    stable_cell_core, stable_cell_poison, validate_target_span,
+    decode_request_cell_tag, decode_stable_kind_layout, handle_status, object_flag,
+    pack_alias_scan, pack_stable_cell, request_cell_packed, request_cell_poison, stable_cell_core,
+    stable_cell_poison, validate_target_span,
 };
 #[cfg(not(feature = "inventory-only"))]
 use p11scope_ebpf_common::object_flow::{
@@ -2338,6 +2339,45 @@ pub extern "C" fn p11_read_ia32_arg(stack_pointer: u64, index: u32) -> u64 {
     read_ia32_arg_with(stack_pointer, index, |address| unsafe {
         helpers::bpf_probe_read_user(address as *const u32).map_err(|_| ())
     })
+}
+
+// Request-cell global boundary: the complete one-slot selector/header/alias/
+// stable-read sequence is verified once, outside the root's eight-slot loop.
+// Five scalars in and finite packed facts out; the caller owns publication.
+// Neither a map row, reservation, target word nor reader pointer crosses.
+#[cfg(not(feature = "inventory-only"))]
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub extern "C" fn p11_request_cell(
+    base: u64,
+    count: u64,
+    tag: u64,
+    peer_base: u64,
+    peer_count: u64,
+) -> u64 {
+    let Some((_, layout, _)) = decode_request_cell_tag(tag) else {
+        return request_cell_poison();
+    };
+    match layout {
+        LinuxLayout::Lp64 => request_cell_packed(
+            base,
+            count,
+            tag,
+            peer_base,
+            peer_count,
+            &mut |address| read_word(address, LinuxLayout::Lp64),
+            &mut |address, buf| read_bytes_user(address, buf, LinuxLayout::Lp64),
+        ),
+        LinuxLayout::Ilp32 => request_cell_packed(
+            base,
+            count,
+            tag,
+            peer_base,
+            peer_count,
+            &mut |address| read_word(address, LinuxLayout::Ilp32),
+            &mut |address, buf| read_bytes_user(address, buf, LinuxLayout::Ilp32),
+        ),
+    }
 }
 
 // Stable-cell global boundary (E1a): classify one authorized value plus its

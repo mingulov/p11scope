@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::object_policy::{self, ScalarDeriveMechanism};
-use crate::{LinuxLayout, ARG_NONE};
+use crate::{ARG_NONE, LinuxLayout};
 use core::cell::RefCell;
 
 extern crate std;
@@ -347,11 +347,7 @@ fn object_producer_object_family_matrix() {
             assert_eq!(
                 words[i],
                 if present[i] {
-                    if i == 0 {
-                        u64::MAX
-                    } else {
-                        0x1_0000_0001
-                    }
+                    if i == 0 { u64::MAX } else { 0x1_0000_0001 }
                 } else {
                     0
                 },
@@ -4172,7 +4168,7 @@ fn streamed_empty_and_overflow_templates_read_nothing_including_peer() {
 #[test]
 fn streamed_get_private_flags_never_enter_public_tail() {
     use crate::object_wire::{
-        canonical_object_wire, ObjectCallWire, ObjectStart, GET_ENTRY_FLAGS_MASK,
+        GET_ENTRY_FLAGS_MASK, ObjectCallWire, ObjectStart, canonical_object_wire,
     };
     let function = fid("C_GetAttributeValue");
     let row = canonical_object_wire(function);
@@ -4281,7 +4277,7 @@ fn streamed_get_partial_result_corpus_matches_reference() {
 
 #[test]
 fn streamed_actual_pair_body_checks_peer_before_either_value_read() {
-    use crate::object_wire::{canonical_object_wire, ObjectStart};
+    use crate::object_wire::{ObjectStart, canonical_object_wire};
     for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
         let w = layout.word_bytes() as u64;
         for mode in 0..4 {
@@ -4353,7 +4349,7 @@ fn streamed_actual_pair_body_checks_peer_before_either_value_read() {
 
 #[test]
 fn streamed_actual_pair_body_distinguishes_failed_argument_from_empty() {
-    use crate::object_wire::{canonical_object_wire, ObjectStart};
+    use crate::object_wire::{ObjectStart, canonical_object_wire};
     for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
         let w = layout.word_bytes() as u64;
         let row = canonical_object_wire(fid("C_GenerateKeyPair"));
@@ -4414,7 +4410,7 @@ fn streamed_actual_pair_body_distinguishes_failed_argument_from_empty() {
 
 #[test]
 fn streamed_actual_pair_body_disjoint_and_refused_derives_are_unchanged() {
-    use crate::object_wire::{canonical_object_wire, ObjectStart, OBJECT_DERIVE_UNAVAILABLE};
+    use crate::object_wire::{OBJECT_DERIVE_UNAVAILABLE, ObjectStart, canonical_object_wire};
     for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
         let w = layout.word_bytes() as u64;
         let target = fresh(w);
@@ -4491,7 +4487,7 @@ fn return_gate_exact_finite_roundtrip_and_all_unknown_bits_refuse() {
 #[test]
 fn return_gate_actual_fill_keeps_full_width_and_continuity_authority() {
     use crate::object_flow::adapter_fill_return_control;
-    use crate::object_wire::{canonical_object_wire, ObjectStart};
+    use crate::object_wire::{ObjectStart, canonical_object_wire};
     let row = canonical_object_wire(fid("C_DeriveKey"));
     let descriptor = row.function + 1;
     for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
@@ -4585,7 +4581,7 @@ fn return_gate_actual_fill_keeps_full_width_and_continuity_authority() {
 #[test]
 fn return_gate_actual_emitters_refuse_unknown_bits_and_unjoined_without_reads() {
     use crate::object_flow::{adapter_emit_find_control, adapter_emit_get_control};
-    use crate::object_wire::{canonical_object_wire, ObjectCallWire, ObjectStart};
+    use crate::object_wire::{ObjectCallWire, ObjectStart, canonical_object_wire};
     for name in ["C_FindObjects", "C_GetAttributeValue"] {
         let row = canonical_object_wire(fid(name));
         let descriptor = row.function + 1;
@@ -4655,7 +4651,7 @@ fn return_gate_actual_emitters_refuse_unknown_bits_and_unjoined_without_reads() 
 #[test]
 fn streamed_actual_get_arguments_missing_is_uninspected_and_zero_is_empty() {
     use crate::object_flow::{capture_get_template, production_capture_get_return};
-    use crate::object_wire::{canonical_object_wire, ObjectAttributeListWire, ObjectStart};
+    use crate::object_wire::{ObjectAttributeListWire, ObjectStart, canonical_object_wire};
     let row = canonical_object_wire(fid("C_GetAttributeValue"));
     for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
         let w = layout.word_bytes() as u64;
@@ -4796,7 +4792,7 @@ fn streamed_get_retained_index_boundary_refuses_before_target_reads() {
 
 #[test]
 fn completed_event_in_place_initializes_all_bytes_from_owned_facts() {
-    use crate::object_flow::{fill_call_event, ReturnEventFacts};
+    use crate::object_flow::{ReturnEventFacts, fill_call_event};
     use crate::{CallStart, Event, ImageIdentity};
     let start = CallStart {
         ts_ns: 900,
@@ -4972,6 +4968,258 @@ fn streamed_stable_recheck_preserves_read_order_and_failure_priority() {
                     ]
                 );
             }
+        }
+    }
+}
+
+#[test]
+fn request_cell_pack_preserves_widths_and_refuses_unknown_bits() {
+    for kind in 0..=6 {
+        for status in 0..=10 {
+            for list_flags in [0, alf::HEADER_READ_FAILURE] {
+                for object_flags in [
+                    0,
+                    ofl::ALIAS,
+                    ofl::CHANGED_METADATA,
+                    ofl::ALIAS | ofl::CHANGED_METADATA,
+                ] {
+                    for value in [0, 1, u16::MAX] {
+                        if value != 0 && (kind == 0 || status != ast::VALUE) {
+                            continue;
+                        }
+                        let facts = RequestCellFacts {
+                            kind,
+                            status,
+                            value,
+                            list_flags,
+                            object_flags,
+                        };
+                        let packed =
+                            pack_request_cell(facts).expect("finite facts fit without truncation");
+                        assert_eq!(packed >> 48, 0);
+                        assert_eq!(unpack_request_cell(packed), Some(facts));
+                    }
+                }
+            }
+        }
+    }
+    let good = RequestCellFacts {
+        kind: 1,
+        status: ast::VALUE,
+        value: 0xabcd,
+        list_flags: alf::HEADER_READ_FAILURE,
+        object_flags: ofl::CHANGED_METADATA,
+    };
+    assert_eq!(pack_request_cell(good), Some(0x1004_abcd_0101));
+    for bad in [
+        RequestCellFacts { kind: 7, ..good },
+        RequestCellFacts {
+            kind: u8::MAX,
+            ..good
+        },
+        RequestCellFacts { status: 11, ..good },
+        RequestCellFacts {
+            status: u8::MAX,
+            ..good
+        },
+        RequestCellFacts { kind: 0, ..good },
+        RequestCellFacts {
+            status: ast::CHANGED,
+            ..good
+        },
+        RequestCellFacts {
+            list_flags: alf::PRESENT,
+            ..good
+        },
+        RequestCellFacts {
+            list_flags: alf::TRUNCATED,
+            ..good
+        },
+        RequestCellFacts {
+            list_flags: alf::INVALID_SPAN,
+            ..good
+        },
+        RequestCellFacts {
+            list_flags: alf::UNINSPECTED,
+            ..good
+        },
+        RequestCellFacts {
+            object_flags: ofl::ARG_READ_FAILURE,
+            ..good
+        },
+        RequestCellFacts {
+            object_flags: 1 << 8,
+            ..good
+        },
+        RequestCellFacts {
+            object_flags: 1 << 31,
+            ..good
+        },
+    ] {
+        assert!(pack_request_cell(bad).is_none(), "bad={bad:?}");
+    }
+    for bit in (48..64).chain([32, 33, 35, 36, 37, 38, 39, 40, 41, 43, 45, 46, 47]) {
+        assert!(unpack_request_cell(1 << bit).is_none(), "unknown bit {bit}");
+    }
+    for bad in [7, 0xff, 11 << 8, 0xff << 8, 1 << 16] {
+        assert!(unpack_request_cell(bad).is_none(), "bad={bad:#x}");
+    }
+    assert_eq!(
+        unpack_request_cell(request_cell_poison()),
+        Some(RequestCellFacts {
+            list_flags: alf::HEADER_READ_FAILURE,
+            ..RequestCellFacts::default()
+        })
+    );
+}
+
+#[test]
+fn request_cell_poison_arguments_never_read_target_memory() {
+    for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+        let good = encode_request_cell_tag(0, layout, true).unwrap();
+        assert_eq!(decode_request_cell_tag(good), Some((0, layout, true)));
+        for index in [8, 0x100, u64::MAX] {
+            assert!(encode_request_cell_tag(index, layout, false).is_none());
+        }
+        let high = if layout == LinuxLayout::Ilp32 {
+            1 << 32
+        } else {
+            u64::MAX - 8
+        };
+        for (base, count, tag) in [
+            (0x4000, 1, good | 8),
+            (0x4000, 1, good | (1 << 10)),
+            (0x4000, 1, good | (1 << 63)),
+            (0x4000, 1, encode_request_cell_tag(7, layout, true).unwrap()),
+            (0x4000, 0, good),
+            (0, 1, good),
+            (high, 1, good),
+            (0x4000, u64::MAX, good),
+        ] {
+            let target = fresh(layout.word_bytes() as u64);
+            let (mut r, mut b) = readers(&target);
+            assert_eq!(
+                request_cell_packed(base, count, tag, 0x6000, 1, &mut r, &mut b),
+                request_cell_poison(),
+                "base={base:#x} count={count} tag={tag:#x}"
+            );
+            assert_log(&target, &[]);
+        }
+        for index in 0..8 {
+            for peer in [false, true] {
+                let tag = encode_request_cell_tag(index, layout, peer).unwrap();
+                assert_eq!(decode_request_cell_tag(tag), Some((index, layout, peer)));
+            }
+        }
+    }
+}
+
+#[test]
+fn request_cell_preserves_ordered_reads_and_failure_priority() {
+    for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+        let w = layout.word_bytes() as u64;
+        for mode in 0..11 {
+            let target = fresh(w);
+            prog_attr(
+                &target,
+                0x4000,
+                0,
+                w,
+                if mode == 2 {
+                    0x11
+                } else if mode == 10 {
+                    (1 << 32) | SEL_CLASS
+                } else {
+                    SEL_CLASS
+                },
+                0x8000,
+                w,
+            );
+            target.borrow_mut().set_word(0x8000, 3);
+            let failed = match mode {
+                1 => Some(0x4000),
+                3 => Some(0x4000 + w),
+                4 => Some(0x4000 + 2 * w),
+                5 => Some(0x8000),
+                _ => None,
+            };
+            if let Some(address) = failed {
+                target.borrow_mut().set_fail(address);
+            }
+            if mode == 6 {
+                target.borrow_mut().script_word(4, 0x4000, SEL_KEYTYPE);
+            }
+            if (7..=9).contains(&mode) {
+                prog_attr(
+                    &target,
+                    0x6000,
+                    0,
+                    w,
+                    SEL_TOKEN,
+                    if mode == 7 { 0x8000 } else { 0x9000 },
+                    2,
+                );
+            }
+            if mode == 9 {
+                target.borrow_mut().set_fail(0x6000 + w);
+            }
+            let (mut r, mut b) = readers(&target);
+            let facts = unpack_request_cell(request_cell_packed(
+                0x4000,
+                1,
+                encode_request_cell_tag(0, layout, (7..=9).contains(&mode)).unwrap(),
+                0x6000,
+                1,
+                &mut r,
+                &mut b,
+            ))
+            .unwrap();
+            let expected = match mode {
+                1 => (0, 0, 0, alf::HEADER_READ_FAILURE, 0),
+                2 | 10 => (0, 0, 0, 0, 0),
+                3 | 4 => (1, ast::UNREADABLE, 0, alf::HEADER_READ_FAILURE, 0),
+                5 => (1, ast::UNREADABLE, 0, 0, 0),
+                6 => (1, ast::CHANGED, 0, 0, ofl::CHANGED_METADATA),
+                7 => (1, ast::ALIAS, 0, 0, ofl::ALIAS),
+                9 => (1, ast::VALUE, 3, alf::HEADER_READ_FAILURE, 0),
+                _ => (1, ast::VALUE, 3, 0, 0),
+            };
+            assert_eq!(
+                (
+                    facts.kind,
+                    facts.status,
+                    facts.value,
+                    facts.list_flags,
+                    facts.object_flags
+                ),
+                expected,
+                "mode={mode} layout={layout:?}"
+            );
+            let mut expected_reads = std::vec![(READ_WORD, 0x4000, w)];
+            if ![1, 2, 10].contains(&mode) {
+                expected_reads.push((READ_WORD, 0x4000 + w, w));
+            }
+            if ![1, 2, 3, 10].contains(&mode) {
+                expected_reads.push((READ_WORD, 0x4000 + 2 * w, w));
+            }
+            if (7..=9).contains(&mode) {
+                expected_reads.extend([
+                    (READ_WORD, 0x6000, w),
+                    (READ_WORD, 0x6000 + w, w),
+                    (READ_WORD, 0x6000 + 2 * w, w),
+                ]);
+            }
+            if ![1, 2, 3, 4, 7, 10].contains(&mode) {
+                expected_reads.push((READ_WORD, 0x8000, w));
+                if mode != 5 {
+                    expected_reads.extend([
+                        (READ_WORD, 0x4000, w),
+                        (READ_WORD, 0x4000 + w, w),
+                        (READ_WORD, 0x4000 + 2 * w, w),
+                    ]);
+                }
+            }
+            assert_log(&target, &expected_reads);
         }
     }
 }

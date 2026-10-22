@@ -29,15 +29,15 @@
 
 use crate::capture;
 use crate::object_policy::{
+    DeriveResultProtocol, ObjectAction, SafeAttributeKind, SafeCurve, ScalarDeriveMechanism,
     classify_attribute_scalar, classify_ec_params, derive_result_protocol, object_descriptor,
-    safe_attribute_kind, valid_safe_attribute_length, DeriveResultProtocol, ObjectAction,
-    SafeAttributeKind, SafeCurve, ScalarDeriveMechanism,
+    safe_attribute_kind, valid_safe_attribute_length,
 };
 use crate::object_wire::{
-    ObjectAttributeListWire, ObjectAttributeWire, OBJECT_DERIVE_DH_PKCS, OBJECT_DERIVE_ECDH1,
-    OBJECT_DERIVE_ECDH1_COFACTOR, OBJECT_DERIVE_SHA256, OBJECT_DERIVE_UNAVAILABLE,
+    OBJECT_DERIVE_DH_PKCS, OBJECT_DERIVE_ECDH1, OBJECT_DERIVE_ECDH1_COFACTOR, OBJECT_DERIVE_SHA256,
+    OBJECT_DERIVE_UNAVAILABLE, ObjectAttributeListWire, ObjectAttributeWire,
 };
-use crate::{instance, target_word_end, InstanceStamp, LinuxLayout, ARG_NONE};
+use crate::{ARG_NONE, InstanceStamp, LinuxLayout, instance, target_word_end};
 
 /// `CKR_OK`: the only RV that authorizes result-handle and Find reads.
 /// From `cryptoki-sys` 0.5.0 (`CK_RV = 0`).
@@ -2180,6 +2180,276 @@ fn clear_attribute_list(out: &mut ObjectAttributeListWire) {
     }
 }
 
+/// One request slot's finite publication facts. Target words never appear in
+/// this result: `value` is the existing classified u16, with only the two
+/// request-cell object contributions permitted by the protocol.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RequestCellFacts {
+    pub kind: u8,
+    pub status: u8,
+    pub value: u16,
+    pub list_flags: u8,
+    pub object_flags: u32,
+}
+
+#[inline(always)]
+fn request_cell_facts_valid(facts: RequestCellFacts) -> bool {
+    (facts.kind == 0 || kind_from_code(facts.kind).is_some())
+        && facts.status <= attr_status::INSUFFICIENT_CAPACITY
+        && (facts.value == 0 || (facts.kind != 0 && facts.status == attr_status::VALUE))
+        && facts.list_flags & !attr_list_flag::HEADER_READ_FAILURE == 0
+        && facts.object_flags & !(object_flag::ALIAS | object_flag::CHANGED_METADATA) == 0
+}
+
+/// Lossless 48-bit encoding: kind8, status8, value16, list-flags8, object-flags8.
+/// Check the full u32 contribution before packing; unknown bits never truncate.
+#[inline(always)]
+pub fn pack_request_cell(facts: RequestCellFacts) -> Option<u64> {
+    if !request_cell_facts_valid(facts) {
+        return None;
+    }
+    Some(
+        u64::from(facts.kind)
+            | (u64::from(facts.status) << 8)
+            | (u64::from(facts.value) << 16)
+            | (u64::from(facts.list_flags) << 32)
+            | (u64::from(facts.object_flags) << 40),
+    )
+}
+
+/// Checked inverse. Reserved bits and nonfinite codes/flags refuse publication.
+#[inline(always)]
+pub fn unpack_request_cell(packed: u64) -> Option<RequestCellFacts> {
+    if packed >> 48 != 0 {
+        return None;
+    }
+    let facts = RequestCellFacts {
+        kind: packed as u8,
+        status: (packed >> 8) as u8,
+        value: (packed >> 16) as u16,
+        list_flags: (packed >> 32) as u8,
+        object_flags: ((packed >> 40) as u8) as u32,
+    };
+    request_cell_facts_valid(facts).then_some(facts)
+}
+
+/// A malformed private boundary cannot publish a cell or authorize a read.
+#[inline(always)]
+pub const fn request_cell_poison() -> u64 {
+    (attr_list_flag::HEADER_READ_FAILURE as u64) << 32
+}
+
+/// Preserve the full index until its bound is checked. Bits8/9 carry the
+/// target layout and explicit peer presence; every other bit must be zero.
+#[inline(always)]
+pub fn encode_request_cell_tag(index: u64, layout: LinuxLayout, peer: bool) -> Option<u64> {
+    if index >= MAX_ATTRIBUTE_SLOTS {
+        return None;
+    }
+    Some(index | (u64::from(layout == LinuxLayout::Ilp32) << 8) | (u64::from(peer) << 9))
+}
+
+#[inline(always)]
+pub fn decode_request_cell_tag(tag: u64) -> Option<(u64, LinuxLayout, bool)> {
+    if tag & !0x307 != 0 {
+        return None;
+    }
+    Some((
+        tag & 7,
+        if tag & 0x100 == 0 {
+            LinuxLayout::Lp64
+        } else {
+            LinuxLayout::Ilp32
+        },
+        tag & 0x200 != 0,
+    ))
+}
+
+#[cfg(target_arch = "bpf")]
+unsafe extern "C" {
+    fn p11_request_cell(base: u64, count: u64, tag: u64, peer_base: u64, peer_count: u64) -> u64;
+}
+
+// Exactly the former loop body's one-slot sequence. Selector failure/unknown
+// selectors authorize no pointer or length read; a failed own pointer read
+// short-circuits the own length read. Alias rescans retain their separate rule
+// of completing a selected neighbor's length read after pointer failure.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn request_cell_core(
+    base: u64,
+    count: u64,
+    index: u64,
+    peer: Option<(u64, u64)>,
+    layout: LinuxLayout,
+    read_word: &mut impl FnMut(u64) -> Result<u64, ()>,
+    #[cfg_attr(target_arch = "bpf", allow(unused_variables))] read_bytes: &mut impl FnMut(
+        u64,
+        &mut [u8],
+    )
+        -> Result<
+        (),
+        (),
+    >,
+) -> RequestCellFacts {
+    let mut facts = RequestCellFacts::default();
+    let Some((selector_address, pointer_address, length_address)) =
+        attribute_header_addresses(base, index, layout)
+    else {
+        facts.list_flags = attr_list_flag::HEADER_READ_FAILURE;
+        return facts;
+    };
+    let selector = match read_word(selector_address) {
+        Ok(selector) => selector,
+        Err(()) => {
+            facts.list_flags = attr_list_flag::HEADER_READ_FAILURE;
+            return facts;
+        }
+    };
+    let Some(kind) = safe_attribute_kind(selector) else {
+        return facts;
+    };
+    facts.kind = safe_kind_code(kind);
+    let ptr = match read_word(pointer_address) {
+        Ok(ptr) => ptr,
+        Err(()) => {
+            facts.status = attr_status::UNREADABLE;
+            facts.list_flags = attr_list_flag::HEADER_READ_FAILURE;
+            return facts;
+        }
+    };
+    let len = match read_word(length_address) {
+        Ok(len) => len,
+        Err(()) => {
+            facts.status = attr_status::UNREADABLE;
+            facts.list_flags = attr_list_flag::HEADER_READ_FAILURE;
+            return facts;
+        }
+    };
+    if ptr == 0 {
+        facts.status = attr_status::UNAVAILABLE;
+    } else if !valid_safe_attribute_length(kind, len, layout) {
+        facts.status = attr_status::INVALID_LENGTH;
+    } else if validate_target_span(ptr, len, layout).is_none() {
+        facts.status = attr_status::INVALID_SPAN;
+    } else {
+        let (mut alias, flags) =
+            request_alias_scan(base, count, index, ptr, len, layout, read_word);
+        facts.list_flags |= flags;
+        if let Some((peer_base, peer_count)) = peer {
+            let (a, f) =
+                request_alias_scan(peer_base, peer_count, u64::MAX, ptr, len, layout, read_word);
+            alias |= a;
+            facts.list_flags |= f;
+        }
+        if alias {
+            facts.status = attr_status::ALIAS;
+            facts.object_flags = object_flag::ALIAS;
+        } else {
+            #[cfg(target_arch = "bpf")]
+            let (status, value, write_value, contrib) = unpack_stable_cell(unsafe {
+                p11_stable_cell(
+                    base,
+                    index,
+                    encode_stable_kind_layout(kind, layout),
+                    ptr,
+                    len,
+                )
+            });
+            #[cfg(not(target_arch = "bpf"))]
+            let (status, value, write_value, contrib) =
+                stable_cell_core(base, index, kind, ptr, len, layout, read_word, read_bytes);
+            facts.status = status;
+            if write_value {
+                facts.value = value;
+            }
+            facts.object_flags = contrib;
+        }
+    }
+    facts
+}
+
+/// The actual five-scalar global body, with injected host readers. Recheck
+/// the whole own span and bounded index before the first read: global scalar
+/// arguments are unconstrained when the kernel verifies this body separately.
+#[inline(always)]
+pub fn request_cell_packed(
+    base: u64,
+    count: u64,
+    tag: u64,
+    peer_base: u64,
+    peer_count: u64,
+    read_word: &mut impl FnMut(u64) -> Result<u64, ()>,
+    read_bytes: &mut impl FnMut(u64, &mut [u8]) -> Result<(), ()>,
+) -> u64 {
+    let Some((index, layout, has_peer)) = decode_request_cell_tag(tag) else {
+        return request_cell_poison();
+    };
+    let Some(table) = attribute_table_span(count, layout) else {
+        return request_cell_poison();
+    };
+    if validate_target_span(base, table, layout).is_none()
+        || index >= count.min(MAX_ATTRIBUTE_SLOTS)
+        || base
+            .checked_add(count.min(MAX_ATTRIBUTE_SLOTS) * 3 * layout.word_bytes() as u64)
+            .is_none()
+    {
+        return request_cell_poison();
+    }
+    pack_request_cell(request_cell_core(
+        base,
+        count,
+        index,
+        has_peer.then_some((peer_base, peer_count)),
+        layout,
+        read_word,
+        read_bytes,
+    ))
+    .unwrap_or_else(request_cell_poison)
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn request_cell(
+    base: u64,
+    count: u64,
+    index: u64,
+    peer: Option<(u64, u64)>,
+    layout: LinuxLayout,
+    #[cfg_attr(target_arch = "bpf", allow(unused_variables))] read_word: &mut impl FnMut(
+        u64,
+    ) -> Result<
+        u64,
+        (),
+    >,
+    #[cfg_attr(target_arch = "bpf", allow(unused_variables))] read_bytes: &mut impl FnMut(
+        u64,
+        &mut [u8],
+    )
+        -> Result<
+        (),
+        (),
+    >,
+) -> RequestCellFacts {
+    let Some(tag) = encode_request_cell_tag(index, layout, peer.is_some()) else {
+        return RequestCellFacts {
+            list_flags: attr_list_flag::HEADER_READ_FAILURE,
+            ..RequestCellFacts::default()
+        };
+    };
+    let (peer_base, peer_count) = peer.unwrap_or((0, 0));
+    #[cfg(target_arch = "bpf")]
+    let packed = unsafe { p11_request_cell(base, count, tag, peer_base, peer_count) };
+    #[cfg(not(target_arch = "bpf"))]
+    let packed = request_cell_packed(
+        base, count, tag, peer_base, peer_count, read_word, read_bytes,
+    );
+    unpack_request_cell(packed).unwrap_or(RequestCellFacts {
+        list_flags: attr_list_flag::HEADER_READ_FAILURE,
+        ..RequestCellFacts::default()
+    })
+}
+
 /// Scalar in-place request protocol for the BPF path. Header rescans are
 /// bounded by eight slots per pair; each eligible value is read once. The
 /// array-based reference above remains independent for differential tests.
@@ -2228,80 +2498,23 @@ pub fn inspect_request_template_into(
     let mut contributed = 0;
     let mut i = 0;
     while i < n {
-        let Some((sel_addr, ptr_addr, len_addr)) =
-            attribute_header_addresses(template_ptr, i, layout)
-        else {
-            out.flags |= attr_list_flag::HEADER_READ_FAILURE;
-            i += 1;
-            continue;
-        };
-        let selector = match read_word(sel_addr) {
-            Ok(sel) => sel,
-            Err(()) => {
-                out.flags |= attr_list_flag::HEADER_READ_FAILURE;
-                i += 1;
-                continue;
-            }
-        };
-        let Some(kind) = safe_attribute_kind(selector) else {
-            i += 1;
-            continue;
-        };
         let Some(cell) = out.cells.get_mut(i as usize) else {
             break;
         };
-        cell.kind = safe_kind_code(kind);
-        let ptr = match read_word(ptr_addr) {
-            Ok(ptr) => ptr,
-            Err(()) => {
-                cell.status = attr_status::UNREADABLE;
-                out.flags |= attr_list_flag::HEADER_READ_FAILURE;
-                i += 1;
-                continue;
-            }
-        };
-        let len = match read_word(len_addr) {
-            Ok(len) => len,
-            Err(()) => {
-                cell.status = attr_status::UNREADABLE;
-                out.flags |= attr_list_flag::HEADER_READ_FAILURE;
-                i += 1;
-                continue;
-            }
-        };
-        if ptr == 0 {
-            cell.status = attr_status::UNAVAILABLE;
-        } else if !valid_safe_attribute_length(kind, len, layout) {
-            cell.status = attr_status::INVALID_LENGTH;
-        } else if validate_target_span(ptr, len, layout).is_none() {
-            cell.status = attr_status::INVALID_SPAN;
-        } else {
-            let (mut alias, flags) =
-                request_alias_scan(template_ptr, count, i, ptr, len, layout, &mut read_word);
-            out.flags |= flags;
-            if let Some((base, count)) = peer {
-                let (a, f) =
-                    request_alias_scan(base, count, u64::MAX, ptr, len, layout, &mut read_word);
-                alias |= a;
-                out.flags |= f;
-            }
-            if alias {
-                cell.status = attr_status::ALIAS;
-                contributed |= object_flag::ALIAS;
-            } else {
-                contributed |= stable_attribute_cell(
-                    template_ptr,
-                    i,
-                    kind,
-                    ptr,
-                    len,
-                    layout,
-                    cell,
-                    &mut read_word,
-                    &mut read_bytes,
-                );
-            }
-        }
+        let facts = request_cell(
+            template_ptr,
+            count,
+            i,
+            peer,
+            layout,
+            &mut read_word,
+            &mut read_bytes,
+        );
+        cell.kind = facts.kind;
+        cell.status = facts.status;
+        cell.value = facts.value;
+        out.flags |= facts.list_flags;
+        contributed |= facts.object_flags;
         i += 1;
     }
     contributed
@@ -2317,7 +2530,7 @@ pub fn capture_get_entry_into(
     side: &mut crate::object_wire::ObjectStart,
     mut read_word: impl FnMut(u64) -> Result<u64, ()>,
 ) -> GetEntryVerdict {
-    use crate::object_wire::{ObjectAttributeSlot, GET_ENTRY_FLAGS_MASK, GET_ENTRY_FLAGS_SHIFT};
+    use crate::object_wire::{GET_ENTRY_FLAGS_MASK, GET_ENTRY_FLAGS_SHIFT, ObjectAttributeSlot};
     side.get_template_base = 0;
     side.inspected_header_end = 0;
     side.get_inspected = 0;

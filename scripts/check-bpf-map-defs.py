@@ -392,7 +392,7 @@ REQUIRED_GLOBAL_HELPERS = frozenset({
 REQUIRED_GLOBAL_OWNER_HELPERS = frozenset({"p11_owner_lease", "p11_owner_refund"})
 REQUIRED_GLOBAL_SCALAR_HELPERS = frozenset({"p11_read_ia32_arg"})
 OBJECT_CAPTURE_GLOBAL_HELPERS = frozenset({
-    "p11_stable_cell", "p11_alias_scan", "p11_alias_capacity",
+    "p11_stable_cell", "p11_alias_scan", "p11_alias_capacity", "p11_request_cell",
 })
 REQUIRED_GLOBAL_EXEC_HELPERS = frozenset({"p11_exec_dumpability"})
 REQUIRED_LOCAL_OWNER_HELPERS = frozenset({
@@ -835,13 +835,13 @@ def validate_object_capture_reachability(elf, *, full):
         if symbol[1] != 0x12 or symbol[2] != 0 or symbol[3] != elf.indices.get(section):
             raise RuntimeError(f"object capture requires {name} GLOBAL DEFAULT {section} root")
         required = ({"p11_stable_cell", "p11_alias_capacity"} if name == "p11_return"
-                    else {"p11_stable_cell", "p11_alias_scan"})
+                    else {"p11_stable_cell", "p11_alias_scan", "p11_request_cell"})
         found = {helper for helper, key in globals_by_name.items() if key in reachable(root)}
         # This diagnostic tail continuation walks the second template in an
         # existing START. Its parent already captured the object attributes;
         # the continuation must not gain a second scalar-capture path.
         captures = full and name != "p11_entry_template_second"
-        if (captures and not required <= found) or (not captures and found):
+        if (captures and required != found) or (not captures and found):
             raise RuntimeError(f"object capture globals not correctly reachable from {name}: {sorted(found)}")
     for name, root in globals_by_name.items():
         allowed = {112} if name != "p11_alias_capacity" else set()

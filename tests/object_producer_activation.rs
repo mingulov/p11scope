@@ -1766,7 +1766,8 @@ fn login_user_type_capture_uses_full_width_finite_policy() {
 /// integration through 242ba841): 113589 B, measured with this actual lexer.
 /// Re-baselined again for full-width login user-type capture and scalar
 /// object-capture globals with constant-layout alias readers; measured with
-/// this actual lexer.
+/// this actual lexer. Request-cell extraction adds one scalar-only global;
+/// its source pin is measured with that same executable lexer.
 #[test]
 fn strip_rust_prose_real_bpf_source_dump_stable() {
     use sha2::{Digest as _, Sha256};
@@ -1776,8 +1777,8 @@ fn strip_rust_prose_real_bpf_source_dump_stable() {
     assert_eq!(
         (stripped.len(), hex.as_str()),
         (
-            115664,
-            "a0592887c56bca1f512272b21f35ceb0e1a4bc601ea71c5e884ae60d9d0959bf"
+            116696,
+            "d9efc6e636abdfbde0091a29a7f515a5e74b8dd66b4df17201e0f9ee03971953"
         ),
         "stripped BPF dump must stay byte-identical"
     );

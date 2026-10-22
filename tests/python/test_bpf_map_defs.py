@@ -905,9 +905,9 @@ class ObjectCaptureGlobalsTests(unittest.TestCase):
 
     def test_object_capture_globals_linkage_signature_and_calls(self):
         elf = checker.Elf(self.object.read_bytes())
-        expected = {"p11_stable_cell", "p11_alias_scan", "p11_alias_capacity"}
+        expected = {"p11_stable_cell", "p11_alias_scan", "p11_alias_capacity", "p11_request_cell"}
         self.assertTrue(expected <= {symbol[0] for symbol in elf.symbols},
-                        "the actual compiled object must retain all three scalar globals")
+                        "the actual compiled object must retain all four scalar globals")
         checker.validate_object_capture_globals(elf)
         full = os.environ.get("P11SCOPE_OBJECT_CAPTURE_FULL", "1")
         self.assertIn(full, ("0", "1"))
@@ -973,7 +973,7 @@ class ObjectCaptureGlobalsTests(unittest.TestCase):
                         continue
                     required = ({"p11_stable_cell", "p11_alias_capacity"}
                                 if root_name == "p11_return"
-                                else {"p11_stable_cell", "p11_alias_scan"})
+                                else {"p11_stable_cell", "p11_alias_scan", "p11_request_cell"})
                     if name not in required:
                         continue
                     changes = [change for caller, destination, at in calls
@@ -986,6 +986,20 @@ class ObjectCaptureGlobalsTests(unittest.TestCase):
         else:
             with self.assertRaisesRegex(RuntimeError, "reachable"):
                 checker.validate_object_capture_reachability(elf, full=True)
+
+        if full == "1":
+            # Return keeps its ordinary/object capture paths intact, but may
+            # never gain the entry-only request reader through another call.
+            target = next(key for key, symbol in bodies.items() if symbol[0] == "p11_request_cell")
+            caller, destination, call_at = next(call for call in calls
+                if call[0] == roots["p11_return"] and bodies[call[1]][0] == "p11_owner_start_get")
+            immediate = struct.unpack_from("<i", self.object.read_bytes(), call_at + 4)[0]
+            mutant = self.mutated([(call_at + 4, "i", immediate + (target[1] - destination[1]) // 8)])
+            _, mutated_edges, _ = checker.bpf_call_graph(mutant)
+            self.assertIn(target, mutated_edges[caller], "return mutant must reach request cell")
+            with self.subTest(root="p11_return", mutation="entry_reader_on_return"), \
+                    self.assertRaisesRegex(RuntimeError, "reachable"):
+                checker.validate_object_capture_reachability(mutant, full=True)
 
         continuation = roots.get("p11_entry_template_second")
         if continuation is not None:
@@ -1023,13 +1037,15 @@ class ObjectCaptureGlobalsTests(unittest.TestCase):
                     self.assertRaisesRegex(RuntimeError, "reachable"):
                 checker.validate_object_capture_reachability(mutant, full=full == "1")
 
-        symbol = next(symbol for symbol in elf.symbols if symbol[0] == "p11_stable_cell")
         text_row, text = elf.sections[".text"]
-        read_at = next(at for at in range(symbol[4], symbol[4] + symbol[5], 8)
-                       if struct.unpack_from("<BBhi", text, at) == (0x85, 0, 0, 112))
-        with self.subTest(mutation="global_reserves_ring"), self.assertRaisesRegex(RuntimeError, "non-read helper"):
-            checker.validate_object_capture_reachability(
-                self.mutated([(text_row[4] + read_at + 4, "i", 131)]), full=full == "1")
+        for name in sorted(expected - {"p11_alias_capacity"}):
+            symbol = next(symbol for symbol in elf.symbols if symbol[0] == name)
+            read_at = next(at for at in range(symbol[4], symbol[4] + symbol[5], 8)
+                           if struct.unpack_from("<BBhi", text, at) == (0x85, 0, 0, 112))
+            with self.subTest(helper=name, mutation="global_reserves_ring"), \
+                    self.assertRaisesRegex(RuntimeError, "non-read helper"):
+                checker.validate_object_capture_reachability(
+                    self.mutated([(text_row[4] + read_at + 4, "i", 131)]), full=full == "1")
 
         map_at = None
         for row, relocations in elf.sections.values():
@@ -1040,9 +1056,12 @@ class ObjectCaptureGlobalsTests(unittest.TestCase):
             if map_at is not None:
                 break
         self.assertIsNotNone(map_at, "real object must provide a map relocation mutation")
-        with self.subTest(mutation="global_references_map"), self.assertRaisesRegex(RuntimeError, "map/state"):
-            checker.validate_object_capture_reachability(
-                self.mutated([(row[4] + map_at, "Q", symbol[4])]), full=full == "1")
+        for name in sorted(expected):
+            symbol = next(symbol for symbol in elf.symbols if symbol[0] == name)
+            with self.subTest(helper=name, mutation="global_references_map"), \
+                    self.assertRaisesRegex(RuntimeError, "map/state"):
+                checker.validate_object_capture_reachability(
+                    self.mutated([(row[4] + map_at, "Q", symbol[4])]), full=full == "1")
 
 
 def run_suite(suite, stream=None):

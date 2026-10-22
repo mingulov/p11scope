@@ -4,6 +4,7 @@
 //! policy types, including `object_policy`, are not map or event layouts.
 #![no_std]
 
+pub mod counter_policy;
 pub mod inventory_callers;
 pub mod object_capture;
 pub mod object_flow;
@@ -11,6 +12,7 @@ pub mod object_journal;
 pub mod object_policy;
 pub mod object_wire;
 
+pub use counter_policy::CounterMode;
 pub use pkcs11_module::layout::LinuxLayout;
 
 /// Conventional x86 userspace code selectors accepted by the observer.
@@ -949,6 +951,29 @@ pub struct SlotStats {
     pub buckets: [u64; LATENCY_BUCKETS],
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct CountStats {
+    pub entered: u64,
+    pub returned: u64,
+    pub errors: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct TimestampStats {
+    pub entered: u64,
+    pub returned: u64,
+    pub errors: u64,
+    pub total_ns: u64,
+    pub max_ns: u64,
+}
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for CountStats {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for TimestampStats {}
+
 impl SlotStats {
     pub const ZERO: Self = Self {
         entered: 0,
@@ -1882,6 +1907,57 @@ mod tests {
         // Locks the Package G storage-model input: 5 u64 counters plus 32
         // u64 latency buckets.
         assert_eq!(core::mem::size_of::<SlotStats>(), 296);
+    }
+
+    #[test]
+    fn compact_counter_stats_have_exact_layout_and_zero_defaults() {
+        use core::mem::{align_of, offset_of, size_of};
+
+        assert_eq!(size_of::<CountStats>(), 24);
+        assert_eq!(align_of::<CountStats>(), 8);
+        assert_eq!(offset_of!(CountStats, entered), 0);
+        assert_eq!(offset_of!(CountStats, returned), 8);
+        assert_eq!(offset_of!(CountStats, errors), 16);
+        assert_eq!(
+            CounterMode::Counts.stats_bytes(),
+            size_of::<CountStats>() as u64
+        );
+        let counts = CountStats::default();
+        assert_eq!([counts.entered, counts.returned, counts.errors], [0; 3]);
+
+        assert_eq!(size_of::<TimestampStats>(), 40);
+        assert_eq!(align_of::<TimestampStats>(), 8);
+        assert_eq!(offset_of!(TimestampStats, entered), 0);
+        assert_eq!(offset_of!(TimestampStats, returned), 8);
+        assert_eq!(offset_of!(TimestampStats, errors), 16);
+        assert_eq!(offset_of!(TimestampStats, total_ns), 24);
+        assert_eq!(offset_of!(TimestampStats, max_ns), 32);
+        assert_eq!(
+            CounterMode::Timestamps.stats_bytes(),
+            size_of::<TimestampStats>() as u64
+        );
+        let timestamps = TimestampStats::default();
+        assert_eq!(
+            [
+                timestamps.entered,
+                timestamps.returned,
+                timestamps.errors,
+                timestamps.total_ns,
+                timestamps.max_ns,
+            ],
+            [0; 5]
+        );
+        assert_eq!(
+            CounterMode::Latency.stats_bytes(),
+            size_of::<SlotStats>() as u64
+        );
+
+        #[cfg(feature = "user")]
+        {
+            fn assert_pod<T: aya::Pod>() {}
+            assert_pod::<CountStats>();
+            assert_pod::<TimestampStats>();
+        }
     }
 
     #[test]

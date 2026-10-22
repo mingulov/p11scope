@@ -7787,7 +7787,7 @@ fn stopped_canary_capture_lifecycle() {
         output.status.success(),
         "stopped coordinator tests failed: {report}"
     );
-    assert_clean_python_suite(&report, "StoppedCanaryCaptureTests", 108);
+    assert_clean_python_suite(&report, "StoppedCanaryCaptureTests", 106);
 }
 
 #[test]

@@ -728,17 +728,20 @@ def transfer_controls():
     exit_instruction = (0x95, 0, 0, 0)
     store = (0xdb, 0x27, 0, 0xf1)  # *(u64 *)r7 CAS r2
 
-    def run(instructions, arguments=None, helpers=()):
-        proof = MemoryProof(Graph(instructions + [exit_instruction], helpers), maps)
+    def run(instructions, arguments=None, helpers=(), stats_size=24):
+        proof_maps = {**maps, "STATS": {"value_size": stats_size}}
+        proof = MemoryProof(Graph(instructions + [exit_instruction], helpers), proof_maps)
         proof.run(key, arguments or [pointer, ONE, scalar(), None, None])
         return proof
 
     report = {}
 
-    def refuses(name, instructions, arguments=None, helpers=()):
+    def refuses(name, instructions, arguments=None, helpers=(), stats_size=24, message=None):
         try:
-            run(instructions, arguments, helpers)
-        except RuntimeError:
+            run(instructions, arguments, helpers, stats_size)
+        except RuntimeError as error:
+            if message and message not in str(error):
+                raise RuntimeError(f"wrong refusal for counter control {name}: {error}") from error
             report[name] = "refused"
         else:
             raise RuntimeError(f"counter transfer control accepted: {name}")
@@ -778,6 +781,89 @@ def transfer_controls():
             [("ptr", "COUNTER_HEALTH", 0, 0, scalar()), None, None, None, None])
     refuses("cumulative_delete", [(0x85, 0, 0, 3)],
             [("map", "STATS"), None, None, None, None], ((0, 3),))
+
+    def histogram_positive(name, instructions, index):
+        proof = run(instructions, [pointer, index, None, None, None], stats_size=296)
+        reads = [touch for touch in proof.touches if touch[2:4] == ("STATS", "read")]
+        if not reads or any(touch[4][0] < 40 or touch[4][1] > 288 for touch in reads):
+            raise RuntimeError(f"counter control did not prove a real bounded bucket read: {name}")
+        report[name] = "accepted"
+
+    # Equality index32 is feasible on JLE-taken and JLT-fallthrough. Losing
+    # it makes a real 8-byte read at STATS+296 disappear from the proof.
+    le_read = [(0xbf, 0x17, 0, 0), (0xb5, 2, 1, 32), exit_instruction,
+               (0x67, 2, 0, 3), (0x0f, 0x27, 0, 0),
+               (0x07, 7, 0, 40), (0x79, 0x70, 0, 0)]
+    lt_read = [(0xbf, 0x17, 0, 0), (0xa5, 2, 4, 32),
+               (0x67, 2, 0, 3), (0x0f, 0x27, 0, 0),
+               (0x07, 7, 0, 40), (0x79, 0x70, 0, 0)]
+    refuses("le_equality32_oob", le_read, [pointer, scalar(0, 32), None, None, None],
+            stats_size=296, message="out-of-bounds STATS read")
+    refuses("lt_fallthrough_equality32_oob", lt_read,
+            [pointer, scalar(31, 32), None, None, None],
+            stats_size=296, message="out-of-bounds STATS read")
+    histogram_positive("le_healthy_index31", le_read, constant(31))
+    lt_healthy = list(lt_read)
+    lt_healthy[1] = (0xa5, 2, 4, 31)
+    histogram_positive("lt_healthy_index31", lt_healthy, constant(31))
+
+    # This is the emitted constant-left JGT/clamp/shift/pointer shape, with
+    # an initially opaque full-width index. A JMP32 guard cannot constrain
+    # its high half; a separately bounded 32-bit input can use that guard.
+    clamp = [(0xbf, 0x17, 0, 0), (0xb7, 1, 0, 31), (0x2d, 0x21, 1, 0),
+             (0xb7, 2, 0, 31), (0x67, 2, 0, 3), (0x0f, 0x27, 0, 0),
+             (0x07, 7, 0, 40), (0x79, 0x70, 0, 0)]
+    histogram_positive("constant_left_clamp64", clamp, scalar())
+    clamp32 = list(clamp)
+    clamp32[2] = (0x2e, 0x21, 1, 0)
+    histogram_positive("constant_left_clamp32_bounded", clamp32, scalar(0, 0xffffffff))
+    refuses("constant_left_clamp32_high_alias", clamp32,
+            [pointer, constant(1 << 32), None, None, None],
+            stats_size=296, message="out-of-bounds STATS read")
+    for name, at, instruction in [
+        ("histogram_guard_direction", 2, (0xad, 0x21, 1, 0)),
+        ("histogram_index32", 3, (0xb7, 2, 0, 32)),
+        ("histogram_stride16", 4, (0x67, 2, 0, 4)),
+    ]:
+        damaged = list(clamp)
+        damaged[at] = instruction
+        refuses(name, damaged, [pointer, scalar(), None, None, None],
+                stats_size=296, message="out-of-bounds STATS read")
+
+    for name, operation, taken, wanted in [
+        ("unsigned_gt_taken", 0x20, True, (33, 63)),
+        ("unsigned_gt_untaken", 0x20, False, (0, 32)),
+        ("unsigned_ge_taken", 0x30, True, (32, 63)),
+        ("unsigned_ge_untaken", 0x30, False, (0, 31)),
+        ("unsigned_lt_taken", 0xa0, True, (0, 31)),
+        ("unsigned_lt_untaken", 0xa0, False, (32, 63)),
+        ("unsigned_le_taken", 0xb0, True, (0, 32)),
+        ("unsigned_le_untaken", 0xb0, False, (33, 63)),
+    ]:
+        registers = [scalar(0, 63)]
+        if (not MemoryProof.refine(registers, 0, registers[0], 32, operation, taken)
+                or registers[0][2:] != wanted):
+            raise RuntimeError(f"wrong unsigned comparison boundary: {name}")
+        report[name] = "accepted"
+    for bound, operation, taken, wanted in [
+        (0, 0x20, True, (1, U64_MAX)), (0, 0x20, False, (0, 0)),
+        (0, 0x30, True, (0, U64_MAX)), (0, 0x30, False, None),
+        (0, 0xa0, True, None), (0, 0xa0, False, (0, U64_MAX)),
+        (0, 0xb0, True, (0, 0)), (0, 0xb0, False, (1, U64_MAX)),
+        (U64_MAX, 0x20, True, None), (U64_MAX, 0x20, False, (0, U64_MAX)),
+        (U64_MAX, 0x30, True, (U64_MAX, U64_MAX)),
+        (U64_MAX, 0x30, False, (0, U64_MAX - 1)),
+        (U64_MAX, 0xa0, True, (0, U64_MAX - 1)),
+        (U64_MAX, 0xa0, False, (U64_MAX, U64_MAX)),
+        (U64_MAX, 0xb0, True, (0, U64_MAX)), (U64_MAX, 0xb0, False, None),
+    ]:
+        registers = [scalar()]
+        before = list(registers)
+        feasible = MemoryProof.refine(registers, 0, registers[0], bound, operation, taken)
+        if ((wanted is None and (feasible or registers != before))
+                or (wanted is not None and (not feasible or registers[0][2:] != wanted))):
+            raise RuntimeError("wrong zero/MAX/empty unsigned comparison intersection")
+    report["unsigned_zero_max_empty_intersections"] = "accepted"
     return report
 
 
@@ -916,6 +1002,40 @@ def owner_linkage_mutant(body, graph):
     return bytes(changed)
 
 
+def histogram_index_mutants(body, graph, histogram_keys):
+    matches = []
+    for key in histogram_keys:
+        instructions = graph.instructions[key]
+        for pc, (op, encoded, offset, immediate) in instructions.items():
+            if op != 0x2d or offset != 1 or immediate:
+                continue
+            threshold, index = encoded & 15, encoded >> 4
+            clamp = instructions.get(pc + 1)
+            shift = instructions.get(pc + 2)
+            pointer_add = instructions.get(pc + 3)
+            if (instructions.get(pc - 1) != (0xb7, threshold, 0, 31)
+                    or clamp != (0xb7, index, 0, 31)
+                    or shift != (0x67, index, 0, 3)
+                    or not pointer_add or pointer_add[0] != 0x0f
+                    or pointer_add[1] >> 4 != index):
+                continue
+            pointer = pointer_add[1] & 15
+            if (pointer_add[2:] != (0, 0)
+                    or instructions.get(pc + 5) != (0x07, pointer, 0, 40)):
+                continue
+            matches.append((key, pc, index))
+    if len(matches) != 1:
+        raise RuntimeError("histogram mutants require one actual checked clamp/index chain")
+    key, pc, index = matches[0]
+    op, encoded, offset, immediate = graph.instructions[key][pc]
+    return {
+        "histogram_guard_direction": mutated_instruction(
+            body, graph, key, pc, (0xad, encoded, offset, immediate)),
+        "histogram_index32": mutated_instruction(body, graph, key, pc + 1, (0xb7, index, 0, 32)),
+        "histogram_stride16": mutated_instruction(body, graph, key, pc + 2, (0x67, index, 0, 4)),
+    }
+
+
 def causal_mutants(body, mode):
     controls = transfer_controls()
     _, (graph, _, owner, proofs) = validate(body, mode)
@@ -994,6 +1114,9 @@ def causal_mutants(body, mode):
         for key, pc, *_ in histogram:
             changed = mutated_instruction(changed, graph, key, pc, (0xbf, 0, 0, 0))
         mutants["missing_histogram_write"] = changed
+        histogram_keys = {touch[0] for touch in proofs["p11_return"].touches
+                          if touch[2:4] == ("STATS", "read") and touch[4][1] + touch[5] > 40}
+        mutants.update(histogram_index_mutants(body, graph, histogram_keys))
     else:
         mutants["histogram_access"] = mutated_instruction(body, graph, key, pc, (op, encoded, 40, immediate))
     health = sorted(site for proof in proofs.values() for site in proof.health)

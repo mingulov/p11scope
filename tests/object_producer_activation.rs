@@ -236,13 +236,26 @@ fn counter_artifact_mutations_are_causally_rejected() {
         let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(report["mode"], mode);
         let controls = report["transfer_controls"].as_object().unwrap();
-        assert_eq!(controls.len(), 18);
+        assert_eq!(controls.len(), 37);
         for name in [
             "ordinary_copy",
             "full_spill",
             "saved_call_copy",
             "health_one_0",
             "health_one_1",
+            "le_healthy_index31",
+            "lt_healthy_index31",
+            "constant_left_clamp64",
+            "constant_left_clamp32_bounded",
+            "unsigned_gt_taken",
+            "unsigned_gt_untaken",
+            "unsigned_ge_taken",
+            "unsigned_ge_untaken",
+            "unsigned_lt_taken",
+            "unsigned_lt_untaken",
+            "unsigned_le_taken",
+            "unsigned_le_untaken",
+            "unsigned_zero_max_empty_intersections",
         ] {
             assert_eq!(controls[name], "accepted", "{mode} {name}");
         }
@@ -260,6 +273,12 @@ fn counter_artifact_mutations_are_causally_rejected() {
             "health_zero_1",
             "health_unknown_key",
             "cumulative_delete",
+            "le_equality32_oob",
+            "lt_fallthrough_equality32_oob",
+            "constant_left_clamp32_high_alias",
+            "histogram_guard_direction",
+            "histogram_index32",
+            "histogram_stride16",
         ] {
             assert_eq!(controls[name], "refused", "{mode} {name}");
         }
@@ -297,6 +316,15 @@ fn counter_artifact_mutations_are_causally_rejected() {
             "histogram_access"
         };
         assert_eq!(report["mutants"][histogram_mutant], "refused", "{mode}");
+        if mode == "latency" {
+            for mutant in [
+                "histogram_guard_direction",
+                "histogram_index32",
+                "histogram_stride16",
+            ] {
+                assert_eq!(report["mutants"][mutant], "refused", "{mode} {mutant}");
+            }
+        }
     }
 }
 

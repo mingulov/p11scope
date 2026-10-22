@@ -3158,6 +3158,35 @@ class RingLayoutTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             subject.parse_ring_records(raw, mmap.PAGESIZE, 376, 0)
 
+    def test_ring_parser_refusals_keep_bounds_and_legacy_callers_fail_closed(self):
+        subject = load_subject(TARGET_BITS)
+        capacity = mmap.PAGESIZE
+        raw = bytearray(2 * capacity)
+        length = subject.EVENT_SIZE
+        stride = subject.ring_stride(length)
+        struct.pack_into('<I', raw, 0, length)
+        cases = [
+            ('capacity', raw, capacity // 2, 0, stride),
+            ('mapping', raw[:-1], capacity, 0, stride),
+            ('positions', raw, capacity, stride, 0),
+            ('overwritten', raw, capacity, 0, capacity + 8),
+            ('truncated', raw, capacity, 0, stride - 8),
+        ]
+        for category, body, size, consumer, producer in cases:
+            with self.subTest(refusal=category), self.assertRaises(AssertionError) as caught:
+                subject.parse_ring_records(body, size, consumer, producer)
+            self.assertIs(type(caught.exception), subject.RingRecordRefusal)
+            self.assertEqual(caught.exception.category, category)
+            self.assertIsNone(subject.ring_diagnostic(caught.exception),
+                              'a legacy parser caller supplies no trusted ring name')
+        for name, lengths in subject.RING_RECORD_LENGTHS.items():
+            for record_length in lengths:
+                valid = bytearray(2 * capacity)
+                struct.pack_into('<I', valid, 0, record_length)
+                self.assertEqual(subject.parse_ring_records(
+                    valid, capacity, 0, subject.ring_stride(record_length), lengths),
+                    [bytes(record_length)], (name, record_length))
+
     def test_ring_adapter_closes_fd_and_partial_mapping_on_failure(self):
         subject = load_subject(TARGET_BITS)
         real_mmap = mmap.mmap

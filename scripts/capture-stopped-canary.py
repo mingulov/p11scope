@@ -132,8 +132,11 @@ def sanitized(phase, error):
             # Do not use str(error): accepted legacy validators can attach raw
             # bytes, and subprocess failures can attach argv/stdout/stderr.
             population = dumper.population_diagnostic(item)
+            ring = evidence.ring_diagnostic(item)
             if population is not None:
                 kind = population
+            elif ring is not None:
+                kind = ring
             elif isinstance(item, custody.DeadlineExpired):
                 kind = 'phase deadline expired'
             else:

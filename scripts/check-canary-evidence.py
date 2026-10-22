@@ -1193,29 +1193,57 @@ def ring_raw_records(manifest, lane):
     return records
 
 
+RING_REFUSAL_CATEGORIES = frozenset((
+    "capacity", "mapping", "positions", "overwritten", "busy", "discard",
+    "length", "truncated", "stride",
+))
+
+
+class RingRecordRefusal(AssertionError):
+    """A framing refusal with finite context for the capture sanitizer."""
+
+    def __init__(self, category, ring_name=None):
+        self.category, self.ring_name = category, ring_name
+        super().__init__("retained ring record refused")
+
+
+def ring_diagnostic(error):
+    """Render only revalidated fields from this module's exact trusted type."""
+    if type(error) is not RingRecordRefusal:
+        return None
+    name, category = getattr(error, "ring_name", None), getattr(error, "category", None)
+    if (type(name) is not str or name not in RING_RECORD_SIZES
+            or type(category) is not str or category not in RING_REFUSAL_CATEGORIES):
+        return None
+    return f"ring={name} refusal={category}"
+
+
 def parse_ring_records(data, capacity, consumer_pos, producer_pos,
-                       record_lengths=(EVENT_SIZE,)):
+                       record_lengths=(EVENT_SIZE,), *, ring_name=None):
+    def check(condition, category):
+        if not condition:
+            raise RingRecordRefusal(category, ring_name)
+
     if isinstance(record_lengths, int):
         record_lengths = (record_lengths,)
-    assert capacity >= mmap.PAGESIZE and capacity & (capacity - 1) == 0
-    assert capacity % mmap.PAGESIZE == 0 and len(data) == 2 * capacity
-    assert producer_pos >= consumer_pos, "ring position wrap cannot be proved"
-    assert producer_pos - consumer_pos <= capacity, "ring data was overwritten"
+    check(capacity >= mmap.PAGESIZE and capacity & (capacity - 1) == 0, "capacity")
+    check(capacity % mmap.PAGESIZE == 0 and len(data) == 2 * capacity, "mapping")
+    check(producer_pos >= consumer_pos, "positions")
+    check(producer_pos - consumer_pos <= capacity, "overwritten")
     records = []
     position = consumer_pos
     while position < producer_pos:
         offset = position & (capacity - 1)
         header = u32(data, offset)
-        assert not header & (1 << 31), "BUSY ring record"
-        assert not header & (1 << 30), "discarded ring record"
+        check(not header & (1 << 31), "busy")
+        check(not header & (1 << 30), "discard")
         length = header & ((1 << 30) - 1)
-        assert length in record_lengths, \
-            f"ring record size {length}, expected one of {record_lengths}"
+        check(length in record_lengths, "length")
         record_size = ring_stride(length)
-        assert position + record_size <= producer_pos
+        check(position + record_size <= producer_pos, "truncated")
         records.append(bytes(data[offset + 8:offset + 8 + length]))
         position += record_size
-    assert position == producer_pos
+    check(position == producer_pos, "stride")
     return records
 
 
@@ -1271,7 +1299,7 @@ class RetainedRingReader:
         page = mmap.PAGESIZE
         return parse_ring_records(
             self.producer[page:], self.item["max_entries"], *positions,
-            RING_RECORD_LENGTHS[self.item["name"]])
+            RING_RECORD_LENGTHS[self.item["name"]], ring_name=self.item["name"])
 
     def _close(self, *, preserve_error=False):
         cleanup_error = None

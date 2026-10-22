@@ -1120,6 +1120,103 @@ def owned_case(pid, directory, case, program, provider):
             os.close(fd)
 
 
+class RetainedRingDiagnosticTests(unittest.TestCase):
+    """Real ring framing and sanitizer seams, with only FD/mmap I/O injected."""
+
+    def read_ring(self, name, category):
+        capture.evidence.initialize(64)
+        fixture = fixtures.RingLayoutTests('test_ring_layout_rejects_busy_and_wrap')
+        item, mappings, libc, fake_mmap, fake_u64 = fixture.retained_fixture(
+            capture.evidence, name=name)
+        item['id'] = 90909090
+        private = b'PRIVATE_CANARY_RING_BYTES'
+        page = capture.evidence.mmap.PAGESIZE
+        mappings[1].data[page + 8:page + 8 + len(private)] = private
+        length = capture.evidence.RING_RECORD_SIZES[name]
+        header = length | {'healthy': 0, 'busy': 1 << 31, 'discard': 1 << 30,
+                           'length': 0}[category]
+        if category == 'length':
+            header = length - 1
+        struct.pack_into('<I', mappings[1].data, page, header)
+        rows, failure = None, None
+        with patch.object(capture.evidence.ctypes, 'CDLL', return_value=libc), \
+                patch.object(capture.evidence.mmap, 'mmap', side_effect=fake_mmap), \
+                patch.object(capture.evidence, 'u64', side_effect=fake_u64):
+            try:
+                with capture.evidence.RetainedRingReader(item) as reader:
+                    rows = reader.read_records()
+            except AssertionError as error:
+                failure = error
+        self.assertTrue(all(mapping.closed for mapping in mappings))
+        with self.assertRaises(OSError):
+            os.fstat(libc.fds[0])
+        return rows, failure
+
+    def sanitized_ring(self, error):
+        diagnostic = io.StringIO()
+        with contextlib.redirect_stderr(diagnostic):
+            issues = capture.sanitized('retained-rings', error)
+        text = '\n'.join(issues) + diagnostic.getvalue()
+        for private in ('PRIVATE_CANARY_RING', '90909090', str(ROOT), __file__):
+            self.assertNotIn(private, text)
+        return issues
+
+    def test_real_ring_refusals_publish_only_approved_name_and_category(self):
+        for name in ('EVENTS', 'DISCOVERY'):
+            rows, failure = self.read_ring(name, 'healthy')
+            self.assertIsNone(failure)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(len(rows[0]), capture.evidence.RING_RECORD_SIZES[name])
+            for category in ('busy', 'discard', 'length'):
+                with self.subTest(ring=name, refusal=category):
+                    rows, failure = self.read_ring(name, category)
+                    self.assertIsNone(rows)
+                    self.assertIsNotNone(failure)
+                    self.assertEqual(self.sanitized_ring(failure), [
+                        f'retained-rings: ring={name} refusal={category}'])
+
+    def test_ring_diagnostic_rejects_spoofed_types_fields_and_messages(self):
+        _, trusted = self.read_ring('EVENTS', 'discard')
+        self.assertEqual(self.sanitized_ring(trusted), [
+            'retained-rings: ring=EVENTS refusal=discard'])
+        trusted.args = ('PRIVATE_CANARY_RING_MESSAGE',)
+        self.assertEqual(self.sanitized_ring(trusted), [
+            'retained-rings: ring=EVENTS refusal=discard'])
+
+        class PrivateString(str):
+            def __str__(self):
+                raise AssertionError('PRIVATE_CANARY_RING_STR')
+
+        for attribute, invalid in (
+                ('ring_name', 'EVENTS PRIVATE_CANARY_RING'), ('ring_name', []),
+                ('ring_name', PrivateString('EVENTS')),
+                ('category', 'discard PRIVATE_CANARY_RING'), ('category', True),
+                ('category', PrivateString('discard'))):
+            _, altered = self.read_ring('EVENTS', 'discard')
+            setattr(altered, attribute, invalid)
+            with self.subTest(attribute=attribute, value_type=type(invalid).__name__):
+                self.assertEqual(self.sanitized_ring(altered), [
+                    'retained-rings: RingRecordRefusal'])
+
+        class Subclass(capture.evidence.RingRecordRefusal):
+            def __str__(self):
+                raise AssertionError('PRIVATE_CANARY_RING_STR')
+
+        lookalike = type('RingRecordRefusal', (AssertionError,), {})('PRIVATE_CANARY_RING')
+        lookalike.ring_name, lookalike.category = 'EVENTS', 'discard'
+        for error, kind in ((lookalike, 'RingRecordRefusal'),
+                            (Subclass('discard', 'EVENTS'), 'Subclass'),
+                            (AssertionError('ring=EVENTS refusal=discard PRIVATE_CANARY_RING'),
+                             'AssertionError')):
+            with self.subTest(kind=kind):
+                self.assertEqual(self.sanitized_ring(error), [f'retained-rings: {kind}'])
+        diagnostic = io.StringIO()
+        diagnostic.close()
+        with contextlib.redirect_stderr(diagnostic):
+            self.assertEqual(capture.sanitized('retained-rings', trusted), [
+                'retained-rings: ring=EVENTS refusal=discard'])
+
+
 class StoppedCanaryCaptureTests(unittest.TestCase):
     def test_outside_epoch_sample_publishes_all_values_without_iterator_identities(self):
         self.probe('case:epoch_sample')

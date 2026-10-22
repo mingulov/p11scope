@@ -368,17 +368,18 @@ jobs:
           sudo install -m 0755 "$bpftool_source" /usr/local/bin/bpftool
           bpftool version
           sudo bpftool version
-      # Reviewed object-attribute protocols, scalar scope, selected
-      # bootstrap and the P0 feature intentionally changed the default
-      # objects. Pin the accepted v0.4.0 source checkpoint; object parity
-      # here does not establish installed/live acceptance.
+      # Reviewed FULL size/scalar verifier boundaries, finite login type
+      # classification and fixed side-row scrubbing intentionally changed
+      # the default objects. Pin their accepted producer checkpoint;
+      # later userspace changes must preserve all three default objects.
+      # Object parity does not establish installed/live acceptance.
       # The checker reconstructs and explicitly fetches each immutable snapshot,
       # then builds it offline (including nested nightly Cargo). No target cache.
       - name: Compare complete default objects
         shell: bash
         run: |
           set -euo pipefail
-          BASELINE=f1bc557e85119f8caa82160a083d2c095eb58ba4
+          BASELINE=383d52af7dbb99a95e7e52746e018e301106bb41
           comparison_root="$RUNNER_TEMP/bpf-noninterference"
           mkdir -m 700 "$comparison_root"
           python3 -I scripts/check-bpf-noninterference.py \

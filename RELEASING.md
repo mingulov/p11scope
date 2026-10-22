@@ -170,12 +170,10 @@ private archive. The full hosted receipt remains on the runner only during
 verification. Actions logs contain a small status, source identity, tree and
 digest-checker summary; record their run URL and result.
 
-The current preview workflow still names its source-export input
-`p11scope-0.3.0-source.tar.gz`, independently of the manifest version. The
-packager validates the archive's recorded revision and derives the public
-source filename from the manifests. Inspect the actual output `RELEASE.json`
-and `SHA256SUMS`; the preview input filename is not version evidence. Workflow
-filename cleanup remains open.
+The preview workflow passes a version-neutral `source.tar.gz` from the exporter
+to the packager. The packager validates the archive's recorded revision and
+derives the public source filename from the manifests. Inspect the actual output
+`RELEASE.json` and `SHA256SUMS` for the candidate's version and source identity.
 `privileged-e2e` needs a `[self-hosted, bpf]` runner; select it only if one
 exists. Record the run URLs and exact source SHA for the release notes. A job
 judged environmental (a flaky coverage run, for example) is an explicit,

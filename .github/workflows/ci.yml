@@ -1019,8 +1019,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          source_archive="$RUNNER_TEMP/release-evidence/source.tar.gz"
           python3 -I scripts/export-source.py \
-            --output "$RUNNER_TEMP/release-evidence/p11scope-0.3.0-source.tar.gz"
+            --output "$source_archive"
           python3 -I scripts/release-notices.py \
             --cargo-about "$RUNNER_TEMP/release-tools/cargo-about" \
             --musl-archive "$RUNNER_TEMP/release-tools/musl-1.2.5.tar.gz" \
@@ -1028,7 +1029,7 @@ jobs:
           python3 -I scripts/package-release.py \
             --receipt "$RUNNER_TEMP/release-evidence/receipt" \
             --notices "$RUNNER_TEMP/release-evidence/notices" \
-            --source "$RUNNER_TEMP/release-evidence/p11scope-0.3.0-source.tar.gz" \
+            --source "$source_archive" \
             --output "$RUNNER_TEMP/release-evidence/public"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

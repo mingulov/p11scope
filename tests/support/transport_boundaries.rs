@@ -59,12 +59,19 @@ pub fn model_marker(path: &str, source: &str) -> Option<&'static str> {
             };
             // The legacy algorithm adapter is permitted only under its real,
             // directly attached test gate. Comments/literals cannot supply it.
-            if name == "deliver_joint_algorithm_failure_for_test"
-                && !code[..signature.start].ends_with(
-                    b"#[cfg(test)]\n    pub(crate) fn deliver_joint_algorithm_failure_for_test(",
-                )
-            {
-                continue;
+            if name == "deliver_joint_algorithm_failure_for_test" {
+                let header =
+                    b"#[cfg(test)]\n    pub(crate) fn deliver_joint_algorithm_failure_for_test(";
+                let preceding = &code[..signature.start];
+                if !preceding.ends_with(header) {
+                    continue;
+                }
+                let before_header = &preceding[..preceding.len() - header.len()];
+                // Macro input can look like an item while an expansion strips
+                // its attribute; the gate must be at real item depth.
+                if !balanced(before_header, b'(', b')') || !balanced(before_header, b'[', b']') {
+                    continue;
+                }
             }
             let signature_text = &source[signature.clone()];
             if signature_text.matches(MODEL_PARAMETER).count() != 1 {
@@ -477,6 +484,32 @@ mod tests {
             " -> &crate::semantics_objects::ObjectSemantics ",
         );
         assert!(model_marker(INPUT, &changed).is_some());
+    }
+
+    #[test]
+    fn test_only_helper_cannot_be_input_to_an_attribute_stripping_macro() {
+        let source = input();
+        let header = "#[cfg(test)]\n    pub(crate) fn deliver_joint_algorithm_failure_for_test(";
+        let begin = source.find(header).unwrap();
+        let (_, body) = function(
+            &source,
+            "deliver_joint_algorithm_failure_for_test",
+            Some("impl CallerRegistry {"),
+        )
+        .unwrap();
+        let item = &source[begin..body.end + 1];
+        let rejected: Vec<_> = [('(', ')'), ('[', ']')]
+            .into_iter()
+            .map(|(open, close)| {
+                let mut changed = source.clone();
+                changed.replace_range(
+                    begin..body.end + 1,
+                    &format!("strip_test_gate!{open}\n    {item}\n    {close};"),
+                );
+                model_marker(INPUT, &changed).is_some()
+            })
+            .collect();
+        assert_eq!(rejected, [true, true]);
     }
 
     #[test]

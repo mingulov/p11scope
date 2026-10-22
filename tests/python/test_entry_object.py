@@ -187,6 +187,116 @@ def mutate(disassembly, function, pc, old, new, internal_call=False, helper_call
 
 
 class EntryObjectTests(unittest.TestCase):
+    def _assert_inline_object_descriptor(self):
+        for variant in OBJECTS:
+            original, _, blocks, _ = consumer_case(variant, "p11_entry")
+            caller = CHECKER["_OwnedCaller"](original.section, original.name, original.lines, original.calls)
+            split = CHECKER["sections"](OBJECTS[variant])
+            internal_calls = {}
+            for owner, _, at, target in CHECKER["D"].internal_call_targets(split[".text"]):
+                internal_calls.setdefault(owner, {})[at] = target
+            caller.closed_callees = CHECKER["closed_entry_callees_contract"](blocks, internal_calls)
+            proof = CHECKER["_OwnedSinkProof"](6, 0, True, ("owned", 77, 0))
+            caller.proof = proof
+            query = call_site(variant, "p11_entry", "p11_object_side_get", 4)
+            index = next(pc for pc, text in caller.insns if pc > query and re.fullmatch(r"w9 = \*\(u32 \*\)\(r\d+ \+ 0x18\)", text))
+            side_reg = "r"+CHECKER["LOAD"].fullmatch(caller.text[index])[3]
+            table = next(pc for pc, name in caller.maps.items() if name == "OBJECT_DESCRIPTORS")
+            lookup = next(pc for pc, text in caller.insns if pc > table and text.startswith("call "))
+            null = next(pc for pc, text in caller.insns if pc > lookup and text.startswith("if r0 == 0x0 goto"))
+            field = next(pc for pc, text in caller.insns if pc > null and text == "w3 = *(u8 *)(r0 + 0x8)")
+            none = next(pc for pc, text in caller.insns if pc > field and text.startswith("if r3 == 0xff goto"))
+            argument = next(pc for pc, target in caller.calls.items() if pc > field and target.endswith("arg_u64"))
+            state = {side_reg: ("side", query, 0), "r10": ("stack", 0), ("side_owner", query): 77,
+                ("side_live", query): True, ("live", 77): True,
+                ("owned_word", 77, 8, 8): ("scalar", 6, 64),
+                ("stack", -128, 8): ("constant", 19)}
+            for pc, _ in caller.insns:
+                if index <= pc < lookup:
+                    state = caller.step(pc, state)
+            with self.subTest(variant=variant, control="side descriptor index is the object-table key"):
+                self.assertEqual(CHECKER["stack_read"](state, state["r2"], 4), ("object_index", query))
+            key = state["r2"]
+            zero = state | {side_reg: ("constant", 0), ("stack", key[1], 4): ("constant", 0), ("side_absent", query): True}
+            zero.pop(("side_live", query))
+            conditional = proof.join(state, zero)
+            with self.subTest(variant=variant, control="real side-absent zero joins retain only conditional index provenance"):
+                self.assertEqual(CHECKER["stack_read"](conditional, key, 4), ("object_optional_index", query))
+                caller.step(lookup, conditional)
+            unqualified = proof.join(state, {k: v for k, v in zero.items() if k != ("side_absent", query)})
+            with self.subTest(variant=variant, control="an arbitrary zero does not inherit side index provenance"), self.assertRaisesRegex(RuntimeError, "object descriptor.*key"):
+                caller.step(lookup, unqualified)
+            acquired = caller.step(lookup, state)
+            with self.subTest(variant=variant, control="nullable object row cannot supply fields"):
+                with self.assertRaisesRegex(RuntimeError, "object descriptor.*(nonnull|lifetime)"):
+                    caller.step(field, acquired)
+            rows = dict(proof.edges(caller, null, acquired, acquired))
+            nonnull = next(rows[pc] for pc in caller.graph[null] if pc != CHECKER["D"].relative_target(null, caller.text[null]))
+            loaded = caller.step(field, nonnull)
+            with self.subTest(variant=variant, control="exact template field survives the readonly lookup"):
+                self.assertEqual(loaded["r3"], ("object_field", lookup, 8))
+            valid = next(s for pc, s in proof.edges(caller, none, loaded, loaded)
+                         if pc != CHECKER["D"].relative_target(none, caller.text[none]))
+            ready = valid | {"r1": ("stack", -40), "r2": ("context", 0), "r4": ("constant", 0)}
+            with self.subTest(variant=variant, control="real inline Result boundary preserves disjoint START/frame"):
+                after = caller.step(argument, ready)
+                self.assertEqual(after[("owned_word", 77, 8, 8)], ("scalar", 6, 64))
+                self.assertEqual(after[("stack", -128, 8)], ("constant", 19))
+                tag = CHECKER["stack_read"](after, ("stack", -40), 8)
+                payload = CHECKER["stack_read"](after, ("stack", -32), 8)
+                self.assertIsNotNone(tag)
+                self.assertIsNotNone(payload)
+                self.assertEqual(tag[0], "object_result")
+                self.assertEqual(payload[0], "object_candidate")
+            first = after
+            second_at = next(pc for pc, target in caller.calls.items() if pc > argument and target.endswith("arg_u64"))
+            second = caller.step(second_at, ready | {"r3": ("object_field", lookup, 9)})
+            tag2 = CHECKER["stack_read"](second, ("stack", -40), 8)
+            value2 = CHECKER["stack_read"](second, ("stack", -32), 8)
+            pair_state = second | {"r1": tag2, "r2": tag,
+                ("stack", -208, 8): payload, ("stack", -200, 8): value2}
+            combine = next(pc for pc, text in caller.insns if pc > second_at and text == "r1 |= r2")
+            paired = caller.step(combine, pair_state)
+            guard = next(pc for pc, text in caller.insns if pc > combine and re.fullmatch(r"if r1 == 0x0 goto .*", text))
+            arms = dict(proof.edges(caller, guard, paired, paired))
+            ok = arms[CHECKER["D"].relative_target(guard, caller.text[guard])]
+            failed = next(s for pc, s in arms.items() if pc != CHECKER["D"].relative_target(guard, caller.text[guard]))
+            with self.subTest(variant=variant, control="actual combined Result guard promotes exactly both payloads"):
+                self.assertEqual(ok[("stack", -208, 8)], ("object_scalar", lookup, 8, 64))
+                self.assertEqual(ok[("stack", -200, 8)], ("object_scalar", lookup, 9, 64))
+                self.assertEqual(failed[("stack", -208, 8)][0], "object_candidate")
+                self.assertNotEqual(proof.partition(ok), proof.partition(failed))
+                none_state = paired | {("object_domain", lookup, 8): frozenset({255})}
+                self.assertNotIn(CHECKER["D"].relative_target(guard, caller.text[guard]), dict(proof.edges(caller, guard, none_state, none_state)))
+            # arg_u64's independently checked Result body handles every byte
+            # index, including ARG_NONE -> Err without a read. Caller effects
+            # need exact field/context/layout provenance, not a second guard.
+            with self.subTest(variant=variant, control="opaque byte index cannot imply a successful Result"):
+                opaque = caller.step(argument, loaded | {"r1": ("stack", -40), "r2": ("context", 0), "r4": ("constant", 0)})
+                self.assertEqual(CHECKER["stack_read"](opaque, ("stack", -32), 8)[0], "object_candidate")
+            for bad, reason in ((ready | {"r3": ("object_field", lookup, 4)}, "non-template object field"),
+                    (ready | {"r4": ("constant", 1)}, "other ABI"),
+                    (ready | {"r1": ("owned", 77, 0)}, "Result output in START")):
+                candidate = bad
+                with self.subTest(variant=variant, control=reason), self.assertRaisesRegex(RuntimeError, "closed.*(Result|index)"):
+                    caller.step(argument, candidate)
+            key = state["r2"]
+            for bad in (("constant", 1), ("object_index", query+1)):
+                changed = state | {("stack", key[1], 4): bad}
+                with self.subTest(variant=variant, control="foreign/mismatched object table key"), self.assertRaisesRegex(RuntimeError, "object descriptor.*key"):
+                    caller.step(lookup, changed)
+            absent = caller.step(lookup, state | {("stack", key[1], 4): ("constant", 0)})
+            absent = next(s for pc, s in proof.edges(caller, null, absent, absent)
+                          if pc != CHECKER["D"].relative_target(null, caller.text[null]))
+            with self.subTest(variant=variant, control="optional row-zero lookup grants no descriptor fields"), self.assertRaisesRegex(RuntimeError, "object descriptor.*lifetime"):
+                caller.step(field, absent)
+            with self.subTest(variant=variant, control="row fields cannot revive a retired original owner"), self.assertRaisesRegex(RuntimeError, "object descriptor.*lifetime"):
+                caller.step(field, nonnull | {("live", 77): False, ("retired_owner", 77): True})
+            old = caller.text[field]
+            caller.text[field] = old.replace("u8", "u64")
+            with self.subTest(variant=variant, control="a wide object load cannot impersonate one template byte"), self.assertRaisesRegex(RuntimeError, "object descriptor.*width"):
+                caller.step(field, nonnull)
+
     def _assert_closed_entry_callees(self):
         for variant in OBJECTS:
             reports = internal_contract(variant, "closed_entry_callees_contract")
@@ -238,6 +348,30 @@ class EntryObjectTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "closed.*memory"):
                     internal_contract(variant, "closed_entry_callees_contract",
                         mutate(OBJECTS[variant], reader, pc, old, "*(u64 *)(r2 + 0x0) = r1"))
+
+    def _assert_entry_known_writer_footprints(self):
+        for variant in OBJECTS:
+            original, _, _, _ = consumer_case(variant, "p11_entry")
+            caller = CHECKER["_OwnedCaller"](original.section, original.name, original.lines, original.calls)
+            query = call_site(variant, "p11_entry", "p11_object_side_get", 4)
+            writer = next(pc for pc, target in caller.calls.items() if pc > query and target == "memset")
+            proof = CHECKER["_OwnedSinkProof"](6, 0, True, ("owned", 77, 0))
+            caller.proof = proof
+            initial = {"r1": ("side", query, 96), "r2": ("constant", 0), "r3": ("constant", 256),
+                ("side_owner", query): 77, ("side_live", query): True, ("live", 77): True,
+                ("owned_word", 77, 8, 8): ("scalar", 6, 64), ("success",): True,
+                ("stack", -128, 8): ("constant", 19)}
+            for pointer, size in ((("side", query, 96), 256), (("side", query, 64), 16), (("stack", -64), 32)):
+                with self.subTest(variant=variant, control="actual bounded writer preserves the disjoint capture", destination=pointer):
+                    after = caller.step(writer, initial | {"r1": pointer, "r3": ("constant", size)})
+                    proof.check_sink(caller, writer, after)
+                    self.assertEqual(after[("stack", -128, 8)], ("constant", 19))
+            for patch in ({"r1": ("owned", 77, 8)}, {"r1": ("context", 0)}, {"r1": ("side", query, 432)},
+                    {"r1": ("side", query, 0)}, {"r1": ("side", query, 64)},
+                    {"r1": ("stack", -8)}, {"r1": None}, {"r3": None}, {"r2": ("constant", 1)},
+                    {("live", 77): False}, {("side_live", query): False}):
+                with self.subTest(variant=variant, control="known writer cannot escape its qualified output", patch=patch), self.assertRaisesRegex(RuntimeError, "known.*(footprint|zero-fill|lifetime)"):
+                    caller.step(writer, initial | patch)
 
     def test_bounded_entry_cycles_require_proved_progress(self):
         for variant in OBJECTS:
@@ -1084,6 +1218,8 @@ class EntryObjectTests(unittest.TestCase):
 
     def test_callee_scalar_reads_and_option_success(self):
         self._assert_closed_entry_callees()
+        self._assert_inline_object_descriptor()
+        self._assert_entry_known_writer_footprints()
         for variant in OBJECTS:
             internal_contract(variant, "scalar_body_contract")
             cases = [

@@ -98,9 +98,13 @@ def narrow(fact, width):
         return None
     if fact[0] == "constant":
         return ("constant", fact[1] & ((1 << width) - 1))
-    if width == 64 or fact[0] == "field":
+    if width == 64 or fact[0] in ("field", "object_field"):
         return fact
     if width == 32:
+        if fact[0] in ("object_index", "object_optional_index", "object_function"):
+            return fact
+        if fact[0] == "object_result":
+            return fact
         if fact[0] == "finite":
             return number_fact(n & 0xffffffff for n in fact[1])
         if fact[0] in ("scalar", "retained"):
@@ -128,7 +132,7 @@ def address(state, base, sign, offset):
         return side_pointer(fact[1], (n+delta for n in offsets))
     if fact[0] == "owned":
         return (fact[0], fact[1], fact[2] + delta)
-    if fact[0] in ("function_value", "external_key"):
+    if fact[0] in ("function_value", "external_key", "object_descriptor"):
         return (fact[0], fact[1], fact[2] + delta)
     return None
 
@@ -721,7 +725,7 @@ class SinkProof:
                     fact = number_operation(old, op, rhs, 32 if dst.startswith("w") else 64)
                 elif rhs[0] == "constant":
                     amount = rhs[1]
-                    if old[0] == "field" and op == "&=" and amount == 255:
+                    if old[0] in ("field", "object_field") and op == "&=" and amount == 255:
                         fact = old
                     elif old[0] == "field" and op == "<<=":
                         fact = ("stride", old[1], 1 << amount, 0, None)
@@ -796,7 +800,7 @@ class SinkProof:
             state[("stack", output[1], size[1])] = ("candidate", pc, field, size[1]*8)
             state["r0"] = ("read_result", pc, field)
         if pc in consumer.helper and text == "call 0x1":
-            if before.get("r1", (None,))[0] == "map" and before["r1"][1] not in ("DESCRIPTORS", "ASYNC_FUNCTIONS"):
+            if before.get("r1", (None,))[0] == "map" and before["r1"][1] not in ("DESCRIPTORS", "ASYNC_FUNCTIONS", "OBJECT_DESCRIPTORS"):
                 # Different counter-map lookups join at shared writebacks;
                 # retain their common disjointness from the local frame.
                 state["r0"] = ("result", "map")
@@ -924,7 +928,7 @@ class SinkProof:
                     # to their full-register value. Option is the proved 0/1
                     # discriminator, not an unconstrained helper return value.
                     for fact in (left, right):
-                        require(not fact or fact[0] in ("constant", "field", "option", "argument_result", "low", "high", "selected")
+                        require(not fact or fact[0] in ("constant", "field", "object_field", "object_index", "object_function", "option", "argument_result", "low", "high", "selected")
                                 or fact[0] in ("scalar", "retained") and fact[2] == 32
                                 or fact[0] == "finite" and all(n <= 0xffffffff for n in fact[1])
                                 or fact == ("rsp", 32, 0),
@@ -1501,6 +1505,7 @@ def closed_entry_callees_contract(internal_blocks, internal_calls):
     require(all(name in internal_blocks for name in ("p11_alias_scan", "p11_stable_cell", "p11_request_cell")),
             "closed entry callee inventory")
     summaries = {}
+    memset_body_contract(internal_blocks)
     allowed = {"p11_alias_scan": 0x401,
                "p11_stable_cell": (0x10 << 32) | 0x1ffffff,
                "p11_request_cell": (0x14 << 40) | (4 << 32) | 0xffffffff}
@@ -1633,6 +1638,13 @@ class _OwnedCaller(_SeedCaller):
                 state.pop(reg(match[1]), None)
                 if fact is not None:
                     state[reg(match[1])] = fact
+            elif pointer and pointer[0] == "side" and pointer[2] == 24 and match[2] == "32":
+                state[reg(match[1])] = ("object_index", pointer[1])
+            elif pointer and pointer[0] == "object_descriptor":
+                if match[2] == "8" and 4 <= pointer[2] < 16:
+                    state[reg(match[1])] = ("object_field", pointer[1], pointer[2])
+                elif match[2] == "32" and pointer[2] == 0:
+                    state[reg(match[1])] = ("object_function", pointer[1])
         if "atomic" in text or "xchg" in text or text.startswith("lock "):
             match = ATOMIC_POINTER.search(text) or EXCHANGE_POINTER.search(text)
             pointer = address(incoming, *match.groups()[1:]) if match else None
@@ -1646,6 +1658,8 @@ class _OwnedCaller(_SeedCaller):
             elif pointer is None and not (match and incoming.get("r"+match[2], (None,))[0] == "result"):
                 forget_owned(state)
         if text.startswith("call "):
+            if pc in self.helper and text == "call 0x1" and incoming.get("r1") == ("map", "OBJECT_DESCRIPTORS"):
+                state["r0"] = ("object_descriptor", pc, 0)
             if not target and pc not in self.helper:
                 forget_owned(state)
             if pc in self.helper:
@@ -1699,6 +1713,13 @@ class _OwnedCaller(_SeedCaller):
             fact = narrow(value(incoming, match[2]), 32)
             if fact is not None:
                 state[reg(match[1])] = fact
+        if match := re.fullmatch(r"([rw]\d+) (\|=|&=) ([rw]\d+|-?0x[0-9a-f]+)", text):
+            left, right = incoming.get(reg(match[1])), value(incoming, match[3])
+            if left and left[0] == "object_result":
+                if match[2] == "|=" and right and right[0] == "object_result":
+                    state[reg(match[1])] = ("object_result", left[1] | right[1])
+                elif (match[2], right) in (("&=", ("constant", 1)), ("|=", ("constant", 0))):
+                    state[reg(match[1])] = left
         return state
 
 
@@ -1727,11 +1748,18 @@ class _OwnedSinkProof(SinkProof):
                 finite = "invalid"
         return super().partition(state) + (state.get(("live", self.start[1])),
             state.get(("cleanup",)), state.get(("poisoned",)), state.get(("entry_pending",)),
-            state.get(("entry_refusal",)), finite)
+            state.get(("entry_refusal",)), finite,
+            bool(state.get(("object_pair_ok", 0))), bool(state.get(("object_pair_ok", 1))))
 
     @staticmethod
     def join(previous, state):
         merged = SinkProof.join(previous, state)
+        if previous is not None:
+            for key in previous.keys() & state.keys():
+                for origin, other, predecessor in ((previous[key], state[key], state), (state[key], previous[key], previous)):
+                    if (isinstance(origin, tuple) and origin and origin[0] in ("object_index", "object_optional_index")
+                            and other == ("constant", 0) and predecessor.get(("side_absent", origin[1]))):
+                        merged[key] = ("object_optional_index", origin[1])
         if previous is not None and ("finite_values",) in previous and ("finite_values",) in state:
             merged[("finite_values",)] = tuple(sorted(set(previous[("finite_values",)]) | set(state[("finite_values",)])))
         return merged
@@ -1766,16 +1794,52 @@ class _OwnedSinkProof(SinkProof):
 
     def transfer(self, consumer, pc, before, state):
         text, target = consumer.text[pc], consumer.calls.get(pc, "")
+        if target in ("memset", "p11_link_current_identity"):
+            pointer = before.get("r1")
+            length = before.get("r3") if target == "memset" else ("constant", 16)
+            require(length and length[0] == "constant" and length[1] > 0
+                    and (target != "memset" or before.get("r2") == ("constant", 0)),
+                    self.fail(consumer, pc, "known output needs a bounded zero-fill/identity effect"))
+            size = length[1]
+            local = pointer and pointer[0] == "stack" and -512 <= pointer[1] and pointer[1]+size <= 0
+            side = pointer[1] if pointer and pointer[0] == "side" else None
+            owner = before.get(("side_owner", side))
+            offsets = pointer[2] if pointer and pointer[0] == "side" else frozenset()
+            offsets = offsets if isinstance(offsets, frozenset) else {offsets}
+            private = (target == "memset" and side is not None and owner is not None
+                       and before.get(("live", owner)) and before.get(("side_live", side))
+                       and all((n, size) in ((64, 16), (96, 256)) for n in offsets))
+            require(local or private, self.fail(consumer, pc,
+                    "known output footprint leaves local storage/current side lifetime or reaches START/context"))
         summary = getattr(consumer, "closed_callees", {}).get(target)
+        if pc in consumer.helper and text == "call 0x1" and before.get("r1") == ("map", "OBJECT_DESCRIPTORS"):
+            index = stack_read(before, before.get("r2"), 4)
+            side = index[1] if index and index[0] in ("object_index", "object_optional_index") else None
+            owner = before.get(("side_owner", side))
+            # Option::None still performs the readonly row-zero lookup; it
+            # grants no row-field authority. The later side guard must refuse.
+            require(index == ("constant", 0) or (side is not None and owner is not None and before.get(("live", owner))
+                    and (index[0] == "object_optional_index" or before.get(("side_live", side)))),
+                    self.fail(consumer, pc, "object descriptor key/current side lifetime"))
+            state[("object_table_side", pc)] = side
         if summary:
             if summary["output"]:
                 output = before.get(summary["output"][0])
                 require(output and output[0] == "stack" and -512 <= output[1] <= -16,
                         self.fail(consumer, pc, "closed callee Result output outside local frame"))
                 if summary.get("argument"):
+                    index = before.get("r3")
+                    side = before.get(("object_table_side", index[1])) if index and index[0] == "object_field" else None
+                    owner = before.get(("side_owner", side))
                     require(before.get("r2") == ("context", 0) and before.get("r4") == ("constant", self.abi)
-                            and before.get("r3", (None,))[0] in ("field", "constant"),
+                            and index and index[0] == "object_field" and 8 <= index[2] <= 11
+                            and before.get(("object_descriptor_live", index[1])) and before.get(("side_live", side))
+                            and owner is not None and before.get(("live", owner)),
                             self.fail(consumer, pc, "closed scalar Result context/layout/index"))
+                    origin = (pc, index[1], index[2], 32 if self.abi else 64)
+                    state[("stack", output[1], 8)] = ("object_result", frozenset({origin}))
+                    state[("stack", output[1]+8, 8)] = ("object_candidate", origin)
+                    state[("object_pair_ok", (index[2]-8)//2)] = False
                 else:
                     closure = before.get("r2")
                     layout = stack_read(before, closure, 8)
@@ -1813,6 +1877,15 @@ class _OwnedSinkProof(SinkProof):
                 offsets = pointer[2] if isinstance(pointer[2], frozenset) else {pointer[2]}
                 require(all(0 <= n and n+size <= 432 for n in offsets),
                         self.fail(consumer, pc, "side memory footprint outside the 432-byte row"))
+            if pointer and pointer[0] == "object_descriptor":
+                side = before.get(("object_table_side", pointer[1]))
+                owner = before.get(("side_owner", side))
+                require(before.get(("object_descriptor_live", pointer[1])) and owner is not None
+                        and before.get(("live", owner)) and before.get(("side_live", side)),
+                        self.fail(consumer, pc, "object descriptor nonnull/current START lifetime"))
+                require(LOAD.fullmatch(text) and ((memory[2] == "32" and pointer[2] == 0)
+                        or (memory[2] == "8" and 4 <= pointer[2] < 16)),
+                        self.fail(consumer, pc, "object descriptor readonly field width"))
         if target == "p11_object_side_get":
             identity, key = (consumer.section, consumer.name), before.get("r1")
             require(before.get(("live", self.start[1])) and key and key[0] == "stack"
@@ -1846,6 +1919,50 @@ class _OwnedSinkProof(SinkProof):
             if branch:
                 left, right = value(before, branch[1]), value(before, branch[3])
                 zero_taken = zero_partition(left, branch[2], 64) if left and right == ("constant", 0) else None
+                taken = successor == D.relative_target(pc, consumer.text[pc])
+                if left and left[0] == "object_descriptor" and zero_taken is not None:
+                    if taken != zero_taken:
+                        state[("object_descriptor_live", left[1])] = True
+                    else:
+                        state.pop(("object_descriptor_live", left[1]), None)
+                        for key, fact in list(state.items()):
+                            if fact == left:
+                                state[key] = ("constant", 0)
+                if left and left[0] == "side" and zero_taken is not None:
+                    if taken == zero_taken:
+                        state[("side_absent", left[1])] = True
+                        state.pop(("side_live", left[1]), None)
+                    else:
+                        state.pop(("side_absent", left[1]), None)
+                if left and left[0] == "object_field" and right and right[0] == "constant":
+                    key = ("object_domain", left[1], left[2])
+                    domain = frozenset(n for n in before.get(key, BYTE_DOMAIN)
+                                       if compare(n, branch[2], right[1], 32 if branch[1].startswith("w") else 64) == taken)
+                    if not domain:
+                        continue
+                    state[key] = domain
+                if left and left[0] == "object_result" and right == ("constant", 0):
+                    require(branch[2] in ("==", "!="), self.fail(consumer, pc, "object Result success predicate"))
+                    success = taken == (branch[2] == "==")
+                    if success:
+                        possible = True
+                        for origin in left[1]:
+                            _, table, field, _ = origin
+                            key = ("object_domain", table, field)
+                            domain = before.get(key, BYTE_DOMAIN) & frozenset(range(7))
+                            if not domain:
+                                possible = False
+                                break
+                            state[key] = domain
+                        if not possible:
+                            continue
+                        for key, fact in list(state.items()):
+                            if isinstance(fact, tuple) and fact and fact[0] == "object_candidate" and fact[1] in left[1]:
+                                _, table, field, width = fact[1]
+                                state[key] = ("object_scalar", table, field, width)
+                    for pair in (0, 1):
+                        if {origin[2] for origin in left[1]} == {8+2*pair, 9+2*pair}:
+                            state[("object_pair_ok", pair)] = success
                 if left and left[0] == "entry_adapter" and zero_taken is not None:
                     require(branch[1].startswith("r"), self.fail(consumer, pc, "entry adapter result width"))
                     state.pop(("entry_pending",), None)
@@ -1935,6 +2052,19 @@ def scalar_scope_flags_contract(disassembly):
     return name
 
 
+def memset_body_contract(blocks):
+    require("memset" in blocks, "seeded START missing memset")
+    memset = D.instructions(blocks["memset"])
+    # Different objdump versions spell the same stored sub-register r2/w2.
+    patterns = (r"if r3 == 0x0 goto .*", r"r4 = 0x0", r"r5 = r1", r"r5 \+= r4",
+                r"\*\(u8 \*\)\(r5 \+ 0x0\) = (?:w2|r2)", r"r4 \+= 0x1", r"if r3 > r4 goto .*", r"exit")
+    require(len(memset) == len(patterns) and all(re.fullmatch(pattern, instruction) for (_, instruction), pattern in zip(memset, patterns)),
+            "seeded START memset byte-loop summary changed")
+    require(D.relative_target(memset[0][0], memset[0][1]) == memset[-1][0]
+            and D.relative_target(memset[-2][0], memset[-2][1]) == memset[2][0],
+            "seeded START memset loop edges changed")
+
+
 def seeded_start_contract(disassembly):
     """Actual ordinary-entry key/immutable-seed wiring, independent of old pins.
 
@@ -1946,19 +2076,7 @@ def seeded_start_contract(disassembly):
     split = sections(disassembly)
     require(".text" in split and "uprobe" in split, "seeded START missing sections")
     blocks = D.function_blocks(split[".text"])
-    require("memset" in blocks, "seeded START missing memset")
-    memset = D.instructions(blocks["memset"])
-    # llvm-objdump 18 prints the stored sub-register as `r2`; 21 prints the
-    # same instruction bytes as `w2`. Accept both spellings: the loop shape
-    # (8 instructions, byte store, bounds) is what the contract pins.
-    patterns = (r"if r3 == 0x0 goto .*", r"r4 = 0x0", r"r5 = r1", r"r5 \+= r4",
-                r"\*\(u8 \*\)\(r5 \+ 0x0\) = (?:w2|r2)", r"r4 \+= 0x1", r"if r3 > r4 goto .*", r"exit")
-    require(len(memset) == len(patterns) and all(re.fullmatch(pattern, instruction) for (_, instruction), pattern in zip(memset, patterns)),
-            "seeded START memset byte-loop summary changed")
-    _, graph = D.instruction_graph(blocks["memset"])
-    require(D.relative_target(memset[0][0], memset[0][1]) == memset[-1][0]
-            and D.relative_target(memset[-2][0], memset[-2][1]) == memset[2][0],
-            "seeded START memset loop edges changed")
+    memset_body_contract(blocks)
     calls = D.internal_call_targets(split["uprobe"] + "\n" + split[".text"])
     report = {}
     for name, lines in D.function_blocks(split["uprobe"]).items():

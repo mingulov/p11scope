@@ -32,7 +32,7 @@ c = capture.custody
 fixtures = load_path(ROOT / 'tests/python/test_canary_evidence.py', 'canary_fixtures')
 
 
-def foreign_population_error(map_id=111, pid=8888, tid=8888):
+def foreign_population_error(map_id=101, pid=8888, tid=8888):
     fixture = fixtures.StoppedPopulationTests('test_framed_records_bind_generations_for_future_coordinator')
     maps, records, arguments = fixture.reconciliation_fixture()
     item = next(row for row in maps if row['id'] == map_id)
@@ -456,7 +456,7 @@ def coordinator_case(pid, directory, case):
     roster_samples, start_dumps = {}, 0
     original_handlers = {number: signal.getsignal(number) for number in (signal.SIGINT, signal.SIGTERM)}
     original_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
-    expected_success = kind in ('native', 'immediate_exit', 'idle_owner')
+    expected_success = kind in ('native', 'immediate_exit', 'idle_owner', 'epoch_sample')
     initial_descriptors = open_descriptors()
     failed_resume = False
     replay_count, inventory_count, position_count = 0, 0, 0
@@ -598,6 +598,13 @@ def coordinator_case(pid, directory, case):
         return original_refuse(item, deadline)
     def frames(*args):
         raw = original_frames(*args)
+        if kind == 'epoch_sample':
+            epoch_id = next(item['id'] for item in source.maps if item['name'] == 'PROC_EPOCH')
+            values = (fixtures.StoppedPopulationTests.epoch_value((), (), 4, 0), bytes(152))
+            # These are iterator identities, never stopped-roster members.
+            return b''.join(capture.dumper.TASK_STORAGE_HEADER.pack(
+                capture.dumper.TASK_STORAGE_MAGIC, 1, epoch_id, task, task, len(value)) + value
+                for task, value in zip((0xffff0001, 0xffff0002), values)) + raw
         if kind == 'frames':
             return raw[:-1]
         if kind == 'cookie':
@@ -778,6 +785,17 @@ def coordinator_case(pid, directory, case):
         if kind == 'idle_owner' and not errors:
             retained = Path(directory) / f'mapdump_THREAD_OWNER_{config.lane}.bin'
             assert retained.is_file() and len(retained.read_bytes()) == 0, 'idle owner bytes were staged'
+        if kind == 'epoch_sample' and not errors:
+            manifest = json.loads(result.read_text())
+            epoch = next(item for item in manifest if item['name'] == 'PROC_EPOCH')
+            receipt = json.loads(Path(epoch['snapshot']['receipt']).read_text())
+            surface = next(row for row in receipt['surfaces'] if row['id'] == epoch['id'])
+            assert set(surface) == {'id', 'acquisition_id', 'phase', 'size', 'sha256', 'record_count'}
+            assert (surface['phase'], surface['record_count'], surface['size']) == ('sampled', 2, 304)
+            assert Path(epoch['file']).read_bytes() == (
+                fixtures.StoppedPopulationTests.epoch_value((), (), 4, 0) + bytes(152))
+            assert all(str(task) not in json.dumps(receipt) for task in (0xffff0001, 0xffff0002))
+            assert [name for name, _ in source.calls].count('INSTANCE_GEN') == 1
         for fd in test_handles:
             assert select.select([fd], [], [], 1)[0]
             try:
@@ -1102,11 +1120,14 @@ def owned_case(pid, directory, case, program, provider):
 
 
 class StoppedCanaryCaptureTests(unittest.TestCase):
+    def test_outside_epoch_sample_publishes_all_values_without_iterator_identities(self):
+        self.probe('case:epoch_sample')
+
     def test_population_diagnostic_preserves_map_relation_and_leader_only(self):
         # Generic sanitization currently discards the map that distinguishes a
         # continuity bookkeeping mismatch from foreign cookie/owner capture.
         for map_id, name in ((101, 'TASK_COOKIE'), (102, 'THREAD_OWNER'),
-                             (103, 'ROOT_AFFILIATION'), (111, 'PROC_EPOCH')):
+                             (103, 'ROOT_AFFILIATION')):
             for relation, pid, tid, leader in (
                 ('outside-roster', 8888, 8888, 'yes'),
                 ('outside-roster', 8888, 8889, 'no'),
@@ -1171,7 +1192,7 @@ class StoppedCanaryCaptureTests(unittest.TestCase):
         diagnostic.close()
         with contextlib.redirect_stderr(diagnostic):
             self.assertEqual(capture.sanitized('retained-semantics', error),
-                             ['retained-semantics: task-storage map=PROC_EPOCH '
+                             ['retained-semantics: task-storage map=TASK_COOKIE '
                               'relation=outside-roster leader=yes'])
 
     def test_retained_object_scrub_requires_q_before_reading_hash(self):

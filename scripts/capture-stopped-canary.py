@@ -894,8 +894,11 @@ class Coordinator:
                     {'cookie': row['role'] == 'leader' and cfg.mode != 'metrics',
                      'owner': row['role'] == 'worker', 'root': owned and row['role'] == 'leader'} for row in tasks]
         receipt_lane = 'owned-root' if owned else 'external'
+        instance_gen = next(item for item in maps if item['name'] == 'INSTANCE_GEN')
+        instance_gen = {**instance_gen, 'cells': ordinary['INSTANCE_GEN']}
         bound = dumper.reconcile_task_storage(task_maps, records, expected=expected, before=before, after=after,
-                                             controls=controls, lane=receipt_lane, small_state=False)
+                                             controls=controls, instance_gen=instance_gen,
+                                             lane=receipt_lane, small_state=False)
         if cfg.mode == 'metrics':
             require(evidence.u64(controls['COOKIE_CTL']['value'], 8) == 0, 'aggregate-only cookie allocation history')
         if cfg.workload_mode in ('matrix', 'object'):
@@ -924,7 +927,11 @@ class Coordinator:
             raw = values[item['name']]
             row = {'id': item['id'], 'acquisition_id': acquisition, 'phase': 'stopped',
                    'size': len(raw), 'sha256': hashlib.sha256(raw).hexdigest()}
-            if item['type'] == 'task_storage':
+            if item['name'] == 'PROC_EPOCH':
+                # This global continuity control may change outside the
+                # stopped workload. Retain all values, never iterator IDs.
+                row.update(phase='sampled', record_count=len(raw) // item['bytes_value'])
+            elif item['type'] == 'task_storage':
                 row['records'] = bound[item['name']]
             elif item['type'] == 'ringbuf':
                 # The two kernel byte counters the retained bytes were read

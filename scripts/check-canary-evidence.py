@@ -1548,22 +1548,26 @@ def assert_stopped_snapshot(manifest, prefix):
         names = [metadata["name"] for metadata in metadata_rows]
         require(len(set(names)) == len(names), "duplicate map names")
         require(set(api["TASK_STORAGE_NAMES"]) | {
-            "COOKIE_CTL", "OWNER_CTL", "ROOT_CTL", "START", "EVENTS", "DISCOVERY"
+            "COOKIE_CTL", "OWNER_CTL", "ROOT_CTL", "INSTANCE_GEN", "START", "EVENTS", "DISCOVERY"
         } <= set(names), "missing required acquisition map")
         records, maps, controls = [], [], {}
-        total = 0
+        total, record_count = 0, 0
+        epoch_raw, instance_gen = None, None
         for item, metadata in zip(manifest, metadata_rows):
             name = metadata["name"]
             context = f"stopped map id={item['id']} name={name}"
             surface = surfaces[item["id"]]
             task_storage = metadata["type"] == "task_storage"
+            sampled = name == "PROC_EPOCH"
             ring = metadata["type"] == "ringbuf"
             require(not ring or name in RING_RECORD_SIZES, "unknown ring surface")
             fields = {"id", "acquisition_id", "phase", "size", "sha256"}
-            require(set(surface) == fields | ({"records"} if task_storage else set())
+            require(set(surface) == fields | ({"record_count"} if sampled else
+                                             {"records"} if task_storage else set())
                     | ({"positions"} if ring else set()),
                     "malformed surface metadata")
-            require(surface["acquisition_id"] == acquisition and surface["phase"] == "stopped",
+            require(surface["acquisition_id"] == acquisition
+                    and surface["phase"] == ("sampled" if sampled else "stopped"),
                     "surface acquisition or phase mismatch")
             require(uint(surface["size"]) and surface["size"] <= maximum - total,
                     "surface exceeds aggregate byte bound")
@@ -1611,10 +1615,20 @@ def assert_stopped_snapshot(manifest, prefix):
                         "ring positions contradict the retained ring bytes")
             if task_storage:
                 maps.append(metadata)
+                if sampled:
+                    count = surface["record_count"]
+                    require(uint(count) and count <= api["TASK_STORAGE_MAX_RECORDS"] - record_count,
+                            "invalid sampled control count bound")
+                    require(len(raw) == count * api["PROC_EPOCH_RECORD"].size,
+                            "sampled control byte count mismatch")
+                    record_count += count
+                    epoch_raw = raw
+                    continue
                 identities = surface["records"]
                 require(isinstance(identities, list)
-                        and len(identities) <= api["TASK_STORAGE_MAX_RECORDS"] - len(records),
+                        and len(identities) <= api["TASK_STORAGE_MAX_RECORDS"] - record_count,
                         "invalid record population bound")
+                record_count += len(identities)
                 size = item["value_size"]
                 require(uint(size, 32, positive=True) and len(raw) == len(identities) * size,
                         "record population byte count mismatch")
@@ -1634,10 +1648,21 @@ def assert_stopped_snapshot(manifest, prefix):
                         "malformed control cell")
                 require(byte_array(cells[0]["key"], 4) == bytes(4), "invalid control key")
                 controls[name] = {**metadata, "value": byte_array(cells[0]["value"], item["value_size"])}
+            elif name == "INSTANCE_GEN":
+                instance_gen = {**metadata, "cells": read_json_bytes(raw)}
         api["reconcile_task_storage"](
             maps, records, expected=receipt["expected"], before=receipt["before"],
-            after=receipt["after"], controls=controls, lane=receipt["lane"],
+            after=receipt["after"], controls=controls, instance_gen=instance_gen, lane=receipt["lane"],
             small_state=receipt["small_state"])
+        require(epoch_raw is not None, "missing sampled continuity control")
+        attach_generation = api["instance_attach_generation"](instance_gen)
+        size = api["PROC_EPOCH_RECORD"].size
+        # Leader/duplicate checks belong to acquisition. Discarded iterator IDs
+        # cannot support those checks or establish row origins during replay:
+        # replay validates retained values, never a frozen global population.
+        require(all(api["proc_epoch_value_valid"](epoch_raw[offset:offset + size], attach_generation)
+                    for offset in range(0, len(epoch_raw), size)),
+                "invalid sampled continuity control value")
     except RuntimeError as error:
         raise AssertionError(str(error)) from None
     except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError, RecursionError):

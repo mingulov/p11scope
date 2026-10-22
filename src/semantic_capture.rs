@@ -3908,7 +3908,8 @@ mod tests {
             self.adapter.bind_session_drain(&grant).unwrap();
             let collection = raw
                 .ingest(&mut self.adapter, &self.producers, &grant)
-                .unwrap_or_else(|(_, reason)| panic!("raw ingest: {reason:?}"));
+                .unwrap_or_else(|(_, reason)| panic!("raw ingest: {reason:?}"))
+                .into_collection_for_birth_test();
             assert_eq!(
                 self.adapter.attest_key(admitted).unwrap(),
                 proof,
@@ -4112,6 +4113,74 @@ mod tests {
             next_ingested.validate_owner(&harness.adapter, &harness.producers),
             Ok(())
         );
+    }
+
+    #[test]
+    fn joint_raw_negative_preserves_sealed_domain_loss_effects() {
+        use crate::semantics_objects::journal::joint_driver::{
+            JointCaptureOwner, RawDisposeReason,
+        };
+        use crate::semantics_objects::journal::tests::{NativeBirthRows, NativePublisher};
+        use crate::semantics_objects::journal::{AttestationRefusal, JournalGap};
+        use crate::semantics_objects::{Lifetime, ObjectEffect, ObjectGap};
+
+        let mut harness = JointBirthHarness::new();
+        harness.push_create(1);
+        let mut raw = harness.collect();
+        let (report, admitted) = harness.route(&mut raw);
+        let (collection, proof) = harness.ingest(raw, &admitted);
+        let publisher = NativePublisher::build();
+        let (row, control, _) =
+            publisher.publish_stamped(&["0", "0"], harness.fixture.attachment().generation());
+        let mut rows = NativeBirthRows { row, control };
+        let witness = harness.birth(report, &admitted, &proof, None, &mut rows);
+        let mut model = crate::semantics_objects::ObjectSemantics::new();
+        assert_eq!(harness.seal(collection, &witness, &mut rows, &mut model), 1);
+        let domain = witness.receipt().domain();
+        let before = model.project();
+        assert_eq!(
+            before.objects.len(),
+            1,
+            "the actual CREATE established history"
+        );
+        let object = before.objects[0].id;
+        assert_eq!(before.objects[0].lifetime, Lifetime::Live);
+        let settled_census = harness.adapter.ledger().census();
+
+        harness.push_create(2);
+        let mut raw = harness.collect();
+        let (_, next_admitted) = harness.route(&mut raw);
+        let mut owner = JointCaptureOwner::from_existing_parts_for_test(harness.adapter, model);
+        let negative = raw
+            .dispose_without_ingest(
+                &mut owner,
+                &harness.producers,
+                RawDisposeReason::NoAdmission,
+            )
+            .unwrap_or_else(|(_, reason)| panic!("original unclaimed disposition: {reason:?}"));
+        let failure = negative
+            .failure()
+            .expect("affecting original requires loss");
+        assert_eq!(failure.gap, JournalGap::ImageTainted);
+        assert!(failure.affects_domain(domain));
+        assert!(
+            failure.effects.effects.iter().any(|effect| matches!(
+                effect,
+                ObjectEffect::Retired { object: affected, reason: ObjectGap::Loss }
+                    if *affected == object
+            )),
+            "original model effects remain with the negative receipt"
+        );
+        assert_eq!(
+            owner.model().project().object(object).unwrap().lifetime,
+            Lifetime::Retired(ObjectGap::Loss)
+        );
+        assert_eq!(
+            owner.adapter_mut().bind_admitted_key(&next_admitted),
+            Err(AttestationRefusal::ImageTainted),
+            "discarded object input cannot later acquire the old domain's authority"
+        );
+        assert_eq!(owner.ledger().census(), settled_census);
     }
 
     #[test]

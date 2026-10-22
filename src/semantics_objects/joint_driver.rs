@@ -5,9 +5,9 @@
 
 use super::ledger::{ExistingReservation, LedgerGeneration};
 use super::{
-    FaultEpoch, FaultReadError, JournalAdapter, JournalCollection, JournalIngestItem,
-    JournalLimits, JournalNativeKey, OpenEntry, SessionDrainGrant, StagingLedger,
-    end_agrees_with_begin,
+    ConsumptionOrdinal, FaultEpoch, FaultReadError, JournalAdapter, JournalCollection, JournalGap,
+    JournalIngestItem, JournalLimits, JournalNativeKey, OpenEntry, SealFailure, SessionDrainGrant,
+    StagingLedger, end_agrees_with_begin,
 };
 use crate::attach::SessionDrainProducers;
 use crate::attach::capture::NativeDomainId;
@@ -143,6 +143,16 @@ pub(crate) struct JointCaptureOwner {
 }
 
 impl JointCaptureOwner {
+    /// Move the fixture's genuine sealed history and original ledger together.
+    /// This test seam neither constructs a domain nor registers model authority.
+    #[cfg(test)]
+    pub(crate) fn from_existing_parts_for_test(
+        adapter: JournalAdapter,
+        model: ObjectSemantics,
+    ) -> Self {
+        Self { model, adapter }
+    }
+
     /// Build the capture's owner over the registry's existing pool: the
     /// adapter takes policy limits with the pool's reserver behind its
     /// ledger, and the model starts empty. The ledger's table storage
@@ -235,6 +245,137 @@ struct RawCuts {
     birth: super::JournalBirthCut,
 }
 
+/// Fixed provenance moved from the one original raw allocation. Its collection
+/// and cuts never acquire a scalar constructor or a second retained wire copy.
+struct RawProvenance {
+    identity: RawQuantumIdentity,
+    collection: JournalCollection,
+    producers: SessionDrainProducers,
+    ledger: LedgerGeneration,
+    cuts: Option<RawCuts>,
+}
+
+impl RawProvenance {
+    fn validate_owner(
+        &self,
+        adapter: &JournalAdapter,
+        producers: &SessionDrainProducers,
+    ) -> Result<(), RawQuantumRefusal> {
+        if !self.producers.same_producers(producers)
+            || !adapter
+                .resource_producers
+                .as_ref()
+                .is_some_and(|own| own.same_producers(producers))
+            || self.cuts.as_ref().is_some_and(|cuts| {
+                !producers.matches_events(cuts.start.events())
+                    || cuts
+                        .end
+                        .as_ref()
+                        .is_some_and(|end| !producers.matches_events(end.events()))
+            })
+        {
+            return Err(RawQuantumRefusal::ForeignCapture);
+        }
+        if adapter.ledger.generation() != Some(self.ledger) {
+            return Err(RawQuantumRefusal::ForeignLedger);
+        }
+        Ok(())
+    }
+}
+
+/// Actual original ingestion, before H3 is taken or an audit is constructed.
+/// Move-only; the frontier remains the one observed at this ingest even after
+/// the adapter consumes a later quantum.
+pub(crate) struct IngestedRaw {
+    raw: RawProvenance,
+    frontier: ConsumptionOrdinal,
+}
+
+#[cfg_attr(not(test), allow(dead_code))] // Prepared-claim/audit ports; the ordinary Joint lane remains inactive.
+impl IngestedRaw {
+    pub(crate) fn frontier(&self) -> ConsumptionOrdinal {
+        self.frontier
+    }
+
+    pub(crate) fn matches_admission(
+        &self,
+        admitted: &crate::discovery::caller_registry::instance_input::AdmittedInstanceCall,
+    ) -> bool {
+        admitted.journal_binding().0 == self.raw.producers.native_domain()
+            && admitted.collected_origin().is_some_and(|origin| {
+                origin.quantum == self.raw.identity && origin.position == admitted.h0_ordinal()
+            })
+    }
+
+    pub(crate) fn validate_owner(
+        &self,
+        adapter: &JournalAdapter,
+        producers: &SessionDrainProducers,
+    ) -> Result<(), RawQuantumRefusal> {
+        self.raw.validate_owner(adapter, producers)?;
+        if adapter.consumed_frontier() != self.frontier {
+            return Err(RawQuantumRefusal::StaleFrontier);
+        }
+        Ok(())
+    }
+
+    // Only the existing journal-owned single-seal consumer can extract this
+    // actual collection. Multi-domain audit ownership replaces that consumer
+    // before ordinary activation; outside callers receive only this proof.
+    pub(super) fn into_collection(self) -> JournalCollection {
+        self.raw.collection
+    }
+
+    #[cfg(test)]
+    pub(crate) fn into_collection_for_birth_test(self) -> JournalCollection {
+        self.into_collection()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RawDisposeReason {
+    Empty,
+    NoAdmission,
+    Capacity,
+    TerminalLoss,
+}
+
+/// Original negative custody/effects. There is no collection/audit/bootstrap
+/// extraction port: an empty disposition grants no clean object prefix.
+pub(crate) struct RawDisposition {
+    raw: RawProvenance,
+    frontier: ConsumptionOrdinal,
+    reason: RawDisposeReason,
+    failure: Option<SealFailure>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))] // The staged machine will retain/deliver this negative before activation.
+impl RawDisposition {
+    pub(crate) fn reason(&self) -> RawDisposeReason {
+        self.reason
+    }
+
+    pub(crate) fn failure(&self) -> Option<&SealFailure> {
+        self.failure.as_ref()
+    }
+
+    pub(crate) fn identity(&self) -> RawQuantumIdentity {
+        self.raw.identity
+    }
+
+    pub(crate) fn frontier(&self) -> ConsumptionOrdinal {
+        self.frontier
+    }
+
+    pub(crate) fn validate_owner(
+        &self,
+        adapter: &JournalAdapter,
+        producers: &SessionDrainProducers,
+    ) -> Result<(), RawQuantumRefusal> {
+        self.raw.validate_owner(adapter, producers)
+    }
+}
+
 pub(crate) struct RawJointQuantum {
     identity: RawQuantumIdentity,
     ordered: Vec<JournalIngestItem>,
@@ -275,6 +416,9 @@ pub(crate) enum RawQuantumRefusal {
     Ledger(super::LedgerRefusal),
     Allocation,
     Admission,
+    StaleFrontier,
+    DispositionMismatch,
+    Stopped,
     Cut(super::BirthCutRefusal),
     Cursor(crate::events::EventsCutRefusal),
     Fault(FaultReadError),
@@ -448,7 +592,7 @@ impl RawJointQuantum {
         self.ordinary.len()
     }
 
-    pub(super) fn ready_for_ingest(
+    fn validate_owner(
         &self,
         adapter: &JournalAdapter,
         producers: &SessionDrainProducers,
@@ -464,6 +608,18 @@ impl RawJointQuantum {
         if self.ledger_generation.is_none() || self.ledger_generation != adapter.ledger.generation()
         {
             return Err(RawQuantumRefusal::ForeignLedger);
+        }
+        Ok(())
+    }
+
+    pub(super) fn ready_for_ingest(
+        &self,
+        adapter: &JournalAdapter,
+        producers: &SessionDrainProducers,
+    ) -> Result<(), RawQuantumRefusal> {
+        self.validate_owner(adapter, producers)?;
+        if adapter.stopped || adapter.invalidated {
+            return Err(RawQuantumRefusal::Stopped);
         }
         if !self.h0_reported || !self.ordinary.is_empty() || self.h0_pending {
             return Err(RawQuantumRefusal::H0Undelivered);
@@ -486,6 +642,99 @@ impl RawJointQuantum {
             || self.audit.counter_error
             || self.audit.fault_error.is_some()
             || self.audit.fault_before != self.audit.fault_after
+    }
+
+    fn contiguous_stream(&self, adapter: &JournalAdapter) -> bool {
+        self.cuts.as_ref().is_some_and(|cuts| {
+            adapter.accepts_birth_cut(&cuts.birth)
+                && adapter.consumed_frontier() == cuts.birth.ordinal
+                && adapter
+                    .stream_boundary
+                    .as_ref()
+                    .is_some_and(|boundary| boundary.same_boundary(&cuts.start))
+                && cuts
+                    .end
+                    .as_ref()
+                    .is_some_and(|end| end.clean_successor_of(&cuts.start))
+                && !self.collection_failed()
+        })
+    }
+
+    /// One advancing borrow of the existing charged H0-origin table. No
+    /// per-record search or second retained association is needed.
+    fn classified_items(&self) -> impl Iterator<Item = (&JournalIngestItem, bool)> {
+        let mut origins = self.h0_origins.iter().peekable();
+        self.ordered.iter().enumerate().map(move |(index, item)| {
+            let quiet = if origins
+                .peek()
+                .is_some_and(|origin| origin.wire_index == index)
+            {
+                origins.next().expect("peeked original H0 position").quiet
+            } else {
+                false
+            };
+            (item, quiet)
+        })
+    }
+
+    fn affecting_images(&self) -> impl Iterator<Item = (u64, u64)> {
+        self.classified_items().flat_map(|(item, quiet)| {
+            let images = match item {
+                JournalIngestItem::Journal(JournalRecord::Begin(begin)) => {
+                    [Some(JournalAdapter::image_of_begin(begin)), None]
+                }
+                JournalIngestItem::Journal(JournalRecord::End(end)) => {
+                    [Some(super::end_image(end)), None]
+                }
+                JournalIngestItem::Journal(JournalRecord::Abandon(abandon)) => {
+                    [Some((abandon.image_cookie(), abandon.image_exec())), None]
+                }
+                JournalIngestItem::Ordinary(record) => {
+                    let event = &record.base.event;
+                    let child = (event.child_image.task_cookie, event.child_image.exec_id);
+                    [
+                        (!quiet).then_some((event.image.task_cookie, event.image.exec_id)),
+                        (child != (0, 0)).then_some(child),
+                    ]
+                }
+            };
+            images.into_iter().flatten()
+        })
+    }
+
+    fn disposal_gap(&self, adapter: &JournalAdapter, unlocalized: bool) -> JournalGap {
+        if adapter.stopped {
+            return JournalGap::Stopped;
+        }
+        if adapter.invalidated {
+            return JournalGap::AdapterInvalidated;
+        }
+        match self.audit.fault_error {
+            Some(FaultReadError::Unreadable) => return JournalGap::FaultUnreadable,
+            Some(FaultReadError::Saturated) => return JournalGap::FaultSaturated,
+            None => {}
+        }
+        if self.audit.fault_before != self.audit.fault_after
+            || adapter
+                .last_fault
+                .is_some_and(|last| last != self.audit.fault_before)
+        {
+            return JournalGap::FaultChanged;
+        }
+        if self.audit.counter_error {
+            return JournalGap::CounterUnprovable;
+        }
+        if self.audit.malformed_delta != 0 {
+            return JournalGap::Malformed;
+        }
+        if self.audit.discarded_delta != 0 {
+            return JournalGap::Discarded;
+        }
+        if unlocalized {
+            JournalGap::AdapterInvalidated
+        } else {
+            JournalGap::ImageTainted
+        }
     }
 
     /// Borrow the retained H0 inputs. The collected leaf consumes copies into
@@ -957,6 +1206,88 @@ impl RawJointQuantum {
         })
     }
 
+    /// Dispose only this allocation, after its ordinary facts reached actual
+    /// H0. Capacity/terminal loss may end raw custody while H0 retains its own
+    /// unresolved original; that is loss, never provider completion.
+    #[cfg_attr(not(test), allow(dead_code))] // Staged negative-machine port, before ordinary Joint activation.
+    #[allow(clippy::result_large_err)] // Refusal preserves the unchanged original and paid buffers.
+    pub(crate) fn dispose_without_ingest(
+        self,
+        owner: &mut JointCaptureOwner,
+        producers: &SessionDrainProducers,
+        reason: RawDisposeReason,
+    ) -> Result<RawDisposition, (Self, RawQuantumRefusal)> {
+        if let Err(refusal) = self.validate_owner(&owner.adapter, producers) {
+            return Err((self, refusal));
+        }
+        if !self.ordinary.is_empty()
+            || (!self.h0_origins.is_empty() && !self.h0_reported)
+            || (self.h0_pending && reason == RawDisposeReason::NoAdmission)
+        {
+            return Err((self, RawQuantumRefusal::H0Undelivered));
+        }
+        if reason == RawDisposeReason::Empty
+            && (!self.ordered.is_empty()
+                || self.attempted != 0
+                || self.collection_failed()
+                || self.resource_refused)
+        {
+            return Err((self, RawQuantumRefusal::DispositionMismatch));
+        }
+        let contiguous = self.contiguous_stream(&owner.adapter);
+        let overflow = owner
+            .adapter
+            .consumed_through
+            .checked_add(self.ordered.len() as u64)
+            .is_none();
+        let unlocalized = self.collection_failed()
+            || (self.cuts.is_some() && !contiguous)
+            || owner.adapter.stopped
+            || owner.adapter.invalidated
+            || owner
+                .adapter
+                .last_fault
+                .is_some_and(|last| last != self.audit.fault_before)
+            || overflow
+            || self.affecting_images().any(|image| image.0 == 0);
+        let affecting = self.affecting_images().next().is_some();
+        let failure = (unlocalized || affecting).then(|| {
+            let gap = if overflow {
+                JournalGap::CutExhausted
+            } else {
+                self.disposal_gap(&owner.adapter, unlocalized)
+            };
+            owner.adapter.refuse_disposed_raw(
+                &mut owner.model,
+                self.affecting_images(),
+                unlocalized,
+                gap,
+            )
+        });
+        // Every increment corresponds to this original consumed wire item.
+        // There is no H8 dispatch, claim, grant or synthetic terminal. Keep
+        // first-affecting sightings monotonic, including fork children.
+        for (item, quiet) in self.classified_items() {
+            let _ = owner.adapter.note_consumed_item(item, quiet);
+        }
+        if contiguous && !unlocalized {
+            owner.adapter.stream_boundary = self.cuts.as_ref().and_then(|cuts| cuts.end.clone());
+        } else if !self.ordered.is_empty() || self.collection_failed() {
+            owner.adapter.stream_broken = true;
+        }
+        if unlocalized {
+            owner.adapter.last_audit_failure = Some(owner.adapter.consumed_through);
+        }
+        let frontier = owner.adapter.consumed_frontier();
+        let raw = self.release_storage(&mut owner.adapter.ledger);
+        Ok(RawDisposition {
+            raw,
+            frontier,
+            reason,
+            failure,
+        })
+    }
+
     /// Consume the original wire sequence once after actual H0 disposition.
     /// Resource custody alone never binds a drain: the caller must first mint
     /// and bind the existing admission-based grant from these SAME producers.
@@ -967,7 +1298,7 @@ impl RawJointQuantum {
         adapter: &mut JournalAdapter,
         producers: &SessionDrainProducers,
         grant: &SessionDrainGrant,
-    ) -> Result<JournalCollection, (Self, RawQuantumRefusal)> {
+    ) -> Result<IngestedRaw, (Self, RawQuantumRefusal)> {
         let refusal = if let Err(refusal) = self.ready_for_ingest(adapter, producers) {
             Some(refusal)
         } else if grant.domain_tag != producers.native_domain().journal_tag()
@@ -981,24 +1312,11 @@ impl RawJointQuantum {
         if let Some(refusal) = refusal {
             return Err((self, refusal));
         }
-        let clean_stream = self.cuts.as_ref().is_some_and(|cuts| {
-            adapter.accepts_birth_cut(&cuts.birth)
-                && adapter.consumed_frontier() == cuts.birth.ordinal
-                && adapter
-                    .stream_boundary
-                    .as_ref()
-                    .is_some_and(|boundary| boundary.same_boundary(&cuts.start))
-                && cuts
-                    .end
-                    .as_ref()
-                    .is_some_and(|end| end.clean_successor_of(&cuts.start))
-                && !self.collection_failed()
-        });
+        let clean_stream = self.contiguous_stream(adapter);
         if !clean_stream {
             adapter.stream_broken = true;
         }
-        let mut origins = self.h0_origins.iter().peekable();
-        for (index, item) in self.ordered.iter().enumerate() {
+        for (item, quiet) in self.classified_items() {
             let resource = match item {
                 JournalIngestItem::Journal(JournalRecord::Begin(begin)) => self
                     .invocations
@@ -1007,19 +1325,19 @@ impl RawJointQuantum {
                     .map(|entry| entry.reservation),
                 _ => None,
             };
-            let quiet = if origins
-                .peek()
-                .is_some_and(|origin| origin.wire_index == index)
-            {
-                origins.next().expect("peeked original H0 position").quiet
-            } else {
-                false
-            };
             adapter.ingest_any_from_raw(*item, resource, quiet);
         }
         if clean_stream {
             adapter.stream_boundary = self.cuts.as_ref().and_then(|cuts| cuts.end.clone());
         }
+        let frontier = adapter.consumed_frontier();
+        let raw = self.release_storage(&mut adapter.ledger);
+        Ok(IngestedRaw { raw, frontier })
+    }
+
+    /// Transfer fixed provenance after every physical raw copy has dropped;
+    /// release only memberships this allocation actually owns, then its lease.
+    fn release_storage(self, ledger: &mut StagingLedger) -> RawProvenance {
         // Preserve IDs on the stack, then actually drop every physical raw
         // copy before removing Raw memberships. The quantum's lease is last.
         let mut releases = [None; super::MAX_UNSETTLED_STAGED];
@@ -1028,7 +1346,7 @@ impl RawJointQuantum {
                 *slot = Some(entry.reservation);
             }
         }
-        let audit = JournalCollection {
+        let collection = JournalCollection {
             resource_refused: self.resource_refused,
             ..self.audit
         };
@@ -1037,10 +1355,16 @@ impl RawJointQuantum {
         drop(self.h0_origins);
         drop(self.invocations);
         for reservation in releases.iter().flatten() {
-            adapter.ledger.release_raw(reservation);
+            ledger.release_raw(reservation);
         }
         drop(self._charge);
-        Ok(audit)
+        RawProvenance {
+            identity: self.identity,
+            collection,
+            producers: self.producers,
+            ledger: self.ledger_generation.expect("validated original ledger"),
+            cuts: self.cuts,
+        }
     }
 
     /// Collect validated original records through the actual retained cursor.
@@ -1205,6 +1529,10 @@ impl RawJointQuantum {
 }
 
 #[cfg(test)]
+#[path = "tests/raw_disposition_tests.rs"]
+mod raw_disposition_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::attach::capture::NativeDomainId;
@@ -1213,9 +1541,6 @@ mod tests {
     use p11scope_ebpf_common::Event;
     use p11scope_ebpf_common::object_wire::publish_object_descriptors;
     use std::cell::Cell;
-
-    #[path = "raw_disposition_tests.rs"]
-    mod raw_disposition_tests;
 
     struct FaultProbe(Cell<u64>);
     impl FaultEpoch for FaultProbe {
@@ -1226,11 +1551,11 @@ mod tests {
         }
     }
 
-    fn producers(events: &EventsDomain) -> SessionDrainProducers {
+    pub(super) fn producers(events: &EventsDomain) -> SessionDrainProducers {
         SessionDrainProducers::test_pair(NativeDomainId::mint(), events.clone())
     }
 
-    struct SteadyFault(Cell<Option<FaultReadError>>);
+    pub(super) struct SteadyFault(pub(super) Cell<Option<FaultReadError>>);
     impl FaultEpoch for SteadyFault {
         fn fault_epoch(&self) -> Result<u64, FaultReadError> {
             self.0.get().map_or(Ok(7), Err)

@@ -887,15 +887,17 @@ impl JournalAdapter {
         self.ingest_any_from_raw(item, None, false)
     }
 
-    fn ingest_any_from_raw(
+    /// Assign the next original consumed position and record its actual
+    /// sightings. Negative raw disposal uses this same accounting without
+    /// interpreting a BEGIN/END as admitted H8 input.
+    fn note_consumed_item(
         &mut self,
-        item: JournalIngestItem,
-        resource: Option<ledger::ExistingReservation>,
+        item: &JournalIngestItem,
         proved_irrelevant: bool,
-    ) -> JournalDisposition {
+    ) -> Option<ConsumptionOrdinal> {
         let Some(next) = self.consumed_through.checked_add(1) else {
             self.invalidated = true;
-            return JournalDisposition::Refused;
+            return None;
         };
         self.consumed_through = next;
         let ordinal = ConsumptionOrdinal(next);
@@ -907,7 +909,7 @@ impl JournalAdapter {
                 sighted_len += 1;
             }
         };
-        match &item {
+        match item {
             JournalIngestItem::Journal(record) => match record {
                 JournalRecord::Begin(begin) => sight(Self::image_of_begin(begin)),
                 JournalRecord::End(end) => sight(end_image(end)),
@@ -925,7 +927,7 @@ impl JournalAdapter {
             }
         }
         for image in &sighted[..sighted_len] {
-            let affecting = match &item {
+            let affecting = match item {
                 JournalIngestItem::Journal(_) => true,
                 JournalIngestItem::Ordinary(decoded) => {
                     let event = &decoded.base.event;
@@ -940,9 +942,22 @@ impl JournalAdapter {
             };
             if !self.note_sighting(*image, affecting, next) {
                 self.taint_image(*image);
-                return JournalDisposition::Refused;
+                return None;
             }
         }
+        Some(ordinal)
+    }
+
+    fn ingest_any_from_raw(
+        &mut self,
+        item: JournalIngestItem,
+        resource: Option<ledger::ExistingReservation>,
+        proved_irrelevant: bool,
+    ) -> JournalDisposition {
+        let Some(ordinal) = self.note_consumed_item(&item, proved_irrelevant) else {
+            return JournalDisposition::Refused;
+        };
+        let next = ordinal.0;
         match item {
             JournalIngestItem::Journal(record) => {
                 if let JournalRecord::Begin(begin) = record
@@ -1293,6 +1308,17 @@ impl JournalAdapter {
     /// attestation refuses it as unknown), and its existing keys are
     /// tainted directly so their seals still refuse.
     fn taint_image(&mut self, image: (u64, u64)) {
+        if self.is_tainted(image) {
+            return;
+        }
+        self.note_image_taint(image);
+        self.remove_open_where(|_, entry| entry.image == image);
+        self.refused.retain(|refused| refused.image != image);
+    }
+
+    /// Record only the irreversible image evidence. A raw batch marks its
+    /// images together, then disposes the existing bounded staging once.
+    fn note_image_taint(&mut self, image: (u64, u64)) {
         if !self.tainted_images.contains(&image)
             && self.tainted_images.len() >= self.limits.image_sightings
         {
@@ -1308,8 +1334,103 @@ impl JournalAdapter {
         } else {
             self.tainted_images.insert(image);
         }
-        self.remove_open_where(|_, entry| entry.image == image);
-        self.refused.retain(|refused| refused.image != image);
+    }
+
+    /// Negative-only transition for original raw records lacking object
+    /// admission. Snapshot retained domains before model loss/key refusal;
+    /// never infer completion or a finite provider-effects upper bound.
+    fn refuse_disposed_raw(
+        &mut self,
+        model: &mut ObjectSemantics,
+        images: impl Iterator<Item = (u64, u64)>,
+        unlocalized: bool,
+        gap: JournalGap,
+    ) -> SealFailure {
+        if !unlocalized {
+            for image in images {
+                if !self.is_tainted(image) {
+                    self.note_image_taint(image);
+                }
+            }
+        }
+        // Image taint changes no key identity or era. The original affected
+        // domains are retained before any model abandonment/refusal below.
+        let scope = if unlocalized {
+            self.affected_failure_scope()
+        } else {
+            let mut domains = Vec::with_capacity(self.keys.len());
+            domains.extend(
+                self.keys
+                    .iter()
+                    .filter(|(key, state)| {
+                        !state.refused && self.is_tainted((key.cookie, key.exec))
+                    })
+                    .map(|(key, state)| {
+                        JournalDomainProof {
+                            key: *key,
+                            era: state.era,
+                        }
+                        .domain()
+                    }),
+            );
+            SealFailureScope::AffectedDomains(domains)
+        };
+        let mut effects = ObjectEffects::default();
+        let taints = &self.tainted_images;
+        let overflow = self.taint_overflow;
+        let sightings = &self.sightings;
+        for (key, state) in &mut self.keys {
+            let image = (key.cookie, key.exec);
+            let affected = unlocalized
+                || taints.contains(&image)
+                || (overflow && !sightings.contains_key(&image));
+            if !affected || state.refused {
+                continue;
+            }
+            if state.model_registered {
+                let domain = JournalDomainProof {
+                    key: *key,
+                    era: state.era,
+                }
+                .domain();
+                effects
+                    .effects
+                    .extend(model.abandon_domain(domain, &mut self.ledger).effects);
+            }
+            state.refused = true;
+        }
+        if unlocalized {
+            self.invalidated = true;
+            self.void_staged();
+        } else {
+            // One bounded pass, rather than scanning all retained opens
+            // again for every interleaved raw record of an affected image.
+            let mut doomed = [(0u64, 0u64); MAX_UNSETTLED_STAGED];
+            let mut count = 0;
+            for (key, entry) in &self.open {
+                if self.is_tainted(entry.image) {
+                    doomed[count] = *key;
+                    count += 1;
+                }
+            }
+            for key in &doomed[..count] {
+                let entry = self.open.remove(key).expect("retained tainted open");
+                self.ledger.release_h8open(entry.begin_ordinal);
+            }
+            let taints = &self.tainted_images;
+            let overflow = self.taint_overflow;
+            let sightings = &self.sightings;
+            self.refused.retain(|entry| {
+                !taints.contains(&entry.image)
+                    && !(overflow && !sightings.contains_key(&entry.image))
+            });
+        }
+        SealFailure {
+            scope,
+            gap,
+            effects,
+            h3_voided: None,
+        }
     }
 }
 
@@ -4838,7 +4959,7 @@ where
                 return Err(self.adapter.failure(JournalGap::DrainMismatch));
             }
         };
-        self.seal_collection(collection, observed, bootstrap, births)
+        self.seal_collection(collection.into_collection(), observed, bootstrap, births)
     }
 
     fn seal_collection(

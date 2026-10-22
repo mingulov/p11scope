@@ -1,7 +1,10 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! Actual collector custody and negative disposal, with substituted ring I/O.
 
+use super::tests::{SteadyFault, producers};
 use super::*;
+use crate::events::{EventsDomain, ScriptedRecords};
+use crate::semantics_edge::resources::SemanticResourcePool;
 use crate::semantics_objects::journal::tests::{
     COOKIE, ENTRY_NS, EXEC, begin_bytes, end_bytes_absent, function_id,
 };
@@ -106,11 +109,16 @@ fn joint_raw_disposal_refunds_only_owned_roles() {
     let before = pool.snapshot().charged_bytes;
     assert_eq!(owner.ledger().census(), 2);
     assert_eq!(owner.ledger().charged_bytes(), 1_000);
+    let identity = raw.h0_identity();
     let disposed = raw
         .dispose_without_ingest(&mut owner, &retained, RawDisposeReason::NoAdmission)
         .unwrap_or_else(|(_, reason)| panic!("owned disposal: {reason:?}"));
     assert_eq!(disposed.reason(), RawDisposeReason::NoAdmission);
     assert!(disposed.failure().is_some());
+    assert!(disposed.identity() == identity);
+    let disposed_frontier = disposed.frontier();
+    assert!(disposed_frontier == owner.adapter.consumed_frontier());
+    assert_eq!(disposed.validate_owner(owner.adapter(), &retained), Ok(()));
     assert_eq!(owner.ledger().census(), 2, "the other raw role survives");
     assert_eq!(owner.ledger().staged(), 1);
     assert_eq!(owner.ledger().charged_bytes(), 1_000);
@@ -123,6 +131,7 @@ fn joint_raw_disposal_refunds_only_owned_roles() {
     let _ = other
         .dispose_without_ingest(&mut owner, &retained, RawDisposeReason::Capacity)
         .unwrap_or_else(|(_, reason)| panic!("second disposal: {reason:?}"));
+    assert!(disposed.frontier() == disposed_frontier);
     assert_eq!(owner.ledger().census(), 1);
     owner.ledger_mut().release_h8open(100);
     assert_eq!(owner.ledger().charged_bytes(), 900);
@@ -206,9 +215,15 @@ fn joint_raw_disposal_refuses_foreign_and_undelivered_input_without_mutation() {
         }
         Ok(_) => panic!("nonempty raw was labeled empty"),
     };
-    let _ = raw
+    let negative = raw
         .dispose_without_ingest(&mut owner, &retained, RawDisposeReason::NoAdmission)
         .unwrap_or_else(|(_, reason)| panic!("actual H0 disposition: {reason:?}"));
+    assert!(negative.identity() == identity);
+    assert_eq!(negative.validate_owner(owner.adapter(), &retained), Ok(()));
+    assert_eq!(
+        negative.validate_owner(other_owner.adapter(), &retained),
+        Err(RawQuantumRefusal::ForeignLedger)
+    );
     assert!(owner.adapter.is_tainted((COOKIE, EXEC)));
     assert_eq!(owner.ledger().census(), 0);
 }
@@ -259,6 +274,8 @@ fn joint_empty_and_capacity_raw_dispositions_need_no_drain_grant() {
     assert!(owner.adapter.is_tainted((COOKIE, EXEC)));
     assert_eq!(owner.ledger().census(), 0);
     assert_eq!(owner.adapter.consumed_through_for_test(), 1);
+    let capacity_frontier = capacity.frontier();
+    assert!(capacity_frontier == owner.adapter.consumed_frontier());
     assert!(owner.adapter.keys.is_empty() && owner.adapter.drain_pins.is_empty());
     drain
         .source_mut()
@@ -288,6 +305,7 @@ fn joint_empty_and_capacity_raw_dispositions_need_no_drain_grant() {
         .dispose_without_ingest(&mut owner, &retained, RawDisposeReason::NoAdmission)
         .unwrap_or_else(|(_, reason)| panic!("genuine END negative disposition: {reason:?}"));
     assert_eq!(owner.adapter.consumed_through_for_test(), 2);
+    assert!(capacity.frontier() == capacity_frontier);
     assert_eq!(owner.ledger().census(), 0);
     assert!(owner.adapter.is_tainted((COOKIE, EXEC)));
 }
@@ -309,10 +327,7 @@ fn joint_stopped_raw_has_only_a_terminal_negative_disposition() {
     let negative = raw
         .dispose_without_ingest(&mut owner, &retained, RawDisposeReason::TerminalLoss)
         .unwrap_or_else(|(_, reason)| panic!("stopped raw disposal: {reason:?}"));
-    assert_eq!(
-        negative.failure().unwrap().gap,
-        super::super::super::JournalGap::Stopped
-    );
+    assert_eq!(negative.failure().unwrap().gap, JournalGap::Stopped);
     assert_eq!(owner.ledger().census(), 0);
     assert!(owner.adapter.stopped);
 }
@@ -347,10 +362,7 @@ fn joint_unlocalizable_raw_loss_never_becomes_an_empty_prefix() {
     let negative = raw
         .dispose_without_ingest(&mut owner, &retained, RawDisposeReason::TerminalLoss)
         .unwrap_or_else(|(_, reason)| panic!("malformed raw disposal: {reason:?}"));
-    assert_eq!(
-        negative.failure().unwrap().gap,
-        super::super::super::JournalGap::Malformed
-    );
+    assert_eq!(negative.failure().unwrap().gap, JournalGap::Malformed);
     assert!(owner.adapter.invalidated && owner.adapter.stream_broken);
     assert_eq!(owner.adapter.consumed_through_for_test(), 0);
     assert_eq!(owner.ledger().census(), 0);

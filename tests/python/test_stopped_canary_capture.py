@@ -412,12 +412,13 @@ def shell_wait_failure(directory, mode):
     shell = (ROOT / 'scripts/verify-canaries.sh').read_text()
     def function(name):
         return shell.split(name + '() {', 1)[1].split('\n}\n', 1)[0].join((name + '() {', '\n}\n'))
-    attributes = [line.split('=', 1)[1] for line in shell.splitlines()
-                  if line.startswith('OBJECT_ATTRIBUTES=')]
-    assert len(attributes) == 1 and attributes[0] in ('present', 'absent'), attributes
+    capture_selection = 'case $CAPTURE_MODE in\n' + shell.split(
+        'case $CAPTURE_MODE in\n', 1)[1].split('\nesac', 1)[0] + '\nesac\n'
     program = ('set -eu\nWORK=' + str(directory) + '\n'
         'WPID=\nWORKLOAD_STARTTIME=\nTARGET_BITS=64\n'
-        'OBJECT_ATTRIBUTES=' + attributes[0] + '\n'
+        'CAPTURE_MODE=full\n' + capture_selection
+        + 'CANARY_WORKLOAD="$WORK/canary_workload"\n'
+        'MATRIX_PROVIDER="$WORK/matrix-provider.so"\nPRIVACY_PROVIDER="$WORK/privacy-provider.so"\n'
         'P11SCOPE_DEFAULT=/bin/true\nP11SCOPE_FEATURE=/bin/true\n'
         'TASK_STORAGE_READER=/bin/true\nTASK_STORAGE_OBJECT=/bin/true\n'
         'process_starttime() { echo 1; }\n'

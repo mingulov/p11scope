@@ -2690,6 +2690,70 @@ int main(void) {
 class FinalScannerSurfaceTests(unittest.TestCase):
     LANES = ("default-safe-start", "feature-safe-start", "feature-unsafe-fault")
 
+    def object_pilot_fixture(self, subject, root, *, case="healthy"):
+        fixture = StoppedPopulationTests("test_framed_records_bind_generations_for_future_coordinator")
+        object_lane = "object-ia32" if TARGET_BITS == 32 else "object-lp64"
+        types = {1: "hash", 2: "array", 3: "prog_array", 5: "percpu_hash", 6: "percpu_array",
+                 8: "cgroup_array", 9: "lru_hash", 27: "ringbuf", 29: "task_storage"}
+        for lane in (object_lane, object_lane + "-blocked"):
+            cell = root / lane
+            cell.mkdir()
+            manifest, receipt, records, controls = fixture.fixture(cell)
+            existing = {item["name"] for item in manifest}
+            for index, (name, row) in enumerate(subject.BPF_MAP_DEFS["SAFE_MAPS"].items(), 200):
+                if name not in existing:
+                    manifest.append({"id": index, "name": name, "type": types[row["type"]],
+                                     "key_size": row["key_size"], "value_size": row["value_size"],
+                                     "max_entries": row["max_entries"], "map_flags": row["flags"], "oracle": "dump"})
+            if lane.endswith("-blocked"):
+                if case == "map-sentinel":
+                    raw = bytearray(fixture.epoch_value(range(1, 9), (0,) * 8))
+                    sentinel = subject.SENTINELS["PIN"]
+                    raw[64:64 + len(sentinel)] = sentinel
+                    next(row for row in records if row["map_id"] == 111)["value"] = bytes(raw)
+                elif case == "receipt-alias":
+                    generation = subject.ALIASES["pss_hash"]
+                    for rows in (receipt["expected"], receipt["before"], receipt["after"], records):
+                        for row in rows:
+                            if row.get("tid") == 7001:
+                                row["generation"] = generation
+            fixture.publish_fixture(cell, manifest, receipt, records, controls)
+            for name in ("EVENTS", "DISCOVERY"):
+                subject.ring_raw_path(cell / "case", name).rename(subject.ring_raw_path(root / lane, name))
+            if case == "claimless" and lane.endswith("-blocked"):
+                for item in manifest:
+                    item.pop("snapshot")
+            manifest_path = root / f"mapdump_manifest_{lane}.json"
+            manifest_path.write_text(json.dumps(manifest))
+            for suffix, content in (("output", "{}"), ("observer.log", ""), ("workload.log", "")):
+                (root / f"{lane}.{suffix}").write_text(content)
+            if lane.endswith("-blocked"):
+                if case == "missing-sibling":
+                    manifest_path.unlink()
+                elif case == "wrong-width":
+                    manifest_path.rename(root / f"mapdump_manifest_{'object-lp64' if TARGET_BITS == 32 else 'object-ia32'}-blocked.json")
+                elif case == "missing-receipt":
+                    (cell / "snapshot.json").unlink()
+
+    def test_object_pilot_requires_both_receipts_and_scans_all_surfaces(self):
+        for case in ("healthy", "missing-sibling", "wrong-width", "claimless", "missing-receipt",
+                     "map-sentinel", "receipt-alias"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                subject = load_subject(TARGET_BITS)
+                self.object_pilot_fixture(subject, root, case=case)
+                arguments = ["--object-pilot", str(root), str(TARGET_BITS)]
+                if case == "healthy":
+                    self.assertEqual(subject.main(arguments), 0)
+                elif case in ("map-sentinel", "receipt-alias"):
+                    message = ("ordinary pointer canaries leaked.*PIN" if case == "map-sentinel" else
+                               "scalar aliases.*pss_hash")
+                    with self.assertRaisesRegex(AssertionError, message):
+                        subject.main(arguments)
+                else:
+                    with self.assertRaises((AssertionError, OSError)):
+                        subject.main(arguments)
+
     def surfaces(self, subject, root, payload):
         result = {}
         for index, lane in enumerate(self.LANES, start=1):

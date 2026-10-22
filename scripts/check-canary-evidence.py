@@ -1814,6 +1814,19 @@ def final_lane_artifacts(work, lane, surfaces, *, combined_log=False):
     return paths
 
 
+def assert_object_pilot(work, target_bits):
+    """Scan the two selected object cells after their live semantic oracle."""
+    object_lane = "object-ia32" if target_bits == 32 else "object-lp64"
+    paths_by_lane = {}
+    for lane in (object_lane, object_lane + "-blocked"):
+        surfaces = assert_exact_owned_map_inventory(work, lane, SAFE_MAPS)
+        paths_by_lane[lane] = final_lane_artifacts(work, lane, surfaces)
+    assert_final_artifact_privacy(path for paths in paths_by_lane.values() for path in paths)
+    for lane, paths in paths_by_lane.items():
+        assert_safe_lane_alias_privacy(lane, paths)
+    print("object canary pilot OK: 2 cells; no ordinary or safe-policy alias leak")
+
+
 def extract_object_attributes(argv):
     """Strip optional `--object-attributes` flags, selecting their mode.
 
@@ -1866,6 +1879,12 @@ def main(argv=None):
         print(error, file=sys.stderr)
         return 2
     work = argv[0]
+    if work == "--object-pilot":
+        if len(argv) != 3:
+            print("usage: check-canary-evidence.py --object-pilot WORK BITS", file=sys.stderr)
+            return 2
+        assert_object_pilot(argv[1], target_bits)
+        return 0
     if work == "--raw-events":
         assert_raw_records(argv[1], argv[2], int(argv[3]), argv[4])
         return 0

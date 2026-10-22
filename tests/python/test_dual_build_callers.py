@@ -8,6 +8,8 @@ from collections import Counter
 from pathlib import Path
 import runpy
 import shutil
+import stat
+import struct
 import subprocess
 import tempfile
 import time
@@ -341,6 +343,212 @@ class DualBuildCallerTests(unittest.TestCase):
                     and "scripts/verify-canaries.sh" in command]
         self.assertEqual(len(commands), 1)
         self.assertIn("scripts/verify-canaries.sh --capture-mode p0", commands[0])
+
+    def prebuilt_canary_inputs(self, bits=64, full=False):
+        inputs = self.base / "prebuilt inputs with spaces"
+        inputs.mkdir(exist_ok=True)
+        target = (1, 3) if bits == 32 else (2, 62)
+        specifications = {
+            "p11scope": (2, 62), "p11scope-discover": target,
+            "canary_workload": target, "matrix-provider.so": target,
+            "privacy-provider.so": target, "dump-task-storage": (2, 62),
+            "dump-task-storage.bpf.o": (2, 247), "default-ebpf": (2, 247),
+        }
+        if full:
+            specifications.update({"p11scope-diagnostic": (2, 62),
+                                   "diagnostic-ebpf": (2, 247), "task-storage-canary": (2, 62)})
+        for name, (elf_class, machine) in specifications.items():
+            header = bytearray(20)
+            header[:6] = b"\x7fELF" + bytes((elf_class, 1))
+            struct.pack_into("<H", header, 18, machine)
+            path = inputs / name
+            path.write_bytes(header)
+            path.chmod(0o600 if name.endswith((".so", ".bpf.o", "-ebpf")) else 0o700)
+        return inputs
+
+    def canary_acquisition_boundary(self, *, stop=83):
+        # Fake only external acquisition/checker commands. The actual runner
+        # still validates inputs, chooses paths, dispatches and owns its C child.
+        self.configure([])
+        config = json.loads(self.config.read_text()) | {"probe_status": stop}
+        self.config.write_text(json.dumps(config))
+        (self.bin / "clang-18").symlink_to("dispatch.py")
+        for name in ("build-task-storage-reader.sh", "build-task-storage-canary.sh"):
+            (self.repo / "scripts" / name).symlink_to(self.bin / "dispatch.py")
+        sudo = self.bin / "sudo"
+        sudo.unlink()
+        sudo.write_text('#!/bin/sh\n[ "${1-}" != -n ] || shift\n'
+                        '[ "${1-}" != chown ] || exit 0\nexec "$@"\n')
+        sudo.chmod(0o755)
+        boundary = '''import json, os, pathlib, sys, time
+config = json.loads(pathlib.Path(os.environ["P11SCOPE_DUAL_BUILD_CONFIG"]).read_text())
+name = pathlib.Path(sys.argv[0]).name
+args = sys.argv[1:]
+with open(config["events"], "a") as stream:
+    stream.write(json.dumps({"kind": name, "argv": args}) + "\\n")
+if "--refusal-probe" in args:
+    raise SystemExit(config["probe_status"])
+if name == "capture-stopped-canary.py":
+    if config.get("acquisition_status"):
+        raise SystemExit(config["acquisition_status"])
+    def argument(key): return args[args.index(key) + 1]
+    if "--workload-pid" in args:
+        pathlib.Path(argument("--go")).touch()
+        if argument("--workload-mode") in ("object", "matrix"):
+            deadline = time.monotonic() + 4
+            while not pathlib.Path(argument("--done")).exists():
+                assert time.monotonic() < deadline, "owned fixture did not finish"
+                time.sleep(.005)
+            pathlib.Path(argument("--finish")).touch()
+        pathlib.Path(argument("--out-dir"), "mapdump_START_" + argument("--lane") + ".json").write_text("[]")
+if "--object-starts" in args:
+    raise SystemExit(config.get("object_status", 0))
+if "--object-pilot" in args:
+    raise SystemExit(config.get("pilot_status", 0))
+'''
+        for name in ("dump-owned-bpf-maps.py", "check-bpf-map-defs.py", "capture-stopped-canary.py",
+                     "check-capture-evidence.py", "check-canary-evidence.py", "qualify-task-storage-canary.py"):
+            (self.repo / "scripts" / name).write_text(boundary)
+        shutil.copy2(ROOT / "scripts/lane-lib-oracle-1.py", self.repo / "scripts/lane-lib-oracle-1.py")
+
+    def test_prebuilt_canary_inputs_never_build_or_modify_sources(self):
+        self.canary_acquisition_boundary()
+        for full in (False, True):
+            for bits in (32, 64):
+                for mode in ("full", "p0"):
+                    with self.subTest(full=full, bits=bits, mode=mode):
+                        inputs = self.prebuilt_canary_inputs(bits, full)
+                        before = {p.name: (p.read_bytes(), stat.S_IMODE(p.stat().st_mode)) for p in inputs.iterdir()}
+                        arguments = ("--prebuilt-dir", str(inputs), "--capture-mode", mode)
+                        if not full:
+                            arguments += ("--object-pilot",)
+                        self.environment["P11SCOPE_PRODUCT_BUILD_MODE"] = "prepared"
+                        self.environment[PREPARED[0]] = "/not/an/executable"
+                        result = self.run_child(CHILDREN[1], bits, arguments=arguments)
+                        self.assertEqual(result.returncode, 83, result.stderr)
+                        self.assertEqual([r["kind"] for r in self.rows()],
+                                         ["dump-owned-bpf-maps.py", "dump-owned-bpf-maps.py"])
+                        after = {p.name: (p.read_bytes(), stat.S_IMODE(p.stat().st_mode)) for p in inputs.iterdir()}
+                        self.assertEqual(after, before)
+
+    def test_prebuilt_canary_missing_mixed_or_overlapping_inputs_refuse(self):
+        self.canary_acquisition_boundary()
+        for arguments in (("--prebuilt-dir",), ("--prebuilt-dir", "relative"),
+                          ("--prebuilt-dir", "/one", "--prebuilt-dir", "/two"),
+                          ("--object-pilot", "--object-pilot"),
+                          ("--self-test", "--object-pilot"),
+                          ("--object-pilot", "--self-test"),
+                          ("--prebuilt-dir=/one",)):
+            with self.subTest(arguments=arguments):
+                result = self.run_child(CHILDREN[1], arguments=arguments)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertFalse(self.events.exists())
+                self.assertFalse(self.work.exists())
+        for bits in (32, 64):
+            inputs = self.prebuilt_canary_inputs(bits, full=True)
+            for name in sorted(path.name for path in inputs.iterdir()):
+                for fault in ("missing", "wrong-width"):
+                    with self.subTest(bits=bits, name=name, fault=fault):
+                        self.prebuilt_canary_inputs(bits, full=True)
+                        path = inputs / name
+                        if fault == "missing":
+                            path.unlink()
+                        else:
+                            raw = bytearray(path.read_bytes())
+                            raw[4] = 3 - raw[4]
+                            path.write_bytes(raw)
+                        result = self.run_child(CHILDREN[1], bits,
+                                                arguments=("--prebuilt-dir", str(inputs)))
+                        self.assertEqual(result.returncode, 2, result.stderr)
+                        self.assertFalse(self.events.exists())
+        for case in ("missing", "short", "wrong-class", "wrong-machine", "big-endian", "not-executable",
+                     "symlink", "writable", "overlap", "input-parent", "work-parent", "bad-build-mode"):
+            with self.subTest(case=case):
+                inputs = self.prebuilt_canary_inputs()
+                self.environment.pop("P11SCOPE_PRODUCT_BUILD_MODE", None)
+                self.environment["P11SCOPE_RECEIPT_WORK"] = str(self.work)
+                target = inputs / "p11scope-discover"
+                if case == "missing":
+                    target.unlink()
+                elif case == "short":
+                    target.write_bytes(b"ELF")
+                elif case in ("wrong-class", "wrong-machine", "big-endian"):
+                    raw = bytearray(target.read_bytes())
+                    raw[{"wrong-class": 4, "wrong-machine": 18, "big-endian": 5}[case]] = 2 if case == "big-endian" else 1
+                    target.write_bytes(raw)
+                elif case == "not-executable":
+                    target.chmod(0o600)
+                elif case == "symlink":
+                    target.unlink()
+                    target.symlink_to(inputs / "p11scope")
+                elif case == "writable":
+                    target.chmod(0o722)
+                elif case in ("overlap", "input-parent", "work-parent"):
+                    self.environment["P11SCOPE_RECEIPT_WORK"] = str({
+                        "overlap": inputs, "input-parent": inputs / "output", "work-parent": self.base}[case])
+                else:
+                    self.environment["P11SCOPE_PRODUCT_BUILD_MODE"] = "prebuilt"
+                result = self.run_child(CHILDREN[1], arguments=("--prebuilt-dir", str(inputs), "--object-pilot"))
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertFalse(self.events.exists())
+                if target.is_symlink():
+                    target.unlink()
+
+    def test_object_pilot_dispatches_only_completion_and_blocked_cells(self):
+        self.canary_acquisition_boundary(stop=0)
+        compiler = shutil.which("gcc")
+        for bits, object_lane in ((32, "object-ia32"), (64, "object-lp64")):
+            inputs = self.prebuilt_canary_inputs(bits, full=True)
+            # Compile the existing workload/providers with the real host
+            # compiler; the runner itself sees compiler tripwires in PATH.
+            for argv in (
+                [compiler, f"-m{bits}", "-O0", "-pthread", str(ROOT / "scripts/fixtures/canary_workload.c"),
+                 "-ldl", "-o", str(inputs / "canary_workload")],
+                *[[compiler, f"-m{bits}", "-shared", "-fPIC", "-DPRIVACY_FIXTURE=1", *flags,
+                   str(ROOT / "crates/discover/tests/fixture/version_matrix.c"), "-o", str(inputs / name)]
+                  for name, flags in (("matrix-provider.so", []), ("privacy-provider.so", ["-DPRIVACY_BLOCKS=1"]))],
+            ):
+                subprocess.run(argv, check=True, capture_output=True, timeout=20)
+            subprocess.run([compiler, f"-m{bits}", "-x", "c", "-", "-o", str(inputs / "p11scope-discover")],
+                           input=b"int main(void) { return 0; }\n", check=True, capture_output=True, timeout=20)
+            for name in ("p11scope", "p11scope-diagnostic", "dump-task-storage", "task-storage-canary"):
+                shutil.copyfile("/bin/true", inputs / name)
+                (inputs / name).chmod(0o700)
+            for field, status in ((None, 0), ("object_status", 42), ("pilot_status", 43), ("acquisition_status", 44)):
+                with self.subTest(bits=bits, failure=field):
+                    shutil.rmtree(self.work, ignore_errors=True)
+                    config = json.loads(self.config.read_text())
+                    for key in ("object_status", "pilot_status", "acquisition_status"):
+                        config.pop(key, None)
+                    if field:
+                        config[field] = status
+                    self.config.write_text(json.dumps(config))
+                    result = self.run_child(CHILDREN[1], bits, arguments=("--prebuilt-dir", str(inputs), "--object-pilot"))
+                    self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+                    captures = [row for row in self.rows() if row["kind"] == "capture-stopped-canary.py"]
+                    lanes = [row["argv"][row["argv"].index("--lane") + 1] for row in captures]
+                    self.assertEqual(lanes, [object_lane] if field == "acquisition_status" else
+                                           [object_lane, object_lane + "-blocked"])
+                    for row in captures:
+                        self.assertEqual(row["argv"][row["argv"].index("--reader") + 1], str(inputs / "dump-task-storage"))
+                        self.assertEqual(row["argv"][row["argv"].index("--obj") + 1], str(inputs / "dump-task-storage.bpf.o"))
+                        self.assertEqual(row["argv"][row["argv"].index("--") + 1], str(inputs / "p11scope"))
+                    self.assertNotIn("canary matrix: ALL OK", result.stdout)
+                    self.assertFalse(any(row["kind"] in ("cargo", "gcc", "qualify-task-storage-canary.py") for row in self.rows()))
+            if bits == 64:
+                shutil.rmtree(self.work)
+                self.config.write_text(json.dumps(config | {"acquisition_status": 0}))
+                result = self.run_child(CHILDREN[1], arguments=("--prebuilt-dir", str(inputs)))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                rows = self.rows()
+                captures = [row for row in rows if row["kind"] == "capture-stopped-canary.py"]
+                self.assertEqual([row["argv"][row["argv"].index("--lane") + 1] for row in captures], [
+                    "default-safe-profile", "default-safe-trace", "feature-safe-profile", "feature-safe-trace",
+                    "feature-unsafe-profile", "feature-unsafe-trace", "aggregate-only-metrics",
+                    "default-safe-start", "feature-safe-start", "feature-unsafe-fault",
+                    "object-lp64", "object-lp64-blocked", "owned-default-metrics", "owned-feature-metrics"])
+                self.assertEqual(sum(row["kind"] == "qualify-task-storage-canary.py" for row in rows), 1)
+                self.assertIn("canary matrix: ALL OK", result.stdout)
 
     def test_canary_product_builds_precede_task_storage_helper(self):
         commands = [command.lstrip() for command in logical_commands(CHILDREN[1])]

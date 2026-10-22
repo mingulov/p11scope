@@ -7,13 +7,14 @@ set -eu
 cd "$(dirname "$0")/.."
 
 usage() {
-    echo "usage: $0 [--capture-mode full|p0] [--prebuilt-dir ABS_DIR] [--object-pilot] | --self-test" >&2
+    echo "usage: $0 [--capture-mode full|p0] [--prebuilt-dir ABS_DIR] [--object-pilot] | --capture-mode full|p0 --object-pilot --prepare-object-inputs ABSENT_DIR | --self-test" >&2
     exit 2
 }
 CAPTURE_MODE=full
 capture_selected=0
 SELF_TEST=0
 PREBUILT_DIR=
+PREPARE_OBJECT_INPUTS=
 OBJECT_PILOT=0
 while [ "$#" -gt 0 ]; do
     case $1 in
@@ -33,15 +34,23 @@ while [ "$#" -gt 0 ]; do
             OBJECT_PILOT=1
             shift
             ;;
+        --prepare-object-inputs)
+            [ "$#" -ge 2 ] && [ -z "$PREPARE_OBJECT_INPUTS" ] || usage
+            case $2 in /*) PREPARE_OBJECT_INPUTS=$2 ;; *) usage ;; esac
+            shift 2
+            ;;
         --self-test)
             [ "$#" -eq 1 ] && [ "$capture_selected" -eq 0 ] \
-                && [ -z "$PREBUILT_DIR" ] && [ "$OBJECT_PILOT" -eq 0 ] || usage
+                && [ -z "$PREBUILT_DIR" ] && [ -z "$PREPARE_OBJECT_INPUTS" ] && [ "$OBJECT_PILOT" -eq 0 ] || usage
             SELF_TEST=1
             shift
             ;;
         *) usage ;;
     esac
 done
+[ -z "$PREPARE_OBJECT_INPUTS" ] || {
+    [ "$OBJECT_PILOT" -eq 1 ] && [ -z "$PREBUILT_DIR" ] && [ "$SELF_TEST" -eq 0 ] || usage
+}
 
 WORK=${P11SCOPE_RECEIPT_WORK-target/canaries}
 if [ "${P11SCOPE_RECEIPT_WORK+set}" = set ]; then
@@ -84,56 +93,33 @@ P11SCOPE_PRODUCT_BUILD_MODE=${P11SCOPE_PRODUCT_BUILD_MODE:-ordinary}
 case $P11SCOPE_PRODUCT_BUILD_MODE in ordinary|prepared) ;; *) usage ;; esac
 . scripts/product-build.sh
 
+if [ -n "$PREPARE_OBJECT_INPUTS" ]; then
+    python3 -I - "$PREPARE_OBJECT_INPUTS" "${P11SCOPE_RECEIPT_WORK-}" <<'PY' || exit 2
+from pathlib import Path
+import runpy
+import sys
+api = runpy.run_path('scripts/release-matrix-contract.py')
+try:
+    api['validate_canary_destination'](Path(sys.argv[1]), sys.argv[2] or None)
+except (OSError, ValueError) as error:
+    print(error, file=sys.stderr)
+    raise SystemExit(2)
+PY
+    CANARY_BUILD_REV=$(git rev-parse HEAD) || exit 2
+    CANARY_BUILD_TREE=$(git rev-parse 'HEAD^{tree}') || exit 2
+    git diff --quiet HEAD -- || { echo 'canary input build requires clean tracked source' >&2; exit 2; }
+fi
+
 if [ -n "$PREBUILT_DIR" ]; then
     PREBUILT_DIR=$(python3 -I - "$PREBUILT_DIR" "$TARGET_BITS" "$OBJECT_PILOT" \
         "${P11SCOPE_RECEIPT_WORK-}" "${TMPDIR:-/tmp}" <<'PY'
-import os
 from pathlib import Path
-import stat
-import struct
+import runpy
 import sys
-
-def require(condition):
-    if not condition:
-        raise ValueError
-
 try:
-    selected = Path(sys.argv[1])
-    require(selected.is_absolute() and not selected.is_symlink())
-    inputs = selected.resolve(strict=True)
-    require(inputs.is_dir())
-    for parent in (inputs, *inputs.parents):
-        info = parent.stat()
-        require(info.st_uid in (0, os.getuid())
-                and (not info.st_mode & 0o022 or info.st_mode & stat.S_ISVTX))
-    if sys.argv[4]:
-        work = Path(sys.argv[4]).resolve()
-        require(not work.is_relative_to(inputs) and not inputs.is_relative_to(work))
-    else:
-        require(not Path(sys.argv[5]).resolve().is_relative_to(inputs))
-    target = (1, 3) if sys.argv[2] == '32' else (2, 62)
-    specifications = {
-        'p11scope': ((2, 62), True), 'p11scope-discover': (target, True),
-        'canary_workload': (target, True), 'matrix-provider.so': (target, False),
-        'privacy-provider.so': (target, False), 'dump-task-storage': ((2, 62), True),
-        'dump-task-storage.bpf.o': ((2, 247), False), 'default-ebpf': ((2, 247), False),
-    }
-    if sys.argv[3] == '0':
-        specifications.update({'p11scope-diagnostic': ((2, 62), True),
-                               'diagnostic-ebpf': ((2, 247), False),
-                               'task-storage-canary': ((2, 62), True)})
-    for name, (expected, executable) in specifications.items():
-        fd = os.open(inputs / name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-        try:
-            info = os.fstat(fd)
-            require(stat.S_ISREG(info.st_mode) and info.st_uid in (0, os.getuid())
-                    and not info.st_mode & 0o022
-                    and (not executable or (info.st_mode & 0o100 and os.access(inputs / name, os.X_OK))))
-            header = os.read(fd, 20)
-            require(len(header) == 20 and header[:4] == b'\x7fELF' and header[5] == 1
-                    and (header[4], struct.unpack_from('<H', header, 18)[0]) == expected)
-        finally:
-            os.close(fd)
+    api = runpy.run_path('scripts/release-matrix-contract.py')
+    inputs = api['validate_canary_payloads'](Path(sys.argv[1]), int(sys.argv[2]),
+        full=sys.argv[3] == '0', work=sys.argv[4] or None, temporary=sys.argv[5])
 except (OSError, ValueError):
     print('prebuilt canary inputs: missing, untrusted, overlapping or wrong ELF ABI', file=sys.stderr)
     raise SystemExit(2)
@@ -155,7 +141,7 @@ require_non_root_caller
 (umask 077; mkdir -p "$WORK")
 WORK=$(cd "$WORK" && pwd -P)
 
-command -v bpftool >/dev/null || { echo "bpftool required"; exit 1; }
+[ -n "$PREPARE_OBJECT_INPUTS" ] || command -v bpftool >/dev/null || { echo "bpftool required"; exit 1; }
 command -v python3 >/dev/null || { echo "python3 required"; exit 1; }
 WPID=
 WORKLOAD_STARTTIME=
@@ -170,6 +156,23 @@ cleanup() {
     exit "$CLEANUP_STATUS"
 }
 . scripts/cleanup-traps.sh
+
+canary_build_step() {
+    canary_build_role=$1
+    shift
+    "$@" || return "$?"
+    if [ -n "$PREPARE_OBJECT_INPUTS" ]; then
+        python3 -I - "$WORK/canary-build.commands.jsonl" "$canary_build_role" "$@" <<'PY'
+import json
+from pathlib import Path
+import sys
+with Path(sys.argv[1]).open('a') as stream:
+    stream.write(json.dumps({'role': sys.argv[2], 'argv': sys.argv[3:],
+        'cwd': str(Path.cwd()), 'exit': 0}) + '\n')
+PY
+    fi
+}
+[ -z "$PREPARE_OBJECT_INPUTS" ] || rm -f "$WORK/canary-build.commands.jsonl"
 
 P11SCOPE_FEATURE=
 FEATURE_BPF=
@@ -193,7 +196,7 @@ echo "=== build ==="
 rm -rf "$WORK/default-build" "$WORK/helper-build"
 set -- --release --workspace
 [ "$CAPTURE_MODE" != p0 ] || set -- "$@" --features stub-object-attributes
-p11scope_product_build "$P11SCOPE_PRODUCT_BUILD_MODE" \
+canary_build_step observer p11scope_product_build "$P11SCOPE_PRODUCT_BUILD_MODE" \
     "$@" --target-dir "$WORK/default-build"
 canary_features=unsafe-unvalidated-metadata
 [ "$CAPTURE_MODE" != p0 ] || canary_features=$canary_features,stub-object-attributes
@@ -207,7 +210,7 @@ fi
 P11SCOPE_DEFAULT="$WORK/default-build/release/p11scope"
 case $TARGET_BITS in
     32)
-        p11scope_product_build "$P11SCOPE_PRODUCT_BUILD_MODE" \
+        canary_build_step helper p11scope_product_build "$P11SCOPE_PRODUCT_BUILD_MODE" \
             --release -p p11scope-discover \
             --target i686-unknown-linux-gnu --target-dir "$WORK/helper-build"
         P11SCOPE_DISCOVER="$WORK/helper-build/i686-unknown-linux-gnu/release/p11scope-discover"
@@ -215,7 +218,7 @@ case $TARGET_BITS in
     64) P11SCOPE_DISCOVER="$WORK/default-build/release/p11scope-discover" ;;
 esac
 rm -rf "$WORK/task-storage-reader"
-scripts/build-task-storage-reader.sh "$WORK/task-storage-reader"
+canary_build_step reader scripts/build-task-storage-reader.sh "$WORK/task-storage-reader"
 TASK_STORAGE_READER=$WORK/task-storage-reader/dump-task-storage
 TASK_STORAGE_OBJECT=$WORK/task-storage-reader/dump-task-storage.bpf.o
 # The seed fixture is x86-64 only and is always built unprivileged, never under sudo.
@@ -224,11 +227,11 @@ rm -rf "$WORK/task-storage-canary"
 scripts/build-task-storage-canary.sh "$WORK/task-storage-canary"
 TASK_STORAGE_FIXTURE=$WORK/task-storage-canary/task-storage-canary
 fi
-gcc "$TARGET_CC_FLAG" -std=c11 -O0 -Wall -Wextra -o "$WORK/canary_workload" \
+canary_build_step workload gcc "$TARGET_CC_FLAG" -std=c11 -O0 -Wall -Wextra -o "$WORK/canary_workload" \
     scripts/fixtures/canary_workload.c -ldl -pthread
-gcc "$TARGET_CC_FLAG" -shared -fPIC -Wall -Wextra -DPRIVACY_FIXTURE=1 \
+canary_build_step matrix-provider gcc "$TARGET_CC_FLAG" -shared -fPIC -Wall -Wextra -DPRIVACY_FIXTURE=1 \
     -o "$WORK/matrix-provider.so" crates/discover/tests/fixture/version_matrix.c
-gcc "$TARGET_CC_FLAG" -shared -fPIC -Wall -Wextra -DPRIVACY_FIXTURE=1 -DPRIVACY_BLOCKS=1 \
+canary_build_step privacy-provider gcc "$TARGET_CC_FLAG" -shared -fPIC -Wall -Wextra -DPRIVACY_FIXTURE=1 -DPRIVACY_BLOCKS=1 \
     -o "$WORK/privacy-provider.so" crates/discover/tests/fixture/version_matrix.c
 CANARY_WORKLOAD=$WORK/canary_workload
 MATRIX_PROVIDER=$WORK/matrix-provider.so
@@ -267,6 +270,22 @@ fi
 set -- "$WORK"/default-build/release/build/p11scope-*/out/p11scope-ebpf
 [ "$#" -eq 1 ] && [ -f "$1" ] || { echo "default BPF object is not unique"; exit 1; }
 DEFAULT_BPF=$1
+fi
+if [ -n "$PREPARE_OBJECT_INPUTS" ]; then
+    python3 -I - "$PREPARE_OBJECT_INPUTS" "$WORK" "$CAPTURE_MODE" "$TARGET_BITS" \
+        "$P11SCOPE_PRODUCT_BUILD_MODE" "$CANARY_BUILD_REV" "$CANARY_BUILD_TREE" <<'PY'
+from pathlib import Path
+import runpy
+import sys
+api = runpy.run_path('scripts/release-matrix-contract.py')
+try:
+    api['export_canary_inputs'](Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3], int(sys.argv[4]),
+        sys.argv[5], sys.argv[6], sys.argv[7])
+except (OSError, ValueError, TypeError) as error:
+    print(error, file=sys.stderr)
+    raise SystemExit(1)
+PY
+    exit 0
 fi
 python3 -I scripts/dump-owned-bpf-maps.py --self-test
 # CGROUP_FILTER is witnessed by the kernel's refusal to look it up, so prove on

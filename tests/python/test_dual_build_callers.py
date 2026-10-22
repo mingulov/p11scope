@@ -186,7 +186,7 @@ class DualBuildCallerTests(unittest.TestCase):
         (self.repo / "scripts").mkdir(parents=True)
         for source in CHILDREN:
             shutil.copy2(source, self.repo / "scripts" / source.name)
-        for name in ("product-build.sh", "cargo.sh", "lib.sh", "cleanup-traps.sh"):
+        for name in ("product-build.sh", "cargo.sh", "lib.sh", "cleanup-traps.sh", "release-matrix-contract.py"):
             shutil.copy2(ROOT / "scripts" / name, self.repo / "scripts" / name)
         shutil.copy2(FIXTURES / "record-preparer.py", self.repo / "scripts/prepare-dependencies.py")
         shutil.copy2(ROOT / ".release-rust-version", self.repo / ".release-rust-version")
@@ -453,6 +453,13 @@ else:
                         expected = self.expected(CHILDREN[1], bits, prepared, capture_mode=mode)
                         self.assertEqual(cargo, [expected[0], *expected[2:]])
                         self.assertEqual({row["kind"] for row in self.rows()}, {"cargo", "gcc", "cc", "clang-18", *([] if prepared else ["prepare"])})
+                        shutil.rmtree(self.work)
+                        check = subprocess.run(["python3", "-I", "-c",
+                            "import pathlib,runpy,sys; api=runpy.run_path('scripts/release-matrix-contract.py'); "
+                            "bundle=pathlib.Path(sys.argv[1]); facts=api['load_canary_facts'](bundle/'canary-build.json'); "
+                            "api['validate_canary_inputs'](facts,bundle,facts)", str(output)],
+                            cwd=self.repo, capture_output=True, text=True, timeout=5)
+                        self.assertEqual(check.returncode, 0, check.stdout + check.stderr)
 
     def test_prepare_object_inputs_refuses_without_successful_build(self):
         self.object_input_build_boundary()
@@ -467,6 +474,21 @@ else:
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                 self.assertFalse(self.events.exists())
                 self.assertFalse(output.exists())
+        output.mkdir()
+        (output / "owned").write_text("preserve")
+        result = self.run_child(CHILDREN[1], arguments=("--object-pilot", "--prepare-object-inputs", str(output)))
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual((output / "owned").read_text(), "preserve")
+        self.assertFalse(self.events.exists())
+        shutil.rmtree(output)
+        source = self.repo / "scripts/fixtures/canary_workload.c"
+        original = source.read_bytes()
+        source.write_bytes(original + b"\n/* uncommitted input */\n")
+        result = self.run_child(CHILDREN[1], arguments=("--object-pilot", "--prepare-object-inputs", str(output)))
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertFalse(self.events.exists())
+        self.assertFalse(output.exists())
+        source.write_bytes(original)
         config = json.loads(self.config.read_text()) | {"fail_kind": "cargo"}
         self.config.write_text(json.dumps(config))
         result = self.run_child(CHILDREN[1], arguments=("--object-pilot", "--prepare-object-inputs", str(output)))
@@ -659,14 +681,19 @@ if "--object-pilot" in args:
                 self.assertIn("canary matrix: ALL OK", result.stdout)
 
     def test_canary_product_builds_precede_task_storage_helper(self):
-        commands = [command.lstrip() for command in logical_commands(CHILDREN[1])]
-        product_builds = [index for index, command in enumerate(commands)
-                          if command.startswith("p11scope_product_build ")]
-        helper_builds = [index for index, command in enumerate(commands)
-                         if command.startswith("scripts/build-task-storage-reader.sh ")]
-        self.assertEqual(len(product_builds), 3)
-        self.assertEqual(len(helper_builds), 1)
-        self.assertLess(max(product_builds), helper_builds[0])
+        self.object_input_build_boundary()
+        self.config.write_text(json.dumps(json.loads(self.config.read_text()) | {"fail_kind": "clang-18"}))
+        for bits, expected_builds in ((32, 3), (64, 2)):
+            for prepared in (False, True):
+                with self.subTest(bits=bits, prepared=prepared):
+                    result = self.run_child(CHILDREN[1], bits, prepared)
+                    self.assertEqual(result.returncode, 83, result.stdout + result.stderr)
+                    kinds = [row["kind"] for row in self.rows()]
+                    product_builds = [index for index, kind in enumerate(kinds) if kind == "cargo"]
+                    self.assertEqual(len(product_builds), expected_builds)
+                    self.assertEqual(kinds.count("clang-18"), 1)
+                    self.assertLess(max(product_builds), kinds.index("clang-18"))
+                    self.assertNotIn("gcc", kinds)
 
     def test_standalone_defaults_to_ordinary_for_all_variants(self):
         self.assert_builds(CHILDREN[0], 64, False)

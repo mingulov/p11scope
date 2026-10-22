@@ -4,10 +4,14 @@
 import argparse
 import hashlib
 import json
+import mmap
 import os
 from pathlib import Path
 import re
 import shutil
+import stat
+import struct
+import subprocess
 import sys
 import uuid
 
@@ -150,6 +154,23 @@ SOURCE_FILES = ("scripts/release-matrix-contract.py", "scripts/qualify-release-m
                 "scripts/qualify-inventory-native.sh", "scripts/inventory-native-oracle.py",
                 "tests/fixtures/public-cli/gated.c", "tests/fixtures/public-cli/mt.c",
                 "tests/fixtures/public-cli/inventory-ledger.c")
+CANARY_SOURCE_FILES = ("scripts/verify-canaries.sh", "scripts/product-build.sh", "scripts/lib.sh",
+    "scripts/lane-lib-oracle-1.py", "scripts/cleanup-traps.sh", "scripts/_loader.py",
+    "scripts/capture-stopped-canary.py", "scripts/canary_process_custody.py",
+    "scripts/check-canary-evidence.py", "scripts/check-capture-evidence.py", "scripts/check-bpf-map-defs.py",
+    "scripts/dump-owned-bpf-maps.py", "scripts/qualify-task-storage-canary.py", ".release-rust-version",
+    "scripts/fixtures/canary_workload.c", "scripts/fixtures/privacy-stack-workload.c")
+CANARY_RUNTIME_SOURCES = ("scripts/fixtures/canary_workload.c", "crates/discover/tests/fixture/version_matrix.c",
+    "scripts/build-task-storage-reader.sh", "scripts/native/dump-task-storage.c", "scripts/native/dump-task-storage.bpf.c")
+CANARY_PRODUCER_SOURCES = ("scripts/verify-canaries.sh", "scripts/product-build.sh", "scripts/cargo.sh",
+    "scripts/release-matrix-contract.py", ".release-rust-version", "build.rs", "src/lib.rs")
+CANARY_PAYLOADS = ("p11scope", "p11scope-discover", "canary_workload", "matrix-provider.so",
+    "privacy-provider.so", "dump-task-storage", "dump-task-storage.bpf.o", "default-ebpf")
+CANARY_BUILD_ENV = ("P11SCOPE_SMALL_RING", "P11SCOPE_SMALL_STATE_MAPS", "P11SCOPE_SMALL_DISCOVERY_RING",
+    "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS")
+CANARY_PREPARED_TOOLS = ("P11SCOPE_PREPARED_STABLE_CARGO", "P11SCOPE_PREPARED_STABLE_RUSTC",
+    "P11SCOPE_PREPARED_BPF_CARGO", "P11SCOPE_PREPARED_BPF_RUSTC")
+CANARY_FACTS_MAX = 128 * 1024
 TOLERANCE_ENV = ("P11SCOPE_PRIV_LIFECYCLE_LOSS", "P11SCOPE_TEST_TIME_SCALE")
 CLASSIC_MULTI = "attach::inventory::activation::privileged_tests::privileged_classic_pid_scope_forced_multi_names_the_target_or_refuses_lp64"
 MULTI_OUTCOMES = {
@@ -171,7 +192,11 @@ def require(condition, message):
 
 
 def sha(path):
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def decode(text):
@@ -200,7 +225,226 @@ def relative(stage, name):
     return path
 
 
-def selection(lane, lib_tests=None, public_cells=None, scan=True):
+def canary_fd(path, executable=False, maximum=512 * 1024 * 1024):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(fd)
+        require(stat.S_ISREG(info.st_mode) and info.st_uid in (0, os.getuid())
+                and not info.st_mode & 0o022 and 0 < info.st_size <= maximum,
+                "untrusted or oversized canary input: " + str(path))
+        require(not executable or (info.st_mode & 0o100 and os.access(path, os.X_OK)),
+                "nonexecutable canary input: " + str(path))
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def validate_canary_payloads(selected, bits, full=False, work=None, temporary=None, embedded=False):
+    """Shared prebuilt/export validation; inspect bounded headers, never execute inputs."""
+    selected = Path(selected)
+    require(selected.is_absolute() and not selected.is_symlink(), "invalid canary input directory")
+    inputs = selected.resolve(strict=True)
+    require(inputs.is_dir() and type(bits) is int and bits in (32, 64), "invalid canary target ABI")
+    for parent in (inputs, *inputs.parents):
+        info = parent.stat()
+        require(info.st_uid in (0, os.getuid()) and (not info.st_mode & 0o022 or info.st_mode & stat.S_ISVTX),
+                "untrusted canary input ancestor")
+    if work:
+        work = Path(work).resolve()
+        require(not work.is_relative_to(inputs) and not inputs.is_relative_to(work), "overlapping canary inputs/work")
+    elif temporary:
+        require(not Path(temporary).resolve().is_relative_to(inputs), "canary temporary directory is inside inputs")
+    target = (1, 3) if bits == 32 else (2, 62)
+    specifications = {"p11scope": ((2, 62), True), "p11scope-discover": (target, True),
+        "canary_workload": (target, True), "matrix-provider.so": (target, False),
+        "privacy-provider.so": (target, False), "dump-task-storage": ((2, 62), True),
+        "dump-task-storage.bpf.o": ((2, 247), False), "default-ebpf": ((2, 247), False)}
+    if full:
+        specifications.update({"p11scope-diagnostic": ((2, 62), True),
+            "diagnostic-ebpf": ((2, 247), False), "task-storage-canary": ((2, 62), True)})
+    for name, (expected, executable) in specifications.items():
+        fd = canary_fd(inputs / name, executable, 64 * 1024 * 1024 if expected[1] == 247 else 512 * 1024 * 1024)
+        try:
+            header = os.read(fd, 20)
+            require(len(header) == 20 and header[:4] == b"\x7fELF" and header[5] == 1
+                    and (header[4], struct.unpack_from("<H", header, 18)[0]) == expected,
+                    "wrong canary ELF ABI: " + name)
+        finally:
+            os.close(fd)
+    if embedded:
+        observer = canary_fd(inputs / "p11scope", True)
+        try:
+            obj = canary_fd(inputs / "default-ebpf", maximum=64 * 1024 * 1024)
+            try:
+                with mmap.mmap(observer, 0, access=mmap.ACCESS_READ) as image, mmap.mmap(obj, 0, access=mmap.ACCESS_READ) as elf:
+                    start = image.find(elf)
+                    require(start >= 0 and image.find(elf, start + 1) == -1,
+                            "selected canary BPF object is not uniquely embedded in observer")
+            finally:
+                os.close(obj)
+        finally:
+            os.close(observer)
+    return inputs
+
+
+def load_canary_facts(path):
+    fd = canary_fd(path, maximum=CANARY_FACTS_MAX)
+    with os.fdopen(fd) as stream:
+        return decode(stream.read())
+
+
+def canary_commands(work, mode, bits, build_mode):
+    """The fixed eight-input producer command contract, including its output association."""
+    work = Path(work)
+    commands = [("observer", ["p11scope_product_build", build_mode, "--release", "--workspace",
+        *(["--features", "stub-object-attributes"] if mode == "p0" else []),
+        "--target-dir", str(work / "default-build")])]
+    if bits == 32:
+        commands.append(("helper", ["p11scope_product_build", build_mode, "--release", "-p", "p11scope-discover",
+            "--target", "i686-unknown-linux-gnu", "--target-dir", str(work / "helper-build")]))
+    commands.extend([
+        ("reader", ["scripts/build-task-storage-reader.sh", str(work / "task-storage-reader")]),
+        ("workload", ["gcc", f"-m{bits}", "-std=c11", "-O0", "-Wall", "-Wextra", "-o", str(work / "canary_workload"),
+            "scripts/fixtures/canary_workload.c", "-ldl", "-pthread"]),
+        ("matrix-provider", ["gcc", f"-m{bits}", "-shared", "-fPIC", "-Wall", "-Wextra", "-DPRIVACY_FIXTURE=1",
+            "-o", str(work / "matrix-provider.so"), "crates/discover/tests/fixture/version_matrix.c"]),
+        ("privacy-provider", ["gcc", f"-m{bits}", "-shared", "-fPIC", "-Wall", "-Wextra", "-DPRIVACY_FIXTURE=1", "-DPRIVACY_BLOCKS=1",
+            "-o", str(work / "privacy-provider.so"), "crates/discover/tests/fixture/version_matrix.c"]),
+    ])
+    return commands
+
+
+def validate_canary_inputs(facts, bundle, candidate):
+    fields = {"producer", "source_root", "source_revision", "source_tree", "source_clean", "capture_mode",
+        "target_bits", "build_mode", "prepared_tools", "release_rust", "build_environment", "builds",
+        "artifacts", "runtime_sources", "producer_sources"}
+    require(isinstance(facts, dict) and set(facts) == fields, "invalid canary build facts")
+    require(facts["producer"] == "verify-canaries.sh --prepare-object-inputs" and facts["source_clean"] is True,
+            "canary inputs need the successful clean build producer")
+    for key in ("source_revision", "source_tree"):
+        require(isinstance(facts[key], str) and re.fullmatch(r"[0-9a-f]{40}", facts[key])
+                and facts[key] == candidate.get(key), "canary/candidate build source mismatch: " + key)
+    root = Path(facts["source_root"])
+    require(root.is_absolute() and str(root.resolve(strict=True)) == str(root) and root.is_dir(), "invalid canary build root")
+    mode, bits, build_mode = facts["capture_mode"], facts["target_bits"], facts["build_mode"]
+    require(mode in ("full", "p0") and type(bits) is int and bits in (32, 64)
+            and build_mode in ("ordinary", "prepared"), "invalid canary build selection")
+    tools = facts["prepared_tools"]
+    require(isinstance(tools, dict) and set(tools) <= set(CANARY_PREPARED_TOOLS)
+            and all(isinstance(value, str) and Path(value).is_absolute() for value in tools.values())
+            and (build_mode != "prepared" or set(tools) == set(CANARY_PREPARED_TOOLS)), "invalid canary prepared tool context")
+    environment = facts["build_environment"]
+    require(isinstance(environment, dict) and set(environment) == set(CANARY_BUILD_ENV)
+            and all(value is None or isinstance(value, str) and len(value) <= 8192 for value in environment.values()),
+            "invalid canary build environment")
+    require(facts["release_rust"] == (root / ".release-rust-version").read_text().strip(), "canary release compiler changed")
+    for key, expected in (("runtime_sources", CANARY_RUNTIME_SOURCES), ("producer_sources", CANARY_PRODUCER_SOURCES)):
+        hashes = facts[key]
+        require(isinstance(hashes, dict) and set(hashes) == set(expected), "missing canary source closure: " + key)
+        for name, digest in hashes.items():
+            require(isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest)
+                    and sha(root / name) == digest, "compiled canary source changed: " + name)
+    require(facts["runtime_sources"]["scripts/fixtures/canary_workload.c"] == sha(ROOT / "scripts/fixtures/canary_workload.c"),
+            "compiled canary sentinel source differs from scanner input")
+    artifacts = facts["artifacts"]
+    require(isinstance(artifacts, dict) and set(artifacts) == set(CANARY_PAYLOADS), "missing canary payload association")
+    for name, item in artifacts.items():
+        require(isinstance(item, dict) and set(item) == {"source", "build", "sha256"}
+                and isinstance(item["source"], str) and Path(item["source"]).is_absolute()
+                and ".." not in Path(item["source"]).parts and str(Path(item["source"])) == item["source"],
+                "invalid canary output association")
+    observer = Path(artifacts["p11scope"]["source"])
+    require(observer.name == "p11scope" and observer.parent.name == "release" and observer.parent.parent.name == "default-build",
+            "canary observer is not the selected build output")
+    work = observer.parent.parent.parent
+    commands = canary_commands(work, mode, bits, build_mode)
+    builds = facts["builds"]
+    require(isinstance(builds, list) and all(isinstance(step, dict) and type(step.get("exit")) is int for step in builds)
+            and builds == [{"role": role, "argv": argv, "cwd": str(root), "exit": 0} for role, argv in commands],
+            "canary build commands/status do not match selected inputs")
+    origins = {"p11scope": (observer, "observer"),
+        "p11scope-discover": (work / ("helper-build/i686-unknown-linux-gnu/release/p11scope-discover" if bits == 32 else "default-build/release/p11scope-discover"), "helper" if bits == 32 else "observer"),
+        "canary_workload": (work / "canary_workload", "workload"),
+        "matrix-provider.so": (work / "matrix-provider.so", "matrix-provider"),
+        "privacy-provider.so": (work / "privacy-provider.so", "privacy-provider"),
+        "dump-task-storage": (work / "task-storage-reader/dump-task-storage", "reader"),
+        "dump-task-storage.bpf.o": (work / "task-storage-reader/dump-task-storage.bpf.o", "reader")}
+    obj = Path(artifacts["default-ebpf"]["source"])
+    require(obj.parent.name == "out" and obj.parent.parent.name.startswith("p11scope-")
+            and obj.parent.parent.parent == work / "default-build/release/build" and obj.name == "p11scope-ebpf",
+            "canary BPF is not from the observer build")
+    origins["default-ebpf"] = (obj, "observer")
+    validate_canary_payloads(bundle, bits, embedded=True)
+    require({path.name for path in Path(bundle).iterdir()} in (set(CANARY_PAYLOADS), set(CANARY_PAYLOADS) | {"canary-build.json"}),
+            "unexpected canary pilot payload")
+    for name, (origin, role) in origins.items():
+        item = artifacts[name]
+        require(item["source"] == str(origin) and item["build"] == role
+                and isinstance(item["sha256"], str) and re.fullmatch(r"[0-9a-f]{64}", item["sha256"])
+                and sha(Path(bundle) / name) == item["sha256"], "stale/mixed canary output: " + name)
+    return facts
+
+
+def validate_canary_destination(destination, work=None):
+    destination = Path(destination)
+    require(destination.is_absolute() and not destination.exists() and not destination.is_symlink(),
+            "canary export requires an absent absolute destination")
+    require(destination.parent.is_dir() and str(destination.parent.resolve()) == str(destination.parent),
+            "canary export requires a canonical existing parent")
+    for parent in destination.parents:
+        info = parent.stat()
+        require(info.st_uid in (0, os.getuid()) and (not info.st_mode & 0o022 or info.st_mode & stat.S_ISVTX),
+                "untrusted canary export ancestor")
+    if work:
+        work = Path(work).resolve()
+        require(not work.is_relative_to(destination) and not destination.is_relative_to(work), "overlapping canary export/work")
+    require(not ROOT.is_relative_to(destination), "canary export overlaps source root")
+    return destination
+
+
+def export_canary_inputs(destination, work, mode, bits, build_mode, revision, tree):
+    """Called only after the shell's actual build steps; never performs a build or live operation."""
+    destination, work = validate_canary_destination(destination, work), Path(work)
+    require(subprocess.run(["git", "diff", "--quiet", "HEAD", "--"], cwd=ROOT).returncode == 0
+            and subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip() == revision
+            and subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], cwd=ROOT, text=True).strip() == tree,
+            "source changed during canary input build")
+    builds = [decode(line) for line in (work / "canary-build.commands.jsonl").read_text().splitlines()]
+    obj, = (work / "default-build/release/build").glob("p11scope-*/out/p11scope-ebpf")
+    origins = {"p11scope": (work / "default-build/release/p11scope", "observer"),
+        "p11scope-discover": (work / ("helper-build/i686-unknown-linux-gnu/release/p11scope-discover" if bits == 32 else "default-build/release/p11scope-discover"), "helper" if bits == 32 else "observer"),
+        "default-ebpf": (obj, "observer"), "canary_workload": (work / "canary_workload", "workload"),
+        "matrix-provider.so": (work / "matrix-provider.so", "matrix-provider"),
+        "privacy-provider.so": (work / "privacy-provider.so", "privacy-provider"),
+        "dump-task-storage": (work / "task-storage-reader/dump-task-storage", "reader"),
+        "dump-task-storage.bpf.o": (work / "task-storage-reader/dump-task-storage.bpf.o", "reader")}
+    for name, (origin, _) in origins.items():
+        fd = canary_fd(origin, maximum=64 * 1024 * 1024 if name.endswith((".bpf.o", "-ebpf")) else 512 * 1024 * 1024)
+        os.close(fd)
+    facts = {"producer": "verify-canaries.sh --prepare-object-inputs", "source_root": str(ROOT),
+        "source_revision": revision, "source_tree": tree, "source_clean": True, "capture_mode": mode,
+        "target_bits": bits, "build_mode": build_mode,
+        "prepared_tools": {name: os.environ[name] for name in CANARY_PREPARED_TOOLS if os.environ.get(name)},
+        "release_rust": (ROOT / ".release-rust-version").read_text().strip(),
+        "build_environment": {name: os.environ.get(name) for name in CANARY_BUILD_ENV}, "builds": builds,
+        "artifacts": {name: {"source": str(origin), "build": role, "sha256": sha(origin)} for name, (origin, role) in origins.items()},
+        "runtime_sources": {name: sha(ROOT / name) for name in CANARY_RUNTIME_SOURCES},
+        "producer_sources": {name: sha(ROOT / name) for name in CANARY_PRODUCER_SOURCES}}
+    require(len((json.dumps(facts, sort_keys=True, indent=2) + "\n").encode()) <= CANARY_FACTS_MAX,
+            "canary build facts exceed input bound")
+    destination.mkdir(mode=0o700)
+    try:
+        for name, (origin, _) in origins.items():
+            shutil.copy2(origin, destination / name)
+        validate_canary_inputs(facts, destination, facts)
+        save(destination / "canary-build.json", facts)
+    except BaseException:
+        shutil.rmtree(destination)
+        raise
+
+
+def selection(lane, lib_tests=None, public_cells=None, scan=True, object_cells=()):
     require(lane in LANES, "unregistered kernel lane: " + lane)
     require(type(scan) is bool, "invalid scan selection")
     defaults = DEFAULT_LIB_TESTS + BREADTH
@@ -216,10 +460,20 @@ def selection(lane, lib_tests=None, public_cells=None, scan=True):
     require(publics and len(publics) == len(set(publics)) and set(publics) <= set(PUBLIC), "invalid public selection")
     ids = list(BASE_IDS) + (["inventory-scan"] if scan else [])
     ids += ["public:" + n for n in publics] + ["lib:" + n for n in libs]
+    objects = []
+    selected = set()
+    for mode, bits in object_cells:
+        require(mode in ("full", "p0") and type(bits) is int and bits in (32, 64), "invalid object cell selection")
+        require((mode, bits) not in selected, "duplicate object cell selection")
+        selected.add((mode, bits))
+    for mode, bits in sorted(selected):
+        required = [f"object:{mode}:{bits}:complete", f"object:{mode}:{bits}:blocked"]
+        objects.append({"mode": mode, "target_bits": bits, "bundle": f"artifacts/canary/{mode}-{bits}", "required_ids": required})
+        ids.extend(required)
     if lane == "5.15.221":
         ids.append("identity:5.15-denied")
     return {"schema": SCHEMA, "claim": "selected-release-matrix", "lane": lane,
-            "required_ids": ids, "lib_tests": libs,
+            "required_ids": ids, "lib_tests": libs, "object_cells": objects,
             "public_cells": [{"cell": n, "qualification": PUBLIC[n]} for n in publics],
             "include_scan": scan, "threads": 12, "pid_filter_test": PID_TEST,
             "tolerance_policy": {"environment": "unset-or-empty", "forbidden_environment": list(TOLERANCE_ENV),
@@ -253,8 +507,11 @@ def validate_contract(contract):
     require(isinstance(contract, dict), "contract is not an object")
     publics = contract.get("public_cells", [])
     require(isinstance(publics, list) and all(isinstance(row, dict) for row in publics), "invalid public contract")
+    objects = contract.get("object_cells", [])
+    require(isinstance(objects, list) and all(isinstance(row, dict) for row in objects), "invalid object contract")
     core = selection(contract.get("lane", ""), contract.get("lib_tests", []),
-                     [row.get("cell") for row in publics], contract.get("include_scan"))
+                     [row.get("cell") for row in publics], contract.get("include_scan"),
+                     [(row.get("mode"), row.get("target_bits")) for row in objects])
     for key, value in core.items():
         require(contract.get(key) == value, "contract registration drift: " + key)
     require(isinstance(contract.get("run_id"), str) and re.fullmatch(r"[0-9a-f]{32}", contract["run_id"]), "invalid run binding")
@@ -306,9 +563,10 @@ def membership(stage, contract):
 
 def prepare(args):
     stage = args.prepare.resolve()
+    cells = object_arguments(args.object_input)
+    core = selection(args.lane, args.lib_test, args.public_cell, not args.without_scan, [(mode, bits) for mode, bits, _ in cells])
     stage.mkdir(parents=True, exist_ok=True)
     require(not (stage / "contract.json").exists(), "refuse to overwrite an execution contract")
-    core = selection(args.lane, args.lib_test, args.public_cell, not args.without_scan)
     core["run_id"] = uuid.uuid4().hex
     bindings = {}
     sources = {"inputs/ignored.txt": args.binary_list, "inputs/curation.txt": args.curation,
@@ -323,6 +581,21 @@ def prepare(args):
                     ("p11scope", "p11scope-lib", "p11scope-bpfmulti")})
     for name in SOURCE_FILES:
         sources["artifacts/source/" + name] = ROOT / name
+    canary_facts = {}
+    if cells:
+        for name in CANARY_SOURCE_FILES:
+            sources["artifacts/source/" + name] = ROOT / name
+    for mode, bits, bundle in cells:
+        require(not stage.is_relative_to(bundle) and not bundle.is_relative_to(stage), "overlapping canary input/stage")
+        facts = validate_canary_inputs(load_canary_facts(bundle / "canary-build.json"), bundle, candidate)
+        require((facts["capture_mode"], facts["target_bits"]) == (mode, bits), "selected canary mode/ABI differs from build")
+        key = f"{mode}-{bits}"
+        canary_facts[key] = facts
+        sources[f"inputs/canary-build/{key}.json"] = bundle / "canary-build.json"
+        for name in CANARY_PAYLOADS:
+            sources[f"artifacts/canary/{key}/{name}"] = bundle / name
+        for name in facts["runtime_sources"] | facts["producer_sources"]:
+            sources[f"artifacts/canary-source/{key}/{name}"] = Path(facts["source_root"]) / name
     # Task2's accepted checker joins the integrated source pin; never invent it.
     if (ROOT / "scripts/public-cli-oracle.py").exists():
         sources["artifacts/source/scripts/public-cli-oracle.py"] = ROOT / "scripts/public-cli-oracle.py"
@@ -332,6 +605,10 @@ def prepare(args):
         path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(origin, path)
         bindings[name] = sha(path)
+    for key, facts in canary_facts.items():
+        validate_canary_inputs(load_canary_facts(stage / f"inputs/canary-build/{key}.json"), stage / f"artifacts/canary/{key}", candidate)
+        for name, digest in (facts["runtime_sources"] | facts["producer_sources"]).items():
+            require(bindings[f"artifacts/canary-source/{key}/{name}"] == digest, "canary source changed during staging")
     core["bindings"] = bindings
     membership(stage, core)
     save(stage / "contract.json", core)
@@ -544,6 +821,13 @@ def verify_inputs(stage, contract_path):
         "inputs/candidate-build.json"}
     required.update("artifacts/source/" + name for name in SOURCE_FILES)
     required.update("artifacts/lib-source/" + name for name in RUNTIME_SOURCES)
+    if contract["object_cells"]:
+        required.update("artifacts/source/" + name for name in CANARY_SOURCE_FILES)
+    for cell in contract["object_cells"]:
+        key = f'{cell["mode"]}-{cell["target_bits"]}'
+        required.add(f"inputs/canary-build/{key}.json")
+        required.update(f"artifacts/canary/{key}/{name}" for name in CANARY_PAYLOADS)
+        required.update(f"artifacts/canary-source/{key}/{name}" for name in (*CANARY_RUNTIME_SOURCES, *CANARY_PRODUCER_SOURCES))
     if (ROOT / "scripts/public-cli-oracle.py").exists():
         required.add("artifacts/source/scripts/public-cli-oracle.py")
     require(isinstance(bindings, dict) and set(bindings) >= required, "missing required source/artifact bindings")
@@ -554,6 +838,12 @@ def verify_inputs(stage, contract_path):
             require(sha(ROOT / name.removeprefix("artifacts/source/")) == digest, "runtime source changed: " + name)
     require(bindings["artifacts/source/scripts/release-matrix-contract.py"] == sha(Path(__file__)), "judge source changed from contract")
     candidate = validate_candidate(load(stage / "inputs/candidate-build.json"), stage / "artifacts/p11scope-lib")
+    for cell in contract["object_cells"]:
+        key = f'{cell["mode"]}-{cell["target_bits"]}'
+        facts = validate_canary_inputs(load_canary_facts(stage / f"inputs/canary-build/{key}.json"), stage / cell["bundle"], candidate)
+        require((facts["capture_mode"], facts["target_bits"]) == (cell["mode"], cell["target_bits"]), "selected canary mode/ABI differs from build")
+        for name, digest in (facts["runtime_sources"] | facts["producer_sources"]).items():
+            require(bindings[f"artifacts/canary-source/{key}/{name}"] == digest, "compiled canary snapshot differs from build")
     for name, digest in candidate["runtime_sources"].items():
         require(bindings["artifacts/lib-source/" + name] == digest, "compiled fixture snapshot does not match build receipt")
     membership(stage, contract)
@@ -562,6 +852,7 @@ def verify_inputs(stage, contract_path):
 
 def judge(stage, contract_path):
     contract = verify_inputs(stage, contract_path)
+    require(not contract["object_cells"], "selected object execution is not activated; prepared inputs alone do not qualify")
     receipt = load(stage / "receipt.json")
     require(receipt.get("schema") == "p11scope/release-matrix-execution/v1", "unknown execution receipt")
     require(receipt.get("run_id") == contract["run_id"] and receipt.get("contract_sha256") == sha(contract_path), "stale execution/contract hash")
@@ -662,6 +953,14 @@ def load_json_line(line):
     return result
 
 
+def object_arguments(arguments):
+    cells = []
+    for mode, bits, directory in arguments or []:
+        require(mode in ("full", "p0") and bits in ("32", "64") and Path(directory).is_absolute(), "invalid object input selection")
+        cells.append((mode, int(bits), Path(directory)))
+    return cells
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     modes = parser.add_mutually_exclusive_group(required=True)
@@ -682,13 +981,16 @@ def main(argv=None):
     parser.add_argument("--bpfmulti-list", type=Path)
     parser.add_argument("--candidate-receipt", type=Path)
     parser.add_argument("--guest-exit", type=int)
+    parser.add_argument("--object-input", nargs=3, action="append", metavar=("MODE", "BITS", "ABS_DIR"))
     args = parser.parse_args(argv)
     try:
         if args.verify_launch_policy:
             launch_policy()
             return 0
         if args.plan:
-            print(json.dumps({"lanes": LANES, "execution": selection(args.lane, args.lib_test, args.public_cell, not args.without_scan)}, indent=2))
+            cells = object_arguments(args.object_input)
+            print(json.dumps({"lanes": LANES, "execution": selection(args.lane, args.lib_test, args.public_cell, not args.without_scan,
+                [(mode, bits) for mode, bits, _ in cells])}, indent=2))
             return 0
         if args.prepare:
             prepare(args)

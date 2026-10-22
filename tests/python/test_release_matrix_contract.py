@@ -598,7 +598,7 @@ class MatrixContract(unittest.TestCase):
         bundle, original = self.canary_inputs()
         original_payloads = {name: (bundle / name).read_bytes() for name in original["artifacts"]}
         cases = ("missing", "untrusted", "symlink", "opposite_mode", "wrong_abi", "wrong_bpf", "mixed_bpf",
-                 "failed_build", "wrong_features", "stale_source", "source_tree", "declaration", "duplicate")
+                 "failed_build", "boolean_exit", "duplicate_embedding", "wrong_features", "stale_source", "source_tree", "declaration", "duplicate")
         for case in cases:
             with self.subTest(case=case):
                 for name, content in original_payloads.items():
@@ -620,6 +620,11 @@ class MatrixContract(unittest.TestCase):
                     (bundle / name).write_bytes(value)
                     facts["artifacts"][name]["sha256"] = hashlib.sha256(value).hexdigest()
                 elif case == "failed_build": facts["builds"][0]["exit"] = 1
+                elif case == "boolean_exit": facts["builds"][0]["exit"] = False
+                elif case == "duplicate_embedding":
+                    value = original_payloads["p11scope"] + original_payloads["default-ebpf"]
+                    (bundle / "p11scope").write_bytes(value)
+                    facts["artifacts"]["p11scope"]["sha256"] = hashlib.sha256(value).hexdigest()
                 elif case == "wrong_features": facts["builds"][0]["argv"][2:2] = ["--features", "stub-object-attributes"]
                 elif case == "stale_source": facts["runtime_sources"]["scripts/fixtures/canary_workload.c"] = "0" * 64
                 elif case == "source_tree": facts["source_tree"] = "c" * 40

@@ -8,6 +8,7 @@ use crate::semantics_edge::resources::SemanticResourcePool;
 use crate::semantics_objects::journal::tests::{
     COOKIE, ENTRY_NS, EXEC, begin_bytes, end_bytes_absent, function_id,
 };
+use p11scope_ebpf_common::object_wire::publish_object_descriptors;
 
 fn collect(
     owner: &mut JointCaptureOwner,

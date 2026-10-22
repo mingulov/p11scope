@@ -983,6 +983,49 @@ class MatrixContract(unittest.TestCase):
         self.assertEqual([row["id"] for row in value["rows"] if row["id"].startswith("object:")],
                          ["object:full:64:complete", "object:full:64:blocked"])
 
+    def test_object_judgment_binds_original_work_root_without_reopening_guest_paths(self):
+        stage = self.object_judgment_fixture((("full", 64),))
+        cell = stage / "object/full-64"
+        path = cell / "result.json"
+        original_result = json.loads(path.read_text())
+        original = Path(original_result["original_work_root"])
+        manifests = {row["manifest"]: json.loads((cell / row["manifest"]).read_text())
+                     for row in original_result["rows"]}
+        shutil.rmtree(original)
+        bound = self.base / "absent guest disk"
+        self.assertFalse(bound.exists())
+        contract = json.loads(self.contract.read_text())
+        contract["guest_work_root"] = str(bound)
+        self.contract.write_text(json.dumps(contract))
+
+        def returned_root(root):
+            # Parser-only guest provenance: references remain self-consistent,
+            # but neither the bound base nor these paths exist on the host.
+            result = dict(original_result, original_work_root=str(root))
+            path.write_text(json.dumps(result))
+            for name, items in manifests.items():
+                values = json.loads(json.dumps(items))
+                for item in values:
+                    if "file" in item:
+                        item["file"] = str(root / Path(item["file"]).relative_to(original))
+                    item["snapshot"]["receipt"] = str(root / Path(item["snapshot"]["receipt"]).relative_to(original))
+                (cell / name).write_text(json.dumps(values))
+            self.seal()
+            return self.judge()
+
+        for root in (bound / "task", bound / "nested/task"):
+            with self.subTest(healthy_root=root):
+                healthy = returned_root(root)
+                self.assertEqual(healthy.returncode, 2, healthy.stdout + healthy.stderr)
+                rows = [row["id"] for row in json.loads(healthy.stdout)["rows"] if row["id"].startswith("object:")]
+                self.assertEqual(rows, ["object:full:64:complete", "object:full:64:blocked"])
+        for root in (bound, self.base / "outside task", Path(str(bound) + "-sibling") / "task",
+                     bound / "../outside task"):
+            with self.subTest(foreign_root=root):
+                refused = returned_root(root)
+                self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+        self.assertFalse(bound.exists(), "host judgment reopened or created the guest base")
+
     def retained_object_inputs(self, cells=(("full", 64),), native_inputs=None):
         repo = self.base / "original object source"
         names = set().union(*(set(CHECKER_MOD[key]) for key in
@@ -1214,6 +1257,63 @@ class MatrixContract(unittest.TestCase):
                 events = [json.loads(line) for line in Path(value["events"]).read_text().splitlines()]
                 self.assertFalse(any(row["kind"] in ("capture", "compiler", "signal") for row in events))
                 shutil.rmtree(stage / "object")
+
+    def test_generated_object_dispatch_requires_private_descendant_of_bound_work_root(self):
+        # No native setup: a valid root reaches a controlled acquisition failure
+        # before any workload, while foreign roots must leave both trees intact.
+        fixture = NativeObjectMatrix()
+        fixture.scene, fixture.base = self, self.base
+        _, stage, _, cwd, env, config_path = fixture.object_stage((("full", 64),), native_inputs=None)
+        bound = self.base / "bound object work"; bound.mkdir(mode=0o700)
+        direct = bound / "private task"; direct.mkdir(mode=0o700)
+        nested_parent = bound / "nested"; nested_parent.mkdir(mode=0o700)
+        nested = nested_parent / "private task"; nested.mkdir(mode=0o700)
+        outside = self.base / "outside object work"; outside.mkdir(mode=0o700)
+        sibling = self.base / "bound object work-sibling"; sibling.mkdir(mode=0o700)
+        alias = bound / "linked outside"; alias.symlink_to(outside, target_is_directory=True)
+        inside_alias = bound / "linked inside"; inside_alias.symlink_to(direct, target_is_directory=True)
+        contract_path = stage / "contract.json"
+        contract = json.loads(contract_path.read_text()); contract["guest_work_root"] = str(bound)
+        contract_path.write_text(json.dumps(contract))
+        config = json.loads(config_path.read_text()); config["failure"] = "refusal"
+
+        def tree(root):
+            return {path.relative_to(root).as_posix():
+                    (stat.S_IMODE(path.lstat().st_mode),
+                     str(path.readlink()) if path.is_symlink() else
+                     hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None)
+                    for path in root.rglob("*")}
+
+        for work in (bound, outside, sibling, bound / ".." / outside.name, alias, inside_alias):
+            with self.subTest(refused_root=work):
+                config["work_root"] = str(work); config_path.write_text(json.dumps(config))
+                before = {root: tree(root) for root in (stage, bound, outside, sibling)}
+                try:
+                    result = fixture.dispatch(stage, work, cwd, env)
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertFalse((stage / "object").exists(), result.stderr)
+                    self.assertEqual({root: tree(root) for root in before}, before)
+                    events_path = Path(config["events"])
+                    events = [json.loads(line) for line in events_path.read_text().splitlines()] if events_path.exists() else []
+                    self.assertFalse(any(row["kind"] in ("refusal_acquisition", "inventory_preflight", "capture", "compiler", "signal")
+                                         for row in events))
+                finally:
+                    shutil.rmtree(stage / "object", ignore_errors=True)
+                    Path(config["events"]).unlink(missing_ok=True)
+        for work in (direct, nested):
+            with self.subTest(healthy_root=work):
+                config["work_root"] = str(work); config_path.write_text(json.dumps(config))
+                result = fixture.dispatch(stage, work, cwd, env)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("controlled refusal acquisition exit=42", result.stderr)
+                self.assertIn("object_runner_exit=42", result.stderr)
+                self.assertFalse(list((stage / "object").rglob("result.json")))
+                self.assertFalse(list(work.glob("*/object-*.ready")))
+                events = [json.loads(line) for line in Path(config["events"]).read_text().splitlines()]
+                self.assertEqual(len([row for row in events if row["kind"] == "refusal_acquisition"]), 1)
+                self.assertFalse(any(row["kind"] in ("capture", "compiler", "signal") for row in events))
+                shutil.rmtree(stage / "object")
+                Path(config["events"]).unlink()
 
     def test_object_wire_fixture_composition_passes_real_semantic_and_final_checkers(self):
         # Serialized acquisition fixtures only: these PIDs are literal wire

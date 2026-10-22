@@ -1116,6 +1116,9 @@ def object_closure(result, contract, cell, read):
             "stale/wrong object result selection")
     require(type(result["runner_exit"]) is int and result["runner_exit"] == 0, "object runner failed")
     original = build_root(result["original_work_root"])
+    bound = build_root(contract["guest_work_root"])
+    require(original != bound and original.is_relative_to(bound),
+            "object original work root must be a strict descendant of bound guest work root")
     def copied(path):
         path = build_root(path)
         require(path != original and path.is_relative_to(original), "object reference escapes original work root")
@@ -1213,7 +1216,10 @@ def run_objects(stage, contract_path, work_root):
         require(result.returncode == 0 and result.stdout.strip() == str(expected), "object runner effective identity mismatch")
     require(caller("sudo", "-n", "true").returncode == 0, "object runner needs noninteractive sudo")
     require(work_root is not None, "object work root required")
+    bound = validate_guest_work_root(contract["guest_work_root"], account.pw_uid)
     work_root = validate_guest_work_root(work_root, account.pw_uid)
+    require(work_root != bound and work_root.is_relative_to(bound),
+            "object work root must be a strict descendant of bound guest work root")
     require(work_root.stat().st_uid == account.pw_uid and not work_root.stat().st_mode & 0o077,
             "object work root must be caller-owned and private")
     require(not work_root.is_relative_to(stage) and not stage.is_relative_to(work_root), "object work/input trees overlap")

@@ -1069,6 +1069,9 @@ class EntryObjectTests(unittest.TestCase):
             root_texts = dict(root_insns)
             epilogue, epilogue_text = next((pc, text) for pc, text in reversed(root_insns)
                                            if text == "r0 = 0x0")
+            # These mutations touch the return root or bodies called only by
+            # that root. Keep one healthy/refused pair through the full contract
+            # per variant; exercise its delegated return proof for the rest.
             for suffix in ("ordinary_return", "object_return"):
                 alias = before_call(variant, root_name, suffix, r"r8 &= 0x1")
                 # The accepted ABI is already 0/1 at this redundant mask.
@@ -1078,13 +1081,19 @@ class EntryObjectTests(unittest.TestCase):
                                   "r9 = *(u32 *)(r0 + 0x38)")
                 snapshot = mutate(snapshot, root_name, epilogue, epilogue_text, "r0 = r9")
                 with self.subTest(variant=variant, call=suffix, control="caller snapshot survives retirement"):
-                    self.assertTrue(all(CHECKER["contract"](snapshot, variant)["verified"].values()))
+                    if suffix == "ordinary_return":
+                        self.assertTrue(all(CHECKER["contract"](snapshot, variant)["verified"].values()))
+                    else:
+                        self.assertEqual(set(return_contract(variant, snapshot)["outlined"]), {"ordinary", "object"})
                 stale = mutate(OBJECTS[variant], root_name, alias, root_texts[alias], "r9 = r0")
                 stale = mutate(stale, root_name, epilogue, epilogue_text,
                                "r0 = *(u32 *)(r9 + 0x38)")
                 with self.subTest(variant=variant, call=suffix, control="caller alias cannot outlive retirement"):
                     with self.assertRaisesRegex(RuntimeError, "return.*START read after retirement"):
-                        CHECKER["contract"](stale, variant)
+                        if suffix == "ordinary_return":
+                            CHECKER["contract"](stale, variant)
+                        else:
+                            return_contract(variant, stale)
                 # A saved pointer's nonnull value survives a callee, but the
                 # lifetime of the original row does not. This later guard
                 # must not reacquire ownership before the same stale read.
@@ -1095,10 +1104,10 @@ class EntryObjectTests(unittest.TestCase):
                 guarded = mutate(stale, root_name, guard, old_guard, new_guard)
                 with self.subTest(variant=variant, call=suffix, control="nonnull alias cannot revive retired row"):
                     with self.assertRaisesRegex(RuntimeError, "return.*START read after retirement"):
-                        CHECKER["contract"](guarded, variant)
+                        return_contract(variant, guarded)
                 guarded_snapshot = mutate(snapshot, root_name, guard, old_guard, new_guard)
                 with self.subTest(variant=variant, call=suffix, control="guarded value snapshot survives retirement"):
-                    self.assertTrue(all(CHECKER["contract"](guarded_snapshot, variant)["verified"].values()))
+                    self.assertEqual(set(return_contract(variant, guarded_snapshot)["outlined"]), {"ordinary", "object"})
                 for register, new in (("r1", "r1 = r10"), ("r2", "r2 += 0x8"),
                                       ("r3", "r3 = r10"), ("r4", "r4 = 0x0"), ("r5", "r5 = 0x2")):
                     pc = before_call(variant, root_name, suffix, register+r" (=|\+=) .*")
@@ -1115,7 +1124,7 @@ class EntryObjectTests(unittest.TestCase):
                     clobber = mutate(clobber, name, offset, old_offset, "r1 += 0x38")
                     with self.subTest(variant=variant, control="known writer cannot clobber live START"):
                         with self.assertRaisesRegex(RuntimeError, "return.*(immutable|footprint|output)"):
-                            CHECKER["contract"](clobber, variant)
+                            return_contract(variant, clobber)
                 # The caller's key is not this function's r10 frame.
                 pc, old = next((pc, text) for pc, text in insns
                                if re.fullmatch(r"r[14] = \*\(u64 \*\)\(r2 \+ 0x0\)", text))

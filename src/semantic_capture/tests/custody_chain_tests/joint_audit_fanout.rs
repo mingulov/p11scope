@@ -1947,7 +1947,15 @@ fn joint_pending_h3_stash_disposes_frame_and_claims_original_in_next_quantum() {
         .joint_capture()
         .adapter()
         .invocation_claims_for_test();
-    assert_eq!(before_claims, (1, vec![3]));
+    assert_eq!(before_claims.0, 1);
+    assert_eq!(
+        before_claims
+            .1
+            .iter()
+            .map(|(at, _)| *at)
+            .collect::<Vec<_>>(),
+        [3]
+    );
     let before_roles = fixture
         .scene
         .real
@@ -2125,16 +2133,22 @@ fn joint_pending_h3_stash_disposes_frame_and_claims_original_in_next_quantum() {
         .unwrap_or_else(|(_, reason)| panic!("actual next raw: {reason:?}"));
     let claims = claim_and_finish(&mut fixture.scene, &ingested);
     assert_eq!(claims.iter().map(|(at, _)| *at).collect::<Vec<_>>(), [4, 5]);
+    let actual_claims = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .invocation_claims_for_test();
+    assert_eq!(actual_claims.0, 3);
     assert_eq!(
-        fixture
-            .scene
-            .real
-            .scene
-            .coordinator
-            .joint_capture()
-            .adapter()
-            .invocation_claims_for_test(),
-        (3, vec![3, 4, 5])
+        actual_claims
+            .1
+            .iter()
+            .map(|(at, _)| *at)
+            .collect::<Vec<_>>(),
+        [3, 4, 5]
     );
     fixture.retain_collected_birth(&admitted[0], current_c, claims[0].1);
     fixture

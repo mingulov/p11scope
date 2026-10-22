@@ -14,6 +14,8 @@ The candidate revision is an explicit provenance declaration, paired with the
 checked executable hash. The caller still must establish that build provenance;
 this script cannot derive a source revision or enabled feature set from an ELF.
 Oracle/C self-tests are unprivileged and are not kernel qualification.
+Version 2 separately binds six exact native/Aya auxiliary source forms; unknown
+BTF-less loads remain fatal and no auxiliary can supply affected-root coverage.
 """
 import argparse
 import copy
@@ -33,7 +35,7 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _loader import load_sibling
 
-CONTRACT = 'p11scope-verifier-headroom-v1'
+CONTRACT = 'p11scope-verifier-headroom-v2'
 MAX_BYTES = 4 * 1024 * 1024
 MAX_ROWS = 4096
 BASE_ROOTS = frozenset(('p11_entry', 'p11_return', 'sched_process_exec', 'sched_process_exit'))
@@ -44,9 +46,25 @@ LOAD_FIELDS = frozenset(('record', 'pid', 'root', 'btf_resolved', 'btf_fd', 'btf
                          'returned_btf_id', 'root_type_id', 'returned_fd', 'program_id',
                          'program_type', 'returned_program_type', 'program_flags',
                          'expected_attach_type', 'insn_count', 'relocated_fnv1a64',
-                         'loaded', 'errno', 'stats_present', 'processed', 'limit'))
+                         'loaded', 'errno', 'stats_present', 'processed', 'limit', 'auxiliary'))
 HEADER_FIELDS = frozenset(('record', 'contract', 'candidate', 'kernel', 'variant',
                            'executable_sha256', 'probe_sha256'))
+# Exact source forms: crates/bpf-multi counting_insns, and pinned Aya
+# sys/bpf.rs + sys/feature_probe.rs. Only the referenced map FD is relocatable.
+# (name, program type, attach type, instruction bytes, map-FD byte offset, value size)
+AUXILIARIES = {
+    'pid-filter': ('p11scope_pidflt', 2, 48,
+                   '620afcff00000000bfa200000000000007020000fcffffff1811000000000000'
+                   '000000000000000085000000010000001500020000000000b701000001000000'
+                   'db10000000000000b7000000000000009500000000000000', 28, 8),
+    'aya-name': ('aya_name_check', 5, 0, 'b7000000000000009500000000000000', None, None),
+    'aya-perf-link': ('', 5, 0, 'b7000000000000009500000000000000', None, None),
+    'aya-helper113': ('', 5, 0, '85000000710000009500000000000000', None, None),
+    'aya-global-data': ('', 1, 0,
+                        '182100000000000000000000000000007a0100002a000000'
+                        'b7000000000000009500000000000000', 4, 32),
+    'aya-helper174': ('', 2, 0, '85000000ae0000009500000000000000', None, None),
+}
 
 
 class MeasurementError(RuntimeError):
@@ -64,6 +82,65 @@ def unsigned(value, *, minimum=0):
 
 def digest_text(value, length):
     return isinstance(value, str) and re.fullmatch('[0-9a-f]{%d}' % length, value) is not None and int(value, 16) != 0
+
+
+def instruction_hash(data):
+    value = 14695981039346656037
+    for byte in data:
+        value = ((value ^ byte) * 1099511628211) & 0xffffffffffffffff
+    return f'{value:016x}'
+
+
+def validate_auxiliary(row, ids):
+    auxiliary = row['auxiliary']
+    require(type(auxiliary) is dict and auxiliary.keys() == {'kind', 'name', 'template_fnv1a64', 'map'},
+            'invalid auxiliary provenance')
+    require(type(auxiliary['kind']) is str and auxiliary['kind'] in AUXILIARIES,
+            'unknown auxiliary source form')
+    name, prog_type, attach, encoded, relocation, value_size = AUXILIARIES[auxiliary['kind']]
+    template = bytes.fromhex(encoded)
+    require(auxiliary['name'] == name and auxiliary['template_fnv1a64'] == instruction_hash(template),
+            'auxiliary source template/name changed')
+    require(row['root'] == 'unresolved' and row['btf_resolved'] is False,
+            'auxiliary cannot replace a BTF product root')
+    for field in ('btf_fd', 'btf_id', 'returned_btf_id', 'root_type_id', 'program_flags'):
+        require(type(row[field]) is int and row[field] == 0, 'auxiliary has product BTF/flags')
+    for field, value in (('program_type', prog_type), ('expected_attach_type', attach),
+                         ('insn_count', len(template) // 8)):
+        require(type(row[field]) is int and row[field] == value, f'auxiliary {field} changed')
+    if relocation is None:
+        require(auxiliary['map'] is None, 'mapless auxiliary carried map provenance')
+    else:
+        mapping = auxiliary['map']
+        require(type(mapping) is dict and mapping.keys() ==
+                {'fd', 'id', 'type', 'key_size', 'value_size', 'max_entries', 'flags'},
+                'invalid auxiliary map provenance')
+        require(unsigned(mapping['fd']) and mapping['fd'] <= 0x7fffffff and
+                unsigned(mapping['id'], minimum=1), 'auxiliary map FD/identity absent')
+        for field, value in (('type', 2), ('key_size', 4), ('value_size', value_size),
+                             ('max_entries', 1), ('flags', 0)):
+            require(type(mapping[field]) is int and mapping[field] == value, 'auxiliary map shape changed')
+        patched = bytearray(template)
+        patched[relocation:relocation + 4] = mapping['fd'].to_bytes(4, 'little')
+        template = patched
+    require(row['relocated_fnv1a64'] == instruction_hash(template),
+            'auxiliary actual instructions differ from the bound source form')
+    require(row['stats_present'] is True and unsigned(row['processed'], minimum=1) and
+            type(row['limit']) is int and row['limit'] == 1000000 and
+            row['processed'] <= row['limit'], 'auxiliary actual stats absent or invalid')
+    if row['loaded'] is True:
+        require(unsigned(row['returned_fd']) and unsigned(row['program_id'], minimum=1) and
+                type(row['returned_program_type']) is int and row['returned_program_type'] == prog_type and
+                type(row['errno']) is int and row['errno'] == 0, 'auxiliary successful FD/type absent')
+        require(row['program_id'] not in ids, 'duplicate returned kernel program id')
+        ids.add(row['program_id'])
+    else:
+        require(row['loaded'] is False and auxiliary['kind'] == 'aya-helper113' and
+                type(row['errno']) is int and row['errno'] == 13 and
+                type(row['returned_fd']) is int and row['returned_fd'] == -1 and
+                type(row['program_id']) is int and row['program_id'] == 0 and
+                type(row['returned_program_type']) is int and row['returned_program_type'] == 0,
+                'unexpected auxiliary load failure')
 
 
 def validate(rows, *, expected=None):
@@ -101,6 +178,9 @@ def validate(rows, *, expected=None):
                 'invalid full BTF root')
         require(header['variant'] == 'diagnostic' or row['root'] not in DIAGNOSTIC_ROOTS,
                 'diagnostic decoder loaded under a default configuration declaration')
+        if row['auxiliary'] is not None:
+            validate_auxiliary(row, ids)
+            continue
         require(row['btf_resolved'] is True and row['loaded'] is True and row['stats_present'] is True,
                 'load, BTF identity or successful stats absent')
         for field in ('btf_fd', 'btf_id', 'returned_btf_id', 'root_type_id', 'program_id',
@@ -249,7 +329,8 @@ def self_test(probe=None):
                      'returned_fd': 5 + index, 'program_id': 100 + index, 'program_type': kind,
                      'returned_program_type': kind, 'program_flags': 0, 'expected_attach_type': 0,
                      'insn_count': 100, 'relocated_fnv1a64': '123456789abcdef0', 'loaded': True,
-                     'errno': 0, 'stats_present': True, 'processed': 950000, 'limit': 1000000})
+                     'errno': 0, 'stats_present': True, 'processed': 950000, 'limit': 1000000,
+                     'auxiliary': None})
     rows.append({'record': 'probe-summary', 'pid': 123, 'records': 9, 'write_failures': 0, 'overflow': False})
     rows.append({'record': 'exit', 'pid': 123, 'status': 0})
     default_rows = [header, *(row for row in rows[1:-2] if row['root'] in BASE_ROOTS),
@@ -302,6 +383,15 @@ def self_test(probe=None):
     else:
         raise AssertionError('duplicate JSON key accepted')
     print(f'headroom oracle: default/diagnostic boundary positives, {refused} refusal controls PASS')
+    native_auxiliaries = None
+    if probe is not None:
+        fixture = Path(probe).resolve(strict=True).with_name('verifier-stats-probe-self-test')
+        native = subprocess.run([str(fixture), '--auxiliary-records'],
+                                capture_output=True, text=True, check=True, timeout=10)
+        native_auxiliaries = [json.loads(line, object_pairs_hook=unique_object)
+                              for line in native.stdout.splitlines()]
+        require(len(native_auxiliaries) == 6, 'native six-class provenance did not execute')
+    auxiliary_self_test(rows, native_auxiliaries)
     if probe is not None:
         # Exercise the real prebuilt-only path and child cleanup with no BPF or
         # privileges: an empty/failed observer must never qualify, nor a timeout.
@@ -330,6 +420,117 @@ def self_test(probe=None):
                     require('descendant exec and reused FD remain byte-empty PASS' in result.stdout,
                             'inherited/reused descriptor control did not run')
                 print(f'{name} observer: refused; owned child reaped')
+
+
+def auxiliary_self_test(product_rows, native_auxiliaries=None):
+    """Finite source-form controls; no saved v1 record is upgraded to v2."""
+    rows = copy.deepcopy(product_rows)
+    for row in rows[1:-2]:
+        row['auxiliary'] = None
+    # A loaded production iterator is not optional merely because it is
+    # outside the four affected headroom roots. Failed load/BTF/stats refuse.
+    query = copy.deepcopy(rows[1])
+    query.update(root='p11_image_query', program_type=26, returned_program_type=26,
+                 expected_attach_type=28, program_id=999, root_type_id=297)
+    query_index = len(rows) - 2
+    rows.insert(-2, query)
+    forms = (
+        ('pid-filter', 'p11scope_pidflt', 2, 48, 11, '0ae5528c14beaadc',
+         'd8233289cdbfd0db', 8, True),
+        ('aya-name', 'aya_name_check', 5, 0, 2, '58255400910d7827',
+         '58255400910d7827', None, True),
+        ('aya-perf-link', '', 5, 0, 2, '58255400910d7827',
+         '58255400910d7827', None, True),
+        ('aya-helper113', '', 5, 0, 2, '382112bd35027674',
+         '382112bd35027674', None, False),
+        ('aya-global-data', '', 1, 0, 5, 'c7d1b8a6c8f7b91c',
+         '048f9e0260e5b0fb', 32, True),
+        ('aya-helper174', '', 2, 0, 2, 'b10c1c56d90769db',
+         'b10c1c56d90769db', None, True),
+    )
+    for index, (kind, name, prog_type, attach, count, raw_hash, template_hash,
+                map_value, loaded) in enumerate(forms):
+        mapping = None if map_value is None else {
+            'fd': 7, 'id': 400 + index, 'type': 2, 'key_size': 4,
+            'value_size': map_value, 'max_entries': 1, 'flags': 0}
+        rows.insert(-2, {
+            'record': 'load', 'pid': 123, 'root': 'unresolved', 'btf_resolved': False,
+            'btf_fd': 0, 'btf_id': 0, 'returned_btf_id': 0, 'root_type_id': 0,
+            'returned_fd': 30 + index if loaded else -1,
+            'program_id': 300 + index if loaded else 0, 'program_type': prog_type,
+            'returned_program_type': prog_type if loaded else 0, 'program_flags': 0,
+            'expected_attach_type': attach, 'insn_count': count,
+            'relocated_fnv1a64': raw_hash, 'loaded': loaded, 'errno': 0 if loaded else 13,
+            'stats_present': True, 'processed': 2 if loaded else 1, 'limit': 1000000,
+            'auxiliary': {'kind': kind, 'name': name, 'template_fnv1a64': template_hash,
+                          'map': mapping}})
+    rows[-2]['records'] = len(rows) - 3
+    require(validate(rows) == validate(product_rows), 'auxiliaries changed product coverage')
+    if native_auxiliaries is not None:
+        actual = copy.deepcopy(rows)
+        for index, auxiliary in enumerate(native_auxiliaries):
+            actual[query_index + 1 + index]['auxiliary'] = auxiliary
+        require(validate(actual) == validate(product_rows), 'native provenance differs from oracle contract')
+    refused = 0
+
+    def rejects(change):
+        nonlocal refused
+        mutant = copy.deepcopy(rows)
+        change(mutant)
+        try:
+            validate(mutant)
+        except MeasurementError:
+            refused += 1
+            return
+        raise AssertionError('oracle accepted an auxiliary refusal control')
+
+    first = query_index + 1
+    for index in range(first, first + len(forms)):
+        for key, value in (('root', 'p11_entry'), ('btf_resolved', True), ('btf_fd', 4),
+                           ('btf_id', 77), ('returned_btf_id', 77), ('root_type_id', 1),
+                           ('program_type', 99), ('expected_attach_type', 99),
+                           ('program_flags', 1), ('insn_count', 12), ('pid', 124),
+                           ('stats_present', False), ('processed', 0), ('limit', 999999),
+                           ('relocated_fnv1a64', '123456789abcdef0'), ('auxiliary', None),
+                           ('unexpected_private_bytes', 'forbidden')):
+            rejects(lambda doc, i=index, k=key, v=value: doc[i].__setitem__(k, v))
+        for key, value in (('kind', 'unrecognized'), ('name', 'p11_entry'),
+                           ('template_fnv1a64', '123456789abcdef0'), ('extra', 0)):
+            rejects(lambda doc, i=index, k=key, v=value: doc[i]['auxiliary'].__setitem__(k, v))
+        rejects(lambda doc, i=index: doc[i].__setitem__('loaded', 1))
+        rejects(lambda doc, i=index: doc[i].__setitem__('errno', 22))
+        if rows[index]['loaded']:
+            rejects(lambda doc, i=index: doc[i].__setitem__('returned_fd', -1))
+            rejects(lambda doc, i=index: doc[i].__setitem__('program_id', 0))
+            rejects(lambda doc, i=index: doc[i].__setitem__('errno', 13))
+        else:
+            rejects(lambda doc, i=index: doc[i].__setitem__('returned_fd', 5))
+            rejects(lambda doc, i=index: doc[i].__setitem__('program_id', 9))
+            rejects(lambda doc, i=index: doc[i].__setitem__('returned_program_type', 5))
+            rejects(lambda doc, i=index: doc[i].__setitem__('errno', 0))
+        if rows[index]['auxiliary']['map'] is None:
+            rejects(lambda doc, i=index: doc[i]['auxiliary'].__setitem__('map', {}))
+        else:
+            for key, value in (('fd', 8), ('id', 0), ('type', 1), ('key_size', 8),
+                               ('value_size', 16), ('max_entries', 2), ('flags', 1),
+                               ('extra', 0)):
+                rejects(lambda doc, i=index, k=key, v=value:
+                        doc[i]['auxiliary']['map'].__setitem__(k, v))
+    for index in range(1, len(product_rows) - 2):
+        def omit_product(doc, i=index):
+            doc.pop(i)
+            doc[-2]['records'] -= 1
+        rejects(omit_product)
+    rejects(lambda doc: doc[1].__setitem__('processed', 950001))
+    rejects(lambda doc: doc[1].__setitem__('loaded', False))
+    rejects(lambda doc: doc[1].__setitem__('auxiliary', copy.deepcopy(doc[first]['auxiliary'])))
+    rejects(lambda doc: doc[0].__setitem__('contract', 'p11scope-verifier-headroom-v1'))
+    rejects(lambda doc: doc[first + 1].__setitem__('program_id', doc[first]['program_id']))
+    for key, value in (('loaded', False), ('btf_resolved', False), ('stats_present', False),
+                       ('errno', 13)):
+        rejects(lambda doc, k=key, v=value: doc[query_index].__setitem__(k, v))
+    rejects(lambda doc: doc[query_index].__setitem__('auxiliary', copy.deepcopy(doc[first]['auxiliary'])))
+    print(f'headroom auxiliaries: six source classes, {refused} refusal controls PASS')
 
 
 def main():

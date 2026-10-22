@@ -842,6 +842,208 @@ class MatrixContract(unittest.TestCase):
                     "--contract", str(stage / "contract.json")).returncode, 1)
                 self.assertEqual(len(missing), 64)
 
+    def test_outer_plan_forwards_exact_object_modes_abis_and_input_paths(self):
+        inputs = []
+        for mode in ("full", "p0"):
+            for bits in (32, 64):
+                directory = self.base / f"selected {mode} {bits}"
+                inputs.extend(("--object-input", mode, str(bits), str(directory)))
+        result = command(str(RUNNER), "--plan", "--rev", "HEAD", "--kernels", "host", *inputs)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        value, _ = json.JSONDecoder().raw_decode(result.stdout[result.stdout.index("{"):])
+        cells = value["execution"]["object_cells"]
+        self.assertEqual([(cell["mode"], cell["target_bits"]) for cell in cells],
+                         [(mode, bits) for mode in ("full", "p0") for bits in (32, 64)])
+        self.assertEqual([ident for cell in cells for ident in cell["required_ids"]],
+                         [f"object:{mode}:{bits}:{role}" for mode in ("full", "p0")
+                          for bits in (32, 64) for role in ("complete", "blocked")])
+        for offset in range(0, len(inputs), 4): self.assertIn(inputs[offset + 3], result.stdout)
+        self.assertFalse(any(self.base.glob("selected *")), "dry-run created input directories")
+        for extra in (("--object-input", "full", "64", "relative"),
+                      ("--object-input", "unknown", "64", str(self.base / "absent")),
+                      ("--object-input", "p0", "16", str(self.base / "absent")), tuple(inputs[:4])):
+            with self.subTest(arguments=extra):
+                failed = command(str(RUNNER), "--plan", "--rev", "HEAD", "--kernels", "host", *inputs, *extra)
+                self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
+
+    def object_judgment_fixture(self, cells=(("full", 32), ("full", 64), ("p0", 32), ("p0", 64))):
+        # Parser controls only. Actual runner/checker execution is covered by
+        # the generated-shell controls; these small snapshots never claim BPF.
+        original_stage, original_id = self.stage, self.run_id
+        stage = self.base / "object judgment"
+        inputs = [(mode, bits, self.canary_inputs(mode, bits)[0]) for mode, bits in cells]
+        prepared = self.prepare_object_inputs(stage, inputs)
+        self.assertEqual(prepared.returncode, 0, prepared.stdout + prepared.stderr)
+        self.stage, self.contract = stage, stage / "contract.json"
+        self.run_id = json.loads(self.contract.read_text())["run_id"]
+        for name in CHECKER_MOD["evidence_paths"](original_stage, json.loads((original_stage / "contract.json").read_text())):
+            source = original_stage / name
+            target = stage / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(source.read_bytes().replace(original_id.encode(), self.run_id.encode()))
+        (stage / "run/logs" / (LIB_B.split("::")[-1] + ".log")).unlink()
+        self.write("run/results.txt", f"PASS {LIB_A} rc=0 seconds=1 :: test result: ok. 1 passed\n")
+        fixtures = runpy.run_path(str(ROOT / "tests/python/test_canary_evidence.py"))
+        pilot = fixtures["FinalScannerSurfaceTests"]()
+        for mode, bits in cells:
+            pilot.object_pilot_fixture.__func__.__globals__["TARGET_BITS"] = bits
+            subject = fixtures["load_subject"](bits)
+            work = self.base / f"original object {mode} {bits}"
+            work.mkdir()
+            pilot.object_pilot_fixture(subject, work)
+            subject.assert_object_pilot(work, bits)
+            lane = "object-ia32" if bits == 32 else "object-lp64"
+            names = {"matrix-manifest.json", "privacy-manifest.json"}
+            for name in names: (work / name).write_text("{}\n")
+            rows = []
+            for role, current in (("complete", lane), ("blocked", lane + "-blocked")):
+                (work / (current + ".ready")).write_text(json.dumps({"pid": 7001}) + "\n")
+                manifest_name = f"mapdump_manifest_{current}.json"
+                manifest = json.loads((work / manifest_name).read_text())
+                receipt = manifest[0]["snapshot"]["receipt"]
+                names.update((manifest_name, Path(receipt).relative_to(work).as_posix(), current + ".ready"))
+                names.update(path.relative_to(work).as_posix() for path in
+                    subject.final_lane_artifacts(work, current,
+                        subject.assert_exact_owned_map_inventory(work, current, subject.SAFE_MAPS)))
+                rows.append({"id": f"object:{mode}:{bits}:{role}", "lane": current,
+                             "manifest": "evidence/" + manifest_name,
+                             "receipt": "evidence/" + Path(receipt).relative_to(work).as_posix()})
+            cell = stage / f"object/{mode}-{bits}"
+            cell.mkdir(parents=True)
+            for name in sorted(names):
+                destination = cell / "evidence" / name
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(work / name, destination)
+            (cell / "run.log").write_text("object_runner_exit=0\nobject_semantic_exit=0\nobject_final_exit=0\n"
+                                          f"matrix_run={self.run_id}\n")
+            (cell / "result.json").write_text(json.dumps({"run_id": self.run_id, "mode": mode,
+                "target_bits": bits, "original_work_root": str(work), "runner_exit": 0,
+                "rows": rows, "evidence_files": ["evidence/" + name for name in sorted(names)]}) + "\n")
+        self.seal()
+        return stage
+
+    def test_object_pair_judgment_is_exact_and_fail_closed(self):
+        self.object_judgment_fixture()
+        healthy = self.judge()
+        self.assertEqual(healthy.returncode, 2, healthy.stdout + healthy.stderr)
+        wanted = {f"object:{mode}:{bits}:{role}" for mode in ("full", "p0")
+                  for bits in (32, 64) for role in ("complete", "blocked")}
+        rows = [row for row in json.loads(healthy.stdout)["rows"] if row["id"].startswith("object:")]
+        self.assertEqual({row["id"] for row in rows}, wanted)
+        self.assertEqual(len(rows), 8)
+        self.assertTrue(all(row["qualification"] == "positive-coverage" for row in rows))
+        original = self.stage
+        cases = ("missing", "duplicate", "other_tuple", "wrong_mode", "wrong_width", "stale_run", "failed_runner",
+                 "extra_field", "missing_manifest", "missing_receipt", "missing_surface", "changed_surface",
+                 "extra_file", "escaping_reference", "missing_log", "failed_semantic", "failed_final", "inner_failure")
+        for case in cases:
+            with self.subTest(case=case):
+                stage = self.base / ("mutant-" + case)
+                shutil.copytree(original, stage)
+                self.stage, self.contract = stage, stage / "contract.json"
+                cell = stage / "object/full-32"
+                path = cell / "result.json"
+                result = json.loads(path.read_text())
+                if case == "missing": result["rows"].pop()
+                elif case == "duplicate": result["rows"][1] = result["rows"][0]
+                elif case == "other_tuple": result["rows"][1]["id"] = "object:full:64:blocked"
+                elif case == "wrong_mode": result["mode"] = "p0"
+                elif case == "wrong_width": result["target_bits"] = 64
+                elif case == "stale_run": result["run_id"] = "0" * 32
+                elif case == "failed_runner": result["runner_exit"] = 2
+                elif case == "extra_field": result["qualified"] = True
+                elif case in ("missing_manifest", "missing_receipt"):
+                    (cell / result["rows"][0]["manifest" if case == "missing_manifest" else "receipt"]).unlink()
+                elif case in ("missing_surface", "changed_surface"):
+                    target = cell / next(name for name in result["evidence_files"] if name.endswith(".bin"))
+                    if case == "missing_surface": target.unlink()
+                    else: target.write_bytes(target.read_bytes() + b"changed")
+                elif case == "extra_file": (cell / "evidence/unlisted").write_text("not named by any manifest")
+                elif case == "escaping_reference":
+                    manifest = cell / result["rows"][0]["manifest"]
+                    values = json.loads(manifest.read_text())
+                    next(item for item in values if "file" in item)["file"] = str(self.base / "outside")
+                    manifest.write_text(json.dumps(values))
+                elif case == "missing_log": (cell / "run.log").unlink()
+                elif case in ("failed_semantic", "failed_final"):
+                    log = cell / "run.log"
+                    log.write_text(log.read_text().replace("object_" + case.removeprefix("failed_") + "_exit=0", "object_" + case.removeprefix("failed_") + "_exit=1"))
+                path.write_text(json.dumps(result))
+                self.seal(guest_exit=124 if case == "inner_failure" else 0)
+                self.reject()
+        self.stage, self.contract = original, original / "contract.json"
+
+    def test_object_pilot_keeps_smoke_nonqualifying(self):
+        self.object_judgment_fixture((("full", 64),))
+        result = self.judge()
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        value = json.loads(result.stdout)
+        self.assertFalse(value["full_stage5_ready"])
+        self.assertEqual(value["qualification"], "nonqualifying")
+        self.assertEqual([row["id"] for row in value["rows"] if row["id"].startswith("object:")],
+                         ["object:full:64:complete", "object:full:64:blocked"])
+
+    def retained_object_inputs(self):
+        repo = self.base / "original object source"
+        names = set().union(*(set(CHECKER_MOD[key]) for key in
+            ("SOURCE_FILES", "RUNTIME_SOURCES", "CANARY_SOURCE_FILES", "CANARY_RUNTIME_SOURCES", "CANARY_PRODUCER_SOURCES")))
+        for name in names:
+            target = repo / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(ROOT / name, target)
+        candidate = candidate_receipt(self.bins, self.base / "object-source-build.json", repo)
+        bundle, facts = self.canary_inputs()
+        facts["source_root"] = str(repo)
+        for step in facts["builds"]: step["cwd"] = str(repo)
+        (bundle / "canary-build.json").write_text(json.dumps(facts))
+        stage = self.base / "retained object stage"
+        result = command(sys.executable, "-I", str(repo / "scripts" / CHECKER.name), "--prepare", str(stage),
+            "--lane", "host", "--kernel", "host", "--bin-dir", str(self.bins), "--binary-list", str(self.listing),
+            "--curation", str(self.curation), "--bpfmulti-list", str(self.bm_list), "--candidate-receipt", str(candidate),
+            "--lib-test", LIB_A, "--object-input", "full", "64", str(bundle))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return repo, stage
+
+    def test_object_dispatch_uses_bound_snapshot_without_relaxing_rust_source_preflight(self):
+        repo, stage = self.retained_object_inputs()
+        module = runpy.run_path(str(stage / "artifacts/source/scripts" / CHECKER.name))
+        contract_path = stage / "contract.json"
+        repo.rename(self.base / "unavailable object source")
+        self.assertFalse(repo.exists())
+        with self.assertRaises((module["Invalid"], OSError)):
+            module["verify_inputs"](stage, contract_path)
+        # This private resolver is used only by the object dispatcher. Ordinary
+        # launch, preparation and lib-fixture judgment stay source-root strict.
+        value = module["_verify_object_inputs"](stage, contract_path)
+        self.assertEqual(value["object_cells"][0]["required_ids"],
+                         ["object:full:64:complete", "object:full:64:blocked"])
+        original = json.loads(contract_path.read_text())
+        snapshot = stage / "artifacts/canary-source/full-64/scripts/fixtures/canary_workload.c"
+        before = snapshot.read_bytes()
+        for case in ("missing", "changed", "foreign_rebound", "missing_binding", "build_cwd", "key_tuple"):
+            with self.subTest(case=case):
+                value = json.loads(json.dumps(original))
+                facts_path = stage / "inputs/canary-build/full-64.json"
+                facts_before = facts_path.read_bytes()
+                if case == "missing": snapshot.unlink()
+                elif case in ("changed", "foreign_rebound"):
+                    snapshot.write_bytes(before + b"foreign snapshot")
+                    if case == "foreign_rebound":
+                        value["bindings"][snapshot.relative_to(stage).as_posix()] = hashlib.sha256(snapshot.read_bytes()).hexdigest()
+                elif case == "missing_binding": value["bindings"].pop("artifacts/source/scripts/lane-lib-oracle-1.py")
+                elif case in ("build_cwd", "key_tuple"):
+                    facts = json.loads(facts_before)
+                    if case == "build_cwd": facts["builds"][0]["cwd"] = str(self.base / "foreign root")
+                    else: facts["capture_mode"] = "p0"
+                    facts_path.write_text(json.dumps(facts))
+                    value["bindings"][facts_path.relative_to(stage).as_posix()] = hashlib.sha256(facts_path.read_bytes()).hexdigest()
+                contract_path.write_text(json.dumps(value))
+                with self.assertRaises((module["Invalid"], OSError)):
+                    module["_verify_object_inputs"](stage, contract_path)
+                snapshot.write_bytes(before)
+                facts_path.write_bytes(facts_before)
+                contract_path.write_text(json.dumps(original))
+
     def test_guest_root_verifies_bound_caller_owned_object_inputs(self):
         bundle, facts = self.canary_inputs()
         stage = self.base / "caller owned guest inputs"

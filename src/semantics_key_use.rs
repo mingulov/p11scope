@@ -307,6 +307,26 @@ impl JointStaging {
         self.staged.len()
     }
 
+    /// Read the original retained membership, without copying its payload or
+    /// changing replay state. Admission positions strictly increase on stage.
+    pub(crate) fn staged_resource(
+        &self,
+        position: u64,
+    ) -> Option<&crate::semantics_objects::journal::StagedResourceOrigin> {
+        let mut lower = 0;
+        let mut upper = self.staged.len();
+        while lower < upper {
+            let middle = lower + (upper - lower) / 2;
+            let head = &self.staged[middle];
+            match head.position.cmp(&position) {
+                std::cmp::Ordering::Less => lower = middle + 1,
+                std::cmp::Ordering::Greater => upper = middle,
+                std::cmp::Ordering::Equal => return head.resource_origin.as_ref(),
+            }
+        }
+        None
+    }
+
     /// Whether real loss ended this feed's object authority.
     pub(crate) fn degraded_loss(&self) -> bool {
         self.degraded_loss

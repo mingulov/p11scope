@@ -107,6 +107,26 @@ impl<C> ReservationTable<C> {
             .map(|member| member.bytes)
     }
 
+    /// Read one original operation after its H8 lookup. A completed fallback
+    /// may release neither an outstanding raw copy nor a converted model call.
+    pub(super) fn unconverted_staging(
+        &self,
+        open: RoleKey,
+        staged: RoleKey,
+        reservation: ReservationId,
+    ) -> bool {
+        let Some(at) = self.key_slot(Role::H8Open, open) else {
+            return false;
+        };
+        let operation = self.slots[at].as_ref().expect("retained H8 membership");
+        operation.aliases.contains(&Some(reservation))
+            && operation.roles[Role::H9Staged.index()]
+                .as_ref()
+                .is_some_and(|member| member.key == staged)
+            && operation.roles[Role::Raw.index()].is_none()
+            && operation.roles[Role::Model.index()].is_none()
+    }
+
     pub(super) fn release_role(&mut self, role: Role) {
         for slot in &mut self.slots {
             let Some(operation) = slot.as_mut() else {

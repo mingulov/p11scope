@@ -170,6 +170,28 @@ impl AuditedFailure<'_> {
     pub(crate) fn matches_ledger(&self, ledger: &StagingLedger) -> bool {
         self.provenance.matches_ledger(ledger)
     }
+
+    pub(super) fn validate_input(
+        &self,
+        adapter: &JournalAdapter,
+        input: &AuditedDomainInput<'_>,
+    ) -> Result<(), RawQuantumRefusal> {
+        let producers = adapter
+            .resource_producers
+            .as_ref()
+            .ok_or(RawQuantumRefusal::ForeignCapture)?;
+        self.provenance.validate_owner(adapter, producers)?;
+        if adapter.consumed_frontier() != self.frontier || input.frontier != self.frontier {
+            return Err(RawQuantumRefusal::StaleFrontier);
+        }
+        if !std::ptr::eq(self.audit, input.audit)
+            || self.domain != input.receipt.domain()
+            || !self.failure.affects_domain(self.domain)
+        {
+            return Err(RawQuantumRefusal::DispositionMismatch);
+        }
+        Ok(())
+    }
     #[cfg(test)]
     pub(crate) fn identity(&self) -> RawQuantumIdentity {
         self.provenance.identity()
@@ -661,12 +683,35 @@ impl IngestedJointQuantum {
                 let failure = self
                     .failure_for(target.bootstrap().domain())
                     .ok_or(RawQuantumRefusal::Admission)?;
-                match registry.deliver_joint_failure(
-                    target.id(),
-                    &failure,
-                    model,
-                    adapter.ledger_mut(),
-                ) {
+                let outcome = if crate::semantics_key_use::disposition_of(failure.failure().gap)
+                    == crate::semantics_key_use::SealFailureDisposition::Fallback
+                    && matches!(
+                        failure.h3(),
+                        H3DispositionEvidence::Clean {
+                            pending_floor: None,
+                            ..
+                        }
+                    ) {
+                    adapter.deliver_completed_fallback(
+                        AuditedDomainInput {
+                            audit: &self.audit,
+                            receipt: target.bootstrap(),
+                            frontier: self.frontier,
+                        },
+                        &failure,
+                        &target,
+                        registry,
+                        model,
+                    )?
+                } else {
+                    registry.deliver_joint_failure(
+                        target.id(),
+                        &failure,
+                        model,
+                        adapter.ledger_mut(),
+                    )
+                };
+                match outcome {
                     FailureApplyOutcome::FellBack { .. }
                     | FailureApplyOutcome::Degraded { .. }
                     | FailureApplyOutcome::Ignored => true,

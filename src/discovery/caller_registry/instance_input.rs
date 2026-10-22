@@ -759,6 +759,21 @@ impl CallerRegistry {
         .then_some(record.feed.staged_len())
     }
 
+    pub(crate) fn joint_staged_resource(
+        &self,
+        target: &JointFeedTarget,
+        position: u64,
+    ) -> Option<&crate::semantics_objects::journal::StagedResourceOrigin> {
+        let record = self.instance_state.semantics.get(&target.id)?;
+        if record.caller != target.caller
+            || record.feed.mode() != FeedMode::Joint
+            || record.feed.selected_receipt()?.domain() != target.bootstrap.domain()
+        {
+            return None;
+        }
+        record.feed.staged_resource(position)
+    }
+
     /// Tests-only feed-mode read (N1): the feed an instance's
     /// registration selected.
     #[cfg(test)]

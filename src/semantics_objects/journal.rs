@@ -3452,6 +3452,166 @@ impl JournalAdapter {
         popped
     }
 
+    /// Dispose only the exact completed originals of an actual audited H9
+    /// fallback. Read-only validation finishes before registry replay starts;
+    /// the adapter remains exclusively borrowed through replay and disposal.
+    /// No supplied success callback, extra queue or reusable disposal token.
+    pub(super) fn deliver_completed_fallback(
+        &mut self,
+        input: joint_audit::AuditedDomainInput<'_>,
+        audited: &joint_audit::AuditedFailure<'_>,
+        target: &crate::discovery::caller_registry::instance_input::JointFeedTarget,
+        registry: &mut crate::discovery::caller_registry::CallerRegistry,
+        model: &ObjectSemantics,
+    ) -> Result<crate::semantics_key_use::FailureApplyOutcome, joint_driver::RawQuantumRefusal>
+    {
+        use crate::semantics_key_use::{
+            FailureApplyOutcome, SealFailureDisposition, disposition_of,
+        };
+        use joint_driver::RawQuantumRefusal;
+
+        audited.validate_input(self, &input)?;
+        let (audit, bootstrap, frontier) = input.into_parts();
+        let proof = bootstrap.proof();
+        let key = proof.key;
+        let H3DispositionEvidence::Clean {
+            staged_max,
+            pending_floor: None,
+        } = &audit.h3
+        else {
+            return Err(RawQuantumRefusal::DispositionMismatch);
+        };
+        if !std::ptr::eq(bootstrap, target.bootstrap())
+            || key.caller != target.caller().0
+            || self
+                .keys
+                .get(&key)
+                .is_none_or(|state| state.era != proof.era)
+            || self
+                .resource_producers
+                .as_ref()
+                .is_none_or(|own| own.native_domain().journal_tag() != key.domain_tag)
+            || disposition_of(audited.failure().gap) != SealFailureDisposition::Fallback
+        {
+            return Err(RawQuantumRefusal::DispositionMismatch);
+        }
+        let expected = registry
+            .joint_staged_count(target)
+            .ok_or(RawQuantumRefusal::Admission)?;
+        let mut verified = 0usize;
+        for entry in self.open.values() {
+            let fingerprint = fingerprint_of_begin(&entry.begin);
+            let Some(claimants) = self.claims.get(&fingerprint) else {
+                continue; // An incomplete unadmitted START keeps its existing owner.
+            };
+            let Some(mine) = claimants.get(&key).filter(|claims| !claims.is_empty()) else {
+                continue;
+            };
+            let Some(end) = entry.end else {
+                return Err(RawQuantumRefusal::DispositionMismatch);
+            };
+            if mine.len() != 1
+                || claimants
+                    .values()
+                    .filter(|claims| !claims.is_empty())
+                    .count()
+                    != 1
+                || entry.begin_ordinal > frontier.0
+                || end.ordinal > frontier.0
+                || entry.image != (key.cookie, key.exec)
+                || entry.converted_ticket.is_some()
+                || entry.converted_for.is_some()
+                || entry.call_key.is_some()
+                || entry.end_converted
+                || entry.abandon.is_some()
+                || entry.corroborated_return.is_some()
+                || entry.raw_resource.is_none()
+            {
+                return Err(RawQuantumRefusal::DispositionMismatch);
+            }
+            let claim = mine.front().expect("one original admission");
+            let event = end.end.payload_base().event;
+            let staged = registry
+                .joint_staged_resource(target, claim.admission)
+                .ok_or(RawQuantumRefusal::DispositionMismatch)?;
+            if claim.admission > *staged_max
+                || claim.admission >= audit.h0_below
+                || !end_agrees_with_begin(&entry.begin, &end.end)
+                || !fingerprint_matches_event(&fingerprint, &event)
+                || event.ts_ns != claim.return_ns
+                || !self
+                    .physical_return_floors
+                    .contains_key(&fingerprint.pid_tgid)
+                || !self.ledger.matches_completed_staging(
+                    entry.begin_ordinal,
+                    key.domain_tag,
+                    claim.admission,
+                    staged,
+                )
+            {
+                return Err(RawQuantumRefusal::DispositionMismatch);
+            }
+            verified = verified.checked_add(1).ok_or(RawQuantumRefusal::Capacity)?;
+        }
+        // No unmatched H9 original may fall back, including a converted call
+        // whose claim is already owned by the model. Counts are checked only
+        // after every matching original's exact membership and terminal.
+        if verified != expected {
+            return Err(RawQuantumRefusal::DispositionMismatch);
+        }
+        let outcome = registry.deliver_joint_failure(target.id(), audited, model, &mut self.ledger);
+        if !matches!(outcome, FailureApplyOutcome::FellBack { .. }) {
+            return Ok(outcome);
+        }
+        // The registry only borrowed the ledger: claims and opens cannot
+        // change between the preflight and this once-only fallback commit.
+        // One advancing cursor visits the existing opens without a key queue.
+        let mut after = None;
+        let mut disposed = 0;
+        loop {
+            let next = match after {
+                None => self.open.first_key_value(),
+                Some(native) => self
+                    .open
+                    .range((
+                        std::ops::Bound::Excluded(native),
+                        std::ops::Bound::Unbounded,
+                    ))
+                    .next(),
+            }
+            .map(|(native, entry)| {
+                (
+                    *native,
+                    self.peek_claim(&fingerprint_of_begin(&entry.begin), key)
+                        .is_some(),
+                )
+            });
+            let Some((native, selected)) = next else {
+                break;
+            };
+            after = Some(native);
+            if !selected {
+                continue;
+            }
+            let (ordinal, fingerprint) = {
+                let entry = self
+                    .open
+                    .remove(&native)
+                    .expect("preflight retained original");
+                (entry.begin_ordinal, fingerprint_of_begin(&entry.begin))
+            }; // Drop the retained physical entry before its H8 membership.
+            self.consume_claim(&fingerprint, key)
+                .expect("preflight retained exact claim");
+            self.ledger.release_h8open(ordinal);
+            disposed += 1;
+        }
+        assert_eq!(
+            disposed, verified,
+            "completed original fallback commits once"
+        );
+        Ok(outcome)
+    }
+
     /// Attribute one staged fingerprint under a sealing key. Every
     /// staged call converts only under its key's admission claim —
     /// including under a sole live key, which does not prove a sole

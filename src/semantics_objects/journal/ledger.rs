@@ -283,6 +283,24 @@ impl StagingLedger {
         })
     }
 
+    pub(super) fn matches_completed_staging(
+        &self,
+        begin_ordinal: u64,
+        domain: u64,
+        admission: u64,
+        staged: &StagedResourceOrigin,
+    ) -> bool {
+        self.generation == Some(staged.generation)
+            && staged.key
+                == (RoleKey {
+                    namespace: domain,
+                    value: admission,
+                })
+            && self.table.as_ref().is_some_and(|table| {
+                table.unconverted_staging(Self::key(begin_ordinal), staged.key, staged.id)
+            })
+    }
+
     pub(in crate::semantics_objects) fn charge_model_from_open(
         &mut self,
         token: u64,

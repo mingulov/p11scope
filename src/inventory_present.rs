@@ -32,6 +32,8 @@ use crate::render::escape_controls;
 use crate::semantics_edge::resources::SemanticResourceSnapshot;
 use crate::semantics_edge::{EdgeEvidence, EdgeSemantics, S1Occupancy};
 
+mod render_index;
+
 /// Trailing window for the dashboard display's "recently observed":
 /// an entry whose last-seen falls inside this window (of the frame's
 /// `now_ns`) reads as recent on screen. The recorded activity signal

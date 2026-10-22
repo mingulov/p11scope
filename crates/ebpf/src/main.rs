@@ -3076,7 +3076,7 @@ fn object_entry_find(
 // inspects authorized pairs into the side request lists (or retains Get
 // headers); refused pairs keep the honest uninspected marking.
 #[cfg(not(feature = "inventory-only"))]
-#[inline(never)]
+#[inline(always)]
 fn object_entry_attributes(
     ctx: &ProbeContext,
     side: Option<&mut ObjectStart>,

@@ -727,22 +727,28 @@ fn native_semantic_resource_registry_probe() {
 
 #[test]
 fn native_semantic_resource_final_types_pinned() {
+    // Collect every static layout mismatch before failing, so one accepted
+    // custody change cannot hide later drift behind the first assertion.
+    let mut mismatches: Vec<(&str, usize, usize)> = Vec::new();
+    macro_rules! pin {
+        ($ty:ty, $expected:expr $(,)?) => {{
+            let actual = size_of::<$ty>();
+            let expected = $expected;
+            if actual != expected {
+                mismatches.push((stringify!($ty), actual, expected));
+            }
+        }};
+    }
     // Final H3 Task5 types, pinned like Edge360/Pending144. Compiler and
     // target ABI are guarded by resources.rs; these pins catch layout drift
     // before SYSTEM activation. Measured on Rust 1.98.1 x86-64 Linux.
     // SemanticBatch carries the H3 disposition inputs C5 requires
     // (awaiting/shed floors plus exhaustion: +40 B over the 88 B base).
-    assert_eq!(size_of::<crate::inventory_semantics::SemanticBatch>(), 128);
-    assert_eq!(size_of::<crate::inventory_semantics::LaneNegative>(), 16);
-    assert_eq!(
-        size_of::<crate::inventory_semantics::LaneCollectionRefusal>(),
-        1
-    );
-    assert_eq!(size_of::<crate::inventory_semantics::LaneCoverage>(), 64);
-    assert_eq!(
-        size_of::<crate::inventory_semantics::TerminalBatchStage>(),
-        40
-    );
+    pin!(crate::inventory_semantics::SemanticBatch, 128);
+    pin!(crate::inventory_semantics::LaneNegative, 16);
+    pin!(crate::inventory_semantics::LaneCollectionRefusal, 1);
+    pin!(crate::inventory_semantics::LaneCoverage, 64);
+    pin!(crate::inventory_semantics::TerminalBatchStage, 40);
     // H7 slice D: TickOutcome::Call and RoutedCall carry the decoded
     // envelope with its optional 240 B validated object tail inline
     // (+248 each, measured 680 on Rust 1.98.1 x86-64 Linux); the
@@ -755,45 +761,62 @@ fn native_semantic_resource_final_types_pinned() {
     // size_of of their actual entries, so this does not require a larger
     // population cap or a new fixed pool charge.
     use crate::semantics_objects::journal::joint_driver::CollectedCallOrigin;
-    assert_eq!(size_of::<CollectedCallOrigin>(), 24);
-    assert_eq!(size_of::<Option<CollectedCallOrigin>>(), 32);
-    assert_eq!(
-        size_of::<crate::semantic_capture::TickOutcome>(),
+    pin!(CollectedCallOrigin, 24);
+    pin!(Option<CollectedCallOrigin>, 32);
+    pin!(
+        crate::semantic_capture::TickOutcome,
         752 + size_of::<Option<CollectedCallOrigin>>()
     );
     // TickReport carries the H0 disposition watermarks C5 requires
     // (allocated floor, awaiting/shed floors, exhaustion: +48 B).
-    assert_eq!(size_of::<crate::semantic_capture::TickReport>(), 160);
-    assert_eq!(
-        size_of::<crate::semantic_capture::RoutedCall>(),
+    pin!(crate::semantic_capture::TickReport, 160);
+    pin!(
+        crate::semantic_capture::RoutedCall,
         752 + size_of::<Option<CollectedCallOrigin>>()
     );
-    // H6 retains the calibrated mapped-file identity in the watched target.
-    assert_eq!(
-        size_of::<crate::semantic_capture::CurrentPartitionReceipt>(),
-        424
+    // H6 retains the calibrated watched file. Actual-H0 birth (0b50b3e1)
+    // adds one optional capture/cursor-cut/raw-allocation tuple, all inline.
+    // Prepared retention charges the actual receipt capacity plus the watched
+    // file's copied path/hash/build-id buffers and ID capacity separately.
+    type RetainedBirth = Option<(
+        u64,
+        crate::semantics_objects::journal::JournalBirthCut,
+        crate::semantics_objects::journal::joint_driver::RawQuantumIdentity,
+    )>;
+    pin!(crate::semantics_objects::journal::JournalBirthCut, 40);
+    pin!(RetainedBirth, 64);
+    pin!(
+        crate::semantic_capture::CurrentPartitionReceipt,
+        424 + size_of::<RetainedBirth>()
     );
-    assert_eq!(size_of::<crate::semantic_capture::Invalidation>(), 72);
-    assert_eq!(size_of::<crate::semantic_capture::InvalidationScope>(), 48);
-    assert_eq!(size_of::<crate::semantic_capture::OtherRecord>(), 392);
-    assert_eq!(size_of::<crate::semantic_capture::Endpoint>(), 16);
-    assert_eq!(size_of::<crate::inventory_events::InstanceEmitter>(), 184);
-    assert_eq!(size_of::<crate::inventory_events::InstanceEmission>(), 32);
-    assert_eq!(size_of::<crate::inventory_events::InstanceSweep>(), 16);
-    assert_eq!(size_of::<crate::inventory_present::InstanceView>(), 48);
-    assert_eq!(
-        size_of::<crate::inventory_present::InstanceSemanticView>(),
-        272
-    );
+    pin!(crate::semantic_capture::Invalidation, 72);
+    pin!(crate::semantic_capture::InvalidationScope, 48);
+    pin!(crate::semantic_capture::OtherRecord, 392);
+    pin!(crate::semantic_capture::Endpoint, 16);
+    pin!(crate::inventory_events::InstanceEmitter, 184);
+    pin!(crate::inventory_events::InstanceEmission, 32);
+    pin!(crate::inventory_events::InstanceSweep, 16);
+    pin!(crate::inventory_present::InstanceView, 48);
+    pin!(crate::inventory_present::InstanceSemanticView, 272);
     // H9 (T4): +224 B for the one immutable operation/key projection
     // (`object_observations`): revision, status, six row vectors and
     // budgets. One snapshot per pass; heap rows stay empty while the
     // publication is unavailable (production today). DR04 opt-in caller
     // context adds the 120 B shared `caller_metadata` frame (bedcbbf6),
-    // measured 1168.
-    assert_eq!(size_of::<crate::inventory_present::Presentation>(), 1168);
+    // measured 1168. D1 c93a0084 adds the optional shared renderer index:
+    // one niche-filled Arc pointer inline, bounded offset rows allocated
+    // separately by its explicit heap envelope (no semantic authority/pool).
+    pin!(crate::inventory_present::PresentationRenderIndex, 8);
+    pin!(
+        crate::inventory_present::Presentation,
+        1168 + size_of::<crate::inventory_present::PresentationRenderIndex>()
+    );
     // Supporting payload: RoutedCall carries one EventRecord.
-    assert_eq!(size_of::<p11scope_ebpf_common::EventRecord>(), 368);
+    pin!(p11scope_ebpf_common::EventRecord, 368);
+    assert!(
+        mismatches.is_empty(),
+        "static layout drift (type, actual, expected): {mismatches:?}"
+    );
     // Existing bounds the N/N+1 populations use.
     assert_eq!(crate::discovery::instances::MAX_INSTANCES, 4_096);
     assert_eq!(crate::inventory_semantics::MAX_LANE_NEGATIVES, 64);

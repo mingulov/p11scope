@@ -314,6 +314,83 @@ class PrebuiltDemotionControls(unittest.TestCase):
 
 
 class NativeWrapControls(unittest.TestCase):
+    @staticmethod
+    def owned_schedule_inputs(directory):
+        """Small validator inputs with real file identities, not native execution."""
+        for name in WRAP['NAMES']:
+            (directory / name).write_bytes(name.encode().ljust(128, b'.'))
+        nonce, pid = '0123456789abcdef0123456789abcdef', os.getpid()
+        identity = dict(kind='identity', nonce=nonce, pid=pid, ready_ns=100,
+            exe_sha256=WRAP['digest'](directory / 'workload'),
+            common_sha256=[WRAP['digest'](directory / name) for name in WRAP['COMMON_NAMES']],
+            provider_a_sha256=[WRAP['digest'](directory / name) for name in WRAP['PROVIDER_A_NAMES']],
+            provider_b_sha256=[WRAP['digest'](directory / name) for name in WRAP['PROVIDER_B_NAMES']])
+        targets = []
+        for slot, name in enumerate(WRAP['COMMON_NAMES'], 4):
+            fd = os.open(directory / name, os.O_RDONLY)
+            try:
+                pin = WRAP['PIN'](fd)
+            finally:
+                os.close(fd)
+            targets.append(dict(kind='target', slot=slot, dev_major=pin['dev'][0],
+                                dev_minor=pin['dev'][1], ino=pin['ino'], offset=0))
+        calls, acks = [], [dict(event='prepared', round=0, calls=0, t=10),
+                           dict(event='ready', round=0, calls=0, t=100)]
+        for phase, event in [('a', 'a-done'), ('shared', 'shared-done'),
+                             ('fence', 'fence-done'), ('proof', 'final-calls')]:
+            if phase == 'shared':
+                acks.append(dict(event='b-ready', round=0, calls=len(calls), t=acks[-1]['t']))
+            elif phase == 'fence':
+                acks.append(dict(event='a-unmapped', round=0, calls=len(calls), t=acks[-1]['t']))
+            for slot in range(4, 36):
+                sequence = len(calls) + 1
+                calls.append(dict(kind='call', sequence=sequence, phase=phase, round=1,
+                    slot=slot, before_call_ns=1000 + sequence * 3,
+                    after_return_ns=1001 + sequence * 3, return_status=0))
+            acks.append(dict(event=event, round=1, calls=len(calls), t=calls[-1]['after_return_ns'] + 1))
+        acks.append(dict(event='done', round=0, calls=len(calls), t=acks[-1]['t'] + 1))
+        return dict(rows=[identity, *targets, *calls,
+                          dict(kind='complete', complete=True, calls=len(calls))],
+                    acks=acks, nonce=nonce, pid=pid)
+
+    def test_shared_schedule_rejects_missing_duplicate_foreign_and_early_ack(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            directory = Path(scratch)
+            original = self.owned_schedule_inputs(directory)
+            def validate(value):
+                return WRAP['check_ledger'](**value, directory=directory, counted=1, shared=1)
+            facts = validate(original)
+            self.assertEqual(facts['physical_pairs'], 32)
+            self.assertEqual(facts['phase_calls'], dict(a=32, shared=32, fence=32, proof=32))
+            for mutation in ('missing', 'duplicate_pair', 'foreign_target', 'wrong_phase',
+                             'wrong_nonce', 'return', 'clock', 'early_ack', 'late_ack'):
+                with self.subTest(mutation=mutation):
+                    value = copy.deepcopy(original)
+                    calls = [row for row in value['rows'] if row['kind'] == 'call']
+                    shared = [row for row in calls if row['phase'] == 'shared']
+                    ack = next(row for row in value['acks'] if row['event'] == 'shared-done')
+                    if mutation == 'missing':
+                        value['rows'].remove(shared[0])
+                    elif mutation == 'duplicate_pair':
+                        shared[-1]['slot'] = shared[0]['slot']
+                    elif mutation == 'foreign_target':
+                        value['rows'][1]['ino'] += 1
+                    elif mutation == 'wrong_phase':
+                        shared[0]['phase'] = 'a'
+                    elif mutation == 'wrong_nonce':
+                        value['rows'][0]['nonce'] = 'foreign'
+                    elif mutation == 'return':
+                        shared[0]['return_status'] = 1
+                    elif mutation == 'clock':
+                        shared[0]['after_return_ns'] = shared[0]['before_call_ns']
+                    elif mutation == 'early_ack':
+                        ack['t'] = shared[-1]['after_return_ns'] - 1
+                    else:
+                        next_call = next(row for row in calls if row['phase'] == 'fence')
+                        ack['t'] = next_call['before_call_ns'] + 1
+                    with self.assertRaises(ValueError):
+                        validate(value)
+
     def test_three_round_probe_has_one_physical_pair_and_exact96_call_oracle(self):
         with tempfile.TemporaryDirectory() as scratch:
             directory = Path(scratch) / 'payload'

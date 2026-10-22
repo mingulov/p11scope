@@ -5720,6 +5720,160 @@ fn twin_range_gap(caller: &str, base: u64, absolute: u64, repeats: u64) -> GapEv
 }
 
 #[test]
+fn operator_diagnostics_wrap_twin_retirement_shared_ranges() -> Result<()> {
+    let modules_a: Vec<String> = (0..32).map(|index| format!("mA-{index:02}")).collect();
+    let modules_b: Vec<String> = (0..32).map(|index| format!("mB-{index:02}")).collect();
+    for (counted, shared) in [(32, 4), (COUNTED, SHARED)] {
+        let exact: Vec<_> = (1..=shared)
+            .map(|round| twin_range_gap("c0", counted + round - 1, counted + round, TARGETS))
+            .collect();
+        // Exercise the current live shared gate first: caller-bound retirement
+        // dispositions must qualify without inventing per-sharer module gaps.
+        let check = |gaps: &[GapEvidence], completed: u64| {
+            check_shared_checkpoint(completed, gaps, &modules_a, &modules_b)
+        };
+        check(&exact[..1], 1)?;
+        check(&exact, shared)?;
+        for mutation in [
+            "missing",
+            "duplicate",
+            "short",
+            "excess",
+            "caller",
+            "module",
+            "range",
+            "growth",
+            "subject",
+        ] {
+            let mut changed = exact.clone();
+            match mutation {
+                "missing" => {
+                    changed.remove(0);
+                }
+                "duplicate" => changed.push(exact[0].clone()),
+                "short" => changed[0].repeats = TARGETS - 1,
+                "excess" => changed[0].repeats = TARGETS + 1,
+                "caller" => changed[0].caller = Some("foreign".into()),
+                "module" => changed[0].module = Some(modules_a[0].clone()),
+                "range" => changed[0] = twin_range_gap("c0", counted - 1, counted, TARGETS),
+                "growth" => {
+                    changed[0].reason = changed[0]
+                        .reason
+                        .replace("1 unattributed", "2 unattributed")
+                }
+                "subject" => changed[0].subject = "another disclosure".into(),
+                _ => unreachable!(),
+            }
+            ensure!(
+                check(&changed, shared).is_err(),
+                "accepted retirement mutation {mutation}"
+            );
+        }
+        let mut compensated = exact.clone();
+        compensated[0].repeats -= 1;
+        compensated.extend(
+            modules_a
+                .iter()
+                .chain(&modules_b)
+                .map(|module| twin_ambiguity_gap(module, shared)),
+        );
+        ensure!(
+            check(&compensated, shared).is_err(),
+            "module disclosures cannot replace a caller retirement unit"
+        );
+    }
+    Ok(())
+}
+
+/// A complete bounded diagnostic input, independent of observed count totals.
+/// Each pair has its own initial A placement, four issued shared units and
+/// its own final B proof. Native topology/ledger checks remain separate.
+fn twin_shared_pair_records() -> Vec<serde_json::Value> {
+    let mut records = Vec::new();
+    let mut seq = 1u64;
+    for index in 0..32 {
+        let pair = format!("p{index}");
+        records.push(serde_json::json!({"kind":"publication","decision":"placed",
+            "seq":seq,"caller":"c0","pair":pair,"module_id":format!("mA-{index:02}"),
+            "base":0,"absolute":1,"staged":1,"edge_total":1}));
+        seq += 1;
+        for round in 1..=4 {
+            let absolute = 32 + round;
+            records.push(serde_json::json!({"kind":"count_observation","seq":seq,
+                "caller":"c0","pair":pair,"absolute":absolute,"pre":1000+10*absolute,"post":1001+10*absolute}));
+            records.push(serde_json::json!({"kind":"count_decision","seq":seq+1,
+                "caller":"c0","pair":pair,"decision":"withheld","reason":"shared_owner",
+                "after":absolute-1,"through":absolute,"absolute":absolute,
+                "pre":1000+10*absolute,"post":1001+10*absolute,
+                "observation_ref":{"seq":seq,"status":"retained"}}));
+            seq += 2;
+        }
+    }
+    records.extend(twin_terminal_records_as(32, 4));
+    records
+}
+
+#[test]
+fn operator_diagnostics_wrap_twin_shared_pairs_no_compensation() -> Result<()> {
+    let exact = twin_shared_pair_records();
+    // The current final gate validates terminal pairs but has no per-pair
+    // shared-phase check. A compensating shared mutation must also fail.
+    let check = |records: &[serde_json::Value]| {
+        check_terminal_pairs_schedule(records, &twin_b_modules(), Some("c0"), 32, 4)
+    };
+    check(&exact)?;
+    for mutation in [
+        "duplicate_pair",
+        "missing",
+        "overlap",
+        "range",
+        "caller",
+        "observation",
+        "reference",
+        "placement",
+        "module_pair",
+    ] {
+        let mut changed = exact.clone();
+        let at = changed
+            .iter()
+            .position(|row| row["decision"] == "withheld" && row["reason"] == "shared_owner")
+            .unwrap();
+        match mutation {
+            "duplicate_pair" => {
+                for row in &mut changed {
+                    if row["pair"] == "p0" && row["reason"] == "shared_owner" {
+                        row["pair"] = "p1".into();
+                    }
+                }
+            }
+            "missing" => {
+                changed.remove(at);
+            }
+            "overlap" => changed.push(changed[at].clone()),
+            "range" => {
+                changed[at]["after"] = 31.into();
+                changed[at]["through"] = 33.into();
+            }
+            "caller" => changed[at]["caller"] = "foreign".into(),
+            "observation" => changed[at]["absolute"] = 34.into(),
+            "reference" => changed[at]["observation_ref"]["seq"] = 999_999.into(),
+            "placement" => {
+                changed[at]["kind"] = "publication".into();
+                changed[at]["decision"] = "placed".into();
+                changed[at]["module_id"] = "mA-00".into();
+            }
+            "module_pair" => changed[0]["module_id"] = "mA-01".into(),
+            _ => unreachable!(),
+        }
+        ensure!(
+            check(&changed).is_err(),
+            "accepted compensating shared-pair mutation {mutation}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn operator_diagnostics_wrap_twin_schedule_args_pilot() -> Result<()> {
     let args = schedule_args(&PILOT_SCHEDULE)?;
     ensure!(

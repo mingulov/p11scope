@@ -146,11 +146,14 @@ class DiscoveryFlow(unittest.TestCase):
             ('system-bit-cleared', 'p11_link_fork_allowed', 'r2 &= 0x42', 'r2 &= 0x2', 'scope'),
             ('pid-bit-added', 'p11_link_fork_allowed', 'r2 &= 0x42', 'r2 &= 0x43', 'scope'),
             ('aggregate-bypass', 'p11_link_fork_allowed', 'r1 &= 0x10', 'r1 &= 0x0', 'scope'),
-            ('thread-bypass', 'p11_link_emit_fork', 'r5 &= 0x10000', 'r5 &= 0x0', 'classification'),
-            ('child-zero', 'p11_link_emit_fork', 'if r2 == 0x0 goto -0xc', 'if r2 != 0x0 goto -0xc', 'classification'),
-            ('parent-identity', 'p11_link_emit_fork', 'if r9 == 0x0 goto', 'if r9 != 0x0 goto', 'classification'),
-            ('child-identity', 'p11_link_emit_fork', 'if r7 != 0x0 goto', 'if r7 == 0x0 goto', 'classification'),
-            ('reserve-too-early', 'p11_link_emit_fork', '\tr5 = r2', '\tcall 0x83', 'classification'),
+            ('thread-bypass', 'p11_link_emit_fork', 'r1 &= 0x10000', 'r1 &= 0x0', 'classification'),
+            ('child-zero', 'p11_link_emit_fork', '@pid-zero', 'if r1 != 0x0 goto', 'classification'),
+            ('parent-identity', 'p11_link_emit_fork', 'if r8 == 0x0 goto', 'if r8 != 0x0 goto', 'classification'),
+            ('child-identity', 'p11_link_emit_fork', 'if r5 == 0x0 goto', 'if r5 != 0x0 goto', 'classification'),
+            ('reserve-too-early', 'p11_link_emit_fork', '\tr1 = r2', '\tcall 0x83', 'classification'),
+            ('pid-preservation', 'p11_link_emit_fork', '\tr6 = r1', '\tr6 = r2', 'classification'),
+            ('pid-low-word', 'p11_link_emit_fork', 'r1 >>= 0x20', 'r1 >>= 0x10', 'classification'),
+            ('clone-class', 'p11_link_emit_fork', '\tr0 = 0x2', '\tr0 = 0x1', 'classification'),
         ]
         self.mutations(cases, 'typed-birth')
 
@@ -169,8 +172,8 @@ class DiscoveryFlow(unittest.TestCase):
             ('unconditional-exact', 'classify_direct_interface', 'if r1 != r2 goto +0x1', 'goto +0x0', 'classification'),
             ('negative-as-other', 'classify_direct_interface', 'if r1 s> r0 goto', 'if r1 s< r0 goto', 'classification'),
             ('null-as-exact', 'classify_direct_interface', 'r9 = 0x30000', 'r9 = 0x10000', 'null'),
-            ('flags-clamp-removed', 'classify_direct_interface', '\tr5 = 0x2', '\tr5 = r5', 'flags'),
-            ('flags-clamp-inverted', 'classify_direct_interface', 'if r1 > r5 goto', 'if r1 < r5 goto', 'flags'),
+            ('flags-clamp-removed', 'classify_direct_interface', '\tr6 = 0x2', '\tr6 = r6', 'flags'),
+            ('flags-clamp-inverted', 'classify_direct_interface', 'if r1 > r6 goto', 'if r1 < r6 goto', 'flags'),
             ('flags-clamp-bound', 'classify_direct_interface', '@flags-bound', 'r1 = -0x1', 'flags'),
             ('other-as-exact', 'classify_direct_interface', 'r9 = 0x20000', 'r9 = 0x10000', 'classification'),
             ('wrong-class-field', 'classify_direct_interface', '*(u64 *)(r10 - 0x40) = r9', '*(u64 *)(r10 - 0x38) = r9', 'metadata'),
@@ -181,6 +184,95 @@ class DiscoveryFlow(unittest.TestCase):
             ('old-class-retained', 'classify_direct_interface', '0xffffff0000ffff ll', '0xffffffffffffffff ll', 'metadata'),
         ]
         self.mutations(cases, 'interface-name')
+
+    def test_returned_flags_reach_payload_only_as_finite_class(self):
+        for variant, elf, disassembly in self.objects:
+            _, lines = C.function(C.sections(disassembly)['.text'], 'classify_direct_interface', 'fixture')
+            site = early_class_site(lines, 2)
+            self.assertEqual(site[1], 'r6 = 0x0')
+            for value in ('0x3', '0x100000000', 'r8'):
+                with self.subTest(variant=variant, value=value):
+                    old, new = instruction_change(lines, site, 'r6 = ' + value)
+                    self.reject_and_restore(elf, disassembly, 'classify_direct_interface', old, new,
+                                            'interface-name', 'flags')
+
+    def test_tail_count_span_and_continuation_mutations(self):
+        # The tuple locates a real dataflow neighborhood; branch targets are
+        # derived from decoded publications, independently of absolute PCs.
+        cases = [
+            ('count-pointer', 'interface_list_return',
+             ('r3 = *(u64 *)(r10 - 0x30)', 'r0 = *(u64 *)(r10 - 0x38)'),
+             0, 'r3 = *(u64 *)(r10 - 0x38)'),
+            ('count32-width', 'interface_list_return',
+             ('r2 = 0x4', '*(u64 *)(r10 - 0x80) = r0', 'call 0x70'), 0, 'r2 = 0x8'),
+            ('count64-width', 'interface_list_return',
+             ('r2 = 0x8', 'call 0x70'), 0, 'r2 = 0x4'),
+            ('count64-result-width', 'interface_list_return',
+             ('r1 = *(u64 *)(r10 - 0x58)', 'r5 = r8', 'r8 = r9'),
+             0, 'w1 = *(u32 *)(r10 - 0x58)'),
+            ('count64-failure-edge', 'interface_list_return',
+             ('r2 = 0x8', 'call 0x70'), 10, '@count-join'),
+            ('count32-failure-edge', 'interface_list_return',
+             ('r2 = 0x4', '*(u64 *)(r10 - 0x80) = r0', 'call 0x70',
+              'r5 = r8', 'r8 = r9', 'r9 = *(u64 *)(r10 - 0x80)'), 6, '@publish'),
+            ('base-null-edge', 'interface_list_return',
+             ('r1 = *(u64 *)(r10 - 0x58)', 'r5 = r8', 'r8 = r9',
+              'r9 = *(u64 *)(r10 - 0x80)'), 4, '@publish'),
+            ('count-zero-edge', 'interface_list_return',
+             ('r1 = *(u64 *)(r10 - 0x58)', 'r5 = r8', 'r8 = r9',
+              'r9 = *(u64 *)(r10 - 0x80)'), 5, '@publish'),
+            ('active-count-limit', 'interface_list_return',
+             ('r3 = 0x10', 'r3 += -0x1', 'r3 *= r2'), 0, 'r3 = 0x11'),
+            ('span-stride', 'interface_list_return', ('r2 = 0xc',), 0, 'r2 = 0x8'),
+            ('span-base', 'interface_list_return', ('r2 += r9',), 0, 'r2 += r8'),
+            ('span-wrap-edge', 'interface_list_return',
+             ('r4 = 0x0', 'r4 &= 0x1'), 2, '@publish'),
+            ('last-word-width', 'interface_list_return', ('r4 = 0x8',), 0, 'r4 = 0x4'),
+            ('last-word-wrap-edge', 'interface_list_return',
+             ('r2 = 0x0', 'r2 &= 0x1'), 2, '@publish'),
+            ('last-word32-end', 'interface_list_return',
+             ('r2 = 0xfffffffd ll',), 0, 'r2 = 0xffffffff ll'),
+            ('publish-base', 'interface_list_return',
+             ('*(u64 *)(r10 - 0x58) = r9', 'r2 = 0xffffffff ll'),
+             0, '*(u64 *)(r10 - 0x58) = r8'),
+            ('publish-count', 'interface_list_return', ('r1 <<= 0x8',), 0, 'r1 <<= 0x10'),
+            ('publish-symbol', 'interface_list_return', ('r5 <<= 0x28',), 0, 'r5 <<= 0x20'),
+            ('worker-packed-source', 'interface_list_worker',
+             ('r4 = *(u64 *)(r0 + 0x8)', 'r9 = r4'), 0, 'r4 = *(u64 *)(r0 + 0x0)'),
+            ('worker-symbol-width', 'interface_list_worker', ('r9 >>= 0x28',), 0, 'r9 >>= 0x20'),
+            ('worker-symbol-store', 'interface_list_worker', ('r9 <<= 0x20',), 0, 'r9 <<= 0x10'),
+            ('worker-symbol-null-edge', 'interface_list_worker',
+             ('r9 = r4', 'r9 >>= 0x28'), 2, '@classifier'),
+            ('worker-count-width', 'interface_list_worker',
+             ('r7 >>= 0x8', 'r2 = r7', 'r2 <<= 0x20', 'r2 >>= 0x20'), 3, 'r2 >>= 0x10'),
+            ('worker-index-mask', 'interface_list_worker', ('r2 &= 0xff',), 0, 'r2 &= 0xffff'),
+            ('worker-index-limit', 'interface_list_worker', ('r2 &= 0xff',), 1, '@classifier'),
+            ('worker-count-limit', 'interface_list_worker',
+             ('r1 = 0x10', 'r2 = r4', 'r2 &= 0xff'), 6, '@classifier'),
+        ]
+        for variant, elf, disassembly in self.objects:
+            text = C.sections(disassembly)
+            text = text['uretprobe'] + text['.text']
+            for label, function, sequence, offset, replacement in cases:
+                with self.subTest(variant=variant, mutation=label):
+                    name, lines = C.function(text, function, 'fixture')
+                    site = instruction_site(lines, sequence, offset)
+                    if replacement == '@publish':
+                        target = instruction_site(lines, ('r2 = r5', 'r2 &= 0xffffff'))[0]
+                        replacement = site[1].split('goto ')[0] + f'goto {target - site[0] - 1:+#x}'
+                    elif replacement == '@count-join':
+                        self.assertTrue(site[1].startswith('goto '))
+                        target = instruction_site(lines, (
+                            'r1 = *(u64 *)(r10 - 0x58)', 'r5 = r8', 'r8 = r9'))[0]
+                        replacement = f'goto {target - site[0] - 1:+#x}'
+                    elif replacement == '@classifier':
+                        targets = [pc for caller, _, pc, target in C.D.internal_call_targets(text)
+                                   if caller == name and target.endswith('classify_direct_interface')]
+                        self.assertEqual(len(targets), 1)
+                        replacement = site[1].split('goto ')[0] + f'goto {targets[0] - site[0] - 1:+#x}'
+                    old, new = instruction_change(lines, site, replacement)
+                    self.reject_and_restore(elf, disassembly, function, old, new, 'interface-name', 'tail')
+                    print(f'verified {variant} interface-name:tail {label}')
 
     def test_all_payload_predecessors(self):
         # Single decoded instructions, including the independent BN-R1 control.
@@ -275,8 +367,18 @@ class DiscoveryFlow(unittest.TestCase):
                     elif old == '@flags-bound':
                         _, lines = C.function(C.sections(disassembly)['.text'], function, 'fixture')
                         site = instruction_site(lines, ('r1 = 0x2', 'r4 = *(u64 *)(r10 - 0x60)',
-                                                       'if r1 > r5 goto +0x1', 'r5 = 0x2'))
+                                                       'if r1 > r6 goto +0x1', 'r6 = 0x2'))
                         old, new = instruction_change(lines, site, new)
+                    elif old == '@pid-zero':
+                        _, lines = C.function(C.sections(disassembly)['.text'], function, 'fixture')
+                        insns = C.D.instructions(lines)
+                        sites = [insns[i + 3] for i in range(len(insns) - 3)
+                                 if tuple(op for _, op in insns[i:i + 3]) ==
+                                 ('r1 = r6', 'r1 <<= 0x20', 'r1 >>= 0x20')
+                                 and insns[i + 3][1].startswith('if r1 == 0x0 goto ')]
+                        self.assertEqual(len(sites), 1)
+                        old, new = instruction_change(lines, sites[0], sites[0][1].replace(
+                            'if r1 == 0x0 goto', new))
                     elif old == '@name-read-destination':
                         _, lines = C.function(C.sections(disassembly)['.text'], function, 'fixture')
                         site = instruction_site(lines, ('r1 = r9', 'r2 = 0x9',

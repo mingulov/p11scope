@@ -821,6 +821,241 @@ def tail_cleanup_contract(disassembly, function, tail_pc, graph):
                                     for pc in owned_paths)
 
 
+def _tail_lowering(insns, source):
+    """One reviewed contiguous tail lowering, with instruction-local labels."""
+    expected, labels = [], {}
+    for text in source.strip().splitlines():
+        text = text.strip()
+        if text.endswith(":"):
+            labels[text[:-1]] = len(expected)
+        else:
+            expected.append(text)
+    matches = []
+    for begin in range(len(insns) - len(expected) + 1):
+        region = insns[begin:begin + len(expected)]
+        for (pc, actual), wanted in zip(region, expected):
+            if "goto @" in wanted:
+                prefix, label = wanted.split("goto @")
+                if (not actual.startswith(prefix + "goto ")
+                        or relative_target(pc, actual) != region[labels[label]][0]):
+                    break
+            elif wanted.endswith("goto ?"):
+                if (not actual.startswith(wanted[:-1])
+                        or relative_target(pc, actual) is None):
+                    break
+            elif actual != wanted:
+                break
+        else:
+            matches.append(region)
+    return matches[0] if len(matches) == 1 else None
+
+
+def _stack_interface_return_contract(lines, insert_pc):
+    """Bind read_word's two widths, nonzero count/base and checked span to insert.
+
+    The native owner now returns StartState on the caller's stack. The old
+    pointer+8 load is absent; an arbitrary stack load cannot replace that proof.
+    Every accepted insert must cross these actual count/span gates, and their
+    refusal edges must be unable to reach the continuation publication.
+    """
+    insns, graph = instruction_graph(lines)
+    state = _tail_lowering(insns, """
+        r3 = *(u64 *)(r10 - 0x30)
+        r0 = *(u64 *)(r10 - 0x38)
+        r8 = *(u64 *)(r10 - 0x48)
+        r9 = *(u64 *)(r10 - 0x50)
+        r1 = r7
+        r1 &= 0x1
+        if r1 == 0x0 goto ?
+        r1 = 0xfffffffd ll
+        if r1 > r3 goto @read32
+        goto ?
+        read32:
+        r1 = r10
+        r1 += -0x58
+        r2 = 0x4
+        *(u64 *)(r10 - 0x80) = r0
+        call 0x70
+        r5 = r8
+        r8 = r9
+        r9 = *(u64 *)(r10 - 0x80)
+        if r0 != 0x0 goto ?
+        w1 = *(u32 *)(r10 - 0x58)
+        goto ?
+        """)
+    read64 = _tail_lowering(insns, """
+        if r3 > -0x8 goto ?
+        *(u64 *)(r10 - 0x80) = r0
+        r1 = r10
+        r1 += -0x58
+        r2 = 0x8
+        call 0x70
+        if r0 == 0x0 goto ?
+        """)
+    span = _tail_lowering(insns, """
+        r1 = *(u64 *)(r10 - 0x58)
+        r5 = r8
+        r8 = r9
+        r9 = *(u64 *)(r10 - 0x80)
+        if r9 == 0x0 goto ?
+        if r1 == 0x0 goto ?
+        r3 = r7
+        r3 &= 0x1
+        r2 = 0xc
+        if r3 != 0x0 goto @stride
+        r2 = 0x18
+        stride:
+        r4 = 0x10
+        r3 = r1
+        if r4 > r1 goto @active
+        r3 = 0x10
+        active:
+        r3 += -0x1
+        r3 *= r2
+        r2 = r3
+        r2 += r9
+        r4 = 0x1
+        if r3 > r2 goto @added
+        r4 = 0x0
+        added:
+        r4 &= 0x1
+        if r4 != 0x0 goto ?
+        r3 = r7
+        r3 &= 0x1
+        r4 = 0x8
+        if r3 != 0x0 goto @lastword
+        r4 = 0x10
+        lastword:
+        r3 = r4
+        r3 += r2
+        r2 = 0x1
+        if r4 > r3 goto @ended
+        r2 = 0x0
+        ended:
+        r2 &= 0x1
+        if r2 != 0x0 goto ?
+        r7 &= 0x1
+        if r7 == 0x0 goto ?
+        r2 = 0xfffffffd ll
+        if r2 > r3 goto ?
+        """)
+    lp64 = _tail_lowering(insns, """
+        if r3 > -0x8 goto ?
+        r2 = r5
+        r2 &= 0xffffff
+        if r2 == 0x0 goto ?
+        """)
+    publish = _tail_lowering(insns, """
+        r2 = r5
+        r2 &= 0xffffff
+        if r2 == 0x0 goto ?
+        *(u64 *)(r10 - 0x20) = r8
+        r2 = 0x1
+        *(u64 *)(r10 - 0x10) = r2
+        r2 = 0x0
+        *(u64 *)(r10 - 0x18) = r2
+        *(u64 *)(r10 - 0x48) = r2
+        *(u64 *)(r10 - 0x58) = r9
+        r2 = 0xffffffff ll
+        if r2 > r1 goto @count
+        r1 = 0xffffffff ll
+        count:
+        r1 <<= 0x8
+        r5 <<= 0x28
+        r1 |= r5
+        *(u64 *)(r10 - 0x50) = r1
+        r1 = r10
+        r1 += -0x20
+        r2 = r10
+        r2 += -0x58
+        r3 = 0x1
+        """)
+    if not all((state, read64, span, lp64, publish)):
+        return False
+    raw_helpers = {pc for _, pc, text in instruction_entries(lines)
+                   if text.startswith("85 00 ")}
+    reads = {state[14][0], read64[5][0]}
+    if not reads <= raw_helpers:
+        return False
+    if (relative_target(*state[6]) != read64[0][0]
+            or relative_target(*state[-1]) != span[4][0]
+            or relative_target(*read64[-1]) != span[0][0]
+            or relative_target(*span[-3]) != lp64[0][0]
+            or relative_target(*span[-1]) != publish[0][0]
+            or graph[publish[-1][0]] != [insert_pc]):
+        return False
+    start = insns[0][0]
+    # The two ABI alternatives do not individually dominate publication.
+    # The common span gates do; branch-only alternatives are checked below.
+    required = (state[0][0], *(span[i][0] for i in (4, 5, 15, 23, 35, 37)),
+                publish[0][0])
+    if (insert_pc in reachable(graph, [start], reads)
+            or any(insert_pc in reachable(graph, [start], {pc}) for pc in required)):
+        return False
+    denied = [state[9], state[18], read64[0], *[span[i] for i in (4, 5, 23, 35)],
+              lp64[0], publish[2]]
+    return not any(insert_pc in reachable(graph, [relative_target(pc, text)])
+                   for pc, text in denied)
+
+
+def _packed_interface_worker_contract(lines, get_pc, classifier_pc):
+    """The symbol is packed>>40, count is u32, and the index is below min(count,16)."""
+    insns, graph = instruction_graph(lines)
+    unpack = _tail_lowering(insns, """
+        if r0 == 0x0 goto ?
+        r5 = *(u64 *)(r0 + 0x0)
+        if r5 == 0x0 goto ?
+        r4 = *(u64 *)(r0 + 0x8)
+        r9 = r4
+        r9 >>= 0x28
+        if r9 == 0x0 goto ?
+        r7 = r4
+        r7 >>= 0x8
+        r2 = r7
+        r2 <<= 0x20
+        r2 >>= 0x20
+        r3 = 0x10
+        r1 = r7
+        if r3 > r2 goto @active
+        r1 = 0x10
+        active:
+        r2 = r4
+        r2 &= 0xff
+        if r2 > 0xf goto ?
+        r1 <<= 0x20
+        r1 >>= 0x20
+        if r2 >= r1 goto ?
+        """)
+    metadata = _tail_lowering(insns, """
+        r9 <<= 0x20
+        r1 = *(u64 *)(r10 - 0x60)
+        r1 <<= 0x8
+        r1 |= r9
+        r1 |= 0x2
+        r4 = r10
+        r4 += -0x40
+        r2 = r7
+        r3 = *(u64 *)(r10 - 0x70)
+        r5 = *(u64 *)(r10 - 0x78)
+        """)
+    if (not unpack or not metadata or graph[get_pc] != [unpack[0][0]]
+            or graph[metadata[-1][0]] != [classifier_pc]):
+        return False
+    guards = [unpack[i] for i in (0, 2, 6, 18, 21)]
+    start = insns[0][0]
+    if not all(classifier_pc not in reachable(graph, [start], {pc})
+               and classifier_pc not in reachable(graph, [relative_target(pc, text)])
+               for pc, text in guards):
+        return False
+    symbol_writes = [pc for pc, text in insns if unpack[5][0] < pc < classifier_pc
+                     and re.match(r"[rw]9\b", text)]
+    live = reachable(graph, [start])
+    return (symbol_writes == [metadata[0][0]]
+            and classifier_pc not in reachable(graph, [start], {metadata[0][0]})
+            and all({pc for pc in live if current[0] in graph[pc]} == {previous[0]}
+                    for previous, current in zip(metadata, metadata[1:])))
+
+
 def interface_tail_contract(disassembly):
     blocks = function_blocks(disassembly)
     returns = [name for name in blocks if name.endswith("interface_list_return")]
@@ -886,21 +1121,29 @@ def interface_tail_contract(disassembly):
             return False
     return_block = "\n".join(return_lines)
     worker_block = "\n".join(worker_lines)
-    if not re.search(r"\br\d+ = \*\(u64 \*\)\(r\d+ \+ 0x8\)", return_block):
-        return False
+    old_return = bool(re.search(r"\br\d+ = \*\(u64 \*\)\(r\d+ \+ 0x8\)", return_block))
     if not re.search(r"\bif r\d+ == 0x0 goto", return_block):
         return False
     if not re.search(r"\bif r\d+ > r\d+ goto", return_block):
         return False
     if re.search(r"\bcall 0xae\b", worker_block):
         return False
-    if not (
+    old_worker = bool(
         re.search(r"\bif r\d+ > 0xffffff goto", worker_block)
         or (
             re.search(r"\br\d+ = 0xffffff\b", worker_block)
             and re.search(r"\bif r\d+ > r\d+ goto", worker_block)
         )
-    ):
+    )
+    insert_pcs = {pc for _, pc in discovery_call_sites(disassembly, return_name, "insert")}
+    if len(insert_pcs) != 1 or len(reads) != 1:
+        return False
+    insert_pc, = insert_pcs
+    get_pc, = reads
+    if not ((old_return and old_worker) or (
+        _stack_interface_return_contract(return_lines, insert_pc)
+        and _packed_interface_worker_contract(worker_lines, get_pc, worker_classifier_calls[0][2])
+    )):
         return False
     if not re.search(r"\br\d+ = 0x10\b", worker_block):
         return False

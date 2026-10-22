@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.dont_write_bytecode = True
 from _loader import load_sibling
 
-DECODER_SHA256 = 'c6e5971bad14424522a9bc33653fdd838a8c352d8272826b489c9ab6a6a4f4d5'
+DECODER_SHA256 = 'ac02c2f21d78df91633c7467de658d90363427db4b6d6cfa182fa2ee7a7a2cdc'
 _decoder = Path(__file__).with_name('check-live-discovery-object.py')
 if hashlib.sha256(_decoder.read_bytes()).hexdigest() != DECODER_SHA256:
     raise RuntimeError('discovery decoder source hash changed; review required')
@@ -218,34 +218,40 @@ def typed_birth(elf, secs):
     _, emitter = function(secs['.text'], 'p11_link_emit_fork', tag + 'classification')
     ei, eg = D.instruction_graph(emitter)
     er = recipe(ei, '''
-        if r3 == 0x0 goto @zero
-        if r4 == 0x0 goto @zero
-        r5 = r2
-        r5 &= 0x10000
-        if r5 != 0x0 goto @zero
-        r9 = *(u64 *)(r3 + 0x0)
-        if r9 == 0x0 goto @zero
-        r7 = *(u64 *)(r4 + 0x0)
-        if r7 != 0x0 goto @classify
-        zero:
-        r0 = 0x0
-        exit
-        classify:
-        r5 = 0x200000000 ll
-        r2 &= r5
-        r5 = 0x1
+        r6 = r1
+        if r3 == 0x0 goto ?
+        if r4 == 0x0 goto ?
+        r1 = r2
+        r1 &= 0x10000
+        if r1 != 0x0 goto ?
+        r8 = *(u64 *)(r3 + 0x0)
+        if r8 == 0x0 goto ?
+        r5 = *(u64 *)(r4 + 0x0)
+        if r5 == 0x0 goto ?
+        r1 = 0x200000000 ll
+        r2 &= r1
+        r0 = 0x1
         if r2 == 0x0 goto @pid
-        r5 = 0x2
+        r0 = 0x2
         pid:
-        r2 = r1
-        r2 <<= 0x20
-        r2 >>= 0x20
-        if r2 == 0x0 goto @zero
+        r1 = r6
+        r1 <<= 0x20
+        r1 >>= 0x20
+        if r1 == 0x0 goto ?
         ''', tag + 'classification')
     require(er[0][0] == ei[0][0], tag + 'classification: guard not entry')
+    denied = {D.relative_target(*er[i]) for i in (1, 2, 5, 7, 9, 18)}
+    require(len(denied) == 1 and None not in denied,
+            tag + 'classification: refusal edges diverge')
+    (zero,) = denied
+    zi = next(i for i, (pc, _) in enumerate(ei) if pc == zero)
+    require(ei[zi:zi + 2] == [(zero, 'r0 = 0x0'), (zero + 1, 'exit')],
+            tag + 'classification: refusal is not return-zero')
     reserves = D.map_call_sites(emitter, 'EVENTS', 0x83)
     require(len(reserves) == 1 and [pc for pc, op in ei if op == 'call 0x83'] == [reserves[0][1]], tag + 'classification: EVENTS reserve')
     dominates(eg, ei[0][0], er[-1][0], reserves[0][1], tag + 'classification')
+    require(reserves[0][1] not in D.reachable(eg, [zero]),
+            tag + 'classification: refusal reaches reserve')
     return True
 
 
@@ -374,6 +380,44 @@ def class_provenance(lines, insns, graph, calls, null, read, classified, meta):
                 and (expected != 1 or proof == 7), tag + ': unproved class or flag bits at payload builder')
 
 
+def interface_flags_provenance(insns, graph, flags, builder):
+    """Every path supplies a full finite flags class, including read failures."""
+    tag = 'interface-name:flags'
+    start = insns[0][0]
+    live = D.reachable(graph, [start])
+    for previous, current in zip(flags[:2], flags[1:3]):
+        require({pc for pc in live if current[0] in graph[pc]} == {previous[0]},
+                tag + ': class clamp entered midway')
+    incoming = {start: None}
+    pending = [start]
+    texts = dict(insns)
+    while pending:
+        pc = pending.pop()
+        value = incoming[pc]
+        if pc == builder:
+            continue
+        text = texts[pc]
+        if match := re.fullmatch(r'([rw])6 = (-?0x[0-9a-f]+)(?: ll)?', text):
+            width, constant = match.groups()
+            constant = int(constant, 16) & (0xffffffff if width == 'w' else 0xffffffffffffffff)
+            value = frozenset({constant})
+        elif re.match(r'[rw]6\b', text):
+            value = None
+        # Both BPF helpers and BPF-to-BPF calls preserve r6.
+        for successor in graph[pc]:
+            edge = value
+            if pc == flags[2][0] and successor == D.relative_target(pc, text):
+                edge = frozenset({0, 1}) if value is None else value & {0, 1}
+            old = incoming.get(successor)
+            merged = (edge if successor not in incoming else
+                      old | edge if old is not None and edge is not None else None)
+            if successor not in incoming or merged != old:
+                incoming[successor] = merged
+                pending.append(successor)
+    require(builder in incoming and incoming[builder] is not None
+            and incoming[builder] <= {0, 1, 2}, tag + ': unproved full flags class at payload')
+
+
 def interface_name(elf, secs):
     tag = 'interface-name:'
     require('.text' in secs and 'uretprobe' in secs, tag + 'tail: sections missing')
@@ -388,15 +432,15 @@ def interface_name(elf, secs):
     emitter_calls = [c for c in calls if c[3].endswith('emit_export')]
     require(len(emitter_calls) == 1, tag + 'metadata: emitter link')
     defined(elf, emitter_calls[0][3], '.text', tag + 'metadata')
-    # The returned CK_INTERFACE.flags word (r5) is read through a
+    # The returned CK_INTERFACE.flags word (r6) is read through a
     # caller-writable pointer: it is clamped to the finite class
     # {0, FORK_SAFE, OTHER=2} before either payload path, so the raw word
     # never reaches the record.
     flags = recipe(insns, '''
         r1 = 0x2
         r4 = *(u64 *)(r10 - 0x60)
-        if r1 > r5 goto @class
-        r5 = 0x2
+        if r1 > r6 goto @class
+        r6 = 0x2
         class:
         r1 = 0x0
         ''', tag + 'flags')
@@ -410,6 +454,7 @@ def interface_name(elf, secs):
     require(flags[-1] == null[0], tag + 'flags: class clamp is not the name guard prefix')
     read = recipe(insns, '''
         *(u64 *)(r10 - 0x68) = r5
+        *(u64 *)(r10 - 0x60) = r4
         r9 = r10
         r9 += -0x40
         r1 = r9
@@ -448,8 +493,8 @@ def interface_name(elf, secs):
         r8 &= r1
         r1 = *(u64 *)(r10 - 0x58)
         {metadata_stores[0]}
-        *(u64 *)(r10 - 0x30) = r5
-        *(u64 *)(r10 - 0x38) = r6
+        *(u64 *)(r10 - 0x30) = r6
+        *(u64 *)(r10 - 0x38) = r5
         r9 |= r8
         r1 = *(u64 *)(r10 - 0x48)
         r9 |= r1
@@ -474,6 +519,7 @@ def interface_name(elf, secs):
     require(graph[null[-1][0]] == [meta[0][0], read[0][0]], tag + 'null: branch wiring')
     require(graph[read[-1][0]] == [classified[0][0]] and graph[classified[-1][0]] == [meta[0][0]], tag + 'classification: adjacency')
     class_provenance(lines, insns, graph, calls, null, read, classified, meta)
+    interface_flags_provenance(insns, graph, flags, meta[0][0])
     exact = classified[11][0]
     require([pc for pc, op in insns if op == 'call 0x72'] == [read[-1][0]] and
             [pc for pc, op in insns if op == 'r9 = 0x10000'] == [exact], tag + 'classification: alternate exact assignment')
@@ -484,7 +530,7 @@ def interface_name(elf, secs):
     # path from a read of the returned flags word (LP64 or ILP32 third word)
     # to the payload builder passes the class clamp.
     word_loads = [pc for pc, op in insns
-                  if re.fullmatch(r'[rw]5 = \*\(u(?:64|32) \*\)\(r10 - 0x(?:30|38)\)', op)]
+                  if re.fullmatch(r'(?:r6 = \*\(u64 \*\)\(r10 - 0x30\)|w6 = \*\(u32 \*\)\(r10 - 0x38\))', op)]
     require(len(word_loads) == 2, tag + 'flags: returned-word loads not found')
     require(not any(meta[-1][0] in D.reachable(graph, [load], {flags[2][0]}) for load in word_loads),
             tag + 'flags: bypass path')

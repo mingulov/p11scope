@@ -264,6 +264,42 @@ class EntryObjectTests(unittest.TestCase):
                 with self.subTest(variant=variant, control=control):
                     with self.assertRaisesRegex(RuntimeError, "side.*(nonnull|lifetime)"):
                         consumer.step(store, candidate)
+            def indexed_write(values, comparison=None):
+                joined = None
+                for number in values:
+                    joined = proof.join(joined, edges[guard+2] | {"r1": ("constant", number)})
+                if comparison:
+                    consumer.text[guard] = f"if {comparison} == 0x0 goto +0x1"
+                    joined = dict(proof.edges(consumer, guard, joined, joined))[guard+2]
+                consumer.text[alias] = "r1 <<= 0x5"
+                shifted = consumer.step(alias, joined)
+                consumer.text[store] = "r8 += r1"
+                shifted = consumer.step(store, shifted)
+                consumer.text[store] = "*(u64 *)(r8 + 0x60) = r7"
+                written = consumer.step(store, shifted)
+                proof.check_sink(consumer, store, written)
+                self.assertEqual(written[("stack", -128, 8)], ("constant", 37))
+            with self.subTest(variant=variant, control="exact selected-slot join keeps bounded row offsets"):
+                indexed_write((0, 1))
+            with self.subTest(variant=variant, control="full-width predicate retains only the safe offset"):
+                indexed_write((0, 1 << 32), "r1")
+            for values, comparison in (((0, 16), None), (range(10), None),
+                    ((0, 1 << 63), None), ((0, 1 << 32), "w1")):
+                with self.subTest(variant=variant, control="unknown or out-of-row index cannot preserve a sink",
+                                  values=tuple(values), comparison=comparison):
+                    with self.assertRaisesRegex(RuntimeError, "side.*footprint|unknown entry write footprint|branch width 32"):
+                        indexed_write(values, comparison)
+            for offsets, allowed in (((0, 32), True), ((0, 512), False), (range(0, 320, 32), False)):
+                joined = None
+                for offset in offsets:
+                    joined = proof.join(joined, edges[guard+2] | {"r8": ("side", query, offset)})
+                consumer.text[store] = "*(u64 *)(r8 + 0x60) = r7"
+                with self.subTest(variant=variant, control="joined private pointer offsets stay bounded", offsets=tuple(offsets)):
+                    if allowed:
+                        proof.check_sink(consumer, store, consumer.step(store, joined))
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "side.*footprint|unknown entry write footprint"):
+                            consumer.step(store, joined)
             for changed, control in (({("stack", -52, 4): ("constant", 1)}, "key padding"),
                     ({("stack", -56, 4): ("low", ("uprobe", "foreign"))}, "foreign slot"),
                     ({"r3": ("constant", 1)}, "wrong required flag"),

@@ -46,6 +46,53 @@ def value(state, operand):
     return state.get(reg(operand)) if operand[0] in "rw" else ("constant", int(operand, 16))
 
 
+def number_values(fact):
+    if fact and fact[0] == "constant":
+        return frozenset({fact[1] & ((1 << 64)-1)})
+    return fact[1] if fact and fact[0] == "finite" else None
+
+
+def number_fact(numbers):
+    numbers = frozenset(numbers)
+    if not numbers or len(numbers) > 9 or any(not 0 <= n < 1 << 64 for n in numbers):
+        return None
+    return ("constant", next(iter(numbers))) if len(numbers) == 1 else ("finite", numbers)
+
+
+def number_operation(left, op, right, width):
+    lhs, rhs = number_values(left), number_values(right)
+    if lhs is None or rhs is None:
+        return None
+    if op == "+=" and right[0] == "constant" and right[1] < 0:
+        rhs = {right[1]}  # An emitted signed immediate may subtract safely.
+    mask, results = (1 << width)-1, set()
+    for a in lhs:
+        for b in rhs:
+            a &= mask
+            if op in ("<<=", ">>=") and not 0 <= b < width:
+                return None
+            if op == "+=": result = a+b
+            elif op == "*=": result = a*b
+            elif op == "<<=": result = a << b
+            elif op == ">>=": result = a >> b
+            elif op == "&=": result = a & (b & mask)
+            elif op == "|=": result = a | (b & mask)
+            elif op == "^=": result = a ^ (b & mask)
+            else: return None
+            # The proof does not turn overflow into a smaller safe index.
+            if not 0 <= result <= mask:
+                return None
+            results.add(result)
+    return number_fact(results)
+
+
+def side_pointer(owner, offsets):
+    offsets = frozenset(offsets)
+    if not offsets or len(offsets) > 9:
+        return None
+    return ("side", owner, next(iter(offsets)) if len(offsets) == 1 else offsets)
+
+
 def narrow(fact, width):
     if not fact:
         return None
@@ -54,6 +101,8 @@ def narrow(fact, width):
     if width == 64 or fact[0] == "field":
         return fact
     if width == 32:
+        if fact[0] == "finite":
+            return number_fact(n & 0xffffffff for n in fact[1])
         if fact[0] in ("scalar", "retained"):
             return (fact[0], fact[1], 32)
         if fact[0] == "key_tail":
@@ -74,7 +123,10 @@ def address(state, base, sign, offset):
         return (fact[0], fact[1] + delta)
     if fact[0] == "descriptor":
         return ("descriptor", fact[1], delta)
-    if fact[0] in ("owned", "side"):
+    if fact[0] == "side":
+        offsets = fact[2] if isinstance(fact[2], frozenset) else {fact[2]}
+        return side_pointer(fact[1], (n+delta for n in offsets))
+    if fact[0] == "owned":
         return (fact[0], fact[1], fact[2] + delta)
     if fact[0] in ("function_value", "external_key"):
         return (fact[0], fact[1], fact[2] + delta)
@@ -91,6 +143,13 @@ def join_fact(left, right):
     if left == right:
         return left
     if isinstance(left, tuple) and left and isinstance(right, tuple) and right:
+        lhs, rhs = number_values(left), number_values(right)
+        if lhs is not None and rhs is not None:
+            return number_fact(lhs | rhs)
+        if left[0] == right[0] == "side" and left[1] == right[1]:
+            lhs = left[2] if isinstance(left[2], frozenset) else {left[2]}
+            rhs = right[2] if isinstance(right[2], frozenset) else {right[2]}
+            return side_pointer(left[1], set(lhs) | set(rhs))
         if left[0] == right[0] == "result":
             return ("result", "map")
         for pointer, zero in ((left, right), (right, left)):
@@ -634,7 +693,7 @@ class SinkProof:
                 # Payload loads are unusable until the corresponding success
                 # edge promoted the helper/Option memory fact.
                 state.pop(reg(dst), None)
-        if pc not in consumer.maps and (match := re.fullmatch(r"([rw]\d+) (=|\+=|<<=|>>=|&=|\|=) ([rw]\d+|-?0x[0-9a-f]+)(?: ll)?", text)):
+        if pc not in consumer.maps and (match := re.fullmatch(r"([rw]\d+) (=|\+=|\*=|<<=|>>=|&=|\|=|\^=) ([rw]\d+|-?0x[0-9a-f]+)(?: ll)?", text)):
             dst, op, src = match.groups()
             old, rhs = before.get(reg(dst)), value(before, src)
             fact = None
@@ -644,11 +703,15 @@ class SinkProof:
                 # Offset selection within a BPF map value cannot turn its
                 # address space into the local frame's address space.
                 fact = old
+            elif op == "+=" and old and old[0] == "side" and number_values(rhs) is not None:
+                state.pop(reg(dst), None)
+                offsets = old[2] if isinstance(old[2], frozenset) else {old[2]}
+                amounts = {rhs[1]} if rhs[0] == "constant" and rhs[1] < 0 else number_values(rhs)
+                fact = side_pointer(old[1], (a+b for a in offsets for b in amounts))
             elif old and rhs:
-                if old[0] == rhs[0] == "constant":
-                    a, b = old[1], rhs[1]
-                    fact = ("constant", {"+=": lambda: a+b, "<<=": lambda: a<<b,
-                            ">>=": lambda: a>>b, "&=": lambda: a&b, "|=": lambda: a|b}[op]() & ((1 << 64)-1))
+                if number_values(old) is not None and number_values(rhs) is not None:
+                    state.pop(reg(dst), None)
+                    fact = number_operation(old, op, rhs, 32 if dst.startswith("w") else 64)
                 elif rhs[0] == "constant":
                     amount = rhs[1]
                     if old[0] == "field" and op == "&=" and amount == 255:
@@ -665,7 +728,7 @@ class SinkProof:
                         fact = ("rsp", 32, 0)
                     elif old[0] == "rsp" and op == "+=":
                         fact = ("rsp", old[1], old[2] + amount)
-                    elif old[0] in ("owned", "side") and op == "+=":
+                    elif old[0] == "owned" and op == "+=":
                         fact = (old[0], old[1], old[2] + amount)
                 elif old == ("rsp", 32, 0) and rhs[0] == "stride" and op == "+=":
                     fact = ("arg_address", rhs)
@@ -856,6 +919,7 @@ class SinkProof:
                     for fact in (left, right):
                         require(not fact or fact[0] in ("constant", "field", "option", "argument_result", "low", "high", "selected")
                                 or fact[0] in ("scalar", "retained") and fact[2] == 32
+                                or fact[0] == "finite" and all(n <= 0xffffffff for n in fact[1])
                                 or fact == ("rsp", 32, 0),
                                 self.fail(consumer, pc, f"branch width 32 cannot refine full-width fact {fact}"))
                 taken = successor == D.relative_target(pc, text)
@@ -863,6 +927,15 @@ class SinkProof:
                 if left and right and left[0] == right[0] == "constant":
                     if compare(left[1], op, right[1], width) != taken:
                         continue
+                elif number_values(left) is not None and number_values(right) is not None:
+                    pairs = {(a, b) for a in number_values(left) for b in number_values(right)
+                             if compare(a, op, b, width) == taken}
+                    if not pairs:
+                        continue
+                    for original, values in ((left, {a for a, _ in pairs}), (right, {b for _, b in pairs})):
+                        for key, fact in list(state.items()):
+                            if fact == original:
+                                state[key] = number_fact(values)
                 elif left and right and left[0] == "field" and right[0] == "constant":
                     domain = frozenset(n for n in self.domain(before, left[1]) if compare(n, op, right[1], width) == taken)
                     if not domain:
@@ -1358,8 +1431,11 @@ class _OwnedCaller(_SeedCaller):
                 forget_owned(state)
         if match := re.fullmatch(r"(r\d+) \+= (-?0x[0-9a-f]+)", text):
             fact = incoming.get(match[1])
-            if fact and fact[0] in ("owned", "side"):
+            if fact and fact[0] == "owned":
                 state[match[1]] = (fact[0], fact[1], fact[2]+int(match[2],16))
+            elif fact and fact[0] == "side":
+                offsets = fact[2] if isinstance(fact[2], frozenset) else {fact[2]}
+                state[match[1]] = side_pointer(fact[1], (n+int(match[2],16) for n in offsets))
         if match := re.fullmatch(r"([rw]\d+) = (w\d+)", text):
             state.pop(reg(match[1]), None)
             fact = narrow(value(incoming, match[2]), 32)
@@ -1438,6 +1514,10 @@ class _OwnedSinkProof(SinkProof):
             pointer = address(before, base, sign, offset)
             require(before.get("r"+base) != ("constant", 0),
                     self.fail(consumer, pc, "side memory access requires nonnull lifetime"))
+            if STORE.fullmatch(text):
+                require(pointer and pointer[0] in ("stack", "owned", "side")
+                        or before.get("r"+base, (None,))[0] == "result",
+                        self.fail(consumer, pc, "unknown entry write footprint"))
             if pointer and pointer[0] == "owned":
                 require(before.get(("live", pointer[1])), self.fail(consumer, pc, "START access outside owned lifetime"))
             if pointer and pointer[0] == "side":
@@ -1445,7 +1525,8 @@ class _OwnedSinkProof(SinkProof):
                 require(owner is not None and before.get(("live", owner)) and before.get(("side_live", pointer[1])),
                         self.fail(consumer, pc, "side access requires nonnull current START lifetime"))
                 size = int(memory[2] if LOAD.fullmatch(text) else memory[1])//8
-                require(0 <= pointer[2] and pointer[2]+size <= 432,
+                offsets = pointer[2] if isinstance(pointer[2], frozenset) else {pointer[2]}
+                require(all(0 <= n and n+size <= 432 for n in offsets),
                         self.fail(consumer, pc, "side memory footprint outside the 432-byte row"))
         if target == "p11_object_side_get":
             identity, key = (consumer.section, consumer.name), before.get("r1")

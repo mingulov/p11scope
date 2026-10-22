@@ -1181,6 +1181,12 @@ fn fit_edge_block(
     budget: usize,
     selected: bool,
 ) -> Option<Vec<String>> {
+    // Every fit stage sees the same immutable facts. Resolve/collect them
+    // once; tighter layouts only change how much of them is displayed.
+    let context = EdgeRenderContext {
+        children: presentation.semantic_children(edge.caller, edge.module),
+        riding_gaps: riding_gaps(presentation, edge),
+    };
     let full = BlockBudget {
         instance_rows: DASHBOARD_MAX_INSTANCES,
         mech_rows: DASHBOARD_MAX_MECHS,
@@ -1188,7 +1194,7 @@ fn fit_edge_block(
         show_gaps: true,
         show_identity: true,
     };
-    let block = render_edge_block(presentation, edge, width, full, selected);
+    let block = render_edge_block(presentation, edge, &context, width, full, selected);
     if block.len() <= budget {
         return Some(block);
     }
@@ -1200,7 +1206,7 @@ fn fit_edge_block(
             show_gaps: true,
             show_identity: true,
         };
-        let block = render_edge_block(presentation, edge, width, stage, selected);
+        let block = render_edge_block(presentation, edge, &context, width, stage, selected);
         if block.len() <= budget {
             return Some(block);
         }
@@ -1213,7 +1219,7 @@ fn fit_edge_block(
             show_gaps,
             show_identity: true,
         };
-        let block = render_edge_block(presentation, edge, width, stage, selected);
+        let block = render_edge_block(presentation, edge, &context, width, stage, selected);
         if block.len() <= budget {
             return Some(block);
         }
@@ -1228,7 +1234,7 @@ fn fit_edge_block(
             show_gaps: false,
             show_identity: false,
         };
-        let block = render_edge_block(presentation, edge, width, compact, selected);
+        let block = render_edge_block(presentation, edge, &context, width, compact, selected);
         if block.len() <= budget {
             return Some(block);
         }
@@ -1448,6 +1454,12 @@ fn wrap_items(width: usize, items: &[String]) -> Vec<String> {
     lines
 }
 
+/// Immutable lookups shared by every fit attempt for one physical edge.
+struct EdgeRenderContext<'a> {
+    children: crate::inventory_present::SemanticChildren<'a>,
+    riding_gaps: Vec<&'a crate::inventory_present::GapView>,
+}
+
 /// One edge as an identity line plus wrapped exact state items.
 /// Item order is stable: base states, mechanism facts, evidence
 /// counters, riding gaps, operation aggregates, active machines.
@@ -1457,6 +1469,7 @@ fn wrap_items(width: usize, items: &[String]) -> Vec<String> {
 fn render_edge_block(
     presentation: &Presentation,
     edge: &crate::inventory_present::EdgeView,
+    context: &EdgeRenderContext<'_>,
     width: usize,
     budget: BlockBudget,
     selected: bool,
@@ -1488,7 +1501,7 @@ fn render_edge_block(
             items.push(format!("evidence +{} hidden", evidence.len()));
         }
     }
-    let riding = riding_gaps(presentation, edge);
+    let riding = &context.riding_gaps;
     if budget.show_gaps {
         items.extend(riding.iter().map(|gap| gap_item(gap)));
     } else if !riding.is_empty() {
@@ -1528,17 +1541,9 @@ fn render_edge_block(
         items.extend(secondary_identity_items(presentation, edge));
     }
     lines.extend(wrap_items(width, &items));
-    let children: Vec<_> = presentation
-        .semantic_edges
-        .iter()
-        .filter(|child| child.caller == edge.caller && child.module == edge.module)
-        .collect();
-    for child in children.iter().take(budget.instance_rows) {
-        let instance = presentation
-            .instances
-            .iter()
-            .find(|r| r.id == child.instance)
-            .expect("semantic instance resolves in presentation");
+    for child in context.children.clone().take(budget.instance_rows) {
+        let instance = child.instance;
+        let child = child.semantic;
         let mut items = vec![
             format!(
                 "instance {} {}",
@@ -1595,7 +1600,7 @@ fn render_edge_block(
         }
         lines.extend(wrap_items(width, &items));
     }
-    let hidden = children.len().saturating_sub(budget.instance_rows);
+    let hidden = context.children.len().saturating_sub(budget.instance_rows);
     if hidden > 0 {
         lines.extend(wrap_items(width, &[format!("instances +{hidden} hidden")]));
     }

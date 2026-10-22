@@ -1377,16 +1377,9 @@ pub(crate) fn render_snapshot(presentation: &Presentation) -> String {
             snapshot_semantics(edge),
             escape_controls(&coverage_label(&edge.coverage)),
         );
-        for child in presentation
-            .semantic_edges
-            .iter()
-            .filter(|child| child.caller == edge.caller && child.module == edge.module)
-        {
-            let instance = presentation
-                .instances
-                .iter()
-                .find(|r| r.id == child.instance)
-                .expect("semantic instance resolves in presentation");
+        for child in presentation.semantic_children(edge.caller, edge.module) {
+            let instance = child.instance;
+            let child = child.semantic;
             let _ = writeln!(
                 out,
                 "  instance {} {} api_returns={}{} historical_only_returns={} semantics {} coverage lossy={} reasons=[{}]",

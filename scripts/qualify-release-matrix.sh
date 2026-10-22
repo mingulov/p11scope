@@ -33,6 +33,7 @@ LOCK=/var/tmp/p11scope-ws-tmp/privileged.lock
 QUIET=/var/tmp/p11scope-ws-tmp/QUIET-WINDOW
 OUT_BASE=/var/tmp/p11scope-ws-tmp/rc-qualify
 STAGE_BASE=/home/user/.cache/p11scope-vng/rc-qualify
+GUEST_WORK_ROOT=/var/tmp/p11scope-ws-tmp
 TIMEOUT=5400
 DRY_RUN=0
 SELF_TEST=0
@@ -102,6 +103,7 @@ while [ $# -gt 0 ]; do
     --timeout) TIMEOUT=$2; shift 2 ;;
     --out-base) OUT_BASE=$2; shift 2 ;;
     --stage-base) STAGE_BASE=$2; shift 2 ;;
+    --guest-work-root) GUEST_WORK_ROOT=$2; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
     --self-test) SELF_TEST=1; shift ;;
     --preflight) PREFLIGHT=1; shift ;;
@@ -236,7 +238,7 @@ judge_kernel() {
 
 # Only writes a concrete Bash script; no command in it runs during preparation.
 write_inner() {
-  local stage=$1 lib_command names
+  local stage=$1 selector_words names
   python3 -I "$CHECKER" --verify-launch-policy || return 1
   python3 -I "$CHECKER" --verify-inputs "$stage" --contract "$stage/contract.json" || return 1
   local -a selectors
@@ -246,18 +248,17 @@ print("\n".join(json.load(open(sys.argv[1]))["lib_tests"]))
 PYARGS
 ) || return 1
   mapfile -t selectors <<< "$names"
-  printf -v lib_command '%q ' "$REPO/scripts/run-privileged-lib-tests.sh" \
-    "$stage/artifacts/p11scope-lib" "$stage/work/priv/run" --include-long "${selectors[@]}"
+  printf -v selector_words '%q ' "${selectors[@]}"
   {
     echo '#!/bin/bash'
     echo 'set -uo pipefail'
-    printf 'STAGE=%q\nR=%q\n' "$stage" "$REPO"
-    printf 'LIB_COMMAND=%q\n' "$lib_command"
+    printf 'STAGE=%q\nR=%q\n' "$stage" "$stage/artifacts/source"
+    printf 'LIB_SELECTORS=(%s)\n' "$selector_words"
     cat <<'INNER'
 P=$STAGE/artifacts/p11scope
 BM=$STAGE/artifacts/p11scope-bpfmulti
-WORK=$STAGE/work
 python3 -I "$R/scripts/release-matrix-contract.py" --verify-launch-policy || exit 1
+[ "$(id -u)" = 0 ] || { echo 'matrix inner requires root' >&2; exit 1; }
 python3 -I "$R/scripts/release-matrix-contract.py" --verify-inputs "$STAGE" --contract "$STAGE/contract.json" || exit 1
 RUN_ID=$(python3 - "$STAGE/contract.json" <<'PYRUN'
 import json,sys
@@ -265,10 +266,35 @@ print(json.load(open(sys.argv[1]))['run_id'])
 PYRUN
 ) || exit 1
 record_exit() { printf '%s_exit=%s\nmatrix_run=%s\n' "$2" "$3" "$RUN_ID" >> "$1"; }
-export SUDO_UID=${SUDO_UID:-1000} SUDO_GID=${SUDO_GID:-1000} SUDO_USER=${SUDO_USER:-user}
-mkdir -p "$WORK/qual" "$WORK/priv" "$WORK/backend" "$WORK/c8-native" "$WORK/c8-scan" || exit 1
-chmod 0711 "$WORK" "$WORK/c8-native" "$WORK/c8-scan" || exit 1
-mkdir -p "$WORK/tmp"; chmod 0700 "$WORK/tmp" || exit 1
+BOOT_OSRELEASE=$(python3 - "$STAGE/contract.json" <<'PYBOOT'
+import json,sys
+print(json.load(open(sys.argv[1]))['expected_osrelease'] or '')
+PYBOOT
+) || exit 1
+if [ -n "$BOOT_OSRELEASE" ]; then
+  [ "$(uname -r)" = "$BOOT_OSRELEASE" ] || { echo 'wrong executed guest osrelease' >&2; exit 1; }
+  # Only vng guests receive a writable /boot overlay. Host lanes never enter.
+  cp -- "$STAGE/inputs/boot-config" "/boot/config-$BOOT_OSRELEASE" || exit 1
+  installed=$(sha256sum -- "/boot/config-$BOOT_OSRELEASE") || exit 1
+  expected=$(python3 - "$STAGE/contract.json" <<'PYHASH'
+import json,sys
+print(json.load(open(sys.argv[1]))['guest_boot_config']['sha256'])
+PYHASH
+) || exit 1
+  [ "${installed%% *}" = "$expected" ] || { echo 'installed guest boot config changed' >&2; exit 1; }
+fi
+python3 -I "$R/scripts/release-matrix-contract.py" --guest-environment "$STAGE" --contract "$STAGE/contract.json" > "$STAGE/guest-work.json" || exit 1
+environment=$(python3 - "$STAGE/guest-work.json" <<'PYENV'
+import json,shlex,sys
+d=json.load(open(sys.argv[1]))
+for key,field in [('WORK','work'),('RUNUID','uid'),('RUNGID','gid'),('RUNUSER','user')]:
+ print(key+'='+shlex.quote(str(d[field])))
+PYENV
+) || exit 1
+eval "$environment"
+# These are the validated invoking account, used by root-owned workload helpers.
+# Object canary dispatch will run as that account through runuser in Task3.
+export SUDO_UID=$RUNUID SUDO_GID=$RUNGID SUDO_USER=$RUNUSER RUNUID RUNGID
 export TMPDIR=$WORK/tmp
 umask 022
 uname -r > "$STAGE/uname.txt"
@@ -278,25 +304,28 @@ ulimit -n 65536 || exit 1
 record_exit "$STAGE/version.log" version "$?"
 "$P" doctor > "$STAGE/doctor.log" 2>&1
 record_exit "$STAGE/doctor.log" doctor "$?"
-THREADS=12 "$R/scripts/qualify-public-cli.sh" "$P" "$WORK/qual/cells" > "$STAGE/qual.log" 2>&1
+MODULE_ARGS=(); [ -z "${MODULE+x}" ] || MODULE_ARGS=(--module "$MODULE")
+MODULE=$(python3 -I "$R/scripts/release-matrix-contract.py" --select-module "${MODULE_ARGS[@]}") || exit 1
+export MODULE
+P11SCOPE_LOCAL_OUTPUT_ROOT=$WORK/outputs THREADS=12 "$R/scripts/qualify-public-cli.sh" "$P" "$WORK/qual/cells" > "$STAGE/qual.log" 2>&1
 record_exit "$STAGE/qual.log" qual "$?"
-[ ! -d "$WORK/qual/cells" ] || cp -r "$WORK/qual/cells" "$STAGE/cells"
+[ ! -d "$WORK/qual/cells" ] || python3 -I "$R/scripts/release-matrix-contract.py" --copy-tree public "$WORK/qual/cells" "$STAGE/cells" || exit 1
 "$R/scripts/qualify-inventory-native.sh" "$P" --lane native --base "$WORK/c8-native" > "$STAGE/inv-native.log" 2>&1
-record_exit "$STAGE/inv-native.log" inv_native "$?"
-cp -r "$WORK/c8-native" "$STAGE/c8-native" 2>/dev/null || true
+native_rc=$?; record_exit "$STAGE/inv-native.log" inv_native "$native_rc"
+[ "$native_rc" = 0 ] || [ "$native_rc" = 2 ] || exit 1
+python3 -I "$R/scripts/release-matrix-contract.py" --copy-tree native "$WORK/c8-native" "$STAGE/c8-native" || exit 1
 "$R/scripts/qualify-inventory-native.sh" "$P" --lane scan --base "$WORK/c8-scan" > "$STAGE/inv-scan.log" 2>&1
-record_exit "$STAGE/inv-scan.log" inv_scan "$?"
-cp -r "$WORK/c8-scan" "$STAGE/c8-scan" 2>/dev/null || true
-(cd "$R" && eval "$LIB_COMMAND") > "$STAGE/priv.log" 2>&1
+scan_rc=$?; record_exit "$STAGE/inv-scan.log" inv_scan "$scan_rc"
+[ "$scan_rc" = 0 ] || [ "$scan_rc" = 2 ] || exit 1
+python3 -I "$R/scripts/release-matrix-contract.py" --copy-tree native "$WORK/c8-scan" "$STAGE/c8-scan" || exit 1
+(cd "$R" && "$R/scripts/run-privileged-lib-tests.sh" "$STAGE/artifacts/p11scope-lib" "$WORK/priv/run" --include-long "${LIB_SELECTORS[@]}") > "$STAGE/priv.log" 2>&1
 record_exit "$STAGE/priv.log" priv "$?"
-[ ! -d "$WORK/priv/run" ] || cp -r "$WORK/priv/run" "$STAGE/run"
+[ ! -d "$WORK/priv/run" ] || python3 -I "$R/scripts/release-matrix-contract.py" --copy-tree plain "$WORK/priv/run" "$STAGE/run" || exit 1
 "$BM" --exact tests::the_pid_filter_probe_reaches_the_kernel --test-threads=1 --nocapture > "$STAGE/pidflt.log" 2>&1
 record_exit "$STAGE/pidflt.log" pidflt "$?"
 # Auto PID and system routes are decided independently by functional probes.
 # These observations corroborate backend selection; counted coverage is supplied
 # by the separately ledgered public/native assertions above.
-MODULE=${MODULE:-/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so}
-[ -f "$MODULE" ] || MODULE=/usr/lib/softhsm/libsofthsm2.so
 backend_probe() {
   local scope=$1 gate=$WORK/backend/gate-$1 wl observer rc
   setpriv --reuid="$SUDO_UID" --regid="$SUDO_GID" --clear-groups \
@@ -334,11 +363,10 @@ backend_probe() {
   kill -TERM "$wl" 2>/dev/null || true; wait "$wl" 2>/dev/null || true
   return "$rc"
 }
-mkdir -p "$STAGE/backend"
 if [ -x "$WORK/qual/cells/fix/gated" ] && [ -f "$MODULE" ]; then
   backend_probe pid || true
   backend_probe sys || true
-  cp -r "$WORK/backend/." "$STAGE/backend/" || exit 1
+  python3 -I "$R/scripts/release-matrix-contract.py" --copy-tree plain "$WORK/backend" "$STAGE/backend" || exit 1
 fi
 date -u +%Y-%m-%dT%H:%M:%SZ > "$STAGE/guest-end.txt"
 python3 -I "$R/scripts/release-matrix-contract.py" --seal "$STAGE" --contract "$STAGE/contract.json" --guest-exit 0 || exit 1
@@ -496,7 +524,7 @@ run_one() {
   [ ! -e "$stage" ] && [ ! -e "$out" ] || { echo "refusing existing stage/output: $tag" >&2; return 1; }
   mkdir -p "$stage" "$out" || return 1
   chmod 0755 "$stage" "$out"
-  python3 -I "$CHECKER" --prepare "$stage" --lane "$lane" --bin-dir "$BIN_OUT" \
+  python3 -I "$CHECKER" --prepare "$stage" --lane "$lane" --kernel "$k" --guest-work-root "$GUEST_WORK_ROOT" --bin-dir "$BIN_OUT" \
     --candidate-receipt "$CANDIDATE_RECEIPT" \
     --binary-list "$STAGE_REV/candidate-ignored.txt" --curation "$STAGE_REV/curation.txt" \
     --bpfmulti-list "$STAGE_REV/bpfmulti-list.txt" > "$stage/preparation.json" || return 1
@@ -506,11 +534,10 @@ run_one() {
   if [ "$k" = host ]; then
     # Explicit host obligation: same contract and harness, same owned lock.
     flock "$LOCK" timeout -k 60 "$TIMEOUT" sudo -n env \
-      SUDO_UID="$(id -u)" SUDO_GID="$(id -g)" SUDO_USER="$(id -un)" \
       bash "$stage/inner.sh" > "$stage/vng-console.log" 2>&1
   else
     flock "$LOCK" timeout -k 60 "$TIMEOUT" vng --run "$k" --user root --cpus 4 \
-      --memory 6G --rwdir "$stage" --exec "bash '$stage/inner.sh'" > "$stage/vng-console.log" 2>&1
+      --memory 6G --rwdir "$stage" --overlay-rwdir /boot --exec "bash '$stage/inner.sh'" > "$stage/vng-console.log" 2>&1
   fi
   vng_exit=$?
   end=$(date +%s); wall=$((end-start))

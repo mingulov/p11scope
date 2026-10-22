@@ -4,6 +4,7 @@
 import json
 import hashlib
 import os
+import pwd
 from pathlib import Path
 import re
 import runpy
@@ -14,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 CHECKER = ROOT / "scripts/release-matrix-contract.py"
@@ -105,9 +107,12 @@ class MatrixContract(unittest.TestCase):
         self.curation.write_text(f"default (0)\nlong (4, --include-long only)\n{LIB_A}\n{LIB_B}\n{LIB_D}\n{LIB_C}\nskipped (0)\nverify: curation matches the binary (4 tests)\n")
         self.bm_list = self.base / "bpf-list.txt"
         self.bm_list.write_text(f"{PID_TEST}: test\n1 test, 0 benchmarks\n")
+        self.kernel = self.base / "vmlinuz-6.1.188"
+        self.kernel.write_bytes(b"controlled kernel; never booted")
+        (self.base / "config-6.1.188").write_bytes(b"CONFIG_CONTROLLED_GUEST=y\n")
         self.contract = self.stage / "contract.json"
         result = command(sys.executable, "-I", str(CHECKER), "--prepare", str(self.stage),
-                         "--lane", "6.1.188", "--bin-dir", str(self.bins),
+                         "--lane", "6.1.188", "--kernel", str(self.kernel), "--bin-dir", str(self.bins),
                          "--binary-list", str(self.listing), "--curation", str(self.curation),
                          "--bpfmulti-list", str(self.bm_list),
                          "--candidate-receipt", str(self.candidate),
@@ -187,6 +192,9 @@ class MatrixContract(unittest.TestCase):
         self.write("inputs/curation.txt", f"default (1)\n{DENIAL}\nlong (0, --include-long only)\nskipped (0)\nverify: curation matches the binary (1 tests)\n")
         for path in ("inputs/ignored.txt", "inputs/curation.txt"):
             core["bindings"][path] = hashlib.sha256((self.stage / path).read_bytes()).hexdigest()
+        self.contract.write_text(json.dumps(core) + "\n")
+        core["expected_osrelease"] = "5.15.221"
+        core["guest_boot_config"]["osrelease"] = "5.15.221"
         self.contract.write_text(json.dumps(core) + "\n")
         self.write("uname.txt", "5.15.221\n")
         self.write("run/results.txt", f"PASS {DENIAL} rc=0 seconds=1 :: test result: ok. 1 passed\n")
@@ -459,7 +467,7 @@ class MatrixContract(unittest.TestCase):
         stage = self.base / "clone-stage"
         receipt = candidate_receipt(self.bins, self.base / "clone-build.json", repo)
         result = command(sys.executable, "-I", str(repo / "scripts" / CHECKER.name), "--prepare", str(stage),
-                         "--lane", "host", "--bin-dir", str(self.bins), "--binary-list", str(self.listing),
+                         "--lane", "host", "--kernel", "host", "--bin-dir", str(self.bins), "--binary-list", str(self.listing),
                          "--curation", str(self.curation), "--bpfmulti-list", str(self.bm_list),
                          "--candidate-receipt", str(receipt), "--lib-test", LIB_A)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -498,7 +506,7 @@ class MatrixContract(unittest.TestCase):
 
     def test_prebuilt_candidate_without_build_root_receipt_is_refused(self):
         result = command(sys.executable, "-I", str(CHECKER), "--prepare", str(self.base / "no-build-receipt"),
-                         "--lane", "host", "--bin-dir", str(self.bins), "--binary-list", str(self.listing),
+                         "--lane", "host", "--kernel", "host", "--bin-dir", str(self.bins), "--binary-list", str(self.listing),
                          "--curation", str(self.curation), "--bpfmulti-list", str(self.bm_list), "--lib-test", LIB_A)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
 
@@ -563,12 +571,198 @@ class MatrixContract(unittest.TestCase):
         return bundle, facts
 
     def prepare_object_inputs(self, stage, cells):
-        argv = [sys.executable, "-I", str(CHECKER), "--prepare", str(stage), "--lane", "host",
+        argv = [sys.executable, "-I", str(CHECKER), "--prepare", str(stage), "--lane", "host", "--kernel", "host",
             "--bin-dir", str(self.bins), "--binary-list", str(self.listing), "--curation", str(self.curation),
             "--bpfmulti-list", str(self.bm_list), "--candidate-receipt", str(self.candidate), "--lib-test", LIB_A]
         for mode, bits, bundle in cells:
             argv.extend(("--object-input", mode, str(bits), str(bundle)))
         return command(*argv)
+
+    def prepare_guest_attempt(self, name, lane="6.1.188", kernel=None):
+        stage = self.base / name
+        if kernel is None:
+            boot = self.base / (name + " boot")
+            boot.mkdir()
+            kernel = boot / ("vmlinuz-" + lane)
+            kernel.write_bytes(b"controlled kernel input; never booted")
+            (boot / ("config-" + lane)).write_bytes(b"CONFIG_CONTROLLED_GUEST=y\n")
+        result = command(sys.executable, "-I", str(CHECKER), "--prepare", str(stage),
+            "--lane", lane, "--kernel", str(kernel), "--bin-dir", str(self.bins),
+            "--binary-list", str(self.listing), "--curation", str(self.curation),
+            "--bpfmulti-list", str(self.bm_list), "--candidate-receipt", str(self.candidate),
+            "--lib-test", LIB_A)
+        return stage, result
+
+    def test_prepare_stages_lane_boot_config_and_binds_osrelease(self):
+        stage, result = self.prepare_guest_attempt("bound guest")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        contract = json.loads((stage / "contract.json").read_text())
+        expected = hashlib.sha256(b"CONFIG_CONTROLLED_GUEST=y\n").hexdigest()
+        self.assertEqual(contract["expected_osrelease"], "6.1.188")
+        self.assertEqual(contract["guest_boot_config"], {
+            "source": str(self.base / "bound guest boot/config-6.1.188"),
+            "sha256": expected, "osrelease": "6.1.188"})
+        self.assertEqual(contract["bindings"]["inputs/boot-config"], expected)
+        self.assertEqual((stage / "inputs/boot-config").read_bytes(), b"CONFIG_CONTROLLED_GUEST=y\n")
+        verify = command(sys.executable, "-I", str(CHECKER), "--verify-inputs", str(stage),
+            "--contract", str(stage / "contract.json"))
+        self.assertEqual(verify.returncode, 0, verify.stdout + verify.stderr)
+
+    def test_host_prepare_stages_no_boot_config(self):
+        stage, result = self.prepare_guest_attempt("bound host", "host", "host")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        contract = json.loads((stage / "contract.json").read_text())
+        self.assertIsNone(contract["guest_boot_config"])
+        self.assertIsNone(contract["expected_osrelease"])
+        self.assertFalse((stage / "inputs/boot-config").exists())
+
+    def test_cached_kernel_tag_binds_its_actual_osrelease(self):
+        home = self.base / "owned kernel cache"
+        boot = home / ".cache/virtme-ng/v6.1.188/amd64/boot"; boot.mkdir(parents=True)
+        config = boot / "config-6.1.188-controlled"; config.write_text("CONFIG_CONTROLLED=y\n")
+        with mock.patch.object(Path, "home", return_value=home):
+            path, release = CHECKER_MOD["guest_boot_config"]("v6.1.188")
+        self.assertEqual((path, release), (config, "6.1.188-controlled"))
+        config.rename(boot / "config-5.15.221")
+        with mock.patch.object(Path, "home", return_value=home), self.assertRaises(CHECKER_MOD["Invalid"]):
+            CHECKER_MOD["guest_boot_config"]("v6.1.188")
+
+    def test_prepare_refuses_unknown_kernel_layouts(self):
+        boot = self.base / "bad boot"; boot.mkdir()
+        kernel = boot / "vmlinuz-6.1.188"; kernel.write_bytes(b"not booted")
+        for case in ("missing", "ambiguous", "wrong_release", "wrong_lane"):
+            with self.subTest(case=case):
+                for path in boot.glob("config-*"): path.unlink()
+                if case == "ambiguous":
+                    (boot / "config-6.1.188").write_text("one")
+                    (boot / "config-6.1.188-other").write_text("two")
+                elif case == "wrong_release": (boot / "config-5.15.221").write_text("foreign")
+                elif case == "wrong_lane": (boot / "config-6.1.188").write_text("one")
+                stage, result = self.prepare_guest_attempt("invalid guest " + case,
+                    "6.6.157" if case == "wrong_lane" else "6.1.188", kernel)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertFalse((stage / "contract.json").exists())
+
+    def test_tampered_boot_binding_fails(self):
+        stage, result = self.prepare_guest_attempt("tamper boot")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        original = json.loads((stage / "contract.json").read_text())
+        for case in ("missing", "hash", "osrelease", "extra_field", "bytes"):
+            with self.subTest(case=case):
+                value = json.loads(json.dumps(original))
+                (stage / "inputs/boot-config").write_bytes(b"CONFIG_CONTROLLED_GUEST=y\n")
+                if case == "missing": value["bindings"].pop("inputs/boot-config")
+                elif case == "hash": value["guest_boot_config"]["sha256"] = "0" * 64
+                elif case == "osrelease": value["expected_osrelease"] = "6.6.157"
+                elif case == "extra_field": value["guest_boot_config"]["ignore"] = True
+                else: (stage / "inputs/boot-config").write_bytes(b"changed")
+                (stage / "contract.json").write_text(json.dumps(value))
+                verify = command(sys.executable, "-I", str(CHECKER), "--verify-inputs", str(stage),
+                    "--contract", str(stage / "contract.json"))
+                self.assertEqual(verify.returncode, 1, verify.stdout + verify.stderr)
+
+    def test_guest_object_dispatch_uses_real_nonroot_identity(self):
+        account = pwd.getpwuid(os.getuid())
+        with mock.patch.dict(os.environ, {"SUDO_UID": "0", "SUDO_GID": "0", "SUDO_USER": "root"}):
+            stage, result = self.prepare_guest_attempt("real caller")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        identity = json.loads((stage / "contract.json").read_text())["run_identity"]
+        self.assertEqual(identity, {"uid": os.getuid(), "gid": os.getgid(), "user": account.pw_name})
+        validate = CHECKER_MOD["validate_run_identity"]
+        self.assertEqual(validate(identity).pw_uid, os.getuid())
+        for change in ({"uid": 0}, {"uid": True}, {"gid": 0}, {"user": "root"}, {"user": "p11scope-missing-account"}, {"extra": 1}):
+            with self.subTest(change=change), self.assertRaises(CHECKER_MOD["Invalid"]):
+                validate(identity | change)
+
+    def test_guest_local_outputs_copy_bytes_without_9p_metadata(self):
+        copy_tree = CHECKER_MOD["copy_guest_tree"]
+        source = self.base / "retired public"; source.mkdir()
+        (source / "fix").mkdir()
+        (source / "fix/gated").write_bytes(b"controlled executable\x00bytes")
+        (source / "fix/gated").chmod(0o755)
+        (source / "results.jsonl").write_text(json.dumps({"cell": "fifo-refused", "pass": True}) + "\n")
+        os.mkfifo(source / "fifo")
+        dest = self.base / "9p destination"
+        # Unsupported metadata operations must not be attempted by the actual copier.
+        with mock.patch.object(shutil, "copystat", side_effect=OSError("9p metadata refused")):
+            copy_tree(source, dest, "public")
+        self.assertEqual((dest / "fix/gated").read_bytes(), (source / "fix/gated").read_bytes())
+        self.assertEqual(stat.S_IMODE((dest / "fix/gated").stat().st_mode), 0o755)
+        self.assertFalse((dest / "fifo").exists())
+        self.assertTrue(stat.S_ISFIFO((source / "fifo").stat().st_mode))
+        native = self.base / "retired native"; (native / "c8-wl.owned/gates").mkdir(parents=True)
+        os.mkfifo(native / "c8-wl.owned/gates/release")
+        (native / "report.json").write_bytes(b"native bytes")
+        copy_tree(native, self.base / "native export", "native")
+        self.assertEqual((self.base / "native export/report.json").read_bytes(), b"native bytes")
+        for case in ("unproved_fifo", "unknown_fifo", "symlink", "extra_destination", "copy_changed", "copy_failed", "copy_missing"):
+            with self.subTest(case=case):
+                target = self.base / ("refuse copy " + case)
+                if case == "unproved_fifo": (source / "results.jsonl").write_text('{"cell":"fifo-refused","pass":false}\n')
+                elif case == "unknown_fifo": os.mkfifo(source / "unknown")
+                elif case == "symlink": (source / "link").symlink_to("fix/gated")
+                elif case == "extra_destination": target.mkdir(); (target / "unexpected").write_text("foreign")
+                with self.assertRaises((CHECKER_MOD["Invalid"], OSError)):
+                    if case == "copy_changed":
+                        with mock.patch.object(shutil, "copyfileobj", side_effect=lambda src, dst, length: dst.write(b"changed")):
+                            copy_tree(source, target, "public")
+                    elif case == "copy_failed":
+                        with mock.patch.object(shutil, "copyfileobj", side_effect=OSError("copy failed")):
+                            copy_tree(source, target, "public")
+                    elif case == "copy_missing":
+                        def disappear(src, dst, length):
+                            dst.write(src.read()); (source / "results.jsonl").unlink()
+                        with mock.patch.object(shutil, "copyfileobj", side_effect=disappear):
+                            copy_tree(source, target, "public")
+                    else: copy_tree(source, target, "public")
+                (source / "results.jsonl").write_text('{"cell":"fifo-refused","pass":true}\n')
+                (source / "unknown").unlink(missing_ok=True); (source / "link").unlink(missing_ok=True)
+
+    def test_guest_work_root_requires_trusted_local_disk(self):
+        validate = CHECKER_MOD["validate_guest_work_root"]
+        root = self.base / "local disk"; root.mkdir(); root.chmod(0o711)
+        result = subprocess.CompletedProcess([], 0, "btrfs\n", "")
+        with mock.patch.object(subprocess, "run", return_value=result):
+            self.assertEqual(validate(root), root)
+            with mock.patch.object(os, "getuid", return_value=0):
+                self.assertEqual(validate(root, pwd.getpwuid(root.stat().st_uid).pw_uid), root)
+        for filesystem in ("9p", "virtiofs", "tmpfs", "nfs4", "unknown", "btrfs\n9p"):
+            with self.subTest(filesystem=filesystem), mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, filesystem, "")):
+                with self.assertRaises(CHECKER_MOD["Invalid"]): validate(root)
+        with mock.patch.object(subprocess, "run", return_value=result):
+            for case in ("writable", "symlink", "missing", "full"):
+                with self.subTest(case=case):
+                    path = root
+                    if case == "writable": root.chmod(0o777)
+                    elif case == "symlink": path = self.base / "disk alias"; path.symlink_to(root)
+                    elif case == "missing": path = self.base / "absent disk"
+                    with self.assertRaises((CHECKER_MOD["Invalid"], OSError)):
+                        if case == "full":
+                            with mock.patch.object(shutil, "disk_usage", return_value=shutil._ntuple_diskusage(1, 1, 0)): validate(path)
+                        else: validate(path)
+                    root.chmod(0o711)
+
+    def test_module_discovery_preserves_explicit_elf_and_refuses_missing_or_wrong_abi(self):
+        select = CHECKER_MOD["select_module"]
+        module = self.base / "explicit non-Debian module.so"
+        header = bytearray(64); header[:6] = b"\x7fELF\x02\x01"; struct.pack_into("<H", header, 18, 62)
+        module.write_bytes(header)
+        self.assertEqual(select(str(module)), module)
+        with mock.patch.object(os, "getuid", return_value=0):
+            self.assertEqual(select(str(module)), module)
+        for case in ("missing", "wrong_abi", "non_elf"):
+            with self.subTest(case=case), self.assertRaises((CHECKER_MOD["Invalid"], OSError)):
+                if case == "missing": select(str(self.base / "missing module"))
+                elif case == "wrong_abi":
+                    value = bytearray(header); value[4] = 1; module.write_bytes(value); select(str(module))
+                else: module.write_bytes(b"not ELF"); select(str(module))
+        module.write_bytes(header)
+        actual_resolve = Path.resolve
+        selected = Path("/usr/lib64/softhsm/libsofthsm2.so")
+        def exists(path): return True if path == selected else False
+        def resolve(path, **kwargs): return module if path == selected else actual_resolve(path, **kwargs)
+        with mock.patch.object(Path, "exists", exists), mock.patch.object(Path, "resolve", resolve):
+            self.assertEqual(select(), module)
 
     def test_object_inputs_bind_actual_build_mode_abi_and_sources(self):
         for mode, bits in (("full", 32), ("full", 64), ("p0", 32), ("p0", 64)):
@@ -594,6 +788,18 @@ class MatrixContract(unittest.TestCase):
                 self.assertEqual(command(sys.executable, "-I", str(CHECKER), "--verify-inputs", str(stage),
                     "--contract", str(stage / "contract.json")).returncode, 1)
                 self.assertEqual(len(missing), 64)
+
+    def test_guest_root_verifies_bound_caller_owned_object_inputs(self):
+        bundle, facts = self.canary_inputs()
+        stage = self.base / "caller owned guest inputs"
+        result = self.prepare_object_inputs(stage, [("full", 64, bundle)])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        with mock.patch.object(os, "getuid", return_value=0):
+            # The generic producer/prebuilt path must not trust an unrelated UID.
+            with self.assertRaises(CHECKER_MOD["Invalid"]):
+                CHECKER_MOD["validate_canary_payloads"](stage / "artifacts/canary/full-64", 64)
+            contract = CHECKER_MOD["verify_inputs"](stage, stage / "contract.json")
+        self.assertEqual(contract["run_identity"]["uid"], pwd.getpwnam(contract["run_identity"]["user"]).pw_uid)
 
     def test_object_input_mutations_refuse_before_contract_publication(self):
         bundle, original = self.canary_inputs()
@@ -688,7 +894,7 @@ class MatrixContract(unittest.TestCase):
             with self.subTest(mutation=mutation):
                 self.candidate.write_text(json.dumps(dict(original, **mutation)) + "\n")
                 result = command(sys.executable, "-I", str(CHECKER), "--prepare", str(self.base / ("invalid-build-" + str(index))),
-                                 "--lane", "host", "--bin-dir", str(self.bins), "--binary-list", str(self.listing),
+                                 "--lane", "host", "--kernel", "host", "--bin-dir", str(self.bins), "--binary-list", str(self.listing),
                                  "--curation", str(self.curation), "--bpfmulti-list", str(self.bm_list),
                                  "--candidate-receipt", str(self.candidate), "--lib-test", LIB_A)
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
@@ -702,7 +908,7 @@ class MatrixContract(unittest.TestCase):
         self.listing.write_text(CHURN + ": test\n")
         self.curation.write_text(f"default (1)\n{CHURN}\nlong (0, --include-long only)\nskipped (0)\nverify: curation matches the binary (1 tests)\n")
         stage = self.base / "compiled-root-stage"
-        result = command(sys.executable, "-I", str(CHECKER), "--prepare", str(stage), "--lane", "host",
+        result = command(sys.executable, "-I", str(CHECKER), "--prepare", str(stage), "--lane", "host", "--kernel", "host",
                          "--bin-dir", str(self.bins), "--binary-list", str(self.listing), "--curation", str(self.curation),
                          "--bpfmulti-list", str(self.bm_list), "--candidate-receipt", str(receipt), "--lib-test", CHURN)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -889,7 +1095,7 @@ class MatrixContract(unittest.TestCase):
         result = self.judge()
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
 
-    def test_generated_guest_executes_mt12_exact_selectors_and_fails_bad_evidence(self):
+    def generated_guest(self, lane="host", controls=None):
         # Only external operations are controlled. The generated guest script,
         # contract sealing and judge are the production bytes and entrypoints.
         repo = self.base / "controlled-source"
@@ -899,6 +1105,14 @@ class MatrixContract(unittest.TestCase):
         for name in ("qualify-public-cli.sh", "qualify-inventory-native.sh", "run-privileged-lib-tests.sh"):
             path = repo / "scripts" / name
             path.write_text("#!/bin/bash\nprintf '%s\\n' \"$THREADS\" \"$@\" > \"$CONTROL_ARGS/" + name + ".args\"\necho 'SUMMARY pass=1 fail=0 skipped=0'\nexit 0\n" if name == "qualify-public-cli.sh" else "#!/bin/bash\nprintf '%s\\n' \"$@\" > \"$CONTROL_ARGS/" + name + ".args\"\necho 'SUMMARY pass=1 fail=0 skipped=0'\nexit 0\n")
+            text = path.read_text()
+            if name == "qualify-public-cli.sh":
+                body = "mkdir -p \"$2\"\nprintf '%s\\n' '{\"cell\":\"fifo-refused\",\"pass\":true}' > \"$2/results.jsonl\"\nmkfifo \"$2/fifo\"\nprintf 'public bytes' > \"$2/regular.txt\"\n"
+            elif name == "qualify-inventory-native.sh":
+                body = "mkdir -p \"$5/c8-wl.owned/gates\"\nmkfifo \"$5/c8-wl.owned/gates/release\"\nprintf 'native bytes' > \"$5/regular.txt\"\n: > \"$5/empty.log\"\n"
+            else:
+                body = "mkdir -p \"$2\"\nprintf 'controlled lib output' > \"$2/results.txt\"\n"
+            path.write_text(text.replace("exit 0\n", body + "exit 0\n"))
             path.chmod(0o755)
         for name in ("scripts/inventory-native-oracle.py", "scripts/mapped-provider-pin.py",
                      "tests/fixtures/public-cli/gated.c", "tests/fixtures/public-cli/mt.c",
@@ -910,9 +1124,16 @@ class MatrixContract(unittest.TestCase):
             path.write_text("#!/bin/bash\nprintf '%s\\n' \"$@\" > \"$CONTROL_ARGS/" + name + ".args\"\necho controlled\nexit 0\n")
             path.chmod(0o755)
         stage = self.base / "guest-stage"
+        guest_disk = self.base / "guest disk"; guest_disk.mkdir(mode=0o711)
+        boot = self.base / "fake guest boot"; boot.mkdir()
+        kernel = "host"
+        if lane != "host":
+            kernel = str(boot / ("vmlinuz-" + lane)); Path(kernel).write_text("not booted")
+            (boot / ("config-" + lane)).write_text("CONFIG_OWNED_GUEST=y\n")
         receipt = candidate_receipt(self.bins, self.base / "guest-build.json", repo)
         result = command(sys.executable, "-I", str(repo / "scripts" / CHECKER.name), "--prepare", str(stage),
-                         "--lane", "host", "--bin-dir", str(self.bins), "--binary-list", str(self.listing),
+                         "--lane", lane, "--kernel", kernel, "--guest-work-root", str(guest_disk),
+                         "--bin-dir", str(self.bins), "--binary-list", str(self.listing),
                          "--curation", str(self.curation), "--bpfmulti-list", str(self.bm_list),
                          "--candidate-receipt", str(receipt),
                          "--lib-test", LIB_A, "--lib-test", LIB_B)
@@ -921,16 +1142,98 @@ class MatrixContract(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         env = os.environ.copy()
         env["CONTROL_ARGS"] = str(self.base)
+        stubs = self.base / "guest external commands"; stubs.mkdir()
+        stub_sources = {
+            "id": "#!/bin/sh\n[ \"$1\" != -u ] || { echo 0; exit 0; }; exec /usr/bin/id \"$@\"\n",
+            "runuser": "#!/usr/bin/python3\nimport os,subprocess,sys\na=sys.argv[1:]; assert a[:3]==['-u',os.environ['CONTROL_USER'],'--']; a=a[3:]\nwith open(os.environ['CONTROL_ARGS']+'/account-commands','a') as f: f.write(' '.join(a)+'\\n')\nif a==['sudo','-n','true']: sys.exit(int(os.environ.get('CONTROL_SUDO_EXIT','0')))\nif a==['id','-u'] and os.environ.get('CONTROL_EFFECTIVE_UID'): print(os.environ['CONTROL_EFFECTIVE_UID']);sys.exit(0)\nif a[:1]==['id']: a[0]='/usr/bin/id'\nif a[:1]==['test'] and (os.environ.get('CONTROL_ACCESS_FAIL')=='all' or (os.environ.get('CONTROL_ACCESS_FAIL')=='private' and a[-1].endswith('/caller'))): sys.exit(1)\nsys.exit(subprocess.run(a).returncode)\n",
+            "findmnt": "#!/bin/sh\nprintf '%s\\n' \"${CONTROL_FILESYSTEM:-btrfs}\"\n",
+            "uname": "#!/bin/sh\nprintf '%s\\n' \"$CONTROL_UNAME\"\n",
+            "cp": "#!/usr/bin/python3\nimport os,shutil,sys\na=sys.argv[1:]; assert a[0]=='--'; source,dest=a[1:]; assert dest.startswith('/boot/config-')\nwith open(os.environ['CONTROL_ARGS']+'/boot-installs','a') as f: f.write(dest+'\\n')\nshutil.copyfile(source,os.environ['CONTROL_BOOT']+'/'+dest.rsplit('/',1)[1])\n",
+            "sha256sum": "#!/usr/bin/python3\nimport hashlib,os,pathlib,sys\na=sys.argv[1:]; p=a[-1]; assert p.startswith('/boot/config-')\nprint(hashlib.sha256(pathlib.Path(os.environ['CONTROL_BOOT'],p.rsplit('/',1)[1]).read_bytes()).hexdigest()+'  '+p)\n",
+        }
+        for name in ("gcc", "clang", "cargo", "rustc"):
+            stub_sources[name] = "#!/bin/sh\necho compiler-invoked >&2\nexit 97\n"
+        for name, text in stub_sources.items():
+            path = stubs / name; path.write_text(text); path.chmod(0o755)
+        module = self.base / "controlled-module.so"
+        header = bytearray(64); header[:6] = b"\x7fELF\x02\x01"; struct.pack_into("<H", header, 18, 62)
+        module.write_bytes(header)
+        env.update(PATH=str(stubs) + ":" + env["PATH"], CONTROL_USER=pwd.getpwuid(os.getuid()).pw_name,
+                   CONTROL_UNAME=lane if lane != "host" else "controlled-host", CONTROL_BOOT=str(boot), MODULE=str(module))
+        env.update(controls or {})
         run = subprocess.run(["bash", str(stage / "inner.sh")], cwd=ROOT,
                              capture_output=True, text=True, env=env, timeout=20)
         retain_command(["bash", str(stage / "inner.sh")], run)
         self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
+        self.assertNotIn("compiler-invoked", run.stdout + run.stderr)
+        return stage, boot, run, env
+
+    def test_generated_guest_executes_mt12_exact_selectors_and_fails_bad_evidence(self):
+        self.generated_guest()
         public_args = (self.base / "qualify-public-cli.sh.args").read_text().splitlines()
         self.assertEqual(public_args[0], "12")
         privileged_args = (self.base / "run-privileged-lib-tests.sh.args").read_text().splitlines()
         self.assertEqual(privileged_args[2:], ["--include-long", LIB_A, LIB_B])
         self.assertEqual((self.base / "p11scope-bpfmulti.args").read_text().splitlines(),
                          ["--exact", PID_TEST, "--test-threads=1", "--nocapture"])
+
+    def test_inner_renders_guest_boot_install_for_guest_lane(self):
+        stage, boot, run, env = self.generated_guest("6.1.188")
+        self.assertEqual((self.base / "boot-installs").read_text(), "/boot/config-6.1.188\n")
+        self.assertEqual((boot / "config-6.1.188").read_text(), "CONFIG_OWNED_GUEST=y\n")
+        self.assertTrue((self.base / "qualify-public-cli.sh.args").is_file(), run.stdout + run.stderr)
+        body = (stage / "inner.sh").read_text()
+        self.assertIn(str(stage / "artifacts/source"), body)
+        self.assertNotIn(str(self.base / "controlled-source/scripts/run-privileged-lib-tests.sh"), body)
+
+    def test_inner_leaves_host_boot_untouched(self):
+        self.generated_guest()
+        self.assertFalse((self.base / "boot-installs").exists())
+
+    def test_generated_guest_copies_retired_fifo_trees_without_metadata(self):
+        stage, boot, run, env = self.generated_guest()
+        local = Path(json.loads((stage / "guest-work.json").read_text())["work"])
+        self.assertTrue(local.is_relative_to(self.base / "guest disk"))
+        self.assertFalse(local.is_relative_to(stage))
+        for name in ("c8-native", "c8-scan"):
+            self.assertEqual(stat.S_IMODE((local / name).stat().st_mode), 0o711)
+            self.assertEqual((stage / name / "regular.txt").read_bytes(), b"native bytes")
+            self.assertEqual((stage / name / "empty.log").read_bytes(), b"")
+            self.assertTrue(stat.S_ISFIFO((local / name / "c8-wl.owned/gates/release").stat().st_mode))
+            self.assertFalse((stage / name / "c8-wl.owned/gates/release").exists())
+        self.assertEqual(stat.S_IMODE((local / "caller").stat().st_mode), 0o700)
+        self.assertEqual((local / "caller").stat().st_uid, os.getuid())
+        self.assertEqual((stage / "cells/regular.txt").read_bytes(), b"public bytes")
+        self.assertFalse((stage / "cells/fifo").exists())
+
+    def test_vng_guest_gets_boot_overlay_and_kernel_binding(self):
+        body = RUNNER.read_text().split("run_one() {", 1)[1].split("\noverall=", 1)[0]
+        self.assertIn('--kernel "$k" --guest-work-root "$GUEST_WORK_ROOT"', body)
+        host, guest = body.split('if [ "$k" = host ]; then', 1)[1].split("\n  else\n", 1)
+        self.assertNotIn("--overlay-rwdir", host)
+        self.assertIn('--rwdir "$stage" --overlay-rwdir /boot', guest)
+
+    def test_generated_guest_refuses_bad_identity_sudo_storage_and_kernel_before_workloads(self):
+        stage, boot, run, env = self.generated_guest("6.1.188")
+        original = json.loads((stage / "contract.json").read_text())
+        for case in ("account", "root", "effective_uid", "sudo", "access", "private", "9p", "tmpfs", "overlap", "kernel"):
+            with self.subTest(case=case):
+                for path in self.base.glob("*.args"): path.unlink()
+                value = json.loads(json.dumps(original)); current = env.copy()
+                if case == "account": value["run_identity"]["user"] = "p11scope-missing-account"
+                elif case == "root": value["run_identity"]["uid"] = 0
+                elif case == "sudo": current["CONTROL_SUDO_EXIT"] = "1"
+                elif case == "effective_uid": current["CONTROL_EFFECTIVE_UID"] = "0"
+                elif case == "access": current["CONTROL_ACCESS_FAIL"] = "all"
+                elif case == "private": current["CONTROL_ACCESS_FAIL"] = "private"
+                elif case == "overlap": value["guest_work_root"] = str(stage / "artifacts")
+                elif case in ("9p", "tmpfs"): current["CONTROL_FILESYSTEM"] = case
+                else: current["CONTROL_UNAME"] = "foreign-release"
+                (stage / "contract.json").write_text(json.dumps(value))
+                result = subprocess.run(["bash", str(stage / "inner.sh")], text=True, capture_output=True, env=current, timeout=20)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertEqual(list(self.base.glob("*.args")), [])
+        (stage / "contract.json").write_text(json.dumps(original))
 
     def test_generated_guest_refuses_tolerance_before_any_workload(self):
         self.test_generated_guest_executes_mt12_exact_selectors_and_fails_bad_evidence()
@@ -1012,7 +1315,7 @@ class MatrixContract(unittest.TestCase):
 
     def preparation_rejected(self):
         result = command(sys.executable, "-I", str(CHECKER), "--prepare", str(self.base / "invalid-stage"),
-                         "--lane", "6.1.188", "--bin-dir", str(self.bins),
+                         "--lane", "6.1.188", "--kernel", str(self.kernel), "--bin-dir", str(self.bins),
                          "--binary-list", str(self.listing), "--curation", str(self.curation),
                          "--bpfmulti-list", str(self.bm_list), "--candidate-receipt", str(self.candidate),
                          "--lib-test", LIB_A, "--lib-test", LIB_B)
@@ -1021,7 +1324,7 @@ class MatrixContract(unittest.TestCase):
     def test_qualifying_selected_subset_may_pass_only_its_claim(self):
         fresh = self.base / "subset"
         result = command(sys.executable, "-I", str(CHECKER), "--prepare", str(fresh),
-                         "--lane", "6.1.188", "--bin-dir", str(self.bins),
+                         "--lane", "6.1.188", "--kernel", str(self.kernel), "--bin-dir", str(self.bins),
                          "--binary-list", str(self.listing), "--curation", str(self.curation),
                          "--bpfmulti-list", str(self.bm_list), "--lib-test", LIB_A,
                          "--candidate-receipt", str(self.candidate),

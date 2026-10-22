@@ -11,11 +11,15 @@ ORACLE=$HERE/public-cli-oracle.py
 CONTROL=0
 CONTROL_KIND=gated
 if [ "${1:-}" = --control-gated ]; then CONTROL=1; shift
-elif [ "${1:-}" = --control-second-sigint ]; then CONTROL=1; CONTROL_KIND=signal; shift; fi
+elif [ "${1:-}" = --control-second-sigint ]; then CONTROL=1; CONTROL_KIND=signal; shift
+elif [ "${1:-}" = --control-fifo ]; then CONTROL=1; CONTROL_KIND=fifo; shift; fi
 if [ "$CONTROL" = 1 ]; then
   if [ "$CONTROL_KIND" = signal ]; then
     [ $# = 2 ] || exit 64
     CONTROL_CELL=second-sigint
+  elif [ "$CONTROL_KIND" = fifo ]; then
+    [ $# = 3 ] || exit 64
+    CONTROL_CELL=fifo-refused
   else
     [ $# -ge 3 ] && [ $# -le 4 ] || exit 64
     CONTROL_CELL=${4:-profile-pid}
@@ -26,17 +30,28 @@ else
 fi
 P=$(realpath -e -- "$1") || exit 64
 OUT=$2
-MODULE=${MODULE:-/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so}
 RUNUID=${RUNUID:-1000}; RUNGID=${RUNGID:-1000}
 ITERS=${ITERS:-500}; THREADS=${THREADS:-12}
 if [ "$CONTROL" = 1 ]; then
-  if [ "$CONTROL_KIND" = gated ]; then GATED=$(realpath -e -- "$3") || exit 64; fi
+  MODULE=${MODULE:-/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so}
+  if [ "$CONTROL_KIND" != signal ]; then GATED=$(realpath -e -- "$3") || exit 64; fi
   READY_TICKS=10; LEDGER_TICKS=10; EXIT_TICKS=20
 else
   [ "$(id -u)" = 0 ] || { echo 'must run as root' >&2; exit 64; }
+  MODULE_ARGS=(); [ -z "${MODULE+x}" ] || MODULE_ARGS=(--module "$MODULE")
+  MODULE=$(python3 -I "$HERE/release-matrix-contract.py" --select-module "${MODULE_ARGS[@]}") || exit 64
   READY_TICKS=1800; LEDGER_TICKS=600; EXIT_TICKS=1800
 fi
 mkdir -p "$OUT" && chmod 755 "$OUT" && OUT=$(realpath -e -- "$OUT") && cd "$OUT" || exit 64
+LOCAL_OUTPUT=$OUT
+if [ -n "${P11SCOPE_LOCAL_OUTPUT_ROOT:-}" ]; then
+  LOCAL_OUTPUT=$(python3 -I "$HERE/release-matrix-contract.py" --check-work-root "$P11SCOPE_LOCAL_OUTPUT_ROOT") || exit 64
+fi
+product_output() { printf '%s/%s\n' "$LOCAL_OUTPUT" "$1"; }
+publish_output() {
+  [ "$LOCAL_OUTPUT" != "$OUT" ] || return 0
+  python3 -I "$HERE/release-matrix-contract.py" --copy-file "$LOCAL_OUTPUT/$1" "$OUT/$1"
+}
 : > results.jsonl
 # PID generations limit cleanup to children created in this invocation.
 declare -A CHILDREN
@@ -122,6 +137,8 @@ gated() {
   local gate=$OUT/$cell.gate ext=json
   [ "$cell" = trace-pid ] && ext=txt
   rm -f -- "$gate" "$cell.$ext" "$cell.wl" "$cell.stderr" "$cell.stdout" "$cell.receipt.json"
+  local output; output=$(product_output "$cell.$ext")
+  [ "$LOCAL_OUTPUT" = "$OUT" ] || rm -f -- "$output"
   local before after gen='' readygen='' wl pp='' ready=0 capturing=0 released=0 observer_rc=125 workload_rc=125
   before=$(pin) || { result "$cell" 0 'provider pin failed' failed; return 1; }
   if [ "$cell" = mt-exact ]; then
@@ -133,6 +150,7 @@ gated() {
   if waitfor "$cell.wl" "^READY pid=$wl$" "$wl" "$READY_TICKS"; then
     ready=1; readygen=$(generation "$wl")
     local args=("${@//@PID@/$wl}")
+    for ((i=0;i<${#args[@]}-1;i++)); do [ "${args[$i]}" != -o ] || args[$((i+1))]=$output; done
     "$P" "${args[@]}" > "$cell.stdout" 2> "$cell.stderr" & pp=$!; register "$pp" || true
     if waitfor "$cell.stderr" 'p11scope: capturing:' "$pp" "$READY_TICKS" && alive "$wl" && alive "$pp"; then
       capturing=1
@@ -152,6 +170,7 @@ gated() {
   fi
   after=$(pin) || after='null'
   receipt || { result "$cell" 0 'receipt publication failed' failed; return 1; }
+  publish_output "$cell.$ext" || { result "$cell" 0 'output copy failed' failed; return 1; }
   judge "$cell.$ext" "$cell.wl" "$cell.receipt.json" "$cell"
 }
 summary() {
@@ -207,12 +226,14 @@ register_owned_descendants() {
 }
 second_sigint() {
   local pp child='' rc=125 custody=0 cleanup_ok=1 pid
+  local output; output=$(product_output sigint2.json)
   rm -f sigint2.json second-child.pid
+  [ "$LOCAL_OUTPUT" = "$OUT" ] || rm -f -- "$output"
   : > second-child.pid
   if [ "$CONTROL" = 0 ]; then chown "$RUNUID:$RUNGID" second-child.pid; fi
   chmod 600 second-child.pid
   # shellcheck disable=SC2016
-  env --default-signal=INT SUDO_UID="$RUNUID" SUDO_GID="$RUNGID" "$P" run -o "$OUT/sigint2.json" -- sh -c 'echo $$ > "$1"; trap "" INT TERM; exec sleep 60' sh "$OUT/second-child.pid" > sig2.stdout 2> sig2.stderr & pp=$!; register "$pp" || true
+  env --default-signal=INT SUDO_UID="$RUNUID" SUDO_GID="$RUNGID" "$P" run -o "$output" -- sh -c 'echo $$ > "$1"; trap "" INT TERM; exec sleep 60' sh "$OUT/second-child.pid" > sig2.stdout 2> sig2.stderr & pp=$!; register "$pp" || true
   if waitfor sig2.stderr 'p11scope: capturing:' "$pp" "$READY_TICKS" && await_signal_child second-child.pid "$pp"; then
     child=$CUSTODY_CHILD; custody=1
     sleep 1; kill -INT "$pp"; sleep 1; kill -INT "$pp"
@@ -226,10 +247,23 @@ second_sigint() {
   for pid in "${!CHILDREN[@]}"; do
     terminate "$pid" || cleanup_ok=0
   done
+  publish_output sigint2.json || cleanup_ok=0
   result second-sigint "$([ "$custody" = 1 ] && [ "$cleanup_ok" = 1 ] && [ "$rc" = 130 ] && grep -qa 'p11scope: cleanup incomplete' sig2.stderr && ! grep -qa panicked sig2.stderr && python3 -c 'import json; json.load(open("sigint2.json"))' 2>/dev/null && echo 1 || echo 0)" "rc=$rc child_custody=$custody child=${child:-unknown} cleanup_complete=$cleanup_ok"
+}
+fifo_refused() {
+  local wl rc=125
+  rm -f fifo; mkfifo fifo || return 1
+  asuser "$GATED" "$MODULE" 100000000 1000 - > fifo.wl 2>&1 & wl=$!; register "$wl" || true
+  if waitfor fifo.wl '^READY pid=' "$wl" "$READY_TICKS"; then
+    # This negative must keep the actual FIFO destination, even in local-output mode.
+    timeout 60 "$P" profile --pid "$wl" --duration 2 -o "$OUT/fifo" > fifo.stdout 2> fifo.stderr; rc=$?
+  fi
+  terminate "$wl"
+  result fifo-refused "$([ "$rc" != 0 ] && [ "$rc" != 125 ] && [ "$rc" != 124 ] && [ -p fifo ] && grep -qai 'fifo\|not a regular\|refus' fifo.stderr && echo 1 || echo 0)" "rc=$rc"
 }
 if [ "$CONTROL" = 1 ]; then
   if [ "$CONTROL_KIND" = signal ]; then second_sigint
+  elif [ "$CONTROL_KIND" = fifo ]; then fifo_refused
   else gated "$CONTROL_CELL" pid "$GATED" profile --pid @PID@ --duration 1 -o "$OUT/$CONTROL_CELL.json"; fi
   summary "$CONTROL_CELL"; exit $?
 fi
@@ -266,9 +300,11 @@ gated trace-pid pid "$GATED" trace --pid @PID@ --duration 12 -o "$OUT/trace-pid.
 for cell in run-short run-cover; do
   n=3; [ "$cell" = run-cover ] && n=2000
   rm -f -- "$cell.json" "$cell.wl" "$cell.stderr" "$cell.stdout"
+  output=$(product_output "$cell.json"); [ "$LOCAL_OUTPUT" = "$OUT" ] || rm -f -- "$output"
   before=$(pin) || before=null
-  SUDO_UID=$RUNUID SUDO_GID=$RUNGID "$P" run --pause auto -o "$OUT/$cell.json" -- "$GATED" "$MODULE" "$n" 0 - > "$cell.stdout" 2> "$cell.stderr" & pp=$!; register "$pp" || true
+  SUDO_UID=$RUNUID SUDO_GID=$RUNGID "$P" run --pause auto -o "$output" -- "$GATED" "$MODULE" "$n" 0 - > "$cell.stdout" 2> "$cell.stderr" & pp=$!; register "$pp" || true
   if finish "$pp" "$EXIT_TICKS"; then rc=$LAST_EXIT; else rc=124; fi
+  publish_output "$cell.json" || rc=1
   # run does not expose a separately authenticated fixture PID/exit/readiness
   # channel here. Validate the available smoke assertion without fabricating it.
   if [ "$rc" = 0 ] && python3 - "$cell.json" <<'PY'
@@ -283,10 +319,11 @@ gated mt-exact pid "$MT" profile --pid @PID@ --duration 25 -o "$OUT/mt-exact.jso
 gated system system "$GATED" profile --system --module "$MODULE" --duration 25 -o "$OUT/system.json"
 # Signal cells retain distinct expected exits; readiness is mandatory.
 rm -f sigint.json sig.gate
+output=$(product_output sigint.json); [ "$LOCAL_OUTPUT" = "$OUT" ] || rm -f -- "$output"
 asuser "$GATED" "$MODULE" 100000000 1000 "$OUT/sig.gate" > sig.wl 2>&1 & wl=$!; register "$wl" || true
 rc=125
 if waitfor sig.wl '^READY pid=' "$wl" "$READY_TICKS"; then
-  env --default-signal=INT "$P" profile --pid "$wl" --duration 120 -o "$OUT/sigint.json" > sig.stdout 2> sig.stderr & pp=$!; register "$pp" || true
+  env --default-signal=INT "$P" profile --pid "$wl" --duration 120 -o "$output" > sig.stdout 2> sig.stderr & pp=$!; register "$pp" || true
   if waitfor sig.stderr 'p11scope: capturing:' "$pp" "$READY_TICKS" && alive "$wl"; then
     touch sig.gate; sleep 1; kill -INT "$pp"
     if finish "$pp" "$EXIT_TICKS"; then rc=$LAST_EXIT; else rc=124; fi
@@ -294,15 +331,9 @@ if waitfor sig.wl '^READY pid=' "$wl" "$READY_TICKS"; then
   [ -n "${CHILDREN[$pp]:-}" ] && terminate "$pp"
 fi
 terminate "$wl"
+publish_output sigint.json || rc=1
 result sigint "$([ "$rc" = 0 ] && python3 -c 'import json; json.load(open("sigint.json"))' 2>/dev/null && echo 1 || echo 0)" "rc=$rc"
 second_sigint
-rm -f fifo; mkfifo fifo
-asuser "$GATED" "$MODULE" 100000000 1000 - > fifo.wl 2>&1 & wl=$!; register "$wl" || true
-rc=125
-if waitfor fifo.wl '^READY pid=' "$wl" "$READY_TICKS"; then
-  timeout 60 "$P" profile --pid "$wl" --duration 2 -o "$OUT/fifo" > fifo.stdout 2> fifo.stderr; rc=$?
-fi
-terminate "$wl"
-result fifo-refused "$([ "$rc" != 0 ] && [ "$rc" != 125 ] && [ "$rc" != 124 ] && [ -p fifo ] && grep -qai 'fifo\|not a regular\|refus' fifo.stderr && echo 1 || echo 0)" "rc=$rc"
+fifo_refused
 summary doctor profile-pid names-pid verdict-pid metrics-pid trace-pid run-short run-cover mt-exact system sigint second-sigint fifo-refused
 exit $?

@@ -10,6 +10,7 @@ import mmap
 import os
 from pathlib import Path
 import runpy
+import stat
 import subprocess
 import struct
 import sys
@@ -564,7 +565,8 @@ while True: time.sleep(.02)
 FAKE_OBSERVER = '''#!/usr/bin/python3
 import hashlib,json,os,pathlib,signal,sys,time
 ''' + FAKE_MAPPING + '''
-out=pathlib.Path(sys.argv[sys.argv.index('-o')+1]); root=out.parent
+out=pathlib.Path(sys.argv[sys.argv.index('-o')+1]); root=pathlib.Path(os.environ.get('CONTROL_OUT',str(out.parent)))
+(root / 'selected-output.json').write_text(json.dumps(str(out)))
 (root / 'observer.pid').write_text(str(os.getpid()))
 mode=os.environ['CONTROL_MODE']
 if mode=='exits-before-ready': sys.exit(17)
@@ -590,7 +592,8 @@ out.write_text(json.dumps(report))
 
 FAKE_SIGNAL_PARENT = '''#!/usr/bin/python3
 import json,os,pathlib,signal,subprocess,sys,time
-out=pathlib.Path(sys.argv[sys.argv.index('-o')+1]);root=out.parent
+out=pathlib.Path(sys.argv[sys.argv.index('-o')+1]);root=pathlib.Path(os.environ.get('CONTROL_OUT',str(out.parent)))
+(root/'selected-output.json').write_text(json.dumps(str(out)))
 self_stat=pathlib.Path('/proc/self/stat').read_text().rsplit(') ',1)[1].split()
 (root/'signal-parent.json').write_text(json.dumps({'pid':os.getpid(),'generation':int(self_stat[19])}))
 received=0
@@ -617,13 +620,15 @@ sys.exit(130)
 
 
 class SignalCustodyTests(unittest.TestCase):
-    def control(self, mode, want):
+    def control(self, mode, want, *, local_output=False):
         with tempfile.TemporaryDirectory() as raw:
             tmp=Path(raw);observer=tmp/'observer';out=tmp/'out';out.mkdir()
             observer.write_text(FAKE_SIGNAL_PARENT);observer.chmod(0o700)
             sentinel=subprocess.Popen([sys.executable,'-I','-c','import time; time.sleep(20)'])
             env=dict(os.environ,CONTROL_SIGNAL_MODE=mode,CONTROL_UNRELATED_PID=str(sentinel.pid),
-                     RUNUID=str(os.getuid()),RUNGID=str(os.getgid()))
+                     RUNUID=str(os.getuid()),RUNGID=str(os.getgid()),CONTROL_OUT=str(out))
+            local=tmp/'local disk';local.mkdir(mode=0o700)
+            if local_output: env['P11SCOPE_LOCAL_OUTPUT_ROOT']=str(local)
             try:
                 args=['bash',str(SHELL),'--control-second-sigint',str(observer),str(out)]
                 proc=subprocess.run(args,env=env,text=True,capture_output=True,timeout=9)
@@ -632,6 +637,10 @@ class SignalCustodyTests(unittest.TestCase):
                 self.assertEqual(len(rows),1,rows)
                 self.assertEqual(rows[0]['cell'],'second-sigint')
                 self.assertEqual(rows[0]['pass'],want==0)
+                if local_output:
+                    selected=Path(json.loads((out/'selected-output.json').read_text()))
+                    self.assertTrue(selected.is_relative_to(local))
+                    self.assertEqual((out/'sigint2.json').read_bytes(), selected.read_bytes())
                 self.assertIsNone(sentinel.poll(),'cleanup killed the unrelated sentinel')
                 path=out/'actual-child.json'
                 if path.exists():
@@ -659,6 +668,9 @@ class SignalCustodyTests(unittest.TestCase):
     def test_r3_delayed_child_pid_has_bounded_owned_cleanup(self):
         self.control('delayed',0)
 
+    def test_guest_signal_output_copies_bytes_after_owned_cleanup(self):
+        self.control('delayed',0,local_output=True)
+
     def test_r3_missing_child_pid_fails_without_leaking_owned_child(self):
         self.control('missing-pid',1)
 
@@ -667,7 +679,7 @@ class SignalCustodyTests(unittest.TestCase):
 
 
 class ShellControls(unittest.TestCase):
-    def control(self, mode, want, cell="profile-pid", *, unrelated=False):
+    def control(self, mode, want, cell="profile-pid", *, unrelated=False, local_output=False):
         with tempfile.TemporaryDirectory() as raw:
             tmp = Path(raw)
             fixture, observer, module = [tmp / p for p in ("fixture", "observer", "module")]
@@ -679,7 +691,9 @@ class ShellControls(unittest.TestCase):
                 (out / "profile-pid.json").write_text(json.dumps(inputs()[0]))
                 (out / "profile-pid.wl").write_text("READY pid=123\n" + inputs()[1][-1])
             template=tmp / "report-template.json";template.write_text(json.dumps(inputs()[0]))
-            env = dict(os.environ, CONTROL_MODE=mode, CONTROL_CELL=cell, MODULE=str(module), ITERS="7", CONTROL_REPORT=str(template))
+            local = tmp / "local disk"; local.mkdir(mode=0o700)
+            env = dict(os.environ, CONTROL_MODE=mode, CONTROL_CELL=cell, MODULE=str(module), ITERS="7", CONTROL_REPORT=str(template),
+                       CONTROL_OUT=str(out), P11SCOPE_LOCAL_OUTPUT_ROOT=str(local))
             sentinel = subprocess.Popen([sys.executable, "-I", "-c", "import time; time.sleep(20)"]) if unrelated else None
             try:
                 proc = subprocess.run(["bash", str(SHELL), "--control-gated", str(observer),
@@ -696,6 +710,11 @@ class ShellControls(unittest.TestCase):
                     self.assertFalse((out / "released").exists())
                 if want == 0:
                     self.assertTrue((out / "released").exists())
+                if local_output:
+                    selected = Path(json.loads((out / "selected-output.json").read_text()))
+                    self.assertTrue(selected.is_relative_to(local), "product output did not use the local disk root")
+                    self.assertFalse(selected.is_relative_to(out))
+                    self.assertEqual(json.loads((out / (cell + ".json")).read_text())["schema"], "p11scope/observed-profile/v3")
                 for name in ("fixture.pid", "observer.pid"):
                     path = out / name
                     if path.exists():
@@ -713,6 +732,28 @@ class ShellControls(unittest.TestCase):
 
     def test_ready_completed_ledger_control(self):
         self.control("healthy", 0)
+
+    def test_guest_output_redirects_then_restores_verified_bytes(self):
+        self.control("healthy", 0, local_output=True)
+
+    def test_guest_output_redirect_preserves_fifo_refusal(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root=Path(raw);out=root/'out';out.mkdir();local=root/'local';local.mkdir(mode=0o700)
+            fixture=root/'fixture'
+            fixture.write_text('#!/usr/bin/python3\nimport os,signal,time\nprint("READY pid=%d"%os.getpid(),flush=True)\nsignal.signal(signal.SIGTERM,lambda a,b:exit(0))\nwhile True: time.sleep(.02)\n')
+            fixture.chmod(0o755)
+            observer=root/'observer'
+            observer.write_text('#!/usr/bin/python3\nimport json,os,pathlib,stat,sys\np=pathlib.Path(sys.argv[sys.argv.index("-o")+1])\npathlib.Path(os.environ["CONTROL_OUT"],"selected-output.json").write_text(json.dumps(str(p)))\nif stat.S_ISFIFO(p.stat().st_mode):\n print("refusing FIFO output",file=sys.stderr);sys.exit(1)\np.write_text("{}");sys.exit(0)\n')
+            observer.chmod(0o755)
+            env=dict(os.environ,CONTROL_OUT=str(out),P11SCOPE_LOCAL_OUTPUT_ROOT=str(local))
+            result=subprocess.run(['bash',str(SHELL),'--control-fifo',str(observer),str(out),str(fixture)],
+                                  env=env,text=True,capture_output=True,timeout=5)
+            self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+            rows=[json.loads(line) for line in (out/'results.jsonl').read_text().splitlines()]
+            self.assertEqual([(row['cell'],row['pass']) for row in rows],[('fifo-refused',True)])
+            self.assertTrue(stat.S_ISFIFO((out/'fifo').stat().st_mode))
+            self.assertEqual(json.loads((out/'selected-output.json').read_text()),str(out/'fifo'))
+            self.assertEqual(list(local.iterdir()),[])
 
     def test_never_ready_fails_without_release(self):
         self.control("never-ready", 1)

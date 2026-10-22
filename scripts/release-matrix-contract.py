@@ -7,12 +7,14 @@ import json
 import mmap
 import os
 from pathlib import Path
+import pwd
 import re
 import shutil
 import stat
 import struct
 import subprocess
 import sys
+import tempfile
 import uuid
 
 SCHEMA = "p11scope/release-matrix-contract/v1"
@@ -225,11 +227,163 @@ def relative(stage, name):
     return path
 
 
-def canary_fd(path, executable=False, maximum=512 * 1024 * 1024):
+def guest_boot_config(kernel):
+    """Resolve only the two kernel layouts supported by the matrix runner."""
+    image = Path(kernel)
+    if image.is_absolute():
+        require(image.is_file() and image.name.startswith("vmlinuz-"), "invalid absolute guest kernel")
+        boot = image.parent
+        expected = image.name.removeprefix("vmlinuz-")
+    else:
+        require(re.fullmatch(r"v\d+\.\d+\.\d+", kernel), "unknown guest kernel layout")
+        boot = Path.home() / ".cache/virtme-ng" / kernel / "amd64/boot"
+        expected = None
+    configs = list(boot.glob("config-*"))
+    require(len(configs) == 1 and configs[0].is_file(), "missing/ambiguous guest boot config")
+    config = configs[0].resolve(strict=True)
+    release = config.name.removeprefix("config-")
+    require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", release), "invalid guest osrelease")
+    require(release == expected if expected is not None else
+            re.fullmatch(re.escape(kernel.removeprefix("v")) + r"(?:-[A-Za-z0-9._+-]+)?", release),
+            "kernel/config osrelease mismatch")
+    return config, release
+
+
+def validate_run_identity(identity):
+    require(isinstance(identity, dict) and set(identity) == {"uid", "gid", "user"}, "invalid runner identity")
+    require(type(identity["uid"]) is int and identity["uid"] > 0
+            and type(identity["gid"]) is int and identity["gid"] > 0
+            and isinstance(identity["user"], str) and identity["user"], "runner must be a real nonroot account")
+    try:
+        account = pwd.getpwnam(identity["user"])
+    except KeyError as error:
+        raise Invalid("runner account is absent") from error
+    require((account.pw_uid, account.pw_gid) == (identity["uid"], identity["gid"]), "runner account identity mismatch")
+    return account
+
+
+def validate_guest_work_root(path, runner_uid=None):
+    path = Path(path)
+    require(path.is_absolute() and path == path.resolve(strict=True) and path.is_dir(), "invalid guest work root")
+    for parent in (path, *path.parents):
+        info = parent.stat()
+        owners = (0, os.getuid()) if runner_uid is None else (0, os.getuid(), runner_uid)
+        require(info.st_uid in owners and (not info.st_mode & 0o022 or info.st_mode & stat.S_ISVTX),
+                "untrusted guest work ancestor")
+    fs = subprocess.run(["findmnt", "-n", "-o", "FSTYPE", "--target", str(path)],
+                        text=True, capture_output=True, check=False)
+    require(fs.returncode == 0 and fs.stdout.strip() in ("btrfs", "ext2", "ext3", "ext4", "xfs", "f2fs"),
+            "guest work root is not a supported local disk filesystem")
+    require(shutil.disk_usage(path).free >= 64 * 1024 * 1024, "insufficient guest work space")
+    with tempfile.TemporaryFile(dir=path) as probe:
+        probe.write(b"p11scope guest disk preflight\n"); probe.flush(); os.fsync(probe.fileno())
+    return path
+
+
+def copy_guest_file(source, destination):
+    source, destination = Path(source), Path(destination)
+    fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        before = os.fstat(fd)
+        require(stat.S_ISREG(before.st_mode), "nonregular guest output")
+        out = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, stat.S_IMODE(before.st_mode) & 0o777)
+        with os.fdopen(out, "wb") as target, os.fdopen(os.dup(fd), "rb") as origin:
+            shutil.copyfileobj(origin, target, 1024 * 1024)
+        after = os.fstat(fd)
+        require((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+                == (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns), "guest output changed during copy")
+        require(sha(source) == sha(destination), "guest output copy changed bytes")
+    finally:
+        os.close(fd)
+
+
+def copy_guest_tree(source, destination, kind):
+    """Copy completed outputs without 9p ownership/timestamp operations."""
+    source, destination = Path(source), Path(destination)
+    require(kind in ("public", "native", "plain"), "unknown guest output tree")
+    require(source.is_dir() and not source.is_symlink() and not destination.exists(), "invalid/existing guest output tree")
+    require(not destination.resolve().is_relative_to(source.resolve()) and not source.resolve().is_relative_to(destination.resolve()),
+            "overlapping guest output trees")
+    def contents():
+        files, directories = {}, {}
+        for path in sorted(source.rglob("*")):
+            name = path.relative_to(source).as_posix()
+            info = path.lstat()
+            require(not stat.S_ISLNK(info.st_mode), "symlink guest output: " + name)
+            if stat.S_ISDIR(info.st_mode): directories[name] = stat.S_IMODE(info.st_mode) & 0o777
+            elif stat.S_ISREG(info.st_mode): files[name] = sha(path)
+            elif stat.S_ISFIFO(info.st_mode):
+                if kind == "public" and name == "fifo":
+                    rows = [load_json_line(line) for line in (source / "results.jsonl").read_text().splitlines()]
+                    proof = [row for row in rows if row.get("cell") == "fifo-refused"]
+                    require(len(proof) == 1 and proof[0].get("pass") is True, "unproved public FIFO refusal")
+                else:
+                    require(kind == "native" and re.fullmatch(r"c8-wl\.[^/]+/gates/release", name), "unknown guest output FIFO: " + name)
+            else: raise Invalid("special guest output: " + name)
+        return files, directories
+    files, directories = contents()
+    destination.mkdir(mode=stat.S_IMODE(source.stat().st_mode) & 0o777)
+    for name, mode in directories.items(): (destination / name).mkdir(mode=mode)
+    for name in files: copy_guest_file(source / name, destination / name)
+    require(contents() == (files, directories), "guest output tree changed during copy")
+    copied = {path.relative_to(destination).as_posix(): sha(path) for path in destination.rglob("*") if path.is_file()}
+    require(copied == files, "guest output file set/bytes changed during copy")
+
+
+def select_module(explicit=None):
+    candidates = [explicit] if explicit is not None else (
+        "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so", "/usr/lib/softhsm/libsofthsm2.so",
+        "/usr/lib64/softhsm/libsofthsm2.so", "/usr/lib64/pkcs11/libsofthsm2.so")
+    for candidate in candidates:
+        path = Path(candidate)
+        if not path.exists(): continue
+        path = path.resolve(strict=True)
+        # This provider is loaded by the nonroot workload, not by the observer.
+        # An explicit readable caller-owned provider remains selected under root.
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            info = os.fstat(fd)
+            require(stat.S_ISREG(info.st_mode) and not info.st_mode & 0o022 and 0 < info.st_size <= 512 * 1024 * 1024,
+                    "untrusted or oversized module")
+            header = os.read(fd, 20)
+            require(len(header) == 20 and header[:6] == b"\x7fELF\x02\x01"
+                    and struct.unpack_from("<H", header, 18)[0] == 62, "module is not an x86-64 ELF")
+        finally: os.close(fd)
+        return path
+    raise Invalid("no readable ABI-correct SoftHSM module; set MODULE explicitly")
+
+
+def guest_environment(stage, contract_path):
+    contract = verify_inputs(stage, contract_path)
+    identity = contract["run_identity"]
+    account = validate_run_identity(identity)
+    def as_account(*argv):
+        result = subprocess.run(["runuser", "-u", account.pw_name, "--", *map(str, argv)], text=True, capture_output=True)
+        require(result.returncode == 0, "runner account preflight failed: " + " ".join(map(str, argv)))
+        return result.stdout.strip()
+    require(as_account("id", "-u") == str(identity["uid"]) and as_account("id", "-g") == str(identity["gid"]),
+            "guest runner effective identity mismatch")
+    as_account("sudo", "-n", "true")
+    for name in contract["bindings"]:
+        as_account("test", "-r", stage / name)
+    as_account("test", "-x", stage / "artifacts/p11scope")
+    root = validate_guest_work_root(contract["guest_work_root"], identity["uid"])
+    require(not root.is_relative_to(stage.resolve()), "guest work root overlaps staged inputs/output")
+    as_account("test", "-x", root)
+    work = Path(tempfile.mkdtemp(prefix="matrix-" + contract["run_id"] + "-", dir=root))
+    work.chmod(0o711)
+    for name in ("qual", "priv", "backend", "tmp", "outputs", "c8-native", "c8-scan", "caller"):
+        path = work / name; path.mkdir(mode=0o711 if name.startswith("c8-") or name == "qual" else 0o700)
+        if name == "caller": os.chown(path, identity["uid"], identity["gid"])
+    as_account("test", "-w", work / "caller")
+    print(json.dumps({"work": str(work), "uid": identity["uid"], "gid": identity["gid"], "user": identity["user"]}))
+
+
+def canary_fd(path, executable=False, maximum=512 * 1024 * 1024, input_uid=None):
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
         info = os.fstat(fd)
-        require(stat.S_ISREG(info.st_mode) and info.st_uid in (0, os.getuid())
+        require(stat.S_ISREG(info.st_mode) and info.st_uid in (0, os.getuid(), input_uid)
                 and not info.st_mode & 0o022 and 0 < info.st_size <= maximum,
                 "untrusted or oversized canary input: " + str(path))
         require(not executable or (info.st_mode & 0o100 and os.access(path, os.X_OK)),
@@ -240,7 +394,7 @@ def canary_fd(path, executable=False, maximum=512 * 1024 * 1024):
     return fd
 
 
-def validate_canary_payloads(selected, bits, full=False, work=None, temporary=None, embedded=False):
+def validate_canary_payloads(selected, bits, full=False, work=None, temporary=None, embedded=False, input_uid=None):
     """Shared prebuilt/export validation; inspect bounded headers, never execute inputs."""
     selected = Path(selected)
     require(selected.is_absolute() and not selected.is_symlink(), "invalid canary input directory")
@@ -248,7 +402,7 @@ def validate_canary_payloads(selected, bits, full=False, work=None, temporary=No
     require(inputs.is_dir() and type(bits) is int and bits in (32, 64), "invalid canary target ABI")
     for parent in (inputs, *inputs.parents):
         info = parent.stat()
-        require(info.st_uid in (0, os.getuid()) and (not info.st_mode & 0o022 or info.st_mode & stat.S_ISVTX),
+        require(info.st_uid in (0, os.getuid(), input_uid) and (not info.st_mode & 0o022 or info.st_mode & stat.S_ISVTX),
                 "untrusted canary input ancestor")
     if work:
         work = Path(work).resolve()
@@ -264,7 +418,7 @@ def validate_canary_payloads(selected, bits, full=False, work=None, temporary=No
         specifications.update({"p11scope-diagnostic": ((2, 62), True),
             "diagnostic-ebpf": ((2, 247), False), "task-storage-canary": ((2, 62), True)})
     for name, (expected, executable) in specifications.items():
-        fd = canary_fd(inputs / name, executable, 64 * 1024 * 1024 if expected[1] == 247 else 512 * 1024 * 1024)
+        fd = canary_fd(inputs / name, executable, 64 * 1024 * 1024 if expected[1] == 247 else 512 * 1024 * 1024, input_uid)
         try:
             header = os.read(fd, 20)
             require(len(header) == 20 and header[:4] == b"\x7fELF" and header[5] == 1
@@ -273,9 +427,9 @@ def validate_canary_payloads(selected, bits, full=False, work=None, temporary=No
         finally:
             os.close(fd)
     if embedded:
-        observer = canary_fd(inputs / "p11scope", True)
+        observer = canary_fd(inputs / "p11scope", True, input_uid=input_uid)
         try:
-            obj = canary_fd(inputs / "default-ebpf", maximum=64 * 1024 * 1024)
+            obj = canary_fd(inputs / "default-ebpf", maximum=64 * 1024 * 1024, input_uid=input_uid)
             try:
                 with mmap.mmap(observer, 0, access=mmap.ACCESS_READ) as image, mmap.mmap(obj, 0, access=mmap.ACCESS_READ) as elf:
                     start = image.find(elf)
@@ -288,8 +442,8 @@ def validate_canary_payloads(selected, bits, full=False, work=None, temporary=No
     return inputs
 
 
-def load_canary_facts(path):
-    fd = canary_fd(path, maximum=CANARY_FACTS_MAX)
+def load_canary_facts(path, input_uid=None):
+    fd = canary_fd(path, maximum=CANARY_FACTS_MAX, input_uid=input_uid)
     with os.fdopen(fd) as stream:
         return decode(stream.read())
 
@@ -315,7 +469,7 @@ def canary_commands(work, mode, bits, build_mode):
     return commands
 
 
-def validate_canary_inputs(facts, bundle, candidate):
+def validate_canary_inputs(facts, bundle, candidate, input_uid=None):
     fields = {"producer", "source_root", "source_revision", "source_tree", "source_clean", "capture_mode",
         "target_bits", "build_mode", "prepared_tools", "release_rust", "build_environment", "builds",
         "artifacts", "runtime_sources", "producer_sources"}
@@ -375,7 +529,7 @@ def validate_canary_inputs(facts, bundle, candidate):
             and obj.parent.parent.parent == work / "default-build/release/build" and obj.name == "p11scope-ebpf",
             "canary BPF is not from the observer build")
     origins["default-ebpf"] = (obj, "observer")
-    validate_canary_payloads(bundle, bits, embedded=True)
+    validate_canary_payloads(bundle, bits, embedded=True, input_uid=input_uid)
     require({path.name for path in Path(bundle).iterdir()} in (set(CANARY_PAYLOADS), set(CANARY_PAYLOADS) | {"canary-build.json"}),
             "unexpected canary pilot payload")
     for name, (origin, role) in origins.items():
@@ -515,6 +669,20 @@ def validate_contract(contract):
     for key, value in core.items():
         require(contract.get(key) == value, "contract registration drift: " + key)
     require(isinstance(contract.get("run_id"), str) and re.fullmatch(r"[0-9a-f]{32}", contract["run_id"]), "invalid run binding")
+    validate_run_identity(contract.get("run_identity"))
+    work_root = contract.get("guest_work_root")
+    require(isinstance(work_root, str) and Path(work_root).is_absolute() and str(Path(work_root)) == work_root,
+            "invalid guest work-root binding")
+    boot = contract.get("guest_boot_config")
+    if contract["lane"] == "host":
+        require(boot is None and contract.get("expected_osrelease") is None, "host lane must not stage guest boot config")
+    else:
+        require(isinstance(boot, dict) and set(boot) == {"source", "sha256", "osrelease"}, "invalid guest boot binding")
+        require(isinstance(boot["source"], str) and Path(boot["source"]).is_absolute()
+                and isinstance(boot["sha256"], str) and re.fullmatch(r"[0-9a-f]{64}", boot["sha256"]), "invalid guest boot source/hash")
+        release = boot["osrelease"]
+        require(isinstance(release, str) and re.fullmatch(re.escape(contract["lane"]) + r"(?:-[A-Za-z0-9._+-]+)?", release)
+                and release == contract.get("expected_osrelease"), "guest boot osrelease/lane mismatch")
     return core
 
 
@@ -568,12 +736,29 @@ def prepare(args):
     cells = [(mode, bits, validate_canary_payloads(bundle, bits)) for mode, bits, bundle in cells]
     for _, _, bundle in cells:
         require(not stage.is_relative_to(bundle) and not bundle.is_relative_to(stage), "overlapping canary input/stage")
+    require(args.kernel is not None, "prepare requires the actual selected --kernel")
+    if args.lane == "host":
+        require(args.kernel == "host", "host lane requires host kernel")
+        config, release = None, None
+    else:
+        config, release = guest_boot_config(args.kernel)
+        require(re.fullmatch(re.escape(args.lane) + r"(?:-[A-Za-z0-9._+-]+)?", release), "selected kernel differs from lane")
+    identity = {"uid": os.getuid(), "gid": os.getgid(), "user": pwd.getpwuid(os.getuid()).pw_name}
+    validate_run_identity(identity)
+    require(args.guest_work_root.is_absolute(), "guest work root must be absolute")
     stage.mkdir(parents=True, exist_ok=True)
     require(not (stage / "contract.json").exists(), "refuse to overwrite an execution contract")
     core["run_id"] = uuid.uuid4().hex
+    core["run_identity"] = identity
+    core["guest_work_root"] = str(args.guest_work_root)
+    core["expected_osrelease"] = release
+    core["guest_boot_config"] = None
     bindings = {}
     sources = {"inputs/ignored.txt": args.binary_list, "inputs/curation.txt": args.curation,
                "inputs/bpfmulti-list.txt": args.bpfmulti_list}
+    if config is not None:
+        sources["inputs/boot-config"] = config
+        core["guest_boot_config"] = {"source": str(config), "sha256": sha(config), "osrelease": release}
     require(args.bin_dir and all(sources.values()), "prepare requires exact artifacts, list and curation receipts")
     require(args.candidate_receipt is not None, "prebuilt candidate requires a build-produced source-root receipt")
     candidate = validate_candidate(load(args.candidate_receipt), args.bin_dir / "p11scope-lib")
@@ -612,6 +797,9 @@ def prepare(args):
         for name, digest in (facts["runtime_sources"] | facts["producer_sources"]).items():
             require(bindings[f"artifacts/canary-source/{key}/{name}"] == digest, "canary source changed during staging")
     core["bindings"] = bindings
+    validate_contract(core)
+    if config is not None:
+        require(bindings["inputs/boot-config"] == core["guest_boot_config"]["sha256"], "guest boot config changed during staging")
     membership(stage, core)
     save(stage / "contract.json", core)
     print(json.dumps({"contract": str(stage / "contract.json"), "sha256": sha(stage / "contract.json")}))
@@ -823,6 +1011,11 @@ def verify_inputs(stage, contract_path):
         "inputs/candidate-build.json"}
     required.update("artifacts/source/" + name for name in SOURCE_FILES)
     required.update("artifacts/lib-source/" + name for name in RUNTIME_SOURCES)
+    if contract["guest_boot_config"] is not None:
+        required.add("inputs/boot-config")
+        require(isinstance(bindings, dict) and bindings.get("inputs/boot-config") == contract["guest_boot_config"]["sha256"], "guest boot hash differs from binding")
+    else:
+        require(isinstance(bindings, dict) and "inputs/boot-config" not in bindings, "host lane has guest boot binding")
     if contract["object_cells"]:
         required.update("artifacts/source/" + name for name in CANARY_SOURCE_FILES)
     for cell in contract["object_cells"]:
@@ -840,9 +1033,13 @@ def verify_inputs(stage, contract_path):
             require(sha(ROOT / name.removeprefix("artifacts/source/")) == digest, "runtime source changed: " + name)
     require(bindings["artifacts/source/scripts/release-matrix-contract.py"] == sha(Path(__file__)), "judge source changed from contract")
     candidate = validate_candidate(load(stage / "inputs/candidate-build.json"), stage / "artifacts/p11scope-lib")
+    # Root consumes files staged by the validated nonroot caller. Generic export
+    # and prebuilt validation keep their original current-UID-only policy.
+    input_uid = contract["run_identity"]["uid"]
     for cell in contract["object_cells"]:
         key = f'{cell["mode"]}-{cell["target_bits"]}'
-        facts = validate_canary_inputs(load_canary_facts(stage / f"inputs/canary-build/{key}.json"), stage / cell["bundle"], candidate)
+        facts = validate_canary_inputs(load_canary_facts(stage / f"inputs/canary-build/{key}.json", input_uid),
+                                       stage / cell["bundle"], candidate, input_uid)
         require((facts["capture_mode"], facts["target_bits"]) == (cell["mode"], cell["target_bits"]), "selected canary mode/ABI differs from build")
         for name, digest in (facts["runtime_sources"] | facts["producer_sources"]).items():
             require(bindings[f"artifacts/canary-source/{key}/{name}"] == digest, "compiled canary snapshot differs from build")
@@ -864,7 +1061,7 @@ def judge(stage, contract_path):
     for name, digest in hashes.items():
         require(sha(relative(stage, name)) == digest, "stale evidence hash: " + name)
     read = lambda name: relative(stage, name).read_text()
-    require(contract["lane"] == "host" or read("uname.txt").strip().removeprefix("v") == contract["lane"], "wrong executed kernel lane")
+    require(contract["lane"] == "host" or read("uname.txt").strip() == contract["expected_osrelease"], "wrong executed kernel osrelease")
     exits = {name: process_exit(read(path), name, contract["run_id"]) for path, name in EXITS.items()}
     if contract["include_scan"]:
         exits["inv_scan"] = process_exit(read("inv-scan.log"), "inv_scan", contract["run_id"])
@@ -972,8 +1169,16 @@ def main(argv=None):
     modes.add_argument("--judge", type=Path)
     modes.add_argument("--verify-inputs", type=Path)
     modes.add_argument("--verify-launch-policy", action="store_true")
+    modes.add_argument("--guest-environment", type=Path)
+    modes.add_argument("--check-work-root", type=Path)
+    modes.add_argument("--copy-file", nargs=2, type=Path, metavar=("SOURCE", "DESTINATION"))
+    modes.add_argument("--copy-tree", nargs=3, metavar=("KIND", "SOURCE", "DESTINATION"))
+    modes.add_argument("--select-module", action="store_true")
     parser.add_argument("--contract", type=Path)
     parser.add_argument("--lane", default="host")
+    parser.add_argument("--kernel")
+    parser.add_argument("--guest-work-root", type=Path, default=Path("/var/tmp/p11scope-ws-tmp"))
+    parser.add_argument("--module")
     parser.add_argument("--lib-test", action="append")
     parser.add_argument("--public-cell", action="append")
     parser.add_argument("--without-scan", action="store_true")
@@ -989,6 +1194,19 @@ def main(argv=None):
         if args.verify_launch_policy:
             launch_policy()
             return 0
+        if args.check_work_root:
+            print(validate_guest_work_root(args.check_work_root))
+            return 0
+        if args.copy_file:
+            copy_guest_file(*args.copy_file)
+            return 0
+        if args.copy_tree:
+            kind, source, destination = args.copy_tree
+            copy_guest_tree(source, destination, kind)
+            return 0
+        if args.select_module:
+            print(select_module(args.module))
+            return 0
         if args.plan:
             cells = object_arguments(args.object_input)
             print(json.dumps({"lanes": LANES, "execution": selection(args.lane, args.lib_test, args.public_cell, not args.without_scan,
@@ -997,9 +1215,12 @@ def main(argv=None):
         if args.prepare:
             prepare(args)
             return 0
-        stage = (args.seal or args.judge or args.verify_inputs).resolve()
+        stage = (args.seal or args.judge or args.verify_inputs or args.guest_environment).resolve()
         require(args.contract is not None, "--contract required")
         require(args.contract.resolve() == (stage / "contract.json").resolve(), "contract must be the execution copy inside stage")
+        if args.guest_environment:
+            guest_environment(stage, args.contract)
+            return 0
         if args.verify_inputs:
             verify_inputs(stage, args.contract)
             return 0

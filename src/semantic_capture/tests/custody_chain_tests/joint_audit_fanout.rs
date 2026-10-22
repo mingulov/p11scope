@@ -4058,6 +4058,24 @@ impl CanonicalFanoutScene {
         frame: &mut IngestedJointQuantum,
         fault: &impl crate::semantics_objects::journal::FaultEpoch,
     ) {
+        {
+            let ports = self
+                .scene
+                .real
+                .scene
+                .coordinator
+                .joint_frame_ports(&self.scene.producers)
+                .unwrap();
+            frame.bind_targets(&ports).unwrap();
+        }
+        self.seal_replay_bound_head(frame, fault);
+    }
+
+    fn seal_replay_bound_head(
+        &mut self,
+        frame: &mut IngestedJointQuantum,
+        fault: &impl crate::semantics_objects::journal::FaultEpoch,
+    ) {
         let h0 = self.scene.real.h0.clone();
         let mut births = NativeFrameBirths {
             h0: &h0,
@@ -4073,7 +4091,6 @@ impl CanonicalFanoutScene {
             .coordinator
             .joint_frame_ports(&self.scene.producers)
             .unwrap();
-        frame.bind_targets(&ports).unwrap();
         assert_eq!(
             frame.seal_next(&mut ports, &mut births, fault),
             Ok(QuantumSealProgress::DeliveryReady)
@@ -4395,7 +4412,7 @@ fn joint_replay_step_capacity_refusal_preserves_original() {
         "the whole failed preflight is refunded"
     );
     drop(hold);
-    fixture.seal_replay_head(&mut frame, &fault);
+    fixture.seal_replay_bound_head(&mut frame, &fault);
     assert_original_replay_partition(frame.active_seal_for_test().unwrap());
     assert_eq!(
         fixture.feeds(),

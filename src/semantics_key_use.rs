@@ -25,9 +25,10 @@ use crate::semantics_edge::{
     EdgeSemantics, EffectOrigin, KeyReceipt, KeyRole, OperationEffect, OperationId,
     OperationOutcome, OperationSink, SemanticCall,
 };
+#[cfg(test)]
+use crate::semantics_objects::journal::H3EvidenceSource;
 use crate::semantics_objects::journal::{
-    BootstrapReceipt, H3DispositionEvidence, H3EvidenceSource, JournalGap, SealFailure,
-    SealSuccess, SealedCall,
+    BootstrapReceipt, H3DispositionEvidence, JournalGap, SealFailure, SealSuccess, SealedCall,
 };
 use crate::semantics_objects::{
     ObjectDomain, ObjectEffect, ObjectEffects, ObjectId, ObjectSemantics, SessionIncarnation,
@@ -182,7 +183,7 @@ impl StagedCall {
 pub(crate) struct JointStaging {
     mode: FeedMode,
     /// Immutable selection for this per-era feed; delivery never rebinds it.
-    selected_domain: Option<ObjectDomain>,
+    selected_receipt: Option<BootstrapReceipt>,
     staged: VecDeque<StagedCall>,
     /// Highest consumed H0 position (replayed or disposed): staging
     /// at or below it is a forbidden replay.
@@ -233,7 +234,7 @@ impl JointStaging {
     pub(crate) fn select_s1_only() -> Self {
         Self {
             mode: FeedMode::S1Only,
-            selected_domain: None,
+            selected_receipt: None,
             staged: VecDeque::new(),
             frontier: 0,
             redeemed: 0,
@@ -255,18 +256,25 @@ impl JointStaging {
         let mut staging = Self::select_s1_only();
         if let Some(receipt) = receipt {
             staging.mode = FeedMode::Joint;
-            staging.selected_domain = Some(receipt.domain());
+            staging.selected_receipt = Some(*receipt);
         }
         staging
     }
 
+    /// The original selection remains retained even after a feed degrades.
+    /// A later broad loss may still invalidate this incarnation's history.
+    pub(crate) fn selected_receipt(&self) -> Option<&BootstrapReceipt> {
+        self.selected_receipt.as_ref()
+    }
+
     pub(crate) fn accepts_seal(&self, seal: &SealSuccess) -> bool {
-        self.selected_domain == Some(seal.prefix.domain())
+        self.selected_receipt.as_ref().map(BootstrapReceipt::domain) == Some(seal.prefix.domain())
     }
 
     pub(crate) fn accepts_failure(&self, failure: &SealFailure) -> bool {
-        self.selected_domain
-            .is_some_and(|domain| failure.affects_domain(domain))
+        self.selected_receipt
+            .as_ref()
+            .is_some_and(|receipt| failure.affects_domain(receipt.domain()))
     }
 
     pub(crate) fn mode(&self) -> FeedMode {
@@ -555,23 +563,92 @@ impl JointStaging {
         outcome
     }
 
+    /// Canonical production path: the frame binds the original failure and
+    /// completed H3 to this exact selected domain and capture ledger.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn apply_failure<S: OperationSink>(
+        &mut self,
+        audited: &crate::semantics_objects::journal::joint_audit::AuditedFailure<'_>,
+        model: &ObjectSemantics,
+        ledger: &mut crate::semantics_objects::journal::StagingLedger,
+        reducer: &mut EdgeSemantics,
+        keyuse: &mut KeyUseReducer,
+        instance: RegistryInstanceId,
+        sink: &mut S,
+        assoc_fallback: Option<&mut crate::semantics_objects::journal::StagingLedger>,
+    ) -> (FailureApplyOutcome, u64) {
+        if self.selected_receipt.as_ref().map(BootstrapReceipt::domain) != Some(audited.domain())
+            || !audited.matches_ledger(ledger)
+        {
+            return (FailureApplyOutcome::Ignored, 0);
+        }
+        self.apply_failure_inner(
+            audited.failure(),
+            audited.h3(),
+            model,
+            ledger,
+            reducer,
+            keyuse,
+            instance,
+            sink,
+            assoc_fallback,
+        )
+    }
+
+    /// Lower-level algorithm controls only. It creates no AuditedFailure and
+    /// is absent from production; real-frame tests cover canonical custody.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn apply_algorithm_failure_for_test<S: OperationSink>(
+        &mut self,
+        failure: &SealFailure,
+        finalizer: &mut impl H3EvidenceSource,
+        model: &ObjectSemantics,
+        ledger: &mut crate::semantics_objects::journal::StagingLedger,
+        reducer: &mut EdgeSemantics,
+        keyuse: &mut KeyUseReducer,
+        instance: RegistryInstanceId,
+        sink: &mut S,
+        assoc_fallback: Option<&mut crate::semantics_objects::journal::StagingLedger>,
+    ) -> (FailureApplyOutcome, u64) {
+        let h3 = if self.mode == FeedMode::Joint
+            && self.accepts_failure(failure)
+            && disposition_of(failure.gap) == SealFailureDisposition::Fallback
+        {
+            finalizer.take_h3_disposition()
+        } else {
+            H3DispositionEvidence::genesis()
+        };
+        self.apply_failure_inner(
+            failure,
+            &h3,
+            model,
+            ledger,
+            reducer,
+            keyuse,
+            instance,
+            sink,
+            assoc_fallback,
+        )
+    }
+
     /// Apply one seal failure: real loss invalidates live operation
     /// authority before history-only disposal; proof-only refusal
     /// with an explicit complete H3 stream replays retained calls
     /// once in order through ordinary S1; anything transient or
     /// completeness-unproven holds staging intact. The H3 receipt is
-    /// taken from the actual finalizer (`take_h3_disposition`),
-    /// never caller-supplied. Invalidation terminals and fallback
+    /// borrowed from the same original completed audit; this path never
+    /// takes the finalizer again. Invalidation terminals and fallback
     /// effects feed the key-use reducer too (open rows close as
     /// Unknown on loss; fallback rows are unknown-key S1Only —
     /// object facts are never invented in fallback). Returns the
     /// outcome plus fallback per-edge bound refusals for
     /// `semantic_refused`.
     #[allow(clippy::too_many_arguments)] // Staging borrows the exact pipeline facts plus the model for retirement.
-    pub(crate) fn apply_failure<S: OperationSink>(
+    fn apply_failure_inner<S: OperationSink>(
         &mut self,
         failure: &SealFailure,
-        finalizer: &mut impl H3EvidenceSource,
+        h3: &H3DispositionEvidence,
         model: &ObjectSemantics,
         ledger: &mut crate::semantics_objects::journal::StagingLedger,
         reducer: &mut EdgeSemantics,
@@ -617,11 +694,11 @@ impl JointStaging {
                 (FailureApplyOutcome::Degraded { disposed }, 0)
             }
             SealFailureDisposition::Fallback => {
-                match finalizer.take_h3_disposition() {
+                match h3 {
                     H3DispositionEvidence::Clean {
                         staged_max,
                         pending_floor: None,
-                    } if self.covered_by(staged_max) => {
+                    } if self.covered_by(*staged_max) => {
                         // Fallback replays staged S1 without object
                         // proof: the failure's invalidations close
                         // affected associations FIRST, so replayed

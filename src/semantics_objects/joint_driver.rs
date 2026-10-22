@@ -260,6 +260,10 @@ impl RawProvenance {
         self.identity
     }
 
+    pub(super) fn matches_ledger(&self, ledger: &StagingLedger) -> bool {
+        ledger.generation() == Some(self.ledger)
+    }
+
     pub(super) fn collection(&self) -> &JournalCollection {
         &self.collection
     }
@@ -330,6 +334,7 @@ impl IngestedRaw {
     // Only the existing journal-owned single-seal consumer can extract this
     // actual collection. Multi-domain audit ownership replaces that consumer
     // before ordinary activation; outside callers receive only this proof.
+    #[cfg(test)]
     pub(super) fn into_collection(self) -> JournalCollection {
         self.raw.collection
     }

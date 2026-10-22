@@ -783,6 +783,19 @@ fn joint_two_feeds_share_nonzero_audited_fallback_once() {
         (2, false),
         "both feeds borrow the same nonzero taken H3, no genesis second take"
     );
+    fixture.scene.assert_claims(&[]);
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .ledger()
+            .roles_for_test()[..4],
+        [0, 0, 0, 0],
+        "completed originals release Raw/H8/Model/H9 after once-only fallback; legitimate live S1 associations keep their own roles"
+    );
 }
 
 struct NoFrameBirths;
@@ -847,8 +860,12 @@ fn joint_original_loss_fans_out_before_ack() {
     let effects = failure.effects.clone();
     let receipts = fixture.receipts();
     {
-        let a = frame.failure_for(receipts[0].domain()).unwrap();
-        let b = frame.failure_for(receipts[1].domain()).unwrap();
+        let a = frame
+            .audited_failure_for_test(receipts[0].domain())
+            .unwrap();
+        let b = frame
+            .audited_failure_for_test(receipts[1].domain())
+            .unwrap();
         assert!(
             std::ptr::eq(a.failure(), b.failure()),
             "both domains borrow the original failure, never recomputed scope/effects"

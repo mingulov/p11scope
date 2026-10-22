@@ -871,6 +871,24 @@ impl JournalAdapter {
         self.consumed_through
     }
 
+    /// Read-only allocation identity check; this never binds a new producer.
+    pub(crate) fn retains_producers(
+        &self,
+        producers: &crate::attach::SessionDrainProducers,
+    ) -> bool {
+        self.resource_producers
+            .as_ref()
+            .is_some_and(|held| held.same_producers(producers))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_starts_for_test(&self) -> Vec<(u64, u64, u64)> {
+        self.open
+            .iter()
+            .map(|(native, entry)| (native.0, native.1, entry.begin_ordinal))
+            .collect()
+    }
+
     /// Read the canonical invocation store and its independent census.
     /// This inspection neither claims nor consumes an original admission.
     #[cfg(test)]
@@ -3470,6 +3488,7 @@ impl JournalAdapter {
     /// Staged inputs below a refused-but-recoverable seal are kept for
     /// a later seal; fault, malformed and H3 loss fence the void
     /// explicitly and drop staged proof.
+    #[cfg(test)]
     pub(crate) fn seal(
         &mut self,
         model: &mut ObjectSemantics,
@@ -3528,73 +3547,7 @@ impl JournalAdapter {
             self.closure_generation,
             &seal_epoch,
         ) {
-            // Any audit failure breaks absence-appearance chains: the clean
-            // coverage the witness requires is gone from this ordinal on.
-            // Voids fence the loss explicitly before dropping staged
-            // truth, so later proof resumes above a fenced interval
-            // instead of silently skipping it; the fencing effects are
-            // reported with the refusal.
-            let scope = match gap {
-                JournalGap::H3Pending | JournalGap::ClosureStale => SealFailureScope::Unqualified,
-                _ => self.affected_failure_scope(),
-            };
-            self.last_audit_failure = Some(self.consumed_through);
-            let mut effects = ObjectEffects::default();
-            let mut h3_voided = None;
-            match gap {
-                JournalGap::FaultSaturated => {
-                    self.stopped = true;
-                }
-                JournalGap::H3Exhausted => {
-                    // The H0 allocator is dead: no future history can
-                    // certify, so the adapter stops (invalidating tracked
-                    // keys) instead of waiting forever.
-                    effects = self.stop(model);
-                }
-                JournalGap::FaultChanged
-                | JournalGap::FaultUnreadable
-                | JournalGap::Malformed
-                | JournalGap::CounterUnprovable
-                | JournalGap::ResourceUnavailable
-                | JournalGap::Discarded
-                | JournalGap::H3Loss => {
-                    // Irreversible refusals first: staged unbounded
-                    // abandonments refuse their incarnations permanently
-                    // BEFORE staged custody is dropped, so a void can
-                    // never erase them into a recoverable fence.
-                    effects = self.preserve_abandonment_refusals(model);
-                    effects
-                        .effects
-                        .extend(self.fence_void(model, self.consumed_through).effects);
-                    self.void_staged();
-                    if gap == JournalGap::H3Loss {
-                        // Forgive the voided H0 interval: re-presented
-                        // barriers at or below it wait for clean
-                        // evidence instead of voiding twice. The void
-                        // report acknowledges the consumed barrier to
-                        // the finalizer through the joint tick.
-                        self.h3_voided_below = self.h3_voided_below.max(audit.h0_below);
-                        h3_voided = Some(self.h3_voided_below);
-                    }
-                    if gap == JournalGap::FaultChanged {
-                        // Re-baseline the cumulative chain on the
-                        // freshest observed epoch: the audited close or
-                        // the seal-time re-read, whichever is newer.
-                        let freshest = audit
-                            .fault_after
-                            .max(seal_epoch.unwrap_or(audit.fault_after));
-                        self.last_fault = Some(freshest);
-                    }
-                }
-                JournalGap::H3Pending | JournalGap::ClosureStale => {}
-                _ => {}
-            }
-            return Err(SealFailure {
-                gap,
-                effects,
-                h3_voided,
-                scope,
-            });
+            return Err(self.reject_audit(model, audit, gap, seal_epoch));
         }
         // The audit passed: pin the cumulative baseline. Past the first
         // seal this is a no-op (the chain rule already equated them).
@@ -3602,6 +3555,83 @@ impl JournalAdapter {
         Ok(())
     }
 
+    fn reject_audit(
+        &mut self,
+        model: &mut ObjectSemantics,
+        audit: &JournalAuditReceipt,
+        gap: JournalGap,
+        seal_epoch: Result<u64, FaultReadError>,
+    ) -> SealFailure {
+        // Any audit failure breaks absence-appearance chains: the clean
+        // coverage the witness requires is gone from this ordinal on.
+        // Voids fence the loss explicitly before dropping staged
+        // truth, so later proof resumes above a fenced interval
+        // instead of silently skipping it; the fencing effects are
+        // reported with the refusal.
+        let scope = match gap {
+            JournalGap::H3Pending | JournalGap::ClosureStale => SealFailureScope::Unqualified,
+            _ => self.affected_failure_scope(),
+        };
+        self.last_audit_failure = Some(self.consumed_through);
+        let mut effects = ObjectEffects::default();
+        let mut h3_voided = None;
+        match gap {
+            JournalGap::FaultSaturated => {
+                self.stopped = true;
+            }
+            JournalGap::H3Exhausted => {
+                // The H0 allocator is dead: no future history can
+                // certify, so the adapter stops (invalidating tracked
+                // keys) instead of waiting forever.
+                effects = self.stop(model);
+            }
+            JournalGap::FaultChanged
+            | JournalGap::FaultUnreadable
+            | JournalGap::Malformed
+            | JournalGap::CounterUnprovable
+            | JournalGap::ResourceUnavailable
+            | JournalGap::Discarded
+            | JournalGap::H3Loss => {
+                // Irreversible refusals first: staged unbounded
+                // abandonments refuse their incarnations permanently
+                // BEFORE staged custody is dropped, so a void can
+                // never erase them into a recoverable fence.
+                effects = self.preserve_abandonment_refusals(model);
+                effects
+                    .effects
+                    .extend(self.fence_void(model, self.consumed_through).effects);
+                self.void_staged();
+                if gap == JournalGap::H3Loss {
+                    // Forgive the voided H0 interval: re-presented
+                    // barriers at or below it wait for clean
+                    // evidence instead of voiding twice. The void
+                    // report acknowledges the consumed barrier to
+                    // the finalizer through the joint tick.
+                    self.h3_voided_below = self.h3_voided_below.max(audit.h0_below);
+                    h3_voided = Some(self.h3_voided_below);
+                }
+                if gap == JournalGap::FaultChanged {
+                    // Re-baseline the cumulative chain on the
+                    // freshest observed epoch: the audited close or
+                    // the seal-time re-read, whichever is newer.
+                    let freshest = audit
+                        .fault_after
+                        .max(seal_epoch.unwrap_or(audit.fault_after));
+                    self.last_fault = Some(freshest);
+                }
+            }
+            JournalGap::H3Pending | JournalGap::ClosureStale => {}
+            _ => {}
+        }
+        SealFailure {
+            gap,
+            effects,
+            h3_voided,
+            scope,
+        }
+    }
+
+    #[cfg(test)]
     fn seal_inner(
         &mut self,
         model: &mut ObjectSemantics,
@@ -3617,6 +3647,65 @@ impl JournalAdapter {
             return Err(self.failure(JournalGap::FrontierRegression));
         }
         self.audit_collected(model, audit, fault)?;
+        self.seal_domain_inner(
+            model,
+            audit,
+            bootstrap,
+            ConsumptionOrdinal(frontier),
+            births,
+        )
+    }
+
+    /// Per-domain conversion under the frame's already adjudicated collection.
+    /// The opaque input can only be minted by that frame. A fresh fault read
+    /// may add a later broad loss; it never takes or re-audits H3/counters.
+    fn seal_in_audit(
+        &mut self,
+        model: &mut ObjectSemantics,
+        input: joint_audit::AuditedDomainInput<'_>,
+        births: &mut impl BirthEvidenceSource,
+        fault: &impl FaultEpoch,
+    ) -> Result<SealSuccess, SealFailure> {
+        let (audit, bootstrap, frontier) = input.into_parts();
+        let requested = self.retained_failure_domain(bootstrap);
+        let outcome = (|| {
+            self.check_collection_owner(audit)?;
+            if frontier.0 > self.consumed_through {
+                return Err(self.failure(JournalGap::FrontierRegression));
+            }
+            let reading = fault.fault_epoch();
+            let gap = match reading {
+                Err(FaultReadError::Saturated) => Some(JournalGap::FaultSaturated),
+                Err(FaultReadError::Unreadable) => Some(JournalGap::FaultUnreadable),
+                Ok(epoch) if epoch > u64::from(u32::MAX) => Some(JournalGap::FaultSaturated),
+                Ok(epoch) if epoch != audit.fault_after => Some(JournalGap::FaultChanged),
+                Ok(_) => None,
+            };
+            if let Some(gap) = gap {
+                return Err(self.reject_audit(model, audit, gap, reading));
+            }
+            self.seal_domain_inner(model, audit, bootstrap, frontier, births)
+        })();
+        outcome.map_err(|mut failure| {
+            if matches!(failure.scope, SealFailureScope::Unqualified)
+                && failure.gap != JournalGap::DrainMismatch
+                && let Some(domain) = requested
+            {
+                failure.scope = SealFailureScope::Domain(domain);
+            }
+            failure
+        })
+    }
+
+    fn seal_domain_inner(
+        &mut self,
+        model: &mut ObjectSemantics,
+        audit: &JournalAuditReceipt,
+        bootstrap: &BootstrapReceipt,
+        frontier: ConsumptionOrdinal,
+        births: &mut impl BirthEvidenceSource,
+    ) -> Result<SealSuccess, SealFailure> {
+        let frontier = frontier.0;
         let key = bootstrap.proof().key;
         let Some(state) = self.keys.get(&key) else {
             return Err(self.failure(JournalGap::BootstrapMismatch));
@@ -3977,6 +4066,60 @@ impl JournalAdapter {
                 .unwrap_or(0)
                 >= need
         })
+    }
+
+    fn awaits_future_terminal(
+        &self,
+        bootstrap: &BootstrapReceipt,
+        frontier: ConsumptionOrdinal,
+    ) -> bool {
+        if self.has_unbound_staging(frontier.0) {
+            return false;
+        }
+        let key = bootstrap.proof().key;
+        let live = self.live_keys_for_image((key.cookie, key.exec));
+        if self
+            .refused
+            .iter()
+            .any(|entry| entry.image == (key.cookie, key.exec) && entry.cut <= frontier.0)
+        {
+            return false;
+        }
+        let mut waiting = false;
+        let mut needed = BTreeMap::<CallFingerprint, usize>::new();
+        for entry in self.open.values().filter(|entry| {
+            entry.image == (key.cookie, key.exec)
+                && entry.begin_ordinal <= frontier.0
+                && entry.converted_ticket.is_none()
+        }) {
+            let fingerprint = fingerprint_of_begin(&entry.begin);
+            match self.attribute_call(key, &fingerprint, &live) {
+                CallAttribution::Sibling => {}
+                CallAttribution::Mine => {
+                    *needed.entry(fingerprint).or_default() += 1;
+                }
+                CallAttribution::Unclaimed => {
+                    let any_claim = self.claims.get(&fingerprint).is_some_and(|claimants| {
+                        claimants.values().any(|claims| !claims.is_empty())
+                    });
+                    if any_claim
+                        || entry.end.is_some()
+                        || entry.abandon.is_some()
+                        || entry.corroborated_return.is_some()
+                    {
+                        return false;
+                    }
+                    waiting = true;
+                }
+            }
+        }
+        waiting
+            && needed.into_iter().all(|(fingerprint, count)| {
+                self.claims
+                    .get(&fingerprint)
+                    .and_then(|claimants| claimants.get(&key))
+                    .is_some_and(|claims| claims.len() >= count)
+            })
     }
 
     /// Whether one staged open entry converts under a sealing key: its
@@ -4866,16 +5009,11 @@ impl JournalAdapter {
     }
 }
 
-/// The production joint seal tick (H8): Session-owned orchestration of
-/// one journal quantum. Each tick collects through the Session drain,
-/// takes the H3 disposition from the actual finalizer, audits, seals,
-/// and forwards the seal's void report back to the finalizer — the
-/// acknowledgement flows through this production path, never through
-/// test orchestration. All I/O is injected: production wires the live
-/// drain, fault cell and finalizer (privileged execution stays UNRUN);
-/// tests wire scripted ones. Construct once per Session; tick per
-/// quantum.
-#[allow(dead_code)] // No Session-loop caller until live activation; tests drive it.
+/// Legacy single-domain algorithm driver. It remains only under cfg(test)
+/// for existing wire/model controls. Production collection, audit, all-domain
+/// delivery and delayed acknowledgement require the owned joint audit frame.
+#[cfg(test)]
+#[allow(dead_code)] // Legacy algorithm driver; production requires the owned audit frame.
 pub(crate) struct JointSealTick<'a, S, F, H> {
     adapter: &'a mut JournalAdapter,
     model: &'a mut ObjectSemantics,
@@ -4888,6 +5026,7 @@ pub(crate) struct JointSealTick<'a, S, F, H> {
     producers: &'a crate::attach::SessionDrainProducers,
 }
 
+#[cfg(test)]
 #[allow(dead_code)] // As above.
 impl<'a, S, F, H> JointSealTick<'a, S, F, H>
 where

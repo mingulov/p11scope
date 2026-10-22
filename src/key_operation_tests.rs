@@ -1107,7 +1107,7 @@ fn key_operation_fallback_and_history_loss() {
         u64::MAX,
         Some(1),
     ));
-    let (outcome, refused) = staging.apply_failure(
+    let (outcome, refused) = staging.apply_algorithm_failure_for_test(
         &failure,
         &mut pending_source,
         &scene.model,
@@ -1126,7 +1126,7 @@ fn key_operation_fallback_and_history_loss() {
     // With the explicit complete stream, retained calls replay once
     // in original order through ordinary S1, then S1Only forever.
     let mut clean_source = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
-    let (outcome, refused) = staging.apply_failure(
+    let (outcome, refused) = staging.apply_algorithm_failure_for_test(
         &failure,
         &mut clean_source,
         &scene.model,
@@ -1203,7 +1203,7 @@ fn key_operation_fallback_and_history_loss() {
         .expect_err("moved fault voids the seal");
     assert_eq!(failure.gap, JournalGap::FaultChanged);
     let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
-    let (outcome, refused) = staging.apply_failure(
+    let (outcome, refused) = staging.apply_algorithm_failure_for_test(
         &failure,
         &mut h3,
         &scene.model,
@@ -1453,7 +1453,7 @@ fn key_operation_joint_retry_and_degraded_inert() {
         .expect_err("short H3 coverage pends");
     assert_eq!(failure.gap, JournalGap::H3Pending);
     let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
-    let (outcome, refused) = staging.apply_failure(
+    let (outcome, refused) = staging.apply_algorithm_failure_for_test(
         &failure,
         &mut h3,
         &scene.model,
@@ -1514,7 +1514,7 @@ fn key_operation_joint_retry_and_degraded_inert() {
         .expect_err("own birth proof mismatches");
     assert_eq!(failure.gap, JournalGap::BootstrapMismatch);
     let mut loss_source = ScriptedH3Source::once(H3DispositionEvidence::scripted_loss(5));
-    let (outcome, refused) = staging.apply_failure(
+    let (outcome, refused) = staging.apply_algorithm_failure_for_test(
         &failure,
         &mut loss_source,
         &scene.model,
@@ -1533,7 +1533,7 @@ fn key_operation_joint_retry_and_degraded_inert() {
 
     // --- Post-degradation outcomes are inert, never touching S1Only. ---
     let calls_before = joint.calls();
-    let (outcome, refused) = staging.apply_failure(
+    let (outcome, refused) = staging.apply_algorithm_failure_for_test(
         &failure,
         &mut loss_source,
         &scene.model,
@@ -1708,7 +1708,7 @@ fn key_operation_fallback_invalidates_before_replay() {
         .adapter
         .scripted_failure(JournalGap::ClosureStale, &bootstrap, effects);
     let mut clean = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
-    let (outcome, _) = staging.apply_failure(
+    let (outcome, _) = staging.apply_algorithm_failure_for_test(
         &failure,
         &mut clean,
         &scene.model,
@@ -1854,7 +1854,7 @@ fn key_operation_n3_held_multicall_applies_invalidations() {
         crate::semantics_objects::ObjectEffects::default(),
     );
     let mut clean = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
-    let (outcome, _) = staging.apply_failure(
+    let (outcome, _) = staging.apply_algorithm_failure_for_test(
         &failure,
         &mut clean,
         &scene.model,
@@ -1947,7 +1947,7 @@ fn key_operation_n3_held_failure_paths_apply_invalidations() {
         u64::MAX,
         Some(1),
     ));
-    let (outcome, refused) = staging.apply_failure(
+    let (outcome, refused) = staging.apply_algorithm_failure_for_test(
         &failure,
         &mut pending,
         &scene.model,
@@ -1984,7 +1984,7 @@ fn key_operation_n3_held_failure_paths_apply_invalidations() {
         &bootstrap,
         crate::semantics_objects::ObjectEffects::default(),
     );
-    let (outcome, _) = staging.apply_failure(
+    let (outcome, _) = staging.apply_algorithm_failure_for_test(
         &failure,
         &mut clean,
         &scene.model,
@@ -2052,7 +2052,7 @@ fn key_operation_n3_held_failure_paths_apply_invalidations() {
         .adapter
         .scripted_failure(JournalGap::H3Pending, &bootstrap, effects);
     let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
-    let (outcome, refused) = staging.apply_failure(
+    let (outcome, refused) = staging.apply_algorithm_failure_for_test(
         &failure,
         &mut h3,
         &scene.model,
@@ -2574,7 +2574,7 @@ fn key_operation_s1_matrix_through_both_feeds() {
         )
         .expect_err("own birth proof mismatches");
     let mut clean = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
-    let (outcome, _) = staging.apply_failure(
+    let (outcome, _) = staging.apply_algorithm_failure_for_test(
         &failure,
         &mut clean,
         &scene.model,
@@ -5073,7 +5073,7 @@ fn key_operation_c2_foreign_namespace_failure_preserves_live_history() {
         .expect_err("the foreign adapter really observes native loss");
     assert_eq!(failure.gap, JournalGap::FaultChanged);
     let mut finalizer = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
-    let (outcome, _) = staging.apply_failure(
+    let (outcome, _) = staging.apply_algorithm_failure_for_test(
         &failure,
         &mut finalizer,
         &foreign.model,
@@ -5161,7 +5161,7 @@ fn key_operation_c2_foreign_namespace_registry_delivery_keeps_projection() {
                 .seal_with_fault(7, 8)
                 .expect_err("genuine foreign loss");
             assert_eq!(
-                own.registry.deliver_joint_failure(
+                own.registry.deliver_joint_algorithm_failure_for_test(
                     id,
                     &failure,
                     &mut finalizer,
@@ -5274,7 +5274,7 @@ fn key_operation_c2_early_loss_scope_comes_from_adapter_not_request() {
     let mut finalizer = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
     assert_eq!(
         foreign_staging
-            .apply_failure(
+            .apply_algorithm_failure_for_test(
                 &failure,
                 &mut finalizer,
                 &own.model,
@@ -5291,7 +5291,7 @@ fn key_operation_c2_early_loss_scope_comes_from_adapter_not_request() {
     assert_eq!(foreign_staging.staged_len(), 1);
     assert_eq!(
         staging
-            .apply_failure(
+            .apply_algorithm_failure_for_test(
                 &failure,
                 &mut finalizer,
                 &own.model,
@@ -5308,7 +5308,7 @@ fn key_operation_c2_early_loss_scope_comes_from_adapter_not_request() {
     assert_eq!(staging.history_disposed(), 1);
     assert_eq!(
         staging
-            .apply_failure(
+            .apply_algorithm_failure_for_test(
                 &failure,
                 &mut finalizer,
                 &own.model,
@@ -5364,7 +5364,7 @@ fn key_operation_c2_unknown_request_is_inert_and_own_receipt_refresh_keeps_front
     let mut finalizer = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
     assert_eq!(
         staging
-            .apply_failure(
+            .apply_algorithm_failure_for_test(
                 &failure,
                 &mut finalizer,
                 &own.model,
@@ -6779,7 +6779,7 @@ fn key_operation_g29_delivery_equivalence_matrix() {
     );
     let mut clean = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
     assert_eq!(
-        guarded.registry.deliver_joint_failure(
+        guarded.registry.deliver_joint_algorithm_failure_for_test(
             joint_id,
             &failure,
             &mut clean,
@@ -6830,7 +6830,7 @@ fn key_operation_g29_delivery_equivalence_matrix() {
     );
     let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
     assert_eq!(
-        guarded.registry.deliver_joint_failure(
+        guarded.registry.deliver_joint_algorithm_failure_for_test(
             joint_id,
             &failure,
             &mut h3,
@@ -7715,7 +7715,7 @@ fn key_operation_schema_contract() {
     );
     let clean = H3DispositionEvidence::scripted_clean(u64::MAX);
     let mut h3 = ScriptedH3Source::once(clean);
-    let (outcome, _) = fall_staging.apply_failure(
+    let (outcome, _) = fall_staging.apply_algorithm_failure_for_test(
         &failure,
         &mut h3,
         &fall_scene.model,
@@ -7764,7 +7764,7 @@ fn key_operation_schema_contract() {
     );
     // HistoryLoss never consults the finalizer: any scripted source will do.
     let mut loss_h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
-    let (outcome, _) = loss_staging.apply_failure(
+    let (outcome, _) = loss_staging.apply_algorithm_failure_for_test(
         &loss_failure,
         &mut loss_h3,
         &loss_scene.model,
@@ -9461,7 +9461,7 @@ fn key_operation_joint_failure_delivery_retains_projection() {
         .expect_err("moved fault voids the seal");
     assert_eq!(failure.gap, JournalGap::FaultChanged);
     let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
-    let outcome = guarded.registry.deliver_joint_failure(
+    let outcome = guarded.registry.deliver_joint_algorithm_failure_for_test(
         joint_id,
         &failure,
         &mut h3,
@@ -9491,7 +9491,7 @@ fn key_operation_joint_failure_delivery_retains_projection() {
     // Unknown instances ignore without effect.
     let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
     assert_eq!(
-        guarded.registry.deliver_joint_failure(
+        guarded.registry.deliver_joint_algorithm_failure_for_test(
             RegistryInstanceId::from_raw(99),
             &failure,
             &mut h3,
@@ -9717,7 +9717,7 @@ fn key_operation_n14_fallback_replay_reserves_and_disposes_on_refusal() {
     );
     let mut clean = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
     let before = guarded.registry.semantic_resource_snapshot().charged_bytes;
-    let outcome = guarded.registry.deliver_joint_failure(
+    let outcome = guarded.registry.deliver_joint_algorithm_failure_for_test(
         joint_id,
         &failure,
         &mut clean,
@@ -9784,7 +9784,7 @@ fn key_operation_n14_fallback_replay_reserves_and_disposes_on_refusal() {
         crate::semantics_objects::ObjectEffects::default(),
     );
     let mut clean = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
-    let outcome = guarded.registry.deliver_joint_failure(
+    let outcome = guarded.registry.deliver_joint_algorithm_failure_for_test(
         joint_id,
         &failure,
         &mut clean,
@@ -10105,7 +10105,7 @@ fn key_operation_n15_post_fallback_terminals_still_accounted() {
     );
     let mut clean = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
     assert_eq!(
-        guarded.registry.deliver_joint_failure(
+        guarded.registry.deliver_joint_algorithm_failure_for_test(
             a_id,
             &failure,
             &mut clean,
@@ -10163,7 +10163,7 @@ fn key_operation_n15_post_loss_s1_still_accounted() {
     );
     let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
     assert_eq!(
-        guarded.registry.deliver_joint_failure(
+        guarded.registry.deliver_joint_algorithm_failure_for_test(
             a_id,
             &failure,
             &mut h3,
@@ -10500,7 +10500,7 @@ fn key_operation_c4_missing_ledger_falls_back_in_order() {
         .expect_err("foreign loss is adapter-minted");
     let mut finalizer = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
     assert_eq!(
-        guarded.registry.deliver_joint_failure(
+        guarded.registry.deliver_joint_algorithm_failure_for_test(
             joint_id,
             &failure,
             &mut finalizer,

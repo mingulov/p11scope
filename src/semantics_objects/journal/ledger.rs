@@ -109,6 +109,22 @@ impl StagingLedger {
         self.reserver.is_some()
     }
 
+    #[cfg(test)]
+    pub(crate) fn roles_for_test(&self) -> [usize; 5] {
+        [
+            Role::Raw,
+            Role::H8Open,
+            Role::Model,
+            Role::H9Staged,
+            Role::Association,
+        ]
+        .map(|role| {
+            self.table
+                .as_ref()
+                .map_or(0, |table| table.population(role))
+        })
+    }
+
     /// Audit custody uses this ledger's existing pool, never a supplied budget.
     pub(super) fn resource_reserver(&self) -> Option<&SemanticResourceReserver> {
         self.reserver.as_ref()

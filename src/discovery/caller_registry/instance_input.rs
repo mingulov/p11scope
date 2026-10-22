@@ -117,6 +117,26 @@ impl fmt::Debug for InstanceKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct RegistryInstanceId(u32);
 
+/// Read-only target from an actual registered Joint feed. Only registry
+/// iteration constructs it; copied numeric IDs cannot install a receipt.
+#[derive(Clone, Copy)]
+pub(crate) struct JointFeedTarget {
+    id: RegistryInstanceId,
+    caller: CallerId,
+    bootstrap: crate::semantics_objects::journal::BootstrapReceipt,
+}
+impl JointFeedTarget {
+    pub(crate) fn id(&self) -> RegistryInstanceId {
+        self.id
+    }
+    pub(crate) fn caller(&self) -> CallerId {
+        self.caller
+    }
+    pub(crate) fn bootstrap(&self) -> &crate::semantics_objects::journal::BootstrapReceipt {
+        &self.bootstrap
+    }
+}
+
 impl RegistryInstanceId {
     /// The raw registry instance number (H9 key-row attribution).
     pub(crate) const fn from_raw(raw: u32) -> Self {
@@ -719,6 +739,26 @@ impl CallerRegistry {
         self.joint_feeds
     }
 
+    pub(crate) fn joint_feed_targets(&self) -> impl Iterator<Item = JointFeedTarget> + '_ {
+        self.instance_state.semantics.values().filter_map(|record| {
+            if record.feed.mode() != FeedMode::Joint {
+                return None;
+            }
+            Some(JointFeedTarget {
+                id: record.id,
+                caller: record.caller,
+                bootstrap: *record.feed.selected_receipt()?,
+            })
+        })
+    }
+
+    pub(crate) fn joint_staged_count(&self, target: &JointFeedTarget) -> Option<usize> {
+        let record = self.instance_state.semantics.get(&target.id)?;
+        (record.caller == target.caller
+            && record.feed.selected_receipt()?.domain() == target.bootstrap.domain())
+        .then_some(record.feed.staged_len())
+    }
+
     /// Tests-only feed-mode read (N1): the feed an instance's
     /// registration selected.
     #[cfg(test)]
@@ -793,6 +833,45 @@ impl CallerRegistry {
     pub(crate) fn deliver_joint_failure(
         &mut self,
         id: RegistryInstanceId,
+        failure: &crate::semantics_objects::journal::joint_audit::AuditedFailure<'_>,
+        model: &crate::semantics_objects::ObjectSemantics,
+        ledger: &mut crate::semantics_objects::journal::StagingLedger,
+    ) -> crate::semantics_key_use::FailureApplyOutcome {
+        use crate::semantics_key_use::FailureApplyOutcome;
+        let Some(record) = self.instance_state.semantics.get_mut(&id) else {
+            return FailureApplyOutcome::Ignored;
+        };
+        if !record.feed.accepts_failure(failure.failure()) {
+            return FailureApplyOutcome::Ignored;
+        }
+        let was_joint = record.feed.mode() == FeedMode::Joint;
+        let Some(reducer) = record.semantics.as_mut() else {
+            return FailureApplyOutcome::Ignored;
+        };
+        let mut outer = NoSink;
+        let (outcome, refused) = record.feed.apply_failure(
+            failure,
+            model,
+            ledger,
+            reducer,
+            &mut self.joint_keyuse,
+            id,
+            &mut outer,
+            Some(&mut self.assoc_fallback),
+        );
+        self.instance_state.semantic_refused =
+            self.instance_state.semantic_refused.saturating_add(refused);
+        self.after_joint_delivery(id, was_joint, model);
+        outcome
+    }
+
+    /// Deliver one H8 seal failure (guarded H9 path): loss disposal
+    /// or proof-only fallback through the shared reducer, then the
+    /// H8 projection is retained for capture. Same holds as seals.
+    #[cfg(test)]
+    pub(crate) fn deliver_joint_algorithm_failure_for_test(
+        &mut self,
+        id: RegistryInstanceId,
         failure: &crate::semantics_objects::journal::SealFailure,
         finalizer: &mut impl crate::semantics_objects::journal::H3EvidenceSource,
         model: &crate::semantics_objects::ObjectSemantics,
@@ -810,7 +889,7 @@ impl CallerRegistry {
             return FailureApplyOutcome::Ignored;
         };
         let mut outer = NoSink;
-        let (outcome, refused) = record.feed.apply_failure(
+        let (outcome, refused) = record.feed.apply_algorithm_failure_for_test(
             failure,
             finalizer,
             model,

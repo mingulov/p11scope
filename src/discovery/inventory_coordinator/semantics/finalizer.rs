@@ -99,6 +99,43 @@ impl<'session> SessionAuditInput<'session> {
     }
 }
 
+/// Ephemeral disjoint borrows from one canonical coordinator. Births borrow
+/// the same move-only binding set as the target chosen by the audit frame.
+pub(crate) struct JointPublicationPorts<'session> {
+    registry: &'session mut crate::discovery::caller_registry::CallerRegistry,
+    owner: &'session mut crate::semantics_objects::journal::joint_driver::JointCaptureOwner,
+    bindings: &'session SemanticBindingSet,
+    finalizer: SessionH3Finalizer<'session>,
+    producers: &'session SessionDrainProducers,
+}
+type JointReadPorts<'a> = (
+    &'a crate::discovery::caller_registry::CallerRegistry,
+    &'a crate::semantics_objects::journal::joint_driver::JointCaptureOwner,
+    &'a SemanticBindingSet,
+    &'a SessionDrainProducers,
+);
+type JointMutablePorts<'a, 'session> = (
+    &'a mut crate::discovery::caller_registry::CallerRegistry,
+    &'a mut crate::semantics_objects::journal::joint_driver::JointCaptureOwner,
+    &'a SemanticBindingSet,
+    &'a mut SessionH3Finalizer<'session>,
+    &'a SessionDrainProducers,
+);
+impl<'session> JointPublicationPorts<'session> {
+    pub(crate) fn read(&self) -> JointReadPorts<'_> {
+        (self.registry, self.owner, self.bindings, self.producers)
+    }
+    pub(crate) fn split(&mut self) -> JointMutablePorts<'_, 'session> {
+        (
+            self.registry,
+            self.owner,
+            self.bindings,
+            &mut self.finalizer,
+            self.producers,
+        )
+    }
+}
+
 impl SessionH3Finalizer<'_> {
     /// Read-only gate: originals must have left the one pending handoff and
     /// produced an untaken disposition in this exact retained Session.
@@ -135,6 +172,44 @@ impl H3FinalizerPort for SessionH3Finalizer<'_> {
 }
 
 impl<Source: ProcessSource> InventoryCoordinator<Source> {
+    /// No insertion/rebinding, H3 take or revision change. The existing
+    /// Session and retained EVENTS allocation must already match the owner.
+    #[cfg_attr(not(test), allow(dead_code))] // Ordinary Joint activation remains gated.
+    pub(crate) fn joint_frame_ports<'session>(
+        &'session mut self,
+        producers: &'session SessionDrainProducers,
+    ) -> Result<
+        JointPublicationPorts<'session>,
+        crate::semantics_objects::journal::joint_driver::RawQuantumRefusal,
+    > {
+        use crate::semantics_objects::journal::joint_driver::RawQuantumRefusal;
+        if !self.joint_capture.adapter().retains_producers(producers) {
+            return Err(RawQuantumRefusal::ForeignCapture);
+        }
+        let state = self
+            .semantic_finalizer
+            .as_mut()
+            .ok_or(RawQuantumRefusal::H3Undisposed)?;
+        if state.domain != producers.native_domain()
+            || !state
+                .producers
+                .as_ref()
+                .is_some_and(|held| held.same_producers(producers))
+        {
+            return Err(RawQuantumRefusal::ForeignCapture);
+        }
+        if state.pending_semantic.is_some() || state.pending_drop.is_some() {
+            return Err(RawQuantumRefusal::H3Undisposed);
+        }
+        Ok(JointPublicationPorts {
+            registry: &mut self.registry,
+            owner: &mut self.joint_capture,
+            bindings: &self.semantic_bindings,
+            finalizer: SessionH3Finalizer { state, producers },
+            producers,
+        })
+    }
+
     /// The genuine fixture's initial history uses the canonical owner on
     /// both sides of delivery; no external model can be substituted.
     #[cfg(test)]

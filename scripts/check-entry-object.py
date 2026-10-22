@@ -74,8 +74,8 @@ def address(state, base, sign, offset):
         return (fact[0], fact[1] + delta)
     if fact[0] == "descriptor":
         return ("descriptor", fact[1], delta)
-    if fact[0] == "owned":
-        return ("owned", fact[1], fact[2] + delta)
+    if fact[0] in ("owned", "side"):
+        return (fact[0], fact[1], fact[2] + delta)
     if fact[0] in ("function_value", "external_key"):
         return (fact[0], fact[1], fact[2] + delta)
     return None
@@ -933,14 +933,114 @@ def ia32_reader_contract(internal_blocks, internal_calls):
         D.relative_target(span[0], reader_consumer.text[span[0]]), user_reads[0], {},
         {pc for pc, text in reader if text == "exit"},
         register_transfer=lambda pc, state: ia32_register_transfer(reader_consumer.text[pc], state))
+    ia32_reader_return_contract(reader_consumer)
+
+
+def ia32_reader_return_contract(consumer):
+    """Only a successful, guarded four-byte read may return a payload word.
+
+    Track the u32 input, normalized RSP, slot expression and helper result
+    independently. Rejected paths must retain the sentinel; merely finding
+    guards or a u32 load somewhere in the body supplies no success summary.
+    """
+    initial = {"r1": ("reader_rsp", False), "r2": ("reader_index", False), "r10": ("stack", 0)}
+    pending = [(consumer.insns[0][0], initial, frozenset())]
+    seen, witnessed = set(), False
+    payload = ("scalar", "ia32_reader", 32)
+    while pending:
+        pc, before, ancestors = pending.pop()
+        error = lambda message: consumer.label(pc) + ": ia32 reader " + message
+        require(pc in consumer.text and pc not in ancestors, error("payload path escapes or cycles"))
+        signature = (pc, repr(sorted(before.items(), key=lambda pair: repr(pair[0]))))
+        if signature in seen:
+            continue
+        seen.add(signature)
+        text = consumer.text[pc]
+        after = consumer.step(pc, before)
+        if move := re.fullmatch(r"([rw]\d+) = ([rw]\d+)", text):
+            fact = value(before, move[2])
+            if "w" in (move[1][0], move[2][0]) and fact and fact[0] in ("reader_index", "reader_rsp"):
+                after[reg(move[1])] = (fact[0], True)
+        if arithmetic := re.fullmatch(r"(r\d+) (<<=|>>=|\+=) ([rw]\d+|-?0x[0-9a-f]+)", text):
+            dst, op, operand = arithmetic.groups()
+            left, right = before.get(dst), value(before, operand)
+            if left and right == ("constant", 32) and op == "<<=" and left[0] in ("reader_index", "reader_rsp", "reader_offset"):
+                after[dst] = ("reader_shift", left)
+            elif left and left[0] == "reader_shift" and right == ("constant", 32) and op == ">>=":
+                original = left[1]
+                after[dst] = original[:-1] + (True,)
+            elif left and left[0] == "reader_index" and op == "<<=" and right == ("constant", 2):
+                after[dst] = ("reader_offset", 4, 0, False)
+            elif left == ("reader_offset", 4, 0, False) and op == "+=" and right == ("constant", 4):
+                after[dst] = ("reader_offset", 4, 4, False)
+            elif left == ("reader_rsp", True) and op == "+=" and right == ("reader_offset", 4, 4, True):
+                after[dst] = ("reader_address", 4, 4)
+        if text.startswith("call "):
+            require(pc in consumer.helper and text == "call 0x70", error("helper has unknown callee footprint"))
+            output = before.get("r1")
+            require(before.get(("reader_index_ok",)) and before.get(("reader_span_ok",))
+                    and before.get("r3") == ("reader_address", 4, 4), error("index/address gate bypassed before helper"))
+            require(before.get("r2") == ("constant", 4) and output and output[0] == "stack"
+                    and -512 <= output[1] and output[1]+4 <= 0, error("helper output/width outside local frame"))
+            after["r0"] = ("reader_rc", pc)
+            after[("reader_output",)] = output
+            after[("reader_success",)] = False
+        if load := LOAD.fullmatch(text):
+            output = address(before, load[3], load[4], load[5])
+            require(load[2] == "32" and output == before.get(("reader_output",))
+                    and before.get(("reader_index_ok",)) and before.get(("reader_span_ok",))
+                    and before.get(("reader_success",)), error("payload load lacks successful index/span/helper proof"))
+            after[reg(load[1])] = payload
+        require(not STORE.fullmatch(text) and not ("atomic" in text or "xchg" in text or text.startswith("lock ")),
+                error("payload leaf has an unsupported memory write"))
+        if text == "exit":
+            result = before.get("r0")
+            require(result == ("constant", 1 << 32) or result == payload,
+                    error("payload return is neither the failure sentinel nor the read u32"))
+            witnessed |= result == payload
+            continue
+        for successor in consumer.graph[pc]:
+            state = after.copy()
+            if branch := BRANCH.fullmatch(text):
+                left, op, right = value(before, branch[1]), branch[2], value(before, branch[3])
+                taken = successor == D.relative_target(pc, text)
+                if left == ("reader_index", True):
+                    require(op == ">" and right == ("constant", 6), error("index gate must reject every value above six"))
+                    state[("reader_index_ok",)] = not taken
+                elif left == ("reader_address", 4, 4):
+                    require(branch[1].startswith("r") and op == ">" and right == ("constant", 0xfffffffc),
+                            error("payload address needs the complete four-byte span"))
+                    state[("reader_span_ok",)] = not taken
+                elif left and left[0] == "reader_rc":
+                    require(branch[1].startswith("r") and op in ("==", "!=") and right == ("constant", 0),
+                            error("helper result needs an exact full-width zero test"))
+                    state[("reader_success",)] = taken == (op == "==")
+                else:
+                    require(left and right and left[0] == right[0] == "constant",
+                            error("index/helper predicate provenance lost"))
+                    if compare(left[1], op, right[1], 32 if branch[1].startswith("w") else 64) != taken:
+                        continue
+            pending.append((successor, state, ancestors | {pc}))
+    require(witnessed, consumer.name + ": ia32 reader has no successful payload return")
 
 
 def scalar_body_contract(internal_blocks, internal_calls, variant):
+    def calls_contract(consumer, callees, helpers):
+        # These summaries preserve caller memory only for the exact checked
+        # effects. An unresolved pseudo-call has no such preservation claim.
+        for pc, text in consumer.insns:
+            if text.startswith("call "):
+                require((pc in consumer.helper and text in helpers)
+                        or (pc not in consumer.helper and consumer.calls.get(pc) in callees),
+                        consumer.label(pc) + ": scalar-read unknown callee/helper footprint")
+
     ia32_reader_contract(internal_blocks, internal_calls)
     names = [name for name in internal_blocks if name.endswith("arg_u64")]
     require(len(names) == 1, "scalar-read Result callee inventory")
     name = names[0]
+    argument_name = name
     consumer = Consumer(".text", name, internal_blocks[name], internal_calls.get(name, {}))
+    calls_contract(consumer, {"p11_read_ia32_arg"}, {"call 0x70"})
     instructions = consumer.insns
     helper_reads = [pc for pc, text in instructions if pc in consumer.helper and text == "call 0x70"]
     require(len(helper_reads) == 1, "scalar-read LP64 user-helper inventory")
@@ -967,6 +1067,7 @@ def scalar_body_contract(internal_blocks, internal_calls, variant):
     require(len(names) == 1, "scalar-read Option callee inventory")
     name = names[0]
     consumer = Consumer(".text", name, internal_blocks[name], internal_calls.get(name, {}))
+    calls_contract(consumer, {argument_name}, {"call 0x1"})
     argument_calls = [pc for pc, target in consumer.calls.items() if target.endswith("arg_u64")]
     require(len(argument_calls) == 1 and not any(pc in consumer.helper and text == "call 0x70"
             for pc, text in consumer.insns), "scalar-read Result boundary inventory")
@@ -1564,9 +1665,17 @@ class _ReturnCaller(_SeedCaller):
                 state.pop(("event_user_type",), None)
         if pc in self.helper and text == "call 0x83":
             state.pop(("event_user_type",), None)
-        if target == "memset" or pc in self.helper and text in ("call 0x70", "call 0x72"):
-            pointer = incoming.get("r1")
-            size = incoming.get("r3" if target == "memset" else "r2")
+        output = None
+        if target == "memset":
+            output = (incoming.get("r1"), incoming.get("r3"))
+        elif target == "p11_link_current_identity":
+            output = (incoming.get("r1"), ("constant", 16))
+        elif target == "p11_instance_return":
+            output = (incoming.get("r2"), ("constant", 40))
+        elif pc in self.helper and text in ("call 0x70", "call 0x72"):
+            output = (incoming.get("r1"), incoming.get("r2"))
+        if output:
+            pointer, size = output
             if pointer and pointer[0] == "event" and (not size or size[0] != "constant"
                     or pointer[1] < 0x74 and 0x70 < pointer[1]+size[1]):
                 state.pop(("event_user_type",), None)
@@ -1576,7 +1685,7 @@ class _ReturnCaller(_SeedCaller):
             state["r0"] = ("scope_flags", self.identity)
         if match := re.fullmatch(r"(r\d+) \+= (-?0x[0-9a-f]+)", text):
             fact = incoming.get(match[1])
-            if fact and fact[0] in ("owned", "external_key"):
+            if fact and fact[0] in ("owned", "side", "external_key"):
                 state[match[1]] = (fact[0], fact[1], fact[2]+int(match[2],16))
         # A tail adapter only writes its ObjectCallWire destination. The
         # base event and local snapshot are disjoint from that narrow region.
@@ -1597,6 +1706,11 @@ class _ReturnRootProof(SinkProof):
 
     def transfer(self, consumer, pc, before, state):
         text, target = consumer.text[pc], consumer.calls.get(pc, "")
+        if match := LOAD.fullmatch(text):
+            pointer = address(before, match[3], match[4], match[5])
+            if pointer and pointer[0] == "owned":
+                require(before.get(("live", pointer[1])),
+                        consumer.label(pc) + ": return START read after retirement")
         if text.startswith("call "):
             allowed = target in ("p11_owner_start_get", "p11_owner_start_remove", "p11_object_fault") or target.endswith("scope_flags_word") or pc in self.targets
             require(allowed if pc not in consumer.helper else text in ("call 0x1", "call 0xc", "call 0xe", "call 0xae"),
@@ -1621,6 +1735,10 @@ class _ReturnRootProof(SinkProof):
             require(before.get(("object_mode",)) == (role == "object"),
                     consumer.label(pc)+": return marker routing boundary")
             self.boundaries.add(pc)
+            # Each checked outlined return retires this same required START
+            # on every terminal path. The caller may retain snapshots, but
+            # returning from the callee cannot revive any saved row alias.
+            state.pop(("live", self.start[1]), None)
         return super().transfer(consumer, pc, before, state)
 
     def edges(self, consumer, pc, before, after):
@@ -1649,6 +1767,17 @@ class _ReturnProof(SinkProof):
     def transfer(self, consumer, pc, before, state):
         text, target = consumer.text[pc], consumer.calls.get(pc, "")
         error = lambda message: consumer.label(pc)+": return "+message
+        if target in ("memset", "p11_link_current_identity"):
+            pointer = before.get("r1")
+            length = before.get("r3") if target == "memset" else ("constant", 16)
+            require(length and length[0] == "constant" and length[1] > 0
+                    and (target != "memset" or before.get("r2") == ("constant", 0)),
+                    error("known output callee needs its bounded zero-fill/identity effect"))
+            size = length[1]
+            require(pointer and ((pointer[0] == "stack" and -512 <= pointer[1] and pointer[1]+size <= 0)
+                    or (pointer[0] == "event" and 0 <= pointer[1]
+                        and pointer[1]+size <= (608 if self.return_role == "object" else 368))),
+                    error("known output footprint reaches immutable START/key/context or leaves owned storage"))
         if text.startswith("call "):
             allowed = target in ("memset", "p11_link_current_identity", "p11_owner_start_remove", "p11_object_fault",
                                  "p11_object_side_get", "p11_instance_return", "p11_root_current_tag") or any(target.endswith(role) for role in self.emission_roles)
@@ -1665,7 +1794,7 @@ class _ReturnProof(SinkProof):
                     or before.get("r"+match[2], (None,))[0] == "result"), error("immutable or unknown atomic footprint"))
         if match := LOAD.fullmatch(text):
             pointer = address(before, match[3], match[4], match[5])
-            if pointer and pointer[0] == "owned":
+            if pointer and pointer[0] in ("owned", "side"):
                 require(before.get(("live", self.start[1])), error("START read after retirement"))
         if target in ("p11_owner_start_remove", "p11_object_side_get", "p11_instance_return"):
             key = before.get("r1")
@@ -1676,6 +1805,11 @@ class _ReturnProof(SinkProof):
             require(before.get("r2") == ("constant", 1) and not before.get(("retired",)), error("required single retirement attempt"))
             state[("retired",)] = True
             state["r0"] = ("retire_result", pc)
+        if target == "p11_object_side_get":
+            require(before.get("r2") == ("high", consumer.identity)
+                    and before.get("r3") in (("constant", 0), ("constant", 1)),
+                    error("side query descriptor/required boundary"))
+            state["r0"] = ("side", pc, 0)
         if target == "p11_object_fault":
             require(before.get(("retired",)), error("fault before retirement attempt"))
             state[("fault",)] = True
@@ -1684,7 +1818,10 @@ class _ReturnProof(SinkProof):
             require(self.return_role == "object" and before.get(("live", self.start[1])), error("side access after retirement"))
         for role in self.emission_roles:
             if target.endswith(role):
-                state["r0"] = ("emission_result", role)
+                side = before.get("r1" if role == "object_fill_return" else "r2")
+                require(side == ("constant", 0) or side and side[0] == "side" and side[2] == 0,
+                        error("side writer/read boundary needs the keyed query's original row"))
+                state["r0"] = ("constant", 0) if side == ("constant", 0) else ("emission_result", role)
         if target == "p11_instance_return":
             require(before.get("r2") == ("event", 0x148), error("continuity output boundary"))
             require(before.get(("live", self.start[1])) if self.return_role == "object" else before.get(("settled",)),
@@ -1713,6 +1850,14 @@ class _ReturnProof(SinkProof):
     def edges(self, consumer, pc, before, after):
         branch = BRANCH.fullmatch(consumer.text[pc])
         for successor, state in super().edges(consumer, pc, before, after):
+            if branch and (side := value(before, branch[1])) and side[0] == "side":
+                require(branch[1].startswith("r") and branch[2] in ("==", "!=")
+                        and value(before, branch[3]) == ("constant", 0),
+                        consumer.label(pc) + ": return side pointer needs a full-width null test")
+                if (successor == D.relative_target(pc, consumer.text[pc])) == (branch[2] == "=="):
+                    for key, fact in list(state.items()):
+                        if fact == side:
+                            state[key] = ("constant", 0)
             if branch and (fact := value(before, branch[1])) and fact[0] == "emission_result":
                 zero_taken = zero_partition(fact, branch[2], 64) if value(before, branch[3]) == ("constant", 0) else None
                 require(zero_taken is not None, consumer.label(pc)+": return emission result guard")

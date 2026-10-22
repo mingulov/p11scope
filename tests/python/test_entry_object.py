@@ -296,6 +296,15 @@ class EntryObjectTests(unittest.TestCase):
             # Bypassing the read is insufficient if the rejected path picks up
             # an uninitialized successful-read payload instead of the sentinel.
             payload = site(variant, name, r"[rw]\d+ = \*\(u32 \*\)\(r10 - 0x4\)")
+            self.assertTrue(all(CHECKER["contract"](OBJECTS[variant], variant)["verified"].values()))
+            for pattern in (r"if r1 > 0x6 goto .*", r"if r0 != 0x0 goto .*"):
+                guard = site(variant, name, pattern)
+                original = dict(insns)[guard]
+                changed = mutate(OBJECTS[variant], name, guard, original,
+                                 original.split(" goto ")[0]+f" goto {payload-guard-1:+#x}")
+                with self.subTest(variant=variant, mutation="non-span rejection reaches payload", guard=pattern):
+                    with self.assertRaisesRegex(RuntimeError, "ia32.*(rejection|sentinel|payload)"):
+                        CHECKER["contract"](changed, variant)
             with self.subTest(variant=variant, mutation="rejection returns payload"):
                 with self.assertRaisesRegex(RuntimeError, "ia32.*span.*sentinel"):
                     internal_contract(variant, "ia32_reader_contract",
@@ -387,6 +396,14 @@ class EntryObjectTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "ia32.*span"):
                     CHECKER["contract"](mutate(OBJECTS[variant], "p11_read_ia32_arg", pc,
                         old, re.sub(r"\br(\d+)\b", r"w\1", old)), variant)
+            for pattern, replacement in ((r"if r1 > 0x6 goto .*", lambda text: text.replace("0x6", "0x7")),
+                    (r"if r0 != 0x0 goto .*", lambda text: text.replace("r0", "w0")),
+                    (r"w6 = \*\(u32 \*\)\(r10 - 0x4\)", lambda text: text.replace("w6", "r6").replace("u32", "u64"))):
+                pc = site(variant, "p11_read_ia32_arg", pattern)
+                old = dict(instructions(variant, "p11_read_ia32_arg")[1])[pc]
+                with self.subTest(variant=variant, mutation=pattern), self.assertRaisesRegex(RuntimeError, "ia32.*(index|helper|payload)"):
+                    internal_contract(variant, "ia32_reader_contract",
+                        mutate(OBJECTS[variant], "p11_read_ia32_arg", pc, old, replacement(old)))
             elf = checker["Elf"](data)
             elf.symbols = [(symbol[0], 2, *symbol[2:]) if symbol[0] == "p11_read_ia32_arg"
                            else symbol for symbol in elf.symbols]
@@ -503,7 +520,24 @@ class EntryObjectTests(unittest.TestCase):
                 self.assertEqual(set(report["outlined"]), {"ordinary", "object"})
             root_name, root_insns = instructions(variant, "p11_return")
             root_texts = dict(root_insns)
+            epilogue, epilogue_text = next((pc, text) for pc, text in reversed(root_insns)
+                                           if text == "r0 = 0x0")
             for suffix in ("ordinary_return", "object_return"):
+                alias = before_call(variant, root_name, suffix, r"r8 &= 0x1")
+                # The accepted ABI is already 0/1 at this redundant mask.
+                # A value snapshot may cross the retiring callee; an alias
+                # to its original live START may not be read afterwards.
+                snapshot = mutate(OBJECTS[variant], root_name, alias, root_texts[alias],
+                                  "r9 = *(u32 *)(r0 + 0x38)")
+                snapshot = mutate(snapshot, root_name, epilogue, epilogue_text, "r0 = r9")
+                with self.subTest(variant=variant, call=suffix, control="caller snapshot survives retirement"):
+                    self.assertTrue(all(CHECKER["contract"](snapshot, variant)["verified"].values()))
+                stale = mutate(OBJECTS[variant], root_name, alias, root_texts[alias], "r9 = r0")
+                stale = mutate(stale, root_name, epilogue, epilogue_text,
+                               "r0 = *(u32 *)(r9 + 0x38)")
+                with self.subTest(variant=variant, call=suffix, control="caller alias cannot outlive retirement"):
+                    with self.assertRaisesRegex(RuntimeError, "return.*START read after retirement"):
+                        CHECKER["contract"](stale, variant)
                 for register, new in (("r1", "r1 = r10"), ("r2", "r2 += 0x8"),
                                       ("r3", "r3 = r10"), ("r4", "r4 = 0x0"), ("r5", "r5 = 0x2")):
                     pc = before_call(variant, root_name, suffix, register+r" (=|\+=) .*")
@@ -512,6 +546,15 @@ class EntryObjectTests(unittest.TestCase):
                             return_contract(variant, mutate(OBJECTS[variant], root_name, pc, root_texts[pc], new))
                 name, insns = instructions(variant, suffix)
                 texts = dict(insns)
+                if suffix == "object_return":
+                    clear = call_site(variant, name, "memset", 1)
+                    base, old_base = next((pc, text) for pc, text in reversed(insns) if pc < clear and text == "r1 = r7")
+                    offset, old_offset = next((pc, text) for pc, text in reversed(insns) if pc < clear and text == "r1 += 0x130")
+                    clobber = mutate(OBJECTS[variant], name, base, old_base, "r1 = r4")
+                    clobber = mutate(clobber, name, offset, old_offset, "r1 += 0x38")
+                    with self.subTest(variant=variant, control="known writer cannot clobber live START"):
+                        with self.assertRaisesRegex(RuntimeError, "return.*(immutable|footprint|output)"):
+                            CHECKER["contract"](clobber, variant)
                 # The caller's key is not this function's r10 frame.
                 pc, old = next((pc, text) for pc, text in insns
                                if re.fullmatch(r"r[14] = \*\(u64 \*\)\(r2 \+ 0x0\)", text))
@@ -855,6 +898,16 @@ class EntryObjectTests(unittest.TestCase):
                     entry_contract(variant, name, mutate(OBJECTS[variant], name, epilogue[0],
                         epilogue[1], "*(u64 *)(r5 + 0x0) = r4"))
             internal_contract(variant, "scalar_body_contract")
+            self.assertTrue(all(CHECKER["contract"](OBJECTS[variant], variant)["verified"].values()))
+            for suffix, pattern in (("arg_u64", r"r7 = 0x0"),
+                                    ("capture_scalar", r"r1 \|= 0x10")):
+                callee, body = instructions(variant, suffix)
+                pc = site(variant, callee, pattern)
+                changed = mutate(OBJECTS[variant], callee, pc, dict(body)[pc],
+                                 "call 0x123456", internal_call=True)
+                with self.subTest(variant=variant, callee=suffix, control="unresolved scalar call"):
+                    with self.assertRaisesRegex(RuntimeError, "scalar-read.*(callee|call)"):
+                        CHECKER["contract"](changed, variant)
             scalar, scalar_insns = instructions(variant, "capture_scalar")
             pc, old = next((pc, text) for pc, text in scalar_insns
                            if re.fullmatch(r"\*\(u32 \*\)\(r7 \+ 0x100\) = [rw]1", text))
@@ -1112,7 +1165,9 @@ class EntryObjectTests(unittest.TestCase):
                 slot = next(pc for pc, text in insns if re.fullmatch(r"\*\(u32 \*\)\(r7 \+ 0x68\) = [rw]1", text))
                 pc, old = next((pc, text) for pc, text in insns if pc > slot
                                and re.fullmatch(r"\*\(u64 \*\)\(r7 \+ 0x60\) = r\d+", text))
-                for new in ("*(u32 *)(r7 + 0x69) = w1", "r9 = atomic_fetch_or((u64 *)(r7 + 0x68), r9)"):
+                # r1 is overwritten by the next field load. Do not also
+                # destroy r9's descriptor before the later side query.
+                for new in ("*(u32 *)(r7 + 0x69) = w1", "r1 = atomic_fetch_or((u64 *)(r7 + 0x68), r1)"):
                     with self.subTest(variant=variant, function=suffix, write=new), self.assertRaisesRegex(RuntimeError, "Event.slot corrupted before submit"):
                         return_contract(variant, mutate(OBJECTS[variant], name, pc, old, new))
 
@@ -1223,6 +1278,36 @@ class EntryObjectTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "return.*(immutable|footprint)"):
                     outlined.step(pc, {"r1": ("context", 0), "r2": ("external_key", identity, 0),
                         "r3": ("owned", 7, 0), "r5": ("constant", 1), ("live", 7): True})
+        outlined.text[pc] = "call -0x1"
+        for target in ("memset", "p11_link_current_identity"):
+            outlined.calls[pc] = target
+            for destination in (("owned", 7, 0x38), ("external_key", identity, 0),
+                                ("context", 0), ("stack", -4), ("event", 600)):
+                with self.subTest(writer=target, forbidden_output=destination), self.assertRaisesRegex(RuntimeError, "return.*(immutable|footprint|output)"):
+                    outlined.step(pc, {"r1": destination, "r2": ("constant", 0), "r3": ("constant", 16),
+                        ("live", 7): True})
+            for destination in (("stack", -64), ("event", 0x130), ("event", 0x70)):
+                state = {"r1": destination, "r2": ("constant", 0), "r3": ("constant", 16),
+                    ("stack", -64, 8): ("retained", 0x38, 32), ("stack", -32, 8): ("constant", 123),
+                    ("event_slot",): ("low", identity), ("event_user_type",): ("retained", 0x38, 32),
+                    ("live", 7): True}
+                with self.subTest(writer=target, writable_output=destination):
+                    result = outlined.step(pc, state)
+                    self.assertEqual(result[("stack", -32, 8)], ("constant", 123))
+                    self.assertEqual(result[("event_slot",)], ("low", identity))
+                    if destination == ("stack", -64):
+                        self.assertNotEqual(result.get(("stack", -64, 8)), ("retained", 0x38, 32))
+                    if destination == ("event", 0x70):
+                        self.assertNotIn(("event_user_type",), result)
+        fill = next(target for _, _, _, target in CHECKER["D"].internal_call_targets(OBJECTS["default"])
+                    if target.endswith("object_fill_return"))
+        outlined.calls[pc] = fill
+        for destination in (("owned", 7, 0), ("external_key", identity, 0), ("context", 0),
+                            ("stack", -64), ("event", 0)):
+            with self.subTest(writer="object_fill_return", forbidden_output=destination), self.assertRaisesRegex(RuntimeError, "return.*(side|footprint)"):
+                outlined.step(pc, {"r1": destination, ("live", 7): True})
+        self.assertEqual(outlined.step(pc, {"r1": ("constant", 0), ("live", 7): True})["r0"],
+                         ("constant", 0), "a missing side cannot invent emission success")
 
 
 if __name__ == "__main__":

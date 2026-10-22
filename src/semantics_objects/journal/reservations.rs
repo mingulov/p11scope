@@ -127,6 +127,27 @@ impl<C> ReservationTable<C> {
             && operation.roles[Role::Model.index()].is_none()
     }
 
+    /// Read the original H8 operation without acquiring/releasing any role.
+    /// `staged` is present only for a genuine already-staged H3 original.
+    pub(super) fn unconverted_original(
+        &self,
+        open: RoleKey,
+        reservation: ReservationId,
+        staged: Option<RoleKey>,
+    ) -> bool {
+        let Some(at) = self.key_slot(Role::H8Open, open) else {
+            return false;
+        };
+        let operation = self.slots[at].as_ref().expect("retained H8 membership");
+        operation.aliases.contains(&Some(reservation))
+            && operation.roles[Role::H9Staged.index()]
+                .as_ref()
+                .map(|member| member.key)
+                == staged
+            && operation.roles[Role::Raw.index()].is_none()
+            && operation.roles[Role::Model.index()].is_none()
+    }
+
     pub(super) fn release_role(&mut self, role: Role) {
         for slot in &mut self.slots {
             let Some(operation) = slot.as_mut() else {

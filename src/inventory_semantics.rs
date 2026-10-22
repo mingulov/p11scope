@@ -376,6 +376,20 @@ impl LaneCoverage {
 /// production stash/merge/batch/finalize/commit path.
 #[cfg(test)]
 pub(crate) trait LaneTestIo {
+    fn stash_pending_floor(&self) -> Option<u64> {
+        None
+    }
+    /// Forward a borrow of the actual substituted H0/stash and the producers
+    /// retained from its collected input. This scripts no pending fact.
+    fn inspect_pending_h3(
+        &self,
+        _inspect: &mut dyn FnMut(
+            &SemanticCapture,
+            &RefreshReceiptStash,
+            &crate::attach::SessionDrainProducers,
+        ),
+    ) {
+    }
     /// Observe the real driver publication notification; grants no permission.
     fn semantic_published(&mut self) {}
     /// Substitute native terminal ownership I/O beneath the real driver/H0
@@ -510,6 +524,59 @@ pub(crate) struct RefreshReceiptStash {
     /// history, so the next merge carries it as a loss barrier. Taken
     /// on handoff; each shed reports exactly once.
     shed_floor: Option<u64>,
+}
+
+/// A live lane's original pending custody, borrowed for one read-only
+/// disposition check. Construction is private; no scalar floor or supplied
+/// record collection can create this continuation authority.
+pub(crate) struct PendingH3Continuation<'a> {
+    capture: &'a SemanticCapture,
+    stash: &'a RefreshReceiptStash,
+    producers: &'a crate::attach::SessionDrainProducers,
+}
+
+impl PendingH3Continuation<'_> {
+    pub(crate) fn matches(
+        &self,
+        producers: &crate::attach::SessionDrainProducers,
+        allocated_below: u64,
+        pending_floor: u64,
+        fault: u64,
+    ) -> bool {
+        self.producers.same_producers(producers)
+            && self.capture.router().domain() == producers.native_domain()
+            && self.stash.shed_floor.is_none()
+            && self
+                .capture
+                .pending_h3_watermark()
+                .is_some_and(|(below, awaiting, epoch)| {
+                    below == allocated_below
+                        && epoch == fault
+                        && awaiting
+                            .into_iter()
+                            .chain(self.stash.min_outcome_position())
+                            .min()
+                            == Some(pending_floor)
+                })
+    }
+
+    pub(crate) fn originals(
+        &self,
+    ) -> impl Iterator<Item = crate::semantic_capture::PendingH3Original<'_>> {
+        self.capture
+            .pending_h3_originals()
+            .chain(self.stash.outcomes.iter().filter_map(|outcome| {
+                let TickOutcome::Call(call) = outcome else {
+                    return None;
+                };
+                Some((
+                    call.position(),
+                    call.collected_origin(),
+                    call.record(),
+                    call.joint_resource(),
+                ))
+            }))
+    }
 }
 
 impl RefreshReceiptStash {
@@ -693,6 +760,35 @@ impl std::fmt::Debug for AttestedSemanticLane {
 }
 
 impl AttestedSemanticLane {
+    pub(crate) fn with_pending_h3_continuation<R>(
+        &self,
+        inspect: impl FnOnce(PendingH3Continuation<'_>) -> R,
+    ) -> Option<R> {
+        #[cfg(test)]
+        if let Some(io) = &self.test_io {
+            let mut inspect = Some(inspect);
+            let mut result = None;
+            io.inspect_pending_h3(&mut |capture, stash, producers| {
+                let inspect = inspect.take().expect("one actual H0 owner");
+                result = Some(inspect(PendingH3Continuation {
+                    capture,
+                    stash,
+                    producers,
+                }));
+            });
+            return result;
+        }
+        let live = self.live.as_ref()?;
+        if live.finished {
+            return None;
+        }
+        let producers = live.session.drain_producers()?;
+        Some(inspect(PendingH3Continuation {
+            capture: &live.capture,
+            stash: &live.stashed_refresh,
+            producers: &producers,
+        }))
+    }
     pub(crate) fn start(
         subset: AttestedSubset,
         _scope: &Scope,
@@ -732,6 +828,10 @@ impl AttestedSemanticLane {
     /// shell lane stashes nothing. Stash overflow sheds ride the merged
     /// report's shed floor instead (taken at merge handoff).
     pub(crate) fn stash_pending_floor(&self) -> Option<u64> {
+        #[cfg(test)]
+        if let Some(io) = &self.test_io {
+            return io.stash_pending_floor();
+        }
         self.live
             .as_ref()
             .and_then(|live| live.stashed_refresh.min_outcome_position())

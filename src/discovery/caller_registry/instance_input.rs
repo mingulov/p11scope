@@ -344,6 +344,10 @@ impl AdmittedInstanceCall {
         self.collected_origin
     }
 
+    pub(crate) fn joint_resource_origin(&self) -> Option<&JointResourceOrigin> {
+        self.joint_resource.as_ref()
+    }
+
     /// Journal per-call authority (H8): this admitted call's
     /// attribution shape for staged-BEGIN matching. `None` when the
     /// call cannot name its instance (unattributable) or names no

@@ -43,6 +43,15 @@ impl CollectedCallOrigin {
     pub(crate) fn in_quantum(&self, quantum: RawQuantumIdentity) -> bool {
         self.quantum == quantum
     }
+    pub(crate) fn position(&self) -> u64 {
+        self.position
+    }
+}
+
+impl std::fmt::Debug for CollectedCallOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CollectedCallOrigin(<private>)")
+    }
 }
 
 struct H0Origin {
@@ -95,6 +104,9 @@ pub(crate) struct JointResourceOrigin {
 }
 
 impl JointResourceOrigin {
+    pub(super) fn invocation(&self) -> JournalNativeKey {
+        self.invocation
+    }
     pub(crate) fn matches_native(&self, native: NativeDomainId) -> bool {
         self.native == native
     }
@@ -317,6 +329,17 @@ impl IngestedRaw {
             && admitted.collected_origin().is_some_and(|origin| {
                 origin.quantum == self.raw.identity && origin.position == admitted.h0_ordinal()
             })
+    }
+
+    pub(crate) fn matches_retained_admission(
+        &self,
+        admitted: &crate::discovery::caller_registry::instance_input::AdmittedInstanceCall,
+        adapter: &JournalAdapter,
+    ) -> bool {
+        // The current proof supplies only the already-validated owner/frontier.
+        // The older allocation must still own this exact physical H8 entry.
+        admitted.journal_binding().0 == self.raw.producers.native_domain()
+            && adapter.matches_retained_admission(admitted)
     }
 
     pub(crate) fn validate_owner(
@@ -681,23 +704,26 @@ impl RawJointQuantum {
 
     /// One advancing borrow of the existing charged H0-origin table. No
     /// per-record search or second retained association is needed.
-    fn classified_items(&self) -> impl Iterator<Item = (&JournalIngestItem, bool)> {
+    fn classified_items(
+        &self,
+    ) -> impl Iterator<Item = (&JournalIngestItem, bool, Option<CollectedCallOrigin>)> {
         let mut origins = self.h0_origins.iter().peekable();
         self.ordered.iter().enumerate().map(move |(index, item)| {
-            let quiet = if origins
+            let (quiet, allocation) = if origins
                 .peek()
                 .is_some_and(|origin| origin.wire_index == index)
             {
-                origins.next().expect("peeked original H0 position").quiet
+                let origin = origins.next().expect("peeked original H0 position");
+                (origin.quiet, origin.allocation)
             } else {
-                false
+                (false, None)
             };
-            (item, quiet)
+            (item, quiet, allocation)
         })
     }
 
     fn affecting_images(&self) -> impl Iterator<Item = (u64, u64)> {
-        self.classified_items().flat_map(|(item, quiet)| {
+        self.classified_items().flat_map(|(item, quiet, _)| {
             let images = match item {
                 JournalIngestItem::Journal(JournalRecord::Begin(begin)) => {
                     [Some(JournalAdapter::image_of_begin(begin)), None]
@@ -857,6 +883,11 @@ impl RawJointQuantum {
     /// clearing their delivery buffer without releasing its capacity.
     pub(crate) fn h0_identity(&self) -> RawQuantumIdentity {
         self.identity
+    }
+
+    #[cfg(test)]
+    pub(crate) fn producers_for_test(&self) -> &SessionDrainProducers {
+        &self.producers
     }
 
     pub(crate) fn note_h0_report(
@@ -1286,7 +1317,7 @@ impl RawJointQuantum {
         // Every increment corresponds to this original consumed wire item.
         // There is no H8 dispatch, claim, grant or synthetic terminal. Keep
         // first-affecting sightings monotonic, including fork children.
-        for (item, quiet) in self.classified_items() {
+        for (item, quiet, _) in self.classified_items() {
             let _ = owner.adapter.note_consumed_item(item, quiet);
         }
         if contiguous && !unlocalized {
@@ -1335,7 +1366,7 @@ impl RawJointQuantum {
         if !clean_stream {
             adapter.stream_broken = true;
         }
-        for (item, quiet) in self.classified_items() {
+        for (item, quiet, origin) in self.classified_items() {
             let resource = match item {
                 JournalIngestItem::Journal(JournalRecord::Begin(begin)) => self
                     .invocations
@@ -1344,7 +1375,19 @@ impl RawJointQuantum {
                     .map(|entry| entry.reservation),
                 _ => None,
             };
-            adapter.ingest_any_from_raw(*item, resource, quiet);
+            let disposition = adapter.ingest_any_from_raw(*item, resource, quiet);
+            if disposition == super::JournalDisposition::EndStaged
+                && let JournalIngestItem::Journal(JournalRecord::End(end)) = item
+            {
+                // This is the only production origin transfer: the same
+                // charged H0 table and exact successfully retained END.
+                let entry = adapter
+                    .open
+                    .get_mut(&(end.thread(), end.sequence()))
+                    .expect("the actual END was just retained");
+                assert!(entry.collected_origin.is_none());
+                entry.collected_origin = origin;
+            }
         }
         if clean_stream {
             adapter.stream_boundary = self.cuts.as_ref().and_then(|cuts| cuts.end.clone());

@@ -1839,11 +1839,20 @@ fn joint_future_end_disposes_frame_without_disposing_call() {
     }
 }
 
-/// Catches treating truthful acquired H3Pending as a permanent local retry.
-/// The deferred call is an original collected END, resolved by its existing
-/// H0 scan job and retained in the real lane stash; B also keeps a real START.
-#[test]
-fn joint_pending_h3_stash_disposes_frame_and_claims_original_in_next_quantum() {
+struct PendingH3Scene {
+    fixture: CanonicalFanoutScene,
+    frame: IngestedJointQuantum,
+    child_c: OwnedStoppedChild,
+    _other_child: Option<OwnedStoppedChild>,
+    c_caller: CallerId,
+    c_image: ImageIdentity,
+    end_b: [u8; 632],
+}
+
+fn pending_h3_from_stash(
+    unmatched_complete: bool,
+    audit_fault: &impl crate::semantics_objects::journal::FaultEpoch,
+) -> PendingH3Scene {
     let mut fixture = CanonicalFanoutScene::prior_sealed();
     let a = std::process::id();
     let b = fixture._child.id();
@@ -1862,13 +1871,30 @@ fn joint_pending_h3_stash_disposes_frame_and_claims_original_in_next_quantum() {
         .drain
         .source_mut()
         .push_record(begin_b.to_vec());
+    let other_child = unmatched_complete.then(OwnedStoppedChild::new);
+    if let Some(child) = &other_child {
+        // H0 has genuine original pidfd custody, but no semantic caller
+        // binding admits this complete physical call. The real finalizer
+        // disposes its conversion refusal while the original stays affecting.
+        fixture.scene.real.h0.0.borrow_mut().io.targets.insert(
+            child.id(),
+            (
+                Arc::new(PidPin::open(child.id()).unwrap()),
+                ImageIdentity {
+                    task_cookie: 74,
+                    exec_id: 0,
+                },
+            ),
+        );
+        fixture.scene.push(child.id(), 0, "C_SignInit", 1);
+    }
     let mut raw = fixture.scene.collect_with_fault(&BirthFault);
     let first = {
         let mut h0 = fixture.scene.real.h0.0.borrow_mut();
         let HeldH0 { capture, io, .. } = &mut *h0;
         io.script.fail_cookie = Some(c_image.task_cookie);
         let first = capture.tick_collected_with(io, &mut raw).unwrap();
-        assert_eq!(first.calls().count(), 1);
+        assert_eq!(first.calls().count(), 1 + usize::from(unmatched_complete));
         assert_eq!(first.awaiting_floor(), Some(4));
         first
     };
@@ -1891,7 +1917,10 @@ fn joint_pending_h3_stash_disposes_frame_and_claims_original_in_next_quantum() {
         let mut completed = capture.tick_collected_with(io, &mut raw).unwrap();
         assert_eq!(completed.calls().count(), 1);
         assert_eq!(completed.awaiting_floor(), None);
-        assert_eq!(completed.allocated_below(), 5);
+        assert_eq!(
+            completed.allocated_below(),
+            5 + u64::from(unmatched_complete)
+        );
         assert_eq!(completed.calls().next().unwrap().position(), Some(4));
         assert_eq!(stash_refresh_report(stash, &mut completed).1, 0);
         assert_eq!(stash.min_outcome_position(), Some(4));
@@ -1918,7 +1947,26 @@ fn joint_pending_h3_stash_disposes_frame_and_claims_original_in_next_quantum() {
         .unwrap_or_else(|(_, reason)| {
             panic!("the genuine same raw is now H0 disposed: {reason:?}")
         });
-    assert_eq!(claim_and_finish(&mut fixture.scene, &ingested).len(), 1);
+    assert!(
+        coordinator
+            .claim_next_prepared_admission(&fixture.scene.producers, &ingested)
+            .unwrap()
+            .unwrap()
+            .1
+            .is_ok()
+    );
+    assert!(
+        coordinator
+            .claim_next_prepared_admission(&fixture.scene.producers, &ingested)
+            .unwrap()
+            .is_none()
+    );
+    let mut staged = 0;
+    while coordinator.stage_next_prepared_admission() {
+        staged += 1;
+    }
+    assert_eq!(staged, 1 + usize::from(unmatched_complete));
+    assert!(coordinator.finish_prepared_semantic_batch(&fixture.scene.real.lane));
     fixture
         .scene
         .real
@@ -1926,7 +1974,35 @@ fn joint_pending_h3_stash_disposes_frame_and_claims_original_in_next_quantum() {
         .coordinator
         .commit_batch_with_semantics(false, Some(&mut fixture.scene.real.lane))
         .unwrap();
-    let mut q1 = acquire(&mut fixture.scene, ingested, &fixture.attached, &BirthFault);
+    let q1 = acquire(&mut fixture.scene, ingested, &fixture.attached, audit_fault);
+
+    PendingH3Scene {
+        fixture,
+        frame: q1,
+        child_c,
+        _other_child: other_child,
+        c_caller,
+        c_image,
+        end_b,
+    }
+}
+
+/// Catches treating truthful acquired H3Pending as a permanent local retry.
+/// The deferred call is an original collected END, resolved by its existing
+/// H0 scan job and retained in the real lane stash; B also keeps a real START.
+#[test]
+fn joint_pending_h3_stash_disposes_frame_and_claims_original_in_next_quantum() {
+    let PendingH3Scene {
+        mut fixture,
+        frame: mut q1,
+        child_c,
+        _other_child,
+        c_caller,
+        c_image,
+        end_b,
+    } = pending_h3_from_stash(false, &BirthFault);
+    let c = child_c.id();
+    let b = fixture._child.id();
     assert_eq!(
         q1.failure_for_test().unwrap().gap,
         crate::semantics_objects::journal::JournalGap::H3Pending
@@ -1965,6 +2041,21 @@ fn joint_pending_h3_stash_disposes_frame_and_claims_original_in_next_quantum() {
         .ledger()
         .roles_for_test();
     assert_eq!(before_roles[..4], [0, 3, 0, 1]);
+    assert_eq!(
+        crate::semantics_objects::journal::JournalAdapter::open_entry_size_for_test(),
+        1160
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .retained_open_charges_for_test(),
+        [1160; 3]
+    );
     let before_starts = fixture
         .scene
         .real
@@ -2000,13 +2091,49 @@ fn joint_pending_h3_stash_disposes_frame_and_claims_original_in_next_quantum() {
             .joint_frame_ports(&fixture.scene.producers)
             .unwrap();
         q1.bind_targets(&ports).unwrap();
+        let real_producers = h0.0.borrow().collected_producers.clone().unwrap();
+        h0.0.borrow_mut().collected_producers = Some(SessionDrainProducers::test_pair(
+            real_producers.native_domain(),
+            crate::events::EventsDomain::test_standin(real_producers.events_id()),
+        ));
+        assert_eq!(
+            q1.defer_pending_h3(&mut ports, &fixture.scene.real.lane),
+            Ok(QuantumSealProgress::LocalPending),
+            "equal numeric EVENTS identity cannot grant a foreign allocation continuation"
+        );
+        h0.0.borrow_mut().collected_producers = Some(real_producers);
+        let retained_outcomes = h0.0.borrow_mut().stash.take_outcomes();
+        assert_eq!(
+            q1.defer_pending_h3(&mut ports, &fixture.scene.real.lane),
+            Ok(QuantumSealProgress::LocalPending),
+            "the old floor grants nothing after actual stash ownership moved"
+        );
+        assert_eq!(
+            h0.0.borrow_mut()
+                .stash
+                .push_all(Vec::new(), retained_outcomes),
+            0
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                q1.defer_pending_h3(&mut ports, &fixture.scene.real.lane),
+                Ok(QuantumSealProgress::AwaitFutureInput)
+            );
+        }
         assert_eq!(
             q1.seal_next(&mut ports, &mut births, &BirthFault),
             Ok(QuantumSealProgress::AwaitFutureInput)
         );
-        q1.finish_frame(&mut ports).unwrap_or_else(|(_, reason)| {
-            panic!("truthful producer-owned pending evidence must allow q2: {reason:?}")
-        });
+        let (retained, reason) = q1
+            .finish_frame(&mut ports)
+            .err()
+            .expect("generic finish has no continuation authority");
+        assert_eq!(reason, RawQuantumRefusal::H3Undisposed);
+        q1 = retained;
+        q1.finish_pending_h3(&mut ports, &fixture.scene.real.lane)
+            .unwrap_or_else(|(_, reason)| {
+                panic!("truthful producer-owned pending evidence must allow q2: {reason:?}")
+            });
     }
     drop(births);
     assert_eq!(fixture.feeds(), before_feeds);
@@ -2131,7 +2258,36 @@ fn joint_pending_h3_stash_disposes_frame_and_claims_original_in_next_quantum() {
             &fixture.grant,
         )
         .unwrap_or_else(|(_, reason)| panic!("actual next raw: {reason:?}"));
+    assert!(
+        !ingested.matches_admission(&admitted[0]),
+        "C is still the actual q1 allocation"
+    );
+    assert!(
+        ingested.matches_retained_admission(
+            &admitted[0],
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .joint_capture()
+                .adapter()
+        )
+    );
     let claims = claim_and_finish(&mut fixture.scene, &ingested);
+    assert!(
+        !ingested.matches_retained_admission(
+            &admitted[0],
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .joint_capture()
+                .adapter()
+        ),
+        "the original is claimed at most once"
+    );
     assert_eq!(claims.iter().map(|(at, _)| *at).collect::<Vec<_>>(), [4, 5]);
     let actual_claims = fixture
         .scene
@@ -2245,5 +2401,488 @@ fn joint_pending_h3_stash_disposes_frame_and_claims_original_in_next_quantum() {
             .coordinator
             .reference_h3_audit_state(),
         (3, false)
+    );
+}
+
+#[test]
+fn joint_pending_h3_keeps_unmatched_complete_original_local() {
+    let PendingH3Scene {
+        mut fixture,
+        frame: mut q1,
+        child_c: _child_c,
+        _other_child,
+        c_caller: _,
+        c_image: _,
+        end_b: _,
+    } = pending_h3_from_stash(true, &BirthFault);
+    assert!(_other_child.is_some());
+    assert_eq!(
+        q1.failure_for_test().unwrap().gap,
+        crate::semantics_objects::journal::JournalGap::H3Pending
+    );
+    assert!(matches!(
+        q1.audit_for_test().h3_for_test(),
+        H3DispositionEvidence::Clean {
+            staged_max: 5,
+            pending_floor: Some(4),
+        }
+    ));
+    let before_feeds = fixture.feeds();
+    let owner = fixture.scene.real.scene.coordinator.joint_capture();
+    let claims = owner.adapter().invocation_claims_for_test();
+    let starts = owner.adapter().retained_starts_for_test();
+    let roles = owner.ledger().roles_for_test();
+    assert_eq!(starts.len(), 4);
+    assert_eq!(claims.0, 1);
+    assert_eq!(roles[..4], [0, 4, 0, 1]);
+    {
+        let mut ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        q1.bind_targets(&ports).unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                q1.defer_pending_h3(&mut ports, &fixture.scene.real.lane),
+                Ok(QuantumSealProgress::LocalPending)
+            );
+        }
+        let (same, reason) = q1
+            .finish_pending_h3(&mut ports, &fixture.scene.real.lane)
+            .err()
+            .expect("a truthful floor cannot forgive an unrelated completed original");
+        assert_eq!(reason, RawQuantumRefusal::H3Undisposed);
+        q1 = same;
+        assert!(q1.finish_frame(&mut ports).is_err());
+    }
+    assert_eq!(fixture.feeds(), before_feeds);
+    let owner = fixture.scene.real.scene.coordinator.joint_capture();
+    assert_eq!(owner.adapter().invocation_claims_for_test(), claims);
+    assert_eq!(owner.adapter().retained_starts_for_test(), starts);
+    assert_eq!(owner.ledger().roles_for_test(), roles);
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .h0
+            .0
+            .borrow()
+            .stash
+            .min_outcome_position(),
+        Some(4)
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_h3_audit_state(),
+        (2, false)
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_h3_acknowledged_below(),
+        0
+    );
+}
+
+#[test]
+fn joint_pending_h3_continuation_cannot_forgive_native_fault() {
+    struct ChangedFault;
+    impl crate::semantics_objects::journal::FaultEpoch for ChangedFault {
+        fn fault_epoch(&self) -> Result<u64, crate::semantics_objects::journal::FaultReadError> {
+            Ok(1)
+        }
+    }
+    let PendingH3Scene {
+        mut fixture,
+        frame: mut q1,
+        child_c: _child_c,
+        _other_child,
+        c_caller: _,
+        c_image: _,
+        end_b: _,
+    } = pending_h3_from_stash(false, &ChangedFault);
+    let original = q1.failure_for_test().unwrap();
+    assert_eq!(
+        original.gap,
+        crate::semantics_objects::journal::JournalGap::FaultChanged
+    );
+    assert!(
+        !original.effects.effects.is_empty(),
+        "the same two original live objects must produce actual loss effects"
+    );
+    let effects = original.effects.clone();
+    let roles = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .ledger()
+        .roles_for_test();
+    {
+        let mut ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        q1.bind_targets(&ports).unwrap();
+        assert_eq!(
+            q1.defer_pending_h3(&mut ports, &fixture.scene.real.lane),
+            Ok(QuantumSealProgress::LocalPending)
+        );
+        assert_eq!(q1.failure_for_test().unwrap().effects, effects);
+        let (same, reason) = q1
+            .finish_pending_h3(&mut ports, &fixture.scene.real.lane)
+            .err()
+            .expect("a real pending owner never changes an original fault into Future");
+        assert_eq!(reason, RawQuantumRefusal::H3Undisposed);
+        q1 = same;
+    }
+    assert_eq!(q1.failure_for_test().unwrap().effects, effects);
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .ledger()
+            .roles_for_test(),
+        roles
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_h3_audit_state(),
+        (2, false)
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_h3_acknowledged_below(),
+        0
+    );
+}
+
+#[test]
+fn joint_first_pending_h3_pins_native_baseline_before_next_fault() {
+    // This owner has never acquired a healthy audit or sealed a model call.
+    // A's genuine New still registers one Joint consumer before its first
+    // pending audit; C's original remains in the same real lane stash.
+    let mut scene = JointScene::for_audit(1);
+    scene.real.h0.0.borrow_mut().io.script.local = 1;
+    let a = std::process::id();
+    let child_b = OwnedStoppedChild::new();
+    let child_c = OwnedStoppedChild::new();
+    let a_caller = scene.real.bind(
+        a,
+        ImageIdentity {
+            task_cookie: 71,
+            exec_id: 0,
+        },
+        0,
+    );
+    scene.real.bind(
+        child_b.id(),
+        ImageIdentity {
+            task_cookie: 72,
+            exec_id: 0,
+        },
+        0,
+    );
+    let c_image = ImageIdentity {
+        task_cookie: 73,
+        exec_id: 0,
+    };
+    scene.real.bind(child_c.id(), c_image, 0);
+    scene.push(a, 0, "C_SignInit", 1);
+    scene.push(child_c.id(), 0, "C_SignInit", 1);
+    let begin_b = scene.encoded(child_b.id(), 0, "C_SignInit", 1).0;
+    scene.drain.source_mut().push_record(begin_b.to_vec());
+    let mut raw = scene.collect_with_fault(&BirthFault);
+    let first = {
+        let mut h0 = scene.real.h0.0.borrow_mut();
+        let HeldH0 { capture, io, .. } = &mut *h0;
+        io.script.fail_cookie = Some(c_image.task_cookie);
+        let first = capture.tick_collected_with(io, &mut raw).unwrap();
+        assert_eq!(first.calls().count(), 1);
+        assert_eq!(first.awaiting_floor(), Some(2));
+        first
+    };
+    let batch =
+        SemanticBatch::from_tick_report(scene.real.lane.domain(), first, Vec::new(), now_ns())
+            .unwrap();
+    scene.admit_providers(a, a_caller, &[0]);
+    {
+        let mut h0 = scene.real.h0.0.borrow_mut();
+        let HeldH0 {
+            capture,
+            io,
+            stash,
+            collected_producers,
+            ..
+        } = &mut *h0;
+        *collected_producers = Some(raw.producers_for_test().clone());
+        io.script.fail_cookie = None;
+        let mut completed = capture.tick_collected_with(io, &mut raw).unwrap();
+        assert_eq!(completed.calls().next().unwrap().position(), Some(2));
+        assert_eq!(completed.awaiting_floor(), None);
+        assert_eq!(stash_refresh_report(stash, &mut completed).1, 0);
+    }
+    scene.real.scene.coordinator.stage_semantic_batch(batch);
+    scene
+        .real
+        .scene
+        .coordinator
+        .prepare_staged_semantic_batch(&mut scene.real.lane, None)
+        .unwrap();
+    let admitted = scene
+        .real
+        .scene
+        .coordinator
+        .prepared_semantic_batch()
+        .unwrap()
+        .admissions()
+        .next()
+        .unwrap()
+        .clone();
+    let current = scene
+        .real
+        .scene
+        .coordinator
+        .take_prepared_current_for_birth_test()
+        .unwrap()
+        .into_iter()
+        .find(|receipt| receipt.image() == admitted.journal_binding().1)
+        .unwrap();
+    let (ingested, proof, grant) = scene.ingest_with_grant(raw);
+    assert_eq!(claim_and_finish(&mut scene, &ingested).len(), 1);
+    let attached = attachment(&mut scene);
+    assert!(
+        scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture_mut()
+            .adapter_mut()
+            .install_closure_grant(&SessionClosureGrant::observe(&attached))
+    );
+    let mut fixture = CanonicalFanoutScene {
+        scene,
+        attached,
+        births: Vec::new(),
+        grant,
+        _child: child_b,
+    };
+    fixture.retain_collected_birth(&admitted, current, proof);
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .commit_batch_with_semantics(false, Some(&mut fixture.scene.real.lane))
+        .unwrap();
+    let mut q1 = acquire(&mut fixture.scene, ingested, &fixture.attached, &BirthFault);
+    assert_eq!(
+        q1.failure_for_test().unwrap().gap,
+        crate::semantics_objects::journal::JournalGap::H3Pending
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .fault_baseline_for_test(),
+        None
+    );
+    let roles = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .ledger()
+        .roles_for_test();
+    let claims = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .invocation_claims_for_test();
+    {
+        let mut ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        q1.bind_targets(&ports).unwrap();
+        assert_eq!(
+            q1.defer_pending_h3(&mut ports, &fixture.scene.real.lane),
+            Ok(QuantumSealProgress::AwaitFutureInput)
+        );
+        q1.finish_pending_h3(&mut ports, &fixture.scene.real.lane)
+            .unwrap_or_else(|(_, reason)| panic!("actual first pending frame: {reason:?}"));
+    }
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .fault_baseline_for_test(),
+        Some(0)
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .ledger()
+            .roles_for_test(),
+        roles
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .invocation_claims_for_test(),
+        claims
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_h3_acknowledged_below(),
+        0
+    );
+    struct ChangedFault;
+    impl crate::semantics_objects::journal::FaultEpoch for ChangedFault {
+        fn fault_epoch(&self) -> Result<u64, crate::semantics_objects::journal::FaultReadError> {
+            Ok(1)
+        }
+    }
+    fixture
+        .scene
+        .real
+        .h0
+        .0
+        .borrow_mut()
+        .io
+        .script
+        .last_health
+        .fault = 1;
+    let raw = fixture.scene.collect_with_fault(&ChangedFault);
+    fixture.scene.real.h0.0.borrow_mut().collected = Some(raw);
+    let batch = fixture.scene.real.tick();
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .stage_semantic_batch(batch);
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .prepare_staged_semantic_batch(&mut fixture.scene.real.lane, None)
+        .unwrap();
+    let raw = fixture
+        .scene
+        .real
+        .h0
+        .0
+        .borrow_mut()
+        .collected
+        .take()
+        .unwrap();
+    let ingested = raw
+        .ingest(
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .joint_capture_mut()
+                .adapter_mut(),
+            &fixture.scene.producers,
+            &fixture.grant,
+        )
+        .unwrap_or_else(|(_, reason)| panic!("genuine q2 fault collection: {reason:?}"));
+    while fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .claim_next_prepared_admission(&fixture.scene.producers, &ingested)
+        .unwrap()
+        .is_some()
+    {}
+    while fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .stage_next_prepared_admission()
+    {}
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .finish_prepared_semantic_batch(&fixture.scene.real.lane)
+    );
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .commit_batch_with_semantics(false, Some(&mut fixture.scene.real.lane))
+        .unwrap();
+    let q2 = acquire(
+        &mut fixture.scene,
+        ingested,
+        &fixture.attached,
+        &ChangedFault,
+    );
+    assert_eq!(
+        q2.failure_for_test().unwrap().gap,
+        crate::semantics_objects::journal::JournalGap::FaultChanged
     );
 }

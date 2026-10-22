@@ -170,7 +170,9 @@ impl PreparedSemanticBatch {
             // Conversion refusals need no journal claim. Their original
             // positions remain owned until the staging/refusal cursor moves.
             if let Some(Ok(input)) = &entry.input {
-                if !ingested.matches_admission(input) {
+                if !ingested.matches_admission(input)
+                    && !ingested.matches_retained_admission(input, adapter)
+                {
                     return Err(RawQuantumRefusal::Admission);
                 }
                 let claim = adapter.attest_key(input);

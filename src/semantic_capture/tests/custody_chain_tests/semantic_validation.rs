@@ -378,6 +378,7 @@ struct HeldH0 {
     io: HeldIo,
     collected: Option<crate::semantics_objects::journal::joint_driver::RawJointQuantum>,
     stash: RefreshReceiptStash,
+    collected_producers: Option<crate::attach::SessionDrainProducers>,
     validations: usize,
     inject: Option<(usize, ValidationFailure)>,
     validation_negatives: Vec<(&'static str, Option<u64>)>,
@@ -389,6 +390,23 @@ struct HeldH0 {
 struct SharedH0(Rc<RefCell<HeldH0>>);
 
 impl LaneTestIo for SharedH0 {
+    fn stash_pending_floor(&self) -> Option<u64> {
+        self.0.borrow().stash.min_outcome_position()
+    }
+
+    fn inspect_pending_h3(
+        &self,
+        inspect: &mut dyn FnMut(
+            &SemanticCapture,
+            &RefreshReceiptStash,
+            &crate::attach::SessionDrainProducers,
+        ),
+    ) {
+        let owned = self.0.borrow();
+        if let Some(producers) = &owned.collected_producers {
+            inspect(&owned.capture, &owned.stash, producers);
+        }
+    }
     fn validate_attachment(&mut self, subset: &AttestedSubset) -> Result<(), SemanticRefusal> {
         let owned = self.0.borrow();
         for (object, slots) in subset.required() {
@@ -482,6 +500,14 @@ impl LaneTestIo for SharedH0 {
     }
     fn tick(&mut self, domain: NativeDomainId) -> Result<SemanticBatch, SemanticRefusal> {
         let mut owned = self.0.borrow_mut();
+        if let Some(raw) = &owned.collected {
+            let producers = raw.producers_for_test().clone();
+            if let Some(retained) = &owned.collected_producers {
+                assert!(retained.same_producers(&producers));
+            } else {
+                owned.collected_producers = Some(producers);
+            }
+        }
         let HeldH0 {
             capture,
             io,
@@ -618,6 +644,7 @@ impl RealScene {
             io,
             collected: None,
             stash: RefreshReceiptStash::new(),
+            collected_producers: None,
             validations: 0,
             inject: None,
             validation_negatives: Vec::new(),

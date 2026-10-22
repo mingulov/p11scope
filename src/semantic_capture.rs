@@ -1038,6 +1038,13 @@ pub(crate) struct SemanticCapture {
     stopped: bool,
     continuity_cuts: u64,
 }
+
+pub(crate) type PendingH3Original<'a> = (
+    Option<u64>,
+    Option<CollectedCallOrigin>,
+    &'a EventRecord,
+    Option<crate::semantics_objects::journal::joint_driver::JointResourceOrigin>,
+);
 static NEXT_SEMANTIC_CAPTURE: AtomicU64 = AtomicU64::new(0);
 impl SemanticCapture {
     pub(crate) fn new(session: &Session, limits: TickLimits) -> anyhow::Result<Self> {
@@ -1709,6 +1716,27 @@ impl SemanticCapture {
         report.allocated_below = self.next_token;
         report.awaiting_floor = self.awaiting.keys().next().copied();
         report.exhausted = report.exhausted || self.exhausted;
+    }
+
+    pub(crate) fn pending_h3_watermark(&self) -> Option<(u64, Option<u64>, u64)> {
+        (!self.stopped && !self.image_failed && !self.exhausted && self.sticky == 0).then_some((
+            self.next_token,
+            self.awaiting.keys().next().copied(),
+            self.fault,
+        ))
+    }
+
+    /// Borrow the original pending records; no copied queue or manufactured
+    /// allocation accompanies the lane's continuation inspection.
+    pub(crate) fn pending_h3_originals(&self) -> impl Iterator<Item = PendingH3Original<'_>> {
+        self.awaiting.iter().map(|(position, waiting)| {
+            (
+                Some(*position),
+                waiting.collected_origin,
+                &waiting.record.base,
+                waiting.record.joint_resource,
+            )
+        })
     }
 
     fn refresh_with_inner(

@@ -417,6 +417,188 @@ impl IngestedJointQuantum {
         self.validate_owner(owner, producers)
     }
 
+    /// A truthful H3-pending audit is not a clean audit and cannot seal or
+    /// replay. Only the live producer's original pending custody permits its
+    /// immutable frame metadata to retire so the next H0 batch can arrive.
+    fn pending_h3_is_owned(
+        &self,
+        ports: &JointPublicationPorts<'_>,
+        lane: &crate::inventory_semantics::AttestedSemanticLane,
+    ) -> bool {
+        let (_, owner, _, producers) = ports.read();
+        let adapter = owner.adapter();
+        let Some(failure) = &self.failure else {
+            return false;
+        };
+        let H3DispositionEvidence::Clean {
+            staged_max,
+            pending_floor: Some(floor),
+        } = &self.audit.h3
+        else {
+            return false;
+        };
+        if failure.gap != JournalGap::H3Pending
+            || !matches!(failure.scope, SealFailureScope::Unqualified)
+            || failure.h3_voided.is_some()
+            || !failure.effects.effects.is_empty()
+            || *floor >= self.audit.h0_below
+            || self.audit.resource_refused
+            || self.audit.closure_generation != adapter.closure_generation
+            || adapter
+                .last_fault
+                .is_some_and(|previous| previous != self.audit.fault_after)
+            || !adapter.refused.is_empty()
+        {
+            return false;
+        }
+        lane.with_pending_h3_continuation(|pending| {
+            if !pending.matches(
+                producers,
+                self.audit.h0_below,
+                *floor,
+                self.audit.fault_after,
+            ) {
+                return false;
+            }
+            let mut unclaimed = 0usize;
+            let mut claimed = 0usize;
+            for entry in adapter.open.values() {
+                let fingerprint = super::fingerprint_of_begin(&entry.begin);
+                let claimants = adapter.claims.get(&fingerprint);
+                let has_claim = claimants
+                    .is_some_and(|claimants| claimants.values().any(|claims| !claims.is_empty()));
+                let Some(end) = entry.end else {
+                    // A genuine unclaimed START remains in H8 unchanged.
+                    if has_claim || entry.abandon.is_some() || entry.corroborated_return.is_some() {
+                        return false;
+                    }
+                    continue;
+                };
+                let (Some(origin), Some(resource)) = (entry.collected_origin, entry.raw_resource)
+                else {
+                    return false;
+                };
+                if entry.begin_ordinal > self.frontier.0
+                    || end.ordinal > self.frontier.0
+                    || origin.position() >= self.audit.h0_below
+                    || entry.converted_ticket.is_some()
+                    || entry.converted_for.is_some()
+                    || entry.call_key.is_some()
+                    || entry.end_converted
+                    || entry.abandon.is_some()
+                    || entry.corroborated_return.is_some()
+                    || !super::end_agrees_with_begin(&entry.begin, &end.end)
+                {
+                    return false;
+                }
+                if has_claim {
+                    let mut originals = claimants
+                        .into_iter()
+                        .flat_map(|claimants| claimants.iter())
+                        .flat_map(|(key, claims)| claims.iter().map(move |claim| (key, claim)));
+                    let Some((key, claim)) = originals.next() else {
+                        return false;
+                    };
+                    if originals.next().is_some()
+                        || !adapter.key_is_live(*key)
+                        || key.domain_tag != producers.native_domain().journal_tag()
+                        || (key.cookie, key.exec) != entry.image
+                        || claim.admission != origin.position()
+                        || claim.admission > *staged_max
+                        || claim.return_ns != end.end.payload_base().event.ts_ns
+                        || !adapter.ledger.matches_unconverted_original(
+                            entry.begin_ordinal,
+                            &resource,
+                            Some((key.domain_tag, claim.admission)),
+                        )
+                    {
+                        return false;
+                    }
+                    claimed += 1;
+                } else {
+                    if !adapter.ledger.matches_unconverted_original(
+                        entry.begin_ordinal,
+                        &resource,
+                        None,
+                    ) {
+                        return false;
+                    }
+                    unclaimed += 1;
+                }
+            }
+            // A shared physical fingerprint cannot count one admission for
+            // two opens. Refused/unrepresented or unmatched claims also stay
+            // local; a numeric pending floor cannot forgive them.
+            if claimed != adapter.claim_counts {
+                return false;
+            }
+            let mut covered = 0usize;
+            let mut floor_seen = false;
+            for (position, origin, record, resource) in pending.originals() {
+                let (Some(position), Some(origin), Some(resource)) = (position, origin, resource)
+                else {
+                    return false;
+                };
+                let Some(entry) = adapter.open.get(&resource.invocation()) else {
+                    return false;
+                };
+                let Some(end) = entry.end else {
+                    return false;
+                };
+                let fingerprint = super::fingerprint_of_begin(&entry.begin);
+                if position != origin.position()
+                    || position < *floor
+                    || position >= self.audit.h0_below
+                    || entry.collected_origin != Some(origin)
+                    || !resource.matches_producers(producers)
+                    || !super::fingerprint_matches_event(&fingerprint, &record.event)
+                    || record.event.ts_ns != end.end.payload_base().event.ts_ns
+                    || adapter.claims.get(&fingerprint).is_some_and(|claimants| {
+                        claimants.values().any(|claims| !claims.is_empty())
+                    })
+                    || !adapter.ledger.matches_unconverted_original(
+                        entry.begin_ordinal,
+                        resource.reservation(),
+                        None,
+                    )
+                {
+                    return false;
+                }
+                covered += 1;
+                floor_seen |= position == *floor;
+            }
+            floor_seen && covered == unclaimed
+        })
+        .unwrap_or(false)
+    }
+
+    pub(crate) fn defer_pending_h3(
+        &mut self,
+        ports: &mut JointPublicationPorts<'_>,
+        lane: &crate::inventory_semantics::AttestedSemanticLane,
+    ) -> Result<QuantumSealProgress, RawQuantumRefusal> {
+        self.preflight(ports)?;
+        if !self.bound || self.active.is_some() {
+            return Err(RawQuantumRefusal::DispositionMismatch);
+        }
+        if !self.pending_h3_is_owned(ports, lane) {
+            return Ok(QuantumSealProgress::LocalPending);
+        }
+        // H3 remains pending. Preserve only the already-checked native fault
+        // prefix so a first pending frame cannot forget a later epoch move.
+        let (_, owner, _, _, _) = ports.split();
+        owner.adapter_mut().last_fault = Some(self.audit.fault_after);
+        for consumer in &mut self.consumers {
+            if consumer.state == ConsumerState::Pending {
+                consumer.state = ConsumerState::Future;
+                self.pending -= 1;
+                self.future += 1;
+            }
+        }
+        self.cursor = self.consumers.len();
+        Ok(self.progress())
+    }
+
     pub(crate) fn bind_targets(
         &mut self,
         ports: &JointPublicationPorts<'_>,
@@ -734,6 +916,37 @@ impl IngestedJointQuantum {
 
     #[allow(clippy::result_large_err)] // Refusal returns the same move-only frame and retained buffers.
     pub(crate) fn finish_frame(
+        self,
+        ports: &mut JointPublicationPorts<'_>,
+    ) -> Result<DisposedJointQuantum, (Self, RawQuantumRefusal)> {
+        if self.future != 0
+            && self
+                .failure
+                .as_ref()
+                .is_some_and(|failure| failure.gap == JournalGap::H3Pending)
+        {
+            return Err((self, RawQuantumRefusal::H3Undisposed));
+        }
+        self.finish_frame_inner(ports)
+    }
+
+    #[allow(clippy::result_large_err)] // Refusal preserves the same frame and original custody.
+    pub(crate) fn finish_pending_h3(
+        self,
+        ports: &mut JointPublicationPorts<'_>,
+        lane: &crate::inventory_semantics::AttestedSemanticLane,
+    ) -> Result<DisposedJointQuantum, (Self, RawQuantumRefusal)> {
+        if let Err(reason) = self.preflight(ports) {
+            return Err((self, reason));
+        }
+        if self.future == 0 || !self.pending_h3_is_owned(ports, lane) {
+            return Err((self, RawQuantumRefusal::H3Undisposed));
+        }
+        self.finish_frame_inner(ports)
+    }
+
+    #[allow(clippy::result_large_err)] // Original frame returned on refusal.
+    fn finish_frame_inner(
         self,
         ports: &mut JointPublicationPorts<'_>,
     ) -> Result<DisposedJointQuantum, (Self, RawQuantumRefusal)> {

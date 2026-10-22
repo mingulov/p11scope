@@ -657,6 +657,9 @@ struct OpenEntry {
     end_converted: bool,
     /// Resource-only lineage from this exact retained native invocation.
     raw_resource: Option<ledger::ExistingReservation>,
+    /// The actual END's H0 allocation survives while that original remains
+    /// in H8, including a real refresh-stash handoff into a later quantum.
+    collected_origin: Option<joint_driver::CollectedCallOrigin>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -915,6 +918,28 @@ impl JournalAdapter {
         (self.claim_counts, originals)
     }
 
+    #[cfg(test)]
+    pub(crate) fn fault_baseline_for_test(&self) -> Option<u64> {
+        self.last_fault
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_entry_size_for_test() -> usize {
+        size_of::<OpenEntry>()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_open_charges_for_test(&self) -> Vec<usize> {
+        self.open
+            .values()
+            .map(|entry| {
+                self.ledger
+                    .h8_open_bytes_for_test(entry.begin_ordinal)
+                    .expect("retained actual H8 charge")
+            })
+            .collect()
+    }
+
     pub(crate) fn consumed_frontier(&self) -> ConsumptionOrdinal {
         ConsumptionOrdinal(self.consumed_through)
     }
@@ -1167,6 +1192,7 @@ impl JournalAdapter {
                 converted_for: None,
                 end_converted: false,
                 raw_resource: resource,
+                collected_origin: None,
             },
         );
         JournalDisposition::BeginAdmitted
@@ -3249,6 +3275,51 @@ impl JournalAdapter {
         }
         let era = self.keys[&key].era;
         Ok(JournalDomainProof { key, era })
+    }
+
+    /// An older actual H0 admission may cross a frame only while its exact
+    /// original END remains unclaimed in this owner's H8 allocation. No
+    /// scalar position, resource ID or equal-shaped sibling can substitute.
+    fn matches_retained_admission(&self, admitted: &AdmittedInstanceCall) -> bool {
+        let (Some(origin), Some(resource), Some(fingerprint)) = (
+            admitted.collected_origin(),
+            admitted.joint_resource_origin(),
+            admitted.journal_call_fingerprint(),
+        ) else {
+            return false;
+        };
+        let Some(entry) = self.open.get(&resource.invocation()) else {
+            return false;
+        };
+        let Some(end) = entry.end else {
+            return false;
+        };
+        origin.position() == admitted.h0_ordinal()
+            && entry.collected_origin == Some(origin)
+            && entry.image == fingerprint.image
+            && fingerprint_of_begin(&entry.begin) == fingerprint
+            && end_agrees_with_begin(&entry.begin, &end.end)
+            && admitted.journal_return_ns() == Some(end.end.payload_base().event.ts_ns)
+            && fingerprint_matches_event(&fingerprint, &end.end.payload_base().event)
+            && entry.converted_ticket.is_none()
+            && entry.converted_for.is_none()
+            && entry.call_key.is_none()
+            && !entry.end_converted
+            && entry.abandon.is_none()
+            && entry.corroborated_return.is_none()
+            && !self
+                .claims
+                .get(&fingerprint)
+                .is_some_and(|claimants| claimants.values().any(|claims| !claims.is_empty()))
+            && self
+                .resource_producers
+                .as_ref()
+                .is_some_and(|producers| resource.matches_producers(producers))
+            && self.ledger.matches_unconverted_original(
+                entry.begin_ordinal,
+                resource.reservation(),
+                None,
+            )
     }
 
     /// Bind the Session drain serving one attested native domain from

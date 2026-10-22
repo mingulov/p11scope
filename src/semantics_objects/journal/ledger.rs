@@ -283,6 +283,29 @@ impl StagingLedger {
         })
     }
 
+    pub(super) fn matches_unconverted_original(
+        &self,
+        begin: u64,
+        original: &ExistingReservation,
+        staged: Option<(u64, u64)>,
+    ) -> bool {
+        self.matches_reservation(original)
+            && self.table.as_ref().is_some_and(|table| {
+                table.unconverted_original(
+                    Self::key(begin),
+                    original.id,
+                    staged.map(|(namespace, value)| RoleKey { namespace, value }),
+                )
+            })
+    }
+
+    #[cfg(test)]
+    pub(super) fn h8_open_bytes_for_test(&self, begin: u64) -> Option<usize> {
+        self.table
+            .as_ref()?
+            .member_bytes(Role::H8Open, Self::key(begin))
+    }
+
     pub(super) fn matches_completed_staging(
         &self,
         begin_ordinal: u64,

@@ -2876,6 +2876,43 @@ class FinalScannerSurfaceTests(unittest.TestCase):
             with self.assertRaisesRegex(AssertionError, "scalar aliases"):
                 subject.assert_safe_lane_alias_privacy(lane, paths)
 
+    def test_json_identity_scan_preserves_custody_and_rejects_distinctive_markers(self):
+        subject = load_subject(TARGET_BITS)
+        fixture = StoppedPopulationTests("test_framed_records_bind_generations_for_future_coordinator")
+        marker = subject.LOADER_PAUSE_IDENTITIES["marker"]
+        for case, generation in (("healthy-receipt", 900), ("narrow-custody", 512),
+                                 ("decimal-marker", marker)):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                manifest, receipt, records, controls = fixture.fixture(root)
+                for rows in (receipt["expected"], receipt["before"], receipt["after"], records):
+                    for row in rows:
+                        if row.get("tid") == 7001:
+                            row["generation"] = generation
+                fixture.publish_fixture(root, manifest, receipt, records, controls)
+                surfaces = fixture.check(root, manifest)
+                self.assertEqual(len(surfaces), 12)
+                paths = [root / "snapshot.json", *surfaces]
+                if case == "decimal-marker":
+                    with self.assertRaisesRegex(AssertionError, "loader/pause identity"):
+                        subject.assert_final_artifact_privacy(paths)
+                else:
+                    subject.assert_final_artifact_privacy(paths)
+        for case, content, forbidden in (
+            ("hex-marker", json.dumps({"generation": hex(marker)}).encode(), True),
+            ("encoded-map-marker", subject.positive_control_content(struct.pack("<Q", marker)), True),
+            ("encoded-map-narrow", subject.positive_control_content(struct.pack("<Q", 512)), False),
+            ("encoded-byte-narrow", subject.positive_control_content(b"\xfa"), False),
+        ):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "map.json"
+                path.write_bytes(content)
+                if forbidden:
+                    with self.assertRaisesRegex(AssertionError, "loader/pause identity"):
+                        subject.assert_final_artifact_privacy([path])
+                else:
+                    subject.assert_final_artifact_privacy([path])
+
     def test_claimless_manifest_is_refused_in_every_lane(self):
         """A manifest claiming no snapshot must fail its lane, never pass it.
 

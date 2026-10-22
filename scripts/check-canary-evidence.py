@@ -1754,6 +1754,12 @@ def assert_final_artifact_privacy(artifacts):
                     str(path), trace_scannable(str(path), rendered)
                 )
         elif path.suffix == ".json":
+            # Custody receipts carry IDs; narrow scalars also occur as single
+            # map bytes. Scan distinctive fixture identities in the raw text
+            # while retaining the existing decoded-value policy for all IDs.
+            distinctive = [value for value in LOADER_PAUSE_IDENTITIES.values()
+                           if isinstance(value, str) or abs(value) >= DISTINCTIVE_FLOOR]
+            assert_no_loader_pause_identity(str(path), content, distinctive)
             assert_no_loader_pause_identity(str(path), reconstruct(content))
         elif path.name.endswith(".workload.log"):
             assert_no_loader_pause_identity(str(path), content, WORKLOAD_IDENTITIES)

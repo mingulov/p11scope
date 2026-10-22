@@ -3931,39 +3931,171 @@ fn validate_runtime_map(
 /// `--ring-bytes` still sizes only EVENTS.
 pub(crate) const SHARED_SCOPE_DISCOVERY_BYTES: u32 = 2 * 1024 * 1024;
 
-/// P0-only ship vehicle: whether the embedded Detailed object carries
-/// stubbed attribute capture. Probes the two verifier-heavy adapter
-/// functions' compiled sizes: the stub folds each to tens of instructions
-/// (27/49 stubbed) while FULL wires thousands (4,652/1,467).
-/// Panics on a half-wired object or an ambiguous probe — a silent
-/// misread here would mislabel the shipped flavor. Test-only: production
-/// derives the build flavor from the feature flag, and the consistency
-/// test pins the two together.
+/// Whether the embedded Detailed object carries stubbed attribute capture.
+/// Entry capture is inlined, so prove its scalar reader is called. Identify
+/// the return adapter exactly, without confusing its closure with its body.
+/// Panics on missing, ambiguous or half-wired evidence. Production continues
+/// to derive the flavor from the feature; these tests check the actual bytes.
 #[cfg(test)]
 pub(crate) fn embedded_object_is_stubbed() -> bool {
-    fn adapter_len(parsed: &aya_obj::Object, fragment: &str) -> usize {
-        let mut matches = parsed
-            .functions
-            .values()
-            .filter(|function| function.name.contains(fragment));
-        let function = matches
-            .next()
-            .unwrap_or_else(|| panic!("embedded Detailed object has no {fragment} function"));
-        assert!(
-            matches.next().is_none(),
-            "embedded Detailed object has several {fragment} functions"
-        );
-        function.instructions.len()
-    }
     let parsed =
         aya_obj::Object::parse(crate::EBPF_OBJECT).expect("embedded Detailed object parses");
-    let entry = adapter_len(&parsed, "object_entry_attributes");
-    let emit = adapter_len(&parsed, "object_emit_get_attributes");
-    let entry_stub = entry < 500;
+    embedded_object_capture_is_stubbed(parsed)
+}
+
+#[cfg(test)]
+fn embedded_adapter_symbol_matches(symbol: &str, helper: &str) -> bool {
+    let Some(path) = symbol.strip_prefix("_RNvC") else {
+        return false;
+    };
+    let path = if let Some(disambiguated) = path.strip_prefix('s') {
+        let Some((base62, path)) = disambiguated.split_once('_') else {
+            return false;
+        };
+        if base62.is_empty() || !base62.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+            return false;
+        }
+        path
+    } else {
+        path
+    };
+    path == format!("13p11scope_ebpf{}{helper}", helper.len())
+}
+
+#[cfg(test)]
+fn embedded_object_capture_entry(mut parsed: aya_obj::Object) -> (aya_obj::Function, u32) {
+    let reader = "p11_request_cell";
+    let mut matches = parsed
+        .functions
+        .values()
+        .filter(|function| function.name == reader);
+    let function = matches
+        .next()
+        .expect("embedded Detailed object lacks request reader");
+    assert!(
+        matches.next().is_none(),
+        "ambiguous embedded request reader"
+    );
+    let reader_id = parsed
+        .btf
+        .as_ref()
+        .expect("embedded object needs original BTF")
+        .id_by_type_name_kind(reader, aya_obj::btf::BtfKind::Func)
+        .expect("embedded request reader needs original BTF FUNC");
+    assert_eq!(
+        function.func_info.func_info.len(),
+        1,
+        "ambiguous request function info"
+    );
+    assert_eq!(
+        function.func_info.func_info[0].type_id, reader_id,
+        "request reader function info must bind its original BTF FUNC"
+    );
+    let entry = parsed
+        .programs
+        .get("p11_entry")
+        .expect("embedded Detailed object lacks entry");
+    let key = entry.function_key();
+    assert_eq!(
+        parsed
+            .functions
+            .values()
+            .filter(|function| function.name == "p11_entry")
+            .count(),
+        1,
+        "ambiguous embedded entry function"
+    );
+    assert_eq!(parsed.functions[&key].name, "p11_entry");
+    let text_sections = parsed
+        .functions
+        .keys()
+        .map(|(section, _)| *section)
+        .collect();
+    // Link only the entry root. Inspect return size independently, so changing
+    // a return body cannot fabricate entry-reader reachability.
+    parsed.programs.retain(|name, _| name == "p11_entry");
+    parsed
+        .relocate_calls(&text_sections)
+        .expect("embedded entry calls relocate");
+    (
+        parsed
+            .functions
+            .remove(&key)
+            .expect("linked entry remains present"),
+        reader_id,
+    )
+}
+
+#[cfg(test)]
+fn embedded_entry_reaches_reader(entry: &aya_obj::Function, reader_id: u32) -> bool {
+    use std::ops::Bound::{Excluded, Unbounded};
+    let functions: BTreeMap<_, _> = entry
+        .func_info
+        .func_info
+        .iter()
+        .map(|info| (info.insn_off as usize, info.type_id))
+        .collect();
+    assert_eq!(
+        functions.len(),
+        entry.func_info.func_info.len(),
+        "ambiguous linked function info"
+    );
+    assert_eq!(
+        functions.first_key_value().map(|(start, _)| *start),
+        Some(0)
+    );
+    assert!(
+        functions
+            .keys()
+            .all(|start| *start < entry.instructions.len())
+    );
+    let mut seen = BTreeSet::new();
+    let mut pending = vec![0];
+    while let Some(start) = pending.pop() {
+        if !seen.insert(start) {
+            continue;
+        }
+        let end = functions
+            .range((Excluded(start), Unbounded))
+            .next()
+            .map_or(entry.instructions.len(), |(end, _)| *end);
+        for (at, instruction) in entry.instructions.iter().enumerate().take(end).skip(start) {
+            if instruction.code == 0x85 && instruction.src_reg() == 1 {
+                let target = (at + 1)
+                    .checked_add_signed(instruction.imm as isize)
+                    .expect("linked entry call target is in range");
+                assert!(
+                    functions.contains_key(&target),
+                    "linked entry call lacks exact function info"
+                );
+                pending.push(target);
+            }
+        }
+    }
+    seen.iter().any(|start| functions[start] == reader_id)
+}
+
+#[cfg(test)]
+fn embedded_object_capture_is_stubbed(parsed: aya_obj::Object) -> bool {
+    let mut matches = parsed.functions.values().filter(|function| {
+        embedded_adapter_symbol_matches(&function.name, "object_emit_get_attributes")
+    });
+    let emit = matches
+        .next()
+        .expect("embedded Detailed object has no exact return adapter")
+        .instructions
+        .len();
+    assert!(
+        matches.next().is_none(),
+        "embedded Detailed object has several exact return adapters"
+    );
     let emit_stub = emit < 300;
+    let (entry, reader_id) = embedded_object_capture_entry(parsed);
+    let entry_stub = !embedded_entry_reaches_reader(&entry, reader_id);
     assert!(
         entry_stub == emit_stub,
-        "half-wired embedded object (entry {entry}, emit {emit} instructions)"
+        "half-wired embedded object (entry reader {}, emit {emit} instructions)",
+        !entry_stub
     );
     entry_stub
 }
@@ -12673,6 +12805,159 @@ mod tests {
             source.contains("DiscoveryStage::poll_discovery("),
             "readiness polls through the shared predicate"
         );
+    }
+
+    #[test]
+    fn embedded_capture_adapter_symbol_match_is_exact() {
+        let helper = "object_emit_get_attributes";
+        for symbol in [
+            "_RNvCscPIs3K62KxS_13p11scope_ebpf26object_emit_get_attributes",
+            "_RNvCsburksC6UTXr_13p11scope_ebpf26object_emit_get_attributes",
+            "_RNvC13p11scope_ebpf26object_emit_get_attributes",
+        ] {
+            assert!(super::embedded_adapter_symbol_matches(symbol, helper));
+        }
+        for symbol in [
+            "_RNvXs1_NtNtNtCsoa9cz3JwRE_4core3ops8function5implsQNCNvCscPIs3K62KxS_13p11scope_ebpf26object_emit_get_attributes0INtB7_5FnMutTyEE8call_mutBR_",
+            "_RNvCscPIs3K62KxS_13p11scope_ebpf26object_emit_get_attributes_suffix",
+            "_RNvCscPIs3K62KxS_13p11scope_ebpf32prefixobject_emit_get_attributes",
+            "_RNvCs_13p11scope_ebpf26object_emit_get_attributes",
+            "_RNvCs!_13p11scope_ebpf26object_emit_get_attributes",
+        ] {
+            assert!(!super::embedded_adapter_symbol_matches(symbol, helper));
+        }
+        let misleading = "prefix13p11scope_ebpf26object_emit_get_attributes";
+        assert!(!super::embedded_adapter_symbol_matches(
+            &format!("_RNvCsa_13p11scope_ebpf{}{misleading}", misleading.len()),
+            helper
+        ));
+    }
+
+    #[test]
+    fn embedded_object_capture_probe_refuses_missing_ambiguous_and_half_wired() {
+        fn refused(parsed: aya_obj::Object, reason: &str) {
+            let error =
+                std::panic::catch_unwind(|| super::embedded_object_capture_is_stubbed(parsed))
+                    .expect_err("mutated embedded object must be refused");
+            let message = error
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| error.downcast_ref::<&str>().copied())
+                .unwrap_or("");
+            assert!(message.contains(reason), "wrong refusal: {message}");
+        }
+        let parsed = aya_obj::Object::parse(crate::EBPF_OBJECT).unwrap();
+        let emit = *parsed
+            .functions
+            .iter()
+            .find(|(_, function)| {
+                super::embedded_adapter_symbol_matches(&function.name, "object_emit_get_attributes")
+            })
+            .unwrap()
+            .0;
+        let reader = *parsed
+            .functions
+            .iter()
+            .find(|(_, function)| function.name == "p11_request_cell")
+            .unwrap()
+            .0;
+        let mut missing = parsed.clone();
+        missing.functions.remove(&emit);
+        refused(missing, "no exact return adapter");
+        let mut misleading = parsed.clone();
+        misleading
+            .functions
+            .get_mut(&emit)
+            .unwrap()
+            .name
+            .push_str("_suffix");
+        refused(misleading, "no exact return adapter");
+        let mut duplicate = parsed.clone();
+        let address = duplicate
+            .functions
+            .keys()
+            .map(|(_, address)| *address)
+            .max()
+            .unwrap()
+            + 8;
+        let mut clone = duplicate.functions[&emit].clone();
+        clone.name = "_RNvCsa_13p11scope_ebpf26object_emit_get_attributes".into();
+        duplicate.functions.insert((emit.0, address), clone);
+        refused(duplicate, "several exact return adapters");
+        let mut missing = parsed.clone();
+        missing.functions.remove(&reader);
+        refused(missing, "lacks request reader");
+        let mut wrong_btf = parsed.clone();
+        wrong_btf
+            .functions
+            .get_mut(&reader)
+            .unwrap()
+            .func_info
+            .func_info[0]
+            .type_id = 0;
+        refused(wrong_btf, "original BTF FUNC");
+        let mut half_wired = parsed;
+        let body = &mut half_wired.functions.get_mut(&emit).unwrap().instructions;
+        let instruction = *body.last().unwrap();
+        body.resize(
+            if cfg!(feature = "stub-object-attributes") {
+                300
+            } else {
+                49
+            },
+            instruction,
+        );
+        refused(half_wired, "half-wired embedded object");
+    }
+
+    #[test]
+    fn embedded_object_capture_entry_requires_real_calls() {
+        let parsed = aya_obj::Object::parse(crate::EBPF_OBJECT).unwrap();
+        let (entry, reader_id) = super::embedded_object_capture_entry(parsed);
+        let captures = !cfg!(feature = "stub-object-attributes");
+        assert_eq!(
+            super::embedded_entry_reaches_reader(&entry, reader_id),
+            captures
+        );
+        let mut unknown = entry.clone();
+        let (at, instruction) = unknown
+            .instructions
+            .iter_mut()
+            .enumerate()
+            .find(|(_, instruction)| instruction.code == 0x85 && instruction.src_reg() == 1)
+            .unwrap();
+        instruction.imm = i32::try_from(entry.instructions.len() - at).unwrap();
+        assert!(
+            std::panic::catch_unwind(|| super::embedded_entry_reaches_reader(&unknown, reader_id))
+                .is_err()
+        );
+        if captures {
+            let target = entry
+                .func_info
+                .func_info
+                .iter()
+                .find(|info| info.type_id == reader_id)
+                .expect("FULL entry must link the actual request reader")
+                .insn_off as usize;
+            let mut removed = entry;
+            let mut changed = 0;
+            for (at, instruction) in removed.instructions.iter_mut().enumerate() {
+                if instruction.code == 0x85
+                    && instruction.src_reg() == 1
+                    && (at + 1).checked_add_signed(instruction.imm as isize) == Some(target)
+                {
+                    instruction.code = 0xb7;
+                    instruction.set_src_reg(0);
+                    instruction.imm = 0;
+                    changed += 1;
+                }
+            }
+            assert!(changed > 0, "actual reader call mutation must be nonzero");
+            assert!(
+                !super::embedded_entry_reaches_reader(&removed, reader_id),
+                "retained reader body/BTF alone cannot prove capture"
+            );
+        }
     }
 
     /// Forced-refusal / no-spurious-degrade control: the session's

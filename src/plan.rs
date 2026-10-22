@@ -51,6 +51,10 @@ pub enum AdmissionPolicy {
     /// count-only and the complete union is admitted atomically within this
     /// endpoint/payload budget.
     Inventory(crate::capacity::InventoryBudget),
+    /// Planner preparation for metrics counters: the complete validated union
+    /// is count-only within a lifetime endpoint envelope. This policy grants
+    /// no native map capacity or runtime activation.
+    Counters(crate::capacity::CounterBudget),
 }
 
 impl AdmissionPolicy {
@@ -62,19 +66,39 @@ impl AdmissionPolicy {
         Self::Inventory(budget)
     }
 
+    pub const fn counters(budget: crate::capacity::CounterBudget) -> Self {
+        Self::Counters(budget)
+    }
+
     fn endpoint_limit(self) -> usize {
         match self {
             Self::Detailed => MAX_SLOTS as usize,
             Self::Inventory(budget) => budget.endpoint_limit() as usize,
+            Self::Counters(budget) => budget.endpoint_limit() as usize,
         }
     }
 
     fn admits_complete_validated_union(self) -> bool {
-        matches!(self, Self::Inventory(_))
+        matches!(self, Self::Inventory(_) | Self::Counters(_))
     }
 
     fn forces_count_only(self) -> bool {
-        matches!(self, Self::Inventory(_))
+        matches!(self, Self::Inventory(_) | Self::Counters(_))
+    }
+
+    fn count_only_subject(self) -> &'static str {
+        match self {
+            Self::Detailed => "detailed",
+            Self::Inventory(_) => "inventory",
+            Self::Counters(_) => "counter",
+        }
+    }
+
+    fn capacity_subject(self) -> &'static str {
+        match self {
+            Self::Detailed | Self::Inventory(_) => "attach slots",
+            Self::Counters(_) => "counter endpoints",
+        }
     }
 
     fn validate_count(self, endpoints: usize) -> Result<(), String> {
@@ -84,13 +108,18 @@ impl AdmissionPolicy {
                 "attach plan requires {endpoints} allocated slots but only {MAX_SLOTS} are available"
             )),
             Self::Inventory(budget) => budget.validate_count(endpoints),
+            Self::Counters(budget) => budget.validate_count(endpoints),
         }
     }
 
     fn checked_required(self, current: usize, additions: usize) -> Result<usize, String> {
-        let required = current
-            .checked_add(additions)
-            .ok_or_else(|| "attach slot requirement overflowed".to_string())?;
+        let required = current.checked_add(additions).ok_or_else(|| {
+            match self {
+                Self::Counters(_) => "counter endpoint requirement overflowed",
+                Self::Detailed | Self::Inventory(_) => "attach slot requirement overflowed",
+            }
+            .to_string()
+        })?;
         self.validate_count(required)?;
         Ok(required)
     }
@@ -279,11 +308,13 @@ fn growth_omission_reason(
     in_use: usize,
     retired: usize,
     kept: usize,
+    policy: AdmissionPolicy,
 ) -> String {
     let endpoints = |count: usize| if count == 1 { "endpoint" } else { "endpoints" };
     format!(
-        "{GROWTH_OMISSION} {omitted} more; only {capacity} attach slots are available; \
+        "{GROWTH_OMISSION} {omitted} more; only {capacity} {} are available; \
          {} — {omitted} {} not attached; kept its {kept} attached {}",
+        policy.capacity_subject(),
         slot_use(in_use, retired, &[]),
         endpoints(omitted),
         endpoints(kept),
@@ -464,6 +495,7 @@ fn slot_holders<'a>(
 /// A whole-module capacity refusal: the demand, the budget, what holds it,
 /// and — in a shared scope — the reserve and how to aim the capture.
 struct CapacityRefusal<'a> {
+    policy: AdmissionPolicy,
     needed: usize,
     capacity: usize,
     in_use: usize,
@@ -477,9 +509,10 @@ struct CapacityRefusal<'a> {
 impl CapacityRefusal<'_> {
     fn reason(&self) -> String {
         let mut reason = format!(
-            "module needs {} more; only {} attach slots are available; {}",
+            "module needs {} more; only {} {} are available; {}",
             self.needed,
             self.capacity,
+            self.policy.capacity_subject(),
             slot_use(self.in_use, self.retired, &self.holders)
         );
         if let Some(reserve) = self.reserve {
@@ -1224,8 +1257,9 @@ impl AttachPlan {
             .is_err()
         {
             let capacity = self.admission_policy.endpoint_limit();
+            let resource = self.admission_policy.capacity_subject();
             return Err(format!(
-                "selection table needs {table_additions} more of the {capacity} attach slots; \
+                "selection table needs {table_additions} more of the {capacity} {resource}; \
                  {pending} are allocated or pending — refusing to attach a prefix"
             ));
         }
@@ -1799,7 +1833,11 @@ impl AttachPlan {
                     || slot.semantics != SlotSemantics::COUNT_ONLY
                     || slot.semantic_authorized)
             {
-                return Err(format!("inventory slot {} is not count-only", slot.index));
+                return Err(format!(
+                    "{} slot {} is not count-only",
+                    self.admission_policy.count_only_subject(),
+                    slot.index
+                ));
             }
             if slot.descriptor_index != 0
                 && (!slot.semantic_authorized
@@ -2500,6 +2538,7 @@ fn merge(
             Err(refused) => {
                 holding.remove(&object);
                 let refusal = CapacityRefusal {
+                    policy: admission_policy,
                     needed: refused.len(),
                     capacity,
                     in_use: allocated_slots,
@@ -2744,6 +2783,7 @@ fn merge(
                         allocated_slots,
                         retired,
                         kept_attached.len(),
+                        admission_policy,
                     ),
                 };
                 refused_module_objects.push((object, omission.clone()));
@@ -5380,17 +5420,22 @@ mod tests {
     #[test]
     fn growth_omission_reason_counts_endpoints_in_singular_and_plural() {
         assert_eq!(
-            growth_omission_reason(1, 512, 512, 0, 1),
+            growth_omission_reason(1, 512, 512, 0, 1, AdmissionPolicy::Detailed),
             "admitted module needs 1 more; only 512 attach slots are available; 512 are in use \
              (512 active, 0 retired) — 1 endpoint not attached; kept its 1 attached endpoint"
         );
         assert_eq!(
-            growth_omission_reason(2, 512, 511, 11, 500),
+            growth_omission_reason(2, 512, 511, 11, 500, AdmissionPolicy::Detailed),
             "admitted module needs 2 more; only 512 attach slots are available; 511 are in use \
              (500 active, 11 retired) — 2 endpoints not attached; kept its 500 attached endpoints"
         );
         assert!(is_growth_omission(&growth_omission_reason(
-            1, 512, 512, 0, 1
+            1,
+            512,
+            512,
+            0,
+            1,
+            AdmissionPolicy::Detailed
         )));
         let whole = "module needs 2 more; only 512 attach slots are available; 511 are in use — \
                      refusing to attach a prefix";
@@ -5398,14 +5443,28 @@ mod tests {
         // The omitted count round-trips through the record the engine ranks.
         for omitted in [1, 2, 511, 2_113] {
             assert_eq!(
-                growth_omitted_count(&growth_omission_reason(omitted, 512, 511, 3, 7)),
+                growth_omitted_count(&growth_omission_reason(
+                    omitted,
+                    512,
+                    511,
+                    3,
+                    7,
+                    AdmissionPolicy::Detailed
+                )),
                 Some(omitted)
             );
         }
         assert_eq!(growth_omitted_count(whole), None);
         assert_eq!(whole_refusal_needed_count(whole), Some(2));
         assert_eq!(
-            whole_refusal_needed_count(&growth_omission_reason(2, 512, 511, 3, 7)),
+            whole_refusal_needed_count(&growth_omission_reason(
+                2,
+                512,
+                511,
+                3,
+                7,
+                AdmissionPolicy::Detailed
+            )),
             None
         );
         assert_eq!(

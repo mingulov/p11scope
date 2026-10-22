@@ -209,6 +209,46 @@ impl DetailedResources {
     }
 }
 
+/// Counters' endpoint planning ceiling, independent of Inventory's policy.
+/// This is not a compiled map, memory, RV, START or attachment capacity and
+/// does not authorize native counter capture or growth.
+pub const MAX_COUNTER_ENDPOINT_LIMIT: u64 = 8_192;
+
+/// Checked capture-lifetime endpoint envelope for counter planner preparation.
+/// Allocated positions include retired endpoints; no payload or native
+/// resource capacity is implied by this budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CounterBudget {
+    endpoint_limit: u64,
+}
+
+impl CounterBudget {
+    pub fn new(endpoint_limit: u64) -> Result<Self, String> {
+        if !(1..=MAX_COUNTER_ENDPOINT_LIMIT).contains(&endpoint_limit) {
+            return Err(format!(
+                "counter endpoint planning budget must be in 1..={MAX_COUNTER_ENDPOINT_LIMIT} (requested {endpoint_limit})"
+            ));
+        }
+        Ok(Self { endpoint_limit })
+    }
+
+    pub const fn endpoint_limit(self) -> u64 {
+        self.endpoint_limit
+    }
+
+    pub(crate) fn validate_count(self, endpoints: usize) -> Result<(), String> {
+        let endpoints = u64::try_from(endpoints)
+            .map_err(|_| "counter endpoint count does not fit u64".to_string())?;
+        if endpoints > self.endpoint_limit {
+            return Err(format!(
+                "counter plan requires {endpoints} counter endpoints but only {} are available",
+                self.endpoint_limit
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// One compact inventory value is one atomic `u64` constrained to 0/1.
 pub const INVENTORY_ENDPOINT_BYTES: u64 = size_of::<u64>() as u64;
 

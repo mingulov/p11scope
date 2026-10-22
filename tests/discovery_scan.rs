@@ -273,7 +273,7 @@ fn future_minor_legacy_tables_are_scanned_as_known_prefix() {
 /// 3136-byte .bss tail in the last file-backed page, so the LP64 scan
 /// sees the first statics (legacy, t240, t30) but t31's window already
 /// crosses into the anonymous mapping. The [3,9] static is therefore
-/// outside the LP64 scan's reach by construction (not by version gate),
+/// outside the LP64 scan's reach in that measured layout (not by version gate),
 /// and the [3,9] scan-decode path itself is covered by
 /// `future_minor_legacy_tables_are_scanned_as_known_prefix` (the legacy
 /// static is first in .bss, always in the tail) and the `scan.rs` unit

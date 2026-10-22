@@ -299,21 +299,23 @@ VERSION_SURFACES = Counter(
 )
 # SCANNED — the canary workload maps the provider *before* attach, so both
 # sources describe it. LP64 scans three file-backed tables and reports one
-# conflict; ILP32 also scans the 3.1 and 3.2 tables and agrees with the manifest.
+# conflict; ILP32 also scans the 3.1, 3.2 and future-minor 3.9 tables and agrees
+# with the manifest. These exact subsets describe the selected compiled
+# fixtures' file-backed page tails, not a version restriction in the scanner.
 # Tables built at run time in .bss are not object-level scan failures. Every
 # scanned table remains an exact per-source record.
 #
 # What the union does *not* change is the attach plan: 104 slots and 208 probes,
 # exactly as before, because a slot is one {object, file offset} however many
 # sources named it. `surfaces` keeps the per-source records, so the scan adds
-# three LP64 surfaces (13 -> 16) or five ILP32 surfaces (13 -> 18).
+# three LP64 surfaces (13 -> 16) or six ILP32 surfaces (13 -> 19).
 # `table_entries` counts exact target occurrences across sources, so neither
 # scan subset changes the 988-entry union.
 VERSION_SURFACES_SCANNED = VERSION_SURFACES + Counter(
     {("full", 68): 2, ("full", 92): 1}
 )
 VERSION_SURFACES_SCANNED_IA32 = VERSION_SURFACES_SCANNED + Counter(
-    {("full", 92): 1, ("full", 104): 1}
+    {("full", 92): 1, ("full", 104): 1, ("known_prefix", 104): 1}
 )
 VERSION_SHAPE_MANIFEST_ONLY = (988, 104, 208, VERSION_SURFACES, 1, "ok")
 VERSION_SHAPE_SCANNED = (988, 104, 208, VERSION_SURFACES_SCANNED, 1, "ok")
@@ -340,7 +342,7 @@ VERSION_TABLES_SCANNED = VERSION_TABLES_MANIFEST_ONLY + Counter(
     {("scan", (2, 40), 68): 2, ("scan", (3, 0), 92): 1}
 )
 VERSION_TABLES_SCANNED_IA32 = VERSION_TABLES_SCANNED + Counter(
-    {("scan", (3, 1), 92): 1, ("scan", (3, 2), 104): 1}
+    {("scan", (3, 1), 92): 1, ("scan", (3, 2), 104): 1, ("scan", (3, 9), 104): 1}
 )
 DISCOVERY_SUBJECT = "discovery subject"
 DISCOVERY_UNAVAILABLE = "discovery unavailable"
@@ -4195,18 +4197,23 @@ def self_test():
     safe32["evidence"]["surfaces"].extend(
         [
             {
-                "walk": "full",
+                "walk": walk,
                 "functions": functions,
                 "acquisition": "ok",
                 "source": f"/opt/p11.so table {major}.{minor}",
             }
-            for major, minor, functions in ((3, 1, 92), (3, 2, 104))
+            for major, minor, functions, walk in (
+                (3, 1, 92, "full"),
+                (3, 2, 104, "full"),
+                (3, 9, 104, "known_prefix"),
+            )
         ]
     )
     safe32["evidence"]["discovery"][0]["tables"].extend(
         [
             {"source": "scan", "version": [3, 1], "entries": 92},
             {"source": "scan", "version": [3, 2], "entries": 104},
+            {"source": "scan", "version": [3, 9], "entries": 104},
         ]
     )
     safe32["evidence"]["discovery"][0].update(
@@ -4214,6 +4221,19 @@ def self_test():
         corroboration=["agreed"],
     )
     safe32["evidence"]["discovery_conflicts"] = 0
+    require(
+        surface_signature(safe32["evidence"]) == Counter({
+            ("full", 68): 4, ("full", 92): 4, ("full", 104): 3,
+            ("known_prefix", 68): 1, ("known_prefix", 92): 2,
+            ("known_prefix", 104): 3, ("refused", 0): 1, ("not_walked", 0): 1,
+        }),
+        "the IA32 matrix has exactly nineteen independently specified surfaces",
+    )
+    require(
+        sum(table["source"] == "manifest"
+            for table in safe32["evidence"]["discovery"][0]["tables"]) == 13,
+        "the extra future-minor scan does not change the thirteen manifest rows",
+    )
     settle_fixture_verdict(safe32)
     validate_canary("default-safe-profile", safe32, 32)
     rejected(lambda: validate_canary("default-safe-profile", safe32, 64))
@@ -4282,7 +4302,7 @@ def self_test():
     for label, mutate in (
         ("missing ia32 scan table", lambda d: d["evidence"]["discovery"][0]["tables"].pop()),
         (
-            "extra ia32 scan table",
+            "duplicate ia32 future-minor scan table",
             lambda d: d["evidence"]["discovery"][0]["tables"].append(
                 {"source": "scan", "version": [3, 9], "entries": 104}
             ),
@@ -4290,6 +4310,27 @@ def self_test():
         (
             "relabeled ia32 scan table",
             lambda d: d["evidence"]["discovery"][0]["tables"][-1].update(source="manifest"),
+        ),
+        (
+            "wrong ia32 future-minor version",
+            lambda d: d["evidence"]["discovery"][0]["tables"][-1].update(version=[3, 8]),
+        ),
+        (
+            "wrong ia32 future-minor entry count",
+            lambda d: d["evidence"]["discovery"][0]["tables"][-1].update(entries=92),
+        ),
+        ("missing ia32 future-minor surface", lambda d: d["evidence"]["surfaces"].pop()),
+        (
+            "duplicate ia32 future-minor surface",
+            lambda d: d["evidence"]["surfaces"].append(dict(d["evidence"]["surfaces"][-1])),
+        ),
+        (
+            "wrong ia32 future-minor walk",
+            lambda d: d["evidence"]["surfaces"][-1].update(walk="full"),
+        ),
+        (
+            "wrong ia32 future-minor surface count",
+            lambda d: d["evidence"]["surfaces"][-1].update(functions=92),
         ),
     ):
         bad = copy.deepcopy(safe32)

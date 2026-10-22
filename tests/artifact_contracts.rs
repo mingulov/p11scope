@@ -13198,6 +13198,7 @@ fn license_legal_surface_accepts_only_quoted_upstream_provenance_names() {
     }
 }
 
+const SEMANTIC_CAPTURE_TESTS: &str = "src/semantic_capture/tests.rs";
 const SEMANTIC_VALIDATION_TEST_CHILD: &str =
     "src/semantic_capture/tests/custody_chain_tests/semantic_validation.rs";
 const OWNER_ADMISSION_TEST_CHILD: &str =
@@ -13209,7 +13210,14 @@ fn semantic_capture_private_test_child_references_are_canonical(path: &str, sour
     // Strip only the approved source sites. Concrete filename references
     // elsewhere also catch differently named #[path] aliases and include!.
     let remainder = match path {
-        "src/semantic_capture.rs" => source.replacen("\n        mod semantic_validation;\n", "", 1),
+        "src/semantic_capture.rs" => {
+            let remainder = source.replacen("\n#[cfg(test)]\nmod tests;\n", "", 1);
+            if remainder.contains("mod tests;") || remainder.contains("tests.rs") {
+                return false;
+            }
+            remainder
+        }
+        SEMANTIC_CAPTURE_TESTS => source.replacen("\n    mod semantic_validation;\n", "", 1),
         SEMANTIC_VALIDATION_TEST_CHILD => source.replacen(
             "\n#[path = \"owner_admission.rs\"]\nmod owner_admission;\n",
             "",
@@ -13223,6 +13231,7 @@ fn semantic_capture_private_test_child_references_are_canonical(path: &str, sour
         _ => source.to_owned(),
     };
     ![
+        "semantic_capture/tests.rs",
         "semantic_validation.rs",
         "owner_admission.rs",
         "successor_replay.rs",
@@ -13236,6 +13245,7 @@ fn semantic_capture_private_test_child_references_are_canonical(path: &str, sour
 
 fn semantic_capture_private_test_children_are_isolated(
     capture: &str,
+    tests: &str,
     validation: &str,
     owner_admission_present: bool,
 ) -> bool {
@@ -13243,27 +13253,32 @@ fn semantic_capture_private_test_children_are_isolated(
         "src/semantic_capture.rs",
         capture,
     ) || !semantic_capture_private_test_child_references_are_canonical(
+        SEMANTIC_CAPTURE_TESTS,
+        tests,
+    ) || !semantic_capture_private_test_child_references_are_canonical(
         SEMANTIC_VALIDATION_TEST_CHILD,
         validation,
     ) {
         return false;
     }
-    // These canonical, rustfmt-indented module boundaries prove ancestry,
-    // rather than finding a cfg(test) elsewhere in this large source file.
-    let Some((_, tests)) = capture.split_once("\n#[cfg(test)]\nmod tests {\n") else {
+    // The unique external module gate protects the whole tests.rs file.
+    // Its canonical, rustfmt-indented custody boundary then proves ancestry;
+    // an unrelated cfg(test) elsewhere cannot license a private-field reader.
+    let Some((production, tail)) = capture.split_once("\n#[cfg(test)]\nmod tests;\n") else {
         return false;
     };
-    let Some((tests, _)) = tests.split_once("\n}\n") else {
+    // No path attribute may redirect this declaration to a different file.
+    if !production.trim_end().ends_with('}') || !tail.trim().is_empty() {
+        return false;
+    }
+    let Some((_, custody)) = tests.split_once("\nmod custody_chain_tests {\n") else {
         return false;
     };
-    let Some((_, custody)) = tests.split_once("\n    mod custody_chain_tests {\n") else {
+    let Some((custody, _)) = custody.split_once("\n}") else {
         return false;
     };
-    let Some((custody, _)) = custody.split_once("\n    }") else {
-        return false;
-    };
-    if !custody.contains("\n        mod semantic_validation;\n")
-        || capture.matches("mod semantic_validation;").count() != 1
+    if !custody.contains("\n    mod semantic_validation;\n")
+        || tests.matches("mod semantic_validation;").count() != 1
     {
         return false;
     }
@@ -13272,8 +13287,13 @@ fn semantic_capture_private_test_children_are_isolated(
             && validation.matches("mod owner_admission;").count() == 1)
 }
 
-fn successor_replay_test_child_is_isolated(capture: &str, validation: &str, owner: &str) -> bool {
-    semantic_capture_private_test_children_are_isolated(capture, validation, true)
+fn successor_replay_test_child_is_isolated(
+    capture: &str,
+    tests: &str,
+    validation: &str,
+    owner: &str,
+) -> bool {
+    semantic_capture_private_test_children_are_isolated(capture, tests, validation, true)
         && semantic_capture_private_test_child_references_are_canonical(
             OWNER_ADMISSION_TEST_CHILD,
             owner,
@@ -13287,16 +13307,18 @@ fn successor_replay_test_child_is_isolated(capture: &str, validation: &str, owne
 #[test]
 fn successor_replay_record_consumer_requires_exact_test_ancestry() {
     let capture = read("src/semantic_capture.rs");
+    let tests = read(SEMANTIC_CAPTURE_TESTS);
     let validation = read(SEMANTIC_VALIDATION_TEST_CHILD);
     let owner = read(OWNER_ADMISSION_TEST_CHILD);
     assert!(successor_replay_test_child_is_isolated(
         &capture,
+        &tests,
         &validation,
         &owner,
     ));
     for (capture, validation, owner) in [
         (
-            capture.replacen("#[cfg(test)]\nmod tests {", "mod tests {", 1),
+            capture.replacen("#[cfg(test)]\nmod tests;", "mod tests;", 1),
             validation.clone(),
             owner.clone(),
         ),
@@ -13327,7 +13349,7 @@ fn successor_replay_record_consumer_requires_exact_test_ancestry() {
         ),
     ] {
         assert!(
-            !successor_replay_test_child_is_isolated(&capture, &validation, &owner),
+            !successor_replay_test_child_is_isolated(&capture, &tests, &validation, &owner),
             "an alternate inclusion must not license private-record consumption",
         );
     }
@@ -13352,33 +13374,68 @@ fn successor_replay_record_consumer_requires_exact_test_ancestry() {
 #[test]
 fn semantic_capture_private_record_test_children_remain_test_only() {
     let capture = read("src/semantic_capture.rs");
+    let tests = read(SEMANTIC_CAPTURE_TESTS);
     let validation = read(SEMANTIC_VALIDATION_TEST_CHILD);
     let owner_admission_present = std::path::Path::new(OWNER_ADMISSION_TEST_CHILD).is_file();
     assert!(
         semantic_capture_private_test_children_are_isolated(
             &capture,
+            &tests,
             &validation,
             owner_admission_present,
         ),
         "private-record test children must inherit semantic_capture's cfg(test) gate"
     );
 
-    let without_cfg = capture.replacen("#[cfg(test)]\nmod tests {", "mod tests {", 1);
+    let without_cfg = capture.replacen("#[cfg(test)]\nmod tests;", "mod tests;", 1);
     assert!(
         !semantic_capture_private_test_children_are_isolated(
             &without_cfg,
+            &tests,
             &validation,
             owner_admission_present,
         ),
         "removing the actual test-module gate must revoke child exemptions"
     );
+    for redirected in [
+        capture.replace(
+            "#[cfg(test)]\nmod tests;",
+            "#[path = \"other.rs\"]\n#[cfg(test)]\nmod tests;",
+        ),
+        capture.replace("#[cfg(test)]\nmod tests;", "#[cfg(any())]\nmod tests;"),
+        format!("{capture}\nmod tests;\n"),
+    ] {
+        assert!(
+            !semantic_capture_private_test_children_are_isolated(
+                &redirected,
+                &tests,
+                &validation,
+                owner_admission_present,
+            ),
+            "only the actual, uniquely gated external test module licenses the fixture",
+        );
+    }
+    let outside_custody = format!(
+        "{}\nmod semantic_validation;\n",
+        tests.replace("    mod semantic_validation;\n", ""),
+    );
+    assert!(
+        !semantic_capture_private_test_children_are_isolated(
+            &capture,
+            &outside_custody,
+            &validation,
+            owner_admission_present,
+        ),
+        "the external test file must retain the child's exact custody ancestry",
+    );
     let moved_child = format!(
         "{}\n#[path = \"semantic_capture/tests/custody_chain_tests/semantic_validation.rs\"]\nmod semantic_validation;\n",
-        capture.replacen("        mod semantic_validation;\n", "", 1),
+        capture,
     );
     assert!(
         !semantic_capture_private_test_children_are_isolated(
             &moved_child,
+            &tests.replace("    mod semantic_validation;\n", ""),
             &validation,
             owner_admission_present,
         ),
@@ -13392,11 +13449,14 @@ fn semantic_capture_private_record_test_children_remain_test_only() {
         "include!(\"semantic_capture/tests/custody_chain_tests/semantic_validation.rs\");",
         "#[path = \"semantic_capture/tests/custody_chain_tests/owner_admission.rs\"]\nmod production_owner;",
         "include!(\"semantic_capture/tests/custody_chain_tests/owner_admission.rs\");",
+        "#[path = \"semantic_capture/tests.rs\"]\nmod production_tests;",
+        "include!(\"semantic_capture/tests.rs\");",
     ] {
         let alias = format!("{capture}\n{inclusion}\n");
         assert!(
             !semantic_capture_private_test_children_are_isolated(
                 &alias,
+                &tests,
                 &validation,
                 owner_admission_present,
             ),
@@ -13408,6 +13468,7 @@ fn semantic_capture_private_record_test_children_remain_test_only() {
         "src/lib.rs",
         "src/render.rs",
         "src/semantic_capture.rs",
+        SEMANTIC_CAPTURE_TESTS,
         SEMANTIC_VALIDATION_TEST_CHILD,
         OWNER_ADMISSION_TEST_CHILD,
         SUCCESSOR_REPLAY_TEST_CHILD,
@@ -13438,6 +13499,7 @@ fn semantic_capture_private_record_test_children_remain_test_only() {
     };
     assert!(semantic_capture_private_test_children_are_isolated(
         &capture,
+        &tests,
         owner_parent,
         true,
     ));
@@ -13448,7 +13510,12 @@ fn semantic_capture_private_record_test_children_remain_test_only() {
         format!("{owner_parent}\ninclude!(\"owner_admission.rs\");\n"),
     ] {
         assert!(
-            !semantic_capture_private_test_children_are_isolated(&capture, &invalid_parent, true),
+            !semantic_capture_private_test_children_are_isolated(
+                &capture,
+                &tests,
+                &invalid_parent,
+                true,
+            ),
             "the owner-admission child must retain its exact parent inclusion"
         );
     }
@@ -13468,6 +13535,7 @@ fn instance_entry_ip_and_stamps_have_no_rendering_consumers() {
         // H0's retained evidence adapter owns private CALL routing/continuity;
         // this grants no renderer or public projection a raw-field consumer.
         "src/semantic_capture.rs",
+        SEMANTIC_CAPTURE_TESTS,
         // Exact fixtures under its cfg(test) ancestry, guarded below. This
         // grants no sibling directory or production consumer an exemption.
         SEMANTIC_VALIDATION_TEST_CHILD,
@@ -13480,6 +13548,7 @@ fn instance_entry_ip_and_stamps_have_no_rendering_consumers() {
         !allowed.contains(&path) && transport_boundaries::uses_private_record_fields(path, source)
     };
     for path in [
+        SEMANTIC_CAPTURE_TESTS,
         SEMANTIC_VALIDATION_TEST_CHILD,
         OWNER_ADMISSION_TEST_CHILD,
         SUCCESSOR_REPLAY_TEST_CHILD,
@@ -13528,6 +13597,7 @@ fn instance_entry_ip_and_stamps_have_no_rendering_consumers() {
     assert!(
         semantic_capture_private_test_children_are_isolated(
             &read("src/semantic_capture.rs"),
+            &read(SEMANTIC_CAPTURE_TESTS),
             &read(SEMANTIC_VALIDATION_TEST_CHILD),
             std::path::Path::new(OWNER_ADMISSION_TEST_CHILD).is_file(),
         ),
@@ -13536,6 +13606,7 @@ fn instance_entry_ip_and_stamps_have_no_rendering_consumers() {
     assert!(
         successor_replay_test_child_is_isolated(
             &read("src/semantic_capture.rs"),
+            &read(SEMANTIC_CAPTURE_TESTS),
             &read(SEMANTIC_VALIDATION_TEST_CHILD),
             &read(OWNER_ADMISSION_TEST_CHILD),
         ),

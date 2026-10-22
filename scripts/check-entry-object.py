@@ -241,6 +241,15 @@ class Consumer:
     def label(self, pc):
         return f"{self.section}:{self.name}:{pc}"
 
+    @staticmethod
+    def merge_facts(previous, state):
+        return state.copy() if previous is None else {
+            key: joined for key, fact in previous.items()
+            if (joined := join_fact(fact, state.get(key))) is not None}
+
+    def flow_edges(self, pc, before, after):
+        return ((successor, after) for successor in self.graph[pc])
+
     def step(self, pc, incoming):
         state = self.transfer(pc, incoming)
         return self.proof.transfer(self, pc, incoming, state) if self.proof else state
@@ -477,11 +486,9 @@ class Consumer:
         while pending:
             pc = pending.popleft()
             state = self.step(pc, incoming[pc])
-            for successor in self.graph[pc]:
+            for successor, edge in self.flow_edges(pc, incoming[pc], state):
                 previous = incoming.get(successor)
-                merged = state.copy() if previous is None else {
-                    k: joined for k, v in previous.items()
-                    if (joined := join_fact(v, state.get(k))) is not None}
+                merged = self.merge_facts(previous, edge)
                 if previous != merged:
                     incoming[successor] = merged
                     pending.append(successor)
@@ -928,14 +935,19 @@ class SinkProof:
                     if compare(left[1], op, right[1], width) != taken:
                         continue
                 elif number_values(left) is not None and number_values(right) is not None:
+                    if branch[1] == branch[3] and compare(0, op, 0, width) != taken:
+                        continue
                     pairs = {(a, b) for a in number_values(left) for b in number_values(right)
                              if compare(a, op, b, width) == taken}
                     if not pairs:
                         continue
-                    for original, values in ((left, {a for a, _ in pairs}), (right, {b for _, b in pairs})):
-                        for key, fact in list(state.items()):
-                            if fact == original:
-                                state[key] = number_fact(values)
+                    # Matching abstract value sets do not establish aliases.
+                    # Without a value-identity token, refine only each tested
+                    # full-width register, never an independent register/spill.
+                    for operand, values in ((branch[1], {a for a, _ in pairs}),
+                                            (branch[3], {b for _, b in pairs})):
+                        if operand.startswith("r"):
+                            state[operand] = number_fact(values)
                 elif left and right and left[0] == "field" and right[0] == "constant":
                     domain = frozenset(n for n in self.domain(before, left[1]) if compare(n, op, right[1], width) == taken)
                     if not domain:
@@ -1280,6 +1292,246 @@ def scalar_body_contract(internal_blocks, internal_calls, variant):
 
 
 
+def scalar_bits(fact):
+    """Possible one bits, used only for closed scalar effects, never indices."""
+    if not isinstance(fact, tuple) or not fact:
+        return None
+    values = number_values(fact)
+    if values is not None:
+        result = 0
+        for number in values:
+            result |= number
+        return result
+    return fact[1] if fact and fact[0] == "bits" else None
+
+
+class _ClosedEffectsProof(SinkProof):
+    """Check actual callees before preserving a caller's private memory.
+
+    Scalar inputs do not confer pointer authority. All memory accesses must
+    resolve to this BPF frame, the exact Result output, or the reader's two
+    readonly closure cells. Return bit bounds are a separate scalar domain;
+    they cannot authorize a frame/private-row offset or bounded-loop visit.
+    """
+    def __init__(self, summaries, allowed, *, result=False):
+        super().__init__("closed", 0, True, ("stack", -0x1000), kind="effects")
+        self.summaries, self.allowed, self.result = summaries, allowed, result
+        self.return_bits, self.exits = 0, set()
+
+    def partition(self, state):
+        return ()
+
+    @staticmethod
+    def join(previous, state):
+        merged = SinkProof.join(previous, state)
+        if previous is not None:
+            for key in previous.keys() & state.keys():
+                left, right = scalar_bits(previous[key]), scalar_bits(state[key])
+                if key not in merged and left is not None and right is not None:
+                    lhs, rhs = number_values(previous[key]), number_values(state[key])
+                    values = lhs | rhs if lhs is not None and rhs is not None else None
+                    # The local EC-parameter clearing loop has ten bytes.
+                    # This larger finite domain is confined to local effects;
+                    # it never widens the final-sink private-row index domain.
+                    merged[key] = (("finite", values) if values is not None and len(values) <= 16
+                                   else ("bits", left | right))
+                if (isinstance(previous[key], tuple) and isinstance(state[key], tuple)
+                        and previous[key] and state[key] and previous[key][0] in ("stack", "locals")
+                        and state[key][0] in ("stack", "locals")):
+                    lhs = {previous[key][1]} if previous[key][0] == "stack" else previous[key][1]
+                    rhs = {state[key][1]} if state[key][0] == "stack" else state[key][1]
+                    offsets = frozenset(lhs | rhs)
+                    if len(offsets) <= 16:
+                        merged[key] = (("stack", next(iter(offsets))) if len(offsets) == 1 else ("locals", offsets))
+        return merged
+
+    def transfer(self, consumer, pc, before, state):
+        text, target = consumer.text[pc], consumer.calls.get(pc)
+        error = lambda reason: consumer.label(pc) + ": closed callee " + reason
+        require(pc not in consumer.maps, error("memory map relocation"))
+        require(not ("atomic" in text or "xchg" in text or text.startswith("lock ")),
+                error("memory atomic footprint"))
+        memory = LOAD.fullmatch(text) or STORE.fullmatch(text)
+        if memory:
+            load = LOAD.fullmatch(text)
+            width = int(memory[2] if load else memory[1])
+            base, sign, offset = memory.groups()[2:5] if load else memory.groups()[1:4]
+            pointer = address(before, base, sign, offset)
+            original = before.get("r"+base)
+            offsets = (original[1] if original and original[0] == "locals" else frozenset())
+            delta = int(offset, 16) * (1 if sign == "+" else -1)
+            local = pointer and pointer[0] == "stack" and -512 <= pointer[1] and pointer[1]+width//8 <= 0
+            if offsets:
+                require(all(-512 <= n+delta and n+delta+width//8 <= 0 for n in offsets),
+                        error("memory local offset bounds"))
+                local = True
+                if not load:
+                    for n in offsets:
+                        forget_stack(state, n+delta, width//8)
+            output = (self.result and pointer and pointer[0] == "stack"
+                      and (pointer[1], width) in ((-0x1000, 64), (-0xff8, 64)))
+            readonly = (self.result and load and pointer and pointer[0] == "stack"
+                        and (pointer[1], width) in ((-0x2000, 64), (-0x3000, 8)))
+            require(local or output or readonly, error("memory address/footprint"))
+            if load and state.get(reg(memory[1])) is None:
+                state[reg(memory[1])] = ("bits", (1 << width)-1)
+        elif text.startswith("call "):
+            if pc in consumer.helper:
+                require(text == "call 0x70", error("unknown helper/callee footprint"))
+                output, size = before.get("r1"), before.get("r2")
+                widths = number_values(size)
+                require(output and output[0] == "stack" and widths is not None
+                        and widths <= {1, 4, 7, 8, 10} and -512 <= output[1] and output[1]+max(widths) <= 0
+                        and scalar_bits(before.get("r3")) is not None,
+                        error("memory user-read output/source footprint"))
+                state.update((key, fact) for key, fact in before.items()
+                             if isinstance(key, tuple) and key[0] == "stack")
+                forget_stack(state, output[1], max(widths))
+                state["r0"] = ("bits", (1 << 64)-1)
+            else:
+                require(target in self.summaries and self.summaries[target]["output"] is None,
+                        error("unknown internal callee footprint"))
+                require(all(scalar_bits(before.get("r"+str(i))) is not None for i in range(1, 6)),
+                        error("private pointer/unknown scalar argument to callee"))
+                state["r0"] = ("bits", self.summaries[target]["return_bits"])
+        elif match := re.fullmatch(r"([rw]\d+) (=|\+=|\*=|<<=|>>=|&=|\|=|\^=) ([rw]\d+|-?0x[0-9a-f]+)(?: ll)?", text):
+            dst, op, src = match.groups()
+            left, right = before.get(reg(dst)), value(before, src)
+            width = 32 if dst.startswith("w") else 64
+            wordmask = (1 << width)-1
+            if op == "=" and right and right[0] in ("stack", "locals"):
+                require(width == 64 and not src.startswith("w"), error("narrow frame pointer"))
+                state[reg(dst)] = right
+            elif op == "+=" and left and left[0] in ("stack", "locals"):
+                amounts = number_values(right)
+                require(width == 64 and amounts is not None, error("memory variable frame offset"))
+                if right[0] == "constant" and right[1] < 0:
+                    amounts = {right[1]}
+                offsets = {left[1]} if left[0] == "stack" else left[1]
+                offsets = frozenset(a+b for a in offsets for b in amounts)
+                require(len(offsets) <= 16 and all(-512 <= n <= 0 for n in offsets), error("memory frame offset bounds"))
+                state[reg(dst)] = (("stack", next(iter(offsets))) if len(offsets) == 1 else ("locals", offsets))
+            else:
+                a, b = scalar_bits(left), scalar_bits(right)
+                require(b is not None and (op == "=" or a is not None), error("unknown scalar operand"))
+                exact = (narrow(right, width) if op == "=" else number_operation(left, op, right, width))
+                if exact is None and number_values(left) is not None and number_values(right) is not None and op != "=":
+                    results = [number_operation(("constant", a), op, ("constant", b), width)
+                               for a in number_values(left) for b in number_values(right)]
+                    if all(result is not None for result in results):
+                        values = frozenset(result[1] for result in results)
+                        if len(values) <= 16:
+                            exact = ("finite", values)
+                if exact is not None:
+                    state[reg(dst)] = exact
+                else:
+                    if op == "=": bits = b
+                    elif op == "&=": bits = a & b
+                    elif op in ("|=", "^="): bits = a | b
+                    elif op in ("<<=", ">>=") and right[0] == "constant" and 0 <= right[1] < width:
+                        bits = a << right[1] if op == "<<=" else a >> right[1]
+                    elif op in ("+=", "*="):
+                        maximum = a+b if op == "+=" else a*b
+                        bits = (1 << maximum.bit_length())-1 if maximum <= wordmask else wordmask
+                    else:
+                        bits = wordmask
+                    state[reg(dst)] = ("bits", bits & wordmask)
+        elif re.fullmatch(r"[rw]\d+ = -[rw]\d+", text):
+            dst, src = text.split(" = -")
+            require(scalar_bits(before.get(reg(src))) is not None, error("unknown negated scalar"))
+            state[reg(dst)] = ("bits", (1 << (32 if dst.startswith("w") else 64))-1)
+        else:
+            require(text == "exit" or BRANCH.fullmatch(text) or re.fullmatch(r"goto [+-]0x[0-9a-f]+", text),
+                    error("unknown instruction effect"))
+        if text == "exit":
+            if not self.result:
+                bits = scalar_bits(before.get("r0"))
+                require(bits is not None and bits & ~self.allowed == 0, error("return bits outside protocol"))
+                self.return_bits |= bits
+            self.exits.add(pc)
+        return state
+
+    def finish(self, consumer):
+        require(self.exits, consumer.name + ": closed callee has no checked exit")
+
+
+class _ClosedEffectsCaller(Consumer):
+    """Fixed point for closed effects, without a loop-termination claim.
+
+    Unlike final-sink loops, these local-only bodies need no iteration bound
+    to establish disjoint writes and a return bit mask. Keep every arm unless
+    an exact numeric predicate refutes it; equality to a literal refines only
+    the tested register. No iteration ceiling truncates a reachable path.
+    """
+    merge_facts = staticmethod(_ClosedEffectsProof.join)
+
+    def transfer(self, pc, incoming):
+        return self.effect.transfer(self, pc, incoming, super().transfer(pc, incoming))
+
+    def flow_edges(self, pc, before, after):
+        branch = BRANCH.fullmatch(self.text[pc])
+        for successor in self.graph[pc]:
+            state = after.copy()
+            if branch:
+                left, right = value(before, branch[1]), value(before, branch[3])
+                lhs, rhs = number_values(left), number_values(right)
+                if lhs is not None and rhs is not None:
+                    pairs = {(a, b) for a in lhs for b in rhs
+                             if compare(a, branch[2], b, 32 if branch[1].startswith("w") else 64)
+                             == (successor == D.relative_target(pc, self.text[pc]))}
+                    if not pairs:
+                        continue
+                    # Refine only the tested registers. Equal abstract sets
+                    # do not establish identity of independent scalar values.
+                    for operand, values in ((branch[1], {a for a, _ in pairs}),
+                                            (branch[3], {b for _, b in pairs})):
+                        if operand.startswith("r"):
+                            state[operand] = (("constant", next(iter(values))) if len(values) == 1
+                                              else ("finite", frozenset(values)))
+                elif (left and left[0] == "bits" and rhs is not None and len(rhs) == 1
+                      and branch[2] in ("==", "!=") and branch[1].startswith("r")):
+                    taken = successor == D.relative_target(pc, self.text[pc])
+                    if taken == (branch[2] == "=="):
+                        state[branch[1]] = ("constant", next(iter(rhs)))
+            yield successor, state
+
+
+def closed_entry_callees_contract(internal_blocks, internal_calls):
+    """Closed effects/return bits, not target-read policy or publication proof."""
+    require(all(name in internal_blocks for name in ("p11_alias_scan", "p11_stable_cell", "p11_request_cell")),
+            "closed entry callee inventory")
+    summaries = {}
+    allowed = {"p11_alias_scan": 0x401,
+               "p11_stable_cell": (0x10 << 32) | 0x1ffffff,
+               "p11_request_cell": (0x14 << 40) | (4 << 32) | 0xffffffff}
+    for name, mask in allowed.items():
+        consumer = _ClosedEffectsCaller(".text", name, internal_blocks[name], internal_calls.get(name, {}))
+        proof = _ClosedEffectsProof(summaries, mask)
+        consumer.effect = proof
+        initial = {"r"+str(i): ("bits", (1 << 64)-1) for i in range(1, 6)}
+        consumer.facts(initial | {"r10": ("stack", 0)})
+        proof.finish(consumer)
+        summaries[name] = {"return_bits": proof.return_bits, "output": None}
+    readers = [name for name in internal_blocks if "object_entry_attributes" in name and "call_mut" in name]
+    require(len(readers) == 1, "closed word-reader callee inventory")
+    name = readers[0]
+    for layout in (0, 1):
+        consumer = _ClosedEffectsCaller(".text", name, internal_blocks[name], internal_calls.get(name, {}))
+        proof = _ClosedEffectsProof({}, 0, result=True)
+        consumer.effect = proof
+        consumer.facts({"r1": ("stack", -0x1000), "r2": ("stack", -0x2000),
+            "r3": ("bits", (1 << 64)-1), "r10": ("stack", 0),
+            ("stack", -0x2000, 8): ("stack", -0x3000),
+            ("stack", -0x3000, 1): ("constant", layout)})
+        proof.finish(consumer)
+    summaries[name] = {"return_bits": None, "output": ("r1", 16)}
+    scalar_body_contract(internal_blocks, internal_calls, "default")
+    arguments = [name for name in internal_blocks if name.endswith("arg_u64")]
+    require(len(arguments) == 1, "closed scalar Result callee inventory")
+    summaries[arguments[0]] = {"return_bits": None, "output": ("r1", 16), "argument": True}
+    return summaries
+
+
 class _SeedCaller(Consumer):
     """Caller-only summaries for the reviewed native APIs, never a native model.
 
@@ -1427,8 +1679,14 @@ class _OwnedCaller(_SeedCaller):
                     "p11_owner_start_begin", "p11_owner_start_aggregate", "p11_object_side_get", "p11_object_fault")
                     or any(target.endswith(suffix) for suffix in ("scope_auth", "scope_flags_word", "object_marker_for",
                         "object_record_entry_abi", "object_fill_entry", "object_entry_derive", "object_entry_results",
-                        "object_entry_find", "object_entry_attributes"))):
+                        "object_entry_find", "object_entry_attributes"))
+                    or target in getattr(self, "closed_callees", {})):
                 forget_owned(state)
+            summary = getattr(self, "closed_callees", {}).get(target)
+            if summary and summary["output"]:
+                pointer = incoming.get(summary["output"][0])
+                if pointer and pointer[0] == "stack":
+                    forget_stack(state, pointer[1], summary["output"][1])
         if match := re.fullmatch(r"(r\d+) \+= (-?0x[0-9a-f]+)", text):
             fact = incoming.get(match[1])
             if fact and fact[0] == "owned":
@@ -1508,6 +1766,33 @@ class _OwnedSinkProof(SinkProof):
 
     def transfer(self, consumer, pc, before, state):
         text, target = consumer.text[pc], consumer.calls.get(pc, "")
+        summary = getattr(consumer, "closed_callees", {}).get(target)
+        if summary:
+            if summary["output"]:
+                output = before.get(summary["output"][0])
+                require(output and output[0] == "stack" and -512 <= output[1] <= -16,
+                        self.fail(consumer, pc, "closed callee Result output outside local frame"))
+                if summary.get("argument"):
+                    require(before.get("r2") == ("context", 0) and before.get("r4") == ("constant", self.abi)
+                            and before.get("r3", (None,))[0] in ("field", "constant"),
+                            self.fail(consumer, pc, "closed scalar Result context/layout/index"))
+                else:
+                    closure = before.get("r2")
+                    layout = stack_read(before, closure, 8)
+                    require(closure and closure[0] == "stack" and -512 <= closure[1] <= -8
+                            and layout and layout[0] == "stack" and -512 <= layout[1] < 0
+                            and stack_read(before, layout, 1) == ("constant", self.abi)
+                            and (output[1]+16 <= closure[1] or closure[1]+8 <= output[1])
+                            and (output[1]+16 <= layout[1] or layout[1]+1 <= output[1]),
+                            self.fail(consumer, pc, "closed word Result readonly closure/layout/overlap"))
+            else:
+                private = {"owned", "side", "stack", "context", "event", "descriptor", "external_key", "result"}
+                require(all(not before.get("r"+str(i)) or before["r"+str(i)][0] not in private for i in range(1, 6)),
+                        self.fail(consumer, pc, "closed scalar callee received a private pointer"))
+                # Refusing continuation checkpoint: closed callee effects do
+                # not establish the caller's finite unpack/publication gates.
+                require(target != "p11_request_cell", self.fail(consumer, pc,
+                        "request-cell finite unpack/publication remains unproved"))
         memory = LOAD.fullmatch(text) or STORE.fullmatch(text)
         if memory:
             base, sign, offset = memory.groups()[2:5] if LOAD.fullmatch(text) else memory.groups()[1:4]
@@ -1778,6 +2063,7 @@ def final_sink_contract(consumer, variant, selectors, internal_blocks, internal_
     if name == "p11_return":
         return retained_contract(consumer, variant, selectors, internal_blocks, internal_calls)
     consumer = _OwnedCaller(consumer.section, name, consumer.lines, consumer.calls)
+    consumer.closed_callees = closed_entry_callees_contract(internal_blocks, internal_calls)
     mode = {"p11_entry_template": 1, "p11_entry_template_pair": 3,
             "p11_entry_template_types": 2, "p11_entry_template_second": "second"}.get(name, 0)
     expected_roles = (14, 15) if mode == "second" else (6, 7, 10, 11, 9, 8) + ((16, "join", "get") if mode == 0 else (12, 13))

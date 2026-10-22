@@ -128,8 +128,13 @@ def consumer_contract(variant, suffix, disassembly=None):
 
 
 def entry_role_contract(variant, name, role, disassembly=None):
-    original, _, _, _ = consumer_case(variant, name, disassembly)
+    original, _, blocks, _ = consumer_case(variant, name, disassembly)
     consumer = CHECKER["_OwnedCaller"](original.section, name, original.lines, original.calls)
+    split = CHECKER["sections"](OBJECTS[variant] if disassembly is None else disassembly)
+    internal_calls = {}
+    for caller, _, pc, target in CHECKER["D"].internal_call_targets(split[".text"]):
+        internal_calls.setdefault(caller, {})[pc] = target
+    consumer.closed_callees = CHECKER["closed_entry_callees_contract"](blocks, internal_calls)
     calls = sorted(pc for pc, target in consumer.calls.items() if target.endswith("capture_scalar"))
     if len(calls) != 9:
         raise AssertionError((name, calls))
@@ -182,6 +187,58 @@ def mutate(disassembly, function, pc, old, new, internal_call=False, helper_call
 
 
 class EntryObjectTests(unittest.TestCase):
+    def _assert_closed_entry_callees(self):
+        for variant in OBJECTS:
+            reports = internal_contract(variant, "closed_entry_callees_contract")
+            masks = {"p11_alias_scan": 0x401,
+                     "p11_stable_cell": (0x10 << 32) | 0x1ffffff,
+                     "p11_request_cell": (0x14 << 40) | (4 << 32) | 0xffffffff}
+            for name, allowed in masks.items():
+                with self.subTest(variant=variant, callee=name, control="actual local effects and return bits"):
+                    self.assertEqual(reports[name]["return_bits"] & ~allowed, 0)
+                    self.assertIsNone(reports[name]["output"])
+                _, body = instructions(variant, name)
+                pc, old = next((pc, text) for pc, text in reversed(body) if text.startswith("r0 ="))
+                mutants = [(pc, old, "r0 = 0x1000000000000 ll", False),
+                           (body[0][0], body[0][1], "*(u64 *)(r1 + 0x0) = r5", False),
+                           (body[0][0], body[0][1], "r0 = *(u64 *)(r1 + 0x0)", False),
+                           (pc, old, "call 0x123456", True)]
+                for at, was, new, pseudo in mutants:
+                    with self.subTest(variant=variant, callee=name, control=new):
+                        with self.assertRaisesRegex(RuntimeError, "closed.*(return|memory|callee)"):
+                            internal_contract(variant, "closed_entry_callees_contract",
+                                mutate(OBJECTS[variant], name, at, was, new, internal_call=pseudo))
+                helper = next(pc for pc, text in body if text == "call 0x70")
+                with self.subTest(variant=variant, callee=name, control="unresolved user-read pseudo call"):
+                    with self.assertRaisesRegex(RuntimeError, "closed.*callee"):
+                        internal_contract(variant, "closed_entry_callees_contract",
+                            mutate(OBJECTS[variant], name, helper, "call 0x70", "call 0x70", internal_call=True))
+                zero_pc, zero_old = body[-2]
+                self.assertEqual(body[-1][1], "exit")
+                zero = mutate(OBJECTS[variant], name, zero_pc, zero_old, "r0 = 0x0")
+                with self.subTest(variant=variant, callee=name, control="smaller scalar result keeps its local footprint"):
+                    smaller = internal_contract(variant, "closed_entry_callees_contract", zero)[name]["return_bits"]
+                    self.assertEqual(smaller & ~reports[name]["return_bits"], 0)
+                    self.assertNotEqual(smaller, reports[name]["return_bits"])
+            readers = [name for name in reports if "call_mut" in name]
+            original, _, _, _ = consumer_case(variant, "p11_entry")
+            caller = CHECKER["_OwnedCaller"](original.section, original.name, original.lines, original.calls)
+            caller.closed_callees = reports
+            caller.proof = CHECKER["_OwnedSinkProof"](6, 0, True, ("owned", 77, 0))
+            request = next(pc for pc, target in caller.calls.items() if target == "p11_request_cell")
+            with self.subTest(variant=variant, control="closed effects cannot qualify unfinished caller publication"):
+                with self.assertRaisesRegex(RuntimeError, "finite unpack/publication remains unproved"):
+                    caller.step(request, {"r"+str(i): ("constant", 0) for i in range(1, 6)})
+            self.assertEqual(len(readers), 1)
+            reader = readers[0]
+            self.assertEqual(reports[reader]["output"], ("r1", 16))
+            _, body = instructions(variant, reader)
+            pc, old = next((pc, text) for pc, text in body if CHECKER["STORE"].fullmatch(text))
+            with self.subTest(variant=variant, callee="word Result", control="output cannot overwrite readonly closure"):
+                with self.assertRaisesRegex(RuntimeError, "closed.*memory"):
+                    internal_contract(variant, "closed_entry_callees_contract",
+                        mutate(OBJECTS[variant], reader, pc, old, "*(u64 *)(r2 + 0x0) = r1"))
+
     def test_bounded_entry_cycles_require_proved_progress(self):
         for variant in OBJECTS:
             name, insns = instructions(variant, "p11_entry")
@@ -289,6 +346,17 @@ class EntryObjectTests(unittest.TestCase):
                                   values=tuple(values), comparison=comparison):
                     with self.assertRaisesRegex(RuntimeError, "side.*footprint|unknown entry write footprint|branch width 32"):
                         indexed_write(values, comparison)
+            consumer.text[guard] = "if r1 == 0x0 goto +0x1"
+            independent = edges[guard+2] | {"r1": ("finite", frozenset({0, 512})),
+                                          "r2": ("finite", frozenset({0, 512}))}
+            refined = dict(proof.edges(consumer, guard, independent, independent))[guard+2]
+            with self.subTest(variant=variant, control="equal finite sets do not prove scalar identity"):
+                self.assertEqual(refined["r2"], independent["r2"])
+                consumer.text[alias] = "r8 += r2"
+                indexed = consumer.step(alias, refined)
+                consumer.text[store] = "*(u64 *)(r8 + 0x60) = r7"
+                with self.assertRaisesRegex(RuntimeError, "side.*footprint"):
+                    consumer.step(store, indexed)
             for offsets, allowed in (((0, 32), True), ((0, 512), False), (range(0, 320, 32), False)):
                 joined = None
                 for offset in offsets:
@@ -1015,6 +1083,7 @@ class EntryObjectTests(unittest.TestCase):
                                 mutate(OBJECTS[variant], name, pc, old, "r0 = r0"))
 
     def test_callee_scalar_reads_and_option_success(self):
+        self._assert_closed_entry_callees()
         for variant in OBJECTS:
             internal_contract(variant, "scalar_body_contract")
             cases = [

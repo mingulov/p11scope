@@ -319,6 +319,72 @@ class DiscoveryFlow(unittest.TestCase):
                     self.reject_and_restore(elf, disassembly, function, old, new, 'interface-name', 'tail')
                     print(f'verified {variant} interface-name:tail {label}')
 
+    def test_worker_index_slot_uses_current_stack_facts(self):
+        # The real lowering calls memset with a disjoint -0x28 destination.
+        # A direct rN store is understood by call_argument_facts; a partial
+        # wN store to a saved pointer is not and must not leave stale facts.
+        before = (
+            '*(u64 *)(r10 - 0x88) = r5',
+            '*(u64 *)(r10 - 0x68) = r4',
+            'r1 = r10',
+            'r1 += -0x28',
+            '*(u64 *)(r10 - 0x78) = r1',
+            'r2 = 0x0',
+            'r3 = 0x1a',
+        )
+        clobber = (
+            'r3 = 0x1a',
+            'r1 = r10',
+            'r1 += -0x28',
+            '*(u64 *)(r10 - 0x78) = r1',
+            'r1 += -0x38',
+            '*(u32 *)(r10 - 0x78) = w1',
+            'r1 = *(u64 *)(r10 - 0x78)',
+        )
+        for variant, elf, disassembly in self.objects:
+            with self.subTest(variant=variant, control='disjoint-memset'):
+                self.assertTrue(C.check_decoded(elf, disassembly, 'interface-name'))
+            text = C.sections(disassembly)
+            _, lines = C.function(text['uretprobe'] + text['.text'], 'interface_list_worker', 'fixture')
+            site = instruction_site(lines, before)
+            insns = C.D.instructions(lines)
+            start = insns.index(site)
+            direct_site = insns[start + 5]
+            old, new = instruction_change(lines, direct_site, '*(u32 *)(r10 - 0x78) = r1')
+            direct = change_function(disassembly, 'interface_list_worker', old, new)
+            with self.subTest(variant=variant, control='supported-direct-store'):
+                self.assertTrue(C.check_decoded(elf, direct, 'interface-name'))
+            bad = disassembly
+            for old_site, replacement in zip(insns[start:start + len(clobber)], clobber):
+                old, new = instruction_change(lines, old_site, replacement)
+                bad = change_function(bad, 'interface_list_worker', old, new)
+            with self.subTest(variant=variant, mutation='partial-pointer-clobber'):
+                self.reject(elf, bad, 'interface-name', 'tail')
+
+    def test_legacy_bound_follows_loaded_field(self):
+        good = C.D._owned_disassembly()
+        self.assertTrue(C.D.interface_tail_contract(good))
+        lines = C.D.function_blocks(good)['interface_list_worker']
+        insns = C.D.instructions(lines)
+        first_pc = insns[0][0]
+        exit_pc = insns[-1][0]
+        first_line, = [line for line in lines if C.D.line_pc(line) == first_pc]
+        pre_get = ''.join(
+            f'{pc:8}:\t{guard} goto +0x{exit_pc - pc - 1:x}\n'
+            for pc, guard in ((first_pc - 2, 'if r8 == 0x0'),
+                              (first_pc - 1, 'if r8 > 0xffffff'))
+        )
+        self.assertEqual(good.count(first_line), 1)
+        with_pre_get = good.replace(first_line, pre_get + first_line, 1)
+        bound = instruction_site(lines, ('r8 = *(u64 *)(r0 + 0x8)',
+                                         'if r8 == 0x0 goto +0x1e',
+                                         'if r1 > r2 goto +0x1d',
+                                         'if r8 > 0xffffff goto +0x1c'), 3)
+        old, new = instruction_change(lines, bound, 'if r8 > 0x1000000 goto +0x1c')
+        bad = change_function(with_pre_get, 'interface_list_worker', old, new)
+        self.assertFalse(C.D.interface_tail_contract(bad))
+        self.assertTrue(C.D.interface_tail_contract(with_pre_get))
+
     def test_current_tail_cannot_select_legacy_with_unrelated_markers(self):
         for variant, elf, disassembly in self.objects:
             marked = change_function(disassembly, 'interface_list_return',

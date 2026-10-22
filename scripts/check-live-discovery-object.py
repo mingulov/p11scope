@@ -1018,16 +1018,24 @@ def _interface_index_slot_preserved(lines, graph, start, end, calls, blocks):
             continue
         state = facts.get(pc, {})
         store = re.fullmatch(
-            r"\*\(u(8|16|32|64) \*\)\(r(\d+) ([+-]) 0x([0-9a-f]+)\) = (?:[rw]\d+|-?0x[0-9a-f]+)",
+            r"\*\(u(8|16|32|64) \*\)\(r(\d+) ([+-]) 0x([0-9a-f]+)\) = ([rw]\d+|-?0x[0-9a-f]+)",
             text,
         )
         if store:
-            width, base, sign, offset = store.groups()
+            width, base, sign, offset, source = store.groups()
             pointer = state.get("r" + base)
             if not pointer or pointer[0] != "stack":
                 return False
             address = pointer[1] + int(offset, 16) * (1 if sign == "+" else -1)
             count = int(width) // 8
+            # call_argument_facts invalidates saved values only for rN stores.
+            # An unmodeled wN/immediate writer may leave a stale stack pointer
+            # that a later reload passes to the byte loop as its destination.
+            if (not source.startswith("r") and any(
+                isinstance(key, int) and key < address + count and address < key + 8
+                for key in state
+            )):
+                return False
         elif text.startswith("call "):
             # Prove the callee's actual byte loop, not just its symbol name.
             callee = instructions(blocks.get(targets.get(pc), []))
@@ -1177,9 +1185,12 @@ def _legacy_owned_tail_value(lines, get_pcs, target, upper_bound=False):
                     getter.append(get_pc)
         if len(getter) != 1:
             continue
+        path = _tail_path_nodes(graph, pc, target) - {pc, target}
         bounds = []
         if upper_bound:
             for bound_pc, bound in insns:
+                if bound_pc <= pc or bound_pc not in path:
+                    continue
                 immediate = re.fullmatch(rf"if r{register} > 0xffffff goto [+-]0x[0-9a-f]+", bound)
                 other = re.fullmatch(rf"if r{register} > (r\d+) goto [+-]0x[0-9a-f]+", bound)
                 if (immediate or (other and facts.get(bound_pc, {}).get(other[1]) == ("constant", 0xffffff))):
@@ -1187,7 +1198,6 @@ def _legacy_owned_tail_value(lines, get_pcs, target, upper_bound=False):
             if len(bounds) != 1:
                 continue
         guards = [(null_pc, null), *bounds]
-        path = _tail_path_nodes(graph, pc, target) - {pc, target}
         if (target in reachable(graph, [start], {getter[0]})
                 or target in reachable(graph, [start], {pc})
                 or any(target in reachable(graph, [start], {guard_pc})

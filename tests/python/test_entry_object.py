@@ -1534,22 +1534,29 @@ class EntryObjectTests(unittest.TestCase):
                     CHECKER["contract"](changed, "unsafe")
 
     def test_post_capture_overlap_and_atomic_corruption(self):
-        entry_role_contract("default", "p11_entry", 6)
-        name, insns = instructions("default", "p11_entry")
-        pc, old = next((pc, text) for pc, text in insns
-                       if re.fullmatch(r"\*\(u64 \*\)\(r8 \+ 0x28\) = r1", text))
-        # An atomic write elsewhere in the owned row cannot erase local
-        # descriptor/Option facts or the disjoint session field.
-        disjoint = mutate(OBJECTS["default"], name, pc, old, "lock *(u64 *)(r8 + 0x100) += r1")
-        self.assertTrue(entry_role_contract("default", name, 6, disjoint).witnesses)
-        for new in ("*(u32 *)(r8 + 0x9) = w1", "r1 = atomic_fetch_or((u64 *)(r8 + 0x8), r1)"):
-            with self.subTest(new=new):
-                changed = mutate(OBJECTS["default"], name, pc, old, new)
-                with self.assertRaisesRegex(RuntimeError, "final-sink 6: successful capture lost"):
-                    entry_role_contract("default", name, 6, changed)
-                restored = mutate(changed, name, pc, new, old)
-                self.assertEqual(restored, OBJECTS["default"])
-                self.assertTrue(entry_role_contract("default", name, 6, restored).witnesses)
+        for variant in OBJECTS:
+            with self.subTest(variant=variant, control="intact owned row"):
+                self.assertTrue(entry_role_contract(variant, "p11_entry", 6).witnesses)
+            name, insns = instructions(variant, "p11_entry")
+            stores = [(pc, text, match.groups()) for pc, text in insns
+                      if (match := re.fullmatch(r"\*\(u64 \*\)\((r\d+) \+ 0x28\) = (r\d+)", text))]
+            self.assertEqual(len(stores), 1, f"{variant}: unique owned-row +0x28 store")
+            pc, old, (base, source) = stores[0]
+            # An atomic write elsewhere in the owned row cannot erase local
+            # descriptor/Option facts or the disjoint session field.
+            disjoint = mutate(OBJECTS[variant], name, pc, old,
+                              f"lock *(u64 *)({base} + 0x100) += {source}")
+            with self.subTest(variant=variant, control="disjoint atomic write"):
+                self.assertTrue(entry_role_contract(variant, name, 6, disjoint).witnesses)
+            for new in (f"*(u32 *)({base} + 0x9) = w{source[1:]}",
+                        f"{source} = atomic_fetch_or((u64 *)({base} + 0x8), {source})"):
+                with self.subTest(variant=variant, new=new):
+                    changed = mutate(OBJECTS[variant], name, pc, old, new)
+                    with self.assertRaisesRegex(RuntimeError, "final-sink 6: successful capture lost"):
+                        entry_role_contract(variant, name, 6, changed)
+                    restored = mutate(changed, name, pc, new, old)
+                    self.assertEqual(restored, OBJECTS[variant])
+                    self.assertTrue(entry_role_contract(variant, name, 6, restored).witnesses)
 
     def test_unknown_postwrite_and_callee_start_clobber(self):
         for variant in OBJECTS:

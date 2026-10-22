@@ -5,6 +5,7 @@
 use super::joint_driver::{
     IngestedRaw, JointCaptureOwner, RawProvenance, RawQuantumIdentity, RawQuantumRefusal,
 };
+use super::seal_replay::{ReplayBounds, ReplayPreparation};
 use super::{
     BirthEvidenceSource, BootstrapReceipt, H3DispositionEvidence, H3FinalizerPort,
     H3VoidAcknowledgement, JournalGap, SealSuccess, SealedCall, SessionBirthEvidence,
@@ -269,6 +270,9 @@ fn outcome_storage(outcome: &Result<SealSuccess, SealFailure>) -> Option<usize> 
             .checked_add(allocation_bytes::<SealedCall>(
                 seal.prefix.settled.capacity(),
             )?)?
+            .checked_add(allocation_bytes::<super::SealReplayStep>(
+                seal.prefix.replay_steps.capacity(),
+            )?)?
             .checked_add(allocation_bytes::<CallKey>(seal.prefix.open.capacity())?),
         Err(failure) => failure_storage(failure),
     }
@@ -407,6 +411,22 @@ impl IngestedJointQuantum {
     #[cfg(test)]
     pub(crate) fn active_seal_for_test(&self) -> Option<&SealSuccess> {
         self.active.as_ref()?.outcome.as_ref().ok()
+    }
+
+    /// Read-only budget discriminator for the genuine frame's refusal test.
+    #[cfg(test)]
+    pub(crate) fn replay_reservation_for_test(
+        &self,
+        ports: &JointPublicationPorts<'_>,
+    ) -> Option<(usize, usize, usize)> {
+        self.preflight(ports).ok()?;
+        let (_, owner, _, _) = ports.read();
+        let bounds = ReplayBounds::sample(owner.adapter(), owner.model())?;
+        Some((
+            result_storage_bound(owner.adapter(), owner.model())?,
+            bounds.retained_bytes()?,
+            bounds.temporary_bytes()?,
+        ))
     }
 
     #[cfg(test)]
@@ -752,14 +772,26 @@ impl IngestedJointQuantum {
         let binding = bindings
             .get(target.caller())
             .ok_or(RawQuantumRefusal::Admission)?;
-        let bytes = result_storage_bound(owner.adapter(), owner.model())
+        let bounds = ReplayBounds::sample(owner.adapter(), owner.model())
             .ok_or(RawQuantumRefusal::Capacity)?;
-        let storage = owner
+        let bytes = result_storage_bound(owner.adapter(), owner.model())
+            .and_then(|base| base.checked_add(bounds.retained_bytes()?))
+            .ok_or(RawQuantumRefusal::Capacity)?;
+        let temporary = bounds
+            .temporary_bytes()
+            .ok_or(RawQuantumRefusal::Capacity)?;
+        let reserver = owner
             .ledger()
             .resource_reserver()
-            .ok_or(RawQuantumRefusal::ForeignLedger)?
+            .ok_or(RawQuantumRefusal::ForeignLedger)?;
+        let storage = reserver
             .reserve(bytes)
             .map_err(RawQuantumRefusal::Resource)?;
+        let locator_storage = reserver
+            .reserve(temporary)
+            .map_err(RawQuantumRefusal::Resource)?;
+        let replay = ReplayPreparation::allocate(bounds, locator_storage)
+            .ok_or(RawQuantumRefusal::Capacity)?;
         let (adapter, model) = owner.parts();
         let input = AuditedDomainInput {
             audit: &self.audit,
@@ -771,7 +803,7 @@ impl IngestedJointQuantum {
             target: &target,
             binding,
         };
-        let outcome = adapter.seal_in_audit(model, input, &mut selected, fault);
+        let outcome = adapter.seal_in_audit(model, input, &mut selected, fault, replay);
         assert!(
             outcome_storage(&outcome).is_some_and(|actual| actual <= bytes),
             "retained seal result exceeds its checked preflight bound"

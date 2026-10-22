@@ -1169,6 +1169,15 @@ impl ObjectSemantics {
         self.state.settle(prefix, ledger)
     }
 
+    pub(in crate::semantics_objects) fn settle_recorded(
+        &mut self,
+        prefix: CompleteInputPrefix,
+        ledger: &mut journal::StagingLedger,
+        record: &mut impl FnMut(state::SettlementTransition, std::ops::Range<usize>),
+    ) -> ObjectEffects {
+        self.state.settle_recorded(prefix, ledger, record)
+    }
+
     /// Apply an explicit reference boundary to the affected scope.
     pub(crate) fn invalidate(
         &mut self,
@@ -1217,5 +1226,10 @@ impl ObjectSemantics {
     /// O(1) cardinalities for prepaying one retained audit-loss result.
     pub(crate) fn audit_loss_record_counts(&self) -> (usize, usize) {
         self.state.audit_loss_record_counts()
+    }
+
+    /// O(1) global upper bound, sampled before journal conversion mutates it.
+    pub(in crate::semantics_objects) fn replay_pending_count(&self) -> usize {
+        self.state.replay_pending_count()
     }
 }

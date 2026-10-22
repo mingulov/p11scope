@@ -4184,6 +4184,10 @@ fn joint_replay_steps_keep_prior_terminal_after_conversion_loss() {
         "capture the retained original before prune"
     );
     assert_original_replay_partition(second);
+    for foreign in q1.active_seal_for_test().unwrap().prefix.replay_steps() {
+        assert!(second.prefix.call_for_step(foreign).is_none());
+        assert!(second.effects_for_step(foreign).is_none());
+    }
     let conversion = second
         .prefix
         .replay_steps()
@@ -4299,6 +4303,13 @@ fn joint_replay_step_capacity_refusal_preserves_original() {
         frame.replay_reservation_for_test(&ports).unwrap()
     };
     assert!(retained > 0 && temporary > 0);
+    let available = legacy
+        .checked_add(retained)
+        .unwrap()
+        .checked_add(temporary)
+        .unwrap()
+        .checked_sub(1)
+        .unwrap();
     let coordinator = &fixture.scene.real.scene.coordinator;
     let claims = coordinator
         .joint_capture()
@@ -4315,7 +4326,7 @@ fn joint_replay_step_capacity_refusal_preserves_original() {
     let snapshot = coordinator.registry().semantic_resource_snapshot();
     let hold = coordinator
         .registry()
-        .reserve_semantic_storage(snapshot.limit_bytes - snapshot.charged_bytes - legacy)
+        .reserve_semantic_storage(snapshot.limit_bytes - snapshot.charged_bytes - available)
         .unwrap();
     let h0 = fixture.scene.real.h0.clone();
     let mut births = NativeFrameBirths {
@@ -4370,7 +4381,7 @@ fn joint_replay_step_capacity_refusal_preserves_original() {
             .registry()
             .semantic_resource_snapshot()
             .charged_bytes,
-        snapshot.limit_bytes - legacy,
+        snapshot.limit_bytes - available,
         "the whole failed preflight is refunded"
     );
     drop(hold);

@@ -25,6 +25,9 @@ pub(crate) mod joint_audit;
 #[path = "joint_driver.rs"]
 pub(crate) mod joint_driver;
 mod reservations;
+mod seal_replay;
+use seal_replay::ReplayPreparation;
+pub(crate) use seal_replay::{SealReplayPhase, SealReplayStep};
 
 // ---------------------------------------------------------------------------
 // Frozen effect-neutral S1 vocabulary
@@ -2974,13 +2977,18 @@ impl SealedCall {
 /// and bootstrap cuts, the settled calls and the still-open keys. Built
 /// only by a passing seal; the only path to a production
 /// [`CompleteInputPrefix`].
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct SealedObjectPrefix {
     domain: ObjectDomain,
     frontier: u64,
     birth_cut: u64,
     bootstrap: Option<u64>,
     settled: Vec<SealedCall>,
+    // Existing single-call H9 consumes only the current begin-ordered delta.
+    // Replay steps may additionally name retained prior conversions appended
+    // to this SAME table; they do not widen legacy replay permission.
+    settled_len: usize,
+    replay_steps: Vec<SealReplayStep>,
     open: Vec<CallKey>,
 }
 
@@ -3015,7 +3023,7 @@ impl SealedObjectPrefix {
 
     /// The calls settled by this seal, in begin-cut order.
     pub(crate) fn settled(&self) -> &[SealedCall] {
-        &self.settled
+        &self.settled[..self.settled_len]
     }
 
     /// The still-open keys at the frontier, for H9's pending alignment.
@@ -3892,6 +3900,7 @@ impl JournalAdapter {
             bootstrap,
             ConsumptionOrdinal(frontier),
             births,
+            None,
         )
     }
 
@@ -3904,6 +3913,7 @@ impl JournalAdapter {
         input: joint_audit::AuditedDomainInput<'_>,
         births: &mut impl BirthEvidenceSource,
         fault: &impl FaultEpoch,
+        replay: ReplayPreparation,
     ) -> Result<SealSuccess, SealFailure> {
         let (audit, bootstrap, frontier) = input.into_parts();
         let requested = self.retained_failure_domain(bootstrap);
@@ -3923,7 +3933,7 @@ impl JournalAdapter {
             if let Some(gap) = gap {
                 return Err(self.reject_audit(model, audit, gap, reading));
             }
-            self.seal_domain_inner(model, audit, bootstrap, frontier, births)
+            self.seal_domain_inner(model, audit, bootstrap, frontier, births, Some(replay))
         })();
         outcome.map_err(|mut failure| {
             if matches!(failure.scope, SealFailureScope::Unqualified)
@@ -3943,6 +3953,7 @@ impl JournalAdapter {
         bootstrap: &BootstrapReceipt,
         frontier: ConsumptionOrdinal,
         births: &mut impl BirthEvidenceSource,
+        replay: Option<ReplayPreparation>,
     ) -> Result<SealSuccess, SealFailure> {
         let frontier = frontier.0;
         let key = bootstrap.proof().key;
@@ -4138,7 +4149,7 @@ impl JournalAdapter {
             Some(pinned) if pinned < floors => None,
             _ => Some(floors),
         };
-        self.seal_validated(model, key, bootstrap, frontier, fence, audit)
+        self.seal_validated(model, key, bootstrap, frontier, fence, audit, replay)
     }
 
     /// Preserve staged unbounded abandonments across a void: each
@@ -4528,6 +4539,7 @@ impl JournalAdapter {
 
     /// Conversion and settlement after every structural rule passed. The
     /// only remaining failures are model surprises, which fail closed.
+    #[allow(clippy::too_many_arguments)] // One validated domain keeps its original audit and prepaid replay storage.
     fn seal_validated(
         &mut self,
         model: &mut ObjectSemantics,
@@ -4536,6 +4548,7 @@ impl JournalAdapter {
         frontier: u64,
         model_fence: Option<u64>,
         audit: &JournalAuditReceipt,
+        replay: Option<ReplayPreparation>,
     ) -> Result<SealSuccess, SealFailure> {
         let image = (key.cookie, key.exec);
         let live = self.live_keys_for_image(image);
@@ -4611,7 +4624,7 @@ impl JournalAdapter {
             return Err(self.failure(JournalGap::BoundNotReady));
         }
         self.validate_invocation_claims(key, &live, frontier, audit)?;
-        self.convert_and_settle(model, key, bootstrap, frontier, model_fence)
+        self.convert_and_settle(model, key, bootstrap, frontier, model_fence, replay)
     }
 
     fn validate_invocation_claims(
@@ -4702,6 +4715,7 @@ impl JournalAdapter {
         bootstrap: &BootstrapReceipt,
         frontier: u64,
         model_fence: Option<u64>,
+        mut replay: Option<ReplayPreparation>,
     ) -> Result<SealSuccess, SealFailure> {
         let image = (key.cookie, key.exec);
         let live = self.live_keys_for_image(image);
@@ -4735,12 +4749,16 @@ impl JournalAdapter {
             .collect();
         refused_cuts.sort_unstable();
         for cut in &refused_cuts {
+            let start = effects.effects.len();
             let refused_effects = model.note_refused_begin(
                 domain,
                 RefCut::sealed(ConsumptionOrdinal(*cut)),
                 &mut self.ledger,
             );
             effects.effects.extend(refused_effects.effects);
+            if let Some(replay) = &mut replay {
+                replay.conversion(*cut, start..effects.effects.len());
+            }
         }
         if !refused_cuts.is_empty() {
             let upper = self
@@ -4753,6 +4771,7 @@ impl JournalAdapter {
                 .max();
             match upper {
                 Some(upper) => {
+                    let start = effects.effects.len();
                     let lost = model.outcome_lost(
                         super::LostOutcome::Refused(
                             domain,
@@ -4761,6 +4780,9 @@ impl JournalAdapter {
                         &mut self.ledger,
                     );
                     effects.effects.extend(lost.effects);
+                    if let Some(replay) = &mut replay {
+                        replay.conversion(upper, start..effects.effects.len());
+                    }
                     // The model fences this upper too; the adapter keeps
                     // the running maximum so the bootstrap rule stays
                     // sufficient on its own evidence.
@@ -4803,7 +4825,9 @@ impl JournalAdapter {
             .map(|(key, entry)| (*key, entry.begin_ordinal))
             .collect();
         begins.sort_by_key(|(_, ordinal)| *ordinal);
-        let mut settled = Vec::new();
+        let mut settled = replay
+            .as_mut()
+            .map_or_else(Vec::new, ReplayPreparation::take_calls);
         for (native, _) in begins {
             let entry = *self.open.get(&native).expect("staged begin");
             // The exact physical invocation has one qualified H0
@@ -4836,9 +4860,13 @@ impl JournalAdapter {
                     scope: SealFailureScope::Unqualified,
                 });
             };
+            let start = effects.effects.len();
             let (admitted, begin_effects) =
                 model.begin_with_resource(origin, &mut self.ledger, &resource);
             effects.effects.extend(begin_effects.effects);
+            if let Some(replay) = &mut replay {
+                replay.conversion(entry.begin_ordinal, start..effects.effects.len());
+            }
             match admitted {
                 Ok(token) => {
                     let popped = self.consume_claim(&fingerprint, key);
@@ -4900,8 +4928,12 @@ impl JournalAdapter {
                 && !entry.end_converted
             {
                 let completed = completed_of(staged.ordinal, entry.function, &staged.end);
+                let start = effects.effects.len();
                 let applied = model.complete(token, completed, &mut self.ledger);
                 effects.effects.extend(applied.effects);
+                if let Some(replay) = &mut replay {
+                    replay.conversion(staged.ordinal, start..effects.effects.len());
+                }
                 self.open
                     .get_mut(&native)
                     .expect("staged terminal")
@@ -4937,11 +4969,15 @@ impl JournalAdapter {
                         scope: SealFailureScope::Unqualified,
                     });
                 };
+                let start = effects.effects.len();
                 let lost = model.outcome_lost(
                     super::LostOutcome::Ticket(token, RefCut::sealed(ConsumptionOrdinal(at))),
                     &mut self.ledger,
                 );
                 effects.effects.extend(lost.effects);
+                if let Some(replay) = &mut replay {
+                    replay.conversion(at, start..effects.effects.len());
+                }
                 let retained = self.keys.get_mut(&key).expect("sealed key");
                 retained.bounded_upper =
                     Some(retained.bounded_upper.map_or(at, |kept| kept.max(at)));
@@ -4982,16 +5018,57 @@ impl JournalAdapter {
             .collect();
         // Terminal deltas append after this seal's conversions; restore
         // the begin-cut order the prefix promises H9.
-        settled.sort_by_key(|summary| summary.begin_cut);
-        let prefix = SealedObjectPrefix {
+        settled.sort_unstable_by_key(|summary| summary.begin_cut);
+        let settled_len = settled.len();
+        if let Some(replay) = &mut replay {
+            let retained = self
+                .open
+                .values()
+                .filter(|entry| entry.converted_for == Some(key))
+                .map(|entry| {
+                    let (session, mechanism) = sealed_fingerprint(&entry.begin);
+                    SealedCall {
+                        ticket: entry.converted_ticket.expect("converted original"),
+                        key: entry.call_key.expect("converted original key"),
+                        function: entry.function,
+                        begin_cut: entry.begin_ordinal,
+                        end_cut: entry
+                            .end
+                            .filter(|staged| staged.ordinal <= frontier)
+                            .map(|staged| staged.ordinal),
+                        abandoned: entry
+                            .abandon
+                            .is_some_and(|staged| staged.ordinal <= frontier),
+                        session,
+                        mechanism,
+                    }
+                });
+            if !replay.freeze_calls(&mut settled, retained) {
+                return Err(SealFailure {
+                    effects,
+                    ..self.failure(JournalGap::ModelRefused)
+                });
+            }
+        }
+        let mut prefix = SealedObjectPrefix {
             domain,
             frontier,
             birth_cut: bootstrap.birth_cut(),
             bootstrap: model_fence,
-            settled: settled.clone(),
+            settled,
+            settled_len,
+            replay_steps: Vec::new(),
             open,
         };
-        let applied = model.settle(CompleteInputPrefix::sealed(&prefix), &mut self.ledger);
+        let offset = effects.effects.len();
+        let applied = match &mut replay {
+            Some(replay) => model.settle_recorded(
+                CompleteInputPrefix::sealed(&prefix),
+                &mut self.ledger,
+                &mut |transition, span| replay.settlement(transition, span, offset),
+            ),
+            None => model.settle(CompleteInputPrefix::sealed(&prefix), &mut self.ledger),
+        };
         let ended = applied.effects.iter().any(|effect| {
             matches!(
                 effect,
@@ -5031,6 +5108,16 @@ impl JournalAdapter {
                 scope: SealFailureScope::Unqualified,
             });
         }
+        if let Some(replay) = replay {
+            let Some(steps) = replay.finish(effects.effects.len()) else {
+                return Err(SealFailure {
+                    effects,
+                    ..self.failure(JournalGap::ModelRefused)
+                });
+            };
+            prefix.replay_steps = steps;
+        }
+        debug_assert!(prefix.settled_len <= prefix.settled.len());
         self.keys.get_mut(&key).expect("sealed key").sealed_through = frontier;
         self.keys
             .get_mut(&key)

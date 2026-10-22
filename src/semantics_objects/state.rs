@@ -585,6 +585,24 @@ fn max_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
     }
 }
 
+/// Borrowed positions from the actual settlement loop, before its calls are
+/// pruned. The journal records indexes/ranges, never a second set of facts.
+#[derive(Clone, Copy)]
+pub(super) enum SettlementTransition {
+    Prelude,
+    Begin {
+        key: CallKey,
+        token: CallToken,
+        cut: u64,
+    },
+    End {
+        key: CallKey,
+        token: CallToken,
+        cut: u64,
+    },
+    Tail,
+}
+
 impl ModelState {
     pub(super) fn new(limits: ObjectLimits) -> Self {
         Self {
@@ -974,6 +992,15 @@ impl ModelState {
         prefix: CompleteInputPrefix,
         ledger: &mut super::journal::StagingLedger,
     ) -> ObjectEffects {
+        self.settle_recorded(prefix, ledger, &mut |_, _| {})
+    }
+
+    pub(super) fn settle_recorded(
+        &mut self,
+        prefix: CompleteInputPrefix,
+        ledger: &mut super::journal::StagingLedger,
+        record: &mut impl FnMut(SettlementTransition, std::ops::Range<usize>),
+    ) -> ObjectEffects {
         let mut effects = ObjectEffects::default();
         let domain = prefix.domain;
         if let Err(reason) = self.held(domain) {
@@ -1029,6 +1056,7 @@ impl ModelState {
             Some(begin) => Some(frontier.min(begin - 1)),
             None => Some(frontier),
         };
+        record(SettlementTransition::Prelude, 0..effects.effects.len());
         let applied = self.domains[&domain].applied;
         if let Some(watermark) = watermark {
             let mut events: Vec<(u64, bool, CallToken)> = Vec::new();
@@ -1055,6 +1083,8 @@ impl ModelState {
                 if self.pending.get(&token).is_none_or(|c| c.fenced) {
                     continue;
                 }
+                let key = self.pending[&token].key;
+                let replay_start = effects.effects.len();
                 #[cfg(test)]
                 let effect_start = effects.effects.len();
                 if is_end {
@@ -1070,6 +1100,22 @@ impl ModelState {
                     token,
                     effect_start..effects.effects.len(),
                 );
+                record(
+                    if is_end {
+                        SettlementTransition::End {
+                            key,
+                            token,
+                            cut: _cut,
+                        }
+                    } else {
+                        SettlementTransition::Begin {
+                            key,
+                            token,
+                            cut: _cut,
+                        }
+                    },
+                    replay_start..effects.effects.len(),
+                );
                 if self.domains[&domain].ended.is_some() {
                     break;
                 }
@@ -1077,7 +1123,12 @@ impl ModelState {
             let state = self.domains.get_mut(&domain).expect("registered domain");
             state.applied = max_opt(state.applied, Some(watermark));
         }
+        let tail_start = effects.effects.len();
         self.prune(domain, ledger);
+        record(
+            SettlementTransition::Tail,
+            tail_start..effects.effects.len(),
+        );
         #[cfg(test)]
         observe_settlement_effects(domain, &effects);
         effects
@@ -3479,6 +3530,10 @@ impl ModelState {
 
     pub(super) fn audit_loss_record_counts(&self) -> (usize, usize) {
         (self.objects.len(), self.sessions.len())
+    }
+
+    pub(super) fn replay_pending_count(&self) -> usize {
+        self.pending.len()
     }
 
     fn usage(&self) -> StateUsage {

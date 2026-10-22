@@ -152,7 +152,7 @@ EXITS = {"version.log": "version", "doctor.log": "doctor", "qual.log": "qual",
 RUNTIME_SOURCES = ("tests/fixtures/public-cli/inventory-ledger.c", "scripts/fixtures/exec_churn.c")
 SOURCE_FILES = ("scripts/release-matrix-contract.py", "scripts/qualify-release-matrix.sh",
                 "scripts/run-privileged-lib-tests.sh", "scripts/qualify-public-cli.sh",
-                "scripts/mapped-provider-pin.py",
+                "scripts/mapped-provider-pin.py", "scripts/public-cli-oracle.py", "scripts/check-capture-evidence.py",
                 "scripts/qualify-inventory-native.sh", "scripts/inventory-native-oracle.py",
                 "tests/fixtures/public-cli/gated.c", "tests/fixtures/public-cli/mt.c",
                 "tests/fixtures/public-cli/inventory-ledger.c")
@@ -783,9 +783,6 @@ def prepare(args):
             sources[f"artifacts/canary/{key}/{name}"] = bundle / name
         for name in facts["runtime_sources"] | facts["producer_sources"]:
             sources[f"artifacts/canary-source/{key}/{name}"] = Path(facts["source_root"]) / name
-    # Task2's accepted checker joins the integrated source pin; never invent it.
-    if (ROOT / "scripts/public-cli-oracle.py").exists():
-        sources["artifacts/source/scripts/public-cli-oracle.py"] = ROOT / "scripts/public-cli-oracle.py"
     for name, origin in sources.items():
         require(origin.is_file(), "missing input: " + str(origin))
         path = relative(stage, name)
@@ -1023,8 +1020,6 @@ def verify_inputs(stage, contract_path):
         required.add(f"inputs/canary-build/{key}.json")
         required.update(f"artifacts/canary/{key}/{name}" for name in CANARY_PAYLOADS)
         required.update(f"artifacts/canary-source/{key}/{name}" for name in (*CANARY_RUNTIME_SOURCES, *CANARY_PRODUCER_SOURCES))
-    if (ROOT / "scripts/public-cli-oracle.py").exists():
-        required.add("artifacts/source/scripts/public-cli-oracle.py")
     require(isinstance(bindings, dict) and set(bindings) >= required, "missing required source/artifact bindings")
     for name, digest in bindings.items():
         require(re.fullmatch(r"[0-9a-f]{64}", digest or ""), "invalid binding hash")

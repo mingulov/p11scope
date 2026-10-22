@@ -693,7 +693,9 @@ class ShellControls(unittest.TestCase):
             template=tmp / "report-template.json";template.write_text(json.dumps(inputs()[0]))
             local = tmp / "local disk"; local.mkdir(mode=0o700)
             env = dict(os.environ, CONTROL_MODE=mode, CONTROL_CELL=cell, MODULE=str(module), ITERS="7", CONTROL_REPORT=str(template),
-                       CONTROL_OUT=str(out), P11SCOPE_LOCAL_OUTPUT_ROOT=str(local))
+                       CONTROL_OUT=str(out))
+            env.pop("P11SCOPE_LOCAL_OUTPUT_ROOT", None)
+            if local_output: env["P11SCOPE_LOCAL_OUTPUT_ROOT"] = str(local)
             sentinel = subprocess.Popen([sys.executable, "-I", "-c", "import time; time.sleep(20)"]) if unrelated else None
             try:
                 proc = subprocess.run(["bash", str(SHELL), "--control-gated", str(observer),
@@ -710,6 +712,10 @@ class ShellControls(unittest.TestCase):
                     self.assertFalse((out / "released").exists())
                 if want == 0:
                     self.assertTrue((out / "released").exists())
+                    if not local_output:
+                        selected = Path(json.loads((out / "selected-output.json").read_text()))
+                        self.assertEqual(selected, out / (cell + ".json"))
+                        self.assertEqual(list(local.iterdir()), [])
                 if local_output:
                     selected = Path(json.loads((out / "selected-output.json").read_text()))
                     self.assertTrue(selected.is_relative_to(local), "product output did not use the local disk root")

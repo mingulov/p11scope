@@ -459,7 +459,7 @@ class MatrixContract(unittest.TestCase):
         repo = self.base / "source-clone"
         for name in ("scripts/release-matrix-contract.py", "scripts/qualify-release-matrix.sh",
                      "scripts/run-privileged-lib-tests.sh", "scripts/qualify-public-cli.sh",
-                     "scripts/mapped-provider-pin.py",
+                     "scripts/mapped-provider-pin.py", "scripts/public-cli-oracle.py", "scripts/check-capture-evidence.py",
                      "scripts/qualify-inventory-native.sh", "scripts/inventory-native-oracle.py",
                      "tests/fixtures/public-cli/gated.c", "tests/fixtures/public-cli/mt.c",
                      "tests/fixtures/public-cli/inventory-ledger.c", "scripts/fixtures/exec_churn.c"):
@@ -472,6 +472,59 @@ class MatrixContract(unittest.TestCase):
                          "--candidate-receipt", str(receipt), "--lib-test", LIB_A)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return repo, stage
+
+    def test_no_object_staged_sources_run_real_public_and_native_oracles_without_checkout(self):
+        # Reuse only the existing external child/report fixtures. The staged
+        # shell, provider pin, public oracle and verdict reader are real bytes.
+        public = runpy.run_path(str(ROOT / "tests/python/test_public_cli_oracle.py"))
+        repo, stage = self.clone_source()
+        self.assertEqual(json.loads((stage / "contract.json").read_text())["object_cells"], [])
+        staged = stage / "artifacts/source/scripts"
+        unrelated = self.base / "unrelated cwd"; unrelated.mkdir()
+        repo.rename(self.base / "unavailable original checkout")
+        self.assertFalse(repo.exists())
+        result = subprocess.run([sys.executable, "-I", str(staged / "public-cli-oracle.py"), "--help"],
+                                cwd=unrelated, text=True, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        shell_control = public["ShellControls"]()
+        shell_control.control.__func__.__globals__["SHELL"] = staged / "qualify-public-cli.sh"
+        previous = Path.cwd()
+        try:
+            os.chdir(unrelated)
+            shell_control.control("healthy", 0, local_output=True)
+        finally:
+            os.chdir(previous)
+        native = subprocess.run([sys.executable, "-I", str(staged / "inventory-native-oracle.py"), "probe-help"],
+                                cwd=unrelated, input="Usage: p11scope inventory --capture --manifest\n",
+                                text=True, capture_output=True, timeout=5)
+        self.assertEqual((native.returncode, native.stdout), (0, "capture=1\nmanifest=1\n"), native.stderr)
+        policy = subprocess.run([sys.executable, "-I", str(staged / "release-matrix-contract.py"), "--verify-launch-policy"],
+                                cwd=unrelated, text=True, capture_output=True, timeout=5)
+        self.assertEqual(policy.returncode, 0, policy.stdout + policy.stderr)
+
+    def test_no_object_required_public_helpers_refuse_missing_or_changed_inputs(self):
+        repo, stage = self.clone_source()
+        contract_path = stage / "contract.json"
+        original = json.loads(contract_path.read_text())
+        for name in ("public-cli-oracle.py", "check-capture-evidence.py"):
+            relative = "artifacts/source/scripts/" + name
+            source, staged = repo / "scripts" / name, stage / relative
+            self.assertIn(relative, original["bindings"])
+            content = staged.read_bytes()
+            for case in ("missing_binding", "missing_file", "changed_file", "changed_runtime"):
+                with self.subTest(helper=name, case=case):
+                    data = json.loads(json.dumps(original))
+                    if case == "missing_binding": data["bindings"].pop(relative)
+                    elif case == "missing_file": staged.unlink()
+                    elif case == "changed_file": staged.write_bytes(content + b"\n# stale staged helper\n")
+                    else: source.write_bytes(content + b"\n# changed runtime helper\n")
+                    contract_path.write_text(json.dumps(data))
+                    result = command(str(repo / "scripts/qualify-release-matrix.sh"), "--write-inner-stage", str(stage),
+                                     "--contract", str(contract_path))
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertFalse((stage / "inner.sh").exists())
+                    staged.write_bytes(content); source.write_bytes(content)
+        contract_path.write_text(json.dumps(original))
 
     def test_runtime_ledger_drift_is_rejected_before_inner_generation(self):
         repo, stage = self.clone_source()
@@ -1100,7 +1153,7 @@ class MatrixContract(unittest.TestCase):
         # contract sealing and judge are the production bytes and entrypoints.
         repo = self.base / "controlled-source"
         (repo / "scripts").mkdir(parents=True)
-        for path in (RUNNER, CHECKER):
+        for path in (RUNNER, CHECKER, ROOT / "scripts/public-cli-oracle.py", ROOT / "scripts/check-capture-evidence.py"):
             shutil.copy2(path, repo / "scripts" / path.name)
         for name in ("qualify-public-cli.sh", "qualify-inventory-native.sh", "run-privileged-lib-tests.sh"):
             path = repo / "scripts" / name

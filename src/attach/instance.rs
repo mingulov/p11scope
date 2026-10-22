@@ -778,6 +778,9 @@ pub(crate) trait BirthRowReader {
 /// failed. Observation refuses; nothing is minted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BirthObservationRefusal {
+    CurrentPartition,
+    StreamCut,
+    AbsenceHistory,
     /// The PROC_EPOCH marker readback is not READY naming the admitted
     /// image's exec id (unpublished, DIRTY, invalid, or another exec).
     MarkerNotReady,
@@ -822,6 +825,26 @@ pub(crate) enum BirthObservationRefusal {
     NegativeFenceMismatch,
 }
 
+/// Only a genuine H3 admission can construct this retained association.
+/// Keep no S1 payload and no caller-selected scalar constructor.
+pub(crate) struct BirthAdmissionBinding {
+    domain: super::capture::NativeDomainId,
+    image: p11scope_ebpf_common::ImageIdentity,
+    caller: crate::discovery::caller_registry::CallerId,
+}
+impl BirthAdmissionBinding {
+    pub(crate) fn from_admitted(
+        admitted: &crate::discovery::caller_registry::instance_input::AdmittedInstanceCall,
+    ) -> Self {
+        let (domain, image, _, caller) = admitted.journal_binding();
+        Self {
+            domain,
+            image,
+            caller,
+        }
+    }
+}
+
 /// Shared birth producers: the admitted domain and image, the
 /// admission authority's custody binding (the held pidfd bound to the
 /// admitted image, live with a start-time basis), and the admission
@@ -834,14 +857,32 @@ fn common_birth_words(
     attachment: &super::AttachedSemanticSet,
     admitted: &crate::discovery::caller_registry::instance_input::AdmittedInstanceCall,
 ) -> std::result::Result<((u64, u64), u64), BirthObservationRefusal> {
-    let (domain, image, _router, caller) = admitted.journal_binding();
+    common_retained_birth_words(
+        control,
+        binding,
+        attachment,
+        &BirthAdmissionBinding::from_admitted(admitted),
+    )
+}
+
+fn common_retained_birth_words(
+    control: &p11scope_ebpf_common::JournalAdmissionControl,
+    binding: &crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding,
+    attachment: &super::AttachedSemanticSet,
+    admitted: &BirthAdmissionBinding,
+) -> std::result::Result<((u64, u64), u64), BirthObservationRefusal> {
+    let (domain, image, caller) = (admitted.domain, admitted.image, admitted.caller);
     if attachment.domain() != domain {
         return Err(BirthObservationRefusal::AttachmentMismatch);
     }
     // Bind the held pidfd to the admitted image: the binding must name
     // the admitted domain, image and caller, and its pin is the custody
     // for exactly those. A live pin for another image is not custody.
-    if binding.domain() != domain || binding.image() != image || binding.caller() != caller {
+    if !binding.scope_current()
+        || binding.domain() != domain
+        || binding.image() != image
+        || binding.caller() != caller
+    {
         return Err(BirthObservationRefusal::BindingMismatch);
     }
     let custody = binding.pin();
@@ -859,6 +900,57 @@ fn common_birth_words(
         return Err(BirthObservationRefusal::SpentExhausted);
     }
     Ok(((image.task_cookie, image.exec_id), custody_word))
+}
+
+/// Re-read native truth using the retained admission and original H0 witness.
+/// The caller validates that witness; no router observation is repeated here.
+pub(crate) fn observe_retained_birth(
+    rows: &mut impl BirthRowReader,
+    binding: &crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding,
+    attachment: &super::AttachedSemanticSet,
+    admitted: &BirthAdmissionBinding,
+    birth: crate::semantics_objects::journal::BirthKind,
+) -> std::result::Result<
+    (
+        SessionGrantToken,
+        crate::semantics_objects::journal::SessionBirthEvidence,
+    ),
+    BirthObservationRefusal,
+> {
+    use crate::semantics_objects::journal::BirthKind;
+    let record = rows
+        .read_marker_row()
+        .map_err(|_| BirthObservationRefusal::RowUnreadable)?;
+    let control = rows
+        .read_admission_control()
+        .map_err(|_| BirthObservationRefusal::RowUnreadable)?;
+    let (image, custody) = common_retained_birth_words(&control, binding, attachment, admitted)?;
+    match birth {
+        BirthKind::ExecMarker => {
+            if p11scope_ebpf_common::journal_marker::read_word(record.journal_bootstrap)
+                != p11scope_ebpf_common::journal_marker::MarkerRead::Ready(image.1)
+            {
+                return Err(BirthObservationRefusal::MarkerNotReady);
+            }
+            if record.exec_attach_gen != attachment.generation() {
+                return Err(BirthObservationRefusal::GenerationMismatch);
+            }
+        }
+        BirthKind::AbsenceAppearance if record.journal_bootstrap != 0 => {
+            return Err(BirthObservationRefusal::MarkerPublished);
+        }
+        BirthKind::AbsenceAppearance => {}
+    }
+    let token = SessionGrantToken(());
+    let evidence = crate::semantics_objects::journal::SessionBirthEvidence::issue(
+        &token,
+        image,
+        record.journal_bootstrap,
+        control.failed,
+        attachment.generation(),
+        custody,
+    );
+    Ok((token, evidence))
 }
 
 /// Session-owned exec-marker birth observation. The producers are
@@ -935,6 +1027,7 @@ pub(crate) fn observe_exec_birth(
 /// the appearance joins the router. No caller-provided
 /// record/control structs on this path. Live map reads stay UNRUN:
 /// production wires [`LiveBirthRows`] and live scans.
+#[cfg(test)] // Legacy negative-protocol unit seam; production consumes actual H0 novelty.
 pub(crate) fn observe_absence_birth(
     rows: &mut impl BirthRowReader,
     absence: crate::attach::image_query::ImageAbsenceProof,
@@ -1141,6 +1234,7 @@ impl<R: BirthRowReader> crate::semantics_objects::journal::BirthEvidenceSource
 /// appearance) against live native state. UNRUN: the Session loop
 /// wires live scans when the journal activates.
 #[allow(dead_code)] // No Session-loop wire until live activation; tests drive fixtures.
+#[cfg(test)]
 pub(crate) struct AbsenceBirthSource<'a, R> {
     rows: R,
     absence: Option<crate::attach::image_query::ImageAbsenceProof>,
@@ -1152,6 +1246,7 @@ pub(crate) struct AbsenceBirthSource<'a, R> {
 }
 
 #[allow(dead_code)] // As above.
+#[cfg(test)]
 impl<'a, R: BirthRowReader> AbsenceBirthSource<'a, R> {
     /// Wire one absence birth: live rows, the sealed negative
     /// witness, the appearance, and the real router the appearance
@@ -1180,6 +1275,7 @@ impl<'a, R: BirthRowReader> AbsenceBirthSource<'a, R> {
 }
 
 #[allow(dead_code)] // As above.
+#[cfg(test)]
 impl<R: BirthRowReader> crate::semantics_objects::journal::BirthEvidenceSource
     for AbsenceBirthSource<'_, R>
 {

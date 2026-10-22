@@ -11,7 +11,9 @@ use super::{
 };
 use crate::attach::SessionDrainProducers;
 use crate::attach::capture::NativeDomainId;
-use crate::events::{DecodedEventRecord, EventDrain, LIVE_POLL_QUANTUM, RecordSource};
+use crate::events::{
+    BoundedRecordSource, DecodedEventRecord, EventDrain, LIVE_POLL_QUANTUM, RecordSource,
+};
 use crate::semantics_edge::resources::{
     OWNED_ALLOCATION_PADDING, ResourceLease, SemanticResourceRefusal, SemanticResourceReserver,
 };
@@ -28,6 +30,57 @@ static NEXT_RAW_QUANTUM: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RawQuantumIdentity(u64);
+
+/// Original raw allocation and wire position, stamped only by the actual H0
+/// allocator. Equal scalar positions from another raw allocation are foreign.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CollectedCallOrigin {
+    quantum: RawQuantumIdentity,
+    wire_index: usize,
+    position: u64,
+}
+impl CollectedCallOrigin {
+    pub(crate) fn in_quantum(&self, quantum: RawQuantumIdentity) -> bool {
+        self.quantum == quantum
+    }
+}
+
+struct H0Origin {
+    wire_index: usize,
+    allocation: Option<CollectedCallOrigin>,
+    quiet: bool,
+}
+
+pub(crate) struct H0Positions<'a> {
+    quantum: RawQuantumIdentity,
+    origins: &'a mut [H0Origin],
+}
+
+impl H0Positions<'_> {
+    pub(crate) fn allocate(
+        &mut self,
+        index: usize,
+        allocation: crate::semantic_capture::H0Allocation,
+    ) -> CollectedCallOrigin {
+        let original = &mut self.origins[index];
+        assert!(original.allocation.is_none(), "H0 inputs delivered once");
+        let origin = CollectedCallOrigin {
+            quantum: self.quantum,
+            wire_index: original.wire_index,
+            position: allocation.ordinal(),
+        };
+        original.allocation = Some(origin);
+        origin
+    }
+}
+
+pub(crate) struct H0Delivery<'a> {
+    pub(crate) records: &'a [DecodedEventRecord],
+    pub(crate) failed: bool,
+    pub(crate) positions: H0Positions<'a>,
+    pub(crate) birth_cut: Option<super::JournalBirthCut>,
+    pub(crate) quantum: RawQuantumIdentity,
+}
 
 /// Immutable resource provenance from the actual retained END projection.
 /// It grants no attribution, H0 position, admission, birth or seal authority.
@@ -176,6 +229,12 @@ type ResourceContext<'a> = (
 /// One bounded original poll. Neither the wire buffer nor its audit establishes
 /// key, birth, drain-binding or H3 authority. The charge remains owned until the
 /// complete quantum (including H0's physical ordinary copy) is disposed.
+struct RawCuts {
+    start: crate::events::EventsConsumptionCut,
+    end: Option<crate::events::EventsConsumptionCut>,
+    birth: super::JournalBirthCut,
+}
+
 pub(crate) struct RawJointQuantum {
     identity: RawQuantumIdentity,
     ordered: Vec<JournalIngestItem>,
@@ -187,7 +246,7 @@ pub(crate) struct RawJointQuantum {
     attempted: usize,
     malformed_seen: u64,
     discarded_seen: u64,
-    h0_origins: Vec<usize>,
+    h0_origins: Vec<H0Origin>,
     h0_delivered: usize,
     completed_delivered: bool,
     h0_pending: bool,
@@ -195,6 +254,7 @@ pub(crate) struct RawJointQuantum {
     invocations: Vec<RawInvocation>,
     ledger_generation: Option<LedgerGeneration>,
     resource_refused: bool,
+    cuts: Option<RawCuts>,
     _charge: ResourceLease,
 }
 
@@ -213,17 +273,167 @@ pub(crate) enum RawQuantumRefusal {
     Resource(SemanticResourceRefusal),
     Ledger(super::LedgerRefusal),
     Allocation,
+    Admission,
+    Cut(super::BirthCutRefusal),
+    Cursor(crate::events::EventsCutRefusal),
     Fault(FaultReadError),
 }
 
 impl RawJointQuantum {
+    pub(crate) fn birth_cut(&self) -> Option<&super::JournalBirthCut> {
+        self.cuts.as_ref().map(|cuts| &cuts.birth)
+    }
+
+    /// The production cursor-bound collector. `stop` is the genuine terminal
+    /// producer position when present; ordinary service leaves it absent.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn collect_bounded_with_adapter<S: BoundedRecordSource>(
+        drain: &mut EventDrain<S>,
+        descriptors: &[ObjectDescriptorWire; MAX_DESCRIPTORS as usize],
+        limit: usize,
+        stop: Option<usize>,
+        fault: &impl FaultEpoch,
+        producers: &SessionDrainProducers,
+        reserve: impl FnOnce(usize) -> Result<ResourceLease, SemanticResourceRefusal>,
+        adapter: &mut JournalAdapter,
+    ) -> Result<Self, RawQuantumRefusal> {
+        let start = drain.consumption_cut().map_err(RawQuantumRefusal::Cursor)?;
+        if !producers.matches_events(start.events()) || !adapter.bind_resource_producers(producers)
+        {
+            return Err(RawQuantumRefusal::ForeignCapture);
+        }
+        let birth = adapter
+            .resolve_birth_cut(&start, producers)
+            .map_err(RawQuantumRefusal::Cut)?;
+        adapter
+            .ledger
+            .prepare_capacity()
+            .map_err(RawQuantumRefusal::Ledger)?;
+        let mut raw = Self::collect_inner(
+            drain,
+            descriptors,
+            limit,
+            fault,
+            producers,
+            reserve,
+            Some((&mut adapter.ledger, &adapter.open, producers)),
+            0,
+        )?;
+        raw.poll_slice_using(
+            drain,
+            descriptors,
+            limit.min(1_024),
+            fault,
+            Some((&mut adapter.ledger, &adapter.open, producers)),
+            |drain, rows, work, ordinary, journal| {
+                Self::read_bounded_slice(drain, rows, work, stop, ordinary, journal)
+            },
+        );
+        raw.cuts = Some(RawCuts {
+            start,
+            end: drain.consumption_cut().ok(),
+            birth,
+        });
+        Ok(raw)
+    }
+
+    fn read_bounded_slice<S: BoundedRecordSource>(
+        drain: &mut EventDrain<S>,
+        rows: &[ObjectDescriptorWire; MAX_DESCRIPTORS as usize],
+        work: usize,
+        stop: Option<usize>,
+        ordinary: &mut dyn FnMut(DecodedEventRecord) -> ControlFlow<()>,
+        journal: &mut dyn FnMut(JournalRecord) -> ControlFlow<()>,
+    ) -> anyhow::Result<crate::events::DispatchPoll> {
+        let Some(stop) = stop else {
+            return Ok(drain.poll_dispatched_quantum(Some(work), rows, ordinary, journal));
+        };
+        let delivered = Cell::new(0usize);
+        let malformed = drain.malformed();
+        let (post_stop, backlog) = crate::events::poll_dispatched_records_to_position(
+            drain,
+            stop,
+            Some(work),
+            rows,
+            |record| {
+                delivered.set(delivered.get() + 1);
+                ordinary(record)
+            },
+            |record| {
+                delivered.set(delivered.get() + 1);
+                journal(record)
+            },
+        )?;
+        anyhow::ensure!(!post_stop, "records beyond original terminal cut");
+        Ok(crate::events::DispatchPoll {
+            attempted: delivered.get() + drain.malformed().saturating_sub(malformed) as usize,
+            backlog,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn continue_bounded_with_adapter<S: BoundedRecordSource>(
+        &mut self,
+        drain: &mut EventDrain<S>,
+        descriptors: &[ObjectDescriptorWire; MAX_DESCRIPTORS as usize],
+        work: usize,
+        stop: Option<usize>,
+        fault: &impl FaultEpoch,
+        producers: &SessionDrainProducers,
+        adapter: &mut JournalAdapter,
+    ) -> Result<crate::events::DispatchPoll, RawQuantumRefusal> {
+        let current = drain.consumption_cut().map_err(RawQuantumRefusal::Cursor)?;
+        if !self
+            .cuts
+            .as_ref()
+            .and_then(|cuts| cuts.end.as_ref())
+            .is_some_and(|end| end.same_boundary(&current))
+            || !producers.matches_events(current.events())
+            || !self.matches_producers(producers)
+            || !adapter.bind_resource_producers(producers)
+        {
+            return Err(RawQuantumRefusal::ForeignDrain);
+        }
+        if self.ledger_generation.is_none() || self.ledger_generation != adapter.ledger.generation()
+        {
+            return Err(RawQuantumRefusal::ForeignLedger);
+        }
+        if descriptors != &self.descriptors {
+            return Err(RawQuantumRefusal::ForeignDescriptors);
+        }
+        if !(1..=1_024).contains(&work) {
+            return Err(RawQuantumRefusal::InvalidLimit);
+        }
+        if self.h0_pending || self.completed_delivered {
+            return Err(RawQuantumRefusal::H0Active);
+        }
+        if self.attempted == self.capacity {
+            return Err(RawQuantumRefusal::Capacity);
+        }
+        self.observe_counters(drain.malformed(), drain.discarded());
+        self.observe_fault(fault.fault_epoch())
+            .map_err(RawQuantumRefusal::Fault)?;
+        let poll = self.poll_slice_using(
+            drain,
+            descriptors,
+            work.min(self.capacity - self.attempted),
+            fault,
+            Some((&mut adapter.ledger, &adapter.open, producers)),
+            |drain, rows, work, ordinary, journal| {
+                Self::read_bounded_slice(drain, rows, work, stop, ordinary, journal)
+            },
+        );
+        self.cuts.as_mut().expect("checked original cuts").end = drain.consumption_cut().ok();
+        Ok(poll)
+    }
+
     fn storage_bytes(limit: usize) -> usize {
         // All four arrays coexist. reserve_exact requests capacity once;
         // callbacks never grow them. Include each allocation's padding.
         limit
             * (size_of::<JournalIngestItem>()
                 + size_of::<DecodedEventRecord>()
-                + size_of::<usize>())
+                + size_of::<H0Origin>())
             + limit.min(super::MAX_UNSETTLED_STAGED) * size_of::<RawInvocation>()
             + 4 * OWNED_ALLOCATION_PADDING
             + size_of::<Self>()
@@ -293,6 +503,74 @@ impl RawJointQuantum {
             return Err(RawQuantumRefusal::InvalidLimit);
         }
         Ok((&self.ordinary, self.collection_failed()))
+    }
+
+    pub(crate) fn h0_delivery(
+        &mut self,
+        native: NativeDomainId,
+        limit: usize,
+    ) -> Result<H0Delivery<'_>, RawQuantumRefusal> {
+        self.h0_input(native, limit)?;
+        let failed = self.collection_failed();
+        let birth_cut = self.birth_cut().cloned();
+        Ok(H0Delivery {
+            records: &self.ordinary,
+            failed,
+            birth_cut,
+            quantum: self.identity,
+            positions: H0Positions {
+                quantum: self.identity,
+                origins: &mut self.h0_origins[self.h0_delivered..],
+            },
+        })
+    }
+
+    /// Associate only this actual H3 admission with its original ordinary
+    /// wire item, before ingestion. This neither binds a key nor claims it.
+    pub(crate) fn classify_ordinary(
+        &mut self,
+        admitted: &crate::discovery::caller_registry::instance_input::AdmittedInstanceCall,
+    ) -> Result<(), RawQuantumRefusal> {
+        let origin = admitted
+            .collected_origin()
+            .ok_or(RawQuantumRefusal::Admission)?;
+        let (domain, image, _, _) = admitted.journal_binding();
+        if domain != self.native
+            || origin.quantum != self.identity
+            || admitted.h0_ordinal() != origin.position
+        {
+            return Err(RawQuantumRefusal::Admission);
+        }
+        let at = self
+            .h0_origins
+            .binary_search_by_key(&origin.wire_index, |item| item.wire_index)
+            .map_err(|_| RawQuantumRefusal::Admission)?;
+        let original = &mut self.h0_origins[at];
+        if original.allocation != Some(origin) {
+            return Err(RawQuantumRefusal::Admission);
+        }
+        if original.quiet {
+            return Err(RawQuantumRefusal::Admission);
+        }
+        let Some(JournalIngestItem::Ordinary(record)) = self.ordered.get(origin.wire_index) else {
+            return Err(RawQuantumRefusal::Admission);
+        };
+        let event = &record.base.event;
+        let fingerprint = admitted
+            .journal_call_fingerprint()
+            .ok_or(RawQuantumRefusal::Admission)?;
+        if image != event.image
+            || !super::fingerprint_matches_event(&fingerprint, event)
+            || admitted.journal_return_ns() != Some(event.ts_ns)
+            || !matches!(
+                super::endpoint_class(fingerprint.function),
+                Some(super::EndpointClass::ProvedIrrelevant)
+            )
+        {
+            return Err(RawQuantumRefusal::Admission);
+        }
+        original.quiet = true;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -470,7 +748,35 @@ impl RawJointQuantum {
         descriptors: &[ObjectDescriptorWire; MAX_DESCRIPTORS as usize],
         work: usize,
         fault: &impl FaultEpoch,
+        resources: Option<ResourceContext<'_>>,
+    ) -> crate::events::DispatchPoll {
+        self.poll_slice_using(
+            drain,
+            descriptors,
+            work,
+            fault,
+            resources,
+            |drain, rows, work, ordinary, journal| {
+                Ok(drain.poll_dispatched_quantum(Some(work), rows, ordinary, journal))
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn poll_slice_using<S: RecordSource>(
+        &mut self,
+        drain: &mut EventDrain<S>,
+        descriptors: &[ObjectDescriptorWire; MAX_DESCRIPTORS as usize],
+        work: usize,
+        fault: &impl FaultEpoch,
         mut resources: Option<ResourceContext<'_>>,
+        read: impl FnOnce(
+            &mut EventDrain<S>,
+            &[ObjectDescriptorWire; MAX_DESCRIPTORS as usize],
+            usize,
+            &mut dyn FnMut(DecodedEventRecord) -> ControlFlow<()>,
+            &mut dyn FnMut(JournalRecord) -> ControlFlow<()>,
+        ) -> anyhow::Result<crate::events::DispatchPoll>,
     ) -> crate::events::DispatchPoll {
         let ordered = RefCell::new(&mut self.ordered);
         let ordinary = RefCell::new(&mut self.ordinary);
@@ -479,49 +785,76 @@ impl RawJointQuantum {
         let resource_refused = &mut self.resource_refused;
         let journal_count = Cell::new(0u64);
         let ordinary_wire_count = Cell::new(0u64);
-        let poll = drain.poll_dispatched_quantum(
-            Some(work),
-            descriptors,
-            |record| {
-                let index = ordered.borrow().len();
-                h0_origins.borrow_mut().push(index);
-                ordinary.borrow_mut().push(record);
-                ordered
-                    .borrow_mut()
-                    .push(JournalIngestItem::Ordinary(record));
-                ordinary_wire_count.set(ordinary_wire_count.get() + 1);
-                ControlFlow::Continue(())
-            },
-            |record| {
-                let index = ordered.borrow().len();
-                let resource = resources.as_mut().and_then(|(ledger, open, producers)| {
-                    Self::resource_for_record(
-                        &record,
-                        invocations,
-                        ledger,
-                        open,
-                        producers,
-                        resource_refused,
-                    )
-                });
-                if let JournalRecord::End(end) = &record {
-                    // Dispatch already validated and observed this completed
-                    // payload. Its H0 copy is not a second wire item or tap.
-                    if let Some(mut completed) =
-                        crate::events::project_journal_end_payload(end, descriptors)
-                    {
-                        completed.joint_resource = resource;
-                        h0_origins.borrow_mut().push(index);
-                        ordinary.borrow_mut().push(completed);
-                    }
+        let mut deliver_ordinary = |record| {
+            let index = ordered.borrow().len();
+            h0_origins.borrow_mut().push(H0Origin {
+                wire_index: index,
+                allocation: None,
+                quiet: false,
+            });
+            ordinary.borrow_mut().push(record);
+            ordered
+                .borrow_mut()
+                .push(JournalIngestItem::Ordinary(record));
+            ordinary_wire_count.set(ordinary_wire_count.get() + 1);
+            ControlFlow::Continue(())
+        };
+        let mut deliver_journal = |record| {
+            let index = ordered.borrow().len();
+            let resource = resources.as_mut().and_then(|(ledger, open, producers)| {
+                Self::resource_for_record(
+                    &record,
+                    invocations,
+                    ledger,
+                    open,
+                    producers,
+                    resource_refused,
+                )
+            });
+            if let JournalRecord::End(end) = &record {
+                // Dispatch already validated and observed this completed
+                // payload. Its H0 copy is not a second wire item or tap.
+                if let Some(mut completed) =
+                    crate::events::project_journal_end_payload(end, descriptors)
+                {
+                    completed.joint_resource = resource;
+                    h0_origins.borrow_mut().push(H0Origin {
+                        wire_index: index,
+                        allocation: None,
+                        quiet: false,
+                    });
+                    ordinary.borrow_mut().push(completed);
                 }
-                ordered
-                    .borrow_mut()
-                    .push(JournalIngestItem::Journal(record));
-                journal_count.set(journal_count.get() + 1);
-                ControlFlow::Continue(())
-            },
+            }
+            ordered
+                .borrow_mut()
+                .push(JournalIngestItem::Journal(record));
+            journal_count.set(journal_count.get() + 1);
+            ControlFlow::Continue(())
+        };
+        let before_malformed = drain.malformed();
+        let read_result = read(
+            drain,
+            descriptors,
+            work,
+            &mut deliver_ordinary,
+            &mut deliver_journal,
         );
+        let poll = match read_result {
+            Ok(poll) => poll,
+            Err(_) => {
+                // BUSY/error before a terminal cut is an irreversible audit
+                // failure; retain every original already collected for disposal.
+                self.audit.counter_error = true;
+                crate::events::DispatchPoll {
+                    attempted: (journal_count.get()
+                        + ordinary_wire_count.get()
+                        + drain.malformed().saturating_sub(before_malformed))
+                        as usize,
+                    backlog: true,
+                }
+            }
+        };
         self.attempted += poll.attempted;
         self.audit.ingested += journal_count.get();
         self.audit.ordinary += ordinary_wire_count.get();
@@ -628,7 +961,7 @@ impl RawJointQuantum {
     /// and bind the existing admission-based grant from these SAME producers.
     /// Refusal returns the unchanged owner, including all paid buffers.
     #[allow(clippy::result_large_err)] // Cold refusal path: returns the unchanged owner with its paid buffers; boxing would churn the ownership contract.
-    pub(super) fn ingest(
+    pub(crate) fn ingest(
         self,
         adapter: &mut JournalAdapter,
         producers: &SessionDrainProducers,
@@ -647,7 +980,24 @@ impl RawJointQuantum {
         if let Some(refusal) = refusal {
             return Err((self, refusal));
         }
-        for item in &self.ordered {
+        let clean_stream = self.cuts.as_ref().is_some_and(|cuts| {
+            adapter.accepts_birth_cut(&cuts.birth)
+                && adapter.consumed_frontier() == cuts.birth.ordinal
+                && adapter
+                    .stream_boundary
+                    .as_ref()
+                    .is_some_and(|boundary| boundary.same_boundary(&cuts.start))
+                && cuts
+                    .end
+                    .as_ref()
+                    .is_some_and(|end| end.clean_successor_of(&cuts.start))
+                && !self.collection_failed()
+        });
+        if !clean_stream {
+            adapter.stream_broken = true;
+        }
+        let mut origins = self.h0_origins.iter().peekable();
+        for (index, item) in self.ordered.iter().enumerate() {
             let resource = match item {
                 JournalIngestItem::Journal(JournalRecord::Begin(begin)) => self
                     .invocations
@@ -656,7 +1006,18 @@ impl RawJointQuantum {
                     .map(|entry| entry.reservation),
                 _ => None,
             };
-            adapter.ingest_any_from_raw(*item, resource);
+            let quiet = if origins
+                .peek()
+                .is_some_and(|origin| origin.wire_index == index)
+            {
+                origins.next().expect("peeked original H0 position").quiet
+            } else {
+                false
+            };
+            adapter.ingest_any_from_raw(*item, resource, quiet);
+        }
+        if clean_stream {
+            adapter.stream_boundary = self.cuts.as_ref().and_then(|cuts| cuts.end.clone());
         }
         // Preserve IDs on the stack, then actually drop every physical raw
         // copy before removing Raw memberships. The quantum's lease is last.
@@ -695,7 +1056,16 @@ impl RawJointQuantum {
         producers: &SessionDrainProducers,
         reserve: impl FnOnce(usize) -> Result<ResourceLease, SemanticResourceRefusal>,
     ) -> Result<Self, RawQuantumRefusal> {
-        Self::collect_inner(drain, descriptors, limit, fault, producers, reserve, None)
+        Self::collect_inner(
+            drain,
+            descriptors,
+            limit,
+            fault,
+            producers,
+            reserve,
+            None,
+            limit.min(1_024),
+        )
     }
 
     #[allow(clippy::too_many_arguments)] // One retained cursor, pool and resource owner, no second handle.
@@ -729,6 +1099,7 @@ impl RawJointQuantum {
             producers,
             reserve,
             Some((&mut adapter.ledger, &adapter.open, producers)),
+            limit.min(1_024),
         )
     }
 
@@ -741,6 +1112,7 @@ impl RawJointQuantum {
         producers: &SessionDrainProducers,
         reserve: impl FnOnce(usize) -> Result<ResourceLease, SemanticResourceRefusal>,
         resources: Option<ResourceContext<'_>>,
+        initial_work: usize,
     ) -> Result<Self, RawQuantumRefusal> {
         if drain.domain_id() != producers.events_id() {
             return Err(RawQuantumRefusal::ForeignDrain);
@@ -820,9 +1192,12 @@ impl RawJointQuantum {
                 .as_ref()
                 .and_then(|(ledger, _, _)| ledger.generation()),
             resource_refused: false,
+            cuts: None,
             _charge: charge,
         };
-        retained.poll_slice(drain, descriptors, limit.min(1_024), fault, resources);
+        if initial_work != 0 {
+            retained.poll_slice(drain, descriptors, initial_work, fault, resources);
+        }
         Ok(retained)
     }
 }
@@ -869,6 +1244,86 @@ mod tests {
             crate::semantics_objects::journal::JournalLimits::policy(),
             StagingLedger::with_resources(pool.reserver()),
         )
+    }
+
+    #[test]
+    fn joint_bound_continuation_keeps_original_cut_and_rejects_foreign_cursor() {
+        use crate::semantics_objects::journal::tests::{
+            ENTRY_NS, begin_bytes, end_bytes_absent, function_id,
+        };
+        let rows = publish_object_descriptors();
+        let begin = begin_bytes(1, 1, function_id("C_Sign"), 0);
+        let end = end_bytes_absent(&begin, 0, ENTRY_NS + 100);
+        let events = EventsDomain::test_standin(0xb113);
+        let retained = producers(&events);
+        let pool = SemanticResourcePool::default();
+        let mut adapter = resource_adapter(&pool);
+        let fault = SteadyFault(Cell::new(None));
+        let mut drain = EventDrain::over_domain(
+            ScriptedRecords::records([begin.to_vec()], 2),
+            events.clone(),
+        );
+        let mut raw = RawJointQuantum::collect_bounded_with_adapter(
+            &mut drain,
+            &rows,
+            4,
+            None,
+            &fault,
+            &retained,
+            |bytes| pool.reserve(bytes),
+            &mut adapter,
+        )
+        .unwrap();
+        let original = raw.birth_cut().unwrap().clone();
+        let capacities = raw.retained_capacities();
+        let mut foreign =
+            EventDrain::over_domain(ScriptedRecords::records([end.to_vec()], 1), events);
+        assert_eq!(
+            raw.continue_bounded_with_adapter(
+                &mut foreign,
+                &rows,
+                1,
+                None,
+                &fault,
+                &retained,
+                &mut adapter
+            ),
+            Err(RawQuantumRefusal::ForeignDrain)
+        );
+        assert_eq!(
+            foreign.source().remaining(),
+            1,
+            "same map allocation is not the original cursor"
+        );
+        drain.source_mut().push_record(end.to_vec());
+        let stop = crate::events::event_drain_positions(&drain).producer;
+        let poll = raw
+            .continue_bounded_with_adapter(
+                &mut drain,
+                &rows,
+                1,
+                Some(stop),
+                &fault,
+                &retained,
+                &mut adapter,
+            )
+            .unwrap();
+        assert_eq!(poll.attempted, 1);
+        assert_eq!(raw.ordered.len(), 2);
+        assert_eq!(raw.ordinary.len(), 1);
+        assert_eq!(raw.retained_capacities(), capacities);
+        assert!(raw.birth_cut().unwrap().same_stream(&original));
+        assert_eq!(raw.birth_cut().unwrap().ordinal, original.ordinal);
+        assert!(
+            raw.cuts
+                .as_ref()
+                .unwrap()
+                .end
+                .as_ref()
+                .unwrap()
+                .is_drained()
+        );
+        assert!(!raw.collection_failed());
     }
 
     #[test]
@@ -1163,7 +1618,7 @@ mod tests {
         // Exercise resource custody only at the actual original ingest
         // helper. No H0 watermark, grant, bootstrap or seal is fabricated.
         assert_eq!(
-            adapter.ingest_any_from_raw(start.ordered[0], Some(reservation)),
+            adapter.ingest_any_from_raw(start.ordered[0], Some(reservation), false),
             super::super::JournalDisposition::BeginAdmitted
         );
         drop(start);
@@ -1235,7 +1690,14 @@ mod tests {
             .unwrap();
         assert_eq!(returned.attempted, 1);
         assert_eq!(quantum.ordered.len(), 2);
-        assert_eq!(quantum.h0_origins, vec![1]);
+        assert_eq!(
+            quantum
+                .h0_origins
+                .iter()
+                .map(|origin| origin.wire_index)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
         assert_eq!(quantum.pending_h0_records(), 1);
         assert_eq!(
             quantum.ordinary[0].base.event.event_type,
@@ -1280,7 +1742,14 @@ mod tests {
         assert_eq!(poll.attempted, 1_024);
         assert_eq!(quantum.ordered.len(), 2_048);
         assert_eq!(quantum.pending_h0_records(), 1_024);
-        assert_eq!(quantum.h0_origins, (1_024..2_048).collect::<Vec<_>>());
+        assert_eq!(
+            quantum
+                .h0_origins
+                .iter()
+                .map(|origin| origin.wire_index)
+                .collect::<Vec<_>>(),
+            (1_024..2_048).collect::<Vec<_>>()
+        );
         assert_eq!(drain.source().remaining(), 0);
         assert_eq!(quantum.audit.ingested, 2_048);
         assert_eq!(quantum.audit.ordinary, 0);
@@ -1575,7 +2044,14 @@ mod tests {
         assert!(matches!(quantum.ordered[1], JournalIngestItem::Ordinary(_)));
         assert!(matches!(quantum.ordered[2], JournalIngestItem::Journal(_)));
         assert_eq!(quantum.ordinary.len(), 2);
-        assert_eq!(quantum.h0_origins, vec![1, 2]);
+        assert_eq!(
+            quantum
+                .h0_origins
+                .iter()
+                .map(|origin| origin.wire_index)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
         assert_eq!(
             quantum.ordinary[0].base.event.event_type,
             p11scope_ebpf_common::event_type::FORK

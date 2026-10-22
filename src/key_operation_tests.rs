@@ -5930,7 +5930,7 @@ fn key_operation_n1_genuine_birth_bootstrap() {
     .expect("genuine producers observe");
     assert_eq!(evidence.image(), (COOKIE, EXEC));
     assert_eq!(evidence.marker_word(), ready_word(EXEC));
-    let grant = SessionBirthGrant::issue(
+    let grant = SessionBirthGrant::issue_for_native_row_test(
         &token,
         proof,
         BirthKind::ExecMarker,

@@ -13,6 +13,10 @@ use crate::discovery::instances::{
 };
 use crate::events::DecodedEventRecord;
 use crate::process::PidPin;
+use crate::semantics_objects::journal::joint_driver::{CollectedCallOrigin, H0Delivery};
+use crate::semantics_objects::journal::{
+    BirthKind, BootstrapReceipt, JournalAdapter, JournalBirthCut, JournalDomainProof,
+};
 use p11scope_ebpf_common::object_wire::ValidatedObjectCall;
 use p11scope_ebpf_common::{EventRecord, ImageIdentity, event_type};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -20,6 +24,7 @@ use std::fmt;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -43,6 +48,11 @@ pub(crate) struct CurrentPartitionReceipt {
     fence: u64,
     deadline: Instant,
     ids: Vec<InstanceId>,
+    birth: Option<(
+        u64,
+        JournalBirthCut,
+        crate::semantics_objects::journal::joint_driver::RawQuantumIdentity,
+    )>,
 }
 impl CurrentPartitionReceipt {
     /// Tests-only receipt: merge tests script receipt plumbing (order,
@@ -73,6 +83,7 @@ impl CurrentPartitionReceipt {
             fence,
             deadline,
             ids,
+            birth: None,
         }
     }
 
@@ -98,6 +109,161 @@ impl CurrentPartitionReceipt {
     /// accessor transfers no construction or renewal authority.
     pub(crate) fn watched(&self) -> &RetainedInventoryTarget {
         &self.watched
+    }
+    pub(crate) fn into_birth_candidate(mut self) -> Result<H0BirthCandidate, Self> {
+        let Some((capture, cut, quantum)) = self.birth.take() else {
+            return Err(self);
+        };
+        Ok(H0BirthCandidate {
+            receipt: self,
+            capture,
+            cut,
+            quantum,
+        })
+    }
+}
+
+/// Moves the existing bounded H0 receipt; no duplicate partition or queue.
+pub(crate) struct H0BirthCandidate {
+    receipt: CurrentPartitionReceipt,
+    capture: u64,
+    cut: JournalBirthCut,
+    quantum: crate::semantics_objects::journal::joint_driver::RawQuantumIdentity,
+}
+
+pub(crate) struct CommittedAbsenceBirth {
+    proof: crate::attach::image_query::ImageAbsenceProof,
+    pin: Arc<PidPin>,
+    watched: RetainedInventoryTarget,
+    capture: u64,
+    cut: JournalBirthCut,
+}
+
+pub(crate) struct RetainedBirthWitness {
+    candidate: H0BirthCandidate,
+    admission: crate::attach::BirthAdmissionBinding,
+    receipt: BootstrapReceipt,
+}
+impl RetainedBirthWitness {
+    pub(crate) fn receipt(&self) -> &BootstrapReceipt {
+        &self.receipt
+    }
+
+    fn validate_scope(
+        &self,
+        attachment: &crate::attach::AttachedSemanticSet,
+        binding: &crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding,
+    ) -> Result<(), crate::attach::BirthObservationRefusal> {
+        if !Arc::ptr_eq(&binding.pin(), &self.candidate.receipt.pin) {
+            return Err(crate::attach::BirthObservationRefusal::BindingMismatch);
+        }
+        if attachment.generation() != self.receipt.closure_generation() {
+            return Err(crate::attach::BirthObservationRefusal::GenerationMismatch);
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)] // The later lane activation borrows this actual Session port.
+    pub(crate) fn fresh_evidence(
+        &self,
+        session: &mut Session,
+        capture: &SemanticCapture,
+        attachment: &crate::attach::AttachedSemanticSet,
+        binding: &crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding,
+    ) -> Result<
+        crate::semantics_objects::journal::SessionBirthEvidence,
+        crate::attach::BirthObservationRefusal,
+    > {
+        self.validate_scope(attachment, binding)?;
+        let deadline = Instant::now()
+            .checked_add(capture.limits.scan_slice)
+            .ok_or(crate::attach::BirthObservationRefusal::CurrentPartition)?;
+        capture.validate_birth_candidate(
+            &mut SessionIo {
+                session,
+                targets: &[],
+            },
+            &self.candidate,
+            true,
+        )?;
+        let evidence = {
+            let maps = session.instance_maps();
+            let mut rows = crate::attach::LiveBirthRows::over(&maps, binding);
+            crate::attach::observe_retained_birth(
+                &mut rows,
+                binding,
+                attachment,
+                &self.admission,
+                self.receipt.birth(),
+            )?
+            .1
+        };
+        capture.validate_birth_candidate(
+            &mut SessionIo {
+                session,
+                targets: &[],
+            },
+            &self.candidate,
+            true,
+        )?;
+        if Instant::now() >= deadline {
+            return Err(crate::attach::BirthObservationRefusal::CurrentPartition);
+        }
+        Ok(evidence)
+    }
+
+    #[cfg(test)]
+    fn fresh_evidence_with(
+        &self,
+        io: &mut impl CaptureIo,
+        rows: &mut impl crate::attach::BirthRowReader,
+        capture: &SemanticCapture,
+        attachment: &crate::attach::AttachedSemanticSet,
+        binding: &crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding,
+    ) -> Result<
+        crate::semantics_objects::journal::SessionBirthEvidence,
+        crate::attach::BirthObservationRefusal,
+    > {
+        self.validate_scope(attachment, binding)?;
+        let deadline = Instant::now()
+            .checked_add(capture.limits.scan_slice)
+            .ok_or(crate::attach::BirthObservationRefusal::CurrentPartition)?;
+        capture.validate_birth_candidate(io, &self.candidate, true)?;
+        let evidence = crate::attach::observe_retained_birth(
+            rows,
+            binding,
+            attachment,
+            &self.admission,
+            self.receipt.birth(),
+        )?
+        .1;
+        capture.validate_birth_candidate(io, &self.candidate, true)?;
+        if Instant::now() >= deadline {
+            return Err(crate::attach::BirthObservationRefusal::CurrentPartition);
+        }
+        Ok(evidence)
+    }
+}
+
+/// A seal borrows fresh Session I/O over the same retained witness each time.
+#[allow(dead_code)] // Kept inactive until the controller accepts the authority foundation.
+pub(crate) struct RetainedBirthSource<'a> {
+    pub(crate) witness: &'a RetainedBirthWitness,
+    pub(crate) session: &'a mut Session,
+    pub(crate) capture: &'a SemanticCapture,
+    pub(crate) attachment: &'a crate::attach::AttachedSemanticSet,
+    pub(crate) binding:
+        &'a crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding,
+}
+impl crate::semantics_objects::journal::BirthEvidenceSource for RetainedBirthSource<'_> {
+    fn take_birth_evidence(
+        &mut self,
+    ) -> Result<
+        crate::semantics_objects::journal::SessionBirthEvidence,
+        crate::attach::BirthObservationRefusal,
+    > {
+        self.witness
+            .fresh_evidence(self.session, self.capture, self.attachment, self.binding)
     }
 }
 impl fmt::Debug for CurrentPartitionReceipt {
@@ -217,6 +383,7 @@ pub(crate) struct RoutedCall {
     route: Route,
     endpoint: Option<Endpoint>,
     token: Option<u64>,
+    collected_origin: Option<CollectedCallOrigin>,
 }
 impl RoutedCall {
     /// Tests-only call: finalizer and terminal tests script Joined calls
@@ -236,11 +403,15 @@ impl RoutedCall {
             route,
             endpoint,
             token,
+            collected_origin: None,
         }
     }
 
     pub(crate) fn token(&self) -> Option<u64> {
         self.token
+    }
+    pub(crate) fn collected_origin(&self) -> Option<CollectedCallOrigin> {
+        self.collected_origin
     }
     pub(crate) fn position(&self) -> Option<u64> {
         self.token
@@ -605,6 +776,10 @@ struct ScanJob {
     slot: u32,
     pin: Arc<PidPin>,
     deadline: Instant,
+    birth_cut: Option<(
+        JournalBirthCut,
+        crate::semantics_objects::journal::joint_driver::RawQuantumIdentity,
+    )>,
 }
 impl ScanJob {
     fn key(&self) -> (u64, u64, u32) {
@@ -769,6 +944,15 @@ impl CaptureIo for SessionIo<'_> {
 struct Awaiting {
     record: DecodedEventRecord,
     endpoint: Option<Endpoint>,
+    collected_origin: Option<CollectedCallOrigin>,
+}
+
+/// Only this owner's actual collection allocator constructs the position.
+pub(crate) struct H0Allocation(u64);
+impl H0Allocation {
+    pub(crate) fn ordinal(self) -> u64 {
+        self.0
+    }
 }
 struct TaskBinding {
     domain: NativeDomainId,
@@ -794,6 +978,7 @@ impl TerminalTaskProof {
 }
 
 pub(crate) struct SemanticCapture {
+    identity: u64,
     router: InstanceRouter,
     limits: TickLimits,
     next_token: u64,
@@ -811,6 +996,7 @@ pub(crate) struct SemanticCapture {
     stopped: bool,
     continuity_cuts: u64,
 }
+static NEXT_SEMANTIC_CAPTURE: AtomicU64 = AtomicU64::new(0);
 impl SemanticCapture {
     pub(crate) fn new(session: &Session, limits: TickLimits) -> anyhow::Result<Self> {
         let domain = session
@@ -832,7 +1018,14 @@ impl SemanticCapture {
                 && !limits.scan_slice.is_zero(),
             "invalid semantic work limits"
         );
+        let identity = NEXT_SEMANTIC_CAPTURE
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+                last.checked_add(1)
+            })
+            .map_err(|_| anyhow::anyhow!("semantic capture identity exhausted"))?
+            + 1;
         Ok(Self {
+            identity,
             router: InstanceRouter::new(domain, RouterLimits::default()),
             limits,
             next_token: 1,
@@ -854,6 +1047,380 @@ impl SemanticCapture {
     }
     pub(crate) fn continuity_cuts(&self) -> u64 {
         self.continuity_cuts
+    }
+
+    /// Acquire while the original H0 owner is idle, after the quiet prefix was
+    /// ingested and before any later appearance. Both cursor snapshots must
+    /// be empty; a BUSY reservation is not an absence boundary.
+    #[allow(dead_code)] // The later lane activation calls this idle acquisition port.
+    pub(crate) fn acquire_absence_birth(
+        &mut self,
+        session: &mut Session,
+        binding: &crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding,
+        attachment: &crate::attach::AttachedSemanticSet,
+        slot: u32,
+        adapter: &mut JournalAdapter,
+    ) -> Result<CommittedAbsenceBirth, crate::attach::BirthObservationRefusal> {
+        use crate::attach::BirthObservationRefusal as Refusal;
+        if !self.awaiting.is_empty() || !self.jobs.is_empty() || self.stopped {
+            return Err(Refusal::CurrentPartition);
+        }
+        let producers = session.drain_producers().ok_or(Refusal::StreamCut)?;
+        let before = session
+            .event_drain()
+            .map_err(|_| Refusal::StreamCut)?
+            .consumption_cut()
+            .map_err(|_| Refusal::StreamCut)?;
+        if !before.is_drained() {
+            return Err(Refusal::StreamCut);
+        }
+        let endpoint = session
+            .instance_endpoint(slot)
+            .ok_or(Refusal::AttachmentMismatch)?;
+        let pin = binding.pin();
+        let deadline = Instant::now()
+            .checked_add(self.limits.scan_slice)
+            .ok_or(Refusal::CurrentPartition)?;
+        let proof = session
+            .prove_image_absence(
+                &pin,
+                endpoint.object,
+                ReadWindow::new(16_384, deadline).map_err(|_| Refusal::CurrentPartition)?,
+                self.router.fence(),
+                || self.router.fence(),
+            )
+            .map_err(|_| Refusal::CurrentPartition)?;
+        let after = session
+            .event_drain()
+            .map_err(|_| Refusal::StreamCut)?
+            .consumption_cut()
+            .map_err(|_| Refusal::StreamCut)?;
+        self.commit_absence_with(
+            &mut SessionIo {
+                session,
+                targets: &[],
+            },
+            proof,
+            before,
+            after,
+            binding,
+            attachment,
+            slot,
+            adapter,
+            &producers,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn commit_absence_with(
+        &self,
+        io: &mut impl CaptureIo,
+        proof: crate::attach::image_query::ImageAbsenceProof,
+        before: crate::events::EventsConsumptionCut,
+        after: crate::events::EventsConsumptionCut,
+        binding: &crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding,
+        attachment: &crate::attach::AttachedSemanticSet,
+        slot: u32,
+        adapter: &mut JournalAdapter,
+        producers: &crate::attach::SessionDrainProducers,
+    ) -> Result<CommittedAbsenceBirth, crate::attach::BirthObservationRefusal> {
+        use crate::attach::BirthObservationRefusal as Refusal;
+        self.birth_health_with(io)?;
+        if self.stopped
+            || !self.awaiting.is_empty()
+            || !self.jobs.is_empty()
+            || io.domain() != Some(self.router.domain())
+            || !binding.scope_current()
+            || proof.domain() != self.router.domain()
+            || proof.image() != binding.image()
+            || attachment.domain() != self.router.domain()
+            || proof.attach_generation() != attachment.generation()
+            || proof.fence() != self.router.fence()
+        {
+            return Err(Refusal::CurrentPartition);
+        }
+        if proof.fence() != self.router.fence()
+            || proof.epochs().fault != self.fault
+            || proof.epochs().sticky != self.sticky
+        {
+            return Err(Refusal::NegativeFenceMismatch);
+        }
+        let endpoint = io.endpoint(slot).ok_or(Refusal::AttachmentMismatch)?;
+        if proof.file_slot() != endpoint.file_slot {
+            return Err(Refusal::AppearanceForeign);
+        }
+        let pin = binding.pin();
+        if !self
+            .bindings
+            .get(&proof.image().task_cookie)
+            .is_some_and(|retained| {
+                retained.current
+                    && retained.image == proof.image()
+                    && Arc::ptr_eq(&retained.pin, &pin)
+            })
+            || !matches!(
+                pin.original_generation_state(),
+                Ok(crate::process::OriginalGenerationState::Current)
+            )
+        {
+            return Err(Refusal::CustodyLost);
+        }
+        if !before.is_drained() || !after.is_drained() || !before.same_boundary(&after) {
+            return Err(Refusal::StreamCut);
+        }
+        let cut = adapter
+            .resolve_birth_cut(&after, producers)
+            .map_err(|_| Refusal::StreamCut)?;
+        if !adapter.quiet_sighting_at(proof.image(), &cut) {
+            return Err(Refusal::AbsenceHistory);
+        }
+        let watched = io
+            .retained_attachment(slot)
+            .map_err(|_| Refusal::AttachmentMismatch)?;
+        if watched.check_unchanged() != Ok(true) {
+            return Err(Refusal::AttachmentMismatch);
+        }
+        Ok(CommittedAbsenceBirth {
+            proof,
+            pin,
+            watched,
+            capture: self.identity,
+            cut,
+        })
+    }
+
+    fn birth_health_with(
+        &self,
+        io: &mut impl CaptureIo,
+    ) -> Result<(), crate::attach::BirthObservationRefusal> {
+        use crate::attach::BirthObservationRefusal as Refusal;
+        if self.stopped
+            || self.exhausted
+            || self.image_failed
+            || io.domain() != Some(self.router.domain())
+        {
+            return Err(Refusal::CurrentPartition);
+        }
+        let health = io.health().map_err(|_| Refusal::CurrentPartition)?;
+        if health.fault != self.fault || health.sticky != self.sticky || health.sticky != 0 {
+            return Err(Refusal::CurrentPartition);
+        }
+        Ok(())
+    }
+
+    /// Read-only birth checks never run H0's mutating audit or consume pending
+    /// originals. The next actual H0 tick publishes every negative/resolution.
+    fn validate_birth_candidate(
+        &self,
+        io: &mut impl CaptureIo,
+        candidate: &H0BirthCandidate,
+        retained: bool,
+    ) -> Result<(), crate::attach::BirthObservationRefusal> {
+        use crate::attach::BirthObservationRefusal as Refusal;
+        if candidate.capture != self.identity {
+            return Err(Refusal::CurrentPartition);
+        }
+        self.birth_health_with(io)?;
+        let receipt = &candidate.receipt;
+        let binding = self
+            .bindings
+            .get(&receipt.image.task_cookie)
+            .ok_or(Refusal::CustodyLost)?;
+        if !binding.current
+            || binding.domain != receipt.domain
+            || binding.image != receipt.image
+            || !Arc::ptr_eq(&binding.pin, &receipt.pin)
+            || receipt.pin.pidfd().is_err()
+        {
+            return Err(Refusal::CustodyLost);
+        }
+        if !retained && io.now() >= receipt.deadline {
+            return Err(Refusal::CurrentPartition);
+        }
+        if !self.receipt_partition_matches(receipt) {
+            return Err(Refusal::CurrentPartition);
+        }
+        if io.endpoint(receipt.attachment_slot) != Some(receipt.endpoint) {
+            return Err(Refusal::AttachmentMismatch);
+        }
+        let target = io
+            .retained_attachment(receipt.attachment_slot)
+            .map_err(|_| Refusal::AttachmentMismatch)?;
+        if !Arc::ptr_eq(
+            &target.retirement_lease(),
+            &receipt.watched.retirement_lease(),
+        ) || target.check_unchanged() != Ok(true)
+            || receipt.watched.check_unchanged() != Ok(true)
+        {
+            return Err(Refusal::AttachmentMismatch);
+        }
+        let deadline = io
+            .now()
+            .checked_add(self.limits.scan_slice)
+            .ok_or(Refusal::CurrentPartition)?;
+        let deadline = if retained {
+            deadline
+        } else {
+            deadline.min(receipt.deadline)
+        };
+        let state = io
+            .receipt_state(
+                &receipt.pin,
+                receipt.image,
+                receipt.endpoint,
+                receipt.attachment_slot,
+                deadline,
+            )
+            .map_err(|_| Refusal::CurrentPartition)?;
+        self.birth_health_with(io)?;
+        if io.now() >= deadline
+            || state.image != receipt.image
+            || state.epochs != receipt.epochs
+            || !self.receipt_partition_matches(receipt)
+        {
+            return Err(Refusal::CurrentPartition);
+        }
+        if io.endpoint(receipt.attachment_slot) != Some(receipt.endpoint)
+            || !Arc::ptr_eq(
+                &state.watched.retirement_lease(),
+                &receipt.watched.retirement_lease(),
+            )
+            || state.watched.check_unchanged() != Ok(true)
+        {
+            return Err(Refusal::AttachmentMismatch);
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_birth(
+        &self,
+        mut candidate: H0BirthCandidate,
+        absence: Option<CommittedAbsenceBirth>,
+        admitted: &crate::discovery::caller_registry::instance_input::AdmittedInstanceCall,
+        binding: &crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding,
+        attachment: &crate::attach::AttachedSemanticSet,
+        proof: &JournalDomainProof,
+        adapter: &JournalAdapter,
+        rows: &mut impl crate::attach::BirthRowReader,
+    ) -> Result<RetainedBirthWitness, crate::attach::BirthObservationRefusal> {
+        use crate::attach::BirthObservationRefusal as Refusal;
+        let (native, image, router, _) = admitted.journal_binding();
+        if native != candidate.receipt.domain
+            || image != candidate.receipt.image
+            || !candidate.receipt.ids.contains(&router)
+            || !proof.matches_admitted(admitted)
+            || !admitted
+                .collected_origin()
+                .is_some_and(|origin| origin.in_quantum(candidate.quantum))
+            || !Arc::ptr_eq(&binding.pin(), &candidate.receipt.pin)
+        {
+            return Err(Refusal::BindingMismatch);
+        }
+        let birth = if let Some(absence) = absence {
+            if absence.capture != self.identity
+                || !Arc::ptr_eq(&absence.pin, &candidate.receipt.pin)
+                || !Arc::ptr_eq(
+                    &absence.watched.retirement_lease(),
+                    &candidate.receipt.watched.retirement_lease(),
+                )
+                || absence.proof.domain() != native
+                || absence.proof.image().task_cookie != image.task_cookie
+                || absence.proof.file_slot() != candidate.receipt.endpoint.file_slot
+                || absence.proof.attach_generation() != attachment.generation()
+            {
+                return Err(Refusal::AppearanceForeign);
+            }
+            if absence.proof.fence() != self.router.fence()
+                || candidate.receipt.fence != absence.proof.fence()
+            {
+                return Err(Refusal::NegativeFenceMismatch);
+            }
+            let before = absence.proof.epochs();
+            let after = candidate.receipt.epochs;
+            if after.local < before.local
+                || after.global < before.global
+                || (after.local == before.local && after.global == before.global)
+                || after.fault != before.fault
+            {
+                return Err(Refusal::AppearanceNotAdvanced);
+            }
+            if !absence.cut.same_stream(&candidate.cut)
+                || !adapter.quiet_sighting_at(image, &absence.cut)
+            {
+                return Err(Refusal::AbsenceHistory);
+            }
+            candidate.cut = absence.cut;
+            BirthKind::AbsenceAppearance
+        } else {
+            BirthKind::ExecMarker
+        };
+        if !adapter.accepts_birth_cut(&candidate.cut) {
+            return Err(Refusal::StreamCut);
+        }
+        let admission = crate::attach::BirthAdmissionBinding::from_admitted(admitted);
+        let (token, evidence) =
+            crate::attach::observe_retained_birth(rows, binding, attachment, &admission, birth)?;
+        let grant = crate::semantics_objects::journal::SessionBirthGrant::issue(
+            &token,
+            *proof,
+            birth,
+            &candidate.cut,
+            attachment.generation(),
+            evidence,
+        );
+        let receipt =
+            BootstrapReceipt::attest(adapter, &grant).map_err(|_| Refusal::AbsenceHistory)?;
+        Ok(RetainedBirthWitness {
+            candidate,
+            admission,
+            receipt,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)] // The later lane activation consumes this actual H0 handoff.
+    pub(crate) fn consume_birth(
+        &mut self,
+        session: &mut Session,
+        candidate: H0BirthCandidate,
+        absence: Option<CommittedAbsenceBirth>,
+        admitted: &crate::discovery::caller_registry::instance_input::AdmittedInstanceCall,
+        binding: &crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding,
+        attachment: &crate::attach::AttachedSemanticSet,
+        proof: &JournalDomainProof,
+        adapter: &JournalAdapter,
+    ) -> Result<RetainedBirthWitness, crate::attach::BirthObservationRefusal> {
+        let deadline = Instant::now()
+            .checked_add(self.limits.scan_slice)
+            .ok_or(crate::attach::BirthObservationRefusal::CurrentPartition)?;
+        self.validate_birth_candidate(
+            &mut SessionIo {
+                session,
+                targets: &[],
+            },
+            &candidate,
+            false,
+        )?;
+        let witness = {
+            let maps = session.instance_maps();
+            let mut rows = crate::attach::LiveBirthRows::over(&maps, binding);
+            self.finish_birth(
+                candidate, absence, admitted, binding, attachment, proof, adapter, &mut rows,
+            )?
+        };
+        self.validate_birth_candidate(
+            &mut SessionIo {
+                session,
+                targets: &[],
+            },
+            &witness.candidate,
+            false,
+        )?;
+        if Instant::now() >= deadline {
+            return Err(crate::attach::BirthObservationRefusal::CurrentPartition);
+        }
+        Ok(witness)
     }
     pub(crate) fn validate_current(
         &mut self,
@@ -1163,6 +1730,7 @@ impl SemanticCapture {
                         slot,
                         pin,
                         deadline: proof_deadline,
+                        birth_cut: None,
                     };
                     self.accept_scan(io, proof, &job, fence, &mut report);
                 }
@@ -1177,6 +1745,7 @@ impl SemanticCapture {
         record: DecodedEventRecord,
         endpoint: Option<Endpoint>,
         route: Route,
+        collected_origin: Option<CollectedCallOrigin>,
         report: &mut TickReport,
     ) {
         report.outcomes.push(TickOutcome::Call(RoutedCall {
@@ -1185,6 +1754,7 @@ impl SemanticCapture {
             route,
             endpoint,
             token,
+            collected_origin,
         }));
     }
     fn allocate_position(&mut self) -> Option<u64> {
@@ -1215,7 +1785,14 @@ impl SemanticCapture {
     fn resolve(&mut self, outcomes: Vec<(u64, Route)>, report: &mut TickReport) {
         for (token, route) in outcomes {
             if let Some(waiting) = self.awaiting.remove(&token) {
-                self.emit(Some(token), waiting.record, waiting.endpoint, route, report);
+                self.emit(
+                    Some(token),
+                    waiting.record,
+                    waiting.endpoint,
+                    route,
+                    waiting.collected_origin,
+                    report,
+                );
             }
         }
     }
@@ -1467,6 +2044,13 @@ impl SemanticCapture {
                     fence,
                     deadline: job.deadline,
                     ids,
+                    birth: if outcome == ObserveOutcome::New {
+                        job.birth_cut
+                            .clone()
+                            .map(|(cut, quantum)| (self.identity, cut, quantum))
+                    } else {
+                        None
+                    },
                 });
             }
         }
@@ -1500,15 +2084,10 @@ impl SemanticCapture {
             "foreign semantic Session"
         );
         anyhow::ensure!(!self.stopped, "semantic capture stopped");
-        let (records, failed) = quantum
-            .h0_input(self.router.domain(), self.limits.records)
+        let delivery = quantum
+            .h0_delivery(self.router.domain(), self.limits.records)
             .map_err(|reason| anyhow::anyhow!("retained semantic collection: {reason:?}"))?;
-        let status = if failed {
-            CollectionStatus::ReadError
-        } else {
-            CollectionStatus::Complete
-        };
-        let mut report = self.tick_with_inner(io, Some((records, status)))?;
+        let mut report = self.tick_with_inner(io, Some(delivery))?;
         self.stamp_disposition(&mut report);
         quantum
             .note_h0_report(CollectedH0Disposition {
@@ -1521,10 +2100,21 @@ impl SemanticCapture {
         Ok(report)
     }
 
+    #[allow(dead_code)] // Thin Session wrapper; ordinary lane selection remains inactive.
+    pub(crate) fn tick_collected(
+        &mut self,
+        session: &mut Session,
+        targets: &[Arc<PidPin>],
+        quantum: &mut crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+    ) -> anyhow::Result<TickReport> {
+        anyhow::ensure!(targets.len() <= MAX_PENDING, "semantic target capacity");
+        self.tick_collected_with(&mut SessionIo { session, targets }, quantum)
+    }
+
     fn tick_with_inner(
         &mut self,
         io: &mut impl CaptureIo,
-        collected: Option<(&[DecodedEventRecord], CollectionStatus)>,
+        collected: Option<H0Delivery<'_>>,
     ) -> anyhow::Result<TickReport> {
         anyhow::ensure!(
             io.domain() == Some(self.router.domain()),
@@ -1533,11 +2123,20 @@ impl SemanticCapture {
         anyhow::ensure!(!self.stopped, "semantic capture stopped");
         let mut report = TickReport::default();
         let owned;
-        let (records, status) = match collected {
-            Some(input) => input,
+        let (records, status, mut positions, birth_cut) = match collected {
+            Some(input) => (
+                input.records,
+                if input.failed {
+                    CollectionStatus::ReadError
+                } else {
+                    CollectionStatus::Complete
+                },
+                Some(input.positions),
+                input.birth_cut.map(|cut| (cut, input.quantum)),
+            ),
             None => {
                 owned = io.collect(self.limits.records);
-                (owned.records.as_slice(), owned.status)
+                (owned.records.as_slice(), owned.status, None, None)
             }
         };
         let collection_failed =
@@ -1548,12 +2147,18 @@ impl SemanticCapture {
             .iter()
             .take(self.limits.records)
             .copied()
-            .map(|record| {
+            .enumerate()
+            .map(|(index, record)| {
                 let position = self.allocate_position();
                 if position.is_none() {
                     self.exhaust(&mut report);
                 }
-                (position, record)
+                let origin = position.and_then(|position| {
+                    positions
+                        .as_mut()
+                        .map(|positions| positions.allocate(index, H0Allocation(position)))
+                });
+                (position, record, origin)
             })
             .collect();
         // Joined calls already have a route, but later publications need a
@@ -1568,7 +2173,7 @@ impl SemanticCapture {
         // Collection never routes; every batch (including empty batches) audits.
         let _ = self.audit(io, &mut report);
         self.terminal_tasks(&mut report);
-        for (position, record) in batch {
+        for (position, record, origin) in batch {
             if record.base.event.event_type != event_type::CALL {
                 report.outcomes.push(TickOutcome::Other(OtherRecord {
                     domain: self.router.domain(),
@@ -1585,6 +2190,7 @@ impl SemanticCapture {
                     record,
                     endpoint,
                     Route::Unknown(UnknownReason::AuthorityExhausted),
+                    origin,
                     &mut report,
                 );
                 continue;
@@ -1597,6 +2203,7 @@ impl SemanticCapture {
                     record,
                     endpoint,
                     Route::Unknown(UnknownReason::NoFile),
+                    origin,
                     &mut report,
                 );
                 continue;
@@ -1623,10 +2230,17 @@ impl SemanticCapture {
                         (record.base.event.pid_tgid >> 32) as u32,
                     ));
                 }
-                self.emit(Some(token), record, endpoint, route, &mut report);
+                self.emit(Some(token), record, endpoint, route, origin, &mut report);
                 continue;
             }
-            self.awaiting.insert(token, Awaiting { record, endpoint });
+            self.awaiting.insert(
+                token,
+                Awaiting {
+                    record,
+                    endpoint,
+                    collected_origin: origin,
+                },
+            );
             let image = record.base.event.image;
             if !self.bindings.contains_key(&image.task_cookie)
                 && self.bindings.len() >= self.limits.bindings
@@ -1651,6 +2265,7 @@ impl SemanticCapture {
                     slot: record.base.event.slot,
                     pin,
                     deadline,
+                    birth_cut: birth_cut.clone(),
                 });
             }
         }
@@ -1754,6 +2369,7 @@ impl SemanticCapture {
                 slot,
                 pin,
                 deadline: proof_deadline,
+                birth_cut: birth_cut.clone(),
             };
             report.scans += 1;
             self.joined_refresh_cursor = Some(key);
@@ -1792,6 +2408,11 @@ impl SemanticCapture {
         self.stamp_disposition(&mut report);
         report
     }
+}
+
+#[cfg(test)]
+pub(crate) fn assert_actual_absence_birth_fixture() {
+    tests::actual_absence_birth_fixture();
 }
 
 #[cfg(test)]
@@ -3042,6 +3663,7 @@ mod tests {
                 slot: endpoint.file_slot * 2,
                 pin: pin.clone(),
                 deadline,
+                birth_cut: None,
             };
             self.scan(&job, deadline, fence, current)
         }
@@ -3050,139 +3672,903 @@ mod tests {
         SemanticCapture::in_domain(io.domain, TickLimits::default()).unwrap()
     }
 
-    #[test]
-    fn joint_birth_witness_uses_actual_new_once() {
-        // Regression: asking a second router observation to authorize the
-        // appearance H0 already consumed makes useful absence birth fail.
-        // The mapping/native reads are substituted below their protocols;
-        // raw dispatch, H0 routing and H3 admission are the actual code.
-        use crate::attach::image_query::acquire_test_absence;
-        use crate::attach::observe_absence_birth;
-        use crate::events::{EventDrain, EventsDomain, ScriptedRecords};
-        use crate::semantics_edge::resources::SemanticResourcePool;
-        use crate::semantics_objects::journal::joint_driver::RawJointQuantum;
-        use crate::semantics_objects::journal::tests::{
-            AttestationFixture, ENTRY_NS, NativeBirthRows, NativePublisher, begin_bytes, end_bytes,
-            function_id,
-        };
-        use p11scope_ebpf_common::object_wire::{OBJECT_ACTION_CREATE, publish_object_descriptors};
+    struct BirthFault;
+    impl crate::semantics_objects::journal::FaultEpoch for BirthFault {
+        fn fault_epoch(&self) -> Result<u64, crate::semantics_objects::journal::FaultReadError> {
+            Ok(0)
+        }
+    }
 
-        struct Fault;
-        impl crate::semantics_objects::journal::FaultEpoch for Fault {
-            fn fault_epoch(
-                &self,
-            ) -> Result<u64, crate::semantics_objects::journal::FaultReadError> {
-                Ok(0)
+    struct JointBirthHarness {
+        fixture: crate::semantics_objects::journal::tests::AttestationFixture,
+        io: ScriptIo,
+        capture: SemanticCapture,
+        pool: crate::semantics_edge::resources::SemanticResourcePool,
+        adapter: JournalAdapter,
+        drain: crate::events::EventDrain<crate::events::ScriptedRecords>,
+        producers: crate::attach::SessionDrainProducers,
+        rows: [p11scope_ebpf_common::object_wire::ObjectDescriptorWire;
+            p11scope_ebpf_common::MAX_DESCRIPTORS as usize],
+    }
+    impl JointBirthHarness {
+        fn new() -> Self {
+            use crate::semantics_objects::journal::{
+                JournalLimits, SessionClosureGrant, StagingLedger,
+            };
+            let image = ImageIdentity {
+                task_cookie: 71,
+                exec_id: 0,
+            };
+            let fixture = crate::semantics_objects::journal::tests::AttestationFixture::new_with_quiet_function(image);
+            let mut io = ScriptIo::with_paths(
+                fixture.domain(),
+                &fixture.provider_path(),
+                std::path::Path::new("/usr/bin/false"),
+            );
+            io.pin = fixture.binding().pin();
+            io.local = 1;
+            io.current_image = image;
+            io.output_image = Some(image);
+            io.endpoints = Some(
+                ["C_CreateObject", "C_GetSessionInfo"]
+                    .into_iter()
+                    .map(|name| fixture.endpoint_for(name))
+                    .collect(),
+            );
+            io.scan_ranges = Some(vec![MapRange::new(0x7000_0000, 0x7000_6000, 0, true)]);
+            let capture = capture(&io);
+            let pool = crate::semantics_edge::resources::SemanticResourcePool::default();
+            let mut adapter = JournalAdapter::with_ledger(
+                JournalLimits::policy(),
+                StagingLedger::with_resources(pool.reserver()),
+            );
+            assert!(
+                adapter.install_closure_grant(&SessionClosureGrant::observe(fixture.attachment()))
+            );
+            let events = crate::events::EventsDomain::test_standin(0xb101);
+            let producers =
+                crate::attach::SessionDrainProducers::test_pair(io.domain, events.clone());
+            let drain = crate::events::EventDrain::over_domain(
+                crate::events::ScriptedRecords::records([], 64),
+                events,
+            );
+            Self {
+                fixture,
+                io,
+                capture,
+                pool,
+                adapter,
+                drain,
+                producers,
+                rows: p11scope_ebpf_common::object_wire::publish_object_descriptors(),
             }
         }
-
-        let image = ImageIdentity {
-            task_cookie: 71,
-            exec_id: 0,
-        };
-        let mut fixture = AttestationFixture::new(image);
-        let (slot, endpoint) = fixture.endpoint_for("C_CreateObject");
-        let mut io = ScriptIo::with_paths(
-            fixture.domain(),
-            &fixture.provider_path(),
-            std::path::Path::new("/usr/bin/false"),
-        );
-        io.pin = fixture.binding().pin();
-        io.local = 1;
-        io.current_image = image;
-        io.output_image = Some(image);
-        io.endpoints = Some(BTreeMap::from([(slot, endpoint)]));
-        io.scan_ranges = Some(vec![MapRange::new(0x7000_0000, 0x7000_6000, 0, true)]);
-        let mut capture = capture(&io);
-
-        let negative = acquire_test_absence(
-            io.domain,
-            image,
-            endpoint.file_slot,
-            CompleteEpochs {
-                local: 0,
+        fn ordinary(&self, child: ImageIdentity) -> EventRecord {
+            let (slot, endpoint) = self.fixture.endpoint_for("C_GetSessionInfo");
+            let pid = u64::from(self.io.pin.pid());
+            let stamp = p11scope_ebpf_common::InstanceStamp {
+                flags: p11scope_ebpf_common::instance::STAMP_VALID,
+                file_slot_plus1: endpoint.file_slot as u16 + 1,
+                epoch: self.io.local,
                 global: 0,
                 fault: 0,
-                sticky: 0,
-                record_flags: 0,
-            },
-            vec![p11scope_manifest::maps::MapEntry {
-                start: 0x4000,
-                end: 0x5000,
-                file_offset: 0,
-                permissions: *b"r-xp",
-                device: p11scope_manifest::maps::Device { major: 8, minor: 2 },
-                inode: 1001,
-                raw_path: None,
-            }],
-            fixture.attachment().generation(),
-            vec![io.watched[0].object_key()],
-            crate::discovery::instances::MappedFileIdentity {
-                dev: 0x801,
-                ino: 999,
-            },
-            |_, _| panic!("no watched-provider mapping to confirm"),
-            capture.router.fence(),
-        )
-        .expect("complete genuine negative protocol");
-        let mut begin = begin_bytes(1, 1, function_id("C_CreateObject"), 0);
-        let pid = u64::from(io.pin.pid());
-        begin[24..32].copy_from_slice(&((pid << 32) | pid).to_le_bytes());
-        begin[56..64].copy_from_slice(&(0x7000_0000 + endpoint.offset).to_le_bytes());
-        begin[64..68].copy_from_slice(&1u32.to_le_bytes());
-        begin[68..76].fill(0);
-        begin[76..78].copy_from_slice(&1u16.to_le_bytes());
-        begin[104..108].copy_from_slice(&slot.to_le_bytes());
-        let end = end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 100);
-        let rows = publish_object_descriptors();
-        let events = EventsDomain::test_standin(0xb101);
-        let producers = crate::attach::SessionDrainProducers::test_pair(io.domain, events.clone());
-        let mut drain = EventDrain::over_domain(
-            ScriptedRecords::records([begin.to_vec(), end.to_vec()], 2),
-            events,
-        );
-        let pool = SemanticResourcePool::default();
-        let mut raw =
-            RawJointQuantum::collect(&mut drain, &rows, 4_096, &Fault, &producers, |bytes| {
-                pool.reserve(bytes)
-            })
-            .expect("original collection");
-        let mut report = capture.tick_collected_with(&mut io, &mut raw).unwrap();
-        assert_eq!(report.observations, vec![ObserveOutcome::New]);
-        assert_eq!(report.calls().count(), 1, "useful original return routed");
-        let admitted = fixture.admit_collected(match report.take_outcomes().pop().unwrap() {
-            TickOutcome::Call(call) => call,
-            other => panic!("actual return expected: {other:?}"),
-        });
-        let appearance = io
-            .scan_selected(
-                &fixture.binding().pin(),
-                endpoint,
-                Instant::now() + Duration::from_secs(1),
-                capture.router.fence(),
-                &|| capture.router.fence(),
+            };
+            EventRecord {
+                event: p11scope_ebpf_common::Event {
+                    event_type: event_type::CALL,
+                    image: self.io.current_image,
+                    child_image: child,
+                    pid_tgid: (pid << 32) | pid,
+                    ts_ns: 100,
+                    duration_ns: 10,
+                    slot,
+                    session: 1,
+                    ..Default::default()
+                },
+                continuity: p11scope_ebpf_common::InstanceContinuity {
+                    entry_stamp: stamp,
+                    return_stamp: stamp,
+                    entry_ip: 0x7000_0000 + endpoint.offset,
+                },
+            }
+        }
+        fn push_ordinary(&mut self, child: ImageIdentity) {
+            let bytes = crate::events::record_bytes(&self.ordinary(child));
+            self.drain.source_mut().push_record(bytes);
+        }
+        fn push_create(&mut self, sequence: u64) {
+            use crate::semantics_objects::journal::tests::{
+                ENTRY_NS, begin_bytes, end_bytes, function_id,
+            };
+            let (slot, endpoint) = self.fixture.endpoint_for("C_CreateObject");
+            let mut begin = begin_bytes(1, sequence, function_id("C_CreateObject"), 0);
+            let pid = u64::from(self.io.pin.pid());
+            begin[24..32].copy_from_slice(&((pid << 32) | pid).to_le_bytes());
+            begin[56..64].copy_from_slice(&(0x7000_0000 + endpoint.offset).to_le_bytes());
+            begin[64..68].copy_from_slice(&self.io.local.to_le_bytes());
+            begin[68..76].fill(0);
+            begin[76..78].copy_from_slice(&1u16.to_le_bytes());
+            begin[104..108].copy_from_slice(&slot.to_le_bytes());
+            let end = end_bytes(
+                &begin,
+                p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE,
+                0,
+                ENTRY_NS + 100,
+            );
+            self.drain.source_mut().push_record(begin.to_vec());
+            self.drain.source_mut().push_record(end.to_vec());
+        }
+        fn collect(&mut self) -> crate::semantics_objects::journal::joint_driver::RawJointQuantum {
+            crate::semantics_objects::journal::joint_driver::RawJointQuantum::collect_bounded_with_adapter(
+                &mut self.drain, &self.rows, 4_096, None, &BirthFault, &self.producers,
+                |bytes| self.pool.reserve(bytes), &mut self.adapter,
+            ).expect("original bounded collection")
+        }
+        fn route(
+            &mut self,
+            raw: &mut crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+        ) -> (
+            TickReport,
+            crate::discovery::caller_registry::instance_input::AdmittedInstanceCall,
+        ) {
+            let mut report = self.capture.tick_collected_with(&mut self.io, raw).unwrap();
+            let mut calls =
+                report
+                    .take_outcomes()
+                    .into_iter()
+                    .filter_map(|outcome| match outcome {
+                        TickOutcome::Call(call) => Some(call),
+                        _ => None,
+                    });
+            let call = calls.next().expect("one actual completed call");
+            assert!(calls.next().is_none());
+            let admitted = self.fixture.admit_collected(call);
+            (report, admitted)
+        }
+        fn ingest(
+            &mut self,
+            raw: crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+            admitted: &crate::discovery::caller_registry::instance_input::AdmittedInstanceCall,
+        ) -> (
+            crate::semantics_objects::journal::JournalCollection,
+            JournalDomainProof,
+        ) {
+            let proof = self
+                .adapter
+                .bind_admitted_key(admitted)
+                .expect("binding does not claim before START ingestion");
+            let grant = crate::semantics_objects::journal::SessionDrainGrant::observe(
+                &self.producers,
+                admitted,
             )
-            .expect("current appearance protocol");
+            .unwrap();
+            self.adapter.bind_session_drain(&grant).unwrap();
+            let collection = raw
+                .ingest(&mut self.adapter, &self.producers, &grant)
+                .unwrap_or_else(|(_, reason)| panic!("raw ingest: {reason:?}"));
+            assert_eq!(
+                self.adapter.attest_key(admitted).unwrap(),
+                proof,
+                "claim follows genuine START ingestion"
+            );
+            (collection, proof)
+        }
+        fn absence(&mut self) -> CommittedAbsenceBirth {
+            use crate::attach::image_query::acquire_test_absence;
+            let (slot, endpoint) = self.fixture.endpoint_for("C_GetSessionInfo");
+            let proof = acquire_test_absence(
+                self.io.domain,
+                self.io.current_image,
+                endpoint.file_slot,
+                CompleteEpochs {
+                    local: u64::from(self.io.local),
+                    global: 0,
+                    fault: 0,
+                    sticky: 0,
+                    record_flags: 0,
+                },
+                vec![p11scope_manifest::maps::MapEntry {
+                    start: 0x4000,
+                    end: 0x5000,
+                    file_offset: 0,
+                    permissions: *b"r-xp",
+                    device: p11scope_manifest::maps::Device { major: 8, minor: 2 },
+                    inode: 1001,
+                    raw_path: None,
+                }],
+                self.fixture.attachment().generation(),
+                vec![self.io.watched[0].object_key()],
+                crate::discovery::instances::MappedFileIdentity {
+                    dev: 0x801,
+                    ino: 999,
+                },
+                |_, _| panic!("no watched-provider mapping"),
+                self.capture.router.fence(),
+            )
+            .expect("genuine provider-free acquisition before appearance");
+            let before = self.drain.consumption_cut().unwrap();
+            let after = self.drain.consumption_cut().unwrap();
+            self.capture
+                .commit_absence_with(
+                    &mut self.io,
+                    proof,
+                    before,
+                    after,
+                    self.fixture.binding(),
+                    self.fixture.attachment(),
+                    slot,
+                    &mut self.adapter,
+                    &self.producers,
+                )
+                .unwrap()
+        }
+        fn birth(
+            &mut self,
+            mut report: TickReport,
+            admitted: &crate::discovery::caller_registry::instance_input::AdmittedInstanceCall,
+            proof: &JournalDomainProof,
+            absence: Option<CommittedAbsenceBirth>,
+            rows: &mut impl crate::attach::BirthRowReader,
+        ) -> RetainedBirthWitness {
+            assert!(report.observations.contains(&ObserveOutcome::New));
+            let candidate = report
+                .take_current()
+                .pop()
+                .unwrap()
+                .into_birth_candidate()
+                .unwrap_or_else(|_| panic!("actual New candidate"));
+            self.capture
+                .validate_birth_candidate(&mut self.io, &candidate, false)
+                .unwrap();
+            self.capture
+                .finish_birth(
+                    candidate,
+                    absence,
+                    admitted,
+                    self.fixture.binding(),
+                    self.fixture.attachment(),
+                    proof,
+                    &self.adapter,
+                    rows,
+                )
+                .unwrap()
+        }
+        fn seal(
+            &mut self,
+            collection: crate::semantics_objects::journal::JournalCollection,
+            witness: &RetainedBirthWitness,
+            rows: &mut impl crate::attach::BirthRowReader,
+            model: &mut crate::semantics_objects::ObjectSemantics,
+        ) -> usize {
+            use crate::semantics_objects::journal::{
+                BirthEvidenceSource, H3DispositionEvidence, JournalAuditReceipt, ScriptedH3Source,
+            };
+            struct Fresh<'a, R> {
+                witness: &'a RetainedBirthWitness,
+                io: &'a mut ScriptIo,
+                capture: &'a SemanticCapture,
+                fixture: &'a crate::semantics_objects::journal::tests::AttestationFixture,
+                rows: &'a mut R,
+            }
+            impl<R: crate::attach::BirthRowReader> BirthEvidenceSource for Fresh<'_, R> {
+                fn take_birth_evidence(
+                    &mut self,
+                ) -> Result<
+                    crate::semantics_objects::journal::SessionBirthEvidence,
+                    crate::attach::BirthObservationRefusal,
+                > {
+                    self.witness.fresh_evidence_with(
+                        self.io,
+                        self.rows,
+                        self.capture,
+                        self.fixture.attachment(),
+                        self.fixture.binding(),
+                    )
+                }
+            }
+            let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(
+                collection.h0_allocated_below,
+            ));
+            let audit = JournalAuditReceipt::collect(
+                &collection,
+                &mut h3,
+                self.fixture.attachment().generation(),
+            );
+            let frontier = self.adapter.consumed_frontier();
+            let mut source = Fresh {
+                witness,
+                io: &mut self.io,
+                capture: &self.capture,
+                fixture: &self.fixture,
+                rows,
+            };
+            self.adapter
+                .seal(
+                    model,
+                    &audit,
+                    witness.receipt(),
+                    frontier,
+                    &mut source,
+                    &BirthFault,
+                )
+                .expect("actual retained birth seals")
+                .prefix
+                .settled()
+                .len()
+        }
+    }
+
+    #[test]
+    fn joint_birth_witness_uses_actual_new_once() {
+        use crate::semantics_objects::journal::tests::{NativeBirthRows, NativePublisher};
+        let mut harness = JointBirthHarness::new();
+        harness.push_create(1);
+        let mut raw = harness.collect();
+        let (report, admitted) = harness.route(&mut raw);
+        assert_eq!(report.observations, vec![ObserveOutcome::New]);
+        let (collection, proof) = harness.ingest(raw, &admitted);
+        let publisher = NativePublisher::build();
+        let (row, control, _) =
+            publisher.publish_stamped(&["0", "0"], harness.fixture.attachment().generation());
+        let mut rows = NativeBirthRows { row, control };
+        let witness = harness.birth(report, &admitted, &proof, None, &mut rows);
+        assert!(Arc::ptr_eq(
+            &witness.candidate.receipt.pin,
+            &harness.fixture.binding().pin()
+        ));
+        let mut model = crate::semantics_objects::ObjectSemantics::new();
+        assert_eq!(harness.seal(collection, &witness, &mut rows, &mut model), 1);
+        harness.io.now += Duration::from_secs(3);
+        assert!(harness.io.now > witness.candidate.receipt.deadline);
+        harness.push_create(2);
+        let mut raw = harness.collect();
+        let (mut report, admitted) = harness.route(&mut raw);
+        assert_eq!(report.observations, vec![ObserveOutcome::Continued]);
+        assert!(
+            report
+                .take_current()
+                .pop()
+                .unwrap()
+                .into_birth_candidate()
+                .is_err()
+        );
+        let (collection, _) = harness.ingest(raw, &admitted);
+        assert_eq!(harness.seal(collection, &witness, &mut rows, &mut model), 1);
+        assert_eq!(
+            harness.capture.router.instances_minted(),
+            1,
+            "successive seals never observe again"
+        );
+        let mut foreign = capture(&harness.io);
+        assert!(
+            witness
+                .fresh_evidence_with(
+                    &mut harness.io,
+                    &mut rows,
+                    &mut foreign,
+                    harness.fixture.attachment(),
+                    harness.fixture.binding()
+                )
+                .is_err()
+        );
+        harness.io.receipt_epochs = Some(CompleteEpochs {
+            local: 2,
+            global: 0,
+            fault: 0,
+            sticky: 0,
+            record_flags: 0,
+        });
+        assert!(
+            witness
+                .fresh_evidence_with(
+                    &mut harness.io,
+                    &mut rows,
+                    &mut harness.capture,
+                    harness.fixture.attachment(),
+                    harness.fixture.binding()
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn joint_absence_birth_requires_prior_negative_and_quiet_sighting() {
+        actual_absence_birth_fixture();
+    }
+    pub(super) fn actual_absence_birth_fixture() {
+        use crate::semantics_objects::journal::tests::{NativeBirthRows, NativePublisher};
+        let mut harness = JointBirthHarness::new();
+        harness.push_ordinary(ImageIdentity::default());
+        let mut quiet = harness.collect();
+        let (quiet_report, admitted) = harness.route(&mut quiet);
+        assert!(quiet_report.observations.contains(&ObserveOutcome::New));
+        quiet
+            .classify_ordinary(&admitted)
+            .expect("only real canonical C_GetSessionInfo admission narrows history");
+        assert!(
+            quiet.classify_ordinary(&admitted).is_err(),
+            "classification cannot replay"
+        );
+        harness.ingest(quiet, &admitted);
+        harness.io.local = 2;
+        let negative = harness.absence();
+        assert!(
+            harness
+                .adapter
+                .quiet_sighting_at(harness.io.current_image, &negative.cut)
+        );
+        harness.io.local = 3;
+        harness.push_create(1);
+        let mut raw = harness.collect();
+        let (report, admitted) = harness.route(&mut raw);
+        let (collection, proof) = harness.ingest(raw, &admitted);
         let publisher = NativePublisher::build();
         let (row, control, _) = publisher.publish(&["0", "0", "0", "0", "1"]);
-        let result = observe_absence_birth(
-            &mut NativeBirthRows { row, control },
-            negative,
-            appearance,
-            &mut capture.router,
-            fixture.binding(),
-            fixture.attachment(),
-            &admitted,
-        );
-        assert!(
-            result.is_ok(),
-            "actual H0 birth must retain its first New: {result:?}"
+        let mut rows = NativeBirthRows { row, control };
+        let witness = harness.birth(report, &admitted, &proof, Some(negative), &mut rows);
+        assert_eq!(
+            witness.receipt().birth_cut(),
+            1,
+            "quiet ordinal <= genuine cut < affecting BEGIN ordinal 2"
         );
         assert_eq!(
-            capture.router.instances_minted(),
-            1,
-            "one original H0 incarnation"
+            harness.capture.router.instances_minted(),
+            2,
+            "old quiet incarnation never upgrades"
         );
+        assert_eq!(
+            harness.seal(
+                collection,
+                &witness,
+                &mut rows,
+                &mut crate::semantics_objects::ObjectSemantics::new()
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn joint_quiet_classification_rejects_foreign_repeated_and_child_positions() {
+        let mut harness = JointBirthHarness::new();
+        harness.push_ordinary(ImageIdentity::default());
+        let mut first = harness.collect();
+        let (_, first_admitted) = harness.route(&mut first);
+        // A second real H0 allocator in the same domain restarts at ordinal1;
+        // exact allocation provenance still rejects the identical wire bytes.
+        let mut foreign_capture = capture(&harness.io);
+        let mut foreign_adapter = JournalAdapter::with_ledger(
+            crate::semantics_objects::journal::JournalLimits::policy(),
+            crate::semantics_objects::journal::StagingLedger::with_resources(
+                harness.pool.reserver(),
+            ),
+        );
+        let foreign_events = crate::events::EventsDomain::test_standin(0xb101);
+        let foreign_producers = crate::attach::SessionDrainProducers::test_pair(
+            harness.io.domain,
+            foreign_events.clone(),
+        );
+        let mut foreign_drain = crate::events::EventDrain::over_domain(
+            crate::events::ScriptedRecords::records(
+                [crate::events::record_bytes(
+                    &harness.ordinary(ImageIdentity::default()),
+                )],
+                1,
+            ),
+            foreign_events,
+        );
+        let mut foreign_raw = crate::semantics_objects::journal::joint_driver::RawJointQuantum::collect_bounded_with_adapter(&mut foreign_drain, &harness.rows, 4_096, None, &BirthFault, &foreign_producers, |bytes| harness.pool.reserve(bytes), &mut foreign_adapter).unwrap();
+        let mut foreign_report = foreign_capture
+            .tick_collected_with(&mut harness.io, &mut foreign_raw)
+            .unwrap();
+        let call = match foreign_report.take_outcomes().pop().unwrap() {
+            TickOutcome::Call(call) => call,
+            _ => panic!("call"),
+        };
+        let foreign_admitted = harness.fixture.admit_collected(call);
+        assert_eq!(first_admitted.h0_ordinal(), foreign_admitted.h0_ordinal());
+        assert!(first.classify_ordinary(&foreign_admitted).is_err());
+        assert!(foreign_raw.classify_ordinary(&first_admitted).is_err());
+        first.classify_ordinary(&first_admitted).unwrap();
+        harness.ingest(first, &first_admitted);
+        let child = ImageIdentity {
+            task_cookie: 72,
+            exec_id: 0,
+        };
+        harness.push_ordinary(child);
+        let mut second = harness.collect();
+        let (_, second_admitted) = harness.route(&mut second);
+        assert!(second_admitted.h0_ordinal() > first_admitted.h0_ordinal());
+        assert!(
+            second.classify_ordinary(&first_admitted).is_err(),
+            "consumed same-shaped admission is foreign"
+        );
+        second.classify_ordinary(&second_admitted).unwrap();
+        harness.ingest(second, &second_admitted);
+        let cut = harness
+            .adapter
+            .resolve_birth_cut(
+                &harness.drain.consumption_cut().unwrap(),
+                &harness.producers,
+            )
+            .unwrap();
+        assert!(
+            harness
+                .adapter
+                .quiet_sighting_at(harness.io.current_image, &cut)
+        );
+        assert!(
+            !harness.adapter.quiet_sighting_at(child, &cut),
+            "fork-child sighting always affects"
+        );
+    }
+
+    #[test]
+    fn joint_birth_cut_requires_original_stream_prefix() {
+        let mut harness = JointBirthHarness::new();
+        let initial = harness.drain.consumption_cut().unwrap();
+        let mut raw = harness.collect();
+        harness
+            .capture
+            .tick_collected_with(&mut harness.io, &mut raw)
+            .unwrap();
+        // Unobserved movement is refused before the next collection consumes.
+        harness.push_ordinary(ImageIdentity::default());
+        harness.drain.poll(Some(1), |_| ControlFlow::Continue(()));
+        let remaining = harness.drain.source().remaining();
+        assert!(crate::semantics_objects::journal::joint_driver::RawJointQuantum::collect_bounded_with_adapter(&mut harness.drain, &harness.rows, 4_096, None, &BirthFault, &harness.producers, |bytes| harness.pool.reserve(bytes), &mut harness.adapter).is_err());
+        assert_eq!(harness.drain.source().remaining(), remaining);
+        let foreign = crate::events::EventDrain::over_domain(
+            crate::events::ScriptedRecords::records([], 0),
+            crate::events::EventsDomain::test_standin(harness.producers.events_id()),
+        );
+        assert!(
+            harness
+                .adapter
+                .resolve_birth_cut(&foreign.consumption_cut().unwrap(), &harness.producers)
+                .is_err()
+        );
+        assert!(
+            harness
+                .adapter
+                .resolve_birth_cut(&initial, &harness.producers)
+                .is_ok(),
+            "original boundary itself remains historical, never remapped to later movement"
+        );
+    }
+
+    #[test]
+    fn joint_birth_witness_refuses_replaced_custody_provider_native_and_fence() {
+        use crate::semantics_objects::journal::tests::{NativeBirthRows, NativePublisher};
+        let mut harness = JointBirthHarness::new();
+        harness.push_create(1);
+        let mut raw = harness.collect();
+        let (report, admitted) = harness.route(&mut raw);
+        let (_, proof) = harness.ingest(raw, &admitted);
+        let publisher = NativePublisher::build();
+        let closure = harness.fixture.attachment().generation();
+        let (row, control, _) = publisher.publish_stamped(&["0", "0"], closure);
+        let mut rows = NativeBirthRows { row, control };
+        let witness = harness.birth(report, &admitted, &proof, None, &mut rows);
+        let native = harness.io.domain;
+        harness.io.domain = NativeDomainId::mint();
+        assert!(
+            witness
+                .fresh_evidence_with(
+                    &mut harness.io,
+                    &mut rows,
+                    &mut harness.capture,
+                    harness.fixture.attachment(),
+                    harness.fixture.binding()
+                )
+                .is_err()
+        );
+        harness.io.domain = native;
+        let original_pin = harness.capture.bindings.get_mut(&71).unwrap().pin.clone();
+        harness.capture.bindings.get_mut(&71).unwrap().pin =
+            Arc::new(PidPin::open(original_pin.pid()).unwrap());
+        assert!(
+            witness
+                .fresh_evidence_with(
+                    &mut harness.io,
+                    &mut rows,
+                    &mut harness.capture,
+                    harness.fixture.attachment(),
+                    harness.fixture.binding()
+                )
+                .is_err(),
+            "same PID and scalar identity cannot replace the original Arc"
+        );
+        harness.capture.bindings.get_mut(&71).unwrap().pin = original_pin;
+        let other = harness.io.watched[1].share();
+        let original = std::mem::replace(&mut harness.io.watched[0], other);
+        assert!(
+            witness
+                .fresh_evidence_with(
+                    &mut harness.io,
+                    &mut rows,
+                    &mut harness.capture,
+                    harness.fixture.attachment(),
+                    harness.fixture.binding()
+                )
+                .is_err()
+        );
+        harness.io.watched[0] = original;
+        let (wrong, control, _) = publisher.publish_stamped(&["0", "0"], closure + 1);
+        let mut wrong_rows = NativeBirthRows {
+            row: wrong,
+            control,
+        };
+        assert_eq!(
+            witness.fresh_evidence_with(
+                &mut harness.io,
+                &mut wrong_rows,
+                &mut harness.capture,
+                harness.fixture.attachment(),
+                harness.fixture.binding()
+            ),
+            Err(crate::attach::BirthObservationRefusal::GenerationMismatch)
+        );
+        struct SlowRows<'a>(&'a mut NativeBirthRows);
+        impl crate::attach::BirthRowReader for SlowRows<'_> {
+            fn read_marker_row(
+                &mut self,
+            ) -> Result<p11scope_ebpf_common::InstanceRecord, crate::attach::BirthRowError>
+            {
+                std::thread::sleep(Duration::from_millis(60));
+                crate::attach::BirthRowReader::read_marker_row(self.0)
+            }
+            fn read_admission_control(
+                &mut self,
+            ) -> Result<p11scope_ebpf_common::JournalAdmissionControl, crate::attach::BirthRowError>
+            {
+                crate::attach::BirthRowReader::read_admission_control(self.0)
+            }
+        }
+        assert!(
+            witness
+                .fresh_evidence_with(
+                    &mut harness.io,
+                    &mut SlowRows(&mut rows),
+                    &mut harness.capture,
+                    harness.fixture.attachment(),
+                    harness.fixture.binding()
+                )
+                .is_err(),
+            "fresh native reads share one bounded window"
+        );
+        assert!(
+            witness
+                .fresh_evidence_with(
+                    &mut harness.io,
+                    &mut rows,
+                    &mut harness.capture,
+                    harness.fixture.attachment(),
+                    harness.fixture.binding()
+                )
+                .is_ok(),
+            "a later fresh read retains the original birth, not a renewed New"
+        );
+        harness.capture.audit_health(
+            Health {
+                fault: 1,
+                sticky: 0,
+            },
+            &mut TickReport::default(),
+        );
+        harness.io.last_health.fault = 1;
+        assert!(
+            witness
+                .fresh_evidence_with(
+                    &mut harness.io,
+                    &mut rows,
+                    &mut harness.capture,
+                    harness.fixture.attachment(),
+                    harness.fixture.binding()
+                )
+                .is_err(),
+            "an original fence never follows a fault-era move"
+        );
+    }
+
+    #[test]
+    fn joint_birth_cut_cannot_bridge_busy_discard_or_malformed_movement() {
+        use crate::events::{BoundedRecord, BoundedRecordSource, EventDrain, RecordSource};
+        use crate::semantics_objects::journal::joint_driver::RawJointQuantum;
+        use std::cell::Cell;
+        use std::rc::Rc;
+        struct GapSource {
+            queue: VecDeque<Vec<u8>>,
+            cursor: usize,
+            mode: Rc<Cell<u8>>,
+            discarded: u64,
+        }
+        impl RecordSource for GapSource {
+            fn next_record(&mut self) -> Option<impl std::ops::Deref<Target = [u8]> + '_> {
+                if let Some(record) = self.queue.pop_front() {
+                    self.cursor += 8;
+                    return Some(record);
+                }
+                match self.mode.get() {
+                    1 => {
+                        self.mode.set(0);
+                        self.cursor += 8;
+                        Some(vec![0])
+                    }
+                    2 => {
+                        self.mode.set(0);
+                        self.cursor += 8;
+                        self.discarded += 1;
+                        None
+                    }
+                    _ => None,
+                }
+            }
+            fn discarded(&self) -> u64 {
+                self.discarded
+            }
+        }
+        impl BoundedRecordSource for GapSource {
+            fn positions(&self) -> aya::maps::ring_buf::RingBufPositions {
+                aya::maps::ring_buf::RingBufPositions {
+                    consumer: self.cursor,
+                    producer: self.cursor
+                        + 8 * (self.queue.len() + usize::from(self.mode.get() != 0)),
+                    capacity: 4096,
+                }
+            }
+            fn consumer(&self) -> usize {
+                self.cursor
+            }
+            fn bounded_record(
+                &mut self,
+                stop: usize,
+            ) -> anyhow::Result<BoundedRecord<impl std::ops::Deref<Target = [u8]> + '_>>
+            {
+                if self.cursor == stop {
+                    return Ok(BoundedRecord::Reached);
+                }
+                let record = self.next_record().map(|record| record.to_vec());
+                Ok(match record {
+                    Some(record) => BoundedRecord::Item(record),
+                    None if self.cursor == stop => BoundedRecord::Reached,
+                    None => BoundedRecord::Pending,
+                })
+            }
+        }
+        for mode in 1..=3 {
+            let mut harness = JointBirthHarness::new();
+            let events = harness.drain.consumption_cut().unwrap().events().clone();
+            let switch = Rc::new(Cell::new(0));
+            let source = GapSource {
+                queue: VecDeque::from([crate::events::record_bytes(
+                    &harness.ordinary(ImageIdentity::default()),
+                )]),
+                cursor: 0,
+                mode: switch.clone(),
+                discarded: 0,
+            };
+            let mut drain = EventDrain::over_domain(source, events);
+            let mut quiet = RawJointQuantum::collect_bounded_with_adapter(
+                &mut drain,
+                &harness.rows,
+                4_096,
+                None,
+                &BirthFault,
+                &harness.producers,
+                |bytes| harness.pool.reserve(bytes),
+                &mut harness.adapter,
+            )
+            .unwrap();
+            let (_, admitted) = harness.route(&mut quiet);
+            quiet.classify_ordinary(&admitted).unwrap();
+            harness.ingest(quiet, &admitted);
+            let original = harness
+                .adapter
+                .resolve_birth_cut(&drain.consumption_cut().unwrap(), &harness.producers)
+                .unwrap();
+            switch.set(mode);
+            let stop = (mode == 3).then_some(16);
+            let mut raw = RawJointQuantum::collect_bounded_with_adapter(
+                &mut drain,
+                &harness.rows,
+                4_096,
+                stop,
+                &BirthFault,
+                &harness.producers,
+                |bytes| harness.pool.reserve(bytes),
+                &mut harness.adapter,
+            )
+            .unwrap();
+            let report = harness
+                .capture
+                .tick_collected_with(&mut harness.io, &mut raw)
+                .unwrap();
+            assert_eq!(report.calls().count(), 0);
+            let (audit, _) = harness.ingest(raw, &admitted);
+            assert!(
+                audit.counter_error || audit.malformed_delta != 0 || audit.discarded_delta != 0
+            );
+            assert!(
+                !harness.adapter.accepts_birth_cut(&original),
+                "no clean prefix after mode {mode}"
+            );
+            switch.set(0);
+            assert!(
+                harness
+                    .adapter
+                    .resolve_birth_cut(&drain.consumption_cut().unwrap(), &harness.producers)
+                    .is_err(),
+                "later healthy reads cannot heal the missing stream at mode {mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn joint_birth_recheck_keeps_pending_original_for_actual_h0_publication() {
+        use crate::semantics_objects::journal::tests::{NativeBirthRows, NativePublisher};
+        let mut harness = JointBirthHarness::new();
+        harness.push_create(1);
+        let mut raw = harness.collect();
+        let (report, admitted) = harness.route(&mut raw);
+        let (_, proof) = harness.ingest(raw, &admitted);
+        let publisher = NativePublisher::build();
+        let (row, control, _) =
+            publisher.publish_stamped(&["0", "0"], harness.fixture.attachment().generation());
+        let mut rows = NativeBirthRows { row, control };
+        let witness = harness.birth(report, &admitted, &proof, None, &mut rows);
+        let mut pending_record = harness.ordinary(ImageIdentity::default());
+        pending_record.event.image.task_cookie = 72;
+        harness
+            .drain
+            .source_mut()
+            .push_record(crate::events::record_bytes(&pending_record));
+        harness.io.fail_cookie = Some(72);
+        let mut pending_raw = harness.collect();
+        let pending = harness
+            .capture
+            .tick_collected_with(&mut harness.io, &mut pending_raw)
+            .unwrap();
+        let position = pending.awaiting_floor().expect("original pending position");
+        assert_eq!(pending.calls().count(), 0);
+        assert_eq!(harness.capture.awaiting.len(), 1);
+        harness.io.last_health.fault = 1;
+        assert!(
+            witness
+                .fresh_evidence_with(
+                    &mut harness.io,
+                    &mut rows,
+                    &mut harness.capture,
+                    harness.fixture.attachment(),
+                    harness.fixture.binding()
+                )
+                .is_err()
+        );
+        assert!(
+            harness.capture.awaiting.contains_key(&position),
+            "a birth read must not consume pending originals into a temporary report"
+        );
+        let mut resolved = harness
+            .capture
+            .tick_collected_with(&mut harness.io, &mut pending_raw)
+            .unwrap();
+        assert_eq!(
+            resolved.calls().count(),
+            1,
+            "actual H0 publishes the original exactly once"
+        );
+        let call = resolved.calls().next().unwrap();
+        assert_eq!(call.position(), Some(position));
+        assert_eq!(
+            crate::events::record_bytes(call.record()),
+            crate::events::record_bytes(&pending_record)
+        );
+        assert!(
+            resolved
+                .take_outcomes()
+                .iter()
+                .any(TickOutcome::is_invalidation)
+        );
+        assert!(harness.capture.awaiting.is_empty());
     }
 
     /// H7 slice D activation: mixed ordinary/lifecycle/object records flow

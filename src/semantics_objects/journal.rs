@@ -239,6 +239,7 @@ pub(crate) fn abandon_disposition(reason: u32) -> Option<AbandonDisposition> {
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::mem::size_of;
 
+use p11scope_ebpf_common::ImageIdentity;
 use p11scope_ebpf_common::MAX_DESCRIPTORS;
 use p11scope_ebpf_common::capture;
 use p11scope_ebpf_common::object_journal::{
@@ -253,6 +254,7 @@ use super::{
     ObjectEffects, ObjectGap, ObjectSemantics, OriginFact, QueryStatus, RefCut, ResultSlot,
     SessionHandle,
 };
+use crate::attach::capture::NativeDomainId;
 use crate::discovery::caller_registry::instance_input::AdmittedInstanceCall;
 
 // ---------------------------------------------------------------------------
@@ -371,6 +373,23 @@ pub(crate) struct CallFingerprint {
     pub(crate) user_type: u32,
 }
 
+fn fingerprint_matches_event(
+    fingerprint: &CallFingerprint,
+    event: &p11scope_ebpf_common::Event,
+) -> bool {
+    fingerprint.image == (event.image.task_cookie, event.image.exec_id)
+        && fingerprint.pid_tgid == event.pid_tgid
+        && event.duration_ns != 0
+        && Some(fingerprint.entry_ns) == event.ts_ns.checked_sub(event.duration_ns)
+        && fingerprint.slot == event.slot
+        && fingerprint.session == event.session
+        && fingerprint.mechanism == event.mechanism
+        && fingerprint.capture == event.capture
+        && fingerprint.slot_id == event.slot_id
+        && fingerprint.flags == event.flags
+        && fingerprint.user_type == event.user_type
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct AdmittedJournalClaim {
     admission: u64,
@@ -393,6 +412,14 @@ enum CallAttribution {
 }
 
 impl JournalDomainProof {
+    pub(crate) fn matches_admitted(&self, admitted: &AdmittedInstanceCall) -> bool {
+        let (native, image, router, caller) = admitted.journal_binding();
+        self.key.domain_tag == native.journal_tag()
+            && self.key.cookie == image.task_cookie
+            && self.key.exec == image.exec_id
+            && self.key.router == router.get()
+            && self.key.caller == caller.0
+    }
     pub(in crate::semantics_objects) fn domain(&self) -> ObjectDomain {
         ObjectDomain::from_sealed_parts(
             u64::from(self.key.caller),
@@ -692,6 +719,8 @@ impl std::fmt::Debug for JournalIngestItem {
 pub(crate) struct JournalAdapter {
     limits: JournalLimits,
     consumed_through: u64,
+    stream_boundary: Option<crate::events::EventsConsumptionCut>,
+    stream_broken: bool,
     open: BTreeMap<JournalNativeKey, OpenEntry>,
     floors: BTreeMap<u64, u64>,
     /// One ordered Session EVENTS/boot-clock namespace. Non-evicted
@@ -763,6 +792,8 @@ impl JournalAdapter {
         Self {
             limits,
             consumed_through: 0,
+            stream_boundary: None,
+            stream_broken: false,
             open: BTreeMap::new(),
             floors: BTreeMap::new(),
             physical_return_floors: BTreeMap::new(),
@@ -819,10 +850,7 @@ impl JournalAdapter {
         producers: &crate::attach::SessionDrainProducers,
     ) -> bool {
         match &self.resource_producers {
-            Some(retained) => {
-                retained.native_domain() == producers.native_domain()
-                    && retained.events_id() == producers.events_id()
-            }
+            Some(retained) => retained.same_producers(producers),
             None => {
                 self.resource_producers = Some(producers.clone());
                 true
@@ -853,13 +881,17 @@ impl JournalAdapter {
     /// corroborate an open key's synchronous return; journal records match
     /// terminally against retained wire truth.
     pub(crate) fn ingest_any(&mut self, item: JournalIngestItem) -> JournalDisposition {
-        self.ingest_any_from_raw(item, None)
+        // Direct fixtures/legacy consumers have no cursor-to-ordinal proof.
+        // Never permit a later real cut to backfill that missing prefix.
+        self.stream_broken = true;
+        self.ingest_any_from_raw(item, None, false)
     }
 
     fn ingest_any_from_raw(
         &mut self,
         item: JournalIngestItem,
         resource: Option<ledger::ExistingReservation>,
+        proved_irrelevant: bool,
     ) -> JournalDisposition {
         let Some(next) = self.consumed_through.checked_add(1) else {
             self.invalidated = true;
@@ -903,11 +935,7 @@ impl JournalAdapter {
                     // affecting; the acting image counts only when its
                     // function is not proved irrelevant (unclassified is
                     // suspect).
-                    (*image == child && child != (0, 0))
-                        || !matches!(
-                            endpoint_class(event.target_function),
-                            Some(EndpointClass::ProvedIrrelevant)
-                        )
+                    (*image == child && child != (0, 0)) || !proved_irrelevant
                 }
             };
             if !self.note_sighting(*image, affecting, next) {
@@ -2336,6 +2364,104 @@ impl SessionBirthEvidence {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct BirthStreamBinding {
+    native: NativeDomainId,
+    events: u64,
+    cursor: u64,
+    ledger: ledger::LedgerGeneration,
+}
+impl std::fmt::Debug for BirthStreamBinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BirthStreamBinding(<private>)")
+    }
+}
+
+/// Only the owning adapter resolves an actual original cursor boundary.
+#[derive(Clone, Debug)]
+pub(crate) struct JournalBirthCut {
+    binding: BirthStreamBinding,
+    ordinal: ConsumptionOrdinal,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BirthCutRefusal {
+    Foreign,
+    Prefix,
+    Gap,
+    Ledger,
+}
+
+impl JournalAdapter {
+    pub(crate) fn resolve_birth_cut(
+        &mut self,
+        cut: &crate::events::EventsConsumptionCut,
+        producers: &crate::attach::SessionDrainProducers,
+    ) -> Result<JournalBirthCut, BirthCutRefusal> {
+        let ledger = self.ledger.generation().ok_or(BirthCutRefusal::Ledger)?;
+        if !producers.matches_events(cut.events())
+            || !self
+                .resource_producers
+                .as_ref()
+                .is_some_and(|retained| retained.same_producers(producers))
+        {
+            return Err(BirthCutRefusal::Foreign);
+        }
+        if self.stream_broken || self.invalidated || self.stopped {
+            return Err(BirthCutRefusal::Gap);
+        }
+        match &self.stream_boundary {
+            Some(boundary) if boundary.same_boundary(cut) => {}
+            None if self.consumed_through == 0 && cut.is_initial() => {
+                self.stream_boundary = Some(cut.clone());
+            }
+            _ => return Err(BirthCutRefusal::Prefix),
+        }
+        Ok(JournalBirthCut {
+            binding: BirthStreamBinding {
+                native: producers.native_domain(),
+                events: producers.events_id(),
+                cursor: cut.cursor(),
+                ledger,
+            },
+            ordinal: self.consumed_frontier(),
+        })
+    }
+
+    pub(crate) fn accepts_birth_cut(&self, cut: &JournalBirthCut) -> bool {
+        !self.stream_broken
+            && !self.invalidated
+            && !self.stopped
+            && self.ledger.generation() == Some(cut.binding.ledger)
+            && cut.ordinal.0 <= self.consumed_through
+            && self.stream_boundary.as_ref().is_some_and(|boundary| {
+                boundary.cursor() == cut.binding.cursor
+                    && boundary.events().id() == cut.binding.events
+            })
+            && self.resource_producers.as_ref().is_some_and(|producers| {
+                producers.native_domain() == cut.binding.native
+                    && producers.events_id() == cut.binding.events
+            })
+    }
+
+    pub(crate) fn quiet_sighting_at(&self, image: ImageIdentity, cut: &JournalBirthCut) -> bool {
+        self.accepts_birth_cut(cut)
+            && self
+                .sightings
+                .get(&(image.task_cookie, image.exec_id))
+                .is_some_and(|sighting| {
+                    sighting.first_seen <= cut.ordinal.0
+                        && sighting.first_affecting.is_none_or(|at| at > cut.ordinal.0)
+                })
+    }
+}
+
+impl JournalBirthCut {
+    pub(crate) fn same_stream(&self, other: &Self) -> bool {
+        self.binding == other.binding
+    }
+}
+
 /// A Session-owned birth grant: the claimed proof, birth kind, cut and
 /// closure generation, plus the Session-observed native evidence the
 /// claim was attested under (exec marker publication/readback or
@@ -2351,6 +2477,7 @@ pub(crate) struct SessionBirthGrant {
     birth_cut: u64,
     closure_generation: u64,
     evidence: SessionBirthEvidence,
+    stream: Option<BirthStreamBinding>,
 }
 
 impl SessionBirthGrant {
@@ -2364,17 +2491,30 @@ impl SessionBirthGrant {
         _token: &crate::attach::SessionGrantToken,
         proof: JournalDomainProof,
         birth: BirthKind,
-        birth_cut: u64,
+        birth_cut: &JournalBirthCut,
         closure_generation: u64,
         evidence: SessionBirthEvidence,
     ) -> Self {
         Self {
             proof,
             birth,
-            birth_cut,
+            birth_cut: birth_cut.ordinal.0,
             closure_generation,
             evidence,
+            stream: Some(birth_cut.binding),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn issue_for_native_row_test(
+        _token: &crate::attach::SessionGrantToken,
+        proof: JournalDomainProof,
+        birth: BirthKind,
+        birth_cut: u64,
+        closure_generation: u64,
+        evidence: SessionBirthEvidence,
+    ) -> Self {
+        Self::scripted_with_evidence(proof, birth, birth_cut, closure_generation, evidence)
     }
 
     #[cfg(test)]
@@ -2391,6 +2531,7 @@ impl SessionBirthGrant {
             birth_cut,
             closure_generation,
             evidence: SessionBirthEvidence::scripted_canonical(image, birth, closure_generation),
+            stream: None,
         }
     }
 
@@ -2408,6 +2549,7 @@ impl SessionBirthGrant {
             birth_cut,
             closure_generation,
             evidence,
+            stream: None,
         }
     }
 }
@@ -2515,6 +2657,15 @@ impl BootstrapReceipt {
     ) -> Result<Self, BirthRefusal> {
         if grant.closure_generation != adapter.closure_generation {
             return Err(BirthRefusal::ClosureStale);
+        }
+        if let Some(stream) = grant.stream
+            && (stream.native.journal_tag() != grant.proof.key.domain_tag
+                || !adapter.accepts_birth_cut(&JournalBirthCut {
+                    binding: stream,
+                    ordinal: ConsumptionOrdinal(grant.birth_cut),
+                }))
+        {
+            return Err(BirthRefusal::EvidenceMismatch);
         }
         let fenced_through = adapter
             .keys
@@ -2857,16 +3008,16 @@ impl JournalAdapter {
         true
     }
 
-    /// Bind one H3-admitted call's incarnation to a journal key: the exact
+    /// Bind one H3-admitted call's incarnation to a journal key without
+    /// claiming the invocation before its original START is ingested: exact
     /// native domain, caller, image and router, plus the adapter-tracked
     /// era. Re-attestation after a fault-void returns the live key; a
     /// tainted image or a full key table refuses. A second live key for
     /// an image whose key already converted refuses: sole-key
-    /// attributions cannot be re-examined. An admitted modeled call
-    /// also claims its fingerprint for per-call conversion authority.
+    /// attributions cannot be re-examined.
     /// Birth and closure are verified on top of this binding by
     /// [`BootstrapReceipt::attest`].
-    pub(crate) fn attest_key(
+    pub(crate) fn bind_admitted_key(
         &mut self,
         admitted: &AdmittedInstanceCall,
     ) -> Result<JournalDomainProof, AttestationRefusal> {
@@ -2902,6 +3053,18 @@ impl JournalAdapter {
                 .or_default()
                 .push(key);
         }
+        let era = self.keys[&key].era;
+        Ok(JournalDomainProof { key, era })
+    }
+
+    /// Preserve normal attestation semantics: bind the key, then claim this
+    /// actual modeled invocation once its original raw history is ingested.
+    pub(crate) fn attest_key(
+        &mut self,
+        admitted: &AdmittedInstanceCall,
+    ) -> Result<JournalDomainProof, AttestationRefusal> {
+        let proof = self.bind_admitted_key(admitted)?;
+        let key = proof.key;
         if let Some(fingerprint) = admitted.journal_call_fingerprint()
             && endpoint_class(fingerprint.function) == Some(EndpointClass::ModeledAffecting)
         {
@@ -3328,6 +3491,14 @@ impl JournalAdapter {
         // under a replaced endpoint set proves nothing under this one.
         if bootstrap.closure_generation() != self.closure_generation {
             return Err(self.failure(JournalGap::ClosureStale));
+        }
+        if let Some(stream) = bootstrap.grant.stream
+            && !self.accepts_birth_cut(&JournalBirthCut {
+                binding: stream,
+                ordinal: ConsumptionOrdinal(bootstrap.birth_cut()),
+            })
+        {
+            return Err(self.failure(JournalGap::BootstrapMismatch));
         }
         // Pull one fresh birth observation: the seal never receives a
         // reusable evidence value. A failed take refuses (the next tick
@@ -6168,6 +6339,22 @@ pub(crate) mod tests {
                 .ingest_any(JournalIngestItem::Ordinary(decoded))
         }
 
+        /// Lower-level ordinal/chain algorithm input only. The actual H0
+        /// admission/cut acceptance is exercised by the retained-birth rig.
+        fn ingest_algorithm_quiet(&mut self, event: Event) -> JournalDisposition {
+            let decoded = crate::events::DecodedEventRecord {
+                joint_resource: None,
+                base: crate::semantic_capture::event_record_with_routing(
+                    event,
+                    InstanceStamp::default(),
+                    0,
+                ),
+                object: None,
+            };
+            self.adapter
+                .ingest_any_from_raw(JournalIngestItem::Ordinary(decoded), None, true)
+        }
+
         fn audit(&mut self) -> JournalAuditReceipt {
             self.prepare_claims();
             JournalAuditReceipt::scripted(
@@ -8170,12 +8357,10 @@ pub(crate) mod tests {
         // and seals the later affecting call.
         let mut scene = Scene::new(image_default());
         let proof = scene.attest();
-        let getinfo = function_id("C_GetInfo");
         let begin = begin_bytes(1, 1, create, 0);
         let mut seen = ordinary_for(&begin, 0);
         seen.slot = 99;
-        seen.target_function = getinfo;
-        scene.ingest_ordinary(seen);
+        scene.ingest_algorithm_quiet(seen);
         scene.ingest(&begin);
         BootstrapReceipt::attest(
             &scene.adapter,
@@ -8312,12 +8497,10 @@ pub(crate) mod tests {
         let mut scene = Scene::new(image_default());
         let proof = scene.attest();
         let create = function_id("C_CreateObject");
-        let getinfo = function_id("C_GetInfo");
         let begin = begin_bytes(1, 1, create, 0);
         let mut seen = ordinary_for(&begin, 0);
         seen.slot = 99;
-        seen.target_function = getinfo;
-        scene.ingest_ordinary(seen);
+        scene.ingest_algorithm_quiet(seen);
         scene.ingest(&begin);
         scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
         let pending = JournalAuditReceipt::scripted_h0(
@@ -8397,9 +8580,8 @@ pub(crate) mod tests {
         let begin = begin_bytes(1, 1, create, 0);
         let mut fork = ordinary_for(&begin, 0);
         fork.slot = 99;
-        fork.target_function = getinfo;
         fork.child_image = child_image;
-        scene.ingest_ordinary(fork);
+        scene.ingest_algorithm_quiet(fork);
         assert_eq!(
             BootstrapReceipt::attest(
                 &scene.adapter,
@@ -9325,13 +9507,11 @@ pub(crate) mod tests {
         let mut scene = Scene::new(image_default());
         let proof = scene.attest();
         let create = function_id("C_CreateObject");
-        let getinfo = function_id("C_GetInfo");
         let template = begin_bytes(1, 1, create, 0);
         for _ in 1..=5u64 {
             let mut seen = ordinary_for(&template, 0);
             seen.slot = 99;
-            seen.target_function = getinfo;
-            scene.ingest_ordinary(seen);
+            scene.ingest_algorithm_quiet(seen);
         }
         let begin = begin_bytes(1, 1, create, 0);
         scene.ingest(&begin);
@@ -9563,15 +9743,13 @@ pub(crate) mod tests {
         let mut scene = Scene::new(image_default());
         let proof = scene.attest();
         let create = function_id("C_CreateObject");
-        let getinfo = function_id("C_GetInfo");
         let begin = begin_bytes(1, 1, create, 0);
         // Ordinal 1 observes the image without affecting it (proved
         // irrelevant), so absence can birth at cut 1; the BEGIN at 2
         // keeps exec novel only at cut 0.
         let mut seen = ordinary_for(&begin, 0);
         seen.slot = 99;
-        seen.target_function = getinfo;
-        scene.ingest_ordinary(seen);
+        scene.ingest_algorithm_quiet(seen);
         scene.ingest(&begin);
         let image = (COOKIE, EXEC);
         let ready = ready_word(EXEC);
@@ -10017,6 +10195,37 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn joint_key_binding_precedes_ingest_without_claiming_original_start() {
+        let mut scene = Scene::new(image_default());
+        let begin = begin_bytes(1, 1, function_id("C_CreateObject"), 0);
+        let end = end_bytes(
+            &begin,
+            p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE,
+            0,
+            ENTRY_NS + 100,
+        );
+        let JournalRecord::End(end) = decode_journal_record(&end, &scene.descriptors).unwrap()
+        else {
+            panic!("END");
+        };
+        let admitted = scene
+            .fixture
+            .admit_original_event("C_CreateObject", end.payload_base().event);
+        let proof = scene.adapter.bind_admitted_key(&admitted).unwrap();
+        assert_eq!(
+            scene.adapter.claim_counts, 0,
+            "binding grants no invocation claim"
+        );
+        assert!(scene.adapter.open.is_empty());
+        scene.ingest(&begin);
+        assert_eq!(scene.adapter.attest_key(&admitted).unwrap(), proof);
+        assert_eq!(
+            scene.adapter.claim_counts, 1,
+            "normal attestation claims after the original START"
+        );
+    }
+
+    #[test]
     fn object_journal_session_exec_birth_observes_genuine_producers() {
         // C1: Session-owned exec-marker birth end to end with zero
         // scripted birth constructors. Observation pulls the genuine
@@ -10061,7 +10270,7 @@ pub(crate) mod tests {
             evidence.custody(),
             scene.fixture.binding().pin().start_time().unwrap()
         );
-        let grant = SessionBirthGrant::issue(
+        let grant = SessionBirthGrant::issue_for_native_row_test(
             &token,
             proof,
             BirthKind::ExecMarker,
@@ -10354,109 +10563,9 @@ pub(crate) mod tests {
 
     #[test]
     fn object_journal_session_absence_birth_seals_on_quiet_history() {
-        // C1: absence observation over a natively unmarked row issues;
-        // the grant attests an absence birth over quiet history and
-        // seals on fresh re-observation (fresh native bytes, a fresh
-        // negative, a fresh appearance, a fresh router — never the
-        // first pass's words). The witness is a committed
-        // provider-free interval after the closure, followed by a
-        // full mapping at advanced epochs — never disjoint positives.
-        use crate::attach::observe_absence_birth;
-        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
-
-        let publisher = NativePublisher::build();
-        let mut scene = Scene::new(image_default());
-        let paired_begin = begin_bytes(1, 1, function_id("C_CreateObject"), 0);
-        let paired_end = end_bytes(&paired_begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50);
-        let JournalRecord::End(paired_end) =
-            decode_journal_record(&paired_end, &scene.descriptors).unwrap()
-        else {
-            panic!("paired END")
-        };
-        let admitted = scene
-            .fixture
-            .admit_original_event("C_CreateObject", paired_end.payload_base().event);
-        let proof = scene.adapter.attest_key(&admitted).expect("key attests");
-        let (domain, _, _, _) = admitted.journal_binding();
-        let full = scan_ranges_full();
-        let mut router = scan_router(domain);
-        let (row, control, _) = publisher.publish(&["0", "0", "0", "0", "1"]);
-        let mut rows = NativeBirthRows { row, control };
-        let closure = scene.closure_generation();
-        let (token, evidence) = observe_absence_birth(
-            &mut rows,
-            absence_proof(
-                domain,
-                COOKIE,
-                SCAN_FILE,
-                0,
-                closure,
-                absence_entries_free(),
-                0,
-            ),
-            scan_proof(domain, COOKIE, SCAN_FILE, 1, full.clone(), 0),
-            &mut router,
-            scene.fixture.binding(),
-            scene.fixture.attachment(),
-            &admitted,
-        )
-        .expect("unmarked row observes");
-        assert_eq!(evidence.marker_word(), 0);
-        assert_eq!(evidence.image(), (COOKIE, EXEC));
-        assert_eq!(evidence.attach_generation(), closure);
-        assert_eq!(
-            evidence.custody(),
-            scene.fixture.binding().pin().start_time().unwrap()
-        );
-        let grant = SessionBirthGrant::issue(
-            &token,
-            proof,
-            BirthKind::AbsenceAppearance,
-            1,
-            scene.closure_generation(),
-            evidence,
-        );
-        let create = function_id("C_CreateObject");
-        let getinfo = function_id("C_GetInfo");
-        let template = begin_bytes(1, 1, create, 0);
-        let mut seen = ordinary_for(&template, 0);
-        seen.slot = 99;
-        seen.target_function = getinfo;
-        scene.ingest_ordinary(seen);
-        let begin = begin_bytes(1, 1, create, 0);
-        scene.ingest(&begin);
-        let birth =
-            BootstrapReceipt::attest(&scene.adapter, &grant).expect("quiet life attests absence");
-        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
-        let (fresh_row, fresh_control, _) = publisher.publish(&["0", "0", "0", "0", "1"]);
-        let mut fresh_rows = NativeBirthRows {
-            row: fresh_row,
-            control: fresh_control,
-        };
-        let mut fresh_router = scan_router(domain);
-        let (_, fresh) = observe_absence_birth(
-            &mut fresh_rows,
-            absence_proof(
-                domain,
-                COOKIE,
-                SCAN_FILE,
-                0,
-                closure,
-                absence_entries_free(),
-                0,
-            ),
-            scan_proof(domain, COOKIE, SCAN_FILE, 1, full.clone(), 0),
-            &mut fresh_router,
-            scene.fixture.binding(),
-            scene.fixture.attachment(),
-            &admitted,
-        )
-        .expect("fresh words re-observe");
-        let frontier = scene.adapter.consumed_frontier();
-        let audit = scene.audit();
-        scene
-            .seal_explicit(&audit, &birth, frontier, fresh)
-            .expect("observed absence seals");
+        // Same native-positive selector now exercises actual collected H0,
+        // the earlier genuine absence/cut and one retained witness.
+        crate::semantic_capture::assert_actual_absence_birth_fixture();
     }
 
     #[test]
@@ -10974,7 +11083,7 @@ pub(crate) mod tests {
             &admitted,
         )
         .expect("genuine producers observe");
-        let grant = SessionBirthGrant::issue(
+        let grant = SessionBirthGrant::issue_for_native_row_test(
             &token,
             proof,
             BirthKind::ExecMarker,

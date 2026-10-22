@@ -98,6 +98,7 @@ impl AdmittedInstanceCall {
             journal_invocation: None,
             object: None,
             joint_resource: None,
+            collected_origin: None,
         }
     }
 }
@@ -242,6 +243,7 @@ pub(crate) struct AdmittedInstanceCall {
     /// Opaque bookkeeping carried from the same original END. It is never
     /// consulted to decide admission, coverage or semantic attribution.
     joint_resource: Option<JointResourceOrigin>,
+    collected_origin: Option<crate::semantics_objects::journal::joint_driver::CollectedCallOrigin>,
 }
 
 impl fmt::Debug for AdmittedInstanceCall {
@@ -291,6 +293,12 @@ impl AdmittedInstanceCall {
     /// feed child reads this.
     pub(crate) fn h0_ordinal(&self) -> u64 {
         self.position.ordinal
+    }
+
+    pub(crate) fn collected_origin(
+        &self,
+    ) -> Option<crate::semantics_objects::journal::joint_driver::CollectedCallOrigin> {
+        self.collected_origin
     }
 
     /// Journal per-call authority (H8): this admitted call's
@@ -1750,6 +1758,7 @@ pub(crate) struct CallEvidence {
     /// routed call. No raw-value Debug: the redacted `Debug` below stays.
     object: Option<ValidatedObjectCall>,
     joint_resource: Option<JointResourceOrigin>,
+    collected_origin: Option<crate::semantics_objects::journal::joint_driver::CollectedCallOrigin>,
 }
 
 impl std::fmt::Debug for CallEvidence {
@@ -1771,6 +1780,7 @@ impl CallEvidence {
         let endpoint = call.endpoint();
         let event = call.record().event;
         let joint_resource = call.joint_resource();
+        let collected_origin = call.collected_origin();
         let object = call.into_object_tail();
         Some(Self {
             domain,
@@ -1781,6 +1791,7 @@ impl CallEvidence {
             event,
             object,
             joint_resource,
+            collected_origin,
         })
     }
 
@@ -1809,6 +1820,7 @@ impl CallEvidence {
             event,
             object: None,
             joint_resource: None,
+            collected_origin: None,
         }
     }
 
@@ -2016,6 +2028,7 @@ pub(crate) fn admit_call_from_evidence(
         },
         permission,
         journal_invocation: JournalInvocationIdentity::from_event(&evidence.event),
+        collected_origin: evidence.collected_origin,
         object,
         joint_resource: evidence
             .joint_resource
@@ -2303,6 +2316,7 @@ mod reference {
             journal_invocation: None,
             object: None,
             joint_resource: None,
+            collected_origin: None,
         }
     }
     pub(crate) enum Scope {

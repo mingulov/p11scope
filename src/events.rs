@@ -19,6 +19,8 @@ use p11scope_ebpf_common::{
 };
 use std::mem::size_of;
 use std::ops::{ControlFlow, Deref};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     num::NonZeroU64,
     os::fd::{AsFd, BorrowedFd, OwnedFd},
@@ -581,6 +583,108 @@ pub struct EventDrain<S> {
     domain: Option<EventsDomain>,
     trace_tap: Option<crate::attach::detailed_identity::ProofTap>,
     object_transport: Option<ObjectTransportRows>,
+    cut_lineage: OnceLock<Option<u64>>,
+}
+
+static NEXT_EVENTS_CURSOR: AtomicU64 = AtomicU64::new(0);
+
+/// A snapshot of this retained consumer, never a timestamp or record count.
+/// Cloning retains the same EVENTS allocation and original cursor lineage.
+#[derive(Clone)]
+pub(crate) struct EventsConsumptionCut {
+    events: EventsDomain,
+    cursor: u64,
+    consumer: usize,
+    producer: usize,
+    malformed: u64,
+    discarded: u64,
+}
+
+impl std::fmt::Debug for EventsConsumptionCut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("EventsConsumptionCut(<private>)")
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EventsCutRefusal {
+    Untracked,
+    Exhausted,
+    Positions,
+}
+
+impl EventsConsumptionCut {
+    pub(crate) fn same_boundary(&self, other: &Self) -> bool {
+        self.same_cursor(other)
+            && self.consumer == other.consumer
+            && self.malformed == other.malformed
+            && self.discarded == other.discarded
+    }
+    fn same_cursor(&self, other: &Self) -> bool {
+        self.events.same_allocation(&other.events) && self.cursor == other.cursor
+    }
+    pub(crate) fn clean_successor_of(&self, before: &Self) -> bool {
+        self.same_cursor(before)
+            && self.consumer >= before.consumer
+            && self.malformed == before.malformed
+            && self.discarded == before.discarded
+    }
+    pub(crate) fn is_initial(&self) -> bool {
+        self.consumer == 0 && self.malformed == 0 && self.discarded == 0
+    }
+    pub(crate) fn is_drained(&self) -> bool {
+        self.consumer == self.producer
+    }
+    pub(crate) fn events(&self) -> &EventsDomain {
+        &self.events
+    }
+    pub(crate) fn cursor(&self) -> u64 {
+        self.cursor
+    }
+}
+
+#[allow(private_bounds)] // Only crate-private cut methods use this private reader seam.
+impl<S: BoundedRecordSource> EventDrain<S> {
+    pub(crate) fn consumption_cut(&self) -> Result<EventsConsumptionCut, EventsCutRefusal> {
+        let events = self.domain.as_ref().ok_or(EventsCutRefusal::Untracked)?;
+        let positions = self.source.positions();
+        if positions.consumer != self.source.consumer()
+            || !positions.consumer.is_multiple_of(8)
+            || !positions.producer.is_multiple_of(8)
+            || positions.capacity == 0
+            || !positions.capacity.is_power_of_two()
+            || positions
+                .producer
+                .checked_sub(positions.consumer)
+                .is_none_or(|unread| unread > positions.capacity)
+            || positions.consumer == usize::MAX
+            || positions.producer == usize::MAX
+        {
+            return Err(EventsCutRefusal::Positions);
+        }
+        if self.malformed == u64::MAX || self.source.discarded() == u64::MAX {
+            return Err(EventsCutRefusal::Exhausted);
+        }
+        let cursor = self
+            .cut_lineage
+            .get_or_init(|| {
+                NEXT_EVENTS_CURSOR
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+                        last.checked_add(1)
+                    })
+                    .ok()
+                    .map(|last| last + 1)
+            })
+            .ok_or(EventsCutRefusal::Exhausted)?;
+        Ok(EventsConsumptionCut {
+            events: events.clone(),
+            cursor,
+            consumer: positions.consumer,
+            producer: positions.producer,
+            malformed: self.malformed,
+            discarded: self.source.discarded(),
+        })
+    }
 }
 
 impl OwnedDrain {
@@ -616,6 +720,7 @@ impl OwnedDrain {
             domain: Some(domain.clone()),
             trace_tap: None,
             object_transport: None,
+            cut_lineage: OnceLock::new(),
         })
     }
 
@@ -656,12 +761,17 @@ impl<S: RecordSource> EventDrain<S> {
             domain: None,
             trace_tap: None,
             object_transport: None,
+            cut_lineage: OnceLock::new(),
         }
     }
 
     #[cfg(test)]
     pub(crate) fn source(&self) -> &S {
         &self.source
+    }
+    #[cfg(test)]
+    pub(crate) fn source_mut(&mut self) -> &mut S {
+        &mut self.source
     }
 
     #[cfg(test)]
@@ -673,6 +783,7 @@ impl<S: RecordSource> EventDrain<S> {
             domain: Some(domain),
             trace_tap: None,
             object_transport: None,
+            cut_lineage: OnceLock::new(),
         }
     }
     #[cfg(test)]
@@ -1349,6 +1460,9 @@ impl ScriptedRecords {
     pub(crate) fn push_event(&mut self, event: &Event) {
         self.queue.push_back(event_bytes(event));
     }
+    pub(crate) fn push_record(&mut self, record: Vec<u8>) {
+        self.queue.push_back(record);
+    }
 }
 
 #[cfg(test)]
@@ -1734,6 +1848,47 @@ mod runtime_tests;
 mod tests {
     use super::*;
     use p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT;
+
+    #[test]
+    fn joint_consumption_cut_keeps_original_cursor_identity() {
+        let events = EventsDomain::test_standin(0xb110);
+        let mut first =
+            EventDrain::over_domain(ScriptedRecords::records([vec![0]], 1), events.clone());
+        let second = EventDrain::over_domain(ScriptedRecords::records([], 0), events);
+        let before = first.consumption_cut().unwrap();
+        let foreign = second.consumption_cut().unwrap();
+        assert!(!before.same_boundary(&foreign), "one map is not one cursor");
+        assert!(before.is_initial());
+        first.poll(Some(1), |_| panic!("malformed bytes"));
+        let after = first.consumption_cut().unwrap();
+        assert!(!before.same_boundary(&after));
+        assert!(
+            !after.clean_successor_of(&before),
+            "malformed movement is a gap"
+        );
+        assert!(matches!(
+            EventDrain::over(ScriptedRecords::records([], 0)).consumption_cut(),
+            Err(EventsCutRefusal::Untracked)
+        ));
+    }
+
+    #[test]
+    fn joint_consumption_cut_refuses_invalid_and_exhausted_snapshots() {
+        for (consumer, producer) in [(16, 8), (0, 4097), (1, 8), (0, usize::MAX)] {
+            let drain =
+                EventDrain::over_test_domain(PendingHeadRecords { consumer, producer }, 0xb111);
+            assert!(matches!(
+                drain.consumption_cut(),
+                Err(EventsCutRefusal::Positions)
+            ));
+        }
+        let mut drain = EventDrain::over_test_domain(ScriptedRecords::records([], 0), 0xb112);
+        drain.malformed = u64::MAX;
+        assert!(matches!(
+            drain.consumption_cut(),
+            Err(EventsCutRefusal::Exhausted)
+        ));
+    }
 
     #[test]
     fn object_producer_decoded_envelope_carries_validated_tail() {

@@ -102,11 +102,13 @@ pub(crate) fn semantic_receipt_query_refusal_test(
 ) -> crate::semantic_capture::CurrentReceiptRefusal {
     semantic_receipt_query_refusal(error)
 }
+#[cfg(test)]
+pub(crate) use instance::{AbsenceBirthSource, observe_absence_birth};
 #[allow(unused_imports)]
 pub(crate) use instance::{
-    AbsenceBirthSource, BirthObservationRefusal, BirthRowError, BirthRowReader, ExecBirthSource,
+    BirthAdmissionBinding, BirthObservationRefusal, BirthRowError, BirthRowReader, ExecBirthSource,
     HookStats, INSTANCE_PROGRAMS, InstanceMaps, InstanceTracking, LiveBirthRows, SessionGrantToken,
-    WatchedFile, observe_absence_birth, observe_exec_birth,
+    WatchedFile, observe_exec_birth, observe_retained_birth,
 };
 mod cleanup_worker;
 pub mod identity_iter;
@@ -2117,6 +2119,14 @@ pub(crate) struct SessionDrainProducers {
 }
 
 impl SessionDrainProducers {
+    pub(crate) fn same_producers(&self, other: &Self) -> bool {
+        self.native == other.native && self.events.same_allocation(&other.events)
+    }
+
+    pub(crate) fn matches_events(&self, events: &events::EventsDomain) -> bool {
+        self.events.same_allocation(events)
+    }
+
     /// The retained native domain the admission is checked against.
     pub(crate) fn native_domain(&self) -> crate::attach::capture::NativeDomainId {
         self.native

@@ -277,6 +277,11 @@ its independently mapped common FD, proves each indexed provider links exactly
 its own common object and no other, and runs192real calls over a small
 schedule. Its missing/duplicate/wrong-slot/clock/return/target/ACK controls
 are fixture oracle checks. They do not qualify diagnostics or BPF ring wrap.
+Every round ACK must follow its32calls and precede the next round's first
+call; ready/load/unmap/done ACKs must appear at their independently declared
+schedule positions. The lightweight Python mutation control uses tiny owned
+files and held-FD mappings; it does not replace the actual native topology
+and192-call fixture check.
 
 The ignored Rust selector is
 `inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_pid_diagnostics_wrap_and_primary_parity_lp64`.
@@ -302,8 +307,8 @@ then one fence and one proof round, each32indexed calls (one per pair). Native
 ACKs and an independent per-slot ledger bind all21120calls. Each next counted
 round waits for all32A edges at the actual committed production count
 milestone validated against caller-bound gap evidence; each shared round
-consumes one observer pass with per-module ambiguity-disclosure checkpoints
-at power-of-two rounds; load-B remains inside the existing observer callback
+waits for its caller-bound retirement range `(400+r-1,400+r]`, with no module
+identity and exactly32folded disclosures; load-B remains inside the existing observer callback
 between passes. Expected primary edge projections are A400 ordinary / 399
 fenced per edge (k validated fenced pairs) and B1 per edge (each its own
 pair's proof). Per-pair physical reconciliation from the schedule plus ledger
@@ -312,6 +317,23 @@ and staged sum 32: 8,288+k withheld entries over 21,120 physical calls.
 Actual32Bplacements (each edge_total 1 on its own pair edge) and their
 selected withheld fence prefixes must remain useful in the exported
 diagnostics.
+
+Retirement has no proven current module. Ordinary pending-count rejection's
+per-sharer module ambiguity gaps remain a separate control and cannot replace
+a missing caller/range unit. Folded public repeats alone do not prove32distinct
+physical pairs. A complete bounded pilot additionally checks each opaque pair's
+indexed A_i/B_i lineage, issued shared intervals once each, actual retained
+read references and PRE/POST intervals, original fence and later B proof.
+Duplicating one pair while omitting another fails even when totals agree.
+
+Before full measurement, the separately selected
+`inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_pid_diagnostics_transition_pilot_lp64`
+uses C=32/S=4, default cadence/capacities and its existing540s bound. It requires
+the exact caller ranges `(32+r-1,32+r]` repeated32, A32 ordinary /31fenced per
+edge, B1 per edge, complete unwrapped diagnostic history and the independent
+native schedule/ledger. Missing, malformed, evicted or mismatched history and
+shared/fence/proof deviations fail qualification. It reports measured settling;
+it does not qualify660rounds, behavior beyond150rounds, ring wrap or cost.
 
 Both default rings must really evict: CountObservation eviction proves the
 ordinary ring filled, and OwnershipTransition/CaptureHealth eviction proves

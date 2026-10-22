@@ -536,10 +536,65 @@ fn range_gap_repeats(gaps: &[GapEvidence], caller: &str, base: u64, absolute: u6
         .filter(|gap| {
             gap.subject == "rejected demoted count"
                 && gap.caller.as_deref() == Some(caller)
+                && gap.module.is_none()
                 && retirement_range(&gap.reason) == Some((base, absolute))
         })
         .map(|gap| gap.repeats)
         .sum()
+}
+
+/// Retirement withholding has no proven current module. Each issued shared
+/// unit has one caller-bound public identity, folded across the 32 physical
+/// pairs. Its repeats establish multiplicity only; the bounded pilot checks
+/// the independent per-pair diagnostic lineage as well.
+fn check_retirement_shared_checkpoint(
+    gaps: &[GapEvidence],
+    caller: &str,
+    counted: u64,
+    completed_shared: u64,
+) -> Result<()> {
+    ensure!(
+        (3..=COUNTED).contains(&counted) && (1..=SHARED).contains(&completed_shared),
+        "invalid retirement checkpoint C={counted} S={completed_shared}"
+    );
+    let end = counted + completed_shared;
+    let mut units = BTreeMap::new();
+    for gap in gaps
+        .iter()
+        .filter(|gap| gap.caller.as_deref() == Some(caller))
+    {
+        let Some((base, absolute)) = retirement_range(&gap.reason) else {
+            continue;
+        };
+        if absolute <= counted || base >= end {
+            continue;
+        }
+        ensure!(
+            gap.module.is_none()
+                && gap.subject == "rejected demoted count"
+                && gap.reason.starts_with(
+                    "the current physical owner is not proven for absolute count range ("
+                )
+                && base >= counted
+                && absolute == base + 1
+                && absolute <= end
+                && gap.repeats == TARGETS,
+            "invalid shared retirement disclosure for {caller} ({base},{absolute}]: {gap:?}"
+        );
+        ensure!(
+            units.insert(absolute, gap.repeats).is_none(),
+            "duplicate shared retirement identity ({base},{absolute}]"
+        );
+    }
+    for absolute in counted + 1..=end {
+        ensure!(
+            units.get(&absolute) == Some(&TARGETS),
+            "shared retirement ({},{}] needs one caller-bound identity repeated32 for {caller}",
+            absolute - 1,
+            absolute
+        );
+    }
+    Ok(())
 }
 
 /// Repeats of the caller-bound startup-fence gap `(1, 2]`, or 0 when absent.
@@ -934,6 +989,262 @@ fn check_terminal_pairs_as(
     check_terminal_pairs_schedule(records, b_modules, expected_caller, COUNTED, SHARED)
 }
 
+/// Complete bounded-pilot proof, never an all-history claim after ring wrap.
+/// Expected units come from the independently checked native schedule; opaque
+/// diagnostic pairs acquire their indexed lineage from A, then must keep it
+/// through every shared unit, their original fence and the matching B proof.
+fn check_shared_pair_dispositions(
+    records: &[serde_json::Value],
+    caller: &str,
+    modules_a: &[String],
+    modules_b: &[String],
+    counted: u64,
+    shared: u64,
+    k: u64,
+) -> Result<()> {
+    ensure!(
+        (3..=COUNTED).contains(&counted) && (1..=SHARED).contains(&shared),
+        "invalid bounded pair schedule C={counted} S={shared}"
+    );
+    ensure!(k == 0 || k == TARGETS, "invalid startup disposition k={k}");
+    let a_ids: BTreeSet<_> = modules_a.iter().cloned().collect();
+    let b_ids: BTreeSet<_> = modules_b.iter().cloned().collect();
+    ensure!(
+        modules_a.len() == TARGETS as usize
+            && modules_b.len() == TARGETS as usize
+            && a_ids.len() == TARGETS as usize
+            && b_ids.len() == TARGETS as usize
+            && a_ids.is_disjoint(&b_ids),
+        "need32 distinct indexed A/B module pairs"
+    );
+    check_terminal_pairs_schedule(records, &b_ids, Some(caller), counted, shared)?;
+    let mut by_seq = BTreeMap::new();
+    for row in records {
+        if let Some(seq) = row["seq"].as_u64() {
+            ensure!(
+                by_seq.insert(seq, row).is_none(),
+                "duplicate diagnostic seq {seq}"
+            );
+        }
+    }
+    let read = |row: &serde_json::Value, require_caller: bool| -> Result<(u64, u64)> {
+        ensure!(
+            row["caller"] == caller,
+            "decision has foreign caller: {row}"
+        );
+        ensure!(
+            row["observation_ref"]["status"] == "retained",
+            "bounded read is not retained: {row}"
+        );
+        let seq = row["seq"].as_u64().context("decision seq")?;
+        let observation_seq = row["observation_ref"]["seq"]
+            .as_u64()
+            .context("observation ref seq")?;
+        let observation = by_seq
+            .get(&observation_seq)
+            .context("referenced original read missing")?;
+        let pre = row["pre"].as_u64().context("read PRE")?;
+        let post = row["post"].as_u64().context("read POST")?;
+        ensure!(
+            observation_seq < seq
+                && observation["kind"] == "count_observation"
+                && observation["pair"] == row["pair"]
+                && observation["absolute"] == row["absolute"]
+                && observation["pre"] == pre
+                && observation["post"] == post
+                && pre <= post
+                && (observation["caller"] == caller
+                    || !require_caller && observation["caller"].is_null()),
+            "decision does not retain its original pair/caller/read interval: {row}"
+        );
+        Ok((pre, post))
+    };
+    let mut pairs = BTreeMap::new();
+    let mut pair_for_index = vec![None; TARGETS as usize];
+    let mut a_units = vec![BTreeMap::new(); TARGETS as usize];
+    for row in records
+        .iter()
+        .filter(|row| row["kind"] == "publication" && row["decision"] == "placed")
+    {
+        let Some(index) = modules_a
+            .iter()
+            .position(|module| row["module_id"] == module.as_str())
+        else {
+            continue;
+        };
+        let pair = row["pair"].as_str().context("A pair")?.to_owned();
+        let known = pairs.entry(pair.clone()).or_insert(index);
+        ensure!(*known == index, "one physical pair spans A modules: {pair}");
+        let lineage = pair_for_index[index].get_or_insert(pair.clone());
+        ensure!(
+            *lineage == pair,
+            "A module has multiple physical pairs: {index}"
+        );
+        let absolute = row["absolute"].as_u64().context("A absolute")?;
+        ensure!(
+            (1..=counted).contains(&absolute)
+                && !(k == TARGETS && absolute == 2)
+                && row["base"] == absolute - 1
+                && row["staged"] == 1
+                && row["edge_total"] == expected_a(absolute, k),
+            "A placement differs from its issued unit: {row}"
+        );
+        let interval = read(row, false)?;
+        ensure!(
+            a_units[index].insert(absolute, interval).is_none(),
+            "duplicate A unit on pair {pair}"
+        );
+    }
+    ensure!(
+        pairs.len() == TARGETS as usize,
+        "need32 distinct A pair lineages"
+    );
+    for units in &a_units {
+        for absolute in 1..=counted {
+            if !(k == TARGETS && absolute == 2) {
+                ensure!(units.contains_key(&absolute), "missing A unit {absolute}");
+            }
+        }
+    }
+    let mut observations = vec![BTreeMap::new(); TARGETS as usize];
+    let mut startup = BTreeSet::new();
+    let mut shared_units = vec![BTreeMap::new(); TARGETS as usize];
+    let mut fences = vec![None; TARGETS as usize];
+    let mut proofs = vec![None; TARGETS as usize];
+    for row in records {
+        let pair = row["pair"].as_str().unwrap_or_default();
+        if row["kind"] == "count_observation"
+            && let Some(absolute) = row["absolute"].as_u64().filter(|absolute| *absolute > 0)
+        {
+            let index = *pairs.get(pair).context("read has no original A pair")?;
+            ensure!(
+                absolute <= counted + shared + 2
+                    && row["reason"].is_null()
+                    && (row["caller"] == caller || row["caller"].is_null())
+                    && observations[index].insert(absolute, row).is_none(),
+                "extra, foreign or invalid native unit read: {row}"
+            );
+        }
+        if row["kind"] == "publication"
+            && row["decision"] == "placed"
+            && (row["caller"] == caller || pairs.contains_key(pair))
+        {
+            let index = *pairs
+                .get(pair)
+                .context("placement has no original A pair")?;
+            if row["module_id"] == modules_a[index] {
+                continue;
+            }
+            ensure!(
+                row["module_id"] == modules_b[index]
+                    && row["base"] == counted + shared + 1
+                    && row["absolute"] == counted + shared + 2
+                    && row["staged"] == 1
+                    && row["edge_total"] == 1,
+                "pair crossed module lineage or placed withheld growth: {row}"
+            );
+            let interval = read(row, true)?;
+            ensure!(
+                proofs[index]
+                    .replace((
+                        interval,
+                        row["baseline_pre"].as_u64(),
+                        row["baseline_post"].as_u64()
+                    ))
+                    .is_none(),
+                "duplicate B proof for pair {pair}"
+            );
+        }
+        if row["kind"] != "count_decision" || row["decision"] != "withheld" {
+            continue;
+        }
+        let after = row["after"].as_u64();
+        let through = row["through"].as_u64();
+        let shared_interval = after
+            .zip(through)
+            .is_some_and(|(after, through)| after < counted + shared && through > counted);
+        if row["reason"] == "shared_owner" || shared_interval {
+            let index = *pairs
+                .get(pair)
+                .context("shared decision has no original A pair")?;
+            let (after, through) = after.zip(through).context("shared interval missing")?;
+            ensure!(
+                row["reason"] == "shared_owner"
+                    && row["module_id"].is_null()
+                    && after >= counted
+                    && after.checked_add(1) == Some(through)
+                    && through <= counted + shared
+                    && row["absolute"] == through,
+                "shared pair interval differs from its issued unit: {row}"
+            );
+            let interval = read(row, true)?;
+            ensure!(
+                shared_units[index].insert(through, interval).is_none(),
+                "duplicate shared unit for pair {pair}"
+            );
+        } else if row["reason"] == "awaiting_fence" && through == Some(2) {
+            let index = *pairs
+                .get(pair)
+                .context("startup fence has no original A pair")?;
+            ensure!(
+                k == TARGETS
+                    && after == Some(1)
+                    && row["absolute"] == 2
+                    && row["module_id"].is_null()
+                    && startup.insert(index),
+                "startup fence differs from the validated all-pair disposition: {row}"
+            );
+            read(row, false)?;
+        } else if row["reason"] == "awaiting_fence"
+            && through.is_some_and(|through| through > counted + shared)
+        {
+            let index = *pairs.get(pair).context("fence has no original A pair")?;
+            ensure!(
+                after == Some(counted + shared)
+                    && through == Some(counted + shared + 1)
+                    && row["absolute"] == counted + shared + 1
+                    && row["module_id"].is_null(),
+                "fence interval differs from its issued unit: {row}"
+            );
+            ensure!(
+                fences[index].replace(read(row, true)?).is_none(),
+                "duplicate fence for pair {pair}"
+            );
+        }
+    }
+    ensure!(startup.len() as u64 == k, "missing per-pair startup fence");
+    for (index, units) in a_units.iter().enumerate() {
+        for absolute in 1..=counted + shared + 2 {
+            ensure!(
+                observations[index].contains_key(&absolute),
+                "pair {index} lacks issued native read {absolute}"
+            );
+        }
+        let mut last_post = units.get(&counted).context("terminal A read missing")?.1;
+        for absolute in counted + 1..=counted + shared {
+            let (pre, post) = shared_units[index]
+                .get(&absolute)
+                .context("pair lacks an issued shared unit")?;
+            ensure!(
+                last_post < *pre,
+                "shared original reads overlap or reverse on pair {index}"
+            );
+            last_post = *post;
+        }
+        let fence = fences[index].context("pair lacks its original fence")?;
+        let (proof, baseline_pre, baseline_post) =
+            proofs[index].context("pair lacks its B proof")?;
+        ensure!(
+            last_post < fence.0
+                && fence.1 < proof.0
+                && baseline_pre == Some(fence.0)
+                && baseline_post == Some(fence.1),
+            "pair {index} proof substituted or overlapped its original fence"
+        );
+    }
+    Ok(())
+}
+
 /// Validate the 32 native targets against 32 genuinely distinct physical
 /// objects: slot `4+i` must live in `libdemotion-common-{i:02}.so` under
 /// `dir`, each file distinct by kernel maps key with the offset in range.
@@ -989,7 +1300,8 @@ fn ambiguity_repeats(gaps: &[GapEvidence], module: &str) -> u64 {
         .sum()
 }
 
-/// Verify a shared-phase checkpoint: at power-of-two rounds the folded
+/// Ordinary immutable pending-count rejection control, distinct from the
+/// retirement path: at power-of-two rounds the folded
 /// ambiguity gaps are mid-run exact and must read exactly `round` on each
 /// of the 64 sharer modules (one pair per module, one disclosure per
 /// round). Between checkpoints any value passes (power-of-two lower bounds
@@ -1526,6 +1838,20 @@ fn primary_facts_core(
     k: u64,
     caller: &serde_json::Value,
 ) -> Result<(serde_json::Value, BTreeSet<String>)> {
+    primary_facts_core_schedule(document, pid, k, caller, COUNTED)
+}
+
+fn primary_facts_core_schedule(
+    document: &serde_json::Value,
+    pid: u32,
+    k: u64,
+    caller: &serde_json::Value,
+    counted: u64,
+) -> Result<(serde_json::Value, BTreeSet<String>)> {
+    ensure!(
+        (3..=COUNTED).contains(&counted),
+        "invalid primary counted schedule"
+    );
     ensure!(
         k == 0 || k == TARGETS,
         "startup disposition is all pairs or none: k={k}"
@@ -1577,11 +1903,10 @@ fn primary_facts_core(
         let module = matching[0];
         ensure!(module_ids.insert(edge["module"].as_str().context("module ID")?.to_owned()));
         let (label, a) = provider_label(module)?;
-        // Pinned per-edge projections (Sol): each A edge is 400/399, each B
-        // edge is exactly 1 (its own pair's proof, partition-independent).
-        // Per-pair physical sums (12,800; 21,120; staged 32) are reconciled
-        // separately from the schedule plus ledger, never from one edge.
-        let expected = if a { expected_a(COUNTED, k) } else { 1 };
+        // Per-edge expectations come from the independently issued schedule.
+        // Full cells keep400/399 on A and1 on each B; the short pilot keeps
+        // its declared C projection. Diagnostics never supply these totals.
+        let expected = if a { expected_a(counted, k) } else { 1 };
         let entries = &edge["entries"];
         let coverage = &entries["coverage"];
         ensure!(
@@ -1653,10 +1978,10 @@ fn primary_facts_core(
             }),
         "need one facts entry per indexed provider"
     );
-    // Independently fixed totals: 12,800-k across the A edges, 32 across B.
+    // Independently fixed totals; full cells retain12,800-k on A and32 on B.
     ensure!(
-        a_sum == TARGETS * expected_a(COUNTED, k),
-        "A total {a_sum} != 12,800-k (k={k})"
+        a_sum == TARGETS * expected_a(counted, k),
+        "A total {a_sum} differs from declared C={counted} k={k}"
     );
     ensure!(b_sum == TARGETS, "B total {b_sum} != 32");
     Ok((
@@ -1689,8 +2014,8 @@ fn primary_facts_system(
 
 /// Post-run exact gap verification on the live-accumulated evidence (the
 /// pre-`ended` flush makes repeats exact) under an explicit schedule:
-/// startup `(1,2]` repeats must equal the live-validated `k`, each of the
-/// 64 sharer modules' ambiguity disclosures must total exactly `shared`,
+/// startup `(1,2]` repeats must equal the live-validated `k`, each issued
+/// shared unit needs exactly32 caller-bound retirement disclosures,
 /// and the fence `(counted + shared, counted + shared + 1]` repeats must
 /// be 32. Live accumulation — not a post-run file replay — because rotated
 /// segments beyond retention are evicted: the refresh loop observes every
@@ -1709,22 +2034,17 @@ fn verify_final_gaps_as(
         modules_a.len() == TARGETS as usize && modules_b.len() == TARGETS as usize,
         "need all64 sharer module ids"
     );
+    ensure!(k == 0 || k == TARGETS, "invalid startup disposition k={k}");
     let startup = startup_fence_repeats(gaps, caller);
     ensure!(
         startup == k,
         "final startup-fence repeats {startup} != live k={k}"
     );
-    for module in modules_a.iter().chain(modules_b.iter()) {
-        let repeats = ambiguity_repeats(gaps, module);
-        ensure!(
-            repeats == shared,
-            "final ambiguity disclosures for {module}: {repeats} != {shared}"
-        );
-    }
+    check_retirement_shared_checkpoint(gaps, caller, counted, shared)?;
     let fence = fence_gap_repeats_as(gaps, caller, counted, shared);
     ensure!(fence == TARGETS, "final fence repeats {fence} != 32");
     eprintln!(
-        "G21_WRAP_GAPS caller={caller} k={k} startup={startup} ambiguity={shared} fence={fence}"
+        "G21_WRAP_GAPS caller={caller} k={k} startup={startup} shared_ranges={shared} repeats_per_range={TARGETS} fence={fence}"
     );
     Ok(())
 }
@@ -1738,6 +2058,28 @@ fn verify_final_gaps(
     k: u64,
 ) -> Result<()> {
     verify_final_gaps_as(gaps, caller, modules_a, modules_b, k, COUNTED, SHARED)
+}
+
+/// Consume terminal flush rows before checking exact repetitions. Stop
+/// callbacks stop refreshing at proof completion, before the final writer flush.
+fn verify_final_view_gaps(
+    view: &mut PassView,
+    events: &Path,
+    pid: u32,
+    k: u64,
+    counted: u64,
+    shared: u64,
+) -> Result<()> {
+    view.refresh(events, pid)?;
+    verify_final_gaps_as(
+        &view.evidence,
+        view.caller_id.as_deref().context("final caller missing")?,
+        &view.modules_a().context("final A module ids missing")?,
+        &view.modules_b().context("final B module ids missing")?,
+        k,
+        counted,
+        shared,
+    )
 }
 
 /// The 32 owned B module ids from a primary document, matched by indexed
@@ -2009,13 +2351,9 @@ fn run_wrap_cell(enabled: bool, cell: WrapCell) -> Result<(serde_json::Value, u6
                     );
                     state.set((3, 1));
                 }
-                // Shared rounds serialize one per observer pass (the stop
-                // callback issues strictly before each pass's collect, so
-                // every new pass observes exactly one new round). Folded
-                // ambiguity gaps cannot gate per-round mid-run; power-of-two
-                // checkpoints plus the post-run exact replay verify the
-                // 1:1 cadence instead. Withholding itself is exact on
-                // every pass.
+                // The 32 pairs fold into one caller/range identity for each
+                // issued unit. Wait for its repeat32 checkpoint before the
+                // next round; module ambiguity gaps cannot replace it.
                 (3, round) => {
                     let k = fence_k.get();
                     let a_counts = view.a_counts().context("A edges missing in shared phase")?;
@@ -2027,9 +2365,9 @@ fn run_wrap_cell(enabled: bool, cell: WrapCell) -> Result<(serde_json::Value, u6
                             && b_counts.iter().all(|count| *count == 0),
                         "shared calls escaped withholding: A={a_counts:?} B={b_counts:?} k={k}"
                     );
-                    let modules_a = view.modules_a().context("A module ids missing")?;
-                    let modules_b = view.modules_b().context("B module ids missing")?;
-                    check_shared_checkpoint(round, &view.evidence, &modules_a, &modules_b)?;
+                    if !shared_round_floor(round, &view.evidence, &caller, COUNTED) {
+                        return Ok(false);
+                    }
                     if round < SHARED {
                         workload.command("shared", "shared-done", round + 1)?;
                         state.set((3, round + 1));
@@ -2150,20 +2488,7 @@ fn run_wrap_cell(enabled: bool, cell: WrapCell) -> Result<(serde_json::Value, u6
         "public event stream lacks terminal end"
     );
     let k = fence_k.get();
-    {
-        let view = view.borrow();
-        verify_final_gaps(
-            &view.evidence,
-            view.caller_id.as_deref().unwrap_or_default(),
-            &view
-                .modules_a()
-                .context("A module ids missing at final gaps")?,
-            &view
-                .modules_b()
-                .context("B module ids missing at final gaps")?,
-            k,
-        )?;
-    }
+    verify_final_view_gaps(&mut view.borrow_mut(), &events, pid, k, COUNTED, SHARED)?;
     let document: serde_json::Value = serde_json::from_slice(&stdout)?;
     let facts = match scope {
         WrapScope::Pid { pid } => primary_facts(&document, pid, k)?,
@@ -2210,13 +2535,12 @@ fn run_wrap_cell(enabled: bool, cell: WrapCell) -> Result<(serde_json::Value, u6
 }
 
 // ---------------------------------------------------------------------------
-// Short full-transition pilot (C=32/S=4): a measurement leg, not a gate. It
+// Short full-transition pilot (C=32/S=4): a bounded transition gate. It
 // runs A -> Shared -> fence -> B proof at default cadence with default
 // diagnostic capacities, retaining the native ledger and unanimity checks,
-// and timestamps every round and pass. It makes no wrap claim: gap-shape
-// oracles that were never live-observed (shared ambiguity, fence, terminal
-// pairs) are characterized on deviation — the leg stops with its evidence —
-// never fixed inline and never silently passed. The recorder footer is
+// and timestamps every round and pass. It makes no wrap claim. Retirement
+// range, per-pair, fence and proof deviations fail qualification; the leg
+// stops with a bounded report. The recorder footer is
 // exported (read and logged) on every exit path, including phase failures.
 // ---------------------------------------------------------------------------
 
@@ -2254,14 +2578,13 @@ struct PilotRoundSample {
     stop_calls: u64,
 }
 
-/// How the pilot leg ended. Characterization outcomes are findings, not
-/// failures: the pilot's job is to measure, and these oracles were never
-/// live-observed. Genuine failures (A-phase unanimity/trajectory, native
-/// ledger, timeouts) return `Err` instead.
+/// How the pilot leg ended. Deviation outcomes preserve bounded failure
+/// detail; only ProofReached with strict final validation qualifies. Immediate
+/// count/ledger/timeout failures return `Err` instead.
 enum PilotOutcome {
     /// B reached unanimous 1 on all 32 edges: full A->Shared->fence->B proof.
     ProofReached,
-    /// Shared evidence deviated from the module-bound oracle within the
+    /// Shared evidence deviated from the caller/range oracle within the
     /// pass bound: the leg stopped with expected-vs-observed detail.
     SharedOracleDeviation { round: u64, detail: String },
     /// Fence evidence never reached 32 repeats within the pass bound.
@@ -2316,33 +2639,22 @@ fn pilot_note_round(
     });
 }
 
-/// Shared-round evidence floor: every one of the 64 sharer modules shows
-/// at least `round` ambiguity disclosures. Power-of-two rounds additionally
-/// need the exact checkpoint (`check_shared_checkpoint`); other rounds
-/// cannot gate on exact mid-run values, but the floor still serializes
-/// rounds on evidence instead of issuing blindly.
-fn shared_round_floor(
-    round: u64,
-    gaps: &[GapEvidence],
-    modules_a: &[String],
-    modules_b: &[String],
-) -> bool {
-    modules_a
-        .iter()
-        .chain(modules_b.iter())
-        .all(|module| ambiguity_repeats(gaps, module) >= round)
+/// Readiness for the next issued round. Each unit's 32 repetitions reaches
+/// an exact power-of-two checkpoint even when the round ordinal is not a
+/// power of two. Missing/partial evidence waits; final verification is strict.
+fn shared_round_floor(round: u64, gaps: &[GapEvidence], caller: &str, counted: u64) -> bool {
+    check_retirement_shared_checkpoint(gaps, caller, counted, round).is_ok()
 }
 
-/// Expected-vs-observed shared evidence for one round: the module-bound
-/// ambiguity histogram across the 64 sharer modules, the deviating
-/// modules, every caller-bound range gap (the predicted alternative
-/// shape), and any other gap subjects. Pure so unit tests pin the
-/// characterization format without a live run.
+/// Bounded failure detail: expected caller/range multiplicity, observed
+/// ranges, ordinary module ambiguity histogram and other gap subjects.
 fn describe_shared_evidence(
     gaps: &[GapEvidence],
     modules_a: &[String],
     modules_b: &[String],
     round: u64,
+    caller: &str,
+    counted: u64,
 ) -> String {
     let mut histogram = BTreeMap::new();
     let mut deviating = Vec::new();
@@ -2356,11 +2668,8 @@ fn describe_shared_evidence(
     let mut caller_ranges = Vec::new();
     let mut other_subjects = BTreeMap::new();
     for gap in gaps {
-        // The caller-bound range shape is the predicted mismatch
-        // alternative; ambiguity evidence (the histogram predicate from
-        // `ambiguity_repeats`) is already counted above. Everything else
-        // — other subjects, unbound/module-bound non-ambiguity gaps —
-        // stays visible here, keyed precisely.
+        // Module-bound ordinary pending rejections remain visible, without
+        // contributing to the retirement checkpoint.
         let is_caller_range =
             gap.subject == "rejected demoted count" && gap.caller.is_some() && gap.module.is_none();
         let is_ambiguity = gap.subject == "rejected demoted count"
@@ -2391,7 +2700,8 @@ fn describe_shared_evidence(
         }
     }
     format!(
-        "expected 64 modules ambiguity=={round}; observed histogram={histogram:?} deviating=[{}] caller_ranges=[{}] other_subjects={other_subjects:?} evidence_total={}",
+        "expected caller={caller} shared_ranges=({counted},{}] repeats_per_range={TARGETS}; observed module_ambiguity={histogram:?} module_deviating=[{}] caller_ranges=[{}] other_subjects={other_subjects:?} evidence_total={}",
+        counted + round,
         deviating.join(","),
         caller_ranges.join(","),
         gaps.len(),
@@ -2470,9 +2780,8 @@ fn pilot_ledger_summary(calls: &[serde_json::Value], acks: &[serde_json::Value])
 /// milestones, the pinned per-edge trajectory and the startup gate, exactly
 /// as in `run_wrap_cell`, plus per-round/pass timestamps and
 /// stop-calls-per-pass counts. Shared, fence and proof phases keep strict
-/// count facts (withholding, attribution bounds) but characterize oracle
-/// deviations as findings with bounded waits instead of failing: those
-/// shapes were never live-observed. The recorder footer is read and logged
+/// count facts (withholding, attribution bounds) and retain bounded deviation
+/// detail before the caller fails qualification. The recorder footer is read and logged
 /// on every exit path before any error returns.
 fn run_transition_pilot(schedule: &WrapSchedule) -> Result<PilotReport> {
     let counted = schedule.counted;
@@ -2661,12 +2970,9 @@ fn run_transition_pilot(schedule: &WrapSchedule) -> Result<PilotReport> {
                     phase_enter_pass.set(passes);
                     state.set((3, 1));
                 }
-                // Shared rounds serialize on evidence: the next round
-                // issues only after this round's evidence satisfies the
-                // checkpoint (exact at powers of two) plus the per-round
-                // floor. Count facts stay strict (withholding must hold);
-                // a gap-shape deviation characterizes and stops the leg
-                // instead of failing: the oracle was never live-observed.
+                // Each issued unit waits for exactly32 caller/range
+                // disclosures. Per-pair identity and retained original
+                // reads are checked on the complete bounded final export.
                 (3, round) => {
                     let k = fence_k.get();
                     let a_counts = view
@@ -2685,13 +2991,12 @@ fn run_transition_pilot(schedule: &WrapSchedule) -> Result<PilotReport> {
                     let modules_a = view.modules_a().context("pilot A module ids missing")?;
                     let modules_b = view.modules_b().context("pilot B module ids missing")?;
                     let checkpoint =
-                        check_shared_checkpoint(round, &view.evidence, &modules_a, &modules_b);
+                        check_retirement_shared_checkpoint(&view.evidence, &caller, counted, round);
                     let checkpoint_text = match &checkpoint {
                         Ok(()) => "ok".to_owned(),
                         Err(error) => format!("err {error:#}"),
                     };
-                    let floor = shared_round_floor(round, &view.evidence, &modules_a, &modules_b);
-                    if checkpoint.is_ok() && floor {
+                    if checkpoint.is_ok() {
                         pilot_note_round(
                             &round_samples,
                             "shared-validated",
@@ -2718,10 +3023,16 @@ fn run_transition_pilot(schedule: &WrapSchedule) -> Result<PilotReport> {
                             state.set((4, 0));
                         }
                     } else if passes - phase_enter_pass.get() > PILOT_SHARED_ROUND_PASS_BOUND {
-                        let detail =
-                            describe_shared_evidence(&view.evidence, &modules_a, &modules_b, round);
+                        let detail = describe_shared_evidence(
+                            &view.evidence,
+                            &modules_a,
+                            &modules_b,
+                            round,
+                            &caller,
+                            counted,
+                        );
                         eprintln!(
-                            "G21_PILOT_SHARED_DEVIATION round={round} elapsed_ms={} passes={passes} checkpoint={checkpoint_text} floor={floor} {detail}",
+                            "G21_PILOT_SHARED_DEVIATION round={round} elapsed_ms={} passes={passes} checkpoint={checkpoint_text} {detail}",
                             start.elapsed().as_millis(),
                         );
                         *outcome.borrow_mut() =
@@ -2858,7 +3169,7 @@ fn run_transition_pilot(schedule: &WrapSchedule) -> Result<PilotReport> {
     )?;
     // The footer exports on every exit path: read and log it before any
     // error below returns.
-    let (records, footer_note) = read_pilot_records(&diagnostics);
+    let (records, footer_note, parsed_complete) = read_pilot_records(&diagnostics);
     let footer = records
         .last()
         .cloned()
@@ -2928,53 +3239,33 @@ fn run_transition_pilot(schedule: &WrapSchedule) -> Result<PilotReport> {
                 "pilot public event stream lacks terminal end"
             );
             let k = fence_k.get();
+            verify_final_view_gaps(&mut view.borrow_mut(), &events, pid, k, counted, shared)?;
             {
                 let view = view.borrow();
-                let caller = view.caller_id.as_deref().unwrap_or_default();
-                // Startup==k is a strict A-phase contract; the ambiguity
-                // and fence finals are findings (never live-observed).
-                let startup = startup_fence_repeats(&view.evidence, caller);
+                let caller = view.caller_id.as_deref().context("pilot caller missing")?;
+                let modules_a = view.modules_a().context("pilot A module ids missing")?;
+                let modules_b = view.modules_b().context("pilot B module ids missing")?;
                 ensure!(
-                    startup == k,
-                    "pilot final startup-fence repeats {startup} != live k={k}"
+                    parsed_complete,
+                    "pilot diagnostic parsing incomplete: {footer_note}"
                 );
-                let modules_a = view.modules_a().unwrap_or_default();
-                let modules_b = view.modules_b().unwrap_or_default();
-                match verify_final_gaps_as(
-                    &view.evidence,
-                    caller,
-                    &modules_a,
-                    &modules_b,
-                    k,
-                    counted,
-                    shared,
-                ) {
-                    Ok(()) => eprintln!("G21_PILOT_FINDING final-gaps=match"),
-                    Err(error) => eprintln!(
-                        "G21_PILOT_FINDING final-gaps=deviation {error:#} {}",
-                        describe_shared_evidence(&view.evidence, &modules_a, &modules_b, shared)
-                    ),
-                }
-            }
-            match serde_json::from_slice::<serde_json::Value>(&stdout) {
-                Ok(document) => match wrap_b_modules(&document, pid) {
-                    Ok(b_modules) => {
-                        match check_terminal_pairs_schedule(
-                            &records, &b_modules, None, counted, shared,
-                        ) {
-                            Ok((fence_sum, proof_sum, staged_sum)) => eprintln!(
-                                "G21_PILOT_FINDING terminal-pairs=match fence={fence_sum} proof={proof_sum} staged={staged_sum}"
-                            ),
-                            Err(error) => {
-                                eprintln!("G21_PILOT_FINDING terminal-pairs=deviation {error:#}")
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        eprintln!("G21_PILOT_FINDING terminal-pairs=no-b-modules {error:#}")
-                    }
-                },
-                Err(error) => eprintln!("G21_PILOT_FINDING terminal-pairs=no-document {error}"),
+                let length = std::fs::metadata(&diagnostics)?.len();
+                check_bounded_pilot_export(&records, length, pid)?;
+                check_shared_pair_dispositions(
+                    &records, caller, &modules_a, &modules_b, counted, shared, k,
+                )?;
+                let document: serde_json::Value = serde_json::from_slice(&stdout)?;
+                let primary_caller = primary_pid_caller(&document, pid)?;
+                ensure!(
+                    primary_caller["id"] == caller,
+                    "pilot primary caller changed"
+                );
+                primary_facts_core_schedule(&document, pid, k, primary_caller, counted)?;
+                let b_modules = wrap_b_modules(&document, pid)?;
+                ensure!(
+                    b_modules == modules_b.into_iter().collect(),
+                    "pilot final B module ids differ from live indexed identities"
+                );
             }
             let ledger_summary = read_pilot_ledger_summary(&workload);
             let report = build_report(PilotOutcome::ProofReached, ledger_summary);
@@ -3014,13 +3305,85 @@ fn run_transition_pilot(schedule: &WrapSchedule) -> Result<PilotReport> {
     }
 }
 
+/// A complete short pilot uses the default capacities without any evicted,
+/// filtered or omitted history. This does not substitute for the full wrap
+/// contract, which separately requires both rings to have actually evicted.
+fn check_bounded_pilot_export(records: &[serde_json::Value], bytes: u64, pid: u32) -> Result<()> {
+    let header = records.first().context("pilot header missing")?;
+    let footer = records.last().context("pilot footer missing")?;
+    ensure!(
+        header["kind"] == "header"
+            && header["scope"] == "pid"
+            && header["mode"] == "native"
+            && header["pid_filter"] == pid
+            && header["limits"]["ordinary_records"] == 24576
+            && header["limits"]["exceptional_records"] == 8192
+            && header["limits"]["heap_bytes"]
+                .as_u64()
+                .is_some_and(|heap| heap <= 16 * 1024 * 1024 - 8192),
+        "pilot must use the bounded default native PID recorder"
+    );
+    ensure!(
+        records.len() >= 2
+            && bytes <= 64 * 1024 * 1024
+            && footer["kind"] == "footer"
+            && footer["diagnostics_complete"] == true
+            && footer["counter_overflow"] == false
+            && footer["sequence_exhausted"] == false
+            && footer["oversized_records"] == 0
+            && footer["records_written"] == records.len() as u64 - 2
+            && footer["bytes_written"] == bytes,
+        "pilot diagnostic export is incomplete"
+    );
+    let names = [
+        "count_observation",
+        "ownership_transition",
+        "count_decision",
+        "publication",
+        "capture_health",
+    ];
+    let mut observed = [0u64; 5];
+    for (index, row) in records[1..records.len() - 1].iter().enumerate() {
+        ensure!(
+            row["seq"] == index as u64 + 1,
+            "pilot diagnostic history has a sequence hole"
+        );
+        let kind = names
+            .iter()
+            .position(|name| row["kind"] == *name)
+            .context("unknown pilot record kind")?;
+        observed[kind] += 1;
+    }
+    let kinds = footer["kinds"].as_array().context("pilot kind counters")?;
+    ensure!(kinds.len() == names.len(), "pilot kind counters missing");
+    for (kind, retained) in kinds.iter().zip(observed) {
+        let keys: BTreeSet<_> = kind
+            .as_object()
+            .context("pilot kind counters object")?
+            .keys()
+            .map(String::as_str)
+            .collect();
+        ensure!(
+            keys == BTreeSet::from(["produced", "retained", "evicted", "filtered", "omitted"])
+                && kind["produced"] == retained
+                && kind["retained"] == retained
+                && kind["evicted"] == 0
+                && kind["filtered"] == 0
+                && kind["omitted"] == 0,
+            "complete bounded pilot requires all actual kind history: {kind}"
+        );
+    }
+    Ok(())
+}
+
 /// Read the pilot diagnostics export tolerantly: every parseable line is
 /// kept, unparseable lines only count into the note. The pilot export is
-/// small (no wrap), so a full read is cheap on every exit path.
-fn read_pilot_records(path: &Path) -> (Vec<serde_json::Value>, String) {
+/// small (no wrap), so a full read is cheap on every exit path. The boolean
+/// prevents the tolerant failure report from qualifying a malformed export.
+fn read_pilot_records(path: &Path) -> (Vec<serde_json::Value>, String, bool) {
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
-        Err(error) => return (Vec::new(), format!("open failed: {error}")),
+        Err(error) => return (Vec::new(), format!("open failed: {error}"), false),
     };
     let mut bytes = Vec::new();
     if file
@@ -3028,10 +3391,14 @@ fn read_pilot_records(path: &Path) -> (Vec<serde_json::Value>, String) {
         .read_to_end(&mut bytes)
         .is_err()
     {
-        return (Vec::new(), "read failed".to_owned());
+        return (Vec::new(), "read failed".to_owned(), false);
     }
     if bytes.len() > 64 * 1024 * 1024 {
-        return (Vec::new(), format!("{} bytes exceed 64MiB", bytes.len()));
+        return (
+            Vec::new(),
+            format!("{} bytes exceed 64MiB", bytes.len()),
+            false,
+        );
     }
     let mut records = Vec::new();
     let mut skipped = 0u64;
@@ -3047,6 +3414,7 @@ fn read_pilot_records(path: &Path) -> (Vec<serde_json::Value>, String) {
     (
         records,
         format!("bytes={} skipped_lines={skipped}", bytes.len()),
+        skipped == 0,
     )
 }
 
@@ -3184,9 +3552,9 @@ fn pilot_footer_kinds(footer: &Option<serde_json::Value>) -> String {
 
 /// Short full-transition pilot (C=32/S=4, PID cell, diagnostics enabled):
 /// measures current-tip settling (passes/round, sec/pass, stop-calls per
-/// pass), shared gap shapes against the oracle, and footer production at
+/// pass), strict retirement/per-pair conservation, and footer production at
 /// default cadence and default diagnostic capacities. Makes no wrap claim;
-/// oracle deviations characterize and stop the leg as findings.
+/// a deviation retains its bounded report and fails qualification.
 #[test]
 #[ignore = "root-owned BPF lane; parameterized C=32/S=4 full-transition pilot at default cadence, bounded540s"]
 fn privileged_native_lane_pid_diagnostics_transition_pilot_lp64() -> Result<()> {
@@ -3212,26 +3580,28 @@ fn privileged_native_lane_pid_diagnostics_transition_pilot_lp64() -> Result<()> 
         }
         PilotOutcome::ProofReached => {}
     }
+    ensure!(
+        matches!(&report.outcome, PilotOutcome::ProofReached),
+        "G21 short transition did not qualify: {}",
+        report.outcome.tag()
+    );
     Ok(())
 }
 
 #[test]
 fn operator_diagnostics_wrap_twin_pilot_shared_floor() -> Result<()> {
-    let modules_a: Vec<String> = (0..32).map(|index| format!("mA-{index:02}")).collect();
-    let modules_b: Vec<String> = (0..32).map(|index| format!("mB-{index:02}")).collect();
-    let gaps_at = |repeats: u64| -> Vec<GapEvidence> {
-        modules_a
-            .iter()
-            .chain(modules_b.iter())
-            .map(|module| twin_ambiguity_gap(module, repeats))
+    let gaps_at = |rounds: u64| -> Vec<GapEvidence> {
+        (1..=rounds)
+            .map(|round| twin_range_gap("c0", 32 + round - 1, 32 + round, TARGETS))
             .collect()
     };
-    ensure!(shared_round_floor(1, &gaps_at(1), &modules_a, &modules_b));
-    ensure!(shared_round_floor(3, &gaps_at(4), &modules_a, &modules_b));
-    ensure!(!shared_round_floor(2, &gaps_at(1), &modules_a, &modules_b));
+    ensure!(shared_round_floor(1, &gaps_at(1), "c0", 32));
+    ensure!(shared_round_floor(3, &gaps_at(3), "c0", 32));
+    ensure!(!shared_round_floor(2, &gaps_at(1), "c0", 32));
     let mut short = gaps_at(4);
-    short[63].repeats = 3;
-    ensure!(!shared_round_floor(4, &short, &modules_a, &modules_b));
+    short[3].repeats = 16;
+    ensure!(!shared_round_floor(4, &short, "c0", 32));
+    ensure!(!shared_round_floor(4, &gaps_at(4), "foreign", 32));
     Ok(())
 }
 
@@ -3239,8 +3609,8 @@ fn operator_diagnostics_wrap_twin_pilot_shared_floor() -> Result<()> {
 fn operator_diagnostics_wrap_twin_pilot_describe_shared() -> Result<()> {
     let modules_a: Vec<String> = (0..32).map(|index| format!("mA-{index:02}")).collect();
     let modules_b: Vec<String> = (0..32).map(|index| format!("mB-{index:02}")).collect();
-    // The predicted mismatch shape: no module-bound disclosures, one
-    // caller-bound range gap per pair.
+    // A partial caller/range repeat must stay visible alongside ordinary
+    // module fanout, which cannot complete the retirement unit.
     let mut gaps = vec![twin_range_gap("c0", 32, 33, 4)];
     gaps.extend(
         modules_a
@@ -3248,23 +3618,26 @@ fn operator_diagnostics_wrap_twin_pilot_describe_shared() -> Result<()> {
             .chain(modules_b.iter())
             .map(|module| twin_ambiguity_gap(module, 0)),
     );
-    let detail = describe_shared_evidence(&gaps, &modules_a, &modules_b, 1);
+    let detail = describe_shared_evidence(&gaps, &modules_a, &modules_b, 1, "c0", 32);
     ensure!(
-        detail.contains("expected 64 modules ambiguity==1")
-            && detail.contains("deviating=")
+        detail.contains("expected caller=c0 shared_ranges=(32,33] repeats_per_range=32")
+            && detail.contains("module_ambiguity=")
             && detail.contains("c0:(32, 33]")
             && detail.contains("evidence_total=65"),
         "mismatch characterization lost its shapes: {detail}"
     );
-    // A matching round describes the unanimous histogram.
-    let matched: Vec<GapEvidence> = modules_a
+    // The ordinary module histogram remains diagnostic context.
+    let mut matched: Vec<GapEvidence> = modules_a
         .iter()
         .chain(modules_b.iter())
         .map(|module| twin_ambiguity_gap(module, 4))
         .collect();
-    let detail = describe_shared_evidence(&matched, &modules_a, &modules_b, 4);
+    matched.push(twin_range_gap("c0", 32, 33, 32));
+    let detail = describe_shared_evidence(&matched, &modules_a, &modules_b, 4, "c0", 32);
     ensure!(
-        detail.contains("4: 64") && detail.contains("caller_ranges=[]"),
+        detail.contains("4: 64")
+            && detail.contains("c0:(32, 33]")
+            && detail.contains("shared_ranges=(32,36]"),
         "matching round misdescribed: {detail}"
     );
     // A module-bound rejected gap with a non-ambiguity reason is neither
@@ -3277,7 +3650,7 @@ fn operator_diagnostics_wrap_twin_pilot_describe_shared() -> Result<()> {
         reason: "some other module-level refusal".to_owned(),
         repeats: 2,
     });
-    let detail = describe_shared_evidence(&foreign, &modules_a, &modules_b, 4);
+    let detail = describe_shared_evidence(&foreign, &modules_a, &modules_b, 4, "c0", 32);
     ensure!(
         detail.contains("some other module-level refusal"),
         "non-ambiguity module gap hidden: {detail}"
@@ -5643,14 +6016,9 @@ fn operator_diagnostics_wrap_twin_wrap_b_modules() -> Result<()> {
     Ok(())
 }
 
-/// Twin helper: one exact final gap stream — startup k, SHARED ambiguity
-/// disclosures per sharer module, and the 32 terminal fences.
-fn twin_final_gap_rows(
-    modules_a: &[String],
-    modules_b: &[String],
-    startup: u64,
-    fence: u64,
-) -> Vec<serde_json::Value> {
+/// Twin helper: one exact final gap stream — startup k, one caller-bound
+/// identity repeated32 for each issued shared unit, and32 terminal fences.
+fn twin_final_gap_rows(startup: u64, fence: u64) -> Vec<serde_json::Value> {
     let mut rows = vec![
         serde_json::json!({"kind":"gap_recorded","event":{
             "caller":"c0","module":null,"subject":"rejected demoted count",
@@ -5658,12 +6026,12 @@ fn twin_final_gap_rows(
         serde_json::json!({"kind":"gap_repeated","event":{"index":0,"repeats":startup}}),
     ];
     let mut index = 1u64;
-    for module in modules_a.iter().chain(modules_b.iter()) {
+    for absolute in COUNTED + 1..=COUNTED + SHARED {
         rows.push(serde_json::json!({"kind":"gap_recorded","event":{
-            "caller":null,"module":module,"subject":"rejected demoted count",
-            "reason":"a native witness endpoint is shared (re-resolved after sharing appeared)"}}));
+            "caller":"c0","module":null,"subject":"rejected demoted count",
+            "reason":format!("the current physical owner is not proven for absolute count range ({}, {absolute}] (1 unattributed calls); x",absolute-1)}}));
         rows.push(
-            serde_json::json!({"kind":"gap_repeated","event":{"index":index,"repeats":SHARED}}),
+            serde_json::json!({"kind":"gap_repeated","event":{"index":index,"repeats":TARGETS}}),
         );
         index += 1;
     }
@@ -5681,16 +6049,14 @@ fn operator_diagnostics_wrap_twin_verify_final_gaps() -> Result<()> {
     // The validator takes the live-accumulated evidence (replayed here from
     // fixture rows): rotated segments beyond retention are evicted, so a
     // post-run file replay would be incomplete.
-    let exact = |startup: u64, fence: u64| {
-        replay_gap_repeats(&twin_final_gap_rows(&modules_a, &modules_b, startup, fence))
-    };
+    let exact = |startup: u64, fence: u64| replay_gap_repeats(&twin_final_gap_rows(startup, fence));
     verify_final_gaps(&exact(32, 32), "c0", &modules_a, &modules_b, 32)?;
     verify_final_gaps(&exact(0, 32), "c0", &modules_a, &modules_b, 0)?;
-    // Wrong startup, fence, or one module's ambiguity fails.
+    // Wrong startup, fence, or one shared caller/range multiplicity fails.
     ensure!(verify_final_gaps(&exact(0, 32), "c0", &modules_a, &modules_b, 32).is_err());
     ensure!(verify_final_gaps(&exact(32, 31), "c0", &modules_a, &modules_b, 32).is_err());
-    let mut short = twin_final_gap_rows(&modules_a, &modules_b, 32, 32);
-    short[3]["event"]["repeats"] = serde_json::json!(SHARED - 1);
+    let mut short = twin_final_gap_rows(32, 32);
+    short[3]["event"]["repeats"] = serde_json::json!(TARGETS - 1);
     ensure!(
         verify_final_gaps(
             &replay_gap_repeats(&short),
@@ -5702,6 +6068,58 @@ fn operator_diagnostics_wrap_twin_verify_final_gaps() -> Result<()> {
         .is_err()
     );
     ensure!(verify_final_gaps(&exact(32, 32), "c0", &modules_a[..31], &modules_b, 32).is_err());
+    Ok(())
+}
+
+#[test]
+fn operator_diagnostics_wrap_twin_final_gap_flush_consumed() -> Result<()> {
+    let modules_a: Vec<_> = (0..32).map(|index| format!("mA-{index:02}")).collect();
+    let modules_b: Vec<_> = (0..32).map(|index| format!("mB-{index:02}")).collect();
+    let dir = tempfile::tempdir()?;
+    let events = dir.path().join("events.jsonl");
+    let mut rows = twin_final_gap_rows(0, TARGETS);
+    rows[3]["event"]["repeats"] = 16.into();
+    let mut file = std::fs::File::create(&events)?;
+    for (seq, row) in rows.iter_mut().enumerate() {
+        row["seq"] = seq.into();
+        writeln!(file, "{row}")?;
+    }
+    let mut view = PassView {
+        caller_id: Some("c0".into()),
+        module_a: modules_a
+            .iter()
+            .enumerate()
+            .map(|(index, id)| (index as u32, id.clone()))
+            .collect(),
+        module_b: modules_b
+            .iter()
+            .enumerate()
+            .map(|(index, id)| (index as u32, id.clone()))
+            .collect(),
+        ..PassView::default()
+    };
+    view.refresh(&events, 123)?;
+    ensure!(verify_final_gaps(&view.evidence, "c0", &modules_a, &modules_b, 0).is_err());
+    let seq = rows.len();
+    writeln!(
+        file,
+        "{}",
+        serde_json::json!({"seq":seq,"kind":"gap_repeated","event":{"index":1,"repeats":32}})
+    )?;
+    writeln!(
+        file,
+        "{}",
+        serde_json::json!({"seq":seq+1,"kind":"ended","event":{}})
+    )?;
+    verify_final_view_gaps(&mut view, &events, 123, 0, COUNTED, SHARED)?;
+    ensure!(view.last_seq == Some((seq + 1) as u64));
+    // A late excess cannot hide behind the previously qualifying checkpoint.
+    writeln!(
+        file,
+        "{}",
+        serde_json::json!({"seq":seq+2,"kind":"gap_repeated","event":{"index":1,"repeats":33}})
+    )?;
+    ensure!(verify_final_view_gaps(&mut view, &events, 123, 0, COUNTED, SHARED).is_err());
     Ok(())
 }
 
@@ -5730,7 +6148,7 @@ fn operator_diagnostics_wrap_twin_retirement_shared_ranges() -> Result<()> {
         // Exercise the current live shared gate first: caller-bound retirement
         // dispositions must qualify without inventing per-sharer module gaps.
         let check = |gaps: &[GapEvidence], completed: u64| {
-            check_shared_checkpoint(completed, gaps, &modules_a, &modules_b)
+            check_retirement_shared_checkpoint(gaps, "c0", counted, completed)
         };
         check(&exact[..1], 1)?;
         check(&exact, shared)?;
@@ -5789,14 +6207,33 @@ fn operator_diagnostics_wrap_twin_retirement_shared_ranges() -> Result<()> {
 /// Each pair has its own initial A placement, four issued shared units and
 /// its own final B proof. Native topology/ledger checks remain separate.
 fn twin_shared_pair_records() -> Vec<serde_json::Value> {
+    twin_shared_pair_records_as(0)
+}
+
+fn twin_shared_pair_records_as(k: u64) -> Vec<serde_json::Value> {
     let mut records = Vec::new();
     let mut seq = 1u64;
     for index in 0..32 {
         let pair = format!("p{index}");
-        records.push(serde_json::json!({"kind":"publication","decision":"placed",
-            "seq":seq,"caller":"c0","pair":pair,"module_id":format!("mA-{index:02}"),
-            "base":0,"absolute":1,"staged":1,"edge_total":1}));
-        seq += 1;
+        for absolute in 1..=32 {
+            records.push(serde_json::json!({"kind":"count_observation","seq":seq,
+                "caller":"c0","pair":pair,"absolute":absolute,"pre":1000+10*absolute,"post":1001+10*absolute}));
+            let mut decision = serde_json::json!({"kind":"publication","decision":"placed",
+                "seq":seq+1,"caller":"c0","pair":pair,"module_id":format!("mA-{index:02}"),
+                "base":absolute-1,"absolute":absolute,"staged":1,"edge_total":expected_a(absolute,k),
+                "pre":1000+10*absolute,"post":1001+10*absolute,
+                "observation_ref":{"seq":seq,"status":"retained"}});
+            if k == TARGETS && absolute == 2 {
+                decision["kind"] = "count_decision".into();
+                decision["decision"] = "withheld".into();
+                decision["reason"] = "awaiting_fence".into();
+                decision["module_id"] = serde_json::Value::Null;
+                decision["after"] = 1.into();
+                decision["through"] = 2.into();
+            }
+            records.push(decision);
+            seq += 2;
+        }
         for round in 1..=4 {
             let absolute = 32 + round;
             records.push(serde_json::json!({"kind":"count_observation","seq":seq,
@@ -5808,20 +6245,55 @@ fn twin_shared_pair_records() -> Vec<serde_json::Value> {
                 "observation_ref":{"seq":seq,"status":"retained"}}));
             seq += 2;
         }
+        for absolute in [37, 38] {
+            records.push(serde_json::json!({"kind":"count_observation","seq":seq,
+                "caller":"c0","pair":pair,"absolute":absolute,"pre":1000+10*absolute,"post":1001+10*absolute}));
+            let mut row = serde_json::json!({"seq":seq+1,"caller":"c0","pair":pair,
+                "absolute":absolute,"pre":1000+10*absolute,"post":1001+10*absolute,
+                "observation_ref":{"seq":seq,"status":"retained"}});
+            if absolute == 37 {
+                row["kind"] = "count_decision".into();
+                row["decision"] = "withheld".into();
+                row["reason"] = "awaiting_fence".into();
+                row["after"] = 36.into();
+                row["through"] = 37.into();
+            } else {
+                row["kind"] = "publication".into();
+                row["decision"] = "placed".into();
+                row["module_id"] = format!("mB-{index:02}").into();
+                row["base"] = 37.into();
+                row["staged"] = 1.into();
+                row["edge_total"] = 1.into();
+                row["baseline_pre"] = 1370.into();
+                row["baseline_post"] = 1371.into();
+            }
+            records.push(row);
+            seq += 2;
+        }
     }
-    records.extend(twin_terminal_records_as(32, 4));
     records
 }
 
 #[test]
 fn operator_diagnostics_wrap_twin_shared_pairs_no_compensation() -> Result<()> {
     let exact = twin_shared_pair_records();
-    // The current final gate validates terminal pairs but has no per-pair
-    // shared-phase check. A compensating shared mutation must also fail.
+    let modules_a: Vec<String> = (0..32).map(|index| format!("mA-{index:02}")).collect();
+    let modules_b: Vec<String> = (0..32).map(|index| format!("mB-{index:02}")).collect();
     let check = |records: &[serde_json::Value]| {
-        check_terminal_pairs_schedule(records, &twin_b_modules(), Some("c0"), 32, 4)
+        check_shared_pair_dispositions(records, "c0", &modules_a, &modules_b, 32, 4, 0)
     };
     check(&exact)?;
+    let mut fenced = twin_shared_pair_records_as(TARGETS);
+    check_shared_pair_dispositions(&fenced, "c0", &modules_a, &modules_b, 32, 4, TARGETS)?;
+    let startup = fenced
+        .iter_mut()
+        .find(|row| row["reason"] == "awaiting_fence" && row["through"] == 2)
+        .unwrap();
+    startup["pair"] = "p1".into();
+    ensure!(
+        check_shared_pair_dispositions(&fenced, "c0", &modules_a, &modules_b, 32, 4, TARGETS)
+            .is_err()
+    );
     for mutation in [
         "duplicate_pair",
         "missing",
@@ -5832,6 +6304,15 @@ fn operator_diagnostics_wrap_twin_shared_pairs_no_compensation() -> Result<()> {
         "reference",
         "placement",
         "module_pair",
+        "crossed_b",
+        "raw_pair",
+        "raw_extra",
+        "interval",
+        "fence_duplicate",
+        "fence_reference",
+        "proof_baseline",
+        "a_missing",
+        "a_compensation",
     ] {
         let mut changed = exact.clone();
         let at = changed
@@ -5862,13 +6343,148 @@ fn operator_diagnostics_wrap_twin_shared_pairs_no_compensation() -> Result<()> {
                 changed[at]["decision"] = "placed".into();
                 changed[at]["module_id"] = "mA-00".into();
             }
-            "module_pair" => changed[0]["module_id"] = "mA-01".into(),
+            "module_pair" => changed[1]["module_id"] = "mA-01".into(),
+            "crossed_b" => {
+                for row in &mut changed {
+                    if row["kind"] == "publication" && row["module_id"] == "mB-00" {
+                        row["module_id"] = "mB-01".into();
+                    } else if row["kind"] == "publication" && row["module_id"] == "mB-01" {
+                        row["module_id"] = "mB-00".into();
+                    }
+                }
+            }
+            "raw_pair" => changed[at - 1]["pair"] = "foreign".into(),
+            "raw_extra" => changed.push(
+                serde_json::json!({"kind":"count_observation","seq":1_000_000,
+                "caller":"c0","pair":"foreign","absolute":33,"pre":1330,"post":1331}),
+            ),
+            "interval" => changed[at]["pre"] = 1332.into(),
+            "fence_duplicate" => {
+                let fence = changed
+                    .iter()
+                    .find(|row| row["reason"] == "awaiting_fence")
+                    .unwrap()
+                    .clone();
+                changed.push(fence);
+            }
+            "fence_reference" => {
+                let fence = changed
+                    .iter_mut()
+                    .find(|row| row["reason"] == "awaiting_fence")
+                    .unwrap();
+                fence["observation_ref"]["seq"] = 999_999.into();
+            }
+            "proof_baseline" => {
+                let proof = changed
+                    .iter_mut()
+                    .find(|row| row["module_id"] == "mB-00")
+                    .unwrap();
+                proof["baseline_post"] = 1361.into();
+            }
+            "a_missing" => {
+                changed.remove(1);
+            }
+            "a_compensation" => {
+                changed[1]["staged"] = 2.into();
+                changed.remove(3);
+            }
             _ => unreachable!(),
         }
         ensure!(
             check(&changed).is_err(),
             "accepted compensating shared-pair mutation {mutation}"
         );
+    }
+    Ok(())
+}
+
+#[test]
+fn operator_diagnostics_wrap_twin_pilot_complete_export() -> Result<()> {
+    let mut exact = vec![
+        serde_json::json!({"kind":"header","scope":"pid","mode":"native","pid_filter":123,
+        "limits":{"ordinary_records":24576,"exceptional_records":8192,"heap_bytes":8*1024*1024}}),
+    ];
+    exact.extend(twin_shared_pair_records());
+    let names = [
+        "count_observation",
+        "ownership_transition",
+        "count_decision",
+        "publication",
+        "capture_health",
+    ];
+    let kinds: Vec<_> = names.iter().map(|name| {
+        let count = exact.iter().filter(|row| row["kind"] == *name).count();
+        serde_json::json!({"produced":count,"retained":count,"evicted":0,"filtered":0,"omitted":0})
+    }).collect();
+    exact.push(
+        serde_json::json!({"kind":"footer","diagnostics_complete":true,"counter_overflow":false,
+        "sequence_exhausted":false,"oversized_records":0,"kinds":kinds}),
+    );
+    let bytes = seal_validator_fixture(&mut exact);
+    check_bounded_pilot_export(&exact, bytes, 123)?;
+    for mutation in [
+        "seq", "evicted", "filtered", "omitted", "produced", "limits", "bytes", "footer",
+    ] {
+        let mut changed = exact.clone();
+        let last = changed.len() - 1;
+        match mutation {
+            "seq" => changed[1]["seq"] = 3.into(),
+            "evicted" | "filtered" | "omitted" => changed[last]["kinds"][0][mutation] = 1.into(),
+            "produced" => changed[last]["kinds"][0]["produced"] = 0.into(),
+            "limits" => changed[0]["limits"]["ordinary_records"] = 100.into(),
+            "bytes" => changed[last]["bytes_written"] = 1.into(),
+            "footer" => changed[last]["diagnostics_complete"] = false.into(),
+            _ => unreachable!(),
+        }
+        ensure!(
+            check_bounded_pilot_export(&changed, bytes, 123).is_err(),
+            "accepted incomplete pilot export {mutation}"
+        );
+    }
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("diagnostics.jsonl");
+    std::fs::write(
+        &path,
+        "{\"kind\":\"header\"}\nmalformed\n{\"kind\":\"footer\"}\n",
+    )?;
+    let (rows, note, complete) = read_pilot_records(&path);
+    ensure!(!complete && rows.len() == 2 && note.contains("skipped_lines=1"));
+    Ok(())
+}
+
+#[test]
+fn operator_diagnostics_wrap_twin_pilot_primary_schedule() -> Result<()> {
+    for k in [0, TARGETS] {
+        let mut document = primary_validator_fixture_k(123, 0, k);
+        for edge in document["edges"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .take(TARGETS as usize)
+        {
+            edge["entries"]["count"] = expected_a(32, k).into();
+        }
+        let caller = primary_pid_caller(&document, 123)?;
+        primary_facts_core_schedule(&document, 123, k, caller, 32)?;
+        ensure!(
+            primary_facts(&document, 123, k).is_err(),
+            "short pilot cannot replace full counts"
+        );
+        for mutation in ["a", "b", "loss", "retirement"] {
+            let mut changed = document.clone();
+            match mutation {
+                "a" => changed["edges"][0]["entries"]["count"] = (expected_a(32, k) + 1).into(),
+                "b" => changed["edges"][32]["entries"]["count"] = 2.into(),
+                "loss" => changed["observation"]["lifecycle"]["ring_loss"] = 1.into(),
+                "retirement" => changed["observation"]["retirement"] = "open".into(),
+                _ => unreachable!(),
+            }
+            let caller = primary_pid_caller(&changed, 123)?;
+            ensure!(
+                primary_facts_core_schedule(&changed, 123, k, caller, 32).is_err(),
+                "accepted pilot primary mutation {mutation}"
+            );
+        }
     }
     Ok(())
 }
@@ -6022,18 +6638,13 @@ fn operator_diagnostics_wrap_twin_verify_final_gaps_schedule() -> Result<()> {
     let modules_b: Vec<String> = (0..32).map(|index| format!("mB-{index:02}")).collect();
     let pilot_gaps = |startup: u64| {
         let mut gaps = vec![twin_startup_gap("c0", startup)];
-        gaps.extend(
-            modules_a
-                .iter()
-                .chain(modules_b.iter())
-                .map(|module| twin_ambiguity_gap(module, 4)),
-        );
+        gaps.extend((1..=4).map(|round| twin_range_gap("c0", 32 + round - 1, 32 + round, TARGETS)));
         gaps.push(twin_range_gap("c0", 36, 37, 32));
         gaps
     };
     verify_final_gaps_as(&pilot_gaps(32), "c0", &modules_a, &modules_b, 32, 32, 4)?;
     verify_final_gaps_as(&pilot_gaps(0), "c0", &modules_a, &modules_b, 0, 32, 4)?;
-    // One short module, a full-shape fence, or a mismatched k fails.
+    // One short shared range, a full-shape fence, or a mismatched k fails.
     let mut short = pilot_gaps(32);
     short[1].repeats = 3;
     ensure!(verify_final_gaps_as(&short, "c0", &modules_a, &modules_b, 32, 32, 4).is_err());

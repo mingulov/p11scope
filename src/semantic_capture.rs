@@ -2761,6 +2761,8 @@ mod tests {
         receipt_refusal: Option<CurrentReceiptRefusal>,
         receipt_epochs: Option<CompleteEpochs>,
         current_image: ImageIdentity,
+        endpoints: Option<BTreeMap<u32, Endpoint>>,
+        scan_ranges: Option<Vec<MapRange>>,
         fault_cell: Arc<std::sync::atomic::AtomicU64>,
         concurrent_raise: bool,
     }
@@ -2833,6 +2835,8 @@ mod tests {
                     task_cookie: 1,
                     exec_id: 1,
                 },
+                endpoints: None,
+                scan_ranges: None,
                 fault_cell: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 concurrent_raise: false,
             }
@@ -2934,8 +2938,12 @@ mod tests {
             if let Some(refusal) = self.attachment_refusal {
                 return Err(refusal);
             }
+            let file = self
+                .endpoint(slot)
+                .ok_or(CurrentReceiptRefusal::Attachment)?
+                .file_slot;
             self.watched
-                .get((slot / 2) as usize)
+                .get(file as usize)
                 .map(RetainedInventoryTarget::share)
                 .ok_or(CurrentReceiptRefusal::Attachment)
         }
@@ -2963,6 +2971,9 @@ mod tests {
             })
         }
         fn endpoint(&self, slot: u32) -> Option<Endpoint> {
+            if let Some(endpoints) = &self.endpoints {
+                return endpoints.get(&slot).copied();
+            }
             (slot < 4).then_some(Endpoint {
                 object: PinnedObjectId(slot / 2),
                 file_slot: slot / 2,
@@ -2992,6 +3003,9 @@ mod tests {
                 MapRange::new(base + 0x1000, base + 0x2000, 0, false),
                 MapRange::new(base + 0x2000, base + 0x3000, 0x1000, true),
             ];
+            if let Some(original) = &self.scan_ranges {
+                ranges = original.clone();
+            }
             if self.extra_range {
                 ranges.push(MapRange::new(0x4000, 0x5000, 0, false));
             }
@@ -3034,6 +3048,141 @@ mod tests {
     }
     fn capture(io: &ScriptIo) -> SemanticCapture {
         SemanticCapture::in_domain(io.domain, TickLimits::default()).unwrap()
+    }
+
+    #[test]
+    fn joint_birth_witness_uses_actual_new_once() {
+        // Regression: asking a second router observation to authorize the
+        // appearance H0 already consumed makes useful absence birth fail.
+        // The mapping/native reads are substituted below their protocols;
+        // raw dispatch, H0 routing and H3 admission are the actual code.
+        use crate::attach::image_query::acquire_test_absence;
+        use crate::attach::observe_absence_birth;
+        use crate::events::{EventDrain, EventsDomain, ScriptedRecords};
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        use crate::semantics_objects::journal::joint_driver::RawJointQuantum;
+        use crate::semantics_objects::journal::tests::{
+            AttestationFixture, ENTRY_NS, NativeBirthRows, NativePublisher, begin_bytes, end_bytes,
+            function_id,
+        };
+        use p11scope_ebpf_common::object_wire::{OBJECT_ACTION_CREATE, publish_object_descriptors};
+
+        struct Fault;
+        impl crate::semantics_objects::journal::FaultEpoch for Fault {
+            fn fault_epoch(
+                &self,
+            ) -> Result<u64, crate::semantics_objects::journal::FaultReadError> {
+                Ok(0)
+            }
+        }
+
+        let image = ImageIdentity {
+            task_cookie: 71,
+            exec_id: 0,
+        };
+        let mut fixture = AttestationFixture::new(image);
+        let (slot, endpoint) = fixture.endpoint_for("C_CreateObject");
+        let mut io = ScriptIo::with_paths(
+            fixture.domain(),
+            &fixture.provider_path(),
+            std::path::Path::new("/usr/bin/false"),
+        );
+        io.pin = fixture.binding().pin();
+        io.local = 1;
+        io.current_image = image;
+        io.output_image = Some(image);
+        io.endpoints = Some(BTreeMap::from([(slot, endpoint)]));
+        io.scan_ranges = Some(vec![MapRange::new(0x7000_0000, 0x7000_6000, 0, true)]);
+        let mut capture = capture(&io);
+
+        let negative = acquire_test_absence(
+            io.domain,
+            image,
+            endpoint.file_slot,
+            CompleteEpochs {
+                local: 0,
+                global: 0,
+                fault: 0,
+                sticky: 0,
+                record_flags: 0,
+            },
+            vec![p11scope_manifest::maps::MapEntry {
+                start: 0x4000,
+                end: 0x5000,
+                file_offset: 0,
+                permissions: *b"r-xp",
+                device: p11scope_manifest::maps::Device { major: 8, minor: 2 },
+                inode: 1001,
+                raw_path: None,
+            }],
+            fixture.attachment().generation(),
+            vec![io.watched[0].object_key()],
+            crate::discovery::instances::MappedFileIdentity {
+                dev: 0x801,
+                ino: 999,
+            },
+            |_, _| panic!("no watched-provider mapping to confirm"),
+            capture.router.fence(),
+        )
+        .expect("complete genuine negative protocol");
+        let mut begin = begin_bytes(1, 1, function_id("C_CreateObject"), 0);
+        let pid = u64::from(io.pin.pid());
+        begin[24..32].copy_from_slice(&((pid << 32) | pid).to_le_bytes());
+        begin[56..64].copy_from_slice(&(0x7000_0000 + endpoint.offset).to_le_bytes());
+        begin[64..68].copy_from_slice(&1u32.to_le_bytes());
+        begin[68..76].fill(0);
+        begin[76..78].copy_from_slice(&1u16.to_le_bytes());
+        begin[104..108].copy_from_slice(&slot.to_le_bytes());
+        let end = end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 100);
+        let rows = publish_object_descriptors();
+        let events = EventsDomain::test_standin(0xb101);
+        let producers = crate::attach::SessionDrainProducers::test_pair(io.domain, events.clone());
+        let mut drain = EventDrain::over_domain(
+            ScriptedRecords::records([begin.to_vec(), end.to_vec()], 2),
+            events,
+        );
+        let pool = SemanticResourcePool::default();
+        let mut raw =
+            RawJointQuantum::collect(&mut drain, &rows, 4_096, &Fault, &producers, |bytes| {
+                pool.reserve(bytes)
+            })
+            .expect("original collection");
+        let mut report = capture.tick_collected_with(&mut io, &mut raw).unwrap();
+        assert_eq!(report.observations, vec![ObserveOutcome::New]);
+        assert_eq!(report.calls().count(), 1, "useful original return routed");
+        let admitted = fixture.admit_collected(match report.take_outcomes().pop().unwrap() {
+            TickOutcome::Call(call) => call,
+            other => panic!("actual return expected: {other:?}"),
+        });
+        let appearance = io
+            .scan_selected(
+                &fixture.binding().pin(),
+                endpoint,
+                Instant::now() + Duration::from_secs(1),
+                capture.router.fence(),
+                &|| capture.router.fence(),
+            )
+            .expect("current appearance protocol");
+        let publisher = NativePublisher::build();
+        let (row, control, _) = publisher.publish(&["0", "0", "0", "0", "1"]);
+        let result = observe_absence_birth(
+            &mut NativeBirthRows { row, control },
+            negative,
+            appearance,
+            &mut capture.router,
+            fixture.binding(),
+            fixture.attachment(),
+            &admitted,
+        );
+        assert!(
+            result.is_ok(),
+            "actual H0 birth must retain its first New: {result:?}"
+        );
+        assert_eq!(
+            capture.router.instances_minted(),
+            1,
+            "one original H0 incarnation"
+        );
     }
 
     /// H7 slice D activation: mixed ordinary/lifecycle/object records flow

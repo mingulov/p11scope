@@ -5374,8 +5374,20 @@ pub(crate) mod tests {
 
     impl AttestationFixture {
         pub(crate) fn new(image: ImageIdentity) -> Self {
+            Self::with_quiet_function(image, false)
+        }
+
+        pub(crate) fn new_with_quiet_function(image: ImageIdentity) -> Self {
+            Self::with_quiet_function(image, true)
+        }
+
+        fn with_quiet_function(image: ImageIdentity, quiet: bool) -> Self {
             use p11scope_manifest::identity::{inspect_file, mapping_file_key, open_object};
             use p11scope_manifest::manifest::*;
+            let admitted_functions: Vec<_> = ADMITTABLE_FUNCTIONS
+                .into_iter()
+                .chain(quiet.then_some("C_GetSessionInfo"))
+                .collect();
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("provider.so");
             std::fs::copy("/bin/true", &path).unwrap();
@@ -5385,7 +5397,7 @@ pub(crate) mod tests {
             let start = inspected
                 .executable_ranges
                 .iter()
-                .find(|(a, b)| b - a > 64 + ADMITTABLE_FUNCTIONS.len() as u64)
+                .find(|(a, b)| b - a > 64 + admitted_functions.len() as u64)
                 .unwrap()
                 .0;
             let functions: Vec<FunctionRecord> =
@@ -5399,7 +5411,7 @@ pub(crate) mod tests {
                         .iter()
                         .flat_map(|span| span.fields())
                         .map(|field| {
-                            let resolution = ADMITTABLE_FUNCTIONS
+                            let resolution = admitted_functions
                                 .iter()
                                 .position(|name| *name == field.name)
                                 .map(|index| Resolution::Resolved {
@@ -5511,7 +5523,7 @@ pub(crate) mod tests {
                 );
             let subset = prepared.subset.expect("nonempty validated operator subset");
             let mut functions = BTreeMap::new();
-            for name in ADMITTABLE_FUNCTIONS {
+            for name in admitted_functions {
                 let slot = subset
                     .plan()
                     .slots
@@ -5611,6 +5623,29 @@ pub(crate) mod tests {
         /// native identity its admissions name.
         pub(crate) fn domain(&self) -> NativeDomainId {
             self.domain
+        }
+
+        pub(crate) fn provider_path(&self) -> std::path::PathBuf {
+            self._dir.path().join("provider.so")
+        }
+
+        pub(crate) fn endpoint_for(&self, name: &str) -> (u32, Endpoint) {
+            self.functions[name]
+        }
+
+        pub(crate) fn admit_collected(&mut self, call: RoutedCall) -> AdmittedInstanceCall {
+            self.next_token = self
+                .next_token
+                .max(call.position().expect("actual H0 position"));
+            let evidence = CallEvidence::from_routed(call).expect("actual H0 joined call");
+            admit_call_from_evidence(
+                evidence,
+                self.binding(),
+                self.subset.as_ref().expect("subset held"),
+                CallStanding::Historical(InstanceReason::SemanticLoss),
+                None,
+            )
+            .expect("actual collected call admits")
         }
 
         /// The happy-path binding, genuinely bound: read back from the
@@ -9959,6 +9994,25 @@ pub(crate) mod tests {
         assert!(
             !source.contains(&needle),
             "scripted bindings remain in journal.rs"
+        );
+    }
+
+    #[test]
+    fn joint_ordinary_async_target_cannot_make_a_quiet_sighting() {
+        // target_function names an async target argument, not this
+        // physical endpoint. Trusting it could hide affecting history
+        // underneath an absence birth cut before any H3 admission.
+        let mut scene = Scene::new(image_default());
+        let begin = begin_bytes(1, 1, function_id("C_Sign"), 0);
+        let mut event = ordinary_for(&begin, 0);
+        event.target_function = function_id("C_GetInfo");
+        scene.ingest_ordinary(event);
+        let sighting = scene.adapter.sightings.get(&(COOKIE, EXEC)).unwrap();
+        assert_eq!(sighting.first_seen, 1);
+        assert_eq!(
+            sighting.first_affecting,
+            Some(1),
+            "unadmitted ordinary input cannot be narrowed by an async target argument",
         );
     }
 

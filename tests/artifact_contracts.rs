@@ -7901,7 +7901,7 @@ fn metadata_canary_matrix() {
     let assert_lanes = between(
         &canaries,
         "assert_lanes() {",
-        "\n}\n\nif [ \"${1-}\" = \"--self-test\" ]",
+        "\n}\n\nif [ \"$SELF_TEST\" -eq 1 ]",
     );
     assert!(
         !assert_lanes.contains("<<'PY'")
@@ -7957,7 +7957,7 @@ aggregate-only-metrics default metrics"
     let owned_lane = between(
         &canaries,
         "run_owned_lane() {",
-        "\n}\n\nwhile read -r owned_lane owned_build; do",
+        "\n}\n\nif [ \"$OBJECT_PILOT\" -eq 0 ]; then\nwhile read -r owned_lane owned_build; do",
     );
     assert!(
         owned_lane.contains("--workload-origin owned")
@@ -7978,7 +7978,7 @@ aggregate-only-metrics default metrics"
     let start_lane = between(
         &canaries,
         "run_start_lane() {",
-        "\n}\n\necho \"=== live safe START policy",
+        "\n}\n\nif [ \"$OBJECT_PILOT\" -eq 0 ]; then\necho \"=== live safe START policy",
     );
     let raw_start = start_lane
         .find("sudo python3 -I scripts/capture-stopped-canary.py")

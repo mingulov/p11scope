@@ -92,6 +92,8 @@ def check_ledger(rows, acks, nonce, pid, directory, counted, shared, probe=False
         if (len(matches) != 1 or matches[0]['calls'] != ordinal * 32
                 or calls[ordinal * 32 - 1]['after_return_ns'] > matches[0]['t']):
             raise ValueError('native phase ACK differs from its actual complete32slot round')
+        if ordinal * 32 < len(calls) and matches[0]['t'] > calls[ordinal * 32]['before_call_ns']:
+            raise ValueError('native next round began before the prior complete32slot ACK')
     return dict(calls=len(expected), targets=32, physical_pairs=32, counted_rounds=counted,
                 shared_rounds=0 if probe else shared,
                 phase_calls=dict(Counter(row['phase'] for row in calls)))

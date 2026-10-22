@@ -560,6 +560,17 @@ fn object_producer_sweep_path_within_jump_budget() {
     );
 }
 
+#[test]
+fn object_producer_scrub_preserves_whole_side_and_neighbors() {
+    owner_fixture::run_object_subcommand(
+        "object_producer_scrub_preserves_whole_side_and_neighbors",
+        "object custody complete scrub passed",
+    );
+    let directory = tempfile::tempdir().expect("complete emitted side scrub");
+    let object = embedded_object(directory.path());
+    println!("{}", run_object_checker(&object, "scrubs"));
+}
+
 /// Actual emitted-object custody checks: exact owned-map allocation,
 /// bounded leaf frames with no nested calls, bounded root call chains, and
 /// fault-call placement. Modes: `frames`, `return-fault`, `exec-exit-fault`.
@@ -908,6 +919,203 @@ def check_exec_exit_fault(data, report):
     report.append('cleanup nests no fault call')
 
 
+def scrub_flow(instructions, map_loads):
+    graph = {}
+    pc = 0
+    while pc < len(instructions):
+        op, _, offset, immediate = instructions[pc]
+        size = 2 if op == 0x18 else 1
+        if size == 2:
+            assert pc + 1 < len(instructions) and instructions[pc + 1][0] == 0
+        if op == 0x95:
+            targets = []
+        elif op == 0x05:
+            targets = [pc + 1 + offset]
+        elif op == 0x06:
+            targets = [pc + 1 + immediate]
+        elif op & 7 in (5, 6) and op != 0x85:
+            targets = [pc + 1, pc + 1 + offset]
+        else:
+            targets = [pc + size]
+        graph[pc] = targets
+        pc += size
+    assert all(target in graph for targets in graph.values() for target in targets)
+    states = {0: (None,) * 10 + (('stack', 0),)}
+    pending = [0]
+    while pending:
+        pc = pending.pop()
+        before = states[pc]
+        values = list(before)
+        op, reg, offset, immediate = instructions[pc]
+        dst, src = reg & 15, reg >> 4
+        if op == 0x85:
+            values[:6] = [None] * 6
+        elif op & 7 == 3 and op & 0xe0 == 0xc0:
+            # Atomic fetch writes its source (CMPXCHG writes r0); the
+            # non-fetch add has no implicit register result.
+            if immediate & 0xf0 == 0xf0:
+                values[0] = None
+            elif immediate & 1:
+                values[src] = None
+        elif op & 7 in (0, 1, 4, 7):
+            value = None
+            if op == 0x18:
+                value = map_loads.get(pc)
+                if value is None:
+                    value = ((immediate & 0xffffffff)
+                             | ((instructions[pc + 1][3] & 0xffffffff) << 32))
+            elif op in (0xb4, 0xb7) and offset == 0:
+                value = immediate & ((1 << (32 if op == 0xb4 else 64)) - 1)
+            elif op == 0xbf and offset == 0:
+                value = before[src]
+            elif op == 0xbc and offset == 0 and isinstance(before[src], int):
+                value = before[src] & 0xffffffff
+            elif op == 0x07 and offset == 0:
+                if isinstance(before[dst], int):
+                    value = (before[dst] + immediate) & ((1 << 64) - 1)
+                elif before[dst] and before[dst][0] == 'stack':
+                    value = ('stack', before[dst][1] + immediate)
+            values[dst] = value
+        after = tuple(values)
+        for target in graph[pc]:
+            previous = states.get(target)
+            merged = (after if previous is None else
+                      tuple(left if left == right else None
+                            for left, right in zip(previous, after)))
+            if previous != merged:
+                states[target] = merged
+                pending.append(target)
+    predecessors = {pc: [] for pc in graph}
+    for pc, targets in graph.items():
+        for target in targets:
+            predecessors[target].append(pc)
+    return states, predecessors
+
+
+def complete_side_scrubs(data):
+    elf, raws, offsets, bodies, relocations = bodies_and_relocations(data)
+    key = only(bodies, 'p11_owner_cleanup')
+    body = body_of(raws, bodies, key)
+    instructions = [struct.unpack_from('<BBhi', body, at)
+                    for at in range(0, len(body), 8)]
+    # Name actual relocated map arguments, including native section-symbol
+    # relocations. A nearby string/symbol is not a map-argument proof.
+    maps = {(symbol[3], symbol[4]): symbol[0] for symbol in elf.symbols
+            if symbol[1] & 15 == 1
+            and symbol[3] in {elf.indices.get('.maps'), elf.indices.get('maps')}}
+    map_loads = {}
+    for pc, (op, _, _, immediate) in enumerate(instructions):
+        relocation = relocations.get((key[0], key[1] + pc * 8))
+        if relocation and relocation[0] == 1:
+            target = relocation[1]
+            name = maps.get((target[3], target[4] + immediate))
+            assert op == 0x18 and name, 'scrub map relocation must name an exact map'
+            map_loads[pc] = ('map', name)
+    states, predecessors = scrub_flow(instructions, map_loads)
+    old_loops = [pc for pc, (op, _, offset, immediate) in enumerate(instructions)
+                 if op & 7 in (5, 6) and offset < 0 and immediate == 432]
+    assert not old_loops, f'side scrub retains 54-word backedge(s): {old_loops}'
+    deletes = [pc for pc, (op, reg, _, immediate) in enumerate(instructions)
+               if op == 0x85 and reg >> 4 == 0 and immediate == 3]
+    assert deletes, 'cleanup must perform actual deletions'
+    side_deletes, stores = [], set()
+    for deleted in deletes:
+        assert states[deleted][1] and states[deleted][1][0] == 'map', \
+            'cleanup deletion has an unproven map argument'
+        if states[deleted][1] != ('map', 'OBJECT_START'):
+            continue
+        side_deletes.append(deleted)
+        delete_key = states[deleted][2]
+        assert delete_key and delete_key[0] == 'stack', 'side deletion needs its actual stack key'
+        pending = [(pc, None, 424, (), frozenset({deleted}))
+                   for pc in predecessors[deleted]]
+        proved = 0
+        while pending:
+            pc, pointer, wanted, stack_writes, ancestors = pending.pop()
+            assert pc not in ancestors, 'side scrub path must be loop-free'
+            ancestors = ancestors | {pc}
+            op, reg, offset, immediate = instructions[pc]
+            dst, src = reg & 15, reg >> 4
+            if op == 0x85:
+                assert (reg >> 4 == 0 and immediate == 1
+                        and states[pc][1] == ('map', 'OBJECT_START')), \
+                    'scrub must reach the exact side lookup without an intervening call'
+                assert wanted == -8 and pointer == (0, 0), \
+                    'side deletion requires all 54 ordered zero stores to its lookup result'
+                assert states[pc][2] == delete_key, 'scrub and deletion must use the same key'
+                assert not any(at < delete_key[1] + 16 and delete_key[1] < at + width
+                               for at, width in stack_writes), 'side key changed after lookup'
+                proved += 1
+                continue
+            if op & 7 in (2, 3):
+                base = states[pc][dst]
+                width = {0: 4, 8: 2, 16: 1, 24: 8}[op & 0x18]
+                if base and base[0] == 'stack':
+                    stack_writes += ((base[1] + offset, width),)
+                else:
+                    assert op in (0x7a, 0x7b), 'side scrub requires full-width ordinary stores'
+                    if pointer is None:
+                        pointer = (dst, 0)
+                    assert pointer[0] == dst and pointer[1] + offset == wanted, \
+                        'side scrub has a missing, reordered, extra or foreign word'
+                    zero = (immediate == 0 if op == 0x7a else states[pc][src] == 0)
+                    assert zero, 'every side scrub store must be proven zero'
+                    stores.add(pc)
+                    wanted -= 8
+            elif pointer is not None and op & 7 in (0, 1, 4, 7) and dst == pointer[0]:
+                if op == 0xbf and offset == 0:
+                    pointer = (src, pointer[1])
+                elif op == 0x07 and offset == 0:
+                    pointer = (dst, pointer[1] + immediate)
+                else:
+                    raise AssertionError('side scrub pointer was clobbered or truncated')
+            assert predecessors[pc], 'side scrub must originate at an actual side lookup'
+            pending.extend((previous, pointer, wanted, stack_writes, ancestors)
+                           for previous in predecessors[pc])
+        assert proved, 'side deletion has no proven scrub path'
+    assert side_deletes and len(stores) >= 54, 'missing real complete side scrub'
+    return key, offsets, instructions, stores, side_deletes
+
+
+def check_scrubs(data, report):
+    key, offsets, instructions, stores, deletes = complete_side_scrubs(data)
+    ordered = sorted(stores)
+    first = ordered[0]
+    op, reg, offset, immediate = instructions[first]
+    assert op == 0x7b, 'actual volatile scrub must have a source-register store'
+    mutations = {
+        'missing word': (0xb7, 5, 0, 0),
+        'nonzero word': (0x7a, reg & 15, offset, 1),
+        'unknown zero source': (op, 0xa0 | (reg & 15), offset, immediate),
+        'wrong word': (op, reg, offset + 8, immediate),
+        'outside side': (op, reg, 432, immediate),
+        'foreign destination': (op, (reg & 0xf0) | 10, offset, immediate),
+        'early delete': (0x85, 0, 0, 3),
+    }
+    for label, replacement in mutations.items():
+        bad = bytearray(data)
+        struct.pack_into('<BBhi', bad, file_offset(offsets, key, first, 0), *replacement)
+        assert bytes(bad) != data, f'{label} must change actual instructions'
+        try:
+            complete_side_scrubs(bytes(bad))
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError(f'{label} scrub mutation accepted')
+    bad = bytearray(data)
+    second = ordered[1]
+    left, right = (file_offset(offsets, key, pc, 0) for pc in (first, second))
+    bad[left:left + 8], bad[right:right + 8] = bad[right:right + 8], bad[left:left + 8]
+    try:
+        complete_side_scrubs(bytes(bad))
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError('reordered scrub mutation accepted')
+    report.append(f'cleanup: {len(deletes)} actual side deletion(s), {len(stores)} '
+                  'complete ordered zero stores; eight actual mutations refused')
+
+
 def main():
     data = Path(sys.argv[1]).read_bytes()
     mode = sys.argv[2]
@@ -925,6 +1133,8 @@ def main():
         check_return_fault(data, report)
     elif mode == 'exec-exit-fault':
         check_exec_exit_fault(data, report)
+    elif mode == 'scrubs':
+        check_scrubs(data, report)
     else:
         raise AssertionError(f'unknown checker mode {mode}')
     print('\n'.join(report))

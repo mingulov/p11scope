@@ -353,6 +353,9 @@ static __always_inline void object_scrub_side(void *side)
 {
     volatile u64 *words = side;
     u32 i;
+    /* Fixed 432-byte row: keep all volatile stores in order, without a
+     * second verifier loop inside each of the 512-slot cleanup sweeps. */
+#pragma clang loop unroll(full)
     for (i = 0; i < OBJECT_START_WORDS; i++)
         words[i] = 0;
 }

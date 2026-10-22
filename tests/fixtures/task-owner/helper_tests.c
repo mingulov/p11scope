@@ -66,6 +66,7 @@ static int fail_start_readback_once;
  * path must scrub before deleting. */
 static unsigned char deleted_side[432];
 static int deleted_side_seen;
+static int require_scrubbed_side_delete, checked_side_deletes;
 static u64 instance_gen[INST_GEN_CELLS];
 static struct instance_counters instance_counters_live;
 #endif
@@ -160,6 +161,14 @@ static long update(void *map, const void *key, const void *data, u64 flags)
 }
 static long pair_delete(void *map, const void *key)
 {
+#ifndef P11SCOPE_INVENTORY_ONLY
+    if (map == &OBJECT_START && require_scrubbed_side_delete) {
+        struct row *side = row(map, key);
+        assert(side);
+        for (unsigned i = 0; i < 432; i++) assert(side->value[i] == 0);
+        checked_side_deletes++;
+    }
+#endif
     if (pair_delete_error) return pair_delete_error;
     /* Models a concurrent lease-accounting loss landing mid-transaction:
      * entry validation already passed with a live count, so only this
@@ -276,6 +285,7 @@ static void reset(void)
     fail_object_side_lookup_once = 0; hide_side_slot = -1; zero_outstanding_on_delete = 0;
     fail_start_readback_once = 0;
     deleted_side_seen = 0;
+    require_scrubbed_side_delete = checked_side_deletes = 0;
     memset(instance_gen, 0, sizeof(instance_gen));
     memset(&instance_counters_live, 0, sizeof(instance_counters_live));
     inst_map_lookup = instance_lookup;
@@ -1717,6 +1727,59 @@ static void object_producer_cleanup_result_reaches_exec_exit_fault(void)
     assert(deleted_side_seen && object_bytes_zeroed(deleted_side));
     puts("object custody cleanup result passed");
 }
+
+static void object_producer_scrub_preserves_whole_side_and_neighbors(void)
+{
+    struct {
+        u64 before[2];
+        u64 words[54];
+        u64 after[2];
+    } guarded;
+    memset(&guarded, 0xA5, sizeof(guarded));
+    object_scrub_side(guarded.words);
+    for (unsigned i = 0; i < 54; i++) assert(guarded.words[i] == 0);
+    for (unsigned i = 0; i < 2; i++) {
+        assert(guarded.before[i] == 0xA5A5A5A5A5A5A5A5ULL);
+        assert(guarded.after[i] == 0xA5A5A5A5A5A5A5A5ULL);
+    }
+    for (int failure = 0; failure < 2; failure++) {
+        struct owner_start_key key = { .slot = 7 };
+        struct owner_start_key foreign;
+        unsigned char poison[432];
+        reset(); object_setup();
+        assert(p11_owner_lease());
+        key.pid_tgid = owners[0].original_pid_tgid;
+        foreign = key;
+        foreign.pid_tgid ^= 1ULL << 32;
+        memset(poison, 0x5A, sizeof(poison));
+        /* No START exists: a valid retained owner authorizes its orphan
+         * sweep. Poison EVERY side byte without forging a live binding. */
+        assert(!update(&OBJECT_START, &key, poison, 1));
+        assert(!update(&OBJECT_START, &foreign, poison, 1));
+        require_scrubbed_side_delete = 1;
+        fail_object_side_delete = failure ? -16 : 0;
+        assert(p11_owner_cleanup() == (u32)failure);
+        assert(checked_side_deletes == 1);
+        assert(row(&OBJECT_START, &foreign));
+        assert(!memcmp(row(&OBJECT_START, &foreign)->value, poison, 432));
+        if (failure) {
+            assert(row(&OBJECT_START, &key));
+            assert(object_bytes_zeroed(row(&OBJECT_START, &key)->value));
+            assert(ctl.outstanding == 1 && !ctl.abandoned_start);
+            assert(ctl.poison == OWNER_STATE_DELETE_FAILED);
+            fail_object_side_delete = 0;
+            assert(p11_owner_cleanup() == 1); /* Sticky poison, settled debt. */
+            assert(checked_side_deletes == 2);
+        }
+        assert(!row(&OBJECT_START, &key));
+        assert(!ctl.outstanding && ctl.abandoned_start == 1);
+        assert(deleted_side_seen && object_bytes_zeroed(deleted_side));
+        assert(p11_owner_cleanup() == (u32)failure);
+        assert(checked_side_deletes == (failure ? 2 : 1));
+        assert(!memcmp(row(&OBJECT_START, &foreign)->value, poison, 432));
+    }
+    puts("object custody complete scrub passed");
+}
 /* H7-E2 root-refusal mirror: replicates the FIXED BPF return root object
  * arms (`p11_return_impl`) through the real native owner transactions:
  * every refusal arm attempts the checked removal before returning, image
@@ -2200,6 +2263,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[1], "object_producer_side_state_n_and_n_plus_one")) object_producer_side_state_n_and_n_plus_one();
         else if (!strcmp(argv[1], "object_producer_missing_side_state_faults_before_return")) object_producer_missing_side_state_faults_before_return();
         else if (!strcmp(argv[1], "object_producer_cleanup_result_reaches_exec_exit_fault")) object_producer_cleanup_result_reaches_exec_exit_fault();
+        else if (!strcmp(argv[1], "object_producer_scrub_preserves_whole_side_and_neighbors")) object_producer_scrub_preserves_whole_side_and_neighbors();
         else if (!strcmp(argv[1], "object_producer_return_refusals_retire_owned_state")) object_producer_return_refusals_retire_owned_state();
         else if (!strcmp(argv[1], "object_producer_alloc_readback_failure_preserves_cleanup_authority")) object_producer_alloc_readback_failure_preserves_cleanup_authority();
         else if (!strcmp(argv[1], "object_producer_orphan_delete_failure_keeps_cleanup_authority")) object_producer_orphan_delete_failure_keeps_cleanup_authority();
@@ -2214,6 +2278,7 @@ int main(int argc, char **argv)
         lease_boundary(); classifier(); transactions(); directory(); lifecycle(); poisoned_reads(); capacity_collision(); ordinary_absence(); discovery_foreign_owner();
         object_producer_owner_terminal_matrix(); object_producer_side_state_n_and_n_plus_one();
         object_producer_missing_side_state_faults_before_return(); object_producer_cleanup_result_reaches_exec_exit_fault();
+        object_producer_scrub_preserves_whole_side_and_neighbors();
         object_producer_return_refusals_retire_owned_state(); object_producer_alloc_readback_failure_preserves_cleanup_authority();
         object_producer_orphan_delete_failure_keeps_cleanup_authority();
         object_producer_empty_lease_refund_failure_remains_visible(); object_owner_sweep_adjacent_lookup_preserves_custody();

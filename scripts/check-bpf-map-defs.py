@@ -929,7 +929,7 @@ def validate_ia32_raw_span(insns, read):
         pc += size
 
     def transfer(pc, state):
-        op, reg, _, imm = insns[pc]
+        op, reg, offset, imm = insns[pc]
         values = list(state)
         dst, src = reg & 15, reg >> 4
         if op == 0x85:
@@ -945,15 +945,16 @@ def validate_ia32_raw_span(insns, read):
             value = None
             if op == 0x18 and src == 0:
                 value = (imm & 0xffffffff) | ((insns[pc + 1][3] & 0xffffffff) << 32)
-            elif op in (0xb4, 0xb7):
+            elif op in (0xb4, 0xb7) and offset == 0:
                 value = imm & ((1 << (32 if op == 0xb4 else 64)) - 1)
-            elif op in (0xbc, 0xbf):
+            elif op in (0xbc, 0xbf) and offset == 0:
                 if src > 10:
                     raise RuntimeError("ia32 reader span has invalid source register")
                 value = state[src]
                 if value is not None and op == 0xbc:
                     value &= 0xffffffff
-            # Loads and unmodeled arithmetic invalidate the destination fact.
+            # Nonzero-offset MOVSX shares MOV opcodes; do not preserve its
+            # source fact. Loads and unmodeled arithmetic also invalidate it.
             values[dst] = value
         return tuple(values)
 

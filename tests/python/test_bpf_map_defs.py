@@ -774,6 +774,9 @@ class MapDefsTests(unittest.TestCase):
                 [(text_row[4] + pc, "B", 0xbc)], "span.*sentinel")
             cases[f"saved_sentinel_unknown_{pc}"] = (
                 [(text_row[4] + pc + 1, "B", 0x90 if reg >> 4 != 9 else 0x80)], "span.*sentinel")
+            for width in (8, 16, 32):
+                cases[f"saved_sentinel_sign_extended_{width}_{pc}"] = (
+                    [(text_row[4] + pc + 2, "h", width)], "span.*sentinel")
         for name, (changes, reason) in cases.items():
             with self.subTest(name=name), self.assertRaisesRegex(RuntimeError, reason):
                 checker.inspect(self.mutate(changes, obj), allowed)
@@ -860,6 +863,8 @@ class Ia32SpanProofTests(unittest.TestCase):
             "caller_saved_clobber": reader(5, [(0x85, 0, 0, 5), (0xbf, 0x50, 0, 0), exit]),
             "unsafe_merge": reader(6, [(0x15, 7, 1, 0), (0xb7, 6, 0, 0), copy, exit]),
         }
+        mutants.update({f"sign_extended_copy_{width}": reader(6, [(0xbf, 0x60, width, 0), exit])
+                        for width in (8, 16, 32)})
         for name, instructions in mutants.items():
             with self.subTest(mutation=name), self.assertRaisesRegex(RuntimeError, "span.*sentinel"):
                 checker.validate_ia32_raw_span(instructions, 3)

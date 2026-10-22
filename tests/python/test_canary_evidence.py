@@ -131,13 +131,16 @@ def owned_metrics_document(bits, calls=30):
         evidence["discovery"][0]["corroboration"] = ["conflict"]
     else:
         evidence["surfaces"].extend([
-            {"walk": "full", "functions": functions, "acquisition": "ok",
+            {"walk": walk, "functions": functions, "acquisition": "ok",
              "source": f"/opt/p11.so table {major}.{minor}"}
-            for major, minor, functions in ((3, 1, 92), (3, 2, 104))
+            for major, minor, functions, walk in (
+                (3, 1, 92, "full"), (3, 2, 104, "full"),
+                (3, 9, 104, "known_prefix"))
         ])
         evidence["discovery"][0]["tables"].extend([
             {"source": "scan", "version": [3, 1], "entries": 92},
             {"source": "scan", "version": [3, 2], "entries": 104},
+            {"source": "scan", "version": [3, 9], "entries": 104},
         ])
         evidence["discovery"][0].update(corroborated=True, corroboration=["agreed"])
     document = subject.document_fixture(
@@ -3297,6 +3300,29 @@ class RingLayoutTests(unittest.TestCase):
 
 
 class OwnedMetricsOracleTests(unittest.TestCase):
+    def test_owned_metrics_fixture_keeps_abi_specific_future_minor_scan(self):
+        for bits, surfaces in ((64, 16), (32, 19)):
+            with self.subTest(bits=bits):
+                capture, document = owned_metrics_document(bits)
+                evidence = document["evidence"]
+                self.assertEqual(len(evidence["surfaces"]), surfaces)
+                future = [table for table in evidence["discovery"][0]["tables"]
+                          if table["source"] == "scan" and table["version"] == [3, 9]]
+                self.assertEqual(future, ([{"source": "scan", "version": [3, 9],
+                                           "entries": 104}] if bits == 32 else []))
+                capture.validate_canary("owned-default-metrics", document, bits)
+                if bits == 32:
+                    bad = copy.deepcopy(document)
+                    bad["evidence"]["surfaces"] = [
+                        row for row in bad["evidence"]["surfaces"]
+                        if row["source"] != "/opt/p11.so table 3.9"]
+                    with self.assertRaisesRegex(AssertionError, "unexpected surfaces"):
+                        capture.validate_canary("owned-default-metrics", bad, bits)
+                    bad = copy.deepcopy(document)
+                    bad["evidence"]["discovery"][0]["tables"].remove(future[0])
+                    with self.assertRaises(AssertionError):
+                        capture.validate_canary("owned-default-metrics", bad, bits)
+
     def test_owned_metrics_require_exact_30_and_closed_run_evidence(self):
         canary = load_subject(TARGET_BITS)
         capture, owned = owned_metrics_document(TARGET_BITS)

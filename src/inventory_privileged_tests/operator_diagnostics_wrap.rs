@@ -1027,6 +1027,8 @@ fn original_diagnostic_read(
     Ok((pre, post))
 }
 
+type ACountLineage = (String, BTreeMap<u64, (u64, u64)>);
+
 /// Pair-bound staging establishes lineage and original reads. Ordinary Bound
 /// staging commits through a null-pair direct publication; pending staging
 /// commits through its actual placed/pending result. Neither shape supplies
@@ -1038,7 +1040,7 @@ fn check_a_count_lineage(
     module: &str,
     issued: &[u64],
     milestones: &[(u64, u64)],
-) -> Result<(String, BTreeMap<u64, (u64, u64)>)> {
+) -> Result<ACountLineage> {
     let mut expected = BTreeMap::new();
     let mut base = 0u64;
     let mut total = 0u64;

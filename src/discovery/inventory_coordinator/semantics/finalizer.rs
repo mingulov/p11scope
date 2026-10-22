@@ -120,6 +120,8 @@ mod tests {
         let other_native = SessionDrainProducers::test_pair(NativeDomainId::mint(), events);
         let other_events =
             SessionDrainProducers::test_pair(native, crate::events::EventsDomain::test_standin(92));
+        let equal_id_foreign =
+            SessionDrainProducers::test_pair(native, crate::events::EventsDomain::test_standin(91));
         let mut state = SessionFinalizerState::new(native);
         assert!(!state.bind_producers(&other_native));
         assert!(state.producers.is_none());
@@ -127,6 +129,10 @@ mod tests {
         assert!(state.bind_producers(&own.clone()));
         assert!(!state.bind_producers(&other_native));
         assert!(!state.bind_producers(&other_events));
+        assert!(
+            !state.bind_producers(&equal_id_foreign),
+            "the same map id cannot replace the retained EVENTS allocation"
+        );
         assert_eq!(
             state.producers.as_ref().unwrap().events_id(),
             own.events_id()

@@ -238,16 +238,18 @@ class DualBuildCallerTests(unittest.TestCase):
                               env=environment, text=True, stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE, timeout=10)
 
-    def expected(self, child, bits, prepared, diagnose=False):
+    def expected(self, child, bits, prepared, diagnose=False, capture_mode="full"):
         prefix = ["build", "--locked", "--offline"] if prepared else [f"+{RELEASE_RUST}", "build", "--locked"]
         if child.name == "verify-attach-e2e.sh":
             features = "skip-attribution,stub-object-attributes" if diagnose else "stub-object-attributes"
             return [prefix + ["--release", "--workspace", "--features", features,
                               "--target-dir", str(self.work / "build")]]
+        stub = ["--features", "stub-object-attributes"] if capture_mode == "p0" else []
+        diagnostic = "unsafe-unvalidated-metadata" + (",stub-object-attributes" if stub else "")
         rows = [
-            prefix + ["--release", "--workspace", "--features", "stub-object-attributes",
+            prefix + ["--release", "--workspace", *stub,
                       "--target-dir", str(self.work / "default-build")],
-            prefix + ["--release", "--workspace", "--features", "unsafe-unvalidated-metadata,stub-object-attributes",
+            prefix + ["--release", "--workspace", "--features", diagnostic,
                       "--target-dir", str(self.work / "feature-build")],
         ]
         if bits == 32:
@@ -256,11 +258,13 @@ class DualBuildCallerTests(unittest.TestCase):
                                    str(self.work / "helper-build")])
         return rows
 
-    def assert_builds(self, child, bits, prepared, diagnose=False):
-        expected = self.expected(child, bits, prepared, diagnose)
+    def assert_builds(self, child, bits, prepared, diagnose=False, capture_mode=None):
+        expected = self.expected(child, bits, prepared, diagnose, capture_mode or "full")
         self.configure([0] * (len(expected) - 1) + [83])
-        result = self.run_child(child, bits, prepared,
-                                ("--diagnose-skips",) if diagnose else ())
+        arguments = ("--diagnose-skips",) if diagnose else ()
+        if capture_mode is not None:
+            arguments += ("--capture-mode", capture_mode)
+        result = self.run_child(child, bits, prepared, arguments)
         self.assertEqual(result.returncode, 83, result.stderr)
         rows = self.rows()
         builds = [row for row in rows if row["kind"] == "cargo"]
@@ -279,6 +283,64 @@ class DualBuildCallerTests(unittest.TestCase):
             self.assertEqual(len(preparations), len(builds))
             self.assertTrue(all(row["isolated"] == 1 and row["argv"] == []
                                 for row in preparations))
+
+    def test_capture_modes_select_build_features_and_oracle_together(self):
+        # Run the actual build caller and its actual oracle dispatcher. Only
+        # external commands are replaced; no fixture recomputes mode selection.
+        checker = self.repo / "scripts/check-canary-evidence.py"
+        checker.write_text(
+            'import json, os, pathlib, sys\n'
+            'config = json.loads(pathlib.Path(os.environ["P11SCOPE_DUAL_BUILD_CONFIG"]).read_text())\n'
+            'with open(config["events"], "a") as handle:\n'
+            ' handle.write(json.dumps({"kind": "checker", "argv": sys.argv[1:]}) + "\\n")\n')
+        sudo = self.bin / "sudo"
+        sudo.unlink()
+        sudo.write_text('#!/bin/sh\nexec "$@"\n')
+        sudo.chmod(0o755)
+        script = (self.repo / "scripts/verify-canaries.sh").read_text()
+        prefix = script[:script.index('P11SCOPE_PRODUCT_BUILD_MODE=')]
+        probe = self.repo / "scripts/oracle-probe.sh"
+        probe.write_text(prefix + '\nassert_lanes --object-starts a b c d 1 2\n'
+                         'assert_lanes "$WORK"\n')
+        for mode, oracle in (("full", "present"), ("p0", "absent")):
+            for bits in (32, 64):
+                for prepared in (False, True):
+                    with self.subTest(mode=mode, bits=bits, prepared=prepared):
+                        self.assert_builds(CHILDREN[1], bits, prepared, capture_mode=mode)
+                        result = subprocess.run(["sh", str(probe), "--capture-mode", mode],
+                            env={**self.environment, "P11SCOPE_CANARY_TARGET_BITS": str(bits)},
+                            capture_output=True, text=True, timeout=5)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        rows = [row for row in self.rows() if row["kind"] == "checker"]
+                        self.assertEqual(len(rows), 2)
+                        for row in rows:
+                            self.assertEqual(row["argv"][:2], ["--object-attributes", oracle])
+                            self.assertEqual(row["argv"][-1], str(bits))
+        captures = [command for command in logical_commands(CHILDREN[1])
+                    if 'scripts/capture-stopped-canary.py' in command]
+        self.assertEqual(len(captures), 5)
+        self.assertTrue(all('--object-attributes "$OBJECT_ATTRIBUTES"' in command for command in captures))
+
+    def test_capture_mode_refuses_before_resources(self):
+        self.configure([83])
+        for arguments in (("--capture-mode", "bogus"), ("--capture-mode", ""),
+                          ("--capture-mode",), ("--capture-mode", "full", "--capture-mode", "p0"),
+                          ("--self-test", "--capture-mode", "p0"),
+                          ("--capture-mode", "full", "--self-test"),
+                          ("--capture-mode=full",), ("extra",)):
+            with self.subTest(arguments=arguments):
+                shutil.rmtree(self.work, ignore_errors=True)
+                result = self.run_child(CHILDREN[1], arguments=arguments)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertFalse(self.events.exists())
+                self.assertFalse(self.work.exists())
+
+    def test_release_canary_call_pins_p0_until_full_activation(self):
+        commands = [command for command in logical_commands(ROOT / "scripts/build-release.sh")
+                    if command.startswith("P11SCOPE_PRODUCT_BUILD_MODE=prepared")
+                    and "scripts/verify-canaries.sh" in command]
+        self.assertEqual(len(commands), 1)
+        self.assertIn("scripts/verify-canaries.sh --capture-mode p0", commands[0])
 
     def test_canary_product_builds_precede_task_storage_helper(self):
         commands = [command.lstrip() for command in logical_commands(CHILDREN[1])]
@@ -601,7 +663,8 @@ raise SystemExit({checker_status})
         for command, child, bits in zip(commands, CHILDREN[::-1], (64, 64)):
             with self.subTest(child=child.name):
                 self.events.unlink(missing_ok=True)
-                expected = self.expected(child, bits, True)
+                expected = self.expected(child, bits, True,
+                                         capture_mode="p0" if child == CHILDREN[1] else "full")
                 self.configure([0] * (len(expected) - 1) + [83])
                 command_file = self.base / f"{child.name}.command"
                 command_file.write_text(command, encoding="utf-8")

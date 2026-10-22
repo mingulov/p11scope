@@ -718,7 +718,7 @@ P11SCOPE_PREPARED_STABLE_CARGO="$T4_TOOLCHAIN_CARGO" \
 P11SCOPE_PREPARED_STABLE_RUSTC="$T4_TOOLCHAIN_RUSTC" \
 P11SCOPE_PREPARED_BPF_CARGO="$t4_nightly_cargo" \
 P11SCOPE_PREPARED_BPF_RUSTC="$t4_nightly_rustc" \
-P11SCOPE_RECEIPT_WORK="$CANARY_WORK" sh scripts/verify-canaries.sh
+P11SCOPE_RECEIPT_WORK="$CANARY_WORK" sh scripts/verify-canaries.sh --capture-mode p0
 
 echo "=== p11scope: dynamic-build attach correctness ==="
 P11SCOPE_PRODUCT_BUILD_MODE=prepared \

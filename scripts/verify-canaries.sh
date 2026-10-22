@@ -6,6 +6,30 @@
 set -eu
 cd "$(dirname "$0")/.."
 
+usage() {
+    echo "usage: $0 [--capture-mode full|p0] | --self-test" >&2
+    exit 2
+}
+CAPTURE_MODE=full
+capture_selected=0
+SELF_TEST=0
+while [ "$#" -gt 0 ]; do
+    case $1 in
+        --capture-mode)
+            [ "$#" -ge 2 ] && [ "$capture_selected" -eq 0 ] || usage
+            case $2 in full|p0) CAPTURE_MODE=$2 ;; *) usage ;; esac
+            capture_selected=1
+            shift 2
+            ;;
+        --self-test)
+            [ "$#" -eq 1 ] && [ "$capture_selected" -eq 0 ] || usage
+            SELF_TEST=1
+            shift
+            ;;
+        *) usage ;;
+    esac
+done
+
 WORK=${P11SCOPE_RECEIPT_WORK-target/canaries}
 if [ "${P11SCOPE_RECEIPT_WORK+set}" = set ]; then
     case $WORK in /*) ;; *) echo "P11SCOPE_RECEIPT_WORK must be absolute" >&2; exit 2 ;; esac
@@ -18,26 +42,23 @@ case $TARGET_BITS in
     *) echo "P11SCOPE_CANARY_TARGET_BITS must be 32 or 64" >&2; exit 2 ;;
 esac
 
-# Both observer builds below carry stub-object-attributes, so every lane
-# oracle runs in absent mode: stopped side rows keep zero attribute state
-# and completion tails mark present pairs UNINSPECTED. A FULL build would
-# need present here to match its inspected values.
-OBJECT_ATTRIBUTES=absent
+case $CAPTURE_MODE in
+    full) OBJECT_ATTRIBUTES=present ;;
+    p0) OBJECT_ATTRIBUTES=absent ;;
+esac
 
 assert_lanes() {
     case ${1-} in
-        --hostile-starts|--fault-starts)
-            sudo python3 -I scripts/check-canary-evidence.py "$@" "$TARGET_BITS"
-            ;;
-        --object-starts)
+        --hostile-starts|--fault-starts|--object-starts)
             sudo python3 -I scripts/check-canary-evidence.py \
-                --object-attributes="$OBJECT_ATTRIBUTES" "$@" "$TARGET_BITS"
+                --object-attributes "$OBJECT_ATTRIBUTES" "$@" "$TARGET_BITS"
             ;;
-        *) python3 -I scripts/check-canary-evidence.py "$@" "$TARGET_BITS" ;;
+        *) python3 -I scripts/check-canary-evidence.py \
+               --object-attributes "$OBJECT_ATTRIBUTES" "$@" "$TARGET_BITS" ;;
     esac
 }
 
-if [ "${1-}" = "--self-test" ]; then
+if [ "$SELF_TEST" -eq 1 ]; then
     python3 -I scripts/check-capture-evidence.py --self-test
     assert_lanes --self-test
     python3 -I tests/python/test_canary_evidence.py --target-bits "$TARGET_BITS" -v
@@ -82,11 +103,14 @@ cleanup() {
 
 echo "=== build ==="
 rm -rf "$WORK/default-build" "$WORK/feature-build" "$WORK/helper-build"
+set -- --release --workspace
+[ "$CAPTURE_MODE" != p0 ] || set -- "$@" --features stub-object-attributes
 p11scope_product_build "$P11SCOPE_PRODUCT_BUILD_MODE" \
-    --release --workspace --features stub-object-attributes \
-    --target-dir "$WORK/default-build"
+    "$@" --target-dir "$WORK/default-build"
+canary_features=unsafe-unvalidated-metadata
+[ "$CAPTURE_MODE" != p0 ] || canary_features=$canary_features,stub-object-attributes
 p11scope_product_build "$P11SCOPE_PRODUCT_BUILD_MODE" \
-    --release --workspace --features unsafe-unvalidated-metadata,stub-object-attributes \
+    --release --workspace --features "$canary_features" \
     --target-dir "$WORK/feature-build"
 P11SCOPE_DEFAULT="$WORK/default-build/release/p11scope"
 P11SCOPE_FEATURE="$WORK/feature-build/release/p11scope"

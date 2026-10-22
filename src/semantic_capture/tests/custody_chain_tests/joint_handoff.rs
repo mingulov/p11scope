@@ -186,6 +186,14 @@ impl JointScene {
     }
 
     fn push(&mut self, pid: u32, file: u32, name: &str, sequence: u64) {
+        let (begin, end) = self.encoded(pid, file, name, sequence);
+        self.drain.source_mut().push_record(begin.to_vec());
+        self.drain.source_mut().push_record(end.to_vec());
+    }
+
+    /// One original physical pair; future-END tests retain these bytes only
+    /// on the fixture stack until the same cursor actually receives END.
+    fn encoded(&self, pid: u32, file: u32, name: &str, sequence: u64) -> ([u8; 224], [u8; 632]) {
         let held = self.real.h0.0.borrow();
         let io = &held.io;
         let image = io.targets[&pid].1;
@@ -232,8 +240,7 @@ impl JointScene {
         } else {
             end_bytes_absent(&begin, 0, ENTRY_NS + 10)
         };
-        self.drain.source_mut().push_record(begin.to_vec());
-        self.drain.source_mut().push_record(end.to_vec());
+        (begin, end)
     }
 
     fn prepare(&mut self, count: usize) -> RawJointQuantum {

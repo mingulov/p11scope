@@ -37,6 +37,9 @@ pub(crate) struct IngestedJointQuantum {
     failure: Option<SealFailure>,
     consumers: Vec<FrameConsumer>,
     bound: bool,
+    cursor: usize,
+    pending: usize,
+    future: usize,
     active: Option<ActiveSeal>,
     // Nested buffers always drop before their own reservation.
     failure_storage: Option<ResourceLease>,
@@ -311,6 +314,9 @@ impl IngestedJointQuantum {
             failure,
             consumers: Vec::new(),
             bound: false,
+            cursor: 0,
+            pending: 0,
+            future: 0,
             active: None,
             failure_storage: None,
             targets_storage: None,
@@ -451,28 +457,33 @@ impl IngestedJointQuantum {
             return Err(RawQuantumRefusal::Admission);
         }
         consumers.sort_unstable_by_key(|consumer| consumer.target.id());
+        self.pending = consumers.len();
         self.consumers = consumers;
         self.targets_storage = Some(storage);
         self.bound = true;
         Ok(())
     }
 
+    fn advance_consumer(&mut self, state: ConsumerState) {
+        debug_assert!(self.consumers[self.cursor].state == ConsumerState::Pending);
+        self.consumers[self.cursor].state = state;
+        self.pending -= 1;
+        self.future += usize::from(state == ConsumerState::Future);
+        while self.cursor < self.consumers.len()
+            && self.consumers[self.cursor].state != ConsumerState::Pending
+        {
+            self.cursor += 1;
+        }
+    }
+
     fn progress(&self) -> QuantumSealProgress {
         if self.active.is_some() {
             return QuantumSealProgress::DeliveryReady;
         }
-        if self
-            .consumers
-            .iter()
-            .any(|consumer| consumer.state == ConsumerState::Pending)
-        {
+        if self.pending != 0 {
             return QuantumSealProgress::LocalPending;
         }
-        if self
-            .consumers
-            .iter()
-            .any(|consumer| consumer.state == ConsumerState::Future)
-        {
+        if self.future != 0 {
             QuantumSealProgress::AwaitFutureInput
         } else {
             QuantumSealProgress::Complete
@@ -514,13 +525,10 @@ impl IngestedJointQuantum {
         if self.active.is_some() {
             return Ok(QuantumSealProgress::DeliveryReady);
         }
-        let Some(index) = self
-            .consumers
-            .iter()
-            .position(|consumer| consumer.state == ConsumerState::Pending)
-        else {
+        if self.pending == 0 {
             return Ok(self.progress());
-        };
+        }
+        let index = self.cursor;
         if let Some(failure) = &self.failure {
             return Ok(
                 if failure.affects_domain(self.consumers[index].target.bootstrap().domain()) {
@@ -564,9 +572,18 @@ impl IngestedJointQuantum {
                 let failure = outcome.expect_err("checked original broad failure");
                 for consumer in &mut self.consumers {
                     if failure.affects_domain(consumer.target.bootstrap().domain()) {
+                        self.pending += usize::from(consumer.state != ConsumerState::Pending);
+                        self.future -= usize::from(consumer.state == ConsumerState::Future);
                         consumer.state = ConsumerState::Pending;
                     }
                 }
+                // One broad failure may revisit earlier positives. Rewind
+                // once, rather than rescan the whole target list per delivery.
+                self.cursor = self
+                    .consumers
+                    .iter()
+                    .position(|consumer| consumer.state == ConsumerState::Pending)
+                    .unwrap_or(self.consumers.len());
                 self.failure = Some(failure);
                 self.failure_storage = Some(storage);
                 return Ok(QuantumSealProgress::DeliveryReady);
@@ -574,7 +591,7 @@ impl IngestedJointQuantum {
             if failure.gap == JournalGap::BoundNotReady
                 && adapter.awaits_future_terminal(target.bootstrap(), self.frontier)
             {
-                self.consumers[index].state = ConsumerState::Future;
+                self.advance_consumer(ConsumerState::Future);
                 return Ok(QuantumSealProgress::AwaitFutureInput);
             }
         }
@@ -595,13 +612,10 @@ impl IngestedJointQuantum {
             return Err(RawQuantumRefusal::DispositionMismatch);
         }
         if self.failure.is_some() {
-            let Some(index) = self
-                .consumers
-                .iter()
-                .position(|consumer| consumer.state == ConsumerState::Pending)
-            else {
+            if self.pending == 0 {
                 return Ok(self.progress());
-            };
+            }
+            let index = self.cursor;
             let target = self.consumers[index].target;
             let Some(failure) = self.failure_for(target.bootstrap().domain()) else {
                 return Ok(QuantumSealProgress::LocalPending);
@@ -613,7 +627,7 @@ impl IngestedJointQuantum {
                 FailureApplyOutcome::Degraded { .. }
                 | FailureApplyOutcome::FellBack { .. }
                 | FailureApplyOutcome::Ignored => {
-                    self.consumers[index].state = ConsumerState::LossDelivered;
+                    self.advance_consumer(ConsumerState::LossDelivered);
                     return Ok(self.progress());
                 }
                 FailureApplyOutcome::Retried | FailureApplyOutcome::HeldForCompleteness => {
@@ -665,7 +679,7 @@ impl IngestedJointQuantum {
             }
         };
         if complete {
-            self.consumers[index].state = ConsumerState::Delivered;
+            self.advance_consumer(ConsumerState::Delivered);
             self.active = None;
             Ok(self.progress())
         } else {
@@ -681,13 +695,7 @@ impl IngestedJointQuantum {
         if let Err(reason) = self.preflight(ports) {
             return Err((self, reason));
         }
-        if !self.bound
-            || self.active.is_some()
-            || self
-                .consumers
-                .iter()
-                .any(|consumer| consumer.state == ConsumerState::Pending)
-        {
+        if !self.bound || self.active.is_some() || self.pending != 0 {
             return Err((self, RawQuantumRefusal::DispositionMismatch));
         }
         if let Some(failure) = &self.failure {

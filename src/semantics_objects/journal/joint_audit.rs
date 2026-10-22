@@ -405,6 +405,11 @@ impl IngestedJointQuantum {
     }
 
     #[cfg(test)]
+    pub(crate) fn active_seal_for_test(&self) -> Option<&SealSuccess> {
+        self.active.as_ref()?.outcome.as_ref().ok()
+    }
+
+    #[cfg(test)]
     pub(crate) fn retained_storage_bytes_for_test(&self) -> usize {
         self.retained_storage_bytes()
             .expect("retained bounded storage")

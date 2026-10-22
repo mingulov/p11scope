@@ -76,7 +76,7 @@ impl CanonicalFanoutScene {
     }
 
     fn prior_sealed_with_providers(providers: usize) -> Self {
-        let (held, attached) = HeldProviders::with_attachment(
+        Self::prior_sealed_with_functions(
             providers,
             &[
                 "C_CreateObject",
@@ -84,7 +84,11 @@ impl CanonicalFanoutScene {
                 "C_SignUpdate",
                 "C_SignFinal",
             ],
-        );
+        )
+    }
+
+    fn prior_sealed_with_functions(providers: usize, functions: &[&str]) -> Self {
+        let (held, attached) = HeldProviders::with_attachment(providers, functions);
         let mut scene = JointScene::from_held(held, Some(attached));
         scene.real.h0.0.borrow_mut().io.script.local = 1;
         let child = OwnedStoppedChild::new();
@@ -3458,4 +3462,505 @@ fn joint_zero_head_pending_h3_requires_original_continuation_and_keeps_fault_pre
             0
         );
     }
+}
+
+/// The same actual collector, owner, model and frame used above; this gate
+/// observes conversion only. Multi-call H9 delivery deliberately stays held.
+struct ObservationWire {
+    label: &'static str,
+    begin: [u8; 224],
+    end: [u8; 632],
+}
+
+fn observation_wire(
+    fixture: &CanonicalFanoutScene,
+    pid: u32,
+    label: &'static str,
+    function: &'static str,
+    sequence: u64,
+) -> ObservationWire {
+    use crate::semantics_objects::journal::tests::{end_bytes_getattr, end_bytes_result};
+    use p11scope_ebpf_common::object_wire::{
+        OBJECT_ACTION_CREATE, OBJECT_ACTION_DESTROY, OBJECT_ACTION_SET,
+    };
+    let (mut begin, _) = fixture.scene.encoded(pid, 0, function, sequence);
+    // A fresh handle, distinct from both prior-sealed fixture objects. The
+    // END builders copy this exact original argument/status into their tails.
+    if matches!(
+        function,
+        "C_SignInit" | "C_GetAttributeValue" | "C_SetAttributeValue" | "C_DestroyObject"
+    ) {
+        begin[88..96].copy_from_slice(&0x5151u64.to_le_bytes());
+        begin[126] = 1;
+    }
+    let end = match function {
+        "C_CreateObject" => {
+            end_bytes_result(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 10, 0x5151)
+        }
+        "C_GetAttributeValue" => end_bytes_getattr(
+            &begin,
+            0,
+            ENTRY_NS + 10,
+            &[
+                (1, 1, 3),
+                (2, 1, 0),
+                (5, 1, if label == "metadata" { 2048 } else { 4096 }),
+            ],
+        ),
+        "C_SetAttributeValue" => end_bytes(&begin, OBJECT_ACTION_SET, 0, ENTRY_NS + 10),
+        "C_DestroyObject" => end_bytes(&begin, OBJECT_ACTION_DESTROY, 0, ENTRY_NS + 10),
+        "C_SignInit" => end_bytes(&begin, OBJECT_ACTION_ACCESS, 0, ENTRY_NS + 10),
+        _ => end_bytes_absent(&begin, 0, ENTRY_NS + 10),
+    };
+    ObservationWire { label, begin, end }
+}
+
+fn observe_genuine_settlement_order(late_metadata: bool) {
+    use crate::semantics_key_use::KeyUseReducer;
+    use crate::semantics_objects::{KeyLabel, trace_settlement_for_test};
+    use pkcs11_types::CkRv;
+    let mut completion_tuples = Vec::new();
+    for reverse_end in [false, true] {
+        let mut delivery_tuple = None;
+        for reverse_delivery in [false, true] {
+            let mut fixture = CanonicalFanoutScene::prior_sealed_with_functions(
+                1,
+                &[
+                    "C_CreateObject",
+                    "C_GetAttributeValue",
+                    "C_SetAttributeValue",
+                    "C_DestroyObject",
+                    "C_SignInit",
+                    "C_SignUpdate",
+                    "C_SignFinal",
+                ],
+            );
+            let target = fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .registry()
+                .joint_feed_targets()
+                .min_by_key(JointFeedTarget::id)
+                .unwrap();
+            let primary = if fixture.births[0].0 == target.caller() {
+                std::process::id()
+            } else {
+                fixture._child.id()
+            };
+            let peer = if primary == std::process::id() {
+                fixture._child.id()
+            } else {
+                std::process::id()
+            };
+            let mut wires = Vec::new();
+            let mut physical = Vec::new();
+            let init_sequence = if late_metadata { 3 } else { 4 };
+            {
+                let mut pair = |wire: ObservationWire| {
+                    let index = wires.len();
+                    physical.push((index, false));
+                    physical.push((index, true));
+                    wires.push(wire);
+                };
+                pair(observation_wire(
+                    &fixture,
+                    primary,
+                    "create",
+                    "C_CreateObject",
+                    2,
+                ));
+                if !late_metadata {
+                    pair(observation_wire(
+                        &fixture,
+                        primary,
+                        "metadata",
+                        "C_GetAttributeValue",
+                        3,
+                    ));
+                }
+            }
+            let init_index = wires.len();
+            let mut init = observation_wire(&fixture, primary, "init", "C_SignInit", init_sequence);
+            let mut independent =
+                observation_wire(&fixture, peer, "independent", "C_SignUpdate", 2);
+            // Two different retained physical threads/images overlap, while
+            // Init still finishes before any dependent metadata mutation.
+            let entry = u64::from_le_bytes(init.begin[48..56].try_into().unwrap());
+            independent.begin[48..56].copy_from_slice(&(entry + 1).to_le_bytes());
+            init.end = end_bytes(
+                &init.begin,
+                OBJECT_ACTION_ACCESS,
+                CkRv::OK.0,
+                ENTRY_NS + if reverse_end { 20 } else { 10 },
+            );
+            independent.end = end_bytes_absent(
+                &independent.begin,
+                CkRv::OK.0,
+                ENTRY_NS + if reverse_end { 9 } else { 19 },
+            );
+            assert_ne!(&init.begin[8..24], &independent.begin[8..24]);
+            wires.push(init);
+            wires.push(independent);
+            physical.extend([(init_index, false), (init_index + 1, false)]);
+            if reverse_end {
+                physical.extend([(init_index + 1, true), (init_index, true)]);
+            } else {
+                physical.extend([(init_index, true), (init_index + 1, true)]);
+            }
+            let mut sequence = init_sequence + 1;
+            if late_metadata {
+                let index = wires.len();
+                wires.push(observation_wire(
+                    &fixture,
+                    primary,
+                    "metadata",
+                    "C_GetAttributeValue",
+                    sequence,
+                ));
+                physical.extend([(index, false), (index, true)]);
+                sequence += 1;
+            }
+            for (label, name) in [
+                ("conflict", "C_GetAttributeValue"),
+                ("invalidate", "C_SetAttributeValue"),
+                ("destroy", "C_DestroyObject"),
+                ("reuse", "C_CreateObject"),
+                ("replacement_metadata", "C_GetAttributeValue"),
+                ("final", "C_SignFinal"),
+            ] {
+                let index = wires.len();
+                wires.push(observation_wire(&fixture, primary, label, name, sequence));
+                physical.extend([(index, false), (index, true)]);
+                sequence += 1;
+            }
+            assert_eq!(wires.len(), 10);
+            for (index, terminal) in &physical {
+                fixture.scene.drain.source_mut().push_record(if *terminal {
+                    wires[*index].end.to_vec()
+                } else {
+                    wires[*index].begin.to_vec()
+                });
+            }
+            let mut raw = fixture.scene.collect_with_fault(&BirthFault);
+            let mut report = {
+                let mut h0 = fixture.scene.real.h0.0.borrow_mut();
+                let HeldH0 { capture, io, .. } = &mut *h0;
+                capture.tick_collected_with(io, &mut raw).unwrap()
+            };
+            assert_eq!(report.calls().count(), wires.len());
+            assert_eq!(report.awaiting_floor(), None);
+            assert_eq!(report.shed_floor(), None);
+            let originals: Vec<_> = report
+                .calls()
+                .map(|call| {
+                    (
+                        call.position().unwrap(),
+                        call.collected_origin().unwrap(),
+                        call.record().event.ts_ns,
+                    )
+                })
+                .collect();
+            let base_admission = originals.iter().map(|entry| entry.0).min().unwrap();
+            let watermark = report.allocated_below();
+            if reverse_delivery {
+                let mut original_outcomes = report.take_outcomes();
+                original_outcomes.reverse();
+                assert_eq!(report.merge_stashed_outcomes(original_outcomes), 0);
+            }
+            let mut after: Vec<_> = report
+                .calls()
+                .map(|call| {
+                    (
+                        call.position().unwrap(),
+                        call.collected_origin().unwrap(),
+                        call.record().event.ts_ns,
+                    )
+                })
+                .collect();
+            after.sort_by_key(|entry| entry.0);
+            let mut before = originals;
+            before.sort_by_key(|entry| entry.0);
+            assert_eq!(after, before, "delivery never remints original H0 identity");
+            assert_eq!(report.allocated_below(), watermark);
+            let batch = SemanticBatch::from_tick_report(
+                fixture.scene.real.lane.domain(),
+                report,
+                Vec::new(),
+                now_ns(),
+            )
+            .unwrap();
+            let coordinator = &mut fixture.scene.real.scene.coordinator;
+            coordinator.stage_semantic_batch(batch);
+            coordinator
+                .prepare_staged_semantic_batch(&mut fixture.scene.real.lane, None)
+                .unwrap();
+            let admissions: Vec<_> = coordinator
+                .prepared_semantic_batch()
+                .unwrap()
+                .admissions()
+                .map(|input| (input.h0_ordinal(), input.s1_facts().ts_ns))
+                .collect();
+            assert_eq!(
+                admissions.iter().map(|entry| entry.0).collect::<Vec<_>>(),
+                (base_admission..watermark).collect::<Vec<_>>()
+            );
+            let ingested = raw
+                .ingest(
+                    coordinator.joint_capture_mut().adapter_mut(),
+                    &fixture.scene.producers,
+                    &fixture.grant,
+                )
+                .unwrap_or_else(|(_, reason)| panic!("original observation raw: {reason:?}"));
+            assert_eq!(
+                claim_and_finish(&mut fixture.scene, &ingested).len(),
+                wires.len()
+            );
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .commit_batch_with_semantics(false, Some(&mut fixture.scene.real.lane))
+                .unwrap();
+            let mut frame = acquire(&mut fixture.scene, ingested, &fixture.attached, &BirthFault);
+            assert!(frame.failure_for_test().is_none());
+            let feeds_before = fixture.feeds();
+            let h0 = fixture.scene.real.h0.clone();
+            let mut births = NativeFrameBirths {
+                h0: &h0,
+                attached: &fixture.attached,
+                retained: &mut fixture.births,
+                seen: Vec::new(),
+                unreadable: false,
+            };
+            let trace = {
+                let mut ports = fixture
+                    .scene
+                    .real
+                    .scene
+                    .coordinator
+                    .joint_frame_ports(&fixture.scene.producers)
+                    .unwrap();
+                frame.bind_targets(&ports).unwrap();
+                let (progress, trace) =
+                    trace_settlement_for_test(target.bootstrap().domain(), || {
+                        frame.seal_next(&mut ports, &mut births, &BirthFault)
+                    });
+                assert_eq!(progress, Ok(QuantumSealProgress::DeliveryReady));
+                trace
+            };
+            assert_eq!(births.seen.len(), 1);
+            drop(births);
+            let seal = frame
+                .active_seal_for_test()
+                .expect("borrow the actual retained seal");
+            assert_eq!(seal.prefix.domain(), target.bootstrap().domain());
+            assert_eq!(seal.prefix.settled().len(), 9);
+            assert_eq!(trace.settlements, 1);
+            assert_eq!(
+                trace.steps.len(),
+                18,
+                "every real BEGIN and END, including empty effects"
+            );
+            let conversion_len = seal
+                .effects
+                .effects
+                .len()
+                .checked_sub(trace.effects.len())
+                .unwrap();
+            assert_eq!(&seal.effects.effects[conversion_len..], trace.effects);
+            assert_eq!(
+                conversion_len, 0,
+                "healthy conversion emitted no pre-settlement effects"
+            );
+            let prefix_base = seal.prefix.frontier_cut() - physical.len() as u64;
+            let mut keyuse = KeyUseReducer::new();
+            let mut selected = Vec::new();
+            for (index, wire) in wires
+                .iter()
+                .enumerate()
+                .filter(|(_, wire)| wire.label != "independent")
+            {
+                let begin_index = physical
+                    .iter()
+                    .position(|item| *item == (index, false))
+                    .unwrap();
+                let end_index = physical
+                    .iter()
+                    .position(|item| *item == (index, true))
+                    .unwrap();
+                let begin_cut = prefix_base + begin_index as u64 + 1;
+                let end_cut = prefix_base + end_index as u64 + 1;
+                let settled = seal
+                    .prefix
+                    .settled()
+                    .iter()
+                    .find(|call| call.begin_cut == begin_cut)
+                    .unwrap();
+                let ts = u64::from_le_bytes(wire.end[24..32].try_into().unwrap());
+                let admission = admissions.iter().find(|entry| entry.1 == ts).unwrap().0;
+                assert_eq!(settled.key.admission(), admission);
+                assert_eq!(settled.end_cut, Some(end_cut));
+                let steps: Vec<_> = trace
+                    .steps
+                    .iter()
+                    .filter(|step| step.call == settled.ticket)
+                    .collect();
+                assert_eq!(steps.len(), 2);
+                assert_eq!((steps[0].cut, steps[0].terminal), (begin_cut, false));
+                assert_eq!((steps[1].cut, steps[1].terminal), (end_cut, true));
+                assert!(steps[0].effects.is_empty());
+                let receipts = keyuse.receipts_for_call(
+                    seal,
+                    settled,
+                    fixture.scene.real.scene.coordinator.joint_capture().model(),
+                    admission,
+                );
+                selected.push((wire.label, *settled, steps[1], receipts));
+            }
+            assert!(trace.steps.windows(2).all(|pair| pair[0].cut < pair[1].cut));
+            let find = |label| selected.iter().find(|entry| entry.0 == label).unwrap();
+            let create = find("create");
+            let old = trace.effects[create.2.effects.clone()]
+                .iter()
+                .find_map(|effect| match effect {
+                    ObjectEffect::Created { call, object, .. } if *call == create.1.ticket => {
+                        Some(*object)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            let reuse = find("reuse");
+            let replacement = trace.effects[reuse.2.effects.clone()]
+                .iter()
+                .find_map(|effect| match effect {
+                    ObjectEffect::Created { call, object, .. } if *call == reuse.1.ticket => {
+                        Some(*object)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            assert_ne!(old, replacement);
+            let init = find("init");
+            assert_eq!(init.3.len(), 1);
+            let receipt = init.3[0];
+            assert_eq!(
+                (receipt.key, receipt.input, receipt.position),
+                (old, 0, init.1.key.admission())
+            );
+            assert!(receipt.attribution_valid);
+            assert_eq!(
+                receipt.label,
+                if late_metadata {
+                    None
+                } else {
+                    Some(KeyLabel::Rsa { modulus_bits: 2048 })
+                }
+            );
+            assert_eq!(
+                receipt.metadata.established_count(),
+                if late_metadata { 0 } else { 3 }
+            );
+            let conflict = find("conflict");
+            assert!(trace.effects[conflict.2.effects.clone()].iter().any(|effect| matches!(effect,
+                ObjectEffect::MetadataConflict { call, object, .. } if *call == conflict.1.ticket && *object == old)));
+            let invalidation = find("invalidate");
+            assert!(
+                trace.effects[invalidation.2.effects.clone()]
+                    .iter()
+                    .any(|effect| matches!(effect,
+                ObjectEffect::MetadataInvalidated { object, .. } if *object == old))
+            );
+            let destroy = find("destroy");
+            assert!(trace.effects[destroy.2.effects.clone()].iter().any(|effect| matches!(effect,
+                ObjectEffect::Destroyed { call, object } if *call == destroy.1.ticket && *object == old)));
+            let final_call = find("final");
+            assert!(
+                final_call.2.effects.is_empty(),
+                "Final still needs its actual empty transition boundary"
+            );
+            assert!(final_call.3.is_empty());
+            assert!(
+                init.2.cut < conflict.2.cut
+                    && conflict.2.cut < invalidation.2.cut
+                    && invalidation.2.cut < destroy.2.cut
+                    && destroy.2.cut < reuse.2.cut
+                    && reuse.2.cut < final_call.2.cut
+            );
+            assert_eq!(
+                fixture
+                    .scene
+                    .real
+                    .scene
+                    .coordinator
+                    .joint_capture()
+                    .model()
+                    .receipt_snapshot(replacement)
+                    .unwrap()
+                    .label,
+                Some(KeyLabel::Rsa { modulus_bits: 4096 })
+            );
+            let tuple = (
+                init.1.key.admission(),
+                init.1.begin_cut,
+                init.1.end_cut.unwrap(),
+            );
+            eprintln!(
+                "observation late={late_metadata} reverse_end={reverse_end} reverse_delivery={reverse_delivery}: init={tuple:?}, frozen={:?}, conflict={}, invalidation={} {:?}, destroy={}, reuse={}, final={} {:?}, pre_settlement_effects={conversion_len}",
+                receipt.label,
+                conflict.2.cut,
+                invalidation.2.cut,
+                invalidation.2.effects,
+                destroy.2.cut,
+                reuse.2.cut,
+                final_call.2.cut,
+                final_call.2.effects,
+            );
+            let offset = if late_metadata { 1 } else { 2 };
+            assert_eq!(tuple.0, base_admission + offset + u64::from(reverse_end));
+            if let Some(previous) = delivery_tuple {
+                assert_eq!(tuple, previous);
+            }
+            delivery_tuple = Some(tuple);
+            assert_eq!(
+                fixture.feeds(),
+                feeds_before,
+                "observation performs no H9 replay"
+            );
+            assert_eq!(
+                fixture
+                    .scene
+                    .real
+                    .scene
+                    .coordinator
+                    .reference_h3_audit_state(),
+                (2, false)
+            );
+            assert_eq!(
+                fixture
+                    .scene
+                    .real
+                    .scene
+                    .coordinator
+                    .reference_h3_acknowledged_below(),
+                0
+            );
+        }
+        completion_tuples.push(delivery_tuple.unwrap());
+    }
+    assert_eq!(completion_tuples[0].1, completion_tuples[1].1);
+    assert_eq!(completion_tuples[0].0 + 1, completion_tuples[1].0);
+    assert_eq!(completion_tuples[0].2 + 1, completion_tuples[1].2);
+}
+
+#[test]
+fn joint_seal_observation_trace_keeps_call_positions() {
+    observe_genuine_settlement_order(false);
+}
+
+#[test]
+fn joint_seal_observation_trace_never_backfills_init() {
+    observe_genuine_settlement_order(true);
 }

@@ -30,6 +30,9 @@
 pub(crate) mod journal;
 mod state;
 
+#[cfg(test)]
+pub(crate) use state::trace_settlement_for_test;
+
 use p11scope_ebpf_common::LinuxLayout;
 use p11scope_ebpf_common::object_policy::{
     SafeAttributeKind, SafeCurve, classify_attribute_scalar, classify_ec_params,

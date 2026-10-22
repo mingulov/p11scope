@@ -33,6 +33,93 @@ use std::mem::size_of;
 
 type InstanceKey = (u64, u64, u64, u64);
 
+/// Test observations of the real settlement loop, never replay authority.
+#[cfg(test)]
+pub(crate) struct SettlementStepForTest {
+    pub(crate) cut: u64,
+    pub(crate) terminal: bool,
+    pub(crate) call: CallToken,
+    pub(crate) effects: std::ops::Range<usize>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct SettlementTraceForTest {
+    pub(crate) steps: Vec<SettlementStepForTest>,
+    pub(crate) effects: Vec<ObjectEffect>,
+    pub(crate) settlements: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static SETTLEMENT_TRACE: std::cell::RefCell<Option<(ObjectDomain, SettlementTraceForTest)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn trace_settlement_for_test<R>(
+    domain: ObjectDomain,
+    run: impl FnOnce() -> R,
+) -> (R, SettlementTraceForTest) {
+    struct Scope;
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            SETTLEMENT_TRACE.with(|slot| {
+                slot.borrow_mut().take();
+            });
+        }
+    }
+    SETTLEMENT_TRACE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        assert!(
+            slot.is_none(),
+            "a settlement observer cannot replace another scope"
+        );
+        *slot = Some((domain, SettlementTraceForTest::default()));
+    });
+    // Thread-local and exact-domain filtering isolate parallel fixtures. The
+    // guard clears the observer on panic as well as normal return.
+    let scope = Scope;
+    let result = run();
+    let trace = SETTLEMENT_TRACE.with(|slot| slot.borrow_mut().take().unwrap().1);
+    drop(scope);
+    (result, trace)
+}
+
+#[cfg(test)]
+fn observe_settlement_step(
+    domain: ObjectDomain,
+    cut: u64,
+    terminal: bool,
+    call: CallToken,
+    effects: std::ops::Range<usize>,
+) {
+    SETTLEMENT_TRACE.with(|slot| {
+        if let Some((selected, trace)) = slot.borrow_mut().as_mut()
+            && *selected == domain
+        {
+            trace.steps.push(SettlementStepForTest {
+                cut,
+                terminal,
+                call,
+                effects,
+            });
+        }
+    });
+}
+
+#[cfg(test)]
+fn observe_settlement_effects(domain: ObjectDomain, effects: &ObjectEffects) {
+    SETTLEMENT_TRACE.with(|slot| {
+        if let Some((selected, trace)) = slot.borrow_mut().as_mut()
+            && *selected == domain
+        {
+            trace.settlements += 1;
+            trace.effects.extend_from_slice(&effects.effects);
+        }
+    });
+}
+
 /// The finite call vocabulary the model accepts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CallKind {
@@ -962,17 +1049,27 @@ impl ModelState {
                 }
             }
             events.sort();
-            for (_, is_end, token) in events {
+            for (_cut, is_end, token) in events {
                 // A contradiction inside this replay fences or releases the
                 // remaining calls: their events no longer apply.
                 if self.pending.get(&token).is_none_or(|c| c.fenced) {
                     continue;
                 }
+                #[cfg(test)]
+                let effect_start = effects.effects.len();
                 if is_end {
                     self.apply_end(token, &mut effects, ledger);
                 } else {
                     self.apply_begin(token);
                 }
+                #[cfg(test)]
+                observe_settlement_step(
+                    domain,
+                    _cut,
+                    is_end,
+                    token,
+                    effect_start..effects.effects.len(),
+                );
                 if self.domains[&domain].ended.is_some() {
                     break;
                 }
@@ -981,6 +1078,8 @@ impl ModelState {
             state.applied = max_opt(state.applied, Some(watermark));
         }
         self.prune(domain, ledger);
+        #[cfg(test)]
+        observe_settlement_effects(domain, &effects);
         effects
     }
 

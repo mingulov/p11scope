@@ -1247,6 +1247,49 @@ mod tests {
     }
 
     #[test]
+    fn joint_raw_quantum_rejects_equal_id_foreign_producers() {
+        let rows = publish_object_descriptors();
+        let events = EventsDomain::test_standin(0xb221);
+        let retained = producers(&events);
+        let equal_id_foreign = SessionDrainProducers::test_pair(
+            retained.native_domain(),
+            EventsDomain::test_standin(events.id()),
+        );
+        let pool = SemanticResourcePool::default();
+        let mut adapter = resource_adapter(&pool);
+        let fault = SteadyFault(Cell::new(None));
+        let mut drain = EventDrain::over_domain(ScriptedRecords::records([], 0), events);
+        let raw = RawJointQuantum::collect_bounded_with_adapter(
+            &mut drain,
+            &rows,
+            4,
+            None,
+            &fault,
+            &retained,
+            |bytes| pool.reserve(bytes),
+            &mut adapter,
+        )
+        .unwrap();
+        let charged = pool.snapshot().charged_bytes;
+        assert!(raw.matches_producers(&retained.clone()));
+        assert!(
+            !raw.matches_producers(&equal_id_foreign),
+            "an equal map ID cannot replace the original producer allocation"
+        );
+        assert_eq!(
+            raw.ready_for_ingest(&adapter, &equal_id_foreign),
+            Err(RawQuantumRefusal::ForeignCapture)
+        );
+        assert_eq!(
+            raw.ready_for_ingest(&adapter, &retained),
+            Err(RawQuantumRefusal::H0Undelivered)
+        );
+        assert_eq!(pool.snapshot().charged_bytes, charged);
+        assert_eq!(adapter.consumed_through_for_test(), 0);
+        assert_eq!(drain.source().remaining(), 0);
+    }
+
+    #[test]
     fn joint_bound_continuation_keeps_original_cut_and_rejects_foreign_cursor() {
         use crate::semantics_objects::journal::tests::{
             ENTRY_NS, begin_bytes, end_bytes_absent, function_id,

@@ -4111,6 +4111,11 @@ fn joint_replay_steps_keep_prior_terminal_after_conversion_loss() {
         .source_mut()
         .push_record(complete.to_vec());
     let mut q1 = fixture.audited(2, 2, &BirthFault);
+    assert!(
+        q1.failure_for_test().is_none(),
+        "q1 must have an actual clean audit: {:?}",
+        q1.failure_for_test()
+    );
     fixture.seal_replay_head(&mut q1, &BirthFault);
     let first = q1.active_seal_for_test().unwrap();
     assert_eq!(first.prefix.domain(), target.bootstrap().domain());
@@ -4169,6 +4174,11 @@ fn joint_replay_steps_keep_prior_terminal_after_conversion_loss() {
         .source_mut()
         .push_record(abandon.to_vec());
     let mut q2 = fixture.audited(0, 0, &BirthFault);
+    assert!(
+        q2.failure_for_test().is_none(),
+        "q2 bounded ABANDON must preserve resource custody: {:?}",
+        q2.failure_for_test()
+    );
     fixture.seal_replay_head(&mut q2, &BirthFault);
     let second = q2.active_seal_for_test().unwrap();
     assert_eq!(

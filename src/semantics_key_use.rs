@@ -23,13 +23,13 @@ use crate::semantics_edge::{
     OperationOutcome, OperationSink, SemanticCall,
 };
 #[cfg(test)]
+use crate::semantics_objects::ObjectEffects;
+#[cfg(test)]
 use crate::semantics_objects::journal::H3EvidenceSource;
 use crate::semantics_objects::journal::{
     BootstrapReceipt, H3DispositionEvidence, JournalGap, SealFailure, SealSuccess, SealedCall,
 };
-use crate::semantics_objects::{
-    ObjectEffect, ObjectEffects, ObjectId, ObjectSemantics, SessionIncarnation,
-};
+use crate::semantics_objects::{ObjectEffect, ObjectId, ObjectSemantics, SessionIncarnation};
 use std::collections::{BTreeMap, VecDeque};
 use std::mem::size_of;
 
@@ -73,6 +73,7 @@ pub(crate) enum StagingRefusal {
 }
 
 /// How one seal advanced the staging.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SealApplyOutcome {
     /// The seal settled exactly the staged head (function-verified,
@@ -99,9 +100,12 @@ pub(crate) enum SealBatchProgress {
     Held,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum FailureBatchProgress {
     Complete(FailureApplyOutcome),
+    /// An already-S1Only history consumed the authenticated original spans
+    /// and any required loss invalidation, without replay or mode reentry.
+    NegativeDelivered(crate::semantics_objects::journal::joint_audit::NegativeDelivered),
     Yielded,
     Held,
 }
@@ -124,9 +128,9 @@ pub(crate) enum FailureApplyOutcome {
     /// silence (or pending work below the watermark) never triggers
     /// the fallback. Staging is intact.
     HeldForCompleteness,
-    /// The feed already left Joint (fallback/degraded staging is
-    /// empty): seal outcomes no longer route here. Inert by design —
-    /// live S1Only machines are never touched.
+    /// Legacy algorithm-only input for a feed that already left Joint.
+    /// Production affecting negatives require typed actual delivery instead.
+    #[cfg(test)]
     Ignored,
 }
 
@@ -779,6 +783,7 @@ impl JointStaging {
         if self.selected_receipt.as_ref().map(BootstrapReceipt::domain) != Some(audited.domain())
             || !audited.matches_ledger(ledger)
             || !self.accepts_failure(audited.failure())
+            || (self.mode == FeedMode::S1Only && !self.staged.is_empty())
         {
             return (FailureBatchProgress::Held, 0);
         }
@@ -787,12 +792,6 @@ impl JointStaging {
             staged_max, pending_floor: None,
         } if self.covered_by(*staged_max));
         self.flush_pending_releases(ledger);
-        if self.mode != FeedMode::Joint {
-            return (
-                FailureBatchProgress::Complete(FailureApplyOutcome::Ignored),
-                0,
-            );
-        }
         while !batch.effects_complete() {
             if *remaining == 0 {
                 return (FailureBatchProgress::Yielded, 0);
@@ -805,19 +804,22 @@ impl JointStaging {
                 keyuse.apply_invalidation(effect, model);
             }
         }
-        if disposition == SealFailureDisposition::Retry {
+        let loss = disposition == SealFailureDisposition::HistoryLoss;
+        if self.mode == FeedMode::Joint && disposition == SealFailureDisposition::Retry {
             return (
                 FailureBatchProgress::Complete(FailureApplyOutcome::Retried),
                 0,
             );
         }
-        if disposition == SealFailureDisposition::Fallback && !covered {
+        if self.mode == FeedMode::Joint
+            && disposition == SealFailureDisposition::Fallback
+            && !covered
+        {
             return (
                 FailureBatchProgress::Complete(FailureApplyOutcome::HeldForCompleteness),
                 0,
             );
         }
-        let loss = disposition == SealFailureDisposition::HistoryLoss;
         if loss && batch.needs_loss_invalidation() {
             if *remaining == 0 {
                 return (FailureBatchProgress::Yielded, 0);
@@ -832,6 +834,20 @@ impl JointStaging {
                 assoc_fallback.as_deref_mut(),
             );
             batch.loss_started();
+        }
+        if self.mode == FeedMode::S1Only {
+            // Mode only gates positive replay. A retained selected receipt
+            // still binds later original negatives to this exact history.
+            // S1Only never owns a staged suffix; refuse before completing if
+            // that invariant is broken rather than discarding any head.
+            self.degraded_loss |= loss;
+            return (
+                batch.negative_delivered().map_or(
+                    FailureBatchProgress::Held,
+                    FailureBatchProgress::NegativeDelivered,
+                ),
+                0,
+            );
         }
         if self.staged.is_empty() {
             self.mode = FeedMode::S1Only;
@@ -2204,6 +2220,7 @@ impl KeyUseReducer {
     /// session ends by model attribution. Runs BEFORE any replay or
     /// disposal the same seal/failure triggers, so a terminal can
     /// never complete a binding its own seal just unproved.
+    #[cfg(test)]
     pub(crate) fn apply_invalidations(&mut self, effects: &ObjectEffects, model: &ObjectSemantics) {
         for effect in &effects.effects {
             self.apply_invalidation(effect, model);
@@ -2295,6 +2312,7 @@ impl KeyUseReducer {
     /// current state, so routing delay cannot backfill an earlier
     /// use. Callers pass the seal's verified single settled call
     /// (see [`JointStaging::apply_seal`]).
+    #[cfg(test)]
     pub(crate) fn receipts_for_call(
         &mut self,
         seal: &SealSuccess,

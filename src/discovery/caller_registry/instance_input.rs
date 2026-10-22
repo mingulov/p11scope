@@ -756,6 +756,49 @@ impl CallerRegistry {
         })
     }
 
+    /// One real selected incarnation, including its negative-only history
+    /// after fallback. Never-selected, retired or superseded S1Only records
+    /// do not gain a receipt or positive replay permission here.
+    fn joint_history_target(
+        &self,
+        record: &InstanceSemanticRecord,
+    ) -> Option<(JointFeedTarget, FeedMode)> {
+        let bootstrap = *record.feed.selected_receipt()?;
+        let mode = record.feed.mode();
+        if mode == FeedMode::S1Only {
+            let current = self.instance_state.records.get(&record.id)?;
+            if current.state == InstanceLifecycle::Retired
+                || current.caller != record.caller
+                || self.instance_state.by_key.get(&current.key) != Some(&record.id)
+            {
+                return None;
+            }
+        }
+        Some((
+            JointFeedTarget {
+                id: record.id,
+                caller: record.caller,
+                bootstrap,
+            },
+            mode,
+        ))
+    }
+
+    pub(crate) fn joint_history_targets(
+        &self,
+    ) -> impl Iterator<Item = (JointFeedTarget, FeedMode)> + '_ {
+        self.instance_state
+            .semantics
+            .values()
+            .filter_map(|record| self.joint_history_target(record))
+    }
+
+    pub(crate) fn joint_history_mode(&self, target: &JointFeedTarget) -> Option<FeedMode> {
+        let (current, mode) =
+            self.joint_history_target(self.instance_state.semantics.get(&target.id)?)?;
+        (current.caller == target.caller && current.bootstrap == target.bootstrap).then_some(mode)
+    }
+
     /// Read-only selection for this exact admitted instance, including an
     /// as-yet unregistered S1Only sibling. An installed original grant still
     /// selects Joint; no numeric caller/image comparison installs a feed.
@@ -962,8 +1005,16 @@ impl CallerRegistry {
         );
         self.instance_state.semantic_refused =
             self.instance_state.semantic_refused.saturating_add(refused);
-        if matches!(outcome, FailureBatchProgress::Complete(_)) {
+        if matches!(
+            &outcome,
+            FailureBatchProgress::Complete(_) | FailureBatchProgress::NegativeDelivered(_)
+        ) {
             self.after_joint_delivery(id, was_joint, model);
+            if !was_joint && matches!(&outcome, FailureBatchProgress::NegativeDelivered(_)) {
+                // A negative-only history still publishes the canonical
+                // model's completed loss, once per actual delivery.
+                self.key_projection = Some(model.project());
+            }
         }
         outcome
     }

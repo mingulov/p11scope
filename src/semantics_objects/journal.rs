@@ -1521,7 +1521,7 @@ impl JournalAdapter {
 
     /// Read every marked physical owner before reserving/taking H3 or
     /// changing the model. A marker never excuses an incomplete, converted,
-    /// colliding or already-claimed original.
+    /// foreign or colliding original; only its exact own claim may remain.
     fn s1only_subjects_are_owned(&self, frontier: ConsumptionOrdinal) -> bool {
         self.open.values().all(|entry| {
             let Some(key) = entry.s1only_subject else {
@@ -1544,10 +1544,7 @@ impl JournalAdapter {
                 && !entry.end_converted
                 && entry.abandon.is_none()
                 && entry.corroborated_return.is_none()
-                && !self
-                    .claims
-                    .get(&fingerprint)
-                    .is_some_and(|claimants| claimants.values().any(|claims| !claims.is_empty()))
+                && self.s1only_original_claim(entry, key).is_some()
                 && self
                     .ledger
                     .matches_unconverted_original(entry.begin_ordinal, &resource, None)
@@ -1557,7 +1554,7 @@ impl JournalAdapter {
     /// One bulk original negative. All image subjects and the full retained
     /// domain union are observed before any state.refused change. Claimed A
     /// rows remain H8-owned for actual bounded fallback; only the exact
-    /// unclaimed S1Only originals are disposed here.
+    /// S1Only originals (with at most their own exact claim) are disposed here.
     fn refuse_s1only_subjects(&mut self, model: &mut ObjectSemantics) -> Option<SealFailure> {
         if !self.has_s1only_subjects() {
             return None;
@@ -1647,11 +1644,23 @@ impl JournalAdapter {
             };
             after = Some(native);
             if selected {
-                let ordinal = self
+                let entry = self
                     .open
                     .remove(&native)
-                    .expect("preflight original subject")
-                    .begin_ordinal;
+                    .expect("preflight original subject");
+                let key = entry.s1only_subject.expect("selected original subject");
+                if let Some(original) = self
+                    .s1only_original_claim(&entry, key)
+                    .expect("preflight exact own claim")
+                {
+                    let claim = self
+                        .consume_claim(&fingerprint_of_begin(&entry.begin), key)
+                        .expect("retained original own claim");
+                    assert_eq!(claim.admission, original.admission);
+                    assert_eq!(claim.return_ns, original.return_ns);
+                }
+                let ordinal = entry.begin_ordinal;
+                drop(entry);
                 self.ledger.release_h8open(ordinal);
             }
         }
@@ -3443,24 +3452,23 @@ impl JournalAdapter {
         Ok(JournalDomainProof { key, era })
     }
 
-    /// An older actual H0 admission may cross a frame only while its exact
-    /// original END remains unclaimed in this owner's H8 allocation. No
-    /// scalar position, resource ID or equal-shaped sibling can substitute.
-    fn matches_retained_admission(&self, admitted: &AdmittedInstanceCall) -> bool {
+    /// Read the actual physical original independently of claim disposition.
+    /// No scalar position, resource ID or equal-shaped sibling substitutes.
+    fn retained_admission_entry(&self, admitted: &AdmittedInstanceCall) -> Option<&OpenEntry> {
         let (Some(origin), Some(resource), Some(fingerprint)) = (
             admitted.collected_origin(),
             admitted.joint_resource_origin(),
             admitted.journal_call_fingerprint(),
         ) else {
-            return false;
+            return None;
         };
         let Some(entry) = self.open.get(&resource.invocation()) else {
-            return false;
+            return None;
         };
         let Some(end) = entry.end else {
-            return false;
+            return None;
         };
-        origin.position() == admitted.h0_ordinal()
+        (origin.position() == admitted.h0_ordinal()
             && entry.collected_origin == Some(origin)
             && entry.image == fingerprint.image
             && fingerprint_of_begin(&entry.begin) == fingerprint
@@ -3473,19 +3481,70 @@ impl JournalAdapter {
             && !entry.end_converted
             && entry.abandon.is_none()
             && entry.corroborated_return.is_none()
-            && !self
-                .claims
-                .get(&fingerprint)
-                .is_some_and(|claimants| claimants.values().any(|claims| !claims.is_empty()))
             && self
                 .resource_producers
                 .as_ref()
-                .is_some_and(|producers| resource.matches_producers(producers))
+                .is_some_and(|producers| resource.matches_producers(producers)))
+        .then_some(entry)
+    }
+
+    /// Continued admission authority still requires an unclaimed original.
+    /// Exact own-claim disposal below grants only a negative, never a claim.
+    fn matches_retained_admission(&self, admitted: &AdmittedInstanceCall) -> bool {
+        let Some(entry) = self.retained_admission_entry(admitted) else {
+            return false;
+        };
+        !self
+            .claims
+            .get(&fingerprint_of_begin(&entry.begin))
+            .is_some_and(|claimants| claimants.values().any(|claims| !claims.is_empty()))
             && self.ledger.matches_unconverted_original(
                 entry.begin_ordinal,
-                resource.reservation(),
+                admitted
+                    .joint_resource_origin()
+                    .expect("checked original")
+                    .reservation(),
                 None,
             )
+    }
+
+    /// An absent claim or exactly this original's one claim. Two same-shaped
+    /// physical rows, another key, a repeated claim or another return refuses.
+    fn s1only_original_claim(
+        &self,
+        entry: &OpenEntry,
+        key: JournalDomainKey,
+    ) -> Option<Option<AdmittedJournalClaim>> {
+        let end = entry.end?;
+        let origin = entry.collected_origin?;
+        if entry.image != (key.cookie, key.exec)
+            || self
+                .resource_producers
+                .as_ref()?
+                .native_domain()
+                .journal_tag()
+                != key.domain_tag
+        {
+            return None;
+        }
+        let fingerprint = fingerprint_of_begin(&entry.begin);
+        let mut originals = self
+            .claims
+            .get(&fingerprint)
+            .into_iter()
+            .flat_map(|claimants| {
+                claimants
+                    .iter()
+                    .flat_map(|(key, claims)| claims.iter().map(move |claim| (key, claim)))
+            });
+        let Some((claimant, claim)) = originals.next() else {
+            return Some(None);
+        };
+        (originals.next().is_none()
+            && *claimant == key
+            && claim.admission == origin.position()
+            && claim.return_ns == end.end.payload_base().event.ts_ns)
+            .then_some(Some(*claim))
     }
 
     /// Retain one already-admitted S1Only negative on its exact original
@@ -3496,9 +3555,6 @@ impl JournalAdapter {
         admitted: &AdmittedInstanceCall,
     ) -> Result<(), joint_driver::RawQuantumRefusal> {
         use joint_driver::RawQuantumRefusal;
-        if !self.matches_retained_admission(admitted) {
-            return Err(RawQuantumRefusal::Admission);
-        }
         let (native, image, router, caller) = admitted.journal_binding();
         let key = JournalDomainKey {
             domain_tag: native.journal_tag(),
@@ -3507,6 +3563,21 @@ impl JournalAdapter {
             exec: image.exec_id,
             router: router.get(),
         };
+        let entry = self
+            .retained_admission_entry(admitted)
+            .ok_or(RawQuantumRefusal::Admission)?;
+        if self.s1only_original_claim(entry, key).is_none()
+            || !self.ledger.matches_unconverted_original(
+                entry.begin_ordinal,
+                admitted
+                    .joint_resource_origin()
+                    .expect("checked original")
+                    .reservation(),
+                None,
+            )
+        {
+            return Err(RawQuantumRefusal::Admission);
+        }
         let resource = admitted
             .joint_resource_origin()
             .expect("checked original END");

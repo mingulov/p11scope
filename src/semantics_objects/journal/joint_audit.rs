@@ -22,7 +22,7 @@ use crate::discovery::engine::inventory_coordinator::semantics::{
 };
 use crate::semantics_edge::resources::{OWNED_ALLOCATION_PADDING, ResourceLease};
 use crate::semantics_key_use::{
-    FailureApplyOutcome, FailureBatchProgress, SealBatchProgress, SealFailureDisposition,
+    FailureApplyOutcome, FailureBatchProgress, FeedMode, SealBatchProgress, SealFailureDisposition,
     disposition_of,
 };
 use crate::semantics_objects::{
@@ -109,6 +109,8 @@ pub(crate) enum QuantumSealProgress {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ConsumerState {
     Pending,
+    // Retained selected history may receive negatives, never a positive seal.
+    NegativeOnly,
     Future,
     Delivered,
     LossDelivered,
@@ -284,6 +286,20 @@ pub(crate) struct FailureBatchDelivery<'q> {
     audited: AuditedFailure<'q>,
     pub(super) cursor: &'q mut FailureReplayCursor,
 }
+
+/// Completion metadata minted from the SAME borrowed originals and cursor.
+/// It cannot authorize a seal, replay, H3 acknowledgement or another history.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct NegativeDelivered {
+    domain: ObjectDomain,
+    disposition: SealFailureDisposition,
+}
+impl NegativeDelivered {
+    fn matches(&self, batch: &FailureBatchDelivery<'_>) -> bool {
+        batch.negative_delivered().as_ref() == Some(self)
+    }
+}
+
 impl<'q> FailureBatchDelivery<'q> {
     pub(crate) fn audited(&self) -> &AuditedFailure<'q> {
         &self.audited
@@ -292,6 +308,15 @@ impl<'q> FailureBatchDelivery<'q> {
         self.audited.originals[self.cursor.slot..]
             .iter()
             .all(Option::is_none)
+    }
+    pub(crate) fn negative_delivered(&self) -> Option<NegativeDelivered> {
+        let disposition = self.audited.disposition();
+        (self.effects_complete()
+            && (disposition != SealFailureDisposition::HistoryLoss || self.cursor.invalidated))
+            .then_some(NegativeDelivered {
+                domain: self.audited.domain(),
+                disposition,
+            })
     }
     pub(crate) fn advance_effect(&mut self) -> Option<Option<&'q ObjectEffect>> {
         while self.cursor.slot < 2 {
@@ -435,10 +460,6 @@ impl IngestedJointQuantum {
                 .as_ref()
                 .and_then(|active| active.outcome.as_ref().err()),
         )
-    }
-
-    fn has_failure(&self) -> bool {
-        self.raw_failure.is_some() || self.failure.is_some()
     }
 
     /// The only constructor requires both actual ingestion and the retained
@@ -652,7 +673,6 @@ impl IngestedJointQuantum {
             era: state.era,
         };
         (state.refused
-            && state.tainted
             && !state.era_ended
             && adapter.is_tainted((key.cookie, key.exec))
             && self.pending_raw_scope_contains(proof.domain()))
@@ -668,7 +688,7 @@ impl IngestedJointQuantum {
         if self.pending_refused_proof(adapter, proof.key) != Some(proof)
             || !matches!(
                 consumer.state,
-                ConsumerState::Pending | ConsumerState::Future
+                ConsumerState::Pending | ConsumerState::Future | ConsumerState::LossDelivered
             )
             || consumer.failure.consumed != 0
             || consumer.failure.suffix.is_some()
@@ -752,6 +772,15 @@ impl IngestedJointQuantum {
                 let Some(count) = registry.joint_staged_count(&consumer.target) else {
                     return false;
                 };
+                match registry.joint_history_mode(&consumer.target) {
+                    Some(FeedMode::S1Only)
+                        if count == 0 && consumer.state == ConsumerState::LossDelivered =>
+                    {
+                        continue;
+                    }
+                    Some(FeedMode::Joint) => {}
+                    _ => return false,
+                }
                 // Visit the existing FIFO once; no target-vector lookup for
                 // each H8 claim and no copied admission/native index.
                 for index in 0..count {
@@ -932,13 +961,14 @@ impl IngestedJointQuantum {
             return Err(RawQuantumRefusal::DispositionMismatch);
         }
         let (registry, owner, bindings, _) = ports.read();
-        let count = registry.joint_feed_targets().count();
-        for target in registry.joint_feed_targets() {
+        let count = registry.joint_history_targets().count();
+        for (target, mode) in registry.joint_history_targets() {
             // Negative fanout still reaches history whose caller binding has
             // ended. Only a fresh positive seal needs the current binding.
-            if self
-                .original_failures()
-                .any(|failure| failure.affects_domain(target.bootstrap().domain()))
+            if mode == FeedMode::S1Only
+                || self
+                    .original_failures()
+                    .any(|failure| failure.affects_domain(target.bootstrap().domain()))
             {
                 continue;
             }
@@ -971,10 +1001,19 @@ impl IngestedJointQuantum {
         {
             return Err(RawQuantumRefusal::Capacity);
         }
-        consumers.extend(registry.joint_feed_targets().map(|target| FrameConsumer {
-            target,
-            state: ConsumerState::Pending,
-            failure: FailureReplayCursor::default(),
+        consumers.extend(registry.joint_history_targets().map(|(target, mode)| {
+            let affects = self
+                .original_failures()
+                .any(|failure| failure.affects_domain(target.bootstrap().domain()));
+            FrameConsumer {
+                target,
+                state: if mode == FeedMode::Joint || affects {
+                    ConsumerState::Pending
+                } else {
+                    ConsumerState::NegativeOnly
+                },
+                failure: FailureReplayCursor::default(),
+            }
         }));
         // One charged snapshot, no duplicate-domain hash table or queue.
         consumers.sort_unstable_by_key(|consumer| consumer.target.bootstrap().domain());
@@ -985,7 +1024,14 @@ impl IngestedJointQuantum {
             return Err(RawQuantumRefusal::Admission);
         }
         consumers.sort_unstable_by_key(|consumer| consumer.target.id());
-        self.pending = consumers.len();
+        self.pending = consumers
+            .iter()
+            .filter(|consumer| consumer.state == ConsumerState::Pending)
+            .count();
+        self.cursor = consumers
+            .iter()
+            .position(|consumer| consumer.state == ConsumerState::Pending)
+            .unwrap_or(consumers.len());
         self.consumers = consumers;
         self.targets_storage = Some(storage);
         self.bound = true;
@@ -997,11 +1043,20 @@ impl IngestedJointQuantum {
         self.consumers[self.cursor].state = state;
         self.pending -= 1;
         self.future += usize::from(state == ConsumerState::Future);
+        self.skip_completed_consumers();
+    }
+
+    fn skip_completed_consumers(&mut self) {
         while self.cursor < self.consumers.len()
             && self.consumers[self.cursor].state != ConsumerState::Pending
         {
             self.cursor += 1;
         }
+    }
+
+    fn advance_pending_visit(&mut self) {
+        self.cursor += 1;
+        self.skip_completed_consumers();
     }
 
     fn progress(&self) -> QuantumSealProgress {
@@ -1049,19 +1104,24 @@ impl IngestedJointQuantum {
         if self.pending == 0 {
             return Ok(self.progress());
         }
-        let index = self.cursor;
-        if self.has_failure() {
-            return Ok(
-                if self
-                    .failure_for(self.consumers[index].target.bootstrap().domain())
-                    .is_some()
-                {
-                    QuantumSealProgress::DeliveryReady
-                } else {
-                    QuantumSealProgress::LocalPending
-                },
-            );
+        // Pending-H3 negative service may have visited every consumer while
+        // leaving original producer-owned history Pending. Only the exact
+        // continuation can turn it Future; no finished-cursor indexing.
+        if self.cursor == self.consumers.len() {
+            return Ok(QuantumSealProgress::LocalPending);
         }
+        let index = self.cursor;
+        if self
+            .failure_for(self.consumers[index].target.bootstrap().domain())
+            .is_some()
+        {
+            return Ok(QuantumSealProgress::DeliveryReady);
+        }
+        if self.failure.is_some() {
+            return Ok(QuantumSealProgress::LocalPending);
+        }
+        // An unrelated raw-only image negative does not replace the actual
+        // clean collection audit for this disjoint selected Joint target.
         let target = self.consumers[index].target;
         let (_, owner, bindings, _, _) = ports.split();
         let binding = bindings
@@ -1160,6 +1220,9 @@ impl IngestedJointQuantum {
         if self.pending == 0 {
             return Ok(self.progress());
         }
+        if self.cursor == self.consumers.len() {
+            return Ok(QuantumSealProgress::LocalPending);
+        }
         let index = self
             .active
             .as_ref()
@@ -1203,9 +1266,25 @@ impl IngestedJointQuantum {
             self.frontier,
             target.bootstrap().domain(),
         ) else {
+            // A truthful pending audit has no positive work to perform at an
+            // unaffected target. Charge this visit without changing its
+            // Pending history, so a later original negative is not stranded.
+            // defer_pending_h3 alone may qualify all held originals Future.
+            if self.active.is_none()
+                && self
+                    .failure
+                    .as_ref()
+                    .is_some_and(|failure| failure.gap == JournalGap::H3Pending)
+                && *remaining != 0
+            {
+                *remaining -= 1;
+                self.advance_pending_visit();
+                return Ok(QuantumSealProgress::DeliveryReady);
+            }
             return Ok(QuantumSealProgress::LocalPending);
         };
         let fallback = audited.disposition() == SealFailureDisposition::Fallback
+            && ports.read().0.joint_history_mode(&target) == Some(FeedMode::Joint)
             && matches!(
                 audited.h3(),
                 H3DispositionEvidence::Clean {
@@ -1242,11 +1321,20 @@ impl IngestedJointQuantum {
             )
         };
         match outcome {
+            FailureBatchProgress::NegativeDelivered(completed) => {
+                if !completed.matches(&batch) {
+                    return Err(RawQuantumRefusal::DispositionMismatch);
+                }
+                self.active = None;
+                self.advance_consumer(ConsumerState::LossDelivered);
+                Ok(self.progress())
+            }
             FailureBatchProgress::Complete(
-                FailureApplyOutcome::Degraded { .. }
-                | FailureApplyOutcome::FellBack { .. }
-                | FailureApplyOutcome::Ignored,
+                FailureApplyOutcome::Degraded { .. } | FailureApplyOutcome::FellBack { .. },
             ) => {
+                if batch.negative_delivered().is_none() {
+                    return Err(RawQuantumRefusal::DispositionMismatch);
+                }
                 self.active = None;
                 self.advance_consumer(ConsumerState::LossDelivered);
                 Ok(self.progress())
@@ -1256,8 +1344,30 @@ impl IngestedJointQuantum {
                 self.consumers[index].failure = FailureReplayCursor::default();
                 Ok(QuantumSealProgress::LocalPending)
             }
-            FailureBatchProgress::Complete(FailureApplyOutcome::HeldForCompleteness)
-            | FailureBatchProgress::Held => Ok(QuantumSealProgress::LocalPending),
+            FailureBatchProgress::Complete(FailureApplyOutcome::HeldForCompleteness) => {
+                if self.active.is_none()
+                    && self
+                        .failure
+                        .as_ref()
+                        .is_some_and(|failure| failure.gap == JournalGap::H3Pending)
+                    && batch.effects_complete()
+                    && *remaining != 0
+                {
+                    // This target's negative spans are done, but its H8/H9
+                    // history stays Pending. Charge the visit, then allow
+                    // later affected consumers their original spans too.
+                    *remaining -= 1;
+                    self.advance_pending_visit();
+                    Ok(QuantumSealProgress::DeliveryReady)
+                } else {
+                    Ok(QuantumSealProgress::LocalPending)
+                }
+            }
+            FailureBatchProgress::Held => Ok(QuantumSealProgress::LocalPending),
+            #[cfg(test)]
+            FailureBatchProgress::Complete(FailureApplyOutcome::Ignored) => {
+                Ok(QuantumSealProgress::LocalPending)
+            }
             FailureBatchProgress::Yielded => Ok(QuantumSealProgress::DeliveryReady),
         }
     }
@@ -1315,13 +1425,15 @@ impl IngestedJointQuantum {
         }
         // The exact continuation above qualified all negative consumers and
         // original H8/H9 owners. They may remain Future only here; no generic
-        // finish, FellBack/LossDelivered state, or H3 void acknowledgement is
-        // manufactured for history still held by the live producer.
-        if self
-            .consumers
-            .iter()
-            .any(|consumer| consumer.state != ConsumerState::Future)
-        {
+        // finish or H3 void acknowledgement is manufactured for history
+        // still held by the live producer. Negative-only histories may have
+        // completed their original spans, without any positive replay.
+        if self.consumers.iter().any(|consumer| {
+            !matches!(
+                consumer.state,
+                ConsumerState::Future | ConsumerState::NegativeOnly | ConsumerState::LossDelivered
+            )
+        }) {
             return Err((self, RawQuantumRefusal::DispositionMismatch));
         }
         let fault_after = self.audit.fault_after;

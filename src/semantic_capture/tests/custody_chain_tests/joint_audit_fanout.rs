@@ -3297,7 +3297,14 @@ fn joint_zero_head_pending_h3_requires_original_continuation_and_keeps_fault_pre
             .claim_next_prepared_admission(&fixture.scene.producers, &ingested)
             .unwrap()
         {
-            assert!(!changed_fault);
+            let owner = coordinator.joint_capture();
+            assert_eq!(owner.adapter().retained_starts_for_test(), starts);
+            assert!(
+                !changed_fault,
+                "actual q2 pending-original claim: ordinal={ordinal}, proof={proof:?}, claims={:?}, roles={:?}",
+                owner.adapter().invocation_claims_for_test(),
+                owner.ledger().roles_for_test(),
+            );
             assert_eq!(ordinal, 2);
             q2_proof = Some(proof.unwrap());
         }

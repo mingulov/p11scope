@@ -3456,7 +3456,7 @@ impl JournalAdapter {
     /// fallback. Read-only validation finishes before registry replay starts;
     /// the adapter remains exclusively borrowed through replay and disposal.
     /// No supplied success callback, extra queue or reusable disposal token.
-    pub(super) fn deliver_completed_fallback(
+    fn deliver_completed_fallback(
         &mut self,
         input: joint_audit::AuditedDomainInput<'_>,
         audited: &joint_audit::AuditedFailure<'_>,

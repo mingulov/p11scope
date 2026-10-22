@@ -5,7 +5,9 @@ use super::audit_handoff::{acquire, attachment, claim_and_finish};
 use super::*;
 use crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild;
 use crate::semantics_objects::journal::tests::{NativeBirthRows, NativePublisher};
-use crate::semantics_objects::journal::{BootstrapReceipt, ScriptedBirthSource};
+use crate::semantics_objects::journal::{
+    BootstrapReceipt, ScriptedBirthSource, SessionClosureGrant,
+};
 use crate::semantics_objects::{Lifetime, ObjectEffect, ObjectGap};
 
 struct CanonicalFanoutScene {
@@ -72,6 +74,16 @@ impl CanonicalFanoutScene {
         assert_eq!(current.len(), 2, "two actual collected New receipts");
         let claims = claim_and_finish(&mut scene, &ingested);
         let attached = attachment(&mut scene);
+        assert!(
+            scene
+                .real
+                .scene
+                .coordinator
+                .joint_capture_mut()
+                .adapter_mut()
+                .install_closure_grant(&SessionClosureGrant::observe(&attached)),
+            "install the genuine current attachment before any birth attestation"
+        );
         let publisher = NativePublisher::build();
         let mut births = Vec::new();
         for receipt in current {
@@ -113,6 +125,10 @@ impl CanonicalFanoutScene {
                     &mut rows,
                 )
                 .expect("the original actual New and native marker authorize this subject");
+            assert_eq!(
+                witness.receipt().closure_generation(),
+                attached.generation()
+            );
             births.push((caller, witness, rows));
         }
         assert_ne!(
@@ -1485,9 +1501,14 @@ fn joint_frame_preflight_keeps_targets_and_birth_selection_on_retry() {
 
 #[test]
 fn joint_future_end_disposes_frame_without_disposing_call() {
+    let mut previous_generation = None;
     for (b_begin_first, fallback_b) in [(false, false), (true, false), (false, true), (true, true)]
     {
+        eprintln!("future-END arm: b_begin_first={b_begin_first}, fallback_b={fallback_b}");
         let mut fixture = CanonicalFanoutScene::prior_sealed();
+        let generation = fixture.attached.generation();
+        assert!(previous_generation.is_none_or(|previous| generation > previous));
+        previous_generation = Some(generation);
         let a = std::process::id();
         let b = fixture._child.id();
         let (begin_a, end_a) = fixture.scene.encoded(a, 0, "C_SignInit", 2);

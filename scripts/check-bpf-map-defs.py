@@ -837,7 +837,11 @@ def validate_object_capture_reachability(elf, *, full):
         required = ({"p11_stable_cell", "p11_alias_capacity"} if name == "p11_return"
                     else {"p11_stable_cell", "p11_alias_scan"})
         found = {helper for helper, key in globals_by_name.items() if key in reachable(root)}
-        if (full and not required <= found) or (not full and found):
+        # This diagnostic tail continuation walks the second template in an
+        # existing START. Its parent already captured the object attributes;
+        # the continuation must not gain a second scalar-capture path.
+        captures = full and name != "p11_entry_template_second"
+        if (captures and not required <= found) or (not captures and found):
             raise RuntimeError(f"object capture globals not correctly reachable from {name}: {sorted(found)}")
     for name, root in globals_by_name.items():
         allowed = {112} if name != "p11_alias_capacity" else set()

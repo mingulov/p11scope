@@ -956,7 +956,7 @@ class ObjectCaptureGlobalsTests(unittest.TestCase):
                     checker.validate_object_capture_globals(mutant)
 
         bodies, edges, calls = checker.bpf_call_graph(elf)
-        roots = {key for key, symbol in bodies.items()
+        roots = {symbol[0]: key for key, symbol in bodies.items()
                  if symbol[0] == "p11_return" or symbol[0].startswith("p11_entry")}
         if full == "1":
             for name in sorted(expected):
@@ -968,16 +968,60 @@ class ObjectCaptureGlobalsTests(unittest.TestCase):
                     if expanded == reaches:
                         break
                     reaches = expanded
-                changes = [change for caller, destination, at in calls
-                           if caller in roots and destination in reaches
-                           for change in [(at, "B", 0xb7), (at + 1, "B", 0)]]
-                self.assertTrue(changes, f"real entry/return roots must reach {name}")
-                with self.subTest(helper=name, mutation="unreachable_global"), \
-                        self.assertRaisesRegex(RuntimeError, "reachable"):
-                    checker.validate_object_capture_reachability(self.mutated(changes), full=True)
+                for root_name, root in roots.items():
+                    if root_name == "p11_entry_template_second":
+                        continue
+                    required = ({"p11_stable_cell", "p11_alias_capacity"}
+                                if root_name == "p11_return"
+                                else {"p11_stable_cell", "p11_alias_scan"})
+                    if name not in required:
+                        continue
+                    changes = [change for caller, destination, at in calls
+                               if caller == root and destination in reaches
+                               for change in [(at, "B", 0xb7), (at + 1, "B", 0)]]
+                    self.assertTrue(changes, f"actual {root_name} must reach {name}")
+                    with self.subTest(root=root_name, helper=name, mutation="unreachable_global"), \
+                            self.assertRaisesRegex(RuntimeError, "reachable"):
+                        checker.validate_object_capture_reachability(self.mutated(changes), full=True)
         else:
             with self.assertRaisesRegex(RuntimeError, "reachable"):
                 checker.validate_object_capture_reachability(elf, full=True)
+
+        continuation = roots.get("p11_entry_template_second")
+        if continuation is not None:
+            symbol_index, symbol = next((i, symbol) for i, symbol in enumerate(elf.symbols)
+                                        if symbol[0] == "p11_entry_template_second")
+            symbol_at = elf.sections[".symtab"][0][4] + 24 * symbol_index
+            for mutation, change in {
+                "local_continuation": (symbol_at + 4, "B", 0x02),
+                "hidden_continuation": (symbol_at + 5, "B", 2),
+            }.items():
+                with self.subTest(mutation=mutation), self.assertRaisesRegex(RuntimeError, "GLOBAL DEFAULT.*root"):
+                    checker.validate_object_capture_reachability(self.mutated([change]), full=full == "1")
+            if full == "1":
+                name_offset = struct.unpack_from("<I", self.object.read_bytes(), symbol_at)[0]
+                strings_index = elf.sections[".symtab"][0][6]
+                strings = next(row for label, (row, _) in elf.sections.items()
+                               if elf.indices[label] == strings_index)
+                # A capture-free root with a merely similar name is not the
+                # second-template continuation and must not gain its role.
+                renamed = self.mutated([(strings[4] + name_offset + len(symbol[0]) - 1, "B", ord("x"))])
+                with self.subTest(mutation="similar_continuation_name"), self.assertRaisesRegex(RuntimeError, "reachable"):
+                    checker.validate_object_capture_reachability(renamed, full=True)
+            # The second-template tail continuation consumes an existing START;
+            # its parent has already run the object-attribute capture path.
+            # Redirect a real pseudo-call, retaining its relocation, to prove
+            # the exact continuation must still reject capture-global reach.
+            target = next(key for key, symbol in bodies.items() if symbol[0] == "p11_stable_cell")
+            _, destination, call_at = next(call for call in calls
+                                           if call[0] == continuation and call[1][0] == target[0])
+            immediate = struct.unpack_from("<i", self.object.read_bytes(), call_at + 4)[0]
+            mutant = self.mutated([(call_at + 4, "i", immediate + (target[1] - destination[1]) // 8)])
+            _, mutated_edges, _ = checker.bpf_call_graph(mutant)
+            self.assertIn(target, mutated_edges[continuation], "mutation must reach the actual scalar global")
+            with self.subTest(root="p11_entry_template_second", mutation="unexpected_capture_global"), \
+                    self.assertRaisesRegex(RuntimeError, "reachable"):
+                checker.validate_object_capture_reachability(mutant, full=full == "1")
 
         symbol = next(symbol for symbol in elf.symbols if symbol[0] == "p11_stable_cell")
         text_row, text = elf.sections[".text"]

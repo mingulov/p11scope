@@ -29,15 +29,15 @@
 
 use crate::capture;
 use crate::object_policy::{
-    DeriveResultProtocol, ObjectAction, SafeAttributeKind, SafeCurve, ScalarDeriveMechanism,
     classify_attribute_scalar, classify_ec_params, derive_result_protocol, object_descriptor,
-    safe_attribute_kind, valid_safe_attribute_length,
+    safe_attribute_kind, valid_safe_attribute_length, DeriveResultProtocol, ObjectAction,
+    SafeAttributeKind, SafeCurve, ScalarDeriveMechanism,
 };
 use crate::object_wire::{
-    OBJECT_DERIVE_DH_PKCS, OBJECT_DERIVE_ECDH1, OBJECT_DERIVE_ECDH1_COFACTOR, OBJECT_DERIVE_SHA256,
-    OBJECT_DERIVE_UNAVAILABLE, ObjectAttributeListWire, ObjectAttributeWire,
+    ObjectAttributeListWire, ObjectAttributeWire, OBJECT_DERIVE_DH_PKCS, OBJECT_DERIVE_ECDH1,
+    OBJECT_DERIVE_ECDH1_COFACTOR, OBJECT_DERIVE_SHA256, OBJECT_DERIVE_UNAVAILABLE,
 };
-use crate::{ARG_NONE, InstanceStamp, LinuxLayout, instance, target_word_end};
+use crate::{instance, target_word_end, InstanceStamp, LinuxLayout, ARG_NONE};
 
 /// `CKR_OK`: the only RV that authorizes result-handle and Find reads.
 /// From `cryptoki-sys` 0.5.0 (`CK_RV = 0`).
@@ -2530,7 +2530,7 @@ pub fn capture_get_entry_into(
     side: &mut crate::object_wire::ObjectStart,
     mut read_word: impl FnMut(u64) -> Result<u64, ()>,
 ) -> GetEntryVerdict {
-    use crate::object_wire::{GET_ENTRY_FLAGS_MASK, GET_ENTRY_FLAGS_SHIFT, ObjectAttributeSlot};
+    use crate::object_wire::{ObjectAttributeSlot, GET_ENTRY_FLAGS_MASK, GET_ENTRY_FLAGS_SHIFT};
     side.get_template_base = 0;
     side.inspected_header_end = 0;
     side.get_inspected = 0;

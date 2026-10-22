@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::object_policy::{self, ScalarDeriveMechanism};
-use crate::{ARG_NONE, LinuxLayout};
+use crate::{LinuxLayout, ARG_NONE};
 use core::cell::RefCell;
 
 extern crate std;
@@ -347,7 +347,11 @@ fn object_producer_object_family_matrix() {
             assert_eq!(
                 words[i],
                 if present[i] {
-                    if i == 0 { u64::MAX } else { 0x1_0000_0001 }
+                    if i == 0 {
+                        u64::MAX
+                    } else {
+                        0x1_0000_0001
+                    }
                 } else {
                     0
                 },
@@ -4168,7 +4172,7 @@ fn streamed_empty_and_overflow_templates_read_nothing_including_peer() {
 #[test]
 fn streamed_get_private_flags_never_enter_public_tail() {
     use crate::object_wire::{
-        GET_ENTRY_FLAGS_MASK, ObjectCallWire, ObjectStart, canonical_object_wire,
+        canonical_object_wire, ObjectCallWire, ObjectStart, GET_ENTRY_FLAGS_MASK,
     };
     let function = fid("C_GetAttributeValue");
     let row = canonical_object_wire(function);
@@ -4277,7 +4281,7 @@ fn streamed_get_partial_result_corpus_matches_reference() {
 
 #[test]
 fn streamed_actual_pair_body_checks_peer_before_either_value_read() {
-    use crate::object_wire::{ObjectStart, canonical_object_wire};
+    use crate::object_wire::{canonical_object_wire, ObjectStart};
     for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
         let w = layout.word_bytes() as u64;
         for mode in 0..4 {
@@ -4349,7 +4353,7 @@ fn streamed_actual_pair_body_checks_peer_before_either_value_read() {
 
 #[test]
 fn streamed_actual_pair_body_distinguishes_failed_argument_from_empty() {
-    use crate::object_wire::{ObjectStart, canonical_object_wire};
+    use crate::object_wire::{canonical_object_wire, ObjectStart};
     for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
         let w = layout.word_bytes() as u64;
         let row = canonical_object_wire(fid("C_GenerateKeyPair"));
@@ -4410,7 +4414,7 @@ fn streamed_actual_pair_body_distinguishes_failed_argument_from_empty() {
 
 #[test]
 fn streamed_actual_pair_body_disjoint_and_refused_derives_are_unchanged() {
-    use crate::object_wire::{OBJECT_DERIVE_UNAVAILABLE, ObjectStart, canonical_object_wire};
+    use crate::object_wire::{canonical_object_wire, ObjectStart, OBJECT_DERIVE_UNAVAILABLE};
     for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
         let w = layout.word_bytes() as u64;
         let target = fresh(w);
@@ -4487,7 +4491,7 @@ fn return_gate_exact_finite_roundtrip_and_all_unknown_bits_refuse() {
 #[test]
 fn return_gate_actual_fill_keeps_full_width_and_continuity_authority() {
     use crate::object_flow::adapter_fill_return_control;
-    use crate::object_wire::{ObjectStart, canonical_object_wire};
+    use crate::object_wire::{canonical_object_wire, ObjectStart};
     let row = canonical_object_wire(fid("C_DeriveKey"));
     let descriptor = row.function + 1;
     for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
@@ -4581,7 +4585,7 @@ fn return_gate_actual_fill_keeps_full_width_and_continuity_authority() {
 #[test]
 fn return_gate_actual_emitters_refuse_unknown_bits_and_unjoined_without_reads() {
     use crate::object_flow::{adapter_emit_find_control, adapter_emit_get_control};
-    use crate::object_wire::{ObjectCallWire, ObjectStart, canonical_object_wire};
+    use crate::object_wire::{canonical_object_wire, ObjectCallWire, ObjectStart};
     for name in ["C_FindObjects", "C_GetAttributeValue"] {
         let row = canonical_object_wire(fid(name));
         let descriptor = row.function + 1;
@@ -4651,7 +4655,7 @@ fn return_gate_actual_emitters_refuse_unknown_bits_and_unjoined_without_reads() 
 #[test]
 fn streamed_actual_get_arguments_missing_is_uninspected_and_zero_is_empty() {
     use crate::object_flow::{capture_get_template, production_capture_get_return};
-    use crate::object_wire::{ObjectAttributeListWire, ObjectStart, canonical_object_wire};
+    use crate::object_wire::{canonical_object_wire, ObjectAttributeListWire, ObjectStart};
     let row = canonical_object_wire(fid("C_GetAttributeValue"));
     for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
         let w = layout.word_bytes() as u64;
@@ -4792,7 +4796,7 @@ fn streamed_get_retained_index_boundary_refuses_before_target_reads() {
 
 #[test]
 fn completed_event_in_place_initializes_all_bytes_from_owned_facts() {
-    use crate::object_flow::{ReturnEventFacts, fill_call_event};
+    use crate::object_flow::{fill_call_event, ReturnEventFacts};
     use crate::{CallStart, Event, ImageIdentity};
     let start = CallStart {
         ts_ns: 900,

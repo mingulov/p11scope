@@ -1,13 +1,16 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
-//! Process-wide cache of the parsed host vmlinux BTF plus the pidfd-iterator
-//! selector probe derived from it.
+//! Process-wide cache of the original and parsed host vmlinux BTF plus the
+//! pidfd-iterator selector probe derived from it.
 //!
 //! `aya::Btf::from_sys_fs` re-reads and re-parses the ~7MB
 //! `/sys/kernel/btf/vmlinux` blob on every call (tens of milliseconds),
 //! which alone can exhaust a 25ms native-query job budget when paid per
 //! query; the `bpf_iter_attach_task` name lookup is a second linear scan.
 //! The running kernel's vmlinux BTF is immutable, so one process-wide
-//! parse serves every native query. The existing Inventory and Session
+//! parse serves every native query. Original bytes stay with that parse:
+//! Aya's serialization does not preserve extended headers or section gaps,
+//! so raw prototype checks must borrow the bytes that were actually parsed.
+//! The existing Inventory and Session
 //! preparations already require BTF and now populate this cache, so the
 //! parse and lookup complete before any budgeted job tick; per-tick
 //! queries borrow the cached facts without cloning or re-scanning.
@@ -18,7 +21,7 @@
 //! before exec: the pre-exec path stays syscall-only, and the cache is
 //! initialized only in observer preparation.
 //!
-//! Hermeticity: no test substitutes host BTF (aya hardcodes the sysfs
+//! Hermeticity: no test substitutes host BTF (the loader fixes the sysfs
 //! path), so the cache cannot shadow a fixture. The tests below drive
 //! local cells with injected loaders and never touch the production cell.
 
@@ -32,6 +35,7 @@ const PIDFD_SELECTOR_TYPE: &str = "bpf_iter_attach_task";
 /// The cached host BTF facts: the shared parse plus the derived selector probe.
 #[derive(Debug)]
 pub(crate) struct HostBtf {
+    raw: Vec<u8>,
     btf: aya::Btf,
     pidfd_selector: bool,
 }
@@ -39,6 +43,11 @@ pub(crate) struct HostBtf {
 impl HostBtf {
     pub(crate) fn btf(&self) -> &aya::Btf {
         &self.btf
+    }
+
+    /// Bind raw checks to the same parse used for hook relocation/loading.
+    pub(crate) fn original_bytes_for(&self, btf: &aya::Btf) -> Option<&[u8]> {
+        std::ptr::eq(&self.btf, btf).then_some(self.raw.as_slice())
     }
 
     pub(crate) fn supports_pidfd_iter_selector(&self) -> bool {
@@ -85,32 +94,41 @@ impl std::error::Error for CachedError {
 
 static HOST_BTF: OnceLock<Result<HostBtf, CachedError>> = OnceLock::new();
 
-fn load(
-    load_btf: impl FnOnce() -> Result<aya::Btf, aya::BtfError>,
-) -> Result<HostBtf, CachedError> {
-    let btf = load_btf().map_err(CachedError::capture)?;
+fn load(read_btf: impl FnOnce() -> Result<Vec<u8>, aya::BtfError>) -> Result<HostBtf, CachedError> {
+    let raw = read_btf().map_err(CachedError::capture)?;
+    let btf = aya::Btf::parse(&raw, aya::Endianness::default()).map_err(CachedError::capture)?;
     let pidfd_selector = btf
         .id_by_type_name_kind(PIDFD_SELECTOR_TYPE, aya_obj::btf::BtfKind::Func)
         .is_ok();
     Ok(HostBtf {
+        raw,
         btf,
         pidfd_selector,
     })
 }
 
-fn cached(
+pub(super) fn cached(
     cell: &OnceLock<Result<HostBtf, CachedError>>,
-    load_btf: impl FnOnce() -> Result<aya::Btf, aya::BtfError>,
+    read_btf: impl FnOnce() -> Result<Vec<u8>, aya::BtfError>,
 ) -> Result<&HostBtf, CachedError> {
-    cell.get_or_init(|| load(load_btf))
+    cell.get_or_init(|| load(read_btf))
         .as_ref()
         .map_err(|error| error.clone())
+}
+
+fn read_btf(path: &std::path::Path) -> Result<Vec<u8>, aya::BtfError> {
+    std::fs::read(path).map_err(|error| aya::BtfError::FileError {
+        path: path.to_owned(),
+        error,
+    })
 }
 
 /// The process-wide host BTF facts, parsed and probed once. Jobs borrow the
 /// result: no per-query clone of the parse and no repeated name lookup.
 pub(crate) fn shared() -> Result<&'static HostBtf, CachedError> {
-    cached(&HOST_BTF, aya::Btf::from_sys_fs)
+    cached(&HOST_BTF, || {
+        read_btf(std::path::Path::new("/sys/kernel/btf/vmlinux"))
+    })
 }
 
 #[cfg(test)]
@@ -166,11 +184,22 @@ mod tests {
     fn local_cell_parses_success_once_and_shares_one_allocation() {
         let cell = OnceLock::new();
         let calls = AtomicUsize::new(0);
+        let raw = fixture_blob(true);
+        let raw_allocation = raw.as_ptr();
         let loader = || {
             calls.fetch_add(1, Ordering::SeqCst);
-            parse_fixture(true)
+            Ok(raw)
         };
         let first = cached(&cell, loader).expect("byte fixture parses");
+        let original = first.original_bytes_for(first.btf()).unwrap();
+        assert_eq!(original, fixture_blob(true));
+        assert_eq!(
+            original.as_ptr(),
+            raw_allocation,
+            "retain the original read"
+        );
+        let foreign = parse_fixture(true).unwrap();
+        assert!(first.original_bytes_for(&foreign).is_none());
         assert!(first.supports_pidfd_iter_selector());
         assert!(
             first
@@ -180,7 +209,7 @@ mod tests {
         );
         let loader = || {
             calls.fetch_add(1, Ordering::SeqCst);
-            parse_fixture(true)
+            Ok(fixture_blob(true))
         };
         let second = cached(&cell, loader).expect("cached facts repeat");
         assert_eq!(calls.load(Ordering::SeqCst), 1, "one parse per cell");
@@ -196,14 +225,14 @@ mod tests {
                 .is_err()
         );
         let cell = OnceLock::new();
-        let host = cached(&cell, || parse_fixture(false)).expect("parse succeeds");
+        let host = cached(&cell, || Ok(fixture_blob(false))).expect("parse succeeds");
         assert!(!host.supports_pidfd_iter_selector());
     }
 
     #[test]
     fn local_cell_caches_absence_and_never_reloads() {
-        fn missing() -> Result<aya::Btf, aya::BtfError> {
-            aya::Btf::parse_file("/nonexistent-p11scope-host-btf", aya::Endianness::default())
+        fn missing() -> Result<Vec<u8>, aya::BtfError> {
+            read_btf(std::path::Path::new("/nonexistent-p11scope-host-btf"))
         }
         missing().expect_err("the absence loader must fail");
         let cell = OnceLock::new();
@@ -225,6 +254,7 @@ mod tests {
             Ok(_) => panic!("absence must fail closed"),
         };
         assert_eq!(calls.load(Ordering::SeqCst), 1, "one load per cell");
+        assert!(Arc::ptr_eq(&first.inner, &second.inner));
         assert_eq!(first.to_string(), second.to_string());
         assert_eq!(format!("{first:?}"), format!("{second:?}"));
         let raw = missing().expect_err("the absence loader must fail");
@@ -242,7 +272,7 @@ mod tests {
         let calls = AtomicUsize::new(0);
         let loader = || {
             calls.fetch_add(1, Ordering::SeqCst);
-            malformed()
+            Ok(vec![0x7f; 64])
         };
         let first = match cached(&cell, loader) {
             Err(error) => error,
@@ -250,13 +280,14 @@ mod tests {
         };
         let loader = || {
             calls.fetch_add(1, Ordering::SeqCst);
-            malformed()
+            Ok(vec![0x7f; 64])
         };
         let second = match cached(&cell, loader) {
             Err(error) => error,
             Ok(_) => panic!("malformed input must fail closed"),
         };
         assert_eq!(calls.load(Ordering::SeqCst), 1, "one load per cell");
+        assert!(Arc::ptr_eq(&first.inner, &second.inner));
         assert_eq!(first.to_string(), second.to_string());
         assert_eq!(format!("{first:?}"), format!("{second:?}"));
         let raw = malformed().expect_err("the malformed loader must fail");
@@ -272,7 +303,9 @@ mod tests {
         let raw = missing().expect_err("the absence loader must fail");
         assert!(raw.source().is_some(), "the fixture must carry a source");
         let cell = OnceLock::new();
-        let snapshot = match cached(&cell, missing) {
+        let snapshot = match cached(&cell, || {
+            read_btf(std::path::Path::new("/nonexistent-p11scope-host-btf"))
+        }) {
             Err(error) => error,
             Ok(_) => panic!("absence must fail closed"),
         };
@@ -328,7 +361,7 @@ mod tests {
                     barrier.wait();
                     let host = cached(&cell, || {
                         calls.fetch_add(1, Ordering::SeqCst);
-                        parse_fixture(true)
+                        Ok(fixture_blob(true))
                     })
                     .expect("byte fixture parses");
                     assert!(host.supports_pidfd_iter_selector());

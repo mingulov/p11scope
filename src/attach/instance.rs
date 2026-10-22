@@ -405,10 +405,9 @@ impl InstanceTracking {
     }
 
     fn load_hooks(ebpf: &mut Ebpf, btf: &Btf) -> Result<LoadedInstancePrograms> {
-        ensure!(
-            exec_release_proto_is_exact(&btf.to_bytes()),
-            "exec_mm_release must be void(task_struct *, mm_struct *)"
-        );
+        let host =
+            super::host_btf::shared().context("loading required vmlinux BTF for instance hooks")?;
+        validate_exec_release_proto(host, btf)?;
         load_instance_programs_with(ebpf, |ebpf, program, target| {
             let hook = ebpf
                 .program_mut(program)
@@ -576,6 +575,17 @@ impl InstanceTracking {
 
 /// Verify the actual BTF prototype rather than accepting the function name
 /// alone. This is separate from the no-LTO cross-file call coverage premise.
+fn validate_exec_release_proto(host: &super::host_btf::HostBtf, btf: &Btf) -> Result<()> {
+    let raw = host
+        .original_bytes_for(btf)
+        .context("instance hook BTF differs from cached host BTF")?;
+    ensure!(
+        exec_release_proto_is_exact(raw),
+        "exec_mm_release must be void(task_struct *, mm_struct *)"
+    );
+    Ok(())
+}
+
 fn exec_release_proto_is_exact(raw: &[u8]) -> bool {
     let word = |bytes: &[u8], at: usize| -> Option<u32> {
         Some(u32::from_le_bytes(
@@ -2134,8 +2144,7 @@ mod tests {
         assert!(!watched.check_unchanged().unwrap());
     }
 
-    #[test]
-    fn image_hook_requires_the_exact_exec_release_prototype() {
+    fn exec_release_btf_fixture(header_len: u32, string_gap: usize) -> Vec<u8> {
         let strings = b"\0task_struct\0mm_struct\0exec_mm_release\0";
         let words = [
             1,
@@ -2164,22 +2173,104 @@ mod tests {
         let types: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
         let mut bytes = vec![0x9f, 0xeb, 1, 0];
         for word in [
-            24,
+            header_len,
             0,
             types.len() as u32,
-            types.len() as u32,
+            types.len() as u32 + string_gap as u32,
             strings.len() as u32,
         ] {
             bytes.extend(word.to_le_bytes());
         }
+        bytes.resize(header_len as usize, 0xa5);
         bytes.extend(types);
+        bytes.resize(bytes.len() + string_gap, 0x5a);
         bytes.extend(strings);
+        bytes
+    }
+
+    #[test]
+    fn image_hook_requires_the_exact_exec_release_prototype() {
+        let bytes = exec_release_btf_fixture(24, 0);
         assert!(exec_release_proto_is_exact(&bytes));
         let mut wrong = bytes.clone();
         wrong[24 + 48 + 16..24 + 48 + 20].copy_from_slice(&4u32.to_le_bytes());
         assert!(!exec_release_proto_is_exact(&wrong));
         for truncated in 0..bytes.len() {
             assert!(!exec_release_proto_is_exact(&bytes[..truncated]));
+        }
+    }
+
+    #[test]
+    fn image_hook_preflight_uses_original_cached_bytes_and_rejects_foreign_parse() {
+        use super::super::host_btf;
+        for (header, gap) in [(24, 0), (32, 0), (24, 7), (32, 7)] {
+            let bytes = exec_release_btf_fixture(header, gap);
+            let foreign = aya::Btf::parse(&bytes, aya::Endianness::default()).unwrap();
+            assert!(exec_release_proto_is_exact(&bytes));
+            assert_eq!(
+                exec_release_proto_is_exact(&foreign.to_bytes()),
+                header == 24 && gap == 0,
+                "pinned Aya does not retain the header extension or string gap"
+            );
+            let cell = std::sync::OnceLock::new();
+            let host = host_btf::cached(&cell, || Ok(bytes)).unwrap();
+            super::validate_exec_release_proto(host, host.btf()).unwrap();
+            assert_eq!(
+                super::validate_exec_release_proto(host, &foreign)
+                    .unwrap_err()
+                    .to_string(),
+                "instance hook BTF differs from cached host BTF"
+            );
+        }
+    }
+
+    #[test]
+    fn image_hook_cached_preflight_keeps_signature_and_extent_refusals() {
+        use super::super::host_btf;
+        let signature_refuses = |bytes| {
+            let cell = std::sync::OnceLock::new();
+            let host = host_btf::cached(&cell, || Ok(bytes))
+                .expect("signature mutant must remain parseable BTF");
+            assert_eq!(
+                super::validate_exec_release_proto(host, host.btf())
+                    .unwrap_err()
+                    .to_string(),
+                "exec_mm_release must be void(task_struct *, mm_struct *)"
+            );
+        };
+        let check = |bytes| {
+            let cell = std::sync::OnceLock::new();
+            match host_btf::cached(&cell, || Ok(bytes)) {
+                Ok(host) => super::validate_exec_release_proto(host, host.btf()).is_ok(),
+                Err(_) => false,
+            }
+        };
+        for (header, gap) in [(24, 0), (32, 7)] {
+            let bytes = exec_release_btf_fixture(header, gap);
+            assert!(check(bytes.clone()));
+            let proto = header as usize + 48;
+            let mut wrong_return = bytes.clone();
+            wrong_return[proto + 8..proto + 12].copy_from_slice(&1u32.to_le_bytes());
+            signature_refuses(wrong_return);
+            let mut wrong_argument = bytes.clone();
+            wrong_argument[proto + 16..proto + 20].copy_from_slice(&4u32.to_le_bytes());
+            signature_refuses(wrong_argument);
+            let type_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+            let type_end = header as usize + type_len as usize;
+            let mut duplicate = bytes.clone();
+            duplicate.splice(
+                type_end..type_end,
+                bytes[type_end - 12..type_end].iter().copied(),
+            );
+            duplicate[12..16].copy_from_slice(&(type_len + 12).to_le_bytes());
+            duplicate[16..20].copy_from_slice(&(type_len + gap as u32 + 12).to_le_bytes());
+            signature_refuses(duplicate);
+            for truncated in 0..bytes.len() {
+                assert!(
+                    !check(bytes[..truncated].to_vec()),
+                    "truncated at {truncated}"
+                );
+            }
         }
     }
 

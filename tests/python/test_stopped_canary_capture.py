@@ -32,6 +32,25 @@ c = capture.custody
 fixtures = load_path(ROOT / 'tests/python/test_canary_evidence.py', 'canary_fixtures')
 
 
+def foreign_population_error(map_id=111, pid=8888, tid=8888):
+    fixture = fixtures.StoppedPopulationTests('test_framed_records_bind_generations_for_future_coordinator')
+    maps, records, arguments = fixture.reconciliation_fixture()
+    item = next(row for row in maps if row['id'] == map_id)
+    # Distinct raw identifiers/bytes make accidental exception interpolation
+    # visible without making those values part of the desired diagnostic.
+    item['id'] = 90909090
+    for row in records:
+        if row['map_id'] == map_id:
+            row['map_id'] = 90909090
+    foreign = {'map_id': 90909090, 'pid': pid, 'tid': tid, 'generation': 123456789,
+               'value': b'PRIVATE_CANARY_VALUE'}
+    try:
+        capture.dumper.reconcile_task_storage(maps, [foreign, *records], **arguments)
+    except RuntimeError as error:
+        return error
+    raise AssertionError('foreign task-storage row was accepted')
+
+
 def generation(pid):
     return int(Path(f'/proc/{pid}/stat').read_text().rsplit(') ', 1)[1].split()[19])
 
@@ -1083,6 +1102,78 @@ def owned_case(pid, directory, case, program, provider):
 
 
 class StoppedCanaryCaptureTests(unittest.TestCase):
+    def test_population_diagnostic_preserves_map_relation_and_leader_only(self):
+        # Generic sanitization currently discards the map that distinguishes a
+        # continuity bookkeeping mismatch from foreign cookie/owner capture.
+        for map_id, name in ((101, 'TASK_COOKIE'), (102, 'THREAD_OWNER'),
+                             (103, 'ROOT_AFFILIATION'), (111, 'PROC_EPOCH')):
+            for relation, pid, tid, leader in (
+                ('outside-roster', 8888, 8888, 'yes'),
+                ('outside-roster', 8888, 8889, 'no'),
+                ('wrong-group', 7002, 7002, 'yes'),
+                ('wrong-group', 8888, 7002, 'no'),
+            ):
+                with self.subTest(map=name, relation=relation, leader=leader):
+                    error = foreign_population_error(map_id, pid, tid)
+                    error.private_context = 'PRIVATE_CANARY_CONTEXT'
+                    error.args = ('PRIVATE_CANARY_EXCEPTION_TEXT',)
+                    diagnostic = io.StringIO()
+                    with contextlib.redirect_stderr(diagnostic):
+                        issues = capture.sanitized('retained-semantics', error)
+                    self.assertEqual(issues, [f'retained-semantics: task-storage map={name} '
+                                              f'relation={relation} leader={leader}'])
+                    for forbidden in ('8888', '8889', '7002', '90909090', '123456789',
+                                      'PRIVATE_CANARY', str(ROOT), __file__):
+                        self.assertNotIn(forbidden, diagnostic.getvalue() + '\n'.join(issues))
+
+    def test_population_diagnostic_forgery_and_closed_stderr_keep_failure(self):
+        error = foreign_population_error()
+        self.assertEqual(type(error).__name__, 'TaskStoragePopulationError')
+
+        class PrivateString(str):
+            def __eq__(self, other):
+                raise AssertionError('untrusted field equality was evaluated')
+
+        class Spoofed(capture.dumper.TaskStoragePopulationError):
+            def __str__(self):
+                raise AssertionError('untrusted exception text was evaluated')
+
+        for field, value in (('map_name', 'PRIVATE_CANARY_MAP'),
+                             ('map_name', PrivateString('PROC_EPOCH')),
+                             ('map_name', None),
+                             ('relation', 'outside-roster\nPRIVATE_CANARY_RELATION'),
+                             ('relation', PrivateString('outside-roster')),
+                             ('relation', ['outside-roster']),
+                             ('leader', 1), ('leader', 'yes')):
+            with self.subTest(field=field, value_type=type(value).__name__):
+                error = foreign_population_error()
+                setattr(error, field, value)
+                diagnostic = io.StringIO()
+                with contextlib.redirect_stderr(diagnostic):
+                    self.assertEqual(capture.sanitized('retained-semantics', error),
+                                     ['retained-semantics: TaskStoragePopulationError'])
+                self.assertNotIn('PRIVATE_CANARY', diagnostic.getvalue())
+        error = foreign_population_error()
+        del error.map_name
+        self.assertEqual(capture.sanitized('retained-semantics', error),
+                         ['retained-semantics: TaskStoragePopulationError'])
+
+        plain = RuntimeError('task-storage map=PROC_EPOCH relation=outside-roster '
+                             'leader=yes PRIVATE_CANARY_TEXT')
+        plain.map_name, plain.relation, plain.leader = 'PROC_EPOCH', 'outside-roster', True
+        for error, kind in ((plain, 'RuntimeError'),
+                            (Spoofed('PROC_EPOCH', 'outside-roster', True), 'Spoofed')):
+            self.assertEqual(capture.sanitized('retained-semantics', error),
+                             [f'retained-semantics: {kind}'])
+
+        error = foreign_population_error()
+        diagnostic = io.StringIO()
+        diagnostic.close()
+        with contextlib.redirect_stderr(diagnostic):
+            self.assertEqual(capture.sanitized('retained-semantics', error),
+                             ['retained-semantics: task-storage map=PROC_EPOCH '
+                              'relation=outside-roster leader=yes'])
+
     def test_retained_object_scrub_requires_q_before_reading_hash(self):
         # Kernel reads are the injected external boundary. The real LiveMaps
         # method still selects its retained FDs, interprets Q and fails closed.

@@ -1924,6 +1924,51 @@ class StoppedPopulationTests(unittest.TestCase):
         return load_subject(TARGET_BITS).owned_map_surfaces(
             "population", manifest, {item["name"] for item in manifest}, str(root / "case"))
 
+    def reconciliation_fixture(self):
+        manifest, receipt, records, values = self.fixture(Path("/unused"))
+        controls = {}
+        for item in manifest:
+            if item["name"] in values:
+                words = values[item["name"]]
+                controls[item["name"]] = {
+                    "id": item["id"], "name": item["name"], "type": item["type"],
+                    "oracle": item["oracle"], "bytes_key": item["key_size"],
+                    "bytes_value": item["value_size"], "max_entries": item["max_entries"],
+                    "map_flags": item["map_flags"],
+                    "value": struct.pack("<" + "Q" * len(words), *words),
+                }
+        arguments = {key: receipt[key] for key in ("expected", "before", "after", "lane")}
+        arguments["controls"] = controls
+        return copy.deepcopy(TaskStorageReaderTests.MAPS), records, arguments
+
+    def test_foreign_task_storage_error_has_only_finite_fields(self):
+        # Losing the typed failure (or permitting a foreign row) must not hide
+        # which finite map/relation failed after the coordinator sanitizes it.
+        dumper = load_dumper()
+        for map_id, name, size in ((101, "TASK_COOKIE", 8), (102, "THREAD_OWNER", 560),
+                                   (103, "ROOT_AFFILIATION", 8), (111, "PROC_EPOCH", 152)):
+            for relation, pid, tid, leader in (
+                ("outside-roster", 8888, 8888, True),
+                ("outside-roster", 8888, 8889, False),
+                ("wrong-group", 7002, 7002, True),
+                ("wrong-group", 8888, 7002, False),
+            ):
+                with self.subTest(map=name, relation=relation, leader=leader):
+                    maps, records, arguments = self.reconciliation_fixture()
+                    foreign = {"map_id": map_id, "pid": pid, "tid": tid,
+                               "generation": 123456789, "value": bytes(size)}
+                    with self.assertRaises(RuntimeError) as caught:
+                        dumper.reconcile_task_storage(maps, [foreign, *records], **arguments)
+                    error = caught.exception
+                    self.assertEqual(type(error).__name__, "TaskStoragePopulationError")
+                    self.assertIs(type(error), dumper.TaskStoragePopulationError)
+                    self.assertEqual((error.map_name, error.relation, error.leader),
+                                     (name, relation, leader))
+                    self.assertIs(type(error.leader), bool)
+                    self.assertEqual(dumper.population_diagnostic(error),
+                                     f"task-storage map={name} relation={relation} "
+                                     f"leader={'yes' if leader else 'no'}")
+
     def test_exact_external_owned_and_permitted_empty_populations(self):
         stride = load_subject(TARGET_BITS).RING_RECORD_STRIDES["DISCOVERY"]
         for owned, empty, small in ((False, False, False), (True, False, False),

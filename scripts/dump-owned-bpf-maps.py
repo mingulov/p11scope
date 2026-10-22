@@ -26,6 +26,30 @@ TASK_STORAGE_HEADER = struct.Struct("<8sIIIII")
 TASK_STORAGE_RECORD = 1
 TASK_STORAGE_EOF = 2
 TASK_STORAGE_NAMES = ("TASK_COOKIE", "THREAD_OWNER", "ROOT_AFFILIATION", "PROC_EPOCH")
+
+
+class TaskStoragePopulationError(RuntimeError):
+    """A rejected task relation with finite fields for the capture sanitizer."""
+
+    def __init__(self, map_name: str, relation: str, leader: bool):
+        self.map_name, self.relation, self.leader = map_name, relation, leader
+        super().__init__("stopped map: foreign identity")
+
+
+def population_diagnostic(error: BaseException) -> str | None:
+    """Publish only revalidated fields of this module's exact trusted error."""
+    if type(error) is not TaskStoragePopulationError:
+        return None
+    name = getattr(error, "map_name", None)
+    relation = getattr(error, "relation", None)
+    leader = getattr(error, "leader", None)
+    if (type(name) is not str or name not in TASK_STORAGE_NAMES
+            or type(relation) is not str or relation not in ("outside-roster", "wrong-group")
+            or type(leader) is not bool):
+        return None
+    return f"task-storage map={name} relation={relation} leader={'yes' if leader else 'no'}"
+
+
 IMAGE_HASH_NAMES = ("IMAGE_CONTINUITY", "IMAGE_TGID_INDEX", "IMAGE_QUERY_REQUESTS")
 OBJECT_ARRAY_NAMES = ("OBJECT_DESCRIPTORS",)
 # The frozen Task 2 D2 qualification surface: the seed fixture creates and
@@ -923,7 +947,10 @@ def reconcile_task_storage(maps, records, *, expected, before, after, controls,
             raise RuntimeError(f"{context}: invalid task identity")
         task = roster.get(record["tid"])
         if task is None or task["pid"] != record["pid"]:
-            raise RuntimeError(f"{context}: foreign identity pid={record['pid']} tid={record['tid']}")
+            raise TaskStoragePopulationError(
+                item["name"], "outside-roster" if task is None else "wrong-group",
+                record["pid"] == record["tid"],
+            )
         if "generation" in record and (
                 not snapshot_uint(record["generation"], positive=True)
                 or record["generation"] != task["generation"]):

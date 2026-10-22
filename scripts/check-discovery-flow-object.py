@@ -421,14 +421,21 @@ def interface_flags_provenance(insns, graph, flags, builder):
 def interface_name(elf, secs):
     tag = 'interface-name:'
     require('.text' in secs and 'uretprobe' in secs, tag + 'tail: sections missing')
+    # LLVM 18 spells a u32 LDX destination rN; LLVM 21 spells the same opcode
+    # wN. The encoded read width remains u32, so use one spelling for recipes.
+    def narrow_loads(section):
+        return re.sub(r'\br(\d+)( = \*\(u32 \*\)\()', r'w\1\2', section)
+
+    return_section = narrow_loads(secs['uretprobe'])
+    shared_section = narrow_loads(secs['.text'])
     # The reused tail contract needs return + worker + .text. No other sections
     # enter its PC lookup; .text comes last for relocations targeting .text.
-    text = secs['uretprobe'] + secs['.text']
+    text = return_section + shared_section
     require(D.interface_tail_contract(text), tag + 'tail: existing interface-tail contract')
-    name, lines = function(secs['.text'], 'classify_direct_interface', tag + 'read')
+    name, lines = function(shared_section, 'classify_direct_interface', tag + 'read')
     defined(elf, name, '.text', tag + 'read')
     insns, graph = D.instruction_graph(lines)
-    calls = [c for c in D.internal_call_targets(secs['.text']) if c[0] == name]
+    calls = [c for c in D.internal_call_targets(shared_section) if c[0] == name]
     emitter_calls = [c for c in calls if c[3].endswith('emit_export')]
     require(len(emitter_calls) == 1, tag + 'metadata: emitter link')
     defined(elf, emitter_calls[0][3], '.text', tag + 'metadata')
@@ -558,7 +565,7 @@ def main(argv=None):
                   decoder_sha256=DECODER_SHA256,
                   boundary='typed birth caller/bridge gates; direct-name ExportPayload.record_meta to emit_export',
                   excluded=['C hook identity semantics (native fixture)', 'downstream ring-byte propagation', 'consumer privacy'],
-                  normalization='strip LLVM CO-RE annotation lines before shared decimal-PC CFG helpers')
+                  normalization='strip LLVM CO-RE annotations; canonicalize u32 LDX destination spelling for interface recipes')
     try:
         report['object_sha256'] = hashlib.sha256(args.object.read_bytes()).hexdigest()
         elf, disassembly = load_object(args.object)

@@ -427,7 +427,6 @@ class EntryObjectTests(unittest.TestCase):
                 self.assertIsNotNone(payload)
                 self.assertEqual(tag[0], "object_result")
                 self.assertEqual(payload[0], "object_candidate")
-            first = after
             second_at = next(pc for pc, target in caller.calls.items() if pc > argument and target.endswith("arg_u64"))
             second = caller.step(second_at, ready | {"r3": ("object_field", lookup, 9)})
             tag2 = CHECKER["stack_read"](second, ("stack", -40), 8)

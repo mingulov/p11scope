@@ -78,6 +78,33 @@ class DiscoveryFlow(unittest.TestCase):
                 with self.subTest(variant=variant, contract=contract):
                     self.assertTrue(C.check_decoded(elf, disassembly, contract))
 
+    def test_narrow_word_load_disassembler_spelling(self):
+        # LLVM 18 prints the same u32 LDX destination as rN; LLVM 21 uses wN.
+        # The instruction width, source slot and all downstream guards must hold.
+        for variant, elf, disassembly in self.objects:
+            self.assertTrue(C.check_decoded(elf, disassembly, 'interface-name'))
+            sections = C.sections(disassembly)
+            for function, register, offset, section in (
+                ('interface_list_return', '1', '58', 'uretprobe'),
+                ('classify_direct_interface', '6', '38', '.text'),
+            ):
+                _, lines = C.function(sections[section], function, 'fixture')
+                loads = [(pc, op) for pc, op in C.D.instructions(lines)
+                         if re.fullmatch(rf'[rw]{register} = \*\(u32 \*\)\(r10 - 0x{offset}\)', op)]
+                self.assertEqual(len(loads), 1)
+                site, = loads
+                alternate = ('w' if site[1].startswith('r') else 'r') + site[1][1:]
+                old, new = instruction_change(lines, site, alternate)
+                equivalent = change_function(disassembly, function, old, new)
+                with self.subTest(variant=variant, function=function, control='register spelling'):
+                    self.assertTrue(C.check_decoded(elf, equivalent, 'interface-name'))
+                wider = f'r{register} = *(u64 *)(r10 - 0x{offset})'
+                old, new = instruction_change(lines, site, wider)
+                changed_width = change_function(disassembly, function, old, new)
+                with self.subTest(variant=variant, function=function, mutation='full-width read'):
+                    self.reject(elf, changed_width, 'interface-name',
+                                'tail' if function == 'interface_list_return' else 'flags')
+
     def test_typed_section_metadata(self):
         for variant, elf, disassembly in self.objects:
             for mutation in ('removed', 'renamed', 'nonexec', 'legacy', 'undefined'):

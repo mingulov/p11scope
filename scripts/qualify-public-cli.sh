@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # qualify-public-cli.sh P11SCOPE OUTDIR: independently ledgered public cells.
 # Requires root for live cells. --control-gated OBSERVER OUTDIR FIXTURE [CELL]
-# executes one bounded profile-pid or mt-exact lifecycle unprivileged.
+# executes one bounded profile-pid, mt-exact or system lifecycle unprivileged.
 # Every terminal result has cell/pass/detail/qualification. Exit 1 means failed
 # evidence, 2 means valid smoke/nonqualifying evidence, 0 qualifies the subset.
 set -u
@@ -23,7 +23,7 @@ if [ "$CONTROL" = 1 ]; then
   else
     [ $# -ge 3 ] && [ $# -le 4 ] || exit 64
     CONTROL_CELL=${4:-profile-pid}
-    [[ "$CONTROL_CELL" = profile-pid || "$CONTROL_CELL" = mt-exact ]] || exit 64
+    [[ "$CONTROL_CELL" = profile-pid || "$CONTROL_CELL" = mt-exact || "$CONTROL_CELL" = system ]] || exit 64
   fi
 else
   [ $# = 2 ] || { echo 'usage: qualify-public-cli.sh P11SCOPE OUTDIR' >&2; exit 64; }
@@ -173,6 +173,9 @@ gated() {
   publish_output "$cell.$ext" || { result "$cell" 0 'output copy failed' failed; return 1; }
   judge "$cell.$ext" "$cell.wl" "$cell.receipt.json" "$cell"
 }
+system_cell() {
+  gated system system "$GATED" profile --system --module "$MODULE" --duration 25 -o "$OUT/system.json"
+}
 summary() {
   python3 - "$@" <<'PY' | tee summary.txt
 import json,sys
@@ -264,6 +267,7 @@ fifo_refused() {
 if [ "$CONTROL" = 1 ]; then
   if [ "$CONTROL_KIND" = signal ]; then second_sigint
   elif [ "$CONTROL_KIND" = fifo ]; then fifo_refused
+  elif [ "$CONTROL_CELL" = system ]; then system_cell
   else gated "$CONTROL_CELL" pid "$GATED" profile --pid @PID@ --duration 1 -o "$OUT/$CONTROL_CELL.json"; fi
   summary "$CONTROL_CELL"; exit $?
 fi
@@ -316,7 +320,7 @@ PY
   else result "$cell" 0 "run smoke failed rc=$rc" failed; fi
 done
 gated mt-exact pid "$MT" profile --pid @PID@ --duration 25 -o "$OUT/mt-exact.json"
-gated system system "$GATED" profile --system --module "$MODULE" --duration 25 -o "$OUT/system.json"
+system_cell
 # Signal cells retain distinct expected exits; readiness is mandatory.
 rm -f sigint.json sig.gate
 output=$(product_output sigint.json); [ "$LOCAL_OUTPUT" = "$OUT" ] || rm -f -- "$output"

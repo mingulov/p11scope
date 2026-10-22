@@ -69,12 +69,14 @@ def independent_mapping_identity(path):
             return matches[0]
 
 
-def inputs(*, metrics=False):
+def inputs(*, metrics=False, system=False):
+    calls = 500 if system else 7
+    scope = "system" if system else "pid"
     targets = [{"name": name, "dev": [8, 1], "ino": 71,
                 "file_offset": 4096 + i * 16} for i, name in enumerate(NAMES)]
     report = {"schema": "p11scope/observed-profile/v3",
-              "lane": "profile", "capture": {"scope": "pid", "mode": "profile"},
-              "functions": [{"names": [name], "calls": 7, "errors": 0, "in_flight": 0, "pending_returns": 0,
+              "lane": "profile", "capture": {"scope": scope, "mode": "profile"},
+              "functions": [{"names": [name], "calls": calls, "errors": 0, "in_flight": 0, "pending_returns": 0,
                              "module": dict(OWNED), "module_ambiguous": False, "module_unresolved": False,
                              "target": {"object": dict(OWNED),
                                         "file_offset": 4096 + i * 16}}
@@ -110,7 +112,8 @@ def inputs(*, metrics=False):
         interface_selection={"selection_truncated": False, "providers": [],
                              "standard_exports": [], "inventory_surfaces": [], "tuples": []},
         attach_mechanisms=["per-offset"],
-        attach_backend={"selection": "singles", "fallback": None, "scope_filter": "perf-task+bpf"},
+        attach_backend={"selection": "singles", "fallback": None,
+                        "scope_filter": None if system else "perf-task+bpf"},
         pid_descendant_gaps=0, multi_rebuild_gaps=0)
     if metrics:
         report["schema"] = "p11scope/observed-profile/v3-metrics"
@@ -120,10 +123,10 @@ def inputs(*, metrics=False):
     ledger = ["TARGET " + json.dumps(row) for row in targets]
     ledger += ["READY pid=123", "LEDGER " + json.dumps({
         "schema": "p11scope/public-cli-ledger/v1", "pid": 123, "complete": True,
-        "functions": [{"name": name, "attempts": 7, "successful": 7}
+        "functions": [{"name": name, "attempts": calls, "successful": calls}
                       for name in NAMES]})]
     receipt = {"schema": "p11scope/public-cli-receipt/v1", "cell": "profile-pid",
-               "scope": "pid", "count_domain": "owned-provider",
+               "scope": scope, "count_domain": "owned-provider",
                "launched_pid": 123, "generation": 456,
                "ready_pid": 123, "ready_generation": 456,
                "workload_ready": True, "capture_ready": True, "gate_released": True,
@@ -132,14 +135,20 @@ def inputs(*, metrics=False):
     return report, ledger, receipt
 
 
+def replace_successful_totals(report, ledger, totals):
+    """Keep the independent ledger and observed report coherent for denominator controls."""
+    payload = json.loads(ledger[-1][len("LEDGER "):])
+    for row, total in zip(payload["functions"], totals):
+        row.update(attempts=total, successful=total)
+    ledger[-1] = "LEDGER " + json.dumps(payload)
+    for row, total in zip(report["functions"], totals):
+        row["calls"] = total
+
+
 class OracleTests(unittest.TestCase):
     def run_case(self, mutate=None, *, cell="profile-pid", want=0):
-        report, ledger, receipt = inputs(metrics=cell == "metrics-pid")
+        report, ledger, receipt = inputs(metrics=cell == "metrics-pid", system=cell == "system")
         receipt["cell"] = cell
-        if cell == "system":
-            receipt["scope"] = "system"
-            report["capture"]["scope"] = "system"
-            report["evidence"]["attach_backend"]["scope_filter"] = None
         if mutate:
             mutate(report, ledger, receipt)
         with tempfile.TemporaryDirectory() as raw:
@@ -168,6 +177,56 @@ class OracleTests(unittest.TestCase):
 
     def test_valid_metrics(self):
         self.run_case(cell="metrics-pid")
+
+    def test_system_six_500_call_totals_pass(self):
+        self.run_case(cell="system")
+
+    def test_system_seven_call_smoke_cannot_qualify(self):
+        self.run_case(lambda d, l, r: replace_successful_totals(d, l, (7,) * 6),
+                      cell="system", want=1)
+
+    def test_system_six_499_call_totals_cannot_qualify(self):
+        self.run_case(lambda d, l, r: replace_successful_totals(d, l, (499,) * 6),
+                      cell="system", want=1)
+
+    def test_system_compensated_499_501_totals_cannot_qualify(self):
+        for index in range(6):
+            totals = [500] * 6
+            totals[index], totals[(index + 1) % 6] = 499, 501
+            self.assertEqual(sum(totals), 3000)
+            with self.subTest(deficient=NAMES[index]):
+                self.run_case(lambda d, l, r: replace_successful_totals(d, l, totals),
+                              cell="system", want=1)
+
+    def test_system_report_must_match_each_independent_total(self):
+        for index in range(6):
+            with self.subTest(target=NAMES[index]):
+                self.run_case(lambda d, l, r: d["functions"][index].update(calls=499),
+                              cell="system", want=1)
+
+    def test_system_target_identity_failures_cannot_qualify(self):
+        mutations = {
+            "missing": lambda d, l, r: l.pop(0),
+            "duplicate": lambda d, l, r: l.insert(0, l[0]),
+            "foreign": lambda d, l, r: d["functions"][0]["target"].update(object=FOREIGN),
+        }
+        for fault, mutate in mutations.items():
+            with self.subTest(fault=fault):
+                self.run_case(mutate, cell="system", want=1)
+
+    def test_system_loss_and_pending_returns_fail(self):
+        mutations = {
+            "loss": lambda d, l, r: d["evidence"].update(event_loss=1),
+            "pending": lambda d, l, r: d["functions"][0].update(pending_returns=1),
+            "in-flight": lambda d, l, r: d["functions"][0].update(in_flight=1),
+        }
+        for fault, mutate in mutations.items():
+            with self.subTest(fault=fault):
+                self.run_case(mutate, cell="system", want=1)
+
+    def test_system_unproven_drain_cannot_be_complete(self):
+        self.run_case(lambda d, l, r: d["evidence"].update(drain_proven=False),
+                      cell="system", want=1)
 
     def test_foreign_provider_equal_counts_fails(self):
         self.run_case(lambda d, l, r: [f["target"].update(object=FOREIGN)
@@ -554,6 +613,8 @@ for i, name in enumerate(names):
  print('TARGET '+json.dumps({'name':name,'dev':dev,'ino':ino,'file_offset':4096+i*16}), flush=True)
 print('READY pid=%d' % (123 if mode=='wrong-ready-pid' else os.getpid()), flush=True)
 while not pathlib.Path(gate).exists(): time.sleep(.02)
+(root / 'readiness-before-release.json').write_text(json.dumps(
+ 'p11scope: capturing:' in (root / (cell + '.stderr')).read_text()))
 (root / 'released').write_text('yes')
 if mode != 'missing-ledger':
  print('LEDGER '+json.dumps({'schema':'p11scope/public-cli-ledger/v1','pid':os.getpid(),'complete':True,
@@ -567,6 +628,7 @@ import hashlib,json,os,pathlib,signal,sys,time
 ''' + FAKE_MAPPING + '''
 out=pathlib.Path(sys.argv[sys.argv.index('-o')+1]); root=pathlib.Path(os.environ.get('CONTROL_OUT',str(out.parent)))
 (root / 'selected-output.json').write_text(json.dumps(str(out)))
+(root / 'observer-argv.json').write_text(json.dumps(sys.argv[1:]))
 (root / 'observer.pid').write_text(str(os.getpid()))
 mode=os.environ['CONTROL_MODE']
 if mode=='exits-before-ready': sys.exit(17)
@@ -690,9 +752,13 @@ class ShellControls(unittest.TestCase):
                 (out / "profile-pid.stderr").write_text("p11scope: capturing: stale\n")
                 (out / "profile-pid.json").write_text(json.dumps(inputs()[0]))
                 (out / "profile-pid.wl").write_text("READY pid=123\n" + inputs()[1][-1])
-            template=tmp / "report-template.json";template.write_text(json.dumps(inputs()[0]))
+            report = inputs(system=cell == "system")[0]
+            if mode == "unproven-drain":
+                report["evidence"]["drain_proven"] = False
+            template=tmp / "report-template.json";template.write_text(json.dumps(report))
             local = tmp / "local disk"; local.mkdir(mode=0o700)
-            env = dict(os.environ, CONTROL_MODE=mode, CONTROL_CELL=cell, MODULE=str(module), ITERS="7", CONTROL_REPORT=str(template),
+            env = dict(os.environ, CONTROL_MODE=mode, CONTROL_CELL=cell, MODULE=str(module),
+                       ITERS="500" if cell == "system" else "7", CONTROL_REPORT=str(template),
                        CONTROL_OUT=str(out))
             env.pop("P11SCOPE_LOCAL_OUTPUT_ROOT", None)
             if local_output: env["P11SCOPE_LOCAL_OUTPUT_ROOT"] = str(local)
@@ -710,8 +776,26 @@ class ShellControls(unittest.TestCase):
                     self.assertIsNone(sentinel.poll(), "runner cleanup killed an unrelated process")
                 if mode in ("never-ready", "exits-before-ready", "stale-output", "wrong-ready-pid"):
                     self.assertFalse((out / "released").exists())
-                if want == 0:
+                if cell == "system" and (out / "observer-argv.json").exists():
+                    argv = json.loads((out / "observer-argv.json").read_text())
+                    self.assertNotIn("--pid", argv)
+                    self.assertEqual(argv, ["profile", "--system", "--module", str(module),
+                                            "--duration", "25", "-o", str(out / "system.json")])
+                if want == 0 or mode in ("missing-ledger", "unproven-drain"):
                     self.assertTrue((out / "released").exists())
+                    self.assertIs(json.loads((out / "readiness-before-release.json").read_text()), True)
+                if want == 0:
+                    if cell == "system":
+                        ledger = [json.loads(line[7:]) for line in (out / "system.wl").read_text().splitlines()
+                                  if line.startswith("LEDGER ")]
+                        self.assertEqual(len(ledger), 1)
+                        self.assertIs(ledger[0]["complete"], True)
+                        self.assertEqual([(row["name"], row["attempts"], row["successful"])
+                                          for row in ledger[0]["functions"]], [(name, 500, 500) for name in NAMES])
+                        receipt = json.loads((out / "system.receipt.json").read_text())
+                        self.assertEqual((receipt["observer_exit"], receipt["workload_exit"]), (0, 0))
+                        self.assertTrue(receipt["workload_ready"] and receipt["capture_ready"] and receipt["gate_released"])
+                        self.assertIs(json.loads((out / "system.json").read_text())["evidence"]["drain_proven"], True)
                     if not local_output:
                         selected = Path(json.loads((out / "selected-output.json").read_text()))
                         self.assertEqual(selected, out / (cell + ".json"))
@@ -738,6 +822,24 @@ class ShellControls(unittest.TestCase):
 
     def test_ready_completed_ledger_control(self):
         self.control("healthy", 0)
+
+    def test_system_control_uses_strict_argv_and_500_call_ledgers(self):
+        self.control("healthy", 0, "system", unrelated=True)
+
+    def test_system_never_ready_fails_without_release(self):
+        self.control("never-ready", 1, "system")
+
+    def test_system_observer_exit_before_ready_fails_without_release(self):
+        self.control("exits-before-ready", 1, "system")
+
+    def test_system_missing_ledger_fails_with_owned_cleanup(self):
+        self.control("missing-ledger", 1, "system", unrelated=True)
+
+    def test_system_wrong_ready_pid_fails_without_release(self):
+        self.control("wrong-ready-pid", 1, "system")
+
+    def test_system_unproven_drain_fails_with_owned_cleanup(self):
+        self.control("unproven-drain", 1, "system")
 
     def test_guest_output_redirects_then_restores_verified_bytes(self):
         self.control("healthy", 0, local_output=True)

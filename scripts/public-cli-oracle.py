@@ -196,6 +196,8 @@ def fixture(text, receipt, cell):
         attempts, successes = row.get("attempts"), row.get("successful")
         require(integer(attempts) and integer(successes) and attempts > 0 and attempts == successes,
                 "workload had failed calls or no successful calls")
+        if cell == "system":
+            require(attempts == 500, "strict SYSTEM requires 500 successful calls per target: " + name)
         expected[name] = attempts
     require(set(expected) == names, "missing fixture ledger function")
     physical, seen = {}, set()

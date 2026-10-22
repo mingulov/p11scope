@@ -557,6 +557,70 @@ def validate_inventory(maps, variant, privacy='allowlisted'):
                 f'map definition mismatch name={item["name"]}')
 
 
+def continuity_map_category(maps, ordinary, *, variant, privacy):
+    """Finite setup facts from the selected observer's already retained maps.
+
+    Full inventory validation binds IMAGE/instance maps to this acquisition;
+    the real raw-cell decoder requires complete, unique array indices. Only
+    INSTANCE_GEN's exact coverage cell3 is authority, never an unrelated row.
+    `map-facts-present` says nothing about a particular call's stamp join.
+    """
+    try:
+        if (type(maps) is not list or type(ordinary) is not dict
+                or any(type(item) is not dict for item in maps)):
+            return 'unknown'
+        validate_inventory(maps, variant, privacy)
+        by_name = {item['name']: item for item in maps}
+        decoded = {name: dumper.normalize_map_dump(ordinary[name], by_name[name])
+                   for name in ('INSTANCE_GEN', 'SLOT_FILE', 'WATCHED_FILES')}
+        generations = {evidence.u32(evidence.bpftool_bytes(row['key'], 4), 0):
+                       evidence.u64(evidence.bpftool_bytes(row['value'], 8), 0)
+                       for row in decoded['INSTANCE_GEN']}
+        coverage = generations[3]
+        slots = [evidence.u32(evidence.bpftool_bytes(row['value'], 4), 0)
+                 for row in decoded['SLOT_FILE']]
+        watched = [evidence.u32(evidence.bpftool_bytes(row['value'], 4), 0)
+                   for row in decoded['WATCHED_FILES']]
+        file_bound = by_name['WATCHED_FILES']['max_entries']
+        if len(set(watched)) != len(watched):
+            return 'unknown'
+    except (AssertionError, KeyError, TypeError, ValueError, RuntimeError, struct.error):
+        # An optional diagnostic never renders decoder context or replaces
+        # the ring's original refusal when map facts are missing/ambiguous.
+        return 'unknown'
+    if coverage == 0:
+        return 'coverage-disabled'
+    if coverage == 2:
+        return 'coverage-failed'
+    if coverage != 1:
+        return 'unknown'
+    if any(value > file_bound for value in slots):
+        return 'slot-files-invalid'
+    if any(value >= file_bound for value in watched):
+        return 'watched-files-invalid'
+    assigned = set(slots) - {0}
+    if not assigned:
+        return 'slot-files-empty'
+    if not watched:
+        return 'watched-files-empty'
+    if not assigned <= {value + 1 for value in watched}:
+        return 'slot-files-invalid'
+    return 'map-facts-present'
+
+
+def retained_ring_records(source, positions, maps, ordinary, *, variant, privacy):
+    category = continuity_map_category(maps, ordinary, variant=variant, privacy=privacy)
+    try:
+        return source.ring_records(positions)
+    except evidence.RingRecordRefusal as error:
+        if type(error) is evidence.RingRecordRefusal:
+            name, refusal = getattr(error, 'ring_name', None), getattr(error, 'category', None)
+            if (type(name) is str and name == 'EVENTS'
+                    and type(refusal) is str and refusal == 'discard'):
+                error.continuity_category = category
+        raise
+
+
 class AcquisitionFiles:
     """Private files of this acquisition only; publication is no-replacement."""
     def __init__(self, config):
@@ -870,7 +934,8 @@ class Coordinator:
             self.files.write(self.files.stage / f'mapdump_{item["name"]}_{cfg.lane}.bin', raw)
             values[item['name']] = raw
         self.check('retained-rings', deadline)
-        rings = source.ring_records(positions)
+        rings = retained_ring_records(source, positions, maps, ordinary,
+                                      variant=cfg.variant, privacy=cfg.privacy)
         for name, rows in rings.items():
             # Frame each record with its 8-byte ring header (length plus
             # zero flags) so mixed 368/608-byte EVENTS forms split exactly

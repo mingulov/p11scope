@@ -1197,6 +1197,10 @@ RING_REFUSAL_CATEGORIES = frozenset((
     "capacity", "mapping", "positions", "overwritten", "busy", "discard",
     "length", "truncated", "stride",
 ))
+CONTINUITY_MAP_CATEGORIES = frozenset((
+    "unknown", "coverage-disabled", "coverage-failed", "slot-files-empty",
+    "slot-files-invalid", "watched-files-empty", "watched-files-invalid", "map-facts-present",
+))
 
 
 class RingRecordRefusal(AssertionError):
@@ -1215,7 +1219,13 @@ def ring_diagnostic(error):
     if (type(name) is not str or name not in RING_RECORD_SIZES
             or type(category) is not str or category not in RING_REFUSAL_CATEGORIES):
         return None
-    return f"ring={name} refusal={category}"
+    continuity = getattr(error, "continuity_category", None)
+    if continuity is None:
+        return f"ring={name} refusal={category}"
+    if (name != "EVENTS" or category != "discard" or type(continuity) is not str
+            or continuity not in CONTINUITY_MAP_CATEGORIES):
+        return None
+    return f"ring={name} refusal={category} continuity={continuity}"
 
 
 def parse_ring_records(data, capacity, consumer_pos, producer_pos,

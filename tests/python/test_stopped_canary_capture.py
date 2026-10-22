@@ -1123,7 +1123,7 @@ def owned_case(pid, directory, case, program, provider):
 class RetainedRingDiagnosticTests(unittest.TestCase):
     """Real ring framing and sanitizer seams, with only FD/mmap I/O injected."""
 
-    def read_ring(self, name, category):
+    def read_ring(self, name, category, continuity=None):
         capture.evidence.initialize(64)
         fixture = fixtures.RingLayoutTests('test_ring_layout_rejects_busy_and_wrap')
         item, mappings, libc, fake_mmap, fake_u64 = fixture.retained_fixture(
@@ -1144,7 +1144,12 @@ class RetainedRingDiagnosticTests(unittest.TestCase):
                 patch.object(capture.evidence, 'u64', side_effect=fake_u64):
             try:
                 with capture.evidence.RetainedRingReader(item) as reader:
-                    rows = reader.read_records()
+                    if continuity is None:
+                        rows = reader.read_records()
+                    else:
+                        source = SimpleNamespace(ring_records=lambda _: {name: reader.read_records()})
+                        rows = capture.retained_ring_records(source, {}, *continuity,
+                                                            variant='default', privacy='allowlisted')[name]
             except AssertionError as error:
                 failure = error
         self.assertTrue(all(mapping.closed for mapping in mappings))
@@ -1215,6 +1220,104 @@ class RetainedRingDiagnosticTests(unittest.TestCase):
         with contextlib.redirect_stderr(diagnostic):
             self.assertEqual(capture.sanitized('retained-rings', trusted), [
                 'retained-rings: ring=EVENTS refusal=discard'])
+
+    def test_events_discard_keeps_only_a_finite_continuity_category(self):
+        _, error = self.read_ring('EVENTS', 'discard')
+        error.continuity_category = 'coverage-failed'
+        self.assertEqual(self.sanitized_ring(error), [
+            'retained-rings: ring=EVENTS refusal=discard continuity=coverage-failed'])
+
+    @staticmethod
+    def continuity_fixture():
+        maps = []
+        for map_id, (name, wanted) in enumerate(sorted(capture.definitions.SAFE_MAPS.items()), 1000):
+            maps.append({'id': map_id, 'name': name, 'type': capture.MAP_TYPES[wanted['type']],
+                'bytes_key': wanted['key_size'], 'bytes_value': wanted['value_size'],
+                'max_entries': wanted['max_entries'],
+                'map_flags': capture.LIVE_IMAGE_MAP_FLAGS.get(name, wanted['flags']),
+                'oracle': capture.dumper.SNAPSHOT_MAP_ORACLES[capture.MAP_TYPES[wanted['type']]]})
+        token = lambda raw: [f'0x{byte:02x}' for byte in raw]
+        cell = lambda index, value, width: {'key': token(struct.pack('<I', index)),
+                                           'value': token(value.to_bytes(width, 'little'))}
+        bound = next(row['max_entries'] for row in maps if row['name'] == 'SLOT_FILE')
+        ordinary = {'INSTANCE_GEN': [cell(index, value, 8) for index, value in
+                                    enumerate((2, 0, 0, 1))],
+                    'SLOT_FILE': [cell(index, int(index == 7), 4) for index in range(bound)],
+                    'WATCHED_FILES': [{'key': token(bytes([0xd7]) * 16),
+                                       'value': token(bytes(4))}]}
+        return maps, ordinary
+
+    def test_continuity_diagnostic_uses_complete_owned_map_decoder_facts(self):
+        for case, expected in (
+                ('healthy', 'map-facts-present'), ('disabled', 'coverage-disabled'),
+                ('failed', 'coverage-failed'), ('invalid-coverage', 'unknown'),
+                ('missing-coverage', 'unknown'), ('duplicate-coverage', 'unknown'),
+                ('truncated-coverage', 'unknown'), ('foreign-coverage', 'unknown'),
+                ('missing-image', 'unknown'), ('empty-slots', 'slot-files-empty'),
+                ('invalid-slot', 'slot-files-invalid'), ('truncated-slots', 'unknown'),
+                ('empty-watched', 'watched-files-empty'), ('missing-watched', 'unknown'),
+                ('invalid-watched', 'watched-files-invalid'),
+                ('unwatched-slot', 'slot-files-invalid'), ('duplicate-file-slot', 'unknown')):
+            maps, ordinary = self.continuity_fixture()
+            if case in ('disabled', 'failed', 'invalid-coverage'):
+                ordinary['INSTANCE_GEN'][3]['value'] = list(struct.pack('<Q', {
+                    'disabled': 0, 'failed': 2, 'invalid-coverage': 3}[case]))
+            elif case == 'missing-coverage':
+                ordinary['INSTANCE_GEN'].pop()
+            elif case == 'duplicate-coverage':
+                ordinary['INSTANCE_GEN'][2] = ordinary['INSTANCE_GEN'][3]
+            elif case == 'truncated-coverage':
+                ordinary['INSTANCE_GEN'][3]['value'].pop()
+            elif case == 'foreign-coverage':
+                next(row for row in maps if row['name'] == 'INSTANCE_GEN')['id'] = maps[0]['id']
+            elif case == 'missing-image':
+                maps = [row for row in maps if row['name'] != 'IMAGE_CONTINUITY']
+            elif case == 'empty-slots':
+                ordinary['SLOT_FILE'][7]['value'] = [0] * 4
+            elif case == 'invalid-slot':
+                ordinary['SLOT_FILE'][7]['value'] = list(struct.pack('<I', 1025))
+            elif case == 'truncated-slots':
+                ordinary['SLOT_FILE'].pop()
+            elif case == 'empty-watched':
+                ordinary['WATCHED_FILES'] = []
+            elif case == 'missing-watched':
+                del ordinary['WATCHED_FILES']
+            elif case == 'invalid-watched':
+                ordinary['WATCHED_FILES'][0]['value'] = list(struct.pack('<I', 1024))
+            elif case == 'unwatched-slot':
+                ordinary['SLOT_FILE'][7]['value'] = [2, 0, 0, 0]
+            elif case == 'duplicate-file-slot':
+                ordinary['WATCHED_FILES'].append({'key': [0] * 16, 'value': [0] * 4})
+            with self.subTest(case=case):
+                self.assertEqual(capture.continuity_map_category(
+                    maps, ordinary, variant='default', privacy='allowlisted'), expected)
+                rows, error = self.read_ring('EVENTS', 'discard', (maps, ordinary))
+                self.assertIsNone(rows)
+                self.assertEqual(self.sanitized_ring(error), [
+                    f'retained-rings: ring=EVENTS refusal=discard continuity={expected}'])
+
+    def test_continuity_context_cannot_override_ring_scope_or_spoof_fields(self):
+        maps, ordinary = self.continuity_fixture()
+        for name, category in (('EVENTS', 'healthy'), ('DISCOVERY', 'healthy'),
+                               ('DISCOVERY', 'discard'), ('EVENTS', 'busy'), ('EVENTS', 'length')):
+            rows, error = self.read_ring(name, category, (maps, ordinary))
+            if category == 'healthy':
+                self.assertIsNone(error)
+                self.assertEqual(len(rows), 1)
+            else:
+                self.assertEqual(self.sanitized_ring(error), [
+                    f'retained-rings: ring={name} refusal={category}'])
+        class PrivateString(str):
+            def __str__(self):
+                raise AssertionError('PRIVATE_CANARY_RING_STR')
+        for field in ('PRIVATE_CANARY_RING_CONTEXT', [], True, PrivateString('coverage-failed')):
+            _, error = self.read_ring('EVENTS', 'discard')
+            error.continuity_category = field
+            self.assertEqual(self.sanitized_ring(error), ['retained-rings: RingRecordRefusal'])
+        for name, category in (('DISCOVERY', 'discard'), ('EVENTS', 'busy')):
+            _, error = self.read_ring(name, category)
+            error.continuity_category = 'coverage-failed'
+            self.assertEqual(self.sanitized_ring(error), ['retained-rings: RingRecordRefusal'])
 
 
 class StoppedCanaryCaptureTests(unittest.TestCase):

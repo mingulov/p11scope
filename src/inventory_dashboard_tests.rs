@@ -4394,6 +4394,10 @@ fn f7_render_fixture(edges: usize, children: usize) -> Presentation {
     }
     presentation.budgets.instances_occupied = children;
     presentation.budgets.instance_semantic_unknown_edges = children;
+    presentation.render_index = crate::inventory_present::PresentationRenderIndex::build(
+        &presentation.instances,
+        &presentation.semantic_edges,
+    );
     presentation
 }
 
@@ -4469,4 +4473,229 @@ fn f7_dashboard_allocation_baseline() {
             );
         }
     }
+}
+
+#[test]
+fn f7_renderers_indexed_and_linear_bytes_match() {
+    // Catch dropped/reordered facts or changed frame bytes when the optional
+    // cache is present versus refused/defaulted. Include the real 4097 cap twin.
+    use crate::discovery::caller_registry::instance_input::InstanceLifecycle;
+    use crate::inventory_present::{GapView, PresentationRenderIndex, render_snapshot};
+
+    for children in [0, 1, 8, 9, 4096, 4097] {
+        let mut presentation = f7_render_fixture(2, children);
+        presentation.callers[0].exe = None;
+        presentation.callers[1].exe.as_mut().unwrap().path =
+            Some("/usr/bin/日本語\u{1b}[2J (deleted)".into());
+        presentation.modules[0].paths.clear();
+        presentation.modules[1].paths = vec!["/lib/日本語\tprovider.so".into()];
+        if let Some(instance) = presentation.instances.first_mut() {
+            instance.state = InstanceLifecycle::Retired;
+            instance.reason = Some("instance_retired");
+        }
+        if let Some(child) = presentation.semantic_edges.get_mut(1) {
+            child.api_returns = None;
+            child.semantics.label = "unknown (no calls observed)";
+            child.lossy = true;
+            child.reasons = vec!["semantic_loss"];
+        }
+        if children > 1 {
+            presentation.semantic_edges.rotate_left(1);
+        }
+        presentation.gaps = vec![GapView {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: "f7\tgap".into(),
+            reason: "line\nwith missing coverage".into(),
+            budget: Some(BudgetRefusal {
+                resource: "edges",
+                limit: 2,
+                requested: 3,
+            }),
+            repeats: 1,
+        }];
+        presentation.render_index =
+            PresentationRenderIndex::build(&presentation.instances, &presentation.semantic_edges);
+        if (1..=4096).contains(&children) {
+            assert!(presentation.render_index.heap_bytes() > 0);
+        } else {
+            assert_eq!(presentation.render_index.heap_bytes(), 0);
+        }
+        let mut linear = presentation.clone();
+        linear.render_index = Default::default();
+        let snapshot = render_snapshot(&presentation);
+        assert_eq!(snapshot, render_snapshot(&linear));
+        assert_eq!(snapshot.matches("  instance ").count(), children);
+        assert!(snapshot.contains("Unknown executable"));
+        assert!(snapshot.contains("Unknown module"));
+        assert!(snapshot.contains("budget edges: limit 2, requested 3"));
+        let indexed = frame_for(&presentation);
+        let fallback = frame_for(&linear);
+        for viewport in [
+            Viewport {
+                width: 80,
+                height: 14,
+            },
+            Viewport {
+                width: 80,
+                height: 24,
+            },
+            Viewport {
+                width: 40,
+                height: 10,
+            },
+            Viewport {
+                width: 200,
+                height: 120,
+            },
+        ] {
+            for page in [DetailPage::Summary, DetailPage::Evidence, DetailPage::Gaps] {
+                for scroll in [0, 1, usize::MAX] {
+                    let mut state = DashboardState::new();
+                    state.detail = page;
+                    state.scroll = scroll;
+                    let bytes = render_frame(&indexed, viewport, &state);
+                    assert_eq!(
+                        bytes,
+                        render_frame(&fallback, viewport, &state),
+                        "children={children}, viewport={}x{}, page={}, scroll={scroll}",
+                        viewport.width,
+                        viewport.height,
+                        page.label(),
+                    );
+                    assert_own_escapes_only(&bytes);
+                    assert_eq!(frame_text(&bytes).lines().count(), viewport.height);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn f7_hot_edge_redraw_allocation_is_independent_of_hidden_children() {
+    // Catch a child-count-sized reference Vec at each block-fit attempt.
+    // Account index construction separately so added build work stays visible.
+    use crate::inventory_present::PresentationRenderIndex;
+    let mut measured = Vec::new();
+    for children in [64, 4096] {
+        let mut presentation = f7_render_fixture(1, children);
+        presentation.render_index = Default::default();
+        let (index, build_allocations, build_bytes) =
+            crate::test_alloc::count_allocs_during(|| {
+                PresentationRenderIndex::build(
+                    &presentation.instances,
+                    &presentation.semantic_edges,
+                )
+            });
+        assert!(index.heap_bytes() > 0);
+        presentation.render_index = index;
+        let frame = frame_for(&presentation);
+        let mut viewports = Vec::new();
+        for height in [14, 24] {
+            let viewport = Viewport { width: 80, height };
+            let state = DashboardState::new();
+            let (bytes, peak, allocations, requested) =
+                crate::test_alloc::counted_peak_during(|| render_frame(&frame, viewport, &state));
+            assert!(!peak.incomplete);
+            assert_eq!(peak.failed_requests, 0);
+            let text = frame_text(&bytes);
+            let shown_children = text.matches("instance i").count();
+            let hidden = children - shown_children;
+            assert!(hidden > 0);
+            assert!(
+                text.contains(&format!("instances +{hidden} hidden")),
+                "{text}"
+            );
+            assert!(
+                text.lines()
+                    .last()
+                    .unwrap()
+                    .contains("showing edges 1-1 of 1")
+            );
+            eprintln!(
+                "F7 hot-edge cost: children={children} viewport=80x{height} index_allocations={build_allocations} index_requested={build_bytes} render_allocations={allocations} render_requested={requested} combined_allocations={} combined_requested={} peak_bytes={} output_bytes={}",
+                build_allocations + allocations,
+                build_bytes + requested,
+                peak.peak_bytes,
+                bytes.len(),
+            );
+            viewports.push((allocations, requested, peak.peak_bytes));
+        }
+        measured.push(viewports);
+    }
+    for (small, large) in measured[0].iter().zip(&measured[1]) {
+        assert!(
+            large.1 <= small.1 + 4096,
+            "hidden-child requested bytes grew: {small:?} -> {large:?}"
+        );
+        assert!(
+            large.0 <= small.0 + 8,
+            "hidden-child allocation count grew: {small:?} -> {large:?}"
+        );
+        assert!(
+            large.2 <= small.2 + 2048,
+            "hidden-child peak grew: {small:?} -> {large:?}"
+        );
+    }
+}
+
+#[test]
+fn f7_large_counts_and_unknowns_survive_indexed_rendering() {
+    // Catch narrowing/float conversions or rendering an unknown as zero.
+    use crate::inventory_present::{PresentationRenderIndex, render_snapshot};
+    let mut presentation = f7_render_fixture(1, 2);
+    presentation.edges[0].entry_count = u64::MAX - 1;
+    presentation.edges[0].semantics = observed_presentation().edges[0].semantics.clone();
+    let operations = presentation.edges[0].semantics.operations.as_mut().unwrap();
+    operations.calls = u64::MAX - 1;
+    operations.started = 9_007_199_254_740_993;
+    operations.completed = 9_007_199_254_740_993;
+    presentation.semantic_edges[0].api_returns = Some(u64::MAX - 1);
+    presentation.semantic_edges[0].saturated = true;
+    presentation.semantic_edges[0].semantics = presentation.edges[0].semantics.clone();
+    presentation.semantic_edges[1].api_returns = None;
+    presentation.semantic_edges[1].semantics.label = "unknown (no calls observed)";
+    presentation.render_index =
+        PresentationRenderIndex::build(&presentation.instances, &presentation.semantic_edges);
+    let document = crate::inventory::render_json_from_presentation(&presentation);
+    let json: serde_json::Value = serde_json::from_str(&document.to_string()).unwrap();
+    assert_eq!(
+        json["edges"][0]["entries"]["count"].as_u64(),
+        Some(u64::MAX - 1)
+    );
+    assert_eq!(json["semantic_edges"][0]["entries"]["unit"], "api_entries");
+    assert_eq!(
+        json["semantic_edges"][0]["api_returns"]["count"].as_u64(),
+        Some(u64::MAX - 1)
+    );
+    assert_eq!(
+        json["semantic_edges"][0]["api_returns"]["unit"],
+        "api_returns"
+    );
+    assert_eq!(
+        json["semantic_edges"][0]["operations"]["completed"].as_u64(),
+        Some(9_007_199_254_740_993)
+    );
+    assert!(json["semantic_edges"][1]["api_returns"]["count"].is_null());
+    let snapshot = render_snapshot(&presentation);
+    assert!(snapshot.contains("9007199254740993"));
+    assert!(snapshot.contains("18446744073709551614"));
+    assert!(snapshot.contains("api_returns=unknown"));
+    let viewport = Viewport {
+        width: 200,
+        height: 120,
+    };
+    let frame = render_frame(&frame_for(&presentation), viewport, &DashboardState::new());
+    let text = frame_text(&frame);
+    assert!(text.contains("9007199254740993"), "{text}");
+    assert!(text.contains("18446744073709551614"), "{text}");
+    assert!(text.contains("api_returns=unknown"), "{text}");
+    let mut linear = presentation;
+    linear.render_index = Default::default();
+    assert_eq!(snapshot, render_snapshot(&linear));
+    assert_eq!(
+        frame,
+        render_frame(&frame_for(&linear), viewport, &DashboardState::new())
+    );
 }

@@ -1870,6 +1870,8 @@ fn f7_snapshot_baseline_preserves_interleaved_children() {
         occupancy: S1Occupancy::default(),
     };
 
+    presentation.render_index =
+        PresentationRenderIndex::build(&presentation.instances, &presentation.semantic_edges);
     let snapshot = render_snapshot(&presentation);
     assert_eq!(
         snapshot,
@@ -1948,6 +1950,8 @@ fn f7_snapshot_high_cardinality_allocation_baseline() {
     assert_eq!(presentation.edges.len(), 4096);
     assert_eq!(presentation.instances.len(), 4096);
     assert_eq!(presentation.semantic_edges.len(), 4096);
+    presentation.render_index =
+        PresentationRenderIndex::build(&presentation.instances, &presentation.semantic_edges);
     let (snapshot, allocations, bytes) =
         crate::test_alloc::count_allocs_during(|| render_snapshot(&presentation));
     assert_eq!(

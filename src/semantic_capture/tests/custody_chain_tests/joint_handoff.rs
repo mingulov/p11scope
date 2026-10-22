@@ -27,7 +27,7 @@ struct JointScene {
 pub(super) fn claim_refusal_and_staging_regression() {
     let mut fixture = JointScene::new(1);
     let pid = std::process::id();
-    fixture.real.bind(pid, image(7), 0);
+    fixture.bind(pid, image(7), &[0]);
     fixture.push(pid, 0, "C_SignInit", 1);
     fixture.push(pid, 0, "C_SignInit", 2);
     let raw = fixture.prepare(2);
@@ -82,6 +82,59 @@ impl JointScene {
             producers,
             drain: EventDrain::over_domain(ScriptedRecords::records([], 64), events),
         }
+    }
+
+    fn bind(&mut self, pid: u32, image: ImageIdentity, files: &[u32]) -> CallerId {
+        let caller = self.real.bind(pid, image, files[0] as usize);
+        for file in files {
+            let candidate = self
+                .real
+                .scene
+                .coordinator
+                .prepare_legacy_semantic_candidate(caller, self.real.lane.domain())
+                .expect("the actual caller retains its original custody");
+            assert!(Arc::ptr_eq(
+                &candidate.pin(),
+                &self.real.h0.0.borrow().io.targets[&pid].0,
+            ));
+            let slot = self.real.h0.0.borrow().io.slot(*file, "C_SignInit");
+            let prepared = self
+                .real
+                .lane
+                .prepare_caller_admission(
+                    candidate.pin(),
+                    slot,
+                    &self.real.modules[*file as usize].0,
+                    |bytes| {
+                        self.real
+                            .scene
+                            .coordinator
+                            .registry()
+                            .reserve_semantic_storage(bytes)
+                    },
+                )
+                .expect("actual H0 receipt and retained provider validate");
+            let (receipt, result) = self
+                .real
+                .scene
+                .coordinator
+                .consume_semantic_admission(candidate, prepared, None);
+            self.real.lane.deliver_admission_receipt(receipt);
+            result.expect("the real provider admission consumer accepts this exact file");
+            let endpoint = self.real.h0.0.borrow().io.endpoint(slot).unwrap();
+            assert!(
+                self.real
+                    .scene
+                    .coordinator
+                    .semantic_bindings()
+                    .get(caller)
+                    .unwrap()
+                    .provider_for_endpoint(endpoint)
+                    .is_some(),
+                "the positive uses actual provider authority, not the legacy reference fallback"
+            );
+        }
+        caller
     }
 
     fn push(&mut self, pid: u32, file: u32, name: &str, sequence: u64) {
@@ -223,7 +276,7 @@ impl JointScene {
 fn joint_prepared_all_originals_claim_after_actual_ingest_once() {
     let mut fixture = JointScene::new(1);
     let pid = std::process::id();
-    fixture.real.bind(pid, image(7), 0);
+    fixture.bind(pid, image(7), &[0]);
     for (sequence, function) in ["C_SignInit", "C_SignUpdate", "C_SignUpdate", "C_SignFinal"]
         .into_iter()
         .enumerate()
@@ -322,7 +375,7 @@ fn joint_prepared_all_originals_claim_after_actual_ingest_once() {
 fn joint_prepared_foreign_or_old_raw_proof_never_advances_claim_cursor() {
     let mut fixture = JointScene::new(1);
     let pid = std::process::id();
-    fixture.real.bind(pid, image(7), 0);
+    fixture.bind(pid, image(7), &[0]);
     fixture.push(pid, 0, "C_SignInit", 1);
     let raw = fixture.prepare(1);
     let (first, proof) = fixture.ingest(raw);
@@ -446,8 +499,8 @@ fn joint_prepared_claims_every_adjacent_provider_and_caller_original() {
     let child = OwnedStoppedChild::new();
     let pid = std::process::id();
     let mut fixture = JointScene::new(2);
-    fixture.real.bind(pid, image(7), 0);
-    fixture.real.bind(child.id(), image(8), 1);
+    fixture.bind(pid, image(7), &[0, 1]);
+    fixture.bind(child.id(), image(8), &[1]);
     fixture.push(pid, 0, "C_SignInit", 1);
     fixture.push(pid, 1, "C_SignInit", 2);
     fixture.push(child.id(), 1, "C_SignInit", 1);

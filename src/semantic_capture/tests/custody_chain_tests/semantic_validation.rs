@@ -349,6 +349,52 @@ struct HeldH0 {
 struct SharedH0(Rc<RefCell<HeldH0>>);
 
 impl LaneTestIo for SharedH0 {
+    fn validate_attachment(&mut self, subset: &AttestedSubset) -> Result<(), SemanticRefusal> {
+        let owned = self.0.borrow();
+        for (object, slots) in subset.required() {
+            for slot in slots {
+                let expected = subset
+                    .plan()
+                    .slots
+                    .iter()
+                    .find(|candidate| candidate.index == *slot)
+                    .ok_or(SemanticRefusal::Attachment)?;
+                let endpoint = owned
+                    .io
+                    .endpoint(*slot)
+                    .ok_or(SemanticRefusal::Attachment)?;
+                let target = owned
+                    .io
+                    .retained_attachment(*slot)
+                    .map_err(|_| SemanticRefusal::Attachment)?;
+                if endpoint.object != *object
+                    || endpoint.offset != expected.file_offset
+                    || !target.same_object_as(subset.pins(), *object)
+                    || target.check_unchanged() != Ok(true)
+                {
+                    return Err(SemanticRefusal::Attachment);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn take_refresh_receipt(
+        &mut self,
+        pin: &Arc<PidPin>,
+        slot: u32,
+    ) -> Option<CurrentPartitionReceipt> {
+        self.0.borrow_mut().stash.take_for_admission(pin, slot)
+    }
+
+    fn stash_admission_evidence(
+        &mut self,
+        receipts: Vec<CurrentPartitionReceipt>,
+        outcomes: Vec<TickOutcome>,
+    ) {
+        assert_eq!(self.0.borrow_mut().stash.push_all(receipts, outcomes), 0);
+    }
+
     fn validate_current(
         &mut self,
         receipt: &CurrentPartitionReceipt,

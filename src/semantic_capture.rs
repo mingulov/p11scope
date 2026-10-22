@@ -110,6 +110,7 @@ impl CurrentPartitionReceipt {
     pub(crate) fn watched(&self) -> &RetainedInventoryTarget {
         &self.watched
     }
+    #[allow(clippy::result_large_err)] // Refusal returns the original receipt without allocating or discarding its custody.
     pub(crate) fn into_birth_candidate(mut self) -> Result<H0BirthCandidate, Self> {
         let Some((capture, cut, quantum)) = self.birth.take() else {
             return Err(self);
@@ -4067,13 +4068,13 @@ mod tests {
             1,
             "successive seals never observe again"
         );
-        let mut foreign = capture(&harness.io);
+        let foreign = capture(&harness.io);
         assert!(
             witness
                 .fresh_evidence_with(
                     &mut harness.io,
                     &mut rows,
-                    &mut foreign,
+                    &foreign,
                     harness.fixture.attachment(),
                     harness.fixture.binding()
                 )
@@ -4091,7 +4092,7 @@ mod tests {
                 .fresh_evidence_with(
                     &mut harness.io,
                     &mut rows,
-                    &mut harness.capture,
+                    &harness.capture,
                     harness.fixture.attachment(),
                     harness.fixture.binding()
                 )
@@ -4364,7 +4365,7 @@ mod tests {
                 .fresh_evidence_with(
                     &mut harness.io,
                     &mut rows,
-                    &mut harness.capture,
+                    &harness.capture,
                     harness.fixture.attachment(),
                     harness.fixture.binding()
                 )
@@ -4379,7 +4380,7 @@ mod tests {
                 .fresh_evidence_with(
                     &mut harness.io,
                     &mut rows,
-                    &mut harness.capture,
+                    &harness.capture,
                     harness.fixture.attachment(),
                     harness.fixture.binding()
                 )
@@ -4394,7 +4395,7 @@ mod tests {
                 .fresh_evidence_with(
                     &mut harness.io,
                     &mut rows,
-                    &mut harness.capture,
+                    &harness.capture,
                     harness.fixture.attachment(),
                     harness.fixture.binding()
                 )
@@ -4410,7 +4411,7 @@ mod tests {
             witness.fresh_evidence_with(
                 &mut harness.io,
                 &mut wrong_rows,
-                &mut harness.capture,
+                &harness.capture,
                 harness.fixture.attachment(),
                 harness.fixture.binding()
             ),
@@ -4437,7 +4438,7 @@ mod tests {
                 .fresh_evidence_with(
                     &mut harness.io,
                     &mut SlowRows(&mut rows),
-                    &mut harness.capture,
+                    &harness.capture,
                     harness.fixture.attachment(),
                     harness.fixture.binding()
                 )
@@ -4449,7 +4450,7 @@ mod tests {
                 .fresh_evidence_with(
                     &mut harness.io,
                     &mut rows,
-                    &mut harness.capture,
+                    &harness.capture,
                     harness.fixture.attachment(),
                     harness.fixture.binding()
                 )
@@ -4469,7 +4470,7 @@ mod tests {
                 .fresh_evidence_with(
                     &mut harness.io,
                     &mut rows,
-                    &mut harness.capture,
+                    &harness.capture,
                     harness.fixture.attachment(),
                     harness.fixture.binding()
                 )
@@ -4645,7 +4646,7 @@ mod tests {
                 .fresh_evidence_with(
                     &mut harness.io,
                     &mut rows,
-                    &mut harness.capture,
+                    &harness.capture,
                     harness.fixture.attachment(),
                     harness.fixture.binding()
                 )

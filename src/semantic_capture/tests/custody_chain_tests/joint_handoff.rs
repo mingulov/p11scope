@@ -16,6 +16,9 @@ use crate::semantics_objects::journal::{
 };
 use p11scope_ebpf_common::object_wire::{OBJECT_ACTION_ACCESS, publish_object_descriptors};
 
+#[path = "joint_audit_handoff.rs"]
+mod audit_handoff;
+
 struct JointScene {
     real: RealScene,
     producers: SessionDrainProducers,
@@ -197,6 +200,14 @@ impl JointScene {
     }
 
     fn prepare(&mut self, count: usize) -> RawJointQuantum {
+        self.prepare_with_fault(count, &BirthFault)
+    }
+
+    fn prepare_with_fault(
+        &mut self,
+        count: usize,
+        fault: &impl crate::semantics_objects::journal::FaultEpoch,
+    ) -> RawJointQuantum {
         let reserve = self
             .real
             .scene
@@ -208,7 +219,7 @@ impl JointScene {
             &publish_object_descriptors(),
             64,
             None,
-            &BirthFault,
+            fault,
             &self.producers,
             |bytes| reserve.reserve(bytes),
             self.real

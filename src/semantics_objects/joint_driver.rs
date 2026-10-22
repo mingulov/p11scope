@@ -2176,6 +2176,8 @@ mod tests {
                     adapter.ingest_any_from_raw(terminal.ordered[0], None, false),
                     super::super::JournalDisposition::AbandonStaged
                 );
+                assert_eq!(adapter.open[&(1, 1)].begin.bytes(), original.bytes());
+                assert_eq!(adapter.ledger.roles_for_test(), before);
             } else {
                 assert!(terminal.invocations.is_empty());
                 assert!(terminal.ordinary[0].joint_resource.is_none());
@@ -2185,9 +2187,12 @@ mod tests {
                         super::super::JournalContradiction::CallAndEnd
                     )
                 );
+                assert!(
+                    adapter.open.is_empty(),
+                    "the existing contradiction taints/removes its invalid START"
+                );
+                assert_eq!(adapter.ledger.roles_for_test()[..4], [0, 0, 0, 0]);
             }
-            assert_eq!(adapter.open[&(1, 1)].begin.bytes(), original.bytes());
-            assert_eq!(adapter.ledger.roles_for_test(), before);
         }
     }
 

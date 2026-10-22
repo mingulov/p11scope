@@ -869,6 +869,24 @@ impl JournalAdapter {
         self.consumed_through
     }
 
+    /// Read the canonical invocation store and its independent census.
+    /// This inspection neither claims nor consumes an original admission.
+    #[cfg(test)]
+    pub(crate) fn invocation_claims_for_test(&self) -> (usize, Vec<(u64, JournalDomainProof)>) {
+        let mut originals = Vec::new();
+        for claimants in self.claims.values() {
+            for (key, claims) in claimants {
+                let proof = JournalDomainProof {
+                    key: *key,
+                    era: self.keys[key].era,
+                };
+                originals.extend(claims.iter().map(|claim| (claim.admission, proof)));
+            }
+        }
+        originals.sort_unstable_by_key(|(admission, _)| *admission);
+        (self.claim_counts, originals)
+    }
+
     pub(crate) fn consumed_frontier(&self) -> ConsumptionOrdinal {
         ConsumptionOrdinal(self.consumed_through)
     }

@@ -31,6 +31,7 @@ pub(super) fn claim_refusal_and_staging_regression() {
     fixture.push(pid, 0, "C_SignInit", 1);
     fixture.push(pid, 0, "C_SignInit", 2);
     let raw = fixture.prepare(2);
+    fixture.assert_claims(&[]);
     let (ingested, _) = fixture.ingest(raw);
     let (adapter, model) = fixture.real.scene.coordinator.joint_capture_mut().parts();
     let _ = adapter.stop(model);
@@ -41,6 +42,13 @@ pub(super) fn claim_refusal_and_staging_regression() {
                 .claim_next_prepared_admission(&fixture.producers, &ingested)
                 .unwrap(),
             Some((ordinal, Err(AttestationRefusal::Stopped)))
+        );
+        assert_eq!(
+            coordinator
+                .joint_capture()
+                .adapter()
+                .invocation_claims_for_test(),
+            (0, vec![])
         );
         if ordinal == 1 {
             assert!(
@@ -55,6 +63,13 @@ pub(super) fn claim_refusal_and_staging_regression() {
                 .claim_next_prepared_admission(&fixture.producers, &ingested)
                 .unwrap()
                 .is_none()
+        );
+        assert_eq!(
+            coordinator
+                .joint_capture()
+                .adapter()
+                .invocation_claims_for_test(),
+            (0, vec![])
         );
     }
     assert!(!coordinator.finish_prepared_semantic_batch(&fixture.real.lane));
@@ -232,6 +247,7 @@ impl JointScene {
 
     fn ingest(&mut self, raw: RawJointQuantum) -> (IngestedRaw, JournalDomainProof) {
         let (prepared, owner) = self.real.scene.coordinator.prepared_joint_parts().unwrap();
+        let before = owner.adapter().invocation_claims_for_test();
         let input = prepared.next_admission().unwrap();
         let proof = owner.adapter_mut().bind_admitted_key(input).unwrap();
         let grant = SessionDrainGrant::observe(&self.producers, input).unwrap();
@@ -239,7 +255,28 @@ impl JointScene {
         let ingested = raw
             .ingest(owner.adapter_mut(), &self.producers, &grant)
             .unwrap_or_else(|(_, reason)| panic!("original ingestion: {reason:?}"));
+        assert_eq!(
+            owner.adapter().invocation_claims_for_test(),
+            before,
+            "initial key binding and original raw ingestion grant no invocation claims"
+        );
         (ingested, proof)
+    }
+
+    fn assert_claims(&self, expected: &[(u64, JournalDomainProof)]) {
+        let (count, originals) = self
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .invocation_claims_for_test();
+        assert_eq!(count, expected.len(), "canonical adapter claim census");
+        assert_eq!(
+            originals.as_slice(),
+            expected,
+            "actual stored original ordinals and keys"
+        );
     }
 
     fn finish(&mut self, count: usize, maximum: u64) {
@@ -284,6 +321,7 @@ fn joint_prepared_all_originals_claim_after_actual_ingest_once() {
         fixture.push(pid, 0, function, sequence as u64 + 1);
     }
     let raw = fixture.prepare(4);
+    fixture.assert_claims(&[]);
     let originals: Vec<_> = fixture
         .real
         .scene
@@ -325,6 +363,7 @@ fn joint_prepared_all_originals_claim_after_actual_ingest_once() {
         }
     ));
     let (ingested, proof) = fixture.ingest(raw);
+    fixture.assert_claims(&[]);
     for ordinal in 1..=4 {
         let (actual, claim) = fixture
             .real
@@ -335,6 +374,11 @@ fn joint_prepared_all_originals_claim_after_actual_ingest_once() {
             .expect("one original claim");
         assert_eq!(actual, ordinal);
         assert_eq!(claim, Ok(proof));
+        fixture.assert_claims(
+            &(1..=ordinal)
+                .map(|original| (original, proof))
+                .collect::<Vec<_>>(),
+        );
         assert!(
             !fixture
                 .real
@@ -363,6 +407,11 @@ fn joint_prepared_all_originals_claim_after_actual_ingest_once() {
                 .unwrap()
                 .is_none()
         );
+        fixture.assert_claims(
+            &(1..=4)
+                .map(|original| (original, proof))
+                .collect::<Vec<_>>(),
+        );
     }
     fixture.finish(4, 4);
     assert_eq!(
@@ -378,19 +427,24 @@ fn joint_prepared_foreign_or_old_raw_proof_never_advances_claim_cursor() {
     fixture.bind(pid, image(7), &[0]);
     fixture.push(pid, 0, "C_SignInit", 1);
     let raw = fixture.prepare(1);
+    fixture.assert_claims(&[]);
     let (first, proof) = fixture.ingest(raw);
+    fixture.assert_claims(&[]);
     let foreign = SessionDrainProducers::test_pair(
         fixture.producers.native_domain(),
         EventsDomain::test_standin(fixture.producers.events_id()),
     );
-    assert_eq!(
-        fixture
-            .real
-            .scene
-            .coordinator
-            .claim_next_prepared_admission(&foreign, &first),
-        Err(RawQuantumRefusal::ForeignCapture)
-    );
+    for _ in 0..2 {
+        assert_eq!(
+            fixture
+                .real
+                .scene
+                .coordinator
+                .claim_next_prepared_admission(&foreign, &first),
+            Err(RawQuantumRefusal::ForeignCapture)
+        );
+        fixture.assert_claims(&[]);
+    }
     assert_eq!(
         fixture
             .real
@@ -419,6 +473,7 @@ fn joint_prepared_foreign_or_old_raw_proof_never_advances_claim_cursor() {
             .unwrap(),
         Some((1, Ok(proof)))
     );
+    fixture.assert_claims(&[(1, proof)]);
     fixture.finish(1, 1);
 
     fixture.push(pid, 0, "C_SignUpdate", 2);
@@ -432,23 +487,29 @@ fn joint_prepared_foreign_or_old_raw_proof_never_advances_claim_cursor() {
         ),
         Ok(())
     );
-    assert_eq!(
-        fixture
-            .real
-            .scene
-            .coordinator
-            .claim_next_prepared_admission(&fixture.producers, &first),
-        Err(RawQuantumRefusal::Admission)
-    );
+    for _ in 0..2 {
+        assert_eq!(
+            fixture
+                .real
+                .scene
+                .coordinator
+                .claim_next_prepared_admission(&fixture.producers, &first),
+            Err(RawQuantumRefusal::Admission)
+        );
+        fixture.assert_claims(&[(1, proof)]);
+    }
     let (next, next_proof) = fixture.ingest(next_raw);
-    assert_eq!(
-        fixture
-            .real
-            .scene
-            .coordinator
-            .claim_next_prepared_admission(&fixture.producers, &first),
-        Err(RawQuantumRefusal::StaleFrontier)
-    );
+    for _ in 0..2 {
+        assert_eq!(
+            fixture
+                .real
+                .scene
+                .coordinator
+                .claim_next_prepared_admission(&fixture.producers, &first),
+            Err(RawQuantumRefusal::StaleFrontier)
+        );
+        fixture.assert_claims(&[(1, proof)]);
+    }
     assert_eq!(
         fixture
             .real
@@ -477,15 +538,19 @@ fn joint_prepared_foreign_or_old_raw_proof_never_advances_claim_cursor() {
             .unwrap(),
         Some((2, Ok(next_proof)))
     );
-    assert!(
-        fixture
-            .real
-            .scene
-            .coordinator
-            .claim_next_prepared_admission(&fixture.producers, &next)
-            .unwrap()
-            .is_none()
-    );
+    fixture.assert_claims(&[(1, proof), (2, next_proof)]);
+    for _ in 0..2 {
+        assert!(
+            fixture
+                .real
+                .scene
+                .coordinator
+                .claim_next_prepared_admission(&fixture.producers, &next)
+                .unwrap()
+                .is_none()
+        );
+        fixture.assert_claims(&[(1, proof), (2, next_proof)]);
+    }
     fixture.finish(1, 2);
     assert_eq!(
         operation_edge_rows(&fixture.real.scene),
@@ -505,7 +570,9 @@ fn joint_prepared_claims_every_adjacent_provider_and_caller_original() {
     fixture.push(pid, 1, "C_SignInit", 2);
     fixture.push(child.id(), 1, "C_SignInit", 1);
     let raw = fixture.prepare(3);
+    fixture.assert_claims(&[]);
     let (ingested, first_proof) = fixture.ingest(raw);
+    fixture.assert_claims(&[]);
     let mut proofs = Vec::new();
     for ordinal in 1..=3 {
         let (actual, proof) = fixture
@@ -517,6 +584,13 @@ fn joint_prepared_claims_every_adjacent_provider_and_caller_original() {
             .expect("actual provider/caller admission");
         assert_eq!(actual, ordinal);
         proofs.push(proof.unwrap());
+        fixture.assert_claims(
+            &proofs
+                .iter()
+                .enumerate()
+                .map(|(at, proof)| (at as u64 + 1, *proof))
+                .collect::<Vec<_>>(),
+        );
     }
     assert_eq!(proofs[0], first_proof);
     assert_ne!(
@@ -533,8 +607,74 @@ fn joint_prepared_claims_every_adjacent_provider_and_caller_original() {
             .unwrap()
             .is_none()
     );
+    fixture.assert_claims(&[(1, proofs[0]), (2, proofs[1]), (3, proofs[2])]);
     fixture.finish(3, 3);
     let rows = operation_edge_rows(&fixture.real.scene);
     assert_eq!(rows.len(), 3);
     assert!(rows.iter().all(|row| *row == (Some(1), 0, false, 1, 0)));
+}
+
+#[test]
+fn joint_prepared_key_binding_alone_does_not_claim_original() {
+    let mut fixture = JointScene::new(1);
+    let pid = std::process::id();
+    fixture.bind(pid, image(7), &[0]);
+    fixture.push(pid, 0, "C_SignInit", 1);
+    let raw = fixture.prepare(1);
+    fixture.assert_claims(&[]);
+    let (ingested, bound) = fixture.ingest(raw);
+    for _ in 0..2 {
+        let (prepared, owner) = fixture
+            .real
+            .scene
+            .coordinator
+            .prepared_joint_parts()
+            .unwrap();
+        assert_eq!(
+            owner
+                .adapter_mut()
+                .bind_admitted_key(prepared.next_admission().unwrap()),
+            Ok(bound),
+            "the actual key-only port returns the same proof without claiming"
+        );
+        fixture.assert_claims(&[]);
+        assert!(
+            !fixture
+                .real
+                .scene
+                .coordinator
+                .stage_next_prepared_admission()
+        );
+        assert!(
+            !fixture
+                .real
+                .scene
+                .coordinator
+                .finish_prepared_semantic_batch(&fixture.real.lane)
+        );
+    }
+    assert_eq!(
+        fixture
+            .real
+            .scene
+            .coordinator
+            .claim_next_prepared_admission(&fixture.producers, &ingested)
+            .unwrap(),
+        Some((1, Ok(bound)))
+    );
+    fixture.assert_claims(&[(1, bound)]);
+    for _ in 0..2 {
+        assert!(
+            fixture
+                .real
+                .scene
+                .coordinator
+                .claim_next_prepared_admission(&fixture.producers, &ingested)
+                .unwrap()
+                .is_none()
+        );
+        fixture.assert_claims(&[(1, bound)]);
+    }
+    fixture.finish(1, 1);
+    assert_eq!(operation_edge_rows(&fixture.real.scene)[0].0, Some(1));
 }

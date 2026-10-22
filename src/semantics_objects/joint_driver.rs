@@ -1216,7 +1216,11 @@ impl RawJointQuantum {
                 };
                 if entry.end.is_some()
                     || entry.abandon.is_some()
-                    || entry.corroborated_return.is_some()
+                    // END after an ordinary return violates never-both.
+                    // ABANDON-9 instead disposes that exact retained return;
+                    // it borrows the existing reservation without a Raw role.
+                    || (matches!(record, JournalRecord::End(_))
+                        && entry.corroborated_return.is_some())
                     || invocations.len() == invocations.capacity()
                     || !ledger.matches_reservation(&reservation)
                 {

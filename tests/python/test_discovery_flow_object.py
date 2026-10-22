@@ -274,6 +274,78 @@ class DiscoveryFlow(unittest.TestCase):
                     self.reject_and_restore(elf, disassembly, function, old, new, 'interface-name', 'tail')
                     print(f'verified {variant} interface-name:tail {label}')
 
+    def test_worker_masked_index_survives_spill_and_reload(self):
+        cases = [
+            ('spill-source', 'interface_list_worker',
+             ('r1 = r4', 'r1 &= 0xff', '*(u64 *)(r10 - 0x60) = r1'),
+             2, '*(u64 *)(r10 - 0x60) = r4'),
+            ('index-mask-removed', 'interface_list_worker',
+             ('r1 = r4', 'r1 &= 0xff'), 1, 'r1 = r1'),
+            ('index-mask-widened', 'interface_list_worker',
+             ('r1 = r4', 'r1 &= 0xff'), 1, 'r1 &= 0xffff'),
+            ('index-source', 'interface_list_worker',
+             ('r1 = r4', 'r1 &= 0xff'), 0, 'r1 = r7'),
+            ('spill-width', 'interface_list_worker',
+             ('r1 = r4', 'r1 &= 0xff', '*(u64 *)(r10 - 0x60) = r1'),
+             2, '*(u32 *)(r10 - 0x60) = w1'),
+            ('later-overlap', 'interface_list_worker',
+             ('*(u64 *)(r10 - 0x80) = r0', '*(u64 *)(r10 - 0x88) = r5'),
+             0, '*(u32 *)(r10 - 0x5c) = w4'),
+            ('later-alias', 'interface_list_worker',
+             ('r1 = r10', 'r1 += -0x28', '*(u64 *)(r10 - 0x78) = r1'),
+             2, '*(u64 *)(r1 - 0x38) = r4'),
+            ('unknown-atomic-writer', 'interface_list_worker',
+             ('*(u64 *)(r10 - 0x80) = r0', '*(u64 *)(r10 - 0x88) = r5'),
+             0, 'r0 = cmpxchg_64(r10 - 0x60, r0, r4)'),
+            ('helper-destination', 'interface_list_worker',
+             ('r1 = r10', 'r1 += -0x28', '*(u64 *)(r10 - 0x78) = r1'),
+             1, 'r1 += -0x60'),
+            ('helper-writer-body', 'memset',
+             ('r5 = r1', 'r5 += r4'), 1, 'r5 += -0x38'),
+            ('first-index-reload', 'interface_list_worker',
+             ('r1 = *(u64 *)(r10 - 0x60)', '*(u64 *)(r10 - 0x80) = r0'),
+             0, 'r1 = *(u64 *)(r10 - 0x68)'),
+            ('metadata-index-reload', 'interface_list_worker',
+             ('r9 <<= 0x20', 'r1 = *(u64 *)(r10 - 0x60)', 'r1 <<= 0x8'),
+             1, 'r1 = *(u64 *)(r10 - 0x68)'),
+        ]
+        for variant, elf, disassembly in self.objects:
+            secs = C.sections(disassembly)
+            text = secs['uretprobe'] + secs['.text']
+            for label, function, sequence, offset, replacement in cases:
+                with self.subTest(variant=variant, mutation=label):
+                    _, lines = C.function(text, function, 'fixture')
+                    old, new = instruction_change(lines, instruction_site(lines, sequence, offset), replacement)
+                    self.reject_and_restore(elf, disassembly, function, old, new, 'interface-name', 'tail')
+                    print(f'verified {variant} interface-name:tail {label}')
+
+    def test_current_tail_cannot_select_legacy_with_unrelated_markers(self):
+        for variant, elf, disassembly in self.objects:
+            marked = change_function(disassembly, 'interface_list_return',
+                                     'r2 = *(u64 *)(r6 + 0x50)', 'r2 = *(u64 *)(r6 + 0x8)')
+            marked = change_function(marked, 'interface_list_worker',
+                                     'r3 = 0xfffffffd ll', 'r3 = 0xffffff ll')
+            secs = C.sections(marked)
+            for function, sequence, offset, replacement in [
+                ('interface_list_return', ('r2 = 0x4', '*(u64 *)(r10 - 0x80) = r0', 'call 0x70'),
+                 0, 'r2 = 0x8'),
+                ('interface_list_worker', ('r1 = r4', 'r1 &= 0xff', '*(u64 *)(r10 - 0x60) = r1'),
+                 2, '*(u64 *)(r10 - 0x60) = r4'),
+            ]:
+                with self.subTest(variant=variant, mutation=function):
+                    _, lines = C.function(secs['uretprobe'] + secs['.text'], function, 'fixture')
+                    old, new = instruction_change(lines, instruction_site(lines, sequence, offset), replacement)
+                    bad = change_function(marked, function, old, new)
+                    with self.assertRaisesRegex(RuntimeError, 'interface-name:tail'):
+                        C.check_decoded(elf, bad, 'all')
+                    restored = change_function(bad, function, new, old)
+                    restored = change_function(restored, 'interface_list_worker',
+                                               'r3 = 0xffffff ll', 'r3 = 0xfffffffd ll')
+                    restored = change_function(restored, 'interface_list_return',
+                                               'r2 = *(u64 *)(r6 + 0x8)', 'r2 = *(u64 *)(r6 + 0x50)')
+                    self.assertEqual(restored, disassembly)
+                    self.assertTrue(C.check_decoded(elf, restored, 'all'))
+
     def test_all_payload_predecessors(self):
         # Single decoded instructions, including the independent BN-R1 control.
         cases = [

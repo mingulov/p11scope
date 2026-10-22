@@ -998,7 +998,74 @@ def _stack_interface_return_contract(lines, insert_pc):
                    for pc, text in denied)
 
 
-def _packed_interface_worker_contract(lines, get_pc, classifier_pc):
+def _tail_path_nodes(graph, start, end):
+    """Instructions on a path between two already decoded tail sites."""
+    reverse = {pc: [] for pc in graph}
+    for pc, successors in graph.items():
+        for successor in successors:
+            reverse[successor].append(pc)
+    return reachable(graph, [start]) & reachable(reverse, [end])
+
+
+def _interface_index_slot_preserved(lines, graph, start, end, calls, blocks):
+    """No overlapping or unproved writer may change the u64 index at -0x60."""
+    facts = call_argument_facts(lines)
+    targets = {pc: target for _, _, pc, target in calls}
+    slot, size = -0x60, 8
+    path = _tail_path_nodes(graph, start, end)
+    for pc, text in instructions(lines):
+        if pc in (start, end) or pc not in path:
+            continue
+        state = facts.get(pc, {})
+        store = re.fullmatch(
+            r"\*\(u(8|16|32|64) \*\)\(r(\d+) ([+-]) 0x([0-9a-f]+)\) = (?:[rw]\d+|-?0x[0-9a-f]+)",
+            text,
+        )
+        if store:
+            width, base, sign, offset = store.groups()
+            pointer = state.get("r" + base)
+            if not pointer or pointer[0] != "stack":
+                return False
+            address = pointer[1] + int(offset, 16) * (1 if sign == "+" else -1)
+            count = int(width) // 8
+        elif text.startswith("call "):
+            # Prove the callee's actual byte loop, not just its symbol name.
+            callee = instructions(blocks.get(targets.get(pc), []))
+            byte_stores = [op for _, op in callee
+                           if re.fullmatch(r"\*\(u8 \*\)\(r5 \+ 0x0\) = [rw]2", op)]
+            if len(byte_stores) != 1:
+                return False
+            loop = _tail_lowering(callee, f"""
+                if r3 == 0x0 goto @done
+                r4 = 0x0
+                again:
+                r5 = r1
+                r5 += r4
+                {byte_stores[0]}
+                r4 += 0x1
+                if r3 > r4 goto @again
+                done:
+                exit
+                """)
+            pointer, length = state.get("r1"), state.get("r3")
+            if (loop != callee or not pointer or pointer[0] != "stack"
+                    or not length or length[0] != "constant"):
+                return False
+            address, count = pointer[1], length[1]
+        elif (text.startswith(("if ", "goto ")) or text == "exit"
+              or re.fullmatch(r"[rw]\d+ = \*\(u(?:8|16|32|64) \*\)\(r\d+ [+-] 0x[0-9a-f]+\)", text)
+              or re.fullmatch(r"[rw]\d+ (?:=|\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>=|s>>=) (?:[rw]\d+|-?0x[0-9a-f]+)(?: ll)?", text)):
+            continue
+        else:
+            # Includes implicit writes such as cmpxchg and lock syntax.
+            return False
+        if (count < 0 or address < -512 or address + count > 0
+                or (count and address < slot + size and slot < address + count)):
+            return False
+    return True
+
+
+def _packed_interface_worker_contract(lines, get_pc, classifier_pc, calls, blocks):
     """The symbol is packed>>40, count is u32, and the index is below min(count,16)."""
     insns, graph = instruction_graph(lines)
     unpack = _tail_lowering(insns, """
@@ -1038,7 +1105,12 @@ def _packed_interface_worker_contract(lines, get_pc, classifier_pc):
         r3 = *(u64 *)(r10 - 0x70)
         r5 = *(u64 *)(r10 - 0x78)
         """)
-    if (not unpack or not metadata or graph[get_pc] != [unpack[0][0]]
+    index = _tail_lowering(insns, """
+        r1 = r4
+        r1 &= 0xff
+        *(u64 *)(r10 - 0x60) = r1
+        """)
+    if (not unpack or not metadata or not index or graph[get_pc] != [unpack[0][0]]
             or graph[metadata[-1][0]] != [classifier_pc]):
         return False
     guards = [unpack[i] for i in (0, 2, 6, 18, 21)]
@@ -1050,10 +1122,83 @@ def _packed_interface_worker_contract(lines, get_pc, classifier_pc):
     symbol_writes = [pc for pc, text in insns if unpack[5][0] < pc < classifier_pc
                      and re.match(r"[rw]9\b", text)]
     live = reachable(graph, [start])
-    return (symbol_writes == [metadata[0][0]]
-            and classifier_pc not in reachable(graph, [start], {metadata[0][0]})
-            and all({pc for pc in live if current[0] in graph[pc]} == {previous[0]}
-                    for previous, current in zip(metadata, metadata[1:])))
+    if (symbol_writes != [metadata[0][0]]
+            or classifier_pc in reachable(graph, [start], {metadata[0][0]})
+            or not all({pc for pc in live if current[0] in graph[pc]} == {previous[0]}
+                       for region in (metadata, index)
+                       for previous, current in zip(region, region[1:]))):
+        return False
+    reloads = [pc for pc, text in insns if text == "r1 = *(u64 *)(r10 - 0x60)"]
+    if (len(reloads) != 2 or reloads[-1] != metadata[1][0]
+            or any(classifier_pc in reachable(graph, [start], {pc})
+                   for pc in (unpack[3][0], index[0][0], index[-1][0], reloads[0]))):
+        return False
+    packed_path = _tail_path_nodes(graph, unpack[3][0], index[0][0]) - {unpack[3][0]}
+    if any(pc in packed_path and (re.match(r"[rw]4\b", text) or text.startswith("call "))
+           for pc, text in insns):
+        return False
+    return _interface_index_slot_preserved(lines, graph, index[-1][0], metadata[1][0], calls, blocks)
+
+
+def _legacy_owned_tail_value(lines, get_pcs, target, upper_bound=False):
+    """Legacy +8 loads and bounds must use the actual direct getter result.
+
+    A context load and an unrelated 24-bit constant cannot opt a current-format
+    object out of the stack/packed proof. Preserve the old direct-get ABI only
+    when its returned field and same-value guards causally protect the sink.
+    """
+    insns, graph = instruction_graph(lines)
+    if not insns or not get_pcs:
+        return False
+    texts = dict(insns)
+    facts = call_argument_facts(lines)
+    start = insns[0][0]
+    candidates = []
+    for index, (pc, text) in enumerate(insns[:-1]):
+        load = re.fullmatch(r"r(\d+) = \*\(u64 \*\)\(r0 \+ 0x8\)", text)
+        if not load:
+            continue
+        register = load.group(1)
+        null_pc, null = insns[index + 1]
+        if not re.fullmatch(rf"if r{register} == 0x0 goto [+-]0x[0-9a-f]+", null):
+            continue
+        getter = []
+        for get_pc in get_pcs:
+            successors = graph[get_pc]
+            if successors == [pc]:
+                getter.append(get_pc)
+            elif len(successors) == 1:
+                result_pc = successors[0]
+                result = texts[result_pc]
+                if (re.fullmatch(r"if r0 == 0x0 goto [+-]0x[0-9a-f]+", result)
+                        and pc in graph[result_pc]
+                        and relative_target(result_pc, result) != pc
+                        and target not in reachable(graph, [relative_target(result_pc, result)])):
+                    getter.append(get_pc)
+        if len(getter) != 1:
+            continue
+        bounds = []
+        if upper_bound:
+            for bound_pc, bound in insns:
+                immediate = re.fullmatch(rf"if r{register} > 0xffffff goto [+-]0x[0-9a-f]+", bound)
+                other = re.fullmatch(rf"if r{register} > (r\d+) goto [+-]0x[0-9a-f]+", bound)
+                if (immediate or (other and facts.get(bound_pc, {}).get(other[1]) == ("constant", 0xffffff))):
+                    bounds.append((bound_pc, bound))
+            if len(bounds) != 1:
+                continue
+        guards = [(null_pc, null), *bounds]
+        path = _tail_path_nodes(graph, pc, target) - {pc, target}
+        if (target in reachable(graph, [start], {getter[0]})
+                or target in reachable(graph, [start], {pc})
+                or any(target in reachable(graph, [start], {guard_pc})
+                       or target in reachable(graph, [relative_target(guard_pc, guard)])
+                       for guard_pc, guard in guards)
+                or any(p in path and (re.match(rf"[rw]{register}\b", op)
+                                      or (int(register) < 6 and op.startswith("call ")))
+                       for p, op in insns)):
+            continue
+        candidates.append(pc)
+    return len(candidates) == 1
 
 
 def interface_tail_contract(disassembly):
@@ -1121,28 +1266,28 @@ def interface_tail_contract(disassembly):
             return False
     return_block = "\n".join(return_lines)
     worker_block = "\n".join(worker_lines)
-    old_return = bool(re.search(r"\br\d+ = \*\(u64 \*\)\(r\d+ \+ 0x8\)", return_block))
     if not re.search(r"\bif r\d+ == 0x0 goto", return_block):
         return False
     if not re.search(r"\bif r\d+ > r\d+ goto", return_block):
         return False
     if re.search(r"\bcall 0xae\b", worker_block):
         return False
-    old_worker = bool(
-        re.search(r"\bif r\d+ > 0xffffff goto", worker_block)
-        or (
-            re.search(r"\br\d+ = 0xffffff\b", worker_block)
-            and re.search(r"\bif r\d+ > r\d+ goto", worker_block)
-        )
-    )
     insert_pcs = {pc for _, pc in discovery_call_sites(disassembly, return_name, "insert")}
     if len(insert_pcs) != 1 or len(reads) != 1:
         return False
     insert_pc, = insert_pcs
     get_pc, = reads
-    if not ((old_return and old_worker) or (
+    return_gets = {pc for _, pc in discovery_call_sites(disassembly, return_name, "get")}
+    legacy = (bool(return_gets)
+              and discovery_arguments(disassembly, return_name, "get", 0)
+              and _legacy_owned_tail_value(return_lines, return_gets, insert_pc)
+              and _legacy_owned_tail_value(worker_lines, reads, worker_classifier_calls[0][2], True))
+    if not (legacy or (
         _stack_interface_return_contract(return_lines, insert_pc)
-        and _packed_interface_worker_contract(worker_lines, get_pc, worker_classifier_calls[0][2])
+        and _packed_interface_worker_contract(
+            worker_lines, get_pc, worker_classifier_calls[0][2],
+            [call for call in calls if call[0] == worker_name], blocks,
+        )
     )):
         return False
     if not re.search(r"\br\d+ = 0x10\b", worker_block):
@@ -1895,6 +2040,13 @@ def _owned_self_test():
                           ("if r8 > 0xffffff", "if r8 > 0x1000000")):
         if interface_tail_contract(mutate("interface_list_worker", before, after)):
             raise AssertionError(f"worker mutation accepted: {before}")
+    for name in ("interface_list_return", "interface_list_worker"):
+        if interface_tail_contract(mutate(name, "r8 = *(u64 *)(r0 + 0x8)",
+                                         "r8 = *(u64 *)(r1 + 0x8)")):
+            raise AssertionError(f"legacy field is not bound to the getter result: {name}")
+    if interface_tail_contract(mutate("interface_list_worker", "if r8 > 0xffffff goto",
+                                     "if r7 > 0xffffff goto")):
+        raise AssertionError("legacy bound does not check the loaded field")
     for name in ("function_list_entry", "interface_entry", "interface_list_worker"):
         for before, after in (("*(u64 *)(r1 + 0x10) = r7", "*(u64 *)(r1 + 0x10) = r0"),
                               ("r1 += -0x18", "r1 += -0x20")):

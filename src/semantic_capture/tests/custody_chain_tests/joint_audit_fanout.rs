@@ -3485,20 +3485,28 @@ fn assert_original_replay_partition(seal: &crate::semantics_objects::journal::Se
         let borrowed = seal.effects_for_step(step).unwrap();
         assert_eq!(borrowed, original);
         assert_eq!(borrowed.as_ptr(), original.as_ptr(), "no cloned facts");
-        if matches!(step.phase(), SealReplayPhase::Begin | SealReplayPhase::End) {
+        if matches!(
+            step.phase(),
+            SealReplayPhase::Begin | SealReplayPhase::End | SealReplayPhase::BoundedLoss
+        ) {
             let call = seal
                 .prefix
                 .call_for_step(step)
                 .expect("original call index");
             assert!(seal.prefix.replay_calls().contains(call));
-            assert_eq!(
-                step.cut(),
-                if step.phase() == SealReplayPhase::End {
-                    call.end_cut
-                } else {
-                    Some(call.begin_cut)
-                }
-            );
+            if step.phase() == SealReplayPhase::BoundedLoss {
+                assert!(call.abandoned && call.end_cut.is_none());
+                assert!(step.cut().is_some(), "actual corroborated loss bound");
+            } else {
+                assert_eq!(
+                    step.cut(),
+                    if step.phase() == SealReplayPhase::End {
+                        call.end_cut
+                    } else {
+                        Some(call.begin_cut)
+                    }
+                );
+            }
         } else {
             assert!(seal.prefix.call_for_step(step).is_none());
         }
@@ -3550,7 +3558,115 @@ fn observation_wire(
     ObservationWire { label, begin, end }
 }
 
-fn observe_genuine_settlement_order(late_metadata: bool) {
+/// Route these exact physical originals through the existing H0 validator,
+/// sorted admission handoff, raw owner, claims and one real collection audit.
+fn prepare_wire_frame(
+    fixture: &mut CanonicalFanoutScene,
+    wires: &[ObservationWire],
+    physical: &[(usize, bool)],
+    reverse_delivery: bool,
+) -> (IngestedJointQuantum, Vec<(u64, u64)>, u64) {
+    for (index, terminal) in physical {
+        fixture.scene.drain.source_mut().push_record(if *terminal {
+            wires[*index].end.to_vec()
+        } else {
+            wires[*index].begin.to_vec()
+        });
+    }
+    let mut raw = fixture.scene.collect_with_fault(&BirthFault);
+    let mut report = {
+        let mut h0 = fixture.scene.real.h0.0.borrow_mut();
+        let HeldH0 { capture, io, .. } = &mut *h0;
+        capture.tick_collected_with(io, &mut raw).unwrap()
+    };
+    assert_eq!(report.calls().count(), wires.len());
+    assert_eq!(report.awaiting_floor(), None);
+    assert_eq!(report.shed_floor(), None);
+    let originals: Vec<_> = report
+        .calls()
+        .map(|call| {
+            (
+                call.position().unwrap(),
+                call.collected_origin().unwrap(),
+                call.record().event.ts_ns,
+            )
+        })
+        .collect();
+    let base_admission = originals.iter().map(|entry| entry.0).min().unwrap();
+    let watermark = report.allocated_below();
+    if reverse_delivery {
+        let mut original_outcomes = report.take_outcomes();
+        original_outcomes.reverse();
+        assert_eq!(report.merge_stashed_outcomes(original_outcomes), 0);
+    }
+    let mut after: Vec<_> = report
+        .calls()
+        .map(|call| {
+            (
+                call.position().unwrap(),
+                call.collected_origin().unwrap(),
+                call.record().event.ts_ns,
+            )
+        })
+        .collect();
+    after.sort_by_key(|entry| entry.0);
+    let mut before = originals;
+    before.sort_by_key(|entry| entry.0);
+    assert_eq!(after, before, "delivery never remints original H0 identity");
+    assert_eq!(report.allocated_below(), watermark);
+    let batch = SemanticBatch::from_tick_report(
+        fixture.scene.real.lane.domain(),
+        report,
+        Vec::new(),
+        now_ns(),
+    )
+    .unwrap();
+    let coordinator = &mut fixture.scene.real.scene.coordinator;
+    coordinator.stage_semantic_batch(batch);
+    coordinator
+        .prepare_staged_semantic_batch(&mut fixture.scene.real.lane, None)
+        .unwrap();
+    let admissions: Vec<_> = coordinator
+        .prepared_semantic_batch()
+        .unwrap()
+        .admissions()
+        .map(|input| (input.h0_ordinal(), input.s1_facts().ts_ns))
+        .collect();
+    assert_eq!(
+        admissions.iter().map(|entry| entry.0).collect::<Vec<_>>(),
+        (base_admission..watermark).collect::<Vec<_>>()
+    );
+    let ingested = raw
+        .ingest(
+            coordinator.joint_capture_mut().adapter_mut(),
+            &fixture.scene.producers,
+            &fixture.grant,
+        )
+        .unwrap_or_else(|(_, reason)| panic!("original observation raw: {reason:?}"));
+    assert_eq!(
+        claim_and_finish(&mut fixture.scene, &ingested).len(),
+        wires.len()
+    );
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .commit_batch_with_semantics(false, Some(&mut fixture.scene.real.lane))
+        .unwrap();
+    let frame = acquire(&mut fixture.scene, ingested, &fixture.attached, &BirthFault);
+    assert!(frame.failure_for_test().is_none());
+    (frame, admissions, base_admission)
+}
+
+fn with_genuine_settlement_order(
+    late_metadata: bool,
+    mut after_observation: impl FnMut(
+        &mut CanonicalFanoutScene,
+        &mut IngestedJointQuantum,
+        JointFeedTarget,
+    ) -> bool,
+) {
     use crate::semantics_key_use::KeyUseReducer;
     use crate::semantics_objects::{KeyLabel, trace_settlement_for_test};
     use pkcs11_types::CkRv;
@@ -3671,96 +3787,8 @@ fn observe_genuine_settlement_order(late_metadata: bool) {
                 sequence += 1;
             }
             assert_eq!(wires.len(), 10);
-            for (index, terminal) in &physical {
-                fixture.scene.drain.source_mut().push_record(if *terminal {
-                    wires[*index].end.to_vec()
-                } else {
-                    wires[*index].begin.to_vec()
-                });
-            }
-            let mut raw = fixture.scene.collect_with_fault(&BirthFault);
-            let mut report = {
-                let mut h0 = fixture.scene.real.h0.0.borrow_mut();
-                let HeldH0 { capture, io, .. } = &mut *h0;
-                capture.tick_collected_with(io, &mut raw).unwrap()
-            };
-            assert_eq!(report.calls().count(), wires.len());
-            assert_eq!(report.awaiting_floor(), None);
-            assert_eq!(report.shed_floor(), None);
-            let originals: Vec<_> = report
-                .calls()
-                .map(|call| {
-                    (
-                        call.position().unwrap(),
-                        call.collected_origin().unwrap(),
-                        call.record().event.ts_ns,
-                    )
-                })
-                .collect();
-            let base_admission = originals.iter().map(|entry| entry.0).min().unwrap();
-            let watermark = report.allocated_below();
-            if reverse_delivery {
-                let mut original_outcomes = report.take_outcomes();
-                original_outcomes.reverse();
-                assert_eq!(report.merge_stashed_outcomes(original_outcomes), 0);
-            }
-            let mut after: Vec<_> = report
-                .calls()
-                .map(|call| {
-                    (
-                        call.position().unwrap(),
-                        call.collected_origin().unwrap(),
-                        call.record().event.ts_ns,
-                    )
-                })
-                .collect();
-            after.sort_by_key(|entry| entry.0);
-            let mut before = originals;
-            before.sort_by_key(|entry| entry.0);
-            assert_eq!(after, before, "delivery never remints original H0 identity");
-            assert_eq!(report.allocated_below(), watermark);
-            let batch = SemanticBatch::from_tick_report(
-                fixture.scene.real.lane.domain(),
-                report,
-                Vec::new(),
-                now_ns(),
-            )
-            .unwrap();
-            let coordinator = &mut fixture.scene.real.scene.coordinator;
-            coordinator.stage_semantic_batch(batch);
-            coordinator
-                .prepare_staged_semantic_batch(&mut fixture.scene.real.lane, None)
-                .unwrap();
-            let admissions: Vec<_> = coordinator
-                .prepared_semantic_batch()
-                .unwrap()
-                .admissions()
-                .map(|input| (input.h0_ordinal(), input.s1_facts().ts_ns))
-                .collect();
-            assert_eq!(
-                admissions.iter().map(|entry| entry.0).collect::<Vec<_>>(),
-                (base_admission..watermark).collect::<Vec<_>>()
-            );
-            let ingested = raw
-                .ingest(
-                    coordinator.joint_capture_mut().adapter_mut(),
-                    &fixture.scene.producers,
-                    &fixture.grant,
-                )
-                .unwrap_or_else(|(_, reason)| panic!("original observation raw: {reason:?}"));
-            assert_eq!(
-                claim_and_finish(&mut fixture.scene, &ingested).len(),
-                wires.len()
-            );
-            fixture
-                .scene
-                .real
-                .scene
-                .coordinator
-                .commit_batch_with_semantics(false, Some(&mut fixture.scene.real.lane))
-                .unwrap();
-            let mut frame = acquire(&mut fixture.scene, ingested, &fixture.attached, &BirthFault);
-            assert!(frame.failure_for_test().is_none());
+            let (mut frame, admissions, base_admission) =
+                prepare_wire_frame(&mut fixture, &wires, &physical, reverse_delivery);
             let feeds_before = fixture.feeds();
             let h0 = fixture.scene.real.h0.clone();
             let mut births = NativeFrameBirths {
@@ -4011,12 +4039,19 @@ fn observe_genuine_settlement_order(late_metadata: bool) {
                     .reference_h3_acknowledged_below(),
                 0
             );
+            if after_observation(&mut fixture, &mut frame, target) {
+                fixture.finish_bounded_batch(frame, false);
+            }
         }
         completion_tuples.push(delivery_tuple.unwrap());
     }
     assert_eq!(completion_tuples[0].1, completion_tuples[1].1);
     assert_eq!(completion_tuples[0].0 + 1, completion_tuples[1].0);
     assert_eq!(completion_tuples[0].2 + 1, completion_tuples[1].2);
+}
+
+fn observe_genuine_settlement_order(late_metadata: bool) {
+    with_genuine_settlement_order(late_metadata, |_, _, _| false);
 }
 
 #[test]
@@ -4103,30 +4138,61 @@ impl CanonicalFanoutScene {
     }
 }
 
-#[test]
-fn joint_replay_steps_keep_prior_terminal_after_conversion_loss() {
+fn with_genuine_prior_terminal(
+    reverse_head: bool,
+    drive_h9: bool,
+    after_seal: impl FnOnce(
+        &mut CanonicalFanoutScene,
+        &mut IngestedJointQuantum,
+        JointFeedTarget,
+        crate::semantics_objects::journal::SealedCall,
+        crate::semantics_objects::journal::SealedCall,
+    ) -> bool,
+) {
     use crate::semantics_objects::journal::SealReplayPhase;
     use crate::semantics_objects::journal::tests::abandon_bytes;
     use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
     let mut fixture = CanonicalFanoutScene::prior_sealed();
     let (target, pid) = fixture.replay_target();
-    let (open, ordinary) = fixture.scene.encoded(pid, 0, "C_SignUpdate", 2);
+    let (open, ordinary) = fixture.scene.encoded(
+        pid,
+        0,
+        if drive_h9 {
+            "C_SignInit"
+        } else {
+            "C_SignUpdate"
+        },
+        2,
+    );
     let (held, complete) = fixture.scene.encoded(pid, 0, "C_SignInit", 3);
+    let ordinary = if reverse_head {
+        // B began first but returns after A. H0 therefore admits A before B,
+        // while q2 still emits B's loss span before A's actual settlement END.
+        end_bytes_absent(&open, 0, ENTRY_NS + 2_010)
+    } else {
+        ordinary
+    };
     fixture.scene.drain.source_mut().push_record(open.to_vec());
-    // An actual ordinary completed return can claim START, but cannot be
-    // followed by END for that SAME invocation (the producer's never-both
-    // contract). A bounded ABANDON will later release the different held call.
-    fixture
-        .scene
-        .drain
-        .source_mut()
-        .push_record(ordinary[24..392].to_vec());
+    if !reverse_head {
+        fixture
+            .scene
+            .drain
+            .source_mut()
+            .push_record(ordinary[24..392].to_vec());
+    }
     fixture.scene.drain.source_mut().push_record(held.to_vec());
     fixture
         .scene
         .drain
         .source_mut()
         .push_record(complete.to_vec());
+    if reverse_head {
+        fixture
+            .scene
+            .drain
+            .source_mut()
+            .push_record(ordinary[24..392].to_vec());
+    }
     let mut q1 = fixture.audited(2, 2, &BirthFault);
     assert!(
         q1.failure_for_test().is_none(),
@@ -4143,6 +4209,14 @@ fn joint_replay_steps_keep_prior_terminal_after_conversion_loss() {
         .iter()
         .find(|call| call.end_cut.is_some())
         .unwrap();
+    let lost = *first
+        .prefix
+        .settled()
+        .iter()
+        .find(|call| call.end_cut.is_none())
+        .unwrap();
+    let loss_bound = first.prefix.frontier_cut() - 4 + if reverse_head { 4 } else { 2 };
+    assert_eq!(old.key.admission() < lost.key.admission(), reverse_head);
     assert!(
         first.effects.effects.is_empty(),
         "the real open holds the watermark"
@@ -4155,6 +4229,39 @@ fn joint_replay_steps_keep_prior_terminal_after_conversion_loss() {
             .iter()
             .any(|step| step.phase() == SealReplayPhase::End)
     );
+    if drive_h9 {
+        let feeds = fixture.feeds();
+        let roles = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .ledger()
+            .roles_for_test();
+        for _ in 0..8 {
+            assert_ne!(
+                fixture.deliver_one_work(&mut q1),
+                QuantumSealProgress::Complete
+            );
+        }
+        assert_eq!(
+            fixture.feeds(),
+            feeds,
+            "no actual End or subject-bound loss yet"
+        );
+        assert_eq!(
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .joint_capture()
+                .ledger()
+                .roles_for_test(),
+            roles
+        );
+    }
     fixture.scene.assert_claims(&[]);
     let before_feeds = fixture.feeds();
     let before_roles = fixture
@@ -4219,9 +4326,13 @@ fn joint_replay_steps_keep_prior_terminal_after_conversion_loss() {
         .prefix
         .replay_steps()
         .iter()
-        .find(|step| step.phase() == SealReplayPhase::Conversion)
+        .find(|step| step.phase() == SealReplayPhase::BoundedLoss)
         .unwrap();
     assert!(!conversion.effect_range().is_empty());
+    let loss_call = second.prefix.call_for_step(conversion).unwrap();
+    assert_eq!((loss_call.key, loss_call.ticket), (lost.key, lost.ticket));
+    assert!(loss_call.abandoned && loss_call.end_cut.is_none());
+    assert_eq!(conversion.cut(), Some(loss_bound));
     assert!(
         second
             .effects_for_step(conversion)
@@ -4300,6 +4411,14 @@ fn joint_replay_steps_keep_prior_terminal_after_conversion_loss() {
             .reference_h3_acknowledged_below(),
         0
     );
+    if after_seal(&mut fixture, &mut q2, target, old, lost) {
+        fixture.finish_bounded_batch(q2, false);
+    }
+}
+
+#[test]
+fn joint_replay_steps_keep_prior_terminal_after_conversion_loss() {
+    with_genuine_prior_terminal(false, false, |_, _, _, _, _| false);
 }
 
 #[test]
@@ -4419,4 +4538,1041 @@ fn joint_replay_step_capacity_refusal_preserves_original() {
         feeds,
         "retry still does not publish or replay"
     );
+}
+
+impl CanonicalFanoutScene {
+    fn s1_counts(&self, id: RegistryInstanceId) -> (u64, u64, u64, u64, usize) {
+        let s1 = self
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .instance_semantic_edges()
+            .find(|record| record.id == id)
+            .unwrap()
+            .semantics
+            .as_ref()
+            .unwrap();
+        (
+            s1.calls(),
+            s1.started(),
+            s1.completed(),
+            s1.unknown(),
+            s1.active_summary()
+                .iter()
+                .map(|entry| entry.2 as usize)
+                .sum(),
+        )
+    }
+
+    /// A service slice has ONE work unit shared by every selected consumer.
+    /// Reductions/disposals cannot each receive a fresh per-feed allowance.
+    fn deliver_one_work(&mut self, frame: &mut IngestedJointQuantum) -> QuantumSealProgress {
+        let before: u64 = self
+            .feeds()
+            .iter()
+            .map(|feed| feed.reduced + feed.disposed)
+            .sum();
+        let audit = self.scene.real.scene.coordinator.reference_h3_audit_state();
+        let ack = self
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_h3_acknowledged_below();
+        let mut remaining = 1;
+        let progress = {
+            let mut ports = self
+                .scene
+                .real
+                .scene
+                .coordinator
+                .joint_frame_ports(&self.scene.producers)
+                .unwrap();
+            frame
+                .deliver_next_bounded(&mut ports, &mut remaining)
+                .unwrap()
+        };
+        let after: u64 = self
+            .feeds()
+            .iter()
+            .map(|feed| feed.reduced + feed.disposed)
+            .sum();
+        assert!(
+            after >= before && after - before <= 1,
+            "one shared service unit"
+        );
+        if after != before {
+            assert_eq!(remaining, 0, "a terminal disposition is charged work");
+        }
+        assert!(remaining <= 1);
+        assert_eq!(
+            self.scene.real.scene.coordinator.reference_h3_audit_state(),
+            audit,
+            "a yielded/retried delivery never takes H3 again"
+        );
+        assert_eq!(
+            self.scene
+                .real
+                .scene
+                .coordinator
+                .reference_h3_acknowledged_below(),
+            ack,
+            "no acknowledgement while an original result is retained"
+        );
+        progress
+    }
+
+    fn seal_selected_for_batch(&mut self, frame: &mut IngestedJointQuantum, unreadable: bool) {
+        let h0 = self.scene.real.h0.clone();
+        let mut births = NativeFrameBirths {
+            h0: &h0,
+            attached: &self.attached,
+            retained: &mut self.births,
+            seen: Vec::new(),
+            unreadable,
+        };
+        let mut ports = self
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&self.scene.producers)
+            .unwrap();
+        assert!(matches!(
+            frame
+                .seal_next(&mut ports, &mut births, &BirthFault)
+                .unwrap(),
+            QuantumSealProgress::DeliveryReady | QuantumSealProgress::Complete
+        ));
+        assert!(births.seen.len() <= 1);
+    }
+
+    fn finish_bounded_batch(&mut self, mut frame: IngestedJointQuantum, unreadable: bool) {
+        let mut complete = false;
+        // This fixture has fewer than 128 original transitions/effects. The
+        // finite guard catches a hidden head/cursor deadlock, not slow I/O.
+        for _ in 0..256 {
+            self.seal_selected_for_batch(&mut frame, unreadable);
+            if self.deliver_one_work(&mut frame) == QuantumSealProgress::Complete {
+                complete = true;
+                break;
+            }
+        }
+        assert!(
+            complete,
+            "every exact original must reach a terminal disposition"
+        );
+        let feeds = self.feeds();
+        assert_eq!(
+            self.deliver_one_work(&mut frame),
+            QuantumSealProgress::Complete
+        );
+        assert_eq!(
+            self.feeds(),
+            feeds,
+            "a completed frame never replays/disposes twice"
+        );
+        let mut ports = self
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&self.scene.producers)
+            .unwrap();
+        frame
+            .finish_frame(&mut ports)
+            .unwrap_or_else(|(_, reason)| panic!("bounded consumers remain: {reason:?}"));
+        self.scene.assert_claims(&[]);
+        assert_eq!(
+            self.scene
+                .real
+                .scene
+                .coordinator
+                .joint_capture()
+                .ledger()
+                .roles_for_test()[..4],
+            [0, 0, 0, 0]
+        );
+    }
+}
+
+/// Catches the old multi-call hold, prefix-only redemption, unbounded per-feed
+/// work, and replacing an original admission with an equal-shaped Update.
+#[test]
+fn key_operation_joint_batch_replays_exact_order() {
+    for reverse_end in [false, true] {
+        for reverse_delivery in [false, true] {
+            let mut fixture = CanonicalFanoutScene::prior_sealed();
+            let (target, primary) = fixture.replay_target();
+            let peer = if primary == std::process::id() {
+                fixture._child.id()
+            } else {
+                std::process::id()
+            };
+            let before = fixture.feeds();
+            let before_s1 = fixture.s1_counts(target.id());
+            let mut wires = Vec::new();
+            let mut physical = Vec::new();
+            for (offset, function) in [
+                "C_CreateObject",
+                "C_SignInit",
+                "C_SignUpdate",
+                "C_SignUpdate",
+                "C_SignFinal",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let first = wires.len();
+                for pid in [primary, peer] {
+                    wires.push(observation_wire(
+                        &fixture,
+                        pid,
+                        "batch",
+                        function,
+                        offset as u64 + 2,
+                    ));
+                }
+                physical.extend([(first, false), (first + 1, false)]);
+                physical.extend(if reverse_end {
+                    [(first + 1, true), (first, true)]
+                } else {
+                    [(first, true), (first + 1, true)]
+                });
+            }
+            let (mut frame, admissions, _) =
+                prepare_wire_frame(&mut fixture, &wires, &physical, reverse_delivery);
+            assert_eq!(admissions.len(), 10);
+            fixture.seal_replay_head(&mut frame, &BirthFault);
+            let seal = frame.active_seal_for_test().unwrap();
+            assert_original_replay_partition(seal);
+            assert_eq!(seal.prefix.replay_calls().len(), 5);
+            assert_eq!(
+                seal.prefix
+                    .replay_steps()
+                    .iter()
+                    .filter(|step| step.phase()
+                        == crate::semantics_objects::journal::SealReplayPhase::End)
+                    .count(),
+                5
+            );
+            let mut original = seal
+                .prefix
+                .replay_calls()
+                .iter()
+                .map(|call| (call.key.admission(), call.function))
+                .collect::<Vec<_>>();
+            original.sort_unstable_by_key(|call| call.0);
+            assert_eq!(
+                original.iter().map(|call| call.1).collect::<Vec<_>>(),
+                [
+                    "C_CreateObject",
+                    "C_SignInit",
+                    "C_SignUpdate",
+                    "C_SignUpdate",
+                    "C_SignFinal"
+                ]
+                .map(function_id)
+            );
+            assert!(original.windows(2).all(|pair| pair[0].0 < pair[1].0));
+            let base = before
+                .iter()
+                .find(|feed| feed.id == target.id())
+                .unwrap()
+                .reduced;
+            let mut done = false;
+            for _ in 0..128 {
+                fixture.deliver_one_work(&mut frame);
+                let feed = fixture
+                    .feeds()
+                    .into_iter()
+                    .find(|feed| feed.id == target.id())
+                    .unwrap();
+                let n = feed.reduced - base;
+                let counts = fixture.s1_counts(target.id());
+                assert_eq!(
+                    counts.0 - before_s1.0,
+                    n,
+                    "only the next original enters S1"
+                );
+                assert_eq!(counts.1 - before_s1.1, u64::from(n >= 2));
+                assert_eq!(counts.2 - before_s1.2, u64::from(n == 5));
+                assert_eq!(counts.3, before_s1.3);
+                assert_eq!(counts.4, usize::from((2..5).contains(&n)));
+                assert_eq!(feed.disposed, 0);
+                if n == 5 {
+                    assert_eq!(feed.staged, 0);
+                    done = true;
+                    break;
+                }
+            }
+            assert!(
+                done,
+                "the genuine five-call prefix must progress with budget one"
+            );
+            let delivered = fixture.feeds();
+            fixture.deliver_one_work(&mut frame);
+            assert_eq!(
+                fixture.feeds(),
+                delivered,
+                "retry of consumed original table is inert"
+            );
+            fixture.finish_bounded_batch(frame, false);
+            for feed in fixture.feeds() {
+                let original = before.iter().find(|old| old.id == feed.id).unwrap();
+                assert_eq!(
+                    (feed.reduced - original.reduced, feed.disposed, feed.staged),
+                    (5, 0, 0)
+                );
+                assert!(!feed.fallback && !feed.degraded);
+            }
+        }
+    }
+}
+
+/// Catches applying the batch's final invalidations before Init, relabeling
+/// from the current replacement object, or losing an empty Final boundary.
+#[test]
+fn key_operation_joint_batch_receipts_keep_observation_time() {
+    for late_metadata in [false, true] {
+        with_genuine_settlement_order(late_metadata, |fixture, frame, target| {
+            let seal = frame.active_seal_for_test().unwrap();
+            let mut calls = seal.prefix.replay_calls().to_vec();
+            calls.sort_unstable_by_key(|call| call.key.admission());
+            let init_rank = calls
+                .iter()
+                .position(|call| call.function == function_id("C_SignInit"))
+                .unwrap() as u64
+                + 1;
+            let before = fixture
+                .feeds()
+                .into_iter()
+                .find(|feed| feed.id == target.id())
+                .unwrap()
+                .reduced;
+            let mut saw_init = false;
+            let mut saw_retirement = false;
+            let mut done = false;
+            for _ in 0..192 {
+                fixture.deliver_one_work(frame);
+                let feed = fixture
+                    .feeds()
+                    .into_iter()
+                    .find(|feed| feed.id == target.id())
+                    .unwrap();
+                let keyuse = fixture
+                    .scene
+                    .real
+                    .scene
+                    .coordinator
+                    .registry()
+                    .keyuse_for_test();
+                let buckets: Vec<_> = keyuse
+                    .aggregates()
+                    .iter()
+                    .filter(|(key, _)| key.instance == target.id())
+                    .collect();
+                assert!(
+                    buckets.iter().all(|(key, _)| key.metadata != "rsa_4096"),
+                    "later replacement metadata cannot label the original use"
+                );
+                if !saw_init && feed.reduced - before == init_rank {
+                    saw_init = true;
+                    if late_metadata {
+                        assert!(
+                            buckets.is_empty(),
+                            "metadata learned later never backfills Init"
+                        );
+                    } else {
+                        assert_eq!(buckets.len(), 1);
+                        assert_eq!(buckets[0].0.metadata, "rsa_2048");
+                        assert_eq!(
+                            (
+                                buckets[0].1.started,
+                                buckets[0].1.active,
+                                buckets[0].1.key_join_lost
+                            ),
+                            (1, 1, 0)
+                        );
+                    }
+                }
+                if buckets
+                    .iter()
+                    .any(|(_, counters)| counters.key_join_lost != 0)
+                {
+                    assert!(saw_init, "the original Init must precede its invalidation");
+                    saw_retirement = true;
+                    assert_eq!((buckets[0].1.active, buckets[0].1.key_join_lost), (0, 1));
+                }
+                if feed.reduced - before == 9 {
+                    assert_eq!(feed.staged, 0);
+                    assert_eq!(
+                        keyuse
+                            .open()
+                            .keys()
+                            .filter(|(instance, _)| *instance == target.id())
+                            .count(),
+                        0
+                    );
+                    done = true;
+                    break;
+                }
+            }
+            assert!(done && saw_init);
+            assert_eq!(saw_retirement, !late_metadata);
+            // The oracle above already checked the actual object is now
+            // RSA4096; replay must retain the earlier frozen label instead.
+            true
+        });
+    }
+}
+
+/// Catches spending a fresh H3 for feed two, switching to S1Only before its
+/// suffix is disposed, or replaying the same retained head on budget retry.
+#[test]
+fn key_operation_two_feeds_share_audited_fallback_once() {
+    let mut fixture = CanonicalFanoutScene::prior_sealed();
+    for (offset, function) in ["C_SignInit", "C_SignUpdate", "C_SignFinal"]
+        .into_iter()
+        .enumerate()
+    {
+        fixture.push_two(function, offset as u64 + 2);
+    }
+    let mut frame = fixture.audited(6, 6, &BirthFault);
+    assert!(matches!(
+        frame.audit_for_test().h3_for_test(),
+        H3DispositionEvidence::Clean {
+            staged_max: 8,
+            pending_floor: None
+        }
+    ));
+    let before = fixture.feeds();
+    {
+        let ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        frame.bind_targets(&ports).unwrap();
+    }
+    for _ in 0..128 {
+        fixture.seal_selected_for_batch(&mut frame, true);
+        let progress = fixture.deliver_one_work(&mut frame);
+        for feed in fixture.feeds() {
+            let start = before.iter().find(|old| old.id == feed.id).unwrap();
+            assert_eq!(feed.reduced - start.reduced + feed.staged as u64, 3);
+            assert_eq!(feed.disposed, 0);
+            assert_eq!(
+                feed.fallback,
+                feed.staged == 0,
+                "mode changes only after that feed's entire original suffix"
+            );
+            assert!(!feed.degraded);
+        }
+        if progress == QuantumSealProgress::Complete {
+            break;
+        }
+    }
+    assert!(
+        fixture
+            .feeds()
+            .iter()
+            .all(|feed| feed.staged == 0 && feed.fallback)
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_h3_audit_state(),
+        (2, false)
+    );
+    fixture.finish_bounded_batch(frame, true);
+    for feed in fixture.feeds() {
+        assert_eq!(fixture.s1_counts(feed.id), (4, 1, 1, 0, 0));
+    }
+}
+
+/// Catches inferring a terminal from table.abandoned, disposing an equal-shaped
+/// sibling, or blocking A forever behind the earlier-emitted loss span of B.
+#[test]
+fn key_operation_joint_batch_bounded_loss_keeps_exact_admission_head() {
+    for reverse_head in [false, true] {
+        with_genuine_prior_terminal(
+            reverse_head,
+            true,
+            |fixture, frame, target, complete, lost| {
+                assert_eq!(
+                    complete.function, lost.function,
+                    "same-shaped distinct originals"
+                );
+                assert_ne!(complete.key, lost.key);
+                assert_ne!(complete.ticket, lost.ticket);
+                let seal = frame.active_seal_for_test().unwrap();
+                use crate::semantics_objects::journal::SealReplayPhase;
+                let loss_index = seal
+                    .prefix
+                    .replay_steps()
+                    .iter()
+                    .position(|step| step.phase() == SealReplayPhase::BoundedLoss)
+                    .unwrap();
+                let end_index = seal
+                    .prefix
+                    .replay_steps()
+                    .iter()
+                    .position(|step| step.phase() == SealReplayPhase::End)
+                    .unwrap();
+                assert!(loss_index < end_index);
+                assert_eq!(
+                    complete.key.admission() < lost.key.admission(),
+                    reverse_head
+                );
+                assert!(!seal.effects.effects.iter().any(|effect| matches!(effect,
+                ObjectEffect::Referenced { call, .. } if *call == complete.ticket || *call == lost.ticket)));
+                let before = fixture.feeds();
+                let target_before = before.iter().find(|feed| feed.id == target.id()).unwrap();
+                let base = (target_before.reduced, target_before.disposed);
+                let counts = fixture.s1_counts(target.id());
+                let roles = fixture
+                    .scene
+                    .real
+                    .scene
+                    .coordinator
+                    .joint_capture()
+                    .ledger()
+                    .roles_for_test();
+                assert_eq!(roles[..4], [0, 0, 0, 2]);
+                // The same-shaped originals of a different producer allocation
+                // cannot authorize either loss disposal or actual-End replay.
+                let mut foreign = CanonicalFanoutScene::prior_sealed();
+                let mut remaining = 1;
+                {
+                    let mut ports = foreign
+                        .scene
+                        .real
+                        .scene
+                        .coordinator
+                        .joint_frame_ports(&foreign.scene.producers)
+                        .unwrap();
+                    assert_eq!(
+                        frame.deliver_next_bounded(&mut ports, &mut remaining),
+                        Err(RawQuantumRefusal::ForeignCapture)
+                    );
+                }
+                assert_eq!(remaining, 1);
+                assert_eq!(fixture.feeds(), before);
+                assert_eq!(
+                    fixture
+                        .scene
+                        .real
+                        .scene
+                        .coordinator
+                        .joint_capture()
+                        .ledger()
+                        .roles_for_test(),
+                    roles
+                );
+                let mut done = false;
+                for _ in 0..64 {
+                    let progress = fixture.deliver_one_work(frame);
+                    let feed = fixture
+                        .feeds()
+                        .into_iter()
+                        .find(|feed| feed.id == target.id())
+                        .unwrap();
+                    let (replayed, disposed) = (feed.reduced - base.0, feed.disposed - base.1);
+                    assert_eq!(
+                        replayed + disposed + feed.staged as u64,
+                        2,
+                        "every original is replayed, explicitly disposed, or still owned"
+                    );
+                    assert!(replayed <= 1 && disposed <= 1);
+                    if reverse_head && disposed != 0 {
+                        assert_eq!(
+                            replayed, 1,
+                            "B cannot discard the earlier equal-shaped A head"
+                        );
+                    }
+                    if !reverse_head && replayed != 0 {
+                        assert_eq!(disposed, 1, "A cannot skip the earlier B head");
+                    }
+                    let current = fixture.s1_counts(target.id());
+                    assert_eq!(
+                        current.0 - counts.0,
+                        replayed,
+                        "bounded loss is history disposal, never S1-positive replay"
+                    );
+                    assert!(
+                        fixture
+                            .scene
+                            .real
+                            .scene
+                            .coordinator
+                            .registry()
+                            .keyuse_for_test()
+                            .aggregates()
+                            .iter()
+                            .all(|(key, counters)| key.instance != target.id()
+                                || counters.active == 0)
+                    );
+                    if feed.staged != 0 {
+                        assert_ne!(progress, QuantumSealProgress::Complete);
+                    } else {
+                        assert_eq!((replayed, disposed), (1, 1));
+                        assert_eq!(
+                            current.4,
+                            usize::from(!reverse_head),
+                            "B's later loss must close A's earlier Init, never resurrect it"
+                        );
+                        assert_eq!(current.3 - counts.3, u64::from(reverse_head));
+                        done = true;
+                        break;
+                    }
+                }
+                assert!(
+                    done,
+                    "independent span and exact-head cursors must both progress"
+                );
+                let feeds = fixture.feeds();
+                let s1 = fixture.s1_counts(target.id());
+                let evidence = fixture
+                    .scene
+                    .real
+                    .scene
+                    .coordinator
+                    .registry()
+                    .keyuse_for_test()
+                    .evidence();
+                for _ in 0..3 {
+                    fixture.deliver_one_work(frame);
+                }
+                assert_eq!(fixture.feeds(), feeds);
+                assert_eq!(fixture.s1_counts(target.id()), s1);
+                assert_eq!(
+                    fixture
+                        .scene
+                        .real
+                        .scene
+                        .coordinator
+                        .registry()
+                        .keyuse_for_test()
+                        .evidence(),
+                    evidence,
+                    "consumed loss neither invalidates nor disposes twice"
+                );
+                true
+            },
+        );
+    }
+}
+
+/// Catches a late S1Only provider pinning a Joint sibling's raw head forever,
+/// tainting only the first image, or erasing A's reservation before H9 joins it.
+#[test]
+fn key_operation_s1only_sibling_raw_reaches_terminal() {
+    use crate::semantics_key_use::FeedMode;
+    for sibling_first in [false, true] {
+        let mut fixture = CanonicalFanoutScene::prior_sealed_with_providers(2);
+        let targets = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .joint_feed_targets()
+            .collect::<Vec<_>>();
+        assert_eq!(targets.len(), 2);
+        let before = fixture.feeds();
+        let before_model = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .model()
+            .project();
+        let mut subjects = Vec::new();
+        for target in &targets {
+            let pid = fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .semantic_bindings()
+                .get(target.caller())
+                .unwrap()
+                .pin()
+                .pid();
+            fixture.scene.admit_providers(pid, target.caller(), &[1]);
+            subjects.push((target.caller(), pid));
+        }
+        let mut b_returns = Vec::new();
+        for (offset, function) in ["C_SignInit", "C_SignUpdate", "C_SignFinal"]
+            .into_iter()
+            .enumerate()
+        {
+            for (caller, pid) in &subjects {
+                for (within, file) in if sibling_first { [1, 0] } else { [0, 1] }
+                    .into_iter()
+                    .enumerate()
+                {
+                    let (begin, end) = fixture.scene.encoded(
+                        *pid,
+                        file,
+                        function,
+                        2 + offset as u64 * 2 + within as u64,
+                    );
+                    // Same image/session/mechanism and input handle; only
+                    // actual provider/slot and original invocation differ.
+                    if file == 1 {
+                        b_returns
+                            .push((*caller, u64::from_le_bytes(end[24..32].try_into().unwrap())));
+                    }
+                    fixture.scene.drain.source_mut().push_record(begin.to_vec());
+                    fixture.scene.drain.source_mut().push_record(end.to_vec());
+                }
+            }
+        }
+        let raw = fixture.scene.prepare(12);
+        let inputs: Vec<_> = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .prepared_semantic_batch()
+            .unwrap()
+            .admissions()
+            .map(|input| {
+                (
+                    input.h0_ordinal(),
+                    input.journal_binding().3,
+                    input.s1_facts().ts_ns,
+                    input.collected_origin().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(inputs.len(), 12);
+        let b_ordinals = inputs
+            .iter()
+            .filter(|input| b_returns.contains(&(input.1, input.2)))
+            .map(|input| input.0)
+            .collect::<Vec<_>>();
+        assert_eq!(b_ordinals.len(), 6);
+        let b_originals = subjects
+            .iter()
+            .map(|(caller, _)| {
+                fixture
+                    .scene
+                    .real
+                    .scene
+                    .coordinator
+                    .prepared_semantic_batch()
+                    .unwrap()
+                    .admissions()
+                    .find(|input| {
+                        input.journal_binding().3 == *caller
+                            && b_ordinals.contains(&input.h0_ordinal())
+                    })
+                    .unwrap()
+                    .clone()
+            })
+            .collect::<Vec<_>>();
+        let mut ingested = raw
+            .ingest(
+                fixture
+                    .scene
+                    .real
+                    .scene
+                    .coordinator
+                    .joint_capture_mut()
+                    .adapter_mut(),
+                &fixture.scene.producers,
+                &fixture.grant,
+            )
+            .unwrap_or_else(|(_, reason)| panic!("original sibling raw: {reason:?}"));
+        let coordinator = &mut fixture.scene.real.scene.coordinator;
+        let mut claims = Vec::new();
+        while let Some((ordinal, result)) = coordinator
+            .claim_next_prepared_admission(&fixture.scene.producers, &ingested)
+            .unwrap()
+        {
+            if b_ordinals.contains(&ordinal) {
+                assert_eq!(
+                    result,
+                    Err(crate::semantics_objects::journal::AttestationRefusal::ImageSealed),
+                    "a genuinely late provider never upgrades the already-sealed image"
+                );
+            } else {
+                assert!(result.is_ok());
+            }
+            claims.push(ordinal);
+        }
+        assert_eq!(
+            claims,
+            inputs.iter().map(|input| input.0).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            coordinator
+                .joint_capture()
+                .adapter()
+                .invocation_claims_for_test()
+                .0,
+            6
+        );
+        let starts = coordinator
+            .joint_capture()
+            .adapter()
+            .retained_starts_for_test();
+        let exact_claims = coordinator
+            .joint_capture()
+            .adapter()
+            .invocation_claims_for_test();
+        let exact_roles = coordinator.joint_capture().ledger().roles_for_test();
+        let foreign = SessionDrainProducers::test_pair(
+            fixture.scene.producers.native_domain(),
+            EventsDomain::test_standin(fixture.scene.producers.events_id()),
+        );
+        assert_eq!(
+            coordinator.stage_next_prepared_admission_with_disposition(&foreign, &mut ingested),
+            Err(RawQuantumRefusal::ForeignCapture)
+        );
+        assert_eq!(
+            coordinator
+                .joint_capture()
+                .adapter()
+                .retained_starts_for_test(),
+            starts
+        );
+        assert_eq!(
+            coordinator
+                .joint_capture()
+                .adapter()
+                .invocation_claims_for_test(),
+            exact_claims
+        );
+        assert_eq!(
+            coordinator.joint_capture().ledger().roles_for_test(),
+            exact_roles
+        );
+        assert_eq!(
+            coordinator
+                .prepared_semantic_batch()
+                .unwrap()
+                .admissions()
+                .map(|input| (
+                    input.h0_ordinal(),
+                    input.journal_binding().3,
+                    input.s1_facts().ts_ns,
+                    input.collected_origin().unwrap()
+                ))
+                .collect::<Vec<_>>(),
+            inputs,
+            "foreign allocation cannot mark, stage or substitute any original"
+        );
+        let mut staged = 0;
+        while coordinator
+            .stage_next_prepared_admission_with_disposition(&fixture.scene.producers, &mut ingested)
+            .unwrap()
+        {
+            staged += 1;
+        }
+        assert_eq!(staged, 12);
+        assert_eq!(
+            coordinator
+                .joint_capture()
+                .adapter()
+                .retained_starts_for_test(),
+            starts,
+            "negative association is retained before physical disposal"
+        );
+        assert_eq!(
+            coordinator
+                .joint_capture()
+                .adapter()
+                .invocation_claims_for_test(),
+            exact_claims
+        );
+        assert_eq!(coordinator.joint_capture().model().project(), before_model);
+        assert_eq!(
+            coordinator
+                .prepared_semantic_batch()
+                .unwrap()
+                .admissions()
+                .count(),
+            0
+        );
+        assert!(coordinator.finish_prepared_semantic_batch(&fixture.scene.real.lane));
+        coordinator
+            .commit_batch_with_semantics(false, Some(&mut fixture.scene.real.lane))
+            .unwrap();
+        assert_eq!(
+            coordinator.joint_capture().ledger().roles_for_test()[..4],
+            [0, 12, 0, 6],
+            "marking negative originals must not erase A's source reservation before H9 joins it"
+        );
+        for target in &targets {
+            let a = coordinator
+                .registry()
+                .instance_semantic_edges()
+                .find(|record| record.id == target.id())
+                .unwrap();
+            assert_eq!((a.feed.staged_len(), a.feed.reduced()), (3, 1));
+            assert_eq!(
+                a.semantics.as_ref().unwrap().calls(),
+                1,
+                "A has not escaped through direct fallback"
+            );
+        }
+        let b_ids = coordinator
+            .registry()
+            .instance_semantic_edges()
+            .filter(|record| {
+                subjects.iter().any(|subject| subject.0 == record.caller)
+                    && !targets.iter().any(|target| target.id() == record.id)
+            })
+            .map(|record| record.id)
+            .collect::<Vec<_>>();
+        assert_eq!(b_ids.len(), 2);
+        for id in &b_ids {
+            assert_eq!(
+                coordinator.registry().feed_mode_for_test(*id),
+                Some(FeedMode::S1Only)
+            );
+        }
+        for id in &b_ids {
+            assert_eq!(fixture.s1_counts(*id), (3, 1, 1, 0, 0));
+        }
+        let mut frame = acquire(&mut fixture.scene, ingested, &fixture.attached, &BirthFault);
+        let failure = frame
+            .failure_for_test()
+            .expect("the original unowned sibling effects must be disclosed");
+        assert!(
+            targets
+                .iter()
+                .all(|target| failure.affects_domain(target.bootstrap().domain())),
+            "the second image's original negative cannot be lost behind the first"
+        );
+        for object in &before_model.objects {
+            assert!(failure.effects.effects.iter().any(|effect| matches!(effect,
+                ObjectEffect::Retired { object: retired, .. } if *retired == object.id)));
+            assert_ne!(
+                fixture
+                    .scene
+                    .real
+                    .scene
+                    .coordinator
+                    .joint_capture()
+                    .model()
+                    .project()
+                    .object(object.id)
+                    .unwrap()
+                    .lifetime,
+                Lifetime::Live
+            );
+        }
+        {
+            let ports = fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .joint_frame_ports(&fixture.scene.producers)
+                .unwrap();
+            frame.bind_targets(&ports).unwrap();
+        }
+        fixture.finish_bounded_batch(frame, false);
+        for target in &targets {
+            let feed = fixture
+                .feeds()
+                .into_iter()
+                .find(|feed| feed.id == target.id())
+                .unwrap();
+            let original = before.iter().find(|feed| feed.id == target.id()).unwrap();
+            assert_eq!(
+                feed.reduced - original.reduced + feed.disposed - original.disposed,
+                3
+            );
+            assert_eq!(feed.staged, 0);
+            assert!(
+                feed.fallback || feed.degraded,
+                "loss/refusal remains explicit"
+            );
+        }
+        for id in &b_ids {
+            assert_eq!(
+                fixture.s1_counts(*id),
+                (3, 1, 1, 0, 0),
+                "direct S1 cannot replay during negative disposal"
+            );
+            assert_eq!(
+                fixture
+                    .scene
+                    .real
+                    .scene
+                    .coordinator
+                    .registry()
+                    .feed_mode_for_test(*id),
+                Some(FeedMode::S1Only)
+            );
+        }
+        assert!(
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .registry()
+                .keyuse_for_test()
+                .aggregates()
+                .is_empty(),
+            "neither colliding provider receives object proof after disclosed loss"
+        );
+        let roles = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .ledger()
+            .roles_for_test();
+        for original in &b_originals {
+            assert_eq!(
+                fixture
+                    .scene
+                    .real
+                    .scene
+                    .coordinator
+                    .joint_capture_mut()
+                    .adapter_mut()
+                    .bind_admitted_key(original),
+                Err(crate::semantics_objects::journal::AttestationRefusal::ImageTainted),
+                "a later original/quiet cut cannot heal the unowned affecting image"
+            );
+        }
+        assert_eq!(
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .joint_capture()
+                .ledger()
+                .roles_for_test(),
+            roles
+        );
+        assert_eq!(
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .reference_h3_audit_state(),
+            (2, false)
+        );
+    }
 }

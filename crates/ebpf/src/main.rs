@@ -11,6 +11,35 @@
 #[cfg(all(feature = "inventory-only", feature = "unsafe-unvalidated-metadata"))]
 compile_error!("inventory-only cannot be combined with unsafe-unvalidated-metadata");
 
+#[cfg(any(
+    all(feature = "counter-counts", feature = "counter-timestamps"),
+    all(feature = "counter-counts", feature = "counter-latency"),
+    all(feature = "counter-timestamps", feature = "counter-latency"),
+    all(
+        feature = "counter-broad",
+        not(any(
+            feature = "counter-counts",
+            feature = "counter-timestamps",
+            feature = "counter-latency"
+        ))
+    )
+))]
+compile_error!("exactly one counter measurement flavor is required");
+
+#[cfg(all(
+    feature = "counter-broad",
+    any(
+        feature = "inventory-only",
+        feature = "wide-detailed-2112",
+        feature = "unsafe-unvalidated-metadata",
+        feature = "stub-object-attributes",
+        feature = "small-ring",
+        feature = "small-state-maps",
+        feature = "small-discovery-ring"
+    )
+))]
+compile_error!("private counter artifacts require default FULL capacities");
+
 #[cfg(feature = "inventory-only")]
 mod inventory;
 #[cfg(feature = "inventory-callers")]
@@ -29,6 +58,18 @@ use aya_ebpf::{EbpfContext as _, helpers};
 use core::mem::MaybeUninit;
 #[cfg(feature = "inventory-only")]
 use p11scope_ebpf_common::INVENTORY_DISCOVERY_BYTES;
+#[cfg(not(any(
+    feature = "inventory-only",
+    feature = "counter-counts",
+    feature = "counter-timestamps"
+)))]
+use p11scope_ebpf_common::SlotStats;
+#[cfg(not(any(
+    feature = "inventory-only",
+    feature = "counter-counts",
+    feature = "counter-timestamps"
+)))]
+use p11scope_ebpf_common::bucket_of;
 #[cfg(not(feature = "inventory-only"))]
 use p11scope_ebpf_common::object_capture::{
     alias_capacity_core, alias_scan_core, decode_alias_capacity_layout, decode_alias_skip_layout,
@@ -71,9 +112,9 @@ use p11scope_ebpf_common::{
     FunctionNameKey, ImageIdentity, InstanceContinuity, LOADER_STATE_PRESENT, LinuxLayout,
     MAX_DESCRIPTORS, MAX_MECH_SHAPES, MAX_SLOTS, MECH_NONE, NATIVE_OWNER_SLOT_BOUND, PAUSE_ARMED,
     PAUSE_REQUESTED, PauseKey, RING_BYTES, RV_ENTRIES, RvKey, SESSION_NONE, STACK_GUARD_ENTRIES,
-    START_ENTRIES, STATE_DOMAIN_EXPORT, STATE_DOMAIN_SELECTION, SlotSemantics, SlotStats, StartKey,
+    START_ENTRIES, STATE_DOMAIN_EXPORT, STATE_DOMAIN_SELECTION, SlotSemantics, StartKey,
     StartState, StateKey, TAIL_CALLS_ENTRIES, TAIL_CALLS_INTERFACE_WORKER_SLOT,
-    TAIL_CALLS_NO_PRIVATE_STACK_INDEX, USER_TYPE_NONE, bucket_of, capture, classify_exec_task,
+    TAIL_CALLS_NO_PRIVATE_STACK_INDEX, USER_TYPE_NONE, capture, classify_exec_task,
     classify_task_newtask, cookie_descriptor, cookie_slot, decode_export_attach_cookie,
     discovery_pause_coalesced, discovery_pause_enabled, discovery_state_take_failed,
     discovery_state_take_scope_lost, discovery_table_slots, discovery_usable_prefix,
@@ -93,6 +134,27 @@ use p11scope_ebpf_common::{
 // literal. Changing either without the other corrupts START ownership.
 const _: () = assert!(MAX_SLOTS == NATIVE_OWNER_SLOT_BOUND);
 
+#[cfg(feature = "counter-broad")]
+const _: () = assert!(MAX_SLOTS == 512 && RV_ENTRIES == 4096 && START_ENTRIES == 16384);
+
+#[cfg(feature = "counter-counts")]
+type EndpointStats = p11scope_ebpf_common::CountStats;
+#[cfg(feature = "counter-timestamps")]
+type EndpointStats = p11scope_ebpf_common::TimestampStats;
+#[cfg(not(any(
+    feature = "inventory-only",
+    feature = "counter-counts",
+    feature = "counter-timestamps"
+)))]
+type EndpointStats = SlotStats;
+
+// Fixed private artifact ABI: two sticky per-CPU u64 cells, or 16 bytes per
+// possible CPU in addition to STATS/RV. No loader/accounting path is active.
+#[cfg(feature = "counter-broad")]
+const COUNTER_HEALTH_SATURATED: u32 = 0;
+#[cfg(feature = "counter-broad")]
+const COUNTER_HEALTH_CONTENDED: u32 = 1;
+
 #[map]
 static CONFIG: Array<u64> = Array::with_max_entries(2, BPF_F_RDONLY_PROG);
 
@@ -104,7 +166,11 @@ static CGROUP_FILTER: CgroupArray = CgroupArray::with_max_entries(1, 0);
 
 #[cfg(not(feature = "inventory-only"))]
 #[map]
-static STATS: PerCpuArray<SlotStats> = PerCpuArray::with_max_entries(MAX_SLOTS, 0);
+static STATS: PerCpuArray<EndpointStats> = PerCpuArray::with_max_entries(MAX_SLOTS, 0);
+
+#[cfg(feature = "counter-broad")]
+#[map]
+static COUNTER_HEALTH: PerCpuArray<u64> = PerCpuArray::with_max_entries(2, 0);
 
 #[cfg(not(feature = "inventory-only"))]
 #[map]
@@ -325,20 +391,77 @@ fn stop_gate_leave() {}
 /// Does this call belong to the capture scope? With no filter configured
 /// nothing is observed — scope is always explicit, and system-wide capture
 /// requires the explicit system scope bit (never a missing filter).
-/// Add to one per-CPU counter cell with a non-fetch atomic add. From Linux
+/// Add to one per-CPU counter cell atomically. From Linux
 /// 6.1 uprobe programs run migrate-disabled but preemptible, so another
 /// program can run on this CPU between a plain load and store of the same
 /// per-CPU cell and its increment is lost. The result is deliberately unused:
 /// only the non-fetch BPF ATOMIC ADD lowers on this toolchain (a consumed
-/// fetch-add does not), and the object checker rejects any other counter write.
+/// fetch-add does not). The private counter artifacts instead use the shared
+/// bounded saturating CAS policy and expose sticky loss dispositions.
 #[inline(always)]
 fn counter_add(cell: *mut u64, delta: u64) {
-    // SAFETY: `cell` is a live map-value pointer for this program run.
-    let _ = unsafe {
-        core::intrinsics::atomic_xadd::<u64, u64, { core::intrinsics::AtomicOrdering::AcqRel }>(
-            cell, delta,
-        )
-    };
+    #[cfg(feature = "counter-broad")]
+    {
+        use p11scope_ebpf_common::counter_policy::{CounterUpdate, add_counter_with};
+        // SAFETY: `cell` is a live map-value pointer. Each actual CAS follows
+        // the shared bounded/saturating policy; a preempting writer may share
+        // this CPU, so a plain load/store increment would lose counts.
+        let update = add_counter_with(
+            delta,
+            || unsafe { cell.read_volatile() },
+            |before, after| unsafe {
+                core::intrinsics::atomic_cxchg::<
+                    u64,
+                    { core::intrinsics::AtomicOrdering::AcqRel },
+                    { core::intrinsics::AtomicOrdering::Acquire },
+                >(cell, before, after)
+                .1
+            },
+        );
+        let health = match update {
+            CounterUpdate::Added => None,
+            CounterUpdate::Saturated => Some(COUNTER_HEALTH_SATURATED),
+            CounterUpdate::Contended => Some(COUNTER_HEALTH_CONTENDED),
+        };
+        if let Some(index) = health {
+            if let Some(value) = COUNTER_HEALTH.get_ptr_mut(index) {
+                // Every writer stores the same sticky one; no read clears it.
+                unsafe { value.write_volatile(1) };
+            }
+        }
+    }
+    #[cfg(not(feature = "counter-broad"))]
+    {
+        // Preserve the ordinary/Inventory non-fetch atomic add unchanged.
+        let _ = unsafe {
+            core::intrinsics::atomic_xadd::<u64, u64, { core::intrinsics::AtomicOrdering::AcqRel }>(
+                cell, delta,
+            )
+        };
+    }
+}
+
+#[cfg(all(feature = "counter-broad", not(feature = "counter-counts")))]
+#[inline(always)]
+fn counter_max(cell: *mut u64, candidate: u64) {
+    use p11scope_ebpf_common::counter_policy::{CounterMaxUpdate, max_counter_with};
+    let update = max_counter_with(
+        candidate,
+        || unsafe { cell.read_volatile() },
+        |before, after| unsafe {
+            core::intrinsics::atomic_cxchg::<
+                u64,
+                { core::intrinsics::AtomicOrdering::AcqRel },
+                { core::intrinsics::AtomicOrdering::Acquire },
+            >(cell, before, after)
+            .1
+        },
+    );
+    if matches!(update, CounterMaxUpdate::Contended) {
+        if let Some(value) = COUNTER_HEALTH.get_ptr_mut(COUNTER_HEALTH_CONTENDED) {
+            unsafe { value.write_volatile(1) };
+        }
+    }
 }
 
 fn bump_evidence(index: u32) {
@@ -3237,7 +3360,11 @@ fn owned_discovery_remove(key: &StateKey, required: bool) -> Result<(), ()> {
 fn record_aggregate_start(key: &StartKey) {
     // No image mint, side row or 288-byte scratch: native construction copies
     // the verified zero prefix and writes only this original entry timestamp.
-    if unsafe { p11_owner_start_aggregate(key, helpers::bpf_ktime_get_ns()) } != 1 {
+    #[cfg(feature = "counter-counts")]
+    let timestamp = 0;
+    #[cfg(not(feature = "counter-counts"))]
+    let timestamp = unsafe { helpers::bpf_ktime_get_ns() };
+    if unsafe { p11_owner_start_aggregate(key, timestamp) } != 1 {
         bump_evidence(EVIDENCE_START_INSERT_FAILURES);
     }
 }
@@ -3293,7 +3420,7 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContex
         // add is atomic because a preempting program can share this CPU.
         counter_add(unsafe { core::ptr::addr_of_mut!((*stats).entered) }, 1);
     }
-    if flags & FLAG_POLICY_AGGREGATE != 0 {
+    if cfg!(feature = "counter-broad") || flags & FLAG_POLICY_AGGREGATE != 0 {
         record_aggregate_start(&key);
         return 0;
     }
@@ -3644,6 +3771,12 @@ fn p11_return_impl(ctx: RetProbeContext) -> u32 {
     if start.is_null() {
         return 0;
     }
+    if cfg!(feature = "counter-broad") && unsafe { (*start).object_required } != 0 {
+        owned_start_discard(&key);
+        unsafe { p11_object_fault() };
+        bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
+        return 0;
+    }
     if unsafe { (*start).object_required } == 0 {
         ordinary_return(ctx, &key, start, flags, layout)
     } else {
@@ -3667,24 +3800,39 @@ fn account_return(
     entry_ns: u64,
     layout: LinuxLayout,
 ) -> ReturnAccounting {
+    #[cfg(feature = "counter-counts")]
+    let (now, delta) = (0, 0);
+    #[cfg(feature = "counter-counts")]
+    let _ = entry_ns;
+    #[cfg(not(feature = "counter-counts"))]
     let now = unsafe { helpers::bpf_ktime_get_ns() };
+    #[cfg(not(feature = "counter-counts"))]
     let delta = now.saturating_sub(entry_ns);
     let rv = normalize_target_word(ctx.ret(), layout);
 
     if let Some(stats) = STATS.get_ptr_mut(slot) {
         // SAFETY: a live per-CPU cell; only field addresses are taken. Every
         // sum is an atomic add (a preempting program can share this CPU).
-        // `max_ns` stays a plain best-effort maximum: a lost update can only
-        // keep a smaller maximum, never add or drop a counted call.
+        // Ordinary `max_ns` stays best-effort. Private counter timing uses
+        // the shared bounded exact-maximum policy and sticky health instead.
         unsafe {
             counter_add(core::ptr::addr_of_mut!((*stats).returned), 1);
-            counter_add(core::ptr::addr_of_mut!((*stats).total_ns), delta);
-            if delta > (*stats).max_ns {
-                (*stats).max_ns = delta;
-            }
-            let b = bucket_of(delta) as usize;
-            if b < (*stats).buckets.len() {
-                counter_add(core::ptr::addr_of_mut!((*stats).buckets[b]), 1);
+            #[cfg(not(feature = "counter-counts"))]
+            {
+                counter_add(core::ptr::addr_of_mut!((*stats).total_ns), delta);
+                #[cfg(feature = "counter-broad")]
+                counter_max(core::ptr::addr_of_mut!((*stats).max_ns), delta);
+                #[cfg(not(feature = "counter-broad"))]
+                if delta > (*stats).max_ns {
+                    (*stats).max_ns = delta;
+                }
+                #[cfg(not(feature = "counter-timestamps"))]
+                {
+                    let b = bucket_of(delta) as usize;
+                    if b < (*stats).buckets.len() {
+                        counter_add(core::ptr::addr_of_mut!((*stats).buckets[b]), 1);
+                    }
+                }
             }
             if rv != 0 && rv != 0x204 {
                 counter_add(core::ptr::addr_of_mut!((*stats).errors), 1);
@@ -3787,7 +3935,7 @@ fn ordinary_return(
         return 0;
     }
     let accounting = account_return(ctx, key.slot, start.ts_ns, layout);
-    if flags & FLAG_POLICY_AGGREGATE != 0 {
+    if cfg!(feature = "counter-broad") || flags & FLAG_POLICY_AGGREGATE != 0 {
         return 0;
     }
     let mut image = ImageIdentity::default();

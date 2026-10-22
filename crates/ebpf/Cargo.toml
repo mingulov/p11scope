@@ -8,6 +8,12 @@ publish = false
 [features]
 wide-detailed-2112 = ["p11scope-ebpf-common/wide-detailed-2112"]
 stub-object-attributes = ["p11scope-ebpf-common/stub-object-attributes"]
+# Private fixed-capacity artifacts, never selected by the observer yet.
+# These features do not forward a larger endpoint/RV capacity to common.
+counter-broad = []
+counter-counts = ["counter-broad"]
+counter-timestamps = ["counter-broad"]
+counter-latency = ["counter-broad"]
 inventory-only = []
 inventory-callers = ["inventory-only"]
 small-ring = ["p11scope-ebpf-common/small-ring"]

@@ -235,6 +235,34 @@ fn counter_artifact_mutations_are_causally_rejected() {
         );
         let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(report["mode"], mode);
+        let controls = report["transfer_controls"].as_object().unwrap();
+        assert_eq!(controls.len(), 18);
+        for name in [
+            "ordinary_copy",
+            "full_spill",
+            "saved_call_copy",
+            "health_one_0",
+            "health_one_1",
+        ] {
+            assert_eq!(controls[name], "accepted", "{mode} {name}");
+        }
+        for name in [
+            "movsx8_copy",
+            "movsx16_copy",
+            "movsx32_copy",
+            "mov32_copy",
+            "unknown_destination",
+            "partial_spill",
+            "caller_saved_clobber",
+            "unknown_call",
+            "mixed_pointer_join",
+            "health_zero_0",
+            "health_zero_1",
+            "health_unknown_key",
+            "cumulative_delete",
+        ] {
+            assert_eq!(controls[name], "refused", "{mode} {name}");
+        }
         for mutant in [
             "stats_value_size",
             "stats_endpoint_limit",
@@ -2000,6 +2028,8 @@ fn login_user_type_capture_uses_full_width_finite_policy() {
 /// object-capture globals with constant-layout alias readers; measured with
 /// this actual lexer. Request-cell extraction adds one scalar-only global;
 /// its source pin is measured with that same executable lexer.
+/// The private counter artifact branches are measured with the same lexer;
+/// ordinary emitted-object noninterference remains a separate compiled check.
 #[test]
 fn strip_rust_prose_real_bpf_source_dump_stable() {
     use sha2::{Digest as _, Sha256};
@@ -2009,8 +2039,8 @@ fn strip_rust_prose_real_bpf_source_dump_stable() {
     assert_eq!(
         (stripped.len(), hex.as_str()),
         (
-            116697,
-            "2b68c084142b3dcd17d8caf8cbe64cd8e75e63579f5492fb5196f844f003ed00"
+            120740,
+            "1cd2b7b3b6f61b479549fb805c929f011fdf1147140a5b8f8926de39bae3ed0b"
         ),
         "stripped BPF dump must stay byte-identical"
     );

@@ -38,6 +38,26 @@ enum BpfFlavor {
     Detailed,
     InventoryGlobal,
     InventoryCallers,
+    CounterCounts,
+    CounterTimestamps,
+    CounterLatency,
+}
+
+impl BpfFlavor {
+    fn counters(self) -> bool {
+        matches!(
+            self,
+            Self::CounterCounts | Self::CounterTimestamps | Self::CounterLatency
+        )
+    }
+}
+
+fn counter_artifacts_requested() -> bool {
+    match env::var("P11SCOPE_COUNTER_ARTIFACTS").as_deref() {
+        Err(env::VarError::NotPresent) | Ok("0") => false,
+        Ok("1") => true,
+        _ => panic!("P11SCOPE_COUNTER_ARTIFACTS must be unset, 0 or 1"),
+    }
 }
 
 /// Drops host-only coverage instrumentation from rustflags before they are
@@ -85,6 +105,8 @@ fn strip_coverage_flags(encoded: &str) -> String {
 }
 
 fn main() {
+    // Refuse malformed requests before any compiler or native build work.
+    let counter_artifacts = counter_artifacts_requested();
     semantic_rustc::emit_proof();
     println!("cargo:rerun-if-changed=crates/ebpf/src");
     println!("cargo:rerun-if-changed=crates/ebpf/native/image_identity.c");
@@ -125,6 +147,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=P11SCOPE_SMALL_RING");
     println!("cargo:rerun-if-env-changed=P11SCOPE_SMALL_STATE_MAPS");
     println!("cargo:rerun-if-env-changed=P11SCOPE_SMALL_DISCOVERY_RING");
+    println!("cargo:rerun-if-env-changed=P11SCOPE_COUNTER_ARTIFACTS");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_UNSAFE_UNVALIDATED_METADATA");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_WIDE_DETAILED_2112");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_STUB_OBJECT_ATTRIBUTES");
@@ -153,6 +176,16 @@ fn main() {
     }
     let wide_detailed = env::var_os("CARGO_FEATURE_WIDE_DETAILED_2112").is_some();
     let stub_object_attributes = env::var_os("CARGO_FEATURE_STUB_OBJECT_ATTRIBUTES").is_some();
+    assert!(
+        !counter_artifacts
+            || !(small_ring
+                || small_state_maps
+                || small_discovery_ring
+                || wide_detailed
+                || stub_object_attributes
+                || env::var_os("CARGO_FEATURE_UNSAFE_UNVALIDATED_METADATA").is_some()),
+        "private counter artifacts currently require default FULL capacities without SMALL, WIDE, unsafe or P0"
+    );
 
     for flavor in [
         BpfFlavor::Detailed,
@@ -173,6 +206,29 @@ fn main() {
     // image-identity contract test): adding or changing it cannot alter the
     // three objects above.
     build_identity_object();
+    if counter_artifacts {
+        for flavor in [
+            BpfFlavor::CounterCounts,
+            BpfFlavor::CounterTimestamps,
+            BpfFlavor::CounterLatency,
+        ] {
+            build_variant(flavor, false, false, false, false, false);
+        }
+    }
+    // Consumers use the emitted set, not file presence. Switching back off
+    // cannot expose stale opt-in artifacts and does not delete owning caches.
+    println!(
+        "cargo:rustc-env=P11SCOPE_COUNTER_ARTIFACTS_ENABLED={}",
+        u8::from(counter_artifacts)
+    );
+    println!(
+        "cargo:rustc-env=P11SCOPE_COUNTER_ARTIFACTS_OUTPUTS={}",
+        if counter_artifacts {
+            "counts,timestamps,latency"
+        } else {
+            ""
+        }
+    );
     println!(
         "cargo:rustc-env=P11SCOPE_INVENTORY_VARIANT={}",
         if small_discovery_ring {
@@ -199,10 +255,17 @@ fn build_variant(
     wide_detailed: bool,
     stub_object_attributes: bool,
 ) {
-    let inventory = !matches!(flavor, BpfFlavor::Detailed);
+    let inventory = matches!(
+        flavor,
+        BpfFlavor::InventoryGlobal | BpfFlavor::InventoryCallers
+    );
     let manifest_dir =
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"));
-    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR not set"));
+    let mut out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR not set"));
+    if flavor.counters() {
+        out_dir.push("counter-artifacts");
+        std::fs::create_dir_all(&out_dir).expect("creating private counter artifact output");
+    }
 
     let target = match env::var("CARGO_CFG_TARGET_ENDIAN").as_deref() {
         Ok("big") => "bpfeb-unknown-none",
@@ -222,7 +285,10 @@ fn build_variant(
             "task_owner",
             "exec_task",
         ],
-        BpfFlavor::Detailed => &[
+        BpfFlavor::Detailed
+        | BpfFlavor::CounterCounts
+        | BpfFlavor::CounterTimestamps
+        | BpfFlavor::CounterLatency => &[
             "image_identity",
             "image_identity_fork",
             "image_identity_query",
@@ -239,6 +305,9 @@ fn build_variant(
             BpfFlavor::Detailed => "detailed",
             BpfFlavor::InventoryGlobal => "inventory",
             BpfFlavor::InventoryCallers => "inventory-callers",
+            BpfFlavor::CounterCounts => "counter-counts",
+            BpfFlavor::CounterTimestamps => "counter-timestamps",
+            BpfFlavor::CounterLatency => "counter-latency",
         };
         let bitcode = out_dir.join(format!("{unit}-{suffix}.bc"));
         // The embedded object keeps DWARF/BTF line info. Name the native
@@ -281,6 +350,9 @@ fn build_variant(
         if !inventory && wide_detailed && *unit == "task_owner" {
             compile.arg("-DP11SCOPE_OWNER_SLOT_BOUND=2112U");
         }
+        if flavor.counters() && *unit == "task_owner" {
+            compile.arg("-DP11SCOPE_OWNER_SLOT_BOUND=512U");
+        }
         if !inventory && wide_detailed && *unit == "instance_epoch" {
             compile.arg("-DP11SCOPE_INSTANCE_SLOT_BOUND=2112U");
         }
@@ -309,6 +381,9 @@ fn build_variant(
         BpfFlavor::Detailed => "ebpf-target",
         BpfFlavor::InventoryGlobal => "ebpf-inventory-target",
         BpfFlavor::InventoryCallers => "ebpf-inventory-callers-target",
+        BpfFlavor::CounterCounts => "ebpf-counter-counts-target",
+        BpfFlavor::CounterTimestamps => "ebpf-counter-timestamps-target",
+        BpfFlavor::CounterLatency => "ebpf-counter-latency-target",
     });
     cmd.args([
         "build",
@@ -328,6 +403,9 @@ fn build_variant(
         BpfFlavor::Detailed => {}
         BpfFlavor::InventoryGlobal => features.push("inventory-only"),
         BpfFlavor::InventoryCallers => features.push("inventory-callers"),
+        BpfFlavor::CounterCounts => features.push("counter-counts"),
+        BpfFlavor::CounterTimestamps => features.push("counter-timestamps"),
+        BpfFlavor::CounterLatency => features.push("counter-latency"),
     }
     // P0-only ship vehicle: the Detailed object alone carries attribute
     // adapters, so only it takes the stub feature. Inventory flavors
@@ -492,6 +570,9 @@ fn build_variant(
             BpfFlavor::Detailed => "p11scope-ebpf",
             BpfFlavor::InventoryGlobal => "p11scope-ebpf-inventory",
             BpfFlavor::InventoryCallers => "p11scope-ebpf-inventory-callers",
+            BpfFlavor::CounterCounts => "p11scope-ebpf-counter-counts",
+            BpfFlavor::CounterTimestamps => "p11scope-ebpf-counter-timestamps",
+            BpfFlavor::CounterLatency => "p11scope-ebpf-counter-latency",
         }),
     )
     .unwrap_or_else(|e| panic!("copying {} to OUT_DIR: {e}", built.display()));

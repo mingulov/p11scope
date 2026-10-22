@@ -58,6 +58,42 @@ fn embedded_scalar_helpers_have_exact_linkage_btf_bodies_and_real_calls() {
     );
 }
 
+#[test]
+fn embedded_object_capture_globals_have_exact_scalar_abis_and_calls() {
+    let directory = tempfile::tempdir().expect("temporary scalar object capture mutations");
+    let object = directory.path().join("p11scope-ebpf");
+    std::fs::write(&object, p11scope::EBPF_OBJECT).expect("write actual embedded BPF object");
+    let output = Command::new("python3")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .env("P11SCOPE_OBJECT_CAPTURE_OBJECT", &object)
+        .env(
+            "P11SCOPE_OBJECT_CAPTURE_FULL",
+            if cfg!(feature = "stub-object-attributes") {
+                "0"
+            } else {
+                "1"
+            },
+        )
+        .args([
+            "-I",
+            "tests/python/test_bpf_map_defs.py",
+            "ObjectCaptureGlobalsTests.test_object_capture_globals_linkage_signature_and_calls",
+        ])
+        .output()
+        .expect("run actual scalar capture ABI and call mutations");
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "scalar capture globals: {report}");
+    assert!(report.contains("Ran 1 test"), "zero selection: {report}");
+    assert!(
+        !report.contains("skipped"),
+        "skipped scalar proof: {report}"
+    );
+}
+
 /// Relocation itself is an object transformation. Distinct sentinel descriptors
 /// exercise the real Aya parser/relocator without creating or loading BPF maps.
 #[test]
@@ -119,6 +155,7 @@ fn native_bpf_map_decoder_contracts() {
         "MapDefsTests.test_root_helpers",
         "MapDefsTests.test_json_and_legacy_cli",
         "MapDefsTests.test_runner_guards",
+        "Ia32SpanProofTests.test_saved_sentinel_requires_proven_full_width_register_flow",
     ];
     let output = Command::new("python3")
         .current_dir(env!("CARGO_MANIFEST_DIR"))

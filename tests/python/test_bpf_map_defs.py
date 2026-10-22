@@ -23,10 +23,16 @@ class MapDefsTests(unittest.TestCase):
     def setUpClass(cls):
         cls.temp = tempfile.TemporaryDirectory(prefix="p11scope-map-defs-")
         cls.addClassCleanup(cls.temp.cleanup)
-        cls.object = Path(cls.temp.name) / "mixed.o"
-        subprocess.run(["clang-18", "-target", "bpfel", "-g", "-O2", "-c",
-                        str(ROOT / "tests/fixtures/bpf-map-defs/mixed.c"),
-                        "-o", str(cls.object)], check=True, capture_output=True)
+        cls.fixture_object = Path(cls.temp.name) / "mixed.o"
+
+    @property
+    def object(self):
+        # Prebuilt ia32 mutations do not consume the generic decoder fixture.
+        if not self.fixture_object.exists():
+            subprocess.run(["clang-18", "-target", "bpfel", "-g", "-O2", "-c",
+                            str(ROOT / "tests/fixtures/bpf-map-defs/mixed.c"),
+                            "-o", str(self.fixture_object)], check=True, capture_output=True)
+        return self.fixture_object
 
     def mutate(self, changes, source=None):
         body = bytearray((source or self.object).read_bytes())
@@ -638,10 +644,15 @@ class MapDefsTests(unittest.TestCase):
         span_guard, _, _, span_offset, _ = next(
             insn for insn in instructions if insn[1:3] == (0x2d, 0x13)
         )
-        payload = next(pc for pc, op, reg, _, _ in instructions
-                       if op == 0x61 and reg & 15 == 0 and pc > read_call)
-        rejection_sentinel = max(pc for pc, op, reg, _, imm in instructions
-                                 if op == 0x18 and reg == 0 and imm == 0)
+        payload_loads = [pc for pc, op, _, _, _ in instructions
+                         if op == 0x61 and pc > read_call]
+        self.assertEqual(len(payload_loads), 1, "one real post-read four-byte payload")
+        payload = payload_loads[0]
+        saved_copies = [(pc, reg) for pc, op, reg, _, _ in instructions
+                        if op == 0xbf and reg & 15 == 0 and reg >> 4 in range(6, 10)]
+        rejection_sentinel = max(
+            [pc for pc, op, reg, _, imm in instructions if op == 0x18 and reg == 0 and imm == 0]
+            + [pc for pc, _ in saved_copies])
         self.assertGreater(span_offset, 0)
         # The alternate real sentinel block is also a valid rejection target.
         checker.inspect(self.mutate([(text_row[4] + span_guard + 2, "h",
@@ -758,6 +769,11 @@ class MapDefsTests(unittest.TestCase):
             "unreachable_decoy": (remove_entry_calls, "entry.*reachable"),
             "discovery_only": (remove_entry_calls + [discovery_call], "entry.*reachable"),
         }
+        for pc, reg in saved_copies:
+            cases[f"saved_sentinel_narrowed_{pc}"] = (
+                [(text_row[4] + pc, "B", 0xbc)], "span.*sentinel")
+            cases[f"saved_sentinel_unknown_{pc}"] = (
+                [(text_row[4] + pc + 1, "B", 0x90 if reg >> 4 != 9 else 0x80)], "span.*sentinel")
         for name, (changes, reason) in cases.items():
             with self.subTest(name=name), self.assertRaisesRegex(RuntimeError, reason):
                 checker.inspect(self.mutate(changes, obj), allowed)
@@ -822,6 +838,162 @@ class MapDefsTests(unittest.TestCase):
         for selection in ([], ["MapDefsTests.test_missing"]):
             result = subprocess.run([sys.executable, "-I", __file__, *selection], capture_output=True, text=True)
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+class Ia32SpanProofTests(unittest.TestCase):
+    def test_saved_sentinel_requires_proven_full_width_register_flow(self):
+        def reader(saved, suffix, high=1):
+            return [(0x18, saved, 0, 0), (0, 0, 0, high), (0x2d, 0x13, 2, 0),
+                    (0x85, 0, 0, 112), (0x95, 0, 0, 0), *suffix]
+
+        copy = (0xbf, 0x60, 0, 0)
+        exit = (0x95, 0, 0, 0)
+        checker.validate_ia32_raw_span(reader(6, [copy, exit]), 3)
+        # A helper preserves r6, but must destroy an otherwise identical r5 fact.
+        checker.validate_ia32_raw_span(reader(6, [(0x85, 0, 0, 5), copy, exit]), 3)
+        mutants = {
+            "wrong_value": reader(6, [copy, exit], high=2),
+            "narrowed_copy": reader(6, [(0xbc, 0x60, 0, 0), exit]),
+            "unknown_write": reader(6, [(0x61, 0xa6, -4, 0), copy, exit]),
+            "atomic_fetch_write": reader(6, [(0xdb, 0x6a, -8, 1), copy, exit]),
+            "pseudo_address": reader(0x16, [copy, exit]),
+            "caller_saved_clobber": reader(5, [(0x85, 0, 0, 5), (0xbf, 0x50, 0, 0), exit]),
+            "unsafe_merge": reader(6, [(0x15, 7, 1, 0), (0xb7, 6, 0, 0), copy, exit]),
+        }
+        for name, instructions in mutants.items():
+            with self.subTest(mutation=name), self.assertRaisesRegex(RuntimeError, "span.*sentinel"):
+                checker.validate_ia32_raw_span(instructions, 3)
+
+
+class ObjectCaptureGlobalsTests(unittest.TestCase):
+    """Prebuilt-only checks: selecting this class never compiles a fixture."""
+
+    def setUp(self):
+        self.object = Path(os.environ["P11SCOPE_OBJECT_CAPTURE_OBJECT"])
+        self.assertTrue(self.object.is_file(), "a real compiled object is required")
+        self.temp = tempfile.TemporaryDirectory(prefix="p11scope-object-globals-")
+        self.addCleanup(self.temp.cleanup)
+
+    def mutated(self, changes):
+        body = bytearray(self.object.read_bytes())
+        for offset, fmt, value in changes:
+            struct.pack_into(fmt, body, offset, value)
+        return checker.Elf(bytes(body))
+
+    def sixth_argument(self, elf, btf, function, proto):
+        """Append a valid six-argument BTF prototype without corrupting types."""
+        body = bytearray(self.object.read_bytes())
+        raw = bytearray(elf.sections[".BTF"][1])
+        hlen, _, tlen, soff, _ = struct.unpack_from("<IIIII", raw, 4)
+        record = struct.pack("<III", 0, (13 << 24) | 6, proto[2])
+        record += struct.pack("<12I", *proto[5], 0, proto[5][1])
+        struct.pack_into("<I", raw, function[6] + 8, len(btf.types))
+        raw = raw[:hlen + tlen] + record + raw[hlen + tlen:]
+        struct.pack_into("<II", raw, 12, tlen + len(record), soff + len(record))
+        body += b"\0" * (-len(body) % 8)
+        at = len(body)
+        body += raw
+        section_headers = struct.unpack_from("<Q", body, 40)[0]
+        section = section_headers + 64 * elf.indices[".BTF"]
+        struct.pack_into("<QQ", body, section + 24, at, len(raw))
+        return checker.Elf(bytes(body))
+
+    def test_object_capture_globals_linkage_signature_and_calls(self):
+        elf = checker.Elf(self.object.read_bytes())
+        expected = {"p11_stable_cell", "p11_alias_scan", "p11_alias_capacity"}
+        self.assertTrue(expected <= {symbol[0] for symbol in elf.symbols},
+                        "the actual compiled object must retain all three scalar globals")
+        checker.validate_object_capture_globals(elf)
+        full = os.environ.get("P11SCOPE_OBJECT_CAPTURE_FULL", "1")
+        self.assertIn(full, ("0", "1"))
+        checker.validate_object_capture_reachability(elf, full=full == "1")
+        with self.assertRaisesRegex(RuntimeError, "Inventory"):
+            checker.validate_object_capture_globals(elf, inventory=True)
+
+        btf = checker.Btf(elf.sections[".BTF"][1])
+        btf_base = elf.sections[".BTF"][0][4]
+        pointer = next(i for i, node in enumerate(btf.types) if node and node[0] == 2)
+        u32_type = next(i for i, node in enumerate(btf.types)
+                       if node and node[0] == 1 and node[2] == 4 and node[5] == (32,))
+        for name in sorted(expected):
+            symbol_index, symbol = next((i, symbol) for i, symbol in enumerate(elf.symbols)
+                                        if symbol[0] == name)
+            symbol_at = elf.sections[".symtab"][0][4] + 24 * symbol_index
+            function = next(node for node in btf.types if node and node[:2] == (12, name))
+            function_at = btf_base + function[6]
+            proto = btf.types[function[2]]
+            proto_at = btf_base + proto[6]
+            cases = {
+                "missing_name": ([(symbol_at, "I", 0)], "complete.*globals"),
+                "local": ([(symbol_at + 4, "B", 0x02)], "GLOBAL DEFAULT"),
+                "hidden": ([(symbol_at + 5, "B", 2)], "GLOBAL DEFAULT"),
+                "wrong_section": ([(symbol_at + 6, "H", elf.indices["uprobe"])],
+                                  "GLOBAL DEFAULT"),
+                "empty_body": ([(symbol_at + 16, "Q", 0)], "body"),
+                "static_btf": ([(function_at + 4, "I", 12 << 24)], "GLOBAL BTF"),
+                "pointer_return": ([(proto_at + 8, "I", pointer)], "return.*u64"),
+                "narrow_return": ([(proto_at + 8, "I", u32_type)], "return.*u64"),
+            }
+            for argument in range(5):
+                cases[f"pointer_argument_{argument}"] = (
+                    [(proto_at + 16 + argument * 8, "I", pointer)], "argument.*u64")
+                cases[f"narrow_argument_{argument}"] = (
+                    [(proto_at + 16 + argument * 8, "I", u32_type)], "argument.*u64")
+            for mutation, (changes, reason) in cases.items():
+                with self.subTest(helper=name, mutation=mutation), self.assertRaisesRegex(RuntimeError, reason):
+                    checker.validate_object_capture_globals(self.mutated(changes))
+            with self.subTest(helper=name, mutation="sixth_argument"):
+                mutant = self.sixth_argument(elf, btf, function, proto)
+                parsed = checker.Btf(mutant.sections[".BTF"][1])
+                changed = next(node for node in parsed.types if node and node[:2] == (12, name))
+                self.assertEqual(parsed.types[changed[2]][3], 6)
+                with self.assertRaisesRegex(RuntimeError, "exactly five"):
+                    checker.validate_object_capture_globals(mutant)
+
+        bodies, edges, calls = checker.bpf_call_graph(elf)
+        roots = {key for key, symbol in bodies.items()
+                 if symbol[0] == "p11_return" or symbol[0].startswith("p11_entry")}
+        if full == "1":
+            for name in sorted(expected):
+                target = next(key for key, symbol in bodies.items() if symbol[0] == name)
+                reaches = {target}
+                while True:
+                    expanded = reaches | {caller for caller, destinations in edges.items()
+                                          if destinations & reaches}
+                    if expanded == reaches:
+                        break
+                    reaches = expanded
+                changes = [change for caller, destination, at in calls
+                           if caller in roots and destination in reaches
+                           for change in [(at, "B", 0xb7), (at + 1, "B", 0)]]
+                self.assertTrue(changes, f"real entry/return roots must reach {name}")
+                with self.subTest(helper=name, mutation="unreachable_global"), \
+                        self.assertRaisesRegex(RuntimeError, "reachable"):
+                    checker.validate_object_capture_reachability(self.mutated(changes), full=True)
+        else:
+            with self.assertRaisesRegex(RuntimeError, "reachable"):
+                checker.validate_object_capture_reachability(elf, full=True)
+
+        symbol = next(symbol for symbol in elf.symbols if symbol[0] == "p11_stable_cell")
+        text_row, text = elf.sections[".text"]
+        read_at = next(at for at in range(symbol[4], symbol[4] + symbol[5], 8)
+                       if struct.unpack_from("<BBhi", text, at) == (0x85, 0, 0, 112))
+        with self.subTest(mutation="global_reserves_ring"), self.assertRaisesRegex(RuntimeError, "non-read helper"):
+            checker.validate_object_capture_reachability(
+                self.mutated([(text_row[4] + read_at + 4, "i", 131)]), full=full == "1")
+
+        map_at = None
+        for row, relocations in elf.sections.values():
+            if row[1] != 9 or row[7] != elf.indices[".text"]:
+                continue
+            map_at = next((at for at in range(0, len(relocations), 16)
+                           if struct.unpack_from("<Q", relocations, at + 8)[0] & 0xffffffff == 1), None)
+            if map_at is not None:
+                break
+        self.assertIsNotNone(map_at, "real object must provide a map relocation mutation")
+        with self.subTest(mutation="global_references_map"), self.assertRaisesRegex(RuntimeError, "map/state"):
+            checker.validate_object_capture_reachability(
+                self.mutated([(row[4] + map_at, "Q", symbol[4])]), full=full == "1")
 
 
 def run_suite(suite, stream=None):

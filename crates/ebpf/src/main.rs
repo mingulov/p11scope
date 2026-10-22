@@ -30,7 +30,11 @@ use core::mem::MaybeUninit;
 #[cfg(feature = "inventory-only")]
 use p11scope_ebpf_common::INVENTORY_DISCOVERY_BYTES;
 #[cfg(not(feature = "inventory-only"))]
-use p11scope_ebpf_common::object_capture::{handle_status, object_flag, validate_target_span};
+use p11scope_ebpf_common::object_capture::{
+    alias_capacity_core, alias_scan_core, decode_alias_capacity_layout, decode_alias_skip_layout,
+    decode_stable_kind_layout, handle_status, object_flag, pack_alias_scan, pack_stable_cell,
+    stable_cell_core, stable_cell_poison, validate_target_span,
+};
 #[cfg(not(feature = "inventory-only"))]
 use p11scope_ebpf_common::object_flow::{
     ReturnEventFacts, adapter_attributes_entry, adapter_derive_entry, adapter_emit_find_control,
@@ -2334,6 +2338,94 @@ pub extern "C" fn p11_read_ia32_arg(stack_pointer: u64, index: u32) -> u64 {
     read_ia32_arg_with(stack_pointer, index, |address| unsafe {
         helpers::bpf_probe_read_user(address as *const u32).map_err(|_| ())
     })
+}
+
+// Stable-cell global boundary (E1a): classify one authorized value plus its
+// header recheck behind a scalar-only subprogram the verifier explores once
+// instead of once per capture-loop call-site state. Five scalar arguments in,
+// one packed scalar out; the root reservation stays local (the caller
+// publishes the unpacked facts). Reads, order, and failure priority are the
+// shared `stable_cell_core` sequence with BPF-local readers bound inside.
+#[cfg(not(feature = "inventory-only"))]
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub extern "C" fn p11_stable_cell(
+    base: u64,
+    index: u64,
+    kind_layout: u64,
+    ptr: u64,
+    len: u64,
+) -> u64 {
+    let Some((kind, layout)) = decode_stable_kind_layout(kind_layout) else {
+        return stable_cell_poison();
+    };
+    let (status, value, write_value, contrib) = stable_cell_core(
+        base,
+        index,
+        kind,
+        ptr,
+        len,
+        layout,
+        &mut |address| read_word(address, layout),
+        &mut |address, buf| read_bytes_user(address, buf, layout),
+    );
+    pack_stable_cell(status, value, write_value, contrib)
+}
+
+// Neighbor-rescan global boundary (E1b): the per-value bounded header rescan
+// as a scalar-only subprogram the verifier explores once instead of once per
+// entry-loop call-site state. Five scalar arguments in (the skip index shares
+// its argument with the layout tag), one packed scalar out; no reads are
+// dropped, added, or reordered (the shared `alias_scan_core` sequence with a
+// BPF-local reader bound inside).
+#[cfg(not(feature = "inventory-only"))]
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub extern "C" fn p11_alias_scan(base: u64, count: u64, skip_tag: u64, ptr: u64, len: u64) -> u64 {
+    let (skip, layout) = decode_alias_skip_layout(skip_tag);
+    // Bind the word width before the loop so its W/2W/3W address facts do
+    // not each occupy a spill slot across the selected header reads.
+    let (alias, flags) = match layout {
+        LinuxLayout::Lp64 => alias_scan_core(
+            base,
+            count,
+            skip,
+            ptr,
+            len,
+            LinuxLayout::Lp64,
+            &mut |address| read_word(address, LinuxLayout::Lp64),
+        ),
+        LinuxLayout::Ilp32 => alias_scan_core(
+            base,
+            count,
+            skip,
+            ptr,
+            len,
+            LinuxLayout::Ilp32,
+            &mut |address| read_word(address, LinuxLayout::Ilp32),
+        ),
+    };
+    pack_alias_scan(alias, flags)
+}
+
+// Retained-capacity global boundary (E1c): the return loop's per-neighbor
+// span check as a pure scalar subprogram the verifier explores once. Five
+// scalar arguments in (the layout crosses as its word width), one scalar
+// verdict out; no helper calls inside.
+#[cfg(not(feature = "inventory-only"))]
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub extern "C" fn p11_alias_capacity(
+    ptr: u64,
+    len: u64,
+    other_ptr: u64,
+    other_cap: u64,
+    wb: u64,
+) -> u64 {
+    let Some(layout) = decode_alias_capacity_layout(wb) else {
+        return 0;
+    };
+    u64::from(alias_capacity_core(ptr, len, other_ptr, other_cap, layout))
 }
 
 #[cfg(not(feature = "inventory-only"))]

@@ -367,6 +367,9 @@ pub fn spans_overlap(a_base: u64, a_len: u64, b_base: u64, b_len: u64) -> bool {
 }
 
 /// Checked addresses of one header's `{type, pValue, ulValueLen}` words.
+// Keep the checked tuple inside scalar capture globals. An outlined sret
+// buffer adds both a frame and a call level to the bounded BPF chains.
+#[inline(always)]
 pub fn attribute_header_addresses(
     base: u64,
     index: u64,
@@ -421,6 +424,33 @@ fn kind_from_code(code: u8) -> Option<SafeAttributeKind> {
     }
 }
 
+/// Slot-kind membership for scans that need selectedness only, not the
+/// decoded kind. Codes run consecutive 1..=6 from `attr_kind::CLASS`
+/// (pinned by `slot_kind_codes_stay_consecutive_from_class`); 0 marks
+/// unused slots and anything above refuses. One subtract-and-compare
+/// instead of a seven-arm match.
+#[inline(always)]
+fn slot_kind_selected(code: u8) -> bool {
+    code.wrapping_sub(attr_kind::CLASS) < 6
+}
+
+/// The single exact wire selector for a decoded kind (inverse of
+/// `safe_attribute_kind`'s injective mapping, pinned by
+/// `selector_for_kind_inverts_policy_mapping`). Comparing the reread
+/// selector directly avoids redecoding a wide word plus an Option
+/// comparison on the streamed return path.
+#[inline(always)]
+fn selector_for_kind(kind: SafeAttributeKind) -> u64 {
+    match kind {
+        SafeAttributeKind::Class => 0x0000,
+        SafeAttributeKind::KeyType => 0x0100,
+        SafeAttributeKind::Token => 0x0001,
+        SafeAttributeKind::ValueLen => 0x0161,
+        SafeAttributeKind::ModulusBits => 0x0121,
+        SafeAttributeKind::EcParams => 0x0180,
+    }
+}
+
 fn safe_curve_code(curve: SafeCurve) -> u16 {
     match curve {
         SafeCurve::Secp256r1 => 1,
@@ -463,8 +493,21 @@ fn read_classified_value(
             if len != 7 && len != 10 {
                 return Err(attr_status::INVALID_LENGTH);
             }
-            let mut buf = [0u8; 10];
-            let buf = &mut buf[..len as usize];
+            // Keep this fixed initialization in the scalar reader's frame:
+            // a synthesized memset adds a level to the BPF return chain.
+            let mut storage = core::mem::MaybeUninit::<[u8; 10]>::uninit();
+            // SAFETY: the ten byte stores initialize every array element
+            // before a reference is formed; this byte array has no padding.
+            let buf = unsafe {
+                let bytes = storage.as_mut_ptr().cast::<u8>();
+                for index in 0..10 {
+                    bytes.add(index).write_volatile(0);
+                }
+                storage.assume_init_mut()
+            };
+            let buf = buf
+                .get_mut(..len as usize)
+                .ok_or(attr_status::INVALID_LENGTH)?;
             read_bytes(ptr, buf).map_err(|()| attr_status::UNREADABLE)?;
             let curve = classify_ec_params(buf).ok_or(attr_status::UNSUPPORTED)?;
             Ok(safe_curve_code(curve))
@@ -1659,12 +1702,67 @@ pub fn capture_get_return(
     outcome
 }
 
+/// BPF-global alias-scan boundary (E1b): the per-value neighbor rescan as a
+/// scalar-only subprogram verified once, called from the entry loops. Five
+/// scalar arguments in, one packed scalar out (see `pack_alias_scan`); the
+/// skip index shares its argument with the layout tag (see
+/// `encode_alias_skip_layout`).
+#[cfg(target_arch = "bpf")]
+unsafe extern "C" {
+    fn p11_alias_scan(base: u64, count: u64, skip_tag: u64, ptr: u64, len: u64) -> u64;
+}
+
+/// Pack one alias-scan outcome: the alias verdict plus list flags.
+#[inline(always)]
+pub fn pack_alias_scan(alias: bool, flags: u8) -> u64 {
+    u64::from(alias) | ((flags as u64) << 8)
+}
+
+/// Inverse of `pack_alias_scan` (pinned by `alias_scan_pack_roundtrips`).
+#[inline(always)]
+pub fn unpack_alias_scan(packed: u64) -> (bool, u8) {
+    (packed & 1 != 0, (packed >> 8) as u8)
+}
+
+/// Layout tag bit inside the shared skip argument.
+const ALIAS_SKIP_TAG_BIT: u64 = 1 << 63;
+/// Skip-index payload inside the shared skip argument.
+const ALIAS_SKIP_VALUE_MASK: u64 = ALIAS_SKIP_TAG_BIT - 1;
+
+/// Encode the skip index plus target layout into one scalar argument: the
+/// layout tag in the top bit, the skip index in the low 63. Exact for every
+/// skip the roots produce (`i < 8`, or `u64::MAX` for no skip): the scan only
+/// compares `j != skip` with `j < 8`, so the decoded `2^63 - 1` behaves
+/// exactly like `u64::MAX` (pinned by `alias_skip_layout_codec_roundtrips`).
+#[inline(always)]
+#[cfg_attr(not(target_arch = "bpf"), allow(dead_code))]
+fn encode_alias_skip_layout(skip: u64, layout: LinuxLayout) -> u64 {
+    let tag = match layout {
+        LinuxLayout::Lp64 => 0,
+        LinuxLayout::Ilp32 => ALIAS_SKIP_TAG_BIT,
+    };
+    (skip & ALIAS_SKIP_VALUE_MASK) | tag
+}
+
+/// Decode `encode_alias_skip_layout`. Total: every input decodes.
+#[inline(always)]
+pub fn decode_alias_skip_layout(code: u64) -> (u64, LinuxLayout) {
+    let layout = if code & ALIAS_SKIP_TAG_BIT == 0 {
+        LinuxLayout::Lp64
+    } else {
+        LinuxLayout::Ilp32
+    };
+    (code & ALIAS_SKIP_VALUE_MASK, layout)
+}
+
 /// Scan bounded selected header spans without reading values. A reread keeps
 /// request inspection scalar: rejected-length neighbors still protect their
 /// entire stated span. Unknown selectors never authorize pointer/length reads.
+/// Shared core behind `request_alias_scan` and the BPF `p11_alias_scan`
+/// global (equivalence pinned by `alias_scan_packed_matches_direct`).
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-fn request_alias_scan(
+pub fn alias_scan_core(
     base: u64,
     count: u64,
     skip: u64,
@@ -1703,8 +1801,7 @@ fn request_alias_scan(
                         };
                         match read_word(len_addr) {
                             Ok(other_len) => {
-                                if other_ptr != 0
-                                    && other_len != 0
+                                if (other_ptr | other_len) != 0
                                     && validate_target_span(other_ptr, other_len, layout).is_some()
                                     && spans_overlap(ptr, len, other_ptr, other_len)
                                 {
@@ -1726,8 +1823,286 @@ fn request_alias_scan(
     (alias, flags)
 }
 
+/// Host-testable packed form of the BPF global boundary: decode, run the
+/// shared core with an injected reader, pack. The BPF `p11_alias_scan` global
+/// is this same sequence with a BPF-local reader bound inside.
+#[inline(always)]
+pub fn alias_scan_packed(
+    base: u64,
+    count: u64,
+    skip_tag: u64,
+    ptr: u64,
+    len: u64,
+    read_word: &mut impl FnMut(u64) -> Result<u64, ()>,
+) -> u64 {
+    let (skip, layout) = decode_alias_skip_layout(skip_tag);
+    let (alias, flags) = alias_scan_core(base, count, skip, ptr, len, layout, read_word);
+    pack_alias_scan(alias, flags)
+}
+
+/// Bounded neighbor rescan. On the BPF target this calls the `p11_alias_scan`
+/// global (scalar-only, verified once); on host it runs the shared core
+/// directly. Both publish identically.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn request_alias_scan(
+    base: u64,
+    count: u64,
+    skip: u64,
+    ptr: u64,
+    len: u64,
+    layout: LinuxLayout,
+    #[cfg_attr(target_arch = "bpf", allow(unused_variables))] read_word: &mut impl FnMut(
+        u64,
+    ) -> Result<
+        u64,
+        (),
+    >,
+) -> (bool, u8) {
+    #[cfg(target_arch = "bpf")]
+    {
+        let packed = unsafe {
+            p11_alias_scan(
+                base,
+                count,
+                encode_alias_skip_layout(skip, layout),
+                ptr,
+                len,
+            )
+        };
+        unpack_alias_scan(packed)
+    }
+    #[cfg(not(target_arch = "bpf"))]
+    {
+        alias_scan_core(base, count, skip, ptr, len, layout, read_word)
+    }
+}
+
+/// BPF-global stable-cell boundary (E1a): a scalar-only subprogram verified
+/// once and called from both capture loops, instead of an inlined body
+/// re-verified per call-site state. Declared here on the BPF target only;
+/// defined in the BPF crate root next to the probe readers. No reservation,
+/// stack, or closure pointer crosses: five scalar arguments in, one packed
+/// scalar out (see `pack_stable_cell`).
+#[cfg(target_arch = "bpf")]
+unsafe extern "C" {
+    fn p11_stable_cell(base: u64, index: u64, kind_layout: u64, ptr: u64, len: u64) -> u64;
+}
+
+/// Pack one stable-cell outcome into the scalar the global boundary returns:
+/// status, value, whether the value cell is written, contributed flags.
+#[inline(always)]
+pub fn pack_stable_cell(status: u8, value: u16, write_value: bool, contrib: u32) -> u64 {
+    (status as u64)
+        | ((value as u64) << 8)
+        | ((u64::from(write_value)) << 24)
+        | ((contrib as u64) << 32)
+}
+
+/// Inverse of `pack_stable_cell` (pinned by `stable_cell_pack_roundtrips`).
+#[inline(always)]
+pub fn unpack_stable_cell(packed: u64) -> (u8, u16, bool, u32) {
+    (
+        packed as u8,
+        (packed >> 8) as u16,
+        (packed >> 24) & 1 != 0,
+        (packed >> 32) as u32,
+    )
+}
+
+/// Encode the kind plus target layout into one scalar argument: the kind code
+/// in the low byte, the layout tag above it. Production use is the BPF
+/// wrapper only; host builds exercise it through tests.
+#[inline(always)]
+#[cfg_attr(not(target_arch = "bpf"), allow(dead_code))]
+fn encode_stable_kind_layout(kind: SafeAttributeKind, layout: LinuxLayout) -> u64 {
+    let tag = match layout {
+        LinuxLayout::Lp64 => 0u64,
+        LinuxLayout::Ilp32 => 1u64,
+    };
+    (tag << 8) | u64::from(safe_kind_code(kind))
+}
+
+/// Decode `encode_stable_kind_layout`; anything else is a poison input the
+/// roots never produce (see `stable_cell_poison`).
+#[inline(always)]
+pub fn decode_stable_kind_layout(code: u64) -> Option<(SafeAttributeKind, LinuxLayout)> {
+    if code >> 8 > 1 {
+        return None;
+    }
+    let kind = kind_from_code(code as u8)?;
+    let layout = if code >> 8 == 1 {
+        LinuxLayout::Ilp32
+    } else {
+        LinuxLayout::Lp64
+    };
+    Some((kind, layout))
+}
+
+/// Unreachable-from-roots fallback for undecodable global arguments: publish
+/// nothing, contribute nothing, keep any prior cell value.
+#[inline(always)]
+pub fn stable_cell_poison() -> u64 {
+    pack_stable_cell(attr_status::UNREADABLE, 0, false, 0)
+}
+
 /// Read exactly one already-authorized value, then recheck its header before
 /// publishing the finite classification. No target word is stored in output.
+/// Returns the outcome facts; the `stable_attribute_cell` wrapper and the BPF
+/// global publish them identically (pinned by `stable_cell_packed_matches_direct`).
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub fn stable_cell_core(
+    base: u64,
+    index: u64,
+    kind: SafeAttributeKind,
+    ptr: u64,
+    len: u64,
+    layout: LinuxLayout,
+    read_word: &mut impl FnMut(u64) -> Result<u64, ()>,
+    read_bytes: &mut impl FnMut(u64, &mut [u8]) -> Result<(), ()>,
+) -> (u8, u16, bool, u32) {
+    let classified = read_classified_value(kind, ptr, len, layout, read_word, read_bytes);
+    let value = match classified {
+        Ok(value) => value,
+        Err(attr_status::UNSUPPORTED) => 0,
+        Err(status) => return (status, 0, false, 0),
+    };
+    let Some((sel_addr, ptr_addr, len_addr)) = attribute_header_addresses(base, index, layout)
+    else {
+        return (attr_status::INVALID_SPAN, 0, false, 0);
+    };
+    // Complete every recheck read before comparing anything: operands reload
+    // from stack, nothing stays live in call-clobbered registers across the
+    // helper calls (the LLVM BPF backend miscompiles outlined
+    // compare-across-call shapes with `R1 !read_ok`; M5). Read order and
+    // failure priority are unchanged.
+    let sel_word = read_word(sel_addr);
+    let ptr_word = read_word(ptr_addr);
+    let len_word = read_word(len_addr);
+    let (selector_read, selector_same) = match sel_word {
+        Ok(sel) => (true, safe_attribute_kind(sel) == Some(kind)),
+        Err(()) => (false, false),
+    };
+    let (pointer_read, pointer_same) = match ptr_word {
+        Ok(ptr2) => (true, ptr2 == ptr),
+        Err(()) => (false, false),
+    };
+    let (length_read, length_same) = match len_word {
+        Ok(len2) => (true, len2 == len),
+        Err(()) => (false, false),
+    };
+    if !selector_read || !pointer_read || !length_read {
+        (attr_status::UNREADABLE, 0, false, 0)
+    } else if !selector_same || !pointer_same || !length_same {
+        (
+            attr_status::CHANGED,
+            0,
+            false,
+            object_flag::CHANGED_METADATA,
+        )
+    } else if classified.is_ok() {
+        (attr_status::VALUE, value, true, 0)
+    } else {
+        (attr_status::UNSUPPORTED, 0, true, 0)
+    }
+}
+
+/// BPF-global alias-capacity boundary (E1c): the return loop's per-neighbor
+/// retained-capacity check as a pure scalar subprogram verified once. Five
+/// scalar arguments in (the target layout crosses as its word width), one
+/// scalar verdict out. The loop skeleton (slot loads, selectedness break,
+/// self skip) stays in the caller; only the wide span facts move.
+#[cfg(target_arch = "bpf")]
+unsafe extern "C" {
+    fn p11_alias_capacity(ptr: u64, len: u64, other_ptr: u64, other_cap: u64, wb: u64) -> u64;
+}
+
+/// Decode the word-width layout tag; anything else is a poison input the
+/// roots never produce (the capacity verdict is then "no alias").
+#[inline(always)]
+pub fn decode_alias_capacity_layout(wb: u64) -> Option<LinuxLayout> {
+    match wb {
+        4 => Some(LinuxLayout::Ilp32),
+        8 => Some(LinuxLayout::Lp64),
+        _ => None,
+    }
+}
+
+/// Whether one retained neighbor capacity aliases the value span. Pure scalar
+/// core behind `alias_capacity_hit` and the BPF `p11_alias_capacity` global
+/// (equivalence pinned by `alias_capacity_packed_matches_direct`).
+#[inline(always)]
+pub fn alias_capacity_core(
+    ptr: u64,
+    len: u64,
+    other_ptr: u64,
+    other_cap: u64,
+    layout: LinuxLayout,
+) -> bool {
+    (other_ptr | other_cap) != 0
+        && validate_target_span(other_ptr, other_cap, layout).is_some()
+        && spans_overlap(ptr, len, other_ptr, other_cap)
+}
+
+/// Host-testable form of the BPF global boundary: decode, run the shared
+/// core, return the verdict scalar. The BPF `p11_alias_capacity` global is
+/// this same sequence.
+#[inline(always)]
+pub fn alias_capacity_packed(ptr: u64, len: u64, other_ptr: u64, other_cap: u64, wb: u64) -> u64 {
+    let Some(layout) = decode_alias_capacity_layout(wb) else {
+        return 0;
+    };
+    u64::from(alias_capacity_core(ptr, len, other_ptr, other_cap, layout))
+}
+
+/// Per-neighbor capacity verdict. On the BPF target this calls the
+/// `p11_alias_capacity` global (scalar-only, verified once); on host it runs
+/// the shared core directly. Both agree.
+#[inline(always)]
+fn alias_capacity_hit(
+    ptr: u64,
+    len: u64,
+    other_ptr: u64,
+    other_cap: u64,
+    layout: LinuxLayout,
+) -> bool {
+    #[cfg(target_arch = "bpf")]
+    {
+        unsafe {
+            p11_alias_capacity(ptr, len, other_ptr, other_cap, layout.word_bytes() as u64) != 0
+        }
+    }
+    #[cfg(not(target_arch = "bpf"))]
+    {
+        alias_capacity_core(ptr, len, other_ptr, other_cap, layout)
+    }
+}
+
+/// Host-testable packed form of the BPF global boundary: decode, run the
+/// shared core with injected readers, pack. The BPF `p11_stable_cell` global
+/// is this same sequence with BPF-local readers bound inside.
+#[inline(always)]
+pub fn stable_cell_packed(
+    base: u64,
+    index: u64,
+    kind_layout: u64,
+    ptr: u64,
+    len: u64,
+    read_word: &mut impl FnMut(u64) -> Result<u64, ()>,
+    read_bytes: &mut impl FnMut(u64, &mut [u8]) -> Result<(), ()>,
+) -> u64 {
+    let Some((kind, layout)) = decode_stable_kind_layout(kind_layout) else {
+        return stable_cell_poison();
+    };
+    let (status, value, write_value, contrib) =
+        stable_cell_core(base, index, kind, ptr, len, layout, read_word, read_bytes);
+    pack_stable_cell(status, value, write_value, contrib)
+}
+
+/// Publish one stable cell. On the BPF target this calls the `p11_stable_cell`
+/// global (scalar-only, verified once); on host it runs the shared core
+/// directly. Both publish identically.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 fn stable_attribute_cell(
@@ -1738,51 +2113,49 @@ fn stable_attribute_cell(
     len: u64,
     layout: LinuxLayout,
     out: &mut ObjectAttributeWire,
-    read_word: &mut impl FnMut(u64) -> Result<u64, ()>,
-    read_bytes: &mut impl FnMut(u64, &mut [u8]) -> Result<(), ()>,
+    #[cfg_attr(target_arch = "bpf", allow(unused_variables))] read_word: &mut impl FnMut(
+        u64,
+    ) -> Result<
+        u64,
+        (),
+    >,
+    #[cfg_attr(target_arch = "bpf", allow(unused_variables))] read_bytes: &mut impl FnMut(
+        u64,
+        &mut [u8],
+    )
+        -> Result<
+        (),
+        (),
+    >,
 ) -> u32 {
-    let classified = read_classified_value(kind, ptr, len, layout, read_word, read_bytes);
-    let value = match classified {
-        Ok(value) => value,
-        Err(attr_status::UNSUPPORTED) => 0,
-        Err(status) => {
-            out.status = status;
-            return 0;
-        }
-    };
-    let Some((sel_addr, ptr_addr, len_addr)) = attribute_header_addresses(base, index, layout)
-    else {
-        out.status = attr_status::INVALID_SPAN;
-        return 0;
-    };
-    // Read every recheck word in the same order, but retain only finite
-    // comparison facts instead of three full Result<u64> payloads at once.
-    let (selector_read, selector_same) = match read_word(sel_addr) {
-        Ok(sel) => (true, safe_attribute_kind(sel) == Some(kind)),
-        Err(()) => (false, false),
-    };
-    let (pointer_read, pointer_same) = match read_word(ptr_addr) {
-        Ok(ptr2) => (true, ptr2 == ptr),
-        Err(()) => (false, false),
-    };
-    let (length_read, length_same) = match read_word(len_addr) {
-        Ok(len2) => (true, len2 == len),
-        Err(()) => (false, false),
-    };
-    if !selector_read || !pointer_read || !length_read {
-        out.status = attr_status::UNREADABLE;
-    } else if !selector_same || !pointer_same || !length_same {
-        out.status = attr_status::CHANGED;
-        return object_flag::CHANGED_METADATA;
-    } else {
-        out.status = if classified.is_ok() {
-            attr_status::VALUE
-        } else {
-            attr_status::UNSUPPORTED
+    #[cfg(target_arch = "bpf")]
+    {
+        let packed = unsafe {
+            p11_stable_cell(
+                base,
+                index,
+                encode_stable_kind_layout(kind, layout),
+                ptr,
+                len,
+            )
         };
-        out.value = value;
+        let (status, value, write_value, contrib) = unpack_stable_cell(packed);
+        out.status = status;
+        if write_value {
+            out.value = value;
+        }
+        contrib
     }
-    0
+    #[cfg(not(target_arch = "bpf"))]
+    {
+        let (status, value, write_value, contrib) =
+            stable_cell_core(base, index, kind, ptr, len, layout, read_word, read_bytes);
+        out.status = status;
+        if write_value {
+            out.value = value;
+        }
+        contrib
+    }
 }
 
 // Volatile field stores keep list clearing leaf-flat on BPF. A synthesized
@@ -1874,7 +2247,9 @@ pub fn inspect_request_template_into(
             i += 1;
             continue;
         };
-        let cell = &mut out.cells[i as usize];
+        let Some(cell) = out.cells.get_mut(i as usize) else {
+            break;
+        };
         cell.kind = safe_kind_code(kind);
         let ptr = match read_word(ptr_addr) {
             Ok(ptr) => ptr,
@@ -2098,7 +2473,7 @@ pub fn capture_get_return_into(
             k += 1;
             continue;
         };
-        if safe_attribute_kind(sel) != Some(kind) {
+        if sel != selector_for_kind(kind) {
             cell.status = attr_status::CHANGED;
             contributed |= object_flag::CHANGED_METADATA;
         } else if slot.value_ptr == 0 {
@@ -2125,14 +2500,11 @@ pub fn capture_get_return_into(
             let mut j = 0;
             while j < 8 {
                 let other = &side.slots[j];
-                if kind_from_code(other.kind).is_none() {
+                if !slot_kind_selected(other.kind) {
                     break;
                 }
                 if j != k
-                    && other.value_ptr != 0
-                    && other.entry_capacity != 0
-                    && validate_target_span(other.value_ptr, other.entry_capacity, layout).is_some()
-                    && spans_overlap(ptr, len, other.value_ptr, other.entry_capacity)
+                    && alias_capacity_hit(ptr, len, other.value_ptr, other.entry_capacity, layout)
                 {
                     alias = true;
                 }

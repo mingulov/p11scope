@@ -27,5 +27,6 @@ path = "src/main.rs"
 panic = "abort"
 lto = true
 codegen-units = 1
+opt-level = "s"
 
 [workspace]

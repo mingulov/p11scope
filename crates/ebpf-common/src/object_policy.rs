@@ -28,6 +28,7 @@ pub enum SafeCurve {
 }
 
 /// Compare the entire target word; excluded/unknown selectors gain no reads.
+#[inline(always)]
 pub const fn safe_attribute_kind(raw: u64) -> Option<SafeAttributeKind> {
     match raw {
         0x0000 => Some(SafeAttributeKind::Class),

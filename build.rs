@@ -412,6 +412,15 @@ fn build_variant(
             "link-arg=--export=p11_instance_return",
             "-C",
             "link-arg=--export=p11_instance_exec",
+            // E1a: Rust stable-cell global (defined in the BPF crate root).
+            "-C",
+            "link-arg=--export=p11_stable_cell",
+            // E1b: Rust alias-scan global (defined in the BPF crate root).
+            "-C",
+            "link-arg=--export=p11_alias_scan",
+            // E1c: Rust alias-capacity global (defined in the BPF crate root).
+            "-C",
+            "link-arg=--export=p11_alias_capacity",
         ] {
             append_flag(flag);
         }

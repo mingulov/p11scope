@@ -391,6 +391,9 @@ REQUIRED_GLOBAL_HELPERS = frozenset({
 })
 REQUIRED_GLOBAL_OWNER_HELPERS = frozenset({"p11_owner_lease", "p11_owner_refund"})
 REQUIRED_GLOBAL_SCALAR_HELPERS = frozenset({"p11_read_ia32_arg"})
+OBJECT_CAPTURE_GLOBAL_HELPERS = frozenset({
+    "p11_stable_cell", "p11_alias_scan", "p11_alias_capacity",
+})
 REQUIRED_GLOBAL_EXEC_HELPERS = frozenset({"p11_exec_dumpability"})
 REQUIRED_LOCAL_OWNER_HELPERS = frozenset({
     "p11_owner_cleanup", "p11_owner_start_get",
@@ -697,12 +700,171 @@ def validate_diagnostic_helper_linkage(elf):
                 f"diagnostic helper {name} lacks GLOBAL BTF FUNC linkage")
 
 
-def validate_ia32_span_paths(graph, entry, guard, rejected, read, updates, exits):
+def validate_object_capture_globals(elf, inventory=False):
+    """Recognize only the complete scalar Detailed boundary, never Inventory."""
+    selected = [symbol for symbol in elf.symbols if symbol[0] in OBJECT_CAPTURE_GLOBAL_HELPERS]
+    if inventory and selected:
+        raise RuntimeError("Inventory contains object capture globals")
+    if not selected:
+        return
+    if (len(selected) != len(OBJECT_CAPTURE_GLOBAL_HELPERS)
+            or {symbol[0] for symbol in selected} != OBJECT_CAPTURE_GLOBAL_HELPERS):
+        raise RuntimeError("object capture requires the complete unique set of globals")
+    if ".BTF" not in elf.sections or ".BTF.ext" not in elf.sections:
+        raise RuntimeError("object capture globals require BTF and BTF.ext")
+    btf = Btf(elf.sections[".BTF"][1])
+    ext = elf.sections[".BTF.ext"][1]
+    magic, version, flags, hlen, off, length = struct.unpack(
+        "<HBBIII", checked_slice(ext, 0, 16, "BTF.ext function info header"))
+    if (magic, version, flags, hlen) != (0xeb9f, 1, 0, 32):
+        raise RuntimeError("unsupported BTF.ext function info header")
+    raw = checked_slice(ext, hlen + off, length, "BTF.ext function info")
+    stride, = struct.unpack("<I", checked_slice(raw, 0, 4, "function info stride"))
+    if stride != 8:
+        raise RuntimeError("unsupported function info stride")
+    info_relocations = {}
+    for row, relocations in elf.sections.values():
+        if row[1] == 9 and row[7] == elf.indices[".BTF.ext"]:
+            for pos in range(0, len(relocations), 16):
+                address, info = struct.unpack_from("<QQ", relocations, pos)
+                if address in info_relocations or info >> 32 >= len(elf.symbols):
+                    raise RuntimeError("invalid object capture function info relocation")
+                info_relocations[address] = (info & 0xffffffff, elf.symbols[info >> 32])
+    pos, records = 4, {}
+    while pos < len(raw):
+        section_name, count = struct.unpack("<II", checked_slice(raw, pos, 8, "function info section"))
+        section = string_at(btf.strings, section_name)
+        pos += 8
+        for _ in range(count):
+            address, ident = struct.unpack("<II", checked_slice(raw, pos, stride, "function info record"))
+            records.setdefault(ident, []).append((section, address, info_relocations.get(hlen + off + pos)))
+            pos += stride
+
+    def unsigned_u64(ref):
+        node = btf.resolve(ref)
+        return node[0] == 1 and node[2] == 8 and node[5] == (64,)
+
+    for name, info, other, section, value, size in selected:
+        if info != 0x12 or other != 0 or section != elf.indices.get(".text"):
+            raise RuntimeError(f"object capture {name} must be GLOBAL DEFAULT FUNC in .text")
+        if not size or value % 8 or size % 8 or value + size > len(elf.sections[".text"][1]):
+            raise RuntimeError(f"object capture {name} has invalid/empty body")
+        functions = [(ident, node) for ident, node in enumerate(btf.types)
+                     if node and node[:2] == (12, name)]
+        if len(functions) != 1 or functions[0][1][3] != 1:
+            raise RuntimeError(f"object capture {name} requires one GLOBAL BTF FUNC")
+        ident, function = functions[0]
+        proto = btf.resolve(function[2])
+        if proto[0] != 13 or proto[3] != 5 or len(proto[5]) != 10:
+            raise RuntimeError(f"object capture {name} requires exactly five scalar arguments")
+        if not unsigned_u64(proto[2]):
+            raise RuntimeError(f"object capture {name} return must be unsigned u64")
+        for argument in proto[5][1::2]:
+            if not unsigned_u64(argument):
+                raise RuntimeError(f"object capture {name} argument must be unsigned u64")
+        entries = records.get(ident, [])
+        if len(entries) != 1:
+            raise RuntimeError(f"object capture {name} function info missing/duplicate")
+        info_section, address, relocation = entries[0]
+        if (info_section != ".text" or address != value or not relocation
+                or relocation[0] != 4 or relocation[1][1] != 3
+                or relocation[1][3] != section or relocation[1][4] != 0):
+            raise RuntimeError(f"object capture {name} function info relocation mismatch")
+
+
+def bpf_call_graph(elf):
+    """Resolve emitted pseudo-calls and retain exact call instruction offsets."""
+    bodies = {(symbol[3], symbol[4]): symbol for symbol in elf.symbols
+              if symbol[1] & 15 == 2 and symbol[5] and symbol[3]}
+    sections = {elf.indices[name]: (row, raw) for name, (row, raw) in elf.sections.items()}
+    relocations = {}
+    for row, raw in elf.sections.values():
+        if row[1] == 9 and row[7] in sections:
+            for at in range(0, len(raw), 16):
+                address, info = struct.unpack_from("<QQ", raw, at)
+                if info >> 32 >= len(elf.symbols) or (row[7], address) in relocations:
+                    raise RuntimeError("invalid BPF call relocation")
+                relocations[row[7], address] = (info & 0xffffffff, elf.symbols[info >> 32])
+    edges, calls = {key: set() for key in bodies}, []
+    for key, symbol in bodies.items():
+        row, raw = sections[key[0]]
+        code = checked_slice(raw, key[1], symbol[5], "BPF call body")
+        for at in range(0, len(code), 8):
+            op, reg, _, immediate = struct.unpack_from("<BBhi", code, at)
+            if (op, reg) != (0x85, 0x10):
+                continue
+            relocation = relocations.get((key[0], key[1] + at))
+            if relocation and relocation[0] == 10:
+                destination = (relocation[1][3], relocation[1][4] + (immediate + 1) * 8)
+            elif relocation:
+                raise RuntimeError("unknown BPF pseudo-call relocation")
+            else:
+                destination = (key[0], key[1] + at + (immediate + 1) * 8)
+            if destination not in bodies:
+                raise RuntimeError("unresolved BPF pseudo-call")
+            edges[key].add(destination)
+            calls.append((key, destination, row[4] + key[1] + at))
+    return bodies, edges, calls
+
+
+def validate_object_capture_reachability(elf, *, full):
+    """FULL reaches scalar readers; P0 never reaches them. Neither publishes."""
+    validate_object_capture_globals(elf)
+    bodies, edges, _ = bpf_call_graph(elf)
+
+    def reachable(root):
+        seen, pending = set(), [root]
+        while pending:
+            key = pending.pop()
+            if key not in seen:
+                seen.add(key)
+                pending.extend(edges[key])
+        return seen
+
+    globals_by_name = {symbol[0]: key for key, symbol in bodies.items()
+                       if symbol[0] in OBJECT_CAPTURE_GLOBAL_HELPERS}
+    if globals_by_name.keys() != OBJECT_CAPTURE_GLOBAL_HELPERS:
+        raise RuntimeError("missing compiled object capture globals")
+    roots = {symbol[0]: key for key, symbol in bodies.items()
+             if symbol[0] == "p11_return" or symbol[0].startswith("p11_entry")}
+    if not {"p11_entry", "p11_return"} <= roots.keys():
+        raise RuntimeError("object capture globals require actual entry/return roots")
+    for name, root in roots.items():
+        symbol = bodies[root]
+        section = "uretprobe" if name == "p11_return" else "uprobe"
+        if symbol[1] != 0x12 or symbol[2] != 0 or symbol[3] != elf.indices.get(section):
+            raise RuntimeError(f"object capture requires {name} GLOBAL DEFAULT {section} root")
+        required = ({"p11_stable_cell", "p11_alias_capacity"} if name == "p11_return"
+                    else {"p11_stable_cell", "p11_alias_scan"})
+        found = {helper for helper, key in globals_by_name.items() if key in reachable(root)}
+        if (full and not required <= found) or (not full and found):
+            raise RuntimeError(f"object capture globals not correctly reachable from {name}: {sorted(found)}")
+    for name, root in globals_by_name.items():
+        allowed = {112} if name != "p11_alias_capacity" else set()
+        for section, start in reachable(root):
+            symbol = bodies[section, start]
+            raw = next(raw for label, (_, raw) in elf.sections.items() if elf.indices[label] == section)
+            code = checked_slice(raw, start, symbol[5], "scalar capture body")
+            for at in range(0, len(code), 8):
+                op, reg, _, helper = struct.unpack_from("<BBhi", code, at)
+                if op == 0x85 and reg != 0x10 and (reg != 0 or helper not in allowed):
+                    raise RuntimeError(f"object capture {name} has a non-read helper")
+            for row, relocations in elf.sections.values():
+                if row[1] == 9 and row[7] == section:
+                    for at in range(0, len(relocations), 16):
+                        address, info = struct.unpack_from("<QQ", relocations, at)
+                        if start <= address < start + symbol[5] and info & 0xffffffff == 1:
+                            raise RuntimeError(f"object capture {name} references map/state")
+
+
+def validate_ia32_span_paths(graph, entry, guard, rejected, read, updates, exits,
+                           *, register_transfer=None):
     """Prove guard dominance and sentinel return on every rejected path.
 
-    Both raw-ELF and disassembly callers supply their own decoded CFG and r0
-    writes. An omitted update preserves r0; None is an unknown value. This
-    deliberately does not infer success from a comparison's mere presence.
+    Disassembly callers supply r0 writes; an omitted update preserves r0 and
+    None is unknown. Raw ELF can track all registers through register_transfer
+    so an optimizer's saved sentinel remains proven across calls and copies.
+    Keep path states separate: one safe predecessor cannot excuse another.
     """
     guard_values = set()
 
@@ -721,9 +883,11 @@ def validate_ia32_span_paths(graph, entry, guard, rejected, read, updates, exits
             if (pc, result) in visited:
                 continue
             visited.add((pc, result))
-            result = updates.get(pc, result)
+            result = (register_transfer(pc, result) if register_transfer
+                      else updates.get(pc, result))
             if pc in exits:
-                if rejection and result != 1 << 32:
+                returned_value = result[0] if register_transfer else result
+                if rejection and returned_value != 1 << 32:
                     raise RuntimeError("ia32 reader span rejection must return failure sentinel")
                 returned = True
                 continue
@@ -732,7 +896,8 @@ def validate_ia32_span_paths(graph, entry, guard, rejected, read, updates, exits
             pending.extend((target, result, ancestors | {pc}) for target in graph[pc])
         return returned
 
-    walk([(entry, None, frozenset())], False)
+    initial = (None,) * 11 if register_transfer else None
+    walk([(entry, initial, frozenset())], False)
     if not guard_values:
         raise RuntimeError("ia32 reader span guard is unreachable")
     if not walk([(rejected, value, frozenset()) for value in guard_values], True):
@@ -745,7 +910,7 @@ def validate_ia32_raw_span(insns, read):
               if (op, reg) == (0x2d, 0x13)]
     if len(guards) != 1:
         raise RuntimeError("ia32 reader requires one full-width address span guard")
-    graph, updates, exits = {}, {}, set()
+    graph, exits = {}, set()
     pc = 0
     while pc < len(insns):
         op, reg, offset, imm = insns[pc]
@@ -761,18 +926,40 @@ def validate_ia32_raw_span(insns, read):
             graph[pc] = [pc + 1, pc + 1 + offset]
         else:
             graph[pc] = [pc + size]
-        if op == 0x85:
-            updates[pc] = None
-        elif reg & 15 == 0 and op & 7 in (0, 1, 4, 7):
-            if op == 0x18:
-                updates[pc] = (imm & 0xffffffff) | ((insns[pc + 1][3] & 0xffffffff) << 32)
-            elif op in (0xb4, 0xb7):
-                updates[pc] = imm & ((1 << (32 if op == 0xb4 else 64)) - 1)
-            else:
-                updates[pc] = None
         pc += size
+
+    def transfer(pc, state):
+        op, reg, _, imm = insns[pc]
+        values = list(state)
+        dst, src = reg & 15, reg >> 4
+        if op == 0x85:
+            # The BPF call ABI preserves r6-r9, but destroys r0-r5 facts.
+            values[:6] = [None] * 6
+        elif op & 7 == 3 and op & 0xe0 == 0xc0:
+            # Atomic fetch operations have implicit register writes. Do not
+            # carry a constant through an unmodeled atomic operation.
+            values = [None] * 11
+        elif op & 7 in (0, 1, 4, 7):
+            if dst > 10:
+                raise RuntimeError("ia32 reader span has invalid destination register")
+            value = None
+            if op == 0x18 and src == 0:
+                value = (imm & 0xffffffff) | ((insns[pc + 1][3] & 0xffffffff) << 32)
+            elif op in (0xb4, 0xb7):
+                value = imm & ((1 << (32 if op == 0xb4 else 64)) - 1)
+            elif op in (0xbc, 0xbf):
+                if src > 10:
+                    raise RuntimeError("ia32 reader span has invalid source register")
+                value = state[src]
+                if value is not None and op == 0xbc:
+                    value &= 0xffffffff
+            # Loads and unmodeled arithmetic invalidate the destination fact.
+            values[dst] = value
+        return tuple(values)
+
     guard = guards[0]
-    validate_ia32_span_paths(graph, 0, guard, guard + 1 + insns[guard][2], read, updates, exits)
+    validate_ia32_span_paths(graph, 0, guard, guard + 1 + insns[guard][2], read, {}, exits,
+                            register_transfer=transfer)
 
 
 def validate_ia32_reader(elf, inventory=False):
@@ -1537,6 +1724,7 @@ def inspect(path, allowed_text_globals=frozenset(), *, variant="default"):
         if any(node[0] == 15 and node[1] == ".maps" for node in btf.types[1:]):
             raise RuntimeError("native BTF DATASEC missing ELF .maps section")
     validate_ia32_reader(elf, inventory)
+    validate_object_capture_globals(elf, inventory)
     validate_owner_helpers(elf, inventory)
     validate_exec_helpers(elf, inventory)
     if not inventory:
@@ -1558,7 +1746,8 @@ def inspect(path, allowed_text_globals=frozenset(), *, variant="default"):
                      frozenset() if inventory else REQUIRED_GLOBAL_HELPERS | SELECTED_GLOBAL_HELPERS)
     return maps, classify(records, sections, allowed_text_globals | image_helpers
                           | REQUIRED_GLOBAL_OWNER_HELPERS | REQUIRED_GLOBAL_SCALAR_HELPERS
-                          | REQUIRED_GLOBAL_EXEC_HELPERS,
+                          | REQUIRED_GLOBAL_EXEC_HELPERS
+                          | (frozenset() if inventory else OBJECT_CAPTURE_GLOBAL_HELPERS),
                           inventory=inventory), {
         record[-1] for record in records
     }
@@ -1600,7 +1789,8 @@ def classify(records, sections, allowed_text_globals=frozenset(), *, inventory=F
             raise RuntimeError(f"unclassified global function {name} in {location}")
         if name in (REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_OWNER_HELPERS
                     | REQUIRED_GLOBAL_SCALAR_HELPERS | REQUIRED_GLOBAL_EXEC_HELPERS
-                    | DIAGNOSTIC_GLOBAL_HELPERS | SELECTED_GLOBAL_HELPERS):
+                    | DIAGNOSTIC_GLOBAL_HELPERS | SELECTED_GLOBAL_HELPERS
+                    | OBJECT_CAPTURE_GLOBAL_HELPERS):
             if name in allowed_text_globals and location == ".text":
                 helpers.add(name)
                 continue
@@ -1829,7 +2019,7 @@ def validate_inventory(variant, maps, programs, symbols):
                    "INV_BASELINE_RQ", "INV_BASELINE_CT",
                    "p11_inventory_image_baseline"} if callers else set()
         forbidden = {name for name in symbols if name not in allowed and
-                     (name in INVENTORY_FORBIDDEN_MAPS
+                     (name in INVENTORY_FORBIDDEN_MAPS or name in OBJECT_CAPTURE_GLOBAL_HELPERS
                       or name.startswith(("p11_owner_start_", "p11_link_", "p11_root_",
                                           "p11_inst", "p11_image_", "p11_object", "p11_selected_")))}
         if forbidden:

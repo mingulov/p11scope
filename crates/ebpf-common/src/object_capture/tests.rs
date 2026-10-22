@@ -4977,6 +4977,229 @@ fn streamed_stable_recheck_preserves_read_order_and_failure_priority() {
 }
 
 #[test]
+fn stable_cell_pack_roundtrips() {
+    for status in [0u8, 1, 5, 0xFF] {
+        for value in [0u16, 1, 0x1234, 0xFFFF] {
+            for write_value in [false, true] {
+                for contrib in [0u32, ofl::CHANGED_METADATA, u32::MAX] {
+                    let (s, v, w, c) =
+                        unpack_stable_cell(pack_stable_cell(status, value, write_value, contrib));
+                    assert_eq!((s, v, w, c), (status, value, write_value, contrib));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn stable_cell_kind_layout_codec_roundtrips() {
+    use object_policy::SafeAttributeKind as Kind;
+    for kind in [
+        Kind::Class,
+        Kind::KeyType,
+        Kind::Token,
+        Kind::ValueLen,
+        Kind::ModulusBits,
+        Kind::EcParams,
+    ] {
+        for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+            let code = encode_stable_kind_layout(kind, layout);
+            assert_eq!(decode_stable_kind_layout(code), Some((kind, layout)));
+        }
+    }
+    // Unused code 0, above-range codes, bad layout tags, high garbage.
+    for bad in [0u64, 7, 0xFF, 0x200, 0x201, 1 << 16, u64::MAX] {
+        assert_eq!(decode_stable_kind_layout(bad), None, "bad={bad:#x}");
+    }
+}
+
+#[test]
+fn stable_cell_poison_inputs_publish_nothing() {
+    for bad in [0u64, 7, 0xFF, 0x200, u64::MAX] {
+        let reads = core::cell::Cell::new(0u32);
+        let packed = stable_cell_packed(
+            0x4000,
+            0,
+            bad,
+            0x8000,
+            8,
+            &mut |_| {
+                reads.set(reads.get() + 1);
+                Ok(0)
+            },
+            &mut |_, _| {
+                reads.set(reads.get() + 1);
+                Ok(())
+            },
+        );
+        assert_eq!(packed, stable_cell_poison(), "bad={bad:#x}");
+        assert_eq!(reads.get(), 0, "bad={bad:#x}");
+        assert_eq!(unpack_stable_cell(packed), (ast::UNREADABLE, 0, false, 0));
+    }
+}
+
+/// E1a boundary equivalence: the packed global form publishes exactly what the
+/// direct wrapper publishes, with identical reads, across every kind, layout,
+/// and recheck fault combination (plus invalid spans and unreadable values).
+#[test]
+fn stable_cell_packed_matches_direct() {
+    use object_policy::SafeAttributeKind as Kind;
+    for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+        let w = layout.word_bytes() as u64;
+        for (kind, selector, len) in [
+            (Kind::Class, SEL_CLASS, w),
+            (Kind::KeyType, SEL_KEYTYPE, w),
+            (Kind::Token, SEL_TOKEN, 1),
+            (Kind::ValueLen, SEL_VALUELEN, w),
+            (Kind::ModulusBits, SEL_MODBITS, w),
+            (Kind::EcParams, SEL_ECPARAMS, 10),
+        ] {
+            for failed in 0u8..8 {
+                for changed in 0u8..8 {
+                    for value_case in 0..3 {
+                        let run = |packed: bool| {
+                            let target = fresh(w);
+                            prog_attr(&target, 0x4000, 0, w, selector, 0x8000, len);
+                            match (kind, value_case) {
+                                (Kind::Token, 0) => {
+                                    target.borrow_mut().set_bytes(0x8000, &[1]);
+                                }
+                                (Kind::Token, 1) => {
+                                    target.borrow_mut().set_bytes(0x8000, &[9]);
+                                }
+                                (Kind::EcParams, 0) => {
+                                    target.borrow_mut().set_bytes(0x8000, EC_P256);
+                                }
+                                (Kind::EcParams, 1) => {
+                                    target.borrow_mut().set_bytes(0x8000, &[9; 10]);
+                                }
+                                (_, 0) => {
+                                    let scalar = match kind {
+                                        Kind::Class => 3,
+                                        Kind::KeyType => 0x10,
+                                        Kind::ValueLen => 32,
+                                        Kind::ModulusBits => 2048,
+                                        _ => unreachable!(),
+                                    };
+                                    target.borrow_mut().set_word(0x8000, scalar);
+                                }
+                                (_, 1) => {
+                                    target.borrow_mut().set_word(0x8000, 0xFFFF);
+                                }
+                                // value_case 2 leaves the value unreadable.
+                                _ => {}
+                            }
+                            let mut read_word = |addr: u64| {
+                                let original = target.borrow_mut().read_word(addr);
+                                let Some(index) = [0x4000, 0x4000 + w, 0x4000 + 2 * w]
+                                    .iter()
+                                    .position(|candidate| *candidate == addr)
+                                else {
+                                    return original;
+                                };
+                                if failed & (1 << index) != 0 {
+                                    Err(())
+                                } else if changed & (1 << index) != 0 {
+                                    Ok([SEL_KEYTYPE, 0x9000, len + 1][index])
+                                } else {
+                                    original
+                                }
+                            };
+                            let mut read_bytes = |addr: u64, bytes: &mut [u8]| {
+                                target.borrow_mut().read_bytes(addr, bytes)
+                            };
+                            let mut out = crate::object_wire::ObjectAttributeWire::default();
+                            let flags = if packed {
+                                let encoded = encode_stable_kind_layout(kind, layout);
+                                let (status, value, write_value, contrib) =
+                                    unpack_stable_cell(stable_cell_packed(
+                                        0x4000,
+                                        0,
+                                        encoded,
+                                        0x8000,
+                                        len,
+                                        &mut read_word,
+                                        &mut read_bytes,
+                                    ));
+                                out.status = status;
+                                if write_value {
+                                    out.value = value;
+                                }
+                                contrib
+                            } else {
+                                stable_attribute_cell(
+                                    0x4000,
+                                    0,
+                                    kind,
+                                    0x8000,
+                                    len,
+                                    layout,
+                                    &mut out,
+                                    &mut read_word,
+                                    &mut read_bytes,
+                                )
+                            };
+                            let outcome =
+                                (out.status, out.value, flags, target.borrow().log().to_vec());
+                            outcome
+                        };
+                        let direct = run(false);
+                        let packed = run(true);
+                        assert_eq!(
+                            packed, direct,
+                            "kind={kind:?} failed={failed} changed={changed} value_case={value_case}"
+                        );
+                    }
+                }
+            }
+            // Invalid header span: the value classifies, then the header
+            // addresses refuse; exactly one read (the value) on either path.
+            for packed in [false, true] {
+                let target = fresh(w);
+                match kind {
+                    Kind::Token => target.borrow_mut().set_bytes(0x8000, &[1]),
+                    Kind::EcParams => target.borrow_mut().set_bytes(0x8000, EC_P256),
+                    Kind::Class => target.borrow_mut().set_word(0x8000, 3),
+                    Kind::KeyType => target.borrow_mut().set_word(0x8000, 0x10),
+                    Kind::ValueLen => target.borrow_mut().set_word(0x8000, 32),
+                    Kind::ModulusBits => target.borrow_mut().set_word(0x8000, 2048),
+                }
+                let (mut rw, mut rb) = readers(&target);
+                let mut out = crate::object_wire::ObjectAttributeWire::default();
+                let flags = if packed {
+                    let encoded = encode_stable_kind_layout(kind, layout);
+                    let (status, value, write_value, contrib) = unpack_stable_cell(
+                        stable_cell_packed(u64::MAX - 8, 0, encoded, 0x8000, len, &mut rw, &mut rb),
+                    );
+                    out.status = status;
+                    if write_value {
+                        out.value = value;
+                    }
+                    contrib
+                } else {
+                    stable_attribute_cell(
+                        u64::MAX - 8,
+                        0,
+                        kind,
+                        0x8000,
+                        len,
+                        layout,
+                        &mut out,
+                        &mut rw,
+                        &mut rb,
+                    )
+                };
+                assert_eq!(
+                    (out.status, out.value, flags, target.borrow().log().len()),
+                    (ast::INVALID_SPAN, 0, 0, 1),
+                    "kind={kind:?} packed={packed}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn streamed_alias_header_failures_keep_all_selected_reads() {
     for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
         let w = layout.word_bytes() as u64;
@@ -5025,5 +5248,227 @@ fn streamed_alias_header_failures_keep_all_selected_reads() {
                 );
             }
         }
+    }
+}
+
+#[test]
+fn alias_scan_pack_roundtrips() {
+    for alias in [false, true] {
+        for flags in [0u8, 1, 0xFF] {
+            assert_eq!(
+                unpack_alias_scan(pack_alias_scan(alias, flags)),
+                (alias, flags)
+            );
+        }
+    }
+}
+
+#[test]
+fn alias_skip_layout_codec_roundtrips() {
+    for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+        // Every skip the roots produce: per-index skips decode exactly.
+        for skip in 0..8u64 {
+            assert_eq!(
+                decode_alias_skip_layout(encode_alias_skip_layout(skip, layout)),
+                (skip, layout)
+            );
+        }
+        // No-skip decodes to a below-`u64::MAX` value that still skips
+        // nothing: the scan only compares `j != skip` with `j < 8`.
+        let (skip, decoded) = decode_alias_skip_layout(encode_alias_skip_layout(u64::MAX, layout));
+        assert_eq!(decoded, layout);
+        for j in 0..8u64 {
+            assert_ne!(j, skip);
+        }
+    }
+}
+
+/// E1b boundary equivalence: the packed global form returns exactly what the
+/// direct wrapper returns, with identical reads, across overlap shapes,
+/// header faults, skip values, and one multi-neighbor layout.
+#[test]
+fn alias_scan_packed_matches_direct() {
+    for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+        let w = layout.word_bytes() as u64;
+        for (other_ptr, other_len) in [
+            (0x8000, 16),
+            (0, 16),
+            (0x9000, 16),
+            (u64::MAX, 16),
+            (0x8000, 0),
+            (0x7ff8, 9),
+        ] {
+            for failed in 0..4 {
+                for skip in [0u64, 1, u64::MAX] {
+                    let run = |packed: bool| {
+                        let target = fresh(w);
+                        prog_attr(&target, 0x4000, 0, w, SEL_TOKEN, other_ptr, other_len);
+                        if failed & 1 != 0 {
+                            target.borrow_mut().set_fail(0x4000 + w);
+                        }
+                        if failed & 2 != 0 {
+                            target.borrow_mut().set_fail(0x4000 + 2 * w);
+                        }
+                        let outcome = if packed {
+                            let encoded = encode_alias_skip_layout(skip, layout);
+                            unpack_alias_scan(alias_scan_packed(
+                                0x4000,
+                                1,
+                                encoded,
+                                0x8000,
+                                8,
+                                &mut word_reader(&target),
+                            ))
+                        } else {
+                            request_alias_scan(
+                                0x4000,
+                                1,
+                                skip,
+                                0x8000,
+                                8,
+                                layout,
+                                &mut word_reader(&target),
+                            )
+                        };
+                        let logged = target.borrow().log().to_vec();
+                        (outcome.0, outcome.1, logged)
+                    };
+                    let direct = run(false);
+                    let packed = run(true);
+                    assert_eq!(
+                        packed, direct,
+                        "other=({other_ptr:#x},{other_len}) failed={failed} skip={skip:#x}"
+                    );
+                }
+            }
+        }
+        // Multi-neighbor: two overlapping selected headers, one skipped.
+        for skip in [3u64, u64::MAX] {
+            let run = |packed: bool| {
+                let target = fresh(w);
+                prog_attr(&target, 0x4000, 3, w, SEL_TOKEN, 0x8000, 16);
+                prog_attr(&target, 0x4000, 5, w, SEL_KEYTYPE, 0x8000, 16);
+                let outcome = if packed {
+                    let encoded = encode_alias_skip_layout(skip, layout);
+                    unpack_alias_scan(alias_scan_packed(
+                        0x4000,
+                        8,
+                        encoded,
+                        0x8000,
+                        8,
+                        &mut word_reader(&target),
+                    ))
+                } else {
+                    request_alias_scan(
+                        0x4000,
+                        8,
+                        skip,
+                        0x8000,
+                        8,
+                        layout,
+                        &mut word_reader(&target),
+                    )
+                };
+                let logged = target.borrow().log().to_vec();
+                (outcome.0, outcome.1, logged)
+            };
+            let direct = run(false);
+            let packed = run(true);
+            assert!(direct.0, "skip={skip:#x}");
+            assert_eq!(packed, direct, "skip={skip:#x}");
+        }
+    }
+}
+
+/// E1c boundary equivalence: the packed global form agrees with the direct
+/// core on every address/capacity edge, both layouts, and poison widths.
+#[test]
+fn alias_capacity_packed_matches_direct() {
+    for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+        for (ptr, len) in [
+            (0u64, 0u64),
+            (0x8000, 8),
+            (0x7ff8, 9),
+            (u64::MAX - 8, 16),
+            (u64::MAX, 1),
+        ] {
+            for (other_ptr, other_cap) in [
+                (0u64, 0u64),
+                (0, 16),
+                (0x8000, 0),
+                (0x8000, 16),
+                (0x9000, 16),
+                (0x7ff8, 9),
+                (u64::MAX, 16),
+                (u64::MAX - 8, 16),
+            ] {
+                let direct = alias_capacity_core(ptr, len, other_ptr, other_cap, layout);
+                let wb = layout.word_bytes() as u64;
+                assert_eq!(
+                    alias_capacity_packed(ptr, len, other_ptr, other_cap, wb),
+                    u64::from(direct),
+                    "ptr={ptr:#x} len={len} other=({other_ptr:#x},{other_cap})"
+                );
+                // Spot-anchor the verdict (not just equivalence): disjoint and
+                // zero spans never alias; identical spans always do.
+                if ptr == 0x8000 && len == 8 {
+                    let expected = (other_ptr, other_cap) == (0x8000, 16)
+                        || (other_ptr, other_cap) == (0x7ff8, 9);
+                    assert_eq!(direct, expected, "other=({other_ptr:#x},{other_cap})");
+                }
+            }
+        }
+        // Poison widths publish "no alias" without a layout.
+        for wb in [0u64, 3, 5, 7, 9, u64::MAX] {
+            assert_eq!(decode_alias_capacity_layout(wb), None);
+            assert_eq!(
+                alias_capacity_packed(0x8000, 8, 0x8000, 16, wb),
+                0,
+                "wb={wb}"
+            );
+        }
+    }
+}
+
+#[test]
+fn slot_kind_codes_stay_consecutive_from_class() {
+    // `slot_kind_selected` subtracts CLASS and range-checks; any renumber
+    // must update it together with this pin.
+    assert_eq!(
+        [
+            attr_kind::CLASS,
+            attr_kind::KEY_TYPE,
+            attr_kind::TOKEN,
+            attr_kind::VALUE_LEN,
+            attr_kind::MODULUS_BITS,
+            attr_kind::EC_PARAMS,
+        ],
+        [1, 2, 3, 4, 5, 6]
+    );
+    for code in 0u8..=u8::MAX {
+        assert_eq!(
+            slot_kind_selected(code),
+            kind_from_code(code).is_some(),
+            "code {code}"
+        );
+    }
+}
+
+#[test]
+fn selector_for_kind_inverts_policy_mapping() {
+    use object_policy::SafeAttributeKind;
+    for kind in [
+        SafeAttributeKind::Class,
+        SafeAttributeKind::KeyType,
+        SafeAttributeKind::Token,
+        SafeAttributeKind::ValueLen,
+        SafeAttributeKind::ModulusBits,
+        SafeAttributeKind::EcParams,
+    ] {
+        assert_eq!(
+            object_policy::safe_attribute_kind(selector_for_kind(kind)),
+            Some(kind),
+            "{kind:?}"
+        );
     }
 }

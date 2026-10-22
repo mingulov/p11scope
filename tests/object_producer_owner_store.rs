@@ -500,6 +500,18 @@ fn object_producer_compiled_function_abis_fit_five_registers() {
 }
 
 #[test]
+fn object_producer_scalar_globals_are_exact_and_reachable() {
+    let directory = tempfile::tempdir().expect("temporary scalar object capture check");
+    let object = embedded_object(directory.path());
+    let mode = if cfg!(feature = "stub-object-attributes") {
+        "scalar-globals-p0"
+    } else {
+        "scalar-globals"
+    };
+    println!("{}", run_object_checker(&object, mode));
+}
+
+#[test]
 fn object_producer_sweep_path_within_jump_budget() {
     // Both teardown sweeps run 512 slots per cleanup; every per-slot
     // branch multiplies into the kernel jump budget (live 8193-jump
@@ -904,6 +916,11 @@ def main():
         check_frames(data, report, diagnostic='diagnostic' in mode, wide='wide' in mode)
     elif mode == 'function-abis':
         check_function_abis(data, report)
+    elif mode in ('scalar-globals', 'scalar-globals-p0'):
+        elf = checker.Elf(data)
+        checker.validate_object_capture_globals(elf)
+        checker.validate_object_capture_reachability(elf, full=mode == 'scalar-globals')
+        report.append('scalar capture globals: exact u64 ABI, private reads and root reachability checked')
     elif mode == 'return-fault':
         check_return_fault(data, report)
     elif mode == 'exec-exit-fault':

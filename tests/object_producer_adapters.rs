@@ -51,6 +51,64 @@ fn nm_text_symbols(object: &Path) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
+fn adapter_symbol_matches(line: &str, helper: &str) -> bool {
+    let mut fields = line.split_whitespace();
+    let (_, Some(kind), Some(symbol), None) =
+        (fields.next(), fields.next(), fields.next(), fields.next())
+    else {
+        return false;
+    };
+    // Match the complete v0 crate-root value path, not a suffix that could
+    // also be embedded inside a longer Rust identifier or closure path.
+    let Some(path) = symbol.strip_prefix("_RNvC") else {
+        return false;
+    };
+    let path = if let Some(disambiguated) = path.strip_prefix('s') {
+        let Some((base62, path)) = disambiguated.split_once('_') else {
+            return false;
+        };
+        if !base62.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+            return false;
+        }
+        path
+    } else {
+        path
+    };
+    matches!(kind, "T" | "t") && path == format!("13p11scope_ebpf{}{helper}", helper.len())
+}
+
+#[test]
+fn object_producer_adapters_symbol_match_is_exact() {
+    let old = "0000000000000000 t _RNvCsjWrHwBgRwZD_13p11scope_ebpf19object_entry_derive";
+    let new = "0000000000003500 t _RNvCscPIs3K62KxS_13p11scope_ebpf19object_entry_derive";
+    let closure = "0000000000006bb0 t _RINvNtCs5q1kJuwIe8v_20p11scope_ebpf_common14object_capture25classify_derive_mechanismNCNvCscPIs3K62KxS_13p11scope_ebpf19object_entry_derives0_0EB1p_";
+    assert!(adapter_symbol_matches(old, "object_entry_derive"));
+    assert!(adapter_symbol_matches(new, "object_entry_derive"));
+    assert!(!adapter_symbol_matches(closure, "object_entry_derive"));
+    assert!(!adapter_symbol_matches(
+        "0000000000003500 t _RNvCscPIs3K62KxS_13p11scope_ebpf23not_object_entry_derive",
+        "object_entry_derive"
+    ));
+    assert!(!adapter_symbol_matches(
+        "0000000000003500 t _RNvCscPIs3K62KxS_13p11scope_ebpf27prefix19object_entry_derive",
+        "object_entry_derive"
+    ));
+    let misleading_name = "prefix13p11scope_ebpf19object_entry_derive";
+    let misleading = format!(
+        "0000000000003500 t _RNvCscPIs3K62KxS_13p11scope_ebpf{}{misleading_name}",
+        misleading_name.len()
+    );
+    assert!(!adapter_symbol_matches(&misleading, "object_entry_derive"));
+    assert_eq!(
+        [old, closure, new]
+            .into_iter()
+            .filter(|line| adapter_symbol_matches(line, "object_entry_derive"))
+            .count(),
+        2,
+        "duplicate actual helpers must remain visible to the ELF contract"
+    );
+}
+
 #[test]
 fn object_producer_adapters_entry_fill_shape() {
     let source = std::fs::read_to_string("crates/ebpf/src/main.rs").expect("read BPF entry root");
@@ -211,7 +269,7 @@ fn object_producer_adapters_helpers_in_elf() {
     ] {
         let hits: Vec<&str> = symbols
             .lines()
-            .filter(|line| line.contains(helper) && (line.contains(" T ") || line.contains(" t ")))
+            .filter(|line| adapter_symbol_matches(line, helper))
             .collect();
         assert_eq!(
             hits.len(),

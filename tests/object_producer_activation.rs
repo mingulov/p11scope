@@ -1764,7 +1764,9 @@ fn login_user_type_capture_uses_full_width_finite_policy() {
 /// Re-baselined after the E4 outlined return branches, scalar scope flags,
 /// alias-header acquisition and Some-only flags load (safe eight-commit
 /// integration through 242ba841): 113589 B, measured with this actual lexer.
-/// Re-baselined again for full-width login user-type capture.
+/// Re-baselined again for full-width login user-type capture and scalar
+/// object-capture globals with constant-layout alias readers; measured with
+/// this actual lexer.
 #[test]
 fn strip_rust_prose_real_bpf_source_dump_stable() {
     use sha2::{Digest as _, Sha256};
@@ -1774,8 +1776,8 @@ fn strip_rust_prose_real_bpf_source_dump_stable() {
     assert_eq!(
         (stripped.len(), hex.as_str()),
         (
-            113631,
-            "0889e995446010d7d4ed54c515fead03539068de9e516fb0dc2eb43faea5dad1"
+            115664,
+            "a0592887c56bca1f512272b21f35ceb0e1a4bc601ea71c5e884ae60d9d0959bf"
         ),
         "stripped BPF dump must stay byte-identical"
     );

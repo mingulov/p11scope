@@ -227,10 +227,10 @@ smokes against the packaged binaries. The helper lane
 `rust:1.98.1-alpine3.22` and the `ubuntu:noble-20260810` run image by digest.
 
 Ordinary source builds default to FULL; `--no-default-features` alone does not
-select P0. The current packager still writes `p11scope_features: []` in
-`RELEASE.json`, so that field alone does not establish capture mode. Report
-the actual builder feature selection and the runtime object-capture disclosure;
-this release metadata correctness gap remains open.
+select P0. The packager records `p11scope_features: ["stub-object-attributes"]`
+and a P0 scope with object-attribute capture disabled in the top-level and bundled
+`RELEASE.json`. This describes the fixed official builder configuration; report
+the runtime object-capture disclosure when qualifying packaged binaries.
 
 Requirements: a non-root user with passwordless `sudo` (`sudo -n true` must
 succeed), a working Docker daemon, SoftHSM2 at

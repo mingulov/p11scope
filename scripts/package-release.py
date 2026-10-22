@@ -22,6 +22,8 @@ import tarfile
 sys.dont_write_bytecode = True
 ARTIFACTS = ("p11scope", "p11scope-discover", "p11scope-discover-glibc", "p11scope-discover-musl")
 LICENSES = ("LICENSE", "LICENSES/GPL-2.0-only.txt", "LICENSES/GPL-2.0-or-later.txt")
+# The trusted build-release.sh receipt covers this fixed official selection.
+OFFICIAL_P11SCOPE_FEATURES = ("stub-object-attributes",)
 
 
 def digest(data: bytes) -> str:
@@ -328,8 +330,9 @@ def package(root: Path, receipt: Path, notices: Path, source: Path, output: Path
         "build_receipt_status": 0, "release_artifacts_sha256": facts["release_artifacts_sha256"],
         "artifacts": hashes, "notices_manifest_sha256": notices_hash,
         "source": {"file": source_name, "sha256": digest(source_data), "format": "networked-source-export-v1"},
-        "p11scope_features": [], "rust": (root / ".release-rust-version").read_text(encoding="utf-8").strip(), "bpf_rust": "nightly-2026-05-20",
-        "scope": "Safe-only official build. Consult the GitHub release notes for qualified kernels and lanes; system-wide tracing remains preview.",
+        "p11scope_features": list(OFFICIAL_P11SCOPE_FEATURES),
+        "rust": (root / ".release-rust-version").read_text(encoding="utf-8").strip(), "bpf_rust": "nightly-2026-05-20",
+        "scope": "P0 official build with object-attribute capture disabled. Consult the GitHub release notes for qualified kernels and lanes; system-wide tracing remains preview.",
     }
     public = encoded(provenance)
     common = {name: (regular(root / name), 0o644) for name in LICENSES}

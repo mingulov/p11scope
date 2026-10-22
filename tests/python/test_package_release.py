@@ -173,6 +173,11 @@ class PackageReleaseTests(unittest.TestCase):
             "p11scope-0.1.0-source.tar.gz", "RELEASE.json", "SHA256SUMS",
         }
         self.assertEqual({p.name for p in self.output.iterdir()}, expected)
+        release_bytes = (self.output / "RELEASE.json").read_bytes()
+        release = json.loads(release_bytes)
+        self.assertEqual(release["p11scope_features"], ["stub-object-attributes"])
+        self.assertIn("P0", release["scope"])
+        self.assertIn("object-attribute capture disabled", release["scope"])
         for path in self.output.iterdir():
             self.assertEqual(path.read_bytes(), (second / path.name).read_bytes())
         checksums = (self.output / "SHA256SUMS").read_text()
@@ -182,6 +187,10 @@ class PackageReleaseTests(unittest.TestCase):
             if not name.endswith(".tar.gz") or name.endswith("-source.tar.gz"):
                 continue
             with tarfile.open(self.output / name) as archive:
+                embedded_release = archive.extractfile(name[:-7] + "/RELEASE.json").read()
+                self.assertEqual(embedded_release, release_bytes)
+                self.assertEqual(json.loads(embedded_release)["p11scope_features"],
+                                 ["stub-object-attributes"])
                 binary_name = "p11scope-discover" if "discover" in name else "p11scope"
                 binary = archive.getmember(name[:-7] + "/" + binary_name)
                 self.assertEqual(binary.mode, 0o755)

@@ -565,6 +565,9 @@ def prepare(args):
     stage = args.prepare.resolve()
     cells = object_arguments(args.object_input)
     core = selection(args.lane, args.lib_test, args.public_cell, not args.without_scan, [(mode, bits) for mode, bits, _ in cells])
+    cells = [(mode, bits, validate_canary_payloads(bundle, bits)) for mode, bits, bundle in cells]
+    for _, _, bundle in cells:
+        require(not stage.is_relative_to(bundle) and not bundle.is_relative_to(stage), "overlapping canary input/stage")
     stage.mkdir(parents=True, exist_ok=True)
     require(not (stage / "contract.json").exists(), "refuse to overwrite an execution contract")
     core["run_id"] = uuid.uuid4().hex
@@ -586,7 +589,6 @@ def prepare(args):
         for name in CANARY_SOURCE_FILES:
             sources["artifacts/source/" + name] = ROOT / name
     for mode, bits, bundle in cells:
-        require(not stage.is_relative_to(bundle) and not bundle.is_relative_to(stage), "overlapping canary input/stage")
         facts = validate_canary_inputs(load_canary_facts(bundle / "canary-build.json"), bundle, candidate)
         require((facts["capture_mode"], facts["target_bits"]) == (mode, bits), "selected canary mode/ABI differs from build")
         key = f"{mode}-{bits}"

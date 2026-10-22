@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import runpy
 import shutil
+import stat
 import struct
 import subprocess
 import sys
@@ -635,6 +636,48 @@ class MatrixContract(unittest.TestCase):
                 result = self.prepare_object_inputs(stage, cells)
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                 self.assertFalse((stage / "contract.json").exists())
+
+    def test_object_input_overlap_refuses_aliases_before_writes(self):
+        def snapshot(root):
+            result = {}
+            for path in sorted(root.rglob("*")):
+                mode = path.lstat().st_mode
+                result[str(path.relative_to(root))] = (mode,
+                    hashlib.sha256(path.read_bytes()).hexdigest() if stat.S_ISREG(mode) else None)
+            return result
+
+        for case in ("same_alias", "child_alias", "same_dotdot", "child_direct", "ancestor_alias"):
+            with self.subTest(case=case):
+                parent = self.base / (case + " parent")
+                parent.mkdir()
+                original, _ = self.canary_inputs()
+                bundle = original.rename(parent / "owned bundle")
+                alias = self.base / (case + " alias")
+                alias.symlink_to(parent, target_is_directory=True)
+                argument = alias / bundle.name
+                stage = bundle
+                if case == "child_alias": stage = bundle / "new stage" / "nested"
+                elif case == "same_dotdot":
+                    (parent / "step").mkdir()
+                    argument = parent / "step" / ".." / bundle.name
+                elif case == "child_direct": stage = bundle / "new stage"; argument = bundle
+                elif case == "ancestor_alias": stage = parent
+                before = snapshot(parent)
+                result = self.prepare_object_inputs(stage, [("full", 64, argument)])
+                after = snapshot(parent)
+                self.assertEqual(after, before, f"{case}: preparation changed the input tree")
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+
+        original, _ = self.canary_inputs()
+        alias = self.base / "healthy alias"
+        alias.symlink_to(self.base, target_is_directory=True)
+        before = snapshot(original)
+        stage = self.base / "healthy distinct stage"
+        result = self.prepare_object_inputs(stage, [("full", 64, alias / original.name)])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(snapshot(original), before)
+        self.assertEqual(command(sys.executable, "-I", str(CHECKER), "--verify-inputs", str(stage),
+            "--contract", str(stage / "contract.json")).returncode, 0)
 
     def test_build_receipt_missing_mismatched_or_declared_provenance_fails(self):
         original = json.loads(self.candidate.read_text())

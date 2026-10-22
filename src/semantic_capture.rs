@@ -4075,6 +4075,57 @@ mod tests {
     fn joint_absence_birth_requires_prior_negative_and_quiet_sighting() {
         actual_absence_birth_fixture();
     }
+
+    #[test]
+    fn joint_native_freshness_alone_cannot_authorize_absence_birth() {
+        use crate::semantics_objects::journal::{
+            SessionBirthGrant,
+            tests::{NativeBirthRows, NativePublisher},
+        };
+        let mut harness = JointBirthHarness::new();
+        harness.push_ordinary(ImageIdentity::default());
+        let mut quiet = harness.collect();
+        let (report, admitted) = harness.route(&mut quiet);
+        quiet.classify_ordinary(&admitted).unwrap();
+        let (_, proof) = harness.ingest(quiet, &admitted);
+        let cut = harness
+            .adapter
+            .resolve_birth_cut(&harness.drain.consumption_cut().unwrap(), &harness.producers)
+            .unwrap();
+        assert!(
+            harness
+                .adapter
+                .quiet_sighting_at(harness.io.current_image, &cut)
+        );
+        // This already-present provider has no committed absence or later
+        // appearance. Discard its actual H0 report instead of consuming New.
+        drop(report);
+        let publisher = NativePublisher::build();
+        let (row, control, _) = publisher.publish(&["0", "0", "0", "0", "1"]);
+        let mut rows = NativeBirthRows { row, control };
+        let binding = crate::attach::BirthAdmissionBinding::from_admitted(&admitted);
+        let (token, evidence) = crate::attach::observe_retained_birth(
+            &mut rows,
+            harness.fixture.binding(),
+            harness.fixture.attachment(),
+            &binding,
+            BirthKind::AbsenceAppearance,
+        )
+        .expect("honest native freshness is available without birth authority");
+        let grant = SessionBirthGrant::issue(
+            &token,
+            proof,
+            BirthKind::AbsenceAppearance,
+            &cut,
+            harness.fixture.attachment().generation(),
+            evidence,
+        );
+        assert!(
+            BootstrapReceipt::attest(&harness.adapter, &grant).is_err(),
+            "native freshness and a quiet stream cut cannot replace a committed absence and actual new appearance"
+        );
+    }
+
     pub(super) fn actual_absence_birth_fixture() {
         use crate::semantics_objects::journal::tests::{NativeBirthRows, NativePublisher};
         let mut harness = JointBirthHarness::new();

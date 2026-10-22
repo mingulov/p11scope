@@ -92,6 +92,18 @@ def entry_contract(variant, name, disassembly=None):
     return CHECKER["final_sink_contract"](consumer, variant, selectors, blocks, calls)
 
 
+
+def return_contract(variant, disassembly=None):
+    split = CHECKER["sections"](OBJECTS[variant] if disassembly is None else disassembly)
+    blocks = CHECKER["D"].function_blocks(split[".text"])
+    calls = {}
+    for caller, _, pc, target in CHECKER["D"].internal_call_targets(split["uretprobe"]+"\n"+split[".text"]):
+        calls.setdefault(caller, {})[pc] = target
+    root = CHECKER["_SeedCaller"]("uretprobe", "p11_return",
+        CHECKER["D"].function_blocks(split["uretprobe"])["p11_return"], calls["p11_return"])
+    return CHECKER["final_sink_contract"](root, variant, [0x23, 0x33], blocks, calls)
+
+
 def mutate(disassembly, function, pc, old, new, internal_call=False, helper_call=False):
     """Change exactly one decoded instruction, retaining its actual-object origin."""
     symbols = list(re.finditer(r"(?m)^[0-9a-f]+ <([^>]+)>:$", disassembly))
@@ -429,26 +441,67 @@ class EntryObjectTests(unittest.TestCase):
             self.assertTrue(any(low <= value <= high for low, high in invalid))
 
     def test_mode_and_return_sink_controls(self):
-        cases = [
-            ("p11_entry_template", site('unsafe', 'p11_entry_template', 'r4\\ \\+=\\ \\-0xc8'), "r4 += -0x78"),
-            ("p11_entry_template", site('unsafe', 'p11_entry_template', 'r3\\ =\\ 0x8', 0), "r3 = 0x4"),
-            ("p11_entry_template", site('unsafe', 'p11_entry_template', 'r1\\ =\\ r8', 1), "r1 = r2"),
-            ("p11_entry_template_pair", site('unsafe', 'p11_entry_template_pair', 'r3\\ =\\ 0x0', 1), "r3 = 0x1"),
-            ("p11_entry_template_pair", site('unsafe', 'p11_entry_template_pair', 'if\\ r0\\ ==\\ 0x0\\ goto\\ \\+0x9'), "if r0 != 0x0 goto +0x9"),
-            ("p11_entry_template_types", before_call('unsafe', 'p11_entry_template_types', 'p11_walk_template_types', r'r4 \+= -0xc8'), "r4 += -0x78"),
-            ("p11_entry_template_types", before_call('unsafe', 'p11_entry_template_types', 'p11_walk_template_types', r'r3 = 0x8'), "r3 = 0x4"),
-            ("p11_entry_template_second", site('unsafe', 'p11_entry_template_second', 'r9\\ \\+=\\ 0xb0'), "r9 += 0x60"),
-            ("p11_entry_template_second", site('unsafe', 'p11_entry_template_second', 'r4\\ =\\ r9'), "r4 = r10"),
-            ("p11_return", 1435, "if r8 != 0x1 goto +0x19"),
-            ("p11_return", 1446, "r2 = 0x8"),
-            ("p11_return", 1612, "r3 = *(u64 *)(r10 - 0xf8)"),
-        ]
-        for function, pc, new in cases:
-            with self.subTest(function=function, pc=pc):
-                insns = dict(CHECKER["D"].instructions(CHECKER["D"].function_blocks(OBJECTS["unsafe"])[function]))
-                changed = mutate(OBJECTS["unsafe"], function, pc, insns[pc], new)
-                with self.assertRaisesRegex(RuntimeError, "final-sink|layout|mode|lifecycle|retained"):
-                    CHECKER["contract"](changed, "unsafe")
+        for variant in OBJECTS:
+            with self.subTest(variant=variant, control="healthy outlined returns"):
+                try:
+                    report = return_contract(variant)
+                except RuntimeError as error:
+                    self.fail("actual outlined return rejected: " + str(error))
+                self.assertEqual(set(report["outlined"]), {"ordinary", "object"})
+            root_name, root_insns = instructions(variant, "p11_return")
+            root_texts = dict(root_insns)
+            for suffix in ("ordinary_return", "object_return"):
+                for register, new in (("r1", "r1 = r10"), ("r2", "r2 += 0x8"),
+                                      ("r3", "r3 = r10"), ("r4", "r4 = 0x0"), ("r5", "r5 = 0x2")):
+                    pc = before_call(variant, root_name, suffix, register+r" (=|\+=) .*")
+                    with self.subTest(variant=variant, call=suffix, parameter=register):
+                        with self.assertRaisesRegex(RuntimeError, "return.*boundary"):
+                            return_contract(variant, mutate(OBJECTS[variant], root_name, pc, root_texts[pc], new))
+                name, insns = instructions(variant, suffix)
+                texts = dict(insns)
+                # The caller's key is not this function's r10 frame.
+                pc, old = next((pc, text) for pc, text in insns
+                               if re.fullmatch(r"r[14] = \*\(u64 \*\)\(r2 \+ 0x0\)", text))
+                with self.subTest(variant=variant, function=suffix, control="separate key frame"):
+                    with self.assertRaisesRegex(RuntimeError, "return.*key"):
+                        return_contract(variant, mutate(OBJECTS[variant], name, pc, old,
+                            old.replace("(r2 +", "(r10 +")))
+                reads = [pc for pc, text in insns if text == "call 0x70"]
+                self.assertEqual(len(reads), 6)
+                for call in reads:
+                    width, old = next((pc, text) for pc, text in reversed(insns)
+                                      if pc < call and text in ("r2 = 0x4", "r2 = 0x8"))
+                    new = "r2 = 0x8" if old == "r2 = 0x4" else "r2 = 0x4"
+                    with self.subTest(variant=variant, function=suffix, read=call):
+                        with self.assertRaisesRegex(RuntimeError, "return|retained|layout"):
+                            return_contract(variant, mutate(OBJECTS[variant], name, width, old, new))
+                if suffix == "ordinary_return":
+                    remove = call_site(variant, name, "p11_owner_start_remove")
+                    pc, old = next((pc, text) for pc, text in insns if pc > remove
+                                   and re.fullmatch(r"r1 = \*\(u64 \*\)\(r10 - 0x[0-9a-f]+\)", text))
+                    with self.subTest(variant=variant, control="unknown outlined callee"):
+                        with self.assertRaisesRegex(RuntimeError, "return.*(callee|unresolved)"):
+                            return_contract(variant, mutate(OBJECTS[variant], name, pc, old,
+                                "call 0x123456", internal_call=True))
+                user_stores = [(pc, text) for pc, text in insns
+                               if re.fullmatch(r"\*\(u32 \*\)\(r7 \+ 0x70\) = [rw]\d+", text)]
+                self.assertEqual(len(user_stores), 1)
+                pc, old = user_stores[0]
+                with self.subTest(variant=variant, function=suffix, control="finite user type copy"):
+                    with self.assertRaisesRegex(RuntimeError, "return.*user.type"):
+                        return_contract(variant, mutate(OBJECTS[variant], name, pc, old, "r0 = r0"))
+                if suffix == "object_return":
+                    fill = call_site(variant, name, "object_fill_return")
+                    pc, old = next((pc, text) for pc, text in insns if pc > fill
+                                   and re.fullmatch(r"if r6 == 0x0 goto .*", text))
+                    with self.subTest(variant=variant, control="failed emission cannot submit"):
+                        with self.assertRaisesRegex(RuntimeError, "return.*emission"):
+                            return_contract(variant, mutate(OBJECTS[variant], name, pc, old, "goto +0x0"))
+                for caller, _, pc, target in CHECKER["D"].internal_call_targets(OBJECTS[variant]):
+                    if caller == name and target == "p11_owner_start_remove":
+                        with self.subTest(variant=variant, function=suffix, retirement=pc):
+                            with self.assertRaisesRegex(RuntimeError, "return|retir|START"):
+                                return_contract(variant, mutate(OBJECTS[variant], name, pc, texts[pc], "r0 = 0x0"))
 
     def test_scalar_index_register_alias(self):
         pc = before_call("default", "p11_entry", "capture_scalar", r"r3 = r8")
@@ -1046,6 +1099,21 @@ class EntryObjectTests(unittest.TestCase):
         consumer.text[1414] = "r9 = atomic_fetch_or((u64 *)(r0 + 0x70), r9)"
         state = {"r0": ("event", 0), "r9": ("constant", 1), ("event_slot",): ("low", identity)}
         self.assertEqual(consumer.step(1414, state)[("event_slot",)], ("low", identity))
+        # Return's START and external caller key are immutable parameters,
+        # distinct from the callee's writable local frame and ring record.
+        _, body = instructions("default", "object_return")
+        outlined = CHECKER["_ReturnCaller"](".text", "object_return",
+            CHECKER["D"].function_blocks(OBJECTS["default"])[next(name for name in
+                CHECKER["D"].function_blocks(OBJECTS["default"]) if name.endswith("object_return"))], {})
+        pc = body[0][0]
+        outlined.proof = CHECKER["_ReturnProof"](0, True, 7, "object", {})
+        for syntax in ("lock *(u64 *)(r3 + 0x38) += r5", "*(u32 *)(r3 + 0x38) = w5",
+                       "*(u64 *)(r2 + 0x8) = r5", "*(u32 *)(r1 + 0x0) = w5"):
+            with self.subTest(readonly_write=syntax):
+                outlined.text[pc] = syntax
+                with self.assertRaisesRegex(RuntimeError, "return.*(immutable|footprint)"):
+                    outlined.step(pc, {"r1": ("context", 0), "r2": ("external_key", identity, 0),
+                        "r3": ("owned", 7, 0), "r5": ("constant", 1), ("live", 7): True})
 
 
 if __name__ == "__main__":

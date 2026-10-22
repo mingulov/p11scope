@@ -54,8 +54,10 @@ def narrow(fact, width):
     if width == 64 or fact[0] == "field":
         return fact
     if width == 32:
-        if fact[0] == "scalar":
-            return ("scalar", fact[1], 32)
+        if fact[0] in ("scalar", "retained"):
+            return (fact[0], fact[1], 32)
+        if fact[0] == "key_tail":
+            return ("low", fact[1])
         if fact[0] == "cookie":
             return ("low", fact[1])
         if fact[0] in ("low", "high", "selected"):
@@ -74,8 +76,8 @@ def address(state, base, sign, offset):
         return ("descriptor", fact[1], delta)
     if fact[0] == "owned":
         return ("owned", fact[1], fact[2] + delta)
-    if fact[0] == "function_value":
-        return ("function_value", fact[1], fact[2] + delta)
+    if fact[0] in ("function_value", "external_key"):
+        return (fact[0], fact[1], fact[2] + delta)
     return None
 
 
@@ -1464,7 +1466,7 @@ def seeded_start_contract(disassembly):
 def final_sink_contract(consumer, variant, selectors, internal_blocks, internal_calls):
     name = consumer.name
     if name == "p11_return":
-        return retained_contract(consumer, variant, selectors)
+        return retained_contract(consumer, variant, selectors, internal_blocks, internal_calls)
     consumer = _OwnedCaller(consumer.section, name, consumer.lines, consumer.calls)
     mode = {"p11_entry_template": 1, "p11_entry_template_pair": 3,
             "p11_entry_template_types": 2, "p11_entry_template_second": "second"}.get(name, 0)
@@ -1494,23 +1496,252 @@ def final_sink_contract(consumer, variant, selectors, internal_blocks, internal_
     return {"roles": roles, "mode": mode, "scenarios": len(selectors)*2}
 
 
-def retained_contract(consumer, variant, selectors):
-    # Return copies these scalars while START is owned, before removal. They
-    # are retained values, never permission to reuse the removed map pointer.
-    delta = int(variant == "unsafe")
-    sites = {1447+delta: (0x30, 1, 1), 1673+delta: (0x30, 1, 0),
-             1617+delta: (0x20, None, 1), 1682+delta: (0x20, None, 0),
-             1651+delta: (0x30, 12, 1), 1692+delta: (0x30, 12, 0)}
+class _ReturnCaller(_SeedCaller):
+    """An outlined frame with explicit external key and START parameters."""
+    identity = ("uretprobe", "p11_return")
+
+    def transfer(self, pc, incoming):
+        state = super().transfer(pc, incoming)
+        text, target = self.text[pc], self.calls.get(pc, "")
+        if match := LOAD.fullmatch(text):
+            pointer = address(incoming, match[3], match[4], match[5])
+            fact = None
+            if pointer and pointer[0] == "external_key":
+                fact = {0: ("pid_tgid", self.identity), 8: ("key_tail", self.identity)}.get(pointer[2]) if match[2] == "64" else None
+            elif pointer and pointer[0] == "owned":
+                fact = ("retained", pointer[2], int(match[2]))
+            if fact:
+                state[reg(match[1])] = fact
+        if match := STORE.fullmatch(text):
+            pointer = address(incoming, match[2], match[3], match[4])
+            if pointer and pointer[0] == "stack" and match[1] == "64" and value(incoming, match[5]) == ("key_tail", self.identity):
+                state[("stack", pointer[1], 4)] = ("low", self.identity)
+                state[("stack", pointer[1]+4, 4)] = ("constant", 0)
+        if match := STORE.fullmatch(text):
+            pointer = address(incoming, match[2], match[3], match[4])
+            if pointer and pointer[0] == "event":
+                size = int(match[1])//8
+                if pointer[1] < 0x74 and 0x70 < pointer[1]+size:
+                    state.pop(("event_user_type",), None)
+                if pointer[1] == 0x70 and match[1] == "32":
+                    fact = narrow(value(incoming, match[5]), 32)
+                    if fact is not None:
+                        state[("event_user_type",)] = fact
+            elif pointer is None:
+                state.pop(("event_user_type",), None)
+        if "atomic" in text or "xchg" in text or text.startswith("lock "):
+            match = ATOMIC_POINTER.search(text) or EXCHANGE_POINTER.search(text)
+            pointer = address(incoming, *match.groups()[1:]) if match else None
+            if pointer is None or pointer[0] == "event" and pointer[1] < 0x74 and 0x70 < pointer[1]+int(match[1])//8:
+                state.pop(("event_user_type",), None)
+        if pc in self.helper and text == "call 0x83":
+            state.pop(("event_user_type",), None)
+        if target == "memset" or pc in self.helper and text in ("call 0x70", "call 0x72"):
+            pointer = incoming.get("r1")
+            size = incoming.get("r3" if target == "memset" else "r2")
+            if pointer and pointer[0] == "event" and (not size or size[0] != "constant"
+                    or pointer[1] < 0x74 and 0x70 < pointer[1]+size[1]):
+                state.pop(("event_user_type",), None)
+        if target == "p11_owner_start_get":
+            state["r0"] = ("owned", pc, 0)
+        elif target.endswith("scope_flags_word"):
+            state["r0"] = ("scope_flags", self.identity)
+        if match := re.fullmatch(r"(r\d+) \+= (-?0x[0-9a-f]+)", text):
+            fact = incoming.get(match[1])
+            if fact and fact[0] in ("owned", "external_key"):
+                state[match[1]] = (fact[0], fact[1], fact[2]+int(match[2],16))
+        # A tail adapter only writes its ObjectCallWire destination. The
+        # base event and local snapshot are disjoint from that narrow region.
+        if any(target.endswith(suffix) for suffix in ("object_tail_fill", "object_emit_find", "object_emit_get_attributes")):
+            require(incoming.get("r1") == ("event", 0x170), self.label(pc)+": return tail output boundary")
+            if ("event_slot",) in incoming:
+                state[("event_slot",)] = incoming[("event_slot",)]
+        return state
+
+
+class _ReturnRootProof(SinkProof):
+    def __init__(self, abi, owner, targets):
+        super().__init__("return", abi, True, ("owned", owner, 0), kind="return")
+        self.retained_sites, self.targets = {}, targets
+
+    def partition(self, state):
+        return super().partition(state) + (state.get(("live", self.start[1])), state.get(("object_mode",)))
+
+    def transfer(self, consumer, pc, before, state):
+        text, target = consumer.text[pc], consumer.calls.get(pc, "")
+        if text.startswith("call "):
+            allowed = target in ("p11_owner_start_get", "p11_owner_start_remove", "p11_object_fault") or target.endswith("scope_flags_word") or pc in self.targets
+            require(allowed if pc not in consumer.helper else text in ("call 0x1", "call 0xc", "call 0xe", "call 0xae"),
+                    consumer.label(pc)+": return unknown root callee/helper")
+        if target.startswith("p11_owner_start_"):
+            key = before.get("r1")
+            require(key and key[0] == "stack" and stack_read(before, key, 8) == ("pid_tgid", consumer.identity)
+                    and stack_read(before, key, 4, 8) == ("low", consumer.identity)
+                    and stack_read(before, key, 4, 12) == ("constant", 0),
+                    consumer.label(pc)+": return START lookup/cleanup key provenance")
+        if pc in self.targets:
+            role = self.targets[pc]
+            require(before.get("r1") == ("context", 0) and before.get("r3") == self.start
+                    and before.get(("live", self.start[1])) and before.get("r4") == ("scope_flags", consumer.identity)
+                    and before.get("r5") == ("constant", self.abi),
+                    consumer.label(pc)+": return context/START/flags/layout boundary")
+            key = before.get("r2")
+            require(key and key[0] == "stack" and stack_read(before, key, 8) == ("pid_tgid", consumer.identity)
+                    and stack_read(before, key, 4, 8) == ("low", consumer.identity)
+                    and stack_read(before, key, 4, 12) == ("constant", 0),
+                    consumer.label(pc)+": return full caller key boundary")
+            require(before.get(("object_mode",)) == (role == "object"),
+                    consumer.label(pc)+": return marker routing boundary")
+            self.boundaries.add(pc)
+        return super().transfer(consumer, pc, before, state)
+
+    def edges(self, consumer, pc, before, after):
+        branch = BRANCH.fullmatch(consumer.text[pc])
+        for successor, state in super().edges(consumer, pc, before, after):
+            if branch and value(before, branch[1]) == ("retained", 0x108, 64) and value(before, branch[3]) == ("constant", 0):
+                zero_taken = zero_partition(value(before, branch[1]), branch[2], 64)
+                require(zero_taken is not None and branch[1].startswith("r"), consumer.label(pc)+": return marker full-word guard")
+                state[("object_mode",)] = (successor == D.relative_target(pc, consumer.text[pc])) != zero_taken
+            yield successor, state
+
+    def finish(self, consumer):
+        require(self.boundaries == set(self.targets), consumer.name+": return outlined boundary inventory")
+
+
+class _ReturnProof(SinkProof):
+    def __init__(self, abi, present, owner, role, sites):
+        super().__init__("return", abi, present, ("owned", owner, 0), kind="return")
+        self.return_role, self.retained_sites = role, sites
+        self.submits = set()
+        self.emission_roles = ("object_fill_return", "object_tail_fill", "object_emit_find", "object_emit_get_attributes")
+
+    def partition(self, state):
+        return super().partition(state) + tuple(state.get((key,)) for key in ("retired", "settled", "fault", "emitted"))
+
+    def transfer(self, consumer, pc, before, state):
+        text, target = consumer.text[pc], consumer.calls.get(pc, "")
+        error = lambda message: consumer.label(pc)+": return "+message
+        if text.startswith("call "):
+            allowed = target in ("memset", "p11_link_current_identity", "p11_owner_start_remove", "p11_object_fault",
+                                 "p11_object_side_get", "p11_instance_return", "p11_root_current_tag") or any(target.endswith(role) for role in self.emission_roles)
+            require(allowed if pc not in consumer.helper else text in ("call 0x1", "call 0x2", "call 0x5", "call 0xe",
+                    "call 0x50", "call 0x70", "call 0x83", "call 0x84", "call 0x85", "call 0xae"), error("unknown callee/helper footprint"))
+        if match := STORE.fullmatch(text):
+            pointer = address(before, match[2], match[3], match[4])
+            require(pointer and pointer[0] in ("stack", "event")
+                    or before.get("r"+match[2], (None,))[0] == "result", error("unknown or immutable START/key/context write"))
+        if "atomic" in text or "xchg" in text or text.startswith("lock "):
+            match = ATOMIC_POINTER.search(text) or EXCHANGE_POINTER.search(text)
+            pointer = address(before, *match.groups()[1:]) if match else None
+            require(match and (pointer and pointer[0] in ("stack", "event")
+                    or before.get("r"+match[2], (None,))[0] == "result"), error("immutable or unknown atomic footprint"))
+        if match := LOAD.fullmatch(text):
+            pointer = address(before, match[3], match[4], match[5])
+            if pointer and pointer[0] == "owned":
+                require(before.get(("live", self.start[1])), error("START read after retirement"))
+        if target in ("p11_owner_start_remove", "p11_object_side_get", "p11_instance_return"):
+            key = before.get("r1")
+            require(key and key[0] == "stack" and stack_read(before, key, 8) == ("pid_tgid", consumer.identity)
+                    and stack_read(before, key, 4, 8) == ("low", consumer.identity)
+                    and stack_read(before, key, 4, 12) == ("constant", 0), error("full callee key provenance"))
+        if target == "p11_owner_start_remove":
+            require(before.get("r2") == ("constant", 1) and not before.get(("retired",)), error("required single retirement attempt"))
+            state[("retired",)] = True
+            state["r0"] = ("retire_result", pc)
+        if target == "p11_object_fault":
+            require(before.get(("retired",)), error("fault before retirement attempt"))
+            state[("fault",)] = True
+        if target == "p11_object_side_get" or any(target.endswith(suffix) for suffix in
+                ("object_fill_return", "object_tail_fill", "object_emit_find", "object_emit_get_attributes")):
+            require(self.return_role == "object" and before.get(("live", self.start[1])), error("side access after retirement"))
+        for role in self.emission_roles:
+            if target.endswith(role):
+                state["r0"] = ("emission_result", role)
+        if target == "p11_instance_return":
+            require(before.get("r2") == ("event", 0x148), error("continuity output boundary"))
+            require(before.get(("live", self.start[1])) if self.return_role == "object" else before.get(("settled",)),
+                    error("continuity lifetime boundary"))
+        if pc in self.retained_sites:
+            require(before.get(("live", self.start[1])) if self.return_role == "object" else before.get(("settled",)),
+                    error("retained read lifetime boundary"))
+            output, size = before.get("r1"), before.get("r2")
+            require(output and output[0] == "stack" and size and size[0] == "constant"
+                    and -512 <= output[1] and output[1]+size[1] <= 0, error("retained read output outside local frame"))
+        if text == "call 0x83" and pc in consumer.helper:
+            require(before.get("r1") == ("map", "EVENTS")
+                    and before.get("r2") == ("constant", 608 if self.return_role == "object" else 368), error("record reserve size"))
+        if text == "call 0x84" and pc in consumer.helper:
+            require(before.get("r1") == ("event", 0) and before.get(("settled",)), error("submit before successful retirement"))
+            require(before.get(("event_slot",)) == ("low", consumer.identity), error("Event.slot corrupted before submit"))
+            require(before.get(("event_user_type",)) == ("retained", 0x38, 32), error("user_type was not copied unchanged"))
+            if self.return_role == "object":
+                require(before.get(("emitted",)) == frozenset(self.emission_roles), error("submit bypassed successful emission"))
+            self.submits.add(pc)
+        if text == "exit":
+            require(before.get(("retired",)) and (before.get(("settled",)) or before.get(("fault",))),
+                    error("exit bypassed checked retirement/fault"))
+        return super().transfer(consumer, pc, before, state)
+
+    def edges(self, consumer, pc, before, after):
+        branch = BRANCH.fullmatch(consumer.text[pc])
+        for successor, state in super().edges(consumer, pc, before, after):
+            if branch and (fact := value(before, branch[1])) and fact[0] == "emission_result":
+                zero_taken = zero_partition(fact, branch[2], 64) if value(before, branch[3]) == ("constant", 0) else None
+                require(zero_taken is not None, consumer.label(pc)+": return emission result guard")
+                if (successor == D.relative_target(pc, consumer.text[pc])) != zero_taken:
+                    state[("emitted",)] = before.get(("emitted",), frozenset()) | {fact[1]}
+            if branch and (fact := value(before, branch[1])) and fact[0] == "retire_result":
+                require(branch[1].startswith("r") and value(before, branch[3]) == ("constant", 0) and branch[2] in ("==", "!="),
+                        consumer.label(pc)+": return retirement result guard")
+                success = (successor == D.relative_target(pc, consumer.text[pc])) == (branch[2] == "==")
+                state[("settled",)] = success
+            yield successor, state
+
+    def finish(self, consumer):
+        require(self.submits, consumer.name+": return no positive submit witness")
+        if self.present:
+            require(self.boundaries == {pc for pc, (_, _, abi) in self.retained_sites.items() if abi == self.abi},
+                    consumer.name+": retained read inventory/layout differs")
+
+
+def retained_contract(consumer, variant, selectors, internal_blocks, internal_calls):
+    root = _ReturnCaller(consumer.section, consumer.name, consumer.lines, consumer.calls)
+    gets = [pc for pc, target in root.calls.items() if target == "p11_owner_start_get"]
+    require(len(gets) == 1, "return START lookup inventory")
+    targets = {}
+    bodies = {}
+    for role in ("ordinary", "object"):
+        names = [name for name in internal_blocks if name.endswith(role+"_return")]
+        require(len(names) == 1, "return outlined callee inventory: "+role)
+        name = names[0]
+        sites = [pc for pc, target in root.calls.items() if target == name]
+        require(len(sites) == 1, "return outlined caller inventory: "+role)
+        targets[sites[0]] = role
+        bodies[role] = _ReturnCaller(".text", name, internal_blocks[name], internal_calls.get(name, {}))
     for selector in selectors:
-        abi = int(selector == 0x23)
-        for present in (False, True):
-            proof = SinkProof("return", abi, present, None, kind="return")
-            proof.retained_sites = sites
-            consumer.facts(proof=proof)
-            if present:
-                require(proof.boundaries == {pc for pc, (_, _, layout) in sites.items() if layout == abi},
-                        consumer.name + ": retained read inventory/layout differs")
-    return {"retained_offsets": [0x20, 0x30], "scenarios": len(selectors)*2}
+        root.facts(proof=_ReturnRootProof(int(selector == 0x23), gets[0], targets))
+    # Literal role inventories: OpenSession, mechanism and ASYNC_GET_ID each
+    # have one actual 4-byte and one 8-byte read. Provenance is checked below.
+    inventory = {
+        "ordinary": ((0x30,1,1), (0x20,None,1), (0x30,1,0), (0x30,12,1), (0x20,None,0), (0x30,12,0)),
+        "object": ((0x30,12,1), (0x20,None,1), (0x30,1,1), (0x20,None,0), (0x30,1,0), (0x30,12,0)),
+    }
+    report = {}
+    for role, body in bodies.items():
+        helpers = [pc for pc, text in body.insns if text == "call 0x70" and pc in body.helper]
+        require(len(helpers) == 6, body.name+": retained read helper inventory")
+        sites = dict(zip(helpers, inventory[role]))
+        retires = [pc for pc, target in body.calls.items() if target == "p11_owner_start_remove"]
+        require(len(retires) == (1 if role == "ordinary" else 7), body.name+": return retirement inventory")
+        for selector in selectors:
+            abi = int(selector == 0x23)
+            for present in (False, True):
+                initial = {"r1": ("context", 0), "r2": ("external_key", root.identity, 0),
+                           "r3": ("owned", gets[0], 0), "r4": ("scope_flags", root.identity),
+                           "r5": ("constant", abi), "r10": ("stack", 0), ("live", gets[0]): True}
+                body.facts(initial, proof=_ReturnProof(abi, present, gets[0], role, sites))
+        report[role] = {"function": body.name, "retained_reads": sorted(sites), "retirements": retires}
+    return {"retained_offsets": [0x20, 0x30], "scenarios": len(selectors)*2, "outlined": report}
 
 
 def descriptor_contract(consumer, facts, lookup):

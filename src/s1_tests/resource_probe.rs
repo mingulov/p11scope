@@ -748,13 +748,26 @@ fn native_semantic_resource_final_types_pinned() {
     // (+248 each, measured 680 on Rust 1.98.1 x86-64 Linux); the
     // same-wire joint custody series adds the 72 B resource-only
     // `joint_resource` lineage to the envelope (97b4fb38), measured
-    // 752. The pins keep catching any further drift before SYSTEM
-    // activation.
-    assert_eq!(size_of::<crate::semantic_capture::TickOutcome>(), 752);
+    // 752. Actual-H0 custody (0b50b3e1) adds the inline optional origin:
+    // raw allocation identity, wire index and issued H0 ordinal (24 B +
+    // 8 B Option tag). It moves through admission without an allocation.
+    // Raw collection/prepared retention and the batch bounds below use
+    // size_of of their actual entries, so this does not require a larger
+    // population cap or a new fixed pool charge.
+    use crate::semantics_objects::journal::joint_driver::CollectedCallOrigin;
+    assert_eq!(size_of::<CollectedCallOrigin>(), 24);
+    assert_eq!(size_of::<Option<CollectedCallOrigin>>(), 32);
+    assert_eq!(
+        size_of::<crate::semantic_capture::TickOutcome>(),
+        752 + size_of::<Option<CollectedCallOrigin>>()
+    );
     // TickReport carries the H0 disposition watermarks C5 requires
     // (allocated floor, awaiting/shed floors, exhaustion: +48 B).
     assert_eq!(size_of::<crate::semantic_capture::TickReport>(), 160);
-    assert_eq!(size_of::<crate::semantic_capture::RoutedCall>(), 752);
+    assert_eq!(
+        size_of::<crate::semantic_capture::RoutedCall>(),
+        752 + size_of::<Option<CollectedCallOrigin>>()
+    );
     // H6 retains the calibrated mapped-file identity in the watched target.
     assert_eq!(
         size_of::<crate::semantic_capture::CurrentPartitionReceipt>(),

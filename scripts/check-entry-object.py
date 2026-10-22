@@ -866,7 +866,28 @@ class SinkProof:
             require("tail" in self.boundaries, consumer.name + ": final-sink mode pair: tail boundary missing")
 
 
-def scalar_body_contract(internal_blocks, internal_calls, variant):
+def ia32_register_transfer(text, incoming):
+    """Conservative constant facts for the disassembled span proof."""
+    state = list(incoming)
+    if text.startswith("call "):
+        state[:6] = [None] * 6
+    elif "atomic" in text or "xchg" in text or text.startswith("lock "):
+        state = [None] * 11
+    elif match := re.fullmatch(r"([rw])(\d+) = (-?0x[0-9a-f]+)(?: ll)?", text):
+        state[int(match[2])] = int(match[3], 16) & ((1 << (32 if match[1] == "w" else 64)) - 1)
+    elif match := re.fullmatch(r"([rw])(\d+) = ([rw])(\d+)", text):
+        fact = incoming[int(match[4])]
+        state[int(match[2])] = (fact & 0xffffffff if fact is not None
+                               and "w" in (match[1], match[3]) else fact)
+    elif match := re.match(r"[rw](\d+)\s", text):
+        state[int(match[1])] = None
+    elif not (BRANCH.fullmatch(text) or STORE.fullmatch(text)
+              or text == "exit" or re.fullmatch(r"goto [+-]0x[0-9a-f]+", text)):
+        state = [None] * 11
+    return tuple(state)
+
+
+def ia32_reader_contract(internal_blocks, internal_calls):
     # The scalar-return summary depends on normalization of the supplied RSP,
     # independently of the index normalization also present in this body.
     require("p11_read_ia32_arg" in internal_blocks, "missing ia32 scalar reader")
@@ -882,16 +903,16 @@ def scalar_body_contract(internal_blocks, internal_calls, variant):
     reader_consumer = Consumer(".text", "p11_read_ia32_arg", internal_blocks["p11_read_ia32_arg"],
                                internal_calls.get("p11_read_ia32_arg", {}))
     require(user_reads[0] in reader_consumer.helper, "ia32 reader span requires genuine user helper")
-    updates = {}
-    for pc, text in reader:
-        constant = re.fullmatch(r"([rw])0 = (-?0x[0-9a-f]+)(?: ll)?", text)
-        if constant:
-            updates[pc] = int(constant[2], 16) & ((1 << (32 if constant[1] == "w" else 64)) - 1)
-        elif re.match(r"[rw]0 ", text) or text.startswith("call "):
-            updates[pc] = None
+    require(reader_consumer.facts().get(span[0], {}).get("r1") == ("constant", 0xfffffffc),
+            "ia32 reader span limit must cover the complete u32")
     SPAN.validate_ia32_span_paths(reader_consumer.graph, reader[0][0], span[0],
-        D.relative_target(span[0], reader_consumer.text[span[0]]), user_reads[0], updates,
-        {pc for pc, text in reader if text == "exit"})
+        D.relative_target(span[0], reader_consumer.text[span[0]]), user_reads[0], {},
+        {pc for pc, text in reader if text == "exit"},
+        register_transfer=lambda pc, state: ia32_register_transfer(reader_consumer.text[pc], state))
+
+
+def scalar_body_contract(internal_blocks, internal_calls, variant):
+    ia32_reader_contract(internal_blocks, internal_calls)
     names = [name for name in internal_blocks if name.endswith("capture_scalar")]
     require(len(names) == 1, "scalar-read callee inventory")
     name = names[0]

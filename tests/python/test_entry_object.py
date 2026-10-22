@@ -67,6 +67,15 @@ def internal_callee_instruction(variant, fragment):
     return f"call {pc - 1:#x}"
 
 
+def internal_contract(variant, name, disassembly=None):
+    split = CHECKER["sections"](OBJECTS[variant] if disassembly is None else disassembly)
+    blocks = CHECKER["D"].function_blocks(split[".text"])
+    calls = {}
+    for caller, _, pc, target in CHECKER["D"].internal_call_targets(split[".text"]):
+        calls.setdefault(caller, {})[pc] = target
+    return CHECKER[name](blocks, calls)
+
+
 def mutate(disassembly, function, pc, old, new, internal_call=False, helper_call=False):
     """Change exactly one decoded instruction, retaining its actual-object origin."""
     symbols = list(re.finditer(r"(?m)^[0-9a-f]+ <([^>]+)>:$", disassembly))
@@ -196,26 +205,66 @@ class EntryObjectTests(unittest.TestCase):
 
     def test_ia32_span_rejection_edge_is_causal(self):
         for variant in OBJECTS:
+            internal_contract(variant, "ia32_reader_contract")
             name, insns = instructions(variant, "p11_read_ia32_arg")
             pc = site(variant, name, r"if r3 > r1 goto .*")
             old = dict(insns)[pc]
             for new in ("if r3 > r1 goto +0x0", "goto +0x0"):
                 with self.subTest(variant=variant, mutation=new):
                     with self.assertRaisesRegex(RuntimeError, "ia32.*span"):
-                        CHECKER["contract"](mutate(OBJECTS[variant], name, pc, old, new), variant)
+                        internal_contract(variant, "ia32_reader_contract",
+                            mutate(OBJECTS[variant], name, pc, old, new))
             # Bypassing the read is insufficient if the rejected path picks up
             # an uninitialized successful-read payload instead of the sentinel.
-            payload = site(variant, name, r"r0 = \*\(u32 \*\)\(r10 - 0x4\)")
+            payload = site(variant, name, r"[rw]\d+ = \*\(u32 \*\)\(r10 - 0x4\)")
             with self.subTest(variant=variant, mutation="rejection returns payload"):
                 with self.assertRaisesRegex(RuntimeError, "ia32.*span.*sentinel"):
-                    CHECKER["contract"](mutate(OBJECTS[variant], name, pc, old,
-                        f"if r3 > r1 goto {payload-pc-1:+#x}"), variant)
-            # A different real rejection block that explicitly restores the
-            # sentinel is valid; the checker must not freeze the branch offset.
-            sentinel = site(variant, name, r"r0 = 0x100000000 ll", 1)
-            changed = mutate(OBJECTS[variant], name, pc, old,
-                             f"if r3 > r1 goto {sentinel-pc-1:+#x}")
-            self.assertTrue(CHECKER["contract"](changed, variant)["verified"])
+                    internal_contract(variant, "ia32_reader_contract",
+                        mutate(OBJECTS[variant], name, pc, old,
+                            f"if r3 > r1 goto {payload-pc-1:+#x}"))
+            saved_pc, saved = next((p, t) for p, t in insns if t.endswith(" = 0x100000000 ll"))
+            register = saved.split(" = ")[0]
+            restore = site(variant, name, rf"r0 = {register}")
+            texts = dict(insns)
+            for where, replacement in ((saved_pc, register + " = 0x200000000 ll"),
+                                        (saved_pc, register + " = r9"),
+                                        (restore, "w0 = w" + register[1:]),
+                                        (restore, "r0 = (s16)" + register)):
+                with self.subTest(variant=variant, mutation=replacement):
+                    with self.assertRaisesRegex(RuntimeError, "ia32.*span.*sentinel"):
+                        internal_contract(variant, "ia32_reader_contract",
+                            mutate(OBJECTS[variant], name, where, texts[where], replacement))
+        # Equivalent explicit/saved return blocks remain valid; a helper only
+        # preserves the callee-saved form. Each path must retain its own fact.
+        graph = {0: [1], 1: [2, 4], 2: [3], 3: [], 4: [5], 5: [6], 6: []}
+        for saved in (False, True):
+            texts = {0: "r6 = 0x100000000 ll" if saved else "r0 = 0x100000000 ll",
+                     1: "if r3 > r1 goto +0x2", 2: "call 0x70", 3: "exit",
+                     4: "call 0x5" if saved else "r1 = r1",
+                     5: "r0 = r6" if saved else "r0 = r0", 6: "exit"}
+            CHECKER["SPAN"].validate_ia32_span_paths(graph, 0, 1, 4, 2, {}, {3, 6},
+                register_transfer=lambda pc, state: CHECKER["ia32_register_transfer"](texts[pc], state))
+        for replacement in ("w0 = w6", "r0 = w6", "w0 = r6", "r0 = (s8)r6",
+                            "r0 = (s16)r6", "r0 = (s32)r6", "r0 = r5"):
+            with self.subTest(mutation=replacement), self.assertRaisesRegex(RuntimeError, "span.*sentinel"):
+                CHECKER["SPAN"].validate_ia32_span_paths(graph, 0, 1, 4, 2, {}, {3, 6},
+                    register_transfer=lambda pc, state: CHECKER["ia32_register_transfer"](
+                        replacement if pc == 5 else texts[pc], state))
+        for fault in ("caller-saved", "atomic-write"):
+            changed = dict(texts)
+            if fault == "caller-saved":
+                changed.update({0: "r5 = 0x100000000 ll", 5: "r0 = r5"})
+            else:
+                changed[4] = "r6 = atomic_fetch_or((u64 *)(r10 - 0x8), r6)"
+            with self.subTest(mutation=fault), self.assertRaisesRegex(RuntimeError, "span.*sentinel"):
+                CHECKER["SPAN"].validate_ia32_span_paths(graph, 0, 1, 4, 2, {}, {3, 6},
+                    register_transfer=lambda pc, state: CHECKER["ia32_register_transfer"](changed[pc], state))
+        merge = {0: [1], 1: [2, 4], 2: [3], 3: [], 4: [5, 6], 5: [7], 6: [7], 7: [8], 8: []}
+        changed = texts | {4: "if r7 == 0x0 goto +0x1", 5: "r6 = 0x0",
+                           6: "r7 = r7", 7: "r0 = r6", 8: "exit"}
+        with self.assertRaisesRegex(RuntimeError, "span.*sentinel"):
+            CHECKER["SPAN"].validate_ia32_span_paths(merge, 0, 1, 4, 2, {}, {3, 8},
+                register_transfer=lambda pc, state: CHECKER["ia32_register_transfer"](changed[pc], state))
 
     def test_async_string_read_requires_genuine_helper_call_kind(self):
         for variant, suffix in (("default", "p11_entry"), ("unsafe", "capture_async_target")):

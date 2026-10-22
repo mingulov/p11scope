@@ -703,13 +703,58 @@ fn joint_prepared_batch_keeps_equal_shaped_original_admissions() {
     let batch = fixture.collected_tick();
     assert_eq!(fixture.h0.0.borrow().last_calls.len(), 3);
     fixture.scene.coordinator.stage_semantic_batch(batch);
+    let charged_before = fixture
+        .scene
+        .coordinator
+        .registry()
+        .semantic_resource_snapshot()
+        .charged_bytes;
     fixture
         .scene
         .coordinator
         .prepare_staged_semantic_batch(&mut fixture.lane, None)
         .unwrap();
+    let charged_retained = fixture
+        .scene
+        .coordinator
+        .registry()
+        .semantic_resource_snapshot()
+        .charged_bytes;
+    assert!(
+        charged_retained > charged_before,
+        "retained original buffers have one pool charge"
+    );
+    assert!(
+        fixture
+            .scene
+            .coordinator
+            .prepare_staged_semantic_batch(&mut fixture.lane, None)
+            .is_err()
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .coordinator
+            .registry()
+            .semantic_resource_snapshot()
+            .charged_bytes,
+        charged_retained
+    );
     assert!(fixture.h0.0.borrow().validations > 0);
     let prepared = fixture.scene.coordinator.prepared_semantic_batch().unwrap();
+    assert_eq!(prepared.next_admission().unwrap().h0_ordinal(), 1);
+    assert!(prepared.current_receipts().iter().any(|receipt| {
+        Arc::ptr_eq(
+            receipt.original_pin(),
+            &fixture
+                .scene
+                .coordinator
+                .semantic_bindings()
+                .get(fixture.scene.coordinator.adapter().live_id(pid).unwrap())
+                .unwrap()
+                .pin(),
+        )
+    }));
     let originals: Vec<_> = prepared
         .admissions()
         .map(|input| {
@@ -746,6 +791,16 @@ fn joint_prepared_batch_keeps_equal_shaped_original_admissions() {
             .scene
             .coordinator
             .finish_prepared_semantic_batch(&fixture.lane)
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .coordinator
+            .registry()
+            .semantic_resource_snapshot()
+            .charged_bytes,
+        charged_before,
+        "finished handoff releases its exact retained charge"
     );
     assert!(
         !fixture
@@ -800,6 +855,12 @@ fn joint_prepared_batch_claim_refusal_and_stage_cursors_do_not_replay() {
                 .claim_next_prepared_admission(&mut adapter),
             Some((ordinal, Err(AttestationRefusal::Stopped)))
         );
+        if ordinal == 1 {
+            assert!(
+                !fixture.scene.coordinator.stage_next_prepared_admission(),
+                "all sibling claim decisions precede any original staging move"
+            );
+        }
     }
     assert!(
         fixture

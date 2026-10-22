@@ -5,6 +5,8 @@ use super::*;
 
 #[path = "semantics/finalizer.rs"]
 mod finalizer;
+#[path = "semantics/joint.rs"]
+mod joint;
 #[path = "semantics/promotion.rs"]
 mod promotion;
 #[cfg(test)]
@@ -30,6 +32,8 @@ use crate::semantic_capture::{
 use crate::semantics_edge::resources::{OWNED_ALLOCATION_PADDING, ResourceLease};
 pub(super) use finalizer::SessionFinalizerState;
 pub(crate) use finalizer::SessionH3Finalizer;
+pub(crate) use joint::PreparedSemanticBatch;
+use joint::{PendingSemanticBatch, PreparedAdmission, PreparedH3};
 use p11scope_ebpf_common::ImageIdentity;
 pub(crate) use promotion::{
     PromotionAdmissionReservation, PromotionInstallCapacity, StagedPromotionAdmission,
@@ -2068,7 +2072,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.semantic_finalizer
             .as_mut()
             .expect("the matching Session state is retained")
-            .pending_semantic = Some(batch);
+            .pending_semantic = Some(PendingSemanticBatch::Collected(batch));
     }
 
     /// Take the latest H3 disposition evidence for one seal audit
@@ -2204,6 +2208,16 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         &mut self,
         lane: Option<&mut crate::inventory_semantics::AttestedSemanticLane>,
     ) {
+        if self.semantic_finalizer.as_ref().is_some_and(|state| {
+            state
+                .pending_semantic
+                .as_ref()
+                .is_some_and(PendingSemanticBatch::is_prepared)
+        }) {
+            // The original prepared inputs have their own explicit cursors.
+            // Another finalization cannot consume them or mint their H3 early.
+            return;
+        }
         match lane {
             None => {
                 // No validation authority: refuse unpublished batches loudly.
@@ -2213,7 +2227,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 if let Some(dropped) = self
                     .semantic_finalizer
                     .as_mut()
-                    .and_then(|state| state.pending_semantic.take())
+                    .and_then(SessionFinalizerState::take_collected)
                 {
                     self.registry.record_gap(RegistryGap {
                         caller: None,
@@ -2429,7 +2443,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         if let Some(pending) = self
             .semantic_finalizer
             .as_mut()
-            .and_then(|state| state.pending_semantic.take())
+            .and_then(SessionFinalizerState::take_collected)
         {
             self.finalize_batch(lane, pending, floor);
         }
@@ -2445,6 +2459,19 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         batch: crate::inventory_semantics::SemanticBatch,
         floor: Option<u64>,
     ) {
+        let Some(mut prepared) = self.prepare_semantic_batch(lane, batch, floor) else {
+            return;
+        };
+        self.drain_prepared_s1(&mut prepared);
+        self.finish_semantic_preparation(prepared, lane.stash_pending_floor());
+    }
+
+    fn prepare_semantic_batch(
+        &mut self,
+        lane: &mut crate::inventory_semantics::AttestedSemanticLane,
+        batch: crate::inventory_semantics::SemanticBatch,
+        floor: Option<u64>,
+    ) -> Option<PreparedSemanticBatch> {
         let domain = batch.domain();
         if self.refused_semantic_domains.contains(&domain) {
             self.registry.record_gap(RegistryGap {
@@ -2458,7 +2485,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 budget: None,
             });
             self.publish_refused_batch_negatives(batch);
-            return;
+            return None;
         }
         if domain != lane.domain() {
             self.registry.record_gap(RegistryGap {
@@ -2472,7 +2499,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 budget: None,
             });
             self.record_semantic_drop(&batch);
-            return;
+            return None;
         }
         let observed_ns = batch.observed_ns();
         let batch_awaiting = batch.awaiting_floor();
@@ -2724,62 +2751,49 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 )
             })
             .collect();
-        let mut first_admitted = None;
-        for (caller, token, result) in staged {
-            match result {
-                Ok(input) => {
-                    // D9: retain the quantum's first admission for the
-                    // seal grant's association proof. The staged
-                    // mutation below still consumes the original.
-                    if first_admitted.is_none() {
-                        first_admitted = Some(input.clone());
-                    }
-                    self.registry.observe_instance_semantic(input);
-                }
-                Err(reason) => {
-                    // A refused call never stages and never retries: its
-                    // position sheds rather than vanishing.
-                    shed_min = Some(shed_min.map_or(token, |floor| floor.min(token)));
-                    self.conversion_gap(caller, reason);
-                }
-            }
-        }
-        // H3 disposition (H8): mint completeness from this
-        // finalization's complete state and store it for the seal.
-        // Staged positions cover calls and invalidations alike; the
-        // pending floor joins the batch's route-waiting floor with
-        // unpublished and lane-stashed history; shed minima (batch,
-        // finalizer, dropped) barrier as loss.
+        Some(PreparedSemanticBatch::new(
+            domain,
+            staged.into_iter().map(PreparedAdmission::new).collect(),
+            current,
+            PreparedH3 {
+                negatives,
+                staged_positions,
+                awaiting_floor: batch_awaiting,
+                shed_floor: batch_shed.into_iter().chain(shed_min).min(),
+                exhausted: batch_exhausted || unpositioned,
+            },
+        ))
+    }
+
+    fn finish_semantic_preparation(
+        &mut self,
+        prepared: PreparedSemanticBatch,
+        stash_pending_floor: Option<u64>,
+    ) {
+        let mut h3 = prepared.into_h3();
         let state = self
             .semantic_finalizer
             .as_mut()
             .expect("finalization retains the matching Session namespace");
-        debug_assert_eq!(state.domain, lane.domain());
-        // D9: first-ever admission per namespace; a set proof is the
-        // Session-stable association, never refreshed per quantum.
-        if state.seal_admission.is_none() {
-            state.seal_admission = first_admitted;
-        }
         if let Some((floor, exhausted)) = state.pending_drop.take() {
-            shed_min = Some(shed_min.map_or(floor, |at| at.min(floor)));
-            unpositioned = unpositioned || exhausted;
+            h3.shed_floor = Some(h3.shed_floor.map_or(floor, |at| at.min(floor)));
+            h3.exhausted = h3.exhausted || exhausted;
         }
         let unpublished = state
             .pending_semantic
             .as_ref()
-            .and_then(|batch| batch.min_outcome_position())
+            .and_then(PendingSemanticBatch::min_outcome_position)
             .into_iter()
-            .chain(lane.stash_pending_floor())
+            .chain(stash_pending_floor)
             .min();
-        let shed_floor = batch_shed.into_iter().chain(shed_min).min();
         let evidence =
             crate::semantics_objects::journal::H3DispositionEvidence::from_finalizer_batch(
-                &negatives,
-                &staged_positions,
-                batch_awaiting,
-                shed_floor,
+                &h3.negatives,
+                &h3.staged_positions,
+                h3.awaiting_floor,
+                h3.shed_floor,
                 unpublished,
-                batch_exhausted || unpositioned,
+                h3.exhausted,
                 &state.h3_last,
                 state.h3_acked_below,
             );
@@ -3904,11 +3918,8 @@ mod promotion_lifecycle_tests {
         let mut coordinator = coordinator();
         let a = domain();
         let mut finalizer = SessionFinalizerState::new(a);
-        finalizer.pending_semantic = Some(crate::inventory_semantics::SemanticBatch::scripted(
-            a,
-            Vec::new(),
-            1,
-        ));
+        finalizer.pending_semantic =
+            Some(crate::inventory_semantics::SemanticBatch::scripted(a, Vec::new(), 1).into());
         coordinator.semantic_finalizer = Some(finalizer);
         coordinator.refused_semantic_domains.insert(a);
         assert!(

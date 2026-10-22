@@ -11,7 +11,7 @@ pub(in crate::discovery::engine::inventory_coordinator) struct SessionFinalizerS
     pub(super) domain: NativeDomainId,
     #[cfg_attr(not(test), allow(dead_code))] // Staged: tested only; no production seal path.
     producers: Option<SessionDrainProducers>,
-    pub(super) pending_semantic: Option<SemanticBatch>,
+    pub(super) pending_semantic: Option<PendingSemanticBatch>,
     pub(super) h3_last: H3DispositionEvidence,
     pub(super) h3_pending: Option<H3DispositionEvidence>,
     pub(super) h3_acked_below: u64,

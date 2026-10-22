@@ -110,6 +110,16 @@ impl CurrentPartitionReceipt {
     pub(crate) fn watched(&self) -> &RetainedInventoryTarget {
         &self.watched
     }
+    pub(crate) fn owned_ids_bytes(&self) -> Option<usize> {
+        let capacity = self.ids.capacity();
+        capacity
+            .checked_mul(std::mem::size_of::<InstanceId>())?
+            .checked_add(if capacity == 0 {
+                0
+            } else {
+                crate::semantics_edge::resources::OWNED_ALLOCATION_PADDING
+            })
+    }
     #[allow(clippy::result_large_err)] // Refusal returns the original receipt without allocating or discarding its custody.
     pub(crate) fn into_birth_candidate(mut self) -> Result<H0BirthCandidate, Self> {
         let Some((capture, cut, quantum)) = self.birth.take() else {

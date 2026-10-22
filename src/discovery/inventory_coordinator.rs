@@ -999,6 +999,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         &self.joint_capture
     }
 
+    /// Borrow the canonical capture owner for raw custody and publication,
+    /// preserving its model history and reservation ledger.
+    #[cfg_attr(not(test), allow(dead_code))] // Staged collection port; ordinary Joint is inactive.
+    pub(crate) fn joint_capture_mut(
+        &mut self,
+    ) -> &mut crate::semantics_objects::journal::joint_driver::JointCaptureOwner {
+        &mut self.joint_capture
+    }
+
     /// Deliver one H8 seal to an instance's Joint feed through the
     /// capture owner's ledger: the test-side seal tick, borrowing the
     /// registry and the owner disjointly exactly like publication.

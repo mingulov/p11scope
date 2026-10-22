@@ -3,8 +3,14 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
 use super::*;
+use crate::attach::SessionDrainProducers;
 use crate::discovery::caller_registry::CallerRegistry;
+use crate::semantics_objects::journal::joint_driver::{
+    IngestedRaw, JointCaptureOwner, RawQuantumRefusal,
+};
 use crate::semantics_objects::journal::{AttestationRefusal, JournalAdapter, JournalDomainProof};
+
+pub(crate) type PreparedClaim = (u64, Result<JournalDomainProof, AttestationRefusal>);
 
 /// The existing single pending slot changes phase; preparation adds no queue.
 pub(super) enum PendingSemanticBatch {
@@ -157,16 +163,24 @@ impl PreparedSemanticBatch {
     pub(super) fn claim_next(
         &mut self,
         adapter: &mut JournalAdapter,
-    ) -> Option<(u64, Result<JournalDomainProof, AttestationRefusal>)> {
-        while let Some(entry) = self.entries.get(self.claim_cursor) {
+        ingested: &IngestedRaw,
+    ) -> Result<Option<PreparedClaim>, RawQuantumRefusal> {
+        let mut next = self.claim_cursor;
+        while let Some(entry) = self.entries.get(next) {
             // Conversion refusals need no journal claim. Their original
             // positions remain owned until the staging/refusal cursor moves.
-            self.claim_cursor += 1;
             if let Some(Ok(input)) = &entry.input {
-                return Some((entry.token, adapter.attest_key(input)));
+                if !ingested.matches_admission(input) {
+                    return Err(RawQuantumRefusal::Admission);
+                }
+                let claim = adapter.attest_key(input);
+                self.claim_cursor = next + 1;
+                return Ok(Some((entry.token, claim)));
             }
+            next += 1;
         }
-        None
+        self.claim_cursor = next;
+        Ok(None)
     }
 
     pub(super) fn dispose_claims_s1(&mut self) {
@@ -256,6 +270,21 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
     }
 
+    /// Borrow the actual prepared originals beside the canonical capture
+    /// owner for initial key binding and ingestion.
+    pub(crate) fn prepared_joint_parts(
+        &mut self,
+    ) -> Option<(&PreparedSemanticBatch, &mut JointCaptureOwner)> {
+        let Some(PendingSemanticBatch::Prepared(batch)) = self
+            .semantic_finalizer
+            .as_ref()
+            .and_then(|state| state.pending_semantic.as_ref())
+        else {
+            return None;
+        };
+        Some((batch, &mut self.joint_capture))
+    }
+
     pub(crate) fn prepare_staged_semantic_batch(
         &mut self,
         lane: &mut AttestedSemanticLane,
@@ -292,19 +321,26 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         Ok(())
     }
 
+    /// The exact original ingestion precedes every claim. A refused proof
+    /// leaves the original inputs and both phase cursors untouched.
     pub(crate) fn claim_next_prepared_admission(
         &mut self,
-        adapter: &mut JournalAdapter,
-    ) -> Option<(u64, Result<JournalDomainProof, AttestationRefusal>)> {
-        let PendingSemanticBatch::Prepared(batch) = self
+        producers: &SessionDrainProducers,
+        ingested: &IngestedRaw,
+    ) -> Result<Option<PreparedClaim>, RawQuantumRefusal> {
+        let adapter = self.joint_capture.adapter_mut();
+        ingested.validate_owner(adapter, producers)?;
+        let Some(PendingSemanticBatch::Prepared(batch)) = self
             .semantic_finalizer
-            .as_mut()?
-            .pending_semantic
-            .as_mut()?
+            .as_mut()
+            .and_then(|state| state.pending_semantic.as_mut())
         else {
-            return None;
+            return Ok(None);
         };
-        batch.claim_next(adapter)
+        if batch.domain != producers.native_domain() {
+            return Err(RawQuantumRefusal::ForeignCapture);
+        }
+        batch.claim_next(adapter, ingested)
     }
 
     pub(crate) fn dispose_prepared_claims_s1(&mut self) {

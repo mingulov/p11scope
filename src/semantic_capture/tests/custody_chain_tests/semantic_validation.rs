@@ -1020,78 +1020,7 @@ fn joint_prepared_current_receipt_budget_includes_held_provider_allocations() {
 
 #[test]
 fn joint_prepared_batch_claim_refusal_and_stage_cursors_do_not_replay() {
-    use crate::semantics_objects::journal::{AttestationRefusal, JournalLimits};
-    let mut fixture = RealScene::new(1);
-    let pid = std::process::id();
-    fixture.bind(pid, image(7), 0);
-    fixture.enqueue(pid, 0, "C_SignInit", 0x000d, 0);
-    fixture.enqueue(pid, 0, "C_SignInit", 0x000d, 0);
-    let batch = fixture.collected_tick();
-    fixture.scene.coordinator.stage_semantic_batch(batch);
-    fixture
-        .scene
-        .coordinator
-        .prepare_staged_semantic_batch(&mut fixture.lane, None)
-        .unwrap();
-    let mut adapter = JournalAdapter::new(JournalLimits::policy());
-    let mut model = crate::semantics_objects::ObjectSemantics::new();
-    let _ = adapter.stop(&mut model);
-    for ordinal in [1, 2] {
-        assert_eq!(
-            fixture
-                .scene
-                .coordinator
-                .claim_next_prepared_admission(&mut adapter),
-            Some((ordinal, Err(AttestationRefusal::Stopped)))
-        );
-        if ordinal == 1 {
-            assert!(
-                !fixture.scene.coordinator.stage_next_prepared_admission(),
-                "all sibling claim decisions precede any original staging move"
-            );
-        }
-    }
-    assert!(
-        fixture
-            .scene
-            .coordinator
-            .claim_next_prepared_admission(&mut adapter)
-            .is_none()
-    );
-    assert!(
-        fixture
-            .scene
-            .coordinator
-            .claim_next_prepared_admission(&mut adapter)
-            .is_none()
-    );
-    assert!(
-        !fixture
-            .scene
-            .coordinator
-            .finish_prepared_semantic_batch(&fixture.lane)
-    );
-    assert!(fixture.scene.coordinator.stage_next_prepared_admission());
-    assert!(
-        !fixture
-            .scene
-            .coordinator
-            .finish_prepared_semantic_batch(&fixture.lane)
-    );
-    assert!(fixture.scene.coordinator.stage_next_prepared_admission());
-    assert!(!fixture.scene.coordinator.stage_next_prepared_admission());
-    assert!(
-        fixture
-            .scene
-            .coordinator
-            .finish_prepared_semantic_batch(&fixture.lane)
-    );
-    fixture
-        .scene
-        .coordinator
-        .commit_batch_with_semantics(false, Some(&mut fixture.lane))
-        .unwrap();
-    assert_eq!(operation_edge_rows(&fixture.scene)[0].0, Some(2));
+    joint_handoff::claim_refusal_and_staging_regression();
 }
 
 #[test]

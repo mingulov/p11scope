@@ -6,21 +6,67 @@ use super::*;
 use crate::attach::SessionDrainProducers;
 use crate::events::{EventDrain, EventsDomain, ScriptedRecords};
 use crate::semantics_objects::journal::joint_driver::{
-    IngestedRaw, JointCaptureOwner, RawJointQuantum, RawQuantumRefusal,
+    IngestedRaw, RawJointQuantum, RawQuantumRefusal,
 };
 use crate::semantics_objects::journal::tests::{
     ENTRY_NS, begin_bytes_shaped, end_bytes, end_bytes_absent, function_id,
 };
 use crate::semantics_objects::journal::{
-    H3DispositionEvidence, JournalDomainProof, JournalLimits, SessionDrainGrant,
+    AttestationRefusal, H3DispositionEvidence, JournalDomainProof, SessionDrainGrant,
 };
 use p11scope_ebpf_common::object_wire::{OBJECT_ACTION_ACCESS, publish_object_descriptors};
 
 struct JointScene {
     real: RealScene,
-    owner: JointCaptureOwner,
     producers: SessionDrainProducers,
     drain: EventDrain<ScriptedRecords>,
+}
+
+/// Preserve the existing refusal/retry selector and its assertions, now with
+/// the original collected ingestion rather than an independent stopped adapter.
+pub(super) fn claim_refusal_and_staging_regression() {
+    let mut fixture = JointScene::new(1);
+    let pid = std::process::id();
+    fixture.real.bind(pid, image(7), 0);
+    fixture.push(pid, 0, "C_SignInit", 1);
+    fixture.push(pid, 0, "C_SignInit", 2);
+    let raw = fixture.prepare(2);
+    let (ingested, _) = fixture.ingest(raw);
+    let (adapter, model) = fixture.real.scene.coordinator.joint_capture_mut().parts();
+    let _ = adapter.stop(model);
+    let coordinator = &mut fixture.real.scene.coordinator;
+    for ordinal in [1, 2] {
+        assert_eq!(
+            coordinator
+                .claim_next_prepared_admission(&fixture.producers, &ingested)
+                .unwrap(),
+            Some((ordinal, Err(AttestationRefusal::Stopped)))
+        );
+        if ordinal == 1 {
+            assert!(
+                !coordinator.stage_next_prepared_admission(),
+                "all sibling claim decisions precede any original staging move"
+            );
+        }
+    }
+    for _ in 0..2 {
+        assert!(
+            coordinator
+                .claim_next_prepared_admission(&fixture.producers, &ingested)
+                .unwrap()
+                .is_none()
+        );
+    }
+    assert!(!coordinator.finish_prepared_semantic_batch(&fixture.real.lane));
+    assert!(coordinator.stage_next_prepared_admission());
+    assert!(!coordinator.finish_prepared_semantic_batch(&fixture.real.lane));
+    assert!(coordinator.stage_next_prepared_admission());
+    assert!(!coordinator.stage_next_prepared_admission());
+    assert!(coordinator.finish_prepared_semantic_batch(&fixture.real.lane));
+    coordinator
+        .commit_batch_with_semantics(false, Some(&mut fixture.real.lane))
+        .unwrap();
+    assert_eq!(operation_edge_rows(&fixture.real.scene)[0].0, Some(2));
 }
 
 impl JointScene {
@@ -29,18 +75,10 @@ impl JointScene {
             providers,
             &["C_SignInit", "C_SignUpdate", "C_SignFinal"],
         ));
-        let owner = JointCaptureOwner::new(
-            JournalLimits::policy(),
-            real.scene
-                .coordinator
-                .registry()
-                .semantic_storage_reserver(),
-        );
         let events = EventsDomain::test_standin(0xb301);
         let producers = SessionDrainProducers::test_pair(real.lane.domain(), events.clone());
         Self {
             real,
-            owner,
             producers,
             drain: EventDrain::over_domain(ScriptedRecords::records([], 64), events),
         }
@@ -91,6 +129,12 @@ impl JointScene {
     }
 
     fn prepare(&mut self, count: usize) -> RawJointQuantum {
+        let reserve = self
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .semantic_storage_reserver();
         let raw = RawJointQuantum::collect_bounded_with_adapter(
             &mut self.drain,
             &publish_object_descriptors(),
@@ -98,14 +142,12 @@ impl JointScene {
             None,
             &BirthFault,
             &self.producers,
-            |bytes| {
-                self.real
-                    .scene
-                    .coordinator
-                    .registry()
-                    .reserve_semantic_storage(bytes)
-            },
-            self.owner.adapter_mut(),
+            |bytes| reserve.reserve(bytes),
+            self.real
+                .scene
+                .coordinator
+                .joint_capture_mut()
+                .adapter_mut(),
         )
         .expect("actual persistent cursor collection");
         assert_eq!(
@@ -136,19 +178,13 @@ impl JointScene {
     }
 
     fn ingest(&mut self, raw: RawJointQuantum) -> (IngestedRaw, JournalDomainProof) {
-        let input = self
-            .real
-            .scene
-            .coordinator
-            .prepared_semantic_batch()
-            .unwrap()
-            .next_admission()
-            .unwrap();
-        let proof = self.owner.adapter_mut().bind_admitted_key(input).unwrap();
+        let (prepared, owner) = self.real.scene.coordinator.prepared_joint_parts().unwrap();
+        let input = prepared.next_admission().unwrap();
+        let proof = owner.adapter_mut().bind_admitted_key(input).unwrap();
         let grant = SessionDrainGrant::observe(&self.producers, input).unwrap();
-        self.owner.adapter_mut().bind_session_drain(&grant).unwrap();
+        owner.adapter_mut().bind_session_drain(&grant).unwrap();
         let ingested = raw
-            .ingest(self.owner.adapter_mut(), &self.producers, &grant)
+            .ingest(owner.adapter_mut(), &self.producers, &grant)
             .unwrap_or_else(|(_, reason)| panic!("original ingestion: {reason:?}"));
         (ingested, proof)
     }
@@ -241,11 +277,7 @@ fn joint_prepared_all_originals_claim_after_actual_ingest_once() {
             .real
             .scene
             .coordinator
-            .claim_next_prepared_admission(
-                fixture.owner.adapter_mut(),
-                &fixture.producers,
-                &ingested,
-            )
+            .claim_next_prepared_admission(&fixture.producers, &ingested)
             .unwrap()
             .expect("one original claim");
         assert_eq!(actual, ordinal);
@@ -274,11 +306,7 @@ fn joint_prepared_all_originals_claim_after_actual_ingest_once() {
                 .real
                 .scene
                 .coordinator
-                .claim_next_prepared_admission(
-                    fixture.owner.adapter_mut(),
-                    &fixture.producers,
-                    &ingested
-                )
+                .claim_next_prepared_admission(&fixture.producers, &ingested)
                 .unwrap()
                 .is_none()
         );
@@ -307,7 +335,7 @@ fn joint_prepared_foreign_or_old_raw_proof_never_advances_claim_cursor() {
             .real
             .scene
             .coordinator
-            .claim_next_prepared_admission(fixture.owner.adapter_mut(), &foreign, &first),
+            .claim_next_prepared_admission(&foreign, &first),
         Err(RawQuantumRefusal::ForeignCapture)
     );
     assert_eq!(
@@ -334,7 +362,7 @@ fn joint_prepared_foreign_or_old_raw_proof_never_advances_claim_cursor() {
             .real
             .scene
             .coordinator
-            .claim_next_prepared_admission(fixture.owner.adapter_mut(), &fixture.producers, &first)
+            .claim_next_prepared_admission(&fixture.producers, &first)
             .unwrap(),
         Some((1, Ok(proof)))
     );
@@ -345,7 +373,10 @@ fn joint_prepared_foreign_or_old_raw_proof_never_advances_claim_cursor() {
     // The old proof still has the adapter's current frontier here. Only its
     // actual original allocation distinguishes this later prepared sibling.
     assert_eq!(
-        first.validate_owner(fixture.owner.adapter(), &fixture.producers),
+        first.validate_owner(
+            fixture.real.scene.coordinator.joint_capture().adapter(),
+            &fixture.producers
+        ),
         Ok(())
     );
     assert_eq!(
@@ -353,7 +384,7 @@ fn joint_prepared_foreign_or_old_raw_proof_never_advances_claim_cursor() {
             .real
             .scene
             .coordinator
-            .claim_next_prepared_admission(fixture.owner.adapter_mut(), &fixture.producers, &first),
+            .claim_next_prepared_admission(&fixture.producers, &first),
         Err(RawQuantumRefusal::Admission)
     );
     let (next, next_proof) = fixture.ingest(next_raw);
@@ -362,7 +393,7 @@ fn joint_prepared_foreign_or_old_raw_proof_never_advances_claim_cursor() {
             .real
             .scene
             .coordinator
-            .claim_next_prepared_admission(fixture.owner.adapter_mut(), &fixture.producers, &first),
+            .claim_next_prepared_admission(&fixture.producers, &first),
         Err(RawQuantumRefusal::StaleFrontier)
     );
     assert_eq!(
@@ -389,7 +420,7 @@ fn joint_prepared_foreign_or_old_raw_proof_never_advances_claim_cursor() {
             .real
             .scene
             .coordinator
-            .claim_next_prepared_admission(fixture.owner.adapter_mut(), &fixture.producers, &next)
+            .claim_next_prepared_admission(&fixture.producers, &next)
             .unwrap(),
         Some((2, Ok(next_proof)))
     );
@@ -398,7 +429,7 @@ fn joint_prepared_foreign_or_old_raw_proof_never_advances_claim_cursor() {
             .real
             .scene
             .coordinator
-            .claim_next_prepared_admission(fixture.owner.adapter_mut(), &fixture.producers, &next)
+            .claim_next_prepared_admission(&fixture.producers, &next)
             .unwrap()
             .is_none()
     );
@@ -428,11 +459,7 @@ fn joint_prepared_claims_every_adjacent_provider_and_caller_original() {
             .real
             .scene
             .coordinator
-            .claim_next_prepared_admission(
-                fixture.owner.adapter_mut(),
-                &fixture.producers,
-                &ingested,
-            )
+            .claim_next_prepared_admission(&fixture.producers, &ingested)
             .unwrap()
             .expect("actual provider/caller admission");
         assert_eq!(actual, ordinal);
@@ -449,11 +476,7 @@ fn joint_prepared_claims_every_adjacent_provider_and_caller_original() {
             .real
             .scene
             .coordinator
-            .claim_next_prepared_admission(
-                fixture.owner.adapter_mut(),
-                &fixture.producers,
-                &ingested
-            )
+            .claim_next_prepared_admission(&fixture.producers, &ingested)
             .unwrap()
             .is_none()
     );

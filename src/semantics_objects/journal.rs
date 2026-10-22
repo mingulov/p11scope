@@ -13026,7 +13026,7 @@ pub(crate) mod tests {
             }
         }
 
-        for mismatch in 0..3 {
+        for mismatch in 0..4 {
             // Native I/O is substituted by the existing algorithm scene. The
             // actual JointSealTick alone mints each move-only acknowledgement.
             let mut scene = Scene::new(image_default());
@@ -13064,9 +13064,13 @@ pub(crate) mod tests {
                     NativeDomainId::mint(),
                     scene.retained_events.clone(),
                 ),
-                _ => crate::attach::SessionDrainProducers::test_pair(
+                2 => crate::attach::SessionDrainProducers::test_pair(
                     producers.native_domain(),
                     crate::events::EventsDomain::test_standin(8),
+                ),
+                _ => crate::attach::SessionDrainProducers::test_pair(
+                    producers.native_domain(),
+                    crate::events::EventsDomain::test_standin(producers.events_id()),
                 ),
             };
             let mut coordinator = InventoryCoordinator::new(

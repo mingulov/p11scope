@@ -394,3 +394,1190 @@ fn joint_prior_sealed_fixture_keeps_nonempty_original_two_domain_effects() {
         0
     );
 }
+
+use crate::attach::{BirthObservationRefusal, BirthRowError, BirthRowReader};
+use crate::discovery::caller_registry::instance_input::{JointFeedTarget, RegistryInstanceId};
+use crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding;
+use crate::semantics_objects::journal::SessionBirthEvidence;
+use crate::semantics_objects::journal::joint_audit::{
+    IngestedJointQuantum, JointBirthEvidenceSource, QuantumSealProgress,
+};
+use std::cell::Cell;
+
+/// Reads the genuine retained native row through the same verifier. Refusal
+/// substitutes only the row I/O leaf, never a birth value or target counter.
+struct NativeFrameBirths<'a> {
+    h0: &'a SharedH0,
+    attached: &'a crate::attach::AttachedSemanticSet,
+    retained: &'a mut [(CallerId, RetainedBirthWitness, NativeBirthRows)],
+    seen: Vec<(
+        RegistryInstanceId,
+        CallerId,
+        ImageIdentity,
+        crate::semantics_objects::ObjectDomain,
+    )>,
+    unreadable: bool,
+}
+
+struct UnreadableRows<'a>(&'a mut NativeBirthRows);
+impl BirthRowReader for UnreadableRows<'_> {
+    fn read_marker_row(&mut self) -> Result<p11scope_ebpf_common::InstanceRecord, BirthRowError> {
+        Err(BirthRowError::Unreadable)
+    }
+    fn read_admission_control(
+        &mut self,
+    ) -> Result<p11scope_ebpf_common::JournalAdmissionControl, BirthRowError> {
+        self.0.read_admission_control()
+    }
+}
+
+impl JointBirthEvidenceSource for NativeFrameBirths<'_> {
+    fn take_for(
+        &mut self,
+        target: &JointFeedTarget,
+        binding: &SemanticCallerBinding,
+    ) -> Result<SessionBirthEvidence, BirthObservationRefusal> {
+        assert_eq!(target.caller(), binding.caller());
+        let (_, witness, rows) = self
+            .retained
+            .iter_mut()
+            .find(|(caller, witness, _)| {
+                *caller == binding.caller()
+                    && witness.receipt().domain() == target.bootstrap().domain()
+            })
+            .expect("the selected typed target names its own original binding/witness");
+        self.seen.push((
+            target.id(),
+            binding.caller(),
+            binding.image(),
+            target.bootstrap().domain(),
+        ));
+        let mut h0 = self.h0.0.borrow_mut();
+        let HeldH0 { capture, io, .. } = &mut *h0;
+        if self.unreadable {
+            witness.fresh_evidence_with(
+                io,
+                &mut UnreadableRows(rows),
+                capture,
+                self.attached,
+                binding,
+            )
+        } else {
+            witness.fresh_evidence_with(io, rows, capture, self.attached, binding)
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct FeedState {
+    id: RegistryInstanceId,
+    caller: CallerId,
+    reduced: u64,
+    staged: usize,
+    disposed: u64,
+    degraded: bool,
+    fallback: bool,
+}
+
+struct FrameFault {
+    epoch: Cell<u64>,
+    reads: Cell<usize>,
+}
+impl FrameFault {
+    fn clean() -> Self {
+        Self {
+            epoch: Cell::new(0),
+            reads: Cell::new(0),
+        }
+    }
+}
+impl crate::semantics_objects::journal::FaultEpoch for FrameFault {
+    fn fault_epoch(&self) -> Result<u64, crate::semantics_objects::journal::FaultReadError> {
+        self.reads.set(self.reads.get() + 1);
+        Ok(self.epoch.get())
+    }
+}
+
+impl CanonicalFanoutScene {
+    fn feeds(&self) -> Vec<FeedState> {
+        self.scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .instance_semantic_edges()
+            .map(|record| FeedState {
+                id: record.id,
+                caller: record.caller,
+                reduced: record.feed.reduced(),
+                staged: record.feed.staged_len(),
+                disposed: record.feed.history_disposed(),
+                degraded: record.feed.degraded_loss(),
+                fallback: record.feed.fell_back(),
+            })
+            .collect()
+    }
+
+    fn push_two(&mut self, name: &str, sequence: u64) {
+        for pid in [std::process::id(), self._child.id()] {
+            self.scene.push(pid, 0, name, sequence);
+        }
+    }
+
+    fn push_distinct_create(&mut self, pid: u32, sequence: u64, result: u64) {
+        let (begin, _) = self.scene.encoded(pid, 0, "C_CreateObject", sequence);
+        let end = crate::semantics_objects::journal::tests::end_bytes_result(
+            &begin,
+            p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE,
+            0,
+            ENTRY_NS + 10,
+            result,
+        );
+        self.scene.drain.source_mut().push_record(begin.to_vec());
+        self.scene.drain.source_mut().push_record(end.to_vec());
+    }
+
+    fn audited(
+        &mut self,
+        physical: usize,
+        admissions: usize,
+        fault: &impl crate::semantics_objects::journal::FaultEpoch,
+    ) -> IngestedJointQuantum {
+        let raw = self.scene.collect_with_fault(fault);
+        assert_eq!(
+            raw.h0_input(self.scene.real.lane.domain(), 64)
+                .unwrap()
+                .0
+                .len(),
+            physical
+        );
+        self.scene.real.h0.0.borrow_mut().collected = Some(raw);
+        let batch = self.scene.real.tick();
+        assert_eq!(self.scene.real.h0.0.borrow().last_calls.len(), physical);
+        let coordinator = &mut self.scene.real.scene.coordinator;
+        coordinator.stage_semantic_batch(batch);
+        coordinator
+            .prepare_staged_semantic_batch(&mut self.scene.real.lane, None)
+            .unwrap();
+        assert_eq!(
+            coordinator
+                .prepared_semantic_batch()
+                .unwrap()
+                .admissions()
+                .count(),
+            admissions
+        );
+        let raw = self.scene.real.h0.0.borrow_mut().collected.take().unwrap();
+        let ingested = raw
+            .ingest(
+                coordinator.joint_capture_mut().adapter_mut(),
+                &self.scene.producers,
+                &self.grant,
+            )
+            .unwrap_or_else(|(_, reason)| panic!("same original ingestion: {reason:?}"));
+        assert_eq!(
+            claim_and_finish(&mut self.scene, &ingested).len(),
+            admissions
+        );
+        // Existing commit applies actual staged payloads to the selected feeds.
+        // Atomic publication/revision wiring is explicitly the later Task5 gate.
+        self.scene
+            .real
+            .scene
+            .coordinator
+            .commit_batch_with_semantics(false, Some(&mut self.scene.real.lane))
+            .unwrap();
+        acquire(&mut self.scene, ingested, &self.attached, fault)
+    }
+}
+
+#[test]
+fn joint_one_audit_fans_out_two_domains() {
+    let mut fixture = CanonicalFanoutScene::prior_sealed();
+    fixture.push_two("C_SignInit", 2);
+    let mut frame = fixture.audited(2, 2, &BirthFault);
+    let identity = frame.identity();
+    let frontier = frame.frontier();
+    assert_eq!(
+        fixture
+            .feeds()
+            .iter()
+            .map(|feed| (feed.reduced, feed.staged))
+            .collect::<Vec<_>>(),
+        [(1, 1), (1, 1)]
+    );
+    let targets = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .joint_feed_targets()
+        .collect::<Vec<_>>();
+    assert_eq!(targets.len(), 2);
+    for target in &targets {
+        assert!(
+            fixture
+                .births
+                .iter()
+                .any(|(caller, witness, _)| *caller == target.caller()
+                    && witness.receipt().domain() == target.bootstrap().domain())
+        );
+    }
+    let h0 = fixture.scene.real.h0.clone();
+    let mut births = NativeFrameBirths {
+        h0: &h0,
+        attached: &fixture.attached,
+        retained: &mut fixture.births,
+        seen: Vec::new(),
+        unreadable: false,
+    };
+    {
+        let mut ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        frame.bind_targets(&ports).unwrap();
+        assert_eq!(
+            frame.bind_targets(&ports),
+            Err(RawQuantumRefusal::DispositionMismatch)
+        );
+        for index in 0..2 {
+            assert_eq!(
+                frame.seal_next(&mut ports, &mut births, &BirthFault),
+                Ok(QuantumSealProgress::DeliveryReady)
+            );
+            assert_eq!(births.seen.len(), index + 1);
+            assert_eq!(
+                frame.seal_next(&mut ports, &mut births, &BirthFault),
+                Ok(QuantumSealProgress::DeliveryReady)
+            );
+            assert_eq!(
+                births.seen.len(),
+                index + 1,
+                "retry never seals or reads birth twice"
+            );
+            assert_eq!(
+                frame.deliver_next(&mut ports),
+                Ok(if index == 0 {
+                    QuantumSealProgress::LocalPending
+                } else {
+                    QuantumSealProgress::Complete
+                })
+            );
+        }
+        assert_eq!(
+            frame.seal_next(&mut ports, &mut births, &BirthFault),
+            Ok(QuantumSealProgress::Complete)
+        );
+        assert_eq!(
+            frame.deliver_next(&mut ports),
+            Ok(QuantumSealProgress::Complete)
+        );
+        let disposed = frame
+            .finish_frame(&mut ports)
+            .unwrap_or_else(|(_, reason)| panic!("all consumers disposed: {reason:?}"));
+        assert!(disposed.identity() == identity);
+        assert_eq!(disposed.frontier(), frontier);
+    }
+    assert_ne!(
+        births.seen[0].2, births.seen[1].2,
+        "different original images/bindings"
+    );
+    assert_eq!(
+        births.seen.iter().map(|seen| seen.0).collect::<Vec<_>>(),
+        targets.iter().map(JointFeedTarget::id).collect::<Vec<_>>()
+    );
+    drop(births);
+    assert!(
+        fixture
+            .feeds()
+            .iter()
+            .all(|feed| feed.reduced == 2 && feed.staged == 0 && !feed.degraded && !feed.fallback)
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_h3_audit_state(),
+        (2, false)
+    );
+    fixture.scene.assert_claims(&[]);
+}
+
+#[test]
+fn joint_two_feeds_share_nonzero_audited_fallback_once() {
+    let mut fixture = CanonicalFanoutScene::prior_sealed();
+    fixture.push_two("C_SignInit", 2);
+    let mut frame = fixture.audited(2, 2, &BirthFault);
+    assert!(matches!(
+        frame.audit_for_test().h3_for_test(),
+        H3DispositionEvidence::Clean {
+            staged_max: 4,
+            pending_floor: None
+        }
+    ));
+    let h0 = fixture.scene.real.h0.clone();
+    let mut births = NativeFrameBirths {
+        h0: &h0,
+        attached: &fixture.attached,
+        retained: &mut fixture.births,
+        seen: Vec::new(),
+        unreadable: true,
+    };
+    {
+        let mut ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        frame.bind_targets(&ports).unwrap();
+        for index in 0..2 {
+            assert_eq!(
+                frame.seal_next(&mut ports, &mut births, &BirthFault),
+                Ok(QuantumSealProgress::DeliveryReady)
+            );
+            assert_eq!(
+                frame.deliver_next(&mut ports),
+                Ok(if index == 0 {
+                    QuantumSealProgress::LocalPending
+                } else {
+                    QuantumSealProgress::Complete
+                })
+            );
+        }
+        assert_eq!(
+            frame.deliver_next(&mut ports),
+            Ok(QuantumSealProgress::Complete)
+        );
+        frame
+            .finish_frame(&mut ports)
+            .unwrap_or_else(|(_, reason)| panic!("audited fallback disposed both: {reason:?}"));
+    }
+    assert_eq!(births.seen.len(), 2);
+    assert_ne!(
+        births.seen[0].2, births.seen[1].2,
+        "first refusal does not choose the next witness by guessed ordinal"
+    );
+    drop(births);
+    assert!(
+        fixture
+            .feeds()
+            .iter()
+            .all(|feed| feed.reduced == 2 && feed.staged == 0 && feed.fallback && !feed.degraded)
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_h3_audit_state(),
+        (2, false),
+        "both feeds borrow the same nonzero taken H3, no genesis second take"
+    );
+}
+
+struct NoFrameBirths;
+impl JointBirthEvidenceSource for NoFrameBirths {
+    fn take_for(
+        &mut self,
+        _: &JointFeedTarget,
+        _: &SemanticCallerBinding,
+    ) -> Result<SessionBirthEvidence, BirthObservationRefusal> {
+        panic!("collection-wide loss must fan out before any fresh per-domain birth");
+    }
+}
+
+#[test]
+fn joint_original_loss_fans_out_before_ack() {
+    let mut fixture = CanonicalFanoutScene::prior_sealed();
+    let original = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .model()
+        .project()
+        .objects;
+    fixture.push_two("C_SignInit", 2);
+    // Genuine H0 no-file refusal: ordinary bytes from the native END recipe,
+    // with its actual descriptor removed only at the injected H0 I/O leaf.
+    // H3 itself must produce the loss barrier; no scripted disposition/cut.
+    let (_, ordinary) = fixture
+        .scene
+        .encoded(std::process::id(), 0, "C_SignFinal", 3);
+    let slot = fixture.scene.real.h0.0.borrow().io.slot(0, "C_SignFinal");
+    fixture
+        .scene
+        .real
+        .h0
+        .0
+        .borrow_mut()
+        .io
+        .endpoints
+        .retain(|(index, _, _)| *index != slot);
+    fixture
+        .scene
+        .drain
+        .source_mut()
+        .push_record(ordinary[24..392].to_vec());
+    let mut frame = fixture.audited(3, 2, &BirthFault);
+    let failure = frame
+        .failure_for_test()
+        .expect("actual finalizer loss is adjudicated once");
+    assert_eq!(
+        failure.gap,
+        crate::semantics_objects::journal::JournalGap::H3Loss
+    );
+    let voided = failure
+        .h3_voided
+        .expect("the original H3 barrier needs acknowledgement");
+    for object in &original {
+        assert!(failure.effects.effects.iter().any(|effect| matches!(effect, ObjectEffect::Retired { object: id, reason: ObjectGap::OutcomeLost } if *id == object.id)));
+    }
+    let effects = failure.effects.clone();
+    let receipts = fixture.receipts();
+    {
+        let a = frame.failure_for(receipts[0].domain()).unwrap();
+        let b = frame.failure_for(receipts[1].domain()).unwrap();
+        assert!(
+            std::ptr::eq(a.failure(), b.failure()),
+            "both domains borrow the original failure, never recomputed scope/effects"
+        );
+        assert!(std::ptr::eq(a.h3(), b.h3()), "same original audit H3");
+        assert!(a.identity() == frame.identity());
+        assert_eq!(a.frontier(), frame.frontier());
+    }
+    {
+        let mut ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        frame.bind_targets(&ports).unwrap();
+        assert_eq!(
+            frame.seal_next(&mut ports, &mut NoFrameBirths, &BirthFault),
+            Ok(QuantumSealProgress::DeliveryReady)
+        );
+        assert_eq!(
+            frame.deliver_next(&mut ports),
+            Ok(QuantumSealProgress::LocalPending)
+        );
+        frame = match frame.finish_frame(&mut ports) {
+            Err((original, reason)) => {
+                assert_eq!(reason, RawQuantumRefusal::DispositionMismatch);
+                original
+            }
+            Ok(_) => panic!("one consumer cannot acknowledge a collection-wide void"),
+        };
+    }
+    assert_eq!(
+        fixture.feeds().iter().filter(|feed| feed.degraded).count(),
+        1
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_h3_acknowledged_below(),
+        0
+    );
+    assert_eq!(frame.failure_for_test().unwrap().effects, effects);
+    {
+        let mut ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        assert_eq!(
+            frame.seal_next(&mut ports, &mut NoFrameBirths, &BirthFault),
+            Ok(QuantumSealProgress::DeliveryReady)
+        );
+        assert_eq!(
+            frame.deliver_next(&mut ports),
+            Ok(QuantumSealProgress::Complete)
+        );
+        assert_eq!(
+            frame.deliver_next(&mut ports),
+            Ok(QuantumSealProgress::Complete)
+        );
+    }
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_h3_acknowledged_below(),
+        0,
+        "delivery is not acknowledgement"
+    );
+    assert!(fixture.feeds().iter().all(|feed| feed.degraded
+        && !feed.fallback
+        && feed.reduced == 1
+        && feed.staged == 0
+        && feed.disposed == 1));
+    {
+        let mut ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        frame
+            .finish_frame(&mut ports)
+            .unwrap_or_else(|(_, reason)| {
+                panic!("both original loss deliveries complete: {reason:?}")
+            });
+    }
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_h3_acknowledged_below(),
+        voided
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_h3_audit_state(),
+        (2, false)
+    );
+}
+
+#[test]
+fn joint_later_loss_precharges_newly_sealed_objects_before_mutation() {
+    let mut fixture = CanonicalFanoutScene::prior_sealed();
+    let before = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .model()
+        .project();
+    let targets = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .joint_feed_targets()
+        .collect::<Vec<_>>();
+    assert_eq!(targets.len(), 2);
+    for (index, target) in targets.iter().enumerate() {
+        let pid = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .semantic_bindings()
+            .get(target.caller())
+            .unwrap()
+            .pin()
+            .pid();
+        fixture.push_distinct_create(pid, 2, 0x5000 + index as u64);
+    }
+    let fault = FrameFault::clean();
+    let mut frame = fixture.audited(2, 2, &fault);
+    let h0 = fixture.scene.real.h0.clone();
+    let mut births = NativeFrameBirths {
+        h0: &h0,
+        attached: &fixture.attached,
+        retained: &mut fixture.births,
+        seen: Vec::new(),
+        unreadable: false,
+    };
+    {
+        let mut ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        frame.bind_targets(&ports).unwrap();
+        assert_eq!(
+            frame.seal_next(&mut ports, &mut births, &fault),
+            Ok(QuantumSealProgress::DeliveryReady)
+        );
+        assert_eq!(
+            frame.deliver_next(&mut ports),
+            Ok(QuantumSealProgress::LocalPending)
+        );
+    }
+    let grown = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .model()
+        .project();
+    assert_eq!(
+        grown.objects.len(),
+        before.objects.len() + 1,
+        "first seal genuinely creates a new retained view"
+    );
+    let new_id = grown
+        .objects
+        .iter()
+        .find(|object| !before.objects.iter().any(|old| old.id == object.id))
+        .unwrap()
+        .id;
+    assert_eq!(grown.object(new_id).unwrap().lifetime, Lifetime::Live);
+    let snapshot = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .semantic_resource_snapshot();
+    let hold = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .reserve_semantic_storage(snapshot.limit_bytes - snapshot.charged_bytes)
+        .unwrap();
+    let reads = fault.reads.get();
+    fault.epoch.set(1);
+    {
+        let mut ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        assert!(matches!(
+            frame.seal_next(&mut ports, &mut births, &fault),
+            Err(RawQuantumRefusal::Resource(_))
+        ));
+    }
+    assert_eq!(
+        fault.reads.get(),
+        reads,
+        "post-growth retained failure capacity is prepaid before audit/fault mutation"
+    );
+    assert_eq!(
+        births.seen.len(),
+        1,
+        "capacity refusal does not select or reread a birth"
+    );
+    assert!(frame.failure_for_test().is_none());
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .model()
+            .project()
+            .object(new_id)
+            .unwrap()
+            .lifetime,
+        Lifetime::Live
+    );
+    drop(hold);
+    {
+        let mut ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        assert_eq!(
+            frame.seal_next(&mut ports, &mut births, &fault),
+            Ok(QuantumSealProgress::DeliveryReady)
+        );
+    }
+    let failure = frame.failure_for_test().unwrap();
+    assert_eq!(
+        failure.gap,
+        crate::semantics_objects::journal::JournalGap::FaultChanged
+    );
+    for object in &grown.objects {
+        assert!(failure.effects.effects.iter().any(|effect| matches!(effect, ObjectEffect::Retired { object: id, reason: ObjectGap::OutcomeLost } if *id == object.id)), "late failure includes original and newly-created live views");
+    }
+    let effects = failure.effects.clone();
+    {
+        let mut ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        assert_eq!(
+            frame.deliver_next(&mut ports),
+            Ok(QuantumSealProgress::LocalPending)
+        );
+        assert_eq!(
+            frame.seal_next(&mut ports, &mut NoFrameBirths, &fault),
+            Ok(QuantumSealProgress::DeliveryReady)
+        );
+        assert_eq!(
+            frame.deliver_next(&mut ports),
+            Ok(QuantumSealProgress::Complete)
+        );
+    }
+    assert_eq!(frame.failure_for_test().unwrap().effects, effects);
+    drop(births);
+    let feeds = fixture.feeds();
+    assert!(feeds.iter().all(|feed| feed.degraded && feed.staged == 0));
+    assert_eq!(
+        feeds
+            .iter()
+            .find(|feed| feed.id == targets[0].id())
+            .unwrap()
+            .reduced,
+        2,
+        "already delivered success is not replayed while its original loss fans out"
+    );
+    assert_eq!(
+        feeds
+            .iter()
+            .find(|feed| feed.id == targets[1].id())
+            .unwrap()
+            .disposed,
+        1
+    );
+    let mut ports = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_frame_ports(&fixture.scene.producers)
+        .unwrap();
+    frame
+        .finish_frame(&mut ports)
+        .unwrap_or_else(|(_, reason)| panic!("original later loss delivered to both: {reason:?}"));
+}
+
+#[test]
+fn joint_frame_preflight_keeps_targets_and_birth_selection_on_retry() {
+    let mut fixture = CanonicalFanoutScene::prior_sealed();
+    fixture.push_two("C_SignInit", 2);
+    let fault = FrameFault::clean();
+    let mut frame = fixture.audited(2, 2, &fault);
+    let identity = frame.identity();
+    let frontier = frame.frontier();
+    let before = fixture.feeds();
+    let foreign = SessionDrainProducers::test_pair(
+        fixture.scene.producers.native_domain(),
+        EventsDomain::test_standin(fixture.scene.producers.events_id()),
+    );
+    assert!(
+        matches!(
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .joint_frame_ports(&foreign),
+            Err(RawQuantumRefusal::ForeignCapture)
+        ),
+        "equal numeric map id cannot lend the retained Session port"
+    );
+    let snapshot = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .semantic_resource_snapshot();
+    let hold = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .reserve_semantic_storage(snapshot.limit_bytes - snapshot.charged_bytes)
+        .unwrap();
+    {
+        let ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        assert!(matches!(
+            frame.bind_targets(&ports),
+            Err(RawQuantumRefusal::Resource(_))
+        ));
+    }
+    assert_eq!(fixture.feeds(), before);
+    assert!(frame.identity() == identity);
+    assert_eq!(frame.frontier(), frontier);
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .semantic_resource_snapshot()
+            .charged_bytes,
+        snapshot.limit_bytes,
+        "refused target acquisition refunds its own attempt"
+    );
+    drop(hold);
+    {
+        let ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        frame.bind_targets(&ports).unwrap();
+    }
+    let targets = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .joint_feed_targets()
+        .collect::<Vec<_>>();
+    let h0 = fixture.scene.real.h0.clone();
+    let mut births = NativeFrameBirths {
+        h0: &h0,
+        attached: &fixture.attached,
+        retained: &mut fixture.births,
+        seen: Vec::new(),
+        unreadable: false,
+    };
+    let snapshot = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .semantic_resource_snapshot();
+    let hold = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .reserve_semantic_storage(snapshot.limit_bytes - snapshot.charged_bytes)
+        .unwrap();
+    let reads = fault.reads.get();
+    {
+        let mut ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        assert!(matches!(
+            frame.seal_next(&mut ports, &mut births, &fault),
+            Err(RawQuantumRefusal::Resource(_))
+        ));
+    }
+    assert_eq!(fault.reads.get(), reads);
+    assert!(births.seen.is_empty());
+    drop(hold);
+    {
+        let mut ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        for index in 0..2 {
+            assert_eq!(
+                frame.seal_next(&mut ports, &mut births, &fault),
+                Ok(QuantumSealProgress::DeliveryReady)
+            );
+            assert_eq!(
+                births.seen[index].0,
+                targets[index].id(),
+                "a refused attempt cannot advance the typed subject"
+            );
+            assert_eq!(
+                frame.deliver_next(&mut ports),
+                Ok(if index == 0 {
+                    QuantumSealProgress::LocalPending
+                } else {
+                    QuantumSealProgress::Complete
+                })
+            );
+        }
+        frame
+            .finish_frame(&mut ports)
+            .unwrap_or_else(|(_, reason)| panic!("same originals retry after refund: {reason:?}"));
+    }
+    drop(births);
+    assert!(
+        fixture
+            .feeds()
+            .iter()
+            .all(|feed| feed.reduced == 2 && feed.staged == 0 && !feed.fallback && !feed.degraded)
+    );
+}
+
+#[test]
+fn joint_future_end_disposes_frame_without_disposing_call() {
+    for b_begin_first in [false, true] {
+        let mut fixture = CanonicalFanoutScene::prior_sealed();
+        let a = std::process::id();
+        let b = fixture._child.id();
+        let (begin_a, end_a) = fixture.scene.encoded(a, 0, "C_SignInit", 2);
+        let (begin_b, end_b) = fixture.scene.encoded(b, 0, "C_SignInit", 2);
+        for begin in if b_begin_first {
+            [begin_b, begin_a]
+        } else {
+            [begin_a, begin_b]
+        } {
+            fixture.scene.drain.source_mut().push_record(begin.to_vec());
+        }
+        fixture.scene.drain.source_mut().push_record(end_b.to_vec());
+        let mut q1 = fixture.audited(1, 1, &BirthFault);
+        assert!(q1.failure_for_test().is_none());
+        let h0 = fixture.scene.real.h0.clone();
+        let mut births = NativeFrameBirths {
+            h0: &h0,
+            attached: &fixture.attached,
+            retained: &mut fixture.births,
+            seen: Vec::new(),
+            unreadable: false,
+        };
+        {
+            let mut ports = fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .joint_frame_ports(&fixture.scene.producers)
+                .unwrap();
+            q1.bind_targets(&ports).unwrap();
+            let mut future = 0;
+            let mut delivered = 0;
+            for _ in 0..2 {
+                match q1.seal_next(&mut ports, &mut births, &BirthFault).unwrap() {
+                    QuantumSealProgress::AwaitFutureInput => future += 1,
+                    QuantumSealProgress::DeliveryReady => {
+                        delivered += 1;
+                        assert!(matches!(
+                            q1.deliver_next(&mut ports).unwrap(),
+                            QuantumSealProgress::LocalPending
+                                | QuantumSealProgress::AwaitFutureInput
+                        ));
+                    }
+                    progress => panic!("unexpected q1 progress: {progress:?}"),
+                }
+            }
+            assert_eq!((future, delivered), (1, 1));
+            assert_eq!(
+                q1.seal_next(&mut ports, &mut births, &BirthFault),
+                Ok(QuantumSealProgress::AwaitFutureInput)
+            );
+        }
+        drop(births);
+        let starts = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .retained_starts_for_test();
+        assert_eq!(starts.len(), 1);
+        assert_eq!(
+            (starts[0].0, starts[0].1),
+            (u64::from(a), 2),
+            "the original actual A START remains unconverted"
+        );
+        fixture.scene.assert_claims(&[]);
+        let roles = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .ledger()
+            .roles_for_test();
+        assert_eq!(
+            roles[..4],
+            [0, 1, 0, 0],
+            "q1 releases physical raw/H9 and keeps only original A H8 custody; associations have their own owners"
+        );
+        {
+            let mut ports = fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .joint_frame_ports(&fixture.scene.producers)
+                .unwrap();
+            q1.finish_frame(&mut ports).unwrap_or_else(|(_, reason)| {
+                panic!("future genuine END releases only the completed frame: {reason:?}")
+            });
+        }
+        assert_eq!(
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .joint_capture()
+                .adapter()
+                .retained_starts_for_test(),
+            starts
+        );
+        assert_eq!(
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .joint_capture()
+                .ledger()
+                .roles_for_test(),
+            roles
+        );
+        let before_b = fixture
+            .feeds()
+            .into_iter()
+            .find(|feed| {
+                fixture
+                    .scene
+                    .real
+                    .scene
+                    .coordinator
+                    .semantic_bindings()
+                    .get(feed.caller)
+                    .unwrap()
+                    .pin()
+                    .pid()
+                    == b
+            })
+            .unwrap();
+        assert_eq!((before_b.reduced, before_b.staged), (2, 0));
+        // The SAME original END arrives through the SAME actual consumer later.
+        fixture.scene.drain.source_mut().push_record(end_a.to_vec());
+        let mut q2 = fixture.audited(1, 1, &BirthFault);
+        assert!(q2.failure_for_test().is_none());
+        let mut births = NativeFrameBirths {
+            h0: &h0,
+            attached: &fixture.attached,
+            retained: &mut fixture.births,
+            seen: Vec::new(),
+            unreadable: false,
+        };
+        {
+            let mut ports = fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .joint_frame_ports(&fixture.scene.producers)
+                .unwrap();
+            q2.bind_targets(&ports).unwrap();
+            for index in 0..2 {
+                assert_eq!(
+                    q2.seal_next(&mut ports, &mut births, &BirthFault),
+                    Ok(QuantumSealProgress::DeliveryReady)
+                );
+                assert_eq!(
+                    q2.deliver_next(&mut ports),
+                    Ok(if index == 0 {
+                        QuantumSealProgress::LocalPending
+                    } else {
+                        QuantumSealProgress::Complete
+                    })
+                );
+            }
+            q2.finish_frame(&mut ports)
+                .unwrap_or_else(|(_, reason)| panic!("actual later END settles once: {reason:?}"));
+        }
+        drop(births);
+        assert!(
+            fixture.feeds().iter().all(|feed| feed.reduced == 2
+                && feed.staged == 0
+                && !feed.degraded
+                && !feed.fallback)
+        );
+        assert_eq!(
+            fixture
+                .feeds()
+                .into_iter()
+                .find(|feed| feed.id == before_b.id)
+                .unwrap(),
+            before_b,
+            "empty later work cannot replay or erase B"
+        );
+        assert!(
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .joint_capture()
+                .adapter()
+                .retained_starts_for_test()
+                .is_empty()
+        );
+        assert_eq!(
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .joint_capture()
+                .ledger()
+                .roles_for_test()[..4],
+            [0, 0, 0, 0]
+        );
+        fixture.scene.assert_claims(&[]);
+        assert_eq!(
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .reference_h3_audit_state(),
+            (3, false)
+        );
+        assert_eq!(
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .reference_h3_acknowledged_below(),
+            0,
+            "a future terminal wait never invents a loss void"
+        );
+    }
+}

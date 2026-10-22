@@ -538,6 +538,20 @@ class EntryObjectTests(unittest.TestCase):
                 with self.subTest(variant=variant, call=suffix, control="caller alias cannot outlive retirement"):
                     with self.assertRaisesRegex(RuntimeError, "return.*START read after retirement"):
                         CHECKER["contract"](stale, variant)
+                # A saved pointer's nonnull value survives a callee, but the
+                # lifetime of the original row does not. This later guard
+                # must not reacquire ownership before the same stale read.
+                guard, old_guard = next((pc, text) for pc, text in reversed(root_insns)
+                                        if re.fullmatch(r"if r1 == 0x0 goto .*", text))
+                exit_pc = root_insns[-1][0]
+                new_guard = f"if r9 == 0x0 goto {exit_pc-guard-1:+#x}"
+                guarded = mutate(stale, root_name, guard, old_guard, new_guard)
+                with self.subTest(variant=variant, call=suffix, control="nonnull alias cannot revive retired row"):
+                    with self.assertRaisesRegex(RuntimeError, "return.*START read after retirement"):
+                        CHECKER["contract"](guarded, variant)
+                guarded_snapshot = mutate(snapshot, root_name, guard, old_guard, new_guard)
+                with self.subTest(variant=variant, call=suffix, control="guarded value snapshot survives retirement"):
+                    self.assertTrue(all(CHECKER["contract"](guarded_snapshot, variant)["verified"].values()))
                 for register, new in (("r1", "r1 = r10"), ("r2", "r2 += 0x8"),
                                       ("r3", "r3 = r10"), ("r4", "r4 = 0x0"), ("r5", "r5 = 0x2")):
                     pc = before_call(variant, root_name, suffix, register+r" (=|\+=) .*")
@@ -699,6 +713,98 @@ class EntryObjectTests(unittest.TestCase):
                         else:
                             self.assertEqual(edges[zero_edge]["r7"], ("constant", 0))
                             self.assertIs(edges[nonzero_edge][("live", 77)], True)
+        # Exercise the real call transfer followed by the shared null edge.
+        # Callee-saved registers and a spilled alias all retain the original
+        # owner identity; only a copied field value survives its retirement.
+        for family in ("root", "ordinary", "object", "entry"):
+            section, name = ("uprobe", "p11_entry") if family == "entry" else ("uretprobe", "p11_return")
+            lines = CHECKER["D"].function_blocks(OBJECTS["default"])[name]
+            cls = CHECKER["_OwnedCaller"] if family == "entry" else CHECKER["_ReturnCaller"]
+            consumer = cls(section, name, lines, {})
+            pcs = [pc for pc, _ in consumer.insns[:6]]
+            snapshot_pc, spill_pc, retire_pc, reload_pc, guard_pc, load_pc = pcs
+            if family == "root":
+                proof = CHECKER["_ReturnRootProof"](0, 77, {retire_pc: "ordinary"})
+                target = "ordinary_return"
+            elif family == "entry":
+                proof = CHECKER["_OwnedSinkProof"](6, 0, True, ("owned", 77, 0))
+                target = "p11_owner_start_remove"
+            else:
+                proof = CHECKER["_ReturnProof"](0, True, 77, family, {})
+                target = "p11_owner_start_remove"
+            consumer.proof = proof
+            consumer.helper.difference_update(pcs)
+            for pc in pcs:
+                consumer.maps.pop(pc, None)
+            identity = consumer.identity if family != "entry" else (section, name)
+            state = {"r10": ("stack", 0), "r3": ("owned", 77, 0),
+                "r4": ("scope_flags", identity), "r5": ("constant", 0),
+                **{f"r{n}": ("owned", 77, 0) for n in range(6, 10)},
+                ("stack", -0x40, 8): ("pid_tgid", identity),
+                ("stack", -0x38, 4): ("low", identity),
+                ("stack", -0x34, 4): ("constant", 0),
+                ("stack", -0x60, 8): ("owned", 77, 0),
+                ("owned_word", 77, 0x38, 4): ("constant", 2),
+                ("live", 77): True, ("object_mode",): False}
+            state["r8"] = ("owned", 77, 0x38)
+            state.update({"r1": ("context", 0), "r2": ("stack", -0x40)} if family == "root"
+                         else {"r1": ("stack", -0x40), "r2": ("constant", 1)})
+            consumer.text[snapshot_pc] = "r0 = *(u32 *)(r6 + 0x38)"
+            snapshot_state = consumer.step(snapshot_pc, state)
+            consumer.text[spill_pc] = "*(u64 *)(r10 - 0x80) = r0"
+            snapshot_state = consumer.step(spill_pc, snapshot_state)
+            consumer.text[retire_pc] = "call -0x1"
+            consumer.calls[retire_pc] = target
+            expired = consumer.step(retire_pc, snapshot_state)
+            self.assertIsNot(expired.get(("live", 77)), True)
+            for alias in ("r6", "r7", "r8", "r9", "spill"):
+                candidate = expired
+                register = "r6" if alias == "spill" else alias
+                if alias == "spill":
+                    consumer.text[reload_pc] = "r6 = *(u64 *)(r10 - 0x60)"
+                    candidate = consumer.step(reload_pc, candidate)
+                consumer.text[guard_pc] = f"if {register} != 0x0 goto +0x1"
+                consumer.graph[guard_pc] = [guard_pc+1, guard_pc+2]
+                refined = dict(proof.edges(consumer, guard_pc, candidate, candidate))[guard_pc+2]
+                with self.subTest(family=family, alias=alias):
+                    self.assertIsNot(refined.get(("live", 77)), True)
+                    consumer.text[load_pc] = f"r0 = *(u32 *)({register} + 0x38)"
+                    with self.assertRaisesRegex(RuntimeError, "START.*(lifetime|retirement)"):
+                        consumer.step(load_pc, refined)
+                    consumer.text[load_pc] = "r0 = *(u64 *)(r10 - 0x80)"
+                    snapshot_fact = ("constant", 2) if family == "entry" else ("retained", 0x38, 32)
+                    self.assertEqual(consumer.step(load_pc, refined)["r0"], snapshot_fact)
+            consumer.text[guard_pc] = "if r6 != 0x0 goto +0x1"
+            for predecessors in ((expired, snapshot_state), (snapshot_state, expired)):
+                merged = proof.join(*predecessors)
+                refined = dict(proof.edges(consumer, guard_pc, merged, merged))[guard_pc+2]
+                with self.subTest(family=family, retired_first=predecessors[0] is expired,
+                                  control="retirement survives a live predecessor join"):
+                    self.assertIsNot(refined.get(("live", 77)), True)
+                    consumer.text[load_pc] = "r0 = *(u32 *)(r6 + 0x38)"
+                    with self.assertRaisesRegex(RuntimeError, "START.*(lifetime|retirement)"):
+                        consumer.step(load_pc, refined)
+        # A new constructor receives a distinct owner token without granting
+        # another lifetime to any of the original row's saved aliases.
+        generic = CHECKER["SinkProof"](6, 0, True, ("stack", -0x128))
+        self.assertNotIn(("stack", -0x80, 8), generic.join({}, merged),
+                         "a value snapshot needs provenance on both predecessors")
+        fresh = CHECKER["_OwnedCaller"]("uprobe", "p11_entry", lines, {retire_pc: "p11_owner_start_begin"})
+        fresh.helper.discard(retire_pc)
+        fresh.maps.pop(retire_pc, None)
+        fresh.text[retire_pc] = "call -0x1"
+        fresh.proof = generic
+        acquired = fresh.step(retire_pc, merged)
+        self.assertEqual(acquired["r0"], ("owned", retire_pc, 0))
+        fresh.text[guard_pc] = "if r0 != 0x0 goto +0x1"
+        fresh.graph[guard_pc] = [guard_pc+1, guard_pc+2]
+        acquired = dict(generic.edges(fresh, guard_pc, acquired, acquired))[guard_pc+2]
+        self.assertIs(acquired[("live", retire_pc)], True)
+        self.assertIsNot(acquired.get(("live", 77)), True)
+        fresh.text[guard_pc] = "if r6 != 0x0 goto +0x1"
+        original = dict(generic.edges(fresh, guard_pc, acquired, acquired))[guard_pc+2]
+        self.assertIsNot(original.get(("live", 77)), True)
+        self.assertIs(original[("live", retire_pc)], True)
 
     def test_proven_32bit_comparisons_and_shared_index_alias(self):
         # Descriptor bytes and normalized IA32 user words may use JMP32;

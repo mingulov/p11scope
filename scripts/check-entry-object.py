@@ -405,9 +405,10 @@ def zero_partition(fact, op, width):
 class SinkProof:
     """Additional facts and obligations for one semantic role in Consumer.
 
-    Index domains union at joins; all other facts intersect. Only this role's
-    success and lifecycle/nonzero predicates partition a join. A successful
-    capture must survive to its final sink; initialized bytes cannot satisfy it.
+    Index domains and per-owner retirement denials union at joins; other facts
+    intersect. Only this role's success and lifecycle/nonzero predicates
+    partition a join. A successful capture must survive to its final sink;
+    initialized bytes cannot satisfy it.
     """
     def __init__(self, role, abi, present, start, *, calls=None, reads=None,
                  helpers=None, insert=None, kind="entry", mode=0):
@@ -429,13 +430,24 @@ class SinkProof:
 
     @staticmethod
     def join(previous, state):
-        if previous is None:
-            return state.copy()
-        merged = {k: v for k, v in previous.items() if state.get(k) == v}
+        merged = state.copy() if previous is None else {
+            k: v for k, v in previous.items() if state.get(k) == v}
+        previous = previous or {}
         for key in previous.keys() & state.keys():
             if isinstance(key, tuple) and key[0] == "domain":
                 merged[key] = previous[key] | state[key]
+        for key in previous.keys() | state.keys():
+            if isinstance(key, tuple) and key[0] == "retired_owner":
+                merged[key] = True
+                merged.pop(("live", key[1]), None)
         return merged
+
+    @staticmethod
+    def retire_owner(state, owner):
+        # Aliases keep the original token across registers and spills. A later
+        # nonnull test says nothing about that original row's ended lifetime.
+        state.pop(("live", owner), None)
+        state[("retired_owner", owner)] = True
 
     def domain(self, state, field):
         return state.get(("domain", field), BYTE_DOMAIN)
@@ -656,6 +668,12 @@ class SinkProof:
         if target == "p11_owner_start_get":
             state["r0"] = ("owned", pc, 0)
         if target == "p11_owner_start_remove":
+            owners = {fact[1] for fact in before.values()
+                      if isinstance(fact, tuple) and fact and fact[0] == "owned"}
+            if self.start[0] == "owned" and before.get(("live", self.start[1])):
+                owners.add(self.start[1])
+            for owner in owners:
+                self.retire_owner(state, owner)
             for key in list(state):
                 if isinstance(key, tuple) and key[0] == "live":
                     del state[key]
@@ -848,7 +866,10 @@ class SinkProof:
                                 del state[key]
                 elif left and left[0] in ("owned", "function_value") and zero_taken is not None:
                     if taken != zero_taken:
-                        state[("live", left[1])] = True
+                        if state.get(("retired_owner", left[1])):
+                            state.pop(("live", left[1]), None)
+                        else:
+                            state[("live", left[1])] = True
                     else:
                         for key, fact in list(state.items()):
                             if fact == left:
@@ -1738,7 +1759,7 @@ class _ReturnRootProof(SinkProof):
             # Each checked outlined return retires this same required START
             # on every terminal path. The caller may retain snapshots, but
             # returning from the callee cannot revive any saved row alias.
-            state.pop(("live", self.start[1]), None)
+            self.retire_owner(state, self.start[1])
         return super().transfer(consumer, pc, before, state)
 
     def edges(self, consumer, pc, before, after):

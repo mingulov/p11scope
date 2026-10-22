@@ -13220,6 +13220,35 @@ const SUCCESSOR_REPLAY_TEST_CHILD: &str =
     "src/semantic_capture/tests/custody_chain_tests/owner_admission/successor_replay.rs";
 
 fn semantic_capture_private_test_child_references_are_canonical(path: &str, source: &str) -> bool {
+    // The newly external root has a common basename. Resolve literal path
+    // aliases from each source file instead of banning every `tests.rs`.
+    let parent = std::path::Path::new(path)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new(""));
+    // Inspect both sides of quotes so an unmatched quote in a comment cannot
+    // hide a later literal inclusion from this conservative source sentinel.
+    for reference in source.split('"') {
+        if std::path::Path::new(reference).file_name() != Some(std::ffi::OsStr::new("tests.rs")) {
+            continue;
+        }
+        let mut resolved = std::path::PathBuf::new();
+        for component in parent.join(reference).components() {
+            match component {
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => match resolved.components().next_back() {
+                    Some(std::path::Component::Normal(_)) => {
+                        resolved.pop();
+                    }
+                    Some(std::path::Component::RootDir) => {}
+                    _ => resolved.push(".."),
+                },
+                _ => resolved.push(component.as_os_str()),
+            }
+        }
+        if resolved == std::path::Path::new(SEMANTIC_CAPTURE_TESTS) {
+            return false;
+        }
+    }
     // Strip only the approved source sites. Concrete filename references
     // elsewhere also catch differently named #[path] aliases and include!.
     let remainder = match path {
@@ -13474,6 +13503,44 @@ fn semantic_capture_private_record_test_children_remain_test_only() {
                 owner_admission_present,
             ),
             "an alternate production inclusion must revoke the child exemption: {inclusion}"
+        );
+    }
+
+    for (path, reference) in [
+        ("src/semantic_capture/other.rs", "tests.rs"),
+        ("src/semantic_capture/other.rs", "./tests.rs"),
+        ("src/semantic_capture/tests/other.rs", "../tests.rs"),
+        (
+            "src/semantic_capture/tests/custody_chain_tests/other.rs",
+            "../../tests.rs",
+        ),
+        (
+            "src/lib.rs",
+            "semantic_capture/../semantic_capture/./tests.rs",
+        ),
+    ] {
+        for inclusion in [
+            format!("#[path = {reference:?}]\nmod alias;"),
+            format!("include!({reference:?});"),
+            format!("// unmatched quote: \"\n#[path = {reference:?}]\nmod alias;"),
+        ] {
+            assert!(
+                !semantic_capture_private_test_child_references_are_canonical(path, &inclusion),
+                "{path} must refuse another inclusion of the external root: {inclusion}",
+            );
+        }
+    }
+    for (path, reference) in [
+        ("src/lib.rs", "tests.rs"),
+        ("src/semantic_capture/other.rs", "other_tests.rs"),
+        ("src/semantic_capture/tests/other.rs", "tests.rs"),
+        ("src/lib.rs", "../../src/semantic_capture/./tests.rs"),
+    ] {
+        assert!(
+            semantic_capture_private_test_child_references_are_canonical(
+                path,
+                &format!("#[path = {reference:?}]\nmod ordinary_tests;"),
+            )
         );
     }
 

@@ -1721,3 +1721,253 @@ fn event_doc_pins_activity_precedence_and_last_seen_presence() {
         "the old `never appears` claim must not return"
     );
 }
+
+#[test]
+fn f7_snapshot_baseline_preserves_interleaved_children() {
+    // Catch a renderer that attaches children to the wrong physical pair,
+    // reorders them, or drops unknown, retired, saturated or loss evidence.
+    use crate::discovery::caller_registry::instance_input::{
+        InstanceLifecycle, RegistryInstanceId,
+    };
+
+    let mut harness = harness();
+    harness.stage_scale(&ScaleSpec {
+        name: "f7-snapshot-baseline",
+        callers: 2,
+        modules: 2,
+        edges_per_caller: 1,
+        endpoints_per_module: 4,
+        first_pid: 70_000,
+    });
+    harness.commit();
+    let mut presentation = Presentation::capture(harness.coordinator(), "f7", 100, 200, 1);
+    for (index, caller) in presentation.callers.iter_mut().enumerate() {
+        caller.incarnation = 0;
+        caller.exe.as_mut().unwrap().path = Some(format!("/usr/bin/f7-app{index}"));
+    }
+    for module in &mut presentation.modules {
+        module.admission_history.clear();
+    }
+    for (edge, count) in presentation.edges.iter_mut().zip([34, 55]) {
+        edge.entry_count = count;
+        edge.entry_observation = "observed";
+        edge.coverage = UseCoverage::Counted {
+            since_ns: 100,
+            lossy: false,
+        };
+        edge.capture = Capture::Armed;
+        edge.activity = Activity::Used;
+    }
+    for (id, pair, state, returns, saturated, historical, lossy, reasons) in [
+        (
+            2,
+            0,
+            InstanceLifecycle::Observed,
+            Some(3),
+            false,
+            0,
+            false,
+            vec![],
+        ),
+        (
+            7,
+            1,
+            InstanceLifecycle::Uncertain,
+            None,
+            false,
+            0,
+            true,
+            vec!["semantic_loss"],
+        ),
+        (
+            11,
+            0,
+            InstanceLifecycle::Retired,
+            Some(5),
+            true,
+            1,
+            true,
+            vec!["instance_retired", "semantic_loss"],
+        ),
+        (
+            4095,
+            1,
+            InstanceLifecycle::Observed,
+            Some(0),
+            false,
+            0,
+            false,
+            vec![],
+        ),
+    ] {
+        let edge = &presentation.edges[pair];
+        let instance = RegistryInstanceId::from_raw(id);
+        presentation.instances.push(InstanceView {
+            id: instance,
+            caller: edge.caller,
+            module: edge.module,
+            state,
+            reason: None,
+            first_seen_ns: 100,
+            last_seen_ns: 200,
+        });
+        presentation.semantic_edges.push(InstanceSemanticView {
+            instance,
+            caller: edge.caller,
+            module: edge.module,
+            api_returns: returns,
+            saturated,
+            historical_only_returns: historical,
+            semantics: EdgeSemanticsView {
+                label: if returns.is_none() {
+                    "unknown (no calls observed)"
+                } else {
+                    "unknown (no operation evidence)"
+                },
+                mechanisms: Vec::new(),
+                operations: None,
+            },
+            lossy,
+            reasons,
+        });
+    }
+    presentation.gaps = vec![GapView {
+        caller: None,
+        module: None,
+        pid: None,
+        subject: "fixture scope".into(),
+        reason: "semantic state refused".into(),
+        budget: Some(BudgetRefusal {
+            resource: "semantic_state",
+            limit: 4,
+            requested: 5,
+        }),
+        repeats: 1,
+    }];
+    // Give this renderer-only fixture explicit small budget inputs, rather
+    // than coupling its expected bytes to changing production default limits.
+    let budgets = &mut presentation.budgets;
+    budgets.callers_limit = 2;
+    budgets.modules_limit = 2;
+    budgets.edges_limit = 2;
+    budgets.endpoints_limit = 8;
+    budgets.counters_observed = 2;
+    budgets.semantic_limit = 4;
+    budgets.semantic_refused = 1;
+    budgets.instances_occupied = 4;
+    budgets.instance_semantic_unknown_edges = 4;
+    budgets.retained_limit = 4;
+    budgets.retained = 1;
+    budgets.inventory_endpoints_limit = 8;
+    budgets.inventory_modules_limit = 2;
+    budgets.instance_semantic_resources = SemanticResourceView {
+        charges: SemanticResourceSnapshot {
+            limit_bytes: 4096,
+            charged_bytes: 128,
+            peak_charged_bytes: 256,
+            refused: 1,
+        },
+        occupancy: S1Occupancy::default(),
+    };
+
+    let snapshot = render_snapshot(&presentation);
+    assert_eq!(
+        snapshot,
+        concat!(
+            "inventory f7 (1 pass, 2 callers, 2 modules, 2 edges)\n",
+            "coverage: 1 gaps, 0 refusals, 0 suppressed\n",
+            "application f7-app0 [c0 pid 70000 incarnation 0] -> module m0.so [m0]: At least 34 entries observed\n",
+            "application f7-app1 [c1 pid 70001 incarnation 0] -> module m1.so [m1]: At least 55 entries observed\n",
+            "Details: retained paths, identities, states and coverage follow.\n",
+            "budgets: callers 2/2 refused 0 | modules 2/2 refused 0 | edges 2/2 refused 0 | endpoints 8/8 refused 0 | counters observed 2 saturated 0 | semantic_state withheld held 0/4 unknown 2 refused 1 | retained_history 1/4 suppressed 0 | inventory_endpoints 0/8 refused 0 | inventory_attach_modules 0/2 refused 0 | semantic 128/4096B peak=256 refused=1 | open=0 active=0 pending=0 detached=0 mechanisms=0 categories=0 functions=0 function_bytes=0 function_capacity=0 returns=0 async_bytes=0 async_capacity=0 origins=0 origin_elements=0 origin_capacity=0\n",
+            "caller c0 pid 70000 incarnation 0 mapped (/usr/bin/f7-app0)\n",
+            "caller c1 pid 70001 incarnation 0 mapped (/usr/bin/f7-app1)\n",
+            "module m0 /scale/m0.so mapped (admitted)\n",
+            "module m1 /scale/m1.so mapped (admitted)\n",
+            "edge c0 -> m0 mapping mapped entries 34 (observed) presence mapped capture armed activity used (recency unknown) semantics unknown (semantic capture withheld) coverage counted since 100\n",
+            "  instance i2 observed api_returns=3 historical_only_returns=0 semantics unknown (no operation evidence) coverage lossy=false reasons=[]\n",
+            "  instance i11 retired api_returns=5 (saturated) historical_only_returns=1 semantics unknown (no operation evidence) coverage lossy=true reasons=[instance_retired,semantic_loss]\n",
+            "edge c1 -> m1 mapping mapped entries 55 (observed) presence mapped capture armed activity used (recency unknown) semantics unknown (semantic capture withheld) coverage counted since 100\n",
+            "  instance i7 uncertain api_returns=unknown historical_only_returns=0 semantics unknown (no calls observed) coverage lossy=true reasons=[semantic_loss]\n",
+            "  instance i4095 observed api_returns=0 historical_only_returns=0 semantics unknown (no operation evidence) coverage lossy=false reasons=[]\n",
+            "gap [fixture scope] semantic state refused (budget semantic_state: limit 4, requested 5)\n",
+        )
+    );
+    assert_eq!(snapshot.matches("entries 34 (").count(), 1);
+    assert_eq!(snapshot.matches("entries 55 (").count(), 1);
+}
+
+#[test]
+fn f7_snapshot_high_cardinality_allocation_baseline() {
+    // Exercise the real renderer with all 4096 edges/children, rather than
+    // timing a toy index or accidentally measuring an empty selection.
+    use crate::discovery::caller_registry::instance_input::{
+        InstanceLifecycle, RegistryInstanceId,
+    };
+    let mut harness = harness();
+    harness.stage_scale(&ScaleSpec {
+        name: "f7-snapshot-scale",
+        callers: 4096,
+        modules: 4096,
+        edges_per_caller: 1,
+        endpoints_per_module: 1,
+        first_pid: 100_000,
+    });
+    harness.commit();
+    let mut presentation = Presentation::capture(harness.coordinator(), "f7", 100, 200, 1);
+    for id in 0..4096 {
+        // 17 is coprime to 4096: every physical edge gets exactly one
+        // child, interleaved against the globally increasing instance IDs.
+        let edge = &presentation.edges[(id * 17) % 4096];
+        let instance = RegistryInstanceId::from_raw(id as u32);
+        presentation.instances.push(InstanceView {
+            id: instance,
+            caller: edge.caller,
+            module: edge.module,
+            state: InstanceLifecycle::Observed,
+            reason: None,
+            first_seen_ns: 100,
+            last_seen_ns: 200,
+        });
+        presentation.semantic_edges.push(InstanceSemanticView {
+            instance,
+            caller: edge.caller,
+            module: edge.module,
+            api_returns: Some(1),
+            saturated: false,
+            historical_only_returns: 0,
+            semantics: EdgeSemanticsView {
+                label: "unknown (no operation evidence)",
+                mechanisms: Vec::new(),
+                operations: None,
+            },
+            lossy: false,
+            reasons: Vec::new(),
+        });
+    }
+    assert_eq!(presentation.edges.len(), 4096);
+    assert_eq!(presentation.instances.len(), 4096);
+    assert_eq!(presentation.semantic_edges.len(), 4096);
+    let (snapshot, allocations, bytes) =
+        crate::test_alloc::count_allocs_during(|| render_snapshot(&presentation));
+    assert_eq!(
+        snapshot
+            .lines()
+            .filter(|line| line.starts_with("edge "))
+            .count(),
+        4096
+    );
+    assert_eq!(
+        snapshot
+            .lines()
+            .filter(|line| line.starts_with("  instance "))
+            .count(),
+        4096
+    );
+    assert!(allocations > 0);
+    assert!(bytes >= snapshot.len());
+    eprintln!(
+        "F7 snapshot baseline: edges=4096 children=4096 allocations={allocations} requested_bytes={bytes} output_bytes={}",
+        snapshot.len(),
+    );
+}

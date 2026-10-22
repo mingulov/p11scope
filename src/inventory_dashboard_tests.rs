@@ -4346,3 +4346,127 @@ fn enabled_footer_names_promotion_keys_on_edge_pages_only() {
         "status stays visible on gaps: {text}"
     );
 }
+
+fn f7_render_fixture(edges: usize, children: usize) -> Presentation {
+    use crate::discovery::caller_registry::instance_input::{
+        InstanceLifecycle, RegistryInstanceId,
+    };
+    use crate::inventory_present::{EdgeSemanticsView, InstanceSemanticView, InstanceView};
+
+    let mut harness = harness();
+    harness.stage_scale(&ScaleSpec {
+        name: "f7-dashboard-baseline",
+        callers: edges,
+        modules: edges,
+        edges_per_caller: 1,
+        endpoints_per_module: 1,
+        first_pid: 110_000,
+    });
+    harness.commit();
+    let mut presentation = Presentation::capture(harness.coordinator(), "f7", 100, 200, 1);
+    for id in 0..children {
+        let edge = &presentation.edges[(id * 17) % edges];
+        let instance = RegistryInstanceId::from_raw(id as u32);
+        presentation.instances.push(InstanceView {
+            id: instance,
+            caller: edge.caller,
+            module: edge.module,
+            state: InstanceLifecycle::Observed,
+            reason: None,
+            first_seen_ns: 100,
+            last_seen_ns: 200,
+        });
+        presentation.semantic_edges.push(InstanceSemanticView {
+            instance,
+            caller: edge.caller,
+            module: edge.module,
+            api_returns: Some(1),
+            saturated: false,
+            historical_only_returns: 0,
+            semantics: EdgeSemanticsView {
+                label: "unknown (no operation evidence)",
+                mechanisms: Vec::new(),
+                operations: None,
+            },
+            lossy: false,
+            reasons: Vec::new(),
+        });
+    }
+    presentation.budgets.instances_occupied = children;
+    presentation.budgets.instance_semantic_unknown_edges = children;
+    presentation
+}
+
+#[test]
+fn f7_budget_header_does_not_render_hidden_inventory() {
+    // Reconstructing a whole snapshot to obtain its budget line would read
+    // this hidden path, allocate its bytes, and violate this consumer bound.
+    let mut presentation = f7_render_fixture(1, 0);
+    presentation.edges.clear();
+    let frame = frame_for(&presentation);
+    let viewport = Viewport {
+        width: 80,
+        height: 24,
+    };
+    let state = DashboardState::new();
+    let (small, small_allocations, small_bytes) =
+        crate::test_alloc::count_allocs_during(|| render_frame(&frame, viewport, &state));
+
+    presentation.modules[0].paths = vec!["x".repeat(128 * 1024)];
+    let large_frame = frame_for(&presentation);
+    let (large, large_allocations, large_bytes) =
+        crate::test_alloc::count_allocs_during(|| render_frame(&large_frame, viewport, &state));
+    assert_eq!(large, small, "offscreen paths cannot change the frame");
+    assert_eq!(large_allocations, small_allocations);
+    assert_eq!(large_bytes, small_bytes);
+    let text = frame_text(&large);
+    assert!(text.lines().nth(2).unwrap().starts_with("budgets: "));
+    assert!(text.lines().last().unwrap().contains("q quit"));
+}
+
+#[test]
+fn f7_dashboard_allocation_baseline() {
+    // Baseline only: the later index change must improve measured actual
+    // redraw work. No wall-clock assertion or preselected speedup is hidden
+    // in this test, and fixture construction is outside the allocator probe.
+    for (edges, children) in [(4096, 4096), (1, 64), (1, 4096)] {
+        let presentation = f7_render_fixture(edges, children);
+        assert_eq!(presentation.edges.len(), edges);
+        assert_eq!(presentation.instances.len(), children);
+        assert_eq!(presentation.semantic_edges.len(), children);
+        let frame = frame_for(&presentation);
+        for height in [14, 24] {
+            let viewport = Viewport { width: 80, height };
+            let state = DashboardState::new();
+            let (bytes, peak, allocations, requested_bytes) =
+                crate::test_alloc::counted_peak_during(|| render_frame(&frame, viewport, &state));
+            assert!(!peak.incomplete, "a partial probe is not a resource bound");
+            assert_eq!(peak.failed_requests, 0);
+            assert_eq!(peak.live_blocks, 1, "only the returned frame remains");
+            assert_eq!(peak.live_bytes, bytes.capacity());
+            assert!(allocations > 0);
+            assert!(requested_bytes >= bytes.len());
+            let text = frame_text(&bytes);
+            assert_eq!(text.lines().count(), height);
+            if edges == 1 {
+                assert!(
+                    text.contains("instances +"),
+                    "hidden children remain explicit: {text}"
+                );
+                assert!(text.contains("hidden"));
+            } else {
+                assert!(
+                    text.contains("4096 edges"),
+                    "full totals remain visible: {text}"
+                );
+                assert!(text.contains("more below"));
+            }
+            eprintln!(
+                "F7 frame baseline: edges={edges} children={children} viewport=80x{height} allocations={allocations} requested_bytes={requested_bytes} peak_bytes={} realloc_overlap_bytes={} output_bytes={}",
+                peak.peak_bytes,
+                peak.realloc_overlap_bytes,
+                bytes.len(),
+            );
+        }
+    }
+}

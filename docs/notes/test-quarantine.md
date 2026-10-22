@@ -14,7 +14,13 @@ Isolation applied to all seven: serial execution (one test at a time, no
 lane-parallel siblings), exact `--exact` filters (no neighbor tests in the
 binary run), `--test-threads=1`, and a private `CARGO_TARGET_DIR`
 (`target/quarantine`, separate from the main build, so build IO never
-contends with a running lane).
+contends with a running lane). One combined offline Cargo compilation emits
+the library and artifact-contract test executable paths as JSON. The runner
+accepts exactly those two current test executables inside the private target,
+then invokes them directly for the seven serial cases; Cargo does not run
+between cases. Missing, ambiguous or nonexecutable outputs fail the lane.
+CI reuses only the existing exact bpf-linker tool cache here; cold compilation
+and the tests' own fixture work remain.
 
 | # | Flake (filter) | Owning lane | Wall-clock isolation |
 |---|---|---|---|

@@ -11,6 +11,7 @@ Run: python3 -I tests/python/test_residual_gates.py -v
 """
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -283,6 +284,197 @@ class ResidualGates(unittest.TestCase):
             "signal_settlement_observes_second_sigint_during_fallback_term_grace",
         ):
             self.assertIn(name, text)
+
+    def test_quarantine_tool_cache_preserves_failure_policy(self):
+        block = ci_text().split("\n  quarantine:\n", 1)[1]
+        self.assertTrue(block.startswith(
+            "    needs: [lint, audit, tests, bpf-noninterference, contracts, scripts]\n"
+            "    if: failure()\n"))
+        self.assertIn("      - id: bpf-linker\n", block)
+        self.assertIn("          path: ~/.cargo/bin/bpf-linker\n", block)
+        self.assertIn(
+            "          key: bpf-linker-${{ env.CI_TOOL_BPF_LINKER }}-"
+            "${{ steps.keys.outputs.image }}-rust-${{ hashFiles('.release-rust-version') }}\n", block)
+        install = 'run: cargo +"$(cat .release-rust-version)" install bpf-linker --version "$CI_TOOL_BPF_LINKER" --locked'
+        self.assertIn("      - if: steps.bpf-linker.outputs.cache-hit != 'true'\n        " + install, block)
+        self.assertEqual(block.count(install), 1)
+        self.assertIn('echo "image=$ImageOS-$ImageVersion" >>"$GITHUB_OUTPUT"', block)
+        self.assertNotIn("restore-keys:", block)
+        self.assertNotIn("target/debug", block)
+
+
+QUARANTINE_CASES = (
+    ("artifact", "lane13_evidence_finalizes_only_after_owned_cleanup"),
+    ("artifact", "metadata_canary_matrix"),
+    ("artifact", "stopped_canary_capture_lifecycle"),
+    ("artifact", "native_helper_suite_recorded_launcher_requires_authenticated_generations_and_bounded_cleanup"),
+    ("lib", "run::tests::actual_handoff_helpers_preserve_errno_and_retry_without_renewing_deadlines"),
+    ("artifact", "release_seal_denies_the_caller_path_to_every_reached_command"),
+    ("lib", "run::tests::signal_settlement_observes_second_sigint_during_fallback_term_grace"),
+)
+
+QUARANTINE_CARGO = '''#!/usr/bin/python3
+import json, os, pathlib, sys
+root = pathlib.Path(os.environ['QUARANTINE_CONTROL'])
+args = sys.argv[1:]
+with (root / 'events.jsonl').open('a') as stream:
+ stream.write(json.dumps({'event': 'compile' if '--no-run' in args else 'cargo-run',
+                          'argv': args, 'target': os.environ.get('CARGO_TARGET_DIR')}) + '\\n')
+if '--no-run' not in args:
+ print('running 1 test\\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;')
+ sys.exit(0)
+if os.environ['QUARANTINE_MODE'] == 'build-failure':
+ print('controlled Cargo build failure', file=sys.stderr)
+ sys.exit(37)
+print((root / 'build.jsonl').read_text(), end='')
+'''
+
+QUARANTINE_TEST = '''#!/usr/bin/python3
+import json, os, pathlib, sys
+root = pathlib.Path(os.environ['QUARANTINE_CONTROL'])
+role = @ROLE@
+args = sys.argv[1:]
+allowed = {name: kind for kind, name in json.loads((root / 'cases.json').read_text())}
+if len(args) != 4 or args[1:] != ['--exact', '--nocapture', '--test-threads=1'] or allowed.get(args[0]) != role:
+ sys.exit(91)
+active = root / 'active-test'
+fd = os.open(active, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+try:
+ with (root / 'events.jsonl').open('a') as stream:
+  stream.write(json.dumps({'event': 'start', 'role': role, 'argv': args}) + '\\n')
+ mode = os.environ['QUARANTINE_MODE']
+ selected = args[0] == 'metadata_canary_matrix'
+ if selected and mode == 'failed-case':
+  print('running 1 test\\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out;')
+  sys.exit(1)
+ if selected and mode == 'zero-match':
+  print('running 0 tests\\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out;')
+ else:
+  print('running 1 test\\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out;')
+finally:
+ os.close(fd)
+ active.unlink()
+ with (root / 'events.jsonl').open('a') as stream:
+  stream.write(json.dumps({'event': 'finish', 'role': role, 'argv': args}) + '\\n')
+'''
+
+
+class QuarantineRunnerTests(unittest.TestCase):
+    def run_case(self, mode="healthy", *, custom_target=False):
+        with tempfile.TemporaryDirectory(prefix="quarantine-control-") as temporary:
+            root = Path(temporary)
+            checkout = root / "checkout"
+            (checkout / "scripts").mkdir(parents=True)
+            script = checkout / "scripts/run-flake-quarantine.sh"
+            script.write_bytes((ROOT / "scripts/run-flake-quarantine.sh").read_bytes())
+            release = (ROOT / ".release-rust-version").read_text().strip()
+            (checkout / ".release-rust-version").write_text(release + "\n")
+            (root / "cases.json").write_text(json.dumps(QUARANTINE_CASES))
+            private_tmp = root / "private tmp"
+            private_tmp.mkdir(mode=0o700)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            cargo = bin_dir / "cargo"
+            cargo.write_text(QUARANTINE_CARGO)
+            cargo.chmod(0o755)
+            target = root / "custom target" if custom_target else checkout / "target/quarantine"
+            executables = target / "debug/deps"
+            executables.mkdir(parents=True)
+            records = []
+            for role, name, kind, source in (
+                ("lib", "p11scope", "lib", "src/lib.rs"),
+                ("artifact", "artifact_contracts", "test", "tests/artifact_contracts.rs"),
+            ):
+                executable = executables / (role + " test executable")
+                if role == "artifact" and mode == "outside-target":
+                    executable = root / "foreign executable"
+                executable.write_text(QUARANTINE_TEST.replace("@ROLE@", json.dumps(role)))
+                executable.chmod(0o644 if role == "artifact" and mode == "nonexecutable" else 0o755)
+                record = {"reason": "compiler-artifact", "profile": {"test": True},
+                          "target": {"name": name, "kind": [kind], "src_path": str(checkout / source)},
+                          "executable": str(executable)}
+                if role == "artifact":
+                    # Other packages and normal builds must not license a stale executable.
+                    records.append(dict(record, target={**record["target"], "src_path": str(root / "other-package.rs")}))
+                    records.append(dict(record, profile={"test": False}))
+                if role != "artifact" or mode != "missing":
+                    records.append(record)
+                if role == "artifact" and mode == "ambiguous":
+                    records.append(record)
+            payload = "\n".join(json.dumps(record) for record in records) + "\n"
+            if mode == "malformed":
+                payload += "not Cargo JSON\n"
+            (root / "build.jsonl").write_text(payload)
+            env = dict(os.environ, PATH=str(bin_dir) + os.pathsep + os.environ["PATH"],
+                       TMPDIR=str(private_tmp), QUARANTINE_CONTROL=str(root), QUARANTINE_MODE=mode)
+            env.pop("CARGO_TARGET_DIR", None)
+            if custom_target:
+                env["CARGO_TARGET_DIR"] = str(target)
+            result = subprocess.run(["sh", str(script)], env=env, text=True, capture_output=True, timeout=5)
+            event_file = root / "events.jsonl"
+            events = [json.loads(line) for line in event_file.read_text().splitlines()] if event_file.exists() else []
+            self.assertFalse((root / "active-test").exists())
+            return result, events, release, str(target)
+
+    def assert_seven_serial_runs(self, events):
+        self.assertEqual([event["event"] for event in events], ["compile"] + ["start", "finish"] * 7)
+        for event, (role, selector) in zip(events[1::2], QUARANTINE_CASES):
+            self.assertEqual((event["role"], event["argv"]),
+                             (role, [selector, "--exact", "--nocapture", "--test-threads=1"]))
+        self.assertEqual(events[1::2], [{**event, "event": "start"} for event in events[2::2]])
+
+    def test_one_compile_runs_seven_exact_serial_cases(self):
+        result, events, release, _target = self.run_case()
+        self.assertEqual(result.returncode, 0, result.stdout[-1000:] + result.stderr[-1000:])
+        self.assert_seven_serial_runs(events)
+        self.assertEqual(events[0]["argv"], ["+" + release, "test", "--locked", "--offline", "--lib",
+                                             "--test", "artifact_contracts", "--no-run", "--message-format=json"])
+        self.assertEqual(events[0]["target"], "target/quarantine")
+        self.assertIn("quarantine: 7 passed, 0 failed in isolation", result.stdout)
+
+    def test_custom_target_directory_is_preserved(self):
+        result, events, _release, target = self.run_case(custom_target=True)
+        self.assertEqual(result.returncode, 0, result.stdout[-1000:] + result.stderr[-1000:])
+        self.assert_seven_serial_runs(events)
+        self.assertEqual(events[0]["target"], target)
+
+    def test_failed_case_does_not_skip_later_cases(self):
+        result, events, _release, _target = self.run_case("failed-case")
+        self.assertNotEqual(result.returncode, 0)
+        self.assert_seven_serial_runs(events)
+        self.assertIn("quarantine: 6 passed, 1 failed in isolation", result.stdout)
+
+    def test_zero_match_does_not_skip_later_cases(self):
+        result, events, _release, _target = self.run_case("zero-match")
+        self.assertNotEqual(result.returncode, 0)
+        self.assert_seven_serial_runs(events)
+        self.assertIn("quarantine: 6 passed, 1 failed in isolation", result.stdout)
+
+    def test_build_failure_prevents_execution(self):
+        result, events, _release, _target = self.run_case("build-failure")
+        self.assertEqual(result.returncode, 37)
+        self.assertEqual([event["event"] for event in events], ["compile"])
+        self.assertIn("controlled Cargo build failure", result.stderr)
+
+    def assert_bad_metadata(self, mode):
+        result, events, _release, _target = self.run_case(mode)
+        self.assertNotEqual(result.returncode, 0, result.stdout[-1000:] + result.stderr[-1000:])
+        self.assertEqual([event["event"] for event in events], ["compile"])
+
+    def test_missing_test_executable_is_rejected(self):
+        self.assert_bad_metadata("missing")
+
+    def test_ambiguous_test_executable_is_rejected(self):
+        self.assert_bad_metadata("ambiguous")
+
+    def test_nonexecutable_output_is_rejected(self):
+        self.assert_bad_metadata("nonexecutable")
+
+    def test_malformed_build_output_is_rejected(self):
+        self.assert_bad_metadata("malformed")
+
+    def test_executable_outside_private_target_is_rejected(self):
+        self.assert_bad_metadata("outside-target")
 
 
 class ResidualOracleKeys(unittest.TestCase):

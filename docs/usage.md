@@ -6,7 +6,7 @@ how to run it, and what its output actually proves. Measured examples below
 name the script that produced them so they can be reproduced; fixed
 implementation limits are code contracts, not measurements.
 
-> **Status: v0.4.0 intermediate source checkpoint.** This guide describes `doctor`,
+> **Status: v0.4.0.** This intermediate source checkpoint provides `doctor`,
 > `inspect` (`--system` is a preview), `profile` (including `--mode metrics`),
 > `trace`, `run` and `inventory` (with `--cgroup` scope, offline `diff`
 > comparison and diagnostics), with memory-scan discovery,

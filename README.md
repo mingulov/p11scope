@@ -11,7 +11,7 @@ table (including stripped providers with no `C_*` symbols), attaches probes by
 file offset, and produces a versioned `observed-profile.json` for migration
 assessment and incident diagnostics.
 
-> **Status: v0.4.0 intermediate source checkpoint**, adds `inventory --cgroup`
+> **Status: v0.4.0** (intermediate source checkpoint), adds `inventory --cgroup`
 > scope, offline `inventory diff` comparison, inventory diagnostics, executable
 > naming for trace and inspect output, and hardened final-output semantics across `doctor`,
 > `inspect`, `profile`, `trace` and `run`. Object-attribute capture is not

@@ -281,6 +281,14 @@ impl JointScene {
     }
 
     fn ingest(&mut self, raw: RawJointQuantum) -> (IngestedRaw, JournalDomainProof) {
+        let (ingested, proof, _) = self.ingest_with_grant(raw);
+        (ingested, proof)
+    }
+
+    fn ingest_with_grant(
+        &mut self,
+        raw: RawJointQuantum,
+    ) -> (IngestedRaw, JournalDomainProof, SessionDrainGrant) {
         let (prepared, owner) = self.real.scene.coordinator.prepared_joint_parts().unwrap();
         let before = owner.adapter().invocation_claims_for_test();
         let input = prepared.next_admission().unwrap();
@@ -295,7 +303,7 @@ impl JointScene {
             before,
             "initial key binding and original raw ingestion grant no invocation claims"
         );
-        (ingested, proof)
+        (ingested, proof, grant)
     }
 
     fn assert_claims(&self, expected: &[(u64, JournalDomainProof)]) {

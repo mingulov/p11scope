@@ -388,16 +388,50 @@ fn joint_audit_no_head_fault_or_malformed_keeps_original_affected_domains() {
         fixture.bind(pid, image(7), &[0, 1]);
         fixture.push(pid, 0, "C_SignInit", 1);
         fixture.push(pid, 1, "C_SignInit", 2);
-        if malformed {
-            fixture.drain.source_mut().push_record(vec![0; 3]);
-        }
         let raw = fixture.prepare(2);
-        let (ingested, _) = fixture.ingest(raw);
+        let (ingested, _, grant) = fixture.ingest_with_grant(raw);
         let claims = claim_and_finish(&mut fixture, &ingested);
         assert_eq!(claims.len(), 2);
         assert_ne!(claims[0].1, claims[1].1);
         fixture.assert_claims(&claims);
         let attached = attachment(&mut fixture);
+        let (ingested, takes) = if malformed {
+            let first = acquire(&mut fixture, ingested, &attached, &BirthFault);
+            assert!(first.failure_for_test().is_none());
+            let previous = first.identity();
+            fixture.assert_claims(&claims);
+            drop(first);
+            assert_eq!(
+                fixture.real.scene.coordinator.reference_h3_audit_state(),
+                (1, false)
+            );
+
+            // A malformed quantum deliberately forbids positive H0 routes.
+            // Its actual loss must still cover both previously admitted keys.
+            // Keep the original Session association for this quiet quantum;
+            // neither a new admission nor a scalar grant replaces it.
+            fixture.drain.source_mut().push_record(vec![0; 3]);
+            let raw = fixture.prepare(0);
+            assert!(raw.h0_identity() != previous);
+            assert!(raw.h0_input(fixture.real.lane.domain(), 64).unwrap().1);
+            let ingested = raw
+                .ingest(
+                    fixture
+                        .real
+                        .scene
+                        .coordinator
+                        .joint_capture_mut()
+                        .adapter_mut(),
+                    &fixture.producers,
+                    &grant,
+                )
+                .unwrap_or_else(|(_, reason)| panic!("original malformed ingestion: {reason:?}"));
+            assert!(claim_and_finish(&mut fixture, &ingested).is_empty());
+            fixture.assert_claims(&claims);
+            (ingested, 2)
+        } else {
+            (ingested, 1)
+        };
         let fault = ReadFault::new(u64::from(!malformed));
         let frame = acquire(&mut fixture, ingested, &attached, &fault);
         let failure = frame
@@ -424,7 +458,7 @@ fn joint_audit_no_head_fault_or_malformed_keeps_original_affected_domains() {
         fixture.assert_claims(&[]);
         assert_eq!(
             fixture.real.scene.coordinator.reference_h3_audit_state(),
-            (1, false)
+            (takes, false)
         );
         assert_eq!(
             fixture

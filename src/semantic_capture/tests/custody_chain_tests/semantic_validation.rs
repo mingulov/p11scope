@@ -327,6 +327,7 @@ enum ValidationFailure {
 struct HeldH0 {
     capture: SemanticCapture,
     io: HeldIo,
+    collected: Option<crate::semantics_objects::journal::joint_driver::RawJointQuantum>,
     stash: RefreshReceiptStash,
     validations: usize,
     inject: Option<(usize, ValidationFailure)>,
@@ -387,11 +388,17 @@ impl LaneTestIo for SharedH0 {
     fn tick(&mut self, domain: NativeDomainId) -> Result<SemanticBatch, SemanticRefusal> {
         let mut owned = self.0.borrow_mut();
         let HeldH0 {
-            capture, io, stash, ..
+            capture,
+            io,
+            stash,
+            collected,
+            ..
         } = &mut *owned;
-        let mut report = capture
-            .tick_with(io)
-            .map_err(|_| SemanticRefusal::Unavailable)?;
+        let mut report = match collected {
+            Some(raw) => capture.tick_collected_with(io, raw),
+            None => capture.tick_with(io),
+        }
+        .map_err(|_| SemanticRefusal::Unavailable)?;
         assert_eq!(merge_stash_into_report(stash, &mut report), 0);
         owned.last_terminal_tasks = report
             .outcomes()
@@ -511,6 +518,7 @@ impl RealScene {
         let h0 = SharedH0(Rc::new(RefCell::new(HeldH0 {
             capture: SemanticCapture::in_domain(domain, TickLimits::default()).unwrap(),
             io,
+            collected: None,
             stash: RefreshReceiptStash::new(),
             validations: 0,
             inject: None,
@@ -617,6 +625,51 @@ impl RealScene {
         self.lane.tick(bindings).unwrap()
     }
 
+    /// Use the actual bounded wire collector and H0 delivery, replacing only
+    /// the native ring/map reads. The prepared-batch tests never issue births.
+    fn collected_tick(&mut self) -> SemanticBatch {
+        use crate::semantics_objects::journal::{JournalLimits, StagingLedger};
+        let records: Vec<_> = self
+            .h0
+            .0
+            .borrow_mut()
+            .io
+            .script
+            .records
+            .drain(..)
+            .map(|record| crate::events::record_bytes(&record.base))
+            .collect();
+        let events = crate::events::EventsDomain::test_standin(0xb201);
+        let producers =
+            crate::attach::SessionDrainProducers::test_pair(self.lane.domain(), events.clone());
+        let mut drain = crate::events::EventDrain::over_domain(
+            crate::events::ScriptedRecords::records(records, 64),
+            events,
+        );
+        let mut adapter = JournalAdapter::with_ledger(
+            JournalLimits::policy(),
+            StagingLedger::with_resources(
+                self.scene
+                    .coordinator
+                    .registry()
+                    .semantic_storage_reserver(),
+            ),
+        );
+        let raw = crate::semantics_objects::journal::joint_driver::RawJointQuantum::collect_bounded_with_adapter(
+            &mut drain,
+            &p11scope_ebpf_common::object_wire::publish_object_descriptors(),
+            4_096,
+            None,
+            &BirthFault,
+            &producers,
+            |bytes| self.scene.coordinator.registry().reserve_semantic_storage(bytes),
+            &mut adapter,
+        )
+        .expect("bounded actual wire collection");
+        self.h0.0.borrow_mut().collected = Some(raw);
+        self.tick()
+    }
+
     fn publish(&mut self, batch: SemanticBatch) {
         self.scene.coordinator.stage_semantic_batch(batch);
         self.scene
@@ -636,6 +689,159 @@ fn image(cookie: u64) -> ImageIdentity {
         task_cookie: cookie,
         exec_id: 1,
     }
+}
+
+#[test]
+fn joint_prepared_batch_keeps_equal_shaped_original_admissions() {
+    use crate::semantics_objects::journal::H3DispositionEvidence;
+    let mut fixture = RealScene::new(1);
+    let pid = std::process::id();
+    fixture.bind(pid, image(7), 0);
+    fixture.enqueue(pid, 0, "C_SignInit", 0x000d, 0);
+    fixture.enqueue(pid, 0, "C_SignInit", 0x000d, 0);
+    fixture.enqueue(pid, 0, "C_Sign", 0, 0);
+    let batch = fixture.collected_tick();
+    assert_eq!(fixture.h0.0.borrow().last_calls.len(), 3);
+    fixture.scene.coordinator.stage_semantic_batch(batch);
+    fixture
+        .scene
+        .coordinator
+        .prepare_staged_semantic_batch(&mut fixture.lane, None)
+        .unwrap();
+    assert!(fixture.h0.0.borrow().validations > 0);
+    let prepared = fixture.scene.coordinator.prepared_semantic_batch().unwrap();
+    let originals: Vec<_> = prepared
+        .admissions()
+        .map(|input| {
+            assert!(input.collected_origin().is_some());
+            (input.h0_ordinal(), input.s1_facts().function.as_str())
+        })
+        .collect();
+    assert_eq!(
+        originals,
+        vec![(1, "C_SignInit"), (2, "C_SignInit"), (3, "C_Sign")]
+    );
+    assert!(
+        !fixture
+            .scene
+            .coordinator
+            .finish_prepared_semantic_batch(&fixture.lane)
+    );
+    assert!(matches!(
+        fixture.scene.coordinator.take_h3_disposition(),
+        H3DispositionEvidence::Clean {
+            staged_max: 0,
+            pending_floor: None
+        }
+    ));
+    assert!(!fixture.scene.coordinator.stage_next_prepared_admission());
+    fixture.scene.coordinator.dispose_prepared_claims_s1();
+    for _ in 0..3 {
+        assert!(fixture.scene.coordinator.stage_next_prepared_admission());
+    }
+    assert!(!fixture.scene.coordinator.stage_next_prepared_admission());
+    assert!(!fixture.scene.coordinator.stage_next_prepared_admission());
+    assert!(
+        fixture
+            .scene
+            .coordinator
+            .finish_prepared_semantic_batch(&fixture.lane)
+    );
+    assert!(
+        !fixture
+            .scene
+            .coordinator
+            .finish_prepared_semantic_batch(&fixture.lane)
+    );
+    assert!(matches!(
+        fixture.scene.coordinator.take_h3_disposition(),
+        H3DispositionEvidence::Clean {
+            staged_max: 3,
+            pending_floor: None
+        }
+    ));
+    fixture
+        .scene
+        .coordinator
+        .commit_batch_with_semantics(false, Some(&mut fixture.lane))
+        .unwrap();
+    let rows = operation_edge_rows(&fixture.scene);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].0,
+        Some(3),
+        "every original stages once through direct S1"
+    );
+}
+
+#[test]
+fn joint_prepared_batch_claim_refusal_and_stage_cursors_do_not_replay() {
+    use crate::semantics_objects::journal::{AttestationRefusal, JournalLimits};
+    let mut fixture = RealScene::new(1);
+    let pid = std::process::id();
+    fixture.bind(pid, image(7), 0);
+    fixture.enqueue(pid, 0, "C_SignInit", 0x000d, 0);
+    fixture.enqueue(pid, 0, "C_SignInit", 0x000d, 0);
+    let batch = fixture.collected_tick();
+    fixture.scene.coordinator.stage_semantic_batch(batch);
+    fixture
+        .scene
+        .coordinator
+        .prepare_staged_semantic_batch(&mut fixture.lane, None)
+        .unwrap();
+    let mut adapter = JournalAdapter::new(JournalLimits::policy());
+    let mut model = crate::semantics_objects::ObjectSemantics::new();
+    let _ = adapter.stop(&mut model);
+    for ordinal in [1, 2] {
+        assert_eq!(
+            fixture
+                .scene
+                .coordinator
+                .claim_next_prepared_admission(&mut adapter),
+            Some((ordinal, Err(AttestationRefusal::Stopped)))
+        );
+    }
+    assert!(
+        fixture
+            .scene
+            .coordinator
+            .claim_next_prepared_admission(&mut adapter)
+            .is_none()
+    );
+    assert!(
+        fixture
+            .scene
+            .coordinator
+            .claim_next_prepared_admission(&mut adapter)
+            .is_none()
+    );
+    assert!(
+        !fixture
+            .scene
+            .coordinator
+            .finish_prepared_semantic_batch(&fixture.lane)
+    );
+    assert!(fixture.scene.coordinator.stage_next_prepared_admission());
+    assert!(
+        !fixture
+            .scene
+            .coordinator
+            .finish_prepared_semantic_batch(&fixture.lane)
+    );
+    assert!(fixture.scene.coordinator.stage_next_prepared_admission());
+    assert!(!fixture.scene.coordinator.stage_next_prepared_admission());
+    assert!(
+        fixture
+            .scene
+            .coordinator
+            .finish_prepared_semantic_batch(&fixture.lane)
+    );
+    fixture
+        .scene
+        .coordinator
+        .commit_batch_with_semantics(false, Some(&mut fixture.lane))
+        .unwrap();
+    assert_eq!(operation_edge_rows(&fixture.scene)[0].0, Some(2));
 }
 
 #[test]

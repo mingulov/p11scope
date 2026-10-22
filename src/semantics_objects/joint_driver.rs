@@ -2086,6 +2086,112 @@ mod tests {
     }
 
     #[test]
+    fn joint_resource_retained_return_accepts_abandon_but_not_end() {
+        use crate::semantics_objects::journal::tests::{
+            ENTRY_NS, abandon_bytes, begin_bytes, end_bytes_absent, function_id, ordinary_for,
+        };
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+        // Run the never-both negative first: the repair must not authorize
+        // native END after an already corroborated ordinary return.
+        for abandon in [false, true] {
+            let rows = publish_object_descriptors();
+            let begin = begin_bytes(1, 1, function_id("C_Sign"), 0);
+            let ordinary = ordinary_for(&begin, 0);
+            let events = EventsDomain::test_standin(0xf107);
+            let retained = producers(&events);
+            let pool = SemanticResourcePool::default();
+            let mut adapter = resource_adapter(&pool);
+            let fault = SteadyFault(Cell::new(None));
+            let pending = std::rc::Rc::new(RefCell::new(std::collections::VecDeque::from([
+                begin.to_vec(),
+                crate::events::event_bytes(&ordinary).to_vec(),
+            ])));
+            let mut drain = EventDrain::over_domain(ArrivingRecords(pending.clone()), events);
+            let start = RawJointQuantum::collect_with_adapter(
+                &mut drain,
+                &rows,
+                4,
+                &fault,
+                &retained,
+                |bytes| pool.reserve(bytes),
+                &mut adapter,
+            )
+            .unwrap();
+            assert!(!start.resource_refused);
+            let reservation = start.invocations[0].reservation;
+            // Actual decoded originals enter the existing resource seam;
+            // this lower-level test mints no H0 admission, H3 or seal.
+            assert_eq!(
+                adapter.ingest_any_from_raw(start.ordered[0], Some(reservation), false),
+                super::super::JournalDisposition::BeginAdmitted
+            );
+            assert_eq!(
+                adapter.ingest_any_from_raw(start.ordered[1], None, false),
+                super::super::JournalDisposition::ReturnObserved
+            );
+            drop(start);
+            adapter.ledger.release_raw(&reservation);
+            let before = adapter.ledger.roles_for_test();
+            let original = adapter.open[&(1, 1)].begin;
+            assert_eq!(before[..4], [0, 1, 0, 0]);
+            let terminal = if abandon {
+                let mut bytes = abandon_bytes(
+                    1,
+                    1,
+                    JOURNAL_REASON_SYNC_RETURN_RESULT_LOST,
+                    (ordinary.image.task_cookie, ordinary.image.exec_id),
+                );
+                bytes[48..52].copy_from_slice(&begin[104..108]);
+                bytes.to_vec()
+            } else {
+                end_bytes_absent(&begin, 0, ENTRY_NS + 100).to_vec()
+            };
+            pending.borrow_mut().push_back(terminal);
+            let terminal = RawJointQuantum::collect_with_adapter(
+                &mut drain,
+                &rows,
+                4,
+                &fault,
+                &retained,
+                |bytes| pool.reserve(bytes),
+                &mut adapter,
+            )
+            .unwrap();
+            assert!(terminal.matches_producers(&retained));
+            assert_eq!(adapter.ledger.roles_for_test(), before, "no new membership");
+            assert_eq!(adapter.open[&(1, 1)].begin.bytes(), original.bytes());
+            assert_eq!(
+                terminal.resource_refused, !abandon,
+                "only the genuine retained ABANDON continuation preserves resource custody"
+            );
+            if abandon {
+                assert_eq!(terminal.invocations.len(), 1);
+                assert!(!terminal.invocations[0].owns_raw);
+                assert!(
+                    adapter
+                        .ledger
+                        .matches_reservation(&terminal.invocations[0].reservation)
+                );
+                assert_eq!(
+                    adapter.ingest_any_from_raw(terminal.ordered[0], None, false),
+                    super::super::JournalDisposition::AbandonStaged
+                );
+            } else {
+                assert!(terminal.invocations.is_empty());
+                assert!(terminal.ordinary[0].joint_resource.is_none());
+                assert_eq!(
+                    adapter.ingest_any_from_raw(terminal.ordered[0], None, false),
+                    super::super::JournalDisposition::Contradiction(
+                        super::super::JournalContradiction::CallAndEnd
+                    )
+                );
+            }
+            assert_eq!(adapter.open[&(1, 1)].begin.bytes(), original.bytes());
+            assert_eq!(adapter.ledger.roles_for_test(), before);
+        }
+    }
+
+    #[test]
     fn joint_native_first_begin_idle_then_end_keeps_one_reserved_quantum() {
         use crate::semantics_objects::journal::tests::{
             ENTRY_NS, begin_bytes, end_bytes_absent, function_id,

@@ -73,6 +73,8 @@ def internal_contract(variant, name, disassembly=None):
     calls = {}
     for caller, _, pc, target in CHECKER["D"].internal_call_targets(split[".text"]):
         calls.setdefault(caller, {})[pc] = target
+    if name == "scalar_body_contract":
+        return CHECKER[name](blocks, calls, variant)
     return CHECKER[name](blocks, calls)
 
 
@@ -601,25 +603,33 @@ class EntryObjectTests(unittest.TestCase):
 
     def test_callee_scalar_reads_and_option_success(self):
         for variant in OBJECTS:
-            blocks = CHECKER["D"].function_blocks(OBJECTS[variant])
-            name = next(name for name in blocks if name.endswith("capture_scalar"))
-            insns = dict(CHECKER["D"].instructions(blocks[name]))
-            # ia32 stride/span/width moved to the globally verified reader;
-            # this callee must now retain its scalar-only call boundary.
-            cases = [(r"r2 = r3", "r2 = r4"),
-                     (r"r1 = \*\(u64 \*\)\(r2 \+ 0x98\)", "r1 = r10"),
-                     (r"call -0x1", "r0 = 0x0"),
-                     (r"r2 = 0x8", "r2 = 0x4"),
-                     (r"r0 = \*\(u64 \*\)\(r2 \+ 0x70\)", "r0 = *(u64 *)(r2 + 0x68)"),
-                     (r"r7 = 0x1", "r7 = r7"),
-                     (r"\*\(u64 \*\)\(r6 \+ 0x8\) = r0", "*(u64 *)(r6 + 0x0) = r0"),
-                     (r"if r1 > r0 goto .*", "if r1 == r0 goto +0x1"),
-                     (r"r0 = \*\(u64 \*\)\(r10 - 0x10\)", "r0 = *(u32 *)(r10 - 0x10)")]
-            for pattern, new in cases:
+            internal_contract(variant, "scalar_body_contract")
+            cases = [
+                ("arg_u64", r"r2 = r3", "r2 = r4"),
+                ("arg_u64", r"r1 = \*\(u64 \*\)\(r2 \+ 0x98\)", "r1 = r10"),
+                ("arg_u64", r"call -0x1", "r0 = 0x0"),
+                ("arg_u64", r"r2 = 0x8", "r2 = 0x4"),
+                ("arg_u64", r"r1 = \*\(u64 \*\)\(r2 \+ 0x70\)", "r1 = *(u64 *)(r2 + 0x68)"),
+                ("arg_u64", r"r7 = 0x0", "r7 = 0x1"),
+                ("arg_u64", r"\*\(u64 \*\)\(r6 \+ 0x8\) = r0", "*(u64 *)(r6 + 0x0) = r0"),
+                ("arg_u64", r"if r0 > r1 goto .*", "if w0 > w1 goto +0x11"),
+                ("arg_u64", r"r1 = \*\(u64 \*\)\(r10 - 0x8\)", "r1 = *(u32 *)(r10 - 0x8)"),
+                ("arg_u64", r"if r3 > -0x9 goto .*", "r3 = r3"),
+                ("arg_u64", r"if r1 >= r3 goto .*", "goto +0x0"),
+                ("arg_u64", r"if r1 >= r3 goto .*", "if w1 >= w3 goto +0xc"),
+                ("capture_scalar", r"r1 = 0x1", "r1 = 0x0"),
+                ("capture_scalar", r"r1 = \*\(u64 \*\)\(r10 - 0x10\)", "r1 = *(u32 *)(r10 - 0x10)"),
+                ("capture_scalar", r"if r1 != 0x0 goto .*", "if r1 == 0x0 goto +0x1"),
+                ("capture_scalar", r"\*\(u32 \*\)\(r7 \+ 0x100\) = w1", "*(u32 *)(r7 + 0x104) = w1"),
+            ]
+            for suffix, pattern, new in cases:
+                name, instructions_ = instructions(variant, suffix)
+                insns = dict(instructions_)
                 pc = site(variant, name, pattern)
-                with self.subTest(variant=variant, pc=pc):
+                with self.subTest(variant=variant, function=suffix, mutation=pattern):
                     with self.assertRaisesRegex(RuntimeError, "scalar-read|final-sink"):
-                        CHECKER["contract"](mutate(OBJECTS[variant], name, pc, insns[pc], new), variant)
+                        internal_contract(variant, "scalar_body_contract",
+                            mutate(OBJECTS[variant], name, pc, insns[pc], new))
 
     def test_template_order_layout_and_disabled_controls(self):
         blocks = CHECKER["D"].function_blocks(OBJECTS["unsafe"])

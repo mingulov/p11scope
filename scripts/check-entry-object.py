@@ -430,6 +430,8 @@ class SinkProof:
         self.dispatches = ()
         self.decoder_required = False
         self.effect_start = None
+        self.argument_calls = {}
+        self.success_tag = 0 if kind == "result" else 1
 
     def partition(self, state):
         return tuple(state.get((key,)) for key in ("success", "nonnull", "life", "done", "inserted"))
@@ -498,7 +500,7 @@ class SinkProof:
             if self.effect_start and pointer:
                 require(pointer[0] == "stack", error("unsupported callee memory destination"))
             if self.effect_start and pointer and pointer[0] == "stack" and pointer[1] < -512:
-                allowed = {(self.effect_start[1]+0x100, 4)}
+                allowed = set() if self.kind == "result" else {(self.effect_start[1]+0x100, 4)}
                 if self.kind == "async":
                     allowed.add((self.effect_start[1]+0x104, 4))
                 else:
@@ -611,6 +613,18 @@ class SinkProof:
                 state[("stack", pointer[1]+8, 8)] = ("candidate", pc, field, 32 if self.abi else 64)
             else:
                 state[("stack", pointer[1], 8)] = ("constant", 0)
+        if pc in self.argument_calls:
+            field = self.argument_calls[pc]
+            require(target.endswith("arg_u64") and before.get("r2") == ("context", 0)
+                    and before.get("r3") == ("field", field)
+                    and before.get("r4") == ("constant", self.abi),
+                    error("scalar-read Result context/index/layout boundary"))
+            output = before.get("r1")
+            require(output and output[0] == "stack" and -512 <= output[1] <= -16,
+                    error("scalar-read Result destination outside local frame"))
+            forget_stack(state, output[1], 16)
+            state[("stack", output[1], 8)] = ("argument_result", pc, field)
+            state[("stack", output[1]+8, 8)] = ("candidate", pc, field, 32 if self.abi else 64)
         if pc in self.helpers and target == "p11_read_ia32_arg":
             field = self.helpers[pc]
             require(self.abi == 1,
@@ -722,11 +736,12 @@ class SinkProof:
             if lifecycle is not None:
                 require(self.domain(before, 3) == {lifecycle}, error("retained lifecycle field 3"))
             self.boundaries.add(pc)
-        if self.kind == "scalar" and text == "exit":
-            expected = 1 if before.get(("success",)) else 0
-            require(stack_read(before, self.start, 8) == ("constant", expected), error("scalar-read Option discriminator"))
-            if expected:
-                require(stack_read(before, self.start, 8, 8) == self.scalar(), error("scalar-read Option success payload"))
+        if self.kind in ("scalar", "result") and text == "exit":
+            success = bool(before.get(("success",)))
+            expected = self.success_tag if success else 1 - self.success_tag
+            require(stack_read(before, self.start, 8) == ("constant", expected), error("scalar-read Option/Result discriminator"))
+            if success:
+                require(stack_read(before, self.start, 8, 8) == self.scalar(), error("scalar-read Option/Result success payload"))
                 self.witnesses.add(pc)
         elif pc == self.insert:
             self.check_sink(consumer, pc, before)
@@ -757,7 +772,7 @@ class SinkProof:
                     # to their full-register value. Option is the proved 0/1
                     # discriminator, not an unconstrained helper return value.
                     for fact in (left, right):
-                        require(not fact or fact[0] in ("constant", "field", "option", "low", "high", "selected")
+                        require(not fact or fact[0] in ("constant", "field", "option", "argument_result", "low", "high", "selected")
                                 or fact[0] in ("scalar", "retained") and fact[2] == 32
                                 or fact == ("rsp", 32, 0),
                                 self.fail(consumer, pc, f"branch width 32 cannot refine full-width fact {fact}"))
@@ -792,15 +807,27 @@ class SinkProof:
                             if fact == right:
                                 state[key] = self.scalar(width=32)
                         self.captured(state)
-                elif left and right and left[0] in ("option", "read_result", "insert_result") and right[0] == "constant":
-                    require(op in ("==", "!=") and right[1] in ((0, 1) if left[0] == "option" else (0,)),
+                elif left and left[0] == "read_result" and right == ("constant", 0xffffffff) and op == ">":
+                    if not taken:
+                        domain = self.domain(before, left[2]) & frozenset(range(7))
+                        if not domain:
+                            continue
+                        state[("domain", left[2])] = domain
+                        state[("read_ok", left[1])] = True
+                        self.read_witnesses |= domain
+                        for key, fact in list(state.items()):
+                            if fact == left:
+                                state[key] = self.scalar(width=32)
+                        self.captured(state)
+                elif left and right and left[0] in ("option", "argument_result", "read_result", "insert_result") and right[0] == "constant":
+                    require(op in ("==", "!=") and right[1] in ((0, 1) if left[0] in ("option", "argument_result") else (0,)),
                             self.fail(consumer, pc, "unsupported success comparison"))
                     success_value = 1 if left[0] == "option" else 0
                     success = compare(success_value, op, right[1], width) == taken
                     # Both outcomes are possible, but their memory provenance
                     # differs. Failure never promotes a helper output.
                     if success:
-                        if left[0] == "option":
+                        if left[0] in ("option", "argument_result"):
                             domain = self.domain(before, left[2]) & frozenset(range(7))
                             if not domain:
                                 continue
@@ -820,7 +847,7 @@ class SinkProof:
                         if left[0] == "insert_result":
                             if left[1] == self.insert:
                                 state[("inserted",)] = True
-                        elif (left[0] == "read_result" or self.role != 16 and self.calls.get(left[1]) == self.role
+                        elif (left[0] in ("read_result", "argument_result") or self.role != 16 and self.calls.get(left[1]) == self.role
                               or self.role == "template" and left[2] in (13, 15)):
                             self.captured(state)
                     else:
@@ -838,6 +865,11 @@ class SinkProof:
                     state[("nonnull",)] = taken != zero_taken
                 # Exact unsigned complete-span edges of the admitted forms.
                 if left == ("rsp", 64, 0) and right == ("constant", -16) and op == ">" and not taken:
+                    state[("span", ("rsp", 64, 8))] = True
+                if left == ("rsp", 64, 0) and right == ("constant", -9) and op == ">" and not taken:
+                    state[("address_no_wrap", 8)] = True
+                if (left == ("rsp", 64, 15) and right == ("rsp", 64, 8) and op == ">=" and taken
+                        and before.get(("address_no_wrap", 8))):
                     state[("span", ("rsp", 64, 8))] = True
                 if left and left[0] == "arg_address" and right == ("constant", 0xfffffffc) and op == ">" and not taken:
                     state[("span", left)] = True
@@ -913,8 +945,8 @@ def ia32_reader_contract(internal_blocks, internal_calls):
 
 def scalar_body_contract(internal_blocks, internal_calls, variant):
     ia32_reader_contract(internal_blocks, internal_calls)
-    names = [name for name in internal_blocks if name.endswith("capture_scalar")]
-    require(len(names) == 1, "scalar-read callee inventory")
+    names = [name for name in internal_blocks if name.endswith("arg_u64")]
+    require(len(names) == 1, "scalar-read Result callee inventory")
     name = names[0]
     consumer = Consumer(".text", name, internal_blocks[name], internal_calls.get(name, {}))
     instructions = consumer.insns
@@ -931,12 +963,27 @@ def scalar_body_contract(internal_blocks, internal_calls, variant):
                 reads[pc] = LP64_OFFSETS.index(offset)
     require(set(reads.values()) == set(range(6)), "scalar-read LP64 register-read inventory")
     for abi in (0, 1):
-        proof = SinkProof(6, abi, True, ("stack", -0x1000), kind="scalar",
+        proof = SinkProof(6, abi, True, ("stack", -0x1000), kind="result",
                           reads=reads if abi == 0 else {},
                           helpers={(ia32_calls[0] if abi else helper_reads[0]): 6})
         proof.effect_start = ("stack", -0x2000)
         initial = {"r1": proof.start, "r2": ("context", 0), "r3": ("field", 6),
-                   "r4": ("constant", abi), "r5": ("stack", -0x2000), "r10": ("stack", 0),
+                   "r4": ("constant", abi), "r10": ("stack", 0),
+                   ("domain", 6): BYTE_DOMAIN}
+        consumer.facts(initial, proof)
+    names = [name for name in internal_blocks if name.endswith("capture_scalar")]
+    require(len(names) == 1, "scalar-read Option callee inventory")
+    name = names[0]
+    consumer = Consumer(".text", name, internal_blocks[name], internal_calls.get(name, {}))
+    argument_calls = [pc for pc, target in consumer.calls.items() if target.endswith("arg_u64")]
+    require(len(argument_calls) == 1 and not any(pc in consumer.helper and text == "call 0x70"
+            for pc, text in consumer.insns), "scalar-read Result boundary inventory")
+    for abi in (0, 1):
+        proof = SinkProof(6, abi, True, ("stack", -0x1000), kind="scalar")
+        proof.argument_calls = {argument_calls[0]: 6}
+        proof.effect_start = ("stack", -0x2000)
+        initial = {"r1": proof.start, "r2": ("context", 0), "r3": ("field", 6),
+                   "r4": ("constant", abi), "r5": proof.effect_start, "r10": ("stack", 0),
                    ("domain", 6): BYTE_DOMAIN}
         consumer.facts(initial, proof)
     names = [name for name in internal_blocks if name.endswith("capture_async_target")]

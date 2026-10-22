@@ -159,9 +159,9 @@ EXCLUDED = {
     "test_entry_object.py": (
         "needs the default and the unsafe-unvalidated-metadata eBPF objects "
         "at once (--default-object/--unsafe-object), which no single build "
-        "has; run against current objects (2026-10-03) it fails 8 of 40 on "
-        "pinned stack offsets and registers, so its instruction pins predate "
-        "the current object and need a refresh before it can be wired in"
+        "has; a driver for the matching pair is still required. Explicit "
+        "paired-object runs remain separate from the ordinary host suite; "
+        "the checker reports partial coverage and does not replace source guards"
     ),
 }
 

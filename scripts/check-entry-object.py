@@ -1111,6 +1111,11 @@ class _OwnedCaller(_SeedCaller):
             match = ATOMIC_POINTER.search(text) or EXCHANGE_POINTER.search(text)
             pointer = address(incoming, *match.groups()[1:]) if match else None
             if pointer and pointer[0] == "owned":
+                # This row is disjoint from the caller's local frame. The
+                # base Consumer cannot identify it, so restore only those
+                # memory facts before invalidating the exact owned footprint.
+                state.update((key, fact) for key, fact in incoming.items()
+                    if isinstance(key, tuple) and key[0] in ("stack", "seed_marker"))
                 forget_owned(state, pointer[1], pointer[2], int(match[1])//8)
             elif pointer is None and not (match and incoming.get("r"+match[2], (None,))[0] == "result"):
                 forget_owned(state)
@@ -1477,6 +1482,25 @@ def final_sink_contract(consumer, variant, selectors, internal_blocks, internal_
     constructors = [pc for pc, target in consumer.calls.items() if target == ("p11_owner_start_get" if mode == "second" else "p11_owner_start_begin")]
     require(len(constructors) == 1, name + ": final-sink owned START constructor inventory")
     start = ("owned", constructors[0], 0)
+    if mode == 3:
+        facts = consumer.facts()
+        tails = [pc for pc, text in consumer.insns if pc in consumer.helper
+                 and text == "call 0xc" and facts.get(pc, {}).get("r2") == ("map", "PAIR_CALLS")]
+        require(len(tails) == 1, name + ": final-sink pair tail inventory")
+        failure = D.reachable(consumer.graph, consumer.graph[tails[0]])
+        counters = [pc for pc in failure if pc in consumer.helper and consumer.text[pc] == "call 0x1"
+                    and facts.get(pc, {}).get("r1") == ("map", "EVIDENCE")
+                    and stack_read(facts[pc], facts[pc].get("r2"), 4) == ("constant", 6)]
+        require(len(counters) == 1 and D.counter_writeback_contract(consumer.lines, counters[0]),
+                name + ": pair tail failure requires atomic evidence 6")
+        exits = {pc for pc, text in consumer.insns if text == "exit"}
+        require(not exits & D.reachable(consumer.graph, consumer.graph[tails[0]], blocked=set(counters)),
+                name + ": pair tail failure bypasses evidence")
+        require(not any(pc in failure and (target.startswith("p11_owner_start_")
+                    or target.endswith(("capture_scalar", "capture_async_target"))
+                    or target in ("p11_decode_params", "p11_walk_template", "p11_walk_template_types"))
+                    for pc, target in consumer.calls.items()),
+                name + ": pair tail failure must retain START and existing captures")
     if mode == 0:
         lifecycle = [pc for pc, text in consumer.insns if re.fullmatch(r"if r\d+ == 0xc goto .*", text)]
         require(len(lifecycle) == 1, name + ": final-sink async lifecycle continuation inventory")

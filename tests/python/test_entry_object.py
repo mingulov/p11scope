@@ -147,6 +147,14 @@ def mechanism_guard(variant, name):
     return next((pc, text) for pc, text in reversed(insns) if pc < store and re.fullmatch(r"if r\d+ == 0x0 goto .*", text))
 
 
+def consumer_names(variant):
+    names = ["p11_entry", "p11_return", "ordinary_return", "object_return"]
+    if variant == "unsafe":
+        names += ["p11_entry_ia32", "p11_entry_template", "p11_entry_template_pair",
+                  "p11_entry_template_second", "p11_entry_template_types"]
+    return names
+
+
 def mutate(disassembly, function, pc, old, new, internal_call=False, helper_call=False):
     """Change exactly one decoded instruction, retaining its actual-object origin."""
     symbols = list(re.finditer(r"(?m)^[0-9a-f]+ <([^>]+)>:$", disassembly))
@@ -757,28 +765,23 @@ class EntryObjectTests(unittest.TestCase):
                             mutate(OBJECTS[variant], name, pc, insns[pc], new))
 
     def test_template_order_layout_and_disabled_controls(self):
-        blocks = CHECKER["D"].function_blocks(OBJECTS["unsafe"])
-        types_callee = "p11_walk_template_types"
-        cases = [("p11_entry_template", site('unsafe', 'p11_entry_template', 'r3\\ =\\ \\*\\(u64\\ \\*\\)\\(r10\\ \\-\\ 0x168\\)'), "r3 = *(u64 *)(r10 - 0x180)"),
-                 ("p11_entry_template", site('unsafe', 'p11_entry_template', 'r3\\ =\\ \\*\\(u64\\ \\*\\)\\(r10\\ \\-\\ 0x198\\)'), "r3 = *(u64 *)(r10 - 0x160)"),
-                 ("p11_entry_template", call_site("unsafe", "p11_entry_template", "p11_walk_template"), "r0 = 0x0"),
-                 ("p11_entry_template_pair", call_site("unsafe", "p11_entry_template_pair", "p11_walk_template"), "r0 = 0x0"),
-                 ("p11_entry_template_pair", after_call("unsafe", "p11_entry_template_pair", "p11_walk_template", r"call 0x1"), "call 0xc"),
-                 ("p11_entry_template_types", call_site("unsafe", "p11_entry_template_types", types_callee), "r0 = 0x0"),
-                 ("p11_entry_template_second", call_site("unsafe", "p11_entry_template_second", "p11_walk_template"), "r0 = 0x0"),
-                 ("p11_entry", before_call("unsafe", "p11_entry", "p11_decode_params", r"r3 = 0x8"), "r3 = 0x4"),
-                 ("p11_entry_ia32", before_call("unsafe", "p11_entry_ia32", "p11_decode_params", r"r3 = 0x4"), "r3 = 0x8")]
-        for name, pc, new in cases:
-            with self.subTest(function=name, pc=pc):
-                insns = CHECKER["D"].instructions(blocks[name])
-                old = dict(insns)[pc]
-                changed = mutate(OBJECTS["unsafe"], name, pc, old, new)
-                if new == "call 0xc":
-                    add_pc, add = next((p, t) for p, t in insns
-                                       if p > pc and t.startswith("lock *(u64 *)(r0 + 0x0) += "))
-                    changed = mutate(changed, name, add_pc, add, "r1 = r1")
-                with self.assertRaisesRegex(RuntimeError, "final-sink|mode|layout"):
-                    CHECKER["contract"](changed, "unsafe")
+        for suffix, walker, destination in (("p11_entry_template", "p11_walk_template", 0x60),
+                ("p11_entry_template_pair", "p11_walk_template", 0x60),
+                ("p11_entry_template_types", "p11_walk_template_types", 0x60),
+                ("p11_entry_template_second", "p11_walk_template", 0xb0)):
+            entry_contract("unsafe", suffix)
+            name, insns = instructions("unsafe", suffix)
+            call = call_site("unsafe", name, walker)
+            texts = dict(insns)
+            cases = [(before_call("unsafe", name, walker, rf"r4 \+= {destination:#x}"), "r4 += 0x58"),
+                     (before_call("unsafe", name, walker, r"r3 = 0x4"), "r3 = 0x8"),
+                     (before_call("unsafe", name, walker, r"r3 = 0x8"), "r3 = 0x4"),
+                     (before_call("unsafe", name, walker, r"r1 = .*"), "r1 = r2"),
+                     (before_call("unsafe", name, walker, r"r2 = .*"), "r2 = r1"),
+                     (call, "r0 = 0x0")]
+            for pc, new in cases:
+                with self.subTest(function=name, pc=pc), self.assertRaisesRegex(RuntimeError, "final-sink|layout|mode"):
+                    entry_contract("unsafe", name, mutate(OBJECTS["unsafe"], name, pc, texts[pc], new))
 
     def test_ordinary_walker_cannot_become_types_walker(self):
         changed, count = re.subn(r"(R_BPF_64_32[ \t]+)p11_walk_template\b",
@@ -818,15 +821,22 @@ class EntryObjectTests(unittest.TestCase):
                     CHECKER["contract"](changed, "unsafe")
 
     def test_post_capture_overlap_and_atomic_corruption(self):
-        old = "*(u32 *)(r10 - 0x68) = r4"
-        for new in ("*(u32 *)(r10 - 0x15f) = r4",
-                    "r4 = atomic_fetch_or((u64 *)(r10 - 0x160), r4)"):
+        entry_role_contract("default", "p11_entry", 6)
+        name, insns = instructions("default", "p11_entry")
+        pc, old = next((pc, text) for pc, text in insns
+                       if re.fullmatch(r"\*\(u64 \*\)\(r8 \+ 0x28\) = r1", text))
+        # An atomic write elsewhere in the owned row cannot erase local
+        # descriptor/Option facts or the disjoint session field.
+        disjoint = mutate(OBJECTS["default"], name, pc, old, "lock *(u64 *)(r8 + 0x100) += r1")
+        self.assertTrue(entry_role_contract("default", name, 6, disjoint).witnesses)
+        for new in ("*(u32 *)(r8 + 0x9) = w1", "r1 = atomic_fetch_or((u64 *)(r8 + 0x8), r1)"):
             with self.subTest(new=new):
-                changed = mutate(OBJECTS["default"], "p11_entry", site('default', 'p11_entry', '\\*\\(u32\\ \\*\\)\\(r10\\ \\-\\ 0x68\\)\\ =\\ r4'), old, new)
+                changed = mutate(OBJECTS["default"], name, pc, old, new)
                 with self.assertRaisesRegex(RuntimeError, "final-sink 6: successful capture lost"):
-                    CHECKER["contract"](changed, "default")
-        restored = mutate(changed, "p11_entry", site('default', 'p11_entry', '\\*\\(u32\\ \\*\\)\\(r10\\ \\-\\ 0x68\\)\\ =\\ r4'), new, old)
-        self.assertTrue(CHECKER["contract"](restored, "default")["verified"])
+                    entry_role_contract("default", name, 6, changed)
+                restored = mutate(changed, name, pc, new, old)
+                self.assertEqual(restored, OBJECTS["default"])
+                self.assertTrue(entry_role_contract("default", name, 6, restored).witnesses)
 
     def test_unknown_postwrite_and_callee_start_clobber(self):
         for variant in OBJECTS:
@@ -854,30 +864,53 @@ class EntryObjectTests(unittest.TestCase):
                         old, old.replace("+ 0x100", "+ 0x8")))
 
     def test_helper_invocation_without_success_path_is_insufficient(self):
-        cases = [("unsafe", "p11_entry", site("unsafe", "p11_entry", r"if r0 != 0x0 goto \+0x3", 0), "goto +0x3")]
         for variant in OBJECTS:
-            blocks = CHECKER["D"].function_blocks(OBJECTS[variant])
-            scalar = next(name for name in blocks if name.endswith("capture_scalar"))
-            pc = site(variant, scalar, r"if r0 != 0x0 goto .*", 0)
-            old = dict(instructions(variant, scalar)[1])[pc]
-            cases.append((variant, scalar, pc, "goto " + old.split(" goto ")[1]))
-        for variant, name, pc, new in cases:
-            with self.subTest(variant=variant, function=name, pc=pc):
-                old = dict(CHECKER["D"].instructions(CHECKER["D"].function_blocks(OBJECTS[variant])[name]))[pc]
-                with self.assertRaisesRegex(RuntimeError, "scalar-read.*index coverage"):
-                    CHECKER["contract"](mutate(OBJECTS[variant], name, pc, old, new), variant)
+            internal_contract(variant, "scalar_body_contract")
+            name, insns = instructions(variant, "arg_u64")
+            read = site(variant, name, r"call 0x70")
+            pc, old = next((pc, text) for pc, text in insns if pc > read and text.startswith("if "))
+            with self.subTest(variant=variant, boundary="Result"), self.assertRaisesRegex(RuntimeError, "scalar-read 6: incomplete index coverage"):
+                internal_contract(variant, "scalar_body_contract", mutate(OBJECTS[variant], name, pc, old,
+                    "goto +0x0"))  # Force the actual Result::Err arm after a successful read.
+            name, insns = instructions(variant, "capture_scalar")
+            pc = site(variant, name, r"if r1 != 0x0 goto .*", 0)
+            old = dict(insns)[pc]
+            with self.subTest(variant=variant, boundary="Option"), self.assertRaisesRegex(RuntimeError, "final-sink 6: no positive successful sink witness"):
+                internal_contract(variant, "scalar_body_contract", mutate(OBJECTS[variant], name, pc, old,
+                    "goto "+old.split(" goto ")[1]))
 
     def test_success_cannot_exit_before_sink_or_lose_pair_tail(self):
-        blocks = CHECKER["D"].function_blocks(OBJECTS["unsafe"])
-        entry = dict(CHECKER["D"].instructions(blocks["p11_entry"]))
-        exit_pc = next(pc for pc, text in entry.items() if text == "exit")
-        cases = [("p11_entry", site('unsafe', 'p11_entry', 'goto\\ \\+0x3', 0), f"goto +{exit_pc-1035:#x}"),
-                 ("p11_entry_template_pair", site('unsafe', 'p11_entry_template_pair', 'call\\ 0xc'), "r0 = 0x0")]
-        for name, pc, new in cases:
-            with self.subTest(function=name, pc=pc):
-                old = dict(CHECKER["D"].instructions(blocks[name]))[pc]
-                with self.assertRaisesRegex(RuntimeError, "final-sink"):
-                    CHECKER["contract"](mutate(OBJECTS["unsafe"], name, pc, old, new), "unsafe")
+        entry_role_contract("unsafe", "p11_entry", 6)
+        name, insns = instructions("unsafe", "p11_entry")
+        call = call_site("unsafe", name, "capture_scalar")
+        pc, old = next((pc, text) for pc, text in insns if pc > call and text.startswith("if "))
+        exit_pc = site("unsafe", name, "exit")
+        with self.assertRaisesRegex(RuntimeError, "final-sink"):
+            entry_role_contract("unsafe", name, 6, mutate(OBJECTS["unsafe"], name, pc, old,
+                old.split(" goto ")[0]+f" goto {exit_pc-pc-1:+#x}"))
+        name = "p11_entry_template_pair"
+        entry_contract("unsafe", name)
+        consumer, initial, _, _ = consumer_case("unsafe", name)
+        facts = consumer.facts(initial)
+        tails = [pc for pc, text in consumer.insns if text == "call 0xc"
+                 and facts.get(pc, {}).get("r2") == ("map", "PAIR_CALLS")]
+        self.assertEqual(len(tails), 1)
+        tail = tails[0]
+        with self.assertRaisesRegex(RuntimeError, "final-sink.*tail"):
+            entry_contract("unsafe", name, mutate(OBJECTS["unsafe"], name, tail, "call 0xc", "r0 = 0x0"))
+        # Failure must disclose the failed transfer while retaining START.
+        failure = next(pc for pc, text in consumer.insns if pc > tail and text == "call 0x1"
+                       and facts.get(pc, {}).get("r1") == ("map", "EVIDENCE")
+                       and CHECKER["stack_read"](facts[pc], facts[pc].get("r2"), 4) == ("constant", 6))
+        add, old = next((pc, text) for pc, text in consumer.insns if pc > failure and text.startswith("lock "))
+        with self.assertRaisesRegex(RuntimeError, "pair.*failure"):
+            entry_contract("unsafe", name, mutate(OBJECTS["unsafe"], name, add, old, "r1 = r1"))
+        key, old = next((pc, text) for pc, text in consumer.insns if tail < pc < failure
+                        and re.fullmatch(r"r\d+ = 0x6", text))
+        exit_pc = site("unsafe", name, "exit")
+        for new in (old.replace("0x6", "0x5"), f"goto {exit_pc-key-1:+#x}"):
+            with self.subTest(failure=new), self.assertRaisesRegex(RuntimeError, "pair.*failure"):
+                entry_contract("unsafe", name, mutate(OBJECTS["unsafe"], name, key, old, new))
 
     def test_unchanged_objects(self):
         for variant, disassembly in OBJECTS.items():
@@ -887,37 +920,26 @@ class EntryObjectTests(unittest.TestCase):
                 self.assertTrue(all(report["verified"].values()))
 
     def test_actual_instruction_controls(self):
-        cases = [
-            ("p11_entry", site('default', 'p11_entry', 'r1\\ <<=\\ 0x20'), "r1 <<= 0x20", "r1 <<= 0x1f"),
-            ("p11_entry", site('default', 'p11_entry', 'r0\\ >>=\\ 0x20', 0), "r0 >>= 0x20", "r0 >>= 0x1f"),
-            ("p11_entry", site('default', 'p11_entry', 'r1\\ =\\ r6', 1), "r1 = r6", "r1 = r10"),
-            ("p11_entry", site('default', 'p11_entry', 'if\\ r0\\ ==\\ 0x0\\ goto\\ \\+0xd'), "if r0 == 0x0 goto +0xd", "goto +0xd"),
-            ("p11_entry", site('default', 'p11_entry', 'if\\ r0\\ ==\\ 0x0\\ goto\\ \\+0xd'), "if r0 == 0x0 goto +0xd", "if r0 != 0x0 goto +0xd"),
-            ("p11_entry", site('default', 'p11_entry', 'if\\ r0\\ ==\\ 0x0\\ goto\\ \\+0xd'), "if r0 == 0x0 goto +0xd", "if r0 == 0x0 goto +0xc"),
-            ("p11_entry", site('default', 'p11_entry', 'r2\\ =\\ 0xff', 0), "r2 = 0xff", "r2 = 0x0"),
-            ("p11_entry", site('default', 'p11_entry', '\\*\\(u32\\ \\*\\)\\(r10\\ \\-\\ 0x168\\)\\ =\\ r8'), "*(u32 *)(r10 - 0x168) = r8", "*(u32 *)(r10 - 0x168) = r0"),
-            ("p11_entry", site('default', 'p11_entry', '\\*\\(u32\\ \\*\\)\\(r10\\ \\-\\ 0x180\\)\\ =\\ r8'), '*(u32 *)(r10 - 0x180) = r8', "*(u32 *)(r10 - 0x180) = r0"),
-            ("p11_return", 1209, "*(u32 *)(r10 - 0xb8) = r1", "*(u32 *)(r10 - 0xb8) = r0"),
-            ("p11_entry", site('default', 'p11_entry', 'if\\ r1\\ ==\\ 0x23\\ goto\\ \\+0xe'), "if r1 == 0x23 goto +0xe", "goto +0xe"),
-            ("p11_entry", site('default', 'p11_entry', 'r2\\ =\\ 0x0', 0), "r2 = 0x0", "r2 = 0x1"),
-            ("p11_entry", site('default', 'p11_entry', 'call\\ 0x755', 0), 'call 0x755', "r0 = 0x0"),
-            ("p11_entry", site('default', 'p11_entry', 'r1\\ =\\ 0x8'), "r1 = 0x8", "r1 = 0x7"),
-            ("p11_entry", site('default', 'p11_entry', 'goto\\ \\+0x134'), "goto +0x134", "goto +0x1"),
-            ("p11_return", 1412, "*(u32 *)(r0 + 0x68) = r1", "*(u32 *)(r0 + 0x68) = r2"),
-            ("p11_entry", site('default', 'p11_entry', '\\*\\(u32\\ \\*\\)\\(r10\\ \\-\\ 0x17c\\)\\ =\\ r7'), '*(u32 *)(r10 - 0x17c) = r7', "if r7 == 0x0 goto +0x10"),
-            ("p11_return", 1227, "call 0x2", "r0 = 0x0"),
-            ("p11_return", call_site("default", "p11_return", "p11_owner_start_remove"), "call 0x755", "r0 = 0x0"),
-            ("p11_return", 1413, "*(u64 *)(r0 + 0x60) = r9", "*(u32 *)(r0 + 0x69) = r9"),
-            ("p11_entry", site('default', 'p11_entry', 'call\\ 0xe'), "call 0xe", "call 0x5"),
-            ("p11_entry", site('default', 'p11_entry', '\\*\\(u32\\ \\*\\)\\(r10\\ \\-\\ 0x17c\\)\\ =\\ r7'), '*(u32 *)(r10 - 0x17c) = r7', "*(u32 *)(r10 - 0x17c) = r8"),
-            ("p11_entry", site('default', 'p11_entry', '\\*\\(u64\\ \\*\\)\\(r10\\ \\-\\ 0x188\\)\\ =\\ r0'), '*(u64 *)(r10 - 0x188) = r0', "*(u32 *)(r10 - 0x188) = r0"),
-            ("p11_entry", site('default', 'p11_entry', '\\*\\(u64\\ \\*\\)\\(r10\\ \\-\\ 0x168\\)\\ =\\ r1', 0), "*(u64 *)(r10 - 0x168) = r1", "*(u8 *)(r10 - 0x185) = r1"),
-        ]
-        for function, pc, old, new in cases:
-            with self.subTest(function=function, pc=pc, new=new):
-                changed = mutate(OBJECTS["default"], function, pc, old, new)
-                with self.assertRaises(RuntimeError):
-                    CHECKER["contract"](changed, "default")
+        for variant in OBJECTS:
+            for suffix in ("p11_entry", "p11_return"):
+                consumer_contract(variant, suffix)
+                consumer, initial, _, _ = consumer_case(variant, suffix)
+                facts = consumer.facts(initial)
+                mutations = []
+                for pc, text in consumer.insns:
+                    shift = re.fullmatch(r"(r\d+) (<<=|>>=) 0x20", text)
+                    if shift and facts.get(pc, {}).get(shift[1], (None,))[0] in ("cookie", "low_shifted"):
+                        mutations.append((pc, text, text.replace("0x20", "0x1f")))
+                    if re.fullmatch(r"if r\d+ > 0x1ff goto .*", text):
+                        mutations.append((pc, text, "goto +0x0"))
+                cookies = [pc for pc, text in consumer.insns if pc in consumer.helper and text == "call 0xae"]
+                first = cookies[0]
+                pc, old = next((pc, text) for pc, text in reversed(consumer.insns) if pc < first and text.startswith("r1 = "))
+                mutations.append((pc, old, "r1 = r10"))
+                self.assertGreaterEqual(len(mutations), 4)
+                for pc, old, new in mutations:
+                    with self.subTest(variant=variant, function=suffix, pc=pc), self.assertRaises(RuntimeError):
+                        consumer_contract(variant, suffix, mutate(OBJECTS[variant], consumer.name, pc, old, new))
 
     def test_each_consumer_descriptor_fields_and_word(self):
         for variant in OBJECTS:
@@ -969,118 +991,130 @@ class EntryObjectTests(unittest.TestCase):
                                     CHECKER["descriptor_contract"](mutant, mutant.facts(initial), lookup)
 
     def test_diagnostic_specialization_and_template_cleanup(self):
-        discovery = CHECKER["D"]
-        disassembly = OBJECTS["unsafe"]
-        blocks = discovery.function_blocks(disassembly)
-        for name in ("p11_entry", "p11_entry_ia32", "p11_entry_template", "p11_entry_template_pair", "p11_entry_template_second", "p11_entry_template_types", "p11_return"):
-            insns = discovery.instructions(blocks[name])
-            pc, text = next((pc, text) for pc, text in insns if text.startswith("if r1 == 0x23 goto"))
-            with self.subTest(function=name, control="selector bypass"):
-                changed = mutate(disassembly, name, pc, text, "goto " + text.split(" goto ")[1])
-                with self.assertRaises(RuntimeError):
-                    CHECKER["contract"](changed, "unsafe")
-            # Every ABI-refusal key in each diagnostic consumer must remain 8.
-            first_descriptor = next(pc for _, pc, _ in discovery.map_call_sites(blocks[name], "DESCRIPTORS", 1))
-            for pc, text in insns:
-                if pc < first_descriptor and text == "r1 = 0x8":
-                    with self.subTest(function=name, pc=pc, control="refusal key"):
-                        changed = mutate(disassembly, name, pc, text, "r1 = 0x7")
-                        with self.assertRaises(RuntimeError):
-                            CHECKER["contract"](changed, "unsafe")
+        for suffix in consumer_names("unsafe"):
+            consumer, initial, _, outlined = consumer_case("unsafe", suffix)
+            if outlined:
+                continue  # ABI admission is proved at the actual root caller.
+            facts = consumer.facts(initial)
+            CHECKER["abi_contract"](consumer, facts, "unsafe")
+            # LP64-only p11_entry's 0x23 classification is redundant after
+            # specialization; its actual admission decision is the 0x33 arm.
+            admitted = "0x33" if suffix == "p11_entry" else "0x23"
+            pc, old = next((pc, text) for pc, text in consumer.insns
+                if (m := CHECKER["BRANCH"].fullmatch(text)) and m[2] == "==" and m[3] == admitted
+                and CHECKER["value"](facts.get(pc, {}), m[1]) == ("selector",))
+            for new in ("goto "+old.split(" goto ")[1], re.sub(r"\br(\d+)\b", r"w\1", old)):
+                changed = mutate(OBJECTS["unsafe"], consumer.name, pc, old, new)
+                mutant, initial, _, _ = consumer_case("unsafe", suffix, changed)
+                with self.subTest(function=suffix, control=new), self.assertRaisesRegex(RuntimeError, "ABI|selector"):
+                    CHECKER["abi_contract"](mutant, mutant.facts(initial), "unsafe")
+            # Several refusal counters share a merged lookup block. Locate
+            # the literal key in the ABI prefix, before admission, rather
+            # than inventing a constant at that merged helper state.
+            selector = next(pc for pc, text in consumer.insns if (m := CHECKER["LOAD"].fullmatch(text))
+                and CHECKER["address"](facts.get(pc, {}), m[3], m[4], m[5]) == ("context", 0x88))
+            admissions = {pc for pc, text in consumer.insns if
+                (text == "call 0x1" and facts.get(pc, {}).get("r1") == ("map", "STATS"))
+                or consumer.calls.get(pc) in ("p11_owner_start_get", "p11_owner_start_begin")}
+            prefix = CHECKER["D"].reachable(consumer.graph, [selector], blocked=admissions)
+            refusals = [(pc, text) for pc, text in consumer.insns if pc in prefix
+                        and re.fullmatch(r"[rw]\d+ = 0x8", text)]
+            self.assertTrue(refusals)
+            for store, old in refusals:
+                changed = mutate(OBJECTS["unsafe"], consumer.name, store, old, old.rsplit(" = ", 1)[0]+" = 0x7")
+                mutant, initial, _, _ = consumer_case("unsafe", suffix, changed)
+                with self.subTest(function=suffix, refusal=store), self.assertRaisesRegex(RuntimeError, "ABI refusal evidence"):
+                    CHECKER["abi_contract"](mutant, mutant.facts(initial), "unsafe")
 
     def test_register_aliases_and_unknown_writes(self):
-        disassembly = OBJECTS["default"]
-        changed = mutate(disassembly, "p11_entry", site('default', 'p11_entry', 'r2\\ =\\ 0xff', 0), "r2 = 0xff", "w2 = 0xff")
-        self.assertTrue(CHECKER["contract"](changed, "default")["verified"])
-        changed = mutate(disassembly, "p11_entry", site('default', 'p11_entry', 'r2\\ =\\ 0xff', 0), "r2 = 0xff", "w2 ^= 0xff")
-        with self.assertRaises(RuntimeError):
-            CHECKER["contract"](changed, "default")
+        consumer_contract("default", "p11_entry")
+        name, insns = instructions("default", "p11_entry")
+        pc, old = next((pc, text) for pc, text in insns if re.fullmatch(r"r\d+ = 0xff", text))
+        register = old.split(" = ")[0]
+        healthy = mutate(OBJECTS["default"], name, pc, old, "w"+register[1:]+" = 0xff")
+        self.assertTrue(consumer_contract("default", name, healthy))
+        changed = mutate(OBJECTS["default"], name, pc, old, "w"+register[1:]+" ^= 0xff")
+        with self.assertRaisesRegex(RuntimeError, "COUNT_ONLY|descriptor"):
+            consumer_contract("default", name, changed)
 
     def test_each_required_operation_cannot_disappear(self):
-        discovery = CHECKER["D"]
-        for variant, disassembly in OBJECTS.items():
-            report = CHECKER["contract"](disassembly, variant)
-            blocks = discovery.function_blocks(disassembly)
-            for name, result in report["consumers"].items():
-                insns = dict(discovery.instructions(blocks[name]))
-                for pc, sink in result["sinks"]:
-                    if sink == "Event.slot":
-                        continue
-                    with self.subTest(variant=variant, function=name, pc=pc, sink=sink):
-                        changed = mutate(disassembly, name, pc, insns[pc], "r0 = 0x0")
+        for variant in OBJECTS:
+            for suffix in consumer_names(variant):
+                report = consumer_contract(variant, suffix)
+                consumer, _, _, _ = consumer_case(variant, suffix)
+                self.assertTrue(report["operations"])
+                for pc, operation in report["operations"]:
+                    with self.subTest(variant=variant, function=suffix, pc=pc, operation=operation):
+                        changed = mutate(OBJECTS[variant], consumer.name, pc, consumer.text[pc], "r0 = 0x0")
                         with self.assertRaises(RuntimeError):
-                            CHECKER["contract"](changed, variant)
+                            consumer_contract(variant, suffix, changed)
 
     def test_full_start_key_in_every_consumer(self):
-        discovery = CHECKER["D"]
-        for variant, disassembly in OBJECTS.items():
-            split = CHECKER["sections"](disassembly)
-            for section in ("uprobe", "uretprobe"):
-                calls = discovery.internal_call_targets(split[section] + "\n" + split[".text"])
-                for name, lines in discovery.function_blocks(split[section]).items():
-                    if not (name.startswith("p11_entry") or name == "p11_return"):
+        for variant in OBJECTS:
+            for suffix in consumer_names(variant):
+                consumer_contract(variant, suffix)
+                consumer, initial, _, outlined = consumer_case(variant, suffix)
+                facts = consumer.facts(initial)
+                first = min(pc for pc, target in consumer.calls.items() if target.startswith("p11_owner_start_"))
+                key = facts[first]["r1"]
+                identity = consumer.identity if outlined or suffix == "p11_return" else (consumer.section, consumer.name)
+                controls = []
+                for pc, text in consumer.insns:
+                    if pc >= first:
                         continue
-                    consumer = CHECKER["Consumer"](section, name, lines,
-                        {pc: target for caller, _, pc, target in calls if caller == name})
-                    facts = consumer.facts()
-                    first = min(pc for pc, target in consumer.calls.items() if target.startswith("p11_owner_start_"))
-                    key = facts[first]["r1"]
-                    controls = []
-                    for pc, text in consumer.insns:
-                        if pc >= first:
-                            continue
-                        match = CHECKER["STORE"].fullmatch(text)
-                        if match:
-                            pointer = CHECKER["address"](facts[pc], match[2], match[3], match[4])
-                            if pointer in (("stack", key[1]), ("stack", key[1] + 8), ("stack", key[1] + 12)):
-                                controls.append((pc, text, text.rsplit(" = ", 1)[0] + " = r10"))
-                        if text == "call 0xe":
-                            controls.append((pc, text, "call 0x5"))
-                    self.assertEqual(len(controls), 4)
-                    for pc, old, new in controls:
-                        with self.subTest(variant=variant, function=name, pc=pc):
-                            with self.assertRaises(RuntimeError):
-                                CHECKER["contract"](mutate(disassembly, name, pc, old, new), variant)
+                    if outlined and (m := CHECKER["LOAD"].fullmatch(text)):
+                        pointer = CHECKER["address"](facts.get(pc, {}), m[3], m[4], m[5])
+                        if pointer and pointer[0] == "external_key":
+                            controls.append((pc, text, text.replace("(r2 +", "(r10 +")))
+                    elif not outlined and (m := CHECKER["STORE"].fullmatch(text)):
+                        pointer = CHECKER["address"](facts.get(pc, {}), m[2], m[3], m[4])
+                        expected = {key[1]: ("pid_tgid", identity), key[1]+8: ("low", identity), key[1]+12: ("constant", 0)}
+                        if (pointer and pointer[0] == "stack" and pointer[1] in expected
+                                and CHECKER["narrow"](CHECKER["value"](facts[pc], m[5]), int(m[1])) == expected[pointer[1]]):
+                            controls.append((pc, text, text.rsplit(" = ", 1)[0]+" = r10"))
+                    if not outlined and text == "call 0xe":
+                        controls.append((pc, text, "call 0x5"))
+                self.assertEqual(len(controls), 2 if outlined else 4, (variant, suffix, controls))
+                for pc, old, new in controls:
+                    with self.subTest(variant=variant, function=suffix, pc=pc), self.assertRaises(RuntimeError):
+                        consumer_contract(variant, suffix, mutate(OBJECTS[variant], consumer.name, pc, old, new))
 
     def test_event_overlap_can_be_restored_before_submission(self):
-        changed = mutate(OBJECTS["default"], "p11_return", 1362,
-                         "*(u64 *)(r0 + 0x60) = r1", "*(u32 *)(r0 + 0x69) = r1")
-        changed = mutate(changed, "p11_return", 1498, "r1 = 0x0", "r1 = *(u64 *)(r10 - 0xd0)")
-        changed = mutate(changed, "p11_return", 1499,
-                         "*(u32 *)(r0 + 0x11c) = r1", "*(u32 *)(r0 + 0x68) = r1")
-        self.assertTrue(CHECKER["contract"](changed, "default")["verified"]["event_slot_through_submit"])
+        return_contract("default")
+        name, insns = instructions("default", "ordinary_return")
+        pc, old = next((pc, text) for pc, text in insns if re.fullmatch(r"\*\(u32 \*\)\(r7 \+ 0x6c\) = [rw]2", text))
+        # This overlap precedes the real Event.slot store, which restores it.
+        changed = mutate(OBJECTS["default"], name, pc, old, old.replace("+ 0x6c", "+ 0x69"))
+        self.assertTrue(return_contract("default", changed)["outlined"])
 
     def test_owner_required_and_insert_value_arguments(self):
-        discovery = CHECKER["D"]
-        for variant, disassembly in OBJECTS.items():
-            split = CHECKER["sections"](disassembly)
-            for section in ("uprobe", "uretprobe"):
-                calls = discovery.internal_call_targets(split[section] + "\n" + split[".text"])
-                for name, lines in discovery.function_blocks(split[section]).items():
-                    if not (name.startswith("p11_entry") or name == "p11_return"):
+        # Current construction passes an immutable seed, not an inserted value.
+        for variant in OBJECTS:
+            for suffix in consumer_names(variant):
+                consumer_contract(variant, suffix)
+                consumer, _, _, _ = consumer_case(variant, suffix)
+                for pc, target in consumer.calls.items():
+                    if not target.startswith("p11_owner_start_"):
                         continue
-                    insns = discovery.instructions(lines)
-                    positions = {pc: index for index, (pc, _) in enumerate(insns)}
-                    for caller, _, pc, target in calls:
-                        if caller != name or not target.startswith("p11_owner_start_"):
-                            continue
-                        if target.endswith("get") and variant == "default":
-                            continue  # This compiled callee does not consume incoming r2.
-                        argument_pc, old = next((p, t) for p, t in reversed(insns[:positions[pc]])
-                                               if re.match(r"r2 (=|\+=) ", t))
-                        new = "r2 = 0x1" if old == "r2 = 0x0" else "r2 = 0x0"
-                        with self.subTest(variant=variant, function=name, pc=pc):
-                            with self.assertRaises(RuntimeError):
-                                CHECKER["contract"](mutate(disassembly, name, argument_pc, old, new), variant)
+                    if target.endswith("get") and variant == "default":
+                        continue  # Actual compiled API does not consume r2.
+                    argument, old = next((p, t) for p, t in reversed(consumer.insns)
+                        if p < pc and re.match(r"r2 (=|\+=) ", t))
+                    new = "r2 = 0x1" if old == "r2 = 0x0" else "r2 = 0x0"
+                    with self.subTest(variant=variant, function=suffix, operation=target, pc=pc), self.assertRaises(RuntimeError):
+                        consumer_contract(variant, suffix, mutate(OBJECTS[variant], consumer.name, argument, old, new))
 
     def test_atomic_event_slot_corruption(self):
-        changed = mutate(OBJECTS["default"], "p11_return", 1485,
-                         "*(u64 *)(r0 + 0x60) = r1", "r1 = 0x400")
-        changed = mutate(changed, "p11_return", 1486,
-                         "r1 = *(u64 *)(r10 - 0x128)",
-                         "r9 = atomic_fetch_or((u64 *)(r0 + 0x68), r9)")
-        with self.assertRaisesRegex(RuntimeError, r"Event.slot corrupted before submit"):
-            CHECKER["contract"](changed, "default")
+        for variant in OBJECTS:
+            return_contract(variant)
+            for suffix in ("ordinary_return", "object_return"):
+                name, insns = instructions(variant, suffix)
+                slot = next(pc for pc, text in insns if re.fullmatch(r"\*\(u32 \*\)\(r7 \+ 0x68\) = [rw]1", text))
+                pc, old = next((pc, text) for pc, text in insns if pc > slot
+                               and re.fullmatch(r"\*\(u64 \*\)\(r7 \+ 0x60\) = r\d+", text))
+                for new in ("*(u32 *)(r7 + 0x69) = w1", "r9 = atomic_fetch_or((u64 *)(r7 + 0x68), r9)"):
+                    with self.subTest(variant=variant, function=suffix, write=new), self.assertRaisesRegex(RuntimeError, "Event.slot corrupted before submit"):
+                        return_contract(variant, mutate(OBJECTS[variant], name, pc, old, new))
 
     def test_lifecycle_start_insert_bypass_is_rejected(self):
         # Construction is already committed. A semantic refusal must take its

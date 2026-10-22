@@ -52,10 +52,20 @@ pub fn model_marker(path: &str, source: &str) -> Option<&'static str> {
             "deliver_joint_seal",
             "deliver_joint_failure",
             "after_joint_delivery",
+            "deliver_joint_algorithm_failure_for_test",
         ] {
             let Some((signature, _)) = function(source, name, Some("impl CallerRegistry {")) else {
                 continue;
             };
+            // The legacy algorithm adapter is permitted only under its real,
+            // directly attached test gate. Comments/literals cannot supply it.
+            if name == "deliver_joint_algorithm_failure_for_test"
+                && !code[..signature.start].ends_with(
+                    b"#[cfg(test)]\n    pub(crate) fn deliver_joint_algorithm_failure_for_test(",
+                )
+            {
+                continue;
+            }
             let signature_text = &source[signature.clone()];
             if signature_text.matches(MODEL_PARAMETER).count() != 1 {
                 continue;
@@ -417,6 +427,56 @@ mod tests {
         ] {
             assert!(model_marker(INPUT, &changed).is_some());
         }
+    }
+
+    #[test]
+    fn algorithm_failure_borrow_requires_the_real_test_only_helper() {
+        const NAME: &str = "deliver_joint_algorithm_failure_for_test";
+        const HEADER: &str =
+            "#[cfg(test)]\n    pub(crate) fn deliver_joint_algorithm_failure_for_test(";
+        let source = input();
+        assert_eq!(source.matches(HEADER).count(), 1);
+        assert_eq!(model_marker(INPUT, &source), None);
+
+        for changed in [
+            source.replace(HEADER, "pub(crate) fn deliver_joint_algorithm_failure_for_test("),
+            source.replace("#[cfg(test)]\n    pub(crate) fn deliver_joint_algorithm", "#[cfg(not(test))]\n    pub(crate) fn deliver_joint_algorithm"),
+            source.replace(HEADER, "/* #[cfg(test)] */\n    pub(crate) fn deliver_joint_algorithm_failure_for_test("),
+            source.replace(HEADER, "#[doc = \"#[cfg(test)]\"]\n    pub(crate) fn deliver_joint_algorithm_failure_for_test("),
+            source.replace(NAME, "other_algorithm_failure"),
+            source.replace("impl CallerRegistry {", "impl Renderer {"),
+            format!("{source}\nimpl CallerRegistry {{\n    #[cfg(test)]\n    fn {NAME}() {{}}\n}}"),
+        ] {
+            assert!(model_marker(INPUT, &changed).is_some());
+        }
+
+        let (signature, body) = function(&source, NAME, Some("impl CallerRegistry {")).unwrap();
+        for parameter in [
+            "model: crate::semantics_objects::ObjectSemantics,",
+            "model: &mut crate::semantics_objects::ObjectSemantics,",
+            "callback: fn(model: &crate::semantics_objects::ObjectSemantics,),",
+        ] {
+            let mut changed = source.clone();
+            changed.replace_range(
+                signature.clone(),
+                &source[signature.clone()].replace(MODEL_PARAMETER, parameter),
+            );
+            assert!(model_marker(INPUT, &changed).is_some());
+        }
+        for declaration in [
+            "let _owned = crate::semantics_objects::ObjectSemantics::new();",
+            "let _owned: crate::semantics_objects::ObjectSemantics;",
+        ] {
+            let mut changed = source.clone();
+            changed.insert_str(body.start, declaration);
+            assert!(model_marker(INPUT, &changed).is_some());
+        }
+        let mut changed = source.clone();
+        changed.replace_range(
+            signature.end + 1..body.start - 1,
+            " -> &crate::semantics_objects::ObjectSemantics ",
+        );
+        assert!(model_marker(INPUT, &changed).is_some());
     }
 
     #[test]

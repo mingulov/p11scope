@@ -1,5 +1,7 @@
-/* Host regression harness for the real Task 3 Stage A hooks (instance_epoch.c).
- * Every helper is a scripted fake; every assertion is on production code. */
+/* Host regression harness for the real birth wrapper and instance epoch hooks.
+ * Every external helper is scripted; every assertion is on production code.
+ * Include the wrapper before the scripted epoch CAS: stop-gate atomics stay real. */
+#include "image_identity_fork.c"
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -59,6 +61,12 @@ static int storage_creates;
 static u64 pid_tgid = (77ULL << 32) | 78;
 static int read_fail_at = -1;
 static int reads;
+unsigned char STOP_GATE;
+static u64 stop_gate_cell;
+static int root_calls;
+static int scope_calls;
+static int identity_calls;
+static int emit_calls;
 
 static struct super_block___p11inst sb = { 0x00800025 };
 static struct inode___p11inst inode = { 4242, &sb };
@@ -80,6 +88,49 @@ static struct instance_entry start_values[4];
 static int start_used[4];
 static int start_update_fail;
 static int start_deletes;
+
+u32 p11_root_propagate_thread(struct task_struct *forked, u64 clone_flags)
+{
+    assert(forked == (struct task_struct *)&child);
+    assert(clone_flags == 0 || clone_flags == INST_CLONE_VM ||
+           clone_flags == (INST_CLONE_VM | INST_CLONE_THREAD));
+    assert(stop_gate_cell == 1 && !scope_calls);
+    root_calls++;
+    return 0;
+}
+
+u32 p11_link_fork_allowed(void)
+{
+    assert(stop_gate_cell == 1);
+    scope_calls++;
+    return 0;
+}
+
+static struct task_struct *birth_current_task(void)
+{
+    identity_calls++;
+    return 0;
+}
+
+u32 p11_link_task_identity(struct task_struct *value, struct image_identity *out)
+{
+    (void)value;
+    (void)out;
+    identity_calls++;
+    return COOKIE_STATUS_BAD_TASK;
+}
+
+u32 p11_link_emit_fork(u32 child_tgid, u64 clone_flags,
+                       const struct image_identity *parent_identity,
+                       const struct image_identity *child_identity)
+{
+    (void)child_tgid;
+    (void)clone_flags;
+    (void)parent_identity;
+    (void)child_identity;
+    emit_calls++;
+    return 0;
+}
 
 static long update(void *map, const void *key, const void *value, u64 flags)
 {
@@ -115,6 +166,10 @@ static long delete(void *map, const void *key)
 static void *lookup(void *map, const void *key)
 {
     u32 index = *(const u32 *)key;
+    if (map == &STOP_GATE) {
+        assert(index == 0);
+        return &stop_gate_cell;
+    }
     if (map == &WATCHED_FILES) {
         const struct instance_file_key *k = key;
         return watched_present && k->dev == watched_key.dev && k->ino == watched_key.ino
@@ -218,11 +273,15 @@ static void reset(void)
     thread.flags = 0;
     leader.flags = 0;
     child.flags = 0;
+    child.mm = &mm;
+    child.group_leader = &child;
     borrower.mm = 0;
     borrower.group_leader = 0;
     borrower.flags = 0;
     current_task = &thread;
     image_entry_ok = 1;
+    stop_gate_cell = 0;
+    root_calls = scope_calls = identity_calls = emit_calls = 0;
 }
 
 static void map_hook(struct vm_area_struct___p11inst *v)
@@ -255,8 +314,82 @@ static struct instance_stamp stamp(u32 endpoint)
     return out.return_stamp;
 }
 
+static void denied_scope_shared_mm_birth(void)
+{
+    /* No wrapper task-shape read may follow denied scope. The opaque child
+     * pointer still identifies the very same real epoch storage record. */
+    u64 ctx[2] = { (u64)(unsigned long)&child, INST_CLONE_VM };
+    reset();
+    mm.mm_users.counter = 2;
+    assert(task_newtask(ctx) == 0);
+    assert(root_calls == 1 && scope_calls == 1 && !identity_calls && !emit_calls);
+    assert(storage_creates == 1 && record_present[1]);
+    assert(records[1].flags == INST_RECORD_SHARED_MM && !stop_gate_cell);
+    assert(!gen[INST_GEN_FAULT] && !gen[INST_GEN_STICKY]);
+
+    /* Parent exits: an observed single mm user must not erase the birth's
+     * shared-mm history and authorize child-local provider mutations. */
+    mm.mm_users.counter = 1;
+    current_task = &child;
+    map_hook(&vma);
+    assert(counters.shared == 1 && counters.global_bumps == 1 && g_epoch[5] == 1);
+    assert(!counters.local_bumps && storage_creates == 1);
+    for (int i = 0; i < INST_RECORD_SLOTS; i++)
+        assert(!records[1].slot_plus1[i] && !records[1].epoch[i]);
+
+    /* Ordinary fork is not a sharer; its sole-user mutation localizes. */
+    reset();
+    ctx[1] = 0;
+    assert(task_newtask(ctx) == 0);
+    assert(root_calls == 1 && scope_calls == 1 && !identity_calls && !emit_calls);
+    assert(!storage_creates && !record_present[1] && !stop_gate_cell);
+    current_task = &child;
+    map_hook(&vma);
+    assert(counters.local_bumps == 1 && !g_epoch[5] && !counters.shared);
+    assert(records[1].slot_plus1[0] == 6 && records[1].epoch[0] == 1);
+    assert(!records[1].flags && !gen[INST_GEN_FAULT] && !gen[INST_GEN_STICKY]);
+
+    /* A thread needs no distinct child mark and skips semantic filtering. */
+    reset();
+    ctx[1] = INST_CLONE_VM | INST_CLONE_THREAD;
+    assert(task_newtask(ctx) == 0);
+    assert(root_calls == 1 && !scope_calls && !identity_calls && !emit_calls);
+    assert(!storage_creates && !record_present[1] && !stop_gate_cell);
+    assert(!gen[INST_GEN_FAULT] && !gen[INST_GEN_STICKY]);
+
+    /* Denied semantic scope must not hide an unmarkable mm sharer. */
+    reset();
+    ctx[1] = INST_CLONE_VM;
+    storage_fail = 1;
+    assert(task_newtask(ctx) == 0);
+    assert(root_calls == 1 && scope_calls == 1 && !identity_calls && !emit_calls);
+    assert(!storage_creates && !record_present[1] && !stop_gate_cell);
+    assert(gen[INST_GEN_STICKY] == INST_STICKY_FORK_UNMARKED);
+    assert(gen[INST_GEN_FAULT] == 1 && counters.faults == 1);
+
+    reset();
+    record_present[1] = 1;
+    cas_lose = INST_CAS_TRIES;
+    assert(task_newtask(ctx) == 0);
+    assert(root_calls == 1 && scope_calls == 1 && !identity_calls && !emit_calls);
+    assert(!records[1].flags && !storage_creates && !stop_gate_cell);
+    assert(gen[INST_GEN_STICKY] == INST_STICKY_FORK_UNMARKED);
+    assert(gen[INST_GEN_FAULT] == 1 && counters.faults == 1 && !cas_lose);
+
+    /* The actual stop gate precedes all root/epoch/scope/identity accesses. */
+    reset();
+    stop_gate_cell = P11_STOP_GATE_STOP;
+    assert(task_newtask(ctx) == 0);
+    assert(!root_calls && !scope_calls && !identity_calls && !emit_calls);
+    assert(!storage_creates && !record_present[1]);
+    assert(!gen[INST_GEN_FAULT] && !gen[INST_GEN_STICKY]);
+    assert(stop_gate_cell == P11_STOP_GATE_STOP);
+}
+
 int main(void)
 {
+    stop_gate_map_lookup = lookup;
+    bpf_get_current_task_btf = birth_current_task;
     inst_map_lookup = lookup;
     inst_map_update = update;
     inst_map_delete = delete;
@@ -266,6 +399,7 @@ int main(void)
     inst_current_task = task;
     leader.group_leader = &leader;
     leader.mm = &mm;
+    denied_scope_shared_mm_birth();
 
     /* A disabled/poisoned image may never leave a joinable entry stamp. */
     reset();

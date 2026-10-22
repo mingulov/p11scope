@@ -6,20 +6,21 @@ how to run it, and what its output actually proves. Measured examples below
 name the script that produced them so they can be reproduced; fixed
 implementation limits are code contracts, not measurements.
 
-> **Status: v0.4.0.** This guide describes the v0.4.0 release: `doctor`,
+> **Status: v0.4.0 intermediate source checkpoint.** This guide describes `doctor`,
 > `inspect` (`--system` is a preview), `profile` (including `--mode metrics`),
 > `trace`, `run` and `inventory` (with `--cgroup` scope, offline `diff`
 > comparison and diagnostics), with memory-scan discovery,
 > `C_GetInterface`, multi-module capture, owned-child live discovery,
 > per-edge entry counts, and schema v3. Object-attribute capture is not
-> enabled in v0.4.0 (P0-only release bytes; disclosed as structured
-> evidence). Its
+> enabled in the selected P0 build (`--no-default-features --features
+> stub-object-attributes`; disclosed as structured evidence). Ordinary source
+> builds default to FULL, whose broader installed acceptance remains open. Its
 > [known limitations](../CHANGELOG.md#known-limitations) apply throughout.
-> The [v0.4.0 GitHub release notes](https://github.com/mingulov/p11scope/releases/tag/v0.4.0)
-> record final tagged-artifact qualification and hosted CI;
+> The [v0.4.0 source tag](https://github.com/mingulov/p11scope/tree/v0.4.0)
+> provides no new binary bundles or complete installed/package qualification;
 > [CHANGELOG.md](../CHANGELOG.md#qualification-of-this-release) preserves
-> revision-specific pre-release evidence. To install the binaries or build
-> from source, see [Install](../README.md#install).
+> revision-specific pre-release evidence. [Install](../README.md#install)
+> distinguishes the source build from the older v0.3.0 binary downloads.
 > The [privacy allowlist](privacy/allowlist-v1.md) defines the capture
 > boundary, and the [profile schema](schema/observed-profile-v3.md) defines
 > public evidence and its authority.
@@ -74,8 +75,9 @@ only in a build compiled with the off-by-default `unsafe-unvalidated-metadata`
 Cargo feature *and* run with `--unsafe-unvalidated-metadata`. The flag alone
 cannot enable code absent from the shipped eBPF object, `metrics` refuses the
 flag, and the observer prints a warning naming the exposure when it is active.
-The official release artifact is built `--no-default-features`, and packaging
-fails if the unsafe path is reachable. See
+The official builder selects `--no-default-features --features
+stub-object-attributes` for P0, and packaging fails if the unsafe path is
+reachable. See
 [docs/privacy/allowlist-v1.md](privacy/allowlist-v1.md) with its
 [v2 extension](privacy/allowlist-v2.md) for the field-by-field
 enforcement (what is captured, why, and how each read is gated — structural
@@ -83,7 +85,10 @@ where a leak is impossible by construction, runtime-gated where a length/
 null check stands in front of the read, each gate named with the test that
 exercises it). The canary matrix includes secret, unterminated, and hostile-
 alias `C_GetInterface` names and scans every artifact and observer-owned map
-for their bytes.
+for their bytes. Separately marked reviewed sections of
+[allowlist v3](privacy/allowlist-v3.md) cover presentation, caller metadata and
+the internal FULL object producer; its remaining proposals grant no capture
+authority or public object projection.
 
 A profile is evidence of what the application *did* during the capture
 window. It is never proof of what the application *cannot* do — see

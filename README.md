@@ -11,15 +11,17 @@ table (including stripped providers with no `C_*` symbols), attaches probes by
 file offset, and produces a versioned `observed-profile.json` for migration
 assessment and incident diagnostics.
 
-> **Status: v0.4.0**, adds `inventory --cgroup` scope, offline `inventory
-> diff` comparison, inventory diagnostics, executable naming for trace and
-> inspect output, and hardened final-output semantics across `doctor`,
+> **Status: v0.4.0 intermediate source checkpoint**, adds `inventory --cgroup`
+> scope, offline `inventory diff` comparison, inventory diagnostics, executable
+> naming for trace and inspect output, and hardened final-output semantics across `doctor`,
 > `inspect`, `profile`, `trace` and `run`. Object-attribute capture is not
-> enabled in v0.4.0 (P0-only release bytes; disclosed as structured
-> evidence). Read the [known limitations](CHANGELOG.md#known-limitations)
+> enabled in the selected P0 build (`--no-default-features --features
+> stub-object-attributes`; disclosed as structured evidence). Ordinary source
+> builds default to FULL; FULL and broader installed qualification remain open.
+> Read the [known limitations](CHANGELOG.md#known-limitations)
 > and [docs/known-limitations.md](docs/known-limitations.md) before relying
-> on a capture; `--system` is a preview. The [v0.4.0 GitHub release notes](https://github.com/mingulov/p11scope/releases/tag/v0.4.0)
-> identify tagged-artifact qualification and hosted CI;
+> on a capture; `--system` is a preview. The [v0.4.0 source tag](https://github.com/mingulov/p11scope/tree/v0.4.0)
+> has no new binary bundles or complete installed/package qualification;
 > [CHANGELOG.md](CHANGELOG.md#qualification-of-this-release) preserves
 > revision-specific pre-release evidence.
 
@@ -87,8 +89,8 @@ or GitHub's automatic source archive excludes the generated trees, receipts
 and local archive cache. All locked registry packages and the fixed
 [pkcs11-components](https://github.com/mingulov/pkcs11-components/) Git revision
 (`d0a47c7`) are separate Cargo inputs and
-must already be cached for an offline build from that checkout. The release's
-source export embeds the two exact pinned Aya archives, but fetching the
+must already be cached for an offline build from that checkout. The published
+v0.3.0 source export embeds the two exact pinned Aya archives, but fetching the
 remaining locked Cargo dependencies requires network access or a populated
 cache. A separate full offline export can embed the complete dependency
 payload; see below.
@@ -106,10 +108,17 @@ assets and local release-mode builds.
 
 ## Install
 
-p11scope v0.4.0 is distributed through the
-[GitHub release](https://github.com/mingulov/p11scope/releases/tag/v0.4.0)
-as a static x86-64 Linux observer bundle, optional glibc and musl discovery
-helper bundles, and a source export. Download `SHA256SUMS` with the bundle you
+p11scope v0.4.0 is an [intermediate source tag](https://github.com/mingulov/p11scope/tree/v0.4.0).
+Build that checkpoint with the explicit P0 feature selection in
+[Build locally from source](#build-locally-from-source). No v0.4.0 binary
+bundles or curated source export were published with the tag. GitHub's
+automatic source archive still needs the dependency inputs described above.
+
+The older [v0.3.0 release](https://github.com/mingulov/p11scope/releases/tag/v0.3.0)
+provides a static x86-64 Linux observer bundle, optional glibc and musl discovery
+helper bundles, and a source export. The examples below install **v0.3.0**;
+they do not include the newer checkpoint's commands and fixes.
+Download `SHA256SUMS` with the bundle you
 choose. The release also provides `RELEASE.json` with curated provenance;
 each bundle contains its license notices and a copy of that record.
 
@@ -145,7 +154,7 @@ The observer needs Linux x86-64 and the kernel and privilege requirements
 below. The helper needs the matching provider ABI and libc; a 32-bit provider
 requires a separately built 32-bit helper.
 
-The release also includes `p11scope-0.3.0-source.tar.gz`. It contains the
+The v0.3.0 release also includes `p11scope-0.3.0-source.tar.gz`. It contains the
 committed source and the two pinned Aya archives needed to reconstruct the
 local patches. Building it still needs network access for the remaining
 locked Cargo dependencies, plus the Rust/BPF and host build tools described
@@ -158,6 +167,12 @@ full export assembled separately.
 trees `scripts/prepare-dependencies.py` generates. The official artifacts are
 built and verified by `scripts/build-release.sh` (see
 [RELEASING.md](RELEASING.md)); the commands below are local build examples.
+
+For the v0.4.0 checkpoint, select the published `v0.4.0` tag in your source
+checkout. Its intended P0 configuration needs `--features stub-object-attributes`
+as well as `--no-default-features`. Omitting that feature selects FULL;
+`--no-default-features` alone does not disable object-attribute capture.
+FULL source builds and their broader acceptance remain development work.
 
 **Build prerequisites** (x86-64 Linux; Ubuntu package names): the pinned
 toolchains from [docs/development.md](docs/development.md). The scripts select
@@ -178,6 +193,7 @@ it never loads a provider, so one binary serves supported x86-64 Linux hosts:
 ```sh
 RUSTFLAGS='-C target-feature=+crt-static' ./scripts/cargo.sh +1.98.1 build \
   --locked --release --no-default-features \
+  --features stub-object-attributes \
   --target x86_64-unknown-linux-musl --bin p11scope
 sudo install -m 0755 target/x86_64-unknown-linux-musl/release/p11scope /usr/local/bin/
 ```
@@ -297,14 +313,18 @@ The previous unvalidated parameter/template decoders still exist, but only
 behind **both** an off-by-default Cargo feature and an explicit
 `--unsafe-unvalidated-metadata` flag; the flag alone cannot enable code that is
 absent from the shipped eBPF object, and `metrics` mode refuses it outright.
-The official release artifact is built `--no-default-features`, so packaging
-fails if the unsafe path is reachable at all.
+The official builder selects `--no-default-features --features
+stub-object-attributes` for P0; packaging fails if the unsafe path is reachable.
 
 The field-by-field inventory is
 [docs/privacy/allowlist-v1.md](docs/privacy/allowlist-v1.md), extended by
 [docs/privacy/allowlist-v2.md](docs/privacy/allowlist-v2.md) (interface
 selection, attach mechanism, descendant rebuild, task-uprobe loss and ABI
-refusal evidence). It is backed by a secret-canary suite (`scripts/verify-canaries.sh`) that plants sentinel PINs,
+refusal evidence). Separately marked reviewed sections of
+[allowlist v3](docs/privacy/allowlist-v3.md) cover presentation, caller metadata
+and the internal FULL object producer; its remaining proposals grant no capture
+authority or public object projection. The boundary is backed by a secret-canary
+suite (`scripts/verify-canaries.sh`) that plants sentinel PINs,
 key material, and buffer contents in a real workload and scans every output
 artifact and every observer-owned BPF map for leaks — including hostile-alias
 lanes, secret/unterminated/hostile-alias `C_GetInterface` names, and the

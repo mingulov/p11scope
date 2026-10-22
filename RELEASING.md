@@ -1,9 +1,15 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Releasing p11scope
 
-The owner's runbook for tagging a release, written for v0.1.0 and current
-through the v0.4.0 candidate. The release
-build uses network access and pins its source dependencies (lockfiles, the
+The owner's runbook for a fully packaged release. The published
+[v0.4.0 tag](https://github.com/mingulov/p11scope/tree/v0.4.0) is an intermediate
+source checkpoint with explicit P0 selection, no new binary assets and open
+installed/package acceptance; it does not claim completion of this runbook.
+The versioned examples below use the current `0.4.0` manifest spelling. For a
+new release, choose an unpublished version and fresh output paths; do not
+recreate or move the existing v0.4.0 tag.
+
+The release build uses network access and pins its source dependencies (lockfiles, the
 `pkcs11-components` Git revision and hash-pinned patched crates), Rust
 toolchains and digest-pinned build images. The builder records the effective host
 tools and source tree in its receipt. Binary byte reproducibility has not been
@@ -11,10 +17,14 @@ established by independent builds. A full offline source export is an optional
 capability, described in [docs/build-offline.md](docs/build-offline.md); the
 attached source export uses network access for remaining dependencies.
 
-Run the steps in order. The release receipt binds the tree of `HEAD`. Finish
-every tracked file before the final hosted CI run, qualification and artifact
-build. Any later source or documentation change creates a new candidate and
-requires the affected gates to run again on that new revision.
+Run the steps in order when assembling the final candidate. During development,
+use focused regression checks per fix and affected checks at coherent integration
+checkpoints; complete candidate gates follow convergence. The release receipt
+binds the tree of `HEAD`. Finish tracked edits before final hosted CI and artifact
+publication. Later edits invalidate affected checks and any whole-tree package
+bindings; reconcile those on the final revision. Keep earlier functional results
+labelled with their actual revision rather than restarting unrelated checks or
+describing an old CI run as an exact-new-commit result.
 
 ## Version and schema-identifier rules
 
@@ -42,8 +52,9 @@ requires the affected gates to run again on that new revision.
 
 ## 1. Freeze the candidate
 
-- Merge the release work to `main` and check out the exact commit to tag.
-  A release branch can stage and test the candidate first. When `main` is
+- Integrate release work into `main` with cherry-picks or a fast-forward and
+  check out the exact commit to tag. A release branch can stage and test the
+  candidate first. When `main` is
   an ancestor of that branch, use a fast-forward to preserve the candidate
   commit. A merge commit, squash, rebase or history rewrite changes its
   identity; reconcile source-bound receipts and run the affected gates on
@@ -150,13 +161,21 @@ Then dispatch `ci` manually on the same ref (Actions → ci → Run workflow,
 `release_preview` selected). The job rebuilds the musl observer, builds the
 observer/holder container images (with hadolint and kubeconform checks over
 `deploy/`), runs the official builder receipt, and assembles the notices,
-source export and public candidate. Keep the `release-preview-public-assets`
-artifact (30 days) and the separately labeled container SBOM
-(`sbom-observer-container-preview`), which describes the preview container
-image, not the official release bytes. The full release receipt remains
-on the hosted runner only during verification; retain the full local builder
-receipt privately. Actions logs contain a small status, source identity, tree
-and digest-checker summary; record their run URL and result.
+source export and public candidate. The `release-preview-public-assets`
+artifact has 30-day retention. The separately labeled container SBOM
+(`sbom-observer-container-preview`) describes the preview container image,
+not the official release bytes. Keep the local builder receipt while packaging,
+verification or active debugging needs it; this does not require a permanent
+private archive. The full hosted receipt remains on the runner only during
+verification. Actions logs contain a small status, source identity, tree and
+digest-checker summary; record their run URL and result.
+
+The current preview workflow still names its source-export input
+`p11scope-0.3.0-source.tar.gz`, independently of the manifest version. The
+packager validates the archive's recorded revision and derives the public
+source filename from the manifests. Inspect the actual output `RELEASE.json`
+and `SHA256SUMS`; the preview input filename is not version evidence. Workflow
+filename cleanup remains open.
 `privileged-e2e` needs a `[self-hosted, bpf]` runner; select it only if one
 exists. Record the run URLs and exact source SHA for the release notes. A job
 judged environmental (a flaky coverage run, for example) is an explicit,
@@ -176,12 +195,15 @@ frozen commit: the release-matrix lanes
 (`scripts/qualify-release-matrix.sh`, seven lanes — 5.15.221, 6.1.188,
 6.6.157, Ubuntu 6.8.0-142-generic, 6.12.111, 7.2.6 and the host; see
 [docs/qualification/release-matrix.md](docs/qualification/release-matrix.md)),
-privacy canaries, container lanes and overhead re-bench. Start with a plan,
-then qualify from prebuilt bytes when they exist:
+privacy canaries, container lanes and overhead re-bench. Start with a plan.
+For prebuilt execution, set `candidate_sha`, `bin_dir` and `candidate_receipt`
+to the selected commit, binary directory and its actual build-produced receipt;
+guest storage/account prerequisites are described in the matrix guide:
 
 ```sh
 scripts/qualify-release-matrix.sh --dry-run
-scripts/qualify-release-matrix.sh --rev <candidate-SHA> --bin-dir <bin-dir>
+scripts/qualify-release-matrix.sh --rev "$candidate_sha" --bin-dir "$bin_dir" \
+  --candidate-receipt "$candidate_receipt"
 ```
 
 Record exact commands, source SHA, kernels, lanes, pass and skip counts,
@@ -190,17 +212,25 @@ that source, not the packaged bytes. After step 5, run every artifact-specific
 qualification claimed in the release notes against the official `work/dist/`
 binaries and record their hashes. Do not promote earlier candidate runs to
 final tagged-artifact qualification. A fix found here invalidates the affected
-results; go back to step 1.
+results. Select the updated candidate, repeat the affected qualification and
+reconcile its build/package bindings before the final candidate gates; do not
+restart unrelated qualification for every fix.
 
 ## 5. Build the release artifacts
 
 `scripts/build-release.sh` is the only path to the official bytes. It builds
-the safe-only static observer (`--no-default-features`, musl, `+crt-static`,
-build-host paths remapped), builds the discover helper for glibc and musl in
-digest-pinned containers, and runs the canary, attach and hostile-target
+the P0 static observer (`--no-default-features --features stub-object-attributes`,
+musl, `+crt-static`, build-host paths remapped), builds the discover helper for
+glibc and musl in digest-pinned containers, and runs the canary, attach and hostile-target
 smokes against the packaged binaries. The helper lane
 (`scripts/verify-discover-containers.sh`) pins `rust:1.98.1-bookworm`,
 `rust:1.98.1-alpine3.22` and the `ubuntu:noble-20260810` run image by digest.
+
+Ordinary source builds default to FULL; `--no-default-features` alone does not
+select P0. The current packager still writes `p11scope_features: []` in
+`RELEASE.json`, so that field alone does not establish capture mode. Report
+the actual builder feature selection and the runtime object-capture disclosure;
+this release metadata correctness gap remains open.
 
 Requirements: a non-root user with passwordless `sudo` (`sudo -n true` must
 succeed), a working Docker daemon, SoftHSM2 at
@@ -260,8 +290,10 @@ scripts/build-release.sh /var/tmp/p11scope-release/v0.4.0
 The body prints `=== build-release: ALL OK ===` before the finalizer runs.
 Accept the build only when the script exits zero, the receipt's `status` file
 contains `0`, and `facts.log` records `terminal_status` and `checker_status`
-as `0`. The marker alone is not a success verdict. Keep the whole evidence
-root: `facts.log`, `stdout.log`, `stderr.log` and `artifacts/` are the receipt.
+as `0`. The marker alone is not a success verdict. `facts.log`, `stdout.log`,
+`stderr.log` and `artifacts/` form the builder receipt; keep it intact through
+packaging and verification. Completed build caches and temporary full logs do
+not require permanent retention once active work no longer needs them.
 The binaries are in `work/dist/`: `p11scope` (static musl observer),
 `p11scope-discover-glibc`, `p11scope-discover-musl`, and `p11scope-discover`
 (a copy of the glibc helper). The duplicate is for the smoke lane; package
@@ -390,7 +422,8 @@ tar --same-permissions --no-same-owner -xzf \
   cd "$source_recipient/p11scope-source"
   python3 -I scripts/prepare-dependencies.py --offline
   mise exec -- ./scripts/cargo.sh +1.98.1 build --locked --release \
-    --no-default-features --target x86_64-unknown-linux-musl --bin p11scope
+    --no-default-features --features stub-object-attributes \
+    --target x86_64-unknown-linux-musl --bin p11scope
 )
 ```
 
@@ -425,6 +458,8 @@ On the commit that steps 3–6 ran on:
 
 ## After the tag
 
-- Keep the evidence root from step 5 with the release records.
+- Record concise source, CI, package and qualification results and unresolved
+  limits. Retain private builder inputs and logs while active work needs them;
+  preserve the licenses, notices and public provenance distributed with assets.
 - Start the next `## [Unreleased]` section in `CHANGELOG.md` only when the
   next change lands.

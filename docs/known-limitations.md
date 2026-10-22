@@ -1,24 +1,31 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Known limitations (v0.4.0)
 
-v0.4.0 ships P0-only release bytes: object-attribute capture is not enabled
-(no BPF program reads object attributes). Every profile, metrics and trace
+v0.4.0 is an intermediate source checkpoint with no new binary bundles.
+Its selected P0 build requires `--no-default-features --features
+stub-object-attributes`: object-attribute capture is not enabled
+(no BPF program reads object attributes). An ordinary source build defaults
+to FULL; `--no-default-features` alone does not select P0.
+In P0, every profile, metrics and trace
 document discloses this as structured evidence
 (`evidence.object_capture.available: false`, `reason: "not_enabled"`), and
-`p11scope doctor` names it in its `object-attribute capture` row. Counts,
-mechanisms and all other P0 facts are exact; only attribute semantics are
-withheld. FULL capture returns in v0.5.0 after E5 qualification.
+`p11scope doctor` names it in its `object-attribute capture` row. P0 retains
+bounded call/count/mechanism evidence; loss and completeness disclosures still
+apply. FULL and broader installed/package qualification remain open.
 
 The G21 FULL-capture wrap legs (660 rounds in 900s, pid + system) are not
-qualified in v0.4.0: FULL is absent from the release bytes, and the legs
-also exceed their time budget on current throughput (correctness of the
+qualified in v0.4.0: FULL is absent from the selected P0 build, and earlier legs
+exceeded their time budget (correctness of the
 wrap accounting proven through 169 fenced rounds pre-split; throughput
-red at ~2.3 s/round vs 1.36 s needed). Owner waiver recorded with expiry
-at v0.5.0, when T/U throughput work, the shared-oracle rework and green
-legs land.
+red at ~2.3 s/round vs 1.36 s needed). These are historical scoped results.
+The T/U throughput work, shared-oracle rework and required green legs remain
+acceptance work; smaller focused checks do not qualify those legs.
 
-The T9-full schema campaign is deferred to v0.5.0; v0.4.0 carries the v1
-schema family unchanged plus shipped-contract consumer checks.
+The full schema/consumer campaign remains open. Current exact identifiers
+include `p11scope/observed-profile/v3`, `p11scope/observed-profile/v3-metrics`
+and the inventory v1 family; see the
+[schema-identifier rules](../RELEASING.md#version-and-schema-identifier-rules).
+Their version spellings grant no cross-schema compatibility.
 
 ## Prior releases
 

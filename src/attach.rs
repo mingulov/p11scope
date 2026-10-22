@@ -45,6 +45,7 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
 
+mod counter_generation;
 pub(crate) mod detailed_identity;
 mod ended_pid_retirement;
 mod global_retirement;
@@ -1303,6 +1304,9 @@ pub struct Session {
     /// so a session that never reached its loop reports no attach time —
     /// never 0, never an estimate.
     attach_mono_ns: Option<u64>,
+    /// Reserved once before BPF preparation, in process-local allocation order.
+    /// Collection identity only; this grants no capture or lifetime authority.
+    counter_collection_generation: NonZeroU64,
     successful_static: BTreeSet<StaticEndpoint>,
     dynamic_attach_evidence: DynamicAttachEvidence,
     policy: CapturePolicy,
@@ -4579,6 +4583,11 @@ impl Session {
         self.policy
     }
 
+    #[allow(dead_code)] // Staged for the Session-bound complete counter reader.
+    pub(crate) const fn counter_collection_generation(&self) -> NonZeroU64 {
+        self.counter_collection_generation
+    }
+
     /// The session's stop-gate mapping.
     pub(crate) fn stop_gate(&self) -> &StopGate {
         &self.stop_gate
@@ -4919,6 +4928,7 @@ impl Session {
         if policy.uses_unsafe_decoders() && !cfg!(feature = "unsafe-unvalidated-metadata") {
             bail!("unsafe-unvalidated-metadata policy is absent from this eBPF object");
         }
+        let counter_collection_generation = counter_generation::allocate()?;
         // `--ring-bytes` resizes the EVENTS ringbuf at load (aya rounds to a
         // page-sized power of two like libbpf); omission resolves to the
         // baked-in default, which is a no-op override of the ELF value.
@@ -5158,6 +5168,7 @@ impl Session {
                 producers_detached: false,
                 detach_wall_ms: 0,
                 attach_mono_ns: None,
+                counter_collection_generation,
                 successful_static: BTreeSet::new(),
                 dynamic_attach_evidence: DynamicAttachEvidence::default(),
                 policy,

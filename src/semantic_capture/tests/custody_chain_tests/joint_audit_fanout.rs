@@ -3275,6 +3275,8 @@ fn joint_zero_head_pending_h3_requires_original_continuation_and_keeps_fault_pre
             .admissions()
             .cloned()
             .collect::<Vec<_>>();
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0].h0_ordinal(), 2);
         let current = coordinator.take_prepared_current_for_birth_test().unwrap();
         let raw = fixture
             .scene
@@ -3299,19 +3301,21 @@ fn joint_zero_head_pending_h3_requires_original_continuation_and_keeps_fault_pre
         {
             let owner = coordinator.joint_capture();
             assert_eq!(owner.adapter().retained_starts_for_test(), starts);
-            assert!(
-                !changed_fault,
-                "actual q2 pending-original claim: ordinal={ordinal}, proof={proof:?}, claims={:?}, roles={:?}",
-                owner.adapter().invocation_claims_for_test(),
-                owner.ledger().roles_for_test(),
-            );
             assert_eq!(ordinal, 2);
-            q2_proof = Some(proof.unwrap());
+            let proof = proof.expect("the same retained original claims before audit");
+            assert_eq!(
+                owner.adapter().invocation_claims_for_test(),
+                (1, vec![(2, proof)])
+            );
+            assert_eq!(owner.ledger().roles_for_test()[..4], [0, 1, 0, 0]);
+            assert!(q2_proof.replace(proof).is_none());
         }
+        let proof = q2_proof.expect("the original is claimed exactly once in either arm");
         while coordinator.stage_next_prepared_admission() {}
         assert!(coordinator.finish_prepared_semantic_batch(&fixture.scene.real.lane));
-        if let Some(proof) = q2_proof {
-            assert_eq!(admitted.len(), 1);
+        // A retained claim corroborates the original before the collection
+        // audit. Only the healthy arm may establish birth and a Joint feed.
+        if !changed_fault {
             let original_new = current
                 .into_iter()
                 .find(|receipt| receipt.image() == image)
@@ -3325,11 +3329,55 @@ fn joint_zero_head_pending_h3_requires_original_continuation_and_keeps_fault_pre
             .coordinator
             .commit_batch_with_semantics(false, Some(&mut fixture.scene.real.lane))
             .unwrap();
+        assert_eq!(
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .joint_capture()
+                .adapter()
+                .fault_baseline_for_test(),
+            Some(0),
+            "claiming and staging never forgive the original native prefix"
+        );
+        let before_audit = fixture.feeds();
         let mut q2 = acquire(&mut fixture.scene, ingested, &fixture.attached, &fault);
         if changed_fault {
             assert_eq!(
                 q2.failure_for_test().unwrap().gap,
                 crate::semantics_objects::journal::JournalGap::FaultChanged
+            );
+            assert!(fixture.births.is_empty());
+            assert_eq!(
+                fixture
+                    .scene
+                    .real
+                    .scene
+                    .coordinator
+                    .registry()
+                    .joint_feed_targets()
+                    .count(),
+                0
+            );
+            assert_eq!(fixture.feeds(), before_audit);
+            assert_eq!(
+                fixture
+                    .scene
+                    .real
+                    .scene
+                    .coordinator
+                    .reference_h3_audit_state(),
+                (2, false)
+            );
+            assert_eq!(
+                fixture
+                    .scene
+                    .real
+                    .scene
+                    .coordinator
+                    .reference_h3_acknowledged_below(),
+                0
             );
             continue;
         }

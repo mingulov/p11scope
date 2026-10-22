@@ -1820,30 +1820,57 @@ mod tests {
         // C1: production closure mints from the mmapable attach cell
         // (the cell BPF stamps into exec records), never the interim
         // userspace counter. The CAS core mints 1, 2, ... from zero
-        // and races exactly under contention.
+        // and never invents a generation under contention. Eight failed CAS
+        // attempts may refuse; a caller must not assume every mint succeeds.
         use std::sync::atomic::{AtomicU64, Ordering};
         let cell = AtomicU64::new(0);
         assert_eq!(super::mint_attach_cell(&cell).unwrap(), 1);
         assert_eq!(super::mint_attach_cell(&cell).unwrap(), 2);
         assert_eq!(cell.load(Ordering::SeqCst), 2);
+        let exhausted = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(super::mint_attach_cell(&exhausted).unwrap(), u64::MAX);
+        for _ in 0..2 {
+            assert_eq!(
+                super::mint_attach_cell(&exhausted).unwrap_err().to_string(),
+                "attach generation exhausted"
+            );
+            assert_eq!(exhausted.load(Ordering::SeqCst), u64::MAX);
+        }
         let cell = std::sync::Arc::new(AtomicU64::new(0));
+        let start = std::sync::Arc::new(std::sync::Barrier::new(4));
         let mut handles = Vec::new();
         for _ in 0..4 {
             let shared = cell.clone();
+            let start = start.clone();
             handles.push(std::thread::spawn(move || {
                 let mut minted = Vec::new();
+                let mut refused = 0;
+                start.wait();
                 for _ in 0..250 {
-                    minted.push(super::mint_attach_cell(&shared).unwrap());
+                    match super::mint_attach_cell(&shared) {
+                        Ok(generation) => minted.push(generation),
+                        Err(error) => {
+                            assert_eq!(error.to_string(), "attach generation contention");
+                            refused += 1;
+                        }
+                    }
                 }
-                minted
+                assert!(minted.windows(2).all(|pair| pair[0] < pair[1]));
+                (minted, refused)
             }));
         }
         let mut all = Vec::new();
+        let mut refused = 0;
         for handle in handles {
-            all.extend(handle.join().unwrap());
+            let (minted, refusals) = handle.join().unwrap();
+            all.extend(minted);
+            refused += refusals;
         }
+        assert!(!all.is_empty());
+        assert_eq!(all.len() + refused, 1000);
         all.sort_unstable();
-        assert_eq!(all, (1..=1000).collect::<Vec<_>>());
+        assert_eq!(all, (1..=all.len() as u64).collect::<Vec<_>>());
+        assert_eq!(cell.load(Ordering::SeqCst), all.len() as u64);
     }
 
     #[test]

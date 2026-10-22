@@ -1081,6 +1081,41 @@ class MatrixContract(unittest.TestCase):
                 self.assertFalse((self.base / "must not create output").exists())
                 self.assertFalse((self.base / "must not create stage").exists())
 
+    def test_object_refusal_acquisition_is_exact_and_unknown_sudo_is_refused(self):
+        source = self.base / "external probe source"
+        scripts = source / "scripts"; scripts.mkdir(parents=True)
+        marker = self.base / "uncontrolled acquisition executed"
+        probe = scripts / "dump-owned-bpf-maps.py"
+        probe.write_text(f"from pathlib import Path\nPath({str(marker)!r}).touch()\nraise SystemExit(77)\n")
+        config_path = self.base / "external probe controls.json"
+        value = {"events": str(self.base / "external probe events.jsonl"), "templates": str(self.base),
+                 "source_root": str(source), "work_root": str(self.base / "caller probe work"), "failure": ""}
+        config_path.write_text(json.dumps(value))
+        sudo = self.base / "sudo"
+        sudo.write_text("#!" + sys.executable + "\n" + OBJECT_EXTERNALS); sudo.chmod(0o755)
+        env = os.environ.copy(); env["P11SCOPE_OBJECT_CONTROL"] = str(config_path)
+        def run(*arguments):
+            return subprocess.run([str(sudo), *arguments], cwd=source, env=env, text=True,
+                                  capture_output=True, timeout=5)
+        result = run("python3", "-I", "scripts/dump-owned-bpf-maps.py", "--refusal-probe")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("controlled refusal acquisition exit=0", result.stdout)
+        self.assertNotIn("ENOTSUPP=524: OK", result.stdout)
+        self.assertFalse(marker.exists(), "fixture executed the uncontrolled acquisition")
+        value["failure"] = "refusal"; config_path.write_text(json.dumps(value))
+        refused = run("-n", "python3", "-I", str(probe), "--refusal-probe")
+        self.assertEqual(refused.returncode, 42, refused.stdout + refused.stderr)
+        self.assertFalse(marker.exists())
+        for arguments in (("/bin/true",), ("python3", "-I", str(probe), "--refusal-probe", "extra"),
+                          ("python3", "-I", str(probe), "--unknown"),
+                          ("chown", "0:0", str(self.base / "outside")),
+                          ("python3", "-I", str(ROOT / "scripts/dump-owned-bpf-maps.py"), "--refusal-probe")):
+            with self.subTest(arguments=arguments):
+                result = run(*arguments)
+                self.assertEqual(result.returncode, 94, result.stdout + result.stderr)
+                self.assertIn("unknown external sudo operation", result.stderr)
+        self.assertFalse(marker.exists())
+
     def test_guest_root_verifies_bound_caller_owned_object_inputs(self):
         bundle, facts = self.canary_inputs()
         stage = self.base / "caller owned guest inputs"
@@ -1658,15 +1693,44 @@ if kind == "runuser":
     record({"kind": "runuser", "argv": args, "real_uid": os.getuid()})
     os.execvp(args[3], args[3:])
 assert kind == "sudo", kind
-if args[0] == "-n": args.pop(0)
-if args[0] == "chown": raise SystemExit(0)  # already owned by the real caller
-for index, value in enumerate(args):
-    if pathlib.Path(value).name == "capture-stopped-canary.py":
-        os.execv(sys.executable, [sys.executable, str(pathlib.Path(config["templates"]) / "acquire.py"), *args[index+1:]])
-    if pathlib.Path(value).name == "lane-lib-oracle-1.py":
-        record({"kind": "signal", "signal": args[index+1], "pid": int(args[index+2]),
-                "real_uid": os.getuid(), "helper": value})
-os.execvp(args[0], args)
+def unknown():
+    print("unknown external sudo operation", file=sys.stderr)
+    raise SystemExit(94)
+if args[:1] == ["-n"]: args.pop(0)
+if args == ["true"]: raise SystemExit(0)
+if args[:1] == ["chown"]:
+    root = pathlib.Path(config["work_root"])
+    if (len(args) >= 3 and args[1] == f"{os.getuid()}:{os.getgid()}"
+            and all(pathlib.Path(value).is_absolute() and ".." not in pathlib.Path(value).parts
+                    and pathlib.Path(value).is_relative_to(root) for value in args[2:])):
+        raise SystemExit(0)  # fixture outputs already belong to the real caller
+    unknown()
+if len(args) < 3 or args[0] not in ("python3", sys.executable) or args[1] != "-I": unknown()
+script, body = pathlib.Path(args[2]), args[3:]
+source = pathlib.Path(config["source_root"])
+if script.resolve() != source / "scripts" / script.name: unknown()
+if script.name == "dump-owned-bpf-maps.py" and body == ["--refusal-probe"]:
+    status = 42 if config["failure"] == "refusal" else 0
+    record({"kind": "refusal_acquisition", "exit": status})
+    print(f"controlled refusal acquisition exit={status}; no kernel probe executed")
+    raise SystemExit(status)
+if script.name == "capture-stopped-canary.py":
+    flags = {"--object-attributes", "--lane", "--variant", "--mode", "--privacy", "--target-bits",
+             "--workload-mode", "--workload-pid", "--generation", "--out-dir", "--prefix", "--ready",
+             "--go", "--done", "--finish", "--observer-log", "--workload-log", "--reader", "--obj"}
+    if body.count("--") != 1: unknown()
+    front = body[:body.index("--")]
+    if len(front) != 2 * len(flags) or set(front[::2]) != flags: unknown()
+    os.execv(sys.executable, [sys.executable, str(pathlib.Path(config["templates"]) / "acquire.py"), *body])
+if script.name == "check-canary-evidence.py":
+    if (len(body) != 10 or body[0] != "--object-attributes" or body[1] not in ("present", "absent")
+            or body[2] != "--object-starts" or body[-1] not in ("32", "64")): unknown()
+    os.execv(sys.executable, [sys.executable, "-I", str(script), *body])
+if script.name == "lane-lib-oracle-1.py":
+    if len(body) not in (3, 4) or body[0] not in ("TERM", "KILL") or not all(value.isdecimal() for value in body[1:]): unknown()
+    record({"kind": "signal", "signal": body[0], "pid": int(body[1]), "real_uid": os.getuid(), "helper": str(script)})
+    os.execv(sys.executable, [sys.executable, "-I", str(script), *body])
+unknown()
 '''
 
 
@@ -1854,7 +1918,8 @@ int main(int argc, char **argv) {
         self.acquisition_templates(controls)
         events = controls / "events.jsonl"
         config = controls / "control.json"
-        config.write_text(json.dumps({"events": str(events), "templates": str(controls), "failure": ""}))
+        config.write_text(json.dumps({"events": str(events), "templates": str(controls),
+            "source_root": str(stage / "artifacts/source"), "work_root": str(self.base / "caller object work"), "failure": ""}))
         acquire = controls / "acquire.py"
         acquire.write_text(OBJECT_ACQUISITION)
         dispatch = controls / "dispatch.py"

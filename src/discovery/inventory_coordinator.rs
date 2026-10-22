@@ -1020,7 +1020,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         model: &crate::semantics_objects::ObjectSemantics,
     ) -> crate::semantics_key_use::SealApplyOutcome {
         let ledger = self.joint_capture.ledger_mut();
-        self.registry.deliver_joint_seal(id, seal, model, ledger)
+        self.registry
+            .deliver_joint_algorithm_seal_for_test(id, seal, model, ledger)
     }
 
     /// Stages one scope-level gap (no caller, module or PID) that

@@ -104,7 +104,7 @@ pub(crate) struct JointResourceOrigin {
 }
 
 impl JointResourceOrigin {
-    pub(super) fn invocation(&self) -> JournalNativeKey {
+    pub(crate) fn invocation(&self) -> JournalNativeKey {
         self.invocation
     }
     pub(crate) fn matches_native(&self, native: NativeDomainId) -> bool {
@@ -340,6 +340,18 @@ impl IngestedRaw {
         // The older allocation must still own this exact physical H8 entry.
         admitted.journal_binding().0 == self.raw.producers.native_domain()
             && adapter.matches_retained_admission(admitted)
+    }
+
+    pub(crate) fn retain_s1only_disposition(
+        &self,
+        adapter: &mut JournalAdapter,
+        admitted: &crate::discovery::caller_registry::instance_input::AdmittedInstanceCall,
+    ) -> Result<(), RawQuantumRefusal> {
+        if !self.matches_admission(admitted) && !self.matches_retained_admission(admitted, adapter)
+        {
+            return Err(RawQuantumRefusal::Admission);
+        }
+        adapter.retain_s1only_subject(admitted)
     }
 
     pub(crate) fn validate_owner(

@@ -220,7 +220,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     ) -> crate::semantics_key_use::SealApplyOutcome {
         let (adapter, model) = self.joint_capture.parts();
         self.registry
-            .deliver_joint_seal(id, seal, model, adapter.ledger_mut())
+            .deliver_joint_algorithm_seal_for_test(id, seal, model, adapter.ledger_mut())
     }
 
     /// Take one actual finished collection into immutable audit custody,

@@ -1345,7 +1345,9 @@ fn key_operation_joint_staging_bounds() {
     assert_eq!(joint.calls(), 1);
     assert_eq!(staging.reduced(), 1);
 
-    // --- A multi-call seal refuses loudly; staging stays intact. ---
+    // Legacy scalar algorithm input refuses multicall. The genuine frame
+    // key_operation_joint_batch_replays_exact_order covers production batching
+    // with its original actual-End steps and shared bounded work cursor.
     let mut scene = JointScene::new();
     let bootstrap = scene.bootstrap();
     let mut staging = JointStaging::select_joint(Some(&bootstrap));
@@ -5173,7 +5175,7 @@ fn key_operation_c2_foreign_namespace_registry_delivery_keeps_projection() {
         } else {
             let seal = foreign.seal().expect("foreign call seals");
             assert_eq!(
-                own.registry.deliver_joint_seal(
+                own.registry.deliver_joint_algorithm_seal_for_test(
                     id,
                     &seal,
                     &foreign.model,
@@ -5205,7 +5207,7 @@ fn key_operation_c2_foreign_namespace_registry_delivery_keeps_projection() {
             .seal()
             .expect("own queued terminal remains healthy");
         assert_eq!(
-            own.registry.deliver_joint_seal(
+            own.registry.deliver_joint_algorithm_seal_for_test(
                 id,
                 &seal,
                 &own.scene.model,
@@ -6736,7 +6738,7 @@ fn key_operation_g29_delivery_equivalence_matrix() {
         ingest_call(&mut guarded.scene, shape, position);
         let seal = guarded.scene.seal().expect("quantum seals");
         assert_eq!(
-            guarded.registry.deliver_joint_seal(
+            guarded.registry.deliver_joint_algorithm_seal_for_test(
                 joint_id,
                 &seal,
                 &guarded.scene.model,
@@ -9142,7 +9144,7 @@ impl GuardedScene {
         ingest_call(&mut self.scene, shape, position);
         let seal = self.scene.seal().expect("quantum seals");
         assert_eq!(seal.prefix.settled().len(), 1, "{}", shape.name);
-        self.registry.deliver_joint_seal(
+        self.registry.deliver_joint_algorithm_seal_for_test(
             id,
             &seal,
             &self.scene.model,
@@ -9280,7 +9282,7 @@ fn key_operation_joint_staging_charges_shared_ledger() {
     ingest_call(&mut guarded.scene, &init, init_position);
     let seal = guarded.scene.seal().expect("init quantum seals");
     assert_eq!(
-        guarded.registry.deliver_joint_seal(
+        guarded.registry.deliver_joint_algorithm_seal_for_test(
             joint_id,
             &seal,
             &guarded.scene.model,
@@ -9378,7 +9380,7 @@ fn key_operation_joint_seal_delivery_replays_and_populates_capture() {
             .publish_with_ledger(guarded.scene.adapter.ledger_mut());
         ingest_call(&mut guarded.scene, shape, position);
         let seal = guarded.scene.seal().expect("single-call quantum seals");
-        let outcome = guarded.registry.deliver_joint_seal(
+        let outcome = guarded.registry.deliver_joint_algorithm_seal_for_test(
             joint_id,
             &seal,
             &guarded.scene.model,
@@ -9425,7 +9427,7 @@ fn key_operation_joint_seal_delivery_replays_and_populates_capture() {
     // Unknown instances hold without effect.
     let last_seal = last_seal.expect("four quanta sealed");
     assert_eq!(
-        guarded.registry.deliver_joint_seal(
+        guarded.registry.deliver_joint_algorithm_seal_for_test(
             RegistryInstanceId::from_raw(99),
             &last_seal,
             &guarded.scene.model,
@@ -9570,7 +9572,7 @@ fn key_operation_n14_joint_replay_reserves_resources() {
     ingest_call(&mut guarded.scene, &shape, position);
     let seal = guarded.scene.seal().expect("init quantum seals");
     let before = guarded.registry.semantic_resource_snapshot().charged_bytes;
-    let outcome = guarded.registry.deliver_joint_seal(
+    let outcome = guarded.registry.deliver_joint_algorithm_seal_for_test(
         joint_id,
         &seal,
         &guarded.scene.model,
@@ -9610,7 +9612,7 @@ fn key_operation_n14_small_budget_refuses_n_plus_one() {
         let seal = probe.scene.seal().expect("probe quantum seals");
         let before = probe.registry.semantic_resource_snapshot().charged_bytes;
         assert_eq!(
-            probe.registry.deliver_joint_seal(
+            probe.registry.deliver_joint_algorithm_seal_for_test(
                 id,
                 &seal,
                 &probe.scene.model,
@@ -9747,7 +9749,7 @@ fn key_operation_n14_fallback_replay_reserves_and_disposes_on_refusal() {
         let seal = probe.scene.seal().expect("probe quantum seals");
         let before = probe.registry.semantic_resource_snapshot().charged_bytes;
         assert_eq!(
-            probe.registry.deliver_joint_seal(
+            probe.registry.deliver_joint_algorithm_seal_for_test(
                 id,
                 &seal,
                 &probe.scene.model,
@@ -9992,8 +9994,12 @@ fn first_fallback_accounting(capacity: bool, invalidate: bool, retire: bool) {
         ingest_call(&mut g.scene, &init, init_position);
         let seal = g.scene.seal().expect("the delayed original Init seals");
         assert_eq!(
-            g.registry
-                .deliver_joint_seal(id, &seal, &g.scene.model, g.scene.adapter.ledger_mut()),
+            g.registry.deliver_joint_algorithm_seal_for_test(
+                id,
+                &seal,
+                &g.scene.model,
+                g.scene.adapter.ledger_mut()
+            ),
             SealApplyOutcome::Held
         );
         assert!(g.registry.keyuse_for_test().open().is_empty());
@@ -10224,7 +10230,7 @@ fn key_operation_c4_full_fallback_preserves_order() {
     ingest_call(&mut guarded.scene, &init, init_pos);
     let seal = guarded.scene.seal().expect("init quantum seals");
     assert_eq!(
-        guarded.registry.deliver_joint_seal(
+        guarded.registry.deliver_joint_algorithm_seal_for_test(
             joint_id,
             &seal,
             &guarded.scene.model,
@@ -10482,7 +10488,7 @@ fn key_operation_c4_missing_ledger_falls_back_in_order() {
         .seal()
         .expect("foreign namespace seals its own input");
     assert_eq!(
-        guarded.registry.deliver_joint_seal(
+        guarded.registry.deliver_joint_algorithm_seal_for_test(
             joint_id,
             &foreign_seal,
             &foreign.model,
@@ -10525,7 +10531,7 @@ fn key_operation_c4_missing_ledger_falls_back_in_order() {
     ingest_call(&mut guarded.scene, &init, init_pos);
     let seal = guarded.scene.seal().expect("init quantum seals");
     assert_eq!(
-        guarded.registry.deliver_joint_seal(
+        guarded.registry.deliver_joint_algorithm_seal_for_test(
             joint_id,
             &seal,
             &guarded.scene.model,
@@ -10686,7 +10692,7 @@ fn key_operation_c5_loss_disposes_staged_and_bars_late_delivery() {
     ingest_call(&mut guarded.scene, &init, staged_at);
     let seal = guarded.scene.seal().expect("init quantum seals");
     assert_eq!(
-        guarded.registry.deliver_joint_seal(
+        guarded.registry.deliver_joint_algorithm_seal_for_test(
             joint_id,
             &seal,
             &guarded.scene.model,
@@ -10849,7 +10855,7 @@ fn key_operation_c5_above_barrier_survives_and_retirement_disposes() {
     ingest_call(&mut guarded.scene, &init_a, pos_a);
     let seal_a = guarded.scene.seal().expect("A quantum seals");
     assert_eq!(
-        guarded.registry.deliver_joint_seal(
+        guarded.registry.deliver_joint_algorithm_seal_for_test(
             joint_id,
             &seal_a,
             &guarded.scene.model,
@@ -10861,7 +10867,7 @@ fn key_operation_c5_above_barrier_survives_and_retirement_disposes() {
     ingest_call(&mut guarded.scene, &init_b, pos_b);
     let seal_b = guarded.scene.seal().expect("B quantum seals");
     assert_eq!(
-        guarded.registry.deliver_joint_seal(
+        guarded.registry.deliver_joint_algorithm_seal_for_test(
             joint_id,
             &seal_b,
             &guarded.scene.model,
@@ -10900,7 +10906,7 @@ fn key_operation_c5_above_barrier_survives_and_retirement_disposes() {
     ingest_call(&mut guarded.scene, &init_a, pos_c);
     let seal_c = guarded.scene.seal().expect("C quantum seals");
     assert_eq!(
-        guarded.registry.deliver_joint_seal(
+        guarded.registry.deliver_joint_algorithm_seal_for_test(
             joint_id,
             &seal_c,
             &guarded.scene.model,

@@ -763,12 +763,14 @@ fn native_semantic_resource_final_types_pinned() {
     use crate::semantics_objects::journal::joint_driver::CollectedCallOrigin;
     pin!(CollectedCallOrigin, 24);
     pin!(Option<CollectedCallOrigin>, 32);
-    // The existing H8 OpenEntry retains that same opaque original inline
-    // across a genuine H3-pending continuation. Its per-open ledger charge
-    // uses size_of::<OpenEntry>(); population and pool caps stay fixed.
+    // The H8 OpenEntry retains that opaque original across H3 continuation.
+    // Task4 adds an optional exact S1Only subject: JournalDomainKey is40 B
+    // (four u64s, one u32 and padding), and its Option is48 B. The per-open
+    // ledger charge uses the complete size_of::<OpenEntry>(), including
+    // padding; population and pool caps stay fixed.
     let open_bytes = crate::semantics_objects::journal::JournalAdapter::open_entry_size_for_test();
-    if open_bytes != 1160 {
-        mismatches.push(("journal::OpenEntry", open_bytes, 1160));
+    if open_bytes != 1160 + 48 {
+        mismatches.push(("journal::OpenEntry", open_bytes, 1160 + 48));
     }
     pin!(
         crate::semantic_capture::TickOutcome,

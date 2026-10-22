@@ -10,14 +10,11 @@
 //! directly and never stages. An S1Only incarnation never becomes
 //! Joint, and an already-reduced call is never replayed.
 //!
-//! Correlation is exact single-quantum: H8 conversion skips blocked
-//! entries (a seal's settled set is not a prefix of staged calls),
-//! and [`SealedObjectPrefix`] carries no per-call H3 identity, so a
-//! seal settling anything but exactly the staged head refuses the
-//! quantum loudly. Multi-call batching needs an explicit H8
-//! correlation enrichment (carry); production live-loop Joint routing
-//! (session-owned adapter/model plumbing) is likewise a carry — the
-//! registry reduces S1Only until that wiring lands.
+//! The original seal retains call-qualified settlement steps and frozen
+//! effect spans. Effect emission and the exact admission head advance
+//! independently under one bounded budget; only an actual End permits S1
+//! replay. Actual bounded loss permits history disposal. The ordinary
+//! Session Joint lane remains gated on assembled runtime acceptance.
 
 use crate::discovery::caller_registry::instance_input::RegistryInstanceId;
 use crate::key_operation_projection::KEY_OP_ROW_CAPACITY;
@@ -82,8 +79,8 @@ pub(crate) enum SealApplyOutcome {
     /// terminally bounded); it replayed once through the reducer.
     ReplayedOne,
     /// Nothing replayed: the seal settled zero calls, the head's
-    /// terminal is still open, the quantum needs batching H9 does not
-    /// run, or the feed already left Joint. Staging is intact.
+    /// terminal is still open, the legacy algorithm input is multicall,
+    /// or the feed already left Joint. Staging is intact.
     Held,
     /// The seal settled exactly the staged head, but H3's resource
     /// pool refused the S1 growth (N14): live S1 invalidated with
@@ -91,6 +88,22 @@ pub(crate) enum SealApplyOutcome {
     /// history, the claim consumed. The feed stays Joint: later seals
     /// may still replay once budget frees.
     ResourceRefused,
+}
+
+/// Progress within the SAME retained original result and service budget.
+/// Counts describe this slice; the feed's frontier owns once-only consumption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SealBatchProgress {
+    Complete { replayed: usize, disposed: usize },
+    Yielded { replayed: usize, disposed: usize },
+    Held,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FailureBatchProgress {
+    Complete(FailureApplyOutcome),
+    Yielded,
+    Held,
 }
 
 /// How one seal failure advanced the staging.
@@ -155,6 +168,9 @@ struct StagedCall {
     position: u64,
     resource_native: Option<crate::attach::capture::NativeDomainId>,
     resource_origin: Option<crate::semantics_objects::journal::StagedResourceOrigin>,
+    /// Retained from the actual collected END, never reconstructed from S1
+    /// shape. It lets the owner dispose the exact completed H8 row in O(log N).
+    original_invocation: Option<(u64, u64)>,
 }
 
 impl StagedCall {
@@ -327,6 +343,12 @@ impl JointStaging {
         None
     }
 
+    pub(crate) fn staged_head_original(&self) -> Option<(u64, Option<(u64, u64)>)> {
+        self.staged
+            .front()
+            .map(|head| (head.position, head.original_invocation))
+    }
+
     /// Whether real loss ended this feed's object authority.
     pub(crate) fn degraded_loss(&self) -> bool {
         self.degraded_loss
@@ -412,6 +434,7 @@ impl JointStaging {
             position,
             resource_native: native,
             resource_origin: None,
+            original_invocation: resource.as_ref().map(|origin| origin.invocation()),
         };
         let charged = match native {
             Some(native) => ledger
@@ -449,6 +472,7 @@ impl JointStaging {
     /// refusal disposes the head as history (see
     /// [`SealApplyOutcome::ResourceRefused`]).
     #[allow(clippy::too_many_arguments)] // Staging borrows the exact pipeline facts plus the shared ledger.
+    #[cfg(test)]
     pub(crate) fn apply_seal<S: OperationSink>(
         &mut self,
         seal: &SealSuccess,
@@ -583,36 +607,306 @@ impl JointStaging {
         outcome
     }
 
-    /// Canonical production path: the frame binds the original failure and
-    /// completed H3 to this exact selected domain and capture ledger.
+    /// The real frame supplies original step/index custody. Effect order and
+    /// FIFO admission order are independent: apply each span once, then redeem
+    /// only the exact head's actual End or explicit bounded history loss.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn apply_failure<S: OperationSink>(
+    pub(crate) fn apply_seal_batch<S: OperationSink>(
         &mut self,
-        audited: &crate::semantics_objects::journal::joint_audit::AuditedFailure<'_>,
+        batch: &mut crate::semantics_objects::journal::SealBatchDelivery<'_>,
         model: &ObjectSemantics,
         ledger: &mut crate::semantics_objects::journal::StagingLedger,
         reducer: &mut EdgeSemantics,
         keyuse: &mut KeyUseReducer,
         instance: RegistryInstanceId,
         sink: &mut S,
-        assoc_fallback: Option<&mut crate::semantics_objects::journal::StagingLedger>,
-    ) -> (FailureApplyOutcome, u64) {
+        mut assoc_fallback: Option<&mut crate::semantics_objects::journal::StagingLedger>,
+        remaining: &mut usize,
+    ) -> (SealBatchProgress, u64) {
+        use crate::semantics_objects::journal::SealReplayPhase;
+        if !self.accepts_seal(batch.seal()) || self.mode != FeedMode::Joint {
+            return (SealBatchProgress::Held, 0);
+        }
+        self.flush_pending_releases(ledger);
+        let (mut replayed, mut disposed, mut refused) = (0, 0, 0u64);
+        loop {
+            if self.staged.is_empty() && batch.effects_complete() {
+                return (SealBatchProgress::Complete { replayed, disposed }, refused);
+            }
+            if *remaining == 0 {
+                return (SealBatchProgress::Yielded { replayed, disposed }, refused);
+            }
+            let terminal = self
+                .staged
+                .front()
+                .and_then(|head| batch.ready_terminal(head.position));
+            if let Some(step) = terminal {
+                let seal = batch.seal();
+                let Some(call) = seal.prefix.call_for_step(step) else {
+                    return (SealBatchProgress::Held, refused);
+                };
+                let head = self
+                    .staged
+                    .front()
+                    .expect("ready terminal has a retained head");
+                let exact =
+                    crate::kinds::function_id(&head.facts.function).is_some_and(|function| {
+                        call.matches_head(
+                            function,
+                            head.facts.session,
+                            head.facts.capture,
+                            head.position,
+                        )
+                    });
+                let end = step.phase() == SealReplayPhase::End
+                    && !call.abandoned
+                    && call.end_cut.is_some()
+                    && step.cut() == call.end_cut;
+                let loss = step.phase() == SealReplayPhase::BoundedLoss
+                    && call.abandoned
+                    && call.end_cut.is_none()
+                    && step.cut().is_some();
+                if !exact || (!end && !loss) {
+                    self.correlation_refusals = self.correlation_refusals.saturating_add(1);
+                    return (SealBatchProgress::Held, refused);
+                }
+                // The immutable original span/subject is checked before any
+                // frontier, head, counter, reducer or resource mutation.
+                let Some(effects) = seal.effects_for_step(step) else {
+                    return (SealBatchProgress::Held, refused);
+                };
+                *remaining -= 1;
+                let head = self.staged.pop_front().expect("exact original checked");
+                self.frontier = head.position;
+                if loss {
+                    // An earlier-emitted B loss can wait behind A's actual
+                    // End. Its late exact-head S1 invalidation is distinct
+                    // from its already-applied object-retirement span.
+                    self.dispose_as_loss(
+                        reducer,
+                        keyuse,
+                        instance,
+                        sink,
+                        Some(&mut *ledger),
+                        assoc_fallback.as_deref_mut(),
+                    );
+                    self.history_disposed = self.history_disposed.saturating_add(1);
+                    head.release(ledger);
+                    disposed += 1;
+                    continue;
+                }
+                self.redeemed = self.redeemed.saturating_add(1);
+                let receipts = keyuse.receipts_for_effects(effects, call, head.position);
+                let early_release = head.resource_origin.is_none() && !ledger.has_reserver();
+                if early_release {
+                    ledger.release(head.position, head.charged_bytes());
+                }
+                let outcome = {
+                    let mut tee = KeyUseTee {
+                        outer: sink,
+                        keyuse,
+                        instance,
+                        shared: Some(&mut *ledger),
+                        fallback: assoc_fallback.as_deref_mut(),
+                        source: head.resource_origin.as_ref(),
+                    };
+                    match reducer.observe_joint_with_resources(
+                        &head.facts,
+                        &head.origin,
+                        &receipts,
+                        &mut tee,
+                    ) {
+                        Ok(count) => {
+                            self.reduced = self.reduced.saturating_add(1);
+                            refused = refused.saturating_add(count);
+                            true
+                        }
+                        Err(_) => {
+                            reducer.invalidate_with_effects(&mut tee);
+                            self.history_disposed = self.history_disposed.saturating_add(1);
+                            false
+                        }
+                    }
+                };
+                if early_release {
+                    drop(head);
+                } else {
+                    head.release(ledger);
+                }
+                if outcome {
+                    replayed += 1;
+                } else {
+                    disposed += 1;
+                }
+                continue;
+            }
+            // An unrelated loss subject cannot hide a later End needed by
+            // the admission head. Work through the SAME original spans once.
+            let Some(effect) = batch.advance_effect() else {
+                return (SealBatchProgress::Held, refused);
+            };
+            *remaining -= 1;
+            if let Some(effect) = effect {
+                keyuse.apply_invalidation(effect, model);
+            }
+        }
+    }
+
+    /// Classify the complete original negative union before any frontier,
+    /// role or mode mutation. The frame's one cursor applies both effect
+    /// spans once and yields after at most one exact staged-head disposition.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn apply_failure_batch<S: OperationSink>(
+        &mut self,
+        batch: &mut crate::semantics_objects::journal::joint_audit::FailureBatchDelivery<'_>,
+        model: &ObjectSemantics,
+        ledger: &mut crate::semantics_objects::journal::StagingLedger,
+        reducer: &mut EdgeSemantics,
+        keyuse: &mut KeyUseReducer,
+        instance: RegistryInstanceId,
+        sink: &mut S,
+        mut assoc_fallback: Option<&mut crate::semantics_objects::journal::StagingLedger>,
+        remaining: &mut usize,
+    ) -> (FailureBatchProgress, u64) {
+        let audited = batch.audited();
         if self.selected_receipt.as_ref().map(BootstrapReceipt::domain) != Some(audited.domain())
             || !audited.matches_ledger(ledger)
+            || !self.accepts_failure(audited.failure())
         {
-            return (FailureApplyOutcome::Ignored, 0);
+            return (FailureBatchProgress::Held, 0);
         }
-        self.apply_failure_inner(
-            audited.failure(),
-            audited.h3(),
-            model,
-            ledger,
-            reducer,
-            keyuse,
-            instance,
-            sink,
-            assoc_fallback,
-        )
+        let disposition = audited.disposition();
+        let covered = matches!(audited.h3(), H3DispositionEvidence::Clean {
+            staged_max, pending_floor: None,
+        } if self.covered_by(*staged_max));
+        self.flush_pending_releases(ledger);
+        if self.mode != FeedMode::Joint {
+            return (
+                FailureBatchProgress::Complete(FailureApplyOutcome::Ignored),
+                0,
+            );
+        }
+        while !batch.effects_complete() {
+            if *remaining == 0 {
+                return (FailureBatchProgress::Yielded, 0);
+            }
+            let Some(effect) = batch.advance_effect() else {
+                return (FailureBatchProgress::Held, 0);
+            };
+            *remaining -= 1;
+            if let Some(effect) = effect {
+                keyuse.apply_invalidation(effect, model);
+            }
+        }
+        if disposition == SealFailureDisposition::Retry {
+            return (
+                FailureBatchProgress::Complete(FailureApplyOutcome::Retried),
+                0,
+            );
+        }
+        if disposition == SealFailureDisposition::Fallback && !covered {
+            return (
+                FailureBatchProgress::Complete(FailureApplyOutcome::HeldForCompleteness),
+                0,
+            );
+        }
+        let loss = disposition == SealFailureDisposition::HistoryLoss;
+        if loss && batch.needs_loss_invalidation() {
+            if *remaining == 0 {
+                return (FailureBatchProgress::Yielded, 0);
+            }
+            *remaining -= 1;
+            self.dispose_as_loss(
+                reducer,
+                keyuse,
+                instance,
+                sink,
+                Some(&mut *ledger),
+                assoc_fallback.as_deref_mut(),
+            );
+            batch.loss_started();
+        }
+        if self.staged.is_empty() {
+            self.mode = FeedMode::S1Only;
+            if loss {
+                self.degraded_loss = true;
+            } else {
+                self.fell_back = true;
+            }
+            return (
+                FailureBatchProgress::Complete(if loss {
+                    FailureApplyOutcome::Degraded { disposed: 0 }
+                } else {
+                    FailureApplyOutcome::FellBack { replayed: 0 }
+                }),
+                0,
+            );
+        }
+        if *remaining == 0 {
+            return (FailureBatchProgress::Yielded, 0);
+        }
+        *remaining -= 1;
+        let head = self.staged.pop_front().expect("retained original head");
+        self.frontier = head.position;
+        let mut refused = 0;
+        let mut replayed = false;
+        if loss || batch.resource_failed() {
+            self.history_disposed = self.history_disposed.saturating_add(1);
+            head.release(ledger);
+        } else {
+            let early_release = head.resource_origin.is_none() && !ledger.has_reserver();
+            if early_release {
+                ledger.release(head.position, head.charged_bytes());
+            }
+            {
+                let mut tee = KeyUseTee {
+                    outer: sink,
+                    keyuse,
+                    instance,
+                    shared: Some(&mut *ledger),
+                    fallback: assoc_fallback,
+                    source: head.resource_origin.as_ref(),
+                };
+                match reducer.observe_joint_with_resources(&head.facts, &head.origin, &[], &mut tee)
+                {
+                    Ok(count) => {
+                        refused = count;
+                        replayed = true;
+                        self.reduced = self.reduced.saturating_add(1);
+                    }
+                    Err(_) => {
+                        reducer.invalidate_with_effects(&mut tee);
+                        self.history_disposed = self.history_disposed.saturating_add(1);
+                        batch.note_resource_failure();
+                    }
+                }
+            }
+            if early_release {
+                drop(head);
+            } else {
+                head.release(ledger);
+            }
+        }
+        if self.staged.is_empty() {
+            self.mode = FeedMode::S1Only;
+            if loss {
+                self.degraded_loss = true;
+            } else {
+                self.fell_back = true;
+            }
+            (
+                FailureBatchProgress::Complete(if loss {
+                    FailureApplyOutcome::Degraded { disposed: 1 }
+                } else {
+                    FailureApplyOutcome::FellBack {
+                        replayed: usize::from(replayed),
+                    }
+                }),
+                refused,
+            )
+        } else {
+            (FailureBatchProgress::Yielded, refused)
+        }
     }
 
     /// Lower-level algorithm controls only. It creates no AuditedFailure and
@@ -665,6 +959,7 @@ impl JointStaging {
     /// outcome plus fallback per-edge bound refusals for
     /// `semantic_refused`.
     #[allow(clippy::too_many_arguments)] // Staging borrows the exact pipeline facts plus the model for retirement.
+    #[cfg(test)]
     fn apply_failure_inner<S: OperationSink>(
         &mut self,
         failure: &SealFailure,
@@ -768,7 +1063,9 @@ impl JointStaging {
     /// Whether an H3 Clean receipt covers every staged position: the
     /// explicit completeness the fallback requires.
     fn covered_by(&self, staged_max: u64) -> bool {
-        self.staged.iter().all(|call| call.position <= staged_max)
+        self.staged
+            .back()
+            .is_none_or(|call| call.position <= staged_max)
     }
 
     /// Flush ledger-less fallback releases on ledger contact (C4).
@@ -1902,16 +2199,22 @@ impl KeyUseReducer {
     /// never complete a binding its own seal just unproved.
     pub(crate) fn apply_invalidations(&mut self, effects: &ObjectEffects, model: &ObjectSemantics) {
         for effect in &effects.effects {
-            match effect {
-                ObjectEffect::Destroyed { object, .. }
-                | ObjectEffect::Retired { object, .. }
-                | ObjectEffect::AccessEnded { object, .. }
-                | ObjectEffect::Downgraded { object, .. }
-                | ObjectEffect::MetadataInvalidated { object, .. }
-                | ObjectEffect::MetadataConflict { object, .. } => self.retire_object(*object),
-                ObjectEffect::SessionEnded { session, .. } => self.retire_session(*session, model),
-                _ => {}
-            }
+            self.apply_invalidation(effect, model);
+        }
+    }
+
+    /// Shared core for a budgeted original span and the legacy whole-result
+    /// adapter. No model lookup can replace a frozen metadata-at-use receipt.
+    fn apply_invalidation(&mut self, effect: &ObjectEffect, model: &ObjectSemantics) {
+        match effect {
+            ObjectEffect::Destroyed { object, .. }
+            | ObjectEffect::Retired { object, .. }
+            | ObjectEffect::AccessEnded { object, .. }
+            | ObjectEffect::Downgraded { object, .. }
+            | ObjectEffect::MetadataInvalidated { object, .. }
+            | ObjectEffect::MetadataConflict { object, .. } => self.retire_object(*object),
+            ObjectEffect::SessionEnded { session, .. } => self.retire_session(*session, model),
+            _ => {}
         }
     }
 
@@ -1992,8 +2295,19 @@ impl KeyUseReducer {
         _model: &ObjectSemantics,
         position: u64,
     ) -> Vec<KeyReceipt> {
+        self.receipts_for_effects(&seal.effects.effects, settled, position)
+    }
+
+    /// New H9 reads only its exact original End span. Ticket/input filtering
+    /// preserves holes and equal-handle roles without a scan of other calls.
+    fn receipts_for_effects(
+        &mut self,
+        effects: &[ObjectEffect],
+        settled: &SealedCall,
+        position: u64,
+    ) -> Vec<KeyReceipt> {
         let mut receipts = Vec::new();
-        for effect in &seal.effects.effects {
+        for effect in effects {
             let ObjectEffect::Referenced {
                 call,
                 object,

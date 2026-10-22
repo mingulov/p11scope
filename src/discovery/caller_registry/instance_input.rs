@@ -756,6 +756,18 @@ impl CallerRegistry {
         })
     }
 
+    /// Read-only selection for this exact admitted instance, including an
+    /// as-yet unregistered S1Only sibling. An installed original grant still
+    /// selects Joint; no numeric caller/image comparison installs a feed.
+    pub(crate) fn admitted_feed_is_s1only(&self, input: &AdmittedInstanceCall) -> bool {
+        match self.instance_state.by_key.get(&input.key) {
+            Some(id) => self.instance_state.semantics.get(id).is_none_or(|record| {
+                record.caller == input.caller && record.feed.mode() == FeedMode::S1Only
+            }),
+            None => !self.joint_grants.contains_key(&input.key),
+        }
+    }
+
     pub(crate) fn joint_staged_count(&self, target: &JointFeedTarget) -> Option<usize> {
         let record = self.instance_state.semantics.get(&target.id)?;
         (record.caller == target.caller
@@ -776,6 +788,19 @@ impl CallerRegistry {
             return None;
         }
         record.feed.staged_resource(position)
+    }
+
+    pub(crate) fn joint_staged_head_original(
+        &self,
+        target: &JointFeedTarget,
+    ) -> Option<(u64, Option<(u64, u64)>)> {
+        let record = self.instance_state.semantics.get(&target.id)?;
+        if record.caller != target.caller
+            || record.feed.selected_receipt()?.domain() != target.bootstrap.domain()
+        {
+            return None;
+        }
+        record.feed.staged_head_original()
     }
 
     /// Tests-only feed-mode read (N1): the feed an instance's
@@ -803,14 +828,54 @@ impl CallerRegistry {
         self.joint_direct_fallback
     }
 
-    /// Deliver one H8 seal to an instance's Joint feed (guarded H9
-    /// path): exact-correlated replay through the shared reducer,
-    /// then the H8 projection is retained for capture. Unknown
-    /// instances and missing reducers hold without effect.
-    /// Live-loop carry: only the staged driver and tests deliver
-    /// (production runs no H8 seals until the joint seal tick lands).
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Borrow one original frame result and its private work cursor. A
+    /// registry ID or caller-supplied settled vector cannot construct this view.
+    #[cfg_attr(not(test), allow(dead_code))] // Ordinary Joint activation remains gated.
     pub(crate) fn deliver_joint_seal(
+        &mut self,
+        id: RegistryInstanceId,
+        batch: &mut crate::semantics_objects::journal::SealBatchDelivery<'_>,
+        model: &crate::semantics_objects::ObjectSemantics,
+        ledger: &mut crate::semantics_objects::journal::StagingLedger,
+        remaining: &mut usize,
+    ) -> crate::semantics_key_use::SealBatchProgress {
+        use crate::semantics_key_use::SealBatchProgress;
+        let Some(record) = self.instance_state.semantics.get_mut(&id) else {
+            return SealBatchProgress::Held;
+        };
+        if !record.feed.accepts_seal(batch.seal()) {
+            return SealBatchProgress::Held;
+        }
+        let was_joint = record.feed.mode() == FeedMode::Joint;
+        let Some(reducer) = record.semantics.as_mut() else {
+            return SealBatchProgress::Held;
+        };
+        let mut outer = NoSink;
+        let (outcome, refused) = record.feed.apply_seal_batch(
+            batch,
+            model,
+            ledger,
+            reducer,
+            &mut self.joint_keyuse,
+            id,
+            &mut outer,
+            Some(&mut self.assoc_fallback),
+            remaining,
+        );
+        self.instance_state.semantic_refused =
+            self.instance_state.semantic_refused.saturating_add(refused);
+        // Project once for the original completed consumer, rather than
+        // rebuilding the whole model projection for each budget-one effect.
+        if matches!(outcome, SealBatchProgress::Complete { .. }) {
+            self.after_joint_delivery(id, was_joint, model);
+        }
+        outcome
+    }
+
+    /// Legacy algorithm input only. The production dispatcher below requires
+    /// the real frame's move-only bounded view and actual terminal steps.
+    #[cfg(test)]
+    pub(crate) fn deliver_joint_algorithm_seal_for_test(
         &mut self,
         id: RegistryInstanceId,
         seal: &crate::semantics_objects::journal::SealSuccess,
@@ -845,31 +910,32 @@ impl CallerRegistry {
         outcome
     }
 
-    /// Deliver one H8 seal failure (guarded H9 path): loss disposal
-    /// or proof-only fallback through the shared reducer, then the
-    /// H8 projection is retained for capture. Same holds as seals.
+    /// Borrow both original failures before the feed can change mode. The
+    /// bounded dispatcher consumes at most one head, allowing the journal to
+    /// commit only that exact completed H8 original after successful fallback.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn deliver_joint_failure(
         &mut self,
         id: RegistryInstanceId,
-        failure: &crate::semantics_objects::journal::joint_audit::AuditedFailure<'_>,
+        batch: &mut crate::semantics_objects::journal::joint_audit::FailureBatchDelivery<'_>,
         model: &crate::semantics_objects::ObjectSemantics,
         ledger: &mut crate::semantics_objects::journal::StagingLedger,
-    ) -> crate::semantics_key_use::FailureApplyOutcome {
-        use crate::semantics_key_use::FailureApplyOutcome;
+        remaining: &mut usize,
+    ) -> crate::semantics_key_use::FailureBatchProgress {
+        use crate::semantics_key_use::FailureBatchProgress;
         let Some(record) = self.instance_state.semantics.get_mut(&id) else {
-            return FailureApplyOutcome::Ignored;
+            return FailureBatchProgress::Held;
         };
-        if !record.feed.accepts_failure(failure.failure()) {
-            return FailureApplyOutcome::Ignored;
+        if !record.feed.accepts_failure(batch.audited().failure()) {
+            return FailureBatchProgress::Held;
         }
         let was_joint = record.feed.mode() == FeedMode::Joint;
         let Some(reducer) = record.semantics.as_mut() else {
-            return FailureApplyOutcome::Ignored;
+            return FailureBatchProgress::Held;
         };
         let mut outer = NoSink;
-        let (outcome, refused) = record.feed.apply_failure(
-            failure,
+        let (outcome, refused) = record.feed.apply_failure_batch(
+            batch,
             model,
             ledger,
             reducer,
@@ -877,10 +943,13 @@ impl CallerRegistry {
             id,
             &mut outer,
             Some(&mut self.assoc_fallback),
+            remaining,
         );
         self.instance_state.semantic_refused =
             self.instance_state.semantic_refused.saturating_add(refused);
-        self.after_joint_delivery(id, was_joint, model);
+        if matches!(outcome, FailureBatchProgress::Complete(_)) {
+            self.after_joint_delivery(id, was_joint, model);
+        }
         outcome
     }
 

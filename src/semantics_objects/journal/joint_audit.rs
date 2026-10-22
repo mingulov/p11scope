@@ -5,7 +5,7 @@
 use super::joint_driver::{
     IngestedRaw, JointCaptureOwner, RawProvenance, RawQuantumIdentity, RawQuantumRefusal,
 };
-use super::seal_replay::{ReplayBounds, ReplayPreparation};
+use super::seal_replay::{ReplayBounds, ReplayPreparation, SealBatchDelivery, SealReplayCursor};
 use super::{
     BirthEvidenceSource, BootstrapReceipt, H3DispositionEvidence, H3FinalizerPort,
     H3VoidAcknowledgement, JournalGap, SealSuccess, SealedCall, SessionBirthEvidence,
@@ -21,7 +21,10 @@ use crate::discovery::engine::inventory_coordinator::semantics::{
     JointPublicationPorts, SemanticCallerBinding, SessionAuditInput,
 };
 use crate::semantics_edge::resources::{OWNED_ALLOCATION_PADDING, ResourceLease};
-use crate::semantics_key_use::{FailureApplyOutcome, SealApplyOutcome};
+use crate::semantics_key_use::{
+    FailureApplyOutcome, FailureBatchProgress, SealBatchProgress, SealFailureDisposition,
+    disposition_of,
+};
 use crate::semantics_objects::{
     CallKey, MAX_FIND_HANDLES, MAX_INPUT_HANDLES, MAX_RESULT_HANDLES, MAX_TEMPLATE_ATTRIBUTES,
 };
@@ -35,6 +38,9 @@ pub(crate) struct IngestedJointQuantum {
     provenance: RawProvenance,
     frontier: ConsumptionOrdinal,
     audit: JournalAuditReceipt,
+    // Original bulk S1Only refusal and original audit result remain distinct.
+    // Both buffers are precharged before the first taint/model mutation.
+    raw_failure: Option<SealFailure>,
     failure: Option<SealFailure>,
     consumers: Vec<FrameConsumer>,
     bound: bool,
@@ -76,9 +82,10 @@ fn storage_bound(adapter: &JournalAdapter, model: &ObjectSemantics) -> Option<us
     } else {
         effects.checked_mul(2)?.max(4)
     };
+    let one = allocation_bytes::<ObjectDomain>(keys)?
+        .checked_add(allocation_bytes::<ObjectEffect>(effect_capacity)?)?;
     size_of::<IngestedJointQuantum>()
-        .checked_add(allocation_bytes::<ObjectDomain>(keys)?)?
-        .checked_add(allocation_bytes::<ObjectEffect>(effect_capacity)?)
+        .checked_add(one.checked_mul(if adapter.has_s1only_subjects() { 2 } else { 1 })?)
 }
 
 /// Only the selected frame supplies this exact typed target and original
@@ -109,10 +116,12 @@ enum ConsumerState {
 struct FrameConsumer {
     target: JointFeedTarget,
     state: ConsumerState,
+    failure: FailureReplayCursor,
 }
 struct ActiveSeal {
     consumer: usize,
     outcome: Result<SealSuccess, SealFailure>,
+    replay: SealReplayCursor,
     _storage: ResourceLease,
 }
 
@@ -153,6 +162,7 @@ impl<'q> AuditedDomainInput<'q> {
 /// No Clone/Copy, supplied failure/H3 pair or production escape constructor.
 pub(crate) struct AuditedFailure<'q> {
     failure: &'q SealFailure,
+    originals: [Option<&'q SealFailure>; 2],
     audit: &'q JournalAuditReceipt,
     provenance: &'q RawProvenance,
     frontier: ConsumptionOrdinal,
@@ -170,6 +180,23 @@ impl AuditedFailure<'_> {
     }
     pub(crate) fn matches_ledger(&self, ledger: &StagingLedger) -> bool {
         self.provenance.matches_ledger(ledger)
+    }
+
+    pub(crate) fn disposition(&self) -> SealFailureDisposition {
+        if self
+            .originals
+            .iter()
+            .flatten()
+            .any(|failure| disposition_of(failure.gap) == SealFailureDisposition::HistoryLoss)
+            || matches!(
+                self.audit.h3,
+                H3DispositionEvidence::StagedLoss { .. } | H3DispositionEvidence::Exhausted
+            )
+        {
+            SealFailureDisposition::HistoryLoss
+        } else {
+            disposition_of(self.failure.gap)
+        }
     }
 
     pub(super) fn validate_input(
@@ -200,6 +227,107 @@ impl AuditedFailure<'_> {
     #[cfg(test)]
     pub(crate) fn frontier(&self) -> ConsumptionOrdinal {
         self.frontier
+    }
+}
+
+fn failure_rank(failure: &SealFailure) -> u8 {
+    match disposition_of(failure.gap) {
+        SealFailureDisposition::Retry => 0,
+        SealFailureDisposition::Fallback => 1,
+        SealFailureDisposition::HistoryLoss => 2,
+    }
+}
+
+impl<'q> AuditedFailure<'q> {
+    fn new(
+        originals: [Option<&'q SealFailure>; 2],
+        audit: &'q JournalAuditReceipt,
+        provenance: &'q RawProvenance,
+        frontier: ConsumptionOrdinal,
+        domain: ObjectDomain,
+    ) -> Option<Self> {
+        let originals =
+            originals.map(|failure| failure.filter(|failure| failure.affects_domain(domain)));
+        let failure = originals
+            .iter()
+            .flatten()
+            .copied()
+            .max_by_key(|failure| failure_rank(failure))?;
+        Some(Self {
+            failure,
+            originals,
+            audit,
+            provenance,
+            frontier,
+            domain,
+        })
+    }
+}
+
+/// Inline indices over the original owners. They grant no disposition without
+/// the frame's borrowed failure, exact target, original H3 and ledger.
+#[derive(Default)]
+pub(super) struct FailureReplayCursor {
+    pub(super) after: Option<super::JournalNativeKey>,
+    pub(super) verified: usize,
+    pub(super) suffix: Option<usize>,
+    pub(super) consumed: usize,
+    slot: usize,
+    effect: usize,
+    invalidated: bool,
+    resource_failed: bool,
+}
+
+/// The real frame's two original negatives and bounded per-consumer cursor.
+/// No public constructor, merged failure, cloned effects or reusable token.
+pub(crate) struct FailureBatchDelivery<'q> {
+    audited: AuditedFailure<'q>,
+    pub(super) cursor: &'q mut FailureReplayCursor,
+}
+impl<'q> FailureBatchDelivery<'q> {
+    pub(crate) fn audited(&self) -> &AuditedFailure<'q> {
+        &self.audited
+    }
+    pub(crate) fn effects_complete(&self) -> bool {
+        self.audited.originals[self.cursor.slot..]
+            .iter()
+            .all(Option::is_none)
+    }
+    pub(crate) fn advance_effect(&mut self) -> Option<Option<&'q ObjectEffect>> {
+        while self.cursor.slot < 2 {
+            let Some(failure) = self.audited.originals[self.cursor.slot] else {
+                self.cursor.slot += 1;
+                continue;
+            };
+            let effects = &failure.effects.effects;
+            let effect = if self.cursor.effect < effects.len() {
+                let effect = &effects[self.cursor.effect];
+                self.cursor.effect += 1;
+                Some(effect)
+            } else if self.cursor.effect == 0 {
+                None
+            } else {
+                return None;
+            };
+            if self.cursor.effect == effects.len() {
+                self.cursor.slot += 1;
+                self.cursor.effect = 0;
+            }
+            return Some(effect);
+        }
+        None
+    }
+    pub(crate) fn needs_loss_invalidation(&self) -> bool {
+        !self.cursor.invalidated
+    }
+    pub(crate) fn loss_started(&mut self) {
+        self.cursor.invalidated = true;
+    }
+    pub(crate) fn resource_failed(&self) -> bool {
+        self.cursor.resource_failed
+    }
+    pub(crate) fn note_resource_failure(&mut self) {
+        self.cursor.resource_failed = true;
     }
 }
 
@@ -277,6 +405,19 @@ fn outcome_storage(outcome: &Result<SealSuccess, SealFailure>) -> Option<usize> 
         Err(failure) => failure_storage(failure),
     }
 }
+
+/// The original locator keeps its separately precharged lease. Counting it
+/// here must not pretend it was also paid by the result-buffer reservation.
+fn lookup_storage(outcome: &Result<SealSuccess, SealFailure>) -> Option<usize> {
+    match outcome {
+        Ok(seal) => seal
+            .prefix
+            .replay_index
+            .as_ref()
+            .map_or(Some(0), |index| index.retained_bytes()),
+        Err(_) => Some(0),
+    }
+}
 fn failure_storage(failure: &SealFailure) -> Option<usize> {
     let domains = match &failure.scope {
         SealFailureScope::AffectedDomains(domains) => domains.capacity(),
@@ -288,6 +429,18 @@ fn failure_storage(failure: &SealFailure) -> Option<usize> {
 }
 
 impl IngestedJointQuantum {
+    fn original_failures(&self) -> impl Iterator<Item = &SealFailure> {
+        self.raw_failure.iter().chain(self.failure.iter()).chain(
+            self.active
+                .as_ref()
+                .and_then(|active| active.outcome.as_ref().err()),
+        )
+    }
+
+    fn has_failure(&self) -> bool {
+        self.raw_failure.is_some() || self.failure.is_some()
+    }
+
     /// The only constructor requires both actual ingestion and the retained
     /// Session finalizer. Every refusal preserves the original proof and H3
     /// slot. The reservation comes from the canonical ledger's own pool.
@@ -300,6 +453,12 @@ impl IngestedJointQuantum {
         let (ingested, owner, mut finalizer, producers) = authorized.into_parts();
         let preflight = (|| {
             ingested.validate_owner(owner.adapter(), producers)?;
+            if !owner
+                .adapter()
+                .s1only_subjects_are_owned(ingested.frontier())
+            {
+                return Err(RawQuantumRefusal::DispositionMismatch);
+            }
             if attachment.domain() != producers.native_domain() {
                 return Err(RawQuantumRefusal::ForeignCapture);
             }
@@ -332,11 +491,13 @@ impl IngestedJointQuantum {
         let (provenance, frontier) = ingested.into_provenance();
         let audit = JournalAuditReceipt::collect(provenance.collection(), &mut finalizer, observed);
         let (adapter, model) = owner.parts();
+        let raw_failure = adapter.refuse_s1only_subjects(model);
         let failure = adapter.audit_collected(model, &audit, fault).err();
         let frame = Self {
             provenance,
             frontier,
             audit,
+            raw_failure,
             failure,
             consumers: Vec::new(),
             bound: false,
@@ -379,15 +540,14 @@ impl IngestedJointQuantum {
 
     fn retained_storage_bytes(&self) -> Option<usize> {
         size_of::<Self>()
+            .checked_add(self.raw_failure.as_ref().map_or(Some(0), failure_storage)?)?
             .checked_add(self.failure.as_ref().map_or(Some(0), failure_storage)?)?
             .checked_add(allocation_bytes::<FrameConsumer>(
                 self.consumers.capacity(),
             )?)?
-            .checked_add(
-                self.active
-                    .as_ref()
-                    .map_or(Some(0), |active| outcome_storage(&active.outcome))?,
-            )
+            .checked_add(self.active.as_ref().map_or(Some(0), |active| {
+                outcome_storage(&active.outcome)?.checked_add(lookup_storage(&active.outcome)?)
+            })?)
     }
 
     #[cfg(test)]
@@ -400,7 +560,13 @@ impl IngestedJointQuantum {
 
     #[cfg(test)]
     pub(crate) fn failure_for_test(&self) -> Option<&SealFailure> {
-        self.failure.as_ref()
+        self.original_failures()
+            .max_by_key(|failure| failure_rank(failure))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn original_failures_for_test(&self) -> impl Iterator<Item = &SealFailure> {
+        self.original_failures()
     }
 
     #[cfg(test)]
@@ -638,9 +804,8 @@ impl IngestedJointQuantum {
             // Negative fanout still reaches history whose caller binding has
             // ended. Only a fresh positive seal needs the current binding.
             if self
-                .failure
-                .as_ref()
-                .is_some_and(|failure| failure.affects_domain(target.bootstrap().domain()))
+                .original_failures()
+                .any(|failure| failure.affects_domain(target.bootstrap().domain()))
             {
                 continue;
             }
@@ -676,6 +841,7 @@ impl IngestedJointQuantum {
         consumers.extend(registry.joint_feed_targets().map(|target| FrameConsumer {
             target,
             state: ConsumerState::Pending,
+            failure: FailureReplayCursor::default(),
         }));
         // One charged snapshot, no duplicate-domain hash table or queue.
         consumers.sort_unstable_by_key(|consumer| consumer.target.bootstrap().domain());
@@ -720,25 +886,18 @@ impl IngestedJointQuantum {
     }
 
     fn failure_for(&self, domain: ObjectDomain) -> Option<AuditedFailure<'_>> {
-        let failure = self
-            .failure
-            .as_ref()
-            .filter(|failure| failure.affects_domain(domain))
-            .or_else(|| {
-                self.active
-                    .as_ref()?
-                    .outcome
+        AuditedFailure::new(
+            [
+                self.raw_failure.as_ref(),
+                self.failure
                     .as_ref()
-                    .err()
-                    .filter(|failure| failure.affects_domain(domain))
-            })?;
-        Some(AuditedFailure {
-            failure,
-            audit: &self.audit,
-            provenance: &self.provenance,
-            frontier: self.frontier,
+                    .or_else(|| self.active.as_ref()?.outcome.as_ref().err()),
+            ],
+            &self.audit,
+            &self.provenance,
+            self.frontier,
             domain,
-        })
+        )
     }
 
     pub(crate) fn seal_next(
@@ -758,9 +917,12 @@ impl IngestedJointQuantum {
             return Ok(self.progress());
         }
         let index = self.cursor;
-        if let Some(failure) = &self.failure {
+        if self.has_failure() {
             return Ok(
-                if failure.affects_domain(self.consumers[index].target.bootstrap().domain()) {
+                if self
+                    .failure_for(self.consumers[index].target.bootstrap().domain())
+                    .is_some()
+                {
                     QuantumSealProgress::DeliveryReady
                 } else {
                     QuantumSealProgress::LocalPending
@@ -808,6 +970,10 @@ impl IngestedJointQuantum {
             outcome_storage(&outcome).is_some_and(|actual| actual <= bytes),
             "retained seal result exceeds its checked preflight bound"
         );
+        assert!(
+            lookup_storage(&outcome).is_some_and(|actual| actual <= temporary),
+            "retained original lookup exceeds its original preflight lease"
+        );
         if let Err(failure) = &outcome {
             if matches!(failure.scope, SealFailureScope::AffectedDomains(_)) {
                 let failure = outcome.expect_err("checked original broad failure");
@@ -816,6 +982,7 @@ impl IngestedJointQuantum {
                         self.pending += usize::from(consumer.state != ConsumerState::Pending);
                         self.future -= usize::from(consumer.state == ConsumerState::Future);
                         consumer.state = ConsumerState::Pending;
+                        consumer.failure = FailureReplayCursor::default();
                     }
                 }
                 // One broad failure may revisit earlier positives. Rewind
@@ -839,115 +1006,148 @@ impl IngestedJointQuantum {
         self.active = Some(ActiveSeal {
             consumer: index,
             outcome,
+            replay: SealReplayCursor::default(),
             _storage: storage,
         });
         Ok(QuantumSealProgress::DeliveryReady)
     }
 
-    pub(crate) fn deliver_next(
+    /// One shared service budget covers original effects, empty phases,
+    /// completed-fallback preflight and exact head disposition. Yielding
+    /// retains the same result, both negative originals and all held roles.
+    pub(crate) fn deliver_next_bounded(
         &mut self,
         ports: &mut JointPublicationPorts<'_>,
+        remaining: &mut usize,
     ) -> Result<QuantumSealProgress, RawQuantumRefusal> {
         self.preflight(ports)?;
         if !self.bound {
             return Err(RawQuantumRefusal::DispositionMismatch);
         }
-        if self.failure.is_some() {
-            if self.pending == 0 {
-                return Ok(self.progress());
-            }
-            let index = self.cursor;
-            let target = self.consumers[index].target;
-            let Some(failure) = self.failure_for(target.bootstrap().domain()) else {
-                return Ok(QuantumSealProgress::LocalPending);
-            };
+        if self.pending == 0 {
+            return Ok(self.progress());
+        }
+        let index = self
+            .active
+            .as_ref()
+            .map_or(self.cursor, |active| active.consumer);
+        let target = self.consumers[index].target;
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|active| active.outcome.is_ok())
+        {
+            let active = self.active.as_mut().expect("selected actual result");
+            let seal = active.outcome.as_ref().expect("positive original result");
+            let mut batch = SealBatchDelivery::new(seal, &mut active.replay);
             let (registry, owner, _, _, _) = ports.split();
             let (adapter, model) = owner.parts();
-            match registry.deliver_joint_failure(target.id(), &failure, model, adapter.ledger_mut())
-            {
-                FailureApplyOutcome::Degraded { .. }
-                | FailureApplyOutcome::FellBack { .. }
-                | FailureApplyOutcome::Ignored => {
-                    self.advance_consumer(ConsumerState::LossDelivered);
-                    return Ok(self.progress());
+            return match registry.deliver_joint_seal(
+                target.id(),
+                &mut batch,
+                model,
+                adapter.ledger_mut(),
+                remaining,
+            ) {
+                SealBatchProgress::Complete { .. } => {
+                    self.active = None;
+                    self.advance_consumer(ConsumerState::Delivered);
+                    Ok(self.progress())
                 }
-                FailureApplyOutcome::Retried | FailureApplyOutcome::HeldForCompleteness => {
-                    return Ok(QuantumSealProgress::LocalPending);
-                }
-            }
+                SealBatchProgress::Yielded { .. } => Ok(QuantumSealProgress::DeliveryReady),
+                SealBatchProgress::Held => Ok(QuantumSealProgress::LocalPending),
+            };
         }
-        let Some(active) = self.active.as_ref() else {
-            return Ok(self.progress());
+        let Some(audited) = AuditedFailure::new(
+            [
+                self.raw_failure.as_ref(),
+                self.failure
+                    .as_ref()
+                    .or_else(|| self.active.as_ref()?.outcome.as_ref().err()),
+            ],
+            &self.audit,
+            &self.provenance,
+            self.frontier,
+            target.bootstrap().domain(),
+        ) else {
+            return Ok(QuantumSealProgress::LocalPending);
         };
-        let index = active.consumer;
-        let target = self.consumers[index].target;
+        let fallback = audited.disposition() == SealFailureDisposition::Fallback
+            && matches!(
+                audited.h3(),
+                H3DispositionEvidence::Clean {
+                    pending_floor: None,
+                    ..
+                }
+            );
+        let mut batch = FailureBatchDelivery {
+            audited,
+            cursor: &mut self.consumers[index].failure,
+        };
         let (registry, owner, _, _, _) = ports.split();
         let (adapter, model) = owner.parts();
-        let complete = match &active.outcome {
-            Ok(seal) => {
-                let outcome =
-                    registry.deliver_joint_seal(target.id(), seal, model, adapter.ledger_mut());
-                match outcome {
-                    SealApplyOutcome::ReplayedOne | SealApplyOutcome::ResourceRefused => true,
-                    // A genuinely empty prefix has no H9 payload to consume.
-                    // This is disposal metadata, never a fabricated seal/replay.
-                    SealApplyOutcome::Held => {
-                        seal.prefix.settled().is_empty()
-                            && seal.prefix.open_keys().is_empty()
-                            && registry.joint_staged_count(&target) == Some(0)
-                    }
-                }
-            }
-            Err(_) => {
-                let failure = self
-                    .failure_for(target.bootstrap().domain())
-                    .ok_or(RawQuantumRefusal::Admission)?;
-                let outcome = if crate::semantics_key_use::disposition_of(failure.failure().gap)
-                    == crate::semantics_key_use::SealFailureDisposition::Fallback
-                    && matches!(
-                        failure.h3(),
-                        H3DispositionEvidence::Clean {
-                            pending_floor: None,
-                            ..
-                        }
-                    ) {
-                    adapter.deliver_completed_fallback(
-                        AuditedDomainInput {
-                            audit: &self.audit,
-                            receipt: target.bootstrap(),
-                            frontier: self.frontier,
-                        },
-                        &failure,
-                        &target,
-                        registry,
-                        model,
-                    )?
-                } else {
-                    registry.deliver_joint_failure(
-                        target.id(),
-                        &failure,
-                        model,
-                        adapter.ledger_mut(),
-                    )
-                };
-                match outcome {
-                    FailureApplyOutcome::FellBack { .. }
-                    | FailureApplyOutcome::Degraded { .. }
-                    | FailureApplyOutcome::Ignored => true,
-                    FailureApplyOutcome::Retried => {
-                        self.active = None;
-                        return Ok(QuantumSealProgress::LocalPending);
-                    }
-                    FailureApplyOutcome::HeldForCompleteness => false,
-                }
-            }
-        };
-        if complete {
-            self.advance_consumer(ConsumerState::Delivered);
-            self.active = None;
-            Ok(self.progress())
+        let outcome = if fallback {
+            adapter.deliver_completed_fallback(
+                AuditedDomainInput {
+                    audit: &self.audit,
+                    receipt: target.bootstrap(),
+                    frontier: self.frontier,
+                },
+                &mut batch,
+                &target,
+                registry,
+                model,
+                remaining,
+            )?
         } else {
-            Ok(QuantumSealProgress::LocalPending)
+            registry.deliver_joint_failure(
+                target.id(),
+                &mut batch,
+                model,
+                adapter.ledger_mut(),
+                remaining,
+            )
+        };
+        match outcome {
+            FailureBatchProgress::Complete(
+                FailureApplyOutcome::Degraded { .. }
+                | FailureApplyOutcome::FellBack { .. }
+                | FailureApplyOutcome::Ignored,
+            ) => {
+                self.active = None;
+                self.advance_consumer(ConsumerState::LossDelivered);
+                Ok(self.progress())
+            }
+            FailureBatchProgress::Complete(FailureApplyOutcome::Retried) => {
+                self.active = None;
+                self.consumers[index].failure = FailureReplayCursor::default();
+                Ok(QuantumSealProgress::LocalPending)
+            }
+            FailureBatchProgress::Complete(FailureApplyOutcome::HeldForCompleteness)
+            | FailureBatchProgress::Held => Ok(QuantumSealProgress::LocalPending),
+            FailureBatchProgress::Yielded => Ok(QuantumSealProgress::DeliveryReady),
+        }
+    }
+
+    /// Existing real-frame test controls use one finite service slice per
+    /// selected consumer. Production supplies its budget explicitly above.
+    #[cfg(test)]
+    pub(crate) fn deliver_next(
+        &mut self,
+        ports: &mut JointPublicationPorts<'_>,
+    ) -> Result<QuantumSealProgress, RawQuantumRefusal> {
+        let mut remaining = super::MAX_UNSETTLED_STAGED;
+        let selected = self.cursor;
+        loop {
+            let before = remaining;
+            let progress = self.deliver_next_bounded(ports, &mut remaining)?;
+            if progress != QuantumSealProgress::DeliveryReady
+                || remaining == 0
+                || before == remaining
+                || self.cursor != selected
+            {
+                return Ok(progress);
+            }
         }
     }
 
@@ -957,9 +1157,8 @@ impl IngestedJointQuantum {
         ports: &mut JointPublicationPorts<'_>,
     ) -> Result<DisposedJointQuantum, (Self, RawQuantumRefusal)> {
         if self
-            .failure
-            .as_ref()
-            .is_some_and(|failure| failure.gap == JournalGap::H3Pending)
+            .original_failures()
+            .any(|failure| failure.gap == JournalGap::H3Pending)
         {
             return Err((self, RawQuantumRefusal::H3Undisposed));
         }
@@ -998,13 +1197,17 @@ impl IngestedJointQuantum {
         if !self.bound || self.active.is_some() || self.pending != 0 {
             return Err((self, RawQuantumRefusal::DispositionMismatch));
         }
-        if let Some(failure) = &self.failure {
-            if self.consumers.iter().any(|consumer| {
+        if self.original_failures().any(|failure| {
+            self.consumers.iter().any(|consumer| {
                 failure.affects_domain(consumer.target.bootstrap().domain())
                     && consumer.state != ConsumerState::LossDelivered
-            }) {
-                return Err((self, RawQuantumRefusal::DispositionMismatch));
-            }
+            })
+        }) {
+            return Err((self, RawQuantumRefusal::DispositionMismatch));
+        }
+        // Check the complete union first. No first original may acknowledge
+        // H3 while a later original still has an undisposed consumer.
+        for failure in self.original_failures() {
             if let Some(voided_below) = failure.h3_voided {
                 let (_, _, _, finalizer, producers) = ports.split();
                 finalizer.acknowledge_h3_void(H3VoidAcknowledgement {

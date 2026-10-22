@@ -383,6 +383,39 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         batch.stage_next(&mut self.registry, &mut state.seal_admission)
     }
 
+    /// Preserve the actual negative subject before moving the original
+    /// admission into registry staging. Adjudication waits until H9 has joined
+    /// its own originals; a foreign proof cannot move either phase cursor.
+    pub(crate) fn stage_next_prepared_admission_with_disposition(
+        &mut self,
+        producers: &SessionDrainProducers,
+        ingested: &mut IngestedRaw,
+    ) -> Result<bool, RawQuantumRefusal> {
+        let adapter = self.joint_capture.adapter_mut();
+        ingested.validate_owner(adapter, producers)?;
+        let Some(state) = self.semantic_finalizer.as_mut() else {
+            return Ok(false);
+        };
+        let Some(PendingSemanticBatch::Prepared(batch)) = state.pending_semantic.as_mut() else {
+            return Ok(false);
+        };
+        if batch.domain != producers.native_domain() {
+            return Err(RawQuantumRefusal::ForeignCapture);
+        }
+        if batch.claim_cursor != batch.entries.len() || batch.stage_cursor >= batch.claim_cursor {
+            return Ok(false);
+        }
+        if let Some(Ok(input)) = batch.entries[batch.stage_cursor].input.as_ref()
+            && self.registry.admitted_feed_is_s1only(input)
+            && crate::kinds::function_id(&input.s1_facts().function)
+                .and_then(crate::semantics_objects::journal::endpoint_class)
+                == Some(crate::semantics_objects::journal::EndpointClass::ModeledAffecting)
+        {
+            ingested.retain_s1only_disposition(adapter, input)?;
+        }
+        Ok(batch.stage_next(&mut self.registry, &mut state.seal_admission))
+    }
+
     pub(crate) fn finish_prepared_semantic_batch(&mut self, lane: &AttestedSemanticLane) -> bool {
         if !self
             .prepared_semantic_batch()

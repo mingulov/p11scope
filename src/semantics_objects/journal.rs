@@ -27,7 +27,7 @@ pub(crate) mod joint_driver;
 mod reservations;
 mod seal_replay;
 use seal_replay::ReplayPreparation;
-pub(crate) use seal_replay::{SealReplayPhase, SealReplayStep};
+pub(crate) use seal_replay::{SealBatchDelivery, SealReplayPhase, SealReplayStep};
 
 // ---------------------------------------------------------------------------
 // Frozen effect-neutral S1 vocabulary
@@ -663,6 +663,10 @@ struct OpenEntry {
     /// The actual END's H0 allocation survives while that original remains
     /// in H8, including a real refresh-stash handoff into a later quantum.
     collected_origin: Option<joint_driver::CollectedCallOrigin>,
+    /// Exact admitted S1Only subject retained before registry staging. The
+    /// original END/origin/reservation above remain the only physical owner;
+    /// this association permits a later bulk negative, never conversion.
+    s1only_subject: Option<JournalDomainKey>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1196,6 +1200,7 @@ impl JournalAdapter {
                 end_converted: false,
                 raw_resource: resource,
                 collected_origin: None,
+                s1only_subject: None,
             },
         );
         JournalDisposition::BeginAdmitted
@@ -1506,6 +1511,153 @@ impl JournalAdapter {
             effects,
             h3_voided: None,
         }
+    }
+
+    fn has_s1only_subjects(&self) -> bool {
+        self.open
+            .values()
+            .any(|entry| entry.s1only_subject.is_some())
+    }
+
+    /// Read every marked physical owner before reserving/taking H3 or
+    /// changing the model. A marker never excuses an incomplete, converted,
+    /// colliding or already-claimed original.
+    fn s1only_subjects_are_owned(&self, frontier: ConsumptionOrdinal) -> bool {
+        self.open.values().all(|entry| {
+            let Some(key) = entry.s1only_subject else {
+                return true;
+            };
+            let (Some(end), Some(origin), Some(resource)) =
+                (entry.end, entry.collected_origin, entry.raw_resource)
+            else {
+                return false;
+            };
+            let fingerprint = fingerprint_of_begin(&entry.begin);
+            entry.image == (key.cookie, key.exec)
+                && origin.position() <= frontier.0
+                && end.ordinal <= frontier.0
+                && end_agrees_with_begin(&entry.begin, &end.end)
+                && fingerprint_matches_event(&fingerprint, &end.end.payload_base().event)
+                && entry.call_key.is_none()
+                && entry.converted_ticket.is_none()
+                && entry.converted_for.is_none()
+                && !entry.end_converted
+                && entry.abandon.is_none()
+                && entry.corroborated_return.is_none()
+                && !self
+                    .claims
+                    .get(&fingerprint)
+                    .is_some_and(|claimants| claimants.values().any(|claims| !claims.is_empty()))
+                && self
+                    .ledger
+                    .matches_unconverted_original(entry.begin_ordinal, &resource, None)
+        })
+    }
+
+    /// One bulk original negative. All image subjects and the full retained
+    /// domain union are observed before any state.refused change. Claimed A
+    /// rows remain H8-owned for actual bounded fallback; only the exact
+    /// unclaimed S1Only originals are disposed here.
+    fn refuse_s1only_subjects(&mut self, model: &mut ObjectSemantics) -> Option<SealFailure> {
+        if !self.has_s1only_subjects() {
+            return None;
+        }
+        let mut after = None;
+        loop {
+            let next = match after {
+                None => self.open.first_key_value(),
+                Some(native) => self
+                    .open
+                    .range((
+                        std::ops::Bound::Excluded(native),
+                        std::ops::Bound::Unbounded,
+                    ))
+                    .next(),
+            }
+            .map(|(native, entry)| {
+                (
+                    *native,
+                    entry.s1only_subject.map(|key| (key.cookie, key.exec)),
+                )
+            });
+            let Some((native, image)) = next else {
+                break;
+            };
+            after = Some(native);
+            if let Some(image) = image {
+                self.note_image_taint(image);
+            }
+        }
+        let mut domains = Vec::with_capacity(self.keys.len());
+        domains.extend(
+            self.keys
+                .iter()
+                .filter(|(key, _)| self.is_tainted((key.cookie, key.exec)))
+                .map(|(key, state)| {
+                    JournalDomainProof {
+                        key: *key,
+                        era: state.era,
+                    }
+                    .domain()
+                }),
+        );
+        let mut effects = ObjectEffects::default();
+        let taints = &self.tainted_images;
+        let overflow = self.taint_overflow;
+        let sightings = &self.sightings;
+        for (key, state) in &mut self.keys {
+            let image = (key.cookie, key.exec);
+            if !taints.contains(&image) && !(overflow && !sightings.contains_key(&image)) {
+                continue;
+            }
+            if !state.refused && state.model_registered {
+                effects.effects.extend(
+                    model
+                        .abandon_domain(
+                            JournalDomainProof {
+                                key: *key,
+                                era: state.era,
+                            }
+                            .domain(),
+                            &mut self.ledger,
+                        )
+                        .effects,
+                );
+            }
+            state.refused = true;
+        }
+        let mut after = None;
+        loop {
+            let next = match after {
+                None => self.open.first_key_value(),
+                Some(native) => self
+                    .open
+                    .range((
+                        std::ops::Bound::Excluded(native),
+                        std::ops::Bound::Unbounded,
+                    ))
+                    .next(),
+            }
+            .map(|(native, entry)| (*native, entry.s1only_subject.is_some()));
+            let Some((native, selected)) = next else {
+                break;
+            };
+            after = Some(native);
+            if selected {
+                let ordinal = self
+                    .open
+                    .remove(&native)
+                    .expect("preflight original subject")
+                    .begin_ordinal;
+                self.ledger.release_h8open(ordinal);
+            }
+        }
+        Some(SealFailure {
+            scope: SealFailureScope::AffectedDomains(domains),
+            gap: JournalGap::ImageTainted,
+            effects,
+            h3_voided: None,
+        })
     }
 }
 
@@ -2989,6 +3141,9 @@ pub(crate) struct SealedObjectPrefix {
     // to this SAME table; they do not widen legacy replay permission.
     settled_len: usize,
     replay_steps: Vec<SealReplayStep>,
+    // The original paid conversion locator follows the same table/steps.
+    // No consumer can construct an index or substitute its allocation.
+    replay_index: Option<seal_replay::ReplayIndex>,
     open: Vec<CallKey>,
 }
 
@@ -3330,6 +3485,39 @@ impl JournalAdapter {
             )
     }
 
+    /// Retain one already-admitted S1Only negative on its exact original
+    /// physical row. No image taint, model transition or membership release
+    /// occurs until the whole prepared batch has actually entered H9/S1.
+    fn retain_s1only_subject(
+        &mut self,
+        admitted: &AdmittedInstanceCall,
+    ) -> Result<(), joint_driver::RawQuantumRefusal> {
+        use joint_driver::RawQuantumRefusal;
+        if !self.matches_retained_admission(admitted) {
+            return Err(RawQuantumRefusal::Admission);
+        }
+        let (native, image, router, caller) = admitted.journal_binding();
+        let key = JournalDomainKey {
+            domain_tag: native.journal_tag(),
+            caller: caller.0,
+            cookie: image.task_cookie,
+            exec: image.exec_id,
+            router: router.get(),
+        };
+        let resource = admitted
+            .joint_resource_origin()
+            .expect("checked original END");
+        let entry = self
+            .open
+            .get_mut(&resource.invocation())
+            .expect("checked physical original");
+        if entry.s1only_subject.is_some() {
+            return Err(RawQuantumRefusal::DispositionMismatch);
+        }
+        entry.s1only_subject = Some(key);
+        Ok(())
+    }
+
     /// Bind the Session drain serving one attested native domain from
     /// the Session-minted association: the grant's EVENTS-map identity
     /// (minted from the Session's retained EVENTS domain) to its native
@@ -3531,25 +3719,95 @@ impl JournalAdapter {
         popped
     }
 
-    /// Dispose only the exact completed originals of an actual audited H9
-    /// fallback. Read-only validation finishes before registry replay starts;
-    /// the adapter remains exclusively borrowed through replay and disposal.
-    /// No supplied success callback, extra queue or reusable disposal token.
+    /// Read one selected physical original. Counts are useful only after
+    /// every matching original has passed this exact key/START/END/H9 check.
+    fn completed_fallback_original(
+        &self,
+        entry: &OpenEntry,
+        audit: &JournalAuditReceipt,
+        key: JournalDomainKey,
+        frontier: ConsumptionOrdinal,
+        staged_max: u64,
+        target: &crate::discovery::caller_registry::instance_input::JointFeedTarget,
+        registry: &crate::discovery::caller_registry::CallerRegistry,
+    ) -> Result<Option<u64>, joint_driver::RawQuantumRefusal> {
+        use joint_driver::RawQuantumRefusal;
+        let fingerprint = fingerprint_of_begin(&entry.begin);
+        let Some(claimants) = self.claims.get(&fingerprint) else {
+            return Ok(None);
+        };
+        let Some(mine) = claimants.get(&key).filter(|claims| !claims.is_empty()) else {
+            return Ok(None);
+        };
+        let Some(end) = entry.end else {
+            return Err(RawQuantumRefusal::DispositionMismatch);
+        };
+        if mine.len() != 1
+            || claimants
+                .values()
+                .filter(|claims| !claims.is_empty())
+                .count()
+                != 1
+            || entry.begin_ordinal > frontier.0
+            || end.ordinal > frontier.0
+            || entry.image != (key.cookie, key.exec)
+            || entry.converted_ticket.is_some()
+            || entry.converted_for.is_some()
+            || entry.call_key.is_some()
+            || entry.end_converted
+            || entry.abandon.is_some()
+            || entry.corroborated_return.is_some()
+            || entry.raw_resource.is_none()
+            || entry.s1only_subject.is_some()
+        {
+            return Err(RawQuantumRefusal::DispositionMismatch);
+        }
+        let claim = mine.front().expect("one original admission");
+        let event = end.end.payload_base().event;
+        let staged = registry
+            .joint_staged_resource(target, claim.admission)
+            .ok_or(RawQuantumRefusal::DispositionMismatch)?;
+        if claim.admission > staged_max
+            || claim.admission >= audit.h0_below
+            || entry
+                .collected_origin
+                .is_none_or(|origin| origin.position() != claim.admission)
+            || !end_agrees_with_begin(&entry.begin, &end.end)
+            || !fingerprint_matches_event(&fingerprint, &event)
+            || event.ts_ns != claim.return_ns
+            || !self
+                .physical_return_floors
+                .contains_key(&fingerprint.pid_tgid)
+            || !self.ledger.matches_completed_staging(
+                entry.begin_ordinal,
+                key.domain_tag,
+                claim.admission,
+                staged,
+            )
+        {
+            return Err(RawQuantumRefusal::DispositionMismatch);
+        }
+        Ok(Some(claim.admission))
+    }
+
+    /// Validate the original suffix once, in bounded work, before any fallback
+    /// effect or S1 replay. The same frame/cursor then commits only one exact
+    /// completed H8 owner after each actual H9 disposition. No callback,
+    /// exported disposal token, copied fact queue or whole-suffix retry scan.
+    #[allow(clippy::too_many_arguments)]
     fn deliver_completed_fallback(
         &mut self,
         input: joint_audit::AuditedDomainInput<'_>,
-        audited: &joint_audit::AuditedFailure<'_>,
+        batch: &mut joint_audit::FailureBatchDelivery<'_>,
         target: &crate::discovery::caller_registry::instance_input::JointFeedTarget,
         registry: &mut crate::discovery::caller_registry::CallerRegistry,
         model: &ObjectSemantics,
-    ) -> Result<crate::semantics_key_use::FailureApplyOutcome, joint_driver::RawQuantumRefusal>
+        remaining: &mut usize,
+    ) -> Result<crate::semantics_key_use::FailureBatchProgress, joint_driver::RawQuantumRefusal>
     {
-        use crate::semantics_key_use::{
-            FailureApplyOutcome, SealFailureDisposition, disposition_of,
-        };
+        use crate::semantics_key_use::{FailureBatchProgress, SealFailureDisposition};
         use joint_driver::RawQuantumRefusal;
-
-        audited.validate_input(self, &input)?;
+        batch.audited().validate_input(self, &input)?;
         let (audit, bootstrap, frontier) = input.into_parts();
         let proof = bootstrap.proof();
         let key = proof.key;
@@ -3570,124 +3828,115 @@ impl JournalAdapter {
                 .resource_producers
                 .as_ref()
                 .is_none_or(|own| own.native_domain().journal_tag() != key.domain_tag)
-            || disposition_of(audited.failure().gap) != SealFailureDisposition::Fallback
+            || batch.audited().disposition() != SealFailureDisposition::Fallback
         {
             return Err(RawQuantumRefusal::DispositionMismatch);
         }
-        let expected = registry
+        if let Some(total) = batch.cursor.suffix {
+            if registry.joint_staged_count(target) != total.checked_sub(batch.cursor.consumed) {
+                return Err(RawQuantumRefusal::DispositionMismatch);
+            }
+        } else {
+            loop {
+                if *remaining == 0 {
+                    return Ok(FailureBatchProgress::Yielded);
+                }
+                let next = match batch.cursor.after {
+                    None => self.open.first_key_value(),
+                    Some(native) => self
+                        .open
+                        .range((
+                            std::ops::Bound::Excluded(native),
+                            std::ops::Bound::Unbounded,
+                        ))
+                        .next(),
+                };
+                *remaining -= 1;
+                let Some((native, entry)) = next else {
+                    let expected = registry
+                        .joint_staged_count(target)
+                        .ok_or(RawQuantumRefusal::Admission)?;
+                    if batch.cursor.verified != expected {
+                        return Err(RawQuantumRefusal::DispositionMismatch);
+                    }
+                    batch.cursor.suffix = Some(expected);
+                    break;
+                };
+                if self
+                    .completed_fallback_original(
+                        entry,
+                        audit,
+                        key,
+                        frontier,
+                        *staged_max,
+                        target,
+                        registry,
+                    )?
+                    .is_some()
+                {
+                    batch.cursor.verified = batch
+                        .cursor
+                        .verified
+                        .checked_add(1)
+                        .ok_or(RawQuantumRefusal::Capacity)?;
+                }
+                batch.cursor.after = Some(*native);
+            }
+        }
+        let before = registry
             .joint_staged_count(target)
             .ok_or(RawQuantumRefusal::Admission)?;
-        let mut verified = 0usize;
-        for entry in self.open.values() {
-            let fingerprint = fingerprint_of_begin(&entry.begin);
-            let Some(claimants) = self.claims.get(&fingerprint) else {
-                continue; // An incomplete unadmitted START keeps its existing owner.
-            };
-            let Some(mine) = claimants.get(&key).filter(|claims| !claims.is_empty()) else {
-                continue;
-            };
-            let Some(end) = entry.end else {
-                return Err(RawQuantumRefusal::DispositionMismatch);
-            };
-            if mine.len() != 1
-                || claimants
-                    .values()
-                    .filter(|claims| !claims.is_empty())
-                    .count()
-                    != 1
-                || entry.begin_ordinal > frontier.0
-                || end.ordinal > frontier.0
-                || entry.image != (key.cookie, key.exec)
-                || entry.converted_ticket.is_some()
-                || entry.converted_for.is_some()
-                || entry.call_key.is_some()
-                || entry.end_converted
-                || entry.abandon.is_some()
-                || entry.corroborated_return.is_some()
-                || entry.raw_resource.is_none()
-            {
-                return Err(RawQuantumRefusal::DispositionMismatch);
-            }
-            let claim = mine.front().expect("one original admission");
-            let event = end.end.payload_base().event;
-            let staged = registry
-                .joint_staged_resource(target, claim.admission)
-                .ok_or(RawQuantumRefusal::DispositionMismatch)?;
-            if claim.admission > *staged_max
-                || claim.admission >= audit.h0_below
-                || !end_agrees_with_begin(&entry.begin, &end.end)
-                || !fingerprint_matches_event(&fingerprint, &event)
-                || event.ts_ns != claim.return_ns
-                || !self
-                    .physical_return_floors
-                    .contains_key(&fingerprint.pid_tgid)
-                || !self.ledger.matches_completed_staging(
-                    entry.begin_ordinal,
-                    key.domain_tag,
-                    claim.admission,
-                    staged,
-                )
-            {
-                return Err(RawQuantumRefusal::DispositionMismatch);
-            }
-            verified = verified.checked_add(1).ok_or(RawQuantumRefusal::Capacity)?;
-        }
-        // No unmatched H9 original may fall back, including a converted call
-        // whose claim is already owned by the model. Counts are checked only
-        // after every matching original's exact membership and terminal.
-        if verified != expected {
-            return Err(RawQuantumRefusal::DispositionMismatch);
-        }
-        let outcome = registry.deliver_joint_failure(target.id(), audited, model, &mut self.ledger);
-        if !matches!(outcome, FailureApplyOutcome::FellBack { .. }) {
-            return Ok(outcome);
-        }
-        // The registry only borrowed the ledger: claims and opens cannot
-        // change between the preflight and this once-only fallback commit.
-        // One advancing cursor visits the existing opens without a key queue.
-        let mut after = None;
-        let mut disposed = 0;
-        loop {
-            let next = match after {
-                None => self.open.first_key_value(),
-                Some(native) => self
+        let head = registry.joint_staged_head_original(target);
+        let original = match head {
+            Some((admission, Some(native))) => {
+                let entry = self
                     .open
-                    .range((
-                        std::ops::Bound::Excluded(native),
-                        std::ops::Bound::Unbounded,
-                    ))
-                    .next(),
+                    .get(&native)
+                    .ok_or(RawQuantumRefusal::DispositionMismatch)?;
+                if self.completed_fallback_original(
+                    entry,
+                    audit,
+                    key,
+                    frontier,
+                    *staged_max,
+                    target,
+                    registry,
+                )? != Some(admission)
+                {
+                    return Err(RawQuantumRefusal::DispositionMismatch);
+                }
+                Some((native, admission))
             }
-            .map(|(native, entry)| {
-                (
-                    *native,
-                    self.peek_claim(&fingerprint_of_begin(&entry.begin), key)
-                        .is_some(),
-                )
-            });
-            let Some((native, selected)) = next else {
-                break;
-            };
-            after = Some(native);
-            if !selected {
-                continue;
-            }
+            Some((_, None)) => return Err(RawQuantumRefusal::DispositionMismatch),
+            None if before == 0 => None,
+            None => return Err(RawQuantumRefusal::DispositionMismatch),
+        };
+        let outcome =
+            registry.deliver_joint_failure(target.id(), batch, model, &mut self.ledger, remaining);
+        let after = registry
+            .joint_staged_count(target)
+            .ok_or(RawQuantumRefusal::Admission)?;
+        if after != before {
+            assert_eq!(
+                before.checked_sub(1),
+                Some(after),
+                "one bounded original disposition"
+            );
+            let (native, admission) = original.expect("preflight exact consumed head");
             let (ordinal, fingerprint) = {
                 let entry = self
                     .open
                     .remove(&native)
-                    .expect("preflight retained original");
+                    .expect("exclusively retained original");
                 (entry.begin_ordinal, fingerprint_of_begin(&entry.begin))
-            }; // Drop the retained physical entry before its H8 membership.
-            self.consume_claim(&fingerprint, key)
-                .expect("preflight retained exact claim");
+            };
+            let claim = self
+                .consume_claim(&fingerprint, key)
+                .expect("preflight original claim");
+            assert_eq!(claim.admission, admission);
             self.ledger.release_h8open(ordinal);
-            disposed += 1;
+            batch.cursor.consumed += 1;
         }
-        assert_eq!(
-            disposed, verified,
-            "completed original fallback commits once"
-        );
         Ok(outcome)
     }
 
@@ -4900,6 +5149,81 @@ impl JournalAdapter {
                 }
             }
         }
+        // Populate the same current delta before terminal actions, while
+        // every converted original still exists. Newly converted BEGINs are
+        // already begin-ordered; search only that unchanged prefix, then append
+        // older fresh terminals once. This avoids a scan per terminal.
+        let converted_begins = settled.len();
+        for entry in self
+            .open
+            .values()
+            .filter(|entry| entry.converted_for == Some(key))
+        {
+            let end = entry
+                .end
+                .filter(|staged| staged.ordinal <= frontier && !entry.end_converted);
+            let abandoned = entry.abandon.is_some_and(|staged| {
+                staged.ordinal <= frontier
+                    && staged.abandon.reason() == JOURNAL_REASON_SYNC_RETURN_RESULT_LOST
+            });
+            if end.is_none() && !abandoned {
+                continue;
+            }
+            if let Ok(index) = settled[..converted_begins]
+                .binary_search_by_key(&entry.begin_ordinal, |summary| summary.begin_cut)
+            {
+                settled[index].end_cut = end.map(|staged| staged.ordinal);
+                settled[index].abandoned = abandoned;
+            } else {
+                let (session, mechanism) = sealed_fingerprint(&entry.begin);
+                settled.push(SealedCall {
+                    ticket: entry.converted_ticket.expect("converted original"),
+                    key: entry.call_key.expect("converted original key"),
+                    function: entry.function,
+                    begin_cut: entry.begin_ordinal,
+                    end_cut: end.map(|staged| staged.ordinal),
+                    abandoned,
+                    session,
+                    mechanism,
+                });
+            }
+        }
+        // Terminal deltas append after this seal's conversions; restore
+        // the begin-cut order the prefix promises H9.
+        settled.sort_unstable_by_key(|summary| summary.begin_cut);
+        let settled_len = settled.len();
+        if let Some(replay) = &mut replay {
+            let retained = self
+                .open
+                .values()
+                .filter(|entry| entry.converted_for == Some(key))
+                .map(|entry| {
+                    let (session, mechanism) = sealed_fingerprint(&entry.begin);
+                    SealedCall {
+                        ticket: entry.converted_ticket.expect("converted original"),
+                        key: entry.call_key.expect("converted original key"),
+                        function: entry.function,
+                        begin_cut: entry.begin_ordinal,
+                        end_cut: entry
+                            .end
+                            .filter(|staged| staged.ordinal <= frontier)
+                            .map(|staged| staged.ordinal),
+                        abandoned: entry
+                            .abandon
+                            .is_some_and(|staged| staged.ordinal <= frontier),
+                        session,
+                        mechanism,
+                    }
+                });
+            if !replay.freeze_calls(&mut settled, retained) {
+                return Err(SealFailure {
+                    effects,
+                    ..self.failure(JournalGap::ModelRefused)
+                });
+            }
+        }
+        // Table metadata is now stable. Only the actual actions below and
+        // actual settlement can mint End/BoundedLoss step permissions.
         // Terminals for this key's converted begins: ends complete,
         // bounded abandonments dispose through the lost-outcome bound.
         // A sibling's converted terminals belong to its own seal.
@@ -4938,23 +5262,6 @@ impl JournalAdapter {
                     .get_mut(&native)
                     .expect("staged terminal")
                     .end_converted = true;
-                if let Some(summary) = settled.iter_mut().find(|summary| summary.ticket == token) {
-                    summary.end_cut = Some(staged.ordinal);
-                } else {
-                    // The BEGIN converted under an earlier seal: emit an
-                    // explicit terminal delta so H9 sees the close.
-                    let (session, mechanism) = sealed_fingerprint(&entry.begin);
-                    settled.push(SealedCall {
-                        ticket: token,
-                        key: entry.call_key.expect("converted terminal has a key"),
-                        function: entry.function,
-                        begin_cut: entry.begin_ordinal,
-                        end_cut: Some(staged.ordinal),
-                        abandoned: false,
-                        session,
-                        mechanism,
-                    });
-                }
             }
             if let Some(staged) = entry.abandon
                 && staged.ordinal <= frontier
@@ -4976,28 +5283,16 @@ impl JournalAdapter {
                 );
                 effects.effects.extend(lost.effects);
                 if let Some(replay) = &mut replay {
-                    replay.conversion(at, start..effects.effects.len());
+                    replay.bounded_loss(
+                        entry.call_key.expect("converted loss subject"),
+                        token,
+                        at,
+                        start..effects.effects.len(),
+                    );
                 }
                 let retained = self.keys.get_mut(&key).expect("sealed key");
                 retained.bounded_upper =
                     Some(retained.bounded_upper.map_or(at, |kept| kept.max(at)));
-                if let Some(summary) = settled.iter_mut().find(|summary| summary.ticket == token) {
-                    summary.abandoned = true;
-                } else {
-                    // The BEGIN converted under an earlier seal: emit an
-                    // explicit terminal delta so H9 sees the bound.
-                    let (session, mechanism) = sealed_fingerprint(&entry.begin);
-                    settled.push(SealedCall {
-                        ticket: token,
-                        key: entry.call_key.expect("converted terminal has a key"),
-                        function: entry.function,
-                        begin_cut: entry.begin_ordinal,
-                        end_cut: None,
-                        abandoned: true,
-                        session,
-                        mechanism,
-                    });
-                }
             }
         }
         // Settle the covered history under this bootstrap. The open
@@ -5016,40 +5311,6 @@ impl JournalAdapter {
             })
             .map(|entry| entry.call_key.expect("converted open has a key"))
             .collect();
-        // Terminal deltas append after this seal's conversions; restore
-        // the begin-cut order the prefix promises H9.
-        settled.sort_unstable_by_key(|summary| summary.begin_cut);
-        let settled_len = settled.len();
-        if let Some(replay) = &mut replay {
-            let retained = self
-                .open
-                .values()
-                .filter(|entry| entry.converted_for == Some(key))
-                .map(|entry| {
-                    let (session, mechanism) = sealed_fingerprint(&entry.begin);
-                    SealedCall {
-                        ticket: entry.converted_ticket.expect("converted original"),
-                        key: entry.call_key.expect("converted original key"),
-                        function: entry.function,
-                        begin_cut: entry.begin_ordinal,
-                        end_cut: entry
-                            .end
-                            .filter(|staged| staged.ordinal <= frontier)
-                            .map(|staged| staged.ordinal),
-                        abandoned: entry
-                            .abandon
-                            .is_some_and(|staged| staged.ordinal <= frontier),
-                        session,
-                        mechanism,
-                    }
-                });
-            if !replay.freeze_calls(&mut settled, retained) {
-                return Err(SealFailure {
-                    effects,
-                    ..self.failure(JournalGap::ModelRefused)
-                });
-            }
-        }
         let mut prefix = SealedObjectPrefix {
             domain,
             frontier,
@@ -5058,6 +5319,7 @@ impl JournalAdapter {
             settled,
             settled_len,
             replay_steps: Vec::new(),
+            replay_index: None,
             open,
         };
         let offset = effects.effects.len();
@@ -5109,13 +5371,14 @@ impl JournalAdapter {
             });
         }
         if let Some(replay) = replay {
-            let Some(steps) = replay.finish(effects.effects.len()) else {
+            let Some((steps, index)) = replay.finish(effects.effects.len()) else {
                 return Err(SealFailure {
                     effects,
                     ..self.failure(JournalGap::ModelRefused)
                 });
             };
             prefix.replay_steps = steps;
+            prefix.replay_index = Some(index);
         }
         debug_assert!(prefix.settled_len <= prefix.settled.len());
         self.keys.get_mut(&key).expect("sealed key").sealed_through = frontier;

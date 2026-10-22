@@ -472,7 +472,10 @@ struct RealScene {
 
 impl RealScene {
     fn new(providers: usize) -> Self {
-        let held = HeldProviders::new(providers);
+        Self::from_held(HeldProviders::new(providers))
+    }
+
+    fn from_held(held: HeldProviders) -> Self {
         let lane = AttestedSemanticLane::start(held.subset, &Scope::System, BackendSelection::Auto)
             .unwrap();
         let domain = lane.domain();
@@ -832,6 +835,166 @@ fn joint_prepared_batch_keeps_equal_shaped_original_admissions() {
         rows[0].0,
         Some(3),
         "every original stages once through direct S1"
+    );
+}
+
+#[test]
+fn joint_prepared_current_receipt_budget_includes_held_provider_allocations() {
+    use crate::inventory_semantics::SemanticRefusal;
+    use crate::semantics_objects::journal::H3DispositionEvidence;
+
+    let pid = std::process::id();
+    let mut healthy = RealScene::new(1);
+    healthy.bind(pid, image(7), 0);
+    healthy.enqueue(pid, 0, "C_SignInit", 0x000d, 0);
+    let batch = healthy.collected_tick();
+    healthy.scene.coordinator.stage_semantic_batch(batch);
+    let healthy_before = healthy
+        .scene
+        .coordinator
+        .registry()
+        .semantic_resource_snapshot();
+    healthy
+        .scene
+        .coordinator
+        .prepare_staged_semantic_batch(&mut healthy.lane, None)
+        .unwrap();
+    let short_path_budget = healthy
+        .scene
+        .coordinator
+        .registry()
+        .semantic_resource_snapshot()
+        .charged_bytes
+        - healthy_before.charged_bytes;
+    let receipts = healthy
+        .scene
+        .coordinator
+        .prepared_semantic_batch()
+        .unwrap()
+        .current_receipts();
+    assert_eq!(receipts.len(), 1, "one genuine current H0 partition");
+    let short_watched_bytes = receipts[0]
+        .watched()
+        .retained_copy_allocation_charge()
+        .unwrap();
+    assert!(short_watched_bytes > 0);
+    healthy.scene.coordinator.dispose_prepared_claims_s1();
+    assert!(healthy.scene.coordinator.stage_next_prepared_admission());
+    assert!(
+        healthy
+            .scene
+            .coordinator
+            .finish_prepared_semantic_batch(&healthy.lane)
+    );
+    assert_eq!(
+        healthy
+            .scene
+            .coordinator
+            .registry()
+            .semantic_resource_snapshot()
+            .charged_bytes,
+        healthy_before.charged_bytes,
+        "successful retention refunds all original storage"
+    );
+
+    // This has the same ELF, physical-key digest and one-call shape. Only
+    // the genuinely opened provider's independently cloned paths grow.
+    let dir = tempfile::tempdir().unwrap();
+    let mut provider_dir = dir.path().to_owned();
+    for index in 0..16 {
+        provider_dir.push(format!("{index:02}-{}", "p".repeat(210)));
+    }
+    std::fs::create_dir_all(&provider_dir).unwrap();
+    let provider = provider_dir.join("provider.so");
+    std::fs::copy("/usr/bin/true", &provider).unwrap();
+    let mut limited = RealScene::from_held(HeldProviders::from_paths(dir, &[provider]));
+    limited.bind(pid, image(7), 0);
+    limited.enqueue(pid, 0, "C_SignInit", 0x000d, 0);
+    let batch = limited.collected_tick();
+    assert_eq!(limited.h0.0.borrow().last_calls.len(), 1);
+    let long_watched_bytes = limited.h0.0.borrow().io.watched[0]
+        .retained_copy_allocation_charge()
+        .unwrap();
+    assert!(
+        long_watched_bytes > short_path_budget,
+        "the actual watched strings alone must exceed this retained handoff budget"
+    );
+    limited.scene.coordinator.stage_semantic_batch(batch);
+    let before = limited
+        .scene
+        .coordinator
+        .registry()
+        .semantic_resource_snapshot();
+    limited
+        .scene
+        .coordinator
+        .registry_mut()
+        .reference_semantic_resource_limit(before.charged_bytes + short_path_budget);
+    assert!(matches!(
+        limited
+            .scene
+            .coordinator
+            .prepare_staged_semantic_batch(&mut limited.lane, None),
+        Err(SemanticRefusal::ProviderStorage)
+    ));
+    let refused = limited
+        .scene
+        .coordinator
+        .registry()
+        .semantic_resource_snapshot();
+    assert_eq!(refused.charged_bytes, before.charged_bytes);
+    assert_eq!(refused.refused, before.refused + 1);
+    assert!(
+        limited
+            .scene
+            .coordinator
+            .prepared_semantic_batch()
+            .is_none()
+    );
+    assert!(
+        limited
+            .scene
+            .coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .any(|gap| {
+                gap.subject == "semantic handoff storage refused"
+                    && gap.reason == "semantic_resource_capacity"
+            })
+    );
+    assert!(!limited.scene.coordinator.stage_next_prepared_admission());
+    assert!(
+        !limited
+            .scene
+            .coordinator
+            .finish_prepared_semantic_batch(&limited.lane)
+    );
+    assert!(matches!(
+        limited.scene.coordinator.take_h3_disposition(),
+        H3DispositionEvidence::Clean {
+            staged_max: 1,
+            pending_floor: None
+        }
+    ));
+    // Isolate the retained-handoff reservation from the S1 reducer's own
+    // later reservations; the original was already staged by refusal.
+    limited
+        .scene
+        .coordinator
+        .registry_mut()
+        .reference_semantic_resource_limit(before.limit_bytes);
+    limited
+        .scene
+        .coordinator
+        .commit_batch_with_semantics(false, Some(&mut limited.lane))
+        .unwrap();
+    let rows = operation_edge_rows(&limited.scene);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].0,
+        Some(1),
+        "refusal preserves the original direct S1 call"
     );
 }
 

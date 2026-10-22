@@ -2260,10 +2260,9 @@ pub(crate) struct SessionBirthEvidence {
 
 impl SessionBirthEvidence {
     /// Production observation: only Session-owned attach code holds the
-    /// issuance token, and only the birth observation sites
-    /// (`observe_exec_birth` / `observe_absence_birth`) call this, with
-    /// words they read or derived from genuine Session producers. The
-    /// joint seal tick that observes in production is later Task 3 work.
+    /// native-evidence issuance token. Observation sites call this with words
+    /// they read or derived from genuine Session producers. This evidence does
+    /// not authorize a grant without the validated H0/absence association.
     #[allow(dead_code)] // No production caller until the joint seal tick lands.
     pub(crate) fn issue(
         _token: &crate::attach::SessionGrantToken,
@@ -2466,9 +2465,9 @@ impl JournalBirthCut {
 /// closure generation, plus the Session-observed native evidence the
 /// claim was attested under (exec marker publication/readback or
 /// held-custody absence/appearance). Production mint requires the
-/// Session issuance capability, so stream inference alone can never
-/// birth; the fields stay private, attestation checks the bundled
-/// evidence, and the seal re-checks fresh evidence against retained
+/// original validated H0/absence association, so native freshness and stream
+/// inference alone can never birth; the fields stay private, attestation checks
+/// the bundled evidence, and the seal re-checks fresh evidence against retained
 /// truth.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SessionBirthGrant {
@@ -2481,20 +2480,12 @@ pub(crate) struct SessionBirthGrant {
 }
 
 impl SessionBirthGrant {
-    /// Production mint: only Session-owned attach code holds the
-    /// issuance token, minted solely by the birth observation sites.
-    /// The joint seal tick that issues in production is later Task 3
-    /// work; until it lands the observation/issue path is exercised by
-    /// tests.
+    /// Production mint consumes the H0 owner's opaque authorization. Its exact
+    /// proof, birth kind, stream cut, closure and native evidence were checked
+    /// together; callers cannot replace one word or mint from a freshness probe.
     #[allow(dead_code)] // No production caller until the joint seal tick lands.
-    pub(crate) fn issue(
-        _token: &crate::attach::SessionGrantToken,
-        proof: JournalDomainProof,
-        birth: BirthKind,
-        birth_cut: &JournalBirthCut,
-        closure_generation: u64,
-        evidence: SessionBirthEvidence,
-    ) -> Self {
+    pub(crate) fn issue(authorization: crate::semantic_capture::ValidatedH0Birth) -> Self {
+        let (proof, birth, birth_cut, closure_generation, evidence) = authorization.into_parts();
         Self {
             proof,
             birth,
@@ -2999,7 +2990,7 @@ impl JournalAdapter {
     /// receipts and audits under older generations refuse as stale; only
     /// fresh Session-granted attestation under the live generation
     /// seals. A supplied integer never advances the closure: production
-    /// grants mint only through the Session issuance capability.
+    /// grants mint only through the H0 owner's validated association.
     pub(crate) fn install_closure_grant(&mut self, grant: &SessionClosureGrant) -> bool {
         if grant.generation < self.closure_generation {
             return false;

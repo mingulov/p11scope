@@ -741,11 +741,10 @@ fn map_file_identity(
     })
 }
 
-/// Issuance capability for H8 birth grants. Only Session-owned attach
-/// code can mint one (private field, constructed solely by the birth
-/// observation sites in this module). The birth sources the seal pulls
-/// through call the observation sites; scripted grants cover the
-/// journal child's other tests through its `cfg(test)` seams.
+/// Issuance capability for native birth evidence, never birth grants.
+/// Only Session-owned attach code can mint one (private field, constructed
+/// solely by the observation sites in this module). Production grant issuance
+/// separately requires the opaque validated H0/absence association.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SessionGrantToken(());
 
@@ -902,8 +901,9 @@ fn common_retained_birth_words(
     Ok(((image.task_cookie, image.exec_id), custody_word))
 }
 
-/// Re-read native truth using the retained admission and original H0 witness.
-/// The caller validates that witness; no router observation is repeated here.
+/// Re-read native truth for a retained admission. This is freshness evidence,
+/// not birth authority; only the H0 owner can authorize an initial birth after
+/// validating its original candidate and any required committed absence.
 pub(crate) fn observe_retained_birth(
     rows: &mut impl BirthRowReader,
     binding: &crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding,
@@ -911,10 +911,7 @@ pub(crate) fn observe_retained_birth(
     admitted: &BirthAdmissionBinding,
     birth: crate::semantics_objects::journal::BirthKind,
 ) -> std::result::Result<
-    (
-        SessionGrantToken,
-        crate::semantics_objects::journal::SessionBirthEvidence,
-    ),
+    crate::semantics_objects::journal::SessionBirthEvidence,
     BirthObservationRefusal,
 > {
     use crate::semantics_objects::journal::BirthKind;
@@ -950,7 +947,7 @@ pub(crate) fn observe_retained_birth(
         attachment.generation(),
         custody,
     );
-    Ok((token, evidence))
+    Ok(evidence)
 }
 
 /// Session-owned exec-marker birth observation. The producers are
@@ -961,11 +958,10 @@ pub(crate) fn observe_retained_birth(
 /// generation), the admission authority's custody binding (the held
 /// pidfd bound to the admitted image), the sealed successful
 /// attachment for the admitted domain, and the admitted image itself.
-/// No caller-provided record/control structs on this path. Returns
-/// the issuance token with the observed evidence; only this path and
-/// its absence twin mint production birth grants. The seal pulls
-/// fresh evidence again, so native truth that moved between the two
-/// refuses.
+/// No caller-provided record/control structs on this path. Returns the native
+/// evidence issuance token with the observed evidence; neither authorizes a
+/// production grant without the validated H0 association. The seal pulls fresh
+/// evidence again, so native truth that moved between the two refuses.
 ///
 /// Live map reads stay UNRUN: production wires [`LiveBirthRows`];
 /// host tests read fixture bytes the real native leaves published.

@@ -139,6 +139,36 @@ pub(crate) struct CommittedAbsenceBirth {
     cut: JournalBirthCut,
 }
 
+/// One-shot authorization minted only after the original H0 candidate, its
+/// admission and any required committed absence have been checked together.
+/// Native freshness observations cannot construct this subject-bound value.
+pub(crate) struct ValidatedH0Birth {
+    proof: JournalDomainProof,
+    birth: BirthKind,
+    cut: JournalBirthCut,
+    closure_generation: u64,
+    evidence: crate::semantics_objects::journal::SessionBirthEvidence,
+}
+impl ValidatedH0Birth {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        JournalDomainProof,
+        BirthKind,
+        JournalBirthCut,
+        u64,
+        crate::semantics_objects::journal::SessionBirthEvidence,
+    ) {
+        (
+            self.proof,
+            self.birth,
+            self.cut,
+            self.closure_generation,
+            self.evidence,
+        )
+    }
+}
+
 pub(crate) struct RetainedBirthWitness {
     candidate: H0BirthCandidate,
     admission: crate::attach::BirthAdmissionBinding,
@@ -196,7 +226,6 @@ impl RetainedBirthWitness {
                 &self.admission,
                 self.receipt.birth(),
             )?
-            .1
         };
         capture.validate_birth_candidate(
             &mut SessionIo {
@@ -235,8 +264,7 @@ impl RetainedBirthWitness {
             attachment,
             &self.admission,
             self.receipt.birth(),
-        )?
-        .1;
+        )?;
         capture.validate_birth_candidate(io, &self.candidate, true)?;
         if Instant::now() >= deadline {
             return Err(crate::attach::BirthObservationRefusal::CurrentPartition);
@@ -1359,16 +1387,16 @@ impl SemanticCapture {
             return Err(Refusal::StreamCut);
         }
         let admission = crate::attach::BirthAdmissionBinding::from_admitted(admitted);
-        let (token, evidence) =
+        let evidence =
             crate::attach::observe_retained_birth(rows, binding, attachment, &admission, birth)?;
-        let grant = crate::semantics_objects::journal::SessionBirthGrant::issue(
-            &token,
-            *proof,
+        let authorization = ValidatedH0Birth {
+            proof: *proof,
             birth,
-            &candidate.cut,
-            attachment.generation(),
+            cut: candidate.cut.clone(),
+            closure_generation: attachment.generation(),
             evidence,
-        );
+        };
+        let grant = crate::semantics_objects::journal::SessionBirthGrant::issue(authorization);
         let receipt =
             BootstrapReceipt::attest(adapter, &grant).map_err(|_| Refusal::AbsenceHistory)?;
         Ok(RetainedBirthWitness {
@@ -4078,19 +4106,19 @@ mod tests {
 
     #[test]
     fn joint_native_freshness_alone_cannot_authorize_absence_birth() {
-        use crate::semantics_objects::journal::{
-            SessionBirthGrant,
-            tests::{NativeBirthRows, NativePublisher},
-        };
+        use crate::semantics_objects::journal::tests::{NativeBirthRows, NativePublisher};
         let mut harness = JointBirthHarness::new();
         harness.push_ordinary(ImageIdentity::default());
         let mut quiet = harness.collect();
-        let (report, admitted) = harness.route(&mut quiet);
+        let (mut report, admitted) = harness.route(&mut quiet);
         quiet.classify_ordinary(&admitted).unwrap();
         let (_, proof) = harness.ingest(quiet, &admitted);
         let cut = harness
             .adapter
-            .resolve_birth_cut(&harness.drain.consumption_cut().unwrap(), &harness.producers)
+            .resolve_birth_cut(
+                &harness.drain.consumption_cut().unwrap(),
+                &harness.producers,
+            )
             .unwrap();
         assert!(
             harness
@@ -4098,13 +4126,12 @@ mod tests {
                 .quiet_sighting_at(harness.io.current_image, &cut)
         );
         // This already-present provider has no committed absence or later
-        // appearance. Discard its actual H0 report instead of consuming New.
-        drop(report);
+        // appearance. The native probe can return freshness evidence only.
         let publisher = NativePublisher::build();
         let (row, control, _) = publisher.publish(&["0", "0", "0", "0", "1"]);
         let mut rows = NativeBirthRows { row, control };
         let binding = crate::attach::BirthAdmissionBinding::from_admitted(&admitted);
-        let (token, evidence) = crate::attach::observe_retained_birth(
+        crate::attach::observe_retained_birth(
             &mut rows,
             harness.fixture.binding(),
             harness.fixture.attachment(),
@@ -4112,18 +4139,48 @@ mod tests {
             BirthKind::AbsenceAppearance,
         )
         .expect("honest native freshness is available without birth authority");
-        let grant = SessionBirthGrant::issue(
-            &token,
-            proof,
-            BirthKind::AbsenceAppearance,
-            &cut,
-            harness.fixture.attachment().generation(),
-            evidence,
+        let candidate = report
+            .take_current()
+            .pop()
+            .unwrap()
+            .into_birth_candidate()
+            .unwrap_or_else(|_| panic!("actual first H0 New candidate"));
+        harness
+            .capture
+            .validate_birth_candidate(&mut harness.io, &candidate, false)
+            .unwrap();
+        let birth = harness.capture.finish_birth(
+            candidate,
+            None,
+            &admitted,
+            harness.fixture.binding(),
+            harness.fixture.attachment(),
+            &proof,
+            &harness.adapter,
+            &mut rows,
         );
         assert!(
-            BootstrapReceipt::attest(&harness.adapter, &grant).is_err(),
+            matches!(
+                birth,
+                Err(crate::attach::BirthObservationRefusal::MarkerNotReady)
+            ),
             "native freshness and a quiet stream cut cannot replace a committed absence and actual new appearance"
         );
+        harness.push_ordinary(ImageIdentity::default());
+        let mut quiet = harness.collect();
+        let (mut report, admitted) = harness.route(&mut quiet);
+        assert_eq!(report.observations, vec![ObserveOutcome::Continued]);
+        assert!(
+            report
+                .take_current()
+                .pop()
+                .unwrap()
+                .into_birth_candidate()
+                .is_err(),
+            "an already-present quiet provider cannot renew actual H0 novelty"
+        );
+        quiet.classify_ordinary(&admitted).unwrap();
+        harness.ingest(quiet, &admitted);
     }
 
     pub(super) fn actual_absence_birth_fixture() {

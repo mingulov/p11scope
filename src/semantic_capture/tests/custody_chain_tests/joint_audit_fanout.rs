@@ -3472,6 +3472,41 @@ struct ObservationWire {
     end: [u8; 632],
 }
 
+/// An omitted empty transition, a guessed call index, or a reordered effect
+/// range must fail at the same original seal H9 will eventually borrow.
+fn assert_original_replay_partition(seal: &crate::semantics_objects::journal::SealSuccess) {
+    use crate::semantics_objects::journal::SealReplayPhase;
+    let mut next = 0;
+    for step in seal.prefix.replay_steps() {
+        let range = step.effect_range();
+        assert_eq!(range.start, next, "steps partition the original buffer");
+        assert!(range.end >= range.start && range.end <= seal.effects.effects.len());
+        let original = &seal.effects.effects[range.clone()];
+        let borrowed = seal.effects_for_step(step).unwrap();
+        assert_eq!(borrowed, original);
+        assert_eq!(borrowed.as_ptr(), original.as_ptr(), "no cloned facts");
+        if matches!(step.phase(), SealReplayPhase::Begin | SealReplayPhase::End) {
+            let call = seal
+                .prefix
+                .call_for_step(step)
+                .expect("original call index");
+            assert!(seal.prefix.replay_calls().contains(call));
+            assert_eq!(
+                step.cut(),
+                if step.phase() == SealReplayPhase::End {
+                    call.end_cut
+                } else {
+                    Some(call.begin_cut)
+                }
+            );
+        } else {
+            assert!(seal.prefix.call_for_step(step).is_none());
+        }
+        next = range.end;
+    }
+    assert_eq!(next, seal.effects.effects.len());
+}
+
 fn observation_wire(
     fixture: &CanonicalFanoutScene,
     pid: u32,
@@ -3775,6 +3810,35 @@ fn observe_genuine_settlement_order(late_metadata: bool) {
                 conversion_len, 0,
                 "healthy conversion emitted no pre-settlement effects"
             );
+            assert_original_replay_partition(seal);
+            use crate::semantics_objects::journal::SealReplayPhase;
+            assert_eq!(seal.prefix.replay_calls(), seal.prefix.settled());
+            assert_eq!(seal.prefix.replay_steps().len(), 38);
+            let actual_steps: Vec<_> = seal
+                .prefix
+                .replay_steps()
+                .iter()
+                .filter(|step| {
+                    matches!(step.phase(), SealReplayPhase::Begin | SealReplayPhase::End)
+                })
+                .collect();
+            assert_eq!(actual_steps.len(), trace.steps.len());
+            for (actual, observed) in actual_steps.iter().zip(&trace.steps) {
+                let original = seal.prefix.call_for_step(actual).unwrap();
+                assert_eq!(original.ticket, observed.call);
+                assert_eq!(actual.cut(), Some(observed.cut));
+                assert_eq!(actual.phase() == SealReplayPhase::End, observed.terminal);
+                assert_eq!(actual.effect_range(), observed.effects.clone());
+            }
+            assert_eq!(
+                seal.prefix
+                    .replay_steps()
+                    .iter()
+                    .filter(|step| step.phase() == SealReplayPhase::Conversion)
+                    .count(),
+                18,
+                "each real conversion stays distinct even when it emits no effects"
+            );
             let prefix_base = seal.prefix.frontier_cut() - physical.len() as u64;
             let mut keyuse = KeyUseReducer::new();
             let mut selected = Vec::new();
@@ -3963,4 +4027,358 @@ fn joint_seal_observation_trace_keeps_call_positions() {
 #[test]
 fn joint_seal_observation_trace_never_backfills_init() {
     observe_genuine_settlement_order(true);
+}
+
+impl CanonicalFanoutScene {
+    fn replay_target(&self) -> (JointFeedTarget, u32) {
+        let target = self
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .joint_feed_targets()
+            .min_by_key(JointFeedTarget::id)
+            .unwrap();
+        let pid = self
+            .scene
+            .real
+            .scene
+            .coordinator
+            .semantic_bindings()
+            .get(target.caller())
+            .unwrap()
+            .pin()
+            .pid();
+        (target, pid)
+    }
+
+    fn seal_replay_head(
+        &mut self,
+        frame: &mut IngestedJointQuantum,
+        fault: &impl crate::semantics_objects::journal::FaultEpoch,
+    ) {
+        let h0 = self.scene.real.h0.clone();
+        let mut births = NativeFrameBirths {
+            h0: &h0,
+            attached: &self.attached,
+            retained: &mut self.births,
+            seen: Vec::new(),
+            unreadable: false,
+        };
+        let mut ports = self
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&self.scene.producers)
+            .unwrap();
+        frame.bind_targets(&ports).unwrap();
+        assert_eq!(
+            frame.seal_next(&mut ports, &mut births, fault),
+            Ok(QuantumSealProgress::DeliveryReady)
+        );
+        assert_eq!(births.seen.len(), 1);
+        assert!(
+            frame.active_seal_for_test().is_some(),
+            "genuine frame must retain the positive"
+        );
+    }
+}
+
+#[test]
+fn joint_replay_steps_keep_prior_terminal_after_conversion_loss() {
+    use crate::semantics_objects::journal::SealReplayPhase;
+    use crate::semantics_objects::journal::tests::abandon_bytes;
+    use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+    let mut fixture = CanonicalFanoutScene::prior_sealed();
+    let (target, pid) = fixture.replay_target();
+    let (open, ordinary) = fixture.scene.encoded(pid, 0, "C_SignUpdate", 2);
+    let (held, complete) = fixture.scene.encoded(pid, 0, "C_SignInit", 3);
+    fixture.scene.drain.source_mut().push_record(open.to_vec());
+    // An actual ordinary completed return can claim START, but cannot be
+    // followed by END for that SAME invocation (the producer's never-both
+    // contract). A bounded ABANDON will later release the different held call.
+    fixture
+        .scene
+        .drain
+        .source_mut()
+        .push_record(ordinary[24..392].to_vec());
+    fixture.scene.drain.source_mut().push_record(held.to_vec());
+    fixture
+        .scene
+        .drain
+        .source_mut()
+        .push_record(complete.to_vec());
+    let mut q1 = fixture.audited(2, 2, &BirthFault);
+    fixture.seal_replay_head(&mut q1, &BirthFault);
+    let first = q1.active_seal_for_test().unwrap();
+    assert_eq!(first.prefix.domain(), target.bootstrap().domain());
+    assert_eq!(first.prefix.settled().len(), 2);
+    let old = *first
+        .prefix
+        .settled()
+        .iter()
+        .find(|call| call.end_cut.is_some())
+        .unwrap();
+    assert!(
+        first.effects.effects.is_empty(),
+        "the real open holds the watermark"
+    );
+    assert_original_replay_partition(first);
+    assert!(
+        !first
+            .prefix
+            .replay_steps()
+            .iter()
+            .any(|step| step.phase() == SealReplayPhase::End)
+    );
+    fixture.scene.assert_claims(&[]);
+    let before_feeds = fixture.feeds();
+    let before_roles = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .ledger()
+        .roles_for_test();
+    assert_eq!(before_roles[..4], [0, 2, 2, 2]);
+
+    let image = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .semantic_bindings()
+        .get(target.caller())
+        .unwrap()
+        .image();
+    let mut abandon = abandon_bytes(
+        u64::from(pid),
+        2,
+        JOURNAL_REASON_SYNC_RETURN_RESULT_LOST,
+        (image.task_cookie, image.exec_id),
+    );
+    abandon[24..32].copy_from_slice(&open[24..32]);
+    abandon[48..52].copy_from_slice(&open[104..108]);
+    abandon[56..64].copy_from_slice(&open[48..56]);
+    fixture
+        .scene
+        .drain
+        .source_mut()
+        .push_record(abandon.to_vec());
+    let mut q2 = fixture.audited(0, 0, &BirthFault);
+    fixture.seal_replay_head(&mut q2, &BirthFault);
+    let second = q2.active_seal_for_test().unwrap();
+    assert_eq!(
+        second.prefix.settled().len(),
+        1,
+        "legacy delta stays unchanged"
+    );
+    assert!(second.prefix.settled()[0].abandoned);
+    assert_eq!(second.prefix.replay_calls().len(), 2);
+    assert_eq!(
+        second.prefix.replay_calls()[1],
+        old,
+        "capture the retained original before prune"
+    );
+    assert_original_replay_partition(second);
+    let conversion = second
+        .prefix
+        .replay_steps()
+        .iter()
+        .find(|step| step.phase() == SealReplayPhase::Conversion)
+        .unwrap();
+    assert!(!conversion.effect_range().is_empty());
+    assert!(
+        second
+            .effects_for_step(conversion)
+            .unwrap()
+            .iter()
+            .any(|effect| matches!(
+                effect,
+                ObjectEffect::Retired {
+                    reason: ObjectGap::OutcomeLost,
+                    ..
+                }
+            ))
+    );
+    let terminal: Vec<_> = second
+        .prefix
+        .replay_steps()
+        .iter()
+        .filter(|step| step.phase() == SealReplayPhase::End)
+        .collect();
+    assert_eq!(
+        terminal.len(),
+        1,
+        "only the different complete original actually settles"
+    );
+    assert_eq!(second.prefix.call_for_step(terminal[0]), Some(&old));
+    assert_eq!(terminal[0].cut(), old.end_cut);
+    assert!(
+        second
+            .effects_for_step(terminal[0])
+            .unwrap()
+            .iter()
+            .any(|effect| matches!(
+                effect,
+                ObjectEffect::Gap {
+                    reason: ObjectGap::BootstrapUnproven
+                }
+            ))
+    );
+    assert!(
+        !second.effects.effects.iter().any(|effect| matches!(effect,
+        ObjectEffect::Referenced { call, .. } if *call == old.ticket)),
+        "conversion loss cannot fabricate a qualified receipt"
+    );
+    assert_eq!(
+        fixture.feeds(),
+        before_feeds,
+        "representation activates no H9 replay"
+    );
+    fixture.scene.assert_claims(&[]);
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .ledger()
+            .roles_for_test()[..4],
+        [0, 0, 0, 2]
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_h3_audit_state(),
+        (3, false)
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_h3_acknowledged_below(),
+        0
+    );
+}
+
+#[test]
+fn joint_replay_step_capacity_refusal_preserves_original() {
+    let mut fixture = CanonicalFanoutScene::prior_sealed();
+    let (_, pid) = fixture.replay_target();
+    fixture.scene.push(pid, 0, "C_SignInit", 2);
+    let fault = FrameFault::clean();
+    let mut frame = fixture.audited(1, 1, &fault);
+    {
+        let ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        frame.bind_targets(&ports).unwrap();
+    }
+    let (legacy, retained, temporary) = {
+        let ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        frame.replay_reservation_for_test(&ports).unwrap()
+    };
+    assert!(retained > 0 && temporary > 0);
+    let coordinator = &fixture.scene.real.scene.coordinator;
+    let claims = coordinator
+        .joint_capture()
+        .adapter()
+        .invocation_claims_for_test();
+    let starts = coordinator
+        .joint_capture()
+        .adapter()
+        .retained_starts_for_test();
+    let roles = coordinator.joint_capture().ledger().roles_for_test();
+    let model = coordinator.joint_capture().model().project();
+    let cursor = (frame.identity(), frame.frontier());
+    let feeds = fixture.feeds();
+    let snapshot = coordinator.registry().semantic_resource_snapshot();
+    let hold = coordinator
+        .registry()
+        .reserve_semantic_storage(snapshot.limit_bytes - snapshot.charged_bytes - legacy)
+        .unwrap();
+    let h0 = fixture.scene.real.h0.clone();
+    let mut births = NativeFrameBirths {
+        h0: &h0,
+        attached: &fixture.attached,
+        retained: &mut fixture.births,
+        seen: Vec::new(),
+        unreadable: false,
+    };
+    let reads = fault.reads.get();
+    {
+        let mut ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        assert!(
+            matches!(
+                frame.seal_next(&mut ports, &mut births, &fault),
+                Err(RawQuantumRefusal::Resource(_))
+            ),
+            "the old result charge alone cannot pay for steps and the temporary locator"
+        );
+    }
+    assert_eq!(fault.reads.get(), reads);
+    assert!(births.seen.is_empty());
+    drop(births);
+    assert_eq!(fixture.feeds(), feeds);
+    let coordinator = &fixture.scene.real.scene.coordinator;
+    assert_eq!(
+        coordinator
+            .joint_capture()
+            .adapter()
+            .invocation_claims_for_test(),
+        claims
+    );
+    assert_eq!(
+        coordinator
+            .joint_capture()
+            .adapter()
+            .retained_starts_for_test(),
+        starts
+    );
+    assert_eq!(coordinator.joint_capture().ledger().roles_for_test(), roles);
+    assert_eq!(coordinator.joint_capture().model().project(), model);
+    assert!(frame.identity() == cursor.0);
+    assert_eq!(frame.frontier(), cursor.1);
+    assert_eq!(
+        coordinator
+            .registry()
+            .semantic_resource_snapshot()
+            .charged_bytes,
+        snapshot.limit_bytes - legacy,
+        "the whole failed preflight is refunded"
+    );
+    drop(hold);
+    fixture.seal_replay_head(&mut frame, &fault);
+    assert_original_replay_partition(frame.active_seal_for_test().unwrap());
+    assert_eq!(
+        fixture.feeds(),
+        feeds,
+        "retry still does not publish or replay"
+    );
 }

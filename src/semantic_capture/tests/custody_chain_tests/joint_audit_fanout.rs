@@ -1523,14 +1523,15 @@ fn joint_frame_preflight_keeps_targets_and_birth_selection_on_retry() {
             .coordinator
             .joint_frame_ports(&fixture.scene.producers)
             .unwrap();
-        for index in 0..2 {
+        assert_eq!(targets.len(), 2);
+        for (index, target) in targets.iter().enumerate() {
             assert_eq!(
                 frame.seal_next(&mut ports, &mut births, &fault),
                 Ok(QuantumSealProgress::DeliveryReady)
             );
             assert_eq!(
                 births.seen[index].0,
-                targets[index].id(),
+                target.id(),
                 "a refused attempt cannot advance the typed subject"
             );
             assert_eq!(

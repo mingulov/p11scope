@@ -7762,6 +7762,29 @@ fn canary_process_custody_lifecycle() {
 }
 
 #[test]
+fn retained_ring_refusal_diagnostics_are_closed() {
+    let output = Command::new("python3")
+        .args([
+            "-I",
+            "tests/python/test_stopped_canary_capture.py",
+            "RetainedRingDiagnosticTests",
+            "-v",
+        ])
+        .output()
+        .expect("run finite retained-ring diagnostic boundaries");
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "retained-ring diagnostics: {report}"
+    );
+    assert_clean_python_suite(&report, "RetainedRingDiagnosticTests", 5);
+}
+
+#[test]
 fn stopped_canary_capture_lifecycle() {
     // Hang guard at ~4x the ~70 s isolated suite time (43-63 s plus ~4 s
     // for the widened missing_* budgets): the old 90 s (~1.5x) fired under

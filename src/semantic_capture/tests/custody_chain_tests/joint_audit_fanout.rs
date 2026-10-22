@@ -468,6 +468,21 @@ impl JointBirthEvidenceSource for NativeFrameBirths<'_> {
     }
 }
 
+struct RefuseOneBirth<'a> {
+    inner: NativeFrameBirths<'a>,
+    refused: Option<CallerId>,
+}
+impl JointBirthEvidenceSource for RefuseOneBirth<'_> {
+    fn take_for(
+        &mut self,
+        target: &JointFeedTarget,
+        binding: &SemanticCallerBinding,
+    ) -> Result<SessionBirthEvidence, BirthObservationRefusal> {
+        self.inner.unreadable = self.refused == Some(target.caller());
+        self.inner.take_for(target, binding)
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct FeedState {
     id: RegistryInstanceId,
@@ -795,6 +810,111 @@ fn joint_two_feeds_share_nonzero_audited_fallback_once() {
             .roles_for_test()[..4],
         [0, 0, 0, 0],
         "completed originals release Raw/H8/Model/H9 after once-only fallback; legitimate live S1 associations keep their own roles"
+    );
+}
+
+#[test]
+fn joint_fallback_preflight_preserves_incomplete_admitted_original() {
+    let mut fixture = CanonicalFanoutScene::prior_sealed();
+    let first = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .joint_feed_targets()
+        .next()
+        .unwrap();
+    let pid = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .semantic_bindings()
+        .get(first.caller())
+        .unwrap()
+        .pin()
+        .pid();
+    let (begin, end) = fixture.scene.encoded(pid, 0, "C_SignInit", 2);
+    fixture.scene.drain.source_mut().push_record(begin.to_vec());
+    // H0 genuinely admits the ordinary physical return, while the journal
+    // retains START without its END. Completeness of H3 cannot invent END.
+    fixture
+        .scene
+        .drain
+        .source_mut()
+        .push_record(end[24..392].to_vec());
+    let mut frame = fixture.audited(1, 1, &BirthFault);
+    let before = fixture.feeds();
+    let owner = fixture.scene.real.scene.coordinator.joint_capture();
+    let claims = owner.adapter().invocation_claims_for_test();
+    let starts = owner.adapter().retained_starts_for_test();
+    let roles = owner.ledger().roles_for_test();
+    assert_eq!(claims.0, 1);
+    assert_eq!(roles[..4], [0, 1, 0, 1]);
+    assert_eq!(
+        owner
+            .adapter()
+            .retained_start_bytes_for_test((u64::from(pid), 2)),
+        Some(begin)
+    );
+    let h0 = fixture.scene.real.h0.clone();
+    let mut births = NativeFrameBirths {
+        h0: &h0,
+        attached: &fixture.attached,
+        retained: &mut fixture.births,
+        seen: Vec::new(),
+        unreadable: true,
+    };
+    {
+        let mut ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        frame.bind_targets(&ports).unwrap();
+        assert_eq!(
+            frame.seal_next(&mut ports, &mut births, &BirthFault),
+            Ok(QuantumSealProgress::DeliveryReady)
+        );
+        assert_eq!(
+            frame.deliver_next(&mut ports),
+            Err(RawQuantumRefusal::DispositionMismatch),
+            "completed-original preflight precedes any H9 fallback mutation"
+        );
+    }
+    drop(births);
+    assert_eq!(fixture.feeds(), before);
+    let owner = fixture.scene.real.scene.coordinator.joint_capture();
+    assert_eq!(owner.adapter().invocation_claims_for_test(), claims);
+    assert_eq!(owner.adapter().retained_starts_for_test(), starts);
+    assert_eq!(owner.ledger().roles_for_test(), roles);
+    assert_eq!(
+        owner
+            .adapter()
+            .retained_start_bytes_for_test((u64::from(pid), 2)),
+        Some(begin)
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_h3_audit_state(),
+        (2, false),
+        "refusal neither retakes H3 nor acknowledges a loss"
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_h3_acknowledged_below(),
+        0
     );
 }
 
@@ -1365,7 +1485,8 @@ fn joint_frame_preflight_keeps_targets_and_birth_selection_on_retry() {
 
 #[test]
 fn joint_future_end_disposes_frame_without_disposing_call() {
-    for b_begin_first in [false, true] {
+    for (b_begin_first, fallback_b) in [(false, false), (true, false), (false, true), (true, true)]
+    {
         let mut fixture = CanonicalFanoutScene::prior_sealed();
         let a = std::process::id();
         let b = fixture._child.id();
@@ -1382,12 +1503,33 @@ fn joint_future_end_disposes_frame_without_disposing_call() {
         let mut q1 = fixture.audited(1, 1, &BirthFault);
         assert!(q1.failure_for_test().is_none());
         let h0 = fixture.scene.real.h0.clone();
-        let mut births = NativeFrameBirths {
-            h0: &h0,
-            attached: &fixture.attached,
-            retained: &mut fixture.births,
-            seen: Vec::new(),
-            unreadable: false,
+        let b_caller = fixture
+            .feeds()
+            .iter()
+            .find(|feed| {
+                fixture
+                    .scene
+                    .real
+                    .scene
+                    .coordinator
+                    .semantic_bindings()
+                    .get(feed.caller)
+                    .unwrap()
+                    .pin()
+                    .pid()
+                    == b
+            })
+            .unwrap()
+            .caller;
+        let mut births = RefuseOneBirth {
+            inner: NativeFrameBirths {
+                h0: &h0,
+                attached: &fixture.attached,
+                retained: &mut fixture.births,
+                seen: Vec::new(),
+                unreadable: false,
+            },
+            refused: fallback_b.then_some(b_caller),
         };
         {
             let mut ports = fixture
@@ -1430,6 +1572,18 @@ fn joint_future_end_disposes_frame_without_disposing_call() {
             .adapter()
             .retained_starts_for_test();
         assert_eq!(starts.len(), 1);
+        assert_eq!(
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .joint_capture()
+                .adapter()
+                .retained_start_bytes_for_test((u64::from(a), 2)),
+            Some(begin_a),
+            "fallback retains the exact original incomplete START bytes"
+        );
         assert_eq!(
             (starts[0].0, starts[0].1),
             (u64::from(a), 2),
@@ -1483,6 +1637,17 @@ fn joint_future_end_disposes_frame_without_disposing_call() {
                 .roles_for_test(),
             roles
         );
+        assert_eq!(
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .joint_capture()
+                .adapter()
+                .retained_start_bytes_for_test((u64::from(a), 2)),
+            Some(begin_a)
+        );
         let before_b = fixture
             .feeds()
             .into_iter()
@@ -1501,6 +1666,7 @@ fn joint_future_end_disposes_frame_without_disposing_call() {
             })
             .unwrap();
         assert_eq!((before_b.reduced, before_b.staged), (2, 0));
+        assert_eq!(before_b.fallback, fallback_b);
         // The SAME original END arrives through the SAME actual consumer later.
         fixture.scene.drain.source_mut().push_record(end_a.to_vec());
         let mut q2 = fixture.audited(1, 1, &BirthFault);
@@ -1521,14 +1687,15 @@ fn joint_future_end_disposes_frame_without_disposing_call() {
                 .joint_frame_ports(&fixture.scene.producers)
                 .unwrap();
             q2.bind_targets(&ports).unwrap();
-            for index in 0..2 {
+            let target_count = if fallback_b { 1 } else { 2 };
+            for index in 0..target_count {
                 assert_eq!(
                     q2.seal_next(&mut ports, &mut births, &BirthFault),
                     Ok(QuantumSealProgress::DeliveryReady)
                 );
                 assert_eq!(
                     q2.deliver_next(&mut ports),
-                    Ok(if index == 0 {
+                    Ok(if index + 1 < target_count {
                         QuantumSealProgress::LocalPending
                     } else {
                         QuantumSealProgress::Complete
@@ -1539,12 +1706,12 @@ fn joint_future_end_disposes_frame_without_disposing_call() {
                 .unwrap_or_else(|(_, reason)| panic!("actual later END settles once: {reason:?}"));
         }
         drop(births);
-        assert!(
-            fixture.feeds().iter().all(|feed| feed.reduced == 2
+        assert!(fixture.feeds().iter().all(|feed| {
+            feed.reduced == 2
                 && feed.staged == 0
                 && !feed.degraded
-                && !feed.fallback)
-        );
+                && feed.fallback == (fallback_b && feed.id == before_b.id)
+        }));
         assert_eq!(
             fixture
                 .feeds()

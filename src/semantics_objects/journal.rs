@@ -889,6 +889,14 @@ impl JournalAdapter {
             .collect()
     }
 
+    #[cfg(test)]
+    pub(crate) fn retained_start_bytes_for_test(
+        &self,
+        native: (u64, u64),
+    ) -> Option<[u8; p11scope_ebpf_common::object_journal::JOURNAL_BEGIN_BYTES]> {
+        self.open.get(&native).map(|entry| *entry.begin.bytes())
+    }
+
     /// Read the canonical invocation store and its independent census.
     /// This inspection neither claims nor consumes an original admission.
     #[cfg(test)]

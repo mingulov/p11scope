@@ -20,6 +20,8 @@
 //! newtypes; this module adds no target-memory read, pointer output or
 //! capture beyond allowlist v1/v2 and the six approved v3 attributes.
 
+#[path = "journal/joint_audit.rs"]
+pub(crate) mod joint_audit;
 #[path = "joint_driver.rs"]
 pub(crate) mod joint_driver;
 mod reservations;
@@ -2180,6 +2182,11 @@ pub(crate) struct JournalCollection {
 }
 
 impl JournalAuditReceipt {
+    #[cfg(test)]
+    pub(crate) fn h3_for_test(&self) -> &H3DispositionEvidence {
+        &self.h3
+    }
+
     /// Production audit from one collection plus the actual H3
     /// finalizer's latest disposition (taken through
     /// [`H3EvidenceSource`], never caller-supplied) and the live
@@ -3006,6 +3013,11 @@ enum SealFailureScope {
 }
 
 impl SealFailure {
+    #[cfg(test)]
+    pub(crate) fn affects_proof_for_test(&self, proof: &JournalDomainProof) -> bool {
+        self.affects_domain(proof.domain())
+    }
+
     pub(crate) fn affects_domain(&self, domain: ObjectDomain) -> bool {
         match &self.scope {
             SealFailureScope::Unqualified => false,
@@ -3480,15 +3492,7 @@ impl JournalAdapter {
             })
     }
 
-    fn seal_inner(
-        &mut self,
-        model: &mut ObjectSemantics,
-        audit: &JournalAuditReceipt,
-        bootstrap: &BootstrapReceipt,
-        frontier: ConsumptionOrdinal,
-        births: &mut impl BirthEvidenceSource,
-        fault: &impl FaultEpoch,
-    ) -> Result<SealSuccess, SealFailure> {
+    fn check_collection_owner(&self, audit: &JournalAuditReceipt) -> Result<(), SealFailure> {
         // A foreign/unbound EVENTS stream proves no loss of this adapter.
         // Check before global audit mutation, independently of the requested
         // bootstrap; an actual owned audit can still void owned domains when
@@ -3499,16 +3503,24 @@ impl JournalAdapter {
         {
             return Err(self.failure(JournalGap::DrainMismatch));
         }
-        let frontier = frontier.0;
         if self.stopped {
             return Err(self.global_failure(JournalGap::Stopped));
         }
         if self.invalidated {
             return Err(self.global_failure(JournalGap::AdapterInvalidated));
         }
-        if frontier > self.consumed_through {
-            return Err(self.failure(JournalGap::FrontierRegression));
-        }
+        Ok(())
+    }
+
+    /// Adjudicate one owned collection even when no domain is eligible to
+    /// seal. Preserve the original affected scope/effects before voiding.
+    pub(super) fn audit_collected(
+        &mut self,
+        model: &mut ObjectSemantics,
+        audit: &JournalAuditReceipt,
+        fault: &impl FaultEpoch,
+    ) -> Result<(), SealFailure> {
+        self.check_collection_owner(audit)?;
         let seal_epoch = fault.fault_epoch();
         if let Err(gap) = audit.check(
             self.last_fault,
@@ -3587,6 +3599,24 @@ impl JournalAdapter {
         // The audit passed: pin the cumulative baseline. Past the first
         // seal this is a no-op (the chain rule already equated them).
         self.last_fault = Some(audit.fault_after);
+        Ok(())
+    }
+
+    fn seal_inner(
+        &mut self,
+        model: &mut ObjectSemantics,
+        audit: &JournalAuditReceipt,
+        bootstrap: &BootstrapReceipt,
+        frontier: ConsumptionOrdinal,
+        births: &mut impl BirthEvidenceSource,
+        fault: &impl FaultEpoch,
+    ) -> Result<SealSuccess, SealFailure> {
+        self.check_collection_owner(audit)?;
+        let frontier = frontier.0;
+        if frontier > self.consumed_through {
+            return Err(self.failure(JournalGap::FrontierRegression));
+        }
+        self.audit_collected(model, audit, fault)?;
         let key = bootstrap.proof().key;
         let Some(state) = self.keys.get(&key) else {
             return Err(self.failure(JournalGap::BootstrapMismatch));

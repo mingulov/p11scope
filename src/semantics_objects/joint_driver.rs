@@ -247,7 +247,7 @@ struct RawCuts {
 
 /// Fixed provenance moved from the one original raw allocation. Its collection
 /// and cuts never acquire a scalar constructor or a second retained wire copy.
-struct RawProvenance {
+pub(super) struct RawProvenance {
     identity: RawQuantumIdentity,
     collection: JournalCollection,
     producers: SessionDrainProducers,
@@ -256,7 +256,15 @@ struct RawProvenance {
 }
 
 impl RawProvenance {
-    fn validate_owner(
+    pub(super) fn identity(&self) -> RawQuantumIdentity {
+        self.identity
+    }
+
+    pub(super) fn collection(&self) -> &JournalCollection {
+        &self.collection
+    }
+
+    pub(super) fn validate_owner(
         &self,
         adapter: &JournalAdapter,
         producers: &SessionDrainProducers,
@@ -324,6 +332,10 @@ impl IngestedRaw {
     // before ordinary activation; outside callers receive only this proof.
     pub(super) fn into_collection(self) -> JournalCollection {
         self.raw.collection
+    }
+
+    pub(super) fn into_provenance(self) -> (RawProvenance, ConsumptionOrdinal) {
+        (self.raw, self.frontier)
     }
 
     #[cfg(test)]
@@ -418,6 +430,8 @@ pub(crate) enum RawQuantumRefusal {
     Admission,
     StaleFrontier,
     DispositionMismatch,
+    H3Undisposed,
+    ClosureStale,
     Stopped,
     Cut(super::BirthCutRefusal),
     Cursor(crate::events::EventsCutRefusal),

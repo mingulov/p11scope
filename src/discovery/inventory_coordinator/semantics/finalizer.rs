@@ -15,6 +15,8 @@ pub(in crate::discovery::engine::inventory_coordinator) struct SessionFinalizerS
     pub(super) h3_last: H3DispositionEvidence,
     pub(super) h3_pending: Option<H3DispositionEvidence>,
     pub(super) h3_acked_below: u64,
+    #[cfg(test)]
+    h3_takes: usize,
     pub(super) pending_drop: Option<(u64, bool)>,
     /// The namespace's first admitted call (D9): the seal grant's
     /// association proof, set once at finalize, borrowed (never
@@ -36,12 +38,18 @@ impl SessionFinalizerState {
             h3_last: H3DispositionEvidence::genesis(),
             h3_pending: None,
             h3_acked_below: 0,
+            #[cfg(test)]
+            h3_takes: 0,
             pending_drop: None,
             seal_admission: None,
         }
     }
 
     pub(super) fn take_disposition(&mut self) -> H3DispositionEvidence {
+        #[cfg(test)]
+        {
+            self.h3_takes += 1;
+        }
         self.h3_pending
             .take()
             .unwrap_or_else(H3DispositionEvidence::genesis)
@@ -68,8 +76,50 @@ pub(crate) struct SessionH3Finalizer<'session> {
     producers: &'session SessionDrainProducers,
 }
 
+/// Ephemeral authorization from this coordinator's disjoint original owner
+/// and finalizer borrows. No other caller can pair independent owner/state
+/// namespaces for an audit; construction remains private to this module.
+pub(crate) struct SessionAuditInput<'session> {
+    ingested: crate::semantics_objects::journal::joint_driver::IngestedRaw,
+    owner: &'session mut crate::semantics_objects::journal::joint_driver::JointCaptureOwner,
+    finalizer: SessionH3Finalizer<'session>,
+    producers: &'session SessionDrainProducers,
+}
+
+impl<'session> SessionAuditInput<'session> {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        crate::semantics_objects::journal::joint_driver::IngestedRaw,
+        &'session mut crate::semantics_objects::journal::joint_driver::JointCaptureOwner,
+        SessionH3Finalizer<'session>,
+        &'session SessionDrainProducers,
+    ) {
+        (self.ingested, self.owner, self.finalizer, self.producers)
+    }
+}
+
+impl SessionH3Finalizer<'_> {
+    /// Read-only gate: originals must have left the one pending handoff and
+    /// produced an untaken disposition in this exact retained Session.
+    pub(crate) fn ready_for_audit(&self, producers: &SessionDrainProducers) -> bool {
+        self.producers.same_producers(producers)
+            && self.state.domain == producers.native_domain()
+            && self
+                .state
+                .producers
+                .as_ref()
+                .is_none_or(|held| held.same_producers(producers))
+            && self.state.pending_semantic.is_none()
+            && self.state.pending_drop.is_none()
+            && self.state.seal_admission.is_some()
+            && self.state.h3_pending.is_some()
+    }
+}
+
 impl H3EvidenceSource for SessionH3Finalizer<'_> {
     fn take_h3_disposition(&mut self) -> H3DispositionEvidence {
+        assert!(self.state.bind_producers(self.producers));
         self.state.take_disposition()
     }
 }
@@ -85,6 +135,44 @@ impl H3FinalizerPort for SessionH3Finalizer<'_> {
 }
 
 impl<Source: ProcessSource> InventoryCoordinator<Source> {
+    /// Take one actual finished collection into immutable audit custody,
+    /// borrowing the canonical owner and finalizer state disjointly.
+    #[cfg_attr(not(test), allow(dead_code))] // Ordinary Joint activation remains gated.
+    #[allow(clippy::result_large_err)] // Refusal preserves the original nonallocating ingestion proof.
+    pub(crate) fn audit_ingested_quantum(
+        &mut self,
+        ingested: crate::semantics_objects::journal::joint_driver::IngestedRaw,
+        producers: &SessionDrainProducers,
+        attachment: &crate::attach::AttachedSemanticSet,
+        fault: &impl crate::semantics_objects::journal::FaultEpoch,
+    ) -> crate::semantics_objects::journal::joint_audit::AuditAcquisition {
+        use crate::semantics_objects::journal::joint_driver::RawQuantumRefusal;
+        if let Err(reason) = ingested.validate_owner(self.joint_capture.adapter(), producers) {
+            return Err((ingested, reason));
+        }
+        let Some(state) = self.semantic_finalizer.as_mut() else {
+            return Err((ingested, RawQuantumRefusal::H3Undisposed));
+        };
+        if state.domain != producers.native_domain()
+            || state
+                .producers
+                .as_ref()
+                .is_some_and(|held| !held.same_producers(producers))
+        {
+            return Err((ingested, RawQuantumRefusal::ForeignCapture));
+        }
+        let finalizer = SessionH3Finalizer { state, producers };
+        let authorized = SessionAuditInput {
+            ingested,
+            owner: &mut self.joint_capture,
+            finalizer,
+            producers,
+        };
+        crate::semantics_objects::journal::joint_audit::IngestedJointQuantum::audit(
+            authorized, attachment, fault,
+        )
+    }
+
     #[cfg_attr(not(test), allow(dead_code))] // Staged H3 finalizer path: exercised by the H3 acknowledgement tests; no production seal path wires it yet.
     pub(crate) fn session_h3_finalizer<'session>(
         &'session mut self,
@@ -104,6 +192,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.semantic_finalizer
             .as_ref()
             .map_or(0, |state| state.h3_acked_below)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reference_h3_audit_state(&self) -> (usize, bool) {
+        self.semantic_finalizer
+            .as_ref()
+            .map_or((0, false), |state| {
+                (state.h3_takes, state.h3_pending.is_some())
+            })
     }
 }
 

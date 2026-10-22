@@ -109,6 +109,11 @@ impl StagingLedger {
         self.reserver.is_some()
     }
 
+    /// Audit custody uses this ledger's existing pool, never a supplied budget.
+    pub(super) fn resource_reserver(&self) -> Option<&SemanticResourceReserver> {
+        self.reserver.as_ref()
+    }
+
     pub(crate) fn prepare_capacity(&mut self) -> Result<(), LedgerRefusal> {
         if self.table.is_some() {
             return Ok(());

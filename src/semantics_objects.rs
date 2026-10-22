@@ -1210,4 +1210,9 @@ impl ObjectSemantics {
     pub(crate) fn state_estimate(&self) -> StateEstimate {
         self.state.estimate()
     }
+
+    /// O(1) cardinalities for prepaying one retained audit-loss result.
+    pub(crate) fn audit_loss_record_counts(&self) -> (usize, usize) {
+        self.state.audit_loss_record_counts()
+    }
 }

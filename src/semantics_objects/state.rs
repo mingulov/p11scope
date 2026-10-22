@@ -3378,6 +3378,10 @@ impl ModelState {
         }
     }
 
+    pub(super) fn audit_loss_record_counts(&self) -> (usize, usize) {
+        (self.objects.len(), self.sessions.len())
+    }
+
     fn usage(&self) -> StateUsage {
         let live_bindings = self
             .domains

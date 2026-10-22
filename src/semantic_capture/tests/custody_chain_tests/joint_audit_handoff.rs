@@ -332,7 +332,7 @@ fn joint_audit_storage_refusal_precedes_take_and_global_mutation() {
         .coordinator
         .registry_mut()
         .reference_semantic_resource_limit(
-            before.charged_bytes + std::mem::size_of::<IngestedJointQuantum>() - 1,
+            before.charged_bytes + std::mem::size_of::<IngestedJointQuantum>(),
         );
     let (ingested, reason) = match fixture.real.scene.coordinator.audit_ingested_quantum(
         ingested,
@@ -341,7 +341,9 @@ fn joint_audit_storage_refusal_precedes_take_and_global_mutation() {
         &fault,
     ) {
         Err(refusal) => refusal,
-        Ok(_) => panic!("the retained audit cannot fit its own inline owner"),
+        Ok(_) => {
+            panic!("inline ownership fits, but the original affected-domain allocation does not")
+        }
     };
     assert!(matches!(reason, RawQuantumRefusal::Resource(_)));
     assert_eq!(

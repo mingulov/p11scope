@@ -1170,40 +1170,53 @@ def validate_inventory_usage_transition(elf, root, relocations):
     at = atomic[0]
     usage = relocations.get((root[3], root[4] + (at - 10) * 8))
     if (not usage or usage[0] != 1 or usage[1][0] != "USAGE"
-            or instructions[at - 10][0] != 0x18
-            or instructions[at - 8] != (0x85, 0, 0, 1)
-            or instructions[at - 7][0:2] != (0x15, 0)
-            or instructions[at - 7][3] != 0):
+            or instructions[at - 10:at - 8] != [(0x18, 1, 0, 0), (0, 0, 0, 0)]
+            or instructions[at - 8] != (0x85, 0, 0, 1)):
         raise RuntimeError("usage CAS requires the exact checked USAGE lookup")
-    load, positive, zero = instructions[at - 6:at - 3]
+    # O3 copies the lookup pointer just before CAS; opt-s hoists that same
+    # copy before the null guard. Admit only these two complete placements.
+    early_pointer = instructions[at - 7][0] == 0xbf
+    pointer_at, null_at = ((at - 7, at - 6) if early_pointer else (at - 2, at - 7))
+    load_at, positive_at, zero_at = null_at + 1, null_at + 2, null_at + 3
+    replacement_at = at - 2 if early_pointer else at - 3
+    pointer = instructions[pointer_at]
+    pointer_register = pointer[1] & 15
+    if pointer != (0xbf, pointer_register, 0, 0) or not 1 <= pointer_register <= 9:
+        raise RuntimeError("usage CAS must preserve the exact lookup pointer")
+    live_pointer = pointer_register if early_pointer else 0
+    null = instructions[null_at]
+    if (null[:2] != (0x15, live_pointer) or null[3] != 0
+            or not at < null_at + 1 + null[2] < len(instructions)):
+        raise RuntimeError("usage CAS requires the checked lookup null guard")
+    load, positive, zero = (instructions[index] for index in (load_at, positive_at, zero_at))
     register = load[1] & 15
-    # R0 must retain the lookup pointer until the later pointer copy.
-    if (not 1 <= register <= 9 or load != (0x79, register, 0, 0)
+    # The load/guards must not overwrite whichever register owns the pointer.
+    if (not 1 <= register <= 9 or register == live_pointer
+            or load != (0x79, live_pointer << 4 | register, 0, 0)
             or positive[0:2] != (0x15, register)
             or positive[3] != 1 or zero[0:2] != (0x55, register) or zero[3] != 0
-            or at - 4 + 1 + zero[2] <= at):
+            or not at < zero_at + 1 + zero[2] < len(instructions)):
         raise RuntimeError("usage needs aligned u64 load and exact one/zero guards")
-    replacement, pointer, expected = instructions[at - 3:at]
-    replacement_register, pointer_register = replacement[1], pointer[1]
-    # Replacement must preserve R0; its pointer copy must preserve replacement.
-    # Neither operand may alias R0, which is then overwritten with expected zero.
+    replacement, expected = instructions[replacement_at], instructions[at - 1]
+    replacement_register = replacement[1] & 15
+    # Replacement and the preserved pointer stay distinct and neither may
+    # alias R0, which is overwritten with the expected zero before the CAS.
     if (replacement != (0xb7, replacement_register, 0, 1)
             or not 1 <= replacement_register <= 9
-            or pointer != (0xbf, pointer_register, 0, 0)
-            or not 1 <= pointer_register <= 9
             or replacement_register == pointer_register
             or expected != (0xb7, 0, 0, 0)
             or instructions[at] != (0xdb, replacement_register << 4 | pointer_register, 0, 0xf1)):
         raise RuntimeError("usage atomic operation must compare zero and write one to the same cell")
     # The already-positive path must reach exit without any map write, helper,
     # or CAS. Only a zero return and forward jumps may remain in this lowering.
-    cursor, visited = at - 5 + 1 + positive[2], set()
+    cursor, zeroed, visited = positive_at + 1 + positive[2], False, set()
     while 0 <= cursor < len(instructions) and cursor not in visited:
         visited.add(cursor)
         instruction = instructions[cursor]
-        if instruction == (0x95, 0, 0, 0):
+        if instruction == (0x95, 0, 0, 0) and zeroed:
             return
         if instruction == (0xb7, 0, 0, 0):
+            zeroed = True
             cursor += 1
         elif instruction[0:2] == (0x05, 0) and instruction[2] > 0 and instruction[3] == 0:
             cursor += instruction[2] + 1

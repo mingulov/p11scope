@@ -71,6 +71,42 @@ def relocations(elf):
 
 
 class ActualInventoryTests(unittest.TestCase):
+    def usage_cas_roles(self, body, elf, symbol):
+        """Select the actual CAS roles in the two emitted pointer placements."""
+        section = elf.sections["uprobe"]
+        start = section[0][4] + symbol[4]
+        raw = section[1][symbol[4]:symbol[4] + symbol[5]]
+        insns = [struct.unpack_from("<BBhi", raw, at) for at in range(0, len(raw), 8)]
+
+        def one(label, predicate, positions):
+            found = [at for at in positions if predicate(insns[at])]
+            self.assertEqual(len(found), 1, (label, found))
+            return found[0]
+
+        atomic = one("CAS", lambda insn: insn[0] == 0xdb and insn[3] == 0xf1, range(len(insns)))
+        lookup_calls = [at for at in range(atomic) if insns[at] == (0x85, 0, 0, 1)]
+        self.assertTrue(lookup_calls)
+        lookup_call = lookup_calls[-1]
+        window = range(lookup_call + 1, atomic)
+        pointer, replacement = insns[atomic][1] & 15, insns[atomic][1] >> 4
+        copy = one("pointer copy", lambda insn: insn == (0xbf, pointer, 0, 0), window)
+        load = one("u64 load", lambda insn: insn[0] == 0x79 and insn[2:] == (0, 0), window)
+        live_pointer, value = insns[load][1] >> 4, insns[load][1] & 15
+        positions = {
+            "lookup": lookup_call - 2, "pointer": copy, "load": load, "atomic": atomic,
+            "null": one("null guard", lambda insn: insn[:2] == (0x15, live_pointer) and insn[3] == 0,
+                        range(lookup_call + 1, load)),
+            "positive": one("one guard", lambda insn: insn[:2] == (0x15, value) and insn[3] == 1,
+                            range(load + 1, atomic)),
+            "zero": one("zero guard", lambda insn: insn[:2] == (0x55, value) and insn[3] == 0,
+                        range(load + 1, atomic)),
+            "replacement": one("replacement", lambda insn: insn == (0xb7, replacement, 0, 1), window),
+            "expected": one("expected zero", lambda insn: insn == (0xb7, 0, 0, 0), window),
+            "exit": one("exit", lambda insn: insn == (0x95, 0, 0, 0), range(len(insns))),
+        }
+        roles = {name: start + at * 8 for name, at in positions.items()}
+        return roles, pointer, live_pointer, copy < load
+
     def test_actual_usage_scope_refusal_cannot_reach_marking(self):
         """Deleting, bypassing or reversing authorization must fail admission."""
         body = Path(os.environ["P11SCOPE_INVENTORY_OBJECT"]).read_bytes()
@@ -159,24 +195,27 @@ class ActualInventoryTests(unittest.TestCase):
         source = Path(os.environ["P11SCOPE_INVENTORY_OBJECT"])
         body = source.read_bytes()
         elf = checker.Elf(body)
+        checker.validate_inventory_entry_reachability(elf)
         with tempfile.TemporaryDirectory(prefix="inventory-usage-cas-") as tmp:
             path = Path(tmp) / "mutated.o"
             for symbol in elf.symbols:
                 if symbol[0] not in {"p11_usage_entry_lp64", "p11_usage_entry_ia32"}:
                     continue
-                section = elf.sections["uprobe"]
-                raw = section[1][symbol[4]:symbol[4] + symbol[5]]
-                cases = [i for i in range(0, len(raw), 8)
-                         if raw[i] == 0xdb and struct.unpack_from("<i", raw, i + 4)[0] == 0xf1]
-                self.assertEqual(len(cases), 1)
-                atomic = section[0][4] + symbol[4] + cases[0]
+                roles, _, _, _ = self.usage_cas_roles(body, elf, symbol)
                 for label, offset, fmt, value in [
-                    ("torn-width-load", atomic - 6 * 8, "B", 0x61),
-                    ("write-on-used-fast-path", atomic - 5 * 8 + 2, "h", 4),
-                    ("wrong-positive-value", atomic - 5 * 8 + 4, "i", 2),
-                    ("missing-zero-guard", atomic - 4 * 8 + 4, "i", 1),
-                    ("wrong-cas-replacement", atomic - 3 * 8 + 4, "i", 2),
-                    ("wrong-cas-cell", atomic + 2, "h", 8),
+                    ("wrong-lookup-register", roles["lookup"] + 1, "B", 2),
+                    ("null-lookup-falls-through", roles["null"] + 2, "h", 0),
+                    ("inverted-null-guard", roles["null"], "B", 0x55),
+                    ("torn-width-load", roles["load"], "B", 0x61),
+                    ("write-on-used-fast-path", roles["positive"] + 2, "h",
+                     (roles["atomic"] - roles["positive"]) // 8 - 1),
+                    ("used-fast-path-bypasses-zero-return", roles["positive"] + 2, "h",
+                     (roles["exit"] - roles["positive"]) // 8 - 1),
+                    ("wrong-positive-value", roles["positive"] + 4, "i", 2),
+                    ("missing-zero-guard", roles["zero"] + 4, "i", 1),
+                    ("wrong-cas-replacement", roles["replacement"] + 4, "i", 2),
+                    ("sign-extending-pointer-copy", roles["pointer"] + 2, "h", 32),
+                    ("wrong-cas-cell", roles["atomic"] + 2, "h", 8),
                 ]:
                     changed = bytearray(body)
                     struct.pack_into("<" + fmt, changed, offset, value)
@@ -187,27 +226,45 @@ class ActualInventoryTests(unittest.TestCase):
     def test_actual_usage_preserves_lookup_pointer_and_distinct_cas_operands(self):
         body = Path(os.environ["P11SCOPE_INVENTORY_OBJECT"]).read_bytes()
         elf = checker.Elf(body)
-        section = elf.sections["uprobe"]
+        checker.validate_inventory_entry_reachability(elf)
         for symbol in elf.symbols:
             if symbol[0] not in {"p11_usage_entry_lp64", "p11_usage_entry_ia32"}:
                 continue
-            raw = section[1][symbol[4]:symbol[4] + symbol[5]]
-            cases = [i for i in range(0, len(raw), 8)
-                     if raw[i] == 0xdb and struct.unpack_from("<i", raw, i + 4)[0] == 0xf1]
-            self.assertEqual(len(cases), 1)
-            atomic = section[0][4] + symbol[4] + cases[0]
-            replacement = body[atomic - 3 * 8 + 1]
-            pointer = body[atomic - 2 * 8 + 1]
-            for label, register_bytes in [
-                ("load-clobbers-lookup-r0", [(-6 * 8 + 1, 0), (-5 * 8 + 1, 0), (-4 * 8 + 1, 0)]),
-                ("replacement-clobbers-lookup-r0", [(-3 * 8 + 1, 0), (1, pointer)]),
-                ("expected-clobbers-pointer-r0", [(-2 * 8 + 1, 0), (1, replacement << 4)]),
-                ("pointer-overwrites-replacement", [(-3 * 8 + 1, pointer), (1, pointer << 4 | pointer)]),
-                ("pointer-aliases-replacement", [(-2 * 8 + 1, replacement), (1, replacement << 4 | replacement)]),
-            ]:
+            roles, pointer, live_pointer, early = self.usage_cas_roles(body, elf, symbol)
+            replacement = body[roles["replacement"] + 1]
+            r0_pointer = [(roles["pointer"] + 1, 0),
+                          (roles["atomic"] + 1, replacement << 4)]
+            aliases = [(roles["pointer"] + 1, replacement),
+                       (roles["atomic"] + 1, replacement << 4 | replacement)]
+            if early:
+                # Keep the guards/load coherent before the aliased replacement
+                # destroys the preserved pointer, rather than failing on a stale register pin.
+                aliases += [(roles["null"] + 1, replacement),
+                            (roles["load"] + 1, replacement << 4 | 9),
+                            (roles["positive"] + 1, 9), (roles["zero"] + 1, 9)]
+                r0_pointer += [(roles["null"] + 1, 0),
+                               (roles["load"] + 1, body[roles["load"] + 1] & 15)]
+            cases = [
+                ("load-clobbers-lookup-pointer", [(roles["load"] + 1, live_pointer << 4 | live_pointer),
+                                                  (roles["positive"] + 1, live_pointer),
+                                                  (roles["zero"] + 1, live_pointer)]),
+                ("replacement-clobbers-lookup-pointer", [(roles["replacement"] + 1, live_pointer),
+                                                         (roles["atomic"] + 1, live_pointer << 4 | pointer)]),
+                ("expected-clobbers-pointer", [(roles["expected"] + 1, pointer)]),
+                ("expected-overwrites-r0-pointer", r0_pointer),
+                ("replacement-and-pointer-alias", [(roles["replacement"] + 1, pointer),
+                                                   (roles["atomic"] + 1, pointer << 4 | pointer)]),
+                ("pointer-aliases-replacement", aliases),
+            ]
+            if early:
+                cases += [
+                    ("hoisted-pointer-wrong-source", [(roles["pointer"] + 1, 0x60 | pointer)]),
+                    ("hoisted-pointer-truncated", [(roles["pointer"], 0xbc)]),
+                ]
+            for label, register_bytes in cases:
                 changed = bytearray(body)
                 for offset, value in register_bytes:
-                    changed[atomic + offset] = value
+                    changed[offset] = value
                 with self.subTest(program=symbol[0], mutation=label), self.assertRaises(RuntimeError):
                     checker.validate_inventory_entry_reachability(checker.Elf(bytes(changed)))
 

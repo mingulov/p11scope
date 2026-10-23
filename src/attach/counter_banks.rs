@@ -1643,4 +1643,151 @@ mod tests {
         assert!(directory.validate_read_plan(&plan(1)).is_ok());
         assert_eq!(directory.published_mask(), 1);
     }
+
+    #[test]
+    fn retained_provider_prefix_binds_independent_stores_before_staging_or_reading() {
+        use crate::discovery::identity::test_fixture::real_scan_pin;
+        let dir = tempfile::tempdir().unwrap();
+        let old_path = dir.path().join("old-provider.so");
+        let foreign_path = dir.path().join("foreign-provider.so");
+        std::fs::write(&old_path, b"identical owned provider bytes").unwrap();
+        std::fs::write(&foreign_path, b"identical owned provider bytes").unwrap();
+        let old = real_scan_pin(&old_path, None, 1, "same-content-digest");
+        let same = real_scan_pin(&old_path, None, 2, "same-content-digest");
+        let foreign = real_scan_pin(&foreign_path, None, 3, "same-content-digest");
+        let id = old.pinned().next().unwrap().id;
+        assert_eq!(same.pinned().next().unwrap().id, id);
+        assert_eq!(foreign.pinned().next().unwrap().id, id);
+        let mut selected = plan(1);
+        selected.slots[0].object = id;
+        let retained = [Some(old.retain_inventory_target(id).unwrap()), None];
+        for pins in [&old, &same] {
+            assert_eq!(
+                validate_provider_slots(&selected.slots, pins, 1, |index| {
+                    retained[index as usize].as_ref()
+                }),
+                Ok(()),
+                "a fresh pin store of the same opened provider is valid"
+            );
+        }
+        assert_eq!(
+            validate_provider_slots(&selected.slots, &foreign, 1, |index| {
+                retained[index as usize].as_ref()
+            }),
+            Err(BankRefusal::Ownership),
+            "same local ID, offset and content do not identify the held file"
+        );
+        assert_eq!(
+            validate_provider_slots(&selected.slots, &same, 1, |_| None),
+            Err(BankRefusal::Ownership),
+            "read labeling requires the actual retained prefix proof"
+        );
+
+        let pool = SemanticResourcePool::reference_limit(4 * 1024 * 1024);
+        let mut directory = BankDirectory::default();
+        let mut native = Native {
+            provider_guard: Some((old, retained)),
+            ..Native::default()
+        };
+        assert!(matches!(
+            directory.stage_with(&mut native, &selected, reservation(), &pool.reserver()),
+            BankPublication::Published {
+                transaction: 1,
+                mask: 1
+            }
+        ));
+        let mut appended = plan(2);
+        appended.slots[0].object = id;
+        // A separately built store now assigns zero to a foreign provider and
+        // one to the original provider. Numeric prefix checks alone accept it.
+        let mut switched = foreign;
+        assert!(switched.absorb(same).is_empty());
+        assert_eq!(switched.pinned().count(), 2);
+        let bindings = native.provider_guard.as_mut().unwrap();
+        bindings.0 = switched;
+        let charged = pool.snapshot().charged_bytes;
+        let before = native.trace.len();
+        assert_eq!(
+            directory.stage_with(&mut native, &appended, reservation(), &pool.reserver()),
+            BankPublication::Refused(BankRefusal::Ownership)
+        );
+        assert_eq!(directory.published_mask(), 1);
+        assert_eq!(directory.allocated, 1);
+        assert_eq!(directory.next_transaction.unwrap().get(), 2);
+        assert_eq!(native.metadata.len(), 1);
+        assert_eq!(native.commits.len(), 1);
+        assert_eq!(native.held.len(), 1);
+        assert_eq!(pool.snapshot().charged_bytes, charged);
+        assert!(!native.trace[before..].iter().any(|step| {
+            matches!(
+                *step,
+                "allocate" | "inner" | "metadata" | "return" | "entry" | "commit"
+            )
+        }));
+    }
+
+    #[test]
+    fn physical_endpoint_duplicates_refuse_even_with_distinct_local_ids() {
+        use crate::discovery::identity::test_fixture::real_scan_pin;
+        use p11scope_manifest::maps::{Device, ObjectKey};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("provider.so");
+        std::fs::write(&path, b"one owned kernel file through two mapping keys").unwrap();
+        let mut pins = real_scan_pin(&path, None, 1, "provider-digest");
+        let old = pins.pinned().next().unwrap().id;
+        let retained = pins.retain_inventory_target(old).unwrap();
+        let alias = real_scan_pin(
+            &path,
+            Some(ObjectKey {
+                device: Device {
+                    major: 0,
+                    minor: 4021,
+                },
+                inode: 987654,
+            }),
+            2,
+            "provider-digest",
+        );
+        assert!(pins.absorb(alias).is_empty());
+        let ids: Vec<_> = pins.pinned().map(|pin| pin.id).collect();
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1]);
+        assert!(retained.same_object_as(&pins, ids[1]));
+        let mut duplicate = plan(2);
+        duplicate.slots[0].object = ids[0];
+        duplicate.slots[1].object = ids[1];
+        let pool = SemanticResourcePool::reference_limit(4 * 1024 * 1024);
+        let mut native = Native {
+            provider_guard: Some((pins, [Some(retained), None])),
+            ..Native::default()
+        };
+        let mut directory = BankDirectory::default();
+        let first = AttachPlan::from_slots_with_policy(
+            duplicate.slots[..1].to_vec(),
+            duplicate.admission_policy(),
+        )
+        .unwrap();
+        assert!(matches!(
+            directory.stage_with(&mut native, &first, reservation(), &pool.reserver()),
+            BankPublication::Published { mask: 1, .. }
+        ));
+        let before = native.trace.len();
+        assert_eq!(
+            directory.stage_with(&mut native, &duplicate, reservation(), &pool.reserver()),
+            BankPublication::Refused(BankRefusal::Ownership)
+        );
+        assert_eq!(directory.published_mask(), 1);
+        assert_eq!(directory.allocated, 1);
+        assert_eq!(native.commits.len(), 1);
+        assert!(!native.trace[before..].contains(&"allocate"));
+        let (pins, retained) = native.provider_guard.as_ref().unwrap();
+        duplicate.slots[1].file_offset += 8;
+        assert_eq!(
+            validate_provider_slots(&duplicate.slots, pins, 1, |index| {
+                retained[index as usize].as_ref()
+            }),
+            Ok(()),
+            "different offsets in the same provider remain different endpoints"
+        );
+    }
 }

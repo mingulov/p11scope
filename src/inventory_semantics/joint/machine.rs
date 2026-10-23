@@ -137,6 +137,16 @@ enum RunState {
     DispositionRequired(SemanticRefusal),
 }
 
+/// Scalar failure, H3 and active-result tags; no proof payload is copied.
+#[cfg(test)]
+type JointAuditDiagnostic = (
+    Option<crate::semantics_objects::journal::JournalGap>,
+    &'static str,
+    Option<u64>,
+    Option<u64>,
+    &'static str,
+);
+
 struct Collected {
     raw: RawJointQuantum,
     attempted: usize,
@@ -528,15 +538,7 @@ impl LiveJointMachine {
     }
 
     #[cfg(test)]
-    pub(crate) fn diagnostic_audit_for_test(
-        &self,
-    ) -> Option<(
-        Option<crate::semantics_objects::journal::JournalGap>,
-        &'static str,
-        Option<u64>,
-        Option<u64>,
-        &'static str,
-    )> {
+    pub(crate) fn diagnostic_audit_for_test(&self) -> Option<JointAuditDiagnostic> {
         use crate::semantics_objects::journal::H3DispositionEvidence;
         let Phase::Audited {
             frame: Some(frame), ..

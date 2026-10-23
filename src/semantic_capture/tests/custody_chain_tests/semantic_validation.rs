@@ -560,6 +560,36 @@ impl LaneTestIo for SharedH0 {
     fn has_pending_evidence(&self) -> bool {
         !self.0.borrow().stash.is_empty()
     }
+    fn physical_gaps(
+        &mut self,
+        domain: NativeDomainId,
+        gaps: &mut Vec<PhysicalSemanticGap>,
+    ) -> Option<Result<SemanticBatch, SemanticRefusal>> {
+        let mut owned = self.0.borrow_mut();
+        let HeldH0 { capture, io, .. } = &mut *owned;
+        Some(
+            capture
+                .apply_physical_gaps_with(io, std::mem::take(gaps))
+                .map_err(|_| SemanticRefusal::Unavailable)
+                .and_then(|report| {
+                    let negatives = report
+                        .outcomes()
+                        .iter()
+                        .filter_map(|outcome| match outcome {
+                            TickOutcome::Invalidation(invalidation)
+                                if matches!(invalidation.scope(), InvalidationScope::FaultEra) =>
+                            {
+                                invalidation.position()
+                            }
+                            _ => None,
+                        })
+                        .max()
+                        .map(|ordinal| vec![LaneNegative::CutBarrier { ordinal }])
+                        .unwrap_or_default();
+                    SemanticBatch::from_tick_report(domain, report, negatives, now_ns())
+                }),
+        )
+    }
     fn finish(&mut self, domain: NativeDomainId) -> SemanticBatch {
         SemanticBatch::from_tick_report(
             domain,

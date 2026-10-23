@@ -159,6 +159,110 @@ fn joint_first_real_birth_publishes_one_revision() {
     }
 }
 
+/// A real physical tail must join the one original H3/audit before any
+/// claim/stage decision. A new tail minted at commit cannot replace it later.
+#[test]
+fn joint_physical_tail_precedes_claims_and_one_audit() {
+    let mut fixture = CanonicalFanoutScene::prior_sealed();
+    let caller = fixture.births[0].0;
+    let before = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .model()
+        .project();
+    assert_eq!(before.objects.len(), 2);
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .reference_mark_tail(caller);
+    fixture.push_two("C_SignInit", 2);
+    let raw = fixture.scene.collect_with_fault(&BirthFault);
+    fixture.scene.real.h0.0.borrow_mut().collected = Some(raw);
+    let batch = fixture.scene.real.tick();
+    let coordinator = &mut fixture.scene.real.scene.coordinator;
+    coordinator.stage_semantic_batch(batch);
+    coordinator
+        .prepare_staged_semantic_batch(&mut fixture.scene.real.lane, None)
+        .unwrap();
+    let raw = fixture
+        .scene
+        .real
+        .h0
+        .0
+        .borrow_mut()
+        .collected
+        .take()
+        .unwrap();
+    let mut ingested = raw
+        .ingest(
+            coordinator.joint_capture_mut().adapter_mut(),
+            &fixture.scene.producers,
+            &fixture.grant,
+        )
+        .unwrap_or_else(|(_, reason)| panic!("original physical-tail collection: {reason:?}"));
+    while coordinator
+        .claim_next_prepared_admission(&fixture.scene.producers, &ingested)
+        .unwrap()
+        .is_some()
+    {}
+    while coordinator
+        .stage_next_prepared_admission_with_disposition(&fixture.scene.producers, &mut ingested)
+        .unwrap()
+    {}
+    assert!(coordinator.finish_prepared_semantic_batch(&fixture.scene.real.lane));
+    let frame = acquire(&mut fixture.scene, ingested, &fixture.attached, &BirthFault);
+    assert!(
+        matches!(
+            frame.audit_for_test().h3_for_test(),
+            H3DispositionEvidence::Loss { .. }
+        ),
+        "the original audit must own the real physical cut, not a later replacement H3"
+    );
+    let failure = frame
+        .failure_for_test()
+        .expect("actual original physical loss");
+    assert_eq!(
+        failure.gap,
+        crate::semantics_objects::journal::JournalGap::H3Loss
+    );
+    for object in &before.objects {
+        assert!(failure.effects.effects.iter().any(|effect| matches!(effect,
+            ObjectEffect::Retired { object: id, reason: ObjectGap::OutcomeLost } if *id == object.id)));
+    }
+    let coordinator = &fixture.scene.real.scene.coordinator;
+    assert_eq!(coordinator.reference_h3_audit_state(), (2, false));
+    let revision = coordinator.registry().published_revision();
+    let before_feeds = fixture.feeds();
+    fixture.complete_publication(&mut Some(frame), &BirthFault, revision);
+    let coordinator = &fixture.scene.real.scene.coordinator;
+    assert_eq!(
+        coordinator.reference_h3_audit_state(),
+        (2, false),
+        "no second H3 take or stranded replacement"
+    );
+    let after = coordinator.joint_capture().model().project();
+    for object in &before.objects {
+        assert_eq!(
+            after.object(object.id).unwrap().lifetime,
+            Lifetime::Retired(ObjectGap::OutcomeLost)
+        );
+    }
+    assert_eq!(
+        fixture.feeds().iter().map(|feed| feed.reduced).sum::<u64>(),
+        before_feeds.iter().map(|feed| feed.reduced).sum::<u64>()
+    );
+    fixture.scene.assert_claims(&[]);
+    assert_eq!(
+        coordinator.joint_capture().ledger().roles_for_test()[..4],
+        [0, 0, 0, 0]
+    );
+}
+
 /// Catches a retry repeating original admission, physical publication,
 /// diagnostics, H9 reduction, or silently applying a later staged batch.
 #[test]

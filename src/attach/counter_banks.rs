@@ -4286,6 +4286,126 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires the explicitly selected format2 artifact; parses only, no native load"]
+    fn format2_preparation_rejects_mixed_profiles_before_lifecycle() {
+        assert_eq!(env!("P11SCOPE_COUNTER_BANK_PROOF_ENABLED"), "1");
+        assert_eq!(
+            env!("P11SCOPE_COUNTER_BANK_PROOF_OUTPUTS"),
+            "counts-bank-growth-v2"
+        );
+        let path = std::path::Path::new(env!("OUT_DIR"))
+            .join("counter-bank-growth-v2")
+            .join("p11scope-ebpf-counts-bank-growth-v2");
+        let bytes = std::fs::read(path).expect("compile the actual selected format2 artifact");
+        let parsed = aya_obj::Object::parse(&bytes).unwrap();
+        for (name, expected) in [
+            ("COUNTER_BANKS", (13, 4, 4, 16, 128)),
+            ("COUNTER_BANK_META", (1, 4, 32, 8192, 128)),
+            ("COUNTER_BANK_COMMIT", (1, 8, 16, 8192, 128)),
+            ("RV_COUNTS", (5, 16, 8, 65536, 0)),
+            ("SLOT_FILE", (2, 4, 4, 8192, 128)),
+            ("STATS", (6, 4, 24, 512, 0)),
+            ("START", (1, 16, 288, 16384, 0)),
+        ] {
+            let map = parsed.maps.get(name).expect("actual required format2 map");
+            assert_eq!(
+                (
+                    map.map_type(),
+                    map.key_size(),
+                    map.value_size(),
+                    map.max_entries(),
+                    map.map_flags()
+                ),
+                expected,
+                "actual emitted {name}"
+            );
+        }
+        let inner = parsed.maps["COUNTER_BANKS"].inner().unwrap();
+        assert_eq!(
+            (
+                inner.map_type(),
+                inner.key_size(),
+                inner.value_size(),
+                inner.max_entries(),
+                inner.map_flags()
+            ),
+            (6, 4, 24, 512, 0)
+        );
+        drop(parsed);
+        // These are explicit request ceilings, not allocations of a GiB or
+        // evidence that any native map/program has loaded successfully.
+        let pool = SemanticResourcePool::reference_limit(4 * 1024 * 1024 * 1024);
+        let envelope = BankReservation {
+            retained_bytes: 1024 * 1024 * 1024,
+            transient_bytes: 512 * 1024 * 1024,
+            metadata_bytes: 64 * 1024 * 1024,
+            file_descriptors: 1_048_576,
+        };
+        let preparation = CounterPreparation::new(&bytes, envelope, &pool.reserver());
+        assert!(
+            preparation.is_ok(),
+            "actual valid format2 preparation: {:?}",
+            preparation.err()
+        );
+        // Ordinary bytes and malformed bytes must fail at the same real
+        // constructor before the actual constructor's lifecycle boundary.
+        for wrong in [crate::EBPF_OBJECT, &b"not an ELF object"[..]] {
+            let charged = pool.snapshot().charged_bytes;
+            let activated = std::cell::Cell::new(false);
+            let preparation = CounterPreparation::new(wrong, envelope, &pool.reserver());
+            let result =
+                super::super::activate_after_preparation_with(preparation.map(|_| ()), || {
+                    activated.set(true);
+                    Ok(())
+                });
+            assert!(result.is_err());
+            assert!(
+                !activated.get(),
+                "wrong actual shape must never reach lifecycle attachment"
+            );
+            assert_eq!(pool.snapshot().charged_bytes, charged);
+        }
+    }
+
+    #[test]
+    fn format2_link_stage_requires_exact_extent() {
+        let pool = SemanticResourcePool::reference_limit(4 * 1024 * 1024);
+        let banks = reader_banks(&pool);
+        *banks.directory.lock().unwrap() = BankDirectory::counts_growth_v2();
+        let slots = vec![slot(511, 1), slot(512, 2)];
+        // The existing atomic is an exact (first,end) guard, not a slot mask.
+        // This literal crosses a bank boundary and cannot be mistaken for2.
+        let stage = banks
+            .begin_link_stage(0x0000_01ff_0000_0201)
+            .expect("format2 extent511..513 must admit its complete target pair");
+        assert!(banks.permits_link_stage(&slots));
+        assert!(!banks.permits_link_stage(&slots[..1]));
+        assert!(!banks.permits_link_stage(&[slot(511, 1), slot(513, 2)]));
+        assert!(banks.begin_link_stage(0x0000_0200_0000_0201).is_err());
+        assert!(
+            banks.permits_link_stage(&slots),
+            "overlap refusal preserves the existing guard"
+        );
+        drop(stage);
+        assert!(!banks.permits_link_stage(&slots));
+        for invalid in [
+            0,
+            0x0000_0200_0000_0200,
+            0x0000_0201_0000_0200,
+            0x0000_2000_0000_2001,
+        ] {
+            assert!(
+                banks.begin_link_stage(invalid).is_err(),
+                "invalid extent {invalid:#x}"
+            );
+        }
+        let last = banks.begin_link_stage(0x0000_1fff_0000_2000).unwrap();
+        assert!(banks.permits_link_stage(&[slot(8191, 3)]));
+        assert!(!banks.permits_link_stage(&[slot(8192, 3)]));
+        drop(last);
+    }
+
+    #[test]
     fn counter_reader_binding_distinguishes_legacy_from_present_refusal() {
         assert!(
             reader_profile_with(

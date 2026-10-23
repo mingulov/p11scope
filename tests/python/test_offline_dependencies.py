@@ -144,7 +144,7 @@ def digest(value: bytes) -> str:
 
 
 class OfflineFixture:
-    def __init__(self, temporary: Path):
+    def __init__(self, temporary: Path, *, shared_repository: Path | None = None):
         self.root = temporary / "source root with spaces"
         (self.root / "scripts").mkdir(parents=True)
         (self.root / "third-party/patches/demo-1.0.0").mkdir(parents=True)
@@ -196,16 +196,6 @@ class OfflineFixture:
         }) + "\n", encoding="utf-8")
 
         self.shared_url = "https://example.invalid/shared-dependency"
-        shared_repository = temporary / "shared Git repository"
-        shared_repository.mkdir()
-        shared_files = {
-            "Cargo.toml": "[package]\nname = 'shared'\nversion = '0.1.0'\n",
-            "src.rs": "shared payload\n",
-            "LICENSE-APACHE": "fixture Apache license\n",
-            "LICENSE-MIT": "fixture MIT license\n",
-        }
-        for name, content in shared_files.items():
-            (shared_repository / name).write_text(content, encoding="utf-8")
         git_environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
         # Fixed test data keeps the revision identical across related refusal scenes.
         git_environment.update({
@@ -221,9 +211,20 @@ class OfflineFixture:
                 check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             ).stdout
 
-        git("-c", "init.templateDir=", "init", "-q", "--object-format=sha1", "--initial-branch=fixture")
-        git("add", "--", *shared_files)
-        git("commit", "-qm", "fixture: shared dependency")
+        if shared_repository is None:
+            shared_repository = temporary / "shared Git repository"
+            shared_repository.mkdir()
+            shared_files = {
+                "Cargo.toml": "[package]\nname = 'shared'\nversion = '0.1.0'\n",
+                "src.rs": "shared payload\n",
+                "LICENSE-APACHE": "fixture Apache license\n",
+                "LICENSE-MIT": "fixture MIT license\n",
+            }
+            for name, content in shared_files.items():
+                (shared_repository / name).write_text(content, encoding="utf-8")
+            git("-c", "init.templateDir=", "init", "-q", "--object-format=sha1", "--initial-branch=fixture")
+            git("add", "--", *shared_files)
+            git("commit", "-qm", "fixture: shared dependency")
         self.shared_revision = git("rev-parse", "HEAD").strip()
         shared_source = f"git+{self.shared_url}?rev={self.shared_revision}#{self.shared_revision}"
         (self.root / "Cargo.lock").write_text(self._lock(shared_source, root=True), encoding="utf-8")

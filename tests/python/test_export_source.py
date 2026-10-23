@@ -225,12 +225,10 @@ class ExportSourceTests(unittest.TestCase):
         (bundle_source / "foreign-uncommitted.txt").write_text(
             "must not enter the source bundle\n", encoding="utf-8"
         )
-        offline_fixture = OFFLINE_TEST_MODULE.OfflineFixture
-        with mock.patch.object(OFFLINE_TEST_MODULE, "REPOSITORY", bundle_source):
-            fixture = offline_fixture(base)
-            fixture.testcase = self
-            shutil.copy2(EXPORTER, fixture.root / "scripts/export-source.py")
-            fixture.assemble()
+        fixture = OFFLINE_TEST_MODULE.OfflineFixture(base, shared_repository=bundle_source)
+        fixture.testcase = self
+        shutil.copy2(EXPORTER, fixture.root / "scripts/export-source.py")
+        fixture.assemble()
         fixture.bundle_source = bundle_source
         fixture.approve()
         shutil.rmtree(fixture.root / "third-party/src")

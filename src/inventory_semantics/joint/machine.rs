@@ -528,6 +528,44 @@ impl LiveJointMachine {
     }
 
     #[cfg(test)]
+    pub(crate) fn diagnostic_audit_for_test(
+        &self,
+    ) -> Option<(
+        Option<crate::semantics_objects::journal::JournalGap>,
+        &'static str,
+        Option<u64>,
+        Option<u64>,
+        &'static str,
+    )> {
+        use crate::semantics_objects::journal::H3DispositionEvidence;
+        let Phase::Audited {
+            frame: Some(frame), ..
+        } = self.phase.as_ref()?
+        else {
+            return None;
+        };
+        let (h3, bound, pending) = match frame.audit_for_test().h3_for_test() {
+            H3DispositionEvidence::Clean {
+                staged_max,
+                pending_floor,
+            } => ("Clean", Some(*staged_max), *pending_floor),
+            H3DispositionEvidence::StagedLoss { barrier } => ("StagedLoss", Some(*barrier), None),
+            H3DispositionEvidence::Exhausted => ("Exhausted", None, None),
+        };
+        Some((
+            frame.failure_for_test().map(|failure| failure.gap),
+            h3,
+            bound,
+            pending,
+            if frame.active_seal_for_test().is_some() {
+                "ActiveSuccess"
+            } else {
+                "NoActiveSuccess"
+            },
+        ))
+    }
+
+    #[cfg(test)]
     pub(crate) fn retained_h0_for_test(
         &self,
     ) -> Option<(&[TickOutcome], &[CurrentPartitionReceipt])> {

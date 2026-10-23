@@ -533,7 +533,7 @@ impl MachineScene {
         panic!(
             "the same machine must publish the retained original within its finite work bound; \
              label={label} frozen={frozen:?} snapshot={:?} preparations={} revision={} \
-             publication_pending={} h3={:?} claims={} roles={:?}",
+             publication_pending={} h3={:?} claims={} roles={:?} audit={:?}",
             self.machine.diagnostic_snapshot_for_test(),
             self.native.preparations.len(),
             coordinator.registry().published_revision(),
@@ -545,6 +545,7 @@ impl MachineScene {
                 .invocation_claims_for_test()
                 .0,
             coordinator.joint_capture().ledger().roles_for_test(),
+            self.machine.diagnostic_audit_for_test(),
         );
     }
 

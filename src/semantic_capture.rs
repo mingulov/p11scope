@@ -1980,6 +1980,7 @@ impl SemanticCapture {
 
     /// Normal Session forwarding to the same private Capture operation.
     /// Session/Q association precedes all report allocation or route mutation.
+    #[allow(dead_code)] // Pending-at-Q forwarding remains inactive in the ordinary driver.
     #[allow(clippy::too_many_arguments)] // Explicit original custody and caller-owned output.
     pub(crate) fn resolve_collected_pending_at_q(
         &mut self,

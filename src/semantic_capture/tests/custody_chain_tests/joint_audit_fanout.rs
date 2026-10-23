@@ -3322,9 +3322,7 @@ fn joint_machine_collected_finish_budget_refusal_preserves_originals() {
     let (refused, allocations, _) =
         crate::test_alloc::count_allocs_during(|| -> Result<(), SemanticRefusal> {
             for _ in 0..128 {
-                if let Err(reason) = fixture.resolve_pending_q(&q, observer.discovery_domain(), 1) {
-                    return Err(reason);
-                }
+                fixture.resolve_pending_q(&q, observer.discovery_domain(), 1)?;
             }
             panic!("the actual tight expiry precharge must refuse within the bounded service");
         });
@@ -3340,9 +3338,7 @@ fn joint_machine_collected_finish_budget_refusal_preserves_originals() {
     let (refused, peak) =
         crate::test_alloc::requested_peak_during(|| -> Result<(), SemanticRefusal> {
             for _ in 0..128 {
-                if let Err(reason) = fixture.resolve_pending_q(&q, observer.discovery_domain(), 1) {
-                    return Err(reason);
-                }
+                fixture.resolve_pending_q(&q, observer.discovery_domain(), 1)?;
             }
             panic!("the actual receiver must expose its injected refusal after real expiry");
         });

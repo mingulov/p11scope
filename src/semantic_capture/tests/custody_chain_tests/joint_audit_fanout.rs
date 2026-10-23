@@ -1051,10 +1051,9 @@ fn joint_machine_pending_a_allows_q2_real_end() {
                 before,
                 "q1 cannot replay through the missing original END(A)"
             );
-            let native_a = (
-                ((u64::from(std::process::id())) << 32) | u64::from(std::process::id()),
-                a_sequence,
-            );
+            // Native invocation identity is the BEGIN header's thread,
+            // independently from the ordinary payload's pid_tgid word.
+            let native_a = (u64::from(std::process::id()), a_sequence);
             assert_eq!(
                 fixture
                     .scene

@@ -1197,6 +1197,7 @@ impl AttestedSemanticLane {
 
     /// Route only the machine's original retained records. This never polls
     /// EVENTS; empty retries resolve the same Capture jobs and merge its stash.
+    #[allow(dead_code)] // Actual Session bridge; the ordinary driver remains inactive.
     fn tick_collected(
         &mut self,
         bindings: &[SemanticCallerBinding],

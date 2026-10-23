@@ -10448,12 +10448,201 @@ fn hosted_pipeline_runs_one_full_matrix_per_commit() {
 /// Bind the behavioral capture helpers to production mode-specific callbacks.
 /// Completed-root retirement is covered by terminal behavioral tests; capture
 /// facts and terminal publication retain their separate provenance checks.
+fn assert_profile_collection_wiring(run: &str, projection: &str) -> Result<(), String> {
+    let profile = contract_section(run, "fn capture_profile(", "fn write_json_report(")?;
+    require_contract_marker(
+        profile,
+        "let mut collection = metrics::CaptureCollection::new(counter_inputs);",
+        "profile collection owner",
+    )?;
+    let tick = contract_section(profile, "let tick = ", "let mut finish_context =")?;
+    require_before(
+        tick,
+        "profile_tick_snapshot(tick_frame, snapshot_cache, || {",
+        "collection.fresh(",
+        "profile live collection under cache gate",
+    )?;
+    require_contract_marker(
+        tick,
+        "context.1, context.0.plan(), context.0.pinned(), profile,",
+        "profile live collection uses actual Session and retained plan",
+    )?;
+    let terminal = profile
+        .split_once("fn run_terminal(")
+        .ok_or("missing profile terminal callback")?
+        .1;
+    require_contract_marker(
+        terminal,
+        "context\n                .6\n                .terminal(context.1, context.0.plan(), context.0.pinned(), profile)?",
+        "profile terminal collection owner",
+    )?;
+
+    let live = contract_section(
+        projection,
+        "pub(crate) fn fresh(",
+        "pub(crate) fn terminal(",
+    )?;
+    require_contract_marker(
+        live,
+        "self.acquire(session, plan, pins, profile, false)",
+        "live collection dispatch",
+    )?;
+    let terminal = contract_section(projection, "pub(crate) fn terminal(", "    fn acquire(")?;
+    require_contract_marker(
+        terminal,
+        "self.acquire(session, plan, pins, profile, true)",
+        "terminal collection dispatch",
+    )?;
+    let acquire = contract_section(projection, "    fn acquire(", "    fn fresh_with<B>(")?;
+    require_contract_marker(
+        acquire,
+        "let binding = session.counter_reader_binding();",
+        "actual Session reader binding",
+    )?;
+    require_before(
+        acquire,
+        "if terminal {",
+        "self.terminal_with(",
+        "terminal dispatch",
+    )?;
+    require_contract_marker(acquire, "self.fresh_with(", "live collection dispatch")?;
+    if acquire
+        .matches(
+            "binding,\n                super::counter_reader::read_bound,\n                legacy,",
+        )
+        .count()
+        != 2
+    {
+        return Err("live and terminal must pass the actual binding and shared reader".into());
+    }
+    let legacy = contract_section(
+        acquire,
+        "let legacy = || {",
+        "        };\n        if terminal {",
+    )?;
+    let (terminal, live) = legacy
+        .split_once("} else {")
+        .ok_or("missing legacy live reads")?;
+    require_before(
+        terminal,
+        "super::read(session, plan)?",
+        "super::kernel_evidence(session)?",
+        "legacy terminal read order",
+    )?;
+    require_before(
+        live,
+        "super::kernel_evidence(session)?",
+        "super::read(session, plan)?",
+        "legacy live read order",
+    )?;
+    let fresh = contract_section(
+        projection,
+        "    fn fresh_with<B>(",
+        "    fn terminal_with<B>(",
+    )?;
+    let ordinary = contract_section(
+        fresh,
+        "            Ok(None) => {",
+        "            binding => {",
+    )?;
+    for marker in [
+        "if self.counter.is_some()",
+        "legacy()?",
+        "if !profile {\n                    kernel.ring_loss = 0;",
+    ] {
+        require_contract_marker(
+            ordinary,
+            marker,
+            "ordinary collection preserves legacy mode",
+        )?;
+    }
+    if fresh.matches("legacy()?").count() != 1 {
+        return Err("only an absent actual binding may invoke the legacy reader".into());
+    }
+    for marker in [
+        "Ok(Some(binding)) => acquire(binding, plan, pins, limits, reserve)",
+        "Err(ReadStage::BankQuarantined)",
+        "Err(_) => Err(ReadStage::BankRouting)",
+    ] {
+        require_contract_marker(fresh, marker, "present counter binding stays closed")?;
+    }
+    let terminal = contract_section(
+        projection,
+        "    fn terminal_with<B>(",
+        "/// One collector per capture.",
+    )?;
+    require_contract_marker(
+        terminal,
+        "self.fresh_with(plan, pins, profile, binding, acquire, legacy)?\n            .require_terminal()",
+        "fresh terminal observation",
+    )?;
+    let terminal_acceptance = contract_section(
+        projection,
+        "    fn require_terminal(self)",
+        "/// The one collection owner",
+    )?;
+    require_contract_marker(
+        terminal_acceptance,
+        "if !self.new_acquisition || self.counter().is_some_and(|snapshot| !snapshot.is_fresh())",
+        "terminal rejects cached or unsuccessful observations",
+    )
+}
+
 #[test]
 fn both_capture_loops_wire_behavioral_helpers_and_terminal_publication() {
     // Ordering inside the helpers is exercised by capture_loop_tests, including
     // compiled mutation controls. This guard binds their real production callers
     // and the mode-specific publication callbacks that those tests do not invoke.
     let run = read("src/run.rs");
+    let projection = read("src/metrics/counter_projection.rs");
+    assert_profile_collection_wiring(&run, &projection).unwrap();
+    for (original, replacement, role) in [
+        (
+            "collection.fresh(",
+            "bare_collection(",
+            "profile live collection under cache gate",
+        ),
+        (
+            ".terminal(context.1, context.0.plan(), context.0.pinned(), profile)?",
+            ".fresh(context.1, context.0.plan(), context.0.pinned(), profile)?",
+            "profile terminal collection owner",
+        ),
+    ] {
+        let mutant = run.replacen(original, replacement, 1);
+        assert_ne!(mutant, run, "{role} mutation changes production source");
+        let error = assert_profile_collection_wiring(&mutant, &projection).unwrap_err();
+        assert!(error.contains(role), "{role}: {error}");
+    }
+    for (original, replacement, reason) in [
+        (
+            "            Ok(None) => {",
+            "            Ok(_) => {",
+            "Ok(None)",
+        ),
+        (
+            ".require_terminal()",
+            ".allow_cached_terminal()",
+            "fresh terminal observation",
+        ),
+        (
+            "kernel.ring_loss = 0;",
+            "kernel.ring_loss = 1;",
+            "ordinary collection preserves legacy mode",
+        ),
+        (
+            "Err(_) => Err(ReadStage::BankRouting)",
+            "Err(_) => legacy()",
+            "present counter binding stays closed",
+        ),
+    ] {
+        let mutant = projection.replacen(original, replacement, 1);
+        assert_ne!(
+            mutant, projection,
+            "{reason} mutation changes production source"
+        );
+        let error = assert_profile_collection_wiring(&run, &mutant).unwrap_err();
+        assert!(error.contains(reason), "{reason}: {error}");
+    }
     let profile = between(&run, "fn capture_profile(", "fn write_json_report(");
     let trace = between(&run, "fn capture_trace(", "\n/// Prints (and, if given,");
     for (name, source, consumer, drain, snapshot) in [
@@ -10462,7 +10651,7 @@ fn both_capture_loops_wire_behavioral_helpers_and_terminal_publication() {
             profile,
             "tracer: None,",
             "drain_events(",
-            "metrics::kernel_evidence(context.1)?",
+            "collection.fresh(",
         ),
         (
             "trace",
@@ -10535,8 +10724,18 @@ fn both_capture_loops_wire_behavioral_helpers_and_terminal_publication() {
         .unwrap()
         .1;
     for (first, second) in [
-        ("let reports = metrics::read(", "let mut kernel_evidence ="),
-        ("let mut kernel_evidence =", ".check_unchanged()"),
+        (
+            ".terminal(context.1, context.0.plan(), context.0.pinned(), profile)?",
+            "let reports = snapshot.reports();",
+        ),
+        (
+            "let reports = snapshot.reports();",
+            "let kernel_evidence = snapshot.kernel_evidence();",
+        ),
+        (
+            "let kernel_evidence = snapshot.kernel_evidence();",
+            ".check_unchanged()",
+        ),
         (".check_unchanged()", "context.0.settle_terminal_drain();"),
         (
             "context.0.settle_terminal_drain();",
@@ -10554,9 +10753,9 @@ fn both_capture_loops_wire_behavioral_helpers_and_terminal_publication() {
         ),
         (
             "ev.settle_terminal(profile);",
-            "let frame = render::live_scoped(",
+            "let frame = render::live_snapshot_scoped(",
         ),
-        ("let frame = render::live_scoped(", "write_stdout("),
+        ("let frame = render::live_snapshot_scoped(", "write_stdout("),
     ] {
         require_before(
             profile_terminal,

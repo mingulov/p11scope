@@ -10708,6 +10708,7 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
         module: Some(ModuleId(0)),
         module_ambiguous: false,
         module_unresolved: false,
+        mode: p11scope_ebpf_common::CounterMode::Latency,
         calls: 3,
         errors: 0,
         in_flight: 0,

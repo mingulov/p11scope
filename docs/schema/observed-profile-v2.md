@@ -409,10 +409,28 @@ One item per attach slot:
 | `errors` | Nonzero returns excluding `CKR_PENDING`. |
 | `pending_returns` | Returns equal to `CKR_PENDING`; also present in `rv_counts`. |
 | `in_flight` | Entries minus returns at read time. |
-| `latency_ns` | `approximate`, bucket-lower-bound `p50`/`p95`/`p99`, and exact `total`/`max`. |
+| `latency_ns` | Timing availability: a histogram object, a timestamps object with measured `total`/`max` and unavailable percentiles, or `null` when timing was not measured. See below. |
 | `rv_counts` | Full-width `CK_RV` formatted as a 16-digit hex key to count. |
 
 Aliased slots are never split into guessed per-name counts.
+
+### Timing availability
+
+The native counter cell's measurement capability determines `latency_ns`,
+independently of semantic authorization and the numeric values:
+
+| Capability | `latency_ns` |
+| --- | --- |
+| Counts | `null`: timing was not measured. |
+| Timestamps | Object with `approximate: false`, null `p50`/`p95`/`p99`, and measured `total`/`max`. No histogram was recorded. |
+| Latency, including legacy reports | Object with `approximate: true`, bucket-lower-bound `p50`/`p95`/`p99`, and measured `total`/`max`. Percentiles are null when the histogram has no observations. |
+
+A measured zero remains zero; it is never used to infer unavailable timing.
+`approximate` describes the percentiles. It does not assert a loss-free
+capture: totals and maxima retain their source's accounting and loss limits,
+and capture evidence still determines completeness. Timing availability does
+not change the aggregate authority for `functions[]` or add semantic detail
+counts into those totals.
 
 ### The owner relation is exact and exclusive
 
@@ -445,7 +463,7 @@ statement, and it forces `PARTIAL` so the count is never read as attributed.
 | `mechanism`, `mechanism_hex` | 64-bit mechanism id admitted by the capture policy; the default policy permits only finite published registry membership. |
 | `ops` | Operation categories observed for this id. |
 | `calls`, `errors` | Event-derived semantic calls and non-success final results. |
-| `latency_ns` | Same shape as function latency; async semantic latency spans pending entry to completion. |
+| `latency_ns` | Always the histogram object shape, independent of function timing availability; async semantic latency spans pending entry to completion. |
 | `params` | Always `null` under the default `allowlisted` policy. A separately enabled unsafe diagnostic capture may contain distinct decoded parameter combinations with counts. |
 | `params_omitted` | v3 only, present exactly when `params` is `null`: `policy` (the `allowlisted` policy disables parameter decoding), `no_shape` (no diagnostic shape is published for this id; decoding was not attempted) or `decode_failed` (a shape exists but every decode attempt failed). A `null` never means "no parameters were passed". |
 | `note` | Whether decoding was unavailable, failed totally, or succeeded. |

@@ -106,6 +106,7 @@ fn report(calls: u64, errors: u64, in_flight: u64) -> SlotReport {
         module: None,
         module_ambiguous: false,
         module_unresolved: true,
+        mode: p11scope_ebpf_common::CounterMode::Latency,
         calls,
         errors,
         in_flight,

@@ -17,6 +17,12 @@ outcome (`stop_quiescence`), the verdict
 classes (`gap_classes` and its three published inputs), and row identity
 (`functions[].target`, `functions[].ordinals`, table linkage `exports`).
 
+The inherited `functions[].latency_ns` timing-availability shapes also apply
+to v3: counts has null timing, timestamps has measured total/max and null
+percentiles, and latency retains the histogram object. A measured zero is
+distinct from unavailable timing. These shapes do not change count authority
+or combine aggregate and semantic-detail totals.
+
 Under the default `allowlisted` policy, every emitted mechanism has
 `params: null` with `params_omitted: "policy"` beside it, and
 `templates.operations` is always empty. Every `params: null` carries a

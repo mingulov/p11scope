@@ -7,6 +7,7 @@ use crate::discovery::scan::Skipped;
 use crate::kinds;
 use crate::metrics::{SlotReport, percentile_ns};
 use crate::plan::{ModuleId, TableSummary};
+use p11scope_ebpf_common::CounterMode;
 use p11scope_manifest::manifest::{SelectionAuthority, SelectionRequest};
 use serde::Serialize;
 use std::time::Duration;
@@ -1798,14 +1799,23 @@ pub fn live_scoped(
         .collect();
     rows.sort_by(|a, b| b.calls.cmp(&a.calls).then(a.names.cmp(&b.names)));
     for r in rows {
+        let percentiles = if r.mode.has_histogram() {
+            [
+                percentile_ns(&r.buckets, 0.50),
+                percentile_ns(&r.buckets, 0.95),
+                percentile_ns(&r.buckets, 0.99),
+            ]
+        } else {
+            [None; 3]
+        };
         s.push_str(&format!(
             "{:<28} {:>8} {:>6} {:>9} {:>9} {:>9} {:>9}\n",
             escape_controls(&label(r)),
             r.calls,
             r.errors,
-            fmt_ns(percentile_ns(&r.buckets, 0.50)),
-            fmt_ns(percentile_ns(&r.buckets, 0.95)),
-            fmt_ns(percentile_ns(&r.buckets, 0.99)),
+            fmt_ns(percentiles[0]),
+            fmt_ns(percentiles[1]),
+            fmt_ns(percentiles[2]),
             r.in_flight
         ));
     }
@@ -2089,13 +2099,14 @@ struct FunctionOut {
     errors: u64,
     pending_returns: u64,
     in_flight: u64,
-    latency_ns: LatencyOut,
+    latency_ns: Option<LatencyOut>,
     rv_counts: std::collections::BTreeMap<String, u64>,
 }
 
 #[derive(Serialize)]
 struct LatencyOut {
-    /// Bucket-approximated; exact values are total/max.
+    /// Whether percentiles are bucket-approximated. Total/max retain their
+    /// source's measurement and loss limits.
     approximate: bool,
     p50: Option<u64>,
     p95: Option<u64>,
@@ -2116,6 +2127,22 @@ fn latency_out(
         p99: percentile_ns(buckets, 0.99),
         total,
         max,
+    }
+}
+
+/// Availability follows the actual row's counter capability, never its values.
+fn latency_out_for_mode(report: &SlotReport) -> Option<LatencyOut> {
+    match report.mode {
+        CounterMode::Counts => None,
+        CounterMode::Timestamps => Some(LatencyOut {
+            approximate: false,
+            p50: None,
+            p95: None,
+            p99: None,
+            total: report.total_ns,
+            max: report.max_ns,
+        }),
+        CounterMode::Latency => Some(latency_out(&report.buckets, report.total_ns, report.max_ns)),
     }
 }
 
@@ -2155,7 +2182,7 @@ fn functions_out(reports: &[SlotReport], modules: &[DiscoveredModule]) -> Vec<Fu
                 .copied()
                 .unwrap_or(0),
             in_flight: r.in_flight,
-            latency_ns: latency_out(&r.buckets, r.total_ns, r.max_ns),
+            latency_ns: latency_out_for_mode(r),
             rv_counts: r
                 .rv_counts
                 .iter()
@@ -2688,6 +2715,10 @@ pub(crate) mod tests {
     #[test]
     fn counter_modes_render_their_timing_availability() {
         use p11scope_ebpf_common::bucket_of;
+        let capture = CaptureMeta {
+            policy: CapturePolicy::AggregateOnly,
+            ..capture_fixture()
+        };
         for (mode, latency) in [
             (CounterMode::Counts, serde_json::Value::Null),
             (
@@ -2713,7 +2744,7 @@ pub(crate) mod tests {
             row.buckets[bucket_of(100) as usize] = 25;
             row.rv_counts.insert(0, 22);
             row.rv_counts.insert(5, 3);
-            let output = json(&[row], &evidence(), &capture_fixture());
+            let output = json(&[row], &evidence(), &capture);
             let functions = output["functions"].as_array().unwrap();
             assert_eq!(functions.len(), 1);
             assert_eq!(functions[0]["latency_ns"], latency, "{mode:?}");
@@ -2730,21 +2761,24 @@ pub(crate) mod tests {
     #[test]
     fn counter_timing_ignores_unavailable_fields_and_preserves_measured_zero() {
         use p11scope_ebpf_common::bucket_of;
+        let capture = CaptureMeta {
+            policy: CapturePolicy::AggregateOnly,
+            ..capture_fixture()
+        };
         let mut row = report("C_Sign", 25, 0, false);
         row.mode = CounterMode::Counts;
         row.total_ns = u64::MAX;
         row.max_ns = u64::MAX;
         row.buckets[bucket_of(100) as usize] = 25;
         assert!(
-            json(&[row.clone()], &evidence(), &capture_fixture())["functions"][0]["latency_ns"]
-                .is_null()
+            json(&[row.clone()], &evidence(), &capture)["functions"][0]["latency_ns"].is_null()
         );
 
         row.mode = CounterMode::Timestamps;
         row.total_ns = 0;
         row.max_ns = 0;
         assert_eq!(
-            json(&[row.clone()], &evidence(), &capture_fixture())["functions"][0]["latency_ns"],
+            json(&[row.clone()], &evidence(), &capture)["functions"][0]["latency_ns"],
             serde_json::json!({
                 "approximate": false, "p50": null, "p95": null, "p99": null,
                 "total": 0, "max": 0,
@@ -2755,7 +2789,7 @@ pub(crate) mod tests {
         row.buckets = [0; LATENCY_BUCKETS];
         row.buckets[0] = 25;
         assert_eq!(
-            json(&[row], &evidence(), &capture_fixture())["functions"][0]["latency_ns"],
+            json(&[row], &evidence(), &capture)["functions"][0]["latency_ns"],
             serde_json::json!({
                 "approximate": true, "p50": 0, "p95": 0, "p99": 0,
                 "total": 0, "max": 0,

@@ -18,7 +18,7 @@ use crate::plan::{AttachPlan, ModuleId};
 use anyhow::{Context as _, Result};
 use aya::maps::{Array, PerCpuArray, PerCpuHashMap};
 use p11scope_ebpf_common::{
-    EVIDENCE_ABI_REFUSALS, EVIDENCE_CGROUP_SCOPE_FAILURES, EVIDENCE_RING_LOSS,
+    CounterMode, EVIDENCE_ABI_REFUSALS, EVIDENCE_CGROUP_SCOPE_FAILURES, EVIDENCE_RING_LOSS,
     EVIDENCE_RV_UPDATE_FAILURES, EVIDENCE_SEMANTIC_CAPTURE_FAILURES,
     EVIDENCE_START_INSERT_FAILURES, EVIDENCE_TEMPLATE_TAIL_FAILURES, EVIDENCE_UNMATCHED_RETURNS,
     EVIDENCE_UNREGISTERED_MECHANISMS, ImageIdentityControl, LATENCY_BUCKETS, OWNER_BAD_CONTROL,
@@ -48,6 +48,9 @@ pub struct SlotReport {
     /// endpoint whose post-mutation generation validation failed). Exclusive
     /// with `module_ambiguous` by construction.
     pub module_unresolved: bool,
+    /// Timing capability of the native counter cell used for this row,
+    /// independent of semantic authorization or requested CLI options.
+    pub mode: CounterMode,
     /// Completed calls (entry and return both observed).
     pub calls: u64,
     pub errors: u64,
@@ -83,6 +86,8 @@ fn slot_report(
         // The exclusive third case, derived from the other two rather than
         // from a second owner list that could drift out of step with them.
         module_unresolved: module.is_none() && !module_ambiguous,
+        // This constructor consumes the actual legacy SlotStats layout.
+        mode: CounterMode::Latency,
         calls: acc.returned,
         errors: acc.errors,
         in_flight: acc.entered.saturating_sub(acc.returned),

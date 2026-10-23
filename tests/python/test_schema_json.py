@@ -184,6 +184,8 @@ class SchemaOracleAgreement(unittest.TestCase):
         self.assertIn({"type": "null"}, shapes)
         objects = [shape for shape in shapes if shape.get("type") == "object"]
         self.assertEqual(len(objects), 2)
+        for shape in objects:
+            self.assertIs(type(shape["properties"]["approximate"]["const"]), bool)
         by_approximation = {shape["properties"]["approximate"]["const"]: shape
                             for shape in objects}
         self.assertEqual(set(by_approximation), {True, False})

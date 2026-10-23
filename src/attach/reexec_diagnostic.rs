@@ -863,6 +863,7 @@ mod tests {
                 module: None,
                 module_ambiguous: false,
                 module_unresolved: true,
+                mode: p11scope_ebpf_common::CounterMode::Latency,
                 calls: completed,
                 errors: 0,
                 in_flight,

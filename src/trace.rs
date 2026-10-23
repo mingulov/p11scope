@@ -842,6 +842,7 @@ mod tests {
             module: None,
             module_ambiguous: false,
             module_unresolved: false,
+            mode: p11scope_ebpf_common::CounterMode::Latency,
             calls,
             errors: 0,
             in_flight,

@@ -2400,6 +2400,7 @@ fn canary_reports() -> Vec<crate::metrics::SlotReport> {
         module: Some(crate::plan::ModuleId(0)),
         module_ambiguous: false,
         module_unresolved: false,
+        mode: p11scope_ebpf_common::CounterMode::Latency,
         calls: 1,
         errors: 0,
         in_flight: 0,

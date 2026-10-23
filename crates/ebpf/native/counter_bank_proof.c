@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-/* Unselected fixed two-bank Counts bridge. Logical IDs remain 0/1 with
- * STATS512/START16384/RV4096. The separately selected native owner cleanup
- * profile spans 8192; that feasibility bound does not provide 8192 bank cells,
- * grow a hot RV map or authorize a public counter selector. */
+/* Unselected format2 Counts bridge:16x512 cells, START16384/RV65536.
+ * Legacy STATS512 remains separate and unused by these roots. Real Session
+ * preparation/reader support and useful population are separately gated. */
 typedef unsigned int u32;
 typedef unsigned long long u64;
 #define SEC(name) __attribute__((section(name), used))
@@ -16,13 +15,9 @@ typedef unsigned long long u64;
 #define BANK_RV_FAULT 4ULL
 #define BANK_SCOPE_FAULT 8ULL
 /* Exact fixed layout/capacity binding, not a collection generation. */
-#define BANK_CONFIG 0x18000102ULL
+#define BANK_CONFIG 0x0200001800100200ULL
 
 struct bank_counts { u64 entered; u64 returned; u64 errors; };
-struct bank_metadata { u64 transaction; u64 bank_mask; u32 logical_slot; u32 cells; };
-struct bank_commit { u64 bank_mask; u64 configuration; };
-/* Additive format2 ABI declarations only: no map or producer selects these
- * until the separately reviewed geometry/native/reader conversion coheres. */
 struct counts_bank_route {
     u64 transaction;
     u32 first, end, bank, cell, inner_id, reserved_zero;
@@ -43,8 +38,9 @@ _Static_assert(__builtin_offsetof(struct counts_bank_commit, configuration) == 8
 struct owner_start_key { u64 pid_tgid; u32 slot; u32 pad; };
 struct bank_rv_key { u32 slot; u32 pad; u64 rv; };
 _Static_assert(sizeof(struct bank_counts) == 24, "Counts ABI");
-_Static_assert(sizeof(struct bank_metadata) == 24, "immutable bank metadata ABI");
-_Static_assert(sizeof(struct bank_commit) == 16, "exact-set commit ABI");
+_Static_assert(__builtin_offsetof(struct bank_counts, entered) == 0, "Counts entered");
+_Static_assert(__builtin_offsetof(struct bank_counts, returned) == 8, "Counts returned");
+_Static_assert(__builtin_offsetof(struct bank_counts, errors) == 16, "Counts errors");
 _Static_assert(sizeof(struct owner_start_key) == 16, "existing START key ABI");
 _Static_assert(sizeof(struct bank_rv_key) == 16, "existing full-width RV key ABI");
 _Static_assert(__builtin_offsetof(struct owner_start_key, slot) == 8, "START logical slot");
@@ -52,33 +48,33 @@ _Static_assert(__builtin_offsetof(struct owner_start_key, pad) == 12, "START zer
 _Static_assert(__builtin_offsetof(struct bank_rv_key, rv) == 8, "full-width RV position");
 
 /* `values` is a zero-length pointer array describing the inner template;
- * no initialized entry publishes a bank or allocates an actual second bank. */
+ * no initialized entry publishes a bank or allocates a real bank. */
 struct bank_inner_template {
     UINT(type, 6); /* PERCPU_ARRAY */
-    UINT(max_entries, 1);
+    UINT(max_entries, 512);
     TYPE(key, u32);
     TYPE(value, struct bank_counts);
 };
 struct {
     UINT(type, 13); /* HASH_OF_MAPS */
-    UINT(max_entries, 2);
+    UINT(max_entries, 16);
     UINT(map_flags, READ_ONLY_PROG);
     TYPE(key, u32);
     ARRAY(values, struct bank_inner_template);
 } COUNTER_BANKS SEC(".maps");
 struct {
     UINT(type, 1);
-    UINT(max_entries, 2);
+    UINT(max_entries, 8192);
     UINT(map_flags, READ_ONLY_PROG);
     TYPE(key, u32);
-    TYPE(value, struct bank_metadata);
+    TYPE(value, struct counts_bank_route);
 } COUNTER_BANK_META SEC(".maps");
 struct {
     UINT(type, 1);
-    UINT(max_entries, 2);
+    UINT(max_entries, 8192);
     UINT(map_flags, READ_ONLY_PROG);
     TYPE(key, u64);
-    TYPE(value, struct bank_commit);
+    TYPE(value, struct counts_bank_commit);
 } COUNTER_BANK_COMMIT SEC(".maps");
 struct {
     UINT(type, 6);
@@ -128,35 +124,36 @@ static INLINE void increment(u64 *cell)
 }
 
 /* Publication is append-only and immutable in the later owning controller.
- * Each bank names its own transaction; there is no latest-transaction gate.
- * The commit mask exactly names the staged subset of these two fixed banks. */
+ * Each route names its original transaction; there is no latest-txn gate.
+ * A commit activates only its complete immutable logical extent. */
 static INLINE struct bank_counts *route(u32 slot, u32 *inactive)
 {
     *inactive = 0;
-    if (slot >= 2)
+    if (slot >= 8192)
         return (void *)0;
-    struct bank_metadata *meta = lookup(&COUNTER_BANK_META, &slot);
+    struct counts_bank_route *meta = lookup(&COUNTER_BANK_META, &slot);
     if (!meta) {
         *inactive = 1;
         return (void *)0;
     }
     u64 transaction = meta->transaction;
-    u64 mask = meta->bank_mask;
-    if (!transaction || !mask || (mask & ~3ULL) || !(mask & (1ULL << slot)) ||
-        meta->logical_slot != slot || meta->cells != 1)
+    u32 first = meta->first, end = meta->end;
+    u32 bank = slot >> 9, cell = slot & 511;
+    if (!transaction || !meta->inner_id || meta->reserved_zero || first >= end ||
+        slot < first || slot >= end || end > 8192 ||
+        meta->bank != bank || meta->cell != cell)
         return (void *)0;
-    struct bank_commit *commit = lookup(&COUNTER_BANK_COMMIT, &transaction);
+    struct counts_bank_commit *commit = lookup(&COUNTER_BANK_COMMIT, &transaction);
     if (!commit) {
         *inactive = 1;
         return (void *)0;
     }
-    if (commit->bank_mask != mask || commit->configuration != BANK_CONFIG)
+    if (commit->first != first || commit->end != end || commit->configuration != BANK_CONFIG)
         return (void *)0;
-    void *inner = lookup(&COUNTER_BANKS, &slot);
+    void *inner = lookup(&COUNTER_BANKS, &bank);
     if (!inner)
         return (void *)0;
-    u32 zero = 0;
-    return lookup(inner, &zero);
+    return lookup(inner, &cell);
 }
 
 /* Scalar-only BTF boundary. Inactive staging never calls START or touches

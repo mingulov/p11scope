@@ -193,7 +193,7 @@ static OBJECT_DESCRIPTORS: Array<ObjectDescriptorWire> =
 #[map]
 static OBJECT_ZERO: Array<ObjectStart> = Array::with_max_entries(1, BPF_F_RDONLY_PROG);
 
-#[cfg(not(feature = "inventory-only"))]
+#[cfg(not(any(feature = "inventory-only", feature = "counts-bank-proof")))]
 #[map]
 static RV_COUNTS: PerCpuHashMap<RvKey, u64> = PerCpuHashMap::with_max_entries(RV_ENTRIES, 0);
 
@@ -4188,3 +4188,5 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 // Appended so disabled proof preparation does not move ordinary BPF lines.
 #[cfg(feature = "counts-bank-proof")]
 mod counter_bank_proof;
+#[cfg(feature = "counts-bank-proof")]
+use counter_bank_proof::RV_COUNTS;

@@ -306,6 +306,60 @@ class CounterObjectCliTests(unittest.TestCase):
         self.assertEqual(legacy_definition["max_entries"], 2)
         self.assertEqual(legacy_definition["inner_template"]["max_entries"], 1)
 
+    def test_growth_footprint_requires_bounded_outer_and_inner_keys(self):
+        checker = runpy.run_path(str(CHECKER), run_name="counter_growth_footprint_test")
+        frame = (1, 0)
+        maps = {"COUNTER_BANKS": {"value_size": 4},
+                "COUNTER_BANK_VALUE": {"value_size": 24}}
+        proof = checker["BankFootprint"](None, maps, native_bound=8192, growth=True)
+
+        def lookup(mapped, low, high):
+            registers = [None] * 11
+            registers[1], registers[2] = mapped, ("stack", frame, -4)
+            memory = {(frame, -4, 4): checker["scalar"](low, high)}
+            proof.helper(1, registers, memory, frame, 0)
+            return registers[0]
+
+        outer = lookup(("map", "COUNTER_BANKS"), 0, 15)
+        self.assertEqual(outer[:4], ("ptr", "COUNTER_BANKS", 0, 0))
+        self.assertEqual(lookup(outer, 0, 511)[:4], ("ptr", "COUNTER_BANK_VALUE", 0, 0))
+        for mapped, low, high in ((("map", "COUNTER_BANKS"), 0, 16),
+                                  (outer, 0, 512), (("ptr", "COUNTER_BANKS", 1, 1, None), 0, 0)):
+            with self.subTest(mapped=mapped, low=low, high=high):
+                with self.assertRaises(RuntimeError):
+                    lookup(mapped, low, high)
+        legacy = checker["BankFootprint"](None, maps)
+        registers = [None] * 11
+        registers[1], registers[2] = outer, ("stack", frame, -4)
+        with self.assertRaises(RuntimeError):
+            legacy.helper(1, registers, {(frame, -4, 4): checker["constant"](1)}, frame, 0)
+
+    def test_growth_execution_separates_shared_cells_and_full64_commit_keys(self):
+        checker = runpy.run_path(str(CHECKER), run_name="counter_growth_lookup_test")
+        vm = checker["BankExecution"](None, growth=True)
+
+        def lookup(handle, raw_key):
+            key = vm.set("lookup_fixture_key", 0, raw_key)
+            registers = [0] * 11
+            registers[1], registers[2] = handle, key
+            return vm.helper(1, registers, (1, 0), 0)
+
+        bank0 = lookup(vm.handles["COUNTER_BANKS"], bytes(4))
+        first = lookup(bank0, bytes(4))
+        last = lookup(bank0, (511).to_bytes(4, "little"))
+        self.assertEqual(first, vm.bank_storage[0])
+        self.assertEqual(last, vm.bank_storage[511])
+        self.assertNotEqual(first, last)
+        self.assertEqual(lookup(bank0, (512).to_bytes(4, "little")), 0)
+        high = 0x1_0000_0007
+        low_body, high_body = struct.pack("<IIQ", 0, 1, 0x18000102), struct.pack("<IIQ", 511, 513, 0x0200001800100200)
+        low_address = vm.set("COUNTER_BANK_COMMIT", 7, low_body)
+        self.assertEqual(lookup(vm.handles["COUNTER_BANK_COMMIT"], high.to_bytes(8, "little")), 0)
+        high_address = vm.set("COUNTER_BANK_COMMIT", high, high_body)
+        self.assertEqual(lookup(vm.handles["COUNTER_BANK_COMMIT"], high.to_bytes(8, "little")), high_address)
+        self.assertEqual(lookup(vm.handles["COUNTER_BANK_COMMIT"], (7).to_bytes(8, "little")), low_address)
+        self.assertNotEqual(low_address, high_address)
+
     def test_bank_instruction_execution_preserves_existing_sticky_fault_bits(self):
         checker = runpy.run_path(str(CHECKER), run_name="counter_bank_vm_test")
 

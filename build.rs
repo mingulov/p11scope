@@ -249,7 +249,7 @@ fn main() {
     println!(
         "cargo:rustc-env=P11SCOPE_COUNTER_BANK_PROOF_OUTPUTS={}",
         if counter_bank_proof {
-            "counts-bank-proof"
+            "counts-bank-growth-v2"
         } else {
             ""
         }
@@ -322,7 +322,7 @@ fn build_variant_with_proof(
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"));
     let mut out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR not set"));
     if bank_proof {
-        out_dir.push("counter-bank-proof");
+        out_dir.push("counter-bank-growth-v2");
         std::fs::create_dir_all(&out_dir).expect("creating private counter bank proof output");
     } else if flavor.counters() {
         out_dir.push("counter-artifacts");
@@ -368,7 +368,7 @@ fn build_variant_with_proof(
     let mut native_bitcodes = Vec::new();
     for unit in &selected_native_units {
         let suffix = if bank_proof {
-            "counts-bank-proof"
+            "counts-bank-growth-v2"
         } else {
             match flavor {
                 BpfFlavor::Detailed => "detailed",
@@ -433,6 +433,9 @@ fn build_variant_with_proof(
         if !inventory && wide_detailed && *unit == "instance_epoch" {
             compile.arg("-DP11SCOPE_INSTANCE_SLOT_BOUND=2112U");
         }
+        if bank_proof && *unit == "instance_epoch" {
+            compile.arg("-DP11SCOPE_INSTANCE_SLOT_BOUND=8192U");
+        }
         let status = compile
             .status()
             .expect("failed to spawn clang-18 for native state");
@@ -455,7 +458,7 @@ fn build_variant_with_proof(
 
     let ebpf_manifest = manifest_dir.join("crates/ebpf/Cargo.toml");
     let target_dir = out_dir.join(if bank_proof {
-        "ebpf-counts-bank-proof-target"
+        "ebpf-counts-bank-growth-v2-target"
     } else {
         match flavor {
             BpfFlavor::Detailed => "ebpf-target",
@@ -657,7 +660,7 @@ fn build_variant_with_proof(
     std::fs::copy(
         &built,
         out_dir.join(if bank_proof {
-            "p11scope-ebpf-counts-bank-proof"
+            "p11scope-ebpf-counts-bank-growth-v2"
         } else {
             match flavor {
                 BpfFlavor::Detailed => "p11scope-ebpf",

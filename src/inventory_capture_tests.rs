@@ -191,6 +191,7 @@ struct ScriptedLane {
     stopping: bool,
     polls: u32,
     retire_after: Option<u32>,
+    retirement_error: bool,
     retired: bool,
     /// The first this many reads cannot prove health.
     unproven_reads: usize,
@@ -256,6 +257,7 @@ impl ScriptedLane {
             stopping: false,
             polls: 0,
             retire_after: Some(1),
+            retirement_error: false,
             retired: false,
             unproven_reads: 0,
             partial_reads: HashSet::new(),
@@ -510,6 +512,9 @@ impl CaptureLane<Pin> for ScriptedLane {
             .push(("retirement", deadline));
         self.note("poll");
         self.polls += 1;
+        if self.retirement_error {
+            return Err(anyhow!("controlled retirement poll failure"));
+        }
         if self.retire_after.is_some_and(|after| self.polls >= after) {
             self.retired = true;
         }
@@ -3899,6 +3904,15 @@ mod publication_progress_tests {
     use super::*;
     use std::cell::Cell;
 
+    fn live_native(run: &RetainedClassicRun<ScriptedLane>) -> &NativeLane<ScriptedLane> {
+        match run.native.as_ref().expect("the original native owner") {
+            RetainedNative::Live(lane) => lane,
+            RetainedNative::Stopping(_) | RetainedNative::Stopped(_) => {
+                panic!("the running loop cannot start terminal I/O")
+            }
+        }
+    }
+
     #[derive(Clone, Copy)]
     enum Poll {
         Pending,
@@ -3933,6 +3947,7 @@ mod publication_progress_tests {
         suspended: usize,
         legacy_commits: usize,
         legacy_stops: usize,
+        lane_stops: usize,
     }
 
     impl Driver {
@@ -3964,6 +3979,7 @@ mod publication_progress_tests {
                 suspended: 0,
                 legacy_commits: 0,
                 legacy_stops: 0,
+                lane_stops: 0,
             }
         }
 
@@ -3979,7 +3995,7 @@ mod publication_progress_tests {
             assert_eq!(self.legacy_commits, 0, "no legacy terminal publication");
             let completed = retained.completed_passes as usize;
             assert_eq!(self.emissions, completed);
-            let lane = retained.lane.as_ref().expect("original native ownership");
+            let lane = live_native(retained);
             assert!(!lane.capture.stopping, "no new terminal drain");
             assert!(!entries(&self.scene.log).iter().any(|line| line == "drop"));
             match &retained.pass {
@@ -4003,6 +4019,9 @@ mod publication_progress_tests {
                     assert_eq!(report.pending_refresh.as_ptr() as usize, self.report_ptr);
                     assert_eq!(self.scene.scans, completed + 1);
                     assert_eq!(self.applies, completed + 1);
+                }
+                RetainedPass::Terminal { .. } => {
+                    panic!("the running loop must retain the original pass")
                 }
             }
         }
@@ -4138,8 +4157,9 @@ mod publication_progress_tests {
         }
         fn on_native_service(&mut self, capture: Option<&mut dyn CaptureLane<Pin>>) {
             self.scene.note("native-service");
-            self.native_domains
-                .push(capture.expect("same native owner").domain());
+            if let Some(capture) = capture {
+                self.native_domains.push(capture.domain());
+            }
         }
         fn on_tick(&mut self) {
             self.scene.note("tick");
@@ -4156,6 +4176,9 @@ mod publication_progress_tests {
         }
         fn on_stop_requested(&mut self) {
             self.legacy_stops += 1;
+        }
+        fn on_lane_stopped(&mut self) {
+            self.lane_stops += 1;
         }
     }
 
@@ -4324,7 +4347,7 @@ mod publication_progress_tests {
         driver.assert_retained(&outcome);
         assert_eq!(driver.ticks, 3);
         assert_eq!(driver.native_domains, [domain; 3]);
-        let held = outcome.retained.as_ref().unwrap().lane.as_ref().unwrap();
+        let held = live_native(outcome.retained.as_ref().unwrap());
         assert_eq!((held.held.len(), held.held_records), (2, 2));
         assert_eq!(
             held.capture.services, 3,
@@ -4407,19 +4430,19 @@ mod publication_progress_tests {
                 false,
                 false,
                 vec![Poll::Fail],
-                Some(AppliedPassPhase::FirstCommit),
+                Some(AppliedPassPhase::FirstCommitAttempted),
             ),
             (
                 false,
                 false,
                 vec![Poll::Pending, Poll::Fail],
-                Some(AppliedPassPhase::FirstCommit),
+                Some(AppliedPassPhase::FirstCommitAttempted),
             ),
             (
                 false,
                 true,
                 vec![Poll::Published, Poll::Pending, Poll::Fail],
-                Some(AppliedPassPhase::ScopedReceipts),
+                Some(AppliedPassPhase::ScopedReceiptsAttempted),
             ),
         ] {
             let log = Log::default();
@@ -4495,7 +4518,7 @@ mod publication_progress_tests {
         let ClassicCompletion::Retained { run, error } = outcome.into_completion().unwrap() else {
             panic!("the complete original run must survive conversion");
         };
-        assert!(run.lane.is_some());
+        assert!(run.native.is_some());
         assert_eq!(error.unwrap().to_string(), "original publication failure");
         drop(stopped);
     }
@@ -4646,7 +4669,7 @@ mod publication_progress_tests {
                 assert_eq!(run.completed_passes, 0);
                 assert_eq!(run.stop_cause, Some(ZeroPassCause::OperatorStop));
                 assert!(run.elapsed < GATE_TIMEOUT);
-                assert_eq!(run.lane.as_ref().unwrap().capture.domain, domain);
+                assert_eq!(live_native(run).capture.domain, domain);
                 assert_eq!((driver.collected_ptr, driver.report_ptr), (0, 0));
                 assert_eq!(driver.changes.len(), usize::from(!stop_before_poll));
                 assert!(driver.scene.staged_lifecycle.is_empty());
@@ -4678,7 +4701,7 @@ mod publication_progress_tests {
                 "the previous pass remains counted once"
             );
             assert_eq!(run.stop_cause, Some(ZeroPassCause::OperatorStop));
-            assert_eq!(run.lane.as_ref().unwrap().capture.domain, domain);
+            assert_eq!(live_native(run).capture.domain, domain);
             assert_eq!(driver.ticks, 2);
             assert_eq!(driver.native_domains, [domain; 2]);
             assert_eq!(
@@ -4687,7 +4710,7 @@ mod publication_progress_tests {
                 "no new native staging after the first tick made publication pending"
             );
             assert_eq!(
-                run.lane.as_ref().unwrap().held.len(),
+                live_native(run).held.len(),
                 1,
                 "pending native service retains the next quantum instead"
             );
@@ -4989,6 +5012,7 @@ mod publication_progress_tests {
             assert_eq!(driver.host_stops, 1);
             assert_eq!(driver.legacy_stops, 0);
             assert_eq!(driver.legacy_commits, 0);
+            assert_eq!(driver.lane_stops, 1);
             assert_eq!(outcome.stopped.as_ref().unwrap().summary.passes, 1);
             assert_eq!(
                 entries(&log)
@@ -5029,6 +5053,44 @@ mod publication_progress_tests {
                     _ => RetainedBlock::PublicationDispositionRequired,
                 };
                 assert_eq!(outcome.retained.as_ref().unwrap().block, Some(want));
+                let run = outcome.retained.as_ref().unwrap();
+                if case == 0 {
+                    let RetainedPass::Collected {
+                        collected: CollectedPass::Legacy(Ok(catalog)),
+                        ..
+                    } = &run.pass
+                    else {
+                        panic!("retain the exact unapplied collection");
+                    };
+                    assert_eq!(catalog.processes.as_ptr() as usize, driver.collected_ptr);
+                    assert_eq!(driver.applies, 0);
+                } else {
+                    let RetainedPass::Applied { report, phase } = &run.pass else {
+                        panic!("retain the exact applied report");
+                    };
+                    assert_eq!(report.pending_refresh.as_ptr() as usize, driver.report_ptr);
+                    if case == 1 {
+                        assert_eq!(*phase, AppliedPassPhase::ScopedCompletionFailed);
+                        assert_eq!(report.scan_callers, 73);
+                        assert_eq!(report.events.iter().filter(|event| matches!(event,
+                            CallerEvent::Exited { reason, .. } if reason == "controlled scoped completion"
+                        )).count(), 1);
+                        assert_eq!((driver.finishes, driver.changes.len()), (1, 2));
+                        assert_eq!(
+                            entries(&log)
+                                .iter()
+                                .filter(|line| line.starts_with("extend["))
+                                .count(),
+                            1
+                        );
+                    } else {
+                        assert_eq!(*phase, AppliedPassPhase::FirstCommitAttempted);
+                        assert_eq!(
+                            outcome.error.as_ref().unwrap().to_string(),
+                            "original publication failure"
+                        );
+                    }
+                }
                 let calls = driver.changes.len();
                 let before = entries(&log);
                 let outcome = slice(&mut driver, outcome, Instant::now(), 100);
@@ -5092,67 +5154,80 @@ mod publication_progress_tests {
 
         #[test]
         fn native_stop_yields_in_order_with_one_original_capture() {
-            let log = Log::default();
-            let mut driver = Driver::new(&log, false, &[Poll::Published, Poll::Published]);
-            let mut lane = ScriptedLane::new(&log);
-            lane.partial_reads.insert(1);
-            lane.partial_refresh_reads.insert(3);
-            let domain = lane.domain;
-            let deadlines = Rc::clone(&lane.io_deadlines);
-            let outcome = before_collection(&mut driver, Some(lane), None);
-            let now = Instant::now();
-            let outcome = complete(&mut driver, outcome, now);
-            assert!(outcome.error.is_none(), "{outcome:?}");
-            let stopped = outcome.stopped.unwrap();
-            assert_eq!(stopped.capture.domain, domain);
-            assert_eq!(stopped.summary.passes, 0);
-            assert!(
-                deadlines
-                    .borrow()
+            for failed_retirement in [false, true] {
+                let log = Log::default();
+                let mut driver = Driver::new(&log, false, &[Poll::Published, Poll::Published]);
+                let mut lane = ScriptedLane::new(&log);
+                lane.retirement_error = failed_retirement;
+                lane.partial_reads.insert(1);
+                lane.partial_refresh_reads.insert(3);
+                let domain = lane.domain;
+                let deadlines = Rc::clone(&lane.io_deadlines);
+                let outcome = before_collection(&mut driver, Some(lane), None);
+                let now = Instant::now();
+                let outcome = complete(&mut driver, outcome, now);
+                assert!(outcome.error.is_none(), "{outcome:?}");
+                let stopped = outcome.stopped.unwrap();
+                assert_eq!(stopped.capture.domain, domain);
+                assert_eq!(stopped.summary.passes, 0);
+                assert_eq!(
+                    matches!(stopped.summary.retirement, Retirement::Unsettled(_)),
+                    failed_retirement
+                );
+                if failed_retirement {
+                    let Retirement::Unsettled(reason) = &stopped.summary.retirement else {
+                        unreachable!()
+                    };
+                    assert!(reason.contains("controlled retirement poll failure"));
+                }
+                assert!(
+                    deadlines
+                        .borrow()
+                        .iter()
+                        .all(|(_, end)| *end <= now + Duration::from_millis(1))
+                );
+                let events = entries(&log);
+                let work: Vec<&str> = events
                     .iter()
-                    .all(|(_, end)| *end <= now + Duration::from_millis(1))
-            );
-            let events = entries(&log);
-            let work: Vec<&str> = events
-                .iter()
-                .map(String::as_str)
-                .filter(|s| {
-                    matches!(
-                        *s,
-                        "read"
-                            | "stage:witness"
-                            | "end_capture_coverage"
-                            | "begin_stop"
-                            | "poll"
-                            | "stage:finish"
-                            | "complete:stop"
-                    )
-                })
-                .collect();
-            assert_eq!(
-                work,
-                [
-                    "read",
-                    "stage:witness",
-                    "read",
-                    "stage:witness",
-                    "end_capture_coverage",
-                    "begin_stop",
-                    "poll",
-                    "read",
-                    "stage:witness",
-                    "read",
-                    "stage:witness",
-                    "stage:finish",
-                    "complete:stop"
-                ]
-            );
-            assert!(!events.iter().any(|line| line == "drop"));
-            drop(stopped);
-            assert_eq!(
-                entries(&log).iter().filter(|line| *line == "drop").count(),
-                1
-            );
+                    .map(String::as_str)
+                    .filter(|s| {
+                        matches!(
+                            *s,
+                            "read"
+                                | "stage:witness"
+                                | "end_capture_coverage"
+                                | "begin_stop"
+                                | "poll"
+                                | "stage:finish"
+                                | "complete:stop"
+                        )
+                    })
+                    .collect();
+                assert_eq!(
+                    work,
+                    [
+                        "read",
+                        "stage:witness",
+                        "read",
+                        "stage:witness",
+                        "end_capture_coverage",
+                        "begin_stop",
+                        "poll",
+                        "read",
+                        "stage:witness",
+                        "read",
+                        "stage:witness",
+                        "stage:finish",
+                        "complete:stop"
+                    ]
+                );
+                assert!(!events.iter().any(|line| line == "drop"));
+                drop(stopped);
+                assert_eq!(
+                    entries(&log).iter().filter(|line| *line == "drop").count(),
+                    1
+                );
+            }
         }
 
         #[test]
@@ -5272,11 +5347,22 @@ mod publication_progress_tests {
                 if scoped {
                     lane.scope_coverage = CaptureScopeCoverage::Cgroup;
                 }
-                let outcome = before_collection(
-                    &mut driver,
-                    Some(lane),
-                    failed.then(|| anyhow!("first run failure")),
-                );
+                let outcome = if failed {
+                    driver.pending = true;
+                    let outcome = drive_initial(
+                        &mut driver,
+                        lane,
+                        windows(),
+                        Some(anyhow!("first run failure")),
+                    );
+                    assert!(outcome.retained.as_ref().unwrap().stop_cause.is_none());
+                    // This cancellation arrives during finite completion,
+                    // after the original error/gate, through the same control.
+                    driver.stop.set(true);
+                    outcome
+                } else {
+                    before_collection(&mut driver, Some(lane), None)
+                };
                 let outcome = complete(&mut driver, outcome, Instant::now());
                 assert_eq!(
                     (driver.scene.scans, driver.applies, driver.emissions),
@@ -5284,12 +5370,27 @@ mod publication_progress_tests {
                 );
                 assert_eq!(driver.host_stops, 1);
                 assert_eq!(outcome.stopped.as_ref().unwrap().summary.passes, 0);
+                assert_eq!(
+                    entries(&log)
+                        .iter()
+                        .filter(|line| *line == "gap:cgroup collection cancelled before launch")
+                        .count(),
+                    usize::from(scoped && !failed),
+                    "preserve the actual scoped startup diagnostic before the generic zero-pass marker"
+                );
+                assert_eq!(driver.changes.len(), if scoped && !failed { 3 } else { 2 });
                 if failed {
                     assert_eq!(
                         outcome.error.as_ref().unwrap().to_string(),
                         "first run failure"
                     );
                     assert!(outcome.zero_pass.is_none());
+                    if let Some(control) = &driver.control {
+                        assert!(
+                            control.check().is_err(),
+                            "finite cancellation latches the original shared control"
+                        );
+                    }
                 } else {
                     let zero = outcome.zero_pass.unwrap();
                     assert_eq!(zero.cause, ZeroPassCause::OperatorStop);
@@ -5302,24 +5403,35 @@ mod publication_progress_tests {
 
         #[test]
         fn scan_zero_pass_failure_retains_its_best_effort_status_channel() {
-            for fail in [false, true] {
+            for failure_at in 0..3 {
                 let log = Log::default();
                 let mut driver = Driver::new(
                     &log,
                     false,
                     &[
                         Poll::Published,
-                        if fail { Poll::Fail } else { Poll::Published },
+                        if failure_at == 1 {
+                            Poll::Fail
+                        } else {
+                            Poll::Published
+                        },
                     ],
                 );
                 let mut outcome = before_collection(&mut driver, None, None);
                 let now = Instant::now();
-                if fail {
+                if failure_at != 0 {
                     for _ in 0..30 {
                         if outcome.retained.as_ref().unwrap().block.is_some() {
                             break;
                         }
-                        outcome = slice(&mut driver, outcome, now, 1);
+                        outcome = slice_with(&mut driver, outcome, now, 1, &mut |driver, point| {
+                            if failure_at == 2 && matches!(&point, Publish::Stop { .. }) {
+                                driver.scene.note("diagnostic-output-attempt");
+                                Err(anyhow!("partial diagnostic output failed"))
+                            } else {
+                                publish(driver, point)
+                            }
+                        });
                     }
                     let run = outcome.retained.as_ref().unwrap();
                     assert!(
@@ -5332,13 +5444,29 @@ mod publication_progress_tests {
                     );
                     assert_eq!(
                         run.terminal_callback_error.as_ref().unwrap().to_string(),
-                        "original publication failure"
+                        if failure_at == 1 {
+                            "original publication failure"
+                        } else {
+                            "partial diagnostic output failed"
+                        }
                     );
                     assert!(run.native.is_none());
+                    let phase = if failure_at == 1 {
+                        RetainedTerminalPhase::FinalCommitAttempted
+                    } else {
+                        RetainedTerminalPhase::EmitStopAttempted
+                    };
+                    assert!(
+                        matches!(run.pass, RetainedPass::Terminal { phase: actual } if actual == phase)
+                    );
                     assert!(
                         outcome.zero_pass.is_none(),
                         "an unfinished diagnostic is not finalized"
                     );
+                    let outcome = slice_with(&mut driver, outcome, now, 100, &mut |_, _| {
+                        panic!("a failed diagnostic callback cannot replay")
+                    });
+                    assert!(outcome.retained.is_some() && outcome.error.is_none());
                 } else {
                     let outcome = complete(&mut driver, outcome, now);
                     assert!(outcome.error.is_none());

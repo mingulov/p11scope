@@ -943,6 +943,38 @@ impl<L> NativeLane<L> {
         }
     }
 
+    /// Admit the same real stop paths as the blocking adapter while keeping
+    /// zero-pass rejection owned. No assertion or fabricated pass substitutes
+    /// for scoped cancellation, the F9 latch or an original run failure.
+    #[allow(clippy::result_large_err)] // A rejected transition returns the original native owner.
+    fn into_finite_stop<Pin>(
+        self,
+        disposition: NativeStopDisposition,
+        control: Option<&CollectionControl>,
+    ) -> std::result::Result<NativeStop<L>, Self>
+    where
+        L: CaptureLane<Pin>,
+    {
+        let valid = match disposition {
+            NativeStopDisposition::Error => true,
+            NativeStopDisposition::Completed => self.passes > 0,
+            NativeStopDisposition::CancelledScoped => {
+                self.passes == 0
+                    && matches!(self.capture.scope_coverage(), CaptureScopeCoverage::Cgroup)
+                    && control.is_some_and(|control| control.check().is_err())
+            }
+            NativeStopDisposition::CancelledUnscoped => {
+                self.passes == 0
+                    && !matches!(self.capture.scope_coverage(), CaptureScopeCoverage::Cgroup)
+            }
+        };
+        if valid {
+            Ok(NativeStop::new(self))
+        } else {
+            Err(self)
+        }
+    }
+
     /// The bounded stop (invariant 4). Needs one full pass after
     /// activation: the loop guarantees it before calling (a stop latched
     /// before the first pass completed takes
@@ -1162,6 +1194,375 @@ pub(crate) fn retire_refused<Pin, L: CaptureLane<Pin>>(capture: &mut L, budget: 
             Ok(false) => std::thread::sleep(Duration::from_millis(1)),
             Ok(true) | Err(_) => break,
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum NativeStopDisposition {
+    Completed,
+    CancelledScoped,
+    CancelledUnscoped,
+    Error,
+}
+
+// Each state owns the actual locals of the existing terminal stop. A yield
+// retains the original batch between read and staging, never another queue.
+#[derive(Clone, Copy)]
+enum NativeStopPhase {
+    Held,
+    Stage,
+    PreDrain,
+    PreWitness,
+    EndCoverage,
+    BeginRetirement,
+    RetirementPoll,
+    RetirementDrain,
+    PostWitness,
+    RefreshLoss,
+    Finish,
+    RetirementGap,
+    Summarize,
+}
+
+#[derive(Clone, Copy)]
+enum NativeAfterStage {
+    Held,
+    PreDrain { done: bool, head_pending: bool },
+    PreWitness { complete: bool },
+    RetirementDrain { drained: bool },
+    PostWitness { exact: bool },
+    Finish,
+}
+
+pub(crate) struct NativeStop<L> {
+    lane: NativeLane<L>,
+    events: Vec<CallerEvent>,
+    held: std::vec::IntoIter<DiscoveryBatch>,
+    phase: NativeStopPhase,
+    pending: Option<NativeBatch>,
+    after_stage: NativeAfterStage,
+    pre_drain_deadline: Option<Instant>,
+    pre_witness_deadline: Option<Instant>,
+    retirement_deadline: Option<Instant>,
+    refresh_deadline: Option<Instant>,
+    drain_attempted: bool,
+    witness_attempted: bool,
+    refresh_attempted: bool,
+    not_before: Option<Instant>,
+    retired: bool,
+    poll_error: Option<String>,
+    retirement_budget: Duration,
+    retirement: Option<Retirement>,
+}
+
+// Both variants move the same native owner; returning Pending must remain
+// allocation-free even after the capture has actually started retirement.
+#[allow(clippy::large_enum_variant)]
+enum NativeStopProgress<L> {
+    Pending(NativeStop<L>),
+    Stopped(Stopped<L>),
+}
+
+impl<L> NativeStop<L> {
+    fn new(mut lane: NativeLane<L>) -> Self {
+        let events = std::mem::take(&mut lane.pending_events);
+        let held = std::mem::take(&mut lane.held).into_iter();
+        lane.held_records = 0;
+        Self {
+            lane,
+            events,
+            held,
+            phase: NativeStopPhase::Held,
+            pending: None,
+            after_stage: NativeAfterStage::Held,
+            pre_drain_deadline: None,
+            pre_witness_deadline: None,
+            retirement_deadline: None,
+            refresh_deadline: None,
+            drain_attempted: false,
+            witness_attempted: false,
+            refresh_attempted: false,
+            not_before: None,
+            retired: false,
+            poll_error: None,
+            retirement_budget: Duration::ZERO,
+            retirement: None,
+        }
+    }
+
+    fn enter(&mut self, phase: NativeStopPhase, now: Instant) {
+        let sweep_end = now + self.lane.windows.terminal_sweep_budget;
+        match phase {
+            NativeStopPhase::PreDrain => {
+                self.pre_drain_deadline.get_or_insert(sweep_end);
+            }
+            NativeStopPhase::PreWitness => {
+                self.pre_witness_deadline.get_or_insert(sweep_end);
+            }
+            NativeStopPhase::PostWitness => {
+                self.refresh_deadline.get_or_insert(sweep_end);
+            }
+            _ => {}
+        }
+        self.phase = phase;
+    }
+
+    fn discovery_window(&self, now: Instant, slice_end: Instant, phase_end: Instant) -> ReadWindow {
+        ReadWindow::new(
+            self.lane.windows.discovery_records.max(1),
+            slice_end
+                .min(phase_end)
+                .min(now + self.lane.windows.discovery_budget),
+        )
+        .expect("the retained discovery row allowance is positive")
+    }
+
+    fn witness_window(&self, now: Instant, slice_end: Instant, phase_end: Instant) -> ReadWindow {
+        ReadWindow::new(
+            self.lane.windows.witness_rows,
+            slice_end
+                .min(phase_end)
+                .min(now + self.lane.windows.witness_budget),
+        )
+        .expect("the retained witness row allowance is positive")
+    }
+
+    /// One cooperative action. The caller checks its allowance before this
+    /// call; native windows are additionally clamped to the slice deadline.
+    fn step<Pin, H>(
+        mut self,
+        host: &mut H,
+        now: Instant,
+        slice_end: Instant,
+        clock: &LoopClock<'_>,
+    ) -> NativeStopProgress<L>
+    where
+        L: CaptureLane<Pin>,
+        H: LaneHost<Pin> + ?Sized,
+    {
+        if self.not_before.is_some_and(|at| now < at) {
+            return NativeStopProgress::Pending(self);
+        }
+        self.not_before = None;
+        match self.phase {
+            NativeStopPhase::Held => match self.held.next() {
+                Some(batch) => {
+                    self.pending = Some(NativeBatch::Lifecycle(batch));
+                    self.after_stage = NativeAfterStage::Held;
+                    self.phase = NativeStopPhase::Stage;
+                }
+                None => self.enter(NativeStopPhase::PreDrain, now),
+            },
+            NativeStopPhase::Stage => {
+                let batch = self
+                    .pending
+                    .take()
+                    .expect("one original read awaits staging");
+                self.events.extend(
+                    host.stage_native(batch, &mut self.lane.capture, now_ns())
+                        .events,
+                );
+                // The next phase's original window starts after this
+                // staging action, exactly once, even if it used the slice.
+                let now = clock.now();
+                match self.after_stage {
+                    NativeAfterStage::Held => self.enter(NativeStopPhase::Held, now),
+                    NativeAfterStage::PreDrain { done, head_pending } => {
+                        if done || now >= self.pre_drain_deadline.unwrap() {
+                            self.enter(NativeStopPhase::PreWitness, now);
+                        } else {
+                            self.phase = NativeStopPhase::PreDrain;
+                            if head_pending {
+                                self.not_before = Some(now + Duration::from_millis(1));
+                            }
+                        }
+                    }
+                    NativeAfterStage::PreWitness { complete } => {
+                        self.enter(
+                            if complete || now >= self.pre_witness_deadline.unwrap() {
+                                NativeStopPhase::EndCoverage
+                            } else {
+                                NativeStopPhase::PreWitness
+                            },
+                            now,
+                        );
+                    }
+                    NativeAfterStage::RetirementDrain { drained } => {
+                        if ((self.retired || self.poll_error.is_some()) && drained)
+                            || now >= self.retirement_deadline.unwrap()
+                        {
+                            self.enter(NativeStopPhase::PostWitness, now);
+                        } else {
+                            self.phase = NativeStopPhase::RetirementPoll;
+                            if drained {
+                                self.not_before = Some(now + Duration::from_millis(1));
+                            }
+                        }
+                    }
+                    NativeAfterStage::PostWitness { exact } => {
+                        self.phase = if exact {
+                            NativeStopPhase::Finish
+                        } else if now >= self.refresh_deadline.unwrap() {
+                            NativeStopPhase::RefreshLoss
+                        } else {
+                            NativeStopPhase::PostWitness
+                        };
+                    }
+                    NativeAfterStage::Finish => self.phase = NativeStopPhase::RetirementGap,
+                }
+            }
+            NativeStopPhase::PreDrain => {
+                let end = self.pre_drain_deadline.unwrap();
+                if self.drain_attempted && now >= end {
+                    self.enter(NativeStopPhase::PreWitness, now);
+                } else {
+                    let batch = self
+                        .lane
+                        .drain_within(self.discovery_window(now, slice_end, end));
+                    self.drain_attempted = true;
+                    self.after_stage = NativeAfterStage::PreDrain {
+                        done: batch.drained() || batch.failure.is_some(),
+                        head_pending: batch.head_pending,
+                    };
+                    self.pending = Some(NativeBatch::Lifecycle(batch));
+                    self.phase = NativeStopPhase::Stage;
+                }
+            }
+            NativeStopPhase::PreWitness => {
+                let end = self.pre_witness_deadline.unwrap();
+                if self.witness_attempted && now >= end {
+                    self.phase = NativeStopPhase::EndCoverage;
+                } else {
+                    let batch = self
+                        .lane
+                        .capture
+                        .read_witnesses(self.witness_window(now, slice_end, end));
+                    self.lane.loss_seen |= self.lane.tally.note_health(&batch);
+                    self.witness_attempted = true;
+                    self.after_stage = NativeAfterStage::PreWitness {
+                        complete: batch.sweep_completed,
+                    };
+                    self.pending = Some(NativeBatch::Witness(Box::new(batch)));
+                    self.phase = NativeStopPhase::Stage;
+                }
+            }
+            NativeStopPhase::EndCoverage => {
+                self.phase = NativeStopPhase::BeginRetirement;
+                host.end_capture_coverage(now_ns());
+            }
+            NativeStopPhase::BeginRetirement => {
+                self.phase = NativeStopPhase::RetirementPoll;
+                self.lane.capture.begin_stop();
+                self.retirement_budget = self
+                    .lane
+                    .windows
+                    .retirement_budget(self.lane.retirement_load());
+                self.retirement_deadline = Some(clock.now() + self.retirement_budget);
+            }
+            NativeStopPhase::RetirementPoll => {
+                self.phase = NativeStopPhase::RetirementDrain;
+                if !self.retired
+                    && self.poll_error.is_none()
+                    && now < self.retirement_deadline.unwrap()
+                {
+                    match self
+                        .lane
+                        .capture
+                        .poll_retirement(slice_end.min(self.retirement_deadline.unwrap()))
+                    {
+                        Ok(done) => self.retired = done,
+                        Err(error) => self.poll_error = Some(format!("{error:#}")),
+                    }
+                }
+            }
+            NativeStopPhase::RetirementDrain => {
+                let batch = self.lane.drain_within(self.discovery_window(
+                    now,
+                    slice_end,
+                    self.retirement_deadline.unwrap(),
+                ));
+                self.after_stage = NativeAfterStage::RetirementDrain {
+                    drained: batch.drained(),
+                };
+                self.pending = Some(NativeBatch::Lifecycle(batch));
+                self.phase = NativeStopPhase::Stage;
+            }
+            NativeStopPhase::PostWitness => {
+                let end = self.refresh_deadline.unwrap();
+                if self.refresh_attempted && now >= end {
+                    self.phase = NativeStopPhase::RefreshLoss;
+                } else {
+                    let batch = self
+                        .lane
+                        .capture
+                        .read_witnesses(self.witness_window(now, slice_end, end));
+                    self.lane.loss_seen |= self.lane.tally.note_health(&batch);
+                    self.refresh_attempted = true;
+                    self.after_stage = NativeAfterStage::PostWitness {
+                        exact: batch.refresh_sweep_completed && !batch.refresh_sweep_gaps,
+                    };
+                    self.pending = Some(NativeBatch::Witness(Box::new(batch)));
+                    self.phase = NativeStopPhase::Stage;
+                }
+            }
+            NativeStopPhase::RefreshLoss => {
+                self.phase = NativeStopPhase::Finish;
+                host.note_refresh_loss(format!(
+                    "terminal count refresh incomplete: no gap-free count-refresh sweep completed \
+                     within {} ms after stop began; witnessed counts keep their last read as a \
+                     lower bound",
+                    self.lane.windows.terminal_sweep_budget.as_millis()
+                ));
+            }
+            NativeStopPhase::Finish => {
+                self.pending = Some(NativeBatch::Finish {
+                    domain: self.lane.capture.domain(),
+                });
+                self.after_stage = NativeAfterStage::Finish;
+                self.phase = NativeStopPhase::Stage;
+            }
+            NativeStopPhase::RetirementGap => {
+                self.phase = NativeStopPhase::Summarize;
+                let retirement = match (
+                    self.retired,
+                    self.poll_error.take(),
+                    self.lane.capture.cleanup(),
+                ) {
+                    (true, _, Some(cleanup)) => Retirement::Closed(cleanup),
+                    (true, _, None) => Retirement::Closed(CleanupSummary::default()),
+                    (false, Some(error), _) => Retirement::Unsettled(error),
+                    (false, None, _) => Retirement::Unsettled(format!(
+                        "the probes did not detach within {} ms",
+                        self.retirement_budget.as_millis()
+                    )),
+                };
+                if let Retirement::Unsettled(reason) = &retirement {
+                    host.note_scope_gap("native capture retirement unsettled".into(), format!(
+                        "{reason}; the document was written while the Inventory probes may still \
+                         be attached, and they are reclaimed (blocking) after it"));
+                }
+                self.retirement = Some(retirement);
+            }
+            NativeStopPhase::Summarize => {
+                return NativeStopProgress::Stopped(Stopped {
+                    events: self.events,
+                    summary: LaneSummary {
+                        retirement: self
+                            .retirement
+                            .take()
+                            .expect("retirement was summarized once"),
+                        backend: self.lane.capture.backend(),
+                        passes: self.lane.passes,
+                        attached: self.lane.attached,
+                        failed: self.lane.failed,
+                        lifecycle: self.lane.tally,
+                        lifecycle_high_water_bytes: self.lane.lifecycle_high_water_bytes,
+                    },
+                    capture: self.lane.capture,
+                });
+            }
+        }
+        NativeStopProgress::Pending(self)
     }
 }
 
@@ -1614,7 +2015,7 @@ pub(crate) enum Publish<'a> {
 /// and — for the native lane — the bounded stop and its commit. The final
 /// sinks are the caller's.
 /// A finalized outcome keeps stopped native ownership through final sinks.
-/// An unfinished publication instead returns its original live owners;
+/// An unfinished completion instead returns its original phase and owners;
 /// callers must match completion before extracting or dropping the driver.
 #[must_use = "match the completion while retaining the original driver and coordinator"]
 pub(crate) struct ClassicOutcome<L> {
@@ -1624,8 +2025,8 @@ pub(crate) struct ClassicOutcome<L> {
     /// stop/deadline (not error): the finalizer emits one stderr line
     /// from it beside the staged scope gap.
     pub(crate) zero_pass: Option<ZeroPassStop>,
-    /// A publication could not complete in the running loop. No terminal
-    /// drain/commit has run; the original driver/coordinator remains required.
+    /// Completion still owns work. The native owner may already be stopped;
+    /// keep the original driver/coordinator through its final publication.
     pub(crate) retained: Option<RetainedClassicRun<L>>,
 }
 
@@ -1633,12 +2034,72 @@ pub(crate) struct ClassicOutcome<L> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AppliedPassPhase {
     FirstCommit,
+    FirstCommitAttempted,
+    FirstPublished,
+    ScopedCompletionAttempted,
     /// The first commit published and finish_pass was called exactly once.
     /// It mutated this report before failing; do not invoke it again.
     ScopedCompletionFailed,
+    ScopedFinished,
     /// Scoped completion and the after-cgroup hook (or its stop skip) have
     /// already run once. Only the original second publication may resume.
     ScopedReceipts,
+    ScopedReceiptsAttempted,
+    ReadyToEmit,
+    EmissionAttempted,
+    Emitted,
+}
+
+/// One call's cooperative work allowance, separate from the run's stop clock.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct RetainedWorkBudget {
+    pub(crate) remaining_actions: usize,
+    pub(crate) deadline: Instant,
+}
+
+/// Only the actual owning driver can reconcile these states. No readiness
+/// flag, retry or generic error conversion supplies that disposition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetainedBlock {
+    CollectedDispositionRequired,
+    ScopedCompletionDispositionRequired,
+    PublicationDispositionRequired,
+    NativeDispositionRequired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetainedServiceCursor {
+    Poll,
+    HoldNative,
+    ServiceNative,
+    Tick,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetainedTerminalPhase {
+    ScopedStartupGap,
+    ScopedStartupCommit,
+    ScopedStartupCommitAttempted,
+    FailureGap,
+    ZeroPassGap,
+    Retiring,
+    RetiringAttempted,
+    NativeStop,
+    LaneStopped,
+    FinalCommit,
+    FinalCommitAttempted,
+    EmitStop,
+    EmitStopAttempted,
+    Complete,
+}
+
+// The original capture moves once through these phases. Keep that bounded
+// ownership inline rather than allocate while returning a failed operation.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum RetainedNative<L> {
+    Live(NativeLane<L>),
+    Stopping(NativeStop<L>),
+    Stopped(Stopped<L>),
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1658,21 +2119,31 @@ pub(crate) enum RetainedPass {
         report: PassReport,
         phase: AppliedPassPhase,
     },
+    /// The original pass was disposed or emitted successfully. Terminal
+    /// progress owns its native state and diagnostic accounting separately.
+    Terminal { phase: RetainedTerminalPhase },
 }
 
-/// An unfinished publication, any existing pass and the same native lane,
+/// An unfinished completion, any existing pass and the same native owner,
 /// with the loop's original stop accounting. This is not a second work
 /// queue or a terminal receipt.
 #[cfg_attr(not(test), allow(dead_code))] // Default synchronous drivers never retain a run.
 pub(crate) struct RetainedClassicRun<L> {
     pub(crate) pass: RetainedPass,
-    pub(crate) lane: Option<NativeLane<L>>,
+    pub(crate) native: Option<RetainedNative<L>>,
     pub(crate) control: Option<CollectionControl>,
     pub(crate) completed_passes: u64,
     pub(crate) discarded_collections: u64,
     pub(crate) elapsed: Duration,
     pub(crate) stop_cause: Option<ZeroPassCause>,
     pub(crate) host_stopped: bool,
+    pub(crate) block: Option<RetainedBlock>,
+    /// Best-effort scan diagnostic failures retain their error without
+    /// changing the ordinary run-status channel (F9).
+    pub(crate) terminal_callback_error: Option<anyhow::Error>,
+    loop_started_at: Instant,
+    service: RetainedServiceCursor,
+    terminal_zero_pass: Option<ZeroPassStop>,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1722,7 +2193,447 @@ impl<L> std::fmt::Debug for ClassicOutcome<L> {
             .field("retained", &self.retained.is_some())
             .field("error", &self.error)
             .field("zero_pass", &self.zero_pass)
+            .field(
+                "terminal_callback_error",
+                &self
+                    .retained
+                    .as_ref()
+                    .and_then(|run| run.terminal_callback_error.as_ref()),
+            )
             .finish()
+    }
+}
+
+/// Service an already gated, retained run for one finite cooperative slice.
+/// The same driver/coordinator must remain beside every returned owner. This
+/// never launches another collector or invents a disposition for a failed
+/// callback. A deadline limits which actions start; callbacks are not preempted.
+/// The phase-aware driver must restrict its service/terminal hooks to the
+/// original owned work after suspension; this grants no fresh admission.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn poll_retained_classic<Pin, D, L>(
+    driver: &mut D,
+    mut run: RetainedClassicRun<L>,
+    mut error: Option<anyhow::Error>,
+    clock: &LoopClock<'_>,
+    budget: &mut RetainedWorkBudget,
+    publish: &mut dyn FnMut(&mut D, Publish<'_>) -> Result<()>,
+) -> ClassicOutcome<L>
+where
+    D: PassDriver<Pin>,
+    L: CaptureLane<Pin>,
+{
+    // In particular, do not sample stateful stop/clock callbacks with zero
+    // allowance, or touch a blocked owner without its actual disposition.
+    let mut finalized = false;
+    while budget.remaining_actions > 0 && run.block.is_none() {
+        let now = clock.now();
+        if now >= budget.deadline {
+            break;
+        }
+        budget.remaining_actions -= 1;
+        if run.stop_cause.is_none() {
+            run.stop_cause = publication_stop_cause(run.control.as_ref(), clock);
+        }
+        run.elapsed = run
+            .elapsed
+            .max(now.saturating_duration_since(run.loop_started_at));
+
+        // A one-action caller resumes the saved service cursor; it cannot
+        // restart at poll_commit forever and starve the retained native owner.
+        match run.service {
+            RetainedServiceCursor::HoldNative => {
+                if let Some(RetainedNative::Live(lane)) = run.native.as_mut() {
+                    let room = lane.windows.held_records.saturating_sub(lane.held_records);
+                    if room > 0 && lane.held.len() < lane.windows.held_batches {
+                        let window = ReadWindow::new(
+                            lane.windows.discovery_records.min(room).max(1),
+                            budget.deadline.min(now + lane.windows.discovery_budget),
+                        )
+                        .expect("positive room in the original held-record bound");
+                        let batch = lane.drain_within(window);
+                        lane.held_records += batch.records.len();
+                        lane.held.push(batch);
+                    }
+                }
+                run.service = RetainedServiceCursor::ServiceNative;
+                continue;
+            }
+            RetainedServiceCursor::ServiceNative => {
+                run.service = RetainedServiceCursor::Tick;
+                let capture: Option<&mut dyn CaptureLane<Pin>> = match run.native.as_mut() {
+                    Some(RetainedNative::Live(lane)) => Some(&mut lane.capture),
+                    Some(RetainedNative::Stopping(stop)) => Some(&mut stop.lane.capture),
+                    Some(RetainedNative::Stopped(stopped)) => Some(&mut stopped.capture),
+                    None => None,
+                };
+                driver.on_native_service(capture);
+                continue;
+            }
+            RetainedServiceCursor::Tick => {
+                run.service = RetainedServiceCursor::Poll;
+                driver.on_tick();
+                continue;
+            }
+            RetainedServiceCursor::Poll => {}
+        }
+
+        let mut failure: Option<(RetainedBlock, anyhow::Error, bool)> = None;
+        match &mut run.pass {
+            RetainedPass::BeforeCollection => match driver.poll_commit(false) {
+                Ok(PassCommitProgress::Pending) => run.service = RetainedServiceCursor::HoldNative,
+                Ok(PassCommitProgress::Published) => {
+                    run.pass = RetainedPass::Terminal {
+                        phase: if error.is_none()
+                            && run.completed_passes == 0
+                            && run
+                                .control
+                                .as_ref()
+                                .is_some_and(|control| control.check().is_err())
+                        {
+                            RetainedTerminalPhase::ScopedStartupGap
+                        } else {
+                            RetainedTerminalPhase::FailureGap
+                        },
+                    }
+                }
+                Err(next) => {
+                    failure = Some((RetainedBlock::PublicationDispositionRequired, next, false))
+                }
+            },
+            RetainedPass::Collected { .. } => {
+                // Stop fenced apply. The real driver must dispose/reconcile
+                // this exact collection and its original cgroup context.
+                run.block = Some(RetainedBlock::CollectedDispositionRequired);
+            }
+            RetainedPass::Applied { report, phase } => match *phase {
+                AppliedPassPhase::FirstCommit => {
+                    *phase = AppliedPassPhase::FirstCommitAttempted;
+                    match driver.poll_commit(false) {
+                        Ok(PassCommitProgress::Pending) => {
+                            *phase = AppliedPassPhase::FirstCommit;
+                            run.service = RetainedServiceCursor::HoldNative;
+                        }
+                        Ok(PassCommitProgress::Published) => {
+                            *phase = AppliedPassPhase::FirstPublished
+                        }
+                        Err(next) => {
+                            failure =
+                                Some((RetainedBlock::PublicationDispositionRequired, next, false))
+                        }
+                    }
+                }
+                AppliedPassPhase::FirstPublished => {
+                    if run.control.is_some() {
+                        *phase = AppliedPassPhase::ScopedCompletionAttempted;
+                        match driver.finish_pass(report) {
+                            Ok(()) => *phase = AppliedPassPhase::ScopedFinished,
+                            Err(next) => {
+                                *phase = AppliedPassPhase::ScopedCompletionFailed;
+                                failure = Some((
+                                    RetainedBlock::ScopedCompletionDispositionRequired,
+                                    next,
+                                    false,
+                                ));
+                            }
+                        }
+                    } else {
+                        *phase = AppliedPassPhase::ReadyToEmit;
+                    }
+                }
+                AppliedPassPhase::ScopedFinished => {
+                    // Every suspended run was already host-gated. Record the
+                    // after-cgroup extension SKIP once; only the completion's
+                    // already-owned receipt/events may publish from here.
+                    *phase = AppliedPassPhase::ScopedReceipts;
+                }
+                AppliedPassPhase::ScopedReceipts => {
+                    *phase = AppliedPassPhase::ScopedReceiptsAttempted;
+                    match driver.poll_commit(false) {
+                        Ok(PassCommitProgress::Pending) => {
+                            *phase = AppliedPassPhase::ScopedReceipts;
+                            run.service = RetainedServiceCursor::HoldNative;
+                        }
+                        Ok(PassCommitProgress::Published) => *phase = AppliedPassPhase::ReadyToEmit,
+                        Err(next) => {
+                            failure =
+                                Some((RetainedBlock::PublicationDispositionRequired, next, false))
+                        }
+                    }
+                }
+                AppliedPassPhase::ReadyToEmit => {
+                    *phase = AppliedPassPhase::EmissionAttempted;
+                    // Match the existing loop's count-before-output rule. An
+                    // output callback can have partially emitted before Err.
+                    run.completed_passes += 1;
+                    match publish(
+                        driver,
+                        Publish::Pass {
+                            report,
+                            now_ns: now_ns(),
+                        },
+                    ) {
+                        Ok(()) => *phase = AppliedPassPhase::Emitted,
+                        Err(next) => {
+                            failure =
+                                Some((RetainedBlock::PublicationDispositionRequired, next, false))
+                        }
+                    }
+                }
+                AppliedPassPhase::Emitted => {
+                    run.pass = RetainedPass::Terminal {
+                        phase: RetainedTerminalPhase::FailureGap,
+                    };
+                }
+                AppliedPassPhase::ScopedCompletionAttempted
+                | AppliedPassPhase::ScopedCompletionFailed => {
+                    run.block = Some(RetainedBlock::ScopedCompletionDispositionRequired);
+                }
+                AppliedPassPhase::FirstCommitAttempted
+                | AppliedPassPhase::ScopedReceiptsAttempted
+                | AppliedPassPhase::EmissionAttempted => {
+                    run.block = Some(RetainedBlock::PublicationDispositionRequired);
+                }
+            },
+            RetainedPass::Terminal { phase } => match *phase {
+                RetainedTerminalPhase::ScopedStartupGap => {
+                    let reason = match run
+                        .control
+                        .as_ref()
+                        .and_then(|control| control.check().err())
+                    {
+                        Some(crate::scope::inventory_cgroup::CollectionStop::OperatorStop) => {
+                            "operator stop"
+                        }
+                        Some(crate::scope::inventory_cgroup::CollectionStop::Deadline) => {
+                            "collection deadline"
+                        }
+                        None => {
+                            run.block = Some(RetainedBlock::PublicationDispositionRequired);
+                            continue;
+                        }
+                    };
+                    *phase = RetainedTerminalPhase::ScopedStartupCommit;
+                    driver.host().note_scope_gap(
+                        "cgroup collection cancelled before launch".into(),
+                        reason.into(),
+                    );
+                }
+                RetainedTerminalPhase::ScopedStartupCommit => {
+                    *phase = RetainedTerminalPhase::ScopedStartupCommitAttempted;
+                    match driver.poll_commit(false) {
+                        Ok(PassCommitProgress::Pending) => {
+                            *phase = RetainedTerminalPhase::ScopedStartupCommit;
+                            run.service = RetainedServiceCursor::HoldNative;
+                        }
+                        Ok(PassCommitProgress::Published) => {
+                            *phase = RetainedTerminalPhase::FailureGap
+                        }
+                        Err(next) => {
+                            failure =
+                                Some((RetainedBlock::PublicationDispositionRequired, next, false))
+                        }
+                    }
+                }
+                RetainedTerminalPhase::FailureGap => {
+                    *phase = RetainedTerminalPhase::ZeroPassGap;
+                    if let Some(error) = &error {
+                        driver.host().note_scope_gap(
+                            "inventory capture failed".into(),
+                            format!("{error:#}"),
+                        );
+                    }
+                }
+                RetainedTerminalPhase::ZeroPassGap => {
+                    *phase = RetainedTerminalPhase::Retiring;
+                    if error.is_none() && run.completed_passes == 0 {
+                        run.terminal_zero_pass = run.stop_cause.map(|cause| ZeroPassStop {
+                            cause,
+                            discarded: run.discarded_collections,
+                            elapsed: run.elapsed,
+                        });
+                        if let Some(zero) = &run.terminal_zero_pass {
+                            driver
+                                .host()
+                                .note_scope_gap(ZERO_PASS_GAP_SUBJECT.into(), zero.gap_reason());
+                        }
+                    }
+                }
+                RetainedTerminalPhase::Retiring => {
+                    if let Some(RetainedNative::Live(lane)) = run.native.as_ref() {
+                        let load = lane.retirement_load();
+                        let point = Publish::Retiring {
+                            attached: lane.attached,
+                            links: load.links,
+                            budget: lane.windows.retirement_budget(load),
+                        };
+                        *phase = RetainedTerminalPhase::RetiringAttempted;
+                        match publish(driver, point) {
+                            Ok(()) => *phase = RetainedTerminalPhase::NativeStop,
+                            Err(next) => {
+                                failure = Some((
+                                    RetainedBlock::PublicationDispositionRequired,
+                                    next,
+                                    false,
+                                ))
+                            }
+                        }
+                    } else if run.native.is_some() {
+                        *phase = RetainedTerminalPhase::NativeStop;
+                    } else if error.is_some() || run.terminal_zero_pass.is_some() {
+                        *phase = RetainedTerminalPhase::FinalCommit;
+                    } else {
+                        *phase = RetainedTerminalPhase::Complete;
+                    }
+                }
+                RetainedTerminalPhase::NativeStop => match run.native.take() {
+                    Some(RetainedNative::Live(lane)) => {
+                        let disposition = if error.is_some() {
+                            NativeStopDisposition::Error
+                        } else if lane.passes > 0 {
+                            NativeStopDisposition::Completed
+                        } else if matches!(
+                            lane.capture.scope_coverage(),
+                            CaptureScopeCoverage::Cgroup
+                        ) {
+                            NativeStopDisposition::CancelledScoped
+                        } else if run.stop_cause.is_some() && run.host_stopped {
+                            NativeStopDisposition::CancelledUnscoped
+                        } else {
+                            run.native = Some(RetainedNative::Live(lane));
+                            run.block = Some(RetainedBlock::NativeDispositionRequired);
+                            continue;
+                        };
+                        match lane.into_finite_stop::<Pin>(disposition, run.control.as_ref()) {
+                            Ok(stop) => run.native = Some(RetainedNative::Stopping(stop)),
+                            Err(lane) => {
+                                run.native = Some(RetainedNative::Live(lane));
+                                run.block = Some(RetainedBlock::NativeDispositionRequired);
+                            }
+                        }
+                    }
+                    Some(RetainedNative::Stopping(stop)) => {
+                        match stop.step::<Pin, _>(driver.host(), now, budget.deadline, clock) {
+                            NativeStopProgress::Pending(stop) => {
+                                run.native = Some(RetainedNative::Stopping(stop))
+                            }
+                            NativeStopProgress::Stopped(stopped) => {
+                                run.native = Some(RetainedNative::Stopped(stopped));
+                                *phase = RetainedTerminalPhase::LaneStopped;
+                            }
+                        }
+                    }
+                    Some(RetainedNative::Stopped(stopped)) => {
+                        run.native = Some(RetainedNative::Stopped(stopped));
+                        *phase = RetainedTerminalPhase::LaneStopped;
+                    }
+                    None => *phase = RetainedTerminalPhase::FinalCommit,
+                },
+                RetainedTerminalPhase::LaneStopped => {
+                    *phase = RetainedTerminalPhase::FinalCommit;
+                    driver.on_lane_stopped();
+                }
+                RetainedTerminalPhase::FinalCommit => {
+                    *phase = RetainedTerminalPhase::FinalCommitAttempted;
+                    let best_effort = run.native.is_none() && run.terminal_zero_pass.is_some();
+                    match driver.poll_commit(false) {
+                        Ok(PassCommitProgress::Pending) => {
+                            *phase = RetainedTerminalPhase::FinalCommit;
+                            run.service = RetainedServiceCursor::HoldNative;
+                        }
+                        Ok(PassCommitProgress::Published) => {
+                            *phase = if run.native.is_some() || run.terminal_zero_pass.is_some() {
+                                RetainedTerminalPhase::EmitStop
+                            } else {
+                                RetainedTerminalPhase::Complete
+                            };
+                        }
+                        Err(next) => {
+                            failure = Some((
+                                RetainedBlock::PublicationDispositionRequired,
+                                next,
+                                best_effort,
+                            ))
+                        }
+                    }
+                }
+                RetainedTerminalPhase::EmitStop => {
+                    *phase = RetainedTerminalPhase::EmitStopAttempted;
+                    let events = match run.native.as_ref() {
+                        Some(RetainedNative::Stopped(stopped)) => stopped.events.as_slice(),
+                        _ => &[],
+                    };
+                    let best_effort = run.native.is_none() && run.terminal_zero_pass.is_some();
+                    match publish(
+                        driver,
+                        Publish::Stop {
+                            events,
+                            now_ns: now_ns(),
+                        },
+                    ) {
+                        Ok(()) => *phase = RetainedTerminalPhase::Complete,
+                        Err(next) => {
+                            failure = Some((
+                                RetainedBlock::PublicationDispositionRequired,
+                                next,
+                                best_effort,
+                            ))
+                        }
+                    }
+                }
+                RetainedTerminalPhase::ScopedStartupCommitAttempted
+                | RetainedTerminalPhase::RetiringAttempted
+                | RetainedTerminalPhase::FinalCommitAttempted
+                | RetainedTerminalPhase::EmitStopAttempted => {
+                    run.block = Some(RetainedBlock::PublicationDispositionRequired);
+                }
+                RetainedTerminalPhase::Complete => {
+                    // A malformed terminal phase still cannot drop an active
+                    // capture. Return its ownership for actual reconciliation.
+                    if run
+                        .native
+                        .as_ref()
+                        .is_some_and(|native| !matches!(native, RetainedNative::Stopped(_)))
+                    {
+                        run.block = Some(RetainedBlock::NativeDispositionRequired);
+                    } else {
+                        finalized = true;
+                    }
+                }
+            },
+        }
+        if let Some((block, next, best_effort)) = failure {
+            run.block = Some(block);
+            if best_effort {
+                run.terminal_callback_error.get_or_insert(next);
+            } else {
+                error.get_or_insert(next);
+            }
+        }
+        if finalized {
+            break;
+        }
+    }
+    if finalized {
+        let stopped = match run.native {
+            Some(RetainedNative::Stopped(stopped)) => Some(stopped),
+            None => None,
+            // The guarded completion above retains these owners instead.
+            Some(RetainedNative::Live(_)) | Some(RetainedNative::Stopping(_)) => unreachable!(),
+        };
+        ClassicOutcome {
+            stopped,
+            error,
+            zero_pass: run.terminal_zero_pass,
+            retained: None,
+        }
+    } else {
+        ClassicOutcome {
+            stopped: None,
+            error,
+            zero_pass: None,
+            retained: Some(run),
+        }
     }
 }
 
@@ -1849,6 +2760,7 @@ where
     let mut discarded_collections: u64 = 0;
     let loop_start = Instant::now();
     let mut retained_pass: Option<(RetainedPass, Option<CollectionControl>)> = None;
+    let mut retained_block = None;
     let running = match initial_error {
         Some(error) => {
             if driver.publication_pending() {
@@ -1882,6 +2794,7 @@ where
                             return Ok(());
                         }
                         Err(error) => {
+                            retained_block = Some(RetainedBlock::PublicationDispositionRequired);
                             retained_pass = Some((RetainedPass::BeforeCollection, control));
                             return Err(error);
                         }
@@ -1975,6 +2888,7 @@ where
                             return Ok(());
                         }
                         Err(error) => {
+                            retained_block = Some(RetainedBlock::PublicationDispositionRequired);
                             retained_pass = Some((
                                 RetainedPass::Collected {
                                     collected,
@@ -2047,10 +2961,11 @@ where
                         return Ok(());
                     }
                     Err(error) => {
+                        retained_block = Some(RetainedBlock::PublicationDispositionRequired);
                         retained_pass = Some((
                             RetainedPass::Applied {
                                 report,
-                                phase: AppliedPassPhase::FirstCommit,
+                                phase: AppliedPassPhase::FirstCommitAttempted,
                             },
                             control,
                         ));
@@ -2064,6 +2979,7 @@ where
                     // Record that once-only boundary explicitly and return
                     // the same owner; never retry it or enter legacy stop.
                     if let Err(error) = driver.finish_pass(&mut report) {
+                        retained_block = Some(RetainedBlock::ScopedCompletionDispositionRequired);
                         retained_pass = Some((
                             RetainedPass::Applied {
                                 report,
@@ -2103,10 +3019,11 @@ where
                             return Ok(());
                         }
                         Err(error) => {
+                            retained_block = Some(RetainedBlock::PublicationDispositionRequired);
                             retained_pass = Some((
                                 RetainedPass::Applied {
                                     report,
-                                    phase: AppliedPassPhase::ScopedReceipts,
+                                    phase: AppliedPassPhase::ScopedReceiptsAttempted,
                                 },
                                 control,
                             ));
@@ -2160,6 +3077,8 @@ where
                                 return Ok(());
                             }
                             Err(error) => {
+                                retained_block =
+                                    Some(RetainedBlock::PublicationDispositionRequired);
                                 retained_pass = Some((RetainedPass::BeforeCollection, control));
                                 return Err(error);
                             }
@@ -2214,6 +3133,8 @@ where
                                 return Ok(());
                             }
                             Err(error) => {
+                                retained_block =
+                                    Some(RetainedBlock::PublicationDispositionRequired);
                                 retained_pass = Some((RetainedPass::BeforeCollection, control));
                                 return Err(error);
                             }
@@ -2246,14 +3167,28 @@ where
             error,
             zero_pass: None,
             retained: Some(RetainedClassicRun {
+                block: retained_block.or_else(|| match &pass {
+                    RetainedPass::Collected { .. } => {
+                        Some(RetainedBlock::CollectedDispositionRequired)
+                    }
+                    RetainedPass::Applied {
+                        phase: AppliedPassPhase::ScopedCompletionFailed,
+                        ..
+                    } => Some(RetainedBlock::ScopedCompletionDispositionRequired),
+                    _ => None,
+                }),
                 pass,
-                lane,
+                native: lane.map(RetainedNative::Live),
                 control,
                 completed_passes: passes,
                 discarded_collections,
                 elapsed: loop_start.elapsed(),
                 stop_cause,
                 host_stopped: true,
+                terminal_callback_error: None,
+                loop_started_at: loop_start,
+                service: RetainedServiceCursor::Poll,
+                terminal_zero_pass: None,
             }),
         };
     }

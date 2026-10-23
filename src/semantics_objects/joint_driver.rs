@@ -269,86 +269,6 @@ struct RawCuts {
     birth: super::JournalBirthCut,
 }
 
-/// Compare the complete constructor-decoded value without allocating a wire
-/// copy, exposing private epochs, or reading representation padding.
-fn same_decoded_h0(left: &DecodedEventRecord, right: &DecodedEventRecord) -> bool {
-    let a = &left.base.event;
-    let b = &right.base.event;
-    (
-        a.ts_ns,
-        a.duration_ns,
-        a.pid_tgid,
-        a.cgroup_id,
-        a.session,
-        a.slot_id,
-        a.mechanism,
-        a.flags,
-        a.rv,
-        a.p0,
-        a.p1,
-        a.p2,
-    ) == (
-        b.ts_ns,
-        b.duration_ns,
-        b.pid_tgid,
-        b.cgroup_id,
-        b.session,
-        b.slot_id,
-        b.mechanism,
-        b.flags,
-        b.rv,
-        b.p0,
-        b.p1,
-        b.p2,
-    ) && (
-        a.async_value,
-        a.slot,
-        a.target_function,
-        a.user_type,
-        a.shape,
-        a.capture,
-        a.event_type,
-        a.image,
-        a.child_image,
-        a.root_affiliation,
-    ) == (
-        b.async_value,
-        b.slot,
-        b.target_function,
-        b.user_type,
-        b.shape,
-        b.capture,
-        b.event_type,
-        b.image,
-        b.child_image,
-        b.root_affiliation,
-    ) && (
-        a.attr_count,
-        a.attr_total,
-        a.attr_bools,
-        a.attr_bools_seen,
-        a.attr_count1,
-        a.attr_total1,
-        a.attr_bools1,
-        a.attr_bools_seen1,
-    ) == (
-        b.attr_count,
-        b.attr_total,
-        b.attr_bools,
-        b.attr_bools_seen,
-        b.attr_count1,
-        b.attr_total1,
-        b.attr_bools1,
-        b.attr_bools_seen1,
-    ) && a.attr_types == b.attr_types
-        && a.attr_types1 == b.attr_types1
-        && left.base.continuity.entry_ip == right.base.continuity.entry_ip
-        && left.base.continuity.entry_stamp == right.base.continuity.entry_stamp
-        && left.base.continuity.return_stamp == right.base.continuity.return_stamp
-        && left.object.as_ref().map(|object| object.tail_bytes())
-            == right.object.as_ref().map(|object| object.tail_bytes())
-}
-
 /// Fixed provenance moved from the one original raw allocation. Its collection
 /// and cuts never acquire a scalar constructor or a second retained wire copy.
 pub(super) struct RawProvenance {
@@ -1097,7 +1017,7 @@ impl RawJointQuantum {
         if matches!(item, JournalIngestItem::Ordinary(_)) && record.joint_resource.is_some() {
             return false;
         }
-        same_decoded_h0(&decoded, record)
+        decoded.same_decoded_payload(record)
     }
 
     /// Report association only: an I/O callback's Ok(()) cannot substitute

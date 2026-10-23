@@ -195,6 +195,89 @@ pub(crate) struct DecodedEventRecord {
         Option<crate::semantics_objects::journal::joint_driver::JointResourceOrigin>,
 }
 
+impl DecodedEventRecord {
+    /// Compare the complete constructor-decoded payload, private continuity
+    /// and object tail without allocating a wire copy or reading padding.
+    /// Resource lineage is checked separately by the original owner.
+    pub(crate) fn same_decoded_payload(&self, other: &Self) -> bool {
+        let a = &self.base.event;
+        let b = &other.base.event;
+        (
+            a.ts_ns,
+            a.duration_ns,
+            a.pid_tgid,
+            a.cgroup_id,
+            a.session,
+            a.slot_id,
+            a.mechanism,
+            a.flags,
+            a.rv,
+            a.p0,
+            a.p1,
+            a.p2,
+        ) == (
+            b.ts_ns,
+            b.duration_ns,
+            b.pid_tgid,
+            b.cgroup_id,
+            b.session,
+            b.slot_id,
+            b.mechanism,
+            b.flags,
+            b.rv,
+            b.p0,
+            b.p1,
+            b.p2,
+        ) && (
+            a.async_value,
+            a.slot,
+            a.target_function,
+            a.user_type,
+            a.shape,
+            a.capture,
+            a.event_type,
+            a.image,
+            a.child_image,
+            a.root_affiliation,
+        ) == (
+            b.async_value,
+            b.slot,
+            b.target_function,
+            b.user_type,
+            b.shape,
+            b.capture,
+            b.event_type,
+            b.image,
+            b.child_image,
+            b.root_affiliation,
+        ) && (
+            a.attr_count,
+            a.attr_total,
+            a.attr_bools,
+            a.attr_bools_seen,
+            a.attr_count1,
+            a.attr_total1,
+            a.attr_bools1,
+            a.attr_bools_seen1,
+        ) == (
+            b.attr_count,
+            b.attr_total,
+            b.attr_bools,
+            b.attr_bools_seen,
+            b.attr_count1,
+            b.attr_total1,
+            b.attr_bools1,
+            b.attr_bools_seen1,
+        ) && a.attr_types == b.attr_types
+            && a.attr_types1 == b.attr_types1
+            && self.base.continuity.entry_ip == other.base.continuity.entry_ip
+            && self.base.continuity.entry_stamp == other.base.continuity.entry_stamp
+            && self.base.continuity.return_stamp == other.base.continuity.return_stamp
+            && self.object.as_ref().map(|object| object.tail_bytes())
+                == other.object.as_ref().map(|object| object.tail_bytes())
+    }
+}
+
 /// Decode the exact 368/608-byte forms atomically; the extended form is
 /// CALL-only and returns the validated tail intact. The prefix alone
 /// never validates: a malformed tail refuses the whole record even when

@@ -2642,6 +2642,21 @@ mod tests {
     // owned-child kill/reap on failure. Native FD teardown can outlast this
     // helper's failure. An outer timeout is FAIL / cleanup unproved, never
     // successful qualification or permission to retry.
+    fn assert_native_growth_backend(
+        session: &Session,
+        backend: crate::attach::AttachBackend,
+        static_attached: bool,
+    ) {
+        if backend != crate::attach::AttachBackend::Multi {
+            return;
+        }
+        let evidence = session.attach_backend_evidence();
+        assert_eq!(evidence.selection, "multi");
+        assert!(evidence.fallback.is_none());
+        assert_eq!(evidence.scope_filter, Some("kernel-pid+bpf"));
+        assert_eq!(session.static_multi_attached(), static_attached);
+    }
+
     struct NativeGrowthRun {
         // Kill/reap an owned blocked driver before the Session drops on failure.
         fixture: GrowthDriver,
@@ -2661,6 +2676,18 @@ mod tests {
 
     impl NativeGrowthRun {
         fn new(final_count: usize, case_deadline: std::time::Instant) -> Self {
+            Self::new_with_backend(
+                final_count,
+                case_deadline,
+                crate::attach::AttachBackend::Singles,
+            )
+        }
+
+        fn new_with_backend(
+            final_count: usize,
+            case_deadline: std::time::Instant,
+            backend: crate::attach::AttachBackend,
+        ) -> Self {
             use crate::attach::counter_banks::{BankPublication, BankReservation};
             use sha2::Digest;
             use std::io::Read;
@@ -2773,13 +2800,21 @@ mod tests {
                     .join("counter-bank-growth-v2/p11scope-ebpf-counts-bank-growth-v2"),
             )
             .unwrap();
-            let mut session = Session::prepare_counter_banks(
-                &crate::attach::Scope::Pid(fixture.child.id()),
-                &artifact,
-                base,
-                &pool.reserver(),
-            )
+            let scope = crate::attach::Scope::Pid(fixture.child.id());
+            let mut session = match backend {
+                crate::attach::AttachBackend::Singles => {
+                    Session::prepare_counter_banks(&scope, &artifact, base, &pool.reserver())
+                }
+                crate::attach::AttachBackend::Multi => Session::prepare_counter_banks_with_backend(
+                    &scope,
+                    &artifact,
+                    base,
+                    &pool.reserver(),
+                    backend,
+                ),
+            }
             .unwrap();
+            assert_native_growth_backend(&session, backend, false);
             assert!(matches!(
                 session.stage_counter_banks(&mut history, &pins, stage, &pool.reserver()),
                 BankPublication::Published {
@@ -2787,6 +2822,7 @@ mod tests {
                     ..
                 }
             ));
+            assert_native_growth_backend(&session, backend, true);
             let limits = CounterLimits {
                 rows: final_count,
                 rv_keys: 65536,
@@ -3079,8 +3115,22 @@ mod tests {
     }
 
     fn native_growth_population(final_count: usize) {
+        native_growth_population_with_backend(final_count, crate::attach::AttachBackend::Singles);
+    }
+
+    fn native_growth_population_with_backend(
+        final_count: usize,
+        backend: crate::attach::AttachBackend,
+    ) {
         let case_deadline = std::time::Instant::now() + GROWTH_CASE_BUDGET;
-        let mut run = NativeGrowthRun::new(final_count, case_deadline);
+        let mut run = match backend {
+            crate::attach::AttachBackend::Singles => {
+                NativeGrowthRun::new(final_count, case_deadline)
+            }
+            crate::attach::AttachBackend::Multi => {
+                NativeGrowthRun::new_with_backend(final_count, case_deadline, backend)
+            }
+        };
         run.fixture.command("START");
         run.fixture.expect("HELD 0");
         run.expected.rows[0].entered += 1;
@@ -3088,6 +3138,7 @@ mod tests {
         run.checkpoint();
         run.step(511);
         run.grow(513);
+        assert_native_growth_backend(&run.session, backend, true);
         assert_eq!(run.held_start(), held);
         run.checkpoint();
         run.step(512);
@@ -3166,6 +3217,12 @@ mod tests {
     #[ignore = "requires prebuilt LP64 growth fixtures, selected format2 object, and authorized 513-endpoint native attachment"]
     fn counter_bank_session_boundary_511_512_counts_growth_lp64() {
         native_growth_population(513);
+    }
+
+    #[test]
+    #[ignore = "requires prebuilt LP64 growth fixtures, selected format2 object, proven kernel Multi PID filtering, and authorized 513-endpoint native Multi attachment"]
+    fn counter_bank_session_boundary_511_512_counts_growth_multi_lp64() {
+        native_growth_population_with_backend(513, crate::attach::AttachBackend::Multi);
     }
 
     #[test]

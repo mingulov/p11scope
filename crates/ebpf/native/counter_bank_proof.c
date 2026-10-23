@@ -203,7 +203,7 @@ __attribute__((noinline)) u32 p11_bank_complete(u32 slot, u64 pid_tgid,
         return 0;
     }
     increment(&counts->returned);
-    if (rv)
+    if (rv != 0 && rv != 0x204)
         increment(&counts->errors);
     completed_rv(key.slot, rv);
     return 0;

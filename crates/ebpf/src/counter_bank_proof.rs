@@ -41,7 +41,7 @@ pub fn p11_counter_bank_return(ctx: RetProbeContext) -> u32 {
             bump_evidence(EVIDENCE_ABI_REFUSALS);
         }
         let rv = layout
-            .map(|layout| normalize_target_word(ctx.ret::<u64>().unwrap_or(0), layout))
+            .map(|layout| normalize_target_word(ctx.ret::<u64>(), layout))
             .unwrap_or(0);
         // The native return first performs optional START lookup, before
         // publication/route checks. Refusal still retires a present START.

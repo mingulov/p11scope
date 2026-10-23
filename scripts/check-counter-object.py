@@ -1772,6 +1772,16 @@ def bank_scenarios(graph):
     check("rv_full_width_accumulates", vm, ((3, 3, 3), (0, 0, 0)), 0,
           rv={(0, 0x100000001): 2, (0, U64_MAX): 1})
     vm = BankExecution(graph)
+    vm.run("p11_bank_enter", (0, 9))
+    vm.run("p11_bank_complete", (0, 9, 0x204, 1))
+    check("pending_is_returned_without_error", vm, ((1, 1, 0), (0, 0, 0)), 0,
+          rv={(0, 0x204): 1})
+    vm = BankExecution(graph)
+    vm.run("p11_bank_enter", (0, 9))
+    vm.run("p11_bank_complete", (0, 9, 0x100000204, 1))
+    check("pending_high_alias_is_full_width_error", vm, ((1, 1, 1), (0, 0, 0)), 0,
+          rv={(0, 0x100000204): 1})
+    vm = BankExecution(graph)
     vm.failed_rv_insert = True
     vm.run("p11_bank_enter", (0, 9))
     vm.run("p11_bank_complete", (0, 9, 0, 1))

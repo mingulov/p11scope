@@ -155,6 +155,8 @@ fn counter_bank_proof_has_exact_routes_and_start_ownership() {
         "full_width_transaction",
         "admission_failure_is_sticky",
         "rv_full_width_accumulates",
+        "pending_is_returned_without_error",
+        "pending_high_alias_is_full_width_error",
         "rv_failure_is_sticky",
         "entered_saturates_without_wrap",
         "bounded_contention_is_unhealthy",

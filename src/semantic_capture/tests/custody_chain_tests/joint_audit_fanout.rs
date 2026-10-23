@@ -529,7 +529,7 @@ impl MachineScene {
     fn absence_scene(providers: usize) -> Self {
         let mut fixture = Self::with_initial_files(providers, &[0], true);
         fixture.push_quiet();
-        fixture.published();
+        fixture.published_labeled("absence-quiet-prefix", None);
         assert_eq!(
             fixture
                 .scene
@@ -791,18 +791,31 @@ impl MachineScene {
 
     fn published_labeled(&mut self, label: &str, frozen: Option<bool>) {
         for _ in 0..512 {
+            let progress = self.service(1).unwrap_or_else(|reason| {
+                self.publication_failed(label, frozen, Some(reason));
+            });
             if matches!(
-                self.service(1).unwrap(),
+                progress,
                 crate::inventory_semantics::JointServiceProgress::Published
             ) {
                 return;
             }
         }
+        self.publication_failed(label, frozen, None);
+    }
+
+    fn publication_failed(
+        &self,
+        label: &str,
+        frozen: Option<bool>,
+        refusal: Option<SemanticRefusal>,
+    ) -> ! {
         let coordinator = &self.scene.real.scene.coordinator;
         panic!(
             "the same machine must publish the retained original within its finite work bound; \
-             label={label} frozen={frozen:?} snapshot={:?} preparations={} revision={} \
-             publication_pending={} h3={:?} claims={} roles={:?} audit={:?}",
+             label={label} frozen={frozen:?} refusal={refusal:?} snapshot={:?} preparations={} revision={} \
+             publication_pending={} h3={:?} claims={} roles={:?} audit={:?} \
+             absence_queries={} birth_outcomes={:?}",
             self.machine.diagnostic_snapshot_for_test(),
             self.native.preparations.len(),
             coordinator.registry().published_revision(),
@@ -815,6 +828,8 @@ impl MachineScene {
                 .0,
             coordinator.joint_capture().ledger().roles_for_test(),
             self.machine.diagnostic_audit_for_test(),
+            self.native.absence_reads.len(),
+            self.native.birth_outcomes,
         );
     }
 
@@ -922,7 +937,7 @@ fn joint_machine_absence_before_appearance_publishes_first_joint() {
         .scene
         .push(std::process::id(), 1, "C_CreateObject", 2);
     fixture.scene.push(std::process::id(), 1, "C_SignInit", 3);
-    fixture.published();
+    fixture.published_labeled("absence-appearance-create-init", None);
     assert!(fixture.pending_absence(1).is_none());
     let witness = fixture.ready_birth(1).unwrap();
     assert_eq!(witness.receipt().birth(), BirthKind::AbsenceAppearance);
@@ -949,7 +964,7 @@ fn joint_machine_absence_before_appearance_publishes_first_joint() {
         pending_before + 1
     );
     fixture.scene.push(std::process::id(), 1, "C_SignFinal", 4);
-    fixture.published();
+    fixture.published_labeled("absence-fresh-final", None);
     assert_eq!(fixture.reduced_for(1), 3);
     assert!(fixture.native.reads.get().0 > 0 && fixture.native.reads.get().1 > 0);
     assert_eq!(

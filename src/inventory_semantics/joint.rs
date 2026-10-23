@@ -481,6 +481,7 @@ impl AttestedSemanticLane {
         self.with_joint_native(witnesses, inspect)
     }
 
+    #[cfg_attr(test, allow(dead_code))] // Test I/O substitutes the native leaf; the actual Session uses this entrypoint.
     pub(crate) fn with_joint_commit_io_for_births<R>(
         &mut self,
         witnesses: &RetainedJointBirths,

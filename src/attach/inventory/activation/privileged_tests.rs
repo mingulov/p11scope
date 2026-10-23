@@ -7598,46 +7598,24 @@ fn privileged_t7_detailed_hot_slot_third_rv_lp64() -> Result<()> {
     Ok(())
 }
 
-fn task4_writer_evidence(endpoints: u32) -> Result<(tempfile::TempDir, Task4Evidence)> {
+fn task4_writer_evidence(endpoints: usize) -> Result<(tempfile::TempDir, [Task4Rows; 3])> {
     let directory = tempfile::tempdir()?;
-    let fixture = OwnedFixture::build_n(false, endpoints)?;
-    let offsets: Vec<_> = fixture
-        .plan
-        .slots
-        .iter()
-        .map(|slot| slot.file_offset)
-        .collect();
-    std::fs::write(
-        directory.path().join("offsets-00.json"),
-        serde_json::to_vec(&offsets)?,
-    )?;
-    let evidence = Task4Evidence::new_control_at(
-        "inventory",
-        if cfg!(feature = "wide-detailed-2112") {
-            "wide-detailed-2112"
-        } else {
-            "default"
-        },
-        &fixture,
-        crate::EBPF_INVENTORY_OBJECT,
-        None,
-        directory.path().to_owned(),
-        0,
-    )?;
-    Ok((directory, evidence))
+    let rows = |name| Task4Rows::create(directory.path(), 0, name, "jsonl", "inventory", endpoints);
+    let writers = [rows("raw")?, rows("ledger")?, rows("links")?];
+    Ok((directory, writers))
 }
 
 fn task4_assert_complete_writer_sweep(
-    endpoints: u32,
+    endpoints: usize,
     raw_rows: usize,
     ledger_rows: usize,
     link_rows: usize,
 ) -> Result<()> {
-    let (_directory, mut evidence) = task4_writer_evidence(endpoints)?;
+    let (_directory, [mut raw, mut ledger, mut links]) = task4_writer_evidence(endpoints)?;
     for (writer, rows) in [
-        (&mut evidence.raw, raw_rows),
-        (&mut evidence.ledger, ledger_rows),
-        (evidence.links.as_mut().context("links writer")?, link_rows),
+        (&mut raw, raw_rows),
+        (&mut ledger, ledger_rows),
+        (&mut links, link_rows),
     ] {
         for position in 0..rows {
             writer.json(serde_json::json!({
@@ -7681,11 +7659,11 @@ fn task4_evidence_preserves_n8192_sweep() -> Result<()> {
 
 #[test]
 fn task4_evidence_refuses_runaway_rows_without_writing() -> Result<()> {
-    let (_directory, mut evidence) = task4_writer_evidence(8_192)?;
+    let (_directory, [mut raw, mut ledger, mut links]) = task4_writer_evidence(8_192)?;
     for (writer, runaway_rows) in [
-        (&mut evidence.raw, 409_650),
-        (&mut evidence.ledger, 82_020),
-        (evidence.links.as_mut().context("links writer")?, 81_940),
+        (&mut raw, 409_650),
+        (&mut ledger, 82_020),
+        (&mut links, 81_940),
     ] {
         let mut refused = false;
         for written in 0..runaway_rows {
@@ -7712,18 +7690,12 @@ fn task4_evidence_refuses_runaway_rows_without_writing() -> Result<()> {
 
 #[test]
 fn task4_evidence_byte_limit_preserves_existing_bytes() -> Result<()> {
-    let (_directory, mut evidence) = task4_writer_evidence(1)?;
+    let (_directory, [mut raw, _, _]) = task4_writer_evidence(1)?;
     let at_limit = vec![b'x'; 16 * 1024 * 1024];
-    evidence.raw.write(&at_limit)?;
-    let error = evidence
-        .raw
-        .write(b"x")
-        .expect_err("oversize file admitted");
+    raw.write(&at_limit)?;
+    let error = raw.write(b"x").expect_err("oversize file admitted");
     ensure!(format!("{error:#}").contains("16 MiB"));
-    ensure!(
-        evidence.raw.contents()? == at_limit,
-        "failed write changed evidence"
-    );
+    ensure!(raw.contents()? == at_limit, "failed write changed evidence");
     Ok(())
 }
 

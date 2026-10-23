@@ -10,6 +10,1027 @@ use crate::semantics_objects::journal::{
 };
 use crate::semantics_objects::{Lifetime, ObjectEffect, ObjectGap};
 
+/// The allocation budget is not the first poll's work allowance. Reading
+/// one BEGIN must leave room for its later physical END in this SAME owner.
+#[test]
+fn joint_machine_initial_work_preserves_full_original_capacity() {
+    let mut scene = JointScene::for_audit(1);
+    let pid = std::process::id();
+    scene.real.bind(
+        pid,
+        ImageIdentity {
+            task_cookie: 71,
+            exec_id: 0,
+        },
+        0,
+    );
+    let (begin, end) = scene.encoded(pid, 0, "C_SignInit", 1);
+    scene.drain.source_mut().push_record(begin.to_vec());
+    let reserve = scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .semantic_storage_reserver();
+    let (mut raw, poll) = RawJointQuantum::begin_bounded_with_adapter(
+        &mut scene.drain,
+        &publish_object_descriptors(),
+        4_096,
+        1,
+        None,
+        &BirthFault,
+        &scene.producers,
+        |bytes| reserve.reserve(bytes),
+        scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture_mut()
+            .adapter_mut(),
+    )
+    .unwrap();
+    assert_eq!(poll.unwrap().attempted, 1);
+    assert_eq!(scene.drain.source_mut().remaining(), 0);
+    let identity = raw.h0_identity();
+    let held = scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .semantic_resource_snapshot()
+        .charged_bytes;
+    // A genuine idle poll between the original BEGIN and END is not a new
+    // allocation or an admission/terminal for that unfinished invocation.
+    let idle = raw
+        .continue_bounded_with_adapter(
+            &mut scene.drain,
+            &publish_object_descriptors(),
+            1,
+            None,
+            &BirthFault,
+            &scene.producers,
+            scene
+                .real
+                .scene
+                .coordinator
+                .joint_capture_mut()
+                .adapter_mut(),
+        )
+        .unwrap();
+    assert_eq!(idle.attempted, 0);
+    scene.drain.source_mut().push_record(end.to_vec());
+    let completed = raw
+        .continue_bounded_with_adapter(
+            &mut scene.drain,
+            &publish_object_descriptors(),
+            1,
+            None,
+            &BirthFault,
+            &scene.producers,
+            scene
+                .real
+                .scene
+                .coordinator
+                .joint_capture_mut()
+                .adapter_mut(),
+        )
+        .unwrap();
+    assert_eq!(completed.attempted, 1);
+    assert!(raw.h0_identity() == identity);
+    assert_eq!(raw.pending_h0_records(), 1);
+    assert_eq!(
+        scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .semantic_resource_snapshot()
+            .charged_bytes,
+        held
+    );
+    assert_eq!(scene.drain.source_mut().remaining(), 0);
+}
+
+/// Zero initial work is unobserved, not an observed-empty read certificate.
+#[test]
+fn joint_machine_zero_initial_work_never_observes_empty() {
+    let mut scene = JointScene::for_audit(1);
+    let pid = std::process::id();
+    scene.real.bind(
+        pid,
+        ImageIdentity {
+            task_cookie: 71,
+            exec_id: 0,
+        },
+        0,
+    );
+    scene.push(pid, 0, "C_SignInit", 1);
+    let boundary = scene.drain.consumption_cut().unwrap();
+    let reserve = scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .semantic_storage_reserver();
+    let adapter = scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture_mut()
+        .adapter_mut();
+    let (mut raw, poll) = RawJointQuantum::begin_bounded_with_adapter(
+        &mut scene.drain,
+        &publish_object_descriptors(),
+        4_096,
+        0,
+        None,
+        &BirthFault,
+        &scene.producers,
+        |bytes| reserve.reserve(bytes),
+        adapter,
+    )
+    .unwrap();
+    assert!(
+        poll.is_none(),
+        "no poll result exists until the cursor was actually serviced"
+    );
+    assert_eq!(scene.drain.source_mut().remaining(), 2);
+    assert!(boundary.same_boundary(&scene.drain.consumption_cut().unwrap()));
+    assert_eq!(raw.pending_h0_records(), 0);
+    assert_eq!(
+        raw.validate_preparation(adapter, &scene.producers),
+        Err(RawQuantumRefusal::H0Undelivered)
+    );
+    let identity = raw.h0_identity();
+    let poll = raw
+        .continue_bounded_with_adapter(
+            &mut scene.drain,
+            &publish_object_descriptors(),
+            1,
+            None,
+            &BirthFault,
+            &scene.producers,
+            adapter,
+        )
+        .unwrap();
+    assert_eq!(poll.attempted, 1);
+    assert_eq!(scene.drain.source_mut().remaining(), 1);
+    assert!(raw.h0_identity() == identity);
+}
+
+// The machine owns all policy/state. This test adapter replaces only the
+// existing Session cursor/map leaves and calls the real Capture, coordinator,
+// birth validator and scoped native-reader builder below that boundary.
+struct MachineNativeRows {
+    publisher: NativePublisher,
+    rows: std::collections::BTreeMap<crate::semantics_objects::ObjectDomain, NativeBirthRows>,
+    reads: Cell<(usize, usize)>,
+    preparations: Vec<(
+        crate::semantics_objects::journal::joint_driver::RawQuantumIdentity,
+        bool,
+    )>,
+    fail_after_preparation: bool,
+}
+
+struct HeldMachineIo<'a> {
+    drain: &'a mut EventDrain<ScriptedRecords>,
+    h0: &'a SharedH0,
+    producers: &'a SessionDrainProducers,
+    attached: &'a crate::attach::AttachedSemanticSet,
+    native: &'a mut MachineNativeRows,
+}
+
+impl crate::inventory_semantics::JointMachineIo for HeldMachineIo<'_> {
+    fn producers(&self) -> &SessionDrainProducers {
+        self.producers
+    }
+    fn attachment(&self) -> &crate::attach::AttachedSemanticSet {
+        self.attached
+    }
+
+    fn collect_raw(
+        &mut self,
+        _lane: &mut AttestedSemanticLane,
+        adapter: &mut JournalAdapter,
+        reserve: &crate::semantics_edge::resources::SemanticResourceReserver,
+        capacity: usize,
+        work: usize,
+    ) -> Result<(RawJointQuantum, Option<crate::events::DispatchPoll>), RawQuantumRefusal> {
+        RawJointQuantum::begin_bounded_with_adapter(
+            self.drain,
+            &publish_object_descriptors(),
+            capacity,
+            work,
+            None,
+            &DisposedNativeFault((*self.h0).clone()),
+            self.producers,
+            |bytes| reserve.reserve(bytes),
+            adapter,
+        )
+    }
+
+    fn continue_raw(
+        &mut self,
+        _lane: &mut AttestedSemanticLane,
+        raw: &mut RawJointQuantum,
+        adapter: &mut JournalAdapter,
+        work: usize,
+    ) -> Result<crate::events::DispatchPoll, RawQuantumRefusal> {
+        raw.continue_bounded_with_adapter(
+            self.drain,
+            &publish_object_descriptors(),
+            work,
+            None,
+            &DisposedNativeFault((*self.h0).clone()),
+            self.producers,
+            adapter,
+        )
+    }
+
+    fn tick_collected(
+        &mut self,
+        _lane: &mut AttestedSemanticLane,
+        _bindings: &[SemanticCallerBinding],
+        raw: &mut RawJointQuantum,
+    ) -> Result<SemanticBatch, SemanticRefusal> {
+        let mut owned = self.h0.0.borrow_mut();
+        if let Some(retained) = &owned.collected_producers {
+            assert!(retained.same_producers(self.producers));
+        } else {
+            owned.collected_producers = Some(self.producers.clone());
+        }
+        let HeldH0 {
+            capture, io, stash, ..
+        } = &mut *owned;
+        let mut report = capture
+            .tick_collected_with(io, raw)
+            .map_err(|_| SemanticRefusal::Unavailable)?;
+        assert_eq!(merge_stash_into_report(stash, &mut report), 0);
+        SemanticBatch::from_tick_report(
+            self.producers.native_domain(),
+            report,
+            Vec::new(),
+            now_ns(),
+        )
+    }
+
+    fn prepare_publication(
+        &mut self,
+        lane: &mut AttestedSemanticLane,
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        raw: &mut RawJointQuantum,
+        engine_changed: bool,
+    ) -> anyhow::Result<()> {
+        self.native
+            .preparations
+            .push((raw.h0_identity(), engine_changed));
+        coordinator.prepare_joint_publication(engine_changed, lane, raw, self.producers)?;
+        if self.native.fail_after_preparation {
+            // The real engine/context already moved. A failed caller return
+            // must not make the machine replay those actual side effects.
+            return Err(anyhow::anyhow!(
+                "actual preparation completed before failed handoff"
+            ));
+        }
+        Ok(())
+    }
+
+    fn consume_birth(
+        &mut self,
+        _lane: &mut AttestedSemanticLane,
+        candidate: H0BirthCandidate,
+        input: &crate::discovery::caller_registry::instance_input::AdmittedInstanceCall,
+        binding: &SemanticCallerBinding,
+        proof: &JournalDomainProof,
+        adapter: &JournalAdapter,
+    ) -> Result<RetainedBirthWitness, BirthObservationRefusal> {
+        let (row, control, _) = self
+            .native
+            .publisher
+            .publish_stamped(&["0", "0"], self.attached.generation());
+        let mut rows = NativeBirthRows { row, control };
+        let mut owned = self.h0.0.borrow_mut();
+        let HeldH0 { capture, io, .. } = &mut *owned;
+        capture.validate_birth_candidate(io, &candidate, false)?;
+        let witness = capture.finish_birth(
+            candidate,
+            None,
+            input,
+            binding,
+            self.attached,
+            proof,
+            adapter,
+            &mut rows,
+        )?;
+        assert!(
+            self.native
+                .rows
+                .insert(witness.receipt().domain(), rows)
+                .is_none()
+        );
+        Ok(witness)
+    }
+
+    fn with_native<R>(
+        &mut self,
+        _lane: &mut AttestedSemanticLane,
+        witnesses: &[crate::inventory_semantics::RetainedJointBirth],
+        inspect: impl for<'io> FnOnce(crate::inventory_semantics::JointCommitIo<'io>) -> R,
+    ) -> Result<R, SemanticRefusal> {
+        let mut owned = self
+            .h0
+            .0
+            .try_borrow_mut()
+            .map_err(|_| SemanticRefusal::Unavailable)?;
+        let HeldH0 {
+            capture, io, stash, ..
+        } = &mut *owned;
+        let rows = self
+            .native
+            .rows
+            .iter_mut()
+            .map(|(domain, rows)| (*domain, rows))
+            .collect();
+        let mut native = HeldCommitNative {
+            io,
+            rows,
+            reads: &self.native.reads,
+        };
+        let native = RefCell::new(&mut native);
+        crate::inventory_semantics::with_joint_commit_io_for_test(
+            capture,
+            stash,
+            self.producers,
+            self.attached,
+            witnesses,
+            &native,
+            inspect,
+        )
+    }
+}
+
+struct MachineScene {
+    scene: JointScene,
+    machine: crate::inventory_semantics::LiveJointMachine,
+    native: MachineNativeRows,
+}
+
+impl MachineScene {
+    fn new(providers: usize) -> Self {
+        let (held, attached) = HeldProviders::with_attachment(
+            providers,
+            &[
+                "C_CreateObject",
+                "C_SignInit",
+                "C_SignUpdate",
+                "C_SignFinal",
+            ],
+        );
+        let mut scene = JointScene::from_held(held, Some(attached));
+        let pid = std::process::id();
+        SIGHT_NS.with(|clock| clock.set(1_005));
+        scene.real.h0.0.borrow_mut().io.script.local = 1;
+        let caller = scene.real.scene.admit(pid, 50);
+        for (module, path) in &scene.real.modules {
+            scene.real.scene.coordinator.registry_mut().note_mapping(
+                caller,
+                pid,
+                ModuleInfo {
+                    path: path.clone(),
+                    key: module.clone(),
+                    double_loaded: false,
+                    build_id: None,
+                    identity_source: Some("held-provider".into()),
+                    admission: AdmissionState::Admitted,
+                    admission_class: Some("exact".into()),
+                    admission_endpoints: Some(4),
+                    admission_reasons: Vec::new(),
+                },
+                60,
+            );
+        }
+        scene.real.scene.coordinator.commit_batch(false).unwrap();
+        let candidate = scene
+            .real
+            .scene
+            .coordinator
+            .prepare_legacy_semantic_candidate(caller, scene.real.lane.domain())
+            .unwrap();
+        scene.real.h0.0.borrow_mut().io.targets.insert(
+            pid,
+            (
+                candidate.pin(),
+                ImageIdentity {
+                    task_cookie: 71,
+                    exec_id: 0,
+                },
+            ),
+        );
+        drop(candidate);
+        assert_eq!(scene.real.scene.coordinator.semantic_bindings().len(), 0);
+        let reserve = scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .semantic_storage_reserver();
+        let machine =
+            crate::inventory_semantics::LiveJointMachine::new(&scene.producers, &reserve).unwrap();
+        Self {
+            scene,
+            machine,
+            native: MachineNativeRows {
+                publisher: NativePublisher::build(),
+                rows: std::collections::BTreeMap::new(),
+                reads: Cell::new((0, 0)),
+                preparations: Vec::new(),
+                fail_after_preparation: false,
+            },
+        }
+    }
+
+    fn service(
+        &mut self,
+        work: usize,
+    ) -> Result<crate::inventory_semantics::JointServiceProgress, SemanticRefusal> {
+        let mut budget = crate::inventory_semantics::JointWorkBudget {
+            remaining_actions: work,
+            deadline: Instant::now() + Duration::from_secs(10),
+        };
+        let Self {
+            scene,
+            machine,
+            native,
+            ..
+        } = self;
+        let mut io = HeldMachineIo {
+            drain: &mut scene.drain,
+            h0: &scene.real.h0,
+            producers: &scene.producers,
+            attached: scene.attached.as_ref().unwrap(),
+            native,
+        };
+        machine.service_with_io(
+            &mut scene.real.lane,
+            &mut scene.real.scene.coordinator,
+            &mut io,
+            crate::inventory_semantics::JointServiceMode::Running,
+            &mut budget,
+        )
+    }
+
+    fn poll_commit(
+        &mut self,
+        work: usize,
+    ) -> Result<crate::discovery::engine::inventory_coordinator::JointCommitProgress, SemanticRefusal>
+    {
+        let mut budget = crate::inventory_semantics::JointWorkBudget {
+            remaining_actions: work,
+            deadline: Instant::now() + Duration::from_secs(10),
+        };
+        let Self {
+            scene,
+            machine,
+            native,
+            ..
+        } = self;
+        let mut io = HeldMachineIo {
+            drain: &mut scene.drain,
+            h0: &scene.real.h0,
+            producers: &scene.producers,
+            attached: scene.attached.as_ref().unwrap(),
+            native,
+        };
+        machine.poll_commit_with_io(
+            &mut scene.real.lane,
+            &mut scene.real.scene.coordinator,
+            &mut io,
+            &mut budget,
+        )
+    }
+
+    fn published(&mut self) {
+        for _ in 0..512 {
+            if matches!(
+                self.service(1).unwrap(),
+                crate::inventory_semantics::JointServiceProgress::Published
+            ) {
+                return;
+            }
+        }
+        panic!("the same machine must publish the retained original within its finite work bound");
+    }
+
+    fn prime(&mut self, providers: usize) {
+        for file in 0..providers {
+            self.scene.push(
+                std::process::id(),
+                file as u32,
+                "C_CreateObject",
+                file as u64 + 1,
+            );
+        }
+        self.published();
+        assert_eq!(
+            self.scene.real.scene.coordinator.registry().joint_feeds(),
+            providers
+        );
+    }
+
+    fn reduced_for(&self, file: usize) -> u64 {
+        let registry = self.scene.real.scene.coordinator.registry();
+        let module = registry
+            .modules()
+            .find(|module| module.key == self.scene.real.modules[file].0)
+            .unwrap()
+            .id;
+        let mut records = registry
+            .instance_semantic_edges()
+            .filter(|record| record.module == module);
+        let result = records.next().unwrap().feed.reduced();
+        assert!(
+            records.next().is_none(),
+            "this fixture has one original incarnation per provider"
+        );
+        result
+    }
+
+    fn reduced(&self) -> Vec<u64> {
+        self.scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .instance_semantic_edges()
+            .map(|record| record.feed.reduced())
+            .collect()
+    }
+}
+
+#[test]
+fn joint_machine_routes_first_birth_to_actual_registry() {
+    let mut fixture = MachineScene::new(1);
+    let revision = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .published_revision();
+    fixture
+        .scene
+        .push(std::process::id(), 0, "C_CreateObject", 1);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 2);
+    fixture.published();
+    let coordinator = &fixture.scene.real.scene.coordinator;
+    assert_eq!(coordinator.registry().joint_feeds(), 1);
+    assert_eq!(fixture.reduced(), [2]);
+    assert_eq!(coordinator.registry().published_revision(), revision + 1);
+    assert_eq!(coordinator.reference_h3_audit_state(), (1, false));
+    assert_eq!(
+        coordinator
+            .joint_capture()
+            .adapter()
+            .invocation_claims_for_test()
+            .0,
+        0
+    );
+    assert_eq!(
+        coordinator.joint_capture().ledger().roles_for_test()[..2],
+        [0, 0]
+    );
+    assert_eq!(fixture.native.rows.len(), 1);
+    assert!(fixture.native.reads.get().0 > 0 && fixture.native.reads.get().1 > 0);
+    assert!(
+        coordinator
+            .joint_capture()
+            .model()
+            .project()
+            .objects
+            .iter()
+            .any(|object| object.lifetime == Lifetime::Live)
+    );
+}
+
+#[test]
+fn joint_machine_begin_slices_and_h0_pending_do_not_repoll() {
+    let mut fixture = MachineScene::new(2);
+    fixture.prime(2);
+    let before_b = fixture.reduced_for(1);
+    {
+        let mut held = fixture.scene.real.h0.0.borrow_mut();
+        let (base, epoch) = held.io.scan_input(0);
+        held.io.scan_inputs.insert(0, (base + 0x20_000, epoch + 1));
+        held.io.script.fail_file = Some(0);
+    }
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 3);
+    fixture.scene.push(std::process::id(), 1, "C_SignInit", 4);
+    for _ in 0..128 {
+        fixture.service(1).unwrap();
+        if fixture.scene.real.h0.0.borrow().capture.awaiting.len() == 1
+            && fixture.machine.retained_h0_for_test().is_some()
+        {
+            break;
+        }
+    }
+    assert_eq!(fixture.scene.real.h0.0.borrow().capture.awaiting.len(), 1);
+    let raw = fixture.machine.retained_raw_for_test().unwrap();
+    assert_eq!(
+        raw.pending_h0_records(),
+        0,
+        "the first real H0 report already acknowledged its ordinary bytes"
+    );
+    let identity = raw.h0_identity();
+    let (outcomes, current) = fixture.machine.retained_h0_for_test().unwrap();
+    let ready = outcomes
+        .iter()
+        .filter_map(|outcome| match outcome {
+            TickOutcome::Call(call) => {
+                Some((call.token().unwrap(), call.collected_origin().unwrap()))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ready.len(),
+        1,
+        "B is genuinely ready while H0 still owns pending A"
+    );
+    assert!(
+        current
+            .iter()
+            .any(|receipt| receipt.endpoint().file_slot == 1)
+    );
+    let original_boundary = fixture.scene.drain.consumption_cut().unwrap();
+    fixture.scene.drain.source_mut().push_record(vec![0; 17]);
+    for _ in 0..3 {
+        fixture.service(4).unwrap();
+        assert!(
+            fixture
+                .machine
+                .retained_raw_for_test()
+                .unwrap()
+                .h0_identity()
+                == identity
+        );
+        assert!(original_boundary.same_boundary(&fixture.scene.drain.consumption_cut().unwrap()));
+        assert_eq!(fixture.scene.drain.source_mut().remaining(), 1);
+        let (outcomes, _) = fixture.machine.retained_h0_for_test().unwrap();
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter_map(|outcome| match outcome {
+                    TickOutcome::Call(call) =>
+                        Some((call.token().unwrap(), call.collected_origin().unwrap())),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            ready
+        );
+    }
+    fixture.scene.real.h0.0.borrow_mut().io.script.fail_file = None;
+    fixture.published();
+    assert_eq!(
+        fixture.scene.drain.source_mut().remaining(),
+        1,
+        "completing the original frame must return before reading the next one"
+    );
+    assert_eq!(
+        fixture.reduced_for(1) - before_b,
+        1,
+        "the retained ready B original reduces once"
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .invocation_claims_for_test()
+            .0,
+        0
+    );
+}
+
+#[test]
+fn joint_machine_pending_a_allows_q2_real_end() {
+    for reverse in [false, true] {
+        let mut fixture = MachineScene::new(2);
+        fixture.prime(2);
+        let before = fixture.reduced();
+        let (a, b) = if reverse { (1, 0) } else { (0, 1) };
+        let (begin_a, end_a) = fixture
+            .scene
+            .encoded(std::process::id(), a, "C_SignInit", 3);
+        let (begin_b, end_b) = fixture
+            .scene
+            .encoded(std::process::id(), b, "C_SignInit", 4);
+        for bytes in [begin_a.to_vec(), begin_b.to_vec(), end_b.to_vec()] {
+            fixture.scene.drain.source_mut().push_record(bytes);
+        }
+        fixture.published();
+        assert_eq!(
+            fixture.reduced(),
+            before,
+            "q1 cannot replay through the missing original END(A)"
+        );
+        let native_a = (
+            ((u64::from(std::process::id())) << 32) | u64::from(std::process::id()),
+            3,
+        );
+        assert_eq!(
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .joint_capture()
+                .adapter()
+                .retained_start_bytes_for_test(native_a),
+            Some(begin_a),
+            "q1 publication keeps the exact physical START for q2's END"
+        );
+        assert!(
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .joint_capture()
+                .ledger()
+                .roles_for_test()[1]
+                > 0
+        );
+        fixture.scene.drain.source_mut().push_record(end_a.to_vec());
+        fixture.published();
+        assert_eq!(
+            fixture.reduced(),
+            before.iter().map(|count| count + 1).collect::<Vec<_>>()
+        );
+        let coordinator = &fixture.scene.real.scene.coordinator;
+        assert_eq!(
+            coordinator
+                .joint_capture()
+                .adapter()
+                .invocation_claims_for_test()
+                .0,
+            0
+        );
+        let roles = coordinator.joint_capture().ledger().roles_for_test();
+        assert_eq!((roles[0], roles[1], roles[3]), (0, 0, 0));
+        assert!(
+            coordinator
+                .joint_capture()
+                .adapter()
+                .retained_start_bytes_for_test(native_a)
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn joint_machine_negative_dispositions_are_finite() {
+    for malformed in [false, true] {
+        let mut fixture = MachineScene::new(1);
+        let revision = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .published_revision();
+        if malformed {
+            fixture.scene.drain.source_mut().push_record(vec![0; 17]);
+        }
+        let boundary = fixture.scene.drain.consumption_cut().unwrap();
+        fixture.service(0).unwrap();
+        assert!(boundary.same_boundary(&fixture.scene.drain.consumption_cut().unwrap()));
+        assert_eq!(
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .registry()
+                .published_revision(),
+            revision
+        );
+        assert!(fixture.native.preparations.is_empty());
+        fixture.machine.begin_commit(false).unwrap();
+        for _ in 0..128 {
+            if matches!(
+                fixture.poll_commit(1).unwrap(),
+                crate::discovery::engine::inventory_coordinator::JointCommitProgress::Published(_)
+            ) {
+                break;
+            }
+        }
+        let coordinator = &fixture.scene.real.scene.coordinator;
+        assert_eq!(coordinator.registry().published_revision(), revision + 1);
+        assert_eq!(coordinator.registry().joint_feeds(), 0);
+        assert!(fixture.native.rows.is_empty());
+        assert!(
+            coordinator
+                .joint_capture()
+                .model()
+                .project()
+                .objects
+                .is_empty()
+        );
+        assert_eq!(
+            coordinator.joint_capture().ledger().roles_for_test()[..4],
+            [0, 0, 0, 0]
+        );
+        let completed = coordinator.registry().published_revision();
+        fixture.service(1).unwrap();
+        assert_eq!(
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .registry()
+                .published_revision(),
+            completed,
+            "an idle slice cannot spin through repeated empty publications"
+        );
+    }
+}
+
+#[test]
+fn joint_machine_request_ack_tracks_actual_preparation_and_attempted_error() {
+    use crate::discovery::engine::inventory_coordinator::JointCommitProgress;
+    for frozen in [false, true] {
+        let mut fixture = MachineScene::new(1);
+        fixture
+            .scene
+            .push(std::process::id(), 0, "C_CreateObject", 1);
+        let old = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .published_revision();
+        let tails = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_engine_tail_stats();
+        let unprepared = if frozen {
+            for _ in 0..128 {
+                fixture.service(1).unwrap();
+                if fixture.scene.real.scene.coordinator.publication_pending() {
+                    break;
+                }
+            }
+            assert!(fixture.scene.real.scene.coordinator.publication_pending());
+            None
+        } else {
+            fixture.service(1).unwrap();
+            assert!(!fixture.scene.real.scene.coordinator.publication_pending());
+            Some(
+                fixture
+                    .machine
+                    .retained_raw_for_test()
+                    .unwrap()
+                    .h0_identity(),
+            )
+        };
+        fixture.machine.begin_commit(true).unwrap();
+        assert!(
+            fixture.machine.begin_commit(false).is_err(),
+            "a second request cannot replace the original demand"
+        );
+        if frozen {
+            fixture.published();
+            assert_eq!(
+                fixture
+                    .scene
+                    .real
+                    .scene
+                    .coordinator
+                    .registry()
+                    .published_revision(),
+                old + 1
+            );
+            assert!(
+                matches!(
+                    fixture.poll_commit(1).unwrap(),
+                    JointCommitProgress::Pending
+                ),
+                "the older actual publication cannot acknowledge the later request"
+            );
+        }
+        // Autonomous service may finish the demand, but cannot consume the
+        // requester's acknowledgement or allow a new request to replace it.
+        fixture.published();
+        assert!(fixture.machine.begin_commit(false).is_err());
+        let JointCommitProgress::Published(completion) = fixture.poll_commit(0).unwrap() else {
+            panic!("service must retain the actual receipt until the requester consumes it");
+        };
+        if let Some(original) = unprepared {
+            assert!(
+                fixture.native.preparations[0].0 == original,
+                "a request may bind to an old Raw only at its actual preparation"
+            );
+        }
+        assert_eq!(
+            completion.registry_published,
+            old + if frozen { 2 } else { 1 }
+        );
+        let after = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_engine_tail_stats();
+        assert_eq!(
+            after.0 + after.1 - tails.0 - tails.1,
+            if frozen { 2 } else { 1 }
+        );
+        assert_eq!(
+            fixture
+                .native
+                .preparations
+                .iter()
+                .map(|(_, changed)| *changed)
+                .collect::<Vec<_>>(),
+            if frozen {
+                vec![false, true]
+            } else {
+                vec![true]
+            }
+        );
+        assert!(
+            matches!(
+                fixture.poll_commit(1).unwrap(),
+                JointCommitProgress::Pending
+            ),
+            "a Published acknowledgement is consumed exactly once"
+        );
+    }
+
+    let mut fixture = MachineScene::new(1);
+    fixture
+        .scene
+        .push(std::process::id(), 0, "C_CreateObject", 1);
+    fixture.native.fail_after_preparation = true;
+    fixture.machine.begin_commit(true).unwrap();
+    let tails = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .reference_engine_tail_stats();
+    let mut failed = false;
+    for _ in 0..128 {
+        if fixture.service(1).is_err() {
+            failed = true;
+            break;
+        }
+    }
+    assert!(
+        failed,
+        "the real preparation is followed by the failed owned handoff"
+    );
+    assert!(fixture.scene.real.scene.coordinator.publication_pending());
+    let attempted = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .reference_engine_tail_stats();
+    assert_eq!(attempted.0 + attempted.1 - tails.0 - tails.1, 1);
+    assert_eq!(fixture.native.preparations.len(), 1);
+    let identity = fixture.native.preparations[0].0;
+    for _ in 0..3 {
+        assert!(fixture.service(8).is_err());
+        assert!(fixture.machine.begin_commit(false).is_err());
+        assert!(
+            fixture
+                .machine
+                .retained_raw_for_test()
+                .unwrap()
+                .h0_identity()
+                == identity
+        );
+        assert_eq!(
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .reference_engine_tail_stats(),
+            attempted
+        );
+        assert_eq!(fixture.native.preparations.len(), 1);
+    }
+}
+
 #[derive(Clone, Copy)]
 enum PublicationReceipts {
     All,

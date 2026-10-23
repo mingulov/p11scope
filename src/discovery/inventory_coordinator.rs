@@ -1015,6 +1015,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         &self.registry
     }
 
+    /// Observe the actual engine tail attempts without adding counters or
+    /// changing the publication path.
+    #[cfg(test)]
+    pub(crate) fn reference_engine_tail_stats(&self) -> (u64, u64) {
+        self.engine.tail_stats()
+    }
+
     /// Borrow the canonical capture owner without changing its model or
     /// ledger. Collected refresh checks original raw custody through this
     /// same ledger while independently reserving provider storage.

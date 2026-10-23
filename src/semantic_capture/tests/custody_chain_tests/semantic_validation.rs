@@ -362,6 +362,11 @@ impl CaptureIo for HeldIo {
         fence: u64,
         _: &dyn Fn() -> u64,
     ) -> Result<ImageScanProof, ImageQueryRefusal> {
+        // A selected refresh and a queued scan read the same failing native
+        // file. Neither may publish a proof while that leaf is unavailable.
+        if self.script.fail_file == Some(endpoint.file_slot) {
+            return Err(ImageQueryRefusal::Unstable);
+        }
         self.scan_proof(self.targets[&pin.pid()].1, endpoint, fence)
     }
 }

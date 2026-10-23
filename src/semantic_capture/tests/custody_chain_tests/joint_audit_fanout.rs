@@ -106,8 +106,11 @@ fn joint_first_real_birth_publishes_one_revision() {
         (PublicationReceipts::Missing, 0),
         (PublicationReceipts::Capacity(1), 1),
     ] {
-        let (mut fixture, original) =
-            CanonicalFanoutScene::first_publication_with_functions(1, &["C_CreateObject"], policy);
+        let (mut fixture, original) = CanonicalFanoutScene::first_publication_with_functions(
+            1,
+            &["C_CreateObject", "C_SignInit"],
+            policy,
+        );
         let coordinator = &fixture.scene.real.scene.coordinator;
         assert_eq!(coordinator.registry().joint_feeds(), 0);
         let old_revision = coordinator.registry().published_revision();
@@ -166,7 +169,7 @@ fn joint_publication_retry_does_not_repeat_admission_or_reducer() {
     };
     let (mut fixture, original) = CanonicalFanoutScene::first_publication_with_functions(
         1,
-        &["C_CreateObject"],
+        &["C_CreateObject", "C_SignInit"],
         PublicationReceipts::All,
     );
     let caller = fixture.births[0].0;
@@ -302,7 +305,7 @@ fn joint_publication_retry_does_not_repeat_admission_or_reducer() {
     }
     let (mut foreign, foreign_frame) = CanonicalFanoutScene::first_publication_with_functions(
         1,
-        &["C_CreateObject"],
+        &["C_CreateObject", "C_SignInit"],
         PublicationReceipts::All,
     );
     let mut foreign_frame = Some(foreign_frame);
@@ -427,7 +430,7 @@ fn joint_second_domain_fault_is_invisible_until_fanout() {
     use crate::inventory_present::Presentation;
     let (mut fixture, original) = CanonicalFanoutScene::first_publication_with_functions(
         1,
-        &["C_CreateObject"],
+        &["C_CreateObject", "C_SignInit"],
         PublicationReceipts::All,
     );
     let old_revision = fixture
@@ -502,7 +505,7 @@ fn joint_second_domain_fault_is_invisible_until_fanout() {
     // genuine localized negative proves that disjoint proved domains survive.
     let (mut fixture, first) = CanonicalFanoutScene::first_publication_with_functions(
         1,
-        &["C_CreateObject"],
+        &["C_CreateObject", "C_SignInit"],
         PublicationReceipts::All,
     );
     let first_revision = fixture

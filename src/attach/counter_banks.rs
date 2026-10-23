@@ -523,7 +523,10 @@ impl<'a> CounterPreparation<'a> {
     ) -> Result<Self> {
         ensure!(
             env!("P11SCOPE_COUNTER_BANK_PROOF_ENABLED") == "1"
-                && env!("P11SCOPE_COUNTER_BANK_PROOF_OUTPUTS") == "counts-bank-proof",
+                && matches!(
+                    env!("P11SCOPE_COUNTER_BANK_PROOF_OUTPUTS"),
+                    "counts-bank-proof"
+                ),
             "private Counts bank artifact was not selected at build time"
         );
         ensure!(

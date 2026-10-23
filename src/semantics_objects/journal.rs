@@ -3005,6 +3005,15 @@ pub(crate) enum DrainMintRefusal {
 }
 
 impl SessionDrainGrant {
+    /// Read-only association check. Inert TDD scaffolding refuses every
+    /// comparison until the actual Q readiness positive has run RED.
+    pub(crate) fn matches_producers(
+        &self,
+        _producers: &crate::attach::SessionDrainProducers,
+    ) -> bool {
+        false
+    }
+
     /// Mint the association through the Session retaining both the
     /// native and EVENTS identities: the admission is checked against
     /// THAT Session (its native domain must equal the retained one),

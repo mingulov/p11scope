@@ -2128,6 +2128,81 @@ pub(crate) struct SessionDrainProducers {
     events: events::EventsDomain,
 }
 
+/// Session-owned Q metadata. No constructor, Clone or Copy permits a caller
+/// to manufacture quiescence from ring positions or a terminal summary.
+/// Inert TDD scaffolding: the observer below cannot mint an instance yet.
+pub(crate) struct CollectedFinishQ {
+    producers: SessionDrainProducers,
+    discovery: events::DiscoveryDomain,
+    events: events::EventsConsumptionCut,
+    discovery_positions: aya::maps::ring_buf::RingBufPositions,
+    grant: Option<crate::semantics_objects::journal::SessionDrainGrant>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))] // Staged Q API; no machine/terminal consumer is active.
+impl CollectedFinishQ {
+    pub(crate) fn matches_owner(
+        &self,
+        _producers: &SessionDrainProducers,
+        _discovery: &events::DiscoveryDomain,
+    ) -> bool {
+        let _ = (&self.producers, &self.discovery);
+        false
+    }
+
+    pub(crate) fn matches_retained_grant(
+        &self,
+        _grant: &crate::semantics_objects::journal::SessionDrainGrant,
+    ) -> bool {
+        let _ = &self.grant;
+        false
+    }
+
+    pub(crate) fn events_stop(&self) -> usize {
+        let _ = &self.events;
+        0
+    }
+
+    pub(crate) fn discovery_stop(&self) -> usize {
+        self.discovery_positions.producer
+    }
+
+    pub(crate) fn covers_events_bounds(&self, _cut: &events::EventsConsumptionCut) -> bool {
+        false
+    }
+
+    pub(crate) fn events_at_bound(&self, _cut: &events::EventsConsumptionCut) -> bool {
+        false
+    }
+}
+
+/// Private borrowed view. Production supplies only the owning Session's
+/// retained fields; tests substitute the native read leaves beneath it.
+struct CollectedFinishQOwner<'a> {
+    gate: &'a StopGate,
+    producers: &'a SessionDrainProducers,
+    discovery: &'a events::DiscoveryDomain,
+    detach: &'a OwnedProducerDetach,
+}
+
+#[cfg_attr(not(test), allow(dead_code))] // Inert until the readiness positive has observed runtime RED.
+fn observe_collected_finish_q_with(
+    owner: CollectedFinishQOwner<'_>,
+    _expected: &SessionDrainProducers,
+    _grant: Option<&crate::semantics_objects::journal::SessionDrainGrant>,
+    _read_events: impl FnOnce() -> Result<events::EventsConsumptionCut>,
+    _read_discovery: impl FnOnce() -> Result<aya::maps::ring_buf::RingBufPositions>,
+) -> Result<Option<CollectedFinishQ>> {
+    let CollectedFinishQOwner {
+        gate,
+        producers,
+        discovery,
+        detach,
+    } = owner;
+    let _ = (gate, producers, discovery, detach);
+    Ok(None)
+}
+
 impl SessionDrainProducers {
     pub(crate) fn same_producers(&self, other: &Self) -> bool {
         self.native == other.native && self.events.same_allocation(&other.events)
@@ -4687,6 +4762,17 @@ impl Session {
     /// The session's stop-gate mapping.
     pub(crate) fn stop_gate(&self) -> &StopGate {
         &self.stop_gate
+    }
+
+    /// Inert staged port. Only the subsequent observer implementation may
+    /// construct Q from this Session's actual gate, domains and consumers.
+    #[allow(dead_code)] // No machine/terminal activation in this slice.
+    pub(crate) fn observe_collected_finish_q(
+        &mut self,
+        _expected: &SessionDrainProducers,
+        _grant: Option<&crate::semantics_objects::journal::SessionDrainGrant>,
+    ) -> Result<Option<CollectedFinishQ>> {
+        Ok(None)
     }
 
     /// Stamps attach completion with one CLOCK_MONOTONIC read (T2, G-14).

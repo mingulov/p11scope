@@ -730,6 +730,99 @@ fn d4_fixture_stamps(fixtures: &BuiltFixtures) -> Result<[FixtureFileStamp; 2], 
     Ok([stamp(&fixtures.provider_file)?, stamp(&fixtures.copy_file)?])
 }
 
+// None is population ineligibility, never a positive. Command/mode/shape
+// errors remain fatal before selection; an eligible capture uses the complete
+// strict oracle unchanged, so its failed assertion cannot become another cap.
+fn d4_attempt_projection(
+    fixtures: &BuiltFixtures,
+    observed: Option<&ObserveOutcome>,
+    backend: &str,
+) -> Result<Option<D4Projection>, String> {
+    let observed = observed.ok_or("command refused or failed")?;
+    let doc = &observed.doc;
+    let observation = doc["observation"]
+        .as_object()
+        .ok_or("missing observation")?;
+    let identity = observation
+        .get("identity")
+        .and_then(Value::as_object)
+        .ok_or("missing identity result")?;
+    if !matches!(backend, "userspace" | "kernel")
+        || !doc.is_object()
+        || doc["schema"] != "p11scope/inventory/v1"
+        || doc["scope"] != "system"
+        || identity.get("backend").and_then(Value::as_str) != Some(backend)
+        || identity.get("fallback") != Some(&Value::Null)
+        || observation.get("usage_feed") != Some(&Value::Bool(false))
+        || observation.contains_key("lane")
+    {
+        return Err("required scan backend refused, fell back or changed observation mode".into());
+    }
+    let valid_id = |value: &Value| value.as_str().is_some_and(|id| !id.is_empty());
+    for caller in doc["callers"].as_array().ok_or("missing callers")? {
+        if !caller.is_object()
+            || !valid_id(&caller["id"])
+            || !caller["pid"]
+                .as_u64()
+                .is_some_and(|pid| pid > 0 && u32::try_from(pid).is_ok())
+        {
+            return Err("malformed caller container".into());
+        }
+    }
+    for module in doc["modules"].as_array().ok_or("missing modules")? {
+        if !module.is_object()
+            || !valid_id(&module["id"])
+            || !module["paths"]
+                .as_array()
+                .is_some_and(|paths| paths.iter().all(Value::is_string))
+        {
+            return Err("malformed module container".into());
+        }
+    }
+    for edge in doc["edges"].as_array().ok_or("missing edges")? {
+        if !edge.is_object()
+            || !valid_id(&edge["caller"])
+            || !valid_id(&edge["module"])
+            || !edge["mapping"].is_object()
+            || !edge["mapping"]["state"].is_string()
+            || !edge["entries"].is_object()
+            || !edge["entries"]["observation"].is_string()
+            || !edge["entries"]["coverage"].is_object()
+            || !edge["entries"]["coverage"]["state"].is_string()
+        {
+            return Err("malformed edge container".into());
+        }
+    }
+    let roles = [
+        FixtureRole::H1,
+        FixtureRole::H2,
+        FixtureRole::H3,
+        FixtureRole::Copy,
+        FixtureRole::DataOnly,
+    ];
+    if observed.role_pids.len() != roles.len()
+        || roles
+            .iter()
+            .any(|role| !observed.role_pids.contains_key(role))
+        || observed.role_pids.values().any(|pid| *pid == 0)
+        || observed.role_pids.values().collect::<BTreeSet<_>>().len() != roles.len()
+    {
+        return Err("incomplete or duplicate independent fixture roles".into());
+    }
+    let holders =
+        [FixtureRole::H1, FixtureRole::H2, FixtureRole::H3].map(|role| observed.role_pids[&role]);
+    if observed.holder_pids != holders
+        || observed.copy_pid != Some(observed.role_pids[&FixtureRole::Copy])
+        || observed.dataonly_pid != Some(observed.role_pids[&FixtureRole::DataOnly])
+    {
+        return Err("independent role ledger disagrees with owned process population".into());
+    }
+    if !sweep_selection_qualifies(observed) {
+        return Ok(None);
+    }
+    d4_projection(fixtures, Some(observed), backend).map(Some)
+}
+
 fn d4_capture_leg(
     fixtures: &BuiltFixtures,
     backend: &str,
@@ -744,10 +837,7 @@ fn d4_capture_leg(
         args[index + 1] = backend.to_owned();
         let attempt = format!("d4-{backend}-{cap}");
         let observed = attempt_observe(fixtures, &attempt, "sweep", &args, cap, report_dir);
-        // A refusal/fallback/wrong edge fails immediately, including an attempt
-        // whose deep-scan versus swept population was not the selected shape.
-        let projection = d4_projection(fixtures, observed.as_ref(), backend)?;
-        if sweep_selection_qualifies(observed.as_ref().expect("validated observation")) {
+        if let Some(projection) = d4_attempt_projection(fixtures, observed.as_ref(), backend)? {
             return Ok(projection);
         }
     }
@@ -1915,5 +2005,120 @@ fn d4_fixture_range_parser_keeps_offsets_permissions_and_multiplicity() {
             "accepted {bad:?}"
         );
         assert_eq!(parse_fixture_ranges(maps, provider).unwrap().len(), 3);
+    }
+}
+
+#[test]
+fn d4_attempt_checks_eligibility_before_strict_projection() {
+    let (_dir, fixtures) = d4_control_fixtures();
+    for backend in ["userspace", "kernel"] {
+        let mut ineligible = d4_control_observation(&fixtures, backend, 1);
+        ineligible.selected = BTreeSet::from([1467, 1520]);
+        let mut ambient = ineligible.doc["callers"][0].clone();
+        ambient["pid"] = serde_json::json!(1467);
+        ineligible.doc["callers"] = serde_json::json!([ambient]);
+        ineligible.doc["modules"] = serde_json::json!([]);
+        ineligible.doc["edges"] = serde_json::json!([]);
+        assert!(
+            d4_attempt_projection(&fixtures, Some(&ineligible), backend)
+                .unwrap()
+                .is_none(),
+            "an ineligible zero-module capture reached the positive oracle"
+        );
+        let mut eligible = d4_control_observation(&fixtures, backend, 2);
+        let healthy = eligible.doc.clone();
+        let projected = d4_attempt_projection(&fixtures, Some(&eligible), backend)
+            .unwrap()
+            .expect("eligible complete population must reach the positive oracle");
+        assert_eq!(
+            projected.edges,
+            BTreeSet::from([FixtureRole::H1, FixtureRole::H2, FixtureRole::H3])
+        );
+        eligible.doc["edges"].as_array_mut().unwrap().remove(1);
+        assert!(
+            d4_attempt_projection(&fixtures, Some(&eligible), backend).is_err(),
+            "a qualifying missing-holder capture became a selection retry"
+        );
+        eligible.doc = healthy.clone();
+        eligible.doc["edges"][1]["caller"] = eligible.doc["callers"][3]["id"].clone();
+        assert!(
+            d4_attempt_projection(&fixtures, Some(&eligible), backend).is_err(),
+            "a qualifying wrong-edge capture became a selection retry"
+        );
+        eligible.doc = healthy;
+        assert!(
+            d4_attempt_projection(&fixtures, Some(&eligible), backend)
+                .unwrap()
+                .is_some()
+        );
+    }
+}
+
+#[test]
+fn d4_attempt_rejects_refusal_fallback_and_malformed_even_when_ineligible() {
+    let (_dir, fixtures) = d4_control_fixtures();
+    for backend in ["userspace", "kernel"] {
+        assert!(d4_attempt_projection(&fixtures, None, backend).is_err());
+        let mut ineligible = d4_control_observation(&fixtures, backend, 1);
+        ineligible.selected.clear();
+        ineligible.doc["callers"] = serde_json::json!([]);
+        ineligible.doc["modules"] = serde_json::json!([]);
+        ineligible.doc["edges"] = serde_json::json!([]);
+        let healthy = ineligible.doc.clone();
+        let mut fallback = healthy.clone();
+        fallback["observation"]["identity"]["fallback"] = serde_json::json!("fd_headroom");
+        let mut wrong_backend = healthy.clone();
+        wrong_backend["observation"]["identity"]["backend"] = serde_json::json!("other");
+        let mut missing_fallback = healthy.clone();
+        missing_fallback["observation"]["identity"]
+            .as_object_mut()
+            .unwrap()
+            .remove("fallback");
+        let mut bad_observation = healthy.clone();
+        bad_observation["observation"] = Value::Null;
+        let mut bad_callers = healthy.clone();
+        bad_callers["callers"] = serde_json::json!({});
+        let mut bad_modules = healthy.clone();
+        bad_modules["modules"] = serde_json::json!({});
+        let mut bad_edges = healthy.clone();
+        bad_edges["edges"] = serde_json::json!({});
+        let mut bad_caller_row = healthy.clone();
+        bad_caller_row["callers"] = serde_json::json!([null]);
+        let mut bad_module_paths = healthy.clone();
+        bad_module_paths["modules"] = serde_json::json!([{"id": "m0", "paths": {}}]);
+        let mut bad_edge_mapping = healthy.clone();
+        bad_edge_mapping["edges"] = serde_json::json!([{
+            "caller": "c0", "module": "m0", "mapping": null,
+            "entries": {"observation": "unknown", "coverage": {"state": "unknown"}},
+        }]);
+        for (name, malformed) in [
+            ("fallback", fallback),
+            ("wrong backend", wrong_backend),
+            ("missing fallback", missing_fallback),
+            ("missing observation", bad_observation),
+            ("non-array callers", bad_callers),
+            ("non-array modules", bad_modules),
+            ("non-array edges", bad_edges),
+            ("non-object caller", bad_caller_row),
+            ("non-array module paths", bad_module_paths),
+            ("non-object edge mapping", bad_edge_mapping),
+        ] {
+            ineligible.doc = malformed;
+            assert!(
+                d4_attempt_projection(&fixtures, Some(&ineligible), backend).is_err(),
+                "{name} was hidden by an ineligible population"
+            );
+            ineligible.doc = healthy.clone();
+            assert!(
+                d4_attempt_projection(&fixtures, Some(&ineligible), backend)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        ineligible.role_pids.remove(&FixtureRole::DataOnly);
+        assert!(
+            d4_attempt_projection(&fixtures, Some(&ineligible), backend).is_err(),
+            "a missing independent role was hidden by eligibility"
+        );
     }
 }

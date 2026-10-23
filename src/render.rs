@@ -2642,7 +2642,7 @@ pub fn profile_json(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use p11scope_ebpf_common::{LATENCY_BUCKETS, shape};
+    use p11scope_ebpf_common::{CounterMode, LATENCY_BUCKETS, shape};
 
     /// One evidence mutation for the table-driven gate pins below.
     type EvidenceMutation = fn(&mut Evidence);
@@ -2674,6 +2674,7 @@ pub(crate) mod tests {
             module: None,
             module_ambiguous: false,
             module_unresolved: false,
+            mode: CounterMode::Latency,
             calls,
             errors: 0,
             in_flight,
@@ -2681,6 +2682,118 @@ pub(crate) mod tests {
             max_ns: 0,
             buckets: [0; LATENCY_BUCKETS],
             rv_counts: Default::default(),
+        }
+    }
+
+    #[test]
+    fn counter_modes_render_their_timing_availability() {
+        use p11scope_ebpf_common::bucket_of;
+        for (mode, latency) in [
+            (CounterMode::Counts, serde_json::Value::Null),
+            (
+                CounterMode::Timestamps,
+                serde_json::json!({
+                    "approximate": false, "p50": null, "p95": null, "p99": null,
+                    "total": 2_500, "max": 100,
+                }),
+            ),
+            (
+                CounterMode::Latency,
+                serde_json::json!({
+                    "approximate": true, "p50": 64, "p95": 64, "p99": 64,
+                    "total": 2_500, "max": 100,
+                }),
+            ),
+        ] {
+            let mut row = report("C_Sign", 25, 2, false);
+            row.mode = mode;
+            row.errors = 3;
+            row.total_ns = 2_500;
+            row.max_ns = 100;
+            row.buckets[bucket_of(100) as usize] = 25;
+            row.rv_counts.insert(0, 22);
+            row.rv_counts.insert(5, 3);
+            let output = json(&[row], &evidence(), &capture_fixture());
+            let functions = output["functions"].as_array().unwrap();
+            assert_eq!(functions.len(), 1);
+            assert_eq!(functions[0]["latency_ns"], latency, "{mode:?}");
+            assert_eq!(functions[0]["calls"], 25);
+            assert_eq!(functions[0]["errors"], 3);
+            assert_eq!(functions[0]["in_flight"], 2);
+            assert_eq!(
+                functions[0]["rv_counts"],
+                serde_json::json!({"0x0000000000000000": 22, "0x0000000000000005": 3})
+            );
+        }
+    }
+
+    #[test]
+    fn counter_timing_ignores_unavailable_fields_and_preserves_measured_zero() {
+        use p11scope_ebpf_common::bucket_of;
+        let mut row = report("C_Sign", 25, 0, false);
+        row.mode = CounterMode::Counts;
+        row.total_ns = u64::MAX;
+        row.max_ns = u64::MAX;
+        row.buckets[bucket_of(100) as usize] = 25;
+        assert!(
+            json(&[row.clone()], &evidence(), &capture_fixture())["functions"][0]["latency_ns"]
+                .is_null()
+        );
+
+        row.mode = CounterMode::Timestamps;
+        row.total_ns = 0;
+        row.max_ns = 0;
+        assert_eq!(
+            json(&[row.clone()], &evidence(), &capture_fixture())["functions"][0]["latency_ns"],
+            serde_json::json!({
+                "approximate": false, "p50": null, "p95": null, "p99": null,
+                "total": 0, "max": 0,
+            })
+        );
+
+        row.mode = CounterMode::Latency;
+        row.buckets = [0; LATENCY_BUCKETS];
+        row.buckets[0] = 25;
+        assert_eq!(
+            json(&[row], &evidence(), &capture_fixture())["functions"][0]["latency_ns"],
+            serde_json::json!({
+                "approximate": true, "p50": 0, "p95": 0, "p99": 0,
+                "total": 0, "max": 0,
+            })
+        );
+    }
+
+    #[test]
+    fn human_counter_percentiles_follow_capability_with_poisoned_buckets() {
+        use p11scope_ebpf_common::bucket_of;
+        for (mode, expected) in [
+            (CounterMode::Counts, "—"),
+            (CounterMode::Timestamps, "—"),
+            (CounterMode::Latency, "64ns"),
+        ] {
+            let mut row = report("C_Sign", 25, 2, false);
+            row.mode = mode;
+            row.errors = 3;
+            row.buckets[bucket_of(100) as usize] = 25;
+            let output = live(
+                &[row],
+                &evidence(),
+                Duration::from_secs(1),
+                "/owned/provider.so",
+                "metrics",
+                CapturePolicy::AggregateOnly,
+            );
+            let fields: Vec<_> = output
+                .lines()
+                .find(|line| line.starts_with("C_Sign "))
+                .unwrap()
+                .split_whitespace()
+                .collect();
+            assert_eq!(
+                fields,
+                ["C_Sign", "25", "3", expected, expected, expected, "2"],
+                "{mode:?}"
+            );
         }
     }
 

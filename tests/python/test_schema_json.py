@@ -176,6 +176,33 @@ class SchemaOracleAgreement(unittest.TestCase):
             CHECKER["MAX_FUNCTION_ORDINALS"],
         )
 
+    def test_function_timing_availability_has_three_closed_shapes(self):
+        row = SCHEMA["properties"]["functions"]["items"]["properties"]
+        self.assertIn("latency_ns", row, "function timing needs an explicit consumer contract")
+        shapes = row["latency_ns"]["oneOf"]
+        self.assertEqual(len(shapes), 3)
+        self.assertIn({"type": "null"}, shapes)
+        objects = [shape for shape in shapes if shape.get("type") == "object"]
+        self.assertEqual(len(objects), 2)
+        by_approximation = {shape["properties"]["approximate"]["const"]: shape
+                            for shape in objects}
+        self.assertEqual(set(by_approximation), {True, False})
+        fields = {"approximate", "p50", "p95", "p99", "total", "max"}
+        for approximate, shape in by_approximation.items():
+            with self.subTest(approximate=approximate):
+                self.assertFalse(shape["additionalProperties"])
+                self.assertEqual(set(shape["required"]), fields)
+                self.assertEqual(set(shape["properties"]), fields)
+                for field in ("total", "max"):
+                    self.assertEqual(shape["properties"][field],
+                                     {"type": "integer", "minimum": 0, "maximum": 2**64 - 1})
+                for field in ("p50", "p95", "p99"):
+                    self.assertEqual(
+                        shape["properties"][field],
+                        {"type": ["integer", "null"], "minimum": 0, "maximum": 2**64 - 1}
+                        if approximate else {"type": "null"},
+                    )
+
     def test_pid_namespace_shape_matches_oracle(self):
         """`evidence.pid_namespace` is the oracle's closed object (DR-K8S-2)."""
         pidns = evidence_schema()["properties"]["pid_namespace"]

@@ -578,27 +578,40 @@ impl MachineScene {
 #[test]
 fn joint_machine_begin_prefix_crosses_1024_before_real_end() {
     let mut fixture = MachineScene::new(1);
+    fixture.scene.drain.source_mut().bound = 1_025;
     let pid = std::process::id();
-    let mut first_end = None;
-    for sequence in 1..=1_024 {
-        let (begin, end) = fixture.scene.encoded(pid, 0, "C_CreateObject", sequence);
-        fixture.scene.drain.source_mut().push_record(begin.to_vec());
-        if sequence == 1 {
-            first_end = Some(end);
-        }
-    }
-    fixture
-        .scene
-        .drain
-        .source_mut()
-        .push_record(first_end.unwrap().to_vec());
+    let (begin, first_end) = fixture.scene.encoded(pid, 0, "C_CreateObject", 1);
+    fixture.scene.drain.source_mut().push_record(begin.to_vec());
     fixture.service(1).unwrap();
     let identity = fixture
         .machine
         .retained_raw_for_test()
         .unwrap()
         .h0_identity();
-    fixture.service(1_024).unwrap();
+    // The actual scripted ring holds512 records. Stream through that same
+    // producer/cursor in bounded chunks rather than invent an overfull cut.
+    for chunk in (2..=1_024).collect::<Vec<_>>().chunks(256) {
+        for sequence in chunk {
+            let (begin, _) = fixture.scene.encoded(pid, 0, "C_CreateObject", *sequence);
+            fixture.scene.drain.source_mut().push_record(begin.to_vec());
+        }
+        fixture.service(chunk.len()).unwrap();
+        assert_eq!(fixture.scene.drain.source_mut().remaining(), 0);
+        assert!(
+            fixture
+                .machine
+                .retained_raw_for_test()
+                .unwrap()
+                .h0_identity()
+                == identity
+        );
+    }
+    fixture
+        .scene
+        .drain
+        .source_mut()
+        .push_record(first_end.to_vec());
+    fixture.service(1).unwrap();
     let raw = fixture.machine.retained_raw_for_test().unwrap();
     assert!(raw.h0_identity() == identity);
     assert_eq!(
@@ -628,18 +641,37 @@ fn joint_machine_begin_prefix_crosses_1024_before_real_end() {
 #[test]
 fn joint_machine_full_raw_capacity_preserves_n_plus_one() {
     let mut fixture = MachineScene::new(1);
-    for sequence in 1..=4_097 {
-        let (begin, _) = fixture
-            .scene
-            .encoded(std::process::id(), 0, "C_CreateObject", sequence);
-        fixture.scene.drain.source_mut().push_record(begin.to_vec());
+    fixture.scene.drain.source_mut().bound = 4_097;
+    let mut identity = None;
+    for chunk in (1..=4_096).collect::<Vec<_>>().chunks(256) {
+        for sequence in chunk {
+            let (begin, _) =
+                fixture
+                    .scene
+                    .encoded(std::process::id(), 0, "C_CreateObject", *sequence);
+            fixture.scene.drain.source_mut().push_record(begin.to_vec());
+        }
+        assert_eq!(
+            fixture.service(chunk.len()).unwrap(),
+            crate::inventory_semantics::JointServiceProgress::Pending
+        );
+        assert_eq!(fixture.scene.drain.source_mut().remaining(), 0);
+        let actual = fixture
+            .machine
+            .retained_raw_for_test()
+            .unwrap()
+            .h0_identity();
+        if let Some(first) = identity {
+            assert!(first == actual);
+        } else {
+            identity = Some(actual);
+        }
     }
-    fixture.service(4_096).unwrap();
-    let identity = fixture
-        .machine
-        .retained_raw_for_test()
-        .unwrap()
-        .h0_identity();
+    let identity = identity.unwrap();
+    let (next, _) = fixture
+        .scene
+        .encoded(std::process::id(), 0, "C_CreateObject", 4_097);
+    fixture.scene.drain.source_mut().push_record(next.to_vec());
     assert_eq!(fixture.scene.drain.source_mut().remaining(), 1);
     let boundary = fixture.scene.drain.consumption_cut().unwrap();
     let coordinator = &fixture.scene.real.scene.coordinator;

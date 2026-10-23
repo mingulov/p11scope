@@ -59,6 +59,128 @@ fn counter_artifact_path(name: &str) -> PathBuf {
         .join(name)
 }
 
+fn counter_bank_proof_path() -> PathBuf {
+    assert_eq!(env!("P11SCOPE_COUNTER_BANK_PROOF_ENABLED"), "1");
+    assert_eq!(env!("P11SCOPE_COUNTER_BANK_PROOF_OUTPUTS"), "counts-bank-proof");
+    Path::new(env!("OUT_DIR"))
+        .join("counter-bank-proof")
+        .join("p11scope-ebpf-counts-bank-proof")
+}
+
+fn counter_bank_proof_check(path: &Path, mutants: bool) -> std::process::Output {
+    let mut command = Command::new("python3");
+    command.args([
+        "-I",
+        "scripts/check-counter-object.py",
+        "--mode",
+        "counts",
+        "--profile",
+        "counts-bank-proof",
+    ]);
+    if mutants {
+        command.arg("--self-test-mutants");
+    }
+    command.arg(path).output().expect("run bank proof checker")
+}
+
+#[test]
+fn counter_bank_proof_build_selection_matches_emitted_contract() {
+    let requested = match option_env!("P11SCOPE_COUNTER_BANK_PROOF") {
+        None | Some("0") => false,
+        Some("1") => true,
+        other => panic!("malformed private counter bank request {other:?}"),
+    };
+    assert_eq!(
+        env!("P11SCOPE_COUNTER_BANK_PROOF_ENABLED"),
+        if requested { "1" } else { "0" }
+    );
+    assert_eq!(
+        env!("P11SCOPE_COUNTER_BANK_PROOF_OUTPUTS"),
+        if requested { "counts-bank-proof" } else { "" },
+        "disabled metadata must refuse stale proof output"
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let ordinary = embedded_object(directory.path());
+    let result = counter_bank_proof_check(&ordinary, false);
+    assert_eq!(result.status.code(), Some(2), "Detailed passed as a bank proof");
+    assert!(String::from_utf8_lossy(&result.stderr).contains("counter object refused:"));
+    if requested {
+        let proof = std::fs::read(counter_bank_proof_path()).unwrap();
+        assert_ne!(proof, p11scope::EBPF_OBJECT);
+    }
+}
+
+#[test]
+#[ignore = "requires P11SCOPE_COUNTER_BANK_PROOF=1 in its own build configuration"]
+fn counter_bank_proof_has_exact_routes_and_start_ownership() {
+    let output = counter_bank_proof_check(&counter_bank_proof_path(), false);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["schema"], "p11scope-counter-bank-object/v1");
+    assert_eq!(report["logical_slots"], serde_json::json!([0, 1]));
+    assert_eq!(report["native_owner_slot_bound"], 512);
+    assert_eq!(report["maps"]["COUNTER_BANKS"]["type"], 13);
+    assert_eq!(report["maps"]["COUNTER_BANKS"]["max_entries"], 2);
+    assert_eq!(report["inner_template"]["type"], 6);
+    assert_eq!(report["inner_template"]["key_size"], 4);
+    assert_eq!(report["inner_template"]["value_size"], 24);
+    assert_eq!(report["inner_template"]["max_entries"], 1);
+    assert_eq!(report["maps"]["START"]["max_entries"], 16_384);
+    assert_eq!(report["maps"]["RV_COUNTS"]["max_entries"], 4_096);
+    assert_eq!(report["ordinary_counter_profile"], "refused");
+    for root in ["p11_counter_bank_entry", "p11_counter_bank_return"] {
+        assert!(report["roots"][root]["stack_chain"].as_u64().unwrap() <= 512);
+        assert_eq!(report["roots"][root]["clocks"], 0);
+        assert_eq!(report["roots"][root]["semantic_or_event_work"], false);
+    }
+    for name in [
+        "inactive_entry", "precommit_return_after_commit",
+        "absent_return_preserves_other_start", "absent_return_preserves_lost_debt",
+        "old_bank_keeps_original_transaction", "missing_route_retires_start",
+        "failed_retirement_keeps_debt", "full_width_transaction",
+    ] {
+        assert_eq!(report["controls"][name], "accepted", "{name}");
+    }
+}
+
+#[test]
+#[ignore = "requires P11SCOPE_COUNTER_BANK_PROOF=1 in its own build configuration"]
+fn counter_bank_proof_mutations_are_causally_rejected() {
+    let output = counter_bank_proof_check(&counter_bank_proof_path(), true);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let mutants = report["mutants"].as_object().unwrap();
+    for name in [
+        "inner_value_width", "inner_cell_count", "outer_type", "logical_index",
+        "commit_gate", "commit_set", "transaction_width", "optional_start_get",
+        "required_start_remove", "missing_start_get", "missing_start_remove",
+        "route_fault", "endpoint_clock", "semantic_helper", "unknown_call",
+    ] {
+        assert_eq!(mutants.get(name), Some(&serde_json::json!("refused")), "{name}");
+    }
+}
+
+/// This explicit positive creates only owned anonymous maps and loads the
+/// two proof programs. It does not attach, publish a route or run a workload.
+#[test]
+#[ignore = "requires explicit counter bank build and authorized BTF/map/program-load lane"]
+fn counter_bank_proof_btf_maps_and_programs_load() {
+    let path = counter_bank_proof_path();
+    let output = counter_bank_proof_check(&path, false);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let mut object = aya::EbpfLoader::new().load_file(path).expect("load bank BTF and maps");
+    let banks = object.map("COUNTER_BANKS").expect("real outer map");
+    let _: aya::maps::HashOfMaps<_, u32> = banks.try_into().expect("real HashOfMaps ABI");
+    for name in ["p11_counter_bank_entry", "p11_counter_bank_return"] {
+        let program: &mut aya::programs::UProbe = object
+            .program_mut(name)
+            .expect("proof root")
+            .try_into()
+            .expect("uprobe program kind");
+        program.load().expect("actual outer-to-inner verifier bridge");
+    }
+}
+
 fn counter_artifact_check(mode: &str, object: &Path, mutants: bool) -> std::process::Output {
     let mut command = Command::new("python3");
     command

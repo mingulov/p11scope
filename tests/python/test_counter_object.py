@@ -47,6 +47,38 @@ class CounterObjectCliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("unrecognized arguments: --self-test-m", result.stderr)
 
+    def test_bank_proof_profile_is_explicit_and_counts_only(self):
+        result = self.invoke("--profile", "counts-bank-proof", "--mode", "counts", "missing.o")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("counter object refused:", result.stderr)
+        for mode in ("timestamps", "latency"):
+            with self.subTest(mode=mode):
+                result = self.invoke("--profile", "counts-bank-proof", "--mode", mode,
+                                     "missing.o")
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("bank proof requires counts", result.stderr)
+        result = self.invoke("--self-test", "--profile", "counts-bank-proof")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--self-test accepts no other arguments", result.stderr)
+
+    def test_bank_proof_controls_preserve_inactive_and_owned_return_boundaries(self):
+        result = self.invoke("--self-test-bank-proof")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["schema"], "p11scope-counter-bank-controls/v1")
+        controls = report["controls"]
+        for name in ("inactive_entry", "precommit_return_after_commit",
+                     "absent_return_preserves_other_start", "absent_return_preserves_lost_debt",
+                     "old_bank_keeps_original_transaction", "missing_route_retires_start",
+                     "failed_retirement_keeps_debt", "full_width_transaction"):
+            self.assertEqual(controls[name], "accepted", name)
+        for arguments in (("--mode", "counts"), ("missing.o",),
+                          ("--profile", "counts-bank-proof"), ("--self-test-mutants",)):
+            with self.subTest(arguments=arguments):
+                result = self.invoke("--self-test-bank-proof", *arguments)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("--self-test-bank-proof accepts no other arguments", result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

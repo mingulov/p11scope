@@ -158,11 +158,16 @@ class CounterObjectCliTests(unittest.TestCase):
                 self.assertEqual(proof.native_bound, expected)
                 self.assertEqual(proof.guards, {(key, 2, "shift", shift)})
         for shift, expected, offset in ((9, 8192, 8), (13, 512, 8),
-                                         (12, 8192, 8), (14, 8192, 8), (13, 8192, 0)):
+                                         (12, 8192, 8), (14, 8192, 8), (13, 8192, 0),
+                                         (-1, 8192, 8), (63, 8192, 8), (77, 8192, 8)):
             with self.subTest(shift=shift, expected=expected, offset=offset):
                 with self.assertRaises(RuntimeError):
                     checker["native_owner_bound"](
                         Graph(shift, offset), {}, expected_bound=expected)
+        truncated = Graph(13)
+        truncated.instructions[key][2] = (0x56, 2, 1, 0)
+        with self.assertRaises(RuntimeError):
+            checker["native_owner_bound"](truncated, {}, expected_bound=8192)
 
     def test_bank_endpoint_cannot_inherit_cleanup_loop_helper_permission(self):
         checker = runpy.run_path(str(CHECKER), run_name="counter_endpoint_helper_test")
@@ -177,6 +182,62 @@ class CounterObjectCliTests(unittest.TestCase):
         checker["BankFootprint"](Graph(14), {}).run(key, [None] * 5)
         with self.assertRaisesRegex(RuntimeError, "forbidden/unknown helper 181"):
             checker["BankFootprint"](Graph(181), {}).run(key, [None] * 5)
+
+    def test_bank_native_bound_mutants_change_the_tagged_guard_producer(self):
+        checker = runpy.run_path(str(CHECKER), run_name="counter_owner_mutant_test")
+        key = (1, 0)
+        instructions = [(0x79, 0x12, 8, 0), (0x77, 2, 0, 13),
+                        (0x55, 2, 1, 0), (0xb7, 0, 0, 1), (0x95, 0, 0, 0)]
+        body = b"".join(struct.pack("<BBhi", *row) for row in instructions)
+
+        class Graph:
+            def __init__(self, raw):
+                self.instructions = {key: {at // 8: struct.unpack_from("<BBhi", raw, at)
+                                           for at in range(0, len(raw), 8)}}
+                self.loops, self.calls, self.bodies = {key: {}}, {}, {key: ("owner_mutant",)}
+
+            @staticmethod
+            def only(name):
+                if name != "p11_owner_start_aggregate":
+                    raise RuntimeError("unexpected owner-mutant callee")
+                return key
+
+            @staticmethod
+            def file_offset(function, pc):
+                if function != key:
+                    raise RuntimeError("unexpected owner-mutant function")
+                return pc * 8
+
+        graph = Graph(body)
+        proof = checker["native_owner_bound"](graph, {}, expected_bound=8192)
+        mutants = checker["bank_owner_bound_mutants"](body, graph, proof)
+        self.assertEqual(set(mutants), {"native_owner_slot_bound", "missing_native_owner_slot_bound",
+                                       "legacy_native_owner_slot_bound"})
+        self.assertEqual(struct.unpack_from("<BBhi", mutants["native_owner_slot_bound"], 8),
+                         (0x77, 2, 0, 12))
+        self.assertEqual(struct.unpack_from("<BBhi", mutants["legacy_native_owner_slot_bound"], 8),
+                         (0x77, 2, 0, 9))
+        for label, changed in mutants.items():
+            with self.subTest(mutant=label):
+                self.assertNotEqual(changed, body)
+                with self.assertRaises(RuntimeError):
+                    checker["native_owner_bound"](Graph(changed), {}, expected_bound=8192)
+        legacy = Graph(mutants["legacy_native_owner_slot_bound"])
+        self.assertEqual(checker["native_owner_bound"](legacy, {}).native_bound, 512)
+        direct = [(0x61, 0x12, 8, 0), (0x25, 2, 1, 8191),
+                  (0xb7, 0, 0, 1), (0x95, 0, 0, 0)]
+        body = b"".join(struct.pack("<BBhi", *row) for row in direct)
+        graph = Graph(body)
+        proof = checker["native_owner_bound"](graph, {}, expected_bound=8192)
+        mutants = checker["bank_owner_bound_mutants"](body, graph, proof)
+        self.assertEqual(struct.unpack_from("<BBhi", mutants["native_owner_slot_bound"], 8),
+                         (0x25, 2, 1, 8190))
+        self.assertEqual(struct.unpack_from("<BBhi", mutants["legacy_native_owner_slot_bound"], 8),
+                         (0x25, 2, 1, 511))
+        for label, changed in mutants.items():
+            with self.subTest(direct_mutant=label):
+                with self.assertRaises(RuntimeError):
+                    checker["native_owner_bound"](Graph(changed), {}, expected_bound=8192)
 
     def test_bank_template_decoder_is_scoped_and_refuses_wrong_inner_shapes(self):
         checker = runpy.run_path(str(CHECKER), run_name="counter_template_test")

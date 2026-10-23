@@ -577,9 +577,13 @@ class MemoryProof:
     being silently treated as an unrelated pointer.
     """
 
-    def __init__(self, graph, maps, strict=True):
+    def __init__(self, graph, maps, strict=True, *, native_bound=512):
+        if type(native_bound) is not int or native_bound not in (512, 8192):
+            raise RuntimeError("unsupported explicit native owner slot bound")
         self.graph, self.maps, self.strict = graph, maps, strict
+        self.native_bound = native_bound
         self.touches, self.health, self.guards = set(), set(), set()
+        self.guard_sources = {}
         self.frames = {}
         self.steps = 0
 
@@ -714,13 +718,15 @@ class MemoryProof:
             tag = left[1]
             if tag in ("key_slot", "key_slot_pad") and operation in (0x20, 0x30, 0xa0, 0xb0):
                 bound = immediate + (1 if operation in (0x20, 0xb0) else 0)
-                if bound != 512:
-                    raise RuntimeError("native owner slot bound differs from STATS512")
+                if bound != self.native_bound:
+                    raise RuntimeError(f"native owner slot bound differs from expected {self.native_bound}")
                 self.guards.add((key, pc, "immediate", immediate))
             if isinstance(tag, tuple) and tag[0] == "key_shift" and operation in (0x10, 0x50) and immediate == 0:
-                if tag[1] != 9:
-                    raise RuntimeError("native owner shifted slot bound differs from STATS512")
-                self.guards.add((key, pc, "shift", 9))
+                if tag[1] != self.native_bound.bit_length() - 1:
+                    raise RuntimeError(f"native owner shifted slot bound differs from expected {self.native_bound}")
+                self.guards.add((key, pc, "shift", tag[1]))
+                if len(tag) == 3:
+                    self.guard_sources[key, pc] = tag[2]
         return operation
 
     @staticmethod
@@ -849,7 +855,12 @@ class MemoryProof:
                     else:
                         registers[destination] = None
                 else:
-                    registers[destination] = scalar_alu(left, right, operation, bits)
+                    value = scalar_alu(left, right, operation, bits)
+                    if operation == 0x70 and isinstance(value[1], tuple) and value[1][0] == "key_shift":
+                        # Keep the actual producing instruction for causal
+                        # bound mutants; never select an unrelated same-size shift.
+                        value = scalar(value[2], value[3], value[1] + ((key, pc),))
+                    registers[destination] = value
             elif op & 7 in (5, 6):
                 if op & 0xf0 == 0:
                     enqueue(pc + 1 + (immediate if op == 0x06 else offset), (registers, memory))
@@ -893,11 +904,11 @@ class MemoryProof:
         return returned, {address: value for address, value in memory.items() if address[0] != frame}
 
 
-def native_owner_bound(graph, maps):
-    proof = MemoryProof(graph, maps, strict=False)
+def native_owner_bound(graph, maps, *, expected_bound=512):
+    proof = MemoryProof(graph, maps, strict=False, native_bound=expected_bound)
     proof.run(graph.only("p11_owner_start_aggregate"), [("key", 0), scalar(), None, None, None])
     if not proof.guards:
-        raise RuntimeError("native aggregate constructor has no proven 512-slot key guard")
+        raise RuntimeError(f"native aggregate constructor has no proven {expected_bound}-slot key guard")
     return proof
 
 
@@ -1145,7 +1156,7 @@ def validate(body, mode):
     result = {
         "schema": SCHEMA,
         "mode": mode,
-        "native_owner_slot_bound": 512,
+        "native_owner_slot_bound": owner.native_bound,
         "maps": {name: {field: maps[name][field] for field in
                          ("type", "key_size", "value_size", "max_entries")}
                  for name in expected},
@@ -1908,7 +1919,7 @@ def validate_bank_proof(body):
         raise RuntimeError("bank proof carries global data")
     validate_counter_owner_helpers(graph.elf)
     bank_global_abi(graph)
-    owner = native_owner_bound(graph, maps)
+    owner = native_owner_bound(graph, maps, expected_bound=8192)
     proof_maps = {**maps, "COUNTER_BANK_VALUE": MAPS.map_def(6, 4, 24, 1)}
     roots, frames, seed_sites = {}, dict(owner.frames), set()
     for name, section in BANK_ROOTS.items():
@@ -1929,7 +1940,7 @@ def validate_bank_proof(body):
                 if (instruction[0] == 0x18
                         and graph.map_at(key, pc) in FORBIDDEN_ENDPOINT_MAPS):
                     raise RuntimeError("Counts bank root reaches semantic/event storage")
-        proof = BankFootprint(graph, proof_maps)
+        proof = BankFootprint(graph, proof_maps, native_bound=8192)
         proof.run(root, [("external", "ctx", 0), None, None, None, None])
         if name.endswith("entry"):
             seed_sites = {touch[:2] for touch in proof.touches
@@ -1954,10 +1965,11 @@ def validate_bank_proof(body):
     else:
         raise RuntimeError("bank proof is accepted by the ordinary fixed counter profile")
     report = {"schema": "p11scope-counter-bank-object/v1", "logical_slots": [0, 1],
-              "native_owner_slot_bound": 512, "maps": {name: maps[name] for name in expected},
+              "native_owner_slot_bound": owner.native_bound,
+              "maps": {name: maps[name] for name in expected},
               "inner_template": maps["COUNTER_BANKS"]["inner_template"], "roots": roots,
               "controls": controls, "ordinary_counter_profile": "refused"}
-    return report, (graph, executions, optional_get, seed_sites)
+    return report, (graph, executions, optional_get, seed_sites, owner)
 
 
 def bank_btf_mutant(body, graph, name, field, wanted, *, inner=False):
@@ -1995,13 +2007,49 @@ def bank_btf_mutant(body, graph, name, field, wanted, *, inner=False):
     return bytes(changed)
 
 
+def bank_owner_bound_mutants(body, graph, owner):
+    """Damage every actual tagged guard, including its producing shift."""
+    if owner.native_bound != 8192:
+        raise RuntimeError("bank owner mutants require the validated private 8192 bound")
+    changes = {name: {} for name in ("native_owner_slot_bound", "missing_native_owner_slot_bound",
+                                     "legacy_native_owner_slot_bound")}
+    for key, pc, kind, value in sorted(owner.guards):
+        instruction = graph.instructions[key][pc]
+        changes["missing_native_owner_slot_bound"][key, pc] = (0xbf, 0, 0, 0)
+        if kind == "immediate":
+            legacy = 511 if instruction[0] & 0xf0 in (0x20, 0xb0) else 512
+            changes["native_owner_slot_bound"][key, pc] = instruction[:3] + (value - 1,)
+            changes["legacy_native_owner_slot_bound"][key, pc] = instruction[:3] + (legacy,)
+        elif kind == "shift":
+            source = owner.guard_sources.get((key, pc))
+            if source is None:
+                raise RuntimeError("native owner guard lost its actual shift producer")
+            shift = graph.instructions[source[0]][source[1]]
+            if shift[0] not in (0x74, 0x77) or shift[2:] != (0, value):
+                raise RuntimeError("native owner guard has no exact immediate shift producer")
+            changes["native_owner_slot_bound"][source] = shift[:3] + (value - 1,)
+            changes["legacy_native_owner_slot_bound"][source] = shift[:3] + (9,)
+        else:
+            raise RuntimeError("unclassified native owner bound guard")
+    mutants = {}
+    for name, sites in changes.items():
+        if not sites:
+            raise RuntimeError("native owner bound mutant has no actual guard")
+        changed = body
+        for (key, pc), instruction in sorted(sites.items()):
+            changed = mutated_instruction(changed, graph, key, pc, instruction)
+        mutants[name] = changed
+    return mutants
+
+
 def bank_causal_mutants(body):
-    report, (graph, executions, optional_get, seed_sites) = validate_bank_proof(body)
+    report, (graph, executions, optional_get, seed_sites, owner) = validate_bank_proof(body)
     mutants = {
         "inner_value_width": bank_btf_mutant(body, graph, "COUNTER_BANKS", "value_bytes", 40, inner=True),
         "inner_cell_count": bank_btf_mutant(body, graph, "COUNTER_BANKS", "max_entries", 2, inner=True),
         "outer_type": bank_btf_mutant(body, graph, "COUNTER_BANKS", "type", 2),
     }
+    mutants.update(bank_owner_bound_mutants(body, graph, owner))
     symbol_index = next(index for index, symbol in enumerate(graph.elf.symbols)
                         if symbol[0] == "p11_bank_enter")
     changed = bytearray(body)

@@ -64,6 +64,7 @@ ROOT = Path(__file__).resolve().parents[1]
 WEIGHTS = ROOT / "scripts" / "ci-test-weights.json"
 SHARDED_TARGET = "artifact_contracts"
 SUBCOMMANDS = ("test", "llvm-cov")
+MAX_COVERAGE_OBJECT_BYTES = 256 * 1024 * 1024
 # Selectors the partition owns. A command that already narrows the selection
 # would be narrowed twice, and the union would no longer be the gate.
 FORBIDDEN = {
@@ -336,8 +337,15 @@ def coverage_objects(debug_dir):
             continue
         if path.suffix in (".d", ".rlib", ".rmeta", ".so") or path.is_symlink():
             continue
-        if path.is_file() and os.stat(path).st_mode & 0o111:
-            found.append(relative)
+        if path.is_file():
+            metadata = os.stat(path)
+            if metadata.st_mode & 0o111:
+                if metadata.st_size >= MAX_COVERAGE_OBJECT_BYTES:
+                    raise PartitionError(
+                        f"coverage executable reaches the 256 MiB scanner limit: "
+                        f"{path} ({metadata.st_size} bytes)"
+                    )
+                found.append(relative)
     return found
 
 
@@ -591,6 +599,30 @@ def self_test():
         table = weights_from_reports([report])
         assert table == {"target": SHARDED_TARGET, "default_seconds": 0.1,
                          "seconds": {"slow": 12.3}}, table
+
+    # Only selected coverage executables meet the scanner's size limit.
+    # Sparse boundary fixtures exercise real stat sizes without a large archive.
+    with tempfile.TemporaryDirectory() as temporary:
+        tree = Path(temporary) / "llvm-cov-target"
+        debug = tree / "debug"
+        (debug / "deps").mkdir(parents=True)
+        limit = 256 * 1024 * 1024
+        library = debug / "deps" / "liblarge.rlib"
+        with library.open("wb") as output:
+            output.truncate(limit + 1)
+        library.chmod(0o755)
+        executable = debug / "deps" / "coverage-test"
+        with executable.open("wb") as output:
+            output.truncate(limit - 1)
+        executable.chmod(0o755)
+        assert coverage_objects(debug) == [Path("deps/coverage-test")]
+        with executable.open("r+b") as output:
+            output.truncate(limit)
+        _expect_error(coverage_objects, debug)
+        (tree / "p11scope-rest-1-boundary.profraw").write_bytes(b"raw")
+        destination = Path(temporary) / "packed"
+        _expect_error(coverage_pack, "rest", tree, destination)
+        assert not destination.exists(), "reject before creating coverage output"
 
     # coverage-pack / coverage-unpack round trip, fail-closed on gaps.
     with tempfile.TemporaryDirectory() as temporary:

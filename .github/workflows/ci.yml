@@ -1130,20 +1130,8 @@ jobs:
       - run: python3 -I scripts/ci-test-partition.py run --partition "${{ matrix.partition }}" -- cargo +"$(cat .release-rust-version)" llvm-cov --locked --offline --workspace --all-targets --no-report
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: ${{ runner.temp }}/coverage-linker
-      # The scanner rejects objects at or above 256 MiB; fail here after the
-      # instrumented build rather than mid-merge when an executable outgrows
-      # it. cargo-llvm-cov builds under target/llvm-cov-target (see the pack
-      # step below), so a pre-run check over target/ would pass vacuously.
-      - name: Assert test executables are under the 256 MiB object limit
-        shell: bash
-        run: |
-          if [ -d target/llvm-cov-target/debug/deps ]; then
-            oversized=$(find target/llvm-cov-target/debug/deps -type f -size +268435455c)
-            if [ -n "$oversized" ]; then
-              echo "$oversized"
-              exit 1
-            fi
-          fi
+      # The packer checks the same selected executables it archives against
+      # the 256 MiB scanner limit; intermediate .rlib files are not objects.
       - run: python3 -I scripts/ci-test-partition.py coverage-pack --partition "${{ matrix.partition }}" --target-dir target/llvm-cov-target --output "$RUNNER_TEMP/coverage"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

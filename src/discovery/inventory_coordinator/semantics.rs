@@ -1215,6 +1215,56 @@ pub(crate) enum JointRetireRefusal {
     PendingWork,
 }
 
+/// One existing promotion/diagnostic consumer for owned refreshes and
+/// borrowed collected Current receipts. Only these disjoint coordinator
+/// fields are borrowed; the original receipt stays with its sole owner.
+fn consume_current_admission<Source: ProcessSource>(
+    adapter: &CallerAdapter<Source>,
+    registry: &mut CallerRegistry,
+    bindings: &mut SemanticBindingSet,
+    candidate: SemanticAdmissionCandidate,
+    receipt: &crate::semantic_capture::CurrentPartitionReceipt,
+    provider: Result<SemanticProviderTarget, SemanticRefusal>,
+    permit: Option<crate::inspect_system::inventory_cgroup::CgroupAdmissionPermit<'_>>,
+) -> Result<(), SemanticBindingRefusal> {
+    let caller = candidate.caller;
+    let requested_file = receipt.endpoint().file_slot;
+    let provider_module = provider
+        .as_ref()
+        .ok()
+        .and_then(|provider| registry.module_id_for(provider.module()));
+    let result = promotion::consume(
+        adapter, registry, bindings, candidate, receipt, provider, permit,
+    );
+    if let Err(reason) = result {
+        registry.record_gap(RegistryGap {
+            caller: Some(caller),
+            module: None,
+            pid: None,
+            subject: "semantic admission refused".into(),
+            reason: reason.code().into(),
+            budget: None,
+        });
+        if matches!(
+            reason,
+            SemanticBindingRefusal::Capacity
+                | SemanticBindingRefusal::OwnerRefused(SemanticRefusal::ProviderStorage)
+        ) {
+            // A refused copy owns no ModuleKey. Preserve the original
+            // bounded file context without allocating an identity first.
+            registry.record_gap(RegistryGap {
+                caller: Some(caller),
+                module: provider_module,
+                pid: None,
+                subject: format!("semantic provider file {requested_file} admission refused"),
+                reason: reason.code().into(),
+                budget: None,
+            });
+        }
+    }
+    result
+}
+
 impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// Four exact mapped attested pairs, including every failed refresh.
     /// Selection scans bounded retained catalogs without allocating a caller
@@ -1446,6 +1496,63 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         )?;
         let candidate = self
             .prepare_legacy_semantic_candidate(caller, domain)
+            .ok_or(SemanticBindingRefusal::NoLiveCaller)?;
+        if !reservation.matches(&candidate) {
+            return Err(SemanticBindingRefusal::NoLiveCaller);
+        }
+        Ok((candidate, reservation))
+    }
+
+    /// The original physical publication owns any cgroup completion. A
+    /// collected Current may add a provider only under that SAME collection's
+    /// actual member permit; PID/system keep their existing candidate path.
+    fn prepare_current_promotion_candidate(
+        &self,
+        caller: CallerId,
+        domain: NativeDomainId,
+    ) -> Result<(SemanticAdmissionCandidate, PromotionAdmissionReservation), SemanticBindingRefusal>
+    {
+        if !matches!(self.engine.scope, Scope::Cgroup { .. }) {
+            return self.prepare_legacy_promotion_candidate(caller, domain);
+        }
+        let record = self
+            .adapter
+            .record(caller)
+            .ok_or(SemanticBindingRefusal::NoLiveCaller)?;
+        let collection = &self
+            .joint_publication
+            .as_ref()
+            .and_then(|pending| pending.completion.cgroup.as_ref())
+            .ok_or(SemanticBindingRefusal::NoLiveCaller)?
+            .0;
+        let permit = collection
+            .permit(record.pid)
+            .ok_or(SemanticBindingRefusal::NoLiveCaller)?;
+        let pin = self
+            .adapter
+            .shared_semantic_custody(caller)
+            .ok_or(SemanticBindingRefusal::NoLiveCaller)?;
+        let path_bytes = record
+            .exe
+            .as_ref()
+            .and_then(|exe| exe.path.as_ref())
+            .map_or(0, String::len);
+        let reservation = PromotionAdmissionReservation::reserve(
+            &self.registry,
+            caller,
+            domain,
+            pin.clone(),
+            path_bytes,
+        )?;
+        let candidate = self
+            .seal_semantic_candidate(
+                caller,
+                &pin,
+                AdmissionScope::Cgroup,
+                domain,
+                Some(permit.generation()),
+                || self.adapter.shared_semantic_custody(caller),
+            )
             .ok_or(SemanticBindingRefusal::NoLiveCaller)?;
         if !reservation.matches(&candidate) {
             return Err(SemanticBindingRefusal::NoLiveCaller);
@@ -1774,42 +1881,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         Result<(), SemanticBindingRefusal>,
     ) {
         let (receipt, provider) = prepared.into_parts();
-        let caller = candidate.caller;
-        let requested_file = receipt.endpoint().file_slot;
-        let provider_module = provider
-            .as_ref()
-            .ok()
-            .and_then(|provider| self.registry.module_id_for(provider.module()));
-        let result = promotion::consume(
+        let result = consume_current_admission(
             &self.adapter,
-            &self.registry,
+            &mut self.registry,
             &mut self.semantic_bindings,
             candidate,
             &receipt,
             provider,
             permit,
         );
-        if let Err(reason) = result {
-            self.semantic_admission_refused(caller, reason.code());
-            if matches!(
-                reason,
-                SemanticBindingRefusal::Capacity
-                    | SemanticBindingRefusal::OwnerRefused(SemanticRefusal::ProviderStorage)
-            ) {
-                // Keep the existing finite refusal diagnostic and add the
-                // particular requested provider for resource/count refusal.
-                // A refused copy owns no ModuleKey, so its sealed file slot
-                // supplies bounded context without allocating identity first.
-                self.registry.record_gap(RegistryGap {
-                    caller: Some(caller),
-                    module: provider_module,
-                    pid: None,
-                    subject: format!("semantic provider file {requested_file} admission refused"),
-                    reason: reason.code().into(),
-                    budget: None,
-                });
-            }
-        }
         (receipt, result)
     }
 
@@ -2550,7 +2630,74 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let mut validation = crate::semantic_capture::TickReport::default();
         for receipt in &current {
             self.observe_proven_image(receipt);
-            match lane.validate_current(receipt, &mut validation) {
+            // A late provider can first appear in this SAME collected batch,
+            // before its NoteMapping is applied. Borrow only the frozen
+            // physical label, then use the actual owner validator and the
+            // ordinary promotion consumer. The original Current/New never
+            // leaves `current` and validation negatives have ONE report owner.
+            let context = self
+                .semantic_bindings
+                .find_by_image(receipt.domain(), receipt.image())
+                .filter(|binding| binding.provider_for_endpoint(receipt.endpoint()).is_none())
+                .and_then(|binding| {
+                    self.registry
+                        .joint_current_provider_module(receipt, binding, lane.subset())
+                        .map(|module| (binding.caller(), module))
+                });
+            let admission = context.map(|(caller, module)| {
+                (
+                    caller,
+                    self.prepare_current_promotion_candidate(caller, receipt.domain()),
+                    module,
+                )
+            });
+            let validated = match admission {
+                Some((_, Ok((candidate, reservation)), module)) => {
+                    let result = lane.validate_current_for_provider(
+                        receipt,
+                        Some(module),
+                        &mut validation,
+                        |bytes| self.registry.reserve_semantic_storage(bytes),
+                    );
+                    match result {
+                        Ok((coverage, provider)) => {
+                            // Only the retained original collection supplies a
+                            // cgroup permit. The final consume rechecks it;
+                            // neither a mapping label nor scope_current grants it.
+                            let permit = self
+                                .joint_publication
+                                .as_ref()
+                                .and_then(|pending| pending.completion.cgroup.as_ref())
+                                .and_then(|(collection, _)| collection.permit(candidate.pid()));
+                            let _ = consume_current_admission(
+                                &self.adapter,
+                                &mut self.registry,
+                                &mut self.semantic_bindings,
+                                candidate,
+                                receipt,
+                                provider,
+                                permit,
+                            );
+                            // Candidate/path temporaries drop before their
+                            // existing reservation; retained provider copies own
+                            // their separate original leases.
+                            drop(reservation);
+                            Ok(coverage)
+                        }
+                        Err(reason) => {
+                            drop(candidate);
+                            drop(reservation);
+                            Err(reason)
+                        }
+                    }
+                }
+                Some((caller, Err(reason), _)) => {
+                    self.semantic_admission_refused(caller, reason.code());
+                    lane.validate_current(receipt, &mut validation)
+                }
+                None => lane.validate_current(receipt, &mut validation),
+            };
+            match validated {
                 Ok(coverage) => coverages.push(coverage),
                 Err(reason) => {
                     let code = match reason {

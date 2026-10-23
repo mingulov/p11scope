@@ -2328,6 +2328,9 @@ struct AppliedJointPublication {
     identity: RawQuantumIdentity,
     frontier: Option<ConsumptionOrdinal>,
     base_revision: u64,
+    // Borrow labels only from the physical inputs actually prepared for this
+    // original. Semantic staging and later arrivals cannot widen the prefix.
+    physical_prefix_end: Option<usize>,
     applied: Option<usize>,
     targets_bound: bool,
     _storage: crate::semantics_edge::resources::ResourceLease,
@@ -3350,6 +3353,7 @@ impl CallerRegistry {
             identity: raw.h0_identity(),
             frontier: None,
             base_revision: self.facts_revision,
+            physical_prefix_end: None,
             applied: None,
             targets_bound: false,
             _storage: storage,
@@ -3369,6 +3373,25 @@ impl CallerRegistry {
         {
             bail!("Joint preparation must retain its original raw allocation and base revision");
         }
+        Ok(())
+    }
+
+    /// Freeze only the actual successful physical preparation. Retrying the
+    /// same original may validate this boundary, but never extends it.
+    pub(crate) fn freeze_joint_physical_prefix(&mut self, raw: &RawJointQuantum) -> Result<()> {
+        self.validate_joint_preparation(raw)?;
+        let phase = self
+            .joint_publication
+            .as_mut()
+            .ok_or_else(|| anyhow!("no original Joint preparation"))?;
+        if phase.targets_bound
+            || phase
+                .physical_prefix_end
+                .is_some_and(|end| end > self.staged.len())
+        {
+            bail!("Joint physical inputs no longer retain their original prefix");
+        }
+        phase.physical_prefix_end.get_or_insert(self.staged.len());
         Ok(())
     }
 

@@ -27,6 +27,113 @@ use std::hash::{BuildHasher, Hash, Hasher};
 pub(crate) const MAX_REGISTRY_INSTANCES: usize = 4096;
 pub(crate) const MAX_INSTANCE_NEGATIVE_SCOPES: usize = 4096;
 
+impl CallerRegistry {
+    /// A module LABEL from this original's frozen physical context. This
+    /// grants no provider authority: the lane must validate the SAME Current
+    /// and the ordinary promotion consumer must accept its owner/scope proof.
+    /// A later mapping, an ambiguous alias or a superseded physical context
+    /// cannot label an earlier New.
+    pub(crate) fn joint_current_provider_module<'a>(
+        &'a self,
+        current: &crate::semantic_capture::CurrentPartitionReceipt,
+        binding: &SemanticCallerBinding,
+        subset: &AttestedSubset,
+    ) -> Option<&'a ModuleKey> {
+        let phase = self.joint_publication.as_ref()?;
+        let end = phase.physical_prefix_end?;
+        if current.birth_quantum() != Some(phase.identity)
+            || phase.base_revision != self.facts_revision
+            || phase.frontier.is_some()
+            || phase.applied.is_some()
+            || phase.targets_bound
+            || end > self.staged.len()
+            || current.domain() != binding.domain()
+            || current.image() != binding.image()
+            || !std::sync::Arc::ptr_eq(current.original_pin(), &binding.pin())
+            || !binding.scope_current()
+            || !self.callers.contains(&binding.caller())
+            || self.retired.contains_key(&binding.caller())
+        {
+            return None;
+        }
+        let object = current.endpoint().object;
+        let names_object = |key: &ModuleKey| {
+            let ModuleKey::Physical {
+                dev_major,
+                dev_minor,
+                ino,
+                ..
+            } = key
+            else {
+                return false;
+            };
+            subset.pins().raw_keys_for(object).iter().any(|raw| {
+                raw.device.major == *dev_major
+                    && raw.device.minor == *dev_minor
+                    && raw.inode == *ino
+            })
+        };
+        let mut selected: Option<&ModuleKey> = None;
+        // Positive catalog rows remain subject to ALL original prefix
+        // negatives below; no first-positive/first-alias selection.
+        for edge in self.edges_of(binding.caller()) {
+            let module = self.modules.get(&edge.module)?;
+            if edge.mapping != MappingState::Mapped || !names_object(&module.key) {
+                continue;
+            }
+            if edge.double_loaded
+                || module.lifecycle == super::ModuleLifecycle::Unloaded
+                || !subset.proves_provider_module(object, &module.key)
+                || selected.is_some_and(|old| old != &module.key)
+            {
+                return None;
+            }
+            selected = Some(&module.key);
+        }
+        for row in &self.staged[..end] {
+            match row {
+                Mutation::NoteMapping {
+                    caller, pid, info, ..
+                } if *caller == binding.caller() => {
+                    if !names_object(&info.key) {
+                        // Unidentified rows cannot disambiguate a retained
+                        // physical provider; unrelated physical files can.
+                        if matches!(info.key, ModuleKey::Unidentified { .. }) {
+                            return None;
+                        }
+                        continue;
+                    }
+                    if *pid != current.original_pin().pid()
+                        || info.double_loaded
+                        || !subset.proves_provider_module(object, &info.key)
+                        || selected.is_some_and(|old| old != &info.key)
+                    {
+                        return None;
+                    }
+                    selected = Some(&info.key);
+                }
+                Mutation::RetireCaller { caller, .. }
+                | Mutation::NoteMemberUnscanned { caller }
+                    if *caller == binding.caller() =>
+                {
+                    return None;
+                }
+                Mutation::NoteModuleAbsent { caller, module, .. }
+                    if *caller == binding.caller()
+                        && self
+                            .modules
+                            .get(module)
+                            .is_none_or(|module| names_object(&module.key)) =>
+                {
+                    return None;
+                }
+                _ => {}
+            }
+        }
+        selected
+    }
+}
+
 /// The map and its allocation probe use this exact value, including the
 /// lease which owns the copied key's text. Removing a row refunds that key;
 /// the separately retained bucket allocation remains charged.

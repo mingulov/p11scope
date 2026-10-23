@@ -127,6 +127,14 @@ impl SemanticProviderTarget {
     }
 }
 
+/// Borrowed coordinates checked against this lane's actual attachment. Only
+/// the owner validator below can turn them into a retained provider; this
+/// private stack value cannot move or replace the original Current/New.
+struct CurrentProviderSubject<'a> {
+    receipt: &'a CurrentPartitionReceipt,
+    module: &'a ModuleKey,
+}
+
 /// Move-only bootstrap evidence. The owner receipt is delivered exactly once
 /// to normal finalization after consuming (or refusing) scoped admission.
 pub(crate) struct PreparedSemanticAdmission {
@@ -1366,54 +1374,12 @@ impl AttestedSemanticLane {
 
         let mut validation = TickReport::default();
         let result = (|| {
-            #[cfg(test)]
-            if let Some(test) = self.test_io.as_mut() {
-                test.validate_attachment(&self.subset)?;
-            } else {
-                let live = self.live.as_ref().ok_or(SemanticRefusal::Unavailable)?;
-                live.session
-                    .validate_semantic_set(&live.attached)
-                    .map_err(|_| SemanticRefusal::Attachment)?;
-            }
-            #[cfg(not(test))]
-            {
-                let live = self.live.as_ref().ok_or(SemanticRefusal::Unavailable)?;
-                live.session
-                    .validate_semantic_set(&live.attached)
-                    .map_err(|_| SemanticRefusal::Attachment)?;
-            }
-            let endpoint = receipt.endpoint();
-            if receipt.domain() != self.domain
-                || !Arc::ptr_eq(receipt.original_pin(), &effective)
-                || !self.subset.proves_provider_module(endpoint.object, module)
-                || !receipt
-                    .watched()
-                    .same_object_as(self.subset.pins(), endpoint.object)
-                || receipt.watched().check_unchanged() != Ok(true)
-                || !self
-                    .subset
-                    .required()
-                    .get(&endpoint.object)
-                    .is_some_and(|required| required.contains(&slot))
-                || !self.subset.plan().slots.iter().any(|actual| {
-                    actual.index == slot
-                        && actual.object == endpoint.object
-                        && actual.file_offset == endpoint.offset
-                })
-            {
-                return Err(SemanticRefusal::ProviderInstanceUnproven);
-            }
-            self.validate_current(&receipt, &mut validation)
+            // Preserve the owned refresh's existing preflight/refusal order.
+            let subject = self.current_provider_subject(&receipt, &effective, slot, module)?;
+            let (_, provider) = self
+                .validate_current_provider_subject(&receipt, Ok(subject), &mut validation, reserve)
                 .map_err(|_| SemanticRefusal::ProviderInstanceUnproven)?;
-            let bytes = SemanticProviderTarget::copy_charge(module, receipt.watched())
-                .ok_or(SemanticRefusal::ProviderStorage)?;
-            let storage = reserve(bytes).map_err(|_| SemanticRefusal::ProviderStorage)?;
-            Ok(SemanticProviderTarget {
-                module: module.clone(),
-                endpoint,
-                _retained: receipt.watched().share(),
-                _storage: storage,
-            })
+            provider
         })();
         // Validation may consume invalidations even on refusal. Keep them
         // beside the original receipt, never copy that receipt into two paths.
@@ -1422,6 +1388,112 @@ impl AttestedSemanticLane {
             receipt,
             provider: result,
         })
+    }
+
+    fn current_provider_subject<'a>(
+        &mut self,
+        receipt: &'a CurrentPartitionReceipt,
+        effective: &Arc<PidPin>,
+        slot: u32,
+        module: &'a ModuleKey,
+    ) -> Result<CurrentProviderSubject<'a>, SemanticRefusal> {
+        #[cfg(test)]
+        if let Some(test) = self.test_io.as_mut() {
+            test.validate_attachment(&self.subset)?;
+        } else {
+            let live = self.live.as_ref().ok_or(SemanticRefusal::Unavailable)?;
+            live.session
+                .validate_semantic_set(&live.attached)
+                .map_err(|_| SemanticRefusal::Attachment)?;
+        }
+        #[cfg(not(test))]
+        {
+            let live = self.live.as_ref().ok_or(SemanticRefusal::Unavailable)?;
+            live.session
+                .validate_semantic_set(&live.attached)
+                .map_err(|_| SemanticRefusal::Attachment)?;
+        }
+        let endpoint = receipt.endpoint();
+        if receipt.domain() != self.domain
+            || !Arc::ptr_eq(receipt.original_pin(), effective)
+            || !self.subset.proves_provider_module(endpoint.object, module)
+            || !receipt
+                .watched()
+                .same_object_as(self.subset.pins(), endpoint.object)
+            || receipt.watched().check_unchanged() != Ok(true)
+            || !self
+                .subset
+                .required()
+                .get(&endpoint.object)
+                .is_some_and(|required| required.contains(&slot))
+            || !self.subset.plan().slots.iter().any(|actual| {
+                actual.index == slot
+                    && actual.object == endpoint.object
+                    && actual.file_offset == endpoint.offset
+            })
+        {
+            return Err(SemanticRefusal::ProviderInstanceUnproven);
+        }
+        Ok(CurrentProviderSubject { receipt, module })
+    }
+
+    fn validate_current_provider_subject(
+        &mut self,
+        receipt: &CurrentPartitionReceipt,
+        subject: Result<CurrentProviderSubject<'_>, SemanticRefusal>,
+        report: &mut TickReport,
+        reserve: impl FnOnce(usize) -> Result<ResourceLease, SemanticResourceRefusal>,
+    ) -> Result<
+        (
+            LaneCoverage,
+            Result<SemanticProviderTarget, SemanticRefusal>,
+        ),
+        CurrentReceiptRefusal,
+    > {
+        // Exactly the normal conversion's actual owner validation. Its
+        // negatives remain in the caller's SAME report, even on refusal.
+        let coverage = self.validate_current(receipt, report)?;
+        let provider = subject.and_then(|subject| {
+            let bytes =
+                SemanticProviderTarget::copy_charge(subject.module, subject.receipt.watched())
+                    .ok_or(SemanticRefusal::ProviderStorage)?;
+            let storage = reserve(bytes).map_err(|_| SemanticRefusal::ProviderStorage)?;
+            Ok(SemanticProviderTarget {
+                module: subject.module.clone(),
+                endpoint: subject.receipt.endpoint(),
+                _retained: subject.receipt.watched().share(),
+                _storage: storage,
+            })
+        });
+        Ok((coverage, provider))
+    }
+
+    /// Validate this original Current once for conversion and, when a
+    /// physical-context label exists, for provider admission. This path never
+    /// takes/stashes a receipt or queries a replacement New.
+    pub(crate) fn validate_current_for_provider(
+        &mut self,
+        receipt: &CurrentPartitionReceipt,
+        module: Option<&ModuleKey>,
+        report: &mut TickReport,
+        reserve: impl FnOnce(usize) -> Result<ResourceLease, SemanticResourceRefusal>,
+    ) -> Result<
+        (
+            LaneCoverage,
+            Result<SemanticProviderTarget, SemanticRefusal>,
+        ),
+        CurrentReceiptRefusal,
+    > {
+        let subject = match module {
+            Some(module) => self.current_provider_subject(
+                receipt,
+                receipt.original_pin(),
+                receipt.attachment_slot(),
+                module,
+            ),
+            None => Err(SemanticRefusal::ProviderInstanceUnproven),
+        };
+        self.validate_current_provider_subject(receipt, subject, report, reserve)
     }
 
     pub(crate) fn deliver_admission_receipt(&mut self, receipt: CurrentPartitionReceipt) {

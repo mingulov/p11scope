@@ -97,7 +97,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             if self.joint_publication.is_none() {
                 bail!("Joint preparation has no original completion context");
             }
-            return Ok(());
+            return self.registry.freeze_joint_physical_prefix(raw);
         }
         if !self
             .semantic_finalizer
@@ -128,7 +128,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             cut_barrier,
             _storage: storage,
         });
-        Ok(())
+        // Retain the actual completion before a fallible boundary check; an
+        // attempted preparation must never drop/repeat its cgroup context.
+        self.registry.freeze_joint_physical_prefix(raw)
     }
 
     #[cfg(test)]

@@ -3118,7 +3118,18 @@ fn joint_machine_empty_disposition_requires_actual_quiet_original() {
             .registry()
             .published_revision();
         fixture.machine.begin_commit(false).unwrap();
-        fixture.service(1).unwrap();
+        // Idle first walks the retained Ready/absence subjects. A single
+        // budget-one action need not have polled the original cursor yet.
+        for _ in 0..128 {
+            if fixture.machine.diagnostic_snapshot_for_test().0 == "Collecting" {
+                break;
+            }
+            fixture.service(1).unwrap();
+        }
+        assert_eq!(
+            fixture.machine.diagnostic_snapshot_for_test().0,
+            "Collecting"
+        );
         let original = fixture.machine.retained_raw_for_test().unwrap();
         let identity = original.h0_identity();
         assert_eq!(

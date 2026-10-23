@@ -3,7 +3,7 @@
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{CounterCapture, CounterFailure};
     use crate::discovery::identity::{PinnedObjects, ReconciledModule};
     use crate::discovery::scan::{ScannedEntry, ScannedModule, ScannedTable};
     use crate::metrics::KernelEvidence;
@@ -30,7 +30,10 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         let bytes = format!("owned counter projection {}", file.path().display()).into_bytes();
         file.write_all(&bytes).unwrap();
-        let hash = format!("{:x}", Sha256::digest(&bytes));
+        let hash: String = Sha256::digest(&bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
         // Existing pin seam retains a real opened file/dev/inode. No native
         // execution is claimed for these controlled cumulative cells.
         let pins =
@@ -180,11 +183,18 @@ mod tests {
         ] {
             let pool = SemanticResourcePool::reference_limit(32 * 1024 * 1024);
             let mut capture = CounterCapture::new(LIMITS, pool.reserver());
-            let snapshot = capture.fresh_with(&plan, &pins, |same_plan, same_pins, _, reserve| {
-                assert!(std::ptr::eq(same_plan, &plan));
-                assert!(std::ptr::eq(same_pins, &pins));
-                Ok(read(same_plan, mode, 1, 5, reserve))
-            });
+            let snapshot = capture.fresh_with(
+                &plan,
+                &pins,
+                |same_plan: &AttachPlan,
+                 same_pins: &PinnedObjects,
+                 _: CounterLimits,
+                 reserve: &SemanticResourceReserver| {
+                    assert!(std::ptr::eq(same_plan, &plan));
+                    assert!(std::ptr::eq(same_pins, &pins));
+                    Ok(read(same_plan, mode, 1, 5, reserve))
+                },
+            );
             assert!(snapshot.is_fresh());
             assert_eq!(snapshot.mode(), Some(mode));
             assert_eq!(snapshot.generation(), Some(1));

@@ -63,11 +63,11 @@ fn counter_bank_proof_path() -> PathBuf {
     assert_eq!(env!("P11SCOPE_COUNTER_BANK_PROOF_ENABLED"), "1");
     assert_eq!(
         env!("P11SCOPE_COUNTER_BANK_PROOF_OUTPUTS"),
-        "counts-bank-proof"
+        "counts-bank-growth-v2"
     );
     Path::new(env!("OUT_DIR"))
-        .join("counter-bank-proof")
-        .join("p11scope-ebpf-counts-bank-proof")
+        .join("counter-bank-growth-v2")
+        .join("p11scope-ebpf-counts-bank-growth-v2")
 }
 
 fn counter_bank_proof_check(path: &Path, mutants: bool) -> std::process::Output {
@@ -78,7 +78,7 @@ fn counter_bank_proof_check(path: &Path, mutants: bool) -> std::process::Output 
         "--mode",
         "counts",
         "--profile",
-        "counts-bank-proof",
+        "counts-bank-growth-v2",
     ]);
     if mutants {
         command.arg("--self-test-mutants");
@@ -99,7 +99,11 @@ fn counter_bank_proof_build_selection_matches_emitted_contract() {
     );
     assert_eq!(
         env!("P11SCOPE_COUNTER_BANK_PROOF_OUTPUTS"),
-        if requested { "counts-bank-proof" } else { "" },
+        if requested {
+            "counts-bank-growth-v2"
+        } else {
+            ""
+        },
         "disabled metadata must refuse stale proof output"
     );
     let directory = tempfile::tempdir().unwrap();
@@ -112,8 +116,27 @@ fn counter_bank_proof_build_selection_matches_emitted_contract() {
     );
     assert!(String::from_utf8_lossy(&result.stderr).contains("counter object refused:"));
     if requested {
-        let proof = std::fs::read(counter_bank_proof_path()).unwrap();
+        let path = counter_bank_proof_path();
+        let proof = std::fs::read(&path).unwrap();
         assert_ne!(proof, p11scope::EBPF_OBJECT);
+        let legacy = Command::new("python3")
+            .args([
+                "-I",
+                "scripts/check-counter-object.py",
+                "--mode",
+                "counts",
+                "--profile",
+                "counts-bank-proof",
+            ])
+            .arg(&path)
+            .output()
+            .expect("run strict format1 profile against actual format2 bytes");
+        assert_eq!(
+            legacy.status.code(),
+            Some(2),
+            "format1 accepted format2 bytes"
+        );
+        assert!(String::from_utf8_lossy(&legacy.stderr).contains("counter object refused:"));
     }
 }
 
@@ -127,18 +150,35 @@ fn counter_bank_proof_has_exact_routes_and_start_ownership() {
         String::from_utf8_lossy(&output.stderr)
     );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(report["schema"], "p11scope-counter-bank-object/v1");
-    assert_eq!(report["logical_slots"], serde_json::json!([0, 1]));
+    assert_eq!(report["schema"], "p11scope-counter-bank-object/v2");
+    assert_eq!(report["configuration"], 0x0200_0018_0010_0200u64);
     assert_eq!(report["native_owner_slot_bound"], 8_192);
-    assert_eq!(report["maps"]["STATS"]["max_entries"], 512);
-    assert_eq!(report["maps"]["COUNTER_BANKS"]["type"], 13);
-    assert_eq!(report["maps"]["COUNTER_BANKS"]["max_entries"], 2);
+    for (name, kind, key, value, entries, flags) in [
+        ("STATS", 6, 4, 24, 512, 0),
+        ("COUNTER_BANKS", 13, 4, 4, 16, 128),
+        ("COUNTER_BANK_META", 1, 4, 32, 8_192, 128),
+        ("COUNTER_BANK_COMMIT", 1, 8, 16, 8_192, 128),
+        ("COUNTER_BANK_FAULT", 6, 4, 8, 1, 0),
+        ("COUNTER_HEALTH", 6, 4, 8, 2, 0),
+        ("START", 1, 16, 288, 16_384, 0),
+        ("RV_COUNTS", 5, 16, 8, 65_536, 0),
+        ("SLOT_FILE", 2, 4, 4, 8_192, 128),
+    ] {
+        for (field, expected) in [
+            ("type", kind),
+            ("key_size", key),
+            ("value_size", value),
+            ("max_entries", entries),
+            ("flags", flags),
+        ] {
+            assert_eq!(report["maps"][name][field], expected, "{name}.{field}");
+        }
+    }
     assert_eq!(report["inner_template"]["type"], 6);
     assert_eq!(report["inner_template"]["key_size"], 4);
     assert_eq!(report["inner_template"]["value_size"], 24);
-    assert_eq!(report["inner_template"]["max_entries"], 1);
-    assert_eq!(report["maps"]["START"]["max_entries"], 16_384);
-    assert_eq!(report["maps"]["RV_COUNTS"]["max_entries"], 4_096);
+    assert_eq!(report["inner_template"]["max_entries"], 512);
+    assert_eq!(report["inner_template"]["flags"], 0);
     assert_eq!(report["ordinary_counter_profile"], "refused");
     for root in ["p11_counter_bank_entry", "p11_counter_bank_return"] {
         assert!(report["roots"][root]["stack_chain"].as_u64().unwrap() <= 512);
@@ -146,6 +186,13 @@ fn counter_bank_proof_has_exact_routes_and_start_ownership() {
         assert_eq!(report["roots"][root]["semantic_or_event_work"], false);
     }
     for name in [
+        "logical_slot_0",
+        "logical_slot_511",
+        "logical_slot_512",
+        "logical_slot_8191",
+        "invalid_logical_slot",
+        "inactive_cell_beside_published_cell",
+        "cross_bank_extent_511_513",
         "inactive_entry",
         "precommit_return_after_commit",
         "absent_return_preserves_other_start",
@@ -154,6 +201,10 @@ fn counter_bank_proof_has_exact_routes_and_start_ownership() {
         "missing_route_retires_start",
         "failed_retirement_keeps_debt",
         "full_width_transaction",
+        "high32_transaction_alias",
+        "wrong_exact_set_or_config",
+        "start_payload_does_not_route",
+        "scope_refusal_retires_without_credit",
         "admission_failure_is_sticky",
         "rv_full_width_accumulates",
         "pending_is_returned_without_error",
@@ -180,7 +231,14 @@ fn counter_bank_proof_mutations_are_causally_rejected() {
     for name in [
         "inner_value_width",
         "inner_cell_count",
+        "outer_bank_count",
         "outer_type",
+        "route_value_width",
+        "route_max_entries",
+        "commit_max_entries",
+        "rv_max_entries",
+        "slot_file_max_entries",
+        "slot_file_flags",
         "native_owner_slot_bound",
         "missing_native_owner_slot_bound",
         "legacy_native_owner_slot_bound",
@@ -189,13 +247,23 @@ fn counter_bank_proof_mutations_are_causally_rejected() {
         "bank_global_linkage",
         "bank_global_abi",
         "commit_gate",
-        "commit_set",
+        "commit_first",
+        "commit_end",
+        "route_first",
+        "route_end",
+        "route_bank",
+        "route_cell",
+        "route_inner_id_zero",
+        "route_reserved",
+        "configuration",
+        "configuration_version",
         "transaction_width",
         "optional_start_get",
         "required_start_remove",
         "missing_start_get",
         "missing_start_remove",
         "route_fault",
+        "legacy_stats_write",
         "endpoint_clock",
         "semantic_helper",
         "unknown_call",
@@ -258,35 +326,54 @@ fn counter_bank_proof_btf_maps_and_programs_load() {
         );
     }
     drop(storage);
-    let first = aya::maps::MapData::create(
-        aya_obj::Map::new_from_params(6, 4, 24, 1, 0),
-        "bank_proof0",
-        None,
-    )
-    .expect("allocate first actual Counts bank");
-    let second = aya::maps::MapData::create(
-        aya_obj::Map::new_from_params(6, 4, 24, 1, 0),
-        "bank_proof1",
-        None,
-    )
-    .expect("allocate second actual Counts bank");
-    let first_id = first.info().unwrap().id();
-    let second_id = second.info().unwrap().id();
-    assert_ne!(first_id, second_id, "banks must own distinct native maps");
+    let native_banks: Vec<_> = (0..16)
+        .map(|bank| {
+            aya::maps::MapData::create(
+                aya_obj::Map::new_from_params(6, 4, 24, 512, 0),
+                &format!("counts_bank{bank}"),
+                None,
+            )
+            .expect("allocate actual 512-cell Counts bank")
+        })
+        .collect();
+    let ids: std::collections::BTreeSet<_> = native_banks
+        .iter()
+        .map(|bank| {
+            let info = bank.info().expect("actual inner-map metadata");
+            assert_eq!(
+                (
+                    info.map_type().unwrap(),
+                    info.key_size(),
+                    info.value_size(),
+                    info.max_entries(),
+                    info.map_flags()
+                ),
+                (aya::maps::MapType::PerCpuArray, 4, 24, 512, 0),
+            );
+            assert_ne!(info.id(), 0);
+            info.id()
+        })
+        .collect();
+    assert_eq!(
+        ids.len(),
+        16,
+        "all sixteen banks retain distinct native IDs"
+    );
     {
         let mut banks: aya::maps::HashOfMaps<_, u32> = object
             .map_mut("COUNTER_BANKS")
             .expect("real outer map")
             .try_into()
             .expect("real HashOfMaps ABI");
-        banks
-            .insert(0, &first, 1)
-            .expect("stage first bank with BPF_NOEXIST");
-        banks
-            .insert(1, &second, 1)
-            .expect("stage second bank with BPF_NOEXIST");
-        assert_eq!(banks.get(&0, 0).unwrap().info().unwrap().id(), first_id);
-        assert_eq!(banks.get(&1, 0).unwrap().info().unwrap().id(), second_id);
+        for (index, bank) in native_banks.iter().enumerate() {
+            banks
+                .insert(index as u32, bank, 1)
+                .expect("stage bank with BPF_NOEXIST");
+            assert_eq!(
+                banks.get(&(index as u32), 0).unwrap().info().unwrap().id(),
+                bank.info().unwrap().id(),
+            );
+        }
     }
     for name in ["p11_counter_bank_entry", "p11_counter_bank_return"] {
         let program: &mut aya::programs::UProbe = object

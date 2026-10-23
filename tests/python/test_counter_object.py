@@ -13,7 +13,8 @@ ROOT = Path(__file__).resolve().parents[2]
 CHECKER = ROOT / "scripts/check-counter-object.py"
 
 
-def bank_template_fixture(*, inner_type=6, inner_cells=1, value_bytes=24, values_length=0):
+def bank_template_fixture(*, outer_banks=2, inner_type=6, inner_cells=1,
+                          value_bytes=24, values_length=0):
     """Small literal BTF shapes; no compiler, host BTF or runtime map needed."""
     strings = bytearray(b"\0")
     types = []
@@ -47,7 +48,7 @@ def bank_template_fixture(*, inner_type=6, inner_cells=1, value_bytes=24, values
                        ("max_entries", integer(inner_cells), 64),
                        ("key", pointer(u32), 128), ("value", pointer(counts), 192)], 32)
     values = add(3, 0, struct.pack("<III", pointer(inner), u32, values_length))
-    outer = structure([("type", integer(13), 0), ("max_entries", integer(2), 64),
+    outer = structure([("type", integer(13), 0), ("max_entries", integer(outer_banks), 64),
                        ("map_flags", integer(128), 128), ("key", pointer(u32), 192),
                        ("values", values, 256)], 32)
     raw = b"".join(types)
@@ -102,6 +103,20 @@ class CounterObjectCliTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 2)
                 self.assertIn("bank proof requires counts", result.stderr)
         result = self.invoke("--self-test", "--profile", "counts-bank-proof")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--self-test accepts no other arguments", result.stderr)
+
+    def test_growth_profile_is_explicit_and_counts_only(self):
+        profile = "counts-bank-growth-v2"
+        result = self.invoke("--profile", profile, "--mode", "counts", "missing.o")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("counter object refused:", result.stderr)
+        for mode in ("timestamps", "latency"):
+            with self.subTest(mode=mode):
+                result = self.invoke("--profile", profile, "--mode", mode, "missing.o")
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("bank proof requires counts", result.stderr)
+        result = self.invoke("--self-test", "--profile", profile)
         self.assertEqual(result.returncode, 2)
         self.assertIn("--self-test accepts no other arguments", result.stderr)
 
@@ -257,6 +272,37 @@ class CounterObjectCliTests(unittest.TestCase):
                 body, ref = bank_template_fixture(**changes)
                 with self.assertRaises(RuntimeError):
                     checker["BankBtf"](body).map_definition(ref)
+
+    def test_growth_template_is_exact_and_does_not_broaden_format1(self):
+        checker = runpy.run_path(str(CHECKER), run_name="counter_growth_template_test")
+        self.assertTrue("BankGrowthBtf" in checker, "explicit format2 template decoder is missing")
+        body, ref = bank_template_fixture(outer_banks=16, inner_cells=512)
+        for decoder in (checker["MAPS"].Btf, checker["BankBtf"]):
+            with self.subTest(decoder=decoder.__name__):
+                with self.assertRaises(RuntimeError):
+                    decoder(body).map_definition(ref)
+        definition, size = checker["BankGrowthBtf"](body).map_definition(ref)
+        self.assertEqual(size, 32)
+        self.assertEqual(definition, {
+            "type": 13, "key_size": 4, "value_size": 4, "max_entries": 16, "flags": 128,
+            "inner_template": {
+                "type": 6, "key_size": 4, "value_size": 24, "max_entries": 512, "flags": 0,
+            },
+        })
+        for changes in ({"outer_banks": 2}, {"outer_banks": 0}, {"outer_banks": 17},
+                        {"inner_cells": 1}, {"inner_cells": 511}, {"inner_cells": 513},
+                        {"inner_type": 2}, {"value_bytes": 40}, {"values_length": 1}):
+            with self.subTest(changes=changes):
+                options = {"outer_banks": 16, "inner_cells": 512, **changes}
+                body, ref = bank_template_fixture(**options)
+                with self.assertRaises(RuntimeError):
+                    checker["BankGrowthBtf"](body).map_definition(ref)
+        legacy, ref = bank_template_fixture()
+        with self.assertRaises(RuntimeError):
+            checker["BankGrowthBtf"](legacy).map_definition(ref)
+        legacy_definition, _ = checker["BankBtf"](legacy).map_definition(ref)
+        self.assertEqual(legacy_definition["max_entries"], 2)
+        self.assertEqual(legacy_definition["inner_template"]["max_entries"], 1)
 
     def test_bank_instruction_execution_preserves_existing_sticky_fault_bits(self):
         checker = runpy.run_path(str(CHECKER), run_name="counter_bank_vm_test")

@@ -1195,14 +1195,19 @@ fn joint_machine_negative_dispositions_are_finite() {
         );
         assert!(fixture.native.preparations.is_empty());
         fixture.machine.begin_commit(false).unwrap();
+        let mut published = None;
         for _ in 0..128 {
-            if matches!(
-                fixture.poll_commit(1).unwrap(),
-                crate::discovery::engine::inventory_coordinator::JointCommitProgress::Published(_)
-            ) {
+            if let crate::discovery::engine::inventory_coordinator::JointCommitProgress::Published(
+                receipt,
+            ) = fixture.poll_commit(1).unwrap()
+            {
+                published = Some(receipt);
                 break;
             }
         }
+        let published =
+            published.expect("the exact original negative publication acknowledges its requester");
+        assert_eq!(published.registry_published, revision + 1);
         let coordinator = &fixture.scene.real.scene.coordinator;
         assert_eq!(coordinator.registry().published_revision(), revision + 1);
         assert_eq!(coordinator.registry().joint_feeds(), 0);
@@ -1220,18 +1225,81 @@ fn joint_machine_negative_dispositions_are_finite() {
             [0, 0, 0, 0]
         );
         let completed = coordinator.registry().published_revision();
-        fixture.service(1).unwrap();
+        let model = coordinator.joint_capture().model().project();
+        let claims = coordinator
+            .joint_capture()
+            .adapter()
+            .invocation_claims_for_test();
+        let roles = coordinator.joint_capture().ledger().roles_for_test();
+        let h3 = coordinator.reference_h3_audit_state();
+        let frontier = coordinator.joint_capture().adapter().consumed_frontier();
+        let charged = coordinator
+            .registry()
+            .semantic_resource_snapshot()
+            .charged_bytes;
+        assert!(!coordinator.publication_pending());
+        let boundary = fixture.scene.drain.consumption_cut().unwrap();
+        let cut = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture_mut()
+            .adapter_mut()
+            .resolve_birth_cut(&boundary, &fixture.scene.producers);
+        if malformed {
+            assert_eq!(
+                cut.err(),
+                Some(crate::semantics_objects::journal::BirthCutRefusal::Gap),
+                "the completed malformed prefix permanently breaks this stream"
+            );
+            assert_eq!(fixture.service(1), Err(SemanticRefusal::Unavailable));
+            assert!(fixture.machine.retained_raw_for_test().is_none());
+            assert!(
+                fixture.machine.begin_commit(false).is_err(),
+                "a new demand cannot heal the original gap"
+            );
+            assert_eq!(
+                fixture
+                    .scene
+                    .real
+                    .scene
+                    .coordinator
+                    .registry()
+                    .semantic_resource_snapshot()
+                    .charged_bytes,
+                charged
+            );
+        } else {
+            assert!(cut.is_ok());
+            assert_eq!(
+                fixture.service(1).unwrap(),
+                crate::inventory_semantics::JointServiceProgress::Pending
+            );
+            assert!(
+                fixture.machine.retained_raw_for_test().is_some(),
+                "a healthy idle read keeps its actual paid allocation"
+            );
+        }
+        let coordinator = &fixture.scene.real.scene.coordinator;
+        assert!(boundary.same_boundary(&fixture.scene.drain.consumption_cut().unwrap()));
         assert_eq!(
-            fixture
-                .scene
-                .real
-                .scene
-                .coordinator
-                .registry()
-                .published_revision(),
+            coordinator.registry().published_revision(),
             completed,
             "an idle slice cannot spin through repeated empty publications"
         );
+        assert_eq!(coordinator.joint_capture().model().project(), model);
+        assert_eq!(
+            coordinator
+                .joint_capture()
+                .adapter()
+                .invocation_claims_for_test(),
+            claims
+        );
+        assert_eq!(coordinator.joint_capture().ledger().roles_for_test(), roles);
+        assert_eq!(coordinator.reference_h3_audit_state(), h3);
+        assert!(coordinator.joint_capture().adapter().consumed_frontier() == frontier);
+        assert!(!coordinator.publication_pending());
     }
 }
 

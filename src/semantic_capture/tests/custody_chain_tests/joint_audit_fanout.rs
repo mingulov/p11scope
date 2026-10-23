@@ -214,7 +214,7 @@ fn joint_publication_retry_does_not_repeat_admission_or_reducer() {
         claims
     );
     assert_eq!(coordinator.joint_capture().ledger().roles_for_test(), roles);
-    assert_eq!(frame.as_ref().unwrap().identity(), identity);
+    assert!(frame.as_ref().unwrap().identity() == identity);
     assert_eq!(frame.as_ref().unwrap().frontier(), frontier);
     drop(hold);
     let mut zero = 0;
@@ -312,7 +312,7 @@ fn joint_publication_retry_does_not_repeat_admission_or_reducer() {
             .publication_step(&mut foreign_frame, &BirthFault, &mut remaining)
             .is_err()
     );
-    assert_eq!(foreign_frame.as_ref().unwrap().identity(), foreign_id);
+    assert!(foreign_frame.as_ref().unwrap().identity() == foreign_id);
     fixture.assert_publication_hidden(old_revision);
     let first = fixture.complete_publication(&mut frame, &BirthFault, old_revision);
     let feeds = fixture.feeds();
@@ -484,7 +484,7 @@ fn joint_second_domain_fault_is_invisible_until_fanout() {
     let history = coordinator.joint_capture().model().project();
     assert_eq!(
         history.object(grown.objects[0].id).unwrap().lifetime,
-        Lifetime::OutcomeLost
+        Lifetime::Retired(ObjectGap::OutcomeLost)
     );
     let feeds = fixture.feeds();
     assert_eq!(feeds.iter().map(|feed| feed.reduced).sum::<u64>(), 1);
@@ -565,10 +565,15 @@ fn joint_second_domain_fault_is_invisible_until_fanout() {
         .claim_next_prepared_admission(&fixture.scene.producers, &ingested)
         .unwrap()
     {
-        assert!(proof.is_ok());
-        claims.push(position);
+        claims.push((position, proof.expect("genuine localized C/D claim")));
     }
-    assert_eq!(claims, [3, 4]);
+    assert_eq!(
+        claims
+            .iter()
+            .map(|(position, _)| *position)
+            .collect::<Vec<_>>(),
+        [3, 4]
+    );
     let roles = coordinator.joint_capture().ledger().roles_for_test();
     assert_eq!(roles[..4], [0, 2, 0, 0]);
     while coordinator
@@ -583,10 +588,11 @@ fn joint_second_domain_fault_is_invisible_until_fanout() {
         failure.gap,
         crate::semantics_objects::journal::JournalGap::ImageTainted
     );
-    assert!(matches!(&failure.scope,
-        crate::semantics_objects::journal::SealFailureScope::AffectedDomains(domains)
-            if domains.len() == 2
-    ));
+    assert!(
+        claims
+            .iter()
+            .all(|(_, proof)| failure.affects_proof_for_test(proof))
+    );
     assert!(
         fixture
             .receipts()

@@ -53,12 +53,13 @@ pub(super) fn read(
 pub(super) fn read_banked(
     session: &Session,
     plan: &AttachPlan,
+    objects: &crate::discovery::identity::PinnedObjects,
     limits: CounterLimits,
     reserve: &SemanticResourceReserver,
 ) -> Result<CounterRead, ReadStage> {
     use crate::attach::counter_banks::BankRefusal;
     let view = session
-        .counter_bank_view(plan)
+        .counter_bank_view(plan, objects)
         .map_err(|failure| match failure {
             BankRefusal::Quarantined => ReadStage::BankQuarantined,
             _ => ReadStage::BankRouting,
@@ -1709,7 +1710,13 @@ mod tests {
         };
         let mut collector = CounterCollector::new(limits, pool.reserver());
         assert_eq!(
-            collector.observe(read_banked(&session, &first, limits, &pool.reserver())),
+            collector.observe(read_banked(
+                &session,
+                &first,
+                &pins,
+                limits,
+                &pool.reserver()
+            )),
             CounterObservation::Initial
         );
 
@@ -1725,7 +1732,13 @@ mod tests {
         );
         assert_eq!(keys[0].slot, 0);
         assert_eq!(starts.get(&keys[0], 0).unwrap().object_required, 0);
-        match collector.observe(read_banked(&session, &first, limits, &pool.reserver())) {
+        match collector.observe(read_banked(
+            &session,
+            &first,
+            &pins,
+            limits,
+            &pool.reserver(),
+        )) {
             CounterObservation::Advanced { deltas, .. } => {
                 assert_eq!((deltas[0].entered, deltas[0].returned), (1, 0))
             }
@@ -1741,7 +1754,13 @@ mod tests {
         assert!(new_transaction > old_transaction);
         fixture.command(b'H');
         fixture.token("HOT");
-        match collector.observe(read_banked(&session, &grown, limits, &pool.reserver())) {
+        match collector.observe(read_banked(
+            &session,
+            &grown,
+            &pins,
+            limits,
+            &pool.reserver(),
+        )) {
             CounterObservation::Advanced { deltas, .. } => {
                 assert_eq!((deltas[0].entered, deltas[0].returned), (0, 0));
                 assert_eq!(
@@ -1755,7 +1774,13 @@ mod tests {
         fixture.command(b'R');
         fixture.token("DONE");
         assert!(fixture.0.wait().unwrap().success());
-        match collector.observe(read_banked(&session, &grown, limits, &pool.reserver())) {
+        match collector.observe(read_banked(
+            &session,
+            &grown,
+            &pins,
+            limits,
+            &pool.reserver(),
+        )) {
             CounterObservation::Advanced { deltas, .. } => {
                 assert_eq!(
                     (deltas[0].entered, deltas[0].returned, deltas[0].errors),

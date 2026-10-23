@@ -2,7 +2,7 @@
 //! Private two-cell Counts transaction. This is not general counter growth.
 
 use super::{CapturePolicy, Scope, Session};
-use crate::discovery::identity::PinnedObjects;
+use crate::discovery::identity::{PinnedObjects, RetainedInventoryTarget};
 use crate::plan::{AttachKey, AttachPlan, Slot};
 use crate::semantics_edge::resources::{
     OWNED_ALLOCATION_PADDING, ResourceLease, SemanticResourceReserver,
@@ -11,10 +11,10 @@ use anyhow::{Context, Result, ensure};
 use aya::Ebpf;
 use aya::maps::{HashMap, HashOfMaps, Map, MapData, MapError, MapType};
 use aya::programs::UProbe;
-use std::fs::File;
 use std::mem::size_of;
 use std::num::NonZeroU64;
 use std::os::fd::{AsFd, AsRawFd};
+use std::os::unix::fs::MetadataExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -161,7 +161,7 @@ pub(crate) enum BankPublication {
 /// replace a key or discard ownership when it reports an uncertain result.
 trait BankIo {
     fn possible_cpus(&self) -> usize;
-    fn validate_targets(&mut self, slots: &[Slot]) -> Result<(), BankRefusal>;
+    fn validate_targets(&mut self, slots: &[Slot], published: u64) -> Result<(), BankRefusal>;
     fn retain_charge(&mut self, charge: ResourceLease);
     fn allocate(&mut self, slot: u32) -> Result<(), BankRefusal>;
     fn insert_inner(&mut self, slot: u32) -> Result<(), BankRefusal>;
@@ -207,6 +207,44 @@ fn physical(slot: &Slot) -> AttachKey {
         object: slot.object,
         file_offset: slot.file_offset,
     }
+}
+
+/// Local pin IDs are labels, never cross-store provider identity. The same
+/// allocation-free guard protects staging and the reader's row labels.
+fn validate_provider_slots<'a>(
+    slots: &[Slot],
+    objects: &PinnedObjects,
+    published: u64,
+    mut retained: impl FnMut(u32) -> Option<&'a RetainedInventoryTarget>,
+) -> Result<(), BankRefusal> {
+    if slots.len() > BANKS || published & !((1u64 << slots.len()) - 1) != 0 {
+        return Err(BankRefusal::Ownership);
+    }
+    let mut endpoints = [None; BANKS];
+    for (index, slot) in slots.iter().enumerate() {
+        if slot.index as usize != index
+            || objects.abi_for(slot.object) != Some(p11scope_manifest::elf::ElfAbi::Lp64)
+            || objects.object_unchanged(slot.object) != Ok(true)
+        {
+            return Err(BankRefusal::Ownership);
+        }
+        if published & (1 << index) != 0 {
+            let held = retained(slot.index).ok_or(BankRefusal::Ownership)?;
+            if held.check_unchanged() != Ok(true) || !held.same_object_as(objects, slot.object) {
+                return Err(BankRefusal::Ownership);
+            }
+        }
+        let file = objects
+            .file_for(slot.object)
+            .ok_or(BankRefusal::Ownership)?;
+        let metadata = file.metadata().map_err(|_| BankRefusal::Ownership)?;
+        let endpoint = (metadata.dev(), metadata.ino(), slot.file_offset);
+        if endpoints[..index].contains(&Some(endpoint)) {
+            return Err(BankRefusal::Ownership);
+        }
+        endpoints[index] = Some(endpoint);
+    }
+    Ok(())
 }
 
 impl BankDirectory {
@@ -302,15 +340,15 @@ impl BankDirectory {
             Ok(charge) => charge,
             Err(_) => return BankPublication::Refused(BankRefusal::Budget),
         };
+        if let Err(reason) = io.validate_targets(&plan.slots, self.published) {
+            return BankPublication::Refused(reason);
+        }
         let slots: Vec<_> = plan
             .slots
             .iter()
             .filter(|slot| mask & (1 << slot.index) != 0)
             .cloned()
             .collect();
-        if let Err(reason) = io.validate_targets(&slots) {
-            return BankPublication::Refused(reason);
-        }
         // This guard moves into the same native custody as the eventual links,
         // including rollback failures, quarantine and abandonment.
         io.retain_charge(charge);
@@ -410,7 +448,8 @@ pub(crate) struct BankHandle {
 #[derive(Default)]
 struct NativeCustody {
     banks: [Option<Arc<BankHandle>>; BANKS],
-    providers: [Option<Arc<File>>; BANKS],
+    // Full retained identity survives link removal, including final reads.
+    providers: [Option<RetainedInventoryTarget>; BANKS],
     // Last: maps/providers drop before the requests that cover their lifetime.
     charges: [Option<ResourceLease>; BANKS],
 }
@@ -511,7 +550,9 @@ impl<'a> CounterPreparation<'a> {
                     .context("counter parser bound overflow")?,
             "counter parser/loader transient reservation is too small"
         );
-        let cpus = aya::util::nr_cpus().context("reading possible counter CPUs")?;
+        let cpus = aya::util::nr_cpus().map_err(|(path, error)| {
+            anyhow::Error::new(error).context(format!("reading possible counter CPUs at {path}"))
+        })?;
         ensure!(
             cpus != 0,
             "private counter preparation requires possible CPUs"
@@ -701,7 +742,7 @@ impl BankIo for NativeIo<'_> {
         self.cpus
     }
 
-    fn validate_targets(&mut self, slots: &[Slot]) -> Result<(), BankRefusal> {
+    fn validate_targets(&mut self, slots: &[Slot], published: u64) -> Result<(), BankRefusal> {
         if self.session.mutation_stopped()
             || self.session.backend != super::AttachBackend::Singles
             || self.objects.check_unchanged() != Ok(true)
@@ -709,11 +750,15 @@ impl BankIo for NativeIo<'_> {
         {
             return Err(BankRefusal::Topology);
         }
+        validate_provider_slots(slots, self.objects, published, |index| {
+            self.custody.providers[index as usize].as_ref()
+        })?;
         let copies = slots
             .iter()
             .try_fold(0usize, |total, slot| {
                 if self.objects.abi_for(slot.object) != Some(p11scope_manifest::elf::ElfAbi::Lp64)
-                    || self.session.has_slot_link(slot.index)
+                    || (published & (1 << slot.index) == 0
+                        && self.session.has_slot_link(slot.index))
                 {
                     return None;
                 }
@@ -755,12 +800,11 @@ impl BankIo for NativeIo<'_> {
             return Err(BankRefusal::Allocated);
         }
         let target = self.plan.slots.get(index).ok_or(BankRefusal::Topology)?;
-        let file = self
+        let retained = self
             .objects
-            .file_for(target.object)
-            .ok_or(BankRefusal::Topology)?;
-        self.custody.providers[index] =
-            Some(Arc::new(file.try_clone().map_err(|_| BankRefusal::Native)?));
+            .retain_inventory_target(target.object)
+            .map_err(|_| BankRefusal::Ownership)?;
+        self.custody.providers[index] = Some(retained);
         let object = aya_obj::Map::new_from_params(6, 4, 24, 1, 0);
         let data =
             MapData::create(object, "p11_counter_bank", None).map_err(|_| BankRefusal::Native)?;
@@ -1109,6 +1153,7 @@ impl Session {
     pub(crate) fn counter_bank_view(
         &self,
         plan: &AttachPlan,
+        objects: &PinnedObjects,
     ) -> Result<CounterBankView, BankRefusal> {
         let banks = self.counter_banks.as_ref().ok_or(BankRefusal::Shape)?;
         let directory = banks
@@ -1121,7 +1166,12 @@ impl Session {
             .lock()
             .map_err(|_| BankRefusal::Quarantined)?;
         let status = match directory.validate_read_plan(plan) {
-            Ok(()) => BankReadStatus::Healthy,
+            Ok(()) => {
+                validate_provider_slots(&plan.slots, objects, directory.published, |index| {
+                    custody.providers[index as usize].as_ref()
+                })?;
+                BankReadStatus::Healthy
+            }
             Err(BankRefusal::Quarantined) => BankReadStatus::Quarantined,
             Err(_) => BankReadStatus::Routing,
         };
@@ -1256,14 +1306,20 @@ mod tests {
         foreign_inner: Option<u32>,
         failed_delete: bool,
         failed_retire: bool,
+        provider_guard: Option<(PinnedObjects, [Option<RetainedInventoryTarget>; BANKS])>,
     }
 
     impl BankIo for Native {
         fn possible_cpus(&self) -> usize {
             2
         }
-        fn validate_targets(&mut self, _: &[Slot]) -> Result<(), BankRefusal> {
+        fn validate_targets(&mut self, slots: &[Slot], published: u64) -> Result<(), BankRefusal> {
             self.trace.push("validate");
+            if let Some((pins, retained)) = &self.provider_guard {
+                validate_provider_slots(slots, pins, published, |index| {
+                    retained[index as usize].as_ref()
+                })?;
+            }
             Ok(())
         }
 
@@ -1703,6 +1759,11 @@ mod tests {
         let mut switched = foreign;
         assert!(switched.absorb(same).is_empty());
         assert_eq!(switched.pinned().count(), 2);
+        appended.slots[1].object = switched
+            .pinned()
+            .map(|pin| pin.id)
+            .find(|&id| id != selected.slots[0].object)
+            .unwrap();
         let bindings = native.provider_guard.as_mut().unwrap();
         bindings.0 = switched;
         let charged = pool.snapshot().charged_bytes;
@@ -1724,6 +1785,22 @@ mod tests {
                 "allocate" | "inner" | "metadata" | "return" | "entry" | "commit"
             )
         }));
+        let mut restored = real_scan_pin(&old_path, None, 4, "same-content-digest");
+        assert!(
+            restored
+                .absorb(real_scan_pin(&foreign_path, None, 5, "same-content-digest"))
+                .is_empty()
+        );
+        native.provider_guard.as_mut().unwrap().0 = restored;
+        assert!(matches!(
+            directory.stage_with(&mut native, &appended, reservation(), &pool.reserver()),
+            BankPublication::Published {
+                transaction: 2,
+                mask: 2
+            }
+        ));
+        assert_eq!(native.metadata[&0].transaction, 1);
+        assert_eq!(native.commits[&1].mask, 1);
     }
 
     #[test]

@@ -622,6 +622,11 @@ impl MachineScene {
     }
 
     fn appear(&mut self, file: u32, epoch: u32) {
+        self.stage_appearance_mapping(file);
+        self.make_provider_present(file, epoch);
+    }
+
+    fn stage_appearance_mapping(&mut self, file: u32) {
         let pid = std::process::id();
         let caller = self
             .scene
@@ -653,10 +658,25 @@ impl MachineScene {
                 },
                 70,
             );
+    }
+
+    fn make_provider_present(&mut self, file: u32, epoch: u32) {
         let mut held = self.scene.real.h0.0.borrow_mut();
         assert!(held.io.absent_files.remove(&file));
         let (base, _) = held.io.scan_input(file);
         held.io.scan_inputs.insert(file, (base, epoch));
+    }
+
+    fn reach_phase(&mut self, phase: &str) {
+        for _ in 0..512 {
+            if self.machine.diagnostic_snapshot_for_test().0 == phase {
+                return;
+            }
+            self.service(1).unwrap_or_else(|reason| {
+                self.publication_failed(phase, None, Some(reason));
+            });
+        }
+        self.publication_failed(phase, None, None);
     }
 
     fn new(providers: usize) -> Self {
@@ -932,6 +952,238 @@ impl MachineScene {
             .instance_semantic_edges()
             .map(|record| record.feed.reduced())
             .collect()
+    }
+}
+
+#[test]
+fn joint_machine_current_provider_uses_frozen_physical_mapping_only() {
+    for mapping in ["healthy", "later", "foreign", "unscanned", "retired"] {
+        let mut fixture = MachineScene::absence_scene(3);
+        fixture.wait_absence(1);
+        fixture.make_provider_present(1, 2);
+        if mapping != "later" {
+            fixture.stage_appearance_mapping(if mapping == "foreign" { 2 } else { 1 });
+        }
+        if mapping == "healthy" {
+            // Two notes of the SAME exact key do not introduce ambiguity.
+            fixture.stage_appearance_mapping(1);
+        }
+        let coordinator = &mut fixture.scene.real.scene.coordinator;
+        let caller = coordinator.adapter().live_id(std::process::id()).unwrap();
+        if mapping == "unscanned" {
+            coordinator.registry_mut().note_member_unscanned(caller);
+        } else if mapping == "retired" {
+            coordinator.registry_mut().retire_caller(
+                caller,
+                "original physical retirement".into(),
+                71,
+            );
+        }
+        fixture
+            .scene
+            .push(std::process::id(), 1, "C_CreateObject", 2);
+        fixture.reach_phase("PreparingAdmissions");
+        let identity = fixture
+            .machine
+            .retained_raw_for_test()
+            .unwrap()
+            .h0_identity();
+        if mapping == "later" {
+            fixture.stage_appearance_mapping(1);
+            // A repeated preparation cannot widen the original prefix to
+            // admit a note queued AFTER its physical context was frozen.
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .registry_mut()
+                .freeze_joint_physical_prefix(fixture.machine.retained_raw_for_test().unwrap())
+                .unwrap();
+        }
+        fixture.reach_phase("BindingKeys");
+        let coordinator = &fixture.scene.real.scene.coordinator;
+        let prepared = coordinator.prepared_semantic_batch().unwrap();
+        let current = prepared
+            .current_receipts()
+            .iter()
+            .find(|receipt| receipt.endpoint().file_slot == 1)
+            .unwrap();
+        assert_eq!(current.birth_quantum(), Some(identity), "{mapping}");
+        let binding = coordinator
+            .semantic_bindings()
+            .find_by_image(current.domain(), current.image())
+            .unwrap();
+        assert!(Arc::ptr_eq(&binding.pin(), current.original_pin()));
+        let module = coordinator.registry().joint_current_provider_module(
+            current,
+            binding,
+            fixture.scene.real.lane.subset(),
+        );
+        assert_eq!(
+            module,
+            (mapping == "healthy").then_some(&fixture.scene.real.modules[1].0),
+            "{mapping}: only the exact frozen physical context may label this Current"
+        );
+        assert_eq!(
+            binding.provider_for_endpoint(current.endpoint()).is_some(),
+            mapping == "healthy",
+            "{mapping}: a mapping label must still traverse the actual owner validator and promotion"
+        );
+        assert!(fixture.pending_absence(1).is_some());
+        assert!(fixture.ready_birth(1).is_none());
+        assert!(
+            fixture
+                .native
+                .birth_outcomes
+                .iter()
+                .all(|(file, _)| *file != 1),
+            "{mapping}: provider preparation does not consume the original New"
+        );
+        assert_eq!(
+            coordinator
+                .joint_capture()
+                .adapter()
+                .invocation_claims_for_test()
+                .0,
+            0
+        );
+        if mapping == "healthy" {
+            fixture.published_labeled("absence-frozen-mapping", None);
+            assert!(fixture.pending_absence(1).is_none());
+            assert!(fixture.ready_birth(1).is_some());
+            assert_eq!(fixture.reduced_for(1), 1);
+        }
+    }
+}
+
+#[test]
+fn joint_machine_current_provider_validation_and_storage_preserve_original() {
+    for refusal in ["healthy", "epoch", "storage"] {
+        let mut fixture = MachineScene::absence_scene(2);
+        fixture.wait_absence(1);
+        fixture.appear(1, 2);
+        fixture
+            .scene
+            .push(std::process::id(), 1, "C_CreateObject", 2);
+        fixture.reach_phase("BindingKeys");
+        let coordinator = &fixture.scene.real.scene.coordinator;
+        let current = coordinator
+            .prepared_semantic_batch()
+            .unwrap()
+            .current_receipts()
+            .iter()
+            .find(|receipt| receipt.endpoint().file_slot == 1)
+            .unwrap();
+        let original = (
+            current.birth_quantum().unwrap(),
+            Arc::as_ptr(current.original_pin()),
+            current.watched().retirement_lease(),
+            current.instances().to_vec(),
+        );
+        let binding = coordinator
+            .semantic_bindings()
+            .find_by_image(current.domain(), current.image())
+            .unwrap();
+        let module = coordinator
+            .registry()
+            .joint_current_provider_module(current, binding, fixture.scene.real.lane.subset())
+            .unwrap();
+        let reserve = coordinator.registry().semantic_storage_reserver();
+        let before = coordinator.registry().semantic_resource_snapshot();
+        let roles = coordinator.joint_capture().ledger().roles_for_test();
+        let claims = coordinator
+            .joint_capture()
+            .adapter()
+            .invocation_claims_for_test();
+        let h3 = coordinator.reference_h3_audit_state();
+        if refusal == "epoch" {
+            let mut held = fixture.scene.real.h0.0.borrow_mut();
+            let (base, epoch) = held.io.scan_input(1);
+            held.io.scan_inputs.insert(1, (base, epoch + 1));
+        }
+        let hold = (refusal == "storage").then(|| {
+            reserve
+                .reserve(before.limit_bytes - before.charged_bytes)
+                .unwrap()
+        });
+        let reservation_calls = Cell::new(0);
+        let validations = fixture.scene.real.h0.0.borrow().validations;
+        let mut report = TickReport::default();
+        let result = fixture.scene.real.lane.validate_current_for_provider(
+            current,
+            Some(module),
+            &mut report,
+            |bytes| {
+                reservation_calls.set(reservation_calls.get() + 1);
+                reserve.reserve(bytes)
+            },
+        );
+        assert_eq!(
+            fixture.scene.real.h0.0.borrow().validations,
+            validations + 1
+        );
+        match refusal {
+            "healthy" => {
+                let (_, provider) = result.unwrap();
+                let provider = provider.unwrap();
+                assert!(
+                    coordinator
+                        .registry()
+                        .semantic_resource_snapshot()
+                        .charged_bytes
+                        > before.charged_bytes
+                );
+                drop(provider);
+                assert_eq!(reservation_calls.get(), 1);
+            }
+            "epoch" => {
+                assert!(matches!(result, Err(CurrentReceiptRefusal::Epoch)));
+                assert_eq!(reservation_calls.get(), 0);
+            }
+            "storage" => {
+                assert!(matches!(
+                    result,
+                    Ok((_, Err(SemanticRefusal::ProviderStorage)))
+                ));
+                assert_eq!(reservation_calls.get(), 1);
+            }
+            _ => unreachable!(),
+        }
+        drop(hold);
+        assert_eq!(
+            coordinator
+                .registry()
+                .semantic_resource_snapshot()
+                .charged_bytes,
+            before.charged_bytes,
+            "{refusal}: rejected and temporary provider copies refund their exact leases"
+        );
+        assert_eq!(current.birth_quantum(), Some(original.0));
+        assert_eq!(Arc::as_ptr(current.original_pin()), original.1);
+        assert!(Arc::ptr_eq(
+            &current.watched().retirement_lease(),
+            &original.2
+        ));
+        assert_eq!(current.instances(), original.3);
+        assert!(fixture.pending_absence(1).is_some());
+        assert!(fixture.ready_birth(1).is_none());
+        assert_eq!(coordinator.joint_capture().ledger().roles_for_test(), roles);
+        assert_eq!(
+            coordinator
+                .joint_capture()
+                .adapter()
+                .invocation_claims_for_test(),
+            claims
+        );
+        assert_eq!(coordinator.reference_h3_audit_state(), h3);
+        assert!(
+            fixture
+                .native
+                .birth_outcomes
+                .iter()
+                .all(|(file, _)| *file != 1)
+        );
     }
 }
 

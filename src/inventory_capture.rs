@@ -1641,7 +1641,11 @@ pub(crate) enum AppliedPassPhase {
     ScopedReceipts,
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // B1 consumes the owned outcome before activation.
+#[cfg_attr(not(test), allow(dead_code))]
+// B1 consumes the owned outcome before activation.
+// Move the bounded original owners inline; boxing would add a fallible
+// allocation and resource charge precisely on this failure handoff.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum RetainedPass {
     /// Publication began before any new pass. Never fabricate a collection
     /// or report just to return the existing driver/native ownership.
@@ -1671,7 +1675,11 @@ pub(crate) struct RetainedClassicRun<L> {
     pub(crate) host_stopped: bool,
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // Actual callers must adopt this before enabling Pending.
+#[cfg_attr(not(test), allow(dead_code))]
+// Actual callers must adopt this before enabling Pending.
+// Move the bounded original owners inline; boxing would add a fallible
+// allocation and resource charge precisely on this failure handoff.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum ClassicCompletion<L> {
     Finalized {
         stopped: Option<Stopped<L>>,

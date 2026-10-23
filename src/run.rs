@@ -2403,6 +2403,7 @@ fn run_loop(
                 ring_bytes,
                 uretprobe_override,
                 resource_start,
+                None,
             )
         }
         Kind::Trace => {
@@ -4367,6 +4368,7 @@ type ProfileTerminalContext<
     'stdout_ref,
     'stdout_open,
     'output,
+    'collection,
 > = (
     &'engine mut Engine,
     &'session mut Session,
@@ -4374,6 +4376,7 @@ type ProfileTerminalContext<
     &'stdout_ref mut crate::sink::SinkWriter<crate::sink::StdoutInner>,
     &'stdout_open mut bool,
     &'output mut Option<AtomicFile>,
+    &'collection mut metrics::CaptureCollection,
 );
 
 type TraceTickContext<
@@ -4652,6 +4655,7 @@ fn capture_profile(
     ring_bytes: Option<u32>,
     uretprobe_override: Option<render::UretprobeOverride>,
     resource_start: crate::timing::ResourceSample,
+    counter_inputs: Option<metrics::CounterCaptureInputs>,
 ) -> Result<render::Evidence> {
     // Opened by the caller before the attach; published by `commit()` only
     // once the final report is written.
@@ -4663,6 +4667,7 @@ fn capture_profile(
     let stdout: &mut crate::sink::SinkWriter<crate::sink::StdoutInner> = &mut stdout_sink;
     let profile = policy.uses_events();
     let mode = if profile { "profile" } else { "metrics" };
+    let mut collection = metrics::CaptureCollection::new(counter_inputs);
 
     // Only `--mode profile` decodes the event stream; `--mode metrics` never
     // drains the ring buffer, so it stays the lighter, maps-only level.
@@ -4765,7 +4770,7 @@ fn capture_profile(
     let mut frames = 0u64;
     let mut ticks = 0u64;
     let mut pin_gate = crate::timing::PinSweepGate::new();
-    let mut last_snapshot: Option<(Vec<metrics::SlotReport>, metrics::KernelEvidence)> = None;
+    let mut last_snapshot: Option<metrics::CaptureSnapshot> = None;
     #[cfg(test)]
     crate::first_use_probe::discovery_loss(
         crate::first_use_probe::DiscoveryStage::BeforeLoop,
@@ -4913,15 +4918,13 @@ fn capture_profile(
                 |context, consumers| {
                     profile_tick_snapshot(tick_frame, snapshot_cache, || {
                         let phase_start = Instant::now();
-                        let mut kernel_evidence = metrics::kernel_evidence(context.1)?;
-                        if !profile {
-                            kernel_evidence.ring_loss = 0;
-                        }
-                        let reports = metrics::read(context.1, context.0.plan())?;
+                        let snapshot = collection.fresh(
+                            context.1, context.0.plan(), context.0.pinned(), profile,
+                        )?;
                         consumers
                             .scheduling
                             .add_phase(SchedulingPhase::Maps, phase_start.elapsed());
-                        Ok((reports, kernel_evidence))
+                        Ok(snapshot)
                     })
                 },
                 |context| {
@@ -4937,10 +4940,12 @@ fn capture_profile(
                 },
             )?
         };
-        let (paused, (reports, kernel_evidence)) = match tick {
+        let (paused, snapshot) = match tick {
             CaptureTick::Continue { paused, snapshot } => (paused, snapshot),
             CaptureTick::End(end) => break Ok(end),
         };
+        let reports = snapshot.reports();
+        let kernel_evidence = snapshot.kernel_evidence();
 
         if tick_frame.render {
             last_frame = Instant::now();
@@ -4949,7 +4954,7 @@ fn capture_profile(
             scheduling.sync_engine_stages(engine);
             scheduling.sync_newcomer_stats(engine, crate::attach::monotonic_ns());
             scheduling.sync_tail_stats(engine);
-            let ev = evidence_for(
+            let mut ev = evidence_for(
                 engine,
                 engine.capture_facts(),
                 session.attached_probes(),
@@ -4957,7 +4962,7 @@ fn capture_profile(
                 session.static_multi_attached(),
                 session.attach_backend_evidence(),
                 session.attach_failures(),
-                &reports,
+                reports,
                 kernel_evidence,
                 process_tracker.evidence(),
                 malformed_records,
@@ -4973,8 +4978,9 @@ fn capture_profile(
                     .as_deref()
                     .and_then(|owned| owned.still_running.then_some(owned.pid)),
             );
-            let frame = render::live_scoped(
-                &reports,
+            render::apply_counter_snapshot(&mut ev, &snapshot);
+            let frame = render::live_snapshot_scoped(
+                &snapshot,
                 &ev,
                 elapsed,
                 &engine.capture_facts().heading(),
@@ -5201,6 +5207,7 @@ fn capture_profile(
                         &mut *stdout,
                         &mut stdout_open,
                         &mut output,
+                        &mut collection,
                     );
                     let mut consumers = CaptureConsumers {
                         state: &mut state,
@@ -5281,6 +5288,7 @@ fn capture_profile(
                 &mut *stdout,
                 &mut stdout_open,
                 &mut output,
+                &mut collection,
             );
             let mut consumers = CaptureConsumers {
                 state: &mut state,
@@ -5295,7 +5303,7 @@ fn capture_profile(
                 &mut consumers,
                 quiesced,
                 terminal_diagnostics().as_mut(),
-                |context: &mut ProfileTerminalContext<'_, '_, '_, '_, '_, '_, '_>,
+                |context: &mut ProfileTerminalContext<'_, '_, '_, '_, '_, '_, '_, '_>,
                  consumers: &mut CaptureConsumers<'_>,
                  quiesced| {
                     poll_terminal_cancellation();
@@ -5404,7 +5412,7 @@ fn capture_profile(
     /// with quiescence unproven, never reusing Q positions it never reached.
     #[allow(clippy::too_many_arguments)]
     fn run_terminal(
-        context: &mut ProfileTerminalContext<'_, '_, '_, '_, '_, '_, '_>,
+        context: &mut ProfileTerminalContext<'_, '_, '_, '_, '_, '_, '_, '_>,
         consumers: &mut CaptureConsumers<'_>,
         scope: &Scope,
         profile: bool,
@@ -5422,12 +5430,13 @@ fn capture_profile(
         poll_terminal_cancellation();
         context.3.begin_tick(crate::sink::SINK_TICK_BUDGET);
         let maps_start = Instant::now();
-        let reports = metrics::read(context.1, context.0.plan())?;
-        let mut kernel_evidence = metrics::kernel_evidence(context.1)?;
+        let snapshot =
+            context
+                .6
+                .terminal(context.1, context.0.plan(), context.0.pinned(), profile)?;
+        let reports = snapshot.reports();
+        let kernel_evidence = snapshot.kernel_evidence();
         poll_terminal_cancellation();
-        if !profile {
-            kernel_evidence.ring_loss = 0;
-        }
         consumers
             .scheduling
             .add_phase(SchedulingPhase::Maps, maps_start.elapsed());
@@ -5471,7 +5480,7 @@ fn capture_profile(
             context.1.static_multi_attached(),
             context.1.attach_backend_evidence(),
             context.1.attach_failures(),
-            &reports,
+            reports,
             kernel_evidence,
             consumers.tracker.evidence(),
             *consumers.malformed_records,
@@ -5495,9 +5504,10 @@ fn capture_profile(
         );
         ev.apply_stop_quiescence(consumers.stop_quiescence);
         ev.settle_terminal(profile);
+        render::apply_counter_snapshot(&mut ev, &snapshot);
         let facts = context.0.capture_facts();
-        let frame = render::live_scoped(
-            &reports,
+        let frame = render::live_snapshot_scoped(
+            &snapshot,
             &ev,
             clock.elapsed(),
             &facts.heading(),
@@ -5520,6 +5530,7 @@ fn capture_profile(
                 .snapshot(crate::events::TERMINAL_DRAIN_BOUND as u64),
             profile,
         );
+        render::apply_counter_snapshot(&mut ev, &snapshot);
         let summary = timing_summary_line(&ev.scheduling);
         poll_terminal_cancellation();
         let _ = crate::sink::try_stderr_line(&summary);
@@ -5543,14 +5554,15 @@ fn capture_profile(
             };
             let j = if profile {
                 render::profile_json(
-                    &reports,
+                    reports,
                     render::VersionedEvidence::wrap(&ev),
                     consumers.state,
                     &capture,
                 )
             } else {
-                render::json(&reports, &ev, &capture)
+                render::json(reports, &ev, &capture)
             };
+            let j = render::with_counter_snapshot(j, &snapshot);
             poll_terminal_cancellation();
             write_json_report(out_file.file(), &j)?;
             poll_terminal_cancellation();
@@ -17211,6 +17223,7 @@ mod tests {
             );
             for forbidden in [
                 "metrics::read",
+                "collection.fresh",
                 "profile_tick_snapshot",
                 "live_display",
                 "frame_tick",

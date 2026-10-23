@@ -16,6 +16,8 @@ mod counter_reader;
 #[cfg_attr(not(test), allow(dead_code))]
 mod counter_projection;
 
+pub(crate) use counter_projection::{CaptureCollection, CaptureSnapshot, CounterCaptureInputs};
+
 #[cfg(test)]
 pub(crate) use counter_projection::tests::{ConsumerFault, ConsumerFixture};
 

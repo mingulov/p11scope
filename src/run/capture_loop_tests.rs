@@ -4,6 +4,35 @@ use crate::events::{EventDrain, LIVE_POLL_QUANTUM, ScriptedRecords};
 use p11scope_ebpf_common::{Event, capture, event_type};
 
 #[test]
+fn profile_counter_consumers_share_collection_at_both_terminal_paths() {
+    let source = include_str!("../run.rs");
+    let profile = source
+        .split_once("fn capture_profile(")
+        .unwrap()
+        .1
+        .split_once("fn write_json_report")
+        .unwrap()
+        .0;
+    assert_eq!(
+        profile
+            .matches("metrics::CaptureCollection::new(counter_inputs)")
+            .count(),
+        1
+    );
+    assert_eq!(profile.matches("collection.fresh(").count(), 1);
+    let compact: String = profile.chars().filter(|ch| !ch.is_whitespace()).collect();
+    assert_eq!(compact.matches("context.6.terminal(").count(), 1);
+    assert_eq!(
+        profile.matches("&mut collection,").count(),
+        2,
+        "both normal and quiesce-error finalizers retain the actual live collector"
+    );
+    let terminal = profile.split_once("fn run_terminal(").unwrap().1;
+    assert!(!terminal.contains("last_snapshot"));
+    assert!(!terminal.contains("profile_tick_snapshot("));
+}
+
+#[test]
 fn profile_counter_modes_share_the_live_and_terminal_collection() {
     use p11scope_ebpf_common::CounterMode;
     for mode in [
@@ -181,6 +210,35 @@ fn profile_counter_generation_and_stale_status_keep_accepted_identity() {
     assert_eq!(metadata["status"], "stale");
     assert_eq!(stale.reports()[0].mode, CounterMode::Timestamps);
     assert_eq!(stale.reports()[0].calls, 7);
+}
+
+#[test]
+fn profile_counter_failed_read_preserves_additional_native_kernel_evidence() {
+    use p11scope_ebpf_common::CounterMode;
+    let mut fixture = metrics::ConsumerFixture::new();
+    fixture.fresh(CounterMode::Counts, 1, 5, None).unwrap();
+    let stale = fixture
+        .fresh(
+            CounterMode::Timestamps,
+            2,
+            8,
+            Some(metrics::ConsumerFault::KernelLoss),
+        )
+        .unwrap();
+    assert_eq!(
+        stale.kernel_evidence().ring_loss,
+        7,
+        "counter evidence is never metrics-masked"
+    );
+    assert_eq!(stale.kernel_evidence().start_insert_failures, 3);
+    assert_eq!(
+        stale.counter_collection().unwrap()["failure"],
+        "kernel_evidence"
+    );
+    assert_eq!(stale.counter_collection().unwrap()["mode"], "counts");
+    assert_eq!(stale.counter_collection().unwrap()["generation"], 1);
+    assert_eq!(stale.reports()[0].calls, 5);
+    assert_eq!(fixture.reads(), (2, 0));
 }
 
 fn open_plan() -> crate::plan::AttachPlan {

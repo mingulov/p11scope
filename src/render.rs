@@ -1765,6 +1765,40 @@ pub fn live(
     live_scoped(reports, ev, elapsed, module, mode, policy, "selected")
 }
 
+/// Derive the extra observation gap from the protected snapshot. This is
+/// reapplied after terminal verdict recomputation, without changing the
+/// existing Evidence layout or the legacy cause/class accounting.
+pub(crate) fn apply_counter_snapshot(
+    ev: &mut Evidence,
+    snapshot: &crate::metrics::CaptureSnapshot,
+) {
+    if snapshot.has_counter_gap() {
+        let observation = &mut ev.gap_classes.observation;
+        if !observation.causes.contains(&"counter_collection") {
+            observation.causes.push("counter_collection");
+        }
+        observation.status = "lossy";
+        ev.completeness = "PARTIAL";
+        ev.verdict_detail = VERDICT_CONCRETE_GAP;
+    }
+}
+
+pub(crate) fn live_snapshot_scoped(
+    snapshot: &crate::metrics::CaptureSnapshot,
+    ev: &Evidence,
+    elapsed: Duration,
+    module: &str,
+    mode: &str,
+    policy: CapturePolicy,
+    scope: &str,
+) -> String {
+    let mut frame = live_scoped(snapshot.reports(), ev, elapsed, module, mode, policy, scope);
+    if let Some(summary) = snapshot.counter_summary() {
+        frame.push_str(&summary);
+    }
+    frame
+}
+
 /// The capture renderer receives only the validated scope kind.
 pub fn live_scoped(
     reports: &[SlotReport],
@@ -1984,6 +2018,7 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str]) -> Vec<String> {
             "malformed_records" => count(ev.malformed_records, "malformed records"),
             "provider_changed" => "provider changed".to_string(),
             "trace_truncated" => "trace truncated at its event cap".to_string(),
+            "counter_collection" => "counter collection incomplete".to_string(),
             "proc_namespace_mismatch" => {
                 "/proc numbering foreign: kernel PIDs unresolvable".to_string()
             }
@@ -2228,6 +2263,21 @@ pub fn json(reports: &[SlotReport], ev: &Evidence, capture: &CaptureMeta<'_>) ->
         "evidence": ev,
         "functions": functions_out(reports, &ev.discovery.modules),
     })
+}
+
+/// Only a protected accepted snapshot can supply this optional derived data.
+/// Ordinary capture/trace evidence and all existing initializers stay intact.
+pub(crate) fn with_counter_snapshot(
+    mut document: serde_json::Value,
+    snapshot: &crate::metrics::CaptureSnapshot,
+) -> serde_json::Value {
+    if let Some(collection) = snapshot.counter_collection() {
+        document["evidence"]
+            .as_object_mut()
+            .expect("capture renderer emits an evidence object")
+            .insert("counter_collection".into(), collection);
+    }
+    document
 }
 
 /// Type-enforced versioned evidence (SYSPLAN residual F-08): the only input
@@ -2829,6 +2879,176 @@ pub(crate) mod tests {
                 "{mode:?}"
             );
         }
+    }
+
+    #[test]
+    fn protected_counter_snapshot_adapters_preserve_legacy_outputs() {
+        for profile in [false, true] {
+            let snapshot = crate::metrics::ConsumerFixture::ordinary_snapshot(profile);
+            let mut ev = evidence();
+            ev.verdict_with_selection(profile);
+            let before = serde_json::to_value(&ev).unwrap();
+            apply_counter_snapshot(&mut ev, &snapshot);
+            assert_eq!(serde_json::to_value(&ev).unwrap(), before);
+            let capture = capture_fixture();
+            let document = if profile {
+                profile_json(
+                    snapshot.reports(),
+                    VersionedEvidence::wrap(&ev),
+                    &state_fixture(),
+                    &capture,
+                )
+            } else {
+                json(snapshot.reports(), &ev, &capture)
+            };
+            assert_eq!(with_counter_snapshot(document.clone(), &snapshot), document);
+            assert_eq!(
+                live_snapshot_scoped(
+                    &snapshot,
+                    &ev,
+                    Duration::ZERO,
+                    "owned",
+                    "profile",
+                    capture.policy,
+                    "pid"
+                ),
+                live_scoped(
+                    snapshot.reports(),
+                    &ev,
+                    Duration::ZERO,
+                    "owned",
+                    "profile",
+                    capture.policy,
+                    "pid"
+                ),
+            );
+            assert!(
+                !versioned_evidence(&ev)
+                    .as_object()
+                    .unwrap()
+                    .contains_key("counter_collection")
+            );
+        }
+    }
+
+    #[test]
+    fn protected_counter_snapshot_metadata_uses_actual_modes_and_aggregate_totals() {
+        let mut detail =
+            crate::semantics::State::with_policy(&init_plan(), CapturePolicy::Allowlisted);
+        let mut event = init_event(0, 0x0D, shape::NONE, 0, 0, 0);
+        event.cgroup_id = 111;
+        detail.observe(&event);
+        detail.observe(&event);
+        for mode in [
+            CounterMode::Counts,
+            CounterMode::Timestamps,
+            CounterMode::Latency,
+        ] {
+            let mut fixture = crate::metrics::ConsumerFixture::new();
+            let snapshot = fixture.fresh(mode, 1, 5, None).unwrap();
+            let mut ev = evidence();
+            ev.verdict_with_selection(false);
+            let before = serde_json::to_value(&ev).unwrap();
+            apply_counter_snapshot(&mut ev, &snapshot);
+            assert_eq!(serde_json::to_value(&ev).unwrap(), before);
+            for profile in [false, true] {
+                let capture = capture_fixture();
+                let document = if profile {
+                    profile_json(
+                        snapshot.reports(),
+                        VersionedEvidence::wrap(&ev),
+                        &detail,
+                        &capture,
+                    )
+                } else {
+                    json(snapshot.reports(), &ev, &capture)
+                };
+                let document = with_counter_snapshot(document, &snapshot);
+                assert_eq!(
+                    document["evidence"]["counter_collection"],
+                    snapshot.counter_collection().unwrap()
+                );
+                assert_eq!(
+                    document["evidence"]["counter_collection"]["mode"],
+                    mode.name()
+                );
+                assert_eq!(document["functions"][0]["calls"], 5);
+                if profile {
+                    assert_eq!(
+                        document["cgroups"][0]["calls"], 2,
+                        "selected detail is nonempty"
+                    );
+                }
+                let timing = &document["functions"][0]["latency_ns"];
+                if mode == CounterMode::Counts {
+                    assert!(timing.is_null());
+                } else if mode == CounterMode::Timestamps {
+                    assert_eq!(timing["total"], 500);
+                    assert!(timing["p50"].is_null());
+                } else {
+                    assert_eq!(timing["total"], 500);
+                    assert!(!timing["p50"].is_null());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn protected_counter_failures_and_discontinuity_cannot_render_complete() {
+        for fault in [
+            crate::metrics::ConsumerFault::Saturated,
+            crate::metrics::ConsumerFault::Contended,
+        ] {
+            let mut fixture = crate::metrics::ConsumerFixture::new();
+            fixture.fresh(CounterMode::Counts, 1, 5, None).unwrap();
+            let stale = fixture
+                .fresh(CounterMode::Counts, 1, 8, Some(fault))
+                .unwrap();
+            let mut ev = evidence();
+            ev.verdict_with_selection(false);
+            let attribution = ev.gap_classes.attribution.clone();
+            let semantics = ev.gap_classes.semantics.clone();
+            apply_counter_snapshot(&mut ev, &stale);
+            apply_counter_snapshot(&mut ev, &stale);
+            assert_eq!(ev.completeness, "PARTIAL");
+            assert_eq!(ev.verdict_detail, VERDICT_CONCRETE_GAP);
+            assert_eq!(
+                ev.gap_classes
+                    .observation
+                    .causes
+                    .iter()
+                    .filter(|&&cause| cause == "counter_collection")
+                    .count(),
+                1
+            );
+            assert_eq!(ev.gap_classes.attribution, attribution);
+            assert_eq!(ev.gap_classes.semantics, semantics);
+            let frame = live_snapshot_scoped(
+                &stale,
+                &ev,
+                Duration::ZERO,
+                "owned",
+                "metrics",
+                CapturePolicy::AggregateOnly,
+                "pid",
+            );
+            assert!(frame.contains("last read stale"), "{frame}");
+            assert!(frame.contains("PARTIAL"), "{frame}");
+            let document =
+                with_counter_snapshot(json(stale.reports(), &ev, &capture_fixture()), &stale);
+            assert!(document["evidence"]["counter_collection"]["health"].is_null());
+            assert_eq!(document["functions"][0]["calls"], 5);
+        }
+        let mut fixture = crate::metrics::ConsumerFixture::new();
+        fixture.fresh(CounterMode::Counts, 1, 5, None).unwrap();
+        let changed = fixture.terminal(CounterMode::Counts, 2, 8, None).unwrap();
+        let mut ev = evidence();
+        ev.settle_terminal(false);
+        apply_counter_snapshot(&mut ev, &changed);
+        assert_eq!(ev.completeness, "PARTIAL");
+        assert_eq!(ev.verdict_detail, VERDICT_CONCRETE_GAP);
+        assert_eq!(changed.counter_collection().unwrap()["status"], "fresh");
+        assert_eq!(changed.counter_collection().unwrap()["discontinuity"], true);
     }
 
     fn ok_surface() -> crate::plan::SurfaceSummary {

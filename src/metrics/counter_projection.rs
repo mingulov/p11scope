@@ -95,6 +95,333 @@ impl CounterSnapshot {
     }
 }
 
+impl CounterFailure {
+    fn with_observed_health(self, health: CounterHealth) -> Self {
+        if health.saturated {
+            Self::Collection(CounterIssue::ProducerSaturated)
+        } else if health.contended {
+            Self::Collection(CounterIssue::Contended)
+        } else {
+            self
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Read(stage) => match stage {
+                ReadStage::Shape => "read_shape",
+                ReadStage::Budget => "read_budget",
+                ReadStage::Stats => "read_stats",
+                ReadStage::Rvs => "read_rvs",
+                ReadStage::Health => "read_health",
+                ReadStage::KernelEvidence => "read_kernel_evidence",
+                ReadStage::BankRouting => "bank_routing",
+                ReadStage::BankQuarantined => "bank_quarantined",
+            },
+            Self::Collection(issue) => match issue {
+                CounterIssue::Topology => "topology",
+                CounterIssue::Mode => "mode",
+                CounterIssue::GenerationRollback => "generation_rollback",
+                CounterIssue::Limits => "limits",
+                CounterIssue::ProducerSaturated | CounterIssue::Saturated { .. } => "saturated",
+                CounterIssue::Contended => "contended",
+                CounterIssue::KernelEvidence => "kernel_evidence",
+                CounterIssue::BankRouting => "bank_routing",
+                CounterIssue::BankQuarantined => "bank_quarantined",
+                CounterIssue::FoldOverflow(_) => "fold_overflow",
+                CounterIssue::Regressed { .. } => "regressed",
+            },
+            Self::Projection => "projection",
+        }
+    }
+}
+
+/// Admission/capture ownership supplies these limits and this existing pool.
+/// There is deliberately no default pool or Session-derived budget here.
+pub(crate) struct CounterCaptureInputs {
+    limits: CounterLimits,
+    reserve: SemanticResourceReserver,
+}
+
+impl CounterCaptureInputs {
+    pub(crate) fn new(rows: usize, rv_keys: usize, reserve: SemanticResourceReserver) -> Self {
+        Self {
+            limits: CounterLimits { rows, rv_keys },
+            reserve,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum CaptureData {
+    Legacy(Vec<SlotReport>, KernelEvidence),
+    Counter(CounterSnapshot),
+}
+
+/// Protected measurement plus an internal proof of acquisition in this call.
+/// Cached clones preserve the measured status/window but cannot settle capture.
+#[derive(Debug)]
+pub(crate) struct CaptureSnapshot {
+    data: CaptureData,
+    new_acquisition: bool,
+}
+
+impl Clone for CaptureSnapshot {
+    fn clone(&self) -> Self {
+        Self {
+            data: self.data.clone(),
+            new_acquisition: false,
+        }
+    }
+}
+
+impl CaptureSnapshot {
+    fn from_counter(snapshot: CounterSnapshot) -> anyhow::Result<Self> {
+        if !snapshot.has_data() || snapshot.kernel_evidence().is_none() {
+            anyhow::bail!(
+                "counter collection unavailable ({})",
+                snapshot
+                    .failure()
+                    .map_or("unavailable", CounterFailure::name)
+            );
+        }
+        Ok(Self {
+            new_acquisition: snapshot.is_fresh(),
+            data: CaptureData::Counter(snapshot),
+        })
+    }
+
+    fn counter(&self) -> Option<&CounterSnapshot> {
+        match &self.data {
+            CaptureData::Counter(snapshot) => Some(snapshot),
+            CaptureData::Legacy(..) => None,
+        }
+    }
+
+    pub(crate) fn reports(&self) -> &[SlotReport] {
+        match &self.data {
+            CaptureData::Legacy(reports, _) => reports,
+            CaptureData::Counter(snapshot) => snapshot.reports(),
+        }
+    }
+
+    pub(crate) fn kernel_evidence(&self) -> KernelEvidence {
+        match &self.data {
+            CaptureData::Legacy(_, kernel) => *kernel,
+            CaptureData::Counter(snapshot) => snapshot
+                .kernel_evidence()
+                .expect("a presented counter snapshot retains actual kernel evidence"),
+        }
+    }
+
+    pub(crate) fn has_counter_gap(&self) -> bool {
+        self.counter()
+            .is_some_and(|snapshot| !snapshot.is_fresh() || snapshot.discontinuity())
+    }
+
+    /// Metadata can only be obtained from this accepted protected snapshot.
+    /// A failed new attempt never substitutes its mode/generation/window.
+    pub(crate) fn counter_collection(&self) -> Option<serde_json::Value> {
+        let snapshot = self.counter()?;
+        Some(serde_json::json!({
+            "mode": snapshot.mode().expect("accepted mode").name(),
+            "generation": snapshot.generation().expect("accepted generation"),
+            "read_window": snapshot.window().map(|window| serde_json::json!({
+                "started_ns": window.started_ns, "finished_ns": window.finished_ns,
+            })),
+            "status": if snapshot.is_fresh() { "fresh" } else { "stale" },
+            "health": snapshot.health().map(|health| serde_json::json!({
+                "saturated": health.saturated, "contended": health.contended,
+            })),
+            "discontinuity": snapshot.discontinuity(),
+            "failure": snapshot.failure().map(CounterFailure::name),
+        }))
+    }
+
+    pub(crate) fn counter_summary(&self) -> Option<String> {
+        let snapshot = self.counter()?;
+        let status = snapshot.failure().map_or_else(
+            || "fresh".to_owned(),
+            |failure| format!("stale ({})", failure.name()),
+        );
+        Some(format!(
+            "Counter collection: {}; generation {}; last read {}{}\n",
+            snapshot.mode().expect("accepted mode").name(),
+            snapshot.generation().expect("accepted generation"),
+            status,
+            if snapshot.discontinuity() {
+                "; generation changed"
+            } else {
+                ""
+            },
+        ))
+    }
+
+    fn require_terminal(self) -> anyhow::Result<Self> {
+        if !self.new_acquisition || self.counter().is_some_and(|snapshot| !snapshot.is_fresh()) {
+            anyhow::bail!(
+                "terminal counter collection unavailable ({})",
+                self.counter()
+                    .and_then(CounterSnapshot::failure)
+                    .map_or("new_observation_required", CounterFailure::name)
+            );
+        }
+        Ok(self)
+    }
+}
+
+/// The one collection owner shared by live snapshots and final publication.
+pub(crate) struct CaptureCollection {
+    counter: Option<CounterCapture>,
+}
+
+impl CaptureCollection {
+    pub(crate) fn new(inputs: Option<CounterCaptureInputs>) -> Self {
+        Self {
+            counter: inputs.map(|inputs| CounterCapture::new(inputs.limits, inputs.reserve)),
+        }
+    }
+
+    pub(crate) fn fresh(
+        &mut self,
+        session: &crate::attach::Session,
+        plan: &AttachPlan,
+        pins: &PinnedObjects,
+        profile: bool,
+    ) -> anyhow::Result<CaptureSnapshot> {
+        self.acquire(session, plan, pins, profile, false)
+    }
+
+    pub(crate) fn terminal(
+        &mut self,
+        session: &crate::attach::Session,
+        plan: &AttachPlan,
+        pins: &PinnedObjects,
+        profile: bool,
+    ) -> anyhow::Result<CaptureSnapshot> {
+        self.acquire(session, plan, pins, profile, true)
+    }
+
+    fn acquire(
+        &mut self,
+        session: &crate::attach::Session,
+        plan: &AttachPlan,
+        pins: &PinnedObjects,
+        profile: bool,
+        terminal: bool,
+    ) -> anyhow::Result<CaptureSnapshot> {
+        // A new scoped, opaque binding comes only from actual preparation.
+        let binding = session.counter_reader_binding();
+        let legacy = || {
+            // Preserve the existing order of ordinary live/terminal reads.
+            if terminal {
+                let reports = super::read(session, plan)?;
+                Ok((reports, super::kernel_evidence(session)?))
+            } else {
+                let kernel = super::kernel_evidence(session)?;
+                Ok((super::read(session, plan)?, kernel))
+            }
+        };
+        if terminal {
+            self.terminal_with(
+                plan,
+                pins,
+                profile,
+                binding,
+                super::counter_reader::read_bound,
+                legacy,
+            )
+        } else {
+            self.fresh_with(
+                plan,
+                pins,
+                profile,
+                binding,
+                super::counter_reader::read_bound,
+                legacy,
+            )
+        }
+    }
+
+    // I/O-only injection stays private. Production callers cannot supply an
+    // arbitrary retained read paired with a newly selected plan.
+    fn fresh_with<B>(
+        &mut self,
+        plan: &AttachPlan,
+        pins: &PinnedObjects,
+        profile: bool,
+        binding: Result<Option<B>, crate::attach::counter_banks::BankRefusal>,
+        acquire: impl FnOnce(
+            B,
+            &AttachPlan,
+            &PinnedObjects,
+            CounterLimits,
+            &SemanticResourceReserver,
+        ) -> Result<CounterRead, ReadStage>,
+        legacy: impl FnOnce() -> anyhow::Result<(Vec<SlotReport>, KernelEvidence)>,
+    ) -> anyhow::Result<CaptureSnapshot> {
+        match binding {
+            Ok(None) => {
+                if self.counter.is_some() {
+                    anyhow::bail!("counter collection requires its prepared Session binding");
+                }
+                let (reports, mut kernel) = legacy()?;
+                if !profile {
+                    kernel.ring_loss = 0;
+                }
+                Ok(CaptureSnapshot {
+                    data: CaptureData::Legacy(reports, kernel),
+                    new_acquisition: true,
+                })
+            }
+            binding => {
+                if self.counter.is_none() {
+                    let failure = match &binding {
+                        Err(crate::attach::counter_banks::BankRefusal::Quarantined) => {
+                            "bank_quarantined"
+                        }
+                        Err(_) => "bank_routing",
+                        _ => "owner limits and reserver required",
+                    };
+                    anyhow::bail!("prepared counter collection unavailable ({failure})");
+                }
+                let counter = self.counter.as_mut().expect("owner inputs checked above");
+                let snapshot =
+                    counter.fresh_with(plan, pins, |plan, pins, limits, reserve| match binding {
+                        Ok(Some(binding)) => acquire(binding, plan, pins, limits, reserve),
+                        Err(crate::attach::counter_banks::BankRefusal::Quarantined) => {
+                            Err(ReadStage::BankQuarantined)
+                        }
+                        Err(_) => Err(ReadStage::BankRouting),
+                        Ok(None) => unreachable!("ordinary binding was handled above"),
+                    });
+                CaptureSnapshot::from_counter(snapshot)
+            }
+        }
+    }
+
+    fn terminal_with<B>(
+        &mut self,
+        plan: &AttachPlan,
+        pins: &PinnedObjects,
+        profile: bool,
+        binding: Result<Option<B>, crate::attach::counter_banks::BankRefusal>,
+        acquire: impl FnOnce(
+            B,
+            &AttachPlan,
+            &PinnedObjects,
+            CounterLimits,
+            &SemanticResourceReserver,
+        ) -> Result<CounterRead, ReadStage>,
+        legacy: impl FnOnce() -> anyhow::Result<(Vec<SlotReport>, KernelEvidence)>,
+    ) -> anyhow::Result<CaptureSnapshot> {
+        // Always acquire, observe and project again. An Ok read with a folded
+        // row issue, health refusal or collector failure is not a settled read.
+        self.fresh_with(plan, pins, profile, binding, acquire, legacy)?
+            .require_terminal()
+    }
+}
+
 /// One collector per capture. No projection is reconstructed from a retained
 /// baseline and an unrelated newer plan, including on acquisition failure.
 pub(super) struct CounterCapture {
@@ -144,6 +471,7 @@ impl CounterCapture {
             }
         };
         let kernel = read.view().kernel;
+        let health = read.view().health;
         // Reserve and copy before observe can advance the baseline. Both the
         // acquisition's owned rows and the old displayed view remain charged.
         let (reports, storage) =
@@ -158,9 +486,11 @@ impl CounterCapture {
                         CounterObservation::ReadFailed(stage) => CounterFailure::Read(stage),
                         _ => unreachable!("invalid folded rows cannot establish a baseline"),
                     };
-                    return self.failed(failure, Some(kernel));
+                    return self.failed(failure.with_observed_health(health), Some(kernel));
                 }
-                Err(failure) => return self.failed(failure, Some(kernel)),
+                Err(failure) => {
+                    return self.failed(failure.with_observed_health(health), Some(kernel));
+                }
             };
         let observation = self.collector.observe(Ok(read));
         let failure = match &observation {
@@ -169,7 +499,7 @@ impl CounterCapture {
             _ => None,
         };
         if let Some(failure) = failure {
-            return self.failed(failure, Some(kernel));
+            return self.failed(failure.with_observed_health(health), Some(kernel));
         }
         self.discontinuity |= matches!(observation, CounterObservation::GenerationChanged { .. });
         let source = self
@@ -190,18 +520,6 @@ impl CounterCapture {
             attempted_kernel: Some(kernel),
             discontinuity: self.discontinuity,
         }
-    }
-
-    #[allow(dead_code)] // The actual prepared-binding consumer is integrated separately.
-    pub(super) fn fresh(
-        &mut self,
-        binding: crate::attach::counter_banks::CounterReaderBinding<'_>,
-        plan: &AttachPlan,
-        pins: &PinnedObjects,
-    ) -> CounterSnapshot {
-        self.fresh_with(plan, pins, |plan, pins, limits, reserve| {
-            super::counter_reader::read_bound(binding, plan, pins, limits, reserve)
-        })
     }
 }
 
@@ -417,6 +735,7 @@ pub(super) mod tests {
             generation,
             returned,
             CounterHealth::default(),
+            KernelEvidence::default(),
             reserve,
         )
     }
@@ -427,6 +746,7 @@ pub(super) mod tests {
         generation: u64,
         returned: u64,
         health: CounterHealth,
+        kernel: KernelEvidence,
         reserve: &SemanticResourceReserver,
     ) -> CounterRead {
         let reservation = ReadReservation::reserve(1, 2, reserve).unwrap();
@@ -501,7 +821,7 @@ pub(super) mod tests {
             ReadWindow::new(Some(10), Some(20)),
             Ok(rows),
             health,
-            KernelEvidence::default(),
+            kernel,
             reservation,
         )
         .unwrap()
@@ -511,8 +831,12 @@ pub(super) mod tests {
     pub(crate) enum ConsumerFault {
         ReadRvs,
         RowTopology,
+        RowTopologySaturated,
+        RowTopologyContended,
+        RowTopologySaturatedContended,
         Saturated,
         Contended,
+        KernelLoss,
     }
 
     /// The run-loop tests replace I/O only: every successful acquisition still
@@ -527,6 +851,20 @@ pub(super) mod tests {
     }
 
     impl ConsumerFixture {
+        pub(crate) fn ordinary_snapshot(profile: bool) -> CaptureSnapshot {
+            let (_file, plan, pins) = fixture();
+            CaptureCollection::new(None)
+                .fresh_with(
+                    &plan,
+                    &pins,
+                    profile,
+                    Ok(None::<()>),
+                    |(), _, _, _, _| panic!("ordinary snapshot cannot acquire counters"),
+                    || Ok((Vec::new(), KernelEvidence::default())),
+                )
+                .unwrap()
+        }
+
         pub(crate) fn new() -> Self {
             let (file, plan, pins) = fixture();
             let pool = SemanticResourcePool::reference_limit(32 * 1024 * 1024);
@@ -586,12 +924,32 @@ pub(super) mod tests {
                 native_reads.set(native_reads.get() + 1);
                 match fault {
                     Some(ConsumerFault::ReadRvs) => Err(ReadStage::Rvs),
-                    Some(ConsumerFault::RowTopology) => CounterRead::new(
+                    Some(
+                        ConsumerFault::RowTopology
+                        | ConsumerFault::RowTopologySaturated
+                        | ConsumerFault::RowTopologyContended
+                        | ConsumerFault::RowTopologySaturatedContended,
+                    ) => CounterRead::new(
                         std::num::NonZeroU64::new(generation).unwrap(),
                         mode,
                         ReadWindow::new(Some(30), Some(40)),
                         Err(CounterIssue::Topology),
-                        CounterHealth::default(),
+                        CounterHealth {
+                            saturated: matches!(
+                                fault,
+                                Some(
+                                    ConsumerFault::RowTopologySaturated
+                                        | ConsumerFault::RowTopologySaturatedContended
+                                )
+                            ),
+                            contended: matches!(
+                                fault,
+                                Some(
+                                    ConsumerFault::RowTopologyContended
+                                        | ConsumerFault::RowTopologySaturatedContended
+                                )
+                            ),
+                        },
                         KernelEvidence::default(),
                         ReadReservation::reserve(0, 0, reserve).unwrap(),
                     ),
@@ -603,6 +961,15 @@ pub(super) mod tests {
                         CounterHealth {
                             saturated: matches!(fault, Some(ConsumerFault::Saturated)),
                             contended: matches!(fault, Some(ConsumerFault::Contended)),
+                        },
+                        if matches!(fault, Some(ConsumerFault::KernelLoss)) {
+                            KernelEvidence {
+                                ring_loss: 7,
+                                start_insert_failures: 3,
+                                ..Default::default()
+                            }
+                        } else {
+                            KernelEvidence::default()
                         },
                         reserve,
                     )),
@@ -725,6 +1092,34 @@ pub(super) mod tests {
                 if profile { 7 } else { 0 }
             );
             assert_eq!(snapshot.kernel_evidence().unmatched_returns, 3);
+        }
+    }
+
+    #[test]
+    fn consumer_mixed_row_failure_preserves_observed_health_and_collector_cause() {
+        for (fault, cause) in [
+            (ConsumerFault::RowTopology, "topology"),
+            (ConsumerFault::RowTopologySaturated, "saturated"),
+            (ConsumerFault::RowTopologyContended, "contended"),
+            (ConsumerFault::RowTopologySaturatedContended, "saturated"),
+        ] {
+            let mut fixture = ConsumerFixture::new();
+            fixture.fresh(CounterMode::Counts, 1, 5, None).unwrap();
+            let stale = fixture
+                .fresh(CounterMode::Timestamps, 2, 8, Some(fault))
+                .unwrap();
+            let metadata = stale.counter_collection().unwrap();
+            assert_eq!(metadata["failure"], cause);
+            assert!(metadata["health"].is_null());
+            assert_eq!(metadata["mode"], "counts");
+            assert_eq!(metadata["generation"], 1);
+            assert_eq!(stale.reports()[0].calls, 5);
+            // Presentation priority did not rewrite the read given to the
+            // actual collector: its original Topology refusal stays sticky.
+            let next = fixture.fresh(CounterMode::Timestamps, 2, 9, None).unwrap();
+            assert_eq!(next.counter_collection().unwrap()["failure"], "topology");
+            assert_eq!(next.reports()[0].calls, 5);
+            assert!(!ConsumerFixture::terminal_eligible(&next));
         }
     }
 

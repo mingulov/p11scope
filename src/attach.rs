@@ -8020,6 +8020,9 @@ mod policy_output {
 }
 
 #[cfg(test)]
+pub(crate) use tests::CollectedFinishQObserverForTest;
+
+#[cfg(test)]
 mod tests {
     use super::publish_and_freeze_object_descriptors_with;
     use crate::attach::capture::NativeDomainId;
@@ -8075,6 +8078,71 @@ mod tests {
     impl Drop for FinishQGate {
         fn drop(&mut self) {
             unsafe { libc::munmap(self.writer.as_ptr().cast(), self.len) };
+        }
+    }
+
+    /// Reuse the Session's actual observer with the fanout scene's ORIGINAL
+    /// EVENTS drain. This owner retains its DISCOVERY drain and real mmap
+    /// STOP_GATE for the whole fixture; neither ring positions nor Q can be
+    /// supplied by a caller. It never polls, scrubs, or creates another EVENTS
+    /// cursor, and an observed Q leaves the DISCOVERY record undelivered.
+    pub(crate) struct CollectedFinishQObserverForTest {
+        gate: FinishQGate,
+        producers: super::SessionDrainProducers,
+        discovery_domain: crate::events::DiscoveryDomain,
+        discovery: crate::events::DiscoveryDrain<crate::events::ScriptedRecords>,
+        detach: super::OwnedProducerDetach,
+    }
+
+    impl CollectedFinishQObserverForTest {
+        pub(crate) fn new(producers: &super::SessionDrainProducers) -> Self {
+            let discovery_domain = crate::events::DiscoveryDomain::test_standin(0xf1d5);
+            Self {
+                gate: FinishQGate::new(),
+                producers: producers.clone(),
+                discovery: crate::events::DiscoveryDrain::over_domain(
+                    crate::events::ScriptedRecords::records([vec![0]], 1),
+                    discovery_domain.clone(),
+                ),
+                discovery_domain,
+                detach: super::OwnedProducerDetach::NotStarted,
+            }
+        }
+
+        pub(crate) fn request_stop(&self) {
+            self.gate.gate.request_stop();
+        }
+
+        pub(crate) fn discovery_domain(&self) -> &crate::events::DiscoveryDomain {
+            &self.discovery_domain
+        }
+
+        pub(crate) fn discovery_remaining(&self) -> usize {
+            self.discovery.source().remaining()
+        }
+
+        pub(crate) fn observe(
+            &self,
+            expected: &super::SessionDrainProducers,
+            grant: Option<&crate::semantics_objects::journal::SessionDrainGrant>,
+            events: &crate::events::EventDrain<crate::events::ScriptedRecords>,
+        ) -> anyhow::Result<Option<super::CollectedFinishQ>> {
+            super::observe_collected_finish_q_with(
+                super::CollectedFinishQOwner {
+                    gate: &self.gate.gate,
+                    producers: &self.producers,
+                    discovery: &self.discovery_domain,
+                    detach: &self.detach,
+                },
+                expected,
+                grant,
+                || {
+                    events.consumption_cut().map_err(|reason| {
+                        anyhow::anyhow!("original EVENTS cut refused: {reason:?}")
+                    })
+                },
+                || Ok(crate::events::discovery_drain_positions(&self.discovery)),
+            )
         }
     }
 

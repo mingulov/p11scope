@@ -206,6 +206,8 @@ struct MachineNativeRows {
         u32,
         Result<crate::semantics_objects::journal::BirthKind, BirthObservationRefusal>,
     )>,
+    pending_q_resolutions: usize,
+    pending_q_calls: usize,
 }
 
 struct HeldMachineIo<'a> {
@@ -321,6 +323,49 @@ impl crate::inventory_semantics::JointMachineIo for HeldMachineIo<'_> {
                 "actual preparation completed before failed handoff"
             ));
         }
+        Ok(())
+    }
+
+    fn pending_h0_at_q_storage_bytes(
+        &self,
+        _lane: &AttestedSemanticLane,
+        raw: &RawJointQuantum,
+        adapter: &JournalAdapter,
+        q: &crate::attach::CollectedFinishQ,
+        discovery: &crate::events::DiscoveryDomain,
+    ) -> Result<usize, SemanticRefusal> {
+        self.h0
+            .0
+            .borrow()
+            .capture
+            .pending_h0_at_q_storage_bytes(raw, adapter, self.producers, discovery, q)
+            .map_err(|_| SemanticRefusal::ProviderStorage)
+    }
+
+    fn resolve_pending_h0_at_q(
+        &mut self,
+        _lane: &mut AttestedSemanticLane,
+        raw: &mut RawJointQuantum,
+        adapter: &JournalAdapter,
+        q: &crate::attach::CollectedFinishQ,
+        discovery: &crate::events::DiscoveryDomain,
+        report: &mut TickReport,
+    ) -> Result<(), SemanticRefusal> {
+        let mut owned = self.h0.0.borrow_mut();
+        let HeldH0 { capture, io, .. } = &mut *owned;
+        self.native.pending_q_resolutions += 1;
+        capture
+            .resolve_collected_pending_at_q_with(
+                io,
+                raw,
+                adapter,
+                self.producers,
+                discovery,
+                q,
+                report,
+            )
+            .map_err(|_| SemanticRefusal::Unavailable)?;
+        self.native.pending_q_calls += report.calls().count();
         Ok(())
     }
 
@@ -773,6 +818,8 @@ impl MachineScene {
                 fail_after_preparation: false,
                 absence_reads: Vec::new(),
                 birth_outcomes: Vec::new(),
+                pending_q_resolutions: 0,
+                pending_q_calls: 0,
             },
         }
     }
@@ -833,6 +880,38 @@ impl MachineScene {
             &mut scene.real.lane,
             &mut scene.real.scene.coordinator,
             &mut io,
+            &mut budget,
+        )
+    }
+
+    fn resolve_pending_q(
+        &mut self,
+        q: &crate::attach::CollectedFinishQ,
+        discovery: &crate::events::DiscoveryDomain,
+        work: usize,
+    ) -> Result<crate::inventory_semantics::JointServiceProgress, SemanticRefusal> {
+        let mut budget = crate::inventory_semantics::JointWorkBudget {
+            remaining_actions: work,
+            deadline: Instant::now() + Duration::from_secs(10),
+        };
+        let Self {
+            scene,
+            machine,
+            native,
+        } = self;
+        let mut io = HeldMachineIo {
+            drain: &mut scene.drain,
+            h0: &scene.real.h0,
+            producers: &scene.producers,
+            attached: scene.attached.as_ref().unwrap(),
+            native,
+        };
+        machine.resolve_pending_h0_at_q_with_io(
+            &mut scene.real.lane,
+            &mut scene.real.scene.coordinator,
+            &mut io,
+            q,
+            discovery,
             &mut budget,
         )
     }
@@ -2522,6 +2601,908 @@ fn joint_machine_begin_slices_and_h0_pending_do_not_repoll() {
             .0,
         0
     );
+}
+
+/// Only fixture observations: the original Raw, Capture, reports and all
+/// authority stay in their existing owners. Opaque identities use equality.
+struct PendingQCustody {
+    raw: crate::semantics_objects::journal::joint_driver::RawQuantumIdentity,
+    boundary: crate::events::EventsConsumptionCut,
+    capture: u64,
+    pending: Vec<(
+        u64,
+        crate::semantics_objects::journal::joint_driver::CollectedCallOrigin,
+    )>,
+    ready: Vec<(
+        u64,
+        crate::semantics_objects::journal::joint_driver::CollectedCallOrigin,
+    )>,
+    current_files: Vec<u32>,
+    roles: [usize; 5],
+    frontier: crate::semantics_objects::journal::ConsumptionOrdinal,
+    claims: (
+        usize,
+        Vec<(u64, crate::semantics_objects::journal::JournalDomainProof)>,
+    ),
+    model: crate::semantics_objects::ObjectProjection,
+    h3: (usize, bool),
+    acked: u64,
+    revision: u64,
+    charged: usize,
+    resolutions: usize,
+    unobserved: u64,
+}
+
+impl PendingQCustody {
+    fn observe(fixture: &MachineScene) -> Self {
+        let coordinator = &fixture.scene.real.scene.coordinator;
+        let held = fixture.scene.real.h0.0.borrow();
+        let (ready, current_files) = fixture
+            .machine
+            .retained_h0_for_test()
+            .map(|(outcomes, current)| {
+                (
+                    outcomes
+                        .iter()
+                        .filter_map(|outcome| match outcome {
+                            TickOutcome::Call(call) => {
+                                Some((call.token().unwrap(), call.collected_origin().unwrap()))
+                            }
+                            _ => None,
+                        })
+                        .collect(),
+                    current
+                        .iter()
+                        .map(|receipt| receipt.endpoint().file_slot)
+                        .collect(),
+                )
+            })
+            .unwrap_or_default();
+        Self {
+            raw: fixture
+                .machine
+                .retained_raw_for_test()
+                .unwrap()
+                .h0_identity(),
+            boundary: fixture.scene.drain.consumption_cut().unwrap(),
+            capture: held.capture.identity,
+            pending: held
+                .capture
+                .awaiting
+                .iter()
+                .map(|(position, waiting)| (*position, waiting.collected_origin.unwrap()))
+                .collect(),
+            ready,
+            current_files,
+            roles: coordinator.joint_capture().ledger().roles_for_test(),
+            frontier: coordinator.joint_capture().adapter().consumed_frontier(),
+            claims: coordinator
+                .joint_capture()
+                .adapter()
+                .invocation_claims_for_test(),
+            model: coordinator.joint_capture().model().project(),
+            h3: coordinator.reference_h3_audit_state(),
+            acked: coordinator.reference_h3_acknowledged_below(),
+            revision: coordinator.registry().published_revision(),
+            charged: coordinator
+                .registry()
+                .semantic_resource_snapshot()
+                .charged_bytes,
+            resolutions: fixture.native.pending_q_resolutions,
+            unobserved: held
+                .capture
+                .router
+                .unknown_counts()
+                .get(&crate::discovery::instances::UnknownReason::Unobserved)
+                .copied()
+                .unwrap_or(0),
+        }
+    }
+
+    fn assert_unchanged(&self, fixture: &MachineScene) {
+        let after = Self::observe(fixture);
+        assert!(after.raw == self.raw);
+        assert!(after.boundary.same_boundary(&self.boundary));
+        assert_eq!(after.capture, self.capture);
+        assert!(after.pending == self.pending);
+        assert!(after.ready == self.ready);
+        assert_eq!(after.current_files, self.current_files);
+        assert_eq!(after.roles, self.roles);
+        assert!(after.frontier == self.frontier);
+        assert!(after.claims == self.claims);
+        assert!(
+            after.model == self.model,
+            "the retained model changed on refusal"
+        );
+        assert_eq!(after.h3, self.h3);
+        assert_eq!(after.acked, self.acked);
+        assert_eq!(after.revision, self.revision);
+        assert_eq!(after.charged, self.charged);
+        assert_eq!(after.resolutions, self.resolutions);
+        assert_eq!(after.unobserved, self.unobserved);
+        assert!(!fixture.scene.real.h0.0.borrow().capture.stopped);
+    }
+}
+
+fn pending_h0_finish_fixture(
+    reverse: bool,
+) -> (
+    MachineScene,
+    crate::attach::CollectedFinishQObserverForTest,
+    JournalAdapter,
+) {
+    let mut fixture = MachineScene::new(2);
+    let observer = crate::attach::CollectedFinishQObserverForTest::new(&fixture.scene.producers);
+    assert!(
+        observer
+            .observe(&fixture.scene.producers, None, &fixture.scene.drain)
+            .unwrap()
+            .is_none(),
+        "an actual zero count WITHOUT STOP cannot mint Q"
+    );
+    // Bind a genuinely different ledger while this SAME cursor is still at
+    // its initial boundary. No consumed-prefix setter or second cursor.
+    let registry = fixture.scene.real.scene.coordinator.registry();
+    let reserve = registry.semantic_storage_reserver();
+    let mut foreign = JournalAdapter::with_ledger(
+        crate::semantics_objects::journal::JournalLimits::policy(),
+        crate::semantics_objects::journal::StagingLedger::with_resources(
+            registry.semantic_storage_reserver(),
+        ),
+    );
+    let initial = fixture.scene.drain.consumption_cut().unwrap();
+    assert!(initial.is_initial());
+    let (unobserved, poll) = RawJointQuantum::begin_bounded_with_adapter(
+        &mut fixture.scene.drain,
+        &publish_object_descriptors(),
+        4,
+        0,
+        None,
+        &BirthFault,
+        &fixture.scene.producers,
+        |bytes| reserve.reserve(bytes),
+        &mut foreign,
+    )
+    .unwrap();
+    assert!(poll.is_none());
+    assert!(initial.same_boundary(&fixture.scene.drain.consumption_cut().unwrap()));
+    drop(unobserved);
+    fixture.prime(2);
+    let a = u32::from(reverse);
+    let b = 1 - a;
+    {
+        let mut held = fixture.scene.real.h0.0.borrow_mut();
+        let (base, epoch) = held.io.scan_input(a);
+        held.io.scan_inputs.insert(a, (base + 0x20_000, epoch + 1));
+        held.io.script.fail_file = Some(a);
+    }
+    let calls = if reverse {
+        [(b, 4), (a, 3)]
+    } else {
+        [(a, 3), (b, 4)]
+    };
+    for (file, sequence) in calls {
+        fixture
+            .scene
+            .push(std::process::id(), file, "C_SignInit", sequence);
+    }
+    for _ in 0..128 {
+        fixture.service(1).unwrap();
+        if fixture.scene.real.h0.0.borrow().capture.awaiting.len() == 1
+            && fixture.machine.retained_h0_for_test().is_some()
+        {
+            break;
+        }
+    }
+    let before = PendingQCustody::observe(&fixture);
+    assert_eq!(fixture.machine.diagnostic_snapshot_for_test().0, "AwaitH0");
+    assert_eq!(before.pending.len(), 1);
+    assert_eq!(before.ready.len(), 1);
+    assert!(before.pending[0].1.in_quantum(before.raw));
+    assert!(before.ready[0].1.in_quantum(before.raw));
+    assert!(
+        before.current_files.contains(&b),
+        "B has a genuine retained Current"
+    );
+    let raw = fixture.machine.retained_raw_for_test().unwrap();
+    assert_eq!(
+        raw.pending_h0_records(),
+        0,
+        "ordinary delivery already happened once"
+    );
+    assert!(
+        raw.ledger_binding()
+            .unwrap()
+            .matches_owner(fixture.scene.real.scene.coordinator.joint_capture())
+    );
+    (fixture, observer, foreign)
+}
+
+fn observe_pending_finish_q(
+    fixture: &MachineScene,
+    observer: &crate::attach::CollectedFinishQObserverForTest,
+) -> crate::attach::CollectedFinishQ {
+    observer.request_stop();
+    let q = observer
+        .observe(
+            &fixture.scene.producers,
+            fixture.machine.retained_drain_grant_for_test(),
+            &fixture.scene.drain,
+        )
+        .unwrap()
+        .expect("the same original producers reached actual STOP/count0");
+    assert!(q.matches_owner(&fixture.scene.producers, observer.discovery_domain()));
+    assert!(q.matches_retained_grant(fixture.machine.retained_drain_grant_for_test().unwrap()));
+    assert_eq!(
+        observer.discovery_remaining(),
+        1,
+        "Q is not a completed drain"
+    );
+    q
+}
+
+/// Catches dropping B's original Current, stopping before resolving A,
+/// pretending expiry is clean, and repeating the same original resolution.
+#[test]
+fn joint_machine_collected_finish_resolves_pending_h0_union_once() {
+    use crate::semantics_objects::journal::JournalGap;
+    for reverse in [false, true] {
+        let (mut fixture, observer, _foreign) = pending_h0_finish_fixture(reverse);
+        let before = PendingQCustody::observe(&fixture);
+        let b = 1 - u32::from(reverse);
+        // Q can cover a bounded older original WITHOUT requiring it to drain
+        // the next owned record. That suffix remains in the original cursor.
+        let (later, _) = fixture
+            .scene
+            .encoded(std::process::id(), b, "C_SignUpdate", 5);
+        fixture.scene.drain.source_mut().push_record(later.to_vec());
+        let q = observe_pending_finish_q(&fixture, &observer);
+        assert!(q.covers_events_bounds(&before.boundary));
+        assert!(!q.events_at_bound(&before.boundary));
+        let at_q = PendingQCustody::observe(&fixture);
+        fixture
+            .resolve_pending_q(&q, observer.discovery_domain(), 0)
+            .unwrap();
+        at_q.assert_unchanged(&fixture);
+        for _ in 0..128 {
+            fixture
+                .resolve_pending_q(&q, observer.discovery_domain(), 1)
+                .unwrap();
+            if fixture.scene.real.h0.0.borrow().capture.awaiting.is_empty()
+                && fixture
+                    .machine
+                    .retained_pending_q_report_for_test()
+                    .is_none()
+            {
+                break;
+            }
+        }
+        assert_eq!(fixture.native.pending_q_resolutions, 1);
+        assert_eq!(fixture.native.pending_q_calls, 1);
+        {
+            let held = fixture.scene.real.h0.0.borrow();
+            assert!(held.capture.awaiting.is_empty());
+            assert!(held.capture.jobs.is_empty());
+            assert!(!held.capture.stopped);
+            assert_eq!(
+                held.capture.router.unknown_counts()
+                    [&crate::discovery::instances::UnknownReason::Unobserved],
+                before.unobserved + 1
+            );
+        }
+        assert_eq!(
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .reference_h3_audit_state(),
+            before.h3
+        );
+        assert_eq!(
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .reference_h3_acknowledged_below(),
+            before.acked
+        );
+        assert_eq!(
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .registry()
+                .published_revision(),
+            before.revision
+        );
+        assert!(
+            fixture
+                .machine
+                .retained_raw_for_test()
+                .unwrap()
+                .h0_identity()
+                == before.raw
+        );
+        assert!(
+            fixture
+                .scene
+                .drain
+                .consumption_cut()
+                .unwrap()
+                .same_boundary(&at_q.boundary)
+        );
+        fixture.reach_phase("BindingKeys");
+        let prepared = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .prepared_semantic_batch()
+            .unwrap();
+        assert!(
+            prepared
+                .current_receipts()
+                .iter()
+                .any(|receipt| receipt.endpoint().file_slot == b)
+        );
+        let admitted = prepared.admissions().collect::<Vec<_>>();
+        assert_eq!(
+            admitted.len(),
+            1,
+            "only B is joined; expired A is an original shed"
+        );
+        assert!(admitted[0].collected_origin() == Some(before.ready[0].1));
+        fixture.reach_phase("Audited");
+        let audit = fixture.machine.diagnostic_audit_for_test().unwrap();
+        assert_eq!(audit.0, Some(JournalGap::H3Loss));
+        assert_eq!(audit.1, "StagedLoss");
+        assert_eq!(audit.2, Some(before.pending[0].0));
+        assert_eq!(audit.3, None);
+        assert_eq!(
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .reference_h3_acknowledged_below(),
+            before.acked,
+            "no acknowledgement before actual fanout/disposal"
+        );
+        fixture.published_labeled("pending-at-Q shared loss", None);
+        assert_eq!(fixture.native.pending_q_resolutions, 1);
+        assert_eq!(fixture.scene.drain.source_mut().remaining(), 1);
+        assert_eq!(observer.discovery_remaining(), 1);
+        let coordinator = &fixture.scene.real.scene.coordinator;
+        assert_eq!(
+            coordinator.registry().published_revision(),
+            before.revision + 1
+        );
+        assert_eq!(
+            coordinator.reference_h3_audit_state(),
+            (before.h3.0 + 1, false)
+        );
+        assert!(coordinator.reference_h3_acknowledged_below() > before.pending[0].0);
+        assert_eq!(
+            coordinator
+                .joint_capture()
+                .adapter()
+                .invocation_claims_for_test()
+                .0,
+            0
+        );
+        let roles = coordinator.joint_capture().ledger().roles_for_test();
+        assert_eq!((roles[0], roles[1], roles[3]), (0, 0, 0));
+        assert!(
+            coordinator
+                .joint_capture()
+                .model()
+                .project()
+                .objects
+                .iter()
+                .all(|object| object.lifetime != Lifetime::Live)
+        );
+    }
+}
+
+/// A same-domain owner or equal numeric cuts do not replace the original
+/// Capture, ledger, frontier or Q. Refusal leaves a correct retry available.
+#[test]
+fn joint_machine_collected_finish_rejects_foreign_stale_duplicate() {
+    let (mut fixture, observer, foreign) = pending_h0_finish_fixture(false);
+    let q = observe_pending_finish_q(&fixture, &observer);
+    let before = PendingQCustody::observe(&fixture);
+    let foreign_owner =
+        crate::attach::CollectedFinishQObserverForTest::new(&fixture.scene.producers);
+    let foreign_q = observe_pending_finish_q(&fixture, &foreign_owner);
+    assert!(!foreign_q.matches_owner(&fixture.scene.producers, observer.discovery_domain()));
+    assert!(
+        fixture
+            .resolve_pending_q(&foreign_q, observer.discovery_domain(), 1)
+            .is_err()
+    );
+    before.assert_unchanged(&fixture);
+    let other_producer = JointScene::new(1);
+    assert!(matches!(
+        fixture
+            .machine
+            .retained_raw_for_test()
+            .unwrap()
+            .validate_pending_finish(
+                fixture
+                    .scene
+                    .real
+                    .scene
+                    .coordinator
+                    .joint_capture()
+                    .adapter(),
+                &other_producer.producers,
+                observer.discovery_domain(),
+                &q
+            ),
+        Err(RawQuantumRefusal::ForeignCapture)
+    ));
+    before.assert_unchanged(&fixture);
+    assert!(matches!(
+        fixture
+            .machine
+            .retained_raw_for_test()
+            .unwrap()
+            .validate_pending_finish(
+                &foreign,
+                &fixture.scene.producers,
+                observer.discovery_domain(),
+                &q
+            ),
+        Err(RawQuantumRefusal::ForeignLedger)
+    ));
+    before.assert_unchanged(&fixture);
+    let mut other_capture =
+        SemanticCapture::in_domain(fixture.scene.real.lane.domain(), TickLimits::default())
+            .unwrap();
+    std::mem::swap(
+        &mut fixture.scene.real.h0.0.borrow_mut().capture,
+        &mut other_capture,
+    );
+    assert!(
+        fixture
+            .resolve_pending_q(&q, observer.discovery_domain(), 1)
+            .is_err()
+    );
+    std::mem::swap(
+        &mut fixture.scene.real.h0.0.borrow_mut().capture,
+        &mut other_capture,
+    );
+    before.assert_unchanged(&fixture);
+    // Move, never reconstruct or clone, another genuine awaiting original.
+    // The receiving Capture keeps its identity, so owner equality alone is
+    // insufficient: exact Raw origin/resource association must also refuse.
+    let (other_original, _observer, _ledger) = pending_h0_finish_fixture(true);
+    let other_before = PendingQCustody::observe(&other_original);
+    {
+        let mut retained = fixture.scene.real.h0.0.borrow_mut();
+        let mut foreign = other_original.scene.real.h0.0.borrow_mut();
+        std::mem::swap(
+            &mut retained.capture.awaiting,
+            &mut foreign.capture.awaiting,
+        );
+    }
+    assert!(
+        fixture
+            .resolve_pending_q(&q, observer.discovery_domain(), 1)
+            .is_err()
+    );
+    {
+        let mut retained = fixture.scene.real.h0.0.borrow_mut();
+        let mut foreign = other_original.scene.real.h0.0.borrow_mut();
+        std::mem::swap(
+            &mut retained.capture.awaiting,
+            &mut foreign.capture.awaiting,
+        );
+    }
+    before.assert_unchanged(&fixture);
+    other_before.assert_unchanged(&other_original);
+    for _ in 0..128 {
+        fixture
+            .resolve_pending_q(&q, observer.discovery_domain(), 1)
+            .unwrap();
+        if fixture.scene.real.h0.0.borrow().capture.awaiting.is_empty()
+            && fixture
+                .machine
+                .retained_pending_q_report_for_test()
+                .is_none()
+        {
+            break;
+        }
+    }
+    let resolved = PendingQCustody::observe(&fixture);
+    assert!(resolved.pending.is_empty());
+    assert!(
+        fixture
+            .resolve_pending_q(&q, observer.discovery_domain(), 1)
+            .is_err(),
+        "an already-resolved original cannot expire twice"
+    );
+    resolved.assert_unchanged(&fixture);
+    fixture.published_labeled("pending-at-Q correct original retry", None);
+    assert_eq!(fixture.native.pending_q_resolutions, 1);
+
+    // Move the actual adapter frontier with a real decoded BEGIN. This hostile
+    // legacy consumer breaks canonical custody; no scalar frontier setter.
+    let (mut stale, stale_observer, _foreign) = pending_h0_finish_fixture(false);
+    let (begin, _) = stale
+        .scene
+        .encoded(std::process::id(), 1, "C_SignUpdate", 5);
+    stale.scene.drain.source_mut().push_record(begin.to_vec());
+    let stale_q = observe_pending_finish_q(&stale, &stale_observer);
+    let before_frontier = stale
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .consumed_frontier();
+    {
+        let scene = &mut stale.scene;
+        let adapter = scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture_mut()
+            .adapter_mut();
+        let poll = scene.drain.poll_dispatched_quantum(
+            Some(1),
+            &publish_object_descriptors(),
+            |_| panic!("the queued original is a journal BEGIN"),
+            |record| {
+                adapter.ingest_any(
+                    crate::semantics_objects::journal::JournalIngestItem::Journal(record),
+                );
+                std::ops::ControlFlow::Continue(())
+            },
+        );
+        assert_eq!(poll.attempted, 1);
+    }
+    assert!(
+        stale
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .consumed_frontier()
+            != before_frontier
+    );
+    let moved = PendingQCustody::observe(&stale);
+    assert!(matches!(
+        stale
+            .machine
+            .retained_raw_for_test()
+            .unwrap()
+            .validate_pending_finish(
+                stale.scene.real.scene.coordinator.joint_capture().adapter(),
+                &stale.scene.producers,
+                stale_observer.discovery_domain(),
+                &stale_q
+            ),
+        Err(RawQuantumRefusal::StaleFrontier)
+    ));
+    assert!(
+        stale
+            .resolve_pending_q(&stale_q, stale_observer.discovery_domain(), 1)
+            .is_err()
+    );
+    moved.assert_unchanged(&stale);
+
+    // A genuinely capacity-full ORIGINAL may end before Q. Exercise this
+    // raw/Capture gate separately from the running machine's fixed 4096
+    // capacity; the normal constructor actually consumes all four slots.
+    let mut full = JointScene::for_audit(2);
+    let pid = std::process::id();
+    full.bind(
+        pid,
+        ImageIdentity {
+            task_cookie: 71,
+            exec_id: 0,
+        },
+        &[0, 1],
+    );
+    {
+        let mut held = full.real.h0.0.borrow_mut();
+        let (base, epoch) = held.io.scan_input(0);
+        held.io.scan_inputs.insert(0, (base + 0x20_000, epoch + 1));
+        held.io.script.fail_file = Some(0);
+    }
+    full.push(pid, 0, "C_SignInit", 1);
+    full.push(pid, 1, "C_SignInit", 2);
+    let reserve = full
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .semantic_storage_reserver();
+    let (raw, poll) = RawJointQuantum::begin_bounded_with_adapter(
+        &mut full.drain,
+        &publish_object_descriptors(),
+        4,
+        4,
+        None,
+        &BirthFault,
+        &full.producers,
+        |bytes| reserve.reserve(bytes),
+        full.real
+            .scene
+            .coordinator
+            .joint_capture_mut()
+            .adapter_mut(),
+    )
+    .unwrap();
+    assert_eq!(poll.unwrap().attempted, 4);
+    let identity = raw.h0_identity();
+    full.real.h0.0.borrow_mut().collected = Some(raw);
+    let ready = full.real.tick();
+    let raw = full.real.h0.0.borrow_mut().collected.take().unwrap();
+    assert!(raw.h0_identity() == identity);
+    assert_eq!(raw.pending_h0_records(), 0);
+    assert_eq!(full.real.h0.0.borrow().capture.awaiting.len(), 1);
+    assert!(
+        ready
+            .current_receipts()
+            .iter()
+            .any(|receipt| receipt.endpoint().file_slot == 1)
+    );
+    let old_end = full.drain.consumption_cut().unwrap();
+    let (later, _) = full.encoded(pid, 1, "C_SignUpdate", 3);
+    full.drain.source_mut().push_record(later.to_vec());
+    let owner = crate::attach::CollectedFinishQObserverForTest::new(&full.producers);
+    owner.request_stop();
+    let q = owner
+        .observe(&full.producers, None, &full.drain)
+        .unwrap()
+        .unwrap();
+    assert!(q.covers_events_bounds(&old_end));
+    assert!(!q.events_at_bound(&old_end));
+    raw.validate_pending_finish(
+        full.real.scene.coordinator.joint_capture().adapter(),
+        &full.producers,
+        owner.discovery_domain(),
+        &q,
+    )
+    .expect("pending-at-Q does not demand the final global Q drain from a full original");
+    assert_eq!(full.drain.source_mut().remaining(), 1);
+    assert_eq!(full.real.h0.0.borrow().capture.awaiting.len(), 1);
+}
+
+/// A tight pool refuses before expiry, and a later receiver refusal retains
+/// the produced report/lease plus resolution state instead of re-expiring A.
+#[test]
+fn joint_machine_collected_finish_budget_refusal_preserves_originals() {
+    let (mut fixture, observer, _foreign) = pending_h0_finish_fixture(false);
+    let q = observe_pending_finish_q(&fixture, &observer);
+    let before = PendingQCustody::observe(&fixture);
+    let bytes = {
+        let held = fixture.scene.real.h0.0.borrow();
+        held.capture
+            .pending_h0_at_q_storage_bytes(
+                fixture.machine.retained_raw_for_test().unwrap(),
+                fixture
+                    .scene
+                    .real
+                    .scene
+                    .coordinator
+                    .joint_capture()
+                    .adapter(),
+                &fixture.scene.producers,
+                observer.discovery_domain(),
+                &q,
+            )
+            .unwrap()
+    };
+    assert!(bytes > 0, "the report and all expiry temporaries are paid");
+    let snapshot = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .semantic_resource_snapshot();
+    let hold = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .reserve_semantic_storage(snapshot.limit_bytes - snapshot.charged_bytes - (bytes - 1))
+        .unwrap();
+    let tight = PendingQCustody::observe(&fixture);
+    let (refused, allocations, _) =
+        crate::test_alloc::count_allocs_during(|| -> Result<(), SemanticRefusal> {
+            for _ in 0..128 {
+                if let Err(reason) = fixture.resolve_pending_q(&q, observer.discovery_domain(), 1) {
+                    return Err(reason);
+                }
+            }
+            panic!("the actual tight expiry precharge must refuse within the bounded service");
+        });
+    assert_eq!(refused, Err(SemanticRefusal::ProviderStorage));
+    assert_eq!(
+        allocations, 0,
+        "preflight does not allocate uncharged expiry scratch"
+    );
+    tight.assert_unchanged(&fixture);
+    drop(hold);
+    before.assert_unchanged(&fixture);
+    fixture.machine.reference_refuse_pending_q_merge_once();
+    let (refused, peak) =
+        crate::test_alloc::requested_peak_during(|| -> Result<(), SemanticRefusal> {
+            for _ in 0..128 {
+                if let Err(reason) = fixture.resolve_pending_q(&q, observer.discovery_domain(), 1) {
+                    return Err(reason);
+                }
+            }
+            panic!("the actual receiver must expose its injected refusal after real expiry");
+        });
+    assert_eq!(refused, Err(SemanticRefusal::ProviderStorage));
+    assert!(!peak.incomplete);
+    assert!(
+        peak.realloc_overlap_bytes <= bytes,
+        "the declared bound includes actual old/new overlap"
+    );
+    assert_eq!(fixture.native.pending_q_resolutions, 1);
+    assert_eq!(fixture.native.pending_q_calls, 1);
+    assert!(fixture.scene.real.h0.0.borrow().capture.awaiting.is_empty());
+    assert!(!fixture.scene.real.h0.0.borrow().capture.stopped);
+    let (report, paid) = fixture
+        .machine
+        .retained_pending_q_report_for_test()
+        .unwrap();
+    assert!(paid > 0);
+    assert_eq!(report.awaiting_floor(), None);
+    let calls = report.calls().collect::<Vec<_>>();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].token(), Some(before.pending[0].0));
+    assert!(calls[0].collected_origin() == Some(before.pending[0].1));
+    assert_eq!(
+        calls[0].route(),
+        crate::discovery::instances::Route::Unknown(
+            crate::discovery::instances::UnknownReason::Unobserved
+        )
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .semantic_resource_snapshot()
+            .charged_bytes,
+        before.charged + paid,
+        "both original reports remain paid across receiver refusal"
+    );
+    let (ready, current) = fixture.machine.retained_h0_for_test().unwrap();
+    assert_eq!(
+        ready
+            .iter()
+            .filter(|outcome| matches!(outcome, TickOutcome::Call(_)))
+            .count(),
+        1
+    );
+    assert!(
+        current
+            .iter()
+            .any(|receipt| receipt.endpoint().file_slot == 1)
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_h3_audit_state(),
+        before.h3
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_h3_acknowledged_below(),
+        before.acked
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .published_revision(),
+        before.revision
+    );
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .model()
+            .project()
+            == before.model
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .ledger()
+            .roles_for_test(),
+        before.roles
+    );
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .invocation_claims_for_test()
+            == before.claims
+    );
+    assert!(
+        fixture
+            .machine
+            .retained_raw_for_test()
+            .unwrap()
+            .h0_identity()
+            == before.raw
+    );
+    for _ in 0..128 {
+        fixture
+            .resolve_pending_q(&q, observer.discovery_domain(), 1)
+            .unwrap();
+        if fixture
+            .machine
+            .retained_pending_q_report_for_test()
+            .is_none()
+        {
+            break;
+        }
+    }
+    assert_eq!(
+        fixture.native.pending_q_resolutions, 1,
+        "retry only transfers the original report"
+    );
+    assert_eq!(fixture.native.pending_q_calls, 1);
+    assert!(
+        fixture
+            .machine
+            .retained_pending_q_report_for_test()
+            .is_none()
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .semantic_resource_snapshot()
+            .charged_bytes,
+        before.charged,
+        "drop incoming buffers before refunding their exact lease; the original accumulator stays paid"
+    );
+    fixture.published_labeled("pending-at-Q paid merge retry", None);
+    assert_eq!(fixture.native.pending_q_resolutions, 1);
 }
 
 #[test]

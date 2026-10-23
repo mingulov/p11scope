@@ -2259,6 +2259,8 @@ fn login_user_type_capture_uses_full_width_finite_policy() {
 /// its source pin is measured with that same executable lexer.
 /// The private counter artifact branches are measured with the same lexer;
 /// ordinary emitted-object noninterference remains a separate compiled check.
+/// The unselected bank module adds only an appended cfg declaration here;
+/// its declaration was measured with the unchanged executable lexer.
 #[test]
 fn strip_rust_prose_real_bpf_source_dump_stable() {
     use sha2::{Digest as _, Sha256};
@@ -2268,8 +2270,8 @@ fn strip_rust_prose_real_bpf_source_dump_stable() {
     assert_eq!(
         (stripped.len(), hex.as_str()),
         (
-            120740,
-            "1cd2b7b3b6f61b479549fb805c929f011fdf1147140a5b8f8926de39bae3ed0b"
+            120786,
+            "43c4636de5b088f2e6ef1e06fa943037eca6faa0dd7445b683a421978eb47310"
         ),
         "stripped BPF dump must stay byte-identical"
     );

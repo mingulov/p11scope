@@ -1796,6 +1796,15 @@ struct ClassicDriver<'a> {
     retiring: Option<RetiringDomain>,
 }
 
+/// Exercise the actual caller refresh/admission path with substituted lane I/O.
+#[cfg(test)]
+pub(crate) fn bind_semantic_callers_for_test(
+    coordinator: &mut InventoryCoordinator<OsProcessSource>,
+    lane: &mut crate::inventory_semantics::AttestedSemanticLane,
+) {
+    bind_semantic_callers(coordinator, lane);
+}
+
 /// Exercise the production driver tick with substituted lane I/O.
 #[cfg(test)]
 pub(crate) fn classic_semantic_tick_for_test(

@@ -384,6 +384,8 @@ struct HeldH0 {
     validation_negatives: Vec<(&'static str, Option<u64>)>,
     last_terminal_tasks: Vec<(u64, u64)>,
     last_calls: Vec<(ImageIdentity, u64)>,
+    last_refresh_observation: Option<ObserveOutcome>,
+    last_refresh_birth: Option<crate::semantics_objects::journal::joint_driver::RawQuantumIdentity>,
 }
 
 #[derive(Clone)]
@@ -547,11 +549,21 @@ impl LaneTestIo for SharedH0 {
     ) -> Result<(Vec<ImageIdentity>, Arc<PidPin>), SemanticRefusal> {
         let mut owned = self.0.borrow_mut();
         let HeldH0 {
-            capture, io, stash, ..
+            capture,
+            io,
+            stash,
+            last_refresh_observation,
+            last_refresh_birth,
+            ..
         } = &mut *owned;
         let mut report = capture
             .refresh_with(io, pin.clone(), slot)
             .map_err(|_| SemanticRefusal::Unavailable)?;
+        *last_refresh_observation = report.observations.last().cloned();
+        *last_refresh_birth = report
+            .current()
+            .iter()
+            .find_map(|receipt| receipt.birth.as_ref().map(|(_, _, quantum)| *quantum));
         let effective = effective_refresh_custody(&report, pin);
         let (images, shed) = stash_refresh_report(stash, &mut report);
         assert_eq!(shed, 0);
@@ -744,6 +756,8 @@ impl RealScene {
             validation_negatives: Vec::new(),
             last_terminal_tasks: Vec::new(),
             last_calls: Vec::new(),
+            last_refresh_observation: None,
+            last_refresh_birth: None,
         })));
         let mut scene = Self {
             scene,

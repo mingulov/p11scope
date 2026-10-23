@@ -17,6 +17,181 @@ enum PublicationReceipts {
     Capacity(usize),
 }
 
+/// The real binder must not spend New before the same collected H0 can carry
+/// its birth. Only the native I/O is substituted; no semantic binding exists
+/// before this production refresh/admission path runs.
+#[test]
+fn joint_real_bind_refresh_preserves_collected_first_new() {
+    for (tick_first, refuse_first) in [(true, false), (true, true), (false, false), (false, true)] {
+        let (held, attached) = HeldProviders::with_attachment(1, &["C_CreateObject", "C_SignInit"]);
+        let mut scene = JointScene::from_held(held, Some(attached));
+        let pid = std::process::id();
+        let image = ImageIdentity {
+            task_cookie: 71,
+            exec_id: 0,
+        };
+        SIGHT_NS.with(|clock| clock.set(1_005));
+        scene.real.h0.0.borrow_mut().io.script.local = 1;
+        let caller = scene.real.scene.admit(pid, 50);
+        let (module, path) = &scene.real.modules[0];
+        scene.real.scene.coordinator.registry_mut().note_mapping(
+            caller,
+            pid,
+            ModuleInfo {
+                path: path.clone(),
+                key: module.clone(),
+                double_loaded: false,
+                build_id: None,
+                identity_source: Some("held-provider".into()),
+                admission: AdmissionState::Admitted,
+                admission_class: Some("exact".into()),
+                admission_endpoints: Some(2),
+                admission_reasons: Vec::new(),
+            },
+            60,
+        );
+        scene.real.scene.coordinator.commit_batch(false).unwrap();
+        let candidate = scene
+            .real
+            .scene
+            .coordinator
+            .prepare_legacy_semantic_candidate(caller, scene.real.lane.domain())
+            .expect("the actual Detailed caller retains its first custody allocation");
+        let original_pin = candidate.pin();
+        drop(candidate);
+        scene
+            .real
+            .h0
+            .0
+            .borrow_mut()
+            .io
+            .targets
+            .insert(pid, (original_pin.clone(), image));
+        assert_eq!(scene.real.scene.coordinator.semantic_bindings().len(), 0);
+        scene.push(pid, 0, "C_CreateObject", 1);
+        let raw = scene.collect_with_fault(&BirthFault);
+        let original_quantum = raw.h0_identity();
+        assert_eq!(raw.pending_h0_records(), 1);
+        let original_boundary = scene.drain.consumption_cut().unwrap();
+        scene.real.h0.0.borrow_mut().collected = Some(raw);
+        let early_batch = tick_first.then(|| scene.real.tick());
+        let retained_records = scene
+            .real
+            .h0
+            .0
+            .borrow()
+            .collected
+            .as_ref()
+            .unwrap()
+            .pending_h0_records();
+        let roles = scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .ledger()
+            .roles_for_test();
+        let hold = refuse_first.then(|| {
+            let registry = scene.real.scene.coordinator.registry();
+            let snapshot = registry.semantic_resource_snapshot();
+            registry
+                .reserve_semantic_storage(snapshot.limit_bytes - snapshot.charged_bytes)
+                .unwrap()
+        });
+        crate::inventory::bind_semantic_callers_for_test(
+            &mut scene.real.scene.coordinator,
+            &mut scene.real.lane,
+        );
+        {
+            let owned = scene.real.h0.0.borrow();
+            assert_eq!(
+                owned.last_refresh_observation,
+                Some(if tick_first {
+                    ObserveOutcome::Continued
+                } else {
+                    ObserveOutcome::New
+                }),
+                "real refresh observation: tick_first={tick_first}, refuse_first={refuse_first}"
+            );
+            let raw = owned.collected.as_ref().unwrap();
+            assert!(raw.h0_identity() == original_quantum);
+            assert_eq!(raw.pending_h0_records(), retained_records);
+        }
+        assert_eq!(
+            scene.real.scene.coordinator.semantic_bindings().len(),
+            usize::from(!refuse_first),
+            "the storage refusal exercises the actual admission consumer"
+        );
+        drop(hold);
+        // The newest matching receipt on retry is Continued. It may support
+        // admission, but cannot replace or recreate the original New.
+        crate::inventory::bind_semantic_callers_for_test(
+            &mut scene.real.scene.coordinator,
+            &mut scene.real.lane,
+        );
+        {
+            let owned = scene.real.h0.0.borrow();
+            assert_eq!(
+                owned.last_refresh_observation,
+                Some(ObserveOutcome::Continued)
+            );
+            assert!(owned.last_refresh_birth.is_none());
+            let raw = owned.collected.as_ref().unwrap();
+            assert!(raw.h0_identity() == original_quantum);
+            assert_eq!(raw.pending_h0_records(), retained_records);
+        }
+        assert!(
+            scene
+                .drain
+                .consumption_cut()
+                .unwrap()
+                .same_boundary(&original_boundary),
+            "refresh/retry must not poll or replace the collected cursor"
+        );
+        assert_eq!(
+            scene
+                .real
+                .scene
+                .coordinator
+                .joint_capture()
+                .ledger()
+                .roles_for_test(),
+            roles,
+            "refresh must not acknowledge or release any original raw role"
+        );
+        let binding = scene
+            .real
+            .scene
+            .coordinator
+            .semantic_bindings()
+            .get(caller)
+            .expect("the retry admits through the original current receipt");
+        assert!(Arc::ptr_eq(&binding.pin(), &original_pin));
+        let endpoint = scene.real.h0.0.borrow().io.endpoint(0).unwrap();
+        assert!(binding.provider_for_endpoint(endpoint).is_some());
+        let batch = early_batch.unwrap_or_else(|| scene.real.tick());
+        scene.prepare_batch(batch, 1);
+        let current = scene
+            .real
+            .scene
+            .coordinator
+            .take_prepared_current_for_birth_test()
+            .unwrap();
+        let births = current
+            .into_iter()
+            .filter_map(|receipt| receipt.into_birth_candidate().ok())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            births.len(),
+            1,
+            "same original New must survive real bind/refresh/retry, stash merge and prepared move: tick_first={tick_first}, refuse_first={refuse_first}"
+        );
+        assert!(births[0].quantum == original_quantum);
+        assert!(Arc::ptr_eq(births[0].receipt.original_pin(), &original_pin));
+        assert_eq!(births[0].receipt.image(), image);
+    }
+}
+
 impl CanonicalFanoutScene {
     fn publication_step(
         &mut self,

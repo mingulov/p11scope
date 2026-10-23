@@ -811,6 +811,16 @@ impl BankDirectory {
             candidate = Some(expected);
             result
         })();
+        if commit_attempted {
+            let Some(expected) = candidate.as_ref() else {
+                return self.quarantine(transaction.get(), extent);
+            };
+            // Even a confirmed absent commit permits rollback only while the
+            // complete candidate still has its original ownership facts.
+            if io.verify_candidate(expected) != CandidateCheck::Exact {
+                return self.quarantine(transaction.get(), extent);
+            }
+        }
         if result == Err(BankRefusal::Quarantined) {
             return self.quarantine(transaction.get(), extent);
         }
@@ -819,9 +829,6 @@ impl BankDirectory {
                 let Some(expected) = candidate else {
                     return self.quarantine(transaction.get(), extent);
                 };
-                if io.verify_candidate(&expected) != CandidateCheck::Exact {
-                    return self.quarantine(transaction.get(), extent);
-                }
                 for &(slot, route) in &expected.routes {
                     self.positions[slot as usize].state = PositionState::Published(route);
                 }
@@ -2552,6 +2559,69 @@ mod tests {
             assert_eq!(io.maps[&0], 101);
             assert!(!io.trace.contains(&"remove-route") && !io.trace.contains(&"remove-bank"));
             assert!(!io.held.is_empty());
+        }
+        // ENOENT alone cannot authorize cleanup after an attempted commit:
+        // the complete candidate must still have the same ownership facts.
+        for damage in [
+            None,
+            Some(GrowthDamage::Provider),
+            Some(GrowthDamage::EntrySide),
+            Some(GrowthDamage::ReturnSide),
+            Some(GrowthDamage::Unreadable),
+        ] {
+            let mut directory = BankDirectory::counts_growth_v2();
+            let mut io = GrowthIo::new(&pool);
+            assert!(matches!(
+                directory.stage_with(&mut io, &plan(1), growth_reservation(), &pool.reserver()),
+                BankPublication::Published { .. }
+            ));
+            let old = io.routes[&0];
+            io.next_stage();
+            io.commit_absent = true;
+            io.damage = damage.map(|kind| (2, kind));
+            let publication =
+                directory.stage_with(&mut io, &plan(2), growth_reservation(), &pool.reserver());
+            assert_eq!(io.checks, 2, "post-insert check with {damage:?}");
+            assert_eq!(io.routes[&0], old);
+            assert_eq!(io.maps[&0], 101);
+            assert!(!io.commits.contains_key(&2));
+            assert!(
+                !io.trace.contains(&"remove-bank"),
+                "shared old bank is retained"
+            );
+            assert!(!io.held.is_empty());
+            if damage.is_none() {
+                assert!(matches!(publication, BankPublication::RolledBack { .. }));
+                assert_eq!(io.routes.keys().copied().collect::<Vec<_>>(), [0]);
+                assert!(io.trace.contains(&"remove-route"));
+                assert!(!directory.quarantined);
+            } else {
+                assert!(
+                    matches!(publication, BankPublication::Quarantined { .. }),
+                    "{damage:?}"
+                );
+                assert_eq!(io.routes.len(), 2);
+                assert!(!io.trace.contains(&"remove-route"));
+                assert!(
+                    !io.trace.contains(&"retire-entry") && !io.trace.contains(&"retire-return")
+                );
+                // Restoring observable facts cannot revive an owner whose
+                // post-insert acknowledgement was already contradictory.
+                io.damage = None;
+                io.providers.insert(1);
+                io.entries.insert(1);
+                io.returns.insert(1);
+                io.next_stage();
+                assert_eq!(
+                    directory.stage_with(&mut io, &plan(2), growth_reservation(), &pool.reserver()),
+                    BankPublication::Refused(BankRefusal::Quarantined)
+                );
+                assert!(io.trace.is_empty());
+                assert_eq!(
+                    directory.validate_read_plan(&plan(2)),
+                    Err(BankRefusal::Quarantined)
+                );
+            }
         }
     }
 

@@ -5692,7 +5692,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             let verdicts =
                 absorbed.map_or_else(BTreeMap::new, |absorbed| self.record_absorbed(absorbed));
             self.project_catalog(&catalog, &verdicts, *now_ns);
-            if let Some(lane) = lane.as_deref_mut() {
+            if let Some(lane) = lane {
                 for (candidate, prepared) in semantic_prepared {
                     // The same final sampled member owns this permit. No
                     // owner/provider scan, PID reopen, or replacement

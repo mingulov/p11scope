@@ -842,6 +842,7 @@ impl MachineScene {
     }
 
     fn published_labeled(&mut self, label: &str, frozen: Option<bool>) {
+        let mut last_mixed_audit = None;
         for _ in 0..512 {
             let progress = self.service(1).unwrap_or_else(|reason| {
                 self.publication_failed(label, frozen, Some(reason));
@@ -869,11 +870,104 @@ impl MachineScene {
                         .filter(|(_, result)| result.is_err())
                         .count(),
                 );
+                if label.starts_with("absence-mixed") {
+                    let coordinator = &self.scene.real.scene.coordinator;
+                    for current in prepared.current_receipts().iter().take(4) {
+                        let binding = coordinator
+                            .semantic_bindings()
+                            .find_by_image(current.domain(), current.image());
+                        eprintln!(
+                            "mixed_current label={label} file={} new={} same_original={} instances={} same_native={} bound={} same_pin={} provider={}",
+                            current.endpoint().file_slot,
+                            current.birth_quantum().is_some(),
+                            self.native
+                                .preparations
+                                .last()
+                                .is_some_and(
+                                    |(identity, _)| current.birth_quantum() == Some(*identity)
+                                ),
+                            current.instances().len(),
+                            current.domain() == self.scene.producers.native_domain(),
+                            binding.is_some(),
+                            binding.is_some_and(|binding| Arc::ptr_eq(
+                                &binding.pin(),
+                                current.original_pin()
+                            )),
+                            binding.is_some_and(|binding| binding
+                                .provider_for_endpoint(current.endpoint())
+                                .is_some()),
+                        );
+                    }
+                    for (ordinal, result) in prepared.claims().take(4) {
+                        let input = prepared
+                            .admissions()
+                            .find(|input| input.h0_ordinal() == ordinal);
+                        eprintln!(
+                            "mixed_claim label={label} ordinal={ordinal} refusal={:?} same_original={} file={} same_image={}",
+                            result.as_ref().err(),
+                            result
+                                .as_ref()
+                                .is_ok_and(|proof| input
+                                    .is_some_and(|input| proof.matches_admitted(input))),
+                            input.map_or(usize::MAX, |input| self
+                                .scene
+                                .real
+                                .modules
+                                .iter()
+                                .position(|(module, _)| module == input.provider_module())
+                                .unwrap_or(usize::MAX)),
+                            input.is_some_and(|input| input.journal_binding().1
+                                == (ImageIdentity {
+                                    task_cookie: 71,
+                                    exec_id: 0
+                                })),
+                        );
+                    }
+                }
+            }
+            if label.starts_with("absence-mixed") {
+                let audit = self.machine.diagnostic_audit_for_test();
+                if audit != last_mixed_audit {
+                    eprintln!("mixed_audit label={label} actual={audit:?}");
+                    last_mixed_audit = audit;
+                }
             }
             if matches!(
                 progress,
                 crate::inventory_semantics::JointServiceProgress::Published
             ) {
+                if label.starts_with("absence-mixed") {
+                    let coordinator = &self.scene.real.scene.coordinator;
+                    eprintln!(
+                        "mixed_published label={label} feeds={} claims={} roles={:?} h3={:?} native_reads={:?} births={:?}",
+                        coordinator.registry().joint_feeds(),
+                        coordinator
+                            .joint_capture()
+                            .adapter()
+                            .invocation_claims_for_test()
+                            .0,
+                        coordinator.joint_capture().ledger().roles_for_test(),
+                        coordinator.reference_h3_audit_state(),
+                        self.native.reads.get(),
+                        self.native.birth_outcomes,
+                    );
+                    for file in 0..self.scene.real.modules.len().min(4) as u32 {
+                        let pending = self.pending_absence(file);
+                        let ready = self.ready_birth(file);
+                        eprintln!(
+                            "mixed_table label={label} file={file} pending={} ready={} same_image={}",
+                            pending.is_some(),
+                            ready.is_some(),
+                            pending.map(|original| original.proof.image()).or_else(|| ready.map(|original| original.candidate.receipt.image())).is_some_and(|image| image == (ImageIdentity { task_cookie: 71, exec_id: 0 })),
+                        );
+                    }
+                    for gap in coordinator.registry().gaps().iter().rev().take(8) {
+                        eprintln!(
+                            "mixed_gap label={label} subject={} reason={}",
+                            gap.subject, gap.reason
+                        );
+                    }
+                }
                 return;
             }
         }
@@ -1527,7 +1621,7 @@ fn joint_machine_absence_selects_exact_subject_with_mixed_ready_and_pending() {
     fixture
         .scene
         .push(std::process::id(), 2, "C_CreateObject", 2);
-    fixture.published();
+    fixture.published_labeled("absence-mixed-first-C", None);
     assert!(fixture.pending_absence(1).is_some() && fixture.ready_birth(2).is_some());
     assert!(fixture.ready_birth(1).is_none());
     let table = fixture.machine.retained_births_for_test();
@@ -1549,7 +1643,7 @@ fn joint_machine_absence_selects_exact_subject_with_mixed_ready_and_pending() {
     fixture
         .scene
         .push(std::process::id(), 1, "C_CreateObject", 3);
-    fixture.published();
+    fixture.published_labeled("absence-mixed-later-B", None);
     assert_eq!(
         fixture
             .scene

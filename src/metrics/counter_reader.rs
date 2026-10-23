@@ -2432,8 +2432,9 @@ mod tests {
     }
 
     // Reuse the existing five-second barrier budget for a WHOLE command or
-    // ledger, child exit, and producer close. Progress cadence is no timeout.
+    // ledger and child exit. Producer close shares the original case budget.
     const GROWTH_OPERATION_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+    const GROWTH_CASE_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
 
     fn growth_reap_until(
         child: &mut std::process::Child,
@@ -2637,10 +2638,10 @@ mod tests {
         }
     }
 
-    // Native invocation also requires an outer exact-test process deadline
-    // and owned-child kill/reap on failure. Production Session::drop may join
-    // cleanup outside this test helper's control. An outer timeout is FAIL /
-    // cleanup unproved, never successful qualification or permission to retry.
+    // Native invocation also requires an outer exact-test 60s deadline and
+    // owned-child kill/reap on failure. Native FD teardown can outlast this
+    // helper's failure. An outer timeout is FAIL / cleanup unproved, never
+    // successful qualification or permission to retry.
     struct NativeGrowthRun {
         // Kill/reap an owned blocked driver before the Session drops on failure.
         fixture: GrowthDriver,
@@ -2655,10 +2656,11 @@ mod tests {
         stage: crate::attach::counter_banks::BankReservation,
         expected: GrowthLedger,
         previous: Option<GrowthLedger>,
+        case_deadline: std::time::Instant,
     }
 
     impl NativeGrowthRun {
-        fn new(final_count: usize) -> Self {
+        fn new(final_count: usize, case_deadline: std::time::Instant) -> Self {
             use crate::attach::counter_banks::{BankPublication, BankReservation};
             use sha2::Digest;
             use std::io::Read;
@@ -2802,6 +2804,7 @@ mod tests {
                 stage,
                 expected: GrowthLedger::empty(),
                 previous: None,
+                case_deadline,
             };
             run.checkpoint();
             run
@@ -3028,13 +3031,21 @@ mod tests {
             self.fixture.wait_after_done();
             self.sample(); // No extra credit or hidden health failure on driver exit.
             self.session.stop_gate().request_stop();
-            let close_deadline = std::time::Instant::now() + GROWTH_OPERATION_BUDGET;
+            // Normal stop uses only what remains of the original whole-case
+            // budget. Driver commands/reap retain their separate 5s bounds.
+            let case_deadline = self.case_deadline;
+            let mut progress = Vec::new();
             self.session
                 .detach_producers_driven(
-                    || std::time::Instant::now() >= close_deadline,
-                    &mut Vec::new(),
+                    || std::time::Instant::now() >= case_deadline,
+                    &mut progress,
                 )
-                .expect("producer close failed or exceeded its finite deadline; cleanup unproved");
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "producer close failed or exceeded the original 60s case deadline; cleanup unproved: {error:#}\ncleanup progress:\n{}",
+                        String::from_utf8_lossy(&progress)
+                    )
+                });
             assert!(self.session.producers_detached() && self.session.stop_gate().quiescent());
             let starts: aya::maps::HashMap<_, StartKey, CallStart> =
                 aya::maps::HashMap::try_from(self.session.ebpf.map("START").unwrap()).unwrap();
@@ -3060,11 +3071,16 @@ mod tests {
                 self.pool.snapshot().charged_bytes,
                 SEMANTIC_TRANSITION_SCRATCH
             );
+            assert!(
+                std::time::Instant::now() < self.case_deadline,
+                "native growth case exceeded its original 60s deadline"
+            );
         }
     }
 
     fn native_growth_population(final_count: usize) {
-        let mut run = NativeGrowthRun::new(final_count);
+        let case_deadline = std::time::Instant::now() + GROWTH_CASE_BUDGET;
+        let mut run = NativeGrowthRun::new(final_count, case_deadline);
         run.fixture.command("START");
         run.fixture.expect("HELD 0");
         run.expected.rows[0].entered += 1;

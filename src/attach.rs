@@ -11200,6 +11200,415 @@ mod tests {
         }
     }
 
+    // Exercise actual grouping and registered ownership with real file FDs.
+    // Matching kernel-link qualification remains in the separate native cells.
+    #[test]
+    fn counter_bank_multi_groups_use_fixed_roots_and_exact_cookies() {
+        let (_fixture, pins, mut first, mut second, _) =
+            counter_banks::tests::growth_provider_fixture();
+        first.index = 511;
+        first.descriptor_index = 17;
+        first.file_offset = 0x80;
+        second.index = 512;
+        second.descriptor_index = 18;
+        second.file_offset = 0x90;
+        let mut third = first.clone();
+        third.index = 513;
+        third.descriptor_index = 19;
+        third.file_offset = 0xa0;
+        let slots = vec![second, third, first];
+        let targets: BTreeMap<_, _> = slots
+            .iter()
+            .map(|slot| {
+                (
+                    slot.index,
+                    (
+                        pins.attach_path_for(slot.object).unwrap(),
+                        pins.abi_for(slot.object).unwrap(),
+                    ),
+                )
+            })
+            .collect();
+        let groups: Vec<StaticGroup> = group_static_slots_with_roots(
+            &slots,
+            CapturePolicy::AggregateOnly,
+            false,
+            &targets,
+            StaticRoots::CounterBanks,
+        )
+        .unwrap();
+        assert_eq!(groups.len(), 2);
+        assert!(
+            groups
+                .iter()
+                .all(|group| group.entry_program == "p11_counter_bank_entry"
+                    && group.return_program == "p11_counter_bank_return")
+        );
+        let mut calls: Vec<(&'static str, Vec<(u64, u64)>, bool)> = Vec::new();
+        let (bundles, outcome) = attach_target_groups_with(
+            &groups,
+            |_| Some(7),
+            |program, _, sites, is_return| {
+                calls.push((program, sites.to_vec(), is_return));
+                Ok(tempfile::tempfile().unwrap().into())
+            },
+        )
+        .unwrap();
+        let _: &Vec<MultiLinkBundle<OwnedFd>> = &bundles;
+        assert_eq!(calls.len(), 4);
+        for pair in calls.chunks_exact(2) {
+            assert_eq!((pair[0].0, pair[0].2), ("p11_counter_bank_return", true));
+            assert_eq!((pair[1].0, pair[1].2), ("p11_counter_bank_entry", false));
+            assert_eq!(pair[0].1, pair[1].1);
+        }
+        let mut sites: Vec<_> = calls
+            .iter()
+            .filter(|call| !call.2)
+            .flat_map(|call| call.1.iter().copied())
+            .collect();
+        sites.sort_unstable_by_key(|site| site.1);
+        assert_eq!(
+            sites,
+            [
+                (0x80, 0x0000_0011_0000_01ff),
+                (0x90, 0x0000_0012_0000_0200),
+                (0xa0, 0x0000_0013_0000_0201),
+            ]
+        );
+        let mut completed: Vec<_> = outcome.completed.iter().map(|(index, _)| *index).collect();
+        completed.sort_unstable();
+        assert_eq!(
+            completed,
+            [511, 512, 513],
+            "each original slot is acknowledged exactly once"
+        );
+        assert_eq!(outcome.successful.len(), 6);
+        assert!(outcome.failures.is_empty() && !outcome.exhausted);
+        let mut links: Vec<RegisteredLink> = Vec::new();
+        let mut pairs = pid_continuity::PairBook::default();
+        let reserved: Result<(), counter_banks::BankRefusal> =
+            reserve_counter_multi_link_capacity(&mut links, 1);
+        reserved.unwrap();
+        let called = std::cell::Cell::new(false);
+        let invalid: io::Result<()> = retain_counter_multi_leaf(
+            &mut links,
+            &mut pairs,
+            "p11_counter_bank_return",
+            &[(0x80, 0x0000_0011_0000_01ff)],
+            &BTreeMap::new(),
+            || {
+                called.set(true);
+                Ok(tempfile::tempfile().unwrap().into())
+            },
+        );
+        assert!(
+            invalid.is_err() && !called.get() && links.is_empty(),
+            "unknown cookie refuses before the native leaf"
+        );
+        for (policy, unsafe_object, bad_abi) in [
+            (CapturePolicy::Allowlisted, false, false),
+            (CapturePolicy::AggregateOnly, true, false),
+            (CapturePolicy::AggregateOnly, false, true),
+        ] {
+            let mut target_facts = targets.clone();
+            if bad_abi {
+                target_facts.get_mut(&511).unwrap().1 = ElfAbi::Ilp32;
+            }
+            let refused: Result<Vec<StaticGroup>> = group_static_slots_with_roots(
+                &slots,
+                policy,
+                unsafe_object,
+                &target_facts,
+                StaticRoots::CounterBanks,
+            );
+            assert!(refused.is_err());
+        }
+        let detailed = group_static_slots(&slots, CapturePolicy::AggregateOnly, false, &targets);
+        assert!(
+            detailed
+                .iter()
+                .all(|group| group.entry_program == "p11_entry")
+        );
+    }
+
+    #[test]
+    fn counter_bank_multi_append_and_late_failure_preserve_old_groups() {
+        for refusal in [None, Some(libc::EOPNOTSUPP), Some(libc::EMFILE)] {
+            let (_fixture, pins, first, mut second, _) =
+                counter_banks::tests::growth_provider_fixture();
+            let old_slots: Vec<_> = (0..511)
+                .map(|index| {
+                    let mut slot = first.clone();
+                    slot.index = index;
+                    slot.file_offset = 0x1000 + 16 * u64::from(index);
+                    slot
+                })
+                .collect();
+            let mut addition = first.clone();
+            addition.index = 511;
+            addition.file_offset = 0x1000 + 16 * 511;
+            second.index = 512;
+            second.file_offset = 0x1000;
+            let fresh = vec![addition, second];
+            let all_targets: BTreeMap<_, _> = old_slots
+                .iter()
+                .chain(&fresh)
+                .map(|slot| {
+                    (
+                        slot.index,
+                        (
+                            pins.attach_path_for(slot.object).unwrap(),
+                            pins.abi_for(slot.object).unwrap(),
+                        ),
+                    )
+                })
+                .collect();
+            let old_groups: Vec<StaticGroup> = group_static_slots_with_roots(
+                &old_slots,
+                CapturePolicy::AggregateOnly,
+                false,
+                &all_targets,
+                StaticRoots::CounterBanks,
+            )
+            .unwrap();
+            let fresh_groups: Vec<StaticGroup> = group_static_slots_with_roots(
+                &fresh,
+                CapturePolicy::AggregateOnly,
+                false,
+                &all_targets,
+                StaticRoots::CounterBanks,
+            )
+            .unwrap();
+            assert_eq!(old_groups.len(), 1);
+            assert_eq!(fresh_groups.len(), 2);
+            let mut links: Vec<RegisteredLink> = Vec::new();
+            let mut pairs = pid_continuity::PairBook::default();
+            let reserved: Result<(), counter_banks::BankRefusal> =
+                reserve_counter_multi_link_capacity(&mut links, old_slots.len());
+            reserved.unwrap();
+            let old_index: BTreeMap<_, _> = old_groups
+                .iter()
+                .flat_map(|group| &group.members)
+                .map(|member| (member.cookie, member.slot.index))
+                .collect();
+            let (_, old_outcome): (Vec<MultiLinkBundle<()>>, AttachOutcome) =
+                attach_target_groups_with(
+                    &old_groups,
+                    |_| Some(1),
+                    |program, _, sites, _| {
+                        retain_counter_multi_leaf(
+                            &mut links,
+                            &mut pairs,
+                            program,
+                            sites,
+                            &old_index,
+                            || Ok(tempfile::tempfile().unwrap().into()),
+                        )
+                    },
+                )
+                .unwrap();
+            assert_eq!(old_outcome.completed.len(), 511);
+            assert_eq!(links.len(), 2);
+            let original_fds: Vec<_> = links
+                .iter()
+                .flat_map(|link| match link {
+                    RegisteredLink::MultiUProbe { fds, .. } => {
+                        fds.iter().map(AsRawFd::as_raw_fd).collect::<Vec<_>>()
+                    }
+                    _ => unreachable!(),
+                })
+                .collect();
+            let old_members: Vec<u32> = (0..511).collect();
+            assert!(
+                links
+                    .iter()
+                    .all(|link| link.slots() == old_members.as_slice())
+            );
+            let reserved: Result<(), counter_banks::BankRefusal> =
+                reserve_counter_multi_link_capacity(&mut links, fresh.len());
+            reserved.unwrap();
+            let fresh_index: BTreeMap<_, _> = fresh_groups
+                .iter()
+                .flat_map(|group| &group.members)
+                .map(|member| (member.cookie, member.slot.index))
+                .collect();
+            let mut native_calls = 0;
+            let outcome: Result<
+                (Vec<MultiLinkBundle<()>>, AttachOutcome),
+                BackendFallbackRequired,
+            > = attach_target_groups_with(
+                &fresh_groups,
+                |_| Some(2),
+                |program, _, sites, _| {
+                    assert!(sites.iter().all(|(_, cookie)| {
+                        fresh_index
+                            .get(cookie)
+                            .is_some_and(|slot| matches!(*slot, 511 | 512))
+                    }));
+                    retain_counter_multi_leaf(
+                        &mut links,
+                        &mut pairs,
+                        program,
+                        sites,
+                        &fresh_index,
+                        || {
+                            native_calls += 1;
+                            if native_calls == 3
+                                && let Some(errno) = refusal
+                            {
+                                Err(io::Error::from_raw_os_error(errno))
+                            } else {
+                                Ok(tempfile::tempfile().unwrap().into())
+                            }
+                        },
+                    )
+                },
+            );
+            match refusal {
+                None => {
+                    let (_, outcome) = outcome.unwrap();
+                    let completed: BTreeSet<_> = outcome
+                        .completed
+                        .into_iter()
+                        .map(|(index, _)| index)
+                        .collect();
+                    assert_eq!(completed, BTreeSet::from([511, 512]));
+                    assert!(!outcome.exhausted && outcome.failures.is_empty());
+                    assert_eq!(links.len(), 6);
+                }
+                Some(libc::EMFILE) => {
+                    let (_, outcome) = outcome.unwrap();
+                    assert!(outcome.exhausted);
+                    assert_eq!(
+                        links.len(),
+                        4,
+                        "the successful fresh return/entry leaves remain owned"
+                    );
+                }
+                Some(_) => {
+                    assert!(outcome.is_err());
+                    assert_eq!(
+                        links.len(),
+                        4,
+                        "late Unsupported cannot drop earlier acquired leaves inline"
+                    );
+                }
+            }
+            assert!(
+                original_fds
+                    .iter()
+                    .all(|fd| unsafe { libc::fcntl(*fd, libc::F_GETFD) } >= 0)
+            );
+            assert!(
+                links[..2]
+                    .iter()
+                    .all(|link| link.slots() == old_members.as_slice())
+            );
+            let requested = BTreeSet::from([511, 512]);
+            let candidate_check: Result<()> = validate_counter_group_retirement(&links, &requested);
+            candidate_check.unwrap();
+            let selected = extract_selected_links(&mut links, &mut pairs, |link| {
+                link.slots().iter().any(|slot| requested.contains(slot))
+            });
+            let selected = selected
+                .into_iter()
+                .map(|link| (link.producer(), link))
+                .collect();
+            let mut closed = Vec::new();
+            let failures = detach_selected_with(selected, |link: RegisteredLink| {
+                closed.push(link.producer());
+                drop(link);
+                Ok(())
+            });
+            assert!(failures.is_empty());
+            assert!(closed.windows(2).all(|pair| !matches!(
+                pair,
+                [
+                    ProducerProgram::UProbe("p11_counter_bank_return"),
+                    ProducerProgram::UProbe("p11_counter_bank_entry")
+                ]
+            )));
+            assert_eq!(links.len(), 2);
+            assert!(
+                links
+                    .iter()
+                    .all(|link| link.slots() == old_members.as_slice())
+            );
+            assert!(
+                original_fds
+                    .iter()
+                    .all(|fd| unsafe { libc::fcntl(*fd, libc::F_GETFD) } >= 0)
+            );
+        }
+    }
+
+    #[test]
+    fn counter_bank_multi_refuses_partial_published_rebuild() {
+        let mut pairs = pid_continuity::PairBook::default();
+        let mut links: Vec<_> = ["p11_counter_bank_return", "p11_counter_bank_entry"]
+            .into_iter()
+            .map(|program| RegisteredLink::MultiUProbe {
+                program,
+                slots: vec![0, 1],
+                fds: vec![tempfile::tempfile().unwrap().into()],
+                registration: pairs.register(),
+            })
+            .collect();
+        let original_fds: Vec<_> = links
+            .iter()
+            .flat_map(|link| match link {
+                RegisteredLink::MultiUProbe { fds, .. } => {
+                    fds.iter().map(AsRawFd::as_raw_fd).collect::<Vec<_>>()
+                }
+                _ => unreachable!(),
+            })
+            .collect();
+        let partial: Result<()> = validate_counter_group_retirement(&links, &BTreeSet::from([1]));
+        assert!(partial.is_err());
+        assert_eq!(links.len(), 2);
+        assert!(links.iter().all(|link| link.slots() == [0, 1]));
+        assert!(
+            original_fds
+                .iter()
+                .all(|fd| unsafe { libc::fcntl(*fd, libc::F_GETFD) } >= 0)
+        );
+        let whole: Result<()> = validate_counter_group_retirement(&links, &BTreeSet::from([0, 1]));
+        whole.unwrap();
+        let selected = extract_selected_links(&mut links, &mut pairs, |_| true);
+        let mut closed = Vec::new();
+        assert!(
+            detach_selected_with(
+                selected
+                    .into_iter()
+                    .map(|link| (link.producer(), link))
+                    .collect(),
+                |link: RegisteredLink| {
+                    closed.push(link.producer());
+                    drop(link);
+                    Ok(())
+                }
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            closed,
+            [
+                ProducerProgram::UProbe("p11_counter_bank_entry"),
+                ProducerProgram::UProbe("p11_counter_bank_return")
+            ]
+        );
+        assert!(links.is_empty());
+        let mut links = Vec::new();
+        let overflow: Result<(), counter_banks::BankRefusal> =
+            reserve_counter_multi_link_capacity(&mut links, usize::MAX);
+        assert!(overflow.is_err());
+        assert_eq!(
+            links.capacity(),
+            0,
+            "overflow refuses before registry allocation"
+        );
+    }
+
     #[test]
     fn selected_multi_late_unsupported_keeps_every_acquired_group_fd() {
         for fail_second_group in [false, true] {

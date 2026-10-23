@@ -2705,6 +2705,7 @@ pub(crate) mod tests {
         target_refusal: Option<BankRefusal>,
         fd_preflight: Option<(usize, Result<FdSnapshot, BankRefusal>)>,
         fd_stage_snapshot: Option<Result<FdSnapshot, BankRefusal>>,
+        counter_multi_storage: Option<(&'a mut Vec<super::super::RegisteredLink>, BankReservation)>,
         failure: Option<&'static str>,
         initial_unreadable: bool,
         commit_absent: bool,
@@ -2783,6 +2784,40 @@ pub(crate) mod tests {
                     snapshot
                 })?;
             }
+            if let Some((links, envelope)) = &self.counter_multi_storage {
+                let geometry = CountsBankGeometry::checked(16, 512)?;
+                let new_banks = (fresh.first / geometry.cells..=(fresh.end - 1) / geometry.cells)
+                    .filter(|bank| !self.maps.contains_key(bank))
+                    .count();
+                let fresh_slots = &slots[fresh.first as usize..fresh.end as usize];
+                let provider_copies = fresh_slots
+                    .iter()
+                    .try_fold(0usize, |bytes, slot| {
+                        bytes.checked_add(
+                            self.target_store?
+                                .retained_target_copy_allocation_charge(slot.object)?
+                                .checked_mul(4)?,
+                        )
+                    })
+                    .ok_or(BankRefusal::Budget)?;
+                let base = stage_requirements(
+                    geometry,
+                    slots,
+                    fresh,
+                    old_capacity,
+                    self.cpus,
+                    new_banks,
+                    provider_copies,
+                    16,
+                )?;
+                check_counter_multi_reservation(
+                    *envelope,
+                    base,
+                    fresh_slots,
+                    links.len(),
+                    links.capacity(),
+                )?;
+            }
             Ok(())
         }
 
@@ -2836,6 +2871,9 @@ pub(crate) mod tests {
                     .commits
                     .contains_key(&self.routes[&slot.index].transaction)
             }));
+            if let Some((links, _)) = &mut self.counter_multi_storage {
+                super::super::reserve_counter_multi_link_capacity(links, slots.len())?;
+            }
             if let Some(owner) = self.provider_owner {
                 let mut custody = owner.lock().unwrap();
                 custody.retain_targets(slots, self.target_store.unwrap())?;
@@ -4968,7 +5006,8 @@ pub(crate) mod tests {
         }
     }
 
-    fn growth_provider_fixture() -> (tempfile::TempDir, PinnedObjects, Slot, Slot, String) {
+    pub(in crate::attach) fn growth_provider_fixture()
+    -> (tempfile::TempDir, PinnedObjects, Slot, Slot, String) {
         use crate::discovery::identity::test_fixture::real_scan_pin;
         use sha2::Digest;
         let dir = tempfile::tempdir().unwrap();
@@ -5591,6 +5630,333 @@ pub(crate) mod tests {
                 let retain = io.trace.iter().position(|&step| step == "retain").unwrap();
                 assert!(query < observe && observe < retain);
             }
+        }
+    }
+
+    #[test]
+    fn counter_bank_multi_storage_remains_paid_after_clean_rollback() {
+        use super::super::RegisteredLink;
+        for short in [None, Some(0), Some(1), Some(2)] {
+            let (_fixture, pins, first, second, _) = growth_provider_fixture();
+            let pool = SemanticResourcePool::reference_limit(256 * 1024 * 1024);
+            let initial = pool.snapshot().charged_bytes;
+            let geometry = CountsBankGeometry::checked(16, 512).unwrap();
+            let keepalive = CounterKeepalive::precharge_with_geometry(
+                &pool.reserver(),
+                16 * 1024 * 1024,
+                geometry,
+            )
+            .unwrap();
+            let mut links: Vec<RegisteredLink> =
+                ["p11_counter_bank_return", "p11_counter_bank_entry"]
+                    .into_iter()
+                    .map(|program| RegisteredLink::MultiUProbe {
+                        program,
+                        slots: vec![0],
+                        fds: vec![tempfile::tempfile().unwrap().into()],
+                        registration: None,
+                    })
+                    .collect::<Box<[_]>>()
+                    .into_vec();
+            let original_fds: Vec<_> = links
+                .iter()
+                .flat_map(|link| match link {
+                    RegisteredLink::MultiUProbe { fds, .. } => {
+                        fds.iter().map(AsRawFd::as_raw_fd).collect::<Vec<_>>()
+                    }
+                    _ => unreachable!(),
+                })
+                .collect();
+            let old_capacity = links.capacity();
+            let policy = crate::plan::AdmissionPolicy::counters(
+                crate::capacity::CounterBudget::new(8192).unwrap(),
+            );
+            let mut history =
+                AttachPlan::from_slots_with_policy(vec![first.clone()], policy).unwrap();
+            let mut directory = BankDirectory::counts_growth_v2();
+            let mut io = GrowthIo::new(&pool);
+            io.target_store = Some(&pins);
+            io.provider_owner = Some(&keepalive.custody);
+            assert!(matches!(
+                directory.stage_with(
+                    &mut io,
+                    &mut history,
+                    growth_reservation(),
+                    &pool.reserver()
+                ),
+                BankPublication::Published { transaction: 1, .. }
+            ));
+            let old = io.routes[&0];
+            history
+                .extend_exact(
+                    AttachPlan::from_slots_with_policy(vec![first, second], policy).unwrap(),
+                )
+                .unwrap();
+            let fresh = BankExtent { first: 1, end: 2 };
+            let fresh_slots = &history.slots[1..];
+            let provider_bytes = pins
+                .retained_target_copy_allocation_charge(fresh_slots[0].object)
+                .unwrap()
+                .checked_mul(4)
+                .unwrap();
+            let base = stage_requirements(
+                geometry,
+                &history.slots,
+                fresh,
+                directory.positions.capacity(),
+                2,
+                0,
+                provider_bytes,
+                16,
+            )
+            .unwrap();
+            let extra: (usize, usize, usize) =
+                counter_multi_requirements(fresh_slots, links.len(), links.capacity()).unwrap();
+            assert!(extra.0 > 0 && extra.1 > 0 && extra.2 > 0);
+            if short.is_none() {
+                let large_slots: Vec<_> = (0..8192)
+                    .map(|index| {
+                        let mut slot = fresh_slots[0].clone();
+                        slot.index = index;
+                        slot.file_offset = 0x1000 + 16 * u64::from(index);
+                        slot
+                    })
+                    .collect();
+                let large: (usize, usize, usize) =
+                    counter_multi_requirements(&large_slots, 0, 0).unwrap();
+                assert!(
+                    large.0.checked_add(large.2).unwrap()
+                        >= 16_384
+                            * (size_of::<RegisteredLink>()
+                                + size_of::<u32>()
+                                + size_of::<std::os::fd::OwnedFd>()
+                                + 2 * OWNED_ALLOCATION_PADDING),
+                    "8192 worst-bisect pairs must pay all retained leaf headers/member/FD backing"
+                );
+                assert!(
+                    large.1 >= 8192 * (2 * size_of::<(u64, u64)>() + 2 * size_of::<usize>()),
+                    "return/entry sites and overlapping bisect indices need real transient backing"
+                );
+                let mut wide = fresh_slots.to_vec();
+                wide[0].names[0].reserve(4096);
+                let extra_name = wide[0].names[0].capacity() - fresh_slots[0].names[0].capacity();
+                let wide_charge: (usize, usize, usize) =
+                    counter_multi_requirements(&wide, links.len(), links.capacity()).unwrap();
+                assert!(
+                    wide_charge.1 >= extra.1 + extra_name,
+                    "a cloned group member must charge its deep name backing"
+                );
+            }
+            assert!(
+                extra.0 + extra.2
+                    >= 4 * size_of::<RegisteredLink>()
+                        + 2 * (size_of::<u32>() + size_of::<std::os::fd::OwnedFd>())
+                        + 4 * OWNED_ALLOCATION_PADDING,
+                "new registry backing and both possible leaf member/FD vectors need retained payment"
+            );
+            assert!(
+                extra.1 >= old_capacity * size_of::<RegisteredLink>(),
+                "old/new backing overlap must remain paid"
+            );
+            let overflow: Result<(usize, usize, usize), BankRefusal> =
+                counter_multi_requirements(fresh_slots, usize::MAX, usize::MAX);
+            assert_eq!(overflow, Err(BankRefusal::Budget));
+            let mut envelope = BankReservation {
+                retained_bytes: base.0.checked_add(extra.0).unwrap(),
+                transient_bytes: base.1.checked_add(extra.1).unwrap(),
+                metadata_bytes: base.2.checked_add(extra.2).unwrap(),
+                file_descriptors: base.3,
+            };
+            match short {
+                Some(0) => envelope.retained_bytes -= 1,
+                Some(1) => envelope.transient_bytes -= 1,
+                Some(2) => envelope.metadata_bytes -= 1,
+                None => {}
+                _ => unreachable!(),
+            }
+            let charged = pool.snapshot().charged_bytes;
+            io.next_stage();
+            io.failure = Some("entry");
+            io.counter_multi_storage = Some((&mut links, envelope));
+            let result = directory.stage_with(&mut io, &mut history, envelope, &pool.reserver());
+            if short.is_some() {
+                assert_eq!(result, BankPublication::Refused(BankRefusal::Budget));
+                assert!(io.trace.iter().all(|step| *step == "validate"));
+                assert_eq!(history.counter_consumed_end(), 1);
+                assert!(history.is_active(1));
+                assert_eq!(directory.allocated_high_water(), 1);
+                assert_eq!(directory.next_transaction, NonZeroU64::new(2));
+                assert_eq!(keepalive.custody.lock().unwrap().charges.len(), 1);
+                assert_eq!(pool.snapshot().charged_bytes, charged);
+            } else {
+                assert_eq!(
+                    result,
+                    BankPublication::RolledBack {
+                        transaction: 2,
+                        extent: fresh,
+                        reason: BankRefusal::Links
+                    }
+                );
+                assert_eq!(history.counter_consumed_end(), 2);
+                assert!(!history.is_active(1));
+                assert_eq!(directory.next_transaction, NonZeroU64::new(3));
+                assert_eq!(keepalive.custody.lock().unwrap().charges.len(), 2);
+                assert_eq!(
+                    pool.snapshot().charged_bytes,
+                    charged + envelope.charges().unwrap().0,
+                    "clean rollback refunds scratch, never the retained extent lease paying registry backing"
+                );
+            }
+            assert_eq!(directory.published_indices().collect::<Vec<_>>(), [0]);
+            assert_eq!(io.routes, BTreeMap::from([(0, old)]));
+            assert_eq!(io.entries, BTreeSet::from([0]));
+            assert_eq!(io.returns, BTreeSet::from([0]));
+            drop(io);
+            assert_eq!(links.len(), 2);
+            if short.is_some() {
+                assert_eq!(links.capacity(), old_capacity);
+            } else {
+                assert!(links.capacity() >= 4 && links.capacity() > old_capacity);
+            }
+            assert!(
+                original_fds
+                    .iter()
+                    .all(|fd| unsafe { libc::fcntl(*fd, libc::F_GETFD) } >= 0)
+            );
+            drop(links);
+            assert!(
+                pool.snapshot().charged_bytes > initial,
+                "releasing registry storage alone cannot refund retained history"
+            );
+            drop(keepalive);
+            assert_eq!(pool.snapshot().charged_bytes, initial);
+        }
+    }
+
+    #[test]
+    fn counter_bank_explicit_backend_is_fixed_before_loading() {
+        use super::super::{AttachBackend, BackendSelection, RegisteredLink};
+        // API pins: a requested backend creates a NEW Session; no existing
+        // Session or setter participates. The old constructor remains Singles.
+        let _: fn(&Scope, &[u8], BankReservation, &SemanticResourceReserver) -> Result<Session> =
+            Session::prepare_counter_banks;
+        let _: fn(
+            &Scope,
+            &[u8],
+            BankReservation,
+            &SemanticResourceReserver,
+            AttachBackend,
+        ) -> Result<Session> = Session::prepare_counter_banks_with_backend;
+        let _load_for_backend =
+            |preparation: &CounterPreparation<'_>, ebpf: &mut Ebpf, backend: AttachBackend| {
+                preparation.validate_and_load(ebpf, backend)
+            };
+        let singles = super::super::select_session_backend(
+            BackendSelection::Singles,
+            true,
+            || panic!("Singles must not probe Multi"),
+            || panic!("Singles must not probe the Multi PID filter"),
+        )
+        .unwrap();
+        assert_eq!(singles.backend, AttachBackend::Singles);
+        let refused = super::super::select_session_backend(
+            BackendSelection::Multi,
+            true,
+            || panic!("PID scope uses its PID gate"),
+            || Err("actual PID-filter gate refused".into()),
+        );
+        assert!(
+            refused.is_err(),
+            "forced Multi cannot silently select Singles"
+        );
+        let activated = std::cell::Cell::new(false);
+        let refusal_before_activation =
+            super::super::activate_after_preparation_with(refused.map(|_| ()), || {
+                activated.set(true);
+                Ok(())
+            });
+        assert!(refusal_before_activation.is_err() && !activated.get());
+        let selected = super::super::select_session_backend(
+            BackendSelection::Multi,
+            true,
+            || panic!("PID scope uses its PID gate"),
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(selected.backend, AttachBackend::Multi);
+        assert!(selected.fallback.is_none());
+        for backend in [AttachBackend::Singles, AttachBackend::Multi] {
+            let pool = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
+            let geometry = CountsBankGeometry::checked(16, 512).unwrap();
+            let banks = CounterBanks {
+                directory: Arc::new(Mutex::new(BankDirectory::counts_growth_v2())),
+                keepalive: CounterKeepalive::precharge_with_geometry(
+                    &pool.reserver(),
+                    16 * 1024 * 1024,
+                    geometry,
+                )
+                .unwrap(),
+                cpus: 2,
+                geometry,
+                link_staging: Arc::new(AtomicU64::new(0)),
+                backend,
+            };
+            let foreign = if backend == AttachBackend::Singles {
+                AttachBackend::Multi
+            } else {
+                AttachBackend::Singles
+            };
+            assert_eq!(banks.backend, backend);
+            let validate_backend =
+                |value: AttachBackend| -> Result<(), BankRefusal> { banks.validate_backend(value) };
+            let validate_unlinked =
+                |value: AttachBackend, links: &[RegisteredLink]| -> Result<(), BankRefusal> {
+                    banks.validate_unlinked_backend(value, links)
+                };
+            assert_eq!(validate_backend(backend), Ok(()));
+            assert_eq!(validate_backend(foreign), Err(BankRefusal::Topology));
+            assert_eq!(validate_unlinked(backend, &[]), Ok(()));
+            assert_eq!(validate_unlinked(foreign, &[]), Err(BankRefusal::Topology));
+            let links = vec![RegisteredLink::MultiUProbe {
+                program: "p11_counter_bank_entry",
+                slots: vec![0],
+                fds: vec![tempfile::tempfile().unwrap().into()],
+                registration: None,
+            }];
+            assert_eq!(
+                validate_unlinked(backend, &links),
+                Err(BankRefusal::Allocated),
+                "constructor admission cannot reuse an active registry"
+            );
+            let activated = std::cell::Cell::new(false);
+            let active_owner =
+                validate_unlinked(backend, &links).map_err(|reason| anyhow::anyhow!("{reason:?}"));
+            let refused = super::super::activate_after_preparation_with(active_owner, || {
+                activated.set(true);
+                Ok(())
+            });
+            assert!(refused.is_err() && !activated.get());
+            assert_eq!(
+                validate_backend(backend),
+                Ok(()),
+                "ordinary later appends keep their healthy old links"
+            );
+            assert!(super::super::loads_with_multi_flag(
+                AttachBackend::Multi,
+                "p11_counter_bank_entry"
+            ));
+            assert!(super::super::loads_with_multi_flag(
+                AttachBackend::Multi,
+                "p11_counter_bank_return"
+            ));
+            assert!(!super::super::loads_with_multi_flag(
+                AttachBackend::Singles,
+                "p11_counter_bank_entry"
+            ));
+            assert!(!super::super::loads_with_multi_flag(
+                AttachBackend::Singles,
+                "p11_counter_bank_return"
+            ));
         }
     }
 

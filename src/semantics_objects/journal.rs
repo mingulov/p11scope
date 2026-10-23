@@ -3005,13 +3005,14 @@ pub(crate) enum DrainMintRefusal {
 }
 
 impl SessionDrainGrant {
-    /// Read-only association check. Inert TDD scaffolding refuses every
-    /// comparison until the actual Q readiness positive has run RED.
+    /// Read-only association metadata, not allocation or cursor authority.
+    /// Q must separately retain the Session's real producers and cursor cut.
     pub(crate) fn matches_producers(
         &self,
-        _producers: &crate::attach::SessionDrainProducers,
+        producers: &crate::attach::SessionDrainProducers,
     ) -> bool {
-        false
+        self.domain_tag == producers.native_domain().journal_tag()
+            && self.events_id == producers.events_id()
     }
 
     /// Mint the association through the Session retaining both the

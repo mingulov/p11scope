@@ -614,6 +614,22 @@ pub(crate) enum EventsCutRefusal {
 }
 
 impl EventsConsumptionCut {
+    pub(crate) fn producer_bound(&self) -> usize {
+        self.producer
+    }
+
+    /// Only byte/cursor containment. Earlier originals may end before Q,
+    /// and malformed/discarded history remains the audit's responsibility.
+    pub(crate) fn within_producer_bound(&self, bound: &Self) -> bool {
+        self.same_cursor(bound)
+            && self.consumer <= bound.producer
+            && self.producer <= bound.producer
+    }
+
+    pub(crate) fn at_producer_bound(&self, bound: &Self) -> bool {
+        self.within_producer_bound(bound) && self.consumer == bound.producer
+    }
+
     pub(crate) fn same_boundary(&self, other: &Self) -> bool {
         self.same_cursor(other)
             && self.consumer == other.consumer

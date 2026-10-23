@@ -2130,7 +2130,8 @@ pub(crate) struct SessionDrainProducers {
 
 /// Session-owned Q metadata. No constructor, Clone or Copy permits a caller
 /// to manufacture quiescence from ring positions or a terminal summary.
-/// Inert TDD scaffolding: the observer below cannot mint an instance yet.
+/// This records producer bounds, not a clean prefix, completed drain, process
+/// death, or permission to detach. Later reads must remain within the bounds.
 pub(crate) struct CollectedFinishQ {
     producers: SessionDrainProducers,
     discovery: events::DiscoveryDomain,
@@ -2143,36 +2144,35 @@ pub(crate) struct CollectedFinishQ {
 impl CollectedFinishQ {
     pub(crate) fn matches_owner(
         &self,
-        _producers: &SessionDrainProducers,
-        _discovery: &events::DiscoveryDomain,
+        producers: &SessionDrainProducers,
+        discovery: &events::DiscoveryDomain,
     ) -> bool {
-        let _ = (&self.producers, &self.discovery);
-        false
+        self.producers.same_producers(producers) && self.discovery.same_allocation(discovery)
     }
 
     pub(crate) fn matches_retained_grant(
         &self,
-        _grant: &crate::semantics_objects::journal::SessionDrainGrant,
+        grant: &crate::semantics_objects::journal::SessionDrainGrant,
     ) -> bool {
-        let _ = &self.grant;
-        false
+        self.grant.as_ref().is_some_and(|retained| {
+            retained == grant && retained.matches_producers(&self.producers)
+        })
     }
 
     pub(crate) fn events_stop(&self) -> usize {
-        let _ = &self.events;
-        0
+        self.events.producer_bound()
     }
 
     pub(crate) fn discovery_stop(&self) -> usize {
         self.discovery_positions.producer
     }
 
-    pub(crate) fn covers_events_bounds(&self, _cut: &events::EventsConsumptionCut) -> bool {
-        false
+    pub(crate) fn covers_events_bounds(&self, cut: &events::EventsConsumptionCut) -> bool {
+        cut.within_producer_bound(&self.events)
     }
 
-    pub(crate) fn events_at_bound(&self, _cut: &events::EventsConsumptionCut) -> bool {
-        false
+    pub(crate) fn events_at_bound(&self, cut: &events::EventsConsumptionCut) -> bool {
+        cut.at_producer_bound(&self.events)
     }
 }
 
@@ -2185,22 +2185,68 @@ struct CollectedFinishQOwner<'a> {
     detach: &'a OwnedProducerDetach,
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // Inert until the readiness positive has observed runtime RED.
+fn validate_collected_finish_q_owner(
+    owner: &CollectedFinishQOwner<'_>,
+    expected: &SessionDrainProducers,
+    grant: Option<&crate::semantics_objects::journal::SessionDrainGrant>,
+) -> Result<()> {
+    anyhow::ensure!(
+        owner.producers.same_producers(expected),
+        "collected Finish Q requires the original Session producers"
+    );
+    anyhow::ensure!(
+        matches!(owner.detach, OwnedProducerDetach::NotStarted),
+        "collected Finish Q cannot follow producer detach"
+    );
+    anyhow::ensure!(
+        grant.is_none_or(|retained| retained.matches_producers(owner.producers)),
+        "collected Finish Q refuses a foreign retained drain grant"
+    );
+    Ok(())
+}
+
 fn observe_collected_finish_q_with(
     owner: CollectedFinishQOwner<'_>,
-    _expected: &SessionDrainProducers,
-    _grant: Option<&crate::semantics_objects::journal::SessionDrainGrant>,
-    _read_events: impl FnOnce() -> Result<events::EventsConsumptionCut>,
-    _read_discovery: impl FnOnce() -> Result<aya::maps::ring_buf::RingBufPositions>,
+    expected: &SessionDrainProducers,
+    grant: Option<&crate::semantics_objects::journal::SessionDrainGrant>,
+    read_events: impl FnOnce() -> Result<events::EventsConsumptionCut>,
+    read_discovery: impl FnOnce() -> Result<aya::maps::ring_buf::RingBufPositions>,
 ) -> Result<Option<CollectedFinishQ>> {
-    let CollectedFinishQOwner {
-        gate,
-        producers,
-        discovery,
-        detach,
-    } = owner;
-    let _ = (gate, producers, discovery, detach);
-    Ok(None)
+    validate_collected_finish_q_owner(&owner, expected, grant)?;
+    if !owner.gate.quiescent() {
+        return Ok(None);
+    }
+    let events = read_events()?;
+    anyhow::ensure!(
+        owner.producers.matches_events(events.events()),
+        "collected Finish Q refuses another EVENTS allocation"
+    );
+    let discovery_positions = read_discovery()?;
+    anyhow::ensure!(
+        discovery_positions.consumer.is_multiple_of(8)
+            && discovery_positions.producer.is_multiple_of(8)
+            && discovery_positions.capacity != 0
+            && discovery_positions.capacity.is_power_of_two()
+            && discovery_positions.consumer != usize::MAX
+            && discovery_positions.producer != usize::MAX
+            && discovery_positions
+                .producer
+                .checked_sub(discovery_positions.consumer)
+                .is_some_and(|unread| unread <= discovery_positions.capacity),
+        "collected Finish Q refuses invalid DISCOVERY positions"
+    );
+    // Q must still hold after BOTH original ring observations. No dequeue,
+    // callback, OBJECT_START scrub or lifecycle proof occurs in this observer.
+    if !owner.gate.quiescent() {
+        return Ok(None);
+    }
+    Ok(Some(CollectedFinishQ {
+        producers: owner.producers.clone(),
+        discovery: owner.discovery.clone(),
+        events,
+        discovery_positions,
+        grant: grant.copied(),
+    }))
 }
 
 impl SessionDrainProducers {
@@ -4764,15 +4810,55 @@ impl Session {
         &self.stop_gate
     }
 
-    /// Inert staged port. Only the subsequent observer implementation may
-    /// construct Q from this Session's actual gate, domains and consumers.
+    /// Observe this Session's actual producer Q without consuming either
+    /// retained ring. A pending result retains all Session ownership.
     #[allow(dead_code)] // No machine/terminal activation in this slice.
     pub(crate) fn observe_collected_finish_q(
         &mut self,
-        _expected: &SessionDrainProducers,
-        _grant: Option<&crate::semantics_objects::journal::SessionDrainGrant>,
+        expected: &SessionDrainProducers,
+        grant: Option<&crate::semantics_objects::journal::SessionDrainGrant>,
     ) -> Result<Option<CollectedFinishQ>> {
-        Ok(None)
+        let producers = self
+            .drain_producers()
+            .context("collected Finish Q has no retained native domain")?;
+        {
+            let owner = CollectedFinishQOwner {
+                gate: &self.stop_gate,
+                producers: &producers,
+                discovery: &self.discovery_domain,
+                detach: &self.producer_detach,
+            };
+            validate_collected_finish_q_owner(&owner, expected, grant)?;
+            if !owner.gate.quiescent() {
+                return Ok(None);
+            }
+        }
+        self.ensure_events_consumer()?;
+        self.ensure_discovery_consumer()?;
+        let events = self
+            .events_consumer
+            .as_ref()
+            .context("retained EVENTS consumer vanished during Q observation")?;
+        let discovery = self
+            .discovery_consumer
+            .as_ref()
+            .context("retained DISCOVERY consumer vanished during Q observation")?;
+        observe_collected_finish_q_with(
+            CollectedFinishQOwner {
+                gate: &self.stop_gate,
+                producers: &producers,
+                discovery: &self.discovery_domain,
+                detach: &self.producer_detach,
+            },
+            expected,
+            grant,
+            || {
+                events
+                    .consumption_cut()
+                    .map_err(|reason| anyhow!("collected Finish EVENTS cut refused: {reason:?}"))
+            },
+            || Ok(events::discovery_drain_positions(discovery)),
+        )
     }
 
     /// Stamps attach completion with one CLOCK_MONOTONIC read (T2, G-14).

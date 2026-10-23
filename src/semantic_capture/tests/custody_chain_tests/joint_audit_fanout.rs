@@ -1126,7 +1126,26 @@ fn joint_machine_pending_a_allows_q2_real_end() {
                 use crate::discovery::engine::inventory_coordinator::JointCommitProgress;
                 fixture.machine.begin_commit(true).unwrap();
                 let mut completed = false;
+                let mut retained_claim_requires_ingestion = false;
                 for _ in 0..128 {
+                    if fixture.machine.diagnostic_snapshot_for_test().0 == "Ingesting" {
+                        let raw = fixture.machine.retained_raw_for_test().unwrap();
+                        assert_eq!(
+                            raw.can_dispose_empty(
+                                fixture
+                                    .scene
+                                    .real
+                                    .scene
+                                    .coordinator
+                                    .joint_capture()
+                                    .adapter(),
+                                &fixture.scene.producers,
+                            ),
+                            Ok(false),
+                            "the original COMPLETE/claim must keep this empty quantum ingested"
+                        );
+                        retained_claim_requires_ingestion = true;
+                    }
                     if matches!(
                         fixture.poll_commit(1).unwrap(),
                         JointCommitProgress::Published(_)
@@ -1139,6 +1158,7 @@ fn joint_machine_pending_a_allows_q2_real_end() {
                     completed,
                     "the genuine retained grant services this idle demand without disposing the unmatched COMPLETE"
                 );
+                assert!(retained_claim_requires_ingestion);
                 assert_eq!(fixture.reduced(), before);
                 let coordinator = &fixture.scene.real.scene.coordinator;
                 assert_eq!(
@@ -1390,9 +1410,50 @@ fn joint_machine_request_ack_tracks_actual_preparation_and_attempted_error() {
                 "the older actual publication cannot acknowledge the later request"
             );
         }
+        let before_requested = frozen.then(|| {
+            (
+                fixture
+                    .scene
+                    .real
+                    .scene
+                    .coordinator
+                    .joint_capture()
+                    .model()
+                    .project(),
+                fixture.reduced(),
+                fixture.scene.drain.consumption_cut().unwrap(),
+            )
+        });
         // Autonomous service may finish the demand, but cannot consume the
         // requester's acknowledgement or allow a new request to replace it.
         fixture.published_labeled("requested publication", Some(frozen));
+        if let Some((model, reduced, boundary)) = before_requested {
+            assert_eq!(
+                fixture
+                    .scene
+                    .real
+                    .scene
+                    .coordinator
+                    .joint_capture()
+                    .model()
+                    .project(),
+                model,
+                "a quiet metadata publication cannot manufacture another object transition"
+            );
+            assert_eq!(fixture.reduced(), reduced);
+            assert!(boundary.same_boundary(&fixture.scene.drain.consumption_cut().unwrap()));
+        }
+        assert_eq!(fixture.reduced(), [1]);
+        assert_eq!(
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .reference_h3_audit_state(),
+            (if frozen { 2 } else { 1 }, false),
+            "each original publication takes exactly its own actual H3"
+        );
         assert!(fixture.machine.begin_commit(false).is_err());
         let mut foreign = InventoryCoordinator::new(
             Scope::System,
@@ -1529,6 +1590,217 @@ fn joint_machine_request_ack_tracks_actual_preparation_and_attempted_error() {
             attempted
         );
         assert_eq!(fixture.native.preparations.len(), 1);
+    }
+}
+
+#[test]
+fn joint_machine_empty_disposition_requires_actual_quiet_original() {
+    use crate::discovery::engine::inventory_coordinator::JointCommitProgress;
+    use crate::semantics_objects::journal::JournalGap;
+    use crate::semantics_objects::journal::joint_driver::RawDisposeReason;
+
+    for native_loss in [false, true] {
+        let mut fixture = MachineScene::new(1);
+        fixture.prime(1);
+        let before = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .model()
+            .project();
+        assert!(
+            before
+                .objects
+                .iter()
+                .any(|object| object.lifetime == Lifetime::Live)
+        );
+        let reduced = fixture.reduced();
+        let h3 = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_h3_audit_state();
+        let revision = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .published_revision();
+        fixture.machine.begin_commit(false).unwrap();
+        fixture.service(1).unwrap();
+        let original = fixture.machine.retained_raw_for_test().unwrap();
+        let identity = original.h0_identity();
+        assert_eq!(
+            original.can_dispose_empty(
+                fixture
+                    .scene
+                    .real
+                    .scene
+                    .coordinator
+                    .joint_capture()
+                    .adapter(),
+                &fixture.scene.producers,
+            ),
+            Err(RawQuantumRefusal::H0Undelivered),
+            "a real empty poll does not replace actual H0 disposition"
+        );
+        for _ in 0..128 {
+            if fixture.machine.diagnostic_snapshot_for_test().0 == "Ingesting" {
+                break;
+            }
+            fixture.service(1).unwrap();
+        }
+        assert_eq!(
+            fixture.machine.diagnostic_snapshot_for_test().0,
+            "Ingesting"
+        );
+        let boundary = fixture.scene.drain.consumption_cut().unwrap();
+        let coordinator = &fixture.scene.real.scene.coordinator;
+        let roles = coordinator.joint_capture().ledger().roles_for_test();
+        let claims = coordinator
+            .joint_capture()
+            .adapter()
+            .invocation_claims_for_test();
+        let charged = coordinator
+            .registry()
+            .semantic_resource_snapshot()
+            .charged_bytes;
+        let original = fixture.machine.retained_raw_for_test().unwrap();
+        assert!(original.h0_identity() == identity);
+        assert_eq!(
+            original.can_dispose_empty(
+                coordinator.joint_capture().adapter(),
+                &fixture.scene.producers
+            ),
+            Ok(true)
+        );
+        let foreign = SessionDrainProducers::test_pair(
+            fixture.scene.producers.native_domain(),
+            crate::events::EventsDomain::test_standin(fixture.scene.producers.events_id()),
+        );
+        assert_eq!(
+            original.can_dispose_empty(coordinator.joint_capture().adapter(), &foreign),
+            Err(RawQuantumRefusal::ForeignCapture)
+        );
+        let foreign_owner = crate::semantics_objects::journal::joint_driver::JointCaptureOwner::new(
+            JournalLimits::policy(),
+            coordinator.registry().semantic_storage_reserver(),
+        );
+        assert!(
+            original
+                .can_dispose_empty(foreign_owner.adapter(), &fixture.scene.producers)
+                .is_err()
+        );
+        drop(foreign_owner);
+        assert_eq!(coordinator.joint_capture().ledger().roles_for_test(), roles);
+        assert_eq!(
+            coordinator
+                .joint_capture()
+                .adapter()
+                .invocation_claims_for_test(),
+            claims
+        );
+        assert_eq!(
+            coordinator
+                .registry()
+                .semantic_resource_snapshot()
+                .charged_bytes,
+            charged
+        );
+        assert_eq!(coordinator.reference_h3_audit_state(), h3);
+        assert_eq!(coordinator.registry().published_revision(), revision);
+        assert!(boundary.same_boundary(&fixture.scene.drain.consumption_cut().unwrap()));
+        if native_loss {
+            fixture
+                .scene
+                .real
+                .h0
+                .0
+                .borrow()
+                .io
+                .script
+                .fault_cell
+                .store(1, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(
+                fixture
+                    .machine
+                    .retained_raw_for_test()
+                    .unwrap()
+                    .can_dispose_empty(
+                        fixture
+                            .scene
+                            .real
+                            .scene
+                            .coordinator
+                            .joint_capture()
+                            .adapter(),
+                        &fixture.scene.producers,
+                    ),
+                Ok(true),
+                "this read-only route cannot substitute for the later fresh native audit"
+            );
+        }
+        let mut saw_empty = false;
+        let mut saw_fault = false;
+        let mut published = false;
+        for _ in 0..128 {
+            let progress = fixture.service(1).unwrap();
+            if let Some(disposed) = fixture.machine.retained_negative_for_test() {
+                assert_eq!(disposed.reason(), RawDisposeReason::Empty);
+                assert!(disposed.identity() == identity);
+                saw_empty = true;
+            }
+            if let Some((gap, _, _, _, _)) = fixture.machine.diagnostic_audit_for_test() {
+                assert_eq!(gap, native_loss.then_some(JournalGap::FaultChanged));
+                saw_fault |= gap == Some(JournalGap::FaultChanged);
+            }
+            if progress == crate::inventory_semantics::JointServiceProgress::Published {
+                published = true;
+                break;
+            }
+        }
+        assert!(saw_empty && published);
+        assert_eq!(saw_fault, native_loss);
+        assert_eq!(fixture.reduced(), reduced);
+        let coordinator = &fixture.scene.real.scene.coordinator;
+        assert_eq!(coordinator.registry().published_revision(), revision + 1);
+        assert_eq!(coordinator.reference_h3_audit_state(), (h3.0 + 1, false));
+        let after = coordinator.joint_capture().model().project();
+        if native_loss {
+            assert_ne!(
+                after, before,
+                "actual native loss still invalidates the retained live object"
+            );
+            assert!(
+                after
+                    .objects
+                    .iter()
+                    .all(|object| object.lifetime != Lifetime::Live)
+            );
+        } else {
+            assert_eq!(after, before);
+        }
+        assert_eq!(
+            coordinator
+                .joint_capture()
+                .adapter()
+                .invocation_claims_for_test(),
+            claims
+        );
+        assert_eq!(coordinator.joint_capture().ledger().roles_for_test(), roles);
+        assert!(boundary.same_boundary(&fixture.scene.drain.consumption_cut().unwrap()));
+        assert!(matches!(
+            fixture.poll_commit(0).unwrap(),
+            JointCommitProgress::Published(_)
+        ));
+        assert!(matches!(
+            fixture.poll_commit(0).unwrap(),
+            JointCommitProgress::Pending
+        ));
     }
 }
 

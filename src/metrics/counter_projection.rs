@@ -474,8 +474,7 @@ mod tests {
             }
         }
         .unwrap();
-        let mut rows = Vec::with_capacity(1);
-        rows.push(row);
+        let rows = vec![row];
         CounterRead::new(
             std::num::NonZeroU64::new(generation).unwrap(),
             mode,
@@ -696,6 +695,7 @@ mod tests {
     fn projection_clones_keep_source_and_delta_charges_until_the_last_view_drops() {
         let (_file, plan, pins) = fixture();
         let pool = SemanticResourcePool::reference_limit(32 * 1024 * 1024);
+        let baseline = pool.snapshot().charged_bytes;
         let mut capture = CounterCapture::new(LIMITS, pool.reserver());
         drop(capture.fresh_with(&plan, &pins, |plan, _, _, reserve| {
             Ok(read(plan, CounterMode::Counts, 1, 5, reserve))
@@ -704,6 +704,10 @@ mod tests {
             Ok(read(plan, CounterMode::Counts, 1, 8, reserve))
         });
         let charged = pool.snapshot().charged_bytes;
+        assert!(
+            charged > baseline,
+            "the retained projection has an actual charge"
+        );
         let held = current.clone();
         assert_eq!(pool.snapshot().charged_bytes, charged);
         drop(capture);
@@ -712,13 +716,14 @@ mod tests {
         assert_eq!(held.reports()[0].calls, 8);
         assert_eq!(held.deltas().unwrap()[0].returned, 3);
         drop(held);
-        assert_eq!(pool.snapshot().charged_bytes, 0);
+        assert_eq!(pool.snapshot().charged_bytes, baseline);
     }
 
     #[test]
     fn initial_unavailable_read_never_fabricates_zero_or_kernel_measurements() {
         let (_file, plan, pins) = fixture();
         let pool = SemanticResourcePool::reference_limit(32 * 1024 * 1024);
+        let baseline = pool.snapshot().charged_bytes;
         let mut capture = CounterCapture::new(LIMITS, pool.reserver());
         let snapshot =
             capture.fresh_with(&plan, &pins, |_, _, _, _| Err(ReadStage::KernelEvidence));
@@ -731,6 +736,8 @@ mod tests {
             snapshot.failure(),
             Some(CounterFailure::Read(ReadStage::KernelEvidence))
         );
-        assert_eq!(pool.snapshot().charged_bytes, 0);
+        drop(snapshot);
+        drop(capture);
+        assert_eq!(pool.snapshot().charged_bytes, baseline);
     }
 }

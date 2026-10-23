@@ -44,10 +44,10 @@ fn prepared_birth_originals(
     );
     let files = (0..providers as u32).collect::<Vec<_>>();
     for file in &files {
-        scene.push(pid, *file, "C_CreateObject", 1);
+        scene.push(pid, *file, "C_CreateObject", u64::from(*file) + 1);
     }
     if repeated_key {
-        scene.push(pid, 0, "C_CreateObject", 2);
+        scene.push(pid, 0, "C_CreateObject", providers as u64 + 1);
     }
     let raw = scene.collect_with_fault(&BirthFault);
     scene.real.h0.0.borrow_mut().collected = Some(raw);
@@ -163,6 +163,7 @@ fn joint_birth_reservation_keeps_original_until_one_install() {
         let h0 = scene.real.h0.clone();
         let publisher = NativePublisher::build();
         let mut native_calls = 0;
+        let mut native_rows = Vec::new();
         let disposition = scene
             .real
             .scene
@@ -179,9 +180,11 @@ fn joint_birth_reservation_keeps_original_until_one_install() {
                     let mut owned = h0.0.borrow_mut();
                     let HeldH0 { capture, io, .. } = &mut *owned;
                     capture.validate_birth_candidate(io, &candidate, false)?;
-                    capture.finish_birth(
+                    let witness = capture.finish_birth(
                         candidate, None, input, binding, &attached, proof, adapter, &mut rows,
-                    )
+                    )?;
+                    native_rows.push((witness.receipt().domain(), rows));
+                    Ok(witness)
                 },
             )
             .unwrap();
@@ -310,7 +313,130 @@ fn joint_birth_reservation_keeps_original_until_one_install() {
         if !refuse_storage {
             crate::discovery::caller_registry::instance_input::joint_grant_post_removal_growth_probe_for_test(*births.as_slice()[0].receipt());
         }
+        let frame = scene
+            .real
+            .scene
+            .coordinator
+            .audit_ingested_quantum(ingested, &scene.producers, &attached, &BirthFault)
+            .unwrap_or_else(|(_, reason)| panic!("actual original first audit: {reason:?}"));
+        finish_reserved_birth_frame(&mut scene, &attached, &births, &mut native_rows, frame);
+        assert_eq!(
+            scene
+                .real
+                .scene
+                .coordinator
+                .joint_capture()
+                .model()
+                .project()
+                .objects
+                .iter()
+                .filter(|object| object.lifetime == Lifetime::Live)
+                .count(),
+            native_calls
+        );
+        scene.assert_claims(&[]);
+        assert_eq!(
+            scene
+                .real
+                .scene
+                .coordinator
+                .joint_capture()
+                .ledger()
+                .roles_for_test()[..4],
+            [0, 0, 0, 0]
+        );
     }
+}
+
+fn finish_reserved_birth_frame(
+    scene: &mut JointScene,
+    attached: &crate::attach::AttachedSemanticSet,
+    births: &crate::inventory_semantics::RetainedJointBirths,
+    rows: &mut [(crate::semantics_objects::ObjectDomain, NativeBirthRows)],
+    frame: IngestedJointQuantum,
+) {
+    use crate::semantics_objects::journal::joint_audit::JointBirthEvidenceSource;
+    struct Reads<'a>(&'a mut dyn JointBirthEvidenceSource);
+    impl JointBirthEvidenceSource for Reads<'_> {
+        fn take_for(
+            &mut self,
+            target: &JointFeedTarget,
+            binding: &SemanticCallerBinding,
+        ) -> Result<SessionBirthEvidence, BirthObservationRefusal> {
+            self.0.take_for(target, binding)
+        }
+    }
+    struct Fault<'a>(&'a dyn crate::semantics_objects::journal::FaultEpoch);
+    impl crate::semantics_objects::journal::FaultEpoch for Fault<'_> {
+        fn fault_epoch(&self) -> Result<u64, crate::semantics_objects::journal::FaultReadError> {
+            self.0.fault_epoch()
+        }
+    }
+    let expected_reads = rows.len();
+    let mut owned = scene.real.h0.0.borrow_mut();
+    let HeldH0 {
+        capture, io, stash, ..
+    } = &mut *owned;
+    let reads = Cell::new((0, 0));
+    let mut native = HeldCommitNative {
+        io,
+        rows: rows
+            .iter_mut()
+            .map(|(domain, rows)| (*domain, rows))
+            .collect(),
+        reads: &reads,
+    };
+    let native = RefCell::new(&mut native);
+    crate::inventory_semantics::with_joint_commit_io_for_test(
+        capture,
+        stash,
+        &scene.producers,
+        attached,
+        births.as_slice(),
+        &native,
+        |io| {
+            let (_, births, fault) = io.into_parts();
+            let mut births = Reads(births);
+            let fault = Fault(fault);
+            let mut frame = Some(frame);
+            let mut ports = scene
+                .real
+                .scene
+                .coordinator
+                .joint_frame_ports(&scene.producers)
+                .unwrap();
+            frame.as_mut().unwrap().bind_targets(&ports).unwrap();
+            let mut complete = false;
+            for _ in 0..256 {
+                let held = frame.as_mut().unwrap();
+                held.seal_next(&mut ports, &mut births, &fault).unwrap();
+                let mut work = 1;
+                if held.deliver_next_bounded(&mut ports, &mut work).unwrap()
+                    == QuantumSealProgress::Complete
+                {
+                    complete = true;
+                    break;
+                }
+            }
+            assert!(
+                complete,
+                "actual first Joint calls reduce through the paid original witness table"
+            );
+            frame
+                .take()
+                .unwrap()
+                .finish_frame(&mut ports)
+                .unwrap_or_else(|(_, reason)| {
+                    panic!("first original terminal disposition: {reason:?}")
+                });
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        reads.get().0,
+        expected_reads,
+        "each original selected domain rechecks the same live native source once"
+    );
 }
 
 #[test]
@@ -334,7 +460,6 @@ fn joint_birth_reservation_refuses_foreign_or_late_subject() {
         &["C_CreateObject", "C_SignInit"],
         PublicationReceipts::All,
     );
-    let foreign_receipt = *foreign.births[0].1.receipt();
     let token = scene
         .real
         .scene
@@ -342,11 +467,11 @@ fn joint_birth_reservation_refuses_foreign_or_late_subject() {
         .registry_mut()
         .reserve_admitted_joint_receipt(&inputs[0])
         .unwrap_or_else(|reason| panic!("original reservation: {reason:?}"));
-    let token = match token.install(&inputs[1], foreign_receipt) {
+    let token = match token.install(&inputs[1], &foreign.births[0].1) {
         Err((token, JointReceiptInstallRefusal::SubjectMismatch)) => token,
         _ => panic!("same-key sibling position must not consume the original reservation"),
     };
-    let token = match token.install(&inputs[0], foreign_receipt) {
+    let token = match token.install(&inputs[0], &foreign.births[0].1) {
         Err((token, JointReceiptInstallRefusal::ReceiptMismatch)) => token,
         _ => panic!("a genuine foreign receipt must not authorize this original"),
     };
@@ -509,7 +634,14 @@ impl crate::semantics_objects::journal::joint_audit::JointBirthEvidenceSource
 struct DisposedNativeFault(SharedH0);
 impl crate::semantics_objects::journal::FaultEpoch for DisposedNativeFault {
     fn fault_epoch(&self) -> Result<u64, crate::semantics_objects::journal::FaultReadError> {
-        let value = self.0.0.borrow().io.script.last_health.fault;
+        let value = self
+            .0
+            .0
+            .borrow()
+            .io
+            .script
+            .fault_cell
+            .load(std::sync::atomic::Ordering::SeqCst);
         if value > u64::from(u32::MAX) {
             Err(crate::semantics_objects::journal::FaultReadError::Saturated)
         } else {

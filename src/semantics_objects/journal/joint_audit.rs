@@ -3,7 +3,8 @@
 #![cfg_attr(not(test), allow(dead_code))] // Ordinary Joint activation remains gated.
 
 use super::joint_driver::{
-    IngestedRaw, JointCaptureOwner, RawProvenance, RawQuantumIdentity, RawQuantumRefusal,
+    IngestedRaw, JointCaptureOwner, RawDisposeReason, RawDisposition, RawProvenance,
+    RawQuantumIdentity, RawQuantumRefusal,
 };
 use super::seal_replay::{ReplayBounds, ReplayPreparation, SealBatchDelivery, SealReplayCursor};
 use super::{
@@ -18,7 +19,7 @@ use super::{
 use crate::attach::{AttachedSemanticSet, SessionDrainProducers};
 use crate::discovery::caller_registry::instance_input::JointFeedTarget;
 use crate::discovery::engine::inventory_coordinator::semantics::{
-    JointPublicationPorts, SemanticCallerBinding, SessionAuditInput,
+    JointPublicationPorts, SemanticCallerBinding, SessionAuditInput, SessionDisposedAuditInput,
 };
 use crate::semantics_edge::resources::{OWNED_ALLOCATION_PADDING, ResourceLease};
 use crate::semantics_key_use::{
@@ -36,6 +37,7 @@ use std::mem::size_of;
 /// and acknowledgement borrow the canonical owner; ordinary Joint remains inactive.
 pub(crate) struct IngestedJointQuantum {
     provenance: RawProvenance,
+    ingress: FrameIngress,
     frontier: ConsumptionOrdinal,
     audit: JournalAuditReceipt,
     // Original bulk S1Only refusal and original audit result remain distinct.
@@ -56,6 +58,14 @@ pub(crate) struct IngestedJointQuantum {
 }
 
 pub(crate) type AuditAcquisition = Result<IngestedJointQuantum, (IngestedRaw, RawQuantumRefusal)>;
+pub(crate) type DisposedAuditAcquisition =
+    Result<IngestedJointQuantum, (RawDisposition, RawQuantumRefusal)>;
+
+#[derive(Clone, Copy)]
+enum FrameIngress {
+    Ingested,
+    Disposed(RawDisposeReason),
+}
 
 fn allocation_bytes<T>(capacity: usize) -> Option<usize> {
     capacity
@@ -67,7 +77,7 @@ fn allocation_bytes<T>(capacity: usize) -> Option<usize> {
         })
 }
 
-fn storage_bound(adapter: &JournalAdapter, model: &ObjectSemantics) -> Option<usize> {
+fn one_failure_bound(adapter: &JournalAdapter, model: &ObjectSemantics) -> Option<usize> {
     let keys = adapter.keys.len();
     let (objects, sessions) = model.audit_loss_record_counts();
     // Collection failure only retires each live view/session once. The
@@ -82,10 +92,21 @@ fn storage_bound(adapter: &JournalAdapter, model: &ObjectSemantics) -> Option<us
     } else {
         effects.checked_mul(2)?.max(4)
     };
-    let one = allocation_bytes::<ObjectDomain>(keys)?
-        .checked_add(allocation_bytes::<ObjectEffect>(effect_capacity)?)?;
+    allocation_bytes::<ObjectDomain>(keys)?
+        .checked_add(allocation_bytes::<ObjectEffect>(effect_capacity)?)
+}
+
+fn storage_bound(adapter: &JournalAdapter, model: &ObjectSemantics) -> Option<usize> {
+    let one = one_failure_bound(adapter, model)?;
     size_of::<IngestedJointQuantum>()
         .checked_add(one.checked_mul(if adapter.has_s1only_subjects() { 2 } else { 1 })?)
+}
+
+pub(super) fn raw_disposition_storage_bound(
+    adapter: &JournalAdapter,
+    model: &ObjectSemantics,
+) -> Option<usize> {
+    size_of::<super::joint_driver::RawDisposition>().checked_add(one_failure_bound(adapter, model)?)
 }
 
 /// Only the selected frame supplies this exact typed target and original
@@ -516,6 +537,7 @@ impl IngestedJointQuantum {
         let failure = adapter.audit_collected(model, &audit, fault).err();
         let frame = Self {
             provenance,
+            ingress: FrameIngress::Ingested,
             frontier,
             audit,
             raw_failure,
@@ -536,6 +558,93 @@ impl IngestedJointQuantum {
                 .is_some_and(|owned| owned <= bytes),
             "audit loss storage exceeds its checked preflight bound"
         );
+        Ok(frame)
+    }
+
+    /// Take the original negative handoff without creating a clean/admitted
+    /// route. Recheck current capacities before the sole H3 take: later model
+    /// growth cannot reuse an older raw reservation as a smaller audit bound.
+    #[allow(clippy::result_large_err)] // Refusal returns the original paid negative owner.
+    pub(crate) fn audit_disposed(
+        authorized: SessionDisposedAuditInput<'_>,
+        attachment: &AttachedSemanticSet,
+        fault: &impl FaultEpoch,
+    ) -> DisposedAuditAcquisition {
+        let (disposed, owner, mut finalizer, producers) = authorized.into_parts();
+        let preflight = (|| {
+            disposed.validate_owner(owner.adapter(), producers)?;
+            if !owner
+                .adapter()
+                .disposed_has_only_future_input(disposed.frontier())
+            {
+                return Err(RawQuantumRefusal::H3Undisposed);
+            }
+            if attachment.domain() != producers.native_domain() {
+                return Err(RawQuantumRefusal::ForeignCapture);
+            }
+            if !finalizer.ready_for_negative_audit(producers) {
+                return Err(RawQuantumRefusal::H3Undisposed);
+            }
+            if attachment.generation() < owner.adapter().closure_generation {
+                return Err(RawQuantumRefusal::ClosureStale);
+            }
+            let raw_bytes = disposed
+                .failure()
+                .map_or(Some(0), failure_storage)
+                .ok_or(RawQuantumRefusal::Capacity)?;
+            let bytes = size_of::<Self>()
+                .checked_add(raw_bytes)
+                .and_then(|bytes| {
+                    bytes.checked_add(one_failure_bound(owner.adapter(), owner.model())?)
+                })
+                .ok_or(RawQuantumRefusal::Capacity)?;
+            let storage = owner
+                .ledger()
+                .resource_reserver()
+                .ok_or(RawQuantumRefusal::ForeignLedger)?
+                .reserve(bytes)
+                .map_err(RawQuantumRefusal::Resource)?;
+            Ok((bytes, storage))
+        })();
+        let (bytes, storage) = match preflight {
+            Ok(paid) => paid,
+            Err(reason) => return Err((disposed, reason)),
+        };
+        let observed = attachment.generation();
+        assert!(
+            owner
+                .adapter_mut()
+                .install_closure_grant(&SessionClosureGrant::observe(attachment))
+        );
+        let (provenance, frontier, reason, raw_failure, raw_storage) = disposed.into_parts();
+        let audit = JournalAuditReceipt::collect(provenance.collection(), &mut finalizer, observed);
+        let (adapter, model) = owner.parts();
+        let failure = adapter.audit_collected(model, &audit, fault).err();
+        let frame = Self {
+            provenance,
+            ingress: FrameIngress::Disposed(reason),
+            frontier,
+            audit,
+            raw_failure,
+            failure,
+            consumers: Vec::new(),
+            bound: false,
+            cursor: 0,
+            pending: 0,
+            future: 0,
+            active: None,
+            failure_storage: None,
+            targets_storage: None,
+            _storage: storage,
+        };
+        assert!(
+            frame
+                .retained_storage_bytes()
+                .is_some_and(|actual| actual <= bytes),
+            "negative audit exceeded its fresh precharge"
+        );
+        // The original failure buffers now live in the fully paid frame.
+        drop(raw_storage);
         Ok(frame)
     }
 
@@ -977,7 +1086,8 @@ impl IngestedJointQuantum {
         for (target, mode) in registry.joint_history_targets() {
             // Negative fanout still reaches history whose caller binding has
             // ended. Only a fresh positive seal needs the current binding.
-            if mode == FeedMode::S1Only
+            if matches!(self.ingress, FrameIngress::Disposed(_))
+                || mode == FeedMode::S1Only
                 || self
                     .original_failures()
                     .any(|failure| failure.affects_domain(target.bootstrap().domain()))
@@ -1132,6 +1242,10 @@ impl IngestedJointQuantum {
         if self.failure.is_some() {
             return Ok(QuantumSealProgress::LocalPending);
         }
+        if let FrameIngress::Disposed(reason) = self.ingress {
+            let _ = reason; // Retain the original reason, never positive authority.
+            return Ok(QuantumSealProgress::DeliveryReady);
+        }
         // An unrelated raw-only image negative does not replace the actual
         // clean collection audit for this disjoint selected Joint target.
         let target = self.consumers[index].target;
@@ -1278,6 +1392,30 @@ impl IngestedJointQuantum {
             self.frontier,
             target.bootstrap().domain(),
         ) else {
+            if matches!(self.ingress, FrameIngress::Disposed(_)) && self.failure.is_none() {
+                if *remaining == 0 {
+                    return Ok(QuantumSealProgress::DeliveryReady);
+                }
+                let (registry, owner, _, _) = ports.read();
+                if registry.joint_staged_count(&target) != Some(0) {
+                    return Ok(QuantumSealProgress::LocalPending);
+                }
+                let state = if owner
+                    .adapter()
+                    .awaits_future_terminal(target.bootstrap(), self.frontier)
+                {
+                    ConsumerState::Future
+                } else {
+                    // Acquisition verified every retained physical owner once.
+                    // This negative-only frame cannot create a terminal, and
+                    // preflight forbids a changed collection frontier. No H9
+                    // head is being consumed and no positive result is minted.
+                    ConsumerState::Delivered
+                };
+                *remaining -= 1;
+                self.advance_consumer(state);
+                return Ok(self.progress());
+            }
             // A truthful pending audit has no positive work to perform at an
             // unaffected target. Charge this visit without changing its
             // Pending history, so a later original negative is not stranded.

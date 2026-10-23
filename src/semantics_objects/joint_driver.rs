@@ -399,6 +399,8 @@ pub(crate) struct RawDisposition {
     frontier: ConsumptionOrdinal,
     reason: RawDisposeReason,
     failure: Option<SealFailure>,
+    // Original effect/scope buffers drop before their retained reservation.
+    _storage: ResourceLease,
 }
 
 #[cfg_attr(not(test), allow(dead_code))] // The staged machine will retain/deliver this negative before activation.
@@ -424,7 +426,29 @@ impl RawDisposition {
         adapter: &JournalAdapter,
         producers: &SessionDrainProducers,
     ) -> Result<(), RawQuantumRefusal> {
-        self.raw.validate_owner(adapter, producers)
+        self.raw.validate_owner(adapter, producers)?;
+        if adapter.consumed_frontier() != self.frontier {
+            return Err(RawQuantumRefusal::StaleFrontier);
+        }
+        Ok(())
+    }
+
+    pub(super) fn into_parts(
+        self,
+    ) -> (
+        RawProvenance,
+        ConsumptionOrdinal,
+        RawDisposeReason,
+        Option<SealFailure>,
+        ResourceLease,
+    ) {
+        (
+            self.raw,
+            self.frontier,
+            self.reason,
+            self.failure,
+            self._storage,
+        )
     }
 }
 
@@ -1401,6 +1425,27 @@ impl RawJointQuantum {
         {
             return Err((self, RawQuantumRefusal::DispositionMismatch));
         }
+        // These originals already belong to the ingested two-negative union.
+        // Raw disposal cannot erase them or introduce an unretained third cause.
+        if owner.adapter.has_s1only_subjects() {
+            return Err((self, RawQuantumRefusal::DispositionMismatch));
+        }
+        let storage = (|| {
+            let bytes =
+                super::joint_audit::raw_disposition_storage_bound(&owner.adapter, &owner.model)
+                    .ok_or(RawQuantumRefusal::Capacity)?;
+            owner
+                .adapter
+                .ledger
+                .resource_reserver()
+                .ok_or(RawQuantumRefusal::ForeignLedger)?
+                .reserve(bytes)
+                .map_err(RawQuantumRefusal::Resource)
+        })();
+        let storage = match storage {
+            Ok(storage) => storage,
+            Err(reason) => return Err((self, reason)),
+        };
         let contiguous = self.contiguous_stream(&owner.adapter);
         let overflow = owner
             .adapter
@@ -1452,6 +1497,7 @@ impl RawJointQuantum {
             frontier,
             reason,
             failure,
+            _storage: storage,
         })
     }
 

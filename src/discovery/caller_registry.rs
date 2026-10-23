@@ -2403,8 +2403,10 @@ pub(crate) struct CallerRegistry {
     /// path): consumed once at registration; empty in production
     /// (no live grants), so every feed stays S1Only. Bounded by the
     /// instance limit.
-    joint_grants:
-        HashMap<instance_input::InstanceKey, crate::semantics_objects::journal::BootstrapReceipt>,
+    joint_grants: HashMap<instance_input::InstanceKey, instance_input::PendingJointGrant>,
+    joint_grant_allocation: instance_input::JointGrantTableAllocation,
+    // The map and copied-key wrappers drop before retained bucket storage.
+    joint_grant_storage: Option<crate::semantics_edge::resources::ResourceLease>,
     /// Capture-wide key-use reducer (guarded H9 path): once Joint
     /// accounting starts, S1Only siblings and later terminals keep
     /// contributing facts for the rest of the capture.
@@ -2503,6 +2505,9 @@ impl CallerRegistry {
             semantic_occupied: 0,
             semantic_refused: 0,
             joint_grants: HashMap::new(),
+            joint_grant_allocation: instance_input::JointGrantTableAllocation::for_entries(0)
+                .expect("empty grant table has no allocation"),
+            joint_grant_storage: None,
             joint_keyuse: crate::semantics_key_use::KeyUseReducer::new(),
             assoc_fallback,
             joint_feeds: 0,

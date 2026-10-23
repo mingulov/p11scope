@@ -112,6 +112,27 @@ impl<'session> SessionAuditInput<'session> {
     }
 }
 
+/// Negative-only ingress from this same canonical coordinator/finalizer.
+/// An empty disposition never supplies a positive admission or genesis H3.
+pub(crate) struct SessionDisposedAuditInput<'session> {
+    disposed: crate::semantics_objects::journal::joint_driver::RawDisposition,
+    owner: &'session mut crate::semantics_objects::journal::joint_driver::JointCaptureOwner,
+    finalizer: SessionH3Finalizer<'session>,
+    producers: &'session SessionDrainProducers,
+}
+impl<'session> SessionDisposedAuditInput<'session> {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        crate::semantics_objects::journal::joint_driver::RawDisposition,
+        &'session mut crate::semantics_objects::journal::joint_driver::JointCaptureOwner,
+        SessionH3Finalizer<'session>,
+        &'session SessionDrainProducers,
+    ) {
+        (self.disposed, self.owner, self.finalizer, self.producers)
+    }
+}
+
 /// Ephemeral disjoint borrows from one canonical coordinator. Births borrow
 /// the same move-only binding set as the target chosen by the audit frame.
 pub(crate) struct JointPublicationPorts<'session> {
@@ -153,6 +174,10 @@ impl SessionH3Finalizer<'_> {
     /// Read-only gate: originals must have left the one pending handoff and
     /// produced an untaken disposition in this exact retained Session.
     pub(crate) fn ready_for_audit(&self, producers: &SessionDrainProducers) -> bool {
+        self.ready_for_negative_audit(producers) && self.state.seal_admission.is_some()
+    }
+
+    pub(crate) fn ready_for_negative_audit(&self, producers: &SessionDrainProducers) -> bool {
         self.producers.same_producers(producers)
             && self.state.domain == producers.native_domain()
             && self
@@ -162,7 +187,6 @@ impl SessionH3Finalizer<'_> {
                 .is_none_or(|held| held.same_producers(producers))
             && self.state.pending_semantic.is_none()
             && self.state.pending_drop.is_none()
-            && self.state.seal_admission.is_some()
             && self.state.h3_pending.is_some()
     }
 }
@@ -270,6 +294,40 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             producers,
         };
         crate::semantics_objects::journal::joint_audit::IngestedJointQuantum::audit(
+            authorized, attachment, fault,
+        )
+    }
+
+    #[allow(clippy::result_large_err)] // Preserve the same original negative buffers on refusal.
+    pub(crate) fn audit_disposed_quantum(
+        &mut self,
+        disposed: crate::semantics_objects::journal::joint_driver::RawDisposition,
+        producers: &SessionDrainProducers,
+        attachment: &crate::attach::AttachedSemanticSet,
+        fault: &impl crate::semantics_objects::journal::FaultEpoch,
+    ) -> crate::semantics_objects::journal::joint_audit::DisposedAuditAcquisition {
+        use crate::semantics_objects::journal::joint_driver::RawQuantumRefusal;
+        if let Err(reason) = disposed.validate_owner(self.joint_capture.adapter(), producers) {
+            return Err((disposed, reason));
+        }
+        let Some(state) = self.semantic_finalizer.as_mut() else {
+            return Err((disposed, RawQuantumRefusal::H3Undisposed));
+        };
+        if state.domain != producers.native_domain()
+            || state
+                .producers
+                .as_ref()
+                .is_some_and(|held| !held.same_producers(producers))
+        {
+            return Err((disposed, RawQuantumRefusal::ForeignCapture));
+        }
+        let authorized = SessionDisposedAuditInput {
+            disposed,
+            owner: &mut self.joint_capture,
+            finalizer: SessionH3Finalizer { state, producers },
+            producers,
+        };
+        crate::semantics_objects::journal::joint_audit::IngestedJointQuantum::audit_disposed(
             authorized, attachment, fault,
         )
     }

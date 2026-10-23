@@ -5,7 +5,7 @@
 use super::*;
 use crate::attach::SessionDrainProducers;
 use crate::discovery::caller_registry::CallerRegistry;
-use crate::inventory_semantics::{JointCommitIo, JointContinuationView};
+use crate::inventory_semantics::{JointCommitIo, JointContinuationView, RetainedJointBirths};
 use crate::semantics_objects::journal::joint_audit::{
     DisposedJointQuantum, IngestedJointQuantum, JointBirthEvidenceSource, QuantumSealProgress,
 };
@@ -332,6 +332,34 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
 
 pub(crate) type PreparedClaim = (u64, Result<JournalDomainProof, AttestationRefusal>);
 
+/// Completion counters only; the registry retains every actual grant and
+/// missing/refused births remain permanent S1 at the original registration.
+pub(crate) struct PreparedBirthDisposition {
+    pub(crate) installed: usize,
+}
+
+struct BirthAssociation {
+    image: (u64, u64),
+    router: u64,
+    current: usize,
+    entry: Option<usize>,
+}
+
+fn disclose_s1_birth_refusal(
+    registry: &mut CallerRegistry,
+    caller: Option<CallerId>,
+    reason: String,
+) {
+    registry.record_gap(RegistryGap {
+        caller,
+        module: None,
+        pid: None,
+        subject: "Joint birth unavailable; retained S1".into(),
+        reason,
+        budget: None,
+    });
+}
+
 /// The existing single pending slot changes phase; preparation adds no queue.
 pub(super) enum PendingSemanticBatch {
     Collected(SemanticBatch),
@@ -364,6 +392,7 @@ pub(super) struct PreparedAdmission {
     caller: Option<CallerId>,
     token: u64,
     input: Option<Result<AdmittedInstanceCall, ConversionRefusal>>,
+    claim: Option<Result<JournalDomainProof, AttestationRefusal>>,
 }
 
 impl PreparedAdmission {
@@ -378,6 +407,7 @@ impl PreparedAdmission {
             caller,
             token,
             input: Some(input),
+            claim: None,
         }
     }
 }
@@ -400,6 +430,7 @@ pub(crate) struct PreparedSemanticBatch {
     h3: PreparedH3,
     claim_cursor: usize,
     stage_cursor: usize,
+    births_decided: bool,
     // Buffers and nested owned payloads drop before their retained charge.
     storage: Option<ResourceLease>,
 }
@@ -428,6 +459,7 @@ impl PreparedSemanticBatch {
             h3,
             claim_cursor: 0,
             stage_cursor: 0,
+            births_decided: false,
             storage: None,
         }
     }
@@ -474,6 +506,14 @@ impl PreparedSemanticBatch {
         &self.current
     }
 
+    pub(crate) fn claims(
+        &self,
+    ) -> impl Iterator<Item = (u64, &Result<JournalDomainProof, AttestationRefusal>)> {
+        self.entries
+            .iter()
+            .filter_map(|entry| Some((entry.token, entry.claim.as_ref()?)))
+    }
+
     pub(crate) fn next_admission(&self) -> Option<&AdmittedInstanceCall> {
         self.entries[self.stage_cursor..]
             .iter()
@@ -486,7 +526,7 @@ impl PreparedSemanticBatch {
         ingested: &IngestedRaw,
     ) -> Result<Option<PreparedClaim>, RawQuantumRefusal> {
         let mut next = self.claim_cursor;
-        while let Some(entry) = self.entries.get(next) {
+        while let Some(entry) = self.entries.get_mut(next) {
             // Conversion refusals need no journal claim. Their original
             // positions remain owned until the staging/refusal cursor moves.
             if let Some(Ok(input)) = &entry.input {
@@ -496,6 +536,11 @@ impl PreparedSemanticBatch {
                     return Err(RawQuantumRefusal::Admission);
                 }
                 let claim = adapter.attest_key(input);
+                assert!(
+                    entry.claim.is_none(),
+                    "each actual original claim is retained once"
+                );
+                entry.claim = Some(claim);
                 self.claim_cursor = next + 1;
                 return Ok(Some((entry.token, claim)));
             }
@@ -623,6 +668,225 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             return None;
         };
         Some((batch, &mut self.joint_capture))
+    }
+
+    /// Join the paid actual claim result to the original New exactly once.
+    /// Native I/O borrows only disjoint registry/binding/adapter fields; no
+    /// callback owns or replaces the coordinator. Storage failure precedes
+    /// New consumption, while native/deadline refusal is final disclosed S1.
+    pub(crate) fn prepare_joint_births(
+        &mut self,
+        ingested: &IngestedRaw,
+        producers: &SessionDrainProducers,
+        births: &mut RetainedJointBirths,
+        mut consume: impl FnMut(
+            crate::semantic_capture::H0BirthCandidate,
+            &AdmittedInstanceCall,
+            &SemanticCallerBinding,
+            &JournalDomainProof,
+            &JournalAdapter,
+        ) -> Result<
+            crate::semantic_capture::RetainedBirthWitness,
+            crate::attach::BirthObservationRefusal,
+        >,
+    ) -> Result<PreparedBirthDisposition, RawQuantumRefusal> {
+        let adapter = self.joint_capture.adapter();
+        ingested.validate_owner(adapter, producers)?;
+        let Some(PendingSemanticBatch::Prepared(batch)) = self
+            .semantic_finalizer
+            .as_mut()
+            .and_then(|state| state.pending_semantic.as_mut())
+        else {
+            return Err(RawQuantumRefusal::Admission);
+        };
+        if batch.domain != producers.native_domain() {
+            return Err(RawQuantumRefusal::ForeignCapture);
+        }
+        if batch.births_decided {
+            return Ok(PreparedBirthDisposition { installed: 0 });
+        }
+        if batch.claim_cursor != batch.entries.len() || batch.stage_cursor != 0 {
+            return Err(RawQuantumRefusal::Admission);
+        }
+        for entry in &batch.entries {
+            if let Some(Ok(input)) = &entry.input {
+                if entry.claim.is_none()
+                    || entry.token != input.h0_ordinal()
+                    || (!ingested.matches_admission(input)
+                        && !ingested.matches_retained_admission(input, adapter))
+                {
+                    return Err(RawQuantumRefusal::Admission);
+                }
+            }
+        }
+        let count = batch
+            .current
+            .iter()
+            .filter(|receipt| receipt.birth_quantum().is_some())
+            .try_fold(0usize, |count, receipt| {
+                count.checked_add(receipt.instances().len())
+            })
+            .ok_or(RawQuantumRefusal::Capacity)?;
+        let reserve = self.registry.semantic_storage_reserver();
+        let bytes =
+            allocation_bytes::<BirthAssociation>(count).ok_or(RawQuantumRefusal::Capacity)?;
+        let Ok(_association_storage) = reserve.reserve(bytes) else {
+            batch.births_decided = true;
+            disclose_s1_birth_refusal(
+                &mut self.registry,
+                None,
+                "semantic_resource_capacity".into(),
+            );
+            return Ok(PreparedBirthDisposition { installed: 0 });
+        };
+        let mut association = Vec::<BirthAssociation>::new();
+        if association.try_reserve_exact(count).is_err() {
+            batch.births_decided = true;
+            disclose_s1_birth_refusal(
+                &mut self.registry,
+                None,
+                "joint_birth_association_capacity".into(),
+            );
+            return Ok(PreparedBirthDisposition { installed: 0 });
+        }
+        assert!(
+            association.capacity() <= count,
+            "original association index was precharged"
+        );
+        for (current, receipt) in batch
+            .current
+            .iter()
+            .enumerate()
+            .filter(|(_, receipt)| receipt.birth_quantum().is_some())
+        {
+            let image = receipt.image();
+            for router in receipt.instances() {
+                association.push(BirthAssociation {
+                    image: (image.task_cookie, image.exec_id),
+                    router: router.get(),
+                    current,
+                    entry: None,
+                });
+            }
+        }
+        association.sort_unstable_by_key(|link| (link.image, link.router));
+        if association
+            .windows(2)
+            .any(|pair| (pair[0].image, pair[0].router) == (pair[1].image, pair[1].router))
+        {
+            return Err(RawQuantumRefusal::Admission);
+        }
+        // One increasing admission walk and binary lookup; never scan the
+        // whole retained suffix per key or re-attest a discarded Result arm.
+        for (at, entry) in batch.entries.iter().enumerate() {
+            let (Some(Ok(input)), Some(Ok(_))) = (&entry.input, &entry.claim) else {
+                continue;
+            };
+            let (_, image, router, _) = input.journal_binding();
+            if let Ok(index) = association.binary_search_by_key(
+                &((image.task_cookie, image.exec_id), router.get()),
+                |link| (link.image, link.router),
+            ) {
+                let link = &mut association[index];
+                if link.entry.is_none()
+                    && batch.current[link.current]
+                        .birth_quantum()
+                        .is_some_and(|quantum| {
+                            input
+                                .collected_origin()
+                                .is_some_and(|origin| origin.in_quantum(quantum))
+                        })
+                {
+                    link.entry = Some(at);
+                }
+            }
+        }
+        // Descending original positions allow moving each Current once with
+        // swap_remove; earlier indices remain valid without another table.
+        association.sort_unstable_by_key(|link| {
+            (
+                std::cmp::Reverse(link.current),
+                link.entry.unwrap_or(usize::MAX),
+            )
+        });
+        batch.births_decided = true;
+        let mut installed = 0;
+        let mut cursor = 0;
+        while cursor < association.len() {
+            let current = association[cursor].current;
+            let entry = association[cursor].entry;
+            while cursor < association.len() && association[cursor].current == current {
+                cursor += 1;
+            }
+            let Some(entry) = entry else {
+                continue;
+            };
+            let Some(Ok(input)) = batch.entries[entry].input.as_ref() else {
+                unreachable!("original index was checked");
+            };
+            let Some(Ok(proof)) = batch.entries[entry].claim else {
+                unreachable!("original successful claim was checked");
+            };
+            let Some(binding) = self.semantic_bindings.get(input.journal_binding().3) else {
+                continue;
+            };
+            let receipt = &batch.current[current];
+            if !receipt.matches_birth_admission(input, binding, &proof) {
+                continue;
+            }
+            let Some(nested) = receipt.owned_storage_bytes() else {
+                continue;
+            };
+            let Ok(slot) = births.reserve_for(&reserve, nested) else {
+                disclose_s1_birth_refusal(
+                    &mut self.registry,
+                    Some(input.journal_binding().3),
+                    "semantic_resource_capacity".into(),
+                );
+                continue;
+            };
+            let Ok(reservation) = self.registry.reserve_admitted_joint_receipt(input) else {
+                continue;
+            };
+            let receipt = batch.current.swap_remove(current);
+            let candidate = match receipt.into_birth_candidate() {
+                Ok(candidate) => candidate,
+                Err(receipt) => {
+                    batch.current.push(receipt);
+                    continue;
+                }
+            };
+            let witness = match consume(candidate, input, binding, &proof, adapter) {
+                Ok(witness) => witness,
+                Err(reason) => {
+                    drop(reservation);
+                    drop(slot);
+                    disclose_s1_birth_refusal(
+                        &mut self.registry,
+                        Some(input.journal_binding().3),
+                        format!("joint_birth_native_{reason:?}"),
+                    );
+                    continue;
+                }
+            };
+            if !witness.matches_original(input, binding, &proof) || !slot.accepts(&witness) {
+                drop(reservation);
+                drop(slot);
+                disclose_s1_birth_refusal(
+                    &mut self.registry,
+                    Some(input.journal_binding().3),
+                    "joint_birth_original_mismatch".into(),
+                );
+                continue;
+            }
+            if reservation.install(input, &witness).is_err() {
+                continue;
+            }
+            slot.retain(witness);
+            installed += 1;
+        }
+        births.order_for_native_reads();
+        Ok(PreparedBirthDisposition { installed })
     }
 
     pub(crate) fn prepare_staged_semantic_batch(

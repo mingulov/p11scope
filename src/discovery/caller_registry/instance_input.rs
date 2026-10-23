@@ -12,9 +12,12 @@ use crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBi
 use crate::discovery::instances::{InstanceId, Route};
 use crate::inventory_semantics::{AttestedSubset, LaneCoverage, LaneNegative};
 use crate::semantic_capture::{Endpoint, InvalidationScope, RoutedCall};
+use crate::semantics_edge::resources::{
+    OWNED_ALLOCATION_PADDING, ResourceLease, SemanticResourceReserver,
+};
 use crate::semantics_edge::{EdgeSemantics, EffectOrigin, NoSink, SemanticCall};
 use crate::semantics_key_use::{FeedMode, JointStaging, KeyUseTee, StagingRefusal};
-use crate::semantics_objects::journal::joint_driver::JointResourceOrigin;
+use crate::semantics_objects::journal::joint_driver::{CollectedCallOrigin, JointResourceOrigin};
 use p11scope_ebpf_common::object_wire::ValidatedObjectCall;
 use p11scope_ebpf_common::{Event, ImageIdentity, SlotSemantics};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -24,6 +27,75 @@ use std::hash::{Hash, Hasher};
 pub(crate) const MAX_REGISTRY_INSTANCES: usize = 4096;
 pub(crate) const MAX_INSTANCE_NEGATIVE_SCOPES: usize = 4096;
 
+/// The map and its allocation probe use this exact value, including the
+/// lease which owns the copied key's text. Removing a row refunds that key;
+/// the separately retained bucket allocation remains charged.
+pub(super) struct PendingJointGrant {
+    receipt: crate::semantics_objects::journal::BootstrapReceipt,
+    origin: Option<CollectedCallOrigin>,
+    _key_storage: ResourceLease,
+}
+type JointGrantEntry = (InstanceKey, PendingJointGrant);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JointReceiptInstallRefusal {
+    SubjectMismatch,
+    ReceiptMismatch,
+    AlreadySelected,
+    AlreadyReserved,
+    Capacity,
+    Storage,
+}
+
+/// A lexical borrow of the actual registry, after all table/key storage was
+/// reserved and before the original New can move into native observation.
+/// It cannot be installed into another registry or another H0 position.
+pub(crate) struct JointReceiptReservation<'a> {
+    key: Option<InstanceKey>,
+    registry: &'a mut CallerRegistry,
+    original: CollectedCallOrigin,
+    caller: CallerId,
+    _key_storage: Option<ResourceLease>,
+}
+
+impl JointReceiptReservation<'_> {
+    #[allow(clippy::result_large_err)] // Refusal preserves the original paid lexical reservation.
+    pub(crate) fn install(
+        mut self,
+        input: &AdmittedInstanceCall,
+        witness: &crate::semantic_capture::RetainedBirthWitness,
+    ) -> Result<(), (Self, JointReceiptInstallRefusal)> {
+        if input.collected_origin() != Some(self.original)
+            || input.caller != self.caller
+            || self.key.as_ref() != Some(&input.key)
+        {
+            return Err((self, JointReceiptInstallRefusal::SubjectMismatch));
+        }
+        if !witness.matches_admitted(input) {
+            return Err((self, JointReceiptInstallRefusal::ReceiptMismatch));
+        }
+        // The exclusive borrow prevents registration/removal while native I/O
+        // runs, but keep these actual state checks at the final mutation too.
+        if self.registry.instance_state.by_key.contains_key(&input.key) {
+            return Err((self, JointReceiptInstallRefusal::AlreadySelected));
+        }
+        if self.registry.joint_grants.contains_key(&input.key) {
+            return Err((self, JointReceiptInstallRefusal::AlreadyReserved));
+        }
+        let key = self.key.take().expect("one original reserved key");
+        let grant = PendingJointGrant {
+            receipt: *witness.receipt(),
+            origin: Some(self.original),
+            _key_storage: self
+                ._key_storage
+                .take()
+                .expect("key storage reserved before New"),
+        };
+        assert!(self.registry.joint_grants.insert(key, grant).is_none());
+        Ok(())
+    }
+}
+
 /// Requested allocation of the private grant table on the pinned Rust1.98.1
 /// x86-64 implementation. The actual std HashMap probe below enforces its
 /// four-bucket minimum, 7/8 load bound and 16-byte control group. This is not a
@@ -31,16 +103,16 @@ pub(crate) const MAX_INSTANCE_NEGATIVE_SCOPES: usize = 4096;
 ///
 /// Keep this allocation geometry until that table allocation is dropped:
 /// HashMap::capacity() can fall after removals without freeing any buckets.
-/// This prerequisite computes storage only; it installs no grant or receipt.
+/// This layout computes storage only; it installs no grant or receipt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct JointGrantTableAllocation {
+pub(super) struct JointGrantTableAllocation {
     buckets: usize,
     capacity: usize,
     requested_bytes: usize,
 }
 
 impl JointGrantTableAllocation {
-    fn for_entries(entries: usize) -> Option<Self> {
+    pub(super) fn for_entries(entries: usize) -> Option<Self> {
         if entries == 0 {
             return Some(Self {
                 buckets: 0,
@@ -55,10 +127,7 @@ impl JointGrantTableAllocation {
         } else {
             (entries.checked_mul(8)? / 7).checked_next_power_of_two()?
         };
-        type Entry = (
-            InstanceKey,
-            crate::semantics_objects::journal::BootstrapReceipt,
-        );
+        type Entry = JointGrantEntry;
         let control_align = std::mem::align_of::<Entry>().max(16);
         let control_offset = std::mem::size_of::<Entry>()
             .checked_mul(buckets)?
@@ -112,6 +181,78 @@ impl JointGrantTableAllocation {
     }
 }
 
+fn copied_key_bytes(key: &InstanceKey) -> Option<usize> {
+    let len = match &key.module {
+        ModuleKey::Physical { sha256, .. } => sha256.as_ref().map_or(0, String::len),
+        ModuleKey::Unidentified { path } => path.len(),
+    };
+    len.checked_add(if len == 0 {
+        0
+    } else {
+        OWNED_ALLOCATION_PADDING
+    })
+}
+
+#[cfg(test)]
+fn moved_key_bytes(key: &InstanceKey) -> Option<usize> {
+    let capacity = match &key.module {
+        ModuleKey::Physical { sha256, .. } => sha256.as_ref().map_or(0, String::capacity),
+        ModuleKey::Unidentified { path } => path.capacity(),
+    };
+    capacity.checked_add(if capacity == 0 {
+        0
+    } else {
+        OWNED_ALLOCATION_PADDING
+    })
+}
+
+/// Grant-specific storage preparation, shared with the real tombstone probe.
+/// Preserve original bucket geometry, even when removal lowered capacity().
+fn reserve_joint_grant_storage(
+    table: &mut HashMap<InstanceKey, PendingJointGrant>,
+    retained: &mut JointGrantTableAllocation,
+    table_storage: &mut Option<ResourceLease>,
+    reserve: &SemanticResourceReserver,
+    key_bytes: usize,
+) -> Result<ResourceLease, JointReceiptInstallRefusal> {
+    let key_storage = reserve
+        .reserve(key_bytes)
+        .map_err(|_| JointReceiptInstallRefusal::Storage)?;
+    if table.len() == table.capacity() {
+        let next = retained
+            .next_growth(
+                table
+                    .len()
+                    .checked_add(1)
+                    .ok_or(JointReceiptInstallRefusal::Capacity)?,
+            )
+            .ok_or(JointReceiptInstallRefusal::Capacity)?;
+        let next_storage = reserve
+            .reserve(
+                next.charge_bytes()
+                    .ok_or(JointReceiptInstallRefusal::Capacity)?,
+            )
+            .map_err(|_| JointReceiptInstallRefusal::Storage)?;
+        // Old + new allocations and every heterogeneous key's own lease are
+        // simultaneously paid before std can grow or rehash the real table.
+        table
+            .try_reserve(1)
+            .map_err(|_| JointReceiptInstallRefusal::Capacity)?;
+        if table.capacity() > retained.capacity {
+            let actual = JointGrantTableAllocation::for_entries(table.capacity())
+                .expect("actual grant capacity is within the precharged bounded size class");
+            assert!(
+                actual.buckets <= next.buckets,
+                "actual grant table exceeded precharged size class"
+            );
+            *retained = actual;
+            *table_storage = Some(next_storage);
+        }
+        // An in-place tombstone cleanup keeps the original geometry/lease.
+    }
+    Ok(key_storage)
+}
+
 #[cfg(test)]
 impl CallerRegistry {
     /// Only the first-allocation prerequisite, not a receipt reservation or a
@@ -129,12 +270,9 @@ impl CallerRegistry {
         };
         let empty = JointGrantTableAllocation::for_entries(0)?;
         let first = empty.next_growth(1)?;
-        let visible_payload = std::mem::size_of::<(
-            InstanceKey,
-            crate::semantics_objects::journal::BootstrapReceipt,
-        )>()
-        .checked_mul(first.capacity)?
-        .checked_add(text_len)?;
+        let visible_payload = std::mem::size_of::<JointGrantEntry>()
+            .checked_mul(first.capacity)?
+            .checked_add(text_len)?;
         Some((
             visible_payload,
             empty.resize_peak_charge(first, 1, text_len)?,
@@ -192,8 +330,8 @@ pub(crate) fn joint_grant_allocation_probe_for_test(
         };
         // Lookup text is baseline storage, not a copied retained table key.
         let mut query = source.clone();
-        let mut table =
-            HashMap::<InstanceKey, crate::semantics_objects::journal::BootstrapReceipt>::new();
+        let pool = crate::semantics_edge::resources::SemanticResourcePool::default();
+        let mut table = HashMap::<InstanceKey, PendingJointGrant>::new();
         let (_, peak) = requested_peak_during(|| {
             let mut retained = JointGrantTableAllocation::for_entries(0).unwrap();
             let mut transitions = 0;
@@ -201,7 +339,19 @@ pub(crate) fn joint_grant_allocation_probe_for_test(
                 let old = retained;
                 let mut key = source.clone();
                 key.router = InstanceId::from_raw(ordinal as u64);
-                assert!(table.insert(key, receipt).is_none());
+                let storage = pool.reserve(copied_key_bytes(&key).unwrap()).unwrap();
+                assert!(
+                    table
+                        .insert(
+                            key,
+                            PendingJointGrant {
+                                receipt,
+                                origin: None,
+                                _key_storage: storage
+                            }
+                        )
+                        .is_none()
+                );
                 let measured = armed_requested_snapshot();
                 let now = JointGrantTableAllocation::for_entries(table.capacity()).unwrap();
                 assert_eq!(
@@ -240,7 +390,10 @@ pub(crate) fn joint_grant_allocation_probe_for_test(
             let retained_charge = retained.charge_bytes().unwrap();
             for ordinal in 1..=MAX_REGISTRY_INSTANCES {
                 query.router = InstanceId::from_raw(ordinal as u64);
-                assert_eq!(table.remove(&query), Some(receipt));
+                assert_eq!(
+                    table.remove(&query).map(|grant| grant.receipt),
+                    Some(receipt)
+                );
                 let measured = armed_requested_snapshot();
                 assert_eq!(
                     measured.live_bytes,
@@ -265,15 +418,211 @@ pub(crate) fn joint_grant_allocation_probe_for_test(
         );
         eprintln!(
             "joint grant allocation: entry={} copied_text={} peak={} overlap={}",
-            std::mem::size_of::<(
-                InstanceKey,
-                crate::semantics_objects::journal::BootstrapReceipt
-            )>(),
+            std::mem::size_of::<JointGrantEntry>(),
             copied_text,
             peak.peak_bytes,
             peak.realloc_overlap_bytes
         );
     }
+}
+
+#[cfg(test)]
+pub(crate) fn joint_grant_post_removal_growth_probe_for_test(
+    receipt: crate::semantics_objects::journal::BootstrapReceipt,
+) {
+    use crate::semantics_edge::resources::SemanticResourcePool;
+    use crate::test_alloc::{armed_requested_snapshot, requested_peak_during};
+    use std::hash::BuildHasher as _;
+
+    let pool = SemanticResourcePool::default();
+    let reserve = pool.reserver();
+    let baseline = pool.snapshot().charged_bytes;
+    let mut table = HashMap::<InstanceKey, PendingJointGrant>::new();
+    let source = InstanceKey {
+        domain: NativeDomainId::mint(),
+        image: ImageIdentity {
+            task_cookie: 71,
+            exec_id: 0,
+        },
+        router: InstanceId::from_raw(0),
+        module: ModuleKey::Physical {
+            dev_major: 1,
+            dev_minor: 0,
+            ino: 1,
+            sha256: None,
+        },
+    };
+    // Pigeonhole bound, not a probabilistic fixture: 897 keys guarantee 29
+    // with one low-five-bit start. At 32 buckets they occupy a long cluster.
+    let mut bins: [Vec<InstanceKey>; 32] = std::array::from_fn(|_| Vec::new());
+    for ordinal in 1..=32 * 28 + 1 {
+        let mut key = source.clone();
+        key.router = InstanceId::from_raw(ordinal as u64);
+        let bucket = (table.hasher().hash_one(&key) & 31) as usize;
+        bins[bucket].push(key);
+        if bins[bucket].len() == 29 {
+            break;
+        }
+    }
+    let cluster = bins
+        .into_iter()
+        .find(|bin| bin.len() == 29)
+        .expect("finite collision bound");
+    let mixed = [String::new(), "a".repeat(64), "/held/provider.so".into()]
+        .into_iter()
+        .enumerate()
+        .map(|(at, text)| {
+            let mut key = source.clone();
+            key.router = InstanceId::from_raw(10_000 + at as u64);
+            key.module = if at == 2 {
+                ModuleKey::Unidentified { path: text }
+            } else {
+                ModuleKey::Physical {
+                    dev_major: 1,
+                    dev_minor: 0,
+                    ino: 1,
+                    sha256: Some(text),
+                }
+            };
+            key
+        })
+        .collect::<Vec<_>>();
+    let mut retained = JointGrantTableAllocation::for_entries(0).unwrap();
+    let mut table_storage = None;
+    let (_, measured) = requested_peak_during(|| {
+        for key in &cluster[..28] {
+            let storage = reserve_joint_grant_storage(
+                &mut table,
+                &mut retained,
+                &mut table_storage,
+                &reserve,
+                0,
+            )
+            .unwrap();
+            assert!(
+                table
+                    .insert(
+                        key.clone(),
+                        PendingJointGrant {
+                            receipt,
+                            origin: None,
+                            _key_storage: storage
+                        }
+                    )
+                    .is_none()
+            );
+        }
+        assert_eq!(
+            (retained.buckets, table.len(), table.capacity()),
+            (32, 28, 28)
+        );
+        assert_eq!(
+            table.remove(&cluster[14]).map(|grant| grant.receipt),
+            Some(receipt)
+        );
+        assert_eq!(
+            (retained.buckets, table.len(), table.capacity()),
+            (32, 27, 27),
+            "actual deletion leaves a tombstone without freeing buckets"
+        );
+        assert_eq!(
+            armed_requested_snapshot().live_bytes,
+            retained.requested_bytes
+        );
+        assert_eq!(
+            pool.snapshot().charged_bytes,
+            baseline + retained.charge_bytes().unwrap()
+        );
+        let old = retained;
+        let next = old.next_growth(28).unwrap();
+        assert_eq!(next.buckets, 64);
+        let snapshot = pool.snapshot();
+        let hold = reserve
+            .reserve(
+                snapshot.limit_bytes - snapshot.charged_bytes - (next.charge_bytes().unwrap() - 1),
+            )
+            .unwrap();
+        assert!(matches!(
+            reserve_joint_grant_storage(&mut table, &mut retained, &mut table_storage, &reserve, 0),
+            Err(JointReceiptInstallRefusal::Storage)
+        ));
+        assert_eq!(
+            (retained, table.len(), table.capacity()),
+            (old, 27, 27),
+            "tight-pool refusal precedes the real rehash/growth"
+        );
+        assert_eq!(armed_requested_snapshot().live_bytes, old.requested_bytes);
+        drop(hold);
+        let storage =
+            reserve_joint_grant_storage(&mut table, &mut retained, &mut table_storage, &reserve, 0)
+                .unwrap();
+        assert_eq!((retained.buckets, table.capacity()), (64, 56));
+        assert_eq!(
+            armed_requested_snapshot().peak_bytes,
+            old.requested_bytes + retained.requested_bytes,
+            "the post-removal transition really allocates old plus new tables"
+        );
+        assert!(
+            table
+                .insert(
+                    cluster[28].clone(),
+                    PendingJointGrant {
+                        receipt,
+                        origin: None,
+                        _key_storage: storage
+                    }
+                )
+                .is_none()
+        );
+        let mut text_charge = 0;
+        for key in &mixed {
+            let bytes = copied_key_bytes(key).unwrap();
+            let storage = reserve_joint_grant_storage(
+                &mut table,
+                &mut retained,
+                &mut table_storage,
+                &reserve,
+                bytes,
+            )
+            .unwrap();
+            text_charge += bytes;
+            assert!(
+                table
+                    .insert(
+                        key.clone(),
+                        PendingJointGrant {
+                            receipt,
+                            origin: None,
+                            _key_storage: storage
+                        }
+                    )
+                    .is_none()
+            );
+            assert_eq!(
+                pool.snapshot().charged_bytes,
+                baseline + retained.charge_bytes().unwrap() + text_charge,
+                "heterogeneous key text is summed, not multiplied by the newest length"
+            );
+        }
+        for key in cluster.iter().chain(mixed.iter()) {
+            table.remove(key);
+        }
+        assert!(table.is_empty());
+        assert_eq!(
+            armed_requested_snapshot().live_bytes,
+            retained.requested_bytes
+        );
+        assert_eq!(
+            pool.snapshot().charged_bytes,
+            baseline + retained.charge_bytes().unwrap()
+        );
+        drop(table);
+        drop(table_storage);
+        assert_eq!(armed_requested_snapshot().live_bytes, 0);
+        assert_eq!(pool.snapshot().charged_bytes, baseline);
+    });
+    assert!(!measured.incomplete);
+    assert_eq!(measured.failed_requests, 0);
 }
 
 #[cfg(test)]
@@ -366,6 +715,9 @@ impl AdmittedInstance {
 
 #[cfg(test)]
 impl AdmittedInstanceCall {
+    pub(crate) fn provider_module(&self) -> &ModuleKey {
+        &self.key.module
+    }
     #[cfg(test)]
     pub(crate) fn instance_key_for_test(&self) -> InstanceKey {
         self.key.clone()
@@ -1007,23 +1359,90 @@ impl CallerRegistry {
         self.staged.push(Mutation::NoteInstance(input));
     }
 
-    /// Install one instance's Joint feed receipt (guarded H9 path):
-    /// the next registration of `key` selects Joint, consuming the
-    /// receipt. Bounded by the instance limit (excess installs
-    /// refuse). Live-loop carry: only the staged driver and
-    /// tests install (production has no grants until the joint seal
-    /// tick lands).
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Reserve against this actual original before moving its New or reading
+    /// native birth state. A selected incarnation is permanent, including S1.
+    pub(crate) fn reserve_admitted_joint_receipt(
+        &mut self,
+        input: &AdmittedInstanceCall,
+    ) -> Result<JointReceiptReservation<'_>, JointReceiptInstallRefusal> {
+        let original = input
+            .collected_origin()
+            .filter(|origin| origin.position() == input.h0_ordinal())
+            .ok_or(JointReceiptInstallRefusal::SubjectMismatch)?;
+        if self.instance_state.by_key.contains_key(&input.key) {
+            return Err(JointReceiptInstallRefusal::AlreadySelected);
+        }
+        if self.joint_grants.contains_key(&input.key) {
+            return Err(JointReceiptInstallRefusal::AlreadyReserved);
+        }
+        if self.joint_grants.len() >= self.instance_state.limit.min(MAX_REGISTRY_INSTANCES) {
+            return Err(JointReceiptInstallRefusal::Capacity);
+        }
+        let reserve = self.semantic_storage_reserver();
+        let key_storage = reserve_joint_grant_storage(
+            &mut self.joint_grants,
+            &mut self.joint_grant_allocation,
+            &mut self.joint_grant_storage,
+            &reserve,
+            copied_key_bytes(&input.key).ok_or(JointReceiptInstallRefusal::Capacity)?,
+        )?;
+        Ok(JointReceiptReservation {
+            key: Some(input.key.clone()),
+            registry: self,
+            original,
+            caller: input.caller,
+            _key_storage: Some(key_storage),
+        })
+    }
+
+    /// Legacy reducer algorithms install their existing scripted receipt.
+    /// Production installation requires the original lexical witness port.
+    #[cfg(test)]
     pub(crate) fn install_joint_receipt(
         &mut self,
         key: InstanceKey,
         receipt: crate::semantics_objects::journal::BootstrapReceipt,
     ) -> bool {
-        if self.joint_grants.len() >= self.instance_state.limit {
+        if self.joint_grants.len() >= self.instance_state.limit
+            || self.joint_grants.contains_key(&key)
+        {
             return false;
         }
-        self.joint_grants.insert(key, receipt);
+        let reserve = self.semantic_storage_reserver();
+        let Some(bytes) = moved_key_bytes(&key) else {
+            return false;
+        };
+        let Ok(storage) = reserve_joint_grant_storage(
+            &mut self.joint_grants,
+            &mut self.joint_grant_allocation,
+            &mut self.joint_grant_storage,
+            &reserve,
+            bytes,
+        ) else {
+            return false;
+        };
+        self.joint_grants.insert(
+            key,
+            PendingJointGrant {
+                receipt,
+                origin: None,
+                _key_storage: storage,
+            },
+        );
         true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_joint_receipts_for_test(
+        &self,
+    ) -> Vec<(
+        CollectedCallOrigin,
+        crate::semantics_objects::journal::JournalDomainProof,
+    )> {
+        self.joint_grants
+            .values()
+            .filter_map(|grant| Some((grant.origin?, grant.receipt.proof())))
+            .collect()
     }
 
     /// Joint-mode feeds (the effects-tee guard reads this).
@@ -1567,7 +1986,7 @@ impl CallerRegistry {
         // receipt selects Joint (consumed — one receipt, one feed);
         // without one the feed stays S1Only, exactly as before.
         let installed = self.joint_grants.remove(&input.key);
-        let feed = JointStaging::select_joint(installed.as_ref());
+        let feed = JointStaging::select_joint(installed.as_ref().map(|grant| &grant.receipt));
         if feed.mode() == FeedMode::Joint {
             self.joint_feeds = self.joint_feeds.saturating_add(1);
             self.joint_accounting = true;

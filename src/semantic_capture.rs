@@ -123,6 +123,45 @@ impl CurrentPartitionReceipt {
             })?
             .checked_add(self.watched.retained_copy_allocation_charge()?)
     }
+
+    /// Read-only association with this accepted original New. Presence alone
+    /// grants nothing: native consumption still validates the real partition.
+    pub(crate) fn birth_quantum(
+        &self,
+    ) -> Option<crate::semantics_objects::journal::joint_driver::RawQuantumIdentity> {
+        self.birth.as_ref().map(|(_, _, quantum)| *quantum)
+    }
+
+    fn matches_admitted_partition(
+        &self,
+        input: &crate::discovery::caller_registry::instance_input::AdmittedInstanceCall,
+    ) -> bool {
+        let (domain, image, router, _) = input.journal_binding();
+        domain == self.domain && image == self.image && self.ids.contains(&router)
+    }
+
+    pub(crate) fn matches_birth_admission(
+        &self,
+        input: &crate::discovery::caller_registry::instance_input::AdmittedInstanceCall,
+        binding: &crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding,
+        proof: &JournalDomainProof,
+    ) -> bool {
+        self.matches_admitted_partition(input)
+            && proof.matches_admitted(input)
+            && self.birth_quantum().is_some_and(|quantum| {
+                input
+                    .collected_origin()
+                    .is_some_and(|origin| origin.in_quantum(quantum))
+            })
+            && binding.domain() == self.domain
+            && binding.image() == self.image
+            && binding.caller() == input.journal_binding().3
+            && binding.scope_current()
+            && Arc::ptr_eq(&binding.pin(), &self.pin)
+            && binding
+                .provider_for_endpoint(self.endpoint)
+                .is_some_and(|provider| provider.module() == input.provider_module())
+    }
     #[allow(clippy::result_large_err)] // Refusal returns the original receipt without allocating or discarding its custody.
     pub(crate) fn into_birth_candidate(mut self) -> Result<H0BirthCandidate, Self> {
         let Some((capture, cut, quantum)) = self.birth.take() else {
@@ -191,6 +230,41 @@ pub(crate) struct RetainedBirthWitness {
 impl RetainedBirthWitness {
     pub(crate) fn receipt(&self) -> &BootstrapReceipt {
         &self.receipt
+    }
+
+    pub(crate) fn owned_storage_bytes(&self) -> Option<usize> {
+        self.candidate.receipt.owned_storage_bytes()
+    }
+
+    /// The original candidate and proof are private native-validated values.
+    /// Equal key/ordinal words from a different collected allocation fail.
+    pub(crate) fn matches_admitted(
+        &self,
+        input: &crate::discovery::caller_registry::instance_input::AdmittedInstanceCall,
+    ) -> bool {
+        self.candidate.receipt.matches_admitted_partition(input)
+            && self.receipt.proof().matches_admitted(input)
+            && input
+                .collected_origin()
+                .is_some_and(|origin| origin.in_quantum(self.candidate.quantum))
+    }
+
+    pub(crate) fn matches_original(
+        &self,
+        input: &crate::discovery::caller_registry::instance_input::AdmittedInstanceCall,
+        binding: &crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding,
+        proof: &JournalDomainProof,
+    ) -> bool {
+        self.matches_admitted(input)
+            && self.receipt.proof() == *proof
+            && binding.domain() == self.candidate.receipt.domain
+            && binding.image() == self.candidate.receipt.image
+            && binding.caller() == input.journal_binding().3
+            && binding.scope_current()
+            && Arc::ptr_eq(&binding.pin(), &self.candidate.receipt.pin)
+            && binding
+                .provider_for_endpoint(self.candidate.receipt.endpoint)
+                .is_some_and(|provider| provider.module() == input.provider_module())
     }
 
     fn validate_scope(

@@ -4,7 +4,7 @@
 mod joint;
 pub(crate) mod selected;
 
-pub(crate) use joint::{JointCommitIo, JointContinuationView};
+pub(crate) use joint::{JointCommitIo, JointContinuationView, RetainedJointBirths};
 #[cfg(test)]
 pub(crate) use joint::{JointNativeIo, with_joint_commit_io_for_test};
 

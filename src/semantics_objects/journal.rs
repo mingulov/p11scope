@@ -1442,9 +1442,7 @@ impl JournalAdapter {
             domains.extend(
                 self.keys
                     .iter()
-                    .filter(|(key, state)| {
-                        !state.refused && self.is_tainted((key.cookie, key.exec))
-                    })
+                    .filter(|(key, _)| self.is_tainted((key.cookie, key.exec)))
                     .map(|(key, state)| {
                         JournalDomainProof {
                             key: *key,
@@ -1504,6 +1502,18 @@ impl JournalAdapter {
                 !taints.contains(&entry.image)
                     && !(overflow && !sightings.contains_key(&entry.image))
             });
+            // The original image loss has irreversibly refused these exact
+            // keys. Their proof claims can no longer convert; H9 still owns
+            // its separate original rows/roles until negative fanout delivers.
+            let count = &mut self.claim_counts;
+            self.claims.retain(|fingerprint, claimants| {
+                let affected = taints.contains(&fingerprint.image)
+                    || (overflow && !sightings.contains_key(&fingerprint.image));
+                if affected {
+                    *count -= claimants.values().map(VecDeque::len).sum::<usize>();
+                }
+                !affected
+            });
         }
         SealFailure {
             scope,
@@ -1517,6 +1527,39 @@ impl JournalAdapter {
         self.open
             .values()
             .any(|entry| entry.s1only_subject.is_some())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn proof_refused_for_test(&self, proof: JournalDomainProof) -> bool {
+        self.keys
+            .get(&proof.key)
+            .is_some_and(|state| state.era == proof.era && state.refused)
+    }
+
+    /// A disposed/no-admission collection cannot convert an earlier terminal
+    /// or release its claim. Real incomplete STARTs may await future END input;
+    /// COMPLETE/ABANDON/ordinary-return and marked subjects require their
+    /// original ingested or explicit loss consumer instead.
+    fn disposed_has_only_future_input(&self, frontier: ConsumptionOrdinal) -> bool {
+        !self.has_s1only_subjects()
+            && self.claim_counts == 0
+            && !self.refused.iter().any(|entry| entry.cut <= frontier.0)
+            && self.open.values().all(|entry| {
+                entry.begin_ordinal <= frontier.0
+                    && entry.raw_resource.as_ref().is_some_and(|resource| {
+                        self.ledger.matches_unconverted_original(
+                            entry.begin_ordinal,
+                            resource,
+                            None,
+                        )
+                    })
+                    && entry.converted_ticket.is_none()
+                    && entry.call_key.is_none()
+                    && !entry.end_converted
+                    && entry.end.is_none()
+                    && entry.abandon.is_none()
+                    && entry.corroborated_return.is_none()
+            })
     }
 
     /// Read every marked physical owner before reserving/taking H3 or

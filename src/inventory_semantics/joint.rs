@@ -10,10 +10,108 @@ use crate::attach::{AttachedSemanticSet, BirthObservationRefusal, Session, Sessi
 use crate::discovery::caller_registry::instance_input::JointFeedTarget;
 use crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding;
 use crate::semantic_capture::RetainedBirthWitness;
+use crate::semantics_edge::resources::{
+    OWNED_ALLOCATION_PADDING, ResourceLease, SemanticResourceReserver,
+};
 use crate::semantics_objects::journal::joint_audit::JointBirthEvidenceSource;
 use crate::semantics_objects::journal::{FaultEpoch, FaultReadError, SessionBirthEvidence};
 use std::borrow::Borrow;
 use std::cell::RefCell;
+
+/// One original witness and its transferred nested-allocation charge. The
+/// existing native source borrows this same table through Borrow, not a copy.
+pub(crate) struct RetainedJointBirth {
+    witness: RetainedBirthWitness,
+    _storage: ResourceLease,
+}
+impl Borrow<RetainedBirthWitness> for RetainedJointBirth {
+    fn borrow(&self) -> &RetainedBirthWitness {
+        &self.witness
+    }
+}
+impl RetainedJointBirth {
+    pub(crate) fn receipt(&self) -> &crate::semantics_objects::journal::BootstrapReceipt {
+        self.witness.receipt()
+    }
+}
+
+/// The eventual lane keeps its actual witnesses here. Container capacity and
+/// each heterogeneous receipt's nested bytes are paid before New/native move;
+/// PreparedSemanticBatch may then refund its original overlapping charge.
+#[derive(Default)]
+pub(crate) struct RetainedJointBirths {
+    witnesses: Vec<RetainedJointBirth>,
+    capacity_storage: Option<ResourceLease>,
+}
+pub(crate) struct RetainedBirthSlot<'a> {
+    owner: &'a mut RetainedJointBirths,
+    nested_limit: usize,
+    storage: ResourceLease,
+}
+impl RetainedJointBirths {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+    pub(crate) fn as_slice(&self) -> &[RetainedJointBirth] {
+        &self.witnesses
+    }
+
+    pub(crate) fn reserve_for(
+        &mut self,
+        reserve: &SemanticResourceReserver,
+        nested_bytes: usize,
+    ) -> Result<RetainedBirthSlot<'_>, ()> {
+        let storage = reserve.reserve(nested_bytes).map_err(|_| ())?;
+        if self.witnesses.len() == self.witnesses.capacity() {
+            let next = self.witnesses.capacity().checked_mul(2).ok_or(())?.max(1);
+            if next > crate::discovery::caller_registry::instance_input::MAX_REGISTRY_INSTANCES {
+                return Err(());
+            }
+            let bytes = next
+                .checked_mul(std::mem::size_of::<RetainedJointBirth>())
+                .and_then(|bytes| bytes.checked_add(OWNED_ALLOCATION_PADDING))
+                .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Self>()))
+                .ok_or(())?;
+            let capacity_storage = reserve.reserve(bytes).map_err(|_| ())?;
+            self.witnesses
+                .try_reserve_exact(next - self.witnesses.len())
+                .map_err(|_| ())?;
+            assert!(
+                self.witnesses.capacity() <= next,
+                "retained witness capacity exceeds its precharge"
+            );
+            self.capacity_storage = Some(capacity_storage);
+        }
+        Ok(RetainedBirthSlot {
+            owner: self,
+            nested_limit: nested_bytes,
+            storage,
+        })
+    }
+
+    pub(crate) fn order_for_native_reads(&mut self) {
+        self.witnesses
+            .sort_unstable_by_key(|witness| witness.receipt().domain());
+    }
+}
+impl RetainedBirthSlot<'_> {
+    pub(crate) fn accepts(&self, witness: &RetainedBirthWitness) -> bool {
+        witness
+            .owned_storage_bytes()
+            .is_some_and(|bytes| bytes <= self.nested_limit)
+            && self.owner.witnesses.len() < self.owner.witnesses.capacity()
+    }
+    pub(crate) fn retain(self, witness: RetainedBirthWitness) {
+        assert!(
+            self.accepts(&witness),
+            "original witness storage was precharged before installation"
+        );
+        self.owner.witnesses.push(RetainedJointBirth {
+            witness,
+            _storage: self.storage,
+        });
+    }
+}
 
 /// Immutable access to the same producer's pending H0/stash. Construction
 /// stays inside the lane; a consumer cannot supply a floor or raw records.
@@ -181,9 +279,9 @@ impl AttestedSemanticLane {
     /// checks share the same immutable Capture. H0 mutations run outside
     /// this scope; the callback cannot return a reader or owner borrow.
     #[allow(dead_code)] // The following machine slice calls the actual Session entrypoint.
-    pub(crate) fn with_joint_commit_io<R>(
+    pub(crate) fn with_joint_commit_io<W: Borrow<RetainedBirthWitness>, R>(
         &mut self,
-        witnesses: &[RetainedBirthWitness],
+        witnesses: &[W],
         inspect: impl for<'io> FnOnce(JointCommitIo<'io>) -> R,
     ) -> Result<R, SemanticRefusal> {
         let live = self.live.as_mut().ok_or(SemanticRefusal::Unavailable)?;
@@ -225,12 +323,16 @@ impl AttestedSemanticLane {
 
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)] // Forward the exact disjoint native-fixture borrows.
-pub(crate) fn with_joint_commit_io_for_test<N: JointNativeIo, R>(
+pub(crate) fn with_joint_commit_io_for_test<
+    N: JointNativeIo,
+    W: Borrow<RetainedBirthWitness>,
+    R,
+>(
     capture: &SemanticCapture,
     stash: &RefreshReceiptStash,
     producers: &SessionDrainProducers,
     attached: &AttachedSemanticSet,
-    witnesses: &[&RetainedBirthWitness],
+    witnesses: &[W],
     native: &RefCell<&mut N>,
     inspect: impl for<'io> FnOnce(JointCommitIo<'io>) -> R,
 ) -> Result<R, SemanticRefusal> {

@@ -262,7 +262,7 @@ impl crate::inventory_semantics::JointMachineIo for HeldMachineIo<'_> {
     fn tick_collected(
         &mut self,
         _lane: &mut AttestedSemanticLane,
-        _bindings: &[SemanticCallerBinding],
+        bindings: &[SemanticCallerBinding],
         raw: &mut RawJointQuantum,
     ) -> Result<SemanticBatch, SemanticRefusal> {
         let mut owned = self.h0.0.borrow_mut();
@@ -278,6 +278,23 @@ impl crate::inventory_semantics::JointMachineIo for HeldMachineIo<'_> {
             .tick_collected_with(io, raw)
             .map_err(|_| SemanticRefusal::Unavailable)?;
         assert_eq!(merge_stash_into_report(stash, &mut report), 0);
+        for current in report.current() {
+            let binding = bindings.iter().find(|binding| {
+                binding.domain() == current.domain() && binding.image() == current.image()
+            });
+            eprintln!(
+                "machine_current file={} has_birth={} same_raw={} instances={} binding={} provider={} same_pin={}",
+                current.endpoint().file_slot,
+                current.birth_quantum().is_some(),
+                current.birth_quantum() == Some(raw.h0_identity()),
+                current.instances().len(),
+                binding.is_some(),
+                binding.is_some_and(|binding| binding
+                    .provider_for_endpoint(current.endpoint())
+                    .is_some()),
+                binding.is_some_and(|binding| Arc::ptr_eq(&binding.pin(), current.original_pin())),
+            );
+        }
         SemanticBatch::from_tick_report(
             self.producers.native_domain(),
             report,
@@ -809,6 +826,30 @@ impl MachineScene {
             let progress = self.service(1).unwrap_or_else(|reason| {
                 self.publication_failed(label, frozen, Some(reason));
             });
+            if label.starts_with("absence")
+                && self.machine.diagnostic_snapshot_for_test().0 == "Births"
+                && let Some(prepared) = self.scene.real.scene.coordinator.prepared_semantic_batch()
+            {
+                eprintln!(
+                    "machine_prepared label={label} entries={} current={} new={} admissions={} claims_ok={} claims_err={}",
+                    prepared.entry_count(),
+                    prepared.current_receipts().len(),
+                    prepared
+                        .current_receipts()
+                        .iter()
+                        .filter(|receipt| receipt.birth_quantum().is_some())
+                        .count(),
+                    prepared.admissions().count(),
+                    prepared
+                        .claims()
+                        .filter(|(_, result)| result.is_ok())
+                        .count(),
+                    prepared
+                        .claims()
+                        .filter(|(_, result)| result.is_err())
+                        .count(),
+                );
+            }
             if matches!(
                 progress,
                 crate::inventory_semantics::JointServiceProgress::Published
@@ -953,7 +994,37 @@ fn joint_machine_absence_before_appearance_publishes_first_joint() {
         .push(std::process::id(), 1, "C_CreateObject", 2);
     fixture.scene.push(std::process::id(), 1, "C_SignInit", 3);
     fixture.published_labeled("absence-appearance-create-init", None);
-    assert!(fixture.pending_absence(1).is_none());
+    assert!(
+        fixture.pending_absence(1).is_none(),
+        "pending B after appearance receipt: snapshot={:?} remaining_wire={} preparations={} births={:?} claims={} roles={:?} h3={:?}",
+        fixture.machine.diagnostic_snapshot_for_test(),
+        fixture.scene.drain.source_mut().remaining(),
+        fixture.native.preparations.len(),
+        fixture.native.birth_outcomes,
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .invocation_claims_for_test()
+            .0,
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .ledger()
+            .roles_for_test(),
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_h3_audit_state(),
+    );
     let witness = fixture.ready_birth(1).unwrap();
     assert_eq!(witness.receipt().birth(), BirthKind::AbsenceAppearance);
     assert!(witness.receipt().birth_cut() >= 1);

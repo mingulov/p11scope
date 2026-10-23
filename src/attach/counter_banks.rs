@@ -1,5 +1,6 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
-//! Private two-cell Counts transaction. This is not general counter growth.
+//! Private Counts publication directory with a live format1 adapter.
+//! Format2 geometry is staged and cannot yet prepare a real Session.
 
 use super::{CapturePolicy, Scope, Session};
 use crate::discovery::identity::{PinnedObjects, RetainedInventoryTarget};
@@ -20,6 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub(crate) const BANK_CONFIG: u64 = 0x1800_0102;
+const COUNTS_GROWTH_V2_CONFIG: u64 = 0x0200_0018_0010_0200;
 const BANKS: usize = 2;
 pub(super) const PROGRAMS: [&str; 2] = ["p11_counter_bank_entry", "p11_counter_bank_return"];
 
@@ -119,6 +121,209 @@ const _: () = {
     assert!(size_of::<BankCommit>() == 16);
 };
 
+/// Format2 is staged here only. The emitted object and real Session adapter
+/// continue to use the independently validated format1 layouts above.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CountsBankRoute {
+    transaction: u64,
+    first: u32,
+    end: u32,
+    bank: u32,
+    cell: u32,
+    inner_id: u32,
+    reserved_zero: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CountsBankCommit {
+    first: u32,
+    end: u32,
+    configuration: u64,
+}
+
+// SAFETY: repr(C), initialized integers only; the checks below exclude padding.
+unsafe impl aya::Pod for CountsBankRoute {}
+// SAFETY: repr(C), initialized integers only; the checks below exclude padding.
+unsafe impl aya::Pod for CountsBankCommit {}
+const _: () = {
+    use std::mem::offset_of;
+    assert!(size_of::<CountsBankRoute>() == 32);
+    assert!(offset_of!(CountsBankRoute, transaction) == 0);
+    assert!(offset_of!(CountsBankRoute, first) == 8);
+    assert!(offset_of!(CountsBankRoute, end) == 12);
+    assert!(offset_of!(CountsBankRoute, bank) == 16);
+    assert!(offset_of!(CountsBankRoute, cell) == 20);
+    assert!(offset_of!(CountsBankRoute, inner_id) == 24);
+    assert!(offset_of!(CountsBankRoute, reserved_zero) == 28);
+    assert!(size_of::<CountsBankCommit>() == 16);
+    assert!(offset_of!(CountsBankCommit, first) == 0);
+    assert!(offset_of!(CountsBankCommit, end) == 4);
+    assert!(offset_of!(CountsBankCommit, configuration) == 8);
+};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BankExtent {
+    pub(crate) first: u32,
+    pub(crate) end: u32,
+}
+
+impl BankExtent {
+    fn checked(first: u32, end: u32, limit: u32) -> Result<Self, BankRefusal> {
+        if first >= end || end > limit {
+            return Err(BankRefusal::Shape);
+        }
+        Ok(Self { first, end })
+    }
+
+    fn len(self) -> usize {
+        (self.end - self.first) as usize
+    }
+
+    fn legacy_mask(self) -> Result<u64, BankRefusal> {
+        Self::checked(self.first, self.end, BANKS as u32)?;
+        Ok(((1u64 << self.end) - 1) & !((1u64 << self.first) - 1))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CountsBankGeometry {
+    banks: u32,
+    cells: u32,
+    configuration: u64,
+}
+
+impl CountsBankGeometry {
+    fn legacy() -> Self {
+        Self {
+            banks: 2,
+            cells: 1,
+            configuration: BANK_CONFIG,
+        }
+    }
+
+    fn checked(banks: u32, cells: u32) -> Result<Self, BankRefusal> {
+        if (banks, cells) != (16, 512) || banks.checked_mul(cells) != Some(8192) {
+            return Err(BankRefusal::Shape);
+        }
+        Ok(Self {
+            banks,
+            cells,
+            configuration: COUNTS_GROWTH_V2_CONFIG,
+        })
+    }
+
+    fn is_legacy(self) -> bool {
+        self == Self::legacy()
+    }
+
+    fn limit(self) -> u32 {
+        // Both constructors accept only the two closed, checked geometries.
+        self.banks * self.cells
+    }
+
+    fn locate(self, slot: u32) -> Result<(u32, u32), BankRefusal> {
+        if slot >= self.limit() {
+            return Err(BankRefusal::Shape);
+        }
+        Ok((slot / self.cells, slot % self.cells))
+    }
+
+    fn bank_payload_bytes(self, cpus: usize) -> Result<usize, BankRefusal> {
+        if cpus == 0 {
+            return Err(BankRefusal::Topology);
+        }
+        (self.cells as usize)
+            .checked_mul(size_of::<p11scope_ebpf_common::CountStats>())
+            .and_then(|bytes| bytes.checked_mul(cpus))
+            .ok_or(BankRefusal::Budget)
+    }
+}
+
+struct StagedExtent {
+    transaction: NonZeroU64,
+    commit: CountsBankCommit,
+    routes: Vec<(u32, CountsBankRoute)>,
+    bank_ids: Vec<(u32, u32)>,
+}
+
+impl StagedExtent {
+    #[cfg(test)]
+    fn checked(
+        transaction: NonZeroU64,
+        commit: CountsBankCommit,
+        routes: Vec<(u32, CountsBankRoute)>,
+        bank_ids: Vec<(u32, u32)>,
+    ) -> Result<Self, BankRefusal> {
+        Self::checked_with(
+            CountsBankGeometry::checked(16, 512)?,
+            transaction,
+            commit,
+            routes,
+            bank_ids,
+        )
+    }
+
+    fn checked_with(
+        geometry: CountsBankGeometry,
+        transaction: NonZeroU64,
+        commit: CountsBankCommit,
+        routes: Vec<(u32, CountsBankRoute)>,
+        bank_ids: Vec<(u32, u32)>,
+    ) -> Result<Self, BankRefusal> {
+        let extent = BankExtent::checked(commit.first, commit.end, geometry.limit())?;
+        let first_bank = geometry.locate(extent.first)?.0;
+        let last_bank = geometry.locate(extent.end - 1)?.0;
+        if commit.configuration != geometry.configuration
+            || routes.len() != extent.len()
+            || bank_ids.len() != (last_bank - first_bank + 1) as usize
+        {
+            return Err(BankRefusal::Shape);
+        }
+        for (index, &(bank, id)) in bank_ids.iter().enumerate() {
+            if bank != first_bank + index as u32
+                || id == 0
+                || bank_ids[..index].iter().any(|(_, old)| *old == id)
+            {
+                return Err(BankRefusal::Ownership);
+            }
+        }
+        for (index, &(slot, route)) in routes.iter().enumerate() {
+            if slot != extent.first + index as u32
+                || route.transaction != transaction.get()
+                || (route.first, route.end) != (extent.first, extent.end)
+                || (route.bank, route.cell) != geometry.locate(slot)?
+                || route.reserved_zero != 0
+                || bank_ids[(route.bank - first_bank) as usize].1 != route.inner_id
+            {
+                return Err(BankRefusal::Ownership);
+            }
+        }
+        Ok(Self {
+            transaction,
+            commit,
+            routes,
+            bank_ids,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CandidateCheck {
+    Exact,
+    Contradictory,
+    Unreadable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommitObservation {
+    Absent,
+    Exact,
+    Contradictory,
+    Unreadable,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BankRefusal {
     Shape,
@@ -133,6 +338,7 @@ pub(crate) enum BankRefusal {
     Quarantined,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CommitAck {
     Absent,
@@ -144,16 +350,16 @@ enum CommitAck {
 pub(crate) enum BankPublication {
     Published {
         transaction: u64,
-        mask: u64,
+        extent: BankExtent,
     },
     RolledBack {
         transaction: u64,
-        mask: u64,
+        extent: BankExtent,
         reason: BankRefusal,
     },
     Quarantined {
         transaction: u64,
-        mask: u64,
+        extent: BankExtent,
     },
     Refused(BankRefusal),
 }
@@ -162,42 +368,59 @@ pub(crate) enum BankPublication {
 /// replace a key or discard ownership when it reports an uncertain result.
 trait BankIo {
     fn possible_cpus(&self) -> usize;
-    fn validate_targets(&mut self, slots: &[Slot], published: u64) -> Result<(), BankRefusal>;
+    fn validate_targets(&mut self, slots: &[Slot], published: &[u32]) -> Result<(), BankRefusal>;
     fn retain_charge(&mut self, charge: ResourceLease);
-    fn allocate(&mut self, slot: u32) -> Result<(), BankRefusal>;
-    fn insert_inner(&mut self, slot: u32) -> Result<(), BankRefusal>;
-    fn insert_metadata(&mut self, slot: u32, metadata: BankMetadata) -> Result<(), BankRefusal>;
+    fn allocate_bank(&mut self, bank: u32) -> Result<u32, BankRefusal>;
+    fn insert_inner(&mut self, bank: u32, expected_id: u32) -> Result<(), BankRefusal>;
+    fn insert_route(&mut self, slot: u32, route: CountsBankRoute) -> Result<(), BankRefusal>;
     fn attach_inactive(&mut self, slots: &[Slot]) -> Result<(), BankRefusal>;
-    fn insert_commit(&mut self, transaction: u64, commit: BankCommit) -> Result<(), BankRefusal>;
-    fn acknowledge(&mut self, transaction: u64) -> CommitAck;
-    fn remove_metadata_owned(
+    fn verify_candidate(&mut self, expected: &StagedExtent) -> CandidateCheck;
+    fn insert_commit(
+        &mut self,
+        transaction: u64,
+        commit: CountsBankCommit,
+    ) -> Result<(), BankRefusal>;
+    fn observe_commit(&mut self, transaction: u64, expected: CountsBankCommit)
+    -> CommitObservation;
+    fn remove_route_owned(
         &mut self,
         slot: u32,
-        expected: BankMetadata,
+        expected: CountsBankRoute,
     ) -> Result<(), BankRefusal>;
-    fn remove_inner_owned(&mut self, slot: u32) -> Result<(), BankRefusal>;
+    fn remove_new_bank_owned(&mut self, bank: u32, expected_id: u32) -> Result<(), BankRefusal>;
     fn retire_links(&mut self, slots: &[Slot]) -> Result<(), BankRefusal>;
 }
 
+#[derive(Clone, Copy)]
+enum PositionState {
+    Pending,
+    Published(CountsBankRoute),
+    NeverPublishedRetired,
+}
+
+#[derive(Clone, Copy)]
+struct BankPosition {
+    key: AttachKey,
+    state: PositionState,
+}
+
 struct BankDirectory {
-    keys: [Option<AttachKey>; BANKS],
-    allocated: u64,
-    published: u64,
+    geometry: CountsBankGeometry,
+    positions: Vec<BankPosition>,
+    bank_ids: Vec<Option<u32>>,
     next_transaction: Option<NonZeroU64>,
     quarantined: bool,
-    metadata: [Option<BankMetadata>; BANKS],
     budget: Option<crate::capacity::CounterBudget>,
 }
 
 impl Default for BankDirectory {
     fn default() -> Self {
         Self {
-            keys: [None; BANKS],
-            allocated: 0,
-            published: 0,
+            geometry: CountsBankGeometry::legacy(),
+            positions: Vec::new(),
+            bank_ids: Vec::new(),
             next_transaction: NonZeroU64::new(1),
             quarantined: false,
-            metadata: [None; BANKS],
             budget: None,
         }
     }
@@ -249,30 +472,66 @@ fn validate_provider_slots<'a>(
 }
 
 impl BankDirectory {
-    fn published_mask(&self) -> u64 {
-        self.published
+    // Staged private constructor: real CounterPreparation never selects it yet.
+    #[allow(dead_code)]
+    fn counts_growth_v2() -> Self {
+        Self {
+            geometry: CountsBankGeometry::checked(16, 512).expect("closed Counts geometry"),
+            ..Self::default()
+        }
+    }
+
+    fn allocated_high_water(&self) -> usize {
+        self.positions.len()
+    }
+
+    fn published_indices(&self) -> impl Iterator<Item = u32> + '_ {
+        self.positions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, position)| {
+                matches!(position.state, PositionState::Published(_)).then_some(index as u32)
+            })
+    }
+
+    fn legacy_published_mask(&self) -> Result<u64, BankRefusal> {
+        if !self.geometry.is_legacy() {
+            return Err(BankRefusal::Shape);
+        }
+        legacy_indices_mask(self.published_indices())
+    }
+
+    fn legacy_metadata(&self) -> Result<[Option<BankMetadata>; BANKS], BankRefusal> {
+        if !self.geometry.is_legacy() {
+            return Err(BankRefusal::Shape);
+        }
+        let mut metadata = [None; BANKS];
+        for (slot, position) in self.positions.iter().enumerate() {
+            if let PositionState::Published(route) = position.state {
+                metadata[slot] = Some(legacy_route(slot as u32, route)?);
+            }
+        }
+        Ok(metadata)
     }
 
     fn validate_plan(&self, plan: &AttachPlan) -> Result<(), BankRefusal> {
         let crate::plan::AdmissionPolicy::Counters(budget) = plan.admission_policy() else {
             return Err(BankRefusal::Shape);
         };
-        if budget.validate_count(plan.slots.len()).is_err() {
+        if budget.validate_count(plan.slots.len()).is_err()
+            || plan.slots.len() > self.geometry.limit() as usize
+        {
             return Err(BankRefusal::Shape);
         }
-        if self.budget.is_some_and(|old| old != budget) {
-            return Err(BankRefusal::Topology);
-        }
-        if plan.slots.len() > BANKS {
-            return Err(BankRefusal::Shape);
-        }
-        if plan.slots.iter().enumerate().any(|(index, slot)| {
-            slot.index as usize != index
-                || self.keys[index].is_some_and(|old| old != physical(slot))
-                || plan.slots[..index]
-                    .iter()
-                    .any(|old| physical(old) == physical(slot))
-        }) || self.keys.iter().skip(plan.slots.len()).any(Option::is_some)
+        if self.budget.is_some_and(|old| old != budget)
+            || plan.slots.len() < self.positions.len()
+            || plan.slots.iter().enumerate().any(|(index, slot)| {
+                slot.index as usize != index
+                    || self
+                        .positions
+                        .get(index)
+                        .is_some_and(|old| old.key != physical(slot))
+            })
         {
             return Err(BankRefusal::Topology);
         }
@@ -284,20 +543,120 @@ impl BankDirectory {
             return Err(BankRefusal::Quarantined);
         }
         if !matches!(plan.admission_policy(), crate::plan::AdmissionPolicy::Counters(budget) if Some(budget) == self.budget)
+            || plan.slots.len() > self.positions.len()
+            || (!self.geometry.is_legacy() && plan.slots.len() != self.positions.len())
         {
             return Err(BankRefusal::Topology);
         }
-        // Rolled-back allocated positions remain retired. An old published
-        // prefix can still be read; it never reuses those failed positions.
-        if plan.slots.len() > BANKS
-            || plan.slots.iter().enumerate().any(|(index, slot)| {
-                slot.index as usize != index
-                    || self.keys[index] != Some(physical(slot))
-                    || self.published & (1 << index) == 0
+        for (index, position) in self.positions.iter().enumerate() {
+            let slot = plan.slots.get(index);
+            if slot
+                .is_some_and(|slot| slot.index as usize != index || physical(slot) != position.key)
+            {
+                return Err(BankRefusal::Topology);
+            }
+            match position.state {
+                PositionState::Published(_) if slot.is_some() => {}
+                PositionState::NeverPublishedRetired
+                    if slot.is_none()
+                        || (!self.geometry.is_legacy() && !plan.is_active(index as u32)) => {}
+                _ => return Err(BankRefusal::Topology),
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_reservation(
+        &self,
+        plan: &AttachPlan,
+        extent: BankExtent,
+        reservation: BankReservation,
+        cpus: usize,
+    ) -> Result<(), BankRefusal> {
+        if self.geometry.is_legacy() {
+            return reservation.validate_stage(&plan.slots, cpus);
+        }
+        let payload = self.geometry.bank_payload_bytes(cpus)?;
+        let first_bank = self.geometry.locate(extent.first)?.0;
+        let last_bank = self.geometry.locate(extent.end - 1)?.0;
+        let new_banks = (first_bank..=last_bank)
+            .filter(|bank| {
+                self.bank_ids
+                    .get(*bank as usize)
+                    .copied()
+                    .flatten()
+                    .is_none()
             })
-            || self.published != (1u64 << plan.slots.len()) - 1
+            .count();
+        let payload = payload.checked_mul(new_banks).ok_or(BankRefusal::Budget)?;
+        let slots = &plan.slots[extent.first as usize..extent.end as usize];
+        let copies = slots
+            .iter()
+            .try_fold(0usize, |total, slot| {
+                total.checked_add(stage_slot_bytes(slot)?.checked_mul(4)?)
+            })
+            .ok_or(BankRefusal::Budget)?;
+        // Count requested old/new table overlap, exact-sized route/dependency
+        // buffers, native per-CPU read scratch and allocator padding. The
+        // caller's additional metadata allowance is not a kernel-memory claim.
+        let table = plan
+            .slots
+            .len()
+            .checked_mul(size_of::<BankPosition>())
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    self.positions
+                        .capacity()
+                        .checked_mul(size_of::<BankPosition>())?,
+                )
+            })
+            .ok_or(BankRefusal::Budget)?;
+        let metadata = extent
+            .len()
+            .checked_mul(2 * size_of::<(u32, CountsBankRoute)>())
+            .and_then(|bytes| {
+                bytes.checked_add(plan.slots.len().checked_mul(size_of::<AttachKey>())?)
+            })
+            .and_then(|bytes| {
+                bytes.checked_add(self.positions.len().checked_mul(size_of::<u32>())?)
+            })
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    (self.geometry.banks as usize)
+                        .checked_mul(2 * size_of::<(u32, u32)>() + size_of::<Option<u32>>())?,
+                )
+            })
+            .and_then(|bytes| {
+                bytes.checked_add(size_of::<StagedExtent>() + 16 * OWNED_ALLOCATION_PADDING)
+            })
+            .ok_or(BankRefusal::Budget)?;
+        let retained = payload
+            .checked_add(copies)
+            .and_then(|bytes| bytes.checked_add(table))
+            .ok_or(BankRefusal::Budget)?;
+        let transient = copies
+            .checked_add(table)
+            .and_then(|bytes| bytes.checked_add(metadata.checked_mul(2)?))
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    cpus.checked_mul(4 * size_of::<p11scope_ebpf_common::CountStats>())?,
+                )
+            })
+            .ok_or(BankRefusal::Budget)?;
+        let fds = cpus
+            .checked_mul(4)
+            .and_then(|count| count.checked_add(4))
+            .and_then(|count| {
+                count.checked_mul(self.published_indices().count().checked_add(extent.len())?)
+            })
+            .and_then(|count| count.checked_add(new_banks))
+            .ok_or(BankRefusal::Budget)?;
+        if reservation.retained_bytes < retained
+            || reservation.transient_bytes < transient
+            || reservation.metadata_bytes < metadata
+            || reservation.file_descriptors < fds
         {
-            return Err(BankRefusal::Topology);
+            return Err(BankRefusal::Budget);
         }
         Ok(())
     }
@@ -315,10 +674,20 @@ impl BankDirectory {
         if let Err(reason) = self.validate_plan(plan) {
             return BankPublication::Refused(reason);
         }
-        let mask = ((1u64 << plan.slots.len()) - 1) & !self.published;
-        if mask == 0 || mask & self.allocated != 0 {
+        let first = self.allocated_high_water() as u32;
+        let end = plan.slots.len() as u32;
+        if first == end
+            || self.positions.iter().enumerate().any(|(index, position)| {
+                matches!(position.state, PositionState::NeverPublishedRetired)
+                    && (self.geometry.is_legacy() || plan.is_active(index as u32))
+            })
+        {
             return BankPublication::Refused(BankRefusal::Allocated);
         }
+        let extent = match BankExtent::checked(first, end, self.geometry.limit()) {
+            Ok(extent) => extent,
+            Err(reason) => return BankPublication::Refused(reason),
+        };
         let Some(transaction) = self.next_transaction else {
             return BankPublication::Refused(BankRefusal::Exhausted);
         };
@@ -326,13 +695,11 @@ impl BankDirectory {
             Ok(bytes) => bytes,
             Err(reason) => return BankPublication::Refused(reason),
         };
-        // The complete plan bounds the new subset without allocating that
-        // subset or duplicating provider/slot metadata first.
-        if let Err(reason) = reservation.validate_stage(&plan.slots, io.possible_cpus()) {
+        if let Err(reason) =
+            self.validate_reservation(plan, extent, reservation, io.possible_cpus())
+        {
             return BankPublication::Refused(reason);
         }
-        // Precharge both old/new overlap and all staging before cloning a Slot
-        // or making native allocation, publication, provider or link calls.
         let charge = match reserve.reserve(retained) {
             Ok(charge) => charge,
             Err(_) => return BankPublication::Refused(BankRefusal::Budget),
@@ -341,104 +708,221 @@ impl BankDirectory {
             Ok(charge) => charge,
             Err(_) => return BankPublication::Refused(BankRefusal::Budget),
         };
-        if let Err(reason) = io.validate_targets(&plan.slots, self.published) {
+        // Every allocation below is within the precharged request envelope.
+        // Exclude ONLY positively never-published holes from uniqueness.
+        let mut keys = Vec::with_capacity(plan.slots.len());
+        for slot in &plan.slots {
+            if self
+                .positions
+                .get(slot.index as usize)
+                .is_some_and(|position| {
+                    matches!(position.state, PositionState::NeverPublishedRetired)
+                })
+            {
+                continue;
+            }
+            keys.push(physical(slot));
+        }
+        keys.sort_unstable();
+        if keys.windows(2).any(|pair| pair[0] == pair[1]) {
+            return BankPublication::Refused(BankRefusal::Topology);
+        }
+        let mut published = Vec::with_capacity(self.positions.len());
+        published.extend(self.published_indices());
+        if let Err(reason) = io.validate_targets(&plan.slots, &published) {
             return BankPublication::Refused(reason);
         }
-        let slots: Vec<_> = plan
-            .slots
-            .iter()
-            .filter(|slot| mask & (1 << slot.index) != 0)
-            .cloned()
-            .collect();
-        // This guard moves into the same native custody as the eventual links,
-        // including rollback failures, quarantine and abandonment.
+        let slots = plan.slots[first as usize..end as usize].to_vec();
+        let mut positions = Vec::with_capacity(plan.slots.len());
+        positions.extend_from_slice(&self.positions);
+        positions.extend(slots.iter().map(|slot| BankPosition {
+            key: physical(slot),
+            state: PositionState::Pending,
+        }));
+        let mut routes = Vec::with_capacity(extent.len());
+        let mut ids = Vec::with_capacity(self.geometry.banks as usize);
+        let mut inserted_routes = Vec::with_capacity(extent.len());
+        let mut inserted_banks = Vec::with_capacity(self.geometry.banks as usize);
+        let mut bank_ids = Vec::with_capacity(self.geometry.banks as usize);
+        bank_ids.extend_from_slice(&self.bank_ids);
+        bank_ids.resize(self.geometry.banks as usize, None);
         io.retain_charge(charge);
-        let transaction = transaction.get();
-        self.next_transaction = transaction.checked_add(1).and_then(NonZeroU64::new);
-        self.allocated |= mask;
-        if let crate::plan::AdmissionPolicy::Counters(budget) = plan.admission_policy() {
-            self.budget = Some(budget);
-        }
-        for slot in &slots {
-            self.keys[slot.index as usize] = Some(physical(slot));
-        }
-        if io.acknowledge(transaction) != CommitAck::Absent {
-            self.quarantined = true;
-            return BankPublication::Quarantined { transaction, mask };
-        }
-        let expected = BankCommit {
-            mask,
-            configuration: BANK_CONFIG,
+        self.positions = positions;
+        self.budget = match plan.admission_policy() {
+            crate::plan::AdmissionPolicy::Counters(budget) => Some(budget),
+            _ => unreachable!("validated counter policy"),
         };
-        let metadata = |slot: u32| BankMetadata {
-            transaction,
-            mask,
-            logical_slot: slot,
-            cells: 1,
+        self.next_transaction = transaction.get().checked_add(1).and_then(NonZeroU64::new);
+        let commit = CountsBankCommit {
+            first,
+            end,
+            configuration: self.geometry.configuration,
         };
-        let mut inners = 0u64;
-        let mut metas = 0u64;
+        if io.observe_commit(transaction.get(), commit) != CommitObservation::Absent {
+            return self.quarantine(transaction.get(), extent);
+        }
         let mut links_attempted = false;
         let mut commit_attempted = false;
+        let mut candidate = None;
         let result = (|| {
+            let first_bank = self.geometry.locate(first)?.0;
+            let last_bank = self.geometry.locate(end - 1)?.0;
+            for bank in first_bank..=last_bank {
+                let id = match bank_ids[bank as usize] {
+                    Some(id) => id,
+                    None => {
+                        let id = io.allocate_bank(bank)?;
+                        if id == 0 || bank_ids.iter().flatten().any(|old| *old == id) {
+                            return Err(BankRefusal::Quarantined);
+                        }
+                        io.insert_inner(bank, id)?;
+                        inserted_banks.push((bank, id));
+                        bank_ids[bank as usize] = Some(id);
+                        id
+                    }
+                };
+                ids.push((bank, id));
+            }
             for slot in &slots {
-                io.allocate(slot.index)?;
-                io.insert_inner(slot.index)?;
-                inners |= 1 << slot.index;
-                io.insert_metadata(slot.index, metadata(slot.index))?;
-                metas |= 1 << slot.index;
+                let (bank, cell) = self.geometry.locate(slot.index)?;
+                let route = CountsBankRoute {
+                    transaction: transaction.get(),
+                    first,
+                    end,
+                    bank,
+                    cell,
+                    inner_id: bank_ids[bank as usize].ok_or(BankRefusal::Ownership)?,
+                    reserved_zero: 0,
+                };
+                io.insert_route(slot.index, route)?;
+                inserted_routes.push((slot.index, route));
+                routes.push((slot.index, route));
             }
             links_attempted = true;
             io.attach_inactive(&slots)?;
+            let expected =
+                StagedExtent::checked_with(self.geometry, transaction, commit, routes, ids)
+                    .map_err(|_| BankRefusal::Quarantined)?;
+            if io.verify_candidate(&expected) != CandidateCheck::Exact {
+                return Err(BankRefusal::Quarantined);
+            }
             commit_attempted = true;
-            io.insert_commit(transaction, expected)
+            let result = io.insert_commit(expected.transaction.get(), expected.commit);
+            candidate = Some(expected);
+            result
         })();
-        match io.acknowledge(transaction) {
-            CommitAck::Present(actual) if commit_attempted && actual == expected => {
-                self.published |= mask;
-                for slot in &slots {
-                    self.metadata[slot.index as usize] = Some(metadata(slot.index));
+        if result == Err(BankRefusal::Quarantined) {
+            return self.quarantine(transaction.get(), extent);
+        }
+        match io.observe_commit(transaction.get(), commit) {
+            CommitObservation::Exact if commit_attempted => {
+                let Some(expected) = candidate else {
+                    return self.quarantine(transaction.get(), extent);
+                };
+                if io.verify_candidate(&expected) != CandidateCheck::Exact {
+                    return self.quarantine(transaction.get(), extent);
                 }
-                BankPublication::Published { transaction, mask }
+                for &(slot, route) in &expected.routes {
+                    self.positions[slot as usize].state = PositionState::Published(route);
+                }
+                self.bank_ids = bank_ids;
+                BankPublication::Published {
+                    transaction: transaction.get(),
+                    extent,
+                }
             }
-            CommitAck::Absent if result == Err(BankRefusal::Quarantined) => {
-                self.quarantined = true;
-                BankPublication::Quarantined { transaction, mask }
-            }
-            CommitAck::Absent => {
+            CommitObservation::Absent => {
                 let mut clean = true;
-                // Only positively inserted keys belong to this candidate. Each
-                // removal independently verifies the exact metadata/map ID.
-                for slot in slots.iter().rev() {
-                    if metas & (1 << slot.index) != 0 {
-                        clean &= io
-                            .remove_metadata_owned(slot.index, metadata(slot.index))
-                            .is_ok();
-                    }
-                    if inners & (1 << slot.index) != 0 {
-                        clean &= io.remove_inner_owned(slot.index).is_ok();
-                    }
+                for &(slot, route) in inserted_routes.iter().rev() {
+                    clean &= io.remove_route_owned(slot, route).is_ok();
                 }
                 if links_attempted {
                     clean &= io.retire_links(&slots).is_ok();
                 }
-                if clean {
-                    BankPublication::RolledBack {
-                        transaction,
-                        mask,
-                        reason: result.err().unwrap_or(BankRefusal::Commit),
-                    }
-                } else {
-                    self.quarantined = true;
-                    BankPublication::Quarantined { transaction, mask }
+                for &(bank, id) in inserted_banks.iter().rev() {
+                    clean &= io.remove_new_bank_owned(bank, id).is_ok();
+                }
+                if !clean {
+                    return self.quarantine(transaction.get(), extent);
+                }
+                for position in &mut self.positions[first as usize..end as usize] {
+                    position.state = PositionState::NeverPublishedRetired;
+                }
+                BankPublication::RolledBack {
+                    transaction: transaction.get(),
+                    extent,
+                    reason: result.err().unwrap_or(BankRefusal::Commit),
                 }
             }
-            CommitAck::Present(_) | CommitAck::Unreadable => {
-                self.quarantined = true;
-                BankPublication::Quarantined { transaction, mask }
-            }
+            _ => self.quarantine(transaction.get(), extent),
         }
     }
+
+    fn quarantine(&mut self, transaction: u64, extent: BankExtent) -> BankPublication {
+        self.quarantined = true;
+        BankPublication::Quarantined {
+            transaction,
+            extent,
+        }
+    }
+}
+
+fn legacy_indices_mask(indices: impl IntoIterator<Item = u32>) -> Result<u64, BankRefusal> {
+    let mut mask = 0;
+    for index in indices {
+        if index >= BANKS as u32 || mask & (1 << index) != 0 {
+            return Err(BankRefusal::Shape);
+        }
+        mask |= 1 << index;
+    }
+    Ok(mask)
+}
+
+fn legacy_commit(commit: CountsBankCommit) -> Result<BankCommit, BankRefusal> {
+    if commit.configuration != BANK_CONFIG {
+        return Err(BankRefusal::Shape);
+    }
+    let extent = BankExtent::checked(commit.first, commit.end, BANKS as u32)?;
+    Ok(BankCommit {
+        mask: extent.legacy_mask()?,
+        configuration: BANK_CONFIG,
+    })
+}
+
+fn legacy_route(slot: u32, route: CountsBankRoute) -> Result<BankMetadata, BankRefusal> {
+    let extent = BankExtent::checked(route.first, route.end, BANKS as u32)?;
+    if route.transaction == 0
+        || route.bank != slot
+        || route.cell != 0
+        || route.inner_id == 0
+        || route.reserved_zero != 0
+        || slot < extent.first
+        || slot >= extent.end
+    {
+        return Err(BankRefusal::Shape);
+    }
+    Ok(BankMetadata {
+        transaction: route.transaction,
+        mask: extent.legacy_mask()?,
+        logical_slot: slot,
+        cells: 1,
+    })
+}
+
+fn stage_slot_bytes(slot: &Slot) -> Option<usize> {
+    size_of::<Slot>()
+        .checked_add(8 * OWNED_ALLOCATION_PADDING)?
+        .checked_add(slot.object_path.capacity())?
+        .checked_add(slot.names.capacity().checked_mul(size_of::<String>())?)?
+        .checked_add(
+            slot.module_ids
+                .capacity()
+                .checked_mul(size_of::<crate::plan::ModuleId>())?,
+        )?
+        .checked_add(slot.names.iter().try_fold(0usize, |sum, name| {
+            sum.checked_add(name.capacity())?
+                .checked_add(OWNED_ALLOCATION_PADDING)
+        })?)
 }
 
 pub(crate) struct BankHandle {
@@ -562,6 +1046,10 @@ impl<'a> CounterPreparation<'a> {
             "private counter preparation requires possible CPUs"
         );
         let parsed = aya_obj::Object::parse(object).context("parsing selected counter artifact")?;
+        // This constructor still prepares format1 only. Reject an incomplete
+        // format2 object before common preparation can attach lifecycle roots.
+        validate_format1_object_maps(|name| parsed.maps.get(name))
+            .map_err(|_| anyhow::anyhow!("unsupported private counter artifact profile"))?;
         ensure!(
             PROGRAMS
                 .iter()
@@ -696,29 +1184,88 @@ fn validate_maps(ebpf: &Ebpf) -> Result<(), BankRefusal> {
 fn validate_maps_with(
     mut metadata: impl FnMut(&str) -> Result<super::ExactMapMetadata, BankRefusal>,
 ) -> Result<(), BankRefusal> {
-    for (name, kind, key, value, entries, flags) in [
-        ("COUNTER_BANKS", MapType::HashOfMaps, 4, 4, 2, 128),
-        ("COUNTER_BANK_META", MapType::Hash, 4, 24, 2, 128),
-        ("COUNTER_BANK_COMMIT", MapType::Hash, 8, 16, 2, 128),
-        ("COUNTER_BANK_FAULT", MapType::PerCpuArray, 4, 8, 1, 0),
-        ("COUNTER_HEALTH", MapType::PerCpuArray, 4, 8, 2, 0),
-        ("STATS", MapType::PerCpuArray, 4, 24, 512, 0),
-        ("RV_COUNTS", MapType::PerCpuHash, 16, 8, 4096, 0),
-        (
-            "START",
+    for (name, expected) in FORMAT1_MAPS {
+        super::compare_map_metadata(name, metadata(name)?, expected)
+            .map_err(|_| BankRefusal::Shape)?;
+    }
+    Ok(())
+}
+
+const FORMAT1_MAPS: [(&str, super::ExactMapMetadata); 8] = [
+    (
+        "COUNTER_BANKS",
+        super::map_metadata(MapType::HashOfMaps, 4, 4, 2, 128),
+    ),
+    (
+        "COUNTER_BANK_META",
+        super::map_metadata(MapType::Hash, 4, 24, 2, 128),
+    ),
+    (
+        "COUNTER_BANK_COMMIT",
+        super::map_metadata(MapType::Hash, 8, 16, 2, 128),
+    ),
+    (
+        "COUNTER_BANK_FAULT",
+        super::map_metadata(MapType::PerCpuArray, 4, 8, 1, 0),
+    ),
+    (
+        "COUNTER_HEALTH",
+        super::map_metadata(MapType::PerCpuArray, 4, 8, 2, 0),
+    ),
+    (
+        "STATS",
+        super::map_metadata(MapType::PerCpuArray, 4, 24, 512, 0),
+    ),
+    (
+        "RV_COUNTS",
+        super::map_metadata(MapType::PerCpuHash, 16, 8, 4096, 0),
+    ),
+    (
+        "START",
+        super::map_metadata(
             MapType::Hash,
             16,
             size_of::<p11scope_ebpf_common::CallStart>() as u32,
             16384,
             0,
         ),
-    ] {
-        super::compare_map_metadata(
-            name,
-            metadata(name)?,
-            super::map_metadata(kind, key, value, entries, flags),
-        )
-        .map_err(|_| BankRefusal::Shape)?;
+    ),
+];
+
+fn validate_format1_object_maps<'a>(
+    mut map: impl FnMut(&str) -> Option<&'a aya_obj::Map>,
+) -> Result<(), BankRefusal> {
+    for (name, expected) in FORMAT1_MAPS {
+        let actual = map(name).ok_or(BankRefusal::Shape)?;
+        if (
+            actual.map_type(),
+            actual.key_size(),
+            actual.value_size(),
+            actual.max_entries(),
+            actual.map_flags(),
+        ) != (
+            expected.map_type as u32,
+            expected.key_size,
+            expected.value_size,
+            expected.max_entries,
+            expected.flags,
+        ) {
+            return Err(BankRefusal::Shape);
+        }
+    }
+    let inner = map("COUNTER_BANKS")
+        .and_then(aya_obj::Map::inner)
+        .ok_or(BankRefusal::Shape)?;
+    if (
+        inner.map_type(),
+        inner.key_size(),
+        inner.value_size(),
+        inner.max_entries(),
+        inner.map_flags(),
+    ) != (6, 4, 24, 1, 0)
+        || inner.inner().is_some()
+    {
+        return Err(BankRefusal::Shape);
     }
     Ok(())
 }
@@ -764,7 +1311,8 @@ impl BankIo for NativeIo<'_> {
         self.cpus
     }
 
-    fn validate_targets(&mut self, slots: &[Slot], published: u64) -> Result<(), BankRefusal> {
+    fn validate_targets(&mut self, slots: &[Slot], published: &[u32]) -> Result<(), BankRefusal> {
+        let published = legacy_indices_mask(published.iter().copied())?;
         if self.session.mutation_stopped()
             || self.session.backend != super::AttachBackend::Singles
             || self.objects.check_unchanged() != Ok(true)
@@ -784,8 +1332,6 @@ impl BankIo for NativeIo<'_> {
                 {
                     return None;
                 }
-                // attach_targets creates a held-object copy and retained targets;
-                // include every simultaneous copy before the first one is made.
                 total.checked_add(
                     self.objects
                         .retained_target_copy_allocation_charge(slot.object)?
@@ -805,19 +1351,22 @@ impl BankIo for NativeIo<'_> {
     }
 
     fn retain_charge(&mut self, charge: ResourceLease) {
-        // At most two permanently allocated positions/attempts. This is
-        // custody, not a second allocation/admission authority or history.
         let slot = self
             .custody
             .charges
             .iter_mut()
             .find(|slot| slot.is_none())
-            .expect("bounded counter attempts have preallocated charge slots");
+            .expect("format1's consumed extent bounds retained attempts");
         *slot = Some(charge);
     }
 
-    fn allocate(&mut self, slot: u32) -> Result<(), BankRefusal> {
-        let index = slot as usize;
+    fn allocate_bank(&mut self, bank: u32) -> Result<u32, BankRefusal> {
+        // Explicit format1 adapter only. Real format2 preparation/staging is
+        // refused before any lifecycle or endpoint attachment.
+        let index = bank as usize;
+        if index >= BANKS {
+            return Err(BankRefusal::Shape);
+        }
         if self.custody.banks[index].is_some() {
             return Err(BankRefusal::Allocated);
         }
@@ -845,13 +1394,19 @@ impl BankIo for NativeIo<'_> {
             map: Map::PerCpuArray(data),
             id,
         }));
-        Ok(())
+        Ok(id)
     }
 
-    fn insert_inner(&mut self, slot: u32) -> Result<(), BankRefusal> {
-        let bank = self.custody.banks[slot as usize]
-            .as_ref()
+    fn insert_inner(&mut self, bank: u32, expected_id: u32) -> Result<(), BankRefusal> {
+        let held = self
+            .custody
+            .banks
+            .get(bank as usize)
+            .and_then(Option::as_ref)
             .ok_or(BankRefusal::Ownership)?;
+        if held.id != expected_id {
+            return Err(BankRefusal::Quarantined);
+        }
         let mut outer: HashOfMaps<_, u32> = HashOfMaps::try_from(
             self.session
                 .ebpf
@@ -859,15 +1414,25 @@ impl BankIo for NativeIo<'_> {
                 .ok_or(BankRefusal::Shape)?,
         )
         .map_err(|_| BankRefusal::Shape)?;
-        let result = outer.insert(slot, map_data(&bank.map)?, super::BPF_NOEXIST);
-        match outer_id(&self.session.ebpf, slot)? {
-            Some(id) if id == bank.id => Ok(()),
+        let result = outer.insert(bank, map_data(&held.map)?, super::BPF_NOEXIST);
+        match outer_id(&self.session.ebpf, bank)? {
+            Some(id) if id == expected_id => Ok(()),
             None if result.is_err() => Err(BankRefusal::Native),
             _ => Err(BankRefusal::Quarantined),
         }
     }
 
-    fn insert_metadata(&mut self, slot: u32, metadata: BankMetadata) -> Result<(), BankRefusal> {
+    fn insert_route(&mut self, slot: u32, route: CountsBankRoute) -> Result<(), BankRefusal> {
+        let wire = legacy_route(slot, route)?;
+        if self
+            .custody
+            .banks
+            .get(route.bank as usize)
+            .and_then(Option::as_ref)
+            .is_none_or(|bank| bank.id != route.inner_id)
+        {
+            return Err(BankRefusal::Quarantined);
+        }
         let mut map: HashMap<_, u32, BankMetadata> = HashMap::try_from(
             self.session
                 .ebpf
@@ -875,26 +1440,26 @@ impl BankIo for NativeIo<'_> {
                 .ok_or(BankRefusal::Shape)?,
         )
         .map_err(|_| BankRefusal::Shape)?;
-        let result = map.insert(slot, metadata, super::BPF_NOEXIST);
+        let result = map.insert(slot, wire, super::BPF_NOEXIST);
         match map.get(&slot, 0) {
-            Ok(actual) if actual == metadata && result.is_ok() => Ok(()),
+            Ok(actual) if actual == wire && result.is_ok() => Ok(()),
             Err(MapError::KeyNotFound) if result.is_err() => Err(BankRefusal::Native),
             _ => Err(BankRefusal::Quarantined),
         }
     }
 
     fn attach_inactive(&mut self, slots: &[Slot]) -> Result<(), BankRefusal> {
-        let mask = slots
-            .iter()
-            .fold(0u64, |mask, slot| mask | (1 << slot.index));
+        let mask = legacy_indices_mask(slots.iter().map(|slot| slot.index))?;
         let banks = self
             .session
             .counter_banks
             .as_ref()
             .ok_or(BankRefusal::Shape)?;
         let _stage = banks.begin_link_stage(mask)?;
-        let result = self.session.attach_targets(slots, self.objects);
-        let (failed, completed) = result.map_err(|_| BankRefusal::Links)?;
+        let (failed, completed) = self
+            .session
+            .attach_targets(slots, self.objects)
+            .map_err(|_| BankRefusal::Links)?;
         if !failed.is_empty()
             || completed.len() != slots.len()
             || self.objects.check_unchanged() != Ok(true)
@@ -914,7 +1479,85 @@ impl BankIo for NativeIo<'_> {
         Ok(())
     }
 
-    fn insert_commit(&mut self, transaction: u64, commit: BankCommit) -> Result<(), BankRefusal> {
+    fn verify_candidate(&mut self, expected: &StagedExtent) -> CandidateCheck {
+        if legacy_commit(expected.commit).is_err()
+            || validate_maps(&self.session.ebpf).is_err()
+            || self.session.mutation_stopped()
+            || self.session.backend != super::AttachBackend::Singles
+        {
+            return CandidateCheck::Contradictory;
+        }
+        if aya::util::nr_cpus().ok() != Some(self.cpus) {
+            return CandidateCheck::Unreadable;
+        }
+        let all = match legacy_indices_mask(self.plan.slots.iter().map(|slot| slot.index)) {
+            Ok(mask) => mask,
+            Err(_) => return CandidateCheck::Contradictory,
+        };
+        if self.objects.check_unchanged() != Ok(true)
+            || validate_provider_slots(&self.plan.slots, self.objects, all, |index| {
+                self.custody.providers[index as usize].as_ref()
+            })
+            .is_err()
+        {
+            return CandidateCheck::Contradictory;
+        }
+        let Some(map) = self.session.ebpf.map("COUNTER_BANK_META") else {
+            return CandidateCheck::Unreadable;
+        };
+        let Ok(metadata): Result<HashMap<_, u32, BankMetadata>, _> = HashMap::try_from(map) else {
+            return CandidateCheck::Contradictory;
+        };
+        let sides = self.session.current_static_sides();
+        for &(bank, id) in &expected.bank_ids {
+            let Some(held) = self
+                .custody
+                .banks
+                .get(bank as usize)
+                .and_then(Option::as_ref)
+            else {
+                return CandidateCheck::Contradictory;
+            };
+            let Ok(data) = map_data(&held.map) else {
+                return CandidateCheck::Contradictory;
+            };
+            let Ok(info) = data.info() else {
+                return CandidateCheck::Unreadable;
+            };
+            if held.id != id || info.id() != id {
+                return CandidateCheck::Contradictory;
+            }
+            match outer_id(&self.session.ebpf, bank) {
+                Ok(Some(actual)) if actual == id => {}
+                Ok(_) => return CandidateCheck::Contradictory,
+                Err(_) => return CandidateCheck::Unreadable,
+            }
+        }
+        for &(slot, route) in &expected.routes {
+            let Ok(wire) = legacy_route(slot, route) else {
+                return CandidateCheck::Contradictory;
+            };
+            if !expected.bank_ids.contains(&(route.bank, route.inner_id))
+                || !sides.contains(&(slot, super::ProbeSide::Entry))
+                || !sides.contains(&(slot, super::ProbeSide::Return))
+            {
+                return CandidateCheck::Contradictory;
+            }
+            match metadata.get(&slot, 0) {
+                Ok(actual) if actual == wire => {}
+                Ok(_) | Err(MapError::KeyNotFound) => return CandidateCheck::Contradictory,
+                Err(_) => return CandidateCheck::Unreadable,
+            }
+        }
+        CandidateCheck::Exact
+    }
+
+    fn insert_commit(
+        &mut self,
+        transaction: u64,
+        commit: CountsBankCommit,
+    ) -> Result<(), BankRefusal> {
+        let wire = legacy_commit(commit)?;
         let mut map: HashMap<_, u64, BankCommit> = HashMap::try_from(
             self.session
                 .ebpf
@@ -922,29 +1565,47 @@ impl BankIo for NativeIo<'_> {
                 .ok_or(BankRefusal::Shape)?,
         )
         .map_err(|_| BankRefusal::Shape)?;
-        map.insert(transaction, commit, super::BPF_NOEXIST)
+        map.insert(transaction, wire, super::BPF_NOEXIST)
             .map_err(|_| BankRefusal::Commit)
     }
 
-    fn acknowledge(&mut self, transaction: u64) -> CommitAck {
-        let Some(map) = self.session.ebpf.map("COUNTER_BANK_COMMIT") else {
-            return CommitAck::Unreadable;
+    fn observe_commit(
+        &mut self,
+        transaction: u64,
+        expected: CountsBankCommit,
+    ) -> CommitObservation {
+        let Ok(wire) = legacy_commit(expected) else {
+            return CommitObservation::Contradictory;
         };
-        let Ok(map) = HashMap::<_, u64, BankCommit>::try_from(map) else {
-            return CommitAck::Unreadable;
+        let Some(map) = self.session.ebpf.map("COUNTER_BANK_COMMIT") else {
+            return CommitObservation::Unreadable;
+        };
+        let Ok(map): Result<HashMap<_, u64, BankCommit>, _> = HashMap::try_from(map) else {
+            return CommitObservation::Unreadable;
         };
         match map.get(&transaction, 0) {
-            Ok(commit) => CommitAck::Present(commit),
-            Err(MapError::KeyNotFound) => CommitAck::Absent,
-            Err(_) => CommitAck::Unreadable,
+            Ok(actual) if actual == wire => CommitObservation::Exact,
+            Ok(_) => CommitObservation::Contradictory,
+            Err(MapError::KeyNotFound) => CommitObservation::Absent,
+            Err(_) => CommitObservation::Unreadable,
         }
     }
 
-    fn remove_metadata_owned(
+    fn remove_route_owned(
         &mut self,
         slot: u32,
-        expected: BankMetadata,
+        expected: CountsBankRoute,
     ) -> Result<(), BankRefusal> {
+        let wire = legacy_route(slot, expected)?;
+        if self
+            .custody
+            .banks
+            .get(expected.bank as usize)
+            .and_then(Option::as_ref)
+            .is_none_or(|bank| bank.id != expected.inner_id)
+        {
+            return Err(BankRefusal::Ownership);
+        }
         let mut map: HashMap<_, u32, BankMetadata> = HashMap::try_from(
             self.session
                 .ebpf
@@ -952,17 +1613,21 @@ impl BankIo for NativeIo<'_> {
                 .ok_or(BankRefusal::Shape)?,
         )
         .map_err(|_| BankRefusal::Shape)?;
-        if map.get(&slot, 0).map_err(|_| BankRefusal::Ownership)? != expected {
+        if map.get(&slot, 0).map_err(|_| BankRefusal::Ownership)? != wire {
             return Err(BankRefusal::Ownership);
         }
         map.remove(&slot).map_err(|_| BankRefusal::Ownership)
     }
 
-    fn remove_inner_owned(&mut self, slot: u32) -> Result<(), BankRefusal> {
-        let bank = self.custody.banks[slot as usize]
-            .as_ref()
-            .ok_or(BankRefusal::Ownership)?;
-        if outer_id(&self.session.ebpf, slot)? != Some(bank.id) {
+    fn remove_new_bank_owned(&mut self, bank: u32, expected_id: u32) -> Result<(), BankRefusal> {
+        if self
+            .custody
+            .banks
+            .get(bank as usize)
+            .and_then(Option::as_ref)
+            .is_none_or(|held| held.id != expected_id)
+            || outer_id(&self.session.ebpf, bank)? != Some(expected_id)
+        {
             return Err(BankRefusal::Ownership);
         }
         let mut outer: HashOfMaps<_, u32> = HashOfMaps::try_from(
@@ -972,7 +1637,7 @@ impl BankIo for NativeIo<'_> {
                 .ok_or(BankRefusal::Shape)?,
         )
         .map_err(|_| BankRefusal::Shape)?;
-        outer.remove(&slot).map_err(|_| BankRefusal::Ownership)
+        outer.remove(&bank).map_err(|_| BankRefusal::Ownership)
     }
 
     fn retire_links(&mut self, slots: &[Slot]) -> Result<(), BankRefusal> {
@@ -1048,6 +1713,9 @@ impl Session {
         let Ok(mut directory) = directory.lock() else {
             return BankPublication::Refused(BankRefusal::Quarantined);
         };
+        if !directory.geometry.is_legacy() {
+            return BankPublication::Refused(BankRefusal::Shape);
+        }
         let Ok(mut custody) = keepalive.custody.lock() else {
             return BankPublication::Refused(BankRefusal::Quarantined);
         };
@@ -1142,14 +1810,17 @@ fn reader_profile_with(
     possible_cpus: impl FnOnce() -> Result<usize, BankRefusal>,
 ) -> Result<Option<CounterReaderProfile>, BankRefusal> {
     let Some(banks) = banks else { return Ok(None) };
-    if banks
+    let directory = banks
         .directory
         .lock()
-        .map_err(|_| BankRefusal::Quarantined)?
-        .quarantined
-    {
+        .map_err(|_| BankRefusal::Quarantined)?;
+    if directory.quarantined {
         return Err(BankRefusal::Quarantined);
     }
+    if !directory.geometry.is_legacy() {
+        return Err(BankRefusal::Shape);
+    }
+    drop(directory);
     let cpus = possible_cpus()?;
     if cpus == 0 || cpus != banks.cpus {
         return Err(BankRefusal::Topology);
@@ -1283,6 +1954,9 @@ impl Session {
             .directory
             .lock()
             .map_err(|_| BankRefusal::Quarantined)?;
+        if !directory.geometry.is_legacy() {
+            return Err(BankRefusal::Shape);
+        }
         let custody = banks
             .keepalive
             .custody
@@ -1290,9 +1964,12 @@ impl Session {
             .map_err(|_| BankRefusal::Quarantined)?;
         let status = match directory.validate_read_plan(plan) {
             Ok(()) => {
-                validate_provider_slots(&plan.slots, objects, directory.published, |index| {
-                    custody.providers[index as usize].as_ref()
-                })?;
+                validate_provider_slots(
+                    &plan.slots,
+                    objects,
+                    directory.legacy_published_mask()?,
+                    |index| custody.providers[index as usize].as_ref(),
+                )?;
                 BankReadStatus::Healthy
             }
             Err(BankRefusal::Quarantined) => BankReadStatus::Quarantined,
@@ -1300,7 +1977,7 @@ impl Session {
         };
         Ok(CounterBankView {
             banks: custody.banks.clone(),
-            metadata: directory.metadata,
+            metadata: directory.legacy_metadata()?,
             expected: plan.slots.len(),
             status,
             _keepalive: Arc::clone(&banks.keepalive),
@@ -1706,6 +2383,70 @@ mod tests {
             ..commit
         };
         assert!(StagedExtent::checked(NonZeroU64::new(1).unwrap(), legacy, routes, ids).is_err());
+
+        // Actual parsing/preparation rejects a future profile before lifecycle
+        // attachment. Build small Aya map definitions, never a host BTF blob.
+        let mut format1 = BTreeMap::new();
+        for (name, _) in FORMAT1_MAPS {
+            let expected = reader_metadata(name).unwrap();
+            format1.insert(
+                name,
+                aya_obj::Map::new_from_params(
+                    expected.map_type as u32,
+                    expected.key_size,
+                    expected.value_size,
+                    expected.max_entries,
+                    expected.flags,
+                ),
+            );
+        }
+        let aya_obj::Map::Legacy(outer) = format1.get_mut("COUNTER_BANKS").unwrap() else {
+            unreachable!();
+        };
+        outer.inner_def = Some(aya_obj::maps::bpf_map_def {
+            map_type: 6,
+            key_size: 4,
+            value_size: 24,
+            max_entries: 1,
+            ..Default::default()
+        });
+        assert_eq!(
+            validate_format1_object_maps(|name| format1.get(name)),
+            Ok(())
+        );
+        for damage in 0..5 {
+            let mut changed = format1.clone();
+            let name = match damage {
+                0 | 1 => "COUNTER_BANKS",
+                2 => "COUNTER_BANK_META",
+                3 => "COUNTER_BANK_COMMIT",
+                _ => "STATS",
+            };
+            let aya_obj::Map::Legacy(map) = changed.get_mut(name).unwrap() else {
+                unreachable!();
+            };
+            match damage {
+                0 => map.def.max_entries = 16,
+                1 => map.inner_def.as_mut().unwrap().max_entries = 512,
+                2 => map.def.value_size = 32,
+                3 => map.def.max_entries = 8192,
+                _ => map.def.value_size = 40,
+            }
+            assert_eq!(
+                validate_format1_object_maps(|name| changed.get(name)),
+                Err(BankRefusal::Shape)
+            );
+        }
+        assert_eq!(
+            validate_format1_object_maps(|name| {
+                if name == "COUNTER_BANK_META" {
+                    None
+                } else {
+                    format1.get(name)
+                }
+            }),
+            Err(BankRefusal::Shape)
+        );
     }
 
     #[test]
@@ -1873,15 +2614,16 @@ mod tests {
     #[test]
     fn scaled_charge_refusal_precedes_every_native_operation() {
         let mut failures = Vec::new();
-        for case in 0..7 {
+        for case in 0..8 {
             let mut bad = growth_reservation();
             match case {
                 0 => bad.retained_bytes = 48, // One cell at two CPUs, not a full512-cell bank.
                 1 => bad.transient_bytes = 1,
-                2 => bad.metadata_bytes = 0,
+                2 => bad.metadata_bytes = 1,
                 3 => bad.file_descriptors = 1,
                 4 => bad.retained_bytes = usize::MAX,
                 5 => bad.metadata_bytes = usize::MAX,
+                6 => bad.metadata_bytes = 0,
                 _ => bad.file_descriptors = 0,
             }
             failures.push((2, bad));
@@ -2074,6 +2816,9 @@ mod tests {
         inners: BTreeMap<u32, u32>,
         metadata: BTreeMap<u32, BankMetadata>,
         commits: BTreeMap<u64, BankCommit>,
+        targets: Vec<Slot>,
+        entries: BTreeSet<u32>,
+        returns: BTreeSet<u32>,
         held: Vec<ResourceLease>,
         acknowledgements: Vec<CommitAck>,
         attempted: BTreeSet<u64>,
@@ -2088,13 +2833,19 @@ mod tests {
         fn possible_cpus(&self) -> usize {
             2
         }
-        fn validate_targets(&mut self, slots: &[Slot], published: u64) -> Result<(), BankRefusal> {
+        fn validate_targets(
+            &mut self,
+            slots: &[Slot],
+            published: &[u32],
+        ) -> Result<(), BankRefusal> {
             self.trace.push("validate");
+            let published = legacy_indices_mask(published.iter().copied())?;
             if let Some((pins, retained)) = &self.provider_guard {
                 validate_provider_slots(slots, pins, published, |index| {
                     retained[index as usize].as_ref()
                 })?;
             }
+            self.targets = slots.to_vec();
             Ok(())
         }
 
@@ -2102,7 +2853,7 @@ mod tests {
             self.held.push(charge);
         }
 
-        fn allocate(&mut self, slot: u32) -> Result<(), BankRefusal> {
+        fn allocate_bank(&mut self, slot: u32) -> Result<u32, BankRefusal> {
             assert!(
                 !self.held.is_empty(),
                 "precharge precedes native allocation"
@@ -2114,27 +2865,34 @@ mod tests {
             if self.foreign_inner == Some(slot) {
                 self.inners.insert(slot, 99);
             }
-            Ok(())
+            if let Some((pins, retained)) = &mut self.provider_guard {
+                let target = self
+                    .targets
+                    .get(slot as usize)
+                    .ok_or(BankRefusal::Topology)?;
+                retained[slot as usize] = Some(
+                    pins.retain_inventory_target(target.object)
+                        .map_err(|_| BankRefusal::Ownership)?,
+                );
+            }
+            Ok(slot + 1)
         }
 
-        fn insert_inner(&mut self, slot: u32) -> Result<(), BankRefusal> {
+        fn insert_inner(&mut self, slot: u32, expected_id: u32) -> Result<(), BankRefusal> {
             self.trace.push("inner");
             if self.inners.contains_key(&slot) {
                 return Err(BankRefusal::Quarantined);
             }
-            self.inners.insert(slot, slot + 1);
+            self.inners.insert(slot, expected_id);
             Ok(())
         }
 
-        fn insert_metadata(
-            &mut self,
-            slot: u32,
-            metadata: BankMetadata,
-        ) -> Result<(), BankRefusal> {
+        fn insert_route(&mut self, slot: u32, route: CountsBankRoute) -> Result<(), BankRefusal> {
             self.trace.push("metadata");
             if self.fail == Some("metadata") || self.metadata.contains_key(&slot) {
                 return Err(BankRefusal::Native);
             }
+            let metadata = legacy_route(slot, route)?;
             self.metadata.insert(slot, metadata);
             Ok(())
         }
@@ -2144,18 +2902,53 @@ mod tests {
                 let metadata = self.metadata[&slot.index];
                 !self.commits.contains_key(&metadata.transaction)
             }));
-            self.trace.extend(["return", "entry"]);
+            self.trace.push("return");
+            self.returns.extend(slots.iter().map(|slot| slot.index));
+            self.trace.push("entry");
             if self.fail == Some("entry") {
                 return Err(BankRefusal::Links);
             }
+            self.entries.extend(slots.iter().map(|slot| slot.index));
             Ok(())
+        }
+
+        fn verify_candidate(&mut self, expected: &StagedExtent) -> CandidateCheck {
+            self.trace.push("verify");
+            if let Some((pins, retained)) = &self.provider_guard {
+                let Ok(all) = legacy_indices_mask(self.targets.iter().map(|slot| slot.index))
+                else {
+                    return CandidateCheck::Contradictory;
+                };
+                if validate_provider_slots(&self.targets, pins, all, |index| {
+                    retained[index as usize].as_ref()
+                })
+                .is_err()
+                {
+                    return CandidateCheck::Contradictory;
+                }
+            }
+            for &(slot, route) in &expected.routes {
+                let Ok(wire) = legacy_route(slot, route) else {
+                    return CandidateCheck::Contradictory;
+                };
+                if self.metadata.get(&slot) != Some(&wire)
+                    || self.inners.get(&route.bank) != Some(&route.inner_id)
+                    || !expected.bank_ids.contains(&(route.bank, route.inner_id))
+                    || !self.entries.contains(&slot)
+                    || !self.returns.contains(&slot)
+                {
+                    return CandidateCheck::Contradictory;
+                }
+            }
+            CandidateCheck::Exact
         }
 
         fn insert_commit(
             &mut self,
             transaction: u64,
-            commit: BankCommit,
+            commit: CountsBankCommit,
         ) -> Result<(), BankRefusal> {
+            let commit = legacy_commit(commit)?;
             self.trace.push("commit");
             self.attempted.insert(transaction);
             assert!(!self.commits.contains_key(&transaction));
@@ -2169,22 +2962,37 @@ mod tests {
             }
         }
 
-        fn acknowledge(&mut self, transaction: u64) -> CommitAck {
+        fn observe_commit(
+            &mut self,
+            transaction: u64,
+            expected: CountsBankCommit,
+        ) -> CommitObservation {
             self.trace.push("ack");
-            if self.attempted.contains(&transaction) && !self.acknowledgements.is_empty() {
-                return self.acknowledgements.remove(0);
-            }
-            match self.commits.get(&transaction) {
-                Some(commit) => CommitAck::Present(*commit),
-                None => CommitAck::Absent,
+            let acknowledgement =
+                if self.attempted.contains(&transaction) && !self.acknowledgements.is_empty() {
+                    self.acknowledgements.remove(0)
+                } else {
+                    match self.commits.get(&transaction) {
+                        Some(commit) => CommitAck::Present(*commit),
+                        None => CommitAck::Absent,
+                    }
+                };
+            match acknowledgement {
+                CommitAck::Absent => CommitObservation::Absent,
+                CommitAck::Present(actual) if legacy_commit(expected) == Ok(actual) => {
+                    CommitObservation::Exact
+                }
+                CommitAck::Present(_) => CommitObservation::Contradictory,
+                CommitAck::Unreadable => CommitObservation::Unreadable,
             }
         }
 
-        fn remove_metadata_owned(
+        fn remove_route_owned(
             &mut self,
             slot: u32,
-            expected: BankMetadata,
+            expected: CountsBankRoute,
         ) -> Result<(), BankRefusal> {
+            let expected = legacy_route(slot, expected)?;
             self.trace.push("remove-metadata");
             if self.failed_delete || self.metadata.get(&slot) != Some(&expected) {
                 return Err(BankRefusal::Ownership);
@@ -2193,20 +3001,28 @@ mod tests {
             Ok(())
         }
 
-        fn remove_inner_owned(&mut self, slot: u32) -> Result<(), BankRefusal> {
+        fn remove_new_bank_owned(
+            &mut self,
+            slot: u32,
+            expected_id: u32,
+        ) -> Result<(), BankRefusal> {
             self.trace.push("remove-inner");
-            if self.failed_delete || self.inners.get(&slot) != Some(&(slot + 1)) {
+            if self.failed_delete || self.inners.get(&slot) != Some(&expected_id) {
                 return Err(BankRefusal::Ownership);
             }
             self.inners.remove(&slot);
             Ok(())
         }
 
-        fn retire_links(&mut self, _: &[Slot]) -> Result<(), BankRefusal> {
+        fn retire_links(&mut self, slots: &[Slot]) -> Result<(), BankRefusal> {
             self.trace.push("retire-links");
             if self.failed_retire {
                 Err(BankRefusal::Links)
             } else {
+                for slot in slots {
+                    self.entries.remove(&slot.index);
+                    self.returns.remove(&slot.index);
+                }
                 Ok(())
             }
         }
@@ -2219,7 +3035,10 @@ mod tests {
         let mut native = Native::default();
         assert!(matches!(
             directory.stage_with(&mut native, &plan(2), reservation(), &pool.reserver()),
-            BankPublication::Published { mask: 3, .. }
+            BankPublication::Published {
+                extent: BankExtent { first: 0, end: 2 },
+                ..
+            }
         ));
         let return_at = native
             .trace
@@ -2265,7 +3084,7 @@ mod tests {
             BankPublication::Refused(BankRefusal::Budget)
         );
         assert!(native.trace.is_empty());
-        assert_eq!(directory.published_mask(), 0);
+        assert_eq!(directory.legacy_published_mask().unwrap(), 0);
         drop(native);
     }
 
@@ -2276,7 +3095,7 @@ mod tests {
         let mut native = Native::default();
         let BankPublication::Published {
             transaction: old,
-            mask: 1,
+            extent: BankExtent { first: 0, end: 1 },
         } = directory.stage_with(&mut native, &plan(1), reservation(), &pool.reserver())
         else {
             panic!("first real transaction did not publish");
@@ -2285,7 +3104,7 @@ mod tests {
         native.fail = Some("commit-ack-lost");
         let BankPublication::Published {
             transaction: new,
-            mask: 2,
+            extent: BankExtent { first: 1, end: 2 },
         } = directory.stage_with(&mut native, &plan(2), reservation(), &pool.reserver())
         else {
             panic!("matching readback must resolve lost syscall acknowledgement");
@@ -2296,7 +3115,7 @@ mod tests {
         assert_eq!(native.metadata[&1].transaction, new);
         assert_eq!(native.commits[&old].mask, 1);
         assert_eq!(native.commits[&new].mask, 2);
-        assert_eq!(directory.published_mask(), 3);
+        assert_eq!(directory.legacy_published_mask().unwrap(), 3);
         assert!(directory.validate_read_plan(&plan(2)).is_ok());
 
         let before = native.trace.len();
@@ -2311,7 +3130,7 @@ mod tests {
             before,
             "mismatch precedes native mutation"
         );
-        assert_eq!(directory.published_mask(), 3);
+        assert_eq!(directory.legacy_published_mask().unwrap(), 3);
     }
 
     #[test]
@@ -2333,7 +3152,7 @@ mod tests {
             assert!(native.inners.is_empty(), "{failure}");
             assert!(native.metadata.is_empty(), "{failure}");
             assert!(native.commits.is_empty(), "{failure}");
-            assert_eq!(directory.published_mask(), 0);
+            assert_eq!(directory.legacy_published_mask().unwrap(), 0);
             assert!(
                 !native.held.is_empty(),
                 "cleanup custody retains the charge"
@@ -2472,7 +3291,7 @@ mod tests {
         );
         assert_eq!(native.trace.len(), before);
         assert!(directory.validate_read_plan(&plan(1)).is_ok());
-        assert_eq!(directory.published_mask(), 1);
+        assert_eq!(directory.legacy_published_mask().unwrap(), 1);
     }
 
     #[test]
@@ -2524,7 +3343,7 @@ mod tests {
             directory.stage_with(&mut native, &selected, reservation(), &pool.reserver()),
             BankPublication::Published {
                 transaction: 1,
-                mask: 1
+                extent: BankExtent { first: 0, end: 1 }
             }
         ));
         let mut appended = plan(2);
@@ -2547,8 +3366,8 @@ mod tests {
             directory.stage_with(&mut native, &appended, reservation(), &pool.reserver()),
             BankPublication::Refused(BankRefusal::Ownership)
         );
-        assert_eq!(directory.published_mask(), 1);
-        assert_eq!(directory.allocated, 1);
+        assert_eq!(directory.legacy_published_mask().unwrap(), 1);
+        assert_eq!(directory.allocated_high_water(), 1);
         assert_eq!(directory.next_transaction.unwrap().get(), 2);
         assert_eq!(native.metadata.len(), 1);
         assert_eq!(native.commits.len(), 1);
@@ -2571,7 +3390,7 @@ mod tests {
             directory.stage_with(&mut native, &appended, reservation(), &pool.reserver()),
             BankPublication::Published {
                 transaction: 2,
-                mask: 2
+                extent: BankExtent { first: 1, end: 2 }
             }
         ));
         assert_eq!(native.metadata[&0].transaction, 1);
@@ -2621,15 +3440,18 @@ mod tests {
         .unwrap();
         assert!(matches!(
             directory.stage_with(&mut native, &first, reservation(), &pool.reserver()),
-            BankPublication::Published { mask: 1, .. }
+            BankPublication::Published {
+                extent: BankExtent { first: 0, end: 1 },
+                ..
+            }
         ));
         let before = native.trace.len();
         assert_eq!(
             directory.stage_with(&mut native, &duplicate, reservation(), &pool.reserver()),
             BankPublication::Refused(BankRefusal::Ownership)
         );
-        assert_eq!(directory.published_mask(), 1);
-        assert_eq!(directory.allocated, 1);
+        assert_eq!(directory.legacy_published_mask().unwrap(), 1);
+        assert_eq!(directory.allocated_high_water(), 1);
         assert_eq!(native.commits.len(), 1);
         assert!(!native.trace[before..].contains(&"allocate"));
         let (pins, retained) = native.provider_guard.as_ref().unwrap();
@@ -2696,6 +3518,15 @@ mod tests {
                 || Ok(2)
             ),
             Err(BankRefusal::Quarantined)
+        ));
+        *banks.directory.lock().unwrap() = BankDirectory::counts_growth_v2();
+        assert!(matches!(
+            reader_profile_with(
+                Some(&banks),
+                |_| panic!("incomplete format2 must refuse before map I/O"),
+                || panic!("incomplete format2 must refuse before CPU I/O")
+            ),
+            Err(BankRefusal::Shape)
         ));
     }
 

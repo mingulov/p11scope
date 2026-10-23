@@ -1718,11 +1718,12 @@ mod tests {
         };
         let BankPublication::Published {
             transaction: old_transaction,
-            mask: 1,
+            extent,
         } = session.stage_counter_banks(&first, &pins, stage, &pool.reserver())
         else {
             panic!("first actual bank did not publish");
         };
+        assert_eq!((extent.first, extent.end), (0, 1));
         let binding = session.counter_reader_binding().unwrap().unwrap();
         assert_eq!(binding.mode(), CounterMode::Counts);
         assert_eq!(
@@ -1791,11 +1792,12 @@ mod tests {
         }
         let BankPublication::Published {
             transaction: new_transaction,
-            mask: 2,
+            extent,
         } = session.stage_counter_banks(&grown, &pins, stage, &pool.reserver())
         else {
             panic!("actual append did not publish");
         };
+        assert_eq!((extent.first, extent.end), (1, 2));
         assert!(new_transaction > old_transaction);
         fixture.command(b'H');
         fixture.token("HOT");

@@ -21,6 +21,25 @@ typedef unsigned long long u64;
 struct bank_counts { u64 entered; u64 returned; u64 errors; };
 struct bank_metadata { u64 transaction; u64 bank_mask; u32 logical_slot; u32 cells; };
 struct bank_commit { u64 bank_mask; u64 configuration; };
+/* Additive format2 ABI declarations only: no map or producer selects these
+ * until the separately reviewed geometry/native/reader conversion coheres. */
+struct counts_bank_route {
+    u64 transaction;
+    u32 first, end, bank, cell, inner_id, reserved_zero;
+};
+struct counts_bank_commit { u32 first, end; u64 configuration; };
+_Static_assert(sizeof(struct counts_bank_route) == 32, "format2 route ABI");
+_Static_assert(__builtin_offsetof(struct counts_bank_route, transaction) == 0, "route transaction");
+_Static_assert(__builtin_offsetof(struct counts_bank_route, first) == 8, "route first");
+_Static_assert(__builtin_offsetof(struct counts_bank_route, end) == 12, "route end");
+_Static_assert(__builtin_offsetof(struct counts_bank_route, bank) == 16, "route bank");
+_Static_assert(__builtin_offsetof(struct counts_bank_route, cell) == 20, "route cell");
+_Static_assert(__builtin_offsetof(struct counts_bank_route, inner_id) == 24, "route inner ID");
+_Static_assert(__builtin_offsetof(struct counts_bank_route, reserved_zero) == 28, "route reserved");
+_Static_assert(sizeof(struct counts_bank_commit) == 16, "format2 commit ABI");
+_Static_assert(__builtin_offsetof(struct counts_bank_commit, first) == 0, "commit first");
+_Static_assert(__builtin_offsetof(struct counts_bank_commit, end) == 4, "commit end");
+_Static_assert(__builtin_offsetof(struct counts_bank_commit, configuration) == 8, "commit configuration");
 struct owner_start_key { u64 pid_tgid; u32 slot; u32 pad; };
 struct bank_rv_key { u32 slot; u32 pad; u64 rv; };
 _Static_assert(sizeof(struct bank_counts) == 24, "Counts ABI");

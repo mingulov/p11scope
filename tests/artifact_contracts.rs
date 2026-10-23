@@ -9590,7 +9590,11 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
         ),
         (
             "quarantine",
-            "if: failure()",
+            concat!(
+                "if: ${{ failure() && (needs.tests.result == 'failure' || ",
+                "needs.contracts.result == 'failure' || needs.scripts.result == 'failure' || ",
+                "needs.bpf-noninterference.result == 'failure') }}",
+            ),
             &["scripts/run-flake-quarantine.sh"],
         ),
     ];
@@ -9995,11 +9999,17 @@ fn hosted_pipeline_retains_the_job_log() {
     ] {
         assert!(archive.contains(required), "archive-log lacks {required:?}");
     }
-    // Triage evidence fires on a failure of ANY check job, never only one.
+    // Keep every dependency, but auxiliary flake triage follows test-lane
+    // failures. Lint/audit failures keep their required gates red alone.
     let quarantine = job_block(&ci, "quarantine");
+    let quarantine_gate = concat!(
+        "    if: ${{ failure() && (needs.tests.result == 'failure' || ",
+        "needs.contracts.result == 'failure' || needs.scripts.result == 'failure' || ",
+        "needs.bpf-noninterference.result == 'failure') }}\n",
+    );
     assert!(
-        quarantine.starts_with(&format!("{needs}    if: failure()\n")),
-        "quarantine must need every check job and run only on failure"
+        quarantine.starts_with(&format!("{needs}{quarantine_gate}")),
+        "quarantine must need every check job and run only on a relevant test failure"
     );
 }
 

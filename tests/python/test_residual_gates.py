@@ -288,8 +288,40 @@ class ResidualGates(unittest.TestCase):
     def test_quarantine_tool_cache_preserves_failure_policy(self):
         block = ci_text().split("\n  quarantine:\n", 1)[1]
         self.assertTrue(block.startswith(
-            "    needs: [lint, audit, tests, bpf-noninterference, contracts, scripts]\n"
-            "    if: failure()\n"))
+            "    needs: [lint, audit, tests, bpf-noninterference, contracts, scripts]\n"))
+        condition = block.splitlines()[1].strip()
+        prefix, suffix = "if: ${{ failure() && (", ") }}"
+        self.assertTrue(condition.startswith(prefix) and condition.endswith(suffix), condition)
+        terms = condition[len(prefix):-len(suffix)].split(" || ")
+        test_jobs = ("tests", "contracts", "scripts", "bpf-noninterference")
+        self.assertEqual(terms, [f"needs.{job}.result == 'failure'" for job in test_jobs])
+        selected_jobs = [term.split(".")[1] for term in terms]
+        check_jobs = ("lint", "audit", *test_jobs)
+        # The fixed failure()/OR form is pinned above. These local result
+        # vectors check its selected terms; GitHub scheduling still needs CI.
+        cases = (
+            ("success", {}, False),
+            ("lint-only", {"lint": "failure"}, False),
+            ("audit-only", {"audit": "failure"}, False),
+            ("lint-and-audit", {"lint": "failure", "audit": "failure"}, False),
+            ("tests", {"tests": "failure"}, True),
+            ("contracts", {"contracts": "failure"}, True),
+            ("scripts", {"scripts": "failure"}, True),
+            ("bpf", {"bpf-noninterference": "failure"}, True),
+            ("mixed-lint", {"lint": "failure", "tests": "failure"}, True),
+            ("mixed-audit", {"audit": "failure", "contracts": "failure"}, True),
+            ("cancelled", dict.fromkeys(check_jobs, "cancelled"), False),
+            ("cancelled-test", {"tests": "cancelled"}, False),
+            ("lint-and-cancelled", {"lint": "failure", "tests": "cancelled"}, False),
+            ("skipped", dict.fromkeys(check_jobs, "skipped"), False),
+        )
+        for name, overrides, expected in cases:
+            with self.subTest(trigger=name):
+                results = dict.fromkeys(check_jobs, "success")
+                results.update(overrides)
+                selected = "failure" in results.values() and any(
+                    results[job] == "failure" for job in selected_jobs)
+                self.assertEqual(selected, expected)
         self.assertIn("      - id: bpf-linker\n", block)
         self.assertIn("          path: ~/.cargo/bin/bpf-linker\n", block)
         self.assertIn(

@@ -1369,6 +1369,142 @@ struct SwapChild {
     addresses: Vec<u64>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct BindSetupError {
+    stage: &'static str,
+    errno: i32,
+}
+
+/// Child-local reply: stage, errno, address, actual opened-file dev and ino.
+/// All words are initialized integers; this is private to one fork's pipe.
+fn decode_bind_ready(words: [u64; 5]) -> Result<(u64, FileIdentity), BindSetupError> {
+    let protocol = || BindSetupError {
+        stage: "reply",
+        errno: libc::EPROTO,
+    };
+    if words[0] != 0 {
+        let stage = match words[0] {
+            1 => "unshare",
+            2 => "make-private",
+            3 => "bind",
+            4 => "open-alias",
+            5 => "stat-alias",
+            6 => "stat-held-source",
+            7 => "source-identity",
+            8 => "mmap",
+            9 => "stat-child-namespace",
+            10 => "namespace-unchanged",
+            _ => return Err(protocol()),
+        };
+        let errno = i32::try_from(words[1])
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or_else(protocol)?;
+        return Err(BindSetupError { stage, errno });
+    }
+    if words[1] != 0 || words[2] == 0 || words[2].checked_add(4096).is_none() || words[4] == 0 {
+        return Err(protocol());
+    }
+    Ok((
+        words[2],
+        FileIdentity {
+            dev: words[3],
+            ino: words[4],
+        },
+    ))
+}
+
+fn read_bind_ready(fd: std::os::fd::BorrowedFd<'_>) -> Result<(u64, FileIdentity), BindSetupError> {
+    use std::os::fd::AsRawFd as _;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut bytes = [0u8; 40];
+    let mut have = 0;
+    while have < bytes.len() {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(BindSetupError {
+                stage: "ready-deadline",
+                errno: libc::ETIMEDOUT,
+            });
+        }
+        let mut poll = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one initialized pollfd, followed by a read into the owned buffer.
+        let ready = unsafe { libc::poll(&raw mut poll, 1, remaining.as_millis().max(1) as i32) };
+        if ready < 0 {
+            let errno = std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO);
+            if errno == libc::EINTR {
+                continue;
+            }
+            return Err(BindSetupError {
+                stage: "ready-poll",
+                errno,
+            });
+        }
+        if ready == 0 {
+            continue;
+        }
+        // SAFETY: the remaining slice is writable and the polled descriptor is live.
+        let got = unsafe {
+            libc::read(
+                fd.as_raw_fd(),
+                bytes[have..].as_mut_ptr().cast(),
+                bytes.len() - have,
+            )
+        };
+        if got <= 0 {
+            let errno = if got == 0 {
+                libc::EPIPE
+            } else {
+                std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO)
+            };
+            if errno == libc::EINTR {
+                continue;
+            }
+            return Err(BindSetupError {
+                stage: "ready-read",
+                errno,
+            });
+        }
+        have += got as usize;
+    }
+    decode_bind_ready(std::array::from_fn(|index| {
+        u64::from_ne_bytes(bytes[index * 8..(index + 1) * 8].try_into().unwrap())
+    }))
+}
+
+fn reap_owned_swap_child(pid: libc::pid_t) {
+    // SAFETY: this PID is an owned, unreaped fork child, including startup failures.
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+        loop {
+            if libc::waitpid(pid, std::ptr::null_mut(), 0) >= 0 {
+                break;
+            }
+            if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                break;
+            }
+        }
+    }
+}
+
+struct PendingBindChild(Option<libc::pid_t>);
+
+impl Drop for PendingBindChild {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            reap_owned_swap_child(pid);
+        }
+    }
+}
+
 impl SwapChild {
     /// One executable mapping of `path`, as a loaded library's text.
     fn spawn(path: &std::path::Path) -> Self {
@@ -1461,6 +1597,197 @@ impl SwapChild {
         }
     }
 
+    /// One child-private bind mount and mapping. The parent never enters the
+    /// namespace or mounts anything. Setup errors are returned, never a skip.
+    fn spawn_private_bind(
+        source: &std::path::Path,
+        held_source: &std::fs::File,
+        alias: &std::path::Path,
+        executable: bool,
+    ) -> Result<(Self, FileIdentity), BindSetupError> {
+        use std::os::fd::{AsFd as _, AsRawFd as _, FromRawFd as _, OwnedFd};
+        use std::os::unix::fs::MetadataExt as _;
+        let path = |path: &std::path::Path| {
+            std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| {
+                BindSetupError {
+                    stage: "path",
+                    errno: libc::EINVAL,
+                }
+            })
+        };
+        let source = path(source)?;
+        let alias = path(alias)?;
+        let parent_namespace =
+            std::fs::metadata("/proc/self/ns/mnt").map_err(|error| BindSetupError {
+                stage: "stat-parent-namespace",
+                errno: error.raw_os_error().unwrap_or(libc::EIO),
+            })?;
+        let parent_namespace = (parent_namespace.dev(), parent_namespace.ino());
+        let pipe = || -> Result<(OwnedFd, OwnedFd), BindSetupError> {
+            let mut fds = [0; 2];
+            // SAFETY: pipe2 initializes two new owned descriptors on success.
+            if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+                return Err(BindSetupError {
+                    stage: "pipe",
+                    errno: std::io::Error::last_os_error()
+                        .raw_os_error()
+                        .unwrap_or(libc::EIO),
+                });
+            }
+            // SAFETY: successful pipe2 returned two new, independently owned fds.
+            Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+        };
+        let (down_read, down_write) = pipe()?;
+        let (up_read, up_write) = pipe()?;
+        let protection = libc::PROT_READ | if executable { libc::PROT_EXEC } else { 0 };
+        // SAFETY: child uses only raw syscalls, fixed stack buffers and paths
+        // allocated before fork; it never returns into the Rust test harness.
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            return Err(BindSetupError {
+                stage: "fork",
+                errno: std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO),
+            });
+        }
+        if pid == 0 {
+            // SAFETY: syscall arguments refer to inherited live fds/paths or
+            // initialized stack buffers. Every error reports and calls _exit.
+            unsafe {
+                libc::close(down_write.as_raw_fd());
+                libc::close(up_read.as_raw_fd());
+                let report = |words: [u64; 5]| {
+                    let mut sent = 0;
+                    while sent < 40 {
+                        let got = libc::write(
+                            up_write.as_raw_fd(),
+                            words.as_ptr().cast::<u8>().add(sent).cast(),
+                            40 - sent,
+                        );
+                        if got < 0 && *libc::__errno_location() == libc::EINTR {
+                            continue;
+                        }
+                        if got <= 0 {
+                            libc::_exit(99);
+                        }
+                        sent += got as usize;
+                    }
+                };
+                let fail = |stage: u64, errno: i32| -> ! {
+                    report([stage, errno as u64, 0, 0, 0]);
+                    libc::_exit(100 + stage as i32);
+                };
+                if libc::syscall(libc::SYS_unshare, libc::CLONE_NEWNS) != 0 {
+                    fail(1, *libc::__errno_location());
+                }
+                let mut namespace = std::mem::MaybeUninit::<libc::stat>::uninit();
+                if libc::stat(c"/proc/self/ns/mnt".as_ptr(), namespace.as_mut_ptr()) != 0 {
+                    fail(9, *libc::__errno_location());
+                }
+                let namespace = namespace.assume_init();
+                if (namespace.st_dev, namespace.st_ino) == parent_namespace {
+                    fail(10, libc::EXDEV);
+                }
+                if libc::syscall(
+                    libc::SYS_mount,
+                    std::ptr::null::<libc::c_char>(),
+                    c"/".as_ptr(),
+                    std::ptr::null::<libc::c_char>(),
+                    libc::MS_REC | libc::MS_PRIVATE,
+                    std::ptr::null::<libc::c_void>(),
+                ) != 0
+                {
+                    fail(2, *libc::__errno_location());
+                }
+                // Resolve this owned source in the new namespace. An inherited
+                // /proc/self/fd source still belongs to the parent's mount tree.
+                if libc::syscall(
+                    libc::SYS_mount,
+                    source.as_ptr(),
+                    alias.as_ptr(),
+                    std::ptr::null::<libc::c_char>(),
+                    libc::MS_BIND,
+                    std::ptr::null::<libc::c_void>(),
+                ) != 0
+                {
+                    fail(3, *libc::__errno_location());
+                }
+                let fd = libc::open(
+                    alias.as_ptr(),
+                    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                );
+                if fd < 0 {
+                    fail(4, *libc::__errno_location());
+                }
+                let mut mapped = std::mem::MaybeUninit::<libc::stat>::uninit();
+                let mut held = std::mem::MaybeUninit::<libc::stat>::uninit();
+                if libc::fstat(fd, mapped.as_mut_ptr()) != 0 {
+                    fail(5, *libc::__errno_location());
+                }
+                if libc::fstat(held_source.as_raw_fd(), held.as_mut_ptr()) != 0 {
+                    fail(6, *libc::__errno_location());
+                }
+                let (mapped, held) = (mapped.assume_init(), held.assume_init());
+                if (mapped.st_dev, mapped.st_ino) != (held.st_dev, held.st_ino) {
+                    fail(7, libc::EXDEV);
+                }
+                let first = libc::mmap(
+                    std::ptr::null_mut(),
+                    4096,
+                    protection,
+                    libc::MAP_PRIVATE,
+                    fd,
+                    0,
+                );
+                let map_errno = *libc::__errno_location();
+                libc::close(fd);
+                if first == libc::MAP_FAILED {
+                    fail(8, map_errno);
+                }
+                report([0, 0, first as u64, mapped.st_dev, mapped.st_ino]);
+                let mut command = 0u8;
+                loop {
+                    let got = libc::read(down_read.as_raw_fd(), (&raw mut command).cast(), 1);
+                    if got < 0 && *libc::__errno_location() == libc::EINTR {
+                        continue;
+                    }
+                    if got != 1 || command != b's' {
+                        break;
+                    }
+                    libc::munmap(first, 4096);
+                    let fd = libc::open(alias.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
+                    let again = libc::mmap(
+                        first,
+                        4096,
+                        protection,
+                        libc::MAP_PRIVATE | libc::MAP_FIXED_NOREPLACE,
+                        fd,
+                        0,
+                    );
+                    libc::close(fd);
+                    let ok = u8::from(again == first);
+                    if libc::write(up_write.as_raw_fd(), (&raw const ok).cast(), 1) != 1 {
+                        break;
+                    }
+                }
+                libc::_exit(0);
+            }
+        }
+        let mut pending = PendingBindChild(Some(pid));
+        drop((down_read, up_write));
+        let (address, identity) = read_bind_ready(up_read.as_fd())?;
+        let child = Self {
+            pid,
+            command: down_write,
+            reply: up_read,
+            address,
+            addresses: vec![address],
+        };
+        pending.0 = None;
+        Ok((child, identity))
+    }
+
     fn remap(&self) {
         use std::os::fd::AsRawFd as _;
         let mut ok = 0u8;
@@ -1491,11 +1818,139 @@ impl SwapChild {
 
 impl Drop for SwapChild {
     fn drop(&mut self) {
-        // SAFETY: our own child; reaped here.
+        reap_owned_swap_child(self.pid);
+    }
+}
+
+#[test]
+fn d4_bind_startup_reply_requires_success_and_a_valid_mapping() {
+    let healthy = [0, 0, 0x1000, 37, 123];
+    let expected = (0x1000, FileIdentity { dev: 37, ino: 123 });
+    assert_eq!(decode_bind_ready(healthy), Ok(expected));
+    assert_eq!(
+        decode_bind_ready([1, libc::EPERM as u64, 0, 0, 0]),
+        Err(BindSetupError {
+            stage: "unshare",
+            errno: libc::EPERM
+        })
+    );
+    assert_eq!(
+        decode_bind_ready([3, libc::EACCES as u64, 0, 0, 0]),
+        Err(BindSetupError {
+            stage: "bind",
+            errno: libc::EACCES
+        })
+    );
+    assert_eq!(
+        decode_bind_ready([7, libc::EXDEV as u64, 0, 0, 0]),
+        Err(BindSetupError {
+            stage: "source-identity",
+            errno: libc::EXDEV
+        })
+    );
+    for invalid in [
+        [0, 1, 0x1000, 37, 123],
+        [0, 0, 0, 37, 123],
+        [0, 0, u64::MAX, 37, 123],
+        [0, 0, 0x1000, 37, 0],
+        [11, 1, 0, 0, 0],
+    ] {
+        assert!(decode_bind_ready(invalid).is_err());
+        assert_eq!(decode_bind_ready(healthy), Ok(expected));
+    }
+}
+
+#[test]
+fn d4_bind_startup_eof_reaps_the_owned_child() {
+    use std::os::fd::{AsFd as _, FromRawFd as _, OwnedFd};
+    let mut fds = [0; 2];
+    // SAFETY: pipe2 writes two newly owned descriptors into the live array.
+    assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+    // SAFETY: successful pipe2 returned both fds, each adopted once.
+    let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    // SAFETY: the child only closes raw fds and exits without entering Rust.
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0);
+    if pid == 0 {
+        // SAFETY: only inherited descriptors and _exit in the fork child.
         unsafe {
-            libc::kill(self.pid, libc::SIGKILL);
-            libc::waitpid(self.pid, std::ptr::null_mut(), 0);
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+            libc::_exit(0);
         }
+    }
+    let pending = PendingBindChild(Some(pid));
+    drop(write);
+    assert_eq!(
+        read_bind_ready(read.as_fd()),
+        Err(BindSetupError {
+            stage: "ready-read",
+            errno: libc::EPIPE
+        })
+    );
+    drop(pending);
+    // SAFETY: querying only this test's PID; the guard must already have reaped it.
+    assert_eq!(
+        unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) },
+        -1
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ECHILD)
+    );
+}
+
+fn d4_private_bind_mount(mountinfo: &str, alias: &std::path::Path) -> Result<(), &'static str> {
+    let escaped = alias
+        .to_str()
+        .ok_or("non-UTF8 fixture path")?
+        .replace('\\', "\\134")
+        .replace(' ', "\\040")
+        .replace('\t', "\\011")
+        .replace('\n', "\\012");
+    let mut found = false;
+    for line in mountinfo.lines() {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.get(4) != Some(&escaped.as_str()) {
+            continue;
+        }
+        if found {
+            return Err("duplicate alias mount");
+        }
+        let separator = fields
+            .iter()
+            .position(|field| *field == "-")
+            .ok_or("malformed alias mount")?;
+        if separator < 6 || fields.get(separator + 1) != Some(&"btrfs") {
+            return Err("alias is not a Btrfs mount");
+        }
+        if fields[6..separator].iter().any(|field| {
+            field.starts_with("shared:")
+                || field.starts_with("master:")
+                || field.starts_with("propagate_from:")
+        }) {
+            return Err("alias mount propagates");
+        }
+        found = true;
+    }
+    if found { Ok(()) } else { Err("no alias mount") }
+}
+
+#[test]
+fn d4_bind_mountinfo_requires_one_private_btrfs_alias() {
+    let alias = std::path::Path::new("/owned/libalias.so");
+    let healthy =
+        "72 25 0:47 /owned/liboriginal.so /owned/libalias.so rw - btrfs /dev/fixture rw\n";
+    assert_eq!(d4_private_bind_mount(healthy, alias), Ok(()));
+    for bad in [
+        healthy.replace(" rw -", " rw shared:1 -"),
+        healthy.replace(" rw -", " rw master:1 -"),
+        healthy.replace("btrfs", "tmpfs"),
+        healthy.replace("/owned/libalias.so", "/other/libalias.so"),
+        format!("{healthy}{healthy}"),
+    ] {
+        assert!(d4_private_bind_mount(&bad, alias).is_err());
+        assert_eq!(d4_private_bind_mount(healthy, alias), Ok(()));
     }
 }
 
@@ -3813,6 +4268,272 @@ fn privileged_d4_btrfs_hardlink_alias_backend_parity() {
         .expect("remove owned kernel probe directory");
     dir.close()
         .expect("remove owned hardlink fixture directory and files");
+}
+
+/// The same alias pathname names A in child-private bind namespaces and an
+/// equal-byte, physically different B in the observer's namespace. Actual
+/// attribution must follow the live mapping and held A pin on both backends;
+/// opening that pathname in the observer would reach the wrong file.
+/// This is one bind substrate control, not whole-row D4 qualification.
+#[test]
+#[ignore = "root Btrfs disk TMPDIR, private mount namespaces and eligible BTF/task_vma identity; actual bind alias parity"]
+fn privileged_d4_btrfs_bind_alias_backend_parity() {
+    use crate::discovery::identity::{
+        PinnedObjects, map_files_identity, test_fixture::real_scan_pin,
+    };
+    use crate::discovery::kernel_identity::IdentitySession;
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::{FileExt as _, MetadataExt as _};
+
+    let namespace_id = |pid: u32| {
+        let metadata = std::fs::metadata(format!("/proc/{pid}/ns/mnt")).unwrap();
+        (metadata.dev(), metadata.ino())
+    };
+    crate::attach::identity_iter::ensure_kernel_identity_btf()
+        .expect("required kernel identity capability; refusal cannot qualify");
+    let btf = aya::Btf::from_sys_fs().expect("readable host BTF");
+    let dir = tempfile::tempdir().unwrap();
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    let c_parent = std::ffi::CString::new(dir.path().as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: a valid path and writable statfs buffer, read only on success.
+    assert_eq!(
+        unsafe { libc::statfs(c_parent.as_ptr(), stat.as_mut_ptr()) },
+        0
+    );
+    // SAFETY: initialized by successful statfs above.
+    let magic = unsafe { stat.assume_init().f_type } as u64 & 0xffff_ffff;
+    assert_eq!(magic, 0x9123_683e, "actual fixture TMPDIR must be Btrfs");
+    let original_path = dir.path().join("liboriginal.so");
+    let alias_path = dir.path().join("libalias.so");
+    let bytes = vec![0x5au8; 8192];
+    std::fs::write(&original_path, &bytes).unwrap();
+    std::fs::copy(&original_path, &alias_path).unwrap();
+    let a_file = std::fs::File::open(&original_path).unwrap();
+    let b_file = std::fs::File::open(&alias_path).unwrap();
+    let a = a_file.metadata().unwrap();
+    let b = b_file.metadata().unwrap();
+    let a_identity = FileIdentity {
+        dev: a.dev(),
+        ino: a.ino(),
+    };
+    let b_identity = FileIdentity {
+        dev: b.dev(),
+        ino: b.ino(),
+    };
+    assert_ne!(
+        a_identity, b_identity,
+        "parent alias is an actual different physical file"
+    );
+    for file in [&a_file, &b_file] {
+        let mut held_bytes = vec![0; bytes.len()];
+        file.read_exact_at(&mut held_bytes, 0).unwrap();
+        assert_eq!(
+            held_bytes, bytes,
+            "equal bytes independently read from held FDs"
+        );
+    }
+    let parent_namespace = namespace_id(std::process::id());
+    let parent_mounts = std::fs::read("/proc/self/mountinfo").unwrap();
+    let parent_unchanged = || {
+        assert_eq!(namespace_id(std::process::id()), parent_namespace);
+        assert_eq!(
+            std::fs::read("/proc/self/mountinfo").unwrap(),
+            parent_mounts,
+            "parent mount tree and propagation remain unchanged"
+        );
+        let current = std::fs::metadata(&alias_path).unwrap();
+        assert_eq!(
+            (current.dev(), current.ino()),
+            (b_identity.dev, b_identity.ino),
+            "the parent alias still opens B"
+        );
+    };
+    let (caller, caller_identity) =
+        SwapChild::spawn_private_bind(&original_path, &a_file, &alias_path, true)
+            .expect("required private bind setup; namespace/mount refusal cannot qualify");
+    parent_unchanged();
+    let copied = SwapChild::spawn(&alias_path);
+    let (reader, reader_identity) =
+        SwapChild::spawn_private_bind(&original_path, &a_file, &alias_path, false)
+            .expect("required data-only private bind setup; refusal cannot qualify");
+    parent_unchanged();
+    assert_eq!(caller_identity, a_identity, "mmap used an FD of held A");
+    assert_eq!(
+        reader_identity, a_identity,
+        "data mapping used an FD of held A"
+    );
+    assert_ne!(namespace_id(caller.pid as u32), parent_namespace);
+    assert_ne!(namespace_id(reader.pid as u32), parent_namespace);
+    assert_ne!(
+        namespace_id(caller.pid as u32),
+        namespace_id(reader.pid as u32)
+    );
+    assert_eq!(namespace_id(copied.pid as u32), parent_namespace);
+    for child in [&caller, &reader] {
+        let mountinfo = std::fs::read_to_string(format!("/proc/{}/mountinfo", child.pid)).unwrap();
+        d4_private_bind_mount(&mountinfo, &alias_path)
+            .expect("actual private Btrfs alias mount in the child's namespace");
+    }
+    let snapshots = [caller.maps(), copied.maps(), reader.maps()];
+    let line_at = |position: usize, child: &SwapChild| {
+        snapshots[position]
+            .iter()
+            .find(|entry| (entry.start, entry.end) == (child.address, child.address + 4096))
+            .expect("the actual live mapping")
+    };
+    let bound_text = line_at(0, &caller);
+    let copy_text = line_at(1, &copied);
+    let bound_data = line_at(2, &reader);
+    assert_eq!(bound_text.permissions, *b"r-xp");
+    assert_eq!(copy_text.permissions, *b"r-xp");
+    assert_eq!(bound_data.permissions, *b"r--p");
+    for entry in [bound_text, copy_text, bound_data] {
+        assert_eq!(
+            entry.raw_path.as_deref(),
+            Some(alias_path.as_os_str().as_encoded_bytes()),
+            "the same actual maps pathname denotes different files by namespace"
+        );
+    }
+    // Independent fixture truth, outside the required kernel legs. File
+    // metadata is never compared with the lexical maps device domain.
+    for (child, expected) in [
+        (&caller, a_identity),
+        (&copied, b_identity),
+        (&reader, a_identity),
+    ] {
+        assert_eq!(
+            map_files_identity(child.pid as u32, child.address, child.address + 4096).unwrap(),
+            expected
+        );
+    }
+    let key = ObjectKey::of(bound_text);
+    let copy_key = ObjectKey::of(copy_text);
+    assert_eq!(ObjectKey::of(bound_data), key);
+    assert_ne!(copy_key, key);
+    let digest = p11scope_manifest::identity::hex(&Sha256::digest(&bytes));
+    let pins: PinnedObjects = real_scan_pin(&original_path, Some(key), 0, &digest);
+    let pin = pins.pinned().next().expect("actual original-file pin");
+    let object = pin.id;
+    assert_eq!(pin.path, original_path.to_str().unwrap());
+    let pinned = pins.file_for(object).unwrap().metadata().unwrap();
+    assert_eq!(
+        (pinned.dev(), pinned.ino()),
+        (a_identity.dev, a_identity.ino)
+    );
+    let (userspace_index, refused) = KnownKeyIndex::build(
+        [(key, Some(object))],
+        &BTreeMap::from([(key, object)]),
+        [],
+        &pins,
+    );
+    assert!(refused.is_empty(), "{refused:?}");
+    assert_eq!(userspace_index.classify(copy_key), KeyClass::Unexamined);
+    let proof_keys = userspace_index.map_files_keys();
+    assert!(proof_keys.contains(&key));
+    assert_eq!(
+        proof_ranges(&snapshots[0], &proof_keys),
+        [(caller.address, caller.address + 4096)]
+    );
+    for snapshot in &snapshots[1..] {
+        assert!(proof_ranges(snapshot, &proof_keys).is_empty());
+    }
+    let probe_dir = tempfile::tempdir().unwrap();
+    let mut session = IdentitySession::probe_and_load(&btf, probe_dir.path())
+        .expect("actual strict-loaded kernel session; no refused/fallback positive");
+    for (position, child) in [&caller, &copied, &reader].into_iter().enumerate() {
+        let userspace = attribute_child(child, snapshots[position].clone(), &userspace_index);
+        let kernel = d4_kernel_collision_attribution(
+            child,
+            snapshots[position].clone(),
+            &pins,
+            object,
+            key,
+            &mut session,
+            position as u64 + 1,
+        );
+        for (backend, out) in [("userspace", &userspace), ("kernel", &kernel)] {
+            assert!(out.losses.is_empty(), "{backend}: {:?}", out.member_losses);
+            assert_eq!(out.unavailable, 0);
+            assert!(out.exited.is_empty());
+            if position == 0 {
+                assert_eq!(
+                    out.members
+                        .iter()
+                        .map(|member| member.pid)
+                        .collect::<Vec<_>>(),
+                    [caller.pid as u32]
+                );
+                assert_eq!(
+                    out.members[0]
+                        .objects
+                        .iter()
+                        .map(|matched| (matched.key, matched.object, matched.path.as_str()))
+                        .collect::<Vec<_>>(),
+                    [(key, object, alias_path.to_str().unwrap())],
+                    "{backend}: bind alias attributes held A despite parent pathname B"
+                );
+                assert_eq!(
+                    out.probed, 1,
+                    "{backend}: actual executable positive demand"
+                );
+            } else {
+                assert!(out.members.is_empty(), "{backend}: {:?}", out.members);
+                assert_eq!(
+                    out.probed, 0,
+                    "{backend}: unknown copy/data-only alias needs no provider proof"
+                );
+                if position == 1 {
+                    assert!(
+                        out.unexamined_objects.contains(&copy_key),
+                        "{backend}: the same-path parent copy remains unexamined"
+                    );
+                    assert!(
+                        out.unexamined
+                            .get(&(copied.pid as u32))
+                            .is_some_and(|count| *count > 0)
+                    );
+                } else {
+                    assert!(!out.unexamined_objects.contains(&key));
+                }
+            }
+        }
+        assert_eq!(userspace.members, kernel.members);
+        assert_eq!(userspace.losses, kernel.losses);
+        assert_eq!(userspace.unexamined_objects, kernel.unexamined_objects);
+        assert_eq!(userspace.unexamined, kernel.unexamined);
+        parent_unchanged();
+    }
+    assert!(
+        pins.object_unchanged(object)
+            .expect("actual pin remains unchanged")
+    );
+    for (file, expected) in [(&a_file, a_identity), (&b_file, b_identity)] {
+        let metadata = file.metadata().unwrap();
+        assert_eq!(
+            (metadata.dev(), metadata.ino()),
+            (expected.dev, expected.ino)
+        );
+        assert_eq!(metadata.len(), bytes.len() as u64);
+        let mut held_bytes = vec![0; bytes.len()];
+        file.read_exact_at(&mut held_bytes, 0).unwrap();
+        assert_eq!(held_bytes, bytes);
+    }
+    eprintln!(
+        "D4_BTRFS_BIND callers={}/{}/{} userspace=1/0/0 kernel=1/0/0 parent_alias=B child_alias=A private_namespaces=true parent_mounts_unchanged=true generations=1/2/3 fallback=none",
+        caller.pid, copied.pid, reader.pid
+    );
+    // No retained namespace/root/map_files handles remain. Reaping the
+    // children releases their private namespaces and bind mounts; the
+    // parent never performs setns or an unmount.
+    drop((session, pins));
+    drop((caller, copied, reader));
+    parent_unchanged();
+    drop((a_file, b_file));
+    probe_dir
+        .close()
+        .expect("remove owned kernel probe directory");
+    dir.close()
+        .expect("remove owned bind fixture files and directory");
 }
 
 /// Root with a loop-mounted ext4: there a held file's maps key is its

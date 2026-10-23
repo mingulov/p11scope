@@ -1643,6 +1643,9 @@ pub(crate) enum AppliedPassPhase {
 
 #[cfg_attr(not(test), allow(dead_code))] // B1 consumes the owned outcome before activation.
 pub(crate) enum RetainedPass {
+    /// Publication began before any new pass. Never fabricate a collection
+    /// or report just to return the existing driver/native ownership.
+    BeforeCollection,
     Collected {
         collected: CollectedPass,
         scan_now_ns: u64,
@@ -1653,8 +1656,9 @@ pub(crate) enum RetainedPass {
     },
 }
 
-/// One existing pass and native lane, with the loop's original stop
-/// accounting. This is not a second work queue or a terminal receipt.
+/// An unfinished publication, any existing pass and the same native lane,
+/// with the loop's original stop accounting. This is not a second work
+/// queue or a terminal receipt.
 #[cfg_attr(not(test), allow(dead_code))] // Default synchronous drivers never retain a run.
 pub(crate) struct RetainedClassicRun<L> {
     pub(crate) pass: RetainedPass,
@@ -1838,11 +1842,43 @@ where
     let loop_start = Instant::now();
     let mut retained_pass: Option<(RetainedPass, Option<CollectionControl>)> = None;
     let running = match initial_error {
-        Some(error) => Err(error),
+        Some(error) => {
+            if driver.publication_pending() {
+                let control = driver.collection_control();
+                stop_cause = publication_stop_cause(control.as_ref(), clock);
+                retained_pass = Some((RetainedPass::BeforeCollection, control));
+            }
+            Err(error)
+        }
         None => (|| -> Result<()> {
             let mut rescan = false;
             loop {
                 let control = driver.collection_control();
+                // A previous service hook can leave an owned publication
+                // pending before a new pass exists. Resolve or return that
+                // owner before cancellation's diagnostic commit, recovery
+                // accounting, collector creation or any fresh native work.
+                if driver.publication_pending() {
+                    match wait_for_publication(
+                        driver,
+                        &mut lane,
+                        clock,
+                        control.as_ref(),
+                        false,
+                        true,
+                    ) {
+                        Ok(PublicationWait::Published) => {}
+                        Ok(PublicationWait::Stopped(cause)) => {
+                            stop_cause.get_or_insert(cause);
+                            retained_pass = Some((RetainedPass::BeforeCollection, control));
+                            return Ok(());
+                        }
+                        Err(error) => {
+                            retained_pass = Some((RetainedPass::BeforeCollection, control));
+                            return Err(error);
+                        }
+                    }
+                }
                 if let Some(control) = &control
                     && latch_collection_stop(control, clock)
                 {
@@ -2098,6 +2134,29 @@ where
                 let mut schedule = TickSchedule::starting(Instant::now(), clock.tick);
                 let mut cancelled_in_sleep = false;
                 loop {
+                    // A pending publication also wins over deadline/stop
+                    // escapes. There is no new report to own at this point.
+                    if driver.publication_pending() {
+                        match wait_for_publication(
+                            driver,
+                            &mut lane,
+                            clock,
+                            control.as_ref(),
+                            false,
+                            true,
+                        ) {
+                            Ok(PublicationWait::Published) => {}
+                            Ok(PublicationWait::Stopped(cause)) => {
+                                stop_cause.get_or_insert(cause);
+                                retained_pass = Some((RetainedPass::BeforeCollection, control));
+                                return Ok(());
+                            }
+                            Err(error) => {
+                                retained_pass = Some((RetainedPass::BeforeCollection, control));
+                                return Err(error);
+                            }
+                        }
+                    }
                     let now = Instant::now();
                     if clock.ending()
                         || now >= next
@@ -2128,6 +2187,30 @@ where
                             .map(|lane| &mut lane.capture as &mut dyn CaptureLane<Pin>),
                     );
                     driver.on_tick();
+                    // This is the actual between-pass producer of Pending.
+                    // Do not run another native staging tick or leave through
+                    // a clock/control stop before returning its same owner.
+                    if driver.publication_pending() {
+                        match wait_for_publication(
+                            driver,
+                            &mut lane,
+                            clock,
+                            control.as_ref(),
+                            false,
+                            true,
+                        ) {
+                            Ok(PublicationWait::Published) => {}
+                            Ok(PublicationWait::Stopped(cause)) => {
+                                stop_cause.get_or_insert(cause);
+                                retained_pass = Some((RetainedPass::BeforeCollection, control));
+                                return Ok(());
+                            }
+                            Err(error) => {
+                                retained_pass = Some((RetainedPass::BeforeCollection, control));
+                                return Err(error);
+                            }
+                        }
+                    }
                     if let Some(control) = &control {
                         latch_collection_stop(control, clock);
                     }

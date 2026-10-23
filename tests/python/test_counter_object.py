@@ -285,8 +285,10 @@ class CounterObjectCliTests(unittest.TestCase):
         self.assertEqual(size, 32)
         self.assertEqual(definition, {
             "type": 13, "key_size": 4, "value_size": 4, "max_entries": 16, "flags": 128,
+            "id": 0, "pinning": 0,
             "inner_template": {
                 "type": 6, "key_size": 4, "value_size": 24, "max_entries": 512, "flags": 0,
+                "id": 0, "pinning": 0,
             },
         })
         for changes in ({"outer_banks": 2}, {"outer_banks": 0}, {"outer_banks": 17},

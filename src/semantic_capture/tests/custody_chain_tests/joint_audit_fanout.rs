@@ -1009,7 +1009,7 @@ fn joint_machine_current_provider_uses_frozen_physical_mapping_only() {
             .iter()
             .find(|receipt| receipt.endpoint().file_slot == 1)
             .unwrap();
-        assert_eq!(current.birth_quantum(), Some(identity), "{mapping}");
+        assert!(current.birth_quantum() == Some(identity), "{mapping}");
         let binding = coordinator
             .semantic_bindings()
             .find_by_image(current.domain(), current.image())
@@ -1159,7 +1159,7 @@ fn joint_machine_current_provider_validation_and_storage_preserve_original() {
             before.charged_bytes,
             "{refusal}: rejected and temporary provider copies refund their exact leases"
         );
-        assert_eq!(current.birth_quantum(), Some(original.0));
+        assert!(current.birth_quantum() == Some(original.0));
         assert_eq!(Arc::as_ptr(current.original_pin()), original.1);
         assert!(Arc::ptr_eq(
             &current.watched().retirement_lease(),

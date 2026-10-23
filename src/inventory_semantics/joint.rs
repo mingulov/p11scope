@@ -19,9 +19,10 @@ use std::borrow::Borrow;
 use std::cell::RefCell;
 
 mod machine;
+#[cfg(test)]
+pub(crate) use machine::JointMachineIo;
 pub(crate) use machine::{
-    JointCommitRefusal, JointMachineIo, JointServiceMode, JointServiceProgress, JointWorkBudget,
-    LiveJointMachine,
+    JointCommitRefusal, JointServiceMode, JointServiceProgress, JointWorkBudget, LiveJointMachine,
 };
 
 /// One original witness and its transferred nested-allocation charge. The

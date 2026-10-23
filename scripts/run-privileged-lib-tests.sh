@@ -42,6 +42,9 @@
 #     fixtures for the separately selected Counts-bank Session test. It also
 #     requires a P11SCOPE_COUNTER_BANK_PROOF=1 libtest build; the runner does
 #     not build or supply these inputs, so that cell is a documented skip.
+#   P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER / _WORKLOAD: distinct8192
+#     endpoint LP64 provider/driver for separately admitted boundary/population
+#     cells; the default campaign neither builds nor supplies these inputs.
 #   RLIMIT_NOFILE: the Task 4 gates sample soft/hard nofile per phase, the
 #     T7 boundary cell pref lights live FD occupancy against it, and
 #     Session::start may raise soft to hard at attach; wide cells attach
@@ -311,6 +314,11 @@ semantics_edge::resource_tests::native_semantic_resource_probe
 # re-enter the runnable campaign once the lane-A runtime fix lands.
 discovery::engine::pressure_native_tests::pressure_live256_genuine_episode_admits_late_then_head
 discovery::engine::pressure_native_tests::pressure_live256_all_blocked_twin_refuses_once
+discovery::sweep_attribution::tests::privileged_d4_btrfs_deleted_mapping_backend_parity
+attach::counter_banks::tests::format2_preparation_rejects_mixed_profiles_before_lifecycle
+attach::counter_banks::tests::format2_preparation_charges_custody_and_payload_together
+metrics::counter_reader::tests::counter_bank_session_boundary_511_512_counts_growth_lp64
+metrics::counter_reader::tests::counter_bank_session_useful_8192_counts_growth_lp64
 )
 SKIP_REASONS=(
 "needs punch-hole support under TMPDIR (btrfs/ext4/xfs; tmpfs refuses); no BPF-independent probe: run by hand as root: TMPDIR=<hole-capable dir> <binary> --exact <path> --ignored"
@@ -336,6 +344,11 @@ SKIP_REASONS=(
 "requires explicit controller-granted host measurement; spawns bounded reducer-profile probes with at most 32 edges per profile, so schedule under a separate authorized measurement plan"
 "known-failing repro (doc Known limit 2026-10-19: lane-A runtime does not converge, the rotation stalls); rerun by hand as root after the runtime fix: <binary> --exact <path> --ignored --test-threads=1 --nocapture"
 "known-failing repro (doc Known limit: same lane-A view-capacity stall, post-settle refusal asserts unreachable until the runtime fix); rerun by hand as root after the runtime fix: <binary> --exact <path> --ignored --test-threads=1 --nocapture"
+"needs root Btrfs disk TMPDIR and eligible BTF/task_vma identity; actual before-unlink positive and deleted-mapping negative; no compiler/provider fixture; run exact ignored test in an authorized BPF lane"
+"pure constructor test needs selected P11SCOPE_COUNTER_BANK_PROOF=1 V2 artifact; no native syscall or root needed; run exact --ignored from that configured libtest"
+"pure constructor accounting test needs selected P11SCOPE_COUNTER_BANK_PROOF=1 V2 artifact; no native syscall or root needed; run exact --ignored from that configured libtest"
+"needs selected V2 proof build and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER/_WORKLOAD; separate authorized 513-endpoint native admission after resource preflight"
+"needs selected V2 proof build and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER/_WORKLOAD; separate authorized 8192-endpoint native FD/memory admission after boundary pilot"
 )
 
 usage() {

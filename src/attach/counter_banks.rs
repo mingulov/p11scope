@@ -2704,6 +2704,7 @@ pub(crate) mod tests {
         damage: Option<(usize, GrowthDamage)>,
         target_refusal: Option<BankRefusal>,
         fd_preflight: Option<(usize, Result<FdSnapshot, BankRefusal>)>,
+        fd_stage_snapshot: Option<Result<FdSnapshot, BankRefusal>>,
         failure: Option<&'static str>,
         initial_unreadable: bool,
         commit_absent: bool,
@@ -2743,10 +2744,10 @@ pub(crate) mod tests {
 
         fn validate_targets(
             &mut self,
-            _: &[Slot],
+            slots: &[Slot],
             published: &[u32],
-            _fresh: BankExtent,
-            _old_capacity: usize,
+            fresh: BankExtent,
+            old_capacity: usize,
         ) -> Result<(), BankRefusal> {
             self.require_precharge();
             self.trace.push("validate");
@@ -2755,6 +2756,28 @@ pub(crate) mod tests {
                 return Err(reason);
             }
             if let Some((required, snapshot)) = self.fd_preflight.take() {
+                check_fd_headroom_with(required, || {
+                    self.trace.push("fd-query");
+                    snapshot
+                })?;
+            }
+            if let Some(snapshot) = self.fd_stage_snapshot.take() {
+                // Replace only the readonly OS query. Consume the same actual
+                // charge calculation NativeIo uses, with this fixture's maps.
+                let geometry = CountsBankGeometry::checked(16, 512)?;
+                let new_banks = (fresh.first / geometry.cells..=(fresh.end - 1) / geometry.cells)
+                    .filter(|bank| !self.maps.contains_key(bank))
+                    .count();
+                let (_, _, _, required) = stage_requirements(
+                    geometry,
+                    slots,
+                    fresh,
+                    old_capacity,
+                    self.cpus,
+                    new_banks,
+                    0,
+                    16,
+                )?;
                 check_fd_headroom_with(required, || {
                     self.trace.push("fd-query");
                     snapshot
@@ -5224,6 +5247,349 @@ pub(crate) mod tests {
                     .unwrap();
                 let observe = io.trace.iter().position(|&step| step == "observe").unwrap();
                 assert!(query < observe);
+            }
+        }
+    }
+
+    #[test]
+    fn one_process_singles_8192_fd_admission_fits_existing_soft_limit() {
+        let (_fixture, pins, first, _, _) = growth_provider_fixture();
+        for cpus in [2, 12] {
+            for caller_fds in [1_048_576, 65_536] {
+                let pool = SemanticResourcePool::reference_limit(256 * 1024 * 1024);
+                let mut directory = BankDirectory::counts_growth_v2();
+                let mut history = AttachPlan::from_slots_with_policy(
+                    (0..8192)
+                        .map(|index| {
+                            let mut selected = first.clone();
+                            selected.index = index;
+                            selected.file_offset = 0x1000 + 16 * u64::from(index);
+                            selected
+                        })
+                        .collect(),
+                    crate::plan::AdmissionPolicy::counters(
+                        crate::capacity::CounterBudget::new(8192).unwrap(),
+                    ),
+                )
+                .unwrap();
+                let mut io = GrowthIo::new(&pool);
+                io.cpus = cpus;
+                io.target_store = Some(&pins);
+                io.fd_stage_snapshot = Some(Ok(FdSnapshot {
+                    soft_limit: FdLimit::Finite(65_536),
+                    observed_open: 100,
+                }));
+                // A deliberate first-allocation refusal isolates admission;
+                // this control creates no native links or 8192-row model maps.
+                io.failure = Some("allocate");
+                let charged = pool.snapshot().charged_bytes;
+                let outcome = directory.stage_with(
+                    &mut io,
+                    &mut history,
+                    BankReservation {
+                        retained_bytes: 64 * 1024 * 1024,
+                        transient_bytes: 64 * 1024 * 1024,
+                        metadata_bytes: 16 * 1024 * 1024,
+                        file_descriptors: caller_fds,
+                    },
+                    &pool.reserver(),
+                );
+                assert_eq!(
+                    outcome,
+                    BankPublication::RolledBack {
+                        transaction: 1,
+                        extent: BankExtent {
+                            first: 0,
+                            end: 8192
+                        },
+                        reason: BankRefusal::Native,
+                    },
+                    "OneProcess/Singles must admit the 8192-fresh/16-map FD demand under the existing 65536 soft limit; cpus={cpus}, caller_fds={caller_fds}, trace={:?}",
+                    io.trace
+                );
+                assert_eq!(
+                    io.trace,
+                    [
+                        "validate", "fd-query", "observe", "retain", "allocate", "observe"
+                    ]
+                );
+                assert_eq!(
+                    stage_requirements(
+                        CountsBankGeometry::checked(16, 512).unwrap(),
+                        &history.slots,
+                        BankExtent {
+                            first: 0,
+                            end: 8192
+                        },
+                        0,
+                        cpus,
+                        16,
+                        0,
+                        16,
+                    )
+                    .unwrap()
+                    .3,
+                    16_401,
+                    "8192 fresh pairs +16 maps +one transient perf FD"
+                );
+                assert_eq!(history.counter_consumed_end(), 8192);
+                assert!((0..8192).all(|index| !history.is_active(index)));
+                assert_eq!(directory.allocated_high_water(), 8192);
+                assert_eq!(directory.next_transaction, NonZeroU64::new(2));
+                assert_eq!(directory.published_indices().count(), 0);
+                assert!(!directory.quarantined);
+                assert!(io.maps.is_empty() && io.outer.is_empty() && io.routes.is_empty());
+                assert!(io.commits.is_empty() && io.entries.is_empty() && io.returns.is_empty());
+                assert_eq!(io.held.len(), 1, "the attempted extent remains paid");
+                assert_eq!(pool.snapshot().charged_bytes, charged + 80 * 1024 * 1024);
+            }
+        }
+    }
+
+    #[test]
+    fn one_process_singles_fd_charge_uses_fresh_extent_and_shared_provider_fds() {
+        use std::os::fd::AsRawFd;
+        let (_fixture, pins, first, _, _) = growth_provider_fixture();
+        let held = pins.retain_inventory_target(first.object).unwrap();
+        let shared = held.share();
+        let original_fd = pins.file_for(first.object).unwrap().as_raw_fd();
+        assert_eq!(held.borrowed_file_and_digest().0.as_raw_fd(), original_fd);
+        assert_eq!(shared.borrowed_file_and_digest().0.as_raw_fd(), original_fd);
+        let provider_bytes = held.retained_copy_allocation_charge().unwrap() * 4;
+        assert!(provider_bytes > 0);
+        let slots: Vec<_> = (0..513)
+            .map(|index| {
+                let mut selected = first.clone();
+                selected.index = index;
+                selected.file_offset = 0x1000 + 16 * u64::from(index);
+                selected
+            })
+            .collect();
+        let geometry = CountsBankGeometry::checked(16, 512).unwrap();
+        let fresh = BankExtent {
+            first: 512,
+            end: 513,
+        };
+        let mut retained = Vec::new();
+        for cpus in [2, 12] {
+            let bare = stage_requirements(geometry, &slots, fresh, 512, cpus, 1, 0, 16).unwrap();
+            let owned =
+                stage_requirements(geometry, &slots, fresh, 512, cpus, 1, provider_bytes, 16)
+                    .unwrap();
+            assert_eq!(
+                bare.3, 4,
+                "one fresh pair, one new bank, one transient perf FD"
+            );
+            assert_eq!(owned.3, 4, "retained File owners share the original FD");
+            assert_eq!(owned.0, bare.0 + provider_bytes);
+            retained.push(bare.0);
+        }
+        assert_eq!(
+            retained[1] - retained[0],
+            122_880,
+            "the full512-cell bank still charges 24 bytes across all additional possible CPUs"
+        );
+        assert_eq!(
+            stage_requirements(geometry, &slots, fresh, 512, usize::MAX, 1, 0, 16),
+            Err(BankRefusal::Budget),
+            "CPU map-byte arithmetic must still refuse checked overflow"
+        );
+    }
+
+    #[test]
+    fn one_process_singles_fd_preflight_preserves_publication_at_headroom_boundary() {
+        use std::os::fd::AsRawFd;
+        for (label, caller_fds, snapshot, refusal) in [
+            (
+                "OS exact fit",
+                128,
+                Ok(FdSnapshot {
+                    soft_limit: FdLimit::Finite(103),
+                    observed_open: 100,
+                }),
+                None,
+            ),
+            (
+                "caller exact fit",
+                3,
+                Ok(FdSnapshot {
+                    soft_limit: FdLimit::Finite(103),
+                    observed_open: 100,
+                }),
+                None,
+            ),
+            (
+                "caller one short",
+                2,
+                Ok(FdSnapshot {
+                    soft_limit: FdLimit::Finite(103),
+                    observed_open: 100,
+                }),
+                Some(BankRefusal::Budget),
+            ),
+            (
+                "OS one short",
+                128,
+                Ok(FdSnapshot {
+                    soft_limit: FdLimit::Finite(102),
+                    observed_open: 100,
+                }),
+                Some(BankRefusal::Budget),
+            ),
+            (
+                "unreadable",
+                128,
+                Err(BankRefusal::Native),
+                Some(BankRefusal::Native),
+            ),
+            (
+                "finite checked overflow",
+                128,
+                Ok(FdSnapshot {
+                    soft_limit: FdLimit::Finite(u64::MAX),
+                    observed_open: u64::MAX - 2,
+                }),
+                Some(BankRefusal::Budget),
+            ),
+            (
+                "unlimited exact arithmetic fit",
+                128,
+                Ok(FdSnapshot {
+                    soft_limit: FdLimit::Unlimited,
+                    observed_open: u64::MAX - 3,
+                }),
+                None,
+            ),
+            (
+                "unlimited checked overflow",
+                128,
+                Ok(FdSnapshot {
+                    soft_limit: FdLimit::Unlimited,
+                    observed_open: u64::MAX - 2,
+                }),
+                Some(BankRefusal::Budget),
+            ),
+        ] {
+            let (_fixture, pins, first, second, _) = growth_provider_fixture();
+            let pool = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
+            let keepalive = CounterKeepalive::precharge_with_geometry(
+                &pool.reserver(),
+                16 * 1024 * 1024,
+                CountsBankGeometry::checked(16, 512).unwrap(),
+            )
+            .unwrap();
+            let policy = crate::plan::AdmissionPolicy::counters(
+                crate::capacity::CounterBudget::new(8192).unwrap(),
+            );
+            let mut history =
+                AttachPlan::from_slots_with_policy(vec![first.clone()], policy).unwrap();
+            let mut directory = BankDirectory::counts_growth_v2();
+            let mut io = GrowthIo::new(&pool);
+            io.target_store = Some(&pins);
+            io.provider_owner = Some(&keepalive.custody);
+            assert!(matches!(
+                directory.stage_with(
+                    &mut io,
+                    &mut history,
+                    growth_reservation(),
+                    &pool.reserver()
+                ),
+                BankPublication::Published { transaction: 1, .. }
+            ));
+            let old = io.routes[&0];
+            let old_fd = keepalive.custody.lock().unwrap().providers[0]
+                .as_ref()
+                .unwrap()
+                .borrowed_file_and_digest()
+                .0
+                .as_raw_fd();
+            history
+                .extend_exact(
+                    AttachPlan::from_slots_with_policy(vec![first, second], policy).unwrap(),
+                )
+                .unwrap();
+            let before = history.slots.clone();
+            let charged = pool.snapshot().charged_bytes;
+            let mut envelope = growth_reservation();
+            envelope.file_descriptors = caller_fds;
+            io.next_stage();
+            // Existing open descriptors already include the old pair, map and
+            // pinned providers. Only this fresh pair + transient FD needs room.
+            io.fd_stage_snapshot = Some(snapshot);
+            let result = directory.stage_with(&mut io, &mut history, envelope, &pool.reserver());
+            assert_eq!(
+                io.trace.iter().filter(|&&step| step == "fd-query").count(),
+                usize::from(caller_fds >= 3),
+                "{label}"
+            );
+            assert_eq!(io.routes[&0], old, "{label}");
+            assert_eq!(io.maps, BTreeMap::from([(0, 101)]));
+            assert_eq!(io.outer, BTreeMap::from([(0, 101)]));
+            assert!(!directory.quarantined);
+            let custody = keepalive.custody.lock().unwrap();
+            assert_eq!(
+                custody.providers[0]
+                    .as_ref()
+                    .unwrap()
+                    .borrowed_file_and_digest()
+                    .0
+                    .as_raw_fd(),
+                old_fd
+            );
+            if let Some(reason) = refusal {
+                assert_eq!(result, BankPublication::Refused(reason), "{label}");
+                assert_eq!(history.counter_consumed_end(), 1);
+                assert_eq!(history.slots, before);
+                assert!(history.is_active(0) && history.is_active(1));
+                assert_eq!(directory.allocated_high_water(), 1);
+                assert_eq!(directory.next_transaction, NonZeroU64::new(2));
+                assert_eq!(directory.published_indices().collect::<Vec<_>>(), [0]);
+                assert!(
+                    io.trace
+                        .iter()
+                        .all(|step| matches!(*step, "validate" | "fd-query"))
+                );
+                assert_eq!(io.routes, BTreeMap::from([(0, old)]));
+                assert_eq!(io.providers, BTreeSet::from([0]));
+                assert_eq!(io.entries, BTreeSet::from([0]));
+                assert_eq!(io.returns, BTreeSet::from([0]));
+                assert_eq!(
+                    io.commits,
+                    BTreeMap::from([(
+                        1,
+                        CountsBankCommit {
+                            first: 0,
+                            end: 1,
+                            configuration: COUNTS_GROWTH_V2_CONFIG
+                        }
+                    )])
+                );
+                assert_eq!(io.attempted, BTreeSet::from([1]));
+                assert_eq!(custody.charges.len(), 1);
+                assert!(custody.providers[1].is_none());
+                assert_eq!(pool.snapshot().charged_bytes, charged);
+            } else {
+                assert_eq!(
+                    result,
+                    BankPublication::Published {
+                        transaction: 2,
+                        extent: BankExtent { first: 1, end: 2 }
+                    },
+                    "{label}"
+                );
+                assert_eq!(history.counter_consumed_end(), 2);
+                assert_eq!(directory.published_indices().collect::<Vec<_>>(), [0, 1]);
+                assert_eq!(custody.charges.len(), 2);
+                assert!(custody.providers[1].is_some());
+                assert_eq!(pool.snapshot().charged_bytes, charged + 1_114_112);
+                let query = io
+                    .trace
+                    .iter()
+                    .position(|&step| step == "fd-query")
+                    .unwrap();
+                let observe = io.trace.iter().position(|&step| step == "observe").unwrap();
+                let retain = io.trace.iter().position(|&step| step == "retain").unwrap();
+                assert!(query < observe && observe < retain);
             }
         }
     }

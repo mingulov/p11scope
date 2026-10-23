@@ -15,6 +15,10 @@ _Static_assert(OWNER_CONTROL_BOUND == OWNER_LIMIT + OWNER_TRANSIENT_CLAIMS,
 static u64 *cas_interference_cell;
 static unsigned cas_failures_remaining, cas_attempts;
 static u64 controlled_cas(u64 *cell, u64 old, u64 replacement);
+#ifdef P11SCOPE_COUNTER_BANK_PROOF
+static long controlled_owner_loop(u32 count, long (*callback)(u32, void *),
+                                  void *context, u64 flags);
+#endif
 #define __sync_val_compare_and_swap controlled_cas
 /* Simulated concurrent claims: another CPU's reservations land between an
  * admission pre-check and this CPU's own atomic add. */
@@ -56,8 +60,18 @@ static u64 expected_delete_debt;
 static unsigned char value[288] __attribute__((aligned(8)));
 struct row { int used; void *map; unsigned char key[24]; unsigned char value[432] __attribute__((aligned(8))); };
 /* START capacity plus subordinate rows and frozen descriptor/zero cells. */
+#ifdef P11SCOPE_COUNTER_BANK_PROOF
+/* Sparse high-key controls exercise at most four live rows, not an 8192-row
+ * population. Keep the replaceable I/O seam small and the real bound literal. */
+#define FIXTURE_ROW_BOUND 128U
+#else
 #define FIXTURE_ROW_BOUND (2U * P11SCOPE_OWNER_SLOT_BOUND + 128U)
+#endif
 static struct row rows[FIXTURE_ROW_BOUND];
+#ifdef P11SCOPE_COUNTER_BANK_PROOF
+static unsigned bank_loop_calls, bank_loop_error_on, bank_loop_short_on;
+static int bank_hide_start_slot;
+#endif
 #ifndef P11SCOPE_INVENTORY_ONLY
 static int fail_object_side_update, fail_object_side_delete, drop_zero_row, poison_zero_row;
 static int fail_object_side_lookup_once, hide_side_slot, zero_outstanding_on_delete;
@@ -69,6 +83,27 @@ static int deleted_side_seen;
 static int require_scrubbed_side_delete, checked_side_deletes;
 static u64 instance_gen[INST_GEN_CELLS];
 static struct instance_counters instance_counters_live;
+#endif
+
+#ifdef P11SCOPE_COUNTER_BANK_PROOF
+/* Only helper 181 is replaced. The callback remains the real native cleanup
+ * body, including its owner checks, removals, scrub, counters and faults. */
+static long controlled_owner_loop(u32 count, long (*callback)(u32, void *),
+                                  void *context, u64 flags)
+{
+    assert(count == 8192 && flags == 0);
+    bank_loop_calls++;
+    if (bank_loop_error_on == bank_loop_calls)
+        return -22;
+    u32 end = bank_loop_short_on == bank_loop_calls ? count - 1 : count;
+    for (u32 i = 0; i < end; i++) {
+        long stop = callback(i, context);
+        assert(stop == 0 || stop == 1);
+        if (stop)
+            return i + 1;
+    }
+    return end;
+}
 #endif
 
 static u64 controlled_cas(u64 *cell, u64 old, u64 replacement)
@@ -116,6 +151,11 @@ static struct row *row(void *map, const void *key)
 static void *lookup(void *map, const void *key)
 {
     if (map == &OWNER_CTL) return &ctl;
+#ifdef P11SCOPE_COUNTER_BANK_PROOF
+    if (map == &START && bank_hide_start_slot >= 0 &&
+        ((const struct owner_start_key *)key)->slot == (u32)bank_hide_start_slot)
+        return NULL;
+#endif
 #ifndef P11SCOPE_INVENTORY_ONLY
     if (map == &OBJECT_ZERO && drop_zero_row) return NULL;
     if (map == &START && fail_start_readback_once && row(map, key)) {
@@ -280,6 +320,11 @@ static void reset(void)
     owner_map_lookup = lookup; owner_map_update = update; owner_map_delete = pair_delete;
     owner_storage_get = storage_get; owner_storage_delete = storage_delete;
     owner_current_task = current_task; owner_pid_tgid = pid_tgid;
+#ifdef P11SCOPE_COUNTER_BANK_PROOF
+    bank_loop_calls = bank_loop_error_on = bank_loop_short_on = 0;
+    bank_hide_start_slot = -1;
+    owner_loop = controlled_owner_loop;
+#endif
 #ifndef P11SCOPE_INVENTORY_ONLY
     fail_object_side_update = fail_object_side_delete = drop_zero_row = poison_zero_row = 0;
     fail_object_side_lookup_once = 0; hide_side_slot = -1; zero_outstanding_on_delete = 0;
@@ -2202,6 +2247,133 @@ static void object_owner_sweep_adjacent_lookup_preserves_custody(void)
     puts("object custody sweep adjacent passed");
 }
 #endif
+#if defined(P11SCOPE_COUNTER_BANK_PROOF) && !defined(P11SCOPE_INVENTORY_ONLY)
+static void counter_bank_owner_high_slot(void)
+{
+    reset();
+    struct owner_start_key high = start_key(8191);
+    struct owner_start_key outside = start_key(8192);
+    assert(p11_owner_start_aggregate(&high, 17) == 1);
+    assert(p11_owner_start_get(&high, 1));
+    struct thread_owner before = owners[0];
+    assert(!p11_owner_start_aggregate(&outside, 19));
+    assert(!row(&START, &outside));
+    assert(!memcmp(&before, &owners[0], sizeof(before)));
+    assert(ctl.outstanding == 1 && !ctl.poison);
+    assert(!p11_owner_cleanup());
+    assert(bank_loop_calls == 2 && !row(&START, &high));
+    assert(ctl.abandoned_start == 1 && !ctl.outstanding && idle(0));
+    assert(!p11_owner_cleanup());
+    assert(bank_loop_calls == 2 && ctl.abandoned_start == 1);
+}
+
+static void counter_bank_owner_start_failures(void)
+{
+    struct owner_start_key high;
+    reset(); high = start_key(8191);
+    assert(p11_owner_start_aggregate(&high, 17) == 1);
+    fail_start_delete = -16;
+    assert(p11_owner_cleanup());
+    /* The failure occurs at the last callback: helper count 8192 alone
+     * cannot distinguish successful completion from explicit callback failure. */
+    assert(bank_loop_calls == 1 && row(&START, &high));
+    assert(owners[0].start_count == 1 && ctl.outstanding == 1 && ctl.poison);
+    assert(!ctl.abandoned_start);
+    fail_start_delete = 0;
+    assert(p11_owner_cleanup());
+    assert(!row(&START, &high) && !ctl.outstanding && idle(0));
+    assert(ctl.abandoned_start == 1 && ctl.poison);
+
+    reset(); high = start_key(8191);
+    assert(p11_owner_start_aggregate(&high, 17) == 1);
+    bank_hide_start_slot = 8191;
+    assert(p11_owner_cleanup());
+    assert(bank_loop_calls == 1 && row(&START, &high));
+    assert(ctl.poison && ctl.outstanding == 1 && owners[0].start_count == 1);
+    assert(!ctl.abandoned_start);
+
+    reset(); high = start_key(8191);
+    assert(p11_owner_start_aggregate(&high, 17) == 1);
+    owners[0].start_count = 2;
+    assert(p11_owner_cleanup());
+    assert(!row(&START, &high) && ctl.abandoned_start == 1);
+    assert(ctl.poison && ctl.outstanding == 1 && owners[0].start_count == 1);
+}
+
+static struct owner_start_key counter_bank_owner_orphan(void)
+{
+    reset();
+    struct owner_start_key high = start_key(8191);
+    assert(p11_owner_start_aggregate(&high, 17) == 1);
+    assert(!pair_delete(&START, &high));
+    owners[0].start_count--;
+    unsigned char side[432];
+    memset(side, 0xA5, sizeof(side));
+    assert(!update(&OBJECT_START, &high, side, 1));
+    struct owner_start_key foreign = high;
+    foreign.pid_tgid = current_number[1];
+    assert(!update(&OBJECT_START, &foreign, side, 1));
+    require_scrubbed_side_delete = 1;
+    return high;
+}
+
+static void counter_bank_owner_orphan_failures(void)
+{
+    struct owner_start_key high = counter_bank_owner_orphan();
+    struct owner_start_key foreign = high;
+    foreign.pid_tgid = current_number[1];
+    assert(!p11_owner_cleanup());
+    assert(bank_loop_calls == 2 && !row(&OBJECT_START, &high));
+    assert(deleted_side_seen && checked_side_deletes == 1);
+    assert(object_bytes_zeroed(deleted_side));
+    assert(!ctl.outstanding && !ctl.poison && ctl.abandoned_start == 1);
+    assert(row(&OBJECT_START, &foreign));
+    for (unsigned i = 0; i < 432; i++)
+        assert(row(&OBJECT_START, &foreign)->value[i] == 0xA5);
+
+    high = counter_bank_owner_orphan();
+    fail_object_side_delete = -16;
+    assert(p11_owner_cleanup());
+    assert(bank_loop_calls == 2 && row(&OBJECT_START, &high));
+    assert(object_bytes_zeroed(row(&OBJECT_START, &high)->value));
+    assert(checked_side_deletes == 1 && ctl.poison && ctl.outstanding == 1);
+    assert(!owners[0].start_count && !ctl.abandoned_start && !idle(0));
+    fail_object_side_delete = 0;
+    assert(p11_owner_cleanup());
+    assert(!row(&OBJECT_START, &high) && !ctl.outstanding);
+    assert(ctl.poison && ctl.abandoned_start == 1 && idle(0));
+}
+
+static void counter_bank_owner_incomplete_loops(void)
+{
+    for (unsigned phase = 1; phase <= 2; phase++) {
+        for (unsigned short_result = 0; short_result <= 1; short_result++) {
+            struct owner_start_key high;
+            if (phase == 1) {
+                reset(); high = start_key(8191);
+                assert(p11_owner_start_aggregate(&high, 17) == 1);
+            } else {
+                high = counter_bank_owner_orphan();
+            }
+            if (short_result) bank_loop_short_on = phase;
+            else bank_loop_error_on = phase;
+            assert(p11_owner_cleanup());
+            assert(bank_loop_calls == phase && ctl.poison && ctl.outstanding == 1);
+            assert(owners[0].flags && owners[0].original_pid_tgid && !idle(0));
+            assert(!ctl.abandoned_start);
+            if (phase == 1) {
+                assert(owners[0].start_count == 1 && row(&START, &high));
+            } else {
+                /* Even count 0 cannot authorize release after an uncompleted
+                 * orphan sweep. The last side remains intact and owned. */
+                assert(!owners[0].start_count && row(&OBJECT_START, &high));
+                for (unsigned i = 0; i < 432; i++)
+                    assert(row(&OBJECT_START, &high)->value[i] == 0xA5);
+            }
+        }
+    }
+}
+#endif
 #ifdef P11SCOPE_INVENTORY_ONLY
 static void inventory_contract(void)
 {
@@ -2272,6 +2444,12 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[1], "object_seeded_start_construction")) object_seeded_start_construction();
         else if (!strcmp(argv[1], "object_aggregate_start_construction")) object_aggregate_start_construction();
         else if (!strcmp(argv[1], "object_seeded_start_failures")) object_seeded_start_failures();
+#ifdef P11SCOPE_COUNTER_BANK_PROOF
+        else if (!strcmp(argv[1], "counter_bank_owner_high_slot")) counter_bank_owner_high_slot();
+        else if (!strcmp(argv[1], "counter_bank_owner_start_failures")) counter_bank_owner_start_failures();
+        else if (!strcmp(argv[1], "counter_bank_owner_orphan_failures")) counter_bank_owner_orphan_failures();
+        else if (!strcmp(argv[1], "counter_bank_owner_incomplete_loops")) counter_bank_owner_incomplete_loops();
+#endif
         else assert(0);
     } else {
         cas_boundaries(); accounting_contention(); threaded_contention(); idle_owner_retention();

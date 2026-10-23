@@ -45,3 +45,46 @@ fn production_task_owner_transactions_and_lifecycle() {
         );
     }
 }
+
+/// Sparse high-key tests over the actual C owner. This is no map-load,
+/// population, verifier or 8192-endpoint collection acceptance.
+#[test]
+fn production_counter_bank_owner_full_bound_cleanup_is_fail_closed() {
+    let temporary = tempfile::tempdir().expect("counter owner test directory");
+    let binary = temporary.path().join("counter-bank-owner");
+    let output = Command::new("clang-18")
+        .args([
+            "-O2",
+            "-g",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-pthread",
+            "-DP11SCOPE_COUNTER_BANK_PROOF",
+            "-I",
+            "crates/ebpf/native",
+            "tests/fixtures/task-owner/helper_tests.c",
+            "-o",
+        ])
+        .arg(&binary)
+        .output()
+        .expect("compile actual counter-bank native owner");
+    assert!(
+        output.status.success(),
+        "native counter owner compile: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for selector in [
+        "counter_bank_owner_high_slot",
+        "counter_bank_owner_start_failures",
+        "counter_bank_owner_orphan_failures",
+        "counter_bank_owner_incomplete_loops",
+    ] {
+        let output = Command::new(&binary).arg(selector).output().unwrap();
+        assert!(
+            output.status.success(),
+            "native counter owner {selector}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}

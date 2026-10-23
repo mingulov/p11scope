@@ -129,7 +129,8 @@ fn counter_bank_proof_has_exact_routes_and_start_ownership() {
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["schema"], "p11scope-counter-bank-object/v1");
     assert_eq!(report["logical_slots"], serde_json::json!([0, 1]));
-    assert_eq!(report["native_owner_slot_bound"], 512);
+    assert_eq!(report["native_owner_slot_bound"], 8_192);
+    assert_eq!(report["maps"]["STATS"]["max_entries"], 512);
     assert_eq!(report["maps"]["COUNTER_BANKS"]["type"], 13);
     assert_eq!(report["maps"]["COUNTER_BANKS"]["max_entries"], 2);
     assert_eq!(report["inner_template"]["type"], 6);
@@ -180,6 +181,9 @@ fn counter_bank_proof_mutations_are_causally_rejected() {
         "inner_value_width",
         "inner_cell_count",
         "outer_type",
+        "native_owner_slot_bound",
+        "missing_native_owner_slot_bound",
+        "legacy_native_owner_slot_bound",
         "logical_index",
         "inner_index",
         "bank_global_linkage",
@@ -204,7 +208,7 @@ fn counter_bank_proof_mutations_are_causally_rejected() {
     }
 }
 
-/// Creates owned anonymous maps and loads both proof roots. Aya may run
+/// Creates owned anonymous maps and loads both proof and exec/exit roots. Aya may run
 /// feature probes; no attachment, commit publication or workload runs here.
 #[test]
 #[ignore = "requires explicit counter bank build and authorized BTF/map/program-load lane"]
@@ -293,6 +297,18 @@ fn counter_bank_proof_btf_maps_and_programs_load() {
         program
             .load()
             .expect("actual outer-to-inner verifier bridge");
+    }
+    // The bounded owner callbacks are reached only by these mandatory
+    // lifecycle roots. Loading endpoint roots alone cannot validate them.
+    for name in ["sched_process_exec", "sched_process_exit"] {
+        let program: &mut aya::programs::RawTracePoint = object
+            .program_mut(name)
+            .expect("actual lifecycle root")
+            .try_into()
+            .expect("raw tracepoint program kind");
+        program
+            .load()
+            .expect("actual full-bound owner cleanup verifier");
     }
 }
 

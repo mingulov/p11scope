@@ -2372,6 +2372,25 @@ static void counter_bank_owner_incomplete_loops(void)
             }
         }
     }
+    /* The first sweep may remove every START before it reports a short
+     * result. A count of zero cannot then hide the still-owned high orphan
+     * or release its physical-task lease before the second sweep. */
+    reset(); object_setup();
+    struct owner_start_key low = start_key(0);
+    struct owner_start_key high = start_key(8191);
+    unsigned char side[432];
+    memset(side, 0xA5, sizeof(side));
+    assert(p11_owner_start_aggregate(&low, 17) == 1);
+    assert(!update(&OBJECT_START, &high, side, 1));
+    bank_loop_short_on = 1;
+    assert(p11_owner_cleanup());
+    assert(bank_loop_calls == 1 && !row(&START, &low));
+    assert(!owners[0].start_count && owners[0].flags);
+    assert(owners[0].original_pid_tgid == pid_tgid() && ctl.outstanding == 1);
+    assert(ctl.poison && ctl.abandoned_start == 1);
+    assert(row(&OBJECT_START, &high));
+    for (unsigned i = 0; i < 432; i++)
+        assert(row(&OBJECT_START, &high)->value[i] == 0xA5);
 }
 #endif
 #ifdef P11SCOPE_INVENTORY_ONLY

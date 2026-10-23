@@ -105,6 +105,79 @@ class CounterObjectCliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("--self-test accepts no other arguments", result.stderr)
 
+    def test_native_owner_bound_is_explicit_and_independent_of_stats_capacity(self):
+        checker = runpy.run_path(str(CHECKER), run_name="counter_owner_bound_test")
+        key = (1, 0)
+
+        class Graph:
+            def __init__(self, limit):
+                self.instructions = {key: {
+                    0: (0x61, 0x12, 8, 0), 1: (0x25, 2, 1, limit - 1),
+                    2: (0xb7, 0, 0, 1), 3: (0x95, 0, 0, 0)}}
+                self.loops, self.calls, self.bodies = {key: {}}, {}, {key: ("owner_bound",)}
+
+            @staticmethod
+            def only(name):
+                if name != "p11_owner_start_aggregate":
+                    raise RuntimeError("unexpected owner-bound callee")
+                return key
+
+        maps = {"STATS": {"max_entries": 512}}
+        self.assertEqual(checker["native_owner_bound"](Graph(512), maps).native_bound, 512)
+        self.assertEqual(checker["native_owner_bound"](
+            Graph(8192), maps, expected_bound=8192).native_bound, 8192)
+        for limit, expected in ((8192, 512), (512, 8192), (8191, 8192), (8193, 8192)):
+            with self.subTest(limit=limit, expected=expected):
+                with self.assertRaises(RuntimeError):
+                    checker["native_owner_bound"](Graph(limit), maps, expected_bound=expected)
+        missing = Graph(8192)
+        missing.instructions[key][1] = (0xbf, 0, 0, 0)
+        with self.assertRaises(RuntimeError):
+            checker["native_owner_bound"](missing, maps, expected_bound=8192)
+
+    def test_native_owner_shift_guard_is_key_bound_and_profile_specific(self):
+        checker = runpy.run_path(str(CHECKER), run_name="counter_owner_shift_test")
+        key = (1, 0)
+
+        class Graph:
+            def __init__(self, shift, key_offset=8):
+                self.instructions = {key: {
+                    0: (0x79, 0x12, key_offset, 0), 1: (0x77, 2, 0, shift),
+                    2: (0x55, 2, 1, 0), 3: (0xb7, 0, 0, 1), 4: (0x95, 0, 0, 0)}}
+                self.loops, self.calls, self.bodies = {key: {}}, {}, {key: ("owner_shift",)}
+
+            @staticmethod
+            def only(name):
+                if name != "p11_owner_start_aggregate":
+                    raise RuntimeError("unexpected owner-shift callee")
+                return key
+
+        for shift, expected in ((9, 512), (13, 8192)):
+            with self.subTest(healthy_shift=shift):
+                proof = checker["native_owner_bound"](Graph(shift), {}, expected_bound=expected)
+                self.assertEqual(proof.native_bound, expected)
+                self.assertEqual(proof.guards, {(key, 2, "shift", shift)})
+        for shift, expected, offset in ((9, 8192, 8), (13, 512, 8),
+                                         (12, 8192, 8), (14, 8192, 8), (13, 8192, 0)):
+            with self.subTest(shift=shift, expected=expected, offset=offset):
+                with self.assertRaises(RuntimeError):
+                    checker["native_owner_bound"](
+                        Graph(shift, offset), {}, expected_bound=expected)
+
+    def test_bank_endpoint_cannot_inherit_cleanup_loop_helper_permission(self):
+        checker = runpy.run_path(str(CHECKER), run_name="counter_endpoint_helper_test")
+        key = (1, 0)
+
+        class Graph:
+            def __init__(self, helper):
+                self.instructions = {key: {0: (0x85, 0, 0, helper), 1: (0x95, 0, 0, 0)}}
+                self.calls = {(key, 0): ("helper", helper)}
+                self.loops, self.bodies = {key: {}}, {key: ("bank_endpoint",)}
+
+        checker["BankFootprint"](Graph(14), {}).run(key, [None] * 5)
+        with self.assertRaisesRegex(RuntimeError, "forbidden/unknown helper 181"):
+            checker["BankFootprint"](Graph(181), {}).run(key, [None] * 5)
+
     def test_bank_template_decoder_is_scoped_and_refuses_wrong_inner_shapes(self):
         checker = runpy.run_path(str(CHECKER), run_name="counter_template_test")
         body, ref = bank_template_fixture()

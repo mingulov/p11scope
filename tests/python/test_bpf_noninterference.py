@@ -346,12 +346,7 @@ class BuildDriverTests(unittest.TestCase):
         fixture_root.mkdir()
         # Validate a real bundle of this tiny fixture's history. Using the
         # product HEAD makes repeated unbundle/fsck work grow with that repo.
-        product_repository = module.REPOSITORY
-        try:
-            module.REPOSITORY = self.repo
-            fixture = module.OfflineFixture(fixture_root)
-        finally:
-            module.REPOSITORY = product_repository
+        fixture = module.OfflineFixture(fixture_root, shared_repository=self.repo)
         fixture.testcase = self
         fixture.assemble()
         fixture.approve()

@@ -712,14 +712,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             return Err(RawQuantumRefusal::Admission);
         }
         for entry in &batch.entries {
-            if let Some(Ok(input)) = &entry.input {
-                if entry.claim.is_none()
+            if let Some(Ok(input)) = &entry.input
+                && (entry.claim.is_none()
                     || entry.token != input.h0_ordinal()
                     || (!ingested.matches_admission(input)
-                        && !ingested.matches_retained_admission(input, adapter))
-                {
-                    return Err(RawQuantumRefusal::Admission);
-                }
+                        && !ingested.matches_retained_admission(input, adapter)))
+            {
+                return Err(RawQuantumRefusal::Admission);
             }
         }
         let count = batch

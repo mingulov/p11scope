@@ -7257,6 +7257,247 @@ mod tests {
         plan
     }
 
+    fn counter_history_plan(count: u32) -> AttachPlan {
+        let object = PinnedObjectId(7);
+        counters_plan(
+            (0..count)
+                .map(|index| {
+                    exact_slot(
+                        index,
+                        object,
+                        0x10 + u64::from(index) * 0x10,
+                        0,
+                        vec![ModuleId(0)],
+                    )
+                })
+                .collect(),
+            vec![exact_module(0, object)],
+            8,
+        )
+    }
+
+    #[test]
+    fn counter_consumed_history_prevents_tail_withdrawal() {
+        let mut history = counter_history_plan(2);
+        assert_eq!(history.counter_consumed_end(), 0);
+        history.consume_counter_extent(0, 2).unwrap();
+        history.deactivate(1);
+        let consumed = history.clone();
+
+        // Even a never-published rollback consumed its original ordinal.
+        history.withdraw_unlinked_additions(1);
+        assert_eq!(history, consumed, "consumed rollback holes stay allocated");
+
+        let delta = history.extend_exact(counter_history_plan(2)).unwrap();
+        assert_eq!(delta.new.len(), 1);
+        assert_eq!(delta.new[0].index, 2, "the retry needs a fresh ordinal");
+        assert_eq!(
+            AttachKey::of(&delta.new[0]),
+            AttachKey::of(&history.slots[1])
+        );
+        assert_eq!(history.slots[..2], consumed.slots);
+        assert_eq!(history.counter_consumed_end(), 2);
+
+        // A later planning-only cell still has the ordinary cleanup behavior.
+        history.deactivate(2);
+        history.withdraw_unlinked_additions(1);
+        assert_eq!(history.slots, consumed.slots);
+        assert_eq!(history.counter_consumed_end(), 2);
+        let delta = history.extend_exact(counter_history_plan(2)).unwrap();
+        assert_eq!(delta.new[0].index, 2);
+        history.consume_counter_extent(2, 3).unwrap();
+        assert_eq!(history.counter_consumed_end(), 3);
+        assert!(!history.is_active(1) && history.is_active(2));
+        assert!(history.validate_slot_index().is_ok());
+    }
+
+    #[test]
+    fn counter_consumed_history_prevents_tail_compaction() {
+        let mut history = counter_history_plan(3);
+        history.consume_counter_extent(0, 3).unwrap();
+        history.extend_exact(counter_history_plan(5)).unwrap();
+        for index in [1, 2, 3] {
+            history.deactivate(index);
+        }
+        let prefix = history.slots[..3].to_vec();
+        let fresh_key = AttachKey::of(&history.slots[4]);
+
+        let mapping = history.excise_unlinked_tail_cells(1, &BTreeSet::from([1, 2, 3, 99]));
+        assert_eq!(mapping, [0, 1, 2, u32::MAX, 3]);
+        assert_eq!(history.slots[..3], prefix);
+        assert_eq!(history.slots.len(), 4);
+        assert_eq!(history.slots[3].index, 3);
+        assert_eq!(AttachKey::of(&history.slots[3]), fresh_key);
+        assert!(history.is_active(0) && history.is_active(3));
+        assert!(!history.is_active(1) && !history.is_active(2));
+        assert_eq!(history.counter_consumed_end(), 3);
+        assert!(history.validate_slot_index().is_ok());
+
+        history.consume_counter_extent(3, 4).unwrap();
+        assert_eq!(history.counter_consumed_end(), 4);
+        assert_eq!(history.slots[..3], prefix);
+    }
+
+    #[test]
+    fn counter_consumption_refuses_invalid_extents_without_mutation() {
+        for policy in [AdmissionPolicy::Detailed, inventory_policy(8)] {
+            let mut plan =
+                AttachPlan::from_slots_with_policy(counter_history_plan(2).slots, policy).unwrap();
+            let before = plan.clone();
+            assert_eq!(
+                plan.consume_counter_extent(0, 2),
+                Err(CounterHistoryError::Policy)
+            );
+            assert_eq!(plan, before);
+        }
+
+        let initial = counter_history_plan(2);
+        for (first, end, expected) in [
+            (0, 0, CounterHistoryError::Extent),
+            (0, 1, CounterHistoryError::Extent),
+            (0, 3, CounterHistoryError::Extent),
+            (1, 2, CounterHistoryError::Frontier),
+            (0, u32::MAX, CounterHistoryError::Extent),
+        ] {
+            let mut plan = initial.clone();
+            assert_eq!(plan.consume_counter_extent(first, end), Err(expected));
+            assert_eq!(
+                plan, initial,
+                "refused extent [{first},{end}) mutates nothing"
+            );
+        }
+        let mut sparse = initial.clone();
+        sparse.slots[1].index = 7;
+        let mut inactive = initial.clone();
+        inactive.deactivate(1);
+        for mut plan in [sparse, inactive] {
+            let before = plan.clone();
+            assert_eq!(
+                plan.consume_counter_extent(0, 2),
+                Err(CounterHistoryError::Topology)
+            );
+            assert_eq!(plan, before);
+        }
+
+        let mut history = initial;
+        history.consume_counter_extent(0, 2).unwrap();
+        let before = history.clone();
+        assert_eq!(
+            history.consume_counter_extent(0, 2),
+            Err(CounterHistoryError::Frontier)
+        );
+        assert_eq!(
+            history, before,
+            "consumption cannot replay or refund an extent"
+        );
+
+        // Make an otherwise consistent short plan: only its consumed floor is wrong.
+        let mut truncated = history.clone();
+        truncated.slots.truncate(1);
+        truncated.aggregate_owners.truncate(1);
+        truncated.slot_by_key.retain(|_, position| *position < 1);
+        assert!(truncated.validate_slot_index().is_err());
+        let mut changed_policy = history;
+        changed_policy.admission_policy = AdmissionPolicy::Detailed;
+        assert!(changed_policy.validate_slot_index().is_err());
+    }
+
+    #[test]
+    fn counter_consumption_preserves_inactive_published_positions() {
+        let mut history = counter_history_plan(2);
+        history.consume_counter_extent(0, 2).unwrap();
+        let consumed = history.clone();
+        assert_eq!(
+            consumed.counter_consumed_end(),
+            2,
+            "clone retains consumption"
+        );
+        let before = history.clone();
+        assert!(
+            history
+                .attested_subset(&BTreeSet::from([PinnedObjectId(7)]), &BTreeSet::new())
+                .is_err(),
+            "a consumed plan cannot become a fresh renumbered subset"
+        );
+        assert_eq!(history, before);
+
+        let delta = history.extend_exact(counter_history_plan(3)).unwrap();
+        assert_eq!(delta.new.len(), 1);
+        assert_eq!(delta.new[0].index, 2);
+        assert_eq!(history.counter_consumed_end(), 2);
+        assert_eq!(history.slots[..2], consumed.slots);
+        history.consume_counter_extent(2, 3).unwrap();
+
+        // Publication belongs to the directory. A consumed row may already
+        // be published; inactivity cannot erase its original identity/owner.
+        let old = history.slots[1].clone();
+        history.deactivate(1);
+        let mapping = history.excise_unlinked_tail_cells(0, &BTreeSet::from([1]));
+        assert_eq!(mapping, [0, 1, 2]);
+        assert_eq!(history.slots[1], old);
+        assert_eq!(history.module_of_slot(1), Some(ModuleId(0)));
+        assert_eq!(history.active_module_of_slot(1), None);
+        assert!(!history.is_active(1));
+        assert_eq!(history.counter_consumed_end(), 3);
+        assert_eq!(consumed.counter_consumed_end(), 2, "clone is independent");
+        assert!(history.validate_slot_index().is_ok());
+    }
+
+    #[test]
+    fn unconsumed_policies_preserve_tail_cleanup() {
+        for policy in [
+            AdmissionPolicy::Detailed,
+            inventory_policy(8),
+            counters_policy(8),
+        ] {
+            let fixture = counter_history_plan(3);
+            let mut initial = AttachPlan::from_slots_with_policy(fixture.slots, policy).unwrap();
+            initial.modules = fixture.modules;
+            assert_eq!(initial.counter_consumed_end(), 0);
+
+            let mut withdrawn = initial.clone();
+            withdrawn.deactivate(1);
+            withdrawn.deactivate(2);
+            withdrawn.withdraw_unlinked_additions(1);
+            assert_eq!(withdrawn.slots, initial.slots[..1]);
+            assert_eq!(withdrawn.counter_consumed_end(), 0);
+            assert!(withdrawn.validate_slot_index().is_ok());
+
+            let mut compacted = initial.clone();
+            compacted.deactivate(1);
+            assert_eq!(
+                compacted.excise_unlinked_tail_cells(1, &BTreeSet::from([0, 1, 99])),
+                [0, u32::MAX, 1]
+            );
+            assert_eq!(compacted.slots[0], initial.slots[0]);
+            assert_eq!(compacted.slots[1].index, 1);
+            assert_eq!(
+                AttachKey::of(&compacted.slots[1]),
+                AttachKey::of(&initial.slots[2])
+            );
+            assert_eq!(compacted.counter_consumed_end(), 0);
+            assert!(compacted.validate_slot_index().is_ok());
+
+            let mut active_tail = initial.clone();
+            active_tail.deactivate(1);
+            let before = active_tail.clone();
+            active_tail.withdraw_unlinked_additions(1);
+            assert_eq!(
+                active_tail, before,
+                "active tail cells still prevent withdrawal"
+            );
+
+            let subset = initial
+                .attested_subset(&BTreeSet::from([PinnedObjectId(7)]), &BTreeSet::new())
+                .unwrap();
+            assert_eq!(subset.slots, initial.slots);
+            assert_eq!(subset.counter_consumed_end(), 0);
+        }
+        let default = AttachPlan::from_slots(counter_history_plan(1).slots);
+        assert_eq!(default.admission_policy(), AdmissionPolicy::Detailed);
+        assert_eq!(default.counter_consumed_end(), 0);
+    }
+
     #[test]
     fn counters_admits_a_complete_union_and_refuses_a_module_whole() {
         let sources: Vec<_> = (0..3)

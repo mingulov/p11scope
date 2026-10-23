@@ -10,7 +10,14 @@ typedef unsigned long long u64;
 #define __type(name, value) typeof(value) *name
 #define OWNER_LEASED 1U
 #ifndef P11SCOPE_OWNER_SLOT_BOUND
+#ifdef P11SCOPE_COUNTER_BANK_PROOF
+#define P11SCOPE_OWNER_SLOT_BOUND 8192U
+#else
 #define P11SCOPE_OWNER_SLOT_BOUND 512U
+#endif
+#endif
+#ifdef P11SCOPE_COUNTER_BANK_PROOF
+_Static_assert(P11SCOPE_OWNER_SLOT_BOUND == 8192U, "bank owner bound must match cleanup");
 #endif
 #if defined(P11SCOPE_INVENTORY_ONLY)
 #define OWNER_LIMIT 64ULL

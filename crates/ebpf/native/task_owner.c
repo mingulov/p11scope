@@ -964,6 +964,69 @@ __attribute__((noinline)) long p11_owner_discovery_insert(const struct owner_dis
     return -1;
 }
 
+#if defined(P11SCOPE_COUNTER_BANK_PROOF) && !defined(P11SCOPE_INVENTORY_ONLY)
+/* Helper 181 verifies the callback body once instead of exploring an 8192-slot
+ * loop frontier in each lifecycle root. This is a private feasibility profile;
+ * both actual exec/exit roots still require a separate kernel load proof. */
+static long (*owner_loop)(u32, long (*)(u32, void *), void *, u64) = (void *)181;
+
+struct owner_cleanup_context {
+    struct owner_control *ctl;
+    struct thread_owner *owner;
+    struct owner_start_key key;
+    u32 failed;
+};
+
+static long owner_cleanup_start_callback(u32 slot, void *opaque)
+{
+    struct owner_cleanup_context *context = opaque;
+    if (slot >= P11SCOPE_OWNER_SLOT_BOUND) {
+        bookkeeping(context->ctl, OWNER_START_KEY_MISMATCH);
+        context->failed = 1;
+        return 1;
+    }
+    context->key.slot = slot;
+    if (owner_map_lookup(&START, &context->key)) {
+        long rc = remove_start(context->ctl, context->owner, &context->key);
+        /* Preserve the existing remove -> readback -> abandoned count ->
+         * error-release order. In particular, cleanup works after poison;
+         * the healthy-gated public remove wrapper cannot replace this leg. */
+        if (!owner_map_lookup(&START, &context->key)) {
+            count(&context->ctl->abandoned_start);
+            if (rc)
+                release_empty(context->ctl, context->owner);
+        }
+        if (rc) {
+            context->failed = 1;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static long owner_cleanup_orphan_callback(u32 slot, void *opaque)
+{
+    struct owner_cleanup_context *context = opaque;
+    if (slot >= P11SCOPE_OWNER_SLOT_BOUND) {
+        bookkeeping(context->ctl, OWNER_START_KEY_MISMATCH);
+        context->failed = 1;
+        return 1;
+    }
+    context->key.slot = slot;
+    void *orphan = owner_map_lookup(&OBJECT_START, &context->key);
+    if (orphan) {
+        object_scrub_side(orphan);
+        if (owner_map_delete(&OBJECT_START, &context->key)) {
+            poison(context->ctl, OWNER_STATE_DELETE_FAILED);
+            context->failed = 1;
+            return 1;
+        }
+        count(&context->ctl->abandoned_start);
+    }
+    return 0;
+}
+#endif
+
 /* Called ONLY by the mandatory current-task raw exec/exit hooks. The actual
  * atomic CAS0->0 is the linearization point, not a plain or cached load.
  * Returns 0 for healthy proven cleanup (or a healthy no-op) and 1 for
@@ -996,6 +1059,36 @@ __attribute__((noinline)) u32 p11_owner_cleanup(void)
     if (!valid_owner(ctl, owner))
         return 1;
 #ifndef P11SCOPE_INVENTORY_ONLY
+#ifdef P11SCOPE_COUNTER_BANK_PROOF
+    struct owner_cleanup_context context = {
+        .ctl = ctl,
+        .owner = owner,
+        .key = { .pid_tgid = owner->original_pid_tgid, .slot = 0, .pad = 0 },
+        .failed = 0,
+    };
+    long completed = owner_loop(P11SCOPE_OWNER_SLOT_BOUND,
+                                owner_cleanup_start_callback, &context, 0);
+    if (context.failed)
+        return 1;
+    if (completed != P11SCOPE_OWNER_SLOT_BOUND) {
+        /* A short/negative helper result is not absence, even when the
+         * callbacks happened to reduce start_count to zero. Keep the lease. */
+        poison(ctl, OWNER_CLASSIFIER_FAILED);
+        return 1;
+    }
+    if (owner->start_count) {
+        bookkeeping(ctl, OWNER_START_COUNT_MISMATCH);
+        return 1;
+    }
+    completed = owner_loop(P11SCOPE_OWNER_SLOT_BOUND,
+                            owner_cleanup_orphan_callback, &context, 0);
+    if (context.failed)
+        return 1;
+    if (completed != P11SCOPE_OWNER_SLOT_BOUND) {
+        poison(ctl, OWNER_CLASSIFIER_FAILED);
+        return 1;
+    }
+#else
     struct owner_start_key start = { .pid_tgid = owner->original_pid_tgid, .slot = 0, .pad = 0 };
     for (u32 i = 0; i < P11SCOPE_OWNER_SLOT_BOUND; i++) {
         start.slot = i;
@@ -1038,6 +1131,7 @@ __attribute__((noinline)) u32 p11_owner_cleanup(void)
             count(&ctl->abandoned_start);
         }
     }
+#endif
 #endif
     struct owner_discovery_key key = { .pid_tgid = owner->original_pid_tgid };
     for (u32 i = 0; i < 64; i++) {

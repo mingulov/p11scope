@@ -421,7 +421,14 @@ fn build_variant_with_proof(
             compile.arg("-DP11SCOPE_OWNER_SLOT_BOUND=2112U");
         }
         if flavor.counters() && *unit == "task_owner" {
-            compile.arg("-DP11SCOPE_OWNER_SLOT_BOUND=512U");
+            if bank_proof {
+                compile.args([
+                    "-DP11SCOPE_COUNTER_BANK_PROOF",
+                    "-DP11SCOPE_OWNER_SLOT_BOUND=8192U",
+                ]);
+            } else {
+                compile.arg("-DP11SCOPE_OWNER_SLOT_BOUND=512U");
+            }
         }
         if !inventory && wide_detailed && *unit == "instance_epoch" {
             compile.arg("-DP11SCOPE_INSTANCE_SLOT_BOUND=2112U");

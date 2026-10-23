@@ -1,7 +1,8 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-/* Unselected fixed two-bank Counts bridge. Logical IDs remain 0/1 inside
- * the existing native512/START16384/RV4096 universe. This does not grow a
- * hot RV map or authorize any Session attachment/public selector. */
+/* Unselected fixed two-bank Counts bridge. Logical IDs remain 0/1 with
+ * STATS512/START16384/RV4096. The separately selected native owner cleanup
+ * profile spans 8192; that feasibility bound does not provide 8192 bank cells,
+ * grow a hot RV map or authorize a public counter selector. */
 typedef unsigned int u32;
 typedef unsigned long long u64;
 #define SEC(name) __attribute__((section(name), used))

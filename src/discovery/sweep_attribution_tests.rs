@@ -2780,6 +2780,261 @@ fn privileged_a_btrfs_collision_on_a_data_range_keeps_the_exec_proven_edge() {
     std::fs::remove_dir(parent.join("t")).unwrap();
 }
 
+fn d4_kernel_collision_attribution(
+    child: &SwapChild,
+    snapshot: Vec<MapEntry>,
+    pins: &crate::discovery::identity::PinnedObjects,
+    object: PinnedObjectId,
+    key: ObjectKey,
+    session: &mut crate::discovery::kernel_identity::IdentitySession,
+    generation: u64,
+) -> SweepAttribution {
+    use crate::discovery::kernel_identity::{AnchorPass, ExaminedCustody, KernelMemberProbe};
+    use std::sync::{Arc, Mutex};
+
+    let (mut index, refused) = KnownKeyIndex::build(
+        [(key, Some(object))],
+        &BTreeMap::from([(key, object)]),
+        [],
+        pins,
+    );
+    assert!(refused.is_empty(), "{refused:?}");
+    assert!(
+        index.map_files_keys().contains(&key),
+        "Btrfs collision must require actual per-range proof"
+    );
+    let owner = ReservationOwner::for_examined(
+        SegmentPolicy::try_snapshot(0, 0).expect("actual FD census"),
+        0,
+    );
+    let mut custody = ExaminedCustody::new(owner, BTreeMap::new());
+    custody
+        .reconcile(SegmentPolicy::try_snapshot(1, 1).expect("actual confirmation FD census"))
+        .expect("shared physical reservation owner");
+    let pass = AnchorPass::prepare(pins, [(key, object)], custody);
+    assert!(pass.fallback.is_empty(), "{:?}", pass.fallback);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut installed = session
+        .install_anchors(pass, generation, deadline)
+        .expect("install actual held-file anchors");
+    let trace = Arc::new(Mutex::new(ProofTrace::default()));
+    let out = {
+        let mut probe = KernelMemberProbe::new(
+            &mut installed,
+            OsConfirmIo::with_pool(None).observing(trace.clone()),
+            deadline,
+        );
+        probe
+            .install_expectations(&mut index)
+            .expect("actual validated anchor expectations");
+        assert!(
+            index
+                .match_slots
+                .get(&key)
+                .is_some_and(|slots| !slots.is_empty()),
+            "the held provider has no validated actual kernel slot"
+        );
+        let mut budget = CaptureWorkBudget::default();
+        assert!(
+            !budget.has_collection_work(),
+            "exercise actual kernel proof, not scoped fallback"
+        );
+        attribute_unselected(
+            &[(child.pid as u32, snapshot)],
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &index,
+            &mut probe,
+            &mut budget,
+        )
+    };
+    drop(installed);
+    let fallback = session.fallback_totals();
+    assert_eq!(fallback.passes, 0, "{fallback:?}");
+    assert_eq!(fallback.pids, 0, "{fallback:?}");
+    assert_eq!(fallback.keys, 0, "{fallback:?}");
+    assert!(fallback.first_reason.is_none(), "{fallback:?}");
+    assert!(
+        trace.lock().unwrap().reads.is_empty(),
+        "the required kernel leg performed userspace range-proof reads"
+    );
+    out
+}
+
+/// Actual identity-substrate parity on one live population: two equal-byte
+/// files in separate Btrfs subvolumes have one lexical maps key but different
+/// physical identities. No gcc, source files or external provider are needed
+/// at runtime: the real identity object is embedded in this libtest.
+/// Same-line remapping and the complete five D4 rows remain separate gates.
+#[test]
+#[ignore = "root Btrfs disk TMPDIR plus eligible BTF/task_vma identity; actual kernel/userspace parity"]
+fn privileged_d4_btrfs_subvolume_collision_backend_parity() {
+    use crate::discovery::identity::{PinnedObjects, test_fixture::real_scan_pin};
+    use crate::discovery::kernel_identity::IdentitySession;
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::MetadataExt as _;
+
+    crate::attach::identity_iter::ensure_kernel_identity_btf()
+        .expect("required kernel identity capability; refusal cannot qualify");
+    let btf = aya::Btf::from_sys_fs().expect("readable host BTF");
+    let dir = tempfile::tempdir().unwrap();
+    let parent = dir.path();
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    let c_parent = std::ffi::CString::new(parent.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: a valid path and writable statfs buffer, read only on success.
+    assert_eq!(
+        unsafe { libc::statfs(c_parent.as_ptr(), stat.as_mut_ptr()) },
+        0
+    );
+    // SAFETY: initialized by the successful statfs above.
+    let magic = unsafe { stat.assume_init().f_type } as u64 & 0xffff_ffff;
+    assert_eq!(magic, 0x9123_683e, "actual fixture TMPDIR must be Btrfs");
+    create_subvolume(parent, "a");
+    create_subvolume(parent, "b");
+    let a_path = parent.join("a/libcollision.so");
+    let b_path = parent.join("b/libcollision.so");
+    std::fs::write(&a_path, vec![0xa5u8; 8192]).unwrap();
+    std::fs::copy(&a_path, &b_path).unwrap();
+    let a_file = std::fs::File::open(&a_path).unwrap();
+    let b_file = std::fs::File::open(&b_path).unwrap();
+    let a = a_file.metadata().unwrap();
+    let b = b_file.metadata().unwrap();
+    assert_eq!(
+        std::fs::read(&a_path).unwrap(),
+        std::fs::read(&b_path).unwrap()
+    );
+    assert_eq!(
+        a.ino(),
+        b.ino(),
+        "fresh subvolume files share the inode number"
+    );
+    assert_ne!(
+        (a.dev(), a.ino()),
+        (b.dev(), b.ino()),
+        "full physical IDs must differ"
+    );
+
+    let caller = SwapChild::spawn_with(&[(&a_path, true), (&b_path, false)]);
+    let wrong = SwapChild::spawn_with(&[(&b_path, true), (&a_path, false)]);
+    let reader = SwapChild::spawn_with(&[(&a_path, false)]);
+    let snapshots = [caller.maps(), wrong.maps(), reader.maps()];
+    fn line_at(snapshot: &[MapEntry], address: u64) -> &MapEntry {
+        snapshot
+            .iter()
+            .find(|entry| entry.start == address)
+            .expect("independent live mapping")
+    }
+    let a_text = line_at(&snapshots[0], caller.addresses[0]);
+    let b_data = line_at(&snapshots[0], caller.addresses[1]);
+    let b_text = line_at(&snapshots[1], wrong.addresses[0]);
+    let a_data = line_at(&snapshots[1], wrong.addresses[1]);
+    let reader_data = line_at(&snapshots[2], reader.address);
+    assert_eq!(a_text.permissions, *b"r-xp");
+    assert_eq!(b_text.permissions, *b"r-xp");
+    for data in [b_data, a_data, reader_data] {
+        assert_eq!(data.permissions, *b"r--p");
+    }
+    let key = ObjectKey::of(a_text);
+    for entry in [b_data, b_text, a_data, reader_data] {
+        assert_eq!(
+            ObjectKey::of(entry),
+            key,
+            "actual lexical collision, not scripted keys"
+        );
+    }
+    let digest = format!("{:x}", Sha256::digest(std::fs::read(&a_path).unwrap()));
+    let pins: PinnedObjects = real_scan_pin(&a_path, Some(key), 0, &digest);
+    let object = pins.pinned().next().expect("actual held-file pin").id;
+    let (userspace_index, refused) = KnownKeyIndex::build(
+        [(key, Some(object))],
+        &BTreeMap::from([(key, object)]),
+        [],
+        &pins,
+    );
+    assert!(refused.is_empty(), "{refused:?}");
+    assert!(userspace_index.map_files_keys().contains(&key));
+    let probe_dir = tempfile::tempdir().unwrap();
+    let mut session = IdentitySession::probe_and_load(&btf, probe_dir.path())
+        .expect("actual strict-loaded kernel session; no refused/fallback positive");
+    for (position, child) in [&caller, &wrong, &reader].into_iter().enumerate() {
+        let userspace = attribute_child(child, snapshots[position].clone(), &userspace_index);
+        let kernel = d4_kernel_collision_attribution(
+            child,
+            snapshots[position].clone(),
+            &pins,
+            object,
+            key,
+            &mut session,
+            position as u64 + 1,
+        );
+        assert_eq!(
+            userspace.members, kernel.members,
+            "exact same-population backend members"
+        );
+        assert_eq!(
+            userspace.losses, kernel.losses,
+            "same actual loss classifications"
+        );
+        for (backend, out) in [("userspace", userspace), ("kernel", kernel)] {
+            let members: Vec<_> = out.members.iter().map(|member| member.pid).collect();
+            match position {
+                0 => {
+                    assert_eq!(
+                        members,
+                        [caller.pid as u32],
+                        "{backend} exact healthy caller"
+                    );
+                    assert_eq!(
+                        out.members[0]
+                            .objects
+                            .iter()
+                            .map(|matched| (matched.key, matched.object))
+                            .collect::<Vec<_>>(),
+                        [(key, object)],
+                        "{backend} exact held original-provider edge"
+                    );
+                    assert!(out.losses.is_empty(), "{backend}: {:?}", out.member_losses);
+                    assert_eq!(out.probed, 1, "{backend} nonempty executable proof demand");
+                }
+                1 => {
+                    assert!(
+                        members.is_empty(),
+                        "{backend} attributed the distinct equal-byte file"
+                    );
+                    assert_eq!(
+                        out.losses,
+                        BTreeMap::from([(AttributionLoss::IdentityMismatch, 1)])
+                    );
+                    assert_eq!(out.probed, 1, "{backend} real negative proof demand");
+                }
+                2 => {
+                    assert!(
+                        members.is_empty(),
+                        "{backend} attributed a data-only mapping"
+                    );
+                    assert!(out.losses.is_empty(), "{backend}: {:?}", out.member_losses);
+                    assert_eq!(
+                        out.probed, 0,
+                        "{backend} data-only input costs no executable proof"
+                    );
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+    eprintln!(
+        "D4_BTRFS_COLLISION callers={}/{}/{} userspace=1/0/0 kernel=1/0/0 \
+         equal_bytes=true lexical_collision=true fallback=none",
+        caller.pid, wrong.pid, reader.pid
+    );
+    drop((caller, wrong, reader));
+    drop((session, pins, a_file, b_file));
+    std::fs::remove_file(&a_path).unwrap();
+    std::fs::remove_file(&b_path).unwrap();
+    std::fs::remove_dir(parent.join("a")).unwrap();
+    std::fs::remove_dir(parent.join("b")).unwrap();
+}
+
 /// Root with a loop-mounted ext4: there a held file's maps key is its
 /// identity, so no per-range stat runs at all. Before A6 a process that
 /// mapped the file only read-only was attributed on the key alone; now

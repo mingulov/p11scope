@@ -6625,8 +6625,28 @@ impl CanonicalFanoutScene {
         joint_preparation: bool,
         probe_preparation_refusal: bool,
     ) -> (Self, IngestedJointQuantum) {
+        Self::first_publication_inputs_at_start(
+            providers,
+            functions,
+            receipt_policy,
+            joint_preparation,
+            probe_preparation_refusal,
+            |_| (),
+        )
+        .0
+    }
+
+    fn first_publication_inputs_at_start<R>(
+        providers: usize,
+        functions: &[&str],
+        receipt_policy: PublicationReceipts,
+        joint_preparation: bool,
+        probe_preparation_refusal: bool,
+        observe: impl FnOnce(&mut JointScene) -> R,
+    ) -> ((Self, IngestedJointQuantum), R) {
         let (held, attached) = HeldProviders::with_attachment(providers, functions);
         let mut scene = JointScene::from_held(held, Some(attached));
+        let initial = observe(&mut scene);
         scene.real.h0.0.borrow_mut().io.script.local = 1;
         let child = OwnedStoppedChild::new();
         let first = scene.real.bind(
@@ -6910,25 +6930,37 @@ impl CanonicalFanoutScene {
             );
         }
         (
-            Self {
-                scene,
-                attached,
-                births,
-                grant,
-                published_before,
-                _child: child,
-            },
-            frame,
+            (
+                Self {
+                    scene,
+                    attached,
+                    births,
+                    grant,
+                    published_before,
+                    _child: child,
+                },
+                frame,
+            ),
+            initial,
         )
     }
 
     fn prior_sealed_with_functions(providers: usize, functions: &[&str]) -> Self {
-        let (mut fixture, frame) = Self::first_publication_inputs(
+        Self::prior_sealed_with_functions_at_start(providers, functions, |_| ()).0
+    }
+
+    fn prior_sealed_with_functions_at_start<R>(
+        providers: usize,
+        functions: &[&str],
+        observe: impl FnOnce(&mut JointScene) -> R,
+    ) -> (Self, R) {
+        let ((mut fixture, frame), initial) = Self::first_publication_inputs_at_start(
             providers,
             functions,
             PublicationReceipts::All,
             false,
             false,
+            observe,
         );
         let Self {
             scene,
@@ -7010,7 +7042,7 @@ impl CanonicalFanoutScene {
                 .iter()
                 .all(|object| object.lifetime == Lifetime::Live)
         );
-        fixture
+        (fixture, initial)
     }
 
     fn receipts(&self) -> Vec<BootstrapReceipt> {
@@ -12852,7 +12884,57 @@ fn joint_s1_original_disposition_preserves_interleaved_healthy_image() {
     use crate::semantics_objects::journal::{AttestationRefusal, JournalGap};
     for tainted_first in [false, true] {
         for stale_frontier in [false, true] {
-            let mut fixture = CanonicalFanoutScene::prior_sealed_with_providers(2);
+            let (mut fixture, mut foreign) =
+                CanonicalFanoutScene::prior_sealed_with_functions_at_start(
+                    2,
+                    &[
+                        "C_CreateObject",
+                        "C_SignInit",
+                        "C_SignUpdate",
+                        "C_SignFinal",
+                    ],
+                    |scene| {
+                        // Bind resource producers at the ACTUAL initial boundary,
+                        // before this cursor has consumed any fixture record.
+                        // No extra cursor, prefix setter or semantic grant exists.
+                        let before = scene.drain.consumption_cut().unwrap();
+                        assert!(before.is_initial());
+                        let reserve = scene
+                            .real
+                            .scene
+                            .coordinator
+                            .registry()
+                            .semantic_storage_reserver();
+                        let mut foreign = JournalAdapter::with_ledger(
+                            crate::semantics_objects::journal::JournalLimits::policy(),
+                            crate::semantics_objects::journal::StagingLedger::with_resources(
+                                scene
+                                    .real
+                                    .scene
+                                    .coordinator
+                                    .registry()
+                                    .semantic_storage_reserver(),
+                            ),
+                        );
+                        let (unobserved, poll) = RawJointQuantum::begin_bounded_with_adapter(
+                            &mut scene.drain,
+                            &publish_object_descriptors(),
+                            4,
+                            0,
+                            None,
+                            &BirthFault,
+                            &scene.producers,
+                            |bytes| reserve.reserve(bytes),
+                            &mut foreign,
+                        )
+                        .unwrap();
+                        assert!(poll.is_none());
+                        assert!(before.same_boundary(&scene.drain.consumption_cut().unwrap()));
+                        assert_eq!(scene.drain.source_mut().remaining(), 0);
+                        drop(unobserved);
+                        foreign
+                    },
+                );
             let targets = fixture
                 .scene
                 .real
@@ -13016,43 +13098,6 @@ fn joint_s1_original_disposition_preserves_interleaved_healthy_image() {
                     break;
                 }
                 if sequence == 3 {
-                    let reserve = fixture
-                        .scene
-                        .real
-                        .scene
-                        .coordinator
-                        .registry()
-                        .semantic_storage_reserver();
-                    let mut foreign = JournalAdapter::with_ledger(
-                        crate::semantics_objects::journal::JournalLimits::policy(),
-                        crate::semantics_objects::journal::StagingLedger::with_resources(
-                            fixture
-                                .scene
-                                .real
-                                .scene
-                                .coordinator
-                                .registry()
-                                .semantic_storage_reserver(),
-                        ),
-                    );
-                    // Bind resource producers through the actual zero-work
-                    // collector. This observes NO empty prefix and grants no
-                    // H0/H3/drain authority; it only constructs the hostile
-                    // same-producer/different-ledger comparison.
-                    let (unobserved, poll) = RawJointQuantum::begin_bounded_with_adapter(
-                        &mut fixture.scene.drain,
-                        &publish_object_descriptors(),
-                        4,
-                        0,
-                        None,
-                        &BirthFault,
-                        &fixture.scene.producers,
-                        |bytes| reserve.reserve(bytes),
-                        &mut foreign,
-                    )
-                    .unwrap();
-                    assert!(poll.is_none());
-                    drop(unobserved);
                     let coordinator = &mut fixture.scene.real.scene.coordinator;
                     let (prepared, owner) = coordinator.prepared_joint_parts().unwrap();
                     let input = prepared

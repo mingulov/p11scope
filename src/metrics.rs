@@ -13,6 +13,9 @@ mod counter_collector;
 #[cfg_attr(not(test), allow(dead_code))]
 mod counter_reader;
 
+#[cfg_attr(not(test), allow(dead_code))]
+mod counter_projection;
+
 use crate::attach::Session;
 use crate::plan::{AttachPlan, ModuleId};
 use anyhow::{Context as _, Result};

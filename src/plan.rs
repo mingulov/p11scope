@@ -3534,6 +3534,35 @@ mod tests {
     use p11scope_manifest::identity::{IdentityKind, ObjectIdentity};
     use p11scope_manifest::manifest::*;
 
+    #[test]
+    fn borrowed_projection_metadata_matches_exact_lookups_and_empty_twins() {
+        let mut plan =
+            build_from_reconciled_modules(&[scanned_with(TEST_OBJECT, "/owned.so", [0x10])]);
+        let slot = plan.slots[0].clone();
+        plan.object_identities.insert(
+            slot.object,
+            TargetObject {
+                dev: (8, 1),
+                ino: 42,
+                sha256: Some("11".repeat(32)),
+            },
+        );
+        let ordinals: Vec<_> = plan.borrowed_ordinals_of(&slot).collect();
+        assert_eq!(ordinals, plan.ordinals_of(&slot));
+        assert!(!ordinals.is_empty());
+        assert_eq!(plan.ordinal_count(&slot), ordinals.len());
+        assert!(std::ptr::eq(
+            plan.borrowed_target_object_of(&slot).unwrap(),
+            plan.object_identities.get(&slot.object).unwrap(),
+        ));
+        let mut absent = slot.clone();
+        absent.file_offset += 1;
+        assert_eq!(plan.ordinal_count(&absent), 0);
+        assert_eq!(plan.borrowed_ordinals_of(&absent).count(), 0);
+        absent.object = PinnedObjectId(u32::MAX);
+        assert!(plan.borrowed_target_object_of(&absent).is_none());
+    }
+
     fn manifest_with(functions: Vec<FunctionRecord>) -> Manifest {
         Manifest {
             schema: SCHEMA.to_string(),

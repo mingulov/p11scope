@@ -596,13 +596,14 @@ mod tests {
     /// HIGH-2: when the scan could not read the target's mappings at all
     /// (another user's process: `/proc/<pid>/maps` is EACCES), inspect knows
     /// nothing about its modules. That is the documented hard error — one
-    /// stderr line naming the cause and the fix, empty stdout, exit 1 — never
+    /// stderr line naming the cause (and a permission fix when applicable),
+    /// empty stdout, exit 1 — never
     /// "0 PKCS#11 modules mapped" with `scan.status: scanned` and exit 0.
     #[test]
     fn unreadable_target_mappings_are_a_hard_error_not_zero_modules() {
-        for reason in [
-            "Permission denied (os error 13)",
-            "reversed or overlapping /proc/<pid>/maps intervals",
+        for (reason, permission_guidance) in [
+            ("Permission denied (os error 13)", true),
+            ("reversed or overlapping /proc/<pid>/maps intervals", false),
         ] {
             let unreadable = || {
                 Ok((
@@ -630,10 +631,14 @@ mod tests {
                 let error = format!("{:#}", result.expect_err("an unreadable target must fail"));
                 assert!(error.contains("/proc/1379/maps"), "{error}");
                 assert!(error.contains(reason), "{error}");
-                assert!(
-                    error.contains("sudo p11scope inspect --pid 1379"),
-                    "{error}"
-                );
+                if permission_guidance {
+                    assert!(
+                        error.contains("sudo p11scope inspect --pid 1379"),
+                        "{error}"
+                    );
+                } else {
+                    assert!(!error.contains("sudo "), "{error}");
+                }
                 assert!(error.contains("unknown, not absent"), "{error}");
                 assert!(!error.contains("0 PKCS#11 modules"), "{error}");
             }

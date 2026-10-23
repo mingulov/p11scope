@@ -1417,6 +1417,7 @@ pub(crate) struct ScriptedRecords {
     queue: std::collections::VecDeque<Vec<u8>>,
     pub(crate) bound: usize,
     taken: usize,
+    front_busy: bool,
 }
 
 #[cfg(test)]
@@ -1430,17 +1431,34 @@ impl ScriptedRecords {
             queue: records.into_iter().collect(),
             bound,
             taken: 0,
+            front_busy: false,
         }
     }
 
     pub(crate) fn remaining(&self) -> usize {
         self.queue.len()
     }
+
+    pub(crate) fn block_front(&mut self) {
+        assert!(
+            !self.queue.is_empty(),
+            "BUSY needs an owned queued reservation"
+        );
+        self.front_busy = true;
+    }
+
+    pub(crate) fn release_front(&mut self) {
+        assert!(self.front_busy && !self.queue.is_empty());
+        self.front_busy = false;
+    }
 }
 
 #[cfg(test)]
 impl RecordSource for ScriptedRecords {
     fn next_record(&mut self) -> Option<impl Deref<Target = [u8]> + '_> {
+        if self.front_busy {
+            return None;
+        }
         let item = self.queue.pop_front()?;
         self.taken += 1;
         assert!(
@@ -1483,6 +1501,9 @@ impl BoundedRecordSource for ScriptedRecords {
     ) -> Result<BoundedRecord<impl Deref<Target = [u8]> + '_>> {
         if self.taken * 8 == stop {
             return Ok(BoundedRecord::Reached);
+        }
+        if self.front_busy {
+            return Ok(BoundedRecord::Pending);
         }
         match self.queue.pop_front() {
             Some(item) => {

@@ -174,6 +174,7 @@ struct HeldIo {
     /// Scripted native input only, installed before H0 observes a scan.
     /// Each file can move independently while sibling proofs stay current.
     scan_inputs: HashMap<u32, (u64, u32)>,
+    absent_files: BTreeSet<u32>,
 }
 
 impl HeldIo {
@@ -206,6 +207,7 @@ impl HeldIo {
             watched,
             targets: HashMap::new(),
             scan_inputs: HashMap::new(),
+            absent_files: BTreeSet::new(),
         }
     }
 
@@ -259,6 +261,9 @@ impl HeldIo {
         endpoint: Endpoint,
         fence: u64,
     ) -> Result<ImageScanProof, ImageQueryRefusal> {
+        if self.absent_files.contains(&endpoint.file_slot) {
+            return Err(ImageQueryRefusal::Empty);
+        }
         let page = endpoint.offset & !0xfff;
         let (base, local) = self.scan_input(endpoint.file_slot);
         acquire_test_scan(

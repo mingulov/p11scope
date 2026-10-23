@@ -201,6 +201,11 @@ struct MachineNativeRows {
         bool,
     )>,
     fail_after_preparation: bool,
+    absence_reads: Vec<(u64, ImageIdentity, u32)>,
+    birth_outcomes: Vec<(
+        u32,
+        Result<crate::semantics_objects::journal::BirthKind, BirthObservationRefusal>,
+    )>,
 }
 
 struct HeldMachineIo<'a> {
@@ -306,29 +311,44 @@ impl crate::inventory_semantics::JointMachineIo for HeldMachineIo<'_> {
         &mut self,
         _lane: &mut AttestedSemanticLane,
         candidate: H0BirthCandidate,
+        absence: Option<CommittedAbsenceBirth>,
         input: &crate::discovery::caller_registry::instance_input::AdmittedInstanceCall,
         binding: &SemanticCallerBinding,
         proof: &JournalDomainProof,
         adapter: &JournalAdapter,
     ) -> Result<RetainedBirthWitness, BirthObservationRefusal> {
-        let (row, control, _) = self
-            .native
-            .publisher
-            .publish_stamped(&["0", "0"], self.attached.generation());
+        let unmarked = absence.is_some() || input.s1_facts().function == "C_GetSessionInfo";
+        let (row, control, _) = self.native.publisher.publish_stamped(
+            if unmarked {
+                &["0", "0", "0", "0", "1"]
+            } else {
+                &["0", "0"]
+            },
+            self.attached.generation(),
+        );
         let mut rows = NativeBirthRows { row, control };
         let mut owned = self.h0.0.borrow_mut();
         let HeldH0 { capture, io, .. } = &mut *owned;
         capture.validate_birth_candidate(io, &candidate, false)?;
-        let witness = capture.finish_birth(
+        let file = candidate.receipt.endpoint().file_slot;
+        let result = capture.finish_birth(
             candidate,
-            None,
+            absence,
             input,
             binding,
             self.attached,
             proof,
             adapter,
             &mut rows,
-        )?;
+        );
+        self.native.birth_outcomes.push((
+            file,
+            result
+                .as_ref()
+                .map(|witness| witness.receipt().birth())
+                .map_err(|reason| *reason),
+        ));
+        let witness = result?;
         assert!(
             self.native
                 .rows
@@ -338,10 +358,96 @@ impl crate::inventory_semantics::JointMachineIo for HeldMachineIo<'_> {
         Ok(witness)
     }
 
+    fn acquire_absence(
+        &mut self,
+        _lane: &mut AttestedSemanticLane,
+        binding: &SemanticCallerBinding,
+        slot: u32,
+        adapter: &mut JournalAdapter,
+    ) -> Result<CommittedAbsenceBirth, BirthObservationRefusal> {
+        let before = self
+            .drain
+            .consumption_cut()
+            .map_err(|_| BirthObservationRefusal::StreamCut)?;
+        if !before.is_drained() {
+            return Err(BirthObservationRefusal::StreamCut);
+        }
+        let mut held = self.h0.0.borrow_mut();
+        let HeldH0 { capture, io, .. } = &mut *held;
+        let endpoint = io
+            .endpoint(slot)
+            .ok_or(BirthObservationRefusal::AttachmentMismatch)?;
+        self.native
+            .absence_reads
+            .push((capture.identity, binding.image(), endpoint.file_slot));
+        let maps = io
+            .watched
+            .iter()
+            .enumerate()
+            .filter(|(file, _)| !io.absent_files.contains(&(*file as u32)))
+            .map(|(file, watched)| {
+                let key = watched.object_key();
+                let (base, _) = io.scan_input(file as u32);
+                p11scope_manifest::maps::MapEntry {
+                    start: base,
+                    end: base + 0x10000,
+                    file_offset: 0,
+                    permissions: *b"r-xp",
+                    device: key.device,
+                    inode: key.inode,
+                    raw_path: None,
+                }
+            })
+            .collect();
+        let target = io.watched[endpoint.file_slot as usize].object_key();
+        let proof = crate::attach::image_query::acquire_test_absence(
+            io.script.domain,
+            binding.image(),
+            endpoint.file_slot,
+            CompleteEpochs {
+                local: u64::from(io.scan_input(endpoint.file_slot).1),
+                global: 0,
+                fault: io.script.last_health.fault,
+                sticky: io.script.last_health.sticky,
+                record_flags: 0,
+            },
+            maps,
+            self.attached.generation(),
+            vec![target],
+            crate::discovery::instances::MappedFileIdentity {
+                dev: libc::makedev(target.device.major, target.device.minor),
+                ino: target.inode,
+            },
+            |_, _| {
+                Ok(crate::discovery::instances::MappedFileIdentity {
+                    dev: libc::makedev(target.device.major, target.device.minor),
+                    ino: target.inode,
+                })
+            },
+            capture.router.fence(),
+        )
+        .map_err(|_| BirthObservationRefusal::CurrentPartition)?;
+        let after = self
+            .drain
+            .consumption_cut()
+            .map_err(|_| BirthObservationRefusal::StreamCut)?;
+        capture.commit_absence_with(
+            io,
+            proof,
+            before,
+            after,
+            binding,
+            self.attached,
+            slot,
+            adapter,
+            self.producers,
+        )
+    }
+
     fn with_native<R>(
         &mut self,
         _lane: &mut AttestedSemanticLane,
-        witnesses: &[crate::inventory_semantics::RetainedJointBirth],
+        witnesses: &crate::inventory_semantics::RetainedJointBirths,
         inspect: impl for<'io> FnOnce(crate::inventory_semantics::JointCommitIo<'io>) -> R,
     ) -> Result<R, SemanticRefusal> {
         let mut owned = self
@@ -364,7 +470,7 @@ impl crate::inventory_semantics::JointMachineIo for HeldMachineIo<'_> {
             reads: &self.native.reads,
         };
         let native = RefCell::new(&mut native);
-        crate::inventory_semantics::with_joint_commit_io_for_test(
+        crate::inventory_semantics::with_joint_commit_io_for_births_test(
             capture,
             stash,
             self.producers,
@@ -383,22 +489,143 @@ struct MachineScene {
 }
 
 impl MachineScene {
+    fn absence_scene(providers: usize) -> Self {
+        let mut fixture = Self::with_initial_files(providers, &[0], true);
+        fixture.push_quiet();
+        fixture.published();
+        assert_eq!(
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .registry()
+                .joint_feeds(),
+            0
+        );
+        assert!(
+            fixture
+                .native
+                .birth_outcomes
+                .iter()
+                .any(|(file, result)| *file == 0 && result.is_err())
+        );
+        fixture
+    }
+
+    fn push_quiet(&mut self) {
+        let mut held = self.scene.real.h0.0.borrow_mut();
+        held.io
+            .enqueue(std::process::id(), 0, "C_GetSessionInfo", 0, 0);
+        let mut record = held.io.script.records.pop_back().unwrap();
+        record.base.event.target_function = p11scope_ebpf_common::FUNCTION_NONE;
+        assert_eq!(
+            record.base.event.target_function,
+            p11scope_ebpf_common::FUNCTION_NONE
+        );
+        let bytes = crate::events::record_bytes(&record.base);
+        drop(held);
+        self.scene.drain.source_mut().push_record(bytes);
+    }
+
+    fn pending_absence(&self, file: u32) -> Option<&CommittedAbsenceBirth> {
+        self.machine
+            .retained_births_for_test()
+            .pending_for_test()
+            .find(|negative| negative.proof.file_slot() == file)
+    }
+
+    fn ready_birth(&self, file: u32) -> Option<&RetainedBirthWitness> {
+        self.machine
+            .retained_births_for_test()
+            .ready_for_test()
+            .find(|witness| witness.candidate.receipt.endpoint().file_slot == file)
+    }
+
+    fn wait_absence(&mut self, file: u32) {
+        for _ in 0..128 {
+            if self.pending_absence(file).is_some() {
+                return;
+            }
+            self.service(1).unwrap();
+        }
+        panic!("actual absent target {file} must be selected before a later appearance");
+    }
+
+    fn appear(&mut self, file: u32, epoch: u32) {
+        let pid = std::process::id();
+        let caller = self
+            .scene
+            .real
+            .scene
+            .coordinator
+            .adapter()
+            .live_id(pid)
+            .unwrap();
+        let (module, path) = &self.scene.real.modules[file as usize];
+        self.scene
+            .real
+            .scene
+            .coordinator
+            .registry_mut()
+            .note_mapping(
+                caller,
+                pid,
+                ModuleInfo {
+                    path: path.clone(),
+                    key: module.clone(),
+                    double_loaded: false,
+                    build_id: None,
+                    identity_source: Some("held-provider-appearance".into()),
+                    admission: AdmissionState::Admitted,
+                    admission_class: Some("exact".into()),
+                    admission_endpoints: Some(5),
+                    admission_reasons: Vec::new(),
+                },
+                70,
+            );
+        let mut held = self.scene.real.h0.0.borrow_mut();
+        assert!(held.io.absent_files.remove(&file));
+        let (base, _) = held.io.scan_input(file);
+        held.io.scan_inputs.insert(file, (base, epoch));
+    }
+
     fn new(providers: usize) -> Self {
+        Self::with_initial_files(providers, &(0..providers as u32).collect::<Vec<_>>(), false)
+    }
+
+    fn with_initial_files(providers: usize, mapped: &[u32], quiet: bool) -> Self {
         let (held, attached) = HeldProviders::with_attachment(
             providers,
-            &[
-                "C_CreateObject",
-                "C_SignInit",
-                "C_SignUpdate",
-                "C_SignFinal",
-            ],
+            if quiet {
+                &[
+                    "C_CreateObject",
+                    "C_SignInit",
+                    "C_SignUpdate",
+                    "C_SignFinal",
+                    "C_GetSessionInfo",
+                ]
+            } else {
+                &[
+                    "C_CreateObject",
+                    "C_SignInit",
+                    "C_SignUpdate",
+                    "C_SignFinal",
+                ]
+            },
         );
         let mut scene = JointScene::from_held(held, Some(attached));
         let pid = std::process::id();
         SIGHT_NS.with(|clock| clock.set(1_005));
         scene.real.h0.0.borrow_mut().io.script.local = 1;
         let caller = scene.real.scene.admit(pid, 50);
-        for (module, path) in &scene.real.modules {
+        for (_, (module, path)) in scene
+            .real
+            .modules
+            .iter()
+            .enumerate()
+            .filter(|(file, _)| mapped.contains(&(*file as u32)))
+        {
             scene.real.scene.coordinator.registry_mut().note_mapping(
                 caller,
                 pid,
@@ -410,7 +637,7 @@ impl MachineScene {
                     identity_source: Some("held-provider".into()),
                     admission: AdmissionState::Admitted,
                     admission_class: Some("exact".into()),
-                    admission_endpoints: Some(4),
+                    admission_endpoints: Some(if quiet { 5 } else { 4 }),
                     admission_reasons: Vec::new(),
                 },
                 60,
@@ -434,6 +661,9 @@ impl MachineScene {
             ),
         );
         drop(candidate);
+        scene.real.h0.0.borrow_mut().io.absent_files = (0..providers as u32)
+            .filter(|file| !mapped.contains(file))
+            .collect();
         assert_eq!(scene.real.scene.coordinator.semantic_bindings().len(), 0);
         let reserve = scene
             .real
@@ -452,6 +682,8 @@ impl MachineScene {
                 reads: Cell::new((0, 0)),
                 preparations: Vec::new(),
                 fail_after_preparation: false,
+                absence_reads: Vec::new(),
+                birth_outcomes: Vec::new(),
             },
         }
     }
@@ -592,6 +824,545 @@ impl MachineScene {
             .instance_semantic_edges()
             .map(|record| record.feed.reduced())
             .collect()
+    }
+}
+
+#[test]
+fn joint_machine_absence_before_appearance_publishes_first_joint() {
+    use crate::semantics_objects::journal::BirthKind;
+    let mut fixture = MachineScene::absence_scene(2);
+    let pending_before = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .published_revision();
+    fixture.wait_absence(1);
+    let negative = fixture.pending_absence(1).unwrap();
+    assert_eq!(
+        negative.proof.image(),
+        ImageIdentity {
+            task_cookie: 71,
+            exec_id: 0
+        }
+    );
+    assert_eq!(negative.proof.epochs().local, 1);
+    let original = (
+        negative.capture,
+        Arc::as_ptr(&negative.pin),
+        negative.proof.fence(),
+    );
+    let reads = fixture
+        .native
+        .absence_reads
+        .iter()
+        .filter(|(_, _, file)| *file == 1)
+        .count();
+    for _ in 0..3 {
+        fixture.service(1).unwrap();
+        let negative = fixture.pending_absence(1).unwrap();
+        assert_eq!(
+            (
+                negative.capture,
+                Arc::as_ptr(&negative.pin),
+                negative.proof.fence()
+            ),
+            original
+        );
+    }
+    assert_eq!(
+        fixture
+            .native
+            .absence_reads
+            .iter()
+            .filter(|(_, _, file)| *file == 1)
+            .count(),
+        reads
+    );
+    fixture.appear(1, 2);
+    fixture
+        .scene
+        .push(std::process::id(), 1, "C_CreateObject", 2);
+    fixture.scene.push(std::process::id(), 1, "C_SignInit", 3);
+    fixture.published();
+    assert!(fixture.pending_absence(1).is_none());
+    let witness = fixture.ready_birth(1).unwrap();
+    assert_eq!(witness.receipt().birth(), BirthKind::AbsenceAppearance);
+    assert!(witness.receipt().birth_cut() >= 1);
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .joint_feeds(),
+        1
+    );
+    assert_eq!(fixture.reduced_for(1), 2);
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .published_revision(),
+        pending_before + 1
+    );
+    fixture.scene.push(std::process::id(), 1, "C_SignFinal", 4);
+    fixture.published();
+    assert_eq!(fixture.reduced_for(1), 3);
+    assert!(fixture.native.reads.get().0 > 0 && fixture.native.reads.get().1 > 0);
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .invocation_claims_for_test()
+            .0,
+        0
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .ledger()
+            .roles_for_test()[..4],
+        [0, 0, 0, 0]
+    );
+}
+
+#[test]
+fn joint_machine_absence_rejects_late_busy_and_affecting_prefix() {
+    // Reservation-source healthy twin: BUSY owns its queued bytes and position;
+    // releasing unmasks that same item rather than retracting a producer slot.
+    let bytes = vec![0x31, 0x22, 0x13];
+    let mut source = ScriptedRecords::records([bytes.clone()], 1);
+    source.block_front();
+    let reserved = crate::events::BoundedRecordSource::positions(&source);
+    let (_, allocations, allocated_bytes) = crate::test_alloc::count_allocs_during(|| {
+        assert!(crate::events::RecordSource::next_record(&mut source).is_none());
+        assert!(matches!(
+            crate::events::BoundedRecordSource::bounded_record(&mut source, reserved.producer)
+                .unwrap(),
+            crate::events::BoundedRecord::Pending
+        ));
+    });
+    assert_eq!((allocations, allocated_bytes), (0, 0));
+    assert_eq!(
+        crate::events::BoundedRecordSource::positions(&source).consumer,
+        reserved.consumer
+    );
+    source.release_front();
+    assert_eq!(
+        crate::events::BoundedRecordSource::positions(&source).producer,
+        reserved.producer
+    );
+    match crate::events::BoundedRecordSource::bounded_record(&mut source, reserved.producer)
+        .unwrap()
+    {
+        crate::events::BoundedRecord::Item(item) => assert_eq!(&*item, bytes.as_slice()),
+        _ => panic!("the same committed reservation must be read once"),
+    }
+    assert!(matches!(
+        crate::events::BoundedRecordSource::bounded_record(&mut source, reserved.producer).unwrap(),
+        crate::events::BoundedRecord::Reached
+    ));
+
+    for boundary in ["late", "busy", "affecting"] {
+        let mut fixture = MachineScene::absence_scene(2);
+        let before = fixture.scene.drain.consumption_cut().unwrap();
+        if boundary == "late" {
+            fixture.appear(1, 1);
+        } else if boundary == "busy" {
+            fixture.push_quiet();
+            fixture.scene.drain.source_mut().block_front();
+            let busy = fixture.scene.drain.consumption_cut().unwrap();
+            assert!(!busy.is_drained());
+            let queued = fixture.scene.drain.source_mut().remaining();
+            for _ in 0..3 {
+                fixture.service(1).unwrap();
+                assert!(fixture.pending_absence(1).is_none());
+                assert!(busy.same_boundary(&fixture.scene.drain.consumption_cut().unwrap()));
+                assert_eq!(fixture.scene.drain.source_mut().remaining(), queued);
+            }
+            fixture.scene.drain.source_mut().release_front();
+            assert!(
+                busy.same_boundary(&fixture.scene.drain.consumption_cut().unwrap()),
+                "unmasking cannot retreat the producer or advance the consumer"
+            );
+            fixture.published();
+            assert_eq!(fixture.scene.drain.source_mut().remaining(), 0);
+            fixture.wait_absence(1);
+            fixture.appear(1, 2);
+        } else {
+            let (begin, _) = fixture
+                .scene
+                .encoded(std::process::id(), 0, "C_CreateObject", 2);
+            fixture.scene.drain.source_mut().push_record(begin.to_vec());
+            fixture.machine.begin_commit(false).unwrap();
+            fixture.published();
+            for _ in 0..4 {
+                fixture.service(1).unwrap();
+            }
+            assert!(fixture.pending_absence(1).is_none());
+            assert_eq!(
+                fixture
+                    .scene
+                    .real
+                    .scene
+                    .coordinator
+                    .joint_capture()
+                    .adapter()
+                    .retained_start_bytes_for_test((u64::from(std::process::id()), 2)),
+                Some(begin)
+            );
+            fixture.appear(1, 2);
+        }
+        fixture
+            .scene
+            .push(std::process::id(), 1, "C_CreateObject", 3);
+        fixture.published();
+        assert_eq!(fixture.ready_birth(1).is_some(), boundary == "busy");
+        assert_eq!(
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .registry()
+                .joint_feeds(),
+            usize::from(boundary == "busy")
+        );
+        if boundary == "late" {
+            assert!(!before.same_boundary(&fixture.scene.drain.consumption_cut().unwrap()));
+        }
+    }
+}
+
+#[test]
+fn joint_machine_absence_selects_exact_subject_with_mixed_ready_and_pending() {
+    let mut fixture = MachineScene::absence_scene(3);
+    fixture.wait_absence(1);
+    fixture.wait_absence(2);
+    let foreign_capture = SemanticCapture::in_domain(
+        fixture.scene.producers.native_domain(),
+        TickLimits::default(),
+    )
+    .unwrap();
+    let foreign_session = MachineScene::with_initial_files(2, &[0], true);
+    let foreign_pin = Arc::new(
+        crate::process::PidPin::open(crate::process::ProcessViewId(0), std::process::id()).unwrap(),
+    );
+    {
+        let held = fixture.scene.real.h0.0.borrow();
+        let negative = fixture.pending_absence(1).unwrap();
+        let image = negative.proof.image();
+        let pin = negative.pin.clone();
+        let endpoint = held.io.endpoint(held.io.slot(1, "C_CreateObject")).unwrap();
+        let adapter = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter();
+        let attached = fixture.scene.attached.as_ref().unwrap();
+        assert!(negative.matches_origin(
+            &held.capture,
+            &fixture.scene.producers,
+            image,
+            &pin,
+            endpoint,
+            attached,
+            adapter
+        ));
+        assert!(!negative.matches_origin(
+            &foreign_capture,
+            &fixture.scene.producers,
+            image,
+            &pin,
+            endpoint,
+            attached,
+            adapter
+        ));
+        assert!(!negative.matches_origin(
+            &held.capture,
+            &foreign_session.scene.producers,
+            image,
+            &pin,
+            endpoint,
+            attached,
+            adapter
+        ));
+        assert!(!negative.matches_origin(
+            &held.capture,
+            &fixture.scene.producers,
+            image,
+            &foreign_pin,
+            endpoint,
+            attached,
+            adapter
+        ));
+        assert!(!negative.matches_origin(
+            &held.capture,
+            &fixture.scene.producers,
+            ImageIdentity {
+                task_cookie: image.task_cookie,
+                exec_id: image.exec_id + 1
+            },
+            &pin,
+            endpoint,
+            attached,
+            adapter
+        ));
+        let other = held.io.endpoint(held.io.slot(2, "C_CreateObject")).unwrap();
+        assert!(!negative.matches_origin(
+            &held.capture,
+            &fixture.scene.producers,
+            image,
+            &pin,
+            other,
+            attached,
+            adapter
+        ));
+    }
+    fixture.appear(2, 2);
+    fixture
+        .scene
+        .push(std::process::id(), 2, "C_CreateObject", 2);
+    fixture.published();
+    assert!(fixture.pending_absence(1).is_some() && fixture.ready_birth(2).is_some());
+    assert!(fixture.ready_birth(1).is_none());
+    let table = fixture.machine.retained_births_for_test();
+    for (target, _) in fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .joint_history_targets()
+    {
+        let witness = table
+            .find_ready(&target)
+            .expect("the exact actual Ready target must be found across pending B");
+        assert_eq!(witness.receipt().domain(), target.bootstrap().domain());
+        assert_eq!(witness.candidate.receipt.endpoint().file_slot, 2);
+    }
+    fixture.appear(1, 2);
+    fixture
+        .scene
+        .push(std::process::id(), 1, "C_CreateObject", 3);
+    fixture.published();
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .joint_feeds(),
+        2
+    );
+    assert_eq!(fixture.reduced_for(1), 1);
+    assert_eq!(fixture.reduced_for(2), 1);
+}
+
+#[test]
+fn joint_machine_absence_stale_inputs_end_in_permanent_s1() {
+    for stale in ["epoch", "fence", "closure"] {
+        let mut fixture = MachineScene::absence_scene(2);
+        fixture.wait_absence(1);
+        if stale == "closure" {
+            let old = fixture.scene.attached.take().unwrap();
+            fixture.scene.attached = Some(crate::attach::reseal_test_attachment(
+                old,
+                fixture.scene.real.lane.subset().pins(),
+            ));
+        } else if stale == "fence" {
+            let caller = fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .adapter()
+                .live_id(std::process::id())
+                .unwrap();
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .reference_mark_tail(caller);
+            fixture.push_quiet();
+            fixture.published();
+        }
+        fixture.appear(1, if stale == "epoch" { 1 } else { 2 });
+        fixture
+            .scene
+            .push(std::process::id(), 1, "C_CreateObject", 2);
+        fixture.published();
+        assert!(
+            fixture.ready_birth(1).is_none(),
+            "{stale} cannot mint a replacement receipt"
+        );
+        assert_eq!(
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .registry()
+                .joint_feeds(),
+            0
+        );
+        assert!(
+            fixture
+                .native
+                .birth_outcomes
+                .iter()
+                .any(|(file, outcome)| *file == 1 && outcome.is_err())
+        );
+        let first_attempts = fixture
+            .native
+            .birth_outcomes
+            .iter()
+            .filter(|(file, _)| *file == 1)
+            .count();
+        fixture.scene.push(std::process::id(), 1, "C_SignInit", 3);
+        fixture.published();
+        assert_eq!(
+            fixture
+                .native
+                .birth_outcomes
+                .iter()
+                .filter(|(file, _)| *file == 1)
+                .count(),
+            first_attempts,
+            "the same-epoch Continued call cannot consume a replacement New"
+        );
+        assert!(
+            fixture.ready_birth(1).is_none(),
+            "an actual later Continued observation cannot upgrade S1"
+        );
+        assert_eq!(
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .registry()
+                .joint_feeds(),
+            0
+        );
+    }
+}
+
+#[test]
+fn joint_machine_absence_storage_precedes_query_and_refunds_owned_overlap() {
+    for refuse in [false, true] {
+        let mut fixture = MachineScene::absence_scene(3);
+        fixture.wait_absence(1);
+        let before_reads = fixture.native.absence_reads.len();
+        let reserve = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .semantic_storage_reserver();
+        let (old, new, nested) = fixture
+            .machine
+            .next_absence_allocation_for_test(
+                &fixture.scene.real.lane,
+                &fixture.scene.real.scene.coordinator,
+            )
+            .unwrap();
+        assert!(old > 0 && new > old && nested > 0);
+        let snapshot = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .semantic_resource_snapshot();
+        let hold = refuse.then(|| {
+            reserve
+                .reserve(snapshot.limit_bytes - snapshot.charged_bytes - (new - old + nested))
+                .unwrap()
+        });
+        if refuse {
+            let pending = fixture.pending_absence(1).unwrap();
+            let original = (
+                pending.capture,
+                Arc::as_ptr(&pending.pin),
+                pending.proof.fence(),
+            );
+            let mut refused = false;
+            for _ in 0..128 {
+                match fixture.service(1) {
+                    Err(SemanticRefusal::ProviderStorage) => {
+                        refused = true;
+                        break;
+                    }
+                    Err(reason) => panic!("unexpected absence reservation refusal: {reason:?}"),
+                    Ok(_) => {}
+                }
+            }
+            assert!(
+                refused,
+                "the actual overlapping reservation must refuse before native acquisition"
+            );
+            assert_eq!(
+                fixture.native.absence_reads.len(),
+                before_reads,
+                "old+new physical capacity must coexist before the query callback"
+            );
+            let pending = fixture.pending_absence(1).unwrap();
+            assert_eq!(
+                (
+                    pending.capture,
+                    Arc::as_ptr(&pending.pin),
+                    pending.proof.fence()
+                ),
+                original
+            );
+            assert!(fixture.pending_absence(2).is_none());
+        } else {
+            fixture.wait_absence(2);
+            assert!(fixture.native.absence_reads.len() > before_reads);
+        }
+        drop(hold);
+        let charged = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .semantic_resource_snapshot()
+            .charged_bytes;
+        let owned = fixture.machine.retained_storage_for_test();
+        assert!(owned > 0);
+        drop(fixture.machine);
+        assert_eq!(
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .registry()
+                .semantic_resource_snapshot()
+                .charged_bytes,
+            charged - owned
+        );
     }
 }
 

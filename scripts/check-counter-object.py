@@ -119,6 +119,7 @@ def bank_maps(graph):
     expected = {
         "STATS": (6, 4, 24, 512, 0), "RV_COUNTS": (5, 16, 8, 4096, 0),
         "START": (1, 16, 288, 16384, 0), "COUNTER_HEALTH": (6, 4, 8, 2, 0),
+        "OWNER_CTL": (2, 4, 56, 1, 0), "THREAD_OWNER": (29, 4, 560, 0, 1),
         "COUNTER_BANKS": (13, 4, 4, 2, 128), "COUNTER_BANK_META": (1, 4, 24, 2, 128),
         "COUNTER_BANK_COMMIT": (1, 8, 16, 2, 128), "COUNTER_BANK_FAULT": (6, 4, 8, 1, 0),
     }
@@ -1339,6 +1340,15 @@ def causal_mutants(body, mode):
 class BankFootprint(MemoryProof):
     """Existing conservative memory proof with one exact map-of-maps edge."""
 
+    @staticmethod
+    def refine(registers, destination, left, immediate, operation, taken):
+        known = singleton(left)
+        if known is not None and immediate is not None and operation in (0x10, 0x50):
+            condition = known == immediate if operation == 0x10 else known != immediate
+            if taken != condition:
+                return False
+        return MemoryProof.refine(registers, destination, left, immediate, operation, taken)
+
     def helper(self, number, registers, memory, key, pc):
         mapped = registers[1]
         if number == 1 and mapped and mapped[:2] == ("ptr", "COUNTER_BANKS"):
@@ -1363,6 +1373,11 @@ class BankFootprint(MemoryProof):
                 raise RuntimeError("bank Counts access is not an exact full-width field")
             if action == "write" and atomic != 0xf1:
                 raise RuntimeError("bank Counts update is not bounded CAS")
+        if (name == "START" and action == "write"
+                and pointer[2] + offset < 8 and pointer[3] + offset + width > 0):
+            if (pointer[2] + offset or pointer[3] + offset or width != 8
+                    or value != ZERO or atomic is not None):
+                raise RuntimeError("Counts START timestamp is not one full zero word")
         if name == "COUNTER_BANK_FAULT" and action == "write":
             if (width != 8 or pointer[2] + offset or pointer[3] + offset
                     or atomic not in (0x40, 0x41) or not value or value[0] != "scalar"
@@ -1383,8 +1398,11 @@ class BankExecution:
     RV and fault operations execute the actual ELF.
     """
 
-    def __init__(self, graph):
+    def __init__(self, graph, *, optimized_optional_get=False, optimized_aggregate=False):
         self.graph = graph
+        self.optimized_optional_get = optimized_optional_get
+        self.optimized_aggregate = optimized_aggregate
+        self.native_get_probe = None
         self.memory, self.regions, self.cells = {}, [], {}
         self.cursor = 0x1000000
         names = ("COUNTER_BANK_META", "COUNTER_BANK_COMMIT", "COUNTER_BANKS",
@@ -1483,7 +1501,7 @@ class BankExecution:
             raise RuntimeError("bank owner call lost original physical START key")
         self.trace.append(("owner", key, pc, name, tuple(registers[1:6]), tuple(origins)))
         if name == "p11_owner_start_aggregate":
-            if registers[2] != 0:
+            if registers[2] != 0 and not self.optimized_aggregate:
                 raise RuntimeError("Counts START acquires a nonzero timestamp")
             if self.failed_admission:
                 return 0
@@ -1492,7 +1510,7 @@ class BankExecution:
             self.start(slot)
             return 1
         if name == "p11_owner_start_get":
-            if registers[2] != 0:
+            if registers[2] != 0 and not self.optimized_optional_get:
                 raise RuntimeError("bank return requires START instead of optional non-settlement lookup")
             return self.starts.get(raw_key, 0)
         if name == "p11_owner_start_remove":
@@ -1511,6 +1529,25 @@ class BankExecution:
         raise RuntimeError("bank execution calls an unsupported owner API")
 
     def helper(self, number, registers, key, pc):
+        if self.native_get_probe is not None:
+            if key != self.native_get_probe:
+                raise RuntimeError("native absence probe escapes its exact START getter")
+            if number == 158:
+                return 0x40000  # one present task; no task-storage owner
+            name = self.by_handle.get(registers[1])
+            if number == 156:
+                if name != "THREAD_OWNER" or registers[2:5] != [0x40000, 0, 0]:
+                    raise RuntimeError("native absence probe changes task-storage lookup")
+                return 0
+            if number != 1 or name not in ("OWNER_CTL", "START"):
+                raise RuntimeError("native absence probe reaches an unexpected helper/map")
+            width = 16 if name == "START" else 4
+            index = self.read(registers[2], width).to_bytes(width, "little")
+            expected = struct.pack("<QII", 9, 0, 0) if name == "START" else bytes(4)
+            if index != expected:
+                raise RuntimeError("native absence probe loses its exact physical key")
+            self.trace.append(("lookup", key, pc, name, index, registers[2]))
+            return self.cells.get((name, index), 0)
         if number not in (1, 2):
             raise RuntimeError("bank bridge reaches an unknown/privacy/clock helper")
         name = self.by_handle.get(registers[1])
@@ -1669,9 +1706,69 @@ class BankExecution:
         raise RuntimeError("bank execution leaves its function")
 
 
-def bank_scenarios(graph):
+def bank_erased_second_argument(graph, key):
+    """Conservative entry-register kill before any read/control transfer."""
+    for _, (op, encoded, _, _) in sorted(graph.instructions[key].items()):
+        destination, source = encoded & 15, encoded >> 4
+        if op == 0x18:
+            overwritten = destination == 2
+        elif op & 7 in (4, 7):
+            if (op & 8 and source == 2) or (op & 0xf0 != 0xb0 and destination == 2):
+                return False
+            overwritten = destination == 2
+        elif op & 7 == 1:
+            if source == 2:
+                return False
+            overwritten = destination == 2
+        elif op & 7 in (2, 3):
+            if destination == 2 or (op & 7 == 3 and source == 2):
+                return False
+            overwritten = False
+        else:
+            # No branches/calls before this definite incoming-R2 kill.
+            return False
+        if overwritten:
+            return True
+    return False
+
+
+def bank_optional_start_get(graph):
+    """Bind a removed LOCAL argument to the actual optional-absence path.
+
+    The source getter's required=0 can disappear under constant-argument
+    optimization, while debug BTF keeps its source signature. Never infer
+    that constant merely from an unused register: also execute the native
+    healthy/no-owner absence path and forbid every custody/health write.
+    Other native owner behavior still uses the unchanged consumed contract.
+    """
+    key = graph.only("p11_owner_start_get")
+    if not bank_erased_second_argument(graph, key):
+        return None
+    vm = BankExecution(graph)
+    vm.native_get_probe = key
+    for name in ("OWNER_CTL", "THREAD_OWNER", "START"):
+        handle = max(vm.by_handle) + 0x100
+        vm.handles[name], vm.by_handle[handle] = handle, name
+    control = struct.pack("<7Q", 16448, 0, 0, 0, 0, 0, 0)
+    at = vm.set("OWNER_CTL", 0, control)
+    start_key = vm.set("native_probe_key", 0, struct.pack("<QII", 9, 0, 0))
+    returned = vm.execute(key, [start_key, 9, 0, 0, 0], 0)
+    if (returned or vm.debt or vm.fault()
+            or vm.read(at, 56).to_bytes(56, "little") != control):
+        raise RuntimeError("optimized native START get does not preserve quiet absence")
+    lookups = [event for event in vm.trace if event[0] == "lookup" and event[3] == "START"]
+    if len(lookups) != 1:
+        raise RuntimeError("optimized native START get has no exact preliminary lookup")
+    return lookups[0][1:3]
+
+
+def bank_scenarios(graph, optional_get, optimized_aggregate):
     """Literal healthy/failure expectations over actual native bridge bodies."""
     reports, executions = {}, []
+
+    def new_vm():
+        return BankExecution(graph, optimized_optional_get=optional_get is not None,
+                             optimized_aggregate=optimized_aggregate)
 
     def check(name, vm, rows, debt, fault=0, rv=None):
         actual_rv = {}
@@ -1688,23 +1785,23 @@ def bank_scenarios(graph):
         executions.append(vm)
 
     zeros = ((0, 0, 0), (0, 0, 0))
-    vm = BankExecution(graph)
+    vm = new_vm()
     vm.delete("COUNTER_BANK_COMMIT", 1)
     vm.run("p11_bank_enter", (0, 9))
     check("inactive_entry", vm, zeros, 0)
     vm.set("COUNTER_BANK_COMMIT", 1, struct.pack("<QQ", 1, BANK_CONFIG))
     vm.run("p11_bank_complete", (0, 9, 0x100000001, 1))
     check("precommit_return_after_commit", vm, zeros, 0)
-    vm = BankExecution(graph)
+    vm = new_vm()
     vm.start(1)
     vm.run("p11_bank_complete", (0, 9, 0, 1))
     check("absent_return_preserves_other_start", vm, zeros, 1)
-    vm = BankExecution(graph)
+    vm = new_vm()
     vm.start(0)
     vm.starts.clear()  # physical loss does not remove the owner's debt
     vm.run("p11_bank_complete", (0, 9, 0, 1))
     check("absent_return_preserves_lost_debt", vm, zeros, 1)
-    vm = BankExecution(graph)
+    vm = new_vm()
     vm.delete("COUNTER_BANK_COMMIT", 2)
     vm.run("p11_bank_enter", (0, 9))
     vm.set("COUNTER_BANK_COMMIT", 2, struct.pack("<QQ", 2, BANK_CONFIG))
@@ -1715,35 +1812,35 @@ def bank_scenarios(graph):
           rv={(0, 0): 1, (1, U64_MAX): 1})
     for slot in (0, 1):
         for missing in ("COUNTER_BANK_META", "COUNTER_BANKS", f"bank{slot}", "COUNTER_BANK_COMMIT"):
-            vm = BankExecution(graph)
+            vm = new_vm()
             vm.run("p11_bank_enter", (slot, 9))
             vm.delete(missing, slot if missing in ("COUNTER_BANK_META", "COUNTER_BANKS") else
                       slot + 1 if missing == "COUNTER_BANK_COMMIT" else 0)
             vm.run("p11_bank_complete", (slot, 9, 0, 1))
             rows = ((1, 0, 0), (0, 0, 0)) if slot == 0 else ((0, 0, 0), (1, 0, 0))
             check("missing_route_retires_start", vm, rows, 0, 1)
-    vm = BankExecution(graph)
+    vm = new_vm()
     vm.start(0)
     vm.failed_retirement = True
     vm.run("p11_bank_complete", (0, 9, 0, 1))
     check("failed_retirement_keeps_debt", vm, zeros, 1, 2)
     for transaction in (0x100000001, U64_MAX):
-        vm = BankExecution(graph)
+        vm = new_vm()
         vm.set("COUNTER_BANK_META", 0, struct.pack("<QQII", transaction, 1, 0, 1))
         vm.set("COUNTER_BANK_COMMIT", transaction, struct.pack("<QQ", 1, BANK_CONFIG))
         vm.run("p11_bank_enter", (0, 9))
         vm.run("p11_bank_complete", (0, 9, transaction, 1))
         check("full_width_transaction", vm, ((1, 1, 1), (0, 0, 0)), 0, rv={(0, transaction): 1})
     for slot in (2, 0xffffffff):
-        vm = BankExecution(graph)
+        vm = new_vm()
         vm.run("p11_bank_enter", (slot, 9))
         check("invalid_logical_slot", vm, zeros, 0, 1)
     for mask, configuration in ((2, BANK_CONFIG), (1, BANK_CONFIG + 1), (3, BANK_CONFIG)):
-        vm = BankExecution(graph)
+        vm = new_vm()
         vm.set("COUNTER_BANK_COMMIT", 1, struct.pack("<QQ", mask, configuration))
         vm.run("p11_bank_enter", (0, 9))
         check("wrong_exact_set_or_config", vm, zeros, 0, 1)
-    vm = BankExecution(graph)
+    vm = new_vm()
     for slot in (0, 1):
         vm.set("COUNTER_BANK_META", slot, struct.pack("<QQII", 3, 3, slot, 1))
     vm.set("COUNTER_BANK_COMMIT", 3, struct.pack("<QQ", 3, BANK_CONFIG))
@@ -1751,11 +1848,11 @@ def bank_scenarios(graph):
         vm.run("p11_bank_enter", (slot, 9))
         vm.run("p11_bank_complete", (slot, 9, 0, 1))
     check("complete_two_bank_union", vm, ((1, 1, 0), (1, 1, 0)), 0, rv={(0, 0): 1, (1, 0): 1})
-    vm = BankExecution(graph)
+    vm = new_vm()
     vm.run("p11_bank_enter", (0, 9))
     vm.run("p11_bank_complete", (0, 9, 0, 0))
     check("scope_refusal_retires_without_credit", vm, ((1, 0, 0), (0, 0, 0)), 0, 8)
-    vm = BankExecution(graph)
+    vm = new_vm()
     vm.run("p11_bank_enter", (1, 9))
     pointer = vm.starts[struct.pack("<QII", 9, 1, 0)]
     # CallStart.slot_id is neither a bank ID nor authoritative for Counts.
@@ -1763,39 +1860,39 @@ def bank_scenarios(graph):
         vm.memory[pointer + 16 + index] = byte
     vm.run("p11_bank_complete", (1, 9, 0, 1))
     check("start_payload_does_not_route", vm, ((0, 0, 0), (1, 1, 0)), 0, rv={(1, 0): 1})
-    vm = BankExecution(graph)
+    vm = new_vm()
     vm.failed_admission = True
     vm.run("p11_bank_enter", (0, 9))
     vm.run("p11_bank_complete", (0, 9, 0, 1))
     check("admission_failure_is_sticky", vm, ((1, 0, 0), (0, 0, 0)), 0, 2)
-    vm = BankExecution(graph)
+    vm = new_vm()
     for rv in (0x100000001, 0x100000001, U64_MAX):
         vm.run("p11_bank_enter", (0, 9))
         vm.run("p11_bank_complete", (0, 9, rv, 1))
     check("rv_full_width_accumulates", vm, ((3, 3, 3), (0, 0, 0)), 0,
           rv={(0, 0x100000001): 2, (0, U64_MAX): 1})
-    vm = BankExecution(graph)
+    vm = new_vm()
     vm.run("p11_bank_enter", (0, 9))
     vm.run("p11_bank_complete", (0, 9, 0x204, 1))
     check("pending_is_returned_without_error", vm, ((1, 1, 0), (0, 0, 0)), 0,
           rv={(0, 0x204): 1})
-    vm = BankExecution(graph)
+    vm = new_vm()
     vm.run("p11_bank_enter", (0, 9))
     vm.run("p11_bank_complete", (0, 9, 0x100000204, 1))
     check("pending_high_alias_is_full_width_error", vm, ((1, 1, 1), (0, 0, 0)), 0,
           rv={(0, 0x100000204): 1})
-    vm = BankExecution(graph)
+    vm = new_vm()
     vm.failed_rv_insert = True
     vm.run("p11_bank_enter", (0, 9))
     vm.run("p11_bank_complete", (0, 9, 0, 1))
     check("rv_failure_is_sticky", vm, ((1, 1, 0), (0, 0, 0)), 0, 4)
-    vm = BankExecution(graph)
+    vm = new_vm()
     vm.bank_storage[0] = vm.set("bank0", 0, struct.pack("<QQQ", U64_MAX, 0, 0))
     vm.run("p11_bank_enter", (0, 9))
     check("entered_saturates_without_wrap", vm, ((U64_MAX, 0, 0), (0, 0, 0)), 1)
     if vm.health(0) != 1 or vm.health(1):
         raise RuntimeError("actual bank saturation has wrong health disposition")
-    vm = BankExecution(graph)
+    vm = new_vm()
     vm.contended.add("bank0")
     vm.run("p11_bank_enter", (0, 9))
     check("bounded_contention_is_unhealthy", vm, ((8, 0, 0), (0, 0, 0)), 1)
@@ -1813,7 +1910,7 @@ def validate_bank_proof(body):
     bank_global_abi(graph)
     owner = native_owner_bound(graph, maps)
     proof_maps = {**maps, "COUNTER_BANK_VALUE": MAPS.map_def(6, 4, 24, 1)}
-    roots, frames = {}, dict(owner.frames)
+    roots, frames, seed_sites = {}, dict(owner.frames), set()
     for name, section in BANK_ROOTS.items():
         root = graph.root(name, section)
         reached = graph.reachable(root)
@@ -1834,6 +1931,11 @@ def validate_bank_proof(body):
                     raise RuntimeError("Counts bank root reaches semantic/event storage")
         proof = BankFootprint(graph, proof_maps)
         proof.run(root, [("external", "ctx", 0), None, None, None, None])
+        if name.endswith("entry"):
+            seed_sites = {touch[:2] for touch in proof.touches
+                          if touch[2:6] == ("START", "write", (0, 0), 8)}
+            if not seed_sites:
+                raise RuntimeError("Counts bank entry omits its zero START timestamp store")
         frames.update({key: max(frames.get(key, 0), depth) for key, depth in proof.frames.items()})
         required_offsets = (0,) if name.endswith("entry") else (8, 16)
         for offset in required_offsets:
@@ -1842,17 +1944,20 @@ def validate_bank_proof(body):
                 raise RuntimeError("bank proof omits a complete Counts field update")
         roots[name] = {"stack_chain": frame_and_chain(graph, root, frames),
                        "clocks": 0, "semantic_or_event_work": False}
-    controls, executions = bank_scenarios(graph)
+    optional_get = bank_optional_start_get(graph)
+    optimized_aggregate = bank_erased_second_argument(graph, graph.only("p11_owner_start_aggregate"))
+    controls, executions = bank_scenarios(graph, optional_get, optimized_aggregate)
     try:
         validate(body, "counts")
     except RuntimeError:
         pass
     else:
         raise RuntimeError("bank proof is accepted by the ordinary fixed counter profile")
-    return {"schema": "p11scope-counter-bank-object/v1", "logical_slots": [0, 1],
-            "native_owner_slot_bound": 512, "maps": {name: maps[name] for name in expected},
-            "inner_template": maps["COUNTER_BANKS"]["inner_template"], "roots": roots,
-            "controls": controls, "ordinary_counter_profile": "refused"}, (graph, executions)
+    report = {"schema": "p11scope-counter-bank-object/v1", "logical_slots": [0, 1],
+              "native_owner_slot_bound": 512, "maps": {name: maps[name] for name in expected},
+              "inner_template": maps["COUNTER_BANKS"]["inner_template"], "roots": roots,
+              "controls": controls, "ordinary_counter_profile": "refused"}
+    return report, (graph, executions, optional_get, seed_sites)
 
 
 def bank_btf_mutant(body, graph, name, field, wanted, *, inner=False):
@@ -1874,9 +1979,12 @@ def bank_btf_mutant(body, graph, name, field, wanted, *, inner=False):
     else:
         member = next(i for i in range(node[3])
                       if MAPS.string_at(btf.strings, node[5][i * 3]) == field)
+        # Select actual pointer-to-array constants directly, without trying
+        # to resolve unrelated void/qualified-void pointers in this ELF.
+        arrays = {ident for ident, candidate in enumerate(btf.types[1:], 1)
+                  if candidate[0] == 3 and candidate[5][2] == wanted}
         pointer_refs = [ident for ident, candidate in enumerate(btf.types[1:], 1)
-                        if candidate[0] == 2 and btf.resolve(candidate[2])[0] == 3
-                        and btf.resolve(candidate[2])[5][2] == wanted]
+                        if candidate[0] == 2 and candidate[2] in arrays]
         if not pointer_refs:
             raise RuntimeError("bank BTF mutant has no literal replacement type")
         address, replacement = base + node[6] + 12 + member * 12 + 4, pointer_refs[0]
@@ -1888,7 +1996,7 @@ def bank_btf_mutant(body, graph, name, field, wanted, *, inner=False):
 
 
 def bank_causal_mutants(body):
-    report, (graph, executions) = validate_bank_proof(body)
+    report, (graph, executions, optional_get, seed_sites) = validate_bank_proof(body)
     mutants = {
         "inner_value_width": bank_btf_mutant(body, graph, "COUNTER_BANKS", "value_bytes", 40, inner=True),
         "inner_cell_count": bank_btf_mutant(body, graph, "COUNTER_BANKS", "max_entries", 2, inner=True),
@@ -1910,10 +2018,20 @@ def bank_causal_mutants(body):
     def instruction(label, site, replacement):
         mutants[label] = mutated_instruction(body, graph, site[0], site[1], replacement)
 
+    seed = min(seed_sites)
+    _, encoded, offset, _ = graph.instructions[seed[0]][seed[1]]
+    instruction("aggregate_timestamp", seed, (0x7a, encoded & 15, offset, 1))
+
     # Every selection below comes from an actual executed call/read/branch,
     # not a source string, function size, hardcoded PC or favorable label.
     for label, helper in (("optional_start_get", "p11_owner_start_get"),
                           ("required_start_remove", "p11_owner_start_remove")):
+        if label == "optional_start_get" and optional_get is not None:
+            # The optimized LOCAL getter has no flag literal to mutate.
+            # Damage its real preliminary absence lookup instead; forcing
+            # the required path must fail the native quiet-absence probe.
+            instruction(label, optional_get, (0xb7, 0, 0, 1))
+            continue
         event = next(event for event in events if event[0] == "owner" and event[3] == helper)
         site = event[5][2]
         if site is None:
@@ -1931,9 +2049,9 @@ def bank_causal_mutants(body):
     old = graph.instructions[read[1]][read[2]]
     instruction("transaction_width", read[1:3], (0x61, old[1], old[2], old[3]))
     logical = next(event for event in events if event[0] == "branch"
-                   and event[3:5] in ((2, 1), (2, 2), (1, 2))
-                   and graph.instructions[event[1]][event[2]][0] & 8 == 0
-                   and graph.instructions[event[1]][event[2]][3] in (1, 2))
+                   and event[3:5] == (2, 1)
+                   and graph.instructions[event[1]][event[2]][0] in (0x25, 0x26)
+                   and graph.instructions[event[1]][event[2]][3] == 1)
     old = graph.instructions[logical[1]][logical[2]]
     instruction("logical_index", logical[1:3], old[:3] + (old[3] + 1,))
     inner_store = None

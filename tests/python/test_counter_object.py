@@ -186,6 +186,114 @@ class CounterObjectCliTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "unknown/out-of-bounds"):
             vm.execute((1, 0), [], 0)
 
+    def test_bank_footprint_prunes_only_proven_constant_equality_edges(self):
+        checker = runpy.run_path(str(CHECKER), run_name="counter_bank_null_edge_test")
+        key = (1, 0)
+        exit_instruction = (0x95, 0, 0, 0)
+        invalid_read = (0x79, 0x10, 8, 0)
+
+        class Graph:
+            def __init__(self, instructions):
+                self.instructions = {key: dict(enumerate(instructions))}
+                self.loops, self.calls, self.bodies = {key: {}}, {}, {key: ("null_edge",)}
+
+        def run(opcode, value):
+            # A literal zero must bypass the invalid scalar-as-pointer read;
+            # a nonzero value must reach it and remain a refusal.
+            instructions = ([(opcode, 1, 1, 0), invalid_read, exit_instruction]
+                            if opcode & 0xf0 == 0x10 else
+                            [(opcode, 1, 1, 0), exit_instruction, invalid_read,
+                             exit_instruction])
+            proof = checker["BankFootprint"](Graph(instructions), {})
+            proof.run(key, [checker["constant"](value), None, None, None, None])
+            return proof
+
+        for opcode in (0x15, 0x55, 0x16, 0x56):
+            with self.subTest(opcode=opcode):
+                self.assertEqual(run(opcode, 0).touches, set())
+                with self.assertRaisesRegex(RuntimeError, "unknown counter read"):
+                    run(opcode, 1)
+                if opcode & 7 == 6:
+                    with self.assertRaisesRegex(RuntimeError, "unknown counter read"):
+                        run(opcode, 1 << 32)
+
+    def test_bank_optional_get_requires_dead_argument_and_real_quiet_absence(self):
+        checker = runpy.run_path(str(CHECKER), run_name="counter_bank_optional_get_test")
+        key = (1, 0)
+
+        class Graph:
+            def __init__(self):
+                self.instructions = {key: {
+                    0: (0xbf, 0x17, 0, 0), 1: (0xbf, 0xa2, 0, 0),
+                    2: (0x07, 2, 0, -4), 3: (0x62, 10, -4, 0),
+                    4: (0x18, 1, 0, 0), 6: (0x85, 0, 0, 1),
+                    7: (0xbf, 8, 0, 0), 8: (0xbf, 0x72, 0, 0),
+                    9: (0x18, 1, 0, 0), 11: (0x85, 0, 0, 1),
+                    12: (0x55, 0, 9, 0), 13: (0x85, 0, 0, 158),
+                    14: (0xbf, 2, 0, 0), 15: (0x18, 1, 0, 0),
+                    17: (0xb7, 3, 0, 0), 18: (0xb7, 4, 0, 0),
+                    19: (0x85, 0, 0, 156), 20: (0xb7, 0, 0, 0),
+                    21: (0x95, 0, 0, 0), 22: (0xb7, 1, 0, 1),
+                    23: (0xdb, 0x18, 16, 0x41), 24: (0xb7, 0, 0, 0),
+                    25: (0x95, 0, 0, 0)}}
+                self.calls = {(key, pc): ("helper", helper) for pc, helper in
+                              ((6, 1), (11, 1), (13, 158), (19, 156))}
+
+            def only(self, name):
+                if name != "p11_owner_start_get":
+                    raise RuntimeError("unexpected test callee")
+                return key
+
+            def map_at(self, function, pc):
+                self.assert_key(function)
+                return {4: "OWNER_CTL", 9: "START", 15: "THREAD_OWNER"}[pc]
+
+            @staticmethod
+            def assert_key(function):
+                if function != key:
+                    raise RuntimeError("unexpected test function")
+
+        graph = Graph()
+        self.assertEqual(checker["bank_optional_start_get"](graph), (key, 11))
+        for first in ((0xbf, 0x27, 0, 0), (0x07, 2, 0, 1),
+                      (0x79, 0x20, 0, 0), (0x15, 1, 0, 0), (0x85, 0, 0, 1)):
+            with self.subTest(live_argument=first):
+                changed = Graph()
+                changed.instructions[key][0] = first
+                self.assertIsNone(checker["bank_optional_start_get"](changed))
+        for pc, instruction in ((11, (0xb7, 0, 0, 1)),
+                                (18, (0xb7, 4, 0, 1)), (20, (0xb7, 0, 0, 1))):
+            with self.subTest(unsafe_absence=(pc, instruction)):
+                changed = Graph()
+                changed.instructions[key][pc] = instruction
+                with self.assertRaises(RuntimeError):
+                    checker["bank_optional_start_get"](changed)
+
+    def test_bank_counts_start_timestamp_requires_one_full_zero_word(self):
+        checker = runpy.run_path(str(CHECKER), run_name="counter_bank_timestamp_test")
+        key = (1, 0)
+
+        class Graph:
+            def __init__(self, instruction):
+                self.instructions = {key: {0: instruction, 1: (0x95, 0, 0, 0)}}
+                self.loops, self.calls, self.bodies = {key: {}}, {}, {key: ("seed_control",)}
+
+        pointer = ("ptr", "START", 0, 0, checker["ZERO"])
+
+        def run(instruction, value):
+            proof = checker["BankFootprint"](Graph(instruction), {"START": {"value_size": 288}})
+            proof.run(key, [pointer, value, None, None, None])
+            return proof
+
+        self.assertEqual(len(run((0x7b, 0x21, 0, 0), checker["ZERO"]).touches), 1)
+        for instruction, value in (((0x7b, 0x21, 0, 0), checker["ONE"]),
+                                   ((0x7b, 0x21, 0, 0), checker["scalar"]()),
+                                   ((0x63, 0x21, 0, 0), checker["ZERO"]),
+                                   ((0xdb, 0x21, 0, 0x40), checker["ZERO"])):
+            with self.subTest(instruction=instruction, value=value):
+                with self.assertRaisesRegex(RuntimeError, "START timestamp"):
+                    run(instruction, value)
+
     def test_bank_instruction_contention_keeps_the_interfering_writer_value(self):
         checker = runpy.run_path(str(CHECKER), run_name="counter_bank_cas_test")
 

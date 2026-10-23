@@ -842,7 +842,6 @@ impl MachineScene {
     }
 
     fn published_labeled(&mut self, label: &str, frozen: Option<bool>) {
-        let mut last_mixed_audit = None;
         for _ in 0..512 {
             let progress = self.service(1).unwrap_or_else(|reason| {
                 self.publication_failed(label, frozen, Some(reason));
@@ -870,104 +869,11 @@ impl MachineScene {
                         .filter(|(_, result)| result.is_err())
                         .count(),
                 );
-                if label.starts_with("absence-mixed") {
-                    let coordinator = &self.scene.real.scene.coordinator;
-                    for current in prepared.current_receipts().iter().take(4) {
-                        let binding = coordinator
-                            .semantic_bindings()
-                            .find_by_image(current.domain(), current.image());
-                        eprintln!(
-                            "mixed_current label={label} file={} new={} same_original={} instances={} same_native={} bound={} same_pin={} provider={}",
-                            current.endpoint().file_slot,
-                            current.birth_quantum().is_some(),
-                            self.native
-                                .preparations
-                                .last()
-                                .is_some_and(
-                                    |(identity, _)| current.birth_quantum() == Some(*identity)
-                                ),
-                            current.instances().len(),
-                            current.domain() == self.scene.producers.native_domain(),
-                            binding.is_some(),
-                            binding.is_some_and(|binding| Arc::ptr_eq(
-                                &binding.pin(),
-                                current.original_pin()
-                            )),
-                            binding.is_some_and(|binding| binding
-                                .provider_for_endpoint(current.endpoint())
-                                .is_some()),
-                        );
-                    }
-                    for (ordinal, result) in prepared.claims().take(4) {
-                        let input = prepared
-                            .admissions()
-                            .find(|input| input.h0_ordinal() == ordinal);
-                        eprintln!(
-                            "mixed_claim label={label} ordinal={ordinal} refusal={:?} same_original={} file={} same_image={}",
-                            result.as_ref().err(),
-                            result
-                                .as_ref()
-                                .is_ok_and(|proof| input
-                                    .is_some_and(|input| proof.matches_admitted(input))),
-                            input.map_or(usize::MAX, |input| self
-                                .scene
-                                .real
-                                .modules
-                                .iter()
-                                .position(|(module, _)| module == input.provider_module())
-                                .unwrap_or(usize::MAX)),
-                            input.is_some_and(|input| input.journal_binding().1
-                                == (ImageIdentity {
-                                    task_cookie: 71,
-                                    exec_id: 0
-                                })),
-                        );
-                    }
-                }
-            }
-            if label.starts_with("absence-mixed") {
-                let audit = self.machine.diagnostic_audit_for_test();
-                if audit != last_mixed_audit {
-                    eprintln!("mixed_audit label={label} actual={audit:?}");
-                    last_mixed_audit = audit;
-                }
             }
             if matches!(
                 progress,
                 crate::inventory_semantics::JointServiceProgress::Published
             ) {
-                if label.starts_with("absence-mixed") {
-                    let coordinator = &self.scene.real.scene.coordinator;
-                    eprintln!(
-                        "mixed_published label={label} feeds={} claims={} roles={:?} h3={:?} native_reads={:?} births={:?}",
-                        coordinator.registry().joint_feeds(),
-                        coordinator
-                            .joint_capture()
-                            .adapter()
-                            .invocation_claims_for_test()
-                            .0,
-                        coordinator.joint_capture().ledger().roles_for_test(),
-                        coordinator.reference_h3_audit_state(),
-                        self.native.reads.get(),
-                        self.native.birth_outcomes,
-                    );
-                    for file in 0..self.scene.real.modules.len().min(4) as u32 {
-                        let pending = self.pending_absence(file);
-                        let ready = self.ready_birth(file);
-                        eprintln!(
-                            "mixed_table label={label} file={file} pending={} ready={} same_image={}",
-                            pending.is_some(),
-                            ready.is_some(),
-                            pending.map(|original| original.proof.image()).or_else(|| ready.map(|original| original.candidate.receipt.image())).is_some_and(|image| image == (ImageIdentity { task_cookie: 71, exec_id: 0 })),
-                        );
-                    }
-                    for gap in coordinator.registry().gaps().iter().rev().take(8) {
-                        eprintln!(
-                            "mixed_gap label={label} subject={} reason={}",
-                            gap.subject, gap.reason
-                        );
-                    }
-                }
                 return;
             }
         }
@@ -1621,10 +1527,22 @@ fn joint_machine_absence_selects_exact_subject_with_mixed_ready_and_pending() {
     fixture
         .scene
         .push(std::process::id(), 2, "C_CreateObject", 2);
-    fixture.published_labeled("absence-mixed-first-C", None);
+    fixture.published();
     assert!(fixture.pending_absence(1).is_some() && fixture.ready_birth(2).is_some());
     assert!(fixture.ready_birth(1).is_none());
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .joint_feeds(),
+        1
+    );
+    assert_eq!(fixture.reduced_for(2), 1);
     let table = fixture.machine.retained_births_for_test();
+    let mut matched_targets = 0;
     for (target, _) in fixture
         .scene
         .real
@@ -1638,12 +1556,70 @@ fn joint_machine_absence_selects_exact_subject_with_mixed_ready_and_pending() {
             .expect("the exact actual Ready target must be found across pending B");
         assert_eq!(witness.receipt().domain(), target.bootstrap().domain());
         assert_eq!(witness.candidate.receipt.endpoint().file_slot, 2);
+        assert_eq!(witness.receipt(), target.bootstrap());
+        matched_targets += 1;
     }
+    assert_eq!(
+        matched_targets, 1,
+        "the mixed-table lookup must not be vacuous"
+    );
+    let coordinator = &fixture.scene.real.scene.coordinator;
+    let before_revision = coordinator.registry().published_revision();
+    let before_h3 = coordinator.reference_h3_audit_state();
+    let before_births = fixture.native.birth_outcomes.len();
+    let before_birth_reads = fixture.native.reads.get().0;
+    let negative = fixture.pending_absence(1).unwrap();
+    let original_negative = (
+        negative.capture,
+        Arc::as_ptr(&negative.pin),
+        negative.proof.fence(),
+    );
     fixture.appear(1, 2);
     fixture
         .scene
         .push(std::process::id(), 1, "C_CreateObject", 3);
-    fixture.published_labeled("absence-mixed-later-B", None);
+    fixture.reach_phase("Births");
+    {
+        let prepared = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .prepared_semantic_batch()
+            .unwrap();
+        let current = prepared
+            .current_receipts()
+            .iter()
+            .find(|receipt| receipt.endpoint().file_slot == 1)
+            .unwrap();
+        assert!(current.birth_quantum() == Some(fixture.native.preparations.last().unwrap().0));
+        assert_eq!(prepared.claims().count(), 1);
+        assert_eq!(
+            prepared.claims().find_map(|(ordinal, result)| result
+                .as_ref()
+                .err()
+                .map(|reason| (ordinal, *reason))),
+            Some((3, AttestationRefusal::ImageSealed)),
+            "a new same-image sibling cannot reinterpret C's already converted history"
+        );
+    }
+    let mut original_negative_audited = false;
+    for _ in 0..512 {
+        if let Some((gap, h3, _, _, _)) = fixture.machine.diagnostic_audit_for_test() {
+            assert_eq!(
+                gap,
+                Some(crate::semantics_objects::journal::JournalGap::ImageTainted)
+            );
+            assert_eq!(h3, "Clean");
+            original_negative_audited = true;
+            break;
+        }
+        fixture.service(1).unwrap();
+    }
+    assert!(original_negative_audited);
+    fixture.published();
+    // Runtime §E keeps ImageSealed conservative: this late sibling stays
+    // S1Only and its ORIGINAL ImageTainted negative reaches existing C.
     assert_eq!(
         fixture
             .scene
@@ -1652,10 +1628,252 @@ fn joint_machine_absence_selects_exact_subject_with_mixed_ready_and_pending() {
             .coordinator
             .registry()
             .joint_feeds(),
-        2
+        0
     );
-    assert_eq!(fixture.reduced_for(1), 1);
+    let s1 = |fixture: &MachineScene, file: usize| {
+        let registry = fixture.scene.real.scene.coordinator.registry();
+        let module = registry
+            .module_id_for(&fixture.scene.real.modules[file].0)
+            .unwrap();
+        let mut rows = registry
+            .instance_semantic_edges()
+            .filter(|row| row.module == module);
+        let row = rows.next().unwrap();
+        assert!(rows.next().is_none());
+        (
+            row.feed.mode(),
+            row.feed.reduced(),
+            row.api_returns,
+            row.semantics.as_ref().unwrap().calls(),
+        )
+    };
+    assert_eq!(
+        s1(&fixture, 1),
+        (crate::semantics_key_use::FeedMode::S1Only, 0, Some(1), 1),
+        "B's actual S1 consumer, independently of the H9 reduced counter"
+    );
+    assert_eq!(
+        s1(&fixture, 2),
+        (crate::semantics_key_use::FeedMode::S1Only, 1, Some(1), 1)
+    );
+    assert_eq!(fixture.native.birth_outcomes.len(), before_births);
+    assert_eq!(fixture.native.reads.get().0, before_birth_reads);
+    assert!(fixture.ready_birth(1).is_none());
+    assert!(fixture.ready_birth(2).is_some());
+    let coordinator = &fixture.scene.real.scene.coordinator;
+    assert_eq!(
+        coordinator.registry().published_revision(),
+        before_revision + 1
+    );
+    assert_eq!(
+        coordinator.reference_h3_audit_state(),
+        (before_h3.0 + 1, false)
+    );
+    assert_eq!(
+        coordinator
+            .joint_capture()
+            .adapter()
+            .invocation_claims_for_test()
+            .0,
+        0
+    );
+    assert_eq!(
+        coordinator.joint_capture().ledger().roles_for_test(),
+        [0; 5]
+    );
+    let negative = fixture.pending_absence(1).unwrap();
+    assert_eq!(
+        (
+            negative.capture,
+            Arc::as_ptr(&negative.pin),
+            negative.proof.fence()
+        ),
+        original_negative
+    );
+
+    // A genuine later Continued call remains direct S1. It cannot consume
+    // the old absence or recreate a New after the exact claim refusal.
+    fixture
+        .scene
+        .push(std::process::id(), 1, "C_CreateObject", 4);
+    fixture.reach_phase("Births");
+    let prepared = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .prepared_semantic_batch()
+        .unwrap();
+    let mut continued = prepared
+        .current_receipts()
+        .iter()
+        .filter(|receipt| receipt.endpoint().file_slot == 1);
+    assert!(
+        continued
+            .next()
+            .expect("the same provider has an actual Continued Current")
+            .birth_quantum()
+            .is_none()
+    );
+    assert!(continued.all(|receipt| receipt.birth_quantum().is_none()));
+    fixture.published();
+    assert_eq!(
+        s1(&fixture, 1),
+        (crate::semantics_key_use::FeedMode::S1Only, 0, Some(2), 2)
+    );
     assert_eq!(fixture.reduced_for(2), 1);
+    assert_eq!(fixture.native.birth_outcomes.len(), before_births);
+    assert_eq!(fixture.native.reads.get().0, before_birth_reads);
+    assert!(fixture.ready_birth(1).is_none());
+    let negative = fixture.pending_absence(1).unwrap();
+    assert_eq!(
+        (
+            negative.capture,
+            Arc::as_ptr(&negative.pin),
+            negative.proof.fence()
+        ),
+        original_negative
+    );
+    let coordinator = &fixture.scene.real.scene.coordinator;
+    assert_eq!(coordinator.registry().joint_feeds(), 0);
+    assert_eq!(
+        coordinator.registry().published_revision(),
+        before_revision + 2
+    );
+    assert_eq!(
+        coordinator.reference_h3_audit_state(),
+        (before_h3.0 + 2, false)
+    );
+    assert_eq!(
+        coordinator
+            .joint_capture()
+            .adapter()
+            .invocation_claims_for_test()
+            .0,
+        0
+    );
+    assert_eq!(
+        coordinator.joint_capture().ledger().roles_for_test(),
+        [0; 5]
+    );
+}
+
+#[test]
+fn joint_machine_absence_two_new_keys_share_first_conversion() {
+    use crate::semantics_objects::journal::BirthKind;
+    for order in [[1, 2], [2, 1]] {
+        let mut fixture = MachineScene::absence_scene(3);
+        fixture.wait_absence(1);
+        fixture.wait_absence(2);
+        let coordinator = &fixture.scene.real.scene.coordinator;
+        let revision = coordinator.registry().published_revision();
+        let h3 = coordinator.reference_h3_audit_state();
+        assert_eq!(coordinator.registry().joint_feeds(), 0);
+        assert!(
+            coordinator
+                .joint_capture()
+                .model()
+                .project()
+                .objects
+                .is_empty()
+        );
+        fixture.appear(1, 2);
+        fixture.appear(2, 2);
+        for (at, file) in order.into_iter().enumerate() {
+            fixture
+                .scene
+                .push(std::process::id(), file, "C_CreateObject", at as u64 + 2);
+        }
+        fixture.reach_phase("Births");
+        let original = fixture.native.preparations.last().unwrap().0;
+        let coordinator = &fixture.scene.real.scene.coordinator;
+        let prepared = coordinator.prepared_semantic_batch().unwrap();
+        assert_eq!(prepared.admissions().count(), 2);
+        assert_eq!(prepared.claims().count(), 2);
+        assert!(
+            prepared.claims().all(
+                |(ordinal, result)| result.as_ref().is_ok_and(|proof| prepared
+                    .admissions()
+                    .any(|input| input.h0_ordinal() == ordinal && proof.matches_admitted(input)))
+            )
+        );
+        for file in [1, 2] {
+            let receipt = prepared
+                .current_receipts()
+                .iter()
+                .find(|receipt| receipt.endpoint().file_slot == file)
+                .unwrap();
+            assert!(receipt.birth_quantum() == Some(original));
+            assert!(fixture.pending_absence(file).is_some());
+            assert!(fixture.ready_birth(file).is_none());
+        }
+        assert!(
+            coordinator
+                .joint_capture()
+                .model()
+                .project()
+                .objects
+                .is_empty(),
+            "B and C's actual keys/claims must both exist BEFORE the first conversion"
+        );
+        fixture.published();
+        let coordinator = &fixture.scene.real.scene.coordinator;
+        assert_eq!(coordinator.registry().joint_feeds(), 2);
+        assert_eq!(coordinator.registry().published_revision(), revision + 1);
+        assert_eq!(coordinator.reference_h3_audit_state(), (h3.0 + 1, false));
+        assert_eq!(
+            coordinator
+                .joint_capture()
+                .adapter()
+                .invocation_claims_for_test()
+                .0,
+            0
+        );
+        assert_eq!(
+            coordinator.joint_capture().ledger().roles_for_test(),
+            [0; 5]
+        );
+        assert_eq!(
+            coordinator
+                .joint_capture()
+                .model()
+                .project()
+                .objects
+                .iter()
+                .filter(|object| object.lifetime == Lifetime::Live)
+                .count(),
+            2
+        );
+        let table = fixture.machine.retained_births_for_test();
+        assert_eq!(table.ready_for_test().count(), 2);
+        let mut targets = 0;
+        for (target, _) in coordinator.registry().joint_history_targets() {
+            let witness = table
+                .find_ready(&target)
+                .expect("each exact original Ready must serve its actual target");
+            assert_eq!(witness.receipt(), target.bootstrap());
+            assert!(witness.original.in_quantum(original));
+            assert!(witness.candidate.quantum == original);
+            assert_eq!(witness.receipt().birth(), BirthKind::AbsenceAppearance);
+            targets += 1;
+        }
+        assert_eq!(targets, 2);
+        for file in [1, 2] {
+            assert!(fixture.pending_absence(file).is_none());
+            assert!(fixture.ready_birth(file).is_some());
+            assert_eq!(fixture.reduced_for(file as usize), 1);
+            assert_eq!(
+                fixture
+                    .native
+                    .birth_outcomes
+                    .iter()
+                    .filter(|(actual, result)| *actual == file
+                        && *result == Ok(BirthKind::AbsenceAppearance))
+                    .count(),
+                1
+            );
+        }
+    }
 }
 
 #[test]

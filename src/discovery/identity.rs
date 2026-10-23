@@ -3268,6 +3268,40 @@ mod tests {
     use std::cell::RefCell;
 
     #[test]
+    fn retained_target_charge_is_bounded_before_the_first_copy() {
+        let mut pins = test_fixture::real_scan_pin(
+            Path::new("/usr/bin/true"), None, 1, "bank-pre-copy-charge",
+        );
+        let id = pins.pinned().next().unwrap().id;
+        assert_eq!(pins.retained_target_copy_allocation_charge(PinnedObjectId(u32::MAX)), None);
+        let entry = pins.by_id.get_mut(&id).unwrap();
+        entry.raw.path = String::with_capacity(4096);
+        entry.raw.path.push_str("/raw/namespace/provider.so");
+        entry.path = String::with_capacity(1024);
+        entry.path.push_str("/display/provider.so");
+        entry.sha256.reserve(2048);
+        entry.build_id = Some(String::with_capacity(512));
+        entry.build_id.as_mut().unwrap().push_str("owned-build-id");
+        let before = pins.revision();
+        let bound = pins.retained_target_copy_allocation_charge(id).unwrap();
+        let original = &pins.by_id[&id];
+        let expected = [
+            Some(&original.raw.path), Some(&original.path), Some(&original.sha256),
+            original.build_id.as_ref(),
+        ].into_iter().flatten().map(|text| text.capacity() + 32).sum::<usize>();
+        assert_eq!(bound, expected);
+        assert!(bound > pins.summary(id).unwrap().path.len() + 1024,
+            "raw namespace text and spare capacities must be included");
+        assert_eq!(pins.revision(), before, "preallocation lookup is read-only");
+        let retained = pins.retain_inventory_target(id).unwrap();
+        assert!(retained.retained_copy_allocation_charge().unwrap() <= bound,
+            "fresh String clones may trim capacity, but cannot exceed the pre-copy bound");
+        assert_eq!(retained.entry.raw.path, "/raw/namespace/provider.so");
+        assert_eq!(retained.entry.path, "/display/provider.so");
+        assert_eq!(pins.revision(), before);
+    }
+
+    #[test]
     fn retained_provider_copy_charge_covers_each_actual_cloned_allocation() {
         let pins = test_fixture::real_scan_pin(
             Path::new("/usr/bin/true"),

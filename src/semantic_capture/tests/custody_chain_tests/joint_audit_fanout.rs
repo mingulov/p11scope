@@ -209,16 +209,15 @@ fn joint_real_bind_refresh_preserves_collected_first_new() {
             "the storage refusal exercises the actual admission consumer"
         );
         if refuse_first {
-            assert!(
-                scene
-                    .real
-                    .scene
-                    .coordinator
-                    .registry()
-                    .gaps()
-                    .iter()
-                    .any(|gap| gap.reason == "provider_storage_refused")
-            );
+            // Refusal diagnostics are still staged at this boundary; the
+            // published gaps cannot describe this uncommitted attempt yet.
+            let snapshot = scene
+                .real
+                .scene
+                .coordinator
+                .registry()
+                .semantic_resource_snapshot();
+            assert_eq!(snapshot.charged_bytes, snapshot.limit_bytes);
         }
         drop(hold);
         // The newest matching receipt on retry is Continued. It may support

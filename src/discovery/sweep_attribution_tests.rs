@@ -1979,8 +1979,12 @@ fn attribute_child(
     snapshot: Vec<MapEntry>,
     index: &KnownKeyIndex,
 ) -> SweepAttribution {
+    attribute_pid(child.pid as u32, snapshot, index)
+}
+
+fn attribute_pid(pid: u32, snapshot: Vec<MapEntry>, index: &KnownKeyIndex) -> SweepAttribution {
     attribute_unselected(
-        &[(child.pid as u32, snapshot)],
+        &[(pid, snapshot)],
         &BTreeSet::new(),
         &BTreeSet::new(),
         index,
@@ -3244,6 +3248,26 @@ fn d4_kernel_collision_attribution(
     session: &mut crate::discovery::kernel_identity::IdentitySession,
     generation: u64,
 ) -> SweepAttribution {
+    d4_kernel_attribution_for_pid(
+        child.pid as u32,
+        snapshot,
+        pins,
+        object,
+        key,
+        session,
+        generation,
+    )
+}
+
+fn d4_kernel_attribution_for_pid(
+    pid: u32,
+    snapshot: Vec<MapEntry>,
+    pins: &crate::discovery::identity::PinnedObjects,
+    object: PinnedObjectId,
+    key: ObjectKey,
+    session: &mut crate::discovery::kernel_identity::IdentitySession,
+    generation: u64,
+) -> SweepAttribution {
     use crate::discovery::kernel_identity::{AnchorPass, ExaminedCustody, KernelMemberProbe};
     use std::sync::{Arc, Mutex};
 
@@ -3295,7 +3319,7 @@ fn d4_kernel_collision_attribution(
             "exercise actual kernel proof, not scoped fallback"
         );
         attribute_unselected(
-            &[(child.pid as u32, snapshot)],
+            &[(pid, snapshot)],
             &BTreeSet::new(),
             &BTreeSet::new(),
             &index,
@@ -4534,6 +4558,671 @@ fn privileged_d4_btrfs_bind_alias_backend_parity() {
         .expect("remove owned kernel probe directory");
     dir.close()
         .expect("remove owned bind fixture files and directory");
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct D4ThreadReady {
+    token: String,
+    tgid: u32,
+    tid: u32,
+    fd: i32,
+    start: u64,
+    end: u64,
+    dev: u64,
+    ino: u64,
+}
+
+fn d4_validate_thread_ready(
+    ready: &D4ThreadReady,
+    pid: u32,
+    token: &str,
+) -> Result<(), &'static str> {
+    if ready.token != token || ready.tgid != pid || pid == 0 {
+        return Err("wrong helper process or token");
+    }
+    if ready.tid == 0 || ready.tid == pid {
+        return Err("mapping did not come from a nonleader");
+    }
+    if ready.fd < 3
+        || ready.start == 0
+        || ready.start.checked_add(4096) != Some(ready.end)
+        || ready.ino == 0
+    {
+        return Err("invalid opened-file mapping reply");
+    }
+    Ok(())
+}
+
+fn d4_write_thread_ready(
+    stream: &mut std::os::unix::net::UnixStream,
+    ready: &D4ThreadReady,
+) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let bytes = serde_json::to_vec(ready).map_err(std::io::Error::other)?;
+    if bytes.is_empty() || bytes.len() > 1024 {
+        return Err(std::io::Error::other("thread READY exceeds its bound"));
+    }
+    stream.write_all(&(bytes.len() as u32).to_ne_bytes())?;
+    stream.write_all(&bytes)
+}
+
+fn d4_read_thread_ready(
+    stream: &mut std::os::unix::net::UnixStream,
+) -> std::io::Result<D4ThreadReady> {
+    use std::io::Read as _;
+    let mut size = [0; 4];
+    stream.read_exact(&mut size)?;
+    let size = u32::from_ne_bytes(size) as usize;
+    if size == 0 || size > 1024 {
+        return Err(std::io::Error::other("invalid thread READY length"));
+    }
+    let mut bytes = vec![0; size];
+    stream.read_exact(&mut bytes)?;
+    serde_json::from_slice(&bytes).map_err(std::io::Error::other)
+}
+
+fn d4_thread_fd_identity(path: &std::path::Path) -> std::io::Result<Option<FileIdentity>> {
+    use std::os::unix::fs::MetadataExt as _;
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(Some(FileIdentity {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        })),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn d4_check_thread_file_table(
+    private: bool,
+    worker: FileIdentity,
+    leader: Option<FileIdentity>,
+) -> Result<(), &'static str> {
+    if private == (leader == Some(worker)) {
+        return Err("actual leader/worker FD evidence disagrees with the requested table state");
+    }
+    Ok(())
+}
+
+struct D4ThreadChild {
+    child: std::process::Child,
+    channel: std::os::unix::net::UnixStream,
+    reaped: bool,
+}
+
+impl D4ThreadChild {
+    fn spawn(path: &std::path::Path, private: bool, token: &str) -> (Self, D4ThreadReady) {
+        use std::os::fd::OwnedFd;
+        use std::process::{Command, Stdio};
+        let (channel, helper) = std::os::unix::net::UnixStream::pair().unwrap();
+        channel
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        channel
+            .set_write_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        helper
+            .set_read_timeout(Some(std::time::Duration::from_secs(60)))
+            .unwrap();
+        helper
+            .set_write_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "discovery::sweep_attribution::tests::d4_thread_mapping_helper",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env_clear()
+            .env("P11SCOPE_D4_THREAD_PATH", path)
+            .env(
+                "P11SCOPE_D4_THREAD_MODE",
+                if private { "private" } else { "shared" },
+            )
+            .env("P11SCOPE_D4_THREAD_TOKEN", token)
+            .stdin(Stdio::from(OwnedFd::from(helper)))
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("fresh exec of the matching libtest helper");
+        // Own the process before any fallible READY I/O or validation.
+        let mut owned = Self {
+            child,
+            channel,
+            reaped: false,
+        };
+        let ready = d4_read_thread_ready(&mut owned.channel)
+            .expect("required actual thread READY; helper refusal cannot qualify");
+        d4_validate_thread_ready(&ready, owned.child.id(), token)
+            .expect("owned helper and actual nonleader mapping");
+        (owned, ready)
+    }
+
+    fn maps(&self) -> Vec<MapEntry> {
+        crate::discovery::scan::read_maps_or_refuse(
+            std::fs::File::open(format!("/proc/{}/maps", self.child.id())).unwrap(),
+            &mut CaptureWorkBudget::default(),
+            crate::attach::monotonic_ns,
+        )
+        .unwrap()
+    }
+
+    fn verify_worker(&self, ready: &D4ThreadReady, expected: FileIdentity, private: bool) -> u64 {
+        let pid = self.child.id();
+        assert_eq!(ready.tgid, pid);
+        let start_time = crate::process::process_start_time(pid).expect("owned helper is alive");
+        assert!(
+            !crate::process::process_is_zombie(pid),
+            "the leader must remain live"
+        );
+        for tid in [pid, ready.tid] {
+            let status = std::fs::read_to_string(format!("/proc/{pid}/task/{tid}/status"))
+                .expect("actual live leader and worker status");
+            let field = |name: &str| {
+                status
+                    .lines()
+                    .find_map(|line| line.strip_prefix(name))
+                    .expect("actual task status identity field")
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap()
+            };
+            assert_eq!(field("Tgid:"), pid);
+            assert_eq!(field("Pid:"), tid);
+        }
+        let worker = d4_thread_fd_identity(std::path::Path::new(&format!(
+            "/proc/{pid}/task/{}/fd/{}",
+            ready.tid, ready.fd
+        )))
+        .expect("inspect actual worker FD")
+        .expect("worker must hold its opened file");
+        assert_eq!(
+            worker,
+            FileIdentity {
+                dev: ready.dev,
+                ino: ready.ino
+            }
+        );
+        assert_eq!(
+            worker, expected,
+            "worker FD must name the independently held file"
+        );
+        let leader = d4_thread_fd_identity(std::path::Path::new(&format!(
+            "/proc/{pid}/fd/{}",
+            ready.fd
+        )))
+        .expect("inspect leader same-number FD; only absence is acceptable refusal");
+        d4_check_thread_file_table(private, worker, leader)
+            .expect("independent leader/worker FD-table evidence");
+        start_time
+    }
+
+    fn finish(mut self) {
+        use std::io::Write as _;
+        self.channel
+            .write_all(b"Q")
+            .expect("release the exact held worker");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => {
+                    self.reaped = true;
+                    assert!(status.success(), "thread helper failed: {status}");
+                    return;
+                }
+                Ok(None) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "thread helper did not exit after release"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => panic!("cannot reap the owned thread helper: {error}"),
+            }
+        }
+    }
+}
+
+impl Drop for D4ThreadChild {
+    fn drop(&mut self) {
+        if self.reaped {
+            return;
+        }
+        let _ = self.child.kill();
+        loop {
+            match self.child.wait() {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                _ => break,
+            }
+        }
+    }
+}
+
+/// Private entrypoint, never a standalone qualification. Rust worker creation
+/// happens only after exec; CLONE_FILES is unshared only in that owned worker.
+#[test]
+#[ignore = "private D4 thread fixture entrypoint; invoked only by its owning parity test with an owned socket/configuration"]
+fn d4_thread_mapping_helper() {
+    use std::io::Read as _;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+    use std::os::unix::fs::MetadataExt as _;
+    let path = std::env::var_os("P11SCOPE_D4_THREAD_PATH").expect("owned helper source path");
+    let token = std::env::var("P11SCOPE_D4_THREAD_TOKEN").expect("owning fixture token");
+    assert!(!token.is_empty());
+    let private = match std::env::var("P11SCOPE_D4_THREAD_MODE").as_deref() {
+        Ok("private") => true,
+        Ok("shared") => false,
+        _ => panic!("owning fixture must select the actual FD-table mode"),
+    };
+    // SAFETY: duplicate only the stdin socket supplied by the owning fixture.
+    let raw = unsafe { libc::fcntl(0, libc::F_DUPFD_CLOEXEC, 3) };
+    assert!(raw >= 0, "duplicate the owned helper channel");
+    // SAFETY: fcntl returned a new fd, adopted once as this socket's owner.
+    let socket = std::os::unix::net::UnixStream::from(unsafe { OwnedFd::from_raw_fd(raw) });
+    socket
+        .peer_addr()
+        .expect("owning fixture must supply a connected Unix socket as stdin");
+    std::thread::spawn(move || {
+        let mut socket = socket;
+        let tgid = std::process::id();
+        // SAFETY: gettid has no arguments and identifies this actual worker.
+        let tid = unsafe { libc::syscall(libc::SYS_gettid) } as u32;
+        assert_ne!(tgid, tid, "the mapping worker must be a nonleader");
+        if private {
+            // SAFETY: only this fresh-exec worker's FD table is detached.
+            let status = unsafe { libc::syscall(libc::SYS_unshare, libc::CLONE_FILES) };
+            assert_eq!(
+                status,
+                0,
+                "required private FD table refused: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        // Open AFTER unshare: the leader's corresponding descriptor must not
+        // acquire this file in private mode. Keep the worker FD through proof.
+        let file = std::fs::File::open(path).expect("open the worker's actual source");
+        let metadata = file.metadata().unwrap();
+        // SAFETY: one read/execute private page from the actual live file fd.
+        let address = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_EXEC,
+                libc::MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(address, libc::MAP_FAILED, "worker mmap failed");
+        struct Mapping(*mut libc::c_void);
+        impl Drop for Mapping {
+            fn drop(&mut self) {
+                // SAFETY: this worker exclusively owns the one-page mapping.
+                unsafe {
+                    libc::munmap(self.0, 4096);
+                }
+            }
+        }
+        let mapping = Mapping(address);
+        let ready = D4ThreadReady {
+            token,
+            tgid,
+            tid,
+            fd: file.as_raw_fd(),
+            start: address as u64,
+            end: address as u64 + 4096,
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        };
+        d4_write_thread_ready(&mut socket, &ready).expect("report actual worker FD/VMA identity");
+        let mut command = [0];
+        socket
+            .read_exact(&mut command)
+            .expect("owning fixture must release its held worker");
+        assert_eq!(command, *b"Q");
+        drop(mapping);
+        drop(file);
+    })
+    .join()
+    .expect("owned mapping worker must finish successfully");
+}
+
+#[test]
+fn d4_thread_ready_protocol_rejects_wrong_process_thread_and_ranges() {
+    use std::io::Write as _;
+    let healthy = D4ThreadReady {
+        token: "owned".into(),
+        tgid: 101,
+        tid: 102,
+        fd: 4,
+        start: 0x1000,
+        end: 0x2000,
+        dev: 37,
+        ino: 123,
+    };
+    assert_eq!(d4_validate_thread_ready(&healthy, 101, "owned"), Ok(()));
+    let (mut writer, mut reader) = std::os::unix::net::UnixStream::pair().unwrap();
+    d4_write_thread_ready(&mut writer, &healthy).unwrap();
+    let read = d4_read_thread_ready(&mut reader).unwrap();
+    assert_eq!(
+        read, healthy,
+        "actual READY frame retains every reported field"
+    );
+    assert_eq!(d4_validate_thread_ready(&read, 101, "owned"), Ok(()));
+    let mut invalid = Vec::new();
+    let mut bad = healthy.clone();
+    bad.token = "foreign".into();
+    invalid.push(bad);
+    let mut bad = healthy.clone();
+    bad.tgid = 103;
+    invalid.push(bad);
+    let mut bad = healthy.clone();
+    bad.tid = 101;
+    invalid.push(bad);
+    let mut bad = healthy.clone();
+    bad.tid = 0;
+    invalid.push(bad);
+    let mut bad = healthy.clone();
+    bad.fd = 0;
+    invalid.push(bad);
+    let mut bad = healthy.clone();
+    bad.end += 1;
+    invalid.push(bad);
+    let mut bad = healthy.clone();
+    bad.start = u64::MAX;
+    invalid.push(bad);
+    let mut bad = healthy.clone();
+    bad.ino = 0;
+    invalid.push(bad);
+    for bad in invalid {
+        assert!(d4_validate_thread_ready(&bad, 101, "owned").is_err());
+        assert_eq!(d4_validate_thread_ready(&healthy, 101, "owned"), Ok(()));
+    }
+    writer.write_all(&1025u32.to_ne_bytes()).unwrap();
+    assert!(
+        d4_read_thread_ready(&mut reader).is_err(),
+        "oversize frame refused before any payload read"
+    );
+}
+
+#[test]
+fn d4_thread_file_table_oracle_requires_actual_shared_or_private_evidence() {
+    let a = FileIdentity { dev: 37, ino: 123 };
+    let b = FileIdentity { dev: 38, ino: 123 };
+    assert_eq!(d4_check_thread_file_table(false, a, Some(a)), Ok(()));
+    for other in [None, Some(b)] {
+        assert!(d4_check_thread_file_table(false, a, other).is_err());
+        assert_eq!(d4_check_thread_file_table(true, a, other), Ok(()));
+        assert_eq!(d4_check_thread_file_table(false, a, Some(a)), Ok(()));
+    }
+    assert!(d4_check_thread_file_table(true, a, Some(a)).is_err());
+    assert_eq!(d4_check_thread_file_table(true, a, Some(b)), Ok(()));
+}
+
+/// A live nonleader maps A with either the shared or its own private FD
+/// table; the live leader's TGID must attribute A on both actual backends.
+/// A third private-table worker maps an equal-byte Btrfs-key collision B,
+/// which must be a real identity mismatch. This observes private files
+/// after unshare; literal clone birth, zombie leaders, active capture and
+/// native provider calls remain separate obligations.
+#[test]
+#[ignore = "root Btrfs disk TMPDIR, worker CLONE_FILES unshare and eligible BTF/task_vma identity; actual live-thread parity"]
+fn privileged_d4_btrfs_live_thread_private_files_backend_parity() {
+    use crate::discovery::identity::{
+        PinnedObjects, map_files_identity, test_fixture::real_scan_pin,
+    };
+    use crate::discovery::kernel_identity::IdentitySession;
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::{FileExt as _, MetadataExt as _};
+
+    crate::attach::identity_iter::ensure_kernel_identity_btf()
+        .expect("required kernel identity capability; refusal cannot qualify");
+    let btf = aya::Btf::from_sys_fs().expect("readable host BTF");
+    let dir = tempfile::tempdir().unwrap();
+    let parent = dir.path();
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    let c_parent = std::ffi::CString::new(parent.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: a valid path and writable statfs buffer, read only on success.
+    assert_eq!(
+        unsafe { libc::statfs(c_parent.as_ptr(), stat.as_mut_ptr()) },
+        0
+    );
+    // SAFETY: initialized by the successful statfs above.
+    let magic = unsafe { stat.assume_init().f_type } as u64 & 0xffff_ffff;
+    assert_eq!(magic, 0x9123_683e, "actual fixture TMPDIR must be Btrfs");
+    create_subvolume(parent, "a");
+    create_subvolume(parent, "b");
+    let a_path = parent.join("a/libthread.so");
+    let b_path = parent.join("b/libthread.so");
+    let bytes = vec![0xa5u8; 8192];
+    std::fs::write(&a_path, &bytes).unwrap();
+    std::fs::copy(&a_path, &b_path).unwrap();
+    let a_file = std::fs::File::open(&a_path).unwrap();
+    let b_file = std::fs::File::open(&b_path).unwrap();
+    let identity = |file: &std::fs::File| {
+        let metadata = file.metadata().unwrap();
+        FileIdentity {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        }
+    };
+    let a = identity(&a_file);
+    let b = identity(&b_file);
+    assert_eq!(
+        a.ino, b.ino,
+        "fresh subvolume files must share an inode number"
+    );
+    assert_ne!(
+        a, b,
+        "the collision files must have different physical identities"
+    );
+    for file in [&a_file, &b_file] {
+        let mut held_bytes = vec![0; bytes.len()];
+        file.read_exact_at(&mut held_bytes, 0).unwrap();
+        assert_eq!(held_bytes, bytes, "actual held equal-byte input");
+    }
+
+    let (shared, shared_ready) = D4ThreadChild::spawn(&a_path, false, "owned-shared-a");
+    let (private, private_ready) = D4ThreadChild::spawn(&a_path, true, "owned-private-a");
+    let (wrong, wrong_ready) = D4ThreadChild::spawn(&b_path, true, "owned-private-b");
+    let children = [&shared, &private, &wrong];
+    let ready = [&shared_ready, &private_ready, &wrong_ready];
+    let expected_files = [a, a, b];
+    let paths = [&a_path, &a_path, &b_path];
+    let start_times: Vec<_> = children
+        .iter()
+        .enumerate()
+        .map(|(position, child)| {
+            child.verify_worker(ready[position], expected_files[position], position != 0)
+        })
+        .collect();
+    for report in ready {
+        eprintln!(
+            "D4_THREAD_WORKER caller={} tid={} fd={} range={:x}-{:x} file={}:{}",
+            report.tgid, report.tid, report.fd, report.start, report.end, report.dev, report.ino
+        );
+    }
+    let snapshots = [shared.maps(), private.maps(), wrong.maps()];
+    let mut fixture_lines = Vec::new();
+    for (position, snapshot) in snapshots.iter().enumerate() {
+        let report = ready[position];
+        let line = snapshot
+            .iter()
+            .find(|entry| (entry.start, entry.end) == (report.start, report.end))
+            .expect("the actual worker's exact live VMA");
+        assert_eq!(line.permissions, *b"r-xp");
+        assert_eq!(line.file_offset, 0);
+        assert_eq!(
+            line.raw_path.as_deref(),
+            Some(paths[position].as_os_str().as_encoded_bytes())
+        );
+        assert!(
+            is_caller_range(line),
+            "each real worker has executable proof demand"
+        );
+        assert_eq!(
+            map_files_identity(report.tgid, line.start, line.end)
+                .expect("independent live vm_file identity"),
+            expected_files[position]
+        );
+        fixture_lines.push(line.clone());
+    }
+    let key = ObjectKey::of(&fixture_lines[0]);
+    for line in &fixture_lines {
+        assert_eq!(ObjectKey::of(line), key, "actual Btrfs maps-key collision");
+    }
+    let digest = p11scope_manifest::identity::hex(&Sha256::digest(&bytes));
+    let pins: PinnedObjects = real_scan_pin(&a_path, Some(key), 0, &digest);
+    let object = pins.pinned().next().expect("actual held A pin").id;
+    assert_eq!(identity(pins.file_for(object).unwrap()), a);
+    let (index, refused) = KnownKeyIndex::build(
+        [(key, Some(object))],
+        &BTreeMap::from([(key, object)]),
+        [],
+        &pins,
+    );
+    assert!(refused.is_empty(), "{refused:?}");
+    let proof_keys = index.map_files_keys();
+    assert!(proof_keys.contains(&key));
+    for (position, snapshot) in snapshots.iter().enumerate() {
+        assert_eq!(
+            proof_ranges(snapshot, &proof_keys),
+            [(ready[position].start, ready[position].end)],
+            "one exact real worker VMA must require identity proof"
+        );
+        assert_eq!(
+            snapshot
+                .iter()
+                .filter(|entry| ObjectKey::of(entry) == key)
+                .cloned()
+                .collect::<Vec<_>>(),
+            [fixture_lines[position].clone()],
+            "no additional fixture-key mapping may hide the population"
+        );
+    }
+    let probe_dir = tempfile::tempdir().unwrap();
+    let mut session = IdentitySession::probe_and_load(&btf, probe_dir.path())
+        .expect("actual strict-loaded kernel session; no refused/fallback positive");
+    for (position, child) in children.iter().enumerate() {
+        let pid = child.child.id();
+        let userspace = attribute_pid(pid, snapshots[position].clone(), &index);
+        let kernel = d4_kernel_attribution_for_pid(
+            pid,
+            snapshots[position].clone(),
+            &pins,
+            object,
+            key,
+            &mut session,
+            position as u64 + 1,
+        );
+        for (backend, out) in [("userspace", &userspace), ("kernel", &kernel)] {
+            assert_eq!(
+                out.probed, 1,
+                "{backend}: nonvacuous actual executable proof demand"
+            );
+            assert_eq!(out.unavailable, 0);
+            assert!(
+                out.exited.is_empty(),
+                "{backend}: the owned leader/worker must remain live"
+            );
+            if position < 2 {
+                assert_eq!(
+                    out.members
+                        .iter()
+                        .map(|member| member.pid)
+                        .collect::<Vec<_>>(),
+                    [pid],
+                    "{backend}: the live leader TGID owns the worker's executable mapping"
+                );
+                assert_eq!(out.members[0].start_time, start_times[position]);
+                assert_eq!(
+                    out.members[0]
+                        .objects
+                        .iter()
+                        .map(|matched| (matched.key, matched.object, matched.path.as_str()))
+                        .collect::<Vec<_>>(),
+                    [(key, object, a_path.to_str().unwrap())],
+                    "{backend}: exact held-A edge"
+                );
+                assert!(out.losses.is_empty(), "{backend}: {:?}", out.member_losses);
+            } else {
+                assert!(
+                    out.members.is_empty(),
+                    "{backend}: the equal-byte private B is not A"
+                );
+                assert_eq!(
+                    out.losses,
+                    BTreeMap::from([(AttributionLoss::IdentityMismatch, 1)]),
+                    "{backend}: actual physical-file mismatch"
+                );
+                assert_eq!(
+                    out.member_losses.get(&pid).map(|(loss, _)| *loss),
+                    Some(AttributionLoss::IdentityMismatch)
+                );
+            }
+        }
+        assert_eq!(
+            userspace.members, kernel.members,
+            "independently checked backend edges"
+        );
+        assert_eq!(userspace.losses, kernel.losses);
+        assert_eq!(
+            child.verify_worker(ready[position], expected_files[position], position != 0),
+            start_times[position]
+        );
+        let after = child.maps();
+        assert_eq!(
+            after
+                .iter()
+                .filter(|entry| ObjectKey::of(entry) == key)
+                .cloned()
+                .collect::<Vec<_>>(),
+            [fixture_lines[position].clone()],
+            "the actual held worker VMA remains stable"
+        );
+    }
+    assert!(
+        pins.object_unchanged(object)
+            .expect("recheck actual held A anchor")
+    );
+    for (file, expected) in [(&a_file, a), (&b_file, b)] {
+        assert_eq!(identity(file), expected);
+        assert_eq!(file.metadata().unwrap().len(), bytes.len() as u64);
+        let mut held_bytes = vec![0; bytes.len()];
+        file.read_exact_at(&mut held_bytes, 0).unwrap();
+        assert_eq!(
+            held_bytes, bytes,
+            "both held physical files remain unchanged"
+        );
+    }
+    let pids = [shared.child.id(), private.child.id(), wrong.child.id()];
+    eprintln!(
+        "D4_BTRFS_THREAD callers={}/{}/{} workers={}/{}/{} userspace=1/1/0 kernel=1/1/0 fd_tables=shared/private/private generations=1/2/3 fallback=none",
+        pids[0], pids[1], pids[2], shared_ready.tid, private_ready.tid, wrong_ready.tid
+    );
+    drop((session, pins));
+    shared.finish();
+    private.finish();
+    wrong.finish();
+    for pid in pids {
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "owned helper must be reaped"
+        );
+    }
+    drop((a_file, b_file));
+    std::fs::remove_file(&a_path).unwrap();
+    std::fs::remove_file(&b_path).unwrap();
+    std::fs::remove_dir(parent.join("a")).unwrap();
+    std::fs::remove_dir(parent.join("b")).unwrap();
+    probe_dir
+        .close()
+        .expect("remove owned kernel probe directory");
+    dir.close()
+        .expect("remove owned Btrfs thread fixture directory");
 }
 
 /// Root with a loop-mounted ext4: there a held file's maps key is its

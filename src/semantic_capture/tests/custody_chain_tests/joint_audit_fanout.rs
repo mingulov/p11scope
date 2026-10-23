@@ -13026,7 +13026,13 @@ fn joint_s1_original_disposition_preserves_interleaved_healthy_image() {
                     let mut foreign = JournalAdapter::with_ledger(
                         crate::semantics_objects::journal::JournalLimits::policy(),
                         crate::semantics_objects::journal::StagingLedger::with_resources(
-                            reserve.clone(),
+                            fixture
+                                .scene
+                                .real
+                                .scene
+                                .coordinator
+                                .registry()
+                                .semantic_storage_reserver(),
                         ),
                     );
                     // Bind resource producers through the actual zero-work

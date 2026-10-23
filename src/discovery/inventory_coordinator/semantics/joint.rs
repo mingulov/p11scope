@@ -427,6 +427,7 @@ pub(crate) struct PreparedSemanticBatch {
     entries: Vec<PreparedAdmission>,
     // Preserve actual H0 birth candidates for the later publication handoff.
     current: Vec<crate::semantic_capture::CurrentPartitionReceipt>,
+    registrations: crate::discovery::caller_registry::instance_input::JointRegistrationWindow,
     h3: PreparedH3,
     claim_cursor: usize,
     stage_cursor: usize,
@@ -450,12 +451,14 @@ impl PreparedSemanticBatch {
         domain: NativeDomainId,
         entries: Vec<PreparedAdmission>,
         current: Vec<crate::semantic_capture::CurrentPartitionReceipt>,
+        registrations: crate::discovery::caller_registry::instance_input::JointRegistrationWindow,
         h3: PreparedH3,
     ) -> Self {
         Self {
             domain,
             entries,
             current,
+            registrations,
             h3,
             claim_cursor: 0,
             stage_cursor: 0,
@@ -727,6 +730,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 count.checked_add(receipt.instances().len())
             })
             .ok_or(RawQuantumRefusal::Capacity)?;
+        if count == 0 {
+            batch.births_decided = true;
+            return Ok(PreparedBirthDisposition { installed: 0 });
+        }
         let reserve = self.registry.semantic_storage_reserver();
         let bytes =
             allocation_bytes::<BirthAssociation>(count).ok_or(RawQuantumRefusal::Capacity)?;
@@ -779,7 +786,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // One increasing admission walk and binary lookup; never scan the
         // whole retained suffix per key or re-attest a discarded Result arm.
         for (at, entry) in batch.entries.iter().enumerate() {
-            let (Some(Ok(input)), Some(Ok(_))) = (&entry.input, &entry.claim) else {
+            let Some(Ok(input)) = &entry.input else {
                 continue;
             };
             let (_, image, router, _) = input.journal_binding();
@@ -809,6 +816,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 link.entry.unwrap_or(usize::MAX),
             )
         });
+        let mut registrations = match self.registry.joint_registration_plan() {
+            Ok(registrations) => registrations,
+            Err(_) => {
+                batch.births_decided = true;
+                return Ok(PreparedBirthDisposition { installed: 0 });
+            }
+        };
         batch.births_decided = true;
         let mut installed = 0;
         let mut cursor = 0;
@@ -825,7 +839,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 unreachable!("original index was checked");
             };
             let Some(Ok(proof)) = batch.entries[entry].claim else {
-                unreachable!("original successful claim was checked");
+                // The FIRST actual same-key original governs permanent feed
+                // selection. A later Ok cannot replace a refused claim.
+                continue;
             };
             let Some(binding) = self.semantic_bindings.get(input.journal_binding().3) else {
                 continue;
@@ -839,13 +855,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             };
             let Ok(slot) = births.reserve_for(&reserve, nested) else {
                 disclose_s1_birth_refusal(
-                    &mut self.registry,
+                    registrations.registry_mut(),
                     Some(input.journal_binding().3),
                     "semantic_resource_capacity".into(),
                 );
                 continue;
             };
-            let Ok(reservation) = self.registry.reserve_admitted_joint_receipt(input) else {
+            let Ok(reservation) = registrations.reserve(input, &batch.registrations) else {
                 continue;
             };
             let receipt = batch.current.swap_remove(current);
@@ -862,7 +878,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     drop(reservation);
                     drop(slot);
                     disclose_s1_birth_refusal(
-                        &mut self.registry,
+                        registrations.registry_mut(),
                         Some(input.journal_binding().3),
                         format!("joint_birth_native_{reason:?}"),
                     );
@@ -873,7 +889,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 drop(reservation);
                 drop(slot);
                 disclose_s1_birth_refusal(
-                    &mut self.registry,
+                    registrations.registry_mut(),
                     Some(input.journal_binding().3),
                     "joint_birth_original_mismatch".into(),
                 );

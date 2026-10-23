@@ -106,7 +106,12 @@ pub(super) fn raw_disposition_storage_bound(
     adapter: &JournalAdapter,
     model: &ObjectSemantics,
 ) -> Option<usize> {
-    size_of::<super::joint_driver::RawDisposition>().checked_add(one_failure_bound(adapter, model)?)
+    // The first negative mutation pays for its eventual same-owner frame
+    // and BOTH original failures. The lease moves with that owner; quiet
+    // disposal cannot strand progress behind a second full reservation.
+    size_of::<super::joint_driver::RawDisposition>()
+        .checked_add(size_of::<IngestedJointQuantum>())?
+        .checked_add(one_failure_bound(adapter, model)?.checked_mul(2)?)
 }
 
 /// Only the selected frame supplies this exact typed target and original
@@ -598,15 +603,24 @@ impl IngestedJointQuantum {
                     bytes.checked_add(one_failure_bound(owner.adapter(), owner.model())?)
                 })
                 .ok_or(RawQuantumRefusal::Capacity)?;
-            let storage = owner
-                .ledger()
-                .resource_reserver()
-                .ok_or(RawQuantumRefusal::ForeignLedger)?
-                .reserve(bytes)
-                .map_err(RawQuantumRefusal::Resource)?;
-            Ok((bytes, storage))
+            // Reuse the original full allowance when it still covers the
+            // actual buffers and current model. Later growth must acquire a
+            // full replacement while the original remains paid and untaken.
+            let replacement = if bytes > disposed.prepaid_bytes() {
+                Some(
+                    owner
+                        .ledger()
+                        .resource_reserver()
+                        .ok_or(RawQuantumRefusal::ForeignLedger)?
+                        .reserve(bytes)
+                        .map_err(RawQuantumRefusal::Resource)?,
+                )
+            } else {
+                None
+            };
+            Ok((bytes.max(disposed.prepaid_bytes()), replacement))
         })();
-        let (bytes, storage) = match preflight {
+        let (bytes, replacement) = match preflight {
             Ok(paid) => paid,
             Err(reason) => return Err((disposed, reason)),
         };
@@ -617,6 +631,14 @@ impl IngestedJointQuantum {
                 .install_closure_grant(&SessionClosureGrant::observe(attachment))
         );
         let (provenance, frontier, reason, raw_failure, raw_storage) = disposed.into_parts();
+        let storage = match replacement {
+            Some(storage) => {
+                // The replacement already covers the original buffers.
+                drop(raw_storage);
+                storage
+            }
+            None => raw_storage,
+        };
         let audit = JournalAuditReceipt::collect(provenance.collection(), &mut finalizer, observed);
         let (adapter, model) = owner.parts();
         let failure = adapter.audit_collected(model, &audit, fault).err();
@@ -643,8 +665,6 @@ impl IngestedJointQuantum {
                 .is_some_and(|actual| actual <= bytes),
             "negative audit exceeded its fresh precharge"
         );
-        // The original failure buffers now live in the fully paid frame.
-        drop(raw_storage);
         Ok(frame)
     }
 

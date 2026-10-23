@@ -3499,6 +3499,7 @@ impl CallerRegistry {
         if let Some(ledger) = ledger.as_deref_mut() {
             self.flush_joint_releases(ledger);
         }
+        self.validate_joint_grants_staged();
         let staged = std::mem::take(&mut self.staged);
         let applied = staged.len();
         // Per-pass activity starts quiet: advances below set it.
@@ -3506,7 +3507,7 @@ impl CallerRegistry {
             edge.entry_rose_since_previous_pass = false;
         }
         self.demoted_place_growth.clear();
-        for mutation in staged {
+        for (position, mutation) in staged.into_iter().enumerate() {
             let count = if observer.is_some() {
                 match &mutation {
                     Mutation::NoteCountedUse {
@@ -3527,7 +3528,12 @@ impl CallerRegistry {
             } else {
                 None
             };
-            self.apply(mutation, ledger.as_deref_mut());
+            match mutation {
+                Mutation::NoteInstance(input) => {
+                    self.apply_instance(input, Some(position), ledger.as_deref_mut())
+                }
+                other => self.apply(other, ledger.as_deref_mut()),
+            }
             if let Some(mut count) = count {
                 count.edge_total = count
                     .module
@@ -3640,7 +3646,9 @@ impl CallerRegistry {
         mut ledger: Option<&mut crate::semantics_objects::journal::StagingLedger>,
     ) {
         match mutation {
-            Mutation::NoteInstance(input) => self.apply_instance(input, ledger.as_deref_mut()),
+            Mutation::NoteInstance(input) => {
+                self.apply_instance(input, None, ledger.as_deref_mut())
+            }
             Mutation::ObserveInstanceSemantic(input) => {
                 self.apply_instance_call(input, ledger.as_deref_mut())
             }

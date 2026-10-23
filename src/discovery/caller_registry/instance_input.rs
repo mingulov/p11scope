@@ -22,7 +22,7 @@ use p11scope_ebpf_common::object_wire::ValidatedObjectCall;
 use p11scope_ebpf_common::{Event, ImageIdentity, SlotSemantics};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
-use std::hash::{Hash, Hasher};
+use std::hash::{BuildHasher, Hash, Hasher};
 
 pub(crate) const MAX_REGISTRY_INSTANCES: usize = 4096;
 pub(crate) const MAX_INSTANCE_NEGATIVE_SCOPES: usize = 4096;
@@ -33,8 +33,104 @@ pub(crate) const MAX_INSTANCE_NEGATIVE_SCOPES: usize = 4096;
 pub(super) struct PendingJointGrant {
     receipt: crate::semantics_objects::journal::BootstrapReceipt,
     origin: Option<CollectedCallOrigin>,
+    registration: Option<usize>,
+    application: Option<JointGrantApplication>,
     _key_storage: ResourceLease,
 }
+/// Exact original associations re-read from the actual staged publication.
+struct JointGrantApplication {
+    registration: usize,
+    caller: CallerId,
+    original: Option<CollectedCallOrigin>,
+}
+
+/// Only the actual registration staging boundary constructs this window.
+/// It is ordering metadata, never admission or birth authority.
+pub(crate) struct JointRegistrationStart(usize);
+pub(crate) struct JointRegistrationWindow {
+    start: usize,
+    end: usize,
+}
+
+struct JointRegistrationSlot {
+    hash: u64,
+    row: usize,
+    registration: Option<usize>,
+    first_call: Option<usize>,
+    fits: bool,
+}
+
+/// One paid temporary index of the registry's ORIGINAL staging rows. The
+/// exclusive borrow keeps that allocation alive across lexical reservations;
+/// no key text, calls or registration facts are copied into this index.
+pub(crate) struct JointRegistrationPlan<'a> {
+    rows: Vec<JointRegistrationSlot>,
+    registry: &'a mut CallerRegistry,
+    staged_len: usize,
+    records: usize,
+    limit: usize,
+    _storage: ResourceLease,
+}
+
+impl JointRegistrationPlan<'_> {
+    pub(crate) fn registry_mut(&mut self) -> &mut CallerRegistry {
+        self.registry
+    }
+
+    fn position(
+        &self,
+        input: &AdmittedInstanceCall,
+        window: &JointRegistrationWindow,
+    ) -> Result<usize, JointReceiptInstallRefusal> {
+        if self.staged_len != self.registry.staged.len()
+            || self.records != self.registry.instance_state.records.len()
+            || self.limit != self.registry.instance_state.limit
+            || window.start > window.end
+            || window.end > self.staged_len
+        {
+            return Err(JointReceiptInstallRefusal::SubjectMismatch);
+        }
+        let hash = self.registry.joint_grants.hasher().hash_one(&input.key);
+        let at = self
+            .rows
+            .binary_search_by_key(&hash, |row| row.hash)
+            .map_err(|_| JointReceiptInstallRefusal::SubjectMismatch)?;
+        let row = &self.rows[at];
+        let position = row
+            .registration
+            .filter(|at| *at >= window.start && *at < window.end)
+            .ok_or(JointReceiptInstallRefusal::SubjectMismatch)?;
+        let Some(Mutation::NoteInstance(registration)) = self.registry.staged.get(position) else {
+            return Err(JointReceiptInstallRefusal::SubjectMismatch);
+        };
+        if registration.key != input.key || registration.caller != input.caller {
+            return Err(JointReceiptInstallRefusal::SubjectMismatch);
+        }
+        if let Some(at) = row.first_call {
+            let Mutation::ObserveInstanceSemantic(first) = &self.registry.staged[at] else {
+                unreachable!("the index borrows the original immutable staging rows");
+            };
+            if first.collected_origin() != input.collected_origin() || first.caller != input.caller
+            {
+                return Err(JointReceiptInstallRefusal::SubjectMismatch);
+            }
+        }
+        if !row.fits {
+            return Err(JointReceiptInstallRefusal::Capacity);
+        }
+        Ok(position)
+    }
+
+    pub(crate) fn reserve(
+        &mut self,
+        input: &AdmittedInstanceCall,
+        window: &JointRegistrationWindow,
+    ) -> Result<JointReceiptReservation<'_>, JointReceiptInstallRefusal> {
+        let registration = self.position(input, window)?;
+        self.registry.reserve_joint_receipt_at(input, registration)
+    }
+}
+
 type JointGrantEntry = (InstanceKey, PendingJointGrant);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +151,7 @@ pub(crate) struct JointReceiptReservation<'a> {
     registry: &'a mut CallerRegistry,
     original: CollectedCallOrigin,
     caller: CallerId,
+    registration: usize,
     _key_storage: Option<ResourceLease>,
 }
 
@@ -86,6 +183,8 @@ impl JointReceiptReservation<'_> {
         let grant = PendingJointGrant {
             receipt: *witness.receipt(),
             origin: Some(self.original),
+            registration: Some(self.registration),
+            application: None,
             _key_storage: self
                 ._key_storage
                 .take()
@@ -347,6 +446,8 @@ pub(crate) fn joint_grant_allocation_probe_for_test(
                             PendingJointGrant {
                                 receipt,
                                 origin: None,
+                                registration: None,
+                                application: None,
                                 _key_storage: storage
                             }
                         )
@@ -506,6 +607,8 @@ pub(crate) fn joint_grant_post_removal_growth_probe_for_test(
                         PendingJointGrant {
                             receipt,
                             origin: None,
+                            registration: None,
+                            application: None,
                             _key_storage: storage
                         }
                     )
@@ -569,6 +672,8 @@ pub(crate) fn joint_grant_post_removal_growth_probe_for_test(
                     PendingJointGrant {
                         receipt,
                         origin: None,
+                        registration: None,
+                        application: None,
                         _key_storage: storage
                     }
                 )
@@ -593,6 +698,8 @@ pub(crate) fn joint_grant_post_removal_growth_probe_for_test(
                         PendingJointGrant {
                             receipt,
                             origin: None,
+                            registration: None,
+                            application: None,
                             _key_storage: storage
                         }
                     )
@@ -1361,11 +1468,164 @@ impl CallerRegistry {
         self.staged.push(Mutation::NoteInstance(input));
     }
 
-    /// Reserve against this actual original before moving its New or reading
-    /// native birth state. A selected incarnation is permanent, including S1.
+    pub(crate) fn begin_joint_registrations(&self) -> JointRegistrationStart {
+        JointRegistrationStart(self.staged.len())
+    }
+
+    pub(crate) fn end_joint_registrations(
+        &self,
+        start: JointRegistrationStart,
+    ) -> JointRegistrationWindow {
+        assert!(start.0 <= self.staged.len());
+        JointRegistrationWindow {
+            start: start.0,
+            end: self.staged.len(),
+        }
+    }
+
+    fn joint_staged_key(&self, at: usize) -> &InstanceKey {
+        match &self.staged[at] {
+            Mutation::NoteInstance(input) => &input.key,
+            Mutation::ObserveInstanceSemantic(input) => &input.key,
+            _ => unreachable!("only original registration/call rows enter this index"),
+        }
+    }
+
+    pub(crate) fn joint_registration_plan(
+        &mut self,
+    ) -> Result<JointRegistrationPlan<'_>, JointReceiptInstallRefusal> {
+        if self.joint_grants.iter().any(|(key, grant)| {
+            grant.origin.is_some()
+                && !grant.registration.is_some_and(|at| {
+                    matches!(self.staged.get(at), Some(Mutation::NoteInstance(input))
+                        if input.key == *key)
+                })
+        }) {
+            return Err(JointReceiptInstallRefusal::SubjectMismatch);
+        }
+        let count = self
+            .staged
+            .iter()
+            .filter(|mutation| {
+                matches!(
+                    mutation,
+                    Mutation::NoteInstance(_) | Mutation::ObserveInstanceSemantic(_)
+                )
+            })
+            .count();
+        let bytes = count
+            .checked_mul(std::mem::size_of::<JointRegistrationSlot>())
+            .and_then(|bytes| {
+                bytes.checked_add(if count == 0 {
+                    0
+                } else {
+                    OWNED_ALLOCATION_PADDING
+                })
+            })
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<JointRegistrationPlan<'_>>()))
+            .ok_or(JointReceiptInstallRefusal::Capacity)?;
+        let storage = self
+            .reserve_semantic_storage(bytes)
+            .map_err(|_| JointReceiptInstallRefusal::Storage)?;
+        let mut rows = Vec::new();
+        rows.try_reserve_exact(count)
+            .map_err(|_| JointReceiptInstallRefusal::Capacity)?;
+        assert!(
+            rows.capacity() <= count,
+            "actual original index capacity was prepaid"
+        );
+        for (at, mutation) in self.staged.iter().enumerate() {
+            let (key, registration, first_call) = match mutation {
+                Mutation::NoteInstance(input) => (&input.key, Some(at), None),
+                Mutation::ObserveInstanceSemantic(input) => (&input.key, None, Some(at)),
+                _ => continue,
+            };
+            rows.push(JointRegistrationSlot {
+                hash: self.joint_grants.hasher().hash_one(key),
+                row: at,
+                registration,
+                first_call,
+                fits: false,
+            });
+        }
+        rows.sort_unstable_by_key(|row| (row.hash, row.row));
+        let mut written = 0;
+        for at in 0..rows.len() {
+            if written != 0 && rows[written - 1].hash == rows[at].hash {
+                // Hashes only locate actual rows. An ambiguous collision is
+                // conservative S1, never equality or capacity authority.
+                if self.joint_staged_key(rows[written - 1].row)
+                    != self.joint_staged_key(rows[at].row)
+                {
+                    return Err(JointReceiptInstallRefusal::SubjectMismatch);
+                }
+                let registration = rows[at].registration;
+                let first_call = rows[at].first_call;
+                let previous = &mut rows[written - 1];
+                previous.registration = previous.registration.or(registration);
+                previous.first_call = previous.first_call.or(first_call);
+            } else {
+                rows.swap(written, at);
+                written += 1;
+            }
+        }
+        rows.truncate(written);
+        rows.sort_unstable_by_key(|row| row.registration.unwrap_or(usize::MAX));
+        let mut occupied = self.instance_state.records.len();
+        for row in &mut rows {
+            if row.registration.is_some()
+                && !self
+                    .instance_state
+                    .by_key
+                    .contains_key(self.joint_staged_key(row.row))
+            {
+                row.fits = occupied < self.instance_state.limit.min(MAX_REGISTRY_INSTANCES);
+                // Earlier queued S1 registrations consume slots too. Counting
+                // a later-refused physical row is conservative, never a grant.
+                occupied = occupied
+                    .checked_add(1)
+                    .ok_or(JointReceiptInstallRefusal::Capacity)?;
+            }
+        }
+        rows.sort_unstable_by_key(|row| row.hash);
+        Ok(JointRegistrationPlan {
+            rows,
+            staged_len: self.staged.len(),
+            records: self.instance_state.records.len(),
+            limit: self.instance_state.limit,
+            registry: self,
+            _storage: storage,
+        })
+    }
+
+    /// The production caller keeps one actual staging index for this batch.
+    /// Standalone witness tests build that same index over their original rows.
+    #[cfg(test)]
     pub(crate) fn reserve_admitted_joint_receipt(
         &mut self,
         input: &AdmittedInstanceCall,
+    ) -> Result<JointReceiptReservation<'_>, JointReceiptInstallRefusal> {
+        let plan = self.joint_registration_plan()?;
+        let window = JointRegistrationWindow {
+            start: 0,
+            end: plan.staged_len,
+        };
+        let position = plan.position(input, &window)?;
+        let JointRegistrationPlan {
+            rows,
+            registry,
+            _storage,
+            ..
+        } = plan;
+        drop(rows);
+        drop(_storage);
+        registry.reserve_joint_receipt_at(input, position)
+    }
+
+    fn reserve_joint_receipt_at(
+        &mut self,
+        input: &AdmittedInstanceCall,
+        registration: usize,
     ) -> Result<JointReceiptReservation<'_>, JointReceiptInstallRefusal> {
         let original = input
             .collected_origin()
@@ -1377,7 +1637,11 @@ impl CallerRegistry {
         if self.joint_grants.contains_key(&input.key) {
             return Err(JointReceiptInstallRefusal::AlreadyReserved);
         }
-        if self.joint_grants.len() >= self.instance_state.limit.min(MAX_REGISTRY_INSTANCES) {
+        if self.instance_state.negative_exhausted
+            || self.instance_state.identity_exhausted
+            || self.instance_state.records.len() >= self.instance_state.limit
+            || self.joint_grants.len() >= self.instance_state.limit.min(MAX_REGISTRY_INSTANCES)
+        {
             return Err(JointReceiptInstallRefusal::Capacity);
         }
         let reserve = self.semantic_storage_reserver();
@@ -1393,8 +1657,71 @@ impl CallerRegistry {
             registry: self,
             original,
             caller: input.caller,
+            registration,
             _key_storage: Some(key_storage),
         })
+    }
+
+    /// Re-read each staged original once before registration can consume any
+    /// grant. A later same-key admission cannot select Joint for an earlier
+    /// registration, even if a preparation caller chose the wrong sibling.
+    pub(super) fn validate_joint_grants_staged(&mut self) {
+        if self.joint_grants.is_empty() {
+            return;
+        }
+        for grant in self.joint_grants.values_mut() {
+            grant.application = None;
+        }
+        for (at, mutation) in self.staged.iter().enumerate() {
+            let (key, caller, original) = match mutation {
+                Mutation::NoteInstance(input) => (&input.key, input.caller, None),
+                Mutation::ObserveInstanceSemantic(input) => {
+                    (&input.key, input.caller, Some(input.collected_origin()))
+                }
+                _ => continue,
+            };
+            let Some(grant) = self.joint_grants.get_mut(key) else {
+                continue;
+            };
+            if grant.origin.is_none() {
+                continue;
+            } // Existing cfg(test) algorithms only.
+            let valid = match original {
+                None => match grant.registration {
+                    Some(registration) if registration == at => {
+                        grant.application = Some(JointGrantApplication {
+                            registration,
+                            caller,
+                            original: None,
+                        });
+                        true
+                    }
+                    Some(registration) if registration < at && grant.application.is_some() => true,
+                    _ => false,
+                },
+                Some(original) => match grant.application.as_mut() {
+                    Some(application) if application.original.is_none() => {
+                        application.original = original;
+                        original == grant.origin
+                            && application.caller == caller
+                            && matches!(mutation, Mutation::ObserveInstanceSemantic(input)
+                                if grant.receipt.proof().matches_admitted(input))
+                    }
+                    Some(_) => true,
+                    None => false,
+                },
+            };
+            if !valid {
+                self.joint_grants.remove(key);
+            }
+        }
+        self.joint_grants.retain(|_, grant| {
+            grant.origin.is_none()
+                || grant.application.as_ref().is_some_and(|application| {
+                    Some(application.registration) == grant.registration
+                        && application.original == grant.origin
+                })
+        });
     }
 
     /// Legacy reducer algorithms install their existing scripted receipt.
@@ -1428,6 +1755,8 @@ impl CallerRegistry {
             PendingJointGrant {
                 receipt,
                 origin: None,
+                registration: None,
+                application: None,
                 _key_storage: storage,
             },
         );
@@ -1851,8 +2180,20 @@ impl CallerRegistry {
     pub(super) fn apply_instance(
         &mut self,
         input: AdmittedInstance,
+        staged_position: Option<usize>,
         mut shared: Option<&mut crate::semantics_objects::journal::StagingLedger>,
     ) {
+        let installed = self
+            .joint_grants
+            .remove(&input.key)
+            .filter(|grant| match grant.origin {
+                Some(origin) => grant.application.as_ref().is_some_and(|application| {
+                    Some(application.registration) == staged_position
+                        && grant.registration == staged_position
+                        && application.original == Some(origin)
+                }),
+                None => cfg!(test),
+            });
         let module = self.modules_by_key.get(&input.key.module).copied();
         let refuse = if matches!(input.key.module, ModuleKey::Unidentified { .. })
             || input.key.image.task_cookie == 0
@@ -1987,7 +2328,6 @@ impl CallerRegistry {
         // Feed selection, once at registration: an installed Joint
         // receipt selects Joint (consumed — one receipt, one feed);
         // without one the feed stays S1Only, exactly as before.
-        let installed = self.joint_grants.remove(&input.key);
         let feed = JointStaging::select_joint(installed.as_ref().map(|grant| &grant.receipt));
         if feed.mode() == FeedMode::Joint {
             self.joint_feeds = self.joint_feeds.saturating_add(1);

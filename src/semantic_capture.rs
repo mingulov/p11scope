@@ -225,6 +225,7 @@ impl ValidatedH0Birth {
 pub(crate) struct RetainedBirthWitness {
     candidate: H0BirthCandidate,
     admission: crate::attach::BirthAdmissionBinding,
+    original: CollectedCallOrigin,
     receipt: BootstrapReceipt,
 }
 impl RetainedBirthWitness {
@@ -244,9 +245,7 @@ impl RetainedBirthWitness {
     ) -> bool {
         self.candidate.receipt.matches_admitted_partition(input)
             && self.receipt.proof().matches_admitted(input)
-            && input
-                .collected_origin()
-                .is_some_and(|origin| origin.in_quantum(self.candidate.quantum))
+            && input.collected_origin() == Some(self.original)
     }
 
     pub(crate) fn matches_original(
@@ -1505,6 +1504,9 @@ impl SemanticCapture {
         Ok(RetainedBirthWitness {
             candidate,
             admission,
+            original: admitted
+                .collected_origin()
+                .expect("the actual admitted origin was validated before native observation"),
             receipt,
         })
     }

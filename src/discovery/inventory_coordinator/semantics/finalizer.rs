@@ -298,6 +298,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         )
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // The actual Session machine consumes this staged negative port later.
     #[allow(clippy::result_large_err)] // Preserve the same original negative buffers on refusal.
     pub(crate) fn audit_disposed_quantum(
         &mut self,

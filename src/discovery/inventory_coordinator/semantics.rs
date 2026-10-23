@@ -2705,6 +2705,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
         // Validated registrations second: every covered id registers.
         // Conversion borrows end before staging mutates the registry.
+        let registration_start = self.registry.begin_joint_registrations();
         for coverage in &coverages {
             let staged: Vec<(
                 CallerId,
@@ -2745,6 +2746,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 }
             }
         }
+        let registrations = self.registry.end_joint_registrations(registration_start);
         // Eligible calls last, in original position order.
         #[cfg(test)]
         lane.note_conversion_barrier(barrier);
@@ -2793,6 +2795,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             domain,
             staged.into_iter().map(PreparedAdmission::new).collect(),
             current,
+            registrations,
             PreparedH3 {
                 negatives,
                 staged_positions,

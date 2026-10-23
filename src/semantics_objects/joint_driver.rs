@@ -399,6 +399,7 @@ pub(crate) struct RawDisposition {
     frontier: ConsumptionOrdinal,
     reason: RawDisposeReason,
     failure: Option<SealFailure>,
+    prepaid_bytes: usize,
     // Original effect/scope buffers drop before their retained reservation.
     _storage: ResourceLease,
 }
@@ -411,6 +412,10 @@ impl RawDisposition {
 
     pub(crate) fn failure(&self) -> Option<&SealFailure> {
         self.failure.as_ref()
+    }
+
+    pub(super) fn prepaid_bytes(&self) -> usize {
+        self.prepaid_bytes
     }
 
     pub(crate) fn identity(&self) -> RawQuantumIdentity {
@@ -1440,9 +1445,10 @@ impl RawJointQuantum {
                 .resource_reserver()
                 .ok_or(RawQuantumRefusal::ForeignLedger)?
                 .reserve(bytes)
+                .map(|storage| (bytes, storage))
                 .map_err(RawQuantumRefusal::Resource)
         })();
-        let storage = match storage {
+        let (prepaid_bytes, storage) = match storage {
             Ok(storage) => storage,
             Err(reason) => return Err((self, reason)),
         };
@@ -1497,6 +1503,7 @@ impl RawJointQuantum {
             frontier,
             reason,
             failure,
+            prepaid_bytes,
             _storage: storage,
         })
     }

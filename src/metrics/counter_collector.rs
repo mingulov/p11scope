@@ -568,6 +568,130 @@ mod tests {
     }
 
     #[test]
+    fn counter_storage_ownership_covers_two_collectors_and_deltas() {
+        // Sharing a charge while deep-copying rows, refunding on an early Arc
+        // drop, or returning uncharged deltas breaks this actual ownership test.
+        use crate::semantics_edge::resources::SemanticResourcePool;
+
+        fn charged(pool: &SemanticResourcePool, level: u64) -> CounterRead {
+            let reservation = ReadReservation::reserve(1, 1, &pool.reserver()).unwrap();
+            let row = latency(
+                &slot(3, 1, 0x80),
+                [level, level, 0, level * 2, 2, level],
+                &[(0, level)],
+            );
+            CounterRead::new(
+                NonZeroU64::new(7).unwrap(),
+                CounterMode::Latency,
+                None,
+                Ok(vec![row]),
+                CounterHealth::default(),
+                KernelEvidence::default(),
+                reservation,
+            )
+            .unwrap()
+        }
+
+        let pool = SemanticResourcePool::reference_limit(32 * 1024 * 1024);
+        let empty = pool.snapshot().charged_bytes;
+        let initial = charged(&pool, 1);
+        let one_read = pool.snapshot().charged_bytes;
+        assert!(one_read > empty);
+        let shared = initial.clone();
+        assert!(
+            std::ptr::eq(
+                &initial.rows.as_ref().unwrap()[0],
+                &shared.rows.as_ref().unwrap()[0],
+            ),
+            "a clone must share the actual immutable row allocation"
+        );
+        assert_eq!(pool.snapshot().charged_bytes, one_read);
+        let mut fast = CounterCollector::new(LIMITS, pool.reserver());
+        let mut slow = CounterCollector::new(LIMITS, pool.reserver());
+        assert_eq!(
+            fast.observe(Ok(initial.clone())),
+            CounterObservation::Initial
+        );
+        assert_eq!(
+            slow.observe(Ok(initial.clone())),
+            CounterObservation::Initial
+        );
+        assert_eq!(pool.snapshot().charged_bytes, one_read);
+
+        let next = charged(&pool, 5);
+        let overlapping = pool.snapshot().charged_bytes;
+        assert!(
+            overlapping > one_read,
+            "old and new physical snapshots overlap"
+        );
+        let fast_delta = match fast.observe(Ok(next.clone())) {
+            CounterObservation::Advanced { deltas, .. } => deltas,
+            other => panic!("expected first independently charged delta: {other:?}"),
+        };
+        let after_fast = pool.snapshot().charged_bytes;
+        assert!(after_fast > overlapping);
+        let slow_delta = match slow.observe(Ok(next.clone())) {
+            CounterObservation::Advanced { deltas, .. } => deltas,
+            other => panic!("expected second independently charged delta: {other:?}"),
+        };
+        assert_eq!(fast_delta[0].returned, 4);
+        assert_eq!(slow_delta[0].rv_counts, BTreeMap::from([(0, 4)]));
+        let after_slow = pool.snapshot().charged_bytes;
+        assert!(after_slow > after_fast);
+        drop(initial);
+        assert_eq!(
+            pool.snapshot().charged_bytes,
+            after_slow,
+            "shared source still owns old storage"
+        );
+        drop(shared);
+        assert_eq!(
+            pool.snapshot().charged_bytes,
+            after_slow - (one_read - empty)
+        );
+        drop(next);
+        let before_collectors_drop = pool.snapshot().charged_bytes;
+        drop(fast);
+        assert_eq!(pool.snapshot().charged_bytes, before_collectors_drop);
+        drop(slow);
+        let deltas_only = pool.snapshot().charged_bytes;
+        assert!(
+            deltas_only > empty,
+            "returned deltas remain charged beyond both collectors"
+        );
+        drop(fast_delta);
+        assert!(pool.snapshot().charged_bytes > empty);
+        drop(slow_delta);
+        assert_eq!(pool.snapshot().charged_bytes, empty);
+
+        // Delta-allocation refusal is transactional, not a sticky producer
+        // failure: releasing budget permits a complete telescoping retry.
+        let mut collector = CounterCollector::new(LIMITS, pool.reserver());
+        assert_eq!(
+            collector.observe(Ok(charged(&pool, 1))),
+            CounterObservation::Initial
+        );
+        let later = charged(&pool, 5);
+        let held = pool.snapshot().charged_bytes;
+        pool.reference_set_limit(held);
+        assert_eq!(
+            collector.observe(Ok(later.clone())),
+            CounterObservation::ReadFailed(ReadStage::Budget)
+        );
+        assert_eq!(pool.snapshot().charged_bytes, held);
+        pool.reference_set_limit(32 * 1024 * 1024);
+        match collector.observe(Ok(later)) {
+            CounterObservation::Advanced { deltas, .. } => {
+                assert_eq!((deltas[0].entered, deltas[0].returned), (4, 4));
+                assert_eq!(deltas[0].rv_counts, BTreeMap::from([(0, 4)]));
+            }
+            other => panic!("budget failure advanced or poisoned the baseline: {other:?}"),
+        }
+        drop(collector);
+        assert_eq!(pool.snapshot().charged_bytes, empty);
+    }
+
+    #[test]
     fn counter_collectors_telescope_all_components_across_failure_and_generation() {
         // A collector which clears maps, drops full-width RVs/buckets, advances
         // on failure or indexes new rows by vector position breaks this ledger.

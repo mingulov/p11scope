@@ -9,6 +9,10 @@
 #[cfg_attr(not(test), allow(dead_code))]
 mod counter_collector;
 
+// Private, unselected native reader; runtime admission/activation is separate.
+#[cfg_attr(not(test), allow(dead_code))]
+mod counter_reader;
+
 use crate::attach::Session;
 use crate::plan::{AttachPlan, ModuleId};
 use anyhow::{Context as _, Result};

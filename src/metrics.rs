@@ -16,6 +16,9 @@ mod counter_reader;
 #[cfg_attr(not(test), allow(dead_code))]
 mod counter_projection;
 
+#[cfg(test)]
+pub(crate) use counter_projection::tests::{ConsumerFault, ConsumerFixture};
+
 use crate::attach::Session;
 use crate::plan::{AttachPlan, ModuleId};
 use anyhow::{Context as _, Result};

@@ -3,6 +3,186 @@ use super::*;
 use crate::events::{EventDrain, LIVE_POLL_QUANTUM, ScriptedRecords};
 use p11scope_ebpf_common::{Event, capture, event_type};
 
+#[test]
+fn profile_counter_modes_share_the_live_and_terminal_collection() {
+    use p11scope_ebpf_common::CounterMode;
+    for mode in [
+        CounterMode::Counts,
+        CounterMode::Timestamps,
+        CounterMode::Latency,
+    ] {
+        let mut fixture = metrics::ConsumerFixture::new();
+        let mut cache = None;
+        let live = profile_tick_snapshot(
+            ProfileFrame {
+                since_frame: Duration::ZERO,
+                fresh_snapshot: true,
+                render: true,
+            },
+            &mut cache,
+            || fixture.fresh(mode, 1, 5, None),
+        )
+        .unwrap();
+        assert_eq!(live.reports()[0].calls, 5);
+        assert_eq!(live.reports()[0].mode, mode);
+        assert_eq!(live.reports()[0].rv_counts[&0x1_0000_0001], 2);
+        let terminal = fixture.terminal(mode, 1, 8, None).unwrap();
+        assert_eq!(terminal.reports()[0].calls, 8);
+        assert_eq!(metrics::ConsumerFixture::delta(&terminal), Some(3));
+        assert!(metrics::ConsumerFixture::terminal_eligible(&terminal));
+        assert_eq!(fixture.reads(), (2, 0));
+    }
+}
+
+#[test]
+fn profile_counter_cached_ticks_make_zero_native_calls() {
+    use p11scope_ebpf_common::CounterMode;
+    let mut fixture = metrics::ConsumerFixture::new();
+    let mut cache = None;
+    let first = profile_tick_snapshot(
+        ProfileFrame {
+            since_frame: Duration::ZERO,
+            fresh_snapshot: true,
+            render: true,
+        },
+        &mut cache,
+        || fixture.fresh(CounterMode::Counts, 1, 5, None),
+    )
+    .unwrap();
+    for _ in 0..4 {
+        let cached = profile_tick_snapshot(
+            ProfileFrame {
+                since_frame: Duration::ZERO,
+                fresh_snapshot: false,
+                render: false,
+            },
+            &mut cache,
+            || panic!("a cached tick cannot acquire another native read"),
+        )
+        .unwrap();
+        assert_eq!(cached.counter_collection(), first.counter_collection());
+        assert_eq!(cached.reports(), first.reports());
+        assert!(!metrics::ConsumerFixture::terminal_eligible(&cached));
+    }
+    assert_eq!(fixture.reads(), (1, 0));
+    let next = fixture.terminal(CounterMode::Counts, 1, 9, None).unwrap();
+    assert_eq!(metrics::ConsumerFixture::delta(&next), Some(4));
+    assert_eq!(fixture.reads(), (2, 0));
+}
+
+#[test]
+fn profile_counter_terminal_requires_a_new_successful_observation() {
+    use metrics::ConsumerFault;
+    use p11scope_ebpf_common::CounterMode;
+    for (fault, cause) in [
+        (ConsumerFault::ReadRvs, "read_rvs"),
+        (ConsumerFault::RowTopology, "topology"),
+        (ConsumerFault::Saturated, "saturated"),
+        (ConsumerFault::Contended, "contended"),
+    ] {
+        let mut fixture = metrics::ConsumerFixture::new();
+        let live = fixture.fresh(CounterMode::Counts, 1, 5, None).unwrap();
+        assert!(!metrics::ConsumerFixture::terminal_eligible(&live.clone()));
+        let stale = profile_tick_snapshot(
+            ProfileFrame {
+                since_frame: Duration::ZERO,
+                fresh_snapshot: true,
+                render: true,
+            },
+            &mut None,
+            || fixture.fresh(CounterMode::Counts, 1, 8, Some(fault)),
+        )
+        .unwrap();
+        assert_eq!(stale.reports()[0].calls, 5);
+        let metadata = stale.counter_collection().unwrap();
+        assert_eq!(metadata["status"], "stale");
+        assert_eq!(metadata["failure"], cause);
+        assert!(metadata["health"].is_null());
+        assert!(!metrics::ConsumerFixture::terminal_eligible(&stale));
+        let error = fixture
+            .terminal(CounterMode::Counts, 1, 9, Some(fault))
+            .unwrap_err();
+        assert!(error.to_string().contains(cause), "{error:#}");
+        assert_eq!(fixture.reads(), (3, 0));
+    }
+}
+
+#[test]
+fn profile_counter_initial_unavailability_cannot_fabricate_zero_measurements() {
+    use metrics::ConsumerFault;
+    use p11scope_ebpf_common::CounterMode;
+    for fault in [
+        ConsumerFault::ReadRvs,
+        ConsumerFault::RowTopology,
+        ConsumerFault::Saturated,
+        ConsumerFault::Contended,
+    ] {
+        let mut fixture = metrics::ConsumerFixture::new();
+        let mut cache = None;
+        let result = profile_tick_snapshot(
+            ProfileFrame {
+                since_frame: Duration::ZERO,
+                fresh_snapshot: true,
+                render: true,
+            },
+            &mut cache,
+            || fixture.fresh(CounterMode::Counts, 1, 5, Some(fault)),
+        );
+        assert!(result.is_err());
+        assert!(
+            cache.is_none(),
+            "no initial unavailable result may become a report"
+        );
+        assert_eq!(fixture.reads(), (1, 0));
+    }
+}
+
+#[test]
+fn profile_counter_captures_keep_independent_collection_baselines() {
+    use p11scope_ebpf_common::CounterMode;
+    let mut a = metrics::ConsumerFixture::new();
+    let mut b = metrics::ConsumerFixture::new();
+    a.fresh(CounterMode::Counts, 1, 5, None).unwrap();
+    b.fresh(CounterMode::Counts, 1, 9, None).unwrap();
+    let a = a.terminal(CounterMode::Counts, 1, 8, None).unwrap();
+    let b = b.terminal(CounterMode::Counts, 1, 14, None).unwrap();
+    assert_eq!(a.reports()[0].calls, 8);
+    assert_eq!(b.reports()[0].calls, 14);
+    assert_eq!(metrics::ConsumerFixture::delta(&a), Some(3));
+    assert_eq!(metrics::ConsumerFixture::delta(&b), Some(5));
+}
+
+#[test]
+fn profile_counter_generation_and_stale_status_keep_accepted_identity() {
+    use p11scope_ebpf_common::CounterMode;
+    let mut fixture = metrics::ConsumerFixture::new();
+    fixture.fresh(CounterMode::Counts, 1, 5, None).unwrap();
+    let changed = fixture.fresh(CounterMode::Timestamps, 2, 7, None).unwrap();
+    let metadata = changed.counter_collection().unwrap();
+    assert_eq!(metadata["mode"], "timestamps");
+    assert_eq!(metadata["generation"], 2);
+    assert_eq!(metadata["status"], "fresh");
+    assert_eq!(metadata["discontinuity"], true);
+    let stale = fixture
+        .fresh(
+            CounterMode::Latency,
+            3,
+            10,
+            Some(metrics::ConsumerFault::ReadRvs),
+        )
+        .unwrap();
+    let metadata = stale.counter_collection().unwrap();
+    assert_eq!(metadata["mode"], "timestamps");
+    assert_eq!(metadata["generation"], 2);
+    assert_eq!(
+        metadata["read_window"],
+        changed.counter_collection().unwrap()["read_window"]
+    );
+    assert_eq!(metadata["status"], "stale");
+    assert_eq!(stale.reports()[0].mode, CounterMode::Timestamps);
+    assert_eq!(stale.reports()[0].calls, 7);
+}
+
 fn open_plan() -> crate::plan::AttachPlan {
     crate::plan::AttachPlan::from_slots(vec![crate::plan::Slot {
         index: 0,

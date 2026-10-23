@@ -55,6 +55,19 @@ pub(super) struct CounterRow {
     levels: CounterLevels,
 }
 
+pub(super) struct CounterRowView<'a> {
+    pub(super) slot: u32,
+    pub(super) target: AttachKey,
+    pub(super) mode: CounterMode,
+    pub(super) entered: u64,
+    pub(super) returned: u64,
+    pub(super) errors: u64,
+    pub(super) total_ns: u64,
+    pub(super) max_ns: u64,
+    pub(super) buckets: &'a [u64; LATENCY_BUCKETS],
+    pub(super) rv_counts: &'a BTreeMap<u64, u64>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CounterField {
     Entered,
@@ -90,6 +103,21 @@ fn add(total: &mut u64, value: u64, field: CounterField) -> Result<(), CounterIs
 }
 
 impl CounterRow {
+    pub(super) fn view(&self) -> CounterRowView<'_> {
+        CounterRowView {
+            slot: self.slot,
+            target: self.target,
+            mode: self.mode,
+            entered: self.levels.entered,
+            returned: self.levels.returned,
+            errors: self.levels.errors,
+            total_ns: self.levels.total_ns,
+            max_ns: self.levels.max_ns,
+            buckets: &self.levels.buckets,
+            rv_counts: &self.levels.rv_counts,
+        }
+    }
+
     /// Bind a fold to the actual plan cell, independent of names/attribution.
     /// RV entries may repeat across CPUs; every fold and new key is checked.
     pub(super) fn fold<'a>(
@@ -219,7 +247,7 @@ pub(super) struct CounterHealth {
 // allocator model. One full internal node per entry dominates retained tree
 // requests; eight extra nodes cover the bounded split/root temporary chain.
 // This is a conservative requested-allocation envelope, never an RSS bound.
-fn tree_bytes<K, V>(entries: usize) -> Option<usize> {
+pub(super) fn tree_bytes<K, V>(entries: usize) -> Option<usize> {
     let node = 16usize
         .checked_add(11usize.checked_mul(size_of::<K>().checked_add(size_of::<V>())?)?)?
         .checked_add(12 * 8)?
@@ -294,7 +322,32 @@ pub(super) struct CounterRead {
     kernel: KernelEvidence,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct CounterReadView<'a> {
+    pub(super) generation: NonZeroU64,
+    pub(super) mode: CounterMode,
+    pub(super) window: Option<ReadWindow>,
+    pub(super) rows: Result<&'a [CounterRow], CounterIssue>,
+    pub(super) health: CounterHealth,
+    pub(super) kernel: KernelEvidence,
+}
+
 impl CounterRead {
+    pub(super) fn view(&self) -> CounterReadView<'_> {
+        CounterReadView {
+            generation: self.generation,
+            mode: self.mode,
+            window: self.window,
+            rows: self
+                .rows
+                .as_deref()
+                .map(|rows| &**rows)
+                .map_err(|&issue| issue),
+            health: self.health,
+            kernel: self.kernel,
+        }
+    }
+
     /// A known-generation fold/limit failure is an explicit loss input. An
     /// incomplete map scrape instead supplies the outer ReadStage error.
     pub(super) fn new(
@@ -494,6 +547,14 @@ pub(super) struct CounterCollector {
 }
 
 impl CounterCollector {
+    pub(super) fn current(&self) -> Option<&CounterRead> {
+        self.baseline.as_ref()
+    }
+
+    pub(super) fn reserver(&self) -> &SemanticResourceReserver {
+        &self.reserve
+    }
+
     pub(super) fn new(limits: CounterLimits, reserve: SemanticResourceReserver) -> Self {
         Self {
             limits,

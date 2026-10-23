@@ -1000,10 +1000,31 @@ impl AttachPlan {
             .unwrap_or_default()
     }
 
+    /// Borrow presentation metadata before reserving its eventual owned copy.
+    pub(crate) fn borrowed_ordinals_of(
+        &self,
+        slot: &Slot,
+    ) -> impl Iterator<Item = SlotOrdinal> + '_ {
+        self.slot_ordinals
+            .get(&AttachKey::of(slot))
+            .into_iter()
+            .flat_map(|ordinals| ordinals.iter().copied())
+    }
+
+    pub(crate) fn ordinal_count(&self, slot: &Slot) -> usize {
+        self.slot_ordinals
+            .get(&AttachKey::of(slot))
+            .map_or(0, BTreeSet::len)
+    }
+
     /// The pinned identity of the object this slot attaches into, when the
     /// plan was built with the pins in hand.
     pub(crate) fn target_object_of(&self, slot: &Slot) -> Option<TargetObject> {
         self.object_identities.get(&slot.object).cloned()
+    }
+
+    pub(crate) fn borrowed_target_object_of(&self, slot: &Slot) -> Option<&TargetObject> {
+        self.object_identities.get(&slot.object)
     }
 
     /// The one display label for `slot` ([`presented_label`]).

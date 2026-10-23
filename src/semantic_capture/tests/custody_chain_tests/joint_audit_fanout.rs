@@ -1349,10 +1349,11 @@ impl MachineScene {
 }
 
 /// Same decoded DISCOVERY transport as the production reader, scoped to an
-/// owned child. It is input, never a Q/Current/completion witness.
+/// owned child. This controlled LEADER_EXIT stimulus is never physical-exit,
+/// Q, Current, cessation or completion authority.
 fn finish_discovery_bytes(pid: u32, at: u64) -> Vec<u8> {
     let mut record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
-    record.kind = p11scope_ebpf_common::DISCOVERY_KIND_EXEC;
+    record.kind = p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT;
     record.pid_tgid = (u64::from(pid) << 32) | u64::from(pid);
     record.hook_ts_ns = at;
     // SAFETY: the shared repr(C) transport is completely initialized above,
@@ -1552,14 +1553,90 @@ fn joint_machine_collected_finish_preserves_last_return_before_stopped() {
 #[test]
 fn joint_machine_collected_finish_idle_uses_same_cursor_q() {
     let child = OwnedStoppedChild::new();
+    let exited_pid = child.id();
+    drop(child); // Reap this separate owned subject; the active semantic owner remains live.
     let mut fixture = MachineScene::new(1);
     fixture.prime(1);
     fixture.enable_finish_fixture(vec![
-        finish_discovery_bytes(child.id(), 100),
-        finish_discovery_bytes(child.id(), 101),
+        finish_discovery_bytes(exited_pid, 100),
+        finish_discovery_bytes(exited_pid, 101),
+        finish_discovery_bytes(exited_pid, 102),
     ]);
+    // The first ORIGINAL record reaches the Engine's real ingestion path in
+    // an exhausted live frame. That path retains it in pending_discovery_records
+    // without dispatch. A vanished queue alone is not a processing oracle.
+    let mut engine_input = None;
+    {
+        let finish = fixture.finish.as_mut().unwrap();
+        let drain = finish.observer.discovery_drain_mut();
+        let bound = crate::events::discovery_drain_positions(drain).producer;
+        crate::events::poll_discovery_to_position(drain, bound, Some(1), |item| {
+            let crate::events::DiscoveryItem::Record(record) = item else {
+                panic!("the owned child's original DISCOVERY input decodes");
+            };
+            assert!(engine_input.replace(record).is_none());
+            std::ops::ControlFlow::Continue(())
+        })
+        .unwrap();
+    }
+    let record = engine_input.unwrap();
+    assert_eq!(record.hook_ts_ns, 100);
+    assert_eq!(record.pid_tgid >> 32, u64::from(exited_pid));
+    assert_eq!(
+        record.kind,
+        p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_finish_exit_subject_for_test(exited_pid, 100),
+        (true, false, false),
+        "System scope admits generations, but this separate subject has no matched Engine view or covering admission"
+    );
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .reference_defer_finish_discovery_for_test(record)
+        .unwrap();
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_collected_finish_discovery_head_for_test(),
+        Some((
+            exited_pid,
+            100,
+            p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT
+        )),
+        "actual exhausted-frame ingestion retains this original at the Engine head"
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_collected_finish_discovery_backlog(0)
+            .0,
+        1
+    );
+    assert!(
+        !fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_unmatched_finish_exit_for_test(exited_pid, 100)
+    );
     // Move one actual decoded item into the existing Session FIFO before Q.
-    // Its credit and bytes remain held; the ring retains the second item.
+    // Its credit and bytes remain held; the ring retains the third item.
     {
         let FinishMachineFixture {
             observer, staged, ..
@@ -1587,12 +1664,98 @@ fn joint_machine_collected_finish_idle_uses_same_cursor_q() {
         .reference_h3_audit_state();
     fixture.begin_finish().unwrap();
     let zero = FinishCustody::observe(&fixture);
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_collected_finish_discovery_backlog(1)
+            .0
+            > 0
+    );
     assert!(matches!(
         fixture.poll_finish(0).unwrap(),
         crate::discovery::engine::inventory_coordinator::JointCommitProgress::Pending
     ));
     zero.assert_unchanged(&fixture);
-    fixture.reach_finish_stop_ready();
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_collected_finish_discovery_head_for_test(),
+        Some((
+            exited_pid,
+            100,
+            p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT
+        ))
+    );
+    assert!(!fixture.scene.real.lane.is_finished());
+    assert!(
+        fixture
+            .scene
+            .real
+            .lane
+            .begin_owned_terminal_cleanup()
+            .is_err()
+    );
+    let mut reached_final_original = false;
+    for _ in 0..512 {
+        let progress = fixture.poll_finish(1).unwrap();
+        let finish = fixture.finish.as_ref().unwrap();
+        let pending = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_collected_finish_discovery_backlog(finish.staged.len());
+        if pending.0 > 0 || pending.1 {
+            assert!(matches!(
+                progress,
+                crate::discovery::engine::inventory_coordinator::JointCommitProgress::Pending
+            ));
+            assert!(!fixture.scene.real.h0.0.borrow().capture.stopped);
+            assert_eq!(finish.stops, 0);
+            assert!(!fixture.scene.real.lane.is_finished());
+            assert_eq!(
+                fixture
+                    .scene
+                    .real
+                    .scene
+                    .coordinator
+                    .registry()
+                    .published_revision(),
+                zero.revision
+            );
+            assert!(
+                fixture
+                    .scene
+                    .real
+                    .lane
+                    .begin_owned_terminal_cleanup()
+                    .is_err()
+            );
+        }
+        if fixture.machine.finish_stop_ready_for_test() {
+            reached_final_original = true;
+            break;
+        }
+    }
+    assert!(
+        reached_final_original,
+        "the retained actual Engine/FIFO/ring work progresses within the original bound"
+    );
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_unmatched_finish_exit_for_test(exited_pid, 100),
+        "the exact original LEADER_EXIT must reach actual lifecycle dispatch; discarding it is not progress"
+    );
     let raw = fixture
         .machine
         .retained_raw_for_test()

@@ -321,6 +321,7 @@ metrics::counter_reader::tests::counter_bank_session_boundary_511_512_counts_gro
 metrics::counter_reader::tests::counter_bank_session_useful_8192_counts_growth_lp64
 discovery::sweep_attribution::tests::privileged_d4_btrfs_hardlink_alias_backend_parity
 discovery::sweep_attribution::tests::privileged_d4_btrfs_bind_alias_backend_parity
+metrics::counter_reader::tests::counter_bank_session_boundary_511_512_counts_growth_multi_lp64
 )
 SKIP_REASONS=(
 "needs punch-hole support under TMPDIR (btrfs/ext4/xfs; tmpfs refuses); no BPF-independent probe: run by hand as root: TMPDIR=<hole-capable dir> <binary> --exact <path> --ignored"
@@ -353,6 +354,7 @@ SKIP_REASONS=(
 "needs selected V2 proof build and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER/_WORKLOAD; separate authorized 8192-endpoint native FD/memory admission after boundary pilot"
 "needs root Btrfs disk TMPDIR and eligible task_vma/BTF for required actual hardlink alias kernel/userspace parity; run exact selector with --ignored --test-threads=1 on a matching prebuilt binary"
 "needs root/CAP_SYS_ADMIN, private child mount namespaces, Btrfs disk TMPDIR and eligible task_vma/BTF; actual bind alias parity requires a separately admitted exact ignored run with unchanged parent mounts"
+"needs proof1/artifacts0 prebuilt libtest and growth provider/workload inputs; explicit Multi PID-filter capability and separately admitted 513-endpoint native FD/memory/cleanup qualification, preserving required Singles coverage"
 )
 
 usage() {

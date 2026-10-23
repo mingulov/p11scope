@@ -33,6 +33,88 @@ unsafe impl aya::Pod for QueryControl {}
 const _: () = assert!(size_of::<QueryRequest>() == 24);
 const _: () = assert!(size_of::<QueryControl>() == 56);
 
+const ABSENCE_MAPS_BYTES: usize = 8 * 1024 * 1024;
+const ABSENCE_MAPS_ROWS: usize = crate::discovery::instances::MAX_RANGES;
+
+/// Complete temporary envelope for ONE absence query/commit. This is only
+/// storage geometry; it creates no identity or evidence. The caller reserves
+/// it before native I/O and keeps it until all query buffers have dropped.
+///
+/// Vec growth can retain old capacity <N alongside replacement capacity <2N.
+/// Count those requests, complete path bytes/padding, per-key ranges plus
+/// aggregate growth/sort/confirmation, and the actual watched/readback copies.
+pub(crate) fn absence_query_storage_bytes(
+    watched_keys: usize,
+    target_copy: usize,
+    static_sides: usize,
+) -> Option<usize> {
+    use crate::semantics_edge::resources::OWNED_ALLOCATION_PADDING as PAD;
+    fn growth<T>(count: usize) -> Option<usize> {
+        count
+            .checked_mul(3)?
+            .checked_mul(size_of::<T>())?
+            .checked_add(2 * crate::semantics_edge::resources::OWNED_ALLOCATION_PADDING)
+    }
+    // Rust 1.98 B-tree: eleven key/value slots, twelve child edges, with
+    // three words covering the parent/index/length header and alignment.
+    // Charging an internal node PER item also covers partially filled roots.
+    fn tree_node<K, V>() -> Option<usize> {
+        11usize
+            .checked_mul(size_of::<K>().checked_add(size_of::<V>())?)?
+            .checked_add(15 * size_of::<usize>())?
+            .checked_add(crate::semantics_edge::resources::OWNED_ALLOCATION_PADDING)
+    }
+    let maps = growth::<u8>(ABSENCE_MAPS_BYTES)?
+        .checked_add(growth::<p11scope_manifest::maps::MapEntry>(
+            ABSENCE_MAPS_ROWS,
+        )?)?
+        .checked_add(ABSENCE_MAPS_BYTES)?
+        .checked_add(ABSENCE_MAPS_ROWS.checked_mul(PAD)?)?;
+    // At most N candidates, one <=N per-key selection, sort scratch <=N,
+    // and simultaneous candidate/confirmation vectors: six N capacities.
+    let ranges = ABSENCE_MAPS_ROWS
+        .checked_mul(6)?
+        .checked_mul(size_of::<MapRange>())?
+        .checked_add(6 * PAD)?;
+    let watched = watched_keys
+        .checked_mul(size_of::<p11scope_manifest::maps::ObjectKey>())?
+        .checked_add(PAD)?
+        .checked_add(target_copy)?;
+    // current_static_sides' collect/sort buffer and one internal-node bound
+    // per original side; descriptor readback retains no owned text.
+    let readback = static_sides
+        .checked_mul(
+            4usize
+                .checked_mul(size_of::<super::StaticEndpoint>())?
+                .checked_add(tree_node::<super::StaticEndpoint, ()>()?)?,
+        )?
+        .checked_add(4 * PAD)?
+        .checked_add(growth::<p11scope_ebpf_common::SlotSemantics>(
+            crate::kinds::DESCRIPTORS.len(),
+        )?)?;
+    // One-image query: old request-map keys (<=QUERY_LIMIT), one requested
+    // cookie, an image+END stream, and one image B-tree node. Proc stat and
+    // ftrace sysctl are kernel records within a page, including grow overlap.
+    let native = growth::<u64>(QUERY_LIMIT)?
+        .checked_add(growth::<u64>(1)?)?
+        .checked_add(growth::<u8>(2 * ROW_LEN)?)?
+        .checked_add(tree_node::<u64, ImageIdentity>()?)?
+        .checked_add(tree_node::<u64, ()>()?)?
+        .checked_add(growth::<u8>(4096)?.checked_mul(2)?)?
+        .checked_add(growth::<(&'static str, super::instance::HookStats)>(
+            super::instance::INSTANCE_PROGRAMS.len(),
+        )?)?
+        .checked_add(
+            super::instance::INSTANCE_PROGRAMS
+                .len()
+                .checked_mul(tree_node::<&'static str, ()>()?)?,
+        )?;
+    maps.checked_add(ranges)?
+        .checked_add(watched)?
+        .checked_add(readback)?
+        .checked_add(native)
+}
+
 /// One retained same-object query program. Requests are immutable while a
 /// run is open; the exclusive Session borrow serializes configuration/runs.
 pub(super) struct ImageQueryOwner {
@@ -315,6 +397,21 @@ pub(super) fn read_iterator(
 }
 
 impl super::Session {
+    /// Read actual retained geometry without cloning WatchedFile or running
+    /// a query. The target-copy allowance comes from the same attested pins.
+    pub(crate) fn absence_query_storage_bytes(
+        &self,
+        object: crate::discovery::identity::PinnedObjectId,
+        target_copy: usize,
+    ) -> Option<usize> {
+        let watched = self.instance.watched(object)?;
+        let sides = self
+            .links
+            .iter()
+            .try_fold(0usize, |count, link| count.checked_add(link.slots().len()))?;
+        absence_query_storage_bytes(watched.maps_keys.len(), target_copy, sides)
+    }
+
     pub(crate) fn native_domain(&self) -> Option<NativeDomainId> {
         self.image_query.as_ref().map(ImageQueryOwner::domain)
     }
@@ -520,7 +617,11 @@ impl<F: Fn() -> u64> AbsenceScanSource for LiveImageScan<'_, F> {
         self.watched.identity
     }
     fn entries(&mut self) -> Result<Vec<p11scope_manifest::maps::MapEntry>, ImageQueryRefusal> {
-        read_parsed_maps_with(&self.proc, self.window.deadline(), 8 * 1024 * 1024, || {})
+        let bytes = self
+            .proc
+            .read_maps(self.window.deadline(), ABSENCE_MAPS_BYTES)
+            .map_err(|_| ImageQueryRefusal::Custody)?;
+        parse_absence_maps(&bytes, self.window.max_rows().min(ABSENCE_MAPS_ROWS))
     }
     fn attach_generation(&mut self) -> Result<u64, ImageQueryRefusal> {
         self.budget()?;
@@ -540,6 +641,27 @@ impl<F: Fn() -> u64> AbsenceScanSource for LiveImageScan<'_, F> {
             .mapped_file_identity(start, end, self.window.deadline())
             .map_err(|_| ImageQueryRefusal::Custody)
     }
+}
+
+fn parse_absence_maps(
+    bytes: &[u8],
+    max_rows: usize,
+) -> Result<Vec<p11scope_manifest::maps::MapEntry>, ImageQueryRefusal> {
+    if !bytes.is_empty() && bytes.last() != Some(&b'\n') {
+        return Err(ImageQueryRefusal::Stream);
+    }
+    // A COMPLETE over-limit enumeration refuses BEFORE parser allocations;
+    // it is never truncated into a provider-free statement.
+    if bytes.len() > ABSENCE_MAPS_BYTES
+        || bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .count()
+            > max_rows
+    {
+        return Err(ImageQueryRefusal::Capacity);
+    }
+    p11scope_manifest::maps::parse_maps(bytes).map_err(|_| ImageQueryRefusal::Stream)
 }
 
 /// The complete retained maps read plus full parse, shared by the
@@ -1184,17 +1306,25 @@ fn prove_absence_with(
         if entries.is_empty() {
             return Err(ImageQueryRefusal::Stream);
         }
+        if entries.len() > ABSENCE_MAPS_ROWS {
+            return Err(ImageQueryRefusal::Capacity);
+        }
         let mut candidates = Vec::new();
         for key in source.watched_keys() {
-            candidates.extend(crate::discovery::instances::ranges_for(
+            let selected = crate::discovery::instances::ranges_for(
                 &entries,
                 key.device.major,
                 key.device.minor,
                 key.inode,
-            ));
-        }
-        if candidates.len() > 16_384 {
-            return Err(ImageQueryRefusal::Capacity);
+            );
+            if candidates
+                .len()
+                .checked_add(selected.len())
+                .is_none_or(|count| count > ABSENCE_MAPS_ROWS)
+            {
+                return Err(ImageQueryRefusal::Capacity);
+            }
+            candidates.extend(selected);
         }
         let confirmed = crate::discovery::instances::confirm_identity(
             candidates,
@@ -1480,6 +1610,62 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn absence_query_envelope_covers_complete_maps_and_refuses_before_parse() {
+        use crate::semantics_edge::resources::{
+            SEMANTIC_RESOURCE_LIMIT, SEMANTIC_TRANSITION_SCRATCH,
+        };
+        let bound = absence_query_storage_bytes(1, 1024, 30).unwrap();
+        assert!(bound + SEMANTIC_TRANSITION_SCRATCH < SEMANTIC_RESOURCE_LIMIT);
+        for (keys, target, sides) in [(usize::MAX, 0, 0), (0, usize::MAX, 0), (0, 0, usize::MAX)] {
+            assert!(absence_query_storage_bytes(keys, target, sides).is_none());
+        }
+
+        let prefix = b"00001000-00002000 r-xp 00000000 00:00 1 /";
+        let mut line = prefix.to_vec();
+        line.resize(511, b'p');
+        line.push(b'\n');
+        let full = line.repeat(ABSENCE_MAPS_ROWS);
+        assert_eq!(full.len(), ABSENCE_MAPS_BYTES);
+        let ((rows, bytes), allocations, allocated) =
+            crate::test_alloc::count_allocs_during(|| {
+                let parsed = parse_absence_maps(&full, ABSENCE_MAPS_ROWS).unwrap();
+                (
+                    parsed.len(),
+                    parsed
+                        .iter()
+                        .map(|entry| entry.raw_path.as_ref().map_or(0, Vec::len))
+                        .sum::<usize>(),
+                )
+            });
+        assert_eq!(rows, ABSENCE_MAPS_ROWS);
+        assert!(bytes > ABSENCE_MAPS_BYTES / 2 && allocations >= ABSENCE_MAPS_ROWS);
+        assert!(
+            allocated <= bound,
+            "all actual parser requests fit the precharged query bound"
+        );
+
+        let over_rows = b"0-1 r--p 0 0:0 0\n".repeat(ABSENCE_MAPS_ROWS + 1);
+        let (refused, allocations, allocated) = crate::test_alloc::count_allocs_during(|| {
+            parse_absence_maps(&over_rows, ABSENCE_MAPS_ROWS)
+        });
+        assert_eq!(refused.err(), Some(ImageQueryRefusal::Capacity));
+        assert_eq!(
+            (allocations, allocated),
+            (0, 0),
+            "a complete N+1 snapshot is refused before parsing/copying any path"
+        );
+
+        // Peak tracking uses <=4096 owned paths so the existing bounded
+        // instrumentation remains complete; it also observes temporary drop.
+        let ((), peak) = crate::test_alloc::requested_peak_during(|| {
+            drop(parse_absence_maps(&full[..512 * 4096], ABSENCE_MAPS_ROWS).unwrap());
+        });
+        assert!(!peak.incomplete && peak.failed_requests == 0);
+        assert!(peak.realloc_overlap_bytes <= bound);
+        assert_eq!((peak.live_bytes, peak.live_blocks), (0, 0));
+    }
 
     fn domain() -> NativeDomainId {
         NativeDomainId::mint()

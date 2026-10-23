@@ -122,6 +122,12 @@ pub(crate) trait JointMachineIo {
         slot: u32,
         adapter: &mut JournalAdapter,
     ) -> Result<CommittedAbsenceBirth, BirthObservationRefusal>;
+    fn absence_query_storage_bytes(
+        &self,
+        lane: &AttestedSemanticLane,
+        object: PinnedObjectId,
+        target_copy: usize,
+    ) -> Option<usize>;
     fn with_native<R>(
         &mut self,
         lane: &mut AttestedSemanticLane,
@@ -739,11 +745,24 @@ impl LiveJointMachine {
                     else {
                         return (Phase::Idle, Err(SemanticRefusal::ProviderStorage));
                     };
+                    let Some(query_bytes) = io.absence_query_storage_bytes(lane, object, nested)
+                    else {
+                        return (Phase::Idle, Err(SemanticRefusal::ProviderStorage));
+                    };
                     let slot_storage = match self.births.reserve_for(&reserve, nested) {
                         Ok(storage) => storage,
                         Err(()) => return (Phase::Idle, Err(SemanticRefusal::ProviderStorage)),
                     };
-                    match io.acquire_absence(lane, binding, slot, adapter) {
+                    let query_storage = match reserve.reserve(query_bytes) {
+                        Ok(storage) => storage,
+                        Err(_) => return (Phase::Idle, Err(SemanticRefusal::ProviderStorage)),
+                    };
+                    let acquired = io.acquire_absence(lane, binding, slot, adapter);
+                    // Native maps/parsed paths/confirmation/watch temporaries
+                    // have dropped. The returned negative's original watched
+                    // copy remains covered by slot_storage's nested lease.
+                    drop(query_storage);
+                    match acquired {
                         Ok(negative) => {
                             if !negative.matches_binding_target(
                                 binding,
@@ -1515,6 +1534,25 @@ impl JointMachineIo for SessionMachineIo {
             slot,
             adapter,
         )
+    }
+
+    fn absence_query_storage_bytes(
+        &self,
+        lane: &AttestedSemanticLane,
+        object: PinnedObjectId,
+        target_copy: usize,
+    ) -> Option<usize> {
+        let live = lane.live.as_deref()?;
+        if live.gated
+            || live.finished
+            || !self
+                .producers
+                .same_producers(&live.session.drain_producers()?)
+        {
+            return None;
+        }
+        live.session
+            .absence_query_storage_bytes(object, target_copy)
     }
 
     fn with_native<R>(

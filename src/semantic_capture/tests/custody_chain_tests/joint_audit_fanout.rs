@@ -457,6 +457,30 @@ impl crate::inventory_semantics::JointMachineIo for HeldMachineIo<'_> {
         )
     }
 
+    fn absence_query_storage_bytes(
+        &self,
+        lane: &AttestedSemanticLane,
+        object: crate::discovery::identity::PinnedObjectId,
+        target_copy: usize,
+    ) -> Option<usize> {
+        let held = self.h0.0.borrow();
+        if !held
+            .io
+            .watched
+            .iter()
+            .any(|target| target.same_object_as(lane.subset().pins(), object))
+        {
+            return None;
+        }
+        // acquire_absence passes exactly one original watched key and the
+        // actual fixture seals both sides of each retained plan slot.
+        crate::attach::image_query::absence_query_storage_bytes(
+            1,
+            target_copy,
+            lane.subset().plan().slots.len().checked_mul(2)?,
+        )
+    }
+
     fn with_native<R>(
         &mut self,
         _lane: &mut AttestedSemanticLane,
@@ -1279,7 +1303,8 @@ fn joint_machine_absence_stale_inputs_end_in_permanent_s1() {
 
 #[test]
 fn joint_machine_absence_storage_precedes_query_and_refunds_owned_overlap() {
-    for refuse in [false, true] {
+    for refusal in ["healthy", "retained-overlap", "query"] {
+        let refuse = refusal != "healthy";
         let mut fixture = MachineScene::absence_scene(3);
         fixture.wait_absence(1);
         let before_reads = fixture.native.absence_reads.len();
@@ -1298,6 +1323,14 @@ fn joint_machine_absence_storage_precedes_query_and_refunds_owned_overlap() {
             )
             .unwrap();
         assert!(old > 0 && new > old && nested > 0);
+        let query = crate::attach::image_query::absence_query_storage_bytes(
+            1,
+            nested,
+            fixture.scene.real.lane.subset().plan().slots.len() * 2,
+        )
+        .unwrap();
+        assert!(query > 8 * 1024 * 1024);
+        assert!(query < crate::semantics_edge::resources::SEMANTIC_RESOURCE_LIMIT);
         let snapshot = fixture
             .scene
             .real
@@ -1306,8 +1339,15 @@ fn joint_machine_absence_storage_precedes_query_and_refunds_owned_overlap() {
             .registry()
             .semantic_resource_snapshot();
         let hold = refuse.then(|| {
+            let remaining = if refusal == "query" {
+                // Retention's real old allocation refunds AFTER the resize;
+                // then exactly query-1 bytes remain for the actual query lease.
+                new - old + nested + query - 1
+            } else {
+                new - old + nested
+            };
             reserve
-                .reserve(snapshot.limit_bytes - snapshot.charged_bytes - (new - old + nested))
+                .reserve(snapshot.limit_bytes - snapshot.charged_bytes - remaining)
                 .unwrap()
         });
         if refuse {
@@ -1330,12 +1370,12 @@ fn joint_machine_absence_storage_precedes_query_and_refunds_owned_overlap() {
             }
             assert!(
                 refused,
-                "the actual overlapping reservation must refuse before native acquisition"
+                "{refusal}: the actual reservation must refuse before native acquisition"
             );
             assert_eq!(
                 fixture.native.absence_reads.len(),
                 before_reads,
-                "old+new physical capacity must coexist before the query callback"
+                "{refusal}: full retained overlap and the full query bound precede the callback"
             );
             let pending = fixture.pending_absence(1).unwrap();
             assert_eq!(

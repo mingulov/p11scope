@@ -555,7 +555,22 @@ impl MachineScene {
         held.io
             .enqueue(std::process::id(), 0, "C_GetSessionInfo", 0, 0);
         let mut record = held.io.script.records.pop_back().unwrap();
+        // HeldIo's algorithm fixture has no physical invocation by default.
+        // The actual ordinary producer returns on a real thread with a
+        // nonzero, unsaturated interval, as collected_tick models too.
+        record.base.event.pid_tgid |= record.base.event.pid_tgid >> 32;
+        record.base.event.duration_ns = 1;
         record.base.event.target_function = p11scope_ebpf_common::FUNCTION_NONE;
+        assert_ne!(record.base.event.pid_tgid as u32, 0);
+        assert!(
+            record.base.event.duration_ns != 0
+                && record
+                    .base
+                    .event
+                    .ts_ns
+                    .checked_sub(record.base.event.duration_ns)
+                    .is_some()
+        );
         assert_eq!(
             record.base.event.target_function,
             p11scope_ebpf_common::FUNCTION_NONE

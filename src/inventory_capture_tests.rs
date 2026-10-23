@@ -226,6 +226,8 @@ struct ScriptedLane {
     /// (1-based: the first entry is the first service); `None` past it.
     drain_high_water_bytes: Vec<Option<u64>>,
     services: usize,
+    /// The actual deadlines passed through the native I/O boundary.
+    io_deadlines: Rc<RefCell<Vec<(&'static str, Instant)>>>,
 }
 
 impl Drop for ScriptedLane {
@@ -270,6 +272,7 @@ impl ScriptedLane {
             failed_services: HashSet::new(),
             drain_high_water_bytes: Vec::new(),
             services: 0,
+            io_deadlines: Rc::default(),
         }
     }
 
@@ -354,6 +357,9 @@ impl CaptureLane<Pin> for ScriptedLane {
     }
 
     fn service_discovery(&mut self, window: ReadWindow) -> DiscoveryBatch {
+        self.io_deadlines
+            .borrow_mut()
+            .push(("discovery", window.deadline()));
         self.note("service");
         self.services += 1;
         // SAFETY: `DiscoveryRecord` is a plain `repr(C)` integer record; all
@@ -389,7 +395,15 @@ impl CaptureLane<Pin> for ScriptedLane {
         batch
     }
 
-    fn read_witnesses(&mut self, _: ReadWindow) -> WitnessBatch {
+    fn read_witnesses(&mut self, window: ReadWindow) -> WitnessBatch {
+        self.io_deadlines.borrow_mut().push((
+            if self.stopping {
+                "post-read"
+            } else {
+                "pre-read"
+            },
+            window.deadline(),
+        ));
         self.note("read");
         std::thread::sleep(self.read_delay);
         let health_read_ns = self.stamps.next();
@@ -490,7 +504,10 @@ impl CaptureLane<Pin> for ScriptedLane {
         self.stopping = true;
     }
 
-    fn poll_retirement(&mut self, _: Instant) -> Result<bool> {
+    fn poll_retirement(&mut self, deadline: Instant) -> Result<bool> {
+        self.io_deadlines
+            .borrow_mut()
+            .push(("retirement", deadline));
         self.note("poll");
         self.polls += 1;
         if self.retire_after.is_some_and(|after| self.polls >= after) {
@@ -4751,6 +4768,591 @@ mod publication_progress_tests {
             );
             assert_eq!(driver.changes.len(), polls.len());
             assert_eq!(driver.ticks, 1);
+        }
+    }
+
+    mod retained_completion_tests {
+        use super::*;
+
+        fn retained(
+            outcome: ClassicOutcome<ScriptedLane>,
+        ) -> (RetainedClassicRun<ScriptedLane>, Option<anyhow::Error>) {
+            match outcome.into_completion().unwrap() {
+                ClassicCompletion::Retained { run, error } => (run, error),
+                ClassicCompletion::Finalized { .. } => panic!("expected the original retained run"),
+            }
+        }
+
+        fn before_collection(
+            driver: &mut Driver,
+            lane: Option<ScriptedLane>,
+            initial_error: Option<anyhow::Error>,
+        ) -> ClassicOutcome<ScriptedLane> {
+            driver.pending = true;
+            driver.stop.set(true);
+            let lane = lane.map(|lane| {
+                NativeLane::start(lane, driver, windows(), None)
+                    .map_err(|(_, reason)| reason)
+                    .unwrap()
+            });
+            let stop = Rc::clone(&driver.stop);
+            let clock = LoopClock {
+                deadline: None,
+                stop: &|| stop.get(),
+                now: &Instant::now,
+                interval: Duration::ZERO,
+                tick: Duration::from_millis(1),
+                collection_tick: NO_COLLECTION_TICK,
+            };
+            run_classic_finalizing(driver, lane, &clock, initial_error, &mut |_, _| {
+                panic!("pending startup cannot emit")
+            })
+        }
+
+        fn publish(driver: &mut Driver, point: Publish<'_>) -> Result<()> {
+            match point {
+                Publish::Pass { report, .. } => {
+                    assert_eq!(report.pending_refresh.as_ptr() as usize, driver.report_ptr);
+                    driver.emissions += 1;
+                    driver.scene.note("complete:pass");
+                }
+                Publish::Retiring { .. } => driver.scene.note("complete:retiring"),
+                Publish::Stop { .. } => driver.scene.note("complete:stop"),
+            }
+            Ok(())
+        }
+
+        fn slice_with(
+            driver: &mut Driver,
+            outcome: ClassicOutcome<ScriptedLane>,
+            now: Instant,
+            actions: usize,
+            emit: &mut dyn FnMut(&mut Driver, Publish<'_>) -> Result<()>,
+        ) -> ClassicOutcome<ScriptedLane> {
+            let (run, error) = retained(outcome);
+            let stop = Rc::clone(&driver.stop);
+            let clock = LoopClock {
+                deadline: None,
+                stop: &|| stop.get(),
+                now: &|| now,
+                interval: Duration::ZERO,
+                tick: Duration::from_millis(1),
+                collection_tick: NO_COLLECTION_TICK,
+            };
+            let mut budget = RetainedWorkBudget {
+                remaining_actions: actions,
+                deadline: now + Duration::from_millis(1),
+            };
+            poll_retained_classic(driver, run, error, &clock, &mut budget, emit)
+        }
+
+        fn slice(
+            driver: &mut Driver,
+            outcome: ClassicOutcome<ScriptedLane>,
+            now: Instant,
+            actions: usize,
+        ) -> ClassicOutcome<ScriptedLane> {
+            slice_with(driver, outcome, now, actions, &mut publish)
+        }
+
+        fn complete(
+            driver: &mut Driver,
+            mut outcome: ClassicOutcome<ScriptedLane>,
+            now: Instant,
+        ) -> ClassicOutcome<ScriptedLane> {
+            for _ in 0..256 {
+                if outcome.retained.is_none() {
+                    return outcome;
+                }
+                assert!(
+                    outcome.retained.as_ref().unwrap().block.is_none(),
+                    "healthy owned work cannot require an invented disposition"
+                );
+                outcome = slice(driver, outcome, now, 1);
+            }
+            panic!("bounded scripted terminal work did not finish");
+        }
+
+        // A zero allowance must not even sample the injected controls. A slice
+        // deadline must fence work, not become an operator/collection stop.
+        #[test]
+        fn zero_budget_and_expired_slice_run_no_work() {
+            for allowance in [0, 1] {
+                let log = Log::default();
+                let mut driver = Driver::new(&log, false, &[Poll::Published]);
+                let outcome = before_collection(&mut driver, Some(ScriptedLane::new(&log)), None);
+                let (run, error) = retained(outcome);
+                let before = entries(&log);
+                let now = Instant::now();
+                let calls = Cell::new(0);
+                let clock = LoopClock {
+                    deadline: None,
+                    stop: &|| {
+                        calls.set(calls.get() + 1);
+                        false
+                    },
+                    now: &|| {
+                        calls.set(calls.get() + 1);
+                        now
+                    },
+                    interval: Duration::ZERO,
+                    tick: Duration::from_millis(1),
+                    collection_tick: NO_COLLECTION_TICK,
+                };
+                let mut budget = RetainedWorkBudget {
+                    remaining_actions: allowance,
+                    deadline: now,
+                };
+                let outcome = poll_retained_classic(
+                    &mut driver,
+                    run,
+                    error,
+                    &clock,
+                    &mut budget,
+                    &mut |_, _| panic!("no publication allowance"),
+                );
+                let (run, _) = retained(outcome);
+                assert!(matches!(run.pass, RetainedPass::BeforeCollection));
+                assert_eq!(entries(&log), before);
+                assert!(driver.changes.is_empty());
+                assert_eq!(driver.host_stops, 1);
+                assert_eq!(run.stop_cause, Some(ZeroPassCause::OperatorStop));
+                if allowance == 0 {
+                    assert_eq!(calls.get(), 0);
+                }
+            }
+        }
+
+        // A budget of one must eventually reach native service and the tick;
+        // repeatedly restarting at poll_commit would starve both forever.
+        #[test]
+        fn budget_one_services_the_same_pending_owner() {
+            let log = Log::default();
+            let mut driver = Driver::new(&log, false, &[Poll::Pending]);
+            driver.stop_after_poll = Some(1);
+            let mut lane = ScriptedLane::new(&log);
+            let domain = lane.domain;
+            lane.records_per_service = 1;
+            let limits = LaneWindows {
+                discovery_records: 1,
+                pass_quanta: 1,
+                held_records: 2,
+                held_batches: 2,
+                ..windows()
+            };
+            let mut outcome = drive(&mut driver, lane, limits);
+            driver.stop_after_poll = None;
+            driver.polls.extend([Poll::Pending; 4]);
+            let now = Instant::now();
+            for _ in 0..12 {
+                outcome = slice(&mut driver, outcome, now, 1);
+            }
+            let (run, _) = retained(outcome);
+            let Some(RetainedNative::Live(lane)) = run.native.as_ref() else {
+                panic!("keep the original live lane");
+            };
+            assert_eq!(driver.native_domains, [domain; 3]);
+            assert_eq!(driver.ticks, 3);
+            assert_eq!((lane.held.len(), lane.held_records), (2, 2));
+            assert_eq!(driver.changes.len(), 4);
+            assert_eq!(
+                (driver.scene.scans, driver.applies, driver.emissions),
+                (1, 1, 0)
+            );
+            assert!(!entries(&log).iter().any(|line| line == "begin_stop"));
+        }
+
+        // Every one-action yield around first publication, finish, the
+        // recorded extension skip and second publication keeps one report.
+        #[test]
+        fn pass_boundaries_finish_count_and_emit_once() {
+            let log = Log::default();
+            let mut driver = Driver::new(&log, true, &[Poll::Pending]);
+            driver.stop_after_poll = Some(1);
+            let outcome = drive(&mut driver, ScriptedLane::new(&log), windows());
+            driver.stop_after_poll = None;
+            driver
+                .polls
+                .extend([Poll::Published, Poll::Published, Poll::Published]);
+            let outcome = complete(&mut driver, outcome, Instant::now());
+            assert!(outcome.error.is_none(), "{outcome:?}");
+            assert_eq!(
+                (
+                    driver.scene.scans,
+                    driver.applies,
+                    driver.finishes,
+                    driver.emissions
+                ),
+                (1, 1, 1, 1)
+            );
+            assert_eq!(driver.changes, [driver.report_changed, false, false, false]);
+            assert_eq!(driver.host_stops, 1);
+            assert_eq!(driver.legacy_stops, 0);
+            assert_eq!(driver.legacy_commits, 0);
+            assert_eq!(outcome.stopped.as_ref().unwrap().summary.passes, 1);
+            assert_eq!(
+                entries(&log)
+                    .iter()
+                    .filter(|line| line.starts_with("extend["))
+                    .count(),
+                1,
+                "a gated completion cannot start the after-cgroup extension"
+            );
+        }
+
+        #[test]
+        fn collected_and_failed_callbacks_require_owned_disposition() {
+            for case in 0..3 {
+                let log = Log::default();
+                let mut driver = Driver::new(
+                    &log,
+                    case == 1,
+                    &[if case == 2 { Poll::Fail } else { Poll::Pending }],
+                );
+                driver.pending_on_collect = case == 0;
+                driver.stop_after_poll = Some(1);
+                driver.fail_finish = case == 1;
+                let mut outcome = drive(&mut driver, ScriptedLane::new(&log), windows());
+                if case == 1 {
+                    driver.stop_after_poll = None;
+                    driver.polls.push_back(Poll::Published);
+                    for _ in 0..8 {
+                        if outcome.retained.as_ref().unwrap().block.is_some() {
+                            break;
+                        }
+                        outcome = slice(&mut driver, outcome, Instant::now(), 1);
+                    }
+                }
+                let want = match case {
+                    0 => RetainedBlock::CollectedDispositionRequired,
+                    1 => RetainedBlock::ScopedCompletionDispositionRequired,
+                    _ => RetainedBlock::PublicationDispositionRequired,
+                };
+                assert_eq!(outcome.retained.as_ref().unwrap().block, Some(want));
+                let calls = driver.changes.len();
+                let before = entries(&log);
+                let outcome = slice(&mut driver, outcome, Instant::now(), 100);
+                assert_eq!(outcome.retained.as_ref().unwrap().block, Some(want));
+                assert_eq!(driver.changes.len(), calls);
+                assert_eq!(entries(&log), before);
+                assert_eq!(driver.emissions, 0);
+            }
+        }
+
+        #[test]
+        fn callback_failure_retains_the_advanced_attempt_and_original_report() {
+            let log = Log::default();
+            let mut driver = Driver::new(&log, false, &[Poll::Pending]);
+            driver.stop_after_poll = Some(1);
+            let mut outcome = drive(&mut driver, ScriptedLane::new(&log), windows());
+            driver.polls.push_back(Poll::Published);
+            for _ in 0..8 {
+                let ready = matches!(
+                    outcome.retained.as_ref().unwrap().pass,
+                    RetainedPass::Applied {
+                        phase: AppliedPassPhase::ReadyToEmit,
+                        ..
+                    }
+                );
+                if ready {
+                    break;
+                }
+                outcome = slice(&mut driver, outcome, Instant::now(), 1);
+            }
+            let outcome = slice_with(
+                &mut driver,
+                outcome,
+                Instant::now(),
+                1,
+                &mut |driver, point| {
+                    assert!(matches!(point, Publish::Pass { .. }));
+                    driver.emissions += 1;
+                    Err(anyhow!("partial pass output failed"))
+                },
+            );
+            let run = outcome.retained.as_ref().unwrap();
+            let RetainedPass::Applied { report, phase } = &run.pass else {
+                panic!("retain the same report on output failure");
+            };
+            assert_eq!(*phase, AppliedPassPhase::EmissionAttempted);
+            assert_eq!(report.pending_refresh.as_ptr() as usize, driver.report_ptr);
+            assert_eq!(run.completed_passes, 1);
+            assert_eq!(
+                run.block,
+                Some(RetainedBlock::PublicationDispositionRequired)
+            );
+            assert_eq!(
+                outcome.error.as_ref().unwrap().to_string(),
+                "partial pass output failed"
+            );
+            let outcome = slice(&mut driver, outcome, Instant::now(), 20);
+            assert_eq!(driver.emissions, 1);
+            assert!(outcome.stopped.is_none());
+        }
+
+        #[test]
+        fn native_stop_yields_in_order_with_one_original_capture() {
+            let log = Log::default();
+            let mut driver = Driver::new(&log, false, &[Poll::Published, Poll::Published]);
+            let mut lane = ScriptedLane::new(&log);
+            lane.partial_reads.insert(1);
+            lane.partial_refresh_reads.insert(3);
+            let domain = lane.domain;
+            let deadlines = Rc::clone(&lane.io_deadlines);
+            let outcome = before_collection(&mut driver, Some(lane), None);
+            let now = Instant::now();
+            let outcome = complete(&mut driver, outcome, now);
+            assert!(outcome.error.is_none(), "{outcome:?}");
+            let stopped = outcome.stopped.unwrap();
+            assert_eq!(stopped.capture.domain, domain);
+            assert_eq!(stopped.summary.passes, 0);
+            assert!(
+                deadlines
+                    .borrow()
+                    .iter()
+                    .all(|(_, end)| *end <= now + Duration::from_millis(1))
+            );
+            let events = entries(&log);
+            let work: Vec<&str> = events
+                .iter()
+                .map(String::as_str)
+                .filter(|s| {
+                    matches!(
+                        *s,
+                        "read"
+                            | "stage:witness"
+                            | "end_capture_coverage"
+                            | "begin_stop"
+                            | "poll"
+                            | "stage:finish"
+                            | "complete:stop"
+                    )
+                })
+                .collect();
+            assert_eq!(
+                work,
+                [
+                    "read",
+                    "stage:witness",
+                    "read",
+                    "stage:witness",
+                    "end_capture_coverage",
+                    "begin_stop",
+                    "poll",
+                    "read",
+                    "stage:witness",
+                    "read",
+                    "stage:witness",
+                    "stage:finish",
+                    "complete:stop"
+                ]
+            );
+            assert!(!events.iter().any(|line| line == "drop"));
+            drop(stopped);
+            assert_eq!(
+                entries(&log).iter().filter(|line| *line == "drop").count(),
+                1
+            );
+        }
+
+        #[test]
+        fn native_deadlines_do_not_restart_between_slices() {
+            let log = Log::default();
+            let mut driver = Driver::new(&log, false, &[Poll::Published, Poll::Published]);
+            let mut lane = ScriptedLane::new(&log);
+            lane.partial_refresh_reads.extend(1..=1000);
+            let deadlines = Rc::clone(&lane.io_deadlines);
+            let mut outcome = before_collection(&mut driver, Some(lane), None);
+            let now = Instant::now();
+            for _ in 0..100 {
+                if deadlines
+                    .borrow()
+                    .iter()
+                    .any(|(kind, _)| *kind == "post-read")
+                {
+                    break;
+                }
+                outcome = slice(&mut driver, outcome, now, 1);
+            }
+            let reads = deadlines
+                .borrow()
+                .iter()
+                .filter(|(kind, _)| *kind == "post-read")
+                .count();
+            assert_eq!(reads, 1);
+            let outcome = complete(&mut driver, outcome, now + Duration::from_secs(1));
+            assert!(outcome.retained.is_none());
+            assert_eq!(
+                deadlines
+                    .borrow()
+                    .iter()
+                    .filter(|(kind, _)| *kind == "post-read")
+                    .count(),
+                reads,
+                "expiry cannot restart the native refresh window"
+            );
+            assert_eq!(
+                entries(&log)
+                    .iter()
+                    .filter(|line| line.starts_with("refresh-loss:"))
+                    .count(),
+                1
+            );
+        }
+
+        #[test]
+        fn stopped_native_owner_survives_final_publication_pending_and_error() {
+            for fail in [false, true] {
+                let log = Log::default();
+                let mut driver = Driver::new(&log, false, &[Poll::Published, Poll::Pending]);
+                let mut outcome =
+                    before_collection(&mut driver, Some(ScriptedLane::new(&log)), None);
+                let now = Instant::now();
+                for _ in 0..100 {
+                    if driver.changes.len() == 2 {
+                        break;
+                    }
+                    outcome = slice(&mut driver, outcome, now, 1);
+                }
+                assert_eq!(driver.changes, [false, false]);
+                assert!(matches!(
+                    outcome.retained.as_ref().unwrap().native,
+                    Some(RetainedNative::Stopped(_))
+                ));
+                assert!(outcome.stopped.is_none());
+                assert!(!entries(&log).iter().any(|line| line == "drop"));
+                driver
+                    .polls
+                    .push_back(if fail { Poll::Fail } else { Poll::Published });
+                if fail {
+                    for _ in 0..8 {
+                        if outcome.retained.as_ref().unwrap().block.is_some() {
+                            break;
+                        }
+                        outcome = slice(&mut driver, outcome, now, 1);
+                    }
+                    let run = outcome.retained.as_ref().unwrap();
+                    assert_eq!(
+                        run.block,
+                        Some(RetainedBlock::PublicationDispositionRequired)
+                    );
+                    assert!(matches!(run.native, Some(RetainedNative::Stopped(_))));
+                    assert_eq!(
+                        outcome.error.as_ref().unwrap().to_string(),
+                        "original publication failure"
+                    );
+                    assert!(
+                        !entries(&log)
+                            .iter()
+                            .any(|line| line == "complete:stop" || line == "drop")
+                    );
+                } else {
+                    let mut outcome = complete(&mut driver, outcome, now);
+                    finish_native(
+                        outcome.stopped.take(),
+                        |_| driver.scene.note("final-sink"),
+                        &|| {},
+                        &mut |_| {},
+                    );
+                    let log = entries(&log);
+                    assert!(
+                        log.iter().position(|s| s == "final-sink").unwrap()
+                            < log.iter().position(|s| s == "drop").unwrap()
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn zero_pass_completion_preserves_cause_accounting_and_first_error() {
+            for (scoped, failed) in [(false, false), (true, false), (false, true), (true, true)] {
+                let log = Log::default();
+                let mut driver = Driver::new(&log, scoped, &[Poll::Published, Poll::Published]);
+                let mut lane = ScriptedLane::new(&log);
+                if scoped {
+                    lane.scope_coverage = CaptureScopeCoverage::Cgroup;
+                }
+                let outcome = before_collection(
+                    &mut driver,
+                    Some(lane),
+                    failed.then(|| anyhow!("first run failure")),
+                );
+                let outcome = complete(&mut driver, outcome, Instant::now());
+                assert_eq!(
+                    (driver.scene.scans, driver.applies, driver.emissions),
+                    (0, 0, 0)
+                );
+                assert_eq!(driver.host_stops, 1);
+                assert_eq!(outcome.stopped.as_ref().unwrap().summary.passes, 0);
+                if failed {
+                    assert_eq!(
+                        outcome.error.as_ref().unwrap().to_string(),
+                        "first run failure"
+                    );
+                    assert!(outcome.zero_pass.is_none());
+                } else {
+                    let zero = outcome.zero_pass.unwrap();
+                    assert_eq!(zero.cause, ZeroPassCause::OperatorStop);
+                    assert_eq!(zero.discarded, 0);
+                    assert!(zero.elapsed < GATE_TIMEOUT);
+                    assert!(outcome.error.is_none());
+                }
+            }
+        }
+
+        #[test]
+        fn scan_zero_pass_failure_retains_its_best_effort_status_channel() {
+            for fail in [false, true] {
+                let log = Log::default();
+                let mut driver = Driver::new(
+                    &log,
+                    false,
+                    &[
+                        Poll::Published,
+                        if fail { Poll::Fail } else { Poll::Published },
+                    ],
+                );
+                let mut outcome = before_collection(&mut driver, None, None);
+                let now = Instant::now();
+                if fail {
+                    for _ in 0..30 {
+                        if outcome.retained.as_ref().unwrap().block.is_some() {
+                            break;
+                        }
+                        outcome = slice(&mut driver, outcome, now, 1);
+                    }
+                    let run = outcome.retained.as_ref().unwrap();
+                    assert!(
+                        outcome.error.is_none(),
+                        "best-effort diagnostic failure cannot change F9 status"
+                    );
+                    assert_eq!(
+                        run.block,
+                        Some(RetainedBlock::PublicationDispositionRequired)
+                    );
+                    assert_eq!(
+                        run.terminal_callback_error.as_ref().unwrap().to_string(),
+                        "original publication failure"
+                    );
+                    assert!(run.native.is_none());
+                    assert!(
+                        outcome.zero_pass.is_none(),
+                        "an unfinished diagnostic is not finalized"
+                    );
+                } else {
+                    let outcome = complete(&mut driver, outcome, now);
+                    assert!(outcome.error.is_none());
+                    assert!(outcome.zero_pass.is_some());
+                    assert!(outcome.stopped.is_none());
+                    assert_eq!(
+                        entries(&log)
+                            .iter()
+                            .filter(|s| *s == "complete:stop")
+                            .count(),
+                        1
+                    );
+                }
+            }
         }
     }
 }

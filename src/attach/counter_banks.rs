@@ -2002,7 +2002,7 @@ impl Session {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::discovery::identity::PinnedObjectId;
     use crate::plan::{AttachPlan, Slot};
@@ -2073,6 +2073,8 @@ mod tests {
         entries: BTreeSet<u32>,
         returns: BTreeSet<u32>,
         held: Vec<ResourceLease>,
+        target_store: Option<&'a PinnedObjects>,
+        provider_owner: Option<&'a Mutex<NativeCustody>>,
         checks: usize,
         damage: Option<(usize, GrowthDamage)>,
         target_refusal: Option<BankRefusal>,
@@ -2125,7 +2127,11 @@ mod tests {
 
         fn retain_charge(&mut self, charge: ResourceLease) {
             self.trace.push("retain");
-            self.held.push(charge);
+            if let Some(owner) = self.provider_owner {
+                owner.lock().unwrap().retain_charge(charge);
+            } else {
+                self.held.push(charge);
+            }
         }
 
         fn allocate_bank(&mut self, bank: u32, all_slots: &[Slot]) -> Result<u32, BankRefusal> {
@@ -2169,6 +2175,16 @@ mod tests {
                     .commits
                     .contains_key(&self.routes[&slot.index].transaction)
             }));
+            if let Some(owner) = self.provider_owner {
+                let mut custody = owner.lock().unwrap();
+                custody.retain_targets(slots, self.target_store.unwrap())?;
+                assert!(
+                    slots
+                        .iter()
+                        .all(|slot| custody.providers[slot.index as usize].is_some())
+                );
+                self.trace.push("retain-provider");
+            }
             self.trace.push("return");
             self.returns.extend(slots.iter().map(|slot| slot.index));
             self.trace.push("entry");
@@ -4283,6 +4299,371 @@ mod tests {
             cpus: 2,
             link_staging: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    fn growth_provider_fixture() -> (tempfile::TempDir, PinnedObjects, Slot, Slot, String) {
+        use crate::discovery::identity::test_fixture::real_scan_pin;
+        use sha2::Digest;
+        let dir = tempfile::tempdir().unwrap();
+        let first_path = dir.path().join("first-provider.so");
+        let second_path = dir.path().join("second-provider.so");
+        let bytes = b"same owned provider bytes, distinct opened kernel files";
+        std::fs::write(&first_path, bytes).unwrap();
+        std::fs::write(&second_path, bytes).unwrap();
+        let digest = format!("{:x}", sha2::Sha256::digest(bytes));
+        let mut pins = real_scan_pin(&first_path, None, 1, &digest);
+        let first_id = pins.pinned().next().unwrap().id;
+        assert!(
+            pins.absorb(real_scan_pin(&second_path, None, 2, &digest))
+                .is_empty()
+        );
+        let second_id = pins
+            .pinned()
+            .map(|pin| pin.id)
+            .find(|&id| id != first_id)
+            .unwrap();
+        let mut first = slot(0, 1);
+        first.object = first_id;
+        first.object_path = first_path.to_str().unwrap().into();
+        let mut second = slot(1, 2);
+        second.object = second_id;
+        second.object_path = second_path.to_str().unwrap().into();
+        (dir, pins, first, second, digest)
+    }
+
+    struct GrowthOwnedHistory {
+        dir: tempfile::TempDir,
+        history: AttachPlan,
+        banks: CounterBanks,
+        pool: SemanticResourcePool,
+        digest: String,
+    }
+
+    fn growth_owned_history(last_slot: bool) -> GrowthOwnedHistory {
+        let (dir, pins, first, second, digest) = growth_provider_fixture();
+        let pool = SemanticResourcePool::reference_limit(256 * 1024 * 1024);
+        let geometry = CountsBankGeometry::checked(16, 512).unwrap();
+        let keepalive =
+            CounterKeepalive::precharge_with_geometry(&pool.reserver(), 16 * 1024 * 1024, geometry)
+                .unwrap();
+        let policy = crate::plan::AdmissionPolicy::counters(
+            crate::capacity::CounterBudget::new(8192).unwrap(),
+        );
+        let mut history = AttachPlan::from_slots_with_policy(vec![first.clone()], policy).unwrap();
+        let mut directory = BankDirectory::counts_growth_v2();
+        let mut io = GrowthIo::new(&pool);
+        io.target_store = Some(&pins);
+        io.provider_owner = Some(&keepalive.custody);
+        let envelope = BankReservation {
+            retained_bytes: 32 * 1024 * 1024,
+            transient_bytes: 64 * 1024 * 1024,
+            metadata_bytes: 8 * 1024 * 1024,
+            file_descriptors: 131_072,
+        };
+        assert!(matches!(
+            directory.stage_with(&mut io, &mut history, envelope, &pool.reserver()),
+            BankPublication::Published { transaction: 1, .. }
+        ));
+        let mut candidate = vec![first.clone()];
+        for index in 1..if last_slot { 8191 } else { 2 } {
+            let mut addition = second.clone();
+            addition.index = index;
+            addition.file_offset = 0x80 + 16 * u64::from(index - 1);
+            candidate.push(addition);
+        }
+        history
+            .extend_exact(AttachPlan::from_slots_with_policy(candidate, policy).unwrap())
+            .unwrap();
+        io.next_stage();
+        if last_slot {
+            // Burn a real Directory extent before the first new map can be
+            // created. This is a host model, not 8192 native attachments.
+            io.failure = Some("allocate");
+        } else {
+            io.commit_absent = true;
+        }
+        assert!(matches!(
+            directory.stage_with(&mut io, &mut history, envelope, &pool.reserver()),
+            BankPublication::RolledBack { transaction: 2, .. }
+        ));
+        io.next_stage();
+        io.failure = None;
+        io.commit_absent = false;
+        history
+            .extend_exact(AttachPlan::from_slots_with_policy(vec![first, second], policy).unwrap())
+            .unwrap();
+        assert!(matches!(
+            directory.stage_with(&mut io, &mut history, envelope, &pool.reserver()),
+            BankPublication::Published { transaction: 3, .. }
+        ));
+        history.deactivate(0);
+        let last = if last_slot { 8191 } else { 2 };
+        assert_eq!(directory.published_indices().collect::<Vec<_>>(), [0, last]);
+        assert_eq!(history.counter_consumed_end(), last + 1);
+        drop(io);
+        GrowthOwnedHistory {
+            dir,
+            history,
+            banks: CounterBanks {
+                directory: Arc::new(Mutex::new(directory)),
+                keepalive,
+                cpus: 2,
+                link_staging: Arc::new(AtomicU64::new(0)),
+            },
+            pool,
+            digest,
+        }
+    }
+
+    /// Actual Directory publication/rollback and real retained files supply
+    /// the charged selection. Only map/link I/O above it is replaced.
+    pub(crate) fn growth_snapshot_fixture(
+        last_slot: bool,
+    ) -> (
+        tempfile::TempDir,
+        AttachPlan,
+        super::CounterPublishedSnapshot,
+        SemanticResourcePool,
+    ) {
+        let owned = growth_owned_history(last_slot);
+        let snapshot = owned
+            .banks
+            .published_snapshot(
+                &owned.history,
+                &PinnedObjects::empty(),
+                &owned.pool.reserver(),
+            )
+            .unwrap();
+        (owned.dir, owned.history, snapshot, owned.pool)
+    }
+
+    #[test]
+    fn format2_charge_holders_cover_8192_nonempty_extents() {
+        let pool = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
+        let charged = pool.snapshot().charged_bytes;
+        let geometry = CountsBankGeometry::checked(16, 512).unwrap();
+        assert!(
+            CounterKeepalive::precharge_with_geometry(&pool.reserver(), 32 * 1024, geometry)
+                .is_err(),
+            "even 8192 lease holders alone exceed this request; reject before allocation"
+        );
+        assert_eq!(pool.snapshot().charged_bytes, charged);
+        let held =
+            CounterKeepalive::precharge_with_geometry(&pool.reserver(), 16 * 1024 * 1024, geometry)
+                .unwrap();
+        let baseline = pool.snapshot().charged_bytes;
+        {
+            let mut custody = held.custody.lock().unwrap();
+            assert!(custody.charges.capacity() >= 8192);
+            assert!(custody.providers.capacity() >= 8192);
+            let storage = custody.charges.as_ptr();
+            for transaction in 1..=8192 {
+                custody.retain_charge(pool.reserver().reserve(1).unwrap());
+                assert_eq!(
+                    custody.charges.as_ptr(),
+                    storage,
+                    "handoff {transaction} allocated after the floor"
+                );
+                assert_eq!(custody.charges.len(), transaction);
+                assert_eq!(pool.snapshot().charged_bytes, baseline + transaction);
+            }
+        }
+        assert_eq!(
+            pool.snapshot().charged_bytes,
+            charged + 16 * 1024 * 1024 + 8192
+        );
+        drop(held);
+        assert_eq!(pool.snapshot().charged_bytes, charged);
+    }
+
+    #[test]
+    fn format2_partial_bank_retains_each_provider() {
+        let (_dir, pins, first, second, digest) = growth_provider_fixture();
+        let pool = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
+        let owner = CounterKeepalive::precharge_with_geometry(
+            &pool.reserver(),
+            16 * 1024 * 1024,
+            CountsBankGeometry::checked(16, 512).unwrap(),
+        )
+        .unwrap();
+        let policy = crate::plan::AdmissionPolicy::counters(
+            crate::capacity::CounterBudget::new(8192).unwrap(),
+        );
+        let mut history = AttachPlan::from_slots_with_policy(vec![first.clone()], policy).unwrap();
+        let mut directory = BankDirectory::counts_growth_v2();
+        let mut io = GrowthIo::new(&pool);
+        io.target_store = Some(&pins);
+        io.provider_owner = Some(&owner.custody);
+        assert!(matches!(
+            directory.stage_with(
+                &mut io,
+                &mut history,
+                growth_reservation(),
+                &pool.reserver()
+            ),
+            BankPublication::Published { transaction: 1, .. }
+        ));
+        history
+            .extend_exact(
+                AttachPlan::from_slots_with_policy(vec![first.clone(), second.clone()], policy)
+                    .unwrap(),
+            )
+            .unwrap();
+        io.next_stage();
+        assert!(matches!(
+            directory.stage_with(
+                &mut io,
+                &mut history,
+                growth_reservation(),
+                &pool.reserver()
+            ),
+            BankPublication::Published { transaction: 2, .. }
+        ));
+        assert!(
+            !io.trace.contains(&"allocate"),
+            "new provider shares the already allocated bank"
+        );
+        assert_eq!(
+            (
+                io.routes[&1].bank,
+                io.routes[&1].cell,
+                io.routes[&1].inner_id
+            ),
+            (0, 1, 101)
+        );
+        let provider = io
+            .trace
+            .iter()
+            .position(|&step| step == "retain-provider")
+            .unwrap();
+        let first_link = io.trace.iter().position(|&step| step == "return").unwrap();
+        assert!(provider < first_link);
+        let mut custody = owner.custody.lock().unwrap();
+        assert_eq!(custody.charges.len(), 2);
+        for target in [&first, &second] {
+            let retained = custody.providers[target.index as usize].as_ref().unwrap();
+            assert_eq!(retained.abi(), p11scope_manifest::elf::ElfAbi::Lp64);
+            assert_eq!(retained.check_unchanged(), Ok(true));
+            assert!(retained.same_object_as(&pins, target.object));
+            let (file, sha256) = retained.borrowed_file_and_digest();
+            assert!(std::ptr::eq(file, pins.file_for(target.object).unwrap()));
+            assert_eq!(sha256, digest);
+        }
+        let mut foreign = first;
+        foreign.object = second.object;
+        assert_eq!(
+            custody.retain_targets(&[foreign], &pins),
+            Err(BankRefusal::Ownership)
+        );
+        assert!(
+            custody.providers[0]
+                .as_ref()
+                .unwrap()
+                .same_object_as(&pins, history.slots[0].object)
+        );
+    }
+
+    #[test]
+    fn format2_view_preserves_holes_and_retained_identity() {
+        use crate::discovery::identity::test_fixture::real_scan_pin;
+        let owned = growth_owned_history(false);
+        let empty = PinnedObjects::empty();
+        let snapshot = owned
+            .banks
+            .published_snapshot(&owned.history, &empty, &owned.pool.reserver())
+            .unwrap();
+        assert_eq!(snapshot.original_indices(), [0, 2]);
+        assert_eq!(snapshot.validate_plan(&owned.history), Ok(()));
+        assert!(
+            !owned.history.is_active(0)
+                && !owned.history.is_active(1)
+                && owned.history.is_active(2)
+        );
+        assert!(
+            owned.banks.keepalive.custody.lock().unwrap().providers[1].is_some(),
+            "the omitted hole deliberately has retained identity; only Directory authority omits it"
+        );
+        for index in [0, 2] {
+            let proof = owned.banks.keepalive.custody.lock().unwrap().providers[index].take();
+            assert!(proof.is_some());
+            assert_eq!(
+                snapshot.validate_plan(&owned.history),
+                Err(BankRefusal::Ownership)
+            );
+            assert!(
+                matches!(
+                    owned
+                        .banks
+                        .published_snapshot(&owned.history, &empty, &owned.pool.reserver()),
+                    Err(BankRefusal::Ownership)
+                ),
+                "missing published proof {index} must not prune the row"
+            );
+            owned.banks.keepalive.custody.lock().unwrap().providers[index] = proof;
+        }
+        let hole = owned.banks.keepalive.custody.lock().unwrap().providers[1].take();
+        assert!(hole.is_some());
+        assert_eq!(
+            owned
+                .banks
+                .published_snapshot(&owned.history, &empty, &owned.pool.reserver())
+                .unwrap()
+                .original_indices(),
+            [0, 2]
+        );
+        let first_path = owned.dir.path().join("first-provider.so");
+        let same = real_scan_pin(&first_path, None, 20, &owned.digest);
+        assert_eq!(
+            owned
+                .banks
+                .published_snapshot(&owned.history, &same, &owned.pool.reserver())
+                .unwrap()
+                .original_indices(),
+            [0, 2]
+        );
+        let foreign_path = owned.dir.path().join("foreign-provider.so");
+        std::fs::copy(&first_path, &foreign_path).unwrap();
+        let foreign = real_scan_pin(&foreign_path, None, 21, &owned.digest);
+        assert!(
+            matches!(
+                owned
+                    .banks
+                    .published_snapshot(&owned.history, &foreign, &owned.pool.reserver()),
+                Err(BankRefusal::Ownership)
+            ),
+            "present foreign ID 0 must never use missing-pin fallback"
+        );
+        let mut relabelled = owned.history.clone();
+        relabelled.slots[0].object = PinnedObjectId(u32::MAX);
+        assert_eq!(
+            snapshot.validate_plan(&relabelled),
+            Err(BankRefusal::Topology)
+        );
+        let refused = SemanticResourcePool::reference_limit(SEMANTIC_TRANSITION_SCRATCH);
+        assert!(matches!(
+            owned
+                .banks
+                .published_snapshot(&owned.history, &empty, &refused.reserver()),
+            Err(BankRefusal::Budget)
+        ));
+        assert_eq!(
+            refused.snapshot().charged_bytes,
+            SEMANTIC_TRANSITION_SCRATCH
+        );
+        std::fs::write(first_path, b"changed retained provider").unwrap();
+        assert_eq!(
+            snapshot.validate_plan(&owned.history),
+            Err(BankRefusal::Ownership)
+        );
+        assert!(
+            matches!(
+                owned
+                    .banks
+                    .published_snapshot(&owned.history, &empty, &owned.pool.reserver()),
+                Err(BankRefusal::Ownership)
+            ),
+            "retained FD mutation cannot become historical success"
+        );
     }
 
     #[test]

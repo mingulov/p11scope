@@ -617,6 +617,8 @@ mod tests {
         cpus: usize,
         stats: BTreeMap<u32, Vec<SlotStats>>,
         rvs: Vec<(RvKey, [u64; 2])>,
+        rv_lookup: Option<BTreeMap<(u32, u64), [u64; 2]>>,
+        published: Option<crate::attach::counter_banks::CounterPublishedSnapshot>,
         health: CounterHealth,
         kernel: KernelEvidence,
         routing: Option<CounterIssue>,
@@ -672,6 +674,8 @@ mod tests {
                     (key(0, HIGH_RV), [rv[1], 0]),
                     (key(0, u64::MAX), [rv[2], 0]),
                 ],
+                rv_lookup: None,
+                published: None,
                 health: CounterHealth::default(),
                 kernel: KernelEvidence::default(),
                 fail: None,
@@ -704,6 +708,11 @@ mod tests {
         fn possible_cpus(&self) -> usize {
             self.cpus
         }
+        fn published_snapshot(
+            &self,
+        ) -> Option<&crate::attach::counter_banks::CounterPublishedSnapshot> {
+            self.published.as_ref()
+        }
         fn routing(&self) -> Result<Option<CounterIssue>, ReadStage> {
             Ok(self.routing)
         }
@@ -713,11 +722,16 @@ mod tests {
         fn rv_total(&self, wanted: &RvKey) -> Result<Result<u64, CounterIssue>, ReadStage> {
             self.rv_reads.set(self.rv_reads.get() + 1);
             self.access(ReadStage::Rvs)?;
-            let (_, values) = self
-                .rvs
-                .iter()
-                .find(|(key, _)| (key.slot, key.rv) == (wanted.slot, wanted.rv))
-                .unwrap();
+            let values = if let Some(lookup) = &self.rv_lookup {
+                lookup.get(&(wanted.slot, wanted.rv)).unwrap()
+            } else {
+                &self
+                    .rvs
+                    .iter()
+                    .find(|(key, _)| (key.slot, key.rv) == (wanted.slot, wanted.rv))
+                    .unwrap()
+                    .1
+            };
             Ok(values[0]
                 .checked_add(values[1])
                 .ok_or(CounterIssue::FoldOverflow(CounterField::Rv(wanted.rv))))
@@ -789,6 +803,239 @@ mod tests {
             let index = self.clock_reads.get();
             self.clock_reads.set(index + 1);
             self.clocks[index % 2]
+        }
+    }
+
+    #[test]
+    fn banked_acquisition_rejects_hole_rvs_and_missing_published_rows() {
+        for hole_rv in [true, false] {
+            let (_dir, history, snapshot, pool) =
+                crate::attach::counter_banks::tests::growth_snapshot_fixture(false);
+            assert_eq!(snapshot.original_indices(), [0, 2]);
+            let mut source = Scripted::sample(CounterMode::Counts, false);
+            let last_stats = source.stats.remove(&1).unwrap();
+            source.stats.insert(2, last_stats);
+            source.rvs.push((key(2, 0x1_0000_0204), [1, 0]));
+            source.published = Some(snapshot);
+            let limits = CounterLimits {
+                rows: 3,
+                rv_keys: 12,
+            };
+            let generation = NonZeroU64::new(19).unwrap();
+            let mut collector = CounterCollector::new(limits, pool.reserver());
+            let initial = acquire(&source, generation, &history, limits, &pool.reserver()).unwrap();
+            assert_eq!(
+                initial
+                    .view()
+                    .rows
+                    .unwrap()
+                    .iter()
+                    .map(|row| row.view().slot)
+                    .collect::<Vec<_>>(),
+                [0, 2]
+            );
+            assert_eq!(collector.observe(Ok(initial)), CounterObservation::Initial);
+            let charged = pool.snapshot().charged_bytes;
+            source.accesses.set(0);
+            source.rv_reads.set(0);
+            if hole_rv {
+                source.rvs.push((key(1, 0), [0, 0]));
+            } else {
+                source.stats.remove(&2);
+            }
+            let observed = collector.observe(acquire(
+                &source,
+                generation,
+                &history,
+                limits,
+                &pool.reserver(),
+            ));
+            assert_eq!(
+                observed,
+                if hole_rv {
+                    CounterObservation::Unavailable(CounterIssue::Topology)
+                } else {
+                    CounterObservation::ReadFailed(ReadStage::Stats)
+                }
+            );
+            let baseline = collector.current().unwrap().view();
+            let rows = baseline.rows.unwrap();
+            assert_eq!(
+                rows.iter()
+                    .map(|row| (row.view().slot, row.view().entered, row.view().returned))
+                    .collect::<Vec<_>>(),
+                [(0, 3, 5), (2, 1, 1)],
+                "failed acquisition must retain the complete physical baseline"
+            );
+            assert_eq!(rows[0].view().rv_counts.get(&HIGH_RV), Some(&1));
+            assert_eq!(rows[1].view().rv_counts.get(&0x1_0000_0204), Some(&1));
+            assert_eq!(pool.snapshot().charged_bytes, charged);
+        }
+    }
+
+    #[test]
+    fn banked_acquisition_uses_validated_bounds_and_charged_membership() {
+        let (_dir, history, snapshot, _owner_pool) =
+            crate::attach::counter_banks::tests::growth_snapshot_fixture(true);
+        assert_eq!(snapshot.original_indices(), [0, 8191]);
+        assert_eq!(
+            (
+                snapshot.logical_slots(),
+                snapshot.rv_keys(),
+                snapshot.start_rows(),
+                snapshot.possible_cpus()
+            ),
+            (8192, 65536, 16384, 2)
+        );
+        let mut source = Scripted::sample(CounterMode::Counts, false);
+        let last_stats = source.stats.remove(&1).unwrap();
+        source.stats.insert(8191, last_stats);
+        source.rvs = (0..65536)
+            .map(|ordinal| {
+                let slot = if ordinal < 32768 { 0 } else { 8191 };
+                let rv = match ordinal {
+                    0 => 7,
+                    1 => 0x1_0000_0007,
+                    _ => 0x2_0000_0000 + ordinal,
+                };
+                (key(slot, rv), [1, 0])
+            })
+            .collect();
+        source.rv_lookup = Some(
+            source
+                .rvs
+                .iter()
+                .map(|(key, values)| ((key.slot, key.rv), *values))
+                .collect(),
+        );
+        source.published = Some(snapshot);
+        let limits = CounterLimits {
+            rows: 8192,
+            rv_keys: 65536,
+        };
+        let pool = test_pool();
+        let baseline = pool.snapshot().charged_bytes;
+        // Probe the separate existing row-storage component. The independent
+        // transient lower bound below includes 8192 direct membership bytes.
+        let storage = ReadReservation::reserve(2, 65536, &pool.reserver()).unwrap();
+        let row_storage = pool.snapshot().charged_bytes - baseline;
+        drop(storage);
+        let read = acquire(
+            &source,
+            NonZeroU64::new(23).unwrap(),
+            &history,
+            limits,
+            &pool.reserver(),
+        )
+        .unwrap();
+        let view = read.view();
+        let rows = view.rows.unwrap();
+        assert_eq!(
+            rows.iter().map(|row| row.view().slot).collect::<Vec<_>>(),
+            [0, 8191]
+        );
+        assert_eq!(
+            (
+                rows[0].view().rv_counts.len(),
+                rows[1].view().rv_counts.len()
+            ),
+            (32768, 32768)
+        );
+        assert_eq!(rows[0].view().rv_counts.get(&7), Some(&1));
+        assert_eq!(rows[0].view().rv_counts.get(&0x1_0000_0007), Some(&1));
+        assert_eq!(
+            pool.snapshot().charged_bytes,
+            baseline + row_storage,
+            "only the two authoritative rows retain storage, despite the 8192-position span"
+        );
+        // 65536*(16-byte key+8-byte total)  + 288 per-CPU scratch  + 160 padding;
+        // this old transient allowance does not pay for 8192 membership bytes.
+        assert!(pool.snapshot().peak_charged_bytes >= baseline + row_storage + 1_573_312 + 8192);
+        drop(read);
+        assert_eq!(pool.snapshot().charged_bytes, baseline);
+        let refused = SemanticResourcePool::reference_limit(baseline + row_storage + 1_573_312);
+        source.accesses.set(0);
+        source.rv_reads.set(0);
+        assert_eq!(
+            acquire(
+                &source,
+                NonZeroU64::new(23).unwrap(),
+                &history,
+                limits,
+                &refused.reserver()
+            )
+            .err(),
+            Some(ReadStage::Budget)
+        );
+        assert_eq!((source.accesses.get(), source.rv_reads.get()), (0, 0));
+        for bad in [
+            CounterLimits {
+                rows: 8193,
+                rv_keys: 65536,
+            },
+            CounterLimits {
+                rows: 8192,
+                rv_keys: 65537,
+            },
+        ] {
+            assert_eq!(
+                acquire(
+                    &source,
+                    NonZeroU64::new(23).unwrap(),
+                    &history,
+                    bad,
+                    &pool.reserver()
+                )
+                .err(),
+                Some(ReadStage::Shape)
+            );
+        }
+        for cpus in [0, 3] {
+            source.cpus = cpus;
+            assert_eq!(
+                acquire(
+                    &source,
+                    NonZeroU64::new(23).unwrap(),
+                    &history,
+                    limits,
+                    &pool.reserver()
+                )
+                .err(),
+                Some(ReadStage::Shape)
+            );
+        }
+        source.cpus = 2;
+        source.mode = CounterMode::Timestamps;
+        assert_eq!(
+            acquire(
+                &source,
+                NonZeroU64::new(23).unwrap(),
+                &history,
+                limits,
+                &pool.reserver()
+            )
+            .err(),
+            Some(ReadStage::Shape)
+        );
+        assert!(transient_bytes(CounterMode::Counts, usize::MAX, 65536).is_none());
+        for mode in [
+            CounterMode::Counts,
+            CounterMode::Timestamps,
+            CounterMode::Latency,
+        ] {
+            let fixed = Scripted::sample(mode, false);
+            assert_eq!(
+                acquire(
+                    &fixed,
+                    NonZeroU64::new(23).unwrap(),
+                    &plan(),
+                    limits,
+                    &pool.reserver()
+                )
+                .err(),
+                Some(ReadStage::Shape),
+                "format2 bounds must not broaden any ordinary fixed artifact"
+            );
         }
     }
 

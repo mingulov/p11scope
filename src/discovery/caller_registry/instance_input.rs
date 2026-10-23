@@ -24,6 +24,124 @@ use std::hash::{Hash, Hasher};
 pub(crate) const MAX_REGISTRY_INSTANCES: usize = 4096;
 pub(crate) const MAX_INSTANCE_NEGATIVE_SCOPES: usize = 4096;
 
+/// Requested allocation of the private grant table on the pinned Rust1.98.1
+/// x86-64 implementation. The actual std HashMap probe below enforces its
+/// four-bucket minimum, 7/8 load bound and 16-byte control group. This is not a
+/// portable std collection contract; the resource module pins the host/ABI.
+///
+/// Keep this allocation geometry until that table allocation is dropped:
+/// HashMap::capacity() can fall after removals without freeing any buckets.
+/// This prerequisite computes storage only; it installs no grant or receipt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct JointGrantTableAllocation {
+    buckets: usize,
+    capacity: usize,
+    requested_bytes: usize,
+}
+
+impl JointGrantTableAllocation {
+    fn for_entries(entries: usize) -> Option<Self> {
+        if entries == 0 {
+            return Some(Self {
+                buckets: 0,
+                capacity: 0,
+                requested_bytes: 0,
+            });
+        }
+        let buckets = if entries < 4 {
+            4
+        } else if entries < 8 {
+            8
+        } else {
+            (entries.checked_mul(8)? / 7).checked_next_power_of_two()?
+        };
+        type Entry = (
+            InstanceKey,
+            crate::semantics_objects::journal::BootstrapReceipt,
+        );
+        let control_align = std::mem::align_of::<Entry>().max(16);
+        let control_offset = std::mem::size_of::<Entry>()
+            .checked_mul(buckets)?
+            .checked_add(control_align - 1)?
+            & !(control_align - 1);
+        let requested_bytes = control_offset.checked_add(buckets)?.checked_add(16)?;
+        if requested_bytes > (isize::MAX as usize).checked_sub(control_align - 1)? {
+            return None;
+        }
+        let capacity = if buckets < 8 {
+            buckets - 1
+        } else {
+            (buckets / 8).checked_mul(7)?
+        };
+        Some(Self {
+            buckets,
+            capacity,
+            requested_bytes,
+        })
+    }
+
+    /// A possible growth retains the old allocation while allocating at least
+    /// the next size class. Tombstones can force this below the instance cap.
+    fn next_growth(self, required: usize) -> Option<Self> {
+        Self::for_entries(required.max(self.capacity.checked_add(1)?))
+    }
+
+    fn charge_bytes(self) -> Option<usize> {
+        self.requested_bytes.checked_add(if self.buckets == 0 {
+            0
+        } else {
+            crate::semantics_edge::resources::OWNED_ALLOCATION_PADDING
+        })
+    }
+
+    /// Full simultaneous old/new-table storage and retained copied key text.
+    /// String::clone requests the source length, not its spare capacity; every
+    /// nonempty clone and each table allocation keeps its own padding charge.
+    fn resize_peak_charge(self, next: Self, copied_keys: usize, text_len: usize) -> Option<usize> {
+        if next.buckets < self.buckets || copied_keys > next.capacity {
+            return None;
+        }
+        let one_text = if text_len == 0 {
+            0
+        } else {
+            text_len.checked_add(crate::semantics_edge::resources::OWNED_ALLOCATION_PADDING)?
+        };
+        self.charge_bytes()?
+            .checked_add(next.charge_bytes()?)?
+            .checked_add(copied_keys.checked_mul(one_text)?)
+    }
+}
+
+#[cfg(test)]
+impl CallerRegistry {
+    /// Only the first-allocation prerequisite, not a receipt reservation or a
+    /// grant installer. The actual borrowed New stays with the caller.
+    pub(crate) fn joint_grant_initial_allocation_for_test(
+        &self,
+        input: &AdmittedInstanceCall,
+    ) -> Option<(usize, usize)> {
+        if !self.joint_grants.is_empty() || self.joint_grants.capacity() != 0 {
+            return None;
+        }
+        let text_len = match &input.key.module {
+            ModuleKey::Physical { sha256, .. } => sha256.as_ref().map_or(0, String::len),
+            ModuleKey::Unidentified { path } => path.len(),
+        };
+        let empty = JointGrantTableAllocation::for_entries(0)?;
+        let first = empty.next_growth(1)?;
+        let visible_payload = std::mem::size_of::<(
+            InstanceKey,
+            crate::semantics_objects::journal::BootstrapReceipt,
+        )>()
+        .checked_mul(first.capacity)?
+        .checked_add(text_len)?;
+        Some((
+            visible_payload,
+            empty.resize_peak_charge(first, 1, text_len)?,
+        ))
+    }
+}
+
 /// Allocation characterization only: the copied receipt came from the real
 /// collected-birth fixture. These local keys never enter a registry or grant
 /// permission; varying their routers exercises the actual grant table type.

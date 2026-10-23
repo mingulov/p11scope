@@ -1181,12 +1181,12 @@ jobs:
       # merged report measures the root package alone and drops every other
       # workspace member from the line count.
       - run: cargo +"$(cat .release-rust-version)" llvm-cov report --locked --offline --workspace --fail-under-lines "$(cat .coverage-floor)"
-  # SYSPLAN residual F-29: flake quarantine. Failure-gated triage evidence:
-  # when any check job fails, each ledgered flake re-runs exactly once,
-  # serially, in isolation. A green quarantine run never greens the workflow.
+  # SYSPLAN residual F-29: triage after a relevant test job fails. Each
+  # ledgered flake re-runs exactly once, serially, in isolation. Lint/audit
+  # alone stay red without these repros; quarantine never greens the workflow.
   quarantine:
     needs: [lint, audit, tests, bpf-noninterference, contracts, scripts]
-    if: failure()
+    if: ${{ failure() && (needs.tests.result == 'failure' || needs.contracts.result == 'failure' || needs.scripts.result == 'failure' || needs.bpf-noninterference.result == 'failure') }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

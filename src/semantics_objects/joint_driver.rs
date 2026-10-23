@@ -269,6 +269,86 @@ struct RawCuts {
     birth: super::JournalBirthCut,
 }
 
+/// Compare the complete constructor-decoded value without allocating a wire
+/// copy, exposing private epochs, or reading representation padding.
+fn same_decoded_h0(left: &DecodedEventRecord, right: &DecodedEventRecord) -> bool {
+    let a = &left.base.event;
+    let b = &right.base.event;
+    (
+        a.ts_ns,
+        a.duration_ns,
+        a.pid_tgid,
+        a.cgroup_id,
+        a.session,
+        a.slot_id,
+        a.mechanism,
+        a.flags,
+        a.rv,
+        a.p0,
+        a.p1,
+        a.p2,
+    ) == (
+        b.ts_ns,
+        b.duration_ns,
+        b.pid_tgid,
+        b.cgroup_id,
+        b.session,
+        b.slot_id,
+        b.mechanism,
+        b.flags,
+        b.rv,
+        b.p0,
+        b.p1,
+        b.p2,
+    ) && (
+        a.async_value,
+        a.slot,
+        a.target_function,
+        a.user_type,
+        a.shape,
+        a.capture,
+        a.event_type,
+        a.image,
+        a.child_image,
+        a.root_affiliation,
+    ) == (
+        b.async_value,
+        b.slot,
+        b.target_function,
+        b.user_type,
+        b.shape,
+        b.capture,
+        b.event_type,
+        b.image,
+        b.child_image,
+        b.root_affiliation,
+    ) && (
+        a.attr_count,
+        a.attr_total,
+        a.attr_bools,
+        a.attr_bools_seen,
+        a.attr_count1,
+        a.attr_total1,
+        a.attr_bools1,
+        a.attr_bools_seen1,
+    ) == (
+        b.attr_count,
+        b.attr_total,
+        b.attr_bools,
+        b.attr_bools_seen,
+        b.attr_count1,
+        b.attr_total1,
+        b.attr_bools1,
+        b.attr_bools_seen1,
+    ) && a.attr_types == b.attr_types
+        && a.attr_types1 == b.attr_types1
+        && left.base.continuity.entry_ip == right.base.continuity.entry_ip
+        && left.base.continuity.entry_stamp == right.base.continuity.entry_stamp
+        && left.base.continuity.return_stamp == right.base.continuity.return_stamp
+        && left.object.as_ref().map(|object| object.tail_bytes())
+            == right.object.as_ref().map(|object| object.tail_bytes())
+}
+
 /// Fixed provenance moved from the one original raw allocation. Its collection
 /// and cuts never acquire a scalar constructor or a second retained wire copy.
 pub(super) struct RawProvenance {
@@ -876,17 +956,190 @@ impl RawJointQuantum {
         Ok(())
     }
 
-    /// Inert pending-at-Q gate. It cannot accept an original until the actual
-    /// owner, ledger, frontier, delivery and Q bounds are checked together.
+    /// Original custody for local pending resolution, not completed-Q drain
+    /// or admission authority. A bounded original may legitimately end before
+    /// Q, and malformed/lost input remains eligible for truthful negatives.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn validate_pending_finish(
         &self,
-        _adapter: &JournalAdapter,
-        _producers: &SessionDrainProducers,
-        _discovery: &crate::events::DiscoveryDomain,
-        _q: &crate::attach::CollectedFinishQ,
+        adapter: &JournalAdapter,
+        producers: &SessionDrainProducers,
+        discovery: &crate::events::DiscoveryDomain,
+        q: &crate::attach::CollectedFinishQ,
     ) -> Result<(), RawQuantumRefusal> {
-        Err(RawQuantumRefusal::H0Undelivered)
+        self.validate_pending_finish_report(adapter, producers, discovery, q)?;
+        if !self.h0_pending {
+            return Err(RawQuantumRefusal::H0Undelivered);
+        }
+        Ok(())
+    }
+
+    /// Custody recheck for a report already produced by the actual Capture.
+    /// A resolved report may have cleared h0_pending; this does not authorize
+    /// another expiry or an ingestion/positive seal by itself.
+    pub(crate) fn validate_pending_finish_report(
+        &self,
+        adapter: &JournalAdapter,
+        producers: &SessionDrainProducers,
+        discovery: &crate::events::DiscoveryDomain,
+        q: &crate::attach::CollectedFinishQ,
+    ) -> Result<(), RawQuantumRefusal> {
+        self.validate_collected_report_owner(adapter, producers)?;
+        let cuts = self
+            .cuts
+            .as_ref()
+            .ok_or(RawQuantumRefusal::DispositionMismatch)?;
+        let end = cuts.end.as_ref().ok_or(RawQuantumRefusal::H0Undelivered)?;
+        if !q.matches_owner(producers, discovery)
+            || !q.covers_events_bounds(&cuts.start)
+            || !q.covers_events_bounds(end)
+        {
+            return Err(RawQuantumRefusal::ForeignCapture);
+        }
+        Ok(())
+    }
+
+    /// Recheck the unchanged original at report transfer, including when
+    /// ordinary bounded service resumes it. This grants neither Q nor expiry.
+    pub(crate) fn validate_collected_report_owner(
+        &self,
+        adapter: &JournalAdapter,
+        producers: &SessionDrainProducers,
+    ) -> Result<(), RawQuantumRefusal> {
+        self.validate_owner(adapter, producers)?;
+        if adapter.consumed_frontier()
+            != self
+                .cuts
+                .as_ref()
+                .ok_or(RawQuantumRefusal::DispositionMismatch)?
+                .birth
+                .ordinal
+        {
+            return Err(RawQuantumRefusal::StaleFrontier);
+        }
+        if adapter.stopped || adapter.invalidated {
+            return Err(RawQuantumRefusal::Stopped);
+        }
+        if !self.h0_reported || !self.ordinary.is_empty() {
+            return Err(RawQuantumRefusal::H0Undelivered);
+        }
+        let cuts = self
+            .cuts
+            .as_ref()
+            .ok_or(RawQuantumRefusal::DispositionMismatch)?;
+        let end = cuts.end.as_ref().ok_or(RawQuantumRefusal::H0Undelivered)?;
+        if cuts.poll.is_none()
+            || !producers.matches_events(cuts.start.events())
+            || !producers.matches_events(end.events())
+            || cuts.start.cursor() != end.cursor()
+        {
+            return Err(RawQuantumRefusal::ForeignCapture);
+        }
+        Ok(())
+    }
+
+    /// The actual allocated H0 slot and decoded wire/resource origin must
+    /// agree. This only permits negative resolution of that pending original.
+    pub(crate) fn matches_pending_h0_original(
+        &self,
+        position: u64,
+        origin: CollectedCallOrigin,
+        record: &DecodedEventRecord,
+        adapter: &JournalAdapter,
+    ) -> bool {
+        if !origin.in_quantum(self.identity) || origin.position != position {
+            return false;
+        }
+        let Ok(at) = self
+            .h0_origins
+            .binary_search_by_key(&origin.wire_index, |item| item.wire_index)
+        else {
+            return false;
+        };
+        if self.h0_origins[at].allocation != Some(origin) {
+            return false;
+        }
+        let Some(item) = self.ordered.get(origin.wire_index) else {
+            return false;
+        };
+        let decoded = match item {
+            JournalIngestItem::Ordinary(original) => *original,
+            JournalIngestItem::Journal(JournalRecord::End(end)) => {
+                let Some(original) =
+                    crate::events::project_journal_end_payload(end, &self.descriptors)
+                else {
+                    return false;
+                };
+                let key = (end.thread(), end.sequence());
+                let entry = self
+                    .invocations
+                    .iter()
+                    .find(|entry| (entry.begin.thread(), entry.begin.sequence()) == key);
+                let expected = entry.filter(|entry| {
+                    entry.terminal
+                        && !entry.poisoned
+                        && !entry.begin.no_end()
+                        && end_agrees_with_begin(&entry.begin, end)
+                        && adapter.ledger.matches_reservation(&entry.reservation)
+                });
+                match (expected, record.joint_resource) {
+                    (Some(entry), Some(resource))
+                        if resource.matches_producers(&self.producers)
+                            && resource.invocation == key
+                            && resource.reservation.same_reservation(&entry.reservation) => {}
+                    (None, None) if self.resource_refused => {}
+                    _ => return false,
+                }
+                original
+            }
+            _ => return false,
+        };
+        if matches!(item, JournalIngestItem::Ordinary(_)) && record.joint_resource.is_some() {
+            return false;
+        }
+        same_decoded_h0(&decoded, record)
+    }
+
+    /// Report association only: an I/O callback's Ok(()) cannot substitute
+    /// for the private Capture stamp/ack and exact original negative slots.
+    pub(crate) fn matches_pending_finish_report(
+        &self,
+        report: &crate::semantic_capture::TickReport,
+    ) -> bool {
+        if !self.h0_reported
+            || !self.ordinary.is_empty()
+            || report.allocated_below() == 0
+            || report.allocated_below() != self.audit.h0_allocated_below
+            || self.h0_pending != report.awaiting_floor().is_some()
+            || !report.current().is_empty()
+            || report.outcomes().is_empty()
+        {
+            return false;
+        }
+        let mut count = 0usize;
+        for call in report.calls() {
+            let Some(origin) = call.collected_origin() else {
+                return false;
+            };
+            let Ok(at) = self
+                .h0_origins
+                .binary_search_by_key(&origin.wire_index, |item| item.wire_index)
+            else {
+                return false;
+            };
+            if !origin.in_quantum(self.identity)
+                || call.token() != Some(origin.position)
+                || self.h0_origins[at].allocation != Some(origin)
+                || call.route()
+                    != crate::discovery::instances::Route::Unknown(
+                        crate::discovery::instances::UnknownReason::Unobserved,
+                    )
+            {
+                return false;
+            }
+            count += 1;
+        }
+        count == report.outcomes().len()
     }
 
     /// Read-only routing hint for this actual empty original. Disposal and
@@ -1185,6 +1438,20 @@ impl RawJointQuantum {
         // not acknowledge ordinary records that no collected tick consumed.
         if !self.h0_reported || !self.ordinary.is_empty() {
             return Err(RawQuantumRefusal::H0Undelivered);
+        }
+        Ok(())
+    }
+
+    /// Same collected owner and a nonregressing actual Capture allocator,
+    /// checked before a pending-resolution mutation or acknowledgement.
+    pub(crate) fn validate_pending_h0_owner(
+        &self,
+        owner: crate::semantic_capture::CollectedH0Owner,
+        allocated_below: u64,
+    ) -> Result<(), RawQuantumRefusal> {
+        self.validate_h0_cut(owner)?;
+        if allocated_below < self.audit.h0_allocated_below {
+            return Err(RawQuantumRefusal::StaleFrontier);
         }
         Ok(())
     }

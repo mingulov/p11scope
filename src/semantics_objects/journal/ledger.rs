@@ -28,6 +28,14 @@ impl std::fmt::Debug for ExistingReservation {
     }
 }
 
+impl ExistingReservation {
+    /// Exact originally minted reservation identity, before any alias merge.
+    /// This comparison creates no reservation or role membership.
+    pub(super) fn same_reservation(&self, other: &Self) -> bool {
+        self.generation == other.generation && self.id == other.id
+    }
+}
+
 /// Returned only by a successful actual H9 membership insertion. A replay
 /// may use it to prepay the association copy before the staged copy drops.
 #[derive(Clone, Copy)]

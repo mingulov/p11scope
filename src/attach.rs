@@ -4904,6 +4904,18 @@ impl Session {
         )
     }
 
+    /// Same retained Session and current native Q only. This is not evidence
+    /// of completed drain, clean prefix, process death or detach permission.
+    #[allow(dead_code)] // Pending-at-Q forwarding remains inactive in the ordinary driver.
+    pub(crate) fn matches_collected_finish_q(&self, q: &CollectedFinishQ) -> bool {
+        matches!(self.producer_detach, OwnedProducerDetach::NotStarted)
+            && self.stop_gate.quiescent()
+            && self
+                .drain_producers()
+                .as_ref()
+                .is_some_and(|producers| q.matches_owner(producers, &self.discovery_domain))
+    }
+
     /// Stamps attach completion with one CLOCK_MONOTONIC read (T2, G-14).
     /// Called once at loop entry, when the session is fully attached; later
     /// discovery-driven attaches do not re-stamp it.

@@ -787,6 +787,27 @@ impl InstanceRouter {
         self.counters
     }
 
+    /// Borrow the real deferred route facts for Capture's original matching.
+    /// Neither a copied pending queue nor an instance observation is minted.
+    pub(crate) fn pending_facts(&self) -> impl Iterator<Item = &CallFacts> {
+        self.pending.iter().map(|call| &call.facts)
+    }
+
+    /// Expiry retains the pending deque in place. The only router allocation
+    /// is growth of the finite unknown-reason counter tree. Pinned Rust 1.98.1
+    /// B-tree nodes hold 11 pairs and 12 edges; a whole internal node per
+    /// existing/new entry plus a spare root dominates both retained and newly
+    /// requested nodes. Tuple size conservatively includes key/value padding.
+    /// These remain existing bounded H0 counter metadata; including their
+    /// growth peak here does not transfer their lifetime to an S1 report lease.
+    pub(crate) fn pending_expiry_storage_bytes(&self) -> Option<usize> {
+        let node = 16usize
+            .checked_add(11usize.checked_mul(std::mem::size_of::<(UnknownReason, u64)>())?)?
+            .checked_add(12usize.checked_mul(std::mem::size_of::<usize>())?)?
+            .checked_add(crate::semantics_edge::resources::OWNED_ALLOCATION_PADDING)?;
+        node.checked_mul(self.unknown.len().checked_add(2)?)
+    }
+
     pub(crate) fn unknown_counts(&self) -> &BTreeMap<UnknownReason, u64> {
         &self.unknown
     }
@@ -1259,6 +1280,25 @@ impl InstanceRouter {
         self.fail_pending(|call| call.facts.image == image, UnknownReason::Unobserved)
     }
 
+    /// The same scoped expiry, streaming into Capture's already-paid output.
+    /// Sorted image keys are a temporary index over the validated originals;
+    /// they grant no observation, join or clean-prefix authority.
+    pub(crate) fn expire_images_into(
+        &mut self,
+        images: &[(u64, u64)],
+        resolved: &mut dyn FnMut(u64, Route),
+    ) {
+        self.fail_pending_into(
+            &mut |call| {
+                images
+                    .binary_search(&(call.facts.image.task_cookie, call.facts.image.exec_id))
+                    .is_ok()
+            },
+            UnknownReason::Unobserved,
+            resolved,
+        );
+    }
+
     #[cfg(test)]
     pub(crate) fn expire_pending(&mut self, cookie: u64) -> Vec<(u64, Route)> {
         self.expire_cookie(cookie)
@@ -1277,16 +1317,28 @@ impl InstanceRouter {
         reason: UnknownReason,
     ) -> Vec<(u64, Route)> {
         let mut resolved = Vec::new();
-        let pending = std::mem::take(&mut self.pending);
-        for call in pending {
-            if matches(&call) {
-                self.note_unknown_n(reason, 1);
-                resolved.push((call.facts.token, Route::Unknown(reason)));
-            } else {
-                self.pending.push_back(call);
-            }
-        }
+        self.fail_pending_into(&mut |call| matches(call), reason, &mut |token, route| {
+            resolved.push((token, route));
+        });
         resolved
+    }
+
+    fn fail_pending_into(
+        &mut self,
+        matches: &mut dyn FnMut(&PendingCall) -> bool,
+        reason: UnknownReason,
+        resolved: &mut dyn FnMut(u64, Route),
+    ) {
+        let mut count = 0u64;
+        self.pending.retain(|call| {
+            if !matches(call) {
+                return true;
+            }
+            resolved(call.facts.token, Route::Unknown(reason));
+            count += 1;
+            false
+        });
+        self.note_unknown_n(reason, count);
     }
 
     fn mint(&mut self) -> Option<InstanceId> {

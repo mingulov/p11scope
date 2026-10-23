@@ -795,6 +795,16 @@ pub(crate) struct TickReport {
     exhausted: bool,
 }
 
+fn pending_q_array_bytes<T>(capacity: usize) -> Option<usize> {
+    capacity
+        .checked_mul(std::mem::size_of::<T>())?
+        .checked_add(if capacity == 0 {
+            0
+        } else {
+            crate::semantics_edge::resources::OWNED_ALLOCATION_PADDING
+        })
+}
+
 /// Only this module constructs an owner from the nonrecycled Capture identity.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CollectedH0Owner(u64);
@@ -1775,35 +1785,234 @@ impl SemanticCapture {
         quantum.validate_h0_cut(CollectedH0Owner(self.identity))
     }
 
-    /// Inert signature for the pending-at-Q allocation envelope. No size is
-    /// certified until original association and expiry temporaries are proved.
+    /// Check actual owner/original association without allocating scratch.
+    /// A different Raw's waiters are preserved, and may not share any image
+    /// selected by this expiry because the router expires a whole image.
+    fn pending_h0_at_q_selection(
+        &self,
+        quantum: &crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+        adapter: &JournalAdapter,
+        producers: &crate::attach::SessionDrainProducers,
+        discovery: &crate::events::DiscoveryDomain,
+        q: &crate::attach::CollectedFinishQ,
+    ) -> Result<usize, crate::semantics_objects::journal::joint_driver::RawQuantumRefusal> {
+        use crate::semantics_objects::journal::joint_driver::RawQuantumRefusal;
+        quantum.validate_pending_finish(adapter, producers, discovery, q)?;
+        quantum.validate_pending_h0_owner(CollectedH0Owner(self.identity), self.next_token)?;
+        if self.stopped || self.router.domain() != producers.native_domain() {
+            return Err(RawQuantumRefusal::Stopped);
+        }
+        if self.awaiting.len() > MAX_PENDING {
+            return Err(RawQuantumRefusal::Capacity);
+        }
+        let selected = |waiting: &Awaiting| {
+            waiting
+                .collected_origin
+                .is_some_and(|origin| origin.in_quantum(quantum.h0_identity()))
+        };
+        let mut count = 0usize;
+        for (position, waiting) in &self.awaiting {
+            if selected(waiting) {
+                let origin = waiting
+                    .collected_origin
+                    .ok_or(RawQuantumRefusal::Admission)?;
+                if !quantum.matches_pending_h0_original(*position, origin, &waiting.record, adapter)
+                {
+                    return Err(RawQuantumRefusal::Admission);
+                }
+                let Some(facts) = self
+                    .router
+                    .pending_facts()
+                    .find(|facts| facts.token == *position)
+                else {
+                    return Err(RawQuantumRefusal::Admission);
+                };
+                if facts.domain != self.router.domain()
+                    || facts.image != waiting.record.base.event.image
+                    || facts.entry != waiting.record.base.continuity.entry_stamp
+                    || facts.ret != waiting.record.base.continuity.return_stamp
+                    || facts.ip != EntryIp::new(waiting.record.base.continuity.entry_ip)
+                    || facts.attached_offset != waiting.endpoint.map(|endpoint| endpoint.offset)
+                {
+                    return Err(RawQuantumRefusal::Admission);
+                }
+                count += 1;
+            } else if self.awaiting.values().any(|candidate| {
+                selected(candidate)
+                    && candidate.record.base.event.image == waiting.record.base.event.image
+            }) {
+                return Err(RawQuantumRefusal::Admission);
+            }
+        }
+        if count == 0 {
+            return Err(RawQuantumRefusal::H0Undelivered);
+        }
+        // Every route the scoped router operation can emit must still have
+        // its SAME original awaiting record in this Capture.
+        for facts in self.router.pending_facts() {
+            if self
+                .awaiting
+                .values()
+                .any(|waiting| selected(waiting) && waiting.record.base.event.image == facts.image)
+                && !self.awaiting.get(&facts.token).is_some_and(selected)
+            {
+                return Err(RawQuantumRefusal::Admission);
+            }
+        }
+        Ok(count)
+    }
+
+    /// Complete checked envelope for the incoming report, its coexistence
+    /// with the paid accumulator, scoped-image/job scratch and counter growth.
+    /// The finite counters keep their existing H0 retention class; the extra
+    /// S1 lease owns report/scratch overlap, not the eventual router-node drop.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn pending_h0_at_q_storage_bytes(
         &self,
-        _quantum: &crate::semantics_objects::journal::joint_driver::RawJointQuantum,
-        _adapter: &crate::semantics_objects::journal::JournalAdapter,
-        _producers: &crate::attach::SessionDrainProducers,
-        _discovery: &crate::events::DiscoveryDomain,
-        _q: &crate::attach::CollectedFinishQ,
+        quantum: &crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+        adapter: &JournalAdapter,
+        producers: &crate::attach::SessionDrainProducers,
+        discovery: &crate::events::DiscoveryDomain,
+        q: &crate::attach::CollectedFinishQ,
     ) -> Result<usize, crate::semantics_objects::journal::joint_driver::RawQuantumRefusal> {
-        Err(crate::semantics_objects::journal::joint_driver::RawQuantumRefusal::H0Undelivered)
+        use crate::semantics_objects::journal::joint_driver::RawQuantumRefusal;
+        let count = self.pending_h0_at_q_selection(quantum, adapter, producers, discovery, q)?;
+        let bytes = (|| {
+            std::mem::size_of::<TickReport>()
+                .checked_add(pending_q_array_bytes::<TickOutcome>(count)?.checked_mul(2)?)?
+                .checked_add(pending_q_array_bytes::<(u64, u64)>(count)?)?
+                .checked_add(pending_q_array_bytes::<(u64, u64, u32)>(
+                    self.awaiting.len(),
+                )?)?
+                .checked_add(self.router.pending_expiry_storage_bytes()?)
+        })();
+        bytes.ok_or(RawQuantumRefusal::Capacity)
     }
 
-    /// Inert refusal: neither expiry nor a disposition/report stamp occurs.
-    /// The caller keeps its original Raw and borrowed output unchanged.
+    /// Resolve only validated original waiters into the caller's already-paid
+    /// report. No ring poll, scan, global fault, new position or Stop occurs.
     #[cfg_attr(not(test), allow(dead_code))]
     #[allow(clippy::too_many_arguments)] // Keep original owner, Q and caller-owned output explicit.
     fn resolve_collected_pending_at_q_with(
         &mut self,
-        _io: &mut impl CaptureIo,
-        _quantum: &mut crate::semantics_objects::journal::joint_driver::RawJointQuantum,
-        _adapter: &crate::semantics_objects::journal::JournalAdapter,
-        _producers: &crate::attach::SessionDrainProducers,
-        _discovery: &crate::events::DiscoveryDomain,
-        _q: &crate::attach::CollectedFinishQ,
-        _report: &mut TickReport,
+        io: &mut impl CaptureIo,
+        quantum: &mut crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+        adapter: &JournalAdapter,
+        producers: &crate::attach::SessionDrainProducers,
+        discovery: &crate::events::DiscoveryDomain,
+        q: &crate::attach::CollectedFinishQ,
+        report: &mut TickReport,
     ) -> Result<(), crate::semantics_objects::journal::joint_driver::RawQuantumRefusal> {
-        Err(crate::semantics_objects::journal::joint_driver::RawQuantumRefusal::H0Undelivered)
+        use crate::semantics_objects::journal::joint_driver::RawQuantumRefusal;
+        let count = self.pending_h0_at_q_selection(quantum, adapter, producers, discovery, q)?;
+        if io.domain() != Some(self.router.domain()) {
+            return Err(RawQuantumRefusal::ForeignCapture);
+        }
+        if report.outcomes.capacity() != 0
+            || report.current.capacity() != 0
+            || report.observations.capacity() != 0
+            || report.scan_refusals.capacity() != 0
+            || report.allocated_below != 0
+            || report.awaiting_floor.is_some()
+            || report.shed_floor.is_some()
+            || report.exhausted
+        {
+            return Err(RawQuantumRefusal::DispositionMismatch);
+        }
+        let mut images = Vec::new();
+        let mut remaining_keys = Vec::new();
+        images
+            .try_reserve_exact(count)
+            .map_err(|_| RawQuantumRefusal::Allocation)?;
+        remaining_keys
+            .try_reserve_exact(self.awaiting.len())
+            .map_err(|_| RawQuantumRefusal::Allocation)?;
+        report
+            .outcomes
+            .try_reserve_exact(count)
+            .map_err(|_| RawQuantumRefusal::Allocation)?;
+        if images.capacity() != count
+            || remaining_keys.capacity() != self.awaiting.len()
+            || report.outcomes.capacity() != count
+        {
+            return Err(RawQuantumRefusal::Allocation);
+        }
+        for waiting in self.awaiting.values().filter(|waiting| {
+            waiting
+                .collected_origin
+                .is_some_and(|origin| origin.in_quantum(quantum.h0_identity()))
+        }) {
+            let image = waiting.record.base.event.image;
+            images.push((image.task_cookie, image.exec_id));
+        }
+        images.sort_unstable();
+        images.dedup();
+        let domain = self.router.domain();
+        let awaiting = &mut self.awaiting;
+        self.router
+            .expire_images_into(&images, &mut |token, route| {
+                if let Some(waiting) = awaiting.remove(&token) {
+                    Self::emit_in_domain(
+                        domain,
+                        Some(token),
+                        waiting.record,
+                        waiting.endpoint,
+                        route,
+                        waiting.collected_origin,
+                        report,
+                    );
+                }
+            });
+        if self.awaiting.is_empty() {
+            self.jobs.clear();
+        } else {
+            remaining_keys.extend(self.awaiting.values().map(Self::pending_key));
+            remaining_keys.sort_unstable();
+            remaining_keys.dedup();
+            self.jobs
+                .retain(|job| remaining_keys.binary_search(&job.key()).is_ok());
+        }
+        self.stamp_disposition(report);
+        self.note_collected_disposition(quantum, report)
+            .map_err(|_| RawQuantumRefusal::DispositionMismatch)?;
+        Ok(())
+    }
+
+    /// Normal Session forwarding to the same private Capture operation.
+    /// Session/Q association precedes all report allocation or route mutation.
+    #[allow(clippy::too_many_arguments)] // Explicit original custody and caller-owned output.
+    pub(crate) fn resolve_collected_pending_at_q(
+        &mut self,
+        session: &mut Session,
+        quantum: &mut crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+        adapter: &JournalAdapter,
+        producers: &crate::attach::SessionDrainProducers,
+        discovery: &crate::events::DiscoveryDomain,
+        q: &crate::attach::CollectedFinishQ,
+        report: &mut TickReport,
+    ) -> Result<(), crate::semantics_objects::journal::joint_driver::RawQuantumRefusal> {
+        if !session.matches_collected_finish_q(q)
+            || !session
+                .drain_producers()
+                .as_ref()
+                .is_some_and(|own| own.same_producers(producers))
+        {
+            return Err(
+                crate::semantics_objects::journal::joint_driver::RawQuantumRefusal::ForeignCapture,
+            );
+        }
+        self.resolve_collected_pending_at_q_with(
+            &mut SessionIo {
+                session,
+                targets: &[],
+            },
+            quantum,
+            adapter,
+            producers,
+            discovery,
+            q,
+            report,
+        )
     }
 
     pub(crate) fn apply_physical_gaps_collected(
@@ -2118,8 +2327,28 @@ impl SemanticCapture {
         collected_origin: Option<CollectedCallOrigin>,
         report: &mut TickReport,
     ) {
+        Self::emit_in_domain(
+            self.router.domain(),
+            token,
+            record,
+            endpoint,
+            route,
+            collected_origin,
+            report,
+        );
+    }
+
+    fn emit_in_domain(
+        domain: NativeDomainId,
+        token: Option<u64>,
+        record: DecodedEventRecord,
+        endpoint: Option<Endpoint>,
+        route: Route,
+        collected_origin: Option<CollectedCallOrigin>,
+        report: &mut TickReport,
+    ) {
         report.outcomes.push(TickOutcome::Call(RoutedCall {
-            domain: self.router.domain(),
+            domain,
             decoded: record,
             route,
             endpoint,

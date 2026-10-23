@@ -97,8 +97,7 @@ pub(crate) trait JointMachineIo {
         bindings: &[SemanticCallerBinding],
         raw: &mut RawJointQuantum,
     ) -> Result<SemanticBatch, SemanticRefusal>;
-    /// Inert default: no unproved expiry/query allocation envelope is usable.
-    #[allow(dead_code)] // Compile-only pending-at-Q port; no service calls it yet.
+    /// Fail closed unless an implementation reads the actual owning Capture.
     fn pending_h0_at_q_storage_bytes(
         &self,
         _lane: &AttestedSemanticLane,
@@ -109,8 +108,7 @@ pub(crate) trait JointMachineIo {
     ) -> Result<usize, SemanticRefusal> {
         Err(SemanticRefusal::ProviderStorage)
     }
-    /// Inert default: keep original H0 ownership and the caller's output.
-    #[allow(dead_code)] // Compile-only pending-at-Q port; no service calls it yet.
+    /// Fail closed unless the same native/Capture owner supplies the operation.
     fn resolve_pending_h0_at_q(
         &mut self,
         _lane: &mut AttestedSemanticLane,
@@ -196,12 +194,31 @@ struct Collected {
     reports: Option<CollectedReports>,
 }
 
+enum PendingQResolution {
+    Attempted,
+    Resolved,
+}
+
+/// One output slot beside the SAME Collected owner. Its state records whether
+/// the actual Capture callback returned; neither state grants Q/H3 authority.
+/// Buffers must drop before their original prepaid lease.
+struct PendingQReport {
+    report: TickReport,
+    resolution: PendingQResolution,
+    bytes: usize,
+    _storage: ResourceLease,
+}
+
 #[allow(clippy::large_enum_variant)] // The complete bounded original stays inline in the paid machine.
 enum Phase {
     Idle,
     Collecting(Collected),
     Binding(Collected),
     AwaitH0(Collected),
+    PendingQ {
+        original: Collected,
+        pending: PendingQReport,
+    },
     Preparing(Collected),
     PreparationAttempted(Collected),
     PreparingAdmissions(Collected),
@@ -391,6 +408,50 @@ impl CollectedReports {
         batch.exhausted |= incoming.exhausted;
         Ok(batch.awaiting_floor.is_none())
     }
+
+    /// Refuse before taking any produced field. The accumulator's original
+    /// capacities already cover the union, so this transfer cannot allocate.
+    fn merge_pending_q(
+        &mut self,
+        domain: crate::attach::capture::NativeDomainId,
+        incoming: &mut TickReport,
+    ) -> Result<bool, SemanticRefusal> {
+        let batch = self.batch.as_mut().ok_or(SemanticRefusal::Unavailable)?;
+        let outcomes = batch.outcomes.len().checked_add(incoming.outcomes().len());
+        let current = batch.current.len().checked_add(incoming.current().len());
+        if self.refused.is_some()
+            || domain != batch.domain
+            || !outcomes
+                .is_some_and(|count| count <= MAX_INSTANCES && count <= batch.outcomes.capacity())
+            || !current.is_some_and(|count| {
+                count <= self.receipt_limit && count <= batch.current.capacity()
+            })
+            || !incoming.current().iter().all(|receipt| {
+                receipt
+                    .owned_storage_bytes()
+                    .is_some_and(|bytes| bytes <= self.nested_per_receipt)
+            })
+        {
+            return Err(SemanticRefusal::ProviderStorage);
+        }
+        batch.awaiting_floor = incoming.awaiting_floor();
+        batch.shed_floor = batch
+            .shed_floor
+            .into_iter()
+            .chain(incoming.shed_floor())
+            .min();
+        batch.exhausted |= incoming.exhausted();
+        batch.observed_ns = batch
+            .observed_ns
+            .max(crate::discovery::caller_registry::now_ns());
+        let mut outcomes = incoming.take_outcomes();
+        let mut current = incoming.take_current();
+        batch.outcomes.append(&mut outcomes);
+        batch.current.append(&mut current);
+        drop(outcomes);
+        drop(current);
+        Ok(batch.awaiting_floor.is_none())
+    }
 }
 
 /// Scheduling state over the original owner, not an alternate capture/model.
@@ -408,6 +469,8 @@ pub(crate) struct LiveJointMachine {
     absence_entry: usize,
     demand: Option<Demand>,
     prepared_base: u64,
+    #[cfg(test)]
+    refuse_pending_q_merge_once: bool,
     // All original phase buffers and birth leases drop before inline storage.
     _storage: ResourceLease,
 }
@@ -439,6 +502,8 @@ impl LiveJointMachine {
             absence_entry: 0,
             demand: None,
             prepared_base: 0,
+            #[cfg(test)]
+            refuse_pending_q_merge_once: false,
             _storage: storage,
         })
     }
@@ -454,20 +519,205 @@ impl LiveJointMachine {
         Ok(())
     }
 
-    /// Compile-only entry: genuine pending H0 remains Pending. In particular
-    /// this does not call expiry, reserve, construct a report or spend work.
+    /// Resolve this live Capture's pending originals at actual Q, then transfer
+    /// the retained report once. A refused receiver retries only that transfer.
     #[cfg_attr(not(test), allow(dead_code))]
     #[allow(clippy::too_many_arguments)] // Preserve disjoint original owners, Q and explicit work.
     pub(crate) fn resolve_pending_h0_at_q_with_io<I: JointMachineIo>(
         &mut self,
-        _lane: &mut AttestedSemanticLane,
-        _coordinator: &mut InventoryCoordinator<OsProcessSource>,
-        _io: &mut I,
-        _q: &CollectedFinishQ,
-        _discovery: &DiscoveryDomain,
-        _budget: &mut JointWorkBudget,
+        lane: &mut AttestedSemanticLane,
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        io: &mut I,
+        q: &CollectedFinishQ,
+        discovery: &DiscoveryDomain,
+        budget: &mut JointWorkBudget,
     ) -> Result<JointServiceProgress, SemanticRefusal> {
+        if !budget.available() {
+            return Ok(JointServiceProgress::Pending);
+        }
+        self.validate_owner(lane, coordinator, io)?;
+        if let RunState::DispositionRequired(reason) = self.state {
+            return Err(reason);
+        }
+        if !q.matches_owner(&self.producers, discovery)
+            || self
+                .grant
+                .as_ref()
+                .is_some_and(|grant| !q.matches_retained_grant(grant))
+        {
+            return Err(SemanticRefusal::Unavailable);
+        }
+        if let Some(Phase::PendingQ { original, .. }) = self.phase.as_ref() {
+            original
+                .raw
+                .validate_pending_finish_report(
+                    coordinator.joint_capture().adapter(),
+                    &self.producers,
+                    discovery,
+                    q,
+                )
+                .map_err(|_| SemanticRefusal::Unavailable)?;
+            let phase = self.phase.take().ok_or(SemanticRefusal::Unavailable)?;
+            let (phase, result) = self.merge_pending_q_phase(phase, lane, coordinator, budget);
+            self.phase = Some(phase);
+            if let Err(reason) = result {
+                if reason != SemanticRefusal::ProviderStorage {
+                    self.state = RunState::DispositionRequired(reason);
+                }
+                return Err(reason);
+            }
+            return Ok(JointServiceProgress::Pending);
+        }
+        let Some(Phase::AwaitH0(original)) = self.phase.as_ref() else {
+            return Err(SemanticRefusal::Unavailable);
+        };
+        original
+            .raw
+            .validate_pending_finish(
+                coordinator.joint_capture().adapter(),
+                &self.producers,
+                discovery,
+                q,
+            )
+            .map_err(|_| SemanticRefusal::Unavailable)?;
+        if original
+            .reports
+            .as_ref()
+            .is_none_or(|reports| reports.refused.is_some())
+        {
+            return Err(SemanticRefusal::Unavailable);
+        }
+        let bytes = io.pending_h0_at_q_storage_bytes(
+            lane,
+            &original.raw,
+            coordinator.joint_capture().adapter(),
+            q,
+            discovery,
+        )?;
+        if bytes == 0 {
+            return Err(SemanticRefusal::ProviderStorage);
+        }
+        let storage = coordinator
+            .registry()
+            .semantic_storage_reserver()
+            .reserve(bytes)
+            .map_err(|_| SemanticRefusal::ProviderStorage)?;
+        let phase = self.phase.take().ok_or(SemanticRefusal::Unavailable)?;
+        let Phase::AwaitH0(mut original) = phase else {
+            self.phase = Some(phase);
+            return Err(SemanticRefusal::Unavailable);
+        };
+        let mut pending = PendingQReport {
+            report: TickReport::default(),
+            resolution: PendingQResolution::Attempted,
+            bytes,
+            _storage: storage,
+        };
+        budget.spend(1);
+        let result = io.resolve_pending_h0_at_q(
+            lane,
+            &mut original.raw,
+            coordinator.joint_capture().adapter(),
+            q,
+            discovery,
+            &mut pending.report,
+        );
+        let result = result.and_then(|()| {
+            original
+                .raw
+                .matches_pending_finish_report(&pending.report)
+                .then_some(())
+                .ok_or(SemanticRefusal::Unavailable)
+        });
+        if result.is_ok() {
+            pending.resolution = PendingQResolution::Resolved;
+        }
+        // Retain even a refused callback's partially produced report. It must
+        // never be silently dropped or cause another expiry attempt.
+        self.phase = Some(Phase::PendingQ { original, pending });
+        if let Err(reason) = result {
+            self.state = RunState::DispositionRequired(reason);
+            return Err(reason);
+        }
+        if budget.available() {
+            let phase = self.phase.take().ok_or(SemanticRefusal::Unavailable)?;
+            let (phase, result) = self.merge_pending_q_phase(phase, lane, coordinator, budget);
+            self.phase = Some(phase);
+            if let Err(reason) = result {
+                if reason != SemanticRefusal::ProviderStorage {
+                    self.state = RunState::DispositionRequired(reason);
+                }
+                return Err(reason);
+            }
+        }
         Ok(JointServiceProgress::Pending)
+    }
+
+    fn merge_pending_q_phase(
+        &mut self,
+        phase: Phase,
+        lane: &AttestedSemanticLane,
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        budget: &mut JointWorkBudget,
+    ) -> (Phase, Result<Step, SemanticRefusal>) {
+        let Phase::PendingQ {
+            mut original,
+            mut pending,
+        } = phase
+        else {
+            return (phase, Err(SemanticRefusal::Unavailable));
+        };
+        if !matches!(pending.resolution, PendingQResolution::Resolved) || pending.bytes == 0 {
+            return (
+                Phase::PendingQ { original, pending },
+                Err(SemanticRefusal::Unavailable),
+            );
+        }
+        if original
+            .raw
+            .validate_collected_report_owner(coordinator.joint_capture().adapter(), &self.producers)
+            .is_err()
+            || !original.raw.matches_pending_finish_report(&pending.report)
+        {
+            return (
+                Phase::PendingQ { original, pending },
+                Err(SemanticRefusal::Unavailable),
+            );
+        }
+        if !budget.available() {
+            return (Phase::PendingQ { original, pending }, Ok(Step::Yield));
+        }
+        budget.spend(1);
+        #[cfg(test)]
+        if self.refuse_pending_q_merge_once {
+            self.refuse_pending_q_merge_once = false;
+            return (
+                Phase::PendingQ { original, pending },
+                Err(SemanticRefusal::ProviderStorage),
+            );
+        }
+        let result = original
+            .reports
+            .as_mut()
+            .ok_or(SemanticRefusal::Unavailable)
+            .and_then(|reports| reports.merge_pending_q(lane.domain(), &mut pending.report));
+        let complete = match result {
+            Ok(complete) => complete,
+            Err(reason) => return (Phase::PendingQ { original, pending }, Err(reason)),
+        };
+        drop(pending); // Dropped incoming buffers precede their exact lease refund.
+        if !complete {
+            return (Phase::AwaitH0(original), Ok(Step::Yield));
+        }
+        let Some(batch) = original
+            .reports
+            .as_mut()
+            .and_then(|reports| reports.batch.take())
+        else {
+            return (Phase::AwaitH0(original), Err(SemanticRefusal::Unavailable));
+        };
+        coordinator.stage_semantic_batch(batch);
+        (Phase::Preparing(original), Ok(Step::Continue))
     }
 
     pub(crate) fn poll_commit_with_io<I: JointMachineIo>(
@@ -519,7 +769,22 @@ impl LiveJointMachine {
                 Ok(Step::Yield) => return Ok(JointServiceProgress::Pending),
                 Ok(Step::Published) => return Ok(JointServiceProgress::Published),
                 Err(reason) => {
-                    self.state = RunState::DispositionRequired(reason);
+                    // This exact produced report remains the retry input.
+                    // Other failed phases keep their existing disposition gate.
+                    if reason != SemanticRefusal::ProviderStorage
+                        || !matches!(
+                            self.phase,
+                            Some(Phase::PendingQ {
+                                pending: PendingQReport {
+                                    resolution: PendingQResolution::Resolved,
+                                    ..
+                                },
+                                ..
+                            })
+                        )
+                    {
+                        self.state = RunState::DispositionRequired(reason);
+                    }
                     return Err(reason);
                 }
             }
@@ -552,16 +817,20 @@ impl LiveJointMachine {
         self.grant.as_ref()
     }
 
-    /// No real pending-at-Q report exists in the inert implementation.
+    /// Borrow the actual receiver-owned report and its retained lease size.
     #[cfg(test)]
     pub(crate) fn retained_pending_q_report_for_test(&self) -> Option<(&TickReport, usize)> {
-        None
+        let Phase::PendingQ { pending, .. } = self.phase.as_ref()? else {
+            return None;
+        };
+        Some((&pending.report, pending.bytes))
     }
 
-    /// Reserved receiver-only refusal hook. With no actual receiver yet it
-    /// has no state, success, expiry or publication effect.
+    /// Refusal only, consumed after actual output and lease are retained.
     #[cfg(test)]
-    pub(crate) fn reference_refuse_pending_q_merge_once(&mut self) {}
+    pub(crate) fn reference_refuse_pending_q_merge_once(&mut self) {
+        self.refuse_pending_q_merge_once = true;
+    }
 
     #[cfg(test)]
     pub(crate) fn retained_raw_for_test(&self) -> Option<&RawJointQuantum> {
@@ -569,6 +838,9 @@ impl LiveJointMachine {
             Phase::Collecting(value)
             | Phase::Binding(value)
             | Phase::AwaitH0(value)
+            | Phase::PendingQ {
+                original: value, ..
+            }
             | Phase::Preparing(value)
             | Phase::PreparationAttempted(value)
             | Phase::PreparingAdmissions(value)
@@ -591,6 +863,7 @@ impl LiveJointMachine {
             Some(Phase::Collecting(value)) => ("Collecting", Some(value)),
             Some(Phase::Binding(value)) => ("Binding", Some(value)),
             Some(Phase::AwaitH0(value)) => ("AwaitH0", Some(value)),
+            Some(Phase::PendingQ { original, .. }) => ("PendingQReport", Some(original)),
             Some(Phase::Preparing(value)) => ("Preparing", Some(value)),
             Some(Phase::PreparationAttempted(value)) => ("PreparationAttempted", Some(value)),
             Some(Phase::PreparingAdmissions(value)) => ("PreparingAdmissions", Some(value)),
@@ -653,8 +926,9 @@ impl LiveJointMachine {
     pub(crate) fn retained_h0_for_test(
         &self,
     ) -> Option<(&[TickOutcome], &[CurrentPartitionReceipt])> {
-        let Phase::AwaitH0(original) = self.phase.as_ref()? else {
-            return None;
+        let original = match self.phase.as_ref()? {
+            Phase::AwaitH0(original) | Phase::PendingQ { original, .. } => original,
+            _ => return None,
         };
         let batch = original.reports.as_ref()?.batch.as_ref()?;
         Some((&batch.outcomes, &batch.current))
@@ -745,6 +1019,9 @@ impl LiveJointMachine {
         budget: &mut JointWorkBudget,
     ) -> (Phase, Result<Step, SemanticRefusal>) {
         match phase {
+            phase @ Phase::PendingQ { .. } => {
+                self.merge_pending_q_phase(phase, lane, coordinator, budget)
+            }
             Phase::Idle => {
                 let reserve = coordinator.registry().semantic_storage_reserver();
                 // No collection, binder or New can precede this scan. One
@@ -1535,6 +1812,54 @@ impl JointMachineIo for SessionMachineIo {
     ) -> Result<SemanticBatch, SemanticRefusal> {
         self.live(lane)?;
         lane.tick_collected(bindings, raw)
+    }
+
+    fn pending_h0_at_q_storage_bytes(
+        &self,
+        lane: &AttestedSemanticLane,
+        raw: &RawJointQuantum,
+        adapter: &JournalAdapter,
+        q: &CollectedFinishQ,
+        discovery: &DiscoveryDomain,
+    ) -> Result<usize, SemanticRefusal> {
+        let live = lane.live.as_deref().ok_or(SemanticRefusal::Unavailable)?;
+        if live.gated
+            || live.finished
+            || !live.session.matches_collected_finish_q(q)
+            || !live
+                .session
+                .drain_producers()
+                .as_ref()
+                .is_some_and(|own| own.same_producers(&self.producers))
+        {
+            return Err(SemanticRefusal::Unavailable);
+        }
+        live.capture
+            .pending_h0_at_q_storage_bytes(raw, adapter, &self.producers, discovery, q)
+            .map_err(|_| SemanticRefusal::ProviderStorage)
+    }
+
+    fn resolve_pending_h0_at_q(
+        &mut self,
+        lane: &mut AttestedSemanticLane,
+        raw: &mut RawJointQuantum,
+        adapter: &JournalAdapter,
+        q: &CollectedFinishQ,
+        discovery: &DiscoveryDomain,
+        report: &mut TickReport,
+    ) -> Result<(), SemanticRefusal> {
+        let live = self.live(lane)?;
+        live.capture
+            .resolve_collected_pending_at_q(
+                &mut live.session,
+                raw,
+                adapter,
+                &self.producers,
+                discovery,
+                q,
+                report,
+            )
+            .map_err(|_| SemanticRefusal::Unavailable)
     }
 
     fn prepare_publication(

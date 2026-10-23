@@ -229,7 +229,11 @@ fn stage_projection(
             .slots
             .get(row.slot as usize)
             .ok_or(CounterFailure::Projection)?;
-        if row.slot != slot.index || row.target != AttachKey::of(slot) || row.mode != view.mode {
+        let target = AttachKey {
+            object: slot.object,
+            file_offset: slot.file_offset,
+        };
+        if row.slot != slot.index || row.target != target || row.mode != view.mode {
             return Err(CounterFailure::Projection);
         }
         if let (Some(expected), Some(actual)) = (

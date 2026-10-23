@@ -4451,6 +4451,7 @@ enum SessionPreparation {
     SelectScope,
     LoadProgram(&'static str),
     LoadImagePrograms,
+    LoadCounterPrograms,
     FreezeDeferred(&'static str),
     PublishTailCalls,
     PrepareEventsDomain,
@@ -4460,6 +4461,7 @@ enum SessionPreparation {
 // preparation order used by startup; activation cannot bypass a preparation failure.
 fn prepare_session_with(
     object_has_unsafe: bool,
+    roots: StaticRoots,
     mut operation: impl FnMut(SessionPreparation) -> Result<()>,
 ) -> Result<()> {
     use SessionPreparation::*;
@@ -4484,6 +4486,9 @@ fn prepare_session_with(
         operation(LoadProgram(name))?;
     }
     operation(LoadImagePrograms)?;
+    if roots == StaticRoots::CounterBanks {
+        operation(LoadCounterPrograms)?;
+    }
     for (name, meta) in BASE_POLICY_MAPS {
         if defers_freeze_until_loaded(name, &meta) && name != TAIL_POLICY_MAP {
             operation(FreezeDeferred(name))?;
@@ -5075,7 +5080,7 @@ impl Session {
         let mut image_query = None;
         let mut prepared_instance = None;
         let mut prepared_owner_limit = None;
-        let preparation = prepare_session_with(object_has_unsafe, |step| {
+        let preparation = prepare_session_with(object_has_unsafe, roots, |step| {
             match step {
                 SessionPreparation::ValidatePolicy => {
                     validate_policy_maps(&ebpf, object_has_unsafe)
@@ -5229,6 +5234,12 @@ impl Session {
                         query_refusal,
                     ));
                 }
+                SessionPreparation::LoadCounterPrograms => {
+                    counter
+                        .as_ref()
+                        .context("counter preparation requires its selected profile")?
+                        .validate_and_load(&mut ebpf)?;
+                }
                 SessionPreparation::FreezeDeferred(name) => {
                     freeze_map(name, ebpf.map(name).with_context(|| format!("{name} map"))?)
                         .with_context(|| format!("freezing {name}"))?;
@@ -5253,9 +5264,6 @@ impl Session {
         // No producer has been attached yet. A selected attempt takes custody
         // of this complete owner before attaching its first lifecycle link.
         preparation?;
-        if let Some(counter) = &counter {
-            counter.validate_and_load(&mut ebpf)?;
-        }
         let events_domain = prepared_domain.expect("preparation established the events domain");
         let discovery_domain =
             prepared_discovery_domain.expect("preparation established the discovery domain");
@@ -9469,7 +9477,7 @@ mod tests {
             let image_loaded = std::cell::Cell::new(false);
             let deferred_frozen = std::cell::Cell::new(0);
             let activation_called = std::cell::Cell::new(false);
-            let preparation = prepare_session_with(unsafe_object, |step| {
+            let preparation = prepare_session_with(unsafe_object, StaticRoots::Detailed, |step| {
                 if step == SessionPreparation::LoadImagePrograms {
                     assert_eq!(deferred_frozen.get(), 0);
                     image_loaded.set(true);
@@ -9495,10 +9503,70 @@ mod tests {
     }
 
     #[test]
+    fn counter_program_load_precedes_deferred_freeze_and_activation() {
+        for roots in [StaticRoots::Detailed, StaticRoots::CounterBanks] {
+            for fail_counter in [false, true] {
+                let mut seen = Vec::new();
+                let mut activated = false;
+                let preparation = prepare_session_with(false, roots, |step| {
+                    if step == SessionPreparation::LoadCounterPrograms {
+                        anyhow::ensure!(
+                            !seen.iter().any(|step| matches!(
+                                step,
+                                SessionPreparation::FreezeDeferred(_)
+                                    | SessionPreparation::PublishTailCalls
+                            )),
+                            "counter roots must load before readonly policy freezes"
+                        );
+                    }
+                    seen.push(step);
+                    if fail_counter && step == SessionPreparation::LoadCounterPrograms {
+                        anyhow::bail!("injected counter root load failure");
+                    }
+                    Ok(())
+                });
+                let result = activate_after_preparation_with(preparation, || {
+                    activated = true;
+                    Ok(())
+                });
+                if roots == StaticRoots::CounterBanks {
+                    let load = seen
+                        .iter()
+                        .position(|step| *step == SessionPreparation::LoadCounterPrograms)
+                        .unwrap();
+                    assert_eq!(
+                        seen.iter()
+                            .filter(|step| { **step == SessionPreparation::LoadCounterPrograms })
+                            .count(),
+                        1
+                    );
+                    if fail_counter {
+                        assert!(result.is_err());
+                        assert!(!activated);
+                        assert_eq!(seen.last(), Some(&SessionPreparation::LoadCounterPrograms));
+                    } else {
+                        result.unwrap();
+                        assert!(activated);
+                        let freeze = seen
+                            .iter()
+                            .position(|step| matches!(step, SessionPreparation::FreezeDeferred(_)))
+                            .unwrap();
+                        assert!(load < freeze);
+                    }
+                } else {
+                    result.unwrap();
+                    assert!(activated);
+                    assert_eq!(seen, expected_preparation(false));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn preparation_contract_runs_every_phase_successfully() {
         for unsafe_object in [false, true] {
             let mut seen = Vec::new();
-            prepare_session_with(unsafe_object, |step| {
+            prepare_session_with(unsafe_object, StaticRoots::Detailed, |step| {
                 seen.push(step);
                 Ok(())
             })
@@ -9514,10 +9582,11 @@ mod tests {
             let mut preparation = Vec::new();
             let mut activation_calls = 0;
             let mut attach_calls = Vec::new();
-            let preparation_result = prepare_session_with(unsafe_object, |step| {
-                preparation.push(step);
-                Ok(())
-            });
+            let preparation_result =
+                prepare_session_with(unsafe_object, StaticRoots::Detailed, |step| {
+                    preparation.push(step);
+                    Ok(())
+                });
             let (events_domain, links) =
                 activate_after_preparation_with(preparation_result, || {
                     assert_eq!(preparation, expected);
@@ -9563,13 +9632,14 @@ mod tests {
                 let mut seen = Vec::new();
                 let mut activation_calls = 0;
                 let mut attach_calls = 0;
-                let preparation_result = prepare_session_with(unsafe_object, |step| {
-                    seen.push(step);
-                    if seen.len() == fail + 1 {
-                        return Err(Injected(fail).into());
-                    }
-                    Ok(())
-                });
+                let preparation_result =
+                    prepare_session_with(unsafe_object, StaticRoots::Detailed, |step| {
+                        seen.push(step);
+                        if seen.len() == fail + 1 {
+                            return Err(Injected(fail).into());
+                        }
+                        Ok(())
+                    });
                 let error = activate_after_preparation_with(preparation_result, || {
                     activation_calls += 1;
                     attach_lifecycle_with(
@@ -9604,7 +9674,8 @@ mod tests {
 
         for unsafe_object in [false, true] {
             let mut activation_calls = 0;
-            let preparation = prepare_session_with(unsafe_object, |_| Ok(()));
+            let preparation =
+                prepare_session_with(unsafe_object, StaticRoots::Detailed, |_| Ok(()));
             let result: Result<()> = activate_after_preparation_with(preparation, || {
                 activation_calls += 1;
                 Err(ActivationFailure.into())

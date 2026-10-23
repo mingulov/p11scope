@@ -1354,6 +1354,658 @@ mod tests {
         }
     }
 
+    // Format2 tests replace only native map/link/provider I/O. The existing
+    // production BankDirectory::stage_with remains the publication algorithm.
+    #[derive(Clone, Copy, Debug)]
+    enum GrowthDamage {
+        RouteId,
+        OuterId,
+        Provider,
+        EntrySide,
+        ReturnSide,
+        Unreadable,
+    }
+
+    #[derive(Default)]
+    struct GrowthIo<'a> {
+        pool: Option<&'a SemanticResourcePool>,
+        charged_before: usize,
+        cpus: usize,
+        trace: Vec<&'static str>,
+        maps: BTreeMap<u32, u32>,
+        outer: BTreeMap<u32, u32>,
+        routes: BTreeMap<u32, CountsBankRoute>,
+        commits: BTreeMap<u64, CountsBankCommit>,
+        providers: BTreeSet<u32>,
+        entries: BTreeSet<u32>,
+        returns: BTreeSet<u32>,
+        held: Vec<ResourceLease>,
+        checks: usize,
+        damage: Option<(usize, GrowthDamage)>,
+        commit_absent: bool,
+        commit_wrong: bool,
+        commit_unreadable: bool,
+        attempted: BTreeSet<u64>,
+    }
+
+    impl<'a> GrowthIo<'a> {
+        fn new(pool: &'a SemanticResourcePool) -> Self {
+            Self {
+                pool: Some(pool),
+                charged_before: pool.snapshot().charged_bytes,
+                cpus: 2,
+                ..Self::default()
+            }
+        }
+
+        fn next_stage(&mut self) {
+            self.trace.clear();
+            self.checks = 0;
+            self.charged_before = self.pool.unwrap().snapshot().charged_bytes;
+        }
+
+        fn require_precharge(&self) {
+            assert!(
+                self.pool.unwrap().snapshot().charged_bytes > self.charged_before,
+                "actual reservation must precede native reads/mutation"
+            );
+        }
+    }
+
+    impl BankIo for GrowthIo<'_> {
+        fn possible_cpus(&self) -> usize {
+            self.cpus
+        }
+
+        fn validate_targets(&mut self, _: &[Slot], published: &[u32]) -> Result<(), BankRefusal> {
+            self.require_precharge();
+            self.trace.push("validate");
+            assert!(published.iter().all(|slot| self.routes.contains_key(slot)));
+            Ok(())
+        }
+
+        fn retain_charge(&mut self, charge: ResourceLease) {
+            self.held.push(charge);
+        }
+
+        fn allocate_bank(&mut self, bank: u32) -> Result<u32, BankRefusal> {
+            self.require_precharge();
+            self.trace.push("allocate");
+            assert!(bank < 16 && !self.maps.contains_key(&bank));
+            let id = 101 + bank;
+            self.maps.insert(bank, id);
+            Ok(id)
+        }
+
+        fn insert_inner(&mut self, bank: u32, expected_id: u32) -> Result<(), BankRefusal> {
+            self.trace.push("inner");
+            assert_eq!(self.maps.get(&bank), Some(&expected_id));
+            assert!(self.outer.insert(bank, expected_id).is_none());
+            Ok(())
+        }
+
+        fn insert_route(&mut self, slot: u32, route: CountsBankRoute) -> Result<(), BankRefusal> {
+            self.trace.push("route");
+            assert!(self.routes.insert(slot, route).is_none());
+            self.providers.insert(slot);
+            Ok(())
+        }
+
+        fn attach_inactive(&mut self, slots: &[Slot]) -> Result<(), BankRefusal> {
+            assert!(slots.iter().all(|slot| {
+                !self
+                    .commits
+                    .contains_key(&self.routes[&slot.index].transaction)
+            }));
+            self.trace.push("return");
+            self.returns.extend(slots.iter().map(|slot| slot.index));
+            self.trace.push("entry");
+            self.entries.extend(slots.iter().map(|slot| slot.index));
+            Ok(())
+        }
+
+        fn verify_candidate(&mut self, expected: &StagedExtent) -> CandidateCheck {
+            self.trace.push("verify");
+            self.checks += 1;
+            if let Some((at, damage)) = self.damage
+                && at == self.checks
+            {
+                let (slot, route) = *expected.routes.last().unwrap();
+                match damage {
+                    GrowthDamage::RouteId => self.routes.get_mut(&slot).unwrap().inner_id = 999,
+                    GrowthDamage::OuterId => {
+                        self.outer.insert(route.bank, 999);
+                    }
+                    GrowthDamage::Provider => {
+                        self.providers.remove(&slot);
+                    }
+                    GrowthDamage::EntrySide => {
+                        self.entries.remove(&slot);
+                    }
+                    GrowthDamage::ReturnSide => {
+                        self.returns.remove(&slot);
+                    }
+                    GrowthDamage::Unreadable => return CandidateCheck::Unreadable,
+                }
+            }
+            for (slot, route) in &expected.routes {
+                if self.routes.get(slot) != Some(route)
+                    || self.maps.get(&route.bank) != Some(&route.inner_id)
+                    || self.outer.get(&route.bank) != Some(&route.inner_id)
+                    || !expected.bank_ids.contains(&(route.bank, route.inner_id))
+                    || !self.providers.contains(slot)
+                    || !self.entries.contains(slot)
+                    || !self.returns.contains(slot)
+                {
+                    return CandidateCheck::Contradictory;
+                }
+            }
+            CandidateCheck::Exact
+        }
+
+        fn insert_commit(
+            &mut self,
+            transaction: u64,
+            commit: CountsBankCommit,
+        ) -> Result<(), BankRefusal> {
+            self.trace.push("commit");
+            self.attempted.insert(transaction);
+            if self.commit_absent {
+                return Err(BankRefusal::Commit);
+            }
+            let stored = if self.commit_wrong {
+                CountsBankCommit {
+                    configuration: commit.configuration ^ 1,
+                    ..commit
+                }
+            } else {
+                commit
+            };
+            assert!(self.commits.insert(transaction, stored).is_none());
+            Ok(())
+        }
+
+        fn observe_commit(
+            &mut self,
+            transaction: u64,
+            expected: CountsBankCommit,
+        ) -> CommitObservation {
+            self.trace.push("observe");
+            if self.commit_unreadable && self.attempted.contains(&transaction) {
+                return CommitObservation::Unreadable;
+            }
+            match self.commits.get(&transaction) {
+                None => CommitObservation::Absent,
+                Some(actual) if *actual == expected => CommitObservation::Exact,
+                Some(_) => CommitObservation::Contradictory,
+            }
+        }
+
+        fn remove_route_owned(
+            &mut self,
+            slot: u32,
+            expected: CountsBankRoute,
+        ) -> Result<(), BankRefusal> {
+            self.trace.push("remove-route");
+            assert_eq!(self.routes.remove(&slot), Some(expected));
+            self.providers.remove(&slot);
+            Ok(())
+        }
+
+        fn remove_new_bank_owned(
+            &mut self,
+            bank: u32,
+            expected_id: u32,
+        ) -> Result<(), BankRefusal> {
+            self.trace.push("remove-bank");
+            assert_eq!(self.outer.remove(&bank), Some(expected_id));
+            assert_eq!(self.maps.remove(&bank), Some(expected_id));
+            Ok(())
+        }
+
+        fn retire_links(&mut self, slots: &[Slot]) -> Result<(), BankRefusal> {
+            self.trace.push("retire-entry");
+            for slot in slots {
+                self.entries.remove(&slot.index);
+            }
+            self.trace.push("retire-return");
+            for slot in slots {
+                self.returns.remove(&slot.index);
+            }
+            Ok(())
+        }
+    }
+
+    fn growth_reservation() -> BankReservation {
+        BankReservation {
+            retained_bytes: 1024 * 1024,
+            transient_bytes: 2 * 1024 * 1024,
+            metadata_bytes: 64 * 1024,
+            file_descriptors: 128,
+        }
+    }
+
+    #[test]
+    fn scaled_counts_geometry_and_record_layouts_are_checked() {
+        use std::mem::{offset_of, size_of};
+        assert_eq!(size_of::<CountsBankRoute>(), 32);
+        assert_eq!(size_of::<CountsBankCommit>(), 16);
+        assert_eq!(
+            (
+                offset_of!(CountsBankRoute, transaction),
+                offset_of!(CountsBankRoute, first),
+                offset_of!(CountsBankRoute, end),
+                offset_of!(CountsBankRoute, bank),
+                offset_of!(CountsBankRoute, cell),
+                offset_of!(CountsBankRoute, inner_id),
+                offset_of!(CountsBankRoute, reserved_zero)
+            ),
+            (0, 8, 12, 16, 20, 24, 28)
+        );
+        assert_eq!(
+            (
+                offset_of!(CountsBankCommit, first),
+                offset_of!(CountsBankCommit, end),
+                offset_of!(CountsBankCommit, configuration)
+            ),
+            (0, 4, 8)
+        );
+        let geometry = CountsBankGeometry::checked(16, 512).unwrap();
+        for (slot, wanted) in [
+            (0, (0, 0)),
+            (511, (0, 511)),
+            (512, (1, 0)),
+            (8191, (15, 511)),
+        ] {
+            assert_eq!(geometry.locate(slot), Ok(wanted));
+        }
+        assert!(geometry.locate(8192).is_err());
+        assert_eq!(geometry.bank_payload_bytes(2), Ok(24_576));
+        assert!(geometry.bank_payload_bytes(0).is_err());
+        assert!(geometry.bank_payload_bytes(usize::MAX).is_err());
+        for (banks, cells) in [
+            (0, 512),
+            (16, 0),
+            (2, 1),
+            (17, 512),
+            (16, 513),
+            (u32::MAX, u32::MAX),
+        ] {
+            assert!(CountsBankGeometry::checked(banks, cells).is_err());
+        }
+        let commit = CountsBankCommit {
+            first: 511,
+            end: 513,
+            configuration: 0x0200_0018_0010_0200,
+        };
+        let routes = vec![
+            (
+                511,
+                CountsBankRoute {
+                    transaction: 1,
+                    first: 511,
+                    end: 513,
+                    bank: 0,
+                    cell: 511,
+                    inner_id: 101,
+                    reserved_zero: 0,
+                },
+            ),
+            (
+                512,
+                CountsBankRoute {
+                    transaction: 1,
+                    first: 511,
+                    end: 513,
+                    bank: 1,
+                    cell: 0,
+                    inner_id: 102,
+                    reserved_zero: 0,
+                },
+            ),
+        ];
+        let ids = vec![(0, 101), (1, 102)];
+        assert!(
+            StagedExtent::checked(
+                NonZeroU64::new(1).unwrap(),
+                commit,
+                routes.clone(),
+                ids.clone()
+            )
+            .is_ok()
+        );
+        let mut wrong_bank_id = routes.clone();
+        wrong_bank_id[0].1.inner_id = 102; // Real dependency, but for the OTHER bank.
+        assert!(
+            StagedExtent::checked(
+                NonZeroU64::new(1).unwrap(),
+                commit,
+                wrong_bank_id,
+                ids.clone()
+            )
+            .is_err()
+        );
+        for damage in 0..5 {
+            let mut changed = routes.clone();
+            match damage {
+                0 => changed[0].1.reserved_zero = 1,
+                1 => changed[0].1.cell = 512,
+                2 => changed[0].1.bank = 16,
+                3 => changed[0].1.transaction = 0,
+                _ => {
+                    changed.remove(0);
+                }
+            }
+            assert!(
+                StagedExtent::checked(NonZeroU64::new(1).unwrap(), commit, changed, ids.clone())
+                    .is_err()
+            );
+        }
+        let legacy = CountsBankCommit {
+            configuration: BANK_CONFIG,
+            ..commit
+        };
+        assert!(StagedExtent::checked(NonZeroU64::new(1).unwrap(), legacy, routes, ids).is_err());
+    }
+
+    #[test]
+    fn partial_bank_extent_stays_inactive_until_complete_ack() {
+        let pool = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
+        let mut directory = BankDirectory::counts_growth_v2();
+        let mut io = GrowthIo::new(&pool);
+        assert!(matches!(
+            directory.stage_with(&mut io, &plan(1), growth_reservation(), &pool.reserver()),
+            BankPublication::Published { .. }
+        ));
+        let old = io.routes[&0];
+        io.next_stage();
+        assert!(matches!(
+            directory.stage_with(&mut io, &plan(2), growth_reservation(), &pool.reserver()),
+            BankPublication::Published { .. }
+        ));
+        assert_eq!(io.maps, BTreeMap::from([(0, 101)]));
+        assert!(
+            !io.trace.contains(&"allocate"),
+            "a partial bank is shared, never replaced"
+        );
+        assert_eq!(io.routes[&0], old);
+        assert_eq!(
+            (
+                io.routes[&1].bank,
+                io.routes[&1].cell,
+                io.routes[&1].inner_id
+            ),
+            (0, 1, 101)
+        );
+        let checks: Vec<_> = io
+            .trace
+            .iter()
+            .enumerate()
+            .filter(|(_, step)| **step == "verify")
+            .map(|(at, _)| at)
+            .collect();
+        let commit = io.trace.iter().position(|step| *step == "commit").unwrap();
+        assert_eq!(checks.len(), 2);
+        assert!(checks[0] < commit && commit < checks[1]);
+        assert_eq!(directory.published_indices().collect::<Vec<_>>(), [0, 1]);
+        for at in [1, 2] {
+            for damage in [
+                GrowthDamage::RouteId,
+                GrowthDamage::OuterId,
+                GrowthDamage::Provider,
+                GrowthDamage::EntrySide,
+                GrowthDamage::ReturnSide,
+                GrowthDamage::Unreadable,
+            ] {
+                let mut directory = BankDirectory::counts_growth_v2();
+                let mut io = GrowthIo::new(&pool);
+                assert!(matches!(
+                    directory.stage_with(&mut io, &plan(1), growth_reservation(), &pool.reserver()),
+                    BankPublication::Published { .. }
+                ));
+                let old = io.routes[&0];
+                io.next_stage();
+                io.damage = Some((at, damage));
+                assert!(
+                    matches!(
+                        directory.stage_with(
+                            &mut io,
+                            &plan(2),
+                            growth_reservation(),
+                            &pool.reserver()
+                        ),
+                        BankPublication::Quarantined { .. }
+                    ),
+                    "check {at}: {damage:?}"
+                );
+                assert_eq!(io.routes[&0], old);
+                assert_eq!(io.maps[&0], 101);
+                assert!(!io.trace.contains(&"remove-route") && !io.trace.contains(&"remove-bank"));
+                assert_eq!(
+                    io.trace.contains(&"commit"),
+                    at == 2,
+                    "bad precommit read must prevent activation"
+                );
+                assert!(!io.held.is_empty());
+                assert_eq!(
+                    directory.validate_read_plan(&plan(2)),
+                    Err(BankRefusal::Quarantined)
+                );
+            }
+        }
+        for unreadable in [false, true] {
+            let mut directory = BankDirectory::counts_growth_v2();
+            let mut io = GrowthIo::new(&pool);
+            assert!(matches!(
+                directory.stage_with(&mut io, &plan(1), growth_reservation(), &pool.reserver()),
+                BankPublication::Published { .. }
+            ));
+            io.next_stage();
+            io.commit_unreadable = unreadable;
+            io.commit_wrong = !unreadable;
+            assert!(matches!(
+                directory.stage_with(&mut io, &plan(2), growth_reservation(), &pool.reserver()),
+                BankPublication::Quarantined { .. }
+            ));
+            assert_eq!(io.routes.len(), 2);
+            assert_eq!(io.maps[&0], 101);
+            assert!(!io.trace.contains(&"remove-route") && !io.trace.contains(&"remove-bank"));
+            assert!(!io.held.is_empty());
+        }
+    }
+
+    #[test]
+    fn consumed_rollback_holes_preserve_historical_positions() {
+        let pool = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
+        let mut directory = BankDirectory::counts_growth_v2();
+        let mut io = GrowthIo::new(&pool);
+        let mut history = plan(1);
+        assert!(matches!(
+            directory.stage_with(&mut io, &history, growth_reservation(), &pool.reserver()),
+            BankPublication::Published { .. }
+        ));
+        let old = io.routes[&0];
+        history.extend_exact(plan(2)).unwrap();
+        io.next_stage();
+        io.commit_absent = true;
+        assert!(matches!(
+            directory.stage_with(&mut io, &history, growth_reservation(), &pool.reserver()),
+            BankPublication::RolledBack { .. }
+        ));
+        assert_eq!(directory.allocated_high_water(), 2);
+        assert_eq!(io.routes.keys().copied().collect::<Vec<_>>(), [0]);
+        assert!(
+            !io.trace.contains(&"remove-bank"),
+            "rollback must preserve the shared old bank"
+        );
+        io.next_stage();
+        assert!(matches!(
+            directory.stage_with(&mut io, &history, growth_reservation(), &pool.reserver()),
+            BankPublication::Refused(BankRefusal::Allocated)
+        ));
+        assert!(io.trace.is_empty());
+        history.deactivate(1);
+        history.extend_exact(plan(2)).unwrap();
+        assert_eq!(
+            history
+                .slots
+                .iter()
+                .map(|slot| slot.index)
+                .collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+        assert!(!history.is_active(1) && history.is_active(2));
+        assert_eq!(physical(&history.slots[1]), physical(&history.slots[2]));
+        io.next_stage();
+        io.commit_absent = false;
+        assert!(matches!(
+            directory.stage_with(&mut io, &history, growth_reservation(), &pool.reserver()),
+            BankPublication::Published { .. }
+        ));
+        assert_eq!(directory.allocated_high_water(), 3);
+        assert_eq!(directory.published_indices().collect::<Vec<_>>(), [0, 2]);
+        assert_eq!(io.routes.keys().copied().collect::<Vec<_>>(), [0, 2]);
+        assert_eq!(io.routes[&0], old);
+        assert_eq!((io.routes[&2].bank, io.routes[&2].cell), (0, 2));
+        // Directory high-water only: no plan floor or tail helper is exercised.
+    }
+
+    #[test]
+    fn scaled_charge_refusal_precedes_every_native_operation() {
+        let mut failures = Vec::new();
+        for case in 0..7 {
+            let mut bad = growth_reservation();
+            match case {
+                0 => bad.retained_bytes = 48, // One cell at two CPUs, not a full512-cell bank.
+                1 => bad.transient_bytes = 1,
+                2 => bad.metadata_bytes = 0,
+                3 => bad.file_descriptors = 1,
+                4 => bad.retained_bytes = usize::MAX,
+                5 => bad.metadata_bytes = usize::MAX,
+                _ => bad.file_descriptors = 0,
+            }
+            failures.push((2, bad));
+        }
+        failures.extend([
+            (0, growth_reservation()),
+            (usize::MAX, growth_reservation()),
+        ]);
+        for (cpus, bad) in failures {
+            let pool = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
+            let mut directory = BankDirectory::counts_growth_v2();
+            let mut io = GrowthIo::new(&pool);
+            io.cpus = cpus;
+            let charged = pool.snapshot().charged_bytes;
+            assert!(matches!(
+                directory.stage_with(&mut io, &plan(1), bad, &pool.reserver()),
+                BankPublication::Refused(BankRefusal::Budget | BankRefusal::Topology)
+            ));
+            assert!(io.trace.is_empty() && io.maps.is_empty() && io.routes.is_empty());
+            assert_eq!(pool.snapshot().charged_bytes, charged);
+            assert_eq!(directory.allocated_high_water(), 0);
+        }
+        // At1024 possible CPUs a whole bank needs12,582,912 payload bytes.
+        // The one-cell amount is only24,576: metadata and FD headroom are
+        // deliberately ample, so forgetting the other511 cells is causal.
+        let geometry = CountsBankGeometry::checked(16, 512).unwrap();
+        assert_eq!(geometry.bank_payload_bytes(1024), Ok(12_582_912));
+        for enough in [false, true] {
+            let pool = SemanticResourcePool::reference_limit(128 * 1024 * 1024);
+            let mut directory = BankDirectory::counts_growth_v2();
+            let mut io = GrowthIo::new(&pool);
+            io.cpus = 1024;
+            let envelope = BankReservation {
+                retained_bytes: if enough {
+                    32 * 1024 * 1024
+                } else {
+                    1024 * 1024
+                },
+                transient_bytes: 8 * 1024 * 1024,
+                metadata_bytes: 1024 * 1024,
+                file_descriptors: 65_536,
+            };
+            let result = directory.stage_with(&mut io, &plan(1), envelope, &pool.reserver());
+            if enough {
+                assert!(matches!(result, BankPublication::Published { .. }));
+                assert_eq!(io.maps.len(), 1);
+            } else {
+                assert_eq!(result, BankPublication::Refused(BankRefusal::Budget));
+                assert!(io.trace.is_empty() && io.maps.is_empty());
+            }
+        }
+        let pool = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
+        let mut directory = BankDirectory::counts_growth_v2();
+        let mut io = GrowthIo::new(&pool);
+        assert!(matches!(
+            directory.stage_with(&mut io, &plan(1), growth_reservation(), &pool.reserver()),
+            BankPublication::Published { .. }
+        ));
+        let old = io.routes[&0];
+        let charged = pool.snapshot().charged_bytes;
+        io.next_stage();
+        let refused = SemanticResourcePool::reference_limit(SEMANTIC_TRANSITION_SCRATCH);
+        assert_eq!(
+            directory.stage_with(&mut io, &plan(2), growth_reservation(), &refused.reserver()),
+            BankPublication::Refused(BankRefusal::Budget)
+        );
+        assert!(io.trace.is_empty());
+        assert_eq!(io.routes[&0], old);
+        assert_eq!(pool.snapshot().charged_bytes, charged);
+        assert_eq!(directory.published_indices().collect::<Vec<_>>(), [0]);
+    }
+
+    #[test]
+    fn full_width_transaction_commit_rejects_high32_alias() {
+        let high = 0x1_0000_0007;
+        let commit = CountsBankCommit {
+            first: 0,
+            end: 1,
+            configuration: 0x0200_0018_0010_0200,
+        };
+        let route = CountsBankRoute {
+            transaction: 7,
+            first: 0,
+            end: 1,
+            bank: 0,
+            cell: 0,
+            inner_id: 101,
+            reserved_zero: 0,
+        };
+        assert!(
+            StagedExtent::checked(
+                NonZeroU64::new(high).unwrap(),
+                commit,
+                vec![(0, route)],
+                vec![(0, 101)]
+            )
+            .is_err()
+        );
+        for missing_high in [false, true] {
+            let pool = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
+            let mut directory = BankDirectory::counts_growth_v2();
+            directory.next_transaction = NonZeroU64::new(high);
+            let mut io = GrowthIo::new(&pool);
+            io.commits.insert(7, commit);
+            io.commit_absent = missing_high;
+            let publication =
+                directory.stage_with(&mut io, &plan(1), growth_reservation(), &pool.reserver());
+            assert_eq!(io.commits[&7], commit);
+            if missing_high {
+                assert!(matches!(publication, BankPublication::RolledBack { .. }));
+                assert!(io.routes.is_empty() && io.maps.is_empty());
+                assert!(!io.commits.contains_key(&high));
+                assert!(directory.published_indices().next().is_none());
+            } else {
+                assert!(
+                    matches!(publication, BankPublication::Published { transaction, .. } if transaction == high)
+                );
+                assert_eq!(io.routes[&0].transaction, high);
+                assert_eq!(io.commits[&high], commit);
+                assert_eq!(directory.published_indices().collect::<Vec<_>>(), [0]);
+            }
+        }
+    }
+
     #[test]
     fn fixed_counter_roots_resolve_abis_then_attach_returns_before_entries() {
         use crate::attach::{

@@ -1203,6 +1203,25 @@ side-local evidence references, population multiplicity and interpretation.
 
 ## Privileges, per environment
 
+Root UID is not an unconditional requirement: the observer can run under an
+ordinary UID with file capabilities. The capture permissions have separate
+roles, and the exact set depends on the target, attach backend and host policy:
+
+| Capability | Capture operation |
+| --- | --- |
+| `CAP_BPF` + `CAP_PERFMON` | Load BPF and attach probes where host policy permits this narrower set. |
+| `CAP_SYS_PTRACE` | Read a target's memory when ptrace/Yama or cross-UID checks require it. |
+| `CAP_DAC_READ_SEARCH` | Open provider files or traverse target paths otherwise unreadable to the observer. |
+| `CAP_CHECKPOINT_RESTORE` or `CAP_SYS_ADMIN` | Follow target `map_files` for Inventory's past-scan-cap identity proof. |
+| `CAP_SYS_ADMIN` | Current self-probe/live-discovery perf-event paths on restrictive `perf_event_paranoid >= 3` hosts; also covers the BPF/perf checks. |
+
+This is a conditional roles list, not one portable minimum or a reason to grant
+all listed capabilities. Offline processing needs no BPF privileges. Capabilities
+only inside a child user namespace do not satisfy host BPF/perf checks; seccomp,
+LSM and lockdown policy can still refuse a privileged observer. Run
+`p11scope doctor --pid <pid>` as the intended observer identity against the actual
+target. The measured matrices and command-specific limitations follow below.
+
 `doctor` reports one finite availability tier for the requested host and
 target. The tier is preflight evidence, not capture authority or a completeness
 promise. With no `--pid`, target readability is explicitly `unassessed`.

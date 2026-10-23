@@ -222,7 +222,9 @@ support and falls back to per-probe links elsewhere. With multi active,
 at paranoid ≥ 3 (live discovery, uretprobe self-probe) needs `CAP_SYS_ADMIN`,
 and on the per-probe `perf_event` path a restrictive paranoid needs
 `CAP_SYS_ADMIN` too
-([measured matrix](docs/usage.md#privileges-per-environment)). The full set is:
+([roles and measured matrix](docs/usage.md#privileges-per-environment)). A broad
+compatibility set is shown below. This is not a minimal set: `CAP_SYS_ADMIN`
+already covers the BPF/perf permission checks.
 
 ```sh
 sudo setcap 'cap_sys_admin,cap_bpf,cap_perfmon,cap_sys_ptrace,cap_dac_read_search+ep' \

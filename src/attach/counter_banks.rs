@@ -5526,6 +5526,78 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[ignore = "requires the explicitly selected format2 artifact; parses only, no native load"]
+    fn format2_preparation_charges_custody_and_payload_together() {
+        assert_eq!(env!("P11SCOPE_COUNTER_BANK_PROOF_ENABLED"), "1");
+        assert_eq!(
+            env!("P11SCOPE_COUNTER_BANK_PROOF_OUTPUTS"),
+            "counts-bank-growth-v2"
+        );
+        let bytes = std::fs::read(
+            std::path::Path::new(env!("OUT_DIR"))
+                .join("counter-bank-growth-v2/p11scope-ebpf-counts-bank-growth-v2"),
+        )
+        .unwrap();
+        let parsed = aya_obj::Object::parse(&bytes).unwrap();
+        let cpus = aya::util::nr_cpus().unwrap();
+        let payload = parsed
+            .maps
+            .values()
+            .try_fold(0usize, |total, map| {
+                total.checked_add(configured_payload(map, cpus)?)
+            })
+            .unwrap();
+        let old_floor = payload
+            + size_of::<CounterBanks>()
+            + size_of::<CounterKeepalive>()
+            + size_of::<Session>()
+            + 16 * OWNED_ALLOCATION_PADDING;
+        // This actual object needs 8192 provider holders AND 8192 consumed
+        // extent leases, alongside every configured map. The old floor already
+        // includes CounterKeepalive inline; count only its backing/Arc here.
+        let combined_floor = old_floor
+            + 8192 * (size_of::<Option<RetainedInventoryTarget>>() + size_of::<ResourceLease>())
+            + 2 * size_of::<usize>()
+            + 3 * OWNED_ALLOCATION_PADDING;
+        let transient = bytes.len().checked_mul(32).unwrap();
+        drop(parsed);
+        for (one_short, healthy) in [(0, true), (1, false)] {
+            let pool = SemanticResourcePool::reference_limit(4 * 1024 * 1024 * 1024);
+            let baseline = pool.snapshot().charged_bytes;
+            let envelope = BankReservation {
+                retained_bytes: combined_floor - 1 - one_short,
+                transient_bytes: transient,
+                metadata_bytes: 1,
+                file_descriptors: 1_048_576,
+            };
+            assert!(
+                envelope.retained_bytes >= old_floor,
+                "both twins satisfy the old payload-only minimum"
+            );
+            let preparation = CounterPreparation::new(&bytes, envelope, &pool.reserver());
+            if healthy {
+                assert!(
+                    preparation.is_ok(),
+                    "exact combined fit: {:?}",
+                    preparation.as_ref().err()
+                );
+                assert_eq!(
+                    pool.snapshot().charged_bytes,
+                    baseline + combined_floor + transient
+                );
+            } else {
+                assert!(
+                    preparation.is_err(),
+                    "one byte short cannot independently spend one charge on maps and custody"
+                );
+                assert_eq!(pool.snapshot().charged_bytes, baseline);
+            }
+            drop(preparation);
+            assert_eq!(pool.snapshot().charged_bytes, baseline);
+        }
+    }
+
+    #[test]
     fn format2_link_stage_requires_exact_extent() {
         let pool = SemanticResourcePool::reference_limit(4 * 1024 * 1024);
         let mut banks = reader_banks(&pool);

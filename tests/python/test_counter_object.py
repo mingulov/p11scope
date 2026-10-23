@@ -360,6 +360,75 @@ class CounterObjectCliTests(unittest.TestCase):
         self.assertEqual(lookup(vm.handles["COUNTER_BANK_COMMIT"], (7).to_bytes(8, "little")), low_address)
         self.assertNotEqual(low_address, high_address)
 
+    def test_growth_precomputed_bank_key_requires_all_unsigned_guards_and_defs(self):
+        checker = runpy.run_path(str(CHECKER), run_name="counter_growth_guarded_spill_test")
+        key = (1, 0)
+
+        class Graph:
+            def __init__(self):
+                self.instructions = {key: {
+                    0: (0x61, 0x08, 12, 0), 1: (0x61, 0xa3, -4, 0),
+                    2: (0xbf, 0x32, 0, 0), 3: (0x77, 2, 0, 9),
+                    4: (0x63, 0x2a, -8, 0), 5: (0xbf, 0, 0, 0),
+                    6: (0x25, 8, 6, 8192), 7: (0x3d, 0x83, 5, 0),
+                    8: (0x61, 3, 16, 0), 9: (0x5d, 0x23, 3, 0),
+                    10: (0xbf, 0, 0, 0), 11: (0x85, 0, 0, 1),
+                    12: (0x95, 0, 0, 0), 13: (0x95, 0, 0, 0),
+                }}
+                self.calls = {(key, 11): ("helper", 1)}
+
+        def lookup(graph):
+            proof = checker["BankFootprint"](graph, {"COUNTER_BANKS": {"value_size": 4}},
+                                               native_bound=8192, growth=True)
+            proof.touches.update({
+                (key, 0, "COUNTER_BANK_META", "read", (12, 12), 4, None),
+                (key, 8, "COUNTER_BANK_META", "read", (16, 16), 4, None),
+            })
+            registers = [None] * 11
+            frame = (key, 0)
+            registers[1], registers[2] = ("map", "COUNTER_BANKS"), ("stack", frame, -8)
+            proof.helper(1, registers, {(frame, -8, 4): checker["scalar"](0, 8388607)}, key, 11)
+            self.assertEqual(registers[0][:4], ("ptr", "COUNTER_BANKS", 0, 0))
+            self.assertEqual(proof.bank_key_proofs[key, 11, -8], (4, 6, 7, 9))
+
+        lookup(Graph())
+        narrow = Graph()
+        for pc in (6, 7, 9):
+            op, encoded, offset, immediate = narrow.instructions[key][pc]
+            narrow.instructions[key][pc] = (op + 1, encoded, offset, immediate)
+        lookup(narrow)  # both operands are genuine zero-extended words
+        after_guard = Graph()
+        after_guard.instructions[key][10] = (0x85, 0, 0, 1)
+        after_guard.calls[key, 10] = ("helper", 1)
+        lookup(after_guard)  # committed-map lookup cannot write the saved key
+        damages = {
+            "missing_end_bound": (6, (0xbf, 0, 0, 0)),
+            "missing_slot_less_end": (7, (0xbf, 0, 0, 0)),
+            "missing_bank_equality": (9, (0xbf, 0, 0, 0)),
+            "wrong_bank_operand": (9, (0x5d, 0x43, 3, 0)),
+            "wrong_shift": (3, (0x77, 2, 0, 8)),
+            "high32_alias_slot": (1, (0x79, 0xa3, -4, 0)),
+            "signed_comparison": (7, (0x7d, 0x83, 5, 0)),
+            "failed_guard_reaches_lookup": (6, (0x25, 8, 4, 8192)),
+            "end_guard_has_identical_edges": (6, (0x25, 8, 0, 8192)),
+            "less_guard_has_identical_edges": (7, (0x3d, 0x83, 0, 0)),
+            "bank_guard_has_identical_edges": (9, (0x5d, 0x23, 0, 0)),
+            "clobbered_slot": (5, (0xb7, 3, 0, 1)),
+            "overwritten_spill": (10, (0x63, 0x9a, -8, 0)),
+            "unknown_writing_call": (10, (0x85, 0x10, 0, 1)),
+            "caller_saved_before_guard": (5, (0x85, 0, 0, 1)),
+            "cyclic_slot_redefinition": (5, (0x55, 9, -5, 0)),
+            "changed_frame_pointer": (5, (0x07, 10, 0, 4)),
+        }
+        for label, (pc, replacement) in damages.items():
+            with self.subTest(label=label):
+                graph = Graph()
+                graph.instructions[key][pc] = replacement
+                if replacement[0] == 0x85:
+                    graph.calls[key, pc] = ("helper", 1) if pc == 5 else ("function", (1, 1))
+                with self.assertRaisesRegex(RuntimeError, "guarded|bounded"):
+                    lookup(graph)
+
     def test_bank_instruction_execution_preserves_existing_sticky_fault_bits(self):
         checker = runpy.run_path(str(CHECKER), run_name="counter_bank_vm_test")
 

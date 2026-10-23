@@ -1392,12 +1392,178 @@ def causal_mutants(body, mode):
             "transfer_controls": controls}
 
 
+def bank_guarded_outer_key(graph, key, call_pc, key_offset, touches):
+    """Prove the emitted pre-guard slot>>9 spill on EVERY route to lookup.
+
+    This is the finite unsigned route lowering, not a range assumption from
+    a function name or map capacity. Unknown writes/calls/aliases refuse.
+    """
+    instructions = graph.instructions[key]
+    pcs = sorted(instructions)
+
+    def successors(pc):
+        op, _, offset, immediate = instructions[pc]
+        if op == 0x95:
+            return ()
+        if op == 0x18:
+            return (pc + 2,)
+        if op & 7 in (5, 6) and op != 0x85:
+            target = pc + 1 + (immediate if op == 0x06 else offset)
+            return (target,) if not op & 0xf0 else (pc + 1, target)
+        return (pc + 1,)
+
+    reach_cache = {}
+
+    def reaches(start, end, cut_node=None, cut_edge=None):
+        cache_key = start, end, cut_node, cut_edge
+        if cache_key in reach_cache:
+            return reach_cache[cache_key]
+        pending, seen = [start], set()
+        while pending:
+            at = pending.pop()
+            if at == cut_node or at in seen or at not in instructions:
+                continue
+            if at == end:
+                reach_cache[cache_key] = True
+                return True
+            seen.add(at)
+            pending.extend(after for after in successors(at) if (at, after) != cut_edge)
+        reach_cache[cache_key] = False
+        return False
+
+    def dominates(node, at):
+        return reaches(0, at) and not reaches(0, at, cut_node=node)
+
+    def required_edge(at, after):
+        edges = successors(at)
+        return (len(edges) == 2 and len(set(edges)) == 2 and after in edges
+                and reaches(0, call_pc) and not reaches(0, call_pc, cut_edge=(at, after)))
+
+    def between(before, after, at):
+        return at not in (before, after) and any(reaches(start, at) for start in successors(before)) and reaches(at, after)
+
+    def writes_register(instruction, register):
+        op, encoded, _, immediate = instruction
+        dst, src = encoded & 15, encoded >> 4
+        if op == 0x85:
+            return register <= 5
+        if op == 0x18 or op & 7 in (1, 4, 7):
+            return dst == register
+        if op & 7 == 3 and op & 0xe0 == 0xc0:
+            return register == 0 if immediate == 0xf1 else bool(immediate & 1 and register == src)
+        return False
+
+    def stable(register, before, after):
+        return not any(writes_register(instruction, register) and between(before, after, at)
+                       for at, instruction in instructions.items())
+
+    def word_definition(register, at, meta_offset=None):
+        found = []
+        for pc, instruction in instructions.items():
+            if instruction[0] != 0x61 or instruction[1] & 15 != register:
+                continue
+            if meta_offset is not None and not any(
+                    touch[:2] == (key, pc) and touch[2:6] == (
+                        "COUNTER_BANK_META", "read", (meta_offset, meta_offset), 4)
+                    for touch in touches):
+                continue
+            if dominates(pc, at) and stable(register, pc, at):
+                found.append(pc)
+        return found[0] if len(found) == 1 else None
+
+    # A single static definition cannot stand for different loop iterations.
+    # Counter update loops after lookup are outside this prefix and unaffected.
+    prefix = {at for at in pcs if reaches(0, at) and reaches(at, call_pc)}
+    indegree = {at: 0 for at in prefix}
+    for at in prefix:
+        for after in successors(at):
+            if after in prefix:
+                indegree[after] += 1
+    ready = [at for at, degree in indegree.items() if degree == 0]
+    visited = 0
+    while ready:
+        at = ready.pop()
+        visited += 1
+        for after in successors(at):
+            if after in prefix:
+                indegree[after] -= 1
+                if indegree[after] == 0:
+                    ready.append(after)
+    if visited != len(prefix) or any(writes_register(instructions[at], 10) for at in prefix):
+        return None
+
+    for at in pcs:
+        op, encoded, offset, _ = instructions[at]
+        if op != 0x63 or encoded & 15 != 10 or offset != key_offset or not dominates(at, call_pc):
+            continue
+        position = pcs.index(at)
+        if position < 2:
+            continue
+        move_pc, shift_pc = pcs[position - 2:position]
+        move, shift = instructions[move_pc], instructions[shift_pc]
+        bank = encoded >> 4
+        if (move[0] not in (0xbf, 0xbc) or move[1] & 15 != bank or move[2:] != (0, 0)
+                or shift not in ((0x77, bank, 0, 9), (0x74, bank, 0, 9))
+                or not dominates(move_pc, at) or not dominates(shift_pc, at)):
+            continue
+        slot = move[1] >> 4
+        slot_definition = word_definition(slot, move_pc)
+        if slot == bank or slot_definition is None:
+            continue
+        safe_spill = True
+        for pc, instruction in instructions.items():
+            if not between(at, call_pc, pc):
+                continue
+            op, registers, offset, _ = instruction
+            if op == 0x85 and graph.calls.get((key, pc)) != ("helper", 1):
+                safe_spill = False
+            if op & 7 in (2, 3) and op & 0xe0 in (0x60, 0xc0):
+                width = WIDTHS[op & 0x18]
+                if registers & 15 != 10 or offset < key_offset + 4 and key_offset < offset + width:
+                    safe_spill = False
+        if not safe_spill:
+            continue
+        for end_pc, instruction in instructions.items():
+            op, encoded, _, immediate = instruction
+            if (op, immediate) not in ((0x25, 8192), (0x26, 8192), (0x35, 8193), (0x36, 8193)):
+                continue
+            end = encoded & 15
+            end_definition = word_definition(end, end_pc, 12)
+            if end_definition is None or not required_edge(end_pc, end_pc + 1):
+                continue
+            for less_pc, instruction in instructions.items():
+                op, encoded, offset, _ = instruction
+                dst, src = encoded & 15, encoded >> 4
+                if op in (0x3d, 0x3e) and (dst, src) == (slot, end):
+                    success = less_pc + 1
+                elif op in (0x2d, 0x2e) and (dst, src) == (end, slot):
+                    success = less_pc + 1 + offset
+                else:
+                    continue
+                if (word_definition(slot, less_pc) != slot_definition
+                        or word_definition(end, less_pc, 12) != end_definition
+                        or not required_edge(less_pc, success)):
+                    continue
+                for equal_pc, instruction in instructions.items():
+                    op, encoded, offset, _ = instruction
+                    dst, src = encoded & 15, encoded >> 4
+                    if op not in (0x5d, 0x5e, 0x1d, 0x1e) or bank not in (dst, src) or dst == src:
+                        continue
+                    field = src if dst == bank else dst
+                    success = equal_pc + 1 if op in (0x5d, 0x5e) else equal_pc + 1 + offset
+                    if (word_definition(field, equal_pc, 16) is not None
+                            and stable(bank, shift_pc, equal_pc) and required_edge(equal_pc, success)):
+                        return at, end_pc, less_pc, equal_pc
+    return None
+
+
 class BankFootprint(MemoryProof):
     """Existing conservative memory proof with one exact map-of-maps edge."""
 
     def __init__(self, *arguments, growth=False, **keywords):
         super().__init__(*arguments, **keywords)
         self.growth = growth
+        self.bank_key_proofs = {}
 
     @staticmethod
     def refine(registers, destination, left, immediate, operation, taken):
@@ -1413,7 +1579,16 @@ class BankFootprint(MemoryProof):
         if number == 1 and mapped == ("map", "COUNTER_BANKS") and self.growth:
             index = self.key_value(registers[2], memory)
             if not index or index[0] != "scalar" or not 0 <= index[2] <= index[3] < 16:
-                raise RuntimeError("format2 outer lookup lacks its bounded bank key")
+                pointer = registers[2]
+                if (self.graph is None or not pointer or pointer[0] != "stack"
+                        or pointer[1][0] != key):
+                    raise RuntimeError("format2 outer lookup lacks its bounded bank key")
+                site = key, pc, pointer[2]
+                if site not in self.bank_key_proofs:
+                    self.bank_key_proofs[site] = bank_guarded_outer_key(
+                        self.graph, key, pc, pointer[2], self.touches)
+                if self.bank_key_proofs[site] is None:
+                    raise RuntimeError("format2 outer lookup lacks its guarded bank-key derivation")
         if number == 1 and mapped and mapped[:2] == ("ptr", "COUNTER_BANKS"):
             if mapped[2:4] != (0, 0):
                 raise RuntimeError("inner lookup uses an adjusted outer-map pointer")
@@ -2174,7 +2349,7 @@ def validate_bank_proof(body, *, growth=False):
     bank_global_abi(graph)
     owner = native_owner_bound(graph, maps, expected_bound=8192)
     proof_maps = {**maps, "COUNTER_BANK_VALUE": MAPS.map_def(6, 4, 24, 512 if growth else 1)}
-    roots, frames, seed_sites = {}, dict(owner.frames), set()
+    roots, frames, seed_sites, bank_keys = {}, dict(owner.frames), set(), {}
     for name, section in BANK_ROOTS.items():
         root = graph.root(name, section)
         reached = graph.reachable(root)
@@ -2195,6 +2370,7 @@ def validate_bank_proof(body, *, growth=False):
                     raise RuntimeError("Counts bank root reaches semantic/event storage")
         proof = BankFootprint(graph, proof_maps, native_bound=8192, growth=growth)
         proof.run(root, [("external", "ctx", 0), None, None, None, None])
+        bank_keys.update(proof.bank_key_proofs)
         if name.endswith("entry"):
             seed_sites = {touch[:2] for touch in proof.touches
                           if touch[2:6] == ("START", "write", (0, 0), 8)}
@@ -2226,7 +2402,7 @@ def validate_bank_proof(body, *, growth=False):
               "controls": controls, "ordinary_counter_profile": "refused"}
     if growth:
         report["configuration"] = BANK_GROWTH_CONFIG
-    return report, (graph, executions, optional_get, seed_sites, owner)
+    return report, (graph, executions, optional_get, seed_sites, owner, bank_keys)
 
 
 def bank_btf_mutant(body, graph, name, field, wanted, *, inner=False):
@@ -2325,14 +2501,29 @@ def bank_map_reference_mutant(body, graph, key, pc, target):
     return bytes(changed)
 
 
+def bank_guard_mutants(body, graph, proofs):
+    mutants = {}
+    for label, index in (("missing_route_end_bound", 1), ("missing_slot_less_end", 2),
+                         ("missing_route_bank_guard", 3)):
+        sites = {(key, proof[index]) for (key, _, _), proof in proofs.items() if proof is not None}
+        if not sites:
+            raise RuntimeError("format2 guard mutant has no validated emitted derivation")
+        changed = body
+        for key, pc in sorted(sites):
+            changed = mutated_instruction(changed, graph, key, pc, (0xbf, 0, 0, 0))
+        mutants[label] = changed
+    return mutants
+
+
 def bank_causal_mutants(body, *, growth=False):
-    report, (graph, executions, optional_get, seed_sites, owner) = validate_bank_proof(body, growth=growth)
+    report, (graph, executions, optional_get, seed_sites, owner, bank_keys) = validate_bank_proof(body, growth=growth)
     mutants = {
         "inner_value_width": bank_btf_mutant(body, graph, "COUNTER_BANKS", "value_bytes", 40, inner=True),
         "inner_cell_count": bank_btf_mutant(body, graph, "COUNTER_BANKS", "max_entries", 1 if growth else 2, inner=True),
         "outer_type": bank_btf_mutant(body, graph, "COUNTER_BANKS", "type", 2),
     }
     if growth:
+        mutants.update(bank_guard_mutants(body, graph, bank_keys))
         mutants.update({
             "outer_bank_count": bank_btf_mutant(body, graph, "COUNTER_BANKS", "max_entries", 2),
             "route_value_width": bank_btf_mutant(body, graph, "COUNTER_BANK_META", "value_bytes", 24),

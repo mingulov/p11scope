@@ -723,6 +723,48 @@
           }
         }
       }
+    },
+    {
+      "if": {
+        "properties": {"evidence": {
+          "required": ["counter_collection"],
+          "properties": {"counter_collection": {"properties": {"mode": {"const": "counts"}}}}
+        }}
+      },
+      "then": {
+        "properties": {"functions": {"items": {
+          "required": ["latency_ns"],
+          "properties": {"latency_ns": {"$ref": "#/properties/functions/items/properties/latency_ns/oneOf/0"}}
+        }}}
+      }
+    },
+    {
+      "if": {
+        "properties": {"evidence": {
+          "required": ["counter_collection"],
+          "properties": {"counter_collection": {"properties": {"mode": {"const": "timestamps"}}}}
+        }}
+      },
+      "then": {
+        "properties": {"functions": {"items": {
+          "required": ["latency_ns"],
+          "properties": {"latency_ns": {"$ref": "#/properties/functions/items/properties/latency_ns/oneOf/2"}}
+        }}}
+      }
+    },
+    {
+      "if": {
+        "properties": {"evidence": {
+          "required": ["counter_collection"],
+          "properties": {"counter_collection": {"properties": {"mode": {"const": "latency"}}}}
+        }}
+      },
+      "then": {
+        "properties": {"functions": {"items": {
+          "required": ["latency_ns"],
+          "properties": {"latency_ns": {"$ref": "#/properties/functions/items/properties/latency_ns/oneOf/1"}}
+        }}}
+      }
     }
   ],
   "$defs": {

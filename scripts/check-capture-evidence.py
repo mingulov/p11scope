@@ -625,6 +625,8 @@ def exact_profile_v3_selection(document, *, terminal=False, run=False):
     else:
         evidence = document
     exact_evidence_keys(evidence, profile=True, terminal=terminal, child=run)
+    if not terminal:
+        exact_counter_function_timing(document)
     exact_scheduling_evidence(evidence)
     exact_kernel_control(evidence)
     exact_task_uprobe_link_losses(evidence)
@@ -854,6 +856,31 @@ def exact_counter_collection(collection):
                 f"stale counter collection must retain a failure and unknown attempt health: {collection!r}")
 
 
+def exact_counter_function_timing(document):
+    """Counter mode describes the accepted rows' existing timing capability."""
+    collection = document["evidence"].get("counter_collection")
+    if collection is None:
+        return
+    mode = collection["mode"]
+    require(isinstance(document["functions"], list), "counter functions must be an array")
+    for row in document["functions"]:
+        require(isinstance(row, dict) and "latency_ns" in row,
+                "counter function must state timing availability")
+        timing = row["latency_ns"]
+        if mode == "counts":
+            require(timing is None, "counts function cannot publish measured timing")
+            continue
+        exact_keys(timing, {"approximate", "p50", "p95", "p99", "total", "max"},
+                   "counter function timing")
+        require(timing["approximate"] is (mode == "latency"),
+                "counter mode disagrees with function percentile availability")
+        require(u64(timing["total"]) and u64(timing["max"]),
+                "counter timing totals must be measured u64 values")
+        for field in ("p50", "p95", "p99"):
+            require(timing[field] is None or mode == "latency" and u64(timing[field]),
+                    "counter function percentile disagrees with measurement capability")
+
+
 def selection_tuple_key(tuple_):
     """Producer field order, rebuilt independently of input object key order."""
     request = tuple_["request"]
@@ -917,6 +944,7 @@ def exact_metrics_schema(document, *, run=False):
     require(document["capture"]["privacy_mode"] == "aggregate-only", document["capture"])
     exact_capture_scope(document)
     exact_evidence_keys(document["evidence"], profile=False, child=run)
+    exact_counter_function_timing(document)
     # Metrics exposes the actual Session backend/filter without publishing
     # profile-only successful-link mechanisms or selection verdict authority.
     exact_attach_backend(document["evidence"]["attach_backend"], None, document)

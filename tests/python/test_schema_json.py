@@ -140,6 +140,76 @@ class SchemaOracleAgreement(unittest.TestCase):
         self.assertEqual(set(failure) - {None}, set(CHECKER["COUNTER_COLLECTION_FAILURES"]))
         self.assertIn(None, failure)
 
+    def test_counter_mode_agrees_with_function_timing_in_both_document_lanes(self):
+        timestamp = {"approximate": False, "p50": None, "p95": None, "p99": None,
+                     "total": 0, "max": 0}
+        histogram_zero = {**timestamp, "approximate": True, "p50": 0, "p95": 0, "p99": 0}
+        histogram_empty = {**timestamp, "approximate": True}
+        for profile in (False, True):
+            for mode, timing in (("counts", None), ("timestamps", timestamp),
+                                 ("latency", histogram_zero), ("latency", histogram_empty)):
+                with self.subTest(profile=profile, mode=mode, timing=timing):
+                    document = self.counter_document(mode=mode)
+                    check = CHECKER["exact_metrics_schema"]
+                    if profile:
+                        document = CHECKER["document_fixture"](document["evidence"])
+                        check = CHECKER["exact_profile_v3_selection"]
+                    row = {
+                        "names": ["C_Sign"], "aliased": False, "module": None,
+                        "module_ambiguous": False, "module_unresolved": True,
+                        "target": {"object": None, "file_offset": 16}, "ordinals": [],
+                        "calls": 0, "errors": 0, "pending_returns": 0, "in_flight": 0,
+                        "rv_counts": {}, "latency_ns": timing,
+                    }
+                    document["functions"] = [row]
+                    check(document)
+                    contradictions = (timestamp, histogram_zero) if mode == "counts" else (
+                        (None, histogram_zero) if mode == "timestamps" else (None, timestamp))
+                    for contradiction in contradictions:
+                        invalid = copy.deepcopy(document)
+                        invalid["functions"][0]["latency_ns"] = contradiction
+                        with self.assertRaises(AssertionError):
+                            check(invalid)
+                    missing = copy.deepcopy(document)
+                    del missing["functions"][0]["latency_ns"]
+                    with self.assertRaises(AssertionError):
+                        check(missing)
+                    if mode != "counts":
+                        for patch in ({"extra": 1}, {"total": True}, {"max": -1},
+                                      {"total": 2**64}, {"p95": False}):
+                            invalid = copy.deepcopy(document)
+                            invalid["functions"][0]["latency_ns"].update(patch)
+                            with self.assertRaises(AssertionError):
+                                check(invalid)
+
+    def test_counter_mode_schema_selects_the_existing_timing_shapes(self):
+        by_mode = {}
+        for branch in SCHEMA["allOf"]:
+            evidence = branch["if"].get("properties", {}).get("evidence", {})
+            collection = evidence.get("properties", {}).get("counter_collection")
+            if collection is None:
+                continue
+            mode = collection["properties"]["mode"]["const"]
+            self.assertEqual(evidence["required"], ["counter_collection"])
+            row = branch["then"]["properties"]["functions"]["items"]
+            self.assertEqual(row["required"], ["latency_ns"])
+            pointer = row["properties"]["latency_ns"]["$ref"]
+            shape = SCHEMA
+            for key in pointer.removeprefix("#/").split("/"):
+                shape = shape[int(key)] if isinstance(shape, list) else shape[key]
+            by_mode[mode] = shape
+        self.assertEqual(set(by_mode), {"counts", "timestamps", "latency"})
+        self.assertEqual(by_mode["counts"], {"type": "null"})
+        for mode, approximate in (("timestamps", False), ("latency", True)):
+            shape = by_mode[mode]
+            self.assertEqual(shape["type"], "object")
+            self.assertIs(shape["properties"]["approximate"]["const"], approximate)
+            for field in ("total", "max"):
+                self.assertEqual(shape["properties"][field]["type"], "integer")
+            for field in ("p50", "p95", "p99"):
+                self.assertEqual(shape["properties"][field]["type"],
+                                 "null" if mode == "timestamps" else ["integer", "null"])
+
     def test_current_metrics_requires_backend_but_historical_shape_excludes_it(self):
         current = self.metrics_document()
         self.assertEqual(current["evidence"].get("attach_backend"),

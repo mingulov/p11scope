@@ -1289,7 +1289,8 @@ fn capture_fact_stage_publishes_once_or_rolls_back_whole() {
 /// two entries.
 #[test]
 fn capture_facts_count_a_corroborated_entry_once_across_both_surfaces() {
-    let (view, modules, pins, input) = same_object_scan_and_manifest(0x40);
+    let fixture = ScanManifestFixture::new();
+    let (view, modules, pins, input) = same_object_scan_and_manifest(&fixture, 0x40);
     let mut engine = discovered_from_inputs(vec![view], modules, pins, vec![input]);
     assert_eq!(engine.plan.entries_seen, 1, "the planner counts it once");
     assert_eq!(engine.plan.surfaces.len(), 2, "one scan and one manifest");
@@ -1308,7 +1309,7 @@ fn capture_facts_count_a_corroborated_entry_once_across_both_surfaces() {
 
     // The other direction: a manifest claim the scan did not decode is a
     // distinct entry, not a duplicate of the one it did.
-    let (view, modules, pins, input) = same_object_scan_and_manifest(0x80);
+    let (view, modules, pins, input) = same_object_scan_and_manifest(&fixture, 0x80);
     let mut engine = discovered_from_inputs(vec![view], modules, pins, vec![input]);
     assert_eq!(engine.plan.entries_seen, 2);
     engine.publish_current_capture_facts().unwrap();
@@ -1344,7 +1345,8 @@ fn blinded_attach_time_corroboration(engine: &mut Engine) {
 #[test]
 fn a_manifest_the_scan_only_reaches_later_is_corroborated_by_capture_end() {
     // Differing targets: the manifest records 0x40, the scan decodes 0x80.
-    let (view, modules, pins, input) = same_object_scan_and_manifest(0x80);
+    let fixture = ScanManifestFixture::new();
+    let (view, modules, pins, input) = same_object_scan_and_manifest(&fixture, 0x80);
     let mut engine = discovered_from_inputs(vec![view], modules, pins, vec![input]);
     blinded_attach_time_corroboration(&mut engine);
 
@@ -1367,7 +1369,8 @@ fn a_manifest_the_scan_only_reaches_later_is_corroborated_by_capture_end() {
 /// it actually derives, not "corroborated somehow".
 #[test]
 fn a_late_scan_that_agrees_is_recorded_as_agreed_not_as_a_conflict() {
-    let (view, modules, pins, input) = same_object_scan_and_manifest(0x40);
+    let fixture = ScanManifestFixture::new();
+    let (view, modules, pins, input) = same_object_scan_and_manifest(&fixture, 0x40);
     let mut engine = discovered_from_inputs(vec![view], modules, pins, vec![input]);
     blinded_attach_time_corroboration(&mut engine);
 
@@ -1389,7 +1392,8 @@ fn a_late_scan_that_agrees_is_recorded_as_agreed_not_as_a_conflict() {
 /// `corroborated: true` and `discovery_uncorroborated: 1`.
 #[test]
 fn a_derived_corroboration_survives_a_later_less_informed_publication() {
-    let (view, modules, pins, input) = same_object_scan_and_manifest(0x80);
+    let fixture = ScanManifestFixture::new();
+    let (view, modules, pins, input) = same_object_scan_and_manifest(&fixture, 0x80);
     let mut engine = discovered_from_inputs(vec![view], modules, pins, vec![input]);
     blinded_attach_time_corroboration(&mut engine);
     engine.publish_current_capture_facts().unwrap();
@@ -1414,7 +1418,8 @@ fn a_derived_corroboration_survives_a_later_less_informed_publication() {
 /// second one.
 #[test]
 fn a_tombstone_gap_survives_another_modules_derived_corroboration() {
-    let (view, modules, pins, input) = same_object_scan_and_manifest(0x80);
+    let fixture = ScanManifestFixture::new();
+    let (view, modules, pins, input) = same_object_scan_and_manifest(&fixture, 0x80);
     let mut engine = discovered_from_inputs(vec![view], modules, pins, vec![input]);
     blinded_attach_time_corroboration(&mut engine);
     engine.publish_current_capture_facts().unwrap();
@@ -1484,7 +1489,8 @@ fn a_tombstone_gap_survives_another_modules_derived_corroboration() {
 /// targets.
 #[test]
 fn a_derived_conflict_stays_counted_when_a_later_scan_agrees() {
-    let (view, modules, pins, input) = same_object_scan_and_manifest(0x80);
+    let fixture = ScanManifestFixture::new();
+    let (view, modules, pins, input) = same_object_scan_and_manifest(&fixture, 0x80);
     let mut engine = discovered_from_inputs(vec![view], modules, pins, vec![input]);
     blinded_attach_time_corroboration(&mut engine);
     engine.publish_current_capture_facts().unwrap();
@@ -1492,7 +1498,8 @@ fn a_derived_conflict_stays_counted_when_a_later_scan_agrees() {
     assert_eq!(engine.discovery.modules[0].corroboration, vec!["conflict"]);
 
     // The same object, decoded again with the targets now agreeing.
-    let (_, agreeing, agreeing_pins, agreeing_input) = same_object_scan_and_manifest(0x40);
+    let (_, agreeing, agreeing_pins, agreeing_input) =
+        same_object_scan_and_manifest(&fixture, 0x40);
     let agreed = discovered_from_inputs(
         vec![ProcessView::open(ProcessViewId(0), std::process::id()).unwrap()],
         agreeing,
@@ -1533,7 +1540,8 @@ fn a_derived_conflict_stays_counted_when_a_later_scan_agrees() {
 /// uncorroborated at capture end, and must stay that way.
 #[test]
 fn a_provider_the_scan_never_reached_stays_uncorroborated() {
-    let (_, modules, pins, input) = same_object_scan_and_manifest(0x80);
+    let fixture = ScanManifestFixture::new();
+    let (_, modules, pins, input) = same_object_scan_and_manifest(&fixture, 0x80);
     let object = pins.pinned().next().unwrap();
     let manifest_only = pin_as_manifest_object(object.path);
     let owned = manifest_only.pinned().next().unwrap().id;
@@ -19126,7 +19134,8 @@ fn loader_collision_candidate_keeps_provider_retirement_without_loader_id() {
 
 #[test]
 fn live_candidate_captures_rejected_keys_before_fallible_plan_extension() {
-    let (_, raw_modules, mut pins, _) = same_object_scan_and_manifest(0x10);
+    let fixture = ScanManifestFixture::new();
+    let (_, raw_modules, mut pins, _) = same_object_scan_and_manifest(&fixture, 0x10);
     let modules = reconcile_for_test(&raw_modules, &mut pins);
     let mut engine = Engine::empty();
     engine.plan = plan::build_from_reconciled_modules(&modules);
@@ -19167,7 +19176,8 @@ fn live_candidate_captures_rejected_keys_before_fallible_plan_extension() {
 
 #[test]
 fn conservative_intent_survives_refusal_until_current_candidate_commits() {
-    let (_, raw_modules, mut pins, _) = same_object_scan_and_manifest(0x10);
+    let fixture = ScanManifestFixture::new();
+    let (_, raw_modules, mut pins, _) = same_object_scan_and_manifest(&fixture, 0x10);
     let modules = reconcile_for_test(&raw_modules, &mut pins);
     let retired = raw_modules[0].view;
     let rejected = pins.pinned().next().unwrap().key;
@@ -22397,7 +22407,127 @@ fn discovered_from_inputs(
     discovered
 }
 
+struct ScanManifestFixture {
+    path: PathBuf,
+    file: std::fs::File,
+    mapping: *mut libc::c_void,
+    length: usize,
+    _directory: tempfile::TempDir,
+}
+
+impl ScanManifestFixture {
+    fn new() -> Self {
+        use std::os::fd::AsRawFd as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("scan-manifest.so");
+        build_fixture_so(&path, FIXTURE_ORIGINAL);
+        let file = p11scope_manifest::identity::open_object(&path).unwrap();
+        let length = usize::try_from(file.metadata().unwrap().len()).unwrap();
+        assert!(
+            (1..=1 << 20).contains(&length),
+            "owned ELF fixture must stay small"
+        );
+        // SAFETY: the held regular file covers this read-only mapping. This
+        // guard retains its file and path and owns the range until Drop.
+        let mapping = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                length,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(mapping, libc::MAP_FAILED);
+        Self {
+            path,
+            file,
+            mapping,
+            length,
+            _directory: directory,
+        }
+    }
+
+    fn scanned_module(&self, view: &ProcessView) -> ScannedModule {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
+        let mapping = maps
+            .iter()
+            .find(|mapping| (mapping.start..mapping.end).contains(&(self.mapping as u64)))
+            .expect("the owned ELF mapping remains live");
+        assert_eq!(
+            mapping.raw_path.as_deref(),
+            Some(self.path.as_os_str().as_bytes())
+        );
+        mapped_object(view, mapping, &self.path)
+    }
+}
+
+impl Drop for ScanManifestFixture {
+    fn drop(&mut self) {
+        // SAFETY: this guard exclusively owns the successful mapping and
+        // releases it once, before closing the file and removing its directory.
+        let result = unsafe { libc::munmap(self.mapping, self.length) };
+        if !std::thread::panicking() {
+            assert_eq!(result, 0, "owned ELF mapping cleanup failed");
+        }
+    }
+}
+
+#[test]
+fn scan_manifest_fixture_keeps_a_small_owned_mapping_and_real_pin_identity() {
+    use sha2::Digest as _;
+    use std::os::unix::fs::MetadataExt as _;
+
+    let kernel_file = |pins: &PinnedObjects, id| {
+        let metadata = pins.file_for(id).unwrap().metadata().unwrap();
+        (metadata.dev(), metadata.ino())
+    };
+    let (path, key) = {
+        let fixture = ScanManifestFixture::new();
+        assert_ne!(fixture.path, std::env::current_exe().unwrap());
+        let (_, modules, pins, input) = same_object_scan_and_manifest(&fixture, 0x40);
+        assert_eq!(modules[0].path, fixture.path.display().to_string());
+        let scan = pins.pinned().next().unwrap();
+        let manifest = input.pins.pinned().next().unwrap();
+        let expected = sha2::Sha256::digest(std::fs::read(&fixture.path).unwrap())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(scan.sha256, expected);
+        assert_eq!(manifest.sha256, expected);
+        let held = fixture.file.metadata().unwrap();
+        let held = (held.dev(), held.ino());
+        assert_eq!(kernel_file(&pins, scan.id), held);
+        assert_eq!(kernel_file(&input.pins, manifest.id), held);
+
+        let (_, later_modules, later_pins, _) = same_object_scan_and_manifest(&fixture, 0x80);
+        assert_eq!(modules[0].key, later_modules[0].key);
+        let later = later_pins.pinned().next().unwrap();
+        assert_eq!(kernel_file(&later_pins, later.id), held);
+        assert!(pins.check_unchanged().unwrap());
+
+        let copy = fixture._directory.path().join("same-bytes.so");
+        std::fs::copy(&fixture.path, &copy).unwrap();
+        let copy_pins = pin_as_manifest_object(copy.to_str().unwrap());
+        let copied = copy_pins.pinned().next().unwrap();
+        assert_eq!(copied.sha256, expected);
+        assert_ne!(kernel_file(&copy_pins, copied.id), held);
+        (fixture.path.clone(), modules[0].key)
+    };
+    assert!(!path.exists(), "owned fixture directory was not removed");
+    let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
+    assert!(
+        maps.iter().all(|mapping| ObjectKey::of(mapping) != key),
+        "owned fixture mapping survived its guard"
+    );
+}
+
 fn same_object_scan_and_manifest(
+    fixture: &ScanManifestFixture,
     scan_offset: u64,
 ) -> (
     ProcessView,
@@ -22405,9 +22535,12 @@ fn same_object_scan_and_manifest(
     PinnedObjects,
     ManifestInput,
 ) {
-    let (mut modules, pins) = pinned_self();
+    let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+    let mut modules = vec![fixture.scanned_module(&view)];
+    let pins = pin_test_module(&view, &modules[0]);
     assert_eq!(modules.len(), 1);
     let summary = pins.pinned().next().unwrap();
+    modules[0].decoder_abi = Some(pins.abi_for(summary.id).unwrap());
     let (path, key, sha256) = (
         summary.path.to_string(),
         summary.key,
@@ -22436,12 +22569,7 @@ fn same_object_scan_and_manifest(
         manifest,
         stale: Vec::new(),
     };
-    (
-        ProcessView::open(ProcessViewId(0), std::process::id()).unwrap(),
-        modules,
-        pins,
-        input,
-    )
+    (view, modules, pins, input)
 }
 
 /// Hermetic stand-in for the old `/bin/sh` + `/bin/ls` copies: host shell
@@ -23401,7 +23529,8 @@ fn multi_process_start_retires_views_that_went_stale_during_attach_live() {
 /// manifest's valid offsets when its sole agreeing scan owner is retired.
 #[test]
 fn stale_sole_owner_agreement_falls_back_to_the_retained_manifest() {
-    let (view, modules, pins, input) = same_object_scan_and_manifest(0x40);
+    let fixture = ScanManifestFixture::new();
+    let (view, modules, pins, input) = same_object_scan_and_manifest(&fixture, 0x40);
     let stale = view.id();
     let mut discovered = discovered_from_inputs(vec![view], modules, pins, vec![input]);
     assert_eq!(discovered.plan.slots.len(), 1);
@@ -23519,7 +23648,8 @@ fn stale_only_identity_mismatch_becomes_manifest_fallback_for_stable_scope() {
 /// the manifest as uncorroborated instead of preserving stale conflict evidence.
 #[test]
 fn stale_conflict_owner_is_removed_from_final_counter_and_corroboration() {
-    let (view, modules, pins, input) = same_object_scan_and_manifest(0x80);
+    let fixture = ScanManifestFixture::new();
+    let (view, modules, pins, input) = same_object_scan_and_manifest(&fixture, 0x80);
     let stale = view.id();
     let mut discovered = discovered_from_inputs(vec![view], modules, pins, vec![input]);
     assert_eq!(discovered.counters.conflicts, 1);
@@ -23563,7 +23693,8 @@ fn repeated_manifest_only_outcomes_preserve_order_and_multiplicity() {
 
 #[test]
 fn repeated_manifest_outcomes_recompute_after_the_scan_owner_is_removed() {
-    let (view, modules, pins, input) = same_object_scan_and_manifest(0x40);
+    let fixture = ScanManifestFixture::new();
+    let (view, modules, pins, input) = same_object_scan_and_manifest(&fixture, 0x40);
     let stale = view.id();
     let mut duplicate = ManifestInput {
         path: PathBuf::from("duplicate-manifest.json"),

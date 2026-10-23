@@ -8576,12 +8576,21 @@ mod tests {
 
     impl CollectedFinishQObserverForTest {
         pub(crate) fn new(producers: &super::SessionDrainProducers) -> Self {
+            Self::with_discovery_bytes(producers, [vec![0]])
+        }
+
+        /// Choose the original fixture records before the retained drain is
+        /// created. This does not change Q observation or accept positions.
+        pub(crate) fn with_discovery_bytes(
+            producers: &super::SessionDrainProducers,
+            records: impl IntoIterator<Item = Vec<u8>>,
+        ) -> Self {
             let discovery_domain = crate::events::DiscoveryDomain::test_standin(0xf1d5);
             Self {
                 gate: FinishQGate::new(),
                 producers: producers.clone(),
                 discovery: crate::events::DiscoveryDrain::over_domain(
-                    crate::events::ScriptedRecords::records([vec![0]], 1),
+                    crate::events::ScriptedRecords::records(records, 1),
                     discovery_domain.clone(),
                 ),
                 discovery_domain,
@@ -8614,6 +8623,13 @@ mod tests {
                 discovery: &self.discovery_domain,
                 detach: &self.detach,
             }
+        }
+
+        /// Borrow the SAME original drain used by the private Q observer.
+        pub(crate) fn discovery_drain_mut(
+            &mut self,
+        ) -> &mut crate::events::DiscoveryDrain<crate::events::ScriptedRecords> {
+            &mut self.discovery
         }
 
         pub(crate) fn observe(

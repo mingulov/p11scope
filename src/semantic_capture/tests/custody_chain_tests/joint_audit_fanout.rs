@@ -216,11 +216,196 @@ struct HeldMachineIo<'a> {
     producers: &'a SessionDrainProducers,
     attached: &'a crate::attach::AttachedSemanticSet,
     native: &'a mut MachineNativeRows,
+    finish: Option<&'a mut FinishMachineFixture>,
+}
+
+/// Original terminal I/O only. The machine owns Q, the final Raw, reports,
+/// leases and publication association; these counters observe actual calls.
+struct FinishMachineFixture {
+    observer: crate::attach::CollectedFinishQObserverForTest,
+    staged: crate::attach::DiscoveryStage,
+    stop_requests: usize,
+    q_observations: usize,
+    stops: usize,
+    at_stop: Option<FinishStopObservation>,
+}
+
+struct FinishStopObservation {
+    raw: crate::semantics_objects::journal::joint_driver::RawQuantumIdentity,
+    revision: u64,
+    reduced: u64,
+    validations: usize,
+    h3: (usize, bool),
 }
 
 impl crate::inventory_semantics::JointMachineIo for HeldMachineIo<'_> {
     fn producers(&self) -> &SessionDrainProducers {
         self.producers
+    }
+
+    fn request_finish_stop(
+        &mut self,
+        lane: &mut AttestedSemanticLane,
+    ) -> Result<(), SemanticRefusal> {
+        let finish = self
+            .finish
+            .as_deref_mut()
+            .ok_or(SemanticRefusal::Unavailable)?;
+        lane.request_semantic_stop();
+        finish.observer.request_stop();
+        finish.stop_requests += 1;
+        Ok(())
+    }
+
+    fn observe_finish_q(
+        &mut self,
+        _lane: &mut AttestedSemanticLane,
+        grant: Option<&crate::semantics_objects::journal::SessionDrainGrant>,
+    ) -> Result<Option<crate::attach::CollectedFinishQ>, SemanticRefusal> {
+        let finish = self
+            .finish
+            .as_deref_mut()
+            .ok_or(SemanticRefusal::Unavailable)?;
+        let observed = finish
+            .observer
+            .observe(self.producers, grant, self.drain)
+            .map_err(|_| SemanticRefusal::Unavailable)?;
+        finish.q_observations += usize::from(observed.is_some());
+        Ok(observed)
+    }
+
+    fn finish_discovery_domain(&self) -> Result<&crate::events::DiscoveryDomain, SemanticRefusal> {
+        Ok(self
+            .finish
+            .as_deref()
+            .ok_or(SemanticRefusal::Unavailable)?
+            .observer
+            .discovery_domain())
+    }
+
+    fn collect_raw_at_q(
+        &mut self,
+        _lane: &mut AttestedSemanticLane,
+        adapter: &mut JournalAdapter,
+        reserve: &crate::semantics_edge::resources::SemanticResourceReserver,
+        q: &crate::attach::CollectedFinishQ,
+        capacity: usize,
+        work: usize,
+    ) -> Result<(RawJointQuantum, Option<crate::events::DispatchPoll>), RawQuantumRefusal> {
+        RawJointQuantum::begin_bounded_with_adapter(
+            self.drain,
+            &publish_object_descriptors(),
+            capacity,
+            work,
+            Some(q.events_stop()),
+            &DisposedNativeFault((*self.h0).clone()),
+            self.producers,
+            |bytes| reserve.reserve(bytes),
+            adapter,
+        )
+    }
+
+    fn continue_raw_at_q(
+        &mut self,
+        _lane: &mut AttestedSemanticLane,
+        raw: &mut RawJointQuantum,
+        adapter: &mut JournalAdapter,
+        q: &crate::attach::CollectedFinishQ,
+        work: usize,
+    ) -> Result<crate::events::DispatchPoll, RawQuantumRefusal> {
+        raw.continue_bounded_with_adapter(
+            self.drain,
+            &publish_object_descriptors(),
+            work,
+            Some(q.events_stop()),
+            &DisposedNativeFault((*self.h0).clone()),
+            self.producers,
+            adapter,
+        )
+    }
+
+    fn service_finish_discovery(
+        &mut self,
+        _lane: &mut AttestedSemanticLane,
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        q: &crate::attach::CollectedFinishQ,
+        work: usize,
+    ) -> Result<crate::inventory_semantics::LaneDrainOutcome, SemanticRefusal> {
+        let finish = self
+            .finish
+            .as_deref_mut()
+            .ok_or(SemanticRefusal::Unavailable)?;
+        coordinator.service_collected_finish_discovery(
+            q,
+            self.producers,
+            finish.observer.discovery_drain_mut(),
+            &mut finish.staged,
+            work,
+        )
+    }
+
+    fn finish_h0_storage_bytes(
+        &self,
+        _lane: &AttestedSemanticLane,
+        raw: &RawJointQuantum,
+        adapter: &JournalAdapter,
+        q: &crate::attach::CollectedFinishQ,
+    ) -> Result<usize, SemanticRefusal> {
+        let finish = self.finish.as_deref().ok_or(SemanticRefusal::Unavailable)?;
+        self.h0
+            .0
+            .borrow()
+            .capture
+            .collected_stop_at_q_storage_bytes(
+                raw,
+                adapter,
+                self.producers,
+                finish.observer.discovery_domain(),
+                q,
+            )
+            .map_err(|_| SemanticRefusal::ProviderStorage)
+    }
+
+    fn finish_h0_at_q(
+        &mut self,
+        _lane: &mut AttestedSemanticLane,
+        coordinator: &InventoryCoordinator<OsProcessSource>,
+        raw: &mut RawJointQuantum,
+        q: &crate::attach::CollectedFinishQ,
+        report: &mut TickReport,
+    ) -> Result<(), SemanticRefusal> {
+        let finish = self
+            .finish
+            .as_deref_mut()
+            .ok_or(SemanticRefusal::Unavailable)?;
+        let mut held = self.h0.0.borrow_mut();
+        let HeldH0 { capture, .. } = &mut *held;
+        assert!(!capture.stopped, "the actual Capture stops only once");
+        capture
+            .stop_collected_at_q(
+                raw,
+                coordinator.joint_capture().adapter(),
+                self.producers,
+                finish.observer.discovery_domain(),
+                q,
+                report,
+            )
+            .map_err(|_| SemanticRefusal::Unavailable)?;
+        assert!(capture.stopped);
+        assert!(report.current().is_empty());
+        finish.stops += 1;
+        finish.at_stop = Some(FinishStopObservation {
+            raw: raw.h0_identity(),
+            revision: coordinator.registry().published_revision(),
+            reduced: coordinator
+                .registry()
+                .instance_semantic_edges()
+                .map(|record| record.feed.reduced())
+                .sum(),
+            validations: held.validations,
+            h3: coordinator.reference_h3_audit_state(),
+        });
+        Ok(())
     }
     fn collect_raw(
         &mut self,
@@ -585,6 +770,7 @@ struct MachineScene {
     scene: JointScene,
     machine: crate::inventory_semantics::LiveJointMachine,
     native: MachineNativeRows,
+    finish: Option<FinishMachineFixture>,
 }
 
 impl MachineScene {
@@ -810,6 +996,7 @@ impl MachineScene {
         Self {
             scene,
             machine,
+            finish: None,
             native: MachineNativeRows {
                 publisher: NativePublisher::build(),
                 rows: std::collections::BTreeMap::new(),
@@ -836,7 +1023,7 @@ impl MachineScene {
             scene,
             machine,
             native,
-            ..
+            finish,
         } = self;
         let mut io = HeldMachineIo {
             drain: &mut scene.drain,
@@ -844,6 +1031,7 @@ impl MachineScene {
             producers: &scene.producers,
             attached: scene.attached.as_ref().unwrap(),
             native,
+            finish: finish.as_mut(),
         };
         machine.service_with_io(
             &mut scene.real.lane,
@@ -867,7 +1055,7 @@ impl MachineScene {
             scene,
             machine,
             native,
-            ..
+            finish,
         } = self;
         let mut io = HeldMachineIo {
             drain: &mut scene.drain,
@@ -875,6 +1063,7 @@ impl MachineScene {
             producers: &scene.producers,
             attached: scene.attached.as_ref().unwrap(),
             native,
+            finish: finish.as_mut(),
         };
         machine.poll_commit_with_io(
             &mut scene.real.lane,
@@ -898,6 +1087,7 @@ impl MachineScene {
             scene,
             machine,
             native,
+            finish,
         } = self;
         let mut io = HeldMachineIo {
             drain: &mut scene.drain,
@@ -905,6 +1095,7 @@ impl MachineScene {
             producers: &scene.producers,
             attached: scene.attached.as_ref().unwrap(),
             native,
+            finish: finish.as_mut(),
         };
         machine.resolve_pending_h0_at_q_with_io(
             &mut scene.real.lane,
@@ -914,6 +1105,129 @@ impl MachineScene {
             discovery,
             &mut budget,
         )
+    }
+
+    fn enable_finish_fixture(&mut self, discovery: Vec<Vec<u8>>) {
+        assert!(self.finish.is_none());
+        self.finish = Some(FinishMachineFixture {
+            observer: crate::attach::CollectedFinishQObserverForTest::with_discovery_bytes(
+                &self.scene.producers,
+                discovery,
+            ),
+            staged: crate::attach::DiscoveryStage::default(),
+            stop_requests: 0,
+            q_observations: 0,
+            stops: 0,
+            at_stop: None,
+        });
+    }
+
+    fn begin_finish(&mut self) -> Result<(), SemanticRefusal> {
+        let Self {
+            scene,
+            machine,
+            native,
+            finish,
+        } = self;
+        let mut io = HeldMachineIo {
+            drain: &mut scene.drain,
+            h0: &scene.real.h0,
+            producers: &scene.producers,
+            attached: scene.attached.as_ref().unwrap(),
+            native,
+            finish: finish.as_mut(),
+        };
+        machine.begin_finish_with_io(
+            &mut scene.real.lane,
+            &mut scene.real.scene.coordinator,
+            &mut io,
+        )
+    }
+
+    fn poll_finish(
+        &mut self,
+        work: usize,
+    ) -> Result<crate::discovery::engine::inventory_coordinator::JointCommitProgress, SemanticRefusal>
+    {
+        let Self {
+            scene,
+            machine,
+            native,
+            finish,
+        } = self;
+        let mut io = HeldMachineIo {
+            drain: &mut scene.drain,
+            h0: &scene.real.h0,
+            producers: &scene.producers,
+            attached: scene.attached.as_ref().unwrap(),
+            native,
+            finish: finish.as_mut(),
+        };
+        let mut budget = crate::inventory_semantics::JointWorkBudget {
+            remaining_actions: work,
+            deadline: Instant::now() + Duration::from_secs(10),
+        };
+        machine.poll_finish_with_io(
+            &mut scene.real.lane,
+            &mut scene.real.scene.coordinator,
+            &mut io,
+            &mut budget,
+        )
+    }
+
+    fn reach_finish_stop_ready(&mut self) {
+        for _ in 0..512 {
+            if self.machine.finish_stop_ready_for_test() {
+                assert!(!self.scene.real.h0.0.borrow().capture.stopped);
+                assert_eq!(self.finish.as_ref().unwrap().stops, 0);
+                return;
+            }
+            assert!(matches!(
+                self.poll_finish(1).unwrap(),
+                crate::discovery::engine::inventory_coordinator::JointCommitProgress::Pending
+            ));
+        }
+        self.publication_failed("Finish final original before Stop", None, None);
+    }
+
+    fn finish_published(
+        &mut self,
+    ) -> crate::discovery::engine::inventory_coordinator::BatchReceipt {
+        for _ in 0..512 {
+            match self.poll_finish(1).unwrap_or_else(|reason| {
+                self.publication_failed("matching collected Finish", None, Some(reason));
+            }) {
+                crate::discovery::engine::inventory_coordinator::JointCommitProgress::Pending => {
+                    assert!(!self.scene.real.lane.is_finished());
+                    assert!(self.scene.real.lane.begin_owned_terminal_cleanup().is_err());
+                }
+                crate::discovery::engine::inventory_coordinator::JointCommitProgress::Published(
+                    receipt,
+                ) => {
+                    assert!(self.scene.real.lane.is_finished());
+                    return receipt;
+                }
+            }
+        }
+        self.publication_failed("matching collected Finish", None, None);
+    }
+
+    fn finish_storage_bytes(&self) -> usize {
+        let finish = self.finish.as_ref().unwrap();
+        self.scene
+            .real
+            .h0
+            .0
+            .borrow()
+            .capture
+            .collected_stop_at_q_storage_bytes(
+                self.machine.retained_raw_for_test().unwrap(),
+                self.scene.real.scene.coordinator.joint_capture().adapter(),
+                &self.scene.producers,
+                finish.observer.discovery_domain(),
+                self.machine.retained_finish_q_for_test().unwrap(),
+            )
+            .unwrap()
     }
 
     fn published(&mut self) {
@@ -1032,6 +1346,468 @@ impl MachineScene {
             .map(|record| record.feed.reduced())
             .collect()
     }
+}
+
+/// Same decoded DISCOVERY transport as the production reader, scoped to an
+/// owned child. It is input, never a Q/Current/completion witness.
+fn finish_discovery_bytes(pid: u32, at: u64) -> Vec<u8> {
+    let mut record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+    record.kind = p11scope_ebpf_common::DISCOVERY_KIND_EXEC;
+    record.pid_tgid = (u64::from(pid) << 32) | u64::from(pid);
+    record.hook_ts_ns = at;
+    // SAFETY: the shared repr(C) transport is completely initialized above,
+    // including padding from zeroed, just as existing discovery fixtures.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            (&record as *const p11scope_ebpf_common::DiscoveryRecord).cast::<u8>(),
+            size_of::<p11scope_ebpf_common::DiscoveryRecord>(),
+        )
+        .to_vec()
+    };
+    assert!(crate::events::decode_discovery(&bytes).is_some());
+    bytes
+}
+
+struct FinishCustody {
+    raw: Option<crate::semantics_objects::journal::joint_driver::RawQuantumIdentity>,
+    boundary: crate::events::EventsConsumptionCut,
+    revision: u64,
+    h3: (usize, bool),
+    frontier: crate::semantics_objects::journal::ConsumptionOrdinal,
+    publication_pending: bool,
+    roles: [usize; 5],
+    claims: (usize, Vec<(u64, JournalDomainProof)>),
+    model: crate::semantics_objects::ObjectProjection,
+    charged: usize,
+    stops: usize,
+    preparations: usize,
+    validations: usize,
+    finished: bool,
+    stopped: bool,
+}
+
+impl FinishCustody {
+    fn observe(fixture: &MachineScene) -> Self {
+        let coordinator = &fixture.scene.real.scene.coordinator;
+        let held = fixture.scene.real.h0.0.borrow();
+        Self {
+            raw: fixture
+                .machine
+                .retained_raw_for_test()
+                .map(RawJointQuantum::h0_identity),
+            boundary: fixture.scene.drain.consumption_cut().unwrap(),
+            revision: coordinator.registry().published_revision(),
+            h3: coordinator.reference_h3_audit_state(),
+            frontier: coordinator.joint_capture().adapter().consumed_frontier(),
+            publication_pending: coordinator.publication_pending(),
+            roles: coordinator.joint_capture().ledger().roles_for_test(),
+            claims: coordinator
+                .joint_capture()
+                .adapter()
+                .invocation_claims_for_test(),
+            model: coordinator.joint_capture().model().project(),
+            charged: coordinator
+                .registry()
+                .semantic_resource_snapshot()
+                .charged_bytes,
+            stops: fixture.finish.as_ref().unwrap().stops,
+            preparations: fixture.native.preparations.len(),
+            validations: held.validations,
+            finished: fixture.scene.real.lane.is_finished(),
+            stopped: held.capture.stopped,
+        }
+    }
+
+    fn assert_unchanged(&self, fixture: &MachineScene) {
+        let after = Self::observe(fixture);
+        assert!(after.raw == self.raw);
+        assert!(after.boundary.same_boundary(&self.boundary));
+        assert_eq!(after.revision, self.revision);
+        assert_eq!(after.h3, self.h3);
+        assert!(after.frontier == self.frontier);
+        assert_eq!(after.publication_pending, self.publication_pending);
+        assert_eq!(after.roles, self.roles);
+        assert!(after.claims == self.claims);
+        assert!(after.model == self.model);
+        assert_eq!(after.charged, self.charged);
+        assert_eq!(after.stops, self.stops);
+        assert_eq!(after.preparations, self.preparations);
+        assert_eq!(after.validations, self.validations);
+        assert_eq!(after.finished, self.finished);
+        assert_eq!(after.stopped, self.stopped);
+    }
+}
+
+/// Stopping before the final return's real seal, or applying a physical tail
+/// only after Capture.stop, must fail this useful reduction/order control.
+#[test]
+fn joint_machine_collected_finish_preserves_last_return_before_stopped() {
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 2);
+    fixture.published_labeled("Finish prior Init", None);
+    assert_eq!(fixture.reduced(), [2]);
+    fixture.scene.push(std::process::id(), 0, "C_SignFinal", 3);
+    fixture.enable_finish_fixture(Vec::new());
+    let revision = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .published_revision();
+    let h3 = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .reference_h3_audit_state();
+    fixture.begin_finish().unwrap();
+    assert!(
+        fixture.scene.real.lane.tick(&[]).is_err(),
+        "ordinary H0 admission is gated"
+    );
+    let mut saw_last_return = false;
+    for _ in 0..512 {
+        assert!(matches!(
+            fixture.poll_finish(1).unwrap(),
+            crate::discovery::engine::inventory_coordinator::JointCommitProgress::Pending
+        ));
+        if fixture.reduced() == [3] {
+            saw_last_return = true;
+            break;
+        }
+    }
+    assert!(
+        saw_last_return,
+        "the last original reaches actual H9 before Stop"
+    );
+    assert!(!fixture.scene.real.h0.0.borrow().capture.stopped);
+    assert_eq!(fixture.finish.as_ref().unwrap().stops, 0);
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .published_revision(),
+        revision + 1
+    );
+    // A nonempty physical tail belongs to the final original. Its actual
+    // Capture.apply_physical_gaps must run while that Capture is still live.
+    let caller = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .adapter()
+        .live_id(std::process::id())
+        .unwrap();
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .reference_mark_tail(caller);
+    let raises = fixture.scene.real.h0.0.borrow().io.script.raises;
+    let receipt = fixture.finish_published();
+    assert!(receipt.registry_published > revision + 1);
+    let finish = fixture.finish.as_ref().unwrap();
+    assert_eq!(
+        (finish.stop_requests, finish.q_observations, finish.stops),
+        (1, 1, 1)
+    );
+    let at_stop = finish.at_stop.as_ref().unwrap();
+    assert_eq!(at_stop.reduced, 3);
+    assert!(at_stop.revision >= revision + 1);
+    assert_eq!(
+        at_stop.h3.0,
+        h3.0 + 1,
+        "the useful original finishes its own H3 before Stop"
+    );
+    assert!(
+        fixture.scene.real.h0.0.borrow().io.script.raises > raises,
+        "the genuine physical tail was applied before actual Stop"
+    );
+    assert_eq!(
+        fixture.scene.real.h0.0.borrow().validations,
+        at_stop.validations,
+        "no Current validation is deferred until after Stopped"
+    );
+    assert_eq!(fixture.reduced(), [3]);
+    assert!(fixture.scene.real.lane.tick(&[]).is_err());
+    assert!(
+        fixture
+            .scene
+            .real
+            .lane
+            .begin_owned_terminal_cleanup()
+            .is_ok()
+    );
+}
+
+/// Final Idle work uses a real new Raw on the SAME cursor, accounts for both
+/// rings/FIFO/Engine backlog, and refuses a genuine post-Q producer movement.
+#[test]
+fn joint_machine_collected_finish_idle_uses_same_cursor_q() {
+    let child = OwnedStoppedChild::new();
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture.enable_finish_fixture(vec![
+        finish_discovery_bytes(child.id(), 100),
+        finish_discovery_bytes(child.id(), 101),
+    ]);
+    // Move one actual decoded item into the existing Session FIFO before Q.
+    // Its credit and bytes remain held; the ring retains the second item.
+    {
+        let FinishMachineFixture {
+            observer, staged, ..
+        } = fixture.finish.as_mut().unwrap();
+        let drain = observer.discovery_drain_mut();
+        let bound = crate::events::discovery_drain_positions(drain).producer;
+        crate::events::poll_discovery_to_position(drain, bound, Some(1), |item| {
+            let mut original = Some(item);
+            let staged_outcome = staged.stage(1, crate::attach::DiscoveryStage::CAPACITY, || {
+                original.take()
+            });
+            assert_eq!(staged_outcome.staged, 1);
+            std::ops::ControlFlow::Continue(())
+        })
+        .unwrap();
+        assert_eq!(staged.len(), 1);
+        assert_eq!(observer.discovery_remaining(), 1);
+    }
+    let cursor = fixture.scene.drain.consumption_cut().unwrap();
+    let h3 = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .reference_h3_audit_state();
+    fixture.begin_finish().unwrap();
+    let zero = FinishCustody::observe(&fixture);
+    assert!(matches!(
+        fixture.poll_finish(0).unwrap(),
+        crate::discovery::engine::inventory_coordinator::JointCommitProgress::Pending
+    ));
+    zero.assert_unchanged(&fixture);
+    fixture.reach_finish_stop_ready();
+    let raw = fixture
+        .machine
+        .retained_raw_for_test()
+        .expect("Idle creates the actual final Raw");
+    let final_id = raw.h0_identity();
+    let q = fixture.machine.retained_finish_q_for_test().unwrap();
+    assert!(q.events_at_bound(&fixture.scene.drain.consumption_cut().unwrap()));
+    assert!(cursor.same_boundary(&fixture.scene.drain.consumption_cut().unwrap()));
+    assert_eq!(fixture.finish.as_ref().unwrap().staged.len(), 0);
+    assert_eq!(
+        fixture
+            .finish
+            .as_ref()
+            .unwrap()
+            .observer
+            .discovery_remaining(),
+        0
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_collected_finish_discovery_backlog(0),
+        (0, false)
+    );
+    assert!(!fixture.scene.real.h0.0.borrow().capture.stopped);
+    fixture.finish_published();
+    let at_stop = fixture.finish.as_ref().unwrap().at_stop.as_ref().unwrap();
+    assert!(
+        at_stop.raw == final_id,
+        "Stop output belongs to the same final Raw"
+    );
+    assert_eq!(fixture.finish.as_ref().unwrap().stops, 1);
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_h3_audit_state(),
+        (h3.0 + 1, false)
+    );
+
+    let mut moved = MachineScene::new(1);
+    moved.enable_finish_fixture(Vec::new());
+    moved.begin_finish().unwrap();
+    for _ in 0..128 {
+        if moved.machine.retained_finish_q_for_test().is_some() {
+            break;
+        }
+        moved.poll_finish(1).unwrap();
+    }
+    assert!(moved.machine.retained_finish_q_for_test().is_some());
+    let boundary = moved.scene.drain.consumption_cut().unwrap();
+    let (begin, _) = moved
+        .scene
+        .encoded(std::process::id(), 0, "C_CreateObject", 1);
+    moved.scene.drain.source_mut().push_record(begin.to_vec());
+    let mut refused = false;
+    for _ in 0..128 {
+        if moved.poll_finish(1).is_err() {
+            refused = true;
+            break;
+        }
+    }
+    assert!(
+        refused,
+        "the original Q never silently advances to a later producer bound"
+    );
+    assert_eq!(moved.scene.drain.source_mut().remaining(), 1);
+    assert!(
+        moved
+            .scene
+            .drain
+            .consumption_cut()
+            .unwrap()
+            .same_boundary(&boundary)
+    );
+    assert_eq!(moved.finish.as_ref().unwrap().stops, 0);
+    assert!(!moved.scene.real.lane.is_finished());
+    assert!(
+        moved
+            .scene
+            .real
+            .lane
+            .begin_owned_terminal_cleanup()
+            .is_err()
+    );
+}
+
+/// A Stop report or Copy BatchReceipt is insufficient: a held final frame or
+/// publication error must withhold every cleanup entrypoint until disposal.
+#[test]
+fn joint_machine_collected_finish_pending_publication_blocks_detach() {
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture.enable_finish_fixture(Vec::new());
+    fixture.begin_finish().unwrap();
+    fixture.reach_finish_stop_ready();
+    fixture.machine.reference_refuse_finish_q_merge_once();
+    let before = FinishCustody::observe(&fixture);
+    let mut refused = false;
+    for _ in 0..128 {
+        if let Err(reason) = fixture.poll_finish(1) {
+            assert_eq!(reason, SemanticRefusal::ProviderStorage);
+            refused = true;
+            break;
+        }
+        assert!(!fixture.scene.real.lane.is_finished());
+    }
+    assert!(refused);
+    assert_eq!(fixture.finish.as_ref().unwrap().stops, 1);
+    assert!(fixture.scene.real.h0.0.borrow().capture.stopped);
+    assert!(fixture.machine.retained_finish_report_for_test().is_some());
+    assert!(!fixture.scene.real.lane.is_finished());
+    assert!(
+        fixture
+            .scene
+            .real
+            .lane
+            .begin_owned_terminal_cleanup()
+            .is_err()
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_h3_audit_state(),
+        before.h3
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .published_revision(),
+        before.revision
+    );
+    let retained_stop = FinishCustody::observe(&fixture);
+    assert!(
+        fixture.scene.real.lane.finish_semantic_stop().is_none(),
+        "the legacy shortcut cannot mark a collected Finish published"
+    );
+    retained_stop.assert_unchanged(&fixture);
+    // Refuse at the actual publication receiver, after the original final
+    // report has been retained. It supplies neither a seal nor completion.
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .reference_refuse_joint_finish_publication_once();
+    let mut publication_refused = false;
+    for _ in 0..512 {
+        if fixture.poll_finish(1).is_err() {
+            publication_refused = true;
+            break;
+        }
+        assert!(!fixture.scene.real.lane.is_finished());
+        assert!(
+            fixture
+                .scene
+                .real
+                .lane
+                .begin_owned_terminal_cleanup()
+                .is_err()
+        );
+    }
+    assert!(publication_refused);
+    assert!(fixture.scene.real.scene.coordinator.publication_pending());
+    assert!(
+        fixture
+            .machine
+            .retained_finish_disposition_for_test()
+            .is_some(),
+        "the actual disposed original stays owned before any Copy receipt"
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .published_revision(),
+        before.revision
+    );
+    assert_eq!(fixture.finish.as_ref().unwrap().stops, 1);
+    assert!(!fixture.scene.real.lane.is_finished());
+    assert!(
+        fixture
+            .scene
+            .real
+            .lane
+            .begin_owned_terminal_cleanup()
+            .is_err()
+    );
+    // The consuming helper must reject this SAME unpublished owner too. No
+    // detach/join is simulated, and an errored publication is not replayed.
+    let machine = fixture.machine;
+    assert!(
+        fixture
+            .scene
+            .real
+            .lane
+            .finish_owned_terminal_cleanup(&|| false, &mut Vec::new(),)
+            .is_err()
+    );
+    assert!(machine.retained_finish_disposition_for_test().is_some());
 }
 
 #[test]
@@ -3275,6 +4051,85 @@ fn joint_machine_collected_finish_rejects_foreign_stale_duplicate() {
     .expect("pending-at-Q does not demand the final global Q drain from a full original");
     assert_eq!(full.drain.source_mut().remaining(), 1);
     assert_eq!(full.real.h0.0.borrow().capture.awaiting.len(), 1);
+
+    // The Finish association is tied to the retained Q/producer/ledger and
+    // actual coordinator, rather than a Copy receipt from another publication.
+    let mut finishing = MachineScene::new(1);
+    finishing.prime(1);
+    let stale_receipt = finishing
+        .scene
+        .real
+        .scene
+        .coordinator
+        .commit_batch(false)
+        .unwrap();
+    finishing.enable_finish_fixture(Vec::new());
+    finishing.begin_finish().unwrap();
+    finishing.reach_finish_stop_ready();
+    let before = FinishCustody::observe(&finishing);
+    assert!(stale_receipt.registry_published <= before.revision);
+    assert!(
+        finishing
+            .scene
+            .real
+            .lane
+            .begin_owned_terminal_cleanup()
+            .is_err()
+    );
+    // Keep the actual Q in the machine, but present another owning DISCOVERY
+    // allocation at the native I/O boundary. Refusal cannot consume that Q.
+    let original_finish = finishing.finish.take().unwrap();
+    finishing.enable_finish_fixture(Vec::new());
+    assert!(finishing.poll_finish(1).is_err());
+    finishing.finish = Some(original_finish);
+    before.assert_unchanged(&finishing);
+    let mut foreign_coordinator = MachineScene::new(1);
+    {
+        let MachineScene {
+            scene,
+            machine,
+            native,
+            finish,
+        } = &mut finishing;
+        let mut io = HeldMachineIo {
+            drain: &mut scene.drain,
+            h0: &scene.real.h0,
+            producers: &scene.producers,
+            attached: scene.attached.as_ref().unwrap(),
+            native,
+            finish: finish.as_mut(),
+        };
+        let mut work = crate::inventory_semantics::JointWorkBudget {
+            remaining_actions: 1,
+            deadline: Instant::now() + Duration::from_secs(10),
+        };
+        assert!(
+            machine
+                .poll_finish_with_io(
+                    &mut scene.real.lane,
+                    &mut foreign_coordinator.scene.real.scene.coordinator,
+                    &mut io,
+                    &mut work,
+                )
+                .is_err()
+        );
+    }
+    before.assert_unchanged(&finishing);
+    assert!(!finishing.scene.real.lane.is_finished());
+    finishing.finish_published();
+    let completed = FinishCustody::observe(&finishing);
+    assert!(
+        finishing.begin_finish().is_err(),
+        "a finished association is not a new Finish"
+    );
+    assert!(
+        !matches!(
+            finishing.poll_finish(0),
+            Ok(crate::discovery::engine::inventory_coordinator::JointCommitProgress::Published(_))
+        ),
+        "the completed Finish receipt is delivered once"
+    );
+    completed.assert_unchanged(&finishing);
 }
 
 /// A tight pool refuses before expiry, and a later receiver refusal retains
@@ -3499,6 +4354,125 @@ fn joint_machine_collected_finish_budget_refusal_preserves_originals() {
     );
     fixture.published_labeled("pending-at-Q paid merge retry", None);
     assert_eq!(fixture.native.pending_q_resolutions, 1);
+
+    // The final Stop is a separate mutation boundary. Zero work and a tight
+    // pool refuse BEFORE it; a later receiver refusal retains its real output.
+    let mut ending = MachineScene::new(1);
+    ending.prime(1);
+    ending.enable_finish_fixture(Vec::new());
+    ending.begin_finish().unwrap();
+    ending.reach_finish_stop_ready();
+    let before_stop = FinishCustody::observe(&ending);
+    ending.poll_finish(0).unwrap();
+    before_stop.assert_unchanged(&ending);
+    let bytes = ending.finish_storage_bytes();
+    assert!(bytes > 0);
+    let resource = ending
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .semantic_resource_snapshot();
+    let hold = ending
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .reserve_semantic_storage(resource.limit_bytes - resource.charged_bytes - (bytes - 1))
+        .unwrap();
+    let tight = FinishCustody::observe(&ending);
+    let (refused, allocations, _) =
+        crate::test_alloc::count_allocs_during(|| ending.poll_finish(1));
+    assert!(matches!(refused, Err(SemanticRefusal::ProviderStorage)));
+    assert_eq!(
+        allocations, 0,
+        "no Stop output is allocated before its pool precharge"
+    );
+    tight.assert_unchanged(&ending);
+    assert!(ending.machine.retained_finish_report_for_test().is_none());
+    drop(hold);
+    before_stop.assert_unchanged(&ending);
+    ending.machine.reference_refuse_finish_q_merge_once();
+    let mut refused = false;
+    for _ in 0..128 {
+        if let Err(reason) = ending.poll_finish(1) {
+            assert_eq!(reason, SemanticRefusal::ProviderStorage);
+            refused = true;
+            break;
+        }
+    }
+    assert!(refused);
+    assert_eq!(ending.finish.as_ref().unwrap().stops, 1);
+    assert!(ending.scene.real.h0.0.borrow().capture.stopped);
+    let (report, paid) = ending.machine.retained_finish_report_for_test().unwrap();
+    assert_eq!(paid, bytes);
+    assert!(report.current().is_empty());
+    assert!(report.outcomes().iter().any(|outcome| matches!(outcome,
+        TickOutcome::Invalidation(invalidation) if matches!(invalidation.scope(), InvalidationScope::Stopped)
+    )));
+    let report_facts = (
+        report.allocated_below(),
+        report.awaiting_floor(),
+        report.shed_floor(),
+        report.exhausted(),
+        report.outcomes().len(),
+    );
+    let held = FinishCustody::observe(&ending);
+    assert_eq!(held.charged, before_stop.charged + paid);
+    assert_eq!(
+        held.h3, before_stop.h3,
+        "no H3 take before the Stop union transfers"
+    );
+    assert_eq!(held.revision, before_stop.revision);
+    assert_eq!(held.roles, before_stop.roles);
+    assert!(held.claims == before_stop.claims);
+    assert!(held.model == before_stop.model);
+    assert!(!ending.scene.real.lane.is_finished());
+    assert!(
+        ending
+            .scene
+            .real
+            .lane
+            .begin_owned_terminal_cleanup()
+            .is_err()
+    );
+    ending.poll_finish(0).unwrap();
+    held.assert_unchanged(&ending);
+    let (same, same_paid) = ending.machine.retained_finish_report_for_test().unwrap();
+    assert_eq!(same_paid, paid);
+    assert_eq!(
+        (
+            same.allocated_below(),
+            same.awaiting_floor(),
+            same.shed_floor(),
+            same.exhausted(),
+            same.outcomes().len()
+        ),
+        report_facts
+    );
+    ending.poll_finish(1).unwrap();
+    assert!(ending.machine.retained_finish_report_for_test().is_none());
+    assert_eq!(
+        ending.finish.as_ref().unwrap().stops,
+        1,
+        "retry only transfers the produced Stop report"
+    );
+    assert_eq!(
+        ending
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .semantic_resource_snapshot()
+            .charged_bytes,
+        before_stop.charged,
+        "the incoming Stop buffers drop before their temporary lease refunds"
+    );
+    ending.finish_published();
+    assert_eq!(ending.finish.as_ref().unwrap().stops, 1);
 }
 
 #[test]
@@ -3934,6 +4908,7 @@ fn joint_machine_request_ack_tracks_actual_preparation_and_attempted_error() {
                 scene,
                 machine,
                 native,
+                finish,
             } = &mut fixture;
             let mut io = HeldMachineIo {
                 drain: &mut scene.drain,
@@ -3941,6 +4916,7 @@ fn joint_machine_request_ack_tracks_actual_preparation_and_attempted_error() {
                 producers: &scene.producers,
                 attached: scene.attached.as_ref().unwrap(),
                 native,
+                finish: finish.as_mut(),
             };
             let mut budget = crate::inventory_semantics::JointWorkBudget {
                 remaining_actions: 0,

@@ -73,6 +73,59 @@
         "cgroup_scope_failures": {"type": "integer", "minimum": 0},
         "child_still_running": {"type": "boolean"},
         "completeness": {"enum": ["COMPLETE", "PARTIAL"]},
+        "counter_collection": {
+          "description": "Optional availability of the accepted cumulative counter snapshot. Cached ticks retain its original read window; failed attempts retain its mode and generation.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "generation", "read_window", "status", "health", "discontinuity", "failure"],
+          "properties": {
+            "mode": {"enum": ["counts", "timestamps", "latency"]},
+            "generation": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+            "read_window": {
+              "oneOf": [
+                {"type": "null"},
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["started_ns", "finished_ns"],
+                  "properties": {
+                    "started_ns": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                    "finished_ns": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615}
+                  }
+                }
+              ]
+            },
+            "status": {"enum": ["fresh", "stale"]},
+            "health": {
+              "oneOf": [
+                {"type": "null"},
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["saturated", "contended"],
+                  "properties": {
+                    "saturated": {"const": false},
+                    "contended": {"const": false}
+                  }
+                }
+              ]
+            },
+            "discontinuity": {"type": "boolean"},
+            "failure": {"enum": [
+              null, "read_shape", "read_budget", "read_stats", "read_rvs", "read_health",
+              "read_kernel_evidence", "bank_routing", "bank_quarantined", "topology",
+              "mode", "generation_rollback", "limits", "saturated", "contended",
+              "kernel_evidence", "fold_overflow", "regressed", "projection"
+            ]}
+          },
+          "allOf": [
+            {
+              "if": {"properties": {"status": {"const": "fresh"}}},
+              "then": {"properties": {"failure": {"type": "null"}, "health": {"type": "object"}}},
+              "else": {"properties": {"failure": {"type": "string"}, "health": {"type": "null"}}}
+            }
+          ]
+        },
         "discovery": {"type": "array"},
         "discovery_conflicts": {"type": "integer", "minimum": 0},
         "discovery_read_failures": {"type": "integer", "minimum": 0},

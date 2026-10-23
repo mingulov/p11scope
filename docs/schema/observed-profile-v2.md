@@ -432,6 +432,12 @@ and capture evidence still determines completeness. Timing availability does
 not change the aggregate authority for `functions[]` or add semantic detail
 counts into those totals.
 
+Current v3 documents can additionally describe the accepted counter read and
+its availability in optional `evidence.counter_collection` metadata, documented
+in [the v3 schema](observed-profile-v3.md). Historical v2 documents retain
+their existing evidence shape. Timing capability alone does not prove that a
+read was fresh or that a capture was complete.
+
 ### The owner relation is exact and exclusive
 
 `module`, `module_ambiguous`, and `module_unresolved` are one relation with

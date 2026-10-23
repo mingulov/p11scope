@@ -256,6 +256,15 @@ ROOT_FAILURE_REASONS = {
 }
 # C_GetInterface result flags publish only this finite class, never the word.
 SELECTION_RESULT_FLAG_CLASSES = {"zero", "fork_safe", "other"}
+COUNTER_COLLECTION_KEYS = {
+    "mode", "generation", "read_window", "status", "health", "discontinuity", "failure",
+}
+COUNTER_COLLECTION_FAILURES = {
+    "read_shape", "read_budget", "read_stats", "read_rvs", "read_health",
+    "read_kernel_evidence", "bank_routing", "bank_quarantined", "topology",
+    "mode", "generation_rollback", "limits", "saturated", "contended",
+    "kernel_evidence", "fold_overflow", "regressed", "projection",
+}
 BASE_EVIDENCE_KEYS = set(COUNTERS) | {
     "kernel_control", "attach_backend", "object_capture",
     "authority", "discovery", "manifest_object_fallbacks", "modules_skipped",
@@ -796,6 +805,9 @@ def exact_evidence_keys(evidence, *, profile, terminal=False, child=False, histo
     wanted |= PROFILE_V3_FIELDS if profile else set()
     if terminal:
         wanted |= TRACE_TERMINAL_KEYS
+    if not historical and not terminal and "counter_collection" in evidence:
+        wanted.add("counter_collection")
+        exact_counter_collection(evidence["counter_collection"])
     actual = set(evidence)
     if child:
         wanted.add("child_still_running")
@@ -807,6 +819,39 @@ def exact_evidence_keys(evidence, *, profile, terminal=False, child=False, histo
     if child:
         require(isinstance(evidence["child_still_running"], bool),
                 f"invalid child_still_running: {evidence['child_still_running']!r}")
+
+
+def exact_counter_collection(collection):
+    """Derived availability of the accepted cumulative snapshot, not intent."""
+    exact_keys(collection, COUNTER_COLLECTION_KEYS, "counter_collection")
+    require(collection["mode"] in ("counts", "timestamps", "latency"),
+            f"invalid counter mode: {collection!r}")
+    require(u64(collection["generation"]) and collection["generation"] > 0,
+            f"invalid counter generation: {collection!r}")
+    window = collection["read_window"]
+    if window is not None:
+        exact_keys(window, {"started_ns", "finished_ns"}, "counter read_window")
+        require(u64(window["started_ns"]) and u64(window["finished_ns"])
+                and window["started_ns"] <= window["finished_ns"],
+                f"invalid counter read_window: {window!r}")
+    require(type(collection["discontinuity"]) is bool,
+            f"invalid counter discontinuity: {collection!r}")
+    require(collection["status"] in ("fresh", "stale"),
+            f"invalid counter status: {collection!r}")
+    failure = collection["failure"]
+    require(failure is None or isinstance(failure, str) and failure in COUNTER_COLLECTION_FAILURES,
+            f"invalid counter failure: {collection!r}")
+    health = collection["health"]
+    if health is not None:
+        exact_keys(health, {"saturated", "contended"}, "counter health")
+        require(all(type(value) is bool for value in health.values()),
+                f"invalid counter health: {health!r}")
+    if collection["status"] == "fresh":
+        require(failure is None and health == {"saturated": False, "contended": False},
+                f"fresh counter collection must have accepted healthy rows: {collection!r}")
+    else:
+        require(failure is not None and health is None,
+                f"stale counter collection must retain a failure and unknown attempt health: {collection!r}")
 
 
 def selection_tuple_key(tuple_):
@@ -1272,6 +1317,11 @@ def expected_gap_classes(evidence):
         gates["attribution"].append((
             "interface_selection.selection_count_only",
             any(t["authority"] == "selection_count_only" for t in selection["tuples"]),
+        ))
+    collection = evidence.get("counter_collection")
+    if collection is not None:
+        gates["observation"].append((
+            "counter_collection", collection["status"] == "stale" or collection["discontinuity"],
         ))
     causes = {name: [cause for cause, hit in gate if hit] for name, gate in gates.items()}
     if causes["semantics"]:

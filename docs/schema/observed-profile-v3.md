@@ -23,6 +23,26 @@ percentiles, and latency retains the histogram object. A measured zero is
 distinct from unavailable timing. These shapes do not change count authority
 or combine aggregate and semantic-detail totals.
 
+When a capture uses the prepared cumulative-counter reader, its evidence also
+contains optional `counter_collection` metadata. Legacy captures omit this
+object. Its exact keys are `mode`, `generation`, `read_window`, `status`,
+`health`, `discontinuity`, and `failure`. Mode and positive generation identify
+the accepted native read. `read_window` is either the measured monotonic
+`{started_ns, finished_ns}` interval or null when that interval is unavailable;
+it does not assert an atomic snapshot. Cached display ticks keep the original
+read window and do not acquire another native read.
+
+`status: "fresh"` has null failure and accepted health
+`{saturated: false, contended: false}`. A failed attempt retains the previous
+accepted rows, mode, generation, and window with `status: "stale"`, null health,
+and a finite failure cause; observed saturation or contention remains explicit
+as `saturated` or `contended`. A generation change sets sticky `discontinuity`.
+Either failure or discontinuity adds `counter_collection` to the observation
+gap causes and requires `PARTIAL` with `verdict_detail: "concrete_gap"`.
+An unavailable initial read cannot produce zero measurements, and a terminal
+report requires a new successful collection and projection. This metadata
+does not select a backend or add capture fields.
+
 Under the default `allowlisted` policy, every emitted mechanism has
 `params: null` with `params_omitted: "policy"` beside it, and
 `templates.operations` is always empty. Every `params: null` carries a

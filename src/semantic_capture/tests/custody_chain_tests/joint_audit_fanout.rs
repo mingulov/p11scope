@@ -10,6 +10,629 @@ use crate::semantics_objects::journal::{
 };
 use crate::semantics_objects::{Lifetime, ObjectEffect, ObjectGap};
 
+#[derive(Clone, Copy)]
+enum PublicationReceipts {
+    All,
+    Missing,
+    Capacity(usize),
+}
+
+impl CanonicalFanoutScene {
+    fn publication_step(
+        &mut self,
+        frame: &mut Option<IngestedJointQuantum>,
+        fault: &impl crate::semantics_objects::journal::FaultEpoch,
+        remaining: &mut usize,
+    ) -> anyhow::Result<Option<crate::discovery::engine::inventory_coordinator::BatchReceipt>> {
+        use crate::discovery::engine::inventory_coordinator::JointCommitProgress;
+        let h0 = self.scene.real.h0.clone();
+        let mut births = NativeFrameBirths {
+            h0: &h0,
+            attached: &self.attached,
+            retained: &mut self.births,
+            seen: Vec::new(),
+            unreadable: false,
+        };
+        let progress = self.scene.real.scene.coordinator.commit_joint_batch(
+            false,
+            &mut self.scene.real.lane,
+            &self.scene.producers,
+            frame,
+            &mut births,
+            fault,
+            remaining,
+        )?;
+        Ok(match progress {
+            JointCommitProgress::Pending => None,
+            JointCommitProgress::Published(receipt) => Some(receipt),
+        })
+    }
+
+    fn assert_publication_hidden(&self, old_revision: u64) {
+        use crate::inventory_present::Presentation;
+        let coordinator = &self.scene.real.scene.coordinator;
+        assert!(coordinator.publication_pending());
+        assert_eq!(coordinator.registry().published_revision(), old_revision);
+        assert!(Presentation::try_capture(coordinator, "system", 1, 2, 1).is_err());
+        assert!(Presentation::try_capture_dashboard(coordinator, "system", 1, 2, 1, 2, 1).is_err());
+        // Legacy entrypoints share the pre-read guard while the ordinary
+        // lane remains inactive. They cannot construct a partial snapshot.
+        for dashboard in [false, true] {
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if dashboard {
+                        Presentation::capture_dashboard(coordinator, "system", 1, 2, 1, 2, 1)
+                    } else {
+                        Presentation::capture(coordinator, "system", 1, 2, 1)
+                    }
+                }))
+                .is_err()
+            );
+        }
+    }
+
+    fn complete_publication(
+        &mut self,
+        frame: &mut Option<IngestedJointQuantum>,
+        fault: &impl crate::semantics_objects::journal::FaultEpoch,
+        old_revision: u64,
+    ) -> crate::discovery::engine::inventory_coordinator::BatchReceipt {
+        // Every slice shares one unit across all actual feeds/effects. The
+        // fixture has <128 transitions, so this also detects stranded heads.
+        for _ in 0..256 {
+            let mut remaining = 1;
+            if let Some(receipt) = self
+                .publication_step(frame, fault, &mut remaining)
+                .expect("same original publication remains runnable")
+            {
+                assert!(frame.is_none(), "only actual disposal consumes the frame");
+                assert!(!self.scene.real.scene.coordinator.publication_pending());
+                assert_eq!(receipt.registry_published, old_revision + 1);
+                return receipt;
+            }
+            self.assert_publication_hidden(old_revision);
+        }
+        panic!("same original publication must reach its real finished boundary")
+    }
+}
+
+/// Catches registration selecting permanent S1Only before a genuine receipt
+/// arrives, publishing an empty first head, or exposing an applied partial view.
+#[test]
+fn joint_first_real_birth_publishes_one_revision() {
+    use crate::inventory_present::Presentation;
+    for (policy, joint) in [
+        (PublicationReceipts::All, 2),
+        (PublicationReceipts::Missing, 0),
+        (PublicationReceipts::Capacity(1), 1),
+    ] {
+        let (mut fixture, original) =
+            CanonicalFanoutScene::first_publication_with_functions(1, &["C_CreateObject"], policy);
+        let coordinator = &fixture.scene.real.scene.coordinator;
+        assert_eq!(coordinator.registry().joint_feeds(), 0);
+        let old_revision = coordinator.registry().published_revision();
+        let old = Presentation::capture(coordinator, "system", 1, 2, 1);
+        let old_text = format!("{old:?}");
+        assert!(old.instances.is_empty());
+        let claims = coordinator
+            .joint_capture()
+            .adapter()
+            .invocation_claims_for_test();
+        assert_eq!(
+            claims.0, joint,
+            "selected originals stay claimed; actual S1Only negatives already dispose their own"
+        );
+        let mut frame = Some(original);
+        let receipt = fixture.complete_publication(&mut frame, &BirthFault, old_revision);
+        assert!(receipt.registry_applied > 0);
+        assert_eq!(format!("{old:?}"), old_text);
+        let coordinator = &fixture.scene.real.scene.coordinator;
+        assert_eq!(coordinator.registry().joint_feeds(), joint);
+        let feeds = fixture.feeds();
+        assert_eq!(feeds.len(), 2, "denied receipt does not drop an admission");
+        assert_eq!(
+            feeds.iter().map(|feed| feed.reduced).sum::<u64>(),
+            joint as u64
+        );
+        assert!(feeds.iter().all(|feed| feed.staged == 0));
+        for feed in feeds {
+            assert_eq!(fixture.s1_counts(feed.id), (1, 0, 0, 0, 0));
+        }
+        let published = Presentation::try_capture(coordinator, "system", 1, 3, 1).unwrap();
+        assert_eq!(published.instances.len(), 2);
+        assert_eq!(published.semantic_edges.len(), 2);
+        assert!(
+            published
+                .semantic_edges
+                .iter()
+                .all(|edge| edge.api_returns == Some(1))
+        );
+        assert_eq!(coordinator.reference_h3_audit_state(), (1, false));
+        fixture.scene.assert_claims(&[]);
+        assert_eq!(
+            coordinator.joint_capture().ledger().roles_for_test()[..4],
+            [0, 0, 0, 0]
+        );
+    }
+}
+
+/// Catches a retry repeating original admission, physical publication,
+/// diagnostics, H9 reduction, or silently applying a later staged batch.
+#[test]
+fn joint_publication_retry_does_not_repeat_admission_or_reducer() {
+    use crate::inventory_diagnostics::{
+        CaptureOutcome, CaptureSettlement, DiagnosticConfig, DiagnosticOutcome,
+        RetainedIdentityView,
+    };
+    let (mut fixture, original) = CanonicalFanoutScene::first_publication_with_functions(
+        1,
+        &["C_CreateObject"],
+        PublicationReceipts::All,
+    );
+    let caller = fixture.births[0].0;
+    let module_key = fixture.scene.real.modules[0].0.clone();
+    let coordinator = &mut fixture.scene.real.scene.coordinator;
+    let module = coordinator.registry().module_id_for(&module_key).unwrap();
+    coordinator
+        .enable_diagnostics(DiagnosticConfig::default())
+        .unwrap();
+    coordinator
+        .registry_mut()
+        .note_counted_use(caller, &module_key, 7, 1, 2, 0);
+    let old_revision = coordinator.registry().published_revision();
+    let claims = coordinator
+        .joint_capture()
+        .adapter()
+        .invocation_claims_for_test();
+    let roles = coordinator.joint_capture().ledger().roles_for_test();
+    let identity = original.identity();
+    let frontier = original.frontier();
+    let snapshot = coordinator.registry().semantic_resource_snapshot();
+    let hold = coordinator
+        .registry()
+        .reserve_semantic_storage(snapshot.limit_bytes - snapshot.charged_bytes)
+        .unwrap();
+    let mut frame = Some(original);
+    let mut remaining = 1;
+    assert!(
+        fixture
+            .publication_step(&mut frame, &BirthFault, &mut remaining)
+            .is_err()
+    );
+    let coordinator = &fixture.scene.real.scene.coordinator;
+    assert!(
+        !coordinator.publication_pending(),
+        "reservation refuses before apply"
+    );
+    assert_eq!(coordinator.registry().published_revision(), old_revision);
+    assert!(fixture.feeds().is_empty());
+    assert_eq!(
+        coordinator
+            .joint_capture()
+            .adapter()
+            .invocation_claims_for_test(),
+        claims
+    );
+    assert_eq!(coordinator.joint_capture().ledger().roles_for_test(), roles);
+    assert_eq!(frame.as_ref().unwrap().identity(), identity);
+    assert_eq!(frame.as_ref().unwrap().frontier(), frontier);
+    drop(hold);
+    let mut zero = 0;
+    assert!(
+        fixture
+            .publication_step(&mut frame, &BirthFault, &mut zero)
+            .unwrap()
+            .is_none()
+    );
+    fixture.assert_publication_hidden(old_revision);
+    let coordinator = &fixture.scene.real.scene.coordinator;
+    assert_eq!(
+        coordinator
+            .registry()
+            .edge(caller, module)
+            .unwrap()
+            .entry_count,
+        7
+    );
+    assert!(
+        fixture
+            .feeds()
+            .iter()
+            .all(|feed| feed.reduced == 0 && feed.staged == 1)
+    );
+    // The next batch stays in the original staging Vec, without being folded
+    // into the already-applied phase by either the Joint or legacy paths.
+    let coordinator = &mut fixture.scene.real.scene.coordinator;
+    coordinator
+        .registry_mut()
+        .note_counted_use(caller, &module_key, 4, 3, 4, 7);
+    assert!(coordinator.commit_batch(true).is_err());
+    assert!(
+        coordinator
+            .commit_batch_with_semantics(true, Some(&mut fixture.scene.real.lane))
+            .is_err()
+    );
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| coordinator
+            .registry_mut()
+            .publish()))
+        .is_err()
+    );
+    for _ in 0..3 {
+        let feeds = fixture.feeds();
+        let claims = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .invocation_claims_for_test();
+        assert!(
+            fixture
+                .publication_step(&mut frame, &BirthFault, &mut zero)
+                .unwrap()
+                .is_none()
+        );
+        fixture.assert_publication_hidden(old_revision);
+        assert_eq!(fixture.feeds(), feeds);
+        assert_eq!(
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .joint_capture()
+                .adapter()
+                .invocation_claims_for_test(),
+            claims
+        );
+        assert_eq!(
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .registry()
+                .edge(caller, module)
+                .unwrap()
+                .entry_count,
+            7
+        );
+    }
+    let (mut foreign, foreign_frame) = CanonicalFanoutScene::first_publication_with_functions(
+        1,
+        &["C_CreateObject"],
+        PublicationReceipts::All,
+    );
+    let mut foreign_frame = Some(foreign_frame);
+    let foreign_id = foreign_frame.as_ref().unwrap().identity();
+    assert!(
+        fixture
+            .publication_step(&mut foreign_frame, &BirthFault, &mut remaining)
+            .is_err()
+    );
+    assert_eq!(foreign_frame.as_ref().unwrap().identity(), foreign_id);
+    fixture.assert_publication_hidden(old_revision);
+    let first = fixture.complete_publication(&mut frame, &BirthFault, old_revision);
+    let feeds = fixture.feeds();
+    assert!(
+        feeds
+            .iter()
+            .all(|feed| feed.reduced == 1 && feed.staged == 0)
+    );
+    let coordinator = &mut fixture.scene.real.scene.coordinator;
+    assert_eq!(
+        coordinator
+            .registry()
+            .edge(caller, module)
+            .unwrap()
+            .entry_count,
+        7
+    );
+    let next = coordinator.commit_batch(false).unwrap();
+    assert_eq!(next.registry_published, first.registry_published + 1);
+    assert_eq!(
+        coordinator
+            .registry()
+            .edge(caller, module)
+            .unwrap()
+            .entry_count,
+        11
+    );
+    assert_eq!(fixture.feeds(), feeds);
+    let finished = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .take_diagnostics(DiagnosticOutcome {
+            capture_outcome: CaptureOutcome::Completed,
+            capture_settlement: CaptureSettlement::Settled,
+        })
+        .unwrap();
+    struct Identities<'a, S: crate::discovery::caller_registry::ProcessSource>(
+        &'a crate::discovery::engine::inventory_coordinator::InventoryCoordinator<S>,
+    );
+    impl<S: crate::discovery::caller_registry::ProcessSource> RetainedIdentityView
+        for Identities<'_, S>
+    {
+        fn application(&self, caller: u32) -> Option<&str> {
+            self.0
+                .adapter()
+                .record(CallerId(caller))?
+                .exe
+                .as_ref()?
+                .path
+                .as_deref()
+        }
+        fn module(&self, module: u32) -> Option<&str> {
+            self.0
+                .registry()
+                .module(crate::discovery::caller_registry::ModuleId(module))?
+                .paths
+                .first()
+                .map(String::as_str)
+        }
+    }
+    let mut bytes = Vec::new();
+    finished
+        .write_jsonl(
+            &mut bytes,
+            &Identities(&fixture.scene.real.scene.coordinator),
+            || false,
+        )
+        .unwrap();
+    let rows = std::str::from_utf8(&bytes)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|row| row["kind"] == "publication")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rows.len(),
+        2,
+        "one observer call for each original mutation, never each retry"
+    );
+    assert_eq!(
+        (
+            rows[0]["staged"].as_u64(),
+            rows[0]["base"].as_u64(),
+            rows[0]["edge_total"].as_u64()
+        ),
+        (Some(7), Some(0), Some(7))
+    );
+    assert_eq!(
+        (
+            rows[1]["staged"].as_u64(),
+            rows[1]["base"].as_u64(),
+            rows[1]["edge_total"].as_u64()
+        ),
+        (Some(4), Some(7), Some(11))
+    );
+    let foreign_revision = foreign
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .published_revision();
+    foreign.complete_publication(&mut foreign_frame, &BirthFault, foreign_revision);
+}
+
+/// Catches a second domain's real late broad loss becoming visible after an
+/// intermediate positive revision, or skipping earlier already-delivered heads.
+#[test]
+fn joint_second_domain_fault_is_invisible_until_fanout() {
+    use crate::inventory_present::Presentation;
+    let (mut fixture, original) = CanonicalFanoutScene::first_publication_with_functions(
+        1,
+        &["C_CreateObject"],
+        PublicationReceipts::All,
+    );
+    let old_revision = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .published_revision();
+    let old = Presentation::capture(&fixture.scene.real.scene.coordinator, "system", 1, 2, 1);
+    let old_text = format!("{old:?}");
+    let fault = FrameFault::clean();
+    let mut frame = Some(original);
+    let mut first_reduced = false;
+    for _ in 0..64 {
+        let mut remaining = 1;
+        assert!(
+            fixture
+                .publication_step(&mut frame, &fault, &mut remaining)
+                .unwrap()
+                .is_none()
+        );
+        fixture.assert_publication_hidden(old_revision);
+        let reduced = fixture.feeds().iter().map(|feed| feed.reduced).sum::<u64>();
+        assert!(
+            reduced <= 1,
+            "one service slice cannot silently replay the next domain"
+        );
+        if reduced == 1 {
+            first_reduced = true;
+            break;
+        }
+    }
+    assert!(first_reduced);
+    let grown = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .model()
+        .project();
+    assert_eq!(
+        grown.objects.len(),
+        1,
+        "the first actual seal creates live history"
+    );
+    assert_eq!(grown.objects[0].lifetime, Lifetime::Live);
+    fault.epoch.set(1);
+    let receipt = fixture.complete_publication(&mut frame, &fault, old_revision);
+    assert_eq!(receipt.registry_published, old_revision + 1);
+    assert_eq!(format!("{old:?}"), old_text);
+    let coordinator = &fixture.scene.real.scene.coordinator;
+    let history = coordinator.joint_capture().model().project();
+    assert_eq!(
+        history.object(grown.objects[0].id).unwrap().lifetime,
+        Lifetime::OutcomeLost
+    );
+    let feeds = fixture.feeds();
+    assert_eq!(feeds.iter().map(|feed| feed.reduced).sum::<u64>(), 1);
+    assert_eq!(feeds.iter().map(|feed| feed.disposed).sum::<u64>(), 1);
+    assert!(feeds.iter().all(|feed| feed.degraded && feed.staged == 0));
+    assert!(Presentation::try_capture(coordinator, "system", 1, 3, 1).is_ok());
+    fixture.scene.assert_claims(&[]);
+    assert_eq!(
+        coordinator.joint_capture().ledger().roles_for_test()[..4],
+        [0, 0, 0, 0]
+    );
+    assert_eq!(coordinator.reference_h3_audit_state(), (1, false));
+
+    // A global FrameFault truthfully affects every retained key. A separate
+    // genuine localized negative proves that disjoint proved domains survive.
+    let (mut fixture, first) = CanonicalFanoutScene::first_publication_with_functions(
+        1,
+        &["C_CreateObject"],
+        PublicationReceipts::All,
+    );
+    let first_revision = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .published_revision();
+    fixture.complete_publication(&mut Some(first), &BirthFault, first_revision);
+    let before = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .model()
+        .project();
+    assert_eq!(before.objects.len(), 2);
+    let raw_children = [OwnedStoppedChild::new(), OwnedStoppedChild::new()];
+    let mut callers = Vec::new();
+    for (offset, child) in raw_children.iter().enumerate() {
+        let caller = fixture.scene.real.bind(
+            child.id(),
+            ImageIdentity {
+                task_cookie: 73 + offset as u64,
+                exec_id: 0,
+            },
+            0,
+        );
+        fixture.scene.push(child.id(), 0, "C_CreateObject", 1);
+        callers.push(caller);
+    }
+    let raw = fixture.scene.collect_with_fault(&BirthFault);
+    fixture.scene.real.h0.0.borrow_mut().collected = Some(raw);
+    let batch = fixture.scene.real.tick();
+    for (child, caller) in raw_children.iter().zip(&callers) {
+        fixture.scene.admit_providers(child.id(), *caller, &[0]);
+    }
+    fixture.scene.prepare_batch(batch, 2);
+    let raw = fixture
+        .scene
+        .real
+        .h0
+        .0
+        .borrow_mut()
+        .collected
+        .take()
+        .unwrap();
+    let coordinator = &mut fixture.scene.real.scene.coordinator;
+    let mut ingested = raw
+        .ingest(
+            coordinator.joint_capture_mut().adapter_mut(),
+            &fixture.scene.producers,
+            &fixture.grant,
+        )
+        .unwrap_or_else(|(_, reason)| panic!("original localized C/D input: {reason:?}"));
+    let mut claims = Vec::new();
+    while let Some((position, proof)) = coordinator
+        .claim_next_prepared_admission(&fixture.scene.producers, &ingested)
+        .unwrap()
+    {
+        assert!(proof.is_ok());
+        claims.push(position);
+    }
+    assert_eq!(claims, [3, 4]);
+    let roles = coordinator.joint_capture().ledger().roles_for_test();
+    assert_eq!(roles[..4], [0, 2, 0, 0]);
+    while coordinator
+        .stage_next_prepared_admission_with_disposition(&fixture.scene.producers, &mut ingested)
+        .unwrap()
+    {}
+    assert_eq!(coordinator.joint_capture().ledger().roles_for_test(), roles);
+    assert!(coordinator.finish_prepared_semantic_batch(&fixture.scene.real.lane));
+    let localized = acquire(&mut fixture.scene, ingested, &fixture.attached, &BirthFault);
+    let failure = localized.failure_for_test().unwrap();
+    assert_eq!(
+        failure.gap,
+        crate::semantics_objects::journal::JournalGap::ImageTainted
+    );
+    assert!(matches!(&failure.scope,
+        crate::semantics_objects::journal::SealFailureScope::AffectedDomains(domains)
+            if domains.len() == 2
+    ));
+    assert!(
+        fixture
+            .receipts()
+            .iter()
+            .all(|receipt| !failure.affects_domain(receipt.domain()))
+    );
+    let revision = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .published_revision();
+    fixture.complete_publication(&mut Some(localized), &BirthFault, revision);
+    let coordinator = &fixture.scene.real.scene.coordinator;
+    assert_eq!(coordinator.registry().joint_feeds(), 2);
+    for caller in callers {
+        let direct = coordinator
+            .registry()
+            .instance_semantic_edges()
+            .find(|record| record.caller == caller)
+            .unwrap();
+        assert_eq!(
+            coordinator.registry().feed_mode_for_test(direct.id),
+            Some(crate::semantics_key_use::FeedMode::S1Only)
+        );
+        assert_eq!(fixture.s1_counts(direct.id), (1, 0, 0, 0, 0));
+    }
+    let after = coordinator.joint_capture().model().project();
+    for object in &before.objects {
+        assert_eq!(after.object(object.id).unwrap().lifetime, Lifetime::Live);
+    }
+    assert!(
+        fixture
+            .feeds()
+            .iter()
+            .all(|feed| !feed.degraded && !feed.fallback && feed.staged == 0)
+    );
+    assert!(Presentation::try_capture(coordinator, "system", 1, 4, 1).is_ok());
+    fixture.scene.assert_claims(&[]);
+    assert_eq!(
+        coordinator.joint_capture().ledger().roles_for_test()[..4],
+        [0, 0, 0, 0]
+    );
+}
+
 struct CanonicalFanoutScene {
     scene: JointScene,
     attached: crate::attach::AttachedSemanticSet,
@@ -87,7 +710,11 @@ impl CanonicalFanoutScene {
         )
     }
 
-    fn prior_sealed_with_functions(providers: usize, functions: &[&str]) -> Self {
+    fn first_publication_with_functions(
+        providers: usize,
+        functions: &[&str],
+        receipt_policy: PublicationReceipts,
+    ) -> (Self, IngestedJointQuantum) {
         let (held, attached) = HeldProviders::with_attachment(providers, functions);
         let mut scene = JointScene::from_held(held, Some(attached));
         scene.real.h0.0.borrow_mut().io.script.local = 1;
@@ -119,7 +746,7 @@ impl CanonicalFanoutScene {
         scene.admit_providers(child.id(), second, &[0]);
         scene.prepare_batch(batch, 2);
         let raw = scene.real.h0.0.borrow_mut().collected.take().unwrap();
-        let (ingested, _, grant) = scene.ingest_with_grant(raw);
+        let (mut ingested, _, grant) = scene.ingest_with_grant(raw);
         let admitted = {
             let (prepared, _) = scene.real.scene.coordinator.prepared_joint_parts().unwrap();
             prepared.admissions().cloned().collect::<Vec<_>>()
@@ -132,7 +759,17 @@ impl CanonicalFanoutScene {
             .unwrap();
         assert_eq!(admitted.len(), 2);
         assert_eq!(current.len(), 2, "two actual collected New receipts");
-        let claims = claim_and_finish(&mut scene, &ingested);
+        let mut claims = Vec::new();
+        while let Some((position, proof)) = scene
+            .real
+            .scene
+            .coordinator
+            .claim_next_prepared_admission(&scene.producers, &ingested)
+            .unwrap()
+        {
+            claims.push((position, proof.expect("actual first key claim")));
+        }
+        assert_eq!(claims.len(), 2);
         let attached = attachment(&mut scene);
         assert!(
             scene
@@ -195,22 +832,93 @@ impl CanonicalFanoutScene {
             births[0].1.receipt().domain(),
             births[1].1.receipt().domain()
         );
+        if let PublicationReceipts::Capacity(limit) = receipt_policy {
+            scene
+                .real
+                .scene
+                .coordinator
+                .registry_mut()
+                .reference_instance_limit(limit);
+        }
+        let mut installed = 0;
         for (caller, witness, _) in &births {
             let input = admitted
                 .iter()
                 .find(|input| input.journal_binding().3 == *caller)
                 .unwrap();
-            assert!(
-                scene
-                    .real
-                    .scene
-                    .coordinator
-                    .registry_mut()
-                    .install_joint_receipt(input.instance_key_for_test(), *witness.receipt(),)
+            if matches!(receipt_policy, PublicationReceipts::Missing) {
+                continue;
+            }
+            let accepted = scene
+                .real
+                .scene
+                .coordinator
+                .registry_mut()
+                .install_joint_receipt(input.instance_key_for_test(), *witness.receipt());
+            let expected = match receipt_policy {
+                PublicationReceipts::All => true,
+                PublicationReceipts::Capacity(limit) => installed < limit,
+                PublicationReceipts::Missing => unreachable!(),
+            };
+            assert_eq!(accepted, expected, "actual grant capacity is respected");
+            installed += usize::from(accepted);
+        }
+        if matches!(receipt_policy, PublicationReceipts::Capacity(_)) {
+            // The exercised refusal is receipt installation. Restore the
+            // ordinary instance cap so both genuine admissions still publish.
+            scene
+                .real
+                .scene
+                .coordinator
+                .registry_mut()
+                .reference_instance_limit(usize::MAX);
+        }
+        // Selection is settled before the actual disposition port: missing
+        // grants must become S1Only negatives, never hidden by old staging.
+        while scene
+            .real
+            .scene
+            .coordinator
+            .stage_next_prepared_admission_with_disposition(&scene.producers, &mut ingested)
+            .unwrap()
+        {}
+        assert!(
+            scene
+                .real
+                .scene
+                .coordinator
+                .finish_prepared_semantic_batch(&scene.real.lane)
+        );
+        let frame = acquire(&mut scene, ingested, &attached, &BirthFault);
+        if matches!(receipt_policy, PublicationReceipts::All) {
+            assert!(frame.failure_for_test().is_none());
+        } else {
+            assert_eq!(
+                frame.failure_for_test().unwrap().gap,
+                crate::semantics_objects::journal::JournalGap::ImageTainted
             );
         }
-        let frame = acquire(&mut scene, ingested, &attached, &BirthFault);
-        assert!(frame.failure_for_test().is_none());
+        (
+            Self {
+                scene,
+                attached,
+                births,
+                grant,
+                _child: child,
+            },
+            frame,
+        )
+    }
+
+    fn prior_sealed_with_functions(providers: usize, functions: &[&str]) -> Self {
+        let (mut fixture, frame) =
+            Self::first_publication_with_functions(providers, functions, PublicationReceipts::All);
+        let Self {
+            scene,
+            attached,
+            births,
+            ..
+        } = &mut fixture;
         scene
             .real
             .scene
@@ -220,7 +928,7 @@ impl CanonicalFanoutScene {
         assert_eq!(scene.real.scene.coordinator.registry().joint_feeds(), 2);
         // Bootstrap the fixture with actual native rechecks and the SAME
         // acquired audit/model/ledger. Tests below exercise new frame delivery.
-        for (caller, witness, rows) in &mut births {
+        for (caller, witness, rows) in births.iter_mut() {
             let fresh = {
                 let mut h0 = scene.real.h0.0.borrow_mut();
                 let HeldH0 { capture, io, .. } = &mut *h0;
@@ -229,7 +937,7 @@ impl CanonicalFanoutScene {
                         io,
                         rows,
                         capture,
-                        &attached,
+                        attached,
                         scene
                             .real
                             .scene
@@ -285,13 +993,7 @@ impl CanonicalFanoutScene {
                 .iter()
                 .all(|object| object.lifetime == Lifetime::Live)
         );
-        Self {
-            scene,
-            attached,
-            births,
-            grant,
-            _child: child,
-        }
+        fixture
     }
 
     fn receipts(&self) -> Vec<BootstrapReceipt> {

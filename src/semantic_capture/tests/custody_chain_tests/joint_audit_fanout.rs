@@ -1856,6 +1856,419 @@ impl JointBirthEvidenceSource for RefuseOneBirth<'_> {
     }
 }
 
+/// Only the native leaf is substituted. Capture, stash, witnesses and frame
+/// remain the originals from the real collection/admission path above.
+struct HeldCommitNative<'a> {
+    io: &'a mut HeldIo,
+    rows: Vec<(
+        crate::semantics_objects::ObjectDomain,
+        &'a mut NativeBirthRows,
+    )>,
+    reads: &'a Cell<(usize, usize)>,
+}
+
+impl crate::inventory_semantics::JointNativeIo for HeldCommitNative<'_> {
+    fn recheck_birth(
+        &mut self,
+        witness: &RetainedBirthWitness,
+        capture: &SemanticCapture,
+        attached: &crate::attach::AttachedSemanticSet,
+        binding: &SemanticCallerBinding,
+    ) -> Result<SessionBirthEvidence, BirthObservationRefusal> {
+        let (births, faults) = self.reads.get();
+        self.reads.set((births + 1, faults));
+        let (_, rows) = self
+            .rows
+            .iter_mut()
+            .find(|(domain, _)| *domain == witness.receipt().domain())
+            .ok_or(BirthObservationRefusal::BindingMismatch)?;
+        witness.fresh_evidence_with(self.io, *rows, capture, attached, binding)
+    }
+
+    fn fault_epoch(&self) -> Result<u64, crate::semantics_objects::journal::FaultReadError> {
+        use crate::semantics_objects::journal::FaultReadError;
+        use std::sync::atomic::Ordering;
+        let (births, faults) = self.reads.get();
+        self.reads.set((births, faults + 1));
+        let epoch = self.io.script.fault_cell.load(Ordering::SeqCst);
+        if epoch > u64::from(u32::MAX) {
+            Err(FaultReadError::Saturated)
+        } else {
+            Ok(epoch)
+        }
+    }
+}
+
+fn with_held_commit_io<R>(
+    h0: &SharedH0,
+    attached: &crate::attach::AttachedSemanticSet,
+    retained: &mut [(CallerId, RetainedBirthWitness, NativeBirthRows)],
+    reads: &Cell<(usize, usize)>,
+    hold_native_read: bool,
+    inspect: impl for<'io> FnOnce(crate::inventory_semantics::JointCommitIo<'io>) -> R,
+) -> Result<R, SemanticRefusal> {
+    let mut owned =
+        h0.0.try_borrow_mut()
+            .map_err(|_| SemanticRefusal::Unavailable)?;
+    // One whole-owner borrow is split once, before either native reader is
+    // constructed. No callback tries to borrow the SharedH0 again.
+    let HeldH0 {
+        capture,
+        io,
+        stash,
+        collected_producers,
+        ..
+    } = &mut *owned;
+    let producers = collected_producers
+        .as_ref()
+        .ok_or(SemanticRefusal::Unavailable)?;
+    let (mut witnesses, rows): (Vec<_>, Vec<_>) = retained
+        .iter_mut()
+        .map(|(_, witness, rows)| (&*witness, (witness.receipt().domain(), rows)))
+        .unzip();
+    witnesses.sort_unstable_by_key(|witness| witness.receipt().domain());
+    let mut native = HeldCommitNative { io, rows, reads };
+    let native = RefCell::new(&mut native);
+    // This holds the exact native cell, not the Capture/stash. Its only use
+    // is the direct read-preflight refusal twin below.
+    let hold = hold_native_read.then(|| native.borrow_mut());
+    let result = crate::inventory_semantics::with_joint_commit_io_for_test(
+        capture, stash, producers, attached, &witnesses, &native, inspect,
+    );
+    drop(hold);
+    result
+}
+
+#[test]
+fn joint_commit_io_shares_capture_and_fresh_native_reads() {
+    use crate::discovery::engine::inventory_coordinator::JointCommitProgress;
+    use std::sync::atomic::Ordering;
+    for move_fault in [false, true] {
+        let (mut fixture, original) = CanonicalFanoutScene::first_publication_with_functions(
+            1,
+            &["C_CreateObject", "C_SignInit"],
+            PublicationReceipts::All,
+        );
+        let identity = original.identity();
+        let old_revision = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .published_revision();
+        let h0 = fixture.scene.real.h0.clone();
+        let fault_cell = h0.0.borrow().io.script.fault_cell.clone();
+        let reads = Cell::new((0, 0));
+        let mut frame = Some(original);
+        let mut fault_moved = false;
+        let mut published = false;
+        for _ in 0..256 {
+            let mut remaining = 1;
+            let CanonicalFanoutScene {
+                scene,
+                attached,
+                births,
+                ..
+            } = &mut fixture;
+            let progress = with_held_commit_io(&h0, attached, births, &reads, false, |io| {
+                scene.real.scene.coordinator.commit_joint_batch_with_io(
+                    io,
+                    &scene.producers,
+                    &mut frame,
+                    &mut remaining,
+                )
+            })
+            .expect("one disjoint borrow of the original H0 owner")
+            .expect("the real publication uses the same scoped readers");
+            if let JointCommitProgress::Published(receipt) = progress {
+                assert!(frame.is_none());
+                assert_eq!(receipt.registry_published, old_revision + 1);
+                published = true;
+                break;
+            }
+            fixture.assert_publication_hidden(old_revision);
+            assert!(frame.as_ref().unwrap().identity() == identity);
+            if move_fault && !fault_moved && fixture.feeds().iter().any(|feed| feed.reduced == 1) {
+                assert!(
+                    fixture
+                        .scene
+                        .real
+                        .scene
+                        .coordinator
+                        .joint_capture()
+                        .model()
+                        .project()
+                        .objects
+                        .iter()
+                        .any(|object| object.lifetime == Lifetime::Live)
+                );
+                // The next scope must reread the native cell, rather than
+                // reuse the initial audit's clean scalar.
+                fault_cell.store(1, Ordering::SeqCst);
+                fault_moved = true;
+            }
+        }
+        assert!(published, "bounded same-frame service must finish");
+        assert!(reads.get().0 != 0 && reads.get().1 != 0);
+        if move_fault {
+            assert!(fault_moved);
+            assert!(fixture.feeds().iter().all(|feed| feed.degraded));
+            assert_eq!(
+                fixture.feeds().iter().map(|feed| feed.reduced).sum::<u64>(),
+                1
+            );
+            assert!(
+                fixture
+                    .scene
+                    .real
+                    .scene
+                    .coordinator
+                    .joint_capture()
+                    .model()
+                    .project()
+                    .objects
+                    .iter()
+                    .all(|object| object.lifetime != Lifetime::Live)
+            );
+        } else {
+            assert!(fixture.feeds().iter().all(|feed| {
+                feed.reduced == 1 && feed.staged == 0 && !feed.degraded && !feed.fallback
+            }));
+        }
+        fixture.scene.assert_claims(&[]);
+        assert_eq!(
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .joint_capture()
+                .ledger()
+                .roles_for_test()[..4],
+            [0, 0, 0, 0]
+        );
+    }
+}
+
+#[test]
+fn joint_commit_io_foreign_and_busy_reads_preserve_originals() {
+    use crate::discovery::engine::inventory_coordinator::JointCommitProgress;
+    use crate::semantics_objects::journal::FaultReadError;
+    let snapshot = |fixture: &CanonicalFanoutScene| {
+        let coordinator = &fixture.scene.real.scene.coordinator;
+        (
+            coordinator.registry().published_revision(),
+            fixture.feeds(),
+            coordinator.joint_capture().ledger().roles_for_test(),
+            coordinator
+                .joint_capture()
+                .adapter()
+                .invocation_claims_for_test(),
+        )
+    };
+    let (mut fixture, original) = CanonicalFanoutScene::first_publication_with_functions(
+        1,
+        &["C_CreateObject", "C_SignInit"],
+        PublicationReceipts::All,
+    );
+    let identity = original.identity();
+    let h0 = fixture.scene.real.h0.clone();
+    let reads = Cell::new((0, 0));
+    let mut frame = Some(original);
+    let before = snapshot(&fixture);
+    let foreign = crate::attach::SessionDrainProducers::test_pair(
+        fixture.scene.producers.native_domain(),
+        EventsDomain::test_standin(fixture.scene.producers.events_id()),
+    );
+    let mut remaining = 1;
+    let CanonicalFanoutScene {
+        scene,
+        attached,
+        births,
+        ..
+    } = &mut fixture;
+    assert!(
+        with_held_commit_io(&h0, attached, births, &reads, false, |io| {
+            scene.real.scene.coordinator.commit_joint_batch_with_io(
+                io,
+                &foreign,
+                &mut frame,
+                &mut remaining,
+            )
+        })
+        .unwrap()
+        .is_err()
+    );
+    assert_eq!(
+        reads.get(),
+        (0, 0),
+        "foreign allocation refuses before native I/O"
+    );
+    assert_eq!(remaining, 1);
+    assert!(frame.as_ref().unwrap().identity() == identity);
+    assert_eq!(snapshot(&fixture), before);
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .joint_feeds(),
+        0
+    );
+    // Apply the actual originals with no delivery allowance, so typed target
+    // selection is available for the direct read-preflight controls.
+    let mut zero = 0;
+    let CanonicalFanoutScene {
+        scene,
+        attached,
+        births,
+        ..
+    } = &mut fixture;
+    assert!(matches!(
+        with_held_commit_io(&h0, attached, births, &reads, false, |io| {
+            scene.real.scene.coordinator.commit_joint_batch_with_io(
+                io,
+                &scene.producers,
+                &mut frame,
+                &mut zero,
+            )
+        })
+        .unwrap()
+        .unwrap(),
+        JointCommitProgress::Pending
+    ));
+    let targets = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .joint_feed_targets()
+        .collect::<Vec<_>>();
+    assert_eq!(targets.len(), 2);
+    let before = snapshot(&fixture);
+    for busy in [true, false] {
+        let CanonicalFanoutScene {
+            scene,
+            attached,
+            births,
+            ..
+        } = &mut fixture;
+        with_held_commit_io(&h0, attached, births, &reads, busy, |mut io| {
+            let (births, fault) = io.native_checks();
+            let bindings = scene.real.scene.coordinator.semantic_bindings();
+            let own = bindings.get(targets[0].caller()).unwrap();
+            let other = bindings.get(targets[1].caller()).unwrap();
+            assert!(matches!(
+                births.take_for(&targets[0], other),
+                Err(BirthObservationRefusal::BindingMismatch)
+            ));
+            assert_eq!(
+                reads.get(),
+                (0, 0),
+                "foreign binding never reaches native I/O"
+            );
+            if busy {
+                assert_eq!(fault.fault_epoch(), Err(FaultReadError::Unreadable));
+                assert!(matches!(
+                    births.take_for(&targets[0], own),
+                    Err(BirthObservationRefusal::CurrentPartition)
+                ));
+                assert_eq!(
+                    reads.get(),
+                    (0, 0),
+                    "busy cell refuses before either native read"
+                );
+            } else {
+                assert_eq!(fault.fault_epoch(), Ok(0));
+                assert!(births.take_for(&targets[0], own).is_ok());
+            }
+        })
+        .unwrap();
+        assert_eq!(snapshot(&fixture), before);
+        assert!(frame.as_ref().unwrap().identity() == identity);
+    }
+    assert_eq!(reads.get(), (1, 1));
+}
+
+#[test]
+fn joint_commit_io_pending_continuation_keeps_original_stash() {
+    let PendingH3Scene {
+        mut fixture,
+        mut frame,
+        child_c: _child_c,
+        ..
+    } = pending_h3_from_stash(false, &BirthFault);
+    let coordinator = &fixture.scene.real.scene.coordinator;
+    let before = (
+        fixture.feeds(),
+        coordinator.joint_capture().ledger().roles_for_test(),
+        coordinator
+            .joint_capture()
+            .adapter()
+            .invocation_claims_for_test(),
+        coordinator
+            .joint_capture()
+            .adapter()
+            .retained_starts_for_test(),
+    );
+    assert_eq!(before.1[..4], [0, 3, 0, 1]);
+    let h0 = fixture.scene.real.h0.clone();
+    assert_eq!(h0.0.borrow().stash.min_outcome_position(), Some(4));
+    let reads = Cell::new((0, 0));
+    let CanonicalFanoutScene {
+        scene,
+        attached,
+        births,
+        ..
+    } = &mut fixture;
+    with_held_commit_io(&h0, attached, births, &reads, false, |io| {
+        let mut ports = scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&scene.producers)
+            .unwrap();
+        frame.bind_targets(&ports).unwrap();
+        assert_eq!(
+            frame.defer_pending_h3_with_view(&mut ports, io.continuation()),
+            Ok(QuantumSealProgress::AwaitFutureInput)
+        );
+        frame
+            .finish_pending_h3_with_view(&mut ports, io.continuation())
+            .unwrap_or_else(|(_, reason)| {
+                panic!("same producer-owned stash remains available: {reason:?}")
+            });
+    })
+    .unwrap();
+    let coordinator = &fixture.scene.real.scene.coordinator;
+    assert_eq!(
+        (
+            fixture.feeds(),
+            coordinator.joint_capture().ledger().roles_for_test(),
+            coordinator
+                .joint_capture()
+                .adapter()
+                .invocation_claims_for_test(),
+            coordinator
+                .joint_capture()
+                .adapter()
+                .retained_starts_for_test(),
+        ),
+        before
+    );
+    assert_eq!(h0.0.borrow().stash.min_outcome_position(), Some(4));
+    assert_eq!(coordinator.reference_h3_acknowledged_below(), 0);
+    assert_eq!(
+        reads.get(),
+        (0, 0),
+        "pending custody neither seals nor invents a native recheck"
+    );
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct FeedState {
     id: RegistryInstanceId,

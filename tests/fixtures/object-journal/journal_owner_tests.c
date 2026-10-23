@@ -1030,14 +1030,30 @@ static void ring_reserve_submit_discard(void)
 struct mint_work {
     u64 *out;
     unsigned count;
+    pthread_barrier_t *round;
 };
+
+static void mint_pthread_require(int rc, const char *operation)
+{
+    if (!rc)
+        return;
+    /* A partial thread start or failed barrier must terminate this fixture,
+     * never leave the parent waiting for workers missing a participant. */
+    fprintf(stderr, "FAIL mint_contention_unique: %s failed: %d\n", operation, rc);
+    exit(EXIT_FAILURE);
+}
 
 static void *mint_hammer(void *arg)
 {
     struct mint_work *work = arg;
     unsigned i;
-    for (i = 0; i < work->count; i++)
+    for (i = 0; i < work->count; i++) {
+        int rc = pthread_barrier_wait(work->round);
+        mint_pthread_require(rc == PTHREAD_BARRIER_SERIAL_THREAD ? 0 : rc, "round start");
         work->out[i] = p11_journal_mint_thread(&journal_ctl);
+        rc = pthread_barrier_wait(work->round);
+        mint_pthread_require(rc == PTHREAD_BARRIER_SERIAL_THREAD ? 0 : rc, "round end");
+    }
     return NULL;
 }
 
@@ -1046,20 +1062,30 @@ static void mint_contention_unique(void)
     static u64 tickets[4][200];
     struct mint_work work[4];
     pthread_t thread[4];
-    unsigned i, j, k;
+    pthread_barrier_t round;
+    unsigned i, j, k, minted = 0;
     int seen[800];
     reset();
+    /* Each round permits one call per worker: at most three other calls can
+     * win while one call is retrying, within the production eight-CAS bound.
+     * The separate interference control proves bounded refusal. These rounds
+     * do not change the host volatile accesses into C11 atomics. */
+    mint_pthread_require(pthread_barrier_init(&round, NULL, 4), "barrier init");
     for (i = 0; i < 4; i++) {
         work[i].out = tickets[i];
         work[i].count = 200;
-        assert(!pthread_create(&thread[i], NULL, mint_hammer, &work[i]));
+        work[i].round = &round;
+        mint_pthread_require(
+            pthread_create(&thread[i], NULL, mint_hammer, &work[i]), "thread create");
     }
     for (i = 0; i < 4; i++)
-        assert(!pthread_join(thread[i], NULL));
+        mint_pthread_require(pthread_join(thread[i], NULL), "thread join");
+    mint_pthread_require(pthread_barrier_destroy(&round), "barrier destroy");
     memset(seen, 0, sizeof(seen));
     for (i = 0; i < 4; i++)
         for (j = 0; j < 200; j++) {
             u64 ticket = tickets[i][j];
+            minted += ticket != 0;
             EXPECT(ticket >= 1 && ticket <= 800, "hammer ticket %llu in range",
                    (unsigned long long)ticket);
             if (ticket >= 1 && ticket <= 800) {
@@ -1076,6 +1102,14 @@ static void mint_contention_unique(void)
     EXPECT(journal_ctl.next_thread == 800, "counter advanced exactly, saw %llu",
            (unsigned long long)journal_ctl.next_thread);
     EXPECT(journal_ctl.poison == 0, "no poison under contention");
+    EXPECT(journal_ctl.admission_failures == 0, "no bounded-round admission refusal, saw %llu",
+           (unsigned long long)journal_ctl.admission_failures);
+    fprintf(stderr,
+            "mint_contention_unique: attempts=800 nonzero=%u counter=%llu "
+            "admission_failures=%llu poison=%llu\n",
+            minted, (unsigned long long)journal_ctl.next_thread,
+            (unsigned long long)journal_ctl.admission_failures,
+            (unsigned long long)journal_ctl.poison);
 }
 
 /* Seed the OBJECT_START subordinate path: descriptor row 1 (marker

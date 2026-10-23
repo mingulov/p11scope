@@ -1015,10 +1015,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         &self.registry
     }
 
-    /// The capture's joint owner (read side): tests assert the SAME
-    /// ledger a commit borrowed. Production borrows the field
-    /// directly at publication; the staged seal tick takes the model.
-    #[cfg(test)]
+    /// Borrow the canonical capture owner without changing its model or
+    /// ledger. Collected refresh checks original raw custody through this
+    /// same ledger while independently reserving provider storage.
     pub(crate) fn joint_capture(
         &self,
     ) -> &crate::semantics_objects::journal::joint_driver::JointCaptureOwner {

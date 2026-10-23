@@ -29,7 +29,7 @@ fn joint_real_bind_refresh_preserves_collected_first_new() {
         // allocation while its cursor is still initial. It cannot refresh a
         // later raw collected through the canonical owner.
         let mut foreign_adapter =
-            JournalAdapter::new(crate::semantics_objects::journal::JournalLimits::default());
+            JournalAdapter::new(crate::semantics_objects::journal::JournalLimits::policy());
         let reserve = scene
             .real
             .scene
@@ -293,6 +293,92 @@ fn joint_real_bind_refresh_preserves_collected_first_new() {
         assert!(Arc::ptr_eq(births[0].receipt.original_pin(), &original_pin));
         assert_eq!(births[0].receipt.image(), image);
     }
+}
+
+#[test]
+fn joint_collected_refresh_rejects_stale_or_stopped_owner() {
+    fn assert_refused(
+        scene: &mut JointScene,
+        raw: &mut RawJointQuantum,
+        reason: RawQuantumRefusal,
+    ) {
+        let before = {
+            let owned = scene.real.h0.0.borrow();
+            (
+                owned.capture.next_token,
+                owned.io.script.now,
+                owned.io.script.health.len(),
+                owned.io.script.raises,
+                owned.last_refresh_observation.clone(),
+                raw.pending_h0_records(),
+            )
+        };
+        let roles = scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .ledger()
+            .roles_for_test();
+        scene.assert_claims(&[]);
+        assert_eq!(
+            crate::inventory::bind_semantic_callers_for_test(
+                &mut scene.real.scene.coordinator,
+                &mut scene.real.lane,
+                raw,
+                &scene.producers,
+            ),
+            Err(reason)
+        );
+        let owned = scene.real.h0.0.borrow();
+        assert_eq!(
+            (
+                owned.capture.next_token,
+                owned.io.script.now,
+                owned.io.script.health.len(),
+                owned.io.script.raises,
+                owned.last_refresh_observation.clone(),
+                raw.pending_h0_records(),
+            ),
+            before,
+            "refusal precedes any refresh audit, scan or raw delivery"
+        );
+        assert_eq!(
+            scene
+                .real
+                .scene
+                .coordinator
+                .joint_capture()
+                .ledger()
+                .roles_for_test(),
+            roles
+        );
+        scene.assert_claims(&[]);
+    }
+
+    let mut scene = JointScene::for_audit(1);
+    let pid = std::process::id();
+    scene.bind(pid, image(71), &[0]);
+    // Retain an actual earlier empty Raw, then advance its SAME owner's
+    // frontier by ingesting the actual later completed call. No cut is reset.
+    let mut stale = scene.collect_with_fault(&BirthFault);
+    let original = stale.h0_identity();
+    stale
+        .validate_refresh(
+            scene.real.scene.coordinator.joint_capture().adapter(),
+            &scene.producers,
+        )
+        .unwrap();
+    scene.push(pid, 0, "C_SignInit", 1);
+    let raw = scene.prepare(1);
+    let (_ingested, _) = scene.ingest(raw);
+    assert_refused(&mut scene, &mut stale, RawQuantumRefusal::StaleFrontier);
+    {
+        let (adapter, model) = scene.real.scene.coordinator.joint_capture_mut().parts();
+        let _ = adapter.stop(model);
+    }
+    assert_refused(&mut scene, &mut stale, RawQuantumRefusal::Stopped);
+    assert!(stale.h0_identity() == original);
 }
 
 impl CanonicalFanoutScene {

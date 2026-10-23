@@ -2078,6 +2078,7 @@ pub(crate) mod tests {
         checks: usize,
         damage: Option<(usize, GrowthDamage)>,
         target_refusal: Option<BankRefusal>,
+        fd_preflight: Option<(usize, Result<FdSnapshot, BankRefusal>)>,
         failure: Option<&'static str>,
         initial_unreadable: bool,
         commit_absent: bool,
@@ -2121,6 +2122,12 @@ pub(crate) mod tests {
             assert!(published.iter().all(|slot| self.routes.contains_key(slot)));
             if let Some(reason) = self.target_refusal {
                 return Err(reason);
+            }
+            if let Some((required, snapshot)) = self.fd_preflight.take() {
+                check_fd_headroom_with(required, || {
+                    self.trace.push("fd-query");
+                    snapshot
+                })?;
             }
             Ok(())
         }
@@ -4435,6 +4442,152 @@ pub(crate) mod tests {
             )
             .unwrap();
         (owned.dir, owned.history, snapshot, owned.pool)
+    }
+
+    #[test]
+    fn format2_fd_headroom_preflight_preserves_existing_publication() {
+        for (label, required, snapshot, refusal) in [
+            (
+                "finite exact fit",
+                24,
+                Ok(FdSnapshot {
+                    soft_limit: FdLimit::Finite(124),
+                    observed_open: 100,
+                }),
+                None,
+            ),
+            (
+                "finite one short",
+                24,
+                Ok(FdSnapshot {
+                    soft_limit: FdLimit::Finite(123),
+                    observed_open: 100,
+                }),
+                Some(BankRefusal::Budget),
+            ),
+            (
+                "unreadable",
+                24,
+                Err(BankRefusal::Native),
+                Some(BankRefusal::Native),
+            ),
+            (
+                "finite overflow",
+                24,
+                Ok(FdSnapshot {
+                    soft_limit: FdLimit::Finite(u64::MAX),
+                    observed_open: u64::MAX - 23,
+                }),
+                Some(BankRefusal::Budget),
+            ),
+            (
+                "unlimited healthy",
+                24,
+                Ok(FdSnapshot {
+                    soft_limit: FdLimit::Unlimited,
+                    observed_open: 100,
+                }),
+                None,
+            ),
+            (
+                "unlimited overflow",
+                24,
+                Ok(FdSnapshot {
+                    soft_limit: FdLimit::Unlimited,
+                    observed_open: u64::MAX - 23,
+                }),
+                Some(BankRefusal::Budget),
+            ),
+            (
+                "zero request",
+                0,
+                Ok(FdSnapshot {
+                    soft_limit: FdLimit::Unlimited,
+                    observed_open: 100,
+                }),
+                Some(BankRefusal::Budget),
+            ),
+        ] {
+            let pool = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
+            let mut directory = BankDirectory::counts_growth_v2();
+            let mut history = plan(1);
+            let mut io = GrowthIo::new(&pool);
+            assert!(matches!(
+                directory.stage_with(
+                    &mut io,
+                    &mut history,
+                    growth_reservation(),
+                    &pool.reserver()
+                ),
+                BankPublication::Published { transaction: 1, .. }
+            ));
+            let old = io.routes[&0];
+            history.extend_exact(plan(2)).unwrap();
+            let slots = history.slots.clone();
+            let charged = pool.snapshot().charged_bytes;
+            io.next_stage();
+            // At two possible CPUs, the existing conservative shared-bank
+            // two-slot envelope is 24 FD slots. The caller allows 128: only
+            // the independently observed OS headroom differs across twins.
+            io.fd_preflight = Some((required, snapshot));
+            let result = directory.stage_with(
+                &mut io,
+                &mut history,
+                growth_reservation(),
+                &pool.reserver(),
+            );
+            assert_eq!(
+                io.trace.iter().filter(|&&step| step == "fd-query").count(),
+                usize::from(required != 0),
+                "{label}"
+            );
+            if let Some(reason) = refusal {
+                assert_eq!(result, BankPublication::Refused(reason), "{label}");
+                assert_eq!(history.counter_consumed_end(), 1);
+                assert_eq!(history.slots, slots);
+                assert!(history.is_active(0) && history.is_active(1));
+                assert_eq!(directory.allocated_high_water(), 1);
+                assert_eq!(directory.next_transaction, NonZeroU64::new(2));
+                assert_eq!(directory.published_indices().collect::<Vec<_>>(), [0]);
+                assert!(!directory.quarantined);
+                assert!(
+                    io.trace
+                        .iter()
+                        .all(|step| matches!(*step, "validate" | "fd-query"))
+                );
+                assert_eq!(io.maps, BTreeMap::from([(0, 101)]));
+                assert_eq!(io.outer, BTreeMap::from([(0, 101)]));
+                assert_eq!(io.routes, BTreeMap::from([(0, old)]));
+                assert_eq!(io.providers, BTreeSet::from([0]));
+                assert_eq!(io.entries, BTreeSet::from([0]));
+                assert_eq!(io.returns, BTreeSet::from([0]));
+                assert_eq!(io.commits.len(), 1);
+                assert_eq!(io.attempted, BTreeSet::from([1]));
+                assert_eq!(io.held.len(), 1);
+                assert_eq!(pool.snapshot().charged_bytes, charged);
+            } else {
+                assert_eq!(
+                    result,
+                    BankPublication::Published {
+                        transaction: 2,
+                        extent: BankExtent { first: 1, end: 2 }
+                    },
+                    "{label}"
+                );
+                assert_eq!(history.counter_consumed_end(), 2);
+                assert_eq!(directory.published_indices().collect::<Vec<_>>(), [0, 1]);
+                assert_eq!(io.routes[&0], old);
+                assert_eq!(io.held.len(), 2);
+                assert_eq!(pool.snapshot().charged_bytes, charged + 1_114_112);
+                let query = io
+                    .trace
+                    .iter()
+                    .position(|&step| step == "fd-query")
+                    .unwrap();
+                let observe = io.trace.iter().position(|&step| step == "observe").unwrap();
+                assert!(query < observe);
+            }
+        }
     }
 
     #[test]

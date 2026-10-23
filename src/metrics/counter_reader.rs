@@ -1039,86 +1039,226 @@ mod tests {
         }
     }
 
+    fn banked_scripted_sample(
+        snapshot: crate::attach::counter_banks::CounterPublishedSnapshot,
+        later: bool,
+    ) -> Scripted {
+        let mut source = Scripted::sample(CounterMode::Counts, later);
+        let last_stats = source.stats.remove(&1).unwrap();
+        source.stats.insert(2, last_stats);
+        source
+            .rvs
+            .push((key(2, 0x1_0000_0204), [if later { 2 } else { 1 }, 0]));
+        source.published = Some(snapshot);
+        source
+    }
+
     #[test]
     fn banked_reader_preserves_physical_prefix_and_routing_health() {
-        let pool = test_pool();
+        let (_dir, history, snapshot, pool) =
+            crate::attach::counter_banks::tests::growth_snapshot_fixture(false);
         let mut collector = CounterCollector::new(LIMITS, pool.reserver());
+        let mut source = banked_scripted_sample(snapshot, false);
         assert_eq!(
             collector.observe(acquire(
-                &Scripted::sample(CounterMode::Counts, false),
+                &source,
                 NonZeroU64::new(5).unwrap(),
-                &plan(),
+                &history,
                 LIMITS,
-                &pool.reserver(),
+                &pool.reserver()
             )),
-            CounterObservation::Initial,
+            CounterObservation::Initial
         );
+        source = banked_scripted_sample(source.published.take().unwrap(), true);
         match collector.observe(acquire(
-            &Scripted::sample(CounterMode::Counts, true),
+            &source,
             NonZeroU64::new(5).unwrap(),
-            &plan(),
+            &history,
             LIMITS,
             &pool.reserver(),
         )) {
             CounterObservation::Advanced { deltas, .. } => {
+                assert_eq!((deltas[0].slot, deltas[1].slot), (0, 2));
                 assert_eq!((deltas[0].entered, deltas[0].returned), (5, 4));
-                assert_eq!(deltas[0].target.object, PinnedObjectId(1));
-                assert_eq!(deltas[1].target.object, PinnedObjectId(2));
+                assert_eq!(deltas[0].target.object, PinnedObjectId(0));
+                assert_eq!(deltas[1].target.object, PinnedObjectId(1));
                 assert_eq!(deltas[0].rv_counts.get(&HIGH_RV), Some(&1));
+                assert_eq!(deltas[1].rv_counts.get(&0x1_0000_0204), Some(&1));
             }
-            other => panic!("two real physical rows must remain distinct: {other:?}"),
+            other => panic!("actual published physical rows must remain distinct: {other:?}"),
         }
         for issue in [CounterIssue::BankRouting, CounterIssue::BankQuarantined] {
+            let (_dir, history, snapshot, pool) =
+                crate::attach::counter_banks::tests::growth_snapshot_fixture(false);
             let mut collector = CounterCollector::new(LIMITS, pool.reserver());
-            let mut damaged = Scripted::sample(CounterMode::Counts, true);
-            damaged.routing = Some(issue);
+            let mut source = banked_scripted_sample(snapshot, false);
+            assert_eq!(
+                collector.observe(acquire(
+                    &source,
+                    NonZeroU64::new(6).unwrap(),
+                    &history,
+                    LIMITS,
+                    &pool.reserver()
+                )),
+                CounterObservation::Initial
+            );
+            source = banked_scripted_sample(source.published.take().unwrap(), true);
+            source.routing = Some(issue);
             let read = acquire(
-                &damaged,
+                &source,
                 NonZeroU64::new(6).unwrap(),
-                &plan(),
+                &history,
                 LIMITS,
                 &pool.reserver(),
             )
             .unwrap();
             assert_eq!(
-                damaged.rv_reads.get(),
+                source.rv_reads.get(),
                 0,
-                "known poisoned routing must not sample rows"
+                "poisoned Some(snapshot) routing must not sample rows"
             );
             assert_eq!(
-                damaged.accesses.get(),
+                source.accesses.get(),
                 2,
-                "health and kernel controls still read"
+                "banked routing still requires both health and kernel reads"
             );
             assert_eq!(
                 collector.observe(Ok(read)),
                 CounterObservation::Unavailable(issue)
             );
+            let baseline = collector.current().unwrap().view();
+            assert_eq!(
+                baseline
+                    .rows
+                    .unwrap()
+                    .iter()
+                    .map(|row| (row.view().slot, row.view().returned))
+                    .collect::<Vec<_>>(),
+                [(0, 5), (2, 1)]
+            );
+            source = banked_scripted_sample(source.published.take().unwrap(), true);
             assert_eq!(
                 collector.observe(acquire(
-                    &Scripted::sample(CounterMode::Counts, true),
+                    &source,
                     NonZeroU64::new(6).unwrap(),
-                    &plan(),
+                    &history,
                     LIMITS,
-                    &pool.reserver(),
+                    &pool.reserver()
                 )),
                 CounterObservation::Unavailable(issue),
-                "same-generation clean cells cannot erase routing/quarantine loss",
+                "same-owner clean banked reads cannot erase routing loss"
             );
         }
-        let mut damaged = Scripted::sample(CounterMode::Counts, true);
-        damaged.routing = Some(CounterIssue::BankRouting);
-        damaged.fail = Some(ReadStage::KernelEvidence);
-        assert!(matches!(
-            acquire(
-                &damaged,
+        for stage in [ReadStage::Health, ReadStage::KernelEvidence] {
+            let (_dir, history, snapshot, pool) =
+                crate::attach::counter_banks::tests::growth_snapshot_fixture(false);
+            let mut collector = CounterCollector::new(LIMITS, pool.reserver());
+            let mut source = banked_scripted_sample(snapshot, false);
+            assert_eq!(
+                collector.observe(acquire(
+                    &source,
+                    NonZeroU64::new(7).unwrap(),
+                    &history,
+                    LIMITS,
+                    &pool.reserver()
+                )),
+                CounterObservation::Initial
+            );
+            source = banked_scripted_sample(source.published.take().unwrap(), true);
+            source.routing = Some(CounterIssue::BankRouting);
+            source.fail = Some(stage);
+            let failed = acquire(
+                &source,
                 NonZeroU64::new(7).unwrap(),
-                &plan(),
+                &history,
                 LIMITS,
-                &pool.reserver()
-            ),
-            Err(ReadStage::KernelEvidence),
-        ));
+                &pool.reserver(),
+            );
+            assert_eq!(failed.as_ref().err(), Some(&stage));
+            assert_eq!(source.rv_reads.get(), 0);
+            assert_eq!(
+                source.accesses.get(),
+                if stage == ReadStage::Health { 1 } else { 2 }
+            );
+            assert_eq!(
+                collector.observe(failed),
+                CounterObservation::ReadFailed(stage)
+            );
+            assert_eq!(
+                collector
+                    .current()
+                    .unwrap()
+                    .view()
+                    .rows
+                    .unwrap()
+                    .iter()
+                    .map(|row| (row.view().slot, row.view().returned))
+                    .collect::<Vec<_>>(),
+                [(0, 5), (2, 1)]
+            );
+            source = banked_scripted_sample(source.published.take().unwrap(), true);
+            match collector.observe(acquire(
+                &source,
+                NonZeroU64::new(7).unwrap(),
+                &history,
+                LIMITS,
+                &pool.reserver(),
+            )) {
+                CounterObservation::Advanced { deltas, .. } => {
+                    assert_eq!((deltas[0].entered, deltas[0].returned), (5, 4))
+                }
+                other => panic!("banked failed mandatory read changed the baseline: {other:?}"),
+            }
+        }
+        for saturated in [true, false] {
+            let (_dir, history, snapshot, pool) =
+                crate::attach::counter_banks::tests::growth_snapshot_fixture(false);
+            let mut collector = CounterCollector::new(LIMITS, pool.reserver());
+            let mut source = banked_scripted_sample(snapshot, false);
+            assert_eq!(
+                collector.observe(acquire(
+                    &source,
+                    NonZeroU64::new(8).unwrap(),
+                    &history,
+                    LIMITS,
+                    &pool.reserver()
+                )),
+                CounterObservation::Initial
+            );
+            source = banked_scripted_sample(source.published.take().unwrap(), true);
+            if saturated {
+                source.health.saturated = true;
+            } else {
+                source.kernel.rv_update_failures = 1;
+            }
+            let expected = if saturated {
+                CounterIssue::ProducerSaturated
+            } else {
+                CounterIssue::KernelEvidence
+            };
+            assert_eq!(
+                collector.observe(acquire(
+                    &source,
+                    NonZeroU64::new(8).unwrap(),
+                    &history,
+                    LIMITS,
+                    &pool.reserver()
+                )),
+                CounterObservation::Unavailable(expected)
+            );
+            assert_eq!(
+                collector
+                    .current()
+                    .unwrap()
+                    .view()
+                    .rows
+                    .unwrap()
+                    .iter()
+                    .map(|row| row.view().returned)
+                    .collect::<Vec<_>>(),
+                [5, 1]
+            );
+        }
     }
 
     #[test]

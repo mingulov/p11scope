@@ -9,7 +9,7 @@ use crate::semantics_objects::journal::joint_audit::{
     DisposedJointQuantum, IngestedJointQuantum, JointBirthEvidenceSource, QuantumSealProgress,
 };
 use crate::semantics_objects::journal::joint_driver::{
-    IngestedRaw, JointCaptureOwner, RawQuantumRefusal,
+    IngestedRaw, JointCaptureOwner, RawJointQuantum, RawQuantumRefusal,
 };
 use crate::semantics_objects::journal::{AttestationRefusal, JournalAdapter, JournalDomainProof};
 use crate::semantics_objects::journal::{FaultEpoch, FaultReadError};
@@ -46,10 +46,63 @@ impl FaultEpoch for BorrowedFault<'_> {
 }
 
 impl<Source: ProcessSource> InventoryCoordinator<Source> {
-    #[allow(clippy::too_many_arguments)] // Original lane/frame/producer/I/O/budget borrows, not a new owner.
-    pub(crate) fn commit_joint_batch(
+    /// Finish physical preparation and its actual H0 cut while the original
+    /// batch is still Collected. No admission, claim or frame audit exists yet.
+    pub(crate) fn prepare_joint_publication(
         &mut self,
         engine_changed: bool,
+        lane: &mut AttestedSemanticLane,
+        raw: &mut RawJointQuantum,
+        producers: &SessionDrainProducers,
+    ) -> Result<()> {
+        raw.validate_preparation(self.joint_capture.adapter(), producers)
+            .map_err(|reason| anyhow::anyhow!("Joint preparation original refused: {reason:?}"))?;
+        if lane.domain() != producers.native_domain() || !lane.is_live() || lane.is_finished() {
+            bail!("Joint preparation must retain its actual live lane");
+        }
+        lane.validate_collected_preparation(raw)
+            .map_err(|reason| anyhow::anyhow!("Joint preparation H0 owner refused: {reason:?}"))?;
+        if self.publication_pending() {
+            self.registry.validate_joint_preparation(raw)?;
+            if self.joint_publication.is_none() {
+                bail!("Joint preparation has no original completion context");
+            }
+            return Ok(());
+        }
+        if !self
+            .semantic_finalizer
+            .as_ref()
+            .is_some_and(|state| state.permits_joint_preparation(producers))
+        {
+            bail!(
+                "Joint preparation requires the original collected semantic batch and no untaken H3"
+            );
+        }
+        let storage = self
+            .registry
+            .reserve_semantic_storage(std::mem::size_of::<PendingJointPublication>())
+            .map_err(|reason| anyhow::anyhow!("Joint completion storage refused: {reason:?}"))?;
+        self.registry
+            .begin_joint_publication(raw, &self.joint_capture, producers)?;
+        let completion = match self.prepare_physical_publication(engine_changed, Some(lane)) {
+            Ok(completion) => completion,
+            Err(reason) => {
+                self.registry.cancel_unapplied_joint_publication();
+                return Err(reason);
+            }
+        };
+        self.observe_pending_h0_images();
+        let cut_barrier = self.finalize_physical_tail(lane, Some(raw));
+        self.joint_publication = Some(PendingJointPublication {
+            completion,
+            cut_barrier,
+            _storage: storage,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn commit_joint_batch(
+        &mut self,
         lane: &mut AttestedSemanticLane,
         producers: &SessionDrainProducers,
         frame: &mut Option<IngestedJointQuantum>,
@@ -58,7 +111,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         remaining: &mut usize,
     ) -> Result<JointCommitProgress> {
         self.commit_batch_inner(
-            engine_changed,
+            false, // Its original engine tail already finished in preparation.
             Some(lane),
             Some(JointCommitInput {
                 producers,
@@ -72,7 +125,6 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
 
     pub(in crate::discovery::engine::inventory_coordinator) fn commit_joint_publication_inner(
         &mut self,
-        engine_changed: bool,
         lane: &mut AttestedSemanticLane,
         input: JointCommitInput<'_>,
     ) -> Result<JointCommitProgress> {
@@ -86,6 +138,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let original = frame
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Joint publication requires its original frame"))?;
+        if self.joint_publication.is_none() || !self.registry.publication_pending() {
+            bail!("Joint physical preparation must precede admissions and the original audit");
+        }
         if lane.domain() != producers.native_domain() || !lane.is_live() || lane.is_finished() {
             bail!("Joint publication must retain its original live lane");
         }
@@ -95,31 +150,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .validate_joint_publication(original, &self.joint_capture, producers)?;
         self.joint_frame_ports(producers)
             .map_err(|reason| anyhow::anyhow!("Joint publication ports refused: {reason:?}"))?;
-        if !self.publication_pending() {
-            let storage = self
-                .registry
-                .reserve_semantic_storage(std::mem::size_of::<PendingJointPublication>())
-                .map_err(|reason| {
-                    anyhow::anyhow!("Joint completion storage refused: {reason:?}")
-                })?;
-            self.registry
-                .begin_joint_publication(original, &self.joint_capture, producers)?;
-            let completion = match self.prepare_publication(engine_changed, Some(lane)) {
-                Ok(completion) => completion,
-                Err(reason) => {
-                    // The only fallible tail precedes taking original cgroup
-                    // custody. Nothing has applied; originals remain queued.
-                    self.registry.cancel_unapplied_joint_publication();
-                    return Err(reason);
-                }
-            };
-            self.joint_publication = Some(PendingJointPublication {
-                completion,
-                _storage: storage,
-            });
-        } else if self.joint_publication.is_none() {
-            bail!("Joint publication has no original completion context");
-        }
+        self.registry
+            .bind_joint_publication_frame(original, &self.joint_capture, producers)?;
         if !self.registry.joint_publication_applied() {
             self.publish_registry(Some((
                 frame.as_ref().expect("retained original frame"),
@@ -531,6 +563,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         lane: &mut AttestedSemanticLane,
         floor: Option<u64>,
     ) -> Result<(), SemanticRefusal> {
+        let floor = floor
+            .into_iter()
+            .chain(
+                self.joint_publication
+                    .as_ref()
+                    .and_then(|pending| pending.cut_barrier),
+            )
+            .max();
         let state = self
             .semantic_finalizer
             .as_mut()

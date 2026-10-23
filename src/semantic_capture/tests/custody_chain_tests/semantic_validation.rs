@@ -590,6 +590,66 @@ impl LaneTestIo for SharedH0 {
                 }),
         )
     }
+    fn validate_collected_preparation(
+        &self,
+        raw: &crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+    ) -> Result<(), SemanticRefusal> {
+        self.0
+            .borrow()
+            .capture
+            .validate_collected_preparation(raw)
+            .map_err(|_| SemanticRefusal::Unavailable)
+    }
+    fn physical_gaps_collected(
+        &mut self,
+        domain: NativeDomainId,
+        gaps: &mut Vec<PhysicalSemanticGap>,
+        raw: &mut crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+    ) -> Option<Result<SemanticBatch, SemanticRefusal>> {
+        let mut owned = self.0.borrow_mut();
+        let HeldH0 { capture, io, .. } = &mut *owned;
+        let repeated: Vec<_> = gaps.iter().map(PhysicalSemanticGap::test_repeat).collect();
+        Some(
+            capture
+                .apply_physical_gaps_collected_with(io, std::mem::take(gaps), raw)
+                .map_err(|_| SemanticRefusal::Unavailable)
+                .and_then(|report| {
+                    if !repeated.is_empty()
+                        && repeated.iter().all(|gap| {
+                            gap.episode
+                                .applied
+                                .load(std::sync::atomic::Ordering::SeqCst)
+                        })
+                    {
+                        let raises = io.script.raises;
+                        let again = capture
+                            .apply_physical_gaps_collected_with(io, repeated, raw)
+                            .map_err(|_| SemanticRefusal::Unavailable)?;
+                        assert!(again.outcomes().is_empty());
+                        assert_eq!(again.allocated_below(), report.allocated_below());
+                        assert_eq!(again.awaiting_floor(), report.awaiting_floor());
+                        assert_eq!(again.shed_floor(), report.shed_floor());
+                        assert_eq!(again.exhausted(), report.exhausted());
+                        assert_eq!(io.script.raises, raises, "actual applied gap is a no-op");
+                    }
+                    let negatives = report
+                        .outcomes()
+                        .iter()
+                        .filter_map(|outcome| match outcome {
+                            TickOutcome::Invalidation(invalidation)
+                                if matches!(invalidation.scope(), InvalidationScope::FaultEra) =>
+                            {
+                                invalidation.position()
+                            }
+                            _ => None,
+                        })
+                        .max()
+                        .map(|ordinal| vec![LaneNegative::CutBarrier { ordinal }])
+                        .unwrap_or_default();
+                    SemanticBatch::from_tick_report(domain, report, negatives, now_ns())
+                }),
+        )
+    }
     fn finish(&mut self, domain: NativeDomainId) -> SemanticBatch {
         SemanticBatch::from_tick_report(
             domain,

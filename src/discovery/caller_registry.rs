@@ -33,7 +33,9 @@ use crate::semantics_edge::resources::{SemanticResourceRefusal, SemanticResource
 use crate::semantics_edge::{EdgeSemantics, SemanticCall};
 use crate::semantics_objects::journal::ConsumptionOrdinal;
 use crate::semantics_objects::journal::joint_audit::{DisposedJointQuantum, IngestedJointQuantum};
-use crate::semantics_objects::journal::joint_driver::{JointCaptureOwner, RawQuantumIdentity};
+use crate::semantics_objects::journal::joint_driver::{
+    JointCaptureOwner, RawJointQuantum, RawQuantumIdentity,
+};
 use anyhow::{Result, anyhow, bail};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::BuildHasher as _;
@@ -2324,7 +2326,7 @@ pub(crate) struct JointPublicationPending;
 
 struct AppliedJointPublication {
     identity: RawQuantumIdentity,
-    frontier: ConsumptionOrdinal,
+    frontier: Option<ConsumptionOrdinal>,
     base_revision: u64,
     applied: Option<usize>,
     targets_bound: bool,
@@ -3314,7 +3316,9 @@ impl CallerRegistry {
             .map_err(|reason| anyhow!("Joint publication original refused: {reason:?}"))?;
         if let Some(phase) = &self.joint_publication
             && (phase.identity != frame.identity()
-                || phase.frontier != frame.frontier()
+                || phase
+                    .frontier
+                    .is_some_and(|frontier| frontier != frame.frontier())
                 || phase.base_revision != self.facts_revision)
         {
             bail!("Joint publication must resume its exact original frame and revision");
@@ -3324,11 +3328,12 @@ impl CallerRegistry {
 
     pub(crate) fn begin_joint_publication(
         &mut self,
-        frame: &IngestedJointQuantum,
+        raw: &RawJointQuantum,
         owner: &JointCaptureOwner,
         producers: &crate::attach::SessionDrainProducers,
     ) -> Result<()> {
-        self.validate_joint_publication(frame, owner, producers)?;
+        raw.validate_preparation(owner.adapter(), producers)
+            .map_err(|reason| anyhow!("Joint preparation original refused: {reason:?}"))?;
         if self.joint_publication.is_some() {
             bail!("Joint publication is already retained");
         }
@@ -3337,13 +3342,45 @@ impl CallerRegistry {
             .reserve(std::mem::size_of::<AppliedJointPublication>())
             .map_err(|reason| anyhow!("Joint publication storage refused: {reason:?}"))?;
         self.joint_publication = Some(AppliedJointPublication {
-            identity: frame.identity(),
-            frontier: frame.frontier(),
+            identity: raw.h0_identity(),
+            frontier: None,
             base_revision: self.facts_revision,
             applied: None,
             targets_bound: false,
             _storage: storage,
         });
+        Ok(())
+    }
+
+    pub(crate) fn validate_joint_preparation(&self, raw: &RawJointQuantum) -> Result<()> {
+        let phase = self
+            .joint_publication
+            .as_ref()
+            .ok_or_else(|| anyhow!("no original Joint preparation"))?;
+        if phase.identity != raw.h0_identity()
+            || phase.frontier.is_some()
+            || phase.applied.is_some()
+            || phase.base_revision != self.facts_revision
+        {
+            bail!("Joint preparation must retain its original raw allocation and base revision");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn bind_joint_publication_frame(
+        &mut self,
+        frame: &IngestedJointQuantum,
+        owner: &JointCaptureOwner,
+        producers: &crate::attach::SessionDrainProducers,
+    ) -> Result<()> {
+        self.validate_joint_publication(frame, owner, producers)?;
+        let phase = self
+            .joint_publication
+            .as_mut()
+            .ok_or_else(|| anyhow!("Joint physical preparation has not run"))?;
+        if phase.frontier.is_none() {
+            phase.frontier = Some(frame.frontier());
+        }
         Ok(())
     }
 
@@ -3366,6 +3403,13 @@ impl CallerRegistry {
         observer: Option<&mut dyn FnMut(CountPublication)>,
     ) -> Result<usize> {
         self.validate_joint_publication(frame, owner, producers)?;
+        if !self
+            .joint_publication
+            .as_ref()
+            .is_some_and(|phase| phase.frontier == Some(frame.frontier()))
+        {
+            bail!("Joint inputs require their original bound frame before apply");
+        }
         assert!(
             self.joint_publication
                 .as_ref()
@@ -3411,7 +3455,7 @@ impl CallerRegistry {
             .as_ref()
             .ok_or_else(|| anyhow!("no retained Joint publication"))?;
         if phase.identity != disposed.identity()
-            || phase.frontier != disposed.frontier()
+            || phase.frontier != Some(disposed.frontier())
             || phase.base_revision != self.facts_revision
             || !phase.targets_bound
         {

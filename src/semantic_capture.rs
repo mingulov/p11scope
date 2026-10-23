@@ -640,12 +640,17 @@ pub(crate) struct TickReport {
     exhausted: bool,
 }
 
+/// Only this module constructs an owner from the nonrecycled Capture identity.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CollectedH0Owner(u64);
+
 /// Move-only acknowledgement minted only after the real collected leaf ran
 /// all H0 routing and stamped its actual allocation watermark. The retained
 /// raw quantum checks the exact identity before applying any scalar.
 pub(crate) struct CollectedH0Disposition {
     quantum: crate::semantics_objects::journal::joint_driver::RawQuantumIdentity,
     native: NativeDomainId,
+    owner: CollectedH0Owner,
     allocated_below: u64,
     pending: bool,
 }
@@ -655,9 +660,12 @@ impl CollectedH0Disposition {
         self,
         quantum: crate::semantics_objects::journal::joint_driver::RawQuantumIdentity,
         native: NativeDomainId,
-    ) -> Option<(u64, bool)> {
-        (self.quantum == quantum && self.native == native && self.allocated_below != 0)
-            .then_some((self.allocated_below, self.pending))
+    ) -> Option<(CollectedH0Owner, u64, bool)> {
+        (self.quantum == quantum && self.native == native && self.allocated_below != 0).then_some((
+            self.owner,
+            self.allocated_below,
+            self.pending,
+        ))
     }
 }
 
@@ -1599,6 +1607,47 @@ impl SemanticCapture {
             gaps,
         )
     }
+
+    /// Only the Capture that routed this actual collection may extend its
+    /// H0 disposition. Native-domain equality alone does not bind an owner.
+    pub(crate) fn validate_collected_preparation(
+        &self,
+        quantum: &crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+    ) -> Result<(), crate::semantics_objects::journal::joint_driver::RawQuantumRefusal> {
+        quantum.validate_h0_cut(CollectedH0Owner(self.identity))
+    }
+
+    pub(crate) fn apply_physical_gaps_collected(
+        &mut self,
+        session: &mut Session,
+        gaps: Vec<PhysicalSemanticGap>,
+        quantum: &mut crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+    ) -> anyhow::Result<TickReport> {
+        self.apply_physical_gaps_collected_with(
+            &mut SessionIo {
+                session,
+                targets: &[],
+            },
+            gaps,
+            quantum,
+        )
+    }
+
+    fn apply_physical_gaps_collected_with(
+        &mut self,
+        io: &mut impl CaptureIo,
+        gaps: Vec<PhysicalSemanticGap>,
+        quantum: &mut crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+    ) -> anyhow::Result<TickReport> {
+        self.validate_collected_preparation(quantum)
+            .map_err(|reason| anyhow::anyhow!("retained semantic cut owner: {reason:?}"))?;
+        let mut report = self.apply_physical_gaps_with(io, gaps)?;
+        // Even an already-applied or exhausted cut carries the real current
+        // floors and allocator state. Do not manufacture a clean watermark.
+        self.stamp_disposition(&mut report);
+        self.note_collected_disposition(quantum, &report)?;
+        Ok(report)
+    }
     fn apply_physical_gaps_with(
         &mut self,
         io: &mut impl CaptureIo,
@@ -2154,20 +2203,38 @@ impl SemanticCapture {
             "foreign semantic Session"
         );
         anyhow::ensure!(!self.stopped, "semantic capture stopped");
+        quantum
+            .h0_input(self.router.domain(), self.limits.records)
+            .map_err(|reason| anyhow::anyhow!("retained semantic collection: {reason:?}"))?;
+        // Pin before routing, including a tick that later refuses. A second
+        // Capture must not consume an original after a partial first tick.
+        quantum
+            .pin_h0_owner(CollectedH0Owner(self.identity))
+            .map_err(|reason| anyhow::anyhow!("retained semantic owner: {reason:?}"))?;
         let delivery = quantum
             .h0_delivery(self.router.domain(), self.limits.records)
             .map_err(|reason| anyhow::anyhow!("retained semantic collection: {reason:?}"))?;
         let mut report = self.tick_with_inner(io, Some(delivery))?;
         self.stamp_disposition(&mut report);
+        self.note_collected_disposition(quantum, &report)?;
+        Ok(report)
+    }
+
+    fn note_collected_disposition(
+        &self,
+        quantum: &mut crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+        report: &TickReport,
+    ) -> anyhow::Result<()> {
         quantum
             .note_h0_report(CollectedH0Disposition {
                 quantum: quantum.h0_identity(),
                 native: self.router.domain(),
+                owner: CollectedH0Owner(self.identity),
                 allocated_below: report.allocated_below(),
                 pending: report.awaiting_floor().is_some(),
             })
             .map_err(|reason| anyhow::anyhow!("retained semantic disposition: {reason:?}"))?;
-        Ok(report)
+        Ok(())
     }
 
     #[allow(dead_code)] // Thin Session wrapper; ordinary lane selection remains inactive.

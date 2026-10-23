@@ -19,6 +19,7 @@ use crate::semantic_capture::{
 use crate::semantics_edge::resources::{
     OWNED_ALLOCATION_PADDING, ResourceLease, SemanticResourceRefusal,
 };
+use crate::semantics_objects::journal::joint_driver::RawJointQuantum;
 use p11scope_ebpf_common::ImageIdentity;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -274,6 +275,12 @@ impl SemanticBatch {
         !self.current.is_empty()
     }
 
+    /// Borrow the original accepted H0 receipts before physical adjudication.
+    /// Presence records an observed image; current authority still revalidates.
+    pub(crate) fn current_receipts(&self) -> &[CurrentPartitionReceipt] {
+        &self.current
+    }
+
     /// Whether the batch carries no outcomes, receipts or negatives:
     /// tests assert quiet ticks stage or commit nothing.
     #[cfg(test)]
@@ -431,6 +438,21 @@ pub(crate) trait LaneTestIo {
         &mut self,
         _domain: NativeDomainId,
         _gaps: &mut Vec<PhysicalSemanticGap>,
+    ) -> Option<Result<SemanticBatch, SemanticRefusal>> {
+        None
+    }
+    /// Borrow the same actual H0 owner that routed this collected quantum.
+    fn validate_collected_preparation(
+        &self,
+        _raw: &RawJointQuantum,
+    ) -> Result<(), SemanticRefusal> {
+        Err(SemanticRefusal::Unavailable)
+    }
+    fn physical_gaps_collected(
+        &mut self,
+        _domain: NativeDomainId,
+        _gaps: &mut Vec<PhysicalSemanticGap>,
+        _raw: &mut RawJointQuantum,
     ) -> Option<Result<SemanticBatch, SemanticRefusal>> {
         None
     }
@@ -1300,6 +1322,67 @@ impl AttestedSemanticLane {
             let shed = live.stashed_refresh.push_all(receipts, outcomes);
             live.scan_refusals = live.scan_refusals.saturating_add(shed);
         }
+    }
+
+    pub(crate) fn validate_collected_preparation(
+        &self,
+        raw: &RawJointQuantum,
+    ) -> Result<(), SemanticRefusal> {
+        #[cfg(test)]
+        if let Some(test) = self.test_io.as_ref() {
+            return test.validate_collected_preparation(raw);
+        }
+        let live = self.live.as_ref().ok_or(SemanticRefusal::Unavailable)?;
+        if live.finished {
+            return Err(SemanticRefusal::Unavailable);
+        }
+        live.capture
+            .validate_collected_preparation(raw)
+            .map_err(|_| SemanticRefusal::Unavailable)
+    }
+
+    /// Extend only the original collected quantum through this lane's real
+    /// physical-cut path. The shell cannot manufacture a collected report.
+    pub(crate) fn apply_physical_gaps_collected(
+        &mut self,
+        gaps: Vec<PhysicalSemanticGap>,
+        raw: &mut RawJointQuantum,
+    ) -> Result<SemanticBatch, SemanticRefusal> {
+        self.validate_collected_preparation(raw)?;
+        #[cfg(test)]
+        let gaps = {
+            let mut gaps = gaps;
+            if let Some(test) = self.test_io.as_mut() {
+                return test
+                    .physical_gaps_collected(self.domain, &mut gaps, raw)
+                    .unwrap_or(Err(SemanticRefusal::Unavailable));
+            }
+            gaps
+        };
+        let live = self.live.as_mut().ok_or(SemanticRefusal::Unavailable)?;
+        if live.finished {
+            return Err(SemanticRefusal::Unavailable);
+        }
+        let report = live
+            .capture
+            .apply_physical_gaps_collected(&mut live.session, gaps, raw)
+            .map_err(|_| SemanticRefusal::Unavailable)?;
+        live.continuity_cuts = live.capture.continuity_cuts();
+        let negatives = report
+            .outcomes()
+            .iter()
+            .filter_map(|outcome| match outcome {
+                TickOutcome::Invalidation(invalidation)
+                    if matches!(invalidation.scope(), InvalidationScope::FaultEra) =>
+                {
+                    invalidation.position()
+                }
+                _ => None,
+            })
+            .max()
+            .map(|ordinal| vec![LaneNegative::CutBarrier { ordinal }])
+            .unwrap_or_default();
+        SemanticBatch::from_tick_report(self.domain, report, negatives, now_ns())
     }
 
     pub(crate) fn apply_physical_gaps(

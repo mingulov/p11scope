@@ -2341,16 +2341,36 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// so entries for unbound tickets are never read): the map stays
     /// bounded by the binding cap instead of growing per distinct scan.
     fn observe_proven_image(&mut self, receipt: &crate::semantic_capture::CurrentPartitionReceipt) {
-        if !self
-            .semantic_bindings
-            .has_ticket(receipt.domain(), receipt.image().task_cookie)
-        {
+        Self::record_proven_image(&self.semantic_bindings, &mut self.proven_images, receipt);
+    }
+
+    fn record_proven_image(
+        bindings: &SemanticBindingSet,
+        observed: &mut HashMap<(NativeDomainId, u64), u64>,
+        receipt: &crate::semantic_capture::CurrentPartitionReceipt,
+    ) {
+        if !bindings.has_ticket(receipt.domain(), receipt.image().task_cookie) {
             return;
         }
-        self.proven_images
+        observed
             .entry((receipt.domain(), receipt.image().task_cookie))
             .and_modify(|exec| *exec = (*exec).max(receipt.image().exec_id))
             .or_insert(receipt.image().exec_id);
+    }
+
+    /// Receipt presence is actual accepted H0 association, never current
+    /// authority. Keep the stored move-only batch intact through the cut.
+    fn observe_pending_h0_images(&mut self) {
+        let Some(PendingSemanticBatch::Collected(batch)) = self
+            .semantic_finalizer
+            .as_ref()
+            .and_then(|state| state.pending_semantic.as_ref())
+        else {
+            return;
+        };
+        for receipt in batch.current_receipts() {
+            Self::record_proven_image(&self.semantic_bindings, &mut self.proven_images, receipt);
+        }
     }
 
     /// Test seam: record an accepted H0 scan the shell lane cannot run,
@@ -2374,28 +2394,24 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.tail_uncertain.insert(caller);
     }
 
-    fn finalize_with_lane(&mut self, lane: &mut crate::inventory_semantics::AttestedSemanticLane) {
-        let state = self
-            .semantic_finalizer
-            .get_or_insert_with(|| SessionFinalizerState::new(lane.domain()));
-        if state.domain != lane.domain() {
-            self.registry.record_gap(RegistryGap {
-                caller: None,
-                module: None,
-                pid: None,
-                subject: "semantic finalizer refused another Session".into(),
-                reason: "the retained Session must complete before a fresh H0 namespace can be installed".into(),
-                budget: None,
-            });
-            return;
-        }
+    /// The original H0 cut is finalized before preparing ordinary admissions.
+    /// Its actual barrier and loss remain in the one finalizer namespace.
+    fn finalize_physical_tail(
+        &mut self,
+        lane: &mut AttestedSemanticLane,
+        collected: Option<&mut crate::semantics_objects::journal::joint_driver::RawJointQuantum>,
+    ) -> Option<u64> {
         // The tail cut joins this publication directly, ahead of the
         // pending ordinary quantum: its barrier fences every unpublished
         // positive below, including just-resolved and queued inputs.
         let (gaps, domains) = self.assemble_tail_gaps();
         let mut cut: Option<crate::inventory_semantics::SemanticBatch> = None;
         if !gaps.is_empty() {
-            match lane.apply_physical_gaps(gaps) {
+            let publication = match collected {
+                Some(raw) => lane.apply_physical_gaps_collected(gaps, raw),
+                None => lane.apply_physical_gaps(gaps),
+            };
+            match publication {
                 Ok(batch) => {
                     if batch.domain() == lane.domain() {
                         cut = Some(batch);
@@ -2441,6 +2457,25 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             floor = cut.cut_barrier();
             self.finalize_batch(lane, cut, None);
         }
+        floor
+    }
+
+    fn finalize_with_lane(&mut self, lane: &mut crate::inventory_semantics::AttestedSemanticLane) {
+        let state = self
+            .semantic_finalizer
+            .get_or_insert_with(|| SessionFinalizerState::new(lane.domain()));
+        if state.domain != lane.domain() {
+            self.registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: "semantic finalizer refused another Session".into(),
+                reason: "the retained Session must complete before a fresh H0 namespace can be installed".into(),
+                budget: None,
+            });
+            return;
+        }
+        let floor = self.finalize_physical_tail(lane, None);
         if let Some(pending) = self
             .semantic_finalizer
             .as_mut()

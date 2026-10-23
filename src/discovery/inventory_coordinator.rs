@@ -135,6 +135,7 @@ struct PublicationCompletion {
 
 struct PendingJointPublication {
     completion: PublicationCompletion,
+    cut_barrier: Option<u64>,
     // Moved cgroup allocations keep their original collection/work bounds.
     // Charge this additional retained inline wrapper before preparation.
     _storage: crate::semantics_edge::resources::ResourceLease,
@@ -5371,18 +5372,19 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     fn commit_batch_inner(
         &mut self,
         engine_changed: bool,
-        lane: Option<&mut AttestedSemanticLane>,
+        mut lane: Option<&mut AttestedSemanticLane>,
         joint: Option<semantics::JointCommitInput<'_>>,
     ) -> Result<JointCommitProgress> {
         if let Some(joint) = joint {
             let lane = lane
                 .ok_or_else(|| anyhow::anyhow!("Joint publication requires its retained lane"))?;
-            return self.commit_joint_publication_inner(engine_changed, lane, joint);
+            return self.commit_joint_publication_inner(lane, joint);
         }
         if self.publication_pending() {
             bail!("an unfinished Joint publication must resume its original frame");
         }
-        let completion = self.prepare_publication(engine_changed, lane)?;
+        let completion = self.prepare_physical_publication(engine_changed, lane.as_deref_mut())?;
+        self.finalize_semantic_batches(lane);
         let applied = self.publish_registry(None)?;
         Ok(JointCommitProgress::Published(
             self.finish_publication_context(completion, applied),
@@ -5393,7 +5395,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.joint_publication.is_some() || self.registry.publication_pending()
     }
 
-    fn prepare_publication(
+    fn prepare_physical_publication(
         &mut self,
         engine_changed: bool,
         mut lane: Option<&mut AttestedSemanticLane>,
@@ -5726,11 +5728,6 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // work, before any semantic input stages: suppression needs a
         // complete publication's proof, never less.
         self.adjudicate_provisional_unscanned(cgroup_proof_complete);
-        // Semantic finalization runs after all reconciliation/catalog work
-        // and immediately before registry publication: negatives first,
-        // validated registrations second, eligible calls in position
-        // order. No semantic positive sits ahead of a physical decision.
-        self.finalize_semantic_batches(lane);
         Ok(PublicationCompletion {
             cgroup: publishing_cgroup,
             events: scoped_events,

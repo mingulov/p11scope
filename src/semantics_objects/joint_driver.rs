@@ -445,6 +445,8 @@ pub(crate) struct RawJointQuantum {
     completed_delivered: bool,
     h0_pending: bool,
     h0_reported: bool,
+    // Inline provenance is included in storage_bytes' size_of::<Self>().
+    h0_owner: Option<crate::semantic_capture::CollectedH0Owner>,
     invocations: Vec<RawInvocation>,
     ledger_generation: Option<LedgerGeneration>,
     resource_refused: bool,
@@ -681,6 +683,33 @@ impl RawJointQuantum {
         Ok(())
     }
 
+    /// Read-only preparation gate over this original collector allocation.
+    /// A malformed/loss collection can still carry its genuine negative;
+    /// matching custody never upgrades its cuts to a clean prefix.
+    pub(crate) fn validate_preparation(
+        &self,
+        adapter: &JournalAdapter,
+        producers: &SessionDrainProducers,
+    ) -> Result<(), RawQuantumRefusal> {
+        self.ready_for_ingest(adapter, producers)?;
+        let cuts = self
+            .cuts
+            .as_ref()
+            .ok_or(RawQuantumRefusal::DispositionMismatch)?;
+        if !producers.matches_events(cuts.start.events())
+            || !cuts
+                .end
+                .as_ref()
+                .is_some_and(|end| producers.matches_events(end.events()))
+        {
+            return Err(RawQuantumRefusal::ForeignCapture);
+        }
+        if adapter.consumed_frontier() != cuts.birth.ordinal {
+            return Err(RawQuantumRefusal::StaleFrontier);
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn retained_capacities(&self) -> (usize, usize, usize) {
         (
@@ -906,9 +935,13 @@ impl RawJointQuantum {
         &mut self,
         report: crate::semantic_capture::CollectedH0Disposition,
     ) -> Result<(), RawQuantumRefusal> {
-        let (allocated_below, pending) = report
+        let (owner, allocated_below, pending) = report
             .for_quantum(self.identity, self.native)
             .ok_or(RawQuantumRefusal::ForeignCapture)?;
+        self.validate_h0_owner(owner)?;
+        if allocated_below < self.audit.h0_allocated_below {
+            return Err(RawQuantumRefusal::StaleFrontier);
+        }
         self.h0_reported = true;
         self.h0_delivered += self.ordinary.len();
         self.completed_delivered |= self
@@ -918,6 +951,40 @@ impl RawJointQuantum {
         self.ordinary.clear();
         self.audit.h0_allocated_below = allocated_below;
         self.h0_pending = pending;
+        Ok(())
+    }
+
+    pub(crate) fn pin_h0_owner(
+        &mut self,
+        owner: crate::semantic_capture::CollectedH0Owner,
+    ) -> Result<(), RawQuantumRefusal> {
+        if self.h0_owner.is_some_and(|retained| retained != owner) {
+            return Err(RawQuantumRefusal::ForeignCapture);
+        }
+        self.h0_owner = Some(owner);
+        Ok(())
+    }
+
+    pub(crate) fn validate_h0_owner(
+        &self,
+        owner: crate::semantic_capture::CollectedH0Owner,
+    ) -> Result<(), RawQuantumRefusal> {
+        if self.h0_owner != Some(owner) {
+            return Err(RawQuantumRefusal::ForeignCapture);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_h0_cut(
+        &self,
+        owner: crate::semantic_capture::CollectedH0Owner,
+    ) -> Result<(), RawQuantumRefusal> {
+        self.validate_h0_owner(owner)?;
+        // A cut may resolve previously routed pending originals, but it may
+        // not acknowledge ordinary records that no collected tick consumed.
+        if !self.h0_reported || !self.ordinary.is_empty() {
+            return Err(RawQuantumRefusal::H0Undelivered);
+        }
         Ok(())
     }
 
@@ -1591,6 +1658,7 @@ impl RawJointQuantum {
             completed_delivered: false,
             h0_pending: false,
             h0_reported: false,
+            h0_owner: None,
             invocations,
             ledger_generation: resources
                 .as_ref()

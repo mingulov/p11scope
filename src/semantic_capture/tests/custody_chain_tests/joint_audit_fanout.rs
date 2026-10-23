@@ -34,7 +34,6 @@ impl CanonicalFanoutScene {
             unreadable: false,
         };
         let progress = self.scene.real.scene.coordinator.commit_joint_batch(
-            false,
             &mut self.scene.real.lane,
             &self.scene.producers,
             frame,
@@ -114,9 +113,8 @@ fn joint_first_real_birth_publishes_one_revision() {
         let coordinator = &fixture.scene.real.scene.coordinator;
         assert_eq!(coordinator.registry().joint_feeds(), 0);
         let old_revision = coordinator.registry().published_revision();
-        let old = Presentation::capture(coordinator, "system", 1, 2, 1);
-        let old_text = format!("{old:?}");
-        assert!(old.instances.is_empty());
+        let old_text = format!("{:?}", fixture.published_before);
+        assert!(fixture.published_before.instances.is_empty());
         let claims = coordinator
             .joint_capture()
             .adapter()
@@ -128,7 +126,7 @@ fn joint_first_real_birth_publishes_one_revision() {
         let mut frame = Some(original);
         let receipt = fixture.complete_publication(&mut frame, &BirthFault, old_revision);
         assert!(receipt.registry_applied > 0);
-        assert_eq!(format!("{old:?}"), old_text);
+        assert_eq!(format!("{:?}", fixture.published_before), old_text);
         let coordinator = &fixture.scene.real.scene.coordinator;
         assert_eq!(coordinator.registry().joint_feeds(), joint);
         let feeds = fixture.feeds();
@@ -164,6 +162,18 @@ fn joint_first_real_birth_publishes_one_revision() {
 #[test]
 fn joint_physical_tail_precedes_claims_and_one_audit() {
     let mut fixture = CanonicalFanoutScene::prior_sealed();
+    struct NativeFault(SharedH0);
+    impl crate::semantics_objects::journal::FaultEpoch for NativeFault {
+        fn fault_epoch(&self) -> Result<u64, crate::semantics_objects::journal::FaultReadError> {
+            let value = self.0.0.borrow().io.script.last_health.fault;
+            if value > u64::from(u32::MAX) {
+                Err(crate::semantics_objects::journal::FaultReadError::Saturated)
+            } else {
+                Ok(value)
+            }
+        }
+    }
+    let native = NativeFault(fixture.scene.real.h0.clone());
     let caller = fixture.births[0].0;
     let before = fixture
         .scene
@@ -181,15 +191,10 @@ fn joint_physical_tail_precedes_claims_and_one_audit() {
         .coordinator
         .reference_mark_tail(caller);
     fixture.push_two("C_SignInit", 2);
-    let raw = fixture.scene.collect_with_fault(&BirthFault);
+    let raw = fixture.scene.collect_with_fault(&native);
     fixture.scene.real.h0.0.borrow_mut().collected = Some(raw);
     let batch = fixture.scene.real.tick();
-    let coordinator = &mut fixture.scene.real.scene.coordinator;
-    coordinator.stage_semantic_batch(batch);
-    coordinator
-        .prepare_staged_semantic_batch(&mut fixture.scene.real.lane, None)
-        .unwrap();
-    let raw = fixture
+    let mut raw = fixture
         .scene
         .real
         .h0
@@ -197,6 +202,19 @@ fn joint_physical_tail_precedes_claims_and_one_audit() {
         .borrow_mut()
         .collected
         .take()
+        .unwrap();
+    let coordinator = &mut fixture.scene.real.scene.coordinator;
+    coordinator.stage_semantic_batch(batch);
+    coordinator
+        .prepare_joint_publication(
+            false,
+            &mut fixture.scene.real.lane,
+            &mut raw,
+            &fixture.scene.producers,
+        )
+        .unwrap();
+    coordinator
+        .prepare_staged_semantic_batch(&mut fixture.scene.real.lane, None)
         .unwrap();
     let mut ingested = raw
         .ingest(
@@ -215,11 +233,11 @@ fn joint_physical_tail_precedes_claims_and_one_audit() {
         .unwrap()
     {}
     assert!(coordinator.finish_prepared_semantic_batch(&fixture.scene.real.lane));
-    let frame = acquire(&mut fixture.scene, ingested, &fixture.attached, &BirthFault);
+    let frame = acquire(&mut fixture.scene, ingested, &fixture.attached, &native);
     assert!(
         matches!(
             frame.audit_for_test().h3_for_test(),
-            H3DispositionEvidence::Loss { .. }
+            H3DispositionEvidence::StagedLoss { .. }
         ),
         "the original audit must own the real physical cut, not a later replacement H3"
     );
@@ -228,7 +246,8 @@ fn joint_physical_tail_precedes_claims_and_one_audit() {
         .expect("actual original physical loss");
     assert_eq!(
         failure.gap,
-        crate::semantics_objects::journal::JournalGap::H3Loss
+        crate::semantics_objects::journal::JournalGap::FaultChanged,
+        "the physical cut raised the same actual native fault cell after raw collection"
     );
     for object in &before.objects {
         assert!(failure.effects.effects.iter().any(|effect| matches!(effect,
@@ -238,7 +257,7 @@ fn joint_physical_tail_precedes_claims_and_one_audit() {
     assert_eq!(coordinator.reference_h3_audit_state(), (2, false));
     let revision = coordinator.registry().published_revision();
     let before_feeds = fixture.feeds();
-    fixture.complete_publication(&mut Some(frame), &BirthFault, revision);
+    fixture.complete_publication(&mut Some(frame), &native, revision);
     let coordinator = &fixture.scene.real.scene.coordinator;
     assert_eq!(
         coordinator.reference_h3_audit_state(),
@@ -271,10 +290,12 @@ fn joint_publication_retry_does_not_repeat_admission_or_reducer() {
         CaptureOutcome, CaptureSettlement, DiagnosticConfig, DiagnosticOutcome,
         RetainedIdentityView,
     };
-    let (mut fixture, original) = CanonicalFanoutScene::first_publication_with_functions(
+    let (mut fixture, original) = CanonicalFanoutScene::first_publication_inputs(
         1,
         &["C_CreateObject", "C_SignInit"],
         PublicationReceipts::All,
+        true,
+        true,
     );
     let caller = fixture.births[0].0;
     let module_key = fixture.scene.real.modules[0].0.clone();
@@ -291,39 +312,9 @@ fn joint_publication_retry_does_not_repeat_admission_or_reducer() {
         .joint_capture()
         .adapter()
         .invocation_claims_for_test();
-    let roles = coordinator.joint_capture().ledger().roles_for_test();
-    let identity = original.identity();
-    let frontier = original.frontier();
-    let snapshot = coordinator.registry().semantic_resource_snapshot();
-    let hold = coordinator
-        .registry()
-        .reserve_semantic_storage(snapshot.limit_bytes - snapshot.charged_bytes)
-        .unwrap();
+    assert_eq!(claims.0, 2);
     let mut frame = Some(original);
     let mut remaining = 1;
-    assert!(
-        fixture
-            .publication_step(&mut frame, &BirthFault, &mut remaining)
-            .is_err()
-    );
-    let coordinator = &fixture.scene.real.scene.coordinator;
-    assert!(
-        !coordinator.publication_pending(),
-        "reservation refuses before apply"
-    );
-    assert_eq!(coordinator.registry().published_revision(), old_revision);
-    assert!(fixture.feeds().is_empty());
-    assert_eq!(
-        coordinator
-            .joint_capture()
-            .adapter()
-            .invocation_claims_for_test(),
-        claims
-    );
-    assert_eq!(coordinator.joint_capture().ledger().roles_for_test(), roles);
-    assert!(frame.as_ref().unwrap().identity() == identity);
-    assert_eq!(frame.as_ref().unwrap().frontier(), frontier);
-    drop(hold);
     let mut zero = 0;
     assert!(
         fixture
@@ -544,8 +535,7 @@ fn joint_second_domain_fault_is_invisible_until_fanout() {
         .coordinator
         .registry()
         .published_revision();
-    let old = Presentation::capture(&fixture.scene.real.scene.coordinator, "system", 1, 2, 1);
-    let old_text = format!("{old:?}");
+    let old_text = format!("{:?}", fixture.published_before);
     let fault = FrameFault::clean();
     let mut frame = Some(original);
     let mut first_reduced = false;
@@ -586,7 +576,7 @@ fn joint_second_domain_fault_is_invisible_until_fanout() {
     fault.epoch.set(1);
     let receipt = fixture.complete_publication(&mut frame, &fault, old_revision);
     assert_eq!(receipt.registry_published, old_revision + 1);
-    assert_eq!(format!("{old:?}"), old_text);
+    assert_eq!(format!("{:?}", fixture.published_before), old_text);
     let coordinator = &fixture.scene.real.scene.coordinator;
     let history = coordinator.joint_capture().model().project();
     assert_eq!(
@@ -649,8 +639,7 @@ fn joint_second_domain_fault_is_invisible_until_fanout() {
     for (child, caller) in raw_children.iter().zip(&callers) {
         fixture.scene.admit_providers(child.id(), *caller, &[0]);
     }
-    fixture.scene.prepare_batch(batch, 2);
-    let raw = fixture
+    let mut raw = fixture
         .scene
         .real
         .h0
@@ -660,6 +649,18 @@ fn joint_second_domain_fault_is_invisible_until_fanout() {
         .take()
         .unwrap();
     let coordinator = &mut fixture.scene.real.scene.coordinator;
+    coordinator.stage_semantic_batch(batch);
+    coordinator
+        .prepare_joint_publication(
+            false,
+            &mut fixture.scene.real.lane,
+            &mut raw,
+            &fixture.scene.producers,
+        )
+        .unwrap();
+    coordinator
+        .prepare_staged_semantic_batch(&mut fixture.scene.real.lane, None)
+        .unwrap();
     let mut ingested = raw
         .ingest(
             coordinator.joint_capture_mut().adapter_mut(),
@@ -751,6 +752,7 @@ struct CanonicalFanoutScene {
     attached: crate::attach::AttachedSemanticSet,
     births: Vec<(CallerId, RetainedBirthWitness, NativeBirthRows)>,
     grant: SessionDrainGrant,
+    published_before: crate::inventory_present::Presentation,
     _child: OwnedStoppedChild,
 }
 
@@ -828,6 +830,16 @@ impl CanonicalFanoutScene {
         functions: &[&str],
         receipt_policy: PublicationReceipts,
     ) -> (Self, IngestedJointQuantum) {
+        Self::first_publication_inputs(providers, functions, receipt_policy, true, false)
+    }
+
+    fn first_publication_inputs(
+        providers: usize,
+        functions: &[&str],
+        receipt_policy: PublicationReceipts,
+        joint_preparation: bool,
+        probe_preparation_refusal: bool,
+    ) -> (Self, IngestedJointQuantum) {
         let (held, attached) = HeldProviders::with_attachment(providers, functions);
         let mut scene = JointScene::from_held(held, Some(attached));
         scene.real.h0.0.borrow_mut().io.script.local = 1;
@@ -848,6 +860,13 @@ impl CanonicalFanoutScene {
             },
             0,
         );
+        let published_before = crate::inventory_present::Presentation::capture(
+            &scene.real.scene.coordinator,
+            "system",
+            1,
+            2,
+            1,
+        );
         // The first accepted H0 scan happens through the actual collected
         // quantum. A preliminary provider refresh would spend New too early.
         scene.push(std::process::id(), 0, "C_CreateObject", 1);
@@ -857,8 +876,102 @@ impl CanonicalFanoutScene {
         let batch = scene.real.tick();
         scene.admit_providers(std::process::id(), first, &[0]);
         scene.admit_providers(child.id(), second, &[0]);
-        scene.prepare_batch(batch, 2);
-        let raw = scene.real.h0.0.borrow_mut().collected.take().unwrap();
+        let mut raw = scene.real.h0.0.borrow_mut().collected.take().unwrap();
+        let coordinator = &mut scene.real.scene.coordinator;
+        coordinator.stage_semantic_batch(batch);
+        if joint_preparation {
+            if probe_preparation_refusal {
+                // Equal native IDs do not let another real Capture route or
+                // restamp this already-collected original, even for a no-op.
+                let mut owned = scene.real.h0.0.borrow_mut();
+                let HeldH0 { capture, io, .. } = &mut *owned;
+                let mut foreign = SemanticCapture::in_domain(
+                    scene.producers.native_domain(),
+                    TickLimits::default(),
+                )
+                .unwrap();
+                let before = (
+                    capture.next_token,
+                    io.script.now,
+                    io.script.raises,
+                    io.script.health.len(),
+                    raw.pending_h0_records(),
+                );
+                assert!(foreign.tick_collected_with(io, &mut raw).is_err());
+                assert!(
+                    foreign
+                        .apply_physical_gaps_collected_with(io, Vec::new(), &mut raw)
+                        .is_err()
+                );
+                assert_eq!(
+                    (
+                        capture.next_token,
+                        io.script.now,
+                        io.script.raises,
+                        io.script.health.len(),
+                        raw.pending_h0_records(),
+                    ),
+                    before,
+                    "foreign Capture refuses before routing or native audit"
+                );
+                capture.validate_collected_preparation(&raw).unwrap();
+                drop(owned);
+                let revision = coordinator.registry().published_revision();
+                let roles = coordinator.joint_capture().ledger().roles_for_test();
+                let snapshot = coordinator.registry().semantic_resource_snapshot();
+                let hold = coordinator
+                    .registry()
+                    .reserve_semantic_storage(snapshot.limit_bytes - snapshot.charged_bytes)
+                    .unwrap();
+                assert!(
+                    coordinator
+                        .prepare_joint_publication(
+                            false,
+                            &mut scene.real.lane,
+                            &mut raw,
+                            &scene.producers
+                        )
+                        .is_err()
+                );
+                assert!(!coordinator.publication_pending());
+                assert_eq!(coordinator.registry().published_revision(), revision);
+                assert_eq!(coordinator.joint_capture().ledger().roles_for_test(), roles);
+                assert!(
+                    coordinator.prepared_semantic_batch().is_none(),
+                    "no admission was prepared on refusal"
+                );
+                drop(hold);
+            }
+            coordinator
+                .prepare_joint_publication(false, &mut scene.real.lane, &mut raw, &scene.producers)
+                .unwrap();
+            let charged = coordinator
+                .registry()
+                .semantic_resource_snapshot()
+                .charged_bytes;
+            coordinator
+                .prepare_joint_publication(false, &mut scene.real.lane, &mut raw, &scene.producers)
+                .unwrap();
+            assert_eq!(
+                coordinator
+                    .registry()
+                    .semantic_resource_snapshot()
+                    .charged_bytes,
+                charged,
+                "same original preparation does not charge/repeat"
+            );
+        }
+        coordinator
+            .prepare_staged_semantic_batch(&mut scene.real.lane, None)
+            .unwrap();
+        assert_eq!(
+            coordinator
+                .prepared_semantic_batch()
+                .unwrap()
+                .admissions()
+                .count(),
+            2
+        );
         let (mut ingested, _, grant) = scene.ingest_with_grant(raw);
         let admitted = {
             let (prepared, _) = scene.real.scene.coordinator.prepared_joint_parts().unwrap();
@@ -1017,6 +1130,7 @@ impl CanonicalFanoutScene {
                 attached,
                 births,
                 grant,
+                published_before,
                 _child: child,
             },
             frame,
@@ -1024,8 +1138,13 @@ impl CanonicalFanoutScene {
     }
 
     fn prior_sealed_with_functions(providers: usize, functions: &[&str]) -> Self {
-        let (mut fixture, frame) =
-            Self::first_publication_with_functions(providers, functions, PublicationReceipts::All);
+        let (mut fixture, frame) = Self::first_publication_inputs(
+            providers,
+            functions,
+            PublicationReceipts::All,
+            false,
+            false,
+        );
         let Self {
             scene,
             attached,

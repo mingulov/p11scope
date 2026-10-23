@@ -30,6 +30,19 @@ pub(in crate::discovery::engine::inventory_coordinator) struct SessionFinalizerS
 }
 
 impl SessionFinalizerState {
+    pub(super) fn permits_joint_preparation(&self, producers: &SessionDrainProducers) -> bool {
+        self.domain == producers.native_domain()
+            && self
+                .producers
+                .as_ref()
+                .is_none_or(|held| held.same_producers(producers))
+            && matches!(
+                self.pending_semantic,
+                Some(PendingSemanticBatch::Collected(_))
+            )
+            && self.h3_pending.is_none()
+    }
+
     pub(super) fn new(domain: NativeDomainId) -> Self {
         Self {
             domain,

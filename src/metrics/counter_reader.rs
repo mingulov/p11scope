@@ -488,6 +488,7 @@ mod tests {
         rvs: Vec<(RvKey, [u64; 2])>,
         health: CounterHealth,
         kernel: KernelEvidence,
+        routing: Option<CounterIssue>,
         fail: Option<ReadStage>,
         accesses: Cell<usize>,
         rv_reads: Cell<usize>,
@@ -543,6 +544,7 @@ mod tests {
                 health: CounterHealth::default(),
                 kernel: KernelEvidence::default(),
                 fail: None,
+                routing: None,
                 accesses: Cell::new(0),
                 rv_reads: Cell::new(0),
                 clocks: if later {
@@ -570,6 +572,9 @@ mod tests {
         }
         fn possible_cpus(&self) -> usize {
             self.cpus
+        }
+        fn routing(&self) -> Result<Option<CounterIssue>, ReadStage> {
+            Ok(self.routing)
         }
         fn rv_keys(&self) -> impl Iterator<Item = Result<RvKey, ReadStage>> + '_ {
             self.rvs.iter().map(|(key, _)| Ok(*key))
@@ -654,6 +659,57 @@ mod tests {
             self.clock_reads.set(index + 1);
             self.clocks[index % 2]
         }
+    }
+
+    #[test]
+    fn banked_reader_preserves_physical_prefix_and_routing_health() {
+        let pool = test_pool();
+        let mut collector = CounterCollector::new(LIMITS, pool.reserver());
+        assert_eq!(
+            collector.observe(acquire(
+                &Scripted::sample(CounterMode::Counts, false),
+                NonZeroU64::new(5).unwrap(), &plan(), LIMITS, &pool.reserver(),
+            )),
+            CounterObservation::Initial,
+        );
+        match collector.observe(acquire(
+            &Scripted::sample(CounterMode::Counts, true),
+            NonZeroU64::new(5).unwrap(), &plan(), LIMITS, &pool.reserver(),
+        )) {
+            CounterObservation::Advanced { deltas, .. } => {
+                assert_eq!((deltas[0].entered, deltas[0].returned), (5, 4));
+                assert_eq!(deltas[0].target.object, PinnedObjectId(1));
+                assert_eq!(deltas[1].target.object, PinnedObjectId(2));
+                assert_eq!(deltas[0].rv_counts.get(&HIGH_RV), Some(&1));
+            }
+            other => panic!("two real physical rows must remain distinct: {other:?}"),
+        }
+        for issue in [CounterIssue::BankRouting, CounterIssue::BankQuarantined] {
+            let mut collector = CounterCollector::new(LIMITS, pool.reserver());
+            let mut damaged = Scripted::sample(CounterMode::Counts, true);
+            damaged.routing = Some(issue);
+            let read = acquire(
+                &damaged, NonZeroU64::new(6).unwrap(), &plan(), LIMITS, &pool.reserver(),
+            ).unwrap();
+            assert_eq!(damaged.rv_reads.get(), 0, "known poisoned routing must not sample rows");
+            assert_eq!(damaged.accesses.get(), 2, "health and kernel controls still read");
+            assert_eq!(collector.observe(Ok(read)), CounterObservation::Unavailable(issue));
+            assert_eq!(
+                collector.observe(acquire(
+                    &Scripted::sample(CounterMode::Counts, true),
+                    NonZeroU64::new(6).unwrap(), &plan(), LIMITS, &pool.reserver(),
+                )),
+                CounterObservation::Unavailable(issue),
+                "same-generation clean cells cannot erase routing/quarantine loss",
+            );
+        }
+        let mut damaged = Scripted::sample(CounterMode::Counts, true);
+        damaged.routing = Some(CounterIssue::BankRouting);
+        damaged.fail = Some(ReadStage::KernelEvidence);
+        assert!(matches!(
+            acquire(&damaged, NonZeroU64::new(7).unwrap(), &plan(), LIMITS, &pool.reserver()),
+            Err(ReadStage::KernelEvidence),
+        ));
     }
 
     #[test]

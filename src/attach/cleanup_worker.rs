@@ -1018,6 +1018,74 @@ pub(crate) fn drive_cleanup(
 mod tests {
     use super::*;
 
+    #[test]
+    fn counter_entry_closes_before_return() {
+        let order = DetachOrder;
+        assert!(
+            order.rank(&ProducerProgram::UProbe("p11_counter_bank_entry"))
+                < order.rank(&ProducerProgram::UProbe("p11_counter_bank_return"))
+        );
+        assert!(
+            order.rank(&ProducerProgram::UProbe("p11_counter_bank_return"))
+                < order.rank(&ProducerProgram::RawTracePoint("sched_process_exit"))
+        );
+    }
+
+    #[test]
+    fn counter_keepalive_survives_failed_quarantined_and_abandoned_payloads() {
+        use crate::attach::counter_banks::CounterKeepalive;
+        use crate::semantics_edge::resources::{
+            SEMANTIC_TRANSITION_SCRATCH, SemanticResourcePool,
+        };
+
+        let pool = SemanticResourcePool::reference_limit(4 * 1024 * 1024);
+        let held = CounterKeepalive::precharge(&pool.reserver(), 32 * 1024).unwrap();
+        let weak = Arc::downgrade(&held);
+        let mut refused = CleanupWorker::pre_start();
+        refused.begin_terminal();
+        let link = OwnedLink::Multi(Vec::new()).retain_counter(held);
+        let failure = refused
+            .submit_live(
+                vec![(link, ProducerProgram::UProbe("p11_counter_bank_entry"))],
+                Arc::default(), DetachOrder,
+            )
+            .unwrap_err();
+        assert!(weak.upgrade().is_some());
+        assert_eq!(pool.snapshot().charged_bytes, SEMANTIC_TRANSITION_SCRATCH + 32 * 1024);
+        refused.retain_unsubmitted(failure);
+        let receipt = refused.join();
+        assert!(!receipt.completed);
+        assert!(weak.upgrade().is_some(), "failed submission payload owns its charge");
+        // Test teardown may reclaim a known non-native empty payload. Production
+        // leaves uncertain real links and their keepalive retained for exit.
+        refused.unsubmitted.lock().unwrap().clear();
+        assert!(weak.upgrade().is_none());
+        assert_eq!(pool.snapshot().charged_bytes, SEMANTIC_TRANSITION_SCRATCH);
+
+        let held = CounterKeepalive::precharge(&pool.reserver(), 48 * 1024).unwrap();
+        let weak = Arc::downgrade(&held);
+        let mut failed = CleanupWorker::pre_start_with(
+            Box::new(|_, _| Err("controlled close refusal".into())),
+            Arc::new(|| Duration::ZERO),
+        );
+        failed.submit(
+            vec![(
+                OwnedLink::Multi(Vec::new()).retain_counter(held),
+                ProducerProgram::UProbe("p11_counter_bank_return"),
+            )], Arc::default(), DetachOrder,
+        );
+        assert!(!failed.join().completed);
+        assert!(weak.upgrade().is_some(), "quarantine owns the counter guard");
+        let slot = failed.state.lock().unwrap().quarantined.pop().unwrap();
+        let payload = slot.lock().unwrap().payload.take().unwrap();
+        drop(failed);
+        drop(slot);
+        assert!(weak.upgrade().is_some(), "the abandoned payload carries its own guard");
+        drop(payload);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(pool.snapshot().charged_bytes, SEMANTIC_TRANSITION_SCRATCH);
+    }
+
     fn multi(role: ProducerProgram) -> (OwnedLink, ProducerProgram) {
         (OwnedLink::Multi(Vec::new()), role)
     }

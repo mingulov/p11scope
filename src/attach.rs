@@ -46,6 +46,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 mod counter_generation;
+#[allow(dead_code)] // Unselected Counts bank transaction; no public loader/selector.
+pub(crate) mod counter_banks;
 pub(crate) mod detailed_identity;
 mod ended_pid_retirement;
 mod global_retirement;

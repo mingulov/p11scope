@@ -6929,7 +6929,13 @@ fn call_start_initializer_is_straight_line_and_caller_owned() {
         "fn p11_entry_impl<",
         "#[uretprobe]\npub fn p11_return",
     );
-    assert!(aggregate.contains("p11_owner_start_aggregate(key, helpers::bpf_ktime_get_ns())"));
+    // Counts deliberately seeds zero without a clock read; every timing mode
+    // passes its one original timestamp through the same native constructor.
+    assert!(aggregate.contains("#[cfg(feature = \"counter-counts\")]\n    let timestamp = 0;"));
+    assert!(aggregate.contains(
+        "#[cfg(not(feature = \"counter-counts\"))]\n    let timestamp = unsafe { helpers::bpf_ktime_get_ns() };"
+    ));
+    assert!(aggregate.contains("p11_owner_start_aggregate(key, timestamp)"));
     assert_eq!(aggregate.matches("helpers::bpf_ktime_get_ns()").count(), 1);
     assert!(!aggregate.contains("CallStart"));
     assert!(!normal.contains("MaybeUninit::<CallStart>::uninit()"));

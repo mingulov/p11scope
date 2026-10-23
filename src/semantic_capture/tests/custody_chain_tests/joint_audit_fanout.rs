@@ -13124,13 +13124,79 @@ fn joint_s1_original_disposition_preserves_interleaved_healthy_image() {
                 }
                 let coordinator = &mut fixture.scene.real.scene.coordinator;
                 let mut staged = 0;
-                while coordinator
-                    .stage_next_prepared_admission_with_disposition(
-                        &fixture.scene.producers,
-                        &mut ingested,
-                    )
-                    .unwrap()
-                {
+                loop {
+                    if sequence == 2 {
+                        let (prepared, owner) = coordinator.prepared_joint_parts().unwrap();
+                        if let Some(input) = prepared.next_admission()
+                            && input.journal_binding().3 == victim.caller()
+                        {
+                            let original = input.collected_origin();
+                            let before = (
+                                owner.ledger().roles_for_test(),
+                                owner.adapter().invocation_claims_for_test(),
+                                owner.adapter().retained_starts_for_test(),
+                            );
+                            // This original REALLY owns H8/END custody, and
+                            // its failed ImageSealed claim has not tainted it
+                            // yet. Both tokens must use the strict path.
+                            assert!(before.0[1] >= 2);
+                            {
+                                let _unused = ingested
+                                    .disposition_s1only_original(
+                                        owner.adapter_mut(),
+                                        &fixture.scene.producers,
+                                        input,
+                                    )
+                                    .unwrap();
+                            }
+                            let same_shape = input.clone();
+                            assert!(matches!(
+                                ingested
+                                    .disposition_s1only_original(
+                                        owner.adapter_mut(),
+                                        &fixture.scene.producers,
+                                        input,
+                                    )
+                                    .unwrap()
+                                    .consume_for(&same_shape),
+                                Err(RawQuantumRefusal::Admission)
+                            ));
+                            // A successful new preflight proves neither
+                            // unused/wrong token wrote the once-only marker.
+                            {
+                                let _correct_retry = ingested
+                                    .disposition_s1only_original(
+                                        owner.adapter_mut(),
+                                        &fixture.scene.producers,
+                                        input,
+                                    )
+                                    .unwrap();
+                            }
+                            assert_eq!(
+                                prepared.next_admission().unwrap().collected_origin(),
+                                original
+                            );
+                            assert_eq!(
+                                (
+                                    owner.ledger().roles_for_test(),
+                                    owner.adapter().invocation_claims_for_test(),
+                                    owner.adapter().retained_starts_for_test(),
+                                ),
+                                before
+                            );
+                        }
+                    }
+                    // The correct real cursor retry now consumes the token
+                    // and writes its marker immediately before this move.
+                    if !coordinator
+                        .stage_next_prepared_admission_with_disposition(
+                            &fixture.scene.producers,
+                            &mut ingested,
+                        )
+                        .unwrap()
+                    {
+                        break;
+                    }
                     staged += 1;
                 }
                 assert_eq!(staged, 2);

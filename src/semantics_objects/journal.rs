@@ -3592,13 +3592,13 @@ impl JournalAdapter {
             .then_some(Some(*claim))
     }
 
-    /// Retain one already-admitted S1Only negative on its exact original
-    /// physical row. No image taint, model transition or membership release
-    /// occurs until the whole prepared batch has actually entered H9/S1.
-    fn retain_s1only_subject(
-        &mut self,
+    /// One strict READ-ONLY validator for mint and consumption. An unused
+    /// or refused bookkeeping token must leave the original unmarked so its
+    /// actual registry cursor can retry it without changing custody.
+    fn preflight_s1only_subject(
+        &self,
         admitted: &AdmittedInstanceCall,
-    ) -> Result<(), joint_driver::RawQuantumRefusal> {
+    ) -> Result<JournalDomainKey, joint_driver::RawQuantumRefusal> {
         use joint_driver::RawQuantumRefusal;
         let (native, image, router, caller) = admitted.journal_binding();
         let key = JournalDomainKey {
@@ -3623,6 +3623,20 @@ impl JournalAdapter {
         {
             return Err(RawQuantumRefusal::Admission);
         }
+        if entry.s1only_subject.is_some() {
+            return Err(RawQuantumRefusal::DispositionMismatch);
+        }
+        Ok(key)
+    }
+
+    /// Commit the marker only after the exact immutable cursor input has
+    /// consumed its token, while the adapter is still exclusively borrowed.
+    /// No image taint, model transition or membership release occurs here.
+    fn retain_s1only_subject(
+        &mut self,
+        admitted: &AdmittedInstanceCall,
+    ) -> Result<(), joint_driver::RawQuantumRefusal> {
+        let key = self.preflight_s1only_subject(admitted)?;
         let resource = admitted
             .joint_resource_origin()
             .expect("checked original END");
@@ -3630,9 +3644,6 @@ impl JournalAdapter {
             .open
             .get_mut(&resource.invocation())
             .expect("checked physical original");
-        if entry.s1only_subject.is_some() {
-            return Err(RawQuantumRefusal::DispositionMismatch);
-        }
         entry.s1only_subject = Some(key);
         Ok(())
     }

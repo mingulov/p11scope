@@ -333,7 +333,13 @@ pub(crate) struct IngestedRaw {
 /// immediate consumer verifies the actual stage-cursor row and consumes it.
 pub(crate) struct S1OriginalDisposition<'adapter, 'input> {
     original: &'input crate::discovery::caller_registry::instance_input::AdmittedInstanceCall,
-    _adapter: &'adapter mut JournalAdapter,
+    adapter: &'adapter mut JournalAdapter,
+    kind: S1OriginalKind,
+}
+
+enum S1OriginalKind {
+    RetainedH8,
+    ReleasedTainted,
 }
 
 impl S1OriginalDisposition<'_, '_> {
@@ -344,7 +350,10 @@ impl S1OriginalDisposition<'_, '_> {
         if !std::ptr::eq(self.original, input) {
             return Err(RawQuantumRefusal::Admission);
         }
-        Ok(())
+        match self.kind {
+            S1OriginalKind::RetainedH8 => self.adapter.retain_s1only_subject(self.original),
+            S1OriginalKind::ReleasedTainted => Ok(()),
+        }
     }
 }
 
@@ -389,14 +398,19 @@ impl IngestedRaw {
         // Always try the unchanged strict physical-H8 path FIRST. The
         // alternate predicate rejects ANY matching custody/claim/refusal,
         // so a failed retained-path check can never become a released proof.
-        if let Err(reason) = adapter.retain_s1only_subject(admitted)
-            && (!current_original || !adapter.released_tainted_s1_original(admitted, producers))
-        {
-            return Err(reason);
-        }
+        let kind = match adapter.preflight_s1only_subject(admitted) {
+            Ok(_) => S1OriginalKind::RetainedH8,
+            Err(reason) => {
+                if !current_original || !adapter.released_tainted_s1_original(admitted, producers) {
+                    return Err(reason);
+                }
+                S1OriginalKind::ReleasedTainted
+            }
+        };
         Ok(S1OriginalDisposition {
             original: admitted,
-            _adapter: adapter,
+            adapter,
+            kind,
         })
     }
 

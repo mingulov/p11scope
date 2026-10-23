@@ -1172,14 +1172,24 @@ def causal_mutants(body, mode):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("object", type=Path)
-    parser.add_argument("--mode", required=True, choices=tuple(STATS_BYTES))
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    parser.add_argument("object", nargs="?", type=Path)
+    parser.add_argument("--mode", choices=tuple(STATS_BYTES))
+    parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--self-test-mutants", action="store_true")
     args = parser.parse_args()
+    if args.self_test:
+        if args.object is not None or args.mode is not None or args.self_test_mutants:
+            parser.error("--self-test accepts no other arguments")
+    elif args.object is None or args.mode is None:
+        parser.error("object and --mode are required for object checks")
     try:
-        body = args.object.read_bytes()
-        result = causal_mutants(body, args.mode) if args.self_test_mutants else validate(body, args.mode)[0]
+        if args.self_test:
+            result = {"schema": "p11scope-counter-transfer-controls/v1",
+                      "transfer_controls": transfer_controls()}
+        else:
+            body = args.object.read_bytes()
+            result = causal_mutants(body, args.mode) if args.self_test_mutants else validate(body, args.mode)[0]
     except (OSError, RuntimeError, struct.error, ValueError, IndexError, KeyError) as error:
         print(f"counter object refused: {error}", file=sys.stderr)
         return 2

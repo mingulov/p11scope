@@ -12439,7 +12439,7 @@ fn aggregate_policy_returns_before_both_events_reserves() {
         "the return path must hold exactly one EVENTS reserve"
     );
     let gate = returned
-        .find("if flags & FLAG_POLICY_AGGREGATE != 0")
+        .find("if cfg!(feature = \"counter-broad\") || flags & FLAG_POLICY_AGGREGATE != 0")
         .expect("return path must gate aggregate policy");
     let reserve = returned
         .find("EVENTS.reserve::<EventRecord>(0)")
@@ -12459,7 +12459,7 @@ fn aggregate_policy_returns_before_both_events_reserves() {
         .find("if owned_start_remove(&key, true).is_err()")
         .expect("ordinary return must retire before its aggregate gate");
     let ordinary_gate = ordinary
-        .find("if flags & FLAG_POLICY_AGGREGATE != 0")
+        .find("if cfg!(feature = \"counter-broad\") || flags & FLAG_POLICY_AGGREGATE != 0")
         .expect("ordinary return must gate aggregate policy");
     let ordinary_reserve = ordinary
         .find("EVENTS.reserve::<EventRecord>(0)")
@@ -12469,7 +12469,7 @@ fn aggregate_policy_returns_before_both_events_reserves() {
         "ordinary aggregate gate must retire, then return before any submit"
     );
     assert!(
-        ordinary.contains("if flags & FLAG_POLICY_AGGREGATE != 0 {\n        return 0;\n    }"),
+        ordinary.contains("if cfg!(feature = \"counter-broad\") || flags & FLAG_POLICY_AGGREGATE != 0 {\n        return 0;\n    }"),
         "ordinary aggregate gate must return before any submit"
     );
     let object = between(
@@ -12802,6 +12802,19 @@ const LICENSE_PROVENANCE_LINES: &[(&str, &str)] = &[
     (
         "tests/python/test_offline_dependencies.py",
         "c5dfe15f3b79d887884126f2a1a6366a46c5b017793fb50643bbfecf9e0c3c1f",
+    ),
+    // Tiny upstream source fixture and its exact tree assertion.
+    (
+        "tests/python/test_offline_dependencies.py",
+        "dadb209b8189d054bf657e24679e167387a8fa09a4eaf7af8193f6550441838b",
+    ),
+    (
+        "tests/python/test_offline_dependencies.py",
+        "fc94905bd22b51afdc6bada2b30be615c0e8032756d1be4e6bc223054ad0fab7",
+    ),
+    (
+        "tests/python/test_offline_dependencies.py",
+        "0e5ac5e5afc9473dd51c98b4ac462fb239470e7402e8fbef03c0a47e95a8821d",
     ),
 ];
 

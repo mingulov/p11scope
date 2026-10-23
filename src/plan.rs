@@ -755,6 +755,10 @@ pub struct AttachPlan {
     // Capture-lifetime ownership for every allocated aggregate cell. Active
     // topology remains in `slot_by_key` and each slot's current `module_ids`.
     aggregate_owners: Vec<AggregateOwner>,
+    // Counter staging consumed these original positions, including inactive
+    // published rows and never-published rollback holes. Retention only:
+    // the counter directory, not this floor, records publication.
+    counter_consumed_end: u32,
     admission_policy: AdmissionPolicy,
     admission_scope: AdmissionScope,
 }
@@ -798,6 +802,16 @@ pub struct AttachDelta {
     pub new: Vec<Slot>,
     pub replace: Vec<Slot>,
     pub retire: Vec<Slot>,
+}
+
+/// Refusal before counter history is consumed; no native authority is implied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))] // The counter staging adapter is a separate slice.
+pub(crate) enum CounterHistoryError {
+    Policy,
+    Extent,
+    Frontier,
+    Topology,
 }
 
 impl AttachPlan {
@@ -871,7 +885,10 @@ impl AttachPlan {
         providers: &BTreeSet<PinnedObjectId>,
         degraded: &BTreeSet<AttachKey>,
     ) -> Result<Self, String> {
-        if !self.retired_slots.is_empty() || !self.provisional_get_function_list.is_empty() {
+        if self.counter_consumed_end != 0
+            || !self.retired_slots.is_empty()
+            || !self.provisional_get_function_list.is_empty()
+        {
             return Err("semantic subsets require a fresh initial plan".into());
         }
         let selected: BTreeSet<_> = self
@@ -985,6 +1002,7 @@ impl AttachPlan {
             provisional_get_function_list: BTreeMap::new(),
             retired_slots: BTreeSet::new(),
             aggregate_owners,
+            counter_consumed_end: 0,
             admission_policy,
             admission_scope: AdmissionScope::Named,
             slot_ordinals: BTreeMap::new(),
@@ -1062,6 +1080,46 @@ impl AttachPlan {
 
     pub const fn admission_scope(&self) -> AdmissionScope {
         self.admission_scope
+    }
+
+    /// Exclusive end of consumed counter history, independent of publication.
+    #[cfg_attr(not(test), allow(dead_code))] // The counter staging adapter is a separate slice.
+    pub(crate) const fn counter_consumed_end(&self) -> u32 {
+        self.counter_consumed_end
+    }
+
+    /// Consume the complete fresh tail of this same historical plan exactly
+    /// once. The caller must finish charged topology/provider/commit-absence
+    /// preflight first and acquire this floor before directory/native mutation.
+    /// This allocation-free port grants no map, link or publication authority.
+    /// Rollback deactivates failed cells without refunding their positions;
+    /// previously published cells likewise survive later inactivity.
+    #[cfg_attr(not(test), allow(dead_code))] // The counter staging adapter is a separate slice.
+    pub(crate) fn consume_counter_extent(
+        &mut self,
+        first: u32,
+        end: u32,
+    ) -> Result<(), CounterHistoryError> {
+        let AdmissionPolicy::Counters(budget) = self.admission_policy else {
+            return Err(CounterHistoryError::Policy);
+        };
+        if first >= end
+            || end as usize != self.slots.len()
+            || u64::from(end) > budget.endpoint_limit()
+        {
+            return Err(CounterHistoryError::Extent);
+        }
+        if first != self.counter_consumed_end {
+            return Err(CounterHistoryError::Frontier);
+        }
+        if self.slots.iter().enumerate().any(|(position, slot)| {
+            slot.index as usize != position
+                || (position >= first as usize && !self.is_active(slot.index))
+        }) {
+            return Err(CounterHistoryError::Topology);
+        }
+        self.counter_consumed_end = end;
+        Ok(())
     }
 
     /// Rebuilds the one complete, capacity-aware snapshot a live caller passes
@@ -1719,8 +1777,11 @@ impl AttachPlan {
     /// no such cell, and keeping them burned the lifetime budget whenever the
     /// same listed-but-inactive endpoints were planned again with additions
     /// closed. Only a wholly inactive tail is withdrawn: an active cell means
-    /// a link exists, and then nothing is given back.
+    /// a link exists, and then nothing is given back. Counter staging also
+    /// consumes positions before links/publication: its history is retained
+    /// even when clean rollback left those cells inactive and never published.
     pub(crate) fn withdraw_unlinked_additions(&mut self, accepted: usize) {
+        let accepted = accepted.max(self.counter_consumed_end as usize);
         if self.slots.len() <= accepted
             || (accepted..self.slots.len()).any(|position| self.is_active(position as u32))
         {
@@ -1748,7 +1809,8 @@ impl AttachPlan {
     /// link, so giving it back cannot strand a count; keeping it would
     /// burn the capture-lifetime budget on every deferral tick. Only
     /// cells at `accepted..` that are inactive are removed — active cells
-    /// and cells below `accepted` are never touched. Surviving tail cells
+    /// and cells below `accepted` or the consumed counter floor are never
+    /// touched. Surviving unconsumed tail cells
     /// shift down with their indices, owners, and key/retirement
     /// positions remapped. Returns the old-index → new-index map
     /// (`u32::MAX` for excised cells) so the caller can remap detached
@@ -1758,6 +1820,7 @@ impl AttachPlan {
         accepted: usize,
         cells: &BTreeSet<u32>,
     ) -> Vec<u32> {
+        let accepted = accepted.max(self.counter_consumed_end as usize);
         let old_len = self.slots.len();
         debug_assert_eq!(self.aggregate_owners.len(), old_len);
         let remove: BTreeSet<usize> = cells
@@ -1824,6 +1887,14 @@ impl AttachPlan {
     }
 
     pub(crate) fn validate_slot_index(&self) -> Result<(), String> {
+        if self.counter_consumed_end as usize > self.slots.len() {
+            return Err("consumed counter history extends past allocated slots".into());
+        }
+        if self.counter_consumed_end != 0
+            && !matches!(self.admission_policy, AdmissionPolicy::Counters(_))
+        {
+            return Err("consumed counter history requires counter admission policy".into());
+        }
         if self.aggregate_owners.len() != self.slots.len() {
             return Err("aggregate-owner state does not match allocated slots".into());
         }

@@ -11412,9 +11412,10 @@ mod tests {
             let original_fds: Vec<_> = links
                 .iter()
                 .flat_map(|link| match link {
-                    RegisteredLink::MultiUProbe { fds, .. } => {
-                        fds.iter().map(AsRawFd::as_raw_fd).collect::<Vec<_>>()
-                    }
+                    RegisteredLink::MultiUProbe { fds, .. } => fds
+                        .iter()
+                        .map(std::os::fd::AsRawFd::as_raw_fd)
+                        .collect::<Vec<_>>(),
                     _ => unreachable!(),
                 })
                 .collect();
@@ -11557,9 +11558,10 @@ mod tests {
         let original_fds: Vec<_> = links
             .iter()
             .flat_map(|link| match link {
-                RegisteredLink::MultiUProbe { fds, .. } => {
-                    fds.iter().map(AsRawFd::as_raw_fd).collect::<Vec<_>>()
-                }
+                RegisteredLink::MultiUProbe { fds, .. } => fds
+                    .iter()
+                    .map(std::os::fd::AsRawFd::as_raw_fd)
+                    .collect::<Vec<_>>(),
                 _ => unreachable!(),
             })
             .collect();

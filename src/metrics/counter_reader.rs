@@ -1,6 +1,424 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! Private native counter acquisition; no selector or Session loading route.
 
+use super::counter_collector::{
+    CounterCell, CounterField, CounterHealth, CounterIssue, CounterLimits, CounterRead, CounterRow,
+    ReadReservation, ReadStage, ReadWindow,
+};
+use super::{KernelControl, KernelEvidence, saturating_total};
+use crate::attach::Session;
+use crate::plan::{AttachPlan, Slot};
+use crate::semantics_edge::resources::{OWNED_ALLOCATION_PADDING, SemanticResourceReserver};
+use aya::maps::{Array, Map, MapData, MapType, PerCpuArray, PerCpuHashMap};
+use p11scope_ebpf_common::{
+    CallStart, CountStats, CounterMode, EVIDENCE_ABI_REFUSALS, EVIDENCE_CELLS,
+    EVIDENCE_CGROUP_SCOPE_FAILURES, EVIDENCE_RING_LOSS, EVIDENCE_RV_UPDATE_FAILURES,
+    EVIDENCE_SEMANTIC_CAPTURE_FAILURES, EVIDENCE_START_INSERT_FAILURES,
+    EVIDENCE_TEMPLATE_TAIL_FAILURES, EVIDENCE_UNMATCHED_RETURNS, EVIDENCE_UNREGISTERED_MECHANISMS,
+    IMAGE_IDENTITY_TICKET_LIMIT, ImageIdentityControl, RootAffiliationControl, RvKey, SlotStats,
+    StartKey, ThreadOwnerControl, TimestampStats,
+};
+use std::mem::size_of;
+use std::num::NonZeroU64;
+
+// These are the actual unselected artifact bounds, independent of the 8192
+// planning ceiling or any Detailed SMALL/WIDE configuration.
+const NATIVE_SLOTS: usize = 512;
+const NATIVE_RVS: usize = 4096;
+const NATIVE_STARTS: u32 = 16384;
+
+/// Real Session identity only. A legacy Detailed/Inventory Session lacks the
+/// required counter health/shape and refuses; this adds no counter loader.
+#[allow(dead_code)] // Staged Session bridge; no counter loader/selector is active.
+pub(super) fn read(
+    session: &Session,
+    plan: &AttachPlan,
+    mode: CounterMode,
+    limits: CounterLimits,
+    reserve: &SemanticResourceReserver,
+) -> Result<CounterRead, ReadStage> {
+    let source = NativeSource::new(|name| session.ebpf.map(name), mode)?;
+    acquire(
+        &source,
+        session.counter_collection_generation(),
+        plan,
+        limits,
+        reserve,
+    )
+}
+
+/// Only I/O is replaceable: acquisition ordering, limits, precharge and checked
+/// folds are shared with the native adapter. No method clears/writes a map.
+trait CounterSource {
+    fn mode(&self) -> CounterMode;
+    fn possible_cpus(&self) -> usize;
+    fn rv_keys(&self) -> impl Iterator<Item = Result<RvKey, ReadStage>> + '_;
+    fn rv_total(&self, key: &RvKey) -> Result<Result<u64, CounterIssue>, ReadStage>;
+    fn fold_row(
+        &self,
+        slot: &Slot,
+        rvs: &[(RvKey, u64)],
+        limits: CounterLimits,
+    ) -> Result<Result<CounterRow, CounterIssue>, ReadStage>;
+    fn health(&self) -> Result<CounterHealth, ReadStage>;
+    fn kernel(&self) -> Result<KernelEvidence, ReadStage>;
+    fn now(&self) -> Option<u64>;
+}
+
+fn transient_bytes(mode: CounterMode, cpus: usize, rv_keys: usize) -> Option<usize> {
+    // Aya allocates an aligned raw per-CPU buffer, then grows a Vec from zero
+    // before boxing it. For these <=1024B values Rust's minimum capacity is 4;
+    // count raw+old/new typed requests and boxing overlap conservatively.
+    // RV staging is reserved exactly; unstable sorting has no heap scratch.
+    let value = usize::try_from(mode.stats_bytes())
+        .ok()?
+        .checked_next_multiple_of(8)?;
+    let capacity = cpus.checked_next_power_of_two()?.max(4);
+    let cells = cpus.checked_mul(2)?.checked_add(capacity.checked_mul(2)?)?;
+    value
+        .checked_mul(cells)?
+        .checked_add(rv_keys.checked_mul(size_of::<(RvKey, u64)>())?)?
+        .checked_add(5 * OWNED_ALLOCATION_PADDING)
+}
+
+fn acquire(
+    source: &impl CounterSource,
+    generation: NonZeroU64,
+    plan: &AttachPlan,
+    limits: CounterLimits,
+    reserve: &SemanticResourceReserver,
+) -> Result<CounterRead, ReadStage> {
+    let started = source.now();
+    if limits.rows > NATIVE_SLOTS
+        || limits.rv_keys > NATIVE_RVS
+        || plan.slots.len() > limits.rows
+        || source.possible_cpus() == 0
+        || plan.slots.iter().enumerate().any(|(index, slot)| {
+            slot.index as usize != index
+                || plan.slots[..index].iter().any(|previous| {
+                    (previous.object, previous.file_offset) == (slot.object, slot.file_offset)
+                })
+        })
+    {
+        return Err(ReadStage::Shape);
+    }
+    let _transient = reserve
+        .reserve(
+            transient_bytes(source.mode(), source.possible_cpus(), limits.rv_keys)
+                .ok_or(ReadStage::Budget)?,
+        )
+        .map_err(|_| ReadStage::Budget)?;
+    let storage = ReadReservation::reserve(plan.slots.len(), limits.rv_keys, reserve)?;
+    let mut rvs = Vec::with_capacity(limits.rv_keys);
+    let mut issue = None;
+    // Do not use Aya's combined MapIter: it can internally skip missing keys
+    // without exposing an iteration bound. Each key and lookup is explicit.
+    for key in source.rv_keys().take(limits.rv_keys + 1) {
+        let key = key?;
+        if rvs.len() == limits.rv_keys {
+            issue = Some(CounterIssue::Limits);
+            break;
+        }
+        if key._pad != 0 || !plan.slots.iter().any(|slot| slot.index == key.slot) {
+            issue = Some(CounterIssue::Topology);
+            break;
+        }
+        match source.rv_total(&key)? {
+            Ok(total) => rvs.push((key, total)),
+            Err(failure) => {
+                issue = Some(failure);
+                break;
+            }
+        }
+    }
+    rvs.sort_unstable_by_key(|(key, _)| (key.slot, key.rv));
+    if issue.is_none()
+        && rvs
+            .windows(2)
+            .any(|pair| (pair[0].0.slot, pair[0].0.rv) == (pair[1].0.slot, pair[1].0.rv))
+    {
+        issue = Some(CounterIssue::Topology);
+    }
+    let rows = if let Some(issue) = issue {
+        Err(issue)
+    } else {
+        let mut rows = Vec::with_capacity(plan.slots.len());
+        let mut start = 0;
+        for slot in &plan.slots {
+            let end = start + rvs[start..].partition_point(|(key, _)| key.slot == slot.index);
+            match source.fold_row(slot, &rvs[start..end], limits)? {
+                Ok(row) => rows.push(row),
+                Err(failure) => {
+                    issue = Some(failure);
+                    break;
+                }
+            }
+            start = end;
+        }
+        issue.map_or(Ok(rows), Err)
+    };
+    // Required health is additional to START/RV/owner evidence. Even a known
+    // fold/topology failure never fabricates successful missing-map reads.
+    let health = source.health()?;
+    let kernel = source.kernel()?;
+    let window = ReadWindow::new(started, source.now());
+    CounterRead::new(
+        generation,
+        source.mode(),
+        window,
+        rows,
+        health,
+        kernel,
+        storage,
+    )
+}
+
+enum NativeStats<'a> {
+    Counts(PerCpuArray<&'a MapData, CountStats>),
+    Timestamps(PerCpuArray<&'a MapData, TimestampStats>),
+    Latency(PerCpuArray<&'a MapData, SlotStats>),
+}
+
+struct NativeSource<'a> {
+    mode: CounterMode,
+    cpus: usize,
+    stats: NativeStats<'a>,
+    rvs: PerCpuHashMap<&'a MapData, RvKey, u64>,
+    health: PerCpuArray<&'a MapData, u64>,
+    evidence: PerCpuArray<&'a MapData, u64>,
+    owner: Array<&'a MapData, ThreadOwnerControl>,
+    cookie: Array<&'a MapData, ImageIdentityControl>,
+    root: Array<&'a MapData, RootAffiliationControl>,
+}
+
+fn shape(
+    map: &Map,
+    kind: MapType,
+    key: usize,
+    value: usize,
+    capacity: u32,
+) -> Result<(), ReadStage> {
+    let data = match map {
+        Map::PerCpuArray(data)
+        | Map::PerCpuHashMap(data)
+        | Map::Array(data)
+        | Map::HashMap(data) => data,
+        _ => return Err(ReadStage::Shape),
+    };
+    let info = data.info().map_err(|_| ReadStage::Shape)?;
+    if info.map_type().map_err(|_| ReadStage::Shape)? != kind
+        || info.key_size() as usize != key
+        || info.value_size() as usize != value
+        || info.max_entries() != capacity
+        || info.map_flags() != 0
+    {
+        return Err(ReadStage::Shape);
+    }
+    Ok(())
+}
+
+impl<'a> NativeSource<'a> {
+    fn new(lookup: impl Fn(&str) -> Option<&'a Map>, mode: CounterMode) -> Result<Self, ReadStage> {
+        let required = |name| lookup(name).ok_or(ReadStage::Shape);
+        let stats = required("STATS")?;
+        let rvs = required("RV_COUNTS")?;
+        let starts = required("START")?;
+        let health = required("COUNTER_HEALTH")?;
+        let evidence = required("EVIDENCE")?;
+        let owner = required("OWNER_CTL")?;
+        let cookie = required("COOKIE_CTL")?;
+        let root = required("ROOT_CTL")?;
+        shape(
+            stats,
+            MapType::PerCpuArray,
+            4,
+            mode.stats_bytes() as usize,
+            NATIVE_SLOTS as u32,
+        )?;
+        shape(
+            rvs,
+            MapType::PerCpuHash,
+            size_of::<RvKey>(),
+            8,
+            NATIVE_RVS as u32,
+        )?;
+        shape(
+            starts,
+            MapType::Hash,
+            size_of::<StartKey>(),
+            size_of::<CallStart>(),
+            NATIVE_STARTS,
+        )?;
+        shape(health, MapType::PerCpuArray, 4, 8, 2)?;
+        shape(evidence, MapType::PerCpuArray, 4, 8, EVIDENCE_CELLS)?;
+        shape(owner, MapType::Array, 4, size_of::<ThreadOwnerControl>(), 1)?;
+        shape(
+            cookie,
+            MapType::Array,
+            4,
+            size_of::<ImageIdentityControl>(),
+            1,
+        )?;
+        shape(
+            root,
+            MapType::Array,
+            4,
+            size_of::<RootAffiliationControl>(),
+            1,
+        )?;
+        let cpus = aya::util::nr_cpus().map_err(|_| ReadStage::Shape)?;
+        if cpus == 0 {
+            return Err(ReadStage::Shape);
+        }
+        Ok(Self {
+            mode,
+            cpus,
+            stats: match mode {
+                CounterMode::Counts => {
+                    NativeStats::Counts(PerCpuArray::try_from(stats).map_err(|_| ReadStage::Shape)?)
+                }
+                CounterMode::Timestamps => NativeStats::Timestamps(
+                    PerCpuArray::try_from(stats).map_err(|_| ReadStage::Shape)?,
+                ),
+                CounterMode::Latency => NativeStats::Latency(
+                    PerCpuArray::try_from(stats).map_err(|_| ReadStage::Shape)?,
+                ),
+            },
+            rvs: PerCpuHashMap::try_from(rvs).map_err(|_| ReadStage::Shape)?,
+            health: PerCpuArray::try_from(health).map_err(|_| ReadStage::Shape)?,
+            evidence: PerCpuArray::try_from(evidence).map_err(|_| ReadStage::Shape)?,
+            owner: Array::try_from(owner).map_err(|_| ReadStage::Shape)?,
+            cookie: Array::try_from(cookie).map_err(|_| ReadStage::Shape)?,
+            root: Array::try_from(root).map_err(|_| ReadStage::Shape)?,
+        })
+    }
+
+    fn cpu_count(&self, count: usize, stage: ReadStage) -> Result<(), ReadStage> {
+        if count == self.cpus {
+            Ok(())
+        } else {
+            Err(stage)
+        }
+    }
+}
+
+impl CounterSource for NativeSource<'_> {
+    fn mode(&self) -> CounterMode {
+        self.mode
+    }
+    fn possible_cpus(&self) -> usize {
+        self.cpus
+    }
+    fn rv_keys(&self) -> impl Iterator<Item = Result<RvKey, ReadStage>> + '_ {
+        self.rvs.keys().map(|key| key.map_err(|_| ReadStage::Rvs))
+    }
+    fn rv_total(&self, key: &RvKey) -> Result<Result<u64, CounterIssue>, ReadStage> {
+        let values = self.rvs.get(key, 0).map_err(|_| ReadStage::Rvs)?;
+        self.cpu_count(values.len(), ReadStage::Rvs)?;
+        Ok(values.iter().try_fold(0u64, |total, &value| {
+            total
+                .checked_add(value)
+                .ok_or(CounterIssue::FoldOverflow(CounterField::Rv(key.rv)))
+        }))
+    }
+    fn fold_row(
+        &self,
+        slot: &Slot,
+        rvs: &[(RvKey, u64)],
+        limits: CounterLimits,
+    ) -> Result<Result<CounterRow, CounterIssue>, ReadStage> {
+        let rvs = || rvs.iter().copied();
+        Ok(match &self.stats {
+            NativeStats::Counts(stats) => {
+                let values = stats.get(&slot.index, 0).map_err(|_| ReadStage::Stats)?;
+                self.cpu_count(values.len(), ReadStage::Stats)?;
+                CounterRow::fold(
+                    slot,
+                    self.mode,
+                    values.iter().map(CounterCell::Counts),
+                    rvs(),
+                    limits,
+                )
+            }
+            NativeStats::Timestamps(stats) => {
+                let values = stats.get(&slot.index, 0).map_err(|_| ReadStage::Stats)?;
+                self.cpu_count(values.len(), ReadStage::Stats)?;
+                CounterRow::fold(
+                    slot,
+                    self.mode,
+                    values.iter().map(CounterCell::Timestamps),
+                    rvs(),
+                    limits,
+                )
+            }
+            NativeStats::Latency(stats) => {
+                let values = stats.get(&slot.index, 0).map_err(|_| ReadStage::Stats)?;
+                self.cpu_count(values.len(), ReadStage::Stats)?;
+                CounterRow::fold(
+                    slot,
+                    self.mode,
+                    values.iter().map(CounterCell::Latency),
+                    rvs(),
+                    limits,
+                )
+            }
+        })
+    }
+    fn health(&self) -> Result<CounterHealth, ReadStage> {
+        let read = |index| -> Result<bool, ReadStage> {
+            let values = self.health.get(&index, 0).map_err(|_| ReadStage::Health)?;
+            self.cpu_count(values.len(), ReadStage::Health)?;
+            Ok(values.iter().any(|&value| value != 0))
+        };
+        Ok(CounterHealth {
+            saturated: read(0)?,
+            contended: read(1)?,
+        })
+    }
+    fn kernel(&self) -> Result<KernelEvidence, ReadStage> {
+        let owner = self
+            .owner
+            .get(&0, 0)
+            .map_err(|_| ReadStage::KernelEvidence)?;
+        let cookie = self
+            .cookie
+            .get(&0, 0)
+            .map_err(|_| ReadStage::KernelEvidence)?;
+        let root = self
+            .root
+            .get(&0, 0)
+            .map_err(|_| ReadStage::KernelEvidence)?;
+        if owner.limit != u64::from(NATIVE_STARTS) + 64
+            || cookie.limit != IMAGE_IDENTITY_TICKET_LIMIT
+        {
+            return Err(ReadStage::KernelEvidence);
+        }
+        let read = |index| -> Result<u64, ReadStage> {
+            let values = self
+                .evidence
+                .get(&index, 0)
+                .map_err(|_| ReadStage::KernelEvidence)?;
+            self.cpu_count(values.len(), ReadStage::KernelEvidence)?;
+            Ok(saturating_total(values.iter().copied()))
+        };
+        Ok(KernelEvidence {
+            ring_loss: read(EVIDENCE_RING_LOSS)?,
+            start_insert_failures: read(EVIDENCE_START_INSERT_FAILURES)?,
+            unmatched_returns: read(EVIDENCE_UNMATCHED_RETURNS)?,
+            rv_update_failures: read(EVIDENCE_RV_UPDATE_FAILURES)?,
+            cgroup_scope_failures: read(EVIDENCE_CGROUP_SCOPE_FAILURES)?,
+            semantic_capture_failures: read(EVIDENCE_SEMANTIC_CAPTURE_FAILURES)?,
+            template_tail_failures: read(EVIDENCE_TEMPLATE_TAIL_FAILURES)?,
+            unregistered_mechanisms: read(EVIDENCE_UNREGISTERED_MECHANISMS)?,
+            abi_refusals: read(EVIDENCE_ABI_REFUSALS)?,
+            control: KernelControl::from_cells(Some(owner), Some(cookie), Some(root)),
+        })
+    }
+    fn now(&self) -> Option<u64> {
+        crate::attach::monotonic_ns()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -596,22 +1014,56 @@ mod tests {
         PerCpuValues::try_from(values).unwrap()
     }
 
+    fn native_pair_values<T: aya::Pod + Copy>(ends: [T; 2], zero: T) -> PerCpuValues<T> {
+        let count = aya::util::nr_cpus().unwrap();
+        assert!(
+            count >= 2,
+            "native counter positives require at least two possible CPUs"
+        );
+        let mut values = vec![zero; count];
+        values[0] = ends[0];
+        values[count - 1] = ends[1];
+        PerCpuValues::try_from(values).unwrap()
+    }
+
     fn write_native(maps: &mut BTreeMap<&'static str, Map>, mode: CounterMode, later: bool) {
         let source = Scripted::sample(mode, later);
         for index in [0, 1] {
-            let cell = source.stats[&index][0];
+            let mut first = source.stats[&index][0];
+            let mut last = SlotStats::ZERO;
+            if index == 0 {
+                // Preserve literal aggregate 3/5/1/50/20 -> 8/9/2/90/25,
+                // but require the reader to consume a nonzero last CPU.
+                last.entered = if later { 3 } else { 1 };
+                last.returned = if later { 4 } else { 2 };
+                last.errors = u64::from(later);
+                last.total_ns = if later { 30 } else { 20 };
+                last.max_ns = if later { 18 } else { 15 };
+                last.buckets[7] = if later { 2 } else { 1 };
+                last.buckets[31] = if later { 2 } else { 1 };
+                first.entered -= last.entered;
+                first.returned -= last.returned;
+                first.errors -= last.errors;
+                first.total_ns -= last.total_ns;
+                first.buckets[7] -= last.buckets[7];
+                first.buckets[31] -= last.buckets[31];
+            } else {
+                last = first;
+                first = SlotStats::ZERO;
+            }
+            let cells = [first, last];
             match mode {
                 CounterMode::Counts => {
                     PerCpuArray::<_, CountStats>::try_from(maps.get_mut("STATS").unwrap())
                         .unwrap()
                         .set(
                             index,
-                            native_values(
-                                CountStats {
+                            native_pair_values(
+                                cells.map(|cell| CountStats {
                                     entered: cell.entered,
                                     returned: cell.returned,
                                     errors: cell.errors,
-                                },
+                                }),
                                 CountStats::default(),
                             ),
                             0,
@@ -623,14 +1075,14 @@ mod tests {
                         .unwrap()
                         .set(
                             index,
-                            native_values(
-                                TimestampStats {
+                            native_pair_values(
+                                cells.map(|cell| TimestampStats {
                                     entered: cell.entered,
                                     returned: cell.returned,
                                     errors: cell.errors,
                                     total_ns: cell.total_ns,
                                     max_ns: cell.max_ns,
-                                },
+                                }),
                                 TimestampStats::default(),
                             ),
                             0,
@@ -640,7 +1092,7 @@ mod tests {
                 CounterMode::Latency => {
                     PerCpuArray::<_, SlotStats>::try_from(maps.get_mut("STATS").unwrap())
                         .unwrap()
-                        .set(index, native_values(cell, SlotStats::ZERO), 0)
+                        .set(index, native_pair_values(cells, SlotStats::ZERO), 0)
                         .unwrap()
                 }
             }
@@ -648,7 +1100,9 @@ mod tests {
         let mut rvs =
             PerCpuHashMap::<_, RvKey, u64>::try_from(maps.get_mut("RV_COUNTS").unwrap()).unwrap();
         for (key, values) in source.rvs {
-            rvs.insert(key, native_values(values[0], 0), 0).unwrap();
+            let last = if later && key.rv != HIGH_RV { 2 } else { 1 };
+            rvs.insert(key, native_pair_values([values[0] - last, last], 0), 0)
+                .unwrap();
         }
     }
 
@@ -677,7 +1131,6 @@ mod tests {
                 )),
                 CounterObservation::Initial
             );
-            drop(source);
             write_native(&mut maps, mode, true);
             let source = NativeSource::new(|name| maps.get(name), mode).unwrap();
             match collector.observe(acquire(
@@ -794,7 +1247,7 @@ mod tests {
         ] {
             PerCpuArray::<_, u64>::try_from(maps.get_mut("COUNTER_HEALTH").unwrap())
                 .unwrap()
-                .set(index, native_values(1, 0), 0)
+                .set(index, native_pair_values([0, 1], 0), 0)
                 .unwrap();
             let pool = test_pool();
             let source = NativeSource::new(|name| maps.get(name), CounterMode::Counts).unwrap();
@@ -809,7 +1262,6 @@ mod tests {
                 )),
                 CounterObservation::Unavailable(issue)
             );
-            drop(source);
             PerCpuArray::<_, u64>::try_from(maps.get_mut("COUNTER_HEALTH").unwrap())
                 .unwrap()
                 .set(index, native_values(0, 0), 0)

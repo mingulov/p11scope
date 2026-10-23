@@ -1,20 +1,25 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! Private preparation for independent cumulative counter collection.
 //!
-//! This module does no map I/O and invents no Session identity or health-map
-//! success. A later adapter must acquire a complete, charged snapshot using the
-//! real Session generation. The limits here bound each retained baseline and
-//! its differences; they do not charge the adapter's source allocation.
+//! Acquisition supplies actual Session identity and complete native health.
+//! Immutable row storage is shared, not deep-cloned under one charge. Each
+//! returned delta batch retains its own allocation charge until its final drop.
 //! Session collection generations must increase strictly on creation, using
 //! checked nonzero allocation; an old Session can never be revived as new.
 
 use super::KernelEvidence;
 use crate::plan::{AttachKey, Slot};
+use crate::semantics_edge::resources::{
+    OWNED_ALLOCATION_PADDING, ResourceLease, SemanticResourceReserver,
+};
 use p11scope_ebpf_common::{
     CountStats, CounterMode, LATENCY_BUCKETS, RvKey, SlotStats, TimestampStats,
 };
 use std::collections::{BTreeMap, BTreeSet};
+use std::mem::{align_of, size_of};
 use std::num::NonZeroU64;
+use std::ops::Deref;
+use std::sync::Arc;
 
 /// Physical rows and distinct (slot, full-width RV) keys, per collector.
 #[derive(Clone, Copy)]
@@ -208,12 +213,81 @@ pub(super) struct CounterHealth {
     pub(super) contended: bool,
 }
 
-#[derive(Clone)]
+// The existing resources module pins Rust 1.98.1's x86-64 B-tree layout and
+// allocator model. One full internal node per entry dominates retained tree
+// requests; eight extra nodes cover the bounded split/root temporary chain.
+// This is a conservative requested-allocation envelope, never an RSS bound.
+fn tree_bytes<K, V>(entries: usize) -> Option<usize> {
+    let node = 16usize
+        .checked_add(11usize.checked_mul(size_of::<K>().checked_add(size_of::<V>())?)?)?
+        .checked_add(12 * 8)?
+        .checked_add(OWNED_ALLOCATION_PADDING)?;
+    entries.checked_add(8)?.checked_mul(node)
+}
+
+fn vector_bytes<T>(capacity: usize) -> Option<usize> {
+    capacity
+        .checked_mul(size_of::<T>())?
+        .checked_add(OWNED_ALLOCATION_PADDING)
+}
+
+/// Reserve before constructing the row Vec or any RV tree. The native reader
+/// holds its separate transient reservation concurrently with this storage.
+pub(super) struct ReadReservation {
+    rows: usize,
+    rv_keys: usize,
+    storage: ResourceLease,
+}
+
+impl ReadReservation {
+    pub(super) fn reserve(
+        rows: usize,
+        rv_keys: usize,
+        reserve: &SemanticResourceReserver,
+    ) -> Result<Self, ReadStage> {
+        let bytes = vector_bytes::<CounterRow>(rows)
+            // Include one potentially empty root per row as well as keys.
+            .and_then(|bytes| {
+                bytes.checked_add(tree_bytes::<u64, u64>(rv_keys.checked_add(rows)?)?)
+            })
+            .and_then(|bytes| bytes.checked_add(size_of::<CounterRows>()))
+            .and_then(|bytes| bytes.checked_add(2 * size_of::<usize>() + OWNED_ALLOCATION_PADDING))
+            .ok_or(ReadStage::Budget)?;
+        Ok(Self {
+            rows,
+            rv_keys,
+            storage: reserve.reserve(bytes).map_err(|_| ReadStage::Budget)?,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct CounterRows {
+    values: Vec<CounterRow>,
+    _storage: ResourceLease,
+}
+
+impl Deref for CounterRows {
+    type Target = [CounterRow];
+
+    fn deref(&self) -> &Self::Target {
+        &self.values
+    }
+}
+
+const _: () = {
+    assert!(align_of::<CounterRow>() <= 8);
+    assert!(align_of::<CounterCellDelta>() <= 8);
+    assert!(align_of::<CounterRows>() <= 8);
+    assert!(align_of::<AttachKey>() <= 8);
+};
+
+#[derive(Debug, Clone)]
 pub(super) struct CounterRead {
     generation: NonZeroU64,
     mode: CounterMode,
     window: Option<ReadWindow>,
-    rows: Result<Vec<CounterRow>, CounterIssue>,
+    rows: Result<Arc<CounterRows>, CounterIssue>,
     health: CounterHealth,
     kernel: KernelEvidence,
 }
@@ -228,23 +302,48 @@ impl CounterRead {
         rows: Result<Vec<CounterRow>, CounterIssue>,
         health: CounterHealth,
         kernel: KernelEvidence,
-    ) -> Self {
-        Self {
+        reservation: ReadReservation,
+    ) -> Result<Self, ReadStage> {
+        let rows = match rows {
+            Ok(rows) => {
+                let keys = rows.iter().try_fold(0usize, |count, row| {
+                    count.checked_add(row.levels.rv_counts.len())
+                });
+                if rows.capacity() > reservation.rows
+                    || keys.is_none_or(|keys| keys > reservation.rv_keys)
+                {
+                    return Err(ReadStage::Budget);
+                }
+                Ok(Arc::new(CounterRows {
+                    values: rows,
+                    _storage: reservation.storage,
+                }))
+            }
+            Err(issue) => Err(issue),
+        };
+        Ok(Self {
             generation,
             mode,
             window,
             rows,
             health,
             kernel,
-        }
+        })
     }
 
-    fn validate(&self, limits: CounterLimits) -> Result<&[CounterRow], CounterIssue> {
-        let rows = self.rows.as_deref().map_err(|&issue| issue)?;
+    fn validate(
+        &self,
+        limits: CounterLimits,
+        reserve: &SemanticResourceReserver,
+    ) -> Result<&[CounterRow], CollectionFailure> {
+        let rows: &[CounterRow] = self
+            .rows
+            .as_deref()
+            .map_err(|&issue| CollectionFailure::Issue(issue))?;
         // Check storage before allocating an identity set, differences or a
         // replacement baseline. RV limits count keys across all physical rows.
         if rows.len() > limits.rows {
-            return Err(CounterIssue::Limits);
+            return Err(CounterIssue::Limits.into());
         }
         let mut keys = 0usize;
         for row in rows {
@@ -254,10 +353,10 @@ impl CounterRead {
                 .ok_or(CounterIssue::Limits)?;
         }
         if self.health.saturated {
-            return Err(CounterIssue::ProducerSaturated);
+            return Err(CounterIssue::ProducerSaturated.into());
         }
         if self.health.contended {
-            return Err(CounterIssue::Contended);
+            return Err(CounterIssue::Contended.into());
         }
         let kernel = &self.kernel;
         if [
@@ -278,23 +377,27 @@ impl CounterRead {
         .into_iter()
         .any(|count| count != 0)
         {
-            return Err(CounterIssue::KernelEvidence);
+            return Err(CounterIssue::KernelEvidence.into());
         }
+        let _identity_storage = reserve
+            .reserve(tree_bytes::<AttachKey, ()>(rows.len()).ok_or(CollectionFailure::Budget)?)
+            .map_err(|_| CollectionFailure::Budget)?;
         let mut targets = BTreeSet::new();
         let mut previous = None;
         for row in rows {
             if row.mode != self.mode {
-                return Err(CounterIssue::Mode);
+                return Err(CounterIssue::Mode.into());
             }
             if previous.is_some_and(|index| index >= row.slot) || !targets.insert(row.target) {
-                return Err(CounterIssue::Topology);
+                return Err(CounterIssue::Topology.into());
             }
             previous = Some(row.slot);
             if let Some(field) = row.saturation() {
                 return Err(CounterIssue::Saturated {
                     slot: row.slot,
                     field,
-                });
+                }
+                .into());
             }
         }
         Ok(rows)
@@ -303,10 +406,23 @@ impl CounterRead {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ReadStage {
+    Shape,
+    Budget,
     Stats,
     Rvs,
     Health,
     KernelEvidence,
+}
+
+enum CollectionFailure {
+    Issue(CounterIssue),
+    Budget,
+}
+
+impl From<CounterIssue> for CollectionFailure {
+    fn from(issue: CounterIssue) -> Self {
+        Self::Issue(issue)
+    }
 }
 
 /// Component-wise sampled differences. Timing/buckets are available according
@@ -325,11 +441,35 @@ pub(super) struct CounterCellDelta {
     pub(super) rv_counts: BTreeMap<u64, u64>,
 }
 
+/// Moving the batch preserves its charge; indexing borrows cells without
+/// producing a second, uncharged Vec/tree copy.
+#[derive(Debug)]
+pub(super) struct CounterDeltas {
+    values: Vec<CounterCellDelta>,
+    _storage: ResourceLease,
+}
+
+impl Deref for CounterDeltas {
+    type Target = [CounterCellDelta];
+
+    fn deref(&self) -> &Self::Target {
+        &self.values
+    }
+}
+
+impl PartialEq for CounterDeltas {
+    fn eq(&self, other: &Self) -> bool {
+        self.values == other.values
+    }
+}
+
+impl Eq for CounterDeltas {}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum CounterObservation {
     Initial,
     Advanced {
-        deltas: Vec<CounterCellDelta>,
+        deltas: CounterDeltas,
         before: Option<ReadWindow>,
         after: Option<ReadWindow>,
     },
@@ -343,15 +483,17 @@ pub(super) enum CounterObservation {
 
 pub(super) struct CounterCollector {
     limits: CounterLimits,
+    reserve: SemanticResourceReserver,
     generation: Option<NonZeroU64>,
     baseline: Option<CounterRead>,
     issue: Option<CounterIssue>,
 }
 
 impl CounterCollector {
-    pub(super) fn new(limits: CounterLimits) -> Self {
+    pub(super) fn new(limits: CounterLimits, reserve: SemanticResourceReserver) -> Self {
         Self {
             limits,
+            reserve,
             generation: None,
             baseline: None,
             issue: None,
@@ -373,8 +515,12 @@ impl CounterCollector {
         if same_generation && let Some(issue) = self.issue {
             return CounterObservation::Unavailable(issue);
         }
-        if let Err(issue) = read.validate(self.limits) {
-            return self.latch(read.generation, issue);
+        match read.validate(self.limits, &self.reserve) {
+            Ok(_) => {}
+            Err(CollectionFailure::Issue(issue)) => return self.latch(read.generation, issue),
+            Err(CollectionFailure::Budget) => {
+                return CounterObservation::ReadFailed(ReadStage::Budget);
+            }
         }
         let observation = if same_generation {
             // A successful first read installs a baseline. An unsuccessful
@@ -383,13 +529,16 @@ impl CounterCollector {
                 .baseline
                 .as_ref()
                 .expect("healthy generation has a baseline");
-            match differences(old, &read) {
+            match differences(old, &read, &self.reserve) {
                 Ok(deltas) => CounterObservation::Advanced {
                     deltas,
                     before: old.window,
                     after: read.window,
                 },
-                Err(issue) => return self.latch(read.generation, issue),
+                Err(CollectionFailure::Issue(issue)) => return self.latch(read.generation, issue),
+                Err(CollectionFailure::Budget) => {
+                    return CounterObservation::ReadFailed(ReadStage::Budget);
+                }
             }
         } else if let Some(previous) = previous {
             CounterObservation::GenerationChanged {
@@ -416,15 +565,34 @@ impl CounterCollector {
 fn differences(
     old: &CounterRead,
     current: &CounterRead,
-) -> Result<Vec<CounterCellDelta>, CounterIssue> {
+    reserve: &SemanticResourceReserver,
+) -> Result<CounterDeltas, CollectionFailure> {
     if old.mode != current.mode {
-        return Err(CounterIssue::Mode);
+        return Err(CounterIssue::Mode.into());
     }
-    let old_rows = old.rows.as_deref().map_err(|&issue| issue)?;
-    let rows = current.rows.as_deref().map_err(|&issue| issue)?;
+    let old_rows = old
+        .rows
+        .as_deref()
+        .map_err(|&issue| CollectionFailure::Issue(issue))?;
+    let rows = current
+        .rows
+        .as_deref()
+        .map_err(|&issue| CollectionFailure::Issue(issue))?;
     if rows.len() < old_rows.len() {
-        return Err(CounterIssue::Topology);
+        return Err(CounterIssue::Topology.into());
     }
+    let keys = rows
+        .iter()
+        .try_fold(0usize, |count, row| {
+            count.checked_add(row.levels.rv_counts.len())
+        })
+        .ok_or(CollectionFailure::Budget)?;
+    let bytes = vector_bytes::<CounterCellDelta>(rows.len())
+        .and_then(|bytes| bytes.checked_add(tree_bytes::<u64, u64>(keys.checked_add(rows.len())?)?))
+        .ok_or(CollectionFailure::Budget)?;
+    let storage = reserve
+        .reserve(bytes)
+        .map_err(|_| CollectionFailure::Budget)?;
     let mut deltas = Vec::with_capacity(rows.len());
     let zero = CounterLevels::default();
     for (index, row) in rows.iter().enumerate() {
@@ -436,7 +604,7 @@ fn differences(
                     .iter()
                     .any(|(rv, &count)| count > 0 && !row.levels.rv_counts.contains_key(rv))
             {
-                return Err(CounterIssue::Topology);
+                return Err(CounterIssue::Topology.into());
             }
             &old.levels
         } else {
@@ -481,7 +649,10 @@ fn differences(
         }
         deltas.push(delta);
     }
-    Ok(deltas)
+    Ok(CounterDeltas {
+        values: deltas,
+        _storage: storage,
+    })
 }
 
 #[cfg(test)]
@@ -550,6 +721,12 @@ mod tests {
     }
 
     fn read(generation: u64, rows: Vec<CounterRow>) -> CounterRead {
+        let pool = crate::semantics_edge::resources::SemanticResourcePool::reference_limit(
+            32 * 1024 * 1024,
+        );
+        let keys = rows.iter().map(|row| row.levels.rv_counts.len()).sum();
+        let reservation =
+            ReadReservation::reserve(rows.capacity(), keys, &pool.reserver()).unwrap();
         CounterRead::new(
             NonZeroU64::new(generation).unwrap(),
             CounterMode::Latency,
@@ -557,10 +734,40 @@ mod tests {
             Ok(rows),
             CounterHealth::default(),
             KernelEvidence::default(),
+            reservation,
         )
+        .unwrap()
     }
 
-    fn advanced(observation: CounterObservation) -> Vec<CounterCellDelta> {
+    fn new_collector(limits: CounterLimits) -> CounterCollector {
+        let pool = crate::semantics_edge::resources::SemanticResourcePool::reference_limit(
+            32 * 1024 * 1024,
+        );
+        CounterCollector::new(limits, pool.reserver())
+    }
+
+    fn mutate_rows(read: &mut CounterRead, mutate: impl FnOnce(&mut Vec<CounterRow>)) {
+        let pool = crate::semantics_edge::resources::SemanticResourcePool::reference_limit(
+            32 * 1024 * 1024,
+        );
+        let reservation =
+            ReadReservation::reserve(LIMITS.rows, LIMITS.rv_keys, &pool.reserver()).unwrap();
+        let mut rows = Vec::with_capacity(LIMITS.rows);
+        rows.extend(read.rows.as_ref().unwrap().iter().cloned());
+        mutate(&mut rows);
+        *read = CounterRead::new(
+            read.generation,
+            read.mode,
+            read.window,
+            Ok(rows),
+            read.health,
+            read.kernel,
+            reservation,
+        )
+        .unwrap();
+    }
+
+    fn advanced(observation: CounterObservation) -> CounterDeltas {
         match observation {
             CounterObservation::Advanced { deltas, .. } => deltas,
             other => panic!("expected sampled differences, got {other:?}"),
@@ -673,7 +880,7 @@ mod tests {
         );
         let later = charged(&pool, 5);
         let held = pool.snapshot().charged_bytes;
-        pool.reference_set_limit(held);
+        pool.reference_set_limit(held + tree_bytes::<AttachKey, ()>(1).unwrap());
         assert_eq!(
             collector.observe(Ok(later.clone())),
             CounterObservation::ReadFailed(ReadStage::Budget)
@@ -727,8 +934,8 @@ mod tests {
                 latency(&appended, [8, 8, 0, 40, 7, 8], &[(0, 8)]),
             ],
         );
-        let mut fast = CounterCollector::new(LIMITS);
-        let mut slow = CounterCollector::new(LIMITS);
+        let mut fast = new_collector(LIMITS);
+        let mut slow = new_collector(LIMITS);
         assert_eq!(
             fast.observe(Ok(initial.clone())),
             CounterObservation::Initial
@@ -866,7 +1073,7 @@ mod tests {
             ReadStage::Health,
             ReadStage::KernelEvidence,
         ] {
-            let mut collector = CounterCollector::new(LIMITS);
+            let mut collector = new_collector(LIMITS);
             assert_eq!(
                 collector.observe(Ok(before.clone())),
                 CounterObservation::Initial
@@ -883,11 +1090,10 @@ mod tests {
             assert_eq!(delta[0].rv_counts, BTreeMap::from([(0, 6), (HIGH_RV, 1)]));
         }
         for mutation in 0..5 {
-            let mut collector = CounterCollector::new(LIMITS);
+            let mut collector = new_collector(LIMITS);
             collector.observe(Ok(before.clone()));
             let mut bad = after.clone();
-            let rows = bad.rows.as_mut().unwrap();
-            match mutation {
+            mutate_rows(&mut bad, |rows| match mutation {
                 0 => {
                     rows.pop();
                 }
@@ -898,7 +1104,7 @@ mod tests {
                 }
                 4 => rows[0].slot = 4,
                 _ => unreachable!(),
-            }
+            });
             assert_eq!(
                 collector.observe(Ok(bad)),
                 CounterObservation::Unavailable(CounterIssue::Topology)
@@ -922,7 +1128,7 @@ mod tests {
         renamed.names = vec!["new alias".into()];
         renamed.object_path = "/renamed.so".into();
         renamed.module_ids = vec![crate::plan::ModuleId(3), crate::plan::ModuleId(4)];
-        let mut collector = CounterCollector::new(LIMITS);
+        let mut collector = new_collector(LIMITS);
         collector.observe(Ok(read(
             1,
             vec![latency(&first, [1, 1, 0, 2, 2, 1], &[(0, 1)])],
@@ -943,7 +1149,7 @@ mod tests {
             collector.observe(Ok(duplicate_target)),
             CounterObservation::Unavailable(CounterIssue::Topology)
         );
-        let mut collector = CounterCollector::new(LIMITS);
+        let mut collector = new_collector(LIMITS);
         collector.observe(Ok(before));
         let mut wrong_mode = after;
         wrong_mode.mode = CounterMode::Counts;
@@ -966,7 +1172,7 @@ mod tests {
             )
             .unwrap()
         };
-        let mut collector = CounterCollector::new(LIMITS);
+        let mut collector = new_collector(LIMITS);
         collector.observe(Ok(read(
             7,
             vec![latency(&first, [1, 1, 0, 1, 1, 1], &[(0, 1)])],
@@ -978,7 +1184,17 @@ mod tests {
             Ok(vec![counts()]),
             CounterHealth::default(),
             KernelEvidence::default(),
-        );
+            ReadReservation::reserve(
+                1,
+                0,
+                &crate::semantics_edge::resources::SemanticResourcePool::reference_limit(
+                    32 * 1024 * 1024,
+                )
+                .reserver(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             collector.observe(Ok(replacement.clone())),
             CounterObservation::Unavailable(CounterIssue::Mode)
@@ -1014,7 +1230,7 @@ mod tests {
                 CounterIssue::Limits => bad.rows = Err(CounterIssue::Limits),
                 _ => unreachable!(),
             }
-            let mut collector = CounterCollector::new(LIMITS);
+            let mut collector = new_collector(LIMITS);
             assert_eq!(
                 collector.observe(Ok(bad)),
                 CounterObservation::Unavailable(issue)
@@ -1137,8 +1353,8 @@ mod tests {
                 &CounterIssue::FoldOverflow(field)
             );
             let mut sample = healthy.clone();
-            sample.rows = folded.map(|row| vec![row]);
-            let mut collector = CounterCollector::new(LIMITS);
+            sample.rows = Err(*folded.as_ref().unwrap_err());
+            let mut collector = new_collector(LIMITS);
             assert_eq!(
                 collector.observe(Ok(sample)),
                 CounterObservation::Unavailable(CounterIssue::FoldOverflow(field))
@@ -1152,14 +1368,12 @@ mod tests {
             rows: 1,
             rv_keys: 1,
         };
-        let mut collector = CounterCollector::new(limited);
+        let mut collector = new_collector(limited);
         collector.observe(Ok(healthy.clone()));
         let mut too_many = healthy.clone();
-        too_many.rows.as_mut().unwrap().push(latency(
-            &slot(19, 2, 0x90),
-            [1, 1, 0, 1, 1, 1],
-            &[(0, 1)],
-        ));
+        mutate_rows(&mut too_many, |rows| {
+            rows.push(latency(&slot(19, 2, 0x90), [1, 1, 0, 1, 1, 1], &[(0, 1)]))
+        });
         assert_eq!(
             collector.observe(Ok(too_many)),
             CounterObservation::Unavailable(CounterIssue::Limits)
@@ -1175,7 +1389,7 @@ mod tests {
                 .len(),
             1
         );
-        let mut collector = CounterCollector::new(limited);
+        let mut collector = new_collector(limited);
         let too_many_keys = read(
             7,
             vec![latency(&first, [2, 2, 0, 2, 1, 2], &[(0, 1), (HIGH_RV, 1)])],
@@ -1185,7 +1399,7 @@ mod tests {
             CounterObservation::Unavailable(CounterIssue::Limits)
         );
         assert!(collector.baseline.is_none());
-        let mut collector = CounterCollector::new(CounterLimits {
+        let mut collector = new_collector(CounterLimits {
             rows: 2,
             rv_keys: 1,
         });
@@ -1204,7 +1418,7 @@ mod tests {
         let mut informational = healthy;
         informational.kernel.control.identity_budget_exhausted = true;
         assert_eq!(
-            CounterCollector::new(LIMITS).observe(Ok(informational)),
+            new_collector(LIMITS).observe(Ok(informational)),
             CounterObservation::Initial
         );
 
@@ -1229,7 +1443,7 @@ mod tests {
             let mut sample = read(7, vec![]);
             fail(&mut sample.kernel);
             assert_eq!(
-                CounterCollector::new(LIMITS).observe(Ok(sample)),
+                new_collector(LIMITS).observe(Ok(sample)),
                 CounterObservation::Unavailable(CounterIssue::KernelEvidence)
             );
         }
@@ -1240,7 +1454,7 @@ mod tests {
         // Rejecting returned>entered, RV/STATS skew or a bad clock would turn
         // non-atomic component reads into a fictitious atomicity requirement.
         let first = slot(3, 1, 0x80);
-        let mut collector = CounterCollector::new(LIMITS);
+        let mut collector = new_collector(LIMITS);
         collector.observe(Ok(read(
             7,
             vec![latency(&first, [2, 3, 0, 10, 4, 6], &[(0, 8)])],
@@ -1296,7 +1510,7 @@ mod tests {
     #[test]
     fn entered_below_returned_regresses_instead_of_clamping_to_zero() {
         let first = slot(3, 1, 0x80);
-        let mut collector = CounterCollector::new(LIMITS);
+        let mut collector = new_collector(LIMITS);
         collector.observe(Ok(read(
             7,
             vec![latency(&first, [10, 10, 0, 10, 1, 10], &[(0, 10)])],
@@ -1319,7 +1533,7 @@ mod tests {
             (CounterField::Bucket(0), [10, 10, 2, 20, 5, 9], 10),
             (CounterField::Rv(HIGH_RV), [10, 10, 2, 20, 5, 10], 9),
         ] {
-            let mut collector = CounterCollector::new(LIMITS);
+            let mut collector = new_collector(LIMITS);
             collector.observe(Ok(read(
                 7,
                 vec![latency(&first, [10, 10, 2, 20, 5, 10], &[(HIGH_RV, 10)])],
@@ -1334,7 +1548,7 @@ mod tests {
     #[test]
     fn grown_rows_saturate_before_any_baseline_lookup() {
         let first = slot(3, 1, 0x80);
-        let mut collector = CounterCollector::new(LIMITS);
+        let mut collector = new_collector(LIMITS);
         let old = latency(&first, [1, 1, 0, 1, 1, 1], &[(0, 1)]);
         collector.observe(Ok(read(7, vec![old.clone()])));
         assert_eq!(
@@ -1359,7 +1573,7 @@ mod tests {
         ] {
             let sample = read(7, vec![latency(&first, values, &[(HIGH_RV, rv)])]);
             assert_eq!(
-                CounterCollector::new(LIMITS).observe(Ok(sample)),
+                new_collector(LIMITS).observe(Ok(sample)),
                 CounterObservation::Unavailable(CounterIssue::Saturated { slot: 3, field })
             );
         }
@@ -1507,7 +1721,7 @@ mod tests {
             LIMITS,
         )
         .unwrap();
-        let mut collector = CounterCollector::new(LIMITS);
+        let mut collector = new_collector(LIMITS);
         assert_eq!(
             collector.observe(Ok(read(7, vec![before]))),
             CounterObservation::Initial

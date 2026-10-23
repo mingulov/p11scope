@@ -460,18 +460,18 @@ fn stage_requirements(
             n.checked_add(cpus.checked_mul(4 * size_of::<p11scope_ebpf_common::CountStats>())?)
         })
         .ok_or(BankRefusal::Budget)?;
-    // Singles + OneProcess uses Aya's pid-scoped perf-event path, with a
-    // retained FD per endpoint side and a transient perf FD during BPF-link
-    // creation. The conservative (4*C+4)*slots+new_banks request includes
-    // historical custody and staging: at C=2, 8192 slots +16 maps is 98,320.
-    // NativeIo checks this fixed backend/scope, the caller reservation and
-    // current OS headroom. This is neither an atomic reservation nor measured
-    // useful-8192 qualification; subsequent EMFILE uses paid rollback/custody.
-    let fds = cpus
-        .checked_mul(4)
-        .and_then(|n| n.checked_add(4))
-        .and_then(|n| n.checked_mul(all_slots.len()))
+    // NativeIo admits only Singles + OneProcess: each fresh endpoint retains
+    // two BPF-link FDs, with one transient perf FD during sequential attachment.
+    // Provider owners share Arc<File>; observed_open already counts old maps,
+    // links and providers. Map bytes above still cover every possible CPU.
+    // A different backend/scope needs its own FD fanout bound before admission.
+    // The caller reservation and readonly OS check remain independent; neither
+    // atomically reserves FDs, and later EMFILE uses paid rollback/custody.
+    let fds = fresh
+        .len()
+        .checked_mul(2)
         .and_then(|n| n.checked_add(new_banks))
+        .and_then(|n| n.checked_add(1))
         .ok_or(BankRefusal::Budget)?;
     Ok((retained, transient, metadata, fds))
 }
@@ -5187,9 +5187,9 @@ pub(crate) mod tests {
             let slots = history.slots.clone();
             let charged = pool.snapshot().charged_bytes;
             io.next_stage();
-            // At two possible CPUs, the existing conservative shared-bank
-            // two-slot envelope is 24 FD slots. The caller allows 128: only
-            // the independently observed OS headroom differs across twins.
+            // An explicit 24-FD request isolates OS arithmetic from the caller's
+            // 128-FD allowance. The actual fresh-extent calculation is covered
+            // separately below; only OS headroom differs across these twins.
             io.fd_preflight = Some((required, snapshot));
             let result = directory.stage_with(
                 &mut io,

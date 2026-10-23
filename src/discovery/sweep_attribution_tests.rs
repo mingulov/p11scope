@@ -3592,6 +3592,229 @@ fn privileged_d4_btrfs_deleted_mapping_backend_parity() {
         .expect("remove owned unlinked-file fixture directory");
 }
 
+/// A hardlink's executable mapping attributes to a pin opened through the
+/// original name, using both actual backends over the same live population.
+/// An equal-byte copy has its own unexamined key, and an alias mapped only
+/// as data has no executable proof demand. Create all names before pinning
+/// so the hardlink's ctime change is not confused with identity rejection.
+/// This qualifies alias attribution only; whole D4 rows remain separate.
+#[test]
+#[ignore = "root Btrfs disk TMPDIR plus eligible BTF/task_vma identity; actual hardlink alias parity"]
+fn privileged_d4_btrfs_hardlink_alias_backend_parity() {
+    use crate::discovery::identity::{PinnedObjects, test_fixture::real_scan_pin};
+    use crate::discovery::kernel_identity::IdentitySession;
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::{FileExt as _, MetadataExt as _};
+
+    crate::attach::identity_iter::ensure_kernel_identity_btf()
+        .expect("required kernel identity capability; refusal cannot qualify");
+    let btf = aya::Btf::from_sys_fs().expect("readable host BTF");
+    let dir = tempfile::tempdir().unwrap();
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    let c_parent = std::ffi::CString::new(dir.path().as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: a valid path and writable statfs buffer, read only on success.
+    assert_eq!(
+        unsafe { libc::statfs(c_parent.as_ptr(), stat.as_mut_ptr()) },
+        0
+    );
+    // SAFETY: initialized by the successful statfs above.
+    let magic = unsafe { stat.assume_init().f_type } as u64 & 0xffff_ffff;
+    assert_eq!(magic, 0x9123_683e, "actual fixture TMPDIR must be Btrfs");
+    let original_path = dir.path().join("liboriginal.so");
+    let alias_path = dir.path().join("libalias.so");
+    let copy_path = dir.path().join("libcopy.so");
+    let bytes = vec![0xa5u8; 8192];
+    std::fs::write(&original_path, &bytes).unwrap();
+    std::fs::hard_link(&original_path, &alias_path).unwrap();
+    std::fs::copy(&original_path, &copy_path).unwrap();
+    let original_file = std::fs::File::open(&original_path).unwrap();
+    let alias_file = std::fs::File::open(&alias_path).unwrap();
+    let copy_file = std::fs::File::open(&copy_path).unwrap();
+    let original = original_file.metadata().unwrap();
+    let alias = alias_file.metadata().unwrap();
+    let copy = copy_file.metadata().unwrap();
+    let original_id = (original.dev(), original.ino());
+    let alias_id = (alias.dev(), alias.ino());
+    let copy_id = (copy.dev(), copy.ino());
+    assert_eq!(alias_id, original_id, "actual hardlink physical identity");
+    assert_eq!(original.nlink(), 2);
+    assert_eq!(alias.nlink(), 2);
+    assert_ne!(
+        copy_id, original_id,
+        "the equal-byte copy is a different held file"
+    );
+    for file in [&original_file, &alias_file, &copy_file] {
+        let mut held_bytes = vec![0; bytes.len()];
+        file.read_exact_at(&mut held_bytes, 0).unwrap();
+        assert_eq!(held_bytes, bytes, "contents checked through each held FD");
+    }
+
+    let caller = SwapChild::spawn(&alias_path);
+    let copied = SwapChild::spawn(&copy_path);
+    let reader = SwapChild::spawn_with(&[(&alias_path, false)]);
+    let snapshots = [caller.maps(), copied.maps(), reader.maps()];
+    let line_at = |position: usize, child: &SwapChild| {
+        snapshots[position]
+            .iter()
+            .find(|entry| (entry.start, entry.end) == (child.address, child.address + 4096))
+            .expect("independent actual mapping")
+    };
+    let alias_text = line_at(0, &caller);
+    let copy_text = line_at(1, &copied);
+    let alias_data = line_at(2, &reader);
+    assert_eq!(alias_text.permissions, *b"r-xp");
+    assert_eq!(copy_text.permissions, *b"r-xp");
+    assert_eq!(alias_data.permissions, *b"r--p");
+    for entry in [alias_text, alias_data] {
+        assert_eq!(
+            entry.raw_path.as_deref(),
+            Some(alias_path.as_os_str().as_encoded_bytes())
+        );
+    }
+    assert_eq!(
+        copy_text.raw_path.as_deref(),
+        Some(copy_path.as_os_str().as_encoded_bytes())
+    );
+    let key = ObjectKey::of(alias_text);
+    let copy_key = ObjectKey::of(copy_text);
+    assert_eq!(ObjectKey::of(alias_data), key);
+    assert_ne!(
+        copy_key, key,
+        "the actual copy has its own lexical maps key"
+    );
+    let digest = p11scope_manifest::identity::hex(&Sha256::digest(&bytes));
+    let pins: PinnedObjects = real_scan_pin(&original_path, Some(key), 0, &digest);
+    let pin = pins
+        .pinned()
+        .next()
+        .expect("actual pin opened through the original name");
+    let object = pin.id;
+    assert_eq!(pin.path, original_path.to_str().unwrap());
+    let pinned = pins.file_for(object).unwrap().metadata().unwrap();
+    assert_eq!((pinned.dev(), pinned.ino()), original_id);
+    let (userspace_index, refused) = KnownKeyIndex::build(
+        [(key, Some(object))],
+        &BTreeMap::from([(key, object)]),
+        [],
+        &pins,
+    );
+    assert!(refused.is_empty(), "{refused:?}");
+    let proof_keys = userspace_index.map_files_keys();
+    assert!(proof_keys.contains(&key));
+    assert_eq!(userspace_index.classify(copy_key), KeyClass::Unexamined);
+    assert_eq!(
+        proof_ranges(&snapshots[0], &proof_keys),
+        [(caller.address, caller.address + 4096)]
+    );
+    for snapshot in &snapshots[1..] {
+        assert!(
+            proof_ranges(snapshot, &proof_keys).is_empty(),
+            "copy and data-only mappings have no provider proof demand"
+        );
+    }
+    let probe_dir = tempfile::tempdir().unwrap();
+    let mut session = IdentitySession::probe_and_load(&btf, probe_dir.path())
+        .expect("actual strict-loaded kernel session; no refused/fallback positive");
+    for (position, child) in [&caller, &copied, &reader].into_iter().enumerate() {
+        let userspace = attribute_child(child, snapshots[position].clone(), &userspace_index);
+        let kernel = d4_kernel_collision_attribution(
+            child,
+            snapshots[position].clone(),
+            &pins,
+            object,
+            key,
+            &mut session,
+            position as u64 + 1,
+        );
+        for (backend, out) in [("userspace", &userspace), ("kernel", &kernel)] {
+            assert!(out.losses.is_empty(), "{backend}: {:?}", out.member_losses);
+            assert_eq!(out.unavailable, 0);
+            assert!(out.exited.is_empty(), "{backend}: an owned child exited");
+            if position == 0 {
+                assert_eq!(
+                    out.members
+                        .iter()
+                        .map(|member| member.pid)
+                        .collect::<Vec<_>>(),
+                    [caller.pid as u32],
+                    "{backend}: exact alias caller"
+                );
+                assert_eq!(
+                    out.members[0]
+                        .objects
+                        .iter()
+                        .map(|matched| (matched.key, matched.object, matched.path.as_str()))
+                        .collect::<Vec<_>>(),
+                    [(key, object, alias_path.to_str().unwrap())],
+                    "{backend}: the original pin is reached through the real alias path"
+                );
+                assert_eq!(
+                    out.probed, 1,
+                    "{backend}: nonempty alias executable proof demand"
+                );
+            } else {
+                assert!(out.members.is_empty(), "{backend}: {:?}", out.members);
+                assert_eq!(
+                    out.probed, 0,
+                    "{backend}: no executable proof for a copy's unknown key or a data-only alias"
+                );
+                if position == 1 {
+                    assert!(
+                        out.unexamined_objects.contains(&copy_key),
+                        "{backend}: the copy remains honestly unexamined"
+                    );
+                    assert!(
+                        out.unexamined
+                            .get(&(copied.pid as u32))
+                            .is_some_and(|count| *count > 0)
+                    );
+                } else {
+                    assert!(
+                        !out.unexamined_objects.contains(&key),
+                        "{backend}: data-only alias is not an unexamined caller"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            userspace.members, kernel.members,
+            "exact independently checked backend members"
+        );
+        assert_eq!(userspace.losses, kernel.losses);
+        assert_eq!(userspace.unexamined_objects, kernel.unexamined_objects);
+        assert_eq!(userspace.unexamined, kernel.unexamined);
+    }
+    assert!(
+        pins.object_unchanged(object)
+            .expect("recheck the actual pin"),
+        "all hardlinks were created before pinning"
+    );
+    for (file, expected) in [
+        (&original_file, original_id),
+        (&alias_file, alias_id),
+        (&copy_file, copy_id),
+    ] {
+        let metadata = file.metadata().unwrap();
+        assert_eq!((metadata.dev(), metadata.ino()), expected);
+        assert_eq!(metadata.len(), bytes.len() as u64);
+        let mut held_bytes = vec![0; bytes.len()];
+        file.read_exact_at(&mut held_bytes, 0).unwrap();
+        assert_eq!(held_bytes, bytes, "held physical files remain unchanged");
+    }
+    eprintln!(
+        "D4_BTRFS_HARDLINK callers={}/{}/{} userspace=1/0/0 kernel=1/0/0 \
+         same_file_alias=true equal_bytes_copy=true copy=unexamined generations=1/2/3 fallback=none",
+        caller.pid, copied.pid, reader.pid
+    );
+    drop((caller, copied, reader));
+    drop((session, pins, original_file, alias_file, copy_file));
+    probe_dir
+        .close()
+        .expect("remove owned kernel probe directory");
+    dir.close()
+        .expect("remove owned hardlink fixture directory and files");
+}
+
 /// Root with a loop-mounted ext4: there a held file's maps key is its
 /// identity, so no per-range stat runs at all. Before A6 a process that
 /// mapped the file only read-only was attributed on the key alone; now

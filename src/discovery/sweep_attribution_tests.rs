@@ -3035,6 +3035,263 @@ fn privileged_d4_btrfs_subvolume_collision_backend_parity() {
     std::fs::remove_dir(parent.join("b")).unwrap();
 }
 
+/// One child remaps an equal-byte, physically different Btrfs file at the
+/// same address and path, leaving its full maps bytes unchanged. Both actual
+/// backends must discard the old provider's edge and accept a fresh pin of
+/// the current provider. Each kernel leg installs a fresh real generation
+/// and validated slots; no fallback or userspace range proof may qualify.
+/// This is scan identity parity, not native calls or whole-row D4 readiness.
+#[test]
+#[ignore = "root Btrfs disk TMPDIR plus eligible BTF/task_vma identity; actual same-line remap parity"]
+fn privileged_d4_btrfs_same_line_remap_backend_parity() {
+    use crate::discovery::identity::{
+        PinnedObjects, map_files_identity, test_fixture::real_scan_pin,
+    };
+    use crate::discovery::kernel_identity::IdentitySession;
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::{FileExt as _, MetadataExt as _};
+
+    fn file_identity(file: &std::fs::File) -> FileIdentity {
+        let metadata = file.metadata().unwrap();
+        FileIdentity {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        }
+    }
+
+    fn assert_pair(
+        phase: &str,
+        child: &SwapChild,
+        expected: Option<(ObjectKey, PinnedObjectId)>,
+        userspace: SweepAttribution,
+        kernel: SweepAttribution,
+    ) {
+        for (backend, out) in [("userspace", &userspace), ("kernel", &kernel)] {
+            assert_eq!(out.probed, 1, "{phase} {backend}: actual executable demand");
+            if let Some(edge) = expected {
+                assert_eq!(
+                    out.members
+                        .iter()
+                        .map(|member| member.pid)
+                        .collect::<Vec<_>>(),
+                    [child.pid as u32],
+                    "{phase} {backend}: {:?}",
+                    out.member_losses
+                );
+                assert_eq!(
+                    out.members[0]
+                        .objects
+                        .iter()
+                        .map(|matched| (matched.key, matched.object))
+                        .collect::<Vec<_>>(),
+                    [edge],
+                    "{phase} {backend}: exact held-provider edge"
+                );
+                assert!(
+                    out.losses.is_empty(),
+                    "{phase} {backend}: {:?}",
+                    out.member_losses
+                );
+            } else {
+                assert!(
+                    out.members.is_empty(),
+                    "{phase} {backend}: {:?}",
+                    out.members
+                );
+                assert_eq!(
+                    out.losses,
+                    BTreeMap::from([(AttributionLoss::IdentityMismatch, 1)]),
+                    "{phase} {backend}: {:?}",
+                    out.member_losses
+                );
+            }
+        }
+        assert_eq!(
+            userspace.members, kernel.members,
+            "{phase}: exact backend members"
+        );
+        assert_eq!(
+            userspace.losses, kernel.losses,
+            "{phase}: actual loss classifications"
+        );
+    }
+
+    crate::attach::identity_iter::ensure_kernel_identity_btf()
+        .expect("required kernel identity capability; refusal cannot qualify");
+    let btf = aya::Btf::from_sys_fs().expect("readable host BTF");
+    let dir = tempfile::tempdir().unwrap();
+    let parent = dir.path();
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    let c_parent = std::ffi::CString::new(parent.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: a valid path and writable statfs buffer, read only on success.
+    assert_eq!(
+        unsafe { libc::statfs(c_parent.as_ptr(), stat.as_mut_ptr()) },
+        0
+    );
+    // SAFETY: initialized by the successful statfs above.
+    let magic = unsafe { stat.assume_init().f_type } as u64 & 0xffff_ffff;
+    assert_eq!(magic, 0x9123_683e, "actual fixture TMPDIR must be Btrfs");
+    create_subvolume(parent, "a");
+    create_subvolume(parent, "b");
+    let path = parent.join("a/libswap.so");
+    let replacement_path = parent.join("b/libswap.so");
+    let bytes = vec![0xa5u8; 8192];
+    std::fs::write(&path, &bytes).unwrap();
+    std::fs::copy(&path, &replacement_path).unwrap();
+    let a_file = std::fs::File::open(&path).unwrap();
+    let b_file = std::fs::File::open(&replacement_path).unwrap();
+    let a_identity = file_identity(&a_file);
+    let b_identity = file_identity(&b_file);
+    assert_eq!(
+        a_identity.ino, b_identity.ino,
+        "fresh subvolumes repeat inode numbers"
+    );
+    assert_ne!(
+        a_identity, b_identity,
+        "the held physical files must differ"
+    );
+    for file in [&a_file, &b_file] {
+        let mut held_bytes = vec![0; bytes.len()];
+        file.read_exact_at(&mut held_bytes, 0).unwrap();
+        assert_eq!(
+            held_bytes, bytes,
+            "equal bytes verified through each held FD"
+        );
+    }
+
+    let child = SwapChild::spawn(&path);
+    let range = (child.address, child.address + 4096);
+    let maps_path = format!("/proc/{}/maps", child.pid);
+    let before_bytes = std::fs::read(&maps_path).unwrap();
+    let before = child.maps();
+    let line = before
+        .iter()
+        .find(|entry| (entry.start, entry.end) == range)
+        .expect("the child's actual executable mapping");
+    assert_eq!(line.permissions, *b"r-xp");
+    let key = ObjectKey::of(line);
+    // Independent fixture truth, outside the required kernel leg: these
+    // identities come from file metadata, never the lexical maps device.
+    let before_identity = map_files_identity(child.pid as u32, range.0, range.1).unwrap();
+    assert_eq!(before_identity, a_identity);
+    let digest = p11scope_manifest::identity::hex(&Sha256::digest(&bytes));
+    let a_pins: PinnedObjects = real_scan_pin(&path, Some(key), 0, &digest);
+    let a_object = a_pins.pinned().next().expect("actual old-provider pin").id;
+    assert_eq!(
+        file_identity(a_pins.file_for(a_object).unwrap()),
+        a_identity
+    );
+    let (a_index, refused) = KnownKeyIndex::build(
+        [(key, Some(a_object))],
+        &BTreeMap::from([(key, a_object)]),
+        [],
+        &a_pins,
+    );
+    assert!(refused.is_empty(), "{refused:?}");
+    assert!(a_index.map_files_keys().contains(&key));
+    let probe_dir = tempfile::tempdir().unwrap();
+    let mut session = IdentitySession::probe_and_load(&btf, probe_dir.path())
+        .expect("actual strict-loaded kernel session; no refused/fallback positive");
+    assert_pair(
+        "before: held A",
+        &child,
+        Some((key, a_object)),
+        attribute_child(&child, before.clone(), &a_index),
+        d4_kernel_collision_attribution(
+            &child,
+            before.clone(),
+            &a_pins,
+            a_object,
+            key,
+            &mut session,
+            1,
+        ),
+    );
+
+    std::fs::rename(parent.join("a"), parent.join("a.old")).unwrap();
+    std::fs::rename(parent.join("b"), parent.join("a")).unwrap();
+    child.remap();
+    let after = child.maps();
+    assert_eq!(
+        std::fs::read(&maps_path).unwrap(),
+        before_bytes,
+        "full maps bytes stay identical"
+    );
+    assert_eq!(
+        after, before,
+        "same ranges, offsets, permissions, keys and paths"
+    );
+    let after_identity = map_files_identity(child.pid as u32, range.0, range.1).unwrap();
+    assert_eq!(after_identity, b_identity, "the live mapping now holds B");
+    assert_ne!(
+        after_identity, before_identity,
+        "the physical file actually changed"
+    );
+    assert_pair(
+        "after: held A must mismatch",
+        &child,
+        None,
+        attribute_child(&child, after.clone(), &a_index),
+        d4_kernel_collision_attribution(
+            &child,
+            after.clone(),
+            &a_pins,
+            a_object,
+            key,
+            &mut session,
+            2,
+        ),
+    );
+
+    let b_pins: PinnedObjects = real_scan_pin(&path, Some(key), 0, &digest);
+    let b_object = b_pins
+        .pinned()
+        .next()
+        .expect("actual current-provider pin")
+        .id;
+    assert_eq!(
+        file_identity(b_pins.file_for(b_object).unwrap()),
+        b_identity
+    );
+    let (b_index, refused) = KnownKeyIndex::build(
+        [(key, Some(b_object))],
+        &BTreeMap::from([(key, b_object)]),
+        [],
+        &b_pins,
+    );
+    assert!(refused.is_empty(), "{refused:?}");
+    assert!(b_index.map_files_keys().contains(&key));
+    assert_pair(
+        "after: fresh held B",
+        &child,
+        Some((key, b_object)),
+        attribute_child(&child, after.clone(), &b_index),
+        d4_kernel_collision_attribution(&child, after, &b_pins, b_object, key, &mut session, 3),
+    );
+    for (file, expected) in [(&a_file, a_identity), (&b_file, b_identity)] {
+        assert_eq!(
+            file_identity(file),
+            expected,
+            "held physical files remain unchanged"
+        );
+        assert_eq!(file.metadata().unwrap().len(), bytes.len() as u64);
+        let mut held_bytes = vec![0; bytes.len()];
+        file.read_exact_at(&mut held_bytes, 0).unwrap();
+        assert_eq!(held_bytes, bytes);
+    }
+    eprintln!(
+        "D4_BTRFS_SAME_LINE caller={} userspace=1/0/1 kernel=1/0/1 \
+         equal_bytes=true identical_maps=true changed_file=true generations=1/2/3 fallback=none",
+        child.pid
+    );
+    drop(child);
+    drop((session, a_pins, b_pins, a_file, b_file));
+    std::fs::remove_file(&path).unwrap();
+    std::fs::remove_file(parent.join("a.old/libswap.so")).unwrap();
+    std::fs::remove_dir(parent.join("a")).unwrap();
+    std::fs::remove_dir(parent.join("a.old")).unwrap();
+}
+
 /// Root with a loop-mounted ext4: there a held file's maps key is its
 /// identity, so no per-range stat runs at all. Before A6 a process that
 /// mapped the file only read-only was attributed on the key alone; now

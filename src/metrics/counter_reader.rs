@@ -1708,6 +1708,36 @@ mod tests {
         else {
             panic!("first actual bank did not publish");
         };
+        let binding = session.counter_reader_binding().unwrap().unwrap();
+        assert_eq!(binding.mode(), CounterMode::Counts);
+        assert_eq!(
+            binding.generation(),
+            session.counter_collection_generation()
+        );
+        assert_eq!(binding.logical_slots(), 512);
+        assert_eq!(binding.rv_keys(), 4096);
+        assert_eq!(binding.start_rows(), 16384);
+        assert_eq!(binding.possible_cpus(), cpus);
+        assert!(read_bound(binding, &first, &pins, limits, &pool.reserver()).is_ok());
+        let foreign = crate::discovery::identity::test_fixture::real_scan_pin(
+            Path::new("/usr/bin/true"),
+            None,
+            1,
+            "foreign-provider-content",
+        );
+        assert!(
+            matches!(
+                read_bound(
+                    session.counter_reader_binding().unwrap().unwrap(),
+                    &first,
+                    &foreign,
+                    limits,
+                    &pool.reserver(),
+                ),
+                Err(ReadStage::BankRouting)
+            ),
+            "a present binding must still validate the actual provider plan"
+        );
         let mut collector = CounterCollector::new(limits, pool.reserver());
         assert_eq!(
             collector.observe(read_banked(

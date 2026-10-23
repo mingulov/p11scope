@@ -1867,4 +1867,95 @@ mod tests {
             "different offsets in the same provider remain different endpoints"
         );
     }
+
+    fn reader_metadata(name: &str) -> Result<super::super::ExactMapMetadata, BankRefusal> {
+        let (kind, key, value, entries, flags) = match name {
+            "COUNTER_BANKS" => (MapType::HashOfMaps, 4, 4, 2, 128),
+            "COUNTER_BANK_META" => (MapType::Hash, 4, 24, 2, 128),
+            "COUNTER_BANK_COMMIT" => (MapType::Hash, 8, 16, 2, 128),
+            "COUNTER_BANK_FAULT" => (MapType::PerCpuArray, 4, 8, 1, 0),
+            "COUNTER_HEALTH" => (MapType::PerCpuArray, 4, 8, 2, 0),
+            "STATS" => (MapType::PerCpuArray, 4, 24, 512, 0),
+            "RV_COUNTS" => (MapType::PerCpuHash, 16, 8, 4096, 0),
+            "START" => (MapType::Hash, 16, 288, 16384, 0),
+            _ => return Err(BankRefusal::Shape),
+        };
+        Ok(super::super::map_metadata(kind, key, value, entries, flags))
+    }
+
+    fn reader_banks(pool: &SemanticResourcePool) -> CounterBanks {
+        CounterBanks {
+            directory: Arc::new(Mutex::new(BankDirectory::default())),
+            keepalive: CounterKeepalive::precharge(&pool.reserver(), 4096).unwrap(),
+            cpus: 2,
+            link_staging: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    #[test]
+    fn counter_reader_binding_distinguishes_legacy_from_present_refusal() {
+        assert!(
+            reader_profile_with(
+                None,
+                |_| panic!("legacy absence must not inspect counter maps"),
+                || panic!("legacy absence must not query counter CPU topology"),
+            )
+            .unwrap()
+            .is_none()
+        );
+        let pool = SemanticResourcePool::reference_limit(4 * 1024 * 1024);
+        let banks = reader_banks(&pool);
+        assert!(matches!(
+            reader_profile_with(Some(&banks), |_| Err(BankRefusal::Native), || Ok(2)),
+            Err(BankRefusal::Native)
+        ));
+        assert!(matches!(
+            reader_profile_with(Some(&banks), reader_metadata, || Err(BankRefusal::Native)),
+            Err(BankRefusal::Native)
+        ));
+        banks.directory.lock().unwrap().quarantined = true;
+        assert!(matches!(
+            reader_profile_with(
+                Some(&banks),
+                |_| panic!("quarantine must not become a healthy profile"),
+                || Ok(2)
+            ),
+            Err(BankRefusal::Quarantined)
+        ));
+    }
+
+    #[test]
+    fn counter_reader_binding_reports_validated_prepared_counts_bounds() {
+        let pool = SemanticResourcePool::reference_limit(4 * 1024 * 1024);
+        let banks = reader_banks(&pool);
+        let profile = reader_profile_with(Some(&banks), reader_metadata, || Ok(2))
+            .unwrap()
+            .unwrap();
+        assert_eq!(profile.mode(), p11scope_ebpf_common::CounterMode::Counts);
+        assert_eq!(profile.logical_slots(), 512);
+        assert_eq!(profile.rv_keys(), 4096);
+        assert_eq!(profile.start_rows(), 16384);
+        assert_eq!(profile.possible_cpus(), 2);
+        assert!(matches!(
+            reader_profile_with(Some(&banks), reader_metadata, || Ok(3)),
+            Err(BankRefusal::Topology)
+        ));
+        assert!(
+            matches!(
+                reader_profile_with(
+                    Some(&banks),
+                    |name| {
+                        let mut actual = reader_metadata(name)?;
+                        if name == "STATS" {
+                            actual.value_size = 40;
+                        }
+                        Ok(actual)
+                    },
+                    || Ok(2)
+                ),
+                Err(BankRefusal::Shape)
+            ),
+            "a timestamps-shaped map cannot relabel this Counts preparation"
+        );
+    }
 }

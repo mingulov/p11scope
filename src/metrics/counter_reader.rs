@@ -2352,4 +2352,703 @@ mod tests {
             "actual native owners and collected storage refund only after drop"
         );
     }
+
+    const GROWTH_ENDPOINTS: usize = 8192;
+    const GROWTH_RVS: [u64; 3] = [0, 0x204, 0x1_0000_0204];
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    struct GrowthLedgerRow {
+        entered: u64,
+        returned: u64,
+        errors: u64,
+        rvs: [u64; 3],
+        other: u64,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct GrowthHotRange {
+        index: usize,
+        first: u64,
+        count: u64,
+        completed: u64,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct GrowthLedger {
+        rows: Vec<GrowthLedgerRow>,
+        hot: Option<GrowthHotRange>,
+    }
+
+    impl GrowthLedger {
+        fn empty() -> Self {
+            Self {
+                rows: vec![GrowthLedgerRow::default(); GROWTH_ENDPOINTS],
+                hot: None,
+            }
+        }
+
+        fn call(&mut self, index: usize, rv: u64) {
+            let row = &mut self.rows[index];
+            row.entered += 1;
+            row.returned += 1;
+            row.errors += u64::from(rv != 0 && rv != 0x204);
+            if let Some(kind) = GROWTH_RVS.iter().position(|&known| known == rv) {
+                row.rvs[kind] += 1;
+            } else {
+                row.other += 1;
+            }
+        }
+
+        fn totals(&self) -> [u64; 3] {
+            self.rows.iter().fold([0u64; 3], |totals, row| {
+                [
+                    totals[0].checked_add(row.entered).unwrap(),
+                    totals[1].checked_add(row.returned).unwrap(),
+                    totals[2].checked_add(row.errors).unwrap(),
+                ]
+            })
+        }
+
+        fn rv_counts(&self, index: usize) -> BTreeMap<u64, u64> {
+            let row = self.rows[index];
+            let mut result: BTreeMap<_, _> = GROWTH_RVS
+                .into_iter()
+                .zip(row.rvs)
+                .filter(|(_, count)| *count != 0)
+                .collect();
+            if let Some(hot) = self.hot.filter(|hot| hot.index == index) {
+                assert_eq!(hot.count, hot.completed);
+                assert_eq!(row.other, hot.completed);
+                for ordinal in 0..hot.completed {
+                    let rv = hot.first.checked_add(ordinal).unwrap();
+                    assert!(!GROWTH_RVS.contains(&rv));
+                    assert!(result.insert(rv, 1).is_none());
+                }
+            } else {
+                assert_eq!(row.other, 0);
+            }
+            result
+        }
+    }
+
+    struct GrowthDriver {
+        child: std::process::Child,
+        output: std::process::ChildStdout,
+        buffered: std::collections::VecDeque<u8>,
+    }
+
+    impl Drop for GrowthDriver {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    impl GrowthDriver {
+        fn spawn(workload: &std::path::Path, provider: &std::path::Path) -> Self {
+            use std::process::{Command, Stdio};
+            let mut child = Command::new(workload)
+                .arg(provider)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap();
+            let output = child.stdout.take().unwrap();
+            let mut fixture = Self {
+                child,
+                output,
+                buffered: std::collections::VecDeque::new(),
+            };
+            fixture.expect("READY 1 8192");
+            fixture
+        }
+
+        fn line(&mut self) -> String {
+            use std::io::Read;
+            use std::os::fd::AsRawFd;
+            use std::time::{Duration, Instant};
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut line = Vec::new();
+            loop {
+                if let Some(byte) = self.buffered.pop_front() {
+                    if byte == b'\n' {
+                        return String::from_utf8(line).unwrap();
+                    }
+                    assert!(byte != 0 && byte != b'\r' && line.len() < 256);
+                    line.push(byte);
+                    continue;
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                assert!(
+                    !remaining.is_zero(),
+                    "owned growth fixture barrier timed out"
+                );
+                let mut poll = libc::pollfd {
+                    fd: self.output.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: one initialized pollfd is live throughout this bounded call.
+                let ready = unsafe {
+                    libc::poll(
+                        &mut poll,
+                        1,
+                        i32::try_from(remaining.as_millis().max(1)).unwrap(),
+                    )
+                };
+                if ready < 0
+                    && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                {
+                    continue;
+                }
+                assert!(
+                    ready > 0,
+                    "owned growth fixture did not reach its next barrier"
+                );
+                let mut chunk = [0u8; 4096];
+                match self.output.read(&mut chunk) {
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    result => {
+                        let count = result.unwrap();
+                        assert!(
+                            count != 0,
+                            "owned growth fixture exited before its next barrier"
+                        );
+                        self.buffered.extend(&chunk[..count]);
+                    }
+                }
+            }
+        }
+
+        fn expect(&mut self, expected: &str) {
+            assert_eq!(self.line(), expected);
+        }
+
+        fn command(&mut self, command: &str) {
+            use std::io::Write;
+            assert!(command.is_ascii() && command.len() < 79 && !command.contains('\n'));
+            writeln!(self.child.stdin.as_mut().unwrap(), "{command}").unwrap();
+        }
+
+        fn ledger(&mut self) -> GrowthLedger {
+            self.command("LEDGER");
+            self.expect("LEDGER_BEGIN 8192");
+            let mut ledger = GrowthLedger::empty();
+            for (index, row) in ledger.rows.iter_mut().enumerate() {
+                let line = self.line();
+                let fields: Vec<_> = line.split_ascii_whitespace().collect();
+                assert_eq!(fields.len(), 9);
+                assert_eq!(fields[0], "ROW");
+                let values: Vec<u64> = fields[1..].iter().map(|s| s.parse().unwrap()).collect();
+                assert_eq!(values[0], index as u64);
+                *row = GrowthLedgerRow {
+                    entered: values[1],
+                    returned: values[2],
+                    errors: values[3],
+                    rvs: [values[4], values[5], values[6]],
+                    other: values[7],
+                };
+            }
+            let mut line = self.line();
+            if line.starts_with("HOT_RV_LEDGER ") {
+                let fields: Vec<_> = line.split_ascii_whitespace().collect();
+                assert_eq!(fields.len(), 5);
+                ledger.hot = Some(GrowthHotRange {
+                    index: fields[1].parse().unwrap(),
+                    first: u64::from_str_radix(fields[2], 16).unwrap(),
+                    count: fields[3].parse().unwrap(),
+                    completed: fields[4].parse().unwrap(),
+                });
+                line = self.line();
+            }
+            let fields: Vec<_> = line.split_ascii_whitespace().collect();
+            assert_eq!(fields.len(), 4);
+            assert_eq!(fields[0], "LEDGER_END");
+            let totals: Vec<u64> = fields[1..].iter().map(|s| s.parse().unwrap()).collect();
+            assert_eq!(totals, ledger.totals());
+            ledger
+        }
+    }
+
+    struct NativeGrowthRun {
+        // Kill/reap an owned blocked driver before the Session drops on failure.
+        fixture: GrowthDriver,
+        session: Session,
+        collector: CounterCollector,
+        pins: crate::discovery::identity::PinnedObjects,
+        slots: Vec<Slot>,
+        extra: Slot,
+        history: AttachPlan,
+        pool: SemanticResourcePool,
+        limits: CounterLimits,
+        stage: crate::attach::counter_banks::BankReservation,
+        expected: GrowthLedger,
+        previous: Option<GrowthLedger>,
+    }
+
+    impl NativeGrowthRun {
+        fn new(final_count: usize) -> Self {
+            use crate::attach::counter_banks::{BankPublication, BankReservation};
+            use sha2::Digest;
+            use std::io::Read;
+            use std::os::unix::fs::MetadataExt;
+            use std::path::{Path, PathBuf};
+            assert!(matches!(final_count, 513 | 8192));
+            assert_eq!(env!("P11SCOPE_COUNTER_BANK_PROOF_ENABLED"), "1");
+            assert_eq!(
+                env!("P11SCOPE_COUNTER_BANK_PROOF_OUTPUTS"),
+                "counts-bank-growth-v2"
+            );
+            let provider = PathBuf::from(
+                std::env::var_os("P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER")
+                    .expect("prebuild counter-bank-growth.c with -DCOUNTER_BANK_GROWTH_PROVIDER"),
+            );
+            let workload = PathBuf::from(
+                std::env::var_os("P11SCOPE_COUNTER_GROWTH_FIXTURE_WORKLOAD")
+                    .expect("prebuild counter-bank-growth.c's LP64 dlopen/pthread driver"),
+            );
+            let mut file = std::fs::File::open(&provider).unwrap();
+            let elf = p11scope_manifest::elf::ElfSnapshot::read(&file).unwrap();
+            assert_eq!(elf.abi(), p11scope_manifest::elf::ElfAbi::Lp64);
+            // One batch symbol walk/index, rather than 8192 defined_symbol parses.
+            let wanted: Vec<_> = (0..GROWTH_ENDPOINTS)
+                .map(|i| format!("counter_bank_growth_e{i:04x}"))
+                .collect();
+            let borrowed: Vec<_> = wanted.iter().map(String::as_str).collect();
+            let mut index = elf.exports_matching(&borrowed).unwrap();
+            index.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            assert_eq!(index.len(), GROWTH_ENDPOINTS);
+            let mut offsets = Vec::with_capacity(GROWTH_ENDPOINTS);
+            for ((name, offset), wanted) in index.iter().zip(&wanted) {
+                assert_eq!(name, wanted);
+                assert!(elf.is_executable_offset(*offset));
+                offsets.push(*offset);
+            }
+            let mut unique = offsets.clone();
+            unique.sort_unstable();
+            assert!(
+                unique.windows(2).all(|pair| pair[0] != pair[1]),
+                "8192 real distinct physical endpoints are required"
+            );
+            // This source-defined LOCAL FUNC is a separate real executable body,
+            // never a fabricated offset, an alias, or an extra accepted link.
+            let extra_offset = elf
+                .defined_symbol("endpoint_body")
+                .unwrap()
+                .expect("provider's actual endpoint_body FUNC")
+                .file_offset;
+            assert!(elf.is_executable_offset(extra_offset));
+            assert!(unique.binary_search(&extra_offset).is_err());
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).unwrap();
+            let digest = p11scope_manifest::identity::hex(&sha2::Sha256::digest(&bytes));
+            let pins = crate::discovery::identity::test_fixture::real_scan_pin(
+                &provider, None, 1, &digest,
+            );
+            let object = pins.pinned().next().unwrap().id;
+            let selected = file.metadata().unwrap();
+            let pinned = pins.file_for(object).unwrap().metadata().unwrap();
+            assert_eq!(
+                (selected.dev(), selected.ino()),
+                (pinned.dev(), pinned.ino())
+            );
+            let slots: Vec<_> = offsets
+                .into_iter()
+                .enumerate()
+                .map(|(i, offset)| {
+                    let mut target = slot(i as u32, 0);
+                    target.object = object;
+                    target.object_path = provider.to_string_lossy().into_owned();
+                    target.file_offset = offset;
+                    target.names = vec![wanted[i].clone()];
+                    target.aliased = false;
+                    target
+                })
+                .collect();
+            let mut extra = slots[0].clone();
+            extra.file_offset = extra_offset;
+            extra.names = vec!["endpoint_body".into()];
+            let fixture = GrowthDriver::spawn(&workload, &provider);
+            let policy = crate::plan::AdmissionPolicy::counters(
+                crate::capacity::CounterBudget::new(8192).unwrap(),
+            );
+            let mut history =
+                AttachPlan::from_slots_with_policy(slots[..512].to_vec(), policy).unwrap();
+            let cpus = aya::util::nr_cpus().unwrap();
+            let pool = SemanticResourcePool::reference_limit(2 * 1024 * 1024 * 1024);
+            let base = BankReservation {
+                retained_bytes: 128 * 1024 * 1024,
+                transient_bytes: 64 * 1024 * 1024,
+                metadata_bytes: 32 * 1024 * 1024,
+                file_descriptors: cpus.checked_mul(4).unwrap() + 512,
+            };
+            // Caller envelopes only: no OS limit is changed. Resource admission
+            // is a separate controller gate before this ignored cell can run.
+            let stage = BankReservation {
+                retained_bytes: 256 * 1024 * 1024,
+                transient_bytes: 256 * 1024 * 1024,
+                metadata_bytes: 16 * 1024 * 1024,
+                file_descriptors: cpus
+                    .checked_mul(4)
+                    .and_then(|n| n.checked_add(4))
+                    .and_then(|n| n.checked_mul(final_count))
+                    .and_then(|n| n.checked_add(16))
+                    .unwrap(),
+            };
+            let artifact = std::fs::read(
+                Path::new(env!("OUT_DIR"))
+                    .join("counter-bank-growth-v2/p11scope-ebpf-counts-bank-growth-v2"),
+            )
+            .unwrap();
+            let mut session = Session::prepare_counter_banks(
+                &crate::attach::Scope::Pid(fixture.child.id()),
+                &artifact,
+                base,
+                &pool.reserver(),
+            )
+            .unwrap();
+            assert!(matches!(
+                session.stage_counter_banks(&mut history, &pins, stage, &pool.reserver()),
+                BankPublication::Published {
+                    extent: crate::attach::counter_banks::BankExtent { first: 0, end: 512 },
+                    ..
+                }
+            ));
+            let limits = CounterLimits {
+                rows: final_count,
+                rv_keys: 65536,
+            };
+            let mut run = Self {
+                fixture,
+                session,
+                collector: CounterCollector::new(limits, pool.reserver()),
+                pins,
+                slots,
+                extra,
+                history,
+                pool,
+                limits,
+                stage,
+                expected: GrowthLedger::empty(),
+                previous: None,
+            };
+            run.checkpoint();
+            run
+        }
+
+        fn checkpoint(&mut self) {
+            let actual = self.fixture.ledger();
+            assert_eq!(
+                actual.hot, self.expected.hot,
+                "independent hot-RV completion"
+            );
+            assert_eq!(
+                actual.totals(),
+                self.expected.totals(),
+                "independent completion totals"
+            );
+            for (index, (actual, expected)) in
+                actual.rows.iter().zip(&self.expected.rows).enumerate()
+            {
+                assert_eq!(actual, expected, "independent driver row {index}");
+            }
+            self.sample();
+        }
+
+        fn sample(&mut self) {
+            let count = self.history.slots.len();
+            assert!(
+                self.expected.rows[count..]
+                    .iter()
+                    .all(|row| *row == GrowthLedgerRow::default())
+            );
+            let read = read_banked(
+                &self.session,
+                &self.history,
+                &self.pins,
+                self.limits,
+                &self.pool.reserver(),
+            )
+            .unwrap();
+            {
+                let view = read.view();
+                assert_eq!(view.health, CounterHealth::default());
+                assert_eq!(view.kernel, KernelEvidence::default());
+                let rows = view.rows.unwrap();
+                assert_eq!(rows.len(), count);
+                let mut totals = [0u64; 3];
+                for (index, row) in rows.iter().enumerate() {
+                    let actual = row.view();
+                    let expected = self.expected.rows[index];
+                    assert_eq!(actual.slot as usize, index);
+                    assert_eq!(
+                        actual.target,
+                        AttachKey {
+                            object: self.history.slots[index].object,
+                            file_offset: self.history.slots[index].file_offset
+                        }
+                    );
+                    assert_eq!(
+                        (actual.entered, actual.returned, actual.errors),
+                        (expected.entered, expected.returned, expected.errors),
+                        "native cumulative row {index}"
+                    );
+                    assert_eq!(
+                        *actual.rv_counts,
+                        self.expected.rv_counts(index),
+                        "full64 native RV row {index}"
+                    );
+                    assert_eq!((actual.total_ns, actual.max_ns), (0, 0));
+                    assert!(actual.buckets.iter().all(|&value| value == 0));
+                    totals[0] += actual.entered;
+                    totals[1] += actual.returned;
+                    totals[2] += actual.errors;
+                }
+                assert_eq!(totals, self.expected.totals());
+            }
+            let observation = self.collector.observe(Ok(read));
+            if let Some(previous) = &self.previous {
+                let CounterObservation::Advanced { deltas, .. } = observation else {
+                    panic!("complete actual growth collection: {observation:?}");
+                };
+                assert_eq!(deltas.len(), count);
+                for (index, delta) in deltas.iter().enumerate() {
+                    let before = previous.rows[index];
+                    let after = self.expected.rows[index];
+                    assert_eq!(delta.slot as usize, index);
+                    assert_eq!(
+                        (delta.entered, delta.returned, delta.errors),
+                        (
+                            after.entered - before.entered,
+                            after.returned - before.returned,
+                            after.errors - before.errors
+                        ),
+                        "native delta row {index}"
+                    );
+                    let old_rvs = previous.rv_counts(index);
+                    let expected_rvs: BTreeMap<_, _> = self
+                        .expected
+                        .rv_counts(index)
+                        .into_iter()
+                        .filter_map(|(rv, now)| {
+                            let difference = now - old_rvs.get(&rv).copied().unwrap_or(0);
+                            (difference != 0).then_some((rv, difference))
+                        })
+                        .collect();
+                    assert_eq!(delta.rv_counts, expected_rvs, "full64 delta row {index}");
+                }
+            } else {
+                assert_eq!(observation, CounterObservation::Initial);
+            }
+            self.previous = Some(self.expected.clone());
+            eprintln!(
+                "COUNTS_GROWTH_CHECKPOINT published={count} totals={:?}",
+                self.expected.totals()
+            );
+        }
+
+        fn held_start(&self) -> (u64, u32, u64) {
+            let starts: aya::maps::HashMap<_, StartKey, CallStart> =
+                aya::maps::HashMap::try_from(self.session.ebpf.map("START").unwrap()).unwrap();
+            let keys: Vec<_> = starts.keys().take(2).collect::<Result<_, _>>().unwrap();
+            assert_eq!(keys.len(), 1, "one actual old START must remain held");
+            assert_eq!((keys[0].slot, keys[0]._pad), (0, 0));
+            let start = starts.get(&keys[0], 0).unwrap();
+            assert_eq!((start.ts_ns, start.object_required), (0, 0));
+            (keys[0].pid_tgid, keys[0].slot, start.slot_id)
+        }
+
+        fn bank_ids(&self) -> Vec<u32> {
+            let view = self
+                .session
+                .counter_bank_view(&self.history, &self.pins, &self.pool.reserver())
+                .unwrap();
+            (0..self.history.slots.len())
+                .step_by(512)
+                .map(|index| {
+                    let (Map::PerCpuArray(data), cell) = view.bank_cell(index as u32).unwrap()
+                    else {
+                        panic!("retained per-CPU bank required");
+                    };
+                    assert_eq!(cell, 0);
+                    data.info().unwrap().id()
+                })
+                .collect()
+        }
+
+        fn grow(&mut self, end: usize) {
+            use crate::attach::counter_banks::{BankExtent, BankPublication};
+            let first = self.history.slots.len();
+            let ids = self.bank_ids();
+            let candidate = AttachPlan::from_slots_with_policy(
+                self.slots[..end].to_vec(),
+                self.history.admission_policy(),
+            )
+            .unwrap();
+            let delta = self.history.extend_exact(candidate).unwrap();
+            assert_eq!(delta.new.len(), end - first);
+            assert!(delta.retire.is_empty() && delta.replace.is_empty());
+            assert!(
+                matches!(self.session.stage_counter_banks(&mut self.history, &self.pins, self.stage, &self.pool.reserver()),
+                BankPublication::Published { extent, .. } if extent == BankExtent { first: first as u32, end: end as u32 })
+            );
+            assert_eq!(self.history.counter_consumed_end() as usize, end);
+            let after = self.bank_ids();
+            assert_eq!(after[..ids.len()], ids);
+            assert_eq!(
+                after
+                    .iter()
+                    .copied()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len(),
+                after.len()
+            );
+        }
+
+        fn step(&mut self, index: usize) {
+            let rv = GROWTH_RVS[index % 3];
+            self.fixture.command(&format!("STEP {index}"));
+            self.fixture.expect(&format!("STEP {index} {rv:016x}"));
+            self.expected.call(index, rv);
+            self.checkpoint();
+        }
+
+        fn refuse_n_plus_one(&mut self) {
+            assert_eq!(self.history.slots.len(), GROWTH_ENDPOINTS);
+            let before = self.history.clone();
+            let ids = self.bank_ids();
+            let charge = self.pool.snapshot().charged_bytes;
+            // One real new physical helper plus 8192 retained original cells is
+            // a lifetime demand of 8193 even if the fresh snapshot lists only it.
+            let candidate = AttachPlan::from_slots_with_policy(
+                vec![self.extra.clone()],
+                self.history.admission_policy(),
+            )
+            .unwrap();
+            let error = self.history.extend_exact(candidate).unwrap_err();
+            assert!(
+                error.contains("8193") && error.contains("8192") && error.contains("counter"),
+                "{error}"
+            );
+            assert!(
+                self.history == before,
+                "N+1 refusal is atomic before native work"
+            );
+            assert_eq!(self.history.counter_consumed_end(), 8192);
+            assert_eq!(self.pool.snapshot().charged_bytes, charge);
+            assert_eq!(self.bank_ids(), ids);
+            self.checkpoint();
+        }
+
+        fn finish(mut self) {
+            self.fixture.command("RELEASE");
+            self.fixture.expect("RELEASED 0 0000000000000204");
+            self.expected.rows[0].returned += 1;
+            self.expected.rows[0].rvs[1] += 1;
+            self.checkpoint();
+            let count = self.history.slots.len();
+            assert!(
+                self.expected.rows[..count]
+                    .iter()
+                    .all(|row| row.entered > 0 && row.returned > 0)
+            );
+            self.fixture.command("QUIT");
+            self.fixture.expect(&format!("DONE {count}"));
+            assert!(self.fixture.child.wait().unwrap().success());
+            self.sample(); // No extra credit or hidden health failure on driver exit.
+            self.session.stop_gate().request_stop();
+            self.session
+                .detach_producers_driven(|| false, &mut Vec::new())
+                .unwrap();
+            assert!(self.session.producers_detached() && self.session.stop_gate().quiescent());
+            let starts: aya::maps::HashMap<_, StartKey, CallStart> =
+                aya::maps::HashMap::try_from(self.session.ebpf.map("START").unwrap()).unwrap();
+            assert!(starts.keys().next().is_none());
+            let owner = Array::<_, ThreadOwnerControl>::try_from(
+                self.session.ebpf.map("OWNER_CTL").unwrap(),
+            )
+            .unwrap()
+            .get(&0, 0)
+            .unwrap();
+            assert_eq!(
+                (owner.outstanding, owner.poison, owner.abandoned_start),
+                (0, 0, 0)
+            );
+            let banks = self.bank_ids().len();
+            eprintln!(
+                "COUNTS_GROWTH_POPULATION allocated={count} published={count} exercised={count} banks={banks} ledger_completed={}",
+                self.expected.totals()[1]
+            );
+            drop(self.collector);
+            drop(self.session);
+            assert_eq!(
+                self.pool.snapshot().charged_bytes,
+                SEMANTIC_TRANSITION_SCRATCH
+            );
+        }
+    }
+
+    fn native_growth_population(final_count: usize) {
+        let mut run = NativeGrowthRun::new(final_count);
+        run.fixture.command("START");
+        run.fixture.expect("HELD 0");
+        run.expected.rows[0].entered += 1;
+        let held = run.held_start();
+        run.checkpoint();
+        run.step(511);
+        run.grow(513);
+        assert_eq!(run.held_start(), held);
+        run.checkpoint();
+        run.step(512);
+        if final_count == GROWTH_ENDPOINTS {
+            run.grow(GROWTH_ENDPOINTS);
+            assert_eq!(run.held_start(), held);
+            run.checkpoint();
+            run.step(8191);
+            assert_eq!(run.bank_ids().len(), 16);
+        } else {
+            assert_eq!(run.bank_ids().len(), 2);
+        }
+        run.fixture.command(&format!("RUN 0 {final_count}"));
+        run.fixture.expect(&format!("RAN 0 {final_count}"));
+        for index in 0..final_count {
+            run.expected.call(index, GROWTH_RVS[index % 3]);
+        }
+        run.checkpoint();
+        // A three-value full64 range is useful traffic, not RV/START exhaustion.
+        let index = final_count - 1;
+        let first = 0x2_0000_0204;
+        run.fixture
+            .command(&format!("HOT_RV {index} {first:016x} 3"));
+        run.fixture
+            .expect(&format!("HOT_RV {index} {first:016x} 3"));
+        for rv in first..first + 3 {
+            run.expected.call(index, rv);
+        }
+        run.expected.hot = Some(GrowthHotRange {
+            index,
+            first,
+            count: 3,
+            completed: 3,
+        });
+        assert_eq!(run.held_start(), held);
+        run.checkpoint();
+        if final_count == GROWTH_ENDPOINTS {
+            run.refuse_n_plus_one();
+        }
+        run.finish();
+    }
+
+    #[test]
+    #[ignore = "requires prebuilt LP64 growth fixtures, selected format2 object, and authorized 513-endpoint native attachment"]
+    fn counter_bank_session_boundary_511_512_counts_growth_lp64() {
+        native_growth_population(513);
+    }
+
+    #[test]
+    #[ignore = "requires prebuilt LP64 growth fixtures and separate FD/memory/native admission for 8192 distinct endpoints after the boundary pilot"]
+    fn counter_bank_session_useful_8192_counts_growth_lp64() {
+        native_growth_population(8192);
+    }
 }

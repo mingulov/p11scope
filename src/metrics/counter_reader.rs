@@ -57,14 +57,35 @@ pub(super) fn read_banked(
     limits: CounterLimits,
     reserve: &SemanticResourceReserver,
 ) -> Result<CounterRead, ReadStage> {
+    let binding = session
+        .counter_reader_binding()
+        .map_err(bank_read_stage)?
+        .ok_or(ReadStage::Shape)?;
+    read_bound(binding, plan, objects, limits, reserve)
+}
+
+fn bank_read_stage(failure: crate::attach::counter_banks::BankRefusal) -> ReadStage {
     use crate::attach::counter_banks::BankRefusal;
+    match failure {
+        BankRefusal::Quarantined => ReadStage::BankQuarantined,
+        _ => ReadStage::BankRouting,
+    }
+}
+
+/// Acquires fresh rows from the exact prepared native owner. Limits and
+/// reservation remain explicit inputs owned by the capture/admission caller.
+pub(super) fn read_bound(
+    binding: crate::attach::counter_banks::CounterReaderBinding<'_>,
+    plan: &AttachPlan,
+    objects: &crate::discovery::identity::PinnedObjects,
+    limits: CounterLimits,
+    reserve: &SemanticResourceReserver,
+) -> Result<CounterRead, ReadStage> {
+    let session = binding.session();
     let view = session
         .counter_bank_view(plan, objects)
-        .map_err(|failure| match failure {
-            BankRefusal::Quarantined => ReadStage::BankQuarantined,
-            _ => ReadStage::BankRouting,
-        })?;
-    let native = NativeSource::new(|name| session.ebpf.map(name), CounterMode::Counts)?;
+        .map_err(bank_read_stage)?;
+    let native = NativeSource::new(|name| session.ebpf.map(name), binding.mode())?;
     let fault = session
         .ebpf
         .map("COUNTER_BANK_FAULT")
@@ -76,13 +97,7 @@ pub(super) fn read_banked(
         ebpf: &session.ebpf,
         fault: PerCpuArray::try_from(fault).map_err(|_| ReadStage::Health)?,
     };
-    acquire(
-        &source,
-        session.counter_collection_generation(),
-        plan,
-        limits,
-        reserve,
-    )
+    acquire(&source, binding.generation(), plan, limits, reserve)
 }
 
 /// Only I/O is replaceable: acquisition ordering, limits, precharge and checked

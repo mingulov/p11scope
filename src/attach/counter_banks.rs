@@ -11,6 +11,7 @@ use anyhow::{Context, Result, ensure};
 use aya::Ebpf;
 use aya::maps::{HashMap, HashOfMaps, Map, MapData, MapError, MapType};
 use aya::programs::UProbe;
+use p11scope_ebpf_common::CounterMode;
 use std::mem::size_of;
 use std::num::NonZeroU64;
 use std::os::fd::{AsFd, AsRawFd};
@@ -683,22 +684,40 @@ fn exact_map(
 }
 
 fn validate_maps(ebpf: &Ebpf) -> Result<(), BankRefusal> {
-    exact_map(ebpf, "COUNTER_BANKS", MapType::HashOfMaps, 4, 4, 2, 128)?;
-    exact_map(ebpf, "COUNTER_BANK_META", MapType::Hash, 4, 24, 2, 128)?;
-    exact_map(ebpf, "COUNTER_BANK_COMMIT", MapType::Hash, 8, 16, 2, 128)?;
-    exact_map(ebpf, "COUNTER_BANK_FAULT", MapType::PerCpuArray, 4, 8, 1, 0)?;
-    exact_map(ebpf, "COUNTER_HEALTH", MapType::PerCpuArray, 4, 8, 2, 0)?;
-    exact_map(ebpf, "STATS", MapType::PerCpuArray, 4, 24, 512, 0)?;
-    exact_map(ebpf, "RV_COUNTS", MapType::PerCpuHash, 16, 8, 4096, 0)?;
-    exact_map(
-        ebpf,
-        "START",
-        MapType::Hash,
-        16,
-        size_of::<p11scope_ebpf_common::CallStart>() as u32,
-        16384,
-        0,
-    )
+    validate_maps_with(|name| {
+        let data = map_data(ebpf.map(name).ok_or(BankRefusal::Shape)?)?;
+        super::read_map_metadata(name, data).map_err(|_| BankRefusal::Shape)
+    })
+}
+
+fn validate_maps_with(
+    mut metadata: impl FnMut(&str) -> Result<super::ExactMapMetadata, BankRefusal>,
+) -> Result<(), BankRefusal> {
+    for (name, kind, key, value, entries, flags) in [
+        ("COUNTER_BANKS", MapType::HashOfMaps, 4, 4, 2, 128),
+        ("COUNTER_BANK_META", MapType::Hash, 4, 24, 2, 128),
+        ("COUNTER_BANK_COMMIT", MapType::Hash, 8, 16, 2, 128),
+        ("COUNTER_BANK_FAULT", MapType::PerCpuArray, 4, 8, 1, 0),
+        ("COUNTER_HEALTH", MapType::PerCpuArray, 4, 8, 2, 0),
+        ("STATS", MapType::PerCpuArray, 4, 24, 512, 0),
+        ("RV_COUNTS", MapType::PerCpuHash, 16, 8, 4096, 0),
+        (
+            "START",
+            MapType::Hash,
+            16,
+            size_of::<p11scope_ebpf_common::CallStart>() as u32,
+            16384,
+            0,
+        ),
+    ] {
+        super::compare_map_metadata(
+            name,
+            metadata(name)?,
+            super::map_metadata(kind, key, value, entries, flags),
+        )
+        .map_err(|_| BankRefusal::Shape)?;
+    }
+    Ok(())
 }
 
 /// Map-of-maps lookup returns an ID. Borrow the retained outer FD directly;
@@ -1088,6 +1107,107 @@ pub(crate) enum BankReadStatus {
     Healthy,
     Routing,
     Quarantined,
+}
+
+/// The current constructor prepares only the validated native Counts proof.
+/// This is not inferred from a caller's requested mode or a map's name.
+struct CounterReaderProfile {
+    cpus: usize,
+}
+
+impl CounterReaderProfile {
+    fn mode(&self) -> CounterMode {
+        CounterMode::Counts
+    }
+    fn logical_slots(&self) -> usize {
+        512
+    }
+    fn rv_keys(&self) -> usize {
+        4096
+    }
+    fn start_rows(&self) -> u32 {
+        16384
+    }
+    fn possible_cpus(&self) -> usize {
+        self.cpus
+    }
+}
+
+fn reader_profile_with(
+    banks: Option<&CounterBanks>,
+    metadata: impl FnMut(&str) -> Result<super::ExactMapMetadata, BankRefusal>,
+    possible_cpus: impl FnOnce() -> Result<usize, BankRefusal>,
+) -> Result<Option<CounterReaderProfile>, BankRefusal> {
+    let Some(banks) = banks else { return Ok(None) };
+    if banks
+        .directory
+        .lock()
+        .map_err(|_| BankRefusal::Quarantined)?
+        .quarantined
+    {
+        return Err(BankRefusal::Quarantined);
+    }
+    let cpus = possible_cpus()?;
+    if cpus == 0 || cpus != banks.cpus {
+        return Err(BankRefusal::Topology);
+    }
+    validate_maps_with(metadata)?;
+    Ok(Some(CounterReaderProfile { cpus }))
+}
+
+/// A fresh-read borrow of the original prepared Session. It cannot be made
+/// from a CLI mode and cannot survive a mutable growth operation on Session.
+/// Collection identity only: this grants no capture or admission authority.
+pub(crate) struct CounterReaderBinding<'s> {
+    session: &'s Session,
+    profile: CounterReaderProfile,
+}
+
+impl<'s> CounterReaderBinding<'s> {
+    pub(crate) fn mode(&self) -> CounterMode {
+        self.profile.mode()
+    }
+    pub(crate) fn generation(&self) -> NonZeroU64 {
+        self.session.counter_collection_generation()
+    }
+    pub(crate) fn logical_slots(&self) -> usize {
+        self.profile.logical_slots()
+    }
+    pub(crate) fn rv_keys(&self) -> usize {
+        self.profile.rv_keys()
+    }
+    pub(crate) fn start_rows(&self) -> u32 {
+        self.profile.start_rows()
+    }
+    pub(crate) fn possible_cpus(&self) -> usize {
+        self.profile.possible_cpus()
+    }
+    pub(crate) fn session(&self) -> &'s Session {
+        self.session
+    }
+}
+
+impl Session {
+    /// None means actual legacy state only. A present counter owner never
+    /// falls back to legacy acquisition after shape, topology or health refusal.
+    pub(crate) fn counter_reader_binding(
+        &self,
+    ) -> Result<Option<CounterReaderBinding<'_>>, BankRefusal> {
+        reader_profile_with(
+            self.counter_banks.as_ref(),
+            |name| {
+                let data = map_data(self.ebpf.map(name).ok_or(BankRefusal::Shape)?)?;
+                super::read_map_metadata(name, data).map_err(|_| BankRefusal::Native)
+            },
+            || aya::util::nr_cpus().map_err(|_| BankRefusal::Native),
+        )
+        .map(|profile| {
+            profile.map(|profile| CounterReaderBinding {
+                session: self,
+                profile,
+            })
+        })
+    }
 }
 
 /// Arc clones share the exact retained handles/charge. No get-by-ID FD is

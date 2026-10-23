@@ -370,11 +370,11 @@ trait BankIo {
     fn possible_cpus(&self) -> usize;
     fn validate_targets(&mut self, slots: &[Slot], published: &[u32]) -> Result<(), BankRefusal>;
     fn retain_charge(&mut self, charge: ResourceLease);
-    fn allocate_bank(&mut self, bank: u32) -> Result<u32, BankRefusal>;
+    fn allocate_bank(&mut self, bank: u32, all_slots: &[Slot]) -> Result<u32, BankRefusal>;
     fn insert_inner(&mut self, bank: u32, expected_id: u32) -> Result<(), BankRefusal>;
     fn insert_route(&mut self, slot: u32, route: CountsBankRoute) -> Result<(), BankRefusal>;
     fn attach_inactive(&mut self, slots: &[Slot]) -> Result<(), BankRefusal>;
-    fn verify_candidate(&mut self, expected: &StagedExtent) -> CandidateCheck;
+    fn verify_candidate(&mut self, expected: &StagedExtent, all_slots: &[Slot]) -> CandidateCheck;
     fn insert_commit(
         &mut self,
         transaction: u64,
@@ -524,9 +524,11 @@ impl BankDirectory {
             return Err(BankRefusal::Shape);
         }
         if self.budget.is_some_and(|old| old != budget)
+            || plan.counter_consumed_end() as usize != self.positions.len()
             || plan.slots.len() < self.positions.len()
             || plan.slots.iter().enumerate().any(|(index, slot)| {
                 slot.index as usize != index
+                    || (index >= self.positions.len() && !plan.is_active(slot.index))
                     || self
                         .positions
                         .get(index)
@@ -664,7 +666,7 @@ impl BankDirectory {
     fn stage_with(
         &mut self,
         io: &mut impl BankIo,
-        plan: &AttachPlan,
+        plan: &mut AttachPlan,
         reservation: BankReservation,
         reserve: &SemanticResourceReserver,
     ) -> BankPublication {
@@ -746,6 +748,20 @@ impl BankDirectory {
         let mut bank_ids = Vec::with_capacity(self.geometry.banks as usize);
         bank_ids.extend_from_slice(&self.bank_ids);
         bank_ids.resize(self.geometry.banks as usize, None);
+        let commit = CountsBankCommit {
+            first,
+            end,
+            configuration: self.geometry.configuration,
+        };
+        if io.observe_commit(transaction.get(), commit) != CommitObservation::Absent {
+            self.quarantined = true;
+            return BankPublication::Refused(BankRefusal::Quarantined);
+        }
+        if plan.consume_counter_extent(first, end).is_err() {
+            return BankPublication::Refused(BankRefusal::Topology);
+        }
+        // Once native work may start, this same plan and directory retain the
+        // consumed extent even if a clean rollback never publishes it.
         io.retain_charge(charge);
         self.positions = positions;
         self.budget = match plan.admission_policy() {
@@ -753,14 +769,6 @@ impl BankDirectory {
             _ => unreachable!("validated counter policy"),
         };
         self.next_transaction = transaction.get().checked_add(1).and_then(NonZeroU64::new);
-        let commit = CountsBankCommit {
-            first,
-            end,
-            configuration: self.geometry.configuration,
-        };
-        if io.observe_commit(transaction.get(), commit) != CommitObservation::Absent {
-            return self.quarantine(transaction.get(), extent);
-        }
         let mut links_attempted = false;
         let mut commit_attempted = false;
         let mut candidate = None;
@@ -771,7 +779,7 @@ impl BankDirectory {
                 let id = match bank_ids[bank as usize] {
                     Some(id) => id,
                     None => {
-                        let id = io.allocate_bank(bank)?;
+                        let id = io.allocate_bank(bank, &plan.slots)?;
                         if id == 0 || bank_ids.iter().flatten().any(|old| *old == id) {
                             return Err(BankRefusal::Quarantined);
                         }
@@ -803,7 +811,7 @@ impl BankDirectory {
             let expected =
                 StagedExtent::checked_with(self.geometry, transaction, commit, routes, ids)
                     .map_err(|_| BankRefusal::Quarantined)?;
-            if io.verify_candidate(&expected) != CandidateCheck::Exact {
+            if io.verify_candidate(&expected, &plan.slots) != CandidateCheck::Exact {
                 return Err(BankRefusal::Quarantined);
             }
             commit_attempted = true;
@@ -817,7 +825,7 @@ impl BankDirectory {
             };
             // Even a confirmed absent commit permits rollback only while the
             // complete candidate still has its original ownership facts.
-            if io.verify_candidate(expected) != CandidateCheck::Exact {
+            if io.verify_candidate(expected, &plan.slots) != CandidateCheck::Exact {
                 return self.quarantine(transaction.get(), extent);
             }
         }
@@ -854,6 +862,9 @@ impl BankDirectory {
                 }
                 for position in &mut self.positions[first as usize..end as usize] {
                     position.state = PositionState::NeverPublishedRetired;
+                }
+                for slot in first..end {
+                    plan.deactivate(slot);
                 }
                 BankPublication::RolledBack {
                     transaction: transaction.get(),
@@ -1310,7 +1321,6 @@ struct NativeIo<'a> {
     custody: &'a mut NativeCustody,
     cpus: usize,
     reservation: BankReservation,
-    plan: &'a AttachPlan,
 }
 
 impl BankIo for NativeIo<'_> {
@@ -1347,7 +1357,7 @@ impl BankIo for NativeIo<'_> {
             })
             .ok_or(BankRefusal::Topology)?;
         let requested = copies
-            .checked_add(stage_owned_bytes(&self.plan.slots, self.cpus).ok_or(BankRefusal::Budget)?)
+            .checked_add(stage_owned_bytes(slots, self.cpus).ok_or(BankRefusal::Budget)?)
             .ok_or(BankRefusal::Budget)?;
         if requested > self.reservation.retained_bytes
             || requested > self.reservation.transient_bytes
@@ -1367,7 +1377,7 @@ impl BankIo for NativeIo<'_> {
         *slot = Some(charge);
     }
 
-    fn allocate_bank(&mut self, bank: u32) -> Result<u32, BankRefusal> {
+    fn allocate_bank(&mut self, bank: u32, all_slots: &[Slot]) -> Result<u32, BankRefusal> {
         // Explicit format1 adapter only. Real format2 preparation/staging is
         // refused before any lifecycle or endpoint attachment.
         let index = bank as usize;
@@ -1377,7 +1387,7 @@ impl BankIo for NativeIo<'_> {
         if self.custody.banks[index].is_some() {
             return Err(BankRefusal::Allocated);
         }
-        let target = self.plan.slots.get(index).ok_or(BankRefusal::Topology)?;
+        let target = all_slots.get(index).ok_or(BankRefusal::Topology)?;
         let retained = self
             .objects
             .retain_inventory_target(target.object)
@@ -1486,7 +1496,7 @@ impl BankIo for NativeIo<'_> {
         Ok(())
     }
 
-    fn verify_candidate(&mut self, expected: &StagedExtent) -> CandidateCheck {
+    fn verify_candidate(&mut self, expected: &StagedExtent, all_slots: &[Slot]) -> CandidateCheck {
         if legacy_commit(expected.commit).is_err()
             || validate_maps(&self.session.ebpf).is_err()
             || self.session.mutation_stopped()
@@ -1497,12 +1507,12 @@ impl BankIo for NativeIo<'_> {
         if aya::util::nr_cpus().ok() != Some(self.cpus) {
             return CandidateCheck::Unreadable;
         }
-        let all = match legacy_indices_mask(self.plan.slots.iter().map(|slot| slot.index)) {
+        let all = match legacy_indices_mask(all_slots.iter().map(|slot| slot.index)) {
             Ok(mask) => mask,
             Err(_) => return CandidateCheck::Contradictory,
         };
         if self.objects.check_unchanged() != Ok(true)
-            || validate_provider_slots(&self.plan.slots, self.objects, all, |index| {
+            || validate_provider_slots(all_slots, self.objects, all, |index| {
                 self.custody.providers[index as usize].as_ref()
             })
             .is_err()
@@ -1706,7 +1716,7 @@ impl Session {
 
     pub(crate) fn stage_counter_banks(
         &mut self,
-        plan: &AttachPlan,
+        plan: &mut AttachPlan,
         objects: &PinnedObjects,
         reservation: BankReservation,
         reserve: &SemanticResourceReserver,
@@ -1732,7 +1742,6 @@ impl Session {
             custody: &mut custody,
             cpus,
             reservation,
-            plan,
         };
         directory.stage_with(&mut native, plan, reservation, reserve)
     }
@@ -2119,9 +2128,15 @@ mod tests {
             self.held.push(charge);
         }
 
-        fn allocate_bank(&mut self, bank: u32) -> Result<u32, BankRefusal> {
+        fn allocate_bank(&mut self, bank: u32, all_slots: &[Slot]) -> Result<u32, BankRefusal> {
             self.require_precharge();
             self.trace.push("allocate");
+            assert!(
+                all_slots
+                    .iter()
+                    .enumerate()
+                    .all(|(index, slot)| slot.index as usize == index)
+            );
             if self.failure == Some("allocate-cut") {
                 panic!("cut at the first native allocation boundary");
             }
@@ -2164,8 +2179,19 @@ mod tests {
             Ok(())
         }
 
-        fn verify_candidate(&mut self, expected: &StagedExtent) -> CandidateCheck {
+        fn verify_candidate(
+            &mut self,
+            expected: &StagedExtent,
+            all_slots: &[Slot],
+        ) -> CandidateCheck {
             self.trace.push("verify");
+            assert_eq!(all_slots.len(), expected.commit.end as usize);
+            assert!(
+                all_slots
+                    .iter()
+                    .enumerate()
+                    .all(|(index, slot)| slot.index as usize == index)
+            );
             self.checks += 1;
             if let Some((at, damage)) = self.damage
                 && at == self.checks
@@ -2484,14 +2510,26 @@ mod tests {
         let pool = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
         let mut directory = BankDirectory::counts_growth_v2();
         let mut io = GrowthIo::new(&pool);
+        let mut history = plan(1);
         assert!(matches!(
-            directory.stage_with(&mut io, &plan(1), growth_reservation(), &pool.reserver()),
+            directory.stage_with(
+                &mut io,
+                &mut history,
+                growth_reservation(),
+                &pool.reserver()
+            ),
             BankPublication::Published { .. }
         ));
         let old = io.routes[&0];
+        history.extend_exact(plan(2)).unwrap();
         io.next_stage();
         assert!(matches!(
-            directory.stage_with(&mut io, &plan(2), growth_reservation(), &pool.reserver()),
+            directory.stage_with(
+                &mut io,
+                &mut history,
+                growth_reservation(),
+                &pool.reserver()
+            ),
             BankPublication::Published { .. }
         ));
         assert_eq!(io.maps, BTreeMap::from([(0, 101)]));
@@ -2530,18 +2568,25 @@ mod tests {
             ] {
                 let mut directory = BankDirectory::counts_growth_v2();
                 let mut io = GrowthIo::new(&pool);
+                let mut history = plan(1);
                 assert!(matches!(
-                    directory.stage_with(&mut io, &plan(1), growth_reservation(), &pool.reserver()),
+                    directory.stage_with(
+                        &mut io,
+                        &mut history,
+                        growth_reservation(),
+                        &pool.reserver()
+                    ),
                     BankPublication::Published { .. }
                 ));
                 let old = io.routes[&0];
+                history.extend_exact(plan(2)).unwrap();
                 io.next_stage();
                 io.damage = Some((at, damage));
                 assert!(
                     matches!(
                         directory.stage_with(
                             &mut io,
-                            &plan(2),
+                            &mut history,
                             growth_reservation(),
                             &pool.reserver()
                         ),
@@ -2559,7 +2604,7 @@ mod tests {
                 );
                 assert!(!io.held.is_empty());
                 assert_eq!(
-                    directory.validate_read_plan(&plan(2)),
+                    directory.validate_read_plan(&history),
                     Err(BankRefusal::Quarantined)
                 );
             }
@@ -2567,15 +2612,27 @@ mod tests {
         for unreadable in [false, true] {
             let mut directory = BankDirectory::counts_growth_v2();
             let mut io = GrowthIo::new(&pool);
+            let mut history = plan(1);
             assert!(matches!(
-                directory.stage_with(&mut io, &plan(1), growth_reservation(), &pool.reserver()),
+                directory.stage_with(
+                    &mut io,
+                    &mut history,
+                    growth_reservation(),
+                    &pool.reserver()
+                ),
                 BankPublication::Published { .. }
             ));
+            history.extend_exact(plan(2)).unwrap();
             io.next_stage();
             io.commit_unreadable = unreadable;
             io.commit_wrong = !unreadable;
             assert!(matches!(
-                directory.stage_with(&mut io, &plan(2), growth_reservation(), &pool.reserver()),
+                directory.stage_with(
+                    &mut io,
+                    &mut history,
+                    growth_reservation(),
+                    &pool.reserver()
+                ),
                 BankPublication::Quarantined { .. }
             ));
             assert_eq!(io.routes.len(), 2);
@@ -2594,16 +2651,27 @@ mod tests {
         ] {
             let mut directory = BankDirectory::counts_growth_v2();
             let mut io = GrowthIo::new(&pool);
+            let mut history = plan(1);
             assert!(matches!(
-                directory.stage_with(&mut io, &plan(1), growth_reservation(), &pool.reserver()),
+                directory.stage_with(
+                    &mut io,
+                    &mut history,
+                    growth_reservation(),
+                    &pool.reserver()
+                ),
                 BankPublication::Published { .. }
             ));
             let old = io.routes[&0];
+            history.extend_exact(plan(2)).unwrap();
             io.next_stage();
             io.commit_absent = true;
             io.damage = damage.map(|kind| (2, kind));
-            let publication =
-                directory.stage_with(&mut io, &plan(2), growth_reservation(), &pool.reserver());
+            let publication = directory.stage_with(
+                &mut io,
+                &mut history,
+                growth_reservation(),
+                &pool.reserver(),
+            );
             assert_eq!(io.checks, 2, "post-insert check with {damage:?}");
             assert_eq!(io.routes[&0], old);
             assert_eq!(io.maps[&0], 101);
@@ -2636,12 +2704,17 @@ mod tests {
                 io.returns.insert(1);
                 io.next_stage();
                 assert_eq!(
-                    directory.stage_with(&mut io, &plan(2), growth_reservation(), &pool.reserver()),
+                    directory.stage_with(
+                        &mut io,
+                        &mut history,
+                        growth_reservation(),
+                        &pool.reserver()
+                    ),
                     BankPublication::Refused(BankRefusal::Quarantined)
                 );
                 assert!(io.trace.is_empty());
                 assert_eq!(
-                    directory.validate_read_plan(&plan(2)),
+                    directory.validate_read_plan(&history),
                     Err(BankRefusal::Quarantined)
                 );
             }
@@ -2655,7 +2728,12 @@ mod tests {
         let mut io = GrowthIo::new(&pool);
         let mut history = plan(1);
         assert!(matches!(
-            directory.stage_with(&mut io, &history, growth_reservation(), &pool.reserver()),
+            directory.stage_with(
+                &mut io,
+                &mut history,
+                growth_reservation(),
+                &pool.reserver()
+            ),
             BankPublication::Published { .. }
         ));
         let old = io.routes[&0];
@@ -2663,7 +2741,12 @@ mod tests {
         io.next_stage();
         io.commit_absent = true;
         assert!(matches!(
-            directory.stage_with(&mut io, &history, growth_reservation(), &pool.reserver()),
+            directory.stage_with(
+                &mut io,
+                &mut history,
+                growth_reservation(),
+                &pool.reserver()
+            ),
             BankPublication::RolledBack { .. }
         ));
         assert_eq!(directory.allocated_high_water(), 2);
@@ -2674,11 +2757,17 @@ mod tests {
         );
         io.next_stage();
         assert!(matches!(
-            directory.stage_with(&mut io, &history, growth_reservation(), &pool.reserver()),
+            directory.stage_with(
+                &mut io,
+                &mut history,
+                growth_reservation(),
+                &pool.reserver()
+            ),
             BankPublication::Refused(BankRefusal::Allocated)
         ));
         assert!(io.trace.is_empty());
-        history.deactivate(1);
+        assert!(!history.is_active(1));
+        assert_eq!(history.counter_consumed_end(), 2);
         history.extend_exact(plan(2)).unwrap();
         assert_eq!(
             history
@@ -2693,7 +2782,12 @@ mod tests {
         io.next_stage();
         io.commit_absent = false;
         assert!(matches!(
-            directory.stage_with(&mut io, &history, growth_reservation(), &pool.reserver()),
+            directory.stage_with(
+                &mut io,
+                &mut history,
+                growth_reservation(),
+                &pool.reserver()
+            ),
             BankPublication::Published { .. }
         ));
         assert_eq!(directory.allocated_high_water(), 3);
@@ -2701,7 +2795,8 @@ mod tests {
         assert_eq!(io.routes.keys().copied().collect::<Vec<_>>(), [0, 2]);
         assert_eq!(io.routes[&0], old);
         assert_eq!((io.routes[&2].bank, io.routes[&2].cell), (0, 2));
-        // Directory high-water only: no plan floor or tail helper is exercised.
+        // The actual transaction consumes this same plan; retries keep the hole.
+        assert_eq!(history.counter_consumed_end(), 3);
     }
 
     #[test]
@@ -3288,7 +3383,7 @@ mod tests {
             io.cpus = cpus;
             let charged = pool.snapshot().charged_bytes;
             assert!(matches!(
-                directory.stage_with(&mut io, &plan(1), bad, &pool.reserver()),
+                directory.stage_with(&mut io, &mut plan(1), bad, &pool.reserver()),
                 BankPublication::Refused(BankRefusal::Budget | BankRefusal::Topology)
             ));
             assert!(io.trace.is_empty() && io.maps.is_empty() && io.routes.is_empty());
@@ -3315,7 +3410,7 @@ mod tests {
                 metadata_bytes: 1024 * 1024,
                 file_descriptors: 65_536,
             };
-            let result = directory.stage_with(&mut io, &plan(1), envelope, &pool.reserver());
+            let result = directory.stage_with(&mut io, &mut plan(1), envelope, &pool.reserver());
             if enough {
                 assert!(matches!(result, BankPublication::Published { .. }));
                 assert_eq!(io.maps.len(), 1);
@@ -3327,16 +3422,28 @@ mod tests {
         let pool = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
         let mut directory = BankDirectory::counts_growth_v2();
         let mut io = GrowthIo::new(&pool);
+        let mut history = plan(1);
         assert!(matches!(
-            directory.stage_with(&mut io, &plan(1), growth_reservation(), &pool.reserver()),
+            directory.stage_with(
+                &mut io,
+                &mut history,
+                growth_reservation(),
+                &pool.reserver()
+            ),
             BankPublication::Published { .. }
         ));
+        history.extend_exact(plan(2)).unwrap();
         let old = io.routes[&0];
         let charged = pool.snapshot().charged_bytes;
         io.next_stage();
         let refused = SemanticResourcePool::reference_limit(SEMANTIC_TRANSITION_SCRATCH);
         assert_eq!(
-            directory.stage_with(&mut io, &plan(2), growth_reservation(), &refused.reserver()),
+            directory.stage_with(
+                &mut io,
+                &mut history,
+                growth_reservation(),
+                &refused.reserver()
+            ),
             BankPublication::Refused(BankRefusal::Budget)
         );
         assert!(io.trace.is_empty());
@@ -3378,8 +3485,12 @@ mod tests {
             let mut io = GrowthIo::new(&pool);
             io.commits.insert(7, commit);
             io.commit_absent = missing_high;
-            let publication =
-                directory.stage_with(&mut io, &plan(1), growth_reservation(), &pool.reserver());
+            let publication = directory.stage_with(
+                &mut io,
+                &mut plan(1),
+                growth_reservation(),
+                &pool.reserver(),
+            );
             assert_eq!(io.commits[&7], commit);
             if missing_high {
                 assert!(matches!(publication, BankPublication::RolledBack { .. }));
@@ -3465,7 +3576,6 @@ mod tests {
         inners: BTreeMap<u32, u32>,
         metadata: BTreeMap<u32, BankMetadata>,
         commits: BTreeMap<u64, BankCommit>,
-        targets: Vec<Slot>,
         entries: BTreeSet<u32>,
         returns: BTreeSet<u32>,
         held: Vec<ResourceLease>,
@@ -3494,7 +3604,6 @@ mod tests {
                     retained[index as usize].as_ref()
                 })?;
             }
-            self.targets = slots.to_vec();
             Ok(())
         }
 
@@ -3502,7 +3611,7 @@ mod tests {
             self.held.push(charge);
         }
 
-        fn allocate_bank(&mut self, slot: u32) -> Result<u32, BankRefusal> {
+        fn allocate_bank(&mut self, slot: u32, all_slots: &[Slot]) -> Result<u32, BankRefusal> {
             assert!(
                 !self.held.is_empty(),
                 "precharge precedes native allocation"
@@ -3515,10 +3624,7 @@ mod tests {
                 self.inners.insert(slot, 99);
             }
             if let Some((pins, retained)) = &mut self.provider_guard {
-                let target = self
-                    .targets
-                    .get(slot as usize)
-                    .ok_or(BankRefusal::Topology)?;
+                let target = all_slots.get(slot as usize).ok_or(BankRefusal::Topology)?;
                 retained[slot as usize] = Some(
                     pins.retain_inventory_target(target.object)
                         .map_err(|_| BankRefusal::Ownership)?,
@@ -3561,14 +3667,18 @@ mod tests {
             Ok(())
         }
 
-        fn verify_candidate(&mut self, expected: &StagedExtent) -> CandidateCheck {
+        fn verify_candidate(
+            &mut self,
+            expected: &StagedExtent,
+            all_slots: &[Slot],
+        ) -> CandidateCheck {
             self.trace.push("verify");
+            assert_eq!(all_slots.len(), expected.commit.end as usize);
             if let Some((pins, retained)) = &self.provider_guard {
-                let Ok(all) = legacy_indices_mask(self.targets.iter().map(|slot| slot.index))
-                else {
+                let Ok(all) = legacy_indices_mask(all_slots.iter().map(|slot| slot.index)) else {
                     return CandidateCheck::Contradictory;
                 };
-                if validate_provider_slots(&self.targets, pins, all, |index| {
+                if validate_provider_slots(all_slots, pins, all, |index| {
                     retained[index as usize].as_ref()
                 })
                 .is_err()
@@ -3683,7 +3793,7 @@ mod tests {
         let mut directory = BankDirectory::default();
         let mut native = Native::default();
         assert!(matches!(
-            directory.stage_with(&mut native, &plan(2), reservation(), &pool.reserver()),
+            directory.stage_with(&mut native, &mut plan(2), reservation(), &pool.reserver()),
             BankPublication::Published {
                 extent: BankExtent { first: 0, end: 2 },
                 ..
@@ -3729,7 +3839,12 @@ mod tests {
         let mut native = Native::default();
         let mut directory = BankDirectory::default();
         assert_eq!(
-            directory.stage_with(&mut native, &plan(1), reservation(), &refused.reserver()),
+            directory.stage_with(
+                &mut native,
+                &mut plan(1),
+                reservation(),
+                &refused.reserver()
+            ),
             BankPublication::Refused(BankRefusal::Budget)
         );
         assert!(native.trace.is_empty());
@@ -3742,19 +3857,21 @@ mod tests {
         let pool = SemanticResourcePool::reference_limit(4 * 1024 * 1024);
         let mut directory = BankDirectory::default();
         let mut native = Native::default();
+        let mut history = plan(1);
         let BankPublication::Published {
             transaction: old,
             extent: BankExtent { first: 0, end: 1 },
-        } = directory.stage_with(&mut native, &plan(1), reservation(), &pool.reserver())
+        } = directory.stage_with(&mut native, &mut history, reservation(), &pool.reserver())
         else {
             panic!("first real transaction did not publish");
         };
         let original = native.metadata[&0];
+        history.extend_exact(plan(2)).unwrap();
         native.fail = Some("commit-ack-lost");
         let BankPublication::Published {
             transaction: new,
             extent: BankExtent { first: 1, end: 2 },
-        } = directory.stage_with(&mut native, &plan(2), reservation(), &pool.reserver())
+        } = directory.stage_with(&mut native, &mut history, reservation(), &pool.reserver())
         else {
             panic!("matching readback must resolve lost syscall acknowledgement");
         };
@@ -3765,13 +3882,12 @@ mod tests {
         assert_eq!(native.commits[&old].mask, 1);
         assert_eq!(native.commits[&new].mask, 2);
         assert_eq!(directory.legacy_published_mask().unwrap(), 3);
-        assert!(directory.validate_read_plan(&plan(2)).is_ok());
+        assert!(directory.validate_read_plan(&history).is_ok());
 
         let before = native.trace.len();
-        let mut replacement = plan(2);
-        replacement.slots[0].object = PinnedObjectId(99);
+        history.slots[0].object = PinnedObjectId(99);
         assert_eq!(
-            directory.stage_with(&mut native, &replacement, reservation(), &pool.reserver()),
+            directory.stage_with(&mut native, &mut history, reservation(), &pool.reserver()),
             BankPublication::Refused(BankRefusal::Topology)
         );
         assert_eq!(
@@ -3791,9 +3907,15 @@ mod tests {
                 fail: Some(failure),
                 ..Native::default()
             };
+            let mut history = plan(2);
             assert!(
                 matches!(
-                    directory.stage_with(&mut native, &plan(2), reservation(), &pool.reserver()),
+                    directory.stage_with(
+                        &mut native,
+                        &mut history,
+                        reservation(),
+                        &pool.reserver()
+                    ),
                     BankPublication::RolledBack { .. }
                 ),
                 "{failure}"
@@ -3808,7 +3930,7 @@ mod tests {
             );
             let before = native.trace.len();
             assert!(matches!(
-                directory.stage_with(&mut native, &plan(2), reservation(), &pool.reserver()),
+                directory.stage_with(&mut native, &mut history, reservation(), &pool.reserver()),
                 BankPublication::Refused(BankRefusal::Allocated)
             ));
             assert_eq!(
@@ -3823,7 +3945,7 @@ mod tests {
             ..Native::default()
         };
         assert!(matches!(
-            directory.stage_with(&mut native, &plan(1), reservation(), &pool.reserver()),
+            directory.stage_with(&mut native, &mut plan(1), reservation(), &pool.reserver()),
             BankPublication::Quarantined { .. }
         ));
         assert_eq!(native.inners.get(&0), Some(&99));
@@ -3854,8 +3976,9 @@ mod tests {
                 acknowledgements: vec![acknowledgement],
                 ..Native::default()
             };
+            let mut history = plan(1);
             assert!(matches!(
-                directory.stage_with(&mut native, &plan(1), reservation(), &pool.reserver()),
+                directory.stage_with(&mut native, &mut history, reservation(), &pool.reserver()),
                 BankPublication::Quarantined { .. }
             ));
             assert_eq!(native.inners.len(), 1);
@@ -3863,12 +3986,13 @@ mod tests {
             assert!(!native.held.is_empty());
             assert!(!native.trace.contains(&"remove-inner"));
             assert_eq!(
-                directory.validate_read_plan(&plan(1)),
+                directory.validate_read_plan(&history),
                 Err(BankRefusal::Quarantined)
             );
+            history.extend_exact(plan(2)).unwrap();
             let before = native.trace.len();
             assert_eq!(
-                directory.stage_with(&mut native, &plan(2), reservation(), &pool.reserver()),
+                directory.stage_with(&mut native, &mut history, reservation(), &pool.reserver()),
                 BankPublication::Refused(BankRefusal::Quarantined)
             );
             assert_eq!(native.trace.len(), before);
@@ -3880,7 +4004,7 @@ mod tests {
             ..Native::default()
         };
         assert!(matches!(
-            directory.stage_with(&mut native, &plan(1), reservation(), &pool.reserver()),
+            directory.stage_with(&mut native, &mut plan(1), reservation(), &pool.reserver()),
             BankPublication::Quarantined { .. }
         ));
         assert!(!native.inners.is_empty());
@@ -3896,7 +4020,7 @@ mod tests {
             ..Native::default()
         };
         assert!(matches!(
-            directory.stage_with(&mut native, &plan(1), reservation(), &pool.reserver()),
+            directory.stage_with(&mut native, &mut plan(1), reservation(), &pool.reserver()),
             BankPublication::Quarantined { .. }
         ));
         assert!(
@@ -3915,31 +4039,37 @@ mod tests {
         let mut native = Native::default();
         let mut directory = BankDirectory::default();
         assert_eq!(
-            directory.stage_with(&mut native, &plan(3), reservation(), &pool.reserver()),
+            directory.stage_with(&mut native, &mut plan(3), reservation(), &pool.reserver()),
             BankPublication::Refused(BankRefusal::Shape),
         );
         let mut aliases = plan(2);
         aliases.slots[1].object = aliases.slots[0].object;
         assert_eq!(
-            directory.stage_with(&mut native, &aliases, reservation(), &pool.reserver()),
+            directory.stage_with(&mut native, &mut aliases, reservation(), &pool.reserver()),
             BankPublication::Refused(BankRefusal::Topology),
         );
         assert!(native.trace.is_empty());
+        let mut history = plan(1);
         directory.next_transaction = std::num::NonZeroU64::new(u64::MAX);
         assert!(matches!(
-            directory.stage_with(&mut native, &plan(1), reservation(), &pool.reserver()),
+            directory.stage_with(&mut native, &mut history, reservation(), &pool.reserver()),
             BankPublication::Published {
                 transaction: u64::MAX,
                 ..
             }
         ));
+        history.extend_exact(plan(2)).unwrap();
         let before = native.trace.len();
         assert_eq!(
-            directory.stage_with(&mut native, &plan(2), reservation(), &pool.reserver()),
+            directory.stage_with(&mut native, &mut history, reservation(), &pool.reserver()),
             BankPublication::Refused(BankRefusal::Exhausted),
         );
         assert_eq!(native.trace.len(), before);
-        assert!(directory.validate_read_plan(&plan(1)).is_ok());
+        history.deactivate(1);
+        history.withdraw_unlinked_additions(1);
+        assert_eq!(history.counter_consumed_end(), 1);
+        assert_eq!(history.slots.len(), 1);
+        assert!(directory.validate_read_plan(&history).is_ok());
         assert_eq!(directory.legacy_published_mask().unwrap(), 1);
     }
 
@@ -3957,8 +4087,12 @@ mod tests {
         let id = old.pinned().next().unwrap().id;
         assert_eq!(same.pinned().next().unwrap().id, id);
         assert_eq!(foreign.pinned().next().unwrap().id, id);
-        let mut selected = plan(1);
-        selected.slots[0].object = id;
+        let mut selected_slot = slot(0, 1);
+        selected_slot.object = id;
+        let policy = crate::plan::AdmissionPolicy::counters(
+            crate::capacity::CounterBudget::new(8192).unwrap(),
+        );
+        let mut selected = AttachPlan::from_slots_with_policy(vec![selected_slot], policy).unwrap();
         let retained = [Some(old.retain_inventory_target(id).unwrap()), None];
         for pins in [&old, &same] {
             assert_eq!(
@@ -3989,30 +4123,35 @@ mod tests {
             ..Native::default()
         };
         assert!(matches!(
-            directory.stage_with(&mut native, &selected, reservation(), &pool.reserver()),
+            directory.stage_with(&mut native, &mut selected, reservation(), &pool.reserver()),
             BankPublication::Published {
                 transaction: 1,
                 extent: BankExtent { first: 0, end: 1 }
             }
         ));
-        let mut appended = plan(2);
-        appended.slots[0].object = id;
         // A separately built store now assigns zero to a foreign provider and
         // one to the original provider. Numeric prefix checks alone accept it.
         let mut switched = foreign;
         assert!(switched.absorb(same).is_empty());
         assert_eq!(switched.pinned().count(), 2);
-        appended.slots[1].object = switched
+        let mut appended_slot = slot(1, 2);
+        appended_slot.object = switched
             .pinned()
             .map(|pin| pin.id)
             .find(|&id| id != selected.slots[0].object)
             .unwrap();
+        let appended = AttachPlan::from_slots_with_policy(
+            vec![selected.slots[0].clone(), appended_slot],
+            policy,
+        )
+        .unwrap();
+        selected.extend_exact(appended).unwrap();
         let bindings = native.provider_guard.as_mut().unwrap();
         bindings.0 = switched;
         let charged = pool.snapshot().charged_bytes;
         let before = native.trace.len();
         assert_eq!(
-            directory.stage_with(&mut native, &appended, reservation(), &pool.reserver()),
+            directory.stage_with(&mut native, &mut selected, reservation(), &pool.reserver()),
             BankPublication::Refused(BankRefusal::Ownership)
         );
         assert_eq!(directory.legacy_published_mask().unwrap(), 1);
@@ -4036,7 +4175,7 @@ mod tests {
         );
         native.provider_guard.as_mut().unwrap().0 = restored;
         assert!(matches!(
-            directory.stage_with(&mut native, &appended, reservation(), &pool.reserver()),
+            directory.stage_with(&mut native, &mut selected, reservation(), &pool.reserver()),
             BankPublication::Published {
                 transaction: 2,
                 extent: BankExtent { first: 1, end: 2 }
@@ -4073,30 +4212,38 @@ mod tests {
         assert_eq!(ids.len(), 2);
         assert_ne!(ids[0], ids[1]);
         assert!(retained.same_object_as(&pins, ids[1]));
-        let mut duplicate = plan(2);
-        duplicate.slots[0].object = ids[0];
-        duplicate.slots[1].object = ids[1];
+        let mut duplicate_slots = vec![slot(0, 1), slot(1, 2)];
+        duplicate_slots[0].object = ids[0];
+        duplicate_slots[1].object = ids[1];
+        let duplicate = AttachPlan::from_slots_with_policy(
+            duplicate_slots,
+            crate::plan::AdmissionPolicy::counters(
+                crate::capacity::CounterBudget::new(8192).unwrap(),
+            ),
+        )
+        .unwrap();
         let pool = SemanticResourcePool::reference_limit(4 * 1024 * 1024);
         let mut native = Native {
             provider_guard: Some((pins, [Some(retained), None])),
             ..Native::default()
         };
         let mut directory = BankDirectory::default();
-        let first = AttachPlan::from_slots_with_policy(
+        let mut first = AttachPlan::from_slots_with_policy(
             duplicate.slots[..1].to_vec(),
             duplicate.admission_policy(),
         )
         .unwrap();
         assert!(matches!(
-            directory.stage_with(&mut native, &first, reservation(), &pool.reserver()),
+            directory.stage_with(&mut native, &mut first, reservation(), &pool.reserver()),
             BankPublication::Published {
                 extent: BankExtent { first: 0, end: 1 },
                 ..
             }
         ));
+        first.extend_exact(duplicate).unwrap();
         let before = native.trace.len();
         assert_eq!(
-            directory.stage_with(&mut native, &duplicate, reservation(), &pool.reserver()),
+            directory.stage_with(&mut native, &mut first, reservation(), &pool.reserver()),
             BankPublication::Refused(BankRefusal::Ownership)
         );
         assert_eq!(directory.legacy_published_mask().unwrap(), 1);
@@ -4104,9 +4251,9 @@ mod tests {
         assert_eq!(native.commits.len(), 1);
         assert!(!native.trace[before..].contains(&"allocate"));
         let (pins, retained) = native.provider_guard.as_ref().unwrap();
-        duplicate.slots[1].file_offset += 8;
+        first.slots[1].file_offset += 8;
         assert_eq!(
-            validate_provider_slots(&duplicate.slots, pins, 1, |index| {
+            validate_provider_slots(&first.slots, pins, 1, |index| {
                 retained[index as usize].as_ref()
             }),
             Ok(()),

@@ -1675,7 +1675,7 @@ mod tests {
         hot.names = vec!["counter_bank_hot".into()];
         let policy =
             crate::plan::AdmissionPolicy::counters(crate::capacity::CounterBudget::new(2).unwrap());
-        let first = AttachPlan::from_slots_with_policy(vec![old.clone()], policy).unwrap();
+        let mut history = AttachPlan::from_slots_with_policy(vec![old.clone()], policy).unwrap();
         let grown = AttachPlan::from_slots_with_policy(vec![old, hot], policy).unwrap();
 
         let child = Command::new(&workload)
@@ -1719,11 +1719,12 @@ mod tests {
         let BankPublication::Published {
             transaction: old_transaction,
             extent,
-        } = session.stage_counter_banks(&first, &pins, stage, &pool.reserver())
+        } = session.stage_counter_banks(&mut history, &pins, stage, &pool.reserver())
         else {
             panic!("first actual bank did not publish");
         };
         assert_eq!((extent.first, extent.end), (0, 1));
+        assert_eq!(history.counter_consumed_end(), 1);
         let binding = session.counter_reader_binding().unwrap().unwrap();
         assert_eq!(binding.mode(), CounterMode::Counts);
         assert_eq!(
@@ -1734,7 +1735,7 @@ mod tests {
         assert_eq!(binding.rv_keys(), 4096);
         assert_eq!(binding.start_rows(), 16384);
         assert_eq!(binding.possible_cpus(), cpus);
-        assert!(read_bound(binding, &first, &pins, limits, &pool.reserver()).is_ok());
+        assert!(read_bound(binding, &history, &pins, limits, &pool.reserver()).is_ok());
         let foreign = crate::discovery::identity::test_fixture::real_scan_pin(
             Path::new("/usr/bin/true"),
             None,
@@ -1745,7 +1746,7 @@ mod tests {
             matches!(
                 read_bound(
                     session.counter_reader_binding().unwrap().unwrap(),
-                    &first,
+                    &history,
                     &foreign,
                     limits,
                     &pool.reserver(),
@@ -1758,7 +1759,7 @@ mod tests {
         assert_eq!(
             collector.observe(read_banked(
                 &session,
-                &first,
+                &history,
                 &pins,
                 limits,
                 &pool.reserver()
@@ -1780,7 +1781,7 @@ mod tests {
         assert_eq!(starts.get(&keys[0], 0).unwrap().object_required, 0);
         match collector.observe(read_banked(
             &session,
-            &first,
+            &history,
             &pins,
             limits,
             &pool.reserver(),
@@ -1790,20 +1791,27 @@ mod tests {
             }
             other => panic!("actual held entry was not collected: {other:?}"),
         }
+        let delta = history.extend_exact(grown).unwrap();
+        assert_eq!(
+            delta.new.iter().map(|slot| slot.index).collect::<Vec<_>>(),
+            [1]
+        );
+        assert!(delta.replace.is_empty() && delta.retire.is_empty());
         let BankPublication::Published {
             transaction: new_transaction,
             extent,
-        } = session.stage_counter_banks(&grown, &pins, stage, &pool.reserver())
+        } = session.stage_counter_banks(&mut history, &pins, stage, &pool.reserver())
         else {
             panic!("actual append did not publish");
         };
         assert_eq!((extent.first, extent.end), (1, 2));
+        assert_eq!(history.counter_consumed_end(), 2);
         assert!(new_transaction > old_transaction);
         fixture.command(b'H');
         fixture.token("HOT");
         match collector.observe(read_banked(
             &session,
-            &grown,
+            &history,
             &pins,
             limits,
             &pool.reserver(),
@@ -1823,7 +1831,7 @@ mod tests {
         assert!(fixture.0.wait().unwrap().success());
         match collector.observe(read_banked(
             &session,
-            &grown,
+            &history,
             &pins,
             limits,
             &pool.reserver(),

@@ -781,54 +781,148 @@ mod tests {
     /// ring sizes) — so its verdict is about the same load, not a bare one.
     #[test]
     fn the_self_probe_and_the_capture_share_one_object_loader() {
-        fn body<'a>(source: &'a str, signature: &str) -> &'a str {
+        fn body<'a>(
+            source: &'a str,
+            signature: &str,
+            end: &str,
+        ) -> std::result::Result<&'a str, String> {
             source
                 .split_once(signature)
-                .unwrap_or_else(|| panic!("{signature} not found"))
+                .ok_or_else(|| format!("{signature} not found"))?
                 .1
-                .split_once("\n}\n")
-                .unwrap()
-                .0
+                .split_once(end)
+                .map(|(body, _)| body)
+                .ok_or_else(|| format!("{signature} body end not found"))
         }
-        let loader = "crate::attach::load_capture_object(";
-        let probe = body(
-            include_str!("uretprobe_hazard.rs"),
-            "#[cfg(target_arch = \"x86_64\")]\nfn probe_kernel_inner()",
-        );
-        assert!(probe.contains(loader), "the self-probe loads bare");
-        assert!(probe.contains("Btf::from_sys_fs()"));
-        assert!(probe.contains("resolve_ring_bytes(None)"));
-        assert!(
-            !probe.contains("EbpfLoader"),
-            "a second loader configuration"
-        );
+
+        fn require(body: &str, markers: &[&str], role: &str) -> std::result::Result<(), String> {
+            for marker in markers {
+                if !body.contains(marker) {
+                    return Err(format!("{role} lacks {marker}"));
+                }
+            }
+            if body.contains("EbpfLoader") {
+                return Err(format!("{role} configures a second loader"));
+            }
+            Ok(())
+        }
+
+        fn contract(probe_source: &str, attach: &str) -> std::result::Result<(), String> {
+            require(
+                body(
+                    probe_source,
+                    "#[cfg(target_arch = \"x86_64\")]\nfn probe_kernel_inner()",
+                    "\n}\n",
+                )?,
+                &[
+                    "crate::attach::load_capture_object(",
+                    "Btf::from_sys_fs()",
+                    "resolve_ring_bytes(None)",
+                ],
+                "self-probe",
+            )?;
+            require(
+                body(attach, "    fn start_inner(", "\n    }\n")?,
+                &["Self::prepare_inner_unlinked("],
+                "capture preparation",
+            )?;
+            require(
+                body(attach, "    fn prepare_inner_unlinked(", "\n    }\n")?,
+                &[
+                    "Self::prepare_inner_unlinked_with_object(",
+                    "            None,",
+                ],
+                "ordinary preparation",
+            )?;
+            require(
+                body(
+                    attach,
+                    "    fn prepare_inner_unlinked_with_object(",
+                    "\n    }\n",
+                )?,
+                &[
+                    "host_btf::shared()",
+                    "let mut ebpf = load_capture_object_bytes_with_images(",
+                    "host.btf()",
+                    "crate::run::resolve_ring_bytes(ring_bytes)",
+                    "discovery_ring_bytes(scope)",
+                    "policy.wants_instance_hooks()",
+                    ".map_or(crate::EBPF_OBJECT, |prepared| prepared.object)",
+                ],
+                "shared preparation",
+            )?;
+            require(
+                body(attach, "pub(crate) fn load_capture_object(", "\n}\n")?,
+                &["load_capture_object_with_images(btf, events_bytes, discovery_bytes, false)"],
+                "self-probe wrapper",
+            )?;
+            require(
+                body(attach, "fn load_capture_object_with_images(", "\n}\n")?,
+                &[
+                    "load_capture_object_bytes_with_images(",
+                    "        btf,\n        events_bytes,\n        discovery_bytes,\n        full_images,\n        crate::EBPF_OBJECT,",
+                ],
+                "embedded-object wrapper",
+            )?;
+            let shared = body(attach, "fn load_capture_object_bytes_with_images(", "\n}\n")?;
+            for setting in [
+                "EbpfLoader::new()",
+                ".btf(Some(btf))",
+                ".allow_unsupported_maps()",
+                ".map_max_entries(\"EVENTS\", events_bytes)",
+                ".map_max_entries(\"DISCOVERY\", discovery_bytes)",
+                ".map_max_entries(\"IMAGE_CONTINUITY\", if full_images { 16_384 } else { 1 })",
+                ".map_max_entries(\"IMAGE_TGID_INDEX\", if full_images { 16_384 } else { 1 })",
+                ".map_max_entries(\"IMAGE_QUERY_REQUESTS\", if full_images { 1_024 } else { 1 })",
+                ".load(object)",
+            ] {
+                if !shared.contains(setting) {
+                    return Err(format!("common loader lacks {setting}"));
+                }
+            }
+            Ok(())
+        }
+
+        let probe = include_str!("uretprobe_hazard.rs");
         let attach = include_str!("attach.rs");
-        let capture = body(attach, "    fn start_inner(");
-        assert!(capture.contains("load_capture_object_with_images("));
-        assert!(
-            !capture.contains("EbpfLoader"),
-            "a second loader configuration"
+        contract(probe, attach).unwrap();
+        let bare_probe = probe.replacen(
+            "crate::attach::load_capture_object(",
+            "bare_probe_object(",
+            1,
         );
-        let wrapper = body(attach, "pub(crate) fn load_capture_object(");
-        assert!(wrapper.contains(
-            "load_capture_object_with_images(btf, events_bytes, discovery_bytes, false)"
-        ));
+        assert_ne!(bare_probe, probe);
         assert!(
-            !wrapper.contains("EbpfLoader"),
-            "a second loader configuration"
+            contract(&bare_probe, attach)
+                .unwrap_err()
+                .contains("self-probe")
         );
-        let shared = body(attach, "fn load_capture_object_with_images(");
-        for setting in [
-            ".btf(Some(btf))",
-            ".allow_unsupported_maps()",
-            ".map_max_entries(\"EVENTS\", events_bytes)",
-            ".map_max_entries(\"DISCOVERY\", discovery_bytes)",
-            ".map_max_entries(\"IMAGE_CONTINUITY\", if full_images { 16_384 } else { 1 })",
-            ".map_max_entries(\"IMAGE_TGID_INDEX\", if full_images { 16_384 } else { 1 })",
-            ".map_max_entries(\"IMAGE_QUERY_REQUESTS\", if full_images { 1_024 } else { 1 })",
-            ".load(crate::EBPF_OBJECT)",
+        for (original, replacement, role) in [
+            (
+                "let mut ebpf = load_capture_object_bytes_with_images(",
+                "let mut ebpf = bare_capture_object(",
+                "shared preparation",
+            ),
+            (
+                "load_capture_object_with_images(btf, events_bytes, discovery_bytes, false)",
+                "bare_probe_object(btf)",
+                "self-probe wrapper",
+            ),
+            (
+                ".map_or(crate::EBPF_OBJECT, |prepared| prepared.object)",
+                ".map_or(other_object, |prepared| prepared.object)",
+                "shared preparation",
+            ),
+            (
+                ".map_max_entries(\"EVENTS\", events_bytes)",
+                ".map_max_entries(\"EVENTS\", 1)",
+                "common loader",
+            ),
         ] {
-            assert!(shared.contains(setting), "{setting}");
+            let mutant = attach.replacen(original, replacement, 1);
+            assert_ne!(mutant, attach, "{role} mutation changes production source");
+            let error = contract(probe, &mutant).expect_err("the changed path must be rejected");
+            assert!(error.contains(role), "{role}: {error}");
         }
     }
 

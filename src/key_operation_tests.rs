@@ -9595,13 +9595,17 @@ fn key_operation_n14_joint_replay_reserves_resources() {
 fn key_operation_n14_small_budget_refuses_n_plus_one() {
     use crate::semantics_edge::resources::{REDUCER_BASE_CHARGE, SEMANTIC_TRANSITION_SCRATCH};
 
-    // Self-calibrate: one Init replay's growth on a fresh reducer.
-    let growth = {
+    // The consumed receipt leaves its grant table allocated and charged.
+    // Measure that retained prepayment separately from one Init's growth.
+    let (registration_prepay, growth) = {
         let mut probe = GuardedScene::new();
+        let baseline = probe.registry.semantic_resource_snapshot().charged_bytes;
         let bootstrap = probe.scene.bootstrap();
         let key = probe.key(1);
-        probe.registry.install_joint_receipt(key.clone(), bootstrap);
+        assert!(probe.registry.install_joint_receipt(key.clone(), bootstrap));
         let (_, id) = probe.register(1);
+        let prepay = probe.registry.semantic_resource_snapshot().charged_bytes - baseline;
+        assert!(prepay > 0, "the consumed grant retains its paid table");
         let shape = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
         let (facts, position) = probe.admit_shape(&shape);
         probe.observe(&key, position, facts);
@@ -9622,16 +9626,16 @@ fn key_operation_n14_small_budget_refuses_n_plus_one() {
         );
         let after = probe.registry.semantic_resource_snapshot().charged_bytes;
         assert!(after > before, "probe: replay reserves");
-        after - before
+        (prepay, after - before)
     };
     eprintln!("calibrated Init growth: {growth}");
 
     let mut guarded = GuardedScene::new();
-    // Room for both reducers + A's full Init + all but 100 bytes of
-    // B's: B refuses by a hair, and A's eventual net release (the
-    // freed machine minus terminal growth) makes room for B's retry.
+    // Room for the retained grant table, both reducers, A's full Init and
+    // all but 100 bytes of B's. A's net release makes room for B's retry.
     guarded.registry.reference_semantic_resource_limit(
-        SEMANTIC_TRANSITION_SCRATCH + 2 * REDUCER_BASE_CHARGE + 2 * growth - 100,
+        SEMANTIC_TRANSITION_SCRATCH + registration_prepay + 2 * REDUCER_BASE_CHARGE + 2 * growth
+            - 100,
     );
     let bootstrap = guarded.scene.bootstrap();
     let a_key = guarded.key(1);
@@ -9645,6 +9649,11 @@ fn key_operation_n14_small_budget_refuses_n_plus_one() {
         .registry
         .install_joint_receipt(b_key.clone(), bootstrap);
     let (_, b_id) = guarded.register(2);
+    assert_eq!(
+        guarded.registry.semantic_resource_snapshot().charged_bytes,
+        SEMANTIC_TRANSITION_SCRATCH + registration_prepay,
+        "both consumed grants reuse one retained allocation, before either reducer exists"
+    );
 
     // A fits.
     let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
@@ -9673,16 +9682,24 @@ fn key_operation_n14_small_budget_refuses_n_plus_one() {
         "the refused head releases its ticket"
     );
     // A's live machine stays useful (refusal is instance-local).
+    let before_completion = guarded.registry.semantic_resource_snapshot().charged_bytes;
     let sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
     assert_eq!(
         guarded.drive_joint(&a_key, a_id, &sign),
         SealApplyOutcome::ReplayedOne
+    );
+    assert!(
+        guarded.registry.semantic_resource_snapshot().charged_bytes < before_completion,
+        "completing A releases live machine storage"
     );
     // Eligible release made room: B's retry fits.
     assert_eq!(
         guarded.drive_joint(&b_key, b_id, &init),
         SealApplyOutcome::ReplayedOne
     );
+    let pool = guarded.registry.semantic_resource_snapshot();
+    let reserve = guarded.registry.semantic_storage_reserver();
+    assert_semantic_pool_refunded_after_drop(guarded, reserve, pool.limit_bytes);
 }
 
 /// N14: fallback replay reserves too, and mid-fallback refusal
@@ -9733,12 +9750,15 @@ fn key_operation_n14_fallback_replay_reserves_and_disposes_on_refusal() {
 
     // --- Small budget: the second replay refuses; live S1 ends
     // Unknown with terminals teed, the rest disposes as history. ---
-    let growth = {
+    let (registration_prepay, growth) = {
         let mut probe = GuardedScene::new();
+        let baseline = probe.registry.semantic_resource_snapshot().charged_bytes;
         let bootstrap = probe.scene.bootstrap();
         let key = probe.key(1);
-        probe.registry.install_joint_receipt(key.clone(), bootstrap);
+        assert!(probe.registry.install_joint_receipt(key.clone(), bootstrap));
         let (_, id) = probe.register(1);
+        let prepay = probe.registry.semantic_resource_snapshot().charged_bytes - baseline;
+        assert!(prepay > 0, "the consumed grant retains its paid table");
         let shape = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
         let (facts, position) = probe.admit_shape(&shape);
         probe.observe(&key, position, facts);
@@ -9759,13 +9779,13 @@ fn key_operation_n14_fallback_replay_reserves_and_disposes_on_refusal() {
         );
         let after = probe.registry.semantic_resource_snapshot().charged_bytes;
         assert!(after > before, "probe: replay reserves");
-        after - before
+        (prepay, after - before)
     };
     let mut guarded = GuardedScene::new();
-    // Room for one Init plus 512 bytes of the second machine-only
-    // growth (1024): the second replay refuses mid-fallback.
+    // Keep the grant table paid, then allow one Init plus 512 bytes of
+    // the second machine-only growth (1024): replay two must refuse.
     guarded.registry.reference_semantic_resource_limit(
-        SEMANTIC_TRANSITION_SCRATCH + REDUCER_BASE_CHARGE + growth + 512,
+        SEMANTIC_TRANSITION_SCRATCH + registration_prepay + REDUCER_BASE_CHARGE + growth + 512,
     );
     let bootstrap = guarded.scene.bootstrap();
     let joint_key = guarded.key(1);
@@ -9773,6 +9793,11 @@ fn key_operation_n14_fallback_replay_reserves_and_disposes_on_refusal() {
         .registry
         .install_joint_receipt(joint_key.clone(), bootstrap);
     let (_, joint_id) = guarded.register(1);
+    assert_eq!(
+        guarded.registry.semantic_resource_snapshot().charged_bytes,
+        SEMANTIC_TRANSITION_SCRATCH + registration_prepay,
+        "registration retains only the calibrated grant table"
+    );
     for shape in [&init7, &init8] {
         let (facts, position) = guarded.admit_shape(shape);
         guarded.observe(&joint_key, position, facts);
@@ -9812,6 +9837,31 @@ fn key_operation_n14_fallback_replay_reserves_and_disposes_on_refusal() {
         .find(|row| row.category == "sign" && row.reason == "unbound")
         .expect("the replayed start's terminal routes to unknown-key");
     assert_eq!((row.unknown, row.active), (1, 0));
+    assert_eq!(guarded.registry.semantic_resource_snapshot().refused, 1);
+    assert_eq!(guarded.scene.adapter.ledger().charged_bytes(), 0);
+    let pool = guarded.registry.semantic_resource_snapshot();
+    let reserve = guarded.registry.semantic_storage_reserver();
+    assert_semantic_pool_refunded_after_drop(guarded, reserve, pool.limit_bytes);
+}
+
+/// Keep a handle to the original pool after all its owners are gone. Filling
+/// exactly the non-scratch headroom detects both leaked and over-refunded leases.
+fn assert_semantic_pool_refunded_after_drop(
+    owner: impl Sized,
+    reserve: crate::semantics_edge::resources::SemanticResourceReserver,
+    limit: usize,
+) {
+    use crate::semantics_edge::resources::SEMANTIC_TRANSITION_SCRATCH;
+
+    drop(owner);
+    let repaid = reserve
+        .reserve(limit - SEMANTIC_TRANSITION_SCRATCH)
+        .expect("every persistent lease returns its exact charge on owner drop");
+    assert!(
+        reserve.reserve(1).is_err(),
+        "the permanently reserved scratch was not over-refunded"
+    );
+    drop(repaid);
 }
 
 #[test]
@@ -11741,9 +11791,17 @@ fn joint_capture_owner_commit_batch_below_prepay_refuses_full_gracefully() {
     let healthy_key = healthy.register(true, 101, 1, healthy_id);
     let healthy_reg = healthy.pool_charged();
     let registration_delta = healthy_reg - healthy_base;
-    assert_eq!(
-        registration_delta, 0,
-        "registration stages no pool bytes; the reducer base lands at first reduction"
+    assert!(
+        registration_delta > 0,
+        "the consumed receipt retains its paid grant-table allocation"
+    );
+    assert!(
+        healthy
+            .coordinator
+            .registry()
+            .instance_semantic_edges()
+            .all(|record| record.semantics.is_none()),
+        "the reducer base still lands only at first reduction"
     );
     let (h_facts, h_pos) = healthy.admit(Some(SESSION));
     // S1Only twin under capture-wide accounting: a silent Joint
@@ -11935,6 +11993,12 @@ fn joint_capture_owner_commit_batch_below_prepay_refuses_full_gracefully() {
         s1_observations_before,
         "the direct twin invents no object facts either"
     );
+    for pipeline in [healthy, s1, refusal] {
+        let registry = pipeline.coordinator.registry();
+        let reserve = registry.semantic_storage_reserver();
+        let limit = registry.semantic_resource_snapshot().limit_bytes;
+        assert_semantic_pool_refunded_after_drop(pipeline, reserve, limit);
+    }
 }
 
 /// Mixed H8-open census via adapter ingest, with N15 at capacity: 1000

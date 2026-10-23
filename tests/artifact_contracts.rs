@@ -1373,31 +1373,49 @@ fn assert_owned_run_pause_internal_contract(
     )
 }
 
-fn assert_static_descriptor_cookie_contract(
-    attach: &str,
-    ebpf: &str,
-    owner: &str,
-    flow: &str,
-) -> Result<(), String> {
-    const COOKIE: &str = "cookie: Some(attach_cookie(slot.index, slot.descriptor_index)),";
-
+fn assert_static_attach_scheduling_contract(attach: &str) -> Result<(), String> {
+    let ordinary = contract_section(
+        attach,
+        "fn attach_targets_observed_with(",
+        "fn attach_targets_observed_with_roots(",
+    )?;
+    require_contract_marker(
+        ordinary,
+        "attach_targets_observed_with_roots(",
+        "ordinary attachment delegates to common root scheduler",
+    )?;
+    require_contract_marker(
+        ordinary,
+        "StaticRoots::Detailed,",
+        "ordinary attachment selects Detailed roots",
+    )?;
     let scheduling = contract_section(
         attach,
-        "fn attach_targets_with(",
+        "fn attach_targets_observed_with_roots(",
         "fn standard_async_catalog",
     )?;
-    require_contract_marker(
+    let return_attach = "attach(return_program, slot, slot_attach_point(slot))";
+    require_before(
         scheduling,
-        "attach(\"p11_return\", slot, slot_attach_point(slot))",
-        "return-before-entry scheduling",
+        "collect::<Result<Vec<_>>>()?",
+        return_attach,
+        "ABI resolution before helper-mediated return attachment",
     )?;
     require_contract_marker(
+        scheduling,
+        "let return_program = if roots == StaticRoots::CounterBanks {\n        \
+         \"p11_counter_bank_return\"\n    } else {\n        \"p11_return\"\n    };",
+        "selected return root",
+    )?;
+    require_before(
+        scheduling,
+        return_attach,
+        "for program in entry_programs {",
+        "return-before-entry attachment",
+    )?;
+    require_before(
         scheduling,
         "for program in entry_programs {",
-        "entry scheduling",
-    )?;
-    require_contract_marker(
-        scheduling,
         "attach(program, slot, slot_attach_point(slot))",
         "selected-entry shared slot attach point",
     )?;
@@ -1406,6 +1424,18 @@ fn assert_static_descriptor_cookie_contract(
         "!return_attached.contains(&slot.index)",
         "return failure entry suppression",
     )?;
+    Ok(())
+}
+
+fn assert_static_descriptor_cookie_contract(
+    attach: &str,
+    ebpf: &str,
+    owner: &str,
+    flow: &str,
+) -> Result<(), String> {
+    const COOKIE: &str = "cookie: Some(attach_cookie(slot.index, slot.descriptor_index)),";
+
+    assert_static_attach_scheduling_contract(attach)?;
     let constructor = contract_section(attach, "fn slot_attach_point(", "fn attach_targets_with(")?;
     if constructor.matches(COOKIE).count() != 1 {
         return Err("slot attach point must construct exactly one shared descriptor cookie".into());
@@ -1631,10 +1661,11 @@ fn ordinary_entry_width_specialization_refuses_before_observation() {
     let attach = read("src/attach.rs");
     let scheduling = between(
         &attach,
-        "fn attach_targets_with(",
+        "fn attach_targets_observed_with_roots(",
         "fn standard_async_catalog",
     );
-    let return_attach = "attach(\"p11_return\", slot, slot_attach_point(slot))";
+    assert_static_attach_scheduling_contract(&attach).unwrap();
+    let return_attach = "attach(return_program, slot, slot_attach_point(slot))";
     require_before(
         scheduling,
         "collect::<Result<Vec<_>>>()?",
@@ -1643,7 +1674,7 @@ fn ordinary_entry_width_specialization_refuses_before_observation() {
     )
     .unwrap();
     let direct_return_attach =
-        scheduling.replacen(return_attach, "attach(\"p11_return\", slot, point)", 1);
+        scheduling.replacen(return_attach, "attach(return_program, slot, point)", 1);
     assert!(
         require_before(
             &direct_return_attach,
@@ -1654,6 +1685,25 @@ fn ordinary_entry_width_specialization_refuses_before_observation() {
         .is_err(),
         "the return attachment must retain the shared slot attach point"
     );
+    let late_resolution = scheduling
+        .replacen("collect::<Result<Vec<_>>>()?", "unresolved_targets()", 1)
+        .replacen(
+            return_attach,
+            &format!("{return_attach}; collect::<Result<Vec<_>>>()?"),
+            1,
+        );
+    assert_ne!(late_resolution, scheduling);
+    assert!(
+        require_before(
+            &late_resolution,
+            "collect::<Result<Vec<_>>>()?",
+            return_attach,
+            "ABI resolution before helper-mediated return attachment",
+        )
+        .unwrap_err()
+        .contains("out of order"),
+        "the common scheduler must resolve every ABI before its first return attachment"
+    );
     assert!(scheduling.contains("entry_program(&slot.semantics, policy, object_has_unsafe, *abi)"));
     let production = between(
         &attach,
@@ -1663,7 +1713,7 @@ fn ordinary_entry_width_specialization_refuses_before_observation() {
     assert!(production.contains("attach_path_for(slot.object)"));
     assert!(production.contains("abi_for(slot.object)"));
     let abi_resolution = "collect::<Result<_>>()?";
-    let observed_attachment = "attach_targets_observed_with(";
+    let observed_attachment = "attach_targets_observed_with_roots(";
     require_before(
         production,
         abi_resolution,
@@ -5655,6 +5705,36 @@ fn descriptor_cookie_and_consumers_source_guard_rejects_contract_regressions() {
     let flow = read("crates/ebpf-common/src/object_flow.rs");
 
     assert_static_descriptor_cookie_contract(&attach, &ebpf, &owner, &flow).unwrap();
+    let scheduling = between(
+        &attach,
+        "fn attach_targets_observed_with_roots(",
+        "fn standard_async_catalog",
+    );
+    let return_attach = "attach(return_program, slot, slot_attach_point(slot))";
+    let entry_attach = "attach(program, slot, slot_attach_point(slot))";
+    let late_return = scheduling
+        .replacen(return_attach, "missing_return()", 1)
+        .replacen(entry_attach, &format!("{entry_attach}; {return_attach}"), 1);
+    for (mutant, reason) in [
+        (late_return, "return-before-entry attachment"),
+        (
+            scheduling.replacen("\"p11_return\"", "\"p11_entry\"", 1),
+            "selected return root",
+        ),
+        (
+            scheduling.replacen("!return_attached.contains(&slot.index)", "false", 1),
+            "return failure entry suppression",
+        ),
+    ] {
+        assert_ne!(
+            mutant, scheduling,
+            "{reason} mutation changes the scheduler"
+        );
+        let changed = attach.replacen(scheduling, &mutant, 1);
+        let error = assert_static_descriptor_cookie_contract(&changed, &ebpf, &owner, &flow)
+            .expect_err("the actual scheduler mutation must violate its contract");
+        assert!(error.contains(reason), "{reason}: {error}");
+    }
     let remove_start = owner
         .find("p11_owner_start_remove(const struct owner_start_key *key, u32 required)")
         .expect("native START remover must exist");

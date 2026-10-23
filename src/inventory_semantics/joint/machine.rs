@@ -850,11 +850,21 @@ impl LiveJointMachine {
             Phase::Ingesting(original) => {
                 budget.spend(1);
                 let identity = original.raw.h0_identity();
-                // A genuinely retained grant also covers a real empty
-                // collection. Its existing H8 COMPLETE/claim may still need
-                // an actual future-input frame; negative disposal cannot
-                // erase that obligation or stand in for this ingestion.
-                if self.grant.is_none() {
+                // Retained COMPLETE/claims need actual ingestion even when
+                // no new wire arrived. A canonically quiet original may use
+                // the existing negative-only path and its mandatory audit.
+                let empty_disposition = if self.grant.is_some() {
+                    retain_on_refusal!(
+                        Phase::Ingesting(original),
+                        original.raw.can_dispose_empty(
+                            coordinator.joint_capture().adapter(),
+                            &self.producers,
+                        )
+                    )
+                } else {
+                    false
+                };
+                if self.grant.is_none() || empty_disposition {
                     coordinator.dispose_prepared_claims_s1();
                     return (Phase::StagingNegative(original), Ok(Step::Continue));
                 }

@@ -828,6 +828,22 @@ impl RawJointQuantum {
         Ok(())
     }
 
+    /// Read-only routing hint for this actual empty original. Disposal and
+    /// the later native/H3 audit still validate their own original custody;
+    /// this cannot authorize a seal, release a claim or consume a terminal.
+    pub(crate) fn can_dispose_empty(
+        &self,
+        adapter: &JournalAdapter,
+        producers: &SessionDrainProducers,
+    ) -> Result<bool, RawQuantumRefusal> {
+        self.validate_preparation(adapter, producers)?;
+        Ok(self.ordered.is_empty()
+            && self.attempted == 0
+            && !self.collection_failed()
+            && !self.resource_refused
+            && adapter.disposed_has_only_future_input(adapter.consumed_frontier()))
+    }
+
     #[cfg(test)]
     pub(crate) fn retained_capacities(&self) -> (usize, usize, usize) {
         (

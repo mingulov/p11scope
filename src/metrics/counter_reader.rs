@@ -2431,46 +2431,116 @@ mod tests {
         }
     }
 
+    // Reuse the existing five-second barrier budget for a WHOLE command or
+    // ledger, child exit, and producer close. Progress cadence is no timeout.
+    const GROWTH_OPERATION_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+    fn growth_reap_until(
+        child: &mut std::process::Child,
+        deadline: std::time::Instant,
+    ) -> std::io::Result<Option<std::process::ExitStatus>> {
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return Ok(Some(status)),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+                Ok(None) => {}
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            std::thread::sleep(remaining.min(std::time::Duration::from_millis(10)));
+        }
+    }
+
     struct GrowthDriver {
         child: std::process::Child,
         output: std::process::ChildStdout,
         buffered: std::collections::VecDeque<u8>,
+        operation_deadline: std::time::Instant,
     }
 
     impl Drop for GrowthDriver {
         fn drop(&mut self) {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+            let pid = self.child.id();
+            let cleanup = match self.child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => {
+                    let _ = self.child.kill();
+                    growth_reap_until(
+                        &mut self.child,
+                        std::time::Instant::now() + GROWTH_OPERATION_BUDGET,
+                    )
+                }
+                Err(error) => Err(error),
+            };
+            if !matches!(cleanup, Ok(Some(_))) {
+                eprintln!(
+                    "owned Counts growth fixture PID {pid} remains pending after bounded kill/reap; cleanup unproved: {cleanup:?}"
+                );
+                if !std::thread::panicking() {
+                    panic!("owned Counts growth fixture PID {pid} cleanup unproved");
+                }
+            }
         }
     }
 
     impl GrowthDriver {
         fn spawn(workload: &std::path::Path, provider: &std::path::Path) -> Self {
             use std::process::{Command, Stdio};
-            let mut child = Command::new(workload)
+            let child = Command::new(workload)
                 .arg(provider)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::inherit())
                 .spawn()
                 .unwrap();
+            Self::from_child(child)
+        }
+
+        fn from_child(mut child: std::process::Child) -> Self {
             let output = child.stdout.take().unwrap();
             let mut fixture = Self {
                 child,
                 output,
                 buffered: std::collections::VecDeque::new(),
+                operation_deadline: std::time::Instant::now() + GROWTH_OPERATION_BUDGET,
             };
             fixture.expect("READY 1 8192");
             fixture
         }
 
+        fn wait_after_done(&mut self) {
+            let pid = self.child.id();
+            let status = growth_reap_until(
+                &mut self.child,
+                std::time::Instant::now() + GROWTH_OPERATION_BUDGET,
+            )
+            .unwrap_or_else(|error| {
+                panic!("owned fixture PID {pid} exit read failed; cleanup unproved: {error}")
+            })
+            .unwrap_or_else(|| {
+                panic!("owned fixture PID {pid} failed to exit after DONE; cleanup unproved")
+            });
+            assert!(
+                status.success(),
+                "owned fixture PID {pid} failed after DONE: {status}"
+            );
+        }
+
         fn line(&mut self) -> String {
             use std::io::Read;
             use std::os::fd::AsRawFd;
-            use std::time::{Duration, Instant};
-            let deadline = Instant::now() + Duration::from_secs(5);
             let mut line = Vec::new();
             loop {
+                let remaining = self
+                    .operation_deadline
+                    .saturating_duration_since(std::time::Instant::now());
+                assert!(
+                    !remaining.is_zero(),
+                    "owned growth fixture whole-operation deadline expired"
+                );
                 if let Some(byte) = self.buffered.pop_front() {
                     if byte == b'\n' {
                         return String::from_utf8(line).unwrap();
@@ -2479,11 +2549,6 @@ mod tests {
                     line.push(byte);
                     continue;
                 }
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                assert!(
-                    !remaining.is_zero(),
-                    "owned growth fixture barrier timed out"
-                );
                 let mut poll = libc::pollfd {
                     fd: self.output.as_raw_fd(),
                     events: libc::POLLIN,
@@ -2528,6 +2593,7 @@ mod tests {
         fn command(&mut self, command: &str) {
             use std::io::Write;
             assert!(command.is_ascii() && command.len() < 79 && !command.contains('\n'));
+            self.operation_deadline = std::time::Instant::now() + GROWTH_OPERATION_BUDGET;
             writeln!(self.child.stdin.as_mut().unwrap(), "{command}").unwrap();
         }
 
@@ -2571,6 +2637,10 @@ mod tests {
         }
     }
 
+    // Native invocation also requires an outer exact-test process deadline
+    // and owned-child kill/reap on failure. Production Session::drop may join
+    // cleanup outside this test helper's control. An outer timeout is FAIL /
+    // cleanup unproved, never successful qualification or permission to retry.
     struct NativeGrowthRun {
         // Kill/reap an owned blocked driver before the Session drops on failure.
         fixture: GrowthDriver,
@@ -2955,12 +3025,16 @@ mod tests {
             );
             self.fixture.command("QUIT");
             self.fixture.expect(&format!("DONE {count}"));
-            assert!(self.fixture.child.wait().unwrap().success());
+            self.fixture.wait_after_done();
             self.sample(); // No extra credit or hidden health failure on driver exit.
             self.session.stop_gate().request_stop();
+            let close_deadline = std::time::Instant::now() + GROWTH_OPERATION_BUDGET;
             self.session
-                .detach_producers_driven(|| false, &mut Vec::new())
-                .unwrap();
+                .detach_producers_driven(
+                    || std::time::Instant::now() >= close_deadline,
+                    &mut Vec::new(),
+                )
+                .expect("producer close failed or exceeded its finite deadline; cleanup unproved");
             assert!(self.session.producers_detached() && self.session.stop_gate().quiescent());
             let starts: aya::maps::HashMap<_, StartKey, CallStart> =
                 aya::maps::HashMap::try_from(self.session.ebpf.map("START").unwrap()).unwrap();
@@ -3038,6 +3112,38 @@ mod tests {
             run.refuse_n_plus_one();
         }
         run.finish();
+    }
+
+    #[test]
+    fn counter_growth_helper_deadlines_refuse_incomplete_cleanup() {
+        use std::process::{Command, Stdio};
+        use std::time::Instant;
+        let child = Command::new("/bin/sh")
+            .args(["-c", "printf 'READY 1 8192\n'; IFS= read -r unused"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut fixture = GrowthDriver::from_child(child);
+        // A whole-operation deadline expires even with a buffered ledger row;
+        // another line must not acquire a fresh five-second allowance.
+        fixture.buffered.extend(b"ROW 0 0 0 0 0 0 0 0\n");
+        fixture.operation_deadline = Instant::now();
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fixture.line())).is_err());
+        fixture.operation_deadline = Instant::now() + GROWTH_OPERATION_BUDGET;
+        fixture.expect("ROW 0 0 0 0 0 0 0 0");
+        assert!(
+            growth_reap_until(&mut fixture.child, Instant::now())
+                .unwrap()
+                .is_none(),
+            "a pending child is not successful exit proof"
+        );
+        fixture.child.kill().unwrap();
+        assert!(
+            growth_reap_until(&mut fixture.child, Instant::now() + GROWTH_OPERATION_BUDGET)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]

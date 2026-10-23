@@ -3292,6 +3292,306 @@ fn privileged_d4_btrfs_same_line_remap_backend_parity() {
     std::fs::remove_dir(parent.join("a.old")).unwrap();
 }
 
+/// A real executable mapping survives unlink with the held file's identity
+/// and bytes intact. Both actual backends first prove its edge, then the
+/// production deleted-path filter must name DeletedMapping without another
+/// confirmation or executable proof. Keep the validated pre-unlink anchor
+/// pass alive: unlink may change ctime, so this does not invent a current pin
+/// or bypass an unchanged-file guard. Whole D4 rows remain separate gates.
+#[test]
+#[ignore = "root Btrfs disk TMPDIR plus eligible BTF/task_vma identity; actual deleted-mapping parity"]
+fn privileged_d4_btrfs_deleted_mapping_backend_parity() {
+    use crate::discovery::identity::{PinnedObjects, test_fixture::real_scan_pin};
+    use crate::discovery::kernel_identity::{
+        AnchorPass, ExaminedCustody, IdentitySession, KernelMemberProbe,
+    };
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::{FileExt as _, MetadataExt as _};
+    use std::sync::{Arc, Mutex};
+
+    // The production OsMemberProbe's delegation, retaining an observable
+    // actual OsConfirmIo so zero post-unlink proof reads are checkable.
+    struct UserspaceProbe<'p>(OsConfirmIo<'p>);
+
+    impl MemberProbe for UserspaceProbe<'_> {
+        fn confirm(
+            &mut self,
+            pid: u32,
+            prove: &BTreeSet<ObjectKey>,
+            budget: &mut CaptureWorkBudget,
+        ) -> Confirmation {
+            confirm_with(&mut self.0, pid, prove, budget)
+        }
+
+        fn stat_ranges(
+            &mut self,
+            pid: u32,
+            ranges: &[(u64, u64)],
+            budget: &mut CaptureWorkBudget,
+        ) -> MappedIdentities {
+            stat_unpinned(&mut self.0, pid, ranges, budget)
+        }
+    }
+
+    fn attribute(
+        child: &SwapChild,
+        snapshot: Vec<MapEntry>,
+        index: &KnownKeyIndex,
+        probe: &mut dyn MemberProbe,
+    ) -> (SweepAttribution, u64) {
+        let mut budget = CaptureWorkBudget::default();
+        assert!(
+            !budget.has_collection_work(),
+            "actual kernel path, no scoped fallback"
+        );
+        let out = attribute_unselected(
+            &[(child.pid as u32, snapshot)],
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            index,
+            probe,
+            &mut budget,
+        );
+        (out, budget.work_units_count())
+    }
+
+    crate::attach::identity_iter::ensure_kernel_identity_btf()
+        .expect("required kernel identity capability; refusal cannot qualify");
+    let btf = aya::Btf::from_sys_fs().expect("readable host BTF");
+    let dir = tempfile::tempdir().unwrap();
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    let c_parent = std::ffi::CString::new(dir.path().as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: a valid path and writable statfs buffer, read only on success.
+    assert_eq!(
+        unsafe { libc::statfs(c_parent.as_ptr(), stat.as_mut_ptr()) },
+        0
+    );
+    // SAFETY: initialized by the successful statfs above.
+    let magic = unsafe { stat.assume_init().f_type } as u64 & 0xffff_ffff;
+    assert_eq!(magic, 0x9123_683e, "actual fixture TMPDIR must be Btrfs");
+    let path = dir.path().join("libdeleted.so");
+    let bytes = vec![0x5au8; 8192];
+    std::fs::write(&path, &bytes).unwrap();
+    let held_file = std::fs::File::open(&path).unwrap();
+    let held = held_file.metadata().unwrap();
+    let physical_id = (held.dev(), held.ino());
+    let mut held_bytes = vec![0; bytes.len()];
+    held_file.read_exact_at(&mut held_bytes, 0).unwrap();
+    assert_eq!(held_bytes, bytes);
+
+    let child = SwapChild::spawn(&path);
+    let range = (child.address, child.address + 4096);
+    let before = child.maps();
+    let position = before
+        .iter()
+        .position(|entry| (entry.start, entry.end) == range)
+        .expect("the child's actual executable mapping");
+    assert_eq!(before[position].permissions, *b"r-xp");
+    let key = ObjectKey::of(&before[position]);
+    let digest = p11scope_manifest::identity::hex(&Sha256::digest(&bytes));
+    let pins: PinnedObjects = real_scan_pin(&path, Some(key), 0, &digest);
+    let object = pins
+        .pinned()
+        .next()
+        .expect("actual pre-unlink held-file pin")
+        .id;
+    let pinned = pins.file_for(object).unwrap().metadata().unwrap();
+    assert_eq!((pinned.dev(), pinned.ino()), physical_id);
+    let (userspace_index, refused) = KnownKeyIndex::build(
+        [(key, Some(object))],
+        &BTreeMap::from([(key, object)]),
+        [],
+        &pins,
+    );
+    assert!(refused.is_empty(), "{refused:?}");
+    assert!(userspace_index.map_files_keys().contains(&key));
+    let mut kernel_index = userspace_index.clone();
+    let probe_dir = tempfile::tempdir().unwrap();
+    let mut session = IdentitySession::probe_and_load(&btf, probe_dir.path())
+        .expect("actual strict-loaded kernel session; no refused/fallback positive");
+    let owner = ReservationOwner::for_examined(
+        SegmentPolicy::try_snapshot(0, 0).expect("actual FD census"),
+        0,
+    );
+    let mut custody = ExaminedCustody::new(owner, BTreeMap::new());
+    custody
+        .reconcile(SegmentPolicy::try_snapshot(1, 1).expect("actual confirmation FD census"))
+        .expect("shared physical reservation owner");
+    let pass = AnchorPass::prepare(&pins, [(key, object)], custody);
+    assert!(pass.fallback.is_empty(), "{:?}", pass.fallback);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut installed = session
+        .install_anchors(pass, 1, deadline)
+        .expect("install actual pre-unlink held-file anchors");
+    let userspace_trace = Arc::new(Mutex::new(ProofTrace::default()));
+    let kernel_trace = Arc::new(Mutex::new(ProofTrace::default()));
+    let mut userspace_probe =
+        UserspaceProbe(OsConfirmIo::with_pool(None).observing(userspace_trace.clone()));
+    let mut kernel_probe = KernelMemberProbe::new(
+        &mut installed,
+        OsConfirmIo::with_pool(None).observing(kernel_trace.clone()),
+        deadline,
+    );
+    kernel_probe
+        .install_expectations(&mut kernel_index)
+        .expect("actual validated pre-unlink anchor expectations");
+    assert!(
+        kernel_index
+            .match_slots
+            .get(&key)
+            .is_some_and(|slots| !slots.is_empty()),
+        "the held provider has no validated actual kernel slot"
+    );
+    let (userspace_before, _) = attribute(
+        &child,
+        before.clone(),
+        &userspace_index,
+        &mut userspace_probe,
+    );
+    let (kernel_before, _) = attribute(&child, before.clone(), &kernel_index, &mut kernel_probe);
+    for (backend, out) in [("userspace", &userspace_before), ("kernel", &kernel_before)] {
+        assert_eq!(
+            out.members
+                .iter()
+                .map(|member| member.pid)
+                .collect::<Vec<_>>(),
+            [child.pid as u32],
+            "{backend}: {:?}",
+            out.member_losses
+        );
+        assert_eq!(
+            out.members[0]
+                .objects
+                .iter()
+                .map(|matched| (matched.key, matched.object))
+                .collect::<Vec<_>>(),
+            [(key, object)],
+            "{backend}: exact pre-unlink provider edge"
+        );
+        assert!(out.losses.is_empty(), "{backend}: {:?}", out.member_losses);
+        assert_eq!(
+            out.probed, 1,
+            "{backend}: nonempty pre-unlink executable demand"
+        );
+    }
+    assert_eq!(userspace_before.members, kernel_before.members);
+    {
+        let mut trace = userspace_trace.lock().unwrap();
+        assert_eq!(
+            trace.reads.len(),
+            1,
+            "positive twin observes an actual userspace proof read"
+        );
+        let (pid, start, end, _, _) = &trace.reads[0];
+        assert_eq!((*pid, *start, *end), (child.pid as u32, range.0, range.1));
+        trace.reads.clear();
+    }
+    assert!(
+        kernel_trace.lock().unwrap().reads.is_empty(),
+        "required kernel positive used userspace proof reads"
+    );
+
+    // Preserve the same live VMA and validated installation across unlink;
+    // only the production path-eligibility fact changes for this observation.
+    std::fs::remove_file(&path).unwrap();
+    assert!(!path.exists(), "the owned pathname really was unlinked");
+    let after = child.maps();
+    let mut expected = before;
+    expected[position]
+        .raw_path
+        .as_mut()
+        .expect("the mapped pathname")
+        .extend_from_slice(b" (deleted)");
+    assert_eq!(
+        after, expected,
+        "same live mapping except the actual deleted-path flag"
+    );
+    assert!(
+        is_caller_range(&after[position]),
+        "the executable caller population is nonempty"
+    );
+    let held_after = held_file.metadata().unwrap();
+    assert_eq!((held_after.dev(), held_after.ino()), physical_id);
+    assert_eq!(
+        held_after.nlink(),
+        0,
+        "the live held file has no remaining pathname"
+    );
+    assert_eq!(held_after.len(), bytes.len() as u64);
+    held_file.read_exact_at(&mut held_bytes, 0).unwrap();
+    assert_eq!(
+        held_bytes, bytes,
+        "unlink preserved the independently held file's bytes"
+    );
+
+    let (userspace_after, userspace_work) = attribute(
+        &child,
+        after.clone(),
+        &userspace_index,
+        &mut userspace_probe,
+    );
+    let (kernel_after, kernel_work) = attribute(&child, after, &kernel_index, &mut kernel_probe);
+    for (backend, out, work) in [
+        ("userspace", &userspace_after, userspace_work),
+        ("kernel", &kernel_after, kernel_work),
+    ] {
+        assert!(out.members.is_empty(), "{backend}: {:?}", out.members);
+        assert_eq!(
+            out.losses,
+            BTreeMap::from([(AttributionLoss::DeletedMapping, 1)]),
+            "{backend}: {:?}",
+            out.member_losses
+        );
+        assert_eq!(
+            out.member_losses
+                .get(&(child.pid as u32))
+                .map(|(loss, _)| *loss),
+            Some(AttributionLoss::DeletedMapping)
+        );
+        assert_eq!(
+            out.probed, 0,
+            "{backend}: deleted mapping needs no confirmation"
+        );
+        assert_eq!(
+            work, 0,
+            "{backend}: deleted mapping needs no executable proof work"
+        );
+        assert_eq!(out.unavailable, 0);
+        assert!(
+            out.exited.is_empty(),
+            "{backend}: the mapped child is still alive"
+        );
+    }
+    assert_eq!(userspace_after.losses, kernel_after.losses);
+    assert!(
+        userspace_trace.lock().unwrap().reads.is_empty(),
+        "deleted userspace leg read a map_files proof"
+    );
+    assert!(
+        kernel_trace.lock().unwrap().reads.is_empty(),
+        "deleted kernel leg read a userspace proof"
+    );
+    drop((userspace_probe, kernel_probe));
+    drop(installed);
+    let fallback = session.fallback_totals();
+    assert_eq!(fallback.passes, 0, "{fallback:?}");
+    assert_eq!(fallback.pids, 0, "{fallback:?}");
+    assert_eq!(fallback.keys, 0, "{fallback:?}");
+    assert!(fallback.first_reason.is_none(), "{fallback:?}");
+    eprintln!(
+        "D4_BTRFS_DELETED caller={} userspace=1/0 kernel=1/0 deleted_mapping=1/1 \
+         after_probed=0/0 after_proof_reads=0/0 held_file_stable=true generation=1 fallback=none",
+        child.pid
+    );
+    drop(child);
+    drop((session, pins, held_file));
+    probe_dir
+        .close()
+        .expect("remove owned kernel probe directory");
+    dir.close()
+        .expect("remove owned unlinked-file fixture directory");
+}
+
 /// Root with a loop-mounted ext4: there a held file's maps key is its
 /// identity, so no per-range stat runs at all. Before A6 a process that
 /// mapped the file only read-only was attributed on the key alone; now

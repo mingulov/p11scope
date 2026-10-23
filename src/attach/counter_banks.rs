@@ -460,11 +460,13 @@ fn stage_requirements(
             n.checked_add(cpus.checked_mul(4 * size_of::<p11scope_ebpf_common::CountStats>())?)
         })
         .ok_or(BankRefusal::Budget)?;
-    // NativeIo admits only Singles + OneProcess: each fresh endpoint retains
-    // two BPF-link FDs, with one transient perf FD during sequential attachment.
+    // NativeIo admits only OneProcess: Singles retains two BPF-link FDs
+    // per endpoint, with one transient perf FD during sequential attachment.
+    // Multi can bisect to the same two-leaf-per-endpoint maximum and needs
+    // no perf FD, so this same bound conservatively admits either backend.
     // Provider owners share Arc<File>; observed_open already counts old maps,
     // links and providers. Map bytes above still cover every possible CPU.
-    // A different backend/scope needs its own FD fanout bound before admission.
+    // A different scope needs its own FD fanout bound before admission.
     // The caller reservation and readonly OS check remain independent; neither
     // atomically reserves FDs, and later EMFILE uses paid rollback/custody.
     let fds = fresh
@@ -476,24 +478,150 @@ fn stage_requirements(
     Ok((retained, transient, metadata, fds))
 }
 
-// Inert signatures for the private Multi Counts controls. Admission remains
-// refused until the checked group/storage implementation is supplied.
+fn counter_allocation_bytes<T>(items: usize) -> Option<usize> {
+    if items == 0 {
+        Some(0)
+    } else {
+        items
+            .checked_mul(size_of::<T>())?
+            .checked_add(OWNED_ALLOCATION_PADDING)
+    }
+}
+
+fn counter_vec_peak_bytes<T>(items: usize) -> Option<usize> {
+    if items == 0 {
+        return Some(0);
+    }
+    // Grow-by-two Vec backing, including simultaneous old/new requests and
+    // the largest minimum nonzero capacity (u8's eight elements).
+    items
+        .max(8)
+        .checked_mul(3)?
+        .checked_mul(size_of::<T>())?
+        .checked_add(3 * OWNED_ALLOCATION_PADDING)
+}
+
+fn counter_tree_bytes<K, V>(items: usize) -> Option<usize> {
+    // Same pinned Rust1.98.1 B=6 internal-node bound as resources.rs. One
+    // whole internal node per entry also dominates a sparse root/leaf tree.
+    if std::mem::align_of::<K>() > 8 || std::mem::align_of::<V>() > 8 {
+        return None;
+    }
+    let node = size_of::<K>()
+        .checked_add(size_of::<V>())?
+        .checked_mul(11)?
+        .checked_add(16 + 12 * size_of::<usize>())?
+        .checked_next_multiple_of(8)?
+        .checked_add(OWNED_ALLOCATION_PADDING)?;
+    items.checked_mul(node)
+}
+
+/// Additional Multi storage, beyond the common Counts stage: retained registry
+/// backing, transient grouping/attach/rollback work, and retained leaf metadata.
+/// This borrows caller facts and performs no allocation or native operation.
 fn counter_multi_requirements(
-    _fresh: &[Slot],
-    _old_link_len: usize,
-    _old_link_capacity: usize,
+    fresh: &[Slot],
+    old_link_len: usize,
+    old_link_capacity: usize,
 ) -> Result<(usize, usize, usize), BankRefusal> {
-    Err(BankRefusal::Budget)
+    if fresh.is_empty() || old_link_len > old_link_capacity {
+        return Err(BankRefusal::Budget);
+    }
+    (|| -> Option<(usize, usize, usize)> {
+        let count = fresh.len();
+        let leaves = count.checked_mul(2)?;
+        let new_len = old_link_len.checked_add(leaves)?;
+        // Generic whole-bundle rollback rebuilds the retained Vec by pushing;
+        // its backing must remain paid even after every candidate FD closes.
+        let rollback_capacity = old_link_len.max(4).checked_mul(2)?;
+        let retained_capacity = old_link_capacity.max(new_len).max(rollback_capacity);
+        let retained = counter_allocation_bytes::<super::RegisteredLink>(retained_capacity)?;
+        let metadata = leaves.checked_mul(
+            size_of::<u32>()
+                .checked_add(size_of::<std::os::fd::OwnedFd>())?
+                .checked_add(2 * OWNED_ALLOCATION_PADDING)?
+                .checked_add(size_of::<super::OwnedLink>() + OWNED_ALLOCATION_PADDING)?
+                // attach_failures retains bounded per-site text. Three tuple
+                // requests per entry dominate cumulative Vec growth/overlap;
+                // earlier consumed extents keep their same metadata payment.
+                .checked_add(super::COUNTER_GROUP_DIAGNOSTIC_BYTES + OWNED_ALLOCATION_PADDING)?
+                .checked_add(3 * size_of::<(u32, String)>() + 3 * OWNED_ALLOCATION_PADDING)?,
+        )?;
+
+        let groups = counter_vec_peak_bytes::<super::StaticGroup>(count)?;
+        let paths =
+            count.checked_mul(super::COUNTER_ATTACH_PATH_BYTES + OWNED_ALLOCATION_PADDING)?;
+        let build = counter_tree_bytes::<
+            (std::path::PathBuf, &'static str),
+            Vec<super::StaticGroupMember>,
+        >(count)?
+        .checked_add(groups)?
+        .checked_add(counter_vec_peak_bytes::<super::StaticGroupMember>(leaves)?)?
+        .checked_add(count.checked_mul(2 * OWNED_ALLOCATION_PADDING)?)?
+        .checked_add(paths.checked_mul(2)?)?;
+        // Group building ends before cookie/program indexes and bisect work
+        // begin. Charge their maximum, rather than summing disjoint phases.
+        let live_members =
+            counter_allocation_bytes::<super::StaticGroupMember>(count.checked_mul(4)?)?
+                .checked_add(count.checked_mul(OWNED_ALLOCATION_PADDING)?)?;
+        let runtime = [
+            groups,
+            live_members,
+            paths,
+            counter_tree_bytes::<u64, u32>(count)?,
+            counter_tree_bytes::<&'static str, ()>(2)?,
+            counter_tree_bytes::<&'static str, std::os::fd::RawFd>(2)?,
+            counter_tree_bytes::<usize, ()>(count)?,
+            counter_vec_peak_bytes::<(u64, u64)>(count.checked_mul(4)?)?,
+            counter_vec_peak_bytes::<&super::StaticGroupMember>(count)?,
+            counter_vec_peak_bytes::<usize>(count.checked_mul(3)?)?,
+            counter_vec_peak_bytes::<Vec<usize>>(count)?,
+            counter_vec_peak_bytes::<p11scope_bpf_multi::RefusedSite>(leaves)?,
+            counter_vec_peak_bytes::<super::SlotCompletion>(count)?,
+            counter_vec_peak_bytes::<super::MultiLinkBundle<()>>(leaves)?,
+            counter_vec_peak_bytes::<super::pid_continuity::AttachRound>(count)?,
+            counter_vec_peak_bytes::<u32>(count.checked_mul(4)?)?,
+        ]
+        .into_iter()
+        .try_fold(0usize, |sum, bytes| sum.checked_add(bytes))?;
+        let deep_members = fresh.iter().try_fold(0usize, |sum, slot| {
+            // Inline Slot fields already live in the member Vec above. Moving
+            // or sorting that Vec never clones its owned string backing.
+            sum.checked_add(stage_slot_bytes(slot)?.checked_sub(size_of::<Slot>())?)
+        })?;
+        let rollback = [
+            counter_vec_peak_bytes::<super::RegisteredLink>(new_len.checked_mul(2)?)?,
+            counter_vec_peak_bytes::<bool>(new_len)?,
+            counter_tree_bytes::<u32, ()>(leaves)?,
+            counter_allocation_bytes::<super::RegisteredLink>(old_link_capacity)?,
+        ]
+        .into_iter()
+        .try_fold(0usize, |sum, bytes| sum.checked_add(bytes))?;
+        let transient = build.max(runtime).checked_add(deep_members)?.max(rollback);
+        Some((retained, transient, metadata))
+    })()
+    .ok_or(BankRefusal::Budget)
 }
 
 fn check_counter_multi_reservation(
-    _envelope: BankReservation,
-    _base: (usize, usize, usize, usize),
-    _fresh: &[Slot],
-    _old_link_len: usize,
-    _old_link_capacity: usize,
+    envelope: BankReservation,
+    base: (usize, usize, usize, usize),
+    fresh: &[Slot],
+    old_link_len: usize,
+    old_link_capacity: usize,
 ) -> Result<(), BankRefusal> {
-    Err(BankRefusal::Budget)
+    let extra = counter_multi_requirements(fresh, old_link_len, old_link_capacity)?;
+    let retained = base.0.checked_add(extra.0).ok_or(BankRefusal::Budget)?;
+    let transient = base.1.checked_add(extra.1).ok_or(BankRefusal::Budget)?;
+    let metadata = base.2.checked_add(extra.2).ok_or(BankRefusal::Budget)?;
+    if envelope.retained_bytes < retained
+        || envelope.transient_bytes < transient
+        || envelope.metadata_bytes < metadata
+        || envelope.file_descriptors < base.3
+    {
+        return Err(BankRefusal::Budget);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1269,6 +1397,15 @@ impl<'a> CounterPreparation<'a> {
         envelope: BankReservation,
         reserve: &SemanticResourceReserver,
     ) -> Result<Self> {
+        Self::new_with_backend(object, envelope, reserve, super::AttachBackend::Singles)
+    }
+
+    fn new_with_backend(
+        object: &'a [u8],
+        envelope: BankReservation,
+        reserve: &SemanticResourceReserver,
+        backend: super::AttachBackend,
+    ) -> Result<Self> {
         ensure!(
             env!("P11SCOPE_COUNTER_BANK_PROOF_ENABLED") == "1",
             "private Counts bank artifact was not selected at build time"
@@ -1380,7 +1517,7 @@ impl<'a> CounterPreparation<'a> {
                 keepalive,
                 cpus,
                 geometry,
-                backend: super::AttachBackend::Singles,
+                backend,
                 link_staging: Arc::new(AtomicU64::new(0)),
             },
             _scratch: scratch,
@@ -1392,11 +1529,9 @@ impl<'a> CounterPreparation<'a> {
         ebpf: &mut Ebpf,
         backend: super::AttachBackend,
     ) -> Result<()> {
-        ensure!(
-            backend == super::AttachBackend::Singles
-                && self.banks.backend == super::AttachBackend::Singles,
-            "private Multi Counts root loading is not implemented"
-        );
+        self.banks
+            .validate_backend(backend)
+            .map_err(|_| anyhow::anyhow!("private counter preparation backend mismatch"))?;
         validate_maps(ebpf, self.banks.geometry)
             .map_err(|failure| anyhow::anyhow!("private counter map refusal: {failure:?}"))?;
         // No caller or lifecycle link exists yet, and all routing maps are
@@ -1443,8 +1578,12 @@ impl<'a> CounterPreparation<'a> {
                 .program_mut(program)
                 .context("private counter root")?
                 .try_into()?;
-            root.load()
-                .with_context(|| format!("loading private counter root {program}"))?;
+            if super::loads_with_multi_flag(backend, program) {
+                root.load_multi()
+            } else {
+                root.load()
+            }
+            .with_context(|| format!("loading private counter root {program}"))?;
         }
         Ok(())
     }
@@ -1783,7 +1922,11 @@ impl BankIo for NativeIo<'_> {
         old_capacity: usize,
     ) -> Result<(), BankRefusal> {
         if self.session.mutation_stopped()
-            || self.session.backend != super::AttachBackend::Singles
+            || self
+                .session
+                .counter_banks
+                .as_ref()
+                .is_none_or(|banks| banks.validate_backend(self.session.backend).is_err())
             || !matches!(
                 self.session.uprobe_scope,
                 aya::programs::uprobe::UProbeScope::OneProcess(_)
@@ -1835,6 +1978,15 @@ impl BankIo for NativeIo<'_> {
             || self.reservation.file_descriptors < fds
         {
             return Err(BankRefusal::Budget);
+        }
+        if self.session.backend == super::AttachBackend::Multi {
+            check_counter_multi_reservation(
+                self.reservation,
+                (retained, transient, metadata, fds),
+                &slots[fresh.first as usize..fresh.end as usize],
+                self.session.links.len(),
+                self.session.links.capacity(),
+            )?;
         }
         check_fd_headroom_with(fds, read_fd_snapshot)?;
         validate_provider_union(slots, published, fresh, self.objects, self.custody, false)
@@ -1942,13 +2094,18 @@ impl BankIo for NativeIo<'_> {
             .as_ref()
             .ok_or(BankRefusal::Shape)?;
         let _stage = banks.begin_link_stage((u64::from(first) << 32) | u64::from(end))?;
-        let (failed, completed) = self
+        let (failed, mut completed) = self
             .session
             .attach_targets(slots, self.objects)
             .map_err(|_| BankRefusal::Links)?;
+        completed.sort_unstable_by_key(|(slot, _)| *slot);
         let sides = self.session.current_static_sides();
         if !failed.is_empty()
             || completed.len() != slots.len()
+            || !completed
+                .iter()
+                .map(|(slot, _)| *slot)
+                .eq(slots.iter().map(|slot| slot.index))
             || self.objects.check_unchanged() != Ok(true)
             || slots.iter().any(|slot| {
                 !sides.contains(&(slot.index, super::ProbeSide::Entry))
@@ -1968,7 +2125,15 @@ impl BankIo for NativeIo<'_> {
     ) -> CandidateCheck {
         if validate_maps(&self.session.ebpf, self.geometry).is_err()
             || self.session.mutation_stopped()
-            || self.session.backend != super::AttachBackend::Singles
+            || self
+                .session
+                .counter_banks
+                .as_ref()
+                .is_none_or(|banks| banks.validate_backend(self.session.backend).is_err())
+            || !matches!(
+                self.session.uprobe_scope,
+                aya::programs::uprobe::UProbeScope::OneProcess(_)
+            )
             || self.objects.check_unchanged() != Ok(true)
         {
             return CandidateCheck::Contradictory;
@@ -2150,8 +2315,7 @@ impl BankIo for NativeIo<'_> {
 }
 
 impl Session {
-    /// A new private Session only. Multi stays inert until its admission and
-    /// native ownership path have passed the focused behavior controls.
+    /// A new private Session only, with its backend fixed before root loading.
     pub(crate) fn prepare_counter_banks_with_backend(
         scope: &Scope,
         object: &[u8],
@@ -2164,7 +2328,55 @@ impl Session {
                 Self::prepare_counter_banks(scope, object, reservation, reserve)
             }
             super::AttachBackend::Multi => {
-                anyhow::bail!("private Multi Counts Session preparation is not implemented")
+                ensure!(
+                    matches!(scope, Scope::Pid(pid) if *pid != 0),
+                    "private bank proof requires one PID scope"
+                );
+                let preparation =
+                    CounterPreparation::new_with_backend(object, reservation, reserve, backend)?;
+                let selected = super::select_session_backend(
+                    super::BackendSelection::Multi,
+                    true,
+                    super::multi_functional_probe,
+                    super::kernel_multi_pid_filter,
+                )?;
+                preparation
+                    .banks
+                    .validate_backend(selected.backend)
+                    .map_err(|_| anyhow::anyhow!("private counter preparation backend mismatch"))?;
+                let (mut session, prepared_instance) = Self::prepare_inner_unlinked_with_object(
+                    scope,
+                    CapturePolicy::AggregateOnly,
+                    None,
+                    None,
+                    None,
+                    backend,
+                    None,
+                    Some(preparation),
+                )?;
+                let banks = session
+                    .counter_banks
+                    .as_ref()
+                    .context("private counter owner")?;
+                banks
+                    .validate_unlinked_backend(session.backend, &session.links)
+                    .map_err(|_| {
+                        anyhow::anyhow!("private counter backend or active registry mismatch")
+                    })?;
+                session.selection = super::BackendSelection::Multi;
+                session.links = super::activate_after_preparation_with(Ok(()), || {
+                    super::attach_lifecycle_with(
+                        &mut session.ebpf,
+                        Self::attach_lifecycle_program,
+                        |ebpf, _, link| super::detach_registered_link(ebpf, link),
+                    )
+                })?;
+                session.instance = super::InstanceTracking::start(
+                    &mut session.ebpf,
+                    &session.image_coverage,
+                    prepared_instance,
+                );
+                Ok(session)
             }
         }
     }
@@ -2243,16 +2455,28 @@ impl Session {
 }
 
 impl CounterBanks {
-    fn validate_backend(&self, _backend: super::AttachBackend) -> Result<(), BankRefusal> {
-        Err(BankRefusal::Topology)
+    pub(super) fn validate_backend(
+        &self,
+        backend: super::AttachBackend,
+    ) -> Result<(), BankRefusal> {
+        if self.backend == backend {
+            Ok(())
+        } else {
+            Err(BankRefusal::Topology)
+        }
     }
 
     fn validate_unlinked_backend(
         &self,
-        _backend: super::AttachBackend,
-        _links: &[super::RegisteredLink],
+        backend: super::AttachBackend,
+        links: &[super::RegisteredLink],
     ) -> Result<(), BankRefusal> {
-        Err(BankRefusal::Topology)
+        self.validate_backend(backend)?;
+        if links.is_empty() {
+            Ok(())
+        } else {
+            Err(BankRefusal::Allocated)
+        }
     }
 
     fn begin_link_stage(&self, word: u64) -> Result<LinkStage, BankRefusal> {

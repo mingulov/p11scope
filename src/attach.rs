@@ -2050,7 +2050,6 @@ struct StaticGroupMember {
 struct StaticGroup {
     path: PathBuf,
     entry_program: &'static str,
-    #[cfg_attr(not(test), allow(dead_code))] // Inert Counts signature; Detailed is unchanged.
     return_program: &'static str,
     members: Vec<StaticGroupMember>,
 }
@@ -2928,6 +2927,55 @@ fn group_static_slots(
     object_has_unsafe: bool,
     attach_targets: &BTreeMap<u32, (PathBuf, ElfAbi)>,
 ) -> Vec<StaticGroup> {
+    group_static_slots_with_roots(
+        slots,
+        policy,
+        object_has_unsafe,
+        attach_targets,
+        StaticRoots::Detailed,
+    )
+    .expect("every selected Detailed target has retained pinned facts")
+}
+
+// An opened Linux FD has at most ten decimal digits. Include the CString NUL
+// in the bound; only the original pinned /proc/self/fd path reaches Counts.
+const COUNTER_ATTACH_PATH_BYTES: usize = b"/proc/self/fd/".len() + 10 + 1;
+const COUNTER_GROUP_DIAGNOSTIC_BYTES: usize = 256;
+
+fn counter_attach_path_is_valid(path: &Path) -> bool {
+    path.as_os_str()
+        .as_encoded_bytes()
+        .strip_prefix(b"/proc/self/fd/")
+        .is_some_and(|digits| {
+            !digits.is_empty() && digits.len() <= 10 && digits.iter().all(u8::is_ascii_digit)
+        })
+}
+
+fn group_static_slots_with_roots(
+    slots: &[Slot],
+    policy: CapturePolicy,
+    object_has_unsafe: bool,
+    attach_targets: &BTreeMap<u32, (PathBuf, ElfAbi)>,
+    roots: StaticRoots,
+) -> Result<Vec<StaticGroup>> {
+    if roots == StaticRoots::CounterBanks {
+        if policy != CapturePolicy::AggregateOnly || object_has_unsafe {
+            bail!("private Counts grouping requires its fixed aggregate-only roots");
+        }
+        for slot in slots {
+            let (path, abi) = attach_targets
+                .get(&slot.index)
+                .context("private Counts target facts missing before grouping")?;
+            if *abi != ElfAbi::Lp64 || !counter_attach_path_is_valid(path) {
+                bail!("private Counts grouping requires an LP64 retained-FD attach path");
+            }
+        }
+    }
+    let return_program = if roots == StaticRoots::CounterBanks {
+        "p11_counter_bank_return"
+    } else {
+        "p11_return"
+    };
     let mut by_key: BTreeMap<(PathBuf, &'static str), Vec<StaticGroupMember>> = BTreeMap::new();
     for slot in slots {
         let (path, abi) = attach_targets
@@ -2940,7 +2988,11 @@ fn group_static_slots(
         else {
             unreachable!("static attach points are absolute with cookies");
         };
-        let program = entry_program(&slot.semantics, policy, object_has_unsafe, *abi);
+        let program = if roots == StaticRoots::CounterBanks {
+            "p11_counter_bank_entry"
+        } else {
+            entry_program(&slot.semantics, policy, object_has_unsafe, *abi)
+        };
         by_key
             .entry((path.clone(), program))
             .or_default()
@@ -2950,57 +3002,133 @@ fn group_static_slots(
                 cookie,
             });
     }
-    by_key
+    Ok(by_key
         .into_iter()
         .map(|((path, entry_program), mut members)| {
             members.sort_by_key(|member| member.slot.index);
             StaticGroup {
                 path,
                 entry_program,
-                return_program: "p11_return",
+                return_program,
                 members,
             }
         })
-        .collect()
+        .collect())
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // Private Multi Counts remains unselected/inert.
-fn group_static_slots_with_roots(
-    _slots: &[Slot],
-    _policy: CapturePolicy,
-    _object_has_unsafe: bool,
-    _attach_targets: &BTreeMap<u32, (PathBuf, ElfAbi)>,
-    _roots: StaticRoots,
-) -> Result<Vec<StaticGroup>> {
-    bail!("private Multi Counts grouping is not implemented")
-}
-
-#[cfg_attr(not(test), allow(dead_code))] // No allocation before checked Multi admission exists.
 fn reserve_counter_multi_link_capacity(
-    _links: &mut Vec<RegisteredLink>,
-    _fresh_len: usize,
+    links: &mut Vec<RegisteredLink>,
+    fresh_len: usize,
 ) -> std::result::Result<(), counter_banks::BankRefusal> {
-    Err(counter_banks::BankRefusal::Budget)
+    let extra = fresh_len
+        .checked_mul(2)
+        .ok_or(counter_banks::BankRefusal::Budget)?;
+    links
+        .len()
+        .checked_add(extra)
+        .ok_or(counter_banks::BankRefusal::Budget)?;
+    links
+        .try_reserve_exact(extra)
+        .map_err(|_| counter_banks::BankRefusal::Budget)
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // Refuse before the native callback or registry mutation.
 fn retain_counter_multi_leaf(
-    _links: &mut Vec<RegisteredLink>,
-    _pairs: &mut pid_continuity::PairBook,
-    _program: &'static str,
-    _sites: &[(u64, u64)],
-    _slots_by_cookie: &BTreeMap<u64, u32>,
-    _attach: impl FnOnce() -> io::Result<OwnedFd>,
+    links: &mut Vec<RegisteredLink>,
+    pairs: &mut pid_continuity::PairBook,
+    program: &'static str,
+    sites: &[(u64, u64)],
+    slots_by_cookie: &BTreeMap<u64, u32>,
+    attach: impl FnOnce() -> io::Result<OwnedFd>,
 ) -> io::Result<()> {
-    Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP))
+    if sites.is_empty()
+        || !matches!(
+            program,
+            "p11_counter_bank_entry" | "p11_counter_bank_return"
+        )
+    {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    if links.len() == links.capacity() {
+        return Err(io::Error::from_raw_os_error(libc::ENOMEM));
+    }
+    let mut slots = Vec::new();
+    slots
+        .try_reserve_exact(sites.len())
+        .map_err(|_| io::Error::from_raw_os_error(libc::ENOMEM))?;
+    for &(_, cookie) in sites {
+        let slot = slots_by_cookie
+            .get(&cookie)
+            .copied()
+            .filter(|slot| *slot == p11scope_ebpf_common::cookie_slot(cookie))
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
+        if slots.last().is_some_and(|old| *old >= slot) {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        slots.push(slot);
+    }
+    let mut fds = Vec::new();
+    fds.try_reserve_exact(1)
+        .map_err(|_| io::Error::from_raw_os_error(libc::ENOMEM))?;
+    // All fallible allocation/validation precedes acquisition. The acquired
+    // FD enters this already-paid registry before a later bisect can fail.
+    let fd = attach()?;
+    fds.push(fd);
+    links.push(RegisteredLink::MultiUProbe {
+        program,
+        slots,
+        fds,
+        registration: pairs.register(),
+    });
+    Ok(())
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // No Counts selective retirement implementation yet.
 fn validate_counter_group_retirement(
-    _links: &[RegisteredLink],
-    _requested: &BTreeSet<u32>,
+    links: &[RegisteredLink],
+    requested: &BTreeSet<u32>,
 ) -> Result<()> {
-    bail!("private Multi Counts group retirement is not implemented")
+    if let Some(slot) = find_partial_multi_member(links, requested) {
+        bail!(
+            "private Counts slot {slot} requires whole-group retirement; published groups cannot rebuild"
+        );
+    }
+    Ok(())
+}
+
+fn group_site_failure(
+    program: &'static str,
+    path: &Path,
+    offset: u64,
+    error: &io::Error,
+) -> String {
+    if matches!(
+        program,
+        "p11_counter_bank_entry" | "p11_counter_bank_return"
+    ) {
+        use std::fmt::Write as _;
+        let shown = if counter_attach_path_is_valid(path) {
+            path
+        } else {
+            Path::new("<invalid FD path>")
+        };
+        // At most 23 ASCII program bytes, 24 FD-path bytes, 18 offset bytes,
+        // 11 errno bytes and 13 separators: 89 UTF-8 bytes total. The fallback
+        // path/error labels are shorter. No intermediate String is allocated.
+        let mut message = String::with_capacity(COUNTER_GROUP_DIAGNOSTIC_BYTES);
+        write!(message, "{program} at {}+{offset:#x}: ", shown.display())
+            .expect("String formatting");
+        match error.raw_os_error() {
+            Some(errno) => write!(message, "errno {errno}"),
+            None => write!(message, "errno unavailable"),
+        }
+        .expect("String formatting");
+        message
+    } else {
+        format!(
+            "{program} at {}+{offset:#x}: {}",
+            path.display(),
+            error_chain(error)
+        )
+    }
 }
 
 /// One attached group side: the program, its member slots, and the live
@@ -3165,7 +3293,7 @@ fn attach_target_groups_unsettled<T>(
             .collect();
         let (return_links, return_refused) = match bisect_attach(
             &mut |slice| {
-                let attempt = attach_link("p11_return", &group.path, slice, true);
+                let attempt = attach_link(group.return_program, &group.path, slice, true);
                 timing.observe_call(attempt.started_ns);
                 attempt.result
             },
@@ -3200,11 +3328,11 @@ fn attach_target_groups_unsettled<T>(
             let member = &group.members[site.index];
             failures.push((
                 member.slot.index,
-                format!(
-                    "p11_return at {}+{:#x}: {}",
-                    group.path.display(),
+                group_site_failure(
+                    group.return_program,
+                    &group.path,
                     member.offset,
-                    error_chain(&site.error)
+                    &site.error,
                 ),
             ));
         }
@@ -3217,13 +3345,13 @@ fn attach_target_groups_unsettled<T>(
             .collect();
         for member in &paired {
             successful.insert(
-                static_endpoint("p11_return", member.slot.index)
-                    .expect("p11_return is a static endpoint"),
+                static_endpoint(group.return_program, member.slot.index)
+                    .expect("selected return program is a static endpoint"),
             );
         }
         if !return_links.is_empty() {
             bundles.push(MultiLinkBundle {
-                program: "p11_return",
+                program: group.return_program,
                 slots: paired.iter().map(|member| member.slot.index).collect(),
                 links: return_links,
             });
@@ -3271,13 +3399,7 @@ fn attach_target_groups_unsettled<T>(
             let member = paired[site.index];
             failures.push((
                 member.slot.index,
-                format!(
-                    "{} at {}+{:#x}: {}",
-                    group.entry_program,
-                    group.path.display(),
-                    member.offset,
-                    error_chain(&site.error)
-                ),
+                group_site_failure(group.entry_program, &group.path, member.offset, &site.error),
             ));
         }
         let mut entry_slots = Vec::new();
@@ -6321,7 +6443,7 @@ impl Session {
         #[cfg(feature = "h6-reexec-diagnostic")]
         let diagnostic = self.reexec_diagnostic();
         let outcome = if self.backend == AttachBackend::Multi {
-            self.attach_targets_multi(targets, &attach_targets)?
+            self.attach_targets_multi(targets, &attach_targets, roots)?
         } else {
             let ebpf = &mut self.ebpf;
             let links = &mut self.links;
@@ -6481,21 +6603,64 @@ impl Session {
         &mut self,
         targets: &[Slot],
         attach_targets: &BTreeMap<u32, (PathBuf, ElfAbi)>,
+        roots: StaticRoots,
     ) -> Result<AttachOutcome> {
-        let groups = group_static_slots(
+        let groups = group_static_slots_with_roots(
             targets,
             self.policy,
             cfg!(feature = "unsafe-unvalidated-metadata"),
             attach_targets,
-        );
+            roots,
+        )?;
         let mut programs: BTreeSet<&'static str> =
             groups.iter().map(|group| group.entry_program).collect();
-        programs.insert("p11_return");
+        programs.extend(groups.iter().map(|group| group.return_program));
         let mut prog_fds = BTreeMap::new();
         for program in programs {
             prog_fds.insert(program, multi_prog_fd(&mut self.ebpf, program)?);
         }
         let pid = multi_link_pid(self.uprobe_scope);
+        if roots == StaticRoots::CounterBanks {
+            // NativeIo checked the complete grouping/registry envelope before
+            // the floor advanced. Its retained extent charge is already in
+            // CounterKeepalive and survives even a confirmed clean rollback.
+            reserve_counter_multi_link_capacity(&mut self.links, targets.len())
+                .map_err(|_| anyhow!("private counter registry capacity refused"))?;
+            let slots_by_cookie: BTreeMap<_, _> = groups
+                .iter()
+                .flat_map(|group| &group.members)
+                .map(|member| (member.cookie, member.slot.index))
+                .collect();
+            let links = &mut self.links;
+            let pairs = &mut self.pid_pairs;
+            let (_resource_free_bundles, outcome) = attach_target_groups_observed_with(
+                &groups,
+                |_| monotonic_ns(),
+                |program, path, slice, is_return| {
+                    let prog_fd = prog_fds
+                        .get(program)
+                        .copied()
+                        .expect("every Counts group side pre-resolved its program fd");
+                    let (offsets, cookies): (Vec<u64>, Vec<u64>) = slice.iter().copied().unzip();
+                    pid_continuity::NativeAttempt::run(
+                        pid_continuity::comparable_monotonic_ns,
+                        || {
+                            retain_counter_multi_leaf(
+                                links,
+                                pairs,
+                                program,
+                                slice,
+                                &slots_by_cookie,
+                                || attach_group(prog_fd, pid, path, &offsets, &cookies, is_return),
+                            )
+                        },
+                    )
+                },
+            )?;
+            // The generic bundles carry only unit acknowledgements. Every
+            // acquired FD already belongs to Session, even on a late halt.
+            return Ok(outcome);
+        }
         if self.native_selection.is_some() {
             let slots_by_cookie: BTreeMap<_, _> = groups
                 .iter()
@@ -6713,6 +6878,17 @@ impl Session {
         failed_cleanup: bool,
     ) -> Result<DetachOutcome> {
         let requested: BTreeSet<_> = slots.iter().map(|slot| slot.index).collect();
+        if let Some(banks) = &self.counter_banks {
+            banks
+                .validate_backend(self.backend)
+                .map_err(|_| anyhow!("private counter retirement backend mismatch"))?;
+            if self.backend == AttachBackend::Multi {
+                // A Counts group's original cookies and published routes stay
+                // immutable. Whole fresh groups can roll back, but an existing
+                // group's surviving members must never be detached/rebuilt.
+                validate_counter_group_retirement(&self.links, &requested)?;
+            }
+        }
         let excluded = if failed_cleanup {
             requested.clone()
         } else {
@@ -11253,6 +11429,52 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn counter_bank_multi_diagnostics_stay_within_precharged_utf8_bound() {
+        let path = Path::new("/proc/self/fd/2147483647");
+        for program in ["p11_counter_bank_entry", "p11_counter_bank_return"] {
+            for errno in [i32::MIN, libc::EMFILE, i32::MAX] {
+                let message = group_site_failure(
+                    program,
+                    path,
+                    u64::MAX,
+                    &io::Error::from_raw_os_error(errno),
+                );
+                assert!(message.starts_with(program));
+                assert!(message.contains("/proc/self/fd/2147483647+0xffffffffffffffff"));
+                assert!(message.ends_with(&format!("errno {errno}")));
+                assert!(message.len() <= COUNTER_GROUP_DIAGNOSTIC_BYTES);
+                assert!(message.capacity() <= COUNTER_GROUP_DIAGNOSTIC_BYTES);
+            }
+            let error = io::Error::other("界".repeat(COUNTER_GROUP_DIAGNOSTIC_BYTES));
+            let message = group_site_failure(program, Path::new("/tmp/界.so"), 7, &error);
+            assert!(message.contains("<invalid FD path>+0x7: errno unavailable"));
+            assert!(!message.contains('界'));
+            assert!(message.len() <= COUNTER_GROUP_DIAGNOSTIC_BYTES);
+            assert!(message.capacity() <= COUNTER_GROUP_DIAGNOSTIC_BYTES);
+            assert!(!counter_attach_path_is_valid(Path::new("/tmp/界.so")));
+            assert!(!counter_attach_path_is_valid(Path::new(
+                "/proc/self/fd/12345678901"
+            )));
+        }
+        // These unchanged exhaustion messages also enter Counts' retained
+        // failures. Include their actual format capacity, not only text length.
+        for (_, message) in [
+            unfinished_after_exhaustion(u32::MAX),
+            exhausted_multi(u32::MAX, usize::MAX, usize::MAX),
+        ] {
+            assert!(message.len() <= COUNTER_GROUP_DIAGNOSTIC_BYTES);
+            assert!(message.capacity() <= COUNTER_GROUP_DIAGNOSTIC_BYTES);
+        }
+        // Detailed keeps the original path and complete error text, including
+        // UTF-8 byte growth. The bounded format belongs only to Counts roots.
+        let error = io::Error::other("provider 界 failure");
+        assert_eq!(
+            group_site_failure("p11_return", Path::new("/tmp/界.so"), 0x123, &error),
+            "p11_return at /tmp/界.so+0x123: provider 界 failure"
+        );
     }
 
     // Exercise actual grouping and registered ownership with real file FDs.

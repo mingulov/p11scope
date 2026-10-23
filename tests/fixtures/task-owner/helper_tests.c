@@ -2250,7 +2250,7 @@ static void object_owner_sweep_adjacent_lookup_preserves_custody(void)
 #if defined(P11SCOPE_COUNTER_BANK_PROOF) && !defined(P11SCOPE_INVENTORY_ONLY)
 static void counter_bank_owner_high_slot(void)
 {
-    reset();
+    reset(); object_setup();
     struct owner_start_key high = start_key(8191);
     struct owner_start_key outside = start_key(8192);
     assert(p11_owner_start_aggregate(&high, 17) == 1);
@@ -2270,7 +2270,7 @@ static void counter_bank_owner_high_slot(void)
 static void counter_bank_owner_start_failures(void)
 {
     struct owner_start_key high;
-    reset(); high = start_key(8191);
+    reset(); object_setup(); high = start_key(8191);
     assert(p11_owner_start_aggregate(&high, 17) == 1);
     fail_start_delete = -16;
     assert(p11_owner_cleanup());
@@ -2284,7 +2284,7 @@ static void counter_bank_owner_start_failures(void)
     assert(!row(&START, &high) && !ctl.outstanding && idle(0));
     assert(ctl.abandoned_start == 1 && ctl.poison);
 
-    reset(); high = start_key(8191);
+    reset(); object_setup(); high = start_key(8191);
     assert(p11_owner_start_aggregate(&high, 17) == 1);
     bank_hide_start_slot = 8191;
     assert(p11_owner_cleanup());
@@ -2292,7 +2292,7 @@ static void counter_bank_owner_start_failures(void)
     assert(ctl.poison && ctl.outstanding == 1 && owners[0].start_count == 1);
     assert(!ctl.abandoned_start);
 
-    reset(); high = start_key(8191);
+    reset(); object_setup(); high = start_key(8191);
     assert(p11_owner_start_aggregate(&high, 17) == 1);
     owners[0].start_count = 2;
     assert(p11_owner_cleanup());
@@ -2302,7 +2302,7 @@ static void counter_bank_owner_start_failures(void)
 
 static struct owner_start_key counter_bank_owner_orphan(void)
 {
-    reset();
+    reset(); object_setup();
     struct owner_start_key high = start_key(8191);
     assert(p11_owner_start_aggregate(&high, 17) == 1);
     assert(!pair_delete(&START, &high));
@@ -2350,7 +2350,7 @@ static void counter_bank_owner_incomplete_loops(void)
         for (unsigned short_result = 0; short_result <= 1; short_result++) {
             struct owner_start_key high;
             if (phase == 1) {
-                reset(); high = start_key(8191);
+                reset(); object_setup(); high = start_key(8191);
                 assert(p11_owner_start_aggregate(&high, 17) == 1);
             } else {
                 high = counter_bank_owner_orphan();

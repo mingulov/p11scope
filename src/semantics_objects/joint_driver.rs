@@ -327,6 +327,27 @@ pub(crate) struct IngestedRaw {
     frontier: ConsumptionOrdinal,
 }
 
+/// Present-state S1 bookkeeping for ONE exact immutable admission. This is
+/// not an ingress receipt, a clean prefix, completion, or H3/object authority.
+/// The adapter and decoded original (including RV) stay borrowed until its
+/// immediate consumer verifies the actual stage-cursor row and consumes it.
+pub(crate) struct S1OriginalDisposition<'adapter, 'input> {
+    original: &'input crate::discovery::caller_registry::instance_input::AdmittedInstanceCall,
+    _adapter: &'adapter mut JournalAdapter,
+}
+
+impl S1OriginalDisposition<'_, '_> {
+    pub(crate) fn consume_for(
+        self,
+        input: &crate::discovery::caller_registry::instance_input::AdmittedInstanceCall,
+    ) -> Result<(), RawQuantumRefusal> {
+        if !std::ptr::eq(self.original, input) {
+            return Err(RawQuantumRefusal::Admission);
+        }
+        Ok(())
+    }
+}
+
 #[cfg_attr(not(test), allow(dead_code))] // Prepared-claim/audit ports; the ordinary Joint lane remains inactive.
 impl IngestedRaw {
     pub(crate) fn frontier(&self) -> ConsumptionOrdinal {
@@ -354,16 +375,29 @@ impl IngestedRaw {
             && adapter.matches_retained_admission(admitted)
     }
 
-    pub(crate) fn retain_s1only_disposition(
+    pub(crate) fn disposition_s1only_original<'adapter, 'input>(
         &self,
-        adapter: &mut JournalAdapter,
-        admitted: &crate::discovery::caller_registry::instance_input::AdmittedInstanceCall,
-    ) -> Result<(), RawQuantumRefusal> {
-        if !self.matches_admission(admitted) && !self.matches_retained_admission(admitted, adapter)
-        {
+        adapter: &'adapter mut JournalAdapter,
+        producers: &SessionDrainProducers,
+        admitted: &'input crate::discovery::caller_registry::instance_input::AdmittedInstanceCall,
+    ) -> Result<S1OriginalDisposition<'adapter, 'input>, RawQuantumRefusal> {
+        self.validate_owner(adapter, producers)?;
+        let current_original = self.matches_admission(admitted);
+        if !current_original && !self.matches_retained_admission(admitted, adapter) {
             return Err(RawQuantumRefusal::Admission);
         }
-        adapter.retain_s1only_subject(admitted)
+        // Always try the unchanged strict physical-H8 path FIRST. The
+        // alternate predicate rejects ANY matching custody/claim/refusal,
+        // so a failed retained-path check can never become a released proof.
+        if let Err(reason) = adapter.retain_s1only_subject(admitted)
+            && (!current_original || !adapter.released_tainted_s1_original(admitted, producers))
+        {
+            return Err(reason);
+        }
+        Ok(S1OriginalDisposition {
+            original: admitted,
+            _adapter: adapter,
+        })
     }
 
     pub(crate) fn validate_owner(

@@ -3637,6 +3637,68 @@ impl JournalAdapter {
         Ok(())
     }
 
+    /// Always-negative PRESENT state for one constructor-bound decoded
+    /// original whose operation has completely left the resource table.
+    /// Nothing here proves that ingest refused it, clears held custody, or
+    /// permits a seal. The exact immutable admission/RV remains borrowed by
+    /// the caller until the same registry stage-cursor original consumes it.
+    fn released_tainted_s1_original(
+        &self,
+        admitted: &AdmittedInstanceCall,
+        producers: &crate::attach::SessionDrainProducers,
+    ) -> bool {
+        let (native, image, _, _) = admitted.journal_binding();
+        let (Some(origin), Some(resource), Some(fingerprint), Some(return_ns)) = (
+            admitted.collected_origin(),
+            admitted.joint_resource_origin(),
+            admitted.journal_call_fingerprint(),
+            admitted.journal_return_ns(),
+        ) else {
+            return false;
+        };
+        if native != producers.native_domain()
+            || !resource.matches_producers(producers)
+            || origin.position() != admitted.h0_ordinal()
+            || fingerprint.image != (image.task_cookie, image.exec_id)
+            || fingerprint.pid_tgid as u32 == 0
+            || fingerprint.pid_tgid >> 32 == 0
+            || fingerprint.entry_ns >= return_ns
+            || return_ns != admitted.s1_facts().ts_ns
+            || endpoint_class(fingerprint.function) != Some(EndpointClass::ModeledAffecting)
+            || !self.is_tainted(fingerprint.image)
+            || !self.ledger.original_is_released(resource.reservation())
+        {
+            return false;
+        }
+        // An invocation collision, retained/converted original, marked row,
+        // refused begin or claim (even an own claim) must stay on the strict
+        // retained path. In particular no per-image/global empty-ledger test
+        // can replace this original's complete alias/role release above.
+        if self.open.contains_key(&resource.invocation())
+            || self.open.values().any(|entry| {
+                entry.collected_origin == Some(origin)
+                    || fingerprint_of_begin(&entry.begin) == fingerprint
+            })
+            || self
+                .refused
+                .iter()
+                .any(|entry| fingerprint_of_refused(entry) == fingerprint)
+            || self.claims.iter().any(|(claimed, claimants)| {
+                claimants.iter().any(|(key, claims)| {
+                    !claims.is_empty()
+                        && (*claimed == fingerprint
+                            || (key.domain_tag == native.journal_tag()
+                                && claims
+                                    .iter()
+                                    .any(|claim| claim.admission == admitted.h0_ordinal())))
+                })
+            })
+        {
+            return false;
+        }
+        true
+    }
+
     /// Bind the Session drain serving one attested native domain from
     /// the Session-minted association: the grant's EVENTS-map identity
     /// (minted from the Session's retained EVENTS domain) to its native

@@ -1046,7 +1046,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 .and_then(crate::semantics_objects::journal::endpoint_class)
                 == Some(crate::semantics_objects::journal::EndpointClass::ModeledAffecting)
         {
-            ingested.retain_s1only_disposition(adapter, input)?;
+            ingested
+                .disposition_s1only_original(adapter, producers, input)?
+                .consume_for(input)?;
         }
         Ok(batch.stage_next(&mut self.registry, &mut state.seal_admission))
     }

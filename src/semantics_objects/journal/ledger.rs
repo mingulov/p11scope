@@ -240,6 +240,17 @@ impl StagingLedger {
         self.generation == Some(reservation.generation)
     }
 
+    /// Present resource state only: neither a positive grant nor proof of
+    /// why ingestion declined the original. All five roles and merged IDs
+    /// must have released this actual generation's minted operation.
+    pub(super) fn original_is_released(&self, reservation: &ExistingReservation) -> bool {
+        self.matches_reservation(reservation)
+            && self
+                .table
+                .as_ref()
+                .is_some_and(|table| table.reservation_is_released(reservation.id))
+    }
+
     pub(super) fn generation(&self) -> Option<LedgerGeneration> {
         self.generation
     }

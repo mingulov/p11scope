@@ -182,6 +182,13 @@ impl<C> ReservationTable<C> {
         })
     }
 
+    /// IDs are never recycled. A previously minted ID is released only
+    /// after its entire operation (including every merged alias/role) left
+    /// the table; a reused physical slot does not revive that identity.
+    pub(super) fn reservation_is_released(&self, id: ReservationId) -> bool {
+        id.0 != 0 && id.0 <= self.next && self.id_slot(id).is_none()
+    }
+
     pub(super) fn preflight(
         &self,
         role: Role,

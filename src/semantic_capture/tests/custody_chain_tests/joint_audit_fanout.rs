@@ -12848,6 +12848,355 @@ fn exercise_s1only_sibling_raw(sibling_first: bool, loss_moment: SiblingLossMome
 /// Catches a late S1Only provider pinning a Joint sibling's raw head forever,
 /// tainting only the first image, or erasing A's reservation before H9 joins it.
 #[test]
+fn joint_s1_original_disposition_preserves_interleaved_healthy_image() {
+    use crate::semantics_objects::journal::{AttestationRefusal, JournalGap};
+    for tainted_first in [false, true] {
+        for stale_frontier in [false, true] {
+            let mut fixture = CanonicalFanoutScene::prior_sealed_with_providers(2);
+            let targets = fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .registry()
+                .joint_feed_targets()
+                .collect::<Vec<_>>();
+            assert_eq!(targets.len(), 2);
+            let victim = targets[0];
+            let healthy = targets[1];
+            let victim_pid = fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .semantic_bindings()
+                .get(victim.caller())
+                .unwrap()
+                .pin()
+                .pid();
+            let healthy_pid = fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .semantic_bindings()
+                .get(healthy.caller())
+                .unwrap()
+                .pin()
+                .pid();
+            assert_ne!(victim_pid, healthy_pid);
+            fixture
+                .scene
+                .admit_providers(victim_pid, victim.caller(), &[1]);
+            let mut old_original = None;
+            for sequence in [2, 3] {
+                // A and B are different real images under one actual Session,
+                // ledger and raw collection. Only B's image becomes tainted.
+                for (pid, file) in if tainted_first {
+                    [(victim_pid, 1), (healthy_pid, 0)]
+                } else {
+                    [(healthy_pid, 0), (victim_pid, 1)]
+                } {
+                    fixture.scene.push(
+                        pid,
+                        file,
+                        if pid == victim_pid {
+                            "C_CreateObject"
+                        } else if sequence == 2 {
+                            "C_SignInit"
+                        } else {
+                            "C_SignFinal"
+                        },
+                        sequence,
+                    );
+                }
+                let raw = fixture.scene.prepare(2);
+                let identity = raw.h0_identity();
+                let mut ingested = raw
+                    .ingest(
+                        fixture
+                            .scene
+                            .real
+                            .scene
+                            .coordinator
+                            .joint_capture_mut()
+                            .adapter_mut(),
+                        &fixture.scene.producers,
+                        &fixture.grant,
+                    )
+                    .unwrap_or_else(|(_, reason)| panic!("actual mixed original: {reason:?}"));
+                {
+                    let coordinator = &mut fixture.scene.real.scene.coordinator;
+                    while let Some((ordinal, result)) = coordinator
+                        .claim_next_prepared_admission(&fixture.scene.producers, &ingested)
+                        .unwrap()
+                    {
+                        let input = coordinator
+                            .prepared_semantic_batch()
+                            .unwrap()
+                            .admissions()
+                            .find(|input| input.h0_ordinal() == ordinal)
+                            .unwrap();
+                        if input.journal_binding().3 == victim.caller() {
+                            assert_eq!(
+                                result.as_ref().err().copied(),
+                                Some(if sequence == 2 {
+                                    AttestationRefusal::ImageSealed
+                                } else {
+                                    AttestationRefusal::ImageTainted
+                                })
+                            );
+                            if sequence == 2 {
+                                old_original = Some(input.clone());
+                            }
+                        } else {
+                            assert!(result.is_ok());
+                        }
+                    }
+                }
+                if sequence == 3 && stale_frontier {
+                    // Deliberately advance the SAME real cursor/adapter with
+                    // a later journal-only BEGIN, while the old prepared row
+                    // stays retained. No scalar frontier setter or H3 mint.
+                    let (begin, _) = fixture.scene.encoded(healthy_pid, 0, "C_CreateObject", 4);
+                    fixture.scene.drain.source_mut().push_record(begin.to_vec());
+                    let next = fixture.scene.collect_with_fault(&BirthFault);
+                    fixture.scene.real.h0.0.borrow_mut().collected = Some(next);
+                    let next_report = fixture.scene.real.tick();
+                    let next = fixture
+                        .scene
+                        .real
+                        .h0
+                        .0
+                        .borrow_mut()
+                        .collected
+                        .take()
+                        .unwrap();
+                    let _next = next
+                        .ingest(
+                            fixture
+                                .scene
+                                .real
+                                .scene
+                                .coordinator
+                                .joint_capture_mut()
+                                .adapter_mut(),
+                            &fixture.scene.producers,
+                            &fixture.grant,
+                        )
+                        .unwrap_or_else(|(_, reason)| panic!("actual later BEGIN: {reason:?}"));
+                    let coordinator = &mut fixture.scene.real.scene.coordinator;
+                    let (prepared, owner) = coordinator.prepared_joint_parts().unwrap();
+                    let input = prepared
+                        .admissions()
+                        .find(|input| input.journal_binding().3 == victim.caller())
+                        .unwrap();
+                    let before = (
+                        owner.ledger().roles_for_test(),
+                        owner.adapter().invocation_claims_for_test(),
+                        owner.adapter().retained_starts_for_test(),
+                    );
+                    assert!(matches!(
+                        ingested.disposition_s1only_original(
+                            owner.adapter_mut(),
+                            &fixture.scene.producers,
+                            input
+                        ),
+                        Err(RawQuantumRefusal::StaleFrontier)
+                    ));
+                    assert_eq!(
+                        (
+                            owner.ledger().roles_for_test(),
+                            owner.adapter().invocation_claims_for_test(),
+                            owner.adapter().retained_starts_for_test()
+                        ),
+                        before
+                    );
+                    drop(next_report);
+                    break;
+                }
+                if sequence == 3 {
+                    let reserve = fixture
+                        .scene
+                        .real
+                        .scene
+                        .coordinator
+                        .registry()
+                        .semantic_storage_reserver();
+                    let mut foreign = JournalAdapter::with_ledger(
+                        crate::semantics_objects::journal::JournalLimits::policy(),
+                        crate::semantics_objects::journal::StagingLedger::with_resources(
+                            reserve.clone(),
+                        ),
+                    );
+                    // Bind resource producers through the actual zero-work
+                    // collector. This observes NO empty prefix and grants no
+                    // H0/H3/drain authority; it only constructs the hostile
+                    // same-producer/different-ledger comparison.
+                    let (unobserved, poll) = RawJointQuantum::begin_bounded_with_adapter(
+                        &mut fixture.scene.drain,
+                        &publish_object_descriptors(),
+                        4,
+                        0,
+                        None,
+                        &BirthFault,
+                        &fixture.scene.producers,
+                        |bytes| reserve.reserve(bytes),
+                        &mut foreign,
+                    )
+                    .unwrap();
+                    assert!(poll.is_none());
+                    drop(unobserved);
+                    let coordinator = &mut fixture.scene.real.scene.coordinator;
+                    let (prepared, owner) = coordinator.prepared_joint_parts().unwrap();
+                    let input = prepared
+                        .admissions()
+                        .find(|input| input.journal_binding().3 == victim.caller())
+                        .unwrap();
+                    assert!(input.collected_origin().unwrap().in_quantum(identity));
+                    let before = (
+                        owner.ledger().roles_for_test(),
+                        owner.adapter().invocation_claims_for_test(),
+                        owner.adapter().retained_starts_for_test(),
+                    );
+                    assert!(
+                        before.0[1] > 0 && before.1.0 == 1,
+                        "healthy original H8 and its claim are genuinely retained"
+                    );
+                    let foreign_producers = SessionDrainProducers::test_pair(
+                        fixture.scene.producers.native_domain(),
+                        EventsDomain::test_standin(fixture.scene.producers.events_id()),
+                    );
+                    assert!(matches!(
+                        ingested.disposition_s1only_original(
+                            owner.adapter_mut(),
+                            &foreign_producers,
+                            input
+                        ),
+                        Err(RawQuantumRefusal::ForeignCapture)
+                    ));
+                    assert!(matches!(
+                        ingested.disposition_s1only_original(
+                            &mut foreign,
+                            &fixture.scene.producers,
+                            input
+                        ),
+                        Err(RawQuantumRefusal::ForeignLedger)
+                    ));
+                    assert!(matches!(
+                        ingested.disposition_s1only_original(
+                            owner.adapter_mut(),
+                            &fixture.scene.producers,
+                            old_original.as_ref().unwrap()
+                        ),
+                        Err(RawQuantumRefusal::Admission)
+                    ));
+                    let same_shape = input.clone();
+                    assert!(matches!(
+                        ingested
+                            .disposition_s1only_original(
+                                owner.adapter_mut(),
+                                &fixture.scene.producers,
+                                input
+                            )
+                            .unwrap()
+                            .consume_for(&same_shape),
+                        Err(RawQuantumRefusal::Admission)
+                    ));
+                    ingested
+                        .disposition_s1only_original(
+                            owner.adapter_mut(),
+                            &fixture.scene.producers,
+                            input,
+                        )
+                        .unwrap()
+                        .consume_for(input)
+                        .unwrap();
+                    assert_eq!(
+                        (
+                            owner.ledger().roles_for_test(),
+                            owner.adapter().invocation_claims_for_test(),
+                            owner.adapter().retained_starts_for_test()
+                        ),
+                        before,
+                        "present-state S1 bookkeeping releases none of the healthy image's real custody"
+                    );
+                }
+                let coordinator = &mut fixture.scene.real.scene.coordinator;
+                let mut staged = 0;
+                while coordinator
+                    .stage_next_prepared_admission_with_disposition(
+                        &fixture.scene.producers,
+                        &mut ingested,
+                    )
+                    .unwrap()
+                {
+                    staged += 1;
+                }
+                assert_eq!(staged, 2);
+                assert!(coordinator.finish_prepared_semantic_batch(&fixture.scene.real.lane));
+                coordinator
+                    .commit_batch_with_semantics(false, Some(&mut fixture.scene.real.lane))
+                    .unwrap();
+                let mut frame =
+                    acquire(&mut fixture.scene, ingested, &fixture.attached, &BirthFault);
+                if sequence == 2 {
+                    assert_eq!(
+                        frame.failure_for_test().unwrap().gap,
+                        JournalGap::ImageTainted
+                    );
+                    assert!(
+                        !frame
+                            .failure_for_test()
+                            .unwrap()
+                            .affects_domain(healthy.bootstrap().domain())
+                    );
+                }
+                {
+                    let ports = fixture
+                        .scene
+                        .real
+                        .scene
+                        .coordinator
+                        .joint_frame_ports(&fixture.scene.producers)
+                        .unwrap();
+                    frame.bind_targets(&ports).unwrap();
+                }
+                fixture.finish_bounded_batch(frame, false);
+                let coordinator = &fixture.scene.real.scene.coordinator;
+                let healthy_feed = coordinator
+                    .registry()
+                    .instance_semantic_edges()
+                    .find(|record| record.id == healthy.id())
+                    .unwrap();
+                assert_eq!(
+                    healthy_feed.feed.mode(),
+                    crate::semantics_key_use::FeedMode::Joint
+                );
+                assert_eq!(healthy_feed.feed.reduced(), sequence);
+                assert_eq!(healthy_feed.semantics.as_ref().unwrap().calls(), sequence);
+                let b_module = coordinator
+                    .registry()
+                    .module_id_for(&fixture.scene.real.modules[1].0)
+                    .unwrap();
+                let b = coordinator
+                    .registry()
+                    .instance_semantic_edges()
+                    .find(|record| record.caller == victim.caller() && record.module == b_module)
+                    .unwrap();
+                assert_eq!(b.feed.mode(), crate::semantics_key_use::FeedMode::S1Only);
+                assert_eq!(b.feed.reduced(), 0);
+                assert_eq!(
+                    (b.api_returns, b.semantics.as_ref().unwrap().calls()),
+                    (Some(sequence - 1), sequence - 1)
+                );
+                assert_eq!(coordinator.registry().joint_feeds(), 1);
+            }
+        }
+    }
+}
+
+#[test]
 fn key_operation_s1only_sibling_raw_reaches_terminal() {
     for sibling_first in [false, true] {
         exercise_s1only_sibling_raw(sibling_first, SiblingLossMoment::None);

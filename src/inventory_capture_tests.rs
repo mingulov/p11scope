@@ -3874,3 +3874,579 @@ mod promotion_baseline_lane_tests {
         );
     }
 }
+
+/// Exercise the production loop, real native-lane staging and coordinator;
+/// only publication readiness and the scoped completion callback are scripted.
+/// These controls supply no actual Joint or installed cgroup qualification.
+mod publication_progress_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[derive(Clone, Copy)]
+    enum Poll {
+        Pending,
+        Published,
+        Fail,
+    }
+
+    struct Driver {
+        scene: Scene,
+        control: Option<CollectionControl>,
+        pending: bool,
+        polls: VecDeque<Poll>,
+        changes: Vec<bool>,
+        stop: Rc<Cell<bool>>,
+        stop_after_poll: Option<usize>,
+        stop_after_tick: Option<usize>,
+        stop_in_apply: bool,
+        fail_finish: bool,
+        collected_ptr: usize,
+        report_ptr: usize,
+        report_changed: bool,
+        applies: usize,
+        finishes: usize,
+        emissions: usize,
+        ticks: usize,
+        native_domains: Vec<NativeDomainId>,
+        host_stops: usize,
+        suspended: usize,
+        legacy_commits: usize,
+        legacy_stops: usize,
+    }
+
+    impl Driver {
+        fn new(log: &Log, scoped: bool, polls: &[Poll]) -> Self {
+            Self {
+                scene: Scene::new(log),
+                control: scoped.then(|| CollectionControl::new(None)),
+                pending: false,
+                polls: polls.iter().copied().collect(),
+                changes: Vec::new(),
+                stop: Rc::default(),
+                stop_after_poll: None,
+                stop_after_tick: None,
+                stop_in_apply: false,
+                fail_finish: false,
+                collected_ptr: 0,
+                report_ptr: 0,
+                report_changed: false,
+                applies: 0,
+                finishes: 0,
+                emissions: 0,
+                ticks: 0,
+                native_domains: Vec::new(),
+                host_stops: 0,
+                suspended: 0,
+                legacy_commits: 0,
+                legacy_stops: 0,
+            }
+        }
+
+        fn assert_retained(&self, outcome: &ClassicOutcome<ScriptedLane>) {
+            assert!(outcome.stopped.is_none());
+            assert!(outcome.zero_pass.is_none());
+            let retained = outcome.retained.as_ref().expect("the same run is retained");
+            assert_eq!(retained.completed_passes, 0);
+            assert_eq!(retained.discarded_collections, 0);
+            assert!(retained.host_stopped);
+            assert_eq!(self.host_stops, 1, "the F9 gate remains once-only");
+            assert_eq!(self.suspended, 1);
+            assert_eq!(self.legacy_stops, 0, "no fresh semantic terminal sequence");
+            assert_eq!(self.legacy_commits, 0, "no legacy terminal publication");
+            assert_eq!(self.emissions, 0);
+            assert_eq!(self.scene.scans, 1);
+            let lane = retained.lane.as_ref().expect("original native ownership");
+            assert!(!lane.capture.stopping, "no new terminal drain");
+            assert!(!entries(&self.scene.log).iter().any(|line| line == "drop"));
+            match &retained.pass {
+                RetainedPass::Collected {
+                    collected,
+                    scan_now_ns,
+                } => {
+                    assert!(*scan_now_ns > 0);
+                    let CollectedPass::Legacy(Ok(catalog)) = collected else {
+                        panic!("the original catalog must remain owned");
+                    };
+                    assert_eq!(catalog.processes.as_ptr() as usize, self.collected_ptr);
+                    assert_eq!(self.applies, 0);
+                }
+                RetainedPass::Applied { report, .. } => {
+                    assert_eq!(report.pending_refresh.as_ptr() as usize, self.report_ptr);
+                    assert_eq!(self.applies, 1);
+                }
+            }
+        }
+    }
+
+    impl LaneHost<Pin> for Driver {
+        fn begin_capture_coverage(&mut self, scope: CaptureScopeCoverage) {
+            self.scene.begin_capture_coverage(scope);
+        }
+        fn abandon_capture_coverage(&mut self) {
+            self.scene.abandon_capture_coverage();
+        }
+        fn note_extend_receipt(&mut self, receipt: &ExtendReceipt) {
+            self.scene.note_extend_receipt(receipt);
+        }
+        fn note_capture_custody(&mut self, custody: &ScopeCustody) {
+            self.scene.note_capture_custody(custody);
+        }
+        fn take_target_delta(&mut self) -> TargetDelta {
+            self.scene.take_target_delta()
+        }
+        fn capture_targets(&self) -> &dyn CaptureTargets {
+            self.scene.capture_targets()
+        }
+        fn stage_native(
+            &mut self,
+            batch: NativeBatch,
+            identity: &mut dyn NativeIdentity<Pin>,
+            now_ns: u64,
+        ) -> NativeReceipt {
+            self.scene.stage_native(batch, identity, now_ns)
+        }
+        fn end_capture_coverage(&mut self, at_ns: u64) {
+            self.scene.end_capture_coverage(at_ns);
+        }
+        fn note_native_lane(&mut self) {
+            self.scene.note_native_lane();
+        }
+        fn note_scope_gap(&mut self, subject: String, reason: String) {
+            self.scene.note_scope_gap(subject, reason);
+        }
+        fn note_refresh_loss(&mut self, reason: String) {
+            self.scene.note_refresh_loss(reason);
+        }
+        fn stop_coordinator(&mut self) {
+            self.host_stops += 1;
+            self.scene.coordinator.stop();
+        }
+    }
+
+    impl PassDriver<Pin> for Driver {
+        type Host = Self;
+        fn host(&mut self) -> &mut Self {
+            self
+        }
+        fn collector(&mut self) -> CollectJob {
+            self.scene.scans += 1;
+            self.scene.note("collect");
+            let catalog = self.scene.catalog();
+            self.collected_ptr = catalog.processes.as_ptr() as usize;
+            CollectJob::Legacy(Box::new(move || Ok(catalog)))
+        }
+        fn collection_control(&self) -> Option<CollectionControl> {
+            self.control.clone()
+        }
+        fn apply(
+            &mut self,
+            collected: CollectedPass,
+            identity: &mut dyn NativeIdentity<Pin>,
+            now_ns: u64,
+        ) -> Result<PassReport> {
+            let CollectedPass::Legacy(Ok(catalog)) = &collected else {
+                panic!("the loop must apply its original successful collection");
+            };
+            assert_eq!(catalog.processes.as_ptr() as usize, self.collected_ptr);
+            self.applies += 1;
+            let mut report = self.scene.apply(collected, identity, now_ns)?;
+            report.pending_refresh = vec![self.scene.caller(PID)];
+            self.report_ptr = report.pending_refresh.as_ptr() as usize;
+            self.report_changed = report.engine_changed;
+            if self.stop_in_apply {
+                self.stop.set(true);
+            }
+            Ok(report)
+        }
+        fn commit(&mut self, changed: bool) -> Result<()> {
+            self.legacy_commits += 1;
+            self.scene.commit(changed)
+        }
+        fn poll_commit(&mut self, changed: bool) -> Result<PassCommitProgress> {
+            self.changes.push(changed);
+            match self.polls.pop_front().unwrap_or(Poll::Published) {
+                Poll::Pending => {
+                    self.scene.note("poll:pending");
+                    self.pending = true;
+                    if self.stop_after_poll == Some(self.changes.len()) {
+                        self.stop.set(true);
+                    }
+                    Ok(PassCommitProgress::Pending)
+                }
+                Poll::Published => {
+                    self.scene.note("poll:published");
+                    self.pending = false;
+                    self.scene.commit(changed)?;
+                    Ok(PassCommitProgress::Published)
+                }
+                Poll::Fail => {
+                    // A failure flag is no ownership or completion oracle.
+                    self.pending = false;
+                    Err(anyhow!("original publication failure"))
+                }
+            }
+        }
+        fn publication_pending(&self) -> bool {
+            self.pending
+        }
+        fn finish_pass(&mut self, report: &mut PassReport) -> Result<()> {
+            self.scene.note("finish");
+            self.finishes += 1;
+            assert_eq!(report.pending_refresh.as_ptr() as usize, self.report_ptr);
+            report.scan_callers = 73;
+            if self.fail_finish {
+                anyhow::bail!("completion failed after mutating the original report");
+            }
+            Ok(())
+        }
+        fn on_native_service(&mut self, capture: Option<&mut dyn CaptureLane<Pin>>) {
+            self.scene.note("native-service");
+            self.native_domains
+                .push(capture.expect("same native owner").domain());
+        }
+        fn on_tick(&mut self) {
+            self.scene.note("tick");
+            self.ticks += 1;
+            if self.stop_after_tick == Some(self.ticks) {
+                self.stop.set(true);
+            }
+        }
+        fn on_publication_suspended(&mut self) {
+            self.suspended += 1;
+        }
+        fn on_stop_requested(&mut self) {
+            self.legacy_stops += 1;
+        }
+    }
+
+    fn drive(
+        driver: &mut Driver,
+        lane: ScriptedLane,
+        windows: LaneWindows,
+    ) -> ClassicOutcome<ScriptedLane> {
+        let started = NativeLane::start(lane, driver, windows, None)
+            .map_err(|(_, reason)| reason)
+            .unwrap();
+        let stop = Rc::clone(&driver.stop);
+        let stop = || stop.get();
+        let clock = LoopClock {
+            deadline: Some(Instant::now() + GATE_TIMEOUT),
+            stop: &stop,
+            now: &Instant::now,
+            interval: Duration::ZERO,
+            tick: Duration::from_millis(1),
+            collection_tick: NO_COLLECTION_TICK,
+        };
+        run_classic_finalizing(driver, Some(started), &clock, None, &mut |driver, point| {
+            if let Publish::Pass { report, .. } = point {
+                assert_eq!(report.pending_refresh.as_ptr() as usize, driver.report_ptr);
+                if driver.control.is_some() {
+                    assert_eq!(
+                        report.scan_callers, 73,
+                        "emit the completed original report"
+                    );
+                }
+                driver.scene.note("emit");
+                driver.emissions += 1;
+                driver.stop.set(true);
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn pending_before_apply_preserves_the_original_collection() {
+        let log = Log::default();
+        let mut driver = Driver::new(
+            &log,
+            false,
+            &[Poll::Pending, Poll::Published, Poll::Published],
+        );
+        driver.pending = true;
+        let outcome = drive(&mut driver, ScriptedLane::new(&log), windows());
+        assert!(outcome.error.is_none(), "{outcome:?}");
+        assert!(outcome.retained.is_none());
+        assert_eq!(
+            (driver.scene.scans, driver.applies, driver.emissions),
+            (1, 1, 1)
+        );
+        assert_eq!(driver.changes, [false, false, driver.report_changed]);
+        assert_eq!(driver.ticks, 1);
+        let log = entries(&log);
+        assert!(
+            log.iter()
+                .position(|line| line == "poll:published")
+                .unwrap()
+                < log.iter().position(|line| line == "scan").unwrap()
+        );
+    }
+
+    #[test]
+    fn both_scoped_commit_polls_finish_and_emit_once() {
+        let log = Log::default();
+        let mut driver = Driver::new(
+            &log,
+            true,
+            &[
+                Poll::Pending,
+                Poll::Published,
+                Poll::Pending,
+                Poll::Published,
+            ],
+        );
+        let outcome = drive(&mut driver, ScriptedLane::new(&log), windows());
+        assert!(outcome.error.is_none(), "{outcome:?}");
+        assert!(outcome.retained.is_none());
+        assert_eq!(
+            (
+                driver.scene.scans,
+                driver.applies,
+                driver.finishes,
+                driver.emissions
+            ),
+            (1, 1, 1, 1)
+        );
+        assert_eq!(driver.changes, [driver.report_changed, false, false, false]);
+        assert_eq!(outcome.stopped.unwrap().summary.passes, 1);
+        let log = entries(&log);
+        let published: Vec<usize> = log
+            .iter()
+            .enumerate()
+            .filter_map(|(i, line)| (line == "poll:published").then_some(i))
+            .collect();
+        let finish = log.iter().position(|line| line == "finish").unwrap();
+        let extend = log.iter().position(|line| line == "extend[0,1]").unwrap();
+        let emit = log.iter().position(|line| line == "emit").unwrap();
+        assert!(
+            published[0] < finish
+                && finish < extend
+                && extend < published[1]
+                && published[1] < emit,
+            "{log:?}"
+        );
+    }
+
+    #[test]
+    fn pending_service_keeps_the_same_native_owner_and_hold_bounds() {
+        let log = Log::default();
+        let mut driver = Driver::new(&log, false, &[Poll::Pending; 4]);
+        driver.stop_after_tick = Some(3);
+        let mut lane = ScriptedLane::new(&log);
+        let domain = lane.domain;
+        lane.records_per_service = 1;
+        let windows = LaneWindows {
+            discovery_records: 1,
+            pass_quanta: 1,
+            held_records: 3,
+            held_batches: 2,
+            ..windows()
+        };
+        let outcome = drive(&mut driver, lane, windows);
+        driver.assert_retained(&outcome);
+        assert_eq!(driver.ticks, 3);
+        assert_eq!(driver.native_domains, [domain; 3]);
+        let held = outcome.retained.as_ref().unwrap().lane.as_ref().unwrap();
+        assert_eq!((held.held.len(), held.held_records), (2, 2));
+        assert_eq!(
+            held.capture.services, 3,
+            "one pass quantum and two held quanta"
+        );
+        let log = entries(&log);
+        assert_eq!(
+            log.iter().filter(|line| *line == "stage:lifecycle").count(),
+            1,
+            "pending service holds new inputs: {log:?}"
+        );
+        for (i, line) in log
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| *line == "native-service")
+        {
+            assert_eq!(
+                log[i + 1],
+                "tick",
+                "service precedes each display tick: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn pending_cancellation_returns_original_collection_or_report() {
+        for (before_apply, scoped, stop_in_apply, polls, phase) in [
+            (true, true, false, vec![Poll::Pending], None),
+            (
+                false,
+                false,
+                false,
+                vec![Poll::Pending],
+                Some(AppliedPassPhase::FirstCommit),
+            ),
+            (
+                false,
+                false,
+                true,
+                vec![Poll::Pending],
+                Some(AppliedPassPhase::FirstCommit),
+            ),
+            (
+                false,
+                true,
+                false,
+                vec![Poll::Published, Poll::Pending],
+                Some(AppliedPassPhase::ScopedReceipts),
+            ),
+        ] {
+            let log = Log::default();
+            let mut driver = Driver::new(&log, scoped, &polls);
+            driver.pending = before_apply;
+            driver.stop_in_apply = stop_in_apply;
+            driver.stop_after_poll = Some(polls.len());
+            let outcome = drive(&mut driver, ScriptedLane::new(&log), windows());
+            driver.assert_retained(&outcome);
+            assert!(outcome.error.is_none(), "{outcome:?}");
+            let retained = outcome.retained.as_ref().unwrap();
+            assert_eq!(retained.stop_cause, Some(ZeroPassCause::OperatorStop));
+            assert!(retained.elapsed < GATE_TIMEOUT);
+            if scoped {
+                assert!(retained.control.as_ref().unwrap().check().is_err());
+            }
+            match (&retained.pass, phase) {
+                (RetainedPass::Collected { .. }, None) => {}
+                (RetainedPass::Applied { phase: actual, .. }, Some(want)) => {
+                    assert_eq!(*actual, want)
+                }
+                _ => panic!("cancellation changed the original owned phase"),
+            }
+        }
+    }
+
+    #[test]
+    fn pending_poll_failure_returns_original_collection_or_report() {
+        for (before_apply, scoped, polls, phase) in [
+            (true, false, vec![Poll::Fail], None),
+            (
+                false,
+                false,
+                vec![Poll::Pending, Poll::Fail],
+                Some(AppliedPassPhase::FirstCommit),
+            ),
+            (
+                false,
+                true,
+                vec![Poll::Published, Poll::Pending, Poll::Fail],
+                Some(AppliedPassPhase::ScopedReceipts),
+            ),
+        ] {
+            let log = Log::default();
+            let mut driver = Driver::new(&log, scoped, &polls);
+            driver.pending = before_apply;
+            let outcome = drive(&mut driver, ScriptedLane::new(&log), windows());
+            driver.assert_retained(&outcome);
+            assert_eq!(
+                outcome.error.as_ref().unwrap().to_string(),
+                "original publication failure"
+            );
+            assert!(
+                !driver.pending,
+                "ownership does not depend on a cleared readiness flag"
+            );
+            match (&outcome.retained.as_ref().unwrap().pass, phase) {
+                (RetainedPass::Collected { .. }, None) => {}
+                (RetainedPass::Applied { phase: actual, .. }, Some(want)) => {
+                    assert_eq!(*actual, want)
+                }
+                _ => panic!("publication failure changed the original owned phase"),
+            }
+        }
+    }
+
+    #[test]
+    fn sync_defaults_preserve_commit_order() {
+        let log = Log::default();
+        let mut scene = Scene::new(&log);
+        let (stopped, _) = run(&mut scene, ScriptedLane::new(&log), 1);
+        assert_eq!(stopped.summary.passes, 1);
+        assert_eq!(scene.scans, 1);
+        let mut expected: Vec<String> = STARTUP.map(String::from).to_vec();
+        expected.extend(pass("extend[0,1]"));
+        expected.extend(STOP.map(String::from));
+        assert_eq!(entries(&log), expected);
+    }
+
+    #[test]
+    fn compat_adapter_preserves_retained_failure_ownership() {
+        let log = Log::default();
+        let mut driver = Driver::new(&log, false, &[Poll::Pending, Poll::Fail]);
+        let lane = NativeLane::start(ScriptedLane::new(&log), &mut driver, windows(), None)
+            .map_err(|(_, reason)| reason)
+            .unwrap();
+        let stop = || false;
+        let clock = LoopClock {
+            deadline: Some(Instant::now() + GATE_TIMEOUT),
+            stop: &stop,
+            now: &Instant::now,
+            interval: Duration::ZERO,
+            tick: Duration::from_millis(1),
+            collection_tick: NO_COLLECTION_TICK,
+        };
+        let mut outcome = match run_classic(&mut driver, Some(lane), &clock, &mut |_, _| Ok(())) {
+            Err(outcome) => outcome,
+            Ok(_) => panic!("compatibility adapter flattened the retained failure"),
+        };
+        driver.assert_retained(&outcome);
+        // Even a malformed mixed outcome must return both owners intact.
+        let other_log = Log::default();
+        let mut other_scene = Scene::new(&other_log);
+        let (stopped, _) = run(&mut other_scene, ScriptedLane::new(&other_log), 1);
+        outcome.stopped = Some(stopped);
+        let mut outcome = match outcome.into_completion() {
+            Err(outcome) => outcome,
+            Ok(_) => panic!("a stopped+retained outcome was accepted"),
+        };
+        assert!(outcome.stopped.is_some() && outcome.retained.is_some());
+        assert!(!entries(&log).iter().any(|line| line == "drop"));
+        assert!(!entries(&other_log).iter().any(|line| line == "drop"));
+        let stopped = outcome.stopped.take().unwrap();
+        let ClassicCompletion::Retained { run, error } = outcome.into_completion().unwrap() else {
+            panic!("the complete original run must survive conversion");
+        };
+        assert!(run.lane.is_some());
+        assert_eq!(error.unwrap().to_string(), "original publication failure");
+        drop(stopped);
+    }
+
+    #[test]
+    fn failed_scoped_completion_preserves_the_mutated_report_and_lane() {
+        let log = Log::default();
+        let mut driver = Driver::new(&log, true, &[Poll::Published]);
+        driver.fail_finish = true;
+        let outcome = drive(&mut driver, ScriptedLane::new(&log), windows());
+        driver.assert_retained(&outcome);
+        assert!(
+            !driver.publication_pending(),
+            "first publication already completed"
+        );
+        assert_eq!(
+            (driver.changes.len(), driver.finishes, driver.emissions),
+            (1, 1, 0)
+        );
+        let RetainedPass::Applied { report, phase } = &outcome.retained.as_ref().unwrap().pass
+        else {
+            panic!("the mutated original report must remain owned");
+        };
+        assert_eq!(*phase, AppliedPassPhase::ScopedCompletionFailed);
+        assert_eq!(report.scan_callers, 73);
+        assert_eq!(
+            outcome.error.as_ref().unwrap().to_string(),
+            "completion failed after mutating the original report"
+        );
+        assert_eq!(
+            entries(&log)
+                .iter()
+                .filter(|line| line.starts_with("extend["))
+                .count(),
+            1,
+            "only startup extends; no after-cgroup hook"
+        );
+    }
+}

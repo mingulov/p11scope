@@ -38,7 +38,7 @@
 //! D3d brief item 6 native-lane coverage: pending (scan lane only).
 
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -1116,4 +1116,406 @@ fn d3d_pid_carries_no_identity_key() {
         "{}",
         doc["observation"]
     );
+}
+
+// D4 controls exercise the same strict evaluator used by the paired CLI cell.
+// The owned files and independent role/range inputs do not execute a provider.
+fn d4_control_fixtures() -> (tempfile::TempDir, BuiltFixtures) {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let dir = private_dir();
+    let provider = dir.path().join("id-d4.so");
+    let copy = dir.path().join("id-copy.so");
+    std::fs::write(&provider, b"same bytes, separate physical fixture files\n").unwrap();
+    std::fs::copy(&provider, &copy).unwrap();
+    let provider_file = std::fs::File::open(&provider).unwrap();
+    let copy_file = std::fs::File::open(&copy).unwrap();
+    let provider_metadata = provider_file.metadata().unwrap();
+    let copy_metadata = copy_file.metadata().unwrap();
+    let fixtures = BuiltFixtures {
+        dir: dir.path().to_path_buf(),
+        driver: dir.path().join("unused-driver"),
+        dataonly: dir.path().join("unused-dataonly"),
+        provider,
+        copy,
+        provider_id: FixtureFileId {
+            dev: provider_metadata.dev(),
+            ino: provider_metadata.ino(),
+        },
+        copy_id: FixtureFileId {
+            dev: copy_metadata.dev(),
+            ino: copy_metadata.ino(),
+        },
+        provider_file,
+        copy_file,
+    };
+    assert_ne!(fixtures.provider_id, fixtures.copy_id);
+    (dir, fixtures)
+}
+
+fn d4_control_observation(fixtures: &BuiltFixtures, backend: &str, epoch: u32) -> ObserveOutcome {
+    let roles = [
+        FixtureRole::H1,
+        FixtureRole::H2,
+        FixtureRole::H3,
+        FixtureRole::Copy,
+        FixtureRole::DataOnly,
+    ];
+    let role_pids: BTreeMap<_, _> = roles
+        .into_iter()
+        .enumerate()
+        .map(|(index, role)| (role, 10_000 + epoch * 10 + index as u32))
+        .collect();
+    let address = 0x1000_0000 + u64::from(epoch) * 0x1000_0000;
+    let holder_inputs = vec![
+        FixtureRange {
+            start: address,
+            end: address + 0x2000,
+            file_offset: 0x1000,
+            permissions: *b"r-xp",
+        },
+        FixtureRange {
+            start: address + 0x4000,
+            end: address + 0x5000,
+            file_offset: 0x5000,
+            permissions: *b"r-xp",
+        },
+    ];
+    let mut role_ranges = BTreeMap::from([
+        (FixtureRole::H1, holder_inputs.clone()),
+        (FixtureRole::H2, holder_inputs.clone()),
+        (FixtureRole::H3, holder_inputs.clone()),
+        (FixtureRole::Copy, vec![holder_inputs[0].clone()]),
+    ]);
+    role_ranges.insert(
+        FixtureRole::DataOnly,
+        vec![FixtureRange {
+            start: address + 0x8000,
+            end: address + 0x10_000,
+            file_offset: 0,
+            permissions: *b"r--p",
+        }],
+    );
+    // Reuse a complete public scan document, changing only the owned population.
+    let mut doc: Value =
+        serde_json::from_str(include_str!("fixtures/inventory-diff/scan-current.json")).unwrap();
+    let caller = doc["callers"][0].clone();
+    let edge = doc["edges"][0].clone();
+    let module_id = format!("module-{epoch}");
+    let callers: Vec<Value> = roles
+        .into_iter()
+        .enumerate()
+        .map(|(index, role)| {
+            let mut row = caller.clone();
+            row["id"] = serde_json::json!(format!("caller-{epoch}-{index}"));
+            row["pid"] = serde_json::json!(role_pids[&role]);
+            row
+        })
+        .collect();
+    let edges: Vec<Value> = (0..3)
+        .map(|index| {
+            let mut row = edge.clone();
+            row["caller"] = callers[index]["id"].clone();
+            row["module"] = serde_json::json!(module_id);
+            row["mapping"]["evidence"] = serde_json::json!(if index == 0 {
+                "deep_scan"
+            } else {
+                "maps_match"
+            });
+            row
+        })
+        .collect();
+    doc["scope"] = serde_json::json!("system");
+    doc["callers"] = serde_json::json!(callers);
+    doc["edges"] = serde_json::json!(edges);
+    doc["modules"][0]["id"] = serde_json::json!(module_id);
+    doc["modules"][0]["paths"] = serde_json::json!([fixtures.provider]);
+    doc["observation"]["identity"] = serde_json::json!({
+        "backend": backend,
+        "fallback": null,
+    });
+    doc["gaps"] = serde_json::json!([]);
+    doc["budgets"]["callers"]["occupied"] = serde_json::json!(5);
+    doc["budgets"]["edges"]["occupied"] = serde_json::json!(3);
+    let holder_pids = vec![
+        role_pids[&FixtureRole::H1],
+        role_pids[&FixtureRole::H2],
+        role_pids[&FixtureRole::H3],
+    ];
+    ObserveOutcome {
+        doc,
+        selected: BTreeSet::from([holder_pids[0]]),
+        holder_ranges: vec![
+            vec![
+                (address, address + 0x2000),
+                (address + 0x4000, address + 0x5000)
+            ];
+            3
+        ],
+        holder_pids,
+        copy_pid: Some(role_pids[&FixtureRole::Copy]),
+        dataonly_pid: Some(role_pids[&FixtureRole::DataOnly]),
+        role_pids,
+        role_ranges,
+    }
+}
+
+#[test]
+fn d4_parity_normalizes_fresh_pids_ids_and_virtual_addresses() {
+    let (_dir, fixtures) = d4_control_fixtures();
+    let userspace = d4_control_observation(&fixtures, "userspace", 1);
+    let kernel = d4_control_observation(&fixtures, "kernel", 2);
+    assert_ne!(userspace.holder_pids, kernel.holder_pids);
+    assert_ne!(
+        userspace.doc["modules"][0]["id"],
+        kernel.doc["modules"][0]["id"]
+    );
+    assert_ne!(userspace.holder_ranges, kernel.holder_ranges);
+    let userspace = d4_projection(&fixtures, Some(&userspace), "userspace").unwrap();
+    let kernel = d4_projection(&fixtures, Some(&kernel), "kernel").unwrap();
+    assert_eq!(userspace.provider, fixtures.provider_id);
+    assert_eq!(
+        userspace.edges,
+        BTreeSet::from([FixtureRole::H1, FixtureRole::H2, FixtureRole::H3])
+    );
+    assert_eq!(
+        userspace.executable_ranges,
+        vec![
+            (
+                FixtureRole::H1,
+                fixtures.provider_id,
+                0x1000,
+                0x2000,
+                *b"r-xp"
+            ),
+            (
+                FixtureRole::H1,
+                fixtures.provider_id,
+                0x5000,
+                0x1000,
+                *b"r-xp"
+            ),
+            (
+                FixtureRole::H2,
+                fixtures.provider_id,
+                0x1000,
+                0x2000,
+                *b"r-xp"
+            ),
+            (
+                FixtureRole::H2,
+                fixtures.provider_id,
+                0x5000,
+                0x1000,
+                *b"r-xp"
+            ),
+            (
+                FixtureRole::H3,
+                fixtures.provider_id,
+                0x1000,
+                0x2000,
+                *b"r-xp"
+            ),
+            (
+                FixtureRole::H3,
+                fixtures.provider_id,
+                0x5000,
+                0x1000,
+                *b"r-xp"
+            ),
+            (
+                FixtureRole::Copy,
+                fixtures.copy_id,
+                0x1000,
+                0x2000,
+                *b"r-xp"
+            ),
+        ]
+    );
+    d4_pair(&userspace, &kernel).unwrap();
+}
+
+#[test]
+fn d4_parity_rejects_wrong_duplicate_missing_and_foreign_edges() {
+    let (_dir, fixtures) = d4_control_fixtures();
+    for backend in ["userspace", "kernel"] {
+        let mut observation = d4_control_observation(&fixtures, backend, 1);
+        let healthy = observation.doc.clone();
+        let mut missing = healthy.clone();
+        missing["edges"].as_array_mut().unwrap().remove(1);
+        let mut compensated = healthy.clone();
+        compensated["edges"][1]["caller"] = compensated["callers"][3]["id"].clone();
+        let mut duplicate = healthy.clone();
+        let repeated = duplicate["edges"][0].clone();
+        duplicate["edges"].as_array_mut().unwrap().push(repeated);
+        let mut foreign = healthy.clone();
+        let mut row = foreign["callers"][0].clone();
+        row["id"] = serde_json::json!("foreign-caller");
+        row["pid"] = serde_json::json!(77_777);
+        foreign["callers"].as_array_mut().unwrap().push(row);
+        foreign["edges"][1]["caller"] = serde_json::json!("foreign-caller");
+        let mut dataonly = healthy.clone();
+        dataonly["edges"][1]["caller"] = dataonly["callers"][4]["id"].clone();
+        let mut empty = healthy.clone();
+        empty["edges"] = serde_json::json!([]);
+        for (name, bad) in [
+            ("missing H2 even if both legs omit it", missing),
+            ("same total with copy replacing H2", compensated),
+            ("duplicate H1", duplicate),
+            ("same total with foreign caller replacing H2", foreign),
+            ("data-only mapper replacing H2", dataonly),
+            ("empty edges", empty),
+        ] {
+            observation.doc = bad;
+            assert!(
+                d4_projection(&fixtures, Some(&observation), backend).is_err(),
+                "{backend} accepted {name}"
+            );
+            observation.doc = healthy.clone();
+            assert!(d4_projection(&fixtures, Some(&observation), backend).is_ok());
+        }
+    }
+}
+
+#[test]
+fn d4_parity_rejects_refusal_fallback_and_partial_legs() {
+    let (_dir, fixtures) = d4_control_fixtures();
+    assert!(d4_projection(&fixtures, None, "kernel").is_err());
+    assert!(d4_projection(&fixtures, None, "userspace").is_err());
+    let mut kernel = d4_control_observation(&fixtures, "kernel", 1);
+    kernel.doc["observation"]["identity"]["fallback"] = serde_json::json!("stream_invalid");
+    assert!(d4_projection(&fixtures, Some(&kernel), "kernel").is_err());
+    kernel.doc["observation"]["identity"]["fallback"] = Value::Null;
+    assert!(d4_projection(&fixtures, Some(&kernel), "kernel").is_ok());
+    kernel.doc["observation"]["identity"]["backend"] = serde_json::json!("userspace");
+    assert!(d4_projection(&fixtures, Some(&kernel), "kernel").is_err());
+    let mut userspace = d4_control_observation(&fixtures, "userspace", 2);
+    let healthy = userspace.doc.clone();
+    userspace.doc["edges"].as_array_mut().unwrap().remove(1);
+    userspace.doc["gaps"] = serde_json::json!([{
+        "subject": "maps attribution", "reason": "map_files_unavailable",
+        "caller": null, "module": null, "pid": userspace.holder_pids[1],
+        "budget": null, "repeats": 1,
+    }]);
+    assert!(d4_projection(&fixtures, Some(&userspace), "userspace").is_err());
+    userspace.doc = healthy.clone();
+    userspace.doc["observation"]["usage_feed"] = serde_json::json!(true);
+    assert!(d4_projection(&fixtures, Some(&userspace), "userspace").is_err());
+    userspace.doc = healthy.clone();
+    userspace.doc["edges"][0]["entries"]["observation"] = serde_json::json!("observed");
+    assert!(d4_projection(&fixtures, Some(&userspace), "userspace").is_err());
+    userspace.doc = healthy;
+    assert!(d4_projection(&fixtures, Some(&userspace), "userspace").is_ok());
+}
+
+#[test]
+fn d4_parity_rejects_changed_physical_file_and_input_ranges() {
+    let (_dir, fixtures) = d4_control_fixtures();
+    let (_other_dir, other_files) = d4_control_fixtures();
+    assert_eq!(
+        std::fs::read(&fixtures.provider).unwrap(),
+        std::fs::read(&other_files.provider).unwrap()
+    );
+    assert_ne!(fixtures.provider_id, other_files.provider_id);
+    let userspace = d4_control_observation(&fixtures, "userspace", 1);
+    let first = d4_projection(&fixtures, Some(&userspace), "userspace").unwrap();
+    let other = d4_control_observation(&other_files, "kernel", 2);
+    let other = d4_projection(&other_files, Some(&other), "kernel").unwrap();
+    assert!(
+        d4_pair(&first, &other).is_err(),
+        "equal bytes joined different physical files"
+    );
+    for mutation in [
+        "offset",
+        "missing",
+        "duplicate",
+        "empty",
+        "missing-negative",
+        "executable-negative",
+    ] {
+        let mut kernel = d4_control_observation(&fixtures, "kernel", 2);
+        match mutation {
+            "offset" => {
+                kernel.role_ranges.get_mut(&FixtureRole::H2).unwrap()[0].file_offset += 0x1000
+            }
+            "missing" => {
+                kernel.role_ranges.get_mut(&FixtureRole::H2).unwrap().pop();
+            }
+            "duplicate" => {
+                let rows = kernel.role_ranges.get_mut(&FixtureRole::H2).unwrap();
+                rows.push(rows[0].clone());
+            }
+            "empty" => kernel
+                .role_ranges
+                .get_mut(&FixtureRole::H2)
+                .unwrap()
+                .clear(),
+            "missing-negative" => {
+                kernel.role_pids.remove(&FixtureRole::DataOnly);
+            }
+            "executable-negative" => {
+                kernel.role_ranges.get_mut(&FixtureRole::DataOnly).unwrap()[0].permissions =
+                    *b"r-xp"
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            d4_projection(&fixtures, Some(&kernel), "kernel")
+                .and_then(|second| d4_pair(&first, &second))
+                .is_err(),
+            "accepted {mutation} input ranges"
+        );
+        let restored = d4_control_observation(&fixtures, "kernel", 2);
+        let restored = d4_projection(&fixtures, Some(&restored), "kernel").unwrap();
+        d4_pair(&first, &restored).unwrap();
+    }
+}
+
+#[test]
+fn d4_fixture_range_parser_keeps_offsets_permissions_and_multiplicity() {
+    let provider = Path::new("/owned/id-d4.so");
+    let maps = "1000-3000 r-xp 00001000 00:23 42 /owned/id-d4.so\n\
+                5000-7000 r-xp 00001000 00:23 42 /owned/id-d4.so\n\
+                9000-a000 r--p 00000000 00:23 42 /owned/id-d4.so\n\
+                b000-c000 r-xp 00009000 00:23 43 /owned/id-copy.so\n";
+    let rows = parse_fixture_ranges(maps, provider).unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(
+        (
+            rows[0].start,
+            rows[0].end,
+            rows[0].file_offset,
+            rows[0].permissions
+        ),
+        (0x1000, 0x3000, 0x1000, *b"r-xp")
+    );
+    assert_eq!(
+        (
+            rows[1].start,
+            rows[1].end,
+            rows[1].file_offset,
+            rows[1].permissions
+        ),
+        (0x5000, 0x7000, 0x1000, *b"r-xp")
+    );
+    assert_eq!(
+        (
+            rows[2].start,
+            rows[2].end,
+            rows[2].file_offset,
+            rows[2].permissions
+        ),
+        (0x9000, 0xa000, 0, *b"r--p")
+    );
+    for bad in [
+        "1000-1000 r-xp 00001000 00:23 42 /owned/id-d4.so\n",
+        "3000-1000 r-xp 00001000 00:23 42 /owned/id-d4.so\n",
+        "1000-3000 r-xp bad-offset 00:23 42 /owned/id-d4.so\n",
+    ] {
+        assert!(
+            parse_fixture_ranges(bad, provider).is_err(),
+            "accepted {bad:?}"
+        );
+        assert_eq!(parse_fixture_ranges(maps, provider).unwrap().len(), 3);
+    }
 }

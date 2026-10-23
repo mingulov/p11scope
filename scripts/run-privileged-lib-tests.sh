@@ -38,6 +38,10 @@
 #     and P11SCOPE_T3A_RATE (SoftHSM continuity experiment, defaults 60 s and
 #     0 unrelated mapping ops/s): optional Task 3 Stage A sizing knobs with
 #     defaults; the runner leaves them unset.
+#   P11SCOPE_COUNTER_BANK_FIXTURE_PROVIDER / _WORKLOAD: prebuilt LP64
+#     fixtures for the separately selected Counts-bank Session test. It also
+#     requires a P11SCOPE_COUNTER_BANK_PROOF=1 libtest build; the runner does
+#     not build or supply these inputs, so that cell is a documented skip.
 #   RLIMIT_NOFILE: the Task 4 gates sample soft/hard nofile per phase, the
 #     T7 boundary cell pref lights live FD occupancy against it, and
 #     Session::start may raise soft to hard at attach; wide cells attach
@@ -234,6 +238,10 @@ inventory::privileged_tests::privileged_native_lane_system_many_endpoints_lp64
 # env): it scales only this cell's 100 ms tick-gap bound and its pass
 # floor. The runner refuses a value outside 1..4 and records a set one.
 inventory::privileged_tests::privileged_native_lane_dashboard_slow_pty_lp64
+# Typed counter readers: real anonymous native maps, with no program load,
+# attach, external workload or opt-in object build required.
+metrics::counter_reader::tests::counter_reader_native_maps_match_all_modes
+metrics::counter_reader::tests::counter_reader_requires_exact_maps_and_health
 )
 
 # Feature-alternative load gates: exactly one exists per binary. Default
@@ -293,6 +301,7 @@ process::tests::pidfd_denial::pidfd_denial_helper
 run::root_fence_runtime::actual_original_exit_delayed_first_admission_retires_pending
 inventory::privileged_tests::privileged_identity_kernel_sweep_cell_lp64
 inventory::privileged_tests::privileged_identity_kernel_multipass_reuse_lp64
+metrics::counter_reader::tests::counter_bank_session_old_return_survives_append_lp64
 s1_tests::resource_probe::native_semantic_resource_final_probe
 s1_tests::resource_probe::native_semantic_resource_registry_probe
 semantics_edge::resource_tests::native_semantic_resource_probe
@@ -317,6 +326,7 @@ SKIP_REASONS=(
 "needs a separately reviewed native stage via P11SCOPE_ROOT_RUNTIME_STAGE (provider.so, driver, provider.json); the test documents no runtime skip"
 "needs TMPDIR on btrfs (it asserts the statfs magic) plus a kernel-identity-capable host (BTF, task_iter pidfd); run by hand as root: TMPDIR=<btrfs dir> <binary> --exact <path> --ignored"
 "needs TMPDIR on btrfs (it asserts the statfs magic) plus a kernel-identity-capable host (BTF, task_iter pidfd); run by hand as root: TMPDIR=<btrfs dir> <binary> --exact <path> --ignored"
+"needs a P11SCOPE_COUNTER_BANK_PROOF=1 libtest build and explicitly prebuilt LP64 fixtures via P11SCOPE_COUNTER_BANK_FIXTURE_PROVIDER/P11SCOPE_COUNTER_BANK_FIXTURE_WORKLOAD; run the exact ignored test as root in an authorized BPF lane"
 "requires explicit controller-granted host measurement; spawns bounded child probes for the final multi-profile large4096 registry measurement, so schedule under a separate authorized measurement plan"
 "requires explicit controller-granted host measurement; spawns bounded child probes for the multi-profile large4096 registry measurement, so schedule under a separate authorized measurement plan"
 "requires explicit controller-granted host measurement; spawns bounded reducer-profile probes with at most 32 edges per profile, so schedule under a separate authorized measurement plan"

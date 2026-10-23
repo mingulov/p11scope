@@ -31,6 +31,24 @@ pub(crate) enum OwnedLink {
     Multi(Vec<OwnedFd>),
     /// Aya's owning legacy perf representation; moved intact, never reopened.
     Probe(UProbeLink),
+    /// Payload closes before its counter ownership guard. The entire value
+    /// travels through submission failure, quarantine and explicit abandon.
+    Counter {
+        link: Box<OwnedLink>,
+        _keepalive: Arc<super::counter_banks::CounterKeepalive>,
+    },
+}
+
+impl OwnedLink {
+    pub(crate) fn retain_counter(
+        self,
+        keepalive: Arc<super::counter_banks::CounterKeepalive>,
+    ) -> Self {
+        Self::Counter {
+            link: Box::new(self),
+            _keepalive: keepalive,
+        }
+    }
 }
 
 /// The existing producer detach order from `detach_selected_with` as data:
@@ -44,12 +62,14 @@ impl DetachOrder {
     pub(crate) fn rank(&self, producer: &ProducerProgram) -> u8 {
         const EARLY: &[(ProducerProgram, u8)] = &[
             (ProducerProgram::UProbe("p11_entry"), 0),
+            (ProducerProgram::UProbe("p11_counter_bank_entry"), 0),
             (ProducerProgram::UProbe("p11_entry_ia32"), 1),
             (ProducerProgram::UProbe("p11_entry_template"), 2),
             (ProducerProgram::UProbe("p11_entry_template_types"), 3),
             (ProducerProgram::UProbe("p11_entry_template_pair"), 4),
             (ProducerProgram::BtfTracePoint("task_newtask"), 5),
             (ProducerProgram::UProbe("p11_return"), 6),
+            (ProducerProgram::UProbe("p11_counter_bank_return"), 6),
         ];
         if let Some((_, rank)) = EARLY.iter().find(|(named, _)| named == producer) {
             return *rank;
@@ -1025,6 +1045,19 @@ mod tests {
             order.rank(&ProducerProgram::UProbe("p11_counter_bank_entry"))
                 < order.rank(&ProducerProgram::UProbe("p11_counter_bank_return"))
         );
+        let mut synchronous = Vec::new();
+        let failures = crate::attach::detach_selected_with(
+            vec![
+                (ProducerProgram::UProbe("p11_counter_bank_return"), "return"),
+                (ProducerProgram::UProbe("p11_counter_bank_entry"), "entry"),
+            ],
+            |side| {
+                synchronous.push(side);
+                Ok(())
+            },
+        );
+        assert!(failures.is_empty());
+        assert_eq!(synchronous, ["entry", "return"]);
         assert!(
             order.rank(&ProducerProgram::UProbe("p11_counter_bank_return"))
                 < order.rank(&ProducerProgram::RawTracePoint("sched_process_exit"))
@@ -1034,11 +1067,46 @@ mod tests {
     #[test]
     fn counter_keepalive_survives_failed_quarantined_and_abandoned_payloads() {
         use crate::attach::counter_banks::CounterKeepalive;
-        use crate::semantics_edge::resources::{
-            SEMANTIC_TRANSITION_SCRATCH, SemanticResourcePool,
-        };
+        use crate::semantics_edge::resources::{SEMANTIC_TRANSITION_SCRATCH, SemanticResourcePool};
 
         let pool = SemanticResourcePool::reference_limit(4 * 1024 * 1024);
+        let held = CounterKeepalive::precharge(&pool.reserver(), 16 * 1024).unwrap();
+        let weak = Arc::downgrade(&held);
+        let (owned, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let peer = Mutex::new(peer);
+        let closing_guard = weak.clone();
+        let observed_pool = pool.snapshot().charged_bytes;
+        // The actual native FD closes before the guard's final refund. The
+        // peer's EOF is independent of a possibly reused process FD number.
+        let mut healthy = CleanupWorker::pre_start_with(
+            Box::new(move |payload, _| {
+                use std::io::Read;
+                assert!(closing_guard.upgrade().is_some());
+                let mut peer = peer.lock().unwrap();
+                assert_eq!(
+                    peer.read(&mut [0u8; 1]).unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+                drop(payload.take());
+                assert!(closing_guard.upgrade().is_none());
+                assert_eq!(peer.read(&mut [0u8; 1]).unwrap(), 0);
+                Ok(())
+            }),
+            Arc::new(|| Duration::ZERO),
+        );
+        healthy.submit(
+            vec![(
+                OwnedLink::Multi(vec![owned.into()]).retain_counter(held),
+                ProducerProgram::UProbe("p11_counter_bank_entry"),
+            )],
+            Arc::default(),
+            DetachOrder,
+        );
+        assert!(healthy.join().completed);
+        assert!(weak.upgrade().is_none());
+        assert!(observed_pool > pool.snapshot().charged_bytes);
+        assert_eq!(pool.snapshot().charged_bytes, SEMANTIC_TRANSITION_SCRATCH);
         let held = CounterKeepalive::precharge(&pool.reserver(), 32 * 1024).unwrap();
         let weak = Arc::downgrade(&held);
         let mut refused = CleanupWorker::pre_start();
@@ -1047,15 +1115,22 @@ mod tests {
         let failure = refused
             .submit_live(
                 vec![(link, ProducerProgram::UProbe("p11_counter_bank_entry"))],
-                Arc::default(), DetachOrder,
+                Arc::default(),
+                DetachOrder,
             )
             .unwrap_err();
         assert!(weak.upgrade().is_some());
-        assert_eq!(pool.snapshot().charged_bytes, SEMANTIC_TRANSITION_SCRATCH + 32 * 1024);
+        assert_eq!(
+            pool.snapshot().charged_bytes,
+            SEMANTIC_TRANSITION_SCRATCH + 32 * 1024
+        );
         refused.retain_unsubmitted(failure);
         let receipt = refused.join();
         assert!(!receipt.completed);
-        assert!(weak.upgrade().is_some(), "failed submission payload owns its charge");
+        assert!(
+            weak.upgrade().is_some(),
+            "failed submission payload owns its charge"
+        );
         // Test teardown may reclaim a known non-native empty payload. Production
         // leaves uncertain real links and their keepalive retained for exit.
         refused.unsubmitted.lock().unwrap().clear();
@@ -1072,15 +1147,23 @@ mod tests {
             vec![(
                 OwnedLink::Multi(Vec::new()).retain_counter(held),
                 ProducerProgram::UProbe("p11_counter_bank_return"),
-            )], Arc::default(), DetachOrder,
+            )],
+            Arc::default(),
+            DetachOrder,
         );
         assert!(!failed.join().completed);
-        assert!(weak.upgrade().is_some(), "quarantine owns the counter guard");
+        assert!(
+            weak.upgrade().is_some(),
+            "quarantine owns the counter guard"
+        );
         let slot = failed.state.lock().unwrap().quarantined.pop().unwrap();
         let payload = slot.lock().unwrap().payload.take().unwrap();
         drop(failed);
         drop(slot);
-        assert!(weak.upgrade().is_some(), "the abandoned payload carries its own guard");
+        assert!(
+            weak.upgrade().is_some(),
+            "the abandoned payload carries its own guard"
+        );
         drop(payload);
         assert!(weak.upgrade().is_none());
         assert_eq!(pool.snapshot().charged_bytes, SEMANTIC_TRANSITION_SCRATCH);

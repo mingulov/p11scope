@@ -45,9 +45,9 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
 
-mod counter_generation;
 #[allow(dead_code)] // Unselected Counts bank transaction; no public loader/selector.
 pub(crate) mod counter_banks;
+mod counter_generation;
 pub(crate) mod detailed_identity;
 mod ended_pid_retirement;
 mod global_retirement;
@@ -1356,6 +1356,9 @@ pub struct Session {
     object_decode: Option<ObjectDecodeTable>,
     #[cfg(feature = "h6-reexec-diagnostic")]
     reexec_diagnostic: Option<reexec_diagnostic::Diagnostic>,
+    /// Last: synchronous Aya links/maps/pins drop before the reservation.
+    /// Every asynchronous transferred link also carries the same keepalive.
+    counter_banks: Option<counter_banks::CounterBanks>,
 }
 
 /// Move-only terminal work, stored inside its original Session. Submission is
@@ -1861,13 +1864,13 @@ fn detach_selected_with<T>(
     mut detach: impl FnMut(T) -> Result<()>,
 ) -> Vec<anyhow::Error> {
     selected.sort_by_key(|(producer, _)| match producer {
-        ProducerProgram::UProbe("p11_entry") => 0,
+        ProducerProgram::UProbe("p11_entry" | "p11_counter_bank_entry") => 0,
         ProducerProgram::UProbe("p11_entry_ia32") => 1,
         ProducerProgram::UProbe("p11_entry_template") => 2,
         ProducerProgram::UProbe("p11_entry_template_types") => 3,
         ProducerProgram::UProbe("p11_entry_template_pair") => 4,
         ProducerProgram::BtfTracePoint("task_newtask") => 5,
-        ProducerProgram::UProbe("p11_return") => 6,
+        ProducerProgram::UProbe("p11_return" | "p11_counter_bank_return") => 6,
         ProducerProgram::RawTracePoint(_) => 8,
         ProducerProgram::InstanceHook(_) => 9,
         _ => 7,
@@ -2016,12 +2019,13 @@ fn export_programs(abi: HookAbi) -> (&'static str, &'static str) {
 
 fn static_probe_side(program: &str) -> Option<ProbeSide> {
     match program {
-        "p11_return" => Some(ProbeSide::Return),
+        "p11_return" | "p11_counter_bank_return" => Some(ProbeSide::Return),
         "p11_entry"
         | "p11_entry_ia32"
         | "p11_entry_template"
         | "p11_entry_template_types"
-        | "p11_entry_template_pair" => Some(ProbeSide::Entry),
+        | "p11_entry_template_pair"
+        | "p11_counter_bank_entry" => Some(ProbeSide::Entry),
         _ => None,
     }
 }
@@ -3430,10 +3434,41 @@ pub(crate) fn attach_targets_with(
     )
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StaticRoots {
+    Detailed,
+    CounterBanks,
+}
+
+#[cfg(test)]
 fn attach_targets_observed_with(
     slots: &[Slot],
     policy: CapturePolicy,
     object_has_unsafe: bool,
+    abi_for: impl FnMut(&Slot) -> Result<ElfAbi>,
+    attach: impl FnMut(
+        &'static str,
+        &Slot,
+        UProbeAttachPoint<'static>,
+    ) -> pid_continuity::NativeAttempt<(), anyhow::Error>,
+    completed_at: impl FnMut(&Slot) -> Option<u64>,
+) -> Result<AttachOutcome> {
+    attach_targets_observed_with_roots(
+        slots,
+        policy,
+        object_has_unsafe,
+        StaticRoots::Detailed,
+        abi_for,
+        attach,
+        completed_at,
+    )
+}
+
+fn attach_targets_observed_with_roots(
+    slots: &[Slot],
+    policy: CapturePolicy,
+    object_has_unsafe: bool,
+    roots: StaticRoots,
     mut abi_for: impl FnMut(&Slot) -> Result<ElfAbi>,
     mut attach: impl FnMut(
         &'static str,
@@ -3448,6 +3483,18 @@ fn attach_targets_observed_with(
         .iter()
         .map(|slot| abi_for(slot).map(|abi| (slot, abi)))
         .collect::<Result<Vec<_>>>()?;
+    if roots == StaticRoots::CounterBanks
+        && (policy != CapturePolicy::AggregateOnly
+            || object_has_unsafe
+            || targets.iter().any(|(_, abi)| *abi != ElfAbi::Lp64))
+    {
+        bail!("private Counts bank attachment requires the LP64 aggregate-only fixed pair");
+    }
+    let return_program = if roots == StaticRoots::CounterBanks {
+        "p11_counter_bank_return"
+    } else {
+        "p11_return"
+    };
     let mut successful = BTreeSet::new();
     let mut failures = Vec::new();
     let mut completed = Vec::new();
@@ -3481,7 +3528,7 @@ fn attach_targets_observed_with(
         }
     };
     for (slot, _) in &targets {
-        let attempt = attach("p11_return", slot, slot_attach_point(slot));
+        let attempt = attach(return_program, slot, slot_attach_point(slot));
         timings
             .entry(slot.index)
             .or_default()
@@ -3489,7 +3536,7 @@ fn attach_targets_observed_with(
         match attempt.result {
             Ok(()) => {
                 successful.insert(
-                    static_endpoint("p11_return", slot.index)
+                    static_endpoint(return_program, slot.index)
                         .expect("p11_return is a static endpoint"),
                 );
                 return_attached.insert(slot.index);
@@ -3511,7 +3558,9 @@ fn attach_targets_observed_with(
         }
     }
 
-    let entry_programs: &[&str] = if object_has_unsafe {
+    let entry_programs: &[&str] = if roots == StaticRoots::CounterBanks {
+        &["p11_counter_bank_entry"]
+    } else if object_has_unsafe {
         &[
             "p11_entry",
             "p11_entry_ia32",
@@ -3525,7 +3574,8 @@ fn attach_targets_observed_with(
     for program in entry_programs {
         for (slot, abi) in &targets {
             if !return_attached.contains(&slot.index)
-                || entry_program(&slot.semantics, policy, object_has_unsafe, *abi) != *program
+                || (roots == StaticRoots::Detailed
+                    && entry_program(&slot.semantics, policy, object_has_unsafe, *abi) != *program)
             {
                 continue;
             }
@@ -4145,6 +4195,22 @@ fn load_capture_object_with_images(
     discovery_bytes: u32,
     full_images: bool,
 ) -> std::result::Result<Ebpf, aya::EbpfError> {
+    load_capture_object_bytes_with_images(
+        btf,
+        events_bytes,
+        discovery_bytes,
+        full_images,
+        crate::EBPF_OBJECT,
+    )
+}
+
+fn load_capture_object_bytes_with_images(
+    btf: &Btf,
+    events_bytes: u32,
+    discovery_bytes: u32,
+    full_images: bool,
+    object: &[u8],
+) -> std::result::Result<Ebpf, aya::EbpfError> {
     EbpfLoader::new()
         .btf(Some(btf))
         .allow_unsupported_maps()
@@ -4153,7 +4219,7 @@ fn load_capture_object_with_images(
         .map_max_entries("IMAGE_CONTINUITY", if full_images { 16_384 } else { 1 })
         .map_max_entries("IMAGE_TGID_INDEX", if full_images { 16_384 } else { 1 })
         .map_max_entries("IMAGE_QUERY_REQUESTS", if full_images { 1_024 } else { 1 })
-        .load(crate::EBPF_OBJECT)
+        .load(object)
 }
 
 pub(crate) fn discovery_ring_bytes(scope: &Scope) -> u32 {
@@ -4344,12 +4410,23 @@ fn expected_programs(unsafe_enabled: bool) -> BTreeSet<&'static str> {
 }
 
 fn validate_program_inventory(ebpf: &Ebpf, unsafe_enabled: bool) -> Result<()> {
+    validate_program_inventory_with_roots(ebpf, unsafe_enabled, StaticRoots::Detailed)
+}
+
+fn validate_program_inventory_with_roots(
+    ebpf: &Ebpf,
+    unsafe_enabled: bool,
+    roots: StaticRoots,
+) -> Result<()> {
     let mut expected = expected_programs(unsafe_enabled);
     // The continuity hooks are present in every Detailed object but load
     // before deferred freezes, optionally (`InstanceTracking::prepare`).
     expected.extend(INSTANCE_PROGRAMS.iter().map(|(program, _)| *program));
     expected.insert("p11_image_query");
     expected.extend(selected_detailed::PROGRAMS);
+    if roots == StaticRoots::CounterBanks {
+        expected.extend(counter_banks::PROGRAMS);
+    }
     let actual: BTreeSet<_> = ebpf.programs().map(|(name, _)| name).collect();
     if actual != expected {
         bail!("eBPF program inventory {actual:?} differs from {expected:?}");
@@ -4927,6 +5004,32 @@ impl Session {
         backend: AttachBackend,
         selected: Option<&crate::process::PidPin>,
     ) -> Result<(Self, instance::PreparedInstanceTracking)> {
+        Self::prepare_inner_unlinked_with_object(
+            scope,
+            policy,
+            pause_key,
+            ring_bytes,
+            owned_child,
+            backend,
+            selected,
+            None,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "private common preparation adds a closed unselected object profile"
+    )]
+    fn prepare_inner_unlinked_with_object(
+        scope: &Scope,
+        policy: CapturePolicy,
+        pause_key: Option<PauseKey>,
+        ring_bytes: Option<u32>,
+        owned_child: Option<&OwnedChild>,
+        backend: AttachBackend,
+        selected: Option<&crate::process::PidPin>,
+        counter: Option<counter_banks::CounterPreparation<'_>>,
+    ) -> Result<(Self, instance::PreparedInstanceTracking)> {
         if policy.uses_unsafe_decoders() && !cfg!(feature = "unsafe-unvalidated-metadata") {
             bail!("unsafe-unvalidated-metadata policy is absent from this eBPF object");
         }
@@ -4944,11 +5047,19 @@ impl Session {
         } else {
             None
         };
-        let mut ebpf = load_capture_object_with_images(
+        let roots = if counter.is_some() {
+            StaticRoots::CounterBanks
+        } else {
+            StaticRoots::Detailed
+        };
+        let mut ebpf = load_capture_object_bytes_with_images(
             host.btf(),
             crate::run::resolve_ring_bytes(ring_bytes),
             discovery_ring_bytes(scope),
             policy.wants_instance_hooks(),
+            counter
+                .as_ref()
+                .map_or(crate::EBPF_OBJECT, |prepared| prepared.object),
         )
         .context("loading BPF object with required task storage")?;
         let native_selection =
@@ -4985,8 +5096,12 @@ impl Session {
                     );
                 }
                 SessionPreparation::ValidatePrograms => {
-                    validate_program_inventory(&ebpf, object_has_unsafe)
-                        .context("validating exact eBPF program inventory")?;
+                    (if roots == StaticRoots::Detailed {
+                        validate_program_inventory(&ebpf, object_has_unsafe)
+                    } else {
+                        validate_program_inventory_with_roots(&ebpf, object_has_unsafe, roots)
+                    })
+                    .context("validating exact eBPF program inventory")?;
                 }
                 SessionPreparation::PublishScope => {
                     crate::scope::publish(&mut ebpf, scope, policy, generation_token)
@@ -5138,6 +5253,9 @@ impl Session {
         // No producer has been attached yet. A selected attempt takes custody
         // of this complete owner before attaching its first lifecycle link.
         preparation?;
+        if let Some(counter) = &counter {
+            counter.validate_and_load(&mut ebpf)?;
+        }
         let events_domain = prepared_domain.expect("preparation established the events domain");
         let discovery_domain =
             prepared_discovery_domain.expect("preparation established the discovery domain");
@@ -5197,6 +5315,7 @@ impl Session {
                 object_decode: None,
                 #[cfg(feature = "h6-reexec-diagnostic")]
                 reexec_diagnostic: None,
+                counter_banks: counter.map(|prepared| prepared.banks),
             },
             prepared_instance.expect("preparation established image program load result"),
         ))
@@ -5861,6 +5980,13 @@ impl Session {
         targets: &[Slot],
         objects: &PinnedObjects,
     ) -> Result<TargetAttachResult> {
+        if self
+            .counter_banks
+            .as_ref()
+            .is_some_and(|banks| !banks.permits_link_stage(targets))
+        {
+            bail!("private counter links require their exact inactive bank transaction");
+        }
         let mut requested = BTreeSet::new();
         if let Some(slot) = targets.iter().find(|slot| !requested.insert(slot.index)) {
             bail!("slot {} was requested for attachment twice", slot.index);
@@ -5918,7 +6044,7 @@ impl Session {
                 }
             })
             .collect();
-        if self.native_selection.is_some() {
+        if self.native_selection.is_some() || self.counter_banks.is_some() {
             // Selected failure cleanup must retain the actual provider closure
             // even if the first endpoint side or a later multi leaf fails.
             for target in &prepared_targets {
@@ -5940,6 +6066,11 @@ impl Session {
         self.instance
             .prepare_targets(&mut self.ebpf, targets, objects);
         let scope = self.uprobe_scope;
+        let roots = if self.counter_banks.is_some() {
+            StaticRoots::CounterBanks
+        } else {
+            StaticRoots::Detailed
+        };
         #[cfg(feature = "h6-reexec-diagnostic")]
         let diagnostic = self.reexec_diagnostic();
         let outcome = if self.backend == AttachBackend::Multi {
@@ -5948,10 +6079,11 @@ impl Session {
             let ebpf = &mut self.ebpf;
             let links = &mut self.links;
             let pairs = &mut self.pid_pairs;
-            attach_targets_observed_with(
+            attach_targets_observed_with_roots(
                 targets,
                 self.policy,
                 cfg!(feature = "unsafe-unvalidated-metadata"),
+                roots,
                 |slot| {
                     Ok(attach_targets
                         .get(&slot.index)
@@ -6276,6 +6408,10 @@ impl Session {
         let Some(worker) = self.cleanup_worker.as_ref() else {
             return Ok(None);
         };
+        let counter_keepalive = self
+            .counter_banks
+            .as_ref()
+            .map(|banks| Arc::clone(&banks.keepalive));
         let ebpf = &mut self.ebpf;
         self.native_retirement.begin_with(
             self.uprobe_scope,
@@ -6288,7 +6424,14 @@ impl Session {
             &mut self.pid_pairs,
             &mut self.global_retirements,
             worker,
-            |link| take_owned_links(ebpf, link),
+            |link| {
+                take_owned_links(ebpf, link).map(|links| {
+                    links
+                        .into_iter()
+                        .map(|link| counter_banks::retain_link(link, counter_keepalive.as_ref()))
+                        .collect()
+                })
+            },
             pid_continuity::comparable_monotonic_ns,
         )
     }
@@ -6558,21 +6701,40 @@ impl Session {
         &mut self,
         family: TerminalProducerFamily,
     ) -> Vec<Result<(OwnedLink, ProducerProgram)>> {
+        let keepalive = self
+            .counter_banks
+            .as_ref()
+            .map(|banks| Arc::clone(&banks.keepalive));
         match family {
             TerminalProducerFamily::Registered => {
                 let mut outcomes = Vec::new();
                 for link in std::mem::take(&mut self.links) {
                     let producer = link.producer();
                     match take_owned_links(&mut self.ebpf, link) {
-                        Ok(links) => {
-                            outcomes.extend(links.into_iter().map(|link| Ok((link, producer))))
-                        }
+                        Ok(links) => outcomes.extend(links.into_iter().map(|link| {
+                            Ok((
+                                counter_banks::retain_link(link, keepalive.as_ref()),
+                                producer,
+                            ))
+                        })),
                         Err(error) => outcomes.push(Err(error)),
                     }
                 }
                 outcomes
             }
-            TerminalProducerFamily::InstanceHooks => self.instance.take_owned_hooks(&mut self.ebpf),
+            TerminalProducerFamily::InstanceHooks => self
+                .instance
+                .take_owned_hooks(&mut self.ebpf)
+                .into_iter()
+                .map(|outcome| {
+                    outcome.map(|(link, producer)| {
+                        (
+                            counter_banks::retain_link(link, keepalive.as_ref()),
+                            producer,
+                        )
+                    })
+                })
+                .collect(),
         }
     }
 
@@ -7531,6 +7693,9 @@ fn finish_producer_detach(
 
 impl Drop for Session {
     fn drop(&mut self) {
+        if self.counter_banks.is_some() {
+            self.stop_gate.request_stop();
+        }
         if let Some(selected) = &self.native_selection {
             self.stop_gate.request_stop();
             let _ = selected.close();
@@ -7551,10 +7716,19 @@ impl Drop for Session {
                 .collect(),
         );
         let mut owned = Vec::new();
+        let keepalive = self
+            .counter_banks
+            .as_ref()
+            .map(|banks| Arc::clone(&banks.keepalive));
         for link in std::mem::take(&mut self.links) {
             let producer = link.producer();
             if let Ok(links) = take_owned_links(&mut self.ebpf, link) {
-                owned.extend(links.into_iter().map(|link| (link, producer)));
+                owned.extend(links.into_iter().map(|link| {
+                    (
+                        counter_banks::retain_link(link, keepalive.as_ref()),
+                        producer,
+                    )
+                }));
             }
         }
         if let Some(worker) = self.cleanup_worker.take() {

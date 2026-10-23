@@ -75,6 +75,8 @@ pub(super) enum CounterIssue {
     ProducerSaturated,
     Contended,
     KernelEvidence,
+    BankRouting,
+    BankQuarantined,
     FoldOverflow(CounterField),
     Regressed { slot: u32, field: CounterField },
     Saturated { slot: u32, field: CounterField },
@@ -412,6 +414,8 @@ pub(super) enum ReadStage {
     Rvs,
     Health,
     KernelEvidence,
+    BankRouting,
+    BankQuarantined,
 }
 
 enum CollectionFailure {

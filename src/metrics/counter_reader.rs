@@ -1,5 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
-//! Private native counter acquisition; no selector or Session loading route.
+//! Private native counter acquisition; no public selector or reader activation.
 
 use super::counter_collector::{
     CounterCell, CounterField, CounterHealth, CounterIssue, CounterLimits, CounterRead, CounterRow,
@@ -47,11 +47,51 @@ pub(super) fn read(
     )
 }
 
+/// Private Counts-only bank bridge. The view shares the original map handles
+/// and leases; creating a scrape opens no inner-map FD or new cursor.
+#[allow(dead_code)] // Unselected two-cell proof; no public/runtime reader activation.
+pub(super) fn read_banked(
+    session: &Session,
+    plan: &AttachPlan,
+    limits: CounterLimits,
+    reserve: &SemanticResourceReserver,
+) -> Result<CounterRead, ReadStage> {
+    use crate::attach::counter_banks::BankRefusal;
+    let view = session
+        .counter_bank_view(plan)
+        .map_err(|failure| match failure {
+            BankRefusal::Quarantined => ReadStage::BankQuarantined,
+            _ => ReadStage::BankRouting,
+        })?;
+    let native = NativeSource::new(|name| session.ebpf.map(name), CounterMode::Counts)?;
+    let fault = session
+        .ebpf
+        .map("COUNTER_BANK_FAULT")
+        .ok_or(ReadStage::Health)?;
+    shape(fault, MapType::PerCpuArray, 4, 8, 1)?;
+    let source = BankedSource {
+        native,
+        view: &view,
+        ebpf: &session.ebpf,
+        fault: PerCpuArray::try_from(fault).map_err(|_| ReadStage::Health)?,
+    };
+    acquire(
+        &source,
+        session.counter_collection_generation(),
+        plan,
+        limits,
+        reserve,
+    )
+}
+
 /// Only I/O is replaceable: acquisition ordering, limits, precharge and checked
 /// folds are shared with the native adapter. No method clears/writes a map.
 trait CounterSource {
     fn mode(&self) -> CounterMode;
     fn possible_cpus(&self) -> usize;
+    fn routing(&self) -> Result<Option<CounterIssue>, ReadStage> {
+        Ok(None)
+    }
     fn rv_keys(&self) -> impl Iterator<Item = Result<RvKey, ReadStage>> + '_;
     fn rv_total(&self, key: &RvKey) -> Result<Result<u64, CounterIssue>, ReadStage>;
     fn fold_row(
@@ -110,24 +150,26 @@ fn acquire(
         .map_err(|_| ReadStage::Budget)?;
     let storage = ReadReservation::reserve(plan.slots.len(), limits.rv_keys, reserve)?;
     let mut rvs = Vec::with_capacity(limits.rv_keys);
-    let mut issue = None;
+    let mut issue = source.routing()?;
     // Do not use Aya's combined MapIter: it can internally skip missing keys
     // without exposing an iteration bound. Each key and lookup is explicit.
-    for key in source.rv_keys().take(limits.rv_keys + 1) {
-        let key = key?;
-        if rvs.len() == limits.rv_keys {
-            issue = Some(CounterIssue::Limits);
-            break;
-        }
-        if key._pad != 0 || !plan.slots.iter().any(|slot| slot.index == key.slot) {
-            issue = Some(CounterIssue::Topology);
-            break;
-        }
-        match source.rv_total(&key)? {
-            Ok(total) => rvs.push((key, total)),
-            Err(failure) => {
-                issue = Some(failure);
+    if issue.is_none() {
+        for key in source.rv_keys().take(limits.rv_keys + 1) {
+            let key = key?;
+            if rvs.len() == limits.rv_keys {
+                issue = Some(CounterIssue::Limits);
                 break;
+            }
+            if key._pad != 0 || !plan.slots.iter().any(|slot| slot.index == key.slot) {
+                issue = Some(CounterIssue::Topology);
+                break;
+            }
+            match source.rv_total(&key)? {
+                Ok(total) => rvs.push((key, total)),
+                Err(failure) => {
+                    issue = Some(failure);
+                    break;
+                }
             }
         }
     }
@@ -161,6 +203,7 @@ fn acquire(
     // fold/topology failure never fabricates successful missing-map reads.
     let health = source.health()?;
     let kernel = source.kernel()?;
+    let rows = source.routing()?.map_or(rows, Err);
     let window = ReadWindow::new(started, source.now());
     CounterRead::new(
         generation,
@@ -189,6 +232,78 @@ struct NativeSource<'a> {
     owner: Array<&'a MapData, ThreadOwnerControl>,
     cookie: Array<&'a MapData, ImageIdentityControl>,
     root: Array<&'a MapData, RootAffiliationControl>,
+}
+
+struct BankedSource<'a> {
+    native: NativeSource<'a>,
+    view: &'a crate::attach::counter_banks::CounterBankView,
+    ebpf: &'a aya::Ebpf,
+    fault: PerCpuArray<&'a MapData, u64>,
+}
+
+impl CounterSource for BankedSource<'_> {
+    fn mode(&self) -> CounterMode {
+        CounterMode::Counts
+    }
+    fn possible_cpus(&self) -> usize {
+        self.native.cpus
+    }
+    fn routing(&self) -> Result<Option<CounterIssue>, ReadStage> {
+        use crate::attach::counter_banks::BankReadStatus;
+        let status = self
+            .view
+            .routing(self.ebpf)
+            .map_err(|_| ReadStage::BankRouting)?;
+        // This additional sticky native map is always sampled, independently
+        // of ordinary counter health and all KernelEvidence/control cells.
+        let values = self.fault.get(&0, 0).map_err(|_| ReadStage::Health)?;
+        self.native.cpu_count(values.len(), ReadStage::Health)?;
+        Ok(match status {
+            BankReadStatus::Quarantined => Some(CounterIssue::BankQuarantined),
+            BankReadStatus::Routing => Some(CounterIssue::BankRouting),
+            BankReadStatus::Healthy if values.iter().any(|&value| value != 0) => {
+                Some(CounterIssue::BankRouting)
+            }
+            BankReadStatus::Healthy => None,
+        })
+    }
+    fn rv_keys(&self) -> impl Iterator<Item = Result<RvKey, ReadStage>> + '_ {
+        self.native.rv_keys()
+    }
+    fn rv_total(&self, key: &RvKey) -> Result<Result<u64, CounterIssue>, ReadStage> {
+        self.native.rv_total(key)
+    }
+    fn fold_row(
+        &self,
+        slot: &Slot,
+        rvs: &[(RvKey, u64)],
+        limits: CounterLimits,
+    ) -> Result<Result<CounterRow, CounterIssue>, ReadStage> {
+        let map = self.view.bank(slot.index).ok_or(ReadStage::Stats)?;
+        shape(map, MapType::PerCpuArray, 4, 24, 1)?;
+        let stats: PerCpuArray<_, CountStats> =
+            PerCpuArray::try_from(map).map_err(|_| ReadStage::Stats)?;
+        // Global physical slot chooses its retained bank. Only the actual
+        // one-cell inner index is zero; RV keys retain the global slot/full64.
+        let values = stats.get(&0, 0).map_err(|_| ReadStage::Stats)?;
+        self.native.cpu_count(values.len(), ReadStage::Stats)?;
+        Ok(CounterRow::fold(
+            slot,
+            CounterMode::Counts,
+            values.iter().map(CounterCell::Counts),
+            rvs.iter().copied(),
+            limits,
+        ))
+    }
+    fn health(&self) -> Result<CounterHealth, ReadStage> {
+        self.native.health()
+    }
+    fn kernel(&self) -> Result<KernelEvidence, ReadStage> {
+        self.native.kernel()
+    }
+    fn now(&self) -> Option<u64> {
+        self.native.now()
+    }
 }
 
 fn shape(
@@ -668,13 +783,19 @@ mod tests {
         assert_eq!(
             collector.observe(acquire(
                 &Scripted::sample(CounterMode::Counts, false),
-                NonZeroU64::new(5).unwrap(), &plan(), LIMITS, &pool.reserver(),
+                NonZeroU64::new(5).unwrap(),
+                &plan(),
+                LIMITS,
+                &pool.reserver(),
             )),
             CounterObservation::Initial,
         );
         match collector.observe(acquire(
             &Scripted::sample(CounterMode::Counts, true),
-            NonZeroU64::new(5).unwrap(), &plan(), LIMITS, &pool.reserver(),
+            NonZeroU64::new(5).unwrap(),
+            &plan(),
+            LIMITS,
+            &pool.reserver(),
         )) {
             CounterObservation::Advanced { deltas, .. } => {
                 assert_eq!((deltas[0].entered, deltas[0].returned), (5, 4));
@@ -689,15 +810,34 @@ mod tests {
             let mut damaged = Scripted::sample(CounterMode::Counts, true);
             damaged.routing = Some(issue);
             let read = acquire(
-                &damaged, NonZeroU64::new(6).unwrap(), &plan(), LIMITS, &pool.reserver(),
-            ).unwrap();
-            assert_eq!(damaged.rv_reads.get(), 0, "known poisoned routing must not sample rows");
-            assert_eq!(damaged.accesses.get(), 2, "health and kernel controls still read");
-            assert_eq!(collector.observe(Ok(read)), CounterObservation::Unavailable(issue));
+                &damaged,
+                NonZeroU64::new(6).unwrap(),
+                &plan(),
+                LIMITS,
+                &pool.reserver(),
+            )
+            .unwrap();
+            assert_eq!(
+                damaged.rv_reads.get(),
+                0,
+                "known poisoned routing must not sample rows"
+            );
+            assert_eq!(
+                damaged.accesses.get(),
+                2,
+                "health and kernel controls still read"
+            );
+            assert_eq!(
+                collector.observe(Ok(read)),
+                CounterObservation::Unavailable(issue)
+            );
             assert_eq!(
                 collector.observe(acquire(
                     &Scripted::sample(CounterMode::Counts, true),
-                    NonZeroU64::new(6).unwrap(), &plan(), LIMITS, &pool.reserver(),
+                    NonZeroU64::new(6).unwrap(),
+                    &plan(),
+                    LIMITS,
+                    &pool.reserver(),
                 )),
                 CounterObservation::Unavailable(issue),
                 "same-generation clean cells cannot erase routing/quarantine loss",
@@ -707,7 +847,13 @@ mod tests {
         damaged.routing = Some(CounterIssue::BankRouting);
         damaged.fail = Some(ReadStage::KernelEvidence);
         assert!(matches!(
-            acquire(&damaged, NonZeroU64::new(7).unwrap(), &plan(), LIMITS, &pool.reserver()),
+            acquire(
+                &damaged,
+                NonZeroU64::new(7).unwrap(),
+                &plan(),
+                LIMITS,
+                &pool.reserver()
+            ),
             Err(ReadStage::KernelEvidence),
         ));
     }
@@ -1395,5 +1541,257 @@ mod tests {
                 "native control/evidence failure {failure}"
             );
         }
+    }
+
+    #[test]
+    #[ignore = "requires explicitly prebuilt LP64 counter-banks fixtures and authorized native attach"]
+    fn counter_bank_session_old_return_survives_append_lp64() {
+        use crate::attach::Scope;
+        use crate::attach::counter_banks::{BankPublication, BankReservation};
+        use std::io::{Read, Write};
+        use std::os::fd::AsRawFd;
+        use std::path::{Path, PathBuf};
+        use std::process::{Child, Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        struct OwnedFixture(Child);
+        impl Drop for OwnedFixture {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        impl OwnedFixture {
+            fn token(&mut self, expected: &str) {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let output = self.0.stdout.as_mut().unwrap();
+                let mut line = Vec::new();
+                loop {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    assert!(
+                        !remaining.is_zero(),
+                        "owned counter fixture barrier timed out"
+                    );
+                    let mut poll = libc::pollfd {
+                        fd: output.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    let millis = i32::try_from(remaining.as_millis().max(1)).unwrap();
+                    // SAFETY: one initialized pollfd is live for the finite call.
+                    let ready = unsafe { libc::poll(&mut poll, 1, millis) };
+                    if ready < 0
+                        && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                    {
+                        continue;
+                    }
+                    assert!(ready > 0, "owned fixture did not reach its next barrier");
+                    let mut byte = [0u8; 1];
+                    output.read_exact(&mut byte).unwrap();
+                    if byte[0] == b'\n' {
+                        break;
+                    }
+                    assert!(line.len() < 16, "fixture emits only finite protocol tokens");
+                    line.push(byte[0]);
+                }
+                assert_eq!(line, expected.as_bytes());
+            }
+            fn command(&mut self, byte: u8) {
+                self.0.stdin.as_mut().unwrap().write_all(&[byte]).unwrap();
+            }
+        }
+
+        assert_eq!(
+            env!("P11SCOPE_COUNTER_BANK_PROOF_ENABLED"),
+            "1",
+            "actual proof artifact is required"
+        );
+        let provider = PathBuf::from(
+            std::env::var_os("P11SCOPE_COUNTER_BANK_FIXTURE_PROVIDER")
+                .expect("prebuild tests/fixtures/counter-banks.c with -DCOUNTER_BANK_PROVIDER"),
+        );
+        let workload = PathBuf::from(
+            std::env::var_os("P11SCOPE_COUNTER_BANK_FIXTURE_WORKLOAD")
+                .expect("prebuild the same fixture's dlopen/pthread driver"),
+        );
+        let mut file = std::fs::File::open(&provider).unwrap();
+        let elf = p11scope_manifest::elf::ElfSnapshot::read(&file).unwrap();
+        assert_eq!(elf.abi(), p11scope_manifest::elf::ElfAbi::Lp64);
+        let old_offset = elf
+            .defined_symbol("counter_bank_old")
+            .unwrap()
+            .unwrap()
+            .file_offset;
+        let hot_offset = elf
+            .defined_symbol("counter_bank_hot")
+            .unwrap()
+            .unwrap()
+            .file_offset;
+        assert_ne!(old_offset, hot_offset);
+        assert!(elf.is_executable_offset(old_offset) && elf.is_executable_offset(hot_offset));
+        let mut provider_bytes = Vec::new();
+        file.read_to_end(&mut provider_bytes).unwrap();
+        use sha2::Digest;
+        let digest: String = sha2::Sha256::digest(&provider_bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        // Fixture-only explicit pin: real opened file/metadata/digest/ELF
+        // offsets. This cell grants no discovery or semantic authority.
+        let pins =
+            crate::discovery::identity::test_fixture::real_scan_pin(&provider, None, 1, &digest);
+        let object = pins.pinned().next().unwrap().id;
+        use std::os::unix::fs::MetadataExt;
+        let selected = file.metadata().unwrap();
+        let pinned = pins.file_for(object).unwrap().metadata().unwrap();
+        assert_eq!(
+            (selected.dev(), selected.ino()),
+            (pinned.dev(), pinned.ino())
+        );
+        let mut old = slot(0, 0);
+        old.object = object;
+        old.object_path = provider.to_string_lossy().into_owned();
+        old.file_offset = old_offset;
+        old.names = vec!["counter_bank_old".into()];
+        let mut hot = old.clone();
+        hot.index = 1;
+        hot.file_offset = hot_offset;
+        hot.names = vec!["counter_bank_hot".into()];
+        let policy =
+            crate::plan::AdmissionPolicy::counters(crate::capacity::CounterBudget::new(2).unwrap());
+        let first = AttachPlan::from_slots_with_policy(vec![old.clone()], policy).unwrap();
+        let grown = AttachPlan::from_slots_with_policy(vec![old, hot], policy).unwrap();
+
+        let child = Command::new(&workload)
+            .arg(&provider)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let mut fixture = OwnedFixture(child);
+        fixture.token("READY");
+        let cpus = aya::util::nr_cpus().unwrap();
+        let pool = SemanticResourcePool::reference_limit(512 * 1024 * 1024);
+        let base = BankReservation {
+            retained_bytes: 128 * 1024 * 1024,
+            transient_bytes: 64 * 1024 * 1024,
+            metadata_bytes: 32 * 1024 * 1024,
+            file_descriptors: cpus.checked_mul(4).unwrap() + 512,
+        };
+        let stage = BankReservation {
+            retained_bytes: 1024 * 1024,
+            transient_bytes: 1024 * 1024,
+            metadata_bytes: 256 * 1024,
+            file_descriptors: cpus.checked_mul(8).unwrap() + 16,
+        };
+        let bytes = std::fs::read(
+            Path::new(env!("OUT_DIR")).join("counter-bank-proof/p11scope-ebpf-counts-bank-proof"),
+        )
+        .unwrap();
+        let mut session = Session::prepare_counter_banks(
+            &Scope::Pid(fixture.0.id()),
+            &bytes,
+            base,
+            &pool.reserver(),
+        )
+        .unwrap();
+        let limits = CounterLimits {
+            rows: 2,
+            rv_keys: 4,
+        };
+        let BankPublication::Published {
+            transaction: old_transaction,
+            mask: 1,
+        } = session.stage_counter_banks(&first, &pins, stage, &pool.reserver())
+        else {
+            panic!("first actual bank did not publish");
+        };
+        let mut collector = CounterCollector::new(limits, pool.reserver());
+        assert_eq!(
+            collector.observe(read_banked(&session, &first, limits, &pool.reserver())),
+            CounterObservation::Initial
+        );
+
+        fixture.command(b'S');
+        fixture.token("HELD");
+        let starts: aya::maps::HashMap<_, StartKey, CallStart> =
+            aya::maps::HashMap::try_from(session.ebpf.map("START").unwrap()).unwrap();
+        let keys: Vec<_> = starts.keys().take(2).collect::<Result<_, _>>().unwrap();
+        assert_eq!(
+            keys.len(),
+            1,
+            "a genuine old START is held across publication"
+        );
+        assert_eq!(keys[0].slot, 0);
+        assert_eq!(starts.get(&keys[0], 0).unwrap().object_required, 0);
+        match collector.observe(read_banked(&session, &first, limits, &pool.reserver())) {
+            CounterObservation::Advanced { deltas, .. } => {
+                assert_eq!((deltas[0].entered, deltas[0].returned), (1, 0))
+            }
+            other => panic!("actual held entry was not collected: {other:?}"),
+        }
+        let BankPublication::Published {
+            transaction: new_transaction,
+            mask: 2,
+        } = session.stage_counter_banks(&grown, &pins, stage, &pool.reserver())
+        else {
+            panic!("actual append did not publish");
+        };
+        assert!(new_transaction > old_transaction);
+        fixture.command(b'H');
+        fixture.token("HOT");
+        match collector.observe(read_banked(&session, &grown, limits, &pool.reserver())) {
+            CounterObservation::Advanced { deltas, .. } => {
+                assert_eq!((deltas[0].entered, deltas[0].returned), (0, 0));
+                assert_eq!(
+                    (deltas[1].entered, deltas[1].returned, deltas[1].errors),
+                    (1, 1, 1)
+                );
+                assert_eq!(deltas[1].rv_counts.get(&0x1_0000_0204), Some(&1));
+            }
+            other => panic!("actual new hot bank was not collected: {other:?}"),
+        }
+        fixture.command(b'R');
+        fixture.token("DONE");
+        assert!(fixture.0.wait().unwrap().success());
+        match collector.observe(read_banked(&session, &grown, limits, &pool.reserver())) {
+            CounterObservation::Advanced { deltas, .. } => {
+                assert_eq!(
+                    (deltas[0].entered, deltas[0].returned, deltas[0].errors),
+                    (0, 1, 0)
+                );
+                assert_eq!(deltas[0].rv_counts.get(&0x204), Some(&1));
+                assert_eq!((deltas[1].entered, deltas[1].returned), (0, 0));
+            }
+            other => panic!("old-bank return did not survive the new transaction: {other:?}"),
+        }
+        session.stop_gate().request_stop();
+        session
+            .detach_producers_driven(|| false, &mut Vec::new())
+            .unwrap();
+        assert!(session.producers_detached());
+        assert!(session.stop_gate().quiescent());
+        let starts: aya::maps::HashMap<_, StartKey, CallStart> =
+            aya::maps::HashMap::try_from(session.ebpf.map("START").unwrap()).unwrap();
+        assert!(starts.keys().next().is_none());
+        let owner =
+            Array::<_, ThreadOwnerControl>::try_from(session.ebpf.map("OWNER_CTL").unwrap())
+                .unwrap()
+                .get(&0, 0)
+                .unwrap();
+        assert_eq!(
+            (owner.outstanding, owner.poison, owner.abandoned_start),
+            (0, 0, 0)
+        );
+        // No quiet optional NULL is counted as settlement; the actual old
+        // START, full64 RV, both return credits and native cleanup were read.
+        drop(collector);
+        drop(session);
+        assert_eq!(
+            pool.snapshot().charged_bytes,
+            SEMANTIC_TRANSITION_SCRATCH,
+            "actual native owners and collected storage refund only after drop"
+        );
     }
 }

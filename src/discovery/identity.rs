@@ -212,23 +212,7 @@ impl RetainedInventoryTarget {
     /// independently cloned strings. File/export Arc clones share their
     /// existing backing; their inline holders are charged by the caller.
     pub(crate) fn retained_copy_allocation_charge(&self) -> Option<usize> {
-        let mut bytes = 0usize;
-        for text in [
-            Some(&self.entry.raw.path),
-            Some(&self.entry.path),
-            Some(&self.entry.sha256),
-            self.entry.build_id.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            if text.capacity() != 0 {
-                bytes = bytes
-                    .checked_add(text.capacity())?
-                    .checked_add(crate::semantics_edge::resources::OWNED_ALLOCATION_PADDING)?;
-            }
-        }
-        Some(bytes)
+        retained_entry_copy_allocation_charge(&self.entry)
     }
 
     /// A second owner of this retained object: the same opened file (one
@@ -312,6 +296,23 @@ impl RetainedInventoryTarget {
             .get(&id)
             .is_some_and(|current| same_kernel_file(&self.entry.file, &current.file))
     }
+}
+
+fn retained_entry_copy_allocation_charge(entry: &Entry) -> Option<usize> {
+    [
+        Some(&entry.raw.path),
+        Some(&entry.path),
+        Some(&entry.sha256),
+        entry.build_id.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|text| text.capacity() != 0)
+    .try_fold(0usize, |bytes, text| {
+        bytes
+            .checked_add(text.capacity())?
+            .checked_add(crate::semantics_edge::resources::OWNED_ALLOCATION_PADDING)
+    })
 }
 
 /// The content half of one opened identity — the pin taken at open plus the
@@ -1192,6 +1193,16 @@ impl PinnedObjects {
             return Err(format!("Inventory object {id:?} changed before retention"));
         }
         Ok(retained)
+    }
+
+    /// Read-only bound before the first retained-target clone. The same
+    /// field/capacity arithmetic also charges later `share` copies; identity
+    /// checks and retention remain the responsibility of their existing path.
+    pub(crate) fn retained_target_copy_allocation_charge(
+        &self,
+        id: PinnedObjectId,
+    ) -> Option<usize> {
+        retained_entry_copy_allocation_charge(self.by_id.get(&id)?)
     }
 
     /// Replaces the raw ownership for one retained process generation while
@@ -3270,10 +3281,16 @@ mod tests {
     #[test]
     fn retained_target_charge_is_bounded_before_the_first_copy() {
         let mut pins = test_fixture::real_scan_pin(
-            Path::new("/usr/bin/true"), None, 1, "bank-pre-copy-charge",
+            Path::new("/usr/bin/true"),
+            None,
+            1,
+            "bank-pre-copy-charge",
         );
         let id = pins.pinned().next().unwrap().id;
-        assert_eq!(pins.retained_target_copy_allocation_charge(PinnedObjectId(u32::MAX)), None);
+        assert_eq!(
+            pins.retained_target_copy_allocation_charge(PinnedObjectId(u32::MAX)),
+            None
+        );
         let entry = pins.by_id.get_mut(&id).unwrap();
         entry.raw.path = String::with_capacity(4096);
         entry.raw.path.push_str("/raw/namespace/provider.so");
@@ -3286,16 +3303,26 @@ mod tests {
         let bound = pins.retained_target_copy_allocation_charge(id).unwrap();
         let original = &pins.by_id[&id];
         let expected = [
-            Some(&original.raw.path), Some(&original.path), Some(&original.sha256),
+            Some(&original.raw.path),
+            Some(&original.path),
+            Some(&original.sha256),
             original.build_id.as_ref(),
-        ].into_iter().flatten().map(|text| text.capacity() + 32).sum::<usize>();
+        ]
+        .into_iter()
+        .flatten()
+        .map(|text| text.capacity() + 32)
+        .sum::<usize>();
         assert_eq!(bound, expected);
-        assert!(bound > pins.summary(id).unwrap().path.len() + 1024,
-            "raw namespace text and spare capacities must be included");
+        assert!(
+            bound > pins.summary(id).unwrap().path.len() + 1024,
+            "raw namespace text and spare capacities must be included"
+        );
         assert_eq!(pins.revision(), before, "preallocation lookup is read-only");
         let retained = pins.retain_inventory_target(id).unwrap();
-        assert!(retained.retained_copy_allocation_charge().unwrap() <= bound,
-            "fresh String clones may trim capacity, but cannot exceed the pre-copy bound");
+        assert!(
+            retained.retained_copy_allocation_charge().unwrap() <= bound,
+            "fresh String clones may trim capacity, but cannot exceed the pre-copy bound"
+        );
         assert_eq!(retained.entry.raw.path, "/raw/namespace/provider.so");
         assert_eq!(retained.entry.path, "/display/provider.so");
         assert_eq!(pins.revision(), before);

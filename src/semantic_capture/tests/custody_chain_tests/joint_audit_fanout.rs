@@ -824,6 +824,16 @@ fn joint_birth_install_refuses_same_quantum_sibling_witness() {
     let publisher = NativePublisher::build();
     let (row, control, _) = publisher.publish_stamped(&["0", "0"], attached.generation());
     let mut rows = NativeBirthRows { row, control };
+    let h3 = scene.real.scene.coordinator.reference_h3_audit_state();
+    // Bind the actual existing namespace; this borrow neither takes H3 nor
+    // constructs evidence. The final port then splits those exact producers.
+    scene
+        .real
+        .scene
+        .coordinator
+        .session_h3_finalizer(&scene.producers)
+        .unwrap();
+    assert_eq!(scene.real.scene.coordinator.reference_h3_audit_state(), h3);
     let mut ports = scene
         .real
         .scene

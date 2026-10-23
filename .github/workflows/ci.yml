@@ -368,10 +368,11 @@ jobs:
           sudo install -m 0755 "$bpftool_source" /usr/local/bin/bpftool
           bpftool version
           sudo bpftool version
-      # Reviewed FULL size/scalar verifier boundaries, finite login type
-      # classification and fixed side-row scrubbing intentionally changed
-      # the default objects. Pin their accepted producer checkpoint;
-      # later userspace changes must preserve all three default objects.
+      # Reviewed private counter arms preserve default code/maps/type graphs,
+      # while intentionally changing debug/BTF line metadata. Pin the accepted
+      # producer and offline-recipe checkpoint separately from this workflow.
+      # Same-source opt-in/disabled full-object parity passes; later changes
+      # must preserve all three complete default objects, including metadata.
       # Object parity does not establish installed/live acceptance.
       # The checker reconstructs and explicitly fetches each immutable snapshot,
       # then builds it offline (including nested nightly Cargo). No target cache.
@@ -379,7 +380,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          BASELINE=383d52af7dbb99a95e7e52746e018e301106bb41
+          BASELINE=19876daa483357062a533944e4aec2f084ff8bfa
           comparison_root="$RUNNER_TEMP/bpf-noninterference"
           mkdir -m 700 "$comparison_root"
           python3 -I scripts/check-bpf-noninterference.py \

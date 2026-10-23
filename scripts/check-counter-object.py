@@ -41,6 +41,171 @@ COUNTER_OWNER_HELPERS = frozenset({
     "p11_owner_start_remove",
 })
 
+BANK_ROOTS = {"p11_counter_bank_entry": "uprobe", "p11_counter_bank_return": "uretprobe"}
+BANK_GLOBALS = frozenset({"p11_bank_enter", "p11_bank_complete"})
+BANK_CONFIG = 0x18000102
+
+
+class BankBtf(MAPS.Btf):
+    """Proof-only exact HASH_OF_MAPS/one-cell Counts template.
+
+    The shared decoder retains its default refusal for `values`; only the
+    explicit proof profile supplies this class. All DATASEC/symbol/relocation
+    validation remains the shared decoder's original implementation.
+    """
+
+    def map_definition(self, ref):
+        node = self.resolve(ref)
+        if node[0] != 4:
+            return super().map_definition(ref)
+        names = [MAPS.string_at(self.strings, item) for item in node[5][::3]]
+        if "values" not in names:
+            return super().map_definition(ref)
+        if (names != ["type", "max_entries", "map_flags", "key", "values"]
+                or node[2:5] != (32, 5, 0) or node[5][2::3] != (0, 64, 128, 192, 256)):
+            raise RuntimeError("unsupported bank outer template layout")
+        integers = []
+        for ref in node[5][1:10:3]:
+            pointer = self.resolve(ref)
+            if pointer[0] != 2:
+                raise RuntimeError("bank outer integer is not a pointer")
+            array = self.resolve(pointer[2])
+            if (array[0] != 3 or self.resolve(array[5][0])[0] != 1
+                    or self.resolve(array[5][1])[0] != 1):
+                raise RuntimeError("bank outer integer encoding")
+            integers.append(array[5][2])
+        key = self.resolve(node[5][10])
+        if integers != [13, 2, 128] or key[0] != 2 or self.size(key[2]) != 4:
+            raise RuntimeError("bank outer must be readonly HASH_OF_MAPS with two u32 keys")
+        array = self.resolve(node[5][13])
+        if (array[0] != 3 or array[5][2] != 0
+                or self.resolve(array[5][1])[0] != 1):
+            raise RuntimeError("bank values must be a zero-length pointer array")
+        pointer = self.resolve(array[5][0])
+        if pointer[0] != 2:
+            raise RuntimeError("bank values element is not an inner-map pointer")
+        inner_ref = pointer[2]
+        inner, size = super().map_definition(inner_ref)
+        if inner != MAPS.map_def(6, 4, 24, 1) or size != 32:
+            raise RuntimeError("bank inner template must be one 24-byte Counts cell")
+        inner_node = self.resolve(inner_ref)
+        value_refs = [inner_node[5][i + 1] for i in range(0, len(inner_node[5]), 3)
+                      if MAPS.string_at(self.strings, inner_node[5][i]) == "value"]
+        if len(value_refs) != 1:
+            raise RuntimeError("bank inner template requires a typed Counts value")
+        value = self.resolve(self.resolve(value_refs[0])[2])
+        value_names = [MAPS.string_at(self.strings, item) for item in value[5][::3]]
+        if (value[:1] != (4,) or value[2:5] != (24, 3, 0)
+                or value_names != ["entered", "returned", "errors"]
+                or value[5][2::3] != (0, 64, 128)):
+            raise RuntimeError("bank Counts value fields/layout differ")
+        for ref in value[5][1::3]:
+            field = self.resolve(ref)
+            if field[0] != 1 or field[2] != 8 or field[5] != (64,):
+                raise RuntimeError("bank Counts fields must be full-width unsigned u64")
+        return {**MAPS.map_def(13, 4, 4, 2, 128), "inner_template": inner}, 32
+
+
+def bank_maps(graph):
+    elf = graph.elf
+    section = elf.indices["maps"]
+    records = [(s[4], s[5], "OBJECT", "", "", str(s[3]), s[0])
+               for s in elf.symbols if s[3] == section and s[1] & 15 == 1]
+    maps = MAPS.decode_map_definitions(records, section, elf.sections["maps"][1])
+    native = MAPS.decode_btf_maps(elf, decoder_class=BankBtf)
+    if maps.keys() & native.keys():
+        raise RuntimeError("duplicate bank proof map")
+    maps.update(native)
+    expected = {
+        "STATS": (6, 4, 24, 512, 0), "RV_COUNTS": (5, 16, 8, 4096, 0),
+        "START": (1, 16, 288, 16384, 0), "COUNTER_HEALTH": (6, 4, 8, 2, 0),
+        "COUNTER_BANKS": (13, 4, 4, 2, 128), "COUNTER_BANK_META": (1, 4, 24, 2, 128),
+        "COUNTER_BANK_COMMIT": (1, 8, 16, 2, 128), "COUNTER_BANK_FAULT": (6, 4, 8, 1, 0),
+    }
+    for name, fields in expected.items():
+        if name not in maps or tuple(maps[name][field] for field in
+                                    ("type", "key_size", "value_size", "max_entries", "flags")) != fields:
+            raise RuntimeError(f"bank proof map shape differs: {name}")
+    if maps["COUNTER_BANKS"].get("inner_template") != MAPS.map_def(6, 4, 24, 1):
+        raise RuntimeError("bank proof has no exact typed inner template")
+    return maps, expected
+
+
+def bank_global_abi(graph):
+    elf = graph.elf
+    helpers = [symbol for symbol in elf.symbols if symbol[0].startswith("p11_bank_")]
+    if len(helpers) != 2 or {symbol[0] for symbol in helpers} != BANK_GLOBALS:
+        raise RuntimeError("bank proof global inventory differs")
+    for _, info, other, section, address, size in helpers:
+        if (info != 0x12 or other or section != elf.indices.get(".text")
+                or not size or address % 8 or size % 8):
+            raise RuntimeError("bank proof requires defined GLOBAL DEFAULT bridge functions")
+    btf = MAPS.Btf(elf.sections[".BTF"][1])
+    bank_functions = [node for node in btf.types[1:]
+                      if node[0] == 12 and node[1].startswith("p11_bank_")]
+    if len(bank_functions) != 2 or {node[1] for node in bank_functions} != BANK_GLOBALS:
+        raise RuntimeError("bank proof BTF global inventory differs")
+    all_functions = [node for node in btf.types[1:] if node[0] == 12]
+    if any(not node[2] or btf.types[node[2]][0] != 13 or btf.types[node[2]][3] > 5
+           for node in all_functions):
+        raise RuntimeError("bank proof exceeds the five-register function ABI")
+    for name, widths in (("p11_bank_enter", (4, 8)), ("p11_bank_complete", (4, 8, 8, 4))):
+        functions = [node for node in btf.types[1:] if node[0] == 12 and node[1] == name]
+        if len(functions) != 1 or functions[0][3] != 1:
+            raise RuntimeError("bank proof global BTF function missing/duplicate")
+        proto = btf.resolve(functions[0][2])
+        refs = (proto[2],) + proto[5][1::2]
+        if proto[0] != 13 or proto[3] != len(widths):
+            raise RuntimeError("bank proof global argument count differs")
+        for ref, width in zip(refs, (4,) + widths):
+            integer = btf.resolve(ref)
+            if integer[0] != 1 or integer[2] != width or integer[5] != (width * 8,):
+                raise RuntimeError("bank proof requires exact unsigned scalar ABI")
+    # Preserve exact FUNC_INFO ownership and its emitted section relocation;
+    # the shared private-helper validator intentionally supports only zero-
+    # argument globals, so do not broaden its ordinary owner/EXEC contract.
+    ext = elf.sections[".BTF.ext"][1]
+    magic, version, flags, hlen, offset, length = struct.unpack_from("<HBBIII", ext)
+    if (magic, version, flags, hlen) != (0xeb9f, 1, 0, 32):
+        raise RuntimeError("unsupported bank function info header")
+    raw = MAPS.checked_slice(ext, hlen + offset, length, "bank function info")
+    if struct.unpack_from("<I", raw)[0] != 8:
+        raise RuntimeError("unsupported bank function info stride")
+    relocations = {}
+    for row, body in elf.sections.values():
+        if row[1] != 9 or row[7] != elf.indices[".BTF.ext"]:
+            continue
+        if row[9] != 16 or len(body) % 16 or row[6] != elf.indices[".symtab"]:
+            raise RuntimeError("invalid bank function info relocation table")
+        for at in range(0, len(body), 16):
+            address, info = struct.unpack_from("<QQ", body, at)
+            if address in relocations or info >> 32 >= len(elf.symbols):
+                raise RuntimeError("duplicate/invalid bank function info relocation")
+            relocations[address] = info & 0xffffffff, elf.symbols[info >> 32]
+    found, cursor = set(), 4
+    while cursor < len(raw):
+        section_name, count = struct.unpack("<II", MAPS.checked_slice(raw, cursor, 8, "bank info section"))
+        section_name = MAPS.string_at(btf.strings, section_name)
+        cursor += 8
+        for _ in range(count):
+            address, ident = struct.unpack("<II", MAPS.checked_slice(raw, cursor, 8, "bank info record"))
+            record = hlen + offset + cursor
+            cursor += 8
+            if not 0 < ident < len(btf.types) or btf.types[ident][0] != 12:
+                raise RuntimeError("bank function info is not a BTF FUNC")
+            name = btf.types[ident][1]
+            if name not in BANK_GLOBALS:
+                continue
+            symbol = next(symbol for symbol in helpers if symbol[0] == name)
+            relocation = relocations.get(record)
+            if (name in found or elf.indices.get(section_name) != symbol[3] or address != symbol[4]
+                    or not relocation or relocation[0] != 4
+                    or relocation[1][1:] != (3, 0, symbol[3], 0, 0)):
+                raise RuntimeError("bank function info/symbol/relocation mismatch")
+            found.add(name)
+    if found != BANK_GLOBALS:
+        raise RuntimeError("bank global function info is incomplete")
+
 
 class CallGraph:
     """Selected donor graph parser, with exact roots and closed call targets."""
@@ -1171,25 +1336,676 @@ def causal_mutants(body, mode):
             "transfer_controls": controls}
 
 
+class BankFootprint(MemoryProof):
+    """Existing conservative memory proof with one exact map-of-maps edge."""
+
+    def helper(self, number, registers, memory, key, pc):
+        mapped = registers[1]
+        if number == 1 and mapped and mapped[:2] == ("ptr", "COUNTER_BANKS"):
+            if mapped[2:4] != (0, 0):
+                raise RuntimeError("inner lookup uses an adjusted outer-map pointer")
+            if self.key_value(registers[2], memory) != ZERO:
+                raise RuntimeError("bank inner lookup does not use its only cell zero")
+            registers[1] = "map", "COUNTER_BANK_VALUE"
+        elif number in (2, 3) and mapped and mapped[:2] in {
+                ("map", name) for name in
+                ("COUNTER_BANKS", "COUNTER_BANK_META", "COUNTER_BANK_COMMIT", "COUNTER_BANK_VALUE")}:
+            raise RuntimeError("endpoint mutates an immutable bank route")
+        super().helper(number, registers, memory, key, pc)
+
+    def touch(self, pointer, offset, width, action, value, key, pc, atomic=None):
+        name = pointer[1]
+        if name == "COUNTER_BANKS":
+            raise RuntimeError("endpoint dereferences outer map as a value")
+        if name == "COUNTER_BANK_VALUE":
+            span = pointer[2] + offset, pointer[3] + offset
+            if width != 8 or span[0] != span[1] or span[0] not in (0, 8, 16):
+                raise RuntimeError("bank Counts access is not an exact full-width field")
+            if action == "write" and atomic != 0xf1:
+                raise RuntimeError("bank Counts update is not bounded CAS")
+        if name == "COUNTER_BANK_FAULT" and action == "write":
+            if (width != 8 or pointer[2] + offset or pointer[3] + offset
+                    or atomic != 0x40 or not value or value[0] != "scalar"
+                    or not 1 <= value[2] <= value[3] <= 15):
+                raise RuntimeError("bank routing fault is not a finite sticky OR")
+        if name in ("COUNTER_BANK_META", "COUNTER_BANK_COMMIT") and action == "write":
+            raise RuntimeError("endpoint writes immutable bank metadata")
+        super().touch(pointer, offset, width, action, value, key, pc, atomic)
+
+
+class BankExecution:
+    """Finite causal executions of actual emitted scalar bridge instructions.
+
+    The unchanged owner APIs use their existing custody contract. Explicit
+    failure inputs supply map-I/O errors and intervening cumulative writers.
+    This does not replace native owner tests, verifier loading or the later
+    real held-START/publication transaction test. Bank branch, memory, CAS,
+    RV and fault operations execute the actual ELF.
+    """
+
+    def __init__(self, graph):
+        self.graph = graph
+        self.memory, self.regions, self.cells = {}, [], {}
+        self.cursor = 0x1000000
+        names = ("COUNTER_BANK_META", "COUNTER_BANK_COMMIT", "COUNTER_BANKS",
+                 "COUNTER_BANK_FAULT", "COUNTER_HEALTH", "RV_COUNTS", "bank0", "bank1")
+        self.handles = {name: 0x10000 + index * 0x100 for index, name in enumerate(names)}
+        self.by_handle = {value: name for name, value in self.handles.items()}
+        self.starts, self.debt = {}, 0
+        self.failed_admission = False
+        self.failed_retirement = False
+        self.failed_rv_insert = False
+        self.contended, self.cas_attempts = set(), {}
+        self.trace, self.steps = [], 0
+        self.last_read = None
+        self.bank_storage = {}
+        for slot in (0, 1):
+            self.set("COUNTER_BANK_META", slot, struct.pack("<QQII", slot + 1, 1 << slot, slot, 1))
+            self.set("COUNTER_BANK_COMMIT", slot + 1, struct.pack("<QQ", 1 << slot, BANK_CONFIG))
+            self.set("COUNTER_BANKS", slot, self.handles[f"bank{slot}"].to_bytes(8, "little"))
+            self.bank_storage[slot] = self.set(f"bank{slot}", 0, bytes(24))
+        self.set("COUNTER_BANK_FAULT", 0, bytes(8))
+        for index in (0, 1):
+            self.set("COUNTER_HEALTH", index, bytes(8))
+
+    @staticmethod
+    def key(name, key):
+        if isinstance(key, bytes):
+            return key
+        return key.to_bytes(8 if name == "COUNTER_BANK_COMMIT" else 4, "little")
+
+    def set(self, name, key, body):
+        key = self.key(name, key)
+        address = self.cursor
+        self.cursor += max(0x1000, len(body))
+        self.regions.append((address, len(body), name, key))
+        self.cells[name, key] = address
+        for offset, byte in enumerate(body):
+            self.memory[address + offset] = byte
+        return address
+
+    def delete(self, name, key):
+        self.cells.pop((name, self.key(name, key)), None)
+
+    def row(self, slot):
+        # Retain the fixture's original backing to assert no credit even
+        # when a causal control makes lookup of that cell unavailable.
+        at = self.bank_storage[slot]
+        return tuple(self.read(at + offset, 8) for offset in (0, 8, 16))
+
+    def fault(self):
+        return self.read(self.cells["COUNTER_BANK_FAULT", bytes(4)], 8)
+
+    def health(self, index):
+        return self.read(self.cells["COUNTER_HEALTH", index.to_bytes(4, "little")], 8)
+
+    def start(self, slot, marker=0):
+        key = struct.pack("<QII", 9, slot, 0)
+        body = bytearray(288)
+        struct.pack_into("<Q", body, 264, marker)
+        self.starts[key] = self.set("START", key, body)
+        self.debt += 1
+
+    def region(self, address, width):
+        return next((item for item in self.regions
+                     if item[0] <= address and address + width <= item[0] + item[1]), None)
+
+    def read(self, address, width):
+        if any(address + index not in self.memory for index in range(width)):
+            raise RuntimeError("bank execution reads unknown/out-of-bounds storage")
+        return int.from_bytes(bytes(self.memory[address + index] for index in range(width)), "little")
+
+    def write(self, address, width, value, atomic, key, pc, stack):
+        region = self.region(address, width)
+        if region:
+            base, _, name, _ = region
+            if name in ("bank0", "bank1", "RV_COUNTS") and (width != 8 or atomic != 0xf1):
+                raise RuntimeError("bank execution writes a cumulative cell without u64 CAS")
+            if name == "COUNTER_BANK_FAULT" and (width != 8 or atomic != 0x40 or not 1 <= value <= 15):
+                raise RuntimeError("bank execution has an invalid sticky routing fault")
+            if name == "COUNTER_HEALTH" and (width != 8 or atomic is not None or value != 1):
+                raise RuntimeError("bank execution clears/changes sticky counter health")
+            if name not in ("bank0", "bank1", "RV_COUNTS", "COUNTER_BANK_FAULT", "COUNTER_HEALTH"):
+                raise RuntimeError("bank execution writes readonly/custody storage directly")
+            self.trace.append(("write", key, pc, name, address - base, value))
+        elif not stack - 512 <= address <= stack - width:
+            raise RuntimeError("bank execution writes outside its own bounded stack")
+        else:
+            self.trace.append(("stack_write", key, pc, address, width, value))
+        for index, byte in enumerate((value & ((1 << (width * 8)) - 1)).to_bytes(width, "little")):
+            self.memory[address + index] = byte
+
+    def owner(self, name, registers, origins, key, pc):
+        raw_key = self.read(registers[1], 16).to_bytes(16, "little")
+        pid, slot, pad = struct.unpack("<QII", raw_key)
+        if pid != 9 or slot >= 512 or pad:
+            raise RuntimeError("bank owner call lost original physical START key")
+        self.trace.append(("owner", key, pc, name, tuple(registers[1:6]), tuple(origins)))
+        if name == "p11_owner_start_aggregate":
+            if registers[2] != 0:
+                raise RuntimeError("Counts START acquires a nonzero timestamp")
+            if self.failed_admission:
+                return 0
+            if raw_key in self.starts:
+                raise RuntimeError("bank execution attempts duplicate START admission")
+            self.start(slot)
+            return 1
+        if name == "p11_owner_start_get":
+            if registers[2] != 0:
+                raise RuntimeError("bank return requires START instead of optional non-settlement lookup")
+            return self.starts.get(raw_key, 0)
+        if name == "p11_owner_start_remove":
+            if registers[2] != 1:
+                raise RuntimeError("bank return does not require retirement of observed START")
+            if self.failed_retirement:
+                return U64_MAX
+            if raw_key not in self.starts:
+                raise RuntimeError("bank return attempts to settle an absent START")
+            address = self.starts[raw_key]
+            for index in range(288):
+                self.memory.pop(address + index, None)
+            del self.starts[raw_key]
+            self.debt -= 1
+            return 0
+        raise RuntimeError("bank execution calls an unsupported owner API")
+
+    def helper(self, number, registers, key, pc):
+        if number not in (1, 2):
+            raise RuntimeError("bank bridge reaches an unknown/privacy/clock helper")
+        name = self.by_handle.get(registers[1])
+        if name is None:
+            raise RuntimeError("bank lookup loses its exact outer/inner map handle")
+        width = 16 if name == "RV_COUNTS" else 8 if name == "COUNTER_BANK_COMMIT" else 4
+        index = self.read(registers[2], width).to_bytes(width, "little")
+        self.trace.append(("lookup" if number == 1 else "insert", key, pc, name, index, registers[2]))
+        if number == 2:
+            if name != "RV_COUNTS" or registers[4] != 1 or self.read(registers[3], 8) != 1:
+                raise RuntimeError("bank bridge replaces/inserts an unowned cumulative value")
+            if self.failed_rv_insert:
+                return (1 << 64) - 7
+            if (name, index) in self.cells:
+                return (1 << 64) - 17
+            self.set(name, index, (1).to_bytes(8, "little"))
+            return 0
+        address = self.cells.get((name, index), 0)
+        return self.read(address, 8) if address and name == "COUNTER_BANKS" else address
+
+    def run(self, name, arguments):
+        key = self.graph.only(name)
+        result = self.execute(key, list(arguments), 0)
+        if result:
+            raise RuntimeError("bank bridge did not return scalar zero")
+
+    def execute(self, key, arguments, depth):
+        if depth >= 8:
+            raise RuntimeError("bank execution call depth exceeds ABI")
+        registers, origins = [0] * 11, [None] * 11
+        registers[1:1 + len(arguments)] = arguments
+        stack = registers[10] = 0x80000000 + depth * 0x10000
+        for address in range(stack - 512, stack):
+            self.memory.pop(address, None)
+        pc = 0
+        instructions = self.graph.instructions[key]
+        while pc in instructions:
+            self.steps += 1
+            if self.steps > 20000:
+                raise RuntimeError("bank execution exceeds finite instruction budget")
+            op, encoded, offset, immediate = instructions[pc]
+            dst, src = encoded & 15, encoded >> 4
+            if dst > 10 or src > 10:
+                raise RuntimeError("invalid bank execution register")
+            next_pc = pc + 1
+            if op == 0x18:
+                mapped = self.graph.map_at(key, pc)
+                if mapped:
+                    if mapped not in self.handles:
+                        raise RuntimeError("bank bridge references unexpected map")
+                    registers[dst] = self.handles[mapped]
+                else:
+                    high = struct.unpack_from("<I", self.graph.sections[key[0]][1], key[1] + pc * 8 + 12)[0]
+                    registers[dst] = high << 32 | immediate & 0xffffffff
+                origins[dst] = (key, pc)
+                next_pc += 1
+            elif op == 0x85:
+                kind, target = self.graph.calls[key, pc]
+                if kind == "helper":
+                    returned = self.helper(target, registers, key, pc)
+                else:
+                    callee = self.graph.bodies[target][0]
+                    returned = (self.owner(callee, registers, origins, key, pc)
+                                if callee.startswith("p11_owner_") else
+                                self.execute(target, registers[1:6], depth + 1))
+                registers[:6] = [returned] + [0xbad0000000000000] * 5
+                origins[:6] = [(key, pc)] + [None] * 5
+            elif op == 0x95:
+                return registers[0]
+            elif op & 7 == 1 and op & 0xe0 == 0x60:
+                width, address = WIDTHS[op & 0x18], registers[src] + offset
+                registers[dst] = self.read(address, width)
+                origins[dst] = (key, pc)
+                region = self.region(address, width)
+                self.last_read = (region[2], address - region[0]) if region else None
+                self.trace.append(("read", key, pc, self.last_read, width))
+            elif op & 7 in (2, 3) and op & 0xe0 in (0x60, 0xc0):
+                width, address = WIDTHS[op & 0x18], registers[dst] + offset
+                value = immediate & U64_MAX if op & 7 == 2 else registers[src]
+                atomic = immediate if op & 0xe0 == 0xc0 else None
+                if atomic == 0xf1:
+                    before = self.read(address, width)
+                    region = self.region(address, width)
+                    name = region[2] if region else "stack"
+                    self.cas_attempts[name] = self.cas_attempts.get(name, 0) + 1
+                    if name in self.contended:
+                        if before == U64_MAX:
+                            raise RuntimeError("contention fixture cannot increment a saturated cell")
+                        before += 1  # a real intervening cumulative update
+                        for index, byte in enumerate(before.to_bytes(width, "little")):
+                            self.memory[address + index] = byte
+                    elif before == registers[0]:
+                        self.write(address, width, value, atomic, key, pc, stack)
+                    registers[0], origins[0] = before, (key, pc)
+                elif atomic == 0x40:
+                    before = self.read(address, width)
+                    self.write(address, width, value, atomic, key, pc, stack)
+                    # write() validates the finite operand; OR preserves all
+                    # prior fault bits rather than replacing their history.
+                    for i, byte in enumerate((before | value).to_bytes(width, "little")):
+                        self.memory[address + i] = byte
+                elif atomic is None:
+                    self.write(address, width, value, None, key, pc, stack)
+                else:
+                    raise RuntimeError("unsupported bank execution atomic")
+            elif op & 7 in (4, 7):
+                bits, operation = (32 if op & 7 == 4 else 64), op & 0xf0
+                mask = (1 << bits) - 1
+                left = registers[dst] & mask
+                right = (registers[src] if op & 8 else immediate) & mask
+                if operation == 0xb0:
+                    if offset:
+                        raise RuntimeError("bank execution refuses sign-extending MOV")
+                    value = right
+                    origins[dst] = origins[src] if op & 8 else (key, pc)
+                elif operation == 0x80:
+                    value = -left
+                    origins[dst] = (key, pc)
+                elif operation == 0xc0:
+                    signed = left - (1 << bits) if left >> (bits - 1) else left
+                    value = signed >> (right & (bits - 1))
+                    origins[dst] = (key, pc)
+                else:
+                    result = scalar_alu(constant(left), constant(right), operation, bits)
+                    value = singleton(result)
+                    if value is None:
+                        raise RuntimeError("unsupported bank execution ALU")
+                    origins[dst] = (key, pc)
+                registers[dst] = value & mask
+            elif op & 7 in (5, 6):
+                operation = op & 0xf0
+                if not operation:
+                    next_pc = pc + 1 + (immediate if op == 0x06 else offset)
+                else:
+                    bits = 32 if op & 7 == 6 else 64
+                    left, right = registers[dst], registers[src] if op & 8 else immediate & U64_MAX
+                    left, right = left & ((1 << bits) - 1), right & ((1 << bits) - 1)
+                    signed_left = left - (1 << bits) if left >> (bits - 1) else left
+                    signed_right = right - (1 << bits) if right >> (bits - 1) else right
+                    comparisons = {0x10: left == right, 0x50: left != right, 0x20: left > right,
+                                   0x30: left >= right, 0x40: bool(left & right), 0xa0: left < right,
+                                   0xb0: left <= right, 0x60: signed_left > signed_right,
+                                   0x70: signed_left >= signed_right, 0xc0: signed_left < signed_right,
+                                   0xd0: signed_left <= signed_right}
+                    if operation not in comparisons:
+                        raise RuntimeError("unsupported bank execution branch")
+                    taken = comparisons[operation]
+                    self.trace.append(("branch", key, pc, left, right, taken, self.last_read))
+                    if taken:
+                        next_pc = pc + 1 + offset
+            else:
+                raise RuntimeError(f"unsupported bank execution opcode {op:#x}")
+            pc = next_pc
+        raise RuntimeError("bank execution leaves its function")
+
+
+def bank_scenarios(graph):
+    """Literal healthy/failure expectations over actual native bridge bodies."""
+    reports, executions = {}, []
+
+    def check(name, vm, rows, debt, fault=0, rv=None):
+        actual_rv = {}
+        for (mapped, raw_key), address in vm.cells.items():
+            if mapped == "RV_COUNTS":
+                slot, pad, value = struct.unpack("<IIQ", raw_key)
+                if pad:
+                    raise RuntimeError("bank RV key has nonzero padding")
+                actual_rv[slot, value] = vm.read(address, 8)
+        if (tuple(vm.row(slot) for slot in (0, 1)) != rows or vm.debt != debt
+                or vm.fault() != fault or len(vm.starts) > debt or actual_rv != (rv or {})):
+            raise RuntimeError(f"actual bank scenario violates custody/counts: {name}")
+        reports[name] = "accepted"
+        executions.append(vm)
+
+    zeros = ((0, 0, 0), (0, 0, 0))
+    vm = BankExecution(graph)
+    vm.delete("COUNTER_BANK_COMMIT", 1)
+    vm.run("p11_bank_enter", (0, 9))
+    check("inactive_entry", vm, zeros, 0)
+    vm.set("COUNTER_BANK_COMMIT", 1, struct.pack("<QQ", 1, BANK_CONFIG))
+    vm.run("p11_bank_complete", (0, 9, 0x100000001, 1))
+    check("precommit_return_after_commit", vm, zeros, 0)
+    vm = BankExecution(graph)
+    vm.start(1)
+    vm.run("p11_bank_complete", (0, 9, 0, 1))
+    check("absent_return_preserves_other_start", vm, zeros, 1)
+    vm = BankExecution(graph)
+    vm.start(0)
+    vm.starts.clear()  # physical loss does not remove the owner's debt
+    vm.run("p11_bank_complete", (0, 9, 0, 1))
+    check("absent_return_preserves_lost_debt", vm, zeros, 1)
+    vm = BankExecution(graph)
+    vm.delete("COUNTER_BANK_COMMIT", 2)
+    vm.run("p11_bank_enter", (0, 9))
+    vm.set("COUNTER_BANK_COMMIT", 2, struct.pack("<QQ", 2, BANK_CONFIG))
+    vm.run("p11_bank_enter", (1, 9))
+    vm.run("p11_bank_complete", (0, 9, 0, 1))
+    vm.run("p11_bank_complete", (1, 9, U64_MAX, 1))
+    check("old_bank_keeps_original_transaction", vm, ((1, 1, 0), (1, 1, 1)), 0,
+          rv={(0, 0): 1, (1, U64_MAX): 1})
+    for slot in (0, 1):
+        for missing in ("COUNTER_BANK_META", "COUNTER_BANKS", f"bank{slot}", "COUNTER_BANK_COMMIT"):
+            vm = BankExecution(graph)
+            vm.run("p11_bank_enter", (slot, 9))
+            vm.delete(missing, slot if missing in ("COUNTER_BANK_META", "COUNTER_BANKS") else
+                      slot + 1 if missing == "COUNTER_BANK_COMMIT" else 0)
+            vm.run("p11_bank_complete", (slot, 9, 0, 1))
+            rows = ((1, 0, 0), (0, 0, 0)) if slot == 0 else ((0, 0, 0), (1, 0, 0))
+            check("missing_route_retires_start", vm, rows, 0, 1)
+    vm = BankExecution(graph)
+    vm.start(0)
+    vm.failed_retirement = True
+    vm.run("p11_bank_complete", (0, 9, 0, 1))
+    check("failed_retirement_keeps_debt", vm, zeros, 1, 2)
+    for transaction in (0x100000001, U64_MAX):
+        vm = BankExecution(graph)
+        vm.set("COUNTER_BANK_META", 0, struct.pack("<QQII", transaction, 1, 0, 1))
+        vm.set("COUNTER_BANK_COMMIT", transaction, struct.pack("<QQ", 1, BANK_CONFIG))
+        vm.run("p11_bank_enter", (0, 9))
+        vm.run("p11_bank_complete", (0, 9, transaction, 1))
+        check("full_width_transaction", vm, ((1, 1, 1), (0, 0, 0)), 0, rv={(0, transaction): 1})
+    for slot in (2, 0xffffffff):
+        vm = BankExecution(graph)
+        vm.run("p11_bank_enter", (slot, 9))
+        check("invalid_logical_slot", vm, zeros, 0, 1)
+    for mask, configuration in ((2, BANK_CONFIG), (1, BANK_CONFIG + 1), (3, BANK_CONFIG)):
+        vm = BankExecution(graph)
+        vm.set("COUNTER_BANK_COMMIT", 1, struct.pack("<QQ", mask, configuration))
+        vm.run("p11_bank_enter", (0, 9))
+        check("wrong_exact_set_or_config", vm, zeros, 0, 1)
+    vm = BankExecution(graph)
+    for slot in (0, 1):
+        vm.set("COUNTER_BANK_META", slot, struct.pack("<QQII", 3, 3, slot, 1))
+    vm.set("COUNTER_BANK_COMMIT", 3, struct.pack("<QQ", 3, BANK_CONFIG))
+    for slot in (0, 1):
+        vm.run("p11_bank_enter", (slot, 9))
+        vm.run("p11_bank_complete", (slot, 9, 0, 1))
+    check("complete_two_bank_union", vm, ((1, 1, 0), (1, 1, 0)), 0, rv={(0, 0): 1, (1, 0): 1})
+    vm = BankExecution(graph)
+    vm.run("p11_bank_enter", (0, 9))
+    vm.run("p11_bank_complete", (0, 9, 0, 0))
+    check("scope_refusal_retires_without_credit", vm, ((1, 0, 0), (0, 0, 0)), 0, 8)
+    vm = BankExecution(graph)
+    vm.run("p11_bank_enter", (1, 9))
+    pointer = vm.starts[struct.pack("<QII", 9, 1, 0)]
+    # CallStart.slot_id is neither a bank ID nor authoritative for Counts.
+    for index, byte in enumerate(U64_MAX.to_bytes(8, "little")):
+        vm.memory[pointer + 16 + index] = byte
+    vm.run("p11_bank_complete", (1, 9, 0, 1))
+    check("start_payload_does_not_route", vm, ((0, 0, 0), (1, 1, 0)), 0, rv={(1, 0): 1})
+    vm = BankExecution(graph)
+    vm.failed_admission = True
+    vm.run("p11_bank_enter", (0, 9))
+    vm.run("p11_bank_complete", (0, 9, 0, 1))
+    check("admission_failure_is_sticky", vm, ((1, 0, 0), (0, 0, 0)), 0, 2)
+    vm = BankExecution(graph)
+    for rv in (0x100000001, 0x100000001, U64_MAX):
+        vm.run("p11_bank_enter", (0, 9))
+        vm.run("p11_bank_complete", (0, 9, rv, 1))
+    check("rv_full_width_accumulates", vm, ((3, 3, 3), (0, 0, 0)), 0,
+          rv={(0, 0x100000001): 2, (0, U64_MAX): 1})
+    vm = BankExecution(graph)
+    vm.failed_rv_insert = True
+    vm.run("p11_bank_enter", (0, 9))
+    vm.run("p11_bank_complete", (0, 9, 0, 1))
+    check("rv_failure_is_sticky", vm, ((1, 1, 0), (0, 0, 0)), 0, 4)
+    vm = BankExecution(graph)
+    vm.bank_storage[0] = vm.set("bank0", 0, struct.pack("<QQQ", U64_MAX, 0, 0))
+    vm.run("p11_bank_enter", (0, 9))
+    check("entered_saturates_without_wrap", vm, ((U64_MAX, 0, 0), (0, 0, 0)), 1)
+    if vm.health(0) != 1 or vm.health(1):
+        raise RuntimeError("actual bank saturation has wrong health disposition")
+    vm = BankExecution(graph)
+    vm.contended.add("bank0")
+    vm.run("p11_bank_enter", (0, 9))
+    check("bounded_contention_is_unhealthy", vm, ((8, 0, 0), (0, 0, 0)), 1)
+    if vm.health(1) != 1 or vm.health(0) or vm.cas_attempts.get("bank0") != 8:
+        raise RuntimeError("actual bank contention loses its eight-attempt/health bound")
+    return reports, executions
+
+
+def validate_bank_proof(body):
+    graph = CallGraph(body)
+    maps, expected = bank_maps(graph)
+    if any(name.startswith((".rodata", ".data", ".bss")) for name in graph.elf.sections):
+        raise RuntimeError("bank proof carries global data")
+    validate_counter_owner_helpers(graph.elf)
+    bank_global_abi(graph)
+    owner = native_owner_bound(graph, maps)
+    proof_maps = {**maps, "COUNTER_BANK_VALUE": MAPS.map_def(6, 4, 24, 1)}
+    roots, frames = {}, dict(owner.frames)
+    for name, section in BANK_ROOTS.items():
+        root = graph.root(name, section)
+        reached = graph.reachable(root)
+        names = {graph.bodies[key][0] for key in reached}
+        required = ({"p11_bank_enter", "p11_owner_start_aggregate"} if name.endswith("entry") else
+                    {"p11_bank_complete", "p11_owner_start_get", "p11_owner_start_remove"})
+        if not required <= names:
+            raise RuntimeError("bank proof root loses mandatory START/bridge work")
+        calls = [target for (key, _), (kind, target) in graph.calls.items()
+                 if key in reached and kind == "helper"]
+        if any(helper == 5 or helper not in ALLOWED_HELPERS or helper in FORBIDDEN_HELPERS
+               for helper in calls):
+            raise RuntimeError("Counts bank root reaches clock/semantic/event/unknown helper")
+        for key in reached:
+            for pc, instruction in graph.instructions[key].items():
+                if (instruction[0] == 0x18
+                        and graph.map_at(key, pc) in FORBIDDEN_ENDPOINT_MAPS):
+                    raise RuntimeError("Counts bank root reaches semantic/event storage")
+        proof = BankFootprint(graph, proof_maps)
+        proof.run(root, [("external", "ctx", 0), None, None, None, None])
+        frames.update({key: max(frames.get(key, 0), depth) for key, depth in proof.frames.items()})
+        required_offsets = (0,) if name.endswith("entry") else (8, 16)
+        for offset in required_offsets:
+            if not any(touch[2:5] == ("COUNTER_BANK_VALUE", "write", (offset, offset))
+                       for touch in proof.touches):
+                raise RuntimeError("bank proof omits a complete Counts field update")
+        roots[name] = {"stack_chain": frame_and_chain(graph, root, frames),
+                       "clocks": 0, "semantic_or_event_work": False}
+    controls, executions = bank_scenarios(graph)
+    try:
+        validate(body, "counts")
+    except RuntimeError:
+        pass
+    else:
+        raise RuntimeError("bank proof is accepted by the ordinary fixed counter profile")
+    return {"schema": "p11scope-counter-bank-object/v1", "logical_slots": [0, 1],
+            "native_owner_slot_bound": 512, "maps": {name: maps[name] for name in expected},
+            "inner_template": maps["COUNTER_BANKS"]["inner_template"], "roots": roots,
+            "controls": controls, "ordinary_counter_profile": "refused"}, (graph, executions)
+
+
+def bank_btf_mutant(body, graph, name, field, wanted, *, inner=False):
+    btf = MAPS.Btf(graph.elf.sections[".BTF"][1])
+    variables = [node for node in btf.types[1:] if node[0] == 14 and node[1] == name]
+    if len(variables) != 1:
+        raise RuntimeError("bank mutant has no exact BTF map variable")
+    node = btf.resolve(variables[0][2])
+    if inner:
+        values_ref = next(node[5][i + 1] for i in range(0, len(node[5]), 3)
+                          if MAPS.string_at(btf.strings, node[5][i]) == "values")
+        node = btf.resolve(btf.resolve(btf.resolve(values_ref)[5][0])[2])
+    base = graph.elf.sections[".BTF"][0][4]
+    if field == "value_bytes":
+        value_ref = next(node[5][i + 1] for i in range(0, len(node[5]), 3)
+                         if MAPS.string_at(btf.strings, node[5][i]) == "value")
+        target = btf.resolve(btf.resolve(value_ref)[2])
+        address, replacement = base + target[6] + 8, wanted
+    else:
+        member = next(i for i in range(node[3])
+                      if MAPS.string_at(btf.strings, node[5][i * 3]) == field)
+        pointer_refs = [ident for ident, candidate in enumerate(btf.types[1:], 1)
+                        if candidate[0] == 2 and btf.resolve(candidate[2])[0] == 3
+                        and btf.resolve(candidate[2])[5][2] == wanted]
+        if not pointer_refs:
+            raise RuntimeError("bank BTF mutant has no literal replacement type")
+        address, replacement = base + node[6] + 12 + member * 12 + 4, pointer_refs[0]
+    changed = bytearray(body)
+    struct.pack_into("<I", changed, address, replacement)
+    if changed == body:
+        raise RuntimeError("bank BTF mutation did not change actual bytes")
+    return bytes(changed)
+
+
+def bank_causal_mutants(body):
+    report, (graph, executions) = validate_bank_proof(body)
+    mutants = {
+        "inner_value_width": bank_btf_mutant(body, graph, "COUNTER_BANKS", "value_bytes", 40, inner=True),
+        "inner_cell_count": bank_btf_mutant(body, graph, "COUNTER_BANKS", "max_entries", 2, inner=True),
+        "outer_type": bank_btf_mutant(body, graph, "COUNTER_BANKS", "type", 2),
+    }
+    symbol_index = next(index for index, symbol in enumerate(graph.elf.symbols)
+                        if symbol[0] == "p11_bank_enter")
+    changed = bytearray(body)
+    changed[graph.elf.sections[".symtab"][0][4] + symbol_index * 24 + 4] = 2
+    mutants["bank_global_linkage"] = bytes(changed)
+    btf = MAPS.Btf(graph.elf.sections[".BTF"][1])
+    function = next(node for node in btf.types[1:] if node[0] == 12 and node[1] == "p11_bank_enter")
+    proto = btf.resolve(function[2])
+    changed = bytearray(body)
+    struct.pack_into("<I", changed, graph.elf.sections[".BTF"][0][4] + proto[6] + 16, proto[5][3])
+    mutants["bank_global_abi"] = bytes(changed)
+    events = [event for execution in executions for event in execution.trace]
+
+    def instruction(label, site, replacement):
+        mutants[label] = mutated_instruction(body, graph, site[0], site[1], replacement)
+
+    # Every selection below comes from an actual executed call/read/branch,
+    # not a source string, function size, hardcoded PC or favorable label.
+    for label, helper in (("optional_start_get", "p11_owner_start_get"),
+                          ("required_start_remove", "p11_owner_start_remove")):
+        event = next(event for event in events if event[0] == "owner" and event[3] == helper)
+        site = event[5][2]
+        if site is None:
+            raise RuntimeError("bank owner argument mutation has no actual defining instruction")
+        op, encoded, offset, immediate = graph.instructions[site[0]][site[1]]
+        if op not in (0xb4, 0xb7) or immediate != (0 if label == "optional_start_get" else 1):
+            raise RuntimeError("bank owner argument is not the expected emitted scalar literal")
+        instruction(label, site, (op, encoded, offset, 1 - immediate))
+    for label, helper in (("missing_start_get", "p11_owner_start_get"),
+                          ("missing_start_remove", "p11_owner_start_remove")):
+        event = next(event for event in events if event[0] == "owner" and event[3] == helper)
+        instruction(label, event[1:3], (0xb7, 0, 0, 0))
+    read = next(event for event in events if event[0] == "read"
+                and event[3] == ("COUNTER_BANK_META", 0) and event[4] == 8)
+    old = graph.instructions[read[1]][read[2]]
+    instruction("transaction_width", read[1:3], (0x61, old[1], old[2], old[3]))
+    logical = next(event for event in events if event[0] == "branch"
+                   and event[3:5] in ((2, 1), (2, 2), (1, 2))
+                   and graph.instructions[event[1]][event[2]][0] & 8 == 0
+                   and graph.instructions[event[1]][event[2]][3] in (1, 2))
+    old = graph.instructions[logical[1]][logical[2]]
+    instruction("logical_index", logical[1:3], old[:3] + (old[3] + 1,))
+    inner_store = None
+    for execution in executions:
+        for index, event in enumerate(execution.trace):
+            if event[0] != "lookup" or event[3] not in ("bank0", "bank1"):
+                continue
+            inner_store = next((item for item in reversed(execution.trace[:index])
+                                if item[0] == "stack_write" and item[3] == event[5]
+                                and item[4] in (4, 8) and item[5] == 0), None)
+            if inner_store:
+                break
+        if inner_store:
+            break
+    if inner_store is None:
+        raise RuntimeError("inner-index mutation has no actual zero-key initialization")
+    old = graph.instructions[inner_store[1]][inner_store[2]]
+    store_op = 0x62 if inner_store[4] == 4 else 0x7a
+    instruction("inner_index", inner_store[1:3], (store_op, old[1] & 15, old[2], 1))
+    commit_gate = None
+    for execution in executions:
+        for event in execution.trace:
+            if event[0] != "branch" or 0 not in event[3:5]:
+                continue
+            other = event[3] or event[4]
+            region = execution.region(other, 1)
+            if region and region[2] == "COUNTER_BANK_COMMIT":
+                commit_gate = event
+                break
+        if commit_gate:
+            break
+    if commit_gate is None:
+        raise RuntimeError("commit-gate mutation has no actual checked commit pointer")
+    instruction("commit_gate", commit_gate[1:3], (0xbf, 0, 0, 0))
+    commit_set = next(event for event in events if event[0] == "branch"
+                      and event[6] == ("COUNTER_BANK_COMMIT", 0)
+                      and set(event[3:5]) == {1, 2})
+    instruction("commit_set", commit_set[1:3], (0xbf, 0, 0, 0))
+    fault = next(event for event in events if event[0] == "write"
+                 and event[3] == "COUNTER_BANK_FAULT" and event[5] == 1)
+    instruction("route_fault", fault[1:3], (0xbf, 0, 0, 0))
+    lookup = next(event for event in events if event[0] == "lookup")
+    for label, number in (("endpoint_clock", 5), ("semantic_helper", 112)):
+        instruction(label, lookup[1:3], (0x85, 0, 0, number))
+    owner_call = next(event for event in events if event[0] == "owner")
+    old = graph.instructions[owner_call[1]][owner_call[2]]
+    instruction("unknown_call", owner_call[1:3], (0x85, 0x20, 0, old[3]))
+    refused = {}
+    for label, changed in mutants.items():
+        if changed == body:
+            raise RuntimeError(f"bank causal mutation did not change actual bytes: {label}")
+        try:
+            validate_bank_proof(changed)
+        except (RuntimeError, struct.error):
+            refused[label] = "refused"
+        else:
+            raise RuntimeError(f"actual bank mutant accepted: {label}")
+    return {"schema": report["schema"], "mutants": refused}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("object", nargs="?", type=Path)
     parser.add_argument("--mode", choices=tuple(STATS_BYTES))
+    parser.add_argument("--profile", choices=("fixed", "counts-bank-proof"))
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--self-test-mutants", action="store_true")
     args = parser.parse_args()
     if args.self_test:
-        if args.object is not None or args.mode is not None or args.self_test_mutants:
+        if args.object is not None or args.mode is not None or args.self_test_mutants or args.profile:
             parser.error("--self-test accepts no other arguments")
     elif args.object is None or args.mode is None:
         parser.error("object and --mode are required for object checks")
+    if args.profile == "counts-bank-proof" and args.mode != "counts":
+        parser.error("bank proof requires counts")
     try:
         if args.self_test:
             result = {"schema": "p11scope-counter-transfer-controls/v1",
                       "transfer_controls": transfer_controls()}
         else:
             body = args.object.read_bytes()
-            result = causal_mutants(body, args.mode) if args.self_test_mutants else validate(body, args.mode)[0]
+            if args.profile == "counts-bank-proof":
+                result = bank_causal_mutants(body) if args.self_test_mutants else validate_bank_proof(body)[0]
+            else:
+                result = causal_mutants(body, args.mode) if args.self_test_mutants else validate(body, args.mode)[0]
     except (OSError, RuntimeError, struct.error, ValueError, IndexError, KeyError) as error:
         print(f"counter object refused: {error}", file=sys.stderr)
         return 2

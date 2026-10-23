@@ -4184,3 +4184,7 @@ pub unsafe extern "C" fn p11_link_emit_fork(
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     loop {}
 }
+
+// Appended so disabled proof preparation does not move ordinary BPF lines.
+#[cfg(feature = "counts-bank-proof")]
+mod counter_bank_proof;

@@ -255,10 +255,10 @@ class Btf:
                        fields.get("max_entries", 0), fields.get("map_flags", 0)), size
 
 
-def decode_btf_maps(elf):
+def decode_btf_maps(elf, *, decoder_class=Btf):
     if ".BTF" not in elf.sections:
         raise RuntimeError("native .maps missing .BTF")
-    btf = Btf(elf.sections[".BTF"][1])
+    btf = decoder_class(elf.sections[".BTF"][1])
     sections = [n for n in btf.types[1:] if n[0] == 15 and n[1] == ".maps"]
     if len(sections) != 1:
         raise RuntimeError("missing/duplicate .maps BTF DATASEC")

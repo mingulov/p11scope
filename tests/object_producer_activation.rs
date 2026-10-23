@@ -61,7 +61,10 @@ fn counter_artifact_path(name: &str) -> PathBuf {
 
 fn counter_bank_proof_path() -> PathBuf {
     assert_eq!(env!("P11SCOPE_COUNTER_BANK_PROOF_ENABLED"), "1");
-    assert_eq!(env!("P11SCOPE_COUNTER_BANK_PROOF_OUTPUTS"), "counts-bank-proof");
+    assert_eq!(
+        env!("P11SCOPE_COUNTER_BANK_PROOF_OUTPUTS"),
+        "counts-bank-proof"
+    );
     Path::new(env!("OUT_DIR"))
         .join("counter-bank-proof")
         .join("p11scope-ebpf-counts-bank-proof")
@@ -102,7 +105,11 @@ fn counter_bank_proof_build_selection_matches_emitted_contract() {
     let directory = tempfile::tempdir().unwrap();
     let ordinary = embedded_object(directory.path());
     let result = counter_bank_proof_check(&ordinary, false);
-    assert_eq!(result.status.code(), Some(2), "Detailed passed as a bank proof");
+    assert_eq!(
+        result.status.code(),
+        Some(2),
+        "Detailed passed as a bank proof"
+    );
     assert!(String::from_utf8_lossy(&result.stderr).contains("counter object refused:"));
     if requested {
         let proof = std::fs::read(counter_bank_proof_path()).unwrap();
@@ -114,7 +121,11 @@ fn counter_bank_proof_build_selection_matches_emitted_contract() {
 #[ignore = "requires P11SCOPE_COUNTER_BANK_PROOF=1 in its own build configuration"]
 fn counter_bank_proof_has_exact_routes_and_start_ownership() {
     let output = counter_bank_proof_check(&counter_bank_proof_path(), false);
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["schema"], "p11scope-counter-bank-object/v1");
     assert_eq!(report["logical_slots"], serde_json::json!([0, 1]));
@@ -134,10 +145,19 @@ fn counter_bank_proof_has_exact_routes_and_start_ownership() {
         assert_eq!(report["roots"][root]["semantic_or_event_work"], false);
     }
     for name in [
-        "inactive_entry", "precommit_return_after_commit",
-        "absent_return_preserves_other_start", "absent_return_preserves_lost_debt",
-        "old_bank_keeps_original_transaction", "missing_route_retires_start",
-        "failed_retirement_keeps_debt", "full_width_transaction",
+        "inactive_entry",
+        "precommit_return_after_commit",
+        "absent_return_preserves_other_start",
+        "absent_return_preserves_lost_debt",
+        "old_bank_keeps_original_transaction",
+        "missing_route_retires_start",
+        "failed_retirement_keeps_debt",
+        "full_width_transaction",
+        "admission_failure_is_sticky",
+        "rv_full_width_accumulates",
+        "rv_failure_is_sticky",
+        "entered_saturates_without_wrap",
+        "bounded_contention_is_unhealthy",
     ] {
         assert_eq!(report["controls"][name], "accepted", "{name}");
     }
@@ -147,37 +167,95 @@ fn counter_bank_proof_has_exact_routes_and_start_ownership() {
 #[ignore = "requires P11SCOPE_COUNTER_BANK_PROOF=1 in its own build configuration"]
 fn counter_bank_proof_mutations_are_causally_rejected() {
     let output = counter_bank_proof_check(&counter_bank_proof_path(), true);
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let mutants = report["mutants"].as_object().unwrap();
     for name in [
-        "inner_value_width", "inner_cell_count", "outer_type", "logical_index",
-        "commit_gate", "commit_set", "transaction_width", "optional_start_get",
-        "required_start_remove", "missing_start_get", "missing_start_remove",
-        "route_fault", "endpoint_clock", "semantic_helper", "unknown_call",
+        "inner_value_width",
+        "inner_cell_count",
+        "outer_type",
+        "logical_index",
+        "inner_index",
+        "bank_global_linkage",
+        "bank_global_abi",
+        "commit_gate",
+        "commit_set",
+        "transaction_width",
+        "optional_start_get",
+        "required_start_remove",
+        "missing_start_get",
+        "missing_start_remove",
+        "route_fault",
+        "endpoint_clock",
+        "semantic_helper",
+        "unknown_call",
     ] {
-        assert_eq!(mutants.get(name), Some(&serde_json::json!("refused")), "{name}");
+        assert_eq!(
+            mutants.get(name),
+            Some(&serde_json::json!("refused")),
+            "{name}"
+        );
     }
 }
 
-/// This explicit positive creates only owned anonymous maps and loads the
-/// two proof programs. It does not attach, publish a route or run a workload.
+/// Creates owned anonymous maps and loads both proof roots. Aya may run
+/// feature probes; no attachment, commit publication or workload runs here.
 #[test]
 #[ignore = "requires explicit counter bank build and authorized BTF/map/program-load lane"]
 fn counter_bank_proof_btf_maps_and_programs_load() {
     let path = counter_bank_proof_path();
     let output = counter_bank_proof_check(&path, false);
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-    let mut object = aya::EbpfLoader::new().load_file(path).expect("load bank BTF and maps");
-    let banks = object.map("COUNTER_BANKS").expect("real outer map");
-    let _: aya::maps::HashOfMaps<_, u32> = banks.try_into().expect("real HashOfMaps ABI");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut object = aya::EbpfLoader::new()
+        .load_file(path)
+        .expect("load bank BTF and maps");
+    let first = aya::maps::MapData::create(
+        aya_obj::Map::new_from_params(6, 4, 24, 1, 0),
+        "bank_proof0",
+        None,
+    )
+    .expect("allocate first actual Counts bank");
+    let second = aya::maps::MapData::create(
+        aya_obj::Map::new_from_params(6, 4, 24, 1, 0),
+        "bank_proof1",
+        None,
+    )
+    .expect("allocate second actual Counts bank");
+    let first_id = first.info().unwrap().id();
+    let second_id = second.info().unwrap().id();
+    assert_ne!(first_id, second_id, "banks must own distinct native maps");
+    {
+        let mut banks: aya::maps::HashOfMaps<_, u32> = object
+            .map_mut("COUNTER_BANKS")
+            .expect("real outer map")
+            .try_into()
+            .expect("real HashOfMaps ABI");
+        banks
+            .insert(0, &first, 1)
+            .expect("stage first bank with BPF_NOEXIST");
+        banks
+            .insert(1, &second, 1)
+            .expect("stage second bank with BPF_NOEXIST");
+        assert_eq!(banks.get(&0, 0).unwrap().info().unwrap().id(), first_id);
+        assert_eq!(banks.get(&1, 0).unwrap().info().unwrap().id(), second_id);
+    }
     for name in ["p11_counter_bank_entry", "p11_counter_bank_return"] {
         let program: &mut aya::programs::UProbe = object
             .program_mut(name)
             .expect("proof root")
             .try_into()
             .expect("uprobe program kind");
-        program.load().expect("actual outer-to-inner verifier bridge");
+        program
+            .load()
+            .expect("actual outer-to-inner verifier bridge");
     }
 }
 

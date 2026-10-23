@@ -1133,12 +1133,14 @@ def causal_mutants(body, mode):
     mutants["stats_out_of_bounds"] = mutated_instruction(
         body, graph, key, pc, (op, encoded, STATS_BYTES[mode] + 8, immediate))
     if mode == "latency":
-        histogram = sorted(touch for proof in proofs.values() for touch in proof.touches
-                           if touch[2:4] == ("STATS", "write") and touch[4][0] >= 40)
+        # A CFG site can be visited under several ranges. Mutate physical
+        # instructions once, while removing every distinct bucket writer.
+        histogram = sorted({touch[:2] for proof in proofs.values() for touch in proof.touches
+                            if touch[2:4] == ("STATS", "write") and touch[4][0] >= 40})
         if not histogram:
             raise RuntimeError("histogram-removal mutant has no actual bucket update")
         changed = body
-        for key, pc, *_ in histogram:
+        for key, pc in histogram:
             changed = mutated_instruction(changed, graph, key, pc, (0xbf, 0, 0, 0))
         mutants["missing_histogram_write"] = changed
         histogram_keys = {touch[0] for touch in proofs["p11_return"].touches

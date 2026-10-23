@@ -1530,6 +1530,13 @@ impl JournalAdapter {
     }
 
     #[cfg(test)]
+    pub(crate) fn restrict_thread_floors_for_test(&mut self, limit: usize) {
+        assert!(self.floors.is_empty() && self.physical_return_floors.is_empty());
+        assert!(limit <= self.limits.thread_floors);
+        self.limits.thread_floors = limit;
+    }
+
+    #[cfg(test)]
     pub(crate) fn proof_refused_for_test(&self, proof: JournalDomainProof) -> bool {
         self.keys
             .get(&proof.key)

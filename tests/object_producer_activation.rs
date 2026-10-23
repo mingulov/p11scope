@@ -217,8 +217,43 @@ fn counter_bank_proof_btf_maps_and_programs_load() {
         String::from_utf8_lossy(&output.stderr)
     );
     let mut object = aya::EbpfLoader::new()
+        .allow_unsupported_maps()
         .load_file(path)
         .expect("load bank BTF and maps");
+    // Match the production loader's raw task-storage handles, while
+    // refusing any other unsupported map or mismatched native layout.
+    let storage: std::collections::BTreeMap<_, _> = object
+        .maps()
+        .filter_map(|(name, map)| match map {
+            aya::maps::Map::Unsupported(data) => Some((name, data)),
+            _ => None,
+        })
+        .collect();
+    let expected = std::collections::BTreeMap::from([
+        ("PROC_EPOCH", 152u32),
+        ("ROOT_AFFILIATION", 8),
+        ("TASK_COOKIE", 8),
+        ("THREAD_OWNER", 560),
+    ]);
+    assert_eq!(
+        storage.keys().collect::<Vec<_>>(),
+        expected.keys().collect::<Vec<_>>()
+    );
+    for (name, value_size) in expected {
+        let info = storage[name].info().expect("read native task-storage info");
+        assert_eq!(
+            (
+                info.map_type().unwrap(),
+                info.key_size(),
+                info.value_size(),
+                info.max_entries(),
+                info.map_flags(),
+            ),
+            (aya::maps::MapType::TaskStorage, 4, value_size, 0, 1),
+            "{name}"
+        );
+    }
+    drop(storage);
     let first = aya::maps::MapData::create(
         aya_obj::Map::new_from_params(6, 4, 24, 1, 0),
         "bank_proof0",

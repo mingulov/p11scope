@@ -2942,7 +2942,7 @@ fn privileged_d4_btrfs_subvolume_collision_backend_parity() {
             "actual lexical collision, not scripted keys"
         );
     }
-    let digest = format!("{:x}", Sha256::digest(std::fs::read(&a_path).unwrap()));
+    let digest = p11scope_manifest::identity::hex(&Sha256::digest(std::fs::read(&a_path).unwrap()));
     let pins: PinnedObjects = real_scan_pin(&a_path, Some(key), 0, &digest);
     let object = pins.pinned().next().expect("actual held-file pin").id;
     let (userspace_index, refused) = KnownKeyIndex::build(

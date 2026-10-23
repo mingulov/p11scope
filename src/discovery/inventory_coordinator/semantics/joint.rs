@@ -5,10 +5,231 @@
 use super::*;
 use crate::attach::SessionDrainProducers;
 use crate::discovery::caller_registry::CallerRegistry;
+use crate::semantics_objects::journal::joint_audit::{
+    DisposedJointQuantum, IngestedJointQuantum, JointBirthEvidenceSource, QuantumSealProgress,
+};
 use crate::semantics_objects::journal::joint_driver::{
     IngestedRaw, JointCaptureOwner, RawQuantumRefusal,
 };
 use crate::semantics_objects::journal::{AttestationRefusal, JournalAdapter, JournalDomainProof};
+use crate::semantics_objects::journal::{FaultEpoch, FaultReadError};
+
+/// Stack-only borrows of the same original service inputs. Erasing the I/O
+/// leaf here keeps the ordinary and Joint callers on commit_batch_inner.
+pub(in crate::discovery::engine::inventory_coordinator) struct JointCommitInput<'a> {
+    producers: &'a SessionDrainProducers,
+    frame: &'a mut Option<IngestedJointQuantum>,
+    births: &'a mut dyn JointBirthEvidenceSource,
+    fault: &'a dyn FaultEpoch,
+    remaining: &'a mut usize,
+}
+
+struct BorrowedBirths<'a>(&'a mut dyn JointBirthEvidenceSource);
+impl JointBirthEvidenceSource for BorrowedBirths<'_> {
+    fn take_for(
+        &mut self,
+        target: &crate::discovery::caller_registry::instance_input::JointFeedTarget,
+        binding: &SemanticCallerBinding,
+    ) -> Result<
+        crate::semantics_objects::journal::SessionBirthEvidence,
+        crate::attach::BirthObservationRefusal,
+    > {
+        self.0.take_for(target, binding)
+    }
+}
+
+struct BorrowedFault<'a>(&'a dyn FaultEpoch);
+impl FaultEpoch for BorrowedFault<'_> {
+    fn fault_epoch(&self) -> Result<u64, FaultReadError> {
+        self.0.fault_epoch()
+    }
+}
+
+impl<Source: ProcessSource> InventoryCoordinator<Source> {
+    #[allow(clippy::too_many_arguments)] // Original lane/frame/producer/I/O/budget borrows, not a new owner.
+    pub(crate) fn commit_joint_batch(
+        &mut self,
+        engine_changed: bool,
+        lane: &mut AttestedSemanticLane,
+        producers: &SessionDrainProducers,
+        frame: &mut Option<IngestedJointQuantum>,
+        births: &mut impl JointBirthEvidenceSource,
+        fault: &impl FaultEpoch,
+        remaining: &mut usize,
+    ) -> Result<JointCommitProgress> {
+        self.commit_batch_inner(
+            engine_changed,
+            Some(lane),
+            Some(JointCommitInput {
+                producers,
+                frame,
+                births,
+                fault,
+                remaining,
+            }),
+        )
+    }
+
+    pub(in crate::discovery::engine::inventory_coordinator) fn commit_joint_publication_inner(
+        &mut self,
+        engine_changed: bool,
+        lane: &mut AttestedSemanticLane,
+        input: JointCommitInput<'_>,
+    ) -> Result<JointCommitProgress> {
+        let JointCommitInput {
+            producers,
+            frame,
+            births,
+            fault,
+            remaining,
+        } = input;
+        let original = frame
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Joint publication requires its original frame"))?;
+        if lane.domain() != producers.native_domain() || !lane.is_live() || lane.is_finished() {
+            bail!("Joint publication must retain its original live lane");
+        }
+        // Every mismatch/refusal precedes engine/cgroup/finalizer/observer
+        // work, including a retry with an equal-shaped foreign allocation.
+        self.registry
+            .validate_joint_publication(original, &self.joint_capture, producers)?;
+        self.joint_frame_ports(producers)
+            .map_err(|reason| anyhow::anyhow!("Joint publication ports refused: {reason:?}"))?;
+        if !self.publication_pending() {
+            let storage = self
+                .registry
+                .reserve_semantic_storage(std::mem::size_of::<PendingJointPublication>())
+                .map_err(|reason| {
+                    anyhow::anyhow!("Joint completion storage refused: {reason:?}")
+                })?;
+            self.registry
+                .begin_joint_publication(original, &self.joint_capture, producers)?;
+            let completion = match self.prepare_publication(engine_changed, Some(lane)) {
+                Ok(completion) => completion,
+                Err(reason) => {
+                    // The only fallible tail precedes taking original cgroup
+                    // custody. Nothing has applied; originals remain queued.
+                    self.registry.cancel_unapplied_joint_publication();
+                    return Err(reason);
+                }
+            };
+            self.joint_publication = Some(PendingJointPublication {
+                completion,
+                _storage: storage,
+            });
+        } else if self.joint_publication.is_none() {
+            bail!("Joint publication has no original completion context");
+        }
+        if !self.registry.joint_publication_applied() {
+            self.publish_registry(Some((
+                frame.as_ref().expect("retained original frame"),
+                producers,
+            )))?;
+        }
+        if !self.registry.joint_publication_targets_bound() {
+            let mut ports = self
+                .joint_frame_ports(producers)
+                .map_err(|reason| anyhow::anyhow!("Joint target ports refused: {reason:?}"))?;
+            frame
+                .as_mut()
+                .expect("retained original frame")
+                .bind_targets(&ports)
+                .map_err(|reason| anyhow::anyhow!("Joint targets refused: {reason:?}"))?;
+            // The private marker avoids repeating snapshot allocation. It
+            // grants no permission: every seal/delivery rechecks the frame.
+            ports.split().0.mark_joint_publication_targets_bound();
+        }
+        if let Some(disposed) = self.finish_joint_frame_if_ready(frame, producers, lane)? {
+            return Ok(self.complete_joint_publication(disposed));
+        }
+        let mut births = BorrowedBirths(births);
+        let fault = BorrowedFault(fault);
+        while *remaining != 0 {
+            let before = *remaining;
+            {
+                let mut ports = self
+                    .joint_frame_ports(producers)
+                    .map_err(|reason| anyhow::anyhow!("Joint service ports refused: {reason:?}"))?;
+                let held = frame.as_mut().expect("same original service frame");
+                held.seal_next(&mut ports, &mut births, &fault)
+                    .map_err(|reason| anyhow::anyhow!("Joint seal refused: {reason:?}"))?;
+                held.deliver_next_bounded(&mut ports, remaining)
+                    .map_err(|reason| anyhow::anyhow!("Joint delivery refused: {reason:?}"))?;
+            }
+            if let Some(disposed) = self.finish_joint_frame_if_ready(frame, producers, lane)? {
+                return Ok(self.complete_joint_publication(disposed));
+            }
+            if *remaining == before {
+                break; // Same-frontier retry or real future-input dependency.
+            }
+        }
+        Ok(JointCommitProgress::Pending)
+    }
+
+    fn finish_joint_frame_if_ready(
+        &mut self,
+        frame: &mut Option<IngestedJointQuantum>,
+        producers: &SessionDrainProducers,
+        lane: &AttestedSemanticLane,
+    ) -> Result<Option<DisposedJointQuantum>> {
+        let mut ports = self
+            .joint_frame_ports(producers)
+            .map_err(|reason| anyhow::anyhow!("Joint completion ports refused: {reason:?}"))?;
+        let held = frame
+            .take()
+            .expect("same original frame until actual finish");
+        let result = match held.finish_frame(&mut ports) {
+            Ok(disposed) => return Ok(Some(disposed)),
+            Err((mut held, RawQuantumRefusal::H3Undisposed)) => {
+                match held.defer_pending_h3(&mut ports, lane) {
+                    Ok(QuantumSealProgress::AwaitFutureInput | QuantumSealProgress::Complete) => {
+                        held.finish_pending_h3(&mut ports, lane)
+                    }
+                    Ok(_) | Err(RawQuantumRefusal::DispositionMismatch) => {
+                        *frame = Some(held);
+                        return Ok(None);
+                    }
+                    Err(reason) => {
+                        *frame = Some(held);
+                        bail!("Joint continuation refused: {reason:?}");
+                    }
+                }
+            }
+            Err(other) => Err(other),
+        };
+        match result {
+            Ok(disposed) => Ok(Some(disposed)),
+            Err((
+                held,
+                RawQuantumRefusal::DispositionMismatch | RawQuantumRefusal::H3Undisposed,
+            )) => {
+                *frame = Some(held);
+                Ok(None)
+            }
+            Err((held, reason)) => {
+                *frame = Some(held);
+                bail!("Joint completion refused: {reason:?}");
+            }
+        }
+    }
+
+    fn complete_joint_publication(
+        &mut self,
+        disposed: DisposedJointQuantum,
+    ) -> JointCommitProgress {
+        let applied = self
+            .registry
+            .finish_joint_publication(&mut self.joint_capture, &disposed)
+            .expect("exclusive original frame disposal matches its preflighted publication");
+        let pending = self
+            .joint_publication
+            .take()
+            .expect("original completion context");
+        let receipt = self.finish_publication_context(pending.completion, applied);
+        drop(pending._storage); // Original collection/events have moved or finished first.
+        JointCommitProgress::Published(receipt)
+    }
+}
 
 pub(crate) type PreparedClaim = (u64, Result<JournalDomainProof, AttestationRefusal>);
 

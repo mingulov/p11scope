@@ -24,8 +24,8 @@
 use crate::discovery::caller_registry::instance_input::{InstanceLifecycle, RegistryInstanceId};
 use crate::discovery::caller_registry::{
     AdmissionChange, AdmissionState, BudgetRefusal, CallerId, CallerLifecycle, CallerRecord,
-    ExeIdentity, ImageAuthority, MappingState, ModuleId, ModuleLifecycle, ModuleRecord,
-    ProcessSource, SEMANTIC_UNKNOWN, UnknownReason, UseCoverage,
+    ExeIdentity, ImageAuthority, JointPublicationPending, MappingState, ModuleId, ModuleLifecycle,
+    ModuleRecord, ProcessSource, SEMANTIC_UNKNOWN, UnknownReason, UseCoverage,
 };
 use crate::discovery::engine::inventory_coordinator::InventoryCoordinator;
 use crate::render::escape_controls;
@@ -564,6 +564,17 @@ impl Presentation {
         ended_ns: u64,
         passes: u64,
     ) -> Self {
+        Self::try_capture(coordinator, scope_label, started_ns, ended_ns, passes)
+            .expect("capture requires a completed registry publication")
+    }
+
+    pub(crate) fn try_capture<Source: ProcessSource>(
+        coordinator: &InventoryCoordinator<Source>,
+        scope_label: &str,
+        started_ns: u64,
+        ended_ns: u64,
+        passes: u64,
+    ) -> Result<Self, JointPublicationPending> {
         Self::capture_inner(
             coordinator,
             scope_label,
@@ -587,6 +598,27 @@ impl Presentation {
         now_ns: u64,
         window_ns: u64,
     ) -> Self {
+        Self::try_capture_dashboard(
+            coordinator,
+            scope_label,
+            started_ns,
+            ended_ns,
+            passes,
+            now_ns,
+            window_ns,
+        )
+        .expect("dashboard capture requires a completed registry publication")
+    }
+
+    pub(crate) fn try_capture_dashboard<Source: ProcessSource>(
+        coordinator: &InventoryCoordinator<Source>,
+        scope_label: &str,
+        started_ns: u64,
+        ended_ns: u64,
+        passes: u64,
+        now_ns: u64,
+        window_ns: u64,
+    ) -> Result<Self, JointPublicationPending> {
         Self::capture_inner(
             coordinator,
             scope_label,
@@ -604,7 +636,10 @@ impl Presentation {
         ended_ns: u64,
         passes: u64,
         basis: ActivityBasis,
-    ) -> Self {
+    ) -> Result<Self, JointPublicationPending> {
+        if coordinator.publication_pending() {
+            return Err(JointPublicationPending);
+        }
         let registry = coordinator.registry();
         let mut caller_ids: Vec<CallerId> = coordinator
             .adapter()
@@ -789,7 +824,7 @@ impl Presentation {
         let limits = registry.limits();
         let (observed_edges, saturated_edges) = registry.counter_census();
         let render_index = PresentationRenderIndex::build(&instances, &semantic_edges);
-        Self {
+        Ok(Self {
             scope_label: scope_label.to_string(),
             started_ns,
             ended_ns,
@@ -868,7 +903,7 @@ impl Presentation {
                 retained_suppressed: registry.gaps_suppressed(),
                 preadmission: coordinator.preadmission_counters(),
             },
-        }
+        })
     }
 
     pub(crate) fn semantic_children(

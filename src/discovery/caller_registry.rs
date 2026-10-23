@@ -31,6 +31,9 @@ pub(crate) mod metadata;
 
 use crate::semantics_edge::resources::{SemanticResourceRefusal, SemanticResourceReserver};
 use crate::semantics_edge::{EdgeSemantics, SemanticCall};
+use crate::semantics_objects::journal::ConsumptionOrdinal;
+use crate::semantics_objects::journal::joint_audit::{DisposedJointQuantum, IngestedJointQuantum};
+use crate::semantics_objects::journal::joint_driver::{JointCaptureOwner, RawQuantumIdentity};
 use anyhow::{Result, anyhow, bail};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::BuildHasher as _;
@@ -2314,10 +2317,21 @@ enum Mutation {
     },
 }
 
-/// The caller/module registry. Mutations stage in batch order and apply
-/// only at `publish`, so readers (including the JSON renderer) observe
-/// one consistent snapshot per batch and the ordering test can pin that
-/// facts publish synchronously with the batch return.
+/// A publication is applied but its original frame has not finished. This
+/// refusal carries no evidence and permits neither replay nor acknowledgement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct JointPublicationPending;
+
+struct AppliedJointPublication {
+    identity: RawQuantumIdentity,
+    frontier: ConsumptionOrdinal,
+    base_revision: u64,
+    applied: Option<usize>,
+    targets_bound: bool,
+    _storage: crate::semantics_edge::resources::ResourceLease,
+}
+
+/// Staged physical and semantic inputs share one publication revision.
 pub(crate) struct CallerRegistry {
     semantic_resources: crate::semantics_edge::resources::SemanticResourcePool,
     instance_state: instance_input::InstanceState,
@@ -2342,6 +2356,9 @@ pub(crate) struct CallerRegistry {
     suppressed_hasher: std::hash::RandomState,
     gaps_suppressed: u64,
     staged: Vec<Mutation>,
+    /// One retained phase over the existing staging vector, never a second
+    /// queue. New staged inputs belong to the next publication.
+    joint_publication: Option<AppliedJointPublication>,
     /// Why an edge no producer covered reads unknown: `ScanOnly` until a
     /// native usage producer runs (Task 6 C5 sets `NotAttached`).
     uncovered_reason: UnknownReason,
@@ -2464,6 +2481,7 @@ impl CallerRegistry {
             suppressed_hasher: std::hash::RandomState::new(),
             gaps_suppressed: 0,
             staged: Vec::new(),
+            joint_publication: None,
             uncovered_reason: UnknownReason::ScanOnly,
             last_health_regression_ns: None,
             watches_ended_ns: None,
@@ -3279,7 +3297,149 @@ impl CallerRegistry {
         self.publish_inner(observer, Some(ledger))
     }
 
+    pub(crate) fn publication_pending(&self) -> bool {
+        self.joint_publication.is_some()
+    }
+
+    /// Check the actual original before any preparation/apply. The stamp only
+    /// protects phase custody; H3/H9 still validate the original frame itself.
+    pub(crate) fn validate_joint_publication(
+        &self,
+        frame: &IngestedJointQuantum,
+        owner: &JointCaptureOwner,
+        producers: &crate::attach::SessionDrainProducers,
+    ) -> Result<()> {
+        frame
+            .validate_owner(owner, producers)
+            .map_err(|reason| anyhow!("Joint publication original refused: {reason:?}"))?;
+        if let Some(phase) = &self.joint_publication
+            && (phase.identity != frame.identity()
+                || phase.frontier != frame.frontier()
+                || phase.base_revision != self.facts_revision)
+        {
+            bail!("Joint publication must resume its exact original frame and revision");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn begin_joint_publication(
+        &mut self,
+        frame: &IngestedJointQuantum,
+        owner: &JointCaptureOwner,
+        producers: &crate::attach::SessionDrainProducers,
+    ) -> Result<()> {
+        self.validate_joint_publication(frame, owner, producers)?;
+        if self.joint_publication.is_some() {
+            bail!("Joint publication is already retained");
+        }
+        let storage = self
+            .semantic_resources
+            .reserve(std::mem::size_of::<AppliedJointPublication>())
+            .map_err(|reason| anyhow!("Joint publication storage refused: {reason:?}"))?;
+        self.joint_publication = Some(AppliedJointPublication {
+            identity: frame.identity(),
+            frontier: frame.frontier(),
+            base_revision: self.facts_revision,
+            applied: None,
+            targets_bound: false,
+            _storage: storage,
+        });
+        Ok(())
+    }
+
+    /// Only an engine-tail failure before preparation/application can unwind
+    /// this new phase. An applied phase always retains its original frame.
+    pub(crate) fn cancel_unapplied_joint_publication(&mut self) {
+        assert!(
+            self.joint_publication
+                .as_ref()
+                .is_some_and(|phase| phase.applied.is_none())
+        );
+        self.joint_publication = None;
+    }
+
+    pub(crate) fn apply_joint_publication(
+        &mut self,
+        owner: &mut JointCaptureOwner,
+        frame: &IngestedJointQuantum,
+        producers: &crate::attach::SessionDrainProducers,
+        observer: Option<&mut dyn FnMut(CountPublication)>,
+    ) -> Result<usize> {
+        self.validate_joint_publication(frame, owner, producers)?;
+        assert!(
+            self.joint_publication
+                .as_ref()
+                .is_some_and(|phase| phase.applied.is_none())
+        );
+        let applied = self.apply_staged(observer, Some(owner.ledger_mut()));
+        self.joint_publication
+            .as_mut()
+            .expect("retained original phase")
+            .applied = Some(applied);
+        Ok(applied)
+    }
+
+    pub(crate) fn joint_publication_applied(&self) -> bool {
+        self.joint_publication
+            .as_ref()
+            .is_some_and(|phase| phase.applied.is_some())
+    }
+
+    pub(crate) fn joint_publication_targets_bound(&self) -> bool {
+        self.joint_publication
+            .as_ref()
+            .expect("retained phase")
+            .targets_bound
+    }
+
+    pub(crate) fn mark_joint_publication_targets_bound(&mut self) {
+        self.joint_publication
+            .as_mut()
+            .expect("retained phase")
+            .targets_bound = true;
+    }
+
+    /// Completion is supplied only by the actual frame finish, never callback
+    /// words, a progress enum, a cut scalar or a second H3 take.
+    pub(crate) fn finish_joint_publication(
+        &mut self,
+        owner: &mut JointCaptureOwner,
+        disposed: &DisposedJointQuantum,
+    ) -> Result<usize> {
+        let phase = self
+            .joint_publication
+            .as_ref()
+            .ok_or_else(|| anyhow!("no retained Joint publication"))?;
+        if phase.identity != disposed.identity()
+            || phase.frontier != disposed.frontier()
+            || phase.base_revision != self.facts_revision
+            || !phase.targets_bound
+        {
+            bail!("Joint completion does not name the retained original publication");
+        }
+        let applied = phase
+            .applied
+            .ok_or_else(|| anyhow!("Joint inputs have not applied"))?;
+        self.complete_publication(Some(owner.ledger_mut()));
+        self.joint_publication = None;
+        Ok(applied)
+    }
+
     fn publish_inner(
+        &mut self,
+        observer: Option<&mut dyn FnMut(CountPublication)>,
+        mut ledger: Option<&mut crate::semantics_objects::journal::StagingLedger>,
+    ) -> usize {
+        assert!(
+            !self.publication_pending(),
+            "an unfinished Joint publication retains its original frame"
+        );
+        let applied = self.apply_staged(observer, ledger.as_deref_mut());
+        self.complete_publication(ledger);
+        applied
+    }
+
+    fn apply_staged(
         &mut self,
         mut observer: Option<&mut dyn FnMut(CountPublication)>,
         mut ledger: Option<&mut crate::semantics_objects::journal::StagingLedger>,
@@ -3327,15 +3487,21 @@ impl CallerRegistry {
                 observer.as_mut().expect("enabled count observer")(count);
             }
         }
-        // Settle both staged-payload and association releases before
-        // publication, even when this publish had no new effects.
+        applied
+    }
+
+    fn complete_publication(
+        &mut self,
+        ledger: Option<&mut crate::semantics_objects::journal::StagingLedger>,
+    ) {
+        // Settle original payload/association releases only after all frame
+        // consumers finish, even when this publication had no new effects.
         if let Some(ledger) = ledger {
             self.flush_joint_releases(ledger);
         }
         self.reconcile_initial_semantic_coverage();
         self.facts_revision = self.facts_revision.saturating_add(1);
         self.published_revision = self.facts_revision;
-        applied
     }
 
     /// Disclose the initial observation interval after physical and semantic

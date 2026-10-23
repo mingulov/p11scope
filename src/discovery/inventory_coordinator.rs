@@ -117,6 +117,29 @@ pub(crate) struct BatchReceipt {
     pub registry_applied: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JointCommitProgress {
+    Pending,
+    Published(BatchReceipt),
+}
+
+/// Move the existing commit locals intact. Cgroup membership pins, work
+/// charges, event allocation and completion counters survive every Pending
+/// slice; collection.finish runs only at the actual publication boundary.
+struct PublicationCompletion {
+    cgroup: Option<(CgroupCollection, u64)>,
+    events: Vec<CallerEvent>,
+    admitted: usize,
+    scan_callers: usize,
+}
+
+struct PendingJointPublication {
+    completion: PublicationCompletion,
+    // Moved cgroup allocations keep their original collection/work bounds.
+    // Charge this additional retained inline wrapper before preparation.
+    _storage: crate::semantics_edge::resources::ResourceLease,
+}
+
 /// Delivered after the actual publication boundary. Cg4 must service its
 /// newly available target delta and emit these delayed admission events.
 #[cfg_attr(not(test), allow(dead_code))] // Cg4 consumes completion after commit.
@@ -246,6 +269,7 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// the semantic finalizer). The parked/active transfer design must
     /// define owner replace/reset semantics; no transfer runs here.
     joint_capture: crate::semantics_objects::journal::joint_driver::JointCaptureOwner,
+    joint_publication: Option<PendingJointPublication>,
     /// Optional hints retain only their own identity-qualified source state.
     /// They do not supply Inventory, H0 or Detailed admission authority.
     caller_metadata: Option<crate::caller_metadata::runtime::job::MetadataLane>,
@@ -432,6 +456,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             semantic_bindings: semantics::SemanticBindingSet::new(),
             semantic_finalizer: None,
             joint_capture,
+            joint_publication: None,
             caller_metadata: None,
             refused_semantic_domains: HashSet::new(),
             pending_adjudication: BTreeMap::new(),
@@ -2016,6 +2041,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         collection: CgroupCollection,
         now_ns: u64,
     ) -> Result<PassReport> {
+        if self.publication_pending() {
+            bail!("the previous Joint publication retains its cgroup continuation");
+        }
         if self.stopped {
             bail!(
                 "the coordinator stopped; the collection starts no new scan, attach, \
@@ -5319,30 +5347,57 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
     }
 
-    /// The I4b batch: the engine tail and the registry publish as one
-    /// synchronous step. Facts from every scan since the last commit are
-    /// invisible before this returns and visible after — the ordering
-    /// the Phase 2 test pins, extended to caller/edge facts.
+    /// The physical tail and registry share the actual publication boundary.
     pub(crate) fn commit_batch(&mut self, engine_changed: bool) -> Result<BatchReceipt> {
-        self.commit_batch_inner(engine_changed, None)
+        match self.commit_batch_inner(engine_changed, None, None)? {
+            JointCommitProgress::Published(receipt) => Ok(receipt),
+            JointCommitProgress::Pending => unreachable!("plain commit cannot start Joint work"),
+        }
     }
 
-    /// The commit with an attested Detailed lane: pending semantic batches
-    /// finalize after all reconciliation/catalog work and immediately
-    /// before registry publication. `commit_batch` delegates with `None`.
     pub(crate) fn commit_batch_with_semantics(
         &mut self,
         engine_changed: bool,
         lane: Option<&mut AttestedSemanticLane>,
     ) -> Result<BatchReceipt> {
-        self.commit_batch_inner(engine_changed, lane)
+        match self.commit_batch_inner(engine_changed, lane, None)? {
+            JointCommitProgress::Published(receipt) => Ok(receipt),
+            JointCommitProgress::Pending => unreachable!("plain commit cannot start Joint work"),
+        }
     }
 
+    /// The single publication entrypoint dispatches retries before engine,
+    /// cgroup, semantic finalizer or observer preparation can repeat.
     fn commit_batch_inner(
         &mut self,
         engine_changed: bool,
+        lane: Option<&mut AttestedSemanticLane>,
+        joint: Option<semantics::JointCommitInput<'_>>,
+    ) -> Result<JointCommitProgress> {
+        if let Some(joint) = joint {
+            let lane = lane
+                .ok_or_else(|| anyhow::anyhow!("Joint publication requires its retained lane"))?;
+            return self.commit_joint_publication_inner(engine_changed, lane, joint);
+        }
+        if self.publication_pending() {
+            bail!("an unfinished Joint publication must resume its original frame");
+        }
+        let completion = self.prepare_publication(engine_changed, lane)?;
+        let applied = self.publish_registry(None)?;
+        Ok(JointCommitProgress::Published(
+            self.finish_publication_context(completion, applied),
+        ))
+    }
+
+    pub(crate) fn publication_pending(&self) -> bool {
+        self.joint_publication.is_some() || self.registry.publication_pending()
+    }
+
+    fn prepare_publication(
+        &mut self,
+        engine_changed: bool,
         mut lane: Option<&mut AttestedSemanticLane>,
-    ) -> Result<BatchReceipt> {
+    ) -> Result<PublicationCompletion> {
         // Original cgroup custody is still in self during the fallible engine
         // tail. Scoped preparation/staging then has no later fallible tail.
         self.engine.publish_batch_tail(engine_changed)?;
@@ -5676,57 +5731,95 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // validated registrations second, eligible calls in position
         // order. No semantic positive sits ahead of a physical decision.
         self.finalize_semantic_batches(lane);
-        // Pure projection performs no additional generation/admission reads.
-        // Keep the original handles through this actual publication call.
+        Ok(PublicationCompletion {
+            cgroup: publishing_cgroup,
+            events: scoped_events,
+            admitted: scoped_admitted,
+            scan_callers: scoped_scan_callers,
+        })
+    }
+
+    fn publish_registry(
+        &mut self,
+        joint: Option<(
+            &crate::semantics_objects::journal::joint_audit::IngestedJointQuantum,
+            &crate::attach::SessionDrainProducers,
+        )>,
+    ) -> Result<usize> {
         let registry_applied = if let Some(recorder) = &mut self.diagnostics {
             let adapter = &self.adapter;
-            self.registry.publish_with_count_observer(
-                Some(&mut |count: CountPublication| {
-                    let mut record = DiagnosticRecord::new(DiagnosticKind::Publication);
-                    record.caller = Some(count.caller.0);
-                    if let Some(caller) = adapter.record(count.caller) {
-                        record.pid = Some(caller.pid);
-                        record.incarnation = Some(u64::from(caller.incarnation));
-                    }
-                    record.module = count.module.map(|module| module.0);
-                    record.staged = Some(count.staged);
-                    record.base = Some(count.base);
-                    record.edge_total = count.edge_total;
-                    // The registry mutation has no genuine raw pair/read reference.
-                    record.reason = Some(DiagnosticReason::ContextUnavailable);
-                    record.context_unavailable = true;
-                    recorder.record(record);
-                }),
-                self.joint_capture.ledger_mut(),
-            )
+            let mut observer = |count: CountPublication| {
+                let mut record = DiagnosticRecord::new(DiagnosticKind::Publication);
+                record.caller = Some(count.caller.0);
+                if let Some(caller) = adapter.record(count.caller) {
+                    record.pid = Some(caller.pid);
+                    record.incarnation = Some(u64::from(caller.incarnation));
+                }
+                record.module = count.module.map(|module| module.0);
+                record.staged = Some(count.staged);
+                record.base = Some(count.base);
+                record.edge_total = count.edge_total;
+                // The registry mutation has no genuine raw pair/read reference.
+                record.reason = Some(DiagnosticReason::ContextUnavailable);
+                record.context_unavailable = true;
+                recorder.record(record);
+            };
+            if let Some((frame, producers)) = joint {
+                self.registry.apply_joint_publication(
+                    &mut self.joint_capture,
+                    frame,
+                    producers,
+                    Some(&mut observer),
+                )?
+            } else {
+                self.registry.publish_with_count_observer(
+                    Some(&mut observer),
+                    self.joint_capture.ledger_mut(),
+                )
+            }
+        } else if let Some((frame, producers)) = joint {
+            self.registry.apply_joint_publication(
+                &mut self.joint_capture,
+                frame,
+                producers,
+                None,
+            )?
         } else {
             self.registry
                 .publish_with_ledger(self.joint_capture.ledger_mut())
         };
+        Ok(registry_applied)
+    }
+
+    fn finish_publication_context(
+        &mut self,
+        completion: PublicationCompletion,
+        registry_applied: usize,
+    ) -> BatchReceipt {
         self.finalize_pending_counts();
-        if let Some((collection, _)) = publishing_cgroup {
+        if let Some((collection, _)) = completion.cgroup {
             collection.observe_publication(
-                scoped_admitted,
-                scoped_scan_callers,
+                completion.admitted,
+                completion.scan_callers,
                 self.attach_set.len(),
             );
             let (state, outcome) = collection.finish();
             self.completed_cgroup = Some(CgroupCompletion {
                 state,
                 outcome,
-                events: scoped_events,
-                admitted: scoped_admitted,
-                scan_callers: scoped_scan_callers,
+                events: completion.events,
+                admitted: completion.admitted,
+                scan_callers: completion.scan_callers,
             });
         }
         self.synchronize_caller_metadata(crate::discovery::caller_registry::now_ns());
-        Ok(BatchReceipt {
+        BatchReceipt {
             engine_facts: self.engine.facts_revision,
             engine_published: self.engine.published_facts_revision,
             registry_facts: self.registry.facts_revision(),
             registry_published: self.registry.published_revision(),
             registry_applied,
-        })
+        }
     }
 }
 

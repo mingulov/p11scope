@@ -32,6 +32,7 @@ use crate::semantic_capture::{
 use crate::semantics_edge::resources::{OWNED_ALLOCATION_PADDING, ResourceLease};
 pub(super) use finalizer::SessionFinalizerState;
 pub(crate) use finalizer::{JointPublicationPorts, SessionAuditInput, SessionH3Finalizer};
+pub(super) use joint::JointCommitInput;
 pub(crate) use joint::PreparedSemanticBatch;
 use joint::{PendingSemanticBatch, PreparedAdmission, PreparedH3};
 use p11scope_ebpf_common::ImageIdentity;

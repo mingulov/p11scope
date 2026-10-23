@@ -1846,7 +1846,9 @@ fn joint_raw_disposition_quiet_and_pending_paths_are_finite() {
 
 #[test]
 fn joint_raw_disposition_reaches_retained_s1only_history() {
+    use crate::semantics_key_use::SealFailureDisposition;
     use crate::semantics_objects::journal::joint_driver::RawDisposeReason;
+    use crate::semantics_objects::journal::{H3DispositionEvidence, JournalGap};
     let mut fixture = CanonicalFanoutScene::prior_sealed();
     fixture.push_two("C_SignInit", 2);
     let mut frame = fixture.audited(2, 2, &BirthFault);
@@ -1876,8 +1878,11 @@ fn joint_raw_disposition_reaches_retained_s1only_history() {
     }
     assert_eq!(fixture.s1_counts(first.id()), (2, 1, 0, 0, 1));
     fixture.finish_bounded_batch(frame, false);
-    for sequence in [3, 4] {
-        if sequence == 4 {
+    let fault = FrameFault::clean();
+    for sequence in [3, 4, 5] {
+        let original_s1 = fixture.s1_counts(first.id());
+        assert_eq!(original_s1.4, usize::from(sequence < 5));
+        if sequence >= 4 {
             assert!(
                 fixture
                     .scene
@@ -1889,11 +1894,20 @@ fn joint_raw_disposition_reaches_retained_s1only_history() {
                     .proof_refused_for_test(first.bootstrap().proof())
             );
         }
-        let (_, end) = fixture.scene.encoded(pid, 0, "C_SignUpdate", sequence);
-        let mut ordinary = end[24..392].to_vec();
-        ordinary[108..112].copy_from_slice(&u32::MAX.to_le_bytes());
-        fixture.scene.drain.source_mut().push_record(ordinary);
-        let raw = fixture.scene.prepare(1);
+        let calls = if sequence == 5 {
+            // A fresh actual loss with no new S1 operation cannot count the
+            // already-ended call again. Keep collection/fresh fault reads at
+            // the same epoch installed by the previous real loss.
+            fixture.scene.drain.source_mut().push_record(vec![0; 17]);
+            0
+        } else {
+            let (_, end) = fixture.scene.encoded(pid, 0, "C_SignUpdate", sequence);
+            let mut ordinary = end[24..392].to_vec();
+            ordinary[108..112].copy_from_slice(&u32::MAX.to_le_bytes());
+            fixture.scene.drain.source_mut().push_record(ordinary);
+            1
+        };
+        let raw = fixture.scene.prepare_with_fault(calls, &fault);
         let disposed = raw
             .dispose_without_ingest(
                 fixture.scene.real.scene.coordinator.joint_capture_mut(),
@@ -1936,8 +1950,15 @@ fn joint_raw_disposition_reaches_retained_s1only_history() {
             .coordinator
             .commit_batch_with_semantics(false, Some(&mut fixture.scene.real.lane))
             .unwrap();
-        let fault = FrameFault::clean();
-        fault.epoch.set(u64::from(sequence == 4));
+        let before = fixture.s1_counts(first.id());
+        assert_eq!(
+            (before.3, before.4),
+            (original_s1.3, original_s1.4),
+            "sequence {sequence}: ordinary publication must preserve the original S1 operation"
+        );
+        if sequence == 4 {
+            fault.epoch.set(1); // Actual later read, after this original collection.
+        }
         let frame = fixture
             .scene
             .real
@@ -1952,19 +1973,41 @@ fn joint_raw_disposition_reaches_retained_s1only_history() {
             .unwrap_or_else(|(_, reason)| {
                 panic!("original raw plus actual later fault: {reason:?}")
             });
-        if sequence == 4 {
-            assert!(frame.original_failures_for_test().any(|failure| failure.gap
-                == crate::semantics_objects::journal::JournalGap::FaultChanged));
+        let audited = frame
+            .audited_failure_for_test(first.bootstrap().domain())
+            .expect("the original negative binds this retained S1Only history");
+        if sequence == 3 {
+            assert_eq!(audited.failure().gap, JournalGap::ImageTainted);
+            assert_eq!(audited.disposition(), SealFailureDisposition::Fallback);
+            assert!(matches!(
+                audited.h3(),
+                H3DispositionEvidence::Clean {
+                    pending_floor: None,
+                    ..
+                }
+            ));
+        } else {
+            assert_eq!(audited.disposition(), SealFailureDisposition::HistoryLoss);
+            if sequence == 4 {
+                assert!(
+                    frame
+                        .original_failures_for_test()
+                        .any(|failure| failure.gap == JournalGap::FaultChanged)
+                );
+            }
         }
-        let before = fixture.s1_counts(first.id());
         finish_disposed_negative_frame(&mut fixture, frame, &fault);
         let after = fixture.s1_counts(first.id());
         assert_eq!(
             after.3,
-            before.3 + u64::from(sequence == 3),
-            "only the original active S1 call can become Unknown once"
+            before.3 + u64::from(sequence == 4),
+            "sequence {sequence}: only actual history loss ends the original S1 call, once"
         );
-        assert_eq!(after.4, 0);
+        assert_eq!(
+            after.4,
+            if sequence == 3 { before.4 } else { 0 },
+            "proof-only refusal preserves active S1; actual loss ends it"
+        );
     }
 }
 

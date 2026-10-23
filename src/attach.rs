@@ -7858,6 +7858,321 @@ mod tests {
     };
     use std::collections::BTreeMap;
 
+    /// A real STOP_GATE mapping, with a second mapping standing in only for
+    /// native atomic updates. No Q receipt is constructed by the fixture.
+    struct FinishQGate {
+        gate: super::StopGate,
+        writer: std::ptr::NonNull<std::sync::atomic::AtomicU64>,
+        len: usize,
+        _file: std::fs::File,
+    }
+
+    impl FinishQGate {
+        fn new() -> Self {
+            use std::os::fd::{AsFd, AsRawFd};
+
+            let file = tempfile::tempfile().unwrap();
+            let len = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
+            file.set_len(u64::try_from(len).unwrap()).unwrap();
+            let gate = super::StopGate::from_map_fd(file.as_fd()).unwrap();
+            let mapping = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    file.as_raw_fd(),
+                    0,
+                )
+            };
+            assert_ne!(mapping, libc::MAP_FAILED);
+            Self {
+                gate,
+                writer: std::ptr::NonNull::new(mapping.cast()).unwrap(),
+                len,
+                _file: file,
+            }
+        }
+
+        fn native_word(&self, value: u64) {
+            // Both mappings refer to the same aligned AtomicU64 cell.
+            unsafe { self.writer.as_ref() }.store(value, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl Drop for FinishQGate {
+        fn drop(&mut self) {
+            unsafe { libc::munmap(self.writer.as_ptr().cast(), self.len) };
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum FinishQReadControl {
+        Normal,
+        EventsError,
+        DiscoveryError,
+        LoseQuiescence,
+    }
+
+    struct FinishQFixture {
+        gate: FinishQGate,
+        producers: super::SessionDrainProducers,
+        discovery_domain: crate::events::DiscoveryDomain,
+        detach: super::OwnedProducerDetach,
+        events: crate::events::EventDrain<crate::events::ScriptedRecords>,
+        discovery: crate::events::DiscoveryDrain<crate::events::ScriptedRecords>,
+        reads: std::cell::Cell<(usize, usize)>,
+    }
+
+    impl FinishQFixture {
+        fn new(native: NativeDomainId) -> Self {
+            use crate::events::{
+                DiscoveryDomain, DiscoveryDrain, EventDrain, EventsDomain, ScriptedRecords,
+            };
+
+            let events = EventsDomain::test_standin(0xf1a1);
+            let discovery_domain = DiscoveryDomain::test_standin(0xf1d1);
+            Self {
+                gate: FinishQGate::new(),
+                producers: super::SessionDrainProducers::test_pair(native, events.clone()),
+                discovery_domain: discovery_domain.clone(),
+                detach: super::OwnedProducerDetach::NotStarted,
+                events: EventDrain::over_domain(
+                    ScriptedRecords::records([vec![0], vec![0]], 4),
+                    events,
+                ),
+                discovery: DiscoveryDrain::over_domain(
+                    ScriptedRecords::records([vec![0]], 1),
+                    discovery_domain,
+                ),
+                reads: std::cell::Cell::new((0, 0)),
+            }
+        }
+
+        fn observe(
+            &self,
+            expected: &super::SessionDrainProducers,
+            grant: Option<&crate::semantics_objects::journal::SessionDrainGrant>,
+            control: FinishQReadControl,
+        ) -> anyhow::Result<Option<super::CollectedFinishQ>> {
+            let owner = super::CollectedFinishQOwner {
+                gate: &self.gate.gate,
+                producers: &self.producers,
+                discovery: &self.discovery_domain,
+                detach: &self.detach,
+            };
+            // This is the SAME private observer builder that Session must
+            // supply with its own fields. Only native ring reads are leaves.
+            super::observe_collected_finish_q_with(
+                owner,
+                expected,
+                grant,
+                || {
+                    let (events, discovery) = self.reads.get();
+                    self.reads.set((events + 1, discovery));
+                    if matches!(control, FinishQReadControl::EventsError) {
+                        anyhow::bail!("injected EVENTS position failure");
+                    }
+                    self.events
+                        .consumption_cut()
+                        .map_err(|reason| anyhow::anyhow!("EVENTS cut refused: {reason:?}"))
+                },
+                || {
+                    let (events, discovery) = self.reads.get();
+                    self.reads.set((events, discovery + 1));
+                    if matches!(control, FinishQReadControl::DiscoveryError) {
+                        anyhow::bail!("injected DISCOVERY position failure");
+                    }
+                    if matches!(control, FinishQReadControl::LoseQuiescence) {
+                        self.gate
+                            .native_word(p11scope_ebpf_common::STOP_GATE_STOP | 1);
+                    }
+                    Ok(crate::events::discovery_drain_positions(&self.discovery))
+                },
+            )
+        }
+    }
+
+    /// Removing either STOP or the count-zero condition would mint authority
+    /// before the actual native producer gate has reached Q.
+    #[test]
+    fn collected_finish_q_requires_actual_stopped_quiescence() {
+        let _session_port: fn(
+            &mut super::Session,
+            &super::SessionDrainProducers,
+            Option<&crate::semantics_objects::journal::SessionDrainGrant>,
+        ) -> anyhow::Result<Option<super::CollectedFinishQ>> =
+            super::Session::observe_collected_finish_q;
+        let fixture = FinishQFixture::new(NativeDomainId::mint());
+        for word in [0, 3, p11scope_ebpf_common::STOP_GATE_STOP | 3] {
+            fixture.gate.native_word(word);
+            assert!(
+                fixture
+                    .observe(&fixture.producers, None, FinishQReadControl::Normal)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(fixture.reads.get(), (0, 0));
+        }
+        fixture.gate.native_word(0);
+        fixture.gate.gate.request_stop();
+        let q = fixture
+            .observe(&fixture.producers, None, FinishQReadControl::Normal)
+            .unwrap()
+            .unwrap();
+        assert!(q.matches_owner(&fixture.producers, &fixture.discovery_domain));
+        assert_eq!((q.events_stop(), q.discovery_stop()), (16, 8));
+        assert_eq!(fixture.events.source().remaining(), 2);
+        assert_eq!(fixture.discovery.source().remaining(), 1);
+    }
+
+    /// Numeric map IDs alone cannot splice another retained allocation;
+    /// optional drain metadata must neither be ignored nor upgraded from None.
+    #[test]
+    fn collected_finish_q_binds_producers_grant_and_detach_owner() {
+        use crate::events::{DiscoveryDomain, EventsDomain};
+        use crate::semantics_objects::journal::{SessionDrainGrant, tests::AttestationFixture};
+
+        let mut admission = AttestationFixture::new(p11scope_ebpf_common::ImageIdentity {
+            task_cookie: 71,
+            exec_id: 0,
+        });
+        let mut fixture = FinishQFixture::new(admission.domain());
+        fixture.gate.gate.request_stop();
+        let input = admission.admit_function("C_CreateObject");
+        let grant = SessionDrainGrant::observe(&fixture.producers, &input).unwrap();
+        let foreign_events = super::SessionDrainProducers::test_pair(
+            admission.domain(),
+            EventsDomain::test_standin(0xf1a2),
+        );
+        let foreign_grant = SessionDrainGrant::observe(&foreign_events, &input).unwrap();
+        let equal_id_allocation = super::SessionDrainProducers::test_pair(
+            admission.domain(),
+            EventsDomain::test_standin(0xf1a1),
+        );
+        let foreign_native = super::SessionDrainProducers::test_pair(
+            NativeDomainId::mint(),
+            fixture.producers.events.clone(),
+        );
+        assert!(grant.matches_producers(&fixture.producers));
+        assert!(!grant.matches_producers(&foreign_events));
+        assert!(!grant.matches_producers(&foreign_native));
+        for expected in [&foreign_events, &equal_id_allocation, &foreign_native] {
+            assert!(
+                fixture
+                    .observe(expected, Some(&grant), FinishQReadControl::Normal)
+                    .is_err()
+            );
+        }
+        assert!(
+            fixture
+                .observe(
+                    &fixture.producers,
+                    Some(&foreign_grant),
+                    FinishQReadControl::Normal
+                )
+                .is_err()
+        );
+        assert_eq!(fixture.reads.get(), (0, 0));
+        let q = fixture
+            .observe(&fixture.producers, Some(&grant), FinishQReadControl::Normal)
+            .unwrap()
+            .unwrap();
+        assert!(q.matches_retained_grant(&grant));
+        assert!(!q.matches_owner(&equal_id_allocation, &fixture.discovery_domain));
+        assert!(!q.matches_owner(&fixture.producers, &DiscoveryDomain::test_standin(0xf1d1)));
+        let negative_only = fixture
+            .observe(&fixture.producers, None, FinishQReadControl::Normal)
+            .unwrap()
+            .unwrap();
+        assert!(!negative_only.matches_retained_grant(&grant));
+        for detach in [
+            super::OwnedProducerDetach::Unproved,
+            super::OwnedProducerDetach::Complete,
+            super::OwnedProducerDetach::Pending {
+                worker: super::CleanupWorker::pre_start_with_spawn(
+                    Box::new(|_, _| Ok(())),
+                    std::sync::Arc::new(|| std::time::Duration::ZERO),
+                    |_| Err(std::io::Error::other("fixture starts no cleanup thread")),
+                ),
+                started: std::time::Instant::now(),
+                had_work: false,
+            },
+        ] {
+            fixture.detach = detach;
+            let before = fixture.reads.get();
+            assert!(
+                fixture
+                    .observe(&fixture.producers, Some(&grant), FinishQReadControl::Normal)
+                    .is_err()
+            );
+            assert_eq!(fixture.reads.get(), before);
+        }
+    }
+
+    /// A single early gate read or swallowed position error must not mint Q.
+    #[test]
+    fn collected_finish_q_rechecks_quiescence_and_preserves_read_errors() {
+        for control in [
+            FinishQReadControl::EventsError,
+            FinishQReadControl::DiscoveryError,
+            FinishQReadControl::LoseQuiescence,
+        ] {
+            let fixture = FinishQFixture::new(NativeDomainId::mint());
+            fixture.gate.gate.request_stop();
+            let result = fixture.observe(&fixture.producers, None, control);
+            if matches!(control, FinishQReadControl::LoseQuiescence) {
+                assert!(result.unwrap().is_none());
+                assert_eq!(fixture.reads.get(), (1, 1));
+            } else {
+                assert!(result.is_err());
+            }
+            assert_eq!(fixture.events.source().remaining(), 2);
+            assert_eq!(fixture.discovery.source().remaining(), 1);
+        }
+    }
+
+    /// Q is an upper bound, not an assertion that this original drained or
+    /// was clean. Another cursor and a post-Q write cannot fit that bound.
+    #[test]
+    fn collected_finish_q_bounds_original_cut_without_claiming_drain() {
+        use crate::events::{EventDrain, ScriptedRecords};
+        use std::ops::ControlFlow;
+
+        let mut fixture = FinishQFixture::new(NativeDomainId::mint());
+        let original = fixture.events.consumption_cut().unwrap();
+        assert!(!original.is_drained());
+        fixture.events.source_mut().push_record(vec![0]);
+        fixture.gate.gate.request_stop();
+        let q = fixture
+            .observe(&fixture.producers, None, FinishQReadControl::Normal)
+            .unwrap()
+            .unwrap();
+        assert_eq!(q.events_stop(), 24);
+        assert!(q.covers_events_bounds(&original));
+        assert!(!q.events_at_bound(&original));
+        let other_cursor = EventDrain::over_domain(
+            ScriptedRecords::records([], 0),
+            fixture.producers.events.clone(),
+        );
+        assert!(!q.covers_events_bounds(&other_cursor.consumption_cut().unwrap()));
+        fixture.events.poll(Some(1), |_| ControlFlow::Continue(()));
+        let prefix = fixture.events.consumption_cut().unwrap();
+        assert!(q.covers_events_bounds(&prefix));
+        assert!(!q.events_at_bound(&prefix));
+        assert_eq!(
+            fixture.events.malformed(),
+            1,
+            "bounds do not erase observed loss"
+        );
+        fixture.events.poll(Some(2), |_| ControlFlow::Continue(()));
+        let end = fixture.events.consumption_cut().unwrap();
+        assert!(q.covers_events_bounds(&end));
+        assert!(q.events_at_bound(&end));
+        fixture.events.source_mut().push_record(vec![0]);
+        assert!(!q.covers_events_bounds(&fixture.events.consumption_cut().unwrap()));
+    }
+
     #[test]
     fn object_transport_ordinary_policy_requires_verified_rows() {
         use super::{CapturePolicy, object_transport_rows_with};

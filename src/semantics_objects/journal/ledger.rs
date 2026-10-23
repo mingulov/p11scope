@@ -494,6 +494,49 @@ mod tests {
     use crate::semantics_edge::resources::SemanticResourcePool;
 
     #[test]
+    fn shared_ledger_released_original_keeps_generation_and_live_siblings_distinct() {
+        let pool = SemanticResourcePool::default();
+        let events = crate::events::EventsDomain::test_standin(0xf19a);
+        let producers = crate::attach::SessionDrainProducers::test_pair(
+            crate::attach::capture::NativeDomainId::mint(),
+            events,
+        );
+        let mut ledger = StagingLedger::with_resources(pool.reserver());
+        let original = ledger.reserve_raw(&producers).unwrap();
+        assert!(!ledger.original_is_released(&original));
+        ledger.charge_h8open_from_raw(1, 1, &original).unwrap();
+        ledger.charge_model_from_open(1, 1, &original).unwrap();
+        ledger.release_raw(&original);
+        ledger.release_h8open(1);
+        assert!(
+            !ledger.original_is_released(&original),
+            "the actual Model alias still owns custody"
+        );
+        ledger.charge_model(2, 1).unwrap();
+        ledger.release_model(1);
+        assert!(ledger.original_is_released(&original));
+        assert_eq!(
+            ledger.census(),
+            1,
+            "unrelated healthy Model custody must remain live"
+        );
+        let reused_slot = ledger.reserve_raw(&producers).unwrap();
+        assert!(reused_slot.id != original.id);
+        assert!(!ledger.original_is_released(&reused_slot));
+        assert!(ledger.original_is_released(&original));
+        let mut foreign = StagingLedger::with_resources(pool.reserver());
+        let foreign_original = foreign.reserve_raw(&producers).unwrap();
+        foreign.release_raw(&foreign_original);
+        assert!(foreign.original_is_released(&foreign_original));
+        assert!(!ledger.original_is_released(&foreign_original));
+        assert!(!foreign.original_is_released(&original));
+        ledger.release_raw(&reused_slot);
+        assert!(ledger.original_is_released(&reused_slot));
+        ledger.release_model(2);
+        assert_eq!(ledger.census(), 0);
+    }
+
+    #[test]
     fn shared_ledger_pool_refuses_before_index_or_member_allocation() {
         let pool = SemanticResourcePool::default();
         let baseline = pool.snapshot().charged_bytes;

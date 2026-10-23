@@ -352,6 +352,38 @@ mod tests {
     }
 
     #[test]
+    fn resource_reservations_release_requires_all_roles_and_merged_aliases() {
+        let mut table = ReservationTable::try_new(2).unwrap();
+        assert!(!table.reservation_is_released(ReservationId(0)));
+        assert!(!table.reservation_is_released(ReservationId(1)));
+        let a = table.insert(Role::Raw, key(1), None, 1, ()).unwrap();
+        let b = table.insert(Role::H9Staged, key(2), None, 1, ()).unwrap();
+        table.merge(a, b).unwrap();
+        for role in [Role::H8Open, Role::Model, Role::Association] {
+            table.insert(role, key(1), Some(b), 1, ()).unwrap();
+        }
+        assert!(!table.reservation_is_released(a));
+        assert!(!table.reservation_is_released(b));
+        for role in [Role::Raw, Role::H8Open, Role::Model, Role::H9Staged] {
+            table
+                .release(role, key(if role == Role::H9Staged { 2 } else { 1 }))
+                .unwrap();
+            assert!(!table.reservation_is_released(a));
+            assert!(!table.reservation_is_released(b));
+        }
+        table.release(Role::Association, key(1)).unwrap();
+        assert!(table.reservation_is_released(a));
+        assert!(table.reservation_is_released(b));
+        let next = table.insert(Role::Raw, key(1), None, 1, ()).unwrap();
+        assert!(next != a && next != b);
+        assert!(!table.reservation_is_released(next));
+        assert!(table.reservation_is_released(a));
+        assert!(table.reservation_is_released(b));
+        assert!(!table.reservation_is_released(ReservationId(table.next + 1)));
+        assert!(!table.reservation_is_released(ReservationId(0)));
+    }
+
+    #[test]
     fn resource_reservations_1024_same_operations_keep_five_physical_roles() {
         let mut table = ReservationTable::try_new(1_024).unwrap();
         let (_, allocations, bytes) = crate::test_alloc::count_allocs_during(|| {

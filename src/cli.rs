@@ -541,7 +541,9 @@ Cgroup discovery is bounded and cooperative; --max-scan-pids limits deep scans, 
 Subset preparation preserves broad physical counting; positive instance delivery awaits runtime activation.
 Inventory separates mapped modules from observed usage entries; entries are not completed calls.
 --max-endpoints selects capture-lifetime physical endpoint IDs: 1..=8192, default 4096; unloading does not refund IDs.
---capture scan uses no BPF and leaves usage unknown. auto prefers native and reports fallback gaps; native fails if unavailable.
+--capture scan disables usage BPF and leaves usage unknown. auto prefers native and reports fallback gaps; native fails if unavailable.
+System inventory selects its identity backend separately; --identity-backend auto may load identity BPF even with --capture scan.
+For system inventory that loads no BPF, use: p11scope inventory --system --capture scan --identity-backend userspace
 --identity-backend selects the system sweep identity proof backend: auto (default) defers any
 identity load until the first nonempty proof plan, userspace never loads identity BPF, kernel
 validates numbering/BTF, strict load and functional probe before capture starts. System scope

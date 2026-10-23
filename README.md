@@ -362,7 +362,9 @@ report format.
   path a restrictive paranoid needs `CAP_SYS_ADMIN` too. Manifest-free
   scanning of a same-UID non-descendant
   additionally needs `CAP_SYS_PTRACE` under Yama `ptrace_scope=1`, or
-  equivalently a descendant target / `--manifest`. Root works everywhere.
+  equivalently a descendant target / `--manifest`. Root normally supplies
+  these permissions; user namespace, seccomp, LSM and lockdown policy can
+  still refuse capture.
   No `CAP_LEASE`, no `fs.suid_dumpable=0`, no root-owned trusted exec dir
   ([measured matrix](docs/usage.md#privileges-per-environment)).
   Kernel floor ≥5.15; on an unsupported environment the tool fails with a

@@ -860,12 +860,16 @@ Limits that matter in pods:
   remains open.
 
   `--capture auto|scan|native` selects the usage lane. `scan` reads
-  `/proc` only (no BPF): every edge's usage coverage
+  `/proc` without loading usage BPF: every edge's usage coverage
   (`entries.coverage`) reads `unknown` with the reason `scan_only` (or
   `not_admitted`), never a zero as fact; the dashboard shows such counts
   as `entries ?`, such edges as `capture scan only` and `activity not
   covered` — never armed, never quiet — and the full coverage on its
-  evidence page. `native` also loads the Inventory BPF object, attaches
+  evidence page. System inventory selects its identity backend separately;
+  `--identity-backend auto` may load identity BPF even with `--capture scan`.
+  Use `p11scope inventory --system --capture scan --identity-backend userspace`
+  for system inventory that loads no BPF.
+  `native` also loads the Inventory BPF object, attaches
   every admitted provider entry, and binds each positive use to the exact
   caller image with its entry count (`counted`: a saturating lower bound
   since the pair's first record, at pass resolution) or reports it as
@@ -1267,11 +1271,11 @@ callers are counted as `map_files_unavailable` losses and discovery stays
 incomplete rather than guessed.
 There is no `CAP_SYS_RESOURCE` or `RLIMIT_MEMLOCK` requirement claim.
 
-The attach floor is backend-dependent. In `auto` mode the product attempts
-one uprobe-multi link per attach group on kernels ≥ 6.9 and falls back to
-per-probe `perf_event` uprobes if multi is unsupported; below 6.9 it uses
-per-probe links (`src/attach.rs`: `kernel_supports_multi`, floor 6.9). Both
-matrices below were measured by
+The attach backend is probe-decided. In `auto` mode the product selects
+uprobe-multi through functional probes, including process-wide PID filtering
+for PID scopes, and falls back to per-probe `perf_event` uprobes when multi is
+unsupported or its required probes fail (`src/attach.rs`:
+`select_session_backend`). Both matrices below were measured by
 `scripts/matrix/verify-fork-scope.sh` against a same-UID non-descendant
 with SoftHSM2 already mapped, at `kernel.perf_event_paranoid=4`,
 `kernel.yama.ptrace_scope=1`.

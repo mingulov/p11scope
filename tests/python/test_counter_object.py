@@ -128,13 +128,51 @@ class CounterObjectCliTests(unittest.TestCase):
         checker = runpy.run_path(str(CHECKER), run_name="counter_bank_vm_test")
 
         class Graph:
-            instructions = {(1, 0): {0: (0xdb, 0x21, 0, 0x40),
-                                     1: (0xb7, 0, 0, 0), 2: (0x95, 0, 0, 0)}}
+            def __init__(self, atomic):
+                self.instructions = {(1, 0): {0: (0xdb, 0x21, 0, atomic),
+                                              1: (0xbf, 0x20, 0, 0), 2: (0x95, 0, 0, 0)}}
 
-        vm = checker["BankExecution"](Graph())
-        at = vm.set("COUNTER_BANK_FAULT", 0, (2).to_bytes(8, "little"))
-        self.assertEqual(vm.execute((1, 0), [at, 1], 0), 0)
-        self.assertEqual(vm.fault(), 3, "actual OR execution must retain both refusal bits")
+        for atomic, returned in ((0x40, 1), (0x41, 2)):
+            with self.subTest(atomic=atomic):
+                vm = checker["BankExecution"](Graph(atomic))
+                at = vm.set("COUNTER_BANK_FAULT", 0, (2).to_bytes(8, "little"))
+                self.assertEqual(vm.execute((1, 0), [at, 1], 0), returned,
+                                 "only OR|FETCH replaces its source with the old cell")
+                self.assertEqual(vm.fault(), 3, "actual OR must retain both refusal bits")
+
+    def test_bank_fault_footprint_requires_finite_full_width_or_and_clobbers_fetch(self):
+        checker = runpy.run_path(str(CHECKER), run_name="counter_bank_fault_transfer_test")
+        key = (1, 0)
+
+        class Graph:
+            def __init__(self, instructions):
+                self.instructions = {key: dict(enumerate(instructions + [(0x95, 0, 0, 0)]))}
+                self.loops, self.calls, self.bodies = {key: {}}, {}, {key: ("fault_control",)}
+
+        pointer = ("ptr", "COUNTER_BANK_FAULT", 0, 0, checker["ZERO"])
+        maps = {"COUNTER_BANK_FAULT": {"value_size": 8}}
+
+        def run(instructions, operand=None):
+            proof = checker["BankFootprint"](Graph(instructions), maps)
+            proof.run(key, [pointer, checker["ONE"] if operand is None else operand,
+                            None, None, None])
+            return proof
+
+        for atomic in (0x40, 0x41):
+            with self.subTest(healthy_atomic=atomic):
+                proof = run([(0xdb, 0x21, 0, atomic)])
+                self.assertEqual(len(proof.touches), 1)
+        for instructions, operand in (
+                ([(0xc3, 0x21, 0, 0x41)], None),
+                ([(0xdb, 0x21, 0, 0x51)], None),
+                ([(0xdb, 0x21, 1, 0x41)], None),
+                ([(0xdb, 0x21, 0, 0x41)], checker["ZERO"]),
+                ([(0xdb, 0x21, 0, 0x41)], checker["constant"](16)),
+                ([(0xdb, 0x21, 0, 0x41)], checker["scalar"]()),
+                ([(0xdb, 0x21, 0, 0x41), (0xdb, 0x21, 0, 0x40)], None)):
+            with self.subTest(instructions=instructions, operand=operand):
+                with self.assertRaisesRegex(RuntimeError, "finite sticky OR"):
+                    run(instructions, operand)
 
     def test_bank_instruction_execution_does_not_reuse_previous_stack_bytes(self):
         checker = runpy.run_path(str(CHECKER), run_name="counter_bank_stack_test")

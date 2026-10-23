@@ -1365,7 +1365,7 @@ class BankFootprint(MemoryProof):
                 raise RuntimeError("bank Counts update is not bounded CAS")
         if name == "COUNTER_BANK_FAULT" and action == "write":
             if (width != 8 or pointer[2] + offset or pointer[3] + offset
-                    or atomic != 0x40 or not value or value[0] != "scalar"
+                    or atomic not in (0x40, 0x41) or not value or value[0] != "scalar"
                     or not 1 <= value[2] <= value[3] <= 15):
                 raise RuntimeError("bank routing fault is not a finite sticky OR")
         if name in ("COUNTER_BANK_META", "COUNTER_BANK_COMMIT") and action == "write":
@@ -1461,7 +1461,8 @@ class BankExecution:
             base, _, name, _ = region
             if name in ("bank0", "bank1", "RV_COUNTS") and (width != 8 or atomic != 0xf1):
                 raise RuntimeError("bank execution writes a cumulative cell without u64 CAS")
-            if name == "COUNTER_BANK_FAULT" and (width != 8 or atomic != 0x40 or not 1 <= value <= 15):
+            if name == "COUNTER_BANK_FAULT" and (width != 8 or atomic not in (0x40, 0x41)
+                                                 or not 1 <= value <= 15):
                 raise RuntimeError("bank execution has an invalid sticky routing fault")
             if name == "COUNTER_HEALTH" and (width != 8 or atomic is not None or value != 1):
                 raise RuntimeError("bank execution clears/changes sticky counter health")
@@ -1604,13 +1605,15 @@ class BankExecution:
                     elif before == registers[0]:
                         self.write(address, width, value, atomic, key, pc, stack)
                     registers[0], origins[0] = before, (key, pc)
-                elif atomic == 0x40:
+                elif atomic in (0x40, 0x41):
                     before = self.read(address, width)
                     self.write(address, width, value, atomic, key, pc, stack)
                     # write() validates the finite operand; OR preserves all
                     # prior fault bits rather than replacing their history.
                     for i, byte in enumerate((before | value).to_bytes(width, "little")):
                         self.memory[address + i] = byte
+                    if atomic == 0x41:
+                        registers[src], origins[src] = before, (key, pc)
                 elif atomic is None:
                     self.write(address, width, value, None, key, pc, stack)
                 else:

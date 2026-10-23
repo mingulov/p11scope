@@ -368,11 +368,12 @@ jobs:
           sudo install -m 0755 "$bpftool_source" /usr/local/bin/bpftool
           bpftool version
           sudo bpftool version
-      # Reviewed private counter arms preserve default code/maps/type graphs,
-      # while intentionally changing debug/BTF line metadata. Pin the accepted
-      # producer and offline-recipe checkpoint separately from this workflow.
-      # Same-source opt-in/disabled full-object parity passes; later changes
-      # must preserve all three complete default objects, including metadata.
+      # Reviewed private bank-owner cleanup preserves ordinary code/maps/types;
+      # its source additions intentionally move BTF line/DWARF metadata. Pin the
+      # accepted native/consumer source and offline recipe before this workflow.
+      # Same-source proof ON/OFF full-object parity passed at source672 (the
+      # native inputs integrated here); historical whole-object equality did
+      # not. Later changes must preserve all three complete baseline objects.
       # Object parity does not establish installed/live acceptance.
       # The checker reconstructs and explicitly fetches each immutable snapshot,
       # then builds it offline (including nested nightly Cargo). No target cache.
@@ -380,7 +381,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          BASELINE=19876daa483357062a533944e4aec2f084ff8bfa
+          BASELINE=68c258cf54d736370e214172d187d7d3905a8bb5
           comparison_root="$RUNNER_TEMP/bpf-noninterference"
           mkdir -m 700 "$comparison_root"
           python3 -I scripts/check-bpf-noninterference.py \

@@ -574,6 +574,269 @@ impl MachineScene {
     }
 }
 
+/// Reverting the machine to a 1024-total-wire guard leaves END(1) unread.
+#[test]
+fn joint_machine_begin_prefix_crosses_1024_before_real_end() {
+    let mut fixture = MachineScene::new(1);
+    let pid = std::process::id();
+    let mut first_end = None;
+    for sequence in 1..=1_024 {
+        let (begin, end) = fixture.scene.encoded(pid, 0, "C_CreateObject", sequence);
+        fixture.scene.drain.source_mut().push_record(begin.to_vec());
+        if sequence == 1 {
+            first_end = Some(end);
+        }
+    }
+    fixture
+        .scene
+        .drain
+        .source_mut()
+        .push_record(first_end.unwrap().to_vec());
+    fixture.service(1).unwrap();
+    let identity = fixture
+        .machine
+        .retained_raw_for_test()
+        .unwrap()
+        .h0_identity();
+    fixture.service(1_024).unwrap();
+    let raw = fixture.machine.retained_raw_for_test().unwrap();
+    assert!(raw.h0_identity() == identity);
+    assert_eq!(
+        raw.pending_h0_records(),
+        1,
+        "the genuine wire1025 END reached the same Raw"
+    );
+    assert_eq!(fixture.scene.drain.source_mut().remaining(), 0);
+    let coordinator = &fixture.scene.real.scene.coordinator;
+    assert_eq!(coordinator.semantic_bindings().len(), 0);
+    assert!(fixture.native.preparations.is_empty());
+    assert_eq!(coordinator.reference_h3_audit_state(), (0, false));
+    assert_eq!(
+        coordinator
+            .joint_capture()
+            .adapter()
+            .invocation_claims_for_test()
+            .0,
+        0
+    );
+    let roles = coordinator.joint_capture().ledger().roles_for_test();
+    assert_eq!((roles[0], roles[1], roles[2], roles[3]), (1_024, 0, 0, 0));
+}
+
+/// The true 4096-wire owner holds its original memberships on refusal; the
+/// next physical record cannot enter the full allocation or a replacement.
+#[test]
+fn joint_machine_full_raw_capacity_preserves_n_plus_one() {
+    let mut fixture = MachineScene::new(1);
+    for sequence in 1..=4_097 {
+        let (begin, _) = fixture
+            .scene
+            .encoded(std::process::id(), 0, "C_CreateObject", sequence);
+        fixture.scene.drain.source_mut().push_record(begin.to_vec());
+    }
+    fixture.service(4_096).unwrap();
+    let identity = fixture
+        .machine
+        .retained_raw_for_test()
+        .unwrap()
+        .h0_identity();
+    assert_eq!(fixture.scene.drain.source_mut().remaining(), 1);
+    let boundary = fixture.scene.drain.consumption_cut().unwrap();
+    let coordinator = &fixture.scene.real.scene.coordinator;
+    let roles = coordinator.joint_capture().ledger().roles_for_test();
+    assert_eq!((roles[0], roles[1], roles[2], roles[3]), (1_024, 0, 0, 0));
+    let reserve = coordinator.registry().semantic_storage_reserver();
+    let snapshot = coordinator.registry().semantic_resource_snapshot();
+    let hold = reserve
+        .reserve(snapshot.limit_bytes - snapshot.charged_bytes)
+        .unwrap();
+    fixture.service(1).unwrap();
+    assert!(fixture.machine.report_preparation_pending_for_test());
+    assert_eq!(fixture.service(1), Err(SemanticRefusal::ProviderStorage));
+    assert!(
+        fixture
+            .machine
+            .retained_raw_for_test()
+            .unwrap()
+            .h0_identity()
+            == identity
+    );
+    assert!(boundary.same_boundary(&fixture.scene.drain.consumption_cut().unwrap()));
+    assert_eq!(fixture.scene.drain.source_mut().remaining(), 1);
+    let coordinator = &fixture.scene.real.scene.coordinator;
+    assert_eq!(coordinator.joint_capture().ledger().roles_for_test(), roles);
+    assert_eq!(coordinator.reference_h3_audit_state(), (0, false));
+    assert_eq!(coordinator.semantic_bindings().len(), 0);
+    assert!(fixture.native.rows.is_empty());
+    drop(hold);
+    assert_eq!(
+        coordinator
+            .registry()
+            .semantic_resource_snapshot()
+            .charged_bytes,
+        snapshot.charged_bytes
+    );
+}
+
+/// A payload estimate must not clone watched Entry text before the pool can
+/// cover the retained report. The actual healthy path still reaches Joint.
+#[test]
+fn joint_machine_report_precharge_refuses_before_watched_copy() {
+    for refuse in [true, false] {
+        let mut fixture = MachineScene::new(1);
+        fixture
+            .scene
+            .push(std::process::id(), 0, "C_CreateObject", 1);
+        for _ in 0..16 {
+            fixture.service(1).unwrap();
+            if fixture.machine.report_preparation_pending_for_test() {
+                break;
+            }
+        }
+        assert!(fixture.machine.report_preparation_pending_for_test());
+        let identity = fixture
+            .machine
+            .retained_raw_for_test()
+            .unwrap()
+            .h0_identity();
+        let boundary = fixture.scene.drain.consumption_cut().unwrap();
+        let coordinator = &fixture.scene.real.scene.coordinator;
+        let snapshot = coordinator.registry().semantic_resource_snapshot();
+        let roles = coordinator.joint_capture().ledger().roles_for_test();
+        let reserve = coordinator.registry().semantic_storage_reserver();
+        let hold = refuse.then(|| {
+            reserve
+                .reserve(snapshot.limit_bytes - snapshot.charged_bytes)
+                .unwrap()
+        });
+        let (result, allocations, bytes) =
+            crate::test_alloc::count_allocs_during(|| fixture.service(1));
+        if refuse {
+            assert_eq!(result, Err(SemanticRefusal::ProviderStorage));
+            assert_eq!(
+                (allocations, bytes),
+                (0, 0),
+                "the exhausted real pool refuses before any watched Entry copy"
+            );
+            let coordinator = &fixture.scene.real.scene.coordinator;
+            assert!(
+                fixture
+                    .machine
+                    .retained_raw_for_test()
+                    .unwrap()
+                    .h0_identity()
+                    == identity
+            );
+            assert!(boundary.same_boundary(&fixture.scene.drain.consumption_cut().unwrap()));
+            assert_eq!(coordinator.joint_capture().ledger().roles_for_test(), roles);
+            assert_eq!(coordinator.reference_h3_audit_state(), (0, false));
+            assert_eq!(coordinator.semantic_bindings().len(), 0);
+            assert!(fixture.native.preparations.is_empty());
+        } else {
+            result.unwrap();
+            assert!(allocations >= 3);
+            assert!(
+                fixture
+                    .scene
+                    .real
+                    .scene
+                    .coordinator
+                    .registry()
+                    .semantic_resource_snapshot()
+                    .charged_bytes
+                    > snapshot.charged_bytes
+            );
+            fixture.published();
+            assert_eq!(
+                fixture
+                    .scene
+                    .real
+                    .scene
+                    .coordinator
+                    .registry()
+                    .joint_feeds(),
+                1
+            );
+            assert_eq!(fixture.reduced(), [1]);
+        }
+        drop(hold);
+    }
+}
+
+/// A physical requester needs a finite original negative even when the first
+/// native BEGIN has no admission/grant. No END, birth or positive is invented.
+#[test]
+fn joint_machine_begin_only_request_publishes_original_negative() {
+    use crate::discovery::engine::inventory_coordinator::JointCommitProgress;
+    use crate::semantics_objects::journal::joint_driver::RawDisposeReason;
+    let mut fixture = MachineScene::new(1);
+    let (begin, _) = fixture
+        .scene
+        .encoded(std::process::id(), 0, "C_CreateObject", 1);
+    fixture.scene.drain.source_mut().push_record(begin.to_vec());
+    let revision = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .published_revision();
+    fixture.machine.begin_commit(true).unwrap();
+    let mut observed_original_negative = false;
+    let mut published = false;
+    for _ in 0..128 {
+        let progress = fixture.service(1).unwrap();
+        if let Some(disposed) = fixture.machine.retained_negative_for_test() {
+            assert_eq!(disposed.reason(), RawDisposeReason::NoAdmission);
+            assert!(disposed.failure().is_some());
+            observed_original_negative = true;
+        }
+        if progress == crate::inventory_semantics::JointServiceProgress::Published {
+            published = true;
+            break;
+        }
+    }
+    assert!(observed_original_negative && published);
+    assert!(matches!(
+        fixture.poll_commit(0).unwrap(),
+        JointCommitProgress::Published(_)
+    ));
+    assert!(matches!(
+        fixture.poll_commit(0).unwrap(),
+        JointCommitProgress::Pending
+    ));
+    let coordinator = &fixture.scene.real.scene.coordinator;
+    assert_eq!(coordinator.registry().published_revision(), revision + 1);
+    assert_eq!(coordinator.registry().joint_feeds(), 0);
+    assert!(
+        coordinator
+            .registry()
+            .instance_semantic_edges()
+            .all(|record| record.feed.reduced() == 0)
+    );
+    assert_eq!(
+        coordinator
+            .joint_capture()
+            .adapter()
+            .invocation_claims_for_test()
+            .0,
+        0
+    );
+    assert_eq!(
+        coordinator.joint_capture().ledger().roles_for_test()[..4],
+        [0, 0, 0, 0]
+    );
+    assert!(
+        coordinator
+            .joint_capture()
+            .model()
+            .project()
+            .objects
+            .is_empty()
+    );
+    assert!(fixture.native.rows.is_empty());
+}
+
 #[test]
 fn joint_machine_routes_first_birth_to_actual_registry() {
     let mut fixture = MachineScene::new(1);
@@ -724,112 +987,151 @@ fn joint_machine_begin_slices_and_h0_pending_do_not_repoll() {
 #[test]
 fn joint_machine_pending_a_allows_q2_real_end() {
     for reverse in [false, true] {
-        let mut fixture = MachineScene::new(2);
-        fixture.prime(2);
-        let before = fixture.reduced();
-        let (a, b) = if reverse { (1, 0) } else { (0, 1) };
-        let (a_sequence, b_sequence) = if reverse { (4, 3) } else { (3, 4) };
-        let (begin_a, end_a) =
-            fixture
-                .scene
-                .encoded(std::process::id(), a, "C_SignInit", a_sequence);
-        let (begin_b, end_b) =
-            fixture
-                .scene
-                .encoded(std::process::id(), b, "C_SignInit", b_sequence);
-        let begins = if reverse {
-            [begin_b, begin_a]
-        } else {
-            [begin_a, begin_b]
-        };
-        for bytes in begins
-            .into_iter()
-            .map(|bytes| bytes.to_vec())
-            .chain([end_b.to_vec()])
-        {
-            fixture.scene.drain.source_mut().push_record(bytes);
-        }
-        fixture.published();
-        assert_eq!(
-            fixture.reduced(),
-            before,
-            "q1 cannot replay through the missing original END(A)"
-        );
-        let native_a = (
-            ((u64::from(std::process::id())) << 32) | u64::from(std::process::id()),
-            a_sequence,
-        );
-        assert_eq!(
-            fixture
-                .scene
-                .real
-                .scene
-                .coordinator
+        for idle_demand in [false, true] {
+            let mut fixture = MachineScene::new(2);
+            fixture.prime(2);
+            let before = fixture.reduced();
+            let (a, b) = if reverse { (1, 0) } else { (0, 1) };
+            let (a_sequence, b_sequence) = if reverse { (4, 3) } else { (3, 4) };
+            let (begin_a, end_a) =
+                fixture
+                    .scene
+                    .encoded(std::process::id(), a, "C_SignInit", a_sequence);
+            let (begin_b, end_b) =
+                fixture
+                    .scene
+                    .encoded(std::process::id(), b, "C_SignInit", b_sequence);
+            let begins = if reverse {
+                [begin_b, begin_a]
+            } else {
+                [begin_a, begin_b]
+            };
+            for bytes in begins
+                .into_iter()
+                .map(|bytes| bytes.to_vec())
+                .chain([end_b.to_vec()])
+            {
+                fixture.scene.drain.source_mut().push_record(bytes);
+            }
+            fixture.published();
+            assert_eq!(
+                fixture.reduced(),
+                before,
+                "q1 cannot replay through the missing original END(A)"
+            );
+            let native_a = (
+                ((u64::from(std::process::id())) << 32) | u64::from(std::process::id()),
+                a_sequence,
+            );
+            assert_eq!(
+                fixture
+                    .scene
+                    .real
+                    .scene
+                    .coordinator
+                    .joint_capture()
+                    .adapter()
+                    .retained_start_bytes_for_test(native_a),
+                Some(begin_a),
+                "q1 publication keeps the exact physical START for q2's END"
+            );
+            assert!(
+                fixture
+                    .scene
+                    .real
+                    .scene
+                    .coordinator
+                    .joint_capture()
+                    .ledger()
+                    .roles_for_test()[1]
+                    > 0
+            );
+            let coordinator = &fixture.scene.real.scene.coordinator;
+            let claims = coordinator
                 .joint_capture()
                 .adapter()
-                .retained_start_bytes_for_test(native_a),
-            Some(begin_a),
-            "q1 publication keeps the exact physical START for q2's END"
-        );
-        assert!(
-            fixture
-                .scene
-                .real
-                .scene
-                .coordinator
-                .joint_capture()
-                .ledger()
-                .roles_for_test()[1]
-                > 0
-        );
-        let coordinator = &fixture.scene.real.scene.coordinator;
-        let claims = coordinator
-            .joint_capture()
-            .adapter()
-            .invocation_claims_for_test();
-        let roles = coordinator.joint_capture().ledger().roles_for_test();
-        let h3 = coordinator.reference_h3_audit_state();
-        let revision = coordinator.registry().published_revision();
-        assert_eq!(claims.0, 1);
-        assert_eq!((roles[0], roles[1], roles[3]), (0, 2, 1));
-        for _ in 0..3 {
-            fixture.service(1).unwrap();
+                .invocation_claims_for_test();
+            let roles = coordinator.joint_capture().ledger().roles_for_test();
+            let h3 = coordinator.reference_h3_audit_state();
+            let revision = coordinator.registry().published_revision();
+            assert_eq!(claims.0, 1);
+            assert_eq!((roles[0], roles[1], roles[3]), (0, 2, 1));
+            for _ in 0..3 {
+                fixture.service(1).unwrap();
+                let coordinator = &fixture.scene.real.scene.coordinator;
+                assert_eq!(
+                    coordinator
+                        .joint_capture()
+                        .adapter()
+                        .invocation_claims_for_test(),
+                    claims
+                );
+                assert_eq!(coordinator.joint_capture().ledger().roles_for_test(), roles);
+                assert_eq!(coordinator.reference_h3_audit_state(), h3);
+                assert_eq!(coordinator.registry().published_revision(), revision);
+            }
+            if idle_demand {
+                use crate::discovery::engine::inventory_coordinator::JointCommitProgress;
+                fixture.machine.begin_commit(true).unwrap();
+                let mut completed = false;
+                for _ in 0..128 {
+                    if matches!(
+                        fixture.poll_commit(1).unwrap(),
+                        JointCommitProgress::Published(_)
+                    ) {
+                        completed = true;
+                        break;
+                    }
+                }
+                assert!(
+                    completed,
+                    "the genuine retained grant services this idle demand without disposing the unmatched COMPLETE"
+                );
+                assert_eq!(fixture.reduced(), before);
+                let coordinator = &fixture.scene.real.scene.coordinator;
+                assert_eq!(
+                    coordinator
+                        .joint_capture()
+                        .adapter()
+                        .invocation_claims_for_test(),
+                    claims
+                );
+                assert_eq!(coordinator.joint_capture().ledger().roles_for_test(), roles);
+                assert_eq!(coordinator.registry().published_revision(), revision + 1);
+                assert_eq!(coordinator.reference_h3_audit_state(), (h3.0 + 1, false));
+                assert_eq!(
+                    coordinator
+                        .joint_capture()
+                        .adapter()
+                        .retained_start_bytes_for_test(native_a),
+                    Some(begin_a)
+                );
+            }
+            fixture.scene.drain.source_mut().push_record(end_a.to_vec());
+            fixture.published();
+            assert_eq!(
+                fixture.reduced(),
+                before.iter().map(|count| count + 1).collect::<Vec<_>>()
+            );
             let coordinator = &fixture.scene.real.scene.coordinator;
             assert_eq!(
                 coordinator
                     .joint_capture()
                     .adapter()
-                    .invocation_claims_for_test(),
-                claims
+                    .invocation_claims_for_test()
+                    .0,
+                0
             );
-            assert_eq!(coordinator.joint_capture().ledger().roles_for_test(), roles);
-            assert_eq!(coordinator.reference_h3_audit_state(), h3);
-            assert_eq!(coordinator.registry().published_revision(), revision);
+            let roles = coordinator.joint_capture().ledger().roles_for_test();
+            assert_eq!((roles[0], roles[1], roles[3]), (0, 0, 0));
+            assert!(
+                coordinator
+                    .joint_capture()
+                    .adapter()
+                    .retained_start_bytes_for_test(native_a)
+                    .is_none()
+            );
         }
-        fixture.scene.drain.source_mut().push_record(end_a.to_vec());
-        fixture.published();
-        assert_eq!(
-            fixture.reduced(),
-            before.iter().map(|count| count + 1).collect::<Vec<_>>()
-        );
-        let coordinator = &fixture.scene.real.scene.coordinator;
-        assert_eq!(
-            coordinator
-                .joint_capture()
-                .adapter()
-                .invocation_claims_for_test()
-                .0,
-            0
-        );
-        let roles = coordinator.joint_capture().ledger().roles_for_test();
-        assert_eq!((roles[0], roles[1], roles[3]), (0, 0, 0));
-        assert!(
-            coordinator
-                .joint_capture()
-                .adapter()
-                .retained_start_bytes_for_test(native_a)
-                .is_none()
-        );
     }
 }
 

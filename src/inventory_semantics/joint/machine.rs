@@ -503,6 +503,19 @@ impl LiveJointMachine {
         let batch = original.reports.as_ref()?.batch.as_ref()?;
         Some((&batch.outcomes, &batch.current))
     }
+
+    #[cfg(test)]
+    pub(crate) fn report_preparation_pending_for_test(&self) -> bool {
+        matches!(self.phase, Some(Phase::Binding(_)))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_negative_for_test(&self) -> Option<&RawDisposition> {
+        let Phase::Negative { original, .. } = self.phase.as_ref()? else {
+            return None;
+        };
+        Some(original)
+    }
 }
 
 enum Step {

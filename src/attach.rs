@@ -2050,6 +2050,8 @@ struct StaticGroupMember {
 struct StaticGroup {
     path: PathBuf,
     entry_program: &'static str,
+    #[cfg_attr(not(test), allow(dead_code))] // Inert Counts signature; Detailed is unchanged.
+    return_program: &'static str,
     members: Vec<StaticGroupMember>,
 }
 
@@ -2955,10 +2957,50 @@ fn group_static_slots(
             StaticGroup {
                 path,
                 entry_program,
+                return_program: "p11_return",
                 members,
             }
         })
         .collect()
+}
+
+#[cfg_attr(not(test), allow(dead_code))] // Private Multi Counts remains unselected/inert.
+fn group_static_slots_with_roots(
+    _slots: &[Slot],
+    _policy: CapturePolicy,
+    _object_has_unsafe: bool,
+    _attach_targets: &BTreeMap<u32, (PathBuf, ElfAbi)>,
+    _roots: StaticRoots,
+) -> Result<Vec<StaticGroup>> {
+    bail!("private Multi Counts grouping is not implemented")
+}
+
+#[cfg_attr(not(test), allow(dead_code))] // No allocation before checked Multi admission exists.
+fn reserve_counter_multi_link_capacity(
+    _links: &mut Vec<RegisteredLink>,
+    _fresh_len: usize,
+) -> std::result::Result<(), counter_banks::BankRefusal> {
+    Err(counter_banks::BankRefusal::Budget)
+}
+
+#[cfg_attr(not(test), allow(dead_code))] // Refuse before the native callback or registry mutation.
+fn retain_counter_multi_leaf(
+    _links: &mut Vec<RegisteredLink>,
+    _pairs: &mut pid_continuity::PairBook,
+    _program: &'static str,
+    _sites: &[(u64, u64)],
+    _slots_by_cookie: &BTreeMap<u64, u32>,
+    _attach: impl FnOnce() -> io::Result<OwnedFd>,
+) -> io::Result<()> {
+    Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP))
+}
+
+#[cfg_attr(not(test), allow(dead_code))] // No Counts selective retirement implementation yet.
+fn validate_counter_group_retirement(
+    _links: &[RegisteredLink],
+    _requested: &BTreeSet<u32>,
+) -> Result<()> {
+    bail!("private Multi Counts group retirement is not implemented")
 }
 
 /// One attached group side: the program, its member slots, and the live
@@ -3355,6 +3397,7 @@ fn reattach_rebuilt_groups_observed_with<T>(
             let round = StaticGroup {
                 path: group.path.clone(),
                 entry_program: group.entry_program,
+                return_program: group.return_program,
                 members: std::mem::take(&mut remaining),
             };
             let (bundles, outcome) = match attach_target_groups_unsettled(
@@ -5422,7 +5465,7 @@ impl Session {
                     counter
                         .as_ref()
                         .context("counter preparation requires its selected profile")?
-                        .validate_and_load(&mut ebpf)?;
+                        .validate_and_load(&mut ebpf, backend)?;
                 }
                 SessionPreparation::FreezeDeferred(name) => {
                     freeze_map(name, ebpf.map(name).with_context(|| format!("{name} map"))?)

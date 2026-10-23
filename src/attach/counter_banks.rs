@@ -476,6 +476,26 @@ fn stage_requirements(
     Ok((retained, transient, metadata, fds))
 }
 
+// Inert signatures for the private Multi Counts controls. Admission remains
+// refused until the checked group/storage implementation is supplied.
+fn counter_multi_requirements(
+    _fresh: &[Slot],
+    _old_link_len: usize,
+    _old_link_capacity: usize,
+) -> Result<(usize, usize, usize), BankRefusal> {
+    Err(BankRefusal::Budget)
+}
+
+fn check_counter_multi_reservation(
+    _envelope: BankReservation,
+    _base: (usize, usize, usize, usize),
+    _fresh: &[Slot],
+    _old_link_len: usize,
+    _old_link_capacity: usize,
+) -> Result<(), BankRefusal> {
+    Err(BankRefusal::Budget)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BankPublication {
     Published {
@@ -1209,6 +1229,7 @@ pub(super) struct CounterBanks {
     pub(super) keepalive: Arc<CounterKeepalive>,
     cpus: usize,
     geometry: CountsBankGeometry,
+    backend: super::AttachBackend,
     // Immutable geometry avoids reentering the Directory lock during stage.
     link_staging: Arc<AtomicU64>,
 }
@@ -1359,13 +1380,23 @@ impl<'a> CounterPreparation<'a> {
                 keepalive,
                 cpus,
                 geometry,
+                backend: super::AttachBackend::Singles,
                 link_staging: Arc::new(AtomicU64::new(0)),
             },
             _scratch: scratch,
         })
     }
 
-    pub(super) fn validate_and_load(&self, ebpf: &mut Ebpf) -> Result<()> {
+    pub(super) fn validate_and_load(
+        &self,
+        ebpf: &mut Ebpf,
+        backend: super::AttachBackend,
+    ) -> Result<()> {
+        ensure!(
+            backend == super::AttachBackend::Singles
+                && self.banks.backend == super::AttachBackend::Singles,
+            "private Multi Counts root loading is not implemented"
+        );
         validate_maps(ebpf, self.banks.geometry)
             .map_err(|failure| anyhow::anyhow!("private counter map refusal: {failure:?}"))?;
         // No caller or lifecycle link exists yet, and all routing maps are
@@ -2119,6 +2150,25 @@ impl BankIo for NativeIo<'_> {
 }
 
 impl Session {
+    /// A new private Session only. Multi stays inert until its admission and
+    /// native ownership path have passed the focused behavior controls.
+    pub(crate) fn prepare_counter_banks_with_backend(
+        scope: &Scope,
+        object: &[u8],
+        reservation: BankReservation,
+        reserve: &SemanticResourceReserver,
+        backend: super::AttachBackend,
+    ) -> Result<Self> {
+        match backend {
+            super::AttachBackend::Singles => {
+                Self::prepare_counter_banks(scope, object, reservation, reserve)
+            }
+            super::AttachBackend::Multi => {
+                anyhow::bail!("private Multi Counts Session preparation is not implemented")
+            }
+        }
+    }
+
     /// Private, explicit proof constructor; no Engine/run/selector calls it.
     pub(crate) fn prepare_counter_banks(
         scope: &Scope,
@@ -2193,6 +2243,18 @@ impl Session {
 }
 
 impl CounterBanks {
+    fn validate_backend(&self, _backend: super::AttachBackend) -> Result<(), BankRefusal> {
+        Err(BankRefusal::Topology)
+    }
+
+    fn validate_unlinked_backend(
+        &self,
+        _backend: super::AttachBackend,
+        _links: &[super::RegisteredLink],
+    ) -> Result<(), BankRefusal> {
+        Err(BankRefusal::Topology)
+    }
+
     fn begin_link_stage(&self, word: u64) -> Result<LinkStage, BankRefusal> {
         let first = (word >> 32) as u32;
         let end = word as u32;
@@ -4543,6 +4605,7 @@ pub(crate) mod tests {
             directory: Arc::new(Mutex::new(BankDirectory::default())),
             keepalive: CounterKeepalive::precharge(&pool.reserver(), 4096).unwrap(),
             cpus: 2,
+            backend: super::super::AttachBackend::Singles,
             link_staging: Arc::new(AtomicU64::new(0)),
         };
         let targets = plan(2).slots;
@@ -5002,6 +5065,7 @@ pub(crate) mod tests {
             directory: Arc::new(Mutex::new(BankDirectory::default())),
             keepalive: CounterKeepalive::precharge(&pool.reserver(), 4096).unwrap(),
             cpus: 2,
+            backend: super::super::AttachBackend::Singles,
             link_staging: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -5115,6 +5179,7 @@ pub(crate) mod tests {
                 directory: Arc::new(Mutex::new(directory)),
                 keepalive,
                 cpus: 2,
+                backend: super::super::AttachBackend::Singles,
                 link_staging: Arc::new(AtomicU64::new(0)),
             },
             pool,

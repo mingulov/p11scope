@@ -231,14 +231,10 @@ impl CollectedReports {
             .ok_or(SemanticRefusal::ProviderStorage)?;
         let mut watched_bound = 0;
         for object in lane.subset().required().keys() {
-            let watched = lane
-                .subset()
-                .pins()
-                .retain_inventory_target(*object)
-                .map_err(|_| SemanticRefusal::ProviderStorage)?;
             watched_bound = watched_bound.max(
-                watched
-                    .retained_copy_allocation_charge()
+                lane.subset()
+                    .pins()
+                    .retained_target_copy_allocation_charge(*object)
                     .ok_or(SemanticRefusal::ProviderStorage)?,
             );
         }
@@ -586,19 +582,25 @@ impl LiveJointMachine {
             }
             Phase::Collecting(mut original) => {
                 // The H0 leaf accepts at most MAX_PENDING ordinary records.
-                // A wire slice ends at that real bound, not at a fake empty.
-                if !original.poll.backlog || original.attempted >= MAX_PENDING {
+                // Total wire capacity and actual ordinary/H0 room are
+                // independent. BEGIN-only prefixes may cross wire1024.
+                if !original.poll.backlog
+                    || original.attempted >= RAW_CAPACITY
+                    || original.raw.pending_h0_records() >= MAX_PENDING
+                {
                     let failed = retain_on_refusal!(
                         Phase::Collecting(original),
                         original.raw.h0_input(lane.domain(), MAX_PENDING)
                     )
                     .1;
-                    let unrequested_empty = original.attempted == 0 && self.demand.is_none();
+                    let requested = matches!(self.demand, Some(Demand::Requested { .. }));
+                    let unrequested_empty = original.attempted == 0 && !requested;
                     let needs_first_end = original.attempted != 0
                         && original.raw.pending_h0_records() == 0
                         && self.grant.is_none()
                         && !failed
-                        && original.attempted < MAX_PENDING;
+                        && !requested
+                        && original.attempted < RAW_CAPACITY;
                     if !unrequested_empty && !needs_first_end {
                         budget.spend(1);
                         return (Phase::Binding(original), Ok(Step::Continue));
@@ -606,7 +608,9 @@ impl LiveJointMachine {
                 }
                 let work = budget
                     .remaining_actions
-                    .min(MAX_PENDING - original.attempted);
+                    .min(MAX_PENDING)
+                    .min(RAW_CAPACITY - original.attempted)
+                    .min(MAX_PENDING - original.raw.pending_h0_records());
                 if work == 0 {
                     return (Phase::Collecting(original), Ok(Step::Yield));
                 }
@@ -655,7 +659,11 @@ impl LiveJointMachine {
             Phase::AwaitH0(mut original) => {
                 let batch = retain_on_refusal!(
                     Phase::AwaitH0(original),
-                    io.tick_collected(lane, coordinator.semantic_bindings(), &mut original.raw,)
+                    io.tick_collected(
+                        lane,
+                        coordinator.semantic_bindings_mut().bindings_for_tick(),
+                        &mut original.raw
+                    )
                 );
                 budget.spend(1);
                 let complete = match original
@@ -766,7 +774,11 @@ impl LiveJointMachine {
             Phase::Ingesting(original) => {
                 budget.spend(1);
                 let identity = original.raw.h0_identity();
-                if original.attempted == 0 || self.grant.is_none() {
+                // A genuinely retained grant also covers a real empty
+                // collection. Its existing H8 COMPLETE/claim may still need
+                // an actual future-input frame; negative disposal cannot
+                // erase that obligation or stand in for this ingestion.
+                if self.grant.is_none() {
                     coordinator.dispose_prepared_claims_s1();
                     return (Phase::StagingNegative(original), Ok(Step::Continue));
                 }
@@ -804,6 +816,8 @@ impl LiveJointMachine {
                 let identity = original.raw.h0_identity();
                 let reason = if original.attempted == 0 {
                     RawDisposeReason::Empty
+                } else if original.attempted == RAW_CAPACITY {
+                    RawDisposeReason::Capacity
                 } else {
                     RawDisposeReason::NoAdmission
                 };

@@ -694,6 +694,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         births: &mut RetainedJointBirths,
         mut consume: impl FnMut(
             crate::semantic_capture::H0BirthCandidate,
+            Option<crate::semantic_capture::CommittedAbsenceBirth>,
             &AdmittedInstanceCall,
             &SemanticCallerBinding,
             &JournalDomainProof,
@@ -859,10 +860,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             if !receipt.matches_birth_admission(input, binding, &proof) {
                 continue;
             }
-            let Some(nested) = receipt.owned_storage_bytes() else {
-                continue;
-            };
-            let Ok(slot) = births.reserve_for(&reserve, nested) else {
+            let Ok(mut slot) = births.reserve_for_current(&reserve, receipt) else {
                 disclose_s1_birth_refusal(
                     registrations.registry_mut(),
                     Some(input.journal_binding().3),
@@ -881,7 +879,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     continue;
                 }
             };
-            let witness = match consume(candidate, input, binding, &proof, adapter) {
+            let absence = slot.take_absence();
+            let witness = match consume(candidate, absence, input, binding, &proof, adapter) {
                 Ok(witness) => witness,
                 Err(reason) => {
                     drop(reservation);
@@ -912,6 +911,23 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
         births.order_for_native_reads();
         Ok(PreparedBirthDisposition { installed })
+    }
+
+    /// The idle machine walks actual accepted image bindings and actual
+    /// attached targets, including providers absent from the Mapped catalog.
+    /// Only disjoint binding/adapter borrows cross the native acquisition.
+    pub(crate) fn joint_absence_parts(
+        &mut self,
+        at: usize,
+    ) -> Option<(&SemanticCallerBinding, &mut JournalAdapter)> {
+        Some((
+            self.semantic_bindings.bindings.get(at)?,
+            self.joint_capture.adapter_mut(),
+        ))
+    }
+
+    pub(crate) fn joint_absence_binding(&self, at: usize) -> Option<&SemanticCallerBinding> {
+        self.semantic_bindings.bindings.get(at)
     }
 
     pub(crate) fn prepare_staged_semantic_batch(

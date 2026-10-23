@@ -307,6 +307,7 @@ impl crate::inventory_semantics::JointMachineIo for HeldMachineIo<'_> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)] // Substitute native rows beneath the actual original consumer.
     fn consume_birth(
         &mut self,
         _lane: &mut AttestedSemanticLane,
@@ -2788,7 +2789,7 @@ fn joint_birth_reservation_keeps_original_until_one_install() {
                 &ingested,
                 &scene.producers,
                 &mut births,
-                |candidate, input, binding, proof, adapter| {
+                |candidate, absence, input, binding, proof, adapter| {
                     native_calls += 1;
                     let (row, control, _) =
                         publisher.publish_stamped(&["0", "0"], attached.generation());
@@ -2797,7 +2798,7 @@ fn joint_birth_reservation_keeps_original_until_one_install() {
                     let HeldH0 { capture, io, .. } = &mut *owned;
                     capture.validate_birth_candidate(io, &candidate, false)?;
                     let witness = capture.finish_birth(
-                        candidate, None, input, binding, &attached, proof, adapter, &mut rows,
+                        candidate, absence, input, binding, &attached, proof, adapter, &mut rows,
                     )?;
                     native_rows.push((witness.receipt().domain(), rows));
                     Ok(witness)
@@ -2868,9 +2869,14 @@ fn joint_birth_reservation_keeps_original_until_one_install() {
             .real
             .scene
             .coordinator
-            .prepare_joint_births(&ingested, &scene.producers, &mut births, |_, _, _, _, _| {
-                panic!("a decided original may never consume New or read native twice")
-            })
+            .prepare_joint_births(
+                &ingested,
+                &scene.producers,
+                &mut births,
+                |_, _, _, _, _, _| {
+                    panic!("a decided original may never consume New or read native twice")
+                },
+            )
             .unwrap();
         assert_eq!(retry.installed, 0);
         assert_eq!(
@@ -2927,7 +2933,7 @@ fn joint_birth_reservation_keeps_original_until_one_install() {
             2
         );
         if !refuse_storage {
-            crate::discovery::caller_registry::instance_input::joint_grant_post_removal_growth_probe_for_test(*births.as_slice()[0].receipt());
+            crate::discovery::caller_registry::instance_input::joint_grant_post_removal_growth_probe_for_test(*births.ready_for_test().next().unwrap().receipt());
         }
         let frame = scene
             .real
@@ -3003,12 +3009,12 @@ fn finish_reserved_birth_frame(
         reads: &reads,
     };
     let native = RefCell::new(&mut native);
-    crate::inventory_semantics::with_joint_commit_io_for_test(
+    crate::inventory_semantics::with_joint_commit_io_for_births_test(
         capture,
         stash,
         &scene.producers,
         attached,
-        births.as_slice(),
+        births,
         &native,
         |io| {
             let (_, births, fault) = io.into_parts();
@@ -3113,7 +3119,7 @@ fn joint_birth_reservation_refuses_foreign_or_late_subject() {
             &ingested,
             &scene.producers,
             &mut births,
-            |candidate, input, binding, proof, adapter| {
+            |candidate, absence, input, binding, proof, adapter| {
                 native_calls += 1;
                 let (row, control, _) =
                     publisher.publish_stamped(&["0", "0"], attached.generation() + 1);
@@ -3122,7 +3128,7 @@ fn joint_birth_reservation_refuses_foreign_or_late_subject() {
                 let HeldH0 { capture, io, .. } = &mut *owned;
                 capture.validate_birth_candidate(io, &candidate, false)?;
                 let refused = capture.finish_birth(
-                    candidate, None, input, binding, &attached, proof, adapter, &mut rows,
+                    candidate, absence, input, binding, &attached, proof, adapter, &mut rows,
                 );
                 assert!(
                     refused.is_err(),
@@ -3140,9 +3146,12 @@ fn joint_birth_reservation_refuses_foreign_or_late_subject() {
         .real
         .scene
         .coordinator
-        .prepare_joint_births(&ingested, &scene.producers, &mut births, |_, _, _, _, _| {
-            panic!("native refusal is final S1, never a late upgrade")
-        })
+        .prepare_joint_births(
+            &ingested,
+            &scene.producers,
+            &mut births,
+            |_, _, _, _, _, _| panic!("native refusal is final S1, never a late upgrade"),
+        )
         .unwrap();
     while scene
         .real
@@ -3188,7 +3197,7 @@ fn joint_birth_reservation_refuses_foreign_or_late_subject() {
             &other_ingested,
             &other.producers,
             &mut retained,
-            |_, _, _, _, _| Ok(foreign_witness.take().unwrap()),
+            |_, _, _, _, _, _| Ok(foreign_witness.take().unwrap()),
         )
         .unwrap();
     assert_eq!(refused.installed, 0);
@@ -3210,7 +3219,7 @@ fn joint_birth_reservation_refuses_foreign_or_late_subject() {
             &other_ingested,
             &other.producers,
             &mut retained,
-            |_, _, _, _, _| panic!("foreign witness refusal cannot recreate the local New"),
+            |_, _, _, _, _, _| panic!("foreign witness refusal cannot recreate the local New"),
         )
         .unwrap();
 
@@ -3257,9 +3266,14 @@ fn joint_birth_first_refused_claim_blocks_later_same_key_original() {
     let roles = coordinator.joint_capture().ledger().roles_for_test();
     let mut births = RetainedJointBirths::new();
     let result = coordinator
-        .prepare_joint_births(&ingested, &scene.producers, &mut births, |_, _, _, _, _| {
-            panic!("a later successful sibling cannot consume the first original's New")
-        })
+        .prepare_joint_births(
+            &ingested,
+            &scene.producers,
+            &mut births,
+            |_, _, _, _, _, _| {
+                panic!("a later successful sibling cannot consume the first original's New")
+            },
+        )
         .unwrap();
     assert_eq!(result.installed, 0);
     assert!(births.as_slice().is_empty());
@@ -3601,7 +3615,7 @@ fn joint_birth_full_registration_table_refuses_before_new() {
             &ingested,
             &fixture.scene.producers,
             &mut births,
-            |_, _, _, _, _| {
+            |_, _, _, _, _, _| {
                 panic!("a full actual registration table must refuse before consuming New/native")
             },
         )
@@ -3703,7 +3717,7 @@ fn joint_birth_queued_registrations_preserve_actual_first_slot() {
             &ingested,
             &scene.producers,
             &mut births,
-            |candidate, input, binding, proof, adapter| {
+            |candidate, absence, input, binding, proof, adapter| {
                 assert!(
                     input.collected_origin() == inputs[0].collected_origin(),
                     "an earlier queued S1 registration owns the last slot, never the later New"
@@ -3716,7 +3730,7 @@ fn joint_birth_queued_registrations_preserve_actual_first_slot() {
                 let HeldH0 { capture, io, .. } = &mut *owned;
                 capture.validate_birth_candidate(io, &candidate, false)?;
                 capture.finish_birth(
-                    candidate, None, input, binding, &attached, proof, adapter, &mut rows,
+                    candidate, absence, input, binding, &attached, proof, adapter, &mut rows,
                 )
             },
         )

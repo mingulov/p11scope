@@ -3,7 +3,7 @@
 //! This module retains originals and scheduling positions; all authority stays
 //! in Capture, prepared admissions, the canonical ledger and the real frame.
 
-use super::{JointCommitIo, RetainedJointBirth, RetainedJointBirths};
+use super::{JointCommitIo, RetainedJointBirths};
 use crate::attach::{BirthObservationRefusal, SessionDrainProducers};
 use crate::discovery::caller_registry::OsProcessSource;
 use crate::discovery::caller_registry::instance_input::AdmittedInstanceCall;
@@ -11,13 +11,15 @@ use crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBi
 use crate::discovery::engine::inventory_coordinator::{
     BatchReceipt, InventoryCoordinator, JointCommitProgress,
 };
+use crate::discovery::identity::PinnedObjectId;
 use crate::discovery::instances::{InstanceId, MAX_INSTANCES, MAX_PENDING};
 use crate::events::DispatchPoll;
 use crate::inventory_semantics::{
     AttestedSemanticLane, LaneNegative, MAX_LANE_NEGATIVES, SemanticBatch, SemanticRefusal,
 };
 use crate::semantic_capture::{
-    CurrentPartitionReceipt, H0BirthCandidate, RetainedBirthWitness, TickOutcome,
+    CommittedAbsenceBirth, CurrentPartitionReceipt, H0BirthCandidate, RetainedBirthWitness,
+    TickOutcome,
 };
 use crate::semantics_edge::resources::{
     OWNED_ALLOCATION_PADDING, ResourceLease, SemanticResourceReserver,
@@ -102,19 +104,28 @@ pub(crate) trait JointMachineIo {
         raw: &mut RawJointQuantum,
         engine_changed: bool,
     ) -> anyhow::Result<()>;
+    #[allow(clippy::too_many_arguments)] // Move the original optional negative beside the existing subject borrows.
     fn consume_birth(
         &mut self,
         lane: &mut AttestedSemanticLane,
         candidate: H0BirthCandidate,
+        absence: Option<CommittedAbsenceBirth>,
         input: &AdmittedInstanceCall,
         binding: &SemanticCallerBinding,
         proof: &JournalDomainProof,
         adapter: &JournalAdapter,
     ) -> Result<RetainedBirthWitness, BirthObservationRefusal>;
+    fn acquire_absence(
+        &mut self,
+        lane: &mut AttestedSemanticLane,
+        binding: &SemanticCallerBinding,
+        slot: u32,
+        adapter: &mut JournalAdapter,
+    ) -> Result<CommittedAbsenceBirth, BirthObservationRefusal>;
     fn with_native<R>(
         &mut self,
         lane: &mut AttestedSemanticLane,
-        witnesses: &[RetainedJointBirth],
+        witnesses: &RetainedJointBirths,
         inspect: impl for<'io> FnOnce(JointCommitIo<'io>) -> R,
     ) -> Result<R, SemanticRefusal>;
 }
@@ -359,6 +370,11 @@ pub(crate) struct LiveJointMachine {
     state: RunState,
     grant: Option<SessionDrainGrant>,
     births: RetainedJointBirths,
+    // Index-only idle selection; no copied image/candidate table. Every
+    // inspected pair/query spends an action before collection can begin.
+    absence_binding: usize,
+    absence_after: Option<PinnedObjectId>,
+    absence_entry: usize,
     demand: Option<Demand>,
     prepared_base: u64,
     // All original phase buffers and birth leases drop before inline storage.
@@ -387,6 +403,9 @@ impl LiveJointMachine {
             state: RunState::Runnable,
             grant: None,
             births: RetainedJointBirths::new(),
+            absence_binding: 0,
+            absence_after: None,
+            absence_entry: 0,
             demand: None,
             prepared_base: 0,
             _storage: storage,
@@ -590,6 +609,48 @@ impl LiveJointMachine {
         };
         Some(original)
     }
+
+    #[cfg(test)]
+    pub(crate) fn retained_births_for_test(&self) -> &RetainedJointBirths {
+        &self.births
+    }
+
+    #[cfg(test)]
+    pub(crate) fn next_absence_allocation_for_test(
+        &self,
+        lane: &AttestedSemanticLane,
+        coordinator: &InventoryCoordinator<OsProcessSource>,
+    ) -> Option<(usize, usize, usize)> {
+        let binding = coordinator.joint_absence_binding(self.absence_binding)?;
+        let (object, _) = match self.absence_after {
+            Some(after) => lane
+                .subset()
+                .required()
+                .range((std::ops::Bound::Excluded(after), std::ops::Bound::Unbounded))
+                .next(),
+            None => lane.subset().required().iter().next(),
+        }?;
+        if self
+            .births
+            .contains_subject(binding, lane.subset().pins(), *object)
+        {
+            return None;
+        }
+        let nested = lane
+            .subset()
+            .pins()
+            .retained_target_copy_allocation_charge(*object)?;
+        self.births.next_allocation_for_test(nested)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_storage_for_test(&self) -> usize {
+        assert!(
+            matches!(self.phase, Some(Phase::Idle)),
+            "this observer measures the actual idle machine and birth leases"
+        );
+        size_of::<Self>() + self.births.retained_storage_for_test()
+    }
 }
 
 enum Step {
@@ -623,6 +684,92 @@ impl LiveJointMachine {
         match phase {
             Phase::Idle => {
                 let reserve = coordinator.registry().semantic_storage_reserver();
+                // No collection, binder or New can precede this scan. One
+                // accepted current image is paired with one real attached
+                // target per action; no Mapped-only selector/cross-product.
+                if self.grant.is_some()
+                    && let Some((binding, adapter)) =
+                        coordinator.joint_absence_parts(self.absence_binding)
+                {
+                    let target = match self.absence_after {
+                        Some(after) => lane
+                            .subset()
+                            .required()
+                            .range((std::ops::Bound::Excluded(after), std::ops::Bound::Unbounded))
+                            .next(),
+                        None => lane.subset().required().iter().next(),
+                    }
+                    .map(|(object, slots)| (*object, slots.first().copied()));
+                    budget.spend(1);
+                    let Some((object, slot)) = target else {
+                        self.absence_binding += 1;
+                        self.absence_after = None;
+                        self.absence_entry = 0;
+                        return (Phase::Idle, Ok(Step::Continue));
+                    };
+                    if !binding.scope_current() || binding.domain() != lane.domain() {
+                        self.absence_after = Some(object);
+                        self.absence_entry = 0;
+                        return (Phase::Idle, Ok(Step::Continue));
+                    }
+                    // The retained table is inspected one entry per shared
+                    // action. A budget-one retry resumes its exact position,
+                    // rather than rescanning every prior witness/negative.
+                    if let Some(matches) = self.births.subject_at(
+                        self.absence_entry,
+                        binding,
+                        lane.subset().pins(),
+                        object,
+                    ) {
+                        if matches {
+                            self.absence_after = Some(object);
+                            self.absence_entry = 0;
+                        } else {
+                            self.absence_entry += 1;
+                        }
+                        return (Phase::Idle, Ok(Step::Continue));
+                    }
+                    let Some(slot) = slot else {
+                        return (Phase::Idle, Err(SemanticRefusal::Attachment));
+                    };
+                    let Some(nested) = lane
+                        .subset()
+                        .pins()
+                        .retained_target_copy_allocation_charge(object)
+                    else {
+                        return (Phase::Idle, Err(SemanticRefusal::ProviderStorage));
+                    };
+                    let slot_storage = match self.births.reserve_for(&reserve, nested) {
+                        Ok(storage) => storage,
+                        Err(()) => return (Phase::Idle, Err(SemanticRefusal::ProviderStorage)),
+                    };
+                    match io.acquire_absence(lane, binding, slot, adapter) {
+                        Ok(negative) => {
+                            if !negative.matches_binding_target(
+                                binding,
+                                lane.subset().pins(),
+                                object,
+                            ) || slot_storage.retain_absence(negative).is_err()
+                            {
+                                return (Phase::Idle, Err(SemanticRefusal::Unavailable));
+                            }
+                            self.absence_after = Some(object);
+                            self.absence_entry = 0;
+                            return (Phase::Idle, Ok(Step::Yield));
+                        }
+                        Err(_) => {
+                            // No absence authority was acquired. The actual
+                            // later New may still choose only its real Exec
+                            // path; this does not manufacture a negative.
+                            self.absence_after = Some(object);
+                            self.absence_entry = 0;
+                            return (Phase::Idle, Ok(Step::Continue));
+                        }
+                    }
+                }
+                self.absence_binding = 0;
+                self.absence_after = None;
+                self.absence_entry = 0;
                 let work = budget.remaining_actions.min(MAX_PENDING);
                 let (raw, poll) = retain_on_refusal!(
                     Phase::Idle,
@@ -969,7 +1116,7 @@ impl LiveJointMachine {
                         identity,
                         base
                     },
-                    io.with_native(lane, self.births.as_slice(), |io| coordinator
+                    io.with_native(lane, &self.births, |io| coordinator
                         .joint_capture_mut()
                         .adapter_mut()
                         .install_closure_grant(&SessionClosureGrant::observe(io.attachment())))
@@ -1011,8 +1158,9 @@ impl LiveJointMachine {
                         &original,
                         &self.producers,
                         &mut self.births,
-                        |candidate, input, binding, proof, adapter| io
-                            .consume_birth(lane, candidate, input, binding, proof, adapter),
+                        |candidate, absence, input, binding, proof, adapter| io.consume_birth(
+                            lane, candidate, absence, input, binding, proof, adapter
+                        ),
                     )
                 );
                 (
@@ -1077,7 +1225,7 @@ impl LiveJointMachine {
             } => {
                 budget.spend(1);
                 let mut original = Some(original);
-                let result = io.with_native(lane, self.births.as_slice(), |io| {
+                let result = io.with_native(lane, &self.births, |io| {
                     let attachment = io.attachment();
                     let (_, _, fault) = io.into_parts();
                     coordinator.audit_ingested_quantum(
@@ -1122,7 +1270,7 @@ impl LiveJointMachine {
             } => {
                 budget.spend(1);
                 let mut original = Some(original);
-                let result = io.with_native(lane, self.births.as_slice(), |io| {
+                let result = io.with_native(lane, &self.births, |io| {
                     let attachment = io.attachment();
                     let (_, _, fault) = io.into_parts();
                     coordinator.audit_disposed_quantum(
@@ -1166,7 +1314,7 @@ impl LiveJointMachine {
                 base,
             } => {
                 let before = budget.remaining_actions;
-                let result = io.with_native(lane, self.births.as_slice(), |io| {
+                let result = io.with_native(lane, &self.births, |io| {
                     coordinator.commit_joint_batch_with_io(
                         io,
                         &self.producers,
@@ -1324,10 +1472,12 @@ impl JointMachineIo for SessionMachineIo {
         coordinator.prepare_joint_publication(engine_changed, lane, raw, &self.producers)
     }
 
+    #[allow(clippy::too_many_arguments)] // Delegate the same original candidate/negative/native subject to Capture.
     fn consume_birth(
         &mut self,
         lane: &mut AttestedSemanticLane,
         candidate: H0BirthCandidate,
+        absence: Option<CommittedAbsenceBirth>,
         input: &AdmittedInstanceCall,
         binding: &SemanticCallerBinding,
         proof: &JournalDomainProof,
@@ -1339,7 +1489,7 @@ impl JointMachineIo for SessionMachineIo {
         live.capture.consume_birth(
             &mut live.session,
             candidate,
-            None,
+            absence,
             input,
             binding,
             &live.attached,
@@ -1348,14 +1498,33 @@ impl JointMachineIo for SessionMachineIo {
         )
     }
 
+    fn acquire_absence(
+        &mut self,
+        lane: &mut AttestedSemanticLane,
+        binding: &SemanticCallerBinding,
+        slot: u32,
+        adapter: &mut JournalAdapter,
+    ) -> Result<CommittedAbsenceBirth, BirthObservationRefusal> {
+        let live = self
+            .live(lane)
+            .map_err(|_| BirthObservationRefusal::BindingMismatch)?;
+        live.capture.acquire_absence_birth(
+            &mut live.session,
+            binding,
+            &live.attached,
+            slot,
+            adapter,
+        )
+    }
+
     fn with_native<R>(
         &mut self,
         lane: &mut AttestedSemanticLane,
-        witnesses: &[RetainedJointBirth],
+        witnesses: &RetainedJointBirths,
         inspect: impl for<'io> FnOnce(JointCommitIo<'io>) -> R,
     ) -> Result<R, SemanticRefusal> {
         self.live(lane)?;
-        lane.with_joint_commit_io(witnesses, inspect)
+        lane.with_joint_commit_io_for_births(witnesses, inspect)
     }
 }
 

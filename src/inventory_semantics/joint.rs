@@ -9,7 +9,9 @@ use super::{
 use crate::attach::{AttachedSemanticSet, BirthObservationRefusal, Session, SessionDrainProducers};
 use crate::discovery::caller_registry::instance_input::JointFeedTarget;
 use crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding;
-use crate::semantic_capture::RetainedBirthWitness;
+use crate::semantic_capture::{
+    CommittedAbsenceBirth, CurrentPartitionReceipt, RetainedBirthWitness,
+};
 use crate::semantics_edge::resources::{
     OWNED_ALLOCATION_PADDING, ResourceLease, SemanticResourceReserver,
 };
@@ -25,26 +27,31 @@ pub(crate) use machine::{
     JointCommitRefusal, JointServiceMode, JointServiceProgress, JointWorkBudget, LiveJointMachine,
 };
 
-/// One original witness and its transferred nested-allocation charge. The
-/// existing native source borrows this same table through Borrow, not a copy.
+/// One original negative or completed witness in the SAME paid allocation.
+/// Pending entries have no receipt and cannot implement Borrow<witness>.
+#[allow(clippy::large_enum_variant)] // Both move-only originals stay inline in the same paid entry.
+enum RetainedBirth {
+    PendingAbsence(CommittedAbsenceBirth),
+    Ready(RetainedBirthWitness),
+}
+
 pub(crate) struct RetainedJointBirth {
-    witness: RetainedBirthWitness,
+    birth: RetainedBirth,
+    nested_bytes: usize,
     _storage: ResourceLease,
 }
-impl Borrow<RetainedBirthWitness> for RetainedJointBirth {
-    fn borrow(&self) -> &RetainedBirthWitness {
-        &self.witness
-    }
-}
 impl RetainedJointBirth {
-    pub(crate) fn receipt(&self) -> &crate::semantics_objects::journal::BootstrapReceipt {
-        self.witness.receipt()
+    fn ready(&self) -> Option<&RetainedBirthWitness> {
+        match &self.birth {
+            RetainedBirth::Ready(witness) => Some(witness),
+            RetainedBirth::PendingAbsence(_) => None,
+        }
     }
 }
 
-/// The eventual lane keeps its actual witnesses here. Container capacity and
-/// each heterogeneous receipt's nested bytes are paid before New/native move;
-/// PreparedSemanticBatch may then refund its original overlapping charge.
+/// Container capacity and each heterogeneous original's nested bytes are
+/// paid before acquisition/New moves. Replacing Pending with Ready keeps
+/// the old original and lease until native consumption actually occurs.
 #[derive(Default)]
 pub(crate) struct RetainedJointBirths {
     witnesses: Vec<RetainedJointBirth>,
@@ -52,15 +59,27 @@ pub(crate) struct RetainedJointBirths {
 }
 pub(crate) struct RetainedBirthSlot<'a> {
     owner: &'a mut RetainedJointBirths,
+    pending: Option<usize>,
     nested_limit: usize,
     storage: ResourceLease,
+    // The consumed negative's allocations stay charged across native I/O.
+    _pending_storage: Option<ResourceLease>,
 }
 impl RetainedJointBirths {
     pub(crate) fn new() -> Self {
         Self::default()
     }
+
+    #[cfg(test)]
     pub(crate) fn as_slice(&self) -> &[RetainedJointBirth] {
         &self.witnesses
+    }
+
+    fn capacity_charge(capacity: usize) -> Option<usize> {
+        capacity
+            .checked_mul(std::mem::size_of::<RetainedJointBirth>())?
+            .checked_add(OWNED_ALLOCATION_PADDING)?
+            .checked_add(std::mem::size_of::<Self>())
     }
 
     pub(crate) fn reserve_for(
@@ -68,37 +87,145 @@ impl RetainedJointBirths {
         reserve: &SemanticResourceReserver,
         nested_bytes: usize,
     ) -> Result<RetainedBirthSlot<'_>, ()> {
+        self.reserve_at(reserve, nested_bytes, None)
+    }
+
+    pub(crate) fn reserve_for_current(
+        &mut self,
+        reserve: &SemanticResourceReserver,
+        current: &CurrentPartitionReceipt,
+    ) -> Result<RetainedBirthSlot<'_>, ()> {
+        let pending = self.witnesses.iter().position(|entry| {
+            matches!(&entry.birth, RetainedBirth::PendingAbsence(negative)
+                if negative.matches_current(current))
+        });
+        self.reserve_at(reserve, current.owned_storage_bytes().ok_or(())?, pending)
+    }
+
+    fn reserve_at(
+        &mut self,
+        reserve: &SemanticResourceReserver,
+        nested_bytes: usize,
+        pending: Option<usize>,
+    ) -> Result<RetainedBirthSlot<'_>, ()> {
         let storage = reserve.reserve(nested_bytes).map_err(|_| ())?;
-        if self.witnesses.len() == self.witnesses.capacity() {
+        if pending.is_none() && self.witnesses.len() == self.witnesses.capacity() {
             let next = self.witnesses.capacity().checked_mul(2).ok_or(())?.max(1);
             if next > crate::discovery::caller_registry::instance_input::MAX_REGISTRY_INSTANCES {
                 return Err(());
             }
-            let bytes = next
-                .checked_mul(std::mem::size_of::<RetainedJointBirth>())
-                .and_then(|bytes| bytes.checked_add(OWNED_ALLOCATION_PADDING))
-                .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Self>()))
-                .ok_or(())?;
-            let capacity_storage = reserve.reserve(bytes).map_err(|_| ())?;
+            // Full replacement is reserved while the old physical allocation
+            // and its charge are live, before either reallocation or query.
+            let capacity_storage = reserve
+                .reserve(Self::capacity_charge(next).ok_or(())?)
+                .map_err(|_| ())?;
             self.witnesses
                 .try_reserve_exact(next - self.witnesses.len())
                 .map_err(|_| ())?;
             assert!(
                 self.witnesses.capacity() <= next,
-                "retained witness capacity exceeds its precharge"
+                "retained birth capacity exceeds its precharge"
             );
             self.capacity_storage = Some(capacity_storage);
         }
         Ok(RetainedBirthSlot {
             owner: self,
+            pending,
             nested_limit: nested_bytes,
             storage,
+            _pending_storage: None,
         })
     }
 
+    pub(crate) fn subject_at(
+        &self,
+        at: usize,
+        binding: &SemanticCallerBinding,
+        pins: &crate::discovery::identity::PinnedObjects,
+        object: crate::discovery::identity::PinnedObjectId,
+    ) -> Option<bool> {
+        Some(match &self.witnesses.get(at)?.birth {
+            RetainedBirth::PendingAbsence(negative) => {
+                negative.matches_binding_target(binding, pins, object)
+            }
+            RetainedBirth::Ready(witness) => witness.matches_binding_target(binding, pins, object),
+        })
+    }
+
+    #[cfg(test)]
+    fn contains_subject(
+        &self,
+        binding: &SemanticCallerBinding,
+        pins: &crate::discovery::identity::PinnedObjects,
+        object: crate::discovery::identity::PinnedObjectId,
+    ) -> bool {
+        (0..self.witnesses.len()).any(|at| self.subject_at(at, binding, pins, object) == Some(true))
+    }
+
     pub(crate) fn order_for_native_reads(&mut self) {
+        self.witnesses.sort_unstable_by_key(|entry| {
+            (
+                entry.ready().is_none(),
+                entry.ready().map(|witness| witness.receipt().domain()),
+            )
+        });
+    }
+
+    /// Borrow only an exact completed original. Pending has no receipt or
+    /// domain and is outside this binary search, including mixed tables.
+    pub(crate) fn find_ready(&self, target: &JointFeedTarget) -> Option<&RetainedBirthWitness> {
+        let ready = self
+            .witnesses
+            .partition_point(|entry| entry.ready().is_some());
+        let at = self.witnesses[..ready]
+            .binary_search_by_key(&target.bootstrap().domain(), |entry| {
+                entry.ready().expect("the ready prefix").receipt().domain()
+            })
+            .ok()?;
+        let witness = self.witnesses[at].ready()?;
+        (witness.receipt() == target.bootstrap()).then_some(witness)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_for_test(&self) -> impl Iterator<Item = &CommittedAbsenceBirth> {
         self.witnesses
-            .sort_unstable_by_key(|witness| witness.receipt().domain());
+            .iter()
+            .filter_map(|entry| match &entry.birth {
+                RetainedBirth::PendingAbsence(negative) => Some(negative),
+                RetainedBirth::Ready(_) => None,
+            })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ready_for_test(&self) -> impl Iterator<Item = &RetainedBirthWitness> {
+        self.witnesses.iter().filter_map(RetainedJointBirth::ready)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn next_allocation_for_test(&self, nested: usize) -> Option<(usize, usize, usize)> {
+        if self.witnesses.len() != self.witnesses.capacity() {
+            return None;
+        }
+        let next = self.witnesses.capacity().checked_mul(2)?.max(1);
+        Some((
+            self.capacity_storage.as_ref().map_or(Some(0), |_| {
+                Self::capacity_charge(self.witnesses.capacity())
+            })?,
+            Self::capacity_charge(next)?,
+            nested,
+        ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_storage_for_test(&self) -> usize {
+        let capacity = self.capacity_storage.as_ref().map_or(0, |_| {
+            Self::capacity_charge(self.witnesses.capacity()).expect("the actual reserved capacity")
+        });
+        self.witnesses.iter().fold(capacity, |bytes, entry| {
+            bytes
+                .checked_add(entry.nested_bytes)
+                .expect("bounded actual resource leases")
+        })
     }
 }
 impl RetainedBirthSlot<'_> {
@@ -106,17 +233,54 @@ impl RetainedBirthSlot<'_> {
         witness
             .owned_storage_bytes()
             .is_some_and(|bytes| bytes <= self.nested_limit)
-            && self.owner.witnesses.len() < self.owner.witnesses.capacity()
+            && (self.pending.is_some()
+                || self.owner.witnesses.len() < self.owner.witnesses.capacity())
     }
+
+    /// Called only AFTER registry reservation and candidate extraction. A
+    /// storage refusal before this point leaves the original negative in place.
+    pub(crate) fn take_absence(&mut self) -> Option<CommittedAbsenceBirth> {
+        let at = self.pending.take()?;
+        let entry = self.owner.witnesses.swap_remove(at);
+        let RetainedBirth::PendingAbsence(negative) = entry.birth else {
+            unreachable!("the lexical slot selected an original negative")
+        };
+        self._pending_storage = Some(entry._storage);
+        Some(negative)
+    }
+
     pub(crate) fn retain(self, witness: RetainedBirthWitness) {
         assert!(
             self.accepts(&witness),
             "original witness storage was precharged before installation"
         );
         self.owner.witnesses.push(RetainedJointBirth {
-            witness,
+            birth: RetainedBirth::Ready(witness),
+            nested_bytes: self.nested_limit,
             _storage: self.storage,
         });
+    }
+
+    #[allow(clippy::result_large_err)] // Refusal returns the original negative without another allocation.
+    pub(crate) fn retain_absence(
+        self,
+        negative: CommittedAbsenceBirth,
+    ) -> Result<(), CommittedAbsenceBirth> {
+        if self.pending.is_some()
+            || negative
+                .owned_storage_bytes()
+                .is_none_or(|bytes| bytes > self.nested_limit)
+            || self.owner.witnesses.len() == self.owner.witnesses.capacity()
+        {
+            return Err(negative);
+        }
+        self.owner.witnesses.push(RetainedJointBirth {
+            birth: RetainedBirth::PendingAbsence(negative),
+            nested_bytes: self.nested_limit,
+            _storage: self.storage,
+        });
+        self.owner.order_for_native_reads();
+        Ok(())
     }
 }
 
@@ -201,14 +365,36 @@ impl JointNativeIo for Session {
     }
 }
 
-struct NativeBirths<'io, 'native, N, W> {
+trait ReadyBirthLookup {
+    fn find_ready(&self, target: &JointFeedTarget) -> Option<&RetainedBirthWitness>;
+}
+
+impl<W: Borrow<RetainedBirthWitness>> ReadyBirthLookup for [W] {
+    fn find_ready(&self, target: &JointFeedTarget) -> Option<&RetainedBirthWitness> {
+        let at = self
+            .binary_search_by_key(&target.bootstrap().domain(), |witness| {
+                witness.borrow().receipt().domain()
+            })
+            .ok()?;
+        let witness = self[at].borrow();
+        (witness.receipt() == target.bootstrap()).then_some(witness)
+    }
+}
+
+impl ReadyBirthLookup for RetainedJointBirths {
+    fn find_ready(&self, target: &JointFeedTarget) -> Option<&RetainedBirthWitness> {
+        RetainedJointBirths::find_ready(self, target)
+    }
+}
+
+struct NativeBirths<'io, 'native, N, W: ?Sized> {
     native: &'io RefCell<&'native mut N>,
     capture: &'io SemanticCapture,
     attached: &'io AttachedSemanticSet,
-    witnesses: &'io [W],
+    witnesses: &'io W,
 }
 
-impl<N: JointNativeIo, W: Borrow<RetainedBirthWitness>> JointBirthEvidenceSource
+impl<N: JointNativeIo, W: ReadyBirthLookup + ?Sized> JointBirthEvidenceSource
     for NativeBirths<'_, '_, N, W>
 {
     fn take_for(
@@ -220,18 +406,12 @@ impl<N: JointNativeIo, W: Borrow<RetainedBirthWitness>> JointBirthEvidenceSource
         {
             return Err(BirthObservationRefusal::BindingMismatch);
         }
-        // The owner supplies its original witnesses in domain order. This
-        // borrows the existing table, with no per-head scan or copied facts.
-        let at = self
+        // The owner supplies its original table. Pending entries never
+        // masquerade as witnesses or enter the ready-domain binary search.
+        let witness = self
             .witnesses
-            .binary_search_by_key(&target.bootstrap().domain(), |witness| {
-                witness.borrow().receipt().domain()
-            })
-            .map_err(|_| BirthObservationRefusal::BindingMismatch)?;
-        let witness = self.witnesses[at].borrow();
-        if witness.receipt() != target.bootstrap() {
-            return Err(BirthObservationRefusal::BindingMismatch);
-        }
+            .find_ready(target)
+            .ok_or(BirthObservationRefusal::BindingMismatch)?;
         let mut native = self
             .native
             .try_borrow_mut()
@@ -253,12 +433,12 @@ impl<N: JointNativeIo> FaultEpoch for NativeFault<'_, '_, N> {
 }
 
 #[allow(clippy::too_many_arguments)] // The immutable fields are disjoint original lane borrows.
-fn with_native<N: JointNativeIo, W: Borrow<RetainedBirthWitness>, R>(
+fn with_native<N: JointNativeIo, W: ReadyBirthLookup + ?Sized, R>(
     capture: &SemanticCapture,
     stash: &RefreshReceiptStash,
     producers: &SessionDrainProducers,
     attached: &AttachedSemanticSet,
-    witnesses: &[W],
+    witnesses: &W,
     native: &RefCell<&mut N>,
     inspect: impl for<'io> FnOnce(JointCommitIo<'io>) -> R,
 ) -> Result<R, SemanticRefusal> {
@@ -296,6 +476,22 @@ impl AttestedSemanticLane {
     pub(crate) fn with_joint_commit_io<W: Borrow<RetainedBirthWitness>, R>(
         &mut self,
         witnesses: &[W],
+        inspect: impl for<'io> FnOnce(JointCommitIo<'io>) -> R,
+    ) -> Result<R, SemanticRefusal> {
+        self.with_joint_native(witnesses, inspect)
+    }
+
+    pub(crate) fn with_joint_commit_io_for_births<R>(
+        &mut self,
+        witnesses: &RetainedJointBirths,
+        inspect: impl for<'io> FnOnce(JointCommitIo<'io>) -> R,
+    ) -> Result<R, SemanticRefusal> {
+        self.with_joint_native(witnesses, inspect)
+    }
+
+    fn with_joint_native<W: ReadyBirthLookup + ?Sized, R>(
+        &mut self,
+        witnesses: &W,
         inspect: impl for<'io> FnOnce(JointCommitIo<'io>) -> R,
     ) -> Result<R, SemanticRefusal> {
         let live = self.live.as_mut().ok_or(SemanticRefusal::Unavailable)?;
@@ -347,6 +543,22 @@ pub(crate) fn with_joint_commit_io_for_test<
     producers: &SessionDrainProducers,
     attached: &AttachedSemanticSet,
     witnesses: &[W],
+    native: &RefCell<&mut N>,
+    inspect: impl for<'io> FnOnce(JointCommitIo<'io>) -> R,
+) -> Result<R, SemanticRefusal> {
+    with_native(
+        capture, stash, producers, attached, witnesses, native, inspect,
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)] // Same disjoint borrows, now over the actual mixed original table.
+pub(crate) fn with_joint_commit_io_for_births_test<N: JointNativeIo, R>(
+    capture: &SemanticCapture,
+    stash: &RefreshReceiptStash,
+    producers: &SessionDrainProducers,
+    attached: &AttachedSemanticSet,
+    witnesses: &RetainedJointBirths,
     native: &RefCell<&mut N>,
     inspect: impl for<'io> FnOnce(JointCommitIo<'io>) -> R,
 ) -> Result<R, SemanticRefusal> {

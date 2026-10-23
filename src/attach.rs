@@ -2561,6 +2561,18 @@ pub(crate) fn seal_test_attachment(
     .expect("fixture attachment seals")
 }
 
+/// Closure-change fixture: consume the SAME retained envelope, rerun the
+/// normal successful test sealing/validate_with path, then mint its next
+/// generation. No pathname reopen or bare generation setter is involved.
+#[cfg(test)]
+pub(crate) fn reseal_test_attachment(
+    attached: AttachedSemanticSet,
+    pins: &crate::discovery::identity::PinnedObjects,
+) -> AttachedSemanticSet {
+    let AttachedSemanticSet { domain, subset, .. } = attached;
+    seal_test_attachment(subset, domain, pins)
+}
+
 fn semantic_receipt_readback(
     policy: CapturePolicy,
     descriptors: Result<Vec<SlotSemantics>>,

@@ -192,6 +192,74 @@ pub(crate) struct CommittedAbsenceBirth {
     cut: JournalBirthCut,
 }
 
+impl CommittedAbsenceBirth {
+    pub(crate) fn owned_storage_bytes(&self) -> Option<usize> {
+        self.watched.retained_copy_allocation_charge()
+    }
+
+    pub(crate) fn matches_binding_target(
+        &self,
+        binding: &crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding,
+        pins: &crate::discovery::identity::PinnedObjects,
+        object: PinnedObjectId,
+    ) -> bool {
+        self.proof.domain() == binding.domain()
+            && self.proof.image() == binding.image()
+            && Arc::ptr_eq(&self.pin, &binding.pin())
+            && self.watched.same_object_as(pins, object)
+    }
+
+    /// Select the original negative without classifying its freshness. A
+    /// stale fence/epoch/closure must reach finish_birth and fail permanently,
+    /// rather than silently falling back to a different birth kind.
+    pub(crate) fn matches_current(&self, current: &CurrentPartitionReceipt) -> bool {
+        current
+            .birth
+            .as_ref()
+            .is_some_and(|(capture, _, _)| *capture == self.capture)
+            && self.proof.domain() == current.domain
+            && self.proof.image() == current.image
+            && self.proof.file_slot() == current.endpoint.file_slot
+            && Arc::ptr_eq(&self.pin, &current.pin)
+            && Arc::ptr_eq(
+                &self.watched.retirement_lease(),
+                &current.watched.retirement_lease(),
+            )
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)] // Read the exact original subject; no scalar minting port.
+    pub(crate) fn matches_origin(
+        &self,
+        capture: &SemanticCapture,
+        producers: &crate::attach::SessionDrainProducers,
+        image: ImageIdentity,
+        pin: &Arc<PidPin>,
+        endpoint: Endpoint,
+        attached: &crate::attach::AttachedSemanticSet,
+        adapter: &JournalAdapter,
+    ) -> bool {
+        self.capture == capture.identity
+            && self.proof.domain() == capture.router.domain()
+            && self.proof.domain() == producers.native_domain()
+            && self.proof.image() == image
+            && self.proof.file_slot() == endpoint.file_slot
+            && Arc::ptr_eq(&self.pin, pin)
+            && capture
+                .bindings
+                .get(&image.task_cookie)
+                .is_some_and(|binding| {
+                    binding.current && binding.image == image && Arc::ptr_eq(&binding.pin, pin)
+                })
+            && self.proof.attach_generation() == attached.generation()
+            && attached.domain() == self.proof.domain()
+            && self.proof.fence() == capture.router.fence()
+            && self.watched.check_unchanged() == Ok(true)
+            && adapter.retains_producers(producers)
+            && adapter.quiet_sighting_at(image, &self.cut)
+    }
+}
+
 /// One-shot authorization minted only after the original H0 candidate, its
 /// admission and any required committed absence have been checked together.
 /// Native freshness observations cannot construct this subject-bound value.
@@ -235,6 +303,20 @@ impl RetainedBirthWitness {
 
     pub(crate) fn owned_storage_bytes(&self) -> Option<usize> {
         self.candidate.receipt.owned_storage_bytes()
+    }
+
+    pub(crate) fn matches_binding_target(
+        &self,
+        binding: &crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding,
+        pins: &crate::discovery::identity::PinnedObjects,
+        object: PinnedObjectId,
+    ) -> bool {
+        let current = &self.candidate.receipt;
+        current.domain == binding.domain()
+            && current.image == binding.image()
+            && Arc::ptr_eq(&current.pin, &binding.pin())
+            && current.endpoint.object == object
+            && current.watched.same_object_as(pins, object)
     }
 
     /// The original candidate and proof are private native-validated values.
@@ -1455,7 +1537,7 @@ impl SemanticCapture {
                     &candidate.receipt.watched.retirement_lease(),
                 )
                 || absence.proof.domain() != native
-                || absence.proof.image().task_cookie != image.task_cookie
+                || absence.proof.image() != image
                 || absence.proof.file_slot() != candidate.receipt.endpoint.file_slot
                 || absence.proof.attach_generation() != attachment.generation()
             {

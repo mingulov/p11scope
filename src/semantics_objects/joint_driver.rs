@@ -876,6 +876,19 @@ impl RawJointQuantum {
         Ok(())
     }
 
+    /// Inert pending-at-Q gate. It cannot accept an original until the actual
+    /// owner, ledger, frontier, delivery and Q bounds are checked together.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn validate_pending_finish(
+        &self,
+        _adapter: &JournalAdapter,
+        _producers: &SessionDrainProducers,
+        _discovery: &crate::events::DiscoveryDomain,
+        _q: &crate::attach::CollectedFinishQ,
+    ) -> Result<(), RawQuantumRefusal> {
+        Err(RawQuantumRefusal::H0Undelivered)
+    }
+
     /// Read-only routing hint for this actual empty original. Disposal and
     /// the later native/H3 audit still validate their own original custody;
     /// this cannot authorize a seal, release a claim or consume a terminal.

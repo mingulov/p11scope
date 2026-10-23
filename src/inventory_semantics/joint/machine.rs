@@ -4,7 +4,7 @@
 //! in Capture, prepared admissions, the canonical ledger and the real frame.
 
 use super::{JointCommitIo, RetainedJointBirths};
-use crate::attach::{BirthObservationRefusal, SessionDrainProducers};
+use crate::attach::{BirthObservationRefusal, CollectedFinishQ, SessionDrainProducers};
 use crate::discovery::caller_registry::OsProcessSource;
 use crate::discovery::caller_registry::instance_input::AdmittedInstanceCall;
 use crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding;
@@ -13,13 +13,13 @@ use crate::discovery::engine::inventory_coordinator::{
 };
 use crate::discovery::identity::PinnedObjectId;
 use crate::discovery::instances::{InstanceId, MAX_INSTANCES, MAX_PENDING};
-use crate::events::DispatchPoll;
+use crate::events::{DiscoveryDomain, DispatchPoll};
 use crate::inventory_semantics::{
     AttestedSemanticLane, LaneNegative, MAX_LANE_NEGATIVES, SemanticBatch, SemanticRefusal,
 };
 use crate::semantic_capture::{
     CommittedAbsenceBirth, CurrentPartitionReceipt, H0BirthCandidate, RetainedBirthWitness,
-    TickOutcome,
+    TickOutcome, TickReport,
 };
 use crate::semantics_edge::resources::{
     OWNED_ALLOCATION_PADDING, ResourceLease, SemanticResourceReserver,
@@ -97,6 +97,31 @@ pub(crate) trait JointMachineIo {
         bindings: &[SemanticCallerBinding],
         raw: &mut RawJointQuantum,
     ) -> Result<SemanticBatch, SemanticRefusal>;
+    /// Inert default: no unproved expiry/query allocation envelope is usable.
+    #[allow(dead_code)] // Compile-only pending-at-Q port; no service calls it yet.
+    fn pending_h0_at_q_storage_bytes(
+        &self,
+        _lane: &AttestedSemanticLane,
+        _raw: &RawJointQuantum,
+        _adapter: &JournalAdapter,
+        _q: &CollectedFinishQ,
+        _discovery: &DiscoveryDomain,
+    ) -> Result<usize, SemanticRefusal> {
+        Err(SemanticRefusal::ProviderStorage)
+    }
+    /// Inert default: keep original H0 ownership and the caller's output.
+    #[allow(dead_code)] // Compile-only pending-at-Q port; no service calls it yet.
+    fn resolve_pending_h0_at_q(
+        &mut self,
+        _lane: &mut AttestedSemanticLane,
+        _raw: &mut RawJointQuantum,
+        _adapter: &JournalAdapter,
+        _q: &CollectedFinishQ,
+        _discovery: &DiscoveryDomain,
+        _report: &mut TickReport,
+    ) -> Result<(), SemanticRefusal> {
+        Err(SemanticRefusal::Unavailable)
+    }
     fn prepare_publication(
         &mut self,
         lane: &mut AttestedSemanticLane,
@@ -429,6 +454,22 @@ impl LiveJointMachine {
         Ok(())
     }
 
+    /// Compile-only entry: genuine pending H0 remains Pending. In particular
+    /// this does not call expiry, reserve, construct a report or spend work.
+    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(clippy::too_many_arguments)] // Preserve disjoint original owners, Q and explicit work.
+    pub(crate) fn resolve_pending_h0_at_q_with_io<I: JointMachineIo>(
+        &mut self,
+        _lane: &mut AttestedSemanticLane,
+        _coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        _io: &mut I,
+        _q: &CollectedFinishQ,
+        _discovery: &DiscoveryDomain,
+        _budget: &mut JointWorkBudget,
+    ) -> Result<JointServiceProgress, SemanticRefusal> {
+        Ok(JointServiceProgress::Pending)
+    }
+
     pub(crate) fn poll_commit_with_io<I: JointMachineIo>(
         &mut self,
         lane: &mut AttestedSemanticLane,
@@ -505,6 +546,22 @@ impl LiveJointMachine {
         }
         Ok(())
     }
+
+    #[cfg(test)]
+    pub(crate) fn retained_drain_grant_for_test(&self) -> Option<&SessionDrainGrant> {
+        self.grant.as_ref()
+    }
+
+    /// No real pending-at-Q report exists in the inert implementation.
+    #[cfg(test)]
+    pub(crate) fn retained_pending_q_report_for_test(&self) -> Option<(&TickReport, usize)> {
+        None
+    }
+
+    /// Reserved receiver-only refusal hook. With no actual receiver yet it
+    /// has no state, success, expiry or publication effect.
+    #[cfg(test)]
+    pub(crate) fn reference_refuse_pending_q_merge_once(&mut self) {}
 
     #[cfg(test)]
     pub(crate) fn retained_raw_for_test(&self) -> Option<&RawJointQuantum> {

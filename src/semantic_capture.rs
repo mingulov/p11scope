@@ -1775,6 +1775,37 @@ impl SemanticCapture {
         quantum.validate_h0_cut(CollectedH0Owner(self.identity))
     }
 
+    /// Inert signature for the pending-at-Q allocation envelope. No size is
+    /// certified until original association and expiry temporaries are proved.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn pending_h0_at_q_storage_bytes(
+        &self,
+        _quantum: &crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+        _adapter: &crate::semantics_objects::journal::JournalAdapter,
+        _producers: &crate::attach::SessionDrainProducers,
+        _discovery: &crate::events::DiscoveryDomain,
+        _q: &crate::attach::CollectedFinishQ,
+    ) -> Result<usize, crate::semantics_objects::journal::joint_driver::RawQuantumRefusal> {
+        Err(crate::semantics_objects::journal::joint_driver::RawQuantumRefusal::H0Undelivered)
+    }
+
+    /// Inert refusal: neither expiry nor a disposition/report stamp occurs.
+    /// The caller keeps its original Raw and borrowed output unchanged.
+    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(clippy::too_many_arguments)] // Keep original owner, Q and caller-owned output explicit.
+    fn resolve_collected_pending_at_q_with(
+        &mut self,
+        _io: &mut impl CaptureIo,
+        _quantum: &mut crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+        _adapter: &crate::semantics_objects::journal::JournalAdapter,
+        _producers: &crate::attach::SessionDrainProducers,
+        _discovery: &crate::events::DiscoveryDomain,
+        _q: &crate::attach::CollectedFinishQ,
+        _report: &mut TickReport,
+    ) -> Result<(), crate::semantics_objects::journal::joint_driver::RawQuantumRefusal> {
+        Err(crate::semantics_objects::journal::joint_driver::RawQuantumRefusal::H0Undelivered)
+    }
+
     pub(crate) fn apply_physical_gaps_collected(
         &mut self,
         session: &mut Session,

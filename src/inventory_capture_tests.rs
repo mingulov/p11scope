@@ -5048,9 +5048,9 @@ mod publication_progress_tests {
                     }
                 }
                 let want = match case {
-                    0 => RetainedBlock::CollectedDispositionRequired,
-                    1 => RetainedBlock::ScopedCompletionDispositionRequired,
-                    _ => RetainedBlock::PublicationDispositionRequired,
+                    0 => RetainedBlock::Collected,
+                    1 => RetainedBlock::ScopedCompletion,
+                    _ => RetainedBlock::Publication,
                 };
                 assert_eq!(outcome.retained.as_ref().unwrap().block, Some(want));
                 let run = outcome.retained.as_ref().unwrap();
@@ -5139,10 +5139,7 @@ mod publication_progress_tests {
             assert_eq!(*phase, AppliedPassPhase::EmissionAttempted);
             assert_eq!(report.pending_refresh.as_ptr() as usize, driver.report_ptr);
             assert_eq!(run.completed_passes, 1);
-            assert_eq!(
-                run.block,
-                Some(RetainedBlock::PublicationDispositionRequired)
-            );
+            assert_eq!(run.block, Some(RetainedBlock::Publication));
             assert_eq!(
                 outcome.error.as_ref().unwrap().to_string(),
                 "partial pass output failed"
@@ -5307,10 +5304,7 @@ mod publication_progress_tests {
                         outcome = slice(&mut driver, outcome, now, 1);
                     }
                     let run = outcome.retained.as_ref().unwrap();
-                    assert_eq!(
-                        run.block,
-                        Some(RetainedBlock::PublicationDispositionRequired)
-                    );
+                    assert_eq!(run.block, Some(RetainedBlock::Publication));
                     assert!(matches!(run.native, Some(RetainedNative::Stopped(_))));
                     assert_eq!(
                         outcome.error.as_ref().unwrap().to_string(),
@@ -5438,10 +5432,7 @@ mod publication_progress_tests {
                         outcome.error.is_none(),
                         "best-effort diagnostic failure cannot change F9 status"
                     );
-                    assert_eq!(
-                        run.block,
-                        Some(RetainedBlock::PublicationDispositionRequired)
-                    );
+                    assert_eq!(run.block, Some(RetainedBlock::Publication));
                     assert_eq!(
                         run.terminal_callback_error.as_ref().unwrap().to_string(),
                         if failure_at == 1 {

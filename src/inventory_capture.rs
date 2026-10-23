@@ -2061,10 +2061,14 @@ pub(crate) struct RetainedWorkBudget {
 /// flag, retry or generic error conversion supplies that disposition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RetainedBlock {
-    CollectedDispositionRequired,
-    ScopedCompletionDispositionRequired,
-    PublicationDispositionRequired,
-    NativeDispositionRequired,
+    /// The original unapplied collection still needs its owned disposition.
+    Collected,
+    /// Scoped completion was attempted; preserve the same mutated report.
+    ScopedCompletion,
+    /// A commit or publisher callback failed; its attempt cannot be replayed.
+    Publication,
+    /// Native stop admission was refused; keep the original native phase.
+    Native,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2297,14 +2301,12 @@ where
                         },
                     }
                 }
-                Err(next) => {
-                    failure = Some((RetainedBlock::PublicationDispositionRequired, next, false))
-                }
+                Err(next) => failure = Some((RetainedBlock::Publication, next, false)),
             },
             RetainedPass::Collected { .. } => {
                 // Stop fenced apply. The real driver must dispose/reconcile
                 // this exact collection and its original cgroup context.
-                run.block = Some(RetainedBlock::CollectedDispositionRequired);
+                run.block = Some(RetainedBlock::Collected);
             }
             RetainedPass::Applied { report, phase } => match *phase {
                 AppliedPassPhase::FirstCommit => {
@@ -2317,10 +2319,7 @@ where
                         Ok(PassCommitProgress::Published) => {
                             *phase = AppliedPassPhase::FirstPublished
                         }
-                        Err(next) => {
-                            failure =
-                                Some((RetainedBlock::PublicationDispositionRequired, next, false))
-                        }
+                        Err(next) => failure = Some((RetainedBlock::Publication, next, false)),
                     }
                 }
                 AppliedPassPhase::FirstPublished => {
@@ -2330,11 +2329,7 @@ where
                             Ok(()) => *phase = AppliedPassPhase::ScopedFinished,
                             Err(next) => {
                                 *phase = AppliedPassPhase::ScopedCompletionFailed;
-                                failure = Some((
-                                    RetainedBlock::ScopedCompletionDispositionRequired,
-                                    next,
-                                    false,
-                                ));
+                                failure = Some((RetainedBlock::ScopedCompletion, next, false));
                             }
                         }
                     } else {
@@ -2355,10 +2350,7 @@ where
                             run.service = RetainedServiceCursor::HoldNative;
                         }
                         Ok(PassCommitProgress::Published) => *phase = AppliedPassPhase::ReadyToEmit,
-                        Err(next) => {
-                            failure =
-                                Some((RetainedBlock::PublicationDispositionRequired, next, false))
-                        }
+                        Err(next) => failure = Some((RetainedBlock::Publication, next, false)),
                     }
                 }
                 AppliedPassPhase::ReadyToEmit => {
@@ -2374,10 +2366,7 @@ where
                         },
                     ) {
                         Ok(()) => *phase = AppliedPassPhase::Emitted,
-                        Err(next) => {
-                            failure =
-                                Some((RetainedBlock::PublicationDispositionRequired, next, false))
-                        }
+                        Err(next) => failure = Some((RetainedBlock::Publication, next, false)),
                     }
                 }
                 AppliedPassPhase::Emitted => {
@@ -2387,12 +2376,12 @@ where
                 }
                 AppliedPassPhase::ScopedCompletionAttempted
                 | AppliedPassPhase::ScopedCompletionFailed => {
-                    run.block = Some(RetainedBlock::ScopedCompletionDispositionRequired);
+                    run.block = Some(RetainedBlock::ScopedCompletion);
                 }
                 AppliedPassPhase::FirstCommitAttempted
                 | AppliedPassPhase::ScopedReceiptsAttempted
                 | AppliedPassPhase::EmissionAttempted => {
-                    run.block = Some(RetainedBlock::PublicationDispositionRequired);
+                    run.block = Some(RetainedBlock::Publication);
                 }
             },
             RetainedPass::Terminal { phase } => match *phase {
@@ -2409,7 +2398,7 @@ where
                             "collection deadline"
                         }
                         None => {
-                            run.block = Some(RetainedBlock::PublicationDispositionRequired);
+                            run.block = Some(RetainedBlock::Publication);
                             continue;
                         }
                     };
@@ -2429,10 +2418,7 @@ where
                         Ok(PassCommitProgress::Published) => {
                             *phase = RetainedTerminalPhase::FailureGap
                         }
-                        Err(next) => {
-                            failure =
-                                Some((RetainedBlock::PublicationDispositionRequired, next, false))
-                        }
+                        Err(next) => failure = Some((RetainedBlock::Publication, next, false)),
                     }
                 }
                 RetainedTerminalPhase::FailureGap => {
@@ -2470,13 +2456,7 @@ where
                         *phase = RetainedTerminalPhase::RetiringAttempted;
                         match publish(driver, point) {
                             Ok(()) => *phase = RetainedTerminalPhase::NativeStop,
-                            Err(next) => {
-                                failure = Some((
-                                    RetainedBlock::PublicationDispositionRequired,
-                                    next,
-                                    false,
-                                ))
-                            }
+                            Err(next) => failure = Some((RetainedBlock::Publication, next, false)),
                         }
                     } else if run.native.is_some() {
                         *phase = RetainedTerminalPhase::NativeStop;
@@ -2501,14 +2481,14 @@ where
                             NativeStopDisposition::CancelledUnscoped
                         } else {
                             run.native = Some(RetainedNative::Live(lane));
-                            run.block = Some(RetainedBlock::NativeDispositionRequired);
+                            run.block = Some(RetainedBlock::Native);
                             continue;
                         };
                         match lane.into_finite_stop::<Pin>(disposition, run.control.as_ref()) {
                             Ok(stop) => run.native = Some(RetainedNative::Stopping(stop)),
                             Err(lane) => {
                                 run.native = Some(RetainedNative::Live(lane));
-                                run.block = Some(RetainedBlock::NativeDispositionRequired);
+                                run.block = Some(RetainedBlock::Native);
                             }
                         }
                     }
@@ -2549,11 +2529,7 @@ where
                             };
                         }
                         Err(next) => {
-                            failure = Some((
-                                RetainedBlock::PublicationDispositionRequired,
-                                next,
-                                best_effort,
-                            ))
+                            failure = Some((RetainedBlock::Publication, next, best_effort))
                         }
                     }
                 }
@@ -2573,11 +2549,7 @@ where
                     ) {
                         Ok(()) => *phase = RetainedTerminalPhase::Complete,
                         Err(next) => {
-                            failure = Some((
-                                RetainedBlock::PublicationDispositionRequired,
-                                next,
-                                best_effort,
-                            ))
+                            failure = Some((RetainedBlock::Publication, next, best_effort))
                         }
                     }
                 }
@@ -2585,7 +2557,7 @@ where
                 | RetainedTerminalPhase::RetiringAttempted
                 | RetainedTerminalPhase::FinalCommitAttempted
                 | RetainedTerminalPhase::EmitStopAttempted => {
-                    run.block = Some(RetainedBlock::PublicationDispositionRequired);
+                    run.block = Some(RetainedBlock::Publication);
                 }
                 RetainedTerminalPhase::Complete => {
                     // A malformed terminal phase still cannot drop an active
@@ -2595,7 +2567,7 @@ where
                         .as_ref()
                         .is_some_and(|native| !matches!(native, RetainedNative::Stopped(_)))
                     {
-                        run.block = Some(RetainedBlock::NativeDispositionRequired);
+                        run.block = Some(RetainedBlock::Native);
                     } else {
                         finalized = true;
                     }
@@ -2794,7 +2766,7 @@ where
                             return Ok(());
                         }
                         Err(error) => {
-                            retained_block = Some(RetainedBlock::PublicationDispositionRequired);
+                            retained_block = Some(RetainedBlock::Publication);
                             retained_pass = Some((RetainedPass::BeforeCollection, control));
                             return Err(error);
                         }
@@ -2888,7 +2860,7 @@ where
                             return Ok(());
                         }
                         Err(error) => {
-                            retained_block = Some(RetainedBlock::PublicationDispositionRequired);
+                            retained_block = Some(RetainedBlock::Publication);
                             retained_pass = Some((
                                 RetainedPass::Collected {
                                     collected,
@@ -2961,7 +2933,7 @@ where
                         return Ok(());
                     }
                     Err(error) => {
-                        retained_block = Some(RetainedBlock::PublicationDispositionRequired);
+                        retained_block = Some(RetainedBlock::Publication);
                         retained_pass = Some((
                             RetainedPass::Applied {
                                 report,
@@ -2979,7 +2951,7 @@ where
                     // Record that once-only boundary explicitly and return
                     // the same owner; never retry it or enter legacy stop.
                     if let Err(error) = driver.finish_pass(&mut report) {
-                        retained_block = Some(RetainedBlock::ScopedCompletionDispositionRequired);
+                        retained_block = Some(RetainedBlock::ScopedCompletion);
                         retained_pass = Some((
                             RetainedPass::Applied {
                                 report,
@@ -3019,7 +2991,7 @@ where
                             return Ok(());
                         }
                         Err(error) => {
-                            retained_block = Some(RetainedBlock::PublicationDispositionRequired);
+                            retained_block = Some(RetainedBlock::Publication);
                             retained_pass = Some((
                                 RetainedPass::Applied {
                                     report,
@@ -3077,8 +3049,7 @@ where
                                 return Ok(());
                             }
                             Err(error) => {
-                                retained_block =
-                                    Some(RetainedBlock::PublicationDispositionRequired);
+                                retained_block = Some(RetainedBlock::Publication);
                                 retained_pass = Some((RetainedPass::BeforeCollection, control));
                                 return Err(error);
                             }
@@ -3133,8 +3104,7 @@ where
                                 return Ok(());
                             }
                             Err(error) => {
-                                retained_block =
-                                    Some(RetainedBlock::PublicationDispositionRequired);
+                                retained_block = Some(RetainedBlock::Publication);
                                 retained_pass = Some((RetainedPass::BeforeCollection, control));
                                 return Err(error);
                             }
@@ -3167,14 +3137,12 @@ where
             error,
             zero_pass: None,
             retained: Some(RetainedClassicRun {
-                block: retained_block.or_else(|| match &pass {
-                    RetainedPass::Collected { .. } => {
-                        Some(RetainedBlock::CollectedDispositionRequired)
-                    }
+                block: retained_block.or(match &pass {
+                    RetainedPass::Collected { .. } => Some(RetainedBlock::Collected),
                     RetainedPass::Applied {
                         phase: AppliedPassPhase::ScopedCompletionFailed,
                         ..
-                    } => Some(RetainedBlock::ScopedCompletionDispositionRequired),
+                    } => Some(RetainedBlock::ScopedCompletion),
                     _ => None,
                 }),
                 pass,

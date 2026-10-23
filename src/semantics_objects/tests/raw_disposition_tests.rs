@@ -117,6 +117,11 @@ fn joint_raw_disposal_refunds_only_owned_roles() {
     assert_eq!(disposed.reason(), RawDisposeReason::NoAdmission);
     assert!(disposed.failure().is_some());
     assert!(disposed.identity() == identity);
+    let prepaid = disposed.prepaid_bytes();
+    assert!(
+        prepaid > 0,
+        "the original negative and following audit remain paid"
+    );
     let disposed_frontier = disposed.frontier();
     assert!(disposed_frontier == owner.adapter.consumed_frontier());
     assert_eq!(disposed.validate_owner(owner.adapter(), &retained), Ok(()));
@@ -126,8 +131,8 @@ fn joint_raw_disposal_refunds_only_owned_roles() {
     assert!(owner.ledger().h8_reservation(100).is_some());
     assert_eq!(
         pool.snapshot().charged_bytes,
-        before - RawJointQuantum::storage_bytes(8) - OWNED_ALLOCATION_PADDING,
-        "physical raw buffers and only their owned zero-byte raw membership refund"
+        before - RawJointQuantum::storage_bytes(8) - OWNED_ALLOCATION_PADDING + prepaid,
+        "physical raw buffers refund while the original negative/audit allowance stays paid"
     );
     let _ = other
         .dispose_without_ingest(&mut owner, &retained, RawDisposeReason::Capacity)
@@ -145,8 +150,13 @@ fn joint_raw_disposal_refunds_only_owned_roles() {
     owner.ledger_mut().release_keyassoc(association);
     assert_eq!(owner.ledger().census(), 0);
     assert_eq!(owner.ledger().charged_bytes(), 0);
-    assert_eq!(pool.snapshot().charged_bytes, table_baseline);
+    assert_eq!(pool.snapshot().charged_bytes, table_baseline + prepaid);
     drop(disposed);
+    assert_eq!(
+        pool.snapshot().charged_bytes,
+        table_baseline,
+        "only dropping the actual negative owner refunds its full allowance"
+    );
     drop(owner);
     assert_eq!(pool.snapshot().charged_bytes, baseline);
 }

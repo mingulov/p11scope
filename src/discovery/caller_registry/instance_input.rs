@@ -715,9 +715,6 @@ impl AdmittedInstance {
 
 #[cfg(test)]
 impl AdmittedInstanceCall {
-    pub(crate) fn provider_module(&self) -> &ModuleKey {
-        &self.key.module
-    }
     #[cfg(test)]
     pub(crate) fn instance_key_for_test(&self) -> InstanceKey {
         self.key.clone()
@@ -927,6 +924,11 @@ impl fmt::Debug for AdmittedInstanceCall {
 }
 
 impl AdmittedInstanceCall {
+    /// Borrow the provider identity already proved by this exact admission.
+    pub(crate) fn provider_module(&self) -> &ModuleKey {
+        &self.key.module
+    }
+
     /// Nested allocations owned by the original admission, beyond its inline
     /// Vec entry. Shared pins/origins add no copied allocation here.
     pub(crate) fn owned_storage_bytes(&self) -> Option<usize> {

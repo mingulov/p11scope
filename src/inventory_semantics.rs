@@ -14,8 +14,8 @@ pub(crate) use joint::{
 };
 #[cfg(test)]
 pub(crate) use joint::{
-    JointMachineIo, JointNativeIo, LiveJointMachine, RetainedJointBirth,
-    bind_collected_semantic_callers, with_joint_commit_io_for_test,
+    JointMachineIo, JointNativeIo, LiveJointMachine, bind_collected_semantic_callers,
+    with_joint_commit_io_for_test,
 };
 
 use crate::attach::capture::NativeDomainId;

@@ -400,6 +400,18 @@ impl crate::inventory_semantics::JointMachineIo for HeldMachineIo<'_> {
             })
             .collect();
         let target = io.watched[endpoint.file_slot as usize].object_key();
+        let dev = libc::makedev(
+            target
+                .device
+                .major
+                .try_into()
+                .map_err(|_| BirthObservationRefusal::CurrentPartition)?,
+            target
+                .device
+                .minor
+                .try_into()
+                .map_err(|_| BirthObservationRefusal::CurrentPartition)?,
+        );
         let proof = crate::attach::image_query::acquire_test_absence(
             io.script.domain,
             binding.image(),
@@ -415,12 +427,12 @@ impl crate::inventory_semantics::JointMachineIo for HeldMachineIo<'_> {
             self.attached.generation(),
             vec![target],
             crate::discovery::instances::MappedFileIdentity {
-                dev: libc::makedev(target.device.major, target.device.minor),
+                dev,
                 ino: target.inode,
             },
             |_, _| {
                 Ok(crate::discovery::instances::MappedFileIdentity {
-                    dev: libc::makedev(target.device.major, target.device.minor),
+                    dev,
                     ino: target.inode,
                 })
             },
@@ -1059,9 +1071,7 @@ fn joint_machine_absence_selects_exact_subject_with_mixed_ready_and_pending() {
     )
     .unwrap();
     let foreign_session = MachineScene::with_initial_files(2, &[0], true);
-    let foreign_pin = Arc::new(
-        crate::process::PidPin::open(crate::process::ProcessViewId(0), std::process::id()).unwrap(),
-    );
+    let foreign_pin = Arc::new(crate::process::PidPin::open(std::process::id()).unwrap());
     {
         let held = fixture.scene.real.h0.0.borrow();
         let negative = fixture.pending_absence(1).unwrap();

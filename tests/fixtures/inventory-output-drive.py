@@ -5,7 +5,7 @@
 Native mode requires P11SCOPE_INVENTORY_OUTPUT_WORKLOAD pointing to coordinator
 JSON {pid, modules: [paths], ledger: path, gate: optional path}. The coordinator
 owns that native workload and lane; this driver owns only its observer/fds.
-Scan mode uses an observer-child catalog workload, then subreaps it after exit.
+Scan mode observes its actual child catalog PID, then subreaps it after exit.
 All watchdogs fail; permanently stopped outputs resume only in final cleanup.
 Reader timestamps are reader times, never claimed as accepted-write times.
 """
@@ -58,7 +58,8 @@ def launcher(spec_path):
     os.execv(argv[0], argv)
 
 
-def fixtures(root, large):
+def build_fixtures(root):
+    root.mkdir(mode=0o700)
     source = Path(__file__).resolve().parents[2]
     driver = root / "catalog-driver"
     provider = root / "provider.so"
@@ -70,6 +71,11 @@ def fixtures(root, large):
     ]:
         result = subprocess.run(command, capture_output=True, timeout=30)
         assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
+
+
+def fixtures(root, large):
+    inputs = root.parent / "fixture-inputs"
+    driver, provider = inputs / "catalog-driver", inputs / "provider.so"
     modules = []
     for i in range(96 if large else 1):
         path = root / f"provider-{i:03d}.so"
@@ -175,7 +181,7 @@ def run_cell(args, root, label, *, json_output=True, first_signal=None,
         os.set_blocking(read_fd, False)
         os.set_blocking(err_read, False)
         duration = "120s" if first_signal is not None else "3s"
-        scope = ["--system", "--max-scan-pids", "4096"] if args.capture == "scan" else ["--pid", "TARGET_PID"]
+        scope = ["--pid", "TARGET_PID"]
         argv = [args.binary, "inventory", *scope, "--capture", args.capture, "--duration", duration]
         if not without_report:
             argv.extend(["-o", str(report), "--event-log", str(events)])
@@ -515,6 +521,10 @@ def main():
             cells = [("progress", {"first_signal": signal.SIGINT, "baseline": 1, "large": True})]
         elif args.case == "large-slow":
             cells = [("slow", {"large": True})]
+        if args.capture == "scan":
+            # Inputs belong only to this invocation. Each cell still gets
+            # provider copies with independent physical module identities.
+            build_fixtures(args.evidence_dir / "fixture-inputs")
         for label, options in cells:
             result["cells"].append(run_cell(args, args.evidence_dir / label, label, **options))
         assert all(c["cleanup"].get("observer_reaped") and c["cleanup"].get("descriptors_closed")

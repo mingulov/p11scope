@@ -4,11 +4,14 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
 import runpy
 import subprocess
+import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -61,6 +64,7 @@ class InventoryOutputReadinessTest(unittest.TestCase):
                 self.returncode = None
                 self.poll_count = 0
                 spec = json.loads(Path(command[-1]).read_text(encoding="utf-8"))
+                state["launch_spec"] = Path(command[-1])
                 Path(spec["target_receipt"]).write_text(
                     json.dumps({"pid": target_pid}), encoding="utf-8"
                 )
@@ -128,7 +132,94 @@ class InventoryOutputReadinessTest(unittest.TestCase):
                                   if pid == target_pid and flags == os.WNOHANG
                                   else self.fail(f"unexpected waitpid({pid}, {flags})")):
             cell = DRIVER["run_cell"](args, cell_root, "controlled")
+        self.last_launch_spec = state["launch_spec"]
         return cell
+
+    def run_fixture_main(self, *, capture="scan", compiler_fails=False):
+        temporary = tempfile.TemporaryDirectory(prefix="inventory-output-fixtures-")
+        self.addCleanup(temporary.cleanup)
+        base = Path(temporary.name)
+        evidence = base / "evidence"
+        binary = base / "observer"
+        binary.write_bytes(b"controlled observer")
+        compiler_commands, observed, providers, drivers = [], [], [], []
+
+        def compiler(command, **_kwargs):
+            self.assertEqual(capture, "scan", "native cells must never invoke a compiler")
+            self.assertEqual(command[0], "gcc")
+            compiler_commands.append(command)
+            if compiler_fails:
+                return SimpleNamespace(returncode=1, stderr=b"controlled compiler refusal")
+            output = Path(command[command.index("-o") + 1])
+            output.write_bytes(b"compiled provider" if "-shared" in command else b"compiled driver")
+            return SimpleNamespace(returncode=0, stderr=b"")
+
+        def observer_cell(args, root, label, **options):
+            observed.append(label)
+            if capture == "scan":
+                root.mkdir(mode=0o700)
+                driver, modules = DRIVER["fixtures"](root, options.get("large", False))
+                drivers.append(driver)
+                providers.extend(Path(module) for module in modules)
+            return {"cleanup": {"observer_reaped": True, "descriptors_closed": True,
+                                "target_reaped": True}}
+
+        with mock.patch.dict(RUN_CELL_GLOBALS, {
+            "subprocess": SimpleNamespace(run=compiler), "run_cell": observer_cell,
+        }), mock.patch.object(sys, "argv", [
+            "inventory-output-drive.py", "--binary", str(binary), "--capture", capture,
+            "--case", "pipe-stall", "--evidence-dir", str(evidence),
+        ]), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            status = DRIVER["main"]()
+        receipt = json.loads((evidence / "control.json").read_text(encoding="utf-8"))
+        return status, receipt, compiler_commands, observed, drivers, providers
+
+    def test_scan_json_and_text_cells_build_once_with_distinct_equal_provider_copies(self):
+        status, receipt, commands, observed, drivers, providers = self.run_fixture_main()
+        self.assertEqual(status, 0, receipt)
+        self.assertEqual(observed, ["json", "text"])
+        self.assertEqual(len(commands), 2, "one driver and provider build per invocation")
+        self.assertEqual(len(providers), 2)
+        self.assertEqual([path.read_bytes() for path in providers], [b"compiled provider"] * 2)
+        identities = {(path.stat().st_dev, path.stat().st_ino) for path in providers}
+        self.assertEqual(len(identities), 2, "equal bytes must not alias physical modules")
+        self.assertEqual(len(set(drivers)), 1, "both cells reuse the same compiled driver")
+        template = Path(commands[1][commands[1].index("-o") + 1])
+        self.assertNotIn((template.stat().st_dev, template.stat().st_ino), identities)
+
+    def test_scan_compile_failure_precedes_every_observer_cell(self):
+        status, receipt, commands, observed, _drivers, _providers = self.run_fixture_main(
+            compiler_fails=True,
+        )
+        self.assertEqual(status, 1)
+        self.assertFalse(receipt["success"])
+        self.assertIn("controlled compiler refusal", receipt["error"])
+        self.assertEqual(len(commands), 1)
+        self.assertEqual(observed, [], "a failed build must not start an observer cell")
+        self.assertEqual(receipt["cells"], [])
+
+    def test_native_main_never_enters_the_compiler(self):
+        status, receipt, commands, observed, drivers, providers = self.run_fixture_main(
+            capture="native",
+        )
+        self.assertEqual(status, 0, receipt)
+        self.assertEqual(observed, ["json", "text"])
+        self.assertEqual(commands, [])
+        self.assertEqual(drivers, [])
+        self.assertEqual(providers, [])
+
+    def test_scan_launcher_executes_the_ready_owned_pid_scope(self):
+        self.run_controlled_cell(case="signal-baseline", payload=self.healthy_payload())
+        target = SimpleNamespace(pid=42001, poll=lambda: None)
+        with mock.patch.dict(RUN_CELL_GLOBALS, {
+            "subprocess": SimpleNamespace(Popen=lambda *_args, **_kwargs: target,
+                                          DEVNULL=subprocess.DEVNULL),
+        }), mock.patch.object(os, "execv") as execute:
+            DRIVER["launcher"](self.last_launch_spec)
+        binary, argv = execute.call_args.args
+        self.assertEqual(binary, "/fixture/p11scope")
+        self.assertEqual(argv[:4], [binary, "inventory", "--pid", "42001"])
+        self.assertNotIn("--system", argv)
 
     def healthy_payload(self, progress=True):
         return json.dumps({

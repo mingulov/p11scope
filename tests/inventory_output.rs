@@ -1,6 +1,8 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! Actual scan command controls; installed native cells use the same driver.
 
+use std::collections::BTreeSet;
+use std::os::unix::fs::MetadataExt as _;
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 
@@ -48,6 +50,77 @@ fn control_mode(case: &str, without_report: bool) {
             .as_array()
             .is_some_and(|cells| !cells.is_empty())
     );
+    let mut provider_ids = BTreeSet::new();
+    for cell in receipt["cells"].as_array().unwrap() {
+        let root = evidence.join(cell["label"].as_str().unwrap());
+        let target: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("target.json")).unwrap()).unwrap();
+        let pid = target["pid"].as_u64().unwrap();
+        let providers: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "so"))
+            .collect();
+        assert_eq!(
+            providers.len(),
+            if matches!(case, "large-slow" | "signal-progress") {
+                96
+            } else {
+                1
+            },
+            "each cell has its complete owned provider inputs"
+        );
+        for provider in &providers {
+            let metadata = std::fs::metadata(provider).unwrap();
+            assert!(
+                provider_ids.insert((metadata.dev(), metadata.ino())),
+                "provider copies must retain distinct physical identities across cells"
+            );
+        }
+        if without_report && cell["exit"] != 0 {
+            continue; // A refused partial stdout document cannot supply scope evidence.
+        }
+        let document: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(root.join(if without_report {
+                "stdout.bin"
+            } else {
+                "report.json"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(document["scope"], format!("pid:{pid}"));
+        // Immediate capture cancellation can correctly commit an empty report.
+        // The staged signal-progress cell and natural captures retain positives.
+        if case == "signal-baseline" || case == "signal-stall" && cell["label"] == "baseline-one" {
+            continue;
+        }
+        let caller = document["callers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|caller| caller["pid"] == pid)
+            .expect("the actual owned workload was observed");
+        for provider in &providers {
+            let module = document["modules"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|module| {
+                    module["paths"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|path| path.as_str() == Some(provider.to_str().unwrap()))
+                })
+                .expect("an actual owned provider was observed");
+            assert!(document["edges"].as_array().unwrap().iter().any(|edge| {
+                edge["caller"] == caller["id"]
+                    && edge["module"] == module["id"]
+                    && edge["mapping"]["state"] == "mapped"
+            }));
+        }
+    }
     println!(
         "inventory-output-control {case}: evidence={}, {receipt}",
         evidence.display()

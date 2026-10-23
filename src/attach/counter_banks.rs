@@ -4310,7 +4310,7 @@ pub(crate) mod tests {
         let bytes = b"same owned provider bytes, distinct opened kernel files";
         std::fs::write(&first_path, bytes).unwrap();
         std::fs::write(&second_path, bytes).unwrap();
-        let digest = format!("{:x}", sha2::Sha256::digest(bytes));
+        let digest = p11scope_manifest::identity::hex(&sha2::Sha256::digest(bytes));
         let mut pins = real_scan_pin(&first_path, None, 1, &digest);
         let first_id = pins.pinned().next().unwrap().id;
         assert!(

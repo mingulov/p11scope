@@ -1392,6 +1392,14 @@ pub(crate) fn collect_cgroup_off_thread(
     })
 }
 
+/// Whether the same owned publication reached its actual boundary.
+#[cfg_attr(not(test), allow(dead_code))] // Pending is enabled by B1's explicit driver port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PassCommitProgress {
+    Pending,
+    Published,
+}
+
 /// The classic loop's pass side: one pass's collection, its application at
 /// `now`, and the batch commit.
 pub(crate) trait PassDriver<Pin> {
@@ -1411,6 +1419,18 @@ pub(crate) trait PassDriver<Pin> {
         now_ns: u64,
     ) -> Result<PassReport>;
     fn commit(&mut self, engine_changed: bool) -> Result<()>;
+    /// Poll the same publication. Only its first call carries the applied
+    /// engine change; every retry passes false and resumes original ownership.
+    /// If a service hook completed it, acknowledge that same publication;
+    /// do not prepare or publish another phase in its place.
+    fn poll_commit(&mut self, engine_changed: bool) -> Result<PassCommitProgress> {
+        self.commit(engine_changed)?;
+        Ok(PassCommitProgress::Published)
+    }
+    /// An earlier owned publication fences the next collected pass's apply.
+    fn publication_pending(&self) -> bool {
+        false
+    }
     /// Consume a scoped completion after its real registry publication.
     fn finish_pass(&mut self, _report: &mut PassReport) -> Result<()> {
         Ok(())
@@ -1423,6 +1443,12 @@ pub(crate) trait PassDriver<Pin> {
     /// interactive dashboard draws here). It must return within a small
     /// bound: it shares the tick.
     fn on_tick(&mut self) {}
+    /// Gate new work promptly when an owned publication leaves the loop.
+    /// This hook must only latch the stop: no terminal I/O, new drain,
+    /// publication, owner extraction or blocking disposal. The caller keeps
+    /// this driver/coordinator beside the returned retained run. The loop
+    /// owns the separate once-only host stop gate, including an F9 latch.
+    fn on_publication_suspended(&mut self) {}
     /// The pass loop ended (stop, deadline, cancellation or error) and
     /// the lane is about to retire: gate promptly anything the stop
     /// must fence before the (possibly slow) retirement runs. Called
@@ -1587,8 +1613,10 @@ pub(crate) enum Publish<'a> {
 /// passes, like a cancelled scoped startup), service ticks between them,
 /// and — for the native lane — the bounded stop and its commit. The final
 /// sinks are the caller's.
-/// The loop outcome keeps stopped native ownership even when capture or
-/// publication failed, so terminal sinks precede an unsettled blocking drop.
+/// A finalized outcome keeps stopped native ownership through final sinks.
+/// An unfinished publication instead returns its original live owners;
+/// callers must match completion before extracting or dropping the driver.
+#[must_use = "match the completion while retaining the original driver and coordinator"]
 pub(crate) struct ClassicOutcome<L> {
     pub(crate) stopped: Option<Stopped<L>>,
     pub(crate) error: Option<anyhow::Error>,
@@ -1596,24 +1624,194 @@ pub(crate) struct ClassicOutcome<L> {
     /// stop/deadline (not error): the finalizer emits one stderr line
     /// from it beside the staged scope gap.
     pub(crate) zero_pass: Option<ZeroPassStop>,
+    /// A publication could not complete in the running loop. No terminal
+    /// drain/commit has run; the original driver/coordinator remains required.
+    pub(crate) retained: Option<RetainedClassicRun<L>>,
+}
+
+/// These states record once-only work, never inferred from a readiness flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AppliedPassPhase {
+    FirstCommit,
+    /// The first commit published and finish_pass was called exactly once.
+    /// It mutated this report before failing; do not invoke it again.
+    ScopedCompletionFailed,
+    /// Scoped completion and the after-cgroup hook (or its stop skip) have
+    /// already run once. Only the original second publication may resume.
+    ScopedReceipts,
+}
+
+#[cfg_attr(not(test), allow(dead_code))] // B1 consumes the owned outcome before activation.
+pub(crate) enum RetainedPass {
+    Collected {
+        collected: CollectedPass,
+        scan_now_ns: u64,
+    },
+    Applied {
+        report: PassReport,
+        phase: AppliedPassPhase,
+    },
+}
+
+/// One existing pass and native lane, with the loop's original stop
+/// accounting. This is not a second work queue or a terminal receipt.
+#[cfg_attr(not(test), allow(dead_code))] // Default synchronous drivers never retain a run.
+pub(crate) struct RetainedClassicRun<L> {
+    pub(crate) pass: RetainedPass,
+    pub(crate) lane: Option<NativeLane<L>>,
+    pub(crate) control: Option<CollectionControl>,
+    pub(crate) completed_passes: u64,
+    pub(crate) discarded_collections: u64,
+    pub(crate) elapsed: Duration,
+    pub(crate) stop_cause: Option<ZeroPassCause>,
+    pub(crate) host_stopped: bool,
+}
+
+#[cfg_attr(not(test), allow(dead_code))] // Actual callers must adopt this before enabling Pending.
+pub(crate) enum ClassicCompletion<L> {
+    Finalized {
+        stopped: Option<Stopped<L>>,
+        error: Option<anyhow::Error>,
+        zero_pass: Option<ZeroPassStop>,
+    },
+    Retained {
+        run: RetainedClassicRun<L>,
+        error: Option<anyhow::Error>,
+    },
+}
+
+impl<L> ClassicOutcome<L> {
+    /// A retained result must stay beside its original driver/coordinator.
+    /// Reject malformed mixed outcomes without dropping either owner.
+    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(clippy::result_large_err)] // Returning the original owners is the failure contract.
+    pub(crate) fn into_completion(self) -> std::result::Result<ClassicCompletion<L>, Self> {
+        if self.retained.is_some() && (self.stopped.is_some() || self.zero_pass.is_some()) {
+            return Err(self);
+        }
+        Ok(match self.retained {
+            Some(run) => ClassicCompletion::Retained {
+                run,
+                error: self.error,
+            },
+            None => ClassicCompletion::Finalized {
+                stopped: self.stopped,
+                error: self.error,
+                zero_pass: self.zero_pass,
+            },
+        })
+    }
+}
+
+impl<L> std::fmt::Debug for ClassicOutcome<L> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClassicOutcome")
+            .field("stopped", &self.stopped.is_some())
+            .field("retained", &self.retained.is_some())
+            .field("error", &self.error)
+            .field("zero_pass", &self.zero_pass)
+            .finish()
+    }
 }
 
 /// Compatibility adapter for existing scripted successful-loop controls.
 #[cfg(test)]
+#[allow(clippy::result_large_err)] // A failed adapter must return the complete original owners.
 pub(crate) fn run_classic<Pin, D, L>(
     driver: &mut D,
     lane: Option<NativeLane<L>>,
     clock: &LoopClock<'_>,
     publish: &mut dyn FnMut(&mut D, Publish<'_>) -> Result<()>,
-) -> Result<Option<Stopped<L>>>
+) -> std::result::Result<Option<Stopped<L>>, ClassicOutcome<L>>
 where
     D: PassDriver<Pin>,
     L: CaptureLane<Pin>,
 {
     let outcome = run_classic_finalizing(driver, lane, clock, None, publish);
-    match outcome.error {
-        Some(error) => Err(error),
-        None => Ok(outcome.stopped),
+    if outcome.error.is_some() || outcome.retained.is_some() {
+        Err(outcome)
+    } else {
+        Ok(outcome.stopped)
+    }
+}
+
+enum PublicationWait {
+    Published,
+    Stopped(ZeroPassCause),
+}
+
+fn publication_stop_cause(
+    control: Option<&CollectionControl>,
+    clock: &LoopClock<'_>,
+) -> Option<ZeroPassCause> {
+    if let Some(cause) = clock.stop_cause() {
+        if cause == ZeroPassCause::OperatorStop
+            && let Some(control) = control
+        {
+            control.cancel();
+        }
+        return Some(cause);
+    }
+    control.and_then(|control| match control.check() {
+        Err(crate::scope::inventory_cgroup::CollectionStop::OperatorStop) => {
+            Some(ZeroPassCause::OperatorStop)
+        }
+        Err(crate::scope::inventory_cgroup::CollectionStop::Deadline) => {
+            Some(ZeroPassCause::Deadline)
+        }
+        Ok(()) => None,
+    })
+}
+
+/// Pending work services the same owner but holds new native quanta under
+/// the collection bounds. It cannot stage fresh inputs into an unfinished
+/// revision. The next ordinary hook or terminal owner stages them once.
+fn wait_for_publication<Pin, D, L>(
+    driver: &mut D,
+    lane: &mut Option<NativeLane<L>>,
+    clock: &LoopClock<'_>,
+    control: Option<&CollectionControl>,
+    mut engine_changed: bool,
+    check_before_first_poll: bool,
+) -> Result<PublicationWait>
+where
+    D: PassDriver<Pin>,
+    L: CaptureLane<Pin>,
+{
+    if check_before_first_poll && let Some(cause) = publication_stop_cause(control, clock) {
+        return Ok(PublicationWait::Stopped(cause));
+    }
+    let mut schedule = TickSchedule::starting(Instant::now(), clock.tick);
+    loop {
+        match driver.poll_commit(engine_changed)? {
+            PassCommitProgress::Published => return Ok(PublicationWait::Published),
+            PassCommitProgress::Pending => engine_changed = false,
+        }
+        if let Some(cause) = publication_stop_cause(control, clock) {
+            return Ok(PublicationWait::Stopped(cause));
+        }
+        std::thread::sleep(schedule.wait(Instant::now()));
+        if let Some(cause) = publication_stop_cause(control, clock) {
+            return Ok(PublicationWait::Stopped(cause));
+        }
+        if let Some(lane) = lane.as_mut() {
+            lane.collecting_tick();
+        }
+        if let Some(cause) = publication_stop_cause(control, clock) {
+            return Ok(PublicationWait::Stopped(cause));
+        }
+        driver.on_native_service(
+            lane.as_mut()
+                .map(|lane| &mut lane.capture as &mut dyn CaptureLane<Pin>),
+        );
+        if let Some(cause) = publication_stop_cause(control, clock) {
+            return Ok(PublicationWait::Stopped(cause));
+        }
+        driver.on_tick();
+        if let Some(cause) = publication_stop_cause(control, clock) {
+            return Ok(PublicationWait::Stopped(cause));
+        }
+        schedule.advance(Instant::now());
     }
 }
 
@@ -1638,6 +1836,7 @@ where
     let mut stop_cause: Option<ZeroPassCause> = None;
     let mut discarded_collections: u64 = 0;
     let loop_start = Instant::now();
+    let mut retained_pass: Option<(RetainedPass, Option<CollectionControl>)> = None;
     let running = match initial_error {
         Some(error) => Err(error),
         None => (|| -> Result<()> {
@@ -1707,6 +1906,42 @@ where
                 if let Some(control) = &control {
                     latch_collection_stop(control, clock);
                 }
+                // A tick may have started a publication during collection.
+                // Keep this exact returned value before apply/native hooks;
+                // cancellation cannot turn its original pins into a discard.
+                if driver.publication_pending() {
+                    match wait_for_publication(
+                        driver,
+                        &mut lane,
+                        clock,
+                        control.as_ref(),
+                        false,
+                        true,
+                    ) {
+                        Ok(PublicationWait::Published) => {}
+                        Ok(PublicationWait::Stopped(cause)) => {
+                            stop_cause.get_or_insert(cause);
+                            retained_pass = Some((
+                                RetainedPass::Collected {
+                                    collected,
+                                    scan_now_ns: now,
+                                },
+                                control,
+                            ));
+                            return Ok(());
+                        }
+                        Err(error) => {
+                            retained_pass = Some((
+                                RetainedPass::Collected {
+                                    collected,
+                                    scan_now_ns: now,
+                                },
+                                control,
+                            ));
+                            return Err(error);
+                        }
+                    }
+                }
                 if control.is_none()
                     && let Some(cause) = clock.stop_cause()
                 {
@@ -1747,10 +1982,54 @@ where
                 if let Some(control) = &control {
                     latch_collection_stop(control, clock);
                 }
-                driver.commit(report.engine_changed)?;
-                if let Some(control) = &control {
-                    driver.finish_pass(&mut report)?;
-                    if !latch_collection_stop(control, clock)
+                match wait_for_publication(
+                    driver,
+                    &mut lane,
+                    clock,
+                    control.as_ref(),
+                    report.engine_changed,
+                    false,
+                ) {
+                    Ok(PublicationWait::Published) => {}
+                    Ok(PublicationWait::Stopped(cause)) => {
+                        stop_cause.get_or_insert(cause);
+                        retained_pass = Some((
+                            RetainedPass::Applied {
+                                report,
+                                phase: AppliedPassPhase::FirstCommit,
+                            },
+                            control,
+                        ));
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        retained_pass = Some((
+                            RetainedPass::Applied {
+                                report,
+                                phase: AppliedPassPhase::FirstCommit,
+                            },
+                            control,
+                        ));
+                        return Err(error);
+                    }
+                }
+                if let Some(scoped_control) = &control {
+                    // First publication is complete, independent of any
+                    // readiness flag. A failing completion may already have
+                    // moved cgroup ownership and mutated the original report.
+                    // Record that once-only boundary explicitly and return
+                    // the same owner; never retry it or enter legacy stop.
+                    if let Err(error) = driver.finish_pass(&mut report) {
+                        retained_pass = Some((
+                            RetainedPass::Applied {
+                                report,
+                                phase: AppliedPassPhase::ScopedCompletionFailed,
+                            },
+                            control,
+                        ));
+                        return Err(error);
+                    }
+                    if !latch_collection_stop(scoped_control, clock)
                         && let Some(lane) = lane.as_mut()
                     {
                         report
@@ -1759,7 +2038,37 @@ where
                     }
                     // No pending scoped transaction remains here. This commits
                     // delayed receipt/native facts without rerunning collection.
-                    driver.commit(false)?;
+                    match wait_for_publication(
+                        driver,
+                        &mut lane,
+                        clock,
+                        control.as_ref(),
+                        false,
+                        false,
+                    ) {
+                        Ok(PublicationWait::Published) => {}
+                        Ok(PublicationWait::Stopped(cause)) => {
+                            stop_cause.get_or_insert(cause);
+                            retained_pass = Some((
+                                RetainedPass::Applied {
+                                    report,
+                                    phase: AppliedPassPhase::ScopedReceipts,
+                                },
+                                control,
+                            ));
+                            return Ok(());
+                        }
+                        Err(error) => {
+                            retained_pass = Some((
+                                RetainedPass::Applied {
+                                    report,
+                                    phase: AppliedPassPhase::ScopedReceipts,
+                                },
+                                control,
+                            ));
+                            return Err(error);
+                        }
+                    }
                 }
                 passes += 1;
                 // Publication time is sampled AFTER collection, refresh, and
@@ -1832,6 +2141,31 @@ where
         })(),
     };
     let mut error = running.err();
+    if let Some((pass, control)) = retained_pass {
+        // Gate only. The old on_stop_requested callback starts terminal I/O,
+        // and stop_after_error performs a fresh drain/commit. Neither can
+        // consume this unfinished pass. The caller must keep its SAME
+        // driver/coordinator with every original owner returned here.
+        driver.on_publication_suspended();
+        if !stop_latched {
+            driver.host().stop_coordinator();
+        }
+        return ClassicOutcome {
+            stopped: None,
+            error,
+            zero_pass: None,
+            retained: Some(RetainedClassicRun {
+                pass,
+                lane,
+                control,
+                completed_passes: passes,
+                discarded_collections,
+                elapsed: loop_start.elapsed(),
+                stop_cause,
+                host_stopped: true,
+            }),
+        };
+    }
     if let Some(error) = &error {
         driver
             .host()
@@ -1916,6 +2250,7 @@ where
             stopped: None,
             error,
             zero_pass,
+            retained: None,
         };
     };
     if let Err(next) = publish(
@@ -1964,6 +2299,7 @@ where
         stopped: Some(stopped),
         error,
         zero_pass,
+        retained: None,
     }
 }
 

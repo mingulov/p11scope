@@ -4094,6 +4094,10 @@ mod publication_progress_tests {
             self.finishes += 1;
             assert_eq!(report.pending_refresh.as_ptr() as usize, self.report_ptr);
             report.scan_callers = 73;
+            report.events.push(CallerEvent::Exited {
+                id: self.scene.caller(PID),
+                reason: "controlled scoped completion".into(),
+            });
             if self.fail_finish {
                 anyhow::bail!("completion failed after mutating the original report");
             }
@@ -4145,6 +4149,13 @@ mod publication_progress_tests {
                         report.scan_callers, 73,
                         "emit the completed original report"
                     );
+                    assert_eq!(
+                        report.events.iter().filter(|event| matches!(event,
+                            CallerEvent::Exited { reason, .. } if reason == "controlled scoped completion"
+                        )).count(),
+                        1,
+                        "emit the scoped completion event once"
+                    );
                 }
                 driver.scene.note("emit");
                 driver.emissions += 1;
@@ -4170,6 +4181,15 @@ mod publication_progress_tests {
             (driver.scene.scans, driver.applies, driver.emissions),
             (1, 1, 1)
         );
+        let ClassicCompletion::Finalized {
+            stopped,
+            error,
+            zero_pass,
+        } = outcome.into_completion().unwrap()
+        else {
+            panic!("the completed original run must finalize");
+        };
+        assert!(stopped.is_some() && error.is_none() && zero_pass.is_none());
         assert_eq!(driver.changes, [false, false, driver.report_changed]);
         assert_eq!(driver.ticks, 1);
         let log = entries(&log);
@@ -4217,6 +4237,12 @@ mod publication_progress_tests {
         let finish = log.iter().position(|line| line == "finish").unwrap();
         let extend = log.iter().position(|line| line == "extend[0,1]").unwrap();
         let emit = log.iter().position(|line| line == "emit").unwrap();
+        assert_eq!(
+            log.iter()
+                .filter(|line| line.starts_with("extend["))
+                .count(),
+            2
+        );
         assert!(
             published[0] < finish
                 && finish < extend
@@ -4324,6 +4350,12 @@ mod publication_progress_tests {
     fn pending_poll_failure_returns_original_collection_or_report() {
         for (before_apply, scoped, polls, phase) in [
             (true, false, vec![Poll::Fail], None),
+            (
+                false,
+                false,
+                vec![Poll::Fail],
+                Some(AppliedPassPhase::FirstCommit),
+            ),
             (
                 false,
                 false,
@@ -4436,6 +4468,16 @@ mod publication_progress_tests {
         };
         assert_eq!(*phase, AppliedPassPhase::ScopedCompletionFailed);
         assert_eq!(report.scan_callers, 73);
+        assert_eq!(
+            report
+                .events
+                .iter()
+                .filter(|event| matches!(event,
+                    CallerEvent::Exited { reason, .. } if reason == "controlled scoped completion"
+                ))
+                .count(),
+            1
+        );
         assert_eq!(
             outcome.error.as_ref().unwrap().to_string(),
             "completion failed after mutating the original report"

@@ -418,7 +418,16 @@ fn drive<L: CaptureLane<PidPin>>(
             }
             Ok(())
         },
-    )?;
+    )
+    .map_err(|outcome| {
+        assert!(
+            outcome.retained.is_none(),
+            "this semantic:None test driver is synchronous: {outcome:?}"
+        );
+        outcome
+            .error
+            .expect("a synchronous loop failure has its error")
+    })?;
     stopped.context("a native run stops its lane")
 }
 
@@ -2564,7 +2573,16 @@ fn privileged_native_lane_sigint_during_extend_lp64() -> Result<()> {
         collection_tick: SERVICE_TICK,
     };
     let began = Instant::now();
-    let stopped = run_classic(&mut driver, Some(lane), &clock, &mut |_, _| Ok(()))?
+    let stopped = run_classic(&mut driver, Some(lane), &clock, &mut |_, _| Ok(()))
+        .map_err(|outcome| {
+            assert!(
+                outcome.retained.is_none(),
+                "this semantic:None test driver is synchronous: {outcome:?}"
+            );
+            outcome
+                .error
+                .expect("a synchronous loop failure has its error")
+        })?
         .context("a native run stops its lane")?;
     // The run is over: end the driver's coordinator borrow before the
     // direct coordinator reads below (its Drop would extend it).

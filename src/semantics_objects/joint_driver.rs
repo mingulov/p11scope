@@ -31,6 +31,17 @@ static NEXT_RAW_QUANTUM: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RawQuantumIdentity(u64);
 
+/// Identity only, retained from an actual collected allocation. It cannot
+/// ingest, claim, create evidence or dispose any history.
+#[derive(Clone, Copy)]
+pub(crate) struct CollectedLedgerBinding(LedgerGeneration);
+
+impl CollectedLedgerBinding {
+    pub(crate) fn matches_owner(&self, owner: &JointCaptureOwner) -> bool {
+        owner.ledger().generation() == Some(self.0)
+    }
+}
+
 /// Original raw allocation and wire position, stamped only by the actual H0
 /// allocator. Equal scalar positions from another raw allocation are foreign.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -254,6 +265,7 @@ type ResourceContext<'a> = (
 struct RawCuts {
     start: crate::events::EventsConsumptionCut,
     end: Option<crate::events::EventsConsumptionCut>,
+    poll: Option<crate::events::DispatchPoll>,
     birth: super::JournalBirthCut,
 }
 
@@ -527,6 +539,37 @@ impl RawJointQuantum {
         reserve: impl FnOnce(usize) -> Result<ResourceLease, SemanticResourceRefusal>,
         adapter: &mut JournalAdapter,
     ) -> Result<Self, RawQuantumRefusal> {
+        Self::begin_bounded_with_adapter(
+            drain,
+            descriptors,
+            limit,
+            limit.min(1_024),
+            stop,
+            fault,
+            producers,
+            reserve,
+            adapter,
+        )
+        .map(|(raw, _)| raw)
+    }
+
+    /// Allocate the complete original independently from its first work slice.
+    /// None means no cursor poll occurred, never an observed-empty proof.
+    #[allow(clippy::too_many_arguments)] // Same owner/cursor inputs plus independent capacity and work.
+    pub(crate) fn begin_bounded_with_adapter<S: BoundedRecordSource>(
+        drain: &mut EventDrain<S>,
+        descriptors: &[ObjectDescriptorWire; MAX_DESCRIPTORS as usize],
+        capacity: usize,
+        initial_work: usize,
+        stop: Option<usize>,
+        fault: &impl FaultEpoch,
+        producers: &SessionDrainProducers,
+        reserve: impl FnOnce(usize) -> Result<ResourceLease, SemanticResourceRefusal>,
+        adapter: &mut JournalAdapter,
+    ) -> Result<(Self, Option<crate::events::DispatchPoll>), RawQuantumRefusal> {
+        if initial_work > 1_024 {
+            return Err(RawQuantumRefusal::InvalidLimit);
+        }
         let start = drain.consumption_cut().map_err(RawQuantumRefusal::Cursor)?;
         if !producers.matches_events(start.events()) || !adapter.bind_resource_producers(producers)
         {
@@ -542,29 +585,32 @@ impl RawJointQuantum {
         let mut raw = Self::collect_inner(
             drain,
             descriptors,
-            limit,
+            capacity,
             fault,
             producers,
             reserve,
             Some((&mut adapter.ledger, &adapter.open, producers)),
             0,
         )?;
-        raw.poll_slice_using(
-            drain,
-            descriptors,
-            limit.min(1_024),
-            fault,
-            Some((&mut adapter.ledger, &adapter.open, producers)),
-            |drain, rows, work, ordinary, journal| {
-                Self::read_bounded_slice(drain, rows, work, stop, ordinary, journal)
-            },
-        );
+        let poll = (initial_work != 0).then(|| {
+            raw.poll_slice_using(
+                drain,
+                descriptors,
+                initial_work.min(capacity),
+                fault,
+                Some((&mut adapter.ledger, &adapter.open, producers)),
+                |drain, rows, work, ordinary, journal| {
+                    Self::read_bounded_slice(drain, rows, work, stop, ordinary, journal)
+                },
+            )
+        });
         raw.cuts = Some(RawCuts {
             start,
-            end: drain.consumption_cut().ok(),
+            end: poll.and_then(|_| drain.consumption_cut().ok()),
+            poll,
             birth,
         });
-        Ok(raw)
+        Ok((raw, poll))
     }
 
     fn read_bounded_slice<S: BoundedRecordSource>(
@@ -616,7 +662,10 @@ impl RawJointQuantum {
         if !self
             .cuts
             .as_ref()
-            .and_then(|cuts| cuts.end.as_ref())
+            .and_then(|cuts| match cuts.poll {
+                None => Some(&cuts.start),
+                Some(_) => cuts.end.as_ref(),
+            })
             .is_some_and(|end| end.same_boundary(&current))
             || !producers.matches_events(current.events())
             || !self.matches_producers(producers)
@@ -653,7 +702,9 @@ impl RawJointQuantum {
                 Self::read_bounded_slice(drain, rows, work, stop, ordinary, journal)
             },
         );
-        self.cuts.as_mut().expect("checked original cuts").end = drain.consumption_cut().ok();
+        let cuts = self.cuts.as_mut().expect("checked original cuts");
+        cuts.end = drain.consumption_cut().ok();
+        cuts.poll = Some(poll);
         Ok(poll)
     }
 
@@ -706,7 +757,11 @@ impl RawJointQuantum {
         if adapter.stopped || adapter.invalidated {
             return Err(RawQuantumRefusal::Stopped);
         }
-        if !self.h0_reported || !self.ordinary.is_empty() || self.h0_pending {
+        if !self.h0_reported
+            || !self.ordinary.is_empty()
+            || self.h0_pending
+            || self.cuts.as_ref().is_some_and(|cuts| cuts.poll.is_none())
+        {
             return Err(RawQuantumRefusal::H0Undelivered);
         }
         Ok(())
@@ -987,6 +1042,12 @@ impl RawJointQuantum {
     /// clearing their delivery buffer without releasing its capacity.
     pub(crate) fn h0_identity(&self) -> RawQuantumIdentity {
         self.identity
+    }
+
+    /// Missing original ledger custody remains a refusal; no generation is
+    /// reconstructed from scalar native/EVENTS words or another allocation.
+    pub(crate) fn ledger_binding(&self) -> Option<CollectedLedgerBinding> {
+        self.ledger_generation.map(CollectedLedgerBinding)
     }
 
     #[cfg(test)]
@@ -1419,6 +1480,7 @@ impl RawJointQuantum {
         if !self.ordinary.is_empty()
             || (!self.h0_origins.is_empty() && !self.h0_reported)
             || (self.h0_pending && reason == RawDisposeReason::NoAdmission)
+            || self.cuts.as_ref().is_some_and(|cuts| cuts.poll.is_none())
         {
             return Err((self, RawQuantumRefusal::H0Undelivered));
         }

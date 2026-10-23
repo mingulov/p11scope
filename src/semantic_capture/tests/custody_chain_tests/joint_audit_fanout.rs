@@ -161,6 +161,17 @@ fn joint_machine_zero_initial_work_never_observes_empty() {
         raw.validate_preparation(adapter, &scene.producers),
         Err(RawQuantumRefusal::H0Undelivered)
     );
+    {
+        let mut owned = scene.real.h0.0.borrow_mut();
+        let HeldH0 { capture, io, .. } = &mut *owned;
+        let empty_report = capture.tick_collected_with(io, &mut raw).unwrap();
+        assert_eq!(empty_report.calls().count(), 0);
+        assert_eq!(
+            raw.validate_preparation(adapter, &scene.producers),
+            Err(RawQuantumRefusal::H0Undelivered),
+            "an H0 report cannot turn an unpolled Raw into an observed cut"
+        );
+    }
     let identity = raw.h0_identity();
     let poll = raw
         .continue_bounded_with_adapter(
@@ -204,10 +215,6 @@ impl crate::inventory_semantics::JointMachineIo for HeldMachineIo<'_> {
     fn producers(&self) -> &SessionDrainProducers {
         self.producers
     }
-    fn attachment(&self) -> &crate::attach::AttachedSemanticSet {
-        self.attached
-    }
-
     fn collect_raw(
         &mut self,
         _lane: &mut AttestedSemanticLane,
@@ -721,13 +728,25 @@ fn joint_machine_pending_a_allows_q2_real_end() {
         fixture.prime(2);
         let before = fixture.reduced();
         let (a, b) = if reverse { (1, 0) } else { (0, 1) };
-        let (begin_a, end_a) = fixture
-            .scene
-            .encoded(std::process::id(), a, "C_SignInit", 3);
-        let (begin_b, end_b) = fixture
-            .scene
-            .encoded(std::process::id(), b, "C_SignInit", 4);
-        for bytes in [begin_a.to_vec(), begin_b.to_vec(), end_b.to_vec()] {
+        let (a_sequence, b_sequence) = if reverse { (4, 3) } else { (3, 4) };
+        let (begin_a, end_a) =
+            fixture
+                .scene
+                .encoded(std::process::id(), a, "C_SignInit", a_sequence);
+        let (begin_b, end_b) =
+            fixture
+                .scene
+                .encoded(std::process::id(), b, "C_SignInit", b_sequence);
+        let begins = if reverse {
+            [begin_b, begin_a]
+        } else {
+            [begin_a, begin_b]
+        };
+        for bytes in begins
+            .into_iter()
+            .map(|bytes| bytes.to_vec())
+            .chain([end_b.to_vec()])
+        {
             fixture.scene.drain.source_mut().push_record(bytes);
         }
         fixture.published();
@@ -738,7 +757,7 @@ fn joint_machine_pending_a_allows_q2_real_end() {
         );
         let native_a = (
             ((u64::from(std::process::id())) << 32) | u64::from(std::process::id()),
-            3,
+            a_sequence,
         );
         assert_eq!(
             fixture
@@ -763,6 +782,30 @@ fn joint_machine_pending_a_allows_q2_real_end() {
                 .roles_for_test()[1]
                 > 0
         );
+        let coordinator = &fixture.scene.real.scene.coordinator;
+        let claims = coordinator
+            .joint_capture()
+            .adapter()
+            .invocation_claims_for_test();
+        let roles = coordinator.joint_capture().ledger().roles_for_test();
+        let h3 = coordinator.reference_h3_audit_state();
+        let revision = coordinator.registry().published_revision();
+        assert_eq!(claims.0, 1);
+        assert_eq!((roles[0], roles[1], roles[3]), (0, 2, 1));
+        for _ in 0..3 {
+            fixture.service(1).unwrap();
+            let coordinator = &fixture.scene.real.scene.coordinator;
+            assert_eq!(
+                coordinator
+                    .joint_capture()
+                    .adapter()
+                    .invocation_claims_for_test(),
+                claims
+            );
+            assert_eq!(coordinator.joint_capture().ledger().roles_for_test(), roles);
+            assert_eq!(coordinator.reference_h3_audit_state(), h3);
+            assert_eq!(coordinator.registry().published_revision(), revision);
+        }
         fixture.scene.drain.source_mut().push_record(end_a.to_vec());
         fixture.published();
         assert_eq!(
@@ -929,6 +972,42 @@ fn joint_machine_request_ack_tracks_actual_preparation_and_attempted_error() {
         // requester's acknowledgement or allow a new request to replace it.
         fixture.published();
         assert!(fixture.machine.begin_commit(false).is_err());
+        let mut foreign = InventoryCoordinator::new(
+            Scope::System,
+            HookRegistry::builtin(),
+            Vec::new(),
+            OsProcessSource,
+            RegistryLimits::default_limits(),
+        )
+        .unwrap();
+        let foreign_revision = foreign.registry().published_revision();
+        let native_reads = fixture.native.reads.get();
+        {
+            let MachineScene {
+                scene,
+                machine,
+                native,
+            } = &mut fixture;
+            let mut io = HeldMachineIo {
+                drain: &mut scene.drain,
+                h0: &scene.real.h0,
+                producers: &scene.producers,
+                attached: scene.attached.as_ref().unwrap(),
+                native,
+            };
+            let mut budget = crate::inventory_semantics::JointWorkBudget {
+                remaining_actions: 0,
+                deadline: Instant::now() + Duration::from_secs(1),
+            };
+            assert!(
+                machine
+                    .poll_commit_with_io(&mut scene.real.lane, &mut foreign, &mut io, &mut budget)
+                    .is_err(),
+                "same producer words do not bind another canonical ledger to the pending acknowledgement"
+            );
+        }
+        assert_eq!(foreign.registry().published_revision(), foreign_revision);
+        assert_eq!(fixture.native.reads.get(), native_reads);
         let JointCommitProgress::Published(completion) = fixture.poll_commit(0).unwrap() else {
             panic!("service must retain the actual receipt until the requester consumes it");
         };

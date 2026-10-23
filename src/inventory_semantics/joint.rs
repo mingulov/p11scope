@@ -18,6 +18,12 @@ use crate::semantics_objects::journal::{FaultEpoch, FaultReadError, SessionBirth
 use std::borrow::Borrow;
 use std::cell::RefCell;
 
+mod machine;
+pub(crate) use machine::{
+    JointCommitRefusal, JointMachineIo, JointServiceMode, JointServiceProgress, JointWorkBudget,
+    LiveJointMachine,
+};
+
 /// One original witness and its transferred nested-allocation charge. The
 /// existing native source borrows this same table through Borrow, not a copy.
 pub(crate) struct RetainedJointBirth {
@@ -133,12 +139,18 @@ impl JointContinuationView<'_> {
 /// Stack-only readers plus immutable continuation custody. Native readers
 /// share one Session cell; neither can retain a borrow across callbacks.
 pub(crate) struct JointCommitIo<'a> {
+    attachment: &'a AttachedSemanticSet,
     continuation: JointContinuationView<'a>,
     births: &'a mut dyn JointBirthEvidenceSource,
     fault: &'a dyn FaultEpoch,
 }
 
 impl<'a> JointCommitIo<'a> {
+    /// The original attachment already borrowed by these same native readers.
+    pub(crate) fn attachment(&self) -> &'a AttachedSemanticSet {
+        self.attachment
+    }
+
     pub(crate) fn continuation(&self) -> &JointContinuationView<'a> {
         &self.continuation
     }
@@ -262,6 +274,7 @@ fn with_native<N: JointNativeIo, W: Borrow<RetainedBirthWitness>, R>(
     };
     let fault = NativeFault(native);
     Ok(inspect(JointCommitIo {
+        attachment: attached,
         continuation: JointContinuationView {
             pending: PendingH3Continuation {
                 capture,
@@ -339,4 +352,69 @@ pub(crate) fn with_joint_commit_io_for_test<
     with_native(
         capture, stash, producers, attached, witnesses, native, inspect,
     )
+}
+
+// One authority loop for the legacy caller and the inactive collected machine.
+#[allow(dead_code)] // The collected runtime calls this path after its AwaitH0 state lands.
+pub(crate) fn bind_collected_semantic_callers(
+    coordinator: &mut super::InventoryCoordinator<super::OsProcessSource>,
+    lane: &mut AttestedSemanticLane,
+    raw: &mut crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+    producers: &crate::attach::SessionDrainProducers,
+) -> Result<(), crate::semantics_objects::journal::joint_driver::RawQuantumRefusal> {
+    // No refresh selector/cursor or admission write precedes this preflight.
+    raw.validate_refresh(coordinator.joint_capture().adapter(), producers)?;
+    bind_semantic_callers_inner(coordinator, lane, Some((raw, producers)));
+    Ok(())
+}
+
+pub(crate) fn bind_semantic_callers_inner(
+    coordinator: &mut super::InventoryCoordinator<super::OsProcessSource>,
+    lane: &mut AttestedSemanticLane,
+    mut collected: Option<(
+        &mut crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+        &crate::attach::SessionDrainProducers,
+    )>,
+) {
+    if !lane.is_live() || lane.is_finished() {
+        return;
+    }
+    for attempt in coordinator.semantic_refresh_attempts(lane, None, |_| true) {
+        let Some(module) = attempt.module else {
+            coordinator.semantic_admission_refused(attempt.caller, "provider_mapping_unproven");
+            continue;
+        };
+        let Some(candidate) =
+            coordinator.prepare_legacy_semantic_candidate(attempt.caller, lane.domain())
+        else {
+            coordinator.semantic_admission_refused(attempt.caller, "caller_custody_unproven");
+            continue;
+        };
+        let prepared = match collected.as_mut() {
+            Some((raw, producers)) => lane.prepare_caller_admission_collected(
+                candidate.pin(),
+                attempt.slot,
+                &module,
+                raw,
+                coordinator.joint_capture().adapter(),
+                producers,
+                |bytes| coordinator.registry().reserve_semantic_storage(bytes),
+            ),
+            None => {
+                lane.prepare_caller_admission(candidate.pin(), attempt.slot, &module, |bytes| {
+                    coordinator.registry().reserve_semantic_storage(bytes)
+                })
+            }
+        };
+        match prepared {
+            Ok(prepared) => {
+                let (receipt, _) =
+                    coordinator.consume_semantic_admission(candidate, prepared, None);
+                lane.deliver_admission_receipt(receipt);
+            }
+            Err(reason) => {
+                coordinator.semantic_admission_refused(attempt.caller, &reason.to_string())
+            }
+        }
+    }
 }

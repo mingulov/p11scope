@@ -1,0 +1,1348 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
+//! Inactive, single-owner service of the actual collected Joint pipeline.
+//! This module retains originals and scheduling positions; all authority stays
+//! in Capture, prepared admissions, the canonical ledger and the real frame.
+
+use super::{JointCommitIo, RetainedJointBirth, RetainedJointBirths};
+use crate::attach::{BirthObservationRefusal, SessionDrainProducers};
+use crate::discovery::caller_registry::OsProcessSource;
+use crate::discovery::caller_registry::instance_input::AdmittedInstanceCall;
+use crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding;
+use crate::discovery::engine::inventory_coordinator::{
+    BatchReceipt, InventoryCoordinator, JointCommitProgress,
+};
+use crate::discovery::instances::{InstanceId, MAX_INSTANCES, MAX_PENDING};
+use crate::events::DispatchPoll;
+use crate::inventory_semantics::{
+    AttestedSemanticLane, LaneNegative, MAX_LANE_NEGATIVES, SemanticBatch, SemanticRefusal,
+};
+use crate::semantic_capture::{
+    CurrentPartitionReceipt, H0BirthCandidate, RetainedBirthWitness, TickOutcome,
+};
+use crate::semantics_edge::resources::{
+    OWNED_ALLOCATION_PADDING, ResourceLease, SemanticResourceReserver,
+};
+use crate::semantics_objects::journal::joint_audit::IngestedJointQuantum;
+use crate::semantics_objects::journal::joint_driver::{
+    CollectedLedgerBinding, IngestedRaw, RawDisposeReason, RawDisposition, RawJointQuantum,
+    RawQuantumIdentity, RawQuantumRefusal,
+};
+use crate::semantics_objects::journal::{
+    EndpointClass, FaultEpoch, FaultReadError, JournalAdapter, JournalDomainProof,
+    SessionClosureGrant, SessionDrainGrant,
+};
+use std::time::Instant;
+
+const RAW_CAPACITY: usize = 4_096;
+// The actual shared binder selects at most four caller/provider pairs. Its
+// no-call receipts join the same original H0 report, never a second stage.
+const REFRESHES_PER_BIND: usize = 4;
+
+pub(crate) struct JointWorkBudget {
+    pub(crate) remaining_actions: usize,
+    pub(crate) deadline: Instant,
+}
+impl JointWorkBudget {
+    fn available(&self) -> bool {
+        self.remaining_actions != 0 && Instant::now() < self.deadline
+    }
+    fn spend(&mut self, actions: usize) {
+        self.remaining_actions = self.remaining_actions.saturating_sub(actions);
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum JointServiceMode {
+    Running,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JointServiceProgress {
+    Pending,
+    Published,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JointCommitRefusal {
+    NotInitialized,
+    OutstandingRequest,
+    DispositionRequired,
+}
+
+/// The real Session implementation below and the genuine H0 fixture replace
+/// only native/cursor leaves. No method supplies a prepared call, H3, audit,
+/// seal, receipt or publication-completion word.
+pub(crate) trait JointMachineIo {
+    fn producers(&self) -> &SessionDrainProducers;
+    fn collect_raw(
+        &mut self,
+        lane: &mut AttestedSemanticLane,
+        adapter: &mut JournalAdapter,
+        reserve: &SemanticResourceReserver,
+        capacity: usize,
+        work: usize,
+    ) -> Result<(RawJointQuantum, Option<DispatchPoll>), RawQuantumRefusal>;
+    fn continue_raw(
+        &mut self,
+        lane: &mut AttestedSemanticLane,
+        raw: &mut RawJointQuantum,
+        adapter: &mut JournalAdapter,
+        work: usize,
+    ) -> Result<DispatchPoll, RawQuantumRefusal>;
+    fn tick_collected(
+        &mut self,
+        lane: &mut AttestedSemanticLane,
+        bindings: &[SemanticCallerBinding],
+        raw: &mut RawJointQuantum,
+    ) -> Result<SemanticBatch, SemanticRefusal>;
+    fn prepare_publication(
+        &mut self,
+        lane: &mut AttestedSemanticLane,
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        raw: &mut RawJointQuantum,
+        engine_changed: bool,
+    ) -> anyhow::Result<()>;
+    fn consume_birth(
+        &mut self,
+        lane: &mut AttestedSemanticLane,
+        candidate: H0BirthCandidate,
+        input: &AdmittedInstanceCall,
+        binding: &SemanticCallerBinding,
+        proof: &JournalDomainProof,
+        adapter: &JournalAdapter,
+    ) -> Result<RetainedBirthWitness, BirthObservationRefusal>;
+    fn with_native<R>(
+        &mut self,
+        lane: &mut AttestedSemanticLane,
+        witnesses: &[RetainedJointBirth],
+        inspect: impl for<'io> FnOnce(JointCommitIo<'io>) -> R,
+    ) -> Result<R, SemanticRefusal>;
+}
+
+enum Demand {
+    Requested {
+        engine_changed: bool,
+    },
+    Bound {
+        original: RawQuantumIdentity,
+        base_revision: u64,
+    },
+    Published(BatchReceipt),
+}
+
+enum RunState {
+    Runnable,
+    // Blocks callbacks; it grants no disposal or replay permission. The
+    // original phase and the coordinator's completion context remain owned.
+    DispositionRequired(SemanticRefusal),
+}
+
+struct Collected {
+    raw: RawJointQuantum,
+    attempted: usize,
+    poll: DispatchPoll,
+    reports: Option<CollectedReports>,
+}
+
+#[allow(clippy::large_enum_variant)] // The complete bounded original stays inline in the paid machine.
+enum Phase {
+    Idle,
+    Collecting(Collected),
+    Binding(Collected),
+    AwaitH0(Collected),
+    Preparing(Collected),
+    PreparationAttempted(Collected),
+    PreparingAdmissions(Collected),
+    BindingKeys {
+        original: Collected,
+        cursor: usize,
+    },
+    Ingesting(Collected),
+    StagingNegative(Collected),
+    Claiming {
+        original: IngestedRaw,
+        identity: RawQuantumIdentity,
+        base: u64,
+    },
+    InstallingClosure {
+        original: IngestedRaw,
+        identity: RawQuantumIdentity,
+        base: u64,
+    },
+    Births {
+        original: IngestedRaw,
+        identity: RawQuantumIdentity,
+        base: u64,
+    },
+    Staging {
+        original: IngestedRaw,
+        identity: RawQuantumIdentity,
+        base: u64,
+    },
+    Auditing {
+        original: IngestedRaw,
+        identity: RawQuantumIdentity,
+        base: u64,
+    },
+    Negative {
+        original: RawDisposition,
+        identity: RawQuantumIdentity,
+        base: u64,
+    },
+    Audited {
+        frame: Option<IngestedJointQuantum>,
+        identity: RawQuantumIdentity,
+        base: u64,
+    },
+}
+
+/// One paid accumulator for the original collection's H0 reports. Incoming
+/// reports move here before another retry. The extra inline slot preserves an
+/// unmerged original on a bounds refusal; it is not another staging queue.
+struct CollectedReports {
+    batch: Option<SemanticBatch>,
+    refused: Option<SemanticBatch>,
+    receipt_limit: usize,
+    nested_per_receipt: usize,
+    _storage: ResourceLease,
+}
+
+fn array_bytes<T>(capacity: usize) -> Option<usize> {
+    capacity
+        .checked_mul(size_of::<T>())?
+        .checked_add(if capacity == 0 {
+            0
+        } else {
+            OWNED_ALLOCATION_PADDING
+        })
+}
+
+impl CollectedReports {
+    fn new(
+        lane: &AttestedSemanticLane,
+        inputs: usize,
+        reserve: &SemanticResourceReserver,
+    ) -> Result<Self, SemanticRefusal> {
+        let receipt_limit = inputs
+            .checked_add(REFRESHES_PER_BIND)
+            .ok_or(SemanticRefusal::ProviderStorage)?;
+        let allocation_limit = receipt_limit
+            .checked_next_power_of_two()
+            .ok_or(SemanticRefusal::ProviderStorage)?;
+        let mut watched_bound = 0;
+        for object in lane.subset().required().keys() {
+            let watched = lane
+                .subset()
+                .pins()
+                .retain_inventory_target(*object)
+                .map_err(|_| SemanticRefusal::ProviderStorage)?;
+            watched_bound = watched_bound.max(
+                watched
+                    .retained_copy_allocation_charge()
+                    .ok_or(SemanticRefusal::ProviderStorage)?,
+            );
+        }
+        let nested_per_receipt = array_bytes::<InstanceId>(MAX_INSTANCES)
+            .and_then(|bytes| bytes.checked_add(watched_bound))
+            .ok_or(SemanticRefusal::ProviderStorage)?;
+        // Both the accumulator and the current callback's original buffers
+        // coexist. Each Current keeps its actual IDs/watched-file allocation.
+        // There are at most input-partition receipts plus the four refreshes:
+        // empty-input retries resolve those same jobs, never add interests.
+        let bytes = (|| {
+            size_of::<Self>()
+                .checked_add(array_bytes::<TickOutcome>(MAX_INSTANCES)?.checked_mul(2)?)?
+                .checked_add(
+                    array_bytes::<CurrentPartitionReceipt>(allocation_limit)?.checked_mul(2)?,
+                )?
+                .checked_add(array_bytes::<LaneNegative>(MAX_LANE_NEGATIVES)?.checked_mul(2)?)?
+                .checked_add(
+                    nested_per_receipt
+                        .checked_mul(receipt_limit)?
+                        .checked_mul(2)?,
+                )
+        })()
+        .ok_or(SemanticRefusal::ProviderStorage)?;
+        let storage = reserve
+            .reserve(bytes)
+            .map_err(|_| SemanticRefusal::ProviderStorage)?;
+        let mut outcomes = Vec::new();
+        let mut current = Vec::new();
+        let mut negatives = Vec::new();
+        outcomes
+            .try_reserve_exact(MAX_INSTANCES)
+            .map_err(|_| SemanticRefusal::ProviderStorage)?;
+        current
+            .try_reserve_exact(receipt_limit)
+            .map_err(|_| SemanticRefusal::ProviderStorage)?;
+        negatives
+            .try_reserve_exact(MAX_LANE_NEGATIVES)
+            .map_err(|_| SemanticRefusal::ProviderStorage)?;
+        if outcomes.capacity() != MAX_INSTANCES
+            || current.capacity() != receipt_limit
+            || negatives.capacity() != MAX_LANE_NEGATIVES
+        {
+            return Err(SemanticRefusal::ProviderStorage);
+        }
+        Ok(Self {
+            batch: Some(SemanticBatch {
+                domain: lane.domain(),
+                outcomes,
+                current,
+                negatives,
+                observed_ns: 0,
+                awaiting_floor: None,
+                shed_floor: None,
+                exhausted: false,
+            }),
+            refused: None,
+            receipt_limit,
+            nested_per_receipt,
+            _storage: storage,
+        })
+    }
+
+    fn merge(&mut self, mut incoming: SemanticBatch) -> Result<bool, SemanticRefusal> {
+        let batch = self.batch.as_mut().expect("not staged until H0 finishes");
+        let fits = incoming.domain == batch.domain
+            && batch
+                .outcomes
+                .len()
+                .checked_add(incoming.outcomes.len())
+                .is_some_and(|count| count <= MAX_INSTANCES)
+            && batch
+                .current
+                .len()
+                .checked_add(incoming.current.len())
+                .is_some_and(|count| count <= self.receipt_limit)
+            && batch
+                .negatives
+                .len()
+                .checked_add(incoming.negatives.len())
+                .is_some_and(|count| count <= MAX_LANE_NEGATIVES)
+            && incoming.current.iter().all(|receipt| {
+                receipt
+                    .owned_storage_bytes()
+                    .is_some_and(|bytes| bytes <= self.nested_per_receipt)
+            });
+        if !fits {
+            self.refused = Some(incoming);
+            return Err(SemanticRefusal::ProviderStorage);
+        }
+        batch.outcomes.append(&mut incoming.outcomes);
+        batch.current.append(&mut incoming.current);
+        batch.negatives.append(&mut incoming.negatives);
+        batch.observed_ns = batch.observed_ns.max(incoming.observed_ns);
+        // A resolved old floor must not strand its own collection forever.
+        batch.awaiting_floor = incoming.awaiting_floor;
+        batch.shed_floor = batch
+            .shed_floor
+            .into_iter()
+            .chain(incoming.shed_floor)
+            .min();
+        batch.exhausted |= incoming.exhausted;
+        Ok(batch.awaiting_floor.is_none())
+    }
+}
+
+/// Scheduling state over the original owner, not an alternate capture/model.
+pub(crate) struct LiveJointMachine {
+    producers: SessionDrainProducers,
+    ledger: Option<CollectedLedgerBinding>,
+    phase: Option<Phase>,
+    state: RunState,
+    grant: Option<SessionDrainGrant>,
+    births: RetainedJointBirths,
+    demand: Option<Demand>,
+    prepared_base: u64,
+    // All original phase buffers and birth leases drop before inline storage.
+    _storage: ResourceLease,
+}
+
+struct ActualFault<'a>(&'a dyn FaultEpoch);
+impl FaultEpoch for ActualFault<'_> {
+    fn fault_epoch(&self) -> Result<u64, FaultReadError> {
+        self.0.fault_epoch()
+    }
+}
+
+impl LiveJointMachine {
+    pub(crate) fn new(
+        producers: &SessionDrainProducers,
+        reserve: &SemanticResourceReserver,
+    ) -> Result<Self, SemanticRefusal> {
+        let storage = reserve
+            .reserve(size_of::<Self>())
+            .map_err(|_| SemanticRefusal::ProviderStorage)?;
+        Ok(Self {
+            producers: producers.clone(),
+            ledger: None,
+            phase: Some(Phase::Idle),
+            state: RunState::Runnable,
+            grant: None,
+            births: RetainedJointBirths::new(),
+            demand: None,
+            prepared_base: 0,
+            _storage: storage,
+        })
+    }
+
+    pub(crate) fn begin_commit(&mut self, engine_changed: bool) -> Result<(), JointCommitRefusal> {
+        if matches!(self.state, RunState::DispositionRequired(_)) {
+            return Err(JointCommitRefusal::DispositionRequired);
+        }
+        if self.demand.is_some() {
+            return Err(JointCommitRefusal::OutstandingRequest);
+        }
+        self.demand = Some(Demand::Requested { engine_changed });
+        Ok(())
+    }
+
+    pub(crate) fn poll_commit_with_io<I: JointMachineIo>(
+        &mut self,
+        lane: &mut AttestedSemanticLane,
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        io: &mut I,
+        budget: &mut JointWorkBudget,
+    ) -> Result<JointCommitProgress, SemanticRefusal> {
+        self.validate_owner(lane, coordinator, io)?;
+        if matches!(self.demand, Some(Demand::Published(_))) {
+            return Ok(self.take_published());
+        }
+        if self.demand.is_none() {
+            return Ok(JointCommitProgress::Pending);
+        }
+        self.service_with_io(lane, coordinator, io, JointServiceMode::Running, budget)?;
+        Ok(self.take_published())
+    }
+
+    fn take_published(&mut self) -> JointCommitProgress {
+        if !matches!(self.demand, Some(Demand::Published(_))) {
+            return JointCommitProgress::Pending;
+        }
+        let Some(Demand::Published(receipt)) = self.demand.take() else {
+            unreachable!()
+        };
+        JointCommitProgress::Published(receipt)
+    }
+
+    pub(crate) fn service_with_io<I: JointMachineIo>(
+        &mut self,
+        lane: &mut AttestedSemanticLane,
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        io: &mut I,
+        _mode: JointServiceMode,
+        budget: &mut JointWorkBudget,
+    ) -> Result<JointServiceProgress, SemanticRefusal> {
+        self.validate_owner(lane, coordinator, io)?;
+        if let RunState::DispositionRequired(reason) = self.state {
+            return Err(reason);
+        }
+        while budget.available() {
+            let phase = self.phase.take().expect("one original machine phase");
+            let (phase, result) = self.advance(phase, lane, coordinator, io, budget);
+            self.phase = Some(phase);
+            match result {
+                Ok(Step::Continue) => {}
+                Ok(Step::Yield) => return Ok(JointServiceProgress::Pending),
+                Ok(Step::Published) => return Ok(JointServiceProgress::Published),
+                Err(reason) => {
+                    self.state = RunState::DispositionRequired(reason);
+                    return Err(reason);
+                }
+            }
+        }
+        Ok(JointServiceProgress::Pending)
+    }
+
+    fn validate_owner<I: JointMachineIo>(
+        &self,
+        lane: &AttestedSemanticLane,
+        coordinator: &InventoryCoordinator<OsProcessSource>,
+        io: &I,
+    ) -> Result<(), SemanticRefusal> {
+        if !self.producers.same_producers(io.producers())
+            || lane.domain() != self.producers.native_domain()
+            || !lane.is_live()
+            || lane.is_finished()
+            || self
+                .ledger
+                .as_ref()
+                .is_some_and(|ledger| !ledger.matches_owner(coordinator.joint_capture()))
+        {
+            return Err(SemanticRefusal::Unavailable);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_raw_for_test(&self) -> Option<&RawJointQuantum> {
+        match self.phase.as_ref()? {
+            Phase::Collecting(value)
+            | Phase::Binding(value)
+            | Phase::AwaitH0(value)
+            | Phase::Preparing(value)
+            | Phase::PreparationAttempted(value)
+            | Phase::PreparingAdmissions(value)
+            | Phase::Ingesting(value)
+            | Phase::StagingNegative(value)
+            | Phase::BindingKeys {
+                original: value, ..
+            } => Some(&value.raw),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_h0_for_test(
+        &self,
+    ) -> Option<(&[TickOutcome], &[CurrentPartitionReceipt])> {
+        let Phase::AwaitH0(original) = self.phase.as_ref()? else {
+            return None;
+        };
+        let batch = original.reports.as_ref()?.batch.as_ref()?;
+        Some((&batch.outcomes, &batch.current))
+    }
+}
+
+enum Step {
+    Continue,
+    Yield,
+    Published,
+}
+
+// Returning the actual owned phase on every error prevents a failed callback
+// from dropping Raw/H8/report/frame custody or replaying its earlier phase.
+macro_rules! retain_on_refusal {
+    ($phase:expr, $result:expr) => {
+        match $result {
+            Ok(value) => value,
+            Err(_) => return ($phase, Err(SemanticRefusal::Unavailable)),
+        }
+    };
+}
+
+impl LiveJointMachine {
+    #[allow(clippy::too_many_arguments)] // Disjoint canonical owners plus one finite shared budget.
+    #[allow(clippy::result_large_err)] // Native callbacks return the original proof/frame without allocating.
+    fn advance<I: JointMachineIo>(
+        &mut self,
+        phase: Phase,
+        lane: &mut AttestedSemanticLane,
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        io: &mut I,
+        budget: &mut JointWorkBudget,
+    ) -> (Phase, Result<Step, SemanticRefusal>) {
+        match phase {
+            Phase::Idle => {
+                let reserve = coordinator.registry().semantic_storage_reserver();
+                let work = budget.remaining_actions.min(MAX_PENDING);
+                let (raw, poll) = retain_on_refusal!(
+                    Phase::Idle,
+                    io.collect_raw(
+                        lane,
+                        coordinator.joint_capture_mut().adapter_mut(),
+                        &reserve,
+                        RAW_CAPACITY,
+                        work,
+                    )
+                );
+                let poll = poll.expect("positive initial work actually polls the original cursor");
+                budget.spend(poll.attempted.max(1));
+                let Some(ledger) = raw.ledger_binding() else {
+                    return (
+                        Phase::Collecting(Collected {
+                            raw,
+                            attempted: poll.attempted,
+                            poll,
+                            reports: None,
+                        }),
+                        Err(SemanticRefusal::Unavailable),
+                    );
+                };
+                self.ledger = Some(ledger);
+                (
+                    Phase::Collecting(Collected {
+                        raw,
+                        attempted: poll.attempted,
+                        poll,
+                        reports: None,
+                    }),
+                    Ok(Step::Continue),
+                )
+            }
+            Phase::Collecting(mut original) => {
+                // The H0 leaf accepts at most MAX_PENDING ordinary records.
+                // A wire slice ends at that real bound, not at a fake empty.
+                if !original.poll.backlog || original.attempted >= MAX_PENDING {
+                    let failed = retain_on_refusal!(
+                        Phase::Collecting(original),
+                        original.raw.h0_input(lane.domain(), MAX_PENDING)
+                    )
+                    .1;
+                    let unrequested_empty = original.attempted == 0 && self.demand.is_none();
+                    let needs_first_end = original.attempted != 0
+                        && original.raw.pending_h0_records() == 0
+                        && self.grant.is_none()
+                        && !failed
+                        && original.attempted < MAX_PENDING;
+                    if !unrequested_empty && !needs_first_end {
+                        budget.spend(1);
+                        return (Phase::Binding(original), Ok(Step::Continue));
+                    }
+                }
+                let work = budget
+                    .remaining_actions
+                    .min(MAX_PENDING - original.attempted);
+                if work == 0 {
+                    return (Phase::Collecting(original), Ok(Step::Yield));
+                }
+                let poll = retain_on_refusal!(
+                    Phase::Collecting(original),
+                    io.continue_raw(
+                        lane,
+                        &mut original.raw,
+                        coordinator.joint_capture_mut().adapter_mut(),
+                        work,
+                    )
+                );
+                original.attempted += poll.attempted;
+                original.poll = poll;
+                budget.spend(poll.attempted.max(1));
+                let step = if poll.attempted == 0 {
+                    Step::Yield
+                } else {
+                    Step::Continue
+                };
+                (Phase::Collecting(original), Ok(step))
+            }
+            Phase::Binding(mut original) => {
+                let reserve = coordinator.registry().semantic_storage_reserver();
+                let reports = match CollectedReports::new(
+                    lane,
+                    original.raw.pending_h0_records(),
+                    &reserve,
+                ) {
+                    Ok(reports) => reports,
+                    Err(reason) => return (Phase::Binding(original), Err(reason)),
+                };
+                original.reports = Some(reports);
+                retain_on_refusal!(
+                    Phase::Binding(original),
+                    super::bind_collected_semantic_callers(
+                        coordinator,
+                        lane,
+                        &mut original.raw,
+                        &self.producers,
+                    )
+                );
+                budget.spend(1);
+                (Phase::AwaitH0(original), Ok(Step::Continue))
+            }
+            Phase::AwaitH0(mut original) => {
+                let batch = retain_on_refusal!(
+                    Phase::AwaitH0(original),
+                    io.tick_collected(lane, coordinator.semantic_bindings(), &mut original.raw,)
+                );
+                budget.spend(1);
+                let complete = match original
+                    .reports
+                    .as_mut()
+                    .expect("prepaid before New")
+                    .merge(batch)
+                {
+                    Ok(complete) => complete,
+                    Err(reason) => return (Phase::AwaitH0(original), Err(reason)),
+                };
+                if !complete {
+                    return (Phase::AwaitH0(original), Ok(Step::Yield));
+                }
+                let batch = original
+                    .reports
+                    .as_mut()
+                    .expect("same reports")
+                    .batch
+                    .take()
+                    .expect("stage once");
+                coordinator.stage_semantic_batch(batch);
+                (Phase::Preparing(original), Ok(Step::Continue))
+            }
+            Phase::Preparing(mut original) => {
+                let identity = original.raw.h0_identity();
+                self.prepared_base = coordinator.registry().published_revision();
+                let changed = match self.demand {
+                    Some(Demand::Requested { engine_changed }) => {
+                        // Attempt recorded before the engine/cgroup callback.
+                        self.demand = Some(Demand::Bound {
+                            original: identity,
+                            base_revision: self.prepared_base,
+                        });
+                        engine_changed
+                    }
+                    _ => false,
+                };
+                budget.spend(1);
+                retain_on_refusal!(
+                    Phase::PreparationAttempted(original),
+                    io.prepare_publication(lane, coordinator, &mut original.raw, changed,)
+                );
+                (Phase::PreparingAdmissions(original), Ok(Step::Continue))
+            }
+            Phase::PreparationAttempted(original) => (
+                Phase::PreparationAttempted(original),
+                Err(SemanticRefusal::Unavailable),
+            ),
+            Phase::PreparingAdmissions(mut original) => {
+                budget.spend(1);
+                retain_on_refusal!(
+                    Phase::PreparingAdmissions(original),
+                    coordinator.prepare_staged_semantic_batch(lane, None)
+                );
+                // The actual prepared entry/current lease now owns the nested
+                // buffers. Refund the overlapping original-report allowance.
+                drop(original.reports.take());
+                (
+                    Phase::BindingKeys {
+                        original,
+                        cursor: 0,
+                    },
+                    Ok(Step::Continue),
+                )
+            }
+            Phase::BindingKeys {
+                mut original,
+                mut cursor,
+            } => {
+                let Some((prepared, owner)) = coordinator.prepared_joint_parts() else {
+                    return (
+                        Phase::BindingKeys { original, cursor },
+                        Err(SemanticRefusal::Unavailable),
+                    );
+                };
+                if cursor == prepared.entry_count() {
+                    budget.spend(1);
+                    return (Phase::Ingesting(original), Ok(Step::Continue));
+                }
+                if let Some(input) = prepared.admission_at(cursor) {
+                    if owner.adapter_mut().bind_admitted_key(input).is_ok() && self.grant.is_none()
+                    {
+                        let grant = retain_on_refusal!(
+                            Phase::BindingKeys { original, cursor },
+                            SessionDrainGrant::observe(&self.producers, input)
+                        );
+                        retain_on_refusal!(
+                            Phase::BindingKeys { original, cursor },
+                            owner.adapter_mut().bind_session_drain(&grant)
+                        );
+                        self.grant = Some(grant);
+                    }
+                    if crate::kinds::function_id(&input.s1_facts().function)
+                        .and_then(crate::semantics_objects::journal::endpoint_class)
+                        == Some(EndpointClass::ProvedIrrelevant)
+                    {
+                        retain_on_refusal!(
+                            Phase::BindingKeys { original, cursor },
+                            original.raw.classify_ordinary(input)
+                        );
+                    }
+                }
+                cursor += 1;
+                budget.spend(1);
+                (Phase::BindingKeys { original, cursor }, Ok(Step::Continue))
+            }
+            Phase::Ingesting(original) => {
+                budget.spend(1);
+                let identity = original.raw.h0_identity();
+                if original.attempted == 0 || self.grant.is_none() {
+                    coordinator.dispose_prepared_claims_s1();
+                    return (Phase::StagingNegative(original), Ok(Step::Continue));
+                }
+                let result = original.raw.ingest(
+                    coordinator.joint_capture_mut().adapter_mut(),
+                    &self.producers,
+                    self.grant.as_ref().expect("real retained admission grant"),
+                );
+                match result {
+                    Ok(ingested) => (
+                        Phase::Claiming {
+                            original: ingested,
+                            identity,
+                            base: self.prepared_base,
+                        },
+                        Ok(Step::Continue),
+                    ),
+                    Err((raw, _)) => (
+                        Phase::Ingesting(Collected { raw, ..original }),
+                        Err(SemanticRefusal::Unavailable),
+                    ),
+                }
+            }
+            Phase::StagingNegative(original) => {
+                budget.spend(1);
+                if coordinator.stage_next_prepared_admission() {
+                    return (Phase::StagingNegative(original), Ok(Step::Continue));
+                }
+                if !coordinator.finish_prepared_semantic_batch(lane) {
+                    return (
+                        Phase::StagingNegative(original),
+                        Err(SemanticRefusal::Unavailable),
+                    );
+                }
+                let identity = original.raw.h0_identity();
+                let reason = if original.attempted == 0 {
+                    RawDisposeReason::Empty
+                } else {
+                    RawDisposeReason::NoAdmission
+                };
+                match original.raw.dispose_without_ingest(
+                    coordinator.joint_capture_mut(),
+                    &self.producers,
+                    reason,
+                ) {
+                    Ok(disposed) => (
+                        Phase::Negative {
+                            original: disposed,
+                            identity,
+                            base: self.prepared_base,
+                        },
+                        Ok(Step::Continue),
+                    ),
+                    Err((raw, _)) => (
+                        Phase::StagingNegative(Collected { raw, ..original }),
+                        Err(SemanticRefusal::Unavailable),
+                    ),
+                }
+            }
+            Phase::Claiming {
+                original,
+                identity,
+                base,
+            } => {
+                budget.spend(1);
+                let next = retain_on_refusal!(
+                    Phase::Claiming {
+                        original,
+                        identity,
+                        base
+                    },
+                    coordinator.claim_next_prepared_admission(&self.producers, &original)
+                );
+                let phase = if next.is_some() {
+                    Phase::Claiming {
+                        original,
+                        identity,
+                        base,
+                    }
+                } else {
+                    Phase::InstallingClosure {
+                        original,
+                        identity,
+                        base,
+                    }
+                };
+                (phase, Ok(Step::Continue))
+            }
+            Phase::InstallingClosure {
+                original,
+                identity,
+                base,
+            } => {
+                budget.spend(1);
+                let installed = retain_on_refusal!(
+                    Phase::InstallingClosure {
+                        original,
+                        identity,
+                        base
+                    },
+                    io.with_native(lane, self.births.as_slice(), |io| coordinator
+                        .joint_capture_mut()
+                        .adapter_mut()
+                        .install_closure_grant(&SessionClosureGrant::observe(io.attachment())))
+                );
+                if !installed {
+                    return (
+                        Phase::InstallingClosure {
+                            original,
+                            identity,
+                            base,
+                        },
+                        Err(SemanticRefusal::Unavailable),
+                    );
+                }
+                // End the immutable Capture/native view before the actual
+                // candidate consumer mutably validates that same Capture.
+                (
+                    Phase::Births {
+                        original,
+                        identity,
+                        base,
+                    },
+                    Ok(Step::Continue),
+                )
+            }
+            Phase::Births {
+                original,
+                identity,
+                base,
+            } => {
+                budget.spend(1);
+                retain_on_refusal!(
+                    Phase::Births {
+                        original,
+                        identity,
+                        base
+                    },
+                    coordinator.prepare_joint_births(
+                        &original,
+                        &self.producers,
+                        &mut self.births,
+                        |candidate, input, binding, proof, adapter| io
+                            .consume_birth(lane, candidate, input, binding, proof, adapter),
+                    )
+                );
+                (
+                    Phase::Staging {
+                        original,
+                        identity,
+                        base,
+                    },
+                    Ok(Step::Continue),
+                )
+            }
+            Phase::Staging {
+                mut original,
+                identity,
+                base,
+            } => {
+                budget.spend(1);
+                let more = retain_on_refusal!(
+                    Phase::Staging {
+                        original,
+                        identity,
+                        base
+                    },
+                    coordinator.stage_next_prepared_admission_with_disposition(
+                        &self.producers,
+                        &mut original
+                    )
+                );
+                if more {
+                    return (
+                        Phase::Staging {
+                            original,
+                            identity,
+                            base,
+                        },
+                        Ok(Step::Continue),
+                    );
+                }
+                if !coordinator.finish_prepared_semantic_batch(lane) {
+                    return (
+                        Phase::Staging {
+                            original,
+                            identity,
+                            base,
+                        },
+                        Err(SemanticRefusal::Unavailable),
+                    );
+                }
+                (
+                    Phase::Auditing {
+                        original,
+                        identity,
+                        base,
+                    },
+                    Ok(Step::Continue),
+                )
+            }
+            Phase::Auditing {
+                original,
+                identity,
+                base,
+            } => {
+                budget.spend(1);
+                let mut original = Some(original);
+                let result = io.with_native(lane, self.births.as_slice(), |io| {
+                    let attachment = io.attachment();
+                    let (_, _, fault) = io.into_parts();
+                    coordinator.audit_ingested_quantum(
+                        original.take().expect("one actual ingestion"),
+                        &self.producers,
+                        attachment,
+                        &ActualFault(fault),
+                    )
+                });
+                match result {
+                    Ok(Ok(frame)) => (
+                        Phase::Audited {
+                            frame: Some(frame),
+                            identity,
+                            base,
+                        },
+                        Ok(Step::Continue),
+                    ),
+                    Ok(Err((ingested, _))) => (
+                        Phase::Auditing {
+                            original: ingested,
+                            identity,
+                            base,
+                        },
+                        Err(SemanticRefusal::Unavailable),
+                    ),
+                    Err(reason) => (
+                        Phase::Auditing {
+                            original: original
+                                .expect("native construction refused before acquisition"),
+                            identity,
+                            base,
+                        },
+                        Err(reason),
+                    ),
+                }
+            }
+            Phase::Negative {
+                original,
+                identity,
+                base,
+            } => {
+                budget.spend(1);
+                let mut original = Some(original);
+                let result = io.with_native(lane, self.births.as_slice(), |io| {
+                    let attachment = io.attachment();
+                    let (_, _, fault) = io.into_parts();
+                    coordinator.audit_disposed_quantum(
+                        original.take().expect("one original negative"),
+                        &self.producers,
+                        attachment,
+                        &ActualFault(fault),
+                    )
+                });
+                match result {
+                    Ok(Ok(frame)) => (
+                        Phase::Audited {
+                            frame: Some(frame),
+                            identity,
+                            base,
+                        },
+                        Ok(Step::Continue),
+                    ),
+                    Ok(Err((disposed, _))) => (
+                        Phase::Negative {
+                            original: disposed,
+                            identity,
+                            base,
+                        },
+                        Err(SemanticRefusal::Unavailable),
+                    ),
+                    Err(reason) => (
+                        Phase::Negative {
+                            original: original
+                                .expect("native construction refused before acquisition"),
+                            identity,
+                            base,
+                        },
+                        Err(reason),
+                    ),
+                }
+            }
+            Phase::Audited {
+                mut frame,
+                identity,
+                base,
+            } => {
+                let before = budget.remaining_actions;
+                let result = io.with_native(lane, self.births.as_slice(), |io| {
+                    coordinator.commit_joint_batch_with_io(
+                        io,
+                        &self.producers,
+                        &mut frame,
+                        &mut budget.remaining_actions,
+                    )
+                });
+                if before == budget.remaining_actions {
+                    budget.spend(1);
+                }
+                match result {
+                    Ok(Ok(JointCommitProgress::Published(receipt))) => {
+                        if let Some(Demand::Bound {
+                            original,
+                            base_revision,
+                        }) = self.demand
+                        {
+                            if original != identity || base_revision != base {
+                                return (Phase::Idle, Err(SemanticRefusal::Unavailable));
+                            }
+                            self.demand = Some(Demand::Published(receipt));
+                        }
+                        (Phase::Idle, Ok(Step::Published))
+                    }
+                    Ok(Ok(JointCommitProgress::Pending)) => (
+                        Phase::Audited {
+                            frame,
+                            identity,
+                            base,
+                        },
+                        Ok(Step::Yield),
+                    ),
+                    Ok(Err(_)) => (
+                        Phase::Audited {
+                            frame,
+                            identity,
+                            base,
+                        },
+                        Err(SemanticRefusal::Unavailable),
+                    ),
+                    Err(reason) => (
+                        Phase::Audited {
+                            frame,
+                            identity,
+                            base,
+                        },
+                        Err(reason),
+                    ),
+                }
+            }
+        }
+    }
+}
+
+/// No Session borrow survives a leaf call. The retained producer allocation
+/// is captured once; every operation checks it against the same live owner.
+#[allow(dead_code)] // The actual Session bridge is staged until ordinary driver selection.
+pub(super) struct SessionMachineIo {
+    pub(super) producers: SessionDrainProducers,
+}
+
+#[allow(dead_code)] // Paired with the inactive actual Session entrypoints below.
+impl SessionMachineIo {
+    fn live<'a>(
+        &self,
+        lane: &'a mut AttestedSemanticLane,
+    ) -> Result<&'a mut crate::inventory_semantics::LiveLane, SemanticRefusal> {
+        if lane.domain() != self.producers.native_domain() {
+            return Err(SemanticRefusal::Unavailable);
+        }
+        let live = lane
+            .live
+            .as_deref_mut()
+            .ok_or(SemanticRefusal::Unavailable)?;
+        if live.gated
+            || live.finished
+            || !live
+                .session
+                .drain_producers()
+                .as_ref()
+                .is_some_and(|own| own.same_producers(&self.producers))
+        {
+            return Err(SemanticRefusal::Unavailable);
+        }
+        Ok(live)
+    }
+}
+
+impl JointMachineIo for SessionMachineIo {
+    fn producers(&self) -> &SessionDrainProducers {
+        &self.producers
+    }
+
+    fn collect_raw(
+        &mut self,
+        lane: &mut AttestedSemanticLane,
+        adapter: &mut JournalAdapter,
+        reserve: &SemanticResourceReserver,
+        capacity: usize,
+        work: usize,
+    ) -> Result<(RawJointQuantum, Option<DispatchPoll>), RawQuantumRefusal> {
+        let live = self.live(lane).map_err(|_| RawQuantumRefusal::Stopped)?;
+        let (drain, rows, fault) = live
+            .session
+            .joint_collection_io()
+            .map_err(|_| RawQuantumRefusal::DrainUnbound)?;
+        let rows = rows.ok_or(RawQuantumRefusal::ForeignDescriptors)?;
+        RawJointQuantum::begin_bounded_with_adapter(
+            drain,
+            rows,
+            capacity,
+            work,
+            None,
+            &fault,
+            &self.producers,
+            |bytes| reserve.reserve(bytes),
+            adapter,
+        )
+    }
+
+    fn continue_raw(
+        &mut self,
+        lane: &mut AttestedSemanticLane,
+        raw: &mut RawJointQuantum,
+        adapter: &mut JournalAdapter,
+        work: usize,
+    ) -> Result<DispatchPoll, RawQuantumRefusal> {
+        let live = self.live(lane).map_err(|_| RawQuantumRefusal::Stopped)?;
+        let (drain, rows, fault) = live
+            .session
+            .joint_collection_io()
+            .map_err(|_| RawQuantumRefusal::DrainUnbound)?;
+        let rows = rows.ok_or(RawQuantumRefusal::ForeignDescriptors)?;
+        raw.continue_bounded_with_adapter(drain, rows, work, None, &fault, &self.producers, adapter)
+    }
+
+    fn tick_collected(
+        &mut self,
+        lane: &mut AttestedSemanticLane,
+        bindings: &[SemanticCallerBinding],
+        raw: &mut RawJointQuantum,
+    ) -> Result<SemanticBatch, SemanticRefusal> {
+        self.live(lane)?;
+        lane.tick_collected(bindings, raw)
+    }
+
+    fn prepare_publication(
+        &mut self,
+        lane: &mut AttestedSemanticLane,
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        raw: &mut RawJointQuantum,
+        engine_changed: bool,
+    ) -> anyhow::Result<()> {
+        self.live(lane).map_err(anyhow::Error::msg)?;
+        coordinator.prepare_joint_publication(engine_changed, lane, raw, &self.producers)
+    }
+
+    fn consume_birth(
+        &mut self,
+        lane: &mut AttestedSemanticLane,
+        candidate: H0BirthCandidate,
+        input: &AdmittedInstanceCall,
+        binding: &SemanticCallerBinding,
+        proof: &JournalDomainProof,
+        adapter: &JournalAdapter,
+    ) -> Result<RetainedBirthWitness, BirthObservationRefusal> {
+        let live = self
+            .live(lane)
+            .map_err(|_| BirthObservationRefusal::BindingMismatch)?;
+        live.capture.consume_birth(
+            &mut live.session,
+            candidate,
+            None,
+            input,
+            binding,
+            &live.attached,
+            proof,
+            adapter,
+        )
+    }
+
+    fn with_native<R>(
+        &mut self,
+        lane: &mut AttestedSemanticLane,
+        witnesses: &[RetainedJointBirth],
+        inspect: impl for<'io> FnOnce(JointCommitIo<'io>) -> R,
+    ) -> Result<R, SemanticRefusal> {
+        self.live(lane)?;
+        lane.with_joint_commit_io(witnesses, inspect)
+    }
+}
+
+#[allow(dead_code)] // Source/type-checked actual Session entrypoints; ordinary selection remains gated.
+impl AttestedSemanticLane {
+    /// Bind the initial machine to the actual Session and canonical pool,
+    /// before the first publication request. This performs no EVENTS/H0 work.
+    pub(crate) fn initialize_joint(
+        &mut self,
+        coordinator: &InventoryCoordinator<OsProcessSource>,
+    ) -> Result<(), SemanticRefusal> {
+        let live = self
+            .live
+            .as_deref_mut()
+            .ok_or(SemanticRefusal::Unavailable)?;
+        if live.gated || live.finished {
+            return Err(SemanticRefusal::Unavailable);
+        }
+        if live.joint_machine.is_none() {
+            if live.ticks != 0 || !live.stashed_refresh.is_empty() {
+                return Err(SemanticRefusal::Unavailable);
+            }
+            let producers = live
+                .session
+                .drain_producers()
+                .ok_or(SemanticRefusal::Unavailable)?;
+            live.joint_machine = Some(LiveJointMachine::new(
+                &producers,
+                &coordinator.registry().semantic_storage_reserver(),
+            )?);
+        }
+        Ok(())
+    }
+
+    /// Inactive entrypoint: callers have not yet selected this machine in the
+    /// ordinary driver. The temporary move splits scheduling state only; the
+    /// canonical Capture/model/ledger and native Session stay in place.
+    fn with_machine<R>(
+        &mut self,
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        service: impl FnOnce(
+            &mut LiveJointMachine,
+            &mut Self,
+            &mut InventoryCoordinator<OsProcessSource>,
+            &mut SessionMachineIo,
+        ) -> Result<R, SemanticRefusal>,
+    ) -> Result<R, SemanticRefusal> {
+        self.initialize_joint(coordinator)?;
+        let live = self
+            .live
+            .as_deref_mut()
+            .ok_or(SemanticRefusal::Unavailable)?;
+        if live.gated || live.finished {
+            return Err(SemanticRefusal::Unavailable);
+        }
+        let producers = live
+            .session
+            .drain_producers()
+            .ok_or(SemanticRefusal::Unavailable)?;
+        let mut machine = live
+            .joint_machine
+            .take()
+            .expect("one original scheduling owner");
+        let mut io = SessionMachineIo { producers };
+        let result = service(&mut machine, self, coordinator, &mut io);
+        self.live
+            .as_deref_mut()
+            .expect("service cannot extract its native owner")
+            .joint_machine = Some(machine);
+        result
+    }
+
+    pub(crate) fn service_joint(
+        &mut self,
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        mode: JointServiceMode,
+        budget: &mut JointWorkBudget,
+    ) -> Result<JointServiceProgress, SemanticRefusal> {
+        self.with_machine(coordinator, |machine, lane, coordinator, io| {
+            machine.service_with_io(lane, coordinator, io, mode, budget)
+        })
+    }
+
+    pub(crate) fn begin_joint_commit(
+        &mut self,
+        engine_changed: bool,
+    ) -> Result<(), JointCommitRefusal> {
+        let machine = self
+            .live
+            .as_deref_mut()
+            .and_then(|live| live.joint_machine.as_mut())
+            .ok_or(JointCommitRefusal::NotInitialized)?;
+        machine.begin_commit(engine_changed)
+    }
+
+    pub(crate) fn poll_joint_commit(
+        &mut self,
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        budget: &mut JointWorkBudget,
+    ) -> Result<JointCommitProgress, SemanticRefusal> {
+        self.with_machine(coordinator, |machine, lane, coordinator, io| {
+            machine.poll_commit_with_io(lane, coordinator, io, budget)
+        })
+    }
+}

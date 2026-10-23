@@ -4,9 +4,20 @@
 mod joint;
 pub(crate) mod selected;
 
-pub(crate) use joint::{JointCommitIo, JointContinuationView, RetainedJointBirths};
+pub(crate) use joint::{
+    JointCommitIo, JointContinuationView, RetainedJointBirths, bind_collected_semantic_callers,
+    bind_semantic_callers_inner,
+};
+#[allow(unused_imports)]
+// Private Session service types; the ordinary driver remains inactive.
+pub(crate) use joint::{
+    JointCommitRefusal, JointServiceMode, JointServiceProgress, JointWorkBudget,
+};
 #[cfg(test)]
-pub(crate) use joint::{JointNativeIo, with_joint_commit_io_for_test};
+pub(crate) use joint::{
+    JointMachineIo, JointNativeIo, LiveJointMachine, RetainedJointBirth,
+    with_joint_commit_io_for_test,
+};
 
 use crate::attach::capture::NativeDomainId;
 use crate::attach::{AttachedSemanticSet, BackendSelection, Scope, Session};
@@ -778,6 +789,9 @@ pub(crate) struct LiveLane {
     drained_batches: u64,
     semantic_loss: bool,
     stashed_refresh: RefreshReceiptStash,
+    /// Lazy, paid from the canonical registry pool at the initial Joint
+    /// service. The ordinary driver does not select it in this slice.
+    joint_machine: Option<joint::LiveJointMachine>,
 }
 
 impl std::fmt::Debug for LiveLane {
@@ -935,6 +949,7 @@ impl AttestedSemanticLane {
                 drained_batches: 0,
                 semantic_loss: false,
                 stashed_refresh: RefreshReceiptStash::new(),
+                joint_machine: None,
             })),
             startup_failed: false,
             staged_at: None,
@@ -1156,7 +1171,7 @@ impl AttestedSemanticLane {
         let Some(live) = self.live.as_mut() else {
             return Err(SemanticRefusal::Unavailable);
         };
-        if live.gated || live.finished {
+        if live.gated || live.finished || live.joint_machine.is_some() {
             return Err(SemanticRefusal::Unavailable);
         }
         let pins: Vec<Arc<PidPin>> = bindings
@@ -1178,6 +1193,39 @@ impl AttestedSemanticLane {
         let shed = merge_stash_into_report(&mut live.stashed_refresh, &mut report);
         live.scan_refusals = live.scan_refusals.saturating_add(shed);
         SemanticBatch::from_tick_report(domain, report, Vec::new(), now_ns())
+    }
+
+    /// Route only the machine's original retained records. This never polls
+    /// EVENTS; empty retries resolve the same Capture jobs and merge its stash.
+    fn tick_collected(
+        &mut self,
+        bindings: &[SemanticCallerBinding],
+        raw: &mut RawJointQuantum,
+    ) -> Result<SemanticBatch, SemanticRefusal> {
+        let live = self
+            .live
+            .as_deref_mut()
+            .ok_or(SemanticRefusal::Unavailable)?;
+        if live.gated || live.finished {
+            return Err(SemanticRefusal::Unavailable);
+        }
+        let pins: Vec<_> = bindings
+            .iter()
+            .filter(|binding| binding.scope_current())
+            .map(SemanticCallerBinding::pin)
+            .collect();
+        let mut report = live
+            .capture
+            .tick_collected(&mut live.session, &pins, raw)
+            .map_err(|_| SemanticRefusal::Unavailable)?;
+        live.ticks = live.ticks.saturating_add(1);
+        live.scan_refusals = live
+            .scan_refusals
+            .saturating_add(report.scan_refusals.len() as u64);
+        live.continuity_cuts = live.capture.continuity_cuts();
+        let shed = merge_stash_into_report(&mut live.stashed_refresh, &mut report);
+        live.scan_refusals = live.scan_refusals.saturating_add(shed);
+        SemanticBatch::from_tick_report(self.domain, report, Vec::new(), now_ns())
     }
 
     /// One bounded no-call refresh for an unbound candidate pin through

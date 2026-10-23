@@ -505,6 +505,16 @@ impl PreparedSemanticBatch {
             .filter_map(|entry| entry.input.as_ref()?.as_ref().ok())
     }
 
+    /// Original paid entry positions, including conversion refusals. The
+    /// machine advances this index once rather than rescanning a suffix.
+    pub(crate) fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub(crate) fn admission_at(&self, at: usize) -> Option<&AdmittedInstanceCall> {
+        self.entries.get(at)?.input.as_ref()?.as_ref().ok()
+    }
+
     pub(crate) fn current_receipts(&self) -> &[crate::semantic_capture::CurrentPartitionReceipt] {
         &self.current
     }

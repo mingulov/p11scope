@@ -35,6 +35,111 @@ class SchemaOracleAgreement(unittest.TestCase):
             CHECKER["evidence_fixture"]({}), schema=CHECKER["METRICS_SCHEMA"],
             mode="metrics", privacy="aggregate-only")
 
+    def counter_document(self, *, mode="counts", failure=None, discontinuity=False):
+        document = self.metrics_document()
+        evidence = document["evidence"]
+        evidence["counter_collection"] = {
+            "mode": mode,
+            "generation": 2,
+            "read_window": {"started_ns": 10, "finished_ns": 20},
+            "status": "fresh" if failure is None else "stale",
+            "health": {"saturated": False, "contended": False} if failure is None else None,
+            "discontinuity": discontinuity,
+            "failure": failure,
+        }
+        if failure is not None or discontinuity:
+            evidence["completeness"] = "PARTIAL"
+            evidence["verdict_detail"] = "concrete_gap"
+            observation = evidence["gap_classes"]["observation"]
+            observation["status"] = "lossy"
+            observation["causes"].append("counter_collection")
+        return document
+
+    def test_counter_collection_optional_fresh_modes_and_unknown_window(self):
+        legacy = self.metrics_document()
+        CHECKER["exact_metrics_schema"](legacy)
+        self.assertNotIn("counter_collection", legacy["evidence"])
+        for mode in ("counts", "timestamps", "latency"):
+            with self.subTest(mode=mode):
+                document = self.counter_document(mode=mode)
+                CHECKER["exact_metrics_schema"](document)
+                document["evidence"]["counter_collection"]["read_window"] = None
+                CHECKER["exact_metrics_schema"](document)
+
+    def test_counter_collection_stale_and_discontinuity_require_concrete_gap(self):
+        for failure in ("read_rvs", "saturated", "contended"):
+            with self.subTest(failure=failure):
+                document = self.counter_document(failure=failure)
+                CHECKER["exact_metrics_schema"](document)
+                for field, value in (("completeness", "COMPLETE"),
+                                     ("verdict_detail", "clean_proven")):
+                    invalid = copy.deepcopy(document)
+                    invalid["evidence"][field] = value
+                    with self.assertRaises(AssertionError):
+                        CHECKER["exact_metrics_schema"](invalid)
+                invalid = copy.deepcopy(document)
+                invalid["evidence"]["gap_classes"]["observation"]["causes"].remove("counter_collection")
+                with self.assertRaises(AssertionError):
+                    CHECKER["exact_metrics_schema"](invalid)
+        document = self.counter_document(discontinuity=True)
+        CHECKER["exact_metrics_schema"](document)
+        document["evidence"]["counter_collection"]["discontinuity"] = False
+        with self.assertRaises(AssertionError):
+            CHECKER["exact_metrics_schema"](document)
+
+    def test_counter_collection_closed_shape_and_consistency_twins(self):
+        healthy = self.counter_document()
+        stale = self.counter_document(failure="read_rvs")
+        invalid_values = (
+            (healthy, {"extra": 1}),
+            (healthy, {"mode": "requested"}),
+            (healthy, {"generation": 0}),
+            (healthy, {"generation": True}),
+            (healthy, {"generation": 2**64}),
+            (healthy, {"read_window": {"started_ns": 20, "finished_ns": 10}}),
+            (healthy, {"read_window": {"started_ns": True, "finished_ns": 20}}),
+            (healthy, {"read_window": {"started_ns": 10, "finished_ns": 20, "extra": 0}}),
+            (healthy, {"status": "cached"}),
+            (healthy, {"discontinuity": 1}),
+            (healthy, {"failure": "read_rvs"}),
+            (healthy, {"health": None}),
+            (healthy, {"health": {"saturated": True, "contended": False}}),
+            (healthy, {"health": {"saturated": False, "contended": 0}}),
+            (healthy, {"health": {"saturated": False, "contended": False, "extra": False}}),
+            (stale, {"failure": None}),
+            (stale, {"failure": "arbitrary"}),
+            (stale, {"health": {"saturated": False, "contended": False}}),
+        )
+        for document, patch in invalid_values:
+            with self.subTest(patch=patch):
+                invalid = copy.deepcopy(document)
+                invalid["evidence"]["counter_collection"].update(patch)
+                with self.assertRaises(AssertionError):
+                    CHECKER["exact_metrics_schema"](invalid)
+        for field in healthy["evidence"]["counter_collection"]:
+            with self.subTest(missing=field):
+                invalid = copy.deepcopy(healthy)
+                del invalid["evidence"]["counter_collection"][field]
+                with self.assertRaises(AssertionError):
+                    CHECKER["exact_metrics_schema"](invalid)
+        historical = CHECKER["document_fixture"](
+            CHECKER["evidence_fixture"]({}), schema=CHECKER["HISTORICAL_METRICS_SCHEMA"],
+            mode="metrics", privacy="aggregate-only")
+        historical["evidence"]["counter_collection"] = healthy["evidence"]["counter_collection"]
+        with self.assertRaises(AssertionError):
+            CHECKER["exact_historical_metrics_schema"](historical)
+
+    def test_counter_collection_schema_matches_finite_oracle_shape(self):
+        collection = evidence_schema()["properties"]["counter_collection"]
+        keys = {"mode", "generation", "read_window", "status", "health", "discontinuity", "failure"}
+        self.assertEqual(set(collection["required"]), keys)
+        self.assertEqual(set(collection["properties"]), keys)
+        self.assertFalse(collection["additionalProperties"])
+        self.assertNotIn("counter_collection", evidence_schema()["required"])
+        failure = collection["properties"]["failure"]["enum"]
+        self.assertEqual(set(failure) - {None}, set(CHECKER["COUNTER_COLLECTION_FAILURES"]))
+        self.assertIn(None, failure)
+
     def test_current_metrics_requires_backend_but_historical_shape_excludes_it(self):
         current = self.metrics_document()
         self.assertEqual(current["evidence"].get("attach_backend"),
@@ -125,7 +230,7 @@ class SchemaOracleAgreement(unittest.TestCase):
         wanted = (
             set(CHECKER["BASE_EVIDENCE_KEYS"])
             | set(CHECKER["PROFILE_V3_FIELDS"])
-            | {"child_still_running"}
+            | {"child_still_running", "counter_collection"}
         )
         self.assertEqual(set(evidence_schema()["properties"]), wanted)
 

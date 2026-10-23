@@ -3652,11 +3652,19 @@ fn joint_first_pending_h3_pins_native_baseline_before_next_fault() {
             .adapter_mut()
             .install_closure_grant(&SessionClosureGrant::observe(&attached))
     );
+    let published_before = crate::inventory_present::Presentation::capture(
+        &scene.real.scene.coordinator,
+        "system",
+        1,
+        2,
+        1,
+    );
     let mut fixture = CanonicalFanoutScene {
         scene,
         attached,
         births: Vec::new(),
         grant,
+        published_before,
         _child: child_b,
     };
     fixture.retain_collected_birth(&admitted, current, proof);
@@ -4020,11 +4028,19 @@ fn first_pending_h3_without_joint_head() -> ZeroHeadPendingScene {
         .commit_batch_with_semantics(false, Some(&mut scene.real.lane))
         .unwrap();
     let attached = attachment(&mut scene);
+    let published_before = crate::inventory_present::Presentation::capture(
+        &scene.real.scene.coordinator,
+        "system",
+        1,
+        2,
+        1,
+    );
     let mut fixture = CanonicalFanoutScene {
         scene,
         attached,
         births: Vec::new(),
         grant,
+        published_before,
         _child: child,
     };
     let frame = acquire(&mut fixture.scene, ingested, &fixture.attached, &BirthFault);

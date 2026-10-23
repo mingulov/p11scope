@@ -584,7 +584,9 @@ impl LaneTestIo for SharedH0 {
                             _ => None,
                         })
                         .max()
-                        .map(|ordinal| vec![LaneNegative::CutBarrier { ordinal }])
+                        .map(|ordinal| {
+                            vec![crate::inventory_semantics::LaneNegative::CutBarrier { ordinal }]
+                        })
                         .unwrap_or_default();
                     SemanticBatch::from_tick_report(domain, report, negatives, now_ns())
                 }),
@@ -644,7 +646,9 @@ impl LaneTestIo for SharedH0 {
                             _ => None,
                         })
                         .max()
-                        .map(|ordinal| vec![LaneNegative::CutBarrier { ordinal }])
+                        .map(|ordinal| {
+                            vec![crate::inventory_semantics::LaneNegative::CutBarrier { ordinal }]
+                        })
                         .unwrap_or_default();
                     SemanticBatch::from_tick_report(domain, report, negatives, now_ns())
                 }),

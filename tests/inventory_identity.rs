@@ -139,27 +139,99 @@ fn ready_pid(ready_dir: &Path, name: &str) -> u32 {
 /// Independent ground truth: executable mappings of `provider` in `pid`
 /// from /proc, read without the observer.
 fn exec_ranges_for(pid: u32, provider: &Path) -> Vec<(u64, u64)> {
+    fixture_ranges_for(pid, provider)
+        .into_iter()
+        .filter(|range| range.permissions[2] == b'x')
+        .map(|range| (range.start, range.end))
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum FixtureRole {
+    H1,
+    H2,
+    H3,
+    Copy,
+    DataOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct FixtureFileId {
+    dev: u64,
+    ino: u64,
+}
+
+impl FixtureFileId {
+    fn from_file(file: &std::fs::File) -> Result<Self, String> {
+        use std::os::unix::fs::MetadataExt as _;
+        let metadata = file.metadata().map_err(|error| error.to_string())?;
+        Ok(Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FixtureRange {
+    start: u64,
+    end: u64,
+    file_offset: u64,
+    permissions: [u8; 4],
+}
+
+fn fixture_ranges_for(pid: u32, provider: &Path) -> Vec<FixtureRange> {
     let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).unwrap();
-    let target = provider.to_str().unwrap().to_string();
+    parse_fixture_ranges(&maps, provider).expect("valid independent fixture mappings")
+}
+
+fn parse_fixture_ranges(maps: &str, provider: &Path) -> Result<Vec<FixtureRange>, String> {
+    let target = provider.to_str().ok_or("non-UTF8 fixture path")?;
     let mut ranges = Vec::new();
     for line in maps.lines() {
-        let mut parts = line.split_whitespace();
-        let range = parts.next().unwrap_or("");
-        let perms = parts.next().unwrap_or("");
-        for _ in 0..3 {
-            parts.next();
+        let mut remaining = line;
+        let mut fields = [""; 5];
+        for field in &mut fields {
+            remaining = remaining.trim_start();
+            let end = remaining
+                .find(char::is_whitespace)
+                .unwrap_or(remaining.len());
+            *field = &remaining[..end];
+            remaining = &remaining[end..];
         }
-        let path = parts.next().unwrap_or("");
-        if perms.starts_with("r-x")
-            && path == target
-            && let Some((low, high)) = range.split_once('-')
-            && let (Ok(low), Ok(high)) =
-                (u64::from_str_radix(low, 16), u64::from_str_radix(high, 16))
-        {
-            ranges.push((low, high));
+        if remaining.trim_start() != target {
+            continue;
         }
+        let (low, high) = fields[0].split_once('-').ok_or("invalid fixture range")?;
+        let start = u64::from_str_radix(low, 16).map_err(|_| "invalid fixture range start")?;
+        let end = u64::from_str_radix(high, 16).map_err(|_| "invalid fixture range end")?;
+        let len = end
+            .checked_sub(start)
+            .filter(|len| *len > 0)
+            .ok_or("empty or reversed fixture range")?;
+        let permissions: [u8; 4] = fields[1]
+            .as_bytes()
+            .try_into()
+            .map_err(|_| "invalid fixture permissions")?;
+        if !matches!(
+            permissions,
+            [b'r' | b'-', b'w' | b'-', b'x' | b'-', b'p' | b's']
+        ) {
+            return Err("invalid fixture permissions".into());
+        }
+        let file_offset =
+            u64::from_str_radix(fields[2], 16).map_err(|_| "invalid fixture file offset")?;
+        file_offset
+            .checked_add(len)
+            .ok_or("fixture file extent overflow")?;
+        ranges.push(FixtureRange {
+            start,
+            end,
+            file_offset,
+            permissions,
+        });
     }
-    ranges
+    Ok(ranges)
 }
 
 fn callers_for(doc: &Value, pid: u64) -> Vec<&Value> {
@@ -214,6 +286,10 @@ struct BuiltFixtures {
     dataonly: PathBuf,
     provider: PathBuf,
     copy: PathBuf,
+    provider_file: std::fs::File,
+    copy_file: std::fs::File,
+    provider_id: FixtureFileId,
+    copy_id: FixtureFileId,
 }
 
 fn build_fixtures(name: &str, minor: u32, so_name: &str) -> BuiltFixtures {
@@ -252,12 +328,21 @@ fn build_fixtures(name: &str, minor: u32, so_name: &str) -> BuiltFixtures {
         std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&copy).unwrap()),
         "different file"
     );
+    let provider_file = std::fs::File::open(&provider).unwrap();
+    let copy_file = std::fs::File::open(&copy).unwrap();
+    let provider_id = FixtureFileId::from_file(&provider_file).unwrap();
+    let copy_id = FixtureFileId::from_file(&copy_file).unwrap();
+    assert_ne!(provider_id, copy_id, "distinct held physical files");
     BuiltFixtures {
         dir,
         driver,
         dataonly,
         provider,
         copy,
+        provider_file,
+        copy_file,
+        provider_id,
+        copy_id,
     }
 }
 
@@ -270,6 +355,8 @@ struct ObserveOutcome {
     /// Independent ground truth per holder: executable provider ranges
     /// from /proc while the holders live (established before coverage).
     holder_ranges: Vec<Vec<(u64, u64)>>,
+    role_pids: BTreeMap<FixtureRole, u32>,
+    role_ranges: BTreeMap<FixtureRole, Vec<FixtureRange>>,
 }
 
 /// One sweep attempt: fresh fixtures under the observer-as-parent
@@ -336,6 +423,26 @@ fn attempt_observe(
         );
         holder_ranges.push(ranges);
     }
+    let mut role_pids = BTreeMap::from([
+        (FixtureRole::H1, holders[0]),
+        (FixtureRole::H2, holders[1]),
+        (FixtureRole::H3, holders[2]),
+    ]);
+    if let (Some(copy), Some(dataonly)) = (copy_pid, dataonly_pid) {
+        role_pids.insert(FixtureRole::Copy, copy);
+        role_pids.insert(FixtureRole::DataOnly, dataonly);
+    }
+    let role_ranges = role_pids
+        .iter()
+        .map(|(&role, &pid)| {
+            let path = if role == FixtureRole::Copy {
+                &fixtures.copy
+            } else {
+                &fixtures.provider
+            };
+            (role, fixture_ranges_for(pid, path))
+        })
+        .collect();
     kill_pids(&pids);
     if !output.status.success() {
         // Refusal arm: no document, but the stderr line and the
@@ -360,6 +467,8 @@ fn attempt_observe(
         copy_pid,
         dataonly_pid,
         holder_ranges,
+        role_pids,
+        role_ranges,
     })
 }
 
@@ -385,6 +494,295 @@ fn ground_truth_range_counts(observed: &ObserveOutcome) -> Vec<usize> {
         "uniform provider layout across holders: {counts:?}"
     );
     counts
+}
+
+type D4ExecutableRange = (FixtureRole, FixtureFileId, u64, u64, [u8; 4]);
+
+#[derive(Debug)]
+struct D4Projection {
+    backend: &'static str,
+    provider: FixtureFileId,
+    edges: BTreeSet<FixtureRole>,
+    executable_ranges: Vec<D4ExecutableRange>,
+}
+
+// This is an acceptance oracle over public output and independent fixture
+// inputs. Its range rows are not a transcript of backend proof verdicts.
+fn d4_projection(
+    fixtures: &BuiltFixtures,
+    observed: Option<&ObserveOutcome>,
+    backend: &str,
+) -> Result<D4Projection, String> {
+    let backend = match backend {
+        "userspace" => "userspace",
+        "kernel" => "kernel",
+        _ => return Err("invalid requested identity backend".into()),
+    };
+    let observed = observed.ok_or("command refused or failed")?;
+    if fixtures.provider_id == fixtures.copy_id
+        || FixtureFileId::from_file(&fixtures.provider_file)? != fixtures.provider_id
+        || FixtureFileId::from_file(&fixtures.copy_file)? != fixtures.copy_id
+    {
+        return Err("fixture physical file identity changed or aliases the copy".into());
+    }
+    let doc = &observed.doc;
+    let observation = doc["observation"]
+        .as_object()
+        .ok_or("missing observation")?;
+    let identity = observation
+        .get("identity")
+        .and_then(Value::as_object)
+        .ok_or("missing identity result")?;
+    if doc["schema"] != "p11scope/inventory/v1"
+        || doc["scope"] != "system"
+        || identity.get("backend").and_then(Value::as_str) != Some(backend)
+        || identity.get("fallback") != Some(&Value::Null)
+        || observation.get("usage_feed") != Some(&Value::Bool(false))
+        || observation.contains_key("lane")
+    {
+        return Err("required scan backend refused, fell back or changed observation mode".into());
+    }
+    let expected_roles = BTreeSet::from([
+        FixtureRole::H1,
+        FixtureRole::H2,
+        FixtureRole::H3,
+        FixtureRole::Copy,
+        FixtureRole::DataOnly,
+    ]);
+    if observed.role_pids.keys().copied().collect::<BTreeSet<_>>() != expected_roles
+        || observed
+            .role_ranges
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            != expected_roles
+        || observed.role_pids.values().any(|pid| *pid == 0)
+        || observed.role_pids.values().collect::<BTreeSet<_>>().len() != expected_roles.len()
+    {
+        return Err("incomplete or duplicate independent fixture roles".into());
+    }
+    let expected_holders =
+        [FixtureRole::H1, FixtureRole::H2, FixtureRole::H3].map(|role| observed.role_pids[&role]);
+    if observed.holder_pids != expected_holders
+        || observed.copy_pid != Some(observed.role_pids[&FixtureRole::Copy])
+        || observed.dataonly_pid != Some(observed.role_pids[&FixtureRole::DataOnly])
+    {
+        return Err("independent role ledger disagrees with owned process population".into());
+    }
+    let mut executable_ranges = Vec::new();
+    for (&role, ranges) in &observed.role_ranges {
+        if ranges.is_empty() {
+            return Err(format!("{role:?} has no independent live mapping"));
+        }
+        let mut executable = 0;
+        for range in ranges {
+            let len = range
+                .end
+                .checked_sub(range.start)
+                .filter(|len| *len > 0)
+                .ok_or("empty or reversed independent fixture range")?;
+            range
+                .file_offset
+                .checked_add(len)
+                .ok_or("independent fixture extent overflow")?;
+            if !matches!(
+                range.permissions,
+                [b'r' | b'-', b'w' | b'-', b'x' | b'-', b'p' | b's']
+            ) {
+                return Err("invalid independent fixture permissions".into());
+            }
+            if range.permissions[2] == b'x' {
+                executable += 1;
+                let file = if role == FixtureRole::Copy {
+                    fixtures.copy_id
+                } else {
+                    fixtures.provider_id
+                };
+                executable_ranges.push((role, file, range.file_offset, len, range.permissions));
+            }
+        }
+        if (role == FixtureRole::DataOnly && executable != 0)
+            || (role != FixtureRole::DataOnly && executable == 0)
+        {
+            return Err(format!(
+                "{role:?} has the wrong independent executable population"
+            ));
+        }
+    }
+    // Sort a Vec, not a set: two equal file-relative mappings stay two inputs.
+    executable_ranges.sort_unstable();
+    let callers = doc["callers"].as_array().ok_or("missing callers")?;
+    let mut caller_pids = BTreeMap::new();
+    for caller in callers {
+        let id = caller["id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .ok_or("invalid caller ID")?;
+        let pid = caller["pid"]
+            .as_u64()
+            .and_then(|pid| u32::try_from(pid).ok())
+            .filter(|pid| *pid > 0)
+            .ok_or("invalid caller PID")?;
+        if caller_pids.insert(id, pid).is_some() {
+            return Err("duplicate public caller ID".into());
+        }
+    }
+    let mut caller_roles = BTreeMap::new();
+    for (&role, &pid) in &observed.role_pids {
+        let ids: Vec<_> = caller_pids
+            .iter()
+            .filter(|(_, actual_pid)| **actual_pid == pid)
+            .map(|(&id, _)| id)
+            .collect();
+        if ids.len() > 1 || (role != FixtureRole::DataOnly && ids.len() != 1) {
+            return Err(format!(
+                "{role:?} is missing or ambiguous in public callers"
+            ));
+        }
+        if let Some(id) = ids.first() {
+            caller_roles.insert(*id, role);
+        }
+    }
+    let modules = doc["modules"].as_array().ok_or("missing modules")?;
+    let path = fixtures.provider.to_str().ok_or("non-UTF8 fixture path")?;
+    let mut module_ids = BTreeSet::new();
+    let mut original = None;
+    for module in modules {
+        let id = module["id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .ok_or("invalid module ID")?;
+        if !module_ids.insert(id) {
+            return Err("duplicate public module ID".into());
+        }
+        let paths = module["paths"].as_array().ok_or("missing module paths")?;
+        if paths
+            .iter()
+            .any(|candidate| candidate.as_str() == Some(path))
+            && original.replace(id).is_some()
+        {
+            return Err("ambiguous original-provider module row".into());
+        }
+    }
+    let original = original.ok_or("missing original-provider module row")?;
+    let mut edges = BTreeSet::new();
+    for edge in doc["edges"].as_array().ok_or("missing edges")? {
+        if !edge["entries"]["observation"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("unknown"))
+            || edge["entries"]["coverage"]["state"] != "unknown"
+        {
+            return Err("scan-only edge invents usage coverage".into());
+        }
+        if edge["module"].as_str() != Some(original) {
+            continue;
+        }
+        let caller = edge["caller"].as_str().ok_or("missing edge caller")?;
+        let role = caller_roles
+            .get(caller)
+            .ok_or("foreign original-provider edge")?;
+        if !matches!(role, FixtureRole::H1 | FixtureRole::H2 | FixtureRole::H3)
+            || edge["mapping"]["state"] != "mapped"
+            || !edges.insert(*role)
+        {
+            return Err("wrong, uncertain or duplicate original-provider edge".into());
+        }
+    }
+    if edges != BTreeSet::from([FixtureRole::H1, FixtureRole::H2, FixtureRole::H3]) {
+        return Err("incomplete original-provider edge set".into());
+    }
+    Ok(D4Projection {
+        backend,
+        provider: fixtures.provider_id,
+        edges,
+        executable_ranges,
+    })
+}
+
+fn d4_pair(userspace: &D4Projection, kernel: &D4Projection) -> Result<(), String> {
+    if userspace.backend != "userspace"
+        || kernel.backend != "kernel"
+        || userspace.provider != kernel.provider
+        || userspace.edges != kernel.edges
+        || userspace.executable_ranges != kernel.executable_ranges
+    {
+        return Err("backend legs differ in physical provider, exact edges or input ranges".into());
+    }
+    Ok(())
+}
+
+type FixtureFileStamp = (FixtureFileId, u64, i64, i64);
+
+fn d4_fixture_stamps(fixtures: &BuiltFixtures) -> Result<[FixtureFileStamp; 2], String> {
+    use std::os::unix::fs::MetadataExt as _;
+    let stamp = |file: &std::fs::File| -> Result<FixtureFileStamp, String> {
+        let metadata = file.metadata().map_err(|error| error.to_string())?;
+        Ok((
+            FixtureFileId {
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+            },
+            metadata.len(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+        ))
+    };
+    Ok([stamp(&fixtures.provider_file)?, stamp(&fixtures.copy_file)?])
+}
+
+fn d4_capture_leg(
+    fixtures: &BuiltFixtures,
+    backend: &str,
+    report_dir: &Path,
+) -> Result<D4Projection, String> {
+    for cap in [8usize, 32, 128] {
+        let mut args = forced_kernel_args(fixtures, cap);
+        let index = args
+            .iter()
+            .position(|arg| arg == "--identity-backend")
+            .unwrap();
+        args[index + 1] = backend.to_owned();
+        let attempt = format!("d4-{backend}-{cap}");
+        let observed = attempt_observe(fixtures, &attempt, "sweep", &args, cap, report_dir);
+        // A refusal/fallback/wrong edge fails immediately, including an attempt
+        // whose deep-scan versus swept population was not the selected shape.
+        let projection = d4_projection(fixtures, observed.as_ref(), backend)?;
+        if sweep_selection_qualifies(observed.as_ref().expect("validated observation")) {
+            return Ok(projection);
+        }
+    }
+    Err("no cap retained one selected supplier and two swept holders".into())
+}
+
+/// Functional Btrfs scan baseline only: fresh PIDs and public IDs normalize
+/// through independent roles, held file identities and file-relative inputs.
+/// Public edges do not enumerate live proof rows; complete-range acceptance is
+/// separately covered at the actual kernel adapter/attribution seam. This does
+/// not close D4 collision/rollover/overlay, native, remote or performance gates.
+#[test]
+#[ignore = "development-host Btrfs/privileged lane; gcc-builds fixtures and rejects every refusal"]
+fn d4_btrfs_scan_backends_match_exact_fixture_population() {
+    let _guard = serial_guard();
+    let fixtures = build_fixtures("inventory-identity-d4-paired", 42, "id-d4.so");
+    assert!(
+        dir_is_btrfs(&fixtures.dir),
+        "paired baseline requires actual Btrfs fixtures"
+    );
+    let report_dir = private_dir();
+    let held = d4_fixture_stamps(&fixtures).unwrap();
+    let userspace = d4_capture_leg(&fixtures, "userspace", report_dir.path()).unwrap();
+    assert_eq!(
+        d4_fixture_stamps(&fixtures).unwrap(),
+        held,
+        "files changed in userspace leg"
+    );
+    let kernel = d4_capture_leg(&fixtures, "kernel", report_dir.path()).unwrap();
+    assert_eq!(
+        d4_fixture_stamps(&fixtures).unwrap(),
+        held,
+        "files changed in kernel leg"
+    );
+    d4_pair(&userspace, &kernel).unwrap();
 }
 
 /// D3d bounded userspace sweep cell: three holders dlopen the complete

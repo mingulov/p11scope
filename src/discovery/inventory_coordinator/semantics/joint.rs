@@ -256,6 +256,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         Ok(JointCommitProgress::Pending)
     }
 
+    // Refusal closures return the original move-only frame without allocating
+    // while its charged buffers and pending H3 ownership are still retained.
+    #[allow(clippy::result_large_err)]
     fn finish_joint_frame_if_ready(
         &mut self,
         frame: &mut Option<IngestedJointQuantum>,

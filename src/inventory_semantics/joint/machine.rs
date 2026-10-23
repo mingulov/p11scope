@@ -490,6 +490,44 @@ impl LiveJointMachine {
     }
 
     #[cfg(test)]
+    pub(crate) fn diagnostic_snapshot_for_test(
+        &self,
+    ) -> (&'static str, &'static str, Option<(usize, usize)>, u64) {
+        let (phase, original) = match self.phase.as_ref() {
+            None => ("NoPhase", None),
+            Some(Phase::Idle) => ("Idle", None),
+            Some(Phase::Collecting(value)) => ("Collecting", Some(value)),
+            Some(Phase::Binding(value)) => ("Binding", Some(value)),
+            Some(Phase::AwaitH0(value)) => ("AwaitH0", Some(value)),
+            Some(Phase::Preparing(value)) => ("Preparing", Some(value)),
+            Some(Phase::PreparationAttempted(value)) => ("PreparationAttempted", Some(value)),
+            Some(Phase::PreparingAdmissions(value)) => ("PreparingAdmissions", Some(value)),
+            Some(Phase::BindingKeys { original, .. }) => ("BindingKeys", Some(original)),
+            Some(Phase::Ingesting(value)) => ("Ingesting", Some(value)),
+            Some(Phase::StagingNegative(value)) => ("StagingNegative", Some(value)),
+            Some(Phase::Claiming { .. }) => ("Claiming", None),
+            Some(Phase::InstallingClosure { .. }) => ("InstallingClosure", None),
+            Some(Phase::Births { .. }) => ("Births", None),
+            Some(Phase::Staging { .. }) => ("Staging", None),
+            Some(Phase::Auditing { .. }) => ("Auditing", None),
+            Some(Phase::Negative { .. }) => ("Negative", None),
+            Some(Phase::Audited { .. }) => ("Audited", None),
+        };
+        let demand = match self.demand {
+            None => "None",
+            Some(Demand::Requested { .. }) => "Requested",
+            Some(Demand::Bound { .. }) => "Bound",
+            Some(Demand::Published(_)) => "Published",
+        };
+        (
+            phase,
+            demand,
+            original.map(|value| (value.attempted, value.raw.pending_h0_records())),
+            self.prepared_base,
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn retained_h0_for_test(
         &self,
     ) -> Option<(&[TickOutcome], &[CurrentPartitionReceipt])> {

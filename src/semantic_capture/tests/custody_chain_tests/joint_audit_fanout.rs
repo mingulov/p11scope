@@ -517,6 +517,10 @@ impl MachineScene {
     }
 
     fn published(&mut self) {
+        self.published_labeled("unlabeled", None);
+    }
+
+    fn published_labeled(&mut self, label: &str, frozen: Option<bool>) {
         for _ in 0..512 {
             if matches!(
                 self.service(1).unwrap(),
@@ -525,7 +529,23 @@ impl MachineScene {
                 return;
             }
         }
-        panic!("the same machine must publish the retained original within its finite work bound");
+        let coordinator = &self.scene.real.scene.coordinator;
+        panic!(
+            "the same machine must publish the retained original within its finite work bound; \
+             label={label} frozen={frozen:?} snapshot={:?} preparations={} revision={} \
+             publication_pending={} h3={:?} claims={} roles={:?}",
+            self.machine.diagnostic_snapshot_for_test(),
+            self.native.preparations.len(),
+            coordinator.registry().published_revision(),
+            coordinator.publication_pending(),
+            coordinator.reference_h3_audit_state(),
+            coordinator
+                .joint_capture()
+                .adapter()
+                .invocation_claims_for_test()
+                .0,
+            coordinator.joint_capture().ledger().roles_for_test(),
+        );
     }
 
     fn prime(&mut self, providers: usize) {
@@ -1350,7 +1370,7 @@ fn joint_machine_request_ack_tracks_actual_preparation_and_attempted_error() {
             "a second request cannot replace the original demand"
         );
         if frozen {
-            fixture.published();
+            fixture.published_labeled("older frozen publication", Some(frozen));
             assert_eq!(
                 fixture
                     .scene
@@ -1371,7 +1391,7 @@ fn joint_machine_request_ack_tracks_actual_preparation_and_attempted_error() {
         }
         // Autonomous service may finish the demand, but cannot consume the
         // requester's acknowledgement or allow a new request to replace it.
-        fixture.published();
+        fixture.published_labeled("requested publication", Some(frozen));
         assert!(fixture.machine.begin_commit(false).is_err());
         let mut foreign = InventoryCoordinator::new(
             Scope::System,

@@ -713,7 +713,7 @@ impl IngestedJointQuantum {
     fn pending_h3_is_owned(
         &self,
         ports: &JointPublicationPorts<'_>,
-        lane: &crate::inventory_semantics::AttestedSemanticLane,
+        view: &crate::inventory_semantics::JointContinuationView<'_>,
     ) -> bool {
         let (registry, owner, _, producers) = ports.read();
         let adapter = owner.adapter();
@@ -752,7 +752,7 @@ impl IngestedJointQuantum {
         {
             return false;
         }
-        lane.with_pending_h3_continuation(|pending| {
+        view.inspect(|pending| {
             if !pending.matches(
                 producers,
                 self.audit.h0_below,
@@ -922,7 +922,6 @@ impl IngestedJointQuantum {
             }
             floor_seen && covered == unclaimed
         })
-        .unwrap_or(false)
     }
 
     pub(crate) fn defer_pending_h3(
@@ -934,7 +933,20 @@ impl IngestedJointQuantum {
         if !self.bound || self.active.is_some() {
             return Err(RawQuantumRefusal::DispositionMismatch);
         }
-        if !self.pending_h3_is_owned(ports, lane) {
+        lane.with_joint_continuation(|view| self.defer_pending_h3_with_view(ports, view))
+            .unwrap_or(Ok(QuantumSealProgress::LocalPending))
+    }
+
+    pub(crate) fn defer_pending_h3_with_view(
+        &mut self,
+        ports: &mut JointPublicationPorts<'_>,
+        view: &crate::inventory_semantics::JointContinuationView<'_>,
+    ) -> Result<QuantumSealProgress, RawQuantumRefusal> {
+        self.preflight(ports)?;
+        if !self.bound || self.active.is_some() {
+            return Err(RawQuantumRefusal::DispositionMismatch);
+        }
+        if !self.pending_h3_is_owned(ports, view) {
             return Ok(QuantumSealProgress::LocalPending);
         }
         // H3 remains pending. Preserve only the already-checked native fault
@@ -1417,7 +1429,30 @@ impl IngestedJointQuantum {
         if let Err(reason) = self.preflight(ports) {
             return Err((self, reason));
         }
-        if !self.pending_h3_is_owned(ports, lane) {
+        let mut held = Some(self);
+        lane.with_joint_continuation(|view| {
+            held.take()
+                .expect("the original frame moves into one pending check")
+                .finish_pending_h3_with_view(ports, view)
+        })
+        .unwrap_or_else(|| {
+            Err((
+                held.expect("an unavailable view preserves the original frame"),
+                RawQuantumRefusal::H3Undisposed,
+            ))
+        })
+    }
+
+    #[allow(clippy::result_large_err)] // Refusal preserves the same frame and original custody.
+    pub(crate) fn finish_pending_h3_with_view(
+        self,
+        ports: &mut JointPublicationPorts<'_>,
+        view: &crate::inventory_semantics::JointContinuationView<'_>,
+    ) -> Result<DisposedJointQuantum, (Self, RawQuantumRefusal)> {
+        if let Err(reason) = self.preflight(ports) {
+            return Err((self, reason));
+        }
+        if !self.pending_h3_is_owned(ports, view) {
             return Err((self, RawQuantumRefusal::H3Undisposed));
         }
         if !self.bound || self.active.is_some() || self.pending != 0 {

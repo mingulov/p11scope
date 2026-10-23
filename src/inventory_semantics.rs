@@ -1,7 +1,12 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! Private authority carried from retained Inventory inputs to a Detailed lane.
 
+mod joint;
 pub(crate) mod selected;
+
+pub(crate) use joint::{JointCommitIo, JointContinuationView};
+#[cfg(test)]
+pub(crate) use joint::{JointNativeIo, with_joint_commit_io_for_test};
 
 use crate::attach::capture::NativeDomainId;
 use crate::attach::{AttachedSemanticSet, BackendSelection, Scope, Session};

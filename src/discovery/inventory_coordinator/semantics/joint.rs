@@ -5,6 +5,7 @@
 use super::*;
 use crate::attach::SessionDrainProducers;
 use crate::discovery::caller_registry::CallerRegistry;
+use crate::inventory_semantics::{JointCommitIo, JointContinuationView};
 use crate::semantics_objects::journal::joint_audit::{
     DisposedJointQuantum, IngestedJointQuantum, JointBirthEvidenceSource, QuantumSealProgress,
 };
@@ -17,11 +18,40 @@ use crate::semantics_objects::journal::{FaultEpoch, FaultReadError};
 /// Stack-only borrows of the same original service inputs. Erasing the I/O
 /// leaf here keeps the ordinary and Joint callers on commit_batch_inner.
 pub(in crate::discovery::engine::inventory_coordinator) struct JointCommitInput<'a> {
+    continuation: JointContinuationInput<'a>,
     producers: &'a SessionDrainProducers,
     frame: &'a mut Option<IngestedJointQuantum>,
     births: &'a mut dyn JointBirthEvidenceSource,
     fault: &'a dyn FaultEpoch,
     remaining: &'a mut usize,
+}
+
+enum JointContinuationInput<'a> {
+    Scoped(JointContinuationView<'a>),
+    // Old fixtures retain a whole-owner RefCell. Borrow its actual view only
+    // during pending checks, never across their separate birth callback.
+    #[cfg(test)]
+    Legacy(&'a AttestedSemanticLane),
+}
+
+impl JointContinuationInput<'_> {
+    fn matches_producers(&self, producers: &SessionDrainProducers) -> bool {
+        match self {
+            Self::Scoped(view) => view.matches_producers(producers),
+            #[cfg(test)]
+            Self::Legacy(lane) => {
+                lane.domain() == producers.native_domain() && lane.is_live() && !lane.is_finished()
+            }
+        }
+    }
+
+    fn with_view<R>(&self, inspect: impl FnOnce(&JointContinuationView<'_>) -> R) -> Option<R> {
+        match self {
+            Self::Scoped(view) => Some(inspect(view)),
+            #[cfg(test)]
+            Self::Legacy(lane) => lane.with_joint_continuation(inspect),
+        }
+    }
 }
 
 struct BorrowedBirths<'a>(&'a mut dyn JointBirthEvidenceSource);
@@ -101,6 +131,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn commit_joint_batch(
         &mut self,
         lane: &mut AttestedSemanticLane,
@@ -112,8 +143,33 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     ) -> Result<JointCommitProgress> {
         self.commit_batch_inner(
             false, // Its original engine tail already finished in preparation.
-            Some(lane),
+            None,
             Some(JointCommitInput {
+                continuation: JointContinuationInput::Legacy(lane),
+                producers,
+                frame,
+                births,
+                fault,
+                remaining,
+            }),
+        )
+    }
+
+    /// The live branch receives only disjoint immutable H0 custody and the
+    /// same Session's scope-bound native readers, never the whole lane.
+    pub(crate) fn commit_joint_batch_with_io(
+        &mut self,
+        io: JointCommitIo<'_>,
+        producers: &SessionDrainProducers,
+        frame: &mut Option<IngestedJointQuantum>,
+        remaining: &mut usize,
+    ) -> Result<JointCommitProgress> {
+        let (continuation, births, fault) = io.into_parts();
+        self.commit_batch_inner(
+            false,
+            None,
+            Some(JointCommitInput {
+                continuation: JointContinuationInput::Scoped(continuation),
                 producers,
                 frame,
                 births,
@@ -125,10 +181,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
 
     pub(in crate::discovery::engine::inventory_coordinator) fn commit_joint_publication_inner(
         &mut self,
-        lane: &mut AttestedSemanticLane,
         input: JointCommitInput<'_>,
     ) -> Result<JointCommitProgress> {
         let JointCommitInput {
+            continuation,
             producers,
             frame,
             births,
@@ -141,7 +197,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         if self.joint_publication.is_none() || !self.registry.publication_pending() {
             bail!("Joint physical preparation must precede admissions and the original audit");
         }
-        if lane.domain() != producers.native_domain() || !lane.is_live() || lane.is_finished() {
+        if !continuation.matches_producers(producers) {
             bail!("Joint publication must retain its original live lane");
         }
         // Every mismatch/refusal precedes engine/cgroup/finalizer/observer
@@ -171,7 +227,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             // grants no permission: every seal/delivery rechecks the frame.
             ports.split().0.mark_joint_publication_targets_bound();
         }
-        if let Some(disposed) = self.finish_joint_frame_if_ready(frame, producers, lane)? {
+        if let Some(disposed) = self.finish_joint_frame_if_ready(frame, producers, &continuation)? {
             return Ok(self.complete_joint_publication(disposed));
         }
         let mut births = BorrowedBirths(births);
@@ -188,7 +244,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 held.deliver_next_bounded(&mut ports, remaining)
                     .map_err(|reason| anyhow::anyhow!("Joint delivery refused: {reason:?}"))?;
             }
-            if let Some(disposed) = self.finish_joint_frame_if_ready(frame, producers, lane)? {
+            if let Some(disposed) =
+                self.finish_joint_frame_if_ready(frame, producers, &continuation)?
+            {
                 return Ok(self.complete_joint_publication(disposed));
             }
             if *remaining == before {
@@ -202,7 +260,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         &mut self,
         frame: &mut Option<IngestedJointQuantum>,
         producers: &SessionDrainProducers,
-        lane: &AttestedSemanticLane,
+        continuation: &JointContinuationInput<'_>,
     ) -> Result<Option<DisposedJointQuantum>> {
         let mut ports = self
             .joint_frame_ports(producers)
@@ -212,20 +270,26 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .expect("same original frame until actual finish");
         let result = match held.finish_frame(&mut ports) {
             Ok(disposed) => return Ok(Some(disposed)),
-            Err((mut held, RawQuantumRefusal::H3Undisposed)) => {
-                match held.defer_pending_h3(&mut ports, lane) {
-                    Ok(QuantumSealProgress::AwaitFutureInput | QuantumSealProgress::Complete) => {
-                        held.finish_pending_h3(&mut ports, lane)
-                    }
-                    Ok(_) | Err(RawQuantumRefusal::DispositionMismatch) => {
-                        *frame = Some(held);
-                        return Ok(None);
-                    }
-                    Err(reason) => {
-                        *frame = Some(held);
-                        bail!("Joint continuation refused: {reason:?}");
-                    }
-                }
+            Err((held, RawQuantumRefusal::H3Undisposed)) => {
+                let mut original = Some(held);
+                continuation
+                    .with_view(|view| {
+                        let mut held = original.take().expect("one original pending frame");
+                        match held.defer_pending_h3_with_view(&mut ports, view) {
+                            Ok(
+                                QuantumSealProgress::AwaitFutureInput
+                                | QuantumSealProgress::Complete,
+                            ) => held.finish_pending_h3_with_view(&mut ports, view),
+                            Ok(_) => Err((held, RawQuantumRefusal::H3Undisposed)),
+                            Err(reason) => Err((held, reason)),
+                        }
+                    })
+                    .unwrap_or_else(|| {
+                        Err((
+                            original.expect("an unavailable view preserves the same frame"),
+                            RawQuantumRefusal::H3Undisposed,
+                        ))
+                    })
             }
             Err(other) => Err(other),
         };

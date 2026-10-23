@@ -5375,9 +5375,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         joint: Option<semantics::JointCommitInput<'_>>,
     ) -> Result<JointCommitProgress> {
         if let Some(joint) = joint {
-            let lane = lane
-                .ok_or_else(|| anyhow::anyhow!("Joint publication requires its retained lane"))?;
-            return self.commit_joint_publication_inner(lane, joint);
+            return self.commit_joint_publication_inner(joint);
         }
         if self.publication_pending() {
             bail!("an unfinished Joint publication must resume its original frame");

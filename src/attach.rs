@@ -11299,7 +11299,8 @@ mod tests {
                 .all(|group| group.entry_program == "p11_counter_bank_entry"
                     && group.return_program == "p11_counter_bank_return")
         );
-        let mut calls: Vec<(&'static str, Vec<(u64, u64)>, bool)> = Vec::new();
+        type RecordedMultiCall = (&'static str, Vec<(u64, u64)>, bool);
+        let mut calls: Vec<RecordedMultiCall> = Vec::new();
         let (bundles, outcome) = attach_target_groups_with(
             &groups,
             |_| Some(7),
@@ -11311,7 +11312,7 @@ mod tests {
         .unwrap();
         let _: &Vec<MultiLinkBundle<OwnedFd>> = &bundles;
         assert_eq!(calls.len(), 4);
-        for pair in calls.chunks_exact(2) {
+        for pair in calls.as_chunks::<2>().0 {
             assert_eq!((pair[0].0, pair[0].2), ("p11_counter_bank_return", true));
             assert_eq!((pair[1].0, pair[1].2), ("p11_counter_bank_entry", false));
             assert_eq!(pair[0].1, pair[1].1);

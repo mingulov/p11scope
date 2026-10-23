@@ -683,6 +683,40 @@ impl RawJointQuantum {
         Ok(())
     }
 
+    /// The original collection may refresh its first provider before H0 has
+    /// routed ordinary records. This checks custody, never delivery or health.
+    pub(crate) fn validate_refresh(
+        &self,
+        adapter: &JournalAdapter,
+        producers: &SessionDrainProducers,
+    ) -> Result<(), RawQuantumRefusal> {
+        self.validate_owner(adapter, producers)?;
+        if adapter.stopped || adapter.invalidated {
+            return Err(RawQuantumRefusal::Stopped);
+        }
+        let cuts = self
+            .cuts
+            .as_ref()
+            .ok_or(RawQuantumRefusal::DispositionMismatch)?;
+        if !producers.matches_events(cuts.start.events())
+            || !cuts.end.as_ref().is_some_and(|end| {
+                producers.matches_events(end.events()) && end.cursor() == cuts.start.cursor()
+            })
+        {
+            return Err(RawQuantumRefusal::ForeignCapture);
+        }
+        if !adapter.accepts_birth_cut(&cuts.birth)
+            || adapter.consumed_frontier() != cuts.birth.ordinal
+            || !adapter
+                .stream_boundary
+                .as_ref()
+                .is_some_and(|boundary| boundary.same_boundary(&cuts.start))
+        {
+            return Err(RawQuantumRefusal::StaleFrontier);
+        }
+        Ok(())
+    }
+
     /// Read-only preparation gate over this original collector allocation.
     /// A malformed/loss collection can still carry its genuine negative;
     /// matching custody never upgrades its cuts to a clean prefix.

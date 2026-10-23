@@ -19,6 +19,7 @@ use crate::semantic_capture::{
 use crate::semantics_edge::resources::{
     OWNED_ALLOCATION_PADDING, ResourceLease, SemanticResourceRefusal,
 };
+use crate::semantics_objects::journal::JournalAdapter;
 use crate::semantics_objects::journal::joint_driver::RawJointQuantum;
 use p11scope_ebpf_common::ImageIdentity;
 use std::sync::Arc;
@@ -472,6 +473,16 @@ pub(crate) trait LaneTestIo {
         pin: Arc<PidPin>,
         slot: u32,
     ) -> Result<(Vec<ImageIdentity>, Arc<PidPin>), SemanticRefusal>;
+    fn refresh_collected(
+        &mut self,
+        _pin: Arc<PidPin>,
+        _slot: u32,
+        _raw: &mut RawJointQuantum,
+        _adapter: &JournalAdapter,
+        _producers: &crate::attach::SessionDrainProducers,
+    ) -> Result<(Vec<ImageIdentity>, Arc<PidPin>), SemanticRefusal> {
+        Err(SemanticRefusal::Unavailable)
+    }
     /// Whether stashed evidence awaits a tick (the stop pre-flush gate).
     fn has_pending_evidence(&self) -> bool;
     /// The real H0 stop plus the production Finish batch construction.
@@ -1190,12 +1201,30 @@ impl AttestedSemanticLane {
         pin: Arc<PidPin>,
         slot: u32,
     ) -> Result<(Vec<ImageIdentity>, Arc<PidPin>), SemanticRefusal> {
+        self.refresh_candidate_with_custody_inner(pin, slot, None)
+    }
+
+    fn refresh_candidate_with_custody_inner(
+        &mut self,
+        pin: Arc<PidPin>,
+        slot: u32,
+        collected: Option<(
+            &mut RawJointQuantum,
+            &JournalAdapter,
+            &crate::attach::SessionDrainProducers,
+        )>,
+    ) -> Result<(Vec<ImageIdentity>, Arc<PidPin>), SemanticRefusal> {
         #[cfg(test)]
         if let Some(test) = self.test_io.as_mut() {
             if self.test_gated || self.test_finished {
                 return Err(SemanticRefusal::Unavailable);
             }
-            return test.refresh(pin, slot);
+            return match collected {
+                Some((raw, adapter, producers)) => {
+                    test.refresh_collected(pin, slot, raw, adapter, producers)
+                }
+                None => test.refresh(pin, slot),
+            };
         }
         let Some(live) = self.live.as_mut() else {
             return Err(SemanticRefusal::Unavailable);
@@ -1203,10 +1232,18 @@ impl AttestedSemanticLane {
         if live.gated || live.finished {
             return Err(SemanticRefusal::Unavailable);
         }
-        let mut report = live
-            .capture
-            .refresh(&mut live.session, pin.clone(), slot)
-            .map_err(|_| SemanticRefusal::Unavailable)?;
+        let mut report = match collected {
+            Some((raw, adapter, producers)) => live.capture.refresh_collected(
+                &mut live.session,
+                pin.clone(),
+                slot,
+                raw,
+                adapter,
+                producers,
+            ),
+            None => live.capture.refresh(&mut live.session, pin.clone(), slot),
+        }
+        .map_err(|_| SemanticRefusal::Unavailable)?;
         live.scan_refusals = live
             .scan_refusals
             .saturating_add(report.scan_refusals.len() as u64);
@@ -1229,6 +1266,36 @@ impl AttestedSemanticLane {
         reserve: impl FnOnce(usize) -> Result<ResourceLease, SemanticResourceRefusal>,
     ) -> Result<PreparedSemanticAdmission, SemanticRefusal> {
         let (_, effective) = self.refresh_candidate_with_custody(pin, slot)?;
+        self.prepare_refreshed_caller_admission(effective, slot, module, reserve)
+    }
+
+    /// The same admission consumer, with New tied to the original collected
+    /// prefix before any ordinary H0 input is acknowledged.
+    #[allow(clippy::too_many_arguments)] // Original collection and existing owners are borrowed, never duplicated.
+    pub(crate) fn prepare_caller_admission_collected(
+        &mut self,
+        pin: Arc<PidPin>,
+        slot: u32,
+        module: &ModuleKey,
+        raw: &mut RawJointQuantum,
+        adapter: &JournalAdapter,
+        producers: &crate::attach::SessionDrainProducers,
+        reserve: impl FnOnce(usize) -> Result<ResourceLease, SemanticResourceRefusal>,
+    ) -> Result<PreparedSemanticAdmission, SemanticRefusal> {
+        raw.validate_refresh(adapter, producers)
+            .map_err(|_| SemanticRefusal::Unavailable)?;
+        let (_, effective) =
+            self.refresh_candidate_with_custody_inner(pin, slot, Some((raw, adapter, producers)))?;
+        self.prepare_refreshed_caller_admission(effective, slot, module, reserve)
+    }
+
+    fn prepare_refreshed_caller_admission(
+        &mut self,
+        effective: Arc<PidPin>,
+        slot: u32,
+        module: &ModuleKey,
+        reserve: impl FnOnce(usize) -> Result<ResourceLease, SemanticResourceRefusal>,
+    ) -> Result<PreparedSemanticAdmission, SemanticRefusal> {
         #[cfg(test)]
         let receipt = if let Some(test) = self.test_io.as_mut() {
             test.take_refresh_receipt(&effective, slot)

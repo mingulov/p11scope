@@ -1752,7 +1752,65 @@ impl SemanticCapture {
         pin: Arc<PidPin>,
         slot: u32,
     ) -> anyhow::Result<TickReport> {
-        let mut report = self.refresh_with_inner(io, pin, slot)?;
+        let mut report = self.refresh_with_inner(io, pin, slot, None)?;
+        self.stamp_disposition(&mut report);
+        Ok(report)
+    }
+
+    /// Refresh against the original pre-H0 cut, without routing or acknowledging
+    /// any of its records. The same Capture owns the later collected tick.
+    #[allow(clippy::too_many_arguments)] // Borrow the original raw and its existing producer/ledger owners together.
+    pub(crate) fn refresh_collected(
+        &mut self,
+        session: &mut Session,
+        pin: Arc<PidPin>,
+        slot: u32,
+        quantum: &mut crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+        adapter: &JournalAdapter,
+        producers: &crate::attach::SessionDrainProducers,
+    ) -> anyhow::Result<TickReport> {
+        self.refresh_collected_with(
+            &mut SessionIo {
+                session,
+                targets: &[],
+            },
+            pin,
+            slot,
+            quantum,
+            adapter,
+            producers,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // The real I/O leaf retains the same original authority borrows.
+    fn refresh_collected_with(
+        &mut self,
+        io: &mut impl CaptureIo,
+        pin: Arc<PidPin>,
+        slot: u32,
+        quantum: &mut crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+        adapter: &JournalAdapter,
+        producers: &crate::attach::SessionDrainProducers,
+    ) -> anyhow::Result<TickReport> {
+        quantum
+            .validate_refresh(adapter, producers)
+            .map_err(|reason| anyhow::anyhow!("retained semantic refresh: {reason:?}"))?;
+        anyhow::ensure!(
+            io.domain() == Some(self.router.domain()),
+            "foreign semantic Session"
+        );
+        anyhow::ensure!(!self.stopped, "semantic capture stopped");
+        quantum
+            .h0_input(self.router.domain(), self.limits.records)
+            .map_err(|reason| anyhow::anyhow!("retained semantic collection: {reason:?}"))?;
+        quantum
+            .pin_h0_owner(CollectedH0Owner(self.identity))
+            .map_err(|reason| anyhow::anyhow!("retained semantic owner: {reason:?}"))?;
+        let birth_cut = quantum
+            .birth_cut()
+            .cloned()
+            .map(|cut| (cut, quantum.h0_identity()));
+        let mut report = self.refresh_with_inner(io, pin, slot, birth_cut)?;
         self.stamp_disposition(&mut report);
         Ok(report)
     }
@@ -1793,6 +1851,10 @@ impl SemanticCapture {
         io: &mut impl CaptureIo,
         pin: Arc<PidPin>,
         slot: u32,
+        birth_cut: Option<(
+            JournalBirthCut,
+            crate::semantics_objects::journal::joint_driver::RawQuantumIdentity,
+        )>,
     ) -> anyhow::Result<TickReport> {
         anyhow::ensure!(
             io.domain() == Some(self.router.domain()),
@@ -1849,7 +1911,7 @@ impl SemanticCapture {
                         slot,
                         pin,
                         deadline: proof_deadline,
-                        birth_cut: None,
+                        birth_cut,
                     };
                     self.accept_scan(io, proof, &job, fence, &mut report);
                 }

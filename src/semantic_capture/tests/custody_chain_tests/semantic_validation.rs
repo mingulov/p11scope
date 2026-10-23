@@ -569,6 +569,36 @@ impl LaneTestIo for SharedH0 {
         assert_eq!(shed, 0);
         Ok((images, effective))
     }
+    fn refresh_collected(
+        &mut self,
+        pin: Arc<PidPin>,
+        slot: u32,
+        raw: &mut crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+        adapter: &crate::semantics_objects::journal::JournalAdapter,
+        producers: &crate::attach::SessionDrainProducers,
+    ) -> Result<(Vec<ImageIdentity>, Arc<PidPin>), SemanticRefusal> {
+        let mut owned = self.0.borrow_mut();
+        let HeldH0 {
+            capture,
+            io,
+            stash,
+            last_refresh_observation,
+            last_refresh_birth,
+            ..
+        } = &mut *owned;
+        let mut report = capture
+            .refresh_collected_with(io, pin.clone(), slot, raw, adapter, producers)
+            .map_err(|_| SemanticRefusal::Unavailable)?;
+        *last_refresh_observation = report.observations.last().cloned();
+        *last_refresh_birth = report
+            .current()
+            .iter()
+            .find_map(|receipt| receipt.birth.as_ref().map(|(_, _, quantum)| *quantum));
+        let effective = effective_refresh_custody(&report, pin);
+        let (images, shed) = stash_refresh_report(stash, &mut report);
+        assert_eq!(shed, 0);
+        Ok((images, effective))
+    }
     fn has_pending_evidence(&self) -> bool {
         !self.0.borrow().stash.is_empty()
     }

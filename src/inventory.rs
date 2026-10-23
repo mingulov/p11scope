@@ -1801,8 +1801,10 @@ struct ClassicDriver<'a> {
 pub(crate) fn bind_semantic_callers_for_test(
     coordinator: &mut InventoryCoordinator<OsProcessSource>,
     lane: &mut crate::inventory_semantics::AttestedSemanticLane,
-) {
-    bind_semantic_callers(coordinator, lane);
+    raw: &mut crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+    producers: &crate::attach::SessionDrainProducers,
+) -> Result<(), crate::semantics_objects::journal::joint_driver::RawQuantumRefusal> {
+    bind_collected_semantic_callers(coordinator, lane, raw, producers)
 }
 
 /// Exercise the production driver tick with substituted lane I/O.
@@ -2848,6 +2850,30 @@ fn bind_semantic_callers(
     coordinator: &mut InventoryCoordinator<OsProcessSource>,
     lane: &mut crate::inventory_semantics::AttestedSemanticLane,
 ) {
+    bind_semantic_callers_inner(coordinator, lane, None);
+}
+
+#[allow(dead_code)] // The collected runtime calls this path after its AwaitH0 state lands.
+fn bind_collected_semantic_callers(
+    coordinator: &mut InventoryCoordinator<OsProcessSource>,
+    lane: &mut crate::inventory_semantics::AttestedSemanticLane,
+    raw: &mut crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+    producers: &crate::attach::SessionDrainProducers,
+) -> Result<(), crate::semantics_objects::journal::joint_driver::RawQuantumRefusal> {
+    // No refresh selector/cursor or admission write precedes this preflight.
+    raw.validate_refresh(coordinator.joint_capture().adapter(), producers)?;
+    bind_semantic_callers_inner(coordinator, lane, Some((raw, producers)));
+    Ok(())
+}
+
+fn bind_semantic_callers_inner(
+    coordinator: &mut InventoryCoordinator<OsProcessSource>,
+    lane: &mut crate::inventory_semantics::AttestedSemanticLane,
+    mut collected: Option<(
+        &mut crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+        &crate::attach::SessionDrainProducers,
+    )>,
+) {
     if !lane.is_live() || lane.is_finished() {
         return;
     }
@@ -2862,9 +2888,23 @@ fn bind_semantic_callers(
             coordinator.semantic_admission_refused(attempt.caller, "caller_custody_unproven");
             continue;
         };
-        match lane.prepare_caller_admission(candidate.pin(), attempt.slot, &module, |bytes| {
-            coordinator.registry().reserve_semantic_storage(bytes)
-        }) {
+        let prepared = match collected.as_mut() {
+            Some((raw, producers)) => lane.prepare_caller_admission_collected(
+                candidate.pin(),
+                attempt.slot,
+                &module,
+                raw,
+                coordinator.joint_capture().adapter(),
+                producers,
+                |bytes| coordinator.registry().reserve_semantic_storage(bytes),
+            ),
+            None => {
+                lane.prepare_caller_admission(candidate.pin(), attempt.slot, &module, |bytes| {
+                    coordinator.registry().reserve_semantic_storage(bytes)
+                })
+            }
+        };
+        match prepared {
             Ok(prepared) => {
                 let (receipt, _) =
                     coordinator.consume_semantic_admission(candidate, prepared, None);

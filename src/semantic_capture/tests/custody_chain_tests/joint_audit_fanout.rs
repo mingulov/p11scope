@@ -25,6 +25,29 @@ fn joint_real_bind_refresh_preserves_collected_first_new() {
     for (tick_first, refuse_first) in [(true, false), (true, true), (false, false), (false, true)] {
         let (held, attached) = HeldProviders::with_attachment(1, &["C_CreateObject", "C_SignInit"]);
         let mut scene = JointScene::from_held(held, Some(attached));
+        // Bind a genuinely different ledger to this same actual producer
+        // allocation while its cursor is still initial. It cannot refresh a
+        // later raw collected through the canonical owner.
+        let mut foreign_adapter =
+            JournalAdapter::new(crate::semantics_objects::journal::JournalLimits::default());
+        let reserve = scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .semantic_storage_reserver();
+        let foreign_raw = RawJointQuantum::collect_bounded_with_adapter(
+            &mut scene.drain,
+            &publish_object_descriptors(),
+            64,
+            None,
+            &BirthFault,
+            &scene.producers,
+            |bytes| reserve.reserve(bytes),
+            &mut foreign_adapter,
+        )
+        .unwrap();
+        drop(foreign_raw);
         let pid = std::process::id();
         let image = ImageIdentity {
             task_cookie: 71,
@@ -98,10 +121,73 @@ fn joint_real_bind_refresh_preserves_collected_first_new() {
                 .reserve_semantic_storage(snapshot.limit_bytes - snapshot.charged_bytes)
                 .unwrap()
         });
+        let mut raw = scene.real.h0.0.borrow_mut().collected.take().unwrap();
+        assert_eq!(
+            raw.validate_refresh(&foreign_adapter, &scene.producers),
+            Err(RawQuantumRefusal::ForeignLedger),
+            "equal producer allocation cannot replace the original ledger"
+        );
+        let foreign_producers = crate::attach::SessionDrainProducers::test_pair(
+            scene.real.lane.domain(),
+            EventsDomain::test_standin(scene.producers.events_id()),
+        );
+        assert_eq!(
+            crate::inventory::bind_semantic_callers_for_test(
+                &mut scene.real.scene.coordinator,
+                &mut scene.real.lane,
+                &mut raw,
+                &foreign_producers,
+            ),
+            Err(RawQuantumRefusal::ForeignCapture),
+            "equal native/map IDs cannot start a foreign refresh"
+        );
+        assert!(scene.real.h0.0.borrow().last_refresh_observation.is_none());
+        assert_eq!(scene.real.scene.coordinator.semantic_bindings().len(), 0);
         crate::inventory::bind_semantic_callers_for_test(
             &mut scene.real.scene.coordinator,
             &mut scene.real.lane,
-        );
+            &mut raw,
+            &scene.producers,
+        )
+        .expect("the binder borrows the same original collected prefix");
+        {
+            let mut owned = scene.real.h0.0.borrow_mut();
+            let slot = owned.io.slot(0, "C_SignInit");
+            let before = (
+                owned.io.script.now,
+                owned.io.script.health.len(),
+                owned.io.script.raises,
+                owned.capture.next_token,
+                raw.pending_h0_records(),
+            );
+            let mut foreign_capture =
+                SemanticCapture::in_domain(scene.real.lane.domain(), TickLimits::default())
+                    .unwrap();
+            assert!(
+                foreign_capture
+                    .refresh_collected_with(
+                        &mut owned.io,
+                        original_pin.clone(),
+                        slot,
+                        &mut raw,
+                        scene.real.scene.coordinator.joint_capture().adapter(),
+                        &scene.producers,
+                    )
+                    .is_err()
+            );
+            assert_eq!(
+                (
+                    owned.io.script.now,
+                    owned.io.script.health.len(),
+                    owned.io.script.raises,
+                    owned.capture.next_token,
+                    raw.pending_h0_records(),
+                ),
+                before,
+                "another Capture in the same native domain refuses before any audit or scan"
+            );
+        }
+        scene.real.h0.0.borrow_mut().collected = Some(raw);
         {
             let owned = scene.real.h0.0.borrow();
             assert_eq!(
@@ -122,13 +208,30 @@ fn joint_real_bind_refresh_preserves_collected_first_new() {
             usize::from(!refuse_first),
             "the storage refusal exercises the actual admission consumer"
         );
+        if refuse_first {
+            assert!(
+                scene
+                    .real
+                    .scene
+                    .coordinator
+                    .registry()
+                    .gaps()
+                    .iter()
+                    .any(|gap| gap.reason == "provider_storage_refused")
+            );
+        }
         drop(hold);
         // The newest matching receipt on retry is Continued. It may support
         // admission, but cannot replace or recreate the original New.
+        let mut raw = scene.real.h0.0.borrow_mut().collected.take().unwrap();
         crate::inventory::bind_semantic_callers_for_test(
             &mut scene.real.scene.coordinator,
             &mut scene.real.lane,
-        );
+            &mut raw,
+            &scene.producers,
+        )
+        .expect("the retry retains that same original collected prefix");
+        scene.real.h0.0.borrow_mut().collected = Some(raw);
         {
             let owned = scene.real.h0.0.borrow();
             assert_eq!(

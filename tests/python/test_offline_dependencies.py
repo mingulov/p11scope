@@ -17,6 +17,7 @@ import tarfile
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 
 REPOSITORY = Path(__file__).resolve().parents[2]
@@ -195,10 +196,35 @@ class OfflineFixture:
         }) + "\n", encoding="utf-8")
 
         self.shared_url = "https://example.invalid/shared-dependency"
-        self.shared_revision = subprocess.run(
-            ["git", "rev-parse", "HEAD"], cwd=REPOSITORY, check=True,
-            stdout=subprocess.PIPE, text=True,
-        ).stdout.strip()
+        shared_repository = temporary / "shared Git repository"
+        shared_repository.mkdir()
+        shared_files = {
+            "Cargo.toml": "[package]\nname = 'shared'\nversion = '0.1.0'\n",
+            "src.rs": "shared payload\n",
+            "LICENSE-APACHE": "fixture Apache license\n",
+            "LICENSE-MIT": "fixture MIT license\n",
+        }
+        for name, content in shared_files.items():
+            (shared_repository / name).write_text(content, encoding="utf-8")
+        git_environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+        # Fixed test data keeps the revision identical across related refusal scenes.
+        git_environment.update({
+            "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_AUTHOR_NAME": "Offline fixture", "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
+            "GIT_COMMITTER_NAME": "Offline fixture", "GIT_COMMITTER_EMAIL": "fixture@example.invalid",
+            "GIT_AUTHOR_DATE": "2000-01-01T00:00:00Z", "GIT_COMMITTER_DATE": "2000-01-01T00:00:00Z",
+        })
+
+        def git(*arguments):
+            return subprocess.run(
+                ["git", *arguments], cwd=shared_repository, env=git_environment,
+                check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            ).stdout
+
+        git("-c", "init.templateDir=", "init", "-q", "--object-format=sha1", "--initial-branch=fixture")
+        git("add", "--", *shared_files)
+        git("commit", "-qm", "fixture: shared dependency")
+        self.shared_revision = git("rev-parse", "HEAD").strip()
         shared_source = f"git+{self.shared_url}?rev={self.shared_revision}#{self.shared_revision}"
         (self.root / "Cargo.lock").write_text(self._lock(shared_source, root=True), encoding="utf-8")
         (self.root / "crates/ebpf/Cargo.lock").write_text(
@@ -221,10 +247,7 @@ class OfflineFixture:
 
         self.shared = temporary / "shared source"
         self.shared.mkdir()
-        subprocess.run(
-            ["git", "bundle", "create", str(self.shared / "source.bundle"), "HEAD"],
-            cwd=REPOSITORY, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        )
+        git("bundle", "create", str(self.shared / "source.bundle"), "HEAD")
         (self.shared / "LICENSE-APACHE").write_text("fixture Apache license\n", encoding="utf-8")
         (self.shared / "LICENSE-MIT").write_text("fixture MIT license\n", encoding="utf-8")
 
@@ -399,6 +422,47 @@ class OfflineDependenciesTests(unittest.TestCase):
         self.assertEqual(result.stdout, "")
         for needle in needles:
             self.assertIn(needle, result.stderr)
+
+    def test_synthetic_shared_bundle_is_owned_single_commit_history(self):
+        owned = Path(self.temporary.name).resolve()
+        real_run = subprocess.run
+        git_commands = []
+
+        def owned_git_only(command, *args, **kwargs):
+            if command[0] == "git":
+                cwd = Path(kwargs.get("cwd", Path.cwd())).resolve()
+                self.assertTrue(cwd.is_relative_to(owned),
+                                f"synthetic fixture consulted product history: {command!r}")
+                git_commands.append(command)
+            return real_run(command, *args, **kwargs)
+
+        with patch.dict(os.environ, {"GIT_DIR": str(owned / "unrelated missing repository")}), \
+                patch.object(subprocess, "run", side_effect=owned_git_only):
+            fixture = self.fixture
+        self.assertTrue(git_commands)
+        helper = load_module(HELPER, "owned_shared_bundle_helper")
+        bundle = fixture.shared / "source.bundle"
+        self.assertEqual(helper._bundle_revision(bundle), fixture.shared_revision)
+        for relative in ("Cargo.lock", "crates/ebpf/Cargo.lock"):
+            shared, _ = helper._locked_dependencies([fixture.root / relative])
+            self.assertEqual(shared, {"url": fixture.shared_url, "revision": fixture.shared_revision})
+
+        repository = owned / "independent bundle import"
+        (repository / "objects").mkdir(parents=True)
+        (repository / "refs").mkdir()
+        (repository / "HEAD").write_text("ref: refs/heads/unused\n", encoding="ascii")
+        environment = helper._isolated_git_environment()
+
+        def git(*arguments):
+            return subprocess.run(
+                ["git", f"--git-dir={repository}", *arguments], env=environment,
+                check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            ).stdout
+
+        git("bundle", "unbundle", str(bundle))
+        self.assertEqual(git("rev-list", "--count", fixture.shared_revision).strip(), "1")
+        self.assertEqual(git("ls-tree", "-r", "--name-only", fixture.shared_revision).splitlines(),
+                         ["Cargo.toml", "LICENSE-APACHE", "LICENSE-MIT", "src.rs"])
 
     def test_maintained_recipe_matches_repository_inputs_and_both_shared_lock_identities(self):
         helper = load_module(HELPER, "maintained_offline_dependency_recipe")

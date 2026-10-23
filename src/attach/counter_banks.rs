@@ -1161,23 +1161,29 @@ impl CounterKeepalive {
         Self::precharge_with_geometry(reserve, bytes, CountsBankGeometry::legacy())
     }
 
-    fn precharge_with_geometry(
-        reserve: &SemanticResourceReserver,
-        bytes: usize,
-        geometry: CountsBankGeometry,
-    ) -> Result<Arc<Self>> {
+    // One checked holder formula serves standalone precharge and preparation's
+    // map/custody overlap. The latter already counts Self in its inline floor.
+    fn allocation_bytes(geometry: CountsBankGeometry) -> Result<usize> {
         geometry
             .validate()
             .map_err(|_| anyhow::anyhow!("unsupported counter geometry"))?;
-        let positions = geometry.limit() as usize;
-        let required = positions
+        (geometry.limit() as usize)
             .checked_mul(size_of::<Option<RetainedInventoryTarget>>() + size_of::<ResourceLease>())
             .and_then(|n| {
                 n.checked_add(
                     size_of::<Self>() + 2 * size_of::<usize>() + 3 * OWNED_ALLOCATION_PADDING,
                 )
             })
-            .context("counter custody capacity overflow")?;
+            .context("counter custody capacity overflow")
+    }
+
+    fn precharge_with_geometry(
+        reserve: &SemanticResourceReserver,
+        bytes: usize,
+        geometry: CountsBankGeometry,
+    ) -> Result<Arc<Self>> {
+        let required = Self::allocation_bytes(geometry)?;
+        let positions = geometry.limit() as usize;
         ensure!(
             bytes >= required,
             "counter custody reservation is smaller than its bounded holders"
@@ -1312,17 +1318,25 @@ impl<'a> CounterPreparation<'a> {
         } else {
             payload
         }; // Format2 real banks are precharged by each stage.
+        let payload_floor = payload
+            .checked_add(
+                size_of::<CounterBanks>()
+                    + size_of::<CounterKeepalive>()
+                    + size_of::<Session>()
+                    + 16 * OWNED_ALLOCATION_PADDING,
+            )
+            .context("counter retained bound overflow")?;
         ensure!(
-            envelope.retained_bytes
-                >= payload
-                    .checked_add(
-                        size_of::<CounterBanks>()
-                            + size_of::<CounterKeepalive>()
-                            + size_of::<Session>()
-                            + 16 * OWNED_ALLOCATION_PADDING
-                    )
-                    .context("counter retained bound overflow")?,
+            envelope.retained_bytes >= payload_floor,
             "counter retained reservation is smaller than configured data capacity"
+        );
+        let combined_floor = payload_floor
+            .checked_sub(size_of::<CounterKeepalive>())
+            .and_then(|bytes| bytes.checked_add(CounterKeepalive::allocation_bytes(geometry).ok()?))
+            .context("counter map/custody overlap bound overflow")?;
+        ensure!(
+            retained >= combined_floor,
+            "counter retained and metadata reservation cannot cover maps and custody together"
         );
         let descriptors = parsed
             .maps

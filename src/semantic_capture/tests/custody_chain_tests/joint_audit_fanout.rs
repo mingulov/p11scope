@@ -1687,7 +1687,7 @@ fn joint_machine_empty_disposition_requires_actual_quiet_original() {
             Err(RawQuantumRefusal::ForeignCapture)
         );
         let foreign_owner = crate::semantics_objects::journal::joint_driver::JointCaptureOwner::new(
-            JournalLimits::policy(),
+            crate::semantics_objects::journal::JournalLimits::policy(),
             coordinator.registry().semantic_storage_reserver(),
         );
         assert!(

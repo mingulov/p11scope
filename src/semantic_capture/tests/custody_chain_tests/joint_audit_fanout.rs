@@ -17,6 +17,140 @@ enum PublicationReceipts {
     Capacity(usize),
 }
 
+/// A payload-only envelope must fail against the actual std HashMap requests,
+/// including every resize and the bucket allocation retained after removal.
+#[test]
+fn joint_grant_table_envelope_covers_actual_capacity_transitions() {
+    let (fixture, _frame) = CanonicalFanoutScene::first_publication_with_functions(
+        1,
+        &["C_CreateObject", "C_SignInit"],
+        PublicationReceipts::All,
+    );
+    crate::discovery::caller_registry::instance_input::joint_grant_allocation_probe_for_test(
+        *fixture.births[0].1.receipt(),
+    );
+}
+
+/// The complete first-table charge must refuse before the actual original New
+/// is moved, even when the pool could cover the visible-entry payload alone.
+#[test]
+fn joint_grant_allocation_refuses_before_original_new_moves() {
+    let mut scene = JointScene::for_audit(1);
+    scene.real.h0.0.borrow_mut().io.script.local = 1;
+    let pid = std::process::id();
+    let image = ImageIdentity {
+        task_cookie: 71,
+        exec_id: 0,
+    };
+    let caller = scene.real.bind(pid, image, 0);
+    scene.push(pid, 0, "C_SignInit", 1);
+    let raw = scene.collect_with_fault(&BirthFault);
+    let quantum = raw.h0_identity();
+    scene.real.h0.0.borrow_mut().collected = Some(raw);
+    let batch = scene.real.tick();
+    scene.admit_providers(pid, caller, &[0]);
+    scene.prepare_batch(batch, 1);
+    let input = scene
+        .real
+        .scene
+        .coordinator
+        .prepared_semantic_batch()
+        .unwrap()
+        .admissions()
+        .next()
+        .unwrap()
+        .clone();
+    let original_origin = input.collected_origin();
+    assert!(
+        original_origin.is_some(),
+        "the admission retains its actual collected allocation"
+    );
+    let mut current = scene
+        .real
+        .scene
+        .coordinator
+        .take_prepared_current_for_birth_test()
+        .unwrap();
+    assert_eq!(current.len(), 1);
+    let current = current.pop().unwrap();
+    let original_pin = Arc::clone(current.original_pin());
+    let registry = scene.real.scene.coordinator.registry();
+    let (payload_only, complete) = registry
+        .joint_grant_initial_allocation_for_test(&input)
+        .unwrap();
+    assert!(complete > payload_only);
+    let baseline = registry.semantic_resource_snapshot();
+    let original_roles = scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .ledger()
+        .roles_for_test();
+    let original_claims = scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .invocation_claims_for_test();
+    for allowance in [payload_only, complete - 1, complete] {
+        let hold = registry
+            .reserve_semantic_storage(baseline.limit_bytes - baseline.charged_bytes - allowance)
+            .unwrap();
+        let (reserved, allocations, bytes) =
+            crate::test_alloc::count_allocs_during(|| registry.reserve_semantic_storage(complete));
+        assert_eq!((allocations, bytes), (0, 0));
+        assert_eq!(reserved.is_ok(), allowance == complete);
+        drop(reserved);
+        drop(hold);
+        assert_eq!(
+            registry.semantic_resource_snapshot().charged_bytes,
+            baseline.charged_bytes
+        );
+        assert!(input.collected_origin() == original_origin);
+        assert_eq!(
+            scene
+                .real
+                .scene
+                .coordinator
+                .joint_capture()
+                .ledger()
+                .roles_for_test(),
+            original_roles
+        );
+        assert_eq!(
+            scene
+                .real
+                .scene
+                .coordinator
+                .joint_capture()
+                .adapter()
+                .invocation_claims_for_test(),
+            original_claims
+        );
+        assert!(
+            scene
+                .real
+                .h0
+                .0
+                .borrow()
+                .collected
+                .as_ref()
+                .unwrap()
+                .h0_identity()
+                == quantum
+        );
+        assert_eq!(registry.joint_feeds(), 0);
+    }
+    let candidate = current
+        .into_birth_candidate()
+        .unwrap_or_else(|_| panic!("precharge refusal must preserve the actual collected New"));
+    assert!(candidate.quantum == quantum);
+    assert_eq!(candidate.receipt.image(), image);
+    assert!(Arc::ptr_eq(candidate.receipt.original_pin(), &original_pin));
+}
+
 /// The real binder must not spend New before the same collected H0 can carry
 /// its birth. Only the native I/O is substituted; no semantic binding exists
 /// before this production refresh/admission path runs.

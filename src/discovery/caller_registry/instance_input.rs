@@ -24,6 +24,177 @@ use std::hash::{Hash, Hasher};
 pub(crate) const MAX_REGISTRY_INSTANCES: usize = 4096;
 pub(crate) const MAX_INSTANCE_NEGATIVE_SCOPES: usize = 4096;
 
+/// Allocation characterization only: the copied receipt came from the real
+/// collected-birth fixture. These local keys never enter a registry or grant
+/// permission; varying their routers exercises the actual grant table type.
+#[cfg(test)]
+pub(crate) fn joint_grant_allocation_probe_for_test(
+    receipt: crate::semantics_objects::journal::BootstrapReceipt,
+) {
+    use crate::semantics_edge::resources::OWNED_ALLOCATION_PADDING;
+    use crate::test_alloc::{armed_requested_snapshot, requested_peak_during};
+
+    let mut path = String::with_capacity(113);
+    path.push_str("/held/provider.so");
+    let mut digest = String::with_capacity(129);
+    digest.push_str(&"a".repeat(64));
+    for module in [
+        ModuleKey::Physical {
+            dev_major: 1,
+            dev_minor: 0,
+            ino: 1,
+            sha256: None,
+        },
+        ModuleKey::Physical {
+            dev_major: 1,
+            dev_minor: 0,
+            ino: 1,
+            sha256: Some(String::with_capacity(31)),
+        },
+        ModuleKey::Physical {
+            dev_major: 1,
+            dev_minor: 0,
+            ino: 1,
+            sha256: Some(digest),
+        },
+        ModuleKey::Unidentified { path },
+    ] {
+        let copied_text = match &module {
+            ModuleKey::Physical { sha256, .. } => sha256.as_ref().map_or(0, String::len),
+            ModuleKey::Unidentified { path } => path.len(),
+        };
+        let source = InstanceKey {
+            domain: NativeDomainId::mint(),
+            image: ImageIdentity {
+                task_cookie: 71,
+                exec_id: 0,
+            },
+            router: InstanceId::from_raw(0),
+            module,
+        };
+        // Lookup text is baseline storage, not a copied retained table key.
+        let mut query = source.clone();
+        let mut table =
+            HashMap::<InstanceKey, crate::semantics_objects::journal::BootstrapReceipt>::new();
+        let (_, peak) = requested_peak_during(|| {
+            let mut retained = JointGrantTableAllocation::for_entries(0).unwrap();
+            let mut transitions = 0;
+            for ordinal in 1..=MAX_REGISTRY_INSTANCES {
+                let old = retained;
+                let mut key = source.clone();
+                key.router = InstanceId::from_raw(ordinal as u64);
+                assert!(table.insert(key, receipt).is_none());
+                let measured = armed_requested_snapshot();
+                let now = JointGrantTableAllocation::for_entries(table.capacity()).unwrap();
+                assert_eq!(
+                    measured.live_bytes,
+                    now.requested_bytes + ordinal * copied_text,
+                    "actual table/control storage and original copied text at len={ordinal}"
+                );
+                assert_eq!(
+                    measured.live_blocks,
+                    1 + usize::from(copied_text != 0) * ordinal
+                );
+                if now.capacity != old.capacity {
+                    transitions += 1;
+                    assert_eq!(old.next_growth(ordinal), Some(now));
+                    assert_eq!(
+                        measured.peak_bytes,
+                        old.requested_bytes + now.requested_bytes + ordinal * copied_text,
+                        "the old and new real table allocations coexist during resize"
+                    );
+                    let envelope = old.resize_peak_charge(now, ordinal, copied_text).unwrap();
+                    let padding = (usize::from(old.capacity != 0)
+                        + 1
+                        + usize::from(copied_text != 0) * ordinal)
+                        * OWNED_ALLOCATION_PADDING;
+                    assert_eq!(envelope, measured.peak_bytes + padding);
+                }
+                assert!(!measured.incomplete);
+                assert_eq!(measured.failed_requests, 0);
+                retained = now;
+            }
+            assert_eq!(
+                transitions, 12,
+                "4 through 8192 buckets, every actual resize"
+            );
+            assert_eq!((retained.buckets, retained.capacity), (8192, 7168));
+            let retained_charge = retained.charge_bytes().unwrap();
+            for ordinal in 1..=MAX_REGISTRY_INSTANCES {
+                query.router = InstanceId::from_raw(ordinal as u64);
+                assert_eq!(table.remove(&query), Some(receipt));
+                let measured = armed_requested_snapshot();
+                assert_eq!(
+                    measured.live_bytes,
+                    retained.requested_bytes + (MAX_REGISTRY_INSTANCES - ordinal) * copied_text,
+                    "removing a grant frees its copied text, not the retained bucket allocation"
+                );
+                assert_eq!(retained.charge_bytes(), Some(retained_charge));
+            }
+            assert_eq!(table.len(), 0);
+            assert!(table.capacity() > 0);
+            assert_eq!(
+                armed_requested_snapshot().live_bytes,
+                retained.requested_bytes
+            );
+            drop(table);
+            assert_eq!(armed_requested_snapshot().live_bytes, 0);
+        });
+        assert!(!peak.incomplete);
+        assert_eq!(
+            (peak.live_bytes, peak.live_blocks, peak.failed_requests),
+            (0, 0, 0)
+        );
+        eprintln!(
+            "joint grant allocation: entry={} copied_text={} peak={} overlap={}",
+            std::mem::size_of::<(
+                InstanceKey,
+                crate::semantics_objects::journal::BootstrapReceipt
+            )>(),
+            copied_text,
+            peak.peak_bytes,
+            peak.realloc_overlap_bytes
+        );
+    }
+}
+
+#[cfg(test)]
+mod joint_grant_storage_tests {
+    use super::*;
+
+    /// A payload-only charge misses empty buckets and the control group; an
+    /// unchecked multiplication can otherwise turn an oversized request small.
+    #[test]
+    fn joint_grant_checked_geometry_rejects_overflow() {
+        for (entries, buckets, capacity) in [
+            (0, 0, 0),
+            (1, 4, 3),
+            (3, 4, 3),
+            (4, 8, 7),
+            (7, 8, 7),
+            (8, 16, 14),
+            (14, 16, 14),
+            (15, 32, 28),
+            (3584, 4096, 3584),
+            (3585, 8192, 7168),
+            (4096, 8192, 7168),
+        ] {
+            let layout = JointGrantTableAllocation::for_entries(entries).unwrap();
+            assert_eq!((layout.buckets, layout.capacity), (buckets, capacity));
+        }
+        assert!(JointGrantTableAllocation::for_entries(usize::MAX).is_none());
+        assert!(JointGrantTableAllocation::for_entries(usize::MAX / 8 + 1).is_none());
+        let empty = JointGrantTableAllocation::for_entries(0).unwrap();
+        let first = JointGrantTableAllocation::for_entries(1).unwrap();
+        assert_eq!((empty.requested_bytes, empty.charge_bytes()), (0, Some(0)));
+        assert!(empty.resize_peak_charge(first, usize::MAX, 2).is_none());
+        assert!(empty.resize_peak_charge(first, 1, usize::MAX).is_none());
+        let maximum = JointGrantTableAllocation::for_entries(MAX_REGISTRY_INSTANCES).unwrap();
+        assert_eq!(maximum.next_growth(4096).unwrap().capacity, 14336);
+        assert!(maximum.next_growth(usize::MAX).is_none());
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct InstanceKey {
     domain: NativeDomainId,

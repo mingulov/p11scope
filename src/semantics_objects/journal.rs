@@ -3461,12 +3461,8 @@ impl JournalAdapter {
         ) else {
             return None;
         };
-        let Some(entry) = self.open.get(&resource.invocation()) else {
-            return None;
-        };
-        let Some(end) = entry.end else {
-            return None;
-        };
+        let entry = self.open.get(&resource.invocation())?;
+        let end = entry.end?;
         (origin.position() == admitted.h0_ordinal()
             && entry.collected_origin == Some(origin)
             && entry.image == fingerprint.image
@@ -3794,6 +3790,7 @@ impl JournalAdapter {
 
     /// Read one selected physical original. Counts are useful only after
     /// every matching original has passed this exact key/START/END/H9 check.
+    #[allow(clippy::too_many_arguments)]
     fn completed_fallback_original(
         &self,
         entry: &OpenEntry,

@@ -5909,7 +5909,6 @@ fn key_operation_s1only_sibling_pending_h3_reaches_next_frame() {
                 .expect("missing original H9 role refuses");
             assert_eq!(reason, RawQuantumRefusal::H3Undisposed);
             drop(retained);
-            drop(ports);
             assert_eq!(
                 fixture
                     .scene

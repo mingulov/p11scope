@@ -6,13 +6,17 @@ mod tests {
     use super::*;
     use crate::discovery::identity::{PinnedObjects, ReconciledModule};
     use crate::discovery::scan::{ScannedEntry, ScannedModule, ScannedTable};
+    use crate::metrics::KernelEvidence;
     use crate::metrics::counter_collector::{
-        CounterCell, CounterHealth, CounterRow, ReadReservation, ReadWindow,
+        CounterCell, CounterHealth, CounterLimits, CounterRead, CounterRow, ReadReservation,
+        ReadStage, ReadWindow,
     };
     use crate::plan::{AdmissionPolicy, AttachPlan};
     use crate::process::{MountNamespaceId, ProcessViewId};
-    use crate::semantics_edge::resources::SemanticResourcePool;
-    use p11scope_ebpf_common::{CountStats, LATENCY_BUCKETS, RvKey, SlotStats, TimestampStats};
+    use crate::semantics_edge::resources::{SemanticResourcePool, SemanticResourceReserver};
+    use p11scope_ebpf_common::{
+        CountStats, CounterMode, LATENCY_BUCKETS, RvKey, SlotStats, TimestampStats,
+    };
     use sha2::{Digest as _, Sha256};
     use std::io::Write as _;
 
@@ -29,7 +33,8 @@ mod tests {
         let hash = format!("{:x}", Sha256::digest(&bytes));
         // Existing pin seam retains a real opened file/dev/inode. No native
         // execution is claimed for these controlled cumulative cells.
-        let pins = crate::discovery::identity::tests::real_scan_pin(file.path(), None, 1, &hash);
+        let pins =
+            crate::discovery::identity::test_fixture::real_scan_pin(file.path(), None, 1, &hash);
         let summary = pins.pinned().next().unwrap();
         let object = summary.id;
         let key = summary.key;
@@ -196,6 +201,97 @@ mod tests {
             assert_eq!(rows[0].target_object, plan.target_object_of(&plan.slots[0]));
             assert_eq!(rows[0].total_ns, if mode.has_timing() { 500 } else { 0 });
         }
+    }
+
+    #[test]
+    fn authoritative_published_rows_skip_holes_and_keep_inactive_history() {
+        let (_file, first_plan, pins) = fixture();
+        let slots = (0..3)
+            .map(|index| {
+                let mut slot = first_plan.slots[0].clone();
+                slot.index = index;
+                slot.file_offset = 0x10 + u64::from(index) * 0x10;
+                slot
+            })
+            .collect();
+        let mut plan = AttachPlan::from_slots_with_policy(
+            slots,
+            AdmissionPolicy::counters(crate::capacity::CounterBudget::new(4).unwrap()),
+        )
+        .unwrap();
+        plan.deactivate(0);
+        plan.deactivate(1);
+        let pool = SemanticResourcePool::reference_limit(32 * 1024 * 1024);
+        let mut capture = CounterCapture::new(LIMITS, pool.reserver());
+        let published = |positions: &[(u32, u64)], reserve: &SemanticResourceReserver| {
+            let reservation =
+                ReadReservation::reserve(positions.len(), positions.len(), reserve).unwrap();
+            let mut rows = Vec::with_capacity(positions.len());
+            for &(index, returned) in positions {
+                let slot = &plan.slots[index as usize];
+                rows.push(
+                    CounterRow::fold(
+                        slot,
+                        CounterMode::Counts,
+                        [CounterCell::Counts(&CountStats {
+                            entered: returned,
+                            returned,
+                            errors: 0,
+                        })],
+                        [(
+                            RvKey {
+                                slot: index,
+                                _pad: 0,
+                                rv: 0,
+                            },
+                            returned,
+                        )],
+                        LIMITS,
+                    )
+                    .unwrap(),
+                );
+            }
+            CounterRead::new(
+                std::num::NonZeroU64::new(1).unwrap(),
+                CounterMode::Counts,
+                ReadWindow::new(Some(10), Some(20)),
+                Ok(rows),
+                CounterHealth::default(),
+                KernelEvidence::default(),
+                reservation,
+            )
+            .unwrap()
+        };
+        let first = capture.fresh_with(&plan, &pins, |_, _, _, reserve| {
+            Ok(published(&[(0, 5)], reserve))
+        });
+        assert_eq!(first.reports().len(), 1);
+        let grown = capture.fresh_with(&plan, &pins, |_, _, _, reserve| {
+            Ok(published(&[(0, 6), (2, 8)], reserve))
+        });
+        assert!(grown.is_fresh());
+        assert_eq!(
+            grown
+                .reports()
+                .iter()
+                .map(|row| (row.file_offset, row.calls))
+                .collect::<Vec<_>>(),
+            [(0x10, 6), (0x30, 8)]
+        );
+        let deltas = grown.deltas().unwrap();
+        assert_eq!(
+            deltas
+                .iter()
+                .map(|delta| (delta.slot, delta.returned))
+                .collect::<Vec<_>>(),
+            [(0, 1), (2, 8)]
+        );
+        assert!(!plan.is_active(0));
+        assert_eq!(
+            plan.slots.len(),
+            3,
+            "never-published hole1 remains part of the historical plan"
+        );
     }
 
     #[test]

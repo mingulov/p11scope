@@ -253,6 +253,12 @@ impl RetainedInventoryTarget {
         Ok(unchanged)
     }
 
+    /// Borrow the original opened file and canonical digest without copying
+    /// identity or opening another descriptor. Callers retain ABI/pin checks.
+    pub(crate) fn borrowed_file_and_digest(&self) -> (&std::fs::File, &str) {
+        (&self.entry.file, &self.entry.sha256)
+    }
+
     /// The raw mapping key this object was first retained under.
     pub(crate) fn object_key(&self) -> ObjectKey {
         self.entry.raw.key

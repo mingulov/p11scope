@@ -1,6 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
-//! Private Counts publication directory with a live format1 adapter.
-//! Format2 geometry is staged and cannot yet prepare a real Session.
+//! Private Counts publication, retained native custody and charged collection.
 
 use super::{CapturePolicy, Scope, Session};
 use crate::discovery::identity::{PinnedObjects, RetainedInventoryTarget};
@@ -23,6 +22,7 @@ use std::sync::{Arc, Mutex};
 pub(crate) const BANK_CONFIG: u64 = 0x1800_0102;
 const COUNTS_GROWTH_V2_CONFIG: u64 = 0x0200_0018_0010_0200;
 const BANKS: usize = 2;
+const GROWTH_BANKS: usize = 16;
 pub(super) const PROGRAMS: [&str; 2] = ["p11_counter_bank_entry", "p11_counter_bank_return"];
 
 /// Caller-requested allocation envelope. Payload capacities and this explicit
@@ -52,47 +52,6 @@ impl BankReservation {
             self.transient_bytes,
         ))
     }
-
-    fn validate_stage(self, slots: &[Slot], cpus: usize) -> Result<(), BankRefusal> {
-        let bytes = stage_owned_bytes(slots, cpus).ok_or(BankRefusal::Budget)?;
-        let fds = cpus
-            .checked_mul(4)
-            .and_then(|n| n.checked_add(4))
-            .and_then(|n| n.checked_mul(slots.len()))
-            .ok_or(BankRefusal::Budget)?;
-        if cpus == 0
-            || self.retained_bytes < bytes
-            || self.transient_bytes < bytes
-            || self.file_descriptors < fds
-        {
-            return Err(BankRefusal::Budget);
-        }
-        Ok(())
-    }
-}
-
-fn stage_owned_bytes(slots: &[Slot], cpus: usize) -> Option<usize> {
-    // Bound the known Slot/per-CPU requests and their common-attach copies.
-    // The fixed allowance covers this <=2-endpoint path's ordered metadata;
-    // the caller separately reserves native/allocator metadata. This is a
-    // requested-allocation envelope, not an exact total-memory measurement.
-    let slots = slots.iter().try_fold(0usize, |total, slot| {
-        total
-            .checked_add(size_of::<Slot>() + 8 * OWNED_ALLOCATION_PADDING)?
-            .checked_add(slot.object_path.capacity())?
-            .checked_add(slot.names.capacity().checked_mul(size_of::<String>())?)?
-            .checked_add(
-                slot.module_ids
-                    .capacity()
-                    .checked_mul(size_of::<crate::plan::ModuleId>())?,
-            )?
-            .checked_add(slot.names.iter().try_fold(0usize, |sum, name| {
-                sum.checked_add(name.capacity())?
-                    .checked_add(OWNED_ALLOCATION_PADDING)
-            })?)?
-            .checked_add(cpus.checked_mul(size_of::<p11scope_ebpf_common::CountStats>())?)
-    })?;
-    slots.checked_mul(16)?.checked_add(32 * 1024)
 }
 
 // Mirrors the already-verified native proof layouts, without changing that ABI.
@@ -121,8 +80,7 @@ const _: () = {
     assert!(size_of::<BankCommit>() == 16);
 };
 
-/// Format2 is staged here only. The emitted object and real Session adapter
-/// continue to use the independently validated format1 layouts above.
+/// Format2 records remain distinct from the independently validated format1 ABI.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CountsBankRoute {
@@ -216,6 +174,34 @@ impl CountsBankGeometry {
 
     fn is_legacy(self) -> bool {
         self == Self::legacy()
+    }
+
+    fn validate(self) -> Result<(), BankRefusal> {
+        if self.is_legacy() || Self::checked(self.banks, self.cells) == Ok(self) {
+            Ok(())
+        } else {
+            Err(BankRefusal::Shape)
+        }
+    }
+
+    fn selected(profile: &str) -> Result<Self, BankRefusal> {
+        match profile {
+            "counts-bank-proof" => Ok(Self::legacy()),
+            "counts-bank-growth-v2" => Self::checked(16, 512),
+            _ => Err(BankRefusal::Shape),
+        }
+    }
+
+    fn logical_slots(self) -> usize {
+        if self.is_legacy() {
+            512
+        } else {
+            self.limit() as usize
+        }
+    }
+
+    fn rv_keys(self) -> usize {
+        if self.is_legacy() { 4096 } else { 65536 }
     }
 
     fn limit(self) -> u32 {
@@ -346,6 +332,150 @@ enum CommitAck {
     Unreadable,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum FdLimit {
+    Finite(u64),
+    Unlimited,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FdSnapshot {
+    soft_limit: FdLimit,
+    observed_open: u64,
+}
+
+fn check_fd_headroom_with(
+    required: usize,
+    read: impl FnOnce() -> Result<FdSnapshot, BankRefusal>,
+) -> Result<(), BankRefusal> {
+    let required = u64::try_from(required)
+        .ok()
+        .filter(|&n| n != 0)
+        .ok_or(BankRefusal::Budget)?;
+    let snapshot = read()?;
+    let total = snapshot
+        .observed_open
+        .checked_add(required)
+        .ok_or(BankRefusal::Budget)?;
+    match snapshot.soft_limit {
+        FdLimit::Finite(limit) if total > limit => Err(BankRefusal::Budget),
+        _ => Ok(()),
+    }
+}
+
+fn read_fd_snapshot() -> Result<FdSnapshot, BankRefusal> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit writes one initialized writable rlimit; no limit changes.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return Err(BankRefusal::Native);
+    }
+    let soft_limit = if limit.rlim_cur == libc::RLIM_INFINITY {
+        FdLimit::Unlimited
+    } else {
+        FdLimit::Finite(limit.rlim_cur)
+    };
+    let entries = std::fs::read_dir("/proc/self/fd").map_err(|_| BankRefusal::Native)?;
+    let mut observed_open = 0u64;
+    for entry in entries {
+        entry.map_err(|_| BankRefusal::Native)?;
+        observed_open = observed_open.checked_add(1).ok_or(BankRefusal::Budget)?;
+    }
+    // The enumeration FD was counted conservatively and has now closed.
+    Ok(FdSnapshot {
+        soft_limit,
+        observed_open,
+    })
+}
+
+#[allow(clippy::too_many_arguments)] // One checked accounting function for directory and native ownership.
+fn stage_requirements(
+    geometry: CountsBankGeometry,
+    all_slots: &[Slot],
+    fresh: BankExtent,
+    old_capacity: usize,
+    cpus: usize,
+    new_banks: usize,
+    provider_copies: usize,
+    slot_copies: usize,
+) -> Result<(usize, usize, usize, usize), BankRefusal> {
+    geometry.validate()?;
+    let payload = geometry
+        .bank_payload_bytes(cpus)?
+        .checked_mul(new_banks)
+        .ok_or(BankRefusal::Budget)?;
+    let copies = all_slots[fresh.first as usize..fresh.end as usize]
+        .iter()
+        .try_fold(0usize, |bytes, slot| {
+            bytes.checked_add(stage_slot_bytes(slot)?.checked_mul(slot_copies)?)
+        })
+        .and_then(|bytes| bytes.checked_add(provider_copies))
+        .ok_or(BankRefusal::Budget)?;
+    let table = all_slots
+        .len()
+        .checked_add(old_capacity)
+        .and_then(|n| n.checked_mul(size_of::<BankPosition>()))
+        .ok_or(BankRefusal::Budget)?;
+    let side_node = 16
+        + 11 * size_of::<(u32, super::ProbeSide)>()
+        + 12 * size_of::<usize>()
+        + OWNED_ALLOCATION_PADDING;
+    let side_scratch = all_slots
+        .len()
+        .checked_mul(2)
+        .and_then(|n| n.checked_mul(side_node))
+        .ok_or(BankRefusal::Budget)?;
+    let metadata = fresh
+        .len()
+        .checked_mul(2 * size_of::<(u32, CountsBankRoute)>())
+        .and_then(|bytes| {
+            bytes.checked_add(
+                all_slots
+                    .len()
+                    .checked_mul(size_of::<AttachKey>() + size_of::<(u64, u64, u64)>())?,
+            )
+        })
+        .and_then(|bytes| bytes.checked_add((fresh.first as usize).checked_mul(size_of::<u32>())?))
+        .and_then(|bytes| {
+            bytes.checked_add(
+                (geometry.banks as usize)
+                    .checked_mul(2 * size_of::<(u32, u32)>() + size_of::<Option<u32>>())?,
+            )
+        })
+        .and_then(|bytes| bytes.checked_add(side_scratch))
+        .and_then(|bytes| {
+            bytes.checked_add(size_of::<StagedExtent>() + 16 * OWNED_ALLOCATION_PADDING)
+        })
+        .ok_or(BankRefusal::Budget)?;
+    let retained = payload
+        .checked_add(copies)
+        .and_then(|n| n.checked_add(table))
+        .ok_or(BankRefusal::Budget)?;
+    let transient = copies
+        .checked_add(table)
+        .and_then(|n| n.checked_add(metadata.checked_mul(2)?))
+        .and_then(|n| {
+            n.checked_add(cpus.checked_mul(4 * size_of::<p11scope_ebpf_common::CountStats>())?)
+        })
+        .ok_or(BankRefusal::Budget)?;
+    // Singles + OneProcess uses Aya's pid-scoped perf-event path, with a
+    // retained FD per endpoint side and a transient perf FD during BPF-link
+    // creation. The conservative (4*C+4)*slots+new_banks request includes
+    // historical custody and staging: at C=2, 8192 slots +16 maps is 98,320.
+    // NativeIo checks this fixed backend/scope, the caller reservation and
+    // current OS headroom. This is neither an atomic reservation nor measured
+    // useful-8192 qualification; subsequent EMFILE uses paid rollback/custody.
+    let fds = cpus
+        .checked_mul(4)
+        .and_then(|n| n.checked_add(4))
+        .and_then(|n| n.checked_mul(all_slots.len()))
+        .and_then(|n| n.checked_add(new_banks))
+        .ok_or(BankRefusal::Budget)?;
+    Ok((retained, transient, metadata, fds))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BankPublication {
     Published {
@@ -368,13 +498,24 @@ pub(crate) enum BankPublication {
 /// replace a key or discard ownership when it reports an uncertain result.
 trait BankIo {
     fn possible_cpus(&self) -> usize;
-    fn validate_targets(&mut self, slots: &[Slot], published: &[u32]) -> Result<(), BankRefusal>;
+    fn validate_targets(
+        &mut self,
+        slots: &[Slot],
+        published: &[u32],
+        fresh: BankExtent,
+        old_capacity: usize,
+    ) -> Result<(), BankRefusal>;
     fn retain_charge(&mut self, charge: ResourceLease);
     fn allocate_bank(&mut self, bank: u32, all_slots: &[Slot]) -> Result<u32, BankRefusal>;
     fn insert_inner(&mut self, bank: u32, expected_id: u32) -> Result<(), BankRefusal>;
     fn insert_route(&mut self, slot: u32, route: CountsBankRoute) -> Result<(), BankRefusal>;
     fn attach_inactive(&mut self, slots: &[Slot]) -> Result<(), BankRefusal>;
-    fn verify_candidate(&mut self, expected: &StagedExtent, all_slots: &[Slot]) -> CandidateCheck;
+    fn verify_candidate(
+        &mut self,
+        expected: &StagedExtent,
+        all_slots: &[Slot],
+        published: &[u32],
+    ) -> CandidateCheck;
     fn insert_commit(
         &mut self,
         transaction: u64,
@@ -435,6 +576,7 @@ fn physical(slot: &Slot) -> AttachKey {
 
 /// Local pin IDs are labels, never cross-store provider identity. The same
 /// allocation-free guard protects staging and the reader's row labels.
+#[cfg(test)]
 fn validate_provider_slots<'a>(
     slots: &[Slot],
     objects: &PinnedObjects,
@@ -471,9 +613,95 @@ fn validate_provider_slots<'a>(
     Ok(())
 }
 
+fn retained_binding(
+    slot: &Slot,
+    plan: Option<&AttachPlan>,
+    objects: Option<&PinnedObjects>,
+    held: &RetainedInventoryTarget,
+) -> Result<(u64, u64, u64), BankRefusal> {
+    if held.abi() != p11scope_manifest::elf::ElfAbi::Lp64 || held.check_unchanged() != Ok(true) {
+        return Err(BankRefusal::Ownership);
+    }
+    let (file, digest) = held.borrowed_file_and_digest();
+    if digest.is_empty() {
+        return Err(BankRefusal::Ownership);
+    }
+    if let Some(objects) = objects
+        && objects.summary(slot.object).is_some()
+        && (objects.object_unchanged(slot.object) != Ok(true)
+            || !held.same_object_as(objects, slot.object))
+    {
+        return Err(BankRefusal::Ownership);
+    }
+    if let Some(expected) = plan.and_then(|plan| plan.borrowed_target_object_of(slot)) {
+        let key = held.object_key();
+        if expected.dev != (key.device.major, key.device.minor)
+            || expected.ino != key.inode
+            || expected.sha256.as_deref() != Some(digest)
+        {
+            return Err(BankRefusal::Ownership);
+        }
+    }
+    let metadata = file.metadata().map_err(|_| BankRefusal::Ownership)?;
+    Ok((metadata.dev(), metadata.ino(), slot.file_offset))
+}
+
+fn validate_provider_union(
+    all_slots: &[Slot],
+    published: &[u32],
+    fresh: BankExtent,
+    objects: &PinnedObjects,
+    custody: &NativeCustody,
+    require_fresh_retained: bool,
+) -> Result<(), BankRefusal> {
+    let mut endpoints = Vec::with_capacity(all_slots.len());
+    let mut old = published.iter().copied().peekable();
+    for slot in all_slots {
+        if old.peek() == Some(&slot.index) {
+            old.next();
+            let held = custody
+                .providers
+                .get(slot.index as usize)
+                .and_then(Option::as_ref)
+                .ok_or(BankRefusal::Ownership)?;
+            endpoints.push(retained_binding(slot, None, Some(objects), held)?);
+        } else if (fresh.first..fresh.end).contains(&slot.index) {
+            if require_fresh_retained {
+                let held = custody
+                    .providers
+                    .get(slot.index as usize)
+                    .and_then(Option::as_ref)
+                    .ok_or(BankRefusal::Ownership)?;
+                endpoints.push(retained_binding(slot, None, Some(objects), held)?);
+                continue;
+            }
+            if objects.abi_for(slot.object) != Some(p11scope_manifest::elf::ElfAbi::Lp64)
+                || objects.object_unchanged(slot.object) != Ok(true)
+            {
+                return Err(BankRefusal::Ownership);
+            }
+            let metadata = objects
+                .file_for(slot.object)
+                .ok_or(BankRefusal::Ownership)?
+                .metadata()
+                .map_err(|_| BankRefusal::Ownership)?;
+            endpoints.push((metadata.dev(), metadata.ino(), slot.file_offset));
+        }
+        // Neither a published position nor the fresh extent: Directory has
+        // positively classified this historical cell as never published.
+    }
+    if old.next().is_some() {
+        return Err(BankRefusal::Ownership);
+    }
+    endpoints.sort_unstable();
+    if endpoints.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(BankRefusal::Ownership);
+    }
+    Ok(())
+}
+
 impl BankDirectory {
-    // Staged private constructor: real CounterPreparation never selects it yet.
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn counts_growth_v2() -> Self {
         Self {
             geometry: CountsBankGeometry::checked(16, 512).expect("closed Counts geometry"),
@@ -494,24 +722,12 @@ impl BankDirectory {
             })
     }
 
+    #[cfg(test)]
     fn legacy_published_mask(&self) -> Result<u64, BankRefusal> {
         if !self.geometry.is_legacy() {
             return Err(BankRefusal::Shape);
         }
         legacy_indices_mask(self.published_indices())
-    }
-
-    fn legacy_metadata(&self) -> Result<[Option<BankMetadata>; BANKS], BankRefusal> {
-        if !self.geometry.is_legacy() {
-            return Err(BankRefusal::Shape);
-        }
-        let mut metadata = [None; BANKS];
-        for (slot, position) in self.positions.iter().enumerate() {
-            if let PositionState::Published(route) = position.state {
-                metadata[slot] = Some(legacy_route(slot as u32, route)?);
-            }
-        }
-        Ok(metadata)
     }
 
     fn validate_plan(&self, plan: &AttachPlan) -> Result<(), BankRefusal> {
@@ -575,84 +791,23 @@ impl BankDirectory {
         reservation: BankReservation,
         cpus: usize,
     ) -> Result<(), BankRefusal> {
-        if self.geometry.is_legacy() {
-            return reservation.validate_stage(&plan.slots, cpus);
-        }
-        let payload = self.geometry.bank_payload_bytes(cpus)?;
-        let first_bank = self.geometry.locate(extent.first)?.0;
-        let last_bank = self.geometry.locate(extent.end - 1)?.0;
-        let new_banks = (first_bank..=last_bank)
-            .filter(|bank| {
-                self.bank_ids
-                    .get(*bank as usize)
-                    .copied()
-                    .flatten()
-                    .is_none()
+        let new_banks = (0..self.geometry.banks as usize)
+            .filter(|&bank| {
+                self.bank_ids.get(bank).copied().flatten().is_none()
+                    && bank >= (extent.first / self.geometry.cells) as usize
+                    && bank <= ((extent.end - 1) / self.geometry.cells) as usize
             })
             .count();
-        let payload = payload.checked_mul(new_banks).ok_or(BankRefusal::Budget)?;
-        let slots = &plan.slots[extent.first as usize..extent.end as usize];
-        let copies = slots
-            .iter()
-            .try_fold(0usize, |total, slot| {
-                total.checked_add(stage_slot_bytes(slot)?.checked_mul(4)?)
-            })
-            .ok_or(BankRefusal::Budget)?;
-        // Count requested old/new table overlap, exact-sized route/dependency
-        // buffers, native per-CPU read scratch and allocator padding. The
-        // caller's additional metadata allowance is not a kernel-memory claim.
-        let table = plan
-            .slots
-            .len()
-            .checked_mul(size_of::<BankPosition>())
-            .and_then(|bytes| {
-                bytes.checked_add(
-                    self.positions
-                        .capacity()
-                        .checked_mul(size_of::<BankPosition>())?,
-                )
-            })
-            .ok_or(BankRefusal::Budget)?;
-        let metadata = extent
-            .len()
-            .checked_mul(2 * size_of::<(u32, CountsBankRoute)>())
-            .and_then(|bytes| {
-                bytes.checked_add(plan.slots.len().checked_mul(size_of::<AttachKey>())?)
-            })
-            .and_then(|bytes| {
-                bytes.checked_add(self.positions.len().checked_mul(size_of::<u32>())?)
-            })
-            .and_then(|bytes| {
-                bytes.checked_add(
-                    (self.geometry.banks as usize)
-                        .checked_mul(2 * size_of::<(u32, u32)>() + size_of::<Option<u32>>())?,
-                )
-            })
-            .and_then(|bytes| {
-                bytes.checked_add(size_of::<StagedExtent>() + 16 * OWNED_ALLOCATION_PADDING)
-            })
-            .ok_or(BankRefusal::Budget)?;
-        let retained = payload
-            .checked_add(copies)
-            .and_then(|bytes| bytes.checked_add(table))
-            .ok_or(BankRefusal::Budget)?;
-        let transient = copies
-            .checked_add(table)
-            .and_then(|bytes| bytes.checked_add(metadata.checked_mul(2)?))
-            .and_then(|bytes| {
-                bytes.checked_add(
-                    cpus.checked_mul(4 * size_of::<p11scope_ebpf_common::CountStats>())?,
-                )
-            })
-            .ok_or(BankRefusal::Budget)?;
-        let fds = cpus
-            .checked_mul(4)
-            .and_then(|count| count.checked_add(4))
-            .and_then(|count| {
-                count.checked_mul(self.published_indices().count().checked_add(extent.len())?)
-            })
-            .and_then(|count| count.checked_add(new_banks))
-            .ok_or(BankRefusal::Budget)?;
+        let (retained, transient, metadata, fds) = stage_requirements(
+            self.geometry,
+            &plan.slots,
+            extent,
+            self.positions.capacity(),
+            cpus,
+            new_banks,
+            0,
+            4,
+        )?;
         if reservation.retained_bytes < retained
             || reservation.transient_bytes < transient
             || reservation.metadata_bytes < metadata
@@ -731,7 +886,9 @@ impl BankDirectory {
         }
         let mut published = Vec::with_capacity(self.positions.len());
         published.extend(self.published_indices());
-        if let Err(reason) = io.validate_targets(&plan.slots, &published) {
+        if let Err(reason) =
+            io.validate_targets(&plan.slots, &published, extent, self.positions.capacity())
+        {
             return BankPublication::Refused(reason);
         }
         let slots = plan.slots[first as usize..end as usize].to_vec();
@@ -811,7 +968,7 @@ impl BankDirectory {
             let expected =
                 StagedExtent::checked_with(self.geometry, transaction, commit, routes, ids)
                     .map_err(|_| BankRefusal::Quarantined)?;
-            if io.verify_candidate(&expected, &plan.slots) != CandidateCheck::Exact {
+            if io.verify_candidate(&expected, &plan.slots, &published) != CandidateCheck::Exact {
                 return Err(BankRefusal::Quarantined);
             }
             commit_attempted = true;
@@ -825,7 +982,7 @@ impl BankDirectory {
             };
             // Even a confirmed absent commit permits rollback only while the
             // complete candidate still has its original ownership facts.
-            if io.verify_candidate(expected, &plan.slots) != CandidateCheck::Exact {
+            if io.verify_candidate(expected, &plan.slots, &published) != CandidateCheck::Exact {
                 return self.quarantine(transaction.get(), extent);
             }
         }
@@ -885,6 +1042,7 @@ impl BankDirectory {
     }
 }
 
+#[cfg(test)]
 fn legacy_indices_mask(indices: impl IntoIterator<Item = u32>) -> Result<u64, BankRefusal> {
     let mut mask = 0;
     for index in indices {
@@ -948,17 +1106,51 @@ pub(crate) struct BankHandle {
     id: u32,
 }
 
-#[derive(Default)]
 struct NativeCustody {
-    banks: [Option<Arc<BankHandle>>; BANKS],
-    // Full retained identity survives link removal, including final reads.
-    providers: [Option<RetainedInventoryTarget>; BANKS],
-    // Last: maps/providers drop before the requests that cover their lifetime.
-    charges: [Option<ResourceLease>; BANKS],
+    banks: [Option<Arc<BankHandle>>; GROWTH_BANKS],
+    providers: Vec<Option<RetainedInventoryTarget>>,
+    // Last: all native handles and retained identity drop before their charges.
+    charges: Vec<ResourceLease>,
 }
 
-/// Shared by the Session and each *actual* transferred link. A failed submit,
-/// closer panic, quarantine or process-exit abandon retains the same owner.
+impl NativeCustody {
+    fn retain_charge(&mut self, charge: ResourceLease) {
+        assert!(
+            self.charges.len() < self.charges.capacity(),
+            "preflight reserves every consumed extent holder"
+        );
+        self.charges.push(charge);
+    }
+
+    fn retain_targets(
+        &mut self,
+        slots: &[Slot],
+        objects: &PinnedObjects,
+    ) -> Result<(), BankRefusal> {
+        for slot in slots {
+            if self
+                .providers
+                .get(slot.index as usize)
+                .is_none_or(Option::is_some)
+                || objects.abi_for(slot.object) != Some(p11scope_manifest::elf::ElfAbi::Lp64)
+                || objects.object_unchanged(slot.object) != Ok(true)
+            {
+                return Err(BankRefusal::Ownership);
+            }
+        }
+        for slot in slots {
+            self.providers[slot.index as usize] = Some(
+                objects
+                    .retain_inventory_target(slot.object)
+                    .map_err(|_| BankRefusal::Ownership)?,
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Shared by Session and every actual transferred link, including uncertain
+/// close/abandonment. The same owner covers all maps, identities and attempts.
 pub(crate) struct CounterKeepalive {
     custody: Mutex<NativeCustody>,
     _base: ResourceLease,
@@ -966,15 +1158,41 @@ pub(crate) struct CounterKeepalive {
 
 impl CounterKeepalive {
     pub(crate) fn precharge(reserve: &SemanticResourceReserver, bytes: usize) -> Result<Arc<Self>> {
+        Self::precharge_with_geometry(reserve, bytes, CountsBankGeometry::legacy())
+    }
+
+    fn precharge_with_geometry(
+        reserve: &SemanticResourceReserver,
+        bytes: usize,
+        geometry: CountsBankGeometry,
+    ) -> Result<Arc<Self>> {
+        geometry
+            .validate()
+            .map_err(|_| anyhow::anyhow!("unsupported counter geometry"))?;
+        let positions = geometry.limit() as usize;
+        let required = positions
+            .checked_mul(size_of::<Option<RetainedInventoryTarget>>() + size_of::<ResourceLease>())
+            .and_then(|n| {
+                n.checked_add(
+                    size_of::<Self>() + 2 * size_of::<usize>() + 3 * OWNED_ALLOCATION_PADDING,
+                )
+            })
+            .context("counter custody capacity overflow")?;
         ensure!(
-            bytes >= size_of::<Self>() + 2 * size_of::<usize>() + OWNED_ALLOCATION_PADDING,
-            "counter keepalive reservation is too small"
+            bytes >= required,
+            "counter custody reservation is smaller than its bounded holders"
         );
         let charge = reserve
             .reserve(bytes)
-            .map_err(|_| anyhow::anyhow!("private counter custody reservation refused"))?;
+            .map_err(|_| anyhow::anyhow!("counter custody reservation refused"))?;
+        let mut providers = Vec::with_capacity(positions);
+        providers.resize_with(positions, || None);
         Ok(Arc::new(Self {
-            custody: Mutex::new(NativeCustody::default()),
+            custody: Mutex::new(NativeCustody {
+                banks: std::array::from_fn(|_| None),
+                providers,
+                charges: Vec::with_capacity(positions),
+            }),
             _base: charge,
         }))
     }
@@ -984,7 +1202,8 @@ pub(super) struct CounterBanks {
     directory: Arc<Mutex<BankDirectory>>,
     pub(super) keepalive: Arc<CounterKeepalive>,
     cpus: usize,
-    // Host transaction admission only; never native/capture/B1 authority.
+    geometry: CountsBankGeometry,
+    // Immutable geometry avoids reentering the Directory lock during stage.
     link_staging: Arc<AtomicU64>,
 }
 
@@ -1024,11 +1243,7 @@ impl<'a> CounterPreparation<'a> {
         reserve: &SemanticResourceReserver,
     ) -> Result<Self> {
         ensure!(
-            env!("P11SCOPE_COUNTER_BANK_PROOF_ENABLED") == "1"
-                && matches!(
-                    env!("P11SCOPE_COUNTER_BANK_PROOF_OUTPUTS"),
-                    "counts-bank-proof"
-                ),
+            env!("P11SCOPE_COUNTER_BANK_PROOF_ENABLED") == "1",
             "private Counts bank artifact was not selected at build time"
         );
         ensure!(
@@ -1039,10 +1254,16 @@ impl<'a> CounterPreparation<'a> {
             )),
             "private Counts bank preparation requires its fixed artifact configuration"
         );
+        let geometry = CountsBankGeometry::selected(env!("P11SCOPE_COUNTER_BANK_PROOF_OUTPUTS"))
+            .map_err(|_| anyhow::anyhow!("unsupported private counter artifact profile"))?;
         let (retained, transient) = envelope
             .charges()
             .map_err(|_| anyhow::anyhow!("invalid counter reservation"))?;
-        let keepalive = CounterKeepalive::precharge(reserve, retained)?;
+        let keepalive = if geometry.is_legacy() {
+            CounterKeepalive::precharge(reserve, retained)?
+        } else {
+            CounterKeepalive::precharge_with_geometry(reserve, retained, geometry)?
+        };
         let scratch = reserve
             .reserve(transient)
             .map_err(|_| anyhow::anyhow!("counter load overlap reservation refused"))?;
@@ -1064,9 +1285,9 @@ impl<'a> CounterPreparation<'a> {
             "private counter preparation requires possible CPUs"
         );
         let parsed = aya_obj::Object::parse(object).context("parsing selected counter artifact")?;
-        // This constructor still prepares format1 only. Reject an incomplete
-        // format2 object before common preparation can attach lifecycle roots.
-        validate_format1_object_maps(|name| parsed.maps.get(name))
+        // Parse and validate actual maps/template before common loading can
+        // attach lifecycle roots. An emitted token alone grants no shape.
+        validate_object_maps(geometry, |name| parsed.maps.get(name))
             .map_err(|_| anyhow::anyhow!("unsupported private counter artifact profile"))?;
         ensure!(
             PROGRAMS
@@ -1081,13 +1302,16 @@ impl<'a> CounterPreparation<'a> {
                 total.checked_add(configured_payload(map, cpus)?)
             })
             .context("unsupported counter payload shape or checked overflow")?;
-        // Both future one-cell banks coexist with all old maps/template/data.
-        let payload = payload
-            .checked_add(
-                cpus.checked_mul(24 * BANKS)
-                    .context("bank payload overflow")?,
-            )
-            .context("counter payload overflow")?;
+        let payload = if geometry.is_legacy() {
+            payload
+                .checked_add(
+                    cpus.checked_mul(24 * BANKS)
+                        .context("bank payload overflow")?,
+                )
+                .context("counter payload overflow")?
+        } else {
+            payload
+        }; // Format2 real banks are precharged by each stage.
         ensure!(
             envelope.retained_bytes
                 >= payload
@@ -1114,9 +1338,13 @@ impl<'a> CounterPreparation<'a> {
         Ok(Self {
             object,
             banks: CounterBanks {
-                directory: Arc::new(Mutex::new(BankDirectory::default())),
+                directory: Arc::new(Mutex::new(BankDirectory {
+                    geometry,
+                    ..BankDirectory::default()
+                })),
                 keepalive,
                 cpus,
+                geometry,
                 link_staging: Arc::new(AtomicU64::new(0)),
             },
             _scratch: scratch,
@@ -1124,7 +1352,7 @@ impl<'a> CounterPreparation<'a> {
     }
 
     pub(super) fn validate_and_load(&self, ebpf: &mut Ebpf) -> Result<()> {
-        validate_maps(ebpf)
+        validate_maps(ebpf, self.banks.geometry)
             .map_err(|failure| anyhow::anyhow!("private counter map refusal: {failure:?}"))?;
         // No caller or lifecycle link exists yet, and all routing maps are
         // required empty. A foreign/stale key never activates staging early.
@@ -1136,13 +1364,27 @@ impl<'a> CounterPreparation<'a> {
                         .next()
                         .is_none()
                 }
-                "COUNTER_BANK_META" => HashMap::<_, u32, BankMetadata>::try_from(
+                "COUNTER_BANK_META" if self.banks.geometry.is_legacy() => {
+                    HashMap::<_, u32, BankMetadata>::try_from(
+                        ebpf.map(name).context("counter metadata map")?,
+                    )?
+                    .keys()
+                    .next()
+                    .is_none()
+                }
+                "COUNTER_BANK_META" => HashMap::<_, u32, CountsBankRoute>::try_from(
                     ebpf.map(name).context("counter metadata map")?,
                 )?
                 .keys()
                 .next()
                 .is_none(),
-                _ => HashMap::<_, u64, BankCommit>::try_from(
+                _ if self.banks.geometry.is_legacy() => HashMap::<_, u64, BankCommit>::try_from(
+                    ebpf.map(name).context("counter commit map")?,
+                )?
+                .keys()
+                .next()
+                .is_none(),
+                _ => HashMap::<_, u64, CountsBankCommit>::try_from(
                     ebpf.map(name).context("counter commit map")?,
                 )?
                 .keys()
@@ -1166,6 +1408,7 @@ impl<'a> CounterPreparation<'a> {
 fn map_data(map: &Map) -> Result<&MapData, BankRefusal> {
     match map {
         Map::HashOfMaps(data)
+        | Map::Array(data)
         | Map::HashMap(data)
         | Map::PerCpuArray(data)
         | Map::PerCpuHashMap(data) => Ok(data),
@@ -1192,17 +1435,54 @@ fn exact_map(
     .map_err(|_| BankRefusal::Shape)
 }
 
-fn validate_maps(ebpf: &Ebpf) -> Result<(), BankRefusal> {
-    validate_maps_with(|name| {
+fn exact_map_metadata(
+    map: &Map,
+    kind: MapType,
+    key: u32,
+    value: u32,
+    entries: u32,
+    flags: u32,
+) -> Result<(), BankRefusal> {
+    let actual = super::read_map_metadata("retained counter bank", map_data(map)?)
+        .map_err(|_| BankRefusal::Native)?;
+    super::compare_map_metadata(
+        "retained counter bank",
+        actual,
+        super::map_metadata(kind, key, value, entries, flags),
+    )
+    .map_err(|_| BankRefusal::Shape)
+}
+
+fn validate_maps(ebpf: &Ebpf, geometry: CountsBankGeometry) -> Result<(), BankRefusal> {
+    validate_maps_for(geometry, |name| {
         let data = map_data(ebpf.map(name).ok_or(BankRefusal::Shape)?)?;
         super::read_map_metadata(name, data).map_err(|_| BankRefusal::Shape)
     })
 }
 
+#[cfg(test)]
 fn validate_maps_with(
+    metadata: impl FnMut(&str) -> Result<super::ExactMapMetadata, BankRefusal>,
+) -> Result<(), BankRefusal> {
+    validate_maps_for(CountsBankGeometry::legacy(), metadata)
+}
+
+fn profile_maps(
+    geometry: CountsBankGeometry,
+) -> &'static [(&'static str, super::ExactMapMetadata)] {
+    if geometry.is_legacy() {
+        &FORMAT1_MAPS
+    } else {
+        &FORMAT2_MAPS
+    }
+}
+
+fn validate_maps_for(
+    geometry: CountsBankGeometry,
     mut metadata: impl FnMut(&str) -> Result<super::ExactMapMetadata, BankRefusal>,
 ) -> Result<(), BankRefusal> {
-    for (name, expected) in FORMAT1_MAPS {
+    geometry.validate()?;
+    for &(name, expected) in profile_maps(geometry) {
         super::compare_map_metadata(name, metadata(name)?, expected)
             .map_err(|_| BankRefusal::Shape)?;
     }
@@ -1250,10 +1530,58 @@ const FORMAT1_MAPS: [(&str, super::ExactMapMetadata); 8] = [
     ),
 ];
 
+const FORMAT2_MAPS: [(&str, super::ExactMapMetadata); 9] = [
+    (
+        "COUNTER_BANKS",
+        super::map_metadata(MapType::HashOfMaps, 4, 4, 16, 128),
+    ),
+    (
+        "COUNTER_BANK_META",
+        super::map_metadata(MapType::Hash, 4, 32, 8192, 128),
+    ),
+    (
+        "COUNTER_BANK_COMMIT",
+        super::map_metadata(MapType::Hash, 8, 16, 8192, 128),
+    ),
+    (
+        "COUNTER_BANK_FAULT",
+        super::map_metadata(MapType::PerCpuArray, 4, 8, 1, 0),
+    ),
+    (
+        "COUNTER_HEALTH",
+        super::map_metadata(MapType::PerCpuArray, 4, 8, 2, 0),
+    ),
+    (
+        "STATS",
+        super::map_metadata(MapType::PerCpuArray, 4, 24, 512, 0),
+    ),
+    (
+        "RV_COUNTS",
+        super::map_metadata(MapType::PerCpuHash, 16, 8, 65536, 0),
+    ),
+    (
+        "START",
+        super::map_metadata(MapType::Hash, 16, 288, 16384, 0),
+    ),
+    (
+        "SLOT_FILE",
+        super::map_metadata(MapType::Array, 4, 4, 8192, 128),
+    ),
+];
+
+#[cfg(test)]
 fn validate_format1_object_maps<'a>(
+    map: impl FnMut(&str) -> Option<&'a aya_obj::Map>,
+) -> Result<(), BankRefusal> {
+    validate_object_maps(CountsBankGeometry::legacy(), map)
+}
+
+fn validate_object_maps<'a>(
+    geometry: CountsBankGeometry,
     mut map: impl FnMut(&str) -> Option<&'a aya_obj::Map>,
 ) -> Result<(), BankRefusal> {
-    for (name, expected) in FORMAT1_MAPS {
+    geometry.validate()?;
+    for &(name, expected) in profile_maps(geometry) {
         let actual = map(name).ok_or(BankRefusal::Shape)?;
         if (
             actual.map_type(),
@@ -1280,7 +1608,7 @@ fn validate_format1_object_maps<'a>(
         inner.value_size(),
         inner.max_entries(),
         inner.map_flags(),
-    ) != (6, 4, 24, 1, 0)
+    ) != (6, 4, 24, geometry.cells, 0)
         || inner.inner().is_some()
     {
         return Err(BankRefusal::Shape);
@@ -1290,10 +1618,22 @@ fn validate_format1_object_maps<'a>(
 
 /// Map-of-maps lookup returns an ID. Borrow the retained outer FD directly;
 /// unlike HashOfMaps::get this does not open another inner FD on each scrape.
-fn outer_id(ebpf: &Ebpf, key: u32) -> Result<Option<u32>, BankRefusal> {
+fn outer_id(
+    ebpf: &Ebpf,
+    geometry: CountsBankGeometry,
+    key: u32,
+) -> Result<Option<u32>, BankRefusal> {
     // Pin buffer sizes at this raw-syscall seam even if another crate-private
     // caller has replaced an Ebpf map since the original preparation.
-    exact_map(ebpf, "COUNTER_BANKS", MapType::HashOfMaps, 4, 4, 2, 128)?;
+    exact_map(
+        ebpf,
+        "COUNTER_BANKS",
+        MapType::HashOfMaps,
+        4,
+        4,
+        geometry.banks,
+        128,
+    )?;
     let Some(Map::HashOfMaps(data)) = ebpf.map("COUNTER_BANKS") else {
         return Err(BankRefusal::Shape);
     };
@@ -1315,11 +1655,73 @@ fn outer_id(ebpf: &Ebpf, key: u32) -> Result<Option<u32>, BankRefusal> {
     }
 }
 
+fn observe_route(
+    ebpf: &Ebpf,
+    geometry: CountsBankGeometry,
+    slot: u32,
+    expected: CountsBankRoute,
+) -> Result<Option<bool>, BankRefusal> {
+    let map = ebpf.map("COUNTER_BANK_META").ok_or(BankRefusal::Shape)?;
+    if geometry.is_legacy() {
+        let map: HashMap<_, u32, BankMetadata> =
+            HashMap::try_from(map).map_err(|_| BankRefusal::Shape)?;
+        match map.get(&slot, 0) {
+            Ok(actual) => Ok(Some(actual == legacy_route(slot, expected)?)),
+            Err(MapError::KeyNotFound) => Ok(None),
+            Err(_) => Err(BankRefusal::Native),
+        }
+    } else {
+        let map: HashMap<_, u32, CountsBankRoute> =
+            HashMap::try_from(map).map_err(|_| BankRefusal::Shape)?;
+        match map.get(&slot, 0) {
+            Ok(actual) => Ok(Some(actual == expected)),
+            Err(MapError::KeyNotFound) => Ok(None),
+            Err(_) => Err(BankRefusal::Native),
+        }
+    }
+}
+
+fn observe_native_commit(
+    ebpf: &Ebpf,
+    geometry: CountsBankGeometry,
+    transaction: u64,
+    expected: CountsBankCommit,
+) -> CommitObservation {
+    let Some(map) = ebpf.map("COUNTER_BANK_COMMIT") else {
+        return CommitObservation::Unreadable;
+    };
+    if geometry.is_legacy() {
+        let Ok(expected) = legacy_commit(expected) else {
+            return CommitObservation::Contradictory;
+        };
+        let Ok(map): Result<HashMap<_, u64, BankCommit>, _> = HashMap::try_from(map) else {
+            return CommitObservation::Contradictory;
+        };
+        match map.get(&transaction, 0) {
+            Ok(actual) if actual == expected => CommitObservation::Exact,
+            Ok(_) => CommitObservation::Contradictory,
+            Err(MapError::KeyNotFound) => CommitObservation::Absent,
+            Err(_) => CommitObservation::Unreadable,
+        }
+    } else {
+        let Ok(map): Result<HashMap<_, u64, CountsBankCommit>, _> = HashMap::try_from(map) else {
+            return CommitObservation::Contradictory;
+        };
+        match map.get(&transaction, 0) {
+            Ok(actual) if actual == expected => CommitObservation::Exact,
+            Ok(_) => CommitObservation::Contradictory,
+            Err(MapError::KeyNotFound) => CommitObservation::Absent,
+            Err(_) => CommitObservation::Unreadable,
+        }
+    }
+}
+
 struct NativeIo<'a> {
     session: &'a mut Session,
     objects: &'a PinnedObjects,
     custody: &'a mut NativeCustody,
     cpus: usize,
+    geometry: CountsBankGeometry,
     reservation: BankReservation,
 }
 
@@ -1328,83 +1730,89 @@ impl BankIo for NativeIo<'_> {
         self.cpus
     }
 
-    fn validate_targets(&mut self, slots: &[Slot], published: &[u32]) -> Result<(), BankRefusal> {
-        let published = legacy_indices_mask(published.iter().copied())?;
+    fn validate_targets(
+        &mut self,
+        slots: &[Slot],
+        published: &[u32],
+        fresh: BankExtent,
+        old_capacity: usize,
+    ) -> Result<(), BankRefusal> {
         if self.session.mutation_stopped()
             || self.session.backend != super::AttachBackend::Singles
+            || !matches!(
+                self.session.uprobe_scope,
+                aya::programs::uprobe::UProbeScope::OneProcess(_)
+            )
             || self.objects.check_unchanged() != Ok(true)
             || aya::util::nr_cpus().ok() != Some(self.cpus)
         {
             return Err(BankRefusal::Topology);
         }
-        validate_provider_slots(slots, self.objects, published, |index| {
-            self.custody.providers[index as usize].as_ref()
-        })?;
-        let copies = slots
+        validate_maps(&self.session.ebpf, self.geometry)?;
+        if self.custody.charges.len() == self.custody.charges.capacity() {
+            return Err(BankRefusal::Budget);
+        }
+        let new_banks = (fresh.first / self.geometry.cells..=(fresh.end - 1) / self.geometry.cells)
+            .filter(|&bank| self.custody.banks[bank as usize].is_none())
+            .count();
+        let provider_copies = slots[fresh.first as usize..fresh.end as usize]
             .iter()
-            .try_fold(0usize, |total, slot| {
-                if self.objects.abi_for(slot.object) != Some(p11scope_manifest::elf::ElfAbi::Lp64)
-                    || (published & (1 << slot.index) == 0
-                        && self.session.has_slot_link(slot.index))
+            .try_fold(0usize, |bytes, slot| {
+                if self.session.has_slot_link(slot.index)
+                    || self
+                        .custody
+                        .providers
+                        .get(slot.index as usize)
+                        .is_none_or(Option::is_some)
                 {
                     return None;
                 }
-                total.checked_add(
+                bytes.checked_add(
                     self.objects
                         .retained_target_copy_allocation_charge(slot.object)?
                         .checked_mul(4)?,
                 )
             })
-            .ok_or(BankRefusal::Topology)?;
-        let requested = copies
-            .checked_add(stage_owned_bytes(slots, self.cpus).ok_or(BankRefusal::Budget)?)
             .ok_or(BankRefusal::Budget)?;
-        if requested > self.reservation.retained_bytes
-            || requested > self.reservation.transient_bytes
+        let (retained, transient, metadata, fds) = stage_requirements(
+            self.geometry,
+            slots,
+            fresh,
+            old_capacity,
+            self.cpus,
+            new_banks,
+            provider_copies,
+            16,
+        )?;
+        if self.reservation.retained_bytes < retained
+            || self.reservation.transient_bytes < transient
+            || self.reservation.metadata_bytes < metadata
+            || self.reservation.file_descriptors < fds
         {
             return Err(BankRefusal::Budget);
         }
-        Ok(())
+        check_fd_headroom_with(fds, read_fd_snapshot)?;
+        validate_provider_union(slots, published, fresh, self.objects, self.custody, false)
     }
 
     fn retain_charge(&mut self, charge: ResourceLease) {
-        let slot = self
-            .custody
-            .charges
-            .iter_mut()
-            .find(|slot| slot.is_none())
-            .expect("format1's consumed extent bounds retained attempts");
-        *slot = Some(charge);
+        self.custody.retain_charge(charge);
     }
 
-    fn allocate_bank(&mut self, bank: u32, all_slots: &[Slot]) -> Result<u32, BankRefusal> {
-        // Explicit format1 adapter only. Real format2 preparation/staging is
-        // refused before any lifecycle or endpoint attachment.
+    fn allocate_bank(&mut self, bank: u32, _: &[Slot]) -> Result<u32, BankRefusal> {
         let index = bank as usize;
-        if index >= BANKS {
+        if bank >= self.geometry.banks {
             return Err(BankRefusal::Shape);
         }
         if self.custody.banks[index].is_some() {
             return Err(BankRefusal::Allocated);
         }
-        let target = all_slots.get(index).ok_or(BankRefusal::Topology)?;
-        let retained = self
-            .objects
-            .retain_inventory_target(target.object)
-            .map_err(|_| BankRefusal::Ownership)?;
-        self.custody.providers[index] = Some(retained);
-        let object = aya_obj::Map::new_from_params(6, 4, 24, 1, 0);
+        let object = aya_obj::Map::new_from_params(6, 4, 24, self.geometry.cells, 0);
         let data =
             MapData::create(object, "p11_counter_bank", None).map_err(|_| BankRefusal::Native)?;
-        let id = data.info().map_err(|_| BankRefusal::Native)?.id();
-        if id == 0
-            || self
-                .custody
-                .banks
-                .iter()
-                .flatten()
-                .any(|bank| bank.id == id)
-        {
+        let info = data.info().map_err(|_| BankRefusal::Native)?;
+        let id = info.id();
+        if id == 0 || self.custody.banks.iter().flatten().any(|old| old.id == id) {
             return Err(BankRefusal::Ownership);
         }
         self.custody.banks[index] = Some(Arc::new(BankHandle {
@@ -1432,15 +1840,18 @@ impl BankIo for NativeIo<'_> {
         )
         .map_err(|_| BankRefusal::Shape)?;
         let result = outer.insert(bank, map_data(&held.map)?, super::BPF_NOEXIST);
-        match outer_id(&self.session.ebpf, bank)? {
-            Some(id) if id == expected_id => Ok(()),
-            None if result.is_err() => Err(BankRefusal::Native),
+        match outer_id(&self.session.ebpf, self.geometry, bank)? {
+            Some(id) if id == expected_id && result.is_ok() => Ok(()),
+            None if result.is_err() => {
+                // No outer key or links ever exposed this positively created map.
+                self.custody.banks[bank as usize] = None;
+                Err(BankRefusal::Native)
+            }
             _ => Err(BankRefusal::Quarantined),
         }
     }
 
     fn insert_route(&mut self, slot: u32, route: CountsBankRoute) -> Result<(), BankRefusal> {
-        let wire = legacy_route(slot, route)?;
         if self
             .custody
             .banks
@@ -1450,45 +1861,53 @@ impl BankIo for NativeIo<'_> {
         {
             return Err(BankRefusal::Quarantined);
         }
-        let mut map: HashMap<_, u32, BankMetadata> = HashMap::try_from(
-            self.session
-                .ebpf
-                .map_mut("COUNTER_BANK_META")
-                .ok_or(BankRefusal::Shape)?,
-        )
-        .map_err(|_| BankRefusal::Shape)?;
-        let result = map.insert(slot, wire, super::BPF_NOEXIST);
-        match map.get(&slot, 0) {
-            Ok(actual) if actual == wire && result.is_ok() => Ok(()),
-            Err(MapError::KeyNotFound) if result.is_err() => Err(BankRefusal::Native),
+        let map = self
+            .session
+            .ebpf
+            .map_mut("COUNTER_BANK_META")
+            .ok_or(BankRefusal::Shape)?;
+        let result = if self.geometry.is_legacy() {
+            let mut map: HashMap<_, u32, BankMetadata> =
+                HashMap::try_from(map).map_err(|_| BankRefusal::Shape)?;
+            map.insert(slot, legacy_route(slot, route)?, super::BPF_NOEXIST)
+        } else {
+            let mut map: HashMap<_, u32, CountsBankRoute> =
+                HashMap::try_from(map).map_err(|_| BankRefusal::Shape)?;
+            map.insert(slot, route, super::BPF_NOEXIST)
+        };
+        match observe_route(&self.session.ebpf, self.geometry, slot, route) {
+            Ok(Some(true)) if result.is_ok() => Ok(()),
+            Ok(None) if result.is_err() => Err(BankRefusal::Native),
             _ => Err(BankRefusal::Quarantined),
         }
     }
 
     fn attach_inactive(&mut self, slots: &[Slot]) -> Result<(), BankRefusal> {
-        let mask = legacy_indices_mask(slots.iter().map(|slot| slot.index))?;
+        self.custody.retain_targets(slots, self.objects)?;
+        let first = slots.first().ok_or(BankRefusal::Topology)?.index;
+        let end = slots
+            .last()
+            .ok_or(BankRefusal::Topology)?
+            .index
+            .checked_add(1)
+            .ok_or(BankRefusal::Shape)?;
         let banks = self
             .session
             .counter_banks
             .as_ref()
             .ok_or(BankRefusal::Shape)?;
-        let _stage = banks.begin_link_stage(mask)?;
+        let _stage = banks.begin_link_stage((u64::from(first) << 32) | u64::from(end))?;
         let (failed, completed) = self
             .session
             .attach_targets(slots, self.objects)
             .map_err(|_| BankRefusal::Links)?;
+        let sides = self.session.current_static_sides();
         if !failed.is_empty()
             || completed.len() != slots.len()
             || self.objects.check_unchanged() != Ok(true)
             || slots.iter().any(|slot| {
-                !self
-                    .session
-                    .current_static_sides()
-                    .contains(&(slot.index, super::ProbeSide::Entry))
-                    || !self
-                        .session
-                        .current_static_sides()
-                        .contains(&(slot.index, super::ProbeSide::Return))
+                !sides.contains(&(slot.index, super::ProbeSide::Entry))
+                    || !sides.contains(&(slot.index, super::ProbeSide::Return))
             })
         {
             return Err(BankRefusal::Links);
@@ -1496,35 +1915,38 @@ impl BankIo for NativeIo<'_> {
         Ok(())
     }
 
-    fn verify_candidate(&mut self, expected: &StagedExtent, all_slots: &[Slot]) -> CandidateCheck {
-        if legacy_commit(expected.commit).is_err()
-            || validate_maps(&self.session.ebpf).is_err()
+    fn verify_candidate(
+        &mut self,
+        expected: &StagedExtent,
+        all_slots: &[Slot],
+        published: &[u32],
+    ) -> CandidateCheck {
+        if validate_maps(&self.session.ebpf, self.geometry).is_err()
             || self.session.mutation_stopped()
             || self.session.backend != super::AttachBackend::Singles
+            || self.objects.check_unchanged() != Ok(true)
         {
             return CandidateCheck::Contradictory;
         }
         if aya::util::nr_cpus().ok() != Some(self.cpus) {
             return CandidateCheck::Unreadable;
         }
-        let all = match legacy_indices_mask(all_slots.iter().map(|slot| slot.index)) {
-            Ok(mask) => mask,
-            Err(_) => return CandidateCheck::Contradictory,
+        let fresh = BankExtent {
+            first: expected.commit.first,
+            end: expected.commit.end,
         };
-        if self.objects.check_unchanged() != Ok(true)
-            || validate_provider_slots(all_slots, self.objects, all, |index| {
-                self.custody.providers[index as usize].as_ref()
-            })
-            .is_err()
+        if validate_provider_union(
+            all_slots,
+            published,
+            fresh,
+            self.objects,
+            self.custody,
+            true,
+        )
+        .is_err()
         {
             return CandidateCheck::Contradictory;
         }
-        let Some(map) = self.session.ebpf.map("COUNTER_BANK_META") else {
-            return CandidateCheck::Unreadable;
-        };
-        let Ok(metadata): Result<HashMap<_, u32, BankMetadata>, _> = HashMap::try_from(map) else {
-            return CandidateCheck::Contradictory;
-        };
         let sides = self.session.current_static_sides();
         for &(bank, id) in &expected.bank_ids {
             let Some(held) = self
@@ -1541,28 +1963,35 @@ impl BankIo for NativeIo<'_> {
             let Ok(info) = data.info() else {
                 return CandidateCheck::Unreadable;
             };
-            if held.id != id || info.id() != id {
+            if held.id != id
+                || info.id() != id
+                || exact_map_metadata(
+                    &held.map,
+                    MapType::PerCpuArray,
+                    4,
+                    24,
+                    self.geometry.cells,
+                    0,
+                )
+                .is_err()
+            {
                 return CandidateCheck::Contradictory;
             }
-            match outer_id(&self.session.ebpf, bank) {
+            match outer_id(&self.session.ebpf, self.geometry, bank) {
                 Ok(Some(actual)) if actual == id => {}
                 Ok(_) => return CandidateCheck::Contradictory,
                 Err(_) => return CandidateCheck::Unreadable,
             }
         }
         for &(slot, route) in &expected.routes {
-            let Ok(wire) = legacy_route(slot, route) else {
-                return CandidateCheck::Contradictory;
-            };
-            if !expected.bank_ids.contains(&(route.bank, route.inner_id))
-                || !sides.contains(&(slot, super::ProbeSide::Entry))
+            if !sides.contains(&(slot, super::ProbeSide::Entry))
                 || !sides.contains(&(slot, super::ProbeSide::Return))
             {
                 return CandidateCheck::Contradictory;
             }
-            match metadata.get(&slot, 0) {
-                Ok(actual) if actual == wire => {}
-                Ok(_) | Err(MapError::KeyNotFound) => return CandidateCheck::Contradictory,
+            match observe_route(&self.session.ebpf, self.geometry, slot, route) {
+                Ok(Some(true)) => {}
+                Ok(_) => return CandidateCheck::Contradictory,
                 Err(_) => return CandidateCheck::Unreadable,
             }
         }
@@ -1574,16 +2003,22 @@ impl BankIo for NativeIo<'_> {
         transaction: u64,
         commit: CountsBankCommit,
     ) -> Result<(), BankRefusal> {
-        let wire = legacy_commit(commit)?;
-        let mut map: HashMap<_, u64, BankCommit> = HashMap::try_from(
-            self.session
-                .ebpf
-                .map_mut("COUNTER_BANK_COMMIT")
-                .ok_or(BankRefusal::Shape)?,
-        )
-        .map_err(|_| BankRefusal::Shape)?;
-        map.insert(transaction, wire, super::BPF_NOEXIST)
-            .map_err(|_| BankRefusal::Commit)
+        let map = self
+            .session
+            .ebpf
+            .map_mut("COUNTER_BANK_COMMIT")
+            .ok_or(BankRefusal::Shape)?;
+        if self.geometry.is_legacy() {
+            let mut map: HashMap<_, u64, BankCommit> =
+                HashMap::try_from(map).map_err(|_| BankRefusal::Shape)?;
+            map.insert(transaction, legacy_commit(commit)?, super::BPF_NOEXIST)
+                .map_err(|_| BankRefusal::Commit)
+        } else {
+            let mut map: HashMap<_, u64, CountsBankCommit> =
+                HashMap::try_from(map).map_err(|_| BankRefusal::Shape)?;
+            map.insert(transaction, commit, super::BPF_NOEXIST)
+                .map_err(|_| BankRefusal::Commit)
+        }
     }
 
     fn observe_commit(
@@ -1591,21 +2026,7 @@ impl BankIo for NativeIo<'_> {
         transaction: u64,
         expected: CountsBankCommit,
     ) -> CommitObservation {
-        let Ok(wire) = legacy_commit(expected) else {
-            return CommitObservation::Contradictory;
-        };
-        let Some(map) = self.session.ebpf.map("COUNTER_BANK_COMMIT") else {
-            return CommitObservation::Unreadable;
-        };
-        let Ok(map): Result<HashMap<_, u64, BankCommit>, _> = HashMap::try_from(map) else {
-            return CommitObservation::Unreadable;
-        };
-        match map.get(&transaction, 0) {
-            Ok(actual) if actual == wire => CommitObservation::Exact,
-            Ok(_) => CommitObservation::Contradictory,
-            Err(MapError::KeyNotFound) => CommitObservation::Absent,
-            Err(_) => CommitObservation::Unreadable,
-        }
+        observe_native_commit(&self.session.ebpf, self.geometry, transaction, expected)
     }
 
     fn remove_route_owned(
@@ -1613,27 +2034,30 @@ impl BankIo for NativeIo<'_> {
         slot: u32,
         expected: CountsBankRoute,
     ) -> Result<(), BankRefusal> {
-        let wire = legacy_route(slot, expected)?;
         if self
             .custody
             .banks
             .get(expected.bank as usize)
             .and_then(Option::as_ref)
             .is_none_or(|bank| bank.id != expected.inner_id)
+            || observe_route(&self.session.ebpf, self.geometry, slot, expected)? != Some(true)
         {
             return Err(BankRefusal::Ownership);
         }
-        let mut map: HashMap<_, u32, BankMetadata> = HashMap::try_from(
-            self.session
-                .ebpf
-                .map_mut("COUNTER_BANK_META")
-                .ok_or(BankRefusal::Shape)?,
-        )
-        .map_err(|_| BankRefusal::Shape)?;
-        if map.get(&slot, 0).map_err(|_| BankRefusal::Ownership)? != wire {
-            return Err(BankRefusal::Ownership);
+        let map = self
+            .session
+            .ebpf
+            .map_mut("COUNTER_BANK_META")
+            .ok_or(BankRefusal::Shape)?;
+        if self.geometry.is_legacy() {
+            let mut map: HashMap<_, u32, BankMetadata> =
+                HashMap::try_from(map).map_err(|_| BankRefusal::Shape)?;
+            map.remove(&slot).map_err(|_| BankRefusal::Ownership)
+        } else {
+            let mut map: HashMap<_, u32, CountsBankRoute> =
+                HashMap::try_from(map).map_err(|_| BankRefusal::Shape)?;
+            map.remove(&slot).map_err(|_| BankRefusal::Ownership)
         }
-        map.remove(&slot).map_err(|_| BankRefusal::Ownership)
     }
 
     fn remove_new_bank_owned(&mut self, bank: u32, expected_id: u32) -> Result<(), BankRefusal> {
@@ -1643,7 +2067,7 @@ impl BankIo for NativeIo<'_> {
             .get(bank as usize)
             .and_then(Option::as_ref)
             .is_none_or(|held| held.id != expected_id)
-            || outer_id(&self.session.ebpf, bank)? != Some(expected_id)
+            || outer_id(&self.session.ebpf, self.geometry, bank)? != Some(expected_id)
         {
             return Err(BankRefusal::Ownership);
         }
@@ -1654,7 +2078,12 @@ impl BankIo for NativeIo<'_> {
                 .ok_or(BankRefusal::Shape)?,
         )
         .map_err(|_| BankRefusal::Shape)?;
-        outer.remove(&bank).map_err(|_| BankRefusal::Ownership)
+        outer.remove(&bank).map_err(|_| BankRefusal::Ownership)?;
+        if outer_id(&self.session.ebpf, self.geometry, bank)?.is_some() {
+            return Err(BankRefusal::Ownership);
+        }
+        self.custody.banks[bank as usize] = None;
+        Ok(())
     }
 
     fn retire_links(&mut self, slots: &[Slot]) -> Result<(), BankRefusal> {
@@ -1727,10 +2156,11 @@ impl Session {
         let directory = Arc::clone(&banks.directory);
         let keepalive = Arc::clone(&banks.keepalive);
         let cpus = banks.cpus;
+        let geometry = banks.geometry;
         let Ok(mut directory) = directory.lock() else {
             return BankPublication::Refused(BankRefusal::Quarantined);
         };
-        if !directory.geometry.is_legacy() {
+        if directory.geometry != geometry {
             return BankPublication::Refused(BankRefusal::Shape);
         }
         let Ok(mut custody) = keepalive.custody.lock() else {
@@ -1741,6 +2171,7 @@ impl Session {
             objects,
             custody: &mut custody,
             cpus,
+            geometry,
             reservation,
         };
         directory.stage_with(&mut native, plan, reservation, reserve)
@@ -1748,13 +2179,15 @@ impl Session {
 }
 
 impl CounterBanks {
-    fn begin_link_stage(&self, mask: u64) -> Result<LinkStage, BankRefusal> {
-        if mask == 0
-            || mask & !3 != 0
-            || self
-                .link_staging
-                .compare_exchange(0, mask, Ordering::Relaxed, Ordering::Relaxed)
-                .is_err()
+    fn begin_link_stage(&self, word: u64) -> Result<LinkStage, BankRefusal> {
+        let first = (word >> 32) as u32;
+        let end = word as u32;
+        BankExtent::checked(first, end, self.geometry.limit())
+            .map_err(|_| BankRefusal::Quarantined)?;
+        if self
+            .link_staging
+            .compare_exchange(0, word, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
         {
             return Err(BankRefusal::Quarantined);
         }
@@ -1762,13 +2195,17 @@ impl CounterBanks {
     }
 
     pub(super) fn permits_link_stage(&self, slots: &[Slot]) -> bool {
-        !slots.is_empty()
-            && slots.len() <= BANKS
-            && slots.iter().all(|slot| (slot.index as usize) < BANKS)
-            && self.link_staging.load(Ordering::Relaxed)
-                == slots
-                    .iter()
-                    .fold(0u64, |mask, slot| mask | (1 << slot.index))
+        let word = self.link_staging.load(Ordering::Relaxed);
+        let first = (word >> 32) as u32;
+        let end = word as u32;
+        let Ok(extent) = BankExtent::checked(first, end, self.geometry.limit()) else {
+            return false;
+        };
+        slots.len() == extent.len()
+            && slots
+                .iter()
+                .enumerate()
+                .all(|(offset, slot)| slot.index == first + offset as u32)
     }
 }
 
@@ -1798,8 +2235,10 @@ pub(crate) enum BankReadStatus {
 
 /// The current constructor prepares only the validated native Counts proof.
 /// This is not inferred from a caller's requested mode or a map's name.
+#[derive(Clone, Copy)]
 struct CounterReaderProfile {
     cpus: usize,
+    geometry: CountsBankGeometry,
 }
 
 impl CounterReaderProfile {
@@ -1807,10 +2246,10 @@ impl CounterReaderProfile {
         CounterMode::Counts
     }
     fn logical_slots(&self) -> usize {
-        512
+        self.geometry.logical_slots()
     }
     fn rv_keys(&self) -> usize {
-        4096
+        self.geometry.rv_keys()
     }
     fn start_rows(&self) -> u32 {
         16384
@@ -1833,16 +2272,20 @@ fn reader_profile_with(
     if directory.quarantined {
         return Err(BankRefusal::Quarantined);
     }
-    if !directory.geometry.is_legacy() {
+    if directory.geometry != banks.geometry {
         return Err(BankRefusal::Shape);
     }
+    directory.geometry.validate()?;
     drop(directory);
     let cpus = possible_cpus()?;
     if cpus == 0 || cpus != banks.cpus {
         return Err(BankRefusal::Topology);
     }
-    validate_maps_with(metadata)?;
-    Ok(Some(CounterReaderProfile { cpus }))
+    validate_maps_for(banks.geometry, metadata)?;
+    Ok(Some(CounterReaderProfile {
+        cpus,
+        geometry: banks.geometry,
+    }))
 }
 
 /// A fresh-read borrow of the original prepared Session. It cannot be made
@@ -1900,59 +2343,248 @@ impl Session {
     }
 }
 
-/// Arc clones share the exact retained handles/charge. No get-by-ID FD is
-/// opened by collection and no slot is inferred from display metadata.
+#[derive(Clone, Copy)]
+struct PublishedRow {
+    index: u32,
+    key: AttachKey,
+    route: CountsBankRoute,
+}
+
+/// Charged read-only Directory selection. This grants neither native-map
+/// health nor capture authority; the native view must verify both scrapes.
+pub(crate) struct CounterPublishedSnapshot {
+    profile: CounterReaderProfile,
+    high_water: usize,
+    budget: crate::capacity::CounterBudget,
+    rows: Vec<PublishedRow>,
+    indices: Vec<u32>,
+    selected: Vec<u8>,
+    physical_prefix: Vec<AttachKey>,
+    keepalive: Arc<CounterKeepalive>,
+    _storage: ResourceLease,
+}
+
+impl CounterPublishedSnapshot {
+    pub(crate) fn original_indices(&self) -> &[u32] {
+        &self.indices
+    }
+    pub(crate) fn logical_slots(&self) -> usize {
+        self.profile.logical_slots()
+    }
+    pub(crate) fn rv_keys(&self) -> usize {
+        self.profile.rv_keys()
+    }
+    pub(crate) fn start_rows(&self) -> u32 {
+        self.profile.start_rows()
+    }
+    pub(crate) fn possible_cpus(&self) -> usize {
+        self.profile.possible_cpus()
+    }
+
+    pub(crate) fn validate_plan(&self, plan: &AttachPlan) -> Result<(), BankRefusal> {
+        self.validate_binding(plan, None)
+    }
+
+    fn validate_binding(
+        &self,
+        plan: &AttachPlan,
+        objects: Option<&PinnedObjects>,
+    ) -> Result<(), BankRefusal> {
+        if plan.slots.len() != self.high_water
+            || plan.counter_consumed_end() as usize != self.high_water
+            || !matches!(plan.admission_policy(), crate::plan::AdmissionPolicy::Counters(budget) if budget == self.budget)
+            || plan.slots.iter().enumerate().any(|(index, slot)| {
+                slot.index as usize != index || physical(slot) != self.physical_prefix[index]
+            })
+        {
+            return Err(BankRefusal::Topology);
+        }
+        let custody = self
+            .keepalive
+            .custody
+            .lock()
+            .map_err(|_| BankRefusal::Quarantined)?;
+        for row in &self.rows {
+            let slot = &plan.slots[row.index as usize];
+            if physical(slot) != row.key {
+                return Err(BankRefusal::Topology);
+            }
+            let held = custody
+                .providers
+                .get(row.index as usize)
+                .and_then(Option::as_ref)
+                .ok_or(BankRefusal::Ownership)?;
+            retained_binding(slot, Some(plan), objects, held)?;
+        }
+        Ok(())
+    }
+}
+
+impl CounterBanks {
+    fn published_snapshot(
+        &self,
+        plan: &AttachPlan,
+        objects: &PinnedObjects,
+        reserve: &SemanticResourceReserver,
+    ) -> Result<CounterPublishedSnapshot, BankRefusal> {
+        // One lock order, entered here exactly once. Native staging never
+        // reenters this helper while it holds the Directory/custody locks.
+        let directory = self
+            .directory
+            .lock()
+            .map_err(|_| BankRefusal::Quarantined)?;
+        if directory.geometry != self.geometry {
+            return Err(BankRefusal::Shape);
+        }
+        directory.validate_read_plan(plan)?;
+        if plan.slots.len() != directory.positions.len()
+            || plan.counter_consumed_end() as usize != directory.positions.len()
+        {
+            return Err(BankRefusal::Topology);
+        }
+        let count = directory.published_indices().count();
+        let bytes = count
+            .checked_mul(
+                size_of::<PublishedRow>() + size_of::<u32>() + size_of::<(u64, u64, u64)>(),
+            )
+            .and_then(|n| {
+                n.checked_add(
+                    directory
+                        .positions
+                        .len()
+                        .checked_mul(size_of::<AttachKey>() + 1)?,
+                )
+            })
+            .and_then(|n| {
+                n.checked_add(size_of::<CounterBankView>() + 5 * OWNED_ALLOCATION_PADDING)
+            })
+            .ok_or(BankRefusal::Budget)?;
+        let storage = reserve.reserve(bytes).map_err(|_| BankRefusal::Budget)?;
+        let custody = self
+            .keepalive
+            .custody
+            .lock()
+            .map_err(|_| BankRefusal::Quarantined)?;
+        let mut rows = Vec::with_capacity(count);
+        let mut indices = Vec::with_capacity(count);
+        let mut selected = vec![0; directory.positions.len()];
+        let physical_prefix = directory
+            .positions
+            .iter()
+            .map(|position| position.key)
+            .collect();
+        let mut endpoints = Vec::with_capacity(count);
+        for index in directory.published_indices() {
+            let slot = &plan.slots[index as usize];
+            let held = custody
+                .providers
+                .get(index as usize)
+                .and_then(Option::as_ref)
+                .ok_or(BankRefusal::Ownership)?;
+            endpoints.push(retained_binding(slot, Some(plan), Some(objects), held)?);
+            let PositionState::Published(route) = directory.positions[index as usize].state else {
+                unreachable!("published iterator")
+            };
+            rows.push(PublishedRow {
+                index,
+                key: physical(slot),
+                route,
+            });
+            indices.push(index);
+            selected[index as usize] = 1;
+        }
+        endpoints.sort_unstable();
+        if endpoints.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(BankRefusal::Ownership);
+        }
+        Ok(CounterPublishedSnapshot {
+            profile: CounterReaderProfile {
+                cpus: self.cpus,
+                geometry: self.geometry,
+            },
+            high_water: directory.positions.len(),
+            budget: directory.budget.ok_or(BankRefusal::Topology)?,
+            rows,
+            indices,
+            selected,
+            physical_prefix,
+            keepalive: Arc::clone(&self.keepalive),
+            _storage: storage,
+        })
+    }
+}
+
+/// The maps share retained handles; no scrape opens get-by-ID descriptors.
 pub(crate) struct CounterBankView {
-    banks: [Option<Arc<BankHandle>>; BANKS],
-    metadata: [Option<BankMetadata>; BANKS],
-    expected: usize,
-    status: BankReadStatus,
-    _keepalive: Arc<CounterKeepalive>,
+    banks: [Option<Arc<BankHandle>>; GROWTH_BANKS],
+    snapshot: CounterPublishedSnapshot,
 }
 
 impl CounterBankView {
-    pub(crate) fn bank(&self, slot: u32) -> Option<&Map> {
-        self.banks
-            .get(slot as usize)?
-            .as_ref()
-            .map(|bank| &bank.map)
+    pub(crate) fn snapshot(&self) -> &CounterPublishedSnapshot {
+        &self.snapshot
     }
 
-    pub(crate) fn routing(&self, ebpf: &Ebpf) -> Result<BankReadStatus, BankRefusal> {
-        validate_maps(ebpf)?;
-        if self.status != BankReadStatus::Healthy {
-            return Ok(self.status);
+    pub(crate) fn bank_cell(&self, slot: u32) -> Option<(&Map, u32)> {
+        if self.snapshot.selected.get(slot as usize) != Some(&1) {
+            return None;
         }
-        let metadata: HashMap<_, u32, BankMetadata> =
-            HashMap::try_from(ebpf.map("COUNTER_BANK_META").ok_or(BankRefusal::Shape)?)
-                .map_err(|_| BankRefusal::Shape)?;
-        let commits: HashMap<_, u64, BankCommit> =
-            HashMap::try_from(ebpf.map("COUNTER_BANK_COMMIT").ok_or(BankRefusal::Shape)?)
-                .map_err(|_| BankRefusal::Shape)?;
-        for slot in 0..self.expected {
-            let Some(bank) = &self.banks[slot] else {
+        let (bank, cell) = self.snapshot.profile.geometry.locate(slot).ok()?;
+        Some((&self.banks.get(bank as usize)?.as_ref()?.map, cell))
+    }
+
+    pub(crate) fn routing(
+        &self,
+        ebpf: &Ebpf,
+        plan: &AttachPlan,
+        objects: &PinnedObjects,
+    ) -> Result<BankReadStatus, BankRefusal> {
+        let geometry = self.snapshot.profile.geometry;
+        validate_maps(ebpf, geometry)?;
+        match self.snapshot.validate_binding(plan, Some(objects)) {
+            Ok(()) => {}
+            Err(BankRefusal::Quarantined) => return Ok(BankReadStatus::Quarantined),
+            Err(_) => return Ok(BankReadStatus::Routing),
+        }
+        let mut checked = [false; GROWTH_BANKS];
+        let mut last_commit = None;
+        for row in &self.snapshot.rows {
+            let route = row.route;
+            let Some(held) = self.banks.get(route.bank as usize).and_then(Option::as_ref) else {
                 return Ok(BankReadStatus::Routing);
             };
-            let Some(expected) = self.metadata[slot] else {
+            if held.id != route.inner_id {
                 return Ok(BankReadStatus::Routing);
+            }
+            if !checked[route.bank as usize] {
+                if exact_map_metadata(&held.map, MapType::PerCpuArray, 4, 24, geometry.cells, 0)
+                    .is_err()
+                    || map_data(&held.map)?
+                        .info()
+                        .map_err(|_| BankRefusal::Native)?
+                        .id()
+                        != held.id
+                    || outer_id(ebpf, geometry, route.bank)? != Some(held.id)
+                {
+                    return Ok(BankReadStatus::Routing);
+                }
+                checked[route.bank as usize] = true;
+            }
+            if observe_route(ebpf, geometry, row.index, route)? != Some(true) {
+                return Ok(BankReadStatus::Routing);
+            }
+            let expected = CountsBankCommit {
+                first: route.first,
+                end: route.end,
+                configuration: geometry.configuration,
             };
-            match metadata.get(&(slot as u32), 0) {
-                Ok(actual) if actual == expected => {}
-                Ok(_) | Err(MapError::KeyNotFound) => return Ok(BankReadStatus::Routing),
-                Err(_) => return Err(BankRefusal::Native),
-            }
-            match commits.get(&expected.transaction, 0) {
-                Ok(commit)
-                    if commit
-                        == (BankCommit {
-                            mask: expected.mask,
-                            configuration: BANK_CONFIG,
-                        }) => {}
-                Ok(_) | Err(MapError::KeyNotFound) => return Ok(BankReadStatus::Routing),
-                Err(_) => return Err(BankRefusal::Native),
-            }
-            if outer_id(ebpf, slot as u32)? != Some(bank.id) {
-                return Ok(BankReadStatus::Routing);
+            if last_commit != Some((route.transaction, expected)) {
+                if observe_native_commit(ebpf, geometry, route.transaction, expected)
+                    != CommitObservation::Exact
+                {
+                    return Ok(BankReadStatus::Routing);
+                }
+                last_commit = Some((route.transaction, expected));
             }
         }
         Ok(BankReadStatus::Healthy)
@@ -1964,39 +2596,18 @@ impl Session {
         &self,
         plan: &AttachPlan,
         objects: &PinnedObjects,
+        reserve: &SemanticResourceReserver,
     ) -> Result<CounterBankView, BankRefusal> {
         let banks = self.counter_banks.as_ref().ok_or(BankRefusal::Shape)?;
-        let directory = banks
-            .directory
-            .lock()
-            .map_err(|_| BankRefusal::Quarantined)?;
-        if !directory.geometry.is_legacy() {
-            return Err(BankRefusal::Shape);
-        }
+        let snapshot = banks.published_snapshot(plan, objects, reserve)?;
         let custody = banks
             .keepalive
             .custody
             .lock()
             .map_err(|_| BankRefusal::Quarantined)?;
-        let status = match directory.validate_read_plan(plan) {
-            Ok(()) => {
-                validate_provider_slots(
-                    &plan.slots,
-                    objects,
-                    directory.legacy_published_mask()?,
-                    |index| custody.providers[index as usize].as_ref(),
-                )?;
-                BankReadStatus::Healthy
-            }
-            Err(BankRefusal::Quarantined) => BankReadStatus::Quarantined,
-            Err(_) => BankReadStatus::Routing,
-        };
         Ok(CounterBankView {
             banks: custody.banks.clone(),
-            metadata: directory.legacy_metadata()?,
-            expected: plan.slots.len(),
-            status,
-            _keepalive: Arc::clone(&banks.keepalive),
+            snapshot,
         })
     }
 }
@@ -2116,7 +2727,13 @@ pub(crate) mod tests {
             self.cpus
         }
 
-        fn validate_targets(&mut self, _: &[Slot], published: &[u32]) -> Result<(), BankRefusal> {
+        fn validate_targets(
+            &mut self,
+            _: &[Slot],
+            published: &[u32],
+            _fresh: BankExtent,
+            _old_capacity: usize,
+        ) -> Result<(), BankRefusal> {
             self.require_precharge();
             self.trace.push("validate");
             assert!(published.iter().all(|slot| self.routes.contains_key(slot)));
@@ -2206,6 +2823,7 @@ pub(crate) mod tests {
             &mut self,
             expected: &StagedExtent,
             all_slots: &[Slot],
+            _published: &[u32],
         ) -> CandidateCheck {
             self.trace.push("verify");
             assert_eq!(all_slots.len(), expected.commit.end as usize);
@@ -3619,6 +4237,8 @@ pub(crate) mod tests {
             &mut self,
             slots: &[Slot],
             published: &[u32],
+            _fresh: BankExtent,
+            _old_capacity: usize,
         ) -> Result<(), BankRefusal> {
             self.trace.push("validate");
             let published = legacy_indices_mask(published.iter().copied())?;
@@ -3694,6 +4314,7 @@ pub(crate) mod tests {
             &mut self,
             expected: &StagedExtent,
             all_slots: &[Slot],
+            _published: &[u32],
         ) -> CandidateCheck {
             self.trace.push("verify");
             assert_eq!(all_slots.len(), expected.commit.end as usize);
@@ -3843,6 +4464,7 @@ pub(crate) mod tests {
         // The actual Session gate must remain closed outside the transaction,
         // and a refused overlapping admission must not clear the first guard.
         let banks = CounterBanks {
+            geometry: CountsBankGeometry::legacy(),
             directory: Arc::new(Mutex::new(BankDirectory::default())),
             keepalive: CounterKeepalive::precharge(&pool.reserver(), 4096).unwrap(),
             cpus: 2,
@@ -3850,7 +4472,7 @@ pub(crate) mod tests {
         };
         let targets = plan(2).slots;
         assert!(!banks.permits_link_stage(&targets));
-        let stage = banks.begin_link_stage(3).unwrap();
+        let stage = banks.begin_link_stage(2).unwrap();
         assert!(banks.permits_link_stage(&targets));
         assert!(!banks.permits_link_stage(&targets[..1]));
         assert!(banks.begin_link_stage(1).is_err());
@@ -4301,6 +4923,7 @@ pub(crate) mod tests {
 
     fn reader_banks(pool: &SemanticResourcePool) -> CounterBanks {
         CounterBanks {
+            geometry: CountsBankGeometry::legacy(),
             directory: Arc::new(Mutex::new(BankDirectory::default())),
             keepalive: CounterKeepalive::precharge(&pool.reserver(), 4096).unwrap(),
             cpus: 2,
@@ -4412,6 +5035,7 @@ pub(crate) mod tests {
             dir,
             history,
             banks: CounterBanks {
+                geometry,
                 directory: Arc::new(Mutex::new(directory)),
                 keepalive,
                 cpus: 2,
@@ -4904,7 +5528,8 @@ pub(crate) mod tests {
     #[test]
     fn format2_link_stage_requires_exact_extent() {
         let pool = SemanticResourcePool::reference_limit(4 * 1024 * 1024);
-        let banks = reader_banks(&pool);
+        let mut banks = reader_banks(&pool);
+        banks.geometry = CountsBankGeometry::checked(16, 512).unwrap();
         *banks.directory.lock().unwrap() = BankDirectory::counts_growth_v2();
         let slots = vec![slot(511, 1), slot(512, 2)];
         // The existing atomic is an exact (first,end) guard, not a slot mask.

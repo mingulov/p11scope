@@ -49,7 +49,7 @@ pub(super) fn read(
 
 /// Private Counts-only bank bridge. The view shares the original map handles
 /// and leases; creating a scrape opens no inner-map FD or new cursor.
-#[allow(dead_code)] // Unselected two-cell proof; no public/runtime reader activation.
+#[allow(dead_code)] // Private validated bank bridge; no public/runtime reader activation.
 pub(super) fn read_banked(
     session: &Session,
     plan: &AttachPlan,
@@ -83,9 +83,15 @@ pub(super) fn read_bound(
 ) -> Result<CounterRead, ReadStage> {
     let session = binding.session();
     let view = session
-        .counter_bank_view(plan, objects)
+        .counter_bank_view(plan, objects, reserve)
         .map_err(bank_read_stage)?;
-    let native = NativeSource::new(|name| session.ebpf.map(name), binding.mode())?;
+    let native = NativeSource::with_bounds(
+        |name| session.ebpf.map(name),
+        binding.mode(),
+        binding.rv_keys(),
+        binding.start_rows(),
+        Some(binding.possible_cpus()),
+    )?;
     let fault = session
         .ebpf
         .map("COUNTER_BANK_FAULT")
@@ -96,6 +102,8 @@ pub(super) fn read_bound(
         view: &view,
         ebpf: &session.ebpf,
         fault: PerCpuArray::try_from(fault).map_err(|_| ReadStage::Health)?,
+        plan,
+        objects,
     };
     acquire(&source, binding.generation(), plan, limits, reserve)
 }
@@ -105,6 +113,11 @@ pub(super) fn read_bound(
 trait CounterSource {
     fn mode(&self) -> CounterMode;
     fn possible_cpus(&self) -> usize;
+    fn published_snapshot(
+        &self,
+    ) -> Option<&crate::attach::counter_banks::CounterPublishedSnapshot> {
+        None
+    }
     fn routing(&self) -> Result<Option<CounterIssue>, ReadStage> {
         Ok(None)
     }
@@ -145,26 +158,71 @@ fn acquire(
     reserve: &SemanticResourceReserver,
 ) -> Result<CounterRead, ReadStage> {
     let started = source.now();
-    if limits.rows > NATIVE_SLOTS
-        || limits.rv_keys > NATIVE_RVS
-        || plan.slots.len() > limits.rows
+    let published = source.published_snapshot(); // Borrow once; never clone a view or its lease.
+    let (logical_slots, rv_limit, row_count) = match published {
+        Some(snapshot) => {
+            if source.mode() != CounterMode::Counts
+                || source.possible_cpus() != snapshot.possible_cpus()
+            {
+                return Err(ReadStage::Shape);
+            }
+            snapshot.validate_plan(plan).map_err(bank_read_stage)?;
+            (
+                snapshot.logical_slots(),
+                snapshot.rv_keys(),
+                snapshot.original_indices().len(),
+            )
+        }
+        None => (NATIVE_SLOTS, NATIVE_RVS, plan.slots.len()),
+    };
+    if limits.rows > logical_slots
+        || limits.rv_keys > rv_limit
+        || row_count > limits.rows
+        || plan.slots.len() > logical_slots
         || source.possible_cpus() == 0
-        || plan.slots.iter().enumerate().any(|(index, slot)| {
-            slot.index as usize != index
-                || plan.slots[..index].iter().any(|previous| {
-                    (previous.object, previous.file_offset) == (slot.object, slot.file_offset)
-                })
-        })
+        || plan
+            .slots
+            .iter()
+            .enumerate()
+            .any(|(index, slot)| slot.index as usize != index)
     {
         return Err(ReadStage::Shape);
     }
-    let _transient = reserve
-        .reserve(
-            transient_bytes(source.mode(), source.possible_cpus(), limits.rv_keys)
-                .ok_or(ReadStage::Budget)?,
-        )
-        .map_err(|_| ReadStage::Budget)?;
-    let storage = ReadReservation::reserve(plan.slots.len(), limits.rv_keys, reserve)?;
+    let transient = transient_bytes(source.mode(), source.possible_cpus(), limits.rv_keys)
+        .and_then(|n| n.checked_add(logical_slots))
+        .and_then(|n| n.checked_add(row_count.checked_mul(size_of::<crate::plan::AttachKey>())?))
+        .and_then(|n| n.checked_add(2 * OWNED_ALLOCATION_PADDING))
+        .ok_or(ReadStage::Budget)?;
+    let _transient = reserve.reserve(transient).map_err(|_| ReadStage::Budget)?;
+    let storage = ReadReservation::reserve(row_count, limits.rv_keys, reserve)?;
+    let mut membership = vec![0u8; logical_slots];
+    let mut targets = Vec::with_capacity(row_count);
+    if let Some(snapshot) = published {
+        for &index in snapshot.original_indices() {
+            let slot = plan.slots.get(index as usize).ok_or(ReadStage::Shape)?;
+            if membership[index as usize] != 0 {
+                return Err(ReadStage::Shape);
+            }
+            membership[index as usize] = 1;
+            targets.push(crate::plan::AttachKey {
+                object: slot.object,
+                file_offset: slot.file_offset,
+            });
+        }
+    } else {
+        for slot in &plan.slots {
+            membership[slot.index as usize] = 1;
+            targets.push(crate::plan::AttachKey {
+                object: slot.object,
+                file_offset: slot.file_offset,
+            });
+        }
+    }
+    targets.sort_unstable();
+    if targets.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(ReadStage::Shape);
+    }
+
     let mut rvs = Vec::with_capacity(limits.rv_keys);
     let mut issue = source.routing()?;
     // Do not use Aya's combined MapIter: it can internally skip missing keys
@@ -176,7 +234,7 @@ fn acquire(
                 issue = Some(CounterIssue::Limits);
                 break;
             }
-            if key._pad != 0 || !plan.slots.iter().any(|slot| slot.index == key.slot) {
+            if key._pad != 0 || membership.get(key.slot as usize) != Some(&1) {
                 issue = Some(CounterIssue::Topology);
                 break;
             }
@@ -200,10 +258,19 @@ fn acquire(
     let rows = if let Some(issue) = issue {
         Err(issue)
     } else {
-        let mut rows = Vec::with_capacity(plan.slots.len());
+        let mut rows = Vec::with_capacity(row_count);
         let mut start = 0;
-        for slot in &plan.slots {
-            let end = start + rvs[start..].partition_point(|(key, _)| key.slot == slot.index);
+        // One dense original-index scan plus one advancing RV cursor. Holes
+        // cannot create rows or accept RVs, and published inactivity is kept.
+        for slot in plan
+            .slots
+            .iter()
+            .filter(|slot| membership[slot.index as usize] != 0)
+        {
+            let mut end = start;
+            while end < rvs.len() && rvs[end].0.slot == slot.index {
+                end += 1;
+            }
             match source.fold_row(slot, &rvs[start..end], limits)? {
                 Ok(row) => rows.push(row),
                 Err(failure) => {
@@ -255,6 +322,8 @@ struct BankedSource<'a> {
     view: &'a crate::attach::counter_banks::CounterBankView,
     ebpf: &'a aya::Ebpf,
     fault: PerCpuArray<&'a MapData, u64>,
+    plan: &'a AttachPlan,
+    objects: &'a crate::discovery::identity::PinnedObjects,
 }
 
 impl CounterSource for BankedSource<'_> {
@@ -264,11 +333,16 @@ impl CounterSource for BankedSource<'_> {
     fn possible_cpus(&self) -> usize {
         self.native.cpus
     }
+    fn published_snapshot(
+        &self,
+    ) -> Option<&crate::attach::counter_banks::CounterPublishedSnapshot> {
+        Some(self.view.snapshot())
+    }
     fn routing(&self) -> Result<Option<CounterIssue>, ReadStage> {
         use crate::attach::counter_banks::BankReadStatus;
         let status = self
             .view
-            .routing(self.ebpf)
+            .routing(self.ebpf, self.plan, self.objects)
             .map_err(|_| ReadStage::BankRouting)?;
         // This additional sticky native map is always sampled, independently
         // of ordinary counter health and all KernelEvidence/control cells.
@@ -295,13 +369,18 @@ impl CounterSource for BankedSource<'_> {
         rvs: &[(RvKey, u64)],
         limits: CounterLimits,
     ) -> Result<Result<CounterRow, CounterIssue>, ReadStage> {
-        let map = self.view.bank(slot.index).ok_or(ReadStage::Stats)?;
-        shape(map, MapType::PerCpuArray, 4, 24, 1)?;
+        let (map, cell) = self.view.bank_cell(slot.index).ok_or(ReadStage::Stats)?;
+        let cells = if self.view.snapshot().logical_slots() == 8192 {
+            512
+        } else {
+            1
+        };
+        shape(map, MapType::PerCpuArray, 4, 24, cells)?;
         let stats: PerCpuArray<_, CountStats> =
             PerCpuArray::try_from(map).map_err(|_| ReadStage::Stats)?;
-        // Global physical slot chooses its retained bank. Only the actual
-        // one-cell inner index is zero; RV keys retain the global slot/full64.
-        let values = stats.get(&0, 0).map_err(|_| ReadStage::Stats)?;
+        // The original logical slot selects its retained bank and cell;
+        // RV and START identities retain that original slot and full64 RV.
+        let values = stats.get(&cell, 0).map_err(|_| ReadStage::Stats)?;
         self.native.cpu_count(values.len(), ReadStage::Stats)?;
         Ok(CounterRow::fold(
             slot,
@@ -350,6 +429,16 @@ fn shape(
 
 impl<'a> NativeSource<'a> {
     fn new(lookup: impl Fn(&str) -> Option<&'a Map>, mode: CounterMode) -> Result<Self, ReadStage> {
+        Self::with_bounds(lookup, mode, NATIVE_RVS, NATIVE_STARTS, None)
+    }
+
+    fn with_bounds(
+        lookup: impl Fn(&str) -> Option<&'a Map>,
+        mode: CounterMode,
+        rv_keys: usize,
+        start_rows: u32,
+        expected_cpus: Option<usize>,
+    ) -> Result<Self, ReadStage> {
         let required = |name| lookup(name).ok_or(ReadStage::Shape);
         let stats = required("STATS")?;
         let rvs = required("RV_COUNTS")?;
@@ -371,14 +460,14 @@ impl<'a> NativeSource<'a> {
             MapType::PerCpuHash,
             size_of::<RvKey>(),
             8,
-            NATIVE_RVS as u32,
+            u32::try_from(rv_keys).map_err(|_| ReadStage::Shape)?,
         )?;
         shape(
             starts,
             MapType::Hash,
             size_of::<StartKey>(),
             size_of::<CallStart>(),
-            NATIVE_STARTS,
+            start_rows,
         )?;
         shape(health, MapType::PerCpuArray, 4, 8, 2)?;
         shape(evidence, MapType::PerCpuArray, 4, 8, EVIDENCE_CELLS)?;
@@ -398,7 +487,7 @@ impl<'a> NativeSource<'a> {
             1,
         )?;
         let cpus = aya::util::nr_cpus().map_err(|_| ReadStage::Shape)?;
-        if cpus == 0 {
+        if cpus == 0 || expected_cpus.is_some_and(|expected| expected != cpus) {
             return Err(ReadStage::Shape);
         }
         Ok(Self {
@@ -2060,8 +2149,9 @@ mod tests {
         hot.index = 1;
         hot.file_offset = hot_offset;
         hot.names = vec!["counter_bank_hot".into()];
-        let policy =
-            crate::plan::AdmissionPolicy::counters(crate::capacity::CounterBudget::new(2).unwrap());
+        let policy = crate::plan::AdmissionPolicy::counters(
+            crate::capacity::CounterBudget::new(8192).unwrap(),
+        );
         let mut history = AttachPlan::from_slots_with_policy(vec![old.clone()], policy).unwrap();
         let grown = AttachPlan::from_slots_with_policy(vec![old, hot], policy).unwrap();
 
@@ -2089,7 +2179,8 @@ mod tests {
             file_descriptors: cpus.checked_mul(8).unwrap() + 16,
         };
         let bytes = std::fs::read(
-            Path::new(env!("OUT_DIR")).join("counter-bank-proof/p11scope-ebpf-counts-bank-proof"),
+            Path::new(env!("OUT_DIR"))
+                .join("counter-bank-growth-v2/p11scope-ebpf-counts-bank-growth-v2"),
         )
         .unwrap();
         let mut session = Session::prepare_counter_banks(
@@ -2118,8 +2209,8 @@ mod tests {
             binding.generation(),
             session.counter_collection_generation()
         );
-        assert_eq!(binding.logical_slots(), 512);
-        assert_eq!(binding.rv_keys(), 4096);
+        assert_eq!(binding.logical_slots(), 8192);
+        assert_eq!(binding.rv_keys(), 65536);
         assert_eq!(binding.start_rows(), 16384);
         assert_eq!(binding.possible_cpus(), cpus);
         assert!(read_bound(binding, &history, &pins, limits, &pool.reserver()).is_ok());

@@ -2157,6 +2157,36 @@ class StoppedCanaryCaptureTests(unittest.TestCase):
                     capture.ready_bound_seconds(release)
                 self.assertIn('unparseable', str(raised.exception))
 
+    def test_ready_bound_declared_label_stays_single_line(self):
+        self.assertEqual(capture.declared_kernel_label('6.6.157-ready-bound-test'),
+                         '6.6.157-ready-bound-test')
+        label = capture.declared_kernel_label('6.6.157\nINJECTED\r\x00\x1b')
+        self.assertNotIn('\n', label)
+        self.assertNotIn('\r', label)
+        self.assertTrue(all(32 <= ord(char) < 127 for char in label), label)
+        self.assertTrue(label.startswith('6.6.157'), label)
+        self.assertLessEqual(len(capture.declared_kernel_label('6.6.' + '1' * 100)), 64)
+
+    def test_ready_bound_run_declares_sanitized_label(self):
+        # Hostile uname string on the success path: the run still declares
+        # the correct bound (the suffix never selects it), but the printed
+        # line stays one parseable line. validate_config is stubbed to stop
+        # the run right after the declaration, before any launch or file.
+        with tempfile.TemporaryDirectory() as directory:
+            config = config_for(os.getpid(), directory)
+            output = io.StringIO()
+            with kernel_release('6.6.157\nINJECTED'), \
+                    contextlib.redirect_stdout(output), \
+                    patch.object(capture, 'validate_config',
+                                 side_effect=capture.CaptureError('stop-after-declaration')):
+                with self.assertRaises(capture.CaptureError):
+                    capture.capture(config, FakeMaps(config))
+        hits = [line for line in output.getvalue().splitlines()
+                if 'CANARY_READY_BOUND_DECLARED' in line]
+        self.assertEqual(len(hits), 1, output.getvalue())
+        self.assertIn('seconds=8', hits[0], output.getvalue())
+        self.assertEqual(len(hits[0].split()), 3, output.getvalue())
+
     def test_ready_bound_unknown_kernel_run_refuses_before_launch(self):
         for release in ('5.4.0-ready-bound-test', '6.5.0-ready-bound-test'):
             with self.subTest(release=release), tempfile.TemporaryDirectory() as directory:

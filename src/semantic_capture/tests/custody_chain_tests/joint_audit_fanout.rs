@@ -1268,6 +1268,42 @@ impl MachineScene {
         )
     }
 
+    /// Poll Finish with a scripted discovery IO (progress tests): the
+    /// first `progressed_for` discovery credits report Engine progress
+    /// with zero records, later ones report none. Returns the poll
+    /// outcome and the discovery service call count.
+    fn poll_finish_discovery_scripted(
+        &mut self,
+        work: usize,
+        progressed_for: usize,
+    ) -> (
+        Result<crate::discovery::engine::inventory_coordinator::JointCommitProgress, SemanticRefusal>,
+        usize,
+    ) {
+        let mut budget = crate::inventory_semantics::JointWorkBudget {
+            remaining_actions: work,
+            deadline: Instant::now() + Duration::from_secs(10),
+        };
+        let mut script = DiscoveryScriptIo {
+            producers: &self.scene.producers,
+            discovery: self
+                .finish
+                .as_ref()
+                .expect("finish fixture enabled")
+                .observer
+                .discovery_domain(),
+            calls: Cell::new(0),
+            progressed_for,
+        };
+        let result = self.machine.poll_finish_with_io(
+            &mut self.scene.real.lane,
+            &mut self.scene.real.scene.coordinator,
+            &mut script,
+            &mut budget,
+        );
+        (result, script.calls.get())
+    }
+
     fn reach_finish_stop_ready(&mut self) {
         for _ in 0..512 {
             if self.machine.finish_stop_ready_for_test() {
@@ -16725,5 +16761,764 @@ fn key_operation_s1only_own_claim_disposes_disjoint_raw() {
             .feeds()
             .iter()
             .all(|feed| feed.staged == 0 && !feed.degraded && !feed.fallback)
+    );
+}
+
+/// Scripted discovery service for the progress tests: no Engine and no
+/// transport. Every credit reports a pending backlog with zero records
+/// and counts the call; the first `progressed_for` credits report Engine
+/// progress, later ones report none.
+struct DiscoveryScriptIo<'a> {
+    producers: &'a SessionDrainProducers,
+    discovery: &'a crate::events::DiscoveryDomain,
+    calls: Cell<usize>,
+    progressed_for: usize,
+}
+
+impl crate::inventory_semantics::JointMachineIo for DiscoveryScriptIo<'_> {
+    fn producers(&self) -> &SessionDrainProducers {
+        self.producers
+    }
+
+    fn finish_discovery_domain(&self) -> Result<&crate::events::DiscoveryDomain, SemanticRefusal> {
+        Ok(self.discovery)
+    }
+
+    fn service_finish_discovery(
+        &mut self,
+        _lane: &mut AttestedSemanticLane,
+        _coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        _q: &crate::attach::CollectedFinishQ,
+        _work: usize,
+    ) -> Result<crate::inventory_semantics::LaneDrainOutcome, SemanticRefusal> {
+        self.calls.set(self.calls.get() + 1);
+        Ok(crate::inventory_semantics::LaneDrainOutcome {
+            records: 0,
+            post_q: false,
+            backlog: true,
+            failed: false,
+        })
+    }
+
+    fn finish_discovery_progressed(
+        &self,
+        _coordinator: &InventoryCoordinator<OsProcessSource>,
+    ) -> bool {
+        self.calls.get() <= self.progressed_for
+    }
+
+    fn collect_raw(
+        &mut self,
+        _lane: &mut AttestedSemanticLane,
+        _adapter: &mut JournalAdapter,
+        _reserve: &crate::semantics_edge::resources::SemanticResourceReserver,
+        _capacity: usize,
+        _work: usize,
+    ) -> Result<
+        (
+            RawJointQuantum,
+            Option<crate::events::DispatchPoll>,
+        ),
+        RawQuantumRefusal,
+    > {
+        unreachable!("discovery-script IO never collects");
+    }
+
+    fn continue_raw(
+        &mut self,
+        _lane: &mut AttestedSemanticLane,
+        _raw: &mut RawJointQuantum,
+        _adapter: &mut JournalAdapter,
+        _work: usize,
+    ) -> Result<crate::events::DispatchPoll, RawQuantumRefusal> {
+        unreachable!("discovery-script IO never continues a Raw");
+    }
+
+    fn tick_collected(
+        &mut self,
+        _lane: &mut AttestedSemanticLane,
+        _bindings: &[SemanticCallerBinding],
+        _raw: &mut RawJointQuantum,
+    ) -> Result<SemanticBatch, SemanticRefusal> {
+        unreachable!("discovery-script IO never ticks");
+    }
+
+    fn prepare_publication(
+        &mut self,
+        _lane: &mut AttestedSemanticLane,
+        _coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        _raw: &mut RawJointQuantum,
+        _engine_changed: bool,
+    ) -> anyhow::Result<()> {
+        unreachable!("discovery-script IO never prepares a publication");
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn consume_birth(
+        &mut self,
+        _lane: &mut AttestedSemanticLane,
+        _candidate: H0BirthCandidate,
+        _absence: Option<CommittedAbsenceBirth>,
+        _input: &crate::discovery::caller_registry::instance_input::AdmittedInstanceCall,
+        _binding: &SemanticCallerBinding,
+        _proof: &JournalDomainProof,
+        _adapter: &JournalAdapter,
+    ) -> Result<RetainedBirthWitness, BirthObservationRefusal> {
+        unreachable!("discovery-script IO never consumes births");
+    }
+
+    fn acquire_absence(
+        &mut self,
+        _lane: &mut AttestedSemanticLane,
+        _binding: &SemanticCallerBinding,
+        _slot: u32,
+        _adapter: &mut JournalAdapter,
+    ) -> Result<CommittedAbsenceBirth, BirthObservationRefusal> {
+        unreachable!("discovery-script IO never acquires absences");
+    }
+
+    fn absence_query_storage_bytes(
+        &self,
+        _lane: &AttestedSemanticLane,
+        _object: PinnedObjectId,
+        _target_copy: usize,
+    ) -> Option<usize> {
+        unreachable!("discovery-script IO never sizes absence queries");
+    }
+
+    fn with_native<R>(
+        &mut self,
+        _lane: &mut AttestedSemanticLane,
+        _witnesses: &crate::inventory_semantics::RetainedJointBirths,
+        _inspect: impl for<'io> FnOnce(
+            crate::inventory_semantics::JointCommitIo<'io>,
+        ) -> R,
+    ) -> Result<R, SemanticRefusal> {
+        unreachable!("discovery-script IO never touches native handles");
+    }
+}
+
+/// Poll Finish one discovery credit from a deeper stack frame with a
+/// large local, so a stack-resident Q address cannot match a direct
+/// poll's address.
+fn poll_finish_from_deeper_frame(
+    scene: &mut MachineScene,
+) -> Result<crate::discovery::engine::inventory_coordinator::JointCommitProgress, SemanticRefusal>
+{
+    let pad = std::hint::black_box([0u8; 4096]);
+    let result = scene.poll_finish(1);
+    std::hint::black_box(pad);
+    result
+}
+
+/// The Q the discovery IO sees keeps one heap address across call
+/// depths and machine moves: it is boxed once at observation.
+#[test]
+fn joint_machine_finish_q_address_is_stable_across_moves() {
+    use crate::inventory_semantics::LiveJointMachine;
+    let child = OwnedStoppedChild::new();
+    let exited_pid = child.id();
+    drop(child);
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture.enable_finish_fixture(vec![
+        finish_discovery_bytes(exited_pid, 100),
+        finish_discovery_bytes(exited_pid, 101),
+        finish_discovery_bytes(exited_pid, 102),
+    ]);
+    fixture.begin_finish().unwrap();
+    // The first poll observes Q and returns before discovery.
+    fixture.poll_finish(1).unwrap();
+    assert!(fixture.machine.retained_finish_q_for_test().is_some());
+    fixture.poll_finish(1).unwrap();
+    let direct = LiveJointMachine::finish_q_addr_for_test();
+    assert_ne!(direct, 0, "discovery service must observe the Q address");
+    poll_finish_from_deeper_frame(&mut fixture).unwrap();
+    let deep = LiveJointMachine::finish_q_addr_for_test();
+    let mut other = MachineScene::new(1);
+    std::mem::swap(&mut fixture.machine, &mut other.machine);
+    std::mem::swap(&mut fixture.machine, &mut other.machine);
+    fixture.poll_finish(1).unwrap();
+    let moved = LiveJointMachine::finish_q_addr_for_test();
+    assert_eq!(
+        direct, deep,
+        "the Q address must not depend on caller stack depth"
+    );
+    assert_eq!(direct, moved, "the Q address must survive machine moves");
+}
+
+/// A Q that no longer matches its discovery owner latches the Finish
+/// disposition at once; the latched first reason is kept.
+#[test]
+fn joint_machine_finish_q_mismatch_latches_disposition() {
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture.enable_finish_fixture(Vec::new());
+    fixture.begin_finish().unwrap();
+    fixture.poll_finish(1).unwrap();
+    assert!(fixture.machine.retained_finish_q_for_test().is_some());
+    assert!(!fixture.machine.finish_disposition_required());
+    // Present another owning DISCOVERY allocation at the native I/O
+    // boundary; the retained Q cannot match it.
+    let original_finish = fixture.finish.take().unwrap();
+    fixture.enable_finish_fixture(Vec::new());
+    assert_eq!(
+        fixture.poll_finish(1),
+        Err(SemanticRefusal::Unavailable)
+    );
+    assert!(
+        fixture.machine.finish_disposition_required(),
+        "a Q mismatch must latch the Finish disposition"
+    );
+    fixture.finish = Some(original_finish);
+    assert_eq!(
+        fixture.poll_finish(1),
+        Err(SemanticRefusal::Unavailable),
+        "the first latched reason is kept after the owner is restored"
+    );
+    assert!(fixture.machine.finish_disposition_required());
+}
+
+/// Retryable `ProviderStorage` refusals count over the whole Finish
+/// without reset; the 100th latches the disposition.
+#[test]
+fn joint_machine_finish_storage_retry_is_bounded() {
+    use crate::inventory_semantics::JOINT_FINISH_STORAGE_RETRIES;
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture.enable_finish_fixture(Vec::new());
+    fixture.begin_finish().unwrap();
+    fixture.reach_finish_stop_ready();
+    let bytes = fixture.finish_storage_bytes();
+    assert!(bytes > 0);
+    let resource = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .semantic_resource_snapshot();
+    let _hold = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .reserve_semantic_storage(resource.limit_bytes - resource.charged_bytes - (bytes - 1))
+        .unwrap();
+    for n in 1..JOINT_FINISH_STORAGE_RETRIES {
+        assert_eq!(
+            fixture.poll_finish(1),
+            Err(SemanticRefusal::ProviderStorage),
+            "refusal {n}"
+        );
+        assert!(
+            !fixture.machine.finish_disposition_required(),
+            "refusal {n} must not latch yet"
+        );
+    }
+    assert_eq!(
+        fixture.poll_finish(1),
+        Err(SemanticRefusal::ProviderStorage)
+    );
+    assert!(
+        fixture.machine.finish_disposition_required(),
+        "the 100th storage refusal latches the disposition"
+    );
+    assert_eq!(
+        fixture.poll_finish(1),
+        Err(SemanticRefusal::ProviderStorage),
+        "the first latched reason is kept"
+    );
+}
+
+/// One Finish poll spends discovery credits up to its budget: 8 queued
+/// single-credit records drain in one budgeted poll, one per credit.
+#[test]
+fn joint_machine_finish_discovery_spends_budget_in_one_poll() {
+    let child = OwnedStoppedChild::new();
+    let exited_pid = child.id();
+    drop(child);
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture.enable_finish_fixture(
+        (100u64..108)
+            .map(|at| finish_discovery_bytes(exited_pid, at))
+            .collect(),
+    );
+    fixture.begin_finish().unwrap();
+    fixture.poll_finish(1).unwrap();
+    fixture.poll_finish(1024).unwrap();
+    assert_eq!(
+        fixture
+            .finish
+            .as_ref()
+            .unwrap()
+            .observer
+            .discovery_remaining(),
+        0,
+        "one budgeted poll consumes all 8 queued records"
+    );
+    assert_eq!(fixture.finish.as_ref().unwrap().staged.len(), 0);
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_collected_finish_discovery_backlog(0),
+        (0, false)
+    );
+    // Twin: a one-action budget consumes exactly one record.
+    let child = OwnedStoppedChild::new();
+    let exited_pid = child.id();
+    drop(child);
+    let mut twin = MachineScene::new(1);
+    twin.prime(1);
+    twin.enable_finish_fixture(
+        (100u64..108)
+            .map(|at| finish_discovery_bytes(exited_pid, at))
+            .collect(),
+    );
+    twin.begin_finish().unwrap();
+    twin.poll_finish(1).unwrap();
+    twin.poll_finish(1).unwrap();
+    assert_eq!(
+        twin.finish.as_ref().unwrap().observer.discovery_remaining(),
+        7,
+        "a one-action budget consumes exactly one record"
+    );
+}
+
+/// An owner-validation refusal inside Finish latches the disposition.
+#[test]
+fn joint_machine_finish_latches_validate_owner_error() {
+    use crate::inventory_semantics::FinishSite;
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture.enable_finish_fixture(Vec::new());
+    fixture.begin_finish().unwrap();
+    fixture
+        .machine
+        .inject_finish_site_for_test(FinishSite::ValidateOwner);
+    assert_eq!(
+        fixture.poll_finish(1),
+        Err(SemanticRefusal::Unavailable)
+    );
+    assert!(fixture.machine.finish_disposition_required());
+    assert_eq!(
+        fixture.poll_finish(1),
+        Err(SemanticRefusal::Unavailable),
+        "the first latched reason is kept"
+    );
+}
+
+/// A discovery-domain refusal inside Finish latches the disposition.
+#[test]
+fn joint_machine_finish_latches_discovery_domain_error() {
+    use crate::inventory_semantics::FinishSite;
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture.enable_finish_fixture(Vec::new());
+    fixture.begin_finish().unwrap();
+    fixture.poll_finish(1).unwrap();
+    fixture
+        .machine
+        .inject_finish_site_for_test(FinishSite::DiscoveryDomain);
+    assert_eq!(
+        fixture.poll_finish(1),
+        Err(SemanticRefusal::Unavailable)
+    );
+    assert!(fixture.machine.finish_disposition_required());
+    assert_eq!(
+        fixture.poll_finish(1),
+        Err(SemanticRefusal::Unavailable),
+        "the first latched reason is kept"
+    );
+}
+
+/// A completion refusal at publication latches the disposition and
+/// publishes nothing.
+#[test]
+fn joint_machine_finish_latches_complete_finish_error() {
+    use crate::discovery::engine::inventory_coordinator::JointCommitProgress;
+    use crate::inventory_semantics::FinishSite;
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture.enable_finish_fixture(Vec::new());
+    fixture.begin_finish().unwrap();
+    fixture
+        .machine
+        .inject_finish_site_for_test(FinishSite::CompleteFinish);
+    let mut refused = false;
+    for _ in 0..512 {
+        match fixture.poll_finish(1) {
+            Err(reason) => {
+                assert_eq!(reason, SemanticRefusal::Unavailable);
+                refused = true;
+                break;
+            }
+            Ok(JointCommitProgress::Published(_)) => {
+                panic!("an injected completion refusal must not publish")
+            }
+            Ok(JointCommitProgress::Pending) => {}
+        }
+    }
+    assert!(
+        refused,
+        "the publish branch must surface the injected refusal"
+    );
+    assert!(fixture.machine.finish_disposition_required());
+    assert!(
+        !fixture.scene.real.lane.is_finished(),
+        "a refused completion publishes nothing"
+    );
+    assert_eq!(
+        fixture.poll_finish(1),
+        Err(SemanticRefusal::Unavailable),
+        "the first latched reason is kept"
+    );
+}
+
+/// A missing publication receipt after completion latches: the lane is
+/// finished, but the Finish disposition is still required.
+#[test]
+fn joint_machine_finish_latches_missing_receipt_error() {
+    use crate::discovery::engine::inventory_coordinator::JointCommitProgress;
+    use crate::inventory_semantics::FinishSite;
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture.enable_finish_fixture(Vec::new());
+    fixture.begin_finish().unwrap();
+    fixture
+        .machine
+        .inject_finish_site_for_test(FinishSite::MissingReceipt);
+    let mut refused = false;
+    for _ in 0..512 {
+        match fixture.poll_finish(1) {
+            Err(reason) => {
+                assert_eq!(reason, SemanticRefusal::Unavailable);
+                refused = true;
+                break;
+            }
+            Ok(JointCommitProgress::Published(_)) => {
+                panic!("a missing receipt must not publish")
+            }
+            Ok(JointCommitProgress::Pending) => {}
+        }
+    }
+    assert!(
+        refused,
+        "the publish branch must surface the missing receipt"
+    );
+    assert!(
+        fixture.scene.real.lane.is_finished(),
+        "completion ran before the missing receipt"
+    );
+    assert!(
+        fixture.machine.finish_disposition_required(),
+        "the missing receipt latches the disposition"
+    );
+    assert_eq!(
+        fixture.poll_finish(1),
+        Err(SemanticRefusal::Unavailable),
+        "the first latched reason is kept"
+    );
+}
+
+/// A pending-report validation refusal latches the disposition.
+#[test]
+fn joint_machine_finish_latches_pending_report_error() {
+    use crate::inventory_semantics::FinishSite;
+    let (mut fixture, observer, _foreign) = pending_h0_finish_fixture(false);
+    let q = observe_pending_finish_q(&fixture, &observer);
+    // Resolve once: AwaitH0 becomes a retained PendingQ report.
+    fixture
+        .resolve_pending_q(&q, observer.discovery_domain(), 1)
+        .unwrap();
+    assert!(
+        fixture
+            .machine
+            .retained_pending_q_report_for_test()
+            .is_some()
+    );
+    fixture
+        .machine
+        .inject_finish_site_for_test(FinishSite::PendingReport);
+    assert_eq!(
+        fixture.resolve_pending_q(&q, observer.discovery_domain(), 1),
+        Err(SemanticRefusal::Unavailable)
+    );
+    assert!(
+        fixture.machine.finish_disposition_required(),
+        "the pending-report refusal latches the disposition"
+    );
+    assert_eq!(
+        fixture.poll_finish(1),
+        Err(SemanticRefusal::Unavailable),
+        "the next poll keeps the first latched reason"
+    );
+}
+
+/// A pending-phase refusal latches the disposition.
+#[test]
+fn joint_machine_finish_latches_pending_phase_error() {
+    use crate::inventory_semantics::FinishSite;
+    let (mut fixture, observer, _foreign) = pending_h0_finish_fixture(false);
+    let q = observe_pending_finish_q(&fixture, &observer);
+    // Resolve once: AwaitH0 becomes a retained PendingQ report.
+    fixture
+        .resolve_pending_q(&q, observer.discovery_domain(), 1)
+        .unwrap();
+    assert!(
+        fixture
+            .machine
+            .retained_pending_q_report_for_test()
+            .is_some()
+    );
+    fixture
+        .machine
+        .inject_finish_site_for_test(FinishSite::PendingPhase);
+    assert_eq!(
+        fixture.resolve_pending_q(&q, observer.discovery_domain(), 1),
+        Err(SemanticRefusal::Unavailable)
+    );
+    assert!(
+        fixture.machine.finish_disposition_required(),
+        "the pending-phase refusal latches the disposition"
+    );
+    assert_eq!(
+        fixture.poll_finish(1),
+        Err(SemanticRefusal::Unavailable),
+        "the next poll keeps the first latched reason"
+    );
+}
+
+/// A refused Q-box reservation latches at once; no Finish starts.
+#[test]
+fn joint_machine_finish_q_box_refusal_latches() {
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture.enable_finish_fixture(Vec::new());
+    // One byte short of the Q box: the reservation must refuse.
+    let need = size_of::<crate::attach::CollectedFinishQ>()
+        + crate::semantics_edge::resources::OWNED_ALLOCATION_PADDING;
+    let resource = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .semantic_resource_snapshot();
+    let _hold = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .reserve_semantic_storage(resource.limit_bytes - resource.charged_bytes - (need - 1))
+        .unwrap();
+    assert_eq!(
+        fixture.begin_finish(),
+        Err(SemanticRefusal::ProviderStorage)
+    );
+    assert!(
+        fixture.machine.finish_disposition_required(),
+        "the Q-box refusal latches at once"
+    );
+    assert!(
+        !fixture.machine.finish_begun(),
+        "no Finish starts without its Q box"
+    );
+}
+
+/// A duplicate begin refuses without latching; the Finish continues.
+#[test]
+fn joint_machine_finish_duplicate_begin_does_not_latch() {
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture.enable_finish_fixture(Vec::new());
+    fixture.begin_finish().unwrap();
+    assert_eq!(
+        fixture.begin_finish(),
+        Err(SemanticRefusal::Unavailable)
+    );
+    assert!(
+        !fixture.machine.finish_disposition_required(),
+        "a duplicate begin latches nothing"
+    );
+    fixture.finish_published();
+}
+
+/// A pre-machine refusal latches the lane flag; a finished lane's
+/// refusal leaves it clear.
+#[test]
+fn joint_lane_finish_wrapper_error_latches_lane_flag() {
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture.enable_finish_fixture(Vec::new());
+    fixture
+        .scene
+        .real
+        .lane
+        .set_inject_pre_machine_for_test(true);
+    let mut budget = crate::inventory_semantics::JointWorkBudget {
+        remaining_actions: 1,
+        deadline: Instant::now() + Duration::from_secs(10),
+    };
+    assert!(
+        fixture
+            .scene
+            .real
+            .lane
+            .poll_joint_finish(
+                &mut fixture.scene.real.scene.coordinator,
+                &mut budget
+            )
+            .is_err()
+    );
+    assert!(
+        fixture
+            .scene
+            .real
+            .lane
+            .joint_finish_disposition_required(),
+        "a pre-machine refusal latches the lane flag"
+    );
+    // Twin: a finished lane's refusal leaves the flag clear.
+    let mut finished = MachineScene::new(1);
+    finished.prime(1);
+    finished.enable_finish_fixture(Vec::new());
+    finished.begin_finish().unwrap();
+    finished.finish_published();
+    assert!(finished.scene.real.lane.is_finished());
+    let mut budget = crate::inventory_semantics::JointWorkBudget {
+        remaining_actions: 1,
+        deadline: Instant::now() + Duration::from_secs(10),
+    };
+    assert!(
+        finished
+            .scene
+            .real
+            .lane
+            .poll_joint_finish(
+                &mut finished.scene.real.scene.coordinator,
+                &mut budget
+            )
+            .is_err()
+    );
+    assert!(
+        !finished
+            .scene
+            .real
+            .lane
+            .joint_finish_disposition_required(),
+        "a finished lane's refusal latches nothing"
+    );
+}
+
+/// Progress without records is not capped: 500 progressed credits with
+/// zero records are all spent, while idle credits yield after 64.
+#[test]
+fn joint_machine_finish_progress_without_records_is_not_capped() {
+    use crate::discovery::engine::inventory_coordinator::JointCommitProgress;
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture.enable_finish_fixture(Vec::new());
+    fixture.begin_finish().unwrap();
+    fixture.poll_finish(1).unwrap();
+    assert!(
+        !fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .collected_finish_progressed(),
+        "no discovery service ran yet"
+    );
+    let (result, calls) = fixture.poll_finish_discovery_scripted(1024, 500);
+    assert!(matches!(result, Ok(JointCommitProgress::Pending)));
+    assert!(
+        calls >= 500,
+        "progressed credits are not capped, got {calls}"
+    );
+    // Twin: without progress the poll yields after exactly 64 credits.
+    let mut idle = MachineScene::new(1);
+    idle.prime(1);
+    idle.enable_finish_fixture(Vec::new());
+    idle.begin_finish().unwrap();
+    idle.poll_finish(1).unwrap();
+    let (result, calls) = idle.poll_finish_discovery_scripted(1024, 0);
+    assert!(matches!(result, Ok(JointCommitProgress::Pending)));
+    assert_eq!(calls, 64, "idle credits yield after exactly 64");
+}
+
+/// With a grant-less Q, the machine's own Raw-minted grant is
+/// admissible and a foreign scene's grant is refused.
+#[test]
+fn joint_machine_finish_grant_predicate_refuses_foreign_producers() {
+    use crate::inventory_semantics::finish_grant_admissible;
+    use crate::semantics_objects::journal::SessionDrainGrant;
+    let mut scene_a = MachineScene::new(1);
+    scene_a
+        .scene
+        .push(std::process::id(), 0, "C_CreateObject", 1);
+    scene_a.reach_phase("BindingKeys");
+    let grant_a = SessionDrainGrant::observe(
+        &scene_a.scene.producers,
+        scene_a
+            .scene
+            .real
+            .scene
+            .coordinator
+            .prepared_semantic_batch()
+            .unwrap()
+            .admissions()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    let mut scene_b = MachineScene::new(1);
+    scene_b
+        .scene
+        .push(std::process::id(), 0, "C_CreateObject", 1);
+    scene_b.reach_phase("BindingKeys");
+    let grant_b = SessionDrainGrant::observe(
+        &scene_b.scene.producers,
+        scene_b
+            .scene
+            .real
+            .scene
+            .coordinator
+            .prepared_semantic_batch()
+            .unwrap()
+            .admissions()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_ne!(
+        grant_a, grant_b,
+        "the two scenes mint distinct drain grants"
+    );
+    // A's grant-less Q: observed before any admission.
+    let observer_a =
+        crate::attach::CollectedFinishQObserverForTest::with_discovery_bytes(
+            &scene_a.scene.producers,
+            Vec::new(),
+        );
+    observer_a.request_stop();
+    let q_a = observer_a
+        .observe(&scene_a.scene.producers, None, &scene_a.scene.drain)
+        .unwrap()
+        .unwrap();
+    assert!(q_a.observed_without_grant());
+    assert!(
+        finish_grant_admissible(&q_a, &grant_a, &scene_a.scene.producers),
+        "the own Raw-minted grant stays admissible without a retained grant"
+    );
+    assert!(
+        !finish_grant_admissible(&q_a, &grant_b, &scene_a.scene.producers),
+        "a foreign scene's grant is refused"
     );
 }

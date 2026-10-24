@@ -16,9 +16,11 @@ use crate::discovery::identity::PinnedObjectId;
 use crate::discovery::instances::{InstanceId, MAX_INSTANCES, MAX_PENDING};
 use crate::events::{DiscoveryDomain, DispatchPoll};
 use crate::inventory_semantics::{
-    AttestedSemanticLane, LaneDrainOutcome, LaneNegative, MAX_LANE_NEGATIVES, SemanticBatch,
-    SemanticRefusal,
+    AttestedSemanticLane, JOINT_FINISH_STORAGE_RETRIES, LaneDrainOutcome, LaneNegative,
+    MAX_LANE_NEGATIVES, SemanticBatch, SemanticRefusal,
 };
+#[cfg(test)]
+use crate::inventory_semantics::FinishSite;
 use crate::semantic_capture::{
     CommittedAbsenceBirth, CurrentPartitionReceipt, H0BirthCandidate, RetainedBirthWitness,
     TickOutcome, TickReport,
@@ -132,6 +134,17 @@ pub(crate) trait JointMachineIo {
         _work: usize,
     ) -> Result<LaneDrainOutcome, SemanticRefusal> {
         Err(SemanticRefusal::Unavailable)
+    }
+    /// Whether the last discovery service call progressed the Engine
+    /// without moving records. The discovery loop yields only after 64
+    /// consecutive credits without progress, so graph work is not capped
+    /// by the record count.
+    #[allow(dead_code)] // Observed once the discovery loop spends graph credits.
+    fn finish_discovery_progressed(
+        &self,
+        coordinator: &InventoryCoordinator<OsProcessSource>,
+    ) -> bool {
+        coordinator.collected_finish_progressed()
     }
     #[allow(dead_code)] // No Stop output allowance is invented by this scaffold.
     fn finish_h0_storage_bytes(
@@ -616,12 +629,25 @@ pub(crate) struct LiveJointMachine {
     finish_disposed: Option<DisposedJointQuantum>,
     finish_completed: Option<CompletedJointFinish>,
     finish_receipt: Option<BatchReceipt>,
+    /// Retryable `ProviderStorage` refusals seen inside this Finish. Never
+    /// reset: retryable refusals occur only in the Finish tail, so the cap
+    /// bounds the tail. The 100th latches the disposition.
+    finish_storage_retries: u16,
     #[cfg(test)]
     refuse_finish_q_merge_once: bool,
     #[cfg(test)]
     refuse_pending_q_merge_once: bool,
+    // Skeleton: armed by the latch tests; read by the latch implementation.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    inject: Option<FinishSite>,
     // All original phase buffers and birth leases drop before inline storage.
     _storage: ResourceLease,
+}
+
+#[cfg(test)]
+thread_local! {
+    static FINISH_Q_ADDR: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 struct ActualFault<'a>(&'a dyn FaultEpoch);
@@ -669,10 +695,13 @@ impl LiveJointMachine {
             finish_disposed: None,
             finish_completed: None,
             finish_receipt: None,
+            finish_storage_retries: 0,
             #[cfg(test)]
             refuse_finish_q_merge_once: false,
             #[cfg(test)]
             refuse_pending_q_merge_once: false,
+            #[cfg(test)]
+            inject: None,
             _storage: storage,
         })
     }
@@ -691,10 +720,51 @@ impl LiveJointMachine {
         Ok(())
     }
 
+    /// Keep the first Finish refusal. A state already latched at its site
+    /// keeps its reason; a retryable `ProviderStorage` refusal counts
+    /// toward the per-Finish bound instead of latching at once.
+    fn latch_finish(&mut self, reason: SemanticRefusal) {
+        if matches!(self.state, RunState::DispositionRequired(_)) {
+            return;
+        }
+        if reason == SemanticRefusal::ProviderStorage {
+            self.finish_storage_retries = self.finish_storage_retries.saturating_add(1);
+            if self.finish_storage_retries < JOINT_FINISH_STORAGE_RETRIES {
+                return;
+            }
+        }
+        self.state = RunState::DispositionRequired(reason);
+    }
+
+    /// Whether this Finish latched a disposition refusal.
+    pub(crate) fn finish_disposition_required(&self) -> bool {
+        matches!(self.state, RunState::DispositionRequired(_))
+    }
+
+    /// Whether a Finish began and still owns its control.
+    pub(crate) fn finish_begun(&self) -> bool {
+        self.finish.is_some()
+    }
+
     /// Latch the request before invoking the existing immediate admission
     /// gate. The same machine retains every later Q/report/frame owner.
     #[allow(dead_code)] // Ordinary Finish selection is intentionally inactive.
     pub(crate) fn begin_finish_with_io<I: JointMachineIo>(
+        &mut self,
+        lane: &mut AttestedSemanticLane,
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        io: &mut I,
+    ) -> Result<(), SemanticRefusal> {
+        // Skeleton: naive total latch; the implementation exempts finished
+        // lanes and duplicate begins.
+        let result = self.begin_finish_inner(lane, coordinator, io);
+        if let Err(reason) = &result {
+            self.latch_finish(*reason);
+        }
+        result
+    }
+
+    fn begin_finish_inner<I: JointMachineIo>(
         &mut self,
         lane: &mut AttestedSemanticLane,
         coordinator: &mut InventoryCoordinator<OsProcessSource>,
@@ -726,6 +796,17 @@ impl LiveJointMachine {
     /// Bounded service of the same original until actual Finish publication.
     #[allow(dead_code)] // Ordinary driver selection remains inactive.
     pub(crate) fn poll_finish_with_io<I: JointMachineIo>(
+        &mut self,
+        lane: &mut AttestedSemanticLane,
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        io: &mut I,
+        budget: &mut JointWorkBudget,
+    ) -> Result<JointCommitProgress, SemanticRefusal> {
+        // Skeleton: pass-through; the implementation latches through latch_finish.
+        self.poll_finish_inner(lane, coordinator, io, budget)
+    }
+
+    fn poll_finish_inner<I: JointMachineIo>(
         &mut self,
         lane: &mut AttestedSemanticLane,
         coordinator: &mut InventoryCoordinator<OsProcessSource>,
@@ -776,6 +857,8 @@ impl LiveJointMachine {
         }
         if matches!(finish.discovery, FinishDiscovery::Pending) {
             budget.spend(1);
+            #[cfg(test)]
+            FINISH_Q_ADDR.with(|addr| addr.set(q as *const _ as usize));
             let progress = match io.service_finish_discovery(lane, coordinator, q, 1) {
                 Ok(progress) => progress,
                 Err(reason) => {
@@ -1163,6 +1246,18 @@ impl LiveJointMachine {
     #[cfg(test)]
     pub(crate) fn retained_drain_grant_for_test(&self) -> Option<&SessionDrainGrant> {
         self.grant.as_ref()
+    }
+
+    /// Arm a one-shot fault at a real Finish `Err` site (latch tests).
+    #[cfg(test)]
+    pub(crate) fn inject_finish_site_for_test(&mut self, site: FinishSite) {
+        self.inject = Some(site);
+    }
+
+    /// Last Q address observed by Finish discovery service (Q-box test).
+    #[cfg(test)]
+    pub(crate) fn finish_q_addr_for_test() -> usize {
+        FINISH_Q_ADDR.with(|addr| addr.get())
     }
 
     #[cfg(test)]
@@ -2855,6 +2950,10 @@ impl AttestedSemanticLane {
             &mut SessionMachineIo,
         ) -> Result<R, SemanticRefusal>,
     ) -> Result<R, SemanticRefusal> {
+        #[cfg(test)]
+        if self.inject_pre_machine {
+            return Err(SemanticRefusal::Unavailable);
+        }
         if self.live.as_deref().is_some_and(|live| !live.gated) {
             self.initialize_joint(coordinator)?;
         }
@@ -2891,6 +2990,37 @@ impl AttestedSemanticLane {
             .expect("service cannot extract its native owner")
             .joint_machine = Some(machine);
         result
+    }
+
+    /// Whether this lane's Finish latched a disposition refusal, on the
+    /// lane flag or in the machine.
+    pub(crate) fn joint_finish_disposition_required(&self) -> bool {
+        self.joint_finish_failure.is_some()
+            || self.live.as_deref().is_some_and(|live| {
+                live.joint_machine
+                    .as_ref()
+                    .is_some_and(|machine| machine.finish_disposition_required())
+            })
+    }
+
+    /// Whether this lane's machine began a Finish that still owns control.
+    pub(crate) fn joint_finish_begun(&self) -> bool {
+        self.live.as_deref().is_some_and(|live| {
+            live.joint_machine
+                .as_ref()
+                .is_some_and(|machine| machine.finish_begun())
+        })
+    }
+
+    /// Latch a terminal Finish refusal noted by the driver. Keeps the first.
+    pub(crate) fn note_joint_finish_failure(&mut self, reason: SemanticRefusal) {
+        self.joint_finish_failure.get_or_insert(reason);
+    }
+
+    /// Arm the pre-machine Finish refusal seam (lane-flag test).
+    #[cfg(test)]
+    pub(crate) fn set_inject_pre_machine_for_test(&mut self, on: bool) {
+        self.inject_pre_machine = on;
     }
 
     /// Request admission STOP, retaining this lane's original machine/Session.

@@ -570,6 +570,38 @@ pub(crate) trait LaneTestIo {
     fn drain_discovery_to(&mut self, stop: usize, quantum: usize) -> LaneDrainOutcome;
 }
 
+/// Fault-injection sites for the Joint Finish latch tests. Each variant
+/// names a real `Err` site on the machine Finish path; the machine returns
+/// that site's error once when armed. Defined beside the lane because the
+/// joint module boundary is owned by another task.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FinishSite {
+    ValidateOwner,
+    DiscoveryDomain,
+    CompleteFinish,
+    MissingReceipt,
+    PendingReport,
+    PendingPhase,
+}
+
+/// Bound on retryable `ProviderStorage` refusals inside one Joint Finish.
+/// The counter is never reset; the 100th refusal latches the disposition.
+pub(crate) const JOINT_FINISH_STORAGE_RETRIES: u16 = 100;
+
+/// Grant half of the Finish Q guard (machine `drive_finish`): the Q's
+/// retained grant, or the machine's first genuine Raw-minted grant after a
+/// grant-less observation. STOP may precede the first Joint admission, so a
+/// grant-less Q plus an own-producers grant stays admissible.
+#[allow(dead_code)] // Skeleton: the narrow placeholder; the latch wires the full predicate.
+pub(crate) fn finish_grant_admissible(
+    q: &crate::attach::CollectedFinishQ,
+    grant: &crate::semantics_objects::journal::SessionDrainGrant,
+    _producers: &crate::attach::SessionDrainProducers,
+) -> bool {
+    q.matches_retained_grant(grant)
+}
+
 /// One optional Detailed lane: the Session owner, H0 `SemanticCapture`
 /// driver and proof-bearing batch supplier. Without a live Session (no
 /// manifests, or a refused startup) every H0-driving method refuses
@@ -583,6 +615,10 @@ pub(crate) struct AttestedSemanticLane {
     // Negative admission/legacy-Finish gate only. Completion requires the
     // constructor-private token from the matching actual publication below.
     collected_finish_requested: bool,
+    /// First Finish refusal latched for this lane: a pre-machine error from
+    /// the lane wrapper, or a driver-noted terminal refusal. The machine
+    /// holds its own latch; the lane query reports either.
+    joint_finish_failure: Option<SemanticRefusal>,
     /// When the lane's latest batch was staged for commit: the driver
     /// stamps it on stage and clears it on publish, bounding the wait
     /// for receipt-free evidence and backing off failed commits.
@@ -596,6 +632,11 @@ pub(crate) struct AttestedSemanticLane {
     /// live lane's gate: regular ticks refuse once stopping.
     #[cfg(test)]
     test_gated: bool,
+    /// Tests-only pre-machine Finish refusal seam: when set, the lane's
+    /// machine wrapper refuses before the machine runs, so the lane flag
+    /// path is exercised without a live Session.
+    #[cfg(test)]
+    inject_pre_machine: bool,
     #[cfg(test)]
     test_finished: bool,
     #[cfg(test)]
@@ -916,11 +957,14 @@ impl AttestedSemanticLane {
             live: None,
             startup_failed: false,
             collected_finish_requested: false,
+            joint_finish_failure: None,
             staged_at: None,
             #[cfg(test)]
             test_io: None,
             #[cfg(test)]
             test_gated: false,
+            #[cfg(test)]
+            inject_pre_machine: false,
             #[cfg(test)]
             test_finished: false,
             #[cfg(test)]
@@ -1012,11 +1056,14 @@ impl AttestedSemanticLane {
             })),
             startup_failed: false,
             collected_finish_requested: false,
+            joint_finish_failure: None,
             staged_at: None,
             #[cfg(test)]
             test_io: None,
             #[cfg(test)]
             test_gated: false,
+            #[cfg(test)]
+            inject_pre_machine: false,
             #[cfg(test)]
             test_finished: false,
             #[cfg(test)]

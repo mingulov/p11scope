@@ -239,6 +239,10 @@ struct PendingExecSuccessor<Pin> {
 /// catalog's Inventory lowering feeds every pass.
 pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     engine: Engine,
+    /// Whether the last collected-Finish service call progressed the
+    /// Engine. The Joint discovery loop reads it to distinguish graph
+    /// progress without records from an idle credit.
+    collected_finish_progressed: bool,
     /// Explicit semantic inputs are independent of broad physical admission.
     semantic_inputs: semantics::SemanticInputs,
     adapter: CallerAdapter<Source>,
@@ -450,6 +454,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         adapter.set_max_callers(registry_limits.max_callers);
         Ok(Self {
             engine: Engine::inventory(inventory_config(endpoint_budget)?, scope, hooks, hints)?,
+            collected_finish_progressed: false,
             semantic_inputs: semantics::SemanticInputs::new(Vec::new()),
             adapter,
             registry,
@@ -1050,6 +1055,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             return Err(SemanticRefusal::Unavailable);
         }
         if work == 0 {
+            self.collected_finish_progressed = false;
             return Ok(LaneDrainOutcome {
                 backlog: positions.consumer != q.discovery_stop()
                     || self.engine.collected_finish_backlog_pending(staged.len()),
@@ -1129,6 +1135,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 &mut collect,
             )
             .map_err(|_| SemanticRefusal::Unavailable)?;
+        self.collected_finish_progressed = progress.progressed;
         let after = crate::events::discovery_drain_positions(discovery);
         Ok(LaneDrainOutcome {
             records: count,
@@ -1163,6 +1170,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .discovery_positions()
             .map_err(|_| SemanticRefusal::Unavailable)?;
         if work == 0 {
+            self.collected_finish_progressed = false;
             return Ok(LaneDrainOutcome {
                 backlog: positions.consumer != q.discovery_stop()
                     || self
@@ -1220,6 +1228,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .engine
             .service_collected_finish_records_with(session, records, malformed, work, &mut collect)
             .map_err(|_| SemanticRefusal::Unavailable)?;
+        self.collected_finish_progressed = progress.progressed;
         session
             .collected_finish_discovery_domain(q)
             .map_err(|_| SemanticRefusal::Unavailable)?;
@@ -1239,6 +1248,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
 
     pub(crate) fn collected_finish_discovery_pending(&self, staged: usize) -> bool {
         self.engine.collected_finish_backlog_pending(staged)
+    }
+
+    /// Whether the last collected-Finish service call progressed the Engine.
+    pub(crate) fn collected_finish_progressed(&self) -> bool {
+        self.collected_finish_progressed
     }
 
     /// Existing retained Engine work and actual Session FIFO occupancy only.

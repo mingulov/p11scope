@@ -136,6 +136,7 @@ struct PublicationCompletion {
 struct PendingJointPublication {
     completion: PublicationCompletion,
     cut_barrier: Option<u64>,
+    finish: Option<crate::semantics_objects::journal::joint_driver::CollectedFinishAssociation>,
     // Moved cgroup allocations keep their original collection/work bounds.
     // Charge this additional retained inline wrapper before preparation.
     _storage: crate::semantics_edge::resources::ResourceLease,
@@ -271,6 +272,8 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// define owner replace/reset semantics; no transfer runs here.
     joint_capture: crate::semantics_objects::journal::joint_driver::JointCaptureOwner,
     joint_publication: Option<PendingJointPublication>,
+    #[cfg(test)]
+    refuse_joint_finish_publication_once: bool,
     /// Optional hints retain only their own identity-qualified source state.
     /// They do not supply Inventory, H0 or Detailed admission authority.
     caller_metadata: Option<crate::caller_metadata::runtime::job::MetadataLane>,
@@ -458,6 +461,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             semantic_finalizer: None,
             joint_capture,
             joint_publication: None,
+            #[cfg(test)]
+            refuse_joint_finish_publication_once: false,
             caller_metadata: None,
             refused_semantic_domains: HashSet::new(),
             pending_adjudication: BTreeMap::new(),
@@ -1022,21 +1027,149 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.engine.tail_stats()
     }
 
-    /// Inert terminal service port. Original rings, FIFO and Engine work stay
-    /// retained; an empty completion word is never returned for unserviced work.
-    #[allow(dead_code)] // Collected Finish has no active terminal/native bridge.
+    /// Fixture transport replacement only: processing still uses this
+    /// coordinator's actual Engine and its original retained queue.
+    #[cfg(test)]
     pub(crate) fn service_collected_finish_discovery<S: crate::events::BoundedRecordSource>(
         &mut self,
-        _q: &crate::attach::CollectedFinishQ,
-        _producers: &crate::attach::SessionDrainProducers,
-        _discovery: &mut crate::events::DiscoveryDrain<S>,
-        _staged: &mut crate::attach::DiscoveryStage,
-        _work: usize,
+        q: &crate::attach::CollectedFinishQ,
+        producers: &crate::attach::SessionDrainProducers,
+        discovery: &mut crate::events::DiscoveryDrain<S>,
+        staged: &mut crate::attach::DiscoveryStage,
+        work: usize,
     ) -> Result<
         crate::inventory_semantics::LaneDrainOutcome,
         crate::inventory_semantics::SemanticRefusal,
     > {
-        Err(crate::inventory_semantics::SemanticRefusal::Unavailable)
+        use crate::inventory_semantics::{LaneDrainOutcome, SemanticRefusal};
+        if !q.matches_discovery_drain(producers, discovery) {
+            return Err(SemanticRefusal::Unavailable);
+        }
+        let positions = crate::events::discovery_drain_positions(discovery);
+        if positions.producer != q.discovery_stop() || positions.consumer > q.discovery_stop() {
+            return Err(SemanticRefusal::Unavailable);
+        }
+        if work == 0 {
+            return Ok(LaneDrainOutcome {
+                backlog: positions.consumer != q.discovery_stop()
+                    || self.engine.collected_finish_backlog_pending(staged.len()),
+                ..Default::default()
+            });
+        }
+        let held = self.engine.discovery_held_len();
+        // One transfer avoids losing a partially collected Vec if a later
+        // BUSY/error is encountered; subsequent originals retain their cursor.
+        let quantum = work
+            .min(1)
+            .min(crate::attach::DiscoveryStage::CAPACITY.saturating_sub(held));
+        let (records, malformed, post_q, ring_pending) =
+            if self.engine.collected_finish_backlog_pending(0) {
+                (
+                    Vec::new(),
+                    0,
+                    false,
+                    positions.consumer != q.discovery_stop() || staged.len() != 0,
+                )
+            } else {
+                crate::attach::collect_staged_discovery_to_position(
+                    staged,
+                    discovery,
+                    q.discovery_stop(),
+                    quantum,
+                )
+                .map_err(|_| SemanticRefusal::Unavailable)?
+            };
+        let count = records.len() as u64 + malformed;
+        // Only native/counter leaves are substituted. Dispatch and the
+        // lifecycle consequence observed by the test remain real Engine work.
+        let mut session = crate::discovery::engine::session_fixture::ScriptedSession::default();
+        let progress = self
+            .engine
+            .service_collected_finish_records(&mut session, records, malformed, work)
+            .map_err(|_| SemanticRefusal::Unavailable)?;
+        let after = crate::events::discovery_drain_positions(discovery);
+        Ok(LaneDrainOutcome {
+            records: count,
+            post_q: post_q
+                || after.producer != q.discovery_stop()
+                || after.consumer > q.discovery_stop(),
+            backlog: ring_pending
+                || progress.pending
+                || staged.len() != 0
+                || after.consumer != q.discovery_stop(),
+            failed: false,
+        })
+    }
+
+    /// One real Session/Q continuation. Acquiring transport and dispatching
+    /// retained Engine work are separate bounded opportunities.
+    #[allow(dead_code)] // The private collected machine is not selected by ordinary inventory.
+    pub(crate) fn service_collected_finish_session(
+        &mut self,
+        session: &mut Session,
+        q: &crate::attach::CollectedFinishQ,
+        work: usize,
+    ) -> Result<
+        crate::inventory_semantics::LaneDrainOutcome,
+        crate::inventory_semantics::SemanticRefusal,
+    > {
+        use crate::inventory_semantics::{LaneDrainOutcome, SemanticRefusal};
+        session
+            .collected_finish_discovery_domain(q)
+            .map_err(|_| SemanticRefusal::Unavailable)?;
+        let positions = session
+            .discovery_positions()
+            .map_err(|_| SemanticRefusal::Unavailable)?;
+        if work == 0 {
+            return Ok(LaneDrainOutcome {
+                backlog: positions.consumer != q.discovery_stop()
+                    || self
+                        .engine
+                        .collected_finish_backlog_pending(session.staged_discovery_len()),
+                ..Default::default()
+            });
+        }
+        let quantum = work.min(1).min(
+            crate::attach::DiscoveryStage::CAPACITY
+                .saturating_sub(self.engine.discovery_held_len()),
+        );
+        let (records, malformed, post_q, ring_pending) =
+            if self.engine.collected_finish_backlog_pending(0) {
+                (
+                    Vec::new(),
+                    0,
+                    false,
+                    positions.consumer != q.discovery_stop() || session.staged_discovery_len() != 0,
+                )
+            } else {
+                session
+                    .collect_discovery_to_position(q.discovery_stop(), quantum)
+                    .map_err(|_| SemanticRefusal::Unavailable)?
+            };
+        let count = records.len() as u64 + malformed;
+        let progress = self
+            .engine
+            .service_collected_finish_records(session, records, malformed, work)
+            .map_err(|_| SemanticRefusal::Unavailable)?;
+        session
+            .collected_finish_discovery_domain(q)
+            .map_err(|_| SemanticRefusal::Unavailable)?;
+        let after = session
+            .discovery_positions()
+            .map_err(|_| SemanticRefusal::Unavailable)?;
+        Ok(LaneDrainOutcome {
+            records: count,
+            post_q,
+            backlog: ring_pending
+                || progress.pending
+                || session.staged_discovery_len() != 0
+                || after.consumer != q.discovery_stop(),
+            failed: false,
+        })
+    }
+
+    pub(crate) fn collected_finish_discovery_pending(&self, staged: usize) -> bool {
+        self.engine.collected_finish_backlog_pending(staged)
     }
 
     /// Existing retained Engine work and actual Session FIFO occupancy only.
@@ -1047,7 +1180,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     ) -> (usize, bool) {
         (
             self.engine.discovery_held_len(),
-            self.engine.discovery_backlog_pending(staged),
+            self.engine.collected_finish_backlog_pending(staged),
         )
     }
 
@@ -1082,9 +1215,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.engine.unmatched_finish_exit_for_test(pid, at)
     }
 
-    /// Refusal-only hook: no final publication receiver exists to run yet.
+    /// Refuse the final receiver only after its actual disposal is retained.
     #[cfg(test)]
-    pub(crate) fn reference_refuse_joint_finish_publication_once(&mut self) {}
+    pub(crate) fn reference_refuse_joint_finish_publication_once(&mut self) {
+        self.refuse_joint_finish_publication_once = true;
+    }
 
     /// Borrow the canonical capture owner without changing its model or
     /// ledger. Collected refresh checks original raw custody through this

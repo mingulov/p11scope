@@ -2157,6 +2157,15 @@ impl CollectedFinishQ {
         self.producers.same_producers(producers) && self.discovery.same_allocation(discovery)
     }
 
+    #[cfg(test)]
+    pub(crate) fn matches_discovery_drain<S: events::RecordSource>(
+        &self,
+        producers: &SessionDrainProducers,
+        drain: &events::DiscoveryDrain<S>,
+    ) -> bool {
+        self.producers.same_producers(producers) && drain.same_domain(&self.discovery)
+    }
+
     pub(crate) fn matches_retained_grant(
         &self,
         grant: &crate::semantics_objects::journal::SessionDrainGrant,
@@ -7713,6 +7722,50 @@ impl Session {
             .context("retained EVENTS consumer vanished after creation")?;
         let table = self.object_decode.as_ref().map(ObjectDecodeTable::rows);
         Ok((consumer, table, InstanceMaps { ebpf: &self.ebpf }))
+    }
+
+    /// Observe only the SAME retained Session/Q domains and producer bounds.
+    /// No consumer creation, polling, scrub or detach is performed here.
+    pub(crate) fn collected_finish_discovery_domain(
+        &self,
+        q: &CollectedFinishQ,
+    ) -> Result<&events::DiscoveryDomain> {
+        anyhow::ensure!(
+            self.matches_collected_finish_q(q),
+            "foreign or no-longer-current Finish Q"
+        );
+        let events = self
+            .events_consumer
+            .as_ref()
+            .context("Finish Q lost its original EVENTS cursor")?
+            .consumption_cut()
+            .map_err(|reason| anyhow!("Finish EVENTS cut refused: {reason:?}"))?;
+        let discovery = events::discovery_drain_positions(
+            self.discovery_consumer
+                .as_ref()
+                .context("Finish Q lost its original DISCOVERY cursor")?,
+        );
+        anyhow::ensure!(
+            q.covers_events_bounds(&events)
+                && events.producer_bound() == q.events_stop()
+                && discovery.producer == q.discovery_stop()
+                && discovery.consumer <= q.discovery_stop()
+                && self.matches_collected_finish_q(q),
+            "an original producer moved after Finish Q"
+        );
+        Ok(&self.discovery_domain)
+    }
+
+    pub(crate) fn joint_collection_io_at_q(
+        &mut self,
+        q: &CollectedFinishQ,
+    ) -> Result<(
+        &mut events::OwnedDrain,
+        Option<&ObjectRows>,
+        InstanceMaps<'_>,
+    )> {
+        self.collected_finish_discovery_domain(q)?;
+        self.joint_collection_io()
     }
 
     /// Borrow the EVENTS map descriptor for readiness waits. The idle

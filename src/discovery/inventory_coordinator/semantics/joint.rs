@@ -24,6 +24,28 @@ pub(in crate::discovery::engine::inventory_coordinator) struct JointCommitInput<
     births: &'a mut dyn JointBirthEvidenceSource,
     fault: &'a dyn FaultEpoch,
     remaining: &'a mut usize,
+    finish: Option<FinishCommitOutput<'a>>,
+}
+
+struct FinishCommitOutput<'a> {
+    disposed: &'a mut Option<DisposedJointQuantum>,
+    completed: &'a mut Option<CompletedJointFinish>,
+}
+
+/// The only constructor is the actual matching final publication receiver,
+/// after its original disposal check and before Copy receipt conversion.
+pub(crate) struct CompletedJointFinish {
+    association: crate::semantics_objects::journal::joint_driver::CollectedFinishAssociation,
+}
+
+impl CompletedJointFinish {
+    pub(crate) fn matches_capture(
+        &self,
+        capture: &crate::semantic_capture::SemanticCapture,
+        producers: &SessionDrainProducers,
+    ) -> bool {
+        self.association.matches_capture(capture, producers)
+    }
 }
 
 enum JointContinuationInput<'a> {
@@ -126,6 +148,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.joint_publication = Some(PendingJointPublication {
             completion,
             cut_barrier,
+            finish: None,
             _storage: storage,
         });
         // Retain the actual completion before a fallible boundary check; an
@@ -153,6 +176,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 births,
                 fault,
                 remaining,
+                finish: None,
             }),
         )
     }
@@ -177,8 +201,95 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 births,
                 fault,
                 remaining,
+                finish: None,
             }),
         )
+    }
+
+    pub(crate) fn commit_joint_finish_batch_with_io(
+        &mut self,
+        io: JointCommitIo<'_>,
+        producers: &SessionDrainProducers,
+        frame: &mut Option<IngestedJointQuantum>,
+        disposed: &mut Option<DisposedJointQuantum>,
+        completed: &mut Option<CompletedJointFinish>,
+        remaining: &mut usize,
+    ) -> Result<JointCommitProgress> {
+        let (continuation, births, fault) = io.into_parts();
+        self.commit_batch_inner(
+            false,
+            None,
+            Some(JointCommitInput {
+                continuation: JointContinuationInput::Scoped(continuation),
+                producers,
+                frame,
+                births,
+                fault,
+                remaining,
+                finish: Some(FinishCommitOutput {
+                    disposed,
+                    completed,
+                }),
+            }),
+        )
+    }
+
+    pub(crate) fn collected_stop_candidate(&self) -> bool {
+        matches!(self.semantic_finalizer.as_ref().and_then(|state| state.pending_semantic.as_ref()),
+            Some(PendingSemanticBatch::Collected(batch)) if batch.permits_collected_stop())
+    }
+
+    pub(crate) fn reserve_collected_stop_union(
+        &mut self,
+        raw: &RawJointQuantum,
+    ) -> Result<(), SemanticRefusal> {
+        self.registry
+            .validate_joint_preparation(raw)
+            .map_err(|_| SemanticRefusal::Unavailable)?;
+        let Some(PendingSemanticBatch::Collected(batch)) = self
+            .semantic_finalizer
+            .as_mut()
+            .and_then(|state| state.pending_semantic.as_mut())
+        else {
+            return Err(SemanticRefusal::Unavailable);
+        };
+        batch.reserve_collected_stop_union()
+    }
+
+    pub(crate) fn merge_collected_stop_report(
+        &mut self,
+        raw: &mut RawJointQuantum,
+        report: &mut crate::semantic_capture::TickReport,
+    ) -> Result<(), SemanticRefusal> {
+        self.registry
+            .validate_joint_preparation(raw)
+            .map_err(|_| SemanticRefusal::Unavailable)?;
+        if !raw.matches_final_stop_report(report)
+            || self
+                .joint_publication
+                .as_ref()
+                .is_none_or(|pending| pending.finish.is_some())
+        {
+            return Err(SemanticRefusal::Unavailable);
+        }
+        let Some(PendingSemanticBatch::Collected(batch)) = self
+            .semantic_finalizer
+            .as_mut()
+            .and_then(|state| state.pending_semantic.as_mut())
+        else {
+            return Err(SemanticRefusal::Unavailable);
+        };
+        batch.merge_collected_stop(report)?;
+        // The checked private Raw stamp is moved only after the original union
+        // accepted all output. It cannot be supplied from receipt scalars.
+        // The unchanged private stamp was checked above. Moving its Option
+        // introduces no fallible step after the report union moved.
+        let association = raw.take_finish_association();
+        self.joint_publication
+            .as_mut()
+            .expect("validated completion context")
+            .finish = association;
+        Ok(())
     }
 
     pub(in crate::discovery::engine::inventory_coordinator) fn commit_joint_publication_inner(
@@ -192,7 +303,28 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             births,
             fault,
             remaining,
+            mut finish,
         } = input;
+        if self
+            .joint_publication
+            .as_ref()
+            .is_some_and(|pending| pending.finish.is_some())
+            != finish.is_some()
+        {
+            bail!("the original Finish association requires its owning receiver");
+        }
+        if let Some(output) = finish.as_mut() {
+            if output.completed.is_some() {
+                bail!("a completed Finish owner cannot be overwritten");
+            }
+            if output.disposed.is_some() {
+                return self.complete_joint_publication(
+                    &mut *output.disposed,
+                    Some(&mut *output.completed),
+                    producers,
+                );
+            }
+        }
         let original = frame
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Joint publication requires its original frame"))?;
@@ -230,7 +362,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             ports.split().0.mark_joint_publication_targets_bound();
         }
         if let Some(disposed) = self.finish_joint_frame_if_ready(frame, producers, &continuation)? {
-            return Ok(self.complete_joint_publication(disposed));
+            return self.complete_joint_output(disposed, finish.as_mut(), producers);
         }
         let mut births = BorrowedBirths(births);
         let fault = BorrowedFault(fault);
@@ -249,7 +381,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             if let Some(disposed) =
                 self.finish_joint_frame_if_ready(frame, producers, &continuation)?
             {
-                return Ok(self.complete_joint_publication(disposed));
+                return self.complete_joint_output(disposed, finish.as_mut(), producers);
             }
             if *remaining == before {
                 break; // Same-frontier retry or real future-input dependency.
@@ -314,21 +446,68 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
     }
 
-    fn complete_joint_publication(
+    fn complete_joint_output(
         &mut self,
         disposed: DisposedJointQuantum,
-    ) -> JointCommitProgress {
+        finish: Option<&mut FinishCommitOutput<'_>>,
+        producers: &SessionDrainProducers,
+    ) -> Result<JointCommitProgress> {
+        if let Some(output) = finish {
+            *output.disposed = Some(disposed);
+            self.complete_joint_publication(
+                &mut *output.disposed,
+                Some(&mut *output.completed),
+                producers,
+            )
+        } else {
+            self.complete_joint_publication(&mut Some(disposed), None, producers)
+        }
+    }
+
+    fn complete_joint_publication(
+        &mut self,
+        disposed: &mut Option<DisposedJointQuantum>,
+        completed: Option<&mut Option<CompletedJointFinish>>,
+        producers: &SessionDrainProducers,
+    ) -> Result<JointCommitProgress> {
+        let original = disposed
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("missing actual disposal"))?;
+        let pending = self
+            .joint_publication
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("missing original completion"))?;
+        if let Some(association) = &pending.finish {
+            if completed.is_none()
+                || !association.matches_disposed(original, &self.joint_capture, producers)
+            {
+                bail!("final publication refused a foreign Finish disposal");
+            }
+            #[cfg(test)]
+            if self.refuse_joint_finish_publication_once {
+                self.refuse_joint_finish_publication_once = false;
+                bail!("the actual final publication receiver refused once");
+            }
+        } else if completed.is_some() {
+            bail!("no original Stop association");
+        }
         let applied = self
             .registry
-            .finish_joint_publication(&mut self.joint_capture, &disposed)
-            .expect("exclusive original frame disposal matches its preflighted publication");
+            .finish_joint_publication(&mut self.joint_capture, original)?;
         let pending = self
             .joint_publication
             .take()
             .expect("original completion context");
+        let authorization = pending
+            .finish
+            .map(|association| CompletedJointFinish { association });
         let receipt = self.finish_publication_context(pending.completion, applied);
+        if let Some(output) = completed {
+            *output = authorization;
+        }
+        drop(disposed.take());
         drop(pending._storage); // Original collection/events have moved or finished first.
-        JointCommitProgress::Published(receipt)
+        Ok(JointCommitProgress::Published(receipt))
     }
 }
 

@@ -42,6 +42,39 @@ impl CollectedLedgerBinding {
     }
 }
 
+/// Move-only identity linkage minted solely from the real final Raw's private
+/// Capture Stop acknowledgement. It grants no seal, H3, loss bound or detach.
+pub(crate) struct CollectedFinishAssociation {
+    identity: RawQuantumIdentity,
+    frontier: ConsumptionOrdinal,
+    ledger: CollectedLedgerBinding,
+    producers: SessionDrainProducers,
+    capture: crate::semantic_capture::CollectedH0Owner,
+    position: u64,
+}
+
+impl CollectedFinishAssociation {
+    pub(crate) fn matches_disposed(
+        &self,
+        disposed: &super::joint_audit::DisposedJointQuantum,
+        owner: &JointCaptureOwner,
+        producers: &SessionDrainProducers,
+    ) -> bool {
+        self.identity == disposed.identity()
+            && self.frontier == disposed.frontier()
+            && self.ledger.matches_owner(owner)
+            && self.producers.same_producers(producers)
+    }
+
+    pub(crate) fn matches_capture(
+        &self,
+        capture: &crate::semantic_capture::SemanticCapture,
+        producers: &SessionDrainProducers,
+    ) -> bool {
+        self.producers.same_producers(producers) && capture.owns_collected_finish(self.capture)
+    }
+}
+
 /// Original raw allocation and wire position, stamped only by the actual H0
 /// allocator. Equal scalar positions from another raw allocation are foreign.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -536,6 +569,7 @@ pub(crate) struct RawJointQuantum {
     h0_reported: bool,
     // Inline provenance is included in storage_bytes' size_of::<Self>().
     h0_owner: Option<crate::semantic_capture::CollectedH0Owner>,
+    finish: Option<CollectedFinishAssociation>,
     invocations: Vec<RawInvocation>,
     ledger_generation: Option<LedgerGeneration>,
     resource_refused: bool,
@@ -905,18 +939,100 @@ impl RawJointQuantum {
         q: &crate::attach::CollectedFinishQ,
     ) -> Result<(), RawQuantumRefusal> {
         self.validate_collected_report_owner(adapter, producers)?;
+        self.validate_collected_q(producers, discovery, q)
+    }
+
+    /// Producer/cursor containment only. The actual phase still checks its
+    /// refresh/H0/frontier obligations before any native or report mutation.
+    pub(crate) fn validate_collected_q(
+        &self,
+        producers: &SessionDrainProducers,
+        discovery: &crate::events::DiscoveryDomain,
+        q: &crate::attach::CollectedFinishQ,
+    ) -> Result<(), RawQuantumRefusal> {
         let cuts = self
             .cuts
             .as_ref()
             .ok_or(RawQuantumRefusal::DispositionMismatch)?;
         let end = cuts.end.as_ref().ok_or(RawQuantumRefusal::H0Undelivered)?;
-        if !q.matches_owner(producers, discovery)
+        if !self.matches_producers(producers)
+            || !q.matches_owner(producers, discovery)
             || !q.covers_events_bounds(&cuts.start)
             || !q.covers_events_bounds(end)
         {
             return Err(RawQuantumRefusal::ForeignCapture);
         }
         Ok(())
+    }
+
+    /// Global Stop is permitted only for the same final empty original at Q;
+    /// earlier capacity-full/pending originals must finish by their own route.
+    pub(crate) fn validate_final_stop(
+        &self,
+        adapter: &JournalAdapter,
+        producers: &SessionDrainProducers,
+        discovery: &crate::events::DiscoveryDomain,
+        q: &crate::attach::CollectedFinishQ,
+    ) -> Result<(), RawQuantumRefusal> {
+        self.validate_pending_finish_report(adapter, producers, discovery, q)?;
+        let end = self
+            .cuts
+            .as_ref()
+            .and_then(|cuts| cuts.end.as_ref())
+            .ok_or(RawQuantumRefusal::H0Undelivered)?;
+        if self.attempted != 0
+            || !self.ordered.is_empty()
+            || !self.h0_origins.is_empty()
+            || self.h0_pending
+            || self.finish.is_some()
+            || !q.events_at_bound(end)
+        {
+            return Err(RawQuantumRefusal::DispositionMismatch);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn note_h0_finish(
+        &mut self,
+        report: crate::semantic_capture::CollectedH0FinishDisposition,
+        adapter: &JournalAdapter,
+        producers: &SessionDrainProducers,
+    ) -> Result<(), RawQuantumRefusal> {
+        let (disposition, position) = report.into_parts();
+        let ledger = self
+            .ledger_binding()
+            .ok_or(RawQuantumRefusal::ForeignLedger)?;
+        self.note_h0_report(disposition)?;
+        let capture = self.h0_owner.ok_or(RawQuantumRefusal::ForeignCapture)?;
+        self.finish = Some(CollectedFinishAssociation {
+            identity: self.identity,
+            frontier: adapter.consumed_frontier(),
+            ledger,
+            producers: producers.clone(),
+            capture,
+            position,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn matches_final_stop_report(
+        &self,
+        report: &crate::semantic_capture::TickReport,
+    ) -> bool {
+        let Some(finish) = &self.finish else {
+            return false;
+        };
+        self.audit.h0_allocated_below == report.allocated_below()
+            && !self.h0_pending
+            && report.current().is_empty()
+            && report.outcomes().len() == 1
+            && matches!(&report.outcomes()[0], crate::semantic_capture::TickOutcome::Invalidation(v)
+                if matches!(v.scope(), crate::semantic_capture::InvalidationScope::Stopped)
+                    && v.position() == Some(finish.position))
+    }
+
+    pub(crate) fn take_finish_association(&mut self) -> Option<CollectedFinishAssociation> {
+        self.finish.take()
     }
 
     /// Recheck the unchanged original at report transfer, including when
@@ -1298,6 +1414,10 @@ impl RawJointQuantum {
     /// reconstructed from scalar native/EVENTS words or another allocation.
     pub(crate) fn ledger_binding(&self) -> Option<CollectedLedgerBinding> {
         self.ledger_generation.map(CollectedLedgerBinding)
+    }
+
+    pub(crate) fn h0_waiting(&self) -> bool {
+        self.h0_pending
     }
 
     #[cfg(test)]
@@ -2072,6 +2192,7 @@ impl RawJointQuantum {
             h0_pending: false,
             h0_reported: false,
             h0_owner: None,
+            finish: None,
             invocations,
             ledger_generation: resources
                 .as_ref()

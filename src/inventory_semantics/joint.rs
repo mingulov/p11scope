@@ -585,9 +585,49 @@ pub(crate) fn bind_collected_semantic_callers(
 pub(crate) fn bind_semantic_callers_inner(
     coordinator: &mut super::InventoryCoordinator<super::OsProcessSource>,
     lane: &mut AttestedSemanticLane,
-    mut collected: Option<(
+    collected: Option<(
         &mut crate::semantics_objects::journal::joint_driver::RawJointQuantum,
         &crate::attach::SessionDrainProducers,
+    )>,
+) {
+    bind_semantic_callers_with_q(coordinator, lane, collected, None)
+}
+
+pub(crate) fn bind_collected_semantic_callers_at_q(
+    coordinator: &mut super::InventoryCoordinator<super::OsProcessSource>,
+    lane: &mut AttestedSemanticLane,
+    raw: &mut crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+    producers: &SessionDrainProducers,
+    discovery: &crate::events::DiscoveryDomain,
+    q: &crate::attach::CollectedFinishQ,
+) -> Result<(), crate::semantics_objects::journal::joint_driver::RawQuantumRefusal> {
+    raw.validate_refresh(coordinator.joint_capture().adapter(), producers)?;
+    raw.validate_collected_q(producers, discovery, q)?;
+    // An empty terminal collection may flush existing jobs/stash in its H0
+    // tick, but must not start a fresh provider scan after admission STOP.
+    // Nonempty pre-Q originals retain the existing collected binder path.
+    if raw.pending_h0_records() == 0 {
+        return Ok(());
+    }
+    bind_semantic_callers_with_q(
+        coordinator,
+        lane,
+        Some((raw, producers)),
+        Some((discovery, q)),
+    );
+    Ok(())
+}
+
+fn bind_semantic_callers_with_q(
+    coordinator: &mut super::InventoryCoordinator<super::OsProcessSource>,
+    lane: &mut AttestedSemanticLane,
+    mut collected: Option<(
+        &mut crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+        &SessionDrainProducers,
+    )>,
+    terminal: Option<(
+        &crate::events::DiscoveryDomain,
+        &crate::attach::CollectedFinishQ,
     )>,
 ) {
     if !lane.is_live() || lane.is_finished() {
@@ -605,6 +645,20 @@ pub(crate) fn bind_semantic_callers_inner(
             continue;
         };
         let prepared = match collected.as_mut() {
+            Some((raw, producers)) if terminal.is_some() => {
+                let (discovery, q) = terminal.expect("same terminal borrow");
+                lane.prepare_caller_admission_collected_at_q(
+                    candidate.pin(),
+                    attempt.slot,
+                    &module,
+                    raw,
+                    coordinator.joint_capture().adapter(),
+                    producers,
+                    discovery,
+                    q,
+                    |bytes| coordinator.registry().reserve_semantic_storage(bytes),
+                )
+            }
             Some((raw, producers)) => lane.prepare_caller_admission_collected(
                 candidate.pin(),
                 attempt.slot,

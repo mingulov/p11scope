@@ -374,6 +374,9 @@ pub struct Engine {
     terminal_batch: Option<TerminalBatch>,
     terminal_journal: Option<TerminalJournal>,
     pending_discovery_records: Vec<QueuedDiscoveryRecord>,
+    /// A collected-Finish service call spends this at actual dispatch or
+    /// retirement boundaries. Ordinary frames leave it unset.
+    collected_finish_actions: Option<usize>,
     /// Set while a pause cycle applies its batch (the owned child stopped).
     pause_owned_batch: bool,
     /// Set while a pressure service pass runs inside record dispatch. Nested
@@ -8476,6 +8479,7 @@ impl Engine {
             terminal_batch: None,
             terminal_journal: None,
             pending_discovery_records: Vec::new(),
+            collected_finish_actions: None,
             pause_owned_batch: false,
             pressure_service_active: false,
             in_refresh_tick: false,
@@ -8705,10 +8709,13 @@ impl Engine {
         let Some(deadline) = self.frame_deadline_ns else {
             return false;
         };
-        self.cancel_flag
-            .as_ref()
-            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
-            || crate::attach::monotonic_ns().is_some_and(|now| now >= deadline)
+        // Collected Finish is already admission-gated. An operator stop must
+        // not strand its owned prefix; its explicit action/time bounds still
+        // apply, while ordinary frames retain the cancellation check.
+        self.cancel_flag.as_ref().is_some_and(|flag| {
+            self.collected_finish_actions.is_none()
+                && flag.load(std::sync::atomic::Ordering::Relaxed)
+        }) || crate::attach::monotonic_ns().is_some_and(|now| now >= deadline)
     }
 
     /// Books one frame's deferral once (F4). Deferred work is delayed, never
@@ -18382,6 +18389,11 @@ impl Engine {
             let mut deferred_mismatches = Vec::new();
             let mut batch = std::mem::take(records).into_iter();
             while let Some(queued) = batch.next() {
+                if !self.take_collected_finish_action() {
+                    self.pending_discovery_records
+                        .extend(std::iter::once(queued).chain(batch));
+                    break;
+                }
                 if self.pending_global_retirement.is_some() {
                     self.pending_discovery_records
                         .extend(std::iter::once(queued).chain(batch));
@@ -18549,6 +18561,18 @@ impl Engine {
                 closure.fail();
                 break;
             }
+            // A terminal opportunity never turns a single dispatched original
+            // into an unbounded retirement pass. Its persistent intents remain
+            // beside the same Engine for a later opportunity.
+            if self.collected_finish_actions == Some(0) {
+                for (view, cause) in std::mem::take(pending_views) {
+                    self.retirement_intents
+                        .entry(view)
+                        .and_modify(|old| *old = old.merge(cause))
+                        .or_insert(cause);
+                }
+                break;
+            }
             self.promote_stale_execs(pending_views);
             if pending_views.is_empty() {
                 if (self.pending_rejected_keys.is_empty() && self.pending_retirements.is_empty())
@@ -18557,6 +18581,9 @@ impl Engine {
                     break;
                 }
                 conservative_replay_attempted = true;
+                if !self.take_collected_finish_action() {
+                    break;
+                }
                 let outcome =
                     self.replay_pending_conservative(session, additions_allowed, pending_views);
                 closure.observe_apply(&outcome);
@@ -18571,6 +18598,13 @@ impl Engine {
                 }
             }
             for (view, mut cause) in std::mem::take(pending_views) {
+                if !self.take_collected_finish_action() {
+                    self.retirement_intents
+                        .entry(view)
+                        .and_modify(|old| *old = old.merge(cause))
+                        .or_insert(cause);
+                    continue;
+                }
                 if let Some(next) = pending_views.remove(&view) {
                     cause = cause.merge(next);
                 }
@@ -21370,6 +21404,131 @@ impl Engine {
             || self.pressure_rotation_pending
             || !self.pending_discovery_records.is_empty()
             || staged_len > 0
+    }
+
+    /// Finish must also retain deferred lifecycle work. A vacant transport
+    /// cursor alone cannot discharge an original already held by the Engine.
+    pub(crate) fn collected_finish_backlog_pending(&self, staged_len: usize) -> bool {
+        self.discovery_backlog_pending(staged_len)
+            || !self.retirement_intents.is_empty()
+            || !self.pending_retirements.is_empty()
+            || !self.pending_rejected_keys.is_empty()
+            || !self.pending_leader_exit_views.is_empty()
+            || self.terminal_batch.is_some()
+            || self.terminal_journal.is_some()
+    }
+
+    fn take_collected_finish_action(&mut self) -> bool {
+        let Some(left) = self.collected_finish_actions.as_mut() else {
+            return true;
+        };
+        if *left == 0 {
+            return false;
+        }
+        *left -= 1;
+        true
+    }
+
+    /// One bounded service of originals already transferred from the actual
+    /// Q-bounded transport. It uses the existing dispatch/retirement machinery,
+    /// but never runs an inventory refresh or a nested, unbounded ring drain.
+    /// Counter refusal and deferred suffixes keep the same queued originals.
+    pub(crate) fn service_collected_finish_records(
+        &mut self,
+        session: &mut dyn EngineSession,
+        records: Vec<DiscoveryRecord>,
+        malformed: u64,
+        work: usize,
+    ) -> Result<BacklogOutcome> {
+        let work = work.min(LIVE_DISCOVERY_DRAIN_QUANTUM);
+        if work == 0 {
+            debug_assert!(records.is_empty() && malformed == 0);
+            return Ok(BacklogOutcome {
+                changed: false,
+                progressed: false,
+                pending: self.collected_finish_backlog_pending(session.staged_discovery_len()),
+            });
+        }
+        let previous = self.collected_finish_actions.replace(work);
+        let result = self.with_live_frame(|engine| {
+            engine.service_collected_finish_records_inner(session, records, malformed, work)
+        });
+        self.collected_finish_actions = previous;
+        result
+    }
+
+    fn service_collected_finish_records_inner(
+        &mut self,
+        session: &mut dyn EngineSession,
+        records: Vec<DiscoveryRecord>,
+        malformed: u64,
+        work: usize,
+    ) -> Result<BacklogOutcome> {
+        let fresh = records.len().saturating_add(malformed as usize);
+        self.charge_discovery_drain(records.len(), malformed);
+        self.record_malformed_discovery(malformed);
+        self.pending_discovery_records
+            .extend(records.into_iter().map(|record| QueuedDiscoveryRecord {
+                record,
+                terminal_owner: None,
+                terminal_exports: Vec::new(),
+            }));
+        self.note_discovery_held_high_water(0);
+        if self.pending_global_retirement.is_some() || self.global_retirement_frame_owed {
+            self.update_counter_snapshot(session)?;
+            return Ok(self
+                .poll_global_retirement_barrier(session)
+                .unwrap_or(BacklogOutcome {
+                    changed: false,
+                    progressed: false,
+                    pending: true,
+                }));
+        }
+        self.take_frame_fresh_blocked();
+        let before = self.pending_discovery_records.len();
+        let take = before.min(work);
+        let queued = self.pending_discovery_records.drain(..take).collect();
+        let mut queued = match begin_discovery_batch(queued, self.update_counter_snapshot(session))
+        {
+            Ok(queued) => queued,
+            Err((error, queued)) => {
+                self.pending_discovery_records.splice(..0, queued);
+                return Err(error);
+            }
+        };
+        let suffix = self.pending_discovery_records.len();
+        let mut additions = false;
+        let mut closure = PauseClosure::new(false);
+        let mut pending_views = PendingViewRetirements::new();
+        // This opportunity owns no nested acquisition allowance. A lifecycle
+        // continuation asking for more transport retains its real unfinished
+        // state; an empty successful read would falsely certify that prefix.
+        let mut no_nested = |_session: &mut dyn EngineSession| {
+            Err(IncompleteTerminalDrain::backlog(Vec::new(), 0).into())
+        };
+        let result = self.process_discovery_records(
+            session,
+            &mut queued,
+            &mut pending_views,
+            &mut additions,
+            &mut no_nested,
+            &mut closure,
+        );
+        self.pending_discovery_records.extend(queued);
+        // Re-parked originals preceded the untouched suffix, even on error.
+        let returned = self.pending_discovery_records.len().saturating_sub(suffix);
+        if returned != 0 {
+            self.pending_discovery_records.rotate_right(returned);
+        }
+        let changed = result?;
+        if changed {
+            self.publish_batch_tail(true)?;
+        }
+        Ok(BacklogOutcome {
+            changed,
+            progressed: changed || fresh != 0 || self.pending_discovery_records.len() < before,
+            pending: self.collected_finish_backlog_pending(session.staged_discovery_len()),
+        })
     }
 
     /// Takes the frame's fresh-blocked flag for the scheduler: a set flag

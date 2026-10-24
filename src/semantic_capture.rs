@@ -820,6 +820,19 @@ pub(crate) struct CollectedH0Disposition {
     pending: bool,
 }
 
+/// Constructed only after the Q-checked final Capture.stop below. Neither an
+/// ordinary tick disposition nor a caller's completion word has this type.
+pub(crate) struct CollectedH0FinishDisposition {
+    disposition: CollectedH0Disposition,
+    position: u64,
+}
+
+impl CollectedH0FinishDisposition {
+    pub(crate) fn into_parts(self) -> (CollectedH0Disposition, u64) {
+        (self.disposition, self.position)
+    }
+}
+
 impl CollectedH0Disposition {
     pub(crate) fn for_quantum(
         self,
@@ -1978,33 +1991,90 @@ impl SemanticCapture {
         Ok(())
     }
 
-    /// Inert final-Stop bound. No allocation allowance or successful original
-    /// association is invented before the actual Finish implementation.
-    #[allow(dead_code)] // Collected Finish remains inactive in normal and libtest builds.
+    /// Checked incoming/union peak for the final empty original. Outstanding
+    /// H0 originals must have reached their earlier actual Q dispositions.
     pub(crate) fn collected_stop_at_q_storage_bytes(
         &self,
-        _quantum: &crate::semantics_objects::journal::joint_driver::RawJointQuantum,
-        _adapter: &JournalAdapter,
-        _producers: &crate::attach::SessionDrainProducers,
-        _discovery: &crate::events::DiscoveryDomain,
-        _q: &crate::attach::CollectedFinishQ,
+        quantum: &crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+        adapter: &JournalAdapter,
+        producers: &crate::attach::SessionDrainProducers,
+        discovery: &crate::events::DiscoveryDomain,
+        q: &crate::attach::CollectedFinishQ,
     ) -> Result<usize, crate::semantics_objects::journal::joint_driver::RawQuantumRefusal> {
-        Err(crate::semantics_objects::journal::joint_driver::RawQuantumRefusal::DispositionMismatch)
+        use crate::semantics_objects::journal::joint_driver::RawQuantumRefusal;
+        quantum.validate_final_stop(adapter, producers, discovery, q)?;
+        quantum.validate_pending_h0_owner(CollectedH0Owner(self.identity), self.next_token)?;
+        if self.stopped || self.router.domain() != producers.native_domain() {
+            return Err(RawQuantumRefusal::Stopped);
+        }
+        if !self.awaiting.is_empty() || self.router.pending_facts().next().is_some() {
+            return Err(RawQuantumRefusal::H0Undelivered);
+        }
+        if self.exhausted || self.next_token.checked_add(1).is_none() {
+            return Err(RawQuantumRefusal::IdentityExhausted);
+        }
+        std::mem::size_of::<TickReport>()
+            .checked_add(
+                pending_q_array_bytes::<TickOutcome>(1)
+                    .and_then(|bytes| bytes.checked_mul(2))
+                    .ok_or(RawQuantumRefusal::Capacity)?,
+            )
+            .ok_or(RawQuantumRefusal::Capacity)
     }
 
-    /// Refuse before Capture.stop, Raw acknowledgement, report or router
-    /// mutation. The caller retains the same original and output slot.
-    #[allow(dead_code)] // No actual final-Stop consumer is implemented yet.
+    pub(crate) fn owns_collected_finish(&self, owner: CollectedH0Owner) -> bool {
+        self.stopped && owner == CollectedH0Owner(self.identity)
+    }
+
+    /// All fallible checks/reserves precede the actual Stop mutation. The
+    /// caller already owns the complete declared report/union allowance.
     pub(crate) fn stop_collected_at_q(
         &mut self,
-        _quantum: &mut crate::semantics_objects::journal::joint_driver::RawJointQuantum,
-        _adapter: &JournalAdapter,
-        _producers: &crate::attach::SessionDrainProducers,
-        _discovery: &crate::events::DiscoveryDomain,
-        _q: &crate::attach::CollectedFinishQ,
-        _report: &mut TickReport,
+        quantum: &mut crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+        adapter: &JournalAdapter,
+        producers: &crate::attach::SessionDrainProducers,
+        discovery: &crate::events::DiscoveryDomain,
+        q: &crate::attach::CollectedFinishQ,
+        report: &mut TickReport,
     ) -> Result<(), crate::semantics_objects::journal::joint_driver::RawQuantumRefusal> {
-        Err(crate::semantics_objects::journal::joint_driver::RawQuantumRefusal::DispositionMismatch)
+        use crate::semantics_objects::journal::joint_driver::RawQuantumRefusal;
+        self.collected_stop_at_q_storage_bytes(quantum, adapter, producers, discovery, q)?;
+        if report.outcomes.capacity() != 0
+            || report.current.capacity() != 0
+            || report.observations.capacity() != 0
+            || report.scan_refusals.capacity() != 0
+            || report.allocated_below != 0
+            || report.awaiting_floor.is_some()
+            || report.shed_floor.is_some()
+            || report.exhausted
+        {
+            return Err(RawQuantumRefusal::DispositionMismatch);
+        }
+        report
+            .outcomes
+            .try_reserve_exact(1)
+            .map_err(|_| RawQuantumRefusal::Capacity)?;
+        if report.outcomes.capacity() != 1 {
+            return Err(RawQuantumRefusal::Capacity);
+        }
+        let position = self.next_token;
+        // The existing Stop core writes into the caller's already-paid output;
+        // there are no unresolved images/temporary expiry buffers at this gate.
+        self.stop_into(report);
+        quantum.note_h0_finish(
+            CollectedH0FinishDisposition {
+                disposition: CollectedH0Disposition {
+                    quantum: quantum.h0_identity(),
+                    native: self.router.domain(),
+                    owner: CollectedH0Owner(self.identity),
+                    allocated_below: report.allocated_below(),
+                    pending: report.awaiting_floor().is_some(),
+                },
+                position,
+            },
+            adapter,
+            producers,
+        )
     }
 
     /// Normal Session forwarding to the same private Capture operation.
@@ -3037,23 +3107,27 @@ impl SemanticCapture {
     }
     pub(crate) fn stop(&mut self) -> TickReport {
         let mut report = TickReport::default();
+        self.stop_into(&mut report);
+        report
+    }
+
+    fn stop_into(&mut self, report: &mut TickReport) {
         if self.stopped {
-            self.stamp_disposition(&mut report);
-            return report;
+            self.stamp_disposition(report);
+            return;
         }
         self.stopped = true;
-        self.invalidate(InvalidationScope::Stopped, &mut report);
+        self.invalidate(InvalidationScope::Stopped, report);
         let images: Vec<_> = self
             .awaiting
             .values()
             .map(|w| w.record.base.event.image)
             .collect();
         for image in images {
-            self.expire(image, &mut report);
+            self.expire(image, report);
         }
         self.jobs.clear();
-        self.stamp_disposition(&mut report);
-        report
+        self.stamp_disposition(report);
     }
 }
 

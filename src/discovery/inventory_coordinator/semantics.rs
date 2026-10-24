@@ -7,6 +7,7 @@ use super::*;
 mod finalizer;
 #[path = "semantics/joint.rs"]
 mod joint;
+pub(crate) use joint::CompletedJointFinish;
 #[path = "semantics/promotion.rs"]
 mod promotion;
 #[cfg(test)]

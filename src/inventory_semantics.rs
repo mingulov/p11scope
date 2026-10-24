@@ -218,6 +218,54 @@ impl std::fmt::Debug for SemanticBatch {
 }
 
 impl SemanticBatch {
+    /// A final Stop may follow only an empty owned batch. Current receipts or
+    /// calls must be prepared/validated/published while Capture is still live.
+    pub(crate) fn permits_collected_stop(&self) -> bool {
+        self.current.is_empty()
+            && !self
+                .outcomes
+                .iter()
+                .any(|outcome| matches!(outcome, TickOutcome::Call(_)))
+    }
+
+    pub(crate) fn reserve_collected_stop_union(&mut self) -> Result<(), SemanticRefusal> {
+        if !self.permits_collected_stop()
+            || self.outcomes.len() >= crate::discovery::instances::MAX_INSTANCES
+            || self.outcomes.len() == self.outcomes.capacity()
+        {
+            return Err(SemanticRefusal::ProviderStorage);
+        }
+        // The original collected accumulator already paid/reserved its full
+        // bounded outcome capacity before any H0 work. Transfer the Stop into
+        // that same allocation; never grow an unpaid replacement after Stop.
+        Ok(())
+    }
+
+    /// The machine holds both incoming/union capacities before actual Stop.
+    /// Every refusal leaves the incoming report and this original untouched.
+    pub(crate) fn merge_collected_stop(
+        &mut self,
+        report: &mut TickReport,
+    ) -> Result<(), SemanticRefusal> {
+        if !self.permits_collected_stop()
+            || !report.current().is_empty()
+            || report.outcomes().len() != 1
+            || self.outcomes.len() == self.outcomes.capacity()
+        {
+            return Err(SemanticRefusal::ProviderStorage);
+        }
+        self.awaiting_floor = report.awaiting_floor();
+        self.shed_floor = match (self.shed_floor, report.shed_floor()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        self.exhausted |= report.exhausted();
+        let (mut outcomes, current) = std::mem::take(report).into_parts();
+        self.outcomes.append(&mut outcomes);
+        drop(outcomes);
+        drop(current);
+        Ok(())
+    }
     /// The lane's batch constructor: bounds-checked before ownership.
     pub(crate) fn from_tick_report(
         domain: NativeDomainId,
@@ -532,6 +580,9 @@ pub(crate) struct AttestedSemanticLane {
     domain: NativeDomainId,
     live: Option<Box<LiveLane>>,
     startup_failed: bool,
+    // Negative admission/legacy-Finish gate only. Completion requires the
+    // constructor-private token from the matching actual publication below.
+    collected_finish_requested: bool,
     /// When the lane's latest batch was staged for commit: the driver
     /// stamps it on stage and clears it on publish, bounding the wait
     /// for receipt-free evidence and backing off failed commits.
@@ -864,6 +915,7 @@ impl AttestedSemanticLane {
             domain,
             live: None,
             startup_failed: false,
+            collected_finish_requested: false,
             staged_at: None,
             #[cfg(test)]
             test_io: None,
@@ -959,6 +1011,7 @@ impl AttestedSemanticLane {
                 joint_machine: None,
             })),
             startup_failed: false,
+            collected_finish_requested: false,
             staged_at: None,
             #[cfg(test)]
             test_io: None,
@@ -1047,6 +1100,51 @@ impl AttestedSemanticLane {
             return true;
         }
         self.live.as_ref().is_some_and(|live| live.finished)
+    }
+
+    pub(crate) fn mark_collected_finish_requested(&mut self) {
+        self.collected_finish_requested = true;
+    }
+
+    /// The authorization is constructor-private to the actual coordinator
+    /// completion, not derived from a Copy batch revision or a Stop callback.
+    pub(crate) fn complete_collected_finish(
+        &mut self,
+        completed: &crate::discovery::engine::inventory_coordinator::semantics::CompletedJointFinish,
+        q: &crate::attach::CollectedFinishQ,
+    ) -> Result<(), SemanticRefusal> {
+        if !self.collected_finish_requested || self.is_finished() {
+            return Err(SemanticRefusal::Unavailable);
+        }
+        #[cfg(test)]
+        if let Some(io) = self.test_io.as_ref() {
+            let mut matches = false;
+            io.inspect_pending_h3(&mut |capture, _, producers| {
+                matches = completed.matches_capture(capture, producers);
+            });
+            if !matches {
+                return Err(SemanticRefusal::Unavailable);
+            }
+            self.test_finished = true;
+            return Ok(());
+        }
+        let live = self
+            .live
+            .as_deref_mut()
+            .ok_or(SemanticRefusal::Unavailable)?;
+        live.session
+            .collected_finish_discovery_domain(q)
+            .map_err(|_| SemanticRefusal::Unavailable)?;
+        let producers = live
+            .session
+            .drain_producers()
+            .ok_or(SemanticRefusal::Unavailable)?;
+        if !completed.matches_capture(&live.capture, &producers) {
+            return Err(SemanticRefusal::Unavailable);
+        }
+        live.finished = true;
+        live.continuity_cuts = live.capture.continuity_cuts();
+        Ok(())
     }
 
     /// Begin native closes only after the driver's H0 Finish publication.
@@ -1210,12 +1308,35 @@ impl AttestedSemanticLane {
         bindings: &[SemanticCallerBinding],
         raw: &mut RawJointQuantum,
     ) -> Result<SemanticBatch, SemanticRefusal> {
+        self.tick_collected_inner(bindings, raw, None)
+    }
+
+    fn tick_collected_at_q(
+        &mut self,
+        bindings: &[SemanticCallerBinding],
+        raw: &mut RawJointQuantum,
+        q: &crate::attach::CollectedFinishQ,
+    ) -> Result<SemanticBatch, SemanticRefusal> {
+        self.tick_collected_inner(bindings, raw, Some(q))
+    }
+
+    fn tick_collected_inner(
+        &mut self,
+        bindings: &[SemanticCallerBinding],
+        raw: &mut RawJointQuantum,
+        q: Option<&crate::attach::CollectedFinishQ>,
+    ) -> Result<SemanticBatch, SemanticRefusal> {
         let live = self
             .live
             .as_deref_mut()
             .ok_or(SemanticRefusal::Unavailable)?;
-        if live.gated || live.finished {
+        if live.finished || (live.gated && q.is_none()) {
             return Err(SemanticRefusal::Unavailable);
+        }
+        if let Some(q) = q {
+            live.session
+                .joint_collection_io_at_q(q)
+                .map_err(|_| SemanticRefusal::Unavailable)?;
         }
         let pins: Vec<_> = bindings
             .iter()
@@ -1262,7 +1383,7 @@ impl AttestedSemanticLane {
         pin: Arc<PidPin>,
         slot: u32,
     ) -> Result<(Vec<ImageIdentity>, Arc<PidPin>), SemanticRefusal> {
-        self.refresh_candidate_with_custody_inner(pin, slot, None)
+        self.refresh_candidate_with_custody_inner(pin, slot, None, None)
     }
 
     fn refresh_candidate_with_custody_inner(
@@ -1274,10 +1395,11 @@ impl AttestedSemanticLane {
             &JournalAdapter,
             &crate::attach::SessionDrainProducers,
         )>,
+        terminal: Option<&crate::attach::CollectedFinishQ>,
     ) -> Result<(Vec<ImageIdentity>, Arc<PidPin>), SemanticRefusal> {
         #[cfg(test)]
         if let Some(test) = self.test_io.as_mut() {
-            if self.test_gated || self.test_finished {
+            if self.test_finished || (self.test_gated && terminal.is_none()) {
                 return Err(SemanticRefusal::Unavailable);
             }
             return match collected {
@@ -1290,8 +1412,13 @@ impl AttestedSemanticLane {
         let Some(live) = self.live.as_mut() else {
             return Err(SemanticRefusal::Unavailable);
         };
-        if live.gated || live.finished {
+        if live.finished || (live.gated && terminal.is_none()) {
             return Err(SemanticRefusal::Unavailable);
+        }
+        if let Some(q) = terminal {
+            live.session
+                .joint_collection_io_at_q(q)
+                .map_err(|_| SemanticRefusal::Unavailable)?;
         }
         let mut report = match collected {
             Some((raw, adapter, producers)) => live.capture.refresh_collected(
@@ -1345,8 +1472,38 @@ impl AttestedSemanticLane {
     ) -> Result<PreparedSemanticAdmission, SemanticRefusal> {
         raw.validate_refresh(adapter, producers)
             .map_err(|_| SemanticRefusal::Unavailable)?;
-        let (_, effective) =
-            self.refresh_candidate_with_custody_inner(pin, slot, Some((raw, adapter, producers)))?;
+        let (_, effective) = self.refresh_candidate_with_custody_inner(
+            pin,
+            slot,
+            Some((raw, adapter, producers)),
+            None,
+        )?;
+        self.prepare_refreshed_caller_admission(effective, slot, module, reserve)
+    }
+
+    #[allow(clippy::too_many_arguments)] // Same original/producers/Q precede the retained provider query.
+    pub(crate) fn prepare_caller_admission_collected_at_q(
+        &mut self,
+        pin: Arc<PidPin>,
+        slot: u32,
+        module: &ModuleKey,
+        raw: &mut RawJointQuantum,
+        adapter: &JournalAdapter,
+        producers: &crate::attach::SessionDrainProducers,
+        discovery: &crate::events::DiscoveryDomain,
+        q: &crate::attach::CollectedFinishQ,
+        reserve: impl FnOnce(usize) -> Result<ResourceLease, SemanticResourceRefusal>,
+    ) -> Result<PreparedSemanticAdmission, SemanticRefusal> {
+        raw.validate_refresh(adapter, producers)
+            .map_err(|_| SemanticRefusal::Unavailable)?;
+        raw.validate_collected_q(producers, discovery, q)
+            .map_err(|_| SemanticRefusal::Unavailable)?;
+        let (_, effective) = self.refresh_candidate_with_custody_inner(
+            pin,
+            slot,
+            Some((raw, adapter, producers)),
+            Some(q),
+        )?;
         self.prepare_refreshed_caller_admission(effective, slot, module, reserve)
     }
 
@@ -2709,6 +2866,9 @@ impl AttestedSemanticLane {
     /// (failed startup) has nothing to finish: `None`. In tests with
     /// substituted H0 I/O, the same H0 stop runs through it.
     pub(crate) fn finish_semantic_stop(&mut self) -> Option<SemanticBatch> {
+        if self.collected_finish_requested {
+            return None; // Its real Stop report/publication belongs to the retained machine.
+        }
         let domain = self.domain;
         #[cfg(test)]
         if let Some(test) = self.test_io.as_mut() {

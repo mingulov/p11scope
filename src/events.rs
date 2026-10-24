@@ -1726,6 +1726,12 @@ impl OwnedDiscoveryDrain {
 }
 
 impl<S: RecordSource> DiscoveryDrain<S> {
+    #[cfg(test)]
+    pub(crate) fn same_domain(&self, expected: &DiscoveryDomain) -> bool {
+        self._domain
+            .as_ref()
+            .is_some_and(|held| held.same_allocation(expected))
+    }
     pub(crate) fn attach_pid_lifecycle_tap(
         &mut self,
         tap: crate::attach::PidLifecycleTap,
@@ -1968,6 +1974,18 @@ mod runtime_tests;
 mod tests {
     use super::*;
     use p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT;
+
+    #[test]
+    fn discovery_drain_keeps_original_domain_allocation() {
+        let retained = DiscoveryDomain::test_standin(0xf105);
+        let original =
+            DiscoveryDrain::over_domain(ScriptedRecords::records([], 0), retained.clone());
+        assert!(original.same_domain(&retained.clone()));
+        let same_id = DiscoveryDomain::test_standin(0xf105);
+        assert_eq!(retained.id(), same_id.id());
+        assert!(!original.same_domain(&same_id));
+        assert!(!DiscoveryDrain::over(ScriptedRecords::records([], 0)).same_domain(&retained));
+    }
 
     #[test]
     fn joint_consumption_cut_keeps_original_cursor_identity() {

@@ -196,6 +196,17 @@ def ready_bound_seconds(release):
     raise CaptureError('canary readiness has no declared bound for this kernel')
 
 
+def declared_kernel_label(release):
+    """Single-line kernel label for the declared readiness bound line.
+
+    Real releases use [A-Za-z0-9._+~-]; anything else (including control
+    characters from a corrupt or hostile uname string) is replaced so the
+    CANARY_READY_BOUND_DECLARED line stays one parseable line. The bound
+    itself never depends on the suffix, only on major.minor.
+    """
+    return re.sub(r'[^A-Za-z0-9._+~-]', '?', release)[:64]
+
+
 def unique_object(pairs):
     value = {}
     for key, item in pairs:
@@ -1091,7 +1102,7 @@ class Coordinator:
         try:
             release = os.uname().release
             ready_seconds = ready_bound_seconds(release)
-            print(f'CANARY_READY_BOUND_DECLARED kernel={release} seconds={ready_seconds}', flush=True)
+            print(f'CANARY_READY_BOUND_DECLARED kernel={declared_kernel_label(release)} seconds={ready_seconds}', flush=True)
             validate_config(self.config)
             evidence.set_object_attributes(getattr(self.config, 'object_attributes', 'present'))
             self.signals.enter()

@@ -98,6 +98,18 @@ def synthetic_done(config, group, deadline, check):
                                       'pid': config.workload_pid, 'generation': config.generation}))
 
 
+def kernel_release(release):
+    """Observe `release` as the running kernel inside the patched scope.
+
+    Only the release string is faked; every other uname field stays real,
+    so the production readiness resolver maps a foreign kernel exactly as
+    the coordinator would observe it there.
+    """
+    real = os.uname()
+    fake = os.uname_result((real.sysname, real.nodename, release, real.version, real.machine))
+    return patch.object(os, 'uname', return_value=fake)
+
+
 STARTUP_THREAD = '''import pathlib, threading, time
 startup = pathlib.Path({directory!r})
 while not (startup / 'start-thread').exists():
@@ -819,6 +831,50 @@ def coordinator_case(pid, directory, case):
             owner.close()
         for fd in test_handles:
             os.close(fd)
+
+
+def ready_bound_case(pid, directory, spec):
+    """Per-kernel readiness bound runs with a faked kernel release.
+
+    spec is pass_515 (ready immediately, must complete), fail_66 or
+    fail_515 (never ready, must expire at the declared bound). The
+    coordinator, custody and FakeMaps are all real; only os.uname is
+    faked, so the production resolver maps the kernel to its bound and
+    the elapsed wall clock proves which bound the run enforced.
+    """
+    release, never_ready = {'pass_515': ('5.15.221-ready-bound-test', False),
+                            'fail_66': ('6.6.157-ready-bound-test', True),
+                            'fail_515': ('5.15.221-ready-bound-test', True)}[spec]
+    expected = {'pass_515': 30, 'fail_66': 8, 'fail_515': 30}[spec]
+    config = config_for(pid, directory)
+    if never_ready:
+        # Never signal readiness: the observer must outlive the longest
+        # declared bound so expiry always happens in the readiness loop,
+        # and custody reaps it on the way out.
+        config.observer_args = [sys.executable, '-c', 'import time; time.sleep(60)']
+    source = FakeMaps(config)
+    output = io.StringIO()
+    started = time.monotonic()
+    with kernel_release(release), \
+            patch.object(capture, 'wait_done', side_effect=synthetic_done), \
+            contextlib.redirect_stdout(output):
+        try:
+            manifest = capture.capture(config, source)
+        except capture.CaptureError as error:
+            assert never_ready, (spec, error)
+            assert 'phase deadline expired' in str(error), str(error)
+            manifest = None
+        else:
+            assert not never_ready, spec
+    elapsed = time.monotonic() - started
+    line = f'CANARY_READY_BOUND_DECLARED kernel={release} seconds={expected}'
+    assert line in output.getvalue().splitlines(), output.getvalue()
+    if never_ready:
+        lower, upper = (8, 15) if spec == 'fail_66' else (30, 44)
+        assert lower <= elapsed < upper, (spec, elapsed)
+        assert not (Path(directory) / f'mapdump_manifest_{config.lane}.json').exists()
+    else:
+        assert manifest.is_file()
 
 
 OWNED_OBSERVER = r'''import json, os, pathlib, subprocess, sys, time
@@ -2044,6 +2100,102 @@ class StoppedCanaryCaptureTests(unittest.TestCase):
                 stream.write('p11scope \u2014 test \u2014 privacy=allowlisted\n'.encode())
             self.assertTrue(coordinator.final_privacy_present(time.monotonic() + 1))
 
+    def test_ready_bound_declares_8s_for_modern_kernels(self):
+        self.assertEqual(capture.READY_SECONDS, 8)
+        for release in ('6.6.157-ready-bound-test', '6.6.0', '6.12.10-generic',
+                        '7.0.0-38-generic', '7.2.9'):
+            with self.subTest(release=release):
+                self.assertEqual(capture.ready_bound_seconds(release), 8)
+
+    def test_ready_bound_declares_30s_for_legacy_kernels(self):
+        self.assertEqual(capture.READY_SECONDS_LEGACY_KERNEL, 30)
+        for release in ('5.15.221-ready-bound-test', '5.15.0',
+                        '6.1.188-ready-bound-test', '6.1.0'):
+            with self.subTest(release=release):
+                self.assertEqual(capture.ready_bound_seconds(release), 30)
+
+    def test_ready_bound_refuses_unknown_kernels(self):
+        for release in ('5.4.0', '5.10.123-generic', '5.19.17', '6.0.19',
+                        '6.5.13-generic', '4.19.0', '', 'not-a-kernel', '6', '6.x'):
+            with self.subTest(release=release):
+                with self.assertRaises(capture.CaptureError) as raised:
+                    capture.ready_bound_seconds(release)
+                self.assertIn('kernel', str(raised.exception))
+
+    def test_ready_bound_ignores_environment_override(self):
+        bogus = {'CANARY_READY_SECONDS': '999', 'CANARY_READY_BOUND_SECONDS': '999',
+                 'READY_SECONDS': '999', 'P11SCOPE_READY_SECONDS': '999'}
+        with patch.dict(os.environ, bogus):
+            self.assertEqual(capture.ready_bound_seconds('6.6.157-ready-bound-test'), 8)
+            self.assertEqual(capture.ready_bound_seconds('5.15.221-ready-bound-test'), 30)
+            with self.assertRaises(capture.CaptureError):
+                capture.ready_bound_seconds('5.4.0')
+
+    def test_ready_bound_unknown_kernel_run_refuses_before_launch(self):
+        for release in ('5.4.0-ready-bound-test', '6.5.0-ready-bound-test'):
+            with self.subTest(release=release), tempfile.TemporaryDirectory() as directory:
+                config = config_for(os.getpid(), directory)
+                with kernel_release(release), \
+                        patch.object(c.Custody, 'launch') as launched:
+                    with self.assertRaises(capture.CaptureError) as raised:
+                        capture.capture(config, FakeMaps(config))
+                    launched.assert_not_called()
+                self.assertIn('kernel', str(raised.exception))
+                self.assertFalse(config.observer_log.exists())
+
+    def ready_bound_probe(self, spec, timeout):
+        """ready_bound_case driver with a guard beyond probe()'s 12 s.
+
+        The 8 s and 30 s bounds need wall-clock runs: only a real expiry
+        proves the coordinator waited the full declared bound instead of
+        failing early (or hanging past it).
+        """
+        old = c._subreaper()
+        c._subreaper(1)
+        child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(90)'])
+        outside = os.pidfd_open(child.pid)
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                command = ['timeout', '--kill-after=1s', f'{timeout}s',
+                           sys.executable, '-I', __file__, '--probe', 'ready_bound:' + spec,
+                           str(child.pid), directory]
+                result = subprocess.run(command, capture_output=True, text=True, timeout=timeout + 10)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertFalse(select.select([outside], [], [], 0)[0])
+                self.assertEqual(c._children(os.getpid(), [os.getpid()], time.monotonic() + 1), [child.pid])
+        finally:
+            try:
+                signal.pidfd_send_signal(outside, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            child.wait(timeout=2)
+            os.close(outside)
+            end = time.monotonic() + 2
+            while time.monotonic() < end:
+                pids = c._children(os.getpid(), [os.getpid()], end)
+                if not pids:
+                    break
+                wave = [(pid, os.pidfd_open(pid)) for pid in pids]
+                try:
+                    for _, fd in wave:
+                        signal.pidfd_send_signal(fd, signal.SIGKILL)
+                    for pid, fd in wave:
+                        assert select.select([fd], [], [], max(0, end - time.monotonic()))[0]
+                        assert os.waitid(os.P_PIDFD, fd, os.WEXITED | os.WNOHANG).si_pid == pid
+                finally:
+                    for _, fd in wave:
+                        os.close(fd)
+            c._subreaper(old)
+
+    def test_ready_bound_515_run_within_30s_passes(self):
+        self.probe('ready_bound:pass_515')
+
+    def test_ready_bound_66_run_over_8s_still_fails(self):
+        self.ready_bound_probe('fail_66', 16)
+
+    def test_ready_bound_515_run_over_30s_fails(self):
+        self.ready_bound_probe('fail_515', 45)
+
 
 CASES = (
     ['native:' + lane for lane in ('aggregate-only-metrics', 'default-safe-profile', 'default-safe-trace',
@@ -2091,6 +2243,8 @@ if __name__ == '__main__':
             owned_case(int(sys.argv[3]), sys.argv[4], sys.argv[2][6:], sys.argv[5], sys.argv[6])
         elif sys.argv[2].startswith('case:'):
             coordinator_case(int(sys.argv[3]), sys.argv[4], sys.argv[2][5:])
+        elif sys.argv[2].startswith('ready_bound:'):
+            ready_bound_case(int(sys.argv[3]), sys.argv[4], sys.argv[2][len('ready_bound:'):])
         else:
             globals()[sys.argv[2]](int(sys.argv[3]), sys.argv[4])
     else:

@@ -16056,7 +16056,7 @@ impl Engine {
                 .exports
                 .iter()
                 .filter(|name| {
-                    session.capture_policy() != CapturePolicy::AggregateOnly
+                    !session.capture_policy().is_aggregate()
                         || self.hooks.abi(name) != Some(HookAbi::Interface)
                 })
                 .collect();

@@ -2346,7 +2346,7 @@ impl Session {
                     .map_err(|_| anyhow::anyhow!("private counter preparation backend mismatch"))?;
                 let (mut session, prepared_instance) = Self::prepare_inner_unlinked_with_object(
                     scope,
-                    CapturePolicy::AggregateOnly,
+                    CapturePolicy::Counter(CounterMode::Counts),
                     None,
                     None,
                     None,
@@ -2395,7 +2395,7 @@ impl Session {
         let preparation = CounterPreparation::new(object, reservation, reserve)?;
         let (mut session, prepared_instance) = Self::prepare_inner_unlinked_with_object(
             scope,
-            CapturePolicy::AggregateOnly,
+            CapturePolicy::Counter(CounterMode::Counts),
             None,
             None,
             None,

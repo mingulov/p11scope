@@ -911,7 +911,7 @@ impl CapturePolicy {
     }
 
     pub const fn uses_events(self) -> bool {
-        !matches!(self, Self::AggregateOnly)
+        !self.is_aggregate()
     }
 
     pub const fn is_aggregate(self) -> bool {
@@ -3091,7 +3091,7 @@ fn group_static_slots_with_roots(
     roots: StaticRoots,
 ) -> Result<Vec<StaticGroup>> {
     if roots == StaticRoots::CounterBanks {
-        if policy != CapturePolicy::AggregateOnly || object_has_unsafe {
+        if !matches!(policy, CapturePolicy::Counter(_)) || object_has_unsafe {
             bail!("private Counts grouping requires its fixed aggregate-only roots");
         }
         for slot in slots {
@@ -3914,7 +3914,7 @@ fn attach_targets_observed_with_roots(
         .map(|slot| abi_for(slot).map(|abi| (slot, abi)))
         .collect::<Result<Vec<_>>>()?;
     if roots == StaticRoots::CounterBanks
-        && (policy != CapturePolicy::AggregateOnly
+        && (!matches!(policy, CapturePolicy::Counter(_))
             || object_has_unsafe
             || targets.iter().any(|(_, abi)| *abi != ElfAbi::Lp64))
     {

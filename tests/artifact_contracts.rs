@@ -573,17 +573,16 @@ fn assert_hosted_bpf_noninterference(ci: &str) -> Result<(), String> {
         "    runs-on: ubuntu-24.04\n",
         "          fetch-depth: 0\n",
         "rustup toolchain install \"$(cat .release-rust-version)\" --profile minimal",
-        "rustup toolchain install 1.98.1 --profile minimal",
         "rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src",
         "apt-get install -y clang-18 gcc libseccomp-dev llvm python3",
         "install bpf-linker --version \"$CI_TOOL_BPF_LINKER\" --locked",
         "- name: Install packaged bpftool",
         "set -euo pipefail",
-        "BASELINE=68c258cf54d736370e214172d187d7d3905a8bb5",
+        "BASELINE=ef896389717739f3859a76f54cf46072cbd1448f",
         "python3 -I scripts/check-bpf-noninterference.py \\",
         "--repo \"$GITHUB_WORKSPACE\" --baseline \"$BASELINE\" --candidate \"$BASELINE\"",
         "--repo \"$GITHUB_WORKSPACE\" --baseline \"$BASELINE\" --candidate \"$GITHUB_SHA\"",
-        "--work \"$comparison_root/integration\" --host-compiler-transition",
+        "--work \"$comparison_root/integration\"\n",
         "test -s \"$comparison_root/repeat-baseline/comparison.json\"",
         "test -s \"$comparison_root/integration/comparison.json\"",
         "        if: ${{ !cancelled() }}\n        uses: actions/upload-artifact@",
@@ -608,9 +607,9 @@ fn assert_hosted_bpf_noninterference(ci: &str) -> Result<(), String> {
             "BPF comparison must execute exactly the control and integration driver".into(),
         );
     }
-    if block.matches("--host-compiler-transition").count() != 1 {
+    if block.contains("--host-compiler-transition") {
         return Err(
-            "only the integration comparison may select the host compiler transition".into(),
+            "the removed host compiler transition must not appear in the comparison".into(),
         );
     }
     Ok(())
@@ -8903,11 +8902,10 @@ fn hosted_pipeline_requires_exact_default_bpf_comparison() {
         "needs: [dedupe, tests]",
         "!cancelled() && needs.dedupe.outputs.run == 'true'",
         "fetch-depth: 0",
-        "BASELINE=68c258cf54d736370e214172d187d7d3905a8bb5",
-        "rustup toolchain install 1.98.1 --profile minimal",
-        "--host-compiler-transition",
+        "BASELINE=ef896389717739f3859a76f54cf46072cbd1448f",
         "--repeat-baseline",
         "--candidate \"$GITHUB_SHA\"",
+        "--work \"$comparison_root/integration\"\n",
         "test -s \"$comparison_root/integration/comparison.json\"",
         "${{ runner.temp }}/bpf-noninterference/*/candidate/",
     ] {
@@ -8918,6 +8916,15 @@ fn hosted_pipeline_requires_exact_default_bpf_comparison() {
             "removing {marker:?} must reject the comparison job"
         );
     }
+    let revived = ci.replacen(
+        "--work \"$comparison_root/integration\"\n",
+        "--work \"$comparison_root/integration\" --host-compiler-transition\n",
+        1,
+    );
+    assert!(
+        assert_hosted_bpf_noninterference(&revived).is_err(),
+        "reviving the removed host compiler transition must reject the comparison job"
+    );
     let prepare = r#"command(["python3", "-I", "scripts/prepare-dependencies.py"]"#;
     let fetch = r#""fetch", "--locked", "--manifest-path", str(logical / "Cargo.toml")"#;
     for marker in [

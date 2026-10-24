@@ -350,7 +350,6 @@ jobs:
         with:
           fetch-depth: 0
       - run: rustup toolchain install "$(cat .release-rust-version)" --profile minimal
-      - run: rustup toolchain install 1.98.1 --profile minimal
       - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
       - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc libseccomp-dev llvm python3
       - run: cargo +"$(cat .release-rust-version)" install bpf-linker --version "$CI_TOOL_BPF_LINKER" --locked
@@ -382,7 +381,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          BASELINE=68c258cf54d736370e214172d187d7d3905a8bb5
+          BASELINE=ef896389717739f3859a76f54cf46072cbd1448f
           comparison_root="$RUNNER_TEMP/bpf-noninterference"
           mkdir -m 700 "$comparison_root"
           python3 -I scripts/check-bpf-noninterference.py \
@@ -390,7 +389,7 @@ jobs:
             --work "$comparison_root/repeat-baseline" --repeat-baseline
           python3 -I scripts/check-bpf-noninterference.py \
             --repo "$GITHUB_WORKSPACE" --baseline "$BASELINE" --candidate "$GITHUB_SHA" \
-            --work "$comparison_root/integration" --host-compiler-transition
+            --work "$comparison_root/integration"
           test -s "$comparison_root/repeat-baseline/comparison.json"
           test -s "$comparison_root/integration/comparison.json"
       - name: Retain available comparison evidence

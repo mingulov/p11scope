@@ -198,7 +198,7 @@ static INLINE void increment(u64 *cell)
  * last bucket, so a pathologically long call is still counted. The
  * unrolled chain keeps every bound a constant; the explicit clamp before
  * indexing is what the object checker's single clamp/index proof reads. */
-static INLINE u32 bank_bucket(u64 delta)
+static INLINE __attribute__((unused)) u32 bank_bucket(u64 delta)
 {
     u32 bucket;
     if (delta >= (1ULL << 31))

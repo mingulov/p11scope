@@ -799,6 +799,8 @@ impl MutationCount {
 /// which the fence always refuses. `Clone` mints a fresh token, so no
 /// whole-plan replacement can replay an old fence. Transparent to plan
 /// equality; prints nothing.
+// consumed by T4: read only by the plan fence until the graph polls it.
+#[allow(dead_code)]
 struct PlanToken(u64);
 
 /// Token value the plan fence always refuses: minted only when the token
@@ -2320,6 +2322,8 @@ impl<N: Ord + Clone, S: Ord + Clone> OccurrenceCounter<N, S> {
         self.targets.len() + self.skips.len()
     }
 
+    // consumed by T4: the cursor clears the counter per group; merge never does.
+    #[allow(dead_code)]
     fn clear(&mut self) {
         self.targets.clear();
         self.skips.clear();
@@ -3826,6 +3830,8 @@ struct PlanFence {
     skipped: usize,
 }
 
+// consumed by T4: the fence runs only inside the cursor poll.
+#[allow(dead_code)]
 impl PlanFence {
     /// Snapshots the fenced members. A poisoned token refuses at once, before
     /// any derivation step runs.
@@ -3854,6 +3860,8 @@ impl PlanFence {
 /// Byte accounting mirrors `discovery::identity`'s conservative-copy
 /// accounting, which is private to that module: every owned allocation below
 /// is covered by the one measured reservation before it happens.
+// consumed by T4: used only by the cursor measure phase.
+#[allow(dead_code)]
 fn plan_bytes_for<T>(count: usize) -> Result<usize, GraphRefusal> {
     count
         .checked_mul(std::mem::size_of::<T>())
@@ -3861,15 +3869,21 @@ fn plan_bytes_for<T>(count: usize) -> Result<usize, GraphRefusal> {
         .ok_or(GraphRefusal::Overflow)
 }
 
+// consumed by T4: used only by the cursor measure phase.
+#[allow(dead_code)]
 fn plan_byte_len(len: usize) -> Result<usize, GraphRefusal> {
     len.checked_add(OWNED_ALLOCATION_PADDING)
         .ok_or(GraphRefusal::Overflow)
 }
 
+// consumed by T4: used only by the cursor measure phase.
+#[allow(dead_code)]
 fn plan_text_bytes(text: &str) -> Result<usize, GraphRefusal> {
     plan_byte_len(text.len())
 }
 
+// consumed by T4: used only by the cursor measure phase.
+#[allow(dead_code)]
 fn plan_tree_bytes<K, V>(entries: usize) -> Result<usize, GraphRefusal> {
     fn align8(bytes: usize) -> Option<usize> {
         bytes.checked_add(7).map(|value| value & !7)
@@ -3898,11 +3912,15 @@ fn plan_tree_bytes<K, V>(entries: usize) -> Result<usize, GraphRefusal> {
         .ok_or(GraphRefusal::Overflow)
 }
 
+// consumed by T4: used only by the cursor measure phase.
+#[allow(dead_code)]
 fn plan_add(total: &mut usize, bytes: usize) -> Result<(), GraphRefusal> {
     *total = total.checked_add(bytes).ok_or(GraphRefusal::Overflow)?;
     Ok(())
 }
 
+// consumed by T4: used only by the cursor copy/retire phases.
+#[allow(dead_code)]
 fn next_after<K: Ord + Clone, V: Clone>(map: &BTreeMap<K, V>, after: &Option<K>) -> Option<(K, V)> {
     use std::ops::Bound::{Excluded, Unbounded};
     match after {
@@ -3912,6 +3930,8 @@ fn next_after<K: Ord + Clone, V: Clone>(map: &BTreeMap<K, V>, after: &Option<K>)
     .map(|(key, value)| (key.clone(), value.clone()))
 }
 
+// consumed by T4: constructed only by graph callers and cursor tests.
+#[allow(dead_code)]
 pub(crate) struct ConservativePlanSources<'a> {
     modules: &'a [ReconciledModule],
     manifests: &'a [Manifest],
@@ -3919,6 +3939,8 @@ pub(crate) struct ConservativePlanSources<'a> {
     broad_admit: bool,
 }
 
+// consumed by T4: constructed only by graph callers and cursor tests.
+#[allow(dead_code)]
 impl<'a> ConservativePlanSources<'a> {
     pub(crate) fn new(
         modules: &'a [ReconciledModule],
@@ -3946,6 +3968,8 @@ pub(crate) struct InstalledPlanBacking {
 /// resume across credits without retaining source borrows. Targets are kept
 /// only as occurrence-count triples plus their keys: names feed the
 /// occurrence recount, keys feed the live set.
+// consumed by T4: read only inside the cursor derivation.
+#[allow(dead_code)]
 struct OwnedPiece {
     object: PinnedObjectId,
     key: ObjectKey,
@@ -3958,6 +3982,8 @@ struct OwnedPiece {
     skipped: Vec<Skipped>,
 }
 
+// consumed by T4: called only by the cursor lowering phase.
+#[allow(dead_code)]
 fn own_piece(piece: Discovered<'_>) -> OwnedPiece {
     OwnedPiece {
         object: piece.object,
@@ -3977,6 +4003,8 @@ fn own_piece(piece: Discovered<'_>) -> OwnedPiece {
 }
 
 /// One old plan module, cached for the slot remap and refusal attribution.
+// consumed by T4: read only inside the cursor derivation.
+#[allow(dead_code)]
 struct OldModuleInfo {
     id: ModuleId,
     object: PinnedObjectId,
@@ -3984,6 +4012,8 @@ struct OldModuleInfo {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+// consumed by T4: transitioned only inside the cursor derivation.
+#[allow(dead_code)]
 enum ConservativePlanPhase {
     New,
     Measure,
@@ -4003,6 +4033,8 @@ enum ConservativePlanPhase {
     Reclaimed,
 }
 
+// consumed by T4: driven only by graph callers and cursor tests.
+#[allow(dead_code)]
 pub(crate) struct ConservativePlanCursor {
     phase: ConservativePlanPhase,
     fence: Option<PlanFence>,
@@ -4089,6 +4121,8 @@ pub(crate) struct ConservativePlanCursor {
     reclaim_step: u8,
 }
 
+// consumed by T4: driven only by graph callers and cursor tests.
+#[allow(dead_code)]
 impl ConservativePlanCursor {
     pub(crate) fn new() -> Self {
         Self {
@@ -4199,6 +4233,8 @@ impl ConservativePlanCursor {
     }
 }
 
+// consumed by T4: polled only by graph callers and cursor tests.
+#[allow(dead_code)]
 impl AttachPlan {
     /// Removal-only rebuild of this plan from surviving sources, one bounded
     /// step per credit. See the [`ConservativePlanCursor`] docs for the
@@ -4257,6 +4293,8 @@ impl AttachPlan {
     }
 }
 
+// consumed by T4: stepped only inside the cursor derivation.
+#[allow(dead_code)]
 impl ConservativePlanCursor {
     /// One bounded derivation step. Returns `true` exactly when the step
     /// reached `Ready`.
@@ -5319,7 +5357,7 @@ impl ConservativePlanCursor {
     fn reclaim_one(&mut self) -> bool {
         match self.reclaim_step {
             0 => {
-                let done = match self.output.as_mut().or_else(|| self.old.as_mut()) {
+                let done = match self.output.as_mut().or(self.old.as_mut()) {
                     Some(plan) => Self::drain_vec(&mut plan.slots),
                     None => true,
                 };
@@ -5329,7 +5367,7 @@ impl ConservativePlanCursor {
                 false
             }
             1 => {
-                let done = match self.output.as_mut().or_else(|| self.old.as_mut()) {
+                let done = match self.output.as_mut().or(self.old.as_mut()) {
                     Some(plan) => Self::drain_vec(&mut plan.modules),
                     None => true,
                 };
@@ -5339,7 +5377,7 @@ impl ConservativePlanCursor {
                 false
             }
             2 => {
-                let done = match self.output.as_mut().or_else(|| self.old.as_mut()) {
+                let done = match self.output.as_mut().or(self.old.as_mut()) {
                     Some(plan) => Self::drain_vec(&mut plan.skipped),
                     None => true,
                 };
@@ -5349,7 +5387,7 @@ impl ConservativePlanCursor {
                 false
             }
             3 => {
-                let done = match self.output.as_mut().or_else(|| self.old.as_mut()) {
+                let done = match self.output.as_mut().or(self.old.as_mut()) {
                     Some(plan) => Self::drain_vec(&mut plan.modules_skipped),
                     None => true,
                 };
@@ -5359,7 +5397,7 @@ impl ConservativePlanCursor {
                 false
             }
             4 => {
-                let done = match self.output.as_mut().or_else(|| self.old.as_mut()) {
+                let done = match self.output.as_mut().or(self.old.as_mut()) {
                     Some(plan) => Self::drain_vec(&mut plan.surfaces),
                     None => true,
                 };
@@ -5369,14 +5407,14 @@ impl ConservativePlanCursor {
                 false
             }
             5 => {
-                if let Some(plan) = self.output.as_mut().or_else(|| self.old.as_mut()) {
+                if let Some(plan) = self.output.as_mut().or(self.old.as_mut()) {
                     plan.aggregate_owners = Vec::new();
                 }
                 self.reclaim_step += 1;
                 false
             }
             6 => {
-                let done = match self.output.as_mut().or_else(|| self.old.as_mut()) {
+                let done = match self.output.as_mut().or(self.old.as_mut()) {
                     Some(plan) => Self::drain_map(&mut plan.slot_by_key),
                     None => true,
                 };
@@ -5386,7 +5424,7 @@ impl ConservativePlanCursor {
                 false
             }
             7 => {
-                let done = match self.output.as_mut().or_else(|| self.old.as_mut()) {
+                let done = match self.output.as_mut().or(self.old.as_mut()) {
                     Some(plan) => Self::drain_set(&mut plan.retired_slots),
                     None => true,
                 };
@@ -5396,7 +5434,7 @@ impl ConservativePlanCursor {
                 false
             }
             8 => {
-                let done = match self.output.as_mut().or_else(|| self.old.as_mut()) {
+                let done = match self.output.as_mut().or(self.old.as_mut()) {
                     Some(plan) => Self::drain_map(&mut plan.slot_ordinals),
                     None => true,
                 };
@@ -5406,7 +5444,7 @@ impl ConservativePlanCursor {
                 false
             }
             9 => {
-                let done = match self.output.as_mut().or_else(|| self.old.as_mut()) {
+                let done = match self.output.as_mut().or(self.old.as_mut()) {
                     Some(plan) => Self::drain_map(&mut plan.object_identities),
                     None => true,
                 };
@@ -5416,7 +5454,7 @@ impl ConservativePlanCursor {
                 false
             }
             10 => {
-                let done = match self.output.as_mut().or_else(|| self.old.as_mut()) {
+                let done = match self.output.as_mut().or(self.old.as_mut()) {
                     Some(plan) => Self::drain_map(&mut plan.provisional_get_function_list),
                     None => true,
                 };
@@ -5426,7 +5464,7 @@ impl ConservativePlanCursor {
                 false
             }
             11 => {
-                let done = match self.output.as_mut().or_else(|| self.old.as_mut()) {
+                let done = match self.output.as_mut().or(self.old.as_mut()) {
                     Some(plan) => Self::drain_vec(&mut plan.refused_module_objects),
                     None => true,
                 };
@@ -5436,7 +5474,7 @@ impl ConservativePlanCursor {
                 false
             }
             12 => {
-                if let Some(plan) = self.output.as_mut().or_else(|| self.old.as_mut()) {
+                if let Some(plan) = self.output.as_mut().or(self.old.as_mut()) {
                     plan.interface_list = String::new();
                 }
                 self.output = None;
@@ -5692,6 +5730,8 @@ impl ConservativePlanCursor {
 
 /// Upper-bound label bytes for one manifest surface summary, read from the
 /// source records without allocating.
+// consumed by T4: used only by the cursor measure phase.
+#[allow(dead_code)]
 fn manifest_surface_label_bytes(
     surface: &p11scope_manifest::manifest::SurfaceRecord,
 ) -> (usize, usize, usize) {

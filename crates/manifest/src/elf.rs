@@ -94,6 +94,20 @@ fn validated_segment_ranges(
     Ok(executable_ranges)
 }
 
+/// `classified_object` plus the snapshot's segment-range validation, with
+/// the executable file ranges the parse produced. Every export walk goes
+/// through here so corrupt headers refuse before any address translation.
+/// The snapshot constructor keeps its own order (interpreter first) and does
+/// not use this entry, preserving its error precedence for doubly-corrupt
+/// images.
+pub(crate) fn classified_validated_object(
+    data: &[u8],
+) -> Result<(object::File<'_>, ElfAbi, Vec<(u64, u64)>), String> {
+    let (object, abi) = classified_object(data)?;
+    let executable_ranges = validated_segment_ranges(&object, data.len() as u64)?;
+    Ok((object, abi, executable_ranges))
+}
+
 fn file_offset(object: &object::File<'_>, address: u64) -> Option<u64> {
     object.segments().find_map(|segment| {
         let start = segment.address();
@@ -284,7 +298,9 @@ impl ElfSnapshot {
     }
 
     pub fn exports_matching(&self, wanted: &[&str]) -> Result<Vec<(String, u64)>, String> {
-        let object = parse(&self.data)?;
+        // The bytes were validated at construction, so the shared validation
+        // always passes here; the walk still goes through the one entry.
+        let (object, _, _) = classified_validated_object(&self.data)?;
         Ok(exports_matching_in_object(&object, wanted))
     }
 }
@@ -360,10 +376,9 @@ fn export_facts_from_mmap(
     mmap: &memmap2::Mmap,
     wanted: &[&str],
 ) -> Result<(ElfAbi, Vec<(String, u64)>, u64 /* charged_bytes */), String> {
-    let (object, abi) = classified_object(mmap)?;
     // The same segment-range validation the snapshot applies: without it,
     // `file_offset` translates through corrupt headers to offsets past EOF.
-    validated_segment_ranges(&object, mmap.len() as u64)?;
+    let (object, abi, _) = classified_validated_object(mmap)?;
     let exports = exports_matching_in_object(&object, wanted);
     Ok((abi, exports, export_table_bytes(&object, mmap.len() as u64)))
 }

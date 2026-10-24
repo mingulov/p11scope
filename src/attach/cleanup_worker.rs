@@ -1077,6 +1077,7 @@ impl CleanupWorker {
     /// time and asks the worker to exit, then this reports pending
     /// until the worker thread has actually finished. Completion is
     /// decided only by the reaped thread, never by `is_done`.
+    #[allow(dead_code)] // Awaiting its production caller: the non-consuming owned-detach poll.
     pub(crate) fn try_join(&mut self) -> Option<CleanupReceipt> {
         if !self.shutdown_sent {
             self.shutdown_sent = true;

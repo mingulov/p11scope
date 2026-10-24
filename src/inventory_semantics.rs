@@ -596,6 +596,11 @@ pub(crate) trait LaneTestIo {
     }
     /// The exact targets the production driver selected for this tick.
     fn tick_targets(&mut self, _pins: &[Arc<PidPin>]) {}
+    /// First-drain stamp of a retained image, for registration
+    /// backdating. Test owners without a real H0 retain nothing.
+    fn retained_registration_ns(&self, _image: ImageIdentity) -> Option<u64> {
+        None
+    }
     /// Substitute Session attachment I/O, retaining the production subset
     /// matching and owner receipt checks around it.
     fn validate_attachment(&mut self, _subset: &AttestedSubset) -> Result<(), SemanticRefusal> {
@@ -1195,6 +1200,20 @@ impl AttestedSemanticLane {
             #[cfg(test)]
             last_conversion_barrier: None,
         })
+    }
+
+    /// First-drain stamp of a retained image, for registration
+    /// backdating: the calls were observed then, even though the binding
+    /// proof only completed later. `None` for images that were never
+    /// retained (including every pre-attach image, which sheds at once).
+    pub(crate) fn retained_registration_ns(&self, image: ImageIdentity) -> Option<u64> {
+        #[cfg(test)]
+        if let Some(io) = &self.test_io {
+            return io.retained_registration_ns(image);
+        }
+        self.live
+            .as_ref()
+            .and_then(|live| live.capture.retained_registration_ns(image))
     }
 
     /// Lane-stash pending floor for the finalizer's disposition: the

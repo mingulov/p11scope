@@ -12,7 +12,8 @@ use crate::discovery::instances::{
     Route, RouterLimits, UnknownReason,
 };
 use crate::events::DecodedEventRecord;
-use crate::process::PidPin;
+use crate::discovery::caller_registry::now_ns;
+use crate::process::{PidPin, process_start_time};
 use crate::semantics_objects::journal::joint_driver::{CollectedCallOrigin, H0Delivery};
 use crate::semantics_objects::journal::{
     BirthKind, BootstrapReceipt, JournalAdapter, JournalBirthCut, JournalDomainProof,
@@ -1213,6 +1214,18 @@ pub(crate) struct SemanticCapture {
     awaiting: BTreeMap<u64, Awaiting>,
     jobs: VecDeque<ScanJob>,
     bindings: BTreeMap<u64, TaskBinding>,
+    /// Post-attach retention cutover (clock ticks since boot, rounded up
+    /// at construction). `None` disables retention: every pin-less drain
+    /// sheds immediately, exactly as before.
+    retention_attach_ticks: Option<u64>,
+    /// Pin-less images held for the imminent binding: first-drain
+    /// monotonic ns per image, for registration backdating. Membership
+    /// only; the records wait in `awaiting`/router-pending under the
+    /// existing pending budget. Entries leave only when their records
+    /// are gone and no binding holds the cookie, so a joined image keeps
+    /// its drain stamp for conversion; at most one entry per pending or
+    /// bound image.
+    retained: BTreeMap<(u64, u64), u64>,
     terminal_cursor: u64,
     /// Fairness among tick-local Joined partitions when Pending scans leave
     /// fewer scan slots than the later calls need. This carries no authority.
@@ -1232,6 +1245,29 @@ pub(crate) type PendingH3Original<'a> = (
     Option<crate::semantics_objects::journal::joint_driver::JointResourceOrigin>,
 );
 static NEXT_SEMANTIC_CAPTURE: AtomicU64 = AtomicU64::new(0);
+
+/// Lane-attach cutover in clock ticks since boot: `/proc/uptime` read at
+/// H0 construction (production constructs H0 right after the session
+/// attaches), rounded up to whole ticks. A task whose `/proc` start time
+/// is strictly later provably started after attach; both readings share
+/// the boot-time basis. `None` (unreadable clock) disables retention,
+/// failing closed to immediate shed.
+pub(crate) fn current_uptime_ticks() -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/uptime").ok()?;
+    let secs: f64 = text.split_ascii_whitespace().next()?.parse().ok()?;
+    // SAFETY: sysconf with _SC_CLK_TCK only reads a constant.
+    let per_sec: u64 = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }
+        .try_into()
+        .ok()
+        .filter(|tps| *tps > 0)?;
+    let ticks = (secs * per_sec as f64).ceil();
+    if ticks.is_finite() && ticks >= 0.0 {
+        Some(ticks as u64)
+    } else {
+        None
+    }
+}
+
 impl SemanticCapture {
     pub(crate) fn new(session: &Session, limits: TickLimits) -> anyhow::Result<Self> {
         let domain = session
@@ -1267,6 +1303,8 @@ impl SemanticCapture {
             awaiting: BTreeMap::new(),
             jobs: VecDeque::new(),
             bindings: BTreeMap::new(),
+            retention_attach_ticks: current_uptime_ticks(),
+            retained: BTreeMap::new(),
             terminal_cursor: 0,
             joined_refresh_cursor: None,
             fault: 0,
@@ -2562,6 +2600,40 @@ impl SemanticCapture {
         self.resolve(resolved, report);
     }
 
+    /// Hold one drained pin-less image iff its task provably started
+    /// after the lane attached: the fresh `/proc` start time (clock
+    /// ticks, the same basis as the cutover) is strictly later. A pid
+    /// reused between the BPF record and this read observes another
+    /// task's start, but the later join still requires the full image
+    /// (cookie plus exec) to match the bound scan proof, and cookies are
+    /// never reused, so a wrongly held image never joins: it waits under
+    /// the pending budget until stop. Unreadable or older tasks return
+    /// false and shed exactly as before.
+    fn retain_post_attach(&mut self, pid: u32, image: ImageIdentity) -> bool {
+        let Some(attach) = self.retention_attach_ticks else {
+            return false;
+        };
+        let Ok(start) = process_start_time(pid) else {
+            return false;
+        };
+        if start <= attach {
+            return false;
+        }
+        self.retained
+            .entry((image.task_cookie, image.exec_id))
+            .or_insert_with(now_ns);
+        true
+    }
+
+    /// First-drain stamp of a retained image, for registration
+    /// backdating: the batch observed the calls then, even though the
+    /// binding proof only completed later.
+    pub(crate) fn retained_registration_ns(&self, image: ImageIdentity) -> Option<u64> {
+        self.retained
+            .get(&(image.task_cookie, image.exec_id))
+            .copied()
+    }
+
     fn refuse_binding(&mut self, image: ImageIdentity, report: &mut TickReport) {
         let resolved = self.router.refuse_image_pending(
             self.router.domain(),
@@ -2965,8 +3037,14 @@ impl SemanticCapture {
                 self.refuse_binding(image, &mut report);
                 continue;
             }
-            let Some(pin) = io.target((record.base.event.pid_tgid >> 32) as u32) else {
-                self.expire(image, &mut report);
+            let pid = (record.base.event.pid_tgid >> 32) as u32;
+            let Some(pin) = io.target(pid) else {
+                // No binding pin yet: a task that provably started after
+                // the lane attached holds its first burst for the imminent
+                // binding; everything else sheds exactly as before (R-34).
+                if !self.retain_post_attach(pid, image) {
+                    self.expire(image, &mut report);
+                }
                 continue;
             };
             let endpoint = endpoint.expect("checked owned endpoint");
@@ -2997,6 +3075,21 @@ impl SemanticCapture {
             self.expire(image, &mut report);
         }
         self.prune_jobs();
+        // Retained images with no records left and no binding holding the
+        // cookie are gone (shed without ever binding); the rest keep
+        // waiting for their binding's scan proof, and joined images keep
+        // their drain stamp for conversion.
+        let awaited: BTreeSet<(u64, u64)> = self
+            .awaiting
+            .values()
+            .map(|waiting| {
+                let image = waiting.record.base.event.image;
+                (image.task_cookie, image.exec_id)
+            })
+            .collect();
+        self.retained.retain(|key, _| {
+            awaited.contains(key) || self.bindings.contains_key(&key.0)
+        });
         // Visit each initial queued job at most once. Refused peers rotate.
         let attempts = self.limits.scans.min(self.jobs.len());
         let mut attempted_keys = BTreeSet::new();
@@ -3127,6 +3220,7 @@ impl SemanticCapture {
             self.expire(image, report);
         }
         self.jobs.clear();
+        self.retained.clear();
         self.stamp_disposition(report);
     }
 }

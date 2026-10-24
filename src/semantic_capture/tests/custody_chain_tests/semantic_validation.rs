@@ -414,6 +414,10 @@ impl LaneTestIo for SharedH0 {
         self.0.borrow().stash.min_outcome_position()
     }
 
+    fn retained_registration_ns(&self, image: ImageIdentity) -> Option<u64> {
+        self.0.borrow().capture.retained_registration_ns(image)
+    }
+
     fn inspect_pending_h3(
         &self,
         inspect: &mut dyn FnMut(

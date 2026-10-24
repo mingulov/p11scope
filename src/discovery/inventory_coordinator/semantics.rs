@@ -2982,6 +2982,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     continue;
                 };
                 let caller = binding.caller();
+                // A retained image's calls were first observed at its
+                // drain, passes before this batch: stamp the registration
+                // then, so a fully joined post-attach burst does not
+                // disclose a boundary gap it never crossed. Never postdate.
+                let observed = lane
+                    .retained_registration_ns(binding.image())
+                    .map_or(observed_ns, |drained| drained.min(observed_ns));
                 coverage
                     .instances()
                     .iter()
@@ -2993,7 +3000,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                                 binding,
                                 lane.subset(),
                                 *id,
-                                observed_ns,
+                                observed,
                                 None,
                             ),
                         )

@@ -302,6 +302,25 @@ class IgnoredTestsTests(unittest.TestCase):
         self.assertIn("f::t_nope", result.stdout)
         self.assertIn("WIDE_DETAILED_2112_TESTS", result.stdout)
 
+    def test_wide_member_from_non_privileged_expansion_fails(self):
+        # Only a privileged macro entry owns the wide campaign: a
+        # feature-gated expansion of a performance-gated macro must not
+        # satisfy a WIDE list member.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sources = {"src/lib.rs": "mod m;\n", "src/m.rs": M_RS}
+            entries = [
+                {"file": "src/m.rs", "path": "m::sweep!",
+                 "reason": "performance: sweep cell",
+                 "cell": "performance"},
+            ]
+            write_fixture(root, sources, entries, [], ["m::t_wide"])
+            result = run_checker(root)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("m::t_wide", result.stdout)
+        self.assertIn("not a wide-owned inventory site or a "
+                      "feature-gated expansion", result.stdout)
+
     def test_feature_entry_without_owner_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

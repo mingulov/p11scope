@@ -606,6 +606,7 @@ def check(root=ROOT, inventory=None, runner=None):
             wide_sites.add(entry.get("path"))
         path = entry.get("path")
         if (isinstance(path, str) and path.endswith("!")
+                and entry.get("cell") == "privileged"
                 and (entry.get("file"), path) in indexed):
             stem = path[:-1]
             macro = stem.rsplit("::", 1)[-1]

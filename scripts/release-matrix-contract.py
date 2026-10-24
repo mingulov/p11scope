@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Versioned release-matrix selection and fail-closed artifact judge (stdlib only)."""
 import argparse
+import errno
 import hashlib
 import json
 import mmap
@@ -386,6 +387,7 @@ def selected_guest_device(disk):
     rows = decode(result.stdout).get("blockdevices")
     require(isinstance(rows, list), "invalid guest disk device enumeration")
     selected = []
+    skipped_unreadable = []
     for row in rows:
         require(isinstance(row, dict), "invalid guest disk device")
         if row.get("type") != "disk":
@@ -397,9 +399,32 @@ def selected_guest_device(disk):
         info = Path(path).stat()
         require(stat.S_ISBLK(info.st_mode) and number == f"{os.major(info.st_rdev)}:{os.minor(info.st_rdev)}",
                 "guest disk enumeration differs from actual block device")
-        if probe_ext4(path, disk["uuid"], allow_other=True):
+        try:
+            matched = probe_ext4(path, disk["uuid"], allow_other=True)
+        except Invalid as probe_error:
+            # An empty removable whole disk (QEMU's phantom /dev/fd0) fails
+            # the probe because the device itself cannot be opened. A blocking
+            # open is the discriminator: the floppy driver skips its media
+            # check under O_NONBLOCK, so only a blocking open reports
+            # ENXIO/ENOMEDIUM for a missing medium. Such a device cannot carry
+            # the selected filesystem, so skip and record it; a device that
+            # opens (including the expected-UUID carrier) stays strict.
+            try:
+                fd = os.open(path, os.O_RDONLY)
+            except OSError as error:
+                if error.errno not in (errno.ENXIO, errno.ENOMEDIUM):
+                    raise probe_error
+                skipped_unreadable.append(path)
+                continue
+            os.close(fd)
+            raise probe_error
+        if matched:
             selected.append({"path": path, "number": number, "device": info.st_rdev})
-    require(len(selected) == 1, "guest disk UUID/type must identify exactly one whole block device")
+    detail = "guest disk UUID/type must identify exactly one whole block device"
+    if skipped_unreadable:
+        detail += "; skipped unreadable device(s): " + ", ".join(skipped_unreadable)
+    require(len(selected) == 1, detail)
+    selected[0]["skipped_unreadable"] = skipped_unreadable
     return selected[0]
 
 

@@ -1089,6 +1089,11 @@ def owned_case(pid, directory, case, program, provider):
             assert not owner.active and all(group.closed for group in owner.groups)
         return replay(manifest, prefix)
     error = None
+    # ready_first_515 replays the immediate-ready owned pass under a faked
+    # 5.15 kernel, proving the 30 s legacy bound reaches the owned path
+    # (launch deadline and owned readiness share the resolved value).
+    bound_release = '5.15.221-ready-bound-test' if case == 'ready_first_515' else None
+    bound_output = io.StringIO()
     try:
         with ExitStack() as stack:
             if case == 'startup_threads':
@@ -1128,6 +1133,9 @@ def owned_case(pid, directory, case, program, provider):
                     opened(*args)
                     source.rings['EVENTS'].rows = [fixtures.event_bytes(0)]
                 stack.enter_context(patch.object(source, 'open_rings', side_effect=event))
+            if bound_release is not None:
+                stack.enter_context(kernel_release(bound_release))
+                stack.enter_context(contextlib.redirect_stdout(bound_output))
             try:
                 manifest = coordinator.run()
             except capture.CaptureError as caught:
@@ -1161,6 +1169,9 @@ def owned_case(pid, directory, case, program, provider):
         if case.startswith('missing_ready') or case == 'missing_capture':
             assert 'phase deadline expired' in str(error), str(error)
             assert not config.go.exists() and not source.opened_rings
+        if bound_release is not None:
+            line = f'CANARY_READY_BOUND_DECLARED kernel={bound_release} seconds=30'
+            assert line in bound_output.getvalue().splitlines(), bound_output.getvalue()
         for fd in handles:
             assert select.select([fd], [], [], 1)[0], 'owned process survived cleanup'
     finally:
@@ -2254,7 +2265,7 @@ for case in CASES:
         self.probe('case:' + case)
     setattr(StoppedCanaryCaptureTests, 'test_' + case.replace(':', '_').replace('-', '_'), test)
 
-for case in ('ready_first', 'ready_first_terminal_barrier', 'capture_first', 'ready_first_feature', 'capture_first_feature', 'startup_threads',
+for case in ('ready_first', 'ready_first_515', 'ready_first_terminal_barrier', 'capture_first', 'ready_first_feature', 'capture_first_feature', 'startup_threads',
              'death_unknown', 'death_stopped', 'wrong_executable', 'extra_child', 'stale_generation',
              'foreign_ready', 'unavailable_children', 'root_missing', 'root_invalid', 'root_control',
              'cookie', 'cookie_history', 'owner', 'start', 'events', 'observer_bad_exit',

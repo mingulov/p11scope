@@ -1893,8 +1893,9 @@ impl PinnedObjects {
 // Engine installation must first supply its own persistent backing-lease sink.
 #[allow(unused_imports)]
 pub(crate) use conservative_copy::{
-    ConservativePinSelection, GraphRefusal, GraphStep, PinnedConservativeCursor,
-    RetainedScannedInputs, ScannedRebindCursor,
+    ConservativePinSelection, GraphRefusal, GraphStep, InstalledModulesBacking,
+    InstalledPinsBacking, PinnedConservativeCursor, RetainedScannedInputs, RetiredFileHandoff,
+    ScannedInputMeasure, ScannedRebindCursor,
 };
 #[cfg(test)]
 use conservative_copy::{conservative_pin_tree_bytes, deallocate_drained_unique_arc};
@@ -1984,6 +1985,14 @@ mod conservative_copy {
 
         fn retires(&self, source: &PinnedObjects, view: ProcessViewId) -> bool {
             self.retired.contains(&view) && source.ownership.contains_key(&view)
+        }
+
+        pub(crate) fn retired(&self) -> &BTreeSet<ProcessViewId> {
+            &self.retired
+        }
+
+        pub(crate) fn rejected(&self) -> &BTreeSet<ObjectKey> {
+            &self.rejected
         }
     }
 
@@ -2311,6 +2320,7 @@ mod conservative_copy {
         Ready,
         Rebinding,
         RebindAborted,
+        Installed,
         Reclaim,
         Reclaimed,
     }
@@ -2361,6 +2371,17 @@ mod conservative_copy {
         }
     }
 
+    /// Payment for installed canonical pins: the install sink swaps the
+    /// cursor's output into the canonical and moves these leases here. They
+    /// stay charged while the canonical holds the installed output; dropping
+    /// them refunds only after the old canonical was reclaimed.
+    #[derive(Debug)]
+    pub(crate) struct InstalledPinsBacking {
+        claim_backing: Option<ResourceLease>,
+        backing: Option<ResourceLease>,
+        header: Option<ResourceLease>,
+    }
+
     /// Every output/scratch allocation stays with these leases through borrowed
     /// Ready and bounded reclamation. There is deliberately no take/swap API.
     pub(crate) struct PinnedConservativeCursor {
@@ -2392,6 +2413,7 @@ mod conservative_copy {
         reclaim_phase: u8,
         after_claim_reclaim: u8,
         rebind_owner: Option<PinCopyCacheId>,
+        installed: Option<PinCopyCacheId>,
         // A growing pin prefix stays with the SAME old H1 backing payment.
         rebind_old_pins: Option<(ProcessViewId, std::vec::IntoIter<PinnedObjectId>)>,
         // Owners above are released BEFORE the actual extra payment below.
@@ -2431,6 +2453,7 @@ mod conservative_copy {
                 reclaim_phase: 0,
                 after_claim_reclaim: 3,
                 rebind_owner: None,
+                installed: None,
                 rebind_old_pins: None,
                 claim_backing: None,
                 backing: None,
@@ -2446,6 +2469,19 @@ mod conservative_copy {
 
         pub(crate) fn skipped(&self) -> Option<&[Skipped]> {
             (self.phase == Phase::Ready).then_some(self.skipped.as_slice())
+        }
+
+        /// The copy output while the rebind loan is outstanding. `Some` only
+        /// in `Phase::Rebinding`: the graph's Plan/Facts read the loaned
+        /// output through this, never through `pinned()`.
+        pub(crate) fn loaned_output(&self) -> Option<&PinnedObjects> {
+            None
+        }
+
+        /// Upper bound on retired files the installed reclaim must hand off:
+        /// removed plus rejected entry ids. `Some` only in `Ready`/`Rebinding`.
+        pub(crate) fn retired_entry_count(&self) -> Option<usize> {
+            None
         }
 
         pub(crate) fn required_bytes(&self) -> Option<usize> {
@@ -3120,7 +3156,11 @@ mod conservative_copy {
                     }
                 }
                 Phase::Ready => {}
-                Phase::Rebinding | Phase::RebindAborted | Phase::Reclaim | Phase::Reclaimed => {
+                Phase::Rebinding
+                | Phase::RebindAborted
+                | Phase::Installed
+                | Phase::Reclaim
+                | Phase::Reclaimed => {
                     return Err(GraphRefusal::Cancelled);
                 }
             }
@@ -3163,6 +3203,33 @@ mod conservative_copy {
                 }
             }
             Ok(GraphStep::Advanced)
+        }
+
+        /// O(1) install sink: swaps the Ready copy (or the Rebinding loaned
+        /// output) into the canonical, records the installed identity, and
+        /// moves the output payment into the returned backing. The cursor's
+        /// output now holds the old canonical for `reclaim_installed`.
+        pub(crate) fn install_ready(
+            &mut self,
+            canonical: &mut PinnedObjects,
+        ) -> Result<InstalledPinsBacking, GraphRefusal> {
+            let _ = canonical;
+            Err(GraphRefusal::Identity)
+        }
+
+        /// Reclaims the old canonical (held in `output` since `install_ready`)
+        /// against the live installed canonical: live-aliased files are
+        /// released, absent files move into the handoff, never dropped.
+        pub(crate) fn reclaim_installed(
+            &mut self,
+            live: &PinnedObjects,
+            selection: &ConservativePinSelection,
+            handoff: &mut RetiredFileHandoff,
+            reserve: &SemanticResourceReserver,
+            work: usize,
+        ) -> Result<GraphStep, GraphRefusal> {
+            let _ = (live, selection, handoff, reserve, work);
+            Err(GraphRefusal::Identity)
         }
 
         fn reclaim_one(&mut self, source: Option<&PinnedObjects>) -> Result<(), GraphRefusal> {
@@ -3371,6 +3438,71 @@ mod conservative_copy {
                 .get(&id)
                 .map(|entry| entry.exports.as_ref())
         }
+
+        #[cfg(test)]
+        pub(super) fn installed_state_for_test(&self) -> (bool, bool) {
+            (self.phase == Phase::Installed, self.rebind_owner.is_none())
+        }
+
+        #[cfg(test)]
+        pub(super) fn installed_output_for_test(&self) -> Option<&PinnedObjects> {
+            (self.phase == Phase::Installed)
+                .then_some(self.output.as_ref())
+                .flatten()
+        }
+    }
+
+    /// Files-only retirement handoff: old-canonical files with no live alias
+    /// move here during installed reclaim instead of being dropped. The lane
+    /// closes them after the same Session's joined terminal detach via
+    /// `close_some`; chained graphs link through `prev`.
+    #[derive(Debug)]
+    pub(crate) struct RetiredFileHandoff {
+        files: Vec<Arc<std::fs::File>>,
+        pub(crate) prev: Option<Box<RetiredFileHandoff>>,
+        lease: Option<ResourceLease>,
+        reserved: usize,
+    }
+
+    impl RetiredFileHandoff {
+        /// One boxed handoff plus an exact `files`-slot Vec, with padding.
+        pub(crate) fn bytes(files: usize) -> usize {
+            std::mem::size_of::<Self>()
+                .saturating_add(OWNED_ALLOCATION_PADDING)
+                .saturating_add(files.saturating_mul(std::mem::size_of::<Arc<std::fs::File>>()))
+                .saturating_add(OWNED_ALLOCATION_PADDING)
+        }
+
+        /// One reservation covering the box and the exact-capacity Vec.
+        pub(crate) fn reserve(
+            files: usize,
+            reserve: &SemanticResourceReserver,
+        ) -> Result<Box<Self>, GraphRefusal> {
+            let _ = (files, reserve);
+            Ok(Box::new(Self {
+                files: Vec::new(),
+                prev: None,
+                lease: None,
+                reserved: 0,
+            }))
+        }
+
+        /// Drops at most `max` file shares, head first then the `prev` chain.
+        /// Returns true only when every link is empty.
+        pub(crate) fn close_some(&mut self, max: usize) -> bool {
+            let _ = max;
+            true
+        }
+
+        fn push(&mut self, file: &Arc<std::fs::File>) -> Result<(), ()> {
+            let _ = file;
+            Err(())
+        }
+
+        #[cfg(test)]
+        pub(super) fn len_for_test(&self) -> usize {
+            self.files.len()
+        }
     }
 
     fn claim_id(claims: &ViewClaims, bucket: u8, index: usize) -> Option<PinnedObjectId> {
@@ -3464,7 +3596,9 @@ mod conservative_copy {
         assert!(align_of::<(String, u64)>() == align_of::<ManuallyDrop<(String, u64)>>());
     };
 
-    pub(crate) use scanned_rebind::{RetainedScannedInputs, ScannedRebindCursor};
+    pub(crate) use scanned_rebind::{
+        InstalledModulesBacking, RetainedScannedInputs, ScannedInputMeasure, ScannedRebindCursor,
+    };
 
     mod scanned_rebind {
         use super::*;
@@ -3868,6 +4002,7 @@ mod conservative_copy {
             ClaimEntries,
             FinishModule,
             Ready,
+            Installed,
             Reclaim,
             Reclaimed,
         }
@@ -3879,6 +4014,40 @@ mod conservative_copy {
             revision: u64,
             version: u64,
             changed: bool,
+        }
+
+        /// Stateful input measurer over scanned rows: one field group or
+        /// element per `step` credit. The rebind cursor drives it during
+        /// measurement; the Engine's RawCopy phase drives it directly.
+        pub(crate) struct ScannedInputMeasure {
+            bytes: usize,
+        }
+
+        impl ScannedInputMeasure {
+            pub(crate) fn new(rows: usize) -> Result<Self, GraphRefusal> {
+                let _ = rows;
+                Ok(Self { bytes: 0 })
+            }
+
+            /// Measures one field group or element of `source`; true when
+            /// this module is fully measured.
+            pub(crate) fn step(&mut self, source: &ScannedModule) -> Result<bool, GraphRefusal> {
+                let _ = source;
+                Ok(true)
+            }
+
+            pub(crate) fn bytes(&self) -> usize {
+                self.bytes
+            }
+        }
+
+        /// Payment for installed canonical modules: moved out of the rebind
+        /// cursor by the install sink, held while the canonical owns them.
+        #[derive(Debug)]
+        pub(crate) struct InstalledModulesBacking {
+            input_storage: Option<ResourceLease>,
+            output_storage: Option<ResourceLease>,
+            header_storage: Option<ResourceLease>,
         }
 
         /// Owns the original iterator/suffix and every output/temporary request.
@@ -4978,6 +5147,32 @@ mod conservative_copy {
                     }
                 }
                 Ok(GraphStep::Advanced)
+            }
+
+            /// O(1) install sink: swaps the bound modules into the canonical;
+            /// the cursor now holds the old canonical modules for
+            /// `reclaim_installed`. The module payment moves into the backing.
+            pub(crate) fn install_ready(
+                &mut self,
+                canonical: &mut Vec<ReconciledModule>,
+            ) -> Result<InstalledModulesBacking, GraphRefusal> {
+                let _ = canonical;
+                Err(GraphRefusal::Identity)
+            }
+
+            /// Reclaims the old canonical modules against the live installed
+            /// pins: aliased exports are released, exclusive slices drain
+            /// element-wise, and the pins loan is released last.
+            pub(crate) fn reclaim_installed(
+                &mut self,
+                pins: &mut PinnedConservativeCursor,
+                live_pins: &PinnedObjects,
+                handoff: &mut RetiredFileHandoff,
+                reserve: &SemanticResourceReserver,
+                work: usize,
+            ) -> Result<GraphStep, GraphRefusal> {
+                let _ = (pins, live_pins, handoff, reserve, work);
+                Err(GraphRefusal::Identity)
             }
 
             fn release_loan(
@@ -11119,5 +11314,942 @@ mod tests {
             assert_eq!(peak.live_blocks, 0);
             assert_eq!(pool.snapshot().charged_bytes, baseline);
         }
+    }
+
+    fn drive_pins_installed_reclaim(
+        cursor: &mut PinnedConservativeCursor,
+        live: &PinnedObjects,
+        selection: &ConservativePinSelection,
+        handoff: &mut RetiredFileHandoff,
+        reserve: &crate::semantics_edge::resources::SemanticResourceReserver,
+    ) -> Result<(), GraphRefusal> {
+        for _ in 0..4096 {
+            match cursor.reclaim_installed(live, selection, handoff, reserve, 1) {
+                Ok(GraphStep::Ready) => return Ok(()),
+                Ok(_) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        panic!("installed pins reclaim must finish over bounded credits");
+    }
+
+    fn drive_rebind_installed_reclaim(
+        rebind: &mut ScannedRebindCursor,
+        pins: &mut PinnedConservativeCursor,
+        live: &PinnedObjects,
+        handoff: &mut RetiredFileHandoff,
+        reserve: &crate::semantics_edge::resources::SemanticResourceReserver,
+    ) -> Result<(), GraphRefusal> {
+        for _ in 0..4096 {
+            match rebind.reclaim_installed(pins, live, handoff, reserve, 1) {
+                Ok(GraphStep::Ready) => return Ok(()),
+                Ok(_) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        panic!("installed rebind reclaim must finish over bounded credits");
+    }
+
+    #[test]
+    fn conservative_install_sink_keeps_leases_until_old_canonical_reclaimed() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        let (_dir, source, _) = conservative_cursor_fixture();
+        let pool = SemanticResourcePool::default();
+        let reserve = pool.reserver();
+        let selection = conservative_selection(&pool, BTreeSet::new(), BTreeSet::new());
+        let baseline = pool.snapshot().charged_bytes;
+        let mut cursor = PinnedConservativeCursor::new();
+        finish_conservative_copy(&source, &mut cursor, &selection, &reserve);
+        let expected = source.clone();
+        let before_install = pool.snapshot().charged_bytes;
+        assert!(before_install > baseline);
+        let mut canonical = source;
+        let installed = cursor.install_ready(&mut canonical);
+        assert!(
+            installed.is_ok(),
+            "install_ready accepts a Ready copy with no loan: {installed:?}"
+        );
+        let backing = installed.unwrap();
+        // The swap moved leases; it refunded nothing.
+        assert_eq!(pool.snapshot().charged_bytes, before_install);
+        assert_conservative_value(&expected, &canonical);
+        // The cursor now holds the old canonical.
+        let old = cursor.installed_output_for_test();
+        assert!(old.is_some(), "installed cursor retains the old canonical");
+        assert_conservative_value(&expected, old.unwrap());
+        assert_eq!(cursor.installed_state_for_test(), (true, true));
+        assert!(cursor.pinned().is_none());
+        assert!(cursor.loaned_output().is_none());
+        // Nothing is retired, so every old file is live-aliased and the
+        // handoff stays empty while the old canonical is reclaimed.
+        assert_eq!(
+            cursor.retired_entry_count(),
+            None,
+            "installed cursor answers no pre-install count"
+        );
+        let handoff = RetiredFileHandoff::reserve(0, &reserve);
+        assert!(handoff.is_ok(), "empty handoff reserves: {handoff:?}");
+        let mut handoff = handoff.unwrap();
+        let handoff_bytes = RetiredFileHandoff::bytes(0);
+        assert_eq!(
+            pool.snapshot().charged_bytes,
+            before_install + handoff_bytes
+        );
+        let outcome = drive_pins_installed_reclaim(
+            &mut cursor,
+            &canonical,
+            &selection,
+            &mut handoff,
+            &reserve,
+        );
+        assert!(
+            outcome.is_ok(),
+            "old canonical reclaims against live: {outcome:?}"
+        );
+        // Leases stay charged through reclaim; only the backing drop refunds.
+        assert_eq!(
+            pool.snapshot().charged_bytes,
+            before_install + handoff_bytes
+        );
+        assert_eq!(handoff.len_for_test(), 0);
+        assert_eq!(cursor.installed_state_for_test(), (false, true));
+        drop(handoff);
+        assert_eq!(pool.snapshot().charged_bytes, before_install);
+        drop(canonical);
+        drop(backing);
+        assert_eq!(pool.snapshot().charged_bytes, baseline);
+    }
+
+    #[test]
+    fn conservative_install_sink_refuses_unready_cursor() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        let (_dir, source, raw) = conservative_cursor_fixture();
+        let pool = SemanticResourcePool::default();
+        let reserve = pool.reserver();
+        let selection = conservative_selection(&pool, BTreeSet::new(), BTreeSet::new());
+        let baseline = pool.snapshot().charged_bytes;
+        let mut canonical = source.clone();
+        // Fresh and mid-copy pins cursors are not Ready.
+        let mut fresh = PinnedConservativeCursor::new();
+        assert!(matches!(
+            fresh.install_ready(&mut canonical),
+            Err(GraphRefusal::Identity)
+        ));
+        assert_eq!(pool.snapshot().charged_bytes, baseline);
+        let mut partial = PinnedConservativeCursor::new();
+        assert_ne!(
+            source
+                .poll_conservative_copy(&mut partial, &selection, &reserve, 1)
+                .unwrap(),
+            GraphStep::Ready
+        );
+        assert!(matches!(
+            partial.install_ready(&mut canonical),
+            Err(GraphRefusal::Identity)
+        ));
+        // A refusal consumes nothing: the same cursor still installs at Ready.
+        finish_conservative_copy(&source, &mut partial, &selection, &reserve);
+        let held = pool.snapshot().charged_bytes;
+        let installed = partial.install_ready(&mut canonical);
+        assert!(
+            installed.is_ok(),
+            "refused cursor installs at Ready: {installed:?}"
+        );
+        let backing = installed.unwrap();
+        assert_eq!(pool.snapshot().charged_bytes, held);
+        drop(canonical);
+        drop(backing);
+        assert_eq!(pool.snapshot().charged_bytes, baseline);
+        // A reclaimed pins cursor reports Cancelled, not Identity.
+        let mut spent = PinnedConservativeCursor::new();
+        finish_conservative_copy(&source, &mut spent, &selection, &reserve);
+        for _ in 0..4096 {
+            if spent
+                .reclaim(Some(&source), &selection, &reserve, 1)
+                .unwrap()
+                == GraphStep::Ready
+            {
+                break;
+            }
+        }
+        let mut canonical = source.clone();
+        assert!(matches!(
+            spent.install_ready(&mut canonical),
+            Err(GraphRefusal::Cancelled)
+        ));
+        assert_eq!(pool.snapshot().charged_bytes, baseline);
+        // An aborted pins cursor (rebind cancelled mid-bind, loan released).
+        let (mut input, _) = retained_rebind_inputs(&pool, &raw, false);
+        let mut pins = PinnedConservativeCursor::new();
+        finish_conservative_copy(&source, &mut pins, &selection, &reserve);
+        let mut aborted = ScannedRebindCursor::new();
+        for _ in 0..4096 {
+            if input.is_none() {
+                break;
+            }
+            pins.poll_scanned_rebind(&mut input, &mut aborted, &reserve, 1)
+                .unwrap();
+        }
+        assert!(input.is_none(), "admit takes the input before cancel");
+        aborted.cancel();
+        for _ in 0..4096 {
+            if aborted.reclaim(Some(&mut pins), &reserve, 1).unwrap() == GraphStep::Ready {
+                break;
+            }
+        }
+        assert!(matches!(
+            pins.install_ready(&mut canonical),
+            Err(GraphRefusal::Cancelled)
+        ));
+        drop(aborted);
+        drop(pins);
+        // Rebind sink: fresh, mid-bind and cancelled refuse without charging.
+        let (mut input2, _) = retained_rebind_inputs(&pool, &raw, false);
+        let mut pins2 = PinnedConservativeCursor::new();
+        finish_conservative_copy(&source, &mut pins2, &selection, &reserve);
+        let mut rebind = ScannedRebindCursor::new();
+        let mut modules = Vec::new();
+        let charged = pool.snapshot().charged_bytes;
+        assert!(matches!(
+            rebind.install_ready(&mut modules),
+            Err(GraphRefusal::Identity)
+        ));
+        assert_eq!(pool.snapshot().charged_bytes, charged);
+        pins2
+            .poll_scanned_rebind(&mut input2, &mut rebind, &reserve, 1)
+            .unwrap();
+        let charged = pool.snapshot().charged_bytes;
+        assert!(matches!(
+            rebind.install_ready(&mut modules),
+            Err(GraphRefusal::Identity)
+        ));
+        assert_eq!(pool.snapshot().charged_bytes, charged);
+        rebind.cancel();
+        assert!(matches!(
+            rebind.install_ready(&mut modules),
+            Err(GraphRefusal::Cancelled)
+        ));
+        assert_eq!(pool.snapshot().charged_bytes, charged);
+        // A reclaimed rebind reports Cancelled.
+        let (mut input3, _) = retained_rebind_inputs(&pool, &raw, false);
+        let mut pins3 = PinnedConservativeCursor::new();
+        finish_conservative_copy(&source, &mut pins3, &selection, &reserve);
+        let mut done = ScannedRebindCursor::new();
+        finish_scanned_rebind(&mut pins3, &mut input3, &mut done, &reserve);
+        for _ in 0..4096 {
+            if done.reclaim(Some(&mut pins3), &reserve, 1).unwrap() == GraphStep::Ready {
+                break;
+            }
+        }
+        let charged = pool.snapshot().charged_bytes;
+        assert!(matches!(
+            done.install_ready(&mut modules),
+            Err(GraphRefusal::Cancelled)
+        ));
+        assert_eq!(pool.snapshot().charged_bytes, charged);
+        drop(done);
+        drop(pins3);
+        drop(input3);
+        // A Ready rebind installs, moving its payment into the backing.
+        let (mut input4, _) = retained_rebind_inputs(&pool, &raw, false);
+        let mut pins4 = PinnedConservativeCursor::new();
+        finish_conservative_copy(&source, &mut pins4, &selection, &reserve);
+        let mut ready = ScannedRebindCursor::new();
+        finish_scanned_rebind(&mut pins4, &mut input4, &mut ready, &reserve);
+        assert!(input4.is_none());
+        let held = pool.snapshot().charged_bytes;
+        let installed = ready.install_ready(&mut modules);
+        assert!(installed.is_ok(), "Ready rebind installs: {installed:?}");
+        let backing = installed.unwrap();
+        assert_eq!(pool.snapshot().charged_bytes, held);
+        assert!(!modules.is_empty(), "installed modules reach the canonical");
+        drop(modules);
+        drop(ready);
+        drop(pins4);
+        drop(backing);
+    }
+
+    #[test]
+    fn conservative_installed_reclaim_hands_off_absent_files_and_releases_live_aliases() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        let (_dir, source, _) = conservative_cursor_fixture();
+        let pool = SemanticResourcePool::default();
+        let reserve = pool.reserver();
+        let selection = conservative_selection(
+            &pool,
+            BTreeSet::from([ProcessViewId(2), ProcessViewId(3)]),
+            BTreeSet::new(),
+        );
+        let id_for = |provider: &str| {
+            source
+                .by_id
+                .iter()
+                .find(|(_, entry)| entry.path.contains(provider))
+                .map(|(id, _)| *id)
+                .unwrap()
+        };
+        let id_a = id_for("provider-0");
+        let id_r1 = id_for("provider-1");
+        let id_r2 = id_for("provider-2");
+        // Sanity: A is claimed by surviving view 1; R ids only by retired views.
+        let surviving: BTreeSet<PinnedObjectId> = source
+            .ownership
+            .iter()
+            .filter(|(view, _)| **view == ProcessViewId(1))
+            .flat_map(|(_, claims)| {
+                claims
+                    .tables
+                    .iter()
+                    .chain(claims.pins.iter())
+                    .copied()
+                    .chain(claims.targets.iter().map(|(id, _)| *id))
+            })
+            .collect();
+        assert!(surviving.contains(&id_a));
+        assert!(!surviving.contains(&id_r1) && !surviving.contains(&id_r2));
+        let retired_claims: BTreeSet<PinnedObjectId> = source
+            .ownership
+            .iter()
+            .filter(|(view, _)| **view != ProcessViewId(1))
+            .flat_map(|(_, claims)| {
+                claims
+                    .tables
+                    .iter()
+                    .chain(claims.pins.iter())
+                    .copied()
+                    .chain(claims.targets.iter().map(|(id, _)| *id))
+            })
+            .collect();
+        let weak_a = Arc::downgrade(&source.by_id.get(&id_a).unwrap().file);
+        let weak_r1 = Arc::downgrade(&source.by_id.get(&id_r1).unwrap().file);
+        let weak_r2 = Arc::downgrade(&source.by_id.get(&id_r2).unwrap().file);
+        let fd_a = source.by_id.get(&id_a).unwrap().file.as_raw_fd();
+        let fd_r1 = source.by_id.get(&id_r1).unwrap().file.as_raw_fd();
+        let fd_r2 = source.by_id.get(&id_r2).unwrap().file.as_raw_fd();
+        let mut cursor = PinnedConservativeCursor::new();
+        finish_conservative_copy(&source, &mut cursor, &selection, &reserve);
+        {
+            let copy = cursor.pinned().unwrap();
+            assert!(!copy.by_id.contains_key(&id_r1) && !copy.by_id.contains_key(&id_r2));
+            assert!(copy.by_id.contains_key(&id_a));
+        }
+        // Handoff capacity: removed plus rejected ids of this copy.
+        let count = cursor.retired_entry_count();
+        assert_eq!(
+            count,
+            Some(retired_claims.len()),
+            "retired count covers every removed claim"
+        );
+        let handoff = RetiredFileHandoff::reserve(count.unwrap(), &reserve);
+        assert!(handoff.is_ok(), "handoff reserves: {handoff:?}");
+        let mut handoff = handoff.unwrap();
+        let mut canonical = source;
+        let installed = cursor.install_ready(&mut canonical);
+        assert!(installed.is_ok(), "Ready copy installs: {installed:?}");
+        let backing = installed.unwrap();
+        assert!(canonical.by_id.contains_key(&id_a));
+        assert!(!canonical.by_id.contains_key(&id_r1));
+        assert!(!canonical.by_id.contains_key(&id_r2));
+        let outcome = drive_pins_installed_reclaim(
+            &mut cursor,
+            &canonical,
+            &selection,
+            &mut handoff,
+            &reserve,
+        );
+        assert!(
+            outcome.is_ok(),
+            "installed reclaim hands off absent files: {outcome:?}"
+        );
+        // Kept entry: the old share dropped under the live alias.
+        assert_eq!(
+            weak_a.strong_count(),
+            1,
+            "live canonical holds the only A share"
+        );
+        // SAFETY: read-only checks of retained descriptors.
+        assert!(unsafe { libc::fcntl(fd_a, libc::F_GETFD) } >= 0);
+        // Retired entries: alive in the handoff, FDs still open.
+        assert_eq!(handoff.len_for_test(), 2);
+        for (weak, fd) in [(&weak_r1, fd_r1), (&weak_r2, fd_r2)] {
+            assert!(
+                weak.upgrade().is_some(),
+                "retired file stays open in the handoff"
+            );
+            assert!(unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0);
+        }
+        // Lane-style close: one file per call until the chain is empty.
+        let mut calls = 0;
+        loop {
+            calls += 1;
+            if handoff.close_some(1) {
+                break;
+            }
+            assert!(calls < 8, "bounded handoff close");
+        }
+        assert_eq!(calls, 2, "two files close in two single-file calls");
+        assert!(weak_r1.upgrade().is_none() && weak_r2.upgrade().is_none());
+        drop(canonical);
+        drop(backing);
+        drop(handoff);
+    }
+
+    #[test]
+    fn scanned_installed_reclaim_drains_absent_exports_elementwise() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        let (_dir, mut source, modules) = conservative_cursor_fixture();
+        // Retire view 3: provider-2's module is absent from the live output.
+        let id_r = source
+            .by_id
+            .iter()
+            .find(|(_, entry)| entry.path.contains("provider-2"))
+            .map(|(id, _)| *id)
+            .unwrap();
+        // Old-canonical modules bind first, cloning this exclusive slice...
+        source.by_id.get_mut(&id_r).unwrap().exports = Arc::from(vec![
+            ("retired-first-export".repeat(8), 11),
+            ("retired-second-export".repeat(16), 22),
+            ("retired-third-export".repeat(32), 33),
+        ]);
+        let mut old_pins = source.clone();
+        old_pins.reset_derived_claims();
+        let (old_modules, _) = bind_scanned_modules(&modules, &mut old_pins);
+        drop(old_pins);
+        assert!(old_modules.iter().any(|module| module.object == id_r));
+        // ...then the live pins move on, leaving the module the last owner.
+        source.by_id.get_mut(&id_r).unwrap().exports =
+            Arc::from(vec![("live-successor-export".into(), 44)]);
+        let bound_exports = old_modules
+            .iter()
+            .find(|module| module.object == id_r)
+            .unwrap()
+            .exports
+            .clone();
+        assert_eq!(
+            Arc::strong_count(&bound_exports),
+            2,
+            "old module plus this probe hold the only shares"
+        );
+        drop(bound_exports);
+        let pool = SemanticResourcePool::default();
+        let reserve = pool.reserver();
+        let selection =
+            conservative_selection(&pool, BTreeSet::from([ProcessViewId(3)]), BTreeSet::new());
+        let mut pins = PinnedConservativeCursor::new();
+        finish_conservative_copy(&source, &mut pins, &selection, &reserve);
+        assert!(!pins.pinned().unwrap().by_id.contains_key(&id_r));
+        // Surviving rows only (retired view excluded, like the Engine filter).
+        let rows: Vec<ScannedModule> = modules
+            .iter()
+            .filter(|module| module.view != ProcessViewId(3))
+            .cloned()
+            .collect();
+        assert_eq!(rows.len(), 3);
+        let (mut input, _) = retained_rebind_inputs(&pool, &rows, false);
+        let mut rebind = ScannedRebindCursor::new();
+        finish_scanned_rebind(&mut pins, &mut input, &mut rebind, &reserve);
+        assert!(input.is_none());
+        let count = pins.retired_entry_count();
+        assert_eq!(count, Some(1), "one retired claim bounds the handoff");
+        let handoff = RetiredFileHandoff::reserve(count.unwrap(), &reserve);
+        assert!(handoff.is_ok(), "handoff reserves: {handoff:?}");
+        let mut handoff = handoff.unwrap();
+        let mut canonical = source;
+        let mut canonical_modules = old_modules;
+        let pins_installed = pins.install_ready(&mut canonical);
+        assert!(
+            pins_installed.is_ok(),
+            "loaned pins install: {pins_installed:?}"
+        );
+        let pins_backing = pins_installed.unwrap();
+        let rebind_installed = rebind.install_ready(&mut canonical_modules);
+        assert!(
+            rebind_installed.is_ok(),
+            "bound rebind installs: {rebind_installed:?}"
+        );
+        let modules_backing = rebind_installed.unwrap();
+        // The retired module's exclusive slice drains one element per credit.
+        let mut prior = 3usize;
+        let mut done = false;
+        let mut error = None;
+        for _ in 0..4096 {
+            match rebind.reclaim_installed(&mut pins, &canonical, &mut handoff, &reserve, 1) {
+                Ok(GraphStep::Ready) => {
+                    done = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(refused) => {
+                    error = Some(refused);
+                    break;
+                }
+            }
+            let left = rebind
+                .reference_pending_exports_for_test(id_r)
+                .map_or(0, |exports| {
+                    exports.iter().filter(|(text, _)| !text.is_empty()).count()
+                });
+            assert!(
+                prior.saturating_sub(left) <= 1,
+                "one credit drains at most one export"
+            );
+            prior = left;
+        }
+        assert!(
+            error.is_none(),
+            "installed rebind reclaim refused: {error:?}"
+        );
+        assert!(done, "installed rebind reclaim reaches Ready");
+        assert_eq!(prior, 0, "exclusive slice fully drained");
+        assert_eq!(
+            handoff.len_for_test(),
+            0,
+            "module exports never enter the file handoff"
+        );
+        assert_eq!(pins.installed_state_for_test(), (true, true));
+        // The retired file still hands off through the pins step.
+        let outcome =
+            drive_pins_installed_reclaim(&mut pins, &canonical, &selection, &mut handoff, &reserve);
+        assert!(
+            outcome.is_ok(),
+            "installed pins reclaim hands off the file: {outcome:?}"
+        );
+        assert_eq!(handoff.len_for_test(), 1);
+        drop(canonical);
+        drop(canonical_modules);
+        drop(pins_backing);
+        drop(modules_backing);
+        drop(handoff);
+    }
+
+    #[test]
+    fn conservative_installed_reclaim_refuses_replaced_live_canonical() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        let (_dir, source, _) = conservative_cursor_fixture();
+        let pool = SemanticResourcePool::default();
+        let reserve = pool.reserver();
+        let selection = conservative_selection(&pool, BTreeSet::new(), BTreeSet::new());
+        let mut cursor = PinnedConservativeCursor::new();
+        finish_conservative_copy(&source, &mut cursor, &selection, &reserve);
+        // A non-installed cursor refuses installed reclaim outright.
+        let handoff = RetiredFileHandoff::reserve(0, &reserve);
+        assert!(handoff.is_ok(), "empty handoff reserves: {handoff:?}");
+        let mut handoff = handoff.unwrap();
+        assert!(matches!(
+            cursor.reclaim_installed(&source, &selection, &mut handoff, &reserve, 1),
+            Err(GraphRefusal::Identity)
+        ));
+        let mut canonical = source;
+        let installed = cursor.install_ready(&mut canonical);
+        assert!(installed.is_ok(), "Ready copy installs: {installed:?}");
+        let backing = installed.unwrap();
+        // One credit against the true live canonical advances.
+        assert_eq!(
+            cursor
+                .reclaim_installed(&canonical, &selection, &mut handoff, &reserve, 1)
+                .unwrap(),
+            GraphStep::Advanced
+        );
+        // A replaced live canonical (fresh copy identity) refuses.
+        let replaced = canonical.clone();
+        assert!(matches!(
+            cursor.reclaim_installed(&replaced, &selection, &mut handoff, &reserve, 1),
+            Err(GraphRefusal::Identity)
+        ));
+        // The refusal kept every owner: resume against the true live.
+        let outcome = drive_pins_installed_reclaim(
+            &mut cursor,
+            &canonical,
+            &selection,
+            &mut handoff,
+            &reserve,
+        );
+        assert!(
+            outcome.is_ok(),
+            "reclaim resumes after refusal: {outcome:?}"
+        );
+        drop(canonical);
+        drop(replaced);
+        drop(backing);
+        drop(handoff);
+    }
+
+    /// One joint-graph round at the identity seam: copy, rebind, install both
+    /// into the canonical, then rebind reclaim before pins reclaim. Returns
+    /// the round's backings, the post-install charge, and the round-local
+    /// selection and handoff charges for exact baseline accounting.
+    fn run_graph_round(
+        pool: &crate::semantics_edge::resources::SemanticResourcePool,
+        canonical: &mut PinnedObjects,
+        canonical_modules: &mut Vec<ReconciledModule>,
+        rows: &[ScannedModule],
+        retired: BTreeSet<ProcessViewId>,
+        rejected: BTreeSet<ObjectKey>,
+        round: u32,
+    ) -> (
+        InstalledPinsBacking,
+        InstalledModulesBacking,
+        usize,
+        usize,
+        usize,
+    ) {
+        let reserve = pool.reserver();
+        let selection_bytes =
+            ConservativePinSelection::storage_bound(retired.len(), rejected.len()).unwrap();
+        let selection = conservative_selection(pool, retired.clone(), rejected.clone());
+        assert_eq!(
+            selection.retired(),
+            &retired,
+            "round {round}: selection keeps retired views"
+        );
+        assert_eq!(
+            selection.rejected(),
+            &rejected,
+            "round {round}: selection keeps rejected keys"
+        );
+        let mut pins = PinnedConservativeCursor::new();
+        finish_conservative_copy(canonical, &mut pins, &selection, &reserve);
+        let (mut input, _) = retained_rebind_inputs(pool, rows, false);
+        let mut rebind = ScannedRebindCursor::new();
+        finish_scanned_rebind(&mut pins, &mut input, &mut rebind, &reserve);
+        assert!(input.is_none(), "round {round}: rebind takes its input");
+        let count = pins.retired_entry_count();
+        assert!(
+            count.is_some(),
+            "round {round}: loaned copy answers a retired count"
+        );
+        let handoff_bytes = RetiredFileHandoff::bytes(count.unwrap());
+        let handoff = RetiredFileHandoff::reserve(count.unwrap(), &reserve);
+        assert!(
+            handoff.is_ok(),
+            "round {round}: handoff reserves: {handoff:?}"
+        );
+        let mut handoff = handoff.unwrap();
+        let pins_installed = pins.install_ready(canonical);
+        assert!(
+            pins_installed.is_ok(),
+            "round {round}: loaned pins install: {pins_installed:?}"
+        );
+        let pins_backing = pins_installed.unwrap();
+        let rebind_installed = rebind.install_ready(canonical_modules);
+        assert!(
+            rebind_installed.is_ok(),
+            "round {round}: bound rebind installs: {rebind_installed:?}"
+        );
+        let modules_backing = rebind_installed.unwrap();
+        let installed_charge = pool.snapshot().charged_bytes;
+        // Order: pins reclaim while the loan is outstanding refuses.
+        assert!(
+            matches!(
+                pins.reclaim_installed(canonical, &selection, &mut handoff, &reserve, 1),
+                Err(GraphRefusal::Identity)
+            ),
+            "round {round}: pins reclaim refuses while the loan is held"
+        );
+        let outcome = drive_rebind_installed_reclaim(
+            &mut rebind,
+            &mut pins,
+            canonical,
+            &mut handoff,
+            &reserve,
+        );
+        assert!(
+            outcome.is_ok(),
+            "round {round}: rebind reclaim releases the loan: {outcome:?}"
+        );
+        assert_eq!(
+            pins.installed_state_for_test(),
+            (true, true),
+            "round {round}: loan released, phase stays Installed"
+        );
+        let outcome =
+            drive_pins_installed_reclaim(&mut pins, canonical, &selection, &mut handoff, &reserve);
+        assert!(
+            outcome.is_ok(),
+            "round {round}: pins reclaim hands off retired files: {outcome:?}"
+        );
+        // Lane-style close, then release every round-local owner.
+        let mut calls = 0;
+        loop {
+            calls += 1;
+            if handoff.close_some(256) {
+                break;
+            }
+            assert!(calls < 64, "round {round}: bounded handoff close");
+        }
+        drop(handoff);
+        drop(selection);
+        drop(pins);
+        drop(rebind);
+        (
+            pins_backing,
+            modules_backing,
+            installed_charge,
+            selection_bytes,
+            handoff_bytes,
+        )
+    }
+
+    #[test]
+    fn conservative_graph_install_and_reclaim_returns_pool_to_baseline() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        let (_dir, source, modules) = conservative_cursor_fixture();
+        let pool = SemanticResourcePool::default();
+        let baseline = pool.snapshot().charged_bytes;
+        // Round-0 canonical: all rows bound against the pristine pins.
+        let mut canonical = source;
+        let mut pins0 = canonical.clone();
+        pins0.reset_derived_claims();
+        let (canonical_modules_init, skips0) = bind_scanned_modules(&modules, &mut pins0);
+        assert!(skips0.is_empty(), "pristine rows all bind: {skips0:?}");
+        drop(pins0);
+        let mut canonical_modules = canonical_modules_init;
+        // Round 1: retire view 1, reject view 2's key.
+        let rows1: Vec<ScannedModule> = modules
+            .iter()
+            .filter(|module| module.view != ProcessViewId(1) && module.key != modules[1].key)
+            .cloned()
+            .collect();
+        assert_eq!(rows1.len(), 2);
+        let (pins_backing1, modules_backing1, installed1, sel1, ho1) = run_graph_round(
+            &pool,
+            &mut canonical,
+            &mut canonical_modules,
+            &rows1,
+            BTreeSet::from([ProcessViewId(1)]),
+            BTreeSet::from([modules[1].key]),
+            1,
+        );
+        // Round 1 kept nothing but the live canonical's own leases.
+        assert_eq!(pool.snapshot().charged_bytes, installed1 - sel1 - ho1);
+        assert!(!canonical.ownership.contains_key(&ProcessViewId(1)));
+        // Exact fit for one graph above the live canonical.
+        let live1 = pool.snapshot().charged_bytes - baseline;
+        let peak1 = pool.snapshot().peak_charged_bytes;
+        pool.reference_set_limit(pool.snapshot().charged_bytes + (peak1 - baseline));
+        // Round 2: retire view 2 (cumulative filter).
+        let rows2: Vec<ScannedModule> = modules
+            .iter()
+            .filter(|module| {
+                module.view != ProcessViewId(1)
+                    && module.view != ProcessViewId(2)
+                    && module.key != modules[1].key
+            })
+            .cloned()
+            .collect();
+        assert_eq!(rows2.len(), 1);
+        let (pins_backing2, modules_backing2, installed2, sel2, ho2) = run_graph_round(
+            &pool,
+            &mut canonical,
+            &mut canonical_modules,
+            &rows2,
+            BTreeSet::from([ProcessViewId(2)]),
+            BTreeSet::new(),
+            2,
+        );
+        drop(pins_backing1);
+        drop(modules_backing1);
+        // Round 2 kept nothing but the new live canonical's own leases.
+        assert_eq!(
+            pool.snapshot().charged_bytes,
+            installed2 - sel2 - ho2 - live1
+        );
+        assert!(!canonical.ownership.contains_key(&ProcessViewId(2)));
+        assert!(canonical.ownership.contains_key(&ProcessViewId(3)));
+        // Tidy: live canonical released while still paid, then the bill.
+        drop(canonical);
+        drop(canonical_modules);
+        drop(pins_backing2);
+        drop(modules_backing2);
+        assert_eq!(pool.snapshot().charged_bytes, baseline);
+    }
+
+    #[test]
+    fn loaned_output_is_some_only_while_rebinding() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        let (_dir, source, raw) = conservative_cursor_fixture();
+        let pool = SemanticResourcePool::default();
+        let reserve = pool.reserver();
+        let selection = conservative_selection(&pool, BTreeSet::new(), BTreeSet::new());
+        let mut pins = PinnedConservativeCursor::new();
+        assert!(pins.loaned_output().is_none(), "New loans nothing");
+        assert_ne!(
+            source
+                .poll_conservative_copy(&mut pins, &selection, &reserve, 1)
+                .unwrap(),
+            GraphStep::Ready
+        );
+        assert!(pins.loaned_output().is_none(), "mid-copy loans nothing");
+        finish_conservative_copy(&source, &mut pins, &selection, &reserve);
+        assert!(pins.pinned().is_some());
+        assert!(
+            pins.loaned_output().is_none(),
+            "Ready without a loan loans nothing"
+        );
+        let expected = pins.pinned().unwrap().clone();
+        let (mut input, _) = retained_rebind_inputs(&pool, &raw, false);
+        let mut rebind = ScannedRebindCursor::new();
+        // Drive to admit (input taken) without finishing.
+        for _ in 0..4096 {
+            if input.is_none() {
+                break;
+            }
+            assert_ne!(
+                pins.poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1)
+                    .unwrap(),
+                GraphStep::Ready
+            );
+        }
+        assert!(input.is_none(), "admit takes the input");
+        assert!(pins.pinned().is_none(), "mid-bind hides the partial output");
+        assert!(
+            pins.loaned_output().is_some(),
+            "admit exposes the loaned output"
+        );
+        // One more bind credit keeps the loan visible.
+        assert_ne!(
+            pins.poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1)
+                .unwrap(),
+            GraphStep::Ready
+        );
+        assert!(
+            pins.loaned_output().is_some(),
+            "mid-bind keeps the loan visible"
+        );
+        finish_scanned_rebind(&mut pins, &mut input, &mut rebind, &reserve);
+        assert!(rebind.modules().is_some());
+        assert!(
+            pins.pinned().is_some(),
+            "completed bind keeps the Ready borrow"
+        );
+        let loaned = pins.loaned_output();
+        assert!(loaned.is_some(), "completed bind still holds the loan");
+        let mut bound = expected.clone();
+        bound.reset_derived_claims();
+        let (oracle_modules, _) = bind_scanned_modules(&raw, &mut bound);
+        assert_conservative_value(&bound, loaned.unwrap());
+        assert_eq!(rebind.modules().unwrap(), &oracle_modules);
+        // Release the loan: the output is no longer loaned.
+        for _ in 0..4096 {
+            if rebind.reclaim(Some(&mut pins), &reserve, 1).unwrap() == GraphStep::Ready {
+                break;
+            }
+        }
+        assert!(
+            pins.pinned().is_some(),
+            "released loan restores the Ready borrow"
+        );
+        assert!(
+            pins.loaned_output().is_none(),
+            "released loan loans nothing"
+        );
+        // Install: neither borrow answers.
+        let mut canonical = source.clone();
+        let installed = pins.install_ready(&mut canonical);
+        assert!(installed.is_ok(), "released pins install: {installed:?}");
+        let backing = installed.unwrap();
+        assert!(pins.pinned().is_none());
+        assert!(
+            pins.loaned_output().is_none(),
+            "installed output is not a loan"
+        );
+        drop(canonical);
+        drop(backing);
+    }
+
+    #[test]
+    fn conservative_installed_reclaim_refuses_full_handoff_with_storage() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        let (_dir, source, _) = conservative_cursor_fixture();
+        let pool = SemanticResourcePool::default();
+        let reserve = pool.reserver();
+        let selection = conservative_selection(&pool, BTreeSet::new(), BTreeSet::new());
+        let mut cursor = PinnedConservativeCursor::new();
+        finish_conservative_copy(&source, &mut cursor, &selection, &reserve);
+        let mut canonical = source;
+        let installed = cursor.install_ready(&mut canonical);
+        assert!(installed.is_ok(), "Ready copy installs: {installed:?}");
+        let backing = installed.unwrap();
+        // Zero reserved slots: any absent file overflows the handoff.
+        let handoff = RetiredFileHandoff::reserve(0, &reserve);
+        assert!(handoff.is_ok(), "empty handoff reserves: {handoff:?}");
+        let mut handoff = handoff.unwrap();
+        // Forge the live canonical: same value identity, a stranger file at
+        // the first entry, so the old share has no live alias to drop under.
+        let id = *canonical.by_id.keys().next().unwrap();
+        let fd = canonical.by_id.get(&id).unwrap().file.as_raw_fd();
+        let stranger = canonical.by_id.values().nth(1).unwrap().file.clone();
+        assert!(!Arc::ptr_eq(
+            &canonical.by_id.get(&id).unwrap().file,
+            &stranger
+        ));
+        canonical.by_id.get_mut(&id).unwrap().file = stranger;
+        assert!(matches!(
+            drive_pins_installed_reclaim(
+                &mut cursor,
+                &canonical,
+                &selection,
+                &mut handoff,
+                &reserve
+            ),
+            Err(GraphRefusal::Storage(_))
+        ));
+        // The refusal kept every owner: nothing was dropped or pushed.
+        assert_eq!(handoff.len_for_test(), 0);
+        assert_eq!(cursor.installed_state_for_test(), (true, true));
+        assert_eq!(
+            cursor.retained_reclaim_file_for_test(id),
+            Some((4, Some(fd)))
+        );
+        drop(canonical);
+        drop(backing);
+        drop(handoff);
+    }
+
+    #[test]
+    fn scanned_input_measure_matches_cursor_input_accounting() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        let (_dir, source, raw) = conservative_cursor_fixture();
+        let pool = SemanticResourcePool::default();
+        let reserve = pool.reserver();
+        let selection = conservative_selection(&pool, BTreeSet::new(), BTreeSet::new());
+        let mut pins = PinnedConservativeCursor::new();
+        finish_conservative_copy(&source, &mut pins, &selection, &reserve);
+        let (mut input, _) = retained_rebind_inputs(&pool, &raw, false);
+        // Direct unit: one group or element per step, true at module end.
+        let capacity = input.as_ref().unwrap().original_capacity_for_test();
+        let mut measure = ScannedInputMeasure::new(capacity).unwrap();
+        assert!(measure.bytes() > 0, "seeded Vec envelope is positive");
+        let mut steps = 0usize;
+        for module in input.as_ref().unwrap().originals_for_test() {
+            let mut module_steps = 0usize;
+            loop {
+                steps += 1;
+                module_steps += 1;
+                assert!(module_steps < 4096, "bounded steps per module");
+                if measure.step(module).unwrap() {
+                    break;
+                }
+            }
+            assert!(
+                module_steps >= 4,
+                "header, exports, interfaces, tables measured"
+            );
+        }
+        assert!(steps > raw.len());
+        let total = measure.bytes();
+        // The cursor charges exactly the same input total for the same rows.
+        let mut rebind = ScannedRebindCursor::new();
+        finish_scanned_rebind(&mut pins, &mut input, &mut rebind, &reserve);
+        let required = rebind.required_input_bytes();
+        assert!(
+            required.is_some(),
+            "bound rebind answers an input requirement"
+        );
+        assert_eq!(
+            required.unwrap(),
+            total,
+            "cursor input accounting matches the standalone measure"
+        );
     }
 }

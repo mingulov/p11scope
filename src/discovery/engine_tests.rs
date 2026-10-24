@@ -44556,7 +44556,7 @@ impl CollectedFinishGraphCase {
         let gate = std::sync::Arc::clone(&release);
         let (entered_sender, entered) = std::sync::mpsc::channel();
         let (returned_sender, returned) = std::sync::mpsc::channel();
-        let retirement = crate::attach::RetirementFixture::new(
+        let retirement = crate::attach::RetirementFixture::new_collected(
             &engine.plan.slots,
             &engine.pinned,
             Box::new(move |owned, producer| {
@@ -44711,6 +44711,47 @@ impl Drop for CollectedFinishGraphCase {
     fn drop(&mut self) {
         self.release();
     }
+}
+
+#[test]
+fn collected_session_requires_original_q() {
+    let err = super::require_original_q(None)
+        .err()
+        .expect("a missing Q must be refused");
+    assert_eq!(
+        err.to_string(),
+        "collected retirement needs the original Q"
+    );
+    let (child, engine, _) = engine_with_one_accepted_provider();
+    let _guard = SystemScopeChildGuard::new(child);
+    let fixture = crate::attach::RetirementFixture::new_collected(
+        &engine.plan.slots,
+        &engine.pinned,
+        Box::new(|owned, _| {
+            drop(owned);
+            Ok(())
+        }),
+    );
+    let q = fixture
+        .collected_q()
+        .expect("new_collected mints the original Q");
+    let out = super::require_original_q(Some(q)).unwrap();
+    assert!(std::ptr::eq(out, q));
+}
+
+#[test]
+fn collected_retirement_is_physical_matches_backend() {
+    use super::EngineSession as _;
+    assert!(
+        ScriptedSession::default().collected_retirement_is_physical(),
+        "the scripted leaf keeps the physical default"
+    );
+    assert!(crate::attach::Session::collected_retirement_is_physical_for(
+        crate::attach::AttachBackend::Multi
+    ));
+    assert!(!crate::attach::Session::collected_retirement_is_physical_for(
+        crate::attach::AttachBackend::Singles
+    ));
 }
 
 #[test]

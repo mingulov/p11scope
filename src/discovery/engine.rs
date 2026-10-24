@@ -4,9 +4,10 @@
 #[cfg(feature = "h6-reexec-diagnostic")]
 use crate::attach::reexec_diagnostic::{Outcome as DiagnosticOutcome, Phase as DiagnosticPhase};
 use crate::attach::{
-    BackendSelection, CapturePolicy, CounterSnapshot, DetachOutcome, DynamicExportIdentity,
-    DynamicLoaderAttachFailure, OwnedPauseGeneration, ReplacementOutcome, RetirementPoll,
-    RetirementTicket, Scope, Session,
+    BackendSelection, CapturePolicy, CollectedFinishQ, CollectedRetirementTicket,
+    CounterSnapshot, DetachOutcome, DynamicExportIdentity, DynamicLoaderAttachFailure,
+    OwnedPauseGeneration, ReplacementOutcome, RetainedRetirementInput, RetirementPoll,
+    RetirementProgress, RetirementTicket, Scope, Session,
 };
 use crate::cli::CaptureArgs;
 use crate::discovery::attribution;
@@ -37,7 +38,8 @@ use crate::manifest_input::{read_manifest, selection_surface_usable, validate_st
 use crate::process::{self, OriginalGenerationState, ProcessView, ProcessViewId, ViewAdmission};
 use crate::run::OwnedChild;
 use crate::{plan, render};
-use anyhow::{Context as _, Result, anyhow, bail};
+use crate::semantics_edge::resources::SemanticResourceReserver;
+use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use p11scope_ebpf_common::{
     DISCOVERY_INTERFACES, DISCOVERY_KIND_EXEC, DISCOVERY_KIND_FUNCTION_LIST_RETURN,
     DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN, DISCOVERY_KIND_INTERFACE_RETURN,
@@ -2681,6 +2683,42 @@ pub(crate) trait EngineSession {
     ) -> Result<(Vec<DiscoveryRecord>, u64, bool, bool)> {
         bail!("this native leaf has no original Q-bounded discovery drain")
     }
+    fn prepare_collected_static_retirement(
+        &mut self,
+        _q: Option<&CollectedFinishQ>,
+        _input: &mut Option<RetainedRetirementInput>,
+        _reserve: &SemanticResourceReserver,
+        _work: usize,
+    ) -> Result<RetirementProgress> {
+        bail!("this native leaf has no collected carrier")
+    }
+    fn begin_collected_static_retirement(
+        &mut self,
+        _q: Option<&CollectedFinishQ>,
+        _ticket: &CollectedRetirementTicket,
+        _work: usize,
+    ) -> Result<RetirementProgress> {
+        bail!("this native leaf has no collected carrier")
+    }
+    fn poll_collected_static_retirement(
+        &mut self,
+        _q: Option<&CollectedFinishQ>,
+        _ticket: &CollectedRetirementTicket,
+        _work: usize,
+    ) -> Result<RetirementProgress> {
+        bail!("this native leaf has no collected carrier")
+    }
+    fn cancel_collected_static_retirement(
+        &mut self,
+        _input: Option<&RetainedRetirementInput>,
+        _ticket: Option<&CollectedRetirementTicket>,
+        _work: usize,
+    ) -> Result<RetirementProgress> {
+        bail!("this native leaf has no collected carrier")
+    }
+    fn collected_retirement_is_physical(&self) -> bool {
+        true
+    }
     fn counter_snapshot(&self) -> Result<CounterSnapshot>;
     fn process_creation_tracking_unavailable(&self) -> Option<&str>;
     fn read_selection_table(
@@ -2764,6 +2802,11 @@ pub(crate) trait EngineSession {
     fn arm_pause(&mut self) -> Result<()>;
     fn pause_state(&self) -> Result<Option<u64>>;
     fn remove_pause(&mut self) -> Result<Option<u64>>;
+}
+
+fn require_original_q(q: Option<&CollectedFinishQ>) -> Result<&CollectedFinishQ> {
+    let _ = q;
+    bail!("skeleton")
 }
 
 impl EngineSession for Session {
@@ -2864,6 +2907,50 @@ impl EngineSession for Session {
     ) -> Result<(Vec<DiscoveryRecord>, u64, bool, bool)> {
         self.collected_finish_discovery_domain(q)?;
         self.collect_discovery_to_position(q.discovery_stop(), quantum)
+    }
+
+    fn prepare_collected_static_retirement(
+        &mut self,
+        q: Option<&CollectedFinishQ>,
+        input: &mut Option<RetainedRetirementInput>,
+        reserve: &SemanticResourceReserver,
+        work: usize,
+    ) -> Result<RetirementProgress> {
+        let q = require_original_q(q)?;
+        Session::prepare_collected_static_retirement(self, q, input, reserve, work)
+    }
+
+    fn begin_collected_static_retirement(
+        &mut self,
+        q: Option<&CollectedFinishQ>,
+        ticket: &CollectedRetirementTicket,
+        work: usize,
+    ) -> Result<RetirementProgress> {
+        let q = require_original_q(q)?;
+        Session::begin_collected_static_retirement(self, q, ticket, work)
+    }
+
+    fn poll_collected_static_retirement(
+        &mut self,
+        q: Option<&CollectedFinishQ>,
+        ticket: &CollectedRetirementTicket,
+        work: usize,
+    ) -> Result<RetirementProgress> {
+        let q = require_original_q(q)?;
+        Session::poll_collected_static_retirement(self, q, ticket, work)
+    }
+
+    fn cancel_collected_static_retirement(
+        &mut self,
+        input: Option<&RetainedRetirementInput>,
+        ticket: Option<&CollectedRetirementTicket>,
+        work: usize,
+    ) -> Result<RetirementProgress> {
+        Session::cancel_collected_static_retirement(self, input, ticket, work)
+    }
+
+    fn collected_retirement_is_physical(&self) -> bool {
+        Session::collected_retirement_is_physical(self)
     }
 
     fn counter_snapshot(&self) -> Result<CounterSnapshot> {
@@ -23187,6 +23274,60 @@ pub(crate) mod session_fixture {
 
         fn staged_discovery_len(&self) -> usize {
             self.staged.len()
+        }
+
+        fn prepare_collected_static_retirement(
+            &mut self,
+            q: Option<&CollectedFinishQ>,
+            input: &mut Option<RetainedRetirementInput>,
+            reserve: &SemanticResourceReserver,
+            work: usize,
+        ) -> Result<RetirementProgress> {
+            ensure!(q.is_none(), "scripted leaf refuses a production Q");
+            let Some(fixture) = self.global_retirement.as_ref() else {
+                bail!("scripted leaf has no collected carrier");
+            };
+            fixture
+                .borrow_mut()
+                .collected_prepare(input, reserve, work)
+        }
+
+        fn begin_collected_static_retirement(
+            &mut self,
+            q: Option<&CollectedFinishQ>,
+            ticket: &CollectedRetirementTicket,
+            work: usize,
+        ) -> Result<RetirementProgress> {
+            ensure!(q.is_none(), "scripted leaf refuses a production Q");
+            let Some(fixture) = self.global_retirement.as_ref() else {
+                bail!("scripted leaf has no collected carrier");
+            };
+            fixture.borrow_mut().collected_begin(ticket, work)
+        }
+
+        fn poll_collected_static_retirement(
+            &mut self,
+            q: Option<&CollectedFinishQ>,
+            ticket: &CollectedRetirementTicket,
+            work: usize,
+        ) -> Result<RetirementProgress> {
+            ensure!(q.is_none(), "scripted leaf refuses a production Q");
+            let Some(fixture) = self.global_retirement.as_ref() else {
+                bail!("scripted leaf has no collected carrier");
+            };
+            fixture.borrow_mut().collected_poll(ticket, work)
+        }
+
+        fn cancel_collected_static_retirement(
+            &mut self,
+            input: Option<&RetainedRetirementInput>,
+            ticket: Option<&CollectedRetirementTicket>,
+            work: usize,
+        ) -> Result<RetirementProgress> {
+            let Some(fixture) = self.global_retirement.as_ref() else {
+                bail!("scripted leaf has no collected carrier");
+            };
+            fixture.borrow_mut().collected_cancel(input, ticket, work)
         }
 
         fn counter_snapshot(&self) -> Result<CounterSnapshot> {

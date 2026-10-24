@@ -530,7 +530,7 @@ fn native_retirement_transfer_failure_cannot_report_untouched_or_recovered() {
 
 // These are source-first pins for the collected path. Existing live-retirement
 // controls above stay unchanged; harmless FDs do not qualify a BPF Session.
-use super::fixture::CollectedRetirementFixture;
+use super::fixture::{CollectedRetirementFixture, RetirementFixture};
 use crate::semantics_edge::resources::{
     ResourceLease, SEMANTIC_TRANSITION_SCRATCH, SemanticResourcePool, SemanticResourceReserver,
 };
@@ -1976,4 +1976,279 @@ fn collected_retirement_retained_release_failure_keeps_original_owners() {
     drop(native);
     assert!(file.upgrade().is_some() && exports.upgrade().is_some());
     assert_eq!(pool.snapshot().charged_bytes, charged);
+}
+
+#[test]
+fn collected_retirement_boxed_q_survives_owner_moves() {
+    fn prepare_at_depth_one(
+        fixture: &mut RetirementFixture,
+        input: &mut Option<RetainedRetirementInput>,
+        reserve: &SemanticResourceReserver,
+    ) -> anyhow::Result<CollectedRetirementTicket> {
+        for _ in 0..COLLECTED_CREDITS {
+            let progress = fixture.collected_prepare(input, reserve, 1)?;
+            assert_eq!(progress.used, 1);
+            match progress.state {
+                CollectedRetirementState::Preparing => {}
+                CollectedRetirementState::Prepared(ticket) => return Ok(ticket),
+                _ => anyhow::bail!("unexpected collected preparation phase"),
+            }
+        }
+        anyhow::bail!("boxed preparation exhausted its finite credits")
+    }
+
+    fn begin_to_pending_via_helper(
+        fixture: &mut RetirementFixture,
+        ticket: &CollectedRetirementTicket,
+    ) {
+        for _ in 0..COLLECTED_CREDITS {
+            let progress = fixture.collected_begin(ticket, 1).unwrap();
+            assert_eq!(progress.used, 1);
+            match progress.state {
+                CollectedRetirementState::Transferring => {}
+                CollectedRetirementState::Pending => return,
+                _ => panic!("boxed ownership did not reach its own worker"),
+            }
+        }
+        panic!("boxed transfer exhausted its finite credits");
+    }
+
+    struct MovedHolder {
+        fixture: RetirementFixture,
+    }
+
+    let (_dir, pins, mut native, slots) = collected_case(
+        1,
+        Box::new(|owned, _| {
+            drop(owned);
+            Ok(())
+        }),
+    );
+    let mut boxed = RetirementFixture::new_collected(
+        &slots,
+        &pins,
+        Box::new(|owned, _| {
+            drop(owned);
+            Ok(())
+        }),
+    );
+    let pool = SemanticResourcePool::reference_limit(COLLECTED_POOL_BYTES);
+    let reserve = pool.reserver();
+    let mut input = Some(collected_input(
+        slots.clone(),
+        reserve.reserve(COLLECTED_INPUT_BYTES).unwrap(),
+    ));
+    let ticket = prepare_at_depth_one(&mut boxed, &mut input, &reserve).unwrap();
+    assert!(input.is_none());
+    // Move the owner of the boxed Q into a struct, then into a Vec; the
+    // heap Q address stays stable across both moves.
+    let holder = MovedHolder { fixture: boxed };
+    let mut holders = vec![holder];
+    begin_to_pending_via_helper(&mut holders[0].fixture, &ticket);
+    let polled = holders[0].fixture.collected_poll(&ticket, 1).unwrap();
+    assert_eq!(polled.used, 1);
+    assert!(matches!(
+        polled.state,
+        CollectedRetirementState::Pending
+    ));
+    assert_eq!(holders[0].fixture.begins, 1);
+
+    // A second Q with equal contents but a different address is refused.
+    let q = native.observe_q();
+    let other = native.observe_q_again();
+    assert_eq!(q.events_stop(), other.events_stop());
+    assert_eq!(q.discovery_stop(), other.discovery_stop());
+    assert_eq!(q.observed_without_grant(), other.observed_without_grant());
+    assert!(!std::ptr::eq(&q, &other));
+    let links = native.original_links();
+    let retained = native.retained_slots();
+    let mut second_input = Some(collected_input(
+        slots.clone(),
+        reserve.reserve(COLLECTED_INPUT_BYTES).unwrap(),
+    ));
+    let second_ticket =
+        collected_prepare_to_ticket(&mut native, &q, &mut second_input, &reserve).unwrap();
+    assert!(second_input.is_none());
+    let refused = native
+        .begin(&other, &second_ticket, 1)
+        .err()
+        .expect("a second Q must be refused");
+    assert_eq!(
+        refused.to_string(),
+        "collected transfer owner/registry changed"
+    );
+    assert_eq!(native.original_links(), links);
+    assert_eq!(native.retained_slots(), retained);
+    collected_submit(&mut native, &q, &second_ticket);
+    let pending = native.poll(&q, &second_ticket, 1).unwrap();
+    assert_eq!(pending.used, 1);
+    assert!(matches!(
+        pending.state,
+        CollectedRetirementState::Pending
+    ));
+}
+
+fn exact_slot_clone(slot: &Slot) -> Slot {
+    let mut object_path = String::with_capacity(slot.object_path.len());
+    object_path.push_str(&slot.object_path);
+    let mut names = Vec::with_capacity(slot.names.len());
+    for name in &slot.names {
+        let mut owned = String::with_capacity(name.len());
+        owned.push_str(name);
+        names.push(owned);
+    }
+    let mut module_ids = Vec::with_capacity(slot.module_ids.len());
+    module_ids.extend_from_slice(&slot.module_ids);
+    Slot {
+        index: slot.index,
+        descriptor_index: slot.descriptor_index,
+        object: slot.object,
+        object_path,
+        file_offset: slot.file_offset,
+        names,
+        aliased: slot.aliased,
+        semantics: slot.semantics,
+        semantic_authorized: slot.semantic_authorized,
+        semantic_ambiguous: slot.semantic_ambiguous,
+        fork_safe: slot.fork_safe,
+        module_ids,
+    }
+}
+
+fn drive_measure(slots: &[Slot]) -> usize {
+    let mut measure = RetainedInputMeasure::new(slots.len()).unwrap();
+    for slot in slots {
+        while !measure.step(slot).unwrap() {}
+    }
+    measure.bytes()
+}
+
+#[test]
+fn collected_retirement_input_measure_covers_preflight() {
+    let (_dir, pins, mut native, slots) = collected_case(
+        2,
+        Box::new(|_, _| panic!("measure and seal do not close original links")),
+    );
+    // (a) Spare capacities cover the exact-clone need.
+    let mut spare = slots.clone();
+    for slot in &mut spare {
+        slot.object_path.reserve(128);
+        slot.names.reserve(8);
+        for name in &mut slot.names {
+            name.reserve(64);
+        }
+        slot.module_ids.reserve(8);
+    }
+    for (spare_slot, slot) in spare.iter().zip(&slots) {
+        assert!(spare_slot.object_path.capacity() > slot.object_path.len());
+        assert!(spare_slot.names.capacity() > slot.names.len());
+        assert!(spare_slot.module_ids.capacity() >= slot.module_ids.len());
+    }
+    let spare_bytes = drive_measure(&spare);
+    let exact: Vec<Slot> = slots.iter().map(exact_slot_clone).collect();
+    for (clone, slot) in exact.iter().zip(&slots) {
+        assert_eq!(clone.object_path.capacity(), slot.object_path.len());
+        assert_eq!(clone.names.capacity(), slot.names.len());
+        for (a, b) in clone.names.iter().zip(&slot.names) {
+            assert_eq!(a.capacity(), b.len());
+        }
+        assert_eq!(clone.module_ids.capacity(), slot.module_ids.len());
+    }
+    let exact_bytes = drive_measure(&exact);
+    assert!(
+        spare_bytes >= exact_bytes,
+        "spare capacities must cover the exact clone: spare={spare_bytes} exact={exact_bytes}"
+    );
+
+    let pool = SemanticResourcePool::reference_limit(COLLECTED_POOL_BYTES);
+    let reserve = pool.reserver();
+    let q = native.observe_q();
+    let mut removed = Vec::with_capacity(exact.len());
+    removed.extend_from_slice(&exact);
+    assert_eq!(removed.capacity(), exact.len());
+    let mut input = Some(collected_input(
+        removed,
+        reserve.reserve(COLLECTED_INPUT_BYTES).unwrap(),
+    ));
+    let mut preflight_need = None;
+    let ticket = (0..COLLECTED_CREDITS)
+        .find_map(|_| {
+            let progress = native.prepare(&q, &mut input, &reserve, 1).unwrap();
+            assert_eq!(progress.used, 1);
+            if native.preflight_at_input_coverage() && preflight_need.is_none() {
+                preflight_need = native.preflight_checkpoint().map(|checkpoint| checkpoint.3);
+            }
+            match progress.state {
+                CollectedRetirementState::Preparing => None,
+                CollectedRetirementState::Prepared(ticket) => Some(ticket),
+                _ => panic!("spare-measured input did not prepare"),
+            }
+        })
+        .expect("spare-measured preparation exhausted its finite credits");
+    let preflight_need = preflight_need.expect("input coverage must be observable");
+    assert_eq!(exact_bytes, preflight_need);
+    assert!(spare_bytes >= preflight_need);
+    assert!(input.is_none());
+    drop(ticket);
+    drop(native);
+
+    // (b) Exact capacities: the measured bytes fit exactly, one less fails.
+    for (delta, healthy) in [(0, true), (1, false)] {
+        let mut native = CollectedRetirementFixture::new(
+            &slots,
+            &pins,
+            Box::new(|_, _| panic!("an envelope test must not close native ownership")),
+        );
+        let q = native.observe_q();
+        let pool = SemanticResourcePool::reference_limit(COLLECTED_POOL_BYTES);
+        let reserve = pool.reserver();
+        let exact: Vec<Slot> = slots.iter().map(exact_slot_clone).collect();
+        let need = drive_measure(&exact);
+        assert_eq!(need, exact_bytes);
+        let mut removed = Vec::with_capacity(exact.len());
+        removed.extend_from_slice(&exact);
+        let ptr = removed.as_ptr();
+        let lease = reserve.reserve(need - delta).unwrap();
+        let mut input = Some(collected_input(removed, lease));
+        let links = native.original_links();
+        let retained = native.retained_slots();
+        let mut ticket = None;
+        let mut failure = None;
+        for _ in 0..COLLECTED_CREDITS {
+            match native.prepare(&q, &mut input, &reserve, 1) {
+                Ok(progress) => {
+                    assert_eq!(progress.used, 1);
+                    match progress.state {
+                        CollectedRetirementState::Preparing => {}
+                        CollectedRetirementState::Prepared(found) => {
+                            ticket = Some(found);
+                            break;
+                        }
+                        _ => panic!("exact envelope reached an unexpected phase"),
+                    }
+                }
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
+            }
+        }
+        assert_eq!(ticket.is_some(), healthy);
+        assert_eq!(failure.is_some(), !healthy);
+        if healthy {
+            assert!(input.is_none());
+        } else {
+            let error = failure.unwrap();
+            assert_eq!(
+                error.to_string(),
+                "collected retirement input is foreign or undercharged"
+            );
+            let kept = input.as_ref().expect("short input stays with the caller");
+            assert_eq!(kept.removed.as_ptr(), ptr);
+            assert_eq!(kept.removed, exact);
+        }
+        assert_eq!(native.original_links(), links);
+        assert_eq!(native.retained_slots(), retained);
+        assert_eq!(native.native_counts(), (0, 0, 0, 0));
+    }
 }

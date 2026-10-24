@@ -102,6 +102,52 @@ impl RetirementFixture {
     pub(crate) fn released(&self) -> usize {
         self.worker.progress().released
     }
+
+    pub(crate) fn new_collected(slots: &[Slot], pins: &PinnedObjects, closer: Closer) -> Self {
+        Self::new(slots, pins, closer)
+    }
+
+    pub(crate) fn collected_q(&self) -> Option<&super::super::CollectedFinishQ> {
+        None
+    }
+
+    pub(crate) fn collected_prepare(
+        &mut self,
+        input: &mut Option<RetainedRetirementInput>,
+        reserve: &crate::semantics_edge::resources::SemanticResourceReserver,
+        work: usize,
+    ) -> Result<RetirementProgress> {
+        let _ = (input, reserve, work);
+        bail!("skeleton")
+    }
+
+    pub(crate) fn collected_begin(
+        &mut self,
+        ticket: &CollectedRetirementTicket,
+        work: usize,
+    ) -> Result<RetirementProgress> {
+        let _ = (ticket, work);
+        bail!("skeleton")
+    }
+
+    pub(crate) fn collected_poll(
+        &mut self,
+        ticket: &CollectedRetirementTicket,
+        work: usize,
+    ) -> Result<RetirementProgress> {
+        let _ = (ticket, work);
+        bail!("skeleton")
+    }
+
+    pub(crate) fn collected_cancel(
+        &mut self,
+        input: Option<&RetainedRetirementInput>,
+        ticket: Option<&CollectedRetirementTicket>,
+        work: usize,
+    ) -> Result<RetirementProgress> {
+        let _ = (input, ticket, work);
+        bail!("skeleton")
+    }
 }
 
 // The collected controls reuse the existing real mmap Q observer and the
@@ -124,38 +170,51 @@ pub(super) struct OriginalLink {
     generations: Vec<Option<u64>>,
 }
 
+fn seal_collected(
+    native: &mut RetirementFixture,
+    slots: &[Slot],
+) -> (
+    super::super::CollectedFinishQObserverForTest,
+    super::super::SessionDrainProducers,
+    crate::events::EventDrain<crate::events::ScriptedRecords>,
+) {
+    // Actual PairBook state makes premature invalidation observable. The
+    // controlled clock/health leaves confer no process-continuity proof.
+    native.pairs.seal(
+        &[super::super::pid_continuity::AttachRound {
+            slots: slots.iter().map(|slot| slot.index).collect(),
+            started_ns: Some(10),
+            last_call_ns: Some(20),
+        }],
+        Some(super::super::pid_continuity::AttachBaseline { loss: 0, fault: 0 }),
+        Some(0),
+        &native.links,
+        &super::super::current_static_sides_from(&native.links),
+        &native.retained,
+        || Some(30),
+    );
+    for slot in slots {
+        assert_eq!(native.pairs.recorded_generation(slot.index), Some(1));
+    }
+    let producers = super::super::SessionDrainProducers {
+        native: super::super::capture::NativeDomainId::mint(),
+        events: crate::events::EventsDomain::test_standin(0xc011),
+    };
+    let events = crate::events::EventDrain::over_domain(
+        crate::events::ScriptedRecords::records([vec![0]], 1),
+        producers.events.clone(),
+    );
+    let observer = super::super::CollectedFinishQObserverForTest::new(&producers);
+    (observer, producers, events)
+}
+
 impl CollectedRetirementFixture {
     pub(super) fn new(slots: &[Slot], pins: &PinnedObjects, closer: Closer) -> Self {
         let mut native = RetirementFixture::new(slots, pins, closer);
-        // Actual PairBook state makes premature invalidation observable. The
-        // controlled clock/health leaves confer no process-continuity proof.
-        native.pairs.seal(
-            &[super::super::pid_continuity::AttachRound {
-                slots: slots.iter().map(|slot| slot.index).collect(),
-                started_ns: Some(10),
-                last_call_ns: Some(20),
-            }],
-            Some(super::super::pid_continuity::AttachBaseline { loss: 0, fault: 0 }),
-            Some(0),
-            &native.links,
-            &super::super::current_static_sides_from(&native.links),
-            &native.retained,
-            || Some(30),
-        );
-        for slot in slots {
-            assert_eq!(native.pairs.recorded_generation(slot.index), Some(1));
-        }
-        let producers = super::super::SessionDrainProducers {
-            native: super::super::capture::NativeDomainId::mint(),
-            events: crate::events::EventsDomain::test_standin(0xc011),
-        };
-        let events = crate::events::EventDrain::over_domain(
-            crate::events::ScriptedRecords::records([vec![0]], 1),
-            producers.events.clone(),
-        );
+        let (observer, producers, events) = seal_collected(&mut native, slots);
         Self {
             native,
-            observer: super::super::CollectedFinishQObserverForTest::new(&producers),
+            observer,
             producers,
             events,
             reads: std::cell::Cell::new((0, 0)),
@@ -176,6 +235,13 @@ impl CollectedRetirementFixture {
             .observe(&self.producers, None, &self.events)
             .unwrap()
             .expect("the retained original observer sees actual STOP/count0")
+    }
+
+    pub(super) fn observe_q_again(&self) -> super::super::CollectedFinishQ {
+        self.observer
+            .observe(&self.producers, None, &self.events)
+            .unwrap()
+            .expect("the retained observer still sees STOP/count0")
     }
 
     pub(super) fn prepare(

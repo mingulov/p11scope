@@ -58,8 +58,8 @@ mod object_stop;
 pub(crate) use native_retirement::fixture::RetirementFixture;
 #[allow(unused_imports)] // Shared crate-private ports consumed by the next Engine packet.
 pub(crate) use native_retirement::{
-    CollectedRetirementState, CollectedRetirementTicket, RetainedRetirementInput,
-    RetainedRetirementInputRefusal, RetirementProgress,
+    CollectedRetirementState, CollectedRetirementTicket, RetainedInputMeasure,
+    RetainedRetirementInput, RetainedRetirementInputRefusal, RetirementProgress,
 };
 pub(crate) use native_retirement::{RetirementPoll, RetirementTicket};
 #[allow(dead_code)] // B2 records private facts; B3 supplies request-bound validation.
@@ -6885,7 +6885,6 @@ impl Session {
     /// Bounded collected retirement on this original stopped Session. STOP
     /// prevents fresh attachment; the exact original Q separately permits
     /// this removal-only carrier. No live-only stopped refusal is reused.
-    #[allow(dead_code)] // Coordinator integration is a separate packet.
     pub(crate) fn prepare_collected_static_retirement(
         &mut self,
         q: &CollectedFinishQ,
@@ -6945,7 +6944,6 @@ impl Session {
         )
     }
 
-    #[allow(dead_code)] // Coordinator integration is a separate packet.
     pub(crate) fn begin_collected_static_retirement(
         &mut self,
         q: &CollectedFinishQ,
@@ -7004,7 +7002,6 @@ impl Session {
         )
     }
 
-    #[allow(dead_code)] // Coordinator integration is a separate packet.
     pub(crate) fn poll_collected_static_retirement(
         &mut self,
         q: &CollectedFinishQ,
@@ -7049,7 +7046,6 @@ impl Session {
         )
     }
 
-    #[allow(dead_code)] // Cancellation releases only this original carrier.
     pub(crate) fn cancel_collected_static_retirement(
         &mut self,
         input: Option<&RetainedRetirementInput>,
@@ -7065,6 +7061,18 @@ impl Session {
             .context("collected cancellation needs its original worker")?;
         self.native_retirement
             .cancel_collected_with(input, ticket, worker, work)
+    }
+
+    /// Whether this Session retires collected removals physically at Q.
+    /// Multi lanes close links natively; Singles lanes retire logically
+    /// only and the terminal detach closes everything.
+    pub(crate) fn collected_retirement_is_physical(&self) -> bool {
+        Self::collected_retirement_is_physical_for(self.backend)
+    }
+
+    pub(crate) fn collected_retirement_is_physical_for(backend: AttachBackend) -> bool {
+        let _ = backend;
+        true
     }
 
     /// Cleanup of an uncompleted new attachment is not coverage retirement.

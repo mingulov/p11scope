@@ -429,6 +429,33 @@ fn array_bytes_for<T>(values: &Vec<T>) -> Result<usize> {
     array_bytes::<T>(values.capacity())
 }
 
+/// Engine-side measure of removed-input bytes (skeleton: unmeasured).
+pub(crate) struct RetainedInputMeasure {
+    bytes: usize,
+    sizing: SlotSizing,
+}
+
+impl RetainedInputMeasure {
+    pub(crate) fn new(removed: usize) -> Result<Self> {
+        let mut bytes = std::mem::size_of::<RetainedRetirementInput>();
+        add_bytes(&mut bytes, array_bytes::<Slot>(removed)?)?;
+        Ok(Self {
+            bytes,
+            sizing: SlotSizing::default(),
+        })
+    }
+
+    pub(crate) fn step(&mut self, source: &Slot) -> Result<bool> {
+        let _ = source;
+        let _ = self.sizing;
+        Ok(true)
+    }
+
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
 // Refusal-only cache/version checks beneath the actual Session/Q owner and
 // exclusive mutation fence. Inline BTreeMap/PairBook addresses are not owner
 // identity: moving the same Session must not replace its native ownership.

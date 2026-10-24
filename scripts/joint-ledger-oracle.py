@@ -14,7 +14,10 @@ import json
 import re
 import sys
 
-MAX_ROWS = 200000
+MAX_CALLS = 200000
+# ready + calls + ack: the emitter's COUNT ceiling (per-call-ledger.c
+# MAX_CALLS) plus its two framing rows, so COUNT 200000 passes.
+MAX_ROWS = MAX_CALLS + 2
 MAX_LINE_BYTES = 4096
 MAX_LEDGER_BYTES = 32 * 1024 * 1024
 MAX_WORD = (1 << 64) - 1
@@ -48,6 +51,28 @@ def _unique_object(pairs):
 
 def _invalid_constant(_value):
     raise LedgerError("nonfinite JSON number")
+
+
+def _shown(value):
+    """Render an untrusted value inside a refusal reason.
+
+    Integers print verbatim (claim narrowing needs the measured numbers);
+    anything else prints as its fixed JSON kind, never its content, so a
+    refusal carries numbers only and never echoes ledger payload.
+    """
+    if type(value) is int:
+        return str(value)
+    if value is None:
+        return "null"
+    if type(value) is bool:
+        return "boolean"
+    if type(value) is float:
+        return "non-integer number"
+    if type(value) is str:
+        return "string"
+    if type(value) is list:
+        return "array"
+    return "object"
 
 
 def _read_jsonl(stream, what):
@@ -114,14 +139,14 @@ def validate_ledger(rows):
     for position, row in enumerate(calls, start=1):
         _keys(row, {"kind", "seq", "fn", "rv", "pid", "tid", "t0", "t1"})
         _require(row["seq"] == position,
-                 f"seq {row['seq']} breaks contiguity at position {position}")
+                 f"seq {_shown(row['seq'])} breaks contiguity at position {position}")
         _require(type(row["fn"]) is str and FN_PATTERN.match(row["fn"]),
                  f"fn label invalid at seq {position}")
         _require(_integer(row["rv"]), f"rv out of range at seq {position}")
         _require(row["pid"] == ready["pid"],
-                 f"pid {row['pid']} disagrees with ready pid at seq {position}")
+                 f"pid {_shown(row['pid'])} disagrees with ready pid at seq {position}")
         _require(row["tid"] == ready["tid"],
-                 f"tid {row['tid']} disagrees with ready tid at seq {position}")
+                 f"tid {_shown(row['tid'])} disagrees with ready tid at seq {position}")
         _require(_integer(row["t0"]) and _integer(row["t1"]),
                  f"t0/t1 out of range at seq {position}")
         _require(row["t0"] <= row["t1"],
@@ -137,13 +162,15 @@ def compare_settlement(rows, events, p99_ns=None, min_rate_per_s=None):
     Every issued call must settle exactly once (no loss, no extras), every
     latency must be non-negative, and the optional p99/rate budgets must
     hold. Returns settled/loss/p99/rate; the achieved rate comes from
-    fixture-side t0/t1 stamps, never from observer claims.
+    fixture-side t0/t1 stamps, never from observer claims. Rows must have
+    passed validate_ledger.
     """
     calls = [row for row in rows if row.get("kind") == "call"]
     _require(calls, "empty settlement: no calls to join")
     end = {}
     for row in calls:
-        _require(row["seq"] not in end, f"duplicate seq {row['seq']} in ledger")
+        _require(row["seq"] not in end,
+                 f"duplicate seq {_shown(row['seq'])} in ledger")
         end[row["seq"]] = row["t1"]
     expected = set(end)
     seen = set()
@@ -153,16 +180,17 @@ def compare_settlement(rows, events, p99_ns=None, min_rate_per_s=None):
         at_ns = event.get("at_ns")
         seq = event.get("ledger_seq")
         _require(_integer(at_ns), "event at_ns out of range")
-        _require(seq in expected, f"event for unknown seq {seq}")
-        _require(seq not in seen, f"duplicate event for seq {seq}")
+        _require(seq in expected, f"event for unknown seq {_shown(seq)}")
+        _require(seq not in seen, f"duplicate event for seq {_shown(seq)}")
         seen.add(seq)
-        _require(at_ns >= end[seq], f"event at_ns precedes END t1 at seq {seq}")
+        _require(at_ns >= end[seq],
+                 f"event at_ns precedes END t1 at seq {_shown(seq)}")
         latencies.append(at_ns - end[seq])
     missing = sorted(expected - seen)
     if missing:
         raise LedgerError(
             f"loss: {len(missing)} of {len(expected)} calls unsettled "
-            f"(missing seq {missing[0]})")
+            f"(missing seq {_shown(missing[0])})")
     ordered = sorted(latencies)
     p99 = ordered[(99 * len(ordered) + 99) // 100 - 1]
     if p99_ns is not None:
@@ -200,8 +228,11 @@ def main(argv=None):
                     events = read_events(stream)
             result.update(compare_settlement(
                 rows, events, args.p99_ns, args.min_rate))
-    except (LedgerError, OSError, UnicodeError):
-        print("ledger refused: incomplete or inconsistent input", file=sys.stderr)
+    except LedgerError as error:
+        print(f"ledger refused: {error}", file=sys.stderr)
+        return 1
+    except (OSError, UnicodeError):
+        print("ledger refused: unreadable input", file=sys.stderr)
         return 1
     print(json.dumps(result, sort_keys=True))
     return 0

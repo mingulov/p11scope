@@ -1,21 +1,27 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
-/* R2 T0: independent per-call ledger emitter (E17 pattern).
+/* Independent per-call ledger emitter (E17 pattern).
  *
  * Usage: per-call-ledger PROVIDER TABLE_INDEX COUNT LEDGER_PATH [GO_FILE]
  *
- * Opens PROVIDER, resolves C_GetFunctionList, and calls the table entry at
- * TABLE_INDEX (0..103, one-pointer-argument shape, NULL argument) COUNT
- * times, recording one JSONL row per call with CLOCK_MONOTONIC t0/t1 stamps.
- * Prints "READY pid=<pid>" after the table is validated, then, when GO_FILE
- * is given, waits for that path to appear before emitting the ready row.
+ * Stub-only fixture: PROVIDER must come from the live-discovery-provider
+ * stub family (the P11ScopeSlot68 marker export must be present); anything
+ * else is refused, because calling unknown-signature entries through the
+ * one-pointer-argument TableEntry would be undefined behaviour. Calls the
+ * table entry at TABLE_INDEX (0..103, one-pointer-argument shape, NULL
+ * argument) COUNT times (1..200000), recording one JSONL row per call with
+ * CLOCK_MONOTONIC t0/t1 stamps. Prints "READY pid=<pid>" after the table
+ * is validated, then, when GO_FILE is given, waits for that path to appear
+ * before emitting the ready row; SIGTERM/SIGINT interrupts the wait.
  * Exit 0 when every call returned CKR_OK, 1 when the ledger is complete but
- * some call did not, 2 on usage/setup failure. LP64 only.
+ * some call did not, 2 on usage/setup/refusal failure. LP64 only; ia32
+ * twins use their own driver, never this emitter.
  */
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <stddef.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -40,6 +46,13 @@ _Static_assert(offsetof(ProviderTable, functions) == 8, "table layout");
 typedef unsigned long (*TableEntry)(void **);
 typedef unsigned long (*GetFunctionList)(void **);
 
+static volatile sig_atomic_t stop;
+
+static void on_signal(int number) {
+    (void)number;
+    stop = 1;
+}
+
 static int clock_ns(uint64_t *out) {
     struct timespec now;
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
@@ -50,13 +63,13 @@ static int clock_ns(uint64_t *out) {
 }
 
 static int wait_for_go(const char *path) {
-    while (access(path, F_OK) != 0) {
+    while (access(path, F_OK) != 0 && !stop) {
         if (errno != ENOENT) {
             return -1;
         }
         usleep(10000);
     }
-    return 0;
+    return stop ? 1 : 0;
 }
 
 static int parse_number(const char *text, unsigned long bound, unsigned long *out) {
@@ -93,6 +106,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "per-call-ledger: COUNT must be 1..%d\n", MAX_CALLS);
         return 2;
     }
+    signal(SIGTERM, on_signal);
+    signal(SIGINT, on_signal);
     void *handle = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
     if (handle == NULL) {
         fprintf(stderr, "per-call-ledger: cannot open provider: %s\n", dlerror());
@@ -111,12 +126,21 @@ int main(int argc, char **argv) {
         dlclose(handle);
         return 2;
     }
+    if (dlsym(handle, "P11ScopeSlot68") == NULL) {
+        fprintf(stderr, "per-call-ledger: refuses non-stub provider (stub-only fixture)\n");
+        dlclose(handle);
+        return 2;
+    }
     TableEntry entry = (TableEntry)table->functions[index];
 
     printf("READY pid=%d\n", (int)getpid());
     fflush(stdout);
     if (argc == 6 && wait_for_go(argv[5]) != 0) {
-        fprintf(stderr, "per-call-ledger: cannot wait for gate\n");
+        if (stop) {
+            fprintf(stderr, "per-call-ledger: interrupted while waiting for gate\n");
+        } else {
+            fprintf(stderr, "per-call-ledger: cannot wait for gate\n");
+        }
         dlclose(handle);
         return 2;
     }

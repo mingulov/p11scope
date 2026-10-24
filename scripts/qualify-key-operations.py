@@ -5,16 +5,21 @@
 Inputs are the controlled application's JSONL ledger (validated by
 scripts/key-operation-ledger.py, which derives counts from call rows rather
 than summaries) and the observer's saved `p11scope/inventory/v1` document,
-from which only the `object_observations` section is read (a bare section
-is also accepted). The oracle re-sums observed completed/failed outcomes
-from the per-row counters itself, pins the frozen H9 key/enum contract and
-the row equation, and refuses any unattributed, cancelled, unknown, active,
-lost, gapped or otherwise unsettled sign/verify outcome. It never trusts
-the product's own accounting (`done`, `budgets.occupied`, `encoded_bytes`):
-occupancy is cross-checked against the rows the oracle counted, never used
-as a tally. Secondary `wrapped_object` rows and `message_contexts` units
-never count as operations. Refusal diagnostics name only frozen labels and
-counts; unknown product strings are never echoed.
+from which the `object_observations` section is read (a bare section
+is also accepted). When the document carries top-level `edges`, the S1
+`edges[].mechanisms` rows are additionally checked for the expected
+CKM_SHA256_RSA_PKCS attribution of sign/verify; bare sections and
+edge-less envelopes leave the mechanism dimension unknown. The oracle
+re-sums observed completed/failed outcomes from the per-row counters
+itself, pins the frozen H9 key/enum contract and the row equation, and
+refuses any unattributed, cancelled, unknown, active, lost, gapped or
+otherwise unsettled sign/verify outcome. It never trusts the product's own
+accounting (`done`, `budgets.occupied`, `encoded_bytes`): occupancy is
+cross-checked against the rows the oracle counted, never used as a tally.
+Secondary `wrapped_object` rows and `message_contexts` units never count
+as operations (all-zero rows of any category/role/unit/metadata are
+tolerated as idle and contribute nothing). Refusal diagnostics name only
+frozen labels and counts; unknown product strings are never echoed.
 
 Exit 0 prints the match summary as JSON; exit 1 leaves stdout empty and
 names the finite refusal cause on stderr.
@@ -28,10 +33,16 @@ import sys
 from pathlib import Path
 
 
+# Whole inventory-document bound (the CLI reads the full inventory/v1
+# document, not just the section); section rows are additionally capped by
+# the 65536 row budgets, the 256 gap cap and the occupancy cross-checks.
 MAX_OBSERVER_BYTES = 8 * 1024 * 1024
 MAX_WORD = (1 << 64) - 1
 INVENTORY_SCHEMA = "p11scope/inventory/v1"
+OBSERVATIONS_VERSION = 1
 ROW_BUDGET_LIMIT = 65536
+GAPS_CAPACITY = 256
+METADATA_SCALAR_MAX = 65535
 
 # Frozen H9 vocabularies (src/key_operation_projection.rs contract tables
 # and docs/schema/inventory-v1-object-observations.schema.json). A schema
@@ -47,6 +58,8 @@ CREATIONS = ("create", "copy", "generate", "generate_pair", "derive", "unwrap")
 LIFETIMES = ("live", "destroyed", "access_ended", "retired")
 ATTRIBUTIONS = ("valid", "downgraded")
 METADATA_KEYS = ("class", "key_type", "token", "value_len", "modulus_bits", "ec_params")
+FIELD_STATUSES = ("unknown", "value", "conflict", "invalidated")
+CURVE_LABELS = ("secp256r1", "secp384r1", "secp521r1")
 QUERY_STATUSES = ("not_queried", "established", "unavailable", "size_only", "unsupported",
                   "malformed", "excluded")
 METADATA_LABELS = ("rsa_1024", "rsa_2048", "rsa_3072", "rsa_4096", "rsa_other", "aes_128",
@@ -91,6 +104,12 @@ GAP_ROW_KEYS = {"subject", "reason", "repeats"}
 BUDGET_KEYS = {"key_rows", "object_rows", "unknown_rows", "encoded_bytes",
                "allocation_refused", "refusal_reason"}
 ROW_BUDGET_KEYS = {"limit", "occupied", "refused"}
+UNKNOWN_BUDGET_KEYS = {"occupied"}
+FIELD_KEYS = {"status", "value"}
+MECHANISM_ROW_KEYS = {"mechanism", "mechanism_hex", "name", "operations", "calls",
+                      "errors", "last_seen_ns", "evidence"}
+MECHANISM_EVIDENCE_KEYS = {"functions", "returns", "truncated"}
+MECHANISM_RETURN_KEYS = {"rv", "rv_hex", "name"}
 
 INSTANCE_RE = re.compile(r"i[0-9]+")
 
@@ -98,6 +117,10 @@ INSTANCE_RE = re.compile(r"i[0-9]+")
 CELL_CATEGORIES = ("sign", "verify")
 CELL_ROLE = "key"
 CELL_METADATA = "rsa_2048"
+CELL_MECHANISM = 0x40
+CELL_MECHANISM_HEX = "0x40"
+CELL_MECHANISM_NAME = "CKM_SHA256_RSA_PKCS"
+CELL_MECHANISM_OPS = ("sign", "verify")
 EXPECTED_API_CALLS = 68
 EXPECTED_CALLS = {"C_Sign": 9, "C_SignUpdate": 9, "C_Verify": 12}
 EXPECTED_OPERATIONS = {"sign": {"completed": 10, "failed": 0},
@@ -179,6 +202,18 @@ def read_observer_file(path):
 
 def _metadata_block(block):
     _keys(block, METADATA_KEYS)
+    for name in METADATA_KEYS:
+        cell = block[name]
+        _keys(cell, FIELD_KEYS)
+        _label(cell["status"], FIELD_STATUSES, "metadata field status")
+        value = cell["value"]
+        if name == "ec_params":
+            _require(value is None or (type(value) is str and value in CURVE_LABELS),
+                     "unexpected metadata curve")
+        else:
+            _require(value is None or (type(value) is int
+                                       and 0 <= value <= METADATA_SCALAR_MAX),
+                     "invalid metadata scalar")
 
 
 def _check_sessions(rows):
@@ -250,6 +285,8 @@ def _check_key_row(row, objects):
     _require(counters["started"] == counters["completed"] + counters["failed"]
              + counters["cancelled"] + counters["unknown"] + counters["active"]
              + counters["key_join_lost"], "key row equation mismatch")
+    if all(value == 0 for value in counters.values()):
+        return category, counters
     _require(unit == "operations", f"unexpected observed unit {unit}")
     _require(category in CELL_CATEGORIES, f"unexpected observed category {category}")
     _require(role == CELL_ROLE, f"unexpected observed role {role}")
@@ -271,6 +308,7 @@ def _check_unknown_row(row):
 def _check_gaps(gaps):
     _keys(gaps, {"rows", "suppressed"})
     _require(type(gaps["rows"]) is list and _u64(gaps["suppressed"]), "invalid gaps")
+    _require(len(gaps["rows"]) <= GAPS_CAPACITY, "too many gap rows")
     seen = set()
     for row in gaps["rows"]:
         _keys(row, GAP_ROW_KEYS)
@@ -294,10 +332,15 @@ def _check_budgets(budgets, key_len, object_len, unknown_len):
         _require(_uint(block["occupied"]) and _u64(block["refused"]), "invalid row budget")
         _require(block["occupied"] == length,
                  f"{name} budget occupancy disagrees with rows")
+        _require(block["occupied"] <= block["limit"],
+                 f"{name} budget occupancy exceeds limit")
         _require(block["refused"] == 0, "budget rows were refused")
     unknown = budgets["unknown_rows"]
-    _keys(unknown, {"occupied"})
+    _keys(unknown, UNKNOWN_BUDGET_KEYS)
     _require(_uint(unknown["occupied"]), "invalid row budget")
+    # No upper bound: the schema leaves unknown_rows.occupied unbounded
+    # (finite by construction, category x reason, capture-wide, with no
+    # limit or refusal path); only the cross-check against rows applies.
     _require(unknown["occupied"] == unknown_len,
              "unknown_rows budget occupancy disagrees with rows")
     _require(_uint(budgets["encoded_bytes"]), "invalid budget encoding size")
@@ -308,7 +351,8 @@ def _check_budgets(budgets, key_len, object_len, unknown_len):
 def check_section(section):
     """Validate the section shape and return the checked facts."""
     _keys(section, SECTION_KEYS)
-    _require(section["version"] == 1 and type(section["version"]) is int,
+    _require(section["version"] == OBSERVATIONS_VERSION
+             and type(section["version"]) is int,
              "unsupported observations version")
     _require(_u64(section["revision"]), "invalid observations revision")
     status = _label(section["status"], STATUSES, "status")
@@ -318,6 +362,7 @@ def check_section(section):
     objects = _check_objects(section["objects"], sessions)
     tallies = {}
     order = []
+    _require(type(section["key_operations"]) is list, "unexpected fields")
     for row in section["key_operations"]:
         category, counters = _check_key_row(row, objects)
         key = (row["instance"], row["object"], category, row["role"], row["metadata_at_use"])
@@ -326,6 +371,7 @@ def check_section(section):
         order.append(key)
     _require(sorted(order) == order, "key rows out of order")
     unknown = []
+    _require(type(section["unknown_key_operations"]) is list, "unexpected fields")
     for row in section["unknown_key_operations"]:
         unknown.append(_check_unknown_row(row))
     pairs = [(category, reason) for category, reason, _, _ in unknown]
@@ -335,6 +381,94 @@ def check_section(section):
     _check_budgets(section["budgets"], len(order), len(objects), len(unknown))
     return {"status": status, "reason": reason, "rows": list(tallies.values()),
             "unknown": unknown, "gaps": gaps}
+
+
+def _check_mechanism_row(row):
+    _keys(row, MECHANISM_ROW_KEYS)
+    _require(_u64(row["mechanism"]), "invalid mechanism row")
+    _require(type(row["mechanism_hex"]) is str
+             and row["mechanism_hex"] == f"0x{row['mechanism']:x}",
+             "inconsistent mechanism hex")
+    _require(row["name"] is None or type(row["name"]) is str,
+             "unexpected mechanism name shape")
+    operations = row["operations"]
+    _require(type(operations) is list
+             and all(type(item) is str and item in CATEGORIES for item in operations),
+             "unexpected mechanism operation")
+    _require(sorted(operations) == operations
+             and len(set(operations)) == len(operations),
+             "mechanism operations out of order")
+    _require(_u64(row["calls"]) and _u64(row["errors"])
+             and _u64(row["last_seen_ns"]), "invalid mechanism counters")
+    evidence = row["evidence"]
+    _keys(evidence, MECHANISM_EVIDENCE_KEYS)
+    functions = evidence["functions"]
+    _require(type(functions) is list
+             and all(type(item) is str for item in functions),
+             "unexpected mechanism function")
+    _require(sorted(functions) == functions
+             and len(set(functions)) == len(functions),
+             "mechanism functions out of order")
+    returns = evidence["returns"]
+    _require(type(returns) is list, "unexpected mechanism returns")
+    seen = set()
+    for entry in returns:
+        _keys(entry, MECHANISM_RETURN_KEYS)
+        _require(_u64(entry["rv"]), "invalid mechanism return")
+        _require(type(entry["rv_hex"]) is str
+                 and entry["rv_hex"] == f"0x{entry['rv']:x}",
+                 "inconsistent return hex")
+        _require(entry["name"] is None or type(entry["name"]) is str,
+                 "unexpected return name")
+        _require(entry["rv"] not in seen, "duplicate mechanism return")
+        seen.add(entry["rv"])
+    _require(sorted(seen) == [entry["rv"] for entry in returns],
+             "mechanism returns out of order")
+    _require(type(evidence["truncated"]) is bool, "unexpected mechanism truncation")
+    return (row["mechanism"], row["name"], operations, row["calls"],
+            evidence["truncated"])
+
+
+def _check_mechanisms(doc):
+    """Check the S1 mechanism dimension when the document carries edges.
+
+    Returns the observed operations of the expected CKM_SHA256_RSA_PKCS
+    row, or None when the document has no edges (bare section or
+    edge-less envelope: mechanism unknown, judged on the
+    object_observations dimension only).
+    """
+    if "edges" not in doc:
+        return None
+    edges = doc["edges"]
+    _require(type(edges) is list, "unexpected edges shape")
+    found = None
+    for edge in edges:
+        _require(type(edge) is dict, "unexpected edges shape")
+        if "mechanisms" not in edge:
+            continue
+        rows = edge["mechanisms"]
+        _require(rows is None or type(rows) is list, "unexpected mechanisms shape")
+        if rows is None:
+            continue
+        ids = []
+        for row in rows:
+            mechanism, name, operations, calls, truncated = _check_mechanism_row(row)
+            ids.append(mechanism)
+            if mechanism == CELL_MECHANISM:
+                _require(name == CELL_MECHANISM_NAME, "unexpected mechanism name")
+                _require(calls > 0, "mechanism without calls")
+                _require(truncated is False, "truncated mechanism provenance")
+                _require(set(CELL_MECHANISM_OPS) <= set(operations),
+                         f"mechanism {CELL_MECHANISM_NAME} missing expected operations")
+                if found is None:
+                    found = sorted(operations)
+            else:
+                _require(not (set(operations) & set(CELL_MECHANISM_OPS)),
+                         f"inconsistent_mechanism for sign/verify under {mechanism}")
+        _require(sorted(ids) == ids and len(set(ids)) == len(ids),
+                 "mechanism rows out of order")
+    _require(found is not None, f"missing expected mechanism {CELL_MECHANISM_NAME}")
+    return found
 
 
 def _dispatch(doc):
@@ -380,6 +514,7 @@ def compare(application_rows, observer_doc):
                  f" completed {counters['completed']} failed {counters['failed']}"
                  f" cancelled {counters['cancelled']} unknown {counters['unknown']}"
                  f" active {counters['active']}")
+    mechanism_operations = _check_mechanisms(observer_doc)
     observed = {}
     for category in CELL_CATEGORIES:
         counters = {"started": 0, "completed": 0, "failed": 0, "cancelled": 0, "unknown": 0,
@@ -403,10 +538,20 @@ def compare(application_rows, observer_doc):
                  f"{expected['completed']}/{expected['failed']}")
         observed[category] = {"started": counters["started"], "completed": counters["completed"],
                               "failed": counters["failed"]}
+    if mechanism_operations is None:
+        observed["mechanism"] = None
+    else:
+        observed["mechanism"] = {"mechanism": CELL_MECHANISM,
+                                 "mechanism_hex": CELL_MECHANISM_HEX,
+                                 "name": CELL_MECHANISM_NAME,
+                                 "operations": mechanism_operations}
+    # The ledger pins the header mechanism to CKM_SHA256_RSA_PKCS during
+    # validation, so repeating the constant here restates validated input.
     return {"match": True,
             "application": {"api_calls": application["api_calls"],
                             "calls_by_function": application["calls_by_function"],
-                            "operations": application["operations"]},
+                            "operations": application["operations"],
+                            "mechanism": CELL_MECHANISM_NAME},
             "observed": observed}
 
 

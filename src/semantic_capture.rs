@@ -1212,6 +1212,11 @@ pub(crate) struct SemanticCapture {
     next_token: u64,
     awaiting: BTreeMap<u64, Awaiting>,
     jobs: VecDeque<ScanJob>,
+    /// Pinless waits: drained images with no binding pin yet, each with
+    /// the wait deadline (first drain plus the pending window). The
+    /// binding's own refresh scan observes and resolves the held calls
+    /// when it lands; past the deadline they expire as unobserved.
+    pinless: BTreeMap<(u64, u64), Instant>,
     bindings: BTreeMap<u64, TaskBinding>,
     terminal_cursor: u64,
     /// Fairness among tick-local Joined partitions when Pending scans leave
@@ -1266,6 +1271,7 @@ impl SemanticCapture {
             next_token: 1,
             awaiting: BTreeMap::new(),
             jobs: VecDeque::new(),
+            pinless: BTreeMap::new(),
             bindings: BTreeMap::new(),
             terminal_cursor: 0,
             joined_refresh_cursor: None,
@@ -1978,6 +1984,7 @@ impl SemanticCapture {
             });
         if self.awaiting.is_empty() {
             self.jobs.clear();
+            self.pinless.clear();
         } else {
             remaining_keys.extend(self.awaiting.values().map(Self::pending_key));
             remaining_keys.sort_unstable();
@@ -2505,6 +2512,7 @@ impl SemanticCapture {
         let resolved = self.router.fail_image_coverage();
         self.resolve(resolved, report);
         self.jobs.clear();
+        self.pinless.clear();
     }
     fn exhaust(&mut self, report: &mut TickReport) {
         if !self.exhausted {
@@ -2521,6 +2529,7 @@ impl SemanticCapture {
         let resolved = self.router.refuse_exhaustion();
         self.resolve(resolved, report);
         self.jobs.clear();
+        self.pinless.clear();
     }
     fn audit(&mut self, io: &mut impl CaptureIo, report: &mut TickReport) -> bool {
         let Ok(health) = io.health() else {
@@ -2966,7 +2975,19 @@ impl SemanticCapture {
                 continue;
             }
             let Some(pin) = io.target((record.base.event.pid_tgid >> 32) as u32) else {
-                self.expire(image, &mut report);
+                // No binding pin yet: hold for the imminent binding
+                // instead of shedding the caller's first burst. The
+                // binding's refresh scan observes and resolves these
+                // calls when it lands; the sweep below expires them
+                // past the pending window.
+                let key = (image.task_cookie, image.exec_id);
+                if !self.pinless.contains_key(&key) {
+                    let Some(deadline) = io.now().checked_add(self.limits.pending_for) else {
+                        self.exhaust(&mut report);
+                        continue;
+                    };
+                    self.pinless.insert(key, deadline);
+                }
                 continue;
             };
             let endpoint = endpoint.expect("checked owned endpoint");
@@ -2997,6 +3018,37 @@ impl SemanticCapture {
             self.expire(image, &mut report);
         }
         self.prune_jobs();
+        // Pinless waits keep their first-drain deadline across ticks.
+        // Prune images with nothing still awaited; expire past-deadline
+        // waits whose calls the binding never resolved.
+        let awaited: BTreeSet<(u64, u64)> = self
+            .awaiting
+            .values()
+            .map(|waiting| {
+                let image = waiting.record.base.event.image;
+                (image.task_cookie, image.exec_id)
+            })
+            .collect();
+        let mut expired_pinless = Vec::new();
+        self.pinless.retain(|key, deadline| {
+            if !awaited.contains(key) {
+                return false;
+            }
+            if io.now() >= *deadline {
+                expired_pinless.push(*key);
+                return false;
+            }
+            true
+        });
+        for (cookie, exec) in expired_pinless {
+            self.expire(
+                ImageIdentity {
+                    task_cookie: cookie,
+                    exec_id: exec,
+                },
+                &mut report,
+            );
+        }
         // Visit each initial queued job at most once. Refused peers rotate.
         let attempts = self.limits.scans.min(self.jobs.len());
         let mut attempted_keys = BTreeSet::new();
@@ -3127,6 +3179,7 @@ impl SemanticCapture {
             self.expire(image, report);
         }
         self.jobs.clear();
+        self.pinless.clear();
         self.stamp_disposition(report);
     }
 }

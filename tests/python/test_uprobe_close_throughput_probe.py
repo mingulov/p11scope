@@ -9,10 +9,15 @@ controller and is never executed by this suite.
 Run: python3 -I tests/python/test_uprobe_close_throughput_probe.py -v
 """
 
+import builtins
+import ctypes
 import json
+import os
 import runpy
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 PROBE = runpy.run_path(str(ROOT / "scripts/uprobe-close-throughput-probe.py"))
@@ -93,6 +98,140 @@ class TimingMathTests(unittest.TestCase):
         self.assertAlmostEqual(record["total_s"], 28.412)
         self.assertAlmostEqual(record["per_close_ms"], 28412.0 / 1026, places=3)
         self.assertEqual(record["binary"], "/bin/true")
+
+
+class PerfFlagTests(unittest.TestCase):
+    def test_perf_flag_fd_cloexec_is_kernel_value(self):
+        self.assertEqual(PROBE["PERF_FLAG_FD_CLOEXEC"], 8)
+        self.assertEqual(PROBE["PERF_FLAG_FD_CLOEXEC"], 1 << 3)
+
+    def test_perf_event_open_passes_cloexec_flag_to_syscall(self):
+        capture = {}
+        Attr = PROBE["PerfEventAttr"]
+
+        def fake_cdll(name, use_errno=False):
+            self.assertEqual(name, "libc.so.6")
+            handle = mock.Mock()
+
+            def fake_syscall(nr, attr_ptr, pid, cpu, group_fd, flags):
+                capture["nr"] = nr
+                capture["flags"] = flags
+                attr = ctypes.cast(attr_ptr, ctypes.POINTER(Attr)).contents
+                capture["type"] = attr.type
+                capture["config"] = attr.config
+                return 99
+
+            handle.syscall = fake_syscall
+            return handle
+
+        with mock.patch.object(ctypes, "CDLL", side_effect=fake_cdll):
+            fd = PROBE["perf_event_open"](2, 12345)
+        self.assertEqual(fd, 99)
+        self.assertEqual(capture["nr"], PROBE["NR_PERF_EVENT_OPEN"])
+        self.assertEqual(capture["flags"], 8)
+        self.assertEqual(capture["type"], 2)
+        self.assertEqual(capture["config"], 12345)
+
+
+class TracepointTypeTests(unittest.TestCase):
+    def test_create_events_without_uprobes_type_file_uses_tracepoint_type(self):
+        group = "p11close_test"
+        with tempfile.TemporaryDirectory() as tmp:
+            tracefs = Path(tmp) / "tracing"
+            (tracefs / "events" / group).mkdir(parents=True)
+            (tracefs / "uprobe_events").write_text("pre-existing\n")
+            pid = os.getpid()
+            for i in range(2):
+                name = "w%d_%d" % (pid, i)
+                event = tracefs / "events" / group / name
+                event.mkdir(parents=True)
+                (event / "id").write_text("42\n")
+            self.assertFalse((tracefs / "events/uprobes/type").exists())
+            seen = []
+            orig = PROBE["perf_event_open"]
+
+            def stub(uprobe_type, config):
+                seen.append((uprobe_type, config))
+                return 100 + len(seen)
+
+            PROBE["perf_event_open"] = stub
+            try:
+                fds, names = PROBE["create_events"](
+                    str(tracefs), group, "/bin/true", [0x1000, 0x1001])
+            finally:
+                PROBE["perf_event_open"] = orig
+            self.assertEqual([kind for kind, _ in seen], [2, 2])
+            self.assertEqual([config for _, config in seen], [42, 42])
+            self.assertEqual(len(fds), 2)
+            self.assertEqual(len(names), 2)
+
+
+class UprobeEventsAppendTests(unittest.TestCase):
+    def test_uprobe_events_writes_use_append_without_truncate(self):
+        group = "p11close_append"
+        with tempfile.TemporaryDirectory() as tmp:
+            tracefs = Path(tmp) / "tracing"
+            (tracefs / "events" / group).mkdir(parents=True)
+            (tracefs / "events" / "uprobes").mkdir(parents=True, exist_ok=True)
+            (tracefs / "events" / "uprobes" / "type").write_text("999\n")
+            uprobe_events = tracefs / "uprobe_events"
+            uprobe_events.write_text("pre-existing-line\n")
+            pid = os.getpid()
+            for i in range(2):
+                name = "w%d_%d" % (pid, i)
+                event = tracefs / "events" / group / name
+                event.mkdir(parents=True)
+                (event / "id").write_text("7\n")
+            orig_perf = PROBE["perf_event_open"]
+            counter = {"n": 0}
+
+            def stub_perf(uprobe_type, config):
+                counter["n"] += 1
+                return 200 + counter["n"]
+
+            PROBE["perf_event_open"] = stub_perf
+            real_os_open = os.open
+            calls = []
+
+            def recording_open(path, flags, *args, **kwargs):
+                try:
+                    text = os.fspath(path)
+                except TypeError:
+                    text = str(path)
+                if str(text).endswith("uprobe_events"):
+                    calls.append(flags)
+                    if flags & os.O_TRUNC:
+                        raise AssertionError("uprobe_events opened with O_TRUNC")
+                    if not (flags & os.O_APPEND):
+                        raise AssertionError("uprobe_events opened without O_APPEND")
+                return real_os_open(path, flags, *args, **kwargs)
+
+            real_open = builtins.open
+
+            def guard_open(file, mode="r", *args, **kwargs):
+                try:
+                    text = os.fspath(file)
+                except TypeError:
+                    text = str(file)
+                if str(text).endswith("uprobe_events") and "w" in str(mode):
+                    raise AssertionError(
+                        "uprobe_events must not use mode %r (truncates)" % (mode,))
+                return real_open(file, mode, *args, **kwargs)
+
+            try:
+                with mock.patch.object(os, "open", side_effect=recording_open):
+                    with mock.patch.object(builtins, "open", side_effect=guard_open):
+                        fds, names = PROBE["create_events"](
+                            str(tracefs), group, "/bin/true", [0x1000, 0x1001])
+                        PROBE["delete_probes"](str(tracefs), group, names)
+            finally:
+                PROBE["perf_event_open"] = orig_perf
+            self.assertEqual(len(calls), 4)
+            for flags in calls:
+                self.assertFalse(flags & os.O_TRUNC)
+                self.assertTrue(flags & os.O_APPEND)
+                self.assertTrue(flags & os.O_CLOEXEC)
+            self.assertIn("pre-existing-line", uprobe_events.read_text())
 
 
 if __name__ == "__main__":

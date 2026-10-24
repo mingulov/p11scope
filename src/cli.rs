@@ -5,6 +5,7 @@
 use crate::attach::BackendSelection;
 use crate::discovery::caller_registry::MAX_MAX_GAPS;
 use crate::discovery::hooks::HookRegistry;
+use p11scope_ebpf_common::CounterMode;
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::PathBuf;
@@ -34,6 +35,8 @@ pub struct CaptureArgs {
     pub scope: ScopeArg,
     /// `--mode metrics` (profile only).
     pub metrics: bool,
+    /// Explicit metrics measurement request; omission keeps legacy behavior.
+    pub counter_mode: Option<CounterMode>,
     pub duration: Option<Duration>,
     pub out: Option<PathBuf>,
     pub max_events: Option<u64>,
@@ -73,6 +76,8 @@ pub struct RunArgs {
     pub hooks: HookRegistry,
     /// `--mode metrics` (rejected beside `--trace`).
     pub metrics: bool,
+    /// Explicit metrics measurement request; omission keeps legacy behavior.
+    pub counter_mode: Option<CounterMode>,
     pub duration: Option<Duration>,
     pub out: Option<PathBuf>,
     pub max_events: Option<u64>,
@@ -678,6 +683,7 @@ struct Common {
     manifests: Vec<PathBuf>,
     hooks: HookRegistry,
     metrics: Option<bool>,
+    counter_mode: Option<CounterMode>,
     duration: Option<Duration>,
     out: Option<PathBuf>,
     max_events: Option<u64>,
@@ -696,6 +702,18 @@ impl Common {
     /// One `--mode` rule for every capture surface: raw event streaming has no
     /// mode, whether it was selected as the `trace` subcommand or `run --trace`.
     fn metrics_for(&self, kind: Kind, subject: &str) -> Result<bool, CliError> {
+        if self.counter_mode.is_some() {
+            if kind != Kind::Profile || self.metrics != Some(true) {
+                return Err(usage_err(
+                    "--counter-mode requires --mode metrics on profile or run",
+                ));
+            }
+            if self.unsafe_requested {
+                return Err(usage_err(
+                    "--counter-mode cannot be combined with --unsafe-unvalidated-metadata",
+                ));
+            }
+        }
         match (kind, self.metrics) {
             (Kind::Trace, Some(_)) => Err(usage_err(format!(
                 "{subject} has no --mode; it always streams raw events"
@@ -736,6 +754,17 @@ fn capture_option(
                     )));
                 }
             });
+        }
+        "--counter-mode" => {
+            if common.counter_mode.is_some() {
+                return Err(usage_err("--counter-mode given twice"));
+            }
+            let value = require_value(args, "--counter-mode")?;
+            common.counter_mode = Some(CounterMode::parse(&value).ok_or_else(|| {
+                usage_err(format!(
+                    "--counter-mode: invalid value {value:?} (expected counts|timestamps|latency)"
+                ))
+            })?);
         }
         "--duration" => {
             if common.duration.is_some() {
@@ -1401,6 +1430,7 @@ pub fn parse_capture(
         hooks: common.hooks,
         scope,
         metrics,
+        counter_mode: common.counter_mode,
         duration: common.duration,
         out,
         max_events: common.max_events,
@@ -1484,6 +1514,7 @@ fn parse_run(mut args: impl Iterator<Item = OsString>) -> Result<RunArgs, CliErr
         manifests: common.manifests,
         hooks: common.hooks,
         metrics,
+        counter_mode: common.counter_mode,
         duration: common.duration,
         out,
         max_events: common.max_events,
@@ -3097,7 +3128,11 @@ mod tests {
             OsString::from("profile"),
             OsString::from_vec(b"child-\xff".to_vec()),
         ];
-        for mode in ["counts", "timestamps", "latency"] {
+        for (mode, expected) in [
+            ("counts", CounterMode::Counts),
+            ("timestamps", CounterMode::Timestamps),
+            ("latency", CounterMode::Latency),
+        ] {
             for options in [
                 ["--mode", "metrics", "--counter-mode", mode],
                 ["--counter-mode", mode, "--mode", "metrics"],
@@ -3113,6 +3148,7 @@ mod tests {
                 assert_eq!(profile.kind, Kind::Profile);
                 assert_eq!(profile.scope, ScopeArg::Pid(42));
                 assert!(profile.metrics && !profile.unsafe_requested);
+                assert_eq!(profile.counter_mode, Some(expected));
                 assert_eq!(profile.attach_backend, BackendSelection::Auto);
 
                 let mut run = vec![OsString::from("run")];
@@ -3127,6 +3163,7 @@ mod tests {
                 };
                 assert_eq!(run.kind, Kind::Profile);
                 assert!(run.metrics && !run.unsafe_requested);
+                assert_eq!(run.counter_mode, Some(expected));
                 assert_eq!(run.pause, PausePolicy::Never);
                 assert_eq!(run.attach_backend, BackendSelection::Auto);
                 assert_eq!(run.command, child, "child flags and bytes belong after --");
@@ -3136,8 +3173,8 @@ mod tests {
 
     #[test]
     fn metrics_counter_capabilities_refuse_nonmetrics_and_repeats() {
-        // Omission preserves the existing parser's profile/metrics distinction;
-        // no new field or policy API is assumed by these tests-first controls.
+        // Omission keeps the legacy path, rather than selecting the default
+        // CounterMode variant as a new measurement request.
         for (argv, metrics) in [
             (vec!["profile", "--pid", "42"], false),
             (vec!["profile", "--pid", "42", "--mode", "metrics"], true),
@@ -3147,6 +3184,7 @@ mod tests {
             };
             assert_eq!(profile.kind, Kind::Profile);
             assert_eq!(profile.metrics, metrics);
+            assert_eq!(profile.counter_mode, None);
             assert!(!profile.unsafe_requested);
             assert_eq!(profile.scope, ScopeArg::Pid(42));
         }
@@ -3173,6 +3211,7 @@ mod tests {
             };
             assert_eq!(run.kind, Kind::Profile);
             assert_eq!(run.metrics, metrics);
+            assert_eq!(run.counter_mode, None);
             assert!(!run.unsafe_requested);
             assert_eq!(run.pause, PausePolicy::Never);
             assert_eq!(run.command, ["/bin/echo", "--counter-mode", "counts"]);

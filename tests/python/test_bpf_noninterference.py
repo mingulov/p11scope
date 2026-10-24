@@ -103,6 +103,71 @@ class ComparisonTests(unittest.TestCase):
         self.assertEqual(dict(os.environ), previous)
         self.assertEqual(tempfile.tempdir, previous_directory)
 
+    def test_logical_source_alias_cleans_only_its_own_link_on_success_or_failure(self):
+        source = self.root / "physical/source"
+        source.mkdir(parents=True)
+        logical = self.root / "logical/source"
+        logical.parent.mkdir()
+        for fail in (False, True):
+            with self.subTest(fail=fail):
+                try:
+                    with self.driver.logical_source_alias(source, logical) as verify:
+                        self.assertEqual(logical.resolve(), source)
+                        verify()
+                        if fail:
+                            raise RuntimeError("owned command failed")
+                except RuntimeError:
+                    self.assertTrue(fail)
+                self.assertFalse(os.path.lexists(logical))
+                self.assertTrue(source.is_dir())
+
+    def test_preexisting_logical_source_alias_or_file_is_never_replaced(self):
+        source = self.root / "physical/source"
+        source.mkdir(parents=True)
+        logical = self.root / "logical/source"
+        logical.parent.mkdir()
+        for kind in ("file", "symlink", "dangling"):
+            with self.subTest(kind=kind):
+                if kind == "file":
+                    logical.write_text("foreign")
+                else:
+                    logical.symlink_to(source if kind == "symlink" else source / "absent")
+                before = logical.lstat()
+                with self.assertRaisesRegex(self.driver.CheckError, "logical source alias"):
+                    with self.driver.logical_source_alias(source, logical):
+                        self.fail("preexisting path was admitted")
+                self.assertEqual(logical.lstat().st_ino, before.st_ino)
+                logical.unlink()
+
+    def test_physical_and_logical_cargo_parent_configs_are_independently_refused(self):
+        source = self.root / "physical/source"
+        source.mkdir(parents=True)
+        logical = self.root / "logical/source"
+        logical.parent.mkdir()
+        for parent in (source.parent, logical.parent, source / "crates"):
+            for name in ("config", "config.toml"):
+                with self.subTest(parent=parent, name=name):
+                    config = parent / ".cargo" / name
+                    config.parent.mkdir(parents=True, exist_ok=True)
+                    config.write_text('[build]\nrustflags=["--cfg", "poison"]\n')
+                    with self.assertRaisesRegex(self.driver.CheckError, "Cargo configuration"):
+                        with self.driver.logical_source_alias(source, logical):
+                            self.fail("unreviewed parent config was admitted")
+                    self.assertFalse(os.path.lexists(logical))
+                    config.unlink()
+
+    def test_recreated_alias_to_the_same_source_is_refused_and_preserved(self):
+        source = self.root / "physical/source"
+        source.mkdir(parents=True)
+        logical = self.root / "logical/source"
+        logical.parent.mkdir()
+        with self.assertRaisesRegex(self.driver.CheckError, "logical source alias"):
+            with self.driver.logical_source_alias(source, logical) as verify:
+                logical.unlink()
+                logical.symlink_to(source, target_is_directory=True)
+                verify()
+        self.assertEqual(logical.resolve(), source)
+
 
 class CanonicalBtfTests(unittest.TestCase):
     """The BTF-order fallback accepts permutations and nothing else.
@@ -461,6 +526,44 @@ class BuildDriverTests(unittest.TestCase):
             self.assertEqual(set(snapshot["lockfiles"]), {"Cargo.lock", "crates/ebpf/Cargo.lock"})
         self.assertEqual(self.git("status", "--porcelain"), "", "driver mutated its input repository")
 
+    def test_logical_manifest_identity_is_stable_over_distinct_physical_sources(self):
+        self.configure(path_sensitive_metadata=True)
+        result = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        builds = [call for call in self.calls() if call["tool"] == "cargo" and "build" in call["argv"]]
+        self.assertEqual(len(builds), 2)
+        logical = self.work / "logical/source"
+        self.assertEqual([call["manifest_path"] for call in builds], [str(logical / "Cargo.toml")] * 2)
+        self.assertNotEqual(builds[0]["cwd"], builds[1]["cwd"])
+        self.assertNotEqual(builds[0]["target"], builds[1]["target"])
+        self.assertEqual(builds[0]["rustflags"], builds[1]["rustflags"])
+        self.assertFalse(os.path.lexists(logical), "completed comparison left a source alias")
+        for call in self.calls():
+            if call["tool"] == "cargo" and any(action in call["argv"] for action in ("fetch", "metadata", "build")):
+                self.assertIn("--manifest-path", call["argv"])
+                if "sysroot" not in call["manifest_path"]:
+                    self.assertTrue(Path(call["manifest_path"]).is_relative_to(logical), call)
+
+    def test_clean_build_environment_restores_the_two_job_bound(self):
+        self.environment["CARGO_BUILD_JOBS"] = "99"
+        result = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        builds = [call for call in self.calls() if call["tool"] == "cargo" and "build" in call["argv"]]
+        self.assertEqual([call["jobs"] for call in builds], ["2", "2"])
+
+    def test_replaced_logical_source_alias_fails_and_is_not_removed(self):
+        replacement = self.root / "foreign-source"
+        replacement.mkdir()
+        sentinel = replacement / "keep"
+        sentinel.write_text("foreign source")
+        self.configure(change_source_alias=str(replacement))
+        result = self.invoke()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("logical source alias", result.stderr)
+        self.assertEqual(sentinel.read_text(), "foreign source")
+        self.assertEqual((self.work / "logical/source").resolve(), replacement)
+        self.assertFalse((self.work / "comparison.json").exists())
+
     def test_repeat_baseline_is_explicit_diagnostic_evidence(self):
         result = self.invoke(repeat=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -486,7 +589,8 @@ class BuildDriverTests(unittest.TestCase):
             self.assertEqual(snapshot["host_compiler"]["release"], release)
             remaps = snapshot["build_environment"]["CARGO_ENCODED_RUSTFLAGS"].split("\x1f")
             self.assertEqual([flag.rsplit("=", 1)[1] for flag in remaps],
-                             ["/p11scope", "/p11scope-build", "/cargo", "/rustup"])
+                             ["/p11scope-build"] * 2 + ["/p11scope"] * 2
+                             + ["/cargo"] * 2 + ["/rustup", "/p11scope"])
             for channel in ("1.98.1", "1.99.1", "nightly-2026-05-20"):
                 for tool in ("cargo", "rustc"):
                     self.assertIn(channel + "-" + tool, snapshot["tools"])
@@ -636,8 +740,8 @@ class BuildDriverTests(unittest.TestCase):
         self.assertEqual(len(fetches), 6)
         for start in (0, 3):
             root, bpf, sysroot = fetches[start:start + 3]
-            self.assertEqual(root["argv"][-1], "Cargo.toml")
-            self.assertEqual(bpf["argv"][-1], "crates/ebpf/Cargo.toml")
+            self.assertEqual(root["argv"][-1], str(self.work / "logical/source/Cargo.toml"))
+            self.assertEqual(bpf["argv"][-1], str(self.work / "logical/source/crates/ebpf/Cargo.toml"))
             self.assertEqual(sysroot["argv"][0], "+nightly-2026-05-20")
             self.assertIn("--locked", sysroot["argv"])
             self.assertEqual(sysroot["argv"][-1], str(paths[0]))

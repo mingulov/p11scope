@@ -515,24 +515,29 @@ fn assert_lane14_selected_python_isolated(source: &str) -> Result<(), String> {
 }
 
 fn assert_bpf_snapshot_dependency_preparation(driver: &str) -> Result<(), String> {
-    let prepare = r#"run_command(["python3", "-I", "scripts/prepare-dependencies.py"]"#;
-    let root_fetch = r#""fetch", "--locked", "--manifest-path", "Cargo.toml""#;
-    let bpf_fetch = r#""fetch", "--locked", "--manifest-path", "crates/ebpf/Cargo.toml""#;
+    let prepare = r#"command(["python3", "-I", "scripts/prepare-dependencies.py"]"#;
+    let root_fetch = r#""fetch", "--locked", "--manifest-path", str(logical / "Cargo.toml")"#;
+    let bpf_fetch =
+        r#""fetch", "--locked", "--manifest-path", str(logical / "crates/ebpf/Cargo.toml")"#;
     let sysroot_fetch = r#""fetch", "--locked", "--manifest-path", nightly["manifest"]"#;
     // Full lines prevent host_env from satisfying the env setter requirement.
     let offline = "\n    env[\"CARGO_NET_OFFLINE\"] = \"true\"\n";
     let host_offline = "\n    host_env[\"CARGO_NET_OFFLINE\"] = \"true\"\n";
-    let metadata = r#""metadata", "--locked", "--offline""#;
-    let build = r#""build", "--locked", "--offline", "--lib""#;
+    let metadata = r#"metadata_log = command([host_cargo, "metadata", "--locked", "--offline""#;
+    let build = r#"build_log = command([host_cargo, "build", "--locked", "--offline", "--lib""#;
     for marker in [
+        "with logical_source_alias(source, logical) as verify:",
+        "    def command(*args, **kwargs):\n        verify()\n        result = run_command(*args, **kwargs)\n        verify()\n        return result\n",
         "--baseline-offline-payload",
         "--candidate-offline-payload",
         "helper._verify_payload_contents(",
         "helper.replacement_config(",
         "verify_home_configuration(",
-        r#""fetch", "--locked", "--offline", "--manifest-path", "Cargo.toml""#,
-        r#""fetch", "--locked", "--offline", "--manifest-path", "crates/ebpf/Cargo.toml""#,
+        r#""fetch", "--locked", "--offline", "--manifest-path", str(logical / "Cargo.toml")"#,
+        r#""fetch", "--locked", "--offline", "--manifest-path", str(logical / "crates/ebpf/Cargo.toml")"#,
         r#""fetch", "--locked", "--offline", "--manifest-path", nightly["manifest"]"#,
+        r#""--no-deps", "--format-version", "1", "--manifest-path", str(logical / "Cargo.toml")]"#,
+        r#""--no-default-features", "--message-format=json", "--manifest-path", str(logical / "Cargo.toml")]"#,
         "nightly-source-before",
         "nightly-source-after",
     ] {
@@ -8913,16 +8918,21 @@ fn hosted_pipeline_requires_exact_default_bpf_comparison() {
             "removing {marker:?} must reject the comparison job"
         );
     }
-    let prepare = r#"run_command(["python3", "-I", "scripts/prepare-dependencies.py"]"#;
-    let fetch = r#""fetch", "--locked", "--manifest-path", "Cargo.toml""#;
+    let prepare = r#"command(["python3", "-I", "scripts/prepare-dependencies.py"]"#;
+    let fetch = r#""fetch", "--locked", "--manifest-path", str(logical / "Cargo.toml")"#;
     for marker in [
         prepare,
         fetch,
-        r#""fetch", "--locked", "--manifest-path", "crates/ebpf/Cargo.toml""#,
+        r#""fetch", "--locked", "--manifest-path", str(logical / "crates/ebpf/Cargo.toml")"#,
         r#""fetch", "--locked", "--manifest-path", nightly["manifest"]"#,
         r#"env["CARGO_NET_OFFLINE"] = "true""#,
         r#"host_env["CARGO_NET_OFFLINE"] = "true""#,
-        r#""build", "--locked", "--offline", "--lib""#,
+        r#"build_log = command([host_cargo, "build", "--locked", "--offline", "--lib""#,
+        "with logical_source_alias(source, logical) as verify:",
+        "\n        verify()\n        result = run_command(*args, **kwargs)",
+        "result = run_command(*args, **kwargs)\n        verify()\n",
+        r#""--no-deps", "--format-version", "1", "--manifest-path", str(logical / "Cargo.toml")]"#,
+        r#""--no-default-features", "--message-format=json", "--manifest-path", str(logical / "Cargo.toml")]"#,
     ] {
         assert!(
             assert_bpf_snapshot_dependency_preparation(&driver.replacen(marker, "", 1)).is_err(),
@@ -8933,6 +8943,13 @@ fn hosted_pipeline_requires_exact_default_bpf_comparison() {
         .replacen(prepare, "", 1)
         .replacen(fetch, &format!("{fetch}\n{prepare}"), 1);
     assert!(assert_bpf_snapshot_dependency_preparation(&moved).is_err());
+    for manifest in [
+        r#"str(logical / "Cargo.toml")"#,
+        r#"str(logical / "crates/ebpf/Cargo.toml")"#,
+    ] {
+        let poisoned = driver.replacen(manifest, r#""/unreviewed/Cargo.toml""#, 1);
+        assert!(assert_bpf_snapshot_dependency_preparation(&poisoned).is_err());
+    }
 }
 
 /// The `scripts` check job: it prints the UNRUN block and runs every

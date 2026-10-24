@@ -14,6 +14,16 @@ cwd = Path.cwd()
 record = {"tool": tool, "argv": args, "cwd": str(cwd)}
 record["executable"] = str(Path(sys.argv[0]).absolute())
 record["rustc"] = os.environ.get("RUSTC")
+manifest = Path(args[args.index("--manifest-path") + 1]) if "--manifest-path" in args else cwd / "Cargo.toml"
+if not manifest.is_absolute():
+    manifest = cwd / manifest
+source = manifest.parent
+if manifest == Path(control["sysroot"]) / "lib/rustlib/src/rust/library/sysroot/Cargo.toml":
+    source = cwd
+elif str(manifest).endswith("/crates/ebpf/Cargo.toml"):
+    source = manifest.parents[2]
+record["manifest_path"] = str(manifest)
+record["source"] = str(source)
 if tool == "cargo" and "fetch" in args:
     record["offline"] = os.environ.get("CARGO_NET_OFFLINE")
 
@@ -24,6 +34,8 @@ if tool == "cargo" and "build" in args:
     record["home_fresh"] = not (home / "fixture-build-marker").exists()
     record["target"] = os.environ.get("CARGO_TARGET_DIR")
     record["build_dir"] = os.environ.get("CARGO_BUILD_BUILD_DIR")
+    record["jobs"] = os.environ.get("CARGO_BUILD_JOBS")
+    record["rustflags"] = os.environ.get("CARGO_ENCODED_RUSTFLAGS")
     record["config"] = (home / "config.toml").read_text() if (home / "config.toml").exists() else None
     record["inherited_overrides"] = {key: os.environ[key] for key in (
         "RUSTFLAGS", "RUSTC_WRAPPER", "CARGO_PROFILE_RELEASE_DEBUG", "CFLAGS",
@@ -58,17 +70,17 @@ elif tool == "llvm-readelf":
 elif tool == "bpftool" and args == ["--version"]:
     print("bpftool v7.7.0")
 elif tool == "cargo" and "metadata" in args:
-    if not any((cwd / name).is_file() for name in ("prepared", "third-party/.prepare-dependencies.lock")):
+    if not any((source / name).is_file() for name in ("prepared", "third-party/.prepare-dependencies.lock")):
         sys.exit("metadata before dependency preparation")
     print(json.dumps({"packages": [{"name": "p11scope", "id": "fixture-root-package",
-                                  "manifest_path": str(cwd / "Cargo.toml")}],
-                      "workspace_root": str(cwd)}))
+                                  "manifest_path": str(manifest)}],
+                      "workspace_root": str(source)}))
 elif tool == "cargo" and "fetch" in args:
     if not any((cwd / name).is_file() for name in ("prepared", "third-party/.prepare-dependencies.lock")):
         sys.exit("fetch before dependency preparation")
     if os.environ.get("CARGO_NET_OFFLINE") == "true" and "--offline" not in args:
         sys.exit("fetch unexpectedly offline")
-    if "crates/ebpf/Cargo.toml" in args:
+    if str(manifest).endswith("/crates/ebpf/Cargo.toml"):
         (cwd / "bpf-fetched").write_text("yes")
     elif args[-1] == str(Path(control["sysroot"]) / "lib/rustlib/src/rust/library/sysroot/Cargo.toml"):
         if not all((cwd / name).exists() for name in ("root-fetched", "bpf-fetched")):
@@ -93,6 +105,8 @@ elif tool == "cargo" and "build" in args:
     names = ("p11scope-ebpf", "p11scope-ebpf-inventory", "p11scope-ebpf-inventory-callers")
     for name in names:
         payload = b"whole ELF with debug" + name.encode()
+        if control.get("path_sensitive_metadata"):
+            payload += str(manifest).encode()
         if name == control.get("mutate_flavor"):
             payload += (cwd / "object-source").read_bytes()
         (out / name).write_bytes(payload)
@@ -137,6 +151,9 @@ elif tool == "cargo" and "build" in args:
     if control.get("change_coordinator_helper"):
         with Path(control["change_coordinator_helper"]).open("a") as changed:
             changed.write("\n# coordinator helper changed during build\n")
+    if control.get("change_source_alias"):
+        source.unlink()
+        source.symlink_to(control["change_source_alias"], target_is_directory=True)
     if control.get("change_sysroot"):
         relative = "sysroot/Cargo.toml" if control["change_sysroot"] == "manifest" else "Cargo.lock"
         with (Path(control["sysroot"]) / "lib/rustlib/src/rust/library" / relative).open("a") as changed:

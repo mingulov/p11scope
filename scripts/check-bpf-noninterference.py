@@ -139,21 +139,80 @@ def clean_environment(scratch: Path) -> dict[str, str]:
     # Explicit paths override any inherited user configuration. The fresh
     # CARGO_HOME excludes global Cargo configuration and existing build caches.
     rustup_home = Path(environment.get("RUSTUP_HOME", str(Path.home() / ".rustup"))).resolve()
+    roots = [scratch.parent / (side + "-scratch") for side in ("baseline", "candidate")]
+    remaps = ([f"--remap-path-prefix={root}=/p11scope-build" for root in roots]
+              + [f"--remap-path-prefix={root / 'source'}=/p11scope" for root in roots]
+              + [f"--remap-path-prefix={root / 'cargo-home'}=/cargo" for root in roots]
+              + [f"--remap-path-prefix={rustup_home}=/rustup",
+                 f"--remap-path-prefix={scratch.parent / 'logical/source'}=/p11scope"])
     environment.update({
         "CARGO_HOME": str(cargo_home),
         "CARGO_TARGET_DIR": str(scratch / "target"),
         "CARGO_BUILD_BUILD_DIR": str(scratch / "build"),
         "CARGO_INCREMENTAL": "0",
-        "CARGO_ENCODED_RUSTFLAGS": "\x1f".join([
-            f"--remap-path-prefix={scratch / 'source'}=/p11scope",
-            f"--remap-path-prefix={scratch}=/p11scope-build",
-            f"--remap-path-prefix={cargo_home}=/cargo",
-            f"--remap-path-prefix={rustup_home}=/rustup",
-        ]),
+        "CARGO_BUILD_JOBS": "2",
+        "CARGO_ENCODED_RUSTFLAGS": "\x1f".join(remaps),
         "TMPDIR": str(scratch / "tmp"),
         "LC_ALL": "C",
     })
     return environment
+
+
+def refuse_cargo_configuration(source: Path) -> None:
+    for directory in (source / "crates/ebpf", source / "crates", source, *source.parents):
+        for filename in ("config", "config.toml"):
+            config = directory / ".cargo" / filename
+            if os.path.lexists(config):
+                raise CheckError(f"unreviewed Cargo configuration override: {config}")
+
+
+@contextlib.contextmanager
+def logical_source_alias(source: Path, logical: Path):
+    """Expose one owned physical tree at a stable logical Cargo package path.
+
+    The comparison owner supplies fresh real directories. Never replace a
+    preexisting entry or unlink a replacement made while a command was running.
+    """
+    if (not source.is_absolute() or source.resolve(strict=True) != source
+            or not source.is_dir() or not logical.is_absolute()
+            or logical.parent.resolve(strict=True) != logical.parent):
+        raise CheckError("logical source alias requires real absolute source and parent directories")
+    if os.path.lexists(logical):
+        raise CheckError("logical source alias must be absent")
+    parent = logical.parent.stat()
+    original = source.stat()
+    logical.symlink_to(source, target_is_directory=True)
+    created = logical.lstat()
+
+    def owned_link():
+        try:
+            current_parent = logical.parent.stat()
+            current = logical.lstat()
+            if (logical.parent.resolve(strict=True) != logical.parent
+                    or (current_parent.st_dev, current_parent.st_ino) != (parent.st_dev, parent.st_ino)
+                    or (current.st_dev, current.st_ino, current.st_ctime_ns)
+                    != (created.st_dev, created.st_ino, created.st_ctime_ns)
+                    or not stat.S_ISLNK(current.st_mode) or os.readlink(logical) != str(source)):
+                raise CheckError("logical source alias changed; refusing replacement cleanup")
+        except OSError as error:
+            raise CheckError(f"logical source alias changed: {error}") from error
+
+    def verify():
+        owned_link()
+        current = source.stat()
+        if (source.resolve(strict=True) != source or not stat.S_ISDIR(current.st_mode)
+                or (current.st_dev, current.st_ino) != (original.st_dev, original.st_ino)):
+            raise CheckError("logical source alias physical directory changed")
+        refuse_cargo_configuration(source)
+        refuse_cargo_configuration(logical)
+
+    try:
+        verify()
+        yield verify
+        verify()
+    finally:
+        owned_link()
+        logical.unlink()
 
 
 def validate_host_metadata(metadata: str, release: str, commit: str) -> None:
@@ -565,10 +624,25 @@ def build_snapshot(repo: Path, revision: str, scratch: Path, evidence: Path, *,
     source.mkdir()
     (scratch / "tmp").mkdir(mode=0o700)
     evidence.mkdir(mode=0o700)
+    logical = scratch.parent / "logical/source"
+    with logical_source_alias(source, logical) as verify:
+        return _build_snapshot(repo, revision, scratch, evidence, source, logical, verify,
+                               host_compiler, host_compilers, offline_payload)
+
+
+def _build_snapshot(repo: Path, revision: str, scratch: Path, evidence: Path,
+                    source: Path, logical: Path, verify, host_compiler: tuple[str, str],
+                    host_compilers: tuple[tuple[str, str], ...], offline_payload: Path | None):
+    def command(*args, **kwargs):
+        verify()
+        result = run_command(*args, **kwargs)
+        verify()
+        return result
+
     env = clean_environment(scratch)
     coordinator = coordinator_identity()
     before = tool_identity(source, env, evidence, "tools-before", host_compilers=host_compilers)
-    archive = run_command(["git", "-C", str(repo), "archive", "--format=tar", revision],
+    archive = command(["git", "-C", str(repo), "archive", "--format=tar", revision],
                           source, env, evidence, "git-archive", stdout_path=evidence / "source.tar")
     source_digests = extract_snapshot(archive, source)
     validate_snapshot_compiler((source / ".release-rust-version").read_text(),
@@ -578,20 +652,14 @@ def build_snapshot(repo: Path, revision: str, scratch: Path, evidence: Path, *,
                      "cargo": before[release + "-cargo"], "rustc": before[release + "-rustc"]}
     host_env = dict(env, RUSTC=selected_host["rustc"]["path"])
     host_cargo = selected_host["cargo"]["path"]
-    # Cargo also reads parent-directory configuration, independent of the
-    # private CARGO_HOME. Refuse it rather than inheriting target/tool overrides.
-    for directory in (source / "crates/ebpf", source / "crates", source, *source.parents):
-        for filename in ("config", "config.toml"):
-            config = directory / ".cargo" / filename
-            if os.path.lexists(config):
-                raise CheckError(f"unreviewed Cargo configuration override: {config}")
-    tree = run_command(["git", "-C", str(repo), "rev-parse", revision + "^{tree}"],
+    tree = command(["git", "-C", str(repo), "rev-parse", revision + "^{tree}"],
                        source, env, evidence, "source-tree")
     nightly_rustc = Path(before[BPF_RUST + "-rustc"]["path"])
     nightly = nightly_source(nightly_rustc, source, env, evidence, "nightly-source-before")
     receipt = {"revision": revision, "tree": read_output(tree).strip(), "archive_sha256": sha256(archive),
+               "source": {"physical": str(source), "logical": str(logical)},
                "lockfiles": {name: sha256(source / name) for name in ("Cargo.lock", "crates/ebpf/Cargo.lock")},
-               "build_environment": {key: host_env[key] for key in ("CARGO_HOME", "CARGO_TARGET_DIR", "CARGO_BUILD_BUILD_DIR", "CARGO_ENCODED_RUSTFLAGS", "RUSTC")},
+               "build_environment": {key: host_env[key] for key in ("CARGO_HOME", "CARGO_TARGET_DIR", "CARGO_BUILD_BUILD_DIR", "CARGO_BUILD_JOBS", "CARGO_ENCODED_RUSTFLAGS", "RUSTC")},
                "host_compiler": selected_host,
                "tools": before, "coordinator": coordinator, "nightly_source": nightly,
                "acquisition_mode": "verified-payload" if offline_payload else "online"}
@@ -599,14 +667,14 @@ def build_snapshot(repo: Path, revision: str, scratch: Path, evidence: Path, *,
     configuration = None
     payload_receipts = None
     if offline_payload is None:
-        run_command(["python3", "-I", "scripts/prepare-dependencies.py"], source, env,
+        command(["python3", "-I", "scripts/prepare-dependencies.py"], source, env,
                     evidence, "prepare-dependencies", timeout=600)
         verify_home_configuration(Path(env["CARGO_HOME"]), None)
-        run_command([host_cargo, "fetch", "--locked", "--manifest-path", "Cargo.toml"],
+        command([host_cargo, "fetch", "--locked", "--manifest-path", str(logical / "Cargo.toml")],
                     source, host_env, evidence, "fetch-root", timeout=900)
-        run_command(["./scripts/cargo.sh", "+" + BPF_RUST, "fetch", "--locked", "--manifest-path", "crates/ebpf/Cargo.toml"],
+        command(["./scripts/cargo.sh", "+" + BPF_RUST, "fetch", "--locked", "--manifest-path", str(logical / "crates/ebpf/Cargo.toml")],
                     source, env, evidence, "fetch-bpf", timeout=900)
-        run_command(["./scripts/cargo.sh", "+" + BPF_RUST, "fetch", "--locked", "--manifest-path", nightly["manifest"]],
+        command(["./scripts/cargo.sh", "+" + BPF_RUST, "fetch", "--locked", "--manifest-path", nightly["manifest"]],
                     source, env, evidence, "fetch-sysroot", timeout=900)
     else:
         receipt["offline_payload_input"] = str(offline_payload)
@@ -637,24 +705,25 @@ def build_snapshot(repo: Path, revision: str, scratch: Path, evidence: Path, *,
         receipt["offline_payload"] = payload_receipts
         write_json(evidence / "snapshot.json", receipt)
         verify_home_configuration(Path(env["CARGO_HOME"]), configuration)
-        run_command([host_cargo, "fetch", "--locked", "--offline", "--manifest-path", "Cargo.toml"],
+        command([host_cargo, "fetch", "--locked", "--offline", "--manifest-path", str(logical / "Cargo.toml")],
                     source, host_env, evidence, "fetch-root", timeout=900)
-        run_command(["./scripts/cargo.sh", "+" + BPF_RUST, "fetch", "--locked", "--offline", "--manifest-path", "crates/ebpf/Cargo.toml"],
+        command(["./scripts/cargo.sh", "+" + BPF_RUST, "fetch", "--locked", "--offline", "--manifest-path", str(logical / "crates/ebpf/Cargo.toml")],
                     source, env, evidence, "fetch-bpf", timeout=900)
-        run_command(["./scripts/cargo.sh", "+" + BPF_RUST, "fetch", "--locked", "--offline", "--manifest-path", nightly["manifest"]],
+        command(["./scripts/cargo.sh", "+" + BPF_RUST, "fetch", "--locked", "--offline", "--manifest-path", nightly["manifest"]],
                     source, env, evidence, "fetch-sysroot", timeout=900)
     # build.rs invokes nested nightly Cargo: propagate offline there too.
     env["CARGO_NET_OFFLINE"] = "true"
     host_env["CARGO_NET_OFFLINE"] = "true"
-    metadata_log = run_command([host_cargo, "metadata", "--locked", "--offline",
-                                "--no-deps", "--format-version", "1"], source, host_env, evidence, "metadata")
+    metadata_log = command([host_cargo, "metadata", "--locked", "--offline",
+                            "--no-deps", "--format-version", "1", "--manifest-path", str(logical / "Cargo.toml")],
+                           source, host_env, evidence, "metadata")
     metadata = json.loads(read_output(metadata_log))
     packages = [package for package in metadata["packages"]
-                if package["name"] == "p11scope" and package["manifest_path"] == str(source / "Cargo.toml")]
-    if len(packages) != 1 or metadata["workspace_root"] != str(source):
+                if package["name"] == "p11scope" and package["manifest_path"] == str(logical / "Cargo.toml")]
+    if len(packages) != 1 or metadata["workspace_root"] != str(logical):
         raise CheckError("metadata must identify exactly the snapshot's root p11scope package")
-    build_log = run_command([host_cargo, "build", "--locked", "--offline", "--lib",
-                             "--no-default-features", "--message-format=json"], source, host_env, evidence,
+    build_log = command([host_cargo, "build", "--locked", "--offline", "--lib",
+                         "--no-default-features", "--message-format=json", "--manifest-path", str(logical / "Cargo.toml")], source, host_env, evidence,
                             "build", timeout=1800)
     out_dir = select_out_dir(read_output(build_log), packages[0]["id"], scratch)
     identity_receipt = out_dir / "p11scope-identity-build-info.txt"
@@ -676,7 +745,7 @@ def build_snapshot(repo: Path, revision: str, scratch: Path, evidence: Path, *,
         destination = copied / name
         shutil.copyfile(original, destination)
         objects[name] = destination
-        summary = run_command(["llvm-readelf", "--sections", "--wide", str(destination)],
+        summary = command(["llvm-readelf", "--sections", "--wide", str(destination)],
                               source, env, evidence, "sections-" + name)
         sections.extend([name + "\n", read_output(summary)])
     (evidence / "sections.txt").write_text("\n".join(sections), encoding="utf-8")
@@ -743,6 +812,7 @@ def main() -> int:
                 raise CheckError("offline payload must be an absolute real directory disjoint from owned work")
         work.mkdir(mode=0o700)
         write_json(work / "ownership.json", {"pid": os.getpid(), "repo": str(repo)})
+        (work / "logical").mkdir(mode=0o700)
         revisions = []
         for side, revision in (("baseline", options.baseline), ("candidate", options.candidate)):
             output = run_command(["git", "-C", str(repo), "rev-parse", "--verify", "--end-of-options", revision + "^{commit}"],

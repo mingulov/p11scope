@@ -6,6 +6,7 @@
 //! journal without I/O or capture mutation. Accepted journals commit before
 //! any proof; rejected records and speculative tails drop before fresh reads.
 
+use crate::discovery::retained_member::RetainedGroupMember;
 use crate::discovery::scan::{
     CaptureWorkBudget, ConfirmMark, MapsReadBudget, MapsReadBuffers, MapsReadLimits,
 };
@@ -34,6 +35,10 @@ pub(crate) struct AcceptedRequest<'a> {
     pidfd: Option<std::os::fd::BorrowedFd<'a>>,
     #[allow(dead_code)] // The central segment hook also includes idle plans.
     kind: AcceptedKind,
+    /// The validated survivor for a zombie-group confirm, borrowed from
+    /// the preparation that minted it. `Some` exactly for zombie-group
+    /// member requests, which only ever run as single-request TID runs.
+    member: Option<&'a RetainedGroupMember>,
 }
 
 #[derive(Clone, Copy)]
@@ -60,6 +65,9 @@ impl AcceptedRequest<'_> {
     #[allow(dead_code)]
     pub(crate) fn kind(&self) -> AcceptedKind {
         self.kind
+    }
+    pub(crate) fn member(&self) -> Option<&RetainedGroupMember> {
+        self.member
     }
 }
 
@@ -105,6 +113,7 @@ pub(crate) fn prove_and_finish_prepared<Io: ConfirmIo>(
             entries: &prepared.entries,
             pidfd: io.borrowed_pidfd(&prepared.pin.pin),
             kind: AcceptedKind::Confirm,
+            member: prepared.member.as_ref(),
         }],
         token: Arc::new(()),
     };
@@ -480,6 +489,10 @@ fn preview<Io: ShardableIo>(
                                 before,
                                 entries,
                                 ranges,
+                                // Speculative transcript replay re-reads
+                                // recorded bytes; live member custody
+                                // belongs to the live prepare path.
+                                member: None,
                             },
                         },
                     }
@@ -752,6 +765,30 @@ where
     })
 }
 
+/// Test-only batch minting for requests the shard driver cannot form
+/// (member-carrying confirms): the caller owns the plans, the batch
+/// borrows them, and no pidfd is attached (multi-request batches never
+/// promote).
+#[cfg(test)]
+pub(crate) fn accepted_batch_for_test<'a, P>(
+    plans: &'a [(u32, PreparedConfirmation<P>)],
+) -> AcceptedBatch<'a> {
+    AcceptedBatch {
+        requests: plans
+            .iter()
+            .map(|(pid, plan)| AcceptedRequest {
+                pid: *pid,
+                ranges: &plan.ranges,
+                entries: &plan.entries,
+                pidfd: None,
+                kind: AcceptedKind::Confirm,
+                member: plan.member.as_ref(),
+            })
+            .collect(),
+        token: std::sync::Arc::new(()),
+    }
+}
+
 /// Only accepted charged preparations can mint these original-pin views.
 fn accepted_batch<'a, Io: ShardableIo>(
     prepared: &'a [(usize, Prepared<Io>)],
@@ -767,6 +804,7 @@ fn accepted_batch<'a, Io: ShardableIo>(
                 entries: &plan.entries,
                 pidfd: io.borrowed_pidfd(&plan.pin.pin),
                 kind: AcceptedKind::Confirm,
+                member: plan.member.as_ref(),
             },
             PreparedState::Idle { ranges, .. } => AcceptedRequest {
                 pid: sweep[*at].0,
@@ -774,6 +812,7 @@ fn accepted_batch<'a, Io: ShardableIo>(
                 entries: &sweep[*at].1,
                 pidfd: None,
                 kind: AcceptedKind::Idle,
+                member: None,
             },
             _ => continue,
         };

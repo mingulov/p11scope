@@ -278,15 +278,30 @@ int p11_identity_vma(struct p11_iter_task_vma *ctx)
         return 0;
     P11_READ(pid, task->pid);
     P11_READ(tgid, task->tgid);
-    if (tgid < 0 || pid != tgid)
+    if (tgid < 0)
         return 0;
+    /* The config selects the run kind: a nonzero `target_tid` runs the
+     * exact retained survivor (never the scope bitmap); anything else
+     * takes the ordinary leader-gated, scope-checked path. */
+    cfg = ident_config();
+    if (!cfg)
+        return 0;
+    if (cfg->target_tid != 0) {
+        if ((u32)pid != cfg->target_tid || (u32)tgid != cfg->target_tgid)
+            return 0;
+    } else {
+        if (pid != tgid)
+            return 0;
+    }
     tgid_u = (u32)tgid;
-    word = tgid_u >> 6;
-    if (word >= P11_IDENT_SCOPE_WORDS)
-        return 0;
-    word_cell = p11_map_lookup(&scope_bitmap, &word);
-    if (!word_cell || !(*word_cell & (1ULL << (tgid_u & 63))))
-        return 0;
+    if (cfg->target_tid == 0) {
+        word = tgid_u >> 6;
+        if (word >= P11_IDENT_SCOPE_WORDS)
+            return 0;
+        word_cell = p11_map_lookup(&scope_bitmap, &word);
+        if (!word_cell || !(*word_cell & (1ULL << (tgid_u & 63))))
+            return 0;
+    }
     P11_READ(vm_file, vma->vm_file);
     if (!vm_file)
         return 0;
@@ -299,9 +314,6 @@ int p11_identity_vma(struct p11_iter_task_vma *ctx)
         if (!(flags & P11_IDENT_VM_EXEC))
             return 0;
     }
-    cfg = ident_config();
-    if (!cfg)
-        return 0;
     gen = cfg->gen;
     P11_READ(addr, vm_file->f_inode);
     if (!addr)

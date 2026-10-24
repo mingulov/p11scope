@@ -9,6 +9,7 @@ use super::identity::{
     ExaminedObject, FileIdentity, HeldExaminedObject, PinnedObjectId, PinnedObjects,
     RetainedInventoryTarget,
 };
+use super::retained_member::ValidatedMemberSelector;
 use super::scan::CaptureWorkBudget;
 use super::sweep_attribution::{
     ConfirmIo, Confirmation, IoResources, KnownKeyIndex, MappedIdentities, MemberProbe,
@@ -16,7 +17,8 @@ use super::sweep_attribution::{
 };
 use super::sweep_attribution::{ReservationOwner, SegmentPolicy, Slot};
 use crate::attach::identity_iter::{
-    AnchorArena, Expect, RunKind, RunMode, ScopeBitmap, StrictIdentity, parse,
+    AnchorArena, Expect, OwnedRunError, ProbeError, RunKind, RunMode, ScopeBitmap, StrictIdentity,
+    consume_owned_run, iter_create, link_create_task_vma_tid, parse,
 };
 use p11scope_manifest::maps::ObjectKey;
 use std::cmp::Reverse;
@@ -368,6 +370,25 @@ impl InstalledAnchorPass<'_, '_> {
         result
     }
 
+    fn read_member_typed(
+        &mut self,
+        selector: ValidatedMemberSelector<'_>,
+        deadline: std::time::Instant,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, RunFailure> {
+        let pass = self.pass.as_mut().expect("installed guard owns its pass");
+        let lease = pass
+            .reservations
+            .immediate()
+            .transient()
+            .map_err(|_| RunFailure::FdHeadroom)?;
+        let result = pass.read_run_member(self.session, selector, deadline, max_bytes);
+        // The concrete read closes iterator/link before this lease or the
+        // enclosing guard can release the arena and examined files.
+        drop(lease);
+        result
+    }
+
     fn replace_target_scope(&mut self, tgids: &[u32]) -> Result<(), RunFailure> {
         let pass = self.pass.as_ref().expect("installed guard owns its pass");
         if !pass.owns_installation(self.session) {
@@ -394,6 +415,65 @@ impl InstalledAnchorPass<'_, '_> {
         }
         result
     }
+
+    /// Write (`Some`) or reset (`None`) the member-run target, keeping
+    /// the installed generation, arena and slot budget. A failed write
+    /// invalidates the binding exactly like [`Self::replace_target_scope`]:
+    /// a stuck target would hijack later ordinary runs, so nothing may
+    /// run on afterwards.
+    fn replace_member_target(&mut self, target: Option<(u32, u32)>) -> Result<(), RunFailure> {
+        let pass = self.pass.as_ref().expect("installed guard owns its pass");
+        if !pass.owns_installation(self.session) {
+            return Err(RunFailure::Scope);
+        }
+        let Some(binding) = self.session.binding.clone() else {
+            return Err(RunFailure::Scope);
+        };
+        let (target_tgid, target_tid) = target.unwrap_or((0, 0));
+        let config = crate::attach::identity_iter::IdentityConfig {
+            generation: binding.generation,
+            arena_base: binding.arena_base,
+            arena_len: binding.arena_len,
+            slots: (binding.arena_len / crate::attach::identity_iter::ANCHOR_STRIDE) as u32,
+            observer_tgid: std::process::id(),
+            target_tgid,
+            target_tid,
+        };
+        let result = self
+            .session
+            .configure(config)
+            .map_err(|_| RunFailure::Scope);
+        if result.is_err() {
+            self.session.binding = None;
+            self.session.scope.invalidate();
+        }
+        result
+    }
+}
+
+/// One member (TID-scoped) target run over the validated selector's
+/// task: a TID-only iterator link plus its reader. The tid derives
+/// privately from retained custody here — callers pass only the
+/// validated selector, never a numeric tid.
+pub(crate) fn attach_and_read_member_run(
+    prog: std::os::fd::BorrowedFd<'_>,
+    member: ValidatedMemberSelector<'_>,
+    deadline: std::time::Instant,
+    max_bytes: usize,
+) -> Result<Vec<u8>, OwnedRunError> {
+    let link = link_create_task_vma_tid(prog, member.tgid(), member.tid()).map_err(|error| {
+        OwnedRunError::Attach(ProbeError {
+            stage: "link",
+            detail: error.to_string(),
+        })
+    })?;
+    let iter = iter_create(link.as_fd()).map_err(|error| {
+        OwnedRunError::Attach(ProbeError {
+            stage: "iter",
+            detail: error.to_string(),
+        })
+    })?;
+    consume_owned_run(iter, link, deadline, max_bytes).map_err(OwnedRunError::Read)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -425,6 +505,11 @@ pub(crate) enum KernelFallbackReason {
     TargetUnavailable,
     Unvisited,
     ConflictingDuplicate,
+    /// A zombie-group member request that cannot run as a single-request
+    /// TID run. Named per request (never a batch verdict); kept in the
+    /// kernel-identity oracle only — it never becomes the surfaced
+    /// first reason until the schema vocabulary allows it.
+    ZombieBatch,
 }
 
 impl KernelFallbackReason {
@@ -440,6 +525,7 @@ impl KernelFallbackReason {
             Self::TargetUnavailable => "target_unavailable",
             Self::Unvisited => "unvisited",
             Self::ConflictingDuplicate => "conflicting_duplicate",
+            Self::ZombieBatch => "zombie-batch",
         }
     }
 
@@ -483,6 +569,10 @@ struct PassFallback {
     pids: BTreeSet<u32>,
     keys: BTreeSet<ObjectKey>,
     reason: Option<KernelFallbackReason>,
+    /// Every per-request name, including ones the surfaced first reason
+    /// must not carry. Test oracle only; production reads `reason`.
+    #[cfg(test)]
+    per_pid: BTreeMap<u32, KernelFallbackReason>,
 }
 
 /// Session-owned fallback accounting. The current pass opens at anchor
@@ -526,7 +616,12 @@ impl KernelFallbackLedger {
         };
         current.pids.insert(pid);
         current.keys.extend(keys);
-        if current.reason.is_none() {
+        #[cfg(test)]
+        current.per_pid.insert(pid, reason);
+        // `ZombieBatch` counts but never becomes the surfaced first
+        // reason: the schema vocabulary has no such label yet.
+        let surfaced = !matches!(reason, KernelFallbackReason::ZombieBatch);
+        if current.reason.is_none() && surfaced {
             current.reason = Some(reason);
         }
     }
@@ -785,6 +880,9 @@ impl SegmentProof for KernelPassProof<'_, '_, '_> {
             Err(reason) => return self.userspace(batch, reason),
         };
         let mut work = TargetWorkDeadline { deadline, steps: 0 };
+        // A zombie-group member request runs only alone, as a TID run
+        // over its survivor; anywhere else it keeps its own name.
+        let singleton_member = matches!(batch.requests(), [only] if only.member().is_some());
         // Exclude a PID before running if any required whole-key expectation
         // is absent. A consumed valid NONE from eligible PIDs is never retried.
         let mut eligible = Vec::with_capacity(batch.requests().len());
@@ -832,7 +930,10 @@ impl SegmentProof for KernelPassProof<'_, '_, '_> {
                     break;
                 }
             }
-            if complete {
+            // A member request outside a singleton batch cannot run
+            // here: it draws no scope and no bytes; the answers name it.
+            let runnable = request.member().is_none() || singleton_member;
+            if complete && runnable {
                 scope.insert(request.pid());
                 maps += request.entries().len(); // Bounded by examined_entries above.
             }
@@ -865,62 +966,148 @@ impl SegmentProof for KernelPassProof<'_, '_, '_> {
         let Some(max_bytes) = max_bytes else {
             return self.userspace(batch, RunFailure::FdHeadroom);
         };
-        if let Err(reason) = self
-            .installed
-            .replace_target_scope(&scope.iter().copied().collect::<Vec<_>>())
-        {
-            return self.userspace(batch, reason);
-        }
-        if let Err(reason) = work.check(budget) {
-            return self.userspace(batch, reason);
-        }
-        // One confirmed request on its original retained pidfd is a per-PID
-        // promotion walk; anything else runs whole-system without a pidfd.
-        // The fd is only ever borrowed from the charged preparation: a
-        // missing pidfd runs whole-system, never a numeric reopen.
-        let promotion = match batch.requests() {
-            [only] => matches!(only.kind(), AcceptedKind::Confirm)
-                .then(|| only.pidfd())
-                .flatten(),
-            _ => None,
+        // A singleton member batch proves by TID run over a freshly
+        // derived selector; a dead selector skips the run entirely (not
+        // an attempt) and the answers name it. Anything else takes the
+        // ordinary scope-and-promotion path.
+        let selector = if singleton_member {
+            batch
+                .requests()
+                .first()
+                .and_then(AcceptedRequest::member)
+                .and_then(|member| member.selector().ok())
+        } else {
+            None
         };
-        let (mode, pid) = match promotion {
-            Some(pidfd) => (RunMode::PerPid, Some(pidfd)),
-            None => (RunMode::WholeSystem, None),
-        };
-        let bytes = match self.installed.read_target_typed(pid, deadline, max_bytes) {
-            Ok(bytes) => {
-                self.installed.target_attempts = self.installed.target_attempts.saturating_add(1);
-                bytes
-            }
-            Err(reason) => {
-                // Reservation/installation refusals precede target I/O and
-                // are not attempts. Only an attempted run's failure demotes
-                // later segments and moves the session streak.
-                if matches!(reason, RunFailure::FdHeadroom | RunFailure::Scope) {
-                    return self.userspace(batch, reason);
+        let mut ran_as_member = false;
+        let run = if singleton_member {
+            match selector {
+                Some(selector) => {
+                    if let Err(reason) = self
+                        .installed
+                        .replace_member_target(Some((selector.tgid(), selector.tid())))
+                    {
+                        return self.userspace(batch, reason);
+                    }
+                    if let Err(reason) = work.check(budget) {
+                        return self.userspace(batch, reason);
+                    }
+                    let bytes = match self
+                        .installed
+                        .read_member_typed(selector, deadline, max_bytes)
+                    {
+                        Ok(bytes) => {
+                            self.installed.target_attempts =
+                                self.installed.target_attempts.saturating_add(1);
+                            bytes
+                        }
+                        Err(reason) => {
+                            // Same attempt policy as ordinary runs:
+                            // only an attempted run's failure demotes
+                            // later segments.
+                            if matches!(reason, RunFailure::FdHeadroom | RunFailure::Scope) {
+                                return self.userspace(batch, reason);
+                            }
+                            self.installed.target_attempts =
+                                self.installed.target_attempts.saturating_add(1);
+                            self.note_attempted_outcome(reason);
+                            self.installed.failed_target = Some(reason);
+                            return self.userspace(batch, reason);
+                        }
+                    };
+                    // Reset before consuming: a stuck target would hijack
+                    // later ordinary runs. Fail closed on a stuck reset.
+                    if let Err(reason) = self.installed.replace_member_target(None) {
+                        return self.userspace(batch, reason);
+                    }
+                    ran_as_member = true;
+                    let only_pid = batch
+                        .requests()
+                        .first()
+                        .expect("singleton member batch")
+                        .pid();
+                    match parse(
+                        &bytes,
+                        &Expect {
+                            generation,
+                            slots,
+                            scope: &BTreeSet::from([only_pid]),
+                            mode: RunMode::PerPid,
+                            run: RunKind::Target,
+                        },
+                    ) {
+                        Ok(run) => run,
+                        Err(_) => {
+                            self.note_attempted_outcome(RunFailure::StreamInvalid);
+                            self.installed.failed_target = Some(RunFailure::StreamInvalid);
+                            return self.userspace(batch, RunFailure::StreamInvalid);
+                        }
+                    }
                 }
-                self.installed.target_attempts = self.installed.target_attempts.saturating_add(1);
-                self.note_attempted_outcome(reason);
-                self.installed.failed_target = Some(reason);
+                // A dead selector skips the run entirely (not an
+                // attempt); the answers below name it.
+                None => crate::attach::identity_iter::Run::default(),
+            }
+        } else {
+            if let Err(reason) = self
+                .installed
+                .replace_target_scope(&scope.iter().copied().collect::<Vec<_>>())
+            {
                 return self.userspace(batch, reason);
             }
-        };
-        let run = match parse(
-            &bytes,
-            &Expect {
-                generation,
-                slots,
-                scope: &scope,
-                mode,
-                run: RunKind::Target,
-            },
-        ) {
-            Ok(run) => run,
-            Err(_) => {
-                self.note_attempted_outcome(RunFailure::StreamInvalid);
-                self.installed.failed_target = Some(RunFailure::StreamInvalid);
-                return self.userspace(batch, RunFailure::StreamInvalid);
+            if let Err(reason) = work.check(budget) {
+                return self.userspace(batch, reason);
+            }
+            // One confirmed request on its original retained pidfd is a per-PID
+            // promotion walk; anything else runs whole-system without a pidfd.
+            // The fd is only ever borrowed from the charged preparation: a
+            // missing pidfd runs whole-system, never a numeric reopen.
+            let promotion = match batch.requests() {
+                [only] => matches!(only.kind(), AcceptedKind::Confirm)
+                    .then(|| only.pidfd())
+                    .flatten(),
+                _ => None,
+            };
+            let (mode, pid) = match promotion {
+                Some(pidfd) => (RunMode::PerPid, Some(pidfd)),
+                None => (RunMode::WholeSystem, None),
+            };
+            let bytes = match self.installed.read_target_typed(pid, deadline, max_bytes) {
+                Ok(bytes) => {
+                    self.installed.target_attempts =
+                        self.installed.target_attempts.saturating_add(1);
+                    bytes
+                }
+                Err(reason) => {
+                    // Reservation/installation refusals precede target I/O and
+                    // are not attempts. Only an attempted run's failure demotes
+                    // later segments and moves the session streak.
+                    if matches!(reason, RunFailure::FdHeadroom | RunFailure::Scope) {
+                        return self.userspace(batch, reason);
+                    }
+                    self.installed.target_attempts =
+                        self.installed.target_attempts.saturating_add(1);
+                    self.note_attempted_outcome(reason);
+                    self.installed.failed_target = Some(reason);
+                    return self.userspace(batch, reason);
+                }
+            };
+            match parse(
+                &bytes,
+                &Expect {
+                    generation,
+                    slots,
+                    scope: &scope,
+                    mode,
+                    run: RunKind::Target,
+                },
+            ) {
+                Ok(run) => run,
+                Err(_) => {
+                    self.note_attempted_outcome(RunFailure::StreamInvalid);
+                    self.installed.failed_target = Some(RunFailure::StreamInvalid);
+                    return self.userspace(batch, RunFailure::StreamInvalid);
+                }
             }
         };
         #[cfg(test)]
@@ -936,6 +1123,18 @@ impl SegmentProof for KernelPassProof<'_, '_, '_> {
                 self.note_attempted_outcome(reason);
                 self.installed.failed_target = Some(reason);
                 return self.userspace(batch, reason);
+            }
+            // A member request answers from its own TID run only; anywhere
+            // else (a shared batch, a dead selector) it keeps its own
+            // name and falls back per request, never per batch.
+            if request.member().is_some() && !ran_as_member {
+                self.installed.session.fallback.note_fallback(
+                    request.pid(),
+                    request_keys(request),
+                    KernelFallbackReason::ZombieBatch,
+                );
+                answers.push(None);
+                continue;
             }
             let demoted = run.demoted_pids.contains(&request.pid());
             let records = eligible
@@ -1389,6 +1588,19 @@ impl<'p> AnchorPass<'p> {
         session.read(run, pid, deadline, max_bytes)
     }
 
+    fn read_run_member(
+        &mut self,
+        session: &IdentitySession,
+        selector: ValidatedMemberSelector<'_>,
+        deadline: std::time::Instant,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, RunFailure> {
+        if !self.owns_installation(session) || !session.scope.ready() {
+            return Err(RunFailure::Scope);
+        }
+        session.read_member(selector, deadline, max_bytes)
+    }
+
     #[cfg(test)]
     fn read_fixture_run(
         &mut self,
@@ -1445,6 +1657,12 @@ struct FixtureRunTrace {
     closed: Vec<(tests::ClosedFdEvidence, tests::ClosedFdEvidence)>,
     outcomes: Vec<Result<(), RunFailure>>,
     pidfds: Vec<Option<i32>>,
+    /// The member target per target run (`Some` exactly for TID runs),
+    /// aligned with `scopes`/`pidfds`/`outcomes`.
+    tids: Vec<Option<(u32, u32)>>,
+    /// Every config write attempt, in order (install, member target,
+    /// reset): the exact bytes each call carried.
+    config_writes: Vec<crate::attach::identity_iter::IdentityConfig>,
 }
 
 #[cfg(test)]
@@ -1540,8 +1758,12 @@ impl IdentitySession {
             SessionObject::Fixture {
                 config: installed,
                 fail_config,
+                target_trace,
                 ..
             } => {
+                // Attempts record before the gate, so a failed write
+                // still shows the bytes it carried.
+                target_trace.lock().unwrap().config_writes.push(config);
                 if *fail_config {
                     return Err("injected configuration failure");
                 }
@@ -1578,80 +1800,131 @@ impl IdentitySession {
                 })
             }
             #[cfg(test)]
-            SessionObject::Fixture {
-                anchor,
-                target,
-                reads,
-                target_steps,
-                target_trace,
-                scope_words,
-                ..
-            } => {
-                use std::os::unix::fs::FileExt;
-                reads.set(reads.get() + 1);
-                let step = (run == RunKind::Target)
-                    .then(|| target_steps.borrow_mut().pop_front())
-                    .flatten();
-                let scope: BTreeSet<_> = scope_words
-                    .borrow()
-                    .iter()
-                    .flat_map(|(&word, &bits)| {
-                        (0..64).filter_map(move |bit| {
-                            (bits & (1u64 << bit) != 0).then_some(word * 64 + bit)
-                        })
-                    })
-                    .collect();
-                if run == RunKind::Target {
-                    let mut trace = target_trace.lock().unwrap();
-                    trace.scopes.push(scope);
-                    trace
-                        .pidfds
-                        .push(pid.map(|fd| std::os::fd::AsRawFd::as_raw_fd(&fd)));
-                }
-                if let Some(FixtureTarget::Failure(reason)) = step {
-                    target_trace.lock().unwrap().outcomes.push(Err(reason));
-                    return Err(reason);
-                }
-                let bytes = match &step {
-                    Some(FixtureTarget::Bytes(bytes) | FixtureTarget::Deadline(bytes)) => bytes,
-                    _ => match run {
-                        RunKind::Anchor => anchor,
-                        RunKind::Target => target,
-                    },
-                };
-                let (file, file_path) = tempfile::NamedTempFile::new().unwrap().into_parts();
-                file.write_at(bytes, 0).unwrap();
-                let (link, link_path) = tempfile::NamedTempFile::new().unwrap().into_parts();
-                let tokens = (tests::FdToken::of(&file), tests::FdToken::of(&link));
-                if run == RunKind::Target {
-                    target_trace.lock().unwrap().concrete_runs += 1;
-                }
-                let read_deadline = if matches!(step, Some(FixtureTarget::Deadline(_))) {
-                    std::time::Instant::now() - std::time::Duration::from_millis(1)
-                } else {
-                    deadline
-                };
-                let result = crate::attach::identity_iter::consume_owned_run(
-                    file.into(),
-                    link.into(),
-                    read_deadline,
-                    max_bytes,
-                )
-                .map_err(RunFailure::from);
-                let closed = (
-                    tests::ClosedFdEvidence::capture(tokens.0, file_path),
-                    tests::ClosedFdEvidence::capture(tokens.1, link_path),
-                );
-                if run == RunKind::Target {
-                    let mut trace = target_trace.lock().unwrap();
-                    trace.closed.push(closed);
-                    trace
-                        .outcomes
-                        .push(result.as_ref().map(|_| ()).map_err(|reason| *reason));
-                }
-                result
-            }
+            SessionObject::Fixture { .. } => Self::run_fixture_target(
+                &self.object,
+                run,
+                pid.map(|fd| std::os::fd::AsRawFd::as_raw_fd(&fd)),
+                None,
+                deadline,
+                max_bytes,
+            ),
         }
+    }
+
+    /// One member (TID-scoped) target run over the validated selector's
+    /// task. The tid selects the task only at attach; generation proof
+    /// stays the confirm path's job.
+    fn read_member(
+        &self,
+        selector: ValidatedMemberSelector<'_>,
+        deadline: std::time::Instant,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, RunFailure> {
+        match &self.object {
+            SessionObject::Kernel(loaded) => {
+                attach_and_read_member_run(loaded.target_fd.as_fd(), selector, deadline, max_bytes)
+                    .map_err(|error| match error {
+                        OwnedRunError::Attach(_) => RunFailure::AttachOrRead,
+                        OwnedRunError::Read(error) => error.into(),
+                    })
+            }
+            #[cfg(test)]
+            SessionObject::Fixture { .. } => Self::run_fixture_target(
+                &self.object,
+                RunKind::Target,
+                None,
+                Some((selector.tgid(), selector.tid())),
+                deadline,
+                max_bytes,
+            ),
+        }
+    }
+
+    /// Scripted target/anchor consumption shared by ordinary and member
+    /// runs: identical bytes, accounting and evidence, with the pidfd
+    /// and member-target recordings supplied per run kind.
+    #[cfg(test)]
+    fn run_fixture_target(
+        object: &SessionObject,
+        run: RunKind,
+        pid_record: Option<i32>,
+        member: Option<(u32, u32)>,
+        deadline: std::time::Instant,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, RunFailure> {
+        let SessionObject::Fixture {
+            anchor,
+            target,
+            reads,
+            target_steps,
+            target_trace,
+            scope_words,
+            ..
+        } = object
+        else {
+            unreachable!("fixture runs need the fixture object")
+        };
+        use std::os::unix::fs::FileExt;
+        reads.set(reads.get() + 1);
+        let step = (run == RunKind::Target)
+            .then(|| target_steps.borrow_mut().pop_front())
+            .flatten();
+        let scope: BTreeSet<_> = scope_words
+            .borrow()
+            .iter()
+            .flat_map(|(&word, &bits)| {
+                (0..64)
+                    .filter_map(move |bit| (bits & (1u64 << bit) != 0).then_some(word * 64 + bit))
+            })
+            .collect();
+        if run == RunKind::Target {
+            let mut trace = target_trace.lock().unwrap();
+            trace.scopes.push(scope);
+            trace.pidfds.push(pid_record);
+            trace.tids.push(member);
+        }
+        if let Some(FixtureTarget::Failure(reason)) = step {
+            target_trace.lock().unwrap().outcomes.push(Err(reason));
+            return Err(reason);
+        }
+        let bytes = match &step {
+            Some(FixtureTarget::Bytes(bytes) | FixtureTarget::Deadline(bytes)) => bytes,
+            _ => match run {
+                RunKind::Anchor => anchor,
+                RunKind::Target => target,
+            },
+        };
+        let (file, file_path) = tempfile::NamedTempFile::new().unwrap().into_parts();
+        file.write_at(bytes, 0).unwrap();
+        let (link, link_path) = tempfile::NamedTempFile::new().unwrap().into_parts();
+        let tokens = (tests::FdToken::of(&file), tests::FdToken::of(&link));
+        if run == RunKind::Target {
+            target_trace.lock().unwrap().concrete_runs += 1;
+        }
+        let read_deadline = if matches!(step, Some(FixtureTarget::Deadline(_))) {
+            std::time::Instant::now() - std::time::Duration::from_millis(1)
+        } else {
+            deadline
+        };
+        let result = crate::attach::identity_iter::consume_owned_run(
+            file.into(),
+            link.into(),
+            read_deadline,
+            max_bytes,
+        )
+        .map_err(RunFailure::from);
+        let closed = (
+            tests::ClosedFdEvidence::capture(tokens.0, file_path),
+            tests::ClosedFdEvidence::capture(tokens.1, link_path),
+        );
+        if run == RunKind::Target {
+            let mut trace = target_trace.lock().unwrap();
+            trace.closed.push(closed);
+            trace
+                .outcomes
+                .push(result.as_ref().map(|_| ()).map_err(|reason| *reason));
+        }
+        result
     }
 
     /// D3d capture disclosure input: the session-owned fallback totals

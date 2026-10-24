@@ -8105,3 +8105,12 @@ fn d3a_directory_final_drop_fences_immediate_reuse() {
     });
     assert_eq!(owner.state_for_test().0, [0; 4]);
 }
+
+#[path = "d4_ext4_cells.rs"]
+mod d4_ext4_cells;
+#[path = "d4_overlay_cells.rs"]
+mod d4_overlay_cells;
+#[path = "d4_population_cells.rs"]
+mod d4_population_cells;
+#[path = "d4_zombie_cells.rs"]
+mod d4_zombie_cells;

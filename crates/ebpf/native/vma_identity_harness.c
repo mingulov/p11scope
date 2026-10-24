@@ -1,17 +1,18 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Host behavioral harness for `p11_anchor_vma` (W3-1 fix round 3, items
- * 3W1F3-01/02). Compiles the REAL `vma_identity.c` for host with stub
- * maps and captured emits: the BPF helper pointers are renamed to
- * host-owned function pointers (assigned in `main` before any program
- * runs), `P11_READ` becomes a byte copy (exactly what the probe read
- * delivers), and `p11_field_exists` is true (the driven anchor path
- * never consults it; the sole use is the target-run `VM_EXEC`
- * pre-filter at `vma_identity.c:296`, undriven here). Zero
- * production-C changes: this TU only adds
- * preprocessor renames around the real sources, so a guard regression
- * in `vma_identity.c` fails these scenarios. Built and driven by the
- * `anchor_host_harness_replay_and_arena_behavior` test; never shipped.
+ * 3W1F3-01/02) plus the member-run target gate of `p11_identity_vma`.
+ * Compiles the REAL `vma_identity.c` for host with stub maps and
+ * captured emits: the BPF helper pointers are renamed to host-owned
+ * function pointers (assigned in `main` before any program runs),
+ * `P11_READ` becomes a byte copy (exactly what the probe read
+ * delivers), and `p11_field_exists` is true (so the target-run
+ * `VM_EXEC` pre-filter is live in the member-run scenarios). Zero
+ * production-C changes: this TU only adds preprocessor renames around
+ * the real sources, so a guard regression in `vma_identity.c` fails
+ * these scenarios. Built and driven by the
+ * `anchor_host_harness_replay_and_arena_behavior` and
+ * `member_run_host_harness_target_gate_behavior` tests; never shipped.
  */
 #include <stdint.h>
 #include <stdio.h>
@@ -209,6 +210,67 @@ static int host_observe_anon(u64 start, u64 end, int tgid)
     first = host_capture_n;
     p11_anchor_vma(&host_ctx);
     return first;
+}
+
+/* Anchor observe with an explicit (pid, tgid) pair, for nonleader tasks. */
+static int host_observe_as(int pid, int tgid, u64 start, u64 end, u64 inode)
+{
+    int first;
+    host_task.pid = pid;
+    host_task.tgid = tgid;
+    host_file.f_inode = (struct inode *)(uintptr_t)inode;
+    host_vma.vm_start = (unsigned long)start;
+    host_vma.vm_end = (unsigned long)end;
+    host_vma.vm_flags = P11_IDENT_VM_EXEC;
+    host_vma.vm_file = &host_file;
+    host_meta.seq = (void *)0x1;
+    host_meta.session_id = 0;
+    host_meta.seq_num = 0;
+    host_ctx.meta = &host_meta;
+    host_ctx.task = &host_task;
+    host_ctx.vma = &host_vma;
+    first = host_capture_n;
+    p11_anchor_vma(&host_ctx);
+    return first;
+}
+
+/* Feed one VMA observation to the TARGET program; returns the capture
+ * index of its first newly emitted record. */
+static int host_target_observe(int pid, int tgid, u64 start, u64 end, u64 inode,
+                               unsigned int flags, int has_file)
+{
+    int first;
+    host_task.pid = pid;
+    host_task.tgid = tgid;
+    host_vma.vm_start = (unsigned long)start;
+    host_vma.vm_end = (unsigned long)end;
+    host_vma.vm_flags = flags;
+    if (has_file) {
+        host_file.f_inode = (struct inode *)(uintptr_t)inode;
+        host_vma.vm_file = &host_file;
+    } else {
+        host_vma.vm_file = (struct file *)0;
+    }
+    host_meta.seq = (void *)0x1;
+    host_meta.session_id = 0;
+    host_meta.seq_num = 0;
+    host_ctx.meta = &host_meta;
+    host_ctx.task = &host_task;
+    host_ctx.vma = &host_vma;
+    first = host_capture_n;
+    p11_identity_vma(&host_ctx);
+    return first;
+}
+
+static void host_set_target(u32 tgid, u32 tid)
+{
+    host_config.target_tgid = tgid;
+    host_config.target_tid = tid;
+}
+
+static void host_scope_set(u32 tgid)
+{
+    host_scope[tgid / 64] |= (u64)1 << (tgid % 64);
 }
 
 static const struct p11_anchor_entry *host_anchor_find(u64 addr)
@@ -488,6 +550,130 @@ static void scenario_contained_install(void)
                "contained_vma_installed");
 }
 
+/* Member run: with target (200, 201) set, the exact nonleader survivor
+ * emits its anchored range keyed by the TGID. */
+static void scenario_member_run_accepts_exact_survivor(void)
+{
+    const u64 base = 0x7F0000000000ULL;
+    const u64 stride = P11_IDENT_ANCHOR_STRIDE;
+    const u64 page = P11_IDENT_PAGE;
+    const u64 x = 0xFFFF888000001000ULL;
+    int at;
+    host_reset(7, base, 2 * stride, 2, 100);
+    host_observe(base, base + page, x, 100);
+    HOST_CHECK(host_capture_n == 1 && host_capture[0].verdict == P11_IDENT_ANCHOR_OK &&
+                   host_capture[0].a == 0,
+               "slot0_installs");
+    host_set_target(200, 201);
+    at = host_capture_n;
+    host_target_observe(201, 200, 0x4000, 0x5000, x, P11_IDENT_VM_EXEC, 1);
+    host_print_record(at);
+    HOST_CHECK(host_capture_n - at == 1 &&
+                   host_capture[at].kind == P11_IDENT_KIND_VMA &&
+                   host_capture[at].a == 200 && host_capture[at].start == 0x4000 &&
+                   host_capture[at].end == 0x5000 && host_capture[at].verdict == 0 &&
+                   host_capture[at].gen == 7,
+               "survivor_emits_slot0_keyed_by_tgid");
+}
+
+/* Member run: the leader, a foreign tid, a foreign group, an anonymous
+ * VMA, a non-exec VMA and a zero-inode VMA all emit nothing. */
+static void scenario_member_run_skips_non_targets(void)
+{
+    const u64 base = 0x7F0000000000ULL;
+    const u64 stride = P11_IDENT_ANCHOR_STRIDE;
+    const u64 page = P11_IDENT_PAGE;
+    const u64 x = 0xFFFF888000001000ULL;
+    host_reset(7, base, 2 * stride, 2, 100);
+    host_observe(base, base + page, x, 100);
+    HOST_CHECK(host_capture_n == 1, "slot0_installs");
+    host_set_target(200, 201);
+    host_target_observe(200, 200, 0x4000, 0x5000, x, P11_IDENT_VM_EXEC, 1);
+    HOST_CHECK(host_capture_n == 1, "leader_skipped");
+    host_target_observe(202, 200, 0x4000, 0x5000, x, P11_IDENT_VM_EXEC, 1);
+    HOST_CHECK(host_capture_n == 1, "foreign_tid_skipped");
+    host_target_observe(201, 202, 0x4000, 0x5000, x, P11_IDENT_VM_EXEC, 1);
+    HOST_CHECK(host_capture_n == 1, "foreign_group_skipped");
+    host_target_observe(201, 200, 0x4000, 0x5000, x, P11_IDENT_VM_EXEC, 0);
+    HOST_CHECK(host_capture_n == 1, "anon_skipped");
+    host_target_observe(201, 200, 0x4000, 0x5000, x, 0, 1);
+    HOST_CHECK(host_capture_n == 1, "non_exec_skipped");
+    host_target_observe(201, 200, 0x4000, 0x5000, 0, P11_IDENT_VM_EXEC, 1);
+    HOST_CHECK(host_capture_n == 1, "zero_inode_skipped");
+}
+
+/* Zeroed target: ordinary leader-gated, scope-checked behavior is
+ * unchanged (the leader gate is never removed globally). */
+static void scenario_zeroed_target_keeps_leader_gate(void)
+{
+    const u64 base = 0x7F0000000000ULL;
+    const u64 stride = P11_IDENT_ANCHOR_STRIDE;
+    const u64 page = P11_IDENT_PAGE;
+    const u64 x = 0xFFFF888000001000ULL;
+    int at;
+    host_reset(7, base, 2 * stride, 2, 100);
+    host_observe(base, base + page, x, 100);
+    HOST_CHECK(host_capture_n == 1, "slot0_installs");
+    /* No host_set_target: the reset zeroed the target fields. */
+    host_scope_set(200);
+    at = host_capture_n;
+    host_target_observe(200, 200, 0x4000, 0x5000, x, P11_IDENT_VM_EXEC, 1);
+    HOST_CHECK(host_capture_n - at == 1 && host_capture[at].kind == P11_IDENT_KIND_VMA &&
+                   host_capture[at].a == 200 && host_capture[at].verdict == 0,
+               "scoped_leader_emits");
+    host_target_observe(201, 200, 0x4000, 0x5000, x, P11_IDENT_VM_EXEC, 1);
+    HOST_CHECK(host_capture_n - at == 1, "nonleader_still_gated");
+    host_target_observe(200, 300, 0x4000, 0x5000, x, P11_IDENT_VM_EXEC, 1);
+    HOST_CHECK(host_capture_n - at == 1, "unscoped_group_still_gated");
+}
+
+/* Anchor program fed a nonleader task installs nothing and emits
+ * nothing: the leader gate holds even under direct TID iteration. */
+static void scenario_nonleader_anchor_installs_nothing(void)
+{
+    const u64 base = 0x7F0000000000ULL;
+    const u64 stride = P11_IDENT_ANCHOR_STRIDE;
+    const u64 page = P11_IDENT_PAGE;
+    const u64 x = 0xFFFF888000001000ULL;
+    host_reset(7, base, 2 * stride, 2, 100);
+    host_observe_as(101, 100, base, base + page, x);
+    HOST_CHECK(host_capture_n == 0, "nonleader_emits_nothing");
+    HOST_CHECK(host_anchors_used() == 0, "nonleader_installs_nothing");
+    HOST_CHECK(host_slots[0] == 0 && host_observed[0] == 0, "slot0_untouched");
+}
+
+/* Member runs are pure reads: replaying the same observation emits
+ * the identical record and changes no map. */
+static void scenario_target_config_replay_is_stable(void)
+{
+    const u64 base = 0x7F0000000000ULL;
+    const u64 stride = P11_IDENT_ANCHOR_STRIDE;
+    const u64 page = P11_IDENT_PAGE;
+    const u64 x = 0xFFFF888000001000ULL;
+    u64 slots_before[HOST_ANCHOR_MAX];
+    u64 observed_before[HOST_ANCHOR_MAX];
+    int first;
+    int second;
+    host_reset(7, base, 2 * stride, 2, 100);
+    host_observe(base, base + page, x, 100);
+    HOST_CHECK(host_capture_n == 1, "slot0_installs");
+    host_set_target(200, 201);
+    first = host_capture_n;
+    host_target_observe(201, 200, 0x4000, 0x5000, x, P11_IDENT_VM_EXEC, 1);
+    memcpy(slots_before, host_slots, sizeof slots_before);
+    memcpy(observed_before, host_observed, sizeof observed_before);
+    second = host_capture_n;
+    host_target_observe(201, 200, 0x4000, 0x5000, x, P11_IDENT_VM_EXEC, 1);
+    HOST_CHECK(host_capture_n - first == 2, "replay_emits_again");
+    HOST_CHECK(memcmp(&host_capture[first], &host_capture[second],
+                      sizeof host_capture[0]) == 0,
+               "replay_identical");
+    HOST_CHECK(host_anchors_used() == 1, "no_new_install");
+    HOST_CHECK(memcmp(slots_before, host_slots, sizeof slots_before) == 0 &&
+                   memcmp(observed_before, host_observed, sizeof observed_before) == 0,
+               "maps_unchanged");
+}
+
 static const struct {
     const char *name;
     void (*run)(void);
@@ -500,6 +686,11 @@ static const struct {
     {"straddle-contained-length", scenario_straddle_contained_length},
     {"shape-cases", scenario_shape_cases},
     {"contained-install", scenario_contained_install},
+    {"member-run-accepts-exact-survivor", scenario_member_run_accepts_exact_survivor},
+    {"member-run-skips-non-targets", scenario_member_run_skips_non_targets},
+    {"zeroed-target-keeps-leader-gate", scenario_zeroed_target_keeps_leader_gate},
+    {"nonleader-anchor-installs-nothing", scenario_nonleader_anchor_installs_nothing},
+    {"target-config-replay-is-stable", scenario_target_config_replay_is_stable},
 };
 
 static int run_one(const char *name, void (*run)(void))

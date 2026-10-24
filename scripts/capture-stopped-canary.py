@@ -183,7 +183,7 @@ def ready_bound_seconds(release):
     at or above MODERN_READY_KERNEL use READY_SECONDS, and anything
     else (older, unknown or unparseable) refuses rather than guesses.
     """
-    match = re.match(r'(\d+)\.(\d+)', release) if type(release) is str else None
+    match = re.match(r'(\d+)\.(\d+)', release) if isinstance(release, str) else None
     if match is None:
         raise CaptureError('unparseable kernel release for canary readiness')
     key = (int(match.group(1)), int(match.group(2)))

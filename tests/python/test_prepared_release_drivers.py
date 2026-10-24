@@ -7,8 +7,10 @@ import os
 from pathlib import Path
 import runpy
 import shutil
+import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 NATIVE = ROOT / "tests/fixtures/prepared-release-drivers"
@@ -280,6 +282,96 @@ class PreparedReleaseDriverTests(unittest.TestCase):
             "bpf_rustc": str(tools[3]),
         })
 
+    def static_build_record(self, fixture, name, extra=()):
+        """Execute the actual static-build fragment, sliced from its mode selector."""
+        source = (fixture.repo / "scripts/build-release.sh").read_text()
+        start = 'case ${RELEASE_CAPTURE_MODE-full} in\n'
+        end = 'P11SCOPE_STATIC=$OFFICIAL_TARGET/'
+        self.assertEqual(source.count(start), 1)
+        command = fixture.base / (name + "-command.sh")
+        command.write_text(source[source.index(start):source.index(end)])
+        cargo = fixture.base / (name + " selected stable cargo")
+        shutil.copy2(NATIVE / "release-build-probe.py", cargo)
+        cargo.chmod(0o700)
+        tools = [cargo]
+        for tool in ("selected stable rustc", "selected bpf cargo", "selected bpf rustc"):
+            path = fixture.base / (name + " " + tool)
+            fixture.inert(path)
+            tools.append(path)
+        record = fixture.base / (name + "-record.json")
+        with patch.dict(os.environ, extra):
+            result = fixture.command([
+                "/bin/sh", str(NATIVE / "release-root-build-launcher.sh"), str(command),
+                str(record), *(str(path) for path in tools),
+            ])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(record.read_text()), fixture, tools
+
+    def test_release_static_build_defaults_to_full_capture(self):
+        fixture = self.fixture("release", "release full default static build")
+        with patch.dict(os.environ):
+            os.environ.pop("RELEASE_CAPTURE_MODE", None)
+            record, fixture, tools = self.static_build_record(fixture, "full-default")
+        self.assertEqual(record["argv"], [
+            "build", "--locked", "--offline", "--release",
+            "--target", "x86_64-unknown-linux-musl", "--bin", "p11scope"])
+        self.assertNotIn("stub-object-attributes", record["argv"])
+        self.assertEqual(record["cargo"], str(tools[0].resolve()))
+        self.assertIsNone(record["rustflags"])
+        self.assertEqual(record["rustc"], str(tools[1]))
+
+    def test_release_static_build_p0_option_restores_stub_features(self):
+        fixture = self.fixture("release", "release p0 static build")
+        record, fixture, tools = self.static_build_record(
+            fixture, "p0-option", {"RELEASE_CAPTURE_MODE": "p0"})
+        self.assertEqual(record["argv"], [
+            "build", "--locked", "--offline", "--release",
+            "--no-default-features", "--features", "stub-object-attributes",
+            "--target", "x86_64-unknown-linux-musl", "--bin", "p11scope"])
+        self.assertEqual(record["cargo"], str(tools[0].resolve()))
+
+    def run_driver_argv(self, fixture, arguments):
+        """Mirror run_to_sudo_probe with caller-selected driver arguments."""
+        caller_path = ":".join((str(fixture.tripwire_bin), str(fixture.fake_bin), os.environ.get("PATH", ""),
+                                "/usr/local/sbin:/usr/sbin:/sbin:/usr/local/bin:/usr/bin:/bin"))
+        overrides = {"PATH": caller_path, "HOME": str(fixture.home), "TMPDIR": str(fixture.seal_parent)}
+        environment = dict(os.environ)
+        for name in SEAL["BUILD_INPUT_VARIABLES"]:
+            environment.pop(name, None)
+        environment.update(overrides)
+        output = fixture.command(["/bin/sh", str(fixture.repo / "scripts/build-release.sh"), *arguments],
+                                 environment=environment, overrides=overrides,
+                                 removed=SEAL["BUILD_INPUT_VARIABLES"])
+        return SEAL["SealedDriverRun"](fixture, output)
+
+    def test_release_records_selected_capture_mode_before_sudo_probe(self):
+        fixture = self.fixture("release", "release full mode fact")
+        run = fixture.run_to_sudo_probe()
+        self.assertEqual(run.output.returncode, 77, run.output.stderr)
+        self.assertEqual(run.fact("capture_mode"), "full", run.diagnostic())
+        self.assertEqual(run.tripped(), "sudo\n", run.diagnostic())
+        p0 = self.fixture("release", "release p0 mode fact")
+        selected = self.run_driver_argv(p0, ["--capture-mode", "p0", str(p0.root)])
+        self.assertEqual(selected.output.returncode, 77, selected.output.stderr)
+        self.assertEqual(selected.fact("capture_mode"), "p0", selected.diagnostic())
+        self.assertEqual(selected.tripped(), "sudo\n", selected.diagnostic())
+
+    def test_release_capture_mode_usage_is_parsed_before_seal(self):
+        for arguments in (["--capture-mode"], ["--capture-mode", "bogus", str(self.base / "root")],
+                          ["--capture-mode", "full", "--capture-mode", "p0", str(self.base / "root")],
+                          ["--capture-mode=full", str(self.base / "root")]):
+            with self.subTest(arguments=arguments):
+                result = subprocess.run(["/bin/sh", str(ROOT / "scripts/build-release.sh"), *arguments],
+                                        cwd=ROOT, input="", text=True,
+                                        capture_output=True, timeout=30)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("usage:", result.stderr)
+        # --self-test takes no further argument; its arity refusal stays silent.
+        refused = subprocess.run(["/bin/sh", str(ROOT / "scripts/build-release.sh"),
+                                  "--self-test", "--capture-mode", "full"],
+                                 cwd=ROOT, input="", text=True,
+                                 capture_output=True, timeout=30)
+        self.assertEqual(refused.returncode, 2, refused.stderr)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

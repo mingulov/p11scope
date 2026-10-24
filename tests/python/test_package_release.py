@@ -2,15 +2,18 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Public packages must preserve tested bytes and exclude private evidence."""
 
+import contextlib
 import hashlib
 import importlib.util
 import io
 import json
 from pathlib import Path
 import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 RELEASE_RUST = (ROOT / ".release-rust-version").read_text(encoding="utf-8").strip()
@@ -205,6 +208,62 @@ class PackageReleaseTests(unittest.TestCase):
                         self.assertNotIn(b"PRIVATE-CAPTURE-CANARY", data)
                         self.assertNotIn(b"/private/host/path", data)
         self.assertEqual((self.dist / "p11scope").stat().st_mode & 0o777, 0o600)
+
+    def test_default_provenance_is_full_capture(self):
+        result = self.package()
+        self.assertEqual(result["p11scope_features"], [])
+        release = json.loads((self.output / "RELEASE.json").read_bytes())
+        self.assertEqual(release["p11scope_features"], [])
+        self.assertIn("FULL", release["scope"])
+        self.assertIn("object-attribute capture enabled", release["scope"])
+        self.assertNotIn("stub-object-attributes", json.dumps(release))
+        for name in ("p11scope-0.1.0-x86_64-linux-musl.tar.gz",
+                     "p11scope-discover-0.1.0-x86_64-linux-gnu.tar.gz",
+                     "p11scope-discover-0.1.0-x86_64-linux-musl.tar.gz"):
+            with tarfile.open(self.output / name) as archive:
+                embedded = json.loads(archive.extractfile(name[:-7] + "/RELEASE.json").read())
+            self.assertEqual(embedded["p11scope_features"], [])
+            self.assertIn("FULL", embedded["scope"])
+
+    def test_p0_option_reproduces_p0_provenance(self):
+        result = PACKAGE.package(self.root, self.receipt, self.notices, self.source,
+                                 self.output, capture_mode="p0")
+        self.assertEqual(result["p11scope_features"], ["stub-object-attributes"])
+        release = json.loads((self.output / "RELEASE.json").read_bytes())
+        self.assertEqual(release["p11scope_features"], ["stub-object-attributes"])
+        self.assertIn("P0", release["scope"])
+        self.assertIn("object-attribute capture disabled", release["scope"])
+
+    def test_unknown_capture_mode_refuses_without_output(self):
+        with self.assertRaisesRegex(ValueError, "capture"):
+            PACKAGE.package(self.root, self.receipt, self.notices, self.source,
+                            self.output, capture_mode="bogus")
+        self.assertFalse(self.output.exists())
+
+    def run_main(self, *arguments):
+        """Run the real CLI parser with the packaging core stubbed out."""
+        with patch.object(PACKAGE, "package", return_value={"version": "0.0.0", "head": "h"}) as packaged:
+            with patch.object(sys, "argv", ["package-release.py", *arguments]):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    code = PACKAGE.main()
+        return code, packaged
+
+    def test_cli_capture_mode_selects_provenance(self):
+        base = ["--receipt", "/r", "--notices", "/n", "--source", "/s", "--output", "/o"]
+        code, packaged = self.run_main(*base)
+        self.assertEqual(code, 0)
+        self.assertEqual(packaged.call_args.kwargs["capture_mode"], "full")
+        code, packaged = self.run_main(*base, "--capture-mode", "p0")
+        self.assertEqual(code, 0)
+        self.assertEqual(packaged.call_args.kwargs["capture_mode"], "p0")
+        with patch.object(PACKAGE, "package", return_value={"version": "0.0.0", "head": "h"}) as packaged:
+            with patch.object(sys, "argv", ["package-release.py", *base, "--capture-mode", "bogus"]):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as refused:
+                        PACKAGE.main()
+        self.assertEqual(refused.exception.code, 2)
+        packaged.assert_not_called()
 
     def test_failed_or_unfinished_receipt_refuses(self):
         for status in ("1\n", "", "0\n0\n"):

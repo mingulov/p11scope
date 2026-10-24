@@ -724,6 +724,80 @@ if "--object-pilot" in args:
                 self.assertFalse(self.events.exists())
                 self.assertFalse(self.work.exists())
 
+    def attach_expected(self, prepared, features):
+        prefix = ["build", "--locked", "--offline"] if prepared else [f"+{RELEASE_RUST}", "build", "--locked"]
+        argv = prefix + ["--release", "--workspace"]
+        if features is not None:
+            argv += ["--features", features]
+        return [argv + ["--target-dir", str(self.work / "build")]]
+
+    def assert_attach_builds(self, prepared, features, arguments=()):
+        expected = self.attach_expected(prepared, features)
+        self.configure([0] * (len(expected) - 1) + [83])
+        result = self.run_child(CHILDREN[0], 64, prepared, arguments)
+        self.assertEqual(result.returncode, 83, result.stderr)
+        builds = [row for row in self.rows() if row["kind"] == "cargo"]
+        self.assertEqual([row["argv"] for row in builds], expected)
+        resources = {"sudo", "gcc", "bpftool", "softhsm2-util", "rustup"}
+        self.assertFalse(resources & {row["kind"] for row in self.rows()})
+
+    def test_attach_defaults_to_full_capture_in_both_build_modes(self):
+        for prepared in (False, True):
+            with self.subTest(prepared=prepared):
+                self.assert_attach_builds(prepared, None)
+
+    def test_attach_capture_mode_p0_restores_stub_features(self):
+        for prepared in (False, True):
+            with self.subTest(prepared=prepared):
+                self.assert_attach_builds(prepared, "stub-object-attributes",
+                                           ("--capture-mode", "p0"))
+
+    def test_attach_capture_mode_combines_with_diagnose_skips(self):
+        for prepared in (False, True):
+            with self.subTest(prepared=prepared):
+                self.assert_attach_builds(prepared, "skip-attribution",
+                                           ("--diagnose-skips",))
+                self.assert_attach_builds(prepared, "skip-attribution,stub-object-attributes",
+                                           ("--diagnose-skips", "--capture-mode", "p0"))
+                self.assert_attach_builds(prepared, "skip-attribution",
+                                           ("--capture-mode", "full", "--diagnose-skips"))
+
+    def test_attach_capture_mode_refuses_invalid_and_accepts_valid(self):
+        self.configure([83])
+        for arguments in (("--capture-mode", "bogus"), ("--capture-mode",),
+                          ("--capture-mode", "full", "--capture-mode", "p0"),
+                          ("--capture-mode=full",),
+                          ("--self-test", "--capture-mode", "full"),
+                          ("--capture-mode", "full", "--self-test"),
+                          ("--diagnose-skips", "--capture-mode", "bogus")):
+            with self.subTest(arguments=arguments):
+                shutil.rmtree(self.work, ignore_errors=True)
+                result = self.run_child(CHILDREN[0], arguments=arguments)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("usage:", result.stderr)
+                self.assertFalse(self.events.exists())
+                self.assertFalse(self.work.exists())
+        for arguments in (("--capture-mode", "full"), ("--capture-mode", "p0")):
+            with self.subTest(arguments=arguments):
+                shutil.rmtree(self.work, ignore_errors=True)
+                result = self.run_child(CHILDREN[0], arguments=arguments)
+                self.assertEqual(result.returncode, 83, result.stderr)
+                builds = [row for row in self.rows() if row["kind"] == "cargo"]
+                self.assertEqual(len(builds), 1)
+
+    def test_release_lane_calls_thread_selected_capture_mode(self):
+        commands = [command for command in logical_commands(ROOT / "scripts/build-release.sh")
+                    if command.startswith("P11SCOPE_PRODUCT_BUILD_MODE=prepared")]
+        canary = [command for command in commands if "scripts/verify-canaries.sh" in command]
+        attach = [command for command in commands if "scripts/verify-attach-e2e.sh" in command]
+        self.assertEqual(len(canary), 1)
+        self.assertEqual(len(attach), 1)
+        self.assertIn('scripts/verify-canaries.sh --capture-mode "${RELEASE_CAPTURE_MODE-full}"', canary[0])
+        self.assertIn('scripts/verify-attach-e2e.sh --capture-mode "${RELEASE_CAPTURE_MODE-full}"', attach[0])
+        source = (ROOT / "scripts/build-release.sh").read_text()
+        self.assertIn("RELEASE_CAPTURE_MODE=full", source)
+        self.assertIn("receipt_fact capture_mode", source)
+
     def configure_attach_observer(self, *, skipped=1, log_lines=(), checker_status=None,
                                   log_fault=None, terminal_attribution=False, profiler_status=0,
                                   require_completed_live=False, workload_status=0,

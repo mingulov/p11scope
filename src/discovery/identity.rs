@@ -2392,6 +2392,8 @@ mod conservative_copy {
         reclaim_phase: u8,
         after_claim_reclaim: u8,
         rebind_owner: Option<PinCopyCacheId>,
+        // A growing pin prefix stays with the SAME old H1 backing payment.
+        rebind_old_pins: Option<(ProcessViewId, std::vec::IntoIter<PinnedObjectId>)>,
         // Owners above are released BEFORE the actual extra payment below.
         claim_backing: Option<ResourceLease>,
         backing: Option<ResourceLease>,
@@ -2429,6 +2431,7 @@ mod conservative_copy {
                 reclaim_phase: 0,
                 after_claim_reclaim: 3,
                 rebind_owner: None,
+                rebind_old_pins: None,
                 claim_backing: None,
                 backing: None,
                 header: None,
@@ -3137,7 +3140,7 @@ mod conservative_copy {
             if work == 0 {
                 return Ok(GraphStep::Yielded);
             }
-            if self.rebind_owner.is_some() {
+            if self.rebind_owner.is_some() || self.rebind_old_pins.is_some() {
                 return Err(GraphRefusal::Identity);
             }
             self.check_pool(selection, reserve)?;
@@ -3852,6 +3855,7 @@ mod conservative_copy {
             ModuleSkip,
             DiscardModule,
             TableStart,
+            MoveSkips,
             NextEntry,
             EntryNormalize,
             EntryResolve,
@@ -3904,6 +3908,8 @@ mod conservative_copy {
             module: Option<ScannedModule>,
             object: Option<PinnedObjectId>,
             entries: Option<std::vec::IntoIter<ScannedEntry>>,
+            old_skips: Option<std::vec::IntoIter<Skipped>>,
+            old_skip_leaf: Option<Skipped>,
             entry: Option<ScannedEntry>,
             ids: Vec<PinnedObjectId>,
             entry_objects: Vec<Vec<PinnedObjectId>>,
@@ -3951,6 +3957,8 @@ mod conservative_copy {
                     module: None,
                     object: None,
                     entries: None,
+                    old_skips: None,
+                    old_skip_leaf: None,
                     entry: None,
                     ids: Vec::new(),
                     entry_objects: Vec::new(),
@@ -4404,7 +4412,28 @@ mod conservative_copy {
                 }
             }
 
-            fn grow_one(&mut self, pins: &mut PinnedObjects) -> Result<(), GraphRefusal> {
+            fn grow_one(
+                &mut self,
+                pins: &mut PinnedObjects,
+                old_prefix: &mut Option<(ProcessViewId, std::vec::IntoIter<PinnedObjectId>)>,
+            ) -> Result<(), GraphRefusal> {
+                if let Some((view, original)) = old_prefix.as_mut() {
+                    let view = *view;
+                    if let Some(id) = original.next() {
+                        pins.ownership
+                            .get_mut(&view)
+                            .ok_or(GraphRefusal::Identity)?
+                            .pins
+                            .push(id);
+                    } else {
+                        // Empty iterator: only its original scalar backing dies.
+                        // It stayed H1-owned and base-paid throughout transfer.
+                        drop(old_prefix.take());
+                        self.last_view = Some(view);
+                        self.bucket = 0;
+                    }
+                    return Ok(());
+                }
                 let Some((view, growth)) = next_map(&self.growth, self.last_view.as_ref()) else {
                     self.phase = BindPhase::NextModule;
                     return Ok(());
@@ -4412,6 +4441,8 @@ mod conservative_copy {
                 let view = *view;
                 if let Some(old) = pins.ownership.get_mut(&view) {
                     match self.bucket {
+                        // These vectors were cleared one row at a time first;
+                        // they carry no populated prefix into reserve_exact.
                         0 if old.tables.capacity() < growth.tables => {
                             old.tables.reserve_exact(growth.tables)
                         }
@@ -4425,7 +4456,10 @@ mod conservative_copy {
                                 .checked_add(growth.pins)
                                 .ok_or(GraphRefusal::Overflow)?;
                             if old.pins.capacity() < wanted {
-                                old.pins.reserve_exact(growth.pins);
+                                let fresh = Vec::with_capacity(wanted);
+                                let original = std::mem::replace(&mut old.pins, fresh);
+                                *old_prefix = Some((view, original.into_iter()));
+                                return Ok(());
                             }
                         }
                         _ => {}
@@ -4461,10 +4495,14 @@ mod conservative_copy {
                 Ok(pins.raw_to_id.get(&raw).copied())
             }
 
-            fn bind_one(&mut self, pins: &mut PinnedObjects) -> Result<(), GraphRefusal> {
+            fn bind_one(
+                &mut self,
+                pins: &mut PinnedObjects,
+                old_pin_prefix: &mut Option<(ProcessViewId, std::vec::IntoIter<PinnedObjectId>)>,
+            ) -> Result<(), GraphRefusal> {
                 match self.phase {
                     BindPhase::Reset => self.reset_one(pins),
-                    BindPhase::Grow => self.grow_one(pins)?,
+                    BindPhase::Grow => self.grow_one(pins, old_pin_prefix)?,
                     BindPhase::NextModule => {
                         if let Some(module) = self
                             .originals
@@ -4578,12 +4616,39 @@ mod conservative_copy {
                             let count = table.entries.len();
                             self.entries = Some(std::mem::take(&mut table.entries).into_iter());
                             table.entries = Vec::with_capacity(count);
-                            table.unpinned.reserve_exact(count);
                             self.ids = Vec::with_capacity(count);
-                            self.phase = BindPhase::NextEntry;
+                            let wanted = table
+                                .unpinned
+                                .len()
+                                .checked_add(count)
+                                .ok_or(GraphRefusal::Overflow)?;
+                            if table.unpinned.capacity() < wanted {
+                                let fresh = Vec::with_capacity(wanted);
+                                let original = std::mem::replace(&mut table.unpinned, fresh);
+                                self.old_skips = Some(original.into_iter());
+                                self.phase = BindPhase::MoveSkips;
+                            } else {
+                                self.phase = BindPhase::NextEntry;
+                            }
                         } else {
                             self.table_pos = 0;
                             self.phase = BindPhase::ClaimTables;
+                        }
+                    }
+                    BindPhase::MoveSkips => {
+                        let original = self.old_skips.as_mut().ok_or(GraphRefusal::Identity)?;
+                        if let Some(skip) = original.next() {
+                            self.module
+                                .as_mut()
+                                .and_then(|module| module.tables.get_mut(self.table_pos))
+                                .ok_or(GraphRefusal::Identity)?
+                                .unpinned
+                                .push(skip);
+                        } else {
+                            // Every original record has moved; dropping this
+                            // empty iterator frees only the old Vec allocation.
+                            drop(self.old_skips.take());
+                            self.phase = BindPhase::NextEntry;
                         }
                     }
                     BindPhase::NextEntry => {
@@ -4834,7 +4899,10 @@ mod conservative_copy {
                         BindPhase::Admit => cursor.admit(self, input, reserve)?,
                         BindPhase::Ready => return Ok(GraphStep::Ready),
                         _ => {
-                            cursor.bind_one(self.output.as_mut().ok_or(GraphRefusal::Identity)?)?;
+                            cursor.bind_one(
+                                self.output.as_mut().ok_or(GraphRefusal::Identity)?,
+                                &mut self.rebind_old_pins,
+                            )?;
                             if cursor.phase == BindPhase::Ready {
                                 self.phase = Phase::Ready;
                                 return Ok(GraphStep::Ready);
@@ -4859,7 +4927,7 @@ mod conservative_copy {
             /// owner, unknown shared or Weak export backing remains paid/refused.
             pub(crate) fn reclaim(
                 &mut self,
-                pins: Option<&mut PinnedConservativeCursor>,
+                mut pins: Option<&mut PinnedConservativeCursor>,
                 reserve: &SemanticResourceReserver,
                 work: usize,
             ) -> Result<GraphStep, GraphRefusal> {
@@ -4867,6 +4935,9 @@ mod conservative_copy {
                     return Ok(GraphStep::Yielded);
                 }
                 self.check_pool(reserve)?;
+                if self.taken && !self.completed && pins.is_none() {
+                    return Err(GraphRefusal::Identity);
+                }
                 if let Some(owner) = pins.as_deref() {
                     if self.fence.is_some() {
                         if self.phase == BindPhase::Reclaimed {
@@ -4888,6 +4959,16 @@ mod conservative_copy {
                 }
                 self.phase = BindPhase::Reclaim;
                 for _ in 0..work {
+                    if let Some(owner) = pins.as_deref_mut()
+                        && let Some((_, original)) = owner.rebind_old_pins.as_mut()
+                    {
+                        if original.next().is_none() {
+                            drop(owner.rebind_old_pins.take());
+                        }
+                        // Abort disposes at most one original scalar claim;
+                        // both old/new buffers remain with their paid H1 owner.
+                        continue;
+                    }
                     let actual = pins.as_deref().and_then(|owner| owner.output.as_ref());
                     self.reclaim_one(actual)?;
                     if self.phase == BindPhase::Reclaimed {
@@ -4906,6 +4987,9 @@ mod conservative_copy {
                     && let Some(pins) = pins
                 {
                     let fence = self.fence.ok_or(GraphRefusal::Identity)?;
+                    if pins.rebind_old_pins.is_some() {
+                        return Err(GraphRefusal::Identity);
+                    }
                     if let Some(owner) = pins.rebind_owner {
                         if owner != fence.input {
                             return Err(GraphRefusal::Identity);
@@ -4922,6 +5006,20 @@ mod conservative_copy {
             }
 
             fn reclaim_one(&mut self, pins: Option<&PinnedObjects>) -> Result<(), GraphRefusal> {
+                if let Some(skip) = &mut self.old_skip_leaf {
+                    if reclaim_skip(skip) {
+                        self.old_skip_leaf = None;
+                    }
+                    return Ok(());
+                }
+                if let Some(original) = &mut self.old_skips {
+                    if let Some(skip) = original.next() {
+                        self.old_skip_leaf = Some(skip);
+                    } else {
+                        drop(self.old_skips.take());
+                    }
+                    return Ok(());
+                }
                 if let Some(module) = &mut self.reconciled_drain {
                     if module.advance(pins)? {
                         self.reconciled_drain = None;
@@ -10638,173 +10736,64 @@ mod tests {
     #[test]
     fn scanned_rebind_cursor_moves_retained_pin_prefix_over_credits() {
         use crate::semantics_edge::resources::SemanticResourcePool;
-        let (_dir, mut source, raw) = conservative_cursor_fixture();
-        let repeated: Vec<_> = std::iter::repeat_n(raw[0].clone(), 64).collect();
-        assert!(bind_scanned_modules(&repeated, &mut source).1.is_empty());
-        let view = raw[0].view;
-        let expected_prefix = source.view_claims(view).unwrap().pins.clone();
-        assert!(expected_prefix.len() > 64);
-        let pool = SemanticResourcePool::default();
-        let reserve = pool.reserver();
-        let selection = conservative_selection(&pool, BTreeSet::new(), BTreeSet::new());
-        let baseline = pool.snapshot().charged_bytes;
-        let (mut input, _) = retained_rebind_inputs(&pool, &raw[..1], false);
-        let mut pins = PinnedConservativeCursor::new();
-        let mut rebind = ScannedRebindCursor::new();
-        let mut observed_growth = false;
-        let mut released_original = false;
-        let ((), peak) = crate::test_alloc::requested_peak_during(|| {
-            finish_conservative_copy(&source, &mut pins, &selection, &reserve);
-            let old_capacity = pins
-                .pinned()
-                .unwrap()
-                .view_claims(view)
-                .unwrap()
-                .pins
-                .capacity();
-            let old_bytes = old_capacity * std::mem::size_of::<PinnedObjectId>();
-            let mut previous = 0usize;
-            for _ in 0..4096 {
-                let before = crate::test_alloc::armed_requested_snapshot();
-                let step = pins
-                    .poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1)
-                    .unwrap();
-                let after = crate::test_alloc::armed_requested_snapshot();
-                let actual = &pins.reference_rebind_claims_for_test(view).unwrap().pins;
-                if !observed_growth && actual.capacity() > old_capacity {
-                    observed_growth = true;
-                    assert!(
-                        actual.len() <= 1,
-                        "a populated pin prefix cannot move in its allocation credit"
-                    );
-                    let new_bytes = actual.capacity() * std::mem::size_of::<PinnedObjectId>();
-                    assert!(
-                        after.live_bytes >= before.live_bytes + new_bytes,
-                        "the old actual pin allocation remains held alongside fresh backing"
-                    );
-                    previous = actual.len();
-                } else if observed_growth && previous < expected_prefix.len() {
-                    assert!(
-                        actual.len() <= previous + 1,
-                        "work1 moves at most one original pin claim"
-                    );
-                    previous = actual.len();
-                }
-                if observed_growth {
-                    let prefix = actual.len().min(expected_prefix.len());
-                    assert_eq!(&actual[..prefix], &expected_prefix[..prefix]);
-                    if actual.len() >= expected_prefix.len()
-                        && before.live_bytes.saturating_sub(after.live_bytes) >= old_bytes
-                    {
-                        released_original = true;
-                    }
-                }
-                if step == GraphStep::Ready {
-                    break;
-                }
-            }
-            assert!(observed_growth && released_original);
-            assert!(rebind.modules().is_some());
-            for _ in 0..4096 {
-                if rebind.reclaim(Some(&mut pins), &reserve, 1).unwrap() == GraphStep::Ready {
-                    break;
-                }
-            }
-            for _ in 0..4096 {
-                if pins
-                    .reclaim(Some(&source), &selection, &reserve, 1)
+        for cancel in [false, true] {
+            let (_dir, mut source, raw) = conservative_cursor_fixture();
+            let repeated: Vec<_> = std::iter::repeat_n(raw[0].clone(), 64).collect();
+            assert!(bind_scanned_modules(&repeated, &mut source).1.is_empty());
+            let view = raw[0].view;
+            let expected_prefix = source.view_claims(view).unwrap().pins.clone();
+            assert!(expected_prefix.len() > 64);
+            let pool = SemanticResourcePool::default();
+            let reserve = pool.reserver();
+            let selection = conservative_selection(&pool, BTreeSet::new(), BTreeSet::new());
+            let baseline = pool.snapshot().charged_bytes;
+            let (mut input, _) = retained_rebind_inputs(&pool, &raw[..1], false);
+            let mut pins = PinnedConservativeCursor::new();
+            let mut rebind = ScannedRebindCursor::new();
+            let mut observed_growth = false;
+            let mut released_original = false;
+            let ((), peak) = crate::test_alloc::requested_peak_during(|| {
+                finish_conservative_copy(&source, &mut pins, &selection, &reserve);
+                let old_capacity = pins
+                    .pinned()
                     .unwrap()
-                    == GraphStep::Ready
-                {
-                    break;
-                }
-            }
-        });
-        assert!(!peak.incomplete);
-        assert_eq!(peak.live_bytes, 0);
-        assert_eq!(peak.live_blocks, 0);
-        assert_eq!(pool.snapshot().charged_bytes, baseline);
-    }
-
-    #[test]
-    fn scanned_rebind_cursor_moves_original_skip_prefix_over_credits() {
-        use crate::semantics_edge::resources::SemanticResourcePool;
-        let (_dir, mut source, raw) = conservative_cursor_fixture();
-        source.reject_observation(raw[2].key);
-        let mut negative = raw[0].clone();
-        negative.tables[0].entries.clear();
-        for ordinal in 0..64 {
-            let mut entry = raw[0].tables[0].entries[0].clone();
-            entry.object = raw[2].key;
-            entry.object_path = format!(
-                "{}/unused-{ordinal}/../provider-2.so",
-                Path::new(&raw[2].path).parent().unwrap().display()
-            );
-            negative.tables[0].entries.push(entry);
-        }
-        // These are original, actual ordinary-binder negative records, with
-        // distinct owned path reasons; no scalar debt or readiness is seeded.
-        let (mut bound, skipped) = bind_scanned_modules(&[negative], &mut source);
-        assert_eq!(skipped.len(), 64);
-        let mut original = bound.remove(0).scanned;
-        let expected_prefix = original.tables[0].unpinned.clone();
-        assert_eq!(expected_prefix.len(), 64);
-        let mut entry = raw[0].tables[0].entries[0].clone();
-        entry.object = raw[2].key;
-        entry.object_path = raw[2].path.clone();
-        original.tables[0].entries.push(entry);
-        let originals = [original];
-        let pool = SemanticResourcePool::default();
-        let reserve = pool.reserver();
-        let selection = conservative_selection(&pool, BTreeSet::new(), BTreeSet::new());
-        let baseline = pool.snapshot().charged_bytes;
-        // Establish the retained-request envelope with the existing allocator
-        // oracle, then admit a same-shape actual copy BEFORE its allocation.
-        let (prepared, _) = retained_rebind_inputs(&pool, &originals, false);
-        let (prepared_rows, storage) = prepared.unwrap().into_originals();
-        drop(prepared_rows);
-        let mut pins = PinnedConservativeCursor::new();
-        let mut rebind = ScannedRebindCursor::new();
-        let mut observed_growth = false;
-        let mut released_original = false;
-        let ((), peak) = crate::test_alloc::requested_peak_during(|| {
-            let rows = originals.to_vec();
-            let mut input =
-                Some(RetainedScannedInputs::from_reserved_originals(rows, storage).unwrap());
-            finish_conservative_copy(&source, &mut pins, &selection, &reserve);
-            let old_capacity = input.as_ref().unwrap().originals_for_test()[0].tables[0]
-                .unpinned
-                .capacity();
-            assert_eq!(
-                old_capacity,
-                expected_prefix.len(),
-                "the actual owned clone has a tight prefix"
-            );
-            let old_bytes = old_capacity * std::mem::size_of::<Skipped>();
-            let mut previous = 0usize;
-            for _ in 0..4096 {
-                let before = crate::test_alloc::armed_requested_snapshot();
-                let step = pins
-                    .poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1)
-                    .unwrap();
-                let after = crate::test_alloc::armed_requested_snapshot();
-                if let Some((capacity, actual)) = rebind.reference_current_unpinned_for_test() {
-                    if !observed_growth && capacity > old_capacity {
+                    .view_claims(view)
+                    .unwrap()
+                    .pins
+                    .capacity();
+                let old_bytes = old_capacity * std::mem::size_of::<PinnedObjectId>();
+                let mut previous = 0usize;
+                for _ in 0..4096 {
+                    let before = crate::test_alloc::armed_requested_snapshot();
+                    let step = pins
+                        .poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1)
+                        .unwrap();
+                    let after = crate::test_alloc::armed_requested_snapshot();
+                    let actual = &pins.reference_rebind_claims_for_test(view).unwrap().pins;
+                    if !observed_growth && actual.capacity() > old_capacity {
                         observed_growth = true;
                         assert!(
                             actual.len() <= 1,
-                            "allocation cannot copy the complete original skip prefix"
+                            "a populated pin prefix cannot move in its allocation credit"
                         );
+                        let new_bytes = actual.capacity() * std::mem::size_of::<PinnedObjectId>();
                         assert!(
-                            after.live_bytes
-                                >= before.live_bytes + capacity * std::mem::size_of::<Skipped>(),
-                            "old and fresh actual skip buffers overlap until prefix transfer finishes"
+                            after.live_bytes >= before.live_bytes + new_bytes,
+                            "the old actual pin allocation remains held alongside fresh backing"
                         );
                         previous = actual.len();
+                        if cancel {
+                            rebind.cancel();
+                            assert!(matches!(
+                                pins.poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1),
+                                Err(GraphRefusal::Cancelled)
+                            ));
+                            break;
+                        }
                     } else if observed_growth && previous < expected_prefix.len() {
                         assert!(
                             actual.len() <= previous + 1,
-                            "work1 moves at most one original skip record"
+                            "work1 moves at most one original pin claim"
                         );
                         previous = actual.len();
                     }
@@ -10817,37 +10806,199 @@ mod tests {
                             released_original = true;
                         }
                     }
+                    if step == GraphStep::Ready {
+                        break;
+                    }
                 }
-                if step == GraphStep::Ready {
-                    break;
+                assert!(observed_growth);
+                if cancel {
+                    assert!(rebind.modules().is_none());
+                } else {
+                    assert!(released_original);
+                    assert!(rebind.modules().is_some());
                 }
+                for _ in 0..4096 {
+                    let before = crate::test_alloc::armed_requested_snapshot();
+                    let step = rebind.reclaim(Some(&mut pins), &reserve, 1).unwrap();
+                    let after = crate::test_alloc::armed_requested_snapshot();
+                    assert!(
+                        before.live_blocks.saturating_sub(after.live_blocks) <= 1,
+                        "work1 cancellation cannot destroy a populated original suffix"
+                    );
+                    if before.live_bytes.saturating_sub(after.live_bytes) >= old_bytes {
+                        released_original = true;
+                    }
+                    if step == GraphStep::Ready {
+                        break;
+                    }
+                }
+                assert!(released_original);
+                for _ in 0..4096 {
+                    if pins
+                        .reclaim(Some(&source), &selection, &reserve, 1)
+                        .unwrap()
+                        == GraphStep::Ready
+                    {
+                        break;
+                    }
+                }
+            });
+            assert!(!peak.incomplete);
+            assert_eq!(peak.live_bytes, 0);
+            assert_eq!(peak.live_blocks, 0);
+            assert_eq!(pool.snapshot().charged_bytes, baseline);
+        }
+    }
+
+    #[test]
+    fn scanned_rebind_cursor_moves_original_skip_prefix_over_credits() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        for cancel in [false, true] {
+            let (_dir, mut source, raw) = conservative_cursor_fixture();
+            source.reject_observation(raw[2].key);
+            let mut negative = raw[0].clone();
+            negative.tables[0].entries.clear();
+            for ordinal in 0..64 {
+                let mut entry = raw[0].tables[0].entries[0].clone();
+                entry.object = raw[2].key;
+                entry.object_path = format!(
+                    "{}/unused-{ordinal}/../provider-2.so",
+                    Path::new(&raw[2].path).parent().unwrap().display()
+                );
+                negative.tables[0].entries.push(entry);
             }
-            assert!(observed_growth && released_original);
-            let module = &rebind.modules().unwrap()[0];
-            assert_eq!(
-                &module.scanned.tables[0].unpinned[..64],
-                expected_prefix.as_slice()
-            );
-            assert_eq!(module.scanned.tables[0].unpinned.len(), 65);
-            assert_eq!(rebind.skipped().unwrap().len(), 1);
-            for _ in 0..4096 {
-                if rebind.reclaim(Some(&mut pins), &reserve, 1).unwrap() == GraphStep::Ready {
-                    break;
+            // These are original, actual ordinary-binder negative records, with
+            // distinct owned path reasons; no scalar debt or readiness is seeded.
+            let (mut bound, skipped) = bind_scanned_modules(&[negative], &mut source);
+            assert_eq!(skipped.len(), 64);
+            let mut original = bound.remove(0).scanned;
+            let expected_prefix = original.tables[0].unpinned.clone();
+            assert_eq!(expected_prefix.len(), 64);
+            let mut entry = raw[0].tables[0].entries[0].clone();
+            entry.object = raw[2].key;
+            entry.object_path = raw[2].path.clone();
+            original.tables[0].entries.push(entry);
+            let originals = [original];
+            let pool = SemanticResourcePool::default();
+            let reserve = pool.reserver();
+            let selection = conservative_selection(&pool, BTreeSet::new(), BTreeSet::new());
+            let baseline = pool.snapshot().charged_bytes;
+            // Establish the retained-request envelope with the existing allocator
+            // oracle, then admit a same-shape actual copy BEFORE its allocation.
+            let (prepared, _) = retained_rebind_inputs(&pool, &originals, false);
+            let (prepared_rows, storage) = prepared.unwrap().into_originals();
+            drop(prepared_rows);
+            let mut pins = PinnedConservativeCursor::new();
+            let mut rebind = ScannedRebindCursor::new();
+            let mut observed_growth = false;
+            let mut released_original = false;
+            let ((), peak) = crate::test_alloc::requested_peak_during(|| {
+                let rows = originals.to_vec();
+                let mut input =
+                    Some(RetainedScannedInputs::from_reserved_originals(rows, storage).unwrap());
+                finish_conservative_copy(&source, &mut pins, &selection, &reserve);
+                let old_capacity = input.as_ref().unwrap().originals_for_test()[0].tables[0]
+                    .unpinned
+                    .capacity();
+                assert_eq!(
+                    old_capacity,
+                    expected_prefix.len(),
+                    "the actual owned clone has a tight prefix"
+                );
+                let old_bytes = old_capacity * std::mem::size_of::<Skipped>();
+                let mut previous = 0usize;
+                for _ in 0..4096 {
+                    let before = crate::test_alloc::armed_requested_snapshot();
+                    let step = pins
+                        .poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1)
+                        .unwrap();
+                    let after = crate::test_alloc::armed_requested_snapshot();
+                    if let Some((capacity, actual)) = rebind.reference_current_unpinned_for_test() {
+                        if !observed_growth && capacity > old_capacity {
+                            observed_growth = true;
+                            assert!(
+                                actual.len() <= 1,
+                                "allocation cannot copy the complete original skip prefix"
+                            );
+                            assert!(
+                                after.live_bytes
+                                    >= before.live_bytes
+                                        + capacity * std::mem::size_of::<Skipped>(),
+                                "old and fresh actual skip buffers overlap until prefix transfer finishes"
+                            );
+                            previous = actual.len();
+                            if cancel {
+                                rebind.cancel();
+                                assert!(matches!(
+                                    pins.poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1),
+                                    Err(GraphRefusal::Cancelled)
+                                ));
+                                break;
+                            }
+                        } else if observed_growth && previous < expected_prefix.len() {
+                            assert!(
+                                actual.len() <= previous + 1,
+                                "work1 moves at most one original skip record"
+                            );
+                            previous = actual.len();
+                        }
+                        if observed_growth {
+                            let prefix = actual.len().min(expected_prefix.len());
+                            assert_eq!(&actual[..prefix], &expected_prefix[..prefix]);
+                            if actual.len() >= expected_prefix.len()
+                                && before.live_bytes.saturating_sub(after.live_bytes) >= old_bytes
+                            {
+                                released_original = true;
+                            }
+                        }
+                    }
+                    if step == GraphStep::Ready {
+                        break;
+                    }
                 }
-            }
-            for _ in 0..4096 {
-                if pins
-                    .reclaim(Some(&source), &selection, &reserve, 1)
-                    .unwrap()
-                    == GraphStep::Ready
-                {
-                    break;
+                assert!(observed_growth);
+                if !cancel {
+                    assert!(released_original);
+                    let module = &rebind.modules().unwrap()[0];
+                    assert_eq!(
+                        &module.scanned.tables[0].unpinned[..64],
+                        expected_prefix.as_slice()
+                    );
+                    assert_eq!(module.scanned.tables[0].unpinned.len(), 65);
+                    assert_eq!(rebind.skipped().unwrap().len(), 1);
+                } else {
+                    assert!(rebind.modules().is_none());
                 }
-            }
-        });
-        assert!(!peak.incomplete);
-        assert_eq!(peak.live_bytes, 0);
-        assert_eq!(peak.live_blocks, 0);
-        assert_eq!(pool.snapshot().charged_bytes, baseline);
+                for _ in 0..4096 {
+                    let before = crate::test_alloc::armed_requested_snapshot();
+                    let step = rebind.reclaim(Some(&mut pins), &reserve, 1).unwrap();
+                    let after = crate::test_alloc::armed_requested_snapshot();
+                    assert!(
+                        before.live_blocks.saturating_sub(after.live_blocks) <= 1,
+                        "work1 cancellation cannot destroy a populated original suffix"
+                    );
+                    if before.live_bytes.saturating_sub(after.live_bytes) >= old_bytes {
+                        released_original = true;
+                    }
+                    if step == GraphStep::Ready {
+                        break;
+                    }
+                }
+                assert!(released_original);
+                for _ in 0..4096 {
+                    if pins
+                        .reclaim(Some(&source), &selection, &reserve, 1)
+                        .unwrap()
+                        == GraphStep::Ready
+                    {
+                        break;
+                    }
+                }
+            });
+            assert!(!peak.incomplete);
+            assert_eq!(peak.live_bytes, 0);
+            assert_eq!(peak.live_blocks, 0);
+            assert_eq!(pool.snapshot().charged_bytes, baseline);
+        }
     }
 }

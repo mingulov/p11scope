@@ -154,6 +154,8 @@ impl AdmissionPreparationError {
             site: Some(site),
         }
     }
+    /// The plain refusal, for the compatibility wrapper below.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn refusal(self) -> SemanticRefusal {
         self.refusal
     }
@@ -1860,6 +1862,10 @@ impl AttestedSemanticLane {
     /// them. An accepted refresh after a failed bind adopts H0's retained
     /// Arc instead of the fresh duplicate, so the stored binding must
     /// share the returned Arc (H0's `ptr_eq` gates refuse any other).
+    /// Compatibility wrapper: the plain refusal without the firing
+    /// site. Production admission calls the inner function directly;
+    /// the test seam keeps this signature.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn refresh_candidate_with_custody(
         &mut self,
         pin: Arc<PidPin>,

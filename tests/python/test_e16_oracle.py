@@ -38,7 +38,13 @@ OFFSET = 0x1130
 KERNEL_CONTROL = {"capture_halted": False, "owner_poison": [], "owner_admission_failures": 0,
                   "identity_unavailable": 0, "identity_budget_exhausted": False,
                   "root_affiliation_failures": []}
-FAKE_RUSTC = b"rustc version 1.98.1 (0123456789 2026-09-01)"
+RELEASE_RUST = (ROOT / ".release-rust-version").read_text().strip()
+[RELEASE_TOOLCHAIN] = [
+    item for item in json.loads((ROOT / "third-party/licenses/sources.json").read_text())["toolchains"]
+    if item["name"] == RELEASE_RUST
+]
+FAKE_RUSTC = RELEASE_TOOLCHAIN["rustc_verbose_version"].splitlines()[0].replace(
+    "rustc ", "rustc version ", 1).encode("ascii")
 FAKE_BPF = b"\x7fELF-fake-bpf-object-" + bytes(range(256)) * 4
 
 
@@ -226,6 +232,13 @@ class H3ObserverProvenance(unittest.TestCase):
             binary, manifest = self.manifest(Path(raw))
             result = E16.validate_provenance(manifest, binary.read_bytes(), check_sources=False)
             self.assertEqual(result["revision"], "0123456789abcdef0123456789abcdef01234567")
+
+    def test_historical_or_missing_compiler_banner_is_refused(self):
+        for banner in (b"rustc version 1.98.1 (48a229cea 2026-09-01)", b""):
+            with self.subTest(banner=banner), tempfile.TemporaryDirectory() as raw:
+                binary, manifest = self.manifest(Path(raw), rustc=banner)
+                with self.assertRaisesRegex(Unknown, "release compiler"):
+                    E16.validate_provenance(manifest, binary.read_bytes(), check_sources=False)
 
     def test_unrelated_or_changed_binary_is_refused(self):
         with tempfile.TemporaryDirectory() as raw:

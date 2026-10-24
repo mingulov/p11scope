@@ -7161,3 +7161,7 @@ pub(crate) mod tests {
         assert_eq!(metrics["lane"], "metrics");
     }
 }
+
+#[cfg(test)]
+#[path = "render_lossless_tests.rs"]
+mod render_lossless_tests;

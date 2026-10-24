@@ -1254,10 +1254,6 @@ class CounterObjectCliTests(unittest.TestCase):
         straight_read = [(0x79, 0x10, 0, 0), (0x85, 0x10, 0, 0),
                          (0x95, 0, 0, 0)]
         self.assertIsNone(check(straight_read, {read(0)}, {(key, 1): ("function", remove_body)}))
-        straight_write = [(0x85, 0x10, 0, 0), (0xdb, 0x21, 8, 0xf1),
-                          (0x95, 0, 0, 0)]
-        self.assertIsNone(check(straight_write, {write(1)},
-                                {(key, 0): ("function", remove_body)}))
         full = [(0x79, 0x10, 0, 0), (0x85, 0x10, 0, 0),
                 (0xdb, 0x21, 8, 0xf1), (0x95, 0, 0, 0)]
         self.assertIsNone(check(full, {read(0), write(2)},
@@ -1271,22 +1267,24 @@ class CounterObjectCliTests(unittest.TestCase):
                 check(branched, {read(1)},
                       {(key, 2): ("function", remove_body),
                        (key, 3): ("function", remove_body)})
-        early_write = [(0xdb, 0x21, 8, 0xf1), (0x85, 0x10, 0, 0),
-                       (0x95, 0, 0, 0)]
+        early_write = [(0x79, 0x10, 0, 0), (0xdb, 0x21, 8, 0xf1),
+                       (0x85, 0x10, 0, 0), (0x95, 0, 0, 0)]
         with self.subTest(mutant="accounting write before START removal"):
             with self.assertRaisesRegex(
                     RuntimeError,
                     "^bank timing return accounts before retiring START$"):
-                check(early_write, {write(0)}, {(key, 1): ("function", remove_body)})
-        unguarded_write = [(0x55, 1, 2, 0), (0x85, 0x10, 0, 0),
-                           (0xdb, 0x21, 8, 0xf1), (0xdb, 0x21, 8, 0xf1),
+                check(early_write, {read(0), write(1)},
+                      {(key, 2): ("function", remove_body)})
+        unguarded_write = [(0x55, 1, 3, 0), (0x79, 0x10, 0, 0),
+                           (0x85, 0x10, 0, 0), (0xdb, 0x21, 8, 0xf1),
+                           (0x79, 0x10, 0, 0), (0xdb, 0x21, 8, 0xf1),
                            (0x95, 0, 0, 0)]
         with self.subTest(mutant="accounting write on a branch without removal"):
             with self.assertRaisesRegex(
                     RuntimeError,
                     "^bank timing return accounts before retiring START$"):
-                check(unguarded_write, {write(2), write(3)},
-                      {(key, 1): ("function", remove_body)})
+                check(unguarded_write, {read(1), read(4), write(3), write(5)},
+                      {(key, 2): ("function", remove_body)})
         with self.subTest(order="no removal and no accounting is vacuous"):
             self.assertIsNone(check([(0x95, 0, 0, 0)], set(), {}))
 

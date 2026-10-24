@@ -8396,4 +8396,535 @@ mod tests {
         assert_eq!(peak.live_bytes, 0);
         assert_eq!(peak.live_blocks, 0);
     }
+
+    fn retained_rebind_inputs(
+        pool: &crate::semantics_edge::resources::SemanticResourcePool,
+        originals: &[ScannedModule],
+        short_backing: bool,
+    ) -> (Option<RetainedScannedInputs>, usize) {
+        // Real owned rows derived from the same normal pin fixture. Measure
+        // the actual heterogeneous retained requests; no production bound or
+        // receipt is supplied by this test-only input setup.
+        let (owned, peak) = crate::test_alloc::requested_peak_during(|| {
+            let mut owned = originals.to_vec();
+            owned.reserve(7);
+            if let Some(first) = owned.first_mut() {
+                first.path.reserve(113);
+                first.exports.reserve(5);
+                if let Some(table) = first.tables.first_mut() {
+                    table.entries.reserve(9);
+                }
+            }
+            owned
+        });
+        assert!(!peak.incomplete);
+        let storage_bytes = peak
+            .live_bytes
+            .checked_add(peak.live_blocks.checked_mul(64).unwrap())
+            .unwrap()
+            .checked_add(4096)
+            .unwrap();
+        let storage = pool
+            .reserve(if short_backing { 1 } else { storage_bytes })
+            .unwrap();
+        let original_pointer = owned.as_ptr();
+        let original_capacity = owned.capacity();
+        let (result, allocations, bytes) = crate::test_alloc::count_allocs_during(|| {
+            RetainedScannedInputs::from_reserved_originals(owned, storage)
+        });
+        assert_eq!(
+            (allocations, bytes),
+            (0, 0),
+            "input packaging is an O(1) move"
+        );
+        let input = result.unwrap();
+        assert_eq!(input.originals_for_test().as_ptr(), original_pointer);
+        assert_eq!(input.original_capacity_for_test(), original_capacity);
+        (Some(input), storage_bytes)
+    }
+
+    fn finish_scanned_rebind(
+        pins: &mut PinnedConservativeCursor,
+        input: &mut Option<RetainedScannedInputs>,
+        rebind: &mut ScannedRebindCursor,
+        reserve: &crate::semantics_edge::resources::SemanticResourceReserver,
+    ) {
+        for _ in 0..4096 {
+            if pins.poll_scanned_rebind(input, rebind, reserve, 1).unwrap() == GraphStep::Ready {
+                return;
+            }
+        }
+        panic!("the tiny retained scanned originals must bind over finite credits");
+    }
+
+    fn rebind_claim_lengths(pins: &PinnedConservativeCursor) -> [(usize, usize, usize); 3] {
+        [ProcessViewId(1), ProcessViewId(2), ProcessViewId(3)].map(|view| {
+            pins.reference_rebind_claims_for_test(view)
+                .map_or((0, 0, 0), |claims| {
+                    (claims.tables.len(), claims.targets.len(), claims.pins.len())
+                })
+        })
+    }
+
+    #[test]
+    fn scanned_rebind_cursor_matches_original_binding() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        let (_dir, source, mut raw) = conservative_cursor_fixture();
+        let missing = raw[2].key;
+        let missing_path = raw[2].path.clone();
+        // Same actual normalized provider; no filesystem reopen may be hidden
+        // in the rebind lookup. Its real pin was accepted before this spelling.
+        let canonical = PathBuf::from(&raw[0].path);
+        raw[0].path = canonical
+            .parent()
+            .unwrap()
+            .join("unused/../provider-0.so")
+            .to_str()
+            .unwrap()
+            .into();
+        raw[0].tables[0].entries[0].object_path = raw[0].path.clone();
+        let duplicate = raw[0].tables[0].entries[0].clone();
+        raw[0].tables[0]
+            .entries
+            .extend(std::iter::repeat_n(duplicate.clone(), 12));
+        let mut absent_entry = duplicate;
+        absent_entry.object = missing;
+        absent_entry.object_path = missing_path;
+        raw[0].tables[0].entries.push(absent_entry);
+        raw[0]
+            .exports
+            .push("controlled heterogeneous input text".repeat(37));
+        raw[0]
+            .interfaces
+            .push(crate::discovery::scan::ScannedInterface {
+                index: 0,
+                name_class: "other",
+                name_lossy: Some("private fixture name".repeat(9)),
+                name_private: Some(vec![1, 2, 3, 4]),
+                flags: 0,
+                table: Some(0),
+            });
+        raw[1].decoder_abi = Some(ElfAbi::Ilp32);
+        let pool = SemanticResourcePool::default();
+        let reserve = pool.reserver();
+        let selection = conservative_selection(&pool, BTreeSet::new(), BTreeSet::from([missing]));
+        let baseline = pool.snapshot().charged_bytes;
+        let mut pins = PinnedConservativeCursor::new();
+        finish_conservative_copy(&source, &mut pins, &selection, &reserve);
+        let mut expected = pins.pinned().unwrap().clone();
+        expected.reset_derived_claims();
+        let (expected_modules, expected_skips) = bind_scanned_modules(&raw, &mut expected);
+        assert!(!expected_modules.is_empty());
+        assert!(
+            expected_skips.len() >= 3,
+            "entry, ABI, and missing-provider negatives are genuine"
+        );
+        let (mut input, input_bytes) = retained_rebind_inputs(&pool, &raw, false);
+        let pointer = input.as_ref().unwrap().originals_for_test().as_ptr();
+        let held = pool.snapshot().charged_bytes;
+        let mut rebind = ScannedRebindCursor::new();
+        let (zero, allocations, bytes) = crate::test_alloc::count_allocs_during(|| {
+            pins.poll_scanned_rebind(&mut input, &mut rebind, &reserve, 0)
+        });
+        assert_eq!(zero.unwrap(), GraphStep::Yielded);
+        assert_eq!((allocations, bytes), (0, 0));
+        assert_eq!(pool.snapshot().charged_bytes, held);
+        assert_eq!(
+            input.as_ref().unwrap().originals_for_test().as_ptr(),
+            pointer
+        );
+        let ((), peak) = crate::test_alloc::requested_peak_during(|| {
+            for _ in 0..4096 {
+                let before_claims = rebind_claim_lengths(&pins);
+                let mut before_refs = [0usize; 3];
+                for (count, entry) in before_refs.iter_mut().zip(source.by_id.values()) {
+                    *count = Arc::strong_count(&entry.exports);
+                }
+                let step = pins
+                    .poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1)
+                    .unwrap();
+                let after_claims = rebind_claim_lengths(&pins);
+                let changed = before_claims
+                    .into_iter()
+                    .zip(after_claims)
+                    .filter(|(before, after)| before != after)
+                    .count();
+                assert!(
+                    changed <= 1,
+                    "one credit cannot reset or bind every process view"
+                );
+                let growth = before_claims
+                    .into_iter()
+                    .zip(after_claims)
+                    .map(|(before, after)| {
+                        after.0.saturating_sub(before.0)
+                            + after.1.saturating_sub(before.1)
+                            + after.2.saturating_sub(before.2)
+                    })
+                    .sum::<usize>();
+                assert!(
+                    growth <= 2,
+                    "one entry may add its target+pin, never a whole table of claims"
+                );
+                for (before, entry) in before_refs.into_iter().zip(source.by_id.values()) {
+                    assert!(Arc::strong_count(&entry.exports).saturating_sub(before) <= 1);
+                }
+                if step == GraphStep::Ready {
+                    break;
+                }
+            }
+        });
+        assert!(!peak.incomplete);
+        assert!(input.is_none(), "the same original Vec was taken once");
+        let actual_modules = rebind
+            .modules()
+            .expect("all originals and claims reach structural readiness");
+        assert_eq!(actual_modules, expected_modules);
+        assert_eq!(rebind.skipped().unwrap(), expected_skips);
+        for (actual, expected) in actual_modules.iter().zip(&expected_modules) {
+            assert!(Arc::ptr_eq(&actual.exports, &expected.exports));
+            for (actual, expected) in actual.scanned.tables.iter().zip(&expected.scanned.tables) {
+                assert_eq!(actual.live_return, expected.live_return);
+                assert_eq!(actual.manifest_supported, expected.manifest_supported);
+            }
+        }
+        assert_conservative_value(&expected, pins.pinned().unwrap());
+        assert!(rebind.required_input_bytes().unwrap() <= input_bytes);
+        assert!(
+            rebind.required_bytes().unwrap() >= peak.peak_bytes.max(peak.realloc_overlap_bytes)
+        );
+        assert_eq!(
+            pool.snapshot().charged_bytes,
+            held + rebind.required_bytes().unwrap()
+        );
+        for _ in 0..4096 {
+            if rebind.reclaim(Some(&mut pins), &reserve, 1).unwrap() == GraphStep::Ready {
+                break;
+            }
+        }
+        assert!(rebind.modules().is_none());
+        for _ in 0..4096 {
+            if pins
+                .reclaim(Some(&source), &selection, &reserve, 1)
+                .unwrap()
+                == GraphStep::Ready
+            {
+                break;
+            }
+        }
+        assert_eq!(pool.snapshot().charged_bytes, baseline);
+    }
+
+    #[test]
+    fn scanned_rebind_cursor_keeps_claim_growth_paid() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        for exit in 0..3 {
+            let (_dir, source, mut raw) = conservative_cursor_fixture();
+            let entry = raw[0].tables[0].entries[0].clone();
+            raw[0].tables[0]
+                .entries
+                .extend(std::iter::repeat_n(entry, 24));
+            let pool = SemanticResourcePool::default();
+            let reserve = pool.reserver();
+            let selection = conservative_selection(&pool, BTreeSet::new(), BTreeSet::new());
+            let baseline = pool.snapshot().charged_bytes;
+            let mut pins = PinnedConservativeCursor::new();
+            finish_conservative_copy(&source, &mut pins, &selection, &reserve);
+            let pin_charge = pool.snapshot().charged_bytes;
+            let view = raw[0].view;
+            let old_capacity = pins
+                .pinned()
+                .unwrap()
+                .view_claims(view)
+                .unwrap()
+                .pins
+                .capacity();
+            let (mut input, _) = retained_rebind_inputs(&pool, &raw, false);
+            let mut rebind = ScannedRebindCursor::new();
+            for _ in 0..4096 {
+                assert_ne!(
+                    pins.poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1)
+                        .unwrap(),
+                    GraphStep::Ready
+                );
+                if pins
+                    .reference_rebind_claims_for_test(view)
+                    .is_some_and(|claims| {
+                        claims.pins.capacity() > old_capacity && !claims.targets.is_empty()
+                    })
+                {
+                    break;
+                }
+            }
+            assert!(input.is_none());
+            assert!(
+                pins.pinned().is_none(),
+                "partial mutable claims are not a Ready output"
+            );
+            assert!(
+                pins.reference_rebind_claims_for_test(view)
+                    .unwrap()
+                    .pins
+                    .capacity()
+                    > old_capacity
+            );
+            let claim_bytes = rebind.required_claim_bytes().unwrap();
+            assert!(claim_bytes > 0);
+            if exit == 2 {
+                // This tests PAYMENT lifetime only, not a bounded abandonment
+                // completion: that separate Engine/native obligation stays open.
+                drop(rebind);
+                assert_eq!(pool.snapshot().charged_bytes, pin_charge + claim_bytes);
+                assert!(pins.pinned().is_none());
+                assert!(
+                    pins.reference_rebind_claims_for_test(view)
+                        .unwrap()
+                        .pins
+                        .capacity()
+                        > old_capacity
+                );
+                drop(pins);
+                assert_eq!(pool.snapshot().charged_bytes, baseline);
+                continue;
+            }
+            if exit == 1 {
+                rebind.cancel();
+                assert!(matches!(
+                    pins.poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1),
+                    Err(GraphRefusal::Cancelled)
+                ));
+                assert!(pins.pinned().is_none());
+            } else {
+                finish_scanned_rebind(&mut pins, &mut input, &mut rebind, &reserve);
+                assert!(rebind.modules().is_some());
+            }
+            for _ in 0..4096 {
+                if rebind.reclaim(Some(&mut pins), &reserve, 1).unwrap() == GraphStep::Ready {
+                    break;
+                }
+            }
+            assert!(rebind.modules().is_none());
+            drop(rebind);
+            assert_eq!(pool.snapshot().charged_bytes, pin_charge + claim_bytes);
+            assert!(
+                pins.reference_rebind_claims_for_test(view)
+                    .unwrap()
+                    .pins
+                    .capacity()
+                    > old_capacity
+            );
+            for _ in 0..4096 {
+                if pins
+                    .reclaim(Some(&source), &selection, &reserve, 1)
+                    .unwrap()
+                    == GraphStep::Ready
+                {
+                    break;
+                }
+            }
+            assert_eq!(pool.snapshot().charged_bytes, baseline);
+        }
+
+        // The module cursor can actually become the last export-slice owner.
+        // Keep independent LIVE shares of the SAME Files so this setup does
+        // not disguise a final FD close as pure per-credit export reclamation.
+        let (_dir, mut source, raw) = conservative_cursor_fixture();
+        let id = *source.by_id.keys().next().unwrap();
+        source.by_id.get_mut(&id).unwrap().exports = Arc::from(vec![
+            ("first retained module label".repeat(8), 1),
+            ("second retained module label".repeat(16), 2),
+            ("third retained module label".repeat(32), 3),
+        ]);
+        let file_guards: Vec<_> = source
+            .by_id
+            .values()
+            .map(|entry| entry.file.clone())
+            .collect();
+        let pool = SemanticResourcePool::default();
+        let reserve = pool.reserver();
+        let selection = conservative_selection(&pool, BTreeSet::new(), BTreeSet::new());
+        let baseline = pool.snapshot().charged_bytes;
+        let mut pins = PinnedConservativeCursor::new();
+        finish_conservative_copy(&source, &mut pins, &selection, &reserve);
+        let (mut input, _) = retained_rebind_inputs(&pool, &raw[..1], false);
+        let mut rebind = ScannedRebindCursor::new();
+        finish_scanned_rebind(&mut pins, &mut input, &mut rebind, &reserve);
+        assert_eq!(rebind.modules().unwrap().len(), 1);
+        let alias = source.exports_for(id);
+        drop(source);
+        drop(pins);
+        let mut refused = false;
+        for _ in 0..4096 {
+            match rebind.reclaim(None, &reserve, 1) {
+                Err(GraphRefusal::Identity) => {
+                    refused = true;
+                    break;
+                }
+                Ok(step) => assert_ne!(step, GraphStep::Ready),
+                Err(other) => panic!("unexpected last-owner refusal: {other:?}"),
+            }
+        }
+        assert!(
+            refused,
+            "unknown shared exports retain their actual module owner and payment"
+        );
+        assert_eq!(alias.iter().filter(|(text, _)| !text.is_empty()).count(), 3);
+        assert!(pool.snapshot().charged_bytes > baseline);
+        let weak = Arc::downgrade(&alias);
+        drop(alias);
+        assert!(matches!(
+            rebind.reclaim(None, &reserve, 1),
+            Err(GraphRefusal::Identity)
+        ));
+        drop(weak);
+        let mut prior = 3usize;
+        for _ in 0..4096 {
+            let step = rebind.reclaim(None, &reserve, 1).unwrap();
+            let left = rebind
+                .reference_pending_exports_for_test(id)
+                .map_or(0, |exports| {
+                    exports.iter().filter(|(text, _)| !text.is_empty()).count()
+                });
+            assert!(prior.saturating_sub(left) <= 1);
+            prior = left;
+            if step == GraphStep::Ready {
+                break;
+            }
+        }
+        assert_eq!(prior, 0);
+        assert_eq!(pool.snapshot().charged_bytes, baseline);
+        for file in &file_guards {
+            // SAFETY: read-only check of each retained actual descriptor.
+            assert!(unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) } >= 0);
+        }
+    }
+
+    #[test]
+    fn scanned_rebind_cursor_refuses_changed_inputs_and_short_pool() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        let (_dir, source, raw) = conservative_cursor_fixture();
+        let pool = SemanticResourcePool::default();
+        let reserve = pool.reserver();
+        let selection = conservative_selection(&pool, BTreeSet::new(), BTreeSet::new());
+        let mut pins = PinnedConservativeCursor::new();
+        finish_conservative_copy(&source, &mut pins, &selection, &reserve);
+        let (mut short, _) = retained_rebind_inputs(&pool, &raw, true);
+        let pointer = short.as_ref().unwrap().originals_for_test().as_ptr();
+        let before = pins.pinned().unwrap().clone();
+        let mut invalid = ScannedRebindCursor::new();
+        let mut refused = false;
+        for _ in 0..4096 {
+            match pins.poll_scanned_rebind(&mut short, &mut invalid, &reserve, 1) {
+                Err(GraphRefusal::Identity) => {
+                    refused = true;
+                    break;
+                }
+                Ok(step) => assert_ne!(step, GraphStep::Ready),
+                Err(other) => panic!("unexpected input-backing refusal: {other:?}"),
+            }
+        }
+        assert!(refused);
+        assert!(invalid.required_input_bytes().unwrap() > 1);
+        assert_eq!(
+            short.as_ref().unwrap().originals_for_test().as_ptr(),
+            pointer
+        );
+        assert_conservative_value(&before, pins.pinned().unwrap());
+        for _ in 0..4096 {
+            if invalid.reclaim(Some(&mut pins), &reserve, 1).unwrap() == GraphStep::Ready {
+                break;
+            }
+        }
+        drop(invalid);
+        let original = short.take().unwrap();
+        let (rows, lease) = original.into_originals();
+        assert_eq!(rows.as_ptr(), pointer);
+        assert!(reserve.covers(&lease, 1));
+        drop(rows);
+        drop(lease);
+
+        let (mut input, _) = retained_rebind_inputs(&pool, &raw, false);
+        let mut rebind = ScannedRebindCursor::new();
+        pins.poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1)
+            .unwrap();
+        assert!(input.is_some());
+        // Equal-valued pins from the SAME original source remain a different
+        // private candidate allocation. They cannot take this cursor/input.
+        let mut foreign_pins = PinnedConservativeCursor::new();
+        finish_conservative_copy(&source, &mut foreign_pins, &selection, &reserve);
+        let held = pool.snapshot().charged_bytes;
+        assert!(matches!(
+            foreign_pins.poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1),
+            Err(GraphRefusal::Identity)
+        ));
+        assert!(input.is_some());
+        assert_eq!(pool.snapshot().charged_bytes, held);
+        assert_conservative_value(&before, foreign_pins.pinned().unwrap());
+        drop(foreign_pins);
+        let pointer = input.as_ref().unwrap().originals_for_test().as_ptr();
+        let (rows, lease) = input.take().unwrap().into_originals();
+        input = Some(RetainedScannedInputs::from_reserved_originals(rows, lease).unwrap());
+        assert_eq!(
+            input.as_ref().unwrap().originals_for_test().as_ptr(),
+            pointer
+        );
+        assert!(
+            matches!(
+                pins.poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1),
+                Err(GraphRefusal::Identity)
+            ),
+            "consuming/re-wrapping the SAME allocation cannot inherit an earlier sizing cursor"
+        );
+        for _ in 0..4096 {
+            if rebind.reclaim(Some(&mut pins), &reserve, 1).unwrap() == GraphStep::Ready {
+                break;
+            }
+        }
+        drop(rebind);
+        let mut rebind = ScannedRebindCursor::new();
+        let before_rebind = pool.snapshot().charged_bytes;
+        let other = SemanticResourcePool::default();
+        let (foreign, allocations, bytes) = crate::test_alloc::count_allocs_during(|| {
+            pins.poll_scanned_rebind(&mut input, &mut rebind, &other.reserver(), 1)
+        });
+        assert!(matches!(foreign, Err(GraphRefusal::Identity)));
+        assert_eq!((allocations, bytes), (0, 0));
+        assert!(input.is_some());
+        assert_eq!(pool.snapshot().charged_bytes, before_rebind);
+        for _ in 0..4096 {
+            if rebind.required_bytes().is_some() {
+                break;
+            }
+            assert_ne!(
+                pins.poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1)
+                    .unwrap(),
+                GraphStep::Ready
+            );
+        }
+        let required = rebind.required_bytes().unwrap();
+        assert!(required > 1);
+        pool.reference_set_limit(before_rebind.checked_add(required).unwrap() - 1);
+        let mut refused = false;
+        for _ in 0..4096 {
+            match pins.poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1) {
+                Err(GraphRefusal::Storage(_)) => {
+                    refused = true;
+                    break;
+                }
+                Ok(step) => assert_ne!(step, GraphStep::Ready),
+                Err(other) => panic!("unexpected output/claim refusal: {other:?}"),
+            }
+        }
+        assert!(refused);
+        assert!(
+            input.is_some(),
+            "precharge refusal takes no original and resets no claims"
+        );
+        assert_conservative_value(&before, pins.pinned().unwrap());
+        pool.reference_set_limit(before_rebind.checked_add(required).unwrap());
+        finish_scanned_rebind(&mut pins, &mut input, &mut rebind, &reserve);
+        assert!(input.is_none());
+        assert_eq!(pool.snapshot().charged_bytes, before_rebind + required);
+        assert!(rebind.modules().is_some());
+    }
 }

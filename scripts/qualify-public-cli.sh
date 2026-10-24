@@ -98,6 +98,36 @@ finish() {
   if alive "$pid"; then terminate "$pid"; return 1; fi
   wait "$pid"; LAST_EXIT=$?; unset 'CHILDREN[$pid]'; return 0
 }
+# Subprocess-free waits for captures that observe the whole machine: every
+# fork/exec/exit during a system capture is a descendant gap, so the system
+# cell polls with shell builtins only (one hot core while waiting). Patterns
+# are coerced from the waitfor regex to a substring: a leading ^ is dropped.
+# The completed flag needs no branch: the pattern is always checked first.
+waitfor_quiet() {
+  local file=$1 needle=$2 pid=$3 ticks=$4
+  needle=${needle#^}
+  local end=$((SECONDS + (ticks + 9) / 10)) content
+  while [ "$SECONDS" -lt "$end" ]; do
+    { content=$(<"$file"); } 2>/dev/null || content=''
+    case $content in
+      *"$needle"*) return 0 ;;
+    esac
+    alive "$pid" || return 1
+  done
+  { content=$(<"$file"); } 2>/dev/null || content=''
+  case $content in
+    *"$needle"*) return 0 ;;
+  esac
+  return 1
+}
+finish_quiet() {
+  local pid=$1 ticks=$2
+  local end=$((SECONDS + (ticks + 9) / 10))
+  while alive "$pid" && [ "$SECONDS" -lt "$end" ]; do :; done
+  if alive "$pid"; then terminate "$pid"; return 1; fi
+  wait "$pid"; LAST_EXIT=$?; unset 'CHILDREN[$pid]'; return 0
+}
+touch_quiet() { : >> "$1"; }
 result() {
   python3 - "$1" "$2" "$3" "${4:-command-contract}" <<'PY' | tee -a results.jsonl
 import json,sys
@@ -140,6 +170,8 @@ gated() {
   local output; output=$(product_output "$cell.$ext")
   [ "$LOCAL_OUTPUT" = "$OUT" ] || rm -f -- "$output"
   local before after gen='' readygen='' wl pp='' ready=0 capturing=0 released=0 observer_rc=125 workload_rc=125
+  local poll=waitfor settle=finish release=touch
+  if [ "$cell" = system ]; then poll=waitfor_quiet settle=finish_quiet release=touch_quiet; fi
   before=$(pin) || { result "$cell" 0 'provider pin failed' failed; return 1; }
   if [ "$cell" = mt-exact ]; then
     asuser "$fixture" "$MODULE" "$THREADS" 5 0 "$gate" > "$cell.wl" 2>&1 &
@@ -152,12 +184,12 @@ gated() {
     local args=("${@//@PID@/$wl}")
     for ((i=0;i<${#args[@]}-1;i++)); do [ "${args[$i]}" != -o ] || args[$((i+1))]=$output; done
     "$P" "${args[@]}" > "$cell.stdout" 2> "$cell.stderr" & pp=$!; register "$pp" || true
-    if waitfor "$cell.stderr" 'p11scope: capturing:' "$pp" "$READY_TICKS" && alive "$wl" && alive "$pp"; then
+    if "$poll" "$cell.stderr" 'p11scope: capturing:' "$pp" "$READY_TICKS" && alive "$wl" && alive "$pp"; then
       capturing=1
-      if touch "$gate"; then
+      if "$release" "$gate"; then
         released=1
-        if waitfor "$cell.wl" '^LEDGER ' "$wl" "$LEDGER_TICKS" 1; then
-          if finish "$pp" "$EXIT_TICKS"; then observer_rc=$LAST_EXIT; else observer_rc=124; fi
+        if "$poll" "$cell.wl" '^LEDGER ' "$wl" "$LEDGER_TICKS" 1; then
+          if "$settle" "$pp" "$EXIT_TICKS"; then observer_rc=$LAST_EXIT; else observer_rc=124; fi
         fi
       fi
     fi

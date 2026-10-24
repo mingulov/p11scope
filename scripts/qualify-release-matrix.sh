@@ -351,12 +351,16 @@ record_exit "$STAGE/qual.log" qual "$?"
 [ ! -d "$WORK/qual/cells" ] || python3 -I "$R/scripts/release-matrix-contract.py" --copy-tree public "$WORK/qual/cells" "$STAGE/cells" || exit 1
 "$R/scripts/qualify-inventory-native.sh" "$P" --lane native --base "$WORK/c8-native" > "$STAGE/inv-native.log" 2>&1
 native_rc=$?; record_exit "$STAGE/inv-native.log" inv_native "$native_rc"
+copy_native_rc=0
+python3 -I "$R/scripts/release-matrix-contract.py" --copy-tree native "$WORK/c8-native" "$STAGE/c8-native" || copy_native_rc=$?
 [ "$native_rc" = 0 ] || [ "$native_rc" = 2 ] || exit 1
-python3 -I "$R/scripts/release-matrix-contract.py" --copy-tree native "$WORK/c8-native" "$STAGE/c8-native" || exit 1
+[ "$copy_native_rc" = 0 ] || exit 1
 "$R/scripts/qualify-inventory-native.sh" "$P" --lane scan --base "$WORK/c8-scan" > "$STAGE/inv-scan.log" 2>&1
 scan_rc=$?; record_exit "$STAGE/inv-scan.log" inv_scan "$scan_rc"
+copy_scan_rc=0
+python3 -I "$R/scripts/release-matrix-contract.py" --copy-tree native "$WORK/c8-scan" "$STAGE/c8-scan" || copy_scan_rc=$?
 [ "$scan_rc" = 0 ] || [ "$scan_rc" = 2 ] || exit 1
-python3 -I "$R/scripts/release-matrix-contract.py" --copy-tree native "$WORK/c8-scan" "$STAGE/c8-scan" || exit 1
+[ "$copy_scan_rc" = 0 ] || exit 1
 (cd "$R" && "$R/scripts/run-privileged-lib-tests.sh" "$STAGE/artifacts/p11scope-lib" "$WORK/priv/run" --include-long "${LIB_SELECTORS[@]}") > "$STAGE/priv.log" 2>&1
 record_exit "$STAGE/priv.log" priv "$?"
 [ ! -d "$WORK/priv/run" ] || python3 -I "$R/scripts/release-matrix-contract.py" --copy-tree plain "$WORK/priv/run" "$STAGE/run" || exit 1
@@ -505,10 +509,13 @@ PYEXE
   [ -n "$libjson" ] && [ -x "$libjson" ] || return 1
   bmjson=$(cd "$REPO" && mise exec -- ./scripts/cargo.sh "+$RUST" test --manifest-path "$REPO/Cargo.toml" --release --locked -p p11scope-bpf-multi --lib --no-run --message-format=json 2>/dev/null | python3 -c 'import json,sys; exes=[json.loads(l).get("executable") for l in sys.stdin if l.strip().startswith("{")]; exes=[e for e in exes if e]; print(exes[-1] if exes else "")') || return 1
   [ -n "$bmjson" ] && [ -x "$bmjson" ] || return 1
+  ( cd "$REPO" && mise exec -- ./scripts/cargo.sh "+$RUST" build --manifest-path "$REPO/Cargo.toml" --release --locked -p p11scope-discover ) || return 1
+  [ -x "$REPO/target/release/p11scope-discover" ] || return 1
   cp -f "$REPO/target/release/p11scope" "$BIN_OUT/p11scope"
   cp -f "$libjson" "$BIN_OUT/p11scope-lib"
   cp -f "$bmjson" "$BIN_OUT/p11scope-bpfmulti"
-  chmod 755 "$BIN_OUT/p11scope" "$BIN_OUT/p11scope-lib" "$BIN_OUT/p11scope-bpfmulti"
+  cp -f "$REPO/target/release/p11scope-discover" "$BIN_OUT/p11scope-discover"
+  chmod 755 "$BIN_OUT/p11scope" "$BIN_OUT/p11scope-lib" "$BIN_OUT/p11scope-bpfmulti" "$BIN_OUT/p11scope-discover"
   git -C "$REPO" diff --quiet HEAD -- && [ "$(git -C "$REPO" rev-parse HEAD)" = "$build_head" ] || {
     echo 'source changed during candidate build; no build receipt' >&2; return 1;
   }
@@ -531,10 +538,10 @@ PYBUILD
 }
 
 if [ -n "$BIN_DIR" ]; then
-  for b in p11scope p11scope-lib p11scope-bpfmulti; do
+  for b in p11scope p11scope-lib p11scope-bpfmulti p11scope-discover; do
     [ -x "$BIN_DIR/$b" ] || { echo "bin-dir missing executable $b" >&2; exit 2; }
   done
-  cp -f "$BIN_DIR/p11scope" "$BIN_DIR/p11scope-lib" "$BIN_DIR/p11scope-bpfmulti" "$BIN_OUT/"
+  cp -f "$BIN_DIR/p11scope" "$BIN_DIR/p11scope-lib" "$BIN_DIR/p11scope-bpfmulti" "$BIN_DIR/p11scope-discover" "$BIN_OUT/"
   chmod 755 "$BIN_OUT/"*
 else
   build_bins || { echo "build failed for $REV" >&2; exit 1; }

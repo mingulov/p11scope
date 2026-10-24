@@ -995,8 +995,11 @@ def prepare(args):
     sources["inputs/candidate-build.json"] = args.candidate_receipt
     for name in RUNTIME_SOURCES:
         sources["artifacts/lib-source/" + name] = Path(candidate["source_root"]) / name
+    # The native inventory lane passes a discover-produced manifest, so the
+    # helper is staged with the candidate binaries; a bin dir without it
+    # refuses here instead of failing attested delivery inside the guest.
     sources.update({"artifacts/" + name: args.bin_dir / name for name in
-                    ("p11scope", "p11scope-lib", "p11scope-bpfmulti")})
+                    ("p11scope", "p11scope-lib", "p11scope-bpfmulti", "p11scope-discover")})
     for name in SOURCE_FILES:
         sources["artifacts/source/" + name] = ROOT / name
     canary_facts = {}
@@ -1264,6 +1267,7 @@ def _verify_inputs(stage, contract_path, candidate_validator, canary_validator):
     bindings = contract.get("bindings")
     required = {
         "artifacts/p11scope", "artifacts/p11scope-lib", "artifacts/p11scope-bpfmulti",
+        "artifacts/p11scope-discover",
         "inputs/ignored.txt", "inputs/curation.txt", "inputs/bpfmulti-list.txt",
         "inputs/candidate-build.json"}
     required.update("artifacts/source/" + name for name in SOURCE_FILES)

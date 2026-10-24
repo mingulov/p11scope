@@ -25,7 +25,10 @@ use crate::inventory_promotion::lifecycle::{SelectedActivationProof, SessionNati
 use crate::inventory_promotion::{PromotionPair, PromotionRefusal};
 use crate::inventory_semantics::selected::ProvisionalSelectedLane;
 use crate::inventory_semantics::{AttestedSemanticLane, LaneNegative, SemanticRefusal};
-use crate::inventory_semantics::{PreparedSemanticAdmission, SemanticProviderTarget};
+use crate::inventory_semantics::{
+    AdmissionPreparationError, AdmissionUnavailableSite, PreparedSemanticAdmission,
+    SemanticProviderTarget,
+};
 use crate::process::PidPin;
 use crate::semantic_capture::{
     CurrentReceiptRefusal, Endpoint, InvalidationScope, PhysicalSemanticGap, TickOutcome,
@@ -1239,12 +1242,24 @@ fn consume_current_admission<Source: ProcessSource>(
         adapter, registry, bindings, candidate, receipt, provider, permit,
     );
     if let Err(reason) = result {
+        // A provider-side Unavailable has exactly one source: the
+        // provider-subject attachment check found no live owner (every
+        // other provider error carries its own code). Name that site.
+        let code = match reason {
+            SemanticBindingRefusal::OwnerRefused(SemanticRefusal::Unavailable) => {
+                AdmissionPreparationError::unavailable(
+                    AdmissionUnavailableSite::ProviderSubjectUnavailable,
+                )
+                .to_string()
+            }
+            other => other.code().to_string(),
+        };
         registry.record_gap(RegistryGap {
             caller: Some(caller),
             module: None,
             pid: None,
             subject: "semantic admission refused".into(),
-            reason: reason.code().into(),
+            reason: code,
             budget: None,
         });
         if matches!(

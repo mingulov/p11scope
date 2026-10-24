@@ -8380,3 +8380,48 @@ fn wound_down_shell_lane_yields_no_native_session() {
         "a shell lane owns no native session to prove"
     );
 }
+
+#[test]
+fn unavailable_admission_errors_carry_finite_site_labels() {
+    use crate::inventory_semantics::{AdmissionPreparationError, AdmissionUnavailableSite as Site};
+    let labeled = [
+        (Site::RefreshTestSeam, "refresh_test_seam"),
+        (Site::RefreshNoLive, "refresh_no_live"),
+        (
+            Site::RefreshFinishedOrGated,
+            "refresh_finished_or_gated",
+        ),
+        (Site::RefreshCollectionIo, "refresh_collection_io"),
+        (Site::RefreshFailed, "refresh_failed"),
+        (Site::NoReceipt, "no_receipt"),
+        (
+            Site::ProviderSubjectUnavailable,
+            "provider_subject_unavailable",
+        ),
+        (Site::CollectedRefreshInvalid, "collected_refresh_invalid"),
+        (Site::CollectedQInvalid, "collected_q_invalid"),
+    ];
+    let mut seen = std::collections::BTreeSet::new();
+    for (site, expected) in labeled {
+        assert_eq!(site.label(), expected);
+        assert!(seen.insert(expected), "duplicate label {expected}");
+        let error = AdmissionPreparationError::unavailable(site);
+        assert_eq!(
+            error.to_string(),
+            format!("semantic_unavailable:{expected}")
+        );
+        assert_eq!(error.refusal(), SemanticRefusal::Unavailable);
+        assert_eq!(error.site(), Some(site));
+    }
+    // Other refusals pass through bare, with no site attached.
+    for refusal in [
+        SemanticRefusal::Attachment,
+        SemanticRefusal::ProviderInstanceUnproven,
+        SemanticRefusal::ProviderStorage,
+    ] {
+        let error = AdmissionPreparationError::refused(refusal);
+        assert_eq!(error.to_string(), refusal.code());
+        assert_eq!(error.refusal(), refusal);
+        assert_eq!(error.site(), None);
+    }
+}

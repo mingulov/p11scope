@@ -81,6 +81,97 @@ impl SemanticRefusal {
     }
 }
 
+/// Which admission-preparation site refused with
+/// [`SemanticRefusal::Unavailable`]. Finite vocabulary for the
+/// `semantic admission refused` gap: the reason carries
+/// `semantic_unavailable:<label>`. The production-live leg is the
+/// refresh scan outcome ([`Self::NoReceipt`]); the rest are
+/// teardown races, defense-in-depth (a lane that lost its live
+/// owner between the driver's liveness guard and the check) or
+/// test/collected-only legs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdmissionUnavailableSite {
+    /// The test H0 seam refused (gate or scripted refusal). Tests only.
+    #[cfg_attr(not(test), allow(dead_code))]
+    RefreshTestSeam,
+    /// The lane holds no live H0 owner.
+    RefreshNoLive,
+    /// The live lane finished, or gated before a terminal collection.
+    RefreshFinishedOrGated,
+    /// The terminal collection I/O was unavailable.
+    RefreshCollectionIo,
+    /// The H0 refresh itself errored (foreign domain, stopped capture).
+    RefreshFailed,
+    /// The refresh minted no receipt for this caller and slot: its
+    /// scan refused (the live pre-cookie leg).
+    NoReceipt,
+    /// The provider-subject attachment check found no live owner.
+    ProviderSubjectUnavailable,
+    /// The collected quantum failed refresh preflight.
+    CollectedRefreshInvalid,
+    /// The collected quantum failed Q validation.
+    CollectedQInvalid,
+}
+
+impl AdmissionUnavailableSite {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::RefreshTestSeam => "refresh_test_seam",
+            Self::RefreshNoLive => "refresh_no_live",
+            Self::RefreshFinishedOrGated => "refresh_finished_or_gated",
+            Self::RefreshCollectionIo => "refresh_collection_io",
+            Self::RefreshFailed => "refresh_failed",
+            Self::NoReceipt => "no_receipt",
+            Self::ProviderSubjectUnavailable => "provider_subject_unavailable",
+            Self::CollectedRefreshInvalid => "collected_refresh_invalid",
+            Self::CollectedQInvalid => "collected_q_invalid",
+        }
+    }
+}
+
+/// An admission-preparation refusal: the finite [`SemanticRefusal`]
+/// plus, for `Unavailable`, the exact firing site. Displays as the
+/// refusal code, with `:<site>` appended for `Unavailable`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AdmissionPreparationError {
+    refusal: SemanticRefusal,
+    site: Option<AdmissionUnavailableSite>,
+}
+
+impl AdmissionPreparationError {
+    /// Total constructor: every production prepare leg is `Unavailable`;
+    /// only the test seam passes other refusals through.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn refused(refusal: SemanticRefusal) -> Self {
+        Self { refusal, site: None }
+    }
+    pub(crate) fn unavailable(site: AdmissionUnavailableSite) -> Self {
+        Self {
+            refusal: SemanticRefusal::Unavailable,
+            site: Some(site),
+        }
+    }
+    pub(crate) fn refusal(self) -> SemanticRefusal {
+        self.refusal
+    }
+    /// The firing site, set only for `Unavailable`.
+    #[cfg(test)]
+    pub(crate) fn site(self) -> Option<AdmissionUnavailableSite> {
+        self.site
+    }
+}
+
+impl std::fmt::Display for AdmissionPreparationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (self.refusal, self.site) {
+            (SemanticRefusal::Unavailable, Some(site)) => {
+                write!(f, "{}:{}", self.refusal.code(), site.label())
+            }
+            _ => f.write_str(self.refusal.code()),
+        }
+    }
+}
+
 pub(crate) use crate::discovery::engine::inventory_coordinator::semantics::AttestedSubset;
 
 /// The actual attached provider, proved by the Detailed owner before scope's
@@ -1772,6 +1863,7 @@ impl AttestedSemanticLane {
         slot: u32,
     ) -> Result<(Vec<ImageIdentity>, Arc<PidPin>), SemanticRefusal> {
         self.refresh_candidate_with_custody_inner(pin, slot, None, None)
+            .map_err(|error| error.refusal())
     }
 
     fn refresh_candidate_with_custody_inner(
@@ -1784,29 +1876,38 @@ impl AttestedSemanticLane {
             &crate::attach::SessionDrainProducers,
         )>,
         terminal: Option<&crate::attach::CollectedFinishQ>,
-    ) -> Result<(Vec<ImageIdentity>, Arc<PidPin>), SemanticRefusal> {
+    ) -> Result<(Vec<ImageIdentity>, Arc<PidPin>), AdmissionPreparationError> {
+        use AdmissionUnavailableSite as Site;
         #[cfg(test)]
         if let Some(test) = self.test_io.as_mut() {
             if self.test_finished || (self.test_gated && terminal.is_none()) {
-                return Err(SemanticRefusal::Unavailable);
+                return Err(AdmissionPreparationError::unavailable(Site::RefreshTestSeam));
             }
             return match collected {
                 Some((raw, adapter, producers)) => {
                     test.refresh_collected(pin, slot, raw, adapter, producers)
                 }
                 None => test.refresh(pin, slot),
-            };
+            }
+            .map_err(|refusal| match refusal {
+                SemanticRefusal::Unavailable => {
+                    AdmissionPreparationError::unavailable(Site::RefreshTestSeam)
+                }
+                other => AdmissionPreparationError::refused(other),
+            });
         }
         let Some(live) = self.live.as_mut() else {
-            return Err(SemanticRefusal::Unavailable);
+            return Err(AdmissionPreparationError::unavailable(Site::RefreshNoLive));
         };
         if live.finished || (live.gated && terminal.is_none()) {
-            return Err(SemanticRefusal::Unavailable);
+            return Err(AdmissionPreparationError::unavailable(
+                Site::RefreshFinishedOrGated,
+            ));
         }
         if let Some(q) = terminal {
-            live.session
-                .joint_collection_io_at_q(q)
-                .map_err(|_| SemanticRefusal::Unavailable)?;
+            live.session.joint_collection_io_at_q(q).map_err(|_| {
+                AdmissionPreparationError::unavailable(Site::RefreshCollectionIo)
+            })?;
         }
         let mut report = match collected {
             Some((raw, adapter, producers)) => live.capture.refresh_collected(
@@ -1819,7 +1920,7 @@ impl AttestedSemanticLane {
             ),
             None => live.capture.refresh(&mut live.session, pin.clone(), slot),
         }
-        .map_err(|_| SemanticRefusal::Unavailable)?;
+        .map_err(|_| AdmissionPreparationError::unavailable(Site::RefreshFailed))?;
         live.scan_refusals = live
             .scan_refusals
             .saturating_add(report.scan_refusals.len() as u64);
@@ -1841,8 +1942,8 @@ impl AttestedSemanticLane {
         slot: u32,
         module: &ModuleKey,
         reserve: impl FnOnce(usize) -> Result<ResourceLease, SemanticResourceRefusal>,
-    ) -> Result<PreparedSemanticAdmission, SemanticRefusal> {
-        let (_, effective) = self.refresh_candidate_with_custody(pin, slot)?;
+    ) -> Result<PreparedSemanticAdmission, AdmissionPreparationError> {
+        let (_, effective) = self.refresh_candidate_with_custody_inner(pin, slot, None, None)?;
         self.prepare_refreshed_caller_admission(effective, slot, module, reserve)
     }
 
@@ -1858,9 +1959,12 @@ impl AttestedSemanticLane {
         adapter: &JournalAdapter,
         producers: &crate::attach::SessionDrainProducers,
         reserve: impl FnOnce(usize) -> Result<ResourceLease, SemanticResourceRefusal>,
-    ) -> Result<PreparedSemanticAdmission, SemanticRefusal> {
-        raw.validate_refresh(adapter, producers)
-            .map_err(|_| SemanticRefusal::Unavailable)?;
+    ) -> Result<PreparedSemanticAdmission, AdmissionPreparationError> {
+        raw.validate_refresh(adapter, producers).map_err(|_| {
+            AdmissionPreparationError::unavailable(
+                AdmissionUnavailableSite::CollectedRefreshInvalid,
+            )
+        })?;
         let (_, effective) = self.refresh_candidate_with_custody_inner(
             pin,
             slot,
@@ -1882,11 +1986,18 @@ impl AttestedSemanticLane {
         discovery: &crate::events::DiscoveryDomain,
         q: &crate::attach::CollectedFinishQ,
         reserve: impl FnOnce(usize) -> Result<ResourceLease, SemanticResourceRefusal>,
-    ) -> Result<PreparedSemanticAdmission, SemanticRefusal> {
-        raw.validate_refresh(adapter, producers)
-            .map_err(|_| SemanticRefusal::Unavailable)?;
+    ) -> Result<PreparedSemanticAdmission, AdmissionPreparationError> {
+        raw.validate_refresh(adapter, producers).map_err(|_| {
+            AdmissionPreparationError::unavailable(
+                AdmissionUnavailableSite::CollectedRefreshInvalid,
+            )
+        })?;
         raw.validate_collected_q(producers, discovery, q)
-            .map_err(|_| SemanticRefusal::Unavailable)?;
+            .map_err(|_| {
+                AdmissionPreparationError::unavailable(
+                    AdmissionUnavailableSite::CollectedQInvalid,
+                )
+            })?;
         let (_, effective) = self.refresh_candidate_with_custody_inner(
             pin,
             slot,
@@ -1902,7 +2013,7 @@ impl AttestedSemanticLane {
         slot: u32,
         module: &ModuleKey,
         reserve: impl FnOnce(usize) -> Result<ResourceLease, SemanticResourceRefusal>,
-    ) -> Result<PreparedSemanticAdmission, SemanticRefusal> {
+    ) -> Result<PreparedSemanticAdmission, AdmissionPreparationError> {
         #[cfg(test)]
         let receipt = if let Some(test) = self.test_io.as_mut() {
             test.take_refresh_receipt(&effective, slot)
@@ -1916,11 +2027,16 @@ impl AttestedSemanticLane {
             .live
             .as_mut()
             .and_then(|live| live.stashed_refresh.take_for_admission(&effective, slot));
-        let receipt = receipt.ok_or(SemanticRefusal::Unavailable)?;
+        let receipt = receipt.ok_or(AdmissionPreparationError::unavailable(
+            AdmissionUnavailableSite::NoReceipt,
+        ))?;
 
         let mut validation = TickReport::default();
         let result = (|| {
             // Preserve the owned refresh's existing preflight/refusal order.
+            // Subject errors land in the provider result (the OwnerRefused
+            // surface names them at consume); only scan/receipt failures
+            // fail preparation itself.
             let subject = self.current_provider_subject(&receipt, &effective, slot, module)?;
             let (_, provider) = self
                 .validate_current_provider_subject(&receipt, Ok(subject), &mut validation, reserve)

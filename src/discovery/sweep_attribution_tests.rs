@@ -6197,6 +6197,1186 @@ fn privileged_d4_btrfs_clone_without_files_backend_parity() {
         .expect("remove owned Btrfs literal-clone fixture directory");
 }
 
+const D4_ZOMBIE_MAGIC: u64 = 0xd401_0001;
+const D4_ZOMBIE_REPLY_LEN: usize = 11 * 8;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct D4ZombieReady {
+    mapping: D4ThreadReady,
+    creator: u32,
+    returned_tid: u32,
+    parent_tid: u32,
+}
+
+fn d4_zombie_reply(bytes: &[u8], pid: u32) -> Result<D4ZombieReady, &'static str> {
+    if bytes.len() != D4_ZOMBIE_REPLY_LEN {
+        return Err("fixture: wrong zombie READY length");
+    }
+    let words: [u64; 11] = std::array::from_fn(|index| {
+        u64::from_ne_bytes(bytes[index * 8..(index + 1) * 8].try_into().unwrap())
+    });
+    if words[0] != D4_ZOMBIE_MAGIC || words[1] != u64::from(pid) {
+        return Err("fixture: foreign zombie helper");
+    }
+    let tid = u32::try_from(words[2]).map_err(|_| "fixture: worker TID overflow")?;
+    let mapping = D4ThreadReady {
+        token: "owned-zombie".into(),
+        tgid: pid,
+        tid,
+        fd: i32::try_from(words[3]).map_err(|_| "fixture: FD overflow")?,
+        start: words[4],
+        end: words[5],
+        dev: words[6],
+        ino: words[7],
+    };
+    d4_validate_thread_ready(&mapping, pid, "owned-zombie")?;
+    let ready = D4ZombieReady {
+        mapping,
+        creator: u32::try_from(words[8]).map_err(|_| "fixture: creator overflow")?,
+        returned_tid: u32::try_from(words[9]).map_err(|_| "fixture: clone return overflow")?,
+        parent_tid: u32::try_from(words[10]).map_err(|_| "fixture: parent TID overflow")?,
+    };
+    if ready.creator == 0
+        || ready.creator == pid
+        || ready.creator == tid
+        || ready.returned_tid != tid
+        || ready.parent_tid != tid
+    {
+        return Err("fixture: actual creator/clone/parent/worker TIDs disagree");
+    }
+    Ok(ready)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct D4ZombieTask {
+    tid: u32,
+    state: u8,
+    birth: u64,
+}
+
+fn d4_zombie_stat(text: &str) -> Result<D4ZombieTask, &'static str> {
+    let end = text.rfind(')').ok_or("fixture: malformed task comm")?;
+    let tid = text
+        .split_whitespace()
+        .next()
+        .ok_or("fixture: missing TID")?
+        .parse::<u32>()
+        .map_err(|_| "fixture: invalid TID")?;
+    let fields: Vec<_> = text[end + 1..].split_whitespace().collect();
+    let state = fields
+        .first()
+        .filter(|value| value.len() == 1)
+        .ok_or("fixture: missing task state")?
+        .as_bytes()[0];
+    let birth = fields
+        .get(19)
+        .ok_or("fixture: missing task birth")?
+        .parse::<u64>()
+        .map_err(|_| "fixture: invalid task birth")?;
+    if tid == 0 || birth == 0 {
+        return Err("fixture: zero task identity");
+    }
+    Ok(D4ZombieTask { tid, state, birth })
+}
+
+fn d4_zombie_task_set(
+    tasks: &[D4ZombieTask],
+    ready: &D4ZombieReady,
+    zombie: bool,
+) -> Result<(), &'static str> {
+    let live = |state| matches!(state, b'R' | b'S' | b'D');
+    let mut expected = BTreeSet::from([ready.mapping.tgid, ready.mapping.tid]);
+    if !zombie {
+        expected.insert(ready.creator);
+    }
+    let actual: BTreeSet<_> = tasks.iter().map(|task| task.tid).collect();
+    if actual != expected || actual.len() != tasks.len() {
+        return Err("fixture: extra, missing or duplicate helper task");
+    }
+    for task in tasks {
+        if zombie && task.tid == ready.mapping.tgid {
+            if task.state != b'Z' {
+                return Err("fixture: leader is not a zombie");
+            }
+        } else if !live(task.state) {
+            return Err("fixture: expected live worker/controller");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn d4_zombie_single_survivor_protocol_rejects_extra_members() {
+    let words = [
+        D4_ZOMBIE_MAGIC,
+        101,
+        103,
+        4,
+        0x1000,
+        0x2000,
+        37,
+        123,
+        102,
+        103,
+        103,
+    ];
+    let encode = |words: &[u64]| {
+        words
+            .iter()
+            .flat_map(|word| word.to_ne_bytes())
+            .collect::<Vec<_>>()
+    };
+    let bytes = encode(&words);
+    let ready = d4_zombie_reply(&bytes, 101).unwrap();
+    let before = [
+        D4ZombieTask {
+            tid: 101,
+            state: b'S',
+            birth: 1,
+        },
+        D4ZombieTask {
+            tid: 102,
+            state: b'S',
+            birth: 2,
+        },
+        D4ZombieTask {
+            tid: 103,
+            state: b'S',
+            birth: 3,
+        },
+    ];
+    let after = [
+        D4ZombieTask {
+            state: b'Z',
+            ..before[0]
+        },
+        before[2],
+    ];
+    assert_eq!(d4_zombie_task_set(&before, &ready, false), Ok(()));
+    assert_eq!(d4_zombie_task_set(&after, &ready, true), Ok(()));
+    for bad in [
+        vec![after[0]],
+        vec![after[0], after[1], before[1]],
+        vec![after[0], after[1], after[1]],
+        vec![before[0], after[1]],
+        vec![
+            after[0],
+            D4ZombieTask {
+                state: b'Z',
+                ..after[1]
+            },
+        ],
+    ] {
+        assert!(d4_zombie_task_set(&bad, &ready, true).is_err());
+        assert_eq!(d4_zombie_task_set(&after, &ready, true), Ok(()));
+    }
+    assert!(d4_zombie_reply(&bytes[..bytes.len() - 1], 101).is_err());
+    for (index, value) in [
+        (0, 0),
+        (1, 104),
+        (8, 101),
+        (8, 103),
+        (9, 104),
+        (10, 104),
+        (5, 0x2001),
+    ] {
+        let mut bad = words;
+        bad[index] = value;
+        assert!(d4_zombie_reply(&encode(&bad), 101).is_err());
+        assert_eq!(d4_zombie_reply(&bytes, 101), Ok(ready.clone()));
+    }
+    let stat = "103 (owned worker) S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 3";
+    assert_eq!(d4_zombie_stat(stat), Ok(before[2]));
+    assert!(d4_zombie_stat("103 (bad) S").is_err());
+}
+
+struct D4ZombieChild {
+    owned: D4ThreadChild,
+}
+
+impl D4ZombieChild {
+    fn spawn(path: &std::path::Path) -> (Self, D4ZombieReady) {
+        use std::io::Read as _;
+        use std::os::fd::OwnedFd;
+        use std::process::{Command, Stdio};
+        let (channel, helper) = std::os::unix::net::UnixStream::pair().unwrap();
+        for socket in [&channel, &helper] {
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
+        }
+        helper
+            .set_read_timeout(Some(std::time::Duration::from_secs(60)))
+            .unwrap();
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "discovery::sweep_attribution::tests::d4_zombie_single_survivor_mapping_helper",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env_clear()
+            .env("P11SCOPE_D4_ZOMBIE_PATH", path)
+            .stdin(Stdio::from(OwnedFd::from(helper)))
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("fixture: matching zombie helper re-exec");
+        let mut owned = Self {
+            owned: D4ThreadChild {
+                child,
+                channel,
+                reaped: false,
+            },
+        };
+        let mut bytes = [0; D4_ZOMBIE_REPLY_LEN];
+        owned
+            .owned
+            .channel
+            .read_exact(&mut bytes)
+            .expect("fixture: actual raw zombie READY");
+        let ready = d4_zombie_reply(&bytes, owned.owned.child.id())
+            .expect("fixture: owned raw worker identity");
+        (owned, ready)
+    }
+
+    fn zombify(&mut self) {
+        use std::io::{Read as _, Write as _};
+        self.owned
+            .channel
+            .write_all(b"Z")
+            .expect("fixture: retire leader/controller");
+        let mut ack = [0];
+        self.owned
+            .channel
+            .read_exact(&mut ack)
+            .expect("fixture: raw retirement ACK");
+        assert_eq!(ack, *b"Z", "fixture: retirement protocol");
+    }
+
+    fn finish(mut self) -> Result<(), String> {
+        use std::io::{Read as _, Write as _};
+        self.owned
+            .channel
+            .write_all(b"Q")
+            .map_err(|e| format!("fixture: release failed: {e}"))?;
+        let mut ack = [0];
+        self.owned
+            .channel
+            .read_exact(&mut ack)
+            .map_err(|e| format!("fixture: cleanup ACK: {e}"))?;
+        if ack != *b"D" {
+            return Err("fixture: wrong cleanup ACK".into());
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match self.owned.child.try_wait() {
+                Ok(Some(status)) => {
+                    self.owned.reaped = true;
+                    return if status.success() {
+                        Ok(())
+                    } else {
+                        Err(format!("fixture: helper exit {status}"))
+                    };
+                }
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(2))
+                }
+                Ok(None) => return Err("fixture: normal whole-group reap timed out".into()),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(format!("fixture: reap failed: {e}")),
+            }
+        }
+    }
+}
+
+fn d4_zombie_open_at(
+    directory: &std::os::fd::OwnedFd,
+    name: &std::ffi::CStr,
+) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    // SAFETY: held fixture directory and internally selected relative name.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        // SAFETY: new descriptor, adopted once.
+        Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+    }
+}
+
+/// Test observation only: no production member authority or selector is minted.
+/// All post-exit reads are relative to directories opened while the leader lives.
+struct D4ZombieObservation {
+    original: std::sync::Arc<crate::process::PidPin>,
+    leader: std::os::fd::OwnedFd,
+    tasks: std::os::fd::OwnedFd,
+    member: std::os::fd::OwnedFd,
+    member_birth: u64,
+}
+
+impl D4ZombieObservation {
+    fn acquire(ready: &D4ZombieReady) -> Self {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let original =
+            std::sync::Arc::new(crate::process::PidPin::open(ready.mapping.tgid).unwrap());
+        original
+            .pidfd()
+            .expect("fixture: original group pidfd required");
+        original
+            .start_time()
+            .expect("fixture: original birth required");
+        assert_eq!(original.original_exited(), Ok(false));
+        let leader = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(format!("/proc/{}", ready.mapping.tgid))
+            .unwrap()
+            .into();
+        let tasks = d4_zombie_open_at(&leader, c"task").unwrap();
+        let name = std::ffi::CString::new(ready.mapping.tid.to_string()).unwrap();
+        let member = d4_zombie_open_at(&tasks, &name).unwrap();
+        let mut result = Self {
+            original,
+            leader,
+            tasks,
+            member,
+            member_birth: 0,
+        };
+        result.member_birth = result.stat(&result.member).unwrap().birth;
+        result.validate(ready);
+        result
+    }
+
+    fn stat(&self, dir: &std::os::fd::OwnedFd) -> std::io::Result<D4ZombieTask> {
+        use std::io::Read as _;
+        let file = std::fs::File::from(d4_zombie_open_at(dir, c"stat")?);
+        let mut text = String::new();
+        file.take(65536).read_to_string(&mut text)?;
+        if text.len() >= 65536 {
+            return Err(std::io::Error::other("fixture: oversized stat"));
+        }
+        d4_zombie_stat(&text).map_err(std::io::Error::other)
+    }
+
+    fn tasks(&self) -> std::io::Result<Vec<D4ZombieTask>> {
+        use std::os::fd::AsRawFd as _;
+        // This fd alias is the retained directory, never a fresh /proc/TGID walk.
+        let mut tasks = Vec::new();
+        for entry in std::fs::read_dir(format!("/proc/self/fd/{}", self.tasks.as_raw_fd()))? {
+            let name = entry?.file_name();
+            let name =
+                std::ffi::CString::new(name.as_encoded_bytes()).map_err(std::io::Error::other)?;
+            tasks.push(self.stat(&d4_zombie_open_at(&self.tasks, &name)?)?);
+        }
+        tasks.sort_by_key(|task| task.tid);
+        Ok(tasks)
+    }
+
+    fn status(&self, directory: &std::os::fd::OwnedFd) -> String {
+        use std::io::Read as _;
+        let mut text = String::new();
+        std::fs::File::from(
+            d4_zombie_open_at(directory, c"status").expect("fixture: retained task status"),
+        )
+        .take(65536)
+        .read_to_string(&mut text)
+        .unwrap();
+        assert!(text.len() < 65536, "fixture: oversized task status");
+        text
+    }
+
+    fn retirement_ready(&self, ready: &D4ZombieReady) {
+        let name = std::ffi::CString::new(ready.creator.to_string()).unwrap();
+        let creator =
+            d4_zombie_open_at(&self.tasks, &name).expect("fixture: actual creator directory");
+        for directory in [&self.leader, &creator] {
+            let status = self.status(directory);
+            let mask = status
+                .lines()
+                .find_map(|line| line.strip_prefix("SigBlk:"))
+                .expect("fixture: actual retirement signal mask")
+                .trim();
+            let mask = u64::from_str_radix(mask, 16).unwrap();
+            assert_eq!(
+                mask & (1 << (libc::SIGUSR1 - 1)),
+                0,
+                "fixture: targeted retirement signal must be unblocked"
+            );
+        }
+    }
+
+    fn validate(&self, ready: &D4ZombieReady) {
+        assert_eq!(
+            self.original.original_exited(),
+            Ok(false),
+            "fixture: whole group must live"
+        );
+        assert!(self.original.still_the_same());
+        let leader = self
+            .stat(&self.leader)
+            .expect("fixture: retained original leader stat");
+        assert_eq!(
+            (leader.tid, Some(leader.birth)),
+            (ready.mapping.tgid, self.original.start_time())
+        );
+        let member = self
+            .stat(&self.member)
+            .expect("fixture: retained live member stat");
+        assert_eq!(
+            (member.tid, member.birth),
+            (ready.mapping.tid, self.member_birth)
+        );
+        assert!(matches!(member.state, b'R' | b'S' | b'D'));
+        let status = self.status(&self.member);
+        for (field, expected) in [("Tgid:", ready.mapping.tgid), ("Pid:", ready.mapping.tid)] {
+            let actual = status
+                .lines()
+                .find_map(|line| line.strip_prefix(field))
+                .expect("fixture: actual member status identity")
+                .trim()
+                .parse::<u32>()
+                .unwrap();
+            assert_eq!(actual, expected, "fixture: actual member {field}");
+        }
+    }
+
+    fn maps(&self) -> Vec<MapEntry> {
+        crate::discovery::scan::read_maps_or_refuse(
+            std::fs::File::from(
+                d4_zombie_open_at(&self.member, c"maps").expect("fixture: retained member maps"),
+            ),
+            &mut CaptureWorkBudget::default(),
+            crate::attach::monotonic_ns,
+        )
+        .expect("fixture: fresh member maps")
+    }
+
+    fn identity(&self, name: &str) -> FileIdentity {
+        use std::os::fd::AsRawFd as _;
+        let name = std::ffi::CString::new(name).unwrap();
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: live retained directory, internal fd/range name; follow its
+        // proc link to obtain actual vm_file/open-file metadata, not a pathname.
+        assert_eq!(
+            unsafe { libc::fstatat(self.member.as_raw_fd(), name.as_ptr(), stat.as_mut_ptr(), 0) },
+            0,
+            "fixture: retained member identity: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: successful fstatat initialized stat.
+        let stat = unsafe { stat.assume_init() };
+        FileIdentity {
+            dev: stat.st_dev,
+            ino: stat.st_ino,
+        }
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[repr(C)]
+struct D4ZombieRawArgs {
+    path: *const libc::c_char,
+    channel: libc::c_int,
+    creator: libc::c_int,
+    parent_tid: *mut std::sync::atomic::AtomicI32,
+    returned_tid: std::sync::atomic::AtomicI32,
+    start: std::sync::atomic::AtomicU32,
+}
+
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+const D4_ZOMBIE_FRAME_SIZE: usize =
+    (D4_CLONE_WORKER_WIRE_OFFSET + D4_ZOMBIE_REPLY_LEN + 1 + 15) & !15;
+
+/// Only the owned helper installs this handler. A targeted signal retires
+/// one thread without running Rust destructors or terminating the group.
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[unsafe(naked)]
+extern "C" fn d4_zombie_thread_exit(_signal: libc::c_int) {
+    core::arch::naked_asm!(
+        "xor edi, edi",
+        "mov eax, {sys_exit}",
+        "syscall",
+        "ud2",
+        sys_exit = const libc::SYS_exit,
+    );
+}
+
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[unsafe(naked)]
+extern "C" fn d4_zombie_creator_park() -> ! {
+    core::arch::naked_asm!(
+        "2:",
+        "mov eax, {sys_pause}",
+        "syscall",
+        "jmp 2b",
+        sys_pause = const libc::SYS_pause,
+    );
+}
+
+/// Separate from the qualified clone worker: this leaf owns the external
+/// protocol after retiring BOTH the TGID leader and libtest controller.
+/// No Rust/libc/TLS, allocator, unwinding, or exit_group runs in this path.
+/// Published storage is never reclaimed while any group member lives.
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[unsafe(naked)]
+extern "C" fn d4_zombie_single_survivor_worker(_context: *mut libc::c_void) -> libc::c_int {
+    core::arch::naked_asm!(
+        "sub rsp, {frame}",
+        "mov rbx, rdi",
+        "mov r12d, dword ptr [rbx + {args_channel}]",
+        // Release/acquire publication on x86-64: no child reads the return
+        // or parent-written TID before the normal creator opens this gate.
+        "2:",
+        "cmp dword ptr [rbx + {args_start}], 1",
+        "je 3f",
+        "pause",
+        "jmp 2b",
+        "3:",
+        "mov eax, {magic}",
+        "mov qword ptr [rsp + {wire}], rax",
+        "mov eax, {sys_getpid}",
+        "syscall",
+        "mov qword ptr [rsp + {wire} + 8], rax",
+        "mov eax, {sys_gettid}",
+        "syscall",
+        "mov qword ptr [rsp + {wire} + 16], rax",
+        "mov eax, dword ptr [rbx + {args_creator}]",
+        "mov qword ptr [rsp + {wire} + 64], rax",
+        "mov eax, dword ptr [rbx + {args_returned}]",
+        "mov qword ptr [rsp + {wire} + 72], rax",
+        "mov rax, qword ptr [rbx + {args_parent}]",
+        "mov eax, dword ptr [rax]",
+        "mov qword ptr [rsp + {wire} + 80], rax",
+        "mov eax, {sys_openat}",
+        "mov rdi, {at_fdcwd}",
+        "mov rsi, qword ptr [rbx + {args_path}]",
+        "mov edx, {open_flags}",
+        "xor r10d, r10d",
+        "syscall",
+        "test rax, rax",
+        "js 9f",
+        "mov r13, rax",
+        "mov qword ptr [rsp + {wire} + 24], rax",
+        "mov eax, {sys_fstat}",
+        "mov edi, r13d",
+        "mov rsi, rsp",
+        "syscall",
+        "test rax, rax",
+        "jnz 9f",
+        "mov rax, qword ptr [rsp + {stat_dev}]",
+        "mov qword ptr [rsp + {wire} + 48], rax",
+        "mov rax, qword ptr [rsp + {stat_ino}]",
+        "mov qword ptr [rsp + {wire} + 56], rax",
+        "mov eax, {sys_mmap}",
+        "xor edi, edi",
+        "mov esi, 4096",
+        "mov edx, {prot}",
+        "mov r10d, {map_private}",
+        "mov r8, r13",
+        "xor r9d, r9d",
+        "syscall",
+        "test rax, rax",
+        "js 9f",
+        "mov r14, rax",
+        "mov qword ptr [rsp + {wire} + 32], rax",
+        "add rax, 4096",
+        "mov qword ptr [rsp + {wire} + 40], rax",
+        "lea rbp, [rsp + {wire}]",
+        "mov r15d, {reply_len}",
+        "4:",
+        "mov eax, {sys_write}",
+        "mov edi, r12d",
+        "mov rsi, rbp",
+        "mov rdx, r15",
+        "syscall",
+        "cmp rax, -{eintr}",
+        "je 4b",
+        "test rax, rax",
+        "jle 9f",
+        "cmp rax, r15",
+        "ja 9f",
+        "add rbp, rax",
+        "sub r15, rax",
+        "jnz 4b",
+        // R15 is now zero: no normal helper threads have retired yet.
+        "5:",
+        "mov eax, {sys_read}",
+        "mov edi, r12d",
+        "lea rsi, [rsp + {wire} + {reply_len}]",
+        "mov edx, 1",
+        "syscall",
+        "cmp rax, -{eintr}",
+        "je 5b",
+        "cmp rax, 1",
+        "jne 9f",
+        "cmp byte ptr [rsp + {wire} + {reply_len}], 90",
+        "je 6f",
+        "cmp byte ptr [rsp + {wire} + {reply_len}], 81",
+        "jne 9f",
+        "6:",
+        "test r15d, r15d",
+        "jnz 7f",
+        // These are actual kernel TGID/creator TIDs from this owned group.
+        "mov eax, {sys_tgkill}",
+        "mov edi, dword ptr [rsp + {wire} + 8]",
+        "mov esi, edi",
+        "mov edx, {retire_signal}",
+        "syscall",
+        "test rax, rax",
+        "jnz 9f",
+        "mov eax, {sys_tgkill}",
+        "mov edi, dword ptr [rsp + {wire} + 8]",
+        "mov esi, dword ptr [rbx + {args_creator}]",
+        "mov edx, {retire_signal}",
+        "syscall",
+        "test rax, rax",
+        "jnz 9f",
+        "mov r15d, 1",
+        "7:",
+        "cmp byte ptr [rsp + {wire} + {reply_len}], 90",
+        "je 8f",
+        "mov eax, {sys_munmap}",
+        "mov rdi, r14",
+        "mov esi, 4096",
+        "syscall",
+        "test rax, rax",
+        "jnz 9f",
+        "mov eax, {sys_close}",
+        "mov edi, r13d",
+        "syscall",
+        "test rax, rax",
+        "jnz 9f",
+        "mov byte ptr [rsp + {wire} + {reply_len}], 68",
+        "8:",
+        "mov eax, {sys_write}",
+        "mov edi, r12d",
+        "lea rsi, [rsp + {wire} + {reply_len}]",
+        "mov edx, 1",
+        "syscall",
+        "cmp rax, -{eintr}",
+        "je 8b",
+        "cmp rax, 1",
+        "jne 9f",
+        "cmp byte ptr [rsp + {wire} + {reply_len}], 90",
+        "je 5b",
+        "xor edi, edi",
+        "mov eax, {sys_exit}",
+        "syscall",
+        "ud2",
+        "9:",
+        "mov edi, 91",
+        "mov eax, {sys_exit}",
+        "syscall",
+        "ud2",
+        frame = const D4_ZOMBIE_FRAME_SIZE,
+        wire = const D4_CLONE_WORKER_WIRE_OFFSET,
+        reply_len = const D4_ZOMBIE_REPLY_LEN,
+        args_path = const std::mem::offset_of!(D4ZombieRawArgs, path),
+        args_channel = const std::mem::offset_of!(D4ZombieRawArgs, channel),
+        args_creator = const std::mem::offset_of!(D4ZombieRawArgs, creator),
+        args_parent = const std::mem::offset_of!(D4ZombieRawArgs, parent_tid),
+        args_returned = const std::mem::offset_of!(D4ZombieRawArgs, returned_tid),
+        args_start = const std::mem::offset_of!(D4ZombieRawArgs, start),
+        stat_dev = const std::mem::offset_of!(libc::stat, st_dev),
+        stat_ino = const std::mem::offset_of!(libc::stat, st_ino),
+        magic = const D4_ZOMBIE_MAGIC,
+        eintr = const libc::EINTR,
+        at_fdcwd = const libc::AT_FDCWD,
+        open_flags = const libc::O_RDONLY | libc::O_CLOEXEC,
+        prot = const libc::PROT_READ | libc::PROT_EXEC,
+        map_private = const libc::MAP_PRIVATE,
+        retire_signal = const libc::SIGUSR1,
+        sys_getpid = const libc::SYS_getpid,
+        sys_gettid = const libc::SYS_gettid,
+        sys_openat = const libc::SYS_openat,
+        sys_fstat = const libc::SYS_fstat,
+        sys_mmap = const libc::SYS_mmap,
+        sys_write = const libc::SYS_write,
+        sys_read = const libc::SYS_read,
+        sys_tgkill = const libc::SYS_tgkill,
+        sys_munmap = const libc::SYS_munmap,
+        sys_close = const libc::SYS_close,
+        sys_exit = const libc::SYS_exit,
+    );
+}
+
+/// Once published, these allocations are never reclaimed in this helper.
+/// The creator and leader exit without unwinding. The shared mm keeps the
+/// storage live through the last worker's exit; the outer owned process
+/// guard then reaps the whole group before claiming cleanup.
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+struct D4ZombieRawStorage {
+    stack: *mut libc::c_void,
+    stack_len: usize,
+    path: *mut libc::c_char,
+    args: *mut D4ZombieRawArgs,
+    tid: *mut std::sync::atomic::AtomicI32,
+    worker: libc::c_int,
+}
+
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+impl D4ZombieRawStorage {
+    fn publish(path: std::ffi::CString, channel: libc::c_int) -> ! {
+        use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+        // SAFETY: all libc/TLS use is confined to the normal creator.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        assert!(page > 0);
+        let page = page as usize;
+        let stack_size = 1024 * 1024;
+        let stack_len = stack_size + 2 * page;
+        let stack = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                stack_len,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(
+            stack,
+            libc::MAP_FAILED,
+            "fixture: owned zombie-worker stack"
+        );
+        let path = path.into_raw();
+        let tid = Box::into_raw(Box::new(AtomicI32::new(-1)));
+        let args = Box::into_raw(Box::new(D4ZombieRawArgs {
+            path,
+            channel,
+            creator: unsafe { libc::syscall(libc::SYS_gettid) } as libc::c_int,
+            parent_tid: tid,
+            returned_tid: AtomicI32::new(-1),
+            start: AtomicU32::new(0),
+        }));
+        let mut owned = Self {
+            stack,
+            stack_len,
+            path,
+            args,
+            tid,
+            worker: 0,
+        };
+        // SAFETY: only the middle of this owned mapping becomes writable.
+        let stack_start = unsafe { stack.cast::<u8>().add(page) };
+        assert_eq!(
+            unsafe {
+                libc::mprotect(
+                    stack_start.cast(),
+                    stack_size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                )
+            },
+            0
+        );
+        // SAFETY: ordinary-parent trampoline; the callback is entirely raw
+        // assembly. The newborn cannot pass its start gate until publication.
+        owned.worker = unsafe {
+            libc::clone(
+                d4_zombie_single_survivor_worker,
+                stack_start.add(stack_size).cast(),
+                D4_CLONE_WITHOUT_FILES_FLAGS,
+                args.cast(),
+                (*tid).as_ptr(),
+                std::ptr::null_mut::<libc::c_void>(),
+                (*tid).as_ptr(),
+            )
+        };
+        assert!(
+            owned.worker > 0,
+            "fixture: literal zombie-worker clone: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_eq!(
+            unsafe { (*tid).load(Ordering::Acquire) },
+            owned.worker,
+            "fixture: kernel parent-TID write"
+        );
+        // SAFETY: these raw allocations were published once, stay live to
+        // whole-group exit, and are only accessed atomically after clone.
+        unsafe {
+            (*args).returned_tid.store(owned.worker, Ordering::Relaxed);
+            (*args).start.store(1, Ordering::Release);
+        }
+        std::mem::forget(owned);
+        d4_zombie_creator_park()
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+impl Drop for D4ZombieRawStorage {
+    fn drop(&mut self) {
+        if self.worker > 0 {
+            // A failure must terminate this owned helper before any live
+            // newborn's stack/context/path can unwind or be reclaimed.
+            unsafe { libc::_exit(105) };
+        }
+        // SAFETY: clone did not create a worker. Successful publication
+        // forgets this guard and relies on outer whole-group reap instead.
+        unsafe {
+            libc::munmap(self.stack, self.stack_len);
+            drop(std::ffi::CString::from_raw(self.path));
+            drop(Box::from_raw(self.args));
+            drop(Box::from_raw(self.tid));
+        }
+    }
+}
+
+/// Private helper never completes as a standalone libtest qualification.
+/// It needs its owning socket/path; normal completion comes from the last
+/// raw worker's SYS_exit after the original leader/controller have retired.
+#[test]
+#[ignore = "private D4 zombie fixture entrypoint; requires owning socket and source configuration"]
+fn d4_zombie_single_survivor_mapping_helper() {
+    #[cfg(not(all(target_arch = "x86_64", target_pointer_width = "64")))]
+    panic!("the actual zombie fixture requires the x86-64 LP64 syscall ABI");
+    #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+    {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+        let path =
+            std::env::var_os("P11SCOPE_D4_ZOMBIE_PATH").expect("fixture: owned zombie source");
+        let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: fresh-exec helper only; stdin must be its owning Unix socket.
+        let raw = unsafe { libc::fcntl(0, libc::F_DUPFD_CLOEXEC, 3) };
+        assert!(raw >= 0);
+        let socket = std::os::unix::net::UnixStream::from(unsafe { OwnedFd::from_raw_fd(raw) });
+        socket
+            .peer_addr()
+            .expect("fixture: connected owning socket required");
+        // SAFETY: only the owned fresh helper changes its process-wide
+        // disposition. The naked handler does a thread-only syscall exit.
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = d4_zombie_thread_exit as *const () as usize;
+        assert_eq!(unsafe { libc::sigemptyset(&mut action.sa_mask) }, 0);
+        assert_eq!(
+            unsafe { libc::sigaction(libc::SIGUSR1, &action, std::ptr::null_mut()) },
+            0
+        );
+        // No return or Rust cleanup after publication; the socket and all
+        // raw allocations remain live until the outer process guard reaps.
+        D4ZombieRawStorage::publish(path, socket.as_raw_fd());
+    }
+}
+
+/// Existing-API required-positive regression, NOT a qualified zombie port.
+/// The post-exit semantic assertions deliberately remain required positives:
+/// today's zombie/leader-only refusals do not satisfy the selected population.
+/// Both real backends are attempted and the owned helper is normally reaped
+/// BEFORE those assertions, even when either backend panics internally.
+#[test]
+#[ignore = "root x86-64 LP64 Btrfs disk TMPDIR and eligible BTF/task_vma; required zombie-leader positive baseline"]
+fn privileged_d4_btrfs_zombie_leader_single_survivor_backend_parity() {
+    use crate::discovery::identity::{PinnedObjects, test_fixture::real_scan_pin};
+    use crate::discovery::kernel_identity::IdentitySession;
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::{FileExt as _, MetadataExt as _};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    assert!(
+        cfg!(all(target_arch = "x86_64", target_pointer_width = "64")),
+        "fixture: actual zombie survivor requires x86-64 LP64"
+    );
+    crate::attach::identity_iter::ensure_kernel_identity_btf()
+        .expect("fixture: required kernel identity capability; refusal cannot qualify");
+    let btf = aya::Btf::from_sys_fs().expect("fixture: readable host BTF");
+    let dir = tempfile::tempdir().unwrap();
+    let parent = dir.path();
+    let raw_parent = std::ffi::CString::new(parent.as_os_str().as_encoded_bytes()).unwrap();
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: valid owned directory name and output buffer.
+    assert_eq!(
+        unsafe { libc::statfs(raw_parent.as_ptr(), stat.as_mut_ptr()) },
+        0
+    );
+    // SAFETY: successful statfs initialized the output.
+    assert_eq!(
+        unsafe { stat.assume_init().f_type } as u64 & 0xffff_ffff,
+        0x9123_683e,
+        "fixture: actual disk TMPDIR must be Btrfs"
+    );
+    create_subvolume(parent, "a");
+    let path = parent.join("a/libzombie.so");
+    let bytes = vec![0x5cu8; 8192];
+    std::fs::write(&path, &bytes).unwrap();
+    let held = std::fs::File::open(&path).unwrap();
+    let identity = |file: &std::fs::File| {
+        let metadata = file.metadata().unwrap();
+        FileIdentity {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        }
+    };
+    let physical = identity(&held);
+    let (mut child, ready) = D4ZombieChild::spawn(&path);
+    let observation = D4ZombieObservation::acquire(&ready);
+    let original_birth = observation
+        .original
+        .start_time()
+        .expect("fixture: retained original birth");
+    let pid = ready.mapping.tgid;
+    let worker = ready.mapping.tid;
+    let creator = ready.creator;
+    let digest = p11scope_manifest::identity::hex(&Sha256::digest(&bytes));
+    let before_maps = observation.maps();
+    let before_line = before_maps
+        .iter()
+        .find(|entry| (entry.start, entry.end) == (ready.mapping.start, ready.mapping.end))
+        .expect("fixture: actual worker executable VMA")
+        .clone();
+    let key = ObjectKey::of(&before_line);
+    let pins: PinnedObjects = real_scan_pin(&path, Some(key), 0, &digest);
+    let object = pins.pinned().next().expect("fixture: actual held-A pin").id;
+    let (index, refused) = KnownKeyIndex::build(
+        [(key, Some(object))],
+        &BTreeMap::from([(key, object)]),
+        [],
+        &pins,
+    );
+    assert!(refused.is_empty(), "fixture: {refused:?}");
+    assert!(
+        index.map_files_keys().contains(&key),
+        "fixture: actual Btrfs range proof required"
+    );
+    let probe_dir = tempfile::tempdir().unwrap();
+    let mut session = IdentitySession::probe_and_load(&btf, probe_dir.path())
+        .expect("fixture: actual strict kernel session; no fallback positive");
+
+    // Fixture checks are separate from the required attribution positives.
+    // Catch them too so a failed observation can still release the owned
+    // group normally. Q retires the controller even if Z was never sent.
+    let outcomes = catch_unwind(AssertUnwindSafe(|| {
+        d4_zombie_task_set(
+            &observation.tasks().expect("fixture: before task set"),
+            &ready,
+            false,
+        )
+        .expect("fixture: exactly leader/controller/raw worker before exit");
+        observation.retirement_ready(&ready);
+        let verify_mapping = |snapshot: &[MapEntry]| {
+            observation.validate(&ready);
+            assert_eq!(
+                (ready.mapping.dev, ready.mapping.ino),
+                (physical.dev, physical.ino),
+                "fixture: actual worker fstat matches held file"
+            );
+            assert_eq!(
+                observation.identity(&format!("fd/{}", ready.mapping.fd)),
+                physical,
+                "fixture: actual live-member FD names held A"
+            );
+            assert_eq!(
+                observation.identity(&format!(
+                    "map_files/{:x}-{:x}",
+                    ready.mapping.start, ready.mapping.end
+                )),
+                physical,
+                "fixture: actual live-member vm_file names held A"
+            );
+            let lines: Vec<_> = snapshot
+                .iter()
+                .filter(|entry| ObjectKey::of(entry) == key)
+                .collect();
+            assert_eq!(
+                lines,
+                [&before_line],
+                "fixture: exact held VMA remains unchanged"
+            );
+            assert_eq!(before_line.permissions, *b"r-xp");
+            assert_eq!(before_line.file_offset, 0);
+            assert_eq!(
+                before_line.raw_path.as_deref(),
+                Some(path.as_os_str().as_encoded_bytes())
+            );
+            assert!(is_caller_range(&before_line));
+            assert_eq!(
+                proof_ranges(snapshot, &index.map_files_keys()),
+                [(ready.mapping.start, ready.mapping.end)],
+                "fixture: one exact actual proof range"
+            );
+            assert_eq!(identity(&held), physical);
+            assert_eq!(identity(pins.file_for(object).unwrap()), physical);
+            assert!(
+                pins.object_unchanged(object)
+                    .expect("fixture: actual held anchor unchanged")
+            );
+            let mut actual_bytes = vec![0; bytes.len()];
+            held.read_exact_at(&mut actual_bytes, 0).unwrap();
+            assert_eq!(actual_bytes, bytes, "fixture: held A bytes remain stable");
+        };
+        verify_mapping(&before_maps);
+        let before_userspace = catch_unwind(AssertUnwindSafe(|| {
+            attribute_pid(pid, before_maps.clone(), &index)
+        }));
+        let before_kernel = catch_unwind(AssertUnwindSafe(|| {
+            d4_kernel_attribution_for_pid(
+                pid,
+                before_maps.clone(),
+                &pins,
+                object,
+                key,
+                &mut session,
+                1,
+            )
+        }));
+        child.zombify();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let after_tasks = loop {
+            match observation.tasks() {
+                Ok(tasks) if d4_zombie_task_set(&tasks, &ready, true).is_ok() => break tasks,
+                Ok(tasks) => assert!(
+                    std::time::Instant::now() < deadline,
+                    "fixture: retirement never reached exactly one live survivor: {tasks:?}"
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "fixture: retiring controller enumeration did not settle: {error}"
+                    );
+                }
+                Err(error) => panic!("fixture: retained task enumeration failed: {error}"),
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        };
+        // The retained MEMBER's maps are opened anew AFTER the zombie
+        // barrier. No leader maps path or saved snapshot substitutes for it.
+        let after_maps = observation.maps();
+        verify_mapping(&after_maps);
+        eprintln!(
+            "D4_ZOMBIE_TRUTH caller={pid} worker={worker} retired_controller={creator} tasks={after_tasks:?} original_birth={original_birth:?} group_pidfd_ready=false fd={} range={:x}-{:x} file={}:{} clone_return={} parent_tid={}",
+            ready.mapping.fd,
+            ready.mapping.start,
+            ready.mapping.end,
+            physical.dev,
+            physical.ino,
+            ready.returned_tid,
+            ready.parent_tid
+        );
+        let after_userspace = catch_unwind(AssertUnwindSafe(|| {
+            attribute_pid(pid, after_maps.clone(), &index)
+        }));
+        let after_kernel = catch_unwind(AssertUnwindSafe(|| {
+            d4_kernel_attribution_for_pid(pid, after_maps, &pins, object, key, &mut session, 2)
+        }));
+        // Both backend calls above have happened before any positive check.
+        verify_mapping(&observation.maps());
+        d4_zombie_task_set(
+            &observation
+                .tasks()
+                .expect("fixture: final retained task set"),
+            &ready,
+            true,
+        )
+        .expect("fixture: sole survivor stays live through both proofs");
+        (
+            before_userspace,
+            before_kernel,
+            after_userspace,
+            after_kernel,
+        )
+    }));
+    let cleanup = child.finish();
+    // On a fixture failure the owned guard also kills/reaps, but that is
+    // distinct from this normal release/reap required by semantic baseline.
+    cleanup.expect("fixture: normal whole-group release/reap required before semantic assertions");
+    assert_eq!(
+        observation.original.original_exited(),
+        Ok(true),
+        "fixture: original group exited"
+    );
+    assert!(!observation.original.still_the_same());
+    for id in [pid, worker, creator] {
+        assert!(
+            !std::path::Path::new(&format!("/proc/{id}")).exists(),
+            "fixture: owned task {id} gone"
+        );
+    }
+    drop((observation, session, pins, held));
+    std::fs::remove_file(&path).unwrap();
+    std::fs::remove_dir(parent.join("a")).unwrap();
+    probe_dir
+        .close()
+        .expect("fixture: remove owned kernel probe directory");
+    dir.close()
+        .expect("fixture: remove owned Btrfs zombie directory");
+    eprintln!(
+        "D4_ZOMBIE_CLEANUP caller={pid} worker={worker} controller={creator} normal_release=true whole_group_reaped=true owned_files_removed=true"
+    );
+    let (before_userspace, before_kernel, after_userspace, after_kernel) =
+        outcomes.unwrap_or_else(|failure| std::panic::resume_unwind(failure));
+    for (label, result) in [
+        ("before/userspace", &before_userspace),
+        ("before/kernel", &before_kernel),
+        ("zombie/userspace", &after_userspace),
+        ("zombie/kernel", &after_kernel),
+    ] {
+        match result {
+            Ok(out) => eprintln!(
+                "D4_ZOMBIE_RESULT {label} members={} probed={} unavailable={} exited={:?} losses={:?}",
+                out.members.len(),
+                out.probed,
+                out.unavailable,
+                out.exited,
+                out.losses
+            ),
+            Err(_) => eprintln!("D4_ZOMBIE_RESULT {label} backend_panicked=true"),
+        }
+    }
+    let before_userspace = before_userspace.expect("fixture/backend: before userspace panic");
+    let before_kernel = before_kernel.expect("fixture/backend: before kernel panic");
+    let after_userspace = after_userspace.expect("fixture/backend: zombie userspace panic");
+    let after_kernel = after_kernel.expect("fixture/backend: zombie kernel panic");
+    for (phase, userspace, kernel) in [
+        ("leader live", &before_userspace, &before_kernel),
+        (
+            "leader zombie / sole live worker",
+            &after_userspace,
+            &after_kernel,
+        ),
+    ] {
+        for (backend, out) in [("userspace", userspace), ("kernel", kernel)] {
+            assert_eq!(
+                out.members
+                    .iter()
+                    .map(|member| member.pid)
+                    .collect::<Vec<_>>(),
+                [pid],
+                "required positive: {phase}/{backend} must attribute original TGID's held A; current refusal is a regression, not qualification"
+            );
+            assert_eq!(out.members[0].start_time, original_birth);
+            assert_eq!(
+                out.members[0]
+                    .objects
+                    .iter()
+                    .map(|matched| (matched.key, matched.object, matched.path.as_str()))
+                    .collect::<Vec<_>>(),
+                [(key, object, path.to_str().unwrap())]
+            );
+            assert_eq!(out.probed, 1);
+            assert_eq!(out.unavailable, 0);
+            assert!(
+                out.exited.is_empty(),
+                "required live group: {phase}/{backend}"
+            );
+            assert!(out.losses.is_empty(), "{phase}/{backend}: {:?}", out.losses);
+        }
+        assert_eq!(
+            userspace.members, kernel.members,
+            "independently required {phase} edges"
+        );
+    }
+}
+
 /// Root with a loop-mounted ext4: there a held file's maps key is its
 /// identity, so no per-range stat runs at all. Before A6 a process that
 /// mapped the file only read-only was attributed on the key alone; now

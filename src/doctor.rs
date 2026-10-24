@@ -1691,9 +1691,19 @@ pub fn render_extra_strict(checks: &[Check]) -> String {
 /// contract (pinned count, tier inputs, verdict gates) stays unchanged
 /// because this capability gates only counter preparation, never ordinary
 /// capture. The old-kernel refusal names the same token the footer carries.
-pub(crate) fn counter_modes_footer(_verdict: &crate::attach::BpfLoopVerdict) -> String {
-    // Stub: placeholder line until the real footer lands.
-    "stub\n".to_string()
+pub(crate) fn counter_modes_footer(verdict: &crate::attach::BpfLoopVerdict) -> String {
+    match verdict {
+        crate::attach::BpfLoopVerdict::Available => {
+            "counter modes: available (the kernel loads the bpf_loop helper-181 probe)\n"
+                .to_string()
+        }
+        crate::attach::BpfLoopVerdict::Unavailable(reason) => {
+            format!("counter modes: counter-mode-unavailable-on-kernel ({reason})\n")
+        }
+        crate::attach::BpfLoopVerdict::Unknown(reason) => {
+            format!("counter modes: {reason}\n")
+        }
+    }
 }
 
 /// `p11scope doctor`: probes, prints the table, returns the exit code.
@@ -1706,11 +1716,14 @@ pub(crate) fn counter_modes_footer(_verdict: &crate::attach::BpfLoopVerdict) -> 
 /// (HIGH-4), so a broken pipe still exits with the verdict code.
 pub fn run(pid: Option<u32>, cgroup: Option<&Path>, extra_strict: bool) -> Result<i32> {
     let checks = probe(pid, cgroup);
-    let (text, code) = if extra_strict {
+    let (mut text, code) = if extra_strict {
         (render_extra_strict(&checks), verdict_extra_strict(&checks))
     } else {
         (render(&checks), verdict(&checks))
     };
+    text.push_str(&counter_modes_footer(
+        &crate::attach::kernel_bpf_loop_probe(),
+    ));
     write_report(&mut std::io::stdout().lock(), &text)?;
     Ok(code)
 }
@@ -3223,7 +3236,7 @@ mod tests {
             ),
             (
                 BpfLoopVerdict::Unknown("test no privilege".into()),
-                "unproven",
+                "test no privilege",
             ),
         ] {
             let line = counter_modes_footer(&verdict);

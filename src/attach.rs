@@ -15,7 +15,9 @@ use aya::programs::tp_btf::BtfTracePointLinkId;
 use aya::programs::uprobe::{UProbeAttachLocation, UProbeAttachPoint, UProbeLinkId, UProbeScope};
 use aya::programs::{BtfTracePoint, RawTracePoint, UProbe};
 use aya::{Btf, Ebpf, EbpfLoader};
-use p11scope_bpf_multi::{BPF_PROG_LOAD, BPF_PROG_TYPE_KPROBE, GroupHalt, attach_group, bisect_attach};
+use p11scope_bpf_multi::{
+    BPF_PROG_LOAD, BPF_PROG_TYPE_KPROBE, GroupHalt, attach_group, bisect_attach,
+};
 use p11scope_ebpf_common::object_wire::{ObjectDescriptorWire, publish_object_descriptors};
 use p11scope_ebpf_common::{
     ARG_NONE, CounterMode, DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES,
@@ -1114,13 +1116,28 @@ pub(crate) enum BpfLoopVerdict {
 /// at slot 9 and the pseudo-func offset reads 9-1-1 = 7, the PC-relative
 /// convention the compiler emits for callbacks (checked against clang-18
 /// BPF output and round-tripped through the disassembler).
-static BPF_LOOP_PROBE_INSNS: [u8; 88] = [0; 88];
+static BPF_LOOP_PROBE_INSNS: [u8; 88] = [
+    0xb7, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, // r1 = 1 (nr_loops)
+    0x18, 0x42, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, // r2 = callback (pseudo func)
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+    0xbf, 0xa3, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // r3 = r10
+    0x07, 0x03, 0x00, 0x00, 0xf8, 0xff, 0xff, 0xff, // r3 += -8 (stack ctx)
+    0xb7, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // r4 = 0 (flags)
+    0x85, 0x00, 0x00, 0x00, 0xb5, 0x00, 0x00, 0x00, // call 181 (bpf_loop)
+    0xb7, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // r0 = 0
+    0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // exit
+    0xb7, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // callback: r0 = 0
+    0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // exit
+];
 
 /// Control load: `r0 = 0; exit`, the same two-instruction shape as the
 /// multi scratch control. Plain kprobe type with no attach type, so it
 /// loads on every kernel back to the 5.15 floor when BPF privilege holds
 /// (the multi scratch's attach type 48 is itself rejected there).
-static BPF_LOOP_CONTROL_INSNS: [u8; 16] = [0; 16];
+static BPF_LOOP_CONTROL_INSNS: [u8; 16] = [
+    0xb7, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+    0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+];
 
 /// Kernel-visible probe names (bpftool inventory). Underscores, not dashes:
 /// the kernel rejects `-` in object names with a logless EINVAL.
@@ -1178,12 +1195,29 @@ const _: () = assert!(BPF_LOOP_CONTROL_NAME.len() < 16);
 /// at the caller, unloading it. No verifier log: the differential verdict
 /// (control vs probe errno) diagnoses the failure, like the scratch
 /// loader's errno-only diagnosis.
-fn bpf_loop_prog_load(_insns: &[u8], _name: &str) -> io::Result<OwnedFd> {
-    // Stub: a synthetic error with no OS code until the real loader lands.
-    Err(io::Error::new(
-        io::ErrorKind::PermissionDenied,
-        "bpf_loop probe loader stub",
-    ))
+fn bpf_loop_prog_load(insns: &[u8], name: &str) -> io::Result<OwnedFd> {
+    let mut attr: BpfLoopProgAttr = unsafe { std::mem::zeroed() };
+    attr.prog_type = BPF_PROG_TYPE_KPROBE;
+    attr.insn_cnt = (insns.len() / 8) as u32;
+    attr.insns = insns.as_ptr() as u64;
+    attr.license = c"GPL".as_ptr() as u64;
+    let bytes = name.as_bytes();
+    attr.prog_name[..bytes.len()].copy_from_slice(bytes);
+    // SAFETY: raw bpf() with a caller-sized attr; exactly what libbpf does.
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            BPF_PROG_LOAD as libc::c_long,
+            std::ptr::addr_of_mut!(attr).cast::<libc::c_void>(),
+            size_of::<BpfLoopProgAttr>(),
+        )
+    };
+    if ret < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        // SAFETY: bpf() returned a fresh owned fd.
+        Ok(unsafe { OwnedFd::from_raw_fd(ret as RawFd) })
+    }
 }
 
 /// Pure differential verdict over the two probe loads, so the EINVAL rule
@@ -1192,19 +1226,39 @@ fn bpf_loop_prog_load(_insns: &[u8], _name: &str) -> io::Result<OwnedFd> {
 /// privilege or the environment, not the kernel, refused); anything
 /// unexpected defers to the real load instead of claiming absence.
 pub(crate) fn classify_bpf_loop_probe(
-    _control: &io::Result<()>,
-    _probe: &io::Result<()>,
+    control: &io::Result<()>,
+    probe: &io::Result<()>,
 ) -> BpfLoopVerdict {
-    // Stub: always unproven until the real classifier lands.
-    BpfLoopVerdict::Unknown("bpf_loop probe classifier stub".into())
+    if probe.is_ok() {
+        return BpfLoopVerdict::Available;
+    }
+    let probe_error = probe.as_ref().unwrap_err();
+    match control {
+        Ok(()) => {
+            if probe_error.raw_os_error() == Some(libc::EINVAL) {
+                BpfLoopVerdict::Unavailable(format!(
+                    "the kernel loads BPF programs but rejects the bpf_loop (helper 181) \
+                     probe ({probe_error}); counter bank objects need Linux 5.17+"
+                ))
+            } else {
+                BpfLoopVerdict::Unknown(format!(
+                    "the bpf_loop (helper 181) probe failed unexpectedly ({probe_error}) \
+                     while the control load succeeded"
+                ))
+            }
+        }
+        Err(control_error) => BpfLoopVerdict::Unknown(format!(
+            "bpf_loop (helper 181) support is unproven (control load: {control_error}; \
+             probe load: {probe_error})"
+        )),
+    }
 }
 
 /// Functional bpf_loop (helper 181) probe: a control no-op load plus a
 /// minimal bpf_loop-calling load. Neither program is ever attached; both
 /// fds drop before return, unloading them.
 pub(crate) fn kernel_bpf_loop_probe() -> BpfLoopVerdict {
-    let control =
-        bpf_loop_prog_load(&BPF_LOOP_CONTROL_INSNS, BPF_LOOP_CONTROL_NAME).map(|_| ());
+    let control = bpf_loop_prog_load(&BPF_LOOP_CONTROL_INSNS, BPF_LOOP_CONTROL_NAME).map(|_| ());
     let probe = bpf_loop_prog_load(&BPF_LOOP_PROBE_INSNS, BPF_LOOP_PROBE_NAME).map(|_| ());
     classify_bpf_loop_probe(&control, &probe)
 }
@@ -17089,7 +17143,10 @@ mod tests {
             );
         }
         assert_eq!(size_of::<BpfLoopProgAttr>(), 152);
-        assert_eq!(std::mem::offset_of!(BpfLoopProgAttr, expected_attach_type), 68);
+        assert_eq!(
+            std::mem::offset_of!(BpfLoopProgAttr, expected_attach_type),
+            68
+        );
         assert_eq!(std::mem::offset_of!(BpfLoopProgAttr, prog_btf_fd), 72);
         // UAPI numbers (linux/bpf.h): PROG_LOAD is 5, KPROBE is 2.
         assert_eq!(BPF_PROG_LOAD, 5);

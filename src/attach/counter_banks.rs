@@ -1426,8 +1426,12 @@ impl<'a> CounterPreparation<'a> {
         // a kernel proven to lack it cannot run counter bank objects, so
         // preparation refuses before charging anything. An unproven probe
         // (no BPF privilege, unexpected errors) defers to the real load.
-        // Stub: the probe verdict is dropped until the refusal lands.
-        let _ = probe();
+        match probe() {
+            BpfLoopVerdict::Available | BpfLoopVerdict::Unknown(_) => {}
+            BpfLoopVerdict::Unavailable(reason) => {
+                anyhow::bail!("counter-mode-unavailable-on-kernel: {reason}")
+            }
+        }
         ensure!(
             env!("P11SCOPE_COUNTER_BANK_PROOF_ENABLED") == "1",
             "private Counts bank artifact was not selected at build time"

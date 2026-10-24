@@ -43,8 +43,20 @@ COUNTER_OWNER_HELPERS = frozenset({
 
 BANK_ROOTS = {"p11_counter_bank_entry": "uprobe", "p11_counter_bank_return": "uretprobe"}
 BANK_GLOBALS = frozenset({"p11_bank_enter", "p11_bank_complete"})
+BANK_TIMED_GLOBALS = frozenset({"p11_bank_enter_timed", "p11_bank_complete_timed"})
 BANK_CONFIG = 0x18000102
 BANK_GROWTH_CONFIG = 0x0200001800100200
+BANK_GROWTH_CONFIGS = {
+    "counts": BANK_GROWTH_CONFIG,
+    "timestamps": 0x0200002800100200,
+    "latency": 0x0200012800100200,
+}
+BANK_PROFILE_MODES = {
+    "counts-bank-proof": "counts",
+    "counts-bank-growth-v2": "counts",
+    "timestamps-bank-growth-v2": "timestamps",
+    "latency-bank-growth-v2": "latency",
+}
 
 
 class BankBtf(MAPS.Btf):
@@ -57,6 +69,10 @@ class BankBtf(MAPS.Btf):
 
     banks = 2
     cells = 1
+    inner_bytes = 24
+    inner_label = "Counts"
+    inner_members = (("entered", 0), ("returned", 64), ("errors", 128))
+    inner_arrays = {}
 
     def map_definition(self, ref):
         node = self.resolve(ref)
@@ -90,23 +106,34 @@ class BankBtf(MAPS.Btf):
             raise RuntimeError("bank values element is not an inner-map pointer")
         inner_ref = pointer[2]
         inner, size = super().map_definition(inner_ref)
-        if inner != MAPS.map_def(6, 4, 24, self.cells) or size != 32:
-            raise RuntimeError("bank inner template differs from its exact Counts profile")
+        if inner != MAPS.map_def(6, 4, self.inner_bytes, self.cells) or size != 32:
+            raise RuntimeError(
+                f"bank inner template differs from its exact {self.inner_label} profile")
         inner_node = self.resolve(inner_ref)
         value_refs = [inner_node[5][i + 1] for i in range(0, len(inner_node[5]), 3)
                       if MAPS.string_at(self.strings, inner_node[5][i]) == "value"]
         if len(value_refs) != 1:
-            raise RuntimeError("bank inner template requires a typed Counts value")
+            raise RuntimeError(f"bank inner template requires a typed {self.inner_label} value")
         value = self.resolve(self.resolve(value_refs[0])[2])
         value_names = [MAPS.string_at(self.strings, item) for item in value[5][::3]]
-        if (value[:1] != (4,) or value[2:5] != (24, 3, 0)
-                or value_names != ["entered", "returned", "errors"]
-                or value[5][2::3] != (0, 64, 128)):
-            raise RuntimeError("bank Counts value fields/layout differ")
-        for ref in value[5][1::3]:
+        want_names = [name for name, _ in self.inner_members]
+        want_offsets = tuple(offset for _, offset in self.inner_members)
+        if (value[:1] != (4,) or value[2:5] != (self.inner_bytes, len(self.inner_members), 0)
+                or value_names != want_names or value[5][2::3] != want_offsets):
+            raise RuntimeError(f"bank {self.inner_label} value fields/layout differ")
+        for name, ref in zip(want_names, value[5][1::3]):
             field = self.resolve(ref)
-            if field[0] != 1 or field[2] != 8 or field[5] != (64,):
-                raise RuntimeError("bank Counts fields must be full-width unsigned u64")
+            if name in self.inner_arrays:
+                count = self.inner_arrays[name]
+                element = self.resolve(field[5][0]) if field[0] == 3 else None
+                if (field[0] != 3 or field[5][2] != count or element is None
+                        or element[0] != 1 or element[2] != 8 or element[5] != (64,)
+                        or self.resolve(field[5][1])[0] != 1):
+                    raise RuntimeError(
+                        f"bank {self.inner_label} buckets must be {count} full-width u64")
+            elif field[0] != 1 or field[2] != 8 or field[5] != (64,):
+                raise RuntimeError(
+                    f"bank {self.inner_label} fields must be full-width unsigned u64")
         return {**MAPS.map_def(13, 4, 4, self.banks, 128), "inner_template": inner}, 32
 
 
@@ -117,13 +144,44 @@ class BankGrowthBtf(BankBtf):
     cells = 512
 
 
-def bank_maps(graph, *, growth=False):
+class BankTimestampsGrowthBtf(BankGrowthBtf):
+    """Explicit format2 timestamps template: 40-byte TimestampStats cells."""
+
+    inner_bytes = 40
+    inner_label = "Timestamps"
+    inner_members = (("entered", 0), ("returned", 64), ("errors", 128),
+                     ("total_ns", 192), ("max_ns", 256))
+
+
+class BankLatencyGrowthBtf(BankGrowthBtf):
+    """Explicit format2 latency template: 296-byte cells with 32 buckets."""
+
+    inner_bytes = 296
+    inner_label = "Latency"
+    inner_members = (("entered", 0), ("returned", 64), ("errors", 128),
+                     ("total_ns", 192), ("max_ns", 256), ("buckets", 320))
+    inner_arrays = {"buckets": 32}
+
+
+def bank_maps(graph, *, growth=False, mode="counts"):
+    if mode not in STATS_BYTES:
+        raise RuntimeError("unknown counter mode")
+    if not growth and mode != "counts":
+        raise RuntimeError("format1 bank proof is counts-only")
     elf = graph.elf
     section = elf.indices["maps"]
     records = [(s[4], s[5], "OBJECT", "", "", str(s[3]), s[0])
                for s in elf.symbols if s[3] == section and s[1] & 15 == 1]
+    if not growth:
+        decoder = BankBtf
+    elif mode == "counts":
+        decoder = BankGrowthBtf
+    elif mode == "timestamps":
+        decoder = BankTimestampsGrowthBtf
+    else:
+        decoder = BankLatencyGrowthBtf
     maps = MAPS.decode_map_definitions(records, section, elf.sections["maps"][1])
-    native = MAPS.decode_btf_maps(elf, decoder_class=BankGrowthBtf if growth else BankBtf)
+    native = MAPS.decode_btf_maps(elf, decoder_class=decoder)
     if maps.keys() & native.keys():
         raise RuntimeError("duplicate bank proof map")
     maps.update(native)
@@ -141,7 +199,8 @@ def bank_maps(graph, *, growth=False):
         if name not in maps or tuple(maps[name][field] for field in
                                     ("type", "key_size", "value_size", "max_entries", "flags")) != fields:
             raise RuntimeError(f"bank proof map shape differs: {name}")
-    if maps["COUNTER_BANKS"].get("inner_template") != MAPS.map_def(6, 4, 24, 512 if growth else 1):
+    if (maps["COUNTER_BANKS"].get("inner_template")
+            != MAPS.map_def(6, 4, STATS_BYTES[mode], 512 if growth else 1)):
         raise RuntimeError("bank proof has no exact typed inner template")
     if growth:
         bank_growth_record_layouts(graph)
@@ -176,10 +235,19 @@ def bank_growth_record_layouts(graph):
                 raise RuntimeError("format2 record field offset/unsigned width differs")
 
 
-def bank_global_abi(graph):
+def bank_global_abi(graph, mode="counts"):
+    if mode == "counts":
+        expected = BANK_GLOBALS
+        shapes = (("p11_bank_enter", (4, 8)), ("p11_bank_complete", (4, 8, 8, 4)))
+    elif mode in ("timestamps", "latency"):
+        expected = BANK_TIMED_GLOBALS
+        shapes = (("p11_bank_enter_timed", (4, 8, 8)),
+                  ("p11_bank_complete_timed", (4, 8, 8, 4, 8)))
+    else:
+        raise RuntimeError("unknown counter mode")
     elf = graph.elf
     helpers = [symbol for symbol in elf.symbols if symbol[0].startswith("p11_bank_")]
-    if len(helpers) != 2 or {symbol[0] for symbol in helpers} != BANK_GLOBALS:
+    if len(helpers) != 2 or {symbol[0] for symbol in helpers} != expected:
         raise RuntimeError("bank proof global inventory differs")
     for _, info, other, section, address, size in helpers:
         if (info != 0x12 or other or section != elf.indices.get(".text")
@@ -188,13 +256,13 @@ def bank_global_abi(graph):
     btf = MAPS.Btf(elf.sections[".BTF"][1])
     bank_functions = [node for node in btf.types[1:]
                       if node[0] == 12 and node[1].startswith("p11_bank_")]
-    if len(bank_functions) != 2 or {node[1] for node in bank_functions} != BANK_GLOBALS:
+    if len(bank_functions) != 2 or {node[1] for node in bank_functions} != expected:
         raise RuntimeError("bank proof BTF global inventory differs")
     all_functions = [node for node in btf.types[1:] if node[0] == 12]
     if any(not node[2] or btf.types[node[2]][0] != 13 or btf.types[node[2]][3] > 5
            for node in all_functions):
         raise RuntimeError("bank proof exceeds the five-register function ABI")
-    for name, widths in (("p11_bank_enter", (4, 8)), ("p11_bank_complete", (4, 8, 8, 4))):
+    for name, widths in shapes:
         functions = [node for node in btf.types[1:] if node[0] == 12 and node[1] == name]
         if len(functions) != 1 or functions[0][3] != 1:
             raise RuntimeError("bank proof global BTF function missing/duplicate")
@@ -239,7 +307,7 @@ def bank_global_abi(graph):
             if not 0 < ident < len(btf.types) or btf.types[ident][0] != 12:
                 raise RuntimeError("bank function info is not a BTF FUNC")
             name = btf.types[ident][1]
-            if name not in BANK_GLOBALS:
+            if name not in expected:
                 continue
             symbol = next(symbol for symbol in helpers if symbol[0] == name)
             relocation = relocations.get(record)
@@ -248,7 +316,7 @@ def bank_global_abi(graph):
                     or relocation[1][1:] != (3, 0, symbol[3], 0, 0)):
                 raise RuntimeError("bank function info/symbol/relocation mismatch")
             found.add(name)
-    if found != BANK_GLOBALS:
+    if found != expected:
         raise RuntimeError("bank global function info is incomplete")
 
 
@@ -1560,9 +1628,12 @@ def bank_guarded_outer_key(graph, key, call_pc, key_offset, touches):
 class BankFootprint(MemoryProof):
     """Existing conservative memory proof with one exact map-of-maps edge."""
 
-    def __init__(self, *arguments, growth=False, **keywords):
+    def __init__(self, *arguments, growth=False, mode="counts", **keywords):
+        if mode not in STATS_BYTES:
+            raise RuntimeError("unknown counter mode")
         super().__init__(*arguments, **keywords)
         self.growth = growth
+        self.mode = mode
         self.bank_key_proofs = {}
 
     @staticmethod
@@ -1607,21 +1678,39 @@ class BankFootprint(MemoryProof):
 
     def touch(self, pointer, offset, width, action, value, key, pc, atomic=None):
         name = pointer[1]
-        if name == "STATS" and action == "write":
-            raise RuntimeError("bank endpoint writes legacy fixed STATS")
+        if name == "STATS":
+            if action == "write":
+                raise RuntimeError("bank endpoint writes legacy fixed STATS")
+            if self.mode != "counts":
+                raise RuntimeError(f"{self.mode} bank root touches legacy fixed STATS")
         if name == "COUNTER_BANKS":
             raise RuntimeError("endpoint dereferences outer map as a value")
         if name == "COUNTER_BANK_VALUE":
             span = pointer[2] + offset, pointer[3] + offset
-            if width != 8 or span[0] != span[1] or span[0] not in (0, 8, 16):
-                raise RuntimeError("bank Counts access is not an exact full-width field")
-            if action == "write" and atomic != 0xf1:
-                raise RuntimeError("bank Counts update is not bounded CAS")
+            if self.mode == "latency":
+                if (width != 8 or span[0] < 0
+                        or (span[1] < 40 and (span[0] != span[1]
+                                             or span[0] not in (0, 8, 16, 24, 32)))
+                        or (span[1] >= 40 and (span[0] < 40 or span[1] > 288))):
+                    raise RuntimeError("bank latency access escapes its bounded cell")
+                if action == "write" and atomic != 0xf1:
+                    raise RuntimeError("bank latency update is not bounded CAS")
+            else:
+                fields = (0, 8, 16) if self.mode == "counts" else (0, 8, 16, 24, 32)
+                label = "Counts" if self.mode == "counts" else "Timestamps"
+                if width != 8 or span[0] != span[1] or span[0] not in fields:
+                    raise RuntimeError(f"bank {label} access is not an exact full-width field")
+                if action == "write" and atomic != 0xf1:
+                    raise RuntimeError(f"bank {label} update is not bounded CAS")
         if (name == "START" and action == "write"
                 and pointer[2] + offset < 8 and pointer[3] + offset + width > 0):
-            if (pointer[2] + offset or pointer[3] + offset or width != 8
-                    or value != ZERO or atomic is not None):
-                raise RuntimeError("Counts START timestamp is not one full zero word")
+            if self.mode == "counts":
+                if (pointer[2] + offset or pointer[3] + offset or width != 8
+                        or value != ZERO or atomic is not None):
+                    raise RuntimeError("Counts START timestamp is not one full zero word")
+            elif (pointer[2] + offset or pointer[3] + offset or width != 8
+                    or atomic is not None or singleton(value) is not None):
+                raise RuntimeError(f"{self.mode} START timestamp is not one full clock word")
         if name == "COUNTER_BANK_FAULT" and action == "write":
             if (width != 8 or pointer[2] + offset or pointer[3] + offset
                     or atomic not in (0x40, 0x41) or not value or value[0] != "scalar"
@@ -2340,56 +2429,191 @@ def bank_growth_scenarios(graph, optional_get, optimized_aggregate):
     return reports, executions
 
 
-def validate_bank_proof(body, *, growth=False):
-    graph = CallGraph(body)
-    maps, expected = bank_maps(graph, growth=growth)
-    if any(name.startswith((".rodata", ".data", ".bss")) for name in graph.elf.sections):
-        raise RuntimeError("bank proof carries global data")
-    validate_counter_owner_helpers(graph.elf)
-    bank_global_abi(graph)
-    owner = native_owner_bound(graph, maps, expected_bound=8192)
-    proof_maps = {**maps, "COUNTER_BANK_VALUE": MAPS.map_def(6, 4, 24, 512 if growth else 1)}
-    roots, frames, seed_sites, bank_keys = {}, dict(owner.frames), set(), {}
-    for name, section in BANK_ROOTS.items():
-        root = graph.root(name, section)
-        reached = graph.reachable(root)
-        names = {graph.bodies[key][0] for key in reached}
-        required = ({"p11_bank_enter", "p11_owner_start_aggregate"} if name.endswith("entry") else
-                    {"p11_bank_complete", "p11_owner_start_get", "p11_owner_start_remove"})
-        if not required <= names:
-            raise RuntimeError("bank proof root loses mandatory START/bridge work")
-        calls = [target for (key, _), (kind, target) in graph.calls.items()
-                 if key in reached and kind == "helper"]
+def bank_require_root_work(names, mode, entry):
+    """Every bank root must reach its bridge plus matched START custody."""
+    if mode == "counts":
+        bridge = ("p11_bank_enter", "p11_bank_complete")
+    elif mode in ("timestamps", "latency"):
+        bridge = ("p11_bank_enter_timed", "p11_bank_complete_timed")
+    else:
+        raise RuntimeError("unknown counter mode")
+    required = ({bridge[0], "p11_owner_start_aggregate"} if entry else
+                {bridge[1], "p11_owner_start_get", "p11_owner_start_remove"})
+    if not required <= set(names):
+        raise RuntimeError("bank proof root loses mandatory START/bridge work")
+
+
+def bank_require_root_helpers(calls, mode):
+    """Counts roots stay clock-free; timing roots each read the clock."""
+    if mode == "counts":
         if any(helper == 5 or helper not in ALLOWED_HELPERS or helper in FORBIDDEN_HELPERS
                for helper in calls):
             raise RuntimeError("Counts bank root reaches clock/semantic/event/unknown helper")
+        return
+    if mode not in ("timestamps", "latency"):
+        raise RuntimeError("unknown counter mode")
+    for helper in calls:
+        if helper in FORBIDDEN_HELPERS or helper not in ALLOWED_HELPERS:
+            raise RuntimeError(f"bank {mode} root reaches forbidden/unknown helper {helper}")
+    if not any(helper == 5 for helper in calls):
+        raise RuntimeError(f"bank {mode} root has no clock read")
+
+
+def bank_required_inner_offsets(mode, entry):
+    if mode == "counts":
+        return (0,) if entry else (8, 16)
+    if mode in ("timestamps", "latency"):
+        return (0,) if entry else (8, 16, 24, 32)
+    raise RuntimeError("unknown counter mode")
+
+
+def bank_require_inner_writes(touches, mode, entry):
+    for offset in bank_required_inner_offsets(mode, entry):
+        if not any(touch[2:5] == ("COUNTER_BANK_VALUE", "write", (offset, offset))
+                   for touch in touches):
+            if mode == "counts":
+                raise RuntimeError("bank proof omits a complete Counts field update")
+            raise RuntimeError(f"bank {mode} proof omits its inner field update at {offset}")
+
+
+def bank_require_bucket_placement(touches, entry):
+    """Latency buckets are return-only histogram memory."""
+    reads = [touch for touch in touches if touch[2:4] == ("COUNTER_BANK_VALUE", "read")
+             and touch[4][1] + touch[5] > 40]
+    writes = [touch for touch in touches if touch[2:4] == ("COUNTER_BANK_VALUE", "write")
+              and touch[4][0] >= 40]
+    if entry:
+        if writes:
+            raise RuntimeError("latency bank entry writes histogram buckets")
+        if reads:
+            raise RuntimeError("latency bank entry reads histogram buckets")
+    elif not writes:
+        raise RuntimeError("latency bank return omits its histogram bucket write")
+
+
+def bank_require_health(health):
+    """Both sticky dispositions must be written; the timing static twin of the
+    counts execution scenarios, which assert the same cells dynamically."""
+    dispositions = {index for _, _, low, high in health for index in range(low, high + 1)}
+    if dispositions != {0, 1}:
+        raise RuntimeError("bank timing root omits a saturated/contended health write")
+
+
+def bank_require_growth_configuration(graph, reached, mode):
+    """The reachable stream must embed exactly its mode word.
+
+    The timing static twin of the counts execution scenarios, which gate on
+    the same word through the commit record. Map loads are relocations, not
+    configuration literals.
+    """
+    if mode not in BANK_GROWTH_CONFIGS:
+        raise RuntimeError("unknown counter mode")
+    wanted = BANK_GROWTH_CONFIGS[mode]
+    seen_wanted, seen_other = False, None
+    for key in reached:
+        for pc, (op, _, _, immediate) in graph.instructions[key].items():
+            if op != 0x18 or graph.map_at(key, pc) is not None:
+                continue
+            high = struct.unpack_from("<I", graph.sections[key[0]][1], key[1] + pc * 8 + 12)[0]
+            word = (high << 32) | (immediate & 0xffffffff)
+            if word == wanted:
+                seen_wanted = True
+            for other_mode, other in BANK_GROWTH_CONFIGS.items():
+                if other_mode != mode and word == other:
+                    seen_other = other_mode
+    if seen_other is not None:
+        raise RuntimeError(
+            f"bank {mode} proof carries another mode's configuration word: {seen_other}")
+    if not seen_wanted:
+        raise RuntimeError(f"bank {mode} proof omits its configuration word")
+
+
+def bank_require_start_read_before_remove(touches, calls, bodies, reached):
+    """Timing return reads CallStart.ts_ns before retiring START.
+
+    Both sites live in the timed completion bridge; a read in another
+    function cannot prove the retired pointer was still live.
+    """
+    removes = [(key, pc) for (key, pc), (kind, target) in calls.items()
+               if key in reached and kind == "function"
+               and bodies.get(target, ("",))[0] == "p11_owner_start_remove"]
+    reads = {(key, pc) for (key, pc, name, action, span, width, _) in touches
+             if key in reached and name == "START" and action == "read"
+             and span == (0, 0) and width == 8}
+    for key, pc in removes:
+        if not any(read_key == key and read_pc < pc for read_key, read_pc in reads):
+            raise RuntimeError("bank timing return retires START before reading its entry timestamp")
+
+
+def validate_bank_proof(body, *, growth=False, mode="counts"):
+    if mode not in STATS_BYTES:
+        raise RuntimeError("unknown counter mode")
+    graph = CallGraph(body)
+    maps, expected = bank_maps(graph, growth=growth, mode=mode)
+    if any(name.startswith((".rodata", ".data", ".bss")) for name in graph.elf.sections):
+        raise RuntimeError("bank proof carries global data")
+    validate_counter_owner_helpers(graph.elf)
+    bank_global_abi(graph, mode)
+    owner = native_owner_bound(graph, maps, expected_bound=8192)
+    proof_maps = {**maps, "COUNTER_BANK_VALUE": MAPS.map_def(
+        6, 4, STATS_BYTES[mode], 512 if growth else 1)}
+    roots, frames, seed_sites, bank_keys = {}, dict(owner.frames), set(), {}
+    reached_union = set()
+    for name, section in BANK_ROOTS.items():
+        root = graph.root(name, section)
+        reached = graph.reachable(root)
+        reached_union |= reached
+        names = {graph.bodies[key][0] for key in reached}
+        entry = name.endswith("entry")
+        bank_require_root_work(names, mode, entry)
+        calls = [target for (key, _), (kind, target) in graph.calls.items()
+                 if key in reached and kind == "helper"]
+        bank_require_root_helpers(calls, mode)
         for key in reached:
             for pc, instruction in graph.instructions[key].items():
                 if (instruction[0] == 0x18
                         and graph.map_at(key, pc) in FORBIDDEN_ENDPOINT_MAPS):
-                    raise RuntimeError("Counts bank root reaches semantic/event storage")
-        proof = BankFootprint(graph, proof_maps, native_bound=8192, growth=growth)
+                    if mode == "counts":
+                        raise RuntimeError("Counts bank root reaches semantic/event storage")
+                    raise RuntimeError(f"{mode} bank root reaches semantic/event storage")
+        proof = BankFootprint(graph, proof_maps, native_bound=8192, growth=growth, mode=mode)
         proof.run(root, [("external", "ctx", 0), None, None, None, None])
         bank_keys.update(proof.bank_key_proofs)
-        if name.endswith("entry"):
+        if entry:
             seed_sites = {touch[:2] for touch in proof.touches
                           if touch[2:6] == ("START", "write", (0, 0), 8)}
             if not seed_sites:
-                raise RuntimeError("Counts bank entry omits its zero START timestamp store")
+                if mode == "counts":
+                    raise RuntimeError("Counts bank entry omits its zero START timestamp store")
+                raise RuntimeError(f"{mode} bank entry omits its clock START timestamp store")
         frames.update({key: max(frames.get(key, 0), depth) for key, depth in proof.frames.items()})
-        required_offsets = (0,) if name.endswith("entry") else (8, 16)
-        for offset in required_offsets:
-            if not any(touch[2:5] == ("COUNTER_BANK_VALUE", "write", (offset, offset))
-                       for touch in proof.touches):
-                raise RuntimeError("bank proof omits a complete Counts field update")
+        bank_require_inner_writes(proof.touches, mode, entry)
+        if mode == "latency":
+            bank_require_bucket_placement(proof.touches, entry)
+        if mode != "counts":
+            bank_require_health(proof.health)
+            if not entry:
+                bank_require_start_read_before_remove(
+                    proof.touches, graph.calls, graph.bodies, reached)
         roots[name] = {"stack_chain": frame_and_chain(graph, root, frames),
-                       "clocks": 0, "semantic_or_event_work": False}
-    optional_get = bank_optional_start_get(graph)
-    optimized_aggregate = bank_erased_second_argument(graph, graph.only("p11_owner_start_aggregate"))
-    controls, executions = (bank_growth_scenarios if growth else bank_scenarios)(
-        graph, optional_get, optimized_aggregate)
+                       "clocks": sum(1 for helper in calls if helper == 5),
+                       "semantic_or_event_work": False}
+    if mode != "counts":
+        bank_require_growth_configuration(graph, reached_union, mode)
+    if growth and mode == "counts":
+        optional_get = bank_optional_start_get(graph)
+        optimized_aggregate = bank_erased_second_argument(
+            graph, graph.only("p11_owner_start_aggregate"))
+        controls, executions = bank_growth_scenarios(graph, optional_get, optimized_aggregate)
+    elif growth:
+        optional_get, executions, controls = None, [], {}
+    else:
+        optional_get = bank_optional_start_get(graph)
+        optimized_aggregate = bank_erased_second_argument(
+            graph, graph.only("p11_owner_start_aggregate"))
+        controls, executions = bank_scenarios(graph, optional_get, optimized_aggregate)
     try:
-        validate(body, "counts")
+        validate(body, mode)
     except RuntimeError:
         pass
     else:
@@ -2401,7 +2625,7 @@ def validate_bank_proof(body, *, growth=False):
               "inner_template": maps["COUNTER_BANKS"]["inner_template"], "roots": roots,
               "controls": controls, "ordinary_counter_profile": "refused"}
     if growth:
-        report["configuration"] = BANK_GROWTH_CONFIG
+        report["configuration"] = BANK_GROWTH_CONFIGS[mode]
     return report, (graph, executions, optional_get, seed_sites, owner, bank_keys)
 
 
@@ -2515,7 +2739,9 @@ def bank_guard_mutants(body, graph, proofs):
     return mutants
 
 
-def bank_causal_mutants(body, *, growth=False):
+def bank_causal_mutants(body, *, growth=False, mode="counts"):
+    if mode != "counts":
+        raise RuntimeError(f"bank {mode} causal mutants need their built object")
     report, (graph, executions, optional_get, seed_sites, owner, bank_keys) = validate_bank_proof(body, growth=growth)
     mutants = {
         "inner_value_width": bank_btf_mutant(body, graph, "COUNTER_BANKS", "value_bytes", 40, inner=True),
@@ -2700,7 +2926,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("object", nargs="?", type=Path)
     parser.add_argument("--mode", choices=tuple(STATS_BYTES))
-    parser.add_argument("--profile", choices=("fixed", "counts-bank-proof", "counts-bank-growth-v2"))
+    parser.add_argument("--profile", choices=("fixed", "counts-bank-proof", "counts-bank-growth-v2",
+                                              "timestamps-bank-growth-v2",
+                                              "latency-bank-growth-v2"))
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--self-test-mutants", action="store_true")
     args = parser.parse_args()
@@ -2709,18 +2937,20 @@ def main():
             parser.error("--self-test accepts no other arguments")
     elif args.object is None or args.mode is None:
         parser.error("object and --mode are required for object checks")
-    if args.profile in ("counts-bank-proof", "counts-bank-growth-v2") and args.mode != "counts":
-        parser.error("bank proof requires counts")
+    if args.profile in BANK_PROFILE_MODES and args.mode != BANK_PROFILE_MODES[args.profile]:
+        parser.error(f"bank proof requires {BANK_PROFILE_MODES[args.profile]}")
     try:
         if args.self_test:
             result = {"schema": "p11scope-counter-transfer-controls/v1",
                       "transfer_controls": transfer_controls()}
         else:
             body = args.object.read_bytes()
-            if args.profile in ("counts-bank-proof", "counts-bank-growth-v2"):
-                growth = args.profile == "counts-bank-growth-v2"
-                result = (bank_causal_mutants(body, growth=growth) if args.self_test_mutants else
-                          validate_bank_proof(body, growth=growth)[0])
+            if args.profile in BANK_PROFILE_MODES:
+                growth = args.profile != "counts-bank-proof"
+                mode = BANK_PROFILE_MODES[args.profile]
+                result = (bank_causal_mutants(body, growth=growth, mode=mode)
+                          if args.self_test_mutants else
+                          validate_bank_proof(body, growth=growth, mode=mode)[0])
             else:
                 result = causal_mutants(body, args.mode) if args.self_test_mutants else validate(body, args.mode)[0]
     except (OSError, RuntimeError, struct.error, ValueError, IndexError, KeyError) as error:

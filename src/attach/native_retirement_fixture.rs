@@ -673,10 +673,16 @@ pub(super) fn exported_owner_case() -> ExportedOwnerCase {
             .len(),
         2
     );
+    assert!(
+        elf.exports_matching(&["C_GetFunctionList"])
+            .unwrap()
+            .is_empty()
+    );
     use std::os::unix::fs::MetadataExt as _;
     let metadata = file.metadata().unwrap();
     use p11scope_manifest::manifest::{
-        Acquisition, Manifest, ObjectRecord, ProvenanceObject, SCHEMA,
+        Acquisition, Manifest, ObjectRecord, ProvenanceObject, SCHEMA, SurfaceRecord,
+        SurfaceSource, WalkOutcome,
     };
     let manifest = Manifest {
         schema: SCHEMA.into(),
@@ -694,7 +700,15 @@ pub(super) fn exported_owner_case() -> ExportedOwnerCase {
             identity: inspected.identity,
         }],
         interface_list: Acquisition::Absent,
-        surfaces: Vec::new(),
+        // This fixture exports only the two named function bodies. Record
+        // the required legacy acquisition honestly; no table was acquired.
+        surfaces: vec![SurfaceRecord {
+            source: SurfaceSource::LegacyFunctionList,
+            acquisition: Acquisition::Absent,
+            version: None,
+            walk: WalkOutcome::NotWalked,
+            functions: Vec::new(),
+        }],
         vendor_interfaces: Vec::new(),
         alias_groups: Vec::new(),
         selection_evidence: Default::default(),

@@ -12,6 +12,8 @@ args = sys.argv[1:]
 control = json.loads(Path(os.environ["BPF_FIXTURE_CONTROL"]).read_text())
 cwd = Path.cwd()
 record = {"tool": tool, "argv": args, "cwd": str(cwd)}
+record["executable"] = str(Path(sys.argv[0]).absolute())
+record["rustc"] = os.environ.get("RUSTC")
 if tool == "cargo" and "fetch" in args:
     record["offline"] = os.environ.get("CARGO_NET_OFFLINE")
 
@@ -20,6 +22,8 @@ if tool == "cargo" and "build" in args:
     record["offline"] = os.environ.get("CARGO_NET_OFFLINE")
     home = Path(os.environ["CARGO_HOME"])
     record["home_fresh"] = not (home / "fixture-build-marker").exists()
+    record["target"] = os.environ.get("CARGO_TARGET_DIR")
+    record["build_dir"] = os.environ.get("CARGO_BUILD_BUILD_DIR")
     record["config"] = (home / "config.toml").read_text() if (home / "config.toml").exists() else None
     record["inherited_overrides"] = {key: os.environ[key] for key in (
         "RUSTFLAGS", "RUSTC_WRAPPER", "CARGO_PROFILE_RELEASE_DEBUG", "CFLAGS",
@@ -30,7 +34,9 @@ with Path(os.environ["BPF_FIXTURE_LOG"]).open("a") as log:
 
 if tool == "rustup":
     if args[:1] == ["which"]:
-        print(Path(control.get("toolchain_dir", Path(sys.argv[0]).parent)) / args[-1])
+        directory = control.get("toolchain_dirs", {}).get(
+            args[-2], control.get("toolchain_dir", Path(sys.argv[0]).parent))
+        print(Path(directory) / args[-1])
     elif args == ["--help"]:
         help_text = control.get("rustup_help", "rustup 1.29.1 (d95a37b6a 2026-08-13)\n\nThe Rust toolchain installer\n\nUsage: rustup [OPTIONS] [COMMAND]\n")
         if control.get("change_rustup_version") and (cwd / "build-already-ran").exists():
@@ -116,13 +122,13 @@ elif tool == "cargo" and "build" in args:
     if control.get("change_source"):
         (cwd / "object-source").write_text("changed during build")
     if control.get("change_tool"):
-        with (Path(sys.argv[0]).parent / "clang-18").open("a") as changed:
+        with (Path(control.get("dispatcher", sys.argv[0])).parent / "clang-18").open("a") as changed:
             changed.write("\n# controlled tool replacement\n")
     if control.get("change_dispatcher"):
-        with Path(sys.argv[0]).open("a") as changed:
+        with Path(control.get("dispatcher", sys.argv[0])).open("a") as changed:
             changed.write("\n# controlled Cargo dispatcher replacement\n")
     if control.get("change_rustup_content"):
-        with (Path(sys.argv[0]).parent / "rustup").open("a") as changed:
+        with (Path(control.get("dispatcher", sys.argv[0])).parent / "rustup").open("a") as changed:
             changed.write("\n# controlled rustup replacement\n")
     if control.get("change_config"):
         (home / "config.toml").write_text("[net]\noffline = false\n")
@@ -148,8 +154,13 @@ elif tool == "rustc":
                 changed.write("\n# source changed between snapshots\n")
         print(sysroot)
     else:
-        print("rustc 1.98.1\nhost: x86_64-unknown-linux-gnu")
+        release = "1.99.1" if Path(sys.argv[0]).parent.name == "1.99.1" else "1.98.1"
+        commit = ("58cf8f9c35b355199727627d07ae34a4e2846d67" if release == "1.99.1"
+                  else "48a229ceaefd4985c50990b14116b6d856af0985")
+        metadata = f"rustc {release}\nrelease: {release}\ncommit-hash: {commit}\nhost: x86_64-unknown-linux-gnu"
+        print(control.get("host_metadata", {}).get(release, metadata))
 elif tool == "cargo":
-    print("cargo 1.98.1")
+    release = "1.99.1" if Path(sys.argv[0]).parent.name == "1.99.1" else "1.98.1"
+    print(f"cargo {release}")
 else:
     print("Ubuntu clang version 18.1.8")

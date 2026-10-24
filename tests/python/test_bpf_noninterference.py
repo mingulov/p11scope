@@ -308,6 +308,8 @@ class BuildDriverTests(unittest.TestCase):
         (self.repo / "crates/ebpf/Cargo.lock").write_text("bpf lock\n", encoding="utf-8")
         (self.repo / "crates/ebpf/Cargo.toml").write_text("bpf manifest\n", encoding="utf-8")
         (self.repo / ".release-rust-version").write_text("1.98.1\n", encoding="utf-8")
+        (self.repo / "build_support").mkdir()
+        self.write_compiler_guard("1.98.1", "48a229ceaefd4985c50990b14116b6d856af0985")
         (self.repo / "object-source").write_text("unchanged", encoding="utf-8")
         self.git("init", "-q")
         self.git("add", ".")
@@ -327,17 +329,50 @@ class BuildDriverTests(unittest.TestCase):
 
     def configure(self, **values):
         values.setdefault("sysroot", str(self.sysroot))
+        values.setdefault("dispatcher", str(self.bin / "cargo"))
         self.control.write_text(json.dumps(values), encoding="utf-8")
 
-    def invoke(self, repeat=False, work=None, payloads=(), script=None):
+    def write_compiler_guard(self, release, commit):
+        (self.repo / "build_support/semantic_rustc.rs").write_text(
+            f'pub const RELEASE: &str = "{release}";\n'
+            f'pub const COMMIT: &str = "{commit}";\n', encoding="utf-8")
+
+    def transition_candidate(self):
+        (self.repo / ".release-rust-version").write_text("1.99.1\n", encoding="utf-8")
+        self.write_compiler_guard("1.99.1", "58cf8f9c35b355199727627d07ae34a4e2846d67")
+        self.git("add", ".")
+        self.candidate = self.commit("candidate host compiler transition")
+        directories = {}
+        for channel in ("1.98.1", "1.99.1", "nightly-2026-05-20"):
+            directory = self.root / "toolchains" / channel
+            directory.mkdir(parents=True)
+            for tool in ("cargo", "rustc"):
+                shutil.copy2(self.bin / tool, directory / tool)
+            directories[channel] = str(directory)
+        self.configure(toolchain_dirs=directories)
+
+    def invoke(self, repeat=False, work=None, payloads=(), script=None,
+               transition=False, fixture_baseline=False):
         self.work = work or self.root / "work"
         command = [sys.executable, "-I", str(script or SCRIPT), "--repo", str(self.repo),
                    "--baseline", self.baseline, "--candidate", self.baseline if repeat else self.candidate,
                    "--work", str(self.work)]
         if repeat:
             command.append("--repeat-baseline")
+        if transition:
+            command.append("--host-compiler-transition")
         for flag, payload in zip(("--baseline-offline-payload", "--candidate-offline-payload"), payloads):
             command += [flag, str(payload)]
+        if fixture_baseline:
+            # The tiny real Git fixture cannot have the historical product's
+            # SHA. Patch only that reviewed selector, retaining the actual
+            # driver's acquisition, metadata validation, builds and comparison.
+            body = (f"import sys; from pathlib import Path; sys.path.insert(0, {str(ROOT / 'scripts')!r}); "
+                    "from _loader import load_path; "
+                    f"driver=load_path(Path({str(script or SCRIPT)!r})); "
+                    f"driver.HOST_TRANSITION_BASELINE={self.baseline!r}; "
+                    f"sys.argv={command[2:]!r}; raise SystemExit(driver.main())")
+            command = [sys.executable, "-I", "-c", body]
         return subprocess.run(command, env=self.environment, text=True, capture_output=True, timeout=30)
 
     def payload_fixture(self):
@@ -399,7 +434,7 @@ class BuildDriverTests(unittest.TestCase):
         self.assertEqual(rustup_calls.count(["--help"]), 4)
         self.assertNotIn(["--version"], rustup_calls)
 
-    def test_fresh_snapshots_use_equal_paths_and_keep_distinct_evidence(self):
+    def test_fresh_snapshots_use_distinct_targets_and_keep_distinct_evidence(self):
         result = self.invoke()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assert_rustup_identity_probes()
@@ -410,7 +445,9 @@ class BuildDriverTests(unittest.TestCase):
         self.assertEqual(receipt["matched_objects"], list(NAMES))
         builds = [call for call in self.calls() if call["tool"] == "cargo" and "build" in call["argv"]]
         self.assertEqual(len(builds), 2)
-        self.assertEqual(builds[0]["cwd"], builds[1]["cwd"])
+        self.assertNotEqual(builds[0]["cwd"], builds[1]["cwd"])
+        self.assertNotEqual(builds[0]["target"], builds[1]["target"])
+        self.assertNotEqual(builds[0]["build_dir"], builds[1]["build_dir"])
         for call in builds:
             self.assertTrue(call["fresh"], "the source/build scratch was reused")
             self.assertTrue(call["home_fresh"], "the private Cargo home was reused")
@@ -427,6 +464,101 @@ class BuildDriverTests(unittest.TestCase):
         result = self.invoke(repeat=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(json.loads((self.work / "comparison.json").read_text())["mode"], "repeat-baseline")
+
+    def test_host_compiler_transition_selects_exact_tools_and_preserves_shared_universe(self):
+        self.transition_candidate()
+        result = self.invoke(transition=True, fixture_baseline=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        receipt = json.loads((self.work / "comparison.json").read_text())
+        self.assertEqual(receipt["mode"], "host-compiler-transition")
+        self.assertEqual(receipt["host_compilers"]["baseline"]["release"], "1.98.1")
+        self.assertEqual(receipt["host_compilers"]["baseline"]["commit"],
+                         "48a229ceaefd4985c50990b14116b6d856af0985")
+        self.assertEqual(receipt["host_compilers"]["candidate"]["release"], "1.99.1")
+        self.assertEqual(receipt["host_compilers"]["candidate"]["commit"],
+                         "58cf8f9c35b355199727627d07ae34a4e2846d67")
+        snapshots = [json.loads((self.work / side / "snapshot.json").read_text())
+                     for side in ("baseline", "candidate")]
+        self.assertEqual(snapshots[0]["tools"], snapshots[1]["tools"])
+        self.assertEqual(snapshots[0]["nightly_source"], snapshots[1]["nightly_source"])
+        for snapshot, release in zip(snapshots, ("1.98.1", "1.99.1")):
+            self.assertEqual(snapshot["host_compiler"]["release"], release)
+            for channel in ("1.98.1", "1.99.1", "nightly-2026-05-20"):
+                for tool in ("cargo", "rustc"):
+                    self.assertIn(channel + "-" + tool, snapshot["tools"])
+        builds = [call for call in self.calls() if call["tool"] == "cargo" and "build" in call["argv"]]
+        self.assertEqual(len(builds), 2)
+        for build, snapshot in zip(builds, snapshots):
+            host = snapshot["host_compiler"]
+            self.assertEqual(build["executable"], host["cargo"]["path"])
+            self.assertEqual(build["rustc"], host["rustc"]["path"])
+            self.assertTrue(build["fresh"])
+            self.assertTrue(build["home_fresh"])
+        self.assertNotEqual(builds[0]["target"], builds[1]["target"])
+        self.assertIn("host compiler transition", result.stdout)
+        self.assertEqual(receipt["matched_objects"], list(NAMES))
+
+    def test_host_compiler_transition_requires_opt_in_and_exact_real_baseline(self):
+        self.transition_candidate()
+        result = self.invoke()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("release Rust compiler", result.stderr)
+        result = self.invoke(transition=True, work=self.root / "wrong-baseline")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("reviewed historical baseline", result.stderr)
+        self.assertFalse((self.work / "comparison.json").exists())
+
+    def test_host_compiler_transition_cannot_relabel_repeat_control(self):
+        self.transition_candidate()
+        result = self.invoke(repeat=True, transition=True, fixture_baseline=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("repeat-baseline", result.stderr)
+        self.assertFalse((self.work / "comparison.json").exists())
+
+    def test_selected_host_compiler_commit_is_validated_before_acquisition(self):
+        self.configure(host_metadata={"1.98.1":
+            "rustc 1.98.1\nrelease: 1.98.1\ncommit-hash: wrong\nhost: x86_64-unknown-linux-gnu"})
+        result = self.invoke()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("host compiler metadata", result.stderr)
+        self.assertFalse(any(call["tool"] == "cargo" and ("fetch" in call["argv"] or "build" in call["argv"])
+                             for call in self.calls()))
+
+    def test_host_compiler_transition_rejects_unreviewed_pin_or_guard(self):
+        self.transition_candidate()
+        for index, (release, guard_release, commit) in enumerate((
+                ("1.98.1", "1.98.1", "48a229ceaefd4985c50990b14116b6d856af0985"),
+                ("1.100.0", "1.100.0", "58cf8f9c35b355199727627d07ae34a4e2846d67"),
+                ("1.99.1", "1.98.1", "48a229ceaefd4985c50990b14116b6d856af0985"),
+                ("1.99.1", "1.99.1", "wrong"))):
+            with self.subTest(release=release, guard_release=guard_release, commit=commit):
+                (self.repo / ".release-rust-version").write_text(release + "\n")
+                self.write_compiler_guard(guard_release, commit)
+                self.git("add", ".")
+                self.candidate = self.commit("unreviewed compiler " + str(index))
+                result = self.invoke(transition=True, fixture_baseline=True,
+                                     work=self.root / ("unreviewed-" + str(index)))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("compiler", result.stderr)
+                self.assertFalse((self.work / "comparison.json").exists())
+
+    def test_host_compiler_transition_still_rejects_shared_tool_and_object_drift(self):
+        self.transition_candidate()
+        (self.repo / "object-source").write_text("real fixture source change")
+        self.git("add", ".")
+        self.candidate = self.commit("changed object producer source")
+        clang = self.bin / "clang-18"
+        original = clang.read_bytes()
+        for index, control in enumerate(({"change_tool": True}, {"mutate_flavor": NAMES[0]})):
+            with self.subTest(control=control):
+                clang.write_bytes(original)
+                configuration = json.loads(self.control.read_text())
+                self.configure(toolchain_dirs=configuration["toolchain_dirs"], **control)
+                result = self.invoke(transition=True, fixture_baseline=True,
+                                     work=self.root / ("transition-drift-" + str(index)))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("tool identity" if index == 0 else NAMES[0], result.stderr)
+                self.assertFalse((self.work / "comparison.json").exists())
 
     def test_invalid_rustup_help_banner_fails_before_acquisition(self):
         for index, help_text in enumerate((

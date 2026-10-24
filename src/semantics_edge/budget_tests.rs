@@ -9,22 +9,40 @@ mod semantic_rustc;
 
 #[test]
 fn native_semantic_resource_compiler_metadata_guard() {
-    let valid = format!(
-        "rustc1.98.1\nrelease: {}\ncommit-hash: {}\nhost: x86_64-unknown-linux-gnu\n",
-        semantic_rustc::RELEASE,
-        semantic_rustc::COMMIT
-    );
-    assert!(semantic_rustc::validate_metadata(&valid).is_ok());
+    // Actual release metadata is independent of the guard's constants: a
+    // stale compiler proof must reject this positive instead of validating
+    // a fixture assembled from its own stale release and commit.
+    let valid = "rustc 1.99.1 (58cf8f9c3 2026-10-13)\n\
+binary: rustc\n\
+commit-hash: 58cf8f9c35b355199727627d07ae34a4e2846d67\n\
+commit-date: 2026-10-13\n\
+host: x86_64-unknown-linux-gnu\n\
+release: 1.99.1\n\
+LLVM version: 23.1.1\n";
+    assert!(semantic_rustc::validate_metadata(valid).is_ok());
+    for release in ["1.98.1", "1.99.0", "1.100.0"] {
+        assert!(
+            semantic_rustc::validate_metadata(
+                &valid.replace("release: 1.99.1", &format!("release: {release}"))
+            )
+            .is_err(),
+            "unvalidated release {release} must refuse"
+        );
+    }
     assert!(
-        semantic_rustc::validate_metadata(&valid.replace("release: 1.98.1", "release: 1.99.0"))
-            .is_err()
+        semantic_rustc::validate_metadata(
+            &valid.replace("58cf8f9c35b355199727627d07ae34a4e2846d67", "wrong-commit")
+        )
+        .is_err()
     );
-    assert!(
-        semantic_rustc::validate_metadata(&valid.replace(semantic_rustc::COMMIT, "wrong-commit"))
-            .is_err()
-    );
-    assert!(semantic_rustc::validate_metadata("rustc1.98.1\nrelease: 1.98.1\n").is_err());
-    assert!(semantic_rustc::validate_metadata(&(valid + "release: 1.98.1\n")).is_err());
+    assert!(semantic_rustc::validate_metadata("rustc 1.99.1\nrelease: 1.99.1\n").is_err());
+    for duplicate in [
+        "release: 1.99.1\n",
+        "commit-hash: 58cf8f9c35b355199727627d07ae34a4e2846d67\n",
+        "host: x86_64-unknown-linux-gnu\n",
+    ] {
+        assert!(semantic_rustc::validate_metadata(&format!("{valid}{duplicate}")).is_err());
+    }
 }
 
 fn direct_charge(name: &str) -> usize {

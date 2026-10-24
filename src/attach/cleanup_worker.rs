@@ -630,6 +630,9 @@ pub(crate) struct CleanupWorker {
     clock: BoxClock,
     handle: Option<std::thread::JoinHandle<()>>,
     start_error: Option<String>,
+    // Latched by the first try_join. Later submissions are refused with
+    // their original owners; only the join receipt settles the worker.
+    shutdown_sent: bool,
     // A failed submission remains owned. Never close its potentially blocking
     // native handles on the foreground thread, including on second SIGINT.
     unsubmitted: Mutex<Vec<SubmissionFailure>>,
@@ -690,6 +693,7 @@ impl CleanupWorker {
             clock,
             handle,
             start_error,
+            shutdown_sent: false,
             unsubmitted: Mutex::new(Vec::new()),
         }
     }
@@ -1034,6 +1038,14 @@ impl CleanupWorker {
         }
         let state = self.state.lock().unwrap();
         state.retained_pending == 0 && state.released.saturating_add(state.uncertain) >= state.total
+    }
+
+    /// Non-blocking reap: the first call records the shutdown
+    /// request, then this reports pending until the worker thread has
+    /// actually finished. Skeleton for the §8.1 tests: always pending.
+    pub(crate) fn try_join(&mut self) -> Option<CleanupReceipt> {
+        let _ = self.shutdown_sent;
+        None
     }
 
     /// Reaps the worker thread and reports what settled. The receipt
@@ -1784,6 +1796,190 @@ mod tests {
         gate_tx.send(()).unwrap();
         let receipt = worker.join();
         assert!(receipt.completed);
+    }
+
+    /// While the worker thread is still closing, try_join reports
+    /// pending and keeps the SAME worker: same thread, still running.
+    /// The first call already sent Shutdown: after the gate opens the
+    /// thread exits on its own and try_join returns the receipt.
+    #[test]
+    fn try_join_pending_keeps_worker() {
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+        let mut worker = CleanupWorker::pre_start_with(
+            legacy_test_closer(Box::new(move |_link, role| {
+                if role == ProducerProgram::UProbe("p11_return") {
+                    let _ = gate_rx.recv();
+                }
+                Ok(())
+            })),
+            scripted_clock(Arc::new(Mutex::new(Duration::ZERO))),
+        );
+        let before = worker.handle.as_ref().map(|handle| handle.thread().id());
+        assert!(before.is_some(), "the worker thread is prestarted");
+        worker.submit(
+            vec![
+                multi(ProducerProgram::UProbe("p11_entry")),
+                multi(ProducerProgram::UProbe("p11_return")),
+            ],
+            Arc::default(),
+            DetachOrder,
+        );
+        for _ in 0..1000 {
+            if worker.progress().attempted == 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(worker.progress().attempted, 2);
+        assert!(
+            worker.try_join().is_none(),
+            "a started-but-unsettled last close keeps the worker pending"
+        );
+        assert_eq!(
+            worker.handle.as_ref().map(|handle| handle.thread().id()),
+            before,
+            "a pending try_join keeps the original worker thread"
+        );
+        assert!(worker.running());
+        gate_tx.send(()).unwrap();
+        for _ in 0..2000 {
+            if worker
+                .handle
+                .as_ref()
+                .is_some_and(|handle| handle.is_finished())
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            worker
+                .handle
+                .as_ref()
+                .is_some_and(|handle| handle.is_finished()),
+            "the first try_join sent Shutdown: the thread exits without join"
+        );
+        let receipt = worker
+            .try_join()
+            .expect("try_join joins once the worker thread has exited");
+        assert!(receipt.completed);
+        assert_eq!(
+            (receipt.released, receipt.total, receipt.uncertain),
+            (2, 2, 0)
+        );
+    }
+
+    /// Once the worker thread has exited, try_join reaps it exactly
+    /// once and returns the join receipt.
+    #[test]
+    fn try_join_joins_once_after_exit() {
+        let mut worker = CleanupWorker::pre_start_with(
+            legacy_test_closer(Box::new(|_link, _role| Ok(()))),
+            scripted_clock(Arc::new(Mutex::new(Duration::ZERO))),
+        );
+        worker.submit(
+            vec![multi(ProducerProgram::UProbe("p11_entry"))],
+            Arc::default(),
+            DetachOrder,
+        );
+        let mut receipt = None;
+        for _ in 0..2000 {
+            receipt = worker.try_join();
+            if receipt.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let receipt = receipt.expect("try_join joins once the worker exits");
+        assert!(receipt.completed);
+        assert_eq!(
+            (receipt.released, receipt.total, receipt.uncertain),
+            (1, 1, 0)
+        );
+        assert!(
+            worker.handle.is_none(),
+            "the worker thread is reaped exactly once"
+        );
+        assert!(worker.original_thread_id().is_none());
+    }
+
+    /// After try_join asked the worker to exit, every submit path
+    /// refuses and returns the original links, leases and retention.
+    #[test]
+    fn try_join_refuses_later_submit_and_returns_ownership() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+
+        let mut worker = CleanupWorker::pre_start_with(
+            legacy_test_closer(Box::new(|_link, _role| Ok(()))),
+            scripted_clock(Arc::new(Mutex::new(Duration::ZERO))),
+        );
+        let live = worker
+            .submit_live(
+                vec![multi(ProducerProgram::UProbe("p11_entry"))],
+                Arc::default(),
+                DetachOrder,
+            )
+            .expect("a live submission before shutdown is accepted");
+        let _ = worker.try_join();
+        assert!(worker.shutdown_sent, "try_join latches the shutdown");
+        let failure = worker
+            .submit_live(
+                vec![multi(ProducerProgram::UProbe("p11_return"))],
+                Arc::default(),
+                DetachOrder,
+            )
+            .expect_err("submit_live after try_join is refused");
+        assert_eq!(
+            failure.links.len(),
+            1,
+            "the refused live links keep their owner"
+        );
+        assert!(!failure.message.is_empty());
+        let total_before = worker.progress().total;
+        worker.submit(
+            vec![multi(ProducerProgram::UProbe("p11_return"))],
+            Arc::default(),
+            DetachOrder,
+        );
+        assert_eq!(
+            worker.progress().total,
+            total_before,
+            "a refused terminal submit never enters accounting"
+        );
+        assert_eq!(
+            worker.unsubmitted.lock().unwrap().len(),
+            1,
+            "submit retains its refused failure"
+        );
+        let pool = SemanticResourcePool::reference_limit(1024 * 1024);
+        let reserve = pool.reserver();
+        let bytes = collected_allocation_charge(1, 1).unwrap();
+        let retention = CollectedCleanupRetention::new(reserve.reserve(bytes).unwrap(), 1);
+        let collected = worker
+            .submit_collected(
+                vec![multi(ProducerProgram::UProbe("p11_entry"))],
+                Arc::default(),
+                Arc::clone(&retention),
+            )
+            .expect_err("submit_collected after try_join is refused");
+        assert_eq!(
+            collected.links.len(),
+            1,
+            "the refused collected links keep their owner"
+        );
+        let release = worker
+            .submit_collected_release(Arc::clone(&retention))
+            .expect_err("submit_collected_release after try_join is refused");
+        assert!(
+            !release.message.is_empty(),
+            "the refused release keeps its retention: {release:?}"
+        );
+        drop(live);
+        let receipt = worker.join();
+        assert!(
+            !receipt.completed,
+            "refused submissions stay disclosed: {receipt:?}"
+        );
     }
 
     /// M1: a completed cleanup prints N/N. The last close sleeps past the

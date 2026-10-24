@@ -62,6 +62,38 @@ fn parse(data: &[u8]) -> Result<object::File<'_>, String> {
     classified_object(data).map(|(object, _)| object)
 }
 
+/// Segment-range validation shared by the snapshot and demand-paged paths:
+/// every segment's virtual range must not overflow `u64`, and every file
+/// range must lie within the `data_len` bytes actually present. Returns the
+/// executable file ranges for the snapshot's attachability index. Both
+/// query paths refuse corrupt headers here, before any address translation.
+fn validated_segment_ranges(
+    object: &object::File<'_>,
+    data_len: u64,
+) -> Result<Vec<(u64, u64)>, String> {
+    let mut executable_ranges = Vec::new();
+    for segment in object.segments() {
+        segment
+            .address()
+            .checked_add(segment.size())
+            .ok_or_else(|| "segment virtual-address range overflows u64".to_string())?;
+        let file_range = {
+            let (start, size) = segment.file_range();
+            let end = start
+                .checked_add(size)
+                .ok_or_else(|| "segment file range overflows u64".to_string())?;
+            if end > data_len {
+                return Err("segment file range extends past the ELF bytes".into());
+            }
+            (start, end)
+        };
+        if segment.permissions().executable() {
+            executable_ranges.push(file_range);
+        }
+    }
+    Ok(executable_ranges)
+}
+
 fn file_offset(object: &object::File<'_>, address: u64) -> Option<u64> {
     object.segments().find_map(|segment| {
         let start = segment.address();
@@ -164,27 +196,7 @@ impl ElfSnapshot {
     fn from_data(data: Vec<u8>) -> Result<Self, String> {
         let (object, abi) = classified_object(&data)?;
         let interpreter = interpreter(&object)?;
-        let mut executable_ranges = Vec::new();
-        let data_len = data.len() as u64;
-        for segment in object.segments() {
-            segment
-                .address()
-                .checked_add(segment.size())
-                .ok_or_else(|| "segment virtual-address range overflows u64".to_string())?;
-            let file_range = {
-                let (start, size) = segment.file_range();
-                let end = start
-                    .checked_add(size)
-                    .ok_or_else(|| "segment file range overflows u64".to_string())?;
-                if end > data_len {
-                    return Err("segment file range extends past the ELF bytes".into());
-                }
-                (start, end)
-            };
-            if segment.permissions().executable() {
-                executable_ranges.push(file_range);
-            }
-        }
+        let executable_ranges = validated_segment_ranges(&object, data.len() as u64)?;
 
         Ok(Self {
             data,
@@ -349,6 +361,9 @@ fn export_facts_from_mmap(
     wanted: &[&str],
 ) -> Result<(ElfAbi, Vec<(String, u64)>, u64 /* charged_bytes */), String> {
     let (object, abi) = classified_object(mmap)?;
+    // The same segment-range validation the snapshot applies: without it,
+    // `file_offset` translates through corrupt headers to offsets past EOF.
+    validated_segment_ranges(&object, mmap.len() as u64)?;
     let exports = exports_matching_in_object(&object, wanted);
     Ok((abi, exports, export_table_bytes(&object, mmap.len() as u64)))
 }

@@ -783,6 +783,19 @@ impl CleanupWorker {
                 Some(retention),
             ));
         }
+        if self.shutdown_sent {
+            let message =
+                "cleanup worker is shutting down; submission refused with ownership retained"
+                    .to_string();
+            self.note_transfer_failed(links.len());
+            self.note_failure(message.clone());
+            return Err(SubmissionFailure::new(
+                message,
+                links,
+                leases,
+                Some(retention),
+            ));
+        }
         if let Err(message) = self.collected_admission() {
             self.note_transfer_failed(links.len());
             self.note_failure(message.clone());
@@ -819,6 +832,18 @@ impl CleanupWorker {
         retention: Arc<CollectedCleanupRetention>,
     ) -> Result<BatchTicket, SubmissionFailure> {
         let leases = Arc::new(Vec::new());
+        if self.shutdown_sent {
+            let message =
+                "cleanup worker is shutting down; retained release refused with ownership retained"
+                    .to_string();
+            self.note_failure(message.clone());
+            return Err(SubmissionFailure::new(
+                message,
+                Vec::new(),
+                leases,
+                Some(retention),
+            ));
+        }
         if let Err(message) = self.collected_admission() {
             self.note_failure(message.clone());
             return Err(SubmissionFailure::new(
@@ -883,6 +908,14 @@ impl CleanupWorker {
         order: DetachOrder,
         retention: Option<Arc<CollectedCleanupRetention>>,
     ) -> Result<BatchTicket, SubmissionFailure> {
+        if self.shutdown_sent {
+            let message =
+                "cleanup worker is shutting down; submission refused with ownership retained"
+                    .to_string();
+            self.note_transfer_failed(links.len());
+            self.note_failure(message.clone());
+            return Err(SubmissionFailure::new(message, links, leases, retention));
+        }
         links.sort_by_key(|(_, producer)| order.rank(producer));
         let mut state = self.state.lock().unwrap();
         if let Some(total) = state.total.checked_add(links.len()) {
@@ -1040,12 +1073,24 @@ impl CleanupWorker {
         state.retained_pending == 0 && state.released.saturating_add(state.uncertain) >= state.total
     }
 
-    /// Non-blocking reap: the first call records the shutdown
-    /// request, then this reports pending until the worker thread has
-    /// actually finished. Skeleton for the §8.1 tests: always pending.
+    /// Non-blocking reap: the first call starts terminal elapsed
+    /// time and asks the worker to exit, then this reports pending
+    /// until the worker thread has actually finished. Completion is
+    /// decided only by the reaped thread, never by `is_done`.
     pub(crate) fn try_join(&mut self) -> Option<CleanupReceipt> {
-        let _ = self.shutdown_sent;
-        None
+        if !self.shutdown_sent {
+            self.shutdown_sent = true;
+            self.begin_terminal();
+            let _ = self.tx.send(Command::Shutdown);
+        }
+        if self
+            .handle
+            .as_ref()
+            .is_some_and(|handle| !handle.is_finished())
+        {
+            return None;
+        }
+        Some(self.join())
     }
 
     /// Reaps the worker thread and reports what settled. The receipt
@@ -1951,7 +1996,7 @@ mod tests {
             1,
             "submit retains its refused failure"
         );
-        let pool = SemanticResourcePool::reference_limit(1024 * 1024);
+        let pool = SemanticResourcePool::reference_limit(4 * 1024 * 1024);
         let reserve = pool.reserver();
         let bytes = collected_allocation_charge(1, 1).unwrap();
         let retention = CollectedCleanupRetention::new(reserve.reserve(bytes).unwrap(), 1);

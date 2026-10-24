@@ -2645,6 +2645,24 @@ static void bank_timing_ts_before_remove(void)
     assert(bank_cell(513)->max_ns == 1500);
     assert(bank_fault_cell == 0);
     assert(!bank_health_cells[0] && !bank_health_cells[1]);
+    /* Full-bound extent: 7680..8192 routes slot 8191 to bank 15, cell 511.
+     * The extent end touches 8192 exactly, so a route that rejects
+     * end == 8192 fails here. */
+    reset(); object_setup();
+    scrub_start_on_delete = 1;
+    bank_publish_route(8191, 3, 7680, 8192);
+    assert(!p11_bank_enter_timed(8191, pid_tgid(), 2000));
+    key = start_key(8191);
+    assert(p11_owner_start_get(&key, 1));
+    assert(bank_cell(8191)->entered == 1);
+    assert(!p11_bank_complete_timed(8191, pid_tgid(), 0, 1, 3500));
+    assert(!p11_owner_start_get(&key, 0));
+    assert(bank_cell(8191)->returned == 1);
+    assert(bank_cell(8191)->errors == 0);
+    assert(bank_cell(8191)->total_ns == 1500);
+    assert(bank_cell(8191)->max_ns == 1500);
+    assert(bank_fault_cell == 0);
+    assert(!bank_health_cells[0] && !bank_health_cells[1]);
 }
 
 /* The entry root accounts entry only: latency buckets stay untouched. */

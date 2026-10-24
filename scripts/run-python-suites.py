@@ -62,6 +62,7 @@ RUN = [
     ("test_h6_system_dispatch.py", []),
     ("test_help_usage_drift.py", []),
     ("test_ia32_automatic_exec.py", []),
+    ("test_ignored_tests.py", []),
     ("test_inventory_capacity_oracle.py", []),
     ("test_inventory_count_only_hooks.py", []),
     ("test_inventory_output_readiness.py", []),

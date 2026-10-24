@@ -156,6 +156,12 @@ impl SemanticResourceReserver {
     pub(crate) fn reserve(&self, bytes: usize) -> Result<ResourceLease, SemanticResourceRefusal> {
         ResourceLease::acquire(&self.shared, bytes)
     }
+
+    /// Checks this lease's live charge in the original pool without changing it.
+    /// Coverage alone grants no input identity or native mutation authority.
+    pub(crate) fn covers(&self, lease: &ResourceLease, required_bytes: usize) -> bool {
+        Arc::ptr_eq(&self.shared, &lease.shared) && lease.bytes >= required_bytes
+    }
 }
 
 impl Default for SemanticResourcePool {

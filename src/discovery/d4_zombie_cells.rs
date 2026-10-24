@@ -766,3 +766,334 @@ fn privileged_d4_btrfs_zombie_leader_collision_and_dataonly_twins() {
     std::fs::remove_dir(parent.join("a")).unwrap();
     std::fs::remove_dir(parent.join("b")).unwrap();
 }
+
+/// ESRCH text the real kernel returns for a zombie-leader `map_files`
+/// stat (privileged open succeeds, `fstatat` fails ESRCH); see
+/// `evidence/r4/zombie2-userspace.strace`.
+fn zombie_leader_esrch() -> String {
+    std::io::Error::from_raw_os_error(libc::ESRCH).to_string()
+}
+
+struct ZombieProofPin;
+
+/// `ConfirmIo` whose leader-path range reads fail exactly like the real
+/// kernel for a zombie leader (ESRCH) and whose member-path reads
+/// succeed with the canned per-inode identity. Mint acquires the real
+/// survivor, so routing (stash vs leader) is what the tests pin.
+struct ZombieProofIo {
+    entries: Vec<MapEntry>,
+    survivor: u32,
+    member_owner: ReservationOwner,
+    stashed: Option<crate::discovery::retained_member::RetainedGroupMember>,
+    minter: Option<std::sync::Arc<crate::process::PidPin>>,
+    member_reads: std::rc::Rc<std::cell::RefCell<Vec<(u64, u64)>>>,
+    leader_reads: std::rc::Rc<std::cell::RefCell<Vec<(u64, u64)>>>,
+}
+
+impl ZombieProofIo {
+    fn canned(
+        entries: Vec<MapEntry>,
+        survivor: u32,
+        member_reads: std::rc::Rc<std::cell::RefCell<Vec<(u64, u64)>>>,
+        leader_reads: std::rc::Rc<std::cell::RefCell<Vec<(u64, u64)>>>,
+    ) -> Self {
+        Self {
+            entries,
+            survivor,
+            member_owner: ReservationOwner::new(SegmentPolicy::from_headroom(64, 1, 1)),
+            stashed: None,
+            minter: None,
+            member_reads,
+            leader_reads,
+        }
+    }
+
+    fn identity_for(&self, start: u64, end: u64) -> FileIdentity {
+        self.entries
+            .iter()
+            .find(|entry| (entry.start, entry.end) == (start, end))
+            .map(|entry| super::vm_file(entry.inode))
+            .unwrap_or_else(|| super::vm_file(super::PROVIDER))
+    }
+}
+
+impl ConfirmIo for ZombieProofIo {
+    type Pin = ZombieProofPin;
+
+    fn open(&mut self, _: u32) -> Result<Self::Pin, String> {
+        Ok(ZombieProofPin)
+    }
+
+    fn start_time(&self, _: &Self::Pin) -> Option<u64> {
+        Some(4_242)
+    }
+
+    fn still_the_same(&self, _: &Self::Pin) -> bool {
+        true
+    }
+
+    fn exe(&self, _: u32) -> Option<ExeIdentity> {
+        if let Some(member) = &self.stashed {
+            return member.read_exe_identity();
+        }
+        Some(super::exe())
+    }
+
+    fn maps(&mut self, _: u32, _: &mut CaptureWorkBudget) -> Result<Vec<MapEntry>, String> {
+        Ok(self.entries.clone())
+    }
+
+    fn gone(&self, pid: u32) -> bool {
+        if self
+            .stashed
+            .as_ref()
+            .is_some_and(|member| member.selector().is_ok())
+        {
+            return false;
+        }
+        crate::process::process_is_zombie(pid)
+    }
+
+    fn mapped_file(&mut self, _: u32, start: u64, end: u64) -> Result<FileIdentity, String> {
+        if self.stashed.is_some() {
+            self.member_reads.borrow_mut().push((start, end));
+            Ok(self.identity_for(start, end))
+        } else {
+            self.leader_reads.borrow_mut().push((start, end));
+            Err(zombie_leader_esrch())
+        }
+    }
+
+    fn mint_member(
+        &mut self,
+        pid: u32,
+        budget: &mut CaptureWorkBudget,
+    ) -> Result<(), Confirmation> {
+        use crate::discovery::retained_member::RetainedGroupMember;
+        self.stashed = None;
+        self.minter = None;
+        if !crate::process::process_is_zombie(pid) {
+            return Ok(());
+        }
+        let original =
+            std::sync::Arc::new(crate::process::PidPin::open(pid).map_err(|error| {
+                Confirmation::Lost(AttributionLoss::MapFilesUnavailable, error)
+            })?);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        match RetainedGroupMember::acquire(
+            &original,
+            self.survivor,
+            &self.member_owner,
+            budget,
+            deadline,
+        ) {
+            Ok(member) => {
+                self.stashed = Some(member);
+                self.minter = Some(original);
+                Ok(())
+            }
+            Err(_) => Ok(()),
+        }
+    }
+
+    fn take_member(&mut self) -> Option<crate::discovery::retained_member::RetainedGroupMember> {
+        self.stashed.take()
+    }
+}
+
+struct ZombieProofProbe {
+    entries: Vec<MapEntry>,
+    survivor: u32,
+    member_reads: std::rc::Rc<std::cell::RefCell<Vec<(u64, u64)>>>,
+    leader_reads: std::rc::Rc<std::cell::RefCell<Vec<(u64, u64)>>>,
+}
+
+impl MemberProbe for ZombieProofProbe {
+    fn confirm(
+        &mut self,
+        pid: u32,
+        prove: &BTreeSet<ObjectKey>,
+        budget: &mut CaptureWorkBudget,
+    ) -> Confirmation {
+        let mut io = ZombieProofIo::canned(
+            self.entries.clone(),
+            self.survivor,
+            self.member_reads.clone(),
+            self.leader_reads.clone(),
+        );
+        confirm_with_resources(&mut io, pid, prove, budget, None)
+    }
+
+    fn stat_ranges(
+        &mut self,
+        _: u32,
+        _: &[(u64, u64)],
+        _: &mut CaptureWorkBudget,
+    ) -> MappedIdentities {
+        MappedIdentities::new()
+    }
+}
+
+#[test]
+fn zombie_survivor_confirm_routes_range_proofs_through_member() {
+    // Custody first: prepare must carry the survivor, so a later
+    // attribution failure pins routing, not minting.
+    let group = ZombieLeaderGroup::spawn();
+    wait_leader_zombie(group.tgid);
+    assert_lone_survivor(&group);
+    let member_reads = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let leader_reads = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let mut io = ZombieProofIo::canned(
+        super::provider_caller(),
+        group.survivor,
+        member_reads.clone(),
+        leader_reads.clone(),
+    );
+    let mut budget = CaptureWorkBudget::default();
+    let prepared = prepare_confirmation(
+        &mut io,
+        group.tgid,
+        &BTreeSet::from([super::key(super::PROVIDER)]),
+        &mut budget,
+        None,
+    )
+    .expect("member confirm prepares");
+    let selector = prepared
+        .member
+        .as_ref()
+        .expect("prepare carries the survivor")
+        .selector()
+        .expect("carried member selects");
+    assert_eq!(selector.tgid(), group.tgid);
+    assert_eq!(selector.tid(), group.survivor);
+    drop(prepared);
+    drop(io);
+    // Then attribution: leader-path reads fail ESRCH like the real
+    // kernel, member-path reads succeed, so the group attributes with
+    // its held object only when proofs route through the member.
+    let checks = super::Checks::default();
+    let index = super::provider_index(&checks);
+    let member_reads = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let leader_reads = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let mut probe = ZombieProofProbe {
+        entries: super::provider_caller(),
+        survivor: group.survivor,
+        member_reads: member_reads.clone(),
+        leader_reads: leader_reads.clone(),
+    };
+    let mut budget = CaptureWorkBudget::default();
+    let out = attribute_unselected(
+        &[(group.tgid, super::provider_caller())],
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        &index,
+        &mut probe,
+        &mut budget,
+    );
+    assert_eq!(
+        out.members.len(),
+        1,
+        "zombie survivor attributes through member proofs: {out:?}"
+    );
+    assert_eq!(out.members[0].pid, group.tgid);
+    assert_eq!(out.members[0].objects.len(), 1);
+    assert_eq!(out.members[0].objects[0].key, super::key(super::PROVIDER));
+    assert_eq!(out.members[0].objects[0].object, super::OBJECT);
+    assert!(out.losses.is_empty(), "{:?}", out.member_losses);
+    assert_eq!(out.probed, 1);
+    assert!(
+        !member_reads.borrow().is_empty(),
+        "member reads served the proofs"
+    );
+    assert!(
+        leader_reads.borrow().is_empty(),
+        "no leader-path range reads: {:?}",
+        leader_reads.borrow()
+    );
+}
+
+struct ZombieUserspaceHook;
+
+impl crate::discovery::confirm_shards::SegmentProof for ZombieUserspaceHook {
+    fn prove<'r>(
+        &'r mut self,
+        _batch: &crate::discovery::confirm_shards::AcceptedBatch<'_>,
+        _budget: &mut CaptureWorkBudget,
+        _resources: &IoResources,
+    ) -> crate::discovery::kernel_identity::ProofDecision<'r> {
+        crate::discovery::kernel_identity::ProofDecision::Userspace(
+            crate::discovery::kernel_identity::RunFailure::AttachOrRead,
+        )
+    }
+}
+
+#[test]
+fn zombie_survivor_segment_fallback_routes_range_proofs_through_member() {
+    let group = ZombieLeaderGroup::spawn();
+    wait_leader_zombie(group.tgid);
+    assert_lone_survivor(&group);
+    let member_reads = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let leader_reads = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let mut io = ZombieProofIo::canned(
+        super::provider_caller(),
+        group.survivor,
+        member_reads.clone(),
+        leader_reads.clone(),
+    );
+    let policy = SegmentPolicy::from_headroom(16, 1, 1);
+    let owner = ReservationOwner::new(policy);
+    let resources = owner.batch();
+    let mut budget = CaptureWorkBudget::default();
+    let prove = BTreeSet::from([super::key(super::PROVIDER)]);
+    let prepared = prepare_confirmation(&mut io, group.tgid, &prove, &mut budget, Some(&resources))
+        .expect("member confirm prepares");
+    assert!(
+        prepared.member.is_some(),
+        "segment fallback carries the survivor"
+    );
+    let mut hook = ZombieUserspaceHook;
+    let confirmation = crate::discovery::confirm_shards::prove_and_finish_prepared(
+        &mut io,
+        group.tgid,
+        prepared,
+        &mut hook,
+        &resources,
+        &mut budget,
+    );
+    let read = match confirmation {
+        Confirmation::Confirmed(read) => read,
+        other => panic!("segment fallback confirms through member proofs: {other:?}"),
+    };
+    for entry in super::provider_caller()
+        .iter()
+        .filter(|entry| is_caller_range(entry))
+    {
+        if ObjectKey::of(entry) != super::key(super::PROVIDER) {
+            continue;
+        }
+        assert_eq!(
+            read.mapped.get(&(entry.start, entry.end)),
+            Some(&RangeProof::MapFiles(super::vm_file(super::PROVIDER))),
+            "provider text proves through the member: {:?}",
+            read.mapped
+        );
+    }
+    assert!(
+        !member_reads.borrow().is_empty(),
+        "member reads served the fallback"
+    );
+    assert!(
+        leader_reads.borrow().is_empty(),
+        "no leader-path range reads: {:?}",
+        leader_reads.borrow()
+    );
+    drop(io);
+    assert_eq!(
+        owner.state_for_test().0,
+        [0; 4],
+        "member fallback leaves no shared lease"
+    );
+    owner
+        .reconcile(policy)
+        .expect("census passes after member fallback");
+}

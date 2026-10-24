@@ -4133,6 +4133,12 @@ impl super::super::sweep_attribution::ConfirmIo for MemberIo {
 
     fn mapped_file(&mut self, pid: u32, start: u64, end: u64) -> Result<FileIdentity, String> {
         self.fallback_reads.borrow_mut().push((pid, start, end));
+        // A leader-path read for a zombie pid fails like the real kernel
+        // (ESRCH): only the member path serves it. Live pids keep the
+        // canned identity, so the existing twins are unchanged.
+        if self.stashed.is_none() && crate::process::process_is_zombie(pid) {
+            return Err(std::io::Error::from_raw_os_error(libc::ESRCH).to_string());
+        }
         Ok(self.identity)
     }
 

@@ -5,6 +5,7 @@
 # Usage:
 #   scripts/run-privileged-lib-tests.sh LIB_TEST_BINARY OUTDIR [--include-long] [SELECTOR...]
 #   scripts/run-privileged-lib-tests.sh --list LIB_TEST_BINARY
+#   scripts/run-privileged-lib-tests.sh --list-integration TEST_BINARY_DIR
 #
 # Run mode executes each selected ignored test once, one at a time, from the
 # repo root, as:
@@ -76,6 +77,10 @@
 # separate: it selects only the ignored tests that exist in a
 # --features wide-detailed-2112 libtest binary, when --wide-detailed-2112
 # is passed in run or --list mode; any other binary is refused cleanly.
+# The integration curation below that names the ignored integration tests
+# as file:path selectors; --list-integration verifies each selector
+# against built test binaries (exactly one binary, exactly one test) and
+# never executes them.
 set -uo pipefail
 
 PROG=${0##*/}
@@ -378,12 +383,26 @@ attach::inventory::activation::privileged_tests::privileged_task4_highslot_2048_
 attach::inventory::activation::privileged_tests::privileged_detailed_2112_stop_publishes_before_cleanup
 )
 
+# Integration-test curation: `tests/<target>.rs:<exact test path>` entries
+# for the ignored integration tests (each target builds one binary named
+# after the file stem). Verified, never executed, by --list-integration
+# against a directory of built test binaries: every entry must resolve to
+# exactly one binary and select exactly one ignored test there.
+INTEGRATION_TESTS=(
+tests/exec_task_continuity.rs:exec_task_core_shapes_kernel_load_without_attachment
+tests/identity_iter_standalone.rs:identity_loader_strict_gate_requires_btf_and_both_programs
+tests/inventory_identity.rs:d4_btrfs_scan_backends_match_exact_fixture_population
+tests/inventory_identity.rs:kernel_identity_positive_cell_rejects_refusal
+tests/run_abandon_report.rs:second_sigint_during_teardown_publishes_truthful_report_and_exits_130
+)
+
 usage() {
     cat <<EOF
 usage: $PROG LIB_TEST_BINARY OUTDIR [--include-long] [SELECTOR...]
        $PROG LIB_TEST_BINARY OUTDIR --wide-detailed-2112 [SELECTOR...]
        $PROG --list LIB_TEST_BINARY
        $PROG --list --wide-detailed-2112 LIB_TEST_BINARY
+       $PROG --list-integration TEST_BINARY_DIR
        $PROG --help
 
 Run the curated privileged (ignored) p11scope lib tests, one at a time.
@@ -396,6 +415,10 @@ is refused). It cannot be combined with --include-long.
 --list prints the curated default, long, and skipped-with-reason lists and
 verifies them against the binary, without running anything. With
 --wide-detailed-2112 it prints and verifies only the wide-Detailed list.
+--list-integration prints the curated integration-test selectors and
+verifies each against the built test binaries in TEST_BINARY_DIR
+(exactly one binary and exactly one selected test per entry), without
+running anything.
 EOF
 }
 
@@ -557,6 +580,53 @@ list_mode() {
     return 1
 }
 
+# --list-integration mode: print the curated integration selectors and
+# verify each against the built test binaries in the directory. Every
+# entry must resolve to exactly one binary (no missing or ambiguous
+# stem) and select exactly one ignored test there; anything else is
+# refused. Unprivileged-safe; verifies only, never executes.
+list_integration_mode() {
+    local depsdir entry file path stem bin bin_list count candidates failed=()
+    [ $# -eq 1 ] || { usage >&2; return 2; }
+    depsdir=$1
+    [ -d "$depsdir" ] || { echo "$PROG: not a directory: $depsdir" >&2; return 1; }
+    for entry in "${INTEGRATION_TESTS[@]}"; do
+        file=${entry%%:*}
+        path=${entry#*:}
+        stem=$(basename "$file" .rs)
+        candidates=$(find "$depsdir" -maxdepth 1 -type f -executable \
+            -name "$stem-*" ! -name "*.*" -print | sort)
+        if [ -z "$candidates" ]; then
+            failed+=("$entry :: no test binary $stem-* in $depsdir")
+            continue
+        fi
+        if [ "$(printf '%s\n' "$candidates" | wc -l)" -ne 1 ]; then
+            failed+=("$entry :: more than one test binary matches $stem-* in $depsdir (stale rebuild?)")
+            continue
+        fi
+        bin=$candidates
+        if ! bin_list=$(binary_ignored_list "$bin"); then
+            failed+=("$entry :: cannot list ignored tests in $bin")
+            continue
+        fi
+        count=$(printf '%s\n' "$bin_list" | grep -cxF "$path" || true)
+        if [ "$count" -ne 1 ]; then
+            failed+=("$entry :: selects $count tests in $bin (expected exactly 1)")
+        fi
+    done
+    echo "integration (${#INTEGRATION_TESTS[@]})"
+    printf '%s\n' "${INTEGRATION_TESTS[@]}"
+    if [ "${#failed[@]}" -ne 0 ]; then
+        {
+            echo "$PROG: integration curation refused against $depsdir"
+            printf '  %s\n' "${failed[@]}"
+        } >&2
+        return 1
+    fi
+    echo "verify: integration curation selects exactly one test per entry (${#INTEGRATION_TESTS[@]} entries)"
+    return 0
+}
+
 # SELECTORS is the global selector list. selected() returns 0 when $1
 # matches any selector (literal substring), or when there are no selectors.
 SELECTORS=()
@@ -587,6 +657,7 @@ main() {
     fi
     case $1 in
         --list) shift; list_mode "$@"; return $? ;;
+        --list-integration) shift; list_integration_mode "$@"; return $? ;;
         -h|--help) usage; return 0 ;;
     esac
     if [ $# -lt 2 ]; then

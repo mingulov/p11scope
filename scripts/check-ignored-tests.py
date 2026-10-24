@@ -20,7 +20,11 @@ compares them both ways against tests/ignored-tests.json:
 - a `feature` entry owned by the wide-detailed-2112 runner, and every
   member of WIDE_DETAILED_2112_TESTS, must resolve both ways: an owned
   entry missing from the list fails, and a list member that is neither
-  a wide-owned entry nor a feature-gated expansion fails.
+  a wide-owned entry nor a feature-gated expansion fails;
+- a `live-kernel` or `privileged` entry under tests/ (an ignored
+  integration test) must be curated as `file:path` in the runner's
+  INTEGRATION_TESTS list, and every list member must resolve back to
+  such an entry.
 
 Usage:
   python3 -I scripts/check-ignored-tests.py [--root DIR]
@@ -45,6 +49,8 @@ RUNNER_LISTS = (
 )
 WIDE_LIST = "WIDE_DETAILED_2112_TESTS"
 WIDE_OWNER = "wide-detailed-2112 runner"
+INTEGRATION_LIST = "INTEGRATION_TESTS"
+INTEGRATION_CELLS = ("live-kernel", "privileged")
 
 MOD_RE = re.compile(
     r"((?:#\s*\[[^\]]*\]\s*)*)"
@@ -364,7 +370,7 @@ def runner_lists(runner_path):
     """{list name: set of curated items} for every runner curation list."""
     text = Path(runner_path).read_text(encoding="utf-8")
     lists = {}
-    for name in (*RUNNER_LISTS, WIDE_LIST):
+    for name in (*RUNNER_LISTS, WIDE_LIST, INTEGRATION_LIST):
         match = re.search(rf"^{name}=\(\n(.*?)\n\)", text, re.M | re.S)
         if match is None:
             raise ValueError(f"{runner_path} has no {name} list")
@@ -480,6 +486,7 @@ def check(root=ROOT, inventory=None, runner=None):
     for name in RUNNER_LISTS:
         registered |= lists.get(name, set())
     wide = lists.get(WIDE_LIST, set())
+    integration = lists.get(INTEGRATION_LIST, set())
 
     sites, scan_errors = scan_sources(root)
     failures.extend(f"FAIL scan: {e}" for e in scan_errors)
@@ -527,6 +534,16 @@ def check(root=ROOT, inventory=None, runner=None):
                 failures.append(
                     f"FAIL {where}: feature {entry['path']} is owned by "
                     f"{WIDE_OWNER} but not curated in {WIDE_LIST}")
+            continue
+        if (isinstance(entry.get("file"), str)
+                and entry["file"].startswith("tests/")):
+            if entry["cell"] in INTEGRATION_CELLS:
+                curated = f"{entry['file']}:{entry['path']}"
+                if curated not in integration:
+                    failures.append(
+                        f"FAIL {where}: {entry['cell']} integration "
+                        f"{entry['path']} is not curated in "
+                        f"{INTEGRATION_LIST}")
             continue
         if entry["cell"] != "privileged":
             continue
@@ -589,6 +606,18 @@ def check(root=ROOT, inventory=None, runner=None):
             failures.append(f"FAIL runner: {WIDE_LIST} member {member} is "
                             "not a wide-owned inventory site or a "
                             "feature-gated expansion")
+
+    curated_sites = set()
+    for entry in entries:
+        if (isinstance(entry, dict) and isinstance(entry.get("file"), str)
+                and entry["file"].startswith("tests/")
+                and entry.get("cell") in INTEGRATION_CELLS):
+            curated_sites.add(f"{entry['file']}:{entry.get('path')}")
+    for member in sorted(integration):
+        if member not in curated_sites:
+            failures.append(f"FAIL runner: {INTEGRATION_LIST} member "
+                            f"{member} is not a live-kernel/privileged "
+                            "integration inventory entry")
     return failures
 
 
@@ -614,7 +643,7 @@ def main(argv):
               f"{count} inventoried site(s)")
         return 1
     print(f"ignored-tests: all {count} inventoried site(s) match the sources; "
-          "privileged and wide-feature curation verified")
+          "privileged, wide-feature and integration curation verified")
     return 0
 
 

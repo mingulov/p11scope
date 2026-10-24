@@ -5,14 +5,16 @@ scripts/check-ignored-tests.py scans the workspace Rust sources for real
 `#[ignore]` attributes and compares them both ways against
 tests/ignored-tests.json: every `privileged` entry must be curated in
 scripts/run-privileged-lib-tests.sh, every `feature` entry must name a
-non-empty owning lane in `owner`, and the wide-featured sites (wide
-`owner` entries plus feature-gated macro expansions) must exactly match
-the runner's WIDE_DETAILED_2112_TESTS list. These tests prove the
-checked-in inventory matches the sources, then exercise each failure
-mode on synthetic fixture trees so a regression in the checker cannot
-hide behind a clean real tree. A final group drives the runner's
-wide-list mode against fake binaries: a wide binary is accepted, a
-default binary is refused cleanly.
+non-empty owning lane in `owner`, the wide-featured sites (wide `owner`
+entries plus feature-gated macro expansions) must exactly match the
+runner's WIDE_DETAILED_2112_TESTS list, and every `live-kernel` or
+`privileged` integration entry must be curated in the runner's
+INTEGRATION_TESTS list. These tests prove the checked-in inventory
+matches the sources, then exercise each failure mode on synthetic
+fixture trees so a regression in the checker cannot hide behind a clean
+real tree. Final groups drive the runner's wide-list and integration
+modes against fake binaries: a matching binary is accepted, a default
+or incomplete one is refused cleanly.
 
 Run: python3 -I tests/python/test_ignored_tests.py -v
 """
@@ -31,8 +33,10 @@ RUNNER = ROOT / "scripts" / "run-privileged-lib-tests.sh"
 
 CELLS = {
     "privileged": "test cell",
+    "live-kernel": "test cell",
     "feature": "test cell",
     "performance": "test cell",
+    "helper": "test cell",
 }
 
 WIDE_OWNER = "wide-detailed-2112 runner"
@@ -53,7 +57,30 @@ WIDE_EXPECTED = [
 ]
 
 
-def write_fixture(root, sources, entries, registered, wide_registered=()):
+INTEGRATION_EXPECTED = [
+    "tests/exec_task_continuity.rs:exec_task_core_shapes_kernel_load_without_attachment",
+    "tests/identity_iter_standalone.rs:identity_loader_strict_gate_requires_btf_and_both_programs",
+    "tests/inventory_identity.rs:d4_btrfs_scan_backends_match_exact_fixture_population",
+    "tests/inventory_identity.rs:kernel_identity_positive_cell_rejects_refusal",
+    "tests/run_abandon_report.rs:second_sigint_during_teardown_publishes_truthful_report_and_exits_130",
+]
+
+INTEGRATION_SOURCES = {
+    "tests/foo.rs": (
+        '#[test]\n'
+        '#[ignore = "needs the kernel lane"]\n'
+        'fn t_live() {}\n'
+    ),
+}
+
+INTEGRATION_ENTRY = {
+    "file": "tests/foo.rs", "path": "t_live",
+    "reason": "needs the kernel lane", "cell": "live-kernel",
+}
+
+
+def write_fixture(root, sources, entries, registered, wide_registered=(),
+                  integration_registered=()):
     """A minimal checkable tree: sources {rel: text}, inventory, runner."""
     for rel, text in sources.items():
         path = root / rel
@@ -83,6 +110,7 @@ def write_fixture(root, sources, entries, registered, wide_registered=()):
             ("LONG_TESTS", []),
             ("SKIP_TESTS", []),
             ("WIDE_DETAILED_2112_TESTS", wide_registered),
+            ("INTEGRATION_TESTS", integration_registered),
         )
     )
     runner.write_text(body, encoding="utf-8")
@@ -165,6 +193,13 @@ def write_fake_binary(path, ignored):
     path.chmod(0o755)
 
 
+def write_fake_integration_binary(depsdir, stem, ignored):
+    """A fake built integration binary: deps/<stem>-<hash>, executable."""
+    path = depsdir / f"{stem}-0123456789abcdef"
+    write_fake_binary(path, ignored)
+    return path
+
+
 def run_runner(*args):
     return subprocess.run(
         [str(RUNNER), *args],
@@ -182,8 +217,8 @@ class IgnoredTestsTests(unittest.TestCase):
                            ["sites"])
         self.assertIn(f"all {inventoried} inventoried site(s) match",
                       result.stdout)
-        self.assertIn("privileged and wide-feature curation verified",
-                      result.stdout)
+        self.assertIn("privileged, wide-feature and integration "
+                      "curation verified", result.stdout)
 
     def test_an_extra_ignored_test_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -340,6 +375,141 @@ class IgnoredTestsTests(unittest.TestCase):
         self.assertIn("wide-detailed-2112", result.stderr)
         self.assertIn("absent from the binary", result.stderr)
         self.assertIn("privileged_task4_detailed_2112_lp64", result.stderr)
+        self.assertNotIn("verify:", result.stdout)
+
+    def test_integration_entry_without_curation_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_fixture(root, INTEGRATION_SOURCES, [INTEGRATION_ENTRY],
+                          [])
+            result = run_checker(root)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("t_live", result.stdout)
+        self.assertIn("INTEGRATION_TESTS", result.stdout)
+
+    def test_privileged_integration_entry_requires_curation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            entry = dict(INTEGRATION_ENTRY, cell="privileged")
+            write_fixture(root, INTEGRATION_SOURCES, [entry], [])
+            result = run_checker(root)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("t_live", result.stdout)
+        self.assertIn("INTEGRATION_TESTS", result.stdout)
+
+    def test_integration_entry_passes_when_curated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_fixture(root, INTEGRATION_SOURCES, [INTEGRATION_ENTRY],
+                          [], integration_registered=["tests/foo.rs:t_live"])
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("all 1 inventoried site(s) match", result.stdout)
+
+    def test_integration_member_without_an_entry_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_fixture(root, {"src/lib.rs": ""}, [], [],
+                          integration_registered=["tests/foo.rs:t_nope"])
+            result = run_checker(root)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("t_nope", result.stdout)
+        self.assertIn("INTEGRATION_TESTS", result.stdout)
+
+    def test_integration_list_mode_accepts_curated_binaries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            deps = Path(tmp) / "deps"
+            deps.mkdir()
+            write_fake_integration_binary(
+                deps, "exec_task_continuity",
+                ["exec_task_core_shapes_kernel_load_without_attachment",
+                 "noise::t_other"])
+            write_fake_integration_binary(
+                deps, "identity_iter_standalone",
+                ["identity_loader_strict_gate_requires_btf_and_both_programs"])
+            write_fake_integration_binary(
+                deps, "inventory_identity",
+                ["d4_btrfs_scan_backends_match_exact_fixture_population",
+                 "kernel_identity_positive_cell_rejects_refusal"])
+            write_fake_integration_binary(
+                deps, "run_abandon_report",
+                ["second_sigint_during_teardown_publishes_truthful_report_and_exits_130"])
+            result = run_runner("--list-integration", str(deps))
+        self.assertEqual(result.returncode, 0,
+                         result.stdout + result.stderr)
+        self.assertIn("integration (5)", result.stdout)
+        for entry in INTEGRATION_EXPECTED:
+            self.assertIn(entry, result.stdout)
+        self.assertIn("verify: integration curation selects exactly one "
+                      "test per entry (5 entries)", result.stdout)
+
+    def test_integration_list_mode_refuses_zero_selection(self):
+        # The inventory_identity binary below is missing one of its two
+        # curated tests: the entry selects nothing and must be refused.
+        with tempfile.TemporaryDirectory() as tmp:
+            deps = Path(tmp) / "deps"
+            deps.mkdir()
+            write_fake_integration_binary(
+                deps, "exec_task_continuity",
+                ["exec_task_core_shapes_kernel_load_without_attachment"])
+            write_fake_integration_binary(
+                deps, "identity_iter_standalone",
+                ["identity_loader_strict_gate_requires_btf_and_both_programs"])
+            write_fake_integration_binary(
+                deps, "inventory_identity",
+                ["kernel_identity_positive_cell_rejects_refusal"])
+            write_fake_integration_binary(
+                deps, "run_abandon_report",
+                ["second_sigint_during_teardown_publishes_truthful_report_and_exits_130"])
+            result = run_runner("--list-integration", str(deps))
+        self.assertEqual(result.returncode, 1,
+                         result.stdout + result.stderr)
+        self.assertIn("integration", result.stderr)
+        self.assertIn("d4_btrfs_scan_backends_match_exact_fixture_population",
+                      result.stderr)
+        self.assertIn("selects 0 tests", result.stderr)
+        self.assertNotIn("verify:", result.stdout)
+
+    def test_integration_list_mode_refuses_missing_binary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            deps = Path(tmp) / "deps"
+            deps.mkdir()
+            write_fake_integration_binary(
+                deps, "exec_task_continuity",
+                ["exec_task_core_shapes_kernel_load_without_attachment"])
+            result = run_runner("--list-integration", str(deps))
+        self.assertEqual(result.returncode, 1,
+                         result.stdout + result.stderr)
+        self.assertIn("run_abandon_report", result.stderr)
+        self.assertIn("no test binary", result.stderr)
+        self.assertNotIn("verify:", result.stdout)
+
+    def test_integration_list_mode_refuses_ambiguous_binary(self):
+        # Two executables match one stem (a stale rebuild left behind):
+        # the entry no longer identifies its binary, so it is refused.
+        with tempfile.TemporaryDirectory() as tmp:
+            deps = Path(tmp) / "deps"
+            deps.mkdir()
+            write_fake_integration_binary(
+                deps, "exec_task_continuity",
+                ["exec_task_core_shapes_kernel_load_without_attachment"])
+            extra = deps / "exec_task_continuity-fedcba9876543210"
+            write_fake_binary(extra, ["exec_task_core_shapes_kernel_load_without_attachment"])
+            write_fake_integration_binary(
+                deps, "identity_iter_standalone",
+                ["identity_loader_strict_gate_requires_btf_and_both_programs"])
+            write_fake_integration_binary(
+                deps, "inventory_identity",
+                ["d4_btrfs_scan_backends_match_exact_fixture_population",
+                 "kernel_identity_positive_cell_rejects_refusal"])
+            write_fake_integration_binary(
+                deps, "run_abandon_report",
+                ["second_sigint_during_teardown_publishes_truthful_report_and_exits_130"])
+            result = run_runner("--list-integration", str(deps))
+        self.assertEqual(result.returncode, 1,
+                         result.stdout + result.stderr)
+        self.assertIn("exec_task_continuity", result.stderr)
+        self.assertIn("more than one test binary", result.stderr)
         self.assertNotIn("verify:", result.stdout)
 
 

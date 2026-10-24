@@ -1444,6 +1444,8 @@ impl FinishCustody {
 /// a grant without making the first actual admission unusable later.
 #[test]
 fn joint_machine_collected_finish_first_unread_work_reaches_h9() {
+    use crate::discovery::caller_registry::MappingState;
+
     let mut fixture = MachineScene::new(1);
     assert_eq!(fixture.machine.diagnostic_snapshot_for_test().0, "Idle");
     assert!(fixture.machine.retained_drain_grant_for_test().is_none());

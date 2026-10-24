@@ -789,7 +789,7 @@ class CounterObjectCliTests(unittest.TestCase):
                 body = bytearray()
                 for word in words:
                     body += struct.pack("<BBhi", 0x18, 1, 0, word & 0xffffffff)
-                    body += struct.pack("<I", word >> 32) + bytes(4)
+                    body += bytes(4) + struct.pack("<I", word >> 32)
                 self.sections = {1: (None, bytes(body))}
                 self.mapped = {(key, pc * 2) for pc in mapped}
 
@@ -872,7 +872,7 @@ class CounterObjectCliTests(unittest.TestCase):
                 body = bytearray()
                 for word in words:
                     body += struct.pack("<BBhi", 0x18, 1, 0, word & 0xffffffff)
-                    body += struct.pack("<I", word >> 32) + bytes(4)
+                    body += bytes(4) + struct.pack("<I", word >> 32)
                 self.sections = {1: (None, bytes(body))}
                 self.mapped = {(key, pc * 2) for pc in mapped}
 

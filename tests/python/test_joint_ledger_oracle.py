@@ -42,7 +42,7 @@ except OSError:
 def require_oracle(test):
     """Fail naming the missing production file (RED) or return the oracle."""
     if ORACLE is None:
-        test.fail(f"oracle missing: {ORACLE_PATH} (T0 implementation not present)")
+        test.fail(f"oracle missing: {ORACLE_PATH} (implementation not present)")
     return ORACLE
 
 
@@ -87,7 +87,7 @@ typedef struct {
 int P11ScopeSlot68;
 static unsigned long count_calls(void **out) {
     (void)out;
-    const char *path = getenv("P11SCOPE_T0_COUNT_PATH");
+    const char *path = getenv("P11SCOPE_LEDGER_COUNT_PATH");
     if (path != NULL) {
         FILE *sink = fopen(path, "a");
         if (sink != NULL) {
@@ -144,6 +144,45 @@ unsigned long C_GetFunctionList(void **out) {
         return 7;
     }
     *out = &plain_table;
+    return 0;
+}
+"""
+
+SLOW_PROVIDER = """/* Test-only slow stub: the entry sleeps, so t1-t0 proves post-call stamping. */
+#define _GNU_SOURCE
+#include <stddef.h>
+#include <time.h>
+typedef struct {
+    unsigned char major, minor;
+    unsigned char reserved[6];
+    void *functions[104];
+} SlowTable;
+int P11ScopeSlot68;
+static unsigned long slow_call(void **out) {
+    (void)out;
+    struct timespec delay = {0, 5000000};
+    while (nanosleep(&delay, &delay) != 0) {
+    }
+    return 0;
+}
+static unsigned long slow_noop(void **out) {
+    (void)out;
+    return 0;
+}
+static SlowTable slow_table;
+__attribute__((constructor)) static void slow_init(void) {
+    slow_table.major = 3;
+    slow_table.minor = 2;
+    for (int i = 0; i < 104; i++) {
+        slow_table.functions[i] = (void *)slow_noop;
+    }
+    slow_table.functions[4] = (void *)slow_call;
+}
+unsigned long C_GetFunctionList(void **out) {
+    if (out == NULL) {
+        return 7;
+    }
+    *out = &slow_table;
     return 0;
 }
 """
@@ -213,6 +252,14 @@ class LedgerOracleTwins(unittest.TestCase):
         rows = healthy_rows()
         rows[1]["t0"] = rows[0]["t"] - 1
         rows[1]["t1"] = rows[0]["t"] - 1
+        with self.assertRaisesRegex(oracle.LedgerError, "window"):
+            oracle.validate_ledger(rows)
+
+    def test_mutation_t1_after_ack_rejected(self):
+        oracle = require_oracle(self)
+        rows = healthy_rows()
+        rows[2]["t0"] = rows[-1]["t"]
+        rows[2]["t1"] = rows[-1]["t"] + 1
         with self.assertRaisesRegex(oracle.LedgerError, "window"):
             oracle.validate_ledger(rows)
 
@@ -308,6 +355,17 @@ class LedgerOracleTwins(unittest.TestCase):
         with self.assertRaisesRegex(oracle.LedgerError, "ack precedes"):
             oracle.validate_ledger(rows)
 
+    def test_mutation_non_object_frame_row_refused(self):
+        oracle = require_oracle(self)
+        rows = healthy_rows()
+        rows[0] = ["ready"]
+        with self.assertRaisesRegex(oracle.LedgerError, "first row must be ready"):
+            oracle.validate_ledger(rows)
+        rows = healthy_rows()
+        rows[-1] = ["ack"]
+        with self.assertRaisesRegex(oracle.LedgerError, "last row must be ack"):
+            oracle.validate_ledger(rows)
+
     def test_mutation_duplicate_json_key_rejected(self):
         oracle = require_oracle(self)
         line = ('{"kind": "ready", "pid": 1, "tid": 1, "t": 2,'
@@ -385,13 +443,42 @@ class LedgerOracleTwins(unittest.TestCase):
             self.assertEqual(completed.returncode, 1)
             self.assertIn("issued 24 disagrees with 25 call rows", completed.stderr)
 
+    def test_cli_string_payload_not_echoed(self):
+        require_oracle(self)
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Path(tmp) / "ledger.jsonl"
+            rows = healthy_rows()
+            rows[5]["pid"] = "PIN=1234-secret"
+            write_jsonl(ledger, rows)
+            completed = subprocess.run(
+                ["python3", "-I", str(ORACLE_PATH), str(ledger)],
+                capture_output=True, text=True, timeout=60)
+            self.assertEqual(completed.returncode, 1)
+            self.assertIn("ledger refused: pid string disagrees with ready pid",
+                          completed.stderr)
+            self.assertNotIn("PIN=1234-secret", completed.stderr)
+
+    def test_cli_non_object_first_row_refused_without_traceback(self):
+        require_oracle(self)
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Path(tmp) / "ledger.jsonl"
+            rows = healthy_rows()
+            rows[0] = ["ready"]
+            write_jsonl(ledger, rows)
+            completed = subprocess.run(
+                ["python3", "-I", str(ORACLE_PATH), str(ledger)],
+                capture_output=True, text=True, timeout=60)
+            self.assertEqual(completed.returncode, 1)
+            self.assertIn("ledger refused: first row must be ready", completed.stderr)
+            self.assertNotIn("Traceback", completed.stderr)
+
 
 class LedgerEmissionTests(unittest.TestCase):
     def build_pair(self, tmp):
         if not shutil.which("gcc"):
             self.skipTest("requires gcc; installs nothing")
         if not FIXTURE_SRC.is_file():
-            self.fail(f"fixture missing: {FIXTURE_SRC} (T0 implementation not present)")
+            self.fail(f"fixture missing: {FIXTURE_SRC} (implementation not present)")
         provider = Path(tmp) / "provider.so"
         fixture = Path(tmp) / "per-call-ledger"
         build = subprocess.run(
@@ -466,7 +553,7 @@ class LedgerEmissionTests(unittest.TestCase):
         if not shutil.which("gcc"):
             self.skipTest("requires gcc; installs nothing")
         if not FIXTURE_SRC.is_file():
-            self.fail(f"fixture missing: {FIXTURE_SRC} (T0 implementation not present)")
+            self.fail(f"fixture missing: {FIXTURE_SRC} (implementation not present)")
         fixture = Path(tmp) / "per-call-ledger"
         build = subprocess.run(
             ["gcc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
@@ -496,7 +583,7 @@ class LedgerEmissionTests(unittest.TestCase):
             provider = self.build_inline_provider(tmp, "count", COUNTING_PROVIDER)
             ledger = Path(tmp) / "ledger.jsonl"
             witness = Path(tmp) / "count"
-            env = dict(os.environ, P11SCOPE_T0_COUNT_PATH=str(witness))
+            env = dict(os.environ, P11SCOPE_LEDGER_COUNT_PATH=str(witness))
             completed = subprocess.run(
                 [str(fixture), str(provider), "4", "5", str(ledger)],
                 capture_output=True, text=True, timeout=60, env=env)
@@ -505,6 +592,25 @@ class LedgerEmissionTests(unittest.TestCase):
                 summary = oracle.validate_ledger(oracle.read_ledger(stream))
             self.assertEqual(summary["issued"], 5)
             self.assertEqual(witness.stat().st_size, 5)
+
+    def test_fixture_slow_provider_call_duration(self):
+        oracle = require_oracle(self)
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self.build_fixture(tmp)
+            provider = self.build_inline_provider(tmp, "slow", SLOW_PROVIDER)
+            ledger = Path(tmp) / "ledger.jsonl"
+            completed = subprocess.run(
+                [str(fixture), str(provider), "4", "5", str(ledger)],
+                capture_output=True, text=True, timeout=60)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            with open(ledger, encoding="utf-8") as stream:
+                rows = oracle.read_ledger(stream)
+            summary = oracle.validate_ledger(rows)
+            self.assertEqual(summary["issued"], 5)
+            for row in rows:
+                if row.get("kind") != "call":
+                    continue
+                self.assertGreaterEqual(row["t1"] - row["t0"], 1_000_000)
 
     def test_fixture_waits_for_go(self):
         oracle = require_oracle(self)

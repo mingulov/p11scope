@@ -478,7 +478,10 @@ fn seeded_byte_mutations_never_panic_or_over_attribute() {
         // The mmap path shares the snapshot's segment-range validation,
         // so any offsets it returns must lie inside the image — seed
         // mutation 45 once returned an offset past EOF here for an image
-        // the snapshot oracle refuses.
+        // the snapshot oracle refuses. Interpreter-divergent mutants (the
+        // snapshot refuses on PT_INTERP while the mmap path yields in-range
+        // facts) are intentionally out of scope here: interpreter validation
+        // stays snapshot-side only.
         let file = open_of(&dir, &bytes);
         if let Ok((_, exports, charged)) = read_export_facts(&file, &[ANSWER]) {
             assert!(

@@ -385,9 +385,10 @@ fn export_facts_from_mmap(
 
 /// `(abi, exports)` for `wanted` without reading the whole file: the image is
 /// demand-paged through a shared mapping and queried with the same
-/// `object`-based core as [`ElfSnapshot`], so facts and refusals agree
-/// exactly with the snapshot oracle. Returns the structural table bytes the
-/// query logically consumed, for budget charging. Every mapping failure takes
+/// `object`-based core as [`ElfSnapshot`], so facts and segment-range
+/// refusals agree exactly with the snapshot oracle (PT_INTERP validation is
+/// snapshot-side only). Returns the structural table bytes the query
+/// logically consumed, for budget charging. Every mapping failure takes
 /// the read-failure skip shape; parsed bytes are never retained.
 // The tuple return is the frozen A5 API; no alias without a new public type.
 #[allow(clippy::type_complexity)]

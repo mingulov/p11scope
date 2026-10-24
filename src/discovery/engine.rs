@@ -9972,6 +9972,13 @@ impl Engine {
     }
 
     fn release_view_id(&mut self, id: ProcessViewId) {
+        // A retained collected transaction cannot release the original ID
+        // while its graph inputs or actual ended-PID owner/proof still name it.
+        // Keep this before trace/inventory bookkeeping as well as free-list
+        // insertion. Ordinary admission/retirement behavior is unchanged.
+        if self.collected_finish_actions.is_some() && self.collected_graph_names_view(id) {
+            return;
+        }
         self.trace_provider_views.remove(&id);
         self.pending_loader_arm_scans.retain(|key| key.view != id);
         self.exec_rearm_views.remove(&id);
@@ -17446,21 +17453,34 @@ impl Engine {
         let Some(view) = self.pending_retirements.first().copied() else {
             return false;
         };
-        if self
-            .modules
-            .iter()
-            .any(|module| module.scanned.view == view)
-            || self.pinned.view_claims(view).is_some()
-            || self
-                .ended_pid_retirement
-                .as_ref()
-                .is_some_and(|ended| ended.owner.id() == view)
-        {
+        if self.collected_graph_names_view(view) {
             return false;
         }
         self.pending_retirements.remove(&view);
         self.finalize_expected_target_exit();
         true
+    }
+
+    /// These are original inputs to the not-yet-bounded conservative graph
+    /// disposition. A numeric pending set cannot replace their ProcessView
+    /// custody. Include pristine scan inputs and live selection owners, not
+    /// only the currently presented modules/pin claims.
+    fn collected_graph_names_view(&self, view: ProcessViewId) -> bool {
+        self.modules
+            .iter()
+            .any(|module| module.scanned.view == view)
+            || self.pinned.view_claims(view).is_some()
+            || self.scan_inputs.contains_key(&view)
+            || self.selection_claims.keys().any(|key| key.view == view)
+            || self.selection_tables.keys().any(|key| key.view == view)
+            || self
+                .selection_bindings
+                .values()
+                .any(|binding| binding.view == view && !binding.retired)
+            || self
+                .ended_pid_retirement
+                .as_ref()
+                .is_some_and(|ended| ended.owner.id() == view)
     }
 
     /// Whether dispatching a matched EXEC for `view` would consume the owned
@@ -18559,6 +18579,16 @@ impl Engine {
                 // Never a frame deferral: deferral would suppress the
                 // inventory work that frees capacity.
                 if !pressure_quiet && self.pressure_head_pending(&queued) {
+                    if self.collected_finish_actions.is_some() {
+                        // Ordinary pressure service can scan/admit/evict views.
+                        // It is not a bounded terminal graph disposition. Keep
+                        // the exact original head/suffix and requests instead
+                        // of reaching its destructive ordinary tick paths.
+                        self.pending_discovery_records
+                            .extend(std::iter::once(queued).chain(batch));
+                        self.pressure_rotation_pending = true;
+                        break;
+                    }
                     if self.frame_work_exhausted() {
                         self.note_frame_deferral();
                         self.pending_discovery_records
@@ -18751,6 +18781,17 @@ impl Engine {
                 }
                 if let Some(persistent) = self.retirement_intents.get(&view).copied() {
                     cause = cause.merge(persistent);
+                }
+                if self.collected_finish_actions.is_some() && self.collected_graph_names_view(view)
+                {
+                    // Until the actual conservative graph/native continuation
+                    // can dispose these inputs, refuse BEFORE context mutation,
+                    // ProcessView removal, scan-input pruning or ID release.
+                    self.retirement_intents
+                        .entry(view)
+                        .and_modify(|old| *old = old.merge(cause))
+                        .or_insert(cause);
+                    continue;
                 }
                 let Some(retained) = self.views.iter().find(|candidate| candidate.id() == view)
                 else {

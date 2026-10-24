@@ -2292,6 +2292,40 @@ mod conservative_copy {
             self.field += 1;
             Ok(false)
         }
+
+        /// Installed-mode step: every field behaves as `advance` except the
+        /// file share, which moves into the handoff when no live alias holds
+        /// this exact share. A full handoff refuses with the pool's own
+        /// storage refusal; the share is never dropped here.
+        fn advance_installed(
+            &mut self,
+            source: Option<&PinnedObjects>,
+            handoff: &mut RetiredFileHandoff,
+            reserve: &SemanticResourceReserver,
+        ) -> Result<bool, GraphRefusal> {
+            if self.field != 4 {
+                return self.advance(source);
+            }
+            let file = self.file.as_ref().ok_or(GraphRefusal::Identity)?;
+            if source
+                .and_then(|pins| pins.by_id.get(&self.id))
+                .is_some_and(|held| Arc::ptr_eq(&held.file, file))
+            {
+                drop(self.file.take());
+            } else {
+                let file = self.file.as_ref().ok_or(GraphRefusal::Identity)?;
+                handoff.push(file).map_err(|()| {
+                    reserve
+                        .reserve(usize::MAX)
+                        .err()
+                        .map(GraphRefusal::Storage)
+                        .unwrap_or(GraphRefusal::Identity)
+                })?;
+                drop(self.file.take());
+            }
+            self.field += 1;
+            Ok(false)
+        }
     }
 
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2416,6 +2450,7 @@ mod conservative_copy {
         installed: Option<PinCopyCacheId>,
         // A growing pin prefix stays with the SAME old H1 backing payment.
         rebind_old_pins: Option<(ProcessViewId, std::vec::IntoIter<PinnedObjectId>)>,
+        rebind_complete: bool,
         // Owners above are released BEFORE the actual extra payment below.
         claim_backing: Option<ResourceLease>,
         backing: Option<ResourceLease>,
@@ -2455,6 +2490,7 @@ mod conservative_copy {
                 rebind_owner: None,
                 installed: None,
                 rebind_old_pins: None,
+                rebind_complete: false,
                 claim_backing: None,
                 backing: None,
                 header: None,
@@ -2462,9 +2498,14 @@ mod conservative_copy {
         }
 
         pub(crate) fn pinned(&self) -> Option<&PinnedObjects> {
-            (self.phase == Phase::Ready)
-                .then_some(self.output.as_ref())
-                .flatten()
+            // A completed bind keeps the Ready-style borrow while the loan is
+            // outstanding; partial mid-bind claims stay hidden as before.
+            (self.phase == Phase::Ready
+                || (self.phase == Phase::Rebinding
+                    && self.rebind_complete
+                    && self.rebind_owner.is_some()))
+            .then_some(self.output.as_ref())
+            .flatten()
         }
 
         pub(crate) fn skipped(&self) -> Option<&[Skipped]> {
@@ -2475,13 +2516,22 @@ mod conservative_copy {
         /// in `Phase::Rebinding`: the graph's Plan/Facts read the loaned
         /// output through this, never through `pinned()`.
         pub(crate) fn loaned_output(&self) -> Option<&PinnedObjects> {
-            None
+            (self.phase == Phase::Rebinding)
+                .then_some(self.output.as_ref())
+                .flatten()
         }
 
         /// Upper bound on retired files the installed reclaim must hand off:
         /// removed plus rejected entry ids. `Some` only in `Ready`/`Rebinding`.
         pub(crate) fn retired_entry_count(&self) -> Option<usize> {
-            None
+            if !matches!(self.phase, Phase::Ready | Phase::Rebinding) {
+                return None;
+            }
+            Some(
+                self.removed_ids
+                    .len()
+                    .saturating_add(self.rejected_ids.len()),
+            )
         }
 
         pub(crate) fn required_bytes(&self) -> Option<usize> {
@@ -3197,7 +3247,7 @@ mod conservative_copy {
             }
             self.phase = Phase::Reclaim;
             for _ in 0..work {
-                self.reclaim_one(source)?;
+                self.reclaim_one(source, None, reserve)?;
                 if self.phase == Phase::Reclaimed {
                     return Ok(GraphStep::Ready);
                 }
@@ -3213,8 +3263,23 @@ mod conservative_copy {
             &mut self,
             canonical: &mut PinnedObjects,
         ) -> Result<InstalledPinsBacking, GraphRefusal> {
-            let _ = canonical;
-            Err(GraphRefusal::Identity)
+            match self.phase {
+                Phase::Ready if self.rebind_owner.is_none() => {}
+                Phase::Rebinding if self.rebind_owner.is_some() => {}
+                Phase::RebindAborted | Phase::Reclaim | Phase::Reclaimed | Phase::Installed => {
+                    return Err(GraphRefusal::Cancelled);
+                }
+                _ => return Err(GraphRefusal::Identity),
+            }
+            let output = self.output.as_mut().ok_or(GraphRefusal::Identity)?;
+            std::mem::swap(output, canonical);
+            self.installed = Some(canonical.copy_source.ok_or(GraphRefusal::Identity)?);
+            self.phase = Phase::Installed;
+            Ok(InstalledPinsBacking {
+                claim_backing: self.claim_backing.take(),
+                backing: self.backing.take(),
+                header: self.header.take(),
+            })
         }
 
         /// Reclaims the old canonical (held in `output` since `install_ready`)
@@ -3228,13 +3293,40 @@ mod conservative_copy {
             reserve: &SemanticResourceReserver,
             work: usize,
         ) -> Result<GraphStep, GraphRefusal> {
-            let _ = (live, selection, handoff, reserve, work);
-            Err(GraphRefusal::Identity)
+            if work == 0 {
+                return Ok(GraphStep::Yielded);
+            }
+            if self.phase == Phase::Reclaimed {
+                return Ok(GraphStep::Ready);
+            }
+            if self.phase != Phase::Installed
+                || live.copy_source != self.installed
+                || self.rebind_owner.is_some()
+            {
+                return Err(GraphRefusal::Identity);
+            }
+            self.check_pool(selection, reserve)?;
+            for _ in 0..work {
+                self.reclaim_one(Some(live), Some(&mut *handoff), reserve)?;
+                if self.phase == Phase::Reclaimed {
+                    return Ok(GraphStep::Ready);
+                }
+            }
+            Ok(GraphStep::Advanced)
         }
 
-        fn reclaim_one(&mut self, source: Option<&PinnedObjects>) -> Result<(), GraphRefusal> {
+        fn reclaim_one(
+            &mut self,
+            source: Option<&PinnedObjects>,
+            handoff: Option<&mut RetiredFileHandoff>,
+            reserve: &SemanticResourceReserver,
+        ) -> Result<(), GraphRefusal> {
             if let Some(entry) = &mut self.reclaim_entry {
-                if entry.advance(source)? {
+                let done = match handoff {
+                    Some(handoff) => entry.advance_installed(source, handoff, reserve)?,
+                    None => entry.advance(source)?,
+                };
+                if done {
                     self.reclaim_entry = None;
                 }
                 return Ok(());
@@ -3478,25 +3570,41 @@ mod conservative_copy {
             files: usize,
             reserve: &SemanticResourceReserver,
         ) -> Result<Box<Self>, GraphRefusal> {
-            let _ = (files, reserve);
+            let lease = reserve
+                .reserve(Self::bytes(files))
+                .map_err(GraphRefusal::Storage)?;
             Ok(Box::new(Self {
-                files: Vec::new(),
+                files: Vec::with_capacity(files),
                 prev: None,
-                lease: None,
-                reserved: 0,
+                lease: Some(lease),
+                reserved: files,
             }))
         }
 
         /// Drops at most `max` file shares, head first then the `prev` chain.
         /// Returns true only when every link is empty.
         pub(crate) fn close_some(&mut self, max: usize) -> bool {
-            let _ = max;
-            true
+            let head = self.files.len().min(max);
+            self.files.drain(..head);
+            let budget = max - head;
+            if budget > 0
+                && let Some(prev) = self.prev.as_mut()
+            {
+                prev.close_some(budget);
+            }
+            self.is_empty()
+        }
+
+        fn is_empty(&self) -> bool {
+            self.files.is_empty() && self.prev.as_ref().is_none_or(|prev| prev.is_empty())
         }
 
         fn push(&mut self, file: &Arc<std::fs::File>) -> Result<(), ()> {
-            let _ = file;
-            Err(())
+            if self.files.len() >= self.reserved {
+                return Err(());
+            }
+            self.files.push(Arc::clone(file));
+            Ok(())
         }
 
         #[cfg(test)]
@@ -3970,12 +4078,7 @@ mod conservative_copy {
         #[derive(Clone, Copy, PartialEq, Eq)]
         enum BindPhase {
             New,
-            MeasureModule,
-            MeasureExports,
-            MeasureInterfaces,
-            MeasureTable,
-            MeasureEntries,
-            MeasureSkips,
+            MeasureInput,
             MeasureViews,
             MeasurePin,
             MeasurePinExports,
@@ -4018,26 +4121,227 @@ mod conservative_copy {
 
         /// Stateful input measurer over scanned rows: one field group or
         /// element per `step` credit. The rebind cursor drives it during
-        /// measurement; the Engine's RawCopy phase drives it directly.
+        /// measurement; the Engine's RawCopy phase drives it directly. Call
+        /// `step` repeatedly for one module until it returns true, then move
+        /// to the next module.
         pub(crate) struct ScannedInputMeasure {
             bytes: usize,
+            extra: usize,
+            max_skips: usize,
+            growth: BTreeMap<ProcessViewId, Growth>,
+            table: usize,
+            item: usize,
+            stage: u8,
         }
 
         impl ScannedInputMeasure {
+            /// Seeds the retained-input envelope for a row Vec of `rows`
+            /// capacity: the wrapper plus the exact backing array charge.
             pub(crate) fn new(rows: usize) -> Result<Self, GraphRefusal> {
-                let _ = rows;
-                Ok(Self { bytes: 0 })
+                Ok(Self {
+                    bytes: std::mem::size_of::<RetainedScannedInputs>()
+                        .checked_add(bytes_for::<ScannedModule>(rows)?)
+                        .ok_or(GraphRefusal::Overflow)?,
+                    extra: 0,
+                    max_skips: 0,
+                    growth: BTreeMap::new(),
+                    table: 0,
+                    item: 0,
+                    stage: 0,
+                })
+            }
+
+            fn empty() -> Self {
+                Self {
+                    bytes: 0,
+                    extra: 0,
+                    max_skips: 0,
+                    growth: BTreeMap::new(),
+                    table: 0,
+                    item: 0,
+                    stage: 0,
+                }
             }
 
             /// Measures one field group or element of `source`; true when
             /// this module is fully measured.
             pub(crate) fn step(&mut self, source: &ScannedModule) -> Result<bool, GraphRefusal> {
-                let _ = source;
-                Ok(true)
+                match self.stage {
+                    0 => {
+                        add(&mut self.bytes, charge_text(&source.path)?)?;
+                        add(
+                            &mut self.bytes,
+                            bytes_for::<String>(source.exports.capacity())?,
+                        )?;
+                        add(
+                            &mut self.bytes,
+                            bytes_for::<ScannedTable>(source.tables.capacity())?,
+                        )?;
+                        add(
+                            &mut self.bytes,
+                            bytes_for::<ScannedInterface>(source.interfaces.capacity())?,
+                        )?;
+                        add(&mut self.extra, normalization_bound(&source.path)?)?;
+                        add(
+                            &mut self.extra,
+                            bytes_for::<Vec<PinnedObjectId>>(source.tables.len())?,
+                        )?;
+                        add(&mut self.extra, text_bytes(&source.path)?)?;
+                        add(&mut self.extra, text_bytes(MODULE_ABI)?)?;
+                        self.max_skips = self
+                            .max_skips
+                            .checked_add(1)
+                            .ok_or(GraphRefusal::Overflow)?;
+                        let growth = self.growth.entry(source.view).or_default();
+                        growth.tables = growth
+                            .tables
+                            .checked_add(source.tables.len())
+                            .ok_or(GraphRefusal::Overflow)?;
+                        growth.pins = growth.pins.checked_add(1).ok_or(GraphRefusal::Overflow)?;
+                        self.item = 0;
+                        self.stage = 1;
+                        Ok(false)
+                    }
+                    1 => {
+                        if let Some(text) = source.exports.get(self.item) {
+                            add(&mut self.bytes, charge_text(text)?)?;
+                            self.item += 1;
+                            Ok(false)
+                        } else {
+                            self.item = 0;
+                            self.stage = 2;
+                            Ok(false)
+                        }
+                    }
+                    2 => {
+                        if let Some(interface) = source.interfaces.get(self.item) {
+                            if let Some(text) = &interface.name_lossy {
+                                add(&mut self.bytes, charge_text(text)?)?;
+                            }
+                            if let Some(bytes) = &interface.name_private {
+                                add(&mut self.bytes, bytes_for::<u8>(bytes.capacity())?)?;
+                            }
+                            self.item += 1;
+                            Ok(false)
+                        } else {
+                            self.table = 0;
+                            self.stage = 3;
+                            Ok(false)
+                        }
+                    }
+                    3 => {
+                        if let Some(table) = source.tables.get(self.table) {
+                            add(
+                                &mut self.bytes,
+                                bytes_for::<ScannedEntry>(table.entries.capacity())?,
+                            )?;
+                            add(
+                                &mut self.bytes,
+                                bytes_for::<&'static str>(table.null_entries.capacity())?,
+                            )?;
+                            add(
+                                &mut self.bytes,
+                                bytes_for::<Skipped>(table.unpinned.capacity())?,
+                            )?;
+                            add(
+                                &mut self.extra,
+                                bytes_for::<ScannedEntry>(table.entries.len())?,
+                            )?;
+                            add(
+                                &mut self.extra,
+                                bytes_for::<PinnedObjectId>(table.entries.len())?,
+                            )?;
+                            let skips = table
+                                .unpinned
+                                .len()
+                                .checked_add(table.entries.len())
+                                .ok_or(GraphRefusal::Overflow)?;
+                            add(&mut self.extra, bytes_for::<Skipped>(skips)?)?;
+                            self.max_skips = self
+                                .max_skips
+                                .checked_add(table.entries.len())
+                                .ok_or(GraphRefusal::Overflow)?;
+                            let growth = self
+                                .growth
+                                .get_mut(&source.view)
+                                .ok_or(GraphRefusal::Identity)?;
+                            growth.targets = growth
+                                .targets
+                                .checked_add(table.entries.len())
+                                .ok_or(GraphRefusal::Overflow)?;
+                            growth.pins = growth
+                                .pins
+                                .checked_add(table.entries.len())
+                                .ok_or(GraphRefusal::Overflow)?;
+                            self.item = 0;
+                            self.stage = 4;
+                            Ok(false)
+                        } else {
+                            self.table = 0;
+                            self.item = 0;
+                            self.stage = 0;
+                            Ok(true)
+                        }
+                    }
+                    4 => {
+                        let table = source
+                            .tables
+                            .get(self.table)
+                            .ok_or(GraphRefusal::Identity)?;
+                        if let Some(entry) = table.entries.get(self.item) {
+                            add(&mut self.bytes, charge_text(&entry.object_path)?)?;
+                            add(&mut self.extra, normalization_bound(&entry.object_path)?)?;
+                            let strings = text_bytes(entry.name)?
+                                .checked_add(text_bytes(&entry.object_path)?)
+                                .and_then(|bytes| {
+                                    bytes.checked_add(ENTRY_MISSING.len().max(ENTRY_ABI.len()))
+                                })
+                                .ok_or(GraphRefusal::Overflow)?;
+                            add(
+                                &mut self.extra,
+                                strings.checked_mul(2).ok_or(GraphRefusal::Overflow)?,
+                            )?;
+                            self.item += 1;
+                            Ok(false)
+                        } else {
+                            self.item = 0;
+                            self.stage = 5;
+                            Ok(false)
+                        }
+                    }
+                    _ => {
+                        let table = source
+                            .tables
+                            .get(self.table)
+                            .ok_or(GraphRefusal::Identity)?;
+                        if let Some(skip) = table.unpinned.get(self.item) {
+                            add(&mut self.bytes, charge_text(&skip.subject)?)?;
+                            add(&mut self.bytes, charge_text(&skip.reason)?)?;
+                            self.item += 1;
+                            Ok(false)
+                        } else {
+                            self.table += 1;
+                            self.stage = 3;
+                            Ok(false)
+                        }
+                    }
+                }
             }
 
             pub(crate) fn bytes(&self) -> usize {
                 self.bytes
+            }
+
+            fn extra(&self) -> usize {
+                self.extra
+            }
+
+            fn max_skips(&self) -> usize {
+                self.max_skips
+            }
+
+            fn take_growth(&mut self) -> BTreeMap<ProcessViewId, Growth> {
+                std::mem::take(&mut self.growth)
             }
         }
 
@@ -4067,6 +4371,7 @@ mod conservative_copy {
             claim_bytes: usize,
             max_skips: usize,
             growth: BTreeMap<ProcessViewId, Growth>,
+            input_measure: ScannedInputMeasure,
             module_pos: usize,
             table_pos: usize,
             item_pos: usize,
@@ -4116,6 +4421,7 @@ mod conservative_copy {
                     claim_bytes: 0,
                     max_skips: 0,
                     growth: BTreeMap::new(),
+                    input_measure: ScannedInputMeasure::empty(),
                     module_pos: 0,
                     table_pos: 0,
                     item_pos: 0,
@@ -4247,14 +4553,12 @@ mod conservative_copy {
                 });
                 self.header_storage = Some(storage);
                 self.header_bytes = header_bytes;
-                self.input_bytes = std::mem::size_of::<RetainedScannedInputs>()
-                    .checked_add(bytes_for::<ScannedModule>(input.rows.capacity())?)
-                    .ok_or(GraphRefusal::Overflow)?;
+                self.input_measure = ScannedInputMeasure::new(input.rows.capacity())?;
                 self.extra_bytes = header_bytes
                     .checked_add(bytes_for::<ReconciledModule>(input.rows.len())?)
                     .ok_or(GraphRefusal::Overflow)?;
                 self.claim_bytes = tree::<ProcessViewId, ViewClaims>(input.rows.len())?;
-                self.phase = BindPhase::MeasureModule;
+                self.phase = BindPhase::MeasureInput;
                 Ok(())
             }
 
@@ -4264,177 +4568,19 @@ mod conservative_copy {
                 input: &RetainedScannedInputs,
             ) -> Result<(), GraphRefusal> {
                 match self.phase {
-                    BindPhase::MeasureModule => {
+                    BindPhase::MeasureInput => {
                         if let Some(module) = input.rows.get(self.module_pos) {
-                            add(&mut self.input_bytes, charge_text(&module.path)?)?;
-                            add(
-                                &mut self.input_bytes,
-                                bytes_for::<String>(module.exports.capacity())?,
-                            )?;
-                            add(
-                                &mut self.input_bytes,
-                                bytes_for::<ScannedTable>(module.tables.capacity())?,
-                            )?;
-                            add(
-                                &mut self.input_bytes,
-                                bytes_for::<ScannedInterface>(module.interfaces.capacity())?,
-                            )?;
-                            add(&mut self.extra_bytes, normalization_bound(&module.path)?)?;
-                            add(
-                                &mut self.extra_bytes,
-                                bytes_for::<Vec<PinnedObjectId>>(module.tables.len())?,
-                            )?;
-                            add(&mut self.extra_bytes, text_bytes(&module.path)?)?;
-                            add(&mut self.extra_bytes, text_bytes(MODULE_ABI)?)?;
-                            self.max_skips = self
-                                .max_skips
-                                .checked_add(1)
-                                .ok_or(GraphRefusal::Overflow)?;
-                            let growth = self.growth.entry(module.view).or_default();
-                            growth.tables = growth
-                                .tables
-                                .checked_add(module.tables.len())
-                                .ok_or(GraphRefusal::Overflow)?;
-                            growth.pins =
-                                growth.pins.checked_add(1).ok_or(GraphRefusal::Overflow)?;
-                            self.item_pos = 0;
-                            self.phase = BindPhase::MeasureExports;
+                            if self.input_measure.step(module)? {
+                                self.module_pos += 1;
+                            }
                         } else {
+                            self.input_bytes = self.input_measure.bytes();
+                            add(&mut self.extra_bytes, self.input_measure.extra())?;
+                            self.max_skips = self.input_measure.max_skips();
+                            self.growth = self.input_measure.take_growth();
                             add(&mut self.extra_bytes, bytes_for::<Skipped>(self.max_skips)?)?;
                             self.last_view = None;
                             self.phase = BindPhase::MeasureViews;
-                        }
-                    }
-                    BindPhase::MeasureExports => {
-                        let module = input
-                            .rows
-                            .get(self.module_pos)
-                            .ok_or(GraphRefusal::Identity)?;
-                        if let Some(text) = module.exports.get(self.item_pos) {
-                            add(&mut self.input_bytes, charge_text(text)?)?;
-                            self.item_pos += 1;
-                        } else {
-                            self.item_pos = 0;
-                            self.phase = BindPhase::MeasureInterfaces;
-                        }
-                    }
-                    BindPhase::MeasureInterfaces => {
-                        let module = input
-                            .rows
-                            .get(self.module_pos)
-                            .ok_or(GraphRefusal::Identity)?;
-                        if let Some(interface) = module.interfaces.get(self.item_pos) {
-                            if let Some(text) = &interface.name_lossy {
-                                add(&mut self.input_bytes, charge_text(text)?)?;
-                            }
-                            if let Some(bytes) = &interface.name_private {
-                                add(&mut self.input_bytes, bytes_for::<u8>(bytes.capacity())?)?;
-                            }
-                            self.item_pos += 1;
-                        } else {
-                            self.table_pos = 0;
-                            self.phase = BindPhase::MeasureTable;
-                        }
-                    }
-                    BindPhase::MeasureTable => {
-                        let module = input
-                            .rows
-                            .get(self.module_pos)
-                            .ok_or(GraphRefusal::Identity)?;
-                        if let Some(table) = module.tables.get(self.table_pos) {
-                            add(
-                                &mut self.input_bytes,
-                                bytes_for::<ScannedEntry>(table.entries.capacity())?,
-                            )?;
-                            add(
-                                &mut self.input_bytes,
-                                bytes_for::<&'static str>(table.null_entries.capacity())?,
-                            )?;
-                            add(
-                                &mut self.input_bytes,
-                                bytes_for::<Skipped>(table.unpinned.capacity())?,
-                            )?;
-                            add(
-                                &mut self.extra_bytes,
-                                bytes_for::<ScannedEntry>(table.entries.len())?,
-                            )?;
-                            add(
-                                &mut self.extra_bytes,
-                                bytes_for::<PinnedObjectId>(table.entries.len())?,
-                            )?;
-                            let skips = table
-                                .unpinned
-                                .len()
-                                .checked_add(table.entries.len())
-                                .ok_or(GraphRefusal::Overflow)?;
-                            add(&mut self.extra_bytes, bytes_for::<Skipped>(skips)?)?;
-                            self.max_skips = self
-                                .max_skips
-                                .checked_add(table.entries.len())
-                                .ok_or(GraphRefusal::Overflow)?;
-                            let growth = self
-                                .growth
-                                .get_mut(&module.view)
-                                .ok_or(GraphRefusal::Identity)?;
-                            growth.targets = growth
-                                .targets
-                                .checked_add(table.entries.len())
-                                .ok_or(GraphRefusal::Overflow)?;
-                            growth.pins = growth
-                                .pins
-                                .checked_add(table.entries.len())
-                                .ok_or(GraphRefusal::Overflow)?;
-                            self.item_pos = 0;
-                            self.phase = BindPhase::MeasureEntries;
-                        } else {
-                            self.module_pos += 1;
-                            self.phase = BindPhase::MeasureModule;
-                        }
-                    }
-                    BindPhase::MeasureEntries => {
-                        let module = input
-                            .rows
-                            .get(self.module_pos)
-                            .ok_or(GraphRefusal::Identity)?;
-                        let table = module
-                            .tables
-                            .get(self.table_pos)
-                            .ok_or(GraphRefusal::Identity)?;
-                        if let Some(entry) = table.entries.get(self.item_pos) {
-                            add(&mut self.input_bytes, charge_text(&entry.object_path)?)?;
-                            add(
-                                &mut self.extra_bytes,
-                                normalization_bound(&entry.object_path)?,
-                            )?;
-                            let strings = text_bytes(entry.name)?
-                                .checked_add(text_bytes(&entry.object_path)?)
-                                .and_then(|bytes| {
-                                    bytes.checked_add(ENTRY_MISSING.len().max(ENTRY_ABI.len()))
-                                })
-                                .ok_or(GraphRefusal::Overflow)?;
-                            add(
-                                &mut self.extra_bytes,
-                                strings.checked_mul(2).ok_or(GraphRefusal::Overflow)?,
-                            )?;
-                            self.item_pos += 1;
-                        } else {
-                            self.item_pos = 0;
-                            self.phase = BindPhase::MeasureSkips;
-                        }
-                    }
-                    BindPhase::MeasureSkips => {
-                        let table = input
-                            .rows
-                            .get(self.module_pos)
-                            .and_then(|module| module.tables.get(self.table_pos))
-                            .ok_or(GraphRefusal::Identity)?;
-                        if let Some(skip) = table.unpinned.get(self.item_pos) {
-                            add(&mut self.input_bytes, charge_text(&skip.subject)?)?;
-                            add(&mut self.input_bytes, charge_text(&skip.reason)?)?;
-                            self.item_pos += 1;
-                        } else {
-                            self.table_pos += 1;
-                            self.phase = BindPhase::MeasureTable;
                         }
                     }
                     BindPhase::MeasureViews => {
@@ -4550,6 +4696,7 @@ mod conservative_copy {
                 // appended/reset-derived claim backing before the first write.
                 pins.claim_backing = Some(claims);
                 pins.rebind_owner = Some(identity);
+                pins.rebind_complete = false;
                 pins.phase = Phase::Rebinding;
                 pins.output
                     .as_mut()
@@ -5051,12 +5198,7 @@ mod conservative_copy {
                 }
                 for _ in 0..credits {
                     match cursor.phase {
-                        BindPhase::MeasureModule
-                        | BindPhase::MeasureExports
-                        | BindPhase::MeasureInterfaces
-                        | BindPhase::MeasureTable
-                        | BindPhase::MeasureEntries
-                        | BindPhase::MeasureSkips
+                        BindPhase::MeasureInput
                         | BindPhase::MeasureViews
                         | BindPhase::MeasurePin
                         | BindPhase::MeasurePinExports => {
@@ -5074,7 +5216,7 @@ mod conservative_copy {
                                 &mut self.rebind_old_pins,
                             )?;
                             if cursor.phase == BindPhase::Ready {
-                                self.phase = Phase::Ready;
+                                self.rebind_complete = true;
                                 return Ok(GraphStep::Ready);
                             }
                         }
@@ -5140,7 +5282,7 @@ mod conservative_copy {
                         continue;
                     }
                     let actual = pins.as_deref().and_then(|owner| owner.output.as_ref());
-                    self.reclaim_one(actual)?;
+                    self.reclaim_one(actual, None)?;
                     if self.phase == BindPhase::Reclaimed {
                         self.release_loan(pins)?;
                         return Ok(GraphStep::Ready);
@@ -5156,8 +5298,23 @@ mod conservative_copy {
                 &mut self,
                 canonical: &mut Vec<ReconciledModule>,
             ) -> Result<InstalledModulesBacking, GraphRefusal> {
-                let _ = canonical;
-                Err(GraphRefusal::Identity)
+                if self.cancelled {
+                    return Err(GraphRefusal::Cancelled);
+                }
+                match self.phase {
+                    BindPhase::Ready => {}
+                    BindPhase::Installed | BindPhase::Reclaim | BindPhase::Reclaimed => {
+                        return Err(GraphRefusal::Cancelled);
+                    }
+                    _ => return Err(GraphRefusal::Identity),
+                }
+                std::mem::swap(&mut self.modules, canonical);
+                self.phase = BindPhase::Installed;
+                Ok(InstalledModulesBacking {
+                    input_storage: self.input_storage.take(),
+                    output_storage: self.output_storage.take(),
+                    header_storage: self.header_storage.take(),
+                })
             }
 
             /// Reclaims the old canonical modules against the live installed
@@ -5171,8 +5328,37 @@ mod conservative_copy {
                 reserve: &SemanticResourceReserver,
                 work: usize,
             ) -> Result<GraphStep, GraphRefusal> {
-                let _ = (pins, live_pins, handoff, reserve, work);
-                Err(GraphRefusal::Identity)
+                // Module exports drain exclusively and modules hold no files,
+                // so installed rebind reclaim takes but never fills the
+                // handoff; the shared reservation stays untouched. These
+                // parameters keep the graph's per-credit reclaim loop uniform.
+                let _ = (handoff, reserve);
+                if work == 0 {
+                    return Ok(GraphStep::Yielded);
+                }
+                if self.phase == BindPhase::Reclaimed {
+                    return Ok(GraphStep::Ready);
+                }
+                if self.phase != BindPhase::Installed {
+                    return Err(GraphRefusal::Identity);
+                }
+                let fence = self.fence.ok_or(GraphRefusal::Identity)?;
+                if live_pins.copy_source != Some(fence.candidate)
+                    || pins.installed != Some(fence.candidate)
+                    || pins.rebind_owner.is_some_and(|held| held != fence.input)
+                    || pins.rebind_old_pins.is_some()
+                {
+                    return Err(GraphRefusal::Identity);
+                }
+                for _ in 0..work {
+                    let old = pins.output.as_ref();
+                    self.reclaim_one(Some(live_pins), old)?;
+                    if self.phase == BindPhase::Reclaimed {
+                        pins.rebind_owner = None;
+                        return Ok(GraphStep::Ready);
+                    }
+                }
+                Ok(GraphStep::Advanced)
             }
 
             fn release_loan(
@@ -5191,6 +5377,7 @@ mod conservative_copy {
                             return Err(GraphRefusal::Identity);
                         }
                         pins.rebind_owner = None;
+                        pins.rebind_complete = false;
                         pins.phase = if self.completed && !self.cancelled {
                             Phase::Ready
                         } else {
@@ -5201,7 +5388,11 @@ mod conservative_copy {
                 Ok(())
             }
 
-            fn reclaim_one(&mut self, pins: Option<&PinnedObjects>) -> Result<(), GraphRefusal> {
+            fn reclaim_one(
+                &mut self,
+                pins: Option<&PinnedObjects>,
+                old: Option<&PinnedObjects>,
+            ) -> Result<(), GraphRefusal> {
                 if let Some(skip) = &mut self.old_skip_leaf {
                     if reclaim_skip(skip) {
                         self.old_skip_leaf = None;
@@ -5217,7 +5408,7 @@ mod conservative_copy {
                     return Ok(());
                 }
                 if let Some(module) = &mut self.reconciled_drain {
-                    if module.advance(pins)? {
+                    if module.advance(pins, old)? {
                         self.reconciled_drain = None;
                     }
                     return Ok(());
@@ -5391,7 +5582,11 @@ mod conservative_copy {
                     drained: 0,
                 }
             }
-            fn advance(&mut self, pins: Option<&PinnedObjects>) -> Result<bool, GraphRefusal> {
+            fn advance(
+                &mut self,
+                pins: Option<&PinnedObjects>,
+                old: Option<&PinnedObjects>,
+            ) -> Result<bool, GraphRefusal> {
                 if let Some(module) = &mut self.module {
                     if module.advance() {
                         self.module = None;
@@ -5406,10 +5601,13 @@ mod conservative_copy {
                     return Ok(false);
                 }
                 if let Some(exports) = self.exports.as_mut() {
-                    if pins
+                    let live_alias = pins
                         .and_then(|pins| pins.by_id.get(&self.object))
-                        .is_some_and(|entry| Arc::ptr_eq(&entry.exports, exports))
-                    {
+                        .is_some_and(|entry| Arc::ptr_eq(&entry.exports, exports));
+                    let old_alias = old
+                        .and_then(|pins| pins.by_id.get(&self.object))
+                        .is_some_and(|entry| Arc::ptr_eq(&entry.exports, exports));
+                    if live_alias || old_alias {
                         drop(self.exports.take());
                         return Ok(false);
                     }

@@ -22,6 +22,7 @@ SCHEMA = "p11scope-counter-object/v3"
 ROOTS = {"p11_entry": "uprobe", "p11_return": "uretprobe"}
 STATS_BYTES = {"counts": 24, "timestamps": 40, "latency": 296}
 U64_MAX = (1 << 64) - 1
+CLOCK_TAG = "clock"
 WIDTHS = {0: 4, 8: 2, 16: 1, 24: 8}
 FORBIDDEN_HELPERS = {4, 25, 112, 114, 115, 130, 131, 132, 133, 134}
 # Exact endpoint helper family consumed by the current producer. Other clock
@@ -592,6 +593,10 @@ def singleton(value):
     return value[2] if value and value[0] == "scalar" and value[2] == value[3] else None
 
 
+def bank_is_clock(value):
+    return bool(value and value[0] == "scalar" and value[1] == CLOCK_TAG)
+
+
 def join_fact(left, right):
     if left == right:
         return left
@@ -615,6 +620,8 @@ def narrowed(value, bits):
         return scalar(0, (1 << bits) - 1)
     maximum = (1 << bits) - 1
     if value[3] <= maximum:
+        if value[1] == CLOCK_TAG and bits < 64:
+            return scalar(value[2], value[3])
         return value
     exact = singleton(value)
     return constant(exact & maximum) if exact is not None else scalar(0, maximum)
@@ -634,7 +641,7 @@ def scalar_alu(left, right, operation, bits):
         if operation in operations:
             return constant(operations[operation]() & mask)
     if operation == 0x50 and b is not None:
-        tag = left[1] if b == mask else (
+        tag = left[1] if b == mask and left[1] != CLOCK_TAG else (
             "key_slot" if left[1] == "key_slot_pad" and b == 0xffffffff else None)
         return scalar(0, min(left[3], b), tag)
     if operation == 0x70 and b is not None:
@@ -793,10 +800,13 @@ class MemoryProof:
             return self.stack_cell(memory, pointer[1], pointer[2], width)
         return None
 
+    def validate_function_call(self, target, registers, key, pc):
+        pass
+
     def helper(self, number, registers, memory, key, pc):
         if number in FORBIDDEN_HELPERS or number not in ALLOWED_HELPERS:
             raise RuntimeError(f"endpoint reaches forbidden/unknown helper {number}")
-        result = scalar()
+        result = scalar(tag=CLOCK_TAG) if number == 5 else scalar()
         if number in (1, 2, 3, 156, 157):
             mapped = registers[1]
             if not mapped or mapped[0] != "map" or mapped[1] not in self.maps:
@@ -929,6 +939,7 @@ class MemoryProof:
                 if kind == "helper":
                     self.helper(target, registers, memory, key, pc)
                 else:
+                    self.validate_function_call(target, registers, key, pc)
                     result, memory = self.run(target, registers[1:6], memory, path + (key,))
                     registers[:6] = [result, None, None, None, None, None]
             elif op == 0x95:
@@ -1645,6 +1656,13 @@ class BankFootprint(MemoryProof):
                 return False
         return MemoryProof.refine(registers, destination, left, immediate, operation, taken)
 
+    def validate_function_call(self, target, registers, key, pc):
+        if self.mode in ("timestamps", "latency") and self.graph is not None:
+            bodies = getattr(self.graph, "bodies", {})
+            callee = bodies.get(target, ("",))[0] if isinstance(bodies, dict) else ""
+            if callee in BANK_TIMED_GLOBALS:
+                bank_require_timed_bridge_clock(callee, registers, self.mode)
+
     def helper(self, number, registers, memory, key, pc):
         mapped = registers[1]
         if number == 1 and mapped == ("map", "COUNTER_BANKS") and self.growth:
@@ -1731,9 +1749,17 @@ class BankExecution:
     RV and fault operations execute the actual ELF.
     """
 
-    def __init__(self, graph, *, optimized_optional_get=False, optimized_aggregate=False, growth=False):
+    def __init__(self, graph, *, optimized_optional_get=False, optimized_aggregate=False,
+                 growth=False, mode="counts"):
+        if mode not in STATS_BYTES:
+            raise RuntimeError("unknown counter mode")
+        if not growth and mode != "counts":
+            raise RuntimeError("format1 bank proof is counts-only")
         self.graph = graph
         self.growth = growth
+        self.mode = mode
+        self.cell_bytes = STATS_BYTES[mode]
+        self.config_word = BANK_GROWTH_CONFIGS[mode] if growth else BANK_CONFIG
         self.optimized_optional_get = optimized_optional_get
         self.optimized_aggregate = optimized_aggregate
         self.native_get_probe = None
@@ -1758,10 +1784,10 @@ class BankExecution:
                      self.growth_route(slot, slot + 1, slot, slot + 1) if growth else
                      struct.pack("<QQII", slot + 1, 1 << slot, slot, 1))
             self.set("COUNTER_BANK_COMMIT", slot + 1,
-                     struct.pack("<IIQ", slot, slot + 1, BANK_GROWTH_CONFIG) if growth else
+                     struct.pack("<IIQ", slot, slot + 1, self.config_word) if growth else
                      struct.pack("<QQ", 1 << slot, BANK_CONFIG))
             self.set("COUNTER_BANKS", bank, self.handles[f"bank{bank}"].to_bytes(8, "little"))
-            self.bank_storage[slot] = self.set(f"bank{bank}", cell, bytes(24))
+            self.bank_storage[slot] = self.set(f"bank{bank}", cell, bytes(self.cell_bytes))
         self.set("COUNTER_BANK_FAULT", 0, bytes(8))
         for index in (0, 1):
             self.set("COUNTER_HEALTH", index, bytes(8))
@@ -1801,15 +1827,27 @@ class BankExecution:
         at = self.bank_storage[slot]
         return tuple(self.read(at + offset, 8) for offset in (0, 8, 16))
 
+    def timing_row(self, slot):
+        if self.mode not in ("timestamps", "latency"):
+            raise RuntimeError("timing row requires a timing mode")
+        at = self.bank_storage[slot]
+        return tuple(self.read(at + offset, 8) for offset in (0, 8, 16, 24, 32))
+
+    def bucket(self, slot, index):
+        if self.mode != "latency" or not 0 <= index < 32:
+            raise RuntimeError("latency bucket requires its mode and finite index")
+        return self.read(self.bank_storage[slot] + 40 + index * 8, 8)
+
     def fault(self):
         return self.read(self.cells["COUNTER_BANK_FAULT", bytes(4)], 8)
 
     def health(self, index):
         return self.read(self.cells["COUNTER_HEALTH", index.to_bytes(4, "little")], 8)
 
-    def start(self, slot, marker=0):
+    def start(self, slot, marker=0, ts=0):
         key = struct.pack("<QII", 9, slot, 0)
         body = bytearray(288)
+        struct.pack_into("<Q", body, 0, ts & U64_MAX)
         struct.pack_into("<Q", body, 264, marker)
         self.starts[key] = self.set("START", key, body)
         self.debt += 1
@@ -1851,13 +1889,14 @@ class BankExecution:
             raise RuntimeError("bank owner call lost original physical START key")
         self.trace.append(("owner", key, pc, name, tuple(registers[1:6]), tuple(origins)))
         if name == "p11_owner_start_aggregate":
-            if registers[2] != 0 and not self.optimized_aggregate:
-                raise RuntimeError("Counts START acquires a nonzero timestamp")
+            if self.mode == "counts":
+                if registers[2] != 0 and not self.optimized_aggregate:
+                    raise RuntimeError("Counts START acquires a nonzero timestamp")
             if self.failed_admission:
                 return 0
             if raw_key in self.starts:
                 raise RuntimeError("bank execution attempts duplicate START admission")
-            self.start(slot)
+            self.start(slot, ts=registers[2] if self.mode != "counts" else 0)
             return 1
         if name == "p11_owner_start_get":
             if registers[2] != 0 and not self.optimized_optional_get:
@@ -2429,6 +2468,242 @@ def bank_growth_scenarios(graph, optional_get, optimized_aggregate):
     return reports, executions
 
 
+def bank_timing_bucket(delta):
+    if type(delta) is not int or not 0 <= delta <= U64_MAX:
+        raise RuntimeError("timing bucket needs a finite u64 delta")
+    return 0 if delta == 0 else min(delta.bit_length(), 31)
+
+
+def bank_timing_growth_scenarios(graph, optional_get, optimized_aggregate, mode):
+    """Small literal format2 timing inputs executing actual timed bridge bytes.
+
+    Ports the counts growth cells, boundaries and health dispositions with
+    ts/now plumbing: delta is now-ts with a backward clock giving zero, and
+    latency buckets count the same delta. Routing, commit, RV and fault
+    behavior is identical to counts; only the timestamp arguments and the
+    total/max/bucket expectations are new.
+    """
+    if mode not in ("timestamps", "latency"):
+        raise RuntimeError("unknown counter mode")
+    reports, executions = {}, []
+    config = BANK_GROWTH_CONFIGS[mode]
+    timed_enter, timed_complete = "p11_bank_enter_timed", "p11_bank_complete_timed"
+
+    def new_vm():
+        return BankExecution(graph, optimized_optional_get=optional_get is not None,
+                             optimized_aggregate=optimized_aggregate, growth=True, mode=mode)
+
+    def check(name, vm, rows=None, timing=None, buckets=None, debt=0, fault=0, rv=None):
+        rows, timing, buckets = rows or {}, timing or {}, buckets or {}
+        actual_rv = {}
+        for (mapped, raw_key), address in vm.cells.items():
+            if mapped == "RV_COUNTS":
+                slot, pad, value = struct.unpack("<IIQ", raw_key)
+                if pad:
+                    raise RuntimeError("format2 timing RV key has nonzero padding")
+                actual_rv[slot, value] = vm.read(address, 8)
+        for slot in vm.bank_storage:
+            if vm.row(slot) != rows.get(slot, (0, 0, 0)):
+                raise RuntimeError(f"actual format2 timing scenario violates custody/counts: {name}")
+            want_total, want_max = timing.get(slot, (0, 0))
+            if vm.timing_row(slot) != rows.get(slot, (0, 0, 0)) + (want_total, want_max):
+                raise RuntimeError(f"actual format2 timing scenario violates total/max: {name}")
+            if mode == "latency":
+                for index in range(32):
+                    if vm.bucket(slot, index) != buckets.get((slot, index), 0):
+                        raise RuntimeError(
+                            f"actual format2 timing scenario violates buckets: {name}")
+        if (rows.keys() - vm.bank_storage.keys() or timing.keys() - vm.bank_storage.keys()
+                or {slot for slot, _ in buckets} - vm.bank_storage.keys()
+                or vm.debt != debt or vm.fault() != fault or len(vm.starts) > debt
+                or actual_rv != (rv or {})):
+            raise RuntimeError(f"actual format2 timing scenario violates custody/counts: {name}")
+        reports[name] = "accepted"
+        executions.append(vm)
+
+    melted = bank_timing_bucket(1000)
+    for slot in (0, 511, 512, 8191):
+        vm = new_vm()
+        vm.run(timed_enter, (slot, 9, 1000))
+        vm.run(timed_complete, (slot, 9, 0, 1, 2000))
+        vm.run(timed_complete, (slot, 9, 0, 1, 2000))  # once only
+        check(f"logical_slot_{slot}", vm, {slot: (1, 1, 0)}, {slot: (1000, 1000)},
+              {(slot, melted): 1} if mode == "latency" else {}, rv={(slot, 0): 1})
+    for slot in (8192, 0xffffffff):
+        vm = new_vm()
+        vm.run(timed_enter, (slot, 9, 1000))
+        check("invalid_logical_slot", vm, fault=1)
+
+    vm = new_vm()
+    vm.delete("COUNTER_BANK_COMMIT", 1)
+    vm.run(timed_enter, (0, 9, 1000))
+    check("inactive_entry", vm)
+    vm.set("COUNTER_BANK_COMMIT", 1, struct.pack("<IIQ", 0, 1, config))
+    vm.run(timed_complete, (0, 9, 0x100000001, 1, 2000))
+    check("precommit_return_after_commit", vm)
+
+    vm = new_vm()
+    vm.delete("COUNTER_BANK_COMMIT", 2)
+    vm.run(timed_enter, (0, 9, 1000))
+    vm.run(timed_enter, (1, 9, 1000))
+    check("inactive_cell_beside_published_cell", vm, {0: (1, 0, 0)}, debt=1)
+    vm.set("COUNTER_BANK_COMMIT", 2, struct.pack("<IIQ", 1, 2, config))
+    vm.run(timed_complete, (1, 9, 0, 1, 2000))  # never admitted before commit
+    vm.run(timed_enter, (1, 9, 1500))
+    vm.run(timed_complete, (0, 9, 0, 1, 2000))
+    vm.run(timed_complete, (0, 9, 0, 1, 2000))
+    vm.run(timed_complete, (1, 9, U64_MAX, 1, 2500))
+    check("old_bank_keeps_original_transaction", vm,
+          {0: (1, 1, 0), 1: (1, 1, 1)},
+          {0: (1000, 1000), 1: (1000, 1000)},
+          {(0, melted): 1, (1, melted): 1} if mode == "latency" else {},
+          rv={(0, 0): 1, (1, U64_MAX): 1})
+
+    vm = new_vm()
+    transaction = 0x100000010
+    for slot in (511, 512):
+        vm.set("COUNTER_BANK_META", slot, vm.growth_route(slot, transaction, 511, 513))
+    vm.set("COUNTER_BANK_COMMIT", transaction, struct.pack("<IIQ", 511, 513, config))
+    for slot in (511, 512):
+        vm.run(timed_enter, (slot, 9, 1000))
+        vm.run(timed_complete, (slot, 9, 0, 1, 2000))
+    check("cross_bank_extent_511_513", vm,
+          {511: (1, 1, 0), 512: (1, 1, 0)},
+          {511: (1000, 1000), 512: (1000, 1000)},
+          {(511, melted): 1, (512, melted): 1} if mode == "latency" else {},
+          rv={(511, 0): 1, (512, 0): 1})
+
+    vm = new_vm()
+    vm.start(511, ts=1000)
+    vm.run(timed_complete, (0, 9, 0, 1, 2000))
+    check("absent_return_preserves_other_start", vm, debt=1)
+    vm = new_vm()
+    vm.start(0, ts=1000)
+    vm.starts.clear()
+    vm.run(timed_complete, (0, 9, 0, 1, 2000))
+    check("absent_return_preserves_lost_debt", vm, debt=1)
+    for slot in (0, 511, 512, 8191):
+        bank, cell = slot >> 9, slot & 511
+        for missing in ("COUNTER_BANK_META", "COUNTER_BANKS", f"bank{bank}", "COUNTER_BANK_COMMIT"):
+            vm = new_vm()
+            vm.run(timed_enter, (slot, 9, 1000))
+            vm.delete(missing, slot if missing == "COUNTER_BANK_META" else
+                      bank if missing == "COUNTER_BANKS" else
+                      slot + 1 if missing == "COUNTER_BANK_COMMIT" else cell)
+            vm.run(timed_complete, (slot, 9, 0, 1, 2000))
+            check("missing_route_retires_start", vm, {slot: (1, 0, 0)}, fault=1)
+    vm = new_vm()
+    vm.start(8191, ts=1000)
+    vm.failed_retirement = True
+    vm.run(timed_complete, (8191, 9, U64_MAX, 1, 2000))
+    check("failed_retirement_keeps_debt", vm, debt=1, fault=2)
+
+    for transaction in (0x100000007, U64_MAX):
+        vm = new_vm()
+        vm.set("COUNTER_BANK_META", 0, vm.growth_route(0, transaction, 0, 1))
+        vm.set("COUNTER_BANK_COMMIT", transaction, struct.pack("<IIQ", 0, 1, config))
+        vm.run(timed_enter, (0, 9, 1000))
+        vm.run(timed_complete, (0, 9, transaction, 1, 2000))
+        check("full_width_transaction", vm, {0: (1, 1, 1)}, {0: (1000, 1000)},
+              {(0, melted): 1} if mode == "latency" else {}, rv={(0, transaction): 1})
+    vm = new_vm()
+    vm.set("COUNTER_BANK_META", 0, vm.growth_route(0, 0x100000007, 0, 1))
+    vm.set("COUNTER_BANK_COMMIT", 7, struct.pack("<IIQ", 0, 1, config))
+    vm.run(timed_enter, (0, 9, 1000))
+    vm.run(timed_complete, (0, 9, 0, 1, 2000))
+    check("high32_transaction_alias", vm)
+
+    for slot, first, end, transaction, fields in (
+            (0, 0, 1, 0, {}), (0, 1, 2, 1, {}), (1, 0, 1, 2, {}),
+            (0, 1, 1, 1, {}), (0, 0, 8193, 1, {}),
+            (0, 0, 1, 1, {"bank": 1}), (511, 511, 512, 512, {"cell": 0}),
+            (0, 0, 1, 1, {"inner_id": 0}), (0, 0, 1, 1, {"reserved_zero": 1})):
+        vm = new_vm()
+        vm.set("COUNTER_BANK_META", slot, vm.growth_route(slot, transaction, first, end, **fields))
+        vm.set("COUNTER_BANK_COMMIT", transaction, struct.pack("<IIQ", first, end, config))
+        vm.run(timed_enter, (slot, 9, 1000))
+        check("wrong_exact_set_or_config", vm, fault=1)
+    for first, end, word in ((1, 1, config), (0, 2, config),
+                             (0, 1, BANK_GROWTH_CONFIGS["counts"]),
+                             (0, 1, config ^ (1 << 56)), (0, 1, config ^ 1)):
+        vm = new_vm()
+        vm.set("COUNTER_BANK_COMMIT", 1, struct.pack("<IIQ", first, end, word))
+        vm.run(timed_enter, (0, 9, 1000))
+        check("wrong_exact_set_or_config", vm, fault=1)
+    vm = new_vm()
+    vm.set("COUNTER_BANK_META", 0, vm.growth_route(0, 1, 0, 1, inner_id=999))
+    vm.run(timed_enter, (0, 9, 1000))
+    vm.run(timed_complete, (0, 9, 0, 1, 2000))
+    check("nonzero_inner_id_is_host_obligation", vm, {0: (1, 1, 0)}, {0: (1000, 1000)},
+          {(0, melted): 1} if mode == "latency" else {}, rv={(0, 0): 1})
+
+    vm = new_vm()
+    vm.run(timed_enter, (511, 9, 1000))
+    pointer = vm.starts[struct.pack("<QII", 9, 511, 0)]
+    for index, byte in enumerate(U64_MAX.to_bytes(8, "little")):
+        vm.memory[pointer + 16 + index] = byte
+    vm.run(timed_complete, (511, 9, 0, 1, 2000))
+    check("start_payload_does_not_route", vm, {511: (1, 1, 0)}, {511: (1000, 1000)},
+          {(511, melted): 1} if mode == "latency" else {}, rv={(511, 0): 1})
+    vm = new_vm()
+    vm.run(timed_enter, (512, 9, 1000))
+    vm.run(timed_complete, (512, 9, 0, 0, 2000))
+    check("scope_refusal_retires_without_credit", vm, {512: (1, 0, 0)}, fault=8)
+    vm = new_vm()
+    vm.failed_admission = True
+    vm.run(timed_enter, (0, 9, 1000))
+    vm.run(timed_complete, (0, 9, 0, 1, 2000))
+    check("admission_failure_is_sticky", vm, {0: (1, 0, 0)}, fault=2)
+    vm = new_vm()
+    for rv in (0x100000001, 0x100000001, U64_MAX):
+        vm.run(timed_enter, (8191, 9, 1000))
+        vm.run(timed_complete, (8191, 9, rv, 1, 2000))
+    check("rv_full_width_accumulates", vm, {8191: (3, 3, 3)}, {8191: (3000, 1000)},
+          {(8191, melted): 3} if mode == "latency" else {},
+          rv={(8191, 0x100000001): 2, (8191, U64_MAX): 1})
+    for rv, errors, name in ((0x204, 0, "pending_is_returned_without_error"),
+                             (0x100000204, 1, "pending_high_alias_is_full_width_error")):
+        vm = new_vm()
+        vm.run(timed_enter, (0, 9, 1000))
+        vm.run(timed_complete, (0, 9, rv, 1, 2000))
+        check(name, vm, {0: (1, 1, errors)}, {0: (1000, 1000)},
+              {(0, melted): 1} if mode == "latency" else {}, rv={(0, rv): 1})
+    vm = new_vm()
+    vm.failed_rv_insert = True
+    vm.run(timed_enter, (512, 9, 1000))
+    vm.run(timed_complete, (512, 9, 0, 1, 2000))
+    check("rv_failure_is_sticky", vm, {512: (1, 1, 0)}, {512: (1000, 1000)},
+          {(512, melted): 1} if mode == "latency" else {}, fault=4)
+    vm = new_vm()
+    vm.run(timed_enter, (0, 9, 2000))
+    vm.run(timed_complete, (0, 9, 0, 1, 1000))
+    check("backward_clock_gives_zero_delta", vm, {0: (1, 1, 0)}, {0: (0, 0)},
+          {(0, 0): 1} if mode == "latency" else {}, rv={(0, 0): 1})
+    vm = new_vm()
+    vm.bank_storage[0] = vm.set("bank0", 0, struct.pack("<QQQ", U64_MAX, 0, 0)
+                                + bytes(vm.cell_bytes - 24))
+    vm.run(timed_enter, (0, 9, 1000))
+    check("entered_saturates_without_wrap", vm, {0: (U64_MAX, 0, 0)}, debt=1)
+    if vm.health(0) != 1 or vm.health(1):
+        raise RuntimeError("format2 timing saturation loses its health disposition")
+    vm = new_vm()
+    vm.contended.add("bank15")
+    vm.run(timed_enter, (8191, 9, 1000))
+    check("bounded_contention_is_unhealthy", vm, {8191: (8, 0, 0)}, debt=1)
+    if vm.health(1) != 1 or vm.health(0) or vm.cas_attempts.get("bank15") != 8:
+        raise RuntimeError("format2 timing contention loses its eight-attempt/health bound")
+    vm = new_vm()
+    vm.bank_storage[0] = vm.set("bank0", 0, struct.pack("<QQQQQ", 0, 0, 0, U64_MAX, 0)
+                                + bytes(vm.cell_bytes - 40))
+    vm.run(timed_enter, (0, 9, 1000))
+    vm.run(timed_complete, (0, 9, 0, 1, 2000))
+    check("total_saturates_without_wrap", vm, {0: (1, 1, 0)}, {0: (U64_MAX, 1000)},
+          {(0, melted): 1} if mode == "latency" else {}, rv={(0, 0): 1})
+    if vm.health(0) != 1:
+        raise RuntimeError("format2 timing total saturation loses its health disposition")
+    return reports, executions
+
+
 def bank_require_root_work(names, mode, entry):
     """Every bank root must reach its bridge plus matched START custody."""
     if mode == "counts":
@@ -2457,6 +2732,26 @@ def bank_require_root_helpers(calls, mode):
             raise RuntimeError(f"bank {mode} root reaches forbidden/unknown helper {helper}")
     if not any(helper == 5 for helper in calls):
         raise RuntimeError(f"bank {mode} root has no clock read")
+
+
+def bank_require_timed_bridge_clock(callee, registers, mode):
+    """Timing bridges take only fresh clock reads as their timestamp args.
+
+    r3 carries ts into p11_bank_enter_timed; r5 carries now into
+    p11_bank_complete_timed. The tag comes only from helper 5 and survives
+    only full-width moves and spills. Constants, pid_tgid and START bytes
+    all refuse with a finite named cause.
+    """
+    if mode not in ("timestamps", "latency"):
+        raise RuntimeError("unknown counter mode")
+    if callee == "p11_bank_enter_timed":
+        if not bank_is_clock(registers[3]):
+            raise RuntimeError(
+                f"bank {mode} entry passes a non-clock timestamp to its timed bridge")
+    elif callee == "p11_bank_complete_timed":
+        if not bank_is_clock(registers[5]):
+            raise RuntimeError(
+                f"bank {mode} return passes a non-clock timestamp to its timed bridge")
 
 
 def bank_required_inner_offsets(mode, entry):
@@ -2545,6 +2840,60 @@ def bank_require_start_read_before_remove(touches, calls, bodies, reached):
             raise RuntimeError("bank timing return retires START before reading its entry timestamp")
 
 
+def bank_require_timing_return_order(graph, reached, touches, calls, bodies):
+    """Timing return order by control flow on every path, same function.
+
+    START ts_ns is read before p11_owner_start_remove, and START removal
+    happens before any bank accounting write. A read in another function
+    cannot prove liveness, and pc order cannot prove dominance: every path
+    from entry to each site must pass through its guard.
+    """
+    for key in reached:
+        instructions = graph.instructions.get(key)
+        if not instructions:
+            continue
+
+        def successors(pc):
+            op, _, offset, immediate = instructions[pc]
+            if op == 0x95:
+                return ()
+            if op == 0x18:
+                return (pc + 2,)
+            if op & 7 in (5, 6) and op != 0x85:
+                target = pc + 1 + (immediate if op == 0x06 else offset)
+                return (target,) if not op & 0xf0 else (pc + 1, target)
+            return (pc + 1,)
+
+        def reaches(start, end, cut):
+            pending, seen = [start], set()
+            while pending:
+                at = pending.pop()
+                if at in cut or at in seen or at not in instructions:
+                    continue
+                if at == end:
+                    return True
+                seen.add(at)
+                pending.extend(successors(at))
+            return False
+
+        removes = [pc for (call_key, pc), (kind, target) in calls.items()
+                   if call_key == key and kind == "function"
+                   and bodies.get(target, ("",))[0] == "p11_owner_start_remove"]
+        reads = [pc for (touch_key, pc, name, action, span, width, _) in touches
+                 if touch_key == key and name == "START" and action == "read"
+                 and span == (0, 0) and width == 8]
+        writes = [pc for (touch_key, pc, name, action, _, _, _) in touches
+                  if touch_key == key and name == "COUNTER_BANK_VALUE"
+                  and action == "write"]
+        for remove_pc in removes:
+            if reaches(0, remove_pc, set(reads)):
+                raise RuntimeError(
+                    "bank timing return retires START before reading its entry timestamp")
+        for write_pc in writes:
+            if reaches(0, write_pc, set(removes)):
+                raise RuntimeError("bank timing return accounts before retiring START")
+
+
 def validate_bank_proof(body, *, growth=False, mode="counts"):
     if mode not in STATS_BYTES:
         raise RuntimeError("unknown counter mode")
@@ -2593,8 +2942,8 @@ def validate_bank_proof(body, *, growth=False, mode="counts"):
         if mode != "counts":
             bank_require_health(proof.health)
             if not entry:
-                bank_require_start_read_before_remove(
-                    proof.touches, graph.calls, graph.bodies, reached)
+                bank_require_timing_return_order(
+                    graph, reached, proof.touches, graph.calls, graph.bodies)
         roots[name] = {"stack_chain": frame_and_chain(graph, root, frames),
                        "clocks": sum(1 for helper in calls if helper == 5),
                        "semantic_or_event_work": False}
@@ -2606,7 +2955,11 @@ def validate_bank_proof(body, *, growth=False, mode="counts"):
             graph, graph.only("p11_owner_start_aggregate"))
         controls, executions = bank_growth_scenarios(graph, optional_get, optimized_aggregate)
     elif growth:
-        optional_get, executions, controls = None, [], {}
+        optional_get = bank_optional_start_get(graph)
+        optimized_aggregate = bank_erased_second_argument(
+            graph, graph.only("p11_owner_start_aggregate"))
+        controls, executions = bank_timing_growth_scenarios(
+            graph, optional_get, optimized_aggregate, mode)
     else:
         optional_get = bank_optional_start_get(graph)
         optimized_aggregate = bank_erased_second_argument(

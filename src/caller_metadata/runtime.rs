@@ -77,7 +77,7 @@ impl MemoryCharge {
     fn reserve(budget: &Arc<MemoryBudget>, bytes: usize) -> Option<Self> {
         let previous = budget
             .used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(bytes)
                     .filter(|next| *next <= CALLER_METADATA_TABLE_CEILING)
             })

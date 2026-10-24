@@ -90,7 +90,7 @@ impl CgroupFence {
     pub(crate) fn invalidate(&self) {
         let _ = self
             .0
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
                 value.checked_add(1)
             });
     }

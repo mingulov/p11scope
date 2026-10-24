@@ -25,7 +25,7 @@ fn allocate_from(issued: &AtomicU64) -> Result<NonZeroU64, Exhausted> {
     // Reservation order defines identity order. No other memory is published
     // by this token, so neither a fence nor completion-order guarantee applies.
     let previous = issued
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
             last.checked_add(1)
         })
         .map_err(|_| Exhausted)?;

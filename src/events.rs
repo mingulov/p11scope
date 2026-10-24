@@ -768,7 +768,7 @@ impl<S: BoundedRecordSource> EventDrain<S> {
             .cut_lineage
             .get_or_init(|| {
                 NEXT_EVENTS_CURSOR
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
                         last.checked_add(1)
                     })
                     .ok()

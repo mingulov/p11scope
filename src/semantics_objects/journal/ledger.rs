@@ -102,7 +102,7 @@ impl StagingLedger {
             next_keyassoc: 0,
             next_raw: 0,
             generation: NEXT_LEDGER_GENERATION
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
                     last.checked_add(1)
                 })
                 .ok()

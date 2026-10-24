@@ -941,7 +941,7 @@ static NEXT_PIN_COPY_SELECTION: AtomicU64 = AtomicU64::new(0);
 
 fn mint_pin_copy_cache_id(counter: &AtomicU64) -> Option<PinCopyCacheId> {
     let previous = counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
             old.checked_add(1)
         })
         .ok()?;

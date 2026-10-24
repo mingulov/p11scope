@@ -468,7 +468,7 @@ impl NativeDomainId {
 
 fn mint_domain_from(counter: &AtomicU64) -> Result<NativeDomainId> {
     let value = counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
             if next == 0 { None } else { next.checked_add(1) }
         })
         .map_err(|_| anyhow::anyhow!("native identity domain exhausted"))?;

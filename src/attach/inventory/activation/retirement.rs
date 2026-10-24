@@ -378,7 +378,7 @@ impl RetirementFallbackEvidence {
         } else {
             &self.0.records
         };
-        let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+        let _ = counter.try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
             Some(value.saturating_add(1))
         });
     }
@@ -387,7 +387,7 @@ impl RetirementFallbackEvidence {
         let _ = self
             .0
             .worker_failures
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
                 Some(value.saturating_add(1))
             });
     }

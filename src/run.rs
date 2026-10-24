@@ -1790,7 +1790,7 @@ impl Drop for OwnedChild {
 
 fn allocate_generation() -> io::Result<NonZeroU64> {
     let generation = NEXT_GENERATION
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             current.checked_add(1).filter(|next| *next != 0)
         })
         .map_err(|_| io::Error::other("owned pause generation space exhausted"))?;
@@ -1988,7 +1988,7 @@ impl SignalState {
         }
         let _ = self
             .state
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |state| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |state| {
                 let first = state & 0xff;
                 let count = (state >> 8) & 3;
                 let first = if first == 0 { signal as u64 } else { first };
@@ -2005,7 +2005,7 @@ impl SignalState {
     fn record_first(&self, signal: libc::c_int) {
         let _ = self
             .state
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |state| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |state| {
                 (state & 0xff == 0).then_some(state | signal as u64)
             });
     }

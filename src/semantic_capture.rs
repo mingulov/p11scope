@@ -1241,7 +1241,7 @@ impl SemanticCapture {
             "invalid semantic work limits"
         );
         let identity = NEXT_SEMANTIC_CAPTURE
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
                 last.checked_add(1)
             })
             .map_err(|_| anyhow::anyhow!("semantic capture identity exhausted"))?

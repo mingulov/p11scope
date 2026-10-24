@@ -2226,7 +2226,7 @@ impl StopFlag {
                     if armed.load(Ordering::SeqCst) {
                         libc::_exit(128 + signal);
                     }
-                    let _ = count.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |seen| {
+                    let _ = count.try_update(Ordering::SeqCst, Ordering::SeqCst, |seen| {
                         (seen < 2).then_some(seen + 1)
                     });
                 })

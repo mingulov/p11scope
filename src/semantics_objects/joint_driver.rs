@@ -2004,7 +2004,7 @@ impl RawJointQuantum {
             return Err(RawQuantumRefusal::InvalidLimit);
         }
         let identity = NEXT_RAW_QUANTUM
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
                 last.checked_add(1)
             })
             .map(|last| RawQuantumIdentity(last + 1))

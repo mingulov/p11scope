@@ -305,7 +305,7 @@ impl RetainedRetirementInput {
         storage: ResourceLease,
         issuer: &AtomicU64,
     ) -> std::result::Result<Self, RetainedRetirementInputRefusal> {
-        match issuer.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |issued| {
+        match issuer.try_update(Ordering::Relaxed, Ordering::Relaxed, |issued| {
             issued.checked_add(1)
         }) {
             Ok(previous) => Ok(Self {

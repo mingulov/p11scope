@@ -24,15 +24,20 @@
 //! and go through the same `merge`, so there is exactly one implementation of the
 //! merge rules rather than two that can drift.
 
-use crate::discovery::identity::{PinnedObjectId, PinnedObjects, ReconciledModule};
+use crate::discovery::identity::{
+    GraphRefusal, GraphStep, PinnedObjectId, PinnedObjects, ReconciledModule,
+};
 pub use crate::discovery::scan::Skipped;
 use crate::discovery::scan::{
-    ObjectExports, ScannedInterface, ScannedTable, TableEvidenceScore, export_agreement,
-    order_tables_by_evidence, standard_ordinal, table_evidence_score, table_linkage,
-    table_name_authorized,
+    ObjectExports, ScannedEntry, ScannedInterface, ScannedTable, TableEvidenceScore,
+    export_agreement, order_tables_by_evidence, standard_ordinal, table_evidence_score,
+    table_linkage, table_name_authorized,
 };
 use crate::inventory_semantics::SemanticRefusal;
 use crate::kinds::AliasAgreement;
+use crate::semantics_edge::resources::{
+    OWNED_ALLOCATION_PADDING, ResourceLease, SemanticResourceReserver,
+};
 use p11scope_ebpf_common::{MAX_SLOTS, SlotSemantics};
 use p11scope_manifest::manifest::{
     Acquisition, InterfaceClassification, Manifest, ObjectRecord, Resolution, SurfaceSource,
@@ -40,6 +45,7 @@ use p11scope_manifest::manifest::{
 };
 use p11scope_manifest::maps::{Device, ObjectKey};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Immutable admission contract carried by one planner for its whole capture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -761,6 +767,80 @@ pub struct AttachPlan {
     counter_consumed_end: u32,
     admission_policy: AdmissionPolicy,
     admission_scope: AdmissionScope,
+    // Plan fence for the conservative rebuild cursor: every `&mut self`
+    // method bumps `mutations` first, and `token` is minted fresh per plan
+    // value (`Clone` mints, so whole-plan replacement changes the token).
+    // Both are transparent to `PartialEq`.
+    mutations: MutationCount,
+    token: PlanToken,
+}
+
+/// Mutation generation of one [`AttachPlan`] value. Bumped first by every
+/// `&mut self` method so the conservative cursor's fence notices in-place
+/// writes. Transparent to plan equality.
+#[derive(Clone, Copy, Debug, Default)]
+struct MutationCount(u64);
+
+impl PartialEq for MutationCount {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl MutationCount {
+    fn bump(&mut self) {
+        self.0 = self.0.wrapping_add(1);
+    }
+}
+
+/// Identity of one [`AttachPlan`] value. Minted from a process-wide counter
+/// the way `mint_pin_copy_cache_id` mints pin generations; the counter never
+/// wraps, and exhaustion (or contention loss) yields [`PLAN_TOKEN_POISON`],
+/// which the fence always refuses. `Clone` mints a fresh token, so no
+/// whole-plan replacement can replay an old fence. Transparent to plan
+/// equality; prints nothing.
+struct PlanToken(u64);
+
+/// Token value the plan fence always refuses: minted only when the token
+/// counter is exhausted.
+const PLAN_TOKEN_POISON: u64 = u64::MAX;
+
+static NEXT_PLAN_TOKEN: AtomicU64 = AtomicU64::new(0);
+
+impl PlanToken {
+    fn mint() -> Self {
+        Self(
+            NEXT_PLAN_TOKEN
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                    old.checked_add(1)
+                })
+                .unwrap_or(PLAN_TOKEN_POISON),
+        )
+    }
+}
+
+impl Clone for PlanToken {
+    fn clone(&self) -> Self {
+        Self::mint()
+    }
+}
+
+impl Default for PlanToken {
+    fn default() -> Self {
+        Self::mint()
+    }
+}
+
+impl PartialEq for PlanToken {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl std::fmt::Debug for PlanToken {
+    fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Ok(())
+    }
 }
 
 /// The one physical attachment identity. A pathname is diagnostic data, not
@@ -1007,6 +1087,8 @@ impl AttachPlan {
             admission_scope: AdmissionScope::Named,
             slot_ordinals: BTreeMap::new(),
             object_identities: BTreeMap::new(),
+            mutations: MutationCount::default(),
+            token: PlanToken::default(),
         })
     }
 
@@ -1054,6 +1136,7 @@ impl AttachPlan {
     /// plan uses. Called wherever a plan is built from pins, so a later
     /// report can identify a target even after its pin retires.
     fn note_object_identities(&mut self, pinned: &PinnedObjects) {
+        self.mutations.bump();
         let objects: BTreeSet<PinnedObjectId> = self
             .slots
             .iter()
@@ -1100,6 +1183,7 @@ impl AttachPlan {
         first: u32,
         end: u32,
     ) -> Result<(), CounterHistoryError> {
+        self.mutations.bump();
         let AdmissionPolicy::Counters(budget) = self.admission_policy else {
             return Err(CounterHistoryError::Policy);
         };
@@ -1144,16 +1228,12 @@ impl AttachPlan {
         pinned: &PinnedObjects,
         broad_admit: bool,
     ) -> AttachPlan {
+        let (pinned_id, compatible) = pinned_manifest_lookups(pinned);
         let mut rebuilt = self.rebuild_from_sources_with(
             scanned,
             manifests,
-            |key, path| pinned.id_for_manifest(key, path),
-            |provider, target| {
-                matches!(
-                    (pinned.abi_for(provider), pinned.abi_for(target)),
-                    (Some(provider), Some(target)) if provider == target
-                )
-            },
+            pinned_id,
+            compatible,
             broad_admit,
             self.admission_policy,
         );
@@ -1227,6 +1307,7 @@ impl AttachPlan {
         &mut self,
         provisional: ProvisionalGetFunctionList,
     ) -> Result<Option<Slot>, String> {
+        self.mutations.bump();
         self.validate_slot_index()?;
         let Some(module) = self
             .modules
@@ -1288,6 +1369,7 @@ impl AttachPlan {
         module: ModuleId,
         targets: impl IntoIterator<Item = SelectionTableTarget>,
     ) -> Result<(), String> {
+        self.mutations.bump();
         self.validate_slot_index()?;
         allocated.validate_slot_index()?;
         if self.admission_policy != allocated.admission_policy {
@@ -1484,6 +1566,7 @@ impl AttachPlan {
         slots: Vec<Slot>,
         remap: &BTreeMap<ModuleId, ModuleId>,
     ) {
+        self.mutations.bump();
         for owner in &mut self.aggregate_owners {
             if let AggregateOwner::Sole(id) = owner
                 && let Some(stable) = remap.get(id)
@@ -1498,6 +1581,7 @@ impl AttachPlan {
     /// proved about already-active exact targets. Candidate identities and
     /// topology remain local until their transaction commits.
     pub(crate) fn latch_ambiguity_from(&mut self, candidate: &Self) -> bool {
+        self.mutations.bump();
         let mut changed = false;
         for (key, candidate_position) in &candidate.slot_by_key {
             if candidate.aggregate_owners.get(*candidate_position)
@@ -1524,6 +1608,7 @@ impl AttachPlan {
     /// replace an existing exact target; descriptors are frozen before any
     /// attachment and can never be upgraded or otherwise mutated live.
     pub fn extend_exact(&mut self, mut rebuilt: AttachPlan) -> Result<AttachDelta, String> {
+        self.mutations.bump();
         self.validate_slot_index()?;
         rebuilt.validate_slot_index()?;
         self.validate_matching_policy(&rebuilt)?;
@@ -1537,6 +1622,7 @@ impl AttachPlan {
         &mut self,
         rebuilt: AttachPlan,
     ) -> Result<AttachDelta, String> {
+        self.mutations.bump();
         self.validate_slot_index()?;
         rebuilt.validate_slot_index()?;
         self.validate_matching_policy(&rebuilt)?;
@@ -1545,6 +1631,7 @@ impl AttachPlan {
     }
 
     fn extend_exact_prepared(&mut self, rebuilt: AttachPlan) -> Result<AttachDelta, String> {
+        self.mutations.bump();
         self.validate_slot_index()?;
         rebuilt.validate_slot_index()?;
         self.validate_extension_capacity(&rebuilt)?;
@@ -1726,6 +1813,7 @@ impl AttachPlan {
         pinned: &PinnedObjects,
         accepted_slots: usize,
     ) -> Vec<Slot> {
+        self.mutations.bump();
         self.modules
             .retain(|module| pinned.summary(module.object).is_some());
         self.refused_module_objects
@@ -1752,6 +1840,7 @@ impl AttachPlan {
     /// cookie. It remains a visible, inactive aggregate slot with finite
     /// attachment evidence owned by the caller.
     pub(crate) fn deactivate(&mut self, slot: u32) {
+        self.mutations.bump();
         let position = slot as usize;
         if position >= self.slots.len() {
             return;
@@ -1781,6 +1870,7 @@ impl AttachPlan {
     /// consumes positions before links/publication: its history is retained
     /// even when clean rollback left those cells inactive and never published.
     pub(crate) fn withdraw_unlinked_additions(&mut self, accepted: usize) {
+        self.mutations.bump();
         let accepted = accepted.max(self.counter_consumed_end as usize);
         if self.slots.len() <= accepted
             || (accepted..self.slots.len()).any(|position| self.is_active(position as u32))
@@ -1820,6 +1910,7 @@ impl AttachPlan {
         accepted: usize,
         cells: &BTreeSet<u32>,
     ) -> Vec<u32> {
+        self.mutations.bump();
         let accepted = accepted.max(self.counter_consumed_end as usize);
         let old_len = self.slots.len();
         debug_assert_eq!(self.aggregate_owners.len(), old_len);
@@ -2185,9 +2276,58 @@ struct Building {
     module_ids: Vec<ModuleId>,
 }
 
+/// Occurrence-deduped decoded counts for one merge group: a manifest
+/// corroborating a scanned entry names the same occurrence and is counted
+/// once. Generic over borrowed (`&str`, for [`decoded_occurrence_count`]) and
+/// owned (`String`, for the conservative cursor's strided recount) names.
+#[derive(Debug, Default)]
+struct OccurrenceCounter<N, S> {
+    targets: BTreeSet<(N, PinnedObjectId, u64, usize)>,
+    skips: BTreeSet<(&'static str, S, S, usize)>,
+}
+
+impl<N: Ord + Clone, S: Ord + Clone> OccurrenceCounter<N, S> {
+    fn feed_target(
+        &mut self,
+        within: &mut BTreeMap<(N, PinnedObjectId, u64), usize>,
+        name: N,
+        object: PinnedObjectId,
+        file_offset: u64,
+    ) {
+        let occurrence = within
+            .entry((name.clone(), object, file_offset))
+            .or_insert(0usize);
+        self.targets
+            .insert((name, object, file_offset, *occurrence));
+        *occurrence += 1;
+    }
+
+    fn feed_skip(
+        &mut self,
+        within: &mut BTreeMap<(S, S), usize>,
+        source: &'static str,
+        subject: S,
+        reason: S,
+    ) {
+        let occurrence = within
+            .entry((subject.clone(), reason.clone()))
+            .or_insert(0usize);
+        self.skips.insert((source, subject, reason, *occurrence));
+        *occurrence += 1;
+    }
+
+    fn count(&self) -> usize {
+        self.targets.len() + self.skips.len()
+    }
+
+    fn clear(&mut self) {
+        self.targets.clear();
+        self.skips.clear();
+    }
+}
+
 fn decoded_occurrence_count(group: &[Discovered<'_>]) -> usize {
-    let mut targets = BTreeSet::new();
-    let mut skips = BTreeSet::new();
+    let mut counter: OccurrenceCounter<&str, &str> = OccurrenceCounter::default();
     for module in group {
         debug_assert_eq!(
             module.entries_seen,
@@ -2195,20 +2335,24 @@ fn decoded_occurrence_count(group: &[Discovered<'_>]) -> usize {
         );
         let mut target_occurrences = BTreeMap::new();
         for target in &module.targets {
-            let record = (target.name, target.object, target.file_offset);
-            let occurrence = target_occurrences.entry(record).or_insert(0usize);
-            targets.insert((record.0, record.1, record.2, *occurrence));
-            *occurrence += 1;
+            counter.feed_target(
+                &mut target_occurrences,
+                target.name,
+                target.object,
+                target.file_offset,
+            );
         }
         let mut skip_occurrences = BTreeMap::new();
         for skip in &module.skipped {
-            let record = (skip.subject.as_str(), skip.reason.as_str());
-            let occurrence = skip_occurrences.entry(record).or_insert(0usize);
-            skips.insert((module.source, record.0, record.1, *occurrence));
-            *occurrence += 1;
+            counter.feed_skip(
+                &mut skip_occurrences,
+                module.source,
+                skip.subject.as_str(),
+                skip.reason.as_str(),
+            );
         }
     }
-    targets.len() + skips.len()
+    counter.count()
 }
 
 fn merge(
@@ -3182,16 +3326,12 @@ fn build_from_sources_with_policy(
     admission_policy: AdmissionPolicy,
     admission_scope: AdmissionScope,
 ) -> AttachPlan {
+    let (pinned_id, compatible) = pinned_manifest_lookups(pinned);
     let mut plan = build_from_sources_with(
         scanned,
         manifests,
-        |key, path| pinned.id_for_manifest(key, path),
-        |provider, target| {
-            matches!(
-                (pinned.abi_for(provider), pinned.abi_for(target)),
-                (Some(provider), Some(target)) if provider == target
-            )
-        },
+        pinned_id,
+        compatible,
         ExistingAllocation {
             slots: 0,
             active: &BTreeMap::new(),
@@ -3214,6 +3354,27 @@ struct ExistingAllocation<'a> {
     /// `active`, under the object of each module that currently owns a
     /// target: a module listed here is already admitted (G-03).
     owned: &'a BTreeMap<PinnedObjectId, BTreeSet<AttachKey>>,
+}
+
+/// The standard manifest lookups over live pins: manifest keys resolve to
+/// pinned objects, and a retained target is admitted only under the
+/// provider's own ABI. Shared by the build paths and the conservative plan
+/// cursor so manifest keys cannot resolve differently between them.
+fn pinned_manifest_lookups(
+    pinned: &PinnedObjects,
+) -> (
+    impl FnMut(ObjectKey, &str) -> Option<PinnedObjectId> + '_,
+    impl FnMut(PinnedObjectId, PinnedObjectId) -> bool + '_,
+) {
+    (
+        |key, path| pinned.id_for_manifest(key, path),
+        |provider, target| {
+            matches!(
+                (pinned.abi_for(provider), pinned.abi_for(target)),
+                (Some(provider), Some(target)) if provider == target
+            )
+        },
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3292,6 +3453,20 @@ fn presented_name(authorized: bool, name: &str) -> &str {
     }
 }
 
+/// The lowered target rows of one scanned table: each decoded entry with the
+/// object it attaches into. Shared by [`lower_scanned`] and the conservative
+/// plan cursor, so the cursor's live-key set is enumerated by the same row
+/// function merge uses and cannot drift from it.
+fn scanned_table_rows(
+    module: &ReconciledModule,
+    table: usize,
+) -> impl Iterator<Item = (&ScannedEntry, PinnedObjectId)> + '_ {
+    module.scanned.tables[table]
+        .entries
+        .iter()
+        .zip(module.entry_objects[table].iter().copied())
+}
+
 fn lower_scanned(module: &ReconciledModule) -> Discovered<'_> {
     let scanned = &module.scanned;
     // The module object's own `.dynsym`: the export-linkage witness for
@@ -3359,10 +3534,10 @@ fn lower_scanned(module: &ReconciledModule) -> Discovered<'_> {
                     functions: published,
                 }),
         );
-        targets.extend(table.entries.iter().zip(&module.entry_objects[index]).map(
-            |(entry, object)| Target {
+        targets.extend(
+            scanned_table_rows(module, index).map(|(entry, object)| Target {
                 name: entry.name,
-                object: *object,
+                object,
                 object_path: &entry.object_path,
                 file_offset: entry.file_offset,
                 fork_safe,
@@ -3378,8 +3553,8 @@ fn lower_scanned(module: &ReconciledModule) -> Discovered<'_> {
                 } else {
                     Vec::new()
                 },
-            },
-        ));
+            }),
+        );
         skipped.extend(table.null_entries.iter().map(|name| Skipped {
             subject: presented_name(authorized, name).to_string(),
             reason: "null pointer".into(),
@@ -3615,6 +3790,1927 @@ fn lower_manifest(
             scan_evidence: None,
         }),
         Vec::new(),
+    )
+}
+
+/// Conservative plan cursor: removal-only rebuild of an [`AttachPlan`] from
+/// surviving sources, one bounded step per credit.
+///
+/// The cursor never grows: output slots are a subset of the old plan's, and
+/// output modules are the already-admitted groups rebuilt from the surviving
+/// sources. A slot survives exactly when a surviving source row still yields
+/// its exact key (through the shared [`lower_scanned`]/[`lower_manifest`]
+/// lowering), or when it is a provisional seed whose object still has an
+/// admitted group (the rebuilt carry loop's module check). Everything else
+/// retires in place. Growth in the sources (new keys, new groups) is ignored:
+/// the delta's `new`/`replace` stay empty and historical refusals are kept.
+///
+/// Output assembly mirrors [`AttachPlan::extend_exact_prepared`]'s removal
+/// path (retired slots stay in place with unchanged content, aggregate owners
+/// merge the same way, retire rows leave in key order), and module summaries,
+/// skips and surfaces replicate merge's per-group build (same dedup rules)
+/// over the surviving groups, so a removal-only derivation equals the
+/// rebuild-then-extend reference field for field. Admission is deliberately
+/// not replicated: surviving groups were admitted under a tighter budget, so
+/// they stay admitted; capacity refusals, spill counts and the broad-admit
+/// flag affect only evidence the cursor carries over (see `assemble`). The
+/// known divergences from a full rebuild are all growth-shaped (new slots,
+/// resurrected retired keys, shared-target name narrowing, re-refusal reason
+/// strings) and resolve to no-growth by design.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct PlanFence {
+    token: u64,
+    mutations: u64,
+    slots: usize,
+    modules: usize,
+    skipped: usize,
+}
+
+impl PlanFence {
+    /// Snapshots the fenced members. A poisoned token refuses at once, before
+    /// any derivation step runs.
+    fn snapshot(plan: &AttachPlan) -> Result<Self, GraphRefusal> {
+        if plan.token.0 == PLAN_TOKEN_POISON {
+            return Err(GraphRefusal::SourceChanged);
+        }
+        Ok(Self {
+            token: plan.token.0,
+            mutations: plan.mutations.0,
+            slots: plan.slots.len(),
+            modules: plan.modules.len(),
+            skipped: plan.skipped.len(),
+        })
+    }
+
+    fn check(&self, plan: &AttachPlan) -> Result<(), GraphRefusal> {
+        if Self::snapshot(plan)? == *self {
+            Ok(())
+        } else {
+            Err(GraphRefusal::SourceChanged)
+        }
+    }
+}
+
+/// Byte accounting mirrors `discovery::identity`'s conservative-copy
+/// accounting, which is private to that module: every owned allocation below
+/// is covered by the one measured reservation before it happens.
+fn plan_bytes_for<T>(count: usize) -> Result<usize, GraphRefusal> {
+    count
+        .checked_mul(std::mem::size_of::<T>())
+        .and_then(|bytes| bytes.checked_add(OWNED_ALLOCATION_PADDING))
+        .ok_or(GraphRefusal::Overflow)
+}
+
+fn plan_byte_len(len: usize) -> Result<usize, GraphRefusal> {
+    len.checked_add(OWNED_ALLOCATION_PADDING)
+        .ok_or(GraphRefusal::Overflow)
+}
+
+fn plan_text_bytes(text: &str) -> Result<usize, GraphRefusal> {
+    plan_byte_len(text.len())
+}
+
+fn plan_tree_bytes<K, V>(entries: usize) -> Result<usize, GraphRefusal> {
+    fn align8(bytes: usize) -> Option<usize> {
+        bytes.checked_add(7).map(|value| value & !7)
+    }
+    if std::mem::align_of::<K>() > 8 || std::mem::align_of::<V>() > 8 {
+        return Err(GraphRefusal::Overflow);
+    }
+    let keys = std::mem::size_of::<K>()
+        .checked_mul(11)
+        .and_then(align8)
+        .ok_or(GraphRefusal::Overflow)?;
+    let values = std::mem::size_of::<V>()
+        .checked_mul(11)
+        .and_then(align8)
+        .ok_or(GraphRefusal::Overflow)?;
+    let node = 16usize
+        .checked_add(keys)
+        .and_then(|bytes| bytes.checked_add(values))
+        .and_then(|bytes| bytes.checked_add(12 * 8))
+        .and_then(|bytes| bytes.checked_add(OWNED_ALLOCATION_PADDING))
+        .ok_or(GraphRefusal::Overflow)?;
+    entries
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(4))
+        .and_then(|count| count.checked_mul(node))
+        .ok_or(GraphRefusal::Overflow)
+}
+
+fn plan_add(total: &mut usize, bytes: usize) -> Result<(), GraphRefusal> {
+    *total = total.checked_add(bytes).ok_or(GraphRefusal::Overflow)?;
+    Ok(())
+}
+
+fn next_after<K: Ord + Clone, V: Clone>(map: &BTreeMap<K, V>, after: &Option<K>) -> Option<(K, V)> {
+    use std::ops::Bound::{Excluded, Unbounded};
+    match after {
+        Some(key) => map.range((Excluded(key), Unbounded)).next(),
+        None => map.first_key_value(),
+    }
+    .map(|(key, value)| (key.clone(), value.clone()))
+}
+
+pub(crate) struct ConservativePlanSources<'a> {
+    modules: &'a [ReconciledModule],
+    manifests: &'a [Manifest],
+    pins: &'a PinnedObjects,
+    broad_admit: bool,
+}
+
+impl<'a> ConservativePlanSources<'a> {
+    pub(crate) fn new(
+        modules: &'a [ReconciledModule],
+        manifests: &'a [Manifest],
+        pins: &'a PinnedObjects,
+        broad_admit: bool,
+    ) -> Self {
+        Self {
+            modules,
+            manifests,
+            pins,
+            broad_admit,
+        }
+    }
+}
+
+// consumed by T4: stored in the graph backing until the old canonical is reclaimed.
+#[allow(dead_code)]
+pub(crate) struct InstalledPlanBacking {
+    output: Option<ResourceLease>,
+    header: Option<ResourceLease>,
+}
+
+/// One lowered source piece, fully owned so the cursor can suspend and
+/// resume across credits without retaining source borrows. Targets are kept
+/// only as occurrence-count triples plus their keys: names feed the
+/// occurrence recount, keys feed the live set.
+struct OwnedPiece {
+    object: PinnedObjectId,
+    key: ObjectKey,
+    path: String,
+    source: &'static str,
+    tables: Vec<TableSummary>,
+    interfaces: usize,
+    surfaces: Vec<SurfaceSummary>,
+    count_targets: Vec<(String, PinnedObjectId, u64)>,
+    skipped: Vec<Skipped>,
+}
+
+fn own_piece(piece: Discovered<'_>) -> OwnedPiece {
+    OwnedPiece {
+        object: piece.object,
+        key: piece.key,
+        path: piece.path.to_owned(),
+        source: piece.source,
+        tables: piece.tables,
+        interfaces: piece.interfaces,
+        surfaces: piece.surfaces,
+        count_targets: piece
+            .targets
+            .iter()
+            .map(|target| (target.name.to_owned(), target.object, target.file_offset))
+            .collect(),
+        skipped: piece.skipped,
+    }
+}
+
+/// One old plan module, cached for the slot remap and refusal attribution.
+struct OldModuleInfo {
+    id: ModuleId,
+    object: PinnedObjectId,
+    path: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ConservativePlanPhase {
+    New,
+    Measure,
+    Measured,
+    Lower,
+    DrainKeys,
+    RecordModules,
+    Replicate,
+    Derive,
+    CopyMaps,
+    Retire,
+    Ready,
+    Installed,
+    Cancelled,
+    Refused,
+    Reclaim,
+    Reclaimed,
+}
+
+pub(crate) struct ConservativePlanCursor {
+    phase: ConservativePlanPhase,
+    fence: Option<PlanFence>,
+    refusal: Option<GraphRefusal>,
+    broad_admit: bool,
+    // Measure (allocation-free lens only).
+    measured: usize,
+    measured_slots: usize,
+    required: Option<usize>,
+    measure_stage: u8,
+    measure_slot: usize,
+    measure_module: usize,
+    measure_source: usize,
+    measure_table: usize,
+    measure_manifest: usize,
+    measure_surface: usize,
+    measure_ordinals_after: Option<AttachKey>,
+    measure_identities_after: Option<PinnedObjectId>,
+    measure_provisional_after: Option<AttachKey>,
+    measure_refused: usize,
+    measure_skipped: usize,
+    // Owned derivation state (allocated after the reservation).
+    storage: Option<ResourceLease>,
+    live: BTreeSet<AttachKey>,
+    pieces: Vec<OwnedPiece>,
+    groups: BTreeMap<PinnedObjectId, Vec<usize>>,
+    group_order: Vec<PinnedObjectId>,
+    manifest_orphaned: Vec<Skipped>,
+    orphan_idx: usize,
+    old_modules: Vec<OldModuleInfo>,
+    old_id_objects: BTreeMap<ModuleId, PinnedObjectId>,
+    old_objects: BTreeSet<PinnedObjectId>,
+    old_paths: BTreeSet<String>,
+    surviving_paths: BTreeSet<String>,
+    stable_ids: BTreeMap<PinnedObjectId, ModuleId>,
+    lower_source: usize,
+    lower_manifest: usize,
+    drain_piece: usize,
+    drain_target: usize,
+    record_module: usize,
+    replicate_group: usize,
+    replicate_step: u8,
+    replicate_piece: usize,
+    replicate_item: usize,
+    replicate_count_only: bool,
+    in_summary: Option<ModuleSummary>,
+    piece_tables: Vec<TableSummary>,
+    piece_surfaces: Vec<SurfaceSummary>,
+    piece_skip_occurrences: BTreeMap<(String, String), usize>,
+    seen_tables: Vec<(&'static str, TableSummary, usize)>,
+    seen_surfaces: Vec<(&'static str, SurfaceSummary, usize)>,
+    seen_skips: BTreeSet<(&'static str, String, String, usize)>,
+    counter: OccurrenceCounter<String, String>,
+    within_targets: BTreeMap<(String, PinnedObjectId, u64), usize>,
+    within_skips: BTreeMap<(String, String), usize>,
+    entries_seen: usize,
+    derive_slot: usize,
+    output_slots: Vec<Slot>,
+    output_slot_by_key: BTreeMap<AttachKey, usize>,
+    output_retired: BTreeSet<usize>,
+    output_owners: Vec<AggregateOwner>,
+    retired_by_cursor: BTreeSet<usize>,
+    ambiguous_count: usize,
+    output_modules: Vec<ModuleSummary>,
+    output_skipped: Vec<Skipped>,
+    output_surfaces: Vec<SurfaceSummary>,
+    copy_stage: u8,
+    copy_key: Option<AttachKey>,
+    copy_object: Option<PinnedObjectId>,
+    copy_provisional: Option<AttachKey>,
+    copy_index: usize,
+    output_ordinals: BTreeMap<AttachKey, BTreeSet<SlotOrdinal>>,
+    output_identities: BTreeMap<PinnedObjectId, TargetObject>,
+    output_provisional: BTreeMap<AttachKey, PinnedObjectId>,
+    output_refused: Vec<(PinnedObjectId, Skipped)>,
+    output_modules_skipped: Vec<Skipped>,
+    retire_slot: usize,
+    retire_key: Option<AttachKey>,
+    output_removed: Vec<u32>,
+    output_retire: Vec<Slot>,
+    output: Option<AttachPlan>,
+    delta: Option<AttachDelta>,
+    old: Option<AttachPlan>,
+    reclaim_step: u8,
+}
+
+impl ConservativePlanCursor {
+    pub(crate) fn new() -> Self {
+        Self {
+            phase: ConservativePlanPhase::New,
+            fence: None,
+            refusal: None,
+            broad_admit: false,
+            measured: 0,
+            measured_slots: 0,
+            required: None,
+            measure_stage: 0,
+            measure_slot: 0,
+            measure_module: 0,
+            measure_source: 0,
+            measure_table: 0,
+            measure_manifest: 0,
+            measure_surface: 0,
+            measure_ordinals_after: None,
+            measure_identities_after: None,
+            measure_provisional_after: None,
+            measure_refused: 0,
+            measure_skipped: 0,
+            storage: None,
+            live: BTreeSet::new(),
+            pieces: Vec::new(),
+            groups: BTreeMap::new(),
+            group_order: Vec::new(),
+            manifest_orphaned: Vec::new(),
+            orphan_idx: 0,
+            old_modules: Vec::new(),
+            old_id_objects: BTreeMap::new(),
+            old_objects: BTreeSet::new(),
+            old_paths: BTreeSet::new(),
+            surviving_paths: BTreeSet::new(),
+            stable_ids: BTreeMap::new(),
+            lower_source: 0,
+            lower_manifest: 0,
+            drain_piece: 0,
+            drain_target: 0,
+            record_module: 0,
+            replicate_group: 0,
+            replicate_step: 0,
+            replicate_piece: 0,
+            replicate_item: 0,
+            replicate_count_only: false,
+            in_summary: None,
+            piece_tables: Vec::new(),
+            piece_surfaces: Vec::new(),
+            piece_skip_occurrences: BTreeMap::new(),
+            seen_tables: Vec::new(),
+            seen_surfaces: Vec::new(),
+            seen_skips: BTreeSet::new(),
+            counter: OccurrenceCounter::default(),
+            within_targets: BTreeMap::new(),
+            within_skips: BTreeMap::new(),
+            entries_seen: 0,
+            derive_slot: 0,
+            output_slots: Vec::new(),
+            output_slot_by_key: BTreeMap::new(),
+            output_retired: BTreeSet::new(),
+            output_owners: Vec::new(),
+            retired_by_cursor: BTreeSet::new(),
+            ambiguous_count: 0,
+            output_modules: Vec::new(),
+            output_skipped: Vec::new(),
+            output_surfaces: Vec::new(),
+            copy_stage: 0,
+            copy_key: None,
+            copy_object: None,
+            copy_provisional: None,
+            copy_index: 0,
+            output_ordinals: BTreeMap::new(),
+            output_identities: BTreeMap::new(),
+            output_provisional: BTreeMap::new(),
+            output_refused: Vec::new(),
+            output_modules_skipped: Vec::new(),
+            retire_slot: 0,
+            retire_key: None,
+            output_removed: Vec::new(),
+            output_retire: Vec::new(),
+            output: None,
+            delta: None,
+            old: None,
+            reclaim_step: 0,
+        }
+    }
+
+    pub(crate) fn required_bytes(&self) -> Option<usize> {
+        self.required
+    }
+
+    pub(crate) fn plan(&self) -> Option<&AttachPlan> {
+        self.output.as_ref()
+    }
+
+    pub(crate) fn delta(&self) -> Option<&AttachDelta> {
+        self.delta.as_ref()
+    }
+
+    pub(crate) fn removed(&self) -> Option<&[u32]> {
+        if self.phase == ConservativePlanPhase::Ready
+            || self.phase == ConservativePlanPhase::Installed
+        {
+            Some(&self.output_removed)
+        } else {
+            None
+        }
+    }
+}
+
+impl AttachPlan {
+    /// Removal-only rebuild of this plan from surviving sources, one bounded
+    /// step per credit. See the [`ConservativePlanCursor`] docs for the
+    /// derivation rules.
+    pub(crate) fn poll_conservative_rebuild(
+        &self,
+        source: ConservativePlanSources<'_>,
+        stable_id: &mut dyn FnMut(PinnedObjectId) -> Option<ModuleId>,
+        cursor: &mut ConservativePlanCursor,
+        reserve: &SemanticResourceReserver,
+        work: usize,
+    ) -> Result<GraphStep, GraphRefusal> {
+        if work == 0 {
+            return Ok(GraphStep::Yielded);
+        }
+        match cursor.fence {
+            Some(fence) => fence.check(self)?,
+            None => cursor.fence = Some(PlanFence::snapshot(self)?),
+        }
+        if cursor.phase == ConservativePlanPhase::Cancelled {
+            return Err(GraphRefusal::Cancelled);
+        }
+        if cursor.phase == ConservativePlanPhase::Refused {
+            return Err(cursor.refusal.expect("a refused cursor keeps its refusal"));
+        }
+        if cursor.phase == ConservativePlanPhase::Ready
+            || cursor.phase == ConservativePlanPhase::Installed
+        {
+            return Ok(GraphStep::Ready);
+        }
+        if cursor.phase == ConservativePlanPhase::Reclaim
+            || cursor.phase == ConservativePlanPhase::Reclaimed
+        {
+            return Err(GraphRefusal::Cancelled);
+        }
+        for _ in 0..work {
+            if cursor.advance(self, &source, stable_id, reserve)? {
+                return Ok(GraphStep::Ready);
+            }
+        }
+        Ok(GraphStep::Advanced)
+    }
+
+    /// An empty plan shell under the given policy/scope for the conservative
+    /// cursor to fill in strided. O(1): no slots, no tables.
+    fn empty_like(admission_policy: AdmissionPolicy, admission_scope: AdmissionScope) -> Self {
+        let mut out = Self::from_indexed_slots(Vec::new(), admission_policy)
+            .expect("an empty slot vec is always a valid plan");
+        out.admission_scope = admission_scope;
+        out
+    }
+
+    #[cfg(test)]
+    pub(crate) fn poison_token_for_test(&mut self) {
+        self.token = PlanToken(PLAN_TOKEN_POISON);
+    }
+}
+
+impl ConservativePlanCursor {
+    /// One bounded derivation step. Returns `true` exactly when the step
+    /// reached `Ready`.
+    fn advance(
+        &mut self,
+        old: &AttachPlan,
+        source: &ConservativePlanSources<'_>,
+        stable_id: &mut dyn FnMut(PinnedObjectId) -> Option<ModuleId>,
+        reserve: &SemanticResourceReserver,
+    ) -> Result<bool, GraphRefusal> {
+        match self.step(old, source, stable_id, reserve) {
+            Ok(ready) => Ok(ready),
+            Err(refusal) => {
+                // A short pool is retryable: the measured derivation stays in
+                // place and the next credit re-attempts the reservation.
+                // Every other refusal is terminal for this derivation.
+                if !matches!(refusal, GraphRefusal::Storage(_)) {
+                    self.phase = ConservativePlanPhase::Refused;
+                    self.refusal = Some(refusal);
+                }
+                Err(refusal)
+            }
+        }
+    }
+
+    fn step(
+        &mut self,
+        old: &AttachPlan,
+        source: &ConservativePlanSources<'_>,
+        stable_id: &mut dyn FnMut(PinnedObjectId) -> Option<ModuleId>,
+        reserve: &SemanticResourceReserver,
+    ) -> Result<bool, GraphRefusal> {
+        match self.phase {
+            ConservativePlanPhase::New => {
+                self.broad_admit = source.broad_admit;
+                self.measured_slots = old.slots.len();
+                self.phase = ConservativePlanPhase::Measure;
+                self.measure_one(old, source)
+            }
+            ConservativePlanPhase::Measure => self.measure_one(old, source),
+            ConservativePlanPhase::Measured => self.reserve_one(reserve),
+            ConservativePlanPhase::Lower => self.lower_one(source),
+            ConservativePlanPhase::DrainKeys => self.drain_one_key(),
+            ConservativePlanPhase::RecordModules => self.record_one_module(old),
+            ConservativePlanPhase::Replicate => self.replicate_one(stable_id),
+            ConservativePlanPhase::Derive => self.derive_one_slot(old),
+            ConservativePlanPhase::CopyMaps => self.copy_one_map_entry(old),
+            ConservativePlanPhase::Retire => self.retire_one(old),
+            ConservativePlanPhase::Ready
+            | ConservativePlanPhase::Installed
+            | ConservativePlanPhase::Reclaim
+            | ConservativePlanPhase::Reclaimed
+            | ConservativePlanPhase::Cancelled
+            | ConservativePlanPhase::Refused => Err(GraphRefusal::Cancelled),
+        }
+    }
+
+    /// One measure unit: O(1) lens only, no allocation, no queries. Stage
+    /// order is old slots, old modules, source modules (header plus one table
+    /// each), manifests (header plus one surface each), the carried maps, then
+    /// the fixed tail that publishes the requirement.
+    fn measure_one(
+        &mut self,
+        old: &AttachPlan,
+        source: &ConservativePlanSources<'_>,
+    ) -> Result<bool, GraphRefusal> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        match self.measure_stage {
+            0 => {
+                let Some(slot) = old.slots.get(self.measure_slot) else {
+                    self.measure_stage = 1;
+                    return Ok(false);
+                };
+                // The output slot clone plus every per-slot structure it may
+                // fill: key index, retirement set, aggregate owner, and the
+                // removal-only delta rows.
+                plan_add(&mut self.measured, plan_bytes_for::<Slot>(1)?)?;
+                plan_add(&mut self.measured, plan_text_bytes(&slot.object_path)?)?;
+                for name in &slot.names {
+                    plan_add(&mut self.measured, plan_text_bytes(name)?)?;
+                }
+                plan_add(
+                    &mut self.measured,
+                    plan_bytes_for::<ModuleId>(slot.module_ids.len())?,
+                )?;
+                plan_add(&mut self.measured, plan_bytes_for::<AggregateOwner>(1)?)?;
+                plan_add(&mut self.measured, plan_tree_bytes::<AttachKey, usize>(1)?)?;
+                plan_add(&mut self.measured, plan_tree_bytes::<usize, ()>(1)?)?;
+                plan_add(&mut self.measured, plan_bytes_for::<u32>(1)?)?;
+                self.measure_slot += 1;
+                Ok(false)
+            }
+            1 => {
+                let Some(module) = old.modules.get(self.measure_module) else {
+                    self.measure_stage = 2;
+                    return Ok(false);
+                };
+                // The remap cache entry plus its index and attribution sets.
+                plan_add(&mut self.measured, plan_bytes_for::<OldModuleInfo>(1)?)?;
+                plan_add(&mut self.measured, plan_text_bytes(&module.path)?)?;
+                plan_add(
+                    &mut self.measured,
+                    plan_tree_bytes::<ModuleId, PinnedObjectId>(1)?,
+                )?;
+                plan_add(
+                    &mut self.measured,
+                    plan_tree_bytes::<PinnedObjectId, ()>(1)?,
+                )?;
+                plan_add(&mut self.measured, plan_text_bytes(&module.path)?)?;
+                self.measure_module += 1;
+                Ok(false)
+            }
+            2 => {
+                let Some(module) = source.modules.get(self.measure_source) else {
+                    self.measure_stage = 3;
+                    return Ok(false);
+                };
+                if self.measure_table == 0 {
+                    // The owned-piece shell plus one upper-bound entry per
+                    // group-level structure this piece may open.
+                    plan_add(&mut self.measured, plan_bytes_for::<OwnedPiece>(1)?)?;
+                    plan_add(&mut self.measured, plan_text_bytes(&module.scanned.path)?)?;
+                    plan_add(
+                        &mut self.measured,
+                        plan_bytes_for::<TableSummary>(module.scanned.tables.len())?,
+                    )?;
+                    plan_add(
+                        &mut self.measured,
+                        plan_tree_bytes::<PinnedObjectId, Vec<usize>>(1)?,
+                    )?;
+                    plan_add(&mut self.measured, plan_bytes_for::<PinnedObjectId>(1)?)?;
+                    plan_add(&mut self.measured, plan_bytes_for::<ModuleId>(1)?)?;
+                    plan_add(&mut self.measured, plan_bytes_for::<ModuleSummary>(1)?)?;
+                    plan_add(&mut self.measured, plan_text_bytes(&module.scanned.path)?)?;
+                }
+                let Some(table) = module.scanned.tables.get(self.measure_table) else {
+                    self.measure_source += 1;
+                    self.measure_table = 0;
+                    return Ok(false);
+                };
+                // Owned count triples plus the two occurrence structures that
+                // clone each name again, the transient lowered targets, and
+                // the live-set entry.
+                for entry in &table.entries {
+                    plan_add(
+                        &mut self.measured,
+                        plan_bytes_for::<(String, PinnedObjectId, u64)>(1)?,
+                    )?;
+                    for _ in 0..3 {
+                        plan_add(&mut self.measured, plan_text_bytes(entry.name)?)?;
+                    }
+                    plan_add(&mut self.measured, plan_bytes_for::<Target<'_>>(1)?)?;
+                    plan_add(
+                        &mut self.measured,
+                        plan_bytes_for::<&str>(module.exports.len())?,
+                    )?;
+                    plan_add(&mut self.measured, plan_tree_bytes::<AttachKey, ()>(1)?)?;
+                    plan_add(
+                        &mut self.measured,
+                        plan_tree_bytes::<(String, PinnedObjectId, u64, usize), ()>(1)?,
+                    )?;
+                    plan_add(
+                        &mut self.measured,
+                        plan_tree_bytes::<(String, PinnedObjectId, u64), usize>(1)?,
+                    )?;
+                }
+                for skip in &table.unpinned {
+                    self.measure_skip_texts(&skip.subject, &skip.reason)?;
+                }
+                for null in &table.null_entries {
+                    self.measure_skip_texts(null, "null pointer")?;
+                    // The subject may instead present as `unknown`.
+                    for _ in 0..5 {
+                        plan_add(&mut self.measured, plan_text_bytes("unknown")?)?;
+                    }
+                }
+                // One table summary plus its surfaces (the table surface and,
+                // upper bound, one per interface), each held three times
+                // (piece, dedup seen-set, output clone).
+                for _ in 0..3 {
+                    plan_add(&mut self.measured, plan_bytes_for::<TableSummary>(1)?)?;
+                }
+                let surfaces = module
+                    .scanned
+                    .interfaces
+                    .len()
+                    .checked_add(1)
+                    .ok_or(GraphRefusal::Overflow)?;
+                for _ in 0..surfaces {
+                    for _ in 0..3 {
+                        plan_add(&mut self.measured, plan_bytes_for::<SurfaceSummary>(1)?)?;
+                        plan_add(&mut self.measured, plan_text_bytes(&module.scanned.path)?)?;
+                        plan_add(&mut self.measured, plan_byte_len(32)?)?;
+                        plan_add(&mut self.measured, plan_text_bytes(table.walk)?)?;
+                        plan_add(&mut self.measured, plan_text_bytes("ok")?)?;
+                    }
+                }
+                self.measure_table += 1;
+                Ok(false)
+            }
+            3 => {
+                let Some(manifest) = source.manifests.get(self.measure_manifest) else {
+                    self.measure_stage = 4;
+                    return Ok(false);
+                };
+                if self.measure_surface == 0 {
+                    plan_add(&mut self.measured, plan_bytes_for::<OwnedPiece>(1)?)?;
+                    plan_add(&mut self.measured, plan_text_bytes(&manifest.module_path)?)?;
+                    plan_add(
+                        &mut self.measured,
+                        plan_bytes_for::<TableSummary>(manifest.surfaces.len())?,
+                    )?;
+                    plan_add(
+                        &mut self.measured,
+                        plan_bytes_for::<SurfaceSummary>(manifest.surfaces.len())?,
+                    )?;
+                    plan_add(
+                        &mut self.measured,
+                        plan_tree_bytes::<PinnedObjectId, Vec<usize>>(1)?,
+                    )?;
+                    plan_add(&mut self.measured, plan_bytes_for::<PinnedObjectId>(1)?)?;
+                    plan_add(&mut self.measured, plan_bytes_for::<ModuleId>(1)?)?;
+                    plan_add(&mut self.measured, plan_bytes_for::<ModuleSummary>(1)?)?;
+                    plan_add(&mut self.measured, plan_text_bytes(&manifest.module_path)?)?;
+                }
+                let Some(surface) = manifest.surfaces.get(self.measure_surface) else {
+                    self.measure_manifest += 1;
+                    self.measure_surface = 0;
+                    return Ok(false);
+                };
+                for function in &surface.functions {
+                    // Upper bound: every function leaves both a count triple
+                    // and a skip (it leaves exactly one of the two).
+                    plan_add(
+                        &mut self.measured,
+                        plan_bytes_for::<(String, PinnedObjectId, u64)>(1)?,
+                    )?;
+                    for _ in 0..3 {
+                        plan_add(&mut self.measured, plan_text_bytes(&function.name)?)?;
+                    }
+                    plan_add(&mut self.measured, plan_bytes_for::<Target<'_>>(1)?)?;
+                    plan_add(&mut self.measured, plan_tree_bytes::<AttachKey, ()>(1)?)?;
+                    plan_add(
+                        &mut self.measured,
+                        plan_tree_bytes::<(String, PinnedObjectId, u64, usize), ()>(1)?,
+                    )?;
+                    plan_add(
+                        &mut self.measured,
+                        plan_tree_bytes::<(String, PinnedObjectId, u64), usize>(1)?,
+                    )?;
+                    let mut reason = function
+                        .name
+                        .len()
+                        .checked_add(manifest.module_path.len())
+                        .and_then(|bytes| bytes.checked_add(128))
+                        .ok_or(GraphRefusal::Overflow)?;
+                    if let Resolution::UnusableFile { reason: cause, .. } = &function.resolution {
+                        reason = reason
+                            .checked_add(cause.len())
+                            .ok_or(GraphRefusal::Overflow)?;
+                    }
+                    let reason = plan_byte_len(reason)?;
+                    plan_add(&mut self.measured, plan_bytes_for::<Skipped>(5)?)?;
+                    for _ in 0..5 {
+                        plan_add(&mut self.measured, plan_text_bytes(&function.name)?)?;
+                        plan_add(&mut self.measured, reason)?;
+                    }
+                    plan_add(
+                        &mut self.measured,
+                        plan_tree_bytes::<(String, String), usize>(1)?,
+                    )?;
+                    plan_add(
+                        &mut self.measured,
+                        plan_tree_bytes::<(&'static str, String, String, usize), ()>(1)?,
+                    )?;
+                    plan_add(
+                        &mut self.measured,
+                        plan_tree_bytes::<(&'static str, String, String, usize), ()>(1)?,
+                    )?;
+                }
+                // The surface summary, three lives; label bytes from the
+                // source records (walk/acquisition details are read, never
+                // copied here).
+                let (source_len, walk_len, acquisition_len) = manifest_surface_label_bytes(surface);
+                for _ in 0..3 {
+                    plan_add(&mut self.measured, plan_bytes_for::<SurfaceSummary>(1)?)?;
+                    plan_add(&mut self.measured, plan_byte_len(source_len)?)?;
+                    plan_add(&mut self.measured, plan_byte_len(walk_len)?)?;
+                    plan_add(&mut self.measured, plan_byte_len(acquisition_len)?)?;
+                }
+                self.measure_surface += 1;
+                Ok(false)
+            }
+            4 => {
+                let next = match &self.measure_ordinals_after {
+                    Some(after) => old.slot_ordinals.range((Excluded(after), Unbounded)).next(),
+                    None => old.slot_ordinals.first_key_value(),
+                };
+                let Some((key, ordinals)) = next else {
+                    self.measure_stage = 5;
+                    self.measure_ordinals_after = None;
+                    return Ok(false);
+                };
+                plan_add(
+                    &mut self.measured,
+                    plan_tree_bytes::<AttachKey, BTreeSet<SlotOrdinal>>(1)?,
+                )?;
+                plan_add(
+                    &mut self.measured,
+                    plan_tree_bytes::<SlotOrdinal, ()>(ordinals.len())?,
+                )?;
+                self.measure_ordinals_after = Some(*key);
+                Ok(false)
+            }
+            5 => {
+                let next = match &self.measure_identities_after {
+                    Some(after) => old
+                        .object_identities
+                        .range((Excluded(after), Unbounded))
+                        .next(),
+                    None => old.object_identities.first_key_value(),
+                };
+                let Some((object, identity)) = next else {
+                    self.measure_stage = 6;
+                    self.measure_identities_after = None;
+                    return Ok(false);
+                };
+                plan_add(
+                    &mut self.measured,
+                    plan_tree_bytes::<PinnedObjectId, TargetObject>(1)?,
+                )?;
+                if let Some(sha) = &identity.sha256 {
+                    plan_add(&mut self.measured, plan_text_bytes(sha)?)?;
+                }
+                self.measure_identities_after = Some(*object);
+                Ok(false)
+            }
+            6 => {
+                let next = match &self.measure_provisional_after {
+                    Some(after) => old
+                        .provisional_get_function_list
+                        .range((Excluded(after), Unbounded))
+                        .next(),
+                    None => old.provisional_get_function_list.first_key_value(),
+                };
+                let Some((key, _)) = next else {
+                    self.measure_stage = 7;
+                    self.measure_provisional_after = None;
+                    return Ok(false);
+                };
+                plan_add(
+                    &mut self.measured,
+                    plan_tree_bytes::<AttachKey, PinnedObjectId>(1)?,
+                )?;
+                self.measure_provisional_after = Some(*key);
+                Ok(false)
+            }
+            7 => {
+                let Some((_, skip)) = old.refused_module_objects.get(self.measure_refused) else {
+                    self.measure_stage = 8;
+                    return Ok(false);
+                };
+                plan_add(
+                    &mut self.measured,
+                    plan_bytes_for::<(PinnedObjectId, Skipped)>(1)?,
+                )?;
+                plan_add(&mut self.measured, plan_text_bytes(&skip.subject)?)?;
+                plan_add(&mut self.measured, plan_text_bytes(&skip.reason)?)?;
+                self.measure_refused += 1;
+                Ok(false)
+            }
+            8 => {
+                let Some(skip) = old.modules_skipped.get(self.measure_skipped) else {
+                    self.measure_stage = 9;
+                    return Ok(false);
+                };
+                plan_add(&mut self.measured, plan_bytes_for::<Skipped>(1)?)?;
+                plan_add(&mut self.measured, plan_text_bytes(&skip.subject)?)?;
+                plan_add(&mut self.measured, plan_text_bytes(&skip.reason)?)?;
+                self.measure_skipped += 1;
+                Ok(false)
+            }
+            _ => {
+                // Fixed tail: stack-resident shells need no charge; every heap
+                // byte is covered per element above.
+                self.required = Some(self.measured);
+                self.phase = ConservativePlanPhase::Measured;
+                Ok(false)
+            }
+        }
+    }
+
+    /// One skip's five lives: owned piece, dedup seen-set, occurrence
+    /// within-map, module summary, and plan-level output.
+    fn measure_skip_texts(&mut self, subject: &str, reason: &str) -> Result<(), GraphRefusal> {
+        plan_add(&mut self.measured, plan_bytes_for::<Skipped>(5)?)?;
+        for _ in 0..5 {
+            plan_add(&mut self.measured, plan_text_bytes(subject)?)?;
+            plan_add(&mut self.measured, plan_text_bytes(reason)?)?;
+        }
+        plan_add(
+            &mut self.measured,
+            plan_tree_bytes::<(String, String), usize>(1)?,
+        )?;
+        plan_add(
+            &mut self.measured,
+            plan_tree_bytes::<(&'static str, String, String, usize), ()>(1)?,
+        )?;
+        plan_add(
+            &mut self.measured,
+            plan_tree_bytes::<(&'static str, String, String, usize), ()>(1)?,
+        )?;
+        Ok(())
+    }
+
+    fn reserve_one(&mut self, reserve: &SemanticResourceReserver) -> Result<bool, GraphRefusal> {
+        let required = self.required.expect("measured before reserve");
+        match reserve.reserve(required) {
+            Ok(lease) => {
+                self.storage = Some(lease);
+                // The removal index, preallocated from the measure (upper
+                // bound: every old slot).
+                self.output_removed = Vec::with_capacity(self.measured_slots);
+                self.phase = ConservativePlanPhase::Lower;
+                Ok(false)
+            }
+            Err(refusal) => Err(GraphRefusal::Storage(refusal)),
+        }
+    }
+
+    /// One lowering unit: one source piece through the shared lowering,
+    /// converted to owned form. Piece lowering is O(piece) per unit (one
+    /// view's single-object decode); every per-row step downstream is
+    /// strided.
+    fn lower_one(&mut self, source: &ConservativePlanSources<'_>) -> Result<bool, GraphRefusal> {
+        if let Some(module) = source.modules.get(self.lower_source) {
+            self.push_piece(own_piece(lower_scanned(module)));
+            self.lower_source += 1;
+            return Ok(false);
+        }
+        if let Some(manifest) = source.manifests.get(self.lower_manifest) {
+            let (pinned_id, compatible) = pinned_manifest_lookups(source.pins);
+            let (piece, orphaned) = lower_manifest(manifest, pinned_id, compatible);
+            if let Some(piece) = piece {
+                self.push_piece(own_piece(piece));
+            }
+            // Orphaned manifest skips are rare resolution failures; they move
+            // to the plan tail after the group skips, in manifest order.
+            self.manifest_orphaned.extend(orphaned);
+            self.lower_manifest += 1;
+            return Ok(false);
+        }
+        self.phase = ConservativePlanPhase::DrainKeys;
+        Ok(false)
+    }
+
+    fn push_piece(&mut self, piece: OwnedPiece) {
+        let index = self.pieces.len();
+        let object = piece.object;
+        self.groups
+            .entry(object)
+            .or_insert_with(|| {
+                self.group_order.push(object);
+                Vec::new()
+            })
+            .push(index);
+        self.pieces.push(piece);
+    }
+
+    /// One live-key unit: one lowered row into the live set.
+    fn drain_one_key(&mut self) -> Result<bool, GraphRefusal> {
+        while let Some(piece) = self.pieces.get(self.drain_piece) {
+            let next =
+                piece
+                    .count_targets
+                    .get(self.drain_target)
+                    .map(|(_, object, file_offset)| AttachKey {
+                        object: *object,
+                        file_offset: *file_offset,
+                    });
+            match next {
+                Some(key) => {
+                    self.live.insert(key);
+                    self.drain_target += 1;
+                    return Ok(false);
+                }
+                None => {
+                    self.drain_piece += 1;
+                    self.drain_target = 0;
+                }
+            }
+        }
+        self.phase = ConservativePlanPhase::RecordModules;
+        Ok(false)
+    }
+
+    /// One remap-cache unit: one old module's identity triple plus its index
+    /// and attribution entries.
+    fn record_one_module(&mut self, old: &AttachPlan) -> Result<bool, GraphRefusal> {
+        let Some(module) = old.modules.get(self.record_module) else {
+            self.phase = ConservativePlanPhase::Replicate;
+            return Ok(false);
+        };
+        self.old_modules.push(OldModuleInfo {
+            id: module.id,
+            object: module.object,
+            path: module.path.clone(),
+        });
+        self.old_id_objects.insert(module.id, module.object);
+        self.old_objects.insert(module.object);
+        self.old_paths.insert(module.path.clone());
+        self.record_module += 1;
+        Ok(false)
+    }
+
+    /// One replication unit within the current group. Groups replicate in
+    /// first-seen order; only already-admitted groups produce summaries (no
+    /// growth at Q), while every group feeds the occurrence recount.
+    fn replicate_one(
+        &mut self,
+        stable_id: &mut dyn FnMut(PinnedObjectId) -> Option<ModuleId>,
+    ) -> Result<bool, GraphRefusal> {
+        let Some(object) = self.group_order.get(self.replicate_group).copied() else {
+            // All groups done: orphaned manifest skips tail the plan skips.
+            if self.orphan_idx < self.manifest_orphaned.len() {
+                let skip = self.manifest_orphaned[self.orphan_idx].clone();
+                self.output_skipped.push(skip);
+                self.orphan_idx += 1;
+                return Ok(false);
+            }
+            self.phase = ConservativePlanPhase::Derive;
+            return Ok(false);
+        };
+        match self.replicate_step {
+            0 => {
+                self.counter.clear();
+                self.piece_tables.clear();
+                self.piece_surfaces.clear();
+                self.piece_skip_occurrences.clear();
+                if !self.old_objects.contains(&object) {
+                    // Growth refused: the group feeds only the recount.
+                    self.replicate_count_only = true;
+                    self.replicate_step = 5;
+                    self.replicate_piece = 0;
+                    self.replicate_item = 0;
+                    return Ok(false);
+                }
+                let Some(stable) = stable_id(object) else {
+                    return Err(GraphRefusal::Identity);
+                };
+                self.stable_ids.insert(object, stable);
+                let first = self
+                    .groups
+                    .get(&object)
+                    .and_then(|pieces| pieces.first().copied())
+                    .ok_or(GraphRefusal::Identity)?;
+                let piece = self.pieces.get(first).ok_or(GraphRefusal::Identity)?;
+                self.in_summary = Some(ModuleSummary {
+                    id: stable,
+                    object,
+                    key: piece.key,
+                    path: piece.path.clone(),
+                    tables: Vec::new(),
+                    interfaces: 0,
+                    source: piece.source,
+                    corroborated: false,
+                    skipped: Vec::new(),
+                });
+                self.surviving_paths.insert(piece.path.clone());
+                self.replicate_count_only = false;
+                self.replicate_step = 1;
+                self.replicate_piece = 0;
+                self.replicate_item = 0;
+                Ok(false)
+            }
+            1 => self.replicate_tables(object),
+            2 => self.replicate_surfaces(object),
+            3 => self.replicate_skips(object),
+            4 => self.replicate_interfaces(object),
+            5 => self.replicate_counts(object),
+            _ => {
+                self.entries_seen = self
+                    .entries_seen
+                    .checked_add(self.counter.count())
+                    .ok_or(GraphRefusal::Overflow)?;
+                if !self.replicate_count_only {
+                    let summary = self.in_summary.take().ok_or(GraphRefusal::Identity)?;
+                    self.output_modules.push(summary);
+                }
+                self.in_summary = None;
+                self.seen_tables.clear();
+                self.seen_surfaces.clear();
+                self.seen_skips.clear();
+                self.replicate_count_only = false;
+                self.replicate_group += 1;
+                self.replicate_step = 0;
+                self.replicate_piece = 0;
+                self.replicate_item = 0;
+                Ok(false)
+            }
+        }
+    }
+
+    /// The current group's piece at position, or `None` once exhausted.
+    fn group_piece(
+        &self,
+        object: PinnedObjectId,
+        position: usize,
+    ) -> Result<Option<usize>, GraphRefusal> {
+        self.groups
+            .get(&object)
+            .ok_or(GraphRefusal::Identity)
+            .map(|pieces| pieces.get(position).copied())
+    }
+
+    /// One table unit: merge's per-piece table dedup, verbatim.
+    fn replicate_tables(&mut self, object: PinnedObjectId) -> Result<bool, GraphRefusal> {
+        let piece_idx = self.group_piece(object, self.replicate_piece)?;
+        let Some(piece_idx) = piece_idx else {
+            self.replicate_step = 2;
+            self.replicate_piece = 0;
+            self.replicate_item = 0;
+            return Ok(false);
+        };
+        let piece = self.pieces.get(piece_idx).ok_or(GraphRefusal::Identity)?;
+        let Some(table) = piece.tables.get(self.replicate_item) else {
+            self.piece_tables.clear();
+            self.replicate_piece += 1;
+            self.replicate_item = 0;
+            return Ok(false);
+        };
+        let (source, table) = (piece.source, table.clone());
+        let occurrence = self
+            .piece_tables
+            .iter()
+            .filter(|known| *known == &table)
+            .count();
+        self.piece_tables.push(table.clone());
+        if !self
+            .seen_tables
+            .iter()
+            .any(|(known_source, known, known_occurrence)| {
+                *known_source == source && known == &table && *known_occurrence == occurrence
+            })
+        {
+            self.seen_tables.push((source, table.clone(), occurrence));
+            self.in_summary
+                .as_mut()
+                .ok_or(GraphRefusal::Identity)?
+                .tables
+                .push(table);
+        }
+        self.replicate_item += 1;
+        Ok(false)
+    }
+
+    /// One surface unit: merge's per-piece surface dedup, verbatim; accepted
+    /// surfaces also tail the plan surfaces.
+    fn replicate_surfaces(&mut self, object: PinnedObjectId) -> Result<bool, GraphRefusal> {
+        let piece_idx = self.group_piece(object, self.replicate_piece)?;
+        let Some(piece_idx) = piece_idx else {
+            self.replicate_step = 3;
+            self.replicate_piece = 0;
+            self.replicate_item = 0;
+            return Ok(false);
+        };
+        let piece = self.pieces.get(piece_idx).ok_or(GraphRefusal::Identity)?;
+        let Some(surface) = piece.surfaces.get(self.replicate_item) else {
+            self.piece_surfaces.clear();
+            self.replicate_piece += 1;
+            self.replicate_item = 0;
+            return Ok(false);
+        };
+        let (source, surface) = (piece.source, surface.clone());
+        let occurrence = self
+            .piece_surfaces
+            .iter()
+            .filter(|known| *known == &surface)
+            .count();
+        self.piece_surfaces.push(surface.clone());
+        if !self
+            .seen_surfaces
+            .iter()
+            .any(|(known_source, known, known_occurrence)| {
+                *known_source == source && known == &surface && *known_occurrence == occurrence
+            })
+        {
+            self.seen_surfaces
+                .push((source, surface.clone(), occurrence));
+            self.output_surfaces.push(surface);
+        }
+        self.replicate_item += 1;
+        Ok(false)
+    }
+
+    /// One skip unit: merge's per-piece skip dedup, verbatim; accepted skips
+    /// land both in the module summary and at the plan tail.
+    fn replicate_skips(&mut self, object: PinnedObjectId) -> Result<bool, GraphRefusal> {
+        let piece_idx = self.group_piece(object, self.replicate_piece)?;
+        let Some(piece_idx) = piece_idx else {
+            self.replicate_step = 4;
+            self.replicate_piece = 0;
+            self.replicate_item = 0;
+            return Ok(false);
+        };
+        let piece = self.pieces.get(piece_idx).ok_or(GraphRefusal::Identity)?;
+        let Some(skip) = piece.skipped.get(self.replicate_item) else {
+            self.piece_skip_occurrences.clear();
+            self.replicate_piece += 1;
+            self.replicate_item = 0;
+            return Ok(false);
+        };
+        let (source, skip) = (piece.source, skip.clone());
+        let record = (skip.subject.clone(), skip.reason.clone());
+        let occurrence = *self
+            .piece_skip_occurrences
+            .entry(record.clone())
+            .or_insert(0usize);
+        if self
+            .seen_skips
+            .insert((source, record.0.clone(), record.1.clone(), occurrence))
+        {
+            self.in_summary
+                .as_mut()
+                .ok_or(GraphRefusal::Identity)?
+                .skipped
+                .push(skip.clone());
+            self.output_skipped.push(skip);
+        }
+        *self.piece_skip_occurrences.entry(record).or_insert(0usize) += 1;
+        self.replicate_item += 1;
+        Ok(false)
+    }
+
+    /// One interface unit: the summary keeps the most any one source saw,
+    /// never the sum across sources.
+    fn replicate_interfaces(&mut self, object: PinnedObjectId) -> Result<bool, GraphRefusal> {
+        let piece_idx = self.group_piece(object, self.replicate_piece)?;
+        let Some(piece_idx) = piece_idx else {
+            self.replicate_step = 5;
+            self.replicate_piece = 0;
+            self.replicate_item = 0;
+            return Ok(false);
+        };
+        let interfaces = self
+            .pieces
+            .get(piece_idx)
+            .ok_or(GraphRefusal::Identity)?
+            .interfaces;
+        let summary = self.in_summary.as_mut().ok_or(GraphRefusal::Identity)?;
+        summary.interfaces = summary.interfaces.max(interfaces);
+        self.replicate_piece += 1;
+        Ok(false)
+    }
+
+    /// One recount unit: occurrence-deduped decoded counts for the group,
+    /// fed through the shared counter.
+    fn replicate_counts(&mut self, object: PinnedObjectId) -> Result<bool, GraphRefusal> {
+        let piece_idx = self.group_piece(object, self.replicate_piece)?;
+        let Some(piece_idx) = piece_idx else {
+            self.replicate_step = 6;
+            self.replicate_piece = 0;
+            self.replicate_item = 0;
+            return Ok(false);
+        };
+        let piece = self.pieces.get(piece_idx).ok_or(GraphRefusal::Identity)?;
+        if let Some((name, target_object, file_offset)) =
+            piece.count_targets.get(self.replicate_item)
+        {
+            let (name, target_object, file_offset) = (name.clone(), *target_object, *file_offset);
+            self.counter
+                .feed_target(&mut self.within_targets, name, target_object, file_offset);
+            self.replicate_item += 1;
+            return Ok(false);
+        }
+        let skip_idx = self.replicate_item - piece.count_targets.len();
+        if let Some(skip) = piece.skipped.get(skip_idx) {
+            let (source, subject, reason) =
+                (piece.source, skip.subject.clone(), skip.reason.clone());
+            self.counter
+                .feed_skip(&mut self.within_skips, source, subject, reason);
+            self.replicate_item += 1;
+            return Ok(false);
+        }
+        self.within_targets.clear();
+        self.within_skips.clear();
+        self.replicate_piece += 1;
+        self.replicate_item = 0;
+        Ok(false)
+    }
+
+    /// One derive unit: one old slot. A slot survives exactly when its key
+    /// is still yielded by the surviving sources and it was not already
+    /// retired, or when it is a retained provisional seed. Surviving slots
+    /// keep their content and index with retired claimers remapped away;
+    /// retired slots stay in place with unchanged content, exactly like the
+    /// reference extend.
+    fn derive_one_slot(&mut self, old: &AttachPlan) -> Result<bool, GraphRefusal> {
+        let Some(old_slot) = old.slots.get(self.derive_slot) else {
+            self.phase = ConservativePlanPhase::CopyMaps;
+            return Ok(false);
+        };
+        let index = self.derive_slot;
+        let key = AttachKey::of(old_slot);
+        let was_retired = old.retired_slots.contains(&index);
+        let retained_provisional = !was_retired
+            && old
+                .provisional_get_function_list
+                .get(&key)
+                .is_some_and(|object| self.stable_ids.contains_key(object));
+        let live = self.live.contains(&key);
+        let owner = old
+            .aggregate_owners
+            .get(index)
+            .copied()
+            .ok_or(GraphRefusal::Identity)?;
+        if (live || retained_provisional) && !was_retired {
+            let mut slot = old_slot.clone();
+            let mut ids = Vec::with_capacity(old_slot.module_ids.len());
+            for id in &old_slot.module_ids {
+                match self
+                    .old_id_objects
+                    .get(id)
+                    .and_then(|object| self.stable_ids.get(object))
+                {
+                    Some(stable) => ids.push(*stable),
+                    None if self.old_id_objects.contains_key(id) => {
+                        // Retired claimer: the rebuilt plan lacks it.
+                    }
+                    None => ids.push(*id),
+                }
+            }
+            slot.module_ids = ids;
+            // Extend's two owner merges, verbatim.
+            let owner = owner
+                .merge(AggregateOwner::from_module_ids(&old_slot.module_ids))
+                .merge(AggregateOwner::from_module_ids(&slot.module_ids));
+            self.ambiguous_count += usize::from(owner == AggregateOwner::Ambiguous);
+            self.output_slot_by_key.insert(key, index);
+            self.output_owners.push(owner);
+            self.output_slots.push(slot);
+        } else {
+            let owner = owner.merge(AggregateOwner::from_module_ids(&old_slot.module_ids));
+            self.ambiguous_count += usize::from(owner == AggregateOwner::Ambiguous);
+            self.output_owners.push(owner);
+            self.output_slots.push(old_slot.clone());
+            self.output_retired.insert(index);
+            if !was_retired {
+                self.retired_by_cursor.insert(index);
+            }
+        }
+        self.derive_slot += 1;
+        Ok(false)
+    }
+
+    /// One carried-map unit. Ordinals and object identities only grow, so the
+    /// old maps carry over whole; provisionals and refusals survive exactly
+    /// when their object does; historical module skips drop only entries
+    /// provably tied to retired modules.
+    fn copy_one_map_entry(&mut self, old: &AttachPlan) -> Result<bool, GraphRefusal> {
+        match self.copy_stage {
+            0 => {
+                let next = next_after(&old.slot_ordinals, &self.copy_key);
+                let Some((key, ordinals)) = next else {
+                    self.copy_stage = 1;
+                    self.copy_key = None;
+                    return Ok(false);
+                };
+                self.copy_key = Some(key);
+                self.output_ordinals.insert(key, ordinals);
+                Ok(false)
+            }
+            1 => {
+                let next = next_after(&old.object_identities, &self.copy_object);
+                let Some((object, identity)) = next else {
+                    self.copy_stage = 2;
+                    self.copy_object = None;
+                    return Ok(false);
+                };
+                self.copy_object = Some(object);
+                self.output_identities.insert(object, identity);
+                Ok(false)
+            }
+            2 => {
+                let next = next_after(&old.provisional_get_function_list, &self.copy_provisional);
+                let Some((key, object)) = next else {
+                    self.copy_stage = 3;
+                    self.copy_provisional = None;
+                    return Ok(false);
+                };
+                self.copy_provisional = Some(key);
+                if self.stable_ids.contains_key(&object) {
+                    self.output_provisional.insert(key, object);
+                }
+                Ok(false)
+            }
+            3 => {
+                let Some((object, skip)) = old.refused_module_objects.get(self.copy_index) else {
+                    self.copy_stage = 4;
+                    self.copy_index = 0;
+                    return Ok(false);
+                };
+                if self.stable_ids.contains_key(object) {
+                    self.output_refused.push((*object, skip.clone()));
+                }
+                self.copy_index += 1;
+                Ok(false)
+            }
+            _ => {
+                let Some(skip) = old.modules_skipped.get(self.copy_index) else {
+                    self.phase = ConservativePlanPhase::Retire;
+                    self.copy_index = 0;
+                    return Ok(false);
+                };
+                // Only refusals attributable to a retired module drop;
+                // unattributed entries are evidence and stay.
+                let retired_module = self.old_paths.contains(&skip.subject)
+                    && !self.surviving_paths.contains(&skip.subject);
+                if !retired_module {
+                    self.output_modules_skipped.push(skip.clone());
+                }
+                self.copy_index += 1;
+                Ok(false)
+            }
+        }
+    }
+
+    /// One retire unit: removed indices leave in ascending slot order, delta
+    /// retire rows in rebuilt key order.
+    fn retire_one(&mut self, old: &AttachPlan) -> Result<bool, GraphRefusal> {
+        if self.retire_slot < old.slots.len() {
+            if self.retired_by_cursor.contains(&self.retire_slot) {
+                self.output_removed.push(self.retire_slot as u32);
+            }
+            self.retire_slot += 1;
+            return Ok(false);
+        }
+        let next = next_after(&old.slot_by_key, &self.retire_key);
+        match next {
+            Some((key, position)) => {
+                self.retire_key = Some(key);
+                if self.retired_by_cursor.contains(&position) {
+                    let slot = old
+                        .slots
+                        .get(position)
+                        .ok_or(GraphRefusal::Identity)?
+                        .clone();
+                    self.output_retire.push(slot);
+                }
+                Ok(false)
+            }
+            None => {
+                self.assemble(old);
+                self.phase = ConservativePlanPhase::Ready;
+                Ok(true)
+            }
+        }
+    }
+
+    /// Moves the derived pieces into the output plan. All moves are O(1);
+    /// scalars come from the old plan or the derivation. Uncorroborated
+    /// spill is exact under broad admit (broad never spills, so the rebuilt
+    /// count is zero) and carried otherwise; the capture-concurrency
+    /// counters, policy and scope are the old plan's, exactly as the
+    /// reference extend leaves them.
+    fn assemble(&mut self, old: &AttachPlan) {
+        let mut out = AttachPlan::empty_like(old.admission_policy, old.admission_scope);
+        out.slots = std::mem::take(&mut self.output_slots);
+        out.modules = std::mem::take(&mut self.output_modules);
+        out.skipped = std::mem::take(&mut self.output_skipped);
+        out.modules_skipped = std::mem::take(&mut self.output_modules_skipped);
+        out.refused_module_objects = std::mem::take(&mut self.output_refused);
+        out.surfaces = std::mem::take(&mut self.output_surfaces);
+        out.slot_by_key = std::mem::take(&mut self.output_slot_by_key);
+        out.provisional_get_function_list = std::mem::take(&mut self.output_provisional);
+        out.slot_ordinals = std::mem::take(&mut self.output_ordinals);
+        out.object_identities = std::mem::take(&mut self.output_identities);
+        out.retired_slots = std::mem::take(&mut self.output_retired);
+        out.aggregate_owners = std::mem::take(&mut self.output_owners);
+        out.entries_seen = self.entries_seen;
+        out.module_ambiguous = self.ambiguous_count;
+        out.vendor_interfaces = old.vendor_interfaces;
+        out.interface_list = old.interface_list.clone();
+        out.counter_consumed_end = old.counter_consumed_end;
+        out.uncorroborated_candidates = if self.broad_admit {
+            0
+        } else {
+            old.uncorroborated_candidates
+        };
+        self.output = Some(out);
+        self.delta = Some(AttachDelta {
+            new: Vec::new(),
+            replace: Vec::new(),
+            retire: std::mem::take(&mut self.output_retire),
+        });
+    }
+}
+
+impl ConservativePlanCursor {
+    fn drain_vec<T>(vec: &mut Vec<T>) -> bool {
+        vec.pop().is_none()
+    }
+
+    fn drain_map<K: Ord, V>(map: &mut BTreeMap<K, V>) -> bool {
+        map.pop_first().is_none()
+    }
+
+    fn drain_set<T: Ord>(set: &mut BTreeSet<T>) -> bool {
+        set.pop_first().is_none()
+    }
+
+    // consumed by T4: installs the Ready output into the canonical plan.
+    #[allow(dead_code)]
+    pub(crate) fn swap_ready(
+        &mut self,
+        canonical: &mut AttachPlan,
+    ) -> Result<InstalledPlanBacking, GraphRefusal> {
+        if self.phase == ConservativePlanPhase::Cancelled {
+            return Err(GraphRefusal::Cancelled);
+        }
+        if self.phase != ConservativePlanPhase::Ready {
+            return Err(GraphRefusal::Identity);
+        }
+        let mut output = self.output.take().ok_or(GraphRefusal::Identity)?;
+        std::mem::swap(&mut output, canonical);
+        self.old = Some(output);
+        self.phase = ConservativePlanPhase::Installed;
+        Ok(InstalledPlanBacking {
+            output: self.storage.take(),
+            header: None,
+        })
+    }
+
+    // consumed by T4: drops derived leaves one per credit after install or refusal.
+    #[allow(dead_code)]
+    pub(crate) fn reclaim(&mut self, work: usize) -> Result<GraphStep, GraphRefusal> {
+        if work == 0 {
+            return Ok(GraphStep::Yielded);
+        }
+        if self.phase == ConservativePlanPhase::Reclaimed {
+            return Ok(GraphStep::Ready);
+        }
+        self.phase = ConservativePlanPhase::Reclaim;
+        for _ in 0..work {
+            if self.reclaim_one() {
+                self.phase = ConservativePlanPhase::Reclaimed;
+                return Ok(GraphStep::Ready);
+            }
+        }
+        Ok(GraphStep::Advanced)
+    }
+
+    // consumed by T4: abandons the derivation; drops nothing.
+    #[allow(dead_code)]
+    pub(crate) fn cancel(&mut self) {
+        self.phase = ConservativePlanPhase::Cancelled;
+    }
+
+    /// One reclaim leaf. Returns `true` once nothing remains.
+    fn reclaim_one(&mut self) -> bool {
+        match self.reclaim_step {
+            0 => {
+                let done = match self.output.as_mut().or_else(|| self.old.as_mut()) {
+                    Some(plan) => Self::drain_vec(&mut plan.slots),
+                    None => true,
+                };
+                if done {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            1 => {
+                let done = match self.output.as_mut().or_else(|| self.old.as_mut()) {
+                    Some(plan) => Self::drain_vec(&mut plan.modules),
+                    None => true,
+                };
+                if done {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            2 => {
+                let done = match self.output.as_mut().or_else(|| self.old.as_mut()) {
+                    Some(plan) => Self::drain_vec(&mut plan.skipped),
+                    None => true,
+                };
+                if done {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            3 => {
+                let done = match self.output.as_mut().or_else(|| self.old.as_mut()) {
+                    Some(plan) => Self::drain_vec(&mut plan.modules_skipped),
+                    None => true,
+                };
+                if done {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            4 => {
+                let done = match self.output.as_mut().or_else(|| self.old.as_mut()) {
+                    Some(plan) => Self::drain_vec(&mut plan.surfaces),
+                    None => true,
+                };
+                if done {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            5 => {
+                if let Some(plan) = self.output.as_mut().or_else(|| self.old.as_mut()) {
+                    plan.aggregate_owners = Vec::new();
+                }
+                self.reclaim_step += 1;
+                false
+            }
+            6 => {
+                let done = match self.output.as_mut().or_else(|| self.old.as_mut()) {
+                    Some(plan) => Self::drain_map(&mut plan.slot_by_key),
+                    None => true,
+                };
+                if done {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            7 => {
+                let done = match self.output.as_mut().or_else(|| self.old.as_mut()) {
+                    Some(plan) => Self::drain_set(&mut plan.retired_slots),
+                    None => true,
+                };
+                if done {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            8 => {
+                let done = match self.output.as_mut().or_else(|| self.old.as_mut()) {
+                    Some(plan) => Self::drain_map(&mut plan.slot_ordinals),
+                    None => true,
+                };
+                if done {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            9 => {
+                let done = match self.output.as_mut().or_else(|| self.old.as_mut()) {
+                    Some(plan) => Self::drain_map(&mut plan.object_identities),
+                    None => true,
+                };
+                if done {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            10 => {
+                let done = match self.output.as_mut().or_else(|| self.old.as_mut()) {
+                    Some(plan) => Self::drain_map(&mut plan.provisional_get_function_list),
+                    None => true,
+                };
+                if done {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            11 => {
+                let done = match self.output.as_mut().or_else(|| self.old.as_mut()) {
+                    Some(plan) => Self::drain_vec(&mut plan.refused_module_objects),
+                    None => true,
+                };
+                if done {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            12 => {
+                if let Some(plan) = self.output.as_mut().or_else(|| self.old.as_mut()) {
+                    plan.interface_list = String::new();
+                }
+                self.output = None;
+                self.old = None;
+                self.reclaim_step += 1;
+                false
+            }
+            13 => {
+                if Self::drain_vec(&mut self.output_slots) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            14 => {
+                if Self::drain_vec(&mut self.output_modules) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            15 => {
+                if Self::drain_vec(&mut self.output_skipped) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            16 => {
+                if Self::drain_vec(&mut self.output_modules_skipped) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            17 => {
+                if Self::drain_vec(&mut self.output_surfaces) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            18 => {
+                self.output_owners = Vec::new();
+                self.reclaim_step += 1;
+                false
+            }
+            19 => {
+                if Self::drain_map(&mut self.output_slot_by_key) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            20 => {
+                if Self::drain_set(&mut self.output_retired) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            21 => {
+                if Self::drain_map(&mut self.output_ordinals) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            22 => {
+                if Self::drain_map(&mut self.output_identities) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            23 => {
+                if Self::drain_map(&mut self.output_provisional) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            24 => {
+                if Self::drain_vec(&mut self.output_refused) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            25 => {
+                match self.delta.as_mut() {
+                    Some(delta) => {
+                        if delta.retire.pop().is_none() {
+                            delta.new = Vec::new();
+                            delta.replace = Vec::new();
+                            self.delta = None;
+                            self.reclaim_step += 1;
+                        }
+                    }
+                    None => self.reclaim_step += 1,
+                }
+                false
+            }
+            26 => {
+                self.output_removed = Vec::new();
+                self.reclaim_step += 1;
+                false
+            }
+            27 => {
+                if Self::drain_vec(&mut self.output_retire) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            28 => {
+                if Self::drain_set(&mut self.live) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            29 => {
+                if Self::drain_vec(&mut self.pieces) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            30 => {
+                if Self::drain_map(&mut self.groups) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            31 => {
+                self.group_order = Vec::new();
+                self.reclaim_step += 1;
+                false
+            }
+            32 => {
+                if Self::drain_vec(&mut self.manifest_orphaned) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            33 => {
+                if Self::drain_vec(&mut self.old_modules) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            34 => {
+                if Self::drain_map(&mut self.old_id_objects) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            35 => {
+                if Self::drain_set(&mut self.old_objects) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            36 => {
+                if Self::drain_set(&mut self.old_paths) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            37 => {
+                if Self::drain_set(&mut self.surviving_paths) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            38 => {
+                if Self::drain_map(&mut self.stable_ids) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            39 => {
+                if Self::drain_set(&mut self.retired_by_cursor) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            40 => {
+                let done = match self.in_summary.as_mut() {
+                    Some(summary) => {
+                        if summary.tables.pop().is_none() {
+                            summary.skipped.pop().is_none()
+                        } else {
+                            false
+                        }
+                    }
+                    None => true,
+                };
+                if done {
+                    self.in_summary = None;
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            41 => {
+                if Self::drain_vec(&mut self.piece_surfaces) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            42 => {
+                if Self::drain_vec(&mut self.seen_surfaces) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            43 => {
+                self.piece_tables = Vec::new();
+                self.seen_tables = Vec::new();
+                self.reclaim_step += 1;
+                false
+            }
+            44 => {
+                if Self::drain_map(&mut self.piece_skip_occurrences) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            45 => {
+                if Self::drain_set(&mut self.seen_skips) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            46 => {
+                if Self::drain_set(&mut self.counter.targets) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            47 => {
+                if Self::drain_set(&mut self.counter.skips) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            48 => {
+                if Self::drain_map(&mut self.within_targets) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            49 => {
+                if Self::drain_map(&mut self.within_skips) {
+                    self.reclaim_step += 1;
+                }
+                false
+            }
+            _ => {
+                self.storage.take();
+                true
+            }
+        }
+    }
+}
+
+/// Upper-bound label bytes for one manifest surface summary, read from the
+/// source records without allocating.
+fn manifest_surface_label_bytes(
+    surface: &p11scope_manifest::manifest::SurfaceRecord,
+) -> (usize, usize, usize) {
+    let source = match &surface.source {
+        SurfaceSource::LegacyFunctionList => "legacy_function_list".len(),
+        SurfaceSource::Interface { .. } => 48,
+    };
+    let walk = match &surface.walk {
+        WalkOutcome::Unreadable { detail } => detail.len().checked_add(16),
+        _ => Some(16),
+    };
+    let acquisition = match &surface.acquisition {
+        Acquisition::Error { detail } => detail.len().checked_add(16),
+        _ => Some(16),
+    };
+    (
+        source,
+        walk.unwrap_or(usize::MAX),
+        acquisition.unwrap_or(usize::MAX),
     )
 }
 
@@ -8858,5 +10954,52 @@ mod tests {
         let (class, lookalikes) = admission_class(&[lower_scanned(&mixed)]);
         assert_eq!(class, AdmissionClass::ClosureArray);
         assert_eq!(lookalikes, 60);
+    }
+
+    #[test]
+    fn plan_token_poison_is_refused_by_the_fence() {
+        use crate::discovery::identity::{GraphRefusal, GraphStep};
+        use crate::semantics_edge::resources::SemanticResourcePool;
+
+        let retained = scanned_with(TEST_OBJECT, "/retained.so", [0x10]);
+        let retired_key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: 43,
+        };
+        let retired = scanned_with(retired_key, "/retired.so", [0x20]);
+        let old = build_from_reconciled_modules(&[retained.clone(), retired]);
+        assert_eq!(old.slots.len(), 2);
+        let surviving = [retained];
+        let pins = PinnedObjects::empty();
+        let mut stable = |object: PinnedObjectId| Some(ModuleId(object.0));
+        let pool = SemanticResourcePool::default();
+        let reserve = pool.reserver();
+
+        // Mid-stream poison trips the fence on the next credit.
+        let mut poisoned = old.clone();
+        let mut cursor = ConservativePlanCursor::new();
+        let sources = ConservativePlanSources::new(&surviving, &[], &pins, false);
+        let first = poisoned
+            .poll_conservative_rebuild(sources, &mut stable, &mut cursor, &reserve, 1)
+            .unwrap();
+        assert_eq!(first, GraphStep::Advanced);
+        poisoned.poison_token_for_test();
+        let sources = ConservativePlanSources::new(&surviving, &[], &pins, false);
+        let err = poisoned
+            .poll_conservative_rebuild(sources, &mut stable, &mut cursor, &reserve, 1)
+            .unwrap_err();
+        assert!(matches!(err, GraphRefusal::SourceChanged));
+
+        // A pre-poisoned plan is refused at the first credit, before measuring.
+        let mut poisoned = old.clone();
+        poisoned.poison_token_for_test();
+        let mut cursor = ConservativePlanCursor::new();
+        let sources = ConservativePlanSources::new(&surviving, &[], &pins, false);
+        let err = poisoned
+            .poll_conservative_rebuild(sources, &mut stable, &mut cursor, &reserve, 1)
+            .unwrap_err();
+        assert!(matches!(err, GraphRefusal::SourceChanged));
+        assert!(cursor.plan().is_none());
+        assert!(cursor.required_bytes().is_none());
     }
 }

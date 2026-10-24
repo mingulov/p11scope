@@ -121,7 +121,7 @@ static int finite_word(CK_ATTRIBUTE_TYPE type, CK_ULONG value) {
     switch (type) {
         case CKA_CLASS: return value <= 4;
         case CKA_KEY_TYPE:
-            return value <= 4 || value == 0x10 || value == 0x1f || value == 0x3a || value == 0x3b;
+            return value <= 4 || value == 0x10 || value == 0x1f || value == 0x40 || value == 0x41;
         case CKA_MODULUS_BITS:
             return value == 1024 || value == 2048 || value == 3072 || value == 4096 || value == 8192;
         default: return 0;

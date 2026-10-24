@@ -22,6 +22,8 @@ mod owner_admission;
 mod sem1_feed;
 #[path = "sem2_feed.rs"]
 mod sem2_feed;
+#[path = "sem3_feed.rs"]
+mod sem3_feed;
 
 struct HeldProviders {
     _dir: tempfile::TempDir,

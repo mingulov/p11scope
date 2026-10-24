@@ -41,6 +41,55 @@ class ReleaseNoticesTests(unittest.TestCase):
     def normalize(self):
         return self.mod.normalize_report(self.report, self.metadata, self.root, self.root)
 
+    def toolchain_fixture(self, stable):
+        (self.root / ".release-rust-version").write_text("1.99.1\n")
+        sysroot = self.root / "sysroot"
+        sysroot.mkdir()
+        notice = b"Original compiler library notices\n"
+        (sysroot / "copyright").write_bytes(notice)
+        recipe = {"toolchains": [{
+            "name": name, "rustc_verbose_version": f"fixture rustc {name}",
+            "files": [{"payload": f"licenses/rust-{name}/COPYRIGHT-library.html",
+                       "source": "copyright", "sha256": hashlib.sha256(notice).hexdigest()}],
+        } for name in (stable, "nightly-2026-05-20")]}
+        tools = {str(self.root / name): name for name in (stable, "nightly-2026-05-20")}
+
+        def run(arguments, root):
+            self.assertEqual(root, self.root)
+            if arguments[:3] == ["rustup", "which", "--toolchain"]:
+                self.assertEqual(arguments[4:], ["rustc"])
+                return str(self.root / arguments[3])
+            name = tools[arguments[0]]
+            if arguments[1:] == ["-Vv"]:
+                return f"fixture rustc {name}"
+            self.assertEqual(arguments[1:], ["--print", "sysroot"])
+            return str(sysroot)
+
+        return recipe, run
+
+    def test_toolchain_payload_refuses_self_consistent_stale_release_recipe(self):
+        recipe, run = self.toolchain_fixture("1.98.1")
+        with mock.patch.object(self.mod, "run", side_effect=run):
+            with self.assertRaisesRegex(self.mod.NoticeError, "current release compiler"):
+                self.mod.toolchain_payload(self.root, recipe)
+
+    def test_toolchain_payload_requires_one_current_release_entry(self):
+        recipe, run = self.toolchain_fixture("1.99.1")
+        recipe["toolchains"].append(recipe["toolchains"][0])
+        with mock.patch.object(self.mod, "run", side_effect=run):
+            with self.assertRaisesRegex(self.mod.NoticeError, "current release compiler"):
+                self.mod.toolchain_payload(self.root, recipe)
+
+    def test_toolchain_payload_keeps_current_release_and_nightly_notices(self):
+        recipe, run = self.toolchain_fixture("1.99.1")
+        with mock.patch.object(self.mod, "run", side_effect=run):
+            payload, facts = self.mod.toolchain_payload(self.root, recipe)
+        self.assertEqual(payload["licenses/rust-1.99.1/COPYRIGHT-library.html"],
+                         b"Original compiler library notices\n")
+        self.assertEqual(payload["licenses/rust-nightly-2026-05-20/COPYRIGHT-library.html"],
+                         b"Original compiler library notices\n")
+        self.assertEqual([item["name"] for item in facts], ["1.99.1", "nightly-2026-05-20"])
+
     def test_synthesized_license_is_rejected(self):
         self.report["licenses"][0]["source_path"] = None
         with self.assertRaisesRegex(self.mod.NoticeError, "synthesized"):

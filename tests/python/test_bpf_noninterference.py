@@ -978,11 +978,14 @@ p=argparse.ArgumentParser()
 for key in ("repo", "baseline", "candidate", "work"):
     p.add_argument("--"+key, required=True)
 p.add_argument("--repeat-baseline", action="store_true")
+p.add_argument("--host-compiler-transition", action="store_true")
 a=p.parse_args()
 with Path(os.environ["CI_FIXTURE_LOG"]).open("a") as log:
     log.write(json.dumps(vars(a))+"\\n")
 if a.repeat_baseline and os.environ.get("CI_FIXTURE_FAIL_CONTROL") == "true":
     raise SystemExit(23)
+if a.host_compiler_transition == a.repeat_baseline:
+    raise SystemExit("repeat needs old compiler; integration needs explicit transition")
 work=Path(a.work)
 work.mkdir()
 if os.environ.get("CI_FIXTURE_MISSING_RECEIPT") != "true":
@@ -1014,6 +1017,8 @@ if os.environ.get("CI_FIXTURE_MISSING_RECEIPT") != "true":
                          (baseline, baseline, True))
         self.assertEqual((integration["baseline"], integration["candidate"], integration["repeat_baseline"]),
                          (baseline, "b" * 40, False))
+        self.assertFalse(control["host_compiler_transition"])
+        self.assertTrue(integration["host_compiler_transition"])
         self.assertNotEqual(control["work"], integration["work"])
 
     def test_failed_control_stops_before_integration(self):

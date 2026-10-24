@@ -21,6 +21,10 @@ pub(crate) mod native_binding;
 pub mod noise;
 pub(crate) mod pause;
 pub(crate) mod proof_stats;
+// Z2 retained-member custody substrate; the Task 3 N1 confirm-path routing
+// is its first consumer (remove once it consumes the whole surface).
+#[allow(dead_code)]
+pub(crate) mod retained_member;
 pub mod scan;
 pub(crate) mod scheduler;
 pub(crate) mod sweep_attribution;

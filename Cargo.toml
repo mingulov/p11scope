@@ -18,7 +18,7 @@ wide-detailed-2112 = ["p11scope-ebpf-common/wide-detailed-2112"]
 # P0 explicit option: build the Detailed object with the H7-E4
 # attribute gate shut (entry acquires nothing, Get emission reads
 # nothing). Official release bytes are FULL (default features) unless
-# --capture-mode p0 selects this; FULL qualification is pending A1.1.
+# --capture-mode p0 selects this.
 stub-object-attributes = []
 # Internal-only diagnostic: attribute every published discovery skip to the
 # site that raised it. Stderr only; the capture document is byte-identical

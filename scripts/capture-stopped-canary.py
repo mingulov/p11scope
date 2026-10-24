@@ -810,8 +810,6 @@ class Coordinator:
         self.phase = 'configuration'
         self.stopped_deadline = None
         self.owned_observer_deadline = None
-        self.ready_kernel_release = None
-        self.ready_bound_seconds = None
         self.go_created = False
 
     def check(self, phase, deadline=None):
@@ -1093,7 +1091,6 @@ class Coordinator:
         try:
             release = os.uname().release
             ready_seconds = ready_bound_seconds(release)
-            self.ready_kernel_release, self.ready_bound_seconds = release, ready_seconds
             print(f'CANARY_READY_BOUND_DECLARED kernel={release} seconds={ready_seconds}', flush=True)
             validate_config(self.config)
             evidence.set_object_attributes(getattr(self.config, 'object_attributes', 'present'))

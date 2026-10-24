@@ -304,7 +304,10 @@ impl RetainedGroupMember {
     }
 
     /// Select the member for a TID proof run, re-proving liveness first.
+    /// Holds a transient lease for the proof I/O like every sibling read,
+    /// so FD exhaustion refuses here instead of succeeding unleased.
     pub(crate) fn selector(&self) -> Result<ValidatedMemberSelector<'_>, String> {
+        let _transient = self.fd_owner.batch().transient()?;
         self.live_identity()?;
         Ok(ValidatedMemberSelector { member: self })
     }
@@ -345,19 +348,74 @@ impl RetainedGroupMember {
     /// The member's map_files directory: `map_files` exists only per process
     /// (`/proc/<tgid>/task/<tid>/` has none), and threads share the TGID mm,
     /// so the TGID directory IS the member's. Held transiently with its own
-    /// lease; the member is re-proved first so a dead group never opens a
-    /// reused TGID's directory.
+    /// lease; the member is re-proved before AND after the open, so a group
+    /// that died (and whose TGID was reused) between the proof and the open
+    /// refuses instead of serving another group's directory.
     pub(crate) fn open_map_files_dir(&self) -> Result<TransientMapFilesDir, String> {
+        self.open_map_files_dir_with_opener(&open_proc_dir)
+    }
+
+    /// `open_map_files_dir` with the TGID directory opener injected.
+    /// Production passes the real opener; tests inject a raced death so the
+    /// post-open bracket is deterministic.
+    pub(crate) fn open_map_files_dir_with_opener(
+        &self,
+        open_dir: &dyn Fn(&Path) -> Result<OwnedFd, String>,
+    ) -> Result<TransientMapFilesDir, String> {
         let lease = self.fd_owner.batch().transient()?;
         self.live_identity()?;
-        let dir = open_proc_dir(&tgid_map_files_path(self.tgid))?;
+        let dir = open_dir(&tgid_map_files_path(self.tgid))?;
+        // Post-open bracket: the group may have died (and the TGID may have
+        // been reused) between the pre-open proof and the open. The opened
+        // directory closes with this refusal; nothing about it is served.
+        self.live_identity()?;
         Ok(TransientMapFilesDir { dir, _lease: lease })
     }
 
     /// One range identity through the held map_files directory: the entry is
     /// followed, like `MapFilesDir::identity`.
     pub(crate) fn stat_map_file(&self, start: u64, end: u64) -> Result<FileIdentity, String> {
-        self.open_map_files_dir()?.stat(start, end)
+        self.stat_map_file_with_opener(start, end, &open_proc_dir)
+    }
+
+    /// `stat_map_file` with the TGID directory opener injected. Production
+    /// passes the real opener; tests inject a raced death so the post-open
+    /// and post-stat brackets are deterministic.
+    pub(crate) fn stat_map_file_with_opener(
+        &self,
+        start: u64,
+        end: u64,
+        open_dir: &dyn Fn(&Path) -> Result<OwnedFd, String>,
+    ) -> Result<FileIdentity, String> {
+        let guard = self.open_map_files_dir_with_opener(open_dir)?;
+        self.stat_guarded(&guard, start, end)
+    }
+
+    /// Stat one range through a held guard, re-proving the member after
+    /// the stat: the member may have died between the open and the stat.
+    /// The proof runs even when the stat fails, so a dead member always
+    /// reports the custody refusal instead of a stale lookup result.
+    /// Shared by `stat_map_file` and the tests so the twin pins the code
+    /// production runs.
+    fn stat_guarded(
+        &self,
+        guard: &TransientMapFilesDir,
+        start: u64,
+        end: u64,
+    ) -> Result<FileIdentity, String> {
+        let stated = guard.stat(start, end);
+        self.live_identity()?;
+        stated
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_stat_guarded(
+        &self,
+        guard: &TransientMapFilesDir,
+        start: u64,
+        end: u64,
+    ) -> Result<FileIdentity, String> {
+        self.stat_guarded(guard, start, end)
     }
 
     #[cfg(test)]

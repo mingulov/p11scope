@@ -99,6 +99,7 @@ RUN = [
     ("test_system_scope_soak.py", []),
     ("test_system_test_manifest.py", []),
     ("test_t7_campaign.py", []),
+    ("test_uprobe_close_throughput_probe.py", []),
 ]
 
 _ARTIFACT_CONTRACTS = "tests/artifact_contracts.rs"

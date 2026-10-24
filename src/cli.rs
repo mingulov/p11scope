@@ -3087,6 +3087,256 @@ mod tests {
     }
 
     #[test]
+    fn metrics_counter_capabilities_accept_all_three_modes() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let child = vec![
+            OsString::from("/bin/echo"),
+            OsString::from("--counter-mode"),
+            OsString::from("latency"),
+            OsString::from("--mode"),
+            OsString::from("profile"),
+            OsString::from_vec(b"child-\xff".to_vec()),
+        ];
+        for mode in ["counts", "timestamps", "latency"] {
+            for options in [
+                ["--mode", "metrics", "--counter-mode", mode],
+                ["--counter-mode", mode, "--mode", "metrics"],
+            ] {
+                let mut profile = vec!["profile", "--pid", "42"];
+                profile.extend_from_slice(&options);
+                let parsed = parse(args(&profile)).unwrap_or_else(|error| {
+                    panic!("profile metrics must accept {mode}, {options:?}: {error:?}")
+                });
+                let Command::Profile(profile) = parsed else {
+                    panic!("counter selection must remain a profile capture");
+                };
+                assert_eq!(profile.kind, Kind::Profile);
+                assert_eq!(profile.scope, ScopeArg::Pid(42));
+                assert!(profile.metrics && !profile.unsafe_requested);
+                assert_eq!(profile.attach_backend, BackendSelection::Auto);
+
+                let mut run = vec![OsString::from("run")];
+                run.extend(options.iter().map(|option| OsString::from(*option)));
+                run.push(OsString::from("--"));
+                run.extend(child.iter().cloned());
+                let parsed = parse(run).unwrap_or_else(|error| {
+                    panic!("run metrics must accept {mode}, {options:?}: {error:?}")
+                });
+                let Command::Run(run) = parsed else {
+                    panic!("counter selection must retain the owned run surface");
+                };
+                assert_eq!(run.kind, Kind::Profile);
+                assert!(run.metrics && !run.unsafe_requested);
+                assert_eq!(run.pause, PausePolicy::Never);
+                assert_eq!(run.attach_backend, BackendSelection::Auto);
+                assert_eq!(run.command, child, "child flags and bytes belong after --");
+            }
+        }
+    }
+
+    #[test]
+    fn metrics_counter_capabilities_refuse_nonmetrics_and_repeats() {
+        // Omission preserves the existing parser's profile/metrics distinction;
+        // no new field or policy API is assumed by these tests-first controls.
+        for (argv, metrics) in [
+            (vec!["profile", "--pid", "42"], false),
+            (vec!["profile", "--pid", "42", "--mode", "metrics"], true),
+        ] {
+            let Command::Profile(profile) = parse(args(&argv)).unwrap() else {
+                panic!("expected legacy profile surface");
+            };
+            assert_eq!(profile.kind, Kind::Profile);
+            assert_eq!(profile.metrics, metrics);
+            assert!(!profile.unsafe_requested);
+            assert_eq!(profile.scope, ScopeArg::Pid(42));
+        }
+        for (argv, metrics) in [
+            (
+                vec!["run", "--", "/bin/echo", "--counter-mode", "counts"],
+                false,
+            ),
+            (
+                vec![
+                    "run",
+                    "--mode",
+                    "metrics",
+                    "--",
+                    "/bin/echo",
+                    "--counter-mode",
+                    "counts",
+                ],
+                true,
+            ),
+        ] {
+            let Command::Run(run) = parse(args(&argv)).unwrap() else {
+                panic!("expected legacy owned run surface");
+            };
+            assert_eq!(run.kind, Kind::Profile);
+            assert_eq!(run.metrics, metrics);
+            assert!(!run.unsafe_requested);
+            assert_eq!(run.pause, PausePolicy::Never);
+            assert_eq!(run.command, ["/bin/echo", "--counter-mode", "counts"]);
+        }
+
+        let refuses = |argv: &[&str], reasons: &[&str]| {
+            let error = parse(args(argv)).expect_err("counter option combination must refuse");
+            let CliError::Usage { message, .. } = error else {
+                panic!("{argv:?}: expected usage refusal, got {error:?}");
+            };
+            for reason in reasons {
+                assert!(
+                    message.contains(reason),
+                    "{argv:?}: refusal must explain {reason:?}, got {message:?}"
+                );
+            }
+        };
+        for mode in ["counts", "timestamps", "latency"] {
+            refuses(
+                &["inventory", "--pid", "42", "--counter-mode", mode],
+                &["--counter-mode"],
+            );
+            for argv in [
+                vec!["profile", "--pid", "42", "--counter-mode", mode],
+                vec![
+                    "profile",
+                    "--pid",
+                    "42",
+                    "--mode",
+                    "profile",
+                    "--counter-mode",
+                    mode,
+                ],
+                vec![
+                    "profile",
+                    "--counter-mode",
+                    mode,
+                    "--mode",
+                    "profile",
+                    "--pid",
+                    "42",
+                ],
+                vec!["trace", "--pid", "42", "--counter-mode", mode],
+                vec!["run", "--counter-mode", mode, "--", "/bin/true"],
+                vec!["run", "--trace", "--counter-mode", mode, "--", "/bin/true"],
+                vec!["run", "--counter-mode", mode, "--trace", "--", "/bin/true"],
+            ] {
+                refuses(&argv, &["--counter-mode", "metrics"]);
+            }
+            for argv in [
+                vec![
+                    "profile",
+                    "--pid",
+                    "42",
+                    "--mode",
+                    "metrics",
+                    "--unsafe-unvalidated-metadata",
+                    "--counter-mode",
+                    mode,
+                ],
+                vec![
+                    "profile",
+                    "--pid",
+                    "42",
+                    "--counter-mode",
+                    mode,
+                    "--mode",
+                    "metrics",
+                    "--unsafe-unvalidated-metadata",
+                ],
+                vec![
+                    "run",
+                    "--mode",
+                    "metrics",
+                    "--unsafe-unvalidated-metadata",
+                    "--counter-mode",
+                    mode,
+                    "--",
+                    "/bin/true",
+                ],
+                vec![
+                    "run",
+                    "--counter-mode",
+                    mode,
+                    "--mode",
+                    "metrics",
+                    "--unsafe-unvalidated-metadata",
+                    "--",
+                    "/bin/true",
+                ],
+            ] {
+                refuses(&argv, &["--counter-mode", "unsafe"]);
+            }
+            refuses(
+                &[
+                    "profile",
+                    "--pid",
+                    "42",
+                    "--mode",
+                    "metrics",
+                    "--counter-mode",
+                    mode,
+                    "--counter-mode",
+                    mode,
+                ],
+                &["--counter-mode", "twice"],
+            );
+            refuses(
+                &[
+                    "run",
+                    "--mode",
+                    "metrics",
+                    "--counter-mode",
+                    mode,
+                    "--counter-mode",
+                    "latency",
+                    "--",
+                    "/bin/true",
+                ],
+                &["--counter-mode", "twice"],
+            );
+        }
+        for mode in ["", "count", "COUNTS", "unknown"] {
+            refuses(
+                &[
+                    "profile",
+                    "--pid",
+                    "42",
+                    "--mode",
+                    "metrics",
+                    "--counter-mode",
+                    mode,
+                ],
+                &["--counter-mode", "invalid"],
+            );
+            refuses(
+                &[
+                    "run",
+                    "--mode",
+                    "metrics",
+                    "--counter-mode",
+                    mode,
+                    "--",
+                    "/bin/true",
+                ],
+                &["--counter-mode", "invalid"],
+            );
+        }
+        for argv in [
+            vec![
+                "profile",
+                "--pid",
+                "42",
+                "--mode",
+                "metrics",
+                "--counter-mode",
+            ],
+            vec!["run", "--mode", "metrics", "--counter-mode"],
+        ] {
+            refuses(&argv, &["--counter-mode", "value"]);
+        }
+    }
+
+    #[test]
     fn attach_backend_flag_selects_the_static_backend_on_every_capture_surface() {
         let Command::Profile(a) = parse(args(&[
             "profile",

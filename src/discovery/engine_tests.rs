@@ -45027,3 +45027,367 @@ fn collected_finish_nonempty_rejection_keeps_actual_collision_until_disposition(
         2
     );
 }
+
+/// Two live views, each with one accepted provider over a distinct object.
+///
+/// Builds on [`engine_with_one_accepted_provider`] (one view, slot 0) and adds
+/// a second view by the same open → snapshot → pin → candidate → apply
+/// pattern, accepting the peer object as slot 1. Both children stay alive for
+/// the test; dropping the guard kills and reaps them.
+struct TwoViewProviderEngine {
+    _first: SystemScopeChildGuard,
+    _second: SystemScopeChildGuard,
+    engine: Engine,
+}
+
+impl TwoViewProviderEngine {
+    fn new() -> Self {
+        let (child, mut engine, first) = engine_with_one_accepted_provider();
+        let first_guard = SystemScopeChildGuard::new(child);
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let view = ProcessView::open(ProcessViewId(4), child.id()).unwrap();
+        let second = child_provider_modules(&view);
+        engine.views.push(view);
+        engine.next_view_id = 5;
+        // The peer object is distinct from the accepted one by construction of
+        // `snapshot_two_provider_modules` (distinct `ObjectKey`s).
+        assert_ne!(second[1].key, first[0].key);
+        let mut pins = engine.pinned.clone();
+        let skipped = pins.absorb(pin_test_modules(&engine.views[1], &second[1..2]));
+        let candidate = engine
+            .live_candidate(pins, vec![first[0].clone(), second[1].clone()], skipped)
+            .unwrap();
+        assert_eq!(
+            candidate.delta.new.len(),
+            1,
+            "only the second view's provider is newly allocated"
+        );
+        assert_eq!(candidate.plan.slots.len(), 2);
+        let mut session = ScriptedSession::default();
+        let mut additions = true;
+        let outcome = engine
+            .apply_candidate(&mut session, candidate, &mut additions, false, &[])
+            .unwrap();
+        assert!(outcome.accepted(), "the second candidate is accepted whole");
+        assert_eq!(engine.views.len(), 2);
+        assert_eq!(engine.plan.slots.len(), 2);
+        assert_eq!(engine.modules.len(), 2);
+        assert!(engine.plan.modules_skipped.is_empty());
+        Self {
+            _first: first_guard,
+            _second: SystemScopeChildGuard::new(child),
+            engine,
+        }
+    }
+}
+
+/// Drives a plan cursor to its terminal state one `work`-sized credit at a
+/// time. Returns `Ready` or the refusal; panics on `Yielded` (a positive
+/// credit must advance or finish) and on non-termination.
+fn drive_plan_cursor_to_terminal<'a>(
+    old: &'a plan::AttachPlan,
+    make_sources: impl Fn() -> crate::plan::ConservativePlanSources<'a>,
+    stable: &mut dyn FnMut(PinnedObjectId) -> Option<plan::ModuleId>,
+    cursor: &mut crate::plan::ConservativePlanCursor,
+    reserve: &crate::semantics_edge::resources::SemanticResourceReserver,
+    work: usize,
+) -> Result<crate::discovery::identity::GraphStep, crate::discovery::identity::GraphRefusal> {
+    use crate::discovery::identity::GraphStep;
+    for _ in 0..100_000 {
+        let sources = make_sources();
+        match old.poll_conservative_rebuild(sources, stable, cursor, reserve, work)? {
+            GraphStep::Ready => return Ok(GraphStep::Ready),
+            GraphStep::Advanced => {}
+            GraphStep::Yielded => panic!("a work-{work} credit must advance or finish"),
+        }
+    }
+    panic!("the plan cursor did not converge within 100_000 credits");
+}
+
+#[test]
+fn collected_plan_cursor_matches_removal_only_reference() {
+    use crate::discovery::identity::{GraphRefusal, GraphStep};
+    use crate::plan::{ConservativePlanCursor, ConservativePlanSources};
+    use crate::semantics_edge::resources::{SEMANTIC_TRANSITION_SCRATCH, SemanticResourcePool};
+
+    let mut two = TwoViewProviderEngine::new();
+    let engine = &mut two.engine;
+    let retired_view = engine.views[0].id();
+    let surviving: Vec<ReconciledModule> = engine
+        .modules
+        .iter()
+        .filter(|module| module.scanned.view != retired_view)
+        .cloned()
+        .collect();
+    assert_eq!(surviving.len(), 1);
+
+    // The removal-only oracle: rebuild from the surviving sources, bind stable
+    // IDs, extend the old plan.
+    let old = engine.plan.clone();
+    let mut rebuilt = old.rebuild_from_sources_broad(
+        &surviving,
+        &engine.manifests,
+        &engine.pinned,
+        engine.broad_admit,
+    );
+    engine
+        .capture_facts
+        .bind_plan_module_ids(&mut rebuilt, &surviving, &engine.manifests, &engine.pinned)
+        .unwrap();
+    let mut next = old.clone();
+    let delta = next
+        .extend_exact_with_stable_module_ids(rebuilt)
+        .unwrap();
+    assert!(delta.new.is_empty(), "the reference must not grow");
+    assert!(delta.replace.is_empty(), "the reference must not replace");
+    assert_eq!(delta.retire.len(), 1, "the reference retires one slot");
+
+    let pool = SemanticResourcePool::default();
+    let reserve = pool.reserver();
+    let pinned = &engine.pinned;
+    let facts = &engine.capture_facts;
+    let manifests = &engine.manifests;
+    let broad_admit = engine.broad_admit;
+    let make_sources =
+        || ConservativePlanSources::new(&surviving, manifests, pinned, broad_admit);
+    let mut stable =
+        |object: PinnedObjectId| facts.module_id_for_object(pinned, object).ok();
+
+    // Work 0 changes nothing.
+    let mut cursor = ConservativePlanCursor::new();
+    let idle = old
+        .poll_conservative_rebuild(make_sources(), &mut stable, &mut cursor, &reserve, 0)
+        .unwrap();
+    assert_eq!(idle, GraphStep::Yielded);
+    assert!(cursor.plan().is_none());
+    assert!(cursor.delta().is_none());
+    assert!(cursor.removed().is_none());
+    assert!(cursor.required_bytes().is_none());
+
+    // One credit at a time to Ready; the output equals the oracle field for
+    // field.
+    drive_plan_cursor_to_terminal(&old, &make_sources, &mut stable, &mut cursor, &reserve, 1)
+        .unwrap();
+    let plan = cursor.plan().expect("a Ready cursor holds the rebuilt plan");
+    let cursor_delta = cursor.delta().expect("a Ready cursor holds the delta");
+    let removed = cursor.removed().expect("a Ready cursor holds the removals");
+    assert_eq!(plan.slots, next.slots);
+    assert_eq!(plan.modules, next.modules);
+    assert_eq!(plan.skipped, next.skipped);
+    assert_eq!(plan.modules_skipped, next.modules_skipped);
+    assert_eq!(plan.surfaces, next.surfaces);
+    assert_eq!(
+        plan, &next,
+        "private plan state (slot index, retirements, aggregate owners) matches"
+    );
+    assert_eq!(cursor_delta.new, delta.new);
+    assert_eq!(cursor_delta.replace, delta.replace);
+    assert_eq!(cursor_delta.retire, delta.retire);
+    let mut retired: Vec<u32> = delta.retire.iter().map(|slot| slot.index).collect();
+    retired.sort();
+    assert_eq!(removed, retired.as_slice());
+
+    // Payment: exact fit reaches Ready; one byte short refuses with no output.
+    let required = cursor
+        .required_bytes()
+        .expect("a Ready cursor measured its cost");
+    assert!(required > 0);
+    let fit = SemanticResourcePool::default();
+    fit.reference_set_limit(SEMANTIC_TRANSITION_SCRATCH + required);
+    let mut fit_cursor = ConservativePlanCursor::new();
+    drive_plan_cursor_to_terminal(
+        &old,
+        &make_sources,
+        &mut stable,
+        &mut fit_cursor,
+        &fit.reserver(),
+        1,
+    )
+    .unwrap();
+    assert!(fit_cursor.plan().is_some());
+    let short = SemanticResourcePool::default();
+    short.reference_set_limit(SEMANTIC_TRANSITION_SCRATCH + required - 1);
+    let short_reserve = short.reserver();
+    let mut short_cursor = ConservativePlanCursor::new();
+    let mut steps = 0;
+    let refusal = loop {
+        steps += 1;
+        assert!(steps < 100_000, "a one-short pool must refuse promptly");
+        match old.poll_conservative_rebuild(
+            make_sources(),
+            &mut stable,
+            &mut short_cursor,
+            &short_reserve,
+            1,
+        ) {
+            Ok(GraphStep::Ready) => panic!("a one-short pool must refuse"),
+            Ok(_) => {}
+            Err(refusal) => break refusal,
+        }
+    };
+    assert!(matches!(refusal, GraphRefusal::Storage(_)));
+    assert!(short_cursor.plan().is_none());
+}
+
+#[test]
+fn collected_plan_cursor_never_grows_at_q() {
+    use crate::plan::{ConservativePlanCursor, ConservativePlanSources};
+    use crate::semantics_edge::resources::SemanticResourcePool;
+
+    let mut two = TwoViewProviderEngine::new();
+    let engine = &mut two.engine;
+    // An extra module over a fresh key: the first module re-decoded at a new
+    // offset, so the reference rebuild genuinely grows.
+    let mut grown = engine.modules.clone();
+    let mut extra = grown[0].clone();
+    extra.scanned.tables[0].entries[0].file_offset = 0x2000;
+    assert!(
+        !engine
+            .plan
+            .slots
+            .iter()
+            .any(|slot| slot.object == extra.object && slot.file_offset == 0x2000)
+    );
+    grown.push(extra);
+
+    let mut old = engine.plan.clone();
+    // Non-vacuity probe: an unattributed historical refusal the cursor must
+    // keep while refusing growth.
+    old.modules_skipped.push(crate::plan::Skipped {
+        subject: "/refused-provider.so".into(),
+        reason: "historical refusal kept without growth".into(),
+    });
+    let mut rebuilt = old.rebuild_from_sources_broad(
+        &grown,
+        &engine.manifests,
+        &engine.pinned,
+        engine.broad_admit,
+    );
+    engine
+        .capture_facts
+        .bind_plan_module_ids(&mut rebuilt, &grown, &engine.manifests, &engine.pinned)
+        .unwrap();
+    let mut next = old.clone();
+    let delta = next.extend_exact_with_stable_module_ids(rebuilt).unwrap();
+    assert_eq!(delta.new.len(), 1, "the grown reference must add one slot");
+    assert!(delta.retire.is_empty());
+
+    let pool = SemanticResourcePool::default();
+    let reserve = pool.reserver();
+    let pinned = &engine.pinned;
+    let facts = &engine.capture_facts;
+    let manifests = &engine.manifests;
+    let broad_admit = engine.broad_admit;
+    let make_sources = || ConservativePlanSources::new(&grown, manifests, pinned, broad_admit);
+    let mut stable = |object: PinnedObjectId| facts.module_id_for_object(pinned, object).ok();
+    let mut cursor = ConservativePlanCursor::new();
+    drive_plan_cursor_to_terminal(&old, &make_sources, &mut stable, &mut cursor, &reserve, 1)
+        .unwrap();
+    let plan = cursor.plan().expect("a Ready cursor holds the rebuilt plan");
+    let cursor_delta = cursor.delta().expect("a Ready cursor holds the delta");
+    assert!(
+        cursor_delta.new.is_empty(),
+        "no growth at Q: the delta adds nothing"
+    );
+    assert!(
+        cursor_delta.replace.is_empty(),
+        "no growth at Q: the delta replaces nothing"
+    );
+    assert_eq!(plan.modules_skipped, old.modules_skipped);
+    assert_eq!(plan.slots, old.slots);
+    assert_eq!(plan.modules, old.modules);
+    let refused: Vec<(PinnedObjectId, &crate::plan::Skipped)> =
+        plan.refused_modules().collect();
+    let old_refused: Vec<(PinnedObjectId, &crate::plan::Skipped)> =
+        old.refused_modules().collect();
+    assert_eq!(refused, old_refused);
+    for slot in &old.slots {
+        assert_eq!(
+            plan.module_of_slot(slot.index),
+            old.module_of_slot(slot.index)
+        );
+    }
+    assert!(cursor.removed().unwrap().is_empty());
+}
+
+#[test]
+fn collected_plan_cursor_refuses_in_place_mutation_and_missing_ids() {
+    use crate::discovery::identity::{GraphRefusal, GraphStep};
+    use crate::plan::{ConservativePlanCursor, ConservativePlanSources};
+    use crate::semantics_edge::resources::SemanticResourcePool;
+
+    let mut two = TwoViewProviderEngine::new();
+    let engine = &mut two.engine;
+    let retired_view = engine.views[0].id();
+    let surviving: Vec<ReconciledModule> = engine
+        .modules
+        .iter()
+        .filter(|module| module.scanned.view != retired_view)
+        .cloned()
+        .collect();
+    assert_eq!(surviving.len(), 1);
+
+    let pool = SemanticResourcePool::default();
+    let reserve = pool.reserver();
+    let pinned = &engine.pinned;
+    let facts = &engine.capture_facts;
+    let manifests = &engine.manifests;
+    let broad_admit = engine.broad_admit;
+    let make_sources =
+        || ConservativePlanSources::new(&surviving, manifests, pinned, broad_admit);
+    let mut stable = |object: PinnedObjectId| facts.module_id_for_object(pinned, object).ok();
+
+    // In-place mutation between credits.
+    let mut cursor = ConservativePlanCursor::new();
+    let first = engine
+        .plan
+        .poll_conservative_rebuild(make_sources(), &mut stable, &mut cursor, &reserve, 1)
+        .unwrap();
+    assert_eq!(first, GraphStep::Advanced);
+    let slot0 = engine.plan.slots[0].index;
+    engine.plan.deactivate(slot0);
+    let err = engine
+        .plan
+        .poll_conservative_rebuild(make_sources(), &mut stable, &mut cursor, &reserve, 1)
+        .unwrap_err();
+    assert!(matches!(err, GraphRefusal::SourceChanged));
+
+    // Whole-plan replacement between credits.
+    let mut cursor = ConservativePlanCursor::new();
+    let first = engine
+        .plan
+        .poll_conservative_rebuild(make_sources(), &mut stable, &mut cursor, &reserve, 1)
+        .unwrap();
+    assert_eq!(first, GraphStep::Advanced);
+    engine.plan = engine.plan.clone();
+    let err = engine
+        .plan
+        .poll_conservative_rebuild(make_sources(), &mut stable, &mut cursor, &reserve, 1)
+        .unwrap_err();
+    assert!(matches!(err, GraphRefusal::SourceChanged));
+
+    // An object with no module ID.
+    let mut cursor = ConservativePlanCursor::new();
+    let mut no_ids = |_: PinnedObjectId| None;
+    let terminal = drive_plan_cursor_to_terminal(
+        &engine.plan,
+        &make_sources,
+        &mut no_ids,
+        &mut cursor,
+        &reserve,
+        1,
+    );
+    assert!(matches!(terminal, Err(GraphRefusal::Identity)));
+
+    // A poisoned token is refused at the first credit.
+    engine.plan.poison_token_for_test();
+    let mut cursor = ConservativePlanCursor::new();
+    let err = engine
+        .plan
+        .poll_conservative_rebuild(make_sources(), &mut stable, &mut cursor, &reserve, 1)
+        .unwrap_err();
+    assert!(matches!(err, GraphRefusal::SourceChanged));
+}

@@ -10430,13 +10430,14 @@ fn hosted_caches_hold_only_tool_binaries_and_build_products() {
 /// One full check matrix per commit: every check and coverage job waits on
 /// the dedupe job and runs only when it says so (coverage-report follows the
 /// coverage shards). The dedupe job reads the Actions API and nothing else,
-/// and the workflow keeps its per-ref group that cancels a superseded run.
+/// and the workflow keeps its per-ref group that sequences a moved branch's
+/// runs instead of cancelling them.
 #[test]
 fn hosted_pipeline_runs_one_full_matrix_per_commit() {
     let ci = read(".github/workflows/ci.yml");
     assert!(
-        ci.contains("\nconcurrency:\n  group: ci-${{ github.ref }}\n  cancel-in-progress: true\n"),
-        "a branch that moves must still cancel its superseded run"
+        ci.contains("\nconcurrency:\n  group: ci-${{ github.ref }}\n  cancel-in-progress: false\n"),
+        "a branch that moves must sequence its runs instead of cancelling them"
     );
     let gate = "    needs: dedupe\n    if: needs.dedupe.outputs.run == 'true'\n";
     for job in CARGO_JOBS {

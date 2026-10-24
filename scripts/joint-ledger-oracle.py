@@ -117,8 +117,10 @@ def read_events(stream):
 def validate_ledger(rows):
     """Validate ready/call/ack shape; return the issued/call summary."""
     _require(rows, "empty ledger")
-    _require(rows[0].get("kind") == "ready", "first row must be ready")
-    _require(rows[-1].get("kind") == "ack", "last row must be ack")
+    _require(type(rows[0]) is dict and rows[0].get("kind") == "ready",
+             "first row must be ready")
+    _require(type(rows[-1]) is dict and rows[-1].get("kind") == "ack",
+             "last row must be ack")
     ready = rows[0]
     _keys(ready, {"kind", "pid", "tid", "t", "clock", "unit"})
     _require(_integer(ready["pid"], minimum=1), "ready pid out of range")

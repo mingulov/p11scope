@@ -9,8 +9,8 @@ use crate::discovery::caller_registry::RegistryLimits;
 use crate::discovery::inventory_workload::{Harness, ScaleSpec};
 use crate::inventory_dashboard::{DashboardState, DisplayFrame, LogTail, Viewport, render_frame};
 use crate::key_operation_projection::{
-    KeyAggRow, MetadataBlock, MetadataField, ObjectObservations, ObjectRow, ObsStatus, QueriesBlock,
-    SECONDARY_ROLE, SessionRow, UnknownAggRow, object_observations_json,
+    KeyAggRow, MetadataBlock, MetadataField, ObjectObservations, ObjectRow, ObsStatus,
+    QueriesBlock, SECONDARY_ROLE, SessionRow, UnknownAggRow, object_observations_json,
 };
 
 /// A captured scale presentation carrying `observations`, the way the
@@ -34,8 +34,7 @@ fn key_ops_presentation(observations: ObjectObservations) -> Presentation {
 }
 
 fn populated(revision: u64) -> ObjectObservations {
-    let mut observations =
-        ObjectObservations::unavailable(revision, "bootstrap_unavailable");
+    let mut observations = ObjectObservations::unavailable(revision, "bootstrap_unavailable");
     observations.status = ObsStatus::Populated;
     observations.reason = "none";
     observations
@@ -134,7 +133,11 @@ fn key_ops_line(snapshot: &str) -> &str {
         .lines()
         .filter(|line| line.starts_with("key operations:"))
         .collect();
-    assert_eq!(lines.len(), 1, "exactly one key operations line:\n{snapshot}");
+    assert_eq!(
+        lines.len(),
+        1,
+        "exactly one key operations line:\n{snapshot}"
+    );
     lines[0]
 }
 
@@ -148,7 +151,14 @@ fn dashboard_projection_line(presentation: &Presentation) -> String {
         presentation: std::sync::Arc::new(presentation.clone()),
         log: tail.snapshot(),
     };
-    let bytes = render_frame(&frame, Viewport { width: 300, height: 24 }, &DashboardState::new());
+    let bytes = render_frame(
+        &frame,
+        Viewport {
+            width: 300,
+            height: 24,
+        },
+        &DashboardState::new(),
+    );
     let text = String::from_utf8(bytes).expect("frames are valid UTF-8");
     text.replace("\x1b[H", "")
         .replace("\x1b[K", "")
@@ -243,14 +253,9 @@ fn key_ops_line_populated_counts_primary_once() {
         .push(key_row("sign", "key", 2, 1, 0, "operations"));
     // The secondary association stands beside the primary's row: its
     // large counts must never leak into the tally (H9 §82).
-    observations.key_operations.push(key_row(
-        "sign",
-        SECONDARY_ROLE,
-        100,
-        50,
-        25,
-        "operations",
-    ));
+    observations
+        .key_operations
+        .push(key_row("sign", SECONDARY_ROLE, 100, 50, 25, "operations"));
     observations
         .unknown_key_operations
         .push(unknown_row("sign", 3, 0, 1, "operations"));
@@ -317,22 +322,12 @@ fn key_ops_line_matches_dashboard_tallies() {
     observations
         .key_operations
         .push(key_row("sign", "key", 2, 1, 3, "operations"));
-    observations.key_operations.push(key_row(
-        "wrap",
-        "wrapping_key",
-        4,
-        0,
-        1,
-        "operations",
-    ));
-    observations.key_operations.push(key_row(
-        "wrap",
-        SECONDARY_ROLE,
-        40,
-        41,
-        42,
-        "operations",
-    ));
+    observations
+        .key_operations
+        .push(key_row("wrap", "wrapping_key", 4, 0, 1, "operations"));
+    observations
+        .key_operations
+        .push(key_row("wrap", SECONDARY_ROLE, 40, 41, 42, "operations"));
     observations
         .unknown_key_operations
         .push(unknown_row("sign", 5, 6, 7, "operations"));
@@ -342,8 +337,7 @@ fn key_ops_line_matches_dashboard_tallies() {
     let frame_line = dashboard_projection_line(&presentation);
     let frame_tallies = dashboard_tallies(&frame_line);
     assert_eq!(
-        text_tallies,
-        frame_tallies,
+        text_tallies, frame_tallies,
         "text and dashboard agree per category"
     );
     assert_eq!(

@@ -38,6 +38,11 @@ pub(crate) enum OwnedLink {
         link: Box<OwnedLink>,
         _keepalive: Arc<super::counter_banks::CounterKeepalive>,
     },
+    /// Test-only single (non-Multi) link. Aya exposes no public `FdLink`
+    /// or `UProbeLink` constructor, so tests needing serial-close singles
+    /// use this stand-in; it counts as single and closes as a no-op.
+    #[cfg(test)]
+    TestSingle,
 }
 
 impl OwnedLink {
@@ -1606,6 +1611,10 @@ mod tests {
         (OwnedLink::Multi(Vec::new()), role)
     }
 
+    fn single(role: ProducerProgram) -> (OwnedLink, ProducerProgram) {
+        (OwnedLink::TestSingle, role)
+    }
+
     fn scripted_clock(now: Arc<Mutex<Duration>>) -> BoxClock {
         Arc::new(move || *now.lock().unwrap())
     }
@@ -2397,6 +2406,224 @@ mod tests {
         );
         let text = String::from_utf8(out.inner).unwrap();
         assert!(text.contains("cleanup incomplete"), "got: {text}");
+    }
+
+    /// Many single links print one up-front stop estimate before the
+    /// first progress line. 40 singles at 50 ms each is exactly 2 s.
+    #[test]
+    fn cleanup_estimate_line_for_many_single_links() {
+        let worker = CleanupWorker::pre_start_with(
+            legacy_test_closer(Box::new(|_link, _| {
+                std::thread::sleep(Duration::from_millis(5));
+                Ok(())
+            })),
+            scripted_clock(Arc::new(Mutex::new(Duration::ZERO))),
+        );
+        worker.submit(
+            (0..40)
+                .map(|_| single(ProducerProgram::UProbe("p11_entry")))
+                .collect(),
+            Arc::default(),
+            DetachOrder,
+        );
+        let mut out = Vec::new();
+        let exit = drive_cleanup(worker, || false, &mut out, Duration::from_millis(1));
+        assert!(matches!(exit, CleanupExit::Completed(_)));
+        let text = String::from_utf8(out).unwrap();
+        let estimate: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("probe links one at a time"))
+            .collect();
+        assert_eq!(estimate.len(), 1, "exactly one estimate line, got: {text}");
+        assert!(
+            estimate[0].contains("closing 40 probe links"),
+            "K=40, got: {}",
+            estimate[0]
+        );
+        assert!(
+            estimate[0].contains("about 2 s"),
+            "E=2, got: {}",
+            estimate[0]
+        );
+        let first_progress = text
+            .lines()
+            .position(|line| {
+                line.contains("links released")
+                    && !line.contains("cleanup completed")
+                    && !line.contains("cleanup incomplete")
+            })
+            .expect("a slow session prints progress lines");
+        let estimate_pos = text
+            .lines()
+            .position(|line| line.contains("probe links one at a time"))
+            .unwrap();
+        assert!(
+            estimate_pos < first_progress,
+            "the estimate precedes the first progress line, got: {text}"
+        );
+    }
+
+    /// 39 singles (1.95 s) stay below the 2 s floor: no estimate line.
+    #[test]
+    fn cleanup_estimate_line_absent_below_two_seconds() {
+        let worker = CleanupWorker::pre_start_with(
+            legacy_test_closer(Box::new(|_link, _| Ok(()))),
+            scripted_clock(Arc::new(Mutex::new(Duration::ZERO))),
+        );
+        worker.submit(
+            (0..39)
+                .map(|_| single(ProducerProgram::UProbe("p11_entry")))
+                .collect(),
+            Arc::default(),
+            DetachOrder,
+        );
+        let mut out = Vec::new();
+        let exit = drive_cleanup(worker, || false, &mut out, Duration::from_millis(1));
+        assert!(matches!(exit, CleanupExit::Completed(_)));
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("cleanup completed, 39/39 links released"),
+            "got: {text}"
+        );
+        assert!(
+            !text.contains("closing "),
+            "no estimate below the 2 s floor, got: {text}"
+        );
+    }
+
+    /// The estimate counts through Counter wrappers, and a
+    /// Counter-wrapped Multi is still not single: 40 wrapped singles
+    /// plus 60 wrapped multis estimate exactly K=40.
+    #[test]
+    fn cleanup_estimate_counts_through_counter_wrappers() {
+        use crate::attach::counter_banks::CounterKeepalive;
+        use crate::semantics_edge::resources::SemanticResourcePool;
+
+        let pool = SemanticResourcePool::reference_limit(4 * 1024 * 1024);
+        let held = CounterKeepalive::precharge(&pool.reserver(), 16 * 1024).unwrap();
+        let worker = CleanupWorker::pre_start_with(
+            legacy_test_closer(Box::new(|_link, _| Ok(()))),
+            scripted_clock(Arc::new(Mutex::new(Duration::ZERO))),
+        );
+        let mut links = Vec::new();
+        for _ in 0..40 {
+            links.push((
+                OwnedLink::TestSingle.retain_counter(Arc::clone(&held)),
+                ProducerProgram::UProbe("p11_entry"),
+            ));
+        }
+        for _ in 0..60 {
+            links.push((
+                OwnedLink::Multi(Vec::new()).retain_counter(Arc::clone(&held)),
+                ProducerProgram::UProbe("p11_return"),
+            ));
+        }
+        worker.submit(links, Arc::default(), DetachOrder);
+        drop(held);
+        let mut out = Vec::new();
+        let exit = drive_cleanup(worker, || false, &mut out, Duration::from_millis(1));
+        assert!(matches!(exit, CleanupExit::Completed(_)));
+        let text = String::from_utf8(out).unwrap();
+        let estimate: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("probe links one at a time"))
+            .collect();
+        assert_eq!(estimate.len(), 1, "exactly one estimate line, got: {text}");
+        assert!(
+            estimate[0].contains("closing 40 probe links"),
+            "wrapped singles count, wrapped multis do not, got: {}",
+            estimate[0]
+        );
+        assert!(
+            estimate[0].contains("about 2 s"),
+            "E=2, got: {}",
+            estimate[0]
+        );
+    }
+
+    /// Multi groups close fast and never print the serial-close
+    /// estimate, however many submit.
+    #[test]
+    fn cleanup_estimate_line_absent_for_multi_only() {
+        let worker = CleanupWorker::pre_start_with(
+            legacy_test_closer(Box::new(|_link, _| Ok(()))),
+            scripted_clock(Arc::new(Mutex::new(Duration::ZERO))),
+        );
+        worker.submit(
+            (0..100)
+                .map(|_| multi(ProducerProgram::UProbe("p11_entry")))
+                .collect(),
+            Arc::default(),
+            DetachOrder,
+        );
+        let mut out = Vec::new();
+        let exit = drive_cleanup(worker, || false, &mut out, Duration::from_millis(1));
+        assert!(matches!(exit, CleanupExit::Completed(_)));
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("cleanup completed, 100/100 links released"),
+            "got: {text}"
+        );
+        assert!(
+            !text.contains("closing "),
+            "no estimate for Multi-only payloads, got: {text}"
+        );
+    }
+
+    /// The up-front estimate does not delay the second-signal abandon:
+    /// a signal right after the estimate still interrupts promptly with
+    /// the existing incomplete lines.
+    #[test]
+    fn cleanup_estimate_keeps_second_signal_prompt() {
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+        let worker = CleanupWorker::pre_start_with(
+            legacy_test_closer(Box::new(move |_link, _| {
+                let _ = gate_rx.recv();
+                Ok(())
+            })),
+            scripted_clock(Arc::new(Mutex::new(Duration::ZERO))),
+        );
+        worker.submit(
+            (0..40)
+                .map(|_| single(ProducerProgram::UProbe("p11_entry")))
+                .collect(),
+            Arc::default(),
+            DetachOrder,
+        );
+        let mut out = Vec::new();
+        let start = std::time::Instant::now();
+        let exit = drive_cleanup(worker, || true, &mut out, Duration::from_millis(1));
+        let elapsed = start.elapsed();
+        let _ = gate_tx.send(());
+        match exit {
+            CleanupExit::Interrupted(progress) => {
+                assert_eq!(progress.total, 40);
+            }
+            CleanupExit::Completed(_) => {
+                panic!("a second signal during cleanup must interrupt with an incomplete receipt")
+            }
+        }
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "the estimate must not delay the abandon, took {elapsed:?}"
+        );
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("closing 40 probe links one at a time"),
+            "the estimate prints before the interrupt, got: {text}"
+        );
+        assert!(
+            text.lines().any(|line| {
+                line.contains("links released")
+                    && !line.contains("cleanup completed")
+                    && !line.contains("cleanup incomplete")
+            }),
+            "stderr must show the progress, got: {text}"
+        );
+        assert!(
+            text.contains("cleanup incomplete"),
+            "stderr must say cleanup incomplete, got: {text}"
+        );
     }
 }
 

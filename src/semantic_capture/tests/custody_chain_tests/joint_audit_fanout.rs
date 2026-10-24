@@ -1439,6 +1439,282 @@ impl FinishCustody {
     }
 }
 
+/// The real caller/mapping admission already exists, but no ordinary machine
+/// service or H8 grant precedes Finish. Q must retain that original absence of
+/// a grant without making the first actual admission unusable later.
+#[test]
+fn joint_machine_collected_finish_first_unread_work_reaches_h9() {
+    let mut fixture = MachineScene::new(1);
+    assert_eq!(fixture.machine.diagnostic_snapshot_for_test().0, "Idle");
+    assert!(fixture.machine.retained_drain_grant_for_test().is_none());
+    assert!(fixture.machine.retained_raw_for_test().is_none());
+    assert!(fixture.native.preparations.is_empty());
+    assert!(fixture.native.birth_outcomes.is_empty());
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .semantic_bindings()
+            .len(),
+        0
+    );
+    let pid = std::process::id();
+    let caller = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .adapter()
+        .live_id(pid)
+        .unwrap();
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .modules()
+            .any(|module| {
+                module.key == fixture.scene.real.modules[0].0
+                    && fixture
+                        .scene
+                        .real
+                        .scene
+                        .coordinator
+                        .registry()
+                        .edge(caller, module.id)
+                        .is_some_and(|edge| edge.mapping == MappingState::Mapped)
+            }),
+        "first work uses the fixture's actual preexisting caller/mapping admission"
+    );
+    for (name, sequence) in [("C_CreateObject", 1), ("C_SignInit", 2), ("C_SignFinal", 3)] {
+        fixture.scene.push(pid, 0, name, sequence);
+    }
+    let unread = fixture.scene.drain.consumption_cut().unwrap();
+    assert!(!unread.is_drained());
+    assert_eq!(fixture.scene.drain.source_mut().remaining(), 6);
+    fixture.enable_finish_fixture(Vec::new());
+    let revision = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .published_revision();
+    let h3 = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .reference_h3_audit_state();
+    fixture.begin_finish().unwrap();
+    assert!(unread.same_boundary(&fixture.scene.drain.consumption_cut().unwrap()));
+    assert!(fixture.machine.retained_drain_grant_for_test().is_none());
+    assert!(fixture.scene.real.lane.tick(&[]).is_err());
+    assert!(
+        fixture
+            .scene
+            .real
+            .lane
+            .begin_owned_terminal_cleanup()
+            .is_err()
+    );
+    let zero = FinishCustody::observe(&fixture);
+    fixture.poll_finish(0).unwrap();
+    zero.assert_unchanged(&fixture);
+
+    let mut first_raw = None;
+    let mut refusal = None;
+    for _ in 0..512 {
+        let progress = fixture.poll_finish(1);
+        if let Some(raw) = fixture.machine.retained_raw_for_test() {
+            let original = *first_raw.get_or_insert(raw.h0_identity());
+            assert!(
+                original == raw.h0_identity(),
+                "the first owned collection is retained"
+            );
+        }
+        assert!(!fixture.scene.real.h0.0.borrow().capture.stopped);
+        assert!(!fixture.scene.real.lane.is_finished());
+        assert_eq!(fixture.finish.as_ref().unwrap().stops, 0);
+        assert!(
+            fixture
+                .scene
+                .real
+                .lane
+                .begin_owned_terminal_cleanup()
+                .is_err()
+        );
+        match progress {
+            Ok(crate::discovery::engine::inventory_coordinator::JointCommitProgress::Pending) => {}
+            Ok(
+                crate::discovery::engine::inventory_coordinator::JointCommitProgress::Published(_),
+            ) => {
+                panic!("Finish cannot publish before observing the useful last return while live");
+            }
+            Err(reason) => {
+                // Preserve a diagnostic for the intended current guard RED;
+                // unrelated fixture/owner/capacity errors are not this seam.
+                assert_eq!(reason, SemanticRefusal::Unavailable);
+                let q = fixture.machine.retained_finish_q_for_test().unwrap();
+                let grant = fixture
+                    .machine
+                    .retained_drain_grant_for_test()
+                    .expect("only the actual original admission may change None to Some");
+                assert!(grant.matches_producers(&fixture.scene.producers));
+                assert!(!q.matches_retained_grant(grant));
+                let raw = fixture.machine.retained_raw_for_test().unwrap();
+                let adapter = fixture
+                    .scene
+                    .real
+                    .scene
+                    .coordinator
+                    .joint_capture()
+                    .adapter();
+                raw.validate_preparation(adapter, &fixture.scene.producers)
+                    .unwrap();
+                raw.validate_collected_q(
+                    &fixture.scene.producers,
+                    fixture.finish.as_ref().unwrap().observer.discovery_domain(),
+                    q,
+                )
+                .unwrap();
+                refusal = Some(reason);
+                break;
+            }
+        }
+        if fixture.reduced() == [3] {
+            break;
+        }
+    }
+    assert_eq!(
+        fixture.reduced(),
+        [3],
+        "the first real New/claim and its last return must reach actual H9 before Stop; refusal={refusal:?}, phase={:?}, native_births={:?}",
+        fixture.machine.diagnostic_snapshot_for_test(),
+        fixture.native.birth_outcomes
+    );
+    assert!(first_raw.is_some());
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .joint_feeds(),
+        1
+    );
+    assert!(fixture.ready_birth(0).is_some());
+    assert_eq!(
+        fixture
+            .native
+            .birth_outcomes
+            .iter()
+            .filter(|(_, result)| result.is_ok())
+            .count(),
+        1
+    );
+    assert!(
+        fixture.native.absence_reads.is_empty(),
+        "Q starts no fresh absence acquisition"
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .published_revision(),
+        revision + 1
+    );
+    assert_eq!(fixture.native.preparations.len(), 1);
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_h3_audit_state()
+            .0,
+        h3.0 + 1
+    );
+    assert_eq!(fixture.scene.drain.source_mut().remaining(), 0);
+    assert!(
+        fixture
+            .scene
+            .drain
+            .consumption_cut()
+            .unwrap()
+            .clean_successor_of(&unread)
+    );
+    let q = fixture.machine.retained_finish_q_for_test().unwrap();
+    assert!(q.matches_owner(
+        &fixture.scene.producers,
+        fixture.finish.as_ref().unwrap().observer.discovery_domain()
+    ));
+    assert!(q.events_at_bound(&fixture.scene.drain.consumption_cut().unwrap()));
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .invocation_claims_for_test()
+            .0,
+        0
+    );
+
+    // The final empty original still owes real physical-tail processing while
+    // Capture is live; no receipt or initial grant can substitute for it.
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .reference_mark_tail(caller);
+    let raises = fixture.scene.real.h0.0.borrow().io.script.raises;
+    let receipt = fixture.finish_published();
+    assert_eq!(receipt.registry_published, revision + 2);
+    assert_eq!(fixture.native.preparations.len(), 2);
+    let finish = fixture.finish.as_ref().unwrap();
+    assert_eq!(
+        (finish.stop_requests, finish.q_observations, finish.stops),
+        (1, 1, 1)
+    );
+    let stopped = finish.at_stop.as_ref().unwrap();
+    assert!(
+        Some(stopped.raw) != first_raw,
+        "the final empty Raw is its own original"
+    );
+    assert_eq!(stopped.reduced, 3);
+    assert_eq!(stopped.revision, revision + 1);
+    assert!(fixture.scene.real.h0.0.borrow().io.script.raises > raises);
+    assert_eq!(
+        fixture.scene.real.h0.0.borrow().validations,
+        stopped.validations
+    );
+    assert_eq!(fixture.reduced(), [3]);
+    assert!(fixture.scene.real.lane.is_finished());
+    assert!(
+        fixture
+            .scene
+            .real
+            .lane
+            .begin_owned_terminal_cleanup()
+            .is_ok()
+    );
+    let completed = FinishCustody::observe(&fixture);
+    assert!(fixture.poll_finish(1).is_err());
+    completed.assert_unchanged(&fixture);
+}
+
 /// Stopping before the final return's real seal, or applying a physical tail
 /// only after Capture.stop, must fail this useful reduction/order control.
 #[test]

@@ -423,3 +423,301 @@ impl CollectedRetirementFixture {
         self.native.links = grouped;
     }
 }
+
+impl CollectedRetirementFixture {
+    pub(super) fn preflight_checkpoint(&self) -> Option<PreflightCheckpoint> {
+        self.native
+            .retirement
+            .preflight
+            .as_ref()
+            .map(CollectedPreflight::checkpoint)
+    }
+
+    pub(super) fn preflight_at_input_coverage(&self) -> bool {
+        self.native
+            .retirement
+            .preflight
+            .as_ref()
+            .is_some_and(|preflight| matches!(preflight.phase, PreflightPhase::InputCovered))
+    }
+
+    pub(super) fn preflight_at_admission(&self) -> bool {
+        self.native
+            .retirement
+            .preflight
+            .as_ref()
+            .is_some_and(|preflight| matches!(preflight.phase, PreflightPhase::Admit))
+    }
+
+    pub(super) fn cursor_phase(&self) -> Option<CollectedPhase> {
+        self.native
+            .retirement
+            .collected
+            .as_ref()
+            .map(|cursor| cursor.phase)
+    }
+
+    // Fault injection uses actual move-only leases; no scalar lease mint or
+    // production setter exposes the retained input's private payment.
+    pub(super) fn replace_taken_input_storage(
+        &mut self,
+        storage: crate::semantics_edge::resources::ResourceLease,
+    ) -> crate::semantics_edge::resources::ResourceLease {
+        std::mem::replace(
+            &mut self
+                .native
+                .retirement
+                .collected
+                .as_mut()
+                .unwrap()
+                .input
+                .as_mut()
+                .unwrap()
+                .storage,
+            storage,
+        )
+    }
+}
+
+impl CollectedRetirementFixture {
+    pub(super) fn extraction_has_return_before_entry(&self) -> bool {
+        self.native
+            .links
+            .iter()
+            .any(|link| link.producer() == super::super::ProducerProgram::UProbe("p11_entry"))
+            && self
+                .native
+                .retirement
+                .collected
+                .as_ref()
+                .is_some_and(|cursor| {
+                    !cursor.buckets[super::super::DetachOrder
+                        .rank(&super::super::ProducerProgram::UProbe("p11_return"))
+                        as usize]
+                        .is_empty()
+                })
+    }
+
+    pub(super) fn all_extracted_before_transfer(&self) -> bool {
+        self.native.links.is_empty()
+            && self
+                .native
+                .retirement
+                .collected
+                .as_ref()
+                .is_some_and(|cursor| cursor.buckets.iter().any(|bucket| !bucket.is_empty()))
+    }
+
+    pub(super) fn original_return_fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd as _;
+        self.native
+            .links
+            .iter()
+            .find_map(|link| match link {
+                RegisteredLink::MultiUProbe {
+                    program: "p11_return",
+                    fds,
+                    ..
+                } => Some(fds[0].as_raw_fd()),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    // Exact production abandonment helper precedes the existing remaining-
+    // registry terminal submit. The harmless FD transfer is the native leaf.
+    pub(super) fn abandon_for_drop(mut self) -> CleanupWorker {
+        self.native.retirement.abandon_collected_with(
+            &self.native.links,
+            Some(&self.native.worker),
+            |original| match original {
+                RegisteredLink::MultiUProbe { fds, .. } => Ok(vec![OwnedLink::Multi(fds)]),
+                _ => bail!("unexpected original fixture registration"),
+            },
+        );
+        let leases = Arc::new(
+            self.native
+                .retained
+                .values()
+                .filter_map(RetainedStaticTarget::retirement_lease)
+                .collect(),
+        );
+        let owned = std::mem::take(&mut self.native.links)
+            .into_iter()
+            .map(|original| {
+                let producer = original.producer();
+                let RegisteredLink::MultiUProbe { fds, .. } = original else {
+                    panic!("real owned fixture FD")
+                };
+                (OwnedLink::Multi(fds), producer)
+            })
+            .collect();
+        self.native.worker.submit(owned, leases, DetachOrder);
+        self.native.worker
+    }
+}
+
+// A small valid ELF DSO with two real .dynsym function definitions. This
+// file-only fixture is parsed/hashed/pinned; it is never loaded or executed.
+pub(super) fn exported_owner_case() -> (
+    tempfile::TempDir,
+    PinnedObjects,
+    CollectedRetirementFixture,
+    Vec<Slot>,
+    std::sync::Weak<[(String, u64)]>,
+) {
+    fn put16(bytes: &mut [u8], at: usize, value: u16) {
+        bytes[at..at + 2].copy_from_slice(&value.to_le_bytes());
+    }
+    fn put32(bytes: &mut [u8], at: usize, value: u32) {
+        bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    fn put64(bytes: &mut [u8], at: usize, value: u64) {
+        bytes[at..at + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    let mut bytes = vec![0u8; 0x1010];
+    bytes[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+    put16(&mut bytes, 16, 3);
+    put16(&mut bytes, 18, 62);
+    put32(&mut bytes, 20, 1);
+    put64(&mut bytes, 32, 64);
+    put64(&mut bytes, 40, 0x400);
+    for (at, value) in [(52, 64), (54, 56), (56, 1), (58, 64), (60, 5), (62, 4)] {
+        put16(&mut bytes, at, value);
+    }
+    put32(&mut bytes, 64, 1);
+    put32(&mut bytes, 68, 5);
+    for (at, value) in [
+        (72, 0x1000),
+        (80, 0x1000),
+        (88, 0x1000),
+        (96, 16),
+        (104, 16),
+        (112, 0x1000),
+    ] {
+        put64(&mut bytes, at, value);
+    }
+    let names = b"\0C_Sign\0C_Encrypt\0";
+    bytes[0x200..0x200 + names.len()].copy_from_slice(names);
+    for (symbol, name, offset) in [(1, 1, 0x1000), (2, 8, 0x1008)] {
+        let at = 0x240 + 24 * symbol;
+        put32(&mut bytes, at, name);
+        bytes[at + 4] = 0x12;
+        put16(&mut bytes, at + 6, 1);
+        put64(&mut bytes, at + 8, offset);
+        put64(&mut bytes, at + 16, 3);
+    }
+    let sections = b"\0.text\0.dynstr\0.dynsym\0.shstrtab\0";
+    bytes[0x300..0x300 + sections.len()].copy_from_slice(sections);
+    let headers: [[u64; 10]; 4] = [
+        [1, 1, 6, 0x1000, 0x1000, 16, 0, 0, 1, 0],
+        [7, 3, 2, 0x200, 0x200, names.len() as u64, 0, 0, 1, 0],
+        [15, 11, 2, 0x240, 0x240, 72, 2, 1, 8, 24],
+        [23, 3, 0, 0, 0x300, sections.len() as u64, 0, 0, 1, 0],
+    ];
+    for (index, header) in headers.into_iter().enumerate() {
+        let at = 0x400 + 64 * (index + 1);
+        put32(&mut bytes, at, header[0] as u32);
+        put32(&mut bytes, at + 4, header[1] as u32);
+        for i in 2..6 {
+            put64(&mut bytes, at + 8 + (i - 2) * 8, header[i]);
+        }
+        put32(&mut bytes, at + 40, header[6] as u32);
+        put32(&mut bytes, at + 44, header[7] as u32);
+        put64(&mut bytes, at + 48, header[8]);
+        put64(&mut bytes, at + 56, header[9]);
+    }
+    bytes[0x1000..0x1003].copy_from_slice(b"\x31\xc0\xc3");
+    bytes[0x1008..0x100b].copy_from_slice(b"\x31\xc0\xc3");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("retained-owner.so");
+    std::fs::write(&path, &bytes).unwrap();
+    let file = File::open(&path).unwrap();
+    let inspected = p11scope_manifest::identity::inspect_file(&file).unwrap();
+    let elf = p11scope_manifest::elf::ElfSnapshot::read(&file).unwrap();
+    assert_eq!(
+        elf.exports_matching(&["C_Sign", "C_Encrypt"])
+            .unwrap()
+            .len(),
+        2
+    );
+    use std::os::unix::fs::MetadataExt as _;
+    let metadata = file.metadata().unwrap();
+    use p11scope_manifest::manifest::{
+        Acquisition, Manifest, ObjectRecord, ProvenanceObject, SCHEMA,
+    };
+    let manifest = Manifest {
+        schema: SCHEMA.into(),
+        module_path: path.to_str().unwrap().into(),
+        objects: vec![ObjectRecord {
+            id: 0,
+            path: path.to_str().unwrap().into(),
+            identity: inspected.identity.clone(),
+        }],
+        provenance_objects: vec![ProvenanceObject {
+            path: path.to_str().unwrap().into(),
+            device_major: u64::from(libc::major(metadata.dev())),
+            device_minor: u64::from(libc::minor(metadata.dev())),
+            inode: metadata.ino(),
+            identity: inspected.identity,
+        }],
+        interface_list: Acquisition::Absent,
+        surfaces: Vec::new(),
+        vendor_interfaces: Vec::new(),
+        alias_groups: Vec::new(),
+        selection_evidence: Default::default(),
+    };
+    let pins = crate::discovery::identity::pin_manifest_objects(&manifest).unwrap();
+    let object = pins.pinned().next().unwrap().id;
+    let exports = pins.exports_for(object);
+    assert_eq!(
+        &*exports,
+        &[("C_Sign".into(), 0x1000), ("C_Encrypt".into(), 0x1008)]
+    );
+    let export_owner = Arc::downgrade(&exports);
+    let slots = exports
+        .iter()
+        .enumerate()
+        .map(|(index, (name, offset))| Slot {
+            index: index as u32,
+            descriptor_index: 0,
+            object,
+            object_path: path.to_str().unwrap().into(),
+            file_offset: *offset,
+            names: vec![name.clone()],
+            aliased: false,
+            semantics: p11scope_ebpf_common::SlotSemantics::COUNT_ONLY,
+            semantic_authorized: false,
+            semantic_ambiguous: false,
+            fork_safe: false,
+            module_ids: vec![crate::plan::ModuleId(0)],
+        })
+        .collect::<Vec<_>>();
+    let native = CollectedRetirementFixture::new(
+        &slots,
+        &pins,
+        Box::new(|owned, _| {
+            drop(owned);
+            Ok(())
+        }),
+    );
+    (dir, pins, native, slots, export_owner)
+}
+
+impl CollectedRetirementFixture {
+    pub(super) fn observe_retained_release(
+        &self,
+        entered: std::sync::mpsc::Sender<std::thread::ThreadId>,
+        resume: std::sync::mpsc::Receiver<()>,
+    ) {
+        self.native
+            .retirement
+            .collected
+            .as_ref()
+            .unwrap()
+            .retention
+            .as_ref()
+            .unwrap()
+            .observe_release(entered, resume);
+    }
+}

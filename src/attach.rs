@@ -1254,6 +1254,18 @@ pub(crate) fn classify_bpf_loop_probe(
     }
 }
 
+/// Helper-identity verdict over the control result, the probe result and the
+/// probe's verifier log (stub: the errno-only differential, ignoring the
+/// log, until the verifier-word rules land).
+pub(crate) fn classify_bpf_loop_probe_with_log(
+    control: &io::Result<()>,
+    probe: &io::Result<()>,
+    log: &str,
+) -> BpfLoopVerdict {
+    let _ = log;
+    classify_bpf_loop_probe(control, probe)
+}
+
 /// Functional bpf_loop (helper 181) probe: a control no-op load plus a
 /// minimal bpf_loop-calling load. Neither program is ever attached; both
 /// fds drop before return, unloading them.
@@ -17201,6 +17213,227 @@ mod tests {
                     error.raw_os_error().is_some(),
                     "{name} load must reach the kernel: {error}"
                 ),
+            }
+        }
+    }
+
+    /// Real verifier log for the bare `call 181` probe on a kernel that
+    /// knows the helper (dev-host capture, load errno EACCES): the verifier
+    /// names `bpf_loop#181`, then rejects the uninitialized call registers.
+    const BPF_LOOP_LOG_HELPER_RESOLVED: &str = "0: R1=ctx() R10=fp0\n\
+         0: (85) call bpf_loop#181\n\
+         R2 !read_ok\n\
+         processed 1 insns (limit 1000000) max_states_per_insn 0 total_states 1 peak_states 1 mark_read 0\n";
+    /// Real verifier log for the same probe on a kernel without the helper
+    /// (5.15.221 capture, load errno EINVAL): the call target stays unknown.
+    const BPF_LOOP_LOG_HELPER_UNKNOWN: &str = "0: (85) call unknown#181\n\
+         invalid func unknown#181\n\
+         processed 1 insns (limit 1000000) max_states_per_insn 0 total_states 0 peak_states 0 mark_read 0\n";
+
+    #[test]
+    fn bpf_loop_probe_bytes_are_call_181_then_exit() {
+        // The helper-identity probe: `call 181; exit`, two instructions.
+        assert_eq!(BPF_LOOP_PROBE_INSNS.len(), 16);
+        assert_eq!(
+            &BPF_LOOP_PROBE_INSNS[..],
+            &[
+                0x85, 0x00, 0x00, 0x00, 0xb5, 0x00, 0x00, 0x00, // call 181
+                0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // exit
+            ]
+        );
+        assert_eq!(BPF_LOOP_CONTROL_INSNS.len(), 16);
+        assert_eq!(BPF_LOOP_CONTROL_INSNS[0], 0xb7, "MOV64_IMM r0, 0");
+        assert_eq!(BPF_LOOP_CONTROL_INSNS[8], 0x95, "EXIT");
+        for name in [BPF_LOOP_PROBE_NAME, BPF_LOOP_CONTROL_NAME] {
+            assert!(name.len() < 16);
+            assert!(
+                name.bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'.'),
+                "kernel object-name charset: {name}"
+            );
+        }
+        assert_eq!(size_of::<BpfLoopProgAttr>(), 152);
+        assert_eq!(
+            std::mem::offset_of!(BpfLoopProgAttr, expected_attach_type),
+            68
+        );
+        assert_eq!(std::mem::offset_of!(BpfLoopProgAttr, prog_btf_fd), 72);
+        // UAPI numbers (linux/bpf.h): PROG_LOAD is 5, KPROBE is 2.
+        assert_eq!(BPF_PROG_LOAD, 5);
+        assert_eq!(BPF_PROG_TYPE_KPROBE, 2);
+    }
+
+    #[test]
+    fn bpf_loop_probe_log_words_grant_presence_on_resolved_helper() {
+        use std::io;
+        let os = io::Error::from_raw_os_error;
+        // A loaded probe proves availability outright, whatever the log says.
+        for log in ["", BPF_LOOP_LOG_HELPER_UNKNOWN] {
+            for control in [Ok(()), Err(os(libc::EPERM))] {
+                assert_eq!(
+                    classify_bpf_loop_probe_with_log(&control, &Ok(()), log),
+                    BpfLoopVerdict::Available
+                );
+            }
+        }
+        // The real 7.0 capture: EACCES, but the verifier named bpf_loop#181,
+        // so the kernel resolved the helper.
+        match classify_bpf_loop_probe_with_log(
+            &Ok(()),
+            &Err(os(libc::EACCES)),
+            BPF_LOOP_LOG_HELPER_RESOLVED,
+        ) {
+            BpfLoopVerdict::Available => {}
+            verdict => panic!("resolved-helper log must prove Available, got {verdict:?}"),
+        }
+        // The helper name without `invalid func` proves presence whatever
+        // errno the bare call drew.
+        for errno in [libc::EPERM, libc::EINVAL, libc::E2BIG] {
+            match classify_bpf_loop_probe_with_log(
+                &Ok(()),
+                &Err(os(errno)),
+                BPF_LOOP_LOG_HELPER_RESOLVED,
+            ) {
+                BpfLoopVerdict::Available => {}
+                verdict => {
+                    panic!("errno {errno} must not hide a resolved helper, got {verdict:?}")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bpf_loop_probe_log_words_prove_absence_only_on_invalid_func_with_control() {
+        use std::io;
+        let os = io::Error::from_raw_os_error;
+        // The errno alone never proves absence: an empty log defers even for
+        // EINVAL with a loaded control.
+        match classify_bpf_loop_probe_with_log(&Ok(()), &Err(os(libc::EINVAL)), "") {
+            BpfLoopVerdict::Unknown(detail) => assert!(detail.contains("unexpectedly"), "{detail}"),
+            verdict => panic!("errno without log words must defer, got {verdict:?}"),
+        }
+        // The real 5.15 capture: `invalid func` with a loaded control proves
+        // the kernel cannot run counter bank objects. The detail keeps the
+        // refusal wording; the raw log never surfaces.
+        match classify_bpf_loop_probe_with_log(
+            &Ok(()),
+            &Err(os(libc::EINVAL)),
+            BPF_LOOP_LOG_HELPER_UNKNOWN,
+        ) {
+            BpfLoopVerdict::Unavailable(detail) => {
+                assert!(detail.contains("helper 181"), "{detail}");
+                assert!(detail.contains("5.17"), "{detail}");
+                assert!(!detail.contains("unknown#181"), "{detail}");
+                assert!(!detail.contains("processed 1 insns"), "{detail}");
+                assert!(!detail.contains('\n'), "{detail}");
+            }
+            verdict => panic!("invalid-func log must prove Unavailable, got {verdict:?}"),
+        }
+        // The log words dominate the errno: `invalid func` refuses even when
+        // the bare call drew something other than EINVAL.
+        match classify_bpf_loop_probe_with_log(
+            &Ok(()),
+            &Err(os(libc::EACCES)),
+            BPF_LOOP_LOG_HELPER_UNKNOWN,
+        ) {
+            BpfLoopVerdict::Unavailable(detail) => {
+                assert!(detail.contains("helper 181"), "{detail}")
+            }
+            verdict => panic!("invalid-func log must refuse whatever the errno, got {verdict:?}"),
+        }
+        // `invalid func` proves nothing when the control itself failed:
+        // privilege or the environment refused, not the kernel.
+        for errno in [libc::EPERM, libc::EACCES, libc::ENOSYS] {
+            match classify_bpf_loop_probe_with_log(
+                &Err(os(errno)),
+                &Err(os(libc::EINVAL)),
+                BPF_LOOP_LOG_HELPER_UNKNOWN,
+            ) {
+                BpfLoopVerdict::Unknown(detail) => assert!(detail.contains("unproven"), "{detail}"),
+                verdict => panic!("errno {errno} control failure must defer, got {verdict:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn bpf_loop_probe_log_words_defer_without_proof() {
+        use std::io;
+        let os = io::Error::from_raw_os_error;
+        // A truncated log proves nothing, even for EINVAL with a loaded
+        // control.
+        match classify_bpf_loop_probe_with_log(
+            &Ok(()),
+            &Err(os(libc::EINVAL)),
+            "0: R1=ctx() R10=fp0\n0: (85) call ",
+        ) {
+            BpfLoopVerdict::Unknown(detail) => assert!(detail.contains("unexpectedly"), "{detail}"),
+            verdict => panic!("truncated log must defer, got {verdict:?}"),
+        }
+        // Unrecognized words defer as well; the detail stays a finite
+        // sentence over the errno, never the raw log.
+        match classify_bpf_loop_probe_with_log(
+            &Ok(()),
+            &Err(os(libc::EACCES)),
+            "some future verifier wording without either marker\n",
+        ) {
+            BpfLoopVerdict::Unknown(detail) => {
+                assert!(detail.contains("unexpectedly"), "{detail}");
+                assert!(!detail.contains("marker"), "{detail}");
+                assert!(!detail.contains('\n'), "{detail}");
+            }
+            verdict => panic!("unrecognized log must defer, got {verdict:?}"),
+        }
+        // A failed control defers whatever the probe drew, with no log at all.
+        for errno in [libc::EPERM, libc::EACCES] {
+            match classify_bpf_loop_probe_with_log(&Err(os(errno)), &Err(os(errno)), "") {
+                BpfLoopVerdict::Unknown(detail) => assert!(detail.contains("unproven"), "{detail}"),
+                verdict => panic!("errno {errno} control failure must defer, got {verdict:?}"),
+            }
+        }
+        // `invalid func` wins over a named helper: a log carrying both still
+        // refuses when the control loaded.
+        match classify_bpf_loop_probe_with_log(
+            &Ok(()),
+            &Err(os(libc::EINVAL)),
+            "0: (85) call bpf_loop#181\ninvalid func bpf_loop#181\n",
+        ) {
+            BpfLoopVerdict::Unavailable(detail) => {
+                assert!(detail.contains("helper 181"), "{detail}")
+            }
+            verdict => panic!("invalid func must win over a named helper, got {verdict:?}"),
+        }
+    }
+
+    /// Live helper-identity verdict: where the running kernel predates 5.17
+    /// the real probe must prove Unavailable, elsewhere Available. Requires
+    /// BPF privilege; the running kernel only picks the expected verdict,
+    /// never the verdict itself.
+    #[test]
+    #[ignore = "requires BPF privilege; asserts the live helper-181 verdict"]
+    fn bpf_loop_probe_reports_helper_presence_on_live_kernel() {
+        let release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .expect("read the running kernel release");
+        let release = release.trim();
+        let numeric_prefix = |text: &str| {
+            text.chars()
+                .take_while(|c| c.is_numeric())
+                .collect::<String>()
+                .parse::<u64>()
+                .expect("numeric kernel release component")
+        };
+        let mut parts = release.split('.');
+        let major = numeric_prefix(parts.next().expect("kernel major release"));
+        let minor = numeric_prefix(parts.next().expect("kernel minor release"));
+        let modern = (major, minor) >= (5, 17);
+        match kernel_bpf_loop_probe() {
+            BpfLoopVerdict::Available => {
+                assert!(modern, "helper 181 resolved below 5.17 ({release})")
+            }
+            BpfLoopVerdict::Unavailable(detail) => {
+                assert!(!modern, "helper 181 missing on {release}: {detail}")
+            }
+            BpfLoopVerdict::Unknown(detail) => {
+                panic!("live probe needs BPF privilege, got Unknown: {detail}")
             }
         }
     }

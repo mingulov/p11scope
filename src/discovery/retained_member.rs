@@ -352,17 +352,20 @@ impl RetainedGroupMember {
             .map_err(std::io::Error::other)
     }
 
-    /// The member's map_files directory: `map_files` exists only per process
-    /// (`/proc/<tgid>/task/<tid>/` has none), and threads share the TGID mm,
-    /// so the TGID directory IS the member's. Held transiently with its own
-    /// lease; the member is re-proved before AND after the open, so a group
-    /// that died (and whose TGID was reused) between the proof and the open
-    /// refuses instead of serving another group's directory.
+    /// The member's map_files directory through the survivor's own
+    /// TID-addressed process directory: `/proc/<tgid>/task/<tid>/` has no
+    /// `map_files`, and for a zombie leader `/proc/<tgid>/map_files`
+    /// serves nothing (the leader mm is gone) while `/proc/<tid>/`
+    /// serves the shared mm. The TID directory is proved through its
+    /// own dirfd (birth, Tgid, non-zombie) before `map_files` opens
+    /// relative to it, so a TID reuse between the pre-open proof and
+    /// the open refuses. Held transiently with its own lease; the
+    /// member is re-proved before AND after the open.
     pub(crate) fn open_map_files_dir(&self) -> Result<TransientMapFilesDir, String> {
         self.open_map_files_dir_with_opener(&open_proc_dir)
     }
 
-    /// `open_map_files_dir` with the TGID directory opener injected.
+    /// `open_map_files_dir` with the TID process-directory opener injected.
     /// Production passes the real opener; tests inject a raced death so the
     /// post-open bracket is deterministic.
     pub(crate) fn open_map_files_dir_with_opener(
@@ -371,10 +374,32 @@ impl RetainedGroupMember {
     ) -> Result<TransientMapFilesDir, String> {
         let lease = self.fd_owner.batch().transient()?;
         self.live_identity()?;
-        let dir = open_dir(&tgid_map_files_path(self.tgid))?;
-        // Post-open bracket: the group may have died (and the TGID may have
-        // been reused) between the pre-open proof and the open. The opened
-        // directory closes with this refusal; nothing about it is served.
+        let proc = open_dir(&tid_proc_path(self.tid))?;
+        // Bind through the same dirfd: a TID reuse between the pre-open
+        // proof and the open reports another birth or group here, not
+        // the member's map_files.
+        let (birth, state) = read_relative_stat(proc.as_fd())
+            .map_err(|error| format!("retained member is no longer alive: {error}"))?;
+        if birth != self.member_birth {
+            return Err(format!(
+                "retained member birth changed (tid reuse): recorded {} live {birth}",
+                self.member_birth
+            ));
+        }
+        if state == 'Z' {
+            return Err("retained member is a zombie, not a live survivor".to_string());
+        }
+        let proc_tgid = read_relative_tgid(proc.as_fd())
+            .map_err(|error| format!("retained member is no longer alive: {error}"))?;
+        if proc_tgid != self.tgid {
+            return Err(format!(
+                "retained member is not in thread group {}",
+                self.tgid
+            ));
+        }
+        let dir = open_relative(proc.as_fd(), c"map_files", true)?;
+        // Post-open bracket: the member may have died between the proof
+        // and the open. Both directories close with this refusal.
         self.live_identity()?;
         Ok(TransientMapFilesDir { dir, _lease: lease })
     }
@@ -385,9 +410,9 @@ impl RetainedGroupMember {
         self.stat_map_file_with_opener(start, end, &open_proc_dir)
     }
 
-    /// `stat_map_file` with the TGID directory opener injected. Production
-    /// passes the real opener; tests inject a raced death so the post-open
-    /// and post-stat brackets are deterministic.
+    /// `stat_map_file` with the TID process-directory opener injected.
+    /// Production passes the real opener; tests inject a raced death so
+    /// the post-open and post-stat brackets are deterministic.
     pub(crate) fn stat_map_file_with_opener(
         &self,
         start: u64,
@@ -462,8 +487,8 @@ fn member_stat_path(tgid: u32, tid: u32) -> PathBuf {
     PathBuf::from(format!("/proc/{tgid}/task/{tid}/stat"))
 }
 
-fn tgid_map_files_path(tgid: u32) -> PathBuf {
-    PathBuf::from(format!("/proc/{tgid}/map_files"))
+fn tid_proc_path(tid: u32) -> PathBuf {
+    PathBuf::from(format!("/proc/{tid}"))
 }
 
 /// Open a `/proc` directory: no symlinks, no inheritance, directory only.

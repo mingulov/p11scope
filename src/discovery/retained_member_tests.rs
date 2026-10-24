@@ -1266,9 +1266,8 @@ fn retained_group_member_map_files_dir_uses_survivor_tid_directory() {
     let original = Arc::new(PidPin::open(tgid).expect("self pins"));
     let owner = test_owner();
     let mut work = test_budget();
-    let member =
-        RetainedGroupMember::acquire(&original, tid, &owner, &mut work, test_deadline())
-            .expect("live member mints");
+    let member = RetainedGroupMember::acquire(&original, tid, &owner, &mut work, test_deadline())
+        .expect("live member mints");
     let seen = RefCell::new(Vec::new());
     let capturing = |path: &std::path::Path| {
         seen.borrow_mut().push(path.to_path_buf());
@@ -1297,9 +1296,8 @@ fn retained_group_member_map_file_stat_uses_survivor_tid_directory() {
     let original = Arc::new(PidPin::open(tgid).expect("self pins"));
     let owner = test_owner();
     let mut work = test_budget();
-    let member =
-        RetainedGroupMember::acquire(&original, tid, &owner, &mut work, test_deadline())
-            .expect("live member mints");
+    let member = RetainedGroupMember::acquire(&original, tid, &owner, &mut work, test_deadline())
+        .expect("live member mints");
     let (start, end) = self_executable_file_range();
     let seen = RefCell::new(Vec::new());
     let capturing = |path: &std::path::Path| {
@@ -1350,11 +1348,9 @@ fn retained_group_member_zombie_survivor_serves_tid_map_files() {
         );
         std::thread::sleep(Duration::from_millis(5));
     }
-    let tgid_maps =
-        std::fs::read_to_string(format!("/proc/{tgid}/maps")).expect("tgid maps read");
+    let tgid_maps = std::fs::read_to_string(format!("/proc/{tgid}/maps")).expect("tgid maps read");
     assert!(tgid_maps.is_empty(), "zombie leader maps are empty");
-    let tid_maps =
-        std::fs::read_to_string(format!("/proc/{tid}/maps")).expect("tid maps read");
+    let tid_maps = std::fs::read_to_string(format!("/proc/{tid}/maps")).expect("tid maps read");
     assert!(!tid_maps.is_empty(), "survivor TID maps are not empty");
     let original = Arc::new(PidPin::open(tgid).expect("zombie group pins"));
     let owner = test_owner();
@@ -1399,10 +1395,7 @@ fn retained_group_member_zombie_survivor_serves_tid_map_files() {
                 error.contains("not permitted"),
                 "zombie survivor stat is EPERM when unprivileged, got: {error}"
             );
-            assert!(
-                guard.stat(start, end).is_err(),
-                "guard fails closed too"
-            );
+            assert!(guard.stat(start, end).is_err(), "guard fails closed too");
         }
     }
     drop(guard);

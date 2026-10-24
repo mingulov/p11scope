@@ -527,7 +527,7 @@
     {
       "file": "src/discovery/identity.rs",
       "path": "discovery::identity::tests::map_files_name_timing_per_thousand",
-      "reason": "",
+      "reason": "manual: indicative map_files-name timing loop, no pass/fail bar; run by hand single-threaded",
       "cell": "performance"
     },
     {
@@ -581,7 +581,7 @@
     {
       "file": "src/discovery/scan.rs",
       "path": "discovery::scan::tests::maps_reuse_timing_per_thousand_reads",
-      "reason": "",
+      "reason": "manual: indicative maps-reuse timing loop, no pass/fail bar; run by hand single-threaded",
       "cell": "performance"
     },
     {

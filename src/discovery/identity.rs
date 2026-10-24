@@ -9203,7 +9203,7 @@ mod tests {
     /// benchmark; run single-threaded:
     /// `test -- --ignored map_files_name_timing --test-threads=1 --nocapture`).
     #[test]
-    #[ignore]
+    #[ignore = "manual: indicative map_files-name timing loop, no pass/fail bar; run by hand single-threaded"]
     fn map_files_name_timing_per_thousand() {
         use std::time::Instant;
 

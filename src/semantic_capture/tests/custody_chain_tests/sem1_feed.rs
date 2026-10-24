@@ -28,7 +28,7 @@ const WORKLOAD_FUNCTIONS: [&str; 11] = [
 ];
 
 /// (function, mechanism): the 8 paired calls per live iteration.
-const WORKLOAD_MAIN: [(&str, u64); 8] = [
+pub(super) const WORKLOAD_MAIN: [(&str, u64); 8] = [
     ("C_DigestInit", 0x250),
     ("C_Digest", 0),
     ("C_GenerateKey", 0x1080),
@@ -39,14 +39,14 @@ const WORKLOAD_MAIN: [(&str, u64); 8] = [
     ("C_Sign", 0),
 ];
 
-fn workload_scene() -> RealScene {
+pub(super) fn workload_scene() -> RealScene {
     RealScene::from_held(HeldProviders::with_functions(1, &WORKLOAD_FUNCTIONS))
 }
 
 /// Admit one caller and publish its mapped attested edge (the scan-lane
 /// projection), without binding it: mirrors the live P1 state after the
 /// mapping commits and before semantic admission runs.
-fn admit_mapped(scene: &mut RealScene, pid: u32) -> CallerId {
+pub(super) fn admit_mapped(scene: &mut RealScene, pid: u32) -> CallerId {
     let caller = scene.scene.admit(pid, 50);
     for (file, (key, path)) in scene.modules.iter().enumerate() {
         scene.scene.coordinator.registry_mut().note_mapping(
@@ -114,7 +114,7 @@ fn production_bind(scene: &mut RealScene, caller: CallerId, pid: u32, image: Ima
 /// Enqueue one workload call shaped like the live BPF record: the real
 /// slot, captured mechanism argument on mechanism-bearing calls, session
 /// handle, rv 0 and main-thread identity.
-fn enqueue_live_like(scene: &mut RealScene, pid: u32, name: &str, mechanism: u64) {
+pub(super) fn enqueue_live_like(scene: &mut RealScene, pid: u32, name: &str, mechanism: u64) {
     scene
         .h0
         .0
@@ -132,7 +132,7 @@ fn enqueue_live_like(scene: &mut RealScene, pid: u32, name: &str, mechanism: u64
     }
 }
 
-fn semantic_gap_subjects(scene: &RealScene) -> Vec<(String, String)> {
+pub(super) fn semantic_gap_subjects(scene: &RealScene) -> Vec<(String, String)> {
     scene
         .scene
         .coordinator
@@ -144,7 +144,6 @@ fn semantic_gap_subjects(scene: &RealScene) -> Vec<(String, String)> {
         .collect()
 }
 
-#[ignore = "shed semantic calls are not disclosed yet (no gap or counter); un-ignore when disclosure lands"]
 #[test]
 fn unbound_eligible_calls_are_disclosed() {
     let mut scene = workload_scene();
@@ -194,7 +193,6 @@ fn unbound_eligible_calls_are_disclosed() {
     );
 }
 
-#[ignore = "shed semantic calls are not disclosed yet (no gap or counter); un-ignore when disclosure lands"]
 #[test]
 fn fault_era_unknown_calls_are_disclosed() {
     let mut scene = workload_scene();

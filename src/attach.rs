@@ -1291,11 +1291,15 @@ pub(crate) fn classify_bpf_loop_probe(
 /// loaded probe proves availability outright; `invalid func` in the log
 /// proves absence, but only when the control loaded (otherwise privilege or
 /// the environment, not the kernel, refused); a log that names `bpf_loop#181`
-/// without `invalid func` proves the kernel resolved the helper even though
-/// the bare call itself is rejected; anything else (empty or truncated log,
-/// failed control, unrecognized words) defers to the real load instead of
-/// claiming absence. Verdict details stay finite sentences (errno allowed);
-/// the raw log is never surfaced.
+/// with none of the `unknown func`, `cannot use helper` or `not allowed`
+/// refusal wordings treats the helper as usable even though the bare call
+/// itself is rejected (the name comes from the kernel's static helper
+/// table, printed before the program-type check, so a refusal wording in
+/// the same log means this program type cannot use the helper and defers
+/// instead); anything else (empty or truncated log, failed control,
+/// unrecognized words) defers to the real load instead of claiming absence.
+/// Verdict details stay finite sentences (errno allowed); the raw log is
+/// never surfaced.
 pub(crate) fn classify_bpf_loop_probe_with_log(
     control: &io::Result<()>,
     probe: &io::Result<()>,
@@ -1318,7 +1322,11 @@ pub(crate) fn classify_bpf_loop_probe_with_log(
              probe load: {probe_error})"
         ));
     }
-    if log.contains("bpf_loop#181") {
+    if log.contains("bpf_loop#181")
+        && !log.contains("unknown func")
+        && !log.contains("cannot use helper")
+        && !log.contains("not allowed")
+    {
         return BpfLoopVerdict::Available;
     }
     match control {

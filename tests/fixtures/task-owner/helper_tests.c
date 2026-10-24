@@ -19,6 +19,11 @@ static u64 controlled_cas(u64 *cell, u64 old, u64 replacement);
 static long controlled_owner_loop(u32 count, long (*callback)(u32, void *),
                                   void *context, u64 flags);
 #endif
+/* The timing-bank suites build in both producer modes; only the bucket
+ * assertions stay latency-only. */
+#if defined(P11SCOPE_BANK_MODE_LATENCY) || defined(P11SCOPE_BANK_MODE_TIMESTAMPS)
+#define P11SCOPE_BANK_TIMING_SUITES 1
+#endif
 #define __sync_val_compare_and_swap controlled_cas
 /* Simulated concurrent claims: another CPU's reservations land between an
  * admission pre-check and this CPU's own atomic add. */
@@ -33,9 +38,9 @@ u64 controlled_add(u64 *cell, u64 delta);
 #define P11SCOPE_INSTANCE_HOST_TEST 1
 #include "instance_epoch.h"
 #include "instance_epoch.c"
-#ifdef P11SCOPE_BANK_MODE_LATENCY
+#ifdef P11SCOPE_BANK_TIMING_SUITES
 /* Timing bank producer under test: the actual C helpers run with the
- * controlled_cas hook active above. Latency mode only. */
+ * controlled_cas hook active above, in whichever mode was selected. */
 #include "counter_bank_timing.c"
 #endif
 #endif
@@ -51,7 +56,7 @@ unsigned char START, DISCOVERY_STATE;
 #ifndef P11SCOPE_INVENTORY_ONLY
 unsigned char OBJECT_START, OBJECT_DESCRIPTORS, OBJECT_ZERO;
 #endif
-#ifdef P11SCOPE_BANK_MODE_LATENCY
+#ifdef P11SCOPE_BANK_TIMING_SUITES
 /* Map identities for the timing bank producer (extern in its TU). */
 unsigned char COUNTER_HEALTH, RV_COUNTS;
 #endif
@@ -81,7 +86,7 @@ static struct row rows[FIXTURE_ROW_BOUND];
 static unsigned bank_loop_calls, bank_loop_error_on, bank_loop_short_on;
 static int bank_hide_start_slot;
 #endif
-#ifdef P11SCOPE_BANK_MODE_LATENCY
+#ifdef P11SCOPE_BANK_TIMING_SUITES
 /* Live inner stores for the timing-bank suites: one 512-cell inner per
  * bank, sized for the latency value (the timestamps value is smaller). */
 static struct {
@@ -163,7 +168,7 @@ static size_t key_size(void *map) {
     if (map == &OBJECT_START)
         return 16;
 #endif
-#ifdef P11SCOPE_BANK_MODE_LATENCY
+#ifdef P11SCOPE_BANK_TIMING_SUITES
     if (map == &COUNTER_BANK_META || map == &COUNTER_BANK_FAULT)
         return 4;
     if (map == &COUNTER_BANK_COMMIT)
@@ -183,7 +188,7 @@ static struct row *row(void *map, const void *key)
 static void *lookup(void *map, const void *key)
 {
     if (map == &OWNER_CTL) return &ctl;
-#ifdef P11SCOPE_BANK_MODE_LATENCY
+#ifdef P11SCOPE_BANK_TIMING_SUITES
     if (map == &COUNTER_BANKS) {
         u32 bank = *(const u32 *)key;
         if (bank < 16 && bank_inners[bank].live)
@@ -253,7 +258,7 @@ static long update(void *map, const void *key, const void *data, u64 flags)
     else
 #endif
     if (map == &START) width = 288;
-#ifdef P11SCOPE_BANK_MODE_LATENCY
+#ifdef P11SCOPE_BANK_TIMING_SUITES
     if (map == &COUNTER_BANK_META) width = 32;
     else if (map == &COUNTER_BANK_COMMIT) width = 16;
     else if (map == &COUNTER_BANK_FAULT || map == &RV_COUNTS) width = 8;
@@ -287,7 +292,7 @@ static long pair_delete(void *map, const void *key)
     if (map == &START && fail_start_delete) return fail_start_delete;
     struct row *r = row(map, key);
     if (!r) return -2;
-#ifdef P11SCOPE_BANK_MODE_LATENCY
+#ifdef P11SCOPE_BANK_TIMING_SUITES
     if (map == &START && scrub_start_on_delete)
         memset(r->value, 0, 288);
 #endif
@@ -391,7 +396,7 @@ static void reset(void)
     bank_hide_start_slot = -1;
     owner_loop = controlled_owner_loop;
 #endif
-#ifdef P11SCOPE_BANK_MODE_LATENCY
+#ifdef P11SCOPE_BANK_TIMING_SUITES
     memset(bank_inners, 0, sizeof(bank_inners));
     bank_fault_cell = 0;
     bank_health_cells[0] = bank_health_cells[1] = 0;
@@ -2504,7 +2509,7 @@ static void counter_bank_owner_incomplete_loops(void)
         assert(row(&OBJECT_START, &high)->value[i] == 0xA5);
 }
 
-#ifdef P11SCOPE_BANK_MODE_LATENCY
+#ifdef P11SCOPE_BANK_TIMING_SUITES
 /* Publishes one live route for `slot` under `transaction`, with its commit
  * and live inner. Mirrors every check the timing route() performs. */
 static void bank_publish_route(u32 slot, u64 transaction, u32 first, u32 end)
@@ -2600,10 +2605,12 @@ static void bank_timing_ts_before_remove(void)
     assert(bank_cell(7)->errors == 0);
     assert(bank_cell(7)->total_ns == 1500);
     assert(bank_cell(7)->max_ns == 1500);
+#ifdef P11SCOPE_BANK_MODE_LATENCY
     assert(bank_cell(7)->buckets[bank_bucket(1500)] == 1);
     for (unsigned b = 0; b < 32; b++)
         if (b != bank_bucket(1500))
             assert(bank_cell(7)->buckets[b] == 0);
+#endif
     assert(bank_fault_cell == 0);
     assert(!bank_health_cells[0] && !bank_health_cells[1]);
     struct bank_rv_key rv = { .slot = 7, .pad = 0, .rv = 0 };
@@ -2616,7 +2623,9 @@ static void bank_timing_ts_before_remove(void)
     assert(bank_cell(7)->errors == 0);
     assert(bank_cell(7)->total_ns == 1500);
     assert(bank_cell(7)->max_ns == 1500);
+#ifdef P11SCOPE_BANK_MODE_LATENCY
     assert(bank_cell(7)->buckets[0] == 1);
+#endif
     /* Absence is not settlement: nothing is accounted or faulted. */
     assert(!p11_bank_complete_timed(7, pid_tgid(), 0, 1, 9999));
     assert(bank_cell(7)->returned == 2);
@@ -2665,7 +2674,8 @@ static void bank_timing_ts_before_remove(void)
     assert(!bank_health_cells[0] && !bank_health_cells[1]);
 }
 
-/* The entry root accounts entry only: latency buckets stay untouched. */
+/* The entry root accounts entry only: no bucket writes (latency buckets
+ * stay untouched; timestamps mode has no buckets). */
 static void bank_timing_enter_writes_no_buckets(void)
 {
     reset(); object_setup();
@@ -2675,8 +2685,10 @@ static void bank_timing_enter_writes_no_buckets(void)
     assert(bank_cell(7)->returned == 0);
     assert(bank_cell(7)->total_ns == 0);
     assert(bank_cell(7)->max_ns == 0);
+#ifdef P11SCOPE_BANK_MODE_LATENCY
     for (unsigned b = 0; b < 32; b++)
         assert(bank_cell(7)->buckets[b] == 0);
+#endif
     assert(bank_fault_cell == 0);
 }
 
@@ -2770,7 +2782,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[1], "counter_bank_owner_orphan_failures")) counter_bank_owner_orphan_failures();
         else if (!strcmp(argv[1], "counter_bank_owner_incomplete_loops")) counter_bank_owner_incomplete_loops();
 #endif
-#ifdef P11SCOPE_BANK_MODE_LATENCY
+#ifdef P11SCOPE_BANK_TIMING_SUITES
         else if (!strcmp(argv[1], "bank_timing_add_saturates")) bank_timing_add_saturates();
         else if (!strcmp(argv[1], "bank_timing_max_exact_eight_and_contention")) bank_timing_max_exact_eight_and_contention();
         else if (!strcmp(argv[1], "bank_timing_ts_before_remove")) bank_timing_ts_before_remove();

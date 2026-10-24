@@ -1694,7 +1694,7 @@ pub fn render_extra_strict(checks: &[Check]) -> String {
 pub(crate) fn counter_modes_footer(verdict: &crate::attach::BpfLoopVerdict) -> String {
     match verdict {
         crate::attach::BpfLoopVerdict::Available => {
-            "counter modes: available (the kernel loads the bpf_loop helper-181 probe)\n"
+            "counter modes: not enabled in this build (the kernel provides bpf_loop (helper 181))\n"
                 .to_string()
         }
         crate::attach::BpfLoopVerdict::Unavailable(reason) => {

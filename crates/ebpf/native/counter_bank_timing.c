@@ -267,6 +267,12 @@ static INLINE __attribute__((unused)) u32 bank_bucket(u64 delta)
         bucket = 1;
     else
         bucket = 0;
+    /* The clamp is load-bearing for the object checker's single
+     * clamp/index proof: without the barrier clang folds the constant
+     * chain and deletes the comparison, leaving the shift operand
+     * unbounded in the emitted object. The barrier keeps the comparison
+     * without changing the value. */
+    __asm__ volatile("" : "+r"(bucket));
     if (bucket > 31)
         bucket = 31;
     return bucket;

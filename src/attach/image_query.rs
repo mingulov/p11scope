@@ -55,7 +55,7 @@ pub(crate) fn absence_query_storage_bytes(
             .checked_mul(size_of::<T>())?
             .checked_add(2 * crate::semantics_edge::resources::OWNED_ALLOCATION_PADDING)
     }
-    // Rust 1.98 B-tree: eleven key/value slots, twelve child edges, with
+    // Rust 1.99.1 B-tree: eleven key/value slots, twelve child edges, with
     // three words covering the parent/index/length header and alignment.
     // Charging an internal node PER item also covers partially filled roots.
     fn tree_node<K, V>() -> Option<usize> {

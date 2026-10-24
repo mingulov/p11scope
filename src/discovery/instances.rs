@@ -794,7 +794,7 @@ impl InstanceRouter {
     }
 
     /// Expiry retains the pending deque in place. The only router allocation
-    /// is growth of the finite unknown-reason counter tree. Pinned Rust 1.98.1
+    /// is growth of the finite unknown-reason counter tree. Pinned Rust 1.99.1
     /// B-tree nodes hold 11 pairs and 12 edges; a whole internal node per
     /// existing/new entry plus a spare root dominates both retained and newly
     /// requested nodes. Tuple size conservatively includes key/value padding.

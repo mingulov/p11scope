@@ -302,9 +302,12 @@ impl JointReceiptReservation<'_> {
     }
 }
 
-/// Requested allocation of the private grant table on the pinned Rust1.98.1
-/// x86-64 implementation. The actual std HashMap probe below enforces its
-/// four-bucket minimum, 7/8 load bound and 16-byte control group. This is not a
+/// Requested allocation of the private grant table on the pinned Rust1.99.1
+/// x86-64 implementation. Std selects hashbrown0.17.1; its raw.rs keeps a
+/// four-bucket minimum for this actual JointGrantEntry (>3 bytes), a 7/8 load
+/// bound above eight buckets and the SSE2 16-byte control group. Its larger
+/// initial buckets for tiny payloads do not apply to this receipt/lease entry.
+/// The actual std HashMap probe below checks these requests. This is not a
 /// portable std collection contract; the resource module pins the host/ABI.
 ///
 /// Keep this allocation geometry until that table allocation is dropped:

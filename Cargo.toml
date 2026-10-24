@@ -2,7 +2,7 @@
 name = "p11scope"
 version = "0.4.0"
 edition = "2024"
-rust-version = "1.98"
+rust-version = "1.99"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/mingulov/p11scope"
 description = "Non-interposing PKCS#11 observer on eBPF uprobes"

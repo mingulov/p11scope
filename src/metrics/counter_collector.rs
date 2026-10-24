@@ -243,7 +243,7 @@ pub(super) struct CounterHealth {
     pub(super) contended: bool,
 }
 
-// The existing resources module pins Rust 1.98.1's x86-64 B-tree layout and
+// The existing resources module pins Rust 1.99.1's x86-64 B-tree layout and
 // allocator model. One full internal node per entry dominates retained tree
 // requests; eight extra nodes cover the bounded split/root temporary chain.
 // This is a conservative requested-allocation envelope, never an RSS bound.

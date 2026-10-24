@@ -1,9 +1,11 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 // These charges depend on the pinned alloc implementation. A stable compiler
 // bump requires semantic-budget remeasurement and source-proof revalidation.
+// Rust1.99.1 alloc/core and std's hashbrown0.17.1 retain the geometry used here;
+// this metadata guard does not replace allocation or final-type measurements.
 
-pub const RELEASE: &str = "1.98.1";
-pub const COMMIT: &str = "48a229ceaefd4985c50990b14116b6d856af0985";
+pub const RELEASE: &str = "1.99.1";
+pub const COMMIT: &str = "58cf8f9c35b355199727627d07ae34a4e2846d67";
 
 pub fn validate_metadata(metadata: &str) -> Result<(), String> {
     let mut release = None;

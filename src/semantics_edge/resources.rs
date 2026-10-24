@@ -16,8 +16,8 @@ use std::sync::{Arc, Mutex};
 compile_error!("semantic allocation charges require revalidation for this target ABI");
 const _: &str = env!("P11SCOPE_SEMANTIC_RUSTC_PROOF");
 
-// Pinned Rust1.98.1 alloc source, not portable BTreeMap folklore:
-// https://github.com/rust-lang/rust/blob/1.98.1/library/alloc/src/collections/btree/node.rs
+// Pinned Rust1.99.1 alloc source, not portable BTreeMap folklore:
+// https://github.com/rust-lang/rust/blob/1.99.1/library/alloc/src/collections/btree/node.rs
 // B=6, capacity11; LeafNode parent pointer+u16 index+u16 len occupies16B;
 // InternalNode adds12 pointers. Every key/value here aligns at most8.
 // map.rs maintains >=5 keys in non-root nodes; thus a nonempty tree has
@@ -82,8 +82,8 @@ const _: () = {
 // temporaries. Source: set.rs FromIterator collects and stable-sorts a Vec;
 // map.rs/append.rs bulk_push builds/fixes the tree's right border; raw_vec
 // grows capacity by max(2*old,required); slice/sort/stable/mod.rs chooses
-// max(n-n/2,min(n,8_000_000/size(T)),32) scratch, bounded here by4096 u64s.
-// These URLs are pinned to the same1.98.1 source directory as node.rs.
+// max(n-n/2,min(n,8_000_000/size(T)),48) scratch, bounded here by4096 u64s.
+// These sources are pinned to the same1.99.1 source directory as node.rs.
 // <=2048 active+256 total async owners can be unproven. Count all below
 // together, even when phases cannot overlap, and include old+new Vec
 // requests during realloc. A <=2304-key B-tree's minimum occupancy5

@@ -502,7 +502,7 @@ fn counter_vec_peak_bytes<T>(items: usize) -> Option<usize> {
 }
 
 fn counter_tree_bytes<K, V>(items: usize) -> Option<usize> {
-    // Same pinned Rust1.98.1 B=6 internal-node bound as resources.rs. One
+    // Same pinned Rust1.99.1 B=6 internal-node bound as resources.rs. One
     // whole internal node per entry also dominates a sparse root/leaf tree.
     if std::mem::align_of::<K>() > 8 || std::mem::align_of::<V>() > 8 {
         return None;

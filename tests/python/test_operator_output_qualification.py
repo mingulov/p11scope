@@ -362,9 +362,10 @@ class NativeWrapControls(unittest.TestCase):
             facts = validate(original)
             self.assertEqual(facts['physical_pairs'], 32)
             self.assertEqual(facts['phase_calls'], dict(a=32, shared=32, fence=32, proof=32))
-            for mutation in ('missing', 'duplicate_pair', 'foreign_target', 'wrong_phase',
-                             'wrong_nonce', 'return', 'clock', 'early_ack', 'late_ack',
-                             'late_b_ready', 'late_unmapped', 'wrong_control_calls'):
+            for mutation in ('missing', 'duplicate_pair', 'foreign_target', 'wrong_device',
+                             'wrong_offset', 'wrong_phase', 'wrong_nonce', 'return', 'clock',
+                             'early_ack', 'late_ack', 'late_b_ready', 'late_unmapped',
+                             'wrong_control_calls'):
                 with self.subTest(mutation=mutation):
                     value = copy.deepcopy(original)
                     calls = [row for row in value['rows'] if row['kind'] == 'call']
@@ -376,6 +377,10 @@ class NativeWrapControls(unittest.TestCase):
                         shared[-1]['slot'] = shared[0]['slot']
                     elif mutation == 'foreign_target':
                         value['rows'][1]['ino'] += 1
+                    elif mutation == 'wrong_device':
+                        value['rows'][1]['dev_major'] += 1
+                    elif mutation == 'wrong_offset':
+                        value['rows'][1]['offset'] = 10 ** 12
                     elif mutation == 'wrong_phase':
                         shared[0]['phase'] = 'a'
                     elif mutation == 'wrong_nonce':
@@ -434,10 +439,25 @@ class NativeWrapControls(unittest.TestCase):
         with tempfile.TemporaryDirectory() as scratch:
             directory = Path(scratch) / 'payload'
             prepared = WRAP['build'](directory)
+            self.assertEqual(prepared['topology_check'],
+                             dict(indexed_pairs=32, providers=64, distinct_provider_objects=64))
             self.assertEqual(prepared['native_check']['calls'], 192)
             self.assertEqual(prepared['native_check']['targets'], 32)
             self.assertEqual(prepared['probe_check']['calls'], 96)
             self.assertEqual(prepared['probe_check']['physical_pairs'], 32)
+            provider = directory / 'provider-A-01.so'
+            image = provider.read_bytes()
+            for tamper, reason in ((b'libdemotion-common-00.so', 'reconnects'),
+                                   (b'diagnostics_slot_4', 'foreign counted body')):
+                with self.subTest(tamper=reason):
+                    try:
+                        with provider.open('ab') as handle:
+                            handle.write(tamper)
+                        with self.assertRaises(ValueError) as raised:
+                            WRAP['check_topology'](directory)
+                        self.assertIn(reason, str(raised.exception))
+                    finally:
+                        provider.write_bytes(image)
             observed = WRAP['execute_fixture'](directory, 1, 1)
             def validate(value):
                 return WRAP['check_ledger'](**value, directory=directory, counted=1, shared=1)

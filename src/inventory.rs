@@ -2337,6 +2337,20 @@ impl ClassicDriver<'_> {
                 ),
             }
         }
+        // One honest stop disclosure: the aggregate scan-refusal gap
+        // plus the lifetime call-count line. Counts only; no
+        // identities, paths or payloads.
+        let counters = self
+            .semantic
+            .as_ref()
+            .map(|lane| (lane.scan_refusal_counts(), lane.semantic_stop_call_counts()));
+        let bindings = self.coordinator.semantic_bindings_mut().len() as u64;
+        if let Some((refusals, (collected, joined, shed, refused))) = counters {
+            self.coordinator.record_scan_refusals_gap(&refusals);
+            self.warn(&crate::inventory_semantics::semantic_stop_line(
+                collected, joined, shed, bindings, refused,
+            ));
+        }
     }
 
     /// DR37 promotion polling, every tick after the display tick:

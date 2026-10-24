@@ -21,6 +21,7 @@ pub(crate) use joint::{
 };
 
 use crate::attach::capture::NativeDomainId;
+use crate::attach::image_query::ImageQueryRefusal;
 use crate::attach::{
     AttachedSemanticSet, BackendSelection, ProducerDetachProgress, Scope, Session,
 };
@@ -642,6 +643,9 @@ pub(crate) struct AttestedSemanticLane {
     /// stamps it on stage and clears it on publish, bounding the wait
     /// for receipt-free evidence and backing off failed commits.
     staged_at: Option<Instant>,
+    /// Calls shed without a route across finalizations (the aggregate
+    /// unrouted gap's lifetime total), for the honest stop line.
+    disclosed_calls_shed: u64,
     /// Tests-only substituted H0 I/O (see [`LaneTestIo`]): installed
     /// by tests that drive the production finalize path without a
     /// live Session.
@@ -892,6 +896,94 @@ pub(crate) fn effective_refresh_custody(report: &TickReport, pin: Arc<PidPin>) -
         .unwrap_or(pin)
 }
 
+/// Finite scan-refusal vocabulary for disclosure surfaces (gaps, stderr
+/// counts). Index-aligned with the per-reason counters the live lane keeps
+/// beside the existing `refused_endpoints` total.
+pub(crate) const SCAN_REFUSAL_LABELS: [&str; 12] = [
+    "policy",
+    "coverage",
+    "custody",
+    "deadline",
+    "capacity",
+    "exhausted",
+    "stream",
+    "unknown",
+    "unstable",
+    "empty",
+    "fence",
+    "present",
+];
+
+/// Per-reason slot for one scan refusal. Same order as
+/// [`SCAN_REFUSAL_LABELS`].
+pub(crate) fn image_query_refusal_index(refusal: ImageQueryRefusal) -> usize {
+    match refusal {
+        ImageQueryRefusal::Policy => 0,
+        ImageQueryRefusal::Coverage => 1,
+        ImageQueryRefusal::Custody => 2,
+        ImageQueryRefusal::Deadline => 3,
+        ImageQueryRefusal::Capacity => 4,
+        ImageQueryRefusal::Exhausted => 5,
+        ImageQueryRefusal::Stream => 6,
+        ImageQueryRefusal::Unknown => 7,
+        ImageQueryRefusal::Unstable => 8,
+        ImageQueryRefusal::Empty => 9,
+        ImageQueryRefusal::Fence => 10,
+        ImageQueryRefusal::Present => 11,
+    }
+}
+
+/// Finite vocabulary label for one scan refusal. Tests pin the
+/// vocabulary through this; production formats counts by index.
+#[cfg(test)]
+pub(crate) fn image_query_refusal_label(refusal: ImageQueryRefusal) -> &'static str {
+    SCAN_REFUSAL_LABELS[image_query_refusal_index(refusal)]
+}
+
+/// Count one report's scan refusals into per-reason slots. The live
+/// tick/refresh sites call this beside the existing total; tests drive
+/// it with scripted refusals.
+pub(crate) fn count_scan_refusals(into: &mut [u64; 12], refusals: &[ImageQueryRefusal]) {
+    for refusal in refusals {
+        let slot = &mut into[image_query_refusal_index(*refusal)];
+        *slot = slot.saturating_add(1);
+    }
+}
+
+/// Aggregate gap reason for per-reason scan-refusal counts: the total
+/// plus sorted `label=count` pairs. `None` when nothing was refused.
+/// Counts only; no pids, paths or payloads.
+pub(crate) fn scan_refusals_gap_reason(counts: &[u64; 12]) -> Option<String> {
+    let total: u64 = counts.iter().sum();
+    if total == 0 {
+        return None;
+    }
+    let mut parts: Vec<String> = counts
+        .iter()
+        .enumerate()
+        .filter(|(_, count)| **count > 0)
+        .map(|(index, count)| format!("{}={count}", SCAN_REFUSAL_LABELS[index]))
+        .collect();
+    parts.sort();
+    Some(format!("{total} scan refusals ({})", parts.join(" ")))
+}
+
+/// One stderr stop line for the semantic lane: lifetime collected,
+/// joined, shed, bound and refused call counts. Counts only; no
+/// identities, paths or payloads.
+pub(crate) fn semantic_stop_line(
+    collected: u64,
+    joined: u64,
+    shed: u64,
+    bindings: u64,
+    refused: u64,
+) -> String {
+    format!(
+        "p11scope: semantic calls: collected {collected}, joined {joined}, \
+         shed {shed}, bindings {bindings}, refused {refused}"
+    )
+}
+
 /// The live lane: the owned Detailed `Session` (the sole retained EVENTS
 /// cursor, maps and links), its H0 `SemanticCapture` driver, the sealed
 /// attachment receipt, and the terminal ownership state. Counts only;
@@ -906,6 +998,10 @@ pub(crate) struct LiveLane {
     final_drain: bool,
     ticks: u64,
     scan_refusals: u64,
+    /// CALL records drained across ticks and the terminal drain.
+    collected_calls: u64,
+    /// Per-reason scan refusals behind [`Self::scan_refusals`].
+    refusal_counts: [u64; 12],
     continuity_cuts: u64,
     unrouted_returns: u64,
     drained_batches: u64,
@@ -983,6 +1079,7 @@ impl AttestedSemanticLane {
             joint_finish_failure: None,
             exit_retained: false,
             staged_at: None,
+            disclosed_calls_shed: 0,
             #[cfg(test)]
             test_io: None,
             #[cfg(test)]
@@ -1073,6 +1170,8 @@ impl AttestedSemanticLane {
                 final_drain: false,
                 ticks: 0,
                 scan_refusals: 0,
+                collected_calls: 0,
+                refusal_counts: [0; 12],
                 continuity_cuts: 0,
                 unrouted_returns: 0,
                 drained_batches: 0,
@@ -1085,6 +1184,7 @@ impl AttestedSemanticLane {
             joint_finish_failure: None,
             exit_retained: false,
             staged_at: None,
+            disclosed_calls_shed: 0,
             #[cfg(test)]
             test_io: None,
             #[cfg(test)]
@@ -1176,6 +1276,40 @@ impl AttestedSemanticLane {
             return true;
         }
         self.live.as_ref().is_some_and(|live| live.finished)
+    }
+
+    /// Note calls shed without a route by one finalization (the
+    /// finalizer counts them beside the aggregate unrouted gap).
+    pub(crate) fn note_shed_calls(&mut self, shed: u64) {
+        self.disclosed_calls_shed = self.disclosed_calls_shed.saturating_add(shed);
+    }
+
+    /// Calls shed without a route across finalizations.
+    #[cfg(test)]
+    pub(crate) fn shed_calls_disclosed(&self) -> u64 {
+        self.disclosed_calls_shed
+    }
+
+    /// Lifetime (collected, joined, shed, refused) call counters for
+    /// the honest stop line. Joined is H0's cumulative router count;
+    /// without a live lane only finalized sheds are known.
+    pub(crate) fn semantic_stop_call_counts(&self) -> (u64, u64, u64, u64) {
+        let (collected, joined, refused) = self.live.as_ref().map_or((0, 0, 0), |live| {
+            (
+                live.collected_calls,
+                live.capture.router().counters().joined,
+                live.scan_refusals,
+            )
+        });
+        (collected, joined, self.disclosed_calls_shed, refused)
+    }
+
+    /// Lifetime per-reason scan-refusal counts (zeros without a live
+    /// lane), index-aligned with [`SCAN_REFUSAL_LABELS`].
+    pub(crate) fn scan_refusal_counts(&self) -> [u64; 12] {
+        self.live
+            .as_ref()
+            .map_or([0; 12], |live| live.refusal_counts)
     }
 
     pub(crate) fn mark_collected_finish_requested(&mut self) {
@@ -1537,6 +1671,10 @@ impl AttestedSemanticLane {
         live.scan_refusals = live
             .scan_refusals
             .saturating_add(report.scan_refusals.len() as u64);
+        count_scan_refusals(&mut live.refusal_counts, &report.scan_refusals);
+        live.collected_calls = live
+            .collected_calls
+            .saturating_add(report.collected_calls as u64);
         live.continuity_cuts = live.capture.continuity_cuts();
         // Quiet no-call registrations stashed since the last tick join
         // this batch behind its own fresh evidence.
@@ -1597,6 +1735,10 @@ impl AttestedSemanticLane {
         live.scan_refusals = live
             .scan_refusals
             .saturating_add(report.scan_refusals.len() as u64);
+        count_scan_refusals(&mut live.refusal_counts, &report.scan_refusals);
+        live.collected_calls = live
+            .collected_calls
+            .saturating_add(report.collected_calls as u64);
         live.continuity_cuts = live.capture.continuity_cuts();
         let shed = merge_stash_into_report(&mut live.stashed_refresh, &mut report);
         live.scan_refusals = live.scan_refusals.saturating_add(shed);
@@ -1681,6 +1823,7 @@ impl AttestedSemanticLane {
         live.scan_refusals = live
             .scan_refusals
             .saturating_add(report.scan_refusals.len() as u64);
+        count_scan_refusals(&mut live.refusal_counts, &report.scan_refusals);
         // The minted receipt carries the Arc H0 actually retained
         // (adopted across a failed-bind retry, else the passed pin).
         let effective = effective_refresh_custody(&report, pin);
@@ -2424,6 +2567,7 @@ struct LiveStopIo<'a> {
     pins: Vec<Arc<PidPin>>,
     domain: NativeDomainId,
     stash: Option<LiveStashDrain<'a>>,
+    collected: &'a mut u64,
 }
 
 impl SemanticStopIo for LiveStopIo<'_> {
@@ -2448,6 +2592,7 @@ impl SemanticStopIo for LiveStopIo<'_> {
             .capture
             .tick(&mut *self.session, &self.pins)
             .map_err(|_| SemanticRefusal::Unavailable)?;
+        *self.collected = self.collected.saturating_add(report.collected_calls as u64);
         // Quiet evidence stashed since the last tick joins this
         // terminal quantum behind its own: a stop before the next tick
         // still registers it. The merge runs before the emptiness
@@ -2531,6 +2676,7 @@ impl SemanticStopIo for LiveStopIo<'_> {
 
     fn finish_h0(&mut self) -> SemanticBatch {
         let report = self.capture.stop();
+        *self.collected = self.collected.saturating_add(report.collected_calls as u64);
         SemanticBatch::from_tick_report(self.domain, report, Vec::new(), now_ns())
             .expect("H0 stop batches respect lane bounds")
     }
@@ -2557,6 +2703,7 @@ fn terminal_io_for<'a>(
             stash: &mut live.stashed_refresh,
             shed: &mut live.scan_refusals,
         }),
+        collected: &mut live.collected_calls,
     }
 }
 
@@ -2929,6 +3076,7 @@ impl AttestedSemanticLane {
                 stash: &mut live.stashed_refresh,
                 shed: &mut live.scan_refusals,
             }),
+            collected: &mut live.collected_calls,
         };
         let summary = run_semantic_drain(
             &mut io,
@@ -3133,6 +3281,7 @@ impl AttestedSemanticLane {
             pins: Vec::new(),
             domain,
             stash: None,
+            collected: &mut live.collected_calls,
         };
         let batch = io.finish_h0();
         live.finished = true;

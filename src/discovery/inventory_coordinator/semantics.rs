@@ -18,7 +18,7 @@ use crate::discovery::caller_registry::instance_input::{
     tail_loss_from_negative,
 };
 use crate::discovery::caller_registry::{CallerLifecycle, ModuleLifecycle};
-use crate::discovery::instances::{MAX_INSTANCES, MAX_PENDING};
+use crate::discovery::instances::{MAX_INSTANCES, MAX_PENDING, Route};
 #[cfg(test)]
 use crate::discovery::native_binding::CallerLookup;
 use crate::inventory_promotion::lifecycle::{SelectedActivationProof, SessionNativeCompletion};
@@ -862,7 +862,8 @@ impl SemanticBindingSet {
         removed.into_iter().collect()
     }
 
-    #[cfg(test)]
+    /// Accepted semantic bindings. The disclosure gap reports how many
+    /// bindings existed when calls shed without a route.
     pub(crate) fn len(&self) -> usize {
         self.bindings.len()
     }
@@ -1943,6 +1944,24 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         });
     }
 
+    /// One aggregate gap for lifetime semantic scan/refresh refusals,
+    /// with per-reason finite labels and counts. Nothing is recorded
+    /// when no scan ever refused. Counts only; no pids, paths or
+    /// payloads.
+    pub(crate) fn record_scan_refusals_gap(&mut self, counts: &[u64; 12]) {
+        let Some(reason) = crate::inventory_semantics::scan_refusals_gap_reason(counts) else {
+            return;
+        };
+        self.registry.record_gap(RegistryGap {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: "semantic scan refused".into(),
+            reason,
+            budget: None,
+        });
+    }
+
     /// A failed fresh membership proof is a persistent suspension, not only
     /// a one-publication loss marker. History retains its original custody.
     pub(crate) fn suspend_semantic_scope_except(&mut self, allowed: &BTreeSet<CallerId>) {
@@ -2799,6 +2818,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
         let mut calls = Vec::new();
         let mut shed_calls = 0usize;
+        // Unrouted sheds by finite reason label, for the aggregate gap
+        // below. A Vec scan avoids new derives on the reason enums.
+        let mut shed_reasons: Vec<(&'static str, u64)> = Vec::new();
         // H3 disposition inputs collected across staging: every outcome
         // position this finalization disposes, the minimum shed
         // position, and whether any outcome lacked a position.
@@ -2809,6 +2831,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             match outcome {
                 TickOutcome::Call(call) => {
                     let token = call.token();
+                    // Read the route before the move: a shed call's
+                    // reason is disclosed through the aggregate gap.
+                    // (A Joined call without a token cannot stage
+                    // either; production always positions Joined calls.)
+                    let shed_reason = match call.route() {
+                        Route::Joined(_) => None,
+                        Route::Unknown(reason) => Some(reason.label()),
+                        Route::Pending => Some("pending"),
+                    };
                     match CallEvidence::from_routed(call) {
                         Some(evidence) => {
                             if calls.len() < MAX_INSTANCES {
@@ -2822,12 +2853,20 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         }
                         // Unjoined routes never stage: their positions
                         // are undisposable, so they shed.
-                        None => match token {
-                            Some(at) => {
-                                shed_min = Some(shed_min.map_or(at, |floor| floor.min(at)));
+                        None => {
+                            if let Some(label) = shed_reason {
+                                match shed_reasons.iter_mut().find(|(known, _)| *known == label) {
+                                    Some((_, count)) => *count += 1,
+                                    None => shed_reasons.push((label, 1u64)),
+                                }
                             }
-                            None => unpositioned = true,
-                        },
+                            match token {
+                                Some(at) => {
+                                    shed_min = Some(shed_min.map_or(at, |floor| floor.min(at)));
+                                }
+                                None => unpositioned = true,
+                            }
+                        }
                     }
                 }
                 TickOutcome::Invalidation(invalidation) => {
@@ -2888,6 +2927,27 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     requested: MAX_INSTANCES + shed_calls,
                 }),
             });
+        }
+        if !shed_reasons.is_empty() {
+            let total: u64 = shed_reasons.iter().map(|(_, count)| count).sum();
+            let mut parts: Vec<String> = shed_reasons
+                .iter()
+                .map(|(label, count)| format!("{label}={count}"))
+                .collect();
+            parts.sort();
+            self.registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: "semantic calls unrouted".into(),
+                reason: format!(
+                    "{total} calls shed without a route ({}) with {} bindings",
+                    parts.join(" "),
+                    self.semantic_bindings.len()
+                ),
+                budget: None,
+            });
+            lane.note_shed_calls(total);
         }
         // Validated registrations second: every covered id registers.
         // Conversion borrows end before staging mutates the registry.

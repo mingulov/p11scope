@@ -348,6 +348,37 @@ pub(crate) enum UnknownReason {
     Retired,
 }
 
+impl UnknownReason {
+    /// Finite vocabulary label for disclosure surfaces (gaps, counters).
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::ForeignDomain => "foreign_domain",
+            Self::AuthorityExhausted => "authority_exhausted",
+            Self::InvalidImage => "invalid_image",
+            Self::Unstamped => "unstamped",
+            Self::NoFile => "no_file",
+            Self::SharedMm => "shared_mm",
+            Self::Overflow => "overflow",
+            Self::LocalFault => "local_fault",
+            Self::Straddle => "straddle",
+            Self::FaultEra => "fault_era",
+            Self::Sticky => "sticky",
+            Self::CoverageFault => "coverage_fault",
+            Self::Unobserved => "unobserved",
+            Self::Evicted => "evicted",
+            Self::IpOutside => "ip_outside",
+            Self::NotExecutable => "not_executable",
+            Self::OffsetMismatch => "offset_mismatch",
+            Self::Unpartitionable => "unpartitionable",
+            Self::InstanceCapacity => "instance_capacity",
+            Self::RangeCapacity => "range_capacity",
+            Self::PendingCapacity => "pending_capacity",
+            Self::BindingCapacity => "binding_capacity",
+            Self::Retired => "retired",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Route {
     Joined(InstanceId),

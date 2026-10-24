@@ -2189,6 +2189,7 @@ fn should_stop(interrupted: &SignalState, elapsed: Duration, duration: Option<Du
 /// discover and pin what is in scope, install the stop flag, then run the same
 /// loop `run` runs — with no owned child, so no pause is ever possible.
 pub fn capture(a: &CaptureArgs) -> Result<()> {
+    refuse_unwired_counter_mode(a.counter_mode)?;
     let kind = a.kind;
     let policy = capture_policy(kind, a.metrics, a.unsafe_requested)?;
     if let Some(warning) = pid_namespace_preflight(&a.scope, crate::pidns::numbering())? {
@@ -2315,6 +2316,16 @@ fn no_profile_duration_notice() -> String {
     "p11scope: no --duration given; profile captures until interrupted (Ctrl-C) or the \
      process exits"
         .to_string()
+}
+
+fn refuse_unwired_counter_mode(mode: Option<p11scope_ebpf_common::CounterMode>) -> Result<()> {
+    if let Some(mode) = mode {
+        anyhow::bail!(
+            "counter-mode-unwired: --counter-mode {} is unavailable in this build",
+            mode.name()
+        );
+    }
+    Ok(())
 }
 
 fn capture_policy(kind: Kind, metrics: bool, unsafe_requested: bool) -> Result<CapturePolicy> {
@@ -3017,6 +3028,7 @@ fn cancelled_by(interrupted: &SignalState) -> impl Fn() -> std::result::Result<b
 /// applies the pause policy, runs live discovery and the capture loop, and
 /// writes the final artifact.
 pub fn run_owned(args: &RunArgs) -> Result<OwnedRunOutcome> {
+    refuse_unwired_counter_mode(args.counter_mode)?;
     let stop = install_stop_flag()?;
     let outcome = run_owned_inner(args, stop.clone());
     match (args.pause, outcome) {

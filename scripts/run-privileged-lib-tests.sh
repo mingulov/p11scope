@@ -324,6 +324,9 @@ discovery::sweep_attribution::tests::privileged_d4_btrfs_bind_alias_backend_pari
 metrics::counter_reader::tests::counter_bank_session_boundary_511_512_counts_growth_multi_lp64
 discovery::sweep_attribution::tests::privileged_d4_btrfs_live_thread_private_files_backend_parity
 discovery::sweep_attribution::tests::d4_thread_mapping_helper
+metrics::counter_reader::tests::counter_bank_session_useful_8192_counts_growth_multi_lp64
+discovery::sweep_attribution::tests::privileged_d4_btrfs_clone_without_files_backend_parity
+discovery::sweep_attribution::tests::d4_clone_without_files_mapping_helper
 )
 SKIP_REASONS=(
 "needs punch-hole support under TMPDIR (btrfs/ext4/xfs; tmpfs refuses); no BPF-independent probe: run by hand as root: TMPDIR=<hole-capable dir> <binary> --exact <path> --ignored"
@@ -359,6 +362,9 @@ SKIP_REASONS=(
 "needs proof1/artifacts0 prebuilt libtest and growth provider/workload inputs; explicit Multi PID-filter capability and separately admitted 513-endpoint native FD/memory/cleanup qualification, preserving required Singles coverage"
 "needs root/proc access, Btrfs disk TMPDIR and eligible task_vma/BTF; explicit live nonleader/shared-and-private FD-table parity with owned re-exec helpers, separately admitted exact ignored run"
 "private entrypoint re-executed only by the owned live-thread/private-files parity fixture; missing owned configuration fails and this helper never qualifies independently"
+"needs qualified Multi513 pilot, proof1/artifacts0 prebuilt libtest and growth provider/workload inputs; separately admitted 8192-endpoint FD/memory/native qualification with unchanged ledger/N+1/cleanup/deadline assertions, preserving required Singles coverage"
+"needs root/proc access, Btrfs disk TMPDIR, x86-64 raw clone support and eligible task_vma/BTF; actual CLONE_THREAD without CLONE_FILES attribution parity requires a separately admitted exact ignored run"
+"private re-exec entrypoint for the owned literal-clone parity fixture; missing owned configuration fails and this helper never qualifies independently"
 )
 
 usage() {

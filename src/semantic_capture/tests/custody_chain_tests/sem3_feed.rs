@@ -46,14 +46,7 @@ fn attempt_production_bind(scene: &mut RealScene, caller: CallerId, pid: u32) ->
 }
 
 fn held_pending(scene: &RealScene) -> usize {
-    scene
-        .h0
-        .0
-        .borrow()
-        .capture
-        .router()
-        .pending_facts()
-        .count()
+    scene.h0.0.borrow().capture.router().pending_facts().count()
 }
 
 fn joined_calls(scene: &RealScene) -> u64 {
@@ -86,10 +79,12 @@ fn pre_existing_burst_waits_for_binding_and_joins() {
         scene.publish(batch);
     }
     assert!(
-        semantic_gap_subjects(&scene).iter().any(|(subject, reason)| {
-            subject == "semantic admission refused"
-                && reason.starts_with("semantic_unavailable")
-        }),
+        semantic_gap_subjects(&scene)
+            .iter()
+            .any(|(subject, reason)| {
+                subject == "semantic admission refused"
+                    && reason.starts_with("semantic_unavailable")
+            }),
         "pre-burst attempts are refused, not skipped"
     );
     // One short burst, drained before the next pass binds the caller:

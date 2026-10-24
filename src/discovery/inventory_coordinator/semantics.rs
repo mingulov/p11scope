@@ -24,11 +24,11 @@ use crate::discovery::native_binding::CallerLookup;
 use crate::inventory_promotion::lifecycle::{SelectedActivationProof, SessionNativeCompletion};
 use crate::inventory_promotion::{PromotionPair, PromotionRefusal};
 use crate::inventory_semantics::selected::ProvisionalSelectedLane;
-use crate::inventory_semantics::{AttestedSemanticLane, LaneNegative, SemanticRefusal};
 use crate::inventory_semantics::{
     AdmissionPreparationError, AdmissionUnavailableSite, PreparedSemanticAdmission,
     SemanticProviderTarget,
 };
+use crate::inventory_semantics::{AttestedSemanticLane, LaneNegative, SemanticRefusal};
 use crate::process::PidPin;
 use crate::semantic_capture::{
     CurrentReceiptRefusal, Endpoint, InvalidationScope, PhysicalSemanticGap, TickOutcome,

@@ -143,7 +143,10 @@ impl AdmissionPreparationError {
     /// only the test seam passes other refusals through.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn refused(refusal: SemanticRefusal) -> Self {
-        Self { refusal, site: None }
+        Self {
+            refusal,
+            site: None,
+        }
     }
     pub(crate) fn unavailable(site: AdmissionUnavailableSite) -> Self {
         Self {
@@ -1881,7 +1884,9 @@ impl AttestedSemanticLane {
         #[cfg(test)]
         if let Some(test) = self.test_io.as_mut() {
             if self.test_finished || (self.test_gated && terminal.is_none()) {
-                return Err(AdmissionPreparationError::unavailable(Site::RefreshTestSeam));
+                return Err(AdmissionPreparationError::unavailable(
+                    Site::RefreshTestSeam,
+                ));
             }
             return match collected {
                 Some((raw, adapter, producers)) => {
@@ -1905,9 +1910,9 @@ impl AttestedSemanticLane {
             ));
         }
         if let Some(q) = terminal {
-            live.session.joint_collection_io_at_q(q).map_err(|_| {
-                AdmissionPreparationError::unavailable(Site::RefreshCollectionIo)
-            })?;
+            live.session
+                .joint_collection_io_at_q(q)
+                .map_err(|_| AdmissionPreparationError::unavailable(Site::RefreshCollectionIo))?;
         }
         let mut report = match collected {
             Some((raw, adapter, producers)) => live.capture.refresh_collected(
@@ -1994,9 +1999,7 @@ impl AttestedSemanticLane {
         })?;
         raw.validate_collected_q(producers, discovery, q)
             .map_err(|_| {
-                AdmissionPreparationError::unavailable(
-                    AdmissionUnavailableSite::CollectedQInvalid,
-                )
+                AdmissionPreparationError::unavailable(AdmissionUnavailableSite::CollectedQInvalid)
             })?;
         let (_, effective) = self.refresh_candidate_with_custody_inner(
             pin,

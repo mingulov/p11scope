@@ -8387,10 +8387,7 @@ fn unavailable_admission_errors_carry_finite_site_labels() {
     let labeled = [
         (Site::RefreshTestSeam, "refresh_test_seam"),
         (Site::RefreshNoLive, "refresh_no_live"),
-        (
-            Site::RefreshFinishedOrGated,
-            "refresh_finished_or_gated",
-        ),
+        (Site::RefreshFinishedOrGated, "refresh_finished_or_gated"),
         (Site::RefreshCollectionIo, "refresh_collection_io"),
         (Site::RefreshFailed, "refresh_failed"),
         (Site::NoReceipt, "no_receipt"),

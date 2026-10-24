@@ -1686,6 +1686,16 @@ pub fn render_extra_strict(checks: &[Check]) -> String {
     out
 }
 
+/// Counter-mode capability footer for `p11scope doctor`: one line naming
+/// bpf_loop (helper 181) support. A footer, not a table row: the probed-row
+/// contract (pinned count, tier inputs, verdict gates) stays unchanged
+/// because this capability gates only counter preparation, never ordinary
+/// capture. The old-kernel refusal names the same token the footer carries.
+pub(crate) fn counter_modes_footer(_verdict: &crate::attach::BpfLoopVerdict) -> String {
+    // Stub: placeholder line until the real footer lands.
+    "stub\n".to_string()
+}
+
 /// `p11scope doctor`: probes, prints the table, returns the exit code.
 /// With `extra_strict`, any `Warn`/`Fail` row refuses (exit 1) and the
 /// render names every violating row; otherwise the default gated verdict
@@ -3199,6 +3209,37 @@ mod tests {
         assert!(
             out.lines().count() == 7,
             "one check must render five summary lines + one row + verdict: {out:?}"
+        );
+    }
+
+    #[test]
+    fn counter_modes_footer_names_availability_per_verdict() {
+        use crate::attach::BpfLoopVerdict;
+        for (verdict, marker) in [
+            (BpfLoopVerdict::Available, "available"),
+            (
+                BpfLoopVerdict::Unavailable("test old kernel".into()),
+                "counter-mode-unavailable-on-kernel",
+            ),
+            (
+                BpfLoopVerdict::Unknown("test no privilege".into()),
+                "unproven",
+            ),
+        ] {
+            let line = counter_modes_footer(&verdict);
+            assert!(line.starts_with("counter modes: "), "{line:?}");
+            assert!(line.ends_with('\n'), "{line:?}");
+            assert_eq!(line.lines().count(), 1, "{line:?}");
+            assert!(line.contains(marker), "{line:?}");
+        }
+        // The refusal token appears only on proven absence.
+        assert!(
+            !counter_modes_footer(&BpfLoopVerdict::Available)
+                .contains("counter-mode-unavailable-on-kernel")
+        );
+        assert!(
+            !counter_modes_footer(&BpfLoopVerdict::Unknown("x".into()))
+                .contains("counter-mode-unavailable-on-kernel")
         );
     }
 }

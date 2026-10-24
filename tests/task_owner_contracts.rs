@@ -88,3 +88,49 @@ fn production_counter_bank_owner_full_bound_cleanup_is_fail_closed() {
         );
     }
 }
+
+/// Timing-bank producer units over the actual C helpers: saturating add,
+/// exact maximum, ts-before-remove ordering and entry-write fences.
+/// Host-only; no BPF load, no attach.
+#[test]
+fn production_counter_bank_timing_helpers() {
+    let temporary = tempfile::tempdir().expect("counter timing test directory");
+    let binary = temporary.path().join("counter-bank-timing");
+    let output = Command::new("clang-18")
+        .args([
+            "-O2",
+            "-g",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-pthread",
+            "-DP11SCOPE_COUNTER_BANK_PROOF",
+            "-DP11SCOPE_BANK_MODE_LATENCY",
+            "-I",
+            "crates/ebpf/native",
+            "tests/fixtures/task-owner/helper_tests.c",
+            "-o",
+        ])
+        .arg(&binary)
+        .output()
+        .expect("compile actual counter-bank timing helpers");
+    assert!(
+        output.status.success(),
+        "native counter timing compile: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for selector in [
+        "bank_timing_add_saturates",
+        "bank_timing_max_exact_eight_and_contention",
+        "bank_timing_ts_before_remove",
+        "bank_timing_enter_writes_no_buckets",
+        "bank_timing_enter_stores_clock",
+    ] {
+        let output = Command::new(&binary).arg(selector).output().unwrap();
+        assert!(
+            output.status.success(),
+            "native counter timing {selector}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}

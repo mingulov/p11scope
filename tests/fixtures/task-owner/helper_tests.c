@@ -33,6 +33,11 @@ u64 controlled_add(u64 *cell, u64 delta);
 #define P11SCOPE_INSTANCE_HOST_TEST 1
 #include "instance_epoch.h"
 #include "instance_epoch.c"
+#ifdef P11SCOPE_BANK_MODE_LATENCY
+/* Timing bank producer under test: the actual C helpers run with the
+ * controlled_cas hook active above. Latency mode only. */
+#include "counter_bank_timing.c"
+#endif
 #endif
 #undef __sync_fetch_and_add
 #undef __sync_val_compare_and_swap
@@ -45,6 +50,10 @@ u64 controlled_add(u64 *cell, u64 delta);
 unsigned char START, DISCOVERY_STATE;
 #ifndef P11SCOPE_INVENTORY_ONLY
 unsigned char OBJECT_START, OBJECT_DESCRIPTORS, OBJECT_ZERO;
+#endif
+#ifdef P11SCOPE_BANK_MODE_LATENCY
+/* Map identities for the timing bank producer (extern in its TU). */
+unsigned char COUNTER_HEALTH, RV_COUNTS;
 #endif
 struct task_struct { int index; };
 static struct task_struct tasks[3] = {{0}, {1}, {2}};
@@ -71,6 +80,21 @@ static struct row rows[FIXTURE_ROW_BOUND];
 #ifdef P11SCOPE_COUNTER_BANK_PROOF
 static unsigned bank_loop_calls, bank_loop_error_on, bank_loop_short_on;
 static int bank_hide_start_slot;
+#endif
+#ifdef P11SCOPE_BANK_MODE_LATENCY
+/* Live inner stores for the timing-bank suites: one 512-cell inner per
+ * bank, sized for the latency value (the timestamps value is smaller). */
+static struct {
+    u32 live;
+    u32 pad;
+    unsigned char cells[512][296] __attribute__((aligned(8)));
+} bank_inners[16];
+static u64 bank_fault_cell;
+static u64 bank_health_cells[2];
+/* Models kernel use-after-delete: a removed START row's bytes are no
+ * longer readable. The ts-order suite arms it; a read-after-remove then
+ * observes zero instead of the retired timestamp. */
+static int scrub_start_on_delete;
 #endif
 #ifndef P11SCOPE_INVENTORY_ONLY
 static int fail_object_side_update, fail_object_side_delete, drop_zero_row, poison_zero_row;
@@ -139,6 +163,14 @@ static size_t key_size(void *map) {
     if (map == &OBJECT_START)
         return 16;
 #endif
+#ifdef P11SCOPE_BANK_MODE_LATENCY
+    if (map == &COUNTER_BANK_META || map == &COUNTER_BANK_FAULT)
+        return 4;
+    if (map == &COUNTER_BANK_COMMIT)
+        return 8;
+    if (map == &RV_COUNTS)
+        return 16;
+#endif
     return map == &START ? 16 : 24;
 }
 static struct row *row(void *map, const void *key)
@@ -151,6 +183,31 @@ static struct row *row(void *map, const void *key)
 static void *lookup(void *map, const void *key)
 {
     if (map == &OWNER_CTL) return &ctl;
+#ifdef P11SCOPE_BANK_MODE_LATENCY
+    if (map == &COUNTER_BANKS) {
+        u32 bank = *(const u32 *)key;
+        if (bank < 16 && bank_inners[bank].live)
+            return &bank_inners[bank];
+        return NULL;
+    }
+    if ((const unsigned char *)map >= (const unsigned char *)&bank_inners[0] &&
+        (const unsigned char *)map < (const unsigned char *)(&bank_inners[16])) {
+        /* Inner lookup: the outer lookup returned the live inner store. */
+        const unsigned char *base = (const unsigned char *)map;
+        unsigned bank = (unsigned)((base - (const unsigned char *)&bank_inners[0]) /
+                                   sizeof(bank_inners[0]));
+        u32 cell = *(const u32 *)key;
+        if (bank < 16 && bank_inners[bank].live && cell < 512)
+            return &bank_inners[bank].cells[cell];
+        return NULL;
+    }
+    if (map == &COUNTER_BANK_FAULT)
+        return *(const u32 *)key == 0 ? &bank_fault_cell : NULL;
+    if (map == &COUNTER_HEALTH) {
+        u32 disposition = *(const u32 *)key;
+        return disposition < 2 ? &bank_health_cells[disposition] : NULL;
+    }
+#endif
 #ifdef P11SCOPE_COUNTER_BANK_PROOF
     if (map == &START && bank_hide_start_slot >= 0 &&
         ((const struct owner_start_key *)key)->slot == (u32)bank_hide_start_slot)
@@ -196,6 +253,11 @@ static long update(void *map, const void *key, const void *data, u64 flags)
     else
 #endif
     if (map == &START) width = 288;
+#ifdef P11SCOPE_BANK_MODE_LATENCY
+    if (map == &COUNTER_BANK_META) width = 32;
+    else if (map == &COUNTER_BANK_COMMIT) width = 16;
+    else if (map == &COUNTER_BANK_FAULT || map == &RV_COUNTS) width = 8;
+#endif
     memcpy(r->value, data, width);
     return 0;
 }
@@ -225,6 +287,10 @@ static long pair_delete(void *map, const void *key)
     if (map == &START && fail_start_delete) return fail_start_delete;
     struct row *r = row(map, key);
     if (!r) return -2;
+#ifdef P11SCOPE_BANK_MODE_LATENCY
+    if (map == &START && scrub_start_on_delete)
+        memset(r->value, 0, 288);
+#endif
 #ifndef P11SCOPE_INVENTORY_ONLY
     if (map == &OBJECT_START) {
         memcpy(deleted_side, r->value, 432);
@@ -324,6 +390,12 @@ static void reset(void)
     bank_loop_calls = bank_loop_error_on = bank_loop_short_on = 0;
     bank_hide_start_slot = -1;
     owner_loop = controlled_owner_loop;
+#endif
+#ifdef P11SCOPE_BANK_MODE_LATENCY
+    memset(bank_inners, 0, sizeof(bank_inners));
+    bank_fault_cell = 0;
+    bank_health_cells[0] = bank_health_cells[1] = 0;
+    scrub_start_on_delete = 0;
 #endif
 #ifndef P11SCOPE_INVENTORY_ONLY
     fail_object_side_update = fail_object_side_delete = drop_zero_row = poison_zero_row = 0;
@@ -2431,6 +2503,160 @@ static void counter_bank_owner_incomplete_loops(void)
     for (unsigned i = 0; i < 432; i++)
         assert(row(&OBJECT_START, &high)->value[i] == 0xA5);
 }
+
+#ifdef P11SCOPE_BANK_MODE_LATENCY
+/* Publishes one live route for `slot` under `transaction`, with its commit
+ * and live inner. Mirrors every check the timing route() performs. */
+static void bank_publish_route(u32 slot, u64 transaction)
+{
+    u32 bank = slot >> 9, cell = slot & 511;
+    struct bank_route meta = {
+        .transaction = transaction, .first = 0, .end = 512,
+        .bank = bank, .cell = cell, .inner_id = 1, .reserved_zero = 0,
+    };
+    struct bank_commit commit = { .first = 0, .end = 512, .configuration = BANK_CONFIG };
+    assert(slot < 512);
+    assert(!update(&COUNTER_BANK_META, &slot, &meta, 1));
+    assert(!update(&COUNTER_BANK_COMMIT, &transaction, &commit, 1));
+    bank_inners[bank].live = 1;
+}
+
+static struct bank_inner_value *bank_cell(u32 slot)
+{
+    return (struct bank_inner_value *)&bank_inners[slot >> 9].cells[slot & 511];
+}
+
+/* Saturating add of a delta, mirroring counter_policy::add_counter_with. */
+static void bank_timing_add_saturates(void)
+{
+    reset();
+    u64 cell = ~0ULL - 1;
+    assert(bank_add(&cell, 2) == BANK_SATURATED && cell == ~0ULL);
+    assert(bank_add(&cell, 0) == BANK_ADDED && cell == ~0ULL);
+    assert(bank_add(&cell, 1) == BANK_SATURATED && cell == ~0ULL);
+    assert(!cas_attempts);
+    cell = 10;
+    assert(bank_add(&cell, 5) == BANK_ADDED && cell == 15);
+    /* Eight attempts, then contention: seven losses still succeed. */
+    cell = 100;
+    cas_interference_cell = &cell;
+    cas_failures_remaining = 7;
+    assert(bank_add(&cell, 4) == BANK_ADDED && cell == 105);
+    assert(cas_attempts == 8);
+    /* Eight losses exhaust the bound and report contention distinctly. */
+    cell = 100;
+    cas_failures_remaining = 8;
+    assert(bank_add(&cell, 4) == BANK_CONTENDED);
+    assert(cas_attempts == 16);
+    /* A contended add never applies its delta: only the interferer wrote. */
+    assert(cell == 100 && cell != 104);
+}
+
+/* Exact maximum with eight attempts and contention, mirroring
+ * counter_policy::max_counter_with. */
+static void bank_timing_max_exact_eight_and_contention(void)
+{
+    reset();
+    u64 cell = 10;
+    assert(bank_max(&cell, 25) == BANK_MAX_RAISED && cell == 25);
+    assert(!cas_attempts);
+    /* Covered candidates never write, even under armed interference. */
+    cas_interference_cell = &cell;
+    cas_failures_remaining = ~0U;
+    assert(bank_max(&cell, 25) == BANK_MAX_KEPT);
+    assert(bank_max(&cell, 9) == BANK_MAX_KEPT);
+    assert(cell == 25 && !cas_attempts);
+    /* Seven losses still raise on the eighth attempt. */
+    cas_failures_remaining = 7;
+    assert(bank_max(&cell, 40) == BANK_MAX_RAISED && cell == 40);
+    assert(cas_attempts == 8);
+    /* Eight losses exhaust the bound; the cell keeps its old maximum. */
+    cell = 25;
+    cas_failures_remaining = 8;
+    assert(bank_max(&cell, 40) == BANK_MAX_CONTENDED);
+    assert(cas_attempts == 16);
+    assert(cell == 25 && cell != 40);
+    /* A concurrent raise observed mid-retry is kept with no second CAS. */
+    cell = 10;
+    cas_failures_remaining = 1;
+    assert(bank_max(&cell, 11) == BANK_MAX_KEPT);
+    assert(cell == 11 && cas_attempts == 17);
+}
+
+/* The return path reads the entry timestamp BEFORE removing START. */
+static void bank_timing_ts_before_remove(void)
+{
+    reset(); object_setup();
+    scrub_start_on_delete = 1;
+    bank_publish_route(7, 1);
+    assert(!p11_bank_enter_timed(7, pid_tgid(), 1000));
+    struct owner_start_key key = start_key(7);
+    assert(p11_owner_start_get(&key, 1));
+    assert(bank_cell(7)->entered == 1);
+    assert(!p11_bank_complete_timed(7, pid_tgid(), 0, 1, 2500));
+    assert(!p11_owner_start_get(&key, 0));
+    assert(bank_cell(7)->returned == 1);
+    assert(bank_cell(7)->errors == 0);
+    assert(bank_cell(7)->total_ns == 1500);
+    assert(bank_cell(7)->max_ns == 1500);
+    assert(bank_cell(7)->buckets[bank_bucket(1500)] == 1);
+    for (unsigned b = 0; b < 32; b++)
+        if (b != bank_bucket(1500))
+            assert(bank_cell(7)->buckets[b] == 0);
+    assert(bank_fault_cell == 0);
+    assert(!bank_health_cells[0] && !bank_health_cells[1]);
+    struct bank_rv_key rv = { .slot = 7, .pad = 0, .rv = 0 };
+    u64 *rv_cell = lookup(&RV_COUNTS, &rv);
+    assert(rv_cell && *rv_cell == 1);
+    /* A backward clock saturates the delta instead of wrapping. */
+    assert(!p11_bank_enter_timed(7, pid_tgid(), 5000));
+    assert(!p11_bank_complete_timed(7, pid_tgid(), 0x204, 1, 1000));
+    assert(bank_cell(7)->returned == 2);
+    assert(bank_cell(7)->errors == 0);
+    assert(bank_cell(7)->total_ns == 1500);
+    assert(bank_cell(7)->max_ns == 1500);
+    assert(bank_cell(7)->buckets[0] == 1);
+    /* Absence is not settlement: nothing is accounted or faulted. */
+    assert(!p11_bank_complete_timed(7, pid_tgid(), 0, 1, 9999));
+    assert(bank_cell(7)->returned == 2);
+    assert(bank_fault_cell == 0);
+    /* An unscouted return retires START and faults scope, uncounted. */
+    assert(!p11_bank_enter_timed(7, pid_tgid(), 100));
+    assert(bank_cell(7)->entered == 3);
+    assert(!p11_bank_complete_timed(7, pid_tgid(), 0, 0, 200));
+    assert(!p11_owner_start_get(&key, 0));
+    assert(bank_cell(7)->returned == 2);
+    assert(bank_fault_cell == BANK_SCOPE_FAULT);
+    assert(!bank_health_cells[0] && !bank_health_cells[1]);
+}
+
+/* The entry root accounts entry only: latency buckets stay untouched. */
+static void bank_timing_enter_writes_no_buckets(void)
+{
+    reset(); object_setup();
+    bank_publish_route(7, 1);
+    assert(!p11_bank_enter_timed(7, pid_tgid(), 1000));
+    assert(bank_cell(7)->entered == 1);
+    assert(bank_cell(7)->returned == 0);
+    assert(bank_cell(7)->total_ns == 0);
+    assert(bank_cell(7)->max_ns == 0);
+    for (unsigned b = 0; b < 32; b++)
+        assert(bank_cell(7)->buckets[b] == 0);
+    assert(bank_fault_cell == 0);
+}
+
+/* The entry root stores the clock value it was given. */
+static void bank_timing_enter_stores_clock(void)
+{
+    reset(); object_setup();
+    bank_publish_route(7, 1);
+    assert(!p11_bank_enter_timed(7, pid_tgid(), 424242));
+    struct owner_start_key key = start_key(7);
+    unsigned char *row = p11_owner_start_get(&key, 1);
+    assert(row);
+    assert(*(u64 *)(row + OBJECT_CALL_START_TS_OFF) == 424242);
+}
+#endif
 #endif
 #ifdef P11SCOPE_INVENTORY_ONLY
 static void inventory_contract(void)
@@ -2508,6 +2734,13 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[1], "counter_bank_owner_start_failures")) counter_bank_owner_start_failures();
         else if (!strcmp(argv[1], "counter_bank_owner_orphan_failures")) counter_bank_owner_orphan_failures();
         else if (!strcmp(argv[1], "counter_bank_owner_incomplete_loops")) counter_bank_owner_incomplete_loops();
+#endif
+#ifdef P11SCOPE_BANK_MODE_LATENCY
+        else if (!strcmp(argv[1], "bank_timing_add_saturates")) bank_timing_add_saturates();
+        else if (!strcmp(argv[1], "bank_timing_max_exact_eight_and_contention")) bank_timing_max_exact_eight_and_contention();
+        else if (!strcmp(argv[1], "bank_timing_ts_before_remove")) bank_timing_ts_before_remove();
+        else if (!strcmp(argv[1], "bank_timing_enter_writes_no_buckets")) bank_timing_enter_writes_no_buckets();
+        else if (!strcmp(argv[1], "bank_timing_enter_stores_clock")) bank_timing_enter_stores_clock();
 #endif
         else assert(0);
     } else {

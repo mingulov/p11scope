@@ -15,7 +15,7 @@ use aya::programs::tp_btf::BtfTracePointLinkId;
 use aya::programs::uprobe::{UProbeAttachLocation, UProbeAttachPoint, UProbeLinkId, UProbeScope};
 use aya::programs::{BtfTracePoint, RawTracePoint, UProbe};
 use aya::{Btf, Ebpf, EbpfLoader};
-use p11scope_bpf_multi::{GroupHalt, attach_group, bisect_attach};
+use p11scope_bpf_multi::{BPF_PROG_LOAD, BPF_PROG_TYPE_KPROBE, GroupHalt, attach_group, bisect_attach};
 use p11scope_ebpf_common::object_wire::{ObjectDescriptorWire, publish_object_descriptors};
 use p11scope_ebpf_common::{
     ARG_NONE, CounterMode, DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES,
@@ -39,7 +39,7 @@ use std::fs::File;
 use std::io;
 use std::mem::size_of_val;
 use std::num::{NonZeroU32, NonZeroU64};
-use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -1091,6 +1091,122 @@ pub(crate) fn multi_functional_probe() -> std::result::Result<(), String> {
     )
     .map(drop)
     .map_err(|error| format!("linking the scratch uprobe-multi probe: {error}"))
+}
+
+/// Verdict of the functional bpf_loop (helper 181) probe that gates counter
+/// preparation: the 8192 owner cleanup calls helper 181, first shipped in
+/// Linux 5.17. Proven by loading a minimal program that calls it, never by
+/// the kernel version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BpfLoopVerdict {
+    /// The probe program loaded: counter bank objects can load here.
+    Available,
+    /// A control program loaded but the bpf_loop program was rejected:
+    /// this kernel cannot run counter bank objects.
+    Unavailable(String),
+    /// Neither outcome was proven (no BPF privilege, unexpected errors):
+    /// preparation proceeds and the real load reports its own failure.
+    Unknown(String),
+}
+
+/// Minimal bpf_loop probe call: `bpf_loop(1, callback, stack_slot, 0)` with
+/// a trivial callback, then exit 0. Eleven instructions; the callback sits
+/// at slot 9 and the pseudo-func offset reads 9-1-1 = 7, the PC-relative
+/// convention the compiler emits for callbacks (checked against clang-18
+/// BPF output and round-tripped through the disassembler).
+static BPF_LOOP_PROBE_INSNS: [u8; 88] = [0; 88];
+
+/// Control load: `r0 = 0; exit`, the same two-instruction shape as the
+/// multi scratch control. Plain kprobe type with no attach type, so it
+/// loads on every kernel back to the 5.15 floor when BPF privilege holds
+/// (the multi scratch's attach type 48 is itself rejected there).
+static BPF_LOOP_CONTROL_INSNS: [u8; 16] = [0; 16];
+
+/// Kernel-visible probe names (bpftool inventory). Underscores, not dashes:
+/// the kernel rejects `-` in object names with a logless EINVAL.
+const BPF_LOOP_PROBE_NAME: &str = "p11scope_bpf181";
+const BPF_LOOP_CONTROL_NAME: &str = "p11scope_bpfctl";
+
+/// `BPF_PROG_LOAD` attr, the same 152-byte shape as the multi scratch
+/// loader (field offsets verified against `linux/bpf.h` there). Duplicated
+/// rather than shared: that loader is multi-typed and cannot serve as the
+/// 5.15-floor control.
+#[repr(C)]
+struct BpfLoopProgAttr {
+    prog_type: u32,
+    insn_cnt: u32,
+    insns: u64,
+    license: u64,
+    log_level: u32,
+    log_size: u32,
+    log_buf: u64,
+    kern_version: u32,
+    prog_flags: u32,
+    prog_name: [u8; 16],
+    prog_ifindex: u32,
+    expected_attach_type: u32,
+    prog_btf_fd: u32,
+    func_info_rec_size: u32,
+    func_info: u64,
+    func_info_cnt: u32,
+    line_info_rec_size: u32,
+    line_info: u64,
+    line_info_cnt: u32,
+    attach_btf_id: u32,
+    attach_prog_fd: u32,
+    core_relo_cnt: u32,
+    fd_array: u64,
+    core_relos: u64,
+    core_relo_rec_size: u32,
+    log_true_size: u32,
+    prog_token_fd: i32,
+    fd_array_cnt: u32,
+}
+
+// UAPI layout, checked at compile time in every profile: a drift must fail
+// the build that loads BPF, not only a debug run.
+const _: () = assert!(size_of::<BpfLoopProgAttr>() == 152);
+const _: () = assert!(std::mem::offset_of!(BpfLoopProgAttr, prog_name) == 48);
+const _: () = assert!(std::mem::offset_of!(BpfLoopProgAttr, expected_attach_type) == 68);
+const _: () = assert!(std::mem::offset_of!(BpfLoopProgAttr, prog_btf_fd) == 72);
+const _: () = assert!(BPF_LOOP_PROBE_INSNS.len().is_multiple_of(8));
+const _: () = assert!(BPF_LOOP_CONTROL_INSNS.len().is_multiple_of(8));
+const _: () = assert!(BPF_LOOP_PROBE_NAME.len() < 16);
+const _: () = assert!(BPF_LOOP_CONTROL_NAME.len() < 16);
+
+/// Load one probe program (plain kprobe type, never attached): the fd drops
+/// at the caller, unloading it. No verifier log: the differential verdict
+/// (control vs probe errno) diagnoses the failure, like the scratch
+/// loader's errno-only diagnosis.
+fn bpf_loop_prog_load(_insns: &[u8], _name: &str) -> io::Result<OwnedFd> {
+    // Stub: a synthetic error with no OS code until the real loader lands.
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "bpf_loop probe loader stub",
+    ))
+}
+
+/// Pure differential verdict over the two probe loads, so the EINVAL rule
+/// is unit-testable: a loaded probe proves availability outright; a
+/// rejected probe proves absence only when the control loaded (otherwise
+/// privilege or the environment, not the kernel, refused); anything
+/// unexpected defers to the real load instead of claiming absence.
+pub(crate) fn classify_bpf_loop_probe(
+    _control: &io::Result<()>,
+    _probe: &io::Result<()>,
+) -> BpfLoopVerdict {
+    // Stub: always unproven until the real classifier lands.
+    BpfLoopVerdict::Unknown("bpf_loop probe classifier stub".into())
+}
+
+/// Functional bpf_loop (helper 181) probe: a control no-op load plus a
+/// minimal bpf_loop-calling load. Neither program is ever attached; both
+/// fds drop before return, unloading them.
+pub(crate) fn kernel_bpf_loop_probe() -> BpfLoopVerdict {
+    let control =
+        bpf_loop_prog_load(&BPF_LOOP_CONTROL_INSNS, BPF_LOOP_CONTROL_NAME).map(|_| ());
+    let probe = bpf_loop_prog_load(&BPF_LOOP_PROBE_INSNS, BPF_LOOP_PROBE_NAME).map(|_| ());
+    classify_bpf_loop_probe(&control, &probe)
 }
 
 /// First backend attempted for a classic session, decided by functional
@@ -16917,5 +17033,118 @@ mod tests {
         session.mint_native_completion()?;
         eprintln!("retirement-cell partial: terminal detach closed both and minted");
         Ok(())
+    }
+
+    #[test]
+    fn bpf_loop_probe_bytes_have_exact_shape() {
+        assert_eq!(BPF_LOOP_PROBE_INSNS.len(), 88);
+        assert_eq!(BPF_LOOP_CONTROL_INSNS.len(), 16);
+        // r1 = 1 (nr_loops).
+        assert_eq!(
+            &BPF_LOOP_PROBE_INSNS[0..8],
+            &[0xb7, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00]
+        );
+        // ld_imm64 r2, pseudo-func (src 4), offset 9-1-1 = 7.
+        assert_eq!(
+            &BPF_LOOP_PROBE_INSNS[8..24],
+            &[
+                0x18, 0x42, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, //
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+            ]
+        );
+        // r3 = r10; r3 += -8 (stack ctx).
+        assert_eq!(
+            &BPF_LOOP_PROBE_INSNS[24..40],
+            &[
+                0xbf, 0xa3, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+                0x07, 0x03, 0x00, 0x00, 0xf8, 0xff, 0xff, 0xff, //
+            ]
+        );
+        // r4 = 0 (flags); call 181.
+        assert_eq!(
+            &BPF_LOOP_PROBE_INSNS[40..56],
+            &[
+                0xb7, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+                0x85, 0x00, 0x00, 0x00, 0xb5, 0x00, 0x00, 0x00, //
+            ]
+        );
+        // r0 = 0; exit; callback r0 = 0; exit.
+        assert_eq!(
+            &BPF_LOOP_PROBE_INSNS[56..88],
+            &[
+                0xb7, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+                0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+                0xb7, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+                0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+            ]
+        );
+        assert_eq!(BPF_LOOP_CONTROL_INSNS[0], 0xb7, "MOV64_IMM r0, 0");
+        assert_eq!(BPF_LOOP_CONTROL_INSNS[8], 0x95, "EXIT");
+        for name in [BPF_LOOP_PROBE_NAME, BPF_LOOP_CONTROL_NAME] {
+            assert!(name.len() < 16);
+            assert!(
+                name.bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'.'),
+                "kernel object-name charset: {name}"
+            );
+        }
+        assert_eq!(size_of::<BpfLoopProgAttr>(), 152);
+        assert_eq!(std::mem::offset_of!(BpfLoopProgAttr, expected_attach_type), 68);
+        assert_eq!(std::mem::offset_of!(BpfLoopProgAttr, prog_btf_fd), 72);
+        // UAPI numbers (linux/bpf.h): PROG_LOAD is 5, KPROBE is 2.
+        assert_eq!(BPF_PROG_LOAD, 5);
+        assert_eq!(BPF_PROG_TYPE_KPROBE, 2);
+    }
+
+    #[test]
+    fn bpf_loop_probe_classification_proves_absence_or_defers() {
+        use std::io;
+        let os = io::Error::from_raw_os_error;
+        // A loaded probe proves availability, even if the control failed.
+        for control in [Ok(()), Err(os(libc::EPERM))] {
+            assert_eq!(
+                classify_bpf_loop_probe(&control, &Ok(())),
+                BpfLoopVerdict::Available
+            );
+        }
+        // Control loads but the probe is rejected: absence proven.
+        match classify_bpf_loop_probe(&Ok(()), &Err(os(libc::EINVAL))) {
+            BpfLoopVerdict::Unavailable(detail) => {
+                assert!(detail.contains("helper 181"), "{detail}");
+                assert!(detail.contains("5.17"), "{detail}");
+            }
+            verdict => panic!("expected Unavailable, got {verdict:?}"),
+        }
+        // Control loads but the probe fails unexpectedly: defer, never claim.
+        match classify_bpf_loop_probe(&Ok(()), &Err(os(libc::EPERM))) {
+            BpfLoopVerdict::Unknown(detail) => assert!(detail.contains("unexpectedly"), "{detail}"),
+            verdict => panic!("expected Unknown, got {verdict:?}"),
+        }
+        // A failed control proves nothing about the kernel either way.
+        for errno in [libc::EPERM, libc::EACCES, libc::ENOSYS] {
+            match classify_bpf_loop_probe(&Err(os(errno)), &Err(os(libc::EINVAL))) {
+                BpfLoopVerdict::Unknown(detail) => assert!(detail.contains("unproven"), "{detail}"),
+                verdict => panic!("expected Unknown for errno {errno}, got {verdict:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn bpf_loop_probe_loader_reaches_the_kernel() {
+        // Privileged lane: loads and drops. Anywhere else the kernel still
+        // answers (EPERM/ENOSYS/...); only local validation would surface a
+        // non-OS error, and there is none on this path.
+        for (insns, name) in [
+            (&BPF_LOOP_CONTROL_INSNS[..], BPF_LOOP_CONTROL_NAME),
+            (&BPF_LOOP_PROBE_INSNS[..], BPF_LOOP_PROBE_NAME),
+        ] {
+            match bpf_loop_prog_load(insns, name) {
+                Ok(_) => {}
+                Err(error) => assert!(
+                    error.raw_os_error().is_some(),
+                    "{name} load must reach the kernel: {error}"
+                ),
+            }
+        }
     }
 }

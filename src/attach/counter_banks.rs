@@ -1,7 +1,7 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! Private Counts publication, retained native custody and charged collection.
 
-use super::{CapturePolicy, Scope, Session};
+use super::{BpfLoopVerdict, CapturePolicy, Scope, Session};
 use crate::discovery::identity::{PinnedObjects, RetainedInventoryTarget};
 use crate::plan::{AttachKey, AttachPlan, Slot};
 use crate::semantics_edge::resources::{
@@ -1406,6 +1406,28 @@ impl<'a> CounterPreparation<'a> {
         reserve: &SemanticResourceReserver,
         backend: super::AttachBackend,
     ) -> Result<Self> {
+        Self::new_with_backend_and_probe(
+            object,
+            envelope,
+            reserve,
+            backend,
+            super::kernel_bpf_loop_probe,
+        )
+    }
+
+    fn new_with_backend_and_probe(
+        object: &'a [u8],
+        envelope: BankReservation,
+        reserve: &SemanticResourceReserver,
+        backend: super::AttachBackend,
+        probe: impl FnOnce() -> BpfLoopVerdict,
+    ) -> Result<Self> {
+        // The 8192 owner cleanup calls helper 181 (bpf_loop, Linux 5.17+):
+        // a kernel proven to lack it cannot run counter bank objects, so
+        // preparation refuses before charging anything. An unproven probe
+        // (no BPF privilege, unexpected errors) defers to the real load.
+        // Stub: the probe verdict is dropped until the refusal lands.
+        let _ = probe();
         ensure!(
             env!("P11SCOPE_COUNTER_BANK_PROOF_ENABLED") == "1",
             "private Counts bank artifact was not selected at build time"
@@ -6766,5 +6788,184 @@ pub(crate) mod tests {
             ),
             "a timestamps-shaped map cannot relabel this Counts preparation"
         );
+    }
+
+    #[test]
+    fn counter_preparation_refuses_when_bpf_loop_is_absent() {
+        use super::super::{AttachBackend, BpfLoopVerdict};
+        let pool = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
+        let baseline = pool.snapshot().charged_bytes;
+        // Garbage bytes: the kernel refusal precedes parsing entirely.
+        let refused = CounterPreparation::new_with_backend_and_probe(
+            b"not an ELF object",
+            reservation(),
+            &pool.reserver(),
+            AttachBackend::Singles,
+            || BpfLoopVerdict::Unavailable("test kernel lacks helper 181".into()),
+        );
+        let Err(error) = refused else {
+            panic!("kernel refusal must fail");
+        };
+        let text = format!("{error:#}");
+        assert!(
+            text.starts_with("counter-mode-unavailable-on-kernel:"),
+            "{text}"
+        );
+        assert!(text.contains("helper 181"), "{text}");
+        assert_eq!(pool.snapshot().charged_bytes, baseline);
+        // An unproven probe defers: some later gate refuses, never the
+        // kernel token, and nothing stays charged.
+        for verdict in [
+            BpfLoopVerdict::Available,
+            BpfLoopVerdict::Unknown("test control load failed".into()),
+        ] {
+            let charged = pool.snapshot().charged_bytes;
+            let result = CounterPreparation::new_with_backend_and_probe(
+                b"not an ELF object",
+                reservation(),
+                &pool.reserver(),
+                AttachBackend::Singles,
+                || verdict,
+            );
+            let Err(error) = result else {
+                panic!("deferred preparation of garbage bytes must fail");
+            };
+            let text = format!("{error:#}");
+            assert!(
+                !text.contains("counter-mode-unavailable-on-kernel"),
+                "must defer past the kernel gate: {text}"
+            );
+            assert_eq!(pool.snapshot().charged_bytes, charged);
+        }
+    }
+
+    /// The C producer's bucket index must equal the shared `bucket_of` over
+    /// the full equality boundary set, in both timing modes.
+    #[test]
+    fn counter_bank_bucket_matches_bucket_of() {
+        use p11scope_ebpf_common::bucket_of;
+        use std::collections::BTreeSet;
+        use std::process::Command;
+        let mut inputs = BTreeSet::from([0u64, u64::MAX]);
+        for shift in 0..64u32 {
+            let power = 1u64 << shift;
+            inputs.insert(power - 1);
+            inputs.insert(power);
+            inputs.insert(power + 1);
+        }
+        let inputs: Vec<u64> = inputs.into_iter().collect();
+        assert_eq!(
+            inputs.len(),
+            190,
+            "boundary set dedups only the small-k overlaps"
+        );
+        let temporary = tempfile::tempdir().expect("counter bucket probe directory");
+        for mode in ["TIMESTAMPS", "LATENCY"] {
+            let binary = temporary.path().join(format!("bank-bucket-{mode}"));
+            let mode_flag = format!("-DP11SCOPE_BANK_MODE_{mode}");
+            let output = Command::new("clang-18")
+                .arg(&mode_flag)
+                .args([
+                    "-O2",
+                    "-g",
+                    "-Wall",
+                    "-Wextra",
+                    "-Werror",
+                    "-DP11SCOPE_COUNTER_BANK_PROOF",
+                    "-I",
+                    "crates/ebpf/native",
+                    "tests/fixtures/task-owner/bank_bucket_probe.c",
+                    "-o",
+                ])
+                .arg(&binary)
+                .output()
+                .expect("compile actual bank_bucket producer");
+            assert!(
+                output.status.success(),
+                "native {mode} bucket compile: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let hex: Vec<String> = inputs.iter().map(|value| format!("{value:x}")).collect();
+            let output = Command::new(&binary)
+                .args(&hex)
+                .output()
+                .expect("run actual bank_bucket producer");
+            assert!(
+                output.status.success(),
+                "native {mode} bucket run: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8(output.stdout).expect("bucket lines are text");
+            let buckets: Vec<u32> = stdout
+                .lines()
+                .map(|line| line.parse().expect("bucket index per line"))
+                .collect();
+            assert_eq!(buckets.len(), inputs.len());
+            for (input, actual) in inputs.iter().zip(buckets) {
+                assert_eq!(
+                    actual,
+                    bucket_of(*input),
+                    "C bank_bucket({input:#x}) in {mode} mode"
+                );
+            }
+        }
+    }
+
+    /// Bank roots never touch the legacy per-slot aggregate map: the timing
+    /// producer must not even name it. (The counts twin is pinned the same
+    /// way by the object checker; timing profiles land with the checker.)
+    #[test]
+    fn counter_bank_timing_roots_never_touch_stats() {
+        let source = std::fs::read_to_string("crates/ebpf/native/counter_bank_timing.c")
+            .expect("timing bank producer source");
+        assert!(
+            !source.contains("STATS"),
+            "timing producer must not name the legacy aggregate map"
+        );
+    }
+
+    /// 5.15 refusal cell: without helper 181, counter preparation refuses
+    /// with the kernel token before parsing or charging anything. Runs on
+    /// pre-5.17 kernels with BPF privilege; the 6.1/6.6/host positive side
+    /// is the existing growth cells, which must keep passing unmodified.
+    #[test]
+    #[ignore = "requires P11SCOPE_COUNTER_BANK_PROOF=1, BPF privilege and a pre-5.17 kernel"]
+    fn counter_preparation_refuses_without_bpf_loop_on_old_kernels() {
+        use super::super::BpfLoopVerdict;
+        assert_eq!(env!("P11SCOPE_COUNTER_BANK_PROOF_ENABLED"), "1");
+        assert_eq!(
+            env!("P11SCOPE_COUNTER_BANK_PROOF_OUTPUTS"),
+            "counts-bank-growth-v2"
+        );
+        // Wrong kernel for this cell fails loud here, never as a vacuous pass.
+        assert!(
+            matches!(
+                super::super::kernel_bpf_loop_probe(),
+                BpfLoopVerdict::Unavailable(_)
+            ),
+            "this refusal cell runs only where the kernel lacks helper 181"
+        );
+        let path = std::path::Path::new(env!("OUT_DIR"))
+            .join("counter-bank-growth-v2")
+            .join("p11scope-ebpf-counts-bank-growth-v2");
+        let bytes = std::fs::read(path).expect("compile the actual selected format2 artifact");
+        let pool = SemanticResourcePool::reference_limit(4 * 1024 * 1024 * 1024);
+        let baseline = pool.snapshot().charged_bytes;
+        let envelope = BankReservation {
+            retained_bytes: 1024 * 1024 * 1024,
+            transient_bytes: 512 * 1024 * 1024,
+            metadata_bytes: 64 * 1024 * 1024,
+            file_descriptors: 1_048_576,
+        };
+        let refused = CounterPreparation::new(&bytes, envelope, &pool.reserver());
+        let Err(error) = refused else {
+            panic!("old-kernel preparation must refuse");
+        };
+        let text = format!("{error:#}");
+        assert!(
+            text.starts_with("counter-mode-unavailable-on-kernel:"),
+            "{text}"
+        );
+        assert_eq!(pool.snapshot().charged_bytes, baseline);
     }
 }

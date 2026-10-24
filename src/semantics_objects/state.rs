@@ -3724,14 +3724,8 @@ mod tests {
                 curve: SafeCurve::Secp256r1
             })
         );
-        let unknown_class = established_with(&[
-            (KeyType, scalar(0x1f)),
-            (ValueLen, scalar(32)),
-        ]);
-        assert_eq!(
-            unknown_class.label(),
-            Some(KeyLabel::Aes { value_len: 32 })
-        );
+        let unknown_class = established_with(&[(KeyType, scalar(0x1f)), (ValueLen, scalar(32))]);
+        assert_eq!(unknown_class.label(), Some(KeyLabel::Aes { value_len: 32 }));
     }
 
     // Failure twin: a conflicting class withholds the combined label.
@@ -3739,10 +3733,7 @@ mod tests {
     fn combined_label_withheld_on_class_conflict() {
         use SafeAttributeKind::*;
         let conflicted = established_with(&[
-            (
-                Class,
-                FieldState::Conflict(Some(FieldValue::Scalar(4))),
-            ),
+            (Class, FieldState::Conflict(Some(FieldValue::Scalar(4)))),
             (KeyType, scalar(0x1f)),
             (ValueLen, scalar(16)),
         ]);

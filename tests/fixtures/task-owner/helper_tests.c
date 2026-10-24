@@ -2507,15 +2507,16 @@ static void counter_bank_owner_incomplete_loops(void)
 #ifdef P11SCOPE_BANK_MODE_LATENCY
 /* Publishes one live route for `slot` under `transaction`, with its commit
  * and live inner. Mirrors every check the timing route() performs. */
-static void bank_publish_route(u32 slot, u64 transaction)
+static void bank_publish_route(u32 slot, u64 transaction, u32 first, u32 end)
 {
     u32 bank = slot >> 9, cell = slot & 511;
     struct bank_route meta = {
-        .transaction = transaction, .first = 0, .end = 512,
+        .transaction = transaction, .first = first, .end = end,
         .bank = bank, .cell = cell, .inner_id = 1, .reserved_zero = 0,
     };
-    struct bank_commit commit = { .first = 0, .end = 512, .configuration = BANK_CONFIG };
-    assert(slot < 512);
+    struct bank_commit commit = { .first = first, .end = end, .configuration = BANK_CONFIG };
+    assert(first < end && end <= 8192);
+    assert(slot >= first && slot < end);
     assert(!update(&COUNTER_BANK_META, &slot, &meta, 1));
     assert(!update(&COUNTER_BANK_COMMIT, &transaction, &commit, 1));
     bank_inners[bank].live = 1;
@@ -2588,7 +2589,7 @@ static void bank_timing_ts_before_remove(void)
 {
     reset(); object_setup();
     scrub_start_on_delete = 1;
-    bank_publish_route(7, 1);
+    bank_publish_route(7, 1, 0, 512);
     assert(!p11_bank_enter_timed(7, pid_tgid(), 1000));
     struct owner_start_key key = start_key(7);
     assert(p11_owner_start_get(&key, 1));
@@ -2628,13 +2629,29 @@ static void bank_timing_ts_before_remove(void)
     assert(bank_cell(7)->returned == 2);
     assert(bank_fault_cell == BANK_SCOPE_FAULT);
     assert(!bank_health_cells[0] && !bank_health_cells[1]);
+    /* Bank-1 geometry: extent 512..1024 routes slot 513 to bank 1, cell 1. */
+    reset(); object_setup();
+    scrub_start_on_delete = 1;
+    bank_publish_route(513, 2, 512, 1024);
+    assert(!p11_bank_enter_timed(513, pid_tgid(), 2000));
+    key = start_key(513);
+    assert(p11_owner_start_get(&key, 1));
+    assert(bank_cell(513)->entered == 1);
+    assert(!p11_bank_complete_timed(513, pid_tgid(), 0, 1, 3500));
+    assert(!p11_owner_start_get(&key, 0));
+    assert(bank_cell(513)->returned == 1);
+    assert(bank_cell(513)->errors == 0);
+    assert(bank_cell(513)->total_ns == 1500);
+    assert(bank_cell(513)->max_ns == 1500);
+    assert(bank_fault_cell == 0);
+    assert(!bank_health_cells[0] && !bank_health_cells[1]);
 }
 
 /* The entry root accounts entry only: latency buckets stay untouched. */
 static void bank_timing_enter_writes_no_buckets(void)
 {
     reset(); object_setup();
-    bank_publish_route(7, 1);
+    bank_publish_route(7, 1, 0, 512);
     assert(!p11_bank_enter_timed(7, pid_tgid(), 1000));
     assert(bank_cell(7)->entered == 1);
     assert(bank_cell(7)->returned == 0);
@@ -2649,7 +2666,7 @@ static void bank_timing_enter_writes_no_buckets(void)
 static void bank_timing_enter_stores_clock(void)
 {
     reset(); object_setup();
-    bank_publish_route(7, 1);
+    bank_publish_route(7, 1, 0, 512);
     assert(!p11_bank_enter_timed(7, pid_tgid(), 424242));
     struct owner_start_key key = start_key(7);
     unsigned char *row = p11_owner_start_get(&key, 1);

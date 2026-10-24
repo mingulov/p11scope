@@ -134,3 +134,56 @@ fn production_counter_bank_timing_helpers() {
         );
     }
 }
+
+/// Timing producer compiles warning-free in both modes under the exact BPF
+/// object flags, so a caller-less mode can never rot. Host-only; emits LLVM
+/// bitcode to a temp dir, no BPF load, no attach.
+#[test]
+fn production_counter_bank_timing_producer_compiles_in_both_modes() {
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    let temporary = tempfile::tempdir().expect("counter timing modes directory");
+    let target = if cfg!(target_endian = "big") {
+        "bpfeb"
+    } else {
+        "bpfel"
+    };
+    let prefix = format!("-ffile-prefix-map={manifest}=/p11scope");
+    let source = format!("{manifest}/crates/ebpf/native/counter_bank_timing.c");
+    for mode in ["TIMESTAMPS", "LATENCY"] {
+        let output_name = format!("counter_bank_timing-{mode}.bc");
+        let output_path = temporary.path().join(&output_name);
+        let mode_flag = format!("-DP11SCOPE_BANK_MODE_{mode}");
+        let output = Command::new("clang-18")
+            .current_dir(temporary.path())
+            .args([
+                "-target",
+                target,
+                "-O2",
+                "-g",
+                "-gno-record-gcc-switches",
+                "-fdebug-compilation-dir=/p11scope/native",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-emit-llvm",
+                "-c",
+            ])
+            .arg(&prefix)
+            .arg(&source)
+            .arg("-DP11SCOPE_COUNTER_BANK_PROOF")
+            .arg(&mode_flag)
+            .arg("-o")
+            .arg(&output_name)
+            .output()
+            .expect("compile timing producer unit");
+        assert!(
+            output.status.success(),
+            "native {mode} producer compile: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output_path.exists(),
+            "native {mode} producer bitcode emitted"
+        );
+    }
+}

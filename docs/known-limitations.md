@@ -609,6 +609,11 @@ capture behavior or establish the provenance of its input files.
 
 ### Leader-exit and exec-chain callers under `--system` stay unattributed (DR-05)
 
+- Development checkpoint: discovery can classify a zombie-leader group as
+  exited even while a surviving thread runs, and omit that group from its
+  membership result. `--system` remains a preview; an absent group does not
+  prove that its provider use or surviving threads have ended. Complete
+  live-group inventory is not supported by this checkpoint.
 - What the user sees: a process whose thread-group leader has exited while
   other threads keep running (a zombie leader) is never admitted as a
   caller: it has no `callers[]` record and no edge, and its provider use
@@ -624,9 +629,10 @@ capture behavior or establish the provenance of its input files.
   (`rows`, `reasons`), `observation.native_witnesses.unbound_reasons`, and
   the per-pass `unbound_rows` of the event stream. No pid is named and no
   watch or positive claim is made for these processes.
-- Workaround: none for attribution; the module-level use is exact.
-- Planned: v0.3.0 (exact image identity, I2c; a zombie-leader admission
-  path that pins a live thread).
+- Workaround: none for complete caller coverage. Module-level observations
+  describe captured rows; they do not establish coverage of an omitted group.
+- Future work: retained live-member identity and zombie-leader admission;
+  outside this intermediate checkpoint.
 
 ### Pre-admission use voids the watch (R-C51-1)
 

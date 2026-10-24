@@ -3144,6 +3144,7 @@ mod tests {
         run.step(512);
         if final_count == GROWTH_ENDPOINTS {
             run.grow(GROWTH_ENDPOINTS);
+            assert_native_growth_backend(&run.session, backend, true);
             assert_eq!(run.held_start(), held);
             run.checkpoint();
             run.step(8191);
@@ -3229,5 +3230,11 @@ mod tests {
     #[ignore = "requires prebuilt LP64 growth fixtures and separate FD/memory/native admission for 8192 distinct endpoints after the boundary pilot"]
     fn counter_bank_session_useful_8192_counts_growth_lp64() {
         native_growth_population(8192);
+    }
+
+    #[test]
+    #[ignore = "requires prebuilt LP64 growth fixtures, selected format2 object, and separate FD/memory/native admission for 8192 distinct endpoints after the qualified Multi513 pilot"]
+    fn counter_bank_session_useful_8192_counts_growth_multi_lp64() {
+        native_growth_population_with_backend(8192, crate::attach::AttachBackend::Multi);
     }
 }

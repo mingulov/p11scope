@@ -2143,6 +2143,36 @@ class StoppedCanaryCaptureTests(unittest.TestCase):
                 self.assertIn('kernel', str(raised.exception))
                 self.assertFalse(config.observer_log.exists())
 
+    def test_ready_bound_unknown_kernel_run_prints_no_declaration(self):
+        # Twin of the refusal-before-launch test at the operator surface:
+        # a refused run must not declare a bound on stdout, while the
+        # refusal reason still reaches the operator on stderr with a
+        # nonzero exit. Refusal happens before config validation, so the
+        # argv below only needs to parse.
+        for release in ('5.4.0-ready-bound-test', '6.5.0-ready-bound-test'):
+            with self.subTest(release=release), tempfile.TemporaryDirectory() as directory:
+                lane = 'aggregate-only-metrics'
+                prefix = str(Path(directory) / lane)
+                argv = ['--lane', lane, '--variant', 'default', '--mode', 'metrics',
+                       '--privacy', 'aggregate-only', '--workload-mode', 'matrix',
+                       '--out-dir', directory, '--prefix', prefix,
+                       '--ready', f'{prefix}.ready', '--go', f'{prefix}.go',
+                       '--done', f'{prefix}.done', '--finish', f'{prefix}.finish',
+                       '--observer-log', f'{prefix}.observer.log',
+                       '--workload-log', f'{prefix}.workload.log',
+                       '--reader', sys.executable, '--obj', sys.executable,
+                       '--target-bits', '64', '--workload-pid', str(os.getpid()),
+                       '--generation', '1', '--', sys.executable, '-c', 'pass']
+                out, err = io.StringIO(), io.StringIO()
+                with kernel_release(release), \
+                        contextlib.redirect_stdout(out), \
+                        contextlib.redirect_stderr(err):
+                    status = capture.main(argv)
+                self.assertEqual(status, 1)
+                self.assertNotIn('CANARY_READY_BOUND_DECLARED', out.getvalue())
+                self.assertIn('kernel', err.getvalue())
+                self.assertIn(release, err.getvalue())
+
     def ready_bound_probe(self, spec, timeout):
         """ready_bound_case driver with a guard beyond probe()'s 12 s.
 

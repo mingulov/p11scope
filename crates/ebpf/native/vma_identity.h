@@ -86,20 +86,27 @@ _Static_assert(__builtin_offsetof(struct p11_anchor_entry, gen) == 8, "entry gen
 /* `config[0]`: observer addresses and counters only, never kernel pointers.
  * The anchor run is always per-pid on the observer: the anchor program
  * installs only for the task whose tgid matches `observer_tgid` and skips
- * every other task, so a wrong-scope walk cannot install foreign inodes. */
+ * every other task, so a wrong-scope walk cannot install foreign inodes.
+ * A nonzero `target_tid` selects a member run over exactly the
+ * (`target_tgid`, `target_tid`) task, bypassing the scope bitmap; every
+ * other run sees both target fields zeroed. */
 struct p11_identity_config {
     u64 gen;
     u64 arena_base;
     u64 arena_len;
     u32 slots;
     u32 observer_tgid;
+    u32 target_tgid;
+    u32 target_tid;
 };
-_Static_assert(sizeof(struct p11_identity_config) == 32, "config ABI");
+_Static_assert(sizeof(struct p11_identity_config) == 40, "config ABI");
 _Static_assert(__builtin_offsetof(struct p11_identity_config, gen) == 0, "config gen");
 _Static_assert(__builtin_offsetof(struct p11_identity_config, arena_base) == 8, "arena base");
 _Static_assert(__builtin_offsetof(struct p11_identity_config, arena_len) == 16, "arena len");
 _Static_assert(__builtin_offsetof(struct p11_identity_config, slots) == 24, "slots");
 _Static_assert(__builtin_offsetof(struct p11_identity_config, observer_tgid) == 28, "observer");
+_Static_assert(__builtin_offsetof(struct p11_identity_config, target_tgid) == 32, "target tgid");
+_Static_assert(__builtin_offsetof(struct p11_identity_config, target_tid) == 36, "target tid");
 
 /* Stable iterator context: fixed kernel offsets, never CO-RE. */
 struct p11_iter_meta {

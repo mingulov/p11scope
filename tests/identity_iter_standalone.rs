@@ -48,7 +48,7 @@ fn identity_object_has_two_iter_programs_and_five_maps() {
         ("anchors", 1u32, 8u32, 16u32, 1024u32, 16u32), // HASH, WRONLY
         ("anchor_slots", 2u32, 4u32, 8u32, 1024u32, 16u32), // ARRAY, WRONLY
         ("anchor_observed", 2u32, 4u32, 8u32, 1024u32, 16u32), // ARRAY, WRONLY
-        ("config", 2u32, 4u32, 32u32, 1u32, 0u32),      // ARRAY
+        ("config", 2u32, 4u32, 40u32, 1u32, 0u32),      // ARRAY
         ("scope_bitmap", 2u32, 4u32, 8u32, 65_536u32, 1024u32), // ARRAY, MMAPABLE
     ] {
         let map = object.maps.get(name).unwrap_or_else(|| {
@@ -177,12 +177,12 @@ const IDENTITY_INPUTS: [(&str, &[u8], &str); 3] = [
     (
         "vma_identity.c",
         include_bytes!("../crates/ebpf/native/vma_identity.c"),
-        "c1197dd1e616f1be4bcbf8abf651fd5254e5683f2d652f650187058a7fe31256",
+        "68551553674bb8f2aa8e317c5b1085f6c6342fdf4c472cea042f0d992e159373",
     ),
     (
         "vma_identity.h",
         include_bytes!("../crates/ebpf/native/vma_identity.h"),
-        "f7832cc4aef629f38a03530412377b902d1a70bd7bcb0c601e8c9f9478f17aba",
+        "c006f48b0e45cbe5e9c6251054b05e16e396959f7b49674f980156eb37bce685",
     ),
     (
         "uapi_check.c",
@@ -1181,4 +1181,187 @@ fn identity_uapi_constants_match_aya_bindings() {
         offset_of!(ii::MapBatchAttr, flags),
         offset_of!(gen_map_batch, flags)
     );
+}
+
+#[test]
+fn identity_link_info_tid_only_selection() {
+    use std::io::ErrorKind;
+    use std::process::{Command, Stdio};
+
+    fn sleep_child() -> std::process::Child {
+        Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("sleep spawns")
+    }
+
+    // This process's own tgid, and a provably never-live tid: Linux
+    // caps tids at pid_max (at most 2^22), so 0x7FFF_FFFF can never name
+    // a live thread. No thread spawn, no task-list diff: the libtest pool
+    // grows threads mid-suite, which made diffing flaky.
+    let tgid = std::process::id();
+    const NEVER_LIVE_TID: u32 = 0x7FFF_FFFF;
+    // ESRCH on Linux (this crate is Linux-only, like its UAPI numbers).
+    const ESRCH: i32 = 3;
+
+    // A live member encodes to the TID-only shape: tid set, pid and
+    // pid_fd zero (never a TGID walk, never a pidfd binding).
+    let mut live = sleep_child();
+    let pid = live.id();
+    let (info, len) = ii::encode_tid_selector(pid, pid).expect("live member encodes");
+    assert_eq!(info.tid, pid);
+    assert_eq!(info.pid, 0, "no TGID-walk mixing");
+    assert_eq!(info.pid_fd, 0, "no pidfd mixing");
+    assert_eq!(info.reserved, 0);
+    assert_eq!(len as usize, std::mem::size_of::<ii::IterLinkInfo>());
+    assert_eq!(len, 16);
+    live.kill().expect("live child dies");
+    let _ = live.wait();
+
+    // Zero selectors refuse before any liveness check.
+    for (tgid, tid) in [(0, pid), (pid, 0), (0, 0)] {
+        let err = ii::encode_tid_selector(tgid, tid).expect_err("zero selector refuses");
+        assert_eq!(
+            err.kind(),
+            ErrorKind::InvalidInput,
+            "zero selector is EINVAL"
+        );
+    }
+
+    // A foreign TGID (a live tid outside the named group) refuses.
+    let mut child_a = sleep_child();
+    let mut child_b = sleep_child();
+    let foreign =
+        ii::encode_tid_selector(child_a.id(), child_b.id()).expect_err("foreign TGID refuses");
+    assert_eq!(foreign.raw_os_error(), Some(ESRCH), "foreign TGID is ESRCH");
+
+    // A stale selector (a tid that can never be live in this group)
+    // refuses the same way.
+    let err = ii::encode_tid_selector(tgid, NEVER_LIVE_TID).expect_err("stale selector refuses");
+    assert_eq!(err.raw_os_error(), Some(ESRCH), "stale selector is ESRCH");
+    assert_eq!(
+        err.raw_os_error(),
+        foreign.raw_os_error(),
+        "foreign and stale share the refusal"
+    );
+    child_a.kill().expect("child A dies");
+    child_b.kill().expect("child B dies");
+    let _ = child_a.wait();
+    let _ = child_b.wait();
+}
+
+#[test]
+fn member_run_host_harness_target_gate_behavior() {
+    let native = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("crates/ebpf/native");
+    let source = native.join("vma_identity_harness.c");
+    assert!(
+        source.is_file(),
+        "harness source {} must exist",
+        source.display()
+    );
+    let work = std::env::temp_dir().join(format!("p11scope-tid-harness-{}", std::process::id()));
+    std::fs::create_dir_all(&work).expect("harness work dir");
+    let binary = work.join("vma_identity_harness");
+    let cwd = std::env::current_dir().expect("cwd");
+    let compiler = clang_resolve::resolve_executable_in(
+        "clang-18",
+        &std::env::var_os("PATH").unwrap_or_default(),
+        &cwd,
+    )
+    .expect("host harness needs an executable clang-18 on PATH");
+    let compile = std::process::Command::new(&compiler)
+        // Default language mode (GNU `typeof` for the map macros, as in
+        // the BPF build); only the BPF-only attribute is silenced.
+        .args([
+            "-O1",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-Wno-unknown-attributes",
+        ])
+        .arg(&source)
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .expect("spawn host cc for the harness");
+    assert!(
+        compile.status.success(),
+        "harness must compile -Werror-clean: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    // (scenario, ASSERT lines that must appear — the harness exits
+    // nonzero on any failed check, and these lines pin the evidence
+    // shape so a vacuous PASS cannot slip through).
+    for (scenario, asserts) in [
+        (
+            "member-run-accepts-exact-survivor",
+            &[
+                "ASSERT slot0_installs",
+                "ASSERT survivor_emits_slot0_keyed_by_tgid",
+            ][..],
+        ),
+        (
+            "member-run-skips-non-targets",
+            &[
+                "ASSERT slot0_installs",
+                "ASSERT leader_skipped",
+                "ASSERT foreign_tid_skipped",
+                "ASSERT foreign_group_skipped",
+                "ASSERT anon_skipped",
+                "ASSERT non_exec_skipped",
+                "ASSERT zero_inode_skipped",
+            ][..],
+        ),
+        (
+            "zeroed-target-keeps-leader-gate",
+            &[
+                "ASSERT slot0_installs",
+                "ASSERT scoped_leader_emits",
+                "ASSERT nonleader_still_gated",
+                "ASSERT unscoped_group_still_gated",
+            ][..],
+        ),
+        (
+            "nonleader-anchor-installs-nothing",
+            &[
+                "ASSERT nonleader_emits_nothing",
+                "ASSERT nonleader_installs_nothing",
+                "ASSERT slot0_untouched",
+            ][..],
+        ),
+        (
+            "target-config-replay-is-stable",
+            &[
+                "ASSERT slot0_installs",
+                "ASSERT replay_emits_again",
+                "ASSERT replay_identical",
+                "ASSERT no_new_install",
+                "ASSERT maps_unchanged",
+            ][..],
+        ),
+    ] {
+        let output = std::process::Command::new(&binary)
+            .arg(scenario)
+            .output()
+            .expect("harness runs the member-run scenario");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "scenario {scenario} failed:\n{stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("SCENARIO {scenario} PASS")),
+            "scenario {scenario} reports PASS:\n{stdout}"
+        );
+        for line in asserts {
+            assert!(
+                stdout.contains(line),
+                "scenario {scenario} emits {line}:\n{stdout}"
+            );
+        }
+    }
+    std::fs::remove_file(&binary).ok();
 }

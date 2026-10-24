@@ -52,6 +52,7 @@ use crate::discovery::identity::{
     ExaminedObject, FileIdentity, MapFilesDir, MappedFile, PinnedObjectId,
 };
 use crate::discovery::proof_stats::{ProofStatPool, RangeStat, stat_batch};
+use crate::discovery::retained_member::RetainedGroupMember;
 use crate::discovery::scan::{
     CaptureWorkBudget, IO_CEILING_REASON, MAPS_CEILING_REASON, MAPS_ENTRY_CEILING_REASON,
     SCAN_CLOCK_REASON, SCAN_DEADLINE_REASON, WORK_CEILING_REASON, duplicate_exec_coverage,
@@ -59,6 +60,7 @@ use crate::discovery::scan::{
 use p11scope_manifest::maps::{MapEntry, MappedPath, ObjectKey, mapped_path};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 /// Why one unselected process mapping a known provider object was not
 /// attributed to it. Counted per category at scope level; the per-pid
@@ -1466,6 +1468,11 @@ pub(crate) struct PreparedConfirmation<P> {
     pub before: ExeIdentity,
     pub entries: Vec<MapEntry>,
     pub ranges: Vec<(u64, u64)>,
+    /// The validated survivor for a zombie-leader confirm, minted by
+    /// `mint_member` and moved here after the reads. Scoped to this one
+    /// confirm phase: the finish consumes it, so it always drops before
+    /// any census boundary.
+    pub member: Option<RetainedGroupMember>,
 }
 
 /// The OS operations one confirmation needs, behind a seam so the
@@ -1508,6 +1515,25 @@ pub(crate) trait ConfirmIo {
     fn exe(&self, pid: u32) -> Option<ExeIdentity>;
     fn maps(&mut self, pid: u32, budget: &mut CaptureWorkBudget) -> Result<Vec<MapEntry>, String>;
     fn gone(&self, pid: u32) -> bool;
+    /// Mint (and stash) the validated group member for a zombie-leader
+    /// confirm, so reads route to the live survivor. Called once per
+    /// prepare, right after `open`; `Ok` with no stash means the
+    /// ordinary path (a live leader, no lone survivor, or any custody
+    /// refusal — a zombie then stays exited). `Err` only when the proof
+    /// could not be attempted (spent budget or deadline), which the
+    /// caller reports as the loss instead of an exit.
+    fn mint_member(
+        &mut self,
+        _pid: u32,
+        _budget: &mut CaptureWorkBudget,
+    ) -> Result<(), Confirmation> {
+        Ok(())
+    }
+    /// Move the stashed member into the preparation. Called once per
+    /// prepare, after the reads it served.
+    fn take_member(&mut self) -> Option<RetainedGroupMember> {
+        None
+    }
 }
 
 /// The proof reads of `ranges` keyed by range. A range whose result is
@@ -1664,6 +1690,9 @@ pub(crate) fn prepare_confirmation<Io: ConfirmIo>(
     if controlled && !budget.poll_collection(1) {
         return Err(stopped_confirmation());
     }
+    // The open phase routes zombie leaders to member custody before any
+    // read: exe, maps and map_files then serve the live survivor.
+    io.mint_member(pid, budget)?;
     let before = io.exe(pid).ok_or_else(|| {
         lost_with(
             io,
@@ -1703,6 +1732,7 @@ pub(crate) fn prepare_confirmation<Io: ConfirmIo>(
         before,
         entries,
         ranges,
+        member: io.take_member(),
     })
 }
 
@@ -1723,7 +1753,13 @@ pub(crate) fn finish_confirmation<Io: ConfirmIo>(
         Ok(lease) => lease,
         Err(error) => return Confirmation::Lost(AttributionLoss::ConfirmUnreadable, error),
     };
-    let after = io.exe(pid);
+    // The member exe re-read serves zombie leaders, whose own exe link
+    // is unreadable; live confirms see the ordinary read unchanged.
+    let after = prepared
+        .member
+        .as_ref()
+        .and_then(|member| member.read_exe_identity())
+        .or_else(|| io.exe(pid));
     if controlled && !budget.poll_collection(1) {
         return stopped_confirmation();
     }
@@ -1824,13 +1860,85 @@ fn map_files_error(error: std::io::Error) -> String {
 /// `map_files` stats relative to one `/proc/<pid>/map_files` directory
 /// (DR-C1b-3), opened at the first range and dropped with this value, so
 /// it is never held past the confirmation or stat batch that opened it.
-#[derive(Default)]
+/// Zombie leaders additionally stash one retained survivor (with its own
+/// private owner) for the current confirm; live leaders never touch it.
 pub(crate) struct OsConfirmIo<'p> {
     map_files: Option<(u32, Result<Arc<HeldMapFiles>, String>)>,
     /// The collection's proof-stat pool (`None`: read on this thread).
     pools: ProofPools<'p>,
     #[cfg(test)]
     observer: Option<Arc<Mutex<ProofTrace>>>,
+    /// The stashed survivor for the current zombie-leader confirm,
+    /// keyed by pid: `mint_member` sets it, `take_member` moves it out.
+    /// Reads route through it only for its own pid.
+    member: Option<(u32, RetainedGroupMember)>,
+    /// The member's minter, kept alive exactly while the member lives:
+    /// the member only borrows it, so dropping this first would refuse
+    /// every member read.
+    minter: Option<Arc<crate::process::PidPin>>,
+    /// The member's private reservation owner: exactly one retained
+    /// slot plus one transient unit, sized for a single confirm. The
+    /// confirm path that needs no shared owner (and the shared census,
+    /// which never sees member leases) both stay untouched.
+    member_owner: ReservationOwner,
+}
+
+impl Default for OsConfirmIo<'_> {
+    fn default() -> Self {
+        Self::with_pool(None)
+    }
+}
+
+/// The local-syscall grace for a member mint: a handful of nonblocking
+/// reads, capped by the confirm budget's own deadline when it has one.
+/// Expiry fails closed (no member, ordinary path).
+const MINT_DEADLINE_GRACE: Duration = Duration::from_secs(1);
+
+fn member_owner() -> ReservationOwner {
+    // Exactly the reserved envelope for one member (one retained slot
+    // plus one transient unit, inside the immediate floor): the minimal
+    // policy `ReservationOwner::new` accepts.
+    ReservationOwner::new(SegmentPolicy {
+        headroom: 6,
+        workers: 1,
+        retained: 1,
+        max_ranges: 0,
+    })
+}
+
+fn mint_deadline(budget: &CaptureWorkBudget) -> Instant {
+    let grace = Instant::now() + MINT_DEADLINE_GRACE;
+    let capped = budget.effective_deadline_ns().and_then(|limit| {
+        let clock = crate::attach::monotonic_ns()?;
+        let left = limit.checked_sub(clock)?;
+        Instant::now().checked_add(Duration::from_nanos(left))
+    });
+    capped.map(|deadline| deadline.min(grace)).unwrap_or(grace)
+}
+
+/// The lone survivor hint for a zombie leader: exactly one non-leader
+/// task listed. Zero survivors (a dead group) and ambiguous groups
+/// (several survivors) both yield `None` — the ordinary path, which
+/// stays exited for a zombie.
+fn lone_survivor_tid(pid: u32, budget: &mut CaptureWorkBudget) -> Option<u32> {
+    if budget.spend(1).is_err() {
+        return None;
+    }
+    let mut lone = None;
+    let mut extra = false;
+    let entries = std::fs::read_dir(format!("/proc/{pid}/task")).ok()?;
+    for entry in entries {
+        let tid: u32 = entry.ok()?.file_name().to_string_lossy().parse().ok()?;
+        if tid == pid {
+            continue;
+        }
+        if lone.is_some() {
+            extra = true;
+            break;
+        }
+        lone = Some(tid);
+    }
+    if extra { None } else { lone }
 }
 
 #[cfg(test)]
@@ -1963,7 +2071,18 @@ impl OsConfirmIo<'_> {
             pools,
             #[cfg(test)]
             observer: None,
+            member: None,
+            minter: None,
+            member_owner: member_owner(),
         }
+    }
+
+    /// The stashed survivor, only for the confirm pid that minted it.
+    fn member_for(&self, pid: u32) -> Option<&RetainedGroupMember> {
+        self.member
+            .as_ref()
+            .filter(|(minted, _)| *minted == pid)
+            .map(|(_, member)| member)
     }
 
     #[cfg(test)]
@@ -1977,6 +2096,24 @@ impl ConfirmIo for OsConfirmIo<'_> {
     type Pin = crate::process::PidPin;
 
     fn mapped_file(&mut self, pid: u32, start: u64, end: u64) -> Result<FileIdentity, String> {
+        // One range through the stashed survivor when this pid minted it:
+        // sequential, on this thread (zombie confirms are rare; no pool),
+        // with the custody refusal dominating any lookup result.
+        if let Some(member) = self.member_for(pid) {
+            let result = member.stat_map_file(start, end);
+            #[cfg(test)]
+            if let Some(observer) = &self.observer {
+                let thread = std::thread::current();
+                observer.lock().unwrap().reads.push((
+                    pid,
+                    start,
+                    end,
+                    thread.id(),
+                    thread.name().map(str::to_owned),
+                ));
+            }
+            return result;
+        }
         let result = self.held(pid, None).and_then(|dir| dir.stat(start, end));
         self.release_directory();
         result
@@ -1998,6 +2135,15 @@ impl ConfirmIo for OsConfirmIo<'_> {
     ) -> Vec<Result<FileIdentity, String>> {
         if ranges.is_empty() {
             return Vec::new();
+        }
+        // Member stats use the member's private owner internally; the
+        // shared batch lease simply drops unused.
+        if self.member_for(pid).is_some() {
+            drop(lease);
+            return ranges
+                .iter()
+                .map(|&(start, end)| self.mapped_file(pid, start, end))
+                .collect();
         }
         let pool = self.pools.for_lease(lease.as_ref());
         let result = match self.held(pid, lease) {
@@ -2025,6 +2171,11 @@ impl ConfirmIo for OsConfirmIo<'_> {
     }
 
     fn exe(&self, pid: u32) -> Option<ExeIdentity> {
+        // The member exe reads relative to the retained survivor
+        // directory, never the caller registry.
+        if let Some(member) = self.member_for(pid) {
+            return member.read_exe_identity();
+        }
         crate::discovery::caller_registry::read_exe_identity(pid)
     }
 
@@ -2035,7 +2186,56 @@ impl ConfirmIo for OsConfirmIo<'_> {
     }
 
     fn gone(&self, pid: u32) -> bool {
+        // A provably live survivor means the group is not gone, zombie
+        // leader or not; when no member validates this stays unchanged.
+        if self
+            .member_for(pid)
+            .is_some_and(|member| member.selector().is_ok())
+        {
+            return false;
+        }
         crate::process::generation_gone(pid) || crate::process::process_is_zombie(pid)
+    }
+
+    fn mint_member(
+        &mut self,
+        pid: u32,
+        budget: &mut CaptureWorkBudget,
+    ) -> Result<(), Confirmation> {
+        // A fresh stash every prepare: an early `Err` return skips the
+        // take, so anything left here belongs to an older confirm.
+        self.member = None;
+        self.minter = None;
+        if !crate::process::process_is_zombie(pid) {
+            return Ok(());
+        }
+        if let Some(reason) = budget.check_deadline_now() {
+            return Err(Confirmation::Lost(AttributionLoss::Budget, reason.into()));
+        }
+        let tid = match lone_survivor_tid(pid, budget) {
+            Some(tid) => tid,
+            None => return Ok(()),
+        };
+        let original = match crate::process::PidPin::open(pid) {
+            Ok(pin) => Arc::new(pin),
+            Err(_) => return Ok(()),
+        };
+        let deadline = mint_deadline(budget);
+        match RetainedGroupMember::acquire(&original, tid, &self.member_owner, budget, deadline) {
+            Ok(member) => {
+                self.member = Some((pid, member));
+                self.minter = Some(original);
+                Ok(())
+            }
+            // Any custody refusal keeps the ordinary path (a zombie
+            // then stays exited); a spent budget self-corrects, because
+            // the ordinary maps read fails the same budget afterwards.
+            Err(_) => Ok(()),
+        }
+    }
+
+    fn take_member(&mut self) -> Option<RetainedGroupMember> {
+        self.member.take().map(|(_, member)| member)
     }
 }
 
@@ -2043,6 +2243,11 @@ impl crate::discovery::confirm_shards::ShardableIo for OsConfirmIo<'_> {
     type Maps = std::fs::File;
 
     fn open_maps(&mut self, pid: u32) -> std::io::Result<Self::Maps> {
+        // The survivor's maps, not the dead leader's empty ones. `maps`
+        // delegates to this opener, so both route together.
+        if let Some(member) = self.member_for(pid) {
+            return member.open_maps().map_err(std::io::Error::other);
+        }
         std::fs::File::open(format!("/proc/{pid}/maps"))
     }
 

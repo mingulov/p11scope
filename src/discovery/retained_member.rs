@@ -26,7 +26,7 @@ use std::time::Instant;
 use crate::discovery::caller_registry::ExeIdentity;
 use crate::discovery::identity::FileIdentity;
 use crate::discovery::scan::CaptureWorkBudget;
-use crate::discovery::sweep_attribution::{FdLease, ReservationOwner};
+use crate::discovery::sweep_attribution::{FdLease, RANGE_NOT_MAPPED, ReservationOwner};
 use crate::process::{PidPin, generation_gone, process_start_time};
 
 /// The discovery work units one mint charges (liveness, two stats, one status).
@@ -123,7 +123,14 @@ impl TransientMapFilesDir {
         // success, and a NUL-terminated relative range name.
         if unsafe { libc::fstatat(self.dir.as_raw_fd(), name.as_ptr(), stat.as_mut_ptr(), 0) } != 0
         {
-            return Err(std::io::Error::last_os_error().to_string());
+            let error = std::io::Error::last_os_error();
+            // A renamed-away entry is the same "not mapped" verdict the
+            // shared map_files reader reports, so member stats stay a
+            // drop-in for `HeldMapFiles::stat` under `RangeProof::from`.
+            if error.raw_os_error() == Some(libc::ENOENT) {
+                return Err(RANGE_NOT_MAPPED.to_string());
+            }
+            return Err(error.to_string());
         }
         // SAFETY: initialized by the successful `fstatat`.
         let stat = unsafe { stat.assume_init() };

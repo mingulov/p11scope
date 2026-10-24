@@ -77,14 +77,22 @@ pub struct IdentityConfig {
     pub slots: u32,
     /// Observer's tgid: the only task the anchor program installs for.
     pub observer_tgid: u32,
+    /// Member runs only: the retained survivor's group (else zero).
+    pub target_tgid: u32,
+    /// Member runs only: the retained survivor's tid (else zero). A
+    /// nonzero tid selects exactly this task and bypasses the scope
+    /// bitmap; every other run sees both target fields zeroed.
+    pub target_tid: u32,
 }
 
-const _: () = assert!(size_of::<IdentityConfig>() == 32);
+const _: () = assert!(size_of::<IdentityConfig>() == 40);
 const _: () = assert!(std::mem::offset_of!(IdentityConfig, generation) == 0);
 const _: () = assert!(std::mem::offset_of!(IdentityConfig, arena_base) == 8);
 const _: () = assert!(std::mem::offset_of!(IdentityConfig, arena_len) == 16);
 const _: () = assert!(std::mem::offset_of!(IdentityConfig, slots) == 24);
 const _: () = assert!(std::mem::offset_of!(IdentityConfig, observer_tgid) == 28);
+const _: () = assert!(std::mem::offset_of!(IdentityConfig, target_tgid) == 32);
+const _: () = assert!(std::mem::offset_of!(IdentityConfig, target_tid) == 36);
 
 /// Value of an `anchors` entry, for documentation and tests. The kernel owns
 /// these entries; userspace never reads them (I6).
@@ -873,6 +881,40 @@ fn encode_task_vma_selector(pid_fd: Option<BorrowedFd<'_>>) -> io::Result<(IterL
     }
 }
 
+/// Encode the `iter_info` selector for a member (TID-scoped) run over
+/// `tid` in group `tgid`: the tid set, `pid`/`pid_fd` zero, len 16. The
+/// kernel narrows the task iterator only on this exact shape. The pair
+/// is custody-derived by the caller (a validated member selector, never
+/// a bare numeric); this encoder additionally refuses what cannot run:
+/// a zero tgid or tid fails with `EINVAL`, and a tid that is not a live
+/// member of the group (foreign TGID, stale or reaped selector) fails
+/// with the `tgkill` `ESRCH`, before any `bpf()` syscall. `EPERM` means
+/// alive (present but unpermitted), exactly like the custody gate.
+pub fn encode_tid_selector(tgid: u32, tid: u32) -> io::Result<(IterLinkInfo, u32)> {
+    if tgid == 0 || tid == 0 {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    // SAFETY: signal 0 sends nothing; only the existence check runs.
+    let done = unsafe { libc::tgkill(tgid as libc::pid_t, tid as libc::pid_t, 0) };
+    if done != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EPERM) {
+            // Present but unpermitted: still a live member.
+        } else {
+            return Err(error);
+        }
+    }
+    Ok((
+        IterLinkInfo {
+            tid,
+            pid: 0,
+            pid_fd: 0,
+            reserved: 0,
+        },
+        size_of::<IterLinkInfo>() as u32,
+    ))
+}
+
 /// Create a `task_vma` iterator link for `prog_fd`: whole-system with
 /// `pid_fd = None`, or one process with `Some(pidfd)`. The pidfd names the
 /// task only at attach (F2); generation proof stays the confirm pin's job.
@@ -893,6 +935,36 @@ pub fn link_create_task_vma(
         } else {
             std::ptr::addr_of!(info).addr() as u64
         },
+        iter_info_len: len,
+        reserved: 0,
+    };
+    let mut attr = attr;
+    let fd = bpf(
+        BPF_LINK_CREATE,
+        std::ptr::addr_of_mut!(attr).cast(),
+        size_of::<LinkCreateAttr>(),
+    )?;
+    // SAFETY: the syscall returned a new owned fd.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Create a `task_vma` iterator link for `prog_fd` scoped to exactly the
+/// `tid` in group `tgid` (see [`encode_tid_selector`]): the member-run
+/// shape, with `pid`/`pid_fd` zero. Unrunnable pairs refuse before any
+/// syscall; the tid names the task only at attach and generation proof
+/// stays the confirm path's job.
+pub fn link_create_task_vma_tid(
+    prog_fd: BorrowedFd<'_>,
+    tgid: u32,
+    tid: u32,
+) -> io::Result<OwnedFd> {
+    let (info, len) = encode_tid_selector(tgid, tid)?;
+    let attr = LinkCreateAttr {
+        prog_fd: prog_fd.as_raw_fd() as u32,
+        target_fd: 0,
+        attach_type: BPF_TRACE_ITER,
+        flags: 0,
+        iter_info: std::ptr::addr_of!(info).addr() as u64,
         iter_info_len: len,
         reserved: 0,
     };
@@ -1661,7 +1733,8 @@ impl AnchorArena {
 
     /// The `config[0]` for a pass over this arena: `installed` slots of
     /// this reservation, observed by `observer_tgid`. Validate with
-    /// [`validate_arena_config`] before writing (the probe does).
+    /// [`validate_arena_config`] before writing (the probe does). Member
+    /// runs are never installed configs: the target fields stay zeroed.
     pub fn config(&self, generation: u64, installed: u32, observer_tgid: u32) -> IdentityConfig {
         IdentityConfig {
             generation,
@@ -1669,6 +1742,8 @@ impl AnchorArena {
             arena_len: self.len(),
             slots: installed,
             observer_tgid,
+            target_tgid: 0,
+            target_tid: 0,
         }
     }
 }
@@ -6981,8 +7056,10 @@ mod tests {
             arena_len: 8192,
             slots: 1,
             observer_tgid: 4242,
+            target_tgid: 0,
+            target_tid: 0,
         };
-        assert_eq!(size_of::<IdentityConfig>(), 32);
+        assert_eq!(size_of::<IdentityConfig>(), 40);
         assert_eq!(std::mem::offset_of!(IdentityConfig, observer_tgid), 28);
         assert_eq!(config.observer_tgid, 4242);
     }
@@ -7032,6 +7109,8 @@ mod tests {
             arena_len: 4 * ANCHOR_STRIDE,
             slots: 4,
             observer_tgid: 4242,
+            target_tgid: 0,
+            target_tid: 0,
         };
         assert_eq!(validate_arena_config(&good), Ok(()));
         // Full capacity is fine.
@@ -8103,5 +8182,70 @@ mod tests {
         for child in &mut children {
             child.reap();
         }
+    }
+
+    /// A TID-scoped anchor run over a live nonleader installs nothing:
+    /// the anchor program's leader gate holds even when the iterator
+    /// visits the thread directly. Run as root with `--ignored`.
+    #[test]
+    #[ignore = "privileged: nonleader anchor run installs nothing live"]
+    fn privileged_identity_nonleader_anchor_installs_nothing() {
+        ensure_kernel_identity_btf().expect("the cell needs an eligible kernel");
+        let btf = aya::Btf::from_sys_fs().expect("readable host BTF");
+        let mut loaded = load_identity_object_strict(&btf).expect("strict load");
+        let arena = AnchorArena::reserve(1).expect("reserve 1 slot");
+        let exe = std::fs::File::open("/proc/self/exe").expect("open self exe");
+        arena.map_slot(0, exe.as_fd()).expect("map slot 0");
+        let observer = std::process::id();
+        let generation = 3;
+        let config = arena.config(generation, 1, observer);
+        validate_arena_config(&config).expect("arena config validates");
+        write_identity_config(&mut loaded.ebpf, &config).expect("config writes");
+        // A live nonleader parked on a channel: its tid is reported from
+        // inside the thread, so the TID selector names a running thread.
+        let (ready, parked) = std::sync::mpsc::channel::<u32>();
+        let worker = std::thread::spawn(move || {
+            // SAFETY: gettid takes no arguments.
+            let tid = unsafe { libc::syscall(libc::SYS_gettid) } as u32;
+            ready.send(tid).expect("tid reports");
+            std::thread::park();
+        });
+        let tid = parked.recv().expect("worker reports its tid");
+        assert_ne!(tid, observer, "the worker is a nonleader");
+        assert_ne!(tid, 0);
+        let link = link_create_task_vma_tid(loaded.anchor_fd.as_fd(), observer, tid)
+            .expect("TID link creates");
+        let iter = iter_create(link.as_fd()).expect("iterator creates");
+        let bytes = read_run(
+            iter.as_fd(),
+            Instant::now() + Duration::from_secs(5),
+            64 * 1024,
+        )
+        .expect("anchor run reads");
+        drop(iter);
+        drop(link);
+        worker.thread().unpark();
+        worker.join().expect("worker joins");
+        let run = parse(
+            &bytes,
+            &Expect {
+                generation,
+                slots: 1,
+                scope: &BTreeSet::from([observer]),
+                mode: RunMode::PerPid,
+                run: RunKind::Anchor,
+            },
+        )
+        .expect("anchor run parses");
+        assert!(
+            run.anchors.is_empty(),
+            "a nonleader anchor run installs nothing: {:?}",
+            run.anchors
+        );
+        assert_eq!(
+            bytes.len(),
+            32,
+            "exactly the END record crosses the iterator"
+        );
     }
 }

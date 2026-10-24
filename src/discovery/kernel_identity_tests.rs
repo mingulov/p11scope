@@ -4041,3 +4041,715 @@ fn d3c_generation_rollover_refuses_reuse() {
     drop(installed);
     assert_eq!(session.generation, 2);
 }
+
+// ---- Member-run (TID) cells ----
+
+use super::super::retained_member::RetainedGroupMember;
+use super::super::sweep_attribution::AttributionLoss;
+use crate::process::PidPin;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+/// A live `sleep` child: real custody for member mints. The tests mint a
+/// leader-as-member on the child, so every member prove runs against a
+/// genuinely live (tgid, tid) pair without raw-clone fixtures.
+struct SleepChild {
+    child: std::process::Child,
+}
+
+impl SleepChild {
+    fn spawn() -> Self {
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("sleep spawns");
+        Self { child }
+    }
+
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+}
+
+impl Drop for SleepChild {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Fake pin for member cells (no FD; custody lives in the member).
+struct MemberPin;
+
+/// `ConfirmIo` serving canned entries, with an optional REAL member mint.
+/// The mint path exercises genuine custody (tgkill, pidfd, birth
+/// brackets) on the live child; the kernel side stays scripted.
+struct MemberIo {
+    entries: Vec<MapEntry>,
+    identity: FileIdentity,
+    exe: super::super::caller_registry::ExeIdentity,
+    mint: bool,
+    member_owner: ReservationOwner,
+    stashed: Option<RetainedGroupMember>,
+    minter: Option<Arc<PidPin>>,
+    fallback_reads: Rc<RefCell<Vec<(u32, u64, u64)>>>,
+}
+
+impl MemberIo {
+    fn canned(
+        entries: Vec<MapEntry>,
+        identity: FileIdentity,
+        mint: bool,
+        fallback_reads: Rc<RefCell<Vec<(u32, u64, u64)>>>,
+    ) -> Self {
+        Self {
+            entries,
+            identity,
+            exe: super::super::caller_registry::ExeIdentity {
+                dev: 1,
+                ino: 2,
+                mtime_secs: 0,
+                mtime_nanos: 0,
+                path: Some("member-fixture".into()),
+            },
+            mint,
+            member_owner: ReservationOwner::new(SegmentPolicy::from_headroom(64, 1, 1)),
+            stashed: None,
+            minter: None,
+            fallback_reads,
+        }
+    }
+}
+
+impl super::super::sweep_attribution::ConfirmIo for MemberIo {
+    type Pin = MemberPin;
+
+    fn open(&mut self, _: u32) -> Result<Self::Pin, String> {
+        Ok(MemberPin)
+    }
+
+    fn mapped_file(&mut self, pid: u32, start: u64, end: u64) -> Result<FileIdentity, String> {
+        self.fallback_reads.borrow_mut().push((pid, start, end));
+        Ok(self.identity)
+    }
+
+    fn start_time(&self, _: &Self::Pin) -> Option<u64> {
+        Some(42)
+    }
+
+    fn still_the_same(&self, _: &Self::Pin) -> bool {
+        true
+    }
+
+    fn exe(&self, _: u32) -> Option<super::super::caller_registry::ExeIdentity> {
+        // Member-preferring, like the production routing: a stashed
+        // member serves its real exe so prepare and finish agree.
+        if let Some(member) = &self.stashed {
+            return member.read_exe_identity();
+        }
+        Some(self.exe.clone())
+    }
+
+    fn maps(
+        &mut self,
+        _: u32,
+        _: &mut crate::discovery::scan::CaptureWorkBudget,
+    ) -> Result<Vec<MapEntry>, String> {
+        Ok(self.entries.clone())
+    }
+
+    fn gone(&self, _: u32) -> bool {
+        false
+    }
+
+    fn mint_member(
+        &mut self,
+        pid: u32,
+        budget: &mut crate::discovery::scan::CaptureWorkBudget,
+    ) -> Result<(), super::super::sweep_attribution::Confirmation> {
+        use super::super::sweep_attribution::Confirmation;
+        self.stashed = None;
+        self.minter = None;
+        if !self.mint {
+            return Ok(());
+        }
+        let original =
+            Arc::new(PidPin::open(pid).map_err(|error| {
+                Confirmation::Lost(AttributionLoss::MapFilesUnavailable, error)
+            })?);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        match RetainedGroupMember::acquire(&original, pid, &self.member_owner, budget, deadline) {
+            Ok(member) => {
+                self.stashed = Some(member);
+                self.minter = Some(original);
+                Ok(())
+            }
+            Err(error) => Err(Confirmation::Lost(
+                AttributionLoss::MapFilesUnavailable,
+                error,
+            )),
+        }
+    }
+
+    fn take_member(&mut self) -> Option<RetainedGroupMember> {
+        self.stashed.take()
+    }
+}
+
+/// One scripted member-run outcome, in run order.
+#[derive(Clone, Copy)]
+enum MemberOutcome {
+    /// The run emits Slot(0) verdicts for every requested range.
+    Slot,
+    /// The run fails before any byte (demotes later segments).
+    Failure(RunFailure),
+}
+
+/// Drives member-cell proves against a fixture session. Singleton
+/// requests each run one `prove_and_finish_prepared` (with finish);
+/// `multi` runs one direct `prove` over all requests (no finish) so
+/// per-request answers stay observable.
+struct MemberCellSpec {
+    mint: Vec<bool>,
+    outcomes: Vec<MemberOutcome>,
+    threshold: Option<usize>,
+    fail_config: bool,
+    multi: bool,
+}
+
+struct MemberObservation {
+    confirmations: Vec<super::super::sweep_attribution::Confirmation>,
+    answers: Vec<Option<MappedIdentities>>,
+    pids: Vec<u32>,
+    attempts: u32,
+    failed_target: Option<RunFailure>,
+    fallback: KernelFallbackTotals,
+    tids: Vec<Option<(u32, u32)>>,
+    pidfds: Vec<Option<i32>>,
+    scopes: Vec<BTreeSet<u32>>,
+    config_writes: Vec<crate::attach::identity_iter::IdentityConfig>,
+    per_pid: BTreeMap<u32, KernelFallbackReason>,
+    binding_valid: bool,
+    fallback_reads: Vec<(u32, u64, u64)>,
+}
+
+fn member_cell(spec: MemberCellSpec) -> MemberObservation {
+    assert_eq!(spec.mint.len(), spec.outcomes.len());
+    let dir = tempfile::tempdir().unwrap();
+    let (file, provider) = opened(dir.path(), "provider.so");
+    drop(file);
+    let pins = super::super::identity::test_fixture::real_scan_pin(
+        &dir.path().join("provider.so"),
+        None,
+        1,
+        "member-custody-fixture",
+    );
+    let id = pins.pinned().next().unwrap().id;
+    let (held, examined) = opened(dir.path(), "examined.so");
+    let children: Vec<SleepChild> = spec.mint.iter().map(|_| SleepChild::spawn()).collect();
+    let pids: Vec<u32> = children.iter().map(SleepChild::pid).collect();
+    let ranges: Vec<(u64, u64)> = pids
+        .iter()
+        .enumerate()
+        .map(|(position, _)| segment_range(position))
+        .collect();
+    // Scripted target bytes per request: Slot verdicts keyed by the real
+    // child pid (the member run emits the TGID), or a scripted failure.
+    let steps: Vec<FixtureTarget> = spec
+        .outcomes
+        .iter()
+        .enumerate()
+        .map(|(position, outcome)| match outcome {
+            MemberOutcome::Slot => {
+                FixtureTarget::Bytes(target_stream(&[(pids[position], ranges[position], 0)]))
+            }
+            MemberOutcome::Failure(reason) => FixtureTarget::Failure(*reason),
+        })
+        .collect();
+    let entries: Vec<Vec<MapEntry>> = pids
+        .iter()
+        .enumerate()
+        .map(|(position, _)| {
+            vec![MapEntry {
+                start: ranges[position].0,
+                end: ranges[position].1,
+                permissions: *b"r-xp",
+                file_offset: 0,
+                device: provider.key.device,
+                inode: provider.key.inode,
+                raw_path: Some(b"/fixture/provider.so".to_vec()),
+            }]
+        })
+        .collect();
+    // The multi prove runs once over all requests: merge every
+    // request's records into one scripted run.
+    let multi_steps = vec![FixtureTarget::Bytes(target_stream(
+        &spec
+            .mint
+            .iter()
+            .enumerate()
+            .filter(|(_, mint)| !**mint)
+            .map(|(position, _)| (pids[position], ranges[position], 0))
+            .collect::<Vec<_>>(),
+    ))];
+    let owner = ReservationOwner::for_examined(SegmentPolicy::from_headroom(16, 0, 0), 1);
+    let mut custody = ExaminedCustody::new(owner.clone(), BTreeMap::new());
+    let scan = custody.begin_scan();
+    assert!(custody.offer_for_test(scan, examined, held));
+    let mut session = fixture_session();
+    let runs = if let SessionObject::Fixture {
+        anchor,
+        target_steps,
+        target_trace,
+        ..
+    } = &mut session.object
+    {
+        *anchor = anchor_stream(&[(0, ANCHOR_OK, 0), (1, ANCHOR_OK, 0)]);
+        *target_steps.borrow_mut() = if spec.multi { multi_steps } else { steps }.into();
+        target_trace.clone()
+    } else {
+        unreachable!()
+    };
+    custody
+        .reconcile(SegmentPolicy::from_headroom(64, 2, spec.mint.len()))
+        .unwrap();
+    let pass = AnchorPass::prepare(&pins, [(provider.key, id)], custody);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut installed = session.install_anchors(pass, 1, deadline).unwrap();
+    // Config failure starts after installation: the install itself
+    // must succeed so the proves exercise the member path.
+    if spec.fail_config {
+        if let SessionObject::Fixture { fail_config, .. } = &mut installed.session.object {
+            *fail_config = true;
+        } else {
+            unreachable!()
+        }
+    }
+    let (mut index, refused) = KnownKeyIndex::build(
+        [(provider.key, Some(id))],
+        &BTreeMap::from([(provider.key, id)]),
+        [examined],
+        &AdapterChecks(provider.identity),
+    );
+    assert!(refused.is_empty());
+    let mut probe = KernelMemberProbe::new(
+        &mut installed,
+        MemberIo::canned(
+            vec![],
+            provider.identity,
+            false,
+            Rc::new(RefCell::new(vec![])),
+        ),
+        deadline,
+    );
+    if let Some(threshold) = spec.threshold {
+        probe = probe.with_auto_threshold(threshold);
+    }
+    probe.install_expectations(&mut index).unwrap();
+    let mut budget = crate::discovery::scan::CaptureWorkBudget::default();
+    let fallback_reads = Rc::new(RefCell::new(Vec::new()));
+    let resources = owner.batch();
+    let prove_set = BTreeSet::from([provider.key]);
+    let mut confirmations = Vec::new();
+    let mut answers = Vec::new();
+    if spec.multi {
+        use super::super::confirm_shards::SegmentProof as _;
+        use super::super::confirm_shards::accepted_batch_for_test;
+        let mut ios: Vec<MemberIo> = spec
+            .mint
+            .iter()
+            .enumerate()
+            .map(|(position, mint)| {
+                MemberIo::canned(
+                    entries[position].clone(),
+                    provider.identity,
+                    *mint,
+                    fallback_reads.clone(),
+                )
+            })
+            .collect();
+        let mut plans = Vec::new();
+        for (position, io) in ios.iter_mut().enumerate() {
+            let prepared = super::super::sweep_attribution::prepare_confirmation(
+                io,
+                pids[position],
+                &prove_set,
+                &mut budget,
+                Some(&resources),
+            )
+            .expect("member request prepares");
+            plans.push((pids[position], prepared));
+        }
+        let batch = accepted_batch_for_test(&plans);
+        let decision = probe.segment_proof().prove(&batch, &mut budget, &resources);
+        for position in 0..plans.len() {
+            answers.push(decision.answer(&batch, position).cloned());
+        }
+        drop(batch);
+        // Emulate the segment driver for unanswered requests: prove by
+        // userspace exactly as `prove_and_finish_prepared` would.
+        for (position, answer) in answers.iter().enumerate() {
+            if answer.is_none() {
+                let mapped = super::super::sweep_attribution::read_ranges_reserved(
+                    &mut ios[position],
+                    pids[position],
+                    &plans[position].1.ranges,
+                    Some(&resources),
+                );
+                assert!(
+                    mapped.values().all(|proof| matches!(
+                        proof,
+                        super::super::sweep_attribution::RangeProof::MapFiles(_)
+                    )),
+                    "unanswered request proves by userspace: {mapped:?}"
+                );
+            }
+        }
+        drop(plans);
+        drop(ios);
+    } else {
+        for (position, mint) in spec.mint.iter().enumerate() {
+            let mut io = MemberIo::canned(
+                entries[position].clone(),
+                provider.identity,
+                *mint,
+                fallback_reads.clone(),
+            );
+            let prepared = super::super::sweep_attribution::prepare_confirmation(
+                &mut io,
+                pids[position],
+                &prove_set,
+                &mut budget,
+                Some(&resources),
+            )
+            .expect("member request prepares");
+            confirmations.push(super::super::confirm_shards::prove_and_finish_prepared(
+                &mut io,
+                pids[position],
+                prepared,
+                probe.segment_proof(),
+                &resources,
+                &mut budget,
+            ));
+        }
+    }
+    let attempts = installed.target_attempts;
+    let failed_target = installed.failed_target;
+    let binding_valid = installed.session.binding.is_some();
+    let per_pid = installed
+        .session
+        .fallback
+        .current
+        .as_ref()
+        .map(|pass| pass.per_pid.clone())
+        .unwrap_or_default();
+    drop(installed);
+    let fallback = session.fallback_totals();
+    let trace = runs.lock().unwrap();
+    let observation = MemberObservation {
+        confirmations,
+        answers,
+        pids,
+        attempts,
+        failed_target,
+        fallback,
+        tids: trace.tids.clone(),
+        pidfds: trace.pidfds.clone(),
+        scopes: trace.scopes.clone(),
+        config_writes: trace.config_writes.clone(),
+        per_pid,
+        binding_valid,
+        fallback_reads: fallback_reads.borrow().clone(),
+    };
+    drop(children);
+    observation
+}
+
+#[test]
+fn tid_run_encoding_uses_tid_only() {
+    let out = member_cell(MemberCellSpec {
+        mint: vec![true],
+        outcomes: vec![MemberOutcome::Slot],
+        threshold: None,
+        fail_config: false,
+        multi: false,
+    });
+    assert_eq!(out.confirmations.len(), 1);
+    assert_kernel_slot(&out.confirmations[0], Slot(0));
+    // The run carried the member's (tgid, tid) with no pidfd and no
+    // scope write: TID selection only.
+    assert_eq!(out.tids.len(), 1);
+    let (tgid, tid) = out.tids[0].expect("member run records its target");
+    assert_eq!(tgid, tid, "leader-as-member fixture");
+    assert_eq!(out.pidfds, [None]);
+    // The run executed under the stale install scope (the observer),
+    // never a replaced batch scope: member runs write no scope.
+    assert_eq!(out.scopes, [BTreeSet::from([std::process::id()])]);
+    assert_ne!(out.pids[0], std::process::id());
+    assert_eq!(out.attempts, 1);
+    assert!(out.failed_target.is_none());
+    // Exactly one config write plus its reset: install, target, zeroed.
+    assert_eq!(out.config_writes.len(), 3);
+    let install = &out.config_writes[0];
+    assert_eq!((install.target_tgid, install.target_tid), (0, 0));
+    let target = &out.config_writes[1];
+    assert_eq!(target.generation, 1);
+    assert_eq!((target.target_tgid, target.target_tid), (tgid, tid));
+    assert_eq!(target.observer_tgid, std::process::id());
+    let reset = &out.config_writes[2];
+    assert_eq!((reset.target_tgid, reset.target_tid), (0, 0));
+    assert!(out.fallback.passes == 0 && out.fallback.pids == 0 && out.fallback.keys == 0);
+    assert!(out.fallback.first_reason.is_none());
+    assert!(out.fallback_reads.is_empty(), "no userspace proof reads");
+}
+
+#[test]
+fn tid_run_zeroes_target_fields_on_other_runs() {
+    let out = member_cell(MemberCellSpec {
+        mint: vec![false, true, false],
+        outcomes: vec![
+            MemberOutcome::Slot,
+            MemberOutcome::Slot,
+            MemberOutcome::Slot,
+        ],
+        threshold: None,
+        fail_config: false,
+        multi: false,
+    });
+    assert_eq!(out.confirmations.len(), 3);
+    for confirmation in &out.confirmations {
+        assert_kernel_slot(confirmation, Slot(0));
+    }
+    // Only the member run selected by TID; the ordinary runs wrote
+    // scope instead and never touched the target fields.
+    assert_eq!(out.tids.len(), 3);
+    assert!(out.tids[0].is_none() && out.tids[2].is_none());
+    assert!(out.tids[1].is_some());
+    assert_eq!(out.pidfds, [None, None, None]);
+    // Ordinary runs replace the scope; the member run in the middle
+    // executed under the stale first scope and replaced nothing.
+    assert_eq!(
+        out.scopes,
+        [
+            BTreeSet::from([out.pids[0]]),
+            BTreeSet::from([out.pids[0]]),
+            BTreeSet::from([out.pids[2]]),
+        ]
+    );
+    assert_eq!(out.config_writes.len(), 3, "ordinaries add no config write");
+    for (position, config) in out.config_writes.iter().enumerate() {
+        if position == 1 {
+            assert_ne!(
+                (config.target_tgid, config.target_tid),
+                (0, 0),
+                "the member write names its target"
+            );
+        } else {
+            assert_eq!((config.target_tgid, config.target_tid), (0, 0));
+        }
+    }
+    assert_eq!(out.attempts, 3);
+}
+
+#[test]
+fn zombie_request_in_batch_is_named_zombie_batch_fallback() {
+    let out = member_cell(MemberCellSpec {
+        mint: vec![true, false],
+        outcomes: vec![MemberOutcome::Slot, MemberOutcome::Slot],
+        threshold: None,
+        fail_config: false,
+        multi: true,
+    });
+    assert_eq!(out.answers.len(), 2);
+    // The zombie-group request cannot run inside a shared batch: it
+    // answers nothing and falls back under its own name, while the
+    // ordinary request still proves by kernel.
+    assert!(
+        out.answers[0].is_none(),
+        "zombie request answers nothing in a shared batch"
+    );
+    let ordinary = out.answers[1].as_ref().expect("ordinary request proves");
+    assert!(
+        ordinary.values().all(|proof| {
+            *proof == super::super::sweep_attribution::RangeProof::Kernel(Slot(0))
+        }),
+        "ordinary request still proves by kernel: {ordinary:?}"
+    );
+    assert_eq!(out.tids, [None], "the shared run is not a TID run");
+    assert_eq!(out.attempts, 1);
+    // The name stays in the oracle: per-request ZombieBatch with its
+    // label, while the surfaced first reason never carries it.
+    let (zombie_pid, _) = out
+        .per_pid
+        .iter()
+        .find(|(_, reason)| **reason == KernelFallbackReason::ZombieBatch)
+        .expect("zombie request named in the oracle");
+    assert_eq!(KernelFallbackReason::ZombieBatch.label(), "zombie-batch");
+    assert!(
+        out.fallback_reads
+            .iter()
+            .any(|(pid, _, _)| pid == zombie_pid),
+        "zombie request falls back to userspace proof"
+    );
+    assert_eq!(out.fallback.passes, 1);
+    assert_eq!(out.fallback.pids, 1);
+    assert_eq!(out.fallback.keys, 1);
+    assert_ne!(
+        out.fallback.first_reason,
+        Some(KernelFallbackReason::ZombieBatch),
+        "zombie-batch never surfaces: {:?}",
+        out.fallback.first_reason
+    );
+}
+
+#[test]
+fn auto_single_member_run_is_below_threshold() {
+    let out = member_cell(MemberCellSpec {
+        mint: vec![true],
+        outcomes: vec![MemberOutcome::Slot],
+        threshold: Some(2_400),
+        fail_config: false,
+        multi: false,
+    });
+    // A single member run never clears the auto gate: no run, no
+    // target write, userspace proof under the threshold name.
+    assert_eq!(
+        out.fallback.first_reason,
+        Some(KernelFallbackReason::BelowThreshold)
+    );
+    assert_eq!(
+        KernelFallbackReason::BelowThreshold.label(),
+        "below_threshold"
+    );
+    assert_eq!(out.attempts, 0);
+    assert!(out.tids.is_empty(), "no run was attempted");
+    assert_eq!(out.config_writes.len(), 1, "install only");
+    assert_eq!(
+        (
+            out.config_writes[0].target_tgid,
+            out.config_writes[0].target_tid
+        ),
+        (0, 0)
+    );
+    assert_eq!(out.confirmations.len(), 1);
+    assert_userspace_mapped(&out.confirmations[0]);
+    assert!(
+        !out.fallback_reads.is_empty(),
+        "userspace proved the ranges"
+    );
+}
+
+#[test]
+fn forced_kernel_member_run_is_positive() {
+    let out = member_cell(MemberCellSpec {
+        mint: vec![true],
+        outcomes: vec![MemberOutcome::Slot],
+        threshold: None,
+        fail_config: false,
+        multi: false,
+    });
+    assert_eq!(out.confirmations.len(), 1);
+    assert_kernel_slot(&out.confirmations[0], Slot(0));
+    assert_eq!(out.attempts, 1);
+    assert!(out.failed_target.is_none());
+    assert!(out.per_pid.is_empty(), "no per-request fallback");
+    assert!(out.fallback.passes == 0 && out.fallback.pids == 0 && out.fallback.keys == 0);
+    assert!(out.fallback.first_reason.is_none());
+    assert_eq!(out.tids.len(), 1);
+    assert!(out.tids[0].is_some());
+    assert!(out.fallback_reads.is_empty(), "no userspace proof reads");
+}
+
+#[test]
+fn member_run_attempt_cap_counts_target_runs() {
+    // Three member runs reach the cap; the fourth falls back under the
+    // attempt name without attempting.
+    let capped = member_cell(MemberCellSpec {
+        mint: vec![true, true, true, true],
+        outcomes: vec![
+            MemberOutcome::Slot,
+            MemberOutcome::Slot,
+            MemberOutcome::Slot,
+            MemberOutcome::Slot,
+        ],
+        threshold: None,
+        fail_config: false,
+        multi: false,
+    });
+    assert_eq!(capped.confirmations.len(), 4);
+    for confirmation in &capped.confirmations[..3] {
+        assert_kernel_slot(confirmation, Slot(0));
+    }
+    assert_userspace_mapped(&capped.confirmations[3]);
+    assert_eq!(capped.attempts, 3);
+    assert!(capped.failed_target.is_none(), "the cap is not a failure");
+    assert_eq!(capped.tids.len(), 3, "the fourth run never attempted");
+    assert_eq!(
+        capped.fallback.first_reason,
+        Some(KernelFallbackReason::TargetLimit)
+    );
+    assert_eq!(KernelFallbackReason::TargetLimit.label(), "fd_headroom");
+    assert_eq!(
+        KernelFallbackReason::TargetLimit.detail(),
+        Some("target_run_limit")
+    );
+    // A failed member attempt demotes later segments instead.
+    let demoted = member_cell(MemberCellSpec {
+        mint: vec![true, true, true],
+        outcomes: vec![
+            MemberOutcome::Slot,
+            MemberOutcome::Failure(RunFailure::AttachOrRead),
+            MemberOutcome::Slot,
+        ],
+        threshold: None,
+        fail_config: false,
+        multi: false,
+    });
+    assert_kernel_slot(&demoted.confirmations[0], Slot(0));
+    assert_userspace_mapped(&demoted.confirmations[1]);
+    assert_userspace_mapped(&demoted.confirmations[2]);
+    assert_eq!(demoted.attempts, 2);
+    assert_eq!(demoted.failed_target, Some(RunFailure::AttachOrRead));
+    assert_eq!(demoted.tids.len(), 2, "the demoted run never attempted");
+    assert_eq!(
+        demoted.fallback.first_reason,
+        Some(KernelFallbackReason::TargetUnavailable)
+    );
+}
+
+#[test]
+fn failed_config_write_invalidates_binding() {
+    let out = member_cell(MemberCellSpec {
+        mint: vec![true, false],
+        outcomes: vec![MemberOutcome::Slot, MemberOutcome::Slot],
+        threshold: None,
+        fail_config: true,
+        multi: false,
+    });
+    // The failed target write invalidates the binding: both the member
+    // prove and the later ordinary prove fall back, with no attempts.
+    assert_eq!(out.confirmations.len(), 2);
+    for confirmation in &out.confirmations {
+        assert_userspace_mapped(confirmation);
+    }
+    assert_eq!(out.fallback.first_reason, Some(KernelFallbackReason::Scope));
+    assert!(!out.binding_valid, "binding invalidated");
+    assert_eq!(out.attempts, 0);
+    assert!(out.tids.is_empty(), "no run was attempted");
+    assert_eq!(
+        out.config_writes.len(),
+        2,
+        "install plus the failed target write"
+    );
+    assert_ne!(
+        (
+            out.config_writes[1].target_tgid,
+            out.config_writes[1].target_tid
+        ),
+        (0, 0),
+        "the failed write named its target"
+    );
+}

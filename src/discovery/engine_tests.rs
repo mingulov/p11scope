@@ -44524,3 +44524,464 @@ fn collected_finish_pending_graph_retains_actual_view_and_id() {
     assert_eq!(engine.deep_scans, 0);
     assert!(session.attached_slots.is_empty() && session.dynamic_attach_calls.is_empty());
 }
+
+/// Retain the actual accepted graph and native FD worker before any debt is
+/// introduced. Only real lifecycle/collision handling and Engine service may
+/// select its originals for retirement. The guard releases a blocked closer
+/// before field destruction on every assertion/error path.
+struct CollectedFinishGraphCase {
+    child: SystemScopeChildGuard,
+    engine: Engine,
+    session: ScriptedSession,
+    release: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    entered: std::sync::mpsc::Receiver<()>,
+    returned: std::sync::mpsc::Receiver<()>,
+    view: ProcessViewId,
+    admission: ViewAdmission,
+    original_slot: plan::Slot,
+    original_owner: plan::ModuleId,
+}
+
+impl CollectedFinishGraphCase {
+    fn new(fail_return: bool) -> Self {
+        let (child, mut engine, _) = engine_with_one_accepted_provider();
+        let child = SystemScopeChildGuard::new(child);
+        engine.scope = Scope::System;
+        let view = engine.views[0].id();
+        let admission = engine.views[0].view_admission();
+        let original_slot = engine.plan.slots[0].clone();
+        let original_owner = engine.plan.module_of_slot(original_slot.index).unwrap();
+        let release =
+            std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let gate = std::sync::Arc::clone(&release);
+        let (entered_sender, entered) = std::sync::mpsc::channel();
+        let (returned_sender, returned) = std::sync::mpsc::channel();
+        let retirement = crate::attach::RetirementFixture::new(
+            &engine.plan.slots,
+            &engine.pinned,
+            Box::new(move |owned, producer| {
+                if producer == crate::attach::ProducerProgram::UProbe("p11_return") {
+                    entered_sender.send(()).map_err(|error| error.to_string())?;
+                    let (lock, changed) = &*gate;
+                    let released = changed
+                        .wait_timeout_while(
+                            lock.lock().unwrap(),
+                            std::time::Duration::from_secs(5),
+                            |ready| !*ready,
+                        )
+                        .map_err(|error| error.to_string())?;
+                    if !*released.0 {
+                        return Err("owned graph retirement release deadline".into());
+                    }
+                    returned_sender
+                        .send(())
+                        .map_err(|error| error.to_string())?;
+                    if fail_return {
+                        return Err("actual graph return closer refused".into());
+                    }
+                }
+                drop(owned);
+                Ok(())
+            }),
+        );
+        let mut session = ScriptedSession::default();
+        session.global_retirement = Some(std::cell::RefCell::new(retirement));
+        Self {
+            child,
+            engine,
+            session,
+            release,
+            entered,
+            returned,
+            view,
+            admission,
+            original_slot,
+            original_owner,
+        }
+    }
+
+    fn release(&self) {
+        *self.release.0.lock().unwrap() = true;
+        self.release.1.notify_all();
+    }
+
+    fn service(&mut self, work: usize) -> BacklogOutcome {
+        self.engine
+            .service_collected_finish_records(&mut self.session, Vec::new(), 0, work)
+            .unwrap()
+    }
+
+    fn assert_original_pending(&mut self) {
+        assert!(self.engine.views.iter().any(|owner| {
+            owner.id() == self.view && owner.view_admission().same_allocation(&self.admission)
+        }));
+        assert!(self.engine.pinned.view_claims(self.view).is_some());
+        assert!(
+            self.engine
+                .pinned
+                .summary(self.original_slot.object)
+                .is_some()
+        );
+        assert!(
+            self.engine
+                .modules
+                .iter()
+                .any(|module| module.scanned.view == self.view)
+        );
+        assert_eq!(
+            self.engine.plan.module_of_slot(self.original_slot.index),
+            Some(self.original_owner)
+        );
+        assert_eq!(self.engine.plan.slots, [self.original_slot.clone()]);
+        let probe = self.engine.allocate_view_id().unwrap();
+        assert_ne!(
+            probe, self.view,
+            "the original graph owner ID is still held"
+        );
+        self.engine.release_view_id(probe);
+        assert_eq!(self.engine.deep_scans, 0);
+        assert!(self.session.attached_slots.is_empty());
+        assert!(self.session.dynamic_attach_calls.is_empty());
+        assert!(self.session.replaced_slot_indices.is_empty());
+    }
+
+    fn reach_native_handoff(&mut self) {
+        let mut submitted = false;
+        for _ in 0..512 {
+            let progress = self.service(1);
+            assert!(
+                progress.pending,
+                "the actual return closer is still blocked"
+            );
+            self.assert_original_pending();
+            if self
+                .session
+                .global_retirement
+                .as_ref()
+                .unwrap()
+                .borrow()
+                .begins
+                != 0
+            {
+                submitted = true;
+                break;
+            }
+        }
+        assert!(
+            submitted,
+            "bounded graph continuation must reach the actual native handoff"
+        );
+        self.entered
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert!(
+            self.session
+                .global_retirement
+                .as_ref()
+                .unwrap()
+                .borrow()
+                .blocking()
+        );
+        assert_eq!(
+            self.session
+                .global_retirement
+                .as_ref()
+                .unwrap()
+                .borrow()
+                .begins,
+            1
+        );
+        for _ in 0..4 {
+            assert!(self.service(1).pending);
+            self.assert_original_pending();
+            assert_eq!(
+                self.session
+                    .global_retirement
+                    .as_ref()
+                    .unwrap()
+                    .borrow()
+                    .begins,
+                1
+            );
+        }
+    }
+}
+
+impl Drop for CollectedFinishGraphCase {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+#[test]
+fn collected_finish_nonempty_retirement_waits_for_original_native_verdict() {
+    for fail_return in [false, true] {
+        let mut case = CollectedFinishGraphCase::new(fail_return);
+        case.child.reap().unwrap();
+        assert_eq!(case.engine.views[0].original_exited(), Ok(true));
+        case.engine.update_counter_snapshot(&case.session).unwrap();
+        case.engine.dispatch_lifecycle_record(
+            &mut case.session,
+            &collected_finish_leader_exit(case.child.pid()),
+            &mut PendingViewRetirements::new(),
+        );
+        assert!(case.engine.pending_leader_exit_views.contains(&case.view));
+        let plan = case.engine.plan.clone();
+        let pins = case.engine.pinned.revision();
+        let reads = case.session.counter_reads();
+        let zero = case.service(0);
+        assert!(zero.pending && !zero.progressed);
+        assert_eq!(case.session.counter_reads(), reads);
+        assert_eq!(case.engine.plan, plan);
+        assert_eq!(case.engine.pinned.revision(), pins);
+        assert_eq!(
+            case.session
+                .global_retirement
+                .as_ref()
+                .unwrap()
+                .borrow()
+                .begins,
+            0
+        );
+        case.assert_original_pending();
+        case.reach_native_handoff();
+        assert!(case.engine.pending_retirements.contains(&case.view));
+        case.release();
+        case.returned
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let progress = case.service(1);
+            let refused = case.engine.counters.object_skips.iter().any(|skip| {
+                skip.subject == "global native retirement"
+                    && skip.reason == "original static ownership remains uncertain; replacement admission is blocked"
+            });
+            if fail_return && refused {
+                assert!(progress.pending);
+                assert!(case.engine.pending_retirements.contains(&case.view));
+                case.assert_original_pending();
+                for _ in 0..4 {
+                    assert!(case.service(1).pending);
+                    case.assert_original_pending();
+                }
+                break;
+            }
+            if !fail_return && !progress.pending {
+                assert!(
+                    !case
+                        .session
+                        .global_retirement
+                        .as_ref()
+                        .unwrap()
+                        .borrow()
+                        .blocking()
+                );
+                assert!(!case.engine.pending_retirements.contains(&case.view));
+                assert!(
+                    case.engine
+                        .views
+                        .iter()
+                        .all(|owner| owner.id() != case.view)
+                );
+                assert!(
+                    case.engine
+                        .modules
+                        .iter()
+                        .all(|module| module.scanned.view != case.view)
+                );
+                assert!(case.engine.pinned.view_claims(case.view).is_none());
+                assert!(!case.engine.plan.is_active(case.original_slot.index));
+                assert_eq!(
+                    case.engine.plan.module_of_slot(case.original_slot.index),
+                    Some(case.original_owner)
+                );
+                assert_eq!(case.engine.plan.slots.len(), 1);
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "actual native verdict did not resolve the retained graph"
+            );
+            std::thread::yield_now();
+        }
+        let begins = case
+            .session
+            .global_retirement
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .begins;
+        assert_eq!(begins, 1);
+        assert_eq!(case.engine.deep_scans, 0);
+        assert!(
+            case.session.attached_slots.is_empty() && case.session.dynamic_attach_calls.is_empty()
+        );
+        if !fail_return {
+            let quiet = case.service(1);
+            assert!(!quiet.pending && !quiet.progressed);
+            assert_eq!(
+                case.session
+                    .global_retirement
+                    .as_ref()
+                    .unwrap()
+                    .borrow()
+                    .begins,
+                begins
+            );
+        }
+    }
+}
+
+#[test]
+fn collected_finish_nonempty_rejection_keeps_actual_collision_until_disposition() {
+    use crate::discovery::identity::test_fixture::real_scan_pin;
+
+    let mut case = CollectedFinishGraphCase::new(false);
+    let object = case.original_slot.object;
+    let summary = case.engine.pinned.summary(object).unwrap();
+    let key = summary.key;
+    let sha256 = summary.sha256.to_string();
+    let dir = tempfile::tempdir().unwrap();
+    let peer = dir.path().join("different-kernel-file.so");
+    std::fs::copy(case.engine.pinned.attach_path_for(object).unwrap(), &peer).unwrap();
+    // Existing identity fixture: a controlled raw mapping key names a second
+    // real opened file. The full same-kernel-file test must reject this actual
+    // collision even though the copied bytes/digest agree. Neither file changes.
+    let conflicting = real_scan_pin(&peer, Some(key), 991, &sha256);
+    let peer_id = conflicting.pinned().next().unwrap().id;
+    assert!(!conflicting.exactly_matches(peer_id, &case.engine.pinned, object));
+    assert_eq!(case.engine.pinned.check_unchanged(), Ok(true));
+    let mut pins = case.engine.pinned.clone();
+    let skipped = pins.absorb(conflicting);
+    assert!(pins.rejects(key) && !skipped.is_empty());
+    let raw = case
+        .engine
+        .modules
+        .iter()
+        .map(|module| module.scanned.clone())
+        .collect();
+    let candidate = case.engine.live_candidate(pins, raw, skipped).unwrap();
+    assert_eq!(candidate.delta.retire.len(), 1);
+    assert!(candidate.delta.new.is_empty() && candidate.delta.replace.is_empty());
+    // A real native preflight refusal leaves the previously accepted graph in
+    // place; the Engine itself retains the collision that the candidate proved.
+    case.session.refuse_preflight = true;
+    let outcome = case
+        .engine
+        .apply_candidate(&mut case.session, candidate, &mut false, false, &[])
+        .unwrap();
+    assert!(!outcome.accepted() && outcome.retains_intent());
+    assert!(outcome.newly_rejected_keys.contains(&key));
+    assert!(!case.session.preflight_targets.borrow().is_empty());
+    case.engine
+        .queue_apply_outcome(&outcome, &mut PendingViewRetirements::new());
+    assert!(case.engine.pending_rejected_keys.contains(&key));
+    assert!(case.engine.plan.is_active(case.original_slot.index));
+    case.assert_original_pending();
+    assert_eq!(
+        case.session
+            .global_retirement
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .begins,
+        0
+    );
+    assert!(
+        case.session
+            .global_retirement
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .has_slot_link(case.original_slot.index)
+    );
+    let reads = case.session.counter_reads();
+    let facts = case.engine.facts_revision;
+    let revision = case.engine.pinned.revision();
+    let zero = case.service(0);
+    assert!(zero.pending && !zero.progressed);
+    assert_eq!(case.session.counter_reads(), reads);
+    assert_eq!(case.engine.facts_revision, facts);
+    assert_eq!(case.engine.pinned.revision(), revision);
+    assert!(case.engine.pending_rejected_keys.contains(&key));
+    case.session.refuse_preflight = false;
+
+    case.reach_native_handoff();
+    assert!(case.engine.pending_rejected_keys.contains(&key));
+    assert!(
+        !case.engine.pinned.rejects(key),
+        "the old canonical graph remains held before native settlement"
+    );
+    case.release();
+    case.returned
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let progress = case.service(1);
+        if !progress.pending {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the original collision needs a real terminal disposition"
+        );
+        std::thread::yield_now();
+    }
+    assert!(case.engine.pending_rejected_keys.is_empty());
+    assert!(
+        case.engine.pinned.rejects(key),
+        "the actual collision stays irreversibly rejected"
+    );
+    assert!(!case.engine.plan.is_active(case.original_slot.index));
+    assert_eq!(
+        case.engine.plan.module_of_slot(case.original_slot.index),
+        Some(case.original_owner)
+    );
+    assert_eq!(case.engine.plan.slots.len(), 1);
+    assert!(case.engine.views.iter().any(|owner| {
+        owner.id() == case.view && owner.view_admission().same_allocation(&case.admission)
+    }));
+    assert_eq!(case.engine.deep_scans, 0);
+    assert!(case.session.attached_slots.is_empty() && case.session.dynamic_attach_calls.is_empty());
+    assert!(case.session.replaced_slot_indices.is_empty());
+    assert_eq!(
+        case.session
+            .global_retirement
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .begins,
+        1
+    );
+    assert_eq!(
+        case.session
+            .global_retirement
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .released(),
+        2
+    );
+    let quiet = case.service(1);
+    assert!(!quiet.pending && !quiet.progressed);
+    assert_eq!(
+        case.session
+            .global_retirement
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .begins,
+        1
+    );
+    assert_eq!(
+        case.session
+            .global_retirement
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .released(),
+        2
+    );
+}

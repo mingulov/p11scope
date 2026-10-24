@@ -44866,7 +44866,7 @@ fn collected_finish_nonempty_rejection_keeps_actual_collision_until_disposition(
     assert!(candidate.delta.new.is_empty() && candidate.delta.replace.is_empty());
     // A real native preflight refusal leaves the previously accepted graph in
     // place; the Engine itself retains the collision that the candidate proved.
-    case.session.refuse_preflight = true;
+    case.session.refuse_preflights([true]);
     let outcome = case
         .engine
         .apply_candidate(&mut case.session, candidate, &mut false, false, &[])
@@ -44905,7 +44905,7 @@ fn collected_finish_nonempty_rejection_keeps_actual_collision_until_disposition(
     assert_eq!(case.engine.facts_revision, facts);
     assert_eq!(case.engine.pinned.revision(), revision);
     assert!(case.engine.pending_rejected_keys.contains(&key));
-    case.session.refuse_preflight = false;
+    case.session.refuse_preflights([]);
 
     case.reach_native_handoff();
     assert!(case.engine.pending_rejected_keys.contains(&key));

@@ -593,13 +593,13 @@ pub(crate) const JOINT_FINISH_STORAGE_RETRIES: u16 = 100;
 /// retained grant, or the machine's first genuine Raw-minted grant after a
 /// grant-less observation. STOP may precede the first Joint admission, so a
 /// grant-less Q plus an own-producers grant stays admissible.
-#[allow(dead_code)] // Skeleton: the narrow placeholder; the latch wires the full predicate.
 pub(crate) fn finish_grant_admissible(
     q: &crate::attach::CollectedFinishQ,
     grant: &crate::semantics_objects::journal::SessionDrainGrant,
-    _producers: &crate::attach::SessionDrainProducers,
+    producers: &crate::attach::SessionDrainProducers,
 ) -> bool {
     q.matches_retained_grant(grant)
+        || (q.observed_without_grant() && grant.matches_producers(producers))
 }
 
 /// One optional Detailed lane: the Session owner, H0 `SemanticCapture`

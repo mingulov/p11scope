@@ -1277,7 +1277,10 @@ impl MachineScene {
         work: usize,
         progressed_for: usize,
     ) -> (
-        Result<crate::discovery::engine::inventory_coordinator::JointCommitProgress, SemanticRefusal>,
+        Result<
+            crate::discovery::engine::inventory_coordinator::JointCommitProgress,
+            SemanticRefusal,
+        >,
         usize,
     ) {
         let mut budget = crate::inventory_semantics::JointWorkBudget {
@@ -16814,13 +16817,7 @@ impl crate::inventory_semantics::JointMachineIo for DiscoveryScriptIo<'_> {
         _reserve: &crate::semantics_edge::resources::SemanticResourceReserver,
         _capacity: usize,
         _work: usize,
-    ) -> Result<
-        (
-            RawJointQuantum,
-            Option<crate::events::DispatchPoll>,
-        ),
-        RawQuantumRefusal,
-    > {
+    ) -> Result<(RawJointQuantum, Option<crate::events::DispatchPoll>), RawQuantumRefusal> {
         unreachable!("discovery-script IO never collects");
     }
 
@@ -16890,9 +16887,7 @@ impl crate::inventory_semantics::JointMachineIo for DiscoveryScriptIo<'_> {
         &mut self,
         _lane: &mut AttestedSemanticLane,
         _witnesses: &crate::inventory_semantics::RetainedJointBirths,
-        _inspect: impl for<'io> FnOnce(
-            crate::inventory_semantics::JointCommitIo<'io>,
-        ) -> R,
+        _inspect: impl for<'io> FnOnce(crate::inventory_semantics::JointCommitIo<'io>) -> R,
     ) -> Result<R, SemanticRefusal> {
         unreachable!("discovery-script IO never touches native handles");
     }
@@ -16903,8 +16898,7 @@ impl crate::inventory_semantics::JointMachineIo for DiscoveryScriptIo<'_> {
 /// poll's address.
 fn poll_finish_from_deeper_frame(
     scene: &mut MachineScene,
-) -> Result<crate::discovery::engine::inventory_coordinator::JointCommitProgress, SemanticRefusal>
-{
+) -> Result<crate::discovery::engine::inventory_coordinator::JointCommitProgress, SemanticRefusal> {
     let pad = std::hint::black_box([0u8; 4096]);
     let result = scene.poll_finish(1);
     std::hint::black_box(pad);
@@ -16962,10 +16956,7 @@ fn joint_machine_finish_q_mismatch_latches_disposition() {
     // boundary; the retained Q cannot match it.
     let original_finish = fixture.finish.take().unwrap();
     fixture.enable_finish_fixture(Vec::new());
-    assert_eq!(
-        fixture.poll_finish(1),
-        Err(SemanticRefusal::Unavailable)
-    );
+    assert_eq!(fixture.poll_finish(1), Err(SemanticRefusal::Unavailable));
     assert!(
         fixture.machine.finish_disposition_required(),
         "a Q mismatch must latch the Finish disposition"
@@ -17101,10 +17092,7 @@ fn joint_machine_finish_latches_validate_owner_error() {
     fixture
         .machine
         .inject_finish_site_for_test(FinishSite::ValidateOwner);
-    assert_eq!(
-        fixture.poll_finish(1),
-        Err(SemanticRefusal::Unavailable)
-    );
+    assert_eq!(fixture.poll_finish(1), Err(SemanticRefusal::Unavailable));
     assert!(fixture.machine.finish_disposition_required());
     assert_eq!(
         fixture.poll_finish(1),
@@ -17125,10 +17113,7 @@ fn joint_machine_finish_latches_discovery_domain_error() {
     fixture
         .machine
         .inject_finish_site_for_test(FinishSite::DiscoveryDomain);
-    assert_eq!(
-        fixture.poll_finish(1),
-        Err(SemanticRefusal::Unavailable)
-    );
+    assert_eq!(fixture.poll_finish(1), Err(SemanticRefusal::Unavailable));
     assert!(fixture.machine.finish_disposition_required());
     assert_eq!(
         fixture.poll_finish(1),
@@ -17339,10 +17324,7 @@ fn joint_machine_finish_duplicate_begin_does_not_latch() {
     fixture.prime(1);
     fixture.enable_finish_fixture(Vec::new());
     fixture.begin_finish().unwrap();
-    assert_eq!(
-        fixture.begin_finish(),
-        Err(SemanticRefusal::Unavailable)
-    );
+    assert_eq!(fixture.begin_finish(), Err(SemanticRefusal::Unavailable));
     assert!(
         !fixture.machine.finish_disposition_required(),
         "a duplicate begin latches nothing"
@@ -17371,18 +17353,11 @@ fn joint_lane_finish_wrapper_error_latches_lane_flag() {
             .scene
             .real
             .lane
-            .poll_joint_finish(
-                &mut fixture.scene.real.scene.coordinator,
-                &mut budget
-            )
+            .poll_joint_finish(&mut fixture.scene.real.scene.coordinator, &mut budget)
             .is_err()
     );
     assert!(
-        fixture
-            .scene
-            .real
-            .lane
-            .joint_finish_disposition_required(),
+        fixture.scene.real.lane.joint_finish_disposition_required(),
         "a pre-machine refusal latches the lane flag"
     );
     // Twin: a finished lane's refusal leaves the flag clear.
@@ -17401,18 +17376,11 @@ fn joint_lane_finish_wrapper_error_latches_lane_flag() {
             .scene
             .real
             .lane
-            .poll_joint_finish(
-                &mut finished.scene.real.scene.coordinator,
-                &mut budget
-            )
+            .poll_joint_finish(&mut finished.scene.real.scene.coordinator, &mut budget)
             .is_err()
     );
     assert!(
-        !finished
-            .scene
-            .real
-            .lane
-            .joint_finish_disposition_required(),
+        !finished.scene.real.lane.joint_finish_disposition_required(),
         "a finished lane's refusal latches nothing"
     );
 }
@@ -17502,11 +17470,10 @@ fn joint_machine_finish_grant_predicate_refuses_foreign_producers() {
         "the two scenes mint distinct drain grants"
     );
     // A's grant-less Q: observed before any admission.
-    let observer_a =
-        crate::attach::CollectedFinishQObserverForTest::with_discovery_bytes(
-            &scene_a.scene.producers,
-            Vec::new(),
-        );
+    let observer_a = crate::attach::CollectedFinishQObserverForTest::with_discovery_bytes(
+        &scene_a.scene.producers,
+        Vec::new(),
+    );
     observer_a.request_stop();
     let q_a = observer_a
         .observe(&scene_a.scene.producers, None, &scene_a.scene.drain)

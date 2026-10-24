@@ -15,12 +15,12 @@ use crate::discovery::engine::inventory_coordinator::{
 use crate::discovery::identity::PinnedObjectId;
 use crate::discovery::instances::{InstanceId, MAX_INSTANCES, MAX_PENDING};
 use crate::events::{DiscoveryDomain, DispatchPoll};
-use crate::inventory_semantics::{
-    AttestedSemanticLane, JOINT_FINISH_STORAGE_RETRIES, LaneDrainOutcome, LaneNegative,
-    MAX_LANE_NEGATIVES, SemanticBatch, SemanticRefusal,
-};
 #[cfg(test)]
 use crate::inventory_semantics::FinishSite;
+use crate::inventory_semantics::{
+    AttestedSemanticLane, JOINT_FINISH_STORAGE_RETRIES, LaneDrainOutcome, LaneNegative,
+    MAX_LANE_NEGATIVES, SemanticBatch, SemanticRefusal, finish_grant_admissible,
+};
 use crate::semantic_capture::{
     CommittedAbsenceBirth, CurrentPartitionReceipt, H0BirthCandidate, RetainedBirthWitness,
     TickOutcome, TickReport,
@@ -353,7 +353,10 @@ enum FinishDiscovery {
     AtQ,
 }
 struct FinishControl {
-    q: Option<CollectedFinishQ>,
+    q: Option<Box<CollectedFinishQ>>,
+    // Held only: the Q-box lease refunds when the Finish control drops.
+    #[allow(dead_code)]
+    q_storage: Option<ResourceLease>,
     discovery: FinishDiscovery,
 }
 
@@ -637,9 +640,8 @@ pub(crate) struct LiveJointMachine {
     refuse_finish_q_merge_once: bool,
     #[cfg(test)]
     refuse_pending_q_merge_once: bool,
-    // Skeleton: armed by the latch tests; read by the latch implementation.
+    // Armed one-shot fault for the latch tests (read at each site).
     #[cfg(test)]
-    #[allow(dead_code)]
     inject: Option<FinishSite>,
     // All original phase buffers and birth leases drop before inline storage.
     _storage: ResourceLease,
@@ -755,10 +757,13 @@ impl LiveJointMachine {
         coordinator: &mut InventoryCoordinator<OsProcessSource>,
         io: &mut I,
     ) -> Result<(), SemanticRefusal> {
-        // Skeleton: naive total latch; the implementation exempts finished
-        // lanes and duplicate begins.
+        let finished_before = lane.is_finished();
+        let duplicate = self.finish.is_some();
         let result = self.begin_finish_inner(lane, coordinator, io);
-        if let Err(reason) = &result {
+        if let Err(reason) = &result
+            && !finished_before
+            && !duplicate
+        {
             self.latch_finish(*reason);
         }
         result
@@ -770,6 +775,10 @@ impl LiveJointMachine {
         coordinator: &mut InventoryCoordinator<OsProcessSource>,
         io: &mut I,
     ) -> Result<(), SemanticRefusal> {
+        #[cfg(test)]
+        if self.take_inject(FinishSite::ValidateOwner) {
+            return Err(SemanticRefusal::Unavailable);
+        }
         self.validate_owner(lane, coordinator, io)?;
         if let RunState::DispositionRequired(reason) = self.state {
             return Err(reason);
@@ -777,10 +786,25 @@ impl LiveJointMachine {
         if self.finish.is_some() {
             return Err(SemanticRefusal::Unavailable);
         }
+        // The observed Q is boxed once so the transfer owner the native
+        // carrier compares stays stable across machine moves. A refused
+        // box latches at once; no Finish starts without it.
+        let q_storage = match coordinator
+            .registry()
+            .semantic_storage_reserver()
+            .reserve(size_of::<CollectedFinishQ>() + OWNED_ALLOCATION_PADDING)
+        {
+            Ok(storage) => storage,
+            Err(_) => {
+                self.state = RunState::DispositionRequired(SemanticRefusal::ProviderStorage);
+                return Err(SemanticRefusal::ProviderStorage);
+            }
+        };
         // Preserve an attempted error instead of automatically repeating the
         // native gate callback. This is not a successful Finish disposition.
         self.finish = Some(FinishControl {
             q: None,
+            q_storage: Some(q_storage),
             discovery: FinishDiscovery::Pending,
         });
         lane.mark_collected_finish_requested();
@@ -802,8 +826,14 @@ impl LiveJointMachine {
         io: &mut I,
         budget: &mut JointWorkBudget,
     ) -> Result<JointCommitProgress, SemanticRefusal> {
-        // Skeleton: pass-through; the implementation latches through latch_finish.
-        self.poll_finish_inner(lane, coordinator, io, budget)
+        let finished_before = lane.is_finished();
+        let result = self.poll_finish_inner(lane, coordinator, io, budget);
+        if let Err(reason) = &result
+            && !finished_before
+        {
+            self.latch_finish(*reason);
+        }
+        result
     }
 
     fn poll_finish_inner<I: JointMachineIo>(
@@ -813,6 +843,10 @@ impl LiveJointMachine {
         io: &mut I,
         budget: &mut JointWorkBudget,
     ) -> Result<JointCommitProgress, SemanticRefusal> {
+        #[cfg(test)]
+        if self.take_inject(FinishSite::ValidateOwner) {
+            return Err(SemanticRefusal::Unavailable);
+        }
         self.validate_owner(lane, coordinator, io)?;
         if let RunState::DispositionRequired(reason) = self.state {
             return Err(reason);
@@ -837,7 +871,7 @@ impl LiveJointMachine {
         if finish.q.is_none() {
             budget.spend(1);
             match io.observe_finish_q(lane, self.grant.as_ref()) {
-                Ok(q) => finish.q = q,
+                Ok(q) => finish.q = q.map(Box::new),
                 Err(reason) => {
                     self.state = RunState::DispositionRequired(reason);
                     return Err(reason);
@@ -845,35 +879,57 @@ impl LiveJointMachine {
             }
             return Ok(JointCommitProgress::Pending);
         }
-        let q = finish.q.as_ref().expect("owned observed Q");
+        let q = finish.q.as_deref().expect("owned observed Q");
+        #[cfg(test)]
+        if self.take_inject(FinishSite::DiscoveryDomain) {
+            return Err(SemanticRefusal::Unavailable);
+        }
         let discovery = io.finish_discovery_domain()?.clone();
         if !q.matches_owner(&self.producers, &discovery)
-            || self.grant.as_ref().is_some_and(|grant| {
-                !q.matches_retained_grant(grant)
-                    && !(q.observed_without_grant() && grant.matches_producers(&self.producers))
-            })
+            || self
+                .grant
+                .as_ref()
+                .is_some_and(|grant| !finish_grant_admissible(q, grant, &self.producers))
         {
             return Err(SemanticRefusal::Unavailable);
         }
         if matches!(finish.discovery, FinishDiscovery::Pending) {
-            budget.spend(1);
-            #[cfg(test)]
-            FINISH_Q_ADDR.with(|addr| addr.set(q as *const _ as usize));
-            let progress = match io.service_finish_discovery(lane, coordinator, q, 1) {
-                Ok(progress) => progress,
-                Err(reason) => {
-                    self.state = RunState::DispositionRequired(reason);
-                    return Err(reason);
+            // Spend discovery credits up to the hook budget. A credit
+            // without moved records still counts when the Engine
+            // progressed; only 64 consecutive idle credits yield.
+            let mut idle = 0;
+            while budget.available() {
+                budget.spend(1);
+                #[cfg(test)]
+                FINISH_Q_ADDR.with(|addr| addr.set(q as *const _ as usize));
+                let progress = match io.service_finish_discovery(lane, coordinator, q, 1) {
+                    Ok(progress) => progress,
+                    Err(reason) => {
+                        self.state = RunState::DispositionRequired(reason);
+                        return Err(reason);
+                    }
+                };
+                if progress.failed || progress.post_q {
+                    self.state = RunState::DispositionRequired(SemanticRefusal::Unavailable);
+                    return Err(SemanticRefusal::Unavailable);
                 }
-            };
-            if progress.failed || progress.post_q {
-                self.state = RunState::DispositionRequired(SemanticRefusal::Unavailable);
-                return Err(SemanticRefusal::Unavailable);
+                if !progress.backlog {
+                    finish.discovery = FinishDiscovery::AtQ;
+                    break;
+                }
+                let moved = progress.records > 0 || io.finish_discovery_progressed(coordinator);
+                if moved {
+                    idle = 0;
+                } else {
+                    idle += 1;
+                    if idle >= 64 {
+                        return Ok(JointCommitProgress::Pending);
+                    }
+                }
             }
-            if !progress.backlog {
-                finish.discovery = FinishDiscovery::AtQ;
+            if matches!(finish.discovery, FinishDiscovery::Pending) {
+                return Ok(JointCommitProgress::Pending);
             }
-            return Ok(JointCommitProgress::Pending);
         }
         while budget.available() {
             if matches!(self.phase.as_ref(), Some(Phase::AwaitH0(original)) if original.raw.h0_waiting())
@@ -889,9 +945,18 @@ impl LiveJointMachine {
             self.phase = Some(phase);
             match progress {
                 Ok(Step::Published) => {
-                    if let Some(completed) = self.finish_completed.as_ref() {
+                    if self.finish_completed.is_some() {
+                        #[cfg(test)]
+                        if self.take_inject(FinishSite::CompleteFinish) {
+                            return Err(SemanticRefusal::Unavailable);
+                        }
+                        let completed = self.finish_completed.as_ref().expect("checked just above");
                         lane.complete_collected_finish(completed, q)?;
                         drop(self.finish_completed.take());
+                        #[cfg(test)]
+                        if self.take_inject(FinishSite::MissingReceipt) {
+                            return Err(SemanticRefusal::Unavailable);
+                        }
                         return self
                             .finish_receipt
                             .take()
@@ -975,8 +1040,18 @@ impl LiveJointMachine {
         discovery: &DiscoveryDomain,
         budget: &mut JointWorkBudget,
     ) -> Result<JointServiceProgress, SemanticRefusal> {
-        if let Some(Phase::PendingQ { original, .. }) = self.phase.as_ref() {
-            original
+        // A pending report refusal latches at its site: this branch also
+        // serves the standalone pending-Q entry, which has no wrapper.
+        if matches!(self.phase, Some(Phase::PendingQ { .. })) {
+            #[cfg(test)]
+            if self.take_inject(FinishSite::PendingReport) {
+                self.state = RunState::DispositionRequired(SemanticRefusal::Unavailable);
+                return Err(SemanticRefusal::Unavailable);
+            }
+            let Some(Phase::PendingQ { original, .. }) = self.phase.as_ref() else {
+                unreachable!("matched just above");
+            };
+            if original
                 .raw
                 .validate_pending_finish_report(
                     coordinator.joint_capture().adapter(),
@@ -984,8 +1059,20 @@ impl LiveJointMachine {
                     discovery,
                     q,
                 )
-                .map_err(|_| SemanticRefusal::Unavailable)?;
-            let phase = self.phase.take().ok_or(SemanticRefusal::Unavailable)?;
+                .is_err()
+            {
+                self.state = RunState::DispositionRequired(SemanticRefusal::Unavailable);
+                return Err(SemanticRefusal::Unavailable);
+            }
+            #[cfg(test)]
+            if self.take_inject(FinishSite::PendingPhase) {
+                self.state = RunState::DispositionRequired(SemanticRefusal::Unavailable);
+                return Err(SemanticRefusal::Unavailable);
+            }
+            let Some(phase) = self.phase.take() else {
+                self.state = RunState::DispositionRequired(SemanticRefusal::Unavailable);
+                return Err(SemanticRefusal::Unavailable);
+            };
             let (phase, result) = self.merge_pending_q_phase(phase, lane, coordinator, budget);
             self.phase = Some(phase);
             if let Err(reason) = result {
@@ -1254,6 +1341,18 @@ impl LiveJointMachine {
         self.inject = Some(site);
     }
 
+    /// Take an armed fault once. Each injection fires a single time so the
+    /// next poll observes the latched first reason, not a fresh fault.
+    #[cfg(test)]
+    fn take_inject(&mut self, site: FinishSite) -> bool {
+        if self.inject == Some(site) {
+            self.inject = None;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Last Q address observed by Finish discovery service (Q-box test).
     #[cfg(test)]
     pub(crate) fn finish_q_addr_for_test() -> usize {
@@ -1267,7 +1366,7 @@ impl LiveJointMachine {
 
     #[cfg(test)]
     pub(crate) fn retained_finish_q_for_test(&self) -> Option<&CollectedFinishQ> {
-        self.finish.as_ref()?.q.as_ref()
+        self.finish.as_ref()?.q.as_deref()
     }
 
     #[cfg(test)]
@@ -2972,7 +3071,7 @@ impl AttestedSemanticLane {
             .joint_machine
             .as_ref()
             .and_then(|machine| machine.finish.as_ref())
-            .and_then(|finish| finish.q.as_ref())
+            .and_then(|finish| finish.q.as_deref())
             .map(|q| live.session.collected_finish_discovery_domain(q).cloned())
             .transpose()
             .map_err(|_| SemanticRefusal::Unavailable)?;
@@ -3028,9 +3127,19 @@ impl AttestedSemanticLane {
         &mut self,
         coordinator: &mut InventoryCoordinator<OsProcessSource>,
     ) -> Result<(), SemanticRefusal> {
-        self.with_machine_owner(coordinator, true, |machine, lane, coordinator, io| {
-            machine.begin_finish_with_io(lane, coordinator, io)
-        })
+        let mut ran = false;
+        let result =
+            self.with_machine_owner(coordinator, true, |machine, lane, coordinator, io| {
+                ran = true;
+                machine.begin_finish_with_io(lane, coordinator, io)
+            });
+        if let Err(reason) = &result
+            && !ran
+            && !self.is_finished()
+        {
+            self.joint_finish_failure.get_or_insert(*reason);
+        }
+        result
     }
 
     /// No Session or scheduling owner escapes while bounded Finish is pending.
@@ -3039,9 +3148,19 @@ impl AttestedSemanticLane {
         coordinator: &mut InventoryCoordinator<OsProcessSource>,
         budget: &mut JointWorkBudget,
     ) -> Result<JointCommitProgress, SemanticRefusal> {
-        self.with_machine_owner(coordinator, true, |machine, lane, coordinator, io| {
-            machine.poll_finish_with_io(lane, coordinator, io, budget)
-        })
+        let mut ran = false;
+        let result =
+            self.with_machine_owner(coordinator, true, |machine, lane, coordinator, io| {
+                ran = true;
+                machine.poll_finish_with_io(lane, coordinator, io, budget)
+            });
+        if let Err(reason) = &result
+            && !ran
+            && !self.is_finished()
+        {
+            self.joint_finish_failure.get_or_insert(*reason);
+        }
+        result
     }
 
     pub(crate) fn service_joint(

@@ -171,6 +171,7 @@ def cross_drive_module():
 
 
 def resolve_binary(path):
+    require(Path(path).is_absolute(), f"binary path is not absolute: {path}")
     resolved = Path(path).resolve(strict=True)
     require(resolved.is_absolute(), f"binary path is not absolute: {path}")
     require(os.access(resolved, os.X_OK), f"binary is not executable: {resolved}")
@@ -797,6 +798,8 @@ def run_red_proof(name, journeys, binary, root):
 
 
 def self_test(journeys, binary):
+    if binary:
+        binary = resolve_binary(binary)
     root = scratch_root()
     try:
         red_proof = os.environ.get(RED_PROOF_ENV)

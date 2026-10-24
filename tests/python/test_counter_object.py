@@ -7,14 +7,25 @@ import runpy
 import struct
 import subprocess
 import sys
+import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 CHECKER = ROOT / "scripts/check-counter-object.py"
+GROWTH_PROFILE_MODES = {
+    "counts-bank-growth-v2": "counts",
+    "timestamps-bank-growth-v2": "timestamps",
+    "latency-bank-growth-v2": "latency",
+}
+GROWTH_CONFIG_WORDS = {
+    "counts": 0x0200001800100200,
+    "timestamps": 0x0200002800100200,
+    "latency": 0x0200012800100200,
+}
 
 
 def bank_template_fixture(*, outer_banks=2, inner_type=6, inner_cells=1,
-                          value_bytes=24, values_length=0):
+                          value_bytes=24, values_length=0, value_shape="counts"):
     """Small literal BTF shapes; no compiler, host BTF or runtime map needed."""
     strings = bytearray(b"\0")
     types = []
@@ -42,11 +53,22 @@ def bank_template_fixture(*, outer_banks=2, inner_type=6, inner_cells=1,
         return add(4, size, b"".join(struct.pack("<III", name(n), ref, offset)
                                    for n, ref, offset in fields), count=len(fields))
 
-    counts = structure([("entered", u64, 0), ("returned", u64, 64),
-                        ("errors", u64, 128)], value_bytes)
+    if value_shape == "counts":
+        members = [("entered", u64, 0), ("returned", u64, 64), ("errors", u64, 128)]
+    elif value_shape == "timestamps":
+        members = [("entered", u64, 0), ("returned", u64, 64), ("errors", u64, 128),
+                   ("total_ns", u64, 192), ("max_ns", u64, 256)]
+    elif value_shape == "latency":
+        buckets = add(3, 0, struct.pack("<III", u64, u32, 32))
+        members = [("entered", u64, 0), ("returned", u64, 64), ("errors", u64, 128),
+                   ("total_ns", u64, 192), ("max_ns", u64, 256),
+                   ("buckets", buckets, 320)]
+    else:
+        raise AssertionError(f"unknown bank value shape: {value_shape}")
+    value = structure(members, value_bytes)
     inner = structure([("type", integer(inner_type), 0),
                        ("max_entries", integer(inner_cells), 64),
-                       ("key", pointer(u32), 128), ("value", pointer(counts), 192)], 32)
+                       ("key", pointer(u32), 128), ("value", pointer(value), 192)], 32)
     values = add(3, 0, struct.pack("<III", pointer(inner), u32, values_length))
     outer = structure([("type", integer(13), 0), ("max_entries", integer(outer_banks), 64),
                        ("map_flags", integer(128), 128), ("key", pointer(u32), 192),
@@ -106,19 +128,38 @@ class CounterObjectCliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("--self-test accepts no other arguments", result.stderr)
 
-    def test_growth_profile_is_explicit_and_counts_only(self):
-        profile = "counts-bank-growth-v2"
-        result = self.invoke("--profile", profile, "--mode", "counts", "missing.o")
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("counter object refused:", result.stderr)
-        for mode in ("timestamps", "latency"):
-            with self.subTest(mode=mode):
+    def test_growth_profiles_are_explicit_and_mode_exact(self):
+        for profile, mode in GROWTH_PROFILE_MODES.items():
+            with self.subTest(profile=profile):
                 result = self.invoke("--profile", profile, "--mode", mode, "missing.o")
                 self.assertEqual(result.returncode, 2)
-                self.assertIn("bank proof requires counts", result.stderr)
-        result = self.invoke("--self-test", "--profile", profile)
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("--self-test accepts no other arguments", result.stderr)
+                self.assertIn("counter object refused:", result.stderr)
+        for profile, mode in GROWTH_PROFILE_MODES.items():
+            for other in ("counts", "timestamps", "latency"):
+                if other == mode:
+                    continue
+                with self.subTest(profile=profile, mode=other):
+                    result = self.invoke("--profile", profile, "--mode", other,
+                                         "missing.o")
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn(f"bank proof requires {mode}", result.stderr)
+        for profile in GROWTH_PROFILE_MODES:
+            with self.subTest(profile=profile):
+                result = self.invoke("--self-test", "--profile", profile)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("--self-test accepts no other arguments", result.stderr)
+        with tempfile.NamedTemporaryFile(prefix="counter-timing-mutants-", suffix=".o") as stale:
+            stale.write(b"not an ELF object")
+            stale.flush()
+            for profile, mode in GROWTH_PROFILE_MODES.items():
+                if mode == "counts":
+                    continue
+                with self.subTest(profile=profile):
+                    result = self.invoke("--profile", profile, "--mode", mode,
+                                         "--self-test-mutants", stale.name)
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn(f"bank {mode} causal mutants need their built object",
+                                  result.stderr)
 
     def test_native_owner_bound_is_explicit_and_independent_of_stats_capacity(self):
         checker = runpy.run_path(str(CHECKER), run_name="counter_owner_bound_test")
@@ -611,6 +652,437 @@ class CounterObjectCliTests(unittest.TestCase):
         vm.contended.add("bank0")
         self.assertEqual(vm.execute((1, 0), [vm.bank_storage[0]], 0), 0)
         self.assertEqual(vm.row(0), (1, 0, 0), "failed CAS must preserve the real interfering update")
+
+    def test_growth_timing_profiles_require_clock_and_exact_value_size(self):
+        checker = runpy.run_path(str(CHECKER), run_name="counter_growth_timing_rules_test")
+        self.assertIn("bank_require_root_helpers", checker, "timing clock rule is not implemented")
+        self.assertIn("bank_require_health", checker, "timing health rule is not implemented")
+        self.assertIn("bank_require_inner_writes", checker, "timing inner-write rule is not implemented")
+        self.assertIn("BankTimestampsGrowthBtf", checker,
+                      "timestamps template decoder is not implemented")
+        self.assertIn("BankLatencyGrowthBtf", checker, "latency template decoder is not implemented")
+        for mode in ("timestamps", "latency"):
+            with self.subTest(mode=mode, clocks="present"):
+                self.assertIsNone(checker["bank_require_root_helpers"]([1, 5, 14], mode))
+            with self.subTest(mode=mode, clocks="absent"):
+                with self.assertRaisesRegex(RuntimeError, "has no clock read"):
+                    checker["bank_require_root_helpers"]([1, 14], mode)
+            with self.subTest(mode=mode, clocks="semantic helper"):
+                with self.assertRaisesRegex(RuntimeError, "forbidden/unknown helper 112"):
+                    checker["bank_require_root_helpers"]([5, 112], mode)
+        key = (1, 0)
+        self.assertIsNone(checker["bank_require_health"]({(key, 0, 0, 0), (key, 1, 1, 1)}))
+        self.assertIsNone(checker["bank_require_health"]({(key, 0, 0, 1)}))
+        for health in (set(), {(key, 0, 0, 0)}, {(key, 0, 1, 1)}):
+            with self.subTest(health=health):
+                with self.assertRaisesRegex(RuntimeError, "saturated/contended health"):
+                    checker["bank_require_health"](health)
+
+        def writes(*offsets):
+            return {(key, pc, "COUNTER_BANK_VALUE", "write", (offset, offset), 8, 0xf1)
+                    for pc, offset in enumerate(offsets)}
+
+        for mode in ("timestamps", "latency"):
+            with self.subTest(mode=mode, root="entry"):
+                self.assertIsNone(checker["bank_require_inner_writes"](writes(0), mode, True))
+                with self.assertRaisesRegex(
+                        RuntimeError, f"bank {mode} proof omits its inner field update at 0"):
+                    checker["bank_require_inner_writes"](set(), mode, True)
+            with self.subTest(mode=mode, root="return"):
+                full = writes(8, 16, 24, 32)
+                self.assertIsNone(checker["bank_require_inner_writes"](full, mode, False))
+                for offset in (8, 16, 24, 32):
+                    with self.subTest(missing=offset):
+                        with self.assertRaisesRegex(RuntimeError, f"at {offset}"):
+                            checker["bank_require_inner_writes"](
+                                {touch for touch in full if touch[4] != (offset, offset)},
+                                mode, False)
+                touched = {(key, 9, "COUNTER_BANK_VALUE", "read", (32, 32), 8, None)}
+                with self.subTest(reads_do_not_count=True):
+                    with self.assertRaisesRegex(RuntimeError, "at 32"):
+                        checker["bank_require_inner_writes"](
+                            writes(8, 16, 24) | touched, mode, False)
+        for mode, decoder, size in (("timestamps", "BankTimestampsGrowthBtf", 40),
+                                    ("latency", "BankLatencyGrowthBtf", 296)):
+            with self.subTest(mode=mode):
+                body, ref = bank_template_fixture(outer_banks=16, inner_cells=512,
+                                                  value_bytes=size, value_shape=mode)
+                definition, _ = checker[decoder](body).map_definition(ref)
+                self.assertEqual(definition["max_entries"], 16)
+                self.assertEqual(definition["inner_template"]["value_size"], size)
+
+        class SeedGraph:
+            def __init__(self, instruction):
+                self.instructions = {key: {0: instruction, 1: (0x95, 0, 0, 0)}}
+                self.loops, self.calls, self.bodies = {key: {}}, {}, {key: ("timing_seed",)}
+
+        pointer = ("ptr", "START", 0, 0, checker["ZERO"])
+
+        def run(instruction, value, mode="timestamps"):
+            proof = checker["BankFootprint"](SeedGraph(instruction),
+                                             {"START": {"value_size": 288}}, mode=mode)
+            proof.run(key, [pointer, value, None, None, None])
+            return proof
+
+        self.assertEqual(len(run((0x7b, 0x21, 0, 0), checker["scalar"]()).touches), 1)
+        self.assertEqual(len(run((0x7b, 0x21, 0, 0), checker["scalar"](), "latency").touches), 1)
+        for instruction, value in (((0x7b, 0x21, 0, 0), checker["ZERO"]),
+                                   ((0x7b, 0x21, 0, 0), checker["constant"](7)),
+                                   ((0x7b, 0x21, 4, 0), checker["scalar"]()),
+                                   ((0x63, 0x21, 0, 0), checker["scalar"]()),
+                                   ((0xdb, 0x21, 0, 0xf1), checker["scalar"]())):
+            with self.subTest(instruction=instruction, value=value):
+                with self.assertRaisesRegex(
+                        RuntimeError, "timestamps START timestamp is not one full clock word"):
+                    run(instruction, value)
+        with self.subTest(mode="latency", value="zero"):
+            with self.assertRaisesRegex(
+                    RuntimeError, "latency START timestamp is not one full clock word"):
+                run((0x7b, 0x21, 0, 0), checker["ZERO"], "latency")
+
+    def test_growth_counts_profile_forbids_clock_and_histogram(self):
+        checker = runpy.run_path(str(CHECKER), run_name="counter_growth_counts_rules_test")
+        self.assertIn("bank_require_root_helpers", checker, "bank clock rule is not implemented")
+        self.assertIsNone(checker["bank_require_root_helpers"]([1, 2, 14], "counts"))
+        with self.assertRaisesRegex(RuntimeError, "reaches clock/semantic/event/unknown helper"):
+            checker["bank_require_root_helpers"]([1, 5], "counts")
+        key = (1, 0)
+
+        class Graph:
+            def __init__(self, instruction):
+                self.instructions = {key: {0: instruction, 1: (0x95, 0, 0, 0)}}
+                self.loops, self.calls, self.bodies = {key: {}}, {}, {key: ("counts_cells",)}
+
+        pointer = ("ptr", "COUNTER_BANK_VALUE", 0, 0, checker["ZERO"])
+        maps = {"COUNTER_BANK_VALUE": {"value_size": 24}}
+
+        def run(instruction):
+            proof = checker["BankFootprint"](Graph(instruction), maps, mode="counts")
+            proof.run(key, [pointer, checker["ONE"], None, None, None])
+            return proof
+
+        for offset in (0, 8, 16):
+            with self.subTest(offset=offset):
+                self.assertEqual(len(run((0xdb, 0x21, offset, 0xf1)).touches), 1)
+        for offset in (24, 32, 40, 288):
+            with self.subTest(histogram_write=offset):
+                with self.assertRaisesRegex(RuntimeError, "not an exact full-width field"):
+                    run((0xdb, 0x21, offset, 0xf1))
+        with self.subTest(histogram_read=40):
+            with self.assertRaisesRegex(RuntimeError, "not an exact full-width field"):
+                run((0x79, 0x10, 40, 0))
+
+    def test_growth_mode_tokens_cannot_cross_configs(self):
+        checker = runpy.run_path(str(CHECKER), run_name="counter_growth_config_test")
+        self.assertIn("BANK_GROWTH_CONFIGS", checker,
+                      "per-mode bank configuration words are not implemented")
+        self.assertIn("bank_require_growth_configuration", checker,
+                      "configuration-word rule is not implemented")
+        self.assertEqual(checker["BANK_GROWTH_CONFIGS"], GROWTH_CONFIG_WORDS)
+        self.assertEqual(checker["BANK_GROWTH_CONFIG"], GROWTH_CONFIG_WORDS["counts"])
+        key = (1, 0)
+
+        class Graph:
+            def __init__(self, words, mapped=()):
+                self.instructions = {key: {pc * 2: (0x18, 1, 0, word & 0xffffffff)
+                                           for pc, word in enumerate(words)}}
+                body = bytearray()
+                for word in words:
+                    body += struct.pack("<BBhi", 0x18, 1, 0, word & 0xffffffff)
+                    body += struct.pack("<I", word >> 32) + bytes(4)
+                self.sections = {1: (None, bytes(body))}
+                self.mapped = {(key, pc * 2) for pc in mapped}
+
+            def map_at(self, function, pc):
+                return "COUNTER_BANKS" if (function, pc) in self.mapped else None
+
+        for mode, word in GROWTH_CONFIG_WORDS.items():
+            with self.subTest(mode=mode, word="own"):
+                self.assertIsNone(checker["bank_require_growth_configuration"](
+                    Graph([word]), {key}, mode))
+        for mode in GROWTH_CONFIG_WORDS:
+            for other, other_word in GROWTH_CONFIG_WORDS.items():
+                if other == mode:
+                    continue
+                with self.subTest(mode=mode, word=other):
+                    with self.assertRaisesRegex(RuntimeError, "another mode's configuration word"):
+                        checker["bank_require_growth_configuration"](
+                            Graph([other_word]), {key}, mode)
+        for mode in GROWTH_CONFIG_WORDS:
+            with self.subTest(mode=mode, word="missing"):
+                with self.assertRaisesRegex(RuntimeError, "omits its configuration word"):
+                    checker["bank_require_growth_configuration"](
+                        Graph([0x0102030405060708]), {key}, mode)
+            with self.subTest(mode=mode, word="absent"):
+                with self.assertRaisesRegex(RuntimeError, "omits its configuration word"):
+                    checker["bank_require_growth_configuration"](Graph([]), {key}, mode)
+
+    def test_growth_counts_mutant_clock_is_refused(self):
+        checker = runpy.run_path(str(CHECKER), run_name="counter_growth_counts_clock_test")
+        self.assertIn("bank_require_root_helpers", checker, "bank clock rule is not implemented")
+        with self.assertRaisesRegex(
+                RuntimeError, "^Counts bank root reaches clock/semantic/event/unknown helper$"):
+            checker["bank_require_root_helpers"]([1, 5, 14], "counts")
+        self.assertIsNone(checker["bank_require_root_helpers"]([1, 14], "counts"))
+
+    def test_growth_timestamps_mutant_histogram_is_refused(self):
+        checker = runpy.run_path(str(CHECKER), run_name="counter_growth_timestamps_cells_test")
+        self.assertIn("BankTimestampsGrowthBtf", checker,
+                      "timestamps template decoder is not implemented")
+        key = (1, 0)
+
+        class Graph:
+            def __init__(self, instruction):
+                self.instructions = {key: {0: instruction, 1: (0x95, 0, 0, 0)}}
+                self.loops, self.calls, self.bodies = {key: {}}, {}, {key: ("timestamp_cells",)}
+
+        pointer = ("ptr", "COUNTER_BANK_VALUE", 0, 0, checker["ZERO"])
+        maps = {"COUNTER_BANK_VALUE": {"value_size": 40}}
+
+        def run(instruction):
+            proof = checker["BankFootprint"](Graph(instruction), maps, mode="timestamps")
+            proof.run(key, [pointer, checker["ONE"], None, None, None])
+            return proof
+
+        for offset in (0, 8, 16, 24, 32):
+            with self.subTest(offset=offset):
+                self.assertEqual(len(run((0xdb, 0x21, offset, 0xf1)).touches), 1)
+        for offset in (40, 48, 288):
+            with self.subTest(histogram_write=offset):
+                with self.assertRaisesRegex(
+                        RuntimeError, "^bank Timestamps access is not an exact full-width field$"):
+                    run((0xdb, 0x21, offset, 0xf1))
+        with self.subTest(histogram_read=40):
+            with self.assertRaisesRegex(
+                    RuntimeError, "^bank Timestamps access is not an exact full-width field$"):
+                run((0x79, 0x10, 40, 0))
+        with self.subTest(max_read=32):
+            self.assertEqual(len(run((0x79, 0x10, 32, 0)).touches), 1)
+
+    def test_growth_mutant_wrong_config_is_refused(self):
+        checker = runpy.run_path(str(CHECKER), run_name="counter_growth_config_mutant_test")
+        self.assertIn("bank_require_growth_configuration", checker,
+                      "configuration-word rule is not implemented")
+        key = (1, 0)
+
+        class Graph:
+            def __init__(self, words, mapped=()):
+                self.instructions = {key: {pc * 2: (0x18, 1, 0, word & 0xffffffff)
+                                           for pc, word in enumerate(words)}}
+                body = bytearray()
+                for word in words:
+                    body += struct.pack("<BBhi", 0x18, 1, 0, word & 0xffffffff)
+                    body += struct.pack("<I", word >> 32) + bytes(4)
+                self.sections = {1: (None, bytes(body))}
+                self.mapped = {(key, pc * 2) for pc in mapped}
+
+            def map_at(self, function, pc):
+                return "COUNTER_BANKS" if (function, pc) in self.mapped else None
+
+        words = GROWTH_CONFIG_WORDS
+        with self.subTest(case="coexisting words name the intruder"):
+            with self.assertRaisesRegex(
+                    RuntimeError,
+                    "^bank timestamps proof carries another mode's configuration word: counts$"):
+                checker["bank_require_growth_configuration"](
+                    Graph([words["timestamps"], words["counts"]]), {key}, "timestamps")
+        with self.subTest(case="relocated literal is not a configuration word"):
+            with self.assertRaisesRegex(
+                    RuntimeError, "^bank latency proof omits its configuration word$"):
+                checker["bank_require_growth_configuration"](
+                    Graph([words["latency"]], mapped=(0,)), {key}, "latency")
+        with self.subTest(case="garbage word"):
+            with self.assertRaisesRegex(
+                    RuntimeError, "^bank counts proof omits its configuration word$"):
+                checker["bank_require_growth_configuration"](
+                    Graph([words["counts"] ^ 0x0100000000000000]), {key}, "counts")
+        with self.subTest(case="unknown mode"):
+            with self.assertRaisesRegex(RuntimeError, "unknown counter mode"):
+                checker["bank_require_growth_configuration"](
+                    Graph([words["counts"]]), {key}, "bogus")
+
+    def test_growth_counts_mutant_wider_template_is_refused(self):
+        checker = runpy.run_path(str(CHECKER), run_name="counter_growth_template_mutant_test")
+        self.assertIn("BankTimestampsGrowthBtf", checker,
+                      "timestamps template decoder is not implemented")
+        body, ref = bank_template_fixture(outer_banks=16, inner_cells=512,
+                                          value_bytes=40, value_shape="timestamps")
+        with self.assertRaisesRegex(RuntimeError, "exact Counts profile"):
+            checker["BankGrowthBtf"](body).map_definition(ref)
+        body, ref = bank_template_fixture(outer_banks=16, inner_cells=512,
+                                          value_bytes=24, value_shape="counts")
+        with self.assertRaisesRegex(RuntimeError, "exact Timestamps profile"):
+            checker["BankTimestampsGrowthBtf"](body).map_definition(ref)
+
+    def test_growth_timing_mutant_missing_start_removal_is_refused(self):
+        checker = runpy.run_path(str(CHECKER), run_name="counter_growth_bridge_work_test")
+        self.assertIn("bank_require_root_work", checker, "bank root-work rule is not implemented")
+        expected = {
+            ("counts", True): {"p11_bank_enter", "p11_owner_start_aggregate"},
+            ("counts", False): {"p11_bank_complete", "p11_owner_start_get",
+                                "p11_owner_start_remove"},
+            ("timestamps", True): {"p11_bank_enter_timed", "p11_owner_start_aggregate"},
+            ("timestamps", False): {"p11_bank_complete_timed", "p11_owner_start_get",
+                                     "p11_owner_start_remove"},
+            ("latency", True): {"p11_bank_enter_timed", "p11_owner_start_aggregate"},
+            ("latency", False): {"p11_bank_complete_timed", "p11_owner_start_get",
+                                 "p11_owner_start_remove"},
+        }
+        for (mode, entry), names in expected.items():
+            with self.subTest(mode=mode, entry=entry, names="complete"):
+                self.assertIsNone(checker["bank_require_root_work"](
+                    names | {"p11_counter_bank_entry"}, mode, entry))
+            for missing in sorted(names):
+                with self.subTest(mode=mode, entry=entry, missing=missing):
+                    with self.assertRaisesRegex(
+                            RuntimeError, "^bank proof root loses mandatory START/bridge work$"):
+                        checker["bank_require_root_work"](names - {missing}, mode, entry)
+        with self.subTest(mode="bogus"):
+            with self.assertRaisesRegex(RuntimeError, "unknown counter mode"):
+                checker["bank_require_root_work"](set(), "bogus", True)
+
+    def test_growth_mutants_swapped_mode_tokens_are_refused(self):
+        checker = runpy.run_path(str(CHECKER), run_name="counter_growth_token_swap_test")
+        self.assertIn("BankTimestampsGrowthBtf", checker,
+                      "timestamps template decoder is not implemented")
+        self.assertIn("BankLatencyGrowthBtf", checker, "latency template decoder is not implemented")
+        decoders = {"counts": "BankGrowthBtf", "timestamps": "BankTimestampsGrowthBtf",
+                    "latency": "BankLatencyGrowthBtf"}
+        shapes = {"counts": 24, "timestamps": 40, "latency": 296}
+        for shape, size in shapes.items():
+            body, ref = bank_template_fixture(outer_banks=16, inner_cells=512,
+                                              value_bytes=size, value_shape=shape)
+            for token, decoder in decoders.items():
+                with self.subTest(shape=shape, token=token):
+                    if shape == token:
+                        definition, _ = checker[decoder](body).map_definition(ref)
+                        self.assertEqual(definition["inner_template"]["value_size"], size)
+                    else:
+                        with self.assertRaises(RuntimeError):
+                            checker[decoder](body).map_definition(ref)
+        for token, decoder in decoders.items():
+            wrong_fields = "counts" if token != "counts" else "timestamps"
+            with self.subTest(token=token, fields=wrong_fields):
+                body, ref = bank_template_fixture(outer_banks=16, inner_cells=512,
+                                                  value_bytes=shapes[token],
+                                                  value_shape=wrong_fields)
+                with self.assertRaises(RuntimeError):
+                    checker[decoder](body).map_definition(ref)
+
+    def test_growth_latency_mutant_entry_bucket_is_refused(self):
+        checker = runpy.run_path(str(CHECKER), run_name="counter_growth_bucket_placement_test")
+        self.assertIn("bank_require_bucket_placement", checker,
+                      "bucket placement rule is not implemented")
+        key = (1, 0)
+
+        def touch(action, span, width=8, pc=0):
+            return (key, pc, "COUNTER_BANK_VALUE", action, span, width,
+                    0xf1 if action == "write" else None)
+
+        entry_clean = {touch("write", (0, 0)), touch("read", (32, 32))}
+        self.assertIsNone(checker["bank_require_bucket_placement"](entry_clean, True))
+        with self.subTest(entry="bucket write"):
+            with self.assertRaisesRegex(
+                    RuntimeError, "^latency bank entry writes histogram buckets$"):
+                checker["bank_require_bucket_placement"](
+                    entry_clean | {touch("write", (40, 40), pc=1)}, True)
+        with self.subTest(entry="bucket range write"):
+            with self.assertRaisesRegex(
+                    RuntimeError, "^latency bank entry writes histogram buckets$"):
+                checker["bank_require_bucket_placement"](
+                    entry_clean | {touch("write", (40, 288), pc=1)}, True)
+        with self.subTest(entry="bucket read"):
+            with self.assertRaisesRegex(
+                    RuntimeError, "^latency bank entry reads histogram buckets$"):
+                checker["bank_require_bucket_placement"](
+                    entry_clean | {touch("read", (40, 288), pc=1)}, True)
+        self.assertIsNone(checker["bank_require_bucket_placement"](
+            {touch("write", (8, 8)), touch("write", (40, 288), pc=1)}, False))
+        with self.subTest(returned="no bucket write"):
+            with self.assertRaisesRegex(
+                    RuntimeError, "^latency bank return omits its histogram bucket write$"):
+                checker["bank_require_bucket_placement"](
+                    {touch("write", (8, 8)), touch("write", (32, 32), pc=1)}, False)
+        with self.subTest(returned="bucket read without write"):
+            with self.assertRaisesRegex(
+                    RuntimeError, "^latency bank return omits its histogram bucket write$"):
+                checker["bank_require_bucket_placement"]({touch("read", (40, 288))}, False)
+
+        class ClampGraph:
+            def __init__(self, instructions):
+                self.instructions = {key: dict(enumerate(instructions))}
+                self.calls = {}
+                self.loops = {key: {}}
+                self.bodies = {key: ("bucket_clamp",)}
+
+        bucket_pointer = ("ptr", "COUNTER_BANK_VALUE", 0, 0, checker["ZERO"])
+        bucket_maps = {"COUNTER_BANK_VALUE": {"value_size": 296}}
+        clamp = [(0xbf, 0x17, 0, 0), (0xb7, 1, 0, 31), (0x2d, 0x21, 1, 0),
+                 (0xb7, 2, 0, 31), (0x67, 2, 0, 3), (0x0f, 0x27, 0, 0),
+                 (0x07, 7, 0, 40)]
+
+        def clamp_run(tail):
+            proof = checker["BankFootprint"](
+                ClampGraph(clamp + [tail, (0x95, 0, 0, 0)]), bucket_maps, mode="latency")
+            proof.run(key, [bucket_pointer, checker["scalar"](), None, None, None])
+            return proof
+
+        for tail, action in (((0x79, 0x70, 0, 0), "read"), ((0xdb, 0x27, 0, 0xf1), "write")):
+            with self.subTest(clamped=action):
+                touches = [touch for touch in clamp_run(tail).touches
+                           if touch[2:4] == ("COUNTER_BANK_VALUE", action)]
+                self.assertTrue(touches, "clamped bucket access left no proven touch")
+                for _, _, _, _, span, width, _ in touches:
+                    self.assertGreaterEqual(span[0], 40)
+                    self.assertLessEqual(span[1], 288)
+                    self.assertEqual(width, 8)
+        for label, at, replacement in (("guard_direction", 2, (0xad, 0x21, 1, 0)),
+                                       ("index32", 3, (0xb7, 2, 0, 32)),
+                                       ("stride16", 4, (0x67, 2, 0, 4))):
+            with self.subTest(damaged=label):
+                damaged = list(clamp)
+                damaged[at] = replacement
+                proof = checker["BankFootprint"](
+                    ClampGraph(damaged + [(0xdb, 0x27, 0, 0xf1), (0x95, 0, 0, 0)]),
+                    bucket_maps, mode="latency")
+                with self.assertRaisesRegex(RuntimeError, "escapes its bounded cell"):
+                    proof.run(key, [bucket_pointer, checker["scalar"](), None, None, None])
+
+    def test_growth_timing_start_read_must_precede_removal(self):
+        checker = runpy.run_path(str(CHECKER), run_name="counter_growth_start_order_test")
+        self.assertIn("bank_require_start_read_before_remove", checker,
+                      "START read-before-remove rule is not implemented")
+        remove_body, bridge_body = (2, 0), (1, 8)
+        bodies = {remove_body: ("p11_owner_start_remove",),
+                  bridge_body: ("p11_bank_complete_timed",)}
+        reached = {(1, 0), remove_body, bridge_body}
+
+        def check(touches, calls):
+            return checker["bank_require_start_read_before_remove"](
+                touches, calls, bodies, reached)
+
+        def read(pc, function=(1, 0)):
+            return (function, pc, "START", "read", (0, 0), 8, None)
+
+        remove_call = {((1, 0), 9): ("function", remove_body)}
+        self.assertIsNone(check({read(5)}, remove_call))
+        for label, touches in (("after removal", {read(12)}),
+                               ("another function", {read(1, bridge_body)}),
+                               ("marker only", {((1, 0), 5, "START", "read", (264, 264), 8, None)}),
+                               ("write only", {((1, 0), 5, "START", "write", (0, 0), 8, None)}),
+                               ("no read", set())):
+            with self.subTest(order=label):
+                with self.assertRaisesRegex(
+                        RuntimeError,
+                        "^bank timing return retires START before reading its entry timestamp$"):
+                    check(touches, remove_call)
+        with self.subTest(order="no removal is vacuous"):
+            self.assertIsNone(check(set(), {}))
+        with self.subTest(order="getter calls are ignored"):
+            get_call = {((1, 0), 9): ("function", (3, 0))}
+            bodies_with_get = {**bodies, (3, 0): ("p11_owner_start_get",)}
+            self.assertIsNone(checker["bank_require_start_read_before_remove"](
+                set(), get_call, bodies_with_get, reached | {(3, 0)}))
 
 
 if __name__ == "__main__":

@@ -16,7 +16,7 @@ const SCALARS: &[(SafeAttributeKind, &[u64])] = &[
     (SafeAttributeKind::Class, &[0, 1, 2, 3, 4]),
     (
         SafeAttributeKind::KeyType,
-        &[0x00, 0x01, 0x02, 0x03, 0x04, 0x10, 0x1f, 0x3a, 0x3b],
+        &[0x00, 0x01, 0x02, 0x03, 0x04, 0x10, 0x1f, 0x40, 0x41],
     ),
     (SafeAttributeKind::Token, &[0, 1]),
     (SafeAttributeKind::ValueLen, &[16, 24, 32]),

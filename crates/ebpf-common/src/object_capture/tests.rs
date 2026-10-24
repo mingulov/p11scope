@@ -1998,7 +1998,7 @@ fn object_producer_attributes_full_width_and_no_read() {
         (
             SEL_KEYTYPE,
             ak::KEY_TYPE,
-            &[0x00, 0x01, 0x02, 0x03, 0x04, 0x10, 0x1f, 0x3a, 0x3b],
+            &[0x00, 0x01, 0x02, 0x03, 0x04, 0x10, 0x1f, 0x40, 0x41],
         ),
         (SEL_TOKEN, ak::TOKEN, &[0, 1]),
         (SEL_VALUELEN, ak::VALUE_LEN, &[16, 24, 32]),

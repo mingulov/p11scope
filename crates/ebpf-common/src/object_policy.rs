@@ -61,7 +61,7 @@ pub const fn valid_safe_attribute_length(
 pub const fn classify_attribute_scalar(kind: SafeAttributeKind, value: u64) -> Option<u16> {
     match (kind, value) {
         (SafeAttributeKind::Class, 0..=4)
-        | (SafeAttributeKind::KeyType, 0x00..=0x04 | 0x10 | 0x1f | 0x3a | 0x3b)
+        | (SafeAttributeKind::KeyType, 0x00..=0x04 | 0x10 | 0x1f | 0x40 | 0x41)
         | (SafeAttributeKind::Token, 0 | 1)
         | (SafeAttributeKind::ValueLen, 16 | 24 | 32)
         | (SafeAttributeKind::ModulusBits, 1024 | 2048 | 3072 | 4096 | 8192) => Some(value as u16),

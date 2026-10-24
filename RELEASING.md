@@ -221,8 +221,8 @@ the P0 static observer (`--no-default-features --features stub-object-attributes
 musl, `+crt-static`, build-host paths remapped), builds the discover helper for
 glibc and musl in digest-pinned containers, and runs the canary, attach and hostile-target
 smokes against the packaged binaries. The helper lane
-(`scripts/verify-discover-containers.sh`) pins `rust:1.98.1-bookworm`,
-`rust:1.98.1-alpine3.22` and the `ubuntu:noble-20260810` run image by digest.
+(`scripts/verify-discover-containers.sh`) pins `rust:1.99.1-bookworm`,
+`rust:1.99.1-alpine3.22` and the `ubuntu:noble-20260810` run image by digest.
 
 Ordinary source builds default to FULL; `--no-default-features` alone does not
 select P0. The packager records `p11scope_features: ["stub-object-attributes"]`
@@ -241,17 +241,17 @@ the inherited build inputs in `RECEIPT_BUILD_INPUTS` set (`RUSTFLAGS`,
 no untracked `.cargo/config.toml`, and the pinned toolchains:
 
 ```sh
-rustup toolchain install 1.98.1 --profile minimal --component rustfmt,clippy
-rustup target add --toolchain 1.98.1 x86_64-unknown-linux-musl
+rustup toolchain install 1.99.1 --profile minimal --component rustfmt,clippy
+rustup target add --toolchain 1.99.1 x86_64-unknown-linux-musl
 rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
-cargo +1.98.1 install bpf-linker --version 0.10.4 --locked
+cargo +1.99.1 install bpf-linker --version 0.10.4 --locked
 python3 -I scripts/prepare-dependencies.py
-cargo +1.98.1 fetch --locked
+cargo +1.99.1 fetch --locked
 cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
 ```
 
 The stable version above is the release compiler, single-sourced from
-`.release-rust-version` (currently 1.98.1); the release scripts and CI read
+`.release-rust-version` (currently 1.99.1); the release scripts and CI read
 that file rather than pinning a literal. The `bpf-linker` version matches
 `CI_TOOL_BPF_LINKER` in `.github/workflows/ci.yml`.
 
@@ -304,7 +304,7 @@ Record the build facts for the release notes:
 
 ```sh
 cd /var/tmp/p11scope-release/v0.4.0/work/dist
-rustc +1.98.1 -V; rustc +nightly-2026-05-20 -V; bpf-linker --version; clang-18 --version
+rustc +1.99.1 -V; rustc +nightly-2026-05-20 -V; bpf-linker --version; clang-18 --version
 if strings -a p11scope | grep -Fq -- "$HOME"; then
   echo 'release binary embeds build-home path' >&2
   exit 1
@@ -339,8 +339,8 @@ archive, top-level `RELEASE.json` and `SHA256SUMS` (which covers the four
 archives plus `RELEASE.json`); those metadata files accompany the four
 archives on GitHub.
 
-Use `cargo-about` 0.9.2 and the official musl 1.2.5 source archive (the Rust 1.98.1 static target
-builds patched musl 1.2.5; the Alpine helper links musl 1.2.5-r12). Both pins
+Use `cargo-about` 0.9.2 and the official musl 1.2.5 source archive (the Rust 1.99.1 static target
+builds patched musl 1.2.5; the Alpine helper links musl 1.2.5-r13). Both pins
 are enforced: the notice generator accepts only `cargo-about 0.9.2` output
 and the recipe-pinned musl SHA-256. Verify its SHA-256
 before running the notice generator. The
@@ -348,7 +348,7 @@ example paths below are absolute; `/var/tmp/p11scope-release` was created with
 mode `0700` in step 5, each output is absent, and their parent remains private:
 
 ```sh
-cargo +1.98.1 install cargo-about --version 0.9.2 --locked --features cli
+cargo +1.99.1 install cargo-about --version 0.9.2 --locked --features cli
 mkdir -m 700 /var/tmp/p11scope-release/v0.4.0-package-inputs
 curl -fL https://musl.libc.org/releases/musl-1.2.5.tar.gz \
   -o /var/tmp/p11scope-release/v0.4.0-package-inputs/musl-1.2.5.tar.gz
@@ -419,7 +419,7 @@ tar --same-permissions --no-same-owner -xzf \
 (
   cd "$source_recipient/p11scope-source"
   python3 -I scripts/prepare-dependencies.py --offline
-  mise exec -- ./scripts/cargo.sh +1.98.1 build --locked --release \
+  mise exec -- ./scripts/cargo.sh +1.99.1 build --locked --release \
     --no-default-features --features stub-object-attributes \
     --target x86_64-unknown-linux-musl --bin p11scope
 )

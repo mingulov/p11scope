@@ -111,8 +111,8 @@ for the operating system's Unix-domain socket path limit.
 For example, enumerate and run an existing focused module before broadening:
 
 ```sh
-mise exec -- ./scripts/cargo.sh +1.98.1 test --locked -p p11scope --lib key_operation_tests:: -- --list
-mise exec -- ./scripts/cargo.sh +1.98.1 test --locked -p p11scope --lib key_operation_tests::
+mise exec -- ./scripts/cargo.sh +1.99.1 test --locked -p p11scope --lib key_operation_tests:: -- --list
+mise exec -- ./scripts/cargo.sh +1.99.1 test --locked -p p11scope --lib key_operation_tests::
 ```
 
 Check the output: libtest may exit successfully when a filter matches nothing.
@@ -120,10 +120,10 @@ The following is the complete V3 gate. Use `--no-fail-fast` on `test` when
 collecting failures across targets; failed and timed-out targets remain failed.
 
 ```sh
-mise exec -- ./scripts/cargo.sh +1.98.1 fmt --all -- --check
-mise exec -- ./scripts/cargo.sh +1.98.1 check --locked --workspace --all-targets
-mise exec -- ./scripts/cargo.sh +1.98.1 test --locked --workspace --all-targets
-mise exec -- ./scripts/cargo.sh +1.98.1 clippy --locked --workspace --all-targets -- -D warnings
+mise exec -- ./scripts/cargo.sh +1.99.1 fmt --all -- --check
+mise exec -- ./scripts/cargo.sh +1.99.1 check --locked --workspace --all-targets
+mise exec -- ./scripts/cargo.sh +1.99.1 test --locked --workspace --all-targets
+mise exec -- ./scripts/cargo.sh +1.99.1 clippy --locked --workspace --all-targets -- -D warnings
 ```
 
 Keep incremental caches warm and serialize Cargo-heavy jobs on a shared host.

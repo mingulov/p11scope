@@ -64,18 +64,18 @@ Public live cgroup qualification remains a development gate.
 
 The root manifest selects two patched crates reconstructed from
 `third-party/sources.json`; their generated trees are intentionally absent from
-Git. Mise selects the project's Rust 1.98.1 toolchain, and `scripts/cargo.sh`
+Git. Mise selects the project's Rust 1.99.1 toolchain, and `scripts/cargo.sh`
 prepares the generated sources before executing Cargo:
 
 ```sh
 mise install
-mise exec -- ./scripts/cargo.sh +1.98.1 build --locked
+mise exec -- ./scripts/cargo.sh +1.99.1 build --locked
 ```
 
-The stable toolchain version is single-sourced from `.release-rust-version`
-(currently 1.98.1), which `mise.toml`, CI, and the build scripts all read. It is the only
-supported toolchain (no older MSRV); it is bumped as new stable Rust releases
-ship.
+The release compiler is defined by `.release-rust-version` (currently 1.99.1).
+CI and build scripts read that pin; `mise.toml` and host manifest floors stay
+in sync with it. It is the supported host compiler, with no older MSRV, and
+is updated when new stable Rust releases ship.
 
 Preparation downloads only the recipe-pinned crates.io archives and verifies
 their hashes, ordered patches, final tree hashes, and receipts. For an offline
@@ -83,7 +83,7 @@ or frozen build, place the exact archives (`aya-0.14.0.crate` and
 `aya-obj-0.3.0.crate`, per `third-party/sources.json`) in
 `third-party/archives/` first, or
 run `python3 -I scripts/prepare-dependencies.py --archive-dir DIRECTORY`, then
-use `mise exec -- ./scripts/cargo.sh +1.98.1 build --locked --offline`. An
+use `mise exec -- ./scripts/cargo.sh +1.99.1 build --locked --offline`. An
 ordinary fresh checkout therefore needs archive access. A plain Git checkout
 or GitHub's automatic source archive excludes the generated trees, receipts
 and local archive cache. All locked registry packages and the fixed
@@ -168,30 +168,31 @@ trees `scripts/prepare-dependencies.py` generates. The official artifacts are
 built and verified by `scripts/build-release.sh` (see
 [RELEASING.md](RELEASING.md)); the commands below are local build examples.
 
-For the v0.4.0 checkpoint, select the published `v0.4.0` tag in your source
-checkout. Its intended P0 configuration needs `--features stub-object-attributes`
-as well as `--no-default-features`. Omitting that feature selects FULL;
+These commands describe current source. The published `v0.4.0` tag keeps
+its own Rust 1.98.1 pin; rebuild it with the instructions from that tag.
+The P0 configuration needs `--features stub-object-attributes` as well as
+`--no-default-features`. Omitting that feature selects FULL;
 `--no-default-features` alone does not disable object-attribute capture.
 FULL source builds and their broader acceptance remain development work.
 
 **Build prerequisites** (x86-64 Linux; Ubuntu package names): the pinned
 toolchains from [docs/development.md](docs/development.md). The scripts select
-the stable toolchain as `+1.98.1`, and the static observer needs its musl
+the stable toolchain as `+1.99.1`, and the static observer needs its musl
 target:
 
 ```sh
 sudo apt-get install -y build-essential clang-18 llvm python3 git
-rustup toolchain install 1.98.1 --profile minimal
-rustup target add --toolchain 1.98.1 x86_64-unknown-linux-musl
+rustup toolchain install 1.99.1 --profile minimal
+rustup target add --toolchain 1.99.1 x86_64-unknown-linux-musl
 rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
-cargo +1.98.1 install bpf-linker --version 0.10.4 --locked
+cargo +1.99.1 install bpf-linker --version 0.10.4 --locked
 ```
 
 **Observer (`p11scope`).** A static musl binary with the BPF object embedded;
 it never loads a provider, so one binary serves supported x86-64 Linux hosts:
 
 ```sh
-RUSTFLAGS='-C target-feature=+crt-static' ./scripts/cargo.sh +1.98.1 build \
+RUSTFLAGS='-C target-feature=+crt-static' ./scripts/cargo.sh +1.99.1 build \
   --locked --release --no-default-features \
   --features stub-object-attributes \
   --target x86_64-unknown-linux-musl --bin p11scope
@@ -205,7 +206,7 @@ provider's C library: build it on (or in a container of) a glibc system for
 glibc providers, and on a musl system such as Alpine for musl providers.
 
 ```sh
-./scripts/cargo.sh +1.98.1 build --locked --release -p p11scope-discover
+./scripts/cargo.sh +1.99.1 build --locked --release -p p11scope-discover
 sudo install -m 0755 target/release/p11scope-discover /usr/local/bin/
 ```
 

@@ -7,6 +7,13 @@ versioned separately and are opaque, exact dispatch keys.
 
 ## [Unreleased]
 
+- Update current host builds to Rust 1.99.1. Preserve the pinned BPF nightly,
+  linker and historical 1.98.1 baseline; CI selects the host transition
+  explicitly and gives each source/configuration its own build target.
+- Bind compiler notices to the selected release and refresh verified Rust,
+  LLVM runtime and helper-image inputs. Image/package metadata checks do not
+  replace the separate installed and packaging qualification.
+
 ## [0.4.0] - 2026-10-21
 
 v0.4.0: `inventory --cgroup` scope, offline `inventory

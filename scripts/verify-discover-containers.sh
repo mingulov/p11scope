@@ -3,7 +3,7 @@
 # Gate G1: p11scope-discover runs against SoftHSM2 and the deterministic
 # 68/92/104 table fixture in ubuntu (glibc) and alpine (musl). Both helper
 # builds are DYNAMIC (a static helper cannot dlopen providers sanely).
-# The glibc binary is built in rust:1.98.1-bookworm
+# The glibc binary is built in rust:1.99.1-bookworm
 # (glibc 2.36) so it runs on ubuntu 24.04 (2.39) — the host glibc may be
 # newer than the container's, so a host build is not portable.
 #
@@ -16,18 +16,18 @@ cd "$(dirname "$0")/.."
 
 ORACLE=scripts/fixtures/discover-manifest.jq
 SOFTHSM_FUNCTION_RECORDS=68
-# Official registry index digests: the Ubuntu pins were acquired on 2026-09-08
-# and the Rust pins on 2026-10-04. Each PLATFORM_IMAGE is the single
-# linux/amd64 entry of the index above it, read back from registry-1.docker.io
-# (Ubuntu on 2026-09-12, Rust on 2026-10-04) and compared digest-for-digest --
-# not inferred. Retain Rust 1.98 and Ubuntu 24.04; changing a tag, index or
-# selected platform must not silently change the qualification inputs.
-DISCOVER_GLIBC_BUILD_IMAGE=rust:1.98.1-bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
-DISCOVER_GLIBC_BUILD_PLATFORM_IMAGE=rust:1.98.1-bookworm@sha256:c49256cbe5ea0188bc658a689500d70c41eb51f009a7a7be209caf60a944f3ec
+# Official registry index digests: Ubuntu's pins remain the reviewed snapshots.
+# Rust 1.99.1 index, unique linux/amd64 child and config bytes were read from
+# registry-1.docker.io on 2026-10-24 and their SHA-256 values checked. These
+# image identities do not establish a container build or workload result.
+# Retain Ubuntu 24.04 and Alpine 3.22; changing a tag, index or selected
+# platform must not silently change the qualification inputs.
+DISCOVER_GLIBC_BUILD_IMAGE=rust:1.99.1-bookworm@sha256:48b7f435b8fc6378ce43b44f15e3a47fd8919b2825f835c39bd4bd3da50af5b8
+DISCOVER_GLIBC_BUILD_PLATFORM_IMAGE=rust:1.99.1-bookworm@sha256:8bf7188ae46ad73b801c8d405eedc13ce63a7852b562885743a56890723549a8
 DISCOVER_GLIBC_RUN_IMAGE=ubuntu:noble-20260810@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517
 DISCOVER_GLIBC_RUN_PLATFORM_IMAGE=ubuntu:noble-20260810@sha256:1e0a86e57d247923571b75e0aaf48a1449cf8c543d51fb3e07a4a7d7bfa79316
-DISCOVER_MUSL_IMAGE=rust:1.98.1-alpine3.22@sha256:a1796ca6fa216d6727b5f61c69e4c665b120b1a4dcb969639e2f25f1ed309456
-DISCOVER_MUSL_PLATFORM_IMAGE=rust:1.98.1-alpine3.22@sha256:df2234c615138222413254f45937ae45d284aad971644fe564e4250609abe452
+DISCOVER_MUSL_IMAGE=rust:1.99.1-alpine3.22@sha256:731f64e16c12af70970d9a3655eecb1eecab4898352f09688a8e5ca2ab8b77c5
+DISCOVER_MUSL_PLATFORM_IMAGE=rust:1.99.1-alpine3.22@sha256:6d199c50733bbd8f001c28042caeae57707725bc7843596a15ea476c300a0cbb
 # Ubuntu 24.04's signed snapshot service freezes the complete apt dependency
 # closure. Alpine has no equivalent archive snapshot, so every requested v3.22
 # package is exact-versioned and restricted to the official main repository.
@@ -57,12 +57,12 @@ work, oracle, records = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3])
 script_path, matrix_path = Path(sys.argv[4]), Path(sys.argv[5])
 
 EXPECTED_PINS = (
-    "DISCOVER_GLIBC_BUILD_IMAGE=rust:1.98.1-bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e",
-    "DISCOVER_GLIBC_BUILD_PLATFORM_IMAGE=rust:1.98.1-bookworm@sha256:c49256cbe5ea0188bc658a689500d70c41eb51f009a7a7be209caf60a944f3ec",
+    "DISCOVER_GLIBC_BUILD_IMAGE=rust:1.99.1-bookworm@sha256:48b7f435b8fc6378ce43b44f15e3a47fd8919b2825f835c39bd4bd3da50af5b8",
+    "DISCOVER_GLIBC_BUILD_PLATFORM_IMAGE=rust:1.99.1-bookworm@sha256:8bf7188ae46ad73b801c8d405eedc13ce63a7852b562885743a56890723549a8",
     "DISCOVER_GLIBC_RUN_IMAGE=ubuntu:noble-20260810@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517",
     "DISCOVER_GLIBC_RUN_PLATFORM_IMAGE=ubuntu:noble-20260810@sha256:1e0a86e57d247923571b75e0aaf48a1449cf8c543d51fb3e07a4a7d7bfa79316",
-    "DISCOVER_MUSL_IMAGE=rust:1.98.1-alpine3.22@sha256:a1796ca6fa216d6727b5f61c69e4c665b120b1a4dcb969639e2f25f1ed309456",
-    "DISCOVER_MUSL_PLATFORM_IMAGE=rust:1.98.1-alpine3.22@sha256:df2234c615138222413254f45937ae45d284aad971644fe564e4250609abe452",
+    "DISCOVER_MUSL_IMAGE=rust:1.99.1-alpine3.22@sha256:731f64e16c12af70970d9a3655eecb1eecab4898352f09688a8e5ca2ab8b77c5",
+    "DISCOVER_MUSL_PLATFORM_IMAGE=rust:1.99.1-alpine3.22@sha256:6d199c50733bbd8f001c28042caeae57707725bc7843596a15ea476c300a0cbb",
     "UBUNTU_APT_SNAPSHOT=20260810T000000Z",
     "ALPINE_MAIN_REPOSITORY=https://dl-cdn.alpinelinux.org/alpine/v3.22/main",
 )
@@ -76,7 +76,7 @@ EXPECTED_APK_PACKAGES = (
     "jq=1.8.2-r0",
     "libatomic=14.2.0-r6",
     "libcap-ng=0.8.5-r0",
-    "libcrypto3=3.5.8-r0",
+    "libcrypto3=3.5.9-r0",
     "libgcc=14.2.0-r6",
     "libgomp=14.2.0-r6",
     "libmagic=5.46-r2",
@@ -84,8 +84,8 @@ EXPECTED_APK_PACKAGES = (
     "libstdc++=14.2.0-r6",
     "mpc1=1.3.1-r1",
     "mpfr4=4.2.1_p1-r0",
-    "musl=1.2.5-r12",
-    "musl-dev=1.2.5-r12",
+    "musl=1.2.5-r13",
+    "musl-dev=1.2.5-r13",
     "ncurses-terminfo-base=6.5_p20250503-r0",
     "oniguruma=6.9.10-r0",
     "readline=8.2.13-r1",
@@ -93,24 +93,25 @@ EXPECTED_APK_PACKAGES = (
     "softhsm=2.6.1-r6",
     "sqlite=3.49.2-r1",
     "sqlite-libs=3.49.2-r1",
-    "zlib=1.3.2-r0",
+    "zlib=1.3.2-r1",
     "zstd-libs=1.5.7-r0",
 )
-# Exact `apk info -v | sort` closure left by the musl lane on the pinned
-# alpine3.22 base: base image (30) plus the 12 requested packages absent
-# from it. Any solver-pulled extra dependency changes this set and must
-# fail the lane. Names are `name-version` as apk info prints them.
+# Expected `apk info -v | sort` closure: actual pinned-image package DB
+# (30 packages) plus the 12 absent exact requests, checked against the
+# official v3.22 APKINDEX dependencies. This is an inferred expectation;
+# the runtime comparison below must prove the installed set. Any extra
+# solver dependency fails the lane. Names use apk's `name-version` format.
 EXPECTED_MUSL_APK_INFO = (
     "alpine-baselayout-3.7.0-r0",
     "alpine-baselayout-data-3.7.0-r0",
     "alpine-keys-2.5-r0",
-    "alpine-release-3.22.6-r0",
+    "alpine-release-3.22.7-r0",
     "apk-tools-2.14.12-r0",
     "binutils-2.44-r3",
     "busybox-1.37.0-r20",
     "busybox-binsh-1.37.0-r20",
-    "ca-certificates-20260909-r0",
-    "ca-certificates-bundle-20260909-r0",
+    "ca-certificates-20261020-r0",
+    "ca-certificates-bundle-20261020-r0",
     "file-5.46-r2",
     "gcc-14.2.0-r6",
     "gmp-6.3.0-r3",
@@ -120,18 +121,18 @@ EXPECTED_MUSL_APK_INFO = (
     "libapk2-2.14.12-r0",
     "libatomic-14.2.0-r6",
     "libcap-ng-0.8.5-r0",
-    "libcrypto3-3.5.8-r0",
+    "libcrypto3-3.5.9-r0",
     "libgcc-14.2.0-r6",
     "libgomp-14.2.0-r6",
     "libmagic-5.46-r2",
     "libncursesw-6.5_p20250503-r0",
-    "libssl3-3.5.8-r0",
+    "libssl3-3.5.9-r0",
     "libstdc++-14.2.0-r6",
     "mpc1-1.3.1-r1",
     "mpfr4-4.2.1_p1-r0",
-    "musl-1.2.5-r12",
-    "musl-dev-1.2.5-r12",
-    "musl-utils-1.2.5-r12",
+    "musl-1.2.5-r13",
+    "musl-dev-1.2.5-r13",
+    "musl-utils-1.2.5-r13",
     "ncurses-terminfo-base-6.5_p20250503-r0",
     "oniguruma-6.9.10-r0",
     "readline-8.2.13-r1",
@@ -141,7 +142,7 @@ EXPECTED_MUSL_APK_INFO = (
     "sqlite-3.49.2-r1",
     "sqlite-libs-3.49.2-r1",
     "ssl_client-1.37.0-r20",
-    "zlib-1.3.2-r0",
+    "zlib-1.3.2-r1",
     "zstd-libs-1.5.7-r0",
 )
 PRODUCTION_CA_BOOTSTRAP = (
@@ -302,7 +303,7 @@ pin_mutations = (
     ),
     (
         "unpinned Alpine package",
-        mutate_production(script_source, "musl-dev=1.2.5-r12", "musl-dev"),
+        mutate_production(script_source, "musl-dev=1.2.5-r13", "musl-dev"),
         matrix_source,
     ),
     (
@@ -368,7 +369,7 @@ pin_mutations = (
     (
         "wrong linux platform manifest",
         script_source.replace(
-            "df2234c615138222413254f45937ae45d284aad971644fe564e4250609abe452",
+            "6d199c50733bbd8f001c28042caeae57707725bc7843596a15ea476c300a0cbb",
             "4cd7a3f9ccccbdf1825d14a015a30ac19bf8b959ec3d18aa5da8e6a17ce7ec70",
             1,
         ),
@@ -776,12 +777,12 @@ MUSL_BUILD_ID=$(create_owned --name "$MUSL_BUILD" \
       binutils=2.44-r3 file=5.46-r2 gcc=14.2.0-r6 \
       gmp=6.3.0-r3 isl26=0.26-r1 jansson=2.14.1-r0 \
       jq=1.8.2-r0 libatomic=14.2.0-r6 libcap-ng=0.8.5-r0 \
-      libcrypto3=3.5.8-r0 libgcc=14.2.0-r6 libgomp=14.2.0-r6 \
+      libcrypto3=3.5.9-r0 libgcc=14.2.0-r6 libgomp=14.2.0-r6 \
       libmagic=5.46-r2 libncursesw=6.5_p20250503-r0 libstdc++=14.2.0-r6 \
-      mpc1=1.3.1-r1 mpfr4=4.2.1_p1-r0 musl=1.2.5-r12 \
-      musl-dev=1.2.5-r12 ncurses-terminfo-base=6.5_p20250503-r0 oniguruma=6.9.10-r0 \
+      mpc1=1.3.1-r1 mpfr4=4.2.1_p1-r0 musl=1.2.5-r13 \
+      musl-dev=1.2.5-r13 ncurses-terminfo-base=6.5_p20250503-r0 oniguruma=6.9.10-r0 \
       readline=8.2.13-r1 setpriv=2.41.6-r1 softhsm=2.6.1-r6 \
-      sqlite=3.49.2-r1 sqlite-libs=3.49.2-r1 zlib=1.3.2-r0 \
+      sqlite=3.49.2-r1 sqlite-libs=3.49.2-r1 zlib=1.3.2-r1 \
       zstd-libs=1.5.7-r0
   apk info -v 2>/dev/null | sort > /receipt/musl-apk-info.txt
   cat /receipt/musl-apk-info.txt
@@ -823,13 +824,13 @@ cat > "$DISCOVER_WORK/musl-apk-expected.txt" <<'EOF'
 alpine-baselayout-3.7.0-r0
 alpine-baselayout-data-3.7.0-r0
 alpine-keys-2.5-r0
-alpine-release-3.22.6-r0
+alpine-release-3.22.7-r0
 apk-tools-2.14.12-r0
 binutils-2.44-r3
 busybox-1.37.0-r20
 busybox-binsh-1.37.0-r20
-ca-certificates-20260909-r0
-ca-certificates-bundle-20260909-r0
+ca-certificates-20261020-r0
+ca-certificates-bundle-20261020-r0
 file-5.46-r2
 gcc-14.2.0-r6
 gmp-6.3.0-r3
@@ -839,18 +840,18 @@ jq-1.8.2-r0
 libapk2-2.14.12-r0
 libatomic-14.2.0-r6
 libcap-ng-0.8.5-r0
-libcrypto3-3.5.8-r0
+libcrypto3-3.5.9-r0
 libgcc-14.2.0-r6
 libgomp-14.2.0-r6
 libmagic-5.46-r2
 libncursesw-6.5_p20250503-r0
-libssl3-3.5.8-r0
+libssl3-3.5.9-r0
 libstdc++-14.2.0-r6
 mpc1-1.3.1-r1
 mpfr4-4.2.1_p1-r0
-musl-1.2.5-r12
-musl-dev-1.2.5-r12
-musl-utils-1.2.5-r12
+musl-1.2.5-r13
+musl-dev-1.2.5-r13
+musl-utils-1.2.5-r13
 ncurses-terminfo-base-6.5_p20250503-r0
 oniguruma-6.9.10-r0
 readline-8.2.13-r1
@@ -860,7 +861,7 @@ softhsm-2.6.1-r6
 sqlite-3.49.2-r1
 sqlite-libs-3.49.2-r1
 ssl_client-1.37.0-r20
-zlib-1.3.2-r0
+zlib-1.3.2-r1
 zstd-libs-1.5.7-r0
 EOF
 cmp -s "$DISCOVER_WORK/musl-apk-expected.txt" "$DISCOVER_WORK/musl-apk-info.txt" \

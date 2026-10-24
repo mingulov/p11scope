@@ -170,7 +170,7 @@
     },
     "debian-gcc-12.2.0-14+deb12u1-copyright.txt": {
       "bytes": 68194,
-      "image": "rust:1.98.1-bookworm@sha256:c49256cbe5ea0188bc658a689500d70c41eb51f009a7a7be209caf60a944f3ec",
+      "image": "rust:1.99.1-bookworm@sha256:8bf7188ae46ad73b801c8d405eedc13ce63a7852b562885743a56890723549a8",
       "package": "gcc-12-base / libgcc-12-dev",
       "package_version": "12.2.0-14+deb12u1",
       "scope": "Original distribution copyright inventory retained conservatively; not an assertion all described code is linked or shipped.",
@@ -180,7 +180,7 @@
     },
     "debian-glibc-2.36-9+deb12u14-copyright.txt": {
       "bytes": 25467,
-      "image": "rust:1.98.1-bookworm@sha256:c49256cbe5ea0188bc658a689500d70c41eb51f009a7a7be209caf60a944f3ec",
+      "image": "rust:1.99.1-bookworm@sha256:8bf7188ae46ad73b801c8d405eedc13ce63a7852b562885743a56890723549a8",
       "package": "libc6-dev",
       "package_version": "2.36-9+deb12u14",
       "scope": "Original distribution copyright inventory retained conservatively; not an assertion all described code is linked or shipped.",
@@ -408,25 +408,25 @@
       "upstream_revision": "c804cd1c00adde061ca51711f63068c103e94eef",
       "url": "https://raw.githubusercontent.com/bminor/glibc/c804cd1c00adde061ca51711f63068c103e94eef/sysdeps/x86_64/start.S"
     },
-    "llvm-52ed14f-compiler-rt-lib-builtins-crtbegin.c.txt": {
-      "bytes": 6750,
-      "sha256": "ad21b03ddb3f66530ef34394cc1819f5156d536c30efba7486a7834120fba93f",
-      "url": "https://raw.githubusercontent.com/rust-lang/llvm-project/52ed14fcd56afc30f9cccd8ca8ce237c2eef7e04/compiler-rt/lib/builtins/crtbegin.c"
+    "llvm-1b9c0d5-compiler-rt-lib-builtins-crtbegin.c.txt": {
+      "bytes": 5750,
+      "sha256": "914d5440e1d1009aa63ab2597026d02fe0d4b772ac648a1d4dd16b0a6add2c6b",
+      "url": "https://raw.githubusercontent.com/rust-lang/llvm-project/1b9c0d5ff9bbe7634aead059efe6b11a7eeba145/compiler-rt/lib/builtins/crtbegin.c"
     },
-    "llvm-52ed14f-compiler-rt-lib-builtins-crtend.c.txt": {
+    "llvm-1b9c0d5-compiler-rt-lib-builtins-crtend.c.txt": {
       "bytes": 890,
       "sha256": "6d5a61b8f2f6fa541a12ec52aea40b5085e40fcf8626984d318523cb30335d06",
-      "url": "https://raw.githubusercontent.com/rust-lang/llvm-project/52ed14fcd56afc30f9cccd8ca8ce237c2eef7e04/compiler-rt/lib/builtins/crtend.c"
+      "url": "https://raw.githubusercontent.com/rust-lang/llvm-project/1b9c0d5ff9bbe7634aead059efe6b11a7eeba145/compiler-rt/lib/builtins/crtend.c"
     },
-    "llvm-52ed14f-compiler-rt-license.txt": {
+    "llvm-1b9c0d5-compiler-rt-license.txt": {
       "bytes": 16708,
       "sha256": "1a8f1058753f1ba890de984e48f0242a3a5c29a6a8f2ed9fd813f36985387e8d",
-      "url": "https://raw.githubusercontent.com/rust-lang/llvm-project/52ed14fcd56afc30f9cccd8ca8ce237c2eef7e04/compiler-rt/LICENSE.TXT"
+      "url": "https://raw.githubusercontent.com/rust-lang/llvm-project/1b9c0d5ff9bbe7634aead059efe6b11a7eeba145/compiler-rt/LICENSE.TXT"
     },
-    "llvm-52ed14f-libunwind-license.txt": {
+    "llvm-1b9c0d5-libunwind-license.txt": {
       "bytes": 16706,
       "sha256": "b5efebcaca80879234098e52d1725e6d9eb8fb96a19fce625d39184b705f7b6d",
-      "url": "https://raw.githubusercontent.com/rust-lang/llvm-project/52ed14fcd56afc30f9cccd8ca8ce237c2eef7e04/libunwind/LICENSE.TXT"
+      "url": "https://raw.githubusercontent.com/rust-lang/llvm-project/1b9c0d5ff9bbe7634aead059efe6b11a7eeba145/libunwind/LICENSE.TXT"
     },
     "musl-1.2.5-COPYRIGHT.txt": {
       "archive": "musl-1.2.5.tar.gz",
@@ -512,8 +512,8 @@
   "musl": [
     {
       "build_recipe": "scripts/verify-discover-containers.sh",
-      "notice_scope": "Full original musl source archive preserves individual file notices; the Rust static target applies rust_patches (musl-cross-make 3635262e 0001-0002 plus Rust-added 0003-0004; reviewed, no new terms) and the helper build pins Alpine musl 1.2.5-r12 with distro patches reviewed in helper_toolchains. No assertion all archive files or distro changes are linked.",
-      "rust_build_recipe": "https://github.com/rust-lang/rust/blob/1.98.1/src/ci/docker/scripts/musl-toolchain.sh",
+      "notice_scope": "Full original musl source archive preserves individual file notices; the Rust static target applies rust_patches (musl-cross-make 3635262e 0001-0002 plus Rust-added 0003-0004; reviewed, no new terms) and the helper build pins Alpine musl 1.2.5-r13 with distro patches reviewed in helper_toolchains. No assertion all archive files or distro changes are linked.",
+      "rust_build_recipe": "https://github.com/rust-lang/rust/blob/1.99.1/src/ci/docker/scripts/musl-toolchain.sh",
       "rust_patches": [
         {
           "file": "musl-cross-make-3635262e-0001-cve-2025-26519-p1.diff.txt",
@@ -542,7 +542,7 @@
     }
   ],
   "native_runtime": {
-    "build_recipe": "https://github.com/rust-lang/rust/blob/1.98.1/src/bootstrap/src/core/build_steps/llvm.rs",
+    "build_recipe": "https://github.com/rust-lang/rust/blob/1.99.1/src/bootstrap/src/core/build_steps/llvm.rs",
     "components": [
       "libunwind",
       "compiler-rt crtbegin/crtend"
@@ -579,7 +579,7 @@
           "debian-glibc-2.36-9+deb12u14-copyright.txt"
         ],
         "distribution": "Debian 12 bookworm",
-        "image": "rust:1.98.1-bookworm@sha256:c49256cbe5ea0188bc658a689500d70c41eb51f009a7a7be209caf60a944f3ec",
+        "image": "rust:1.99.1-bookworm@sha256:8bf7188ae46ad73b801c8d405eedc13ce63a7852b562885743a56890723549a8",
         "packages": {
           "gcc-12": "12.2.0-14+deb12u1",
           "libc6-dev": "2.36-9+deb12u14",
@@ -588,23 +588,23 @@
       },
       {
         "aports_gcc_commit": "fbf60319be3bbaf6dd32ef55cc6fb7189e05c266",
-        "aports_musl_commit": "1546f29a1fd233db15464ce000b6247ed71b31e7",
-        "base_image_musl": "1.2.5-r12",
+        "aports_musl_commit": "ddaf59b84bc6983a37d6e24d2210c2c4791642bb",
+        "base_image_musl": "1.2.5-r13",
         "distribution": "Alpine 3.22",
         "gcc_recipe_url": "https://raw.githubusercontent.com/alpinelinux/aports/fbf60319be3bbaf6dd32ef55cc6fb7189e05c266/main/gcc/APKBUILD",
-        "image": "rust:1.98.1-alpine3.22@sha256:df2234c615138222413254f45937ae45d284aad971644fe564e4250609abe452",
-        "musl_recipe_url": "https://raw.githubusercontent.com/alpinelinux/aports/1546f29a1fd233db15464ce000b6247ed71b31e7/main/musl/APKBUILD",
+        "image": "rust:1.99.1-alpine3.22@sha256:6d199c50733bbd8f001c28042caeae57707725bc7843596a15ea476c300a0cbb",
+        "musl_recipe_url": "https://raw.githubusercontent.com/alpinelinux/aports/ddaf59b84bc6983a37d6e24d2210c2c4791642bb/main/musl/APKBUILD",
         "packages": {
           "gcc": "14.2.0-r6",
           "libgcc": "14.2.0-r6",
-          "musl": "1.2.5-r12",
-          "musl-dev": "1.2.5-r12"
+          "musl": "1.2.5-r13",
+          "musl-dev": "1.2.5-r13"
         },
-        "patch_review_scope": "Recipe-local patches verified against APKBUILD SHA-512 values. No patch changes libgcc/crtstuff.c, the copied unwind source files, or musl crt startup sources. No added standalone copyright or licensing terms in reviewed patches. Runtime-wide per-object membership is not asserted."
+        "patch_review_scope": "Recipe-local patches verified against APKBUILD SHA-512 values. The musl 1.2.5-r13 update adds CVE-2026-107891.patch in src/regex/regcomp.c; CVE-2026-6042.patch renames the byte-identical prior iconv patch. No patch changes libgcc/crtstuff.c, the copied unwind source files, or musl crt startup sources. No added standalone copyright or licensing terms in reviewed patches. Runtime-wide per-object membership is not asserted."
       }
     ],
-    "llvm_revision": "52ed14fcd56afc30f9cccd8ca8ce237c2eef7e04",
-    "rust_gitlink": "https://github.com/rust-lang/rust/tree/1.98.1/src/llvm-project",
+    "llvm_revision": "1b9c0d5ff9bbe7634aead059efe6b11a7eeba145",
+    "rust_gitlink": "https://github.com/rust-lang/rust/tree/1.99.1/src/llvm-project",
     "scope": "Notices for the native libraries and startup objects supplied by the pinned Rust target; actual linked members depend on the final artifact."
   },
   "schema_version": 1,
@@ -612,73 +612,73 @@
     {
       "files": [
         {
-          "payload": "licenses/rust-1.98.1/COPYRIGHT-library.html",
-          "sha256": "68129500b616d5838629e68f55ff3aed5e096dacf60ce9eb41bbe599a563afa6",
+          "payload": "licenses/rust-1.99.1/COPYRIGHT-library.html",
+          "sha256": "5647be074c8edf7339fd863055923a8fc80bc5610a8d4661ec3b767b9d392c27",
           "source": "share/doc/rust/COPYRIGHT-library.html"
         },
         {
-          "payload": "licenses/rust-1.98.1/licenses/Apache-2.0.txt",
+          "payload": "licenses/rust-1.99.1/licenses/Apache-2.0.txt",
           "sha256": "074e6e32c86a4c0ef8b3ed25b721ca23aca83df277cd88106ef7177c354615ff",
           "source": "share/doc/rust/licenses/Apache-2.0.txt"
         },
         {
-          "payload": "licenses/rust-1.98.1/licenses/BSD-2-Clause.txt",
+          "payload": "licenses/rust-1.99.1/licenses/BSD-2-Clause.txt",
           "sha256": "f32fb3b417a194167cfad068223fc975ba96c5960513a10f66a3c28720aec1df",
           "source": "share/doc/rust/licenses/BSD-2-Clause.txt"
         },
         {
-          "payload": "licenses/rust-1.98.1/licenses/CC-BY-SA-4.0.txt",
+          "payload": "licenses/rust-1.99.1/licenses/CC-BY-SA-4.0.txt",
           "sha256": "23ee78c8bae49cf08ea2f0c84945c66b987ebe4520881fb51b3dad4fb43d07c2",
           "source": "share/doc/rust/licenses/CC-BY-SA-4.0.txt"
         },
         {
-          "payload": "licenses/rust-1.98.1/licenses/GCC-exception-3.1.txt",
+          "payload": "licenses/rust-1.99.1/licenses/GCC-exception-3.1.txt",
           "sha256": "a3966c9410ef94a1efbfa9ec04e9c1994026a70623fbf0885ce36737bfba3b54",
           "source": "share/doc/rust/licenses/GCC-exception-3.1.txt"
         },
         {
-          "payload": "licenses/rust-1.98.1/licenses/GPL-2.0-only.txt",
+          "payload": "licenses/rust-1.99.1/licenses/GPL-2.0-only.txt",
           "sha256": "54b212ba1f97f6948fa5486239ab505dd820b02e50cbfd296b4062c8609a70af",
           "source": "share/doc/rust/licenses/GPL-2.0-only.txt"
         },
         {
-          "payload": "licenses/rust-1.98.1/licenses/GPL-3.0-or-later.txt",
+          "payload": "licenses/rust-1.99.1/licenses/GPL-3.0-or-later.txt",
           "sha256": "05315fce6c35f79b8a35454828995fa26336f235895ac64557abc028f4ffcea2",
           "source": "share/doc/rust/licenses/GPL-3.0-or-later.txt"
         },
         {
-          "payload": "licenses/rust-1.98.1/licenses/ISC.txt",
+          "payload": "licenses/rust-1.99.1/licenses/ISC.txt",
           "sha256": "0ff61769b238634e042ab759dddfd104a8e69d091e3600ae3410e401a6164381",
           "source": "share/doc/rust/licenses/ISC.txt"
         },
         {
-          "payload": "licenses/rust-1.98.1/licenses/LLVM-exception.txt",
+          "payload": "licenses/rust-1.99.1/licenses/LLVM-exception.txt",
           "sha256": "e34c58338bd89d43e709e226610d8f32b3e3c47f4ad9a99a8dc1d4ac7842488e",
           "source": "share/doc/rust/licenses/LLVM-exception.txt"
         },
         {
-          "payload": "licenses/rust-1.98.1/licenses/MIT.txt",
+          "payload": "licenses/rust-1.99.1/licenses/MIT.txt",
           "sha256": "b85dcd3e453d05982552c52b5fc9e0bdd6d23c6f8e844b984a88af32570b0cc0",
           "source": "share/doc/rust/licenses/MIT.txt"
         },
         {
-          "payload": "licenses/rust-1.98.1/licenses/NCSA.txt",
+          "payload": "licenses/rust-1.99.1/licenses/NCSA.txt",
           "sha256": "39cb0234065c92b9e6cee3830cbb52b1aa289aa8fe9ba2e66730fec5cf05c630",
           "source": "share/doc/rust/licenses/NCSA.txt"
         },
         {
-          "payload": "licenses/rust-1.98.1/licenses/OFL-1.1.txt",
+          "payload": "licenses/rust-1.99.1/licenses/OFL-1.1.txt",
           "sha256": "8eea8287e5876b539670cadb82e99f9a7afddec6f6730811be1daf25d2e9bcfd",
           "source": "share/doc/rust/licenses/OFL-1.1.txt"
         },
         {
-          "payload": "licenses/rust-1.98.1/licenses/Unicode-3.0.txt",
+          "payload": "licenses/rust-1.99.1/licenses/Unicode-3.0.txt",
           "sha256": "f5062c9a188d81dfe66b56db4182dcf9e4b17c0d9b0d311a8e20b3a1b075c443",
           "source": "share/doc/rust/licenses/Unicode-3.0.txt"
         }
       ],
-      "name": "1.98.1",
-      "rustc_verbose_version": "rustc 1.98.1 (48a229cea 2026-09-01)\nbinary: rustc\ncommit-hash: 48a229ceaefd4985c50990b14116b6d856af0985\ncommit-date: 2026-09-01\nhost: x86_64-unknown-linux-gnu\nrelease: 1.98.1\nLLVM version: 22.1.8"
+      "name": "1.99.1",
+      "rustc_verbose_version": "rustc 1.99.1 (58cf8f9c3 2026-10-13)\nbinary: rustc\ncommit-hash: 58cf8f9c35b355199727627d07ae34a4e2846d67\ncommit-date: 2026-10-13\nhost: x86_64-unknown-linux-gnu\nrelease: 1.99.1\nLLVM version: 23.1.1"
     },
     {
       "files": [

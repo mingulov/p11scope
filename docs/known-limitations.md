@@ -958,17 +958,17 @@ described above.
 
 ## Packaging
 
-### Toolchain: 1.98.1 only; 1.88 MSRV retired
+### Toolchain: 1.99.1 only; 1.88 MSRV retired
 
 - What the user sees: the release compiler (`.release-rust-version`,
-  currently 1.98.1) is the only supported toolchain (edition 2024, Linux
+  currently 1.99.1) is the only supported toolchain (edition 2024, Linux
   x86-64). The 1.88 floor and its CI job are gone; build containers use
-  `rust:1.98.1`. `crates/ebpf-common` stays at rust-version 1.97 because
+  `rust:1.99.1`. `crates/ebpf-common` stays at rust-version 1.97 because
   the pinned BPF nightly-2026-05-20 (rustc 1.97) also compiles it.
 - Kernels/conditions: all builds.
 - Disclosure: `README.md` build section, `docs/development.md`, contract
   test `ebpf_common_rust_version_matches_the_bpf_nightly`.
-- Workaround: install 1.98.1 (`mise install`).
+- Workaround: install 1.99.1 (`mise install`).
 - Planned: v0.3.0 (C7 BPF campaign: bump the nightly in one verifier/vng
   matrix run, then raise `ebpf-common` to the release major.minor).
 

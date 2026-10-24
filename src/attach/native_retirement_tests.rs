@@ -1453,3 +1453,95 @@ fn collected_retirement_metadata_release_respects_one_credit() {
     assert!(native.join().completed);
     assert_eq!(pool.snapshot().charged_bytes, SEMANTIC_TRANSITION_SCRATCH);
 }
+
+#[test]
+fn collected_retirement_authenticates_bound_from_original_registry() {
+    let (_dir, pins, _old, mut slots) = collected_case(2, Box::new(|_, _| panic!("unused owner")));
+    // A small real owner demonstrates the validated physical index domain;
+    // no8192 native population or experimental scalar grants authority here.
+    slots[1].index = p11scope_ebpf_common::MAX_SLOTS + 1;
+    let mut native = CollectedRetirementFixture::new(
+        &slots,
+        &pins,
+        Box::new(|owned, _| {
+            drop(owned);
+            Ok(())
+        }),
+    );
+    let q = native.observe_q();
+    let pool = SemanticResourcePool::reference_limit(COLLECTED_POOL_BYTES);
+    let reserve = pool.reserver();
+    let mut input = Some(collected_input(
+        slots,
+        reserve.reserve(COLLECTED_INPUT_BYTES).unwrap(),
+    ));
+    let ticket = collected_prepare_to_ticket(&mut native, &q, &mut input, &reserve).unwrap();
+    collected_submit(&mut native, &q, &ticket);
+    drop(collected_close(&mut native, &q, &ticket));
+    assert_eq!(native.native_counts(), (4, 4, 4, 0));
+    assert!(native.join().completed);
+    assert_eq!(pool.snapshot().charged_bytes, SEMANTIC_TRANSITION_SCRATCH);
+}
+
+#[test]
+fn collected_retirement_worker_failure_retains_actual_paid_provider() {
+    use super::super::cleanup_worker::{CollectedCleanupRetention, collected_allocation_charge};
+    for closed_channel in [false, true] {
+        let (dir, pins, target) = fixture();
+        let file = target.retirement_lease().unwrap();
+        let weak = Arc::downgrade(&file);
+        let pool = SemanticResourcePool::reference_limit(COLLECTED_POOL_BYTES);
+        let reserve = pool.reserver();
+        let bytes = collected_allocation_charge(1, 1).unwrap();
+        let guard = CollectedCleanupRetention::new(reserve.reserve(bytes).unwrap(), 1);
+        guard.retain_file(file);
+        let mut worker = CleanupWorker::pre_start_with(
+            Box::new(|_owned, _| Err("actual retained native-close failure".into())),
+            Arc::new(|| Duration::ZERO),
+        );
+        if closed_channel {
+            assert!(worker.join().completed);
+        }
+        let leaf = OwnedLink::Multi(vec![File::open("/dev/null").unwrap().into()]);
+        let result = worker.submit_collected(
+            vec![(leaf, ProducerProgram::UProbe("p11_entry"))],
+            Arc::new(Vec::new()),
+            Arc::clone(&guard),
+        );
+        let ticket = if closed_channel {
+            let failure = result.expect_err("closed original worker refuses the same owned leaf");
+            worker.retain_unsubmitted(failure);
+            None
+        } else {
+            Some(result.expect("original running worker owns the leaf"))
+        };
+        drop(guard);
+        drop(target);
+        drop(pins);
+        drop(dir);
+        if let Some(ticket) = ticket {
+            wait_for(|| ticket.status() == BatchStatus::Failed);
+            let receipt = worker.join();
+            assert!(!receipt.completed);
+            assert_eq!(
+                (receipt.total, receipt.released, receipt.uncertain),
+                (1, 0, 1)
+            );
+            drop(ticket);
+        }
+        assert!(weak.upgrade().is_some());
+        assert_eq!(
+            pool.snapshot().charged_bytes,
+            SEMANTIC_TRANSITION_SCRATCH + bytes
+        );
+        drop(worker);
+        assert!(
+            weak.upgrade().is_some(),
+            "explicit abandon retains its original guard"
+        );
+        assert_eq!(
+            pool.snapshot().charged_bytes,
+            SEMANTIC_TRANSITION_SCRATCH + bytes
+        );
+    }
+}

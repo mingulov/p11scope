@@ -9126,3 +9126,7 @@ mod export_linkage_tests;
 #[cfg(test)]
 #[path = "scan_kthread_tests.rs"]
 mod scan_kthread_tests;
+
+#[cfg(test)]
+#[path = "hostile_tables_tests.rs"]
+mod hostile_tables_tests;

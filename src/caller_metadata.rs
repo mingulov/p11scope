@@ -826,4 +826,179 @@ mod tests {
         assert_eq!(parsed.status, ParseStatus::Refused);
         assert_eq!(parsed.reason, Some(ParseReason::AmbiguousPattern));
     }
+
+    // Hostile-input regressions: malformed membership bytes refuse with a
+    // named reason and carry no hints; recognized hints are verbatim
+    // substrings of the input. Fixed seed recorded so failures reproduce.
+    const HOSTILE_CGROUP_SEED: u64 = 0xC2E1_F00D_0000_0005;
+    const HOSTILE_MUTATIONS: usize = 2000;
+
+    fn hostile_xorshift(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *state = x;
+        x
+    }
+
+    #[test]
+    fn cgroup_membership_bounds_are_exact() {
+        // Recognized docker form keeps its exact id.
+        let id = "a".repeat(64);
+        let parsed = parse_cgroup_membership(&membership(&format!("docker/{id}")));
+        assert_eq!(parsed.status, ParseStatus::Recognized);
+        assert_eq!(
+            parsed.container.map(|hint| hint.id.as_str().to_string()),
+            Some(id)
+        );
+        // The byte limit refuses one past the cap and accepts the cap itself
+        // when the content is otherwise a valid unrecognized membership.
+        let filler = "x".repeat(MAX_CGROUP_BYTES - "0::/\n".len());
+        let at_cap = membership(&filler);
+        assert_eq!(at_cap.len(), MAX_CGROUP_BYTES);
+        assert_ne!(
+            parse_cgroup_membership(&at_cap).reason,
+            Some(ParseReason::ByteLimit)
+        );
+        let mut over_cap = at_cap.clone();
+        over_cap.push(b'x');
+        assert_eq!(
+            parse_cgroup_membership(&over_cap).reason,
+            Some(ParseReason::ByteLimit)
+        );
+        assert_eq!(
+            parse_cgroup_membership(&over_cap).status,
+            ParseStatus::Refused
+        );
+        // Row limit: 32 well-formed rows parse, the 33rd refuses.
+        let mut rows = String::from("0::/\n");
+        for n in 1..=31 {
+            rows.push_str(&format!("{n}:cpu:/\n"));
+        }
+        assert_ne!(
+            parse_cgroup_membership(rows.as_bytes()).reason,
+            Some(ParseReason::RowLimit)
+        );
+        rows.push_str("32:cpu:/\n");
+        assert_eq!(rows.lines().count(), MAX_CGROUP_ROWS + 1);
+        assert_eq!(
+            parse_cgroup_membership(rows.as_bytes()).reason,
+            Some(ParseReason::RowLimit)
+        );
+        // Structural refusals name their reason and carry no hints.
+        for (input, reason) in [
+            (b"".as_slice(), ParseReason::Malformed),
+            (b"0::/\n\n", ParseReason::Malformed),
+            (b"0::/\x00\n", ParseReason::Malformed),
+            (b"0::/\x07\n", ParseReason::Malformed),
+            (b"0::/\x7f\n", ParseReason::Malformed),
+            (b"1:cpu:/\n", ParseReason::HierarchyUnsupported),
+            (b"1::/\n", ParseReason::Malformed),
+            (b"0::/a\n0::/b\n", ParseReason::MembershipAmbiguous),
+            (b"00::/\n", ParseReason::Malformed),
+            (b"x::/\n", ParseReason::Malformed),
+            (b"0::/a:b\n", ParseReason::Malformed),
+            (b"0::no-leading-slash\n", ParseReason::Malformed),
+        ] {
+            let parsed = parse_cgroup_membership(input);
+            assert_eq!(parsed.status, ParseStatus::Refused, "input {input:?}");
+            assert_eq!(parsed.reason, Some(reason), "input {input:?}");
+            assert!(
+                parsed.container.is_none() && parsed.pod.is_none(),
+                "input {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cgroup_mutations_refuse_or_attribute_only_present_ids() {
+        let seeds: &[Vec<u8>] = &[
+            membership(&format!("docker/{}", "b".repeat(64))),
+            membership(
+                "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-podc0ffee11_2222_3333_4444_555566667777.slice/docker-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.scope",
+            ),
+            membership("user.slice/user-1000.slice/session-3.scope"),
+            b"0::/\n".to_vec(),
+            "0::/sys\\x2dfs/cgroup\n".as_bytes().to_vec(),
+        ];
+        let mut rng = HOSTILE_CGROUP_SEED;
+        let mut refused = 0usize;
+        let mut accepted = 0usize;
+        for iteration in 0..HOSTILE_MUTATIONS {
+            let seed = &seeds[(hostile_xorshift(&mut rng) % seeds.len() as u64) as usize];
+            let flips = 1 + (hostile_xorshift(&mut rng) % 8) as usize;
+            let mut candidate = seed.clone();
+            // Occasionally grow or shrink the input as well as flip bytes.
+            match hostile_xorshift(&mut rng) % 4 {
+                0 => candidate
+                    .truncate((hostile_xorshift(&mut rng) % (candidate.len() + 1) as u64) as usize),
+                1 => candidate.extend(std::iter::repeat_n(
+                    (hostile_xorshift(&mut rng) % 256) as u8,
+                    (hostile_xorshift(&mut rng) % 64) as usize,
+                )),
+                _ => {}
+            }
+            if candidate.is_empty() {
+                candidate.push(b'\n');
+            }
+            for _ in 0..flips {
+                let offset = (hostile_xorshift(&mut rng) % candidate.len() as u64) as usize;
+                candidate[offset] = (hostile_xorshift(&mut rng) % 256) as u8;
+            }
+            let parsed = parse_cgroup_membership(&candidate);
+            match parsed.status {
+                ParseStatus::Refused => {
+                    refused += 1;
+                    assert!(
+                        parsed.reason.is_some(),
+                        "mutation {iteration}: refusal without a reason"
+                    );
+                    assert!(
+                        parsed.container.is_none() && parsed.pod.is_none(),
+                        "mutation {iteration}: refusal carries hints"
+                    );
+                }
+                ParseStatus::Unrecognized => {
+                    accepted += 1;
+                    assert_eq!(parsed.reason, Some(ParseReason::Unrecognized));
+                    assert!(parsed.container.is_none() && parsed.pod.is_none());
+                }
+                ParseStatus::Recognized => {
+                    accepted += 1;
+                    // No false attribution: every hint id is present in the
+                    // input modulo the parser's two canonicalizations
+                    // (systemd `_` for `-`, ASCII lowercasing), so the
+                    // candidate is normalized the same way before searching.
+                    let normalized: Vec<u8> = candidate
+                        .iter()
+                        .map(|byte| {
+                            if *byte == b'_' {
+                                b'-'
+                            } else {
+                                byte.to_ascii_lowercase()
+                            }
+                        })
+                        .collect();
+                    if let Some(hint) = parsed.container {
+                        let id = hint.id.as_str().as_bytes();
+                        let present = id.len() <= normalized.len()
+                            && normalized.windows(id.len()).any(|window| window == id);
+                        assert!(present, "mutation {iteration}: container id not in input");
+                    }
+                    if let Some(hint) = parsed.pod {
+                        let uid = hint.uid.as_str().as_bytes();
+                        let present = uid.len() <= normalized.len()
+                            && normalized.windows(uid.len()).any(|window| window == uid);
+                        assert!(present, "mutation {iteration}: pod uid not in input");
+                    }
+                }
+            }
+        }
+        assert_eq!(refused + accepted, HOSTILE_MUTATIONS);
+        assert!(
+            refused > 0 && accepted > 0,
+            "both outcomes must occur (refused {refused}, accepted {accepted})"
+        );
+    }
 }

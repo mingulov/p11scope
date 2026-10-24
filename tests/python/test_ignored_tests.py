@@ -3,11 +3,16 @@
 
 scripts/check-ignored-tests.py scans the workspace Rust sources for real
 `#[ignore]` attributes and compares them both ways against
-tests/ignored-tests.json, and requires every `privileged` entry to be
-curated in scripts/run-privileged-lib-tests.sh. These tests prove the
+tests/ignored-tests.json: every `privileged` entry must be curated in
+scripts/run-privileged-lib-tests.sh, every `feature` entry must name a
+non-empty owning lane in `owner`, and the wide-featured sites (wide
+`owner` entries plus feature-gated macro expansions) must exactly match
+the runner's WIDE_DETAILED_2112_TESTS list. These tests prove the
 checked-in inventory matches the sources, then exercise each failure
 mode on synthetic fixture trees so a regression in the checker cannot
-hide behind a clean real tree.
+hide behind a clean real tree. A final group drives the runner's
+wide-list mode against fake binaries: a wide binary is accepted, a
+default binary is refused cleanly.
 
 Run: python3 -I tests/python/test_ignored_tests.py -v
 """
@@ -22,6 +27,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 CHECKER = ROOT / "scripts" / "check-ignored-tests.py"
 INVENTORY = ROOT / "tests" / "ignored-tests.json"
+RUNNER = ROOT / "scripts" / "run-privileged-lib-tests.sh"
 
 CELLS = {
     "privileged": "test cell",
@@ -29,8 +35,25 @@ CELLS = {
     "performance": "test cell",
 }
 
+WIDE_OWNER = "wide-detailed-2112 runner"
 
-def write_fixture(root, sources, entries, registered):
+# The exact wide-featured lib tests: the four wide-gated fns plus the
+# five wide-gated detailed_sweep_test! expansions. Pinned literally so a
+# runner edit that drops or renames one fails here, not silently.
+WIDE_EXPECTED = [
+    "attach::inventory::activation::privileged_tests::privileged_task4_detailed_2112_lp64",
+    "attach::inventory::activation::privileged_tests::privileged_task4_detailed_n511_lp64",
+    "attach::inventory::activation::privileged_tests::privileged_task4_detailed_n512_lp64",
+    "attach::inventory::activation::privileged_tests::privileged_task4_detailed_n513_lp64",
+    "attach::inventory::activation::privileged_tests::privileged_task4_detailed_n2048_lp64",
+    "attach::inventory::activation::privileged_tests::privileged_task4_detailed_n2049_lp64",
+    "attach::inventory::activation::privileged_tests::privileged_task4_highslot_2048_worker_exit",
+    "attach::inventory::activation::privileged_tests::privileged_task4_highslot_2048_nonleader_exec",
+    "attach::inventory::activation::privileged_tests::privileged_detailed_2112_stop_publishes_before_cleanup",
+]
+
+
+def write_fixture(root, sources, entries, registered, wide_registered=()):
     """A minimal checkable tree: sources {rel: text}, inventory, runner."""
     for rel, text in sources.items():
         path = root / rel
@@ -59,6 +82,7 @@ def write_fixture(root, sources, entries, registered):
             ("ALTERNATIVE_TESTS", []),
             ("LONG_TESTS", []),
             ("SKIP_TESTS", []),
+            ("WIDE_DETAILED_2112_TESTS", wide_registered),
         )
     )
     runner.write_text(body, encoding="utf-8")
@@ -119,6 +143,36 @@ ENTRIES = [
 
 REGISTERED = ["a::t_priv", "m::t_sweep"]
 
+FEATURE_SOURCES = {
+    "src/lib.rs": "mod f;\n",
+    "src/f.rs": (
+        '#[test]\n'
+        '#[ignore = "needs feature x"]\n'
+        'fn t_feat() {}\n'
+    ),
+}
+
+FEATURE_ENTRY = {
+    "file": "src/f.rs", "path": "f::t_feat",
+    "reason": "needs feature x", "cell": "feature",
+}
+
+
+def write_fake_binary(path, ignored):
+    """An executable stub answering `--list --ignored` with canned tests."""
+    lines = "".join(f"echo '{name}: test'\n" for name in ignored)
+    path.write_text("#!/bin/sh\n" + lines, encoding="utf-8")
+    path.chmod(0o755)
+
+
+def run_runner(*args):
+    return subprocess.run(
+        [str(RUNNER), *args],
+        capture_output=True,
+        text=True,
+        cwd=ROOT,
+    )
+
 
 class IgnoredTestsTests(unittest.TestCase):
     def test_checked_in_inventory_matches_the_sources(self):
@@ -128,7 +182,8 @@ class IgnoredTestsTests(unittest.TestCase):
                            ["sites"])
         self.assertIn(f"all {inventoried} inventoried site(s) match",
                       result.stdout)
-        self.assertIn("privileged curation verified", result.stdout)
+        self.assertIn("privileged and wide-feature curation verified",
+                      result.stdout)
 
     def test_an_extra_ignored_test_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -138,7 +193,7 @@ class IgnoredTestsTests(unittest.TestCase):
                 '\n#[test]\n#[ignore = "privileged: sneaked in"]\n'
                 "fn t_new() {}\n"
             )
-            write_fixture(root, sources, ENTRIES, REGISTERED)
+            write_fixture(root, sources, ENTRIES, REGISTERED, ["m::t_wide"])
             result = run_checker(root)
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn("a::t_new has no inventory entry", result.stdout)
@@ -146,7 +201,8 @@ class IgnoredTestsTests(unittest.TestCase):
     def test_a_removed_inventory_entry_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            write_fixture(root, SOURCES, ENTRIES[1:], REGISTERED)
+            write_fixture(root, SOURCES, ENTRIES[1:], REGISTERED,
+                          ["m::t_wide"])
             result = run_checker(root)
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn("a::t_priv has no inventory entry", result.stdout)
@@ -158,7 +214,7 @@ class IgnoredTestsTests(unittest.TestCase):
                 {"file": "src/a.rs", "path": "a::t_gone",
                  "reason": "privileged: removed", "cell": "privileged"},
             ]
-            write_fixture(root, SOURCES, entries, REGISTERED)
+            write_fixture(root, SOURCES, entries, REGISTERED, ["m::t_wide"])
             result = run_checker(root)
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn("no matching #[ignore] site for src/a.rs a::t_gone",
@@ -167,7 +223,8 @@ class IgnoredTestsTests(unittest.TestCase):
     def test_an_unregistered_privileged_entry_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            write_fixture(root, SOURCES, ENTRIES, ["m::t_sweep"])
+            write_fixture(root, SOURCES, ENTRIES, ["m::t_sweep"],
+                          ["m::t_wide"])
             result = run_checker(root)
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn("privileged a::t_priv is not curated", result.stdout)
@@ -175,7 +232,7 @@ class IgnoredTestsTests(unittest.TestCase):
     def test_comment_and_string_mentions_are_not_sites(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            write_fixture(root, SOURCES, ENTRIES, REGISTERED)
+            write_fixture(root, SOURCES, ENTRIES, REGISTERED, ["m::t_wide"])
             result = run_checker(root)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("all 3 inventoried site(s) match", result.stdout)
@@ -183,19 +240,107 @@ class IgnoredTestsTests(unittest.TestCase):
     def test_macro_expansions_must_be_curated(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            write_fixture(root, SOURCES, ENTRIES, ["a::t_priv"])
+            write_fixture(root, SOURCES, ENTRIES, ["a::t_priv"],
+                          ["m::t_wide"])
             result = run_checker(root)
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn("expands to m::t_sweep, not curated", result.stdout)
 
-    def test_feature_gated_expansions_are_exempt(self):
-        # m::t_wide is gated on cargo feature "wide" and unregistered; the
-        # fixture in the other tests already relies on this passing.
+    def test_feature_gated_expansions_require_wide_curation(self):
+        # m::t_wide is gated on cargo feature "wide": exempt from the
+        # default lists, but it must be curated in WIDE_DETAILED_2112_TESTS.
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            write_fixture(root, SOURCES, ENTRIES, REGISTERED)
+            write_fixture(root, SOURCES, ENTRIES, REGISTERED, [])
+            result = run_checker(root)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("m::t_wide", result.stdout)
+        self.assertIn("WIDE_DETAILED_2112_TESTS", result.stdout)
+
+    def test_wide_list_member_without_a_wide_site_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_fixture(root, {"src/lib.rs": ""}, [], [],
+                          ["f::t_nope"])
+            result = run_checker(root)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("f::t_nope", result.stdout)
+        self.assertIn("WIDE_DETAILED_2112_TESTS", result.stdout)
+
+    def test_feature_entry_without_owner_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_fixture(root, FEATURE_SOURCES, [FEATURE_ENTRY], [])
+            result = run_checker(root)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("owner", result.stdout)
+
+    def test_feature_entry_with_empty_owner_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            entry = dict(FEATURE_ENTRY, owner="")
+            write_fixture(root, FEATURE_SOURCES, [entry], [])
+            result = run_checker(root)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("owner", result.stdout)
+
+    def test_feature_entry_with_other_owner_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            entry = dict(FEATURE_ENTRY, owner="counter-bank-proof build")
+            write_fixture(root, FEATURE_SOURCES, [entry], [])
             result = run_checker(root)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("all 1 inventoried site(s) match", result.stdout)
+
+    def test_wide_owned_feature_entry_must_be_wide_curated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            entry = dict(FEATURE_ENTRY, owner=WIDE_OWNER)
+            write_fixture(root, FEATURE_SOURCES, [entry], [])
+            result = run_checker(root)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("f::t_feat", result.stdout)
+        self.assertIn("WIDE_DETAILED_2112_TESTS", result.stdout)
+
+    def test_wide_owned_feature_entry_passes_when_curated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            entry = dict(FEATURE_ENTRY, owner=WIDE_OWNER)
+            write_fixture(root, FEATURE_SOURCES, [entry], [], ["f::t_feat"])
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("all 1 inventoried site(s) match", result.stdout)
+
+    def test_wide_list_mode_accepts_a_wide_binary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = Path(tmp) / "libtest-wide"
+            write_fake_binary(binary, WIDE_EXPECTED + ["plain::t_one"])
+            result = run_runner("--list", "--wide-detailed-2112",
+                                str(binary))
+        self.assertEqual(result.returncode, 0,
+                         result.stdout + result.stderr)
+        self.assertIn("wide-detailed-2112 (9)", result.stdout)
+        for name in WIDE_EXPECTED:
+            self.assertIn(name, result.stdout)
+        self.assertIn("verify: wide-detailed-2112 curation matches "
+                      "the binary (9 tests)", result.stdout)
+
+    def test_wide_list_mode_refuses_a_default_binary(self):
+        # A default binary carries none of the wide tests: the mode must
+        # refuse (exit 1, missing tests named) instead of printing a
+        # verify receipt or an empty PASS.
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = Path(tmp) / "libtest-default"
+            write_fake_binary(binary, ["plain::t_one", "plain::t_two"])
+            result = run_runner("--list", "--wide-detailed-2112",
+                                str(binary))
+        self.assertEqual(result.returncode, 1,
+                         result.stdout + result.stderr)
+        self.assertIn("wide-detailed-2112", result.stderr)
+        self.assertIn("absent from the binary", result.stderr)
+        self.assertIn("privileged_task4_detailed_2112_lp64", result.stderr)
+        self.assertNotIn("verify:", result.stdout)
 
 
 if __name__ == "__main__":

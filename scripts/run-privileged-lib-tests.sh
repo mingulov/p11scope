@@ -72,7 +72,10 @@
 # per binary (default vs stub-object-attributes builds). Both modes verify
 # the curation against the binary's own `--list --ignored` output and refuse
 # on drift, so a new ignored test can never be silently dropped and a
-# renamed one can never silently pass.
+# renamed one can never silently pass. The wide-Detailed campaign below is
+# separate: it selects only the ignored tests that exist in a
+# --features wide-detailed-2112 libtest binary, when --wide-detailed-2112
+# is passed in run or --list mode; any other binary is refused cleanly.
 set -uo pipefail
 
 PROG=${0##*/}
@@ -402,18 +405,42 @@ SKIP_REASONS=(
 "private re-exec entrypoint for the owned single-survivor zombie fixture; missing owning socket/source fails and this helper never qualifies independently"
 )
 
+# Wide-Detailed campaign: the ignored tests that exist only in a
+# --features wide-detailed-2112 libtest binary — the four wide-gated fns
+# plus the five wide-gated detailed_sweep_test! expansions (source order).
+# Selected only with --wide-detailed-2112 in run or --list mode; the
+# default campaign's exact-cover check cannot see these tests because a
+# default binary does not contain them.
+WIDE_DETAILED_2112_TESTS=(
+attach::inventory::activation::privileged_tests::privileged_task4_detailed_2112_lp64
+attach::inventory::activation::privileged_tests::privileged_task4_detailed_n511_lp64
+attach::inventory::activation::privileged_tests::privileged_task4_detailed_n512_lp64
+attach::inventory::activation::privileged_tests::privileged_task4_detailed_n513_lp64
+attach::inventory::activation::privileged_tests::privileged_task4_detailed_n2048_lp64
+attach::inventory::activation::privileged_tests::privileged_task4_detailed_n2049_lp64
+attach::inventory::activation::privileged_tests::privileged_task4_highslot_2048_worker_exit
+attach::inventory::activation::privileged_tests::privileged_task4_highslot_2048_nonleader_exec
+attach::inventory::activation::privileged_tests::privileged_detailed_2112_stop_publishes_before_cleanup
+)
+
 usage() {
     cat <<EOF
 usage: $PROG LIB_TEST_BINARY OUTDIR [--include-long] [SELECTOR...]
+       $PROG LIB_TEST_BINARY OUTDIR --wide-detailed-2112 [SELECTOR...]
        $PROG --list LIB_TEST_BINARY
+       $PROG --list --wide-detailed-2112 LIB_TEST_BINARY
        $PROG --help
 
 Run the curated privileged (ignored) p11scope lib tests, one at a time.
 SELECTORs are literal substrings matched against full test paths; a test
 runs when any SELECTOR matches (no SELECTOR runs the whole campaign).
 --include-long additionally runs the long campaign cells.
+--wide-detailed-2112 runs only the wide-Detailed campaign cells (a binary
+built with --features wide-detailed-2112 is required; any other binary
+is refused). It cannot be combined with --include-long.
 --list prints the curated default, long, and skipped-with-reason lists and
-verifies them against the binary, without running anything.
+verifies them against the binary, without running anything. With
+--wide-detailed-2112 it prints and verifies only the wide-Detailed list.
 EOF
 }
 
@@ -491,12 +518,56 @@ $aname"; fi
     return 0
 }
 
+# Compare the wide-Detailed curation against the binary. Every member must
+# select exactly one ignored test; a default binary (or any binary missing
+# a member) is refused with the missing names, never run empty.
+check_wide_curation() {
+    local bin=$1 bin_list name count missing=() multi=()
+    if ! bin_list=$(binary_ignored_list "$bin"); then
+        echo "$PROG: cannot list ignored tests in $bin" >&2
+        return 1
+    fi
+    for name in "${WIDE_DETAILED_2112_TESTS[@]}"; do
+        count=$(printf '%s\n' "$bin_list" | grep -cxF "$name" || true)
+        if [ "$count" -eq 0 ]; then
+            missing+=("$name")
+        elif [ "$count" -ne 1 ]; then
+            multi+=("$name")
+        fi
+    done
+    if [ "${#missing[@]}" -ne 0 ] || [ "${#multi[@]}" -ne 0 ]; then
+        {
+            echo "$PROG: wide-detailed-2112 curation refused against $bin"
+            if [ "${#missing[@]}" -ne 0 ]; then
+                echo "curated but absent from the binary (a default build lacks these; rebuild with --features wide-detailed-2112):"
+                printf '  %s\n' "${missing[@]}"
+            fi
+            if [ "${#multi[@]}" -ne 0 ]; then
+                echo "selected more than one test (duplicated listing?):"
+                printf '  %s\n' "${multi[@]}"
+            fi
+        } >&2
+        return 1
+    fi
+    return 0
+}
+
 # --list mode: curated lists plus a verification footer. Unprivileged-safe.
 list_mode() {
-    local bin name i
+    local bin name i wide=0
+    if [ "${1:-}" = "--wide-detailed-2112" ]; then wide=1; shift; fi
     [ $# -eq 1 ] || { usage >&2; return 2; }
     bin=$1
     [ -x "$bin" ] || { echo "$PROG: not an executable test binary: $bin" >&2; return 1; }
+    if [ "$wide" -eq 1 ]; then
+        echo "wide-detailed-2112 (${#WIDE_DETAILED_2112_TESTS[@]})"
+        printf '%s\n' "${WIDE_DETAILED_2112_TESTS[@]}"
+        if check_wide_curation "$bin"; then
+            echo "verify: wide-detailed-2112 curation matches the binary (${#WIDE_DETAILED_2112_TESTS[@]} tests)"
+            return 0
+        fi
+        return 1
+    fi
     # The receipt stays per-binary exact: resolve the feature-alternative
     # load gate against this binary and list the present member (if any) as
     # a default-campaign cell. The drift check below still refuses a binary
@@ -548,7 +619,7 @@ selected() {
 }
 
 main() {
-    local bin outdir include_long=0
+    local bin outdir include_long=0 wide=0
     local selected_runnable=() selected_skipped=()
     local arg name i pass=0 fail=0 skipped=0 seq=0
     local tmpdir logdir eviddir results log evdir short start end seconds rc
@@ -573,10 +644,15 @@ main() {
     for arg in "$@"; do
         case $arg in
             --include-long) include_long=1 ;;
+            --wide-detailed-2112) wide=1 ;;
             --*) echo "$PROG: unknown option: $arg" >&2; usage >&2; return 2 ;;
             *) SELECTORS+=("$arg") ;;
         esac
     done
+    if [ "$wide" -eq 1 ] && [ "$include_long" -eq 1 ]; then
+        echo "$PROG: --wide-detailed-2112 selects only the wide campaign; --include-long does not apply" >&2
+        return 2
+    fi
 
     if [ "$(id -u)" -ne 0 ]; then
         echo "$PROG: must be run as root (this campaign loads BPF)" >&2
@@ -590,43 +666,61 @@ main() {
     outdir=$(CDPATH='' cd "$outdir" && pwd) || return 1
 
     # Fail fast when the curation no longer covers the binary exactly.
-    check_curation "$bin" || return 1
+    if [ "$wide" -eq 1 ]; then
+        check_wide_curation "$bin" || return 1
+    else
+        check_curation "$bin" || return 1
+    fi
 
     # Narrow the campaign, preserving curated order and de-duplicating.
-    for name in "${DEFAULT_TESTS[@]}"; do
-        if selected "$name"; then
-            selected_runnable+=("$name")
-        fi
-    done
-    # Feature-alternative load gate: run whichever member this binary has.
-    for name in "${ALTERNATIVE_TESTS[@]}"; do
-        if binary_has_ignored "$bin" "$name" && selected "$name"; then
-            selected_runnable+=("$name")
-        fi
-    done
-    if [ "$include_long" -eq 1 ]; then
-        for name in "${LONG_TESTS[@]}"; do
+    if [ "$wide" -eq 1 ]; then
+        for name in "${WIDE_DETAILED_2112_TESTS[@]}"; do
             if selected "$name"; then
                 selected_runnable+=("$name")
             fi
         done
-    fi
-    for i in "${!SKIP_TESTS[@]}"; do
-        if selected "${SKIP_TESTS[$i]}"; then
-            selected_skipped+=("$i")
+    else
+        for name in "${DEFAULT_TESTS[@]}"; do
+            if selected "$name"; then
+                selected_runnable+=("$name")
+            fi
+        done
+        # Feature-alternative load gate: run whichever member this binary has.
+        for name in "${ALTERNATIVE_TESTS[@]}"; do
+            if binary_has_ignored "$bin" "$name" && selected "$name"; then
+                selected_runnable+=("$name")
+            fi
+        done
+        if [ "$include_long" -eq 1 ]; then
+            for name in "${LONG_TESTS[@]}"; do
+                if selected "$name"; then
+                    selected_runnable+=("$name")
+                fi
+            done
         fi
-    done
+        for i in "${!SKIP_TESTS[@]}"; do
+            if selected "${SKIP_TESTS[$i]}"; then
+                selected_skipped+=("$i")
+            fi
+        done
+    fi
     # Every SELECTOR must match at least one curated test.
     for arg in ${SELECTORS[@]+"${SELECTORS[@]}"}; do
         local matched=0 candidate
-        for candidate in "${DEFAULT_TESTS[@]}" "${ALTERNATIVE_TESTS[@]}" "${LONG_TESTS[@]}" "${SKIP_TESTS[@]}"; do
-            case $candidate in *"$arg"*) matched=1; break ;; esac
-        done
+        if [ "$wide" -eq 1 ]; then
+            for candidate in "${WIDE_DETAILED_2112_TESTS[@]}"; do
+                case $candidate in *"$arg"*) matched=1; break ;; esac
+            done
+        else
+            for candidate in "${DEFAULT_TESTS[@]}" "${ALTERNATIVE_TESTS[@]}" "${LONG_TESTS[@]}" "${SKIP_TESTS[@]}"; do
+                case $candidate in *"$arg"*) matched=1; break ;; esac
+            done
+        fi
         if [ "$matched" -eq 0 ]; then
             echo "$PROG: selector matches no curated test: $arg" >&2
             return 1
         fi
-        if [ "$include_long" -eq 0 ]; then
+        if [ "$wide" -eq 0 ] && [ "$include_long" -eq 0 ]; then
             for candidate in "${LONG_TESTS[@]}"; do
                 case $candidate in
                     *"$arg"*)
@@ -710,6 +804,7 @@ main() {
         echo "# $PROG run: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
         echo "# binary: $bin"
         echo "# include_long: $include_long"
+        echo "# wide_detailed_2112: $wide"
         echo "# selectors: ${SELECTORS[*]:-<none>}"
         if [ -n "${P11SCOPE_PRIV_LIFECYCLE_LOSS:-}" ]; then
             echo "# opt-in: P11SCOPE_PRIV_LIFECYCLE_LOSS=$P11SCOPE_PRIV_LIFECYCLE_LOSS"

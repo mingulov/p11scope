@@ -1894,6 +1894,7 @@ impl PinnedObjects {
 #[allow(unused_imports)]
 pub(crate) use conservative_copy::{
     ConservativePinSelection, GraphRefusal, GraphStep, PinnedConservativeCursor,
+    RetainedScannedInputs, ScannedRebindCursor,
 };
 #[cfg(test)]
 use conservative_copy::{conservative_pin_tree_bytes, deallocate_drained_unique_arc};
@@ -2308,6 +2309,8 @@ mod conservative_copy {
         ApplyRejected,
         Publish,
         Ready,
+        Rebinding,
+        RebindAborted,
         Reclaim,
         Reclaimed,
     }
@@ -2388,7 +2391,9 @@ mod conservative_copy {
         retired_count: u64,
         reclaim_phase: u8,
         after_claim_reclaim: u8,
+        rebind_owner: Option<PinCopyCacheId>,
         // Owners above are released BEFORE the actual extra payment below.
+        claim_backing: Option<ResourceLease>,
         backing: Option<ResourceLease>,
         header: Option<ResourceLease>,
     }
@@ -2423,6 +2428,8 @@ mod conservative_copy {
                 retired_count: 0,
                 reclaim_phase: 0,
                 after_claim_reclaim: 3,
+                rebind_owner: None,
+                claim_backing: None,
                 backing: None,
                 header: None,
             }
@@ -2454,6 +2461,10 @@ mod conservative_copy {
                     .is_some_and(|lease| !reserve.covers(lease, 0))
                 || self
                     .backing
+                    .as_ref()
+                    .is_some_and(|lease| !reserve.covers(lease, 0))
+                || self
+                    .claim_backing
                     .as_ref()
                     .is_some_and(|lease| !reserve.covers(lease, 0))
             {
@@ -3106,7 +3117,9 @@ mod conservative_copy {
                     }
                 }
                 Phase::Ready => {}
-                Phase::Reclaim | Phase::Reclaimed => return Err(GraphRefusal::Cancelled),
+                Phase::Rebinding | Phase::RebindAborted | Phase::Reclaim | Phase::Reclaimed => {
+                    return Err(GraphRefusal::Cancelled);
+                }
             }
             Ok(())
         }
@@ -3123,6 +3136,9 @@ mod conservative_copy {
         ) -> Result<GraphStep, GraphRefusal> {
             if work == 0 {
                 return Ok(GraphStep::Yielded);
+            }
+            if self.rebind_owner.is_some() {
+                return Err(GraphRefusal::Identity);
             }
             self.check_pool(selection, reserve)?;
             if let Some(fence) = self.fence {
@@ -3309,6 +3325,10 @@ mod conservative_copy {
                     self.reclaim_phase += 1;
                 }
                 18 => {
+                    self.claim_backing = None;
+                    self.reclaim_phase += 1;
+                }
+                19 => {
                     self.backing = None;
                     self.reclaim_phase += 1;
                 }
@@ -3394,7 +3414,10 @@ mod conservative_copy {
             } else {
                 SourceFence::new(self, selection)?;
             }
-            if matches!(cursor.phase, Phase::Reclaim | Phase::Reclaimed) {
+            if matches!(
+                cursor.phase,
+                Phase::Rebinding | Phase::RebindAborted | Phase::Reclaim | Phase::Reclaimed
+            ) {
                 return Err(GraphRefusal::Cancelled);
             }
             for _ in 0..work {
@@ -3437,6 +3460,1682 @@ mod conservative_copy {
         assert!(size_of::<(String, u64)>() == size_of::<ManuallyDrop<(String, u64)>>());
         assert!(align_of::<(String, u64)>() == align_of::<ManuallyDrop<(String, u64)>>());
     };
+
+    pub(crate) use scanned_rebind::{RetainedScannedInputs, ScannedRebindCursor};
+
+    mod scanned_rebind {
+        use super::*;
+        use crate::discovery::scan::{ScannedEntry, ScannedInterface, ScannedTable};
+
+        static NEXT_SCANNED_INPUT: AtomicU64 = AtomicU64::new(0);
+        const MODULE_MISSING: &str =
+            "module has no comparable pinned identity; it was not attached";
+        const MODULE_ABI: &str = "module decoder ABI disagrees with its retained pinned identity; its tables were not attached";
+        const ENTRY_MISSING: &str =
+            " could not be reconciled to a comparable pinned object; entry was not attached";
+        const ENTRY_ABI: &str =
+            " has a different target ABI from its provider; entry was not attached";
+
+        /// Original owned rows plus actual payment, not proof of valid backing,
+        /// admission or pin identity. Only positive-work preflight may take it.
+        pub(crate) struct RetainedScannedInputs {
+            rows: Vec<ScannedModule>,
+            identity: PinCopyCacheId,
+            storage: ResourceLease,
+        }
+
+        pub(crate) struct ScannedInputRefusal {
+            rows: Vec<ScannedModule>,
+            storage: ResourceLease,
+        }
+
+        impl std::fmt::Debug for ScannedInputRefusal {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct("ScannedInputRefusal")
+                    .field("rows", &self.rows.len())
+                    .finish_non_exhaustive()
+            }
+        }
+
+        impl ScannedInputRefusal {
+            pub(crate) fn into_originals(self) -> (Vec<ScannedModule>, ResourceLease) {
+                (self.rows, self.storage)
+            }
+        }
+
+        impl RetainedScannedInputs {
+            pub(crate) fn from_reserved_originals(
+                rows: Vec<ScannedModule>,
+                storage: ResourceLease,
+            ) -> Result<Self, ScannedInputRefusal> {
+                match mint_pin_copy_cache_id(&NEXT_SCANNED_INPUT) {
+                    Some(identity) => Ok(Self {
+                        rows,
+                        identity,
+                        storage,
+                    }),
+                    None => Err(ScannedInputRefusal { rows, storage }),
+                }
+            }
+
+            pub(crate) fn into_originals(self) -> (Vec<ScannedModule>, ResourceLease) {
+                (self.rows, self.storage)
+            }
+
+            #[cfg(test)]
+            pub(crate) fn originals_for_test(&self) -> &[ScannedModule] {
+                &self.rows
+            }
+            #[cfg(test)]
+            pub(crate) fn original_capacity_for_test(&self) -> usize {
+                self.rows.capacity()
+            }
+        }
+
+        #[derive(Clone, Copy, Default)]
+        struct Growth {
+            tables: usize,
+            targets: usize,
+            pins: usize,
+        }
+
+        fn charge_text(text: &String) -> Result<usize, GraphRefusal> {
+            text.capacity()
+                .checked_add(OWNED_ALLOCATION_PADDING)
+                .ok_or(GraphRefusal::Overflow)
+        }
+
+        fn normalization_bound(path: &str) -> Result<usize, GraphRefusal> {
+            text_bytes(path)?
+                .checked_add(bytes_for::<usize>(path.len() / 2 + 1)?)
+                .ok_or(GraphRefusal::Overflow)
+        }
+
+        /// A Linux path-component cursor. Neither lookup nor measurement calls
+        /// the allocating, whole-path ordinary normalization helper.
+        struct Normalize {
+            path: String,
+            parents: Vec<usize>,
+            start: usize,
+            scan: usize,
+            copying: Option<(usize, usize)>,
+        }
+
+        impl Normalize {
+            fn new(original: &str) -> Option<Self> {
+                if !original.starts_with('/') {
+                    return None;
+                }
+                let mut path = String::with_capacity(original.len());
+                path.push('/');
+                Some(Self {
+                    path,
+                    parents: Vec::with_capacity(original.len() / 2 + 1),
+                    start: 1,
+                    scan: 1,
+                    copying: None,
+                })
+            }
+
+            fn advance(&mut self, original: &str) -> bool {
+                if let Some((start, end)) = self.copying {
+                    let mut next = start.saturating_add(TEXT_QUANTUM).min(end);
+                    while !original.is_char_boundary(next) {
+                        next -= 1;
+                    }
+                    self.path.push_str(&original[start..next]);
+                    if next == end {
+                        self.copying = None;
+                        self.start = end + 1;
+                        self.scan = end + 1;
+                    } else {
+                        self.copying = Some((next, end));
+                    }
+                    return false;
+                }
+                if self.start > original.len() {
+                    return true;
+                }
+                let stop = self.scan.saturating_add(TEXT_QUANTUM).min(original.len());
+                let slash = original.as_bytes()[self.scan..stop]
+                    .iter()
+                    .position(|byte| *byte == b'/');
+                let end = match slash {
+                    Some(offset) => self.scan + offset,
+                    None if stop < original.len() => {
+                        self.scan = stop;
+                        return false;
+                    }
+                    None => original.len(),
+                };
+                let component = &original[self.start..end];
+                match component {
+                    "" | "." => {
+                        self.start = end + 1;
+                        self.scan = end + 1;
+                    }
+                    ".." => {
+                        if let Some(parent) = self.parents.pop() {
+                            self.path.truncate(parent);
+                        }
+                        self.start = end + 1;
+                        self.scan = end + 1;
+                    }
+                    _ => {
+                        self.parents.push(self.path.len());
+                        if self.path.len() > 1 {
+                            self.path.push('/');
+                        }
+                        self.copying = Some((self.start, end));
+                    }
+                }
+                false
+            }
+
+            fn reclaim_one(&mut self) -> bool {
+                if self.path.capacity() != 0 {
+                    drop(std::mem::take(&mut self.path));
+                    return false;
+                }
+                if self.parents.capacity() != 0 {
+                    drop(std::mem::take(&mut self.parents));
+                    return false;
+                }
+                true
+            }
+        }
+
+        struct SkipCopy {
+            skip: Skipped,
+            stage: u8,
+            prefix_done: usize,
+            suffix_done: usize,
+        }
+        impl SkipCopy {
+            fn new() -> Self {
+                Self {
+                    skip: Skipped {
+                        subject: String::new(),
+                        reason: String::new(),
+                    },
+                    stage: 0,
+                    prefix_done: 0,
+                    suffix_done: 0,
+                }
+            }
+            fn advance(&mut self, subject: &str, prefix: &str, suffix: &str) -> bool {
+                match self.stage {
+                    0 => {
+                        self.skip.subject = String::with_capacity(subject.len());
+                        self.stage = 1;
+                    }
+                    1 => {
+                        if copy_text(&mut self.skip.subject, subject) {
+                            self.stage = 2;
+                        }
+                    }
+                    2 => {
+                        self.skip.reason = String::with_capacity(prefix.len() + suffix.len());
+                        self.stage = 3;
+                    }
+                    3 => {
+                        let mut end = self
+                            .prefix_done
+                            .saturating_add(TEXT_QUANTUM)
+                            .min(prefix.len());
+                        while !prefix.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        self.skip.reason.push_str(&prefix[self.prefix_done..end]);
+                        self.prefix_done = end;
+                        if end == prefix.len() {
+                            self.stage = 4;
+                        }
+                    }
+                    4 => {
+                        let mut end = self
+                            .suffix_done
+                            .saturating_add(TEXT_QUANTUM)
+                            .min(suffix.len());
+                        while !suffix.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        self.skip.reason.push_str(&suffix[self.suffix_done..end]);
+                        self.suffix_done = end;
+                        if end == suffix.len() {
+                            self.stage = 5;
+                        }
+                    }
+                    _ => return true,
+                }
+                false
+            }
+        }
+
+        fn reclaim_skip(skip: &mut Skipped) -> bool {
+            if skip.subject.capacity() != 0 {
+                drop(std::mem::take(&mut skip.subject));
+                false
+            } else if skip.reason.capacity() != 0 {
+                drop(std::mem::take(&mut skip.reason));
+                false
+            } else {
+                true
+            }
+        }
+
+        struct TableDrain {
+            table: ScannedTable,
+            stage: u8,
+            skip: Option<Skipped>,
+        }
+        impl TableDrain {
+            fn new(table: ScannedTable) -> Self {
+                Self {
+                    table,
+                    stage: 0,
+                    skip: None,
+                }
+            }
+            fn advance(&mut self) -> bool {
+                match self.stage {
+                    0 => {
+                        if let Some(entry) = self.table.entries.pop() {
+                            drop(entry.object_path);
+                        } else {
+                            drop(std::mem::take(&mut self.table.entries));
+                            self.stage = 1;
+                        }
+                    }
+                    1 => {
+                        drop(std::mem::take(&mut self.table.null_entries));
+                        self.stage = 2;
+                    }
+                    2 => {
+                        if let Some(skip) = &mut self.skip {
+                            if reclaim_skip(skip) {
+                                self.skip = None;
+                            }
+                        } else if let Some(skip) = self.table.unpinned.pop() {
+                            self.skip = Some(skip);
+                        } else {
+                            drop(std::mem::take(&mut self.table.unpinned));
+                            self.stage = 3;
+                        }
+                    }
+                    _ => return true,
+                }
+                false
+            }
+        }
+
+        struct ModuleDrain {
+            module: ScannedModule,
+            stage: u8,
+            table: Option<TableDrain>,
+            interface: Option<ScannedInterface>,
+        }
+        impl ModuleDrain {
+            fn new(module: ScannedModule) -> Self {
+                Self {
+                    module,
+                    stage: 0,
+                    table: None,
+                    interface: None,
+                }
+            }
+            fn advance(&mut self) -> bool {
+                match self.stage {
+                    0 => {
+                        drop(std::mem::take(&mut self.module.path));
+                        self.stage = 1;
+                    }
+                    1 => {
+                        if self.module.exports.pop().is_none() {
+                            drop(std::mem::take(&mut self.module.exports));
+                            self.stage = 2;
+                        }
+                    }
+                    2 => {
+                        if let Some(table) = &mut self.table {
+                            if table.advance() {
+                                self.table = None;
+                            }
+                        } else if let Some(table) = self.module.tables.pop() {
+                            self.table = Some(TableDrain::new(table));
+                        } else {
+                            drop(std::mem::take(&mut self.module.tables));
+                            self.stage = 3;
+                        }
+                    }
+                    3 => {
+                        if let Some(interface) = &mut self.interface {
+                            if interface.name_lossy.take().is_some() {
+                                return false;
+                            }
+                            if interface.name_private.take().is_some() {
+                                return false;
+                            }
+                            self.interface = None;
+                        } else if let Some(interface) = self.module.interfaces.pop() {
+                            self.interface = Some(interface);
+                        } else {
+                            drop(std::mem::take(&mut self.module.interfaces));
+                            self.stage = 4;
+                        }
+                    }
+                    _ => return true,
+                }
+                false
+            }
+        }
+
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum BindPhase {
+            New,
+            MeasureModule,
+            MeasureExports,
+            MeasureInterfaces,
+            MeasureTable,
+            MeasureEntries,
+            MeasureSkips,
+            MeasureViews,
+            MeasurePin,
+            MeasurePinExports,
+            Admit,
+            Reset,
+            Grow,
+            NextModule,
+            ProviderStart,
+            ProviderNormalize,
+            ProviderResolve,
+            ModuleSkip,
+            DiscardModule,
+            TableStart,
+            NextEntry,
+            EntryNormalize,
+            EntryResolve,
+            EntrySkip,
+            EntrySkipCopy,
+            DropEntry,
+            FinishTable,
+            ClaimTables,
+            ClaimModule,
+            ClaimEntries,
+            FinishModule,
+            Ready,
+            Reclaim,
+            Reclaimed,
+        }
+
+        #[derive(Clone, Copy)]
+        struct BindFence {
+            candidate: PinCopyCacheId,
+            input: PinCopyCacheId,
+            revision: u64,
+            version: u64,
+            changed: bool,
+        }
+
+        /// Owns the original iterator/suffix and every output/temporary request.
+        /// No read-only view exists until all original binding and claims finish.
+        pub(crate) struct ScannedRebindCursor {
+            phase: BindPhase,
+            fence: Option<BindFence>,
+            cancelled: bool,
+            taken: bool,
+            completed: bool,
+            input_required: Option<usize>,
+            extra_required: Option<usize>,
+            claim_required: Option<usize>,
+            header_bytes: usize,
+            input_bytes: usize,
+            extra_bytes: usize,
+            claim_bytes: usize,
+            max_skips: usize,
+            growth: BTreeMap<ProcessViewId, Growth>,
+            module_pos: usize,
+            table_pos: usize,
+            item_pos: usize,
+            last_view: Option<ProcessViewId>,
+            last_pin: Option<PinnedObjectId>,
+            bucket: u8,
+            originals: Option<std::vec::IntoIter<ScannedModule>>,
+            module: Option<ScannedModule>,
+            object: Option<PinnedObjectId>,
+            entries: Option<std::vec::IntoIter<ScannedEntry>>,
+            entry: Option<ScannedEntry>,
+            ids: Vec<PinnedObjectId>,
+            entry_objects: Vec<Vec<PinnedObjectId>>,
+            normalize: Option<Normalize>,
+            normalized: Option<String>,
+            skip_copy: Option<SkipCopy>,
+            skip_primary: Option<Skipped>,
+            skip_reason: &'static str,
+            modules: Vec<ReconciledModule>,
+            skipped: Vec<Skipped>,
+            module_drain: Option<ModuleDrain>,
+            reconciled_drain: Option<ReconciledDrain>,
+            reclaim_stage: u8,
+            // Original nested buffers can move into output rows; this payment
+            // stays until ALL those owners, not merely the input Vec, die.
+            input_storage: Option<ResourceLease>,
+            output_storage: Option<ResourceLease>,
+            header_storage: Option<ResourceLease>,
+        }
+
+        impl ScannedRebindCursor {
+            pub(crate) fn new() -> Self {
+                Self {
+                    phase: BindPhase::New,
+                    fence: None,
+                    cancelled: false,
+                    taken: false,
+                    completed: false,
+                    input_required: None,
+                    extra_required: None,
+                    claim_required: None,
+                    header_bytes: 0,
+                    input_bytes: 0,
+                    extra_bytes: 0,
+                    claim_bytes: 0,
+                    max_skips: 0,
+                    growth: BTreeMap::new(),
+                    module_pos: 0,
+                    table_pos: 0,
+                    item_pos: 0,
+                    last_view: None,
+                    last_pin: None,
+                    bucket: 0,
+                    originals: None,
+                    module: None,
+                    object: None,
+                    entries: None,
+                    entry: None,
+                    ids: Vec::new(),
+                    entry_objects: Vec::new(),
+                    normalize: None,
+                    normalized: None,
+                    skip_copy: None,
+                    skip_primary: None,
+                    skip_reason: "",
+                    modules: Vec::new(),
+                    skipped: Vec::new(),
+                    module_drain: None,
+                    reconciled_drain: None,
+                    reclaim_stage: 0,
+                    input_storage: None,
+                    output_storage: None,
+                    header_storage: None,
+                }
+            }
+            pub(crate) fn modules(&self) -> Option<&[ReconciledModule]> {
+                (self.phase == BindPhase::Ready).then_some(self.modules.as_slice())
+            }
+            pub(crate) fn skipped(&self) -> Option<&[Skipped]> {
+                (self.phase == BindPhase::Ready).then_some(self.skipped.as_slice())
+            }
+            pub(crate) fn required_bytes(&self) -> Option<usize> {
+                self.extra_required
+            }
+            pub(crate) fn required_input_bytes(&self) -> Option<usize> {
+                self.input_required
+            }
+            pub(crate) fn required_claim_bytes(&self) -> Option<usize> {
+                self.claim_required
+            }
+            pub(crate) fn cancel(&mut self) {
+                self.cancelled = true;
+            }
+
+            fn check_pool(&self, reserve: &SemanticResourceReserver) -> Result<(), GraphRefusal> {
+                for lease in [
+                    &self.header_storage,
+                    &self.input_storage,
+                    &self.output_storage,
+                ] {
+                    if lease
+                        .as_ref()
+                        .is_some_and(|lease| !reserve.covers(lease, 0))
+                    {
+                        return Err(GraphRefusal::Identity);
+                    }
+                }
+                Ok(())
+            }
+
+            fn check_candidate(&self, pins: &PinnedConservativeCursor) -> Result<(), GraphRefusal> {
+                let fence = self.fence.ok_or(GraphRefusal::Identity)?;
+                let output = pins.output.as_ref().ok_or(GraphRefusal::Identity)?;
+                if output.copy_source != Some(fence.candidate) {
+                    return Err(GraphRefusal::Identity);
+                }
+                if output.revision != fence.revision
+                    || output.copy_version != fence.version
+                    || output.changed.get() != fence.changed
+                {
+                    return Err(GraphRefusal::SourceChanged);
+                }
+                if self.taken {
+                    if pins.rebind_owner != Some(fence.input) {
+                        return Err(GraphRefusal::Identity);
+                    }
+                } else if pins.phase != Phase::Ready || pins.rebind_owner.is_some() {
+                    return Err(GraphRefusal::Identity);
+                }
+                Ok(())
+            }
+
+            fn begin_measure(
+                &mut self,
+                pins: &PinnedConservativeCursor,
+                input: &RetainedScannedInputs,
+                reserve: &SemanticResourceReserver,
+            ) -> Result<(), GraphRefusal> {
+                if pins.phase != Phase::Ready
+                    || pins.rebind_owner.is_some()
+                    || pins.claim_backing.is_some()
+                    || !reserve.covers(&input.storage, 0)
+                    || pins
+                        .header
+                        .as_ref()
+                        .is_none_or(|lease| !reserve.covers(lease, 0))
+                {
+                    return Err(GraphRefusal::Identity);
+                }
+                let output = pins.output.as_ref().ok_or(GraphRefusal::Identity)?;
+                if output.revision == u64::MAX
+                    || output
+                        .copy_version
+                        .checked_add(2)
+                        .is_none_or(|version| version == u64::MAX)
+                {
+                    return Err(GraphRefusal::SourceChanged);
+                }
+                let header_bytes = std::mem::size_of::<Self>()
+                    .checked_add(OWNED_ALLOCATION_PADDING)
+                    .and_then(|bytes| {
+                        bytes.checked_add(tree::<ProcessViewId, Growth>(input.rows.len()).ok()?)
+                    })
+                    .ok_or(GraphRefusal::Overflow)?;
+                let storage = reserve
+                    .reserve(header_bytes)
+                    .map_err(GraphRefusal::Storage)?;
+                self.fence = Some(BindFence {
+                    candidate: output.copy_source.ok_or(GraphRefusal::Identity)?,
+                    input: input.identity,
+                    revision: output.revision,
+                    version: output.copy_version,
+                    changed: output.changed.get(),
+                });
+                self.header_storage = Some(storage);
+                self.header_bytes = header_bytes;
+                self.input_bytes = std::mem::size_of::<RetainedScannedInputs>()
+                    .checked_add(bytes_for::<ScannedModule>(input.rows.capacity())?)
+                    .ok_or(GraphRefusal::Overflow)?;
+                self.extra_bytes = header_bytes
+                    .checked_add(bytes_for::<ReconciledModule>(input.rows.len())?)
+                    .ok_or(GraphRefusal::Overflow)?;
+                self.claim_bytes = tree::<ProcessViewId, ViewClaims>(input.rows.len())?;
+                self.phase = BindPhase::MeasureModule;
+                Ok(())
+            }
+
+            fn measure(
+                &mut self,
+                pins: &PinnedObjects,
+                input: &RetainedScannedInputs,
+            ) -> Result<(), GraphRefusal> {
+                match self.phase {
+                    BindPhase::MeasureModule => {
+                        if let Some(module) = input.rows.get(self.module_pos) {
+                            add(&mut self.input_bytes, charge_text(&module.path)?)?;
+                            add(
+                                &mut self.input_bytes,
+                                bytes_for::<String>(module.exports.capacity())?,
+                            )?;
+                            add(
+                                &mut self.input_bytes,
+                                bytes_for::<ScannedTable>(module.tables.capacity())?,
+                            )?;
+                            add(
+                                &mut self.input_bytes,
+                                bytes_for::<ScannedInterface>(module.interfaces.capacity())?,
+                            )?;
+                            add(&mut self.extra_bytes, normalization_bound(&module.path)?)?;
+                            add(
+                                &mut self.extra_bytes,
+                                bytes_for::<Vec<PinnedObjectId>>(module.tables.len())?,
+                            )?;
+                            add(&mut self.extra_bytes, text_bytes(&module.path)?)?;
+                            add(&mut self.extra_bytes, text_bytes(MODULE_ABI)?)?;
+                            self.max_skips = self
+                                .max_skips
+                                .checked_add(1)
+                                .ok_or(GraphRefusal::Overflow)?;
+                            let growth = self.growth.entry(module.view).or_default();
+                            growth.tables = growth
+                                .tables
+                                .checked_add(module.tables.len())
+                                .ok_or(GraphRefusal::Overflow)?;
+                            growth.pins =
+                                growth.pins.checked_add(1).ok_or(GraphRefusal::Overflow)?;
+                            self.item_pos = 0;
+                            self.phase = BindPhase::MeasureExports;
+                        } else {
+                            add(&mut self.extra_bytes, bytes_for::<Skipped>(self.max_skips)?)?;
+                            self.last_view = None;
+                            self.phase = BindPhase::MeasureViews;
+                        }
+                    }
+                    BindPhase::MeasureExports => {
+                        let module = input
+                            .rows
+                            .get(self.module_pos)
+                            .ok_or(GraphRefusal::Identity)?;
+                        if let Some(text) = module.exports.get(self.item_pos) {
+                            add(&mut self.input_bytes, charge_text(text)?)?;
+                            self.item_pos += 1;
+                        } else {
+                            self.item_pos = 0;
+                            self.phase = BindPhase::MeasureInterfaces;
+                        }
+                    }
+                    BindPhase::MeasureInterfaces => {
+                        let module = input
+                            .rows
+                            .get(self.module_pos)
+                            .ok_or(GraphRefusal::Identity)?;
+                        if let Some(interface) = module.interfaces.get(self.item_pos) {
+                            if let Some(text) = &interface.name_lossy {
+                                add(&mut self.input_bytes, charge_text(text)?)?;
+                            }
+                            if let Some(bytes) = &interface.name_private {
+                                add(&mut self.input_bytes, bytes_for::<u8>(bytes.capacity())?)?;
+                            }
+                            self.item_pos += 1;
+                        } else {
+                            self.table_pos = 0;
+                            self.phase = BindPhase::MeasureTable;
+                        }
+                    }
+                    BindPhase::MeasureTable => {
+                        let module = input
+                            .rows
+                            .get(self.module_pos)
+                            .ok_or(GraphRefusal::Identity)?;
+                        if let Some(table) = module.tables.get(self.table_pos) {
+                            add(
+                                &mut self.input_bytes,
+                                bytes_for::<ScannedEntry>(table.entries.capacity())?,
+                            )?;
+                            add(
+                                &mut self.input_bytes,
+                                bytes_for::<&'static str>(table.null_entries.capacity())?,
+                            )?;
+                            add(
+                                &mut self.input_bytes,
+                                bytes_for::<Skipped>(table.unpinned.capacity())?,
+                            )?;
+                            add(
+                                &mut self.extra_bytes,
+                                bytes_for::<ScannedEntry>(table.entries.len())?,
+                            )?;
+                            add(
+                                &mut self.extra_bytes,
+                                bytes_for::<PinnedObjectId>(table.entries.len())?,
+                            )?;
+                            let skips = table
+                                .unpinned
+                                .len()
+                                .checked_add(table.entries.len())
+                                .ok_or(GraphRefusal::Overflow)?;
+                            add(&mut self.extra_bytes, bytes_for::<Skipped>(skips)?)?;
+                            self.max_skips = self
+                                .max_skips
+                                .checked_add(table.entries.len())
+                                .ok_or(GraphRefusal::Overflow)?;
+                            let growth = self
+                                .growth
+                                .get_mut(&module.view)
+                                .ok_or(GraphRefusal::Identity)?;
+                            growth.targets = growth
+                                .targets
+                                .checked_add(table.entries.len())
+                                .ok_or(GraphRefusal::Overflow)?;
+                            growth.pins = growth
+                                .pins
+                                .checked_add(table.entries.len())
+                                .ok_or(GraphRefusal::Overflow)?;
+                            self.item_pos = 0;
+                            self.phase = BindPhase::MeasureEntries;
+                        } else {
+                            self.module_pos += 1;
+                            self.phase = BindPhase::MeasureModule;
+                        }
+                    }
+                    BindPhase::MeasureEntries => {
+                        let module = input
+                            .rows
+                            .get(self.module_pos)
+                            .ok_or(GraphRefusal::Identity)?;
+                        let table = module
+                            .tables
+                            .get(self.table_pos)
+                            .ok_or(GraphRefusal::Identity)?;
+                        if let Some(entry) = table.entries.get(self.item_pos) {
+                            add(&mut self.input_bytes, charge_text(&entry.object_path)?)?;
+                            add(
+                                &mut self.extra_bytes,
+                                normalization_bound(&entry.object_path)?,
+                            )?;
+                            let strings = text_bytes(entry.name)?
+                                .checked_add(text_bytes(&entry.object_path)?)
+                                .and_then(|bytes| {
+                                    bytes.checked_add(ENTRY_MISSING.len().max(ENTRY_ABI.len()))
+                                })
+                                .ok_or(GraphRefusal::Overflow)?;
+                            add(
+                                &mut self.extra_bytes,
+                                strings.checked_mul(2).ok_or(GraphRefusal::Overflow)?,
+                            )?;
+                            self.item_pos += 1;
+                        } else {
+                            self.item_pos = 0;
+                            self.phase = BindPhase::MeasureSkips;
+                        }
+                    }
+                    BindPhase::MeasureSkips => {
+                        let table = input
+                            .rows
+                            .get(self.module_pos)
+                            .and_then(|module| module.tables.get(self.table_pos))
+                            .ok_or(GraphRefusal::Identity)?;
+                        if let Some(skip) = table.unpinned.get(self.item_pos) {
+                            add(&mut self.input_bytes, charge_text(&skip.subject)?)?;
+                            add(&mut self.input_bytes, charge_text(&skip.reason)?)?;
+                            self.item_pos += 1;
+                        } else {
+                            self.table_pos += 1;
+                            self.phase = BindPhase::MeasureTable;
+                        }
+                    }
+                    BindPhase::MeasureViews => {
+                        if let Some((view, growth)) =
+                            next_map(&self.growth, self.last_view.as_ref())
+                        {
+                            self.last_view = Some(*view);
+                            let old = pins.ownership.get(view);
+                            let tables = old
+                                .map_or(0, |old| old.tables.capacity())
+                                .max(growth.tables);
+                            let targets = old
+                                .map_or(0, |old| old.targets.capacity())
+                                .max(growth.targets);
+                            let pin_count = old
+                                .map_or(0, |old| old.pins.len())
+                                .checked_add(growth.pins)
+                                .ok_or(GraphRefusal::Overflow)?;
+                            let pin_count = old.map_or(0, |old| old.pins.capacity()).max(pin_count);
+                            add(&mut self.claim_bytes, bytes_for::<PinnedObjectId>(tables)?)?;
+                            add(
+                                &mut self.claim_bytes,
+                                bytes_for::<(PinnedObjectId, u64)>(targets)?,
+                            )?;
+                            add(
+                                &mut self.claim_bytes,
+                                bytes_for::<PinnedObjectId>(pin_count)?,
+                            )?;
+                        } else {
+                            self.last_pin = None;
+                            self.phase = BindPhase::MeasurePin;
+                        }
+                    }
+                    BindPhase::MeasurePin => {
+                        if let Some((id, entry)) = next_map(&pins.by_id, self.last_pin.as_ref()) {
+                            self.last_pin = Some(*id);
+                            add(
+                                &mut self.extra_bytes,
+                                bytes_for::<(String, u64)>(entry.exports.len())?,
+                            )?;
+                            add(&mut self.extra_bytes, 2 * std::mem::size_of::<usize>())?;
+                            self.item_pos = 0;
+                            self.phase = BindPhase::MeasurePinExports;
+                        } else {
+                            self.input_required = Some(self.input_bytes);
+                            self.claim_required = Some(self.claim_bytes);
+                            self.extra_required = Some(
+                                self.extra_bytes
+                                    .checked_add(self.claim_bytes)
+                                    .ok_or(GraphRefusal::Overflow)?,
+                            );
+                            self.phase = BindPhase::Admit;
+                        }
+                    }
+                    BindPhase::MeasurePinExports => {
+                        let entry = pins
+                            .by_id
+                            .get(&self.last_pin.ok_or(GraphRefusal::Identity)?)
+                            .ok_or(GraphRefusal::Identity)?;
+                        if let Some((text, _)) = entry.exports.get(self.item_pos) {
+                            add(&mut self.extra_bytes, charge_text(text)?)?;
+                            self.item_pos += 1;
+                        } else {
+                            self.phase = BindPhase::MeasurePin;
+                        }
+                    }
+                    _ => return Err(GraphRefusal::Identity),
+                }
+                Ok(())
+            }
+        }
+
+        impl ScannedRebindCursor {
+            fn admit(
+                &mut self,
+                pins: &mut PinnedConservativeCursor,
+                input: &mut Option<RetainedScannedInputs>,
+                reserve: &SemanticResourceReserver,
+            ) -> Result<(), GraphRefusal> {
+                let original = input.as_ref().ok_or(GraphRefusal::Identity)?;
+                if !reserve.covers(
+                    &original.storage,
+                    self.input_required.ok_or(GraphRefusal::Identity)?,
+                ) {
+                    return Err(GraphRefusal::Identity);
+                }
+                let output_bytes = self
+                    .extra_bytes
+                    .checked_sub(self.header_bytes)
+                    .ok_or(GraphRefusal::Overflow)?;
+                // Both reservations are local until ALL precharges succeed.
+                // A second refusal refunds no live input/claim allocation.
+                let output = reserve
+                    .reserve(output_bytes)
+                    .map_err(GraphRefusal::Storage)?;
+                let claims = reserve
+                    .reserve(self.claim_required.ok_or(GraphRefusal::Identity)?)
+                    .map_err(GraphRefusal::Storage)?;
+                let updated = self
+                    .fence
+                    .ok_or(GraphRefusal::Identity)?
+                    .version
+                    .checked_add(2)
+                    .filter(|version| *version < u64::MAX)
+                    .ok_or(GraphRefusal::SourceChanged)?;
+                let original = input.take().ok_or(GraphRefusal::Identity)?;
+                let capacity = original.rows.len();
+                let identity = original.identity;
+                self.originals = Some(original.rows.into_iter());
+                self.input_storage = Some(original.storage);
+                self.output_storage = Some(output);
+                // The candidate, not this module cursor, owns payment for ALL
+                // appended/reset-derived claim backing before the first write.
+                pins.claim_backing = Some(claims);
+                pins.rebind_owner = Some(identity);
+                pins.phase = Phase::Rebinding;
+                pins.output
+                    .as_mut()
+                    .ok_or(GraphRefusal::Identity)?
+                    .copy_version = updated;
+                self.fence.as_mut().ok_or(GraphRefusal::Identity)?.version = updated;
+                self.taken = true;
+                self.modules = Vec::with_capacity(capacity);
+                self.skipped = Vec::with_capacity(self.max_skips);
+                self.last_view = None;
+                self.phase = BindPhase::Reset;
+                Ok(())
+            }
+
+            fn reset_one(&mut self, pins: &mut PinnedObjects) {
+                if let Some((view, _)) = next_map(&pins.ownership, self.last_view.as_ref()) {
+                    let view = *view;
+                    if let Some(claims) = pins.ownership.get_mut(&view) {
+                        // Both element types are Copy/no-drop. Capacity stays
+                        // owned/paid; one original ownership row per credit.
+                        claims.tables.clear();
+                        claims.targets.clear();
+                    }
+                    self.last_view = Some(view);
+                } else {
+                    self.last_view = None;
+                    self.bucket = 0;
+                    self.phase = BindPhase::Grow;
+                }
+            }
+
+            fn grow_one(&mut self, pins: &mut PinnedObjects) -> Result<(), GraphRefusal> {
+                let Some((view, growth)) = next_map(&self.growth, self.last_view.as_ref()) else {
+                    self.phase = BindPhase::NextModule;
+                    return Ok(());
+                };
+                let view = *view;
+                if let Some(old) = pins.ownership.get_mut(&view) {
+                    match self.bucket {
+                        0 if old.tables.capacity() < growth.tables => {
+                            old.tables.reserve_exact(growth.tables)
+                        }
+                        1 if old.targets.capacity() < growth.targets => {
+                            old.targets.reserve_exact(growth.targets)
+                        }
+                        2 => {
+                            let wanted = old
+                                .pins
+                                .len()
+                                .checked_add(growth.pins)
+                                .ok_or(GraphRefusal::Overflow)?;
+                            if old.pins.capacity() < wanted {
+                                old.pins.reserve_exact(growth.pins);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if self.bucket == 2 {
+                    self.last_view = Some(view);
+                    self.bucket = 0;
+                } else {
+                    self.bucket += 1;
+                }
+                Ok(())
+            }
+
+            fn resolve_normalized(
+                &mut self,
+                pins: &PinnedObjects,
+                key: ObjectKey,
+            ) -> Result<Option<PinnedObjectId>, GraphRefusal> {
+                let Some(path) = self.normalized.take() else {
+                    return Ok(None);
+                };
+                let namespace = self
+                    .module
+                    .as_ref()
+                    .ok_or(GraphRefusal::Identity)?
+                    .mount_namespace;
+                let raw = RawObjectInstance {
+                    mount_namespace: Some(namespace),
+                    key,
+                    path,
+                };
+                Ok(pins.raw_to_id.get(&raw).copied())
+            }
+
+            fn bind_one(&mut self, pins: &mut PinnedObjects) -> Result<(), GraphRefusal> {
+                match self.phase {
+                    BindPhase::Reset => self.reset_one(pins),
+                    BindPhase::Grow => self.grow_one(pins)?,
+                    BindPhase::NextModule => {
+                        if let Some(module) = self
+                            .originals
+                            .as_mut()
+                            .ok_or(GraphRefusal::Identity)?
+                            .next()
+                        {
+                            self.module = Some(module);
+                            self.object = None;
+                            self.table_pos = 0;
+                            self.item_pos = 0;
+                            self.phase = BindPhase::ProviderStart;
+                        } else {
+                            self.completed = true;
+                            self.phase = BindPhase::Ready;
+                        }
+                    }
+                    BindPhase::ProviderStart => {
+                        let original = &self.module.as_ref().ok_or(GraphRefusal::Identity)?.path;
+                        self.normalize = Normalize::new(original);
+                        if self.normalize.is_some() {
+                            self.phase = BindPhase::ProviderNormalize;
+                        } else {
+                            self.skip_reason = MODULE_MISSING;
+                            self.phase = BindPhase::ModuleSkip;
+                        }
+                    }
+                    BindPhase::ProviderNormalize | BindPhase::EntryNormalize => {
+                        let provider = self.phase == BindPhase::ProviderNormalize;
+                        let original = if provider {
+                            self.module.as_ref().map(|module| module.path.as_str())
+                        } else {
+                            self.entry.as_ref().map(|entry| entry.object_path.as_str())
+                        }
+                        .ok_or(GraphRefusal::Identity)?;
+                        if self
+                            .normalize
+                            .as_mut()
+                            .ok_or(GraphRefusal::Identity)?
+                            .advance(original)
+                        {
+                            let mut normalized =
+                                self.normalize.take().ok_or(GraphRefusal::Identity)?;
+                            self.normalized = Some(std::mem::take(&mut normalized.path));
+                            // Only its primitive stack backing remains here.
+                            drop(normalized);
+                            self.phase = if provider {
+                                BindPhase::ProviderResolve
+                            } else {
+                                BindPhase::EntryResolve
+                            };
+                        }
+                    }
+                    BindPhase::ProviderResolve => {
+                        let key = self.module.as_ref().ok_or(GraphRefusal::Identity)?.key;
+                        match self.resolve_normalized(pins, key)? {
+                            None => {
+                                self.skip_reason = MODULE_MISSING;
+                                self.phase = BindPhase::ModuleSkip;
+                            }
+                            Some(object) => {
+                                let old =
+                                    pins.by_id.get(&object).ok_or(GraphRefusal::SourceChanged)?;
+                                let module = self.module.as_ref().ok_or(GraphRefusal::Identity)?;
+                                if module.decoder_abi.is_some_and(|decoded| decoded != old.abi) {
+                                    self.skip_reason = MODULE_ABI;
+                                    self.phase = BindPhase::ModuleSkip;
+                                } else {
+                                    self.object = Some(object);
+                                    self.entry_objects = Vec::with_capacity(module.tables.len());
+                                    self.table_pos = 0;
+                                    self.phase = BindPhase::TableStart;
+                                }
+                            }
+                        }
+                    }
+                    BindPhase::ModuleSkip => {
+                        if self.skip_copy.is_none() {
+                            self.skip_copy = Some(SkipCopy::new());
+                        } else {
+                            let subject = &self.module.as_ref().ok_or(GraphRefusal::Identity)?.path;
+                            if self
+                                .skip_copy
+                                .as_mut()
+                                .ok_or(GraphRefusal::Identity)?
+                                .advance(subject, "", self.skip_reason)
+                            {
+                                let skip =
+                                    self.skip_copy.take().ok_or(GraphRefusal::Identity)?.skip;
+                                self.skipped.push(skip);
+                                let module = self.module.take().ok_or(GraphRefusal::Identity)?;
+                                self.module_drain = Some(ModuleDrain::new(module));
+                                self.phase = BindPhase::DiscardModule;
+                            }
+                        }
+                    }
+                    BindPhase::DiscardModule => {
+                        if self
+                            .module_drain
+                            .as_mut()
+                            .ok_or(GraphRefusal::Identity)?
+                            .advance()
+                        {
+                            self.module_drain = None;
+                            self.phase = BindPhase::NextModule;
+                        }
+                    }
+                    BindPhase::TableStart => {
+                        let module = self.module.as_mut().ok_or(GraphRefusal::Identity)?;
+                        if let Some(table) = module.tables.get_mut(self.table_pos) {
+                            let count = table.entries.len();
+                            self.entries = Some(std::mem::take(&mut table.entries).into_iter());
+                            table.entries = Vec::with_capacity(count);
+                            table.unpinned.reserve_exact(count);
+                            self.ids = Vec::with_capacity(count);
+                            self.phase = BindPhase::NextEntry;
+                        } else {
+                            self.table_pos = 0;
+                            self.phase = BindPhase::ClaimTables;
+                        }
+                    }
+                    BindPhase::NextEntry => {
+                        if let Some(entry) =
+                            self.entries.as_mut().ok_or(GraphRefusal::Identity)?.next()
+                        {
+                            self.normalize = Normalize::new(&entry.object_path);
+                            self.entry = Some(entry);
+                            self.phase = if self.normalize.is_some() {
+                                BindPhase::EntryNormalize
+                            } else {
+                                BindPhase::EntryResolve
+                            };
+                        } else {
+                            self.phase = BindPhase::FinishTable;
+                        }
+                    }
+                    BindPhase::EntryResolve => {
+                        let key = self.entry.as_ref().ok_or(GraphRefusal::Identity)?.object;
+                        let candidate = self.resolve_normalized(pins, key)?;
+                        let provider = self.object.ok_or(GraphRefusal::Identity)?;
+                        let compatible = candidate.is_some_and(|target| {
+                            matches!((pins.abi_for(target), pins.abi_for(provider)),
+                                (Some(target), Some(provider)) if target == provider)
+                        });
+                        if compatible {
+                            let id = candidate.ok_or(GraphRefusal::Identity)?;
+                            self.ids.push(id);
+                            let entry = self.entry.take().ok_or(GraphRefusal::Identity)?;
+                            self.module
+                                .as_mut()
+                                .and_then(|module| module.tables.get_mut(self.table_pos))
+                                .ok_or(GraphRefusal::Identity)?
+                                .entries
+                                .push(entry);
+                            self.phase = BindPhase::NextEntry;
+                        } else {
+                            self.skip_reason = if candidate.is_some() {
+                                ENTRY_ABI
+                            } else {
+                                ENTRY_MISSING
+                            };
+                            self.phase = BindPhase::EntrySkip;
+                        }
+                    }
+                    BindPhase::EntrySkip => {
+                        if self.skip_copy.is_none() {
+                            self.skip_copy = Some(SkipCopy::new());
+                        } else {
+                            let entry = self.entry.as_ref().ok_or(GraphRefusal::Identity)?;
+                            if self
+                                .skip_copy
+                                .as_mut()
+                                .ok_or(GraphRefusal::Identity)?
+                                .advance(entry.name, &entry.object_path, self.skip_reason)
+                            {
+                                self.skip_primary =
+                                    Some(self.skip_copy.take().ok_or(GraphRefusal::Identity)?.skip);
+                                self.phase = BindPhase::EntrySkipCopy;
+                            }
+                        }
+                    }
+                    BindPhase::EntrySkipCopy => {
+                        if self.skip_copy.is_none() {
+                            self.skip_copy = Some(SkipCopy::new());
+                        } else {
+                            let skip = self.skip_primary.as_ref().ok_or(GraphRefusal::Identity)?;
+                            if self
+                                .skip_copy
+                                .as_mut()
+                                .ok_or(GraphRefusal::Identity)?
+                                .advance(&skip.subject, &skip.reason, "")
+                            {
+                                let copy =
+                                    self.skip_copy.take().ok_or(GraphRefusal::Identity)?.skip;
+                                let primary =
+                                    self.skip_primary.take().ok_or(GraphRefusal::Identity)?;
+                                self.module
+                                    .as_mut()
+                                    .and_then(|module| module.tables.get_mut(self.table_pos))
+                                    .ok_or(GraphRefusal::Identity)?
+                                    .unpinned
+                                    .push(primary);
+                                self.skipped.push(copy);
+                                self.phase = BindPhase::DropEntry;
+                            }
+                        }
+                    }
+                    BindPhase::DropEntry => {
+                        drop(self.entry.take());
+                        self.phase = BindPhase::NextEntry;
+                    }
+                    BindPhase::FinishTable => {
+                        if self
+                            .entries
+                            .as_ref()
+                            .is_some_and(|entries| !entries.as_slice().is_empty())
+                        {
+                            return Err(GraphRefusal::Identity);
+                        }
+                        drop(self.entries.take());
+                        self.entry_objects.push(std::mem::take(&mut self.ids));
+                        self.table_pos += 1;
+                        self.phase = BindPhase::TableStart;
+                    }
+                    BindPhase::ClaimTables => {
+                        let module = self.module.as_ref().ok_or(GraphRefusal::Identity)?;
+                        if !pins.ownership.contains_key(&module.view) {
+                            let growth = self
+                                .growth
+                                .get(&module.view)
+                                .ok_or(GraphRefusal::Identity)?;
+                            pins.ownership.insert(
+                                module.view,
+                                ViewClaims {
+                                    tables: Vec::with_capacity(growth.tables),
+                                    targets: Vec::with_capacity(growth.targets),
+                                    pins: Vec::with_capacity(growth.pins),
+                                },
+                            );
+                        } else if self.table_pos < module.tables.len() {
+                            pins.ownership
+                                .get_mut(&module.view)
+                                .ok_or(GraphRefusal::Identity)?
+                                .tables
+                                .push(self.object.ok_or(GraphRefusal::Identity)?);
+                            self.table_pos += 1;
+                        } else {
+                            self.phase = BindPhase::ClaimModule;
+                        }
+                    }
+                    BindPhase::ClaimModule => {
+                        let view = self.module.as_ref().ok_or(GraphRefusal::Identity)?.view;
+                        pins.ownership
+                            .get_mut(&view)
+                            .ok_or(GraphRefusal::Identity)?
+                            .pins
+                            .push(self.object.ok_or(GraphRefusal::Identity)?);
+                        self.table_pos = 0;
+                        self.item_pos = 0;
+                        self.phase = BindPhase::ClaimEntries;
+                    }
+                    BindPhase::ClaimEntries => {
+                        let module = self.module.as_ref().ok_or(GraphRefusal::Identity)?;
+                        if let Some(table) = module.tables.get(self.table_pos) {
+                            if let Some(entry) = table.entries.get(self.item_pos) {
+                                let id = *self
+                                    .entry_objects
+                                    .get(self.table_pos)
+                                    .and_then(|ids| ids.get(self.item_pos))
+                                    .ok_or(GraphRefusal::Identity)?;
+                                let claims = pins
+                                    .ownership
+                                    .get_mut(&module.view)
+                                    .ok_or(GraphRefusal::Identity)?;
+                                claims.targets.push((id, entry.file_offset));
+                                claims.pins.push(id);
+                                self.item_pos += 1;
+                            } else {
+                                self.table_pos += 1;
+                                self.item_pos = 0;
+                            }
+                        } else {
+                            self.phase = BindPhase::FinishModule;
+                        }
+                    }
+                    BindPhase::FinishModule => {
+                        let object = self.object.take().ok_or(GraphRefusal::Identity)?;
+                        let exports = pins
+                            .by_id
+                            .get(&object)
+                            .ok_or(GraphRefusal::SourceChanged)?
+                            .exports
+                            .clone();
+                        self.modules.push(ReconciledModule {
+                            scanned: self.module.take().ok_or(GraphRefusal::Identity)?,
+                            object,
+                            entry_objects: std::mem::take(&mut self.entry_objects),
+                            exports,
+                        });
+                        self.phase = BindPhase::NextModule;
+                    }
+                    _ => return Err(GraphRefusal::Identity),
+                }
+                Ok(())
+            }
+        }
+
+        impl PinnedConservativeCursor {
+            pub(crate) fn poll_scanned_rebind(
+                &mut self,
+                input: &mut Option<RetainedScannedInputs>,
+                cursor: &mut ScannedRebindCursor,
+                reserve: &SemanticResourceReserver,
+                work: usize,
+            ) -> Result<GraphStep, GraphRefusal> {
+                if work == 0 {
+                    return Ok(GraphStep::Yielded);
+                }
+                if cursor.cancelled {
+                    return Err(GraphRefusal::Cancelled);
+                }
+                cursor.check_pool(reserve)?;
+                let mut credits = work;
+                if cursor.phase == BindPhase::New {
+                    cursor.begin_measure(
+                        self,
+                        input.as_ref().ok_or(GraphRefusal::Identity)?,
+                        reserve,
+                    )?;
+                    // Construction/binding of the first measurement itself
+                    // consumes one credit and takes no original allocation.
+                    credits -= 1;
+                }
+                cursor.check_candidate(self)?;
+                if cursor.taken {
+                    if input.is_some() {
+                        return Err(GraphRefusal::Identity);
+                    }
+                } else {
+                    let original = input.as_ref().ok_or(GraphRefusal::Identity)?;
+                    if Some(original.identity) != cursor.fence.map(|fence| fence.input)
+                        || !reserve.covers(&original.storage, 0)
+                    {
+                        return Err(GraphRefusal::Identity);
+                    }
+                }
+                if matches!(cursor.phase, BindPhase::Reclaim | BindPhase::Reclaimed) {
+                    return Err(GraphRefusal::Cancelled);
+                }
+                for _ in 0..credits {
+                    match cursor.phase {
+                        BindPhase::MeasureModule
+                        | BindPhase::MeasureExports
+                        | BindPhase::MeasureInterfaces
+                        | BindPhase::MeasureTable
+                        | BindPhase::MeasureEntries
+                        | BindPhase::MeasureSkips
+                        | BindPhase::MeasureViews
+                        | BindPhase::MeasurePin
+                        | BindPhase::MeasurePinExports => {
+                            let original = input.as_ref().ok_or(GraphRefusal::Identity)?;
+                            cursor.measure(
+                                self.output.as_ref().ok_or(GraphRefusal::Identity)?,
+                                original,
+                            )?;
+                        }
+                        BindPhase::Admit => cursor.admit(self, input, reserve)?,
+                        BindPhase::Ready => return Ok(GraphStep::Ready),
+                        _ => {
+                            cursor.bind_one(self.output.as_mut().ok_or(GraphRefusal::Identity)?)?;
+                            if cursor.phase == BindPhase::Ready {
+                                self.phase = Phase::Ready;
+                                return Ok(GraphStep::Ready);
+                            }
+                        }
+                    }
+                }
+                Ok(GraphStep::Advanced)
+            }
+
+            #[cfg(test)]
+            pub(crate) fn reference_rebind_claims_for_test(
+                &self,
+                view: ProcessViewId,
+            ) -> Option<&ViewClaims> {
+                self.output.as_ref()?.ownership.get(&view)
+            }
+        }
+
+        impl ScannedRebindCursor {
+            /// Reclamation, not graph/semantic completion. With no borrowed pin
+            /// owner, unknown shared or Weak export backing remains paid/refused.
+            pub(crate) fn reclaim(
+                &mut self,
+                pins: Option<&mut PinnedConservativeCursor>,
+                reserve: &SemanticResourceReserver,
+                work: usize,
+            ) -> Result<GraphStep, GraphRefusal> {
+                if work == 0 {
+                    return Ok(GraphStep::Yielded);
+                }
+                self.check_pool(reserve)?;
+                if let Some(owner) = pins.as_deref() {
+                    if self.fence.is_some() {
+                        if self.phase == BindPhase::Reclaimed {
+                            let fence = self.fence.ok_or(GraphRefusal::Identity)?;
+                            if owner.output.as_ref().and_then(|output| output.copy_source)
+                                != Some(fence.candidate)
+                                || owner.rebind_owner.is_some_and(|held| held != fence.input)
+                            {
+                                return Err(GraphRefusal::Identity);
+                            }
+                        } else {
+                            self.check_candidate(owner)?;
+                        }
+                    }
+                }
+                if self.phase == BindPhase::Reclaimed {
+                    self.release_loan(pins)?;
+                    return Ok(GraphStep::Ready);
+                }
+                self.phase = BindPhase::Reclaim;
+                for _ in 0..work {
+                    let actual = pins.as_deref().and_then(|owner| owner.output.as_ref());
+                    self.reclaim_one(actual)?;
+                    if self.phase == BindPhase::Reclaimed {
+                        self.release_loan(pins)?;
+                        return Ok(GraphStep::Ready);
+                    }
+                }
+                Ok(GraphStep::Advanced)
+            }
+
+            fn release_loan(
+                &self,
+                pins: Option<&mut PinnedConservativeCursor>,
+            ) -> Result<(), GraphRefusal> {
+                if self.taken
+                    && let Some(pins) = pins
+                {
+                    let fence = self.fence.ok_or(GraphRefusal::Identity)?;
+                    if let Some(owner) = pins.rebind_owner {
+                        if owner != fence.input {
+                            return Err(GraphRefusal::Identity);
+                        }
+                        pins.rebind_owner = None;
+                        pins.phase = if self.completed && !self.cancelled {
+                            Phase::Ready
+                        } else {
+                            Phase::RebindAborted
+                        };
+                    }
+                }
+                Ok(())
+            }
+
+            fn reclaim_one(&mut self, pins: Option<&PinnedObjects>) -> Result<(), GraphRefusal> {
+                if let Some(module) = &mut self.reconciled_drain {
+                    if module.advance(pins)? {
+                        self.reconciled_drain = None;
+                    }
+                    return Ok(());
+                }
+                if let Some(module) = &mut self.module_drain {
+                    if module.advance() {
+                        self.module_drain = None;
+                    }
+                    return Ok(());
+                }
+                match self.reclaim_stage {
+                    0 => {
+                        if let Some(normalize) = &mut self.normalize {
+                            if normalize.reclaim_one() {
+                                self.normalize = None;
+                            }
+                        } else {
+                            self.reclaim_stage = 1;
+                        }
+                    }
+                    1 => {
+                        drop(self.normalized.take());
+                        self.reclaim_stage = 2;
+                    }
+                    2 => {
+                        if let Some(copy) = &mut self.skip_copy {
+                            if reclaim_skip(&mut copy.skip) {
+                                self.skip_copy = None;
+                            }
+                        } else {
+                            self.reclaim_stage = 3;
+                        }
+                    }
+                    3 => {
+                        if let Some(skip) = &mut self.skip_primary {
+                            if reclaim_skip(skip) {
+                                self.skip_primary = None;
+                            }
+                        } else {
+                            self.reclaim_stage = 4;
+                        }
+                    }
+                    4 => {
+                        drop(self.entry.take());
+                        self.reclaim_stage = 5;
+                    }
+                    5 => {
+                        if let Some(entries) = &mut self.entries {
+                            if let Some(entry) = entries.next() {
+                                drop(entry.object_path);
+                            } else {
+                                drop(self.entries.take());
+                            }
+                        } else {
+                            self.reclaim_stage = 6;
+                        }
+                    }
+                    6 => {
+                        drop(std::mem::take(&mut self.ids));
+                        self.reclaim_stage = 7;
+                    }
+                    7 => {
+                        if self.entry_objects.pop().is_none() {
+                            drop(std::mem::take(&mut self.entry_objects));
+                            self.reclaim_stage = 8;
+                        }
+                    }
+                    8 => {
+                        if let Some(module) = self.module.take() {
+                            self.module_drain = Some(ModuleDrain::new(module));
+                        } else {
+                            self.reclaim_stage = 9;
+                        }
+                    }
+                    9 => {
+                        if let Some(originals) = &mut self.originals {
+                            if let Some(module) = originals.next() {
+                                self.module_drain = Some(ModuleDrain::new(module));
+                            } else {
+                                drop(self.originals.take());
+                            }
+                        } else {
+                            self.reclaim_stage = 10;
+                        }
+                    }
+                    10 => {
+                        if let Some(module) = self.modules.pop() {
+                            self.reconciled_drain = Some(ReconciledDrain::new(module));
+                        } else {
+                            drop(std::mem::take(&mut self.modules));
+                            self.reclaim_stage = 11;
+                        }
+                    }
+                    11 => {
+                        if let Some(skip) = &mut self.skip_primary {
+                            if reclaim_skip(skip) {
+                                self.skip_primary = None;
+                            }
+                        } else if let Some(skip) = self.skipped.pop() {
+                            self.skip_primary = Some(skip);
+                        } else {
+                            drop(std::mem::take(&mut self.skipped));
+                            self.reclaim_stage = 12;
+                        }
+                    }
+                    12 => {
+                        if self.growth.pop_first().is_none() {
+                            drop(std::mem::take(&mut self.growth));
+                            self.reclaim_stage = 13;
+                        }
+                    }
+                    // Refunds follow actual nested/suffix/empty-root teardown.
+                    13 => {
+                        self.input_storage = None;
+                        self.reclaim_stage = 14;
+                    }
+                    14 => {
+                        self.output_storage = None;
+                        self.reclaim_stage = 15;
+                    }
+                    15 => {
+                        self.header_storage = None;
+                        self.reclaim_stage = 16;
+                    }
+                    _ => {
+                        self.phase = BindPhase::Reclaimed;
+                    }
+                }
+                Ok(())
+            }
+
+            #[cfg(test)]
+            pub(crate) fn reference_pending_exports_for_test(
+                &self,
+                object: PinnedObjectId,
+            ) -> Option<&[(String, u64)]> {
+                if let Some(module) = &self.reconciled_drain
+                    && module.object == object
+                {
+                    return module.exports.as_deref();
+                }
+                self.modules
+                    .iter()
+                    .find(|module| module.object == object)
+                    .map(|module| module.exports.as_ref())
+            }
+        }
+
+        struct ReconciledDrain {
+            object: PinnedObjectId,
+            module: Option<ModuleDrain>,
+            ids: Vec<Vec<PinnedObjectId>>,
+            exports: Option<Arc<[(String, u64)]>>,
+            drained: usize,
+        }
+        impl ReconciledDrain {
+            fn new(module: ReconciledModule) -> Self {
+                Self {
+                    object: module.object,
+                    module: Some(ModuleDrain::new(module.scanned)),
+                    ids: module.entry_objects,
+                    exports: Some(module.exports),
+                    drained: 0,
+                }
+            }
+            fn advance(&mut self, pins: Option<&PinnedObjects>) -> Result<bool, GraphRefusal> {
+                if let Some(module) = &mut self.module {
+                    if module.advance() {
+                        self.module = None;
+                    }
+                    return Ok(false);
+                }
+                if self.ids.pop().is_some() {
+                    return Ok(false);
+                }
+                if self.ids.capacity() != 0 {
+                    drop(std::mem::take(&mut self.ids));
+                    return Ok(false);
+                }
+                if let Some(exports) = self.exports.as_mut() {
+                    if pins
+                        .and_then(|pins| pins.by_id.get(&self.object))
+                        .is_some_and(|entry| Arc::ptr_eq(&entry.exports, exports))
+                    {
+                        drop(self.exports.take());
+                        return Ok(false);
+                    }
+                    let slice = Arc::get_mut(exports).ok_or(GraphRefusal::Identity)?;
+                    if self.drained < slice.len() {
+                        drop(std::mem::take(&mut slice[self.drained].0));
+                        self.drained += 1;
+                        return Ok(false);
+                    }
+                    // The same approved final-layout transition as H1. No
+                    // mutable/public Arc exposure exists in reclamation.
+                    let slice = Arc::get_mut(exports).ok_or(GraphRefusal::Identity)?;
+                    if slice.len() != self.drained {
+                        return Err(GraphRefusal::Identity);
+                    }
+                    let exports = self.exports.take().ok_or(GraphRefusal::Identity)?;
+                    // SAFETY: each owned String was taken/freed individually;
+                    // get_mut just re-proved exclusivity/noWeak, drained==len,
+                    // and the original allocation/metadata is transferred once.
+                    unsafe {
+                        deallocate_drained_unique_arc(exports);
+                    }
+                    return Ok(false);
+                }
+                Ok(true)
+            }
+        }
+    }
 
     #[cfg(test)]
     mod lifecycle_tests {

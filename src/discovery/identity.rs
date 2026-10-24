@@ -10802,7 +10802,7 @@ mod tests {
 
                     if cancel
                         && observed_growth
-                        && actual.len() > 0
+                        && !actual.is_empty()
                         && actual.len() < expected_prefix.len()
                     {
                         let current = &pins.reference_rebind_claims_for_test(view).unwrap().pins;
@@ -10835,7 +10835,7 @@ mod tests {
                             GraphStep::Advanced
                         );
                         let current = &pins.reference_rebind_claims_for_test(view).unwrap().pins;
-                        assert!(current.len() > 0 && current.len() < expected_prefix.len());
+                        assert!(!current.is_empty() && current.len() < expected_prefix.len());
                         assert_eq!(&current[..], &expected_prefix[..current.len()]);
                         let custody = (current.as_ptr(), current.len(), current.capacity());
                         rebind.cancel();
@@ -11007,7 +11007,7 @@ mod tests {
 
                         if cancel
                             && observed_growth
-                            && actual.len() > 0
+                            && !actual.is_empty()
                             && actual.len() < expected_prefix.len()
                         {
                             let (capacity, current) =
@@ -11028,7 +11028,7 @@ mod tests {
                             let (capacity, current) =
                                 rebind.reference_current_unpinned_for_test().unwrap();
                             assert_eq!((current.as_ptr(), current.len(), capacity), custody);
-                            assert_eq!(&current[..], &expected_prefix[..current.len()]);
+                            assert_eq!(current, &expected_prefix[..current.len()]);
                             assert_eq!(pool.snapshot(), held);
                             assert_eq!(crate::test_alloc::armed_requested_snapshot(), allocated);
                             // Normal binding still advances: ownerless refusal did not switch the
@@ -11040,8 +11040,8 @@ mod tests {
                             );
                             let (capacity, current) =
                                 rebind.reference_current_unpinned_for_test().unwrap();
-                            assert!(current.len() > 0 && current.len() < expected_prefix.len());
-                            assert_eq!(&current[..], &expected_prefix[..current.len()]);
+                            assert!(!current.is_empty() && current.len() < expected_prefix.len());
+                            assert_eq!(current, &expected_prefix[..current.len()]);
                             let custody = (current.as_ptr(), current.len(), capacity);
                             rebind.cancel();
                             let held = pool.snapshot();
@@ -11053,7 +11053,7 @@ mod tests {
                             let (capacity, current) =
                                 rebind.reference_current_unpinned_for_test().unwrap();
                             assert_eq!((current.as_ptr(), current.len(), capacity), custody);
-                            assert_eq!(&current[..], &expected_prefix[..current.len()]);
+                            assert_eq!(current, &expected_prefix[..current.len()]);
                             assert_eq!(
                                 (
                                     input.is_none(),

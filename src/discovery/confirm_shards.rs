@@ -101,7 +101,7 @@ pub(crate) trait SegmentProof {
 pub(crate) fn prove_and_finish_prepared<Io: ConfirmIo>(
     io: &mut Io,
     pid: u32,
-    prepared: PreparedConfirmation<Io::Pin>,
+    mut prepared: PreparedConfirmation<Io::Pin>,
     hook: &mut (dyn SegmentProof + '_),
     resources: &IoResources,
     budget: &mut CaptureWorkBudget,
@@ -123,8 +123,18 @@ pub(crate) fn prove_and_finish_prepared<Io: ConfirmIo>(
     if let Some(reason) = budget.check_deadline_now() {
         return Confirmation::Lost(AttributionLoss::Budget, reason.into());
     }
-    let mapped =
-        answers.unwrap_or_else(|| read_ranges_reserved(io, pid, &prepared.ranges, Some(resources)));
+    // A kernel answer needs no userspace reads; otherwise the member
+    // returns to the stash for the fallback proofs, like the scalar
+    // confirm path, and is taken back for the finish.
+    let mapped = match answers {
+        Some(mapped) => mapped,
+        None => {
+            io.return_member(pid, prepared.member.take());
+            let mapped = read_ranges_reserved(io, pid, &prepared.ranges, Some(resources));
+            prepared.member = io.take_member();
+            mapped
+        }
+    };
     let result = finish_confirmation(io, pid, prepared, mapped, Some(resources), budget);
     // Keep the guard-bound result through final live checks, and consume it
     // before another target run can replace scope or reuse slot numbers.

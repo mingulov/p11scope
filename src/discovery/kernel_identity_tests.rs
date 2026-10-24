@@ -4203,6 +4203,10 @@ impl super::super::sweep_attribution::ConfirmIo for MemberIo {
     fn take_member(&mut self) -> Option<RetainedGroupMember> {
         self.stashed.take()
     }
+
+    fn return_member(&mut self, _pid: u32, member: Option<RetainedGroupMember>) {
+        self.stashed = member;
+    }
 }
 
 /// One scripted member-run outcome, in run order.

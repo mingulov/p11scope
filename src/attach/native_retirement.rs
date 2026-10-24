@@ -1426,17 +1426,16 @@ impl NativeRetirement {
             }
             CollectedPhase::Targets(index) => {
                 if let Some(slot) = cursor.original().removed.get(index).map(|slot| slot.index) {
-                    let target = retained.remove(&slot);
-                    if target.is_none() {
-                        cursor.phase = CollectedPhase::Refused;
-                    } else {
+                    if let Some(target) = retained.remove(&slot) {
                         cursor
                             .retention
                             .as_ref()
                             .expect("retained original guard")
-                            .retain_target(target.expect("checked original target"));
+                            .retain_target(target);
                         cursor.fence.target_count = retained.len();
                         cursor.phase = CollectedPhase::Targets(index + 1);
+                    } else {
+                        cursor.phase = CollectedPhase::Refused;
                     }
                 } else {
                     cursor.phase = CollectedPhase::Extract(cursor.choices.len());

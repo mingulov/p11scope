@@ -1,9 +1,12 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
-use p11scope_manifest::elf::ElfAbi;
+use object::elf;
+use p11scope_manifest::elf::{ElfAbi, ElfSnapshot};
 use p11scope_manifest::identity::{
-    IdentityKind, MappingFileKey, identify, inspect_file, open_object,
+    IdentityKind, MappingFileKey, identify, inspect_file, inspect_file_with_reader_exporting,
+    open_object,
 };
 use p11scope_manifest::maps::{executable_file_keys, parse_maps};
+use std::os::unix::fs::FileExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -143,4 +146,163 @@ fn unreadable_is_explicitly_not_reusable() {
     assert!(!id.reusable);
     assert!(id.value.is_none());
     assert!(id.sha256.is_none());
+}
+
+const INSPECT_REGISTRY: &[&str] = &["C_GetFunctionList", "NSC_GetFunctionList"];
+
+fn provider_source() -> &'static str {
+    "unsigned long C_GetFunctionList(void **p){(void)p;return 0;}\n\
+     unsigned long NSC_GetFunctionList(void **p){(void)p;return 0;}\n"
+}
+
+fn cc_provider(dir: &Path, out: &str) -> PathBuf {
+    let src = dir.join("provider.c");
+    std::fs::write(&src, provider_source()).unwrap();
+    let so = dir.join(out);
+    let ok = Command::new("gcc")
+        .args(["-shared", "-fPIC", "-o"])
+        .arg(&so)
+        .arg(&src)
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok, "gcc failed");
+    so
+}
+
+fn le_u16(bytes: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap())
+}
+
+fn le_u64(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
+}
+
+fn executable_load_header(bytes: &[u8]) -> std::ops::Range<usize> {
+    assert_eq!(&bytes[..4], b"\x7fELF");
+    assert_eq!(bytes[4], 2, "fixture must be ELF64");
+    assert_eq!(bytes[5], 1, "fixture must be little-endian");
+    let start: usize = le_u64(bytes, 0x20).try_into().unwrap();
+    let size = usize::from(le_u16(bytes, 0x36));
+    let count = usize::from(le_u16(bytes, 0x38));
+    (0..count)
+        .map(|index| start + index * size)
+        .find(|offset| {
+            u32::from_le_bytes(bytes[*offset..*offset + 4].try_into().unwrap()) == elf::PT_LOAD
+                && u32::from_le_bytes(bytes[*offset + 4..*offset + 8].try_into().unwrap())
+                    & elf::PF_X
+                    != 0
+        })
+        .map(|offset| offset..offset + size)
+        .unwrap()
+}
+
+#[test]
+fn inspect_refuses_segment_past_eof() {
+    // The inspect path must apply the snapshot's segment-range validation
+    // before walking exports or collecting executable ranges: the same
+    // one-field corruption as `export_facts_mmap_refuses_segment_past_eof`
+    // (executable PT_LOAD p_offset moved past EOF) must refuse
+    // byte-identically to the snapshot oracle, never answer with export
+    // offsets and ranges past EOF.
+    let d = tmpdir("inspect-segment-past-eof");
+    let provider = cc_provider(&d, "provider.so");
+    let original = std::fs::read(&provider).unwrap();
+    let mut bytes = original.clone();
+    let header = executable_load_header(&bytes);
+    let offset = le_u64(&bytes, header.start + 8);
+    let filesz = le_u64(&bytes, header.start + 32);
+    assert!(
+        offset
+            .checked_add(filesz)
+            .is_some_and(|end| end <= original.len() as u64),
+        "fixture segment must start in range (offset {offset:#x}, filesz {filesz:#x})"
+    );
+    let corrupted = original.len() as u64 + 0x1000;
+    bytes[header.start + 8..header.start + 16].copy_from_slice(&corrupted.to_le_bytes());
+    assert_ne!(bytes, original, "the patch must change the image");
+    let path = d.join("segment-past-eof.so");
+    std::fs::write(&path, &bytes).unwrap();
+
+    // The oracle pins the setup: the image still classifies, and refuses
+    // only on the segment range.
+    let file = open_object(&path).unwrap();
+    let oracle_err = ElfSnapshot::read(&file).unwrap_err();
+    assert_eq!(oracle_err, "segment file range extends past the ELF bytes");
+    // The exporting inspect path refuses byte-identically (pre-fix: Ok with
+    // exports and ranges past EOF).
+    let file = open_object(&path).unwrap();
+    match inspect_file_with_reader_exporting(
+        &file,
+        |file, bytes, offset| file.read_at(bytes, offset),
+        INSPECT_REGISTRY,
+    ) {
+        Err(error) => assert_eq!(error, oracle_err),
+        Ok(inspected) => panic!(
+            "inspect answered for a past-EOF image: exports {:?}, ranges {:?} (len {})",
+            inspected.exports,
+            inspected.executable_ranges,
+            bytes.len(),
+        ),
+    }
+    // The plain inspect path shares the same refused core.
+    let file = open_object(&path).unwrap();
+    assert_eq!(inspect_file(&file).unwrap_err(), oracle_err);
+}
+
+#[test]
+fn inspect_matches_snapshot_on_valid_image() {
+    // Healthy twin of the segment-past-EOF refusal: the same seed image,
+    // unpatched, yields inspect exports and executable ranges equal to the
+    // snapshot path, with every offset inside the file.
+    let d = tmpdir("inspect-valid-twin");
+    let provider = cc_provider(&d, "provider.so");
+    let file_len = std::fs::metadata(&provider).unwrap().len();
+    let file = open_object(&provider).unwrap();
+    let snapshot = ElfSnapshot::read(&file).unwrap();
+    let file = open_object(&provider).unwrap();
+    let inspected = inspect_file_with_reader_exporting(
+        &file,
+        |file, bytes, offset| file.read_at(bytes, offset),
+        INSPECT_REGISTRY,
+    )
+    .unwrap();
+    assert_eq!(inspected.abi, snapshot.abi());
+    let oracle_exports = snapshot.exports_matching(INSPECT_REGISTRY).unwrap();
+    assert!(
+        !oracle_exports.is_empty(),
+        "the fixture must export hooks, or the offsets are unpinned"
+    );
+    assert_eq!(inspected.exports, oracle_exports);
+    for (name, offset) in &inspected.exports {
+        assert!(
+            *offset < file_len,
+            "{name} offset {offset} outside {file_len} bytes"
+        );
+        assert!(
+            snapshot.is_executable_offset(*offset),
+            "{name} offset {offset} is outside every snapshot executable range"
+        );
+    }
+    assert!(
+        !inspected.executable_ranges.is_empty(),
+        "the fixture must have executable ranges, or admission is unpinned"
+    );
+    for (start, end) in &inspected.executable_ranges {
+        assert!(
+            start < end && *end <= file_len,
+            "range {start}..{end} outside {file_len} bytes"
+        );
+        assert!(snapshot.is_executable_offset(*start));
+        assert!(snapshot.is_executable_offset(end - 1));
+    }
+    // Dense admission agreement between the inspect ranges and the snapshot
+    // oracle, plus the past-EOF boundary.
+    for probe in (0..file_len).step_by(16).chain([file_len, file_len + 1]) {
+        assert_eq!(
+            inspected.contains_executable_offset(probe),
+            snapshot.is_executable_offset(probe),
+            "admission differs at {probe:#x}"
+        );
+    }
 }

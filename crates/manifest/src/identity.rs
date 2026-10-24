@@ -6,7 +6,7 @@
 //! explicitly not reusable.
 
 #[cfg(feature = "identify")]
-use object::{Object as _, ObjectSegment as _};
+use object::Object as _;
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "identify")]
 use sha2::{Digest as _, Sha256};
@@ -18,7 +18,7 @@ use std::os::unix::fs::{FileExt as _, OpenOptionsExt as _};
 use std::path::Path;
 
 #[cfg(feature = "identify")]
-use crate::elf::{ElfAbi, classified_object, exports_matching_in_object};
+use crate::elf::{ElfAbi, classified_validated_object, exports_matching_in_object};
 #[cfg(feature = "identify")]
 use crate::maps::{Device, ObjectKey};
 
@@ -216,7 +216,9 @@ pub fn inspect_file_with_reader_exporting(
     wanted: &[&str],
 ) -> Result<InspectedObject, String> {
     let data = read_object_bytes_with(file, reader)?;
-    let (object, abi) = classified_object(&data)?;
+    // The shared validated parse: corrupt segment ranges refuse here, before
+    // the export walk below; the executable ranges arrive validated with it.
+    let (object, abi, executable_ranges) = classified_validated_object(&data)?;
     let sha256 = hex(&Sha256::digest(&data));
     let mut note = None;
     // object reads the build-id from PT_NOTE program headers too, so a
@@ -247,14 +249,6 @@ pub fn inspect_file_with_reader_exporting(
             }
         }
     };
-    let executable_ranges = object
-        .segments()
-        .filter(|segment| segment.permissions().executable())
-        .filter_map(|segment| {
-            let (start, size) = segment.file_range();
-            start.checked_add(size).map(|end| (start, end))
-        })
-        .collect();
     let exports = if wanted.is_empty() {
         Vec::new()
     } else {

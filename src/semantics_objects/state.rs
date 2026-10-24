@@ -3637,6 +3637,139 @@ fn is_null_cancel_init(function: u32) -> bool {
         })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use p11scope_ebpf_common::object_policy::SafeCurve;
+
+    fn scalar(value: u16) -> FieldState {
+        FieldState::Value(FieldValue::Scalar(value))
+    }
+
+    fn established_with(pairs: &[(SafeAttributeKind, FieldState)]) -> ViewRecord {
+        let mut established = [FieldState::Unknown; METADATA_FIELDS];
+        for (kind, state) in pairs {
+            established[field_index(*kind)] = *state;
+        }
+        ViewRecord {
+            domain: ObjectDomain::reference(1, 1, 1, 1, 1),
+            session: SessionIncarnation(7),
+            handle: ObjectHandle::new(9).unwrap(),
+            origin: ViewOrigin::FirstObserved,
+            creator: None,
+            birth: Birth::Unknown,
+            lifetime: Lifetime::Live,
+            attribution: Attribution::Valid,
+            references: 0,
+            key_uses: 0,
+            key_retained: false,
+            requested: [FieldState::Unknown; METADATA_FIELDS],
+            established,
+            queries: [QueryStatus::NotQueried; METADATA_FIELDS],
+        }
+    }
+
+    // Healthy twins: an established compatible class keeps the combined
+    // label, and an unknown class does not block it.
+    #[test]
+    fn combined_label_healthy_class_key_pairs() {
+        use SafeAttributeKind::*;
+        let aes = established_with(&[
+            (Class, scalar(4)),
+            (KeyType, scalar(0x1f)),
+            (ValueLen, scalar(16)),
+        ]);
+        assert_eq!(aes.label(), Some(KeyLabel::Aes { value_len: 16 }));
+        let rsa = established_with(&[
+            (Class, scalar(3)),
+            (KeyType, scalar(0x00)),
+            (ModulusBits, scalar(2048)),
+        ]);
+        assert_eq!(rsa.label(), Some(KeyLabel::Rsa { modulus_bits: 2048 }));
+        let rsa_public = established_with(&[
+            (Class, scalar(2)),
+            (KeyType, scalar(0x00)),
+            (ModulusBits, scalar(4096)),
+        ]);
+        assert_eq!(
+            rsa_public.label(),
+            Some(KeyLabel::Rsa { modulus_bits: 4096 })
+        );
+        let ec = established_with(&[
+            (Class, scalar(2)),
+            (KeyType, scalar(0x03)),
+            (
+                EcParams,
+                FieldState::Value(FieldValue::Curve(SafeCurve::Secp256r1)),
+            ),
+        ]);
+        assert_eq!(
+            ec.label(),
+            Some(KeyLabel::Ec {
+                curve: SafeCurve::Secp256r1
+            })
+        );
+        let unknown_class = established_with(&[
+            (KeyType, scalar(0x1f)),
+            (ValueLen, scalar(32)),
+        ]);
+        assert_eq!(
+            unknown_class.label(),
+            Some(KeyLabel::Aes { value_len: 32 })
+        );
+    }
+
+    // Failure twin: a conflicting class withholds the combined label.
+    #[test]
+    fn combined_label_withheld_on_class_conflict() {
+        use SafeAttributeKind::*;
+        let conflicted = established_with(&[
+            (
+                Class,
+                FieldState::Conflict(Some(FieldValue::Scalar(4))),
+            ),
+            (KeyType, scalar(0x1f)),
+            (ValueLen, scalar(16)),
+        ]);
+        assert_eq!(conflicted.label(), None);
+    }
+
+    // Failure twins: an established class incompatible with the key
+    // type withholds the combined label (AES needs secret_key; RSA/EC
+    // need public_key/private_key).
+    #[test]
+    fn combined_label_withheld_on_incompatible_class() {
+        use SafeAttributeKind::*;
+        let curve = FieldState::Value(FieldValue::Curve(SafeCurve::Secp384r1));
+        for (key_type, size_kind, size, class, name) in [
+            (0x1f, ValueLen, 16, 2, "aes under public_key"),
+            (0x1f, ValueLen, 24, 0, "aes under data"),
+            (0x00, ModulusBits, 2048, 4, "rsa under secret_key"),
+            (0x00, ModulusBits, 1024, 1, "rsa under certificate"),
+            (0x00, ModulusBits, 3072, 0, "rsa under data"),
+        ] {
+            let view = established_with(&[
+                (Class, scalar(class)),
+                (KeyType, scalar(key_type)),
+                (size_kind, scalar(size)),
+            ]);
+            assert_eq!(view.label(), None, "{name}");
+        }
+        for (class, name) in [
+            (4, "ec under secret_key"),
+            (1, "ec under certificate"),
+            (0, "ec under data"),
+        ] {
+            let view = established_with(&[
+                (Class, scalar(class)),
+                (KeyType, scalar(0x03)),
+                (EcParams, curve),
+            ]);
+            assert_eq!(view.label(), None, "{name}");
+        }
+    }
+}
+
 fn requested_fields(list: Option<&AttributeList>) -> [FieldState; METADATA_FIELDS] {
     let mut fields = [FieldState::Unknown; METADATA_FIELDS];
     let Some(list) = list else {

@@ -3,6 +3,7 @@
 """Exercise actual matrix preparation, judge and production shell seams."""
 import json
 import contextlib
+import errno
 import hashlib
 import io
 import os
@@ -962,7 +963,7 @@ class MatrixContract(unittest.TestCase):
         if case == "untrusted": root.chmod(0o777)
         events = []
         state = {"mounted": mounted}
-        real_run, real_stat = subprocess.run, Path.stat
+        real_run, real_stat, real_os_open = subprocess.run, Path.stat, os.open
         def device_stat(path, *args, **kwargs):
             if str(path) in ("/dev/c2disk", "/dev/c2other"):
                 return mock.Mock(st_mode=stat.S_IFBLK | 0o600,
@@ -974,17 +975,24 @@ class MatrixContract(unittest.TestCase):
             return info
         def external(argv, **kwargs):
             argv = list(map(str, argv))
-            def done(rc=0, stdout=""): return subprocess.CompletedProcess(argv, rc, stdout, "")
+            def done(rc=0, stdout="", stderr=""): return subprocess.CompletedProcess(argv, rc, stdout, stderr)
             if argv[0] == "uname": return done(stdout="foreign\n" if case == "kernel" else "6.1.188\n")
             if argv[0] == "lsblk":
                 rows = [{"path": "/dev/c2disk", "type": "disk", "maj:min": "252:0"}]
                 if case == "missing": rows = []
-                elif case in ("duplicate", "probe_error", "empty_other", "other_uuid"):
+                elif case in ("duplicate", "probe_error", "empty_other", "other_uuid", "fd0_enxio", "fd0_enomedium",
+                              "selected_probe_error"):
                     rows += [{"path": "/dev/c2other", "type": "disk", "maj:min": "252:1"}]
                 return done(stdout=json.dumps({"blockdevices": rows}))
             if argv[0] == "blkid":
                 if case == "probe_error" and argv[-1] == "/dev/c2other": return done(1)
                 if case == "empty_other" and argv[-1] == "/dev/c2other": return done(2)
+                if case in ("fd0_enxio", "fd0_enomedium") and argv[-1] == "/dev/c2other":
+                    detail = "No such device or address" if case == "fd0_enxio" else "No medium found"
+                    return done(2, "", "blkid: error: /dev/c2other: " + detail + "\n")
+                if case == "selected_probe_error" and argv[-1] == "/dev/c2disk": return done(1)
+                if case == "selected_unreadable" and argv[-1] == "/dev/c2disk":
+                    return done(2, "", "blkid: error: /dev/c2disk: No such device or address\n")
                 other_uuid = case == "uuid" or (case == "other_uuid" and argv[-1] == "/dev/c2other")
                 uuid = "87654321-1234-4234-9234-123456789abc" if other_uuid else contract["guest_disk"]["uuid"]
                 return done(stdout="TYPE=" + ("xfs" if case == "type" else "ext4") + "\nUUID=" + uuid + "\n")
@@ -1017,8 +1025,24 @@ class MatrixContract(unittest.TestCase):
                 events.append("outputs_complete")
                 return result
             self.fail("unexpected external command: " + repr(argv))
+        # Controlled block-device readability: only the named cases hold an
+        # unreadable device; every other /dev/c2* open behaves as on a host
+        # without those nodes, and all other paths use the real opener.
+        unreadable_opens = {("fd0_enxio", "/dev/c2other"): errno.ENXIO,
+                            ("fd0_enomedium", "/dev/c2other"): errno.ENOMEDIUM,
+                            ("selected_unreadable", "/dev/c2disk"): errno.ENXIO}
+        def controlled_open(path, *args, **kwargs):
+            number = unreadable_opens.get((case, str(path)))
+            if number is not None:
+                raise OSError(number, os.strerror(number))
+            if str(path) in ("/dev/c2disk", "/dev/c2other"):
+                if (case, str(path)) == ("selected_probe_error", "/dev/c2disk"):
+                    return real_os_open(os.devnull, os.O_RDONLY)  # opens fine: the probe error is genuine
+                raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), str(path))
+            return real_os_open(path, *args, **kwargs)
         stdout, stderr = io.StringIO(), io.StringIO()
         with mock.patch.object(Path, "stat", device_stat), mock.patch.object(subprocess, "run", side_effect=external), \
+                mock.patch.object(os, "open", controlled_open), \
                 mock.patch.object(os, "geteuid", return_value=1000 if case == "nonroot" else 0), \
                 contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             try:
@@ -1067,6 +1091,87 @@ class MatrixContract(unittest.TestCase):
                 self.assertFalse(output, detail)
                 self.assertNotIn("child", events)
                 self.assertNotIn("umount", events, "must not unmount an unrelated or preexisting mount")
+
+    def test_guest_disk_skips_unreadable_nonselected_device(self):
+        # Phantom-floppy twin: /dev/c2other fails blkid with the empty-drive
+        # open error while /dev/c2disk carries the expected UUID; the mount
+        # lifetime must proceed on the UUID carrier.
+        image, uuid, env = self.guest_disk_fixture()
+        stage = self.prepare_disk_stage(image, uuid, env)
+        mounts = tempfile.TemporaryDirectory(prefix="matrix-guest-mount-", dir="/var/tmp")
+        self.addCleanup(mounts.cleanup)
+        root = Path(mounts.name) / "disk-mount"
+        for case in ("fd0_enxio", "fd0_enomedium"):
+            with self.subTest(case=case):
+                rc, events, output, detail = self.controlled_guest_disk(stage, root, case)
+                self.assertEqual(rc, 7, detail)
+                self.assertTrue(output)
+                self.assertEqual(events, ["mount", "child", "outputs_complete", "umount"])
+
+    def test_guest_disk_refuses_selected_device_probe_errors(self):
+        # A probe failure on the UUID-carrying candidate still refuses, even
+        # when another device probes cleanly (selected_probe_error), and an
+        # unreadable sole candidate refuses without selecting anything.
+        image, uuid, env = self.guest_disk_fixture()
+        stage = self.prepare_disk_stage(image, uuid, env)
+        mounts = tempfile.TemporaryDirectory(prefix="matrix-guest-mount-", dir="/var/tmp")
+        self.addCleanup(mounts.cleanup)
+        for index, case in enumerate(("selected_probe_error", "selected_unreadable")):
+            with self.subTest(case=case):
+                rc, events, output, detail = self.controlled_guest_disk(stage, Path(mounts.name) / ("mount-" + str(index)), case)
+                self.assertEqual(rc, 1, detail)
+                self.assertFalse(output, detail)
+                self.assertNotIn("mount", events)
+                self.assertNotIn("child", events)
+                self.assertNotIn("umount", events)
+        rc, _, _, detail = self.controlled_guest_disk(stage, Path(mounts.name) / "mount-strict", "selected_probe_error")
+        self.assertEqual(rc, 1, detail)
+        self.assertNotIn("skipped unreadable", detail)
+
+    def test_selected_guest_device_records_skipped_unreadable_devices(self):
+        uuid = "12345678-1234-4234-9234-123456789abc"
+        healthy = "TYPE=ext4\nUUID=" + uuid + "\n"
+        foreign = "TYPE=ext4\nUUID=87654321-1234-4234-9234-123456789abc\n"
+        rows = [{"path": "/dev/c2disk", "type": "disk", "maj:min": "252:0"},
+                {"path": "/dev/c2other", "type": "disk", "maj:min": "252:1"}]
+        real_stat, real_os_open = Path.stat, os.open
+        def select(blkid_by_path, unreadable=()):
+            def external(argv, **kwargs):
+                argv = list(map(str, argv))
+                if argv[0] == "lsblk":
+                    return subprocess.CompletedProcess(argv, 0, json.dumps({"blockdevices": rows}), "")
+                if argv[0] == "blkid":
+                    rc, stdout, stderr = blkid_by_path[argv[-1]]
+                    return subprocess.CompletedProcess(argv, rc, stdout, stderr)
+                self.fail("unexpected external command: " + repr(argv))
+            def device_stat(path, *args, **kwargs):
+                for row in rows:
+                    if str(path) == row["path"]:
+                        major, minor = row["maj:min"].split(":")
+                        return mock.Mock(st_mode=stat.S_IFBLK | 0o600, st_rdev=os.makedev(int(major), int(minor)))
+                return real_stat(path, *args, **kwargs)
+            def controlled_open(path, *args, **kwargs):
+                if str(path) in unreadable:
+                    raise OSError(errno.ENXIO, os.strerror(errno.ENXIO))
+                return real_os_open(path, *args, **kwargs)
+            with mock.patch.object(subprocess, "run", side_effect=external), \
+                    mock.patch.object(Path, "stat", device_stat), \
+                    mock.patch.object(os, "open", controlled_open):
+                return CHECKER_MOD["selected_guest_device"]({"uuid": uuid})
+        device = select({"/dev/c2disk": (0, healthy, ""),
+                         "/dev/c2other": (2, "", "blkid: error: /dev/c2other: No such device or address\n")},
+                        unreadable=("/dev/c2other",))
+        self.assertEqual(device["path"], "/dev/c2disk")
+        self.assertEqual(device["skipped_unreadable"], ["/dev/c2other"])
+        device = select({"/dev/c2disk": (0, healthy, ""), "/dev/c2other": (0, foreign, "")})
+        self.assertEqual(device["skipped_unreadable"], [])
+        with self.assertRaises(CHECKER_MOD["Invalid"]) as refused:
+            select({"/dev/c2disk": (2, "", "blkid: error: /dev/c2disk: No such device or address\n"),
+                    "/dev/c2other": (0, foreign, "")}, unreadable=("/dev/c2disk",))
+        self.assertIn("skipped unreadable device(s): /dev/c2disk", str(refused.exception))
+        with self.assertRaises(CHECKER_MOD["Invalid"]) as refused:
+            select({"/dev/c2disk": (0, healthy, ""), "/dev/c2other": (0, healthy, "")})
+        self.assertNotIn("skipped unreadable", str(refused.exception))
 
     def test_module_discovery_preserves_explicit_elf_and_refuses_missing_or_wrong_abi(self):
         select = CHECKER_MOD["select_module"]

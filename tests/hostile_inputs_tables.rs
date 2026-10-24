@@ -37,6 +37,46 @@ fn build_provider(dir: &Path, name: &str, source: &str) -> PathBuf {
     so
 }
 
+/// Every hostile provider module built by this file's tests, grouped by the
+/// owning test. Each test builds its names from its slice and asserts it
+/// built exactly that slice; `hostile_provider_corpus_is_pinned` pins the
+/// exact membership, so the corpus cannot shrink silently.
+/// `unusable_module_paths_are_refused` builds nothing (path-only refusals).
+const HOSTILE_PROVIDERS: &[&str] = &[
+    // null_and_failing_legacy_acquisitions_are_errors
+    "null_table",
+    "bad_rv",
+    // module_without_pkcs11_exports_is_refused_not_attributed
+    "plain",
+    // hostile_versions_are_never_walked
+    "version_9_9",
+    "version_0_0",
+    "version_4_0",
+    "version_2_255",
+    // unmapped_table_pointer_is_unreadable
+    "unmapped_ptr",
+    // garbage_slots_resolve_only_the_real_code_pointer
+    "slots",
+    // lying_interface_counts_are_capped
+    "crowded",
+    "growing",
+    "overfill",
+    // hostile_interface_names_and_lists_are_evidence_only
+    "ifaces",
+];
+
+/// Builds `name` from `source`, recording the name so each test can assert it
+/// built exactly its [`HOSTILE_PROVIDERS`] slice.
+fn build_tracked<'a>(
+    dir: &Path,
+    built: &mut Vec<&'a str>,
+    name: &'a str,
+    source: &str,
+) -> PathBuf {
+    built.push(name);
+    build_provider(dir, name, source)
+}
+
 /// Only the legacy slot exists and it records absence: no standard
 /// interface surface was walked.
 fn only_absent_legacy(manifest: &p11scope_manifest::manifest::Manifest) -> bool {
@@ -71,9 +111,11 @@ fn assert_nothing_resolved(manifest: &p11scope_manifest::manifest::Manifest, con
 #[test]
 fn null_and_failing_legacy_acquisitions_are_errors() {
     let dir = workdir("legacy-absent");
-    let null = build_provider(
+    let mut built = Vec::new();
+    let null = build_tracked(
         &dir,
-        "null_table",
+        &mut built,
+        HOSTILE_PROVIDERS[0],
         r#"typedef unsigned long CK_RV;
 unsigned long C_GetFunctionList(void **out){ *out = 0; return 0; }
 "#,
@@ -89,9 +131,10 @@ unsigned long C_GetFunctionList(void **out){ *out = 0; return 0; }
     assert!(surface.functions.is_empty());
     assert_nothing_resolved(&manifest, "null table");
 
-    let bad_rv = build_provider(
+    let bad_rv = build_tracked(
         &dir,
-        "bad_rv",
+        &mut built,
+        HOSTILE_PROVIDERS[1],
         r#"typedef unsigned long CK_RV;
 unsigned long C_GetFunctionList(void **out){ (void)out; return 7; }
 "#,
@@ -104,12 +147,19 @@ unsigned long C_GetFunctionList(void **out){ (void)out; return 7; }
         surface.acquisition
     );
     assert_nothing_resolved(&manifest, "bad rv");
+    assert_eq!(built, HOSTILE_PROVIDERS[0..2]);
 }
 
 #[test]
 fn module_without_pkcs11_exports_is_refused_not_attributed() {
     let dir = workdir("no-exports");
-    let plain = build_provider(&dir, "plain", "int plain_symbol(void){return 1;}\n");
+    let mut built = Vec::new();
+    let plain = build_tracked(
+        &dir,
+        &mut built,
+        HOSTILE_PROVIDERS[2],
+        "int plain_symbol(void){return 1;}\n",
+    );
     // No acquisition export exists, so discovery refuses outright with no
     // manifest at all — nothing is attributed to the module.
     let error = discover(&plain).unwrap_err();
@@ -117,15 +167,21 @@ fn module_without_pkcs11_exports_is_refused_not_attributed() {
         error.contains("no module acquisition export"),
         "export-less module must be refused as unacquirable: {error}"
     );
+    assert_eq!(built, HOSTILE_PROVIDERS[2..3]);
 }
 
 #[test]
 fn hostile_versions_are_never_walked() {
     let dir = workdir("versions");
-    for (major, minor) in [(9u8, 9u8), (0, 0), (4, 0), (2, 255)] {
-        let provider = build_provider(
+    let mut built = Vec::new();
+    let cases = [(9u8, 9u8), (0, 0), (4, 0), (2, 255)];
+    assert_eq!(cases.len(), HOSTILE_PROVIDERS[3..7].len());
+    for ((major, minor), name) in cases.into_iter().zip(&HOSTILE_PROVIDERS[3..7]) {
+        assert_eq!(name, &format!("version_{major}_{minor}"));
+        let provider = build_tracked(
             &dir,
-            &format!("version_{major}_{minor}"),
+            &mut built,
+            name,
             &format!(
                 r#"typedef unsigned char CK_BYTE;
 typedef unsigned long CK_RV;
@@ -164,14 +220,17 @@ CK_RV C_GetFunctionList(void **out){{ *out = &table; return 0; }}
             assert!(surface.functions.is_empty());
         }
     }
+    assert_eq!(built, HOSTILE_PROVIDERS[3..7]);
 }
 
 #[test]
 fn unmapped_table_pointer_is_unreadable() {
     let dir = workdir("unmapped");
-    let provider = build_provider(
+    let mut built = Vec::new();
+    let provider = build_tracked(
         &dir,
-        "unmapped_ptr",
+        &mut built,
+        HOSTILE_PROVIDERS[7],
         r#"typedef unsigned long CK_RV;
 CK_RV C_GetFunctionList(void **out){ *out = (void *)0xdeadbeefdeadbeefUL; return 0; }
 "#,
@@ -186,14 +245,17 @@ CK_RV C_GetFunctionList(void **out){ *out = (void *)0xdeadbeefdeadbeefUL; return
     );
     assert!(surface.functions.is_empty());
     assert_nothing_resolved(&manifest, "unmapped pointer");
+    assert_eq!(built, HOSTILE_PROVIDERS[7..8]);
 }
 
 #[test]
 fn garbage_slots_resolve_only_the_real_code_pointer() {
     let dir = workdir("slots");
-    let provider = build_provider(
+    let mut built = Vec::new();
+    let provider = build_tracked(
         &dir,
-        "slots",
+        &mut built,
+        HOSTILE_PROVIDERS[8],
         r#"typedef unsigned char CK_BYTE;
 typedef unsigned long CK_RV;
 typedef struct { CK_BYTE major; CK_BYTE minor; } CK_VERSION;
@@ -236,15 +298,18 @@ CK_RV C_GetFunctionList(void **out){ *out = &table; return 0; }
             assert!(*file_offset < len, "resolved offset out of range");
         }
     }
+    assert_eq!(built, HOSTILE_PROVIDERS[8..9]);
 }
 
 #[test]
 fn lying_interface_counts_are_capped() {
     let dir = workdir("iface-count");
+    let mut built = Vec::new();
     // 300 interfaces over the 256 cap.
-    let crowded = build_provider(
+    let crowded = build_tracked(
         &dir,
-        "crowded",
+        &mut built,
+        HOSTILE_PROVIDERS[9],
         r#"typedef unsigned long CK_RV; typedef unsigned long CK_ULONG; typedef unsigned long CK_FLAGS;
 typedef struct { char *pInterfaceName; void *pFunctionList; CK_FLAGS flags; } CK_INTERFACE;
 CK_RV C_GetInterfaceList(CK_INTERFACE *out, CK_ULONG *count){
@@ -262,9 +327,10 @@ CK_RV C_GetInterfaceList(CK_INTERFACE *out, CK_ULONG *count){
     assert!(only_absent_legacy(&manifest));
     assert!(manifest.vendor_interfaces.is_empty());
     // A count that keeps growing exhausts the retry budget.
-    let growing = build_provider(
+    let growing = build_tracked(
         &dir,
-        "growing",
+        &mut built,
+        HOSTILE_PROVIDERS[10],
         r#"typedef unsigned long CK_RV; typedef unsigned long CK_ULONG; typedef unsigned long CK_FLAGS;
 typedef struct { char *pInterfaceName; void *pFunctionList; CK_FLAGS flags; } CK_INTERFACE;
 CK_RV C_GetInterfaceList(CK_INTERFACE *out, CK_ULONG *count){
@@ -280,9 +346,10 @@ CK_RV C_GetInterfaceList(CK_INTERFACE *out, CK_ULONG *count){
         manifest.interface_list
     );
     // A fill count larger than the reservation is refused.
-    let overfill = build_provider(
+    let overfill = build_tracked(
         &dir,
-        "overfill",
+        &mut built,
+        HOSTILE_PROVIDERS[11],
         r#"typedef unsigned long CK_RV; typedef unsigned long CK_ULONG; typedef unsigned long CK_FLAGS;
 typedef struct { char *pInterfaceName; void *pFunctionList; CK_FLAGS flags; } CK_INTERFACE;
 static CK_INTERFACE one[1];
@@ -298,14 +365,17 @@ CK_RV C_GetInterfaceList(CK_INTERFACE *out, CK_ULONG *count){
         "overfill: {:?}",
         manifest.interface_list
     );
+    assert_eq!(built, HOSTILE_PROVIDERS[9..12]);
 }
 
 #[test]
 fn hostile_interface_names_and_lists_are_evidence_only() {
     let dir = workdir("iface-names");
-    let provider = build_provider(
+    let mut built = Vec::new();
+    let provider = build_tracked(
         &dir,
-        "ifaces",
+        &mut built,
+        HOSTILE_PROVIDERS[12],
         r#"typedef unsigned long CK_RV; typedef unsigned long CK_ULONG; typedef unsigned long CK_FLAGS;
 typedef struct { char *pInterfaceName; void *pFunctionList; CK_FLAGS flags; } CK_INTERFACE;
 static char vendor_name[] = "vendor-hostile-interface";
@@ -343,6 +413,32 @@ CK_RV C_GetInterfaceList(CK_INTERFACE *out, CK_ULONG *count){
         );
     }
     assert_nothing_resolved(&manifest, "hostile interfaces");
+    assert_eq!(built, HOSTILE_PROVIDERS[12..13]);
+}
+
+#[test]
+fn hostile_provider_corpus_is_pinned() {
+    // The hostile corpus is a fixed compiled-provider set (byte-mutating a
+    // dlopened .so per iteration would blow the per-target time budget); pin
+    // its exact membership so it cannot shrink silently.
+    assert_eq!(
+        HOSTILE_PROVIDERS,
+        &[
+            "null_table",
+            "bad_rv",
+            "plain",
+            "version_9_9",
+            "version_0_0",
+            "version_4_0",
+            "version_2_255",
+            "unmapped_ptr",
+            "slots",
+            "crowded",
+            "growing",
+            "overfill",
+            "ifaces",
+        ]
+    );
 }
 
 #[test]

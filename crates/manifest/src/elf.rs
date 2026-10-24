@@ -100,6 +100,9 @@ fn validated_segment_ranges(
 /// The snapshot constructor keeps its own order (interpreter first) and does
 /// not use this entry, preserving its error precedence for doubly-corrupt
 /// images.
+// The tuple return matches the file's existing export-facts tuples; no alias
+// without a new shared type.
+#[allow(clippy::type_complexity)]
 pub(crate) fn classified_validated_object(
     data: &[u8],
 ) -> Result<(object::File<'_>, ElfAbi, Vec<(u64, u64)>), String> {

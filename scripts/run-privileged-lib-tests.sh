@@ -422,11 +422,16 @@ running anything.
 EOF
 }
 
+# Print the binary's ignored-test full paths in listed order, keeping
+# duplicates, so exact-count checks can spot duplicated listings.
+binary_ignored_list_raw() {
+    "$1" --list --ignored --format terse 2>/dev/null \
+        | sed -e 's/:[[:space:]]*test$//' -e '/^[[:space:]]*$/d'
+}
+
 # Print the binary's ignored-test full paths, sorted unique, one per line.
 binary_ignored_list() {
-    "$1" --list --ignored --format terse 2>/dev/null \
-        | sed -e 's/:[[:space:]]*test$//' -e '/^[[:space:]]*$/d' \
-        | sort -u
+    binary_ignored_list_raw "$1" | sort -u
 }
 
 # True when the binary's ignored set contains the exact full path.
@@ -501,7 +506,9 @@ $aname"; fi
 # a member) is refused with the missing names, never run empty.
 check_wide_curation() {
     local bin=$1 bin_list name count missing=() multi=()
-    if ! bin_list=$(binary_ignored_list "$bin"); then
+    # Count the raw listing: a deduped list could never select more
+    # than one test per member, hiding duplicated listings.
+    if ! bin_list=$(binary_ignored_list_raw "$bin"); then
         echo "$PROG: cannot list ignored tests in $bin" >&2
         return 1
     fi
@@ -605,7 +612,9 @@ list_integration_mode() {
             continue
         fi
         bin=$candidates
-        if ! bin_list=$(binary_ignored_list "$bin"); then
+        # Count the raw listing: a deduped list could never select more
+        # than one test per entry, hiding duplicated listings.
+        if ! bin_list=$(binary_ignored_list_raw "$bin"); then
             failed+=("$entry :: cannot list ignored tests in $bin")
             continue
         fi

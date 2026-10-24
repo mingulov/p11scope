@@ -432,6 +432,21 @@ class IgnoredTestsTests(unittest.TestCase):
         self.assertIn("privileged_task4_detailed_2112_lp64", result.stderr)
         self.assertNotIn("verify:", result.stdout)
 
+    def test_wide_list_mode_refuses_a_duplicated_listing(self):
+        # A binary listing one curated member twice selects two tests,
+        # not exactly one: the mode must refuse instead of deduping
+        # the duplicate away and printing a verify receipt.
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = Path(tmp) / "libtest-dup"
+            write_fake_binary(binary, WIDE_EXPECTED + [WIDE_EXPECTED[0]])
+            result = run_runner("--list", "--wide-detailed-2112",
+                                str(binary))
+        self.assertEqual(result.returncode, 1,
+                         result.stdout + result.stderr)
+        self.assertIn("more than one", result.stderr)
+        self.assertIn(WIDE_EXPECTED[0], result.stderr)
+        self.assertNotIn("verify:", result.stdout)
+
     def test_integration_entry_without_curation_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -537,6 +552,35 @@ class IgnoredTestsTests(unittest.TestCase):
                          result.stdout + result.stderr)
         self.assertIn("run_abandon_report", result.stderr)
         self.assertIn("no test binary", result.stderr)
+        self.assertNotIn("verify:", result.stdout)
+
+    def test_integration_list_mode_refuses_duplicated_selection(self):
+        # The inventory_identity binary below lists one of its two
+        # curated tests twice: the entry selects two tests, not exactly
+        # one, and must be refused.
+        with tempfile.TemporaryDirectory() as tmp:
+            deps = Path(tmp) / "deps"
+            deps.mkdir()
+            write_fake_integration_binary(
+                deps, "exec_task_continuity",
+                ["exec_task_core_shapes_kernel_load_without_attachment"])
+            write_fake_integration_binary(
+                deps, "identity_iter_standalone",
+                ["identity_loader_strict_gate_requires_btf_and_both_programs"])
+            write_fake_integration_binary(
+                deps, "inventory_identity",
+                ["d4_btrfs_scan_backends_match_exact_fixture_population",
+                 "d4_btrfs_scan_backends_match_exact_fixture_population",
+                 "kernel_identity_positive_cell_rejects_refusal"])
+            write_fake_integration_binary(
+                deps, "run_abandon_report",
+                ["second_sigint_during_teardown_publishes_truthful_report_and_exits_130"])
+            result = run_runner("--list-integration", str(deps))
+        self.assertEqual(result.returncode, 1,
+                         result.stdout + result.stderr)
+        self.assertIn("d4_btrfs_scan_backends_match_exact_fixture_population",
+                      result.stderr)
+        self.assertIn("selects 2 tests", result.stderr)
         self.assertNotIn("verify:", result.stdout)
 
     def test_integration_list_mode_refuses_ambiguous_binary(self):

@@ -3652,6 +3652,27 @@ fn is_null_cancel_init(function: u32) -> bool {
         })
 }
 
+fn requested_fields(list: Option<&AttributeList>) -> [FieldState; METADATA_FIELDS] {
+    let mut fields = [FieldState::Unknown; METADATA_FIELDS];
+    let Some(list) = list else {
+        return fields;
+    };
+    for observation in list.observations() {
+        let (Some(kind), Some(value)) = (observation.kind, observation.value) else {
+            continue;
+        };
+        let index = field_index(kind);
+        fields[index] = match fields[index] {
+            FieldState::Unknown => FieldState::Value(value),
+            FieldState::Value(old) if old == value => FieldState::Value(old),
+            FieldState::Value(old) => FieldState::Conflict(Some(old)),
+            FieldState::Conflict(earlier) => FieldState::Conflict(earlier),
+            FieldState::Invalidated(_) => FieldState::Value(value),
+        };
+    }
+    fields
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3774,25 +3795,4 @@ mod tests {
             assert_eq!(view.label(), None, "{name}");
         }
     }
-}
-
-fn requested_fields(list: Option<&AttributeList>) -> [FieldState; METADATA_FIELDS] {
-    let mut fields = [FieldState::Unknown; METADATA_FIELDS];
-    let Some(list) = list else {
-        return fields;
-    };
-    for observation in list.observations() {
-        let (Some(kind), Some(value)) = (observation.kind, observation.value) else {
-            continue;
-        };
-        let index = field_index(kind);
-        fields[index] = match fields[index] {
-            FieldState::Unknown => FieldState::Value(value),
-            FieldState::Value(old) if old == value => FieldState::Value(old),
-            FieldState::Value(old) => FieldState::Conflict(Some(old)),
-            FieldState::Conflict(earlier) => FieldState::Conflict(earlier),
-            FieldState::Invalidated(_) => FieldState::Value(value),
-        };
-    }
-    fields
 }

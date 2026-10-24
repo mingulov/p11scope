@@ -25,6 +25,11 @@ assessment and incident diagnostics.
 > [CHANGELOG.md](CHANGELOG.md#qualification-of-this-release) preserves
 > revision-specific pre-release evidence.
 
+The unreleased development checkpoint retains legacy metrics when
+`--counter-mode` is omitted. Explicit `counts`, `timestamps` and `latency`
+selections are reserved and return an error before capture setup; public
+activation of those modes remains future work.
+
 Function-table support is cumulative: legacy PKCS #11 2.00, every 2.01–2.40
 table, and standard 3.0, 3.1, and 3.2 interfaces (all 104 slots published in
 the final 3.2 header). A newer minor version (after 2.40 or 3.2) is read up to

@@ -13,6 +13,11 @@ document discloses this as structured evidence
 bounded call/count/mechanism evidence; loss and completeness disclosures still
 apply. FULL and broader installed/package qualification remain open.
 
+The unreleased development checkpoint retains the existing metrics path when
+`--counter-mode` is omitted. Explicit `counts`, `timestamps` and `latency`
+requests are preparatory and refuse before capture setup. Useful public
+activation of those measurement modes remains outside this checkpoint.
+
 The G21 FULL-capture wrap legs (660 rounds in 900s, pid + system) are not
 qualified in v0.4.0: FULL is absent from the selected P0 build, and earlier legs
 exceeded their time budget (correctness of the

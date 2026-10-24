@@ -55,6 +55,8 @@ def bank_template_fixture(*, outer_banks=2, inner_type=6, inner_cells=1,
 
     if value_shape == "counts":
         members = [("entered", u64, 0), ("returned", u64, 64), ("errors", u64, 128)]
+    elif value_shape == "counts_wrong_fields":
+        members = [("entered", u64, 0), ("returned", u64, 64), ("total_ns", u64, 128)]
     elif value_shape == "timestamps":
         members = [("entered", u64, 0), ("returned", u64, 64), ("errors", u64, 128),
                    ("total_ns", u64, 192), ("max_ns", u64, 256)]
@@ -948,6 +950,7 @@ class CounterObjectCliTests(unittest.TestCase):
         self.assertIn("BankLatencyGrowthBtf", checker, "latency template decoder is not implemented")
         decoders = {"counts": "BankGrowthBtf", "timestamps": "BankTimestampsGrowthBtf",
                     "latency": "BankLatencyGrowthBtf"}
+        labels = {"counts": "Counts", "timestamps": "Timestamps", "latency": "Latency"}
         shapes = {"counts": 24, "timestamps": 40, "latency": 296}
         for shape, size in shapes.items():
             body, ref = bank_template_fixture(outer_banks=16, inner_cells=512,
@@ -958,16 +961,27 @@ class CounterObjectCliTests(unittest.TestCase):
                         definition, _ = checker[decoder](body).map_definition(ref)
                         self.assertEqual(definition["inner_template"]["value_size"], size)
                     else:
-                        with self.assertRaises(RuntimeError):
+                        with self.assertRaisesRegex(
+                                RuntimeError, f"exact {labels[token]} profile"):
                             checker[decoder](body).map_definition(ref)
         for token, decoder in decoders.items():
-            wrong_fields = "counts" if token != "counts" else "timestamps"
+            # Well-formed value struct in the token's own size with the wrong
+            # field names, so each twin reaches the bank field check.
+            wrong_fields = "counts_wrong_fields" if token == "counts" else "counts"
             with self.subTest(token=token, fields=wrong_fields):
                 body, ref = bank_template_fixture(outer_banks=16, inner_cells=512,
                                                   value_bytes=shapes[token],
                                                   value_shape=wrong_fields)
-                with self.assertRaises(RuntimeError):
+                with self.assertRaisesRegex(
+                        RuntimeError, f"bank {labels[token]} value fields/layout differ"):
                     checker[decoder](body).map_definition(ref)
+        with self.subTest(token="counts", fields="timestamps_malformed"):
+            # Five u64 members packed into a 24-byte struct are malformed BTF;
+            # the shared decoder refuses them before the bank field check.
+            body, ref = bank_template_fixture(outer_banks=16, inner_cells=512,
+                                              value_bytes=24, value_shape="timestamps")
+            with self.assertRaisesRegex(RuntimeError, "BTF value member bounds"):
+                checker["BankGrowthBtf"](body).map_definition(ref)
 
     def test_growth_latency_mutant_entry_bucket_is_refused(self):
         checker = runpy.run_path(str(CHECKER), run_name="counter_growth_bucket_placement_test")

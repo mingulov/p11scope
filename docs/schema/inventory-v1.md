@@ -777,6 +777,81 @@ physical edge or a newer ordinal alone does not prove semantic recovery.
 Empty arrays in current production captures do not prove absence of instances
 or complete semantic coverage. No object authority is added.
 
+## Object observations (additive within v1)
+
+The additive `object_observations` section carries capture-local object
+activity and limited metadata observed from application calls: session
+rows, object views with requested/established metadata, proved-key
+operation aggregates and unknown-key summaries. The frozen consumer
+contract is
+[inventory-v1-object-observations.schema.json](inventory-v1-object-observations.schema.json)
+(section version 1); consumers must reject unknown section versions,
+never guess. JSON, JSONL and the dashboard render from this one
+immutable projection. While H9 delivery stays gated, production
+captures carry `status: "unavailable"` with a finite `reason` and
+empty rows; unavailable/partial/stale name object authority only and
+never imply S1 loss.
+
+- `version` is 1; `revision` is the publication revision. `status` is
+  `populated`, `partial`, `stale` or `unavailable`; `reason` is `none`
+  only when populated. A stale publication's rows are historical, not
+  current authority.
+- `sessions[]` (`{session, origin, status}`, sorted by session id) is
+  snapshot-only: the event stream carries session lifecycle through
+  `object_observed` rows, not a session kind.
+- `objects[]` (sorted by object id) holds one view per observed object
+  incarnation: `{object, session, origin, creation, birth, lifetime,
+  lifetime_reason, attribution, attribution_reason, requested,
+  established, queries, label, successful_references,
+  successful_key_references, accessing_sessions}`. IDs are
+  capture-local monotonic model IDs, never raw handles. `creation` is
+  the observed creation family or null; `birth` is the observed call
+  interval or null, never physical age. Counters count successful
+  references, never distinct keys, completed operations or physical
+  token inventory.
+- `requested`/`established` each hold the six fixed metadata slots
+  (`class`, `key_type`, `token`, `value_len`, `modulus_bits`,
+  `ec_params`), every slot `{status, value}` with `status` one of
+  `unknown`, `value`, `conflict` or `invalidated`. A `value` carries
+  the accepted numeric code or null: class 0-4, key type 0, 1, 2, 3,
+  4, 16, 31, 64 or 65 (OASIS numbers), token 0 or 1, value length 16,
+  24 or 32 bytes, modulus bits 1024, 2048, 3072, 4096 or 8192, and
+  the EC curve name (`secp256r1`, `secp384r1`, `secp521r1`) or null.
+  Labels are presentation names; JSON carries numeric codes. Requested
+  metadata never establishes result properties; conflicting duplicates
+  stay conflicts, never last-writer-wins.
+- `queries` holds the per-field latest query outcome (`not_queried`,
+  `established`, `unavailable`, `size_only`, `unsupported`,
+  `malformed`, `excluded`), distinct from current validity.
+- `label` is the combined key label from established facts of the same
+  view only (`rsa_1024`, `rsa_2048`, `rsa_3072`, `rsa_4096`,
+  `rsa_other`, `aes_128`, `aes_192`, `aes_256`, `aes_other`,
+  `ec_p256`, `ec_p384`, `ec_p521`) or null. It is withheld when class
+  conflicts or an established class is incompatible with the key type
+  (AES needs `secret_key`; RSA/EC need `public_key`/`private_key`).
+- `key_operations[]` (sorted by instance, object, category, role and
+  metadata label) holds proved-key aggregate rows
+  `{instance, object, category, role, metadata_at_use, unit,
+  started, completed, failed, cancelled, unknown, active,
+  key_join_lost}`. `instance` joins `instances[]`; `unit` is
+  `operations`, or `message_contexts` for `message_*` categories.
+  Row equation: `started = completed + failed + cancelled + unknown
+  + active + key_join_lost` (before counter saturation). Role rows
+  count associations and cannot be summed across roles into a global
+  operation denominator.
+- `unknown_key_operations[]` (sorted by category and reason) holds
+  capture-wide unknown-key summaries without `started` (starts are
+  never fabricated into the unknown bucket).
+- `gaps` (`{rows[{subject, reason, repeats}], suppressed}`) and
+  `budgets` (`key_rows`/`object_rows`/`unknown_rows` occupancy,
+  measured `encoded_bytes`, pool `allocation_refused`/`refusal_reason`)
+  mirror the snapshot's loss accounting. Row limits refuse with
+  `partial` coverage; history is never evicted.
+- Privacy: no raw handles, pointers, native keys, epochs, PIDs/TIDs,
+  address-derived hashes or arbitrary attribute bytes appear anywhere
+  in this section. Key values, moduli, EC points, labels, IDs and PINs
+  are never read or carried.
+
 ## Caller metadata (additive within v1)
 
 The opt-in source contract uses the one immutable `Presentation`.

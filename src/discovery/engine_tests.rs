@@ -44044,9 +44044,10 @@ fn collected_finish_terminal_batch_respects_one_action() {
         );
         let remaining = collected_finish_terminal_originals(&engine);
         assert!(engine.loader_records_accepted <= 3);
-        assert!(
-            remaining.ends_with(&original[engine.loader_records_accepted as usize..]),
-            "the exact suffix stays owned: {remaining:?}"
+        assert_eq!(
+            remaining,
+            original[engine.loader_records_accepted as usize..],
+            "only the exact undispatched originals remain; an accepted prefix cannot remain replayable"
         );
         if engine.terminal_journal.is_none() {
             settled = true;
@@ -44291,6 +44292,30 @@ fn collected_finish_disposes_settled_retirement_frame_without_admission() {
             .borrow()
             .blocking()
     );
+    // A different real retained subject supplies other counted Finish debt.
+    // It must survive the hint-only action; the original retired owner's
+    // refresh request must not be cleared by this independent assessment.
+    let mut sibling = e06_spawn_sleeps(1).pop().unwrap();
+    let sibling_id = case.engine.allocate_view_id().unwrap();
+    let sibling_view = ProcessView::open(sibling_id, sibling.pid()).unwrap();
+    let sibling_admission = sibling_view.view_admission();
+    case.engine.views.push(sibling_view);
+    let exit = collected_finish_leader_exit(sibling.pid());
+    case.engine.dispatch_lifecycle_record(
+        &mut case.session,
+        &exit,
+        &mut PendingViewRetirements::new(),
+    );
+    assert_eq!(
+        case.engine.pending_leader_exit_views,
+        BTreeSet::from([sibling_id])
+    );
+    assert_eq!(
+        case.engine.pending_leader_exit_order[&sibling_id],
+        Some(exit.hook_ts_ns)
+    );
+    let assessments = case.engine.pending_leader_exit_views.clone();
+    let assessment_order = case.engine.pending_leader_exit_order.clone();
     let scans = case.engine.deep_scans;
     let slots = case.engine.plan.slots.len();
     let pinned = case.engine.pinned.pinned().count();
@@ -44318,7 +44343,6 @@ fn collected_finish_disposes_settled_retirement_frame_without_admission() {
         .borrow()
         .begins;
     let mut completed = false;
-    let mut dispositions = 0;
     let reads = case.session.counter_reads();
     let zero = case
         .engine
@@ -44328,12 +44352,51 @@ fn collected_finish_disposes_settled_retirement_frame_without_admission() {
     assert_eq!(case.session.counter_reads(), reads);
     assert!(case.engine.global_retirement_frame_owed && case.engine.immediate_exec_recovery_frame);
     assert_eq!(case.engine.refresh_requested, requests);
-    for _ in 0..32 {
+    assert_eq!(case.engine.pending_leader_exit_views, assessments);
+    assert_eq!(case.engine.pending_leader_exit_order, assessment_order);
+    let hint = case
+        .engine
+        .service_collected_finish_records(&mut case.session, Vec::new(), 0, 1)
+        .unwrap();
+    assert!(
+        hint.progressed && hint.pending,
+        "the actual owed hint is disposed, but the unchanged matched assessment still prevents Finish readiness"
+    );
+    assert!(!case.engine.global_retirement_frame_owed);
+    assert!(!case.engine.immediate_exec_recovery_frame);
+    assert_eq!(case.engine.pending_leader_exit_views, assessments);
+    assert_eq!(case.engine.pending_leader_exit_order, assessment_order);
+    assert_eq!(case.engine.refresh_requested, requests);
+    assert!(
+        case.engine
+            .views
+            .iter()
+            .find(|view| view.id() == sibling_id)
+            .unwrap()
+            .view_admission()
+            .same_allocation(&sibling_admission)
+    );
+    let mut dispositions = usize::from(hint.progressed);
+    sibling.reap().unwrap();
+    assert_eq!(
+        case.engine
+            .views
+            .iter()
+            .find(|view| view.id() == sibling_id)
+            .unwrap()
+            .original_exited(),
+        Ok(true)
+    );
+    for _ in 1..32 {
+        let owed = case.engine.global_retirement_frame_owed;
         let progress = case
             .engine
             .service_collected_finish_records(&mut case.session, Vec::new(), 0, 1)
             .unwrap();
-        dispositions += usize::from(progress.progressed);
+        if owed && !case.engine.global_retirement_frame_owed {
+            assert!(progress.progressed);
+            dispositions += 1;
+        }
         if !progress.pending {
             completed = true;
             break;

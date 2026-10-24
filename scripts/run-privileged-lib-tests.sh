@@ -327,6 +327,8 @@ discovery::sweep_attribution::tests::d4_thread_mapping_helper
 metrics::counter_reader::tests::counter_bank_session_useful_8192_counts_growth_multi_lp64
 discovery::sweep_attribution::tests::privileged_d4_btrfs_clone_without_files_backend_parity
 discovery::sweep_attribution::tests::d4_clone_without_files_mapping_helper
+discovery::sweep_attribution::tests::privileged_d4_btrfs_zombie_leader_single_survivor_backend_parity
+discovery::sweep_attribution::tests::d4_zombie_single_survivor_mapping_helper
 )
 SKIP_REASONS=(
 "needs punch-hole support under TMPDIR (btrfs/ext4/xfs; tmpfs refuses); no BPF-independent probe: run by hand as root: TMPDIR=<hole-capable dir> <binary> --exact <path> --ignored"
@@ -365,6 +367,8 @@ SKIP_REASONS=(
 "needs qualified Multi513 pilot, proof1/artifacts0 prebuilt libtest and growth provider/workload inputs; separately admitted 8192-endpoint FD/memory/native qualification with unchanged ledger/N+1/cleanup/deadline assertions, preserving required Singles coverage"
 "needs root/proc access, Btrfs disk TMPDIR, x86-64 raw clone support and eligible task_vma/BTF; actual CLONE_THREAD without CLONE_FILES attribution parity requires a separately admitted exact ignored run"
 "private re-exec entrypoint for the owned literal-clone parity fixture; missing owned configuration fails and this helper never qualifies independently"
+"needs root x86-64 LP64 Btrfs disk TMPDIR and eligible BTF/task_vma; required single-survivor zombie-leader positive baseline currently exposes an unqualified production path; run exact ignored test in a separately admitted native lane"
+"private re-exec entrypoint for the owned single-survivor zombie fixture; missing owning socket/source fails and this helper never qualifies independently"
 )
 
 usage() {

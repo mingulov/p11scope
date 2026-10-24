@@ -225,7 +225,7 @@ glibc and musl in digest-pinned containers, and runs the canary, attach and host
 smokes against the packaged binaries. The helper lane
 (`scripts/verify-discover-containers.sh`) pins `rust:1.99.1-bookworm`,
 `rust:1.99.1-alpine3.22` and the `ubuntu:noble-20260810` run image by digest.
-FULL qualification is pending A1.1.
+Qualify the packaged FULL bytes on the release candidate before publishing.
 
 Ordinary source builds default to FULL; `--no-default-features` alone does not
 select P0. The packager records `p11scope_features: []` and a FULL scope with
@@ -233,7 +233,7 @@ object-attribute capture enabled by default, and `["stub-object-attributes"]`
 with a P0 scope (capture disabled) under `--capture-mode p0`, in the top-level
 and bundled `RELEASE.json`. This describes the official builder configuration
 per capture mode; report the runtime object-capture disclosure when qualifying
-packaged binaries. FULL qualification is pending A1.1.
+packaged binaries. Qualify the packaged FULL bytes on the release candidate before publishing.
 
 Requirements: a non-root user with passwordless `sudo` (`sudo -n true` must
 succeed), a working Docker daemon, SoftHSM2 at

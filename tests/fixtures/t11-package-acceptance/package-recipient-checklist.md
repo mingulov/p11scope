@@ -58,7 +58,7 @@ file "$rx"/<gnu-dir>/p11scope-discover    # dynamically linked, glibc
   executed absolute path; `test_release_recipient_uses_selected_binary` and
   `test_recipient_install_uses_extracted_absolute_bytes` automate this — C8
   closed). Official bytes are FULL by default with `--capture-mode p0` as the
-  explicit P0 option; FULL qualification is pending A1.1.
+  explicit P0 option; qualify the packaged FULL bytes on the release candidate.
 - [ ] musl dynamic helper smoke runs on a compatible musl host/container;
   archive inspection still happens on the build host.
 

@@ -43695,3 +43695,695 @@ fn midfinal_res3_exact_target_contribution_from_healthy_peer_attaches() {
         "the proven retry keeps exactly its one reallocated cell"
     );
 }
+
+// Collected Finish debt controls below observe original transport identities
+// and real lifecycle consequences. These snapshots never feed authority back
+// into Engine and never manufacture a terminal batch or retirement ticket.
+#[derive(Debug, PartialEq, Eq)]
+struct CollectedFinishDebtOriginal {
+    kind: u8,
+    pid_tgid: u64,
+    at: u64,
+    case: u8,
+    owner: Option<LoaderContextId>,
+}
+
+fn collected_finish_terminal_originals(engine: &Engine) -> Vec<CollectedFinishDebtOriginal> {
+    engine
+        .terminal_batch
+        .as_ref()
+        .into_iter()
+        .flat_map(|batch| &batch.records)
+        .map(|queued| CollectedFinishDebtOriginal {
+            kind: queued.record.kind,
+            pid_tgid: queued.record.pid_tgid,
+            at: queued.record.hook_ts_ns,
+            case: queued.record.case_id,
+            owner: queued.terminal_owner,
+        })
+        .collect()
+}
+
+fn collected_finish_leader_exit(pid: u32) -> DiscoveryRecord {
+    let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+    record.kind = DISCOVERY_KIND_LEADER_EXIT;
+    record.pid_tgid = (u64::from(pid) << 32) | u64::from(pid);
+    record.hook_ts_ns = crate::attach::monotonic_ns().unwrap();
+    assert!(valid_discovery_record(&record));
+    record
+}
+
+#[test]
+fn collected_finish_services_matched_leader_exit_assessments() {
+    let mut children = e06_spawn_sleeps(2);
+    let originals: Vec<_> = children
+        .iter()
+        .enumerate()
+        .map(|(index, child)| ProcessView::open(ProcessViewId(index as u32), child.pid()).unwrap())
+        .collect();
+    let admissions: Vec<_> = originals.iter().map(ProcessView::view_admission).collect();
+    let views: Vec<_> = originals.iter().map(ProcessView::id).collect();
+    let mut engine = lifecycle_discovered(originals);
+    engine.scope = Scope::System;
+    let mut session = ScriptedSession::default();
+    engine.update_counter_snapshot(&session).unwrap();
+    for child in &children {
+        let record = collected_finish_leader_exit(child.pid());
+        engine.dispatch_lifecycle_record(&mut session, &record, &mut PendingViewRetirements::new());
+    }
+    assert_eq!(engine.pending_leader_exit_views.len(), 2);
+    assert!(
+        engine
+            .views
+            .iter()
+            .all(|view| view.original_exited() == Ok(false))
+    );
+    assert_eq!(engine.task_uprobe_link_losses, 0);
+    assert!(engine.retirement_intents.is_empty());
+
+    // Keep the SAME actual view locally while the Engine cannot obtain it.
+    // An unavailable assessment is not a proved exit or an empty queue.
+    let retained = std::mem::take(&mut engine.views);
+    let counters = session.counter_reads();
+    let zero = engine
+        .service_collected_finish_records(&mut session, Vec::new(), 0, 0)
+        .unwrap();
+    assert!(zero.pending && !zero.progressed);
+    assert_eq!(session.counter_reads(), counters);
+    session.fail_counter_reads([true]);
+    assert!(
+        engine
+            .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+            .is_err()
+    );
+    for _ in 0..2 {
+        let pending = engine
+            .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+            .unwrap();
+        assert!(pending.pending);
+        assert_eq!(engine.pending_leader_exit_views.len(), 2);
+        assert_eq!(engine.task_uprobe_link_losses, 0);
+    }
+    engine.views = retained;
+    assert!(
+        engine
+            .views
+            .iter()
+            .zip(&admissions)
+            .all(|(view, admission)| view.view_admission().same_allocation(admission))
+    );
+    for child in &mut children {
+        child.reap().unwrap();
+    }
+    assert!(
+        engine
+            .views
+            .iter()
+            .all(|view| view.original_exited() == Ok(true))
+    );
+    let scans = engine.deep_scans;
+    let mut completed = false;
+    for _ in 0..32 {
+        let assessments = engine.pending_leader_exit_views.len();
+        let progress = engine
+            .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+            .unwrap();
+        assert!(
+            assessments.saturating_sub(engine.pending_leader_exit_views.len()) <= 1,
+            "one action cannot settle every retained assessment"
+        );
+        if !progress.pending {
+            completed = true;
+            break;
+        }
+    }
+    assert!(
+        completed,
+        "a matched assessment must be serviced after the actual original group exits"
+    );
+    assert!(engine.pending_leader_exit_views.is_empty());
+    assert!(engine.pending_leader_exit_order.is_empty());
+    assert!(
+        engine
+            .views
+            .iter()
+            .all(|owner| !views.contains(&owner.id()))
+    );
+    assert!(
+        !engine.expected_target_exit(),
+        "System scope does not become a named-target exit"
+    );
+    assert_eq!(
+        engine.task_uprobe_link_losses, 0,
+        "proved exit is not invented link loss"
+    );
+    assert_eq!(engine.deep_scans, scans);
+    assert!(session.attached_slots.is_empty() && session.dynamic_attach_calls.is_empty());
+    let quiet = engine
+        .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+        .unwrap();
+    assert!(!quiet.pending && !quiet.progressed);
+    assert_eq!(engine.task_uprobe_link_losses, 0);
+}
+
+/// Create the debt through actual lifecycle dispatch, one-shot native detach,
+/// and a real partial collector result. No ready/complete/journal field is set.
+fn collected_finish_incomplete_terminal_route() -> (Engine, ScriptedSession, LoaderContextId) {
+    let pid = std::process::id();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Pid(pid);
+    let (view, owner) = attach_live_loader_context(&mut engine, pid);
+    let mut session = ScriptedSession::with_records([], 16);
+    session.detach_exports = vec![terminal_export()];
+    let mut pending = PendingViewRetirements::new();
+    assert_eq!(
+        engine.dispatch_lifecycle_record(&mut session, &exec_record_for(pid), &mut pending),
+        Some(view)
+    );
+    assert_eq!(
+        engine.retirement_intents.get(&view),
+        Some(&RetirementCause::ExecRefresh)
+    );
+    let mut a = loader_record_for(owner, pid);
+    a.hook_ts_ns = 101;
+    let mut b = loader_record_for(LoaderContextId::from_case_id(9), pid);
+    b.hook_ts_ns = 102;
+    session.dequeues.extend([
+        Ok(Some(crate::events::DiscoveryItem::Record(a))),
+        Ok(Some(crate::events::DiscoveryItem::Record(b))),
+        Err(anyhow!("owned post-detach collector refusal")),
+    ]);
+    let mut collect = Engine::collect_discovery_records;
+    let (_, complete) = engine
+        .retire_loader_contexts(
+            view,
+            &mut TerminalSelectionHandoffs::new(),
+            &mut session,
+            &mut false,
+            &mut pending,
+            &mut collect,
+            &mut PauseClosure::new(false),
+        )
+        .unwrap();
+    assert!(!complete);
+    assert_eq!(session.detached, [owner]);
+    let batch = engine.terminal_batch.as_ref().unwrap();
+    assert_eq!(
+        (
+            batch.authority.owner,
+            batch.record_count(),
+            batch.complete()
+        ),
+        (owner, 2, false)
+    );
+    assert_eq!(batch.tagged_owners(), [Some(owner), None]);
+    assert_eq!(engine.loader_records_accepted, 0);
+    assert_eq!(
+        engine.terminal_journal_for_test(),
+        Some((owner, false, false))
+    );
+    assert!(engine.loader_registry.is_tombstoned(owner));
+    (engine, session, owner)
+}
+
+#[test]
+fn collected_finish_continues_original_terminal_journal() {
+    // Healthy existing continuation first: its actual collector can consume
+    // the suffix and settle the original authority without a fresh frame.
+    let (mut ordinary, mut source, owner) = collected_finish_incomplete_terminal_route();
+    let mut suffix = loader_record_for(owner, std::process::id());
+    suffix.hook_ts_ns = 103;
+    source
+        .dequeues
+        .push_back(Ok(Some(crate::events::DiscoveryItem::Record(suffix))));
+    let mut collect = Engine::collect_discovery_records;
+    ordinary
+        .continue_terminal_batch(
+            &mut source,
+            &mut false,
+            &mut PendingViewRetirements::new(),
+            &mut collect,
+            &mut PauseClosure::new(false),
+        )
+        .unwrap();
+    assert_eq!(ordinary.loader_records_accepted, 3);
+    assert!(ordinary.terminal_batch.is_none() && ordinary.terminal_journal.is_none());
+
+    let (mut engine, mut session, owner) = collected_finish_incomplete_terminal_route();
+    let original = collected_finish_terminal_originals(&engine);
+    let mut suffix = loader_record_for(owner, std::process::id());
+    suffix.hook_ts_ns = 103;
+    session
+        .dequeues
+        .push_back(Ok(Some(crate::events::DiscoveryItem::Record(suffix))));
+    session
+        .stage_discovery(1, engine.discovery_held_len())
+        .unwrap();
+    assert_eq!(session.staged_discovery_len(), 1);
+    assert!(session.dequeues.is_empty());
+    let reads = session.counter_reads();
+    let zero = engine
+        .service_collected_finish_records(&mut session, Vec::new(), 0, 0)
+        .unwrap();
+    assert!(zero.pending && !zero.progressed);
+    assert_eq!(session.counter_reads(), reads);
+    assert_eq!(collected_finish_terminal_originals(&engine), original);
+    session.fail_counter_reads([true]);
+    assert!(
+        engine
+            .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+            .is_err()
+    );
+    assert_eq!(collected_finish_terminal_originals(&engine), original);
+    assert_eq!(session.staged_discovery_len(), 1);
+    let scans = engine.deep_scans;
+    let mut settled = false;
+    for _ in 0..32 {
+        let before = engine.loader_records_accepted;
+        let progress = engine
+            .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+            .unwrap();
+        assert!(
+            engine.loader_records_accepted - before <= 1,
+            "one action cannot replay a whole prefix"
+        );
+        if engine.terminal_journal.is_none() {
+            settled = true;
+            break;
+        }
+        assert!(progress.pending);
+    }
+    assert!(
+        settled,
+        "the original terminal journal must reach its retained FIFO suffix instead of starving it"
+    );
+    assert_eq!(engine.loader_records_accepted, 3);
+    assert_eq!(session.staged_discovery_len(), 0);
+    assert!(engine.terminal_batch.is_none());
+    assert!(engine.loader_registry.context(owner).is_none());
+    assert_eq!(
+        session.detached,
+        [owner],
+        "the native close is never repeated"
+    );
+    assert_eq!(engine.deep_scans, scans);
+    assert!(session.attached_slots.is_empty() && session.dynamic_attach_calls.is_empty());
+}
+
+#[test]
+fn collected_finish_terminal_batch_respects_one_action() {
+    let (mut engine, mut session, owner) = collected_finish_incomplete_terminal_route();
+    let mut suffix = loader_record_for(owner, std::process::id());
+    suffix.hook_ts_ns = 103;
+    session
+        .dequeues
+        .push_back(Ok(Some(crate::events::DiscoveryItem::Record(suffix))));
+    let mut collect = Engine::collect_discovery_records;
+    engine
+        .collect_terminal_batch(&mut session, &mut collect)
+        .unwrap()
+        .unwrap();
+    let original = collected_finish_terminal_originals(&engine);
+    assert_eq!(
+        original.iter().map(|record| record.at).collect::<Vec<_>>(),
+        [101, 102, 103]
+    );
+    assert!(engine.terminal_batch.as_ref().unwrap().complete());
+    assert_eq!(
+        engine.terminal_journal_for_test(),
+        Some((owner, false, false))
+    );
+    let reads = session.counter_reads();
+    assert!(
+        engine
+            .service_collected_finish_records(&mut session, Vec::new(), 0, 0)
+            .unwrap()
+            .pending
+    );
+    assert_eq!(session.counter_reads(), reads);
+    assert_eq!(collected_finish_terminal_originals(&engine), original);
+    session.fail_counter_reads([true]);
+    assert!(
+        engine
+            .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+            .is_err()
+    );
+    assert_eq!(collected_finish_terminal_originals(&engine), original);
+    assert_eq!(engine.loader_records_accepted, 0);
+    let scans = engine.deep_scans;
+    let mut settled = false;
+    for _ in 0..32 {
+        let before = engine.loader_records_accepted;
+        engine
+            .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+            .unwrap();
+        let applied = engine.loader_records_accepted - before;
+        assert!(
+            applied <= 1,
+            "one terminal action dispatched {applied} originals from its retained batch"
+        );
+        let remaining = collected_finish_terminal_originals(&engine);
+        assert!(engine.loader_records_accepted <= 3);
+        assert!(
+            remaining.ends_with(&original[engine.loader_records_accepted as usize..]),
+            "the exact suffix stays owned: {remaining:?}"
+        );
+        if engine.terminal_journal.is_none() {
+            settled = true;
+            break;
+        }
+    }
+    assert!(
+        settled,
+        "bounded dispatch and original registry cleanup must complete"
+    );
+    assert_eq!(engine.loader_records_accepted, 3);
+    assert_eq!(session.detached, [owner]);
+    assert_eq!(engine.deep_scans, scans);
+    assert!(session.attached_slots.is_empty() && session.dynamic_attach_calls.is_empty());
+    let before = engine.loader_records_accepted;
+    engine
+        .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+        .unwrap();
+    assert_eq!(
+        engine.loader_records_accepted, before,
+        "no terminal original is replayed twice"
+    );
+}
+
+struct CollectedFinishRetirementCase {
+    _child: SystemScopeChildGuard,
+    engine: Engine,
+    session: ScriptedSession,
+    release: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    returned: std::sync::mpsc::Receiver<()>,
+}
+
+impl CollectedFinishRetirementCase {
+    fn new(fail_return: bool, leader_debt: bool) -> Self {
+        let (child, mut engine, modules) = engine_with_one_accepted_provider();
+        let child = SystemScopeChildGuard::new(child);
+        engine.scope = Scope::System;
+        let release =
+            std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let gate = std::sync::Arc::clone(&release);
+        let (entered_sender, entered) = std::sync::mpsc::channel();
+        let (returned_sender, returned) = std::sync::mpsc::channel();
+        let retirement = crate::attach::RetirementFixture::new(
+            &engine.plan.slots,
+            &engine.pinned,
+            Box::new(move |owned, producer| {
+                if producer == crate::attach::ProducerProgram::UProbe("p11_return") {
+                    entered_sender.send(()).map_err(|error| error.to_string())?;
+                    let (lock, changed) = &*gate;
+                    let released = changed
+                        .wait_timeout_while(
+                            lock.lock().unwrap(),
+                            std::time::Duration::from_secs(5),
+                            |ready| !*ready,
+                        )
+                        .map_err(|error| error.to_string())?;
+                    if !*released.0 {
+                        return Err("owned retirement release deadline".into());
+                    }
+                    returned_sender
+                        .send(())
+                        .map_err(|error| error.to_string())?;
+                    if fail_return {
+                        return Err("actual final native closer refused".into());
+                    }
+                }
+                drop(owned);
+                Ok(())
+            }),
+        );
+        let mut session = ScriptedSession::default();
+        session.global_retirement = Some(std::cell::RefCell::new(retirement));
+        if leader_debt {
+            let record = collected_finish_leader_exit(child.pid());
+            engine.dispatch_lifecycle_record(
+                &mut session,
+                &record,
+                &mut PendingViewRetirements::new(),
+            );
+            assert!(
+                engine
+                    .pending_leader_exit_views
+                    .contains(&engine.views[0].id())
+            );
+        }
+        let mut case = Self {
+            _child: child,
+            engine,
+            session,
+            release,
+            returned,
+        };
+        // Install the release guard before any actual close can block. Only
+        // apply_candidate/native handoff may mint and retain its ticket.
+        let mut candidate = peer_candidate(&mut case.engine, &modules);
+        candidate
+            .delta
+            .retire
+            .push(case.engine.plan.slots[0].clone());
+        candidate.plan.deactivate(0);
+        let outcome = case
+            .engine
+            .apply_candidate(&mut case.session, candidate, &mut true, false, &[])
+            .unwrap();
+        assert_eq!(outcome.disposition, ApplyDisposition::Deferred);
+        assert!(case.engine.pending_global_retirement.is_some());
+        entered
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        case
+    }
+
+    fn release(&self) {
+        *self.release.0.lock().unwrap() = true;
+        self.release.1.notify_all();
+    }
+}
+
+impl Drop for CollectedFinishRetirementCase {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+#[test]
+fn collected_finish_disposes_settled_retirement_frame_without_admission() {
+    // Native failure is never converted to terminal readiness. A successful
+    // native receipt also cannot hide a different retained Engine assessment.
+    for fail_return in [true, false] {
+        let mut case = CollectedFinishRetirementCase::new(fail_return, true);
+        let view = case.engine.views[0].id();
+        let native = crate::attach::PidSessionFixture::new(&case.engine.views[0]);
+        native.terminal(); // Existing native continuity leaf refuses new mutations.
+        case.session.pid_continuity = Some(std::cell::RefCell::new(native));
+        assert!(case.session.mutation_stopped());
+        let initial = case
+            .session
+            .global_retirement
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .polls;
+        let counters = case.session.counter_reads();
+        assert!(
+            case.engine
+                .service_collected_finish_records(&mut case.session, Vec::new(), 0, 0)
+                .unwrap()
+                .pending
+        );
+        assert_eq!(case.session.counter_reads(), counters);
+        assert_eq!(
+            case.session
+                .global_retirement
+                .as_ref()
+                .unwrap()
+                .borrow()
+                .polls,
+            initial
+        );
+        case.session.fail_counter_reads([true]);
+        assert!(
+            case.engine
+                .service_collected_finish_records(&mut case.session, Vec::new(), 0, 1)
+                .is_err()
+        );
+        assert!(case.engine.pending_global_retirement.is_some());
+        let held = case
+            .engine
+            .service_collected_finish_records(&mut case.session, Vec::new(), 0, 1)
+            .unwrap();
+        assert!(held.pending && !held.progressed);
+        assert!(case.engine.pending_leader_exit_views.contains(&view));
+        let scans = case.engine.deep_scans;
+        case.release();
+        case.returned
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let progress = case
+                .engine
+                .service_collected_finish_records(&mut case.session, Vec::new(), 0, 1)
+                .unwrap();
+            if !case.engine.pending_leader_exit_views.is_empty() {
+                assert!(
+                    progress.pending,
+                    "a settled native ticket cannot hide the still-owned matched assessment"
+                );
+            }
+            if fail_return {
+                if case
+                    .engine
+                    .counters
+                    .object_skips
+                    .iter()
+                    .any(|skip| skip.subject == "global native retirement"
+                        && skip.reason == "original static ownership remains uncertain; replacement admission is blocked")
+                {
+                    assert!(case.engine.pending_global_retirement.is_some() && progress.pending);
+                    break;
+                }
+            } else if case.engine.pending_global_retirement.is_none() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "actual native handoff did not reach its terminal verdict"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(case.engine.deep_scans, scans);
+        assert!(
+            case.session.attached_slots.is_empty() && case.session.replaced_slot_indices.is_empty()
+        );
+        assert!(case.session.dynamic_attach_calls.is_empty());
+    }
+
+    // An ordinary successful ticket poll legitimately owes an ordinary frame.
+    // Finish must discharge that retained debt conservatively, without running
+    // a fresh admission frame or silently deleting the scheduling flag.
+    let mut case = CollectedFinishRetirementCase::new(false, false);
+    case.release();
+    case.returned
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while case.engine.pending_global_retirement.is_some() {
+        case.engine
+            .service_backlog_quantum(&mut case.session)
+            .unwrap();
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    assert!(case.engine.global_retirement_frame_owed);
+    assert!(case.engine.immediate_exec_recovery_frame);
+    assert!(
+        !case
+            .session
+            .global_retirement
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .blocking()
+    );
+    let scans = case.engine.deep_scans;
+    let slots = case.engine.plan.slots.len();
+    let pinned = case.engine.pinned.pinned().count();
+    let requests = case.engine.refresh_requested.clone();
+    assert!(
+        !requests.is_empty(),
+        "the real retired owner still has unserved recovery work"
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|(pid, request)| request.owner.is_some_and(|owner| case
+                .engine
+                .views
+                .iter()
+                .any(|view| view.id() == owner && view.pid() == *pid)))
+    );
+    let unserved = case.engine.newcomer_stats(None);
+    assert!(unserved.pending >= requests.len() as u64);
+    let begins = case
+        .session
+        .global_retirement
+        .as_ref()
+        .unwrap()
+        .borrow()
+        .begins;
+    let mut completed = false;
+    let mut dispositions = 0;
+    let reads = case.session.counter_reads();
+    let zero = case
+        .engine
+        .service_collected_finish_records(&mut case.session, Vec::new(), 0, 0)
+        .unwrap();
+    assert!(zero.pending && !zero.progressed);
+    assert_eq!(case.session.counter_reads(), reads);
+    assert!(case.engine.global_retirement_frame_owed && case.engine.immediate_exec_recovery_frame);
+    assert_eq!(case.engine.refresh_requested, requests);
+    for _ in 0..32 {
+        let progress = case
+            .engine
+            .service_collected_finish_records(&mut case.session, Vec::new(), 0, 1)
+            .unwrap();
+        dispositions += usize::from(progress.progressed);
+        if !progress.pending {
+            completed = true;
+            break;
+        }
+    }
+    assert!(
+        completed,
+        "an actual settled ticket's frame debt cannot wait forever for forbidden fresh admission"
+    );
+    assert!(!case.engine.global_retirement_frame_owed);
+    assert!(!case.engine.immediate_exec_recovery_frame);
+    assert_eq!(
+        dispositions, 1,
+        "one bounded terminal-hint disposition reports actual progress"
+    );
+    assert_eq!(
+        case.engine.refresh_requested, requests,
+        "the same original pid/serial/owner/binding stays disclosed as unserved, not credited as a new frame"
+    );
+    let after = case.engine.newcomer_stats(None);
+    assert_eq!(
+        (
+            after.pending,
+            after.admitted,
+            after.admitted_unknown,
+            after.dropped,
+            after.dropped_unknown
+        ),
+        (
+            unserved.pending,
+            unserved.admitted,
+            unserved.admitted_unknown,
+            unserved.dropped,
+            unserved.dropped_unknown
+        )
+    );
+    assert_eq!(case.engine.deep_scans, scans);
+    assert_eq!(case.engine.plan.slots.len(), slots);
+    assert_eq!(case.engine.pinned.pinned().count(), pinned);
+    assert_eq!(
+        case.session
+            .global_retirement
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .begins,
+        begins
+    );
+    assert!(
+        case.session.attached_slots.is_empty() && case.session.replaced_slot_indices.is_empty()
+    );
+    assert!(case.session.dynamic_attach_calls.is_empty());
+}

@@ -17,12 +17,10 @@ use crate::discovery::inventory_workload::{Harness, ScaleSpec};
 use crate::discovery::scan::ScanOutcome;
 use crate::inspect::render_json as inspect_json;
 use crate::inventory::render_json_from_presentation;
-use crate::inventory_dashboard::{
-    DashboardState, DisplayFrame, LogTail, Viewport, render_frame,
-};
+use crate::inventory_dashboard::{DashboardState, DisplayFrame, LogTail, Viewport, render_frame};
 use crate::inventory_diagnostics::{
-    CaptureOutcome, CaptureSettlement, DiagnosticConfig, DiagnosticOutcome,
-    Recorder, RetainedIdentityView,
+    CaptureOutcome, CaptureSettlement, DiagnosticConfig, DiagnosticOutcome, Recorder,
+    RetainedIdentityView,
 };
 use crate::inventory_diff::run_with_writer;
 use crate::inventory_event_identity::IdentityIndex;
@@ -34,8 +32,7 @@ use crate::plan::AttachPlan;
 use crate::semantics::State;
 use crate::trace::{evidence_line, format_line};
 use p11scope_ebpf_common::{
-    CounterMode, Event, LATENCY_BUCKETS, MECH_NONE, SESSION_NONE,
-    USER_TYPE_NONE, shape,
+    CounterMode, Event, LATENCY_BUCKETS, MECH_NONE, SESSION_NONE, USER_TYPE_NONE, shape,
 };
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::sync::Arc;
@@ -58,11 +55,7 @@ pub(crate) fn assert_lossless_u64_json(value: &serde_json::Value, expected: u64)
 }
 
 /// Values no float lane can carry: 2^53+1, u64::MAX-1, u64::MAX.
-const LOSSLESS_VALUES: [u64; 3] = [
-    9_007_199_254_740_993,
-    18_446_744_073_709_551_614,
-    u64::MAX,
-];
+const LOSSLESS_VALUES: [u64; 3] = [9_007_199_254_740_993, 18_446_744_073_709_551_614, u64::MAX];
 
 /// What `value as f64` would print on this platform — asserted ABSENT
 /// (in the lane's delimited form) wherever the exact digits are
@@ -160,11 +153,7 @@ fn frame_text_at(view: &Presentation, width: usize, height: usize) -> String {
         presentation: Arc::new(view.clone()),
         log: tail.snapshot(),
     };
-    let bytes = render_frame(
-        &frame,
-        Viewport { width, height },
-        &DashboardState::new(),
-    );
+    let bytes = render_frame(&frame, Viewport { width, height }, &DashboardState::new());
     let text = String::from_utf8(bytes).expect("frames are valid UTF-8");
     assert!(text.starts_with("\x1b[H"), "frames home first");
     text.replace("\x1b[H", "").replace("\x1b[K", "")
@@ -347,8 +336,7 @@ fn render_missing_return_stays_partial_everywhere() {
             .gap_classes
             .observation
             .causes
-            .iter()
-            .any(|cause| *cause == "in_flight_at_end"),
+            .contains(&"in_flight_at_end"),
         "clean evidence must not name the missing-return cause: {:?}",
         clean.gap_classes.observation.causes
     );
@@ -407,10 +395,7 @@ fn render_missing_return_stays_partial_everywhere() {
     assert_eq!(payload["entries"]["in_flight"], true);
     let bytes = jsonl_bytes("edge_observed", payload, 7);
     let streamed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(
-        streamed["event"]["activity"],
-        Activity::InFlight.label()
-    );
+    assert_eq!(streamed["event"]["activity"], Activity::InFlight.label());
     assert_eq!(streamed["event"]["entries"]["in_flight"], true);
     assert_eq!(streamed["event"]["identity_context"]["caller"]["id"], "c0");
     assert_eq!(
@@ -459,10 +444,7 @@ fn presentation_revision_agrees_across_all_lanes() {
     // JSON lane: the reference projection of this revision.
     let document = render_json_from_presentation(&view);
     assert_eq!(document["edges"][0]["caller"], expected_caller);
-    assert_lossless_u64_json(
-        &document["edges"][0]["entries"]["count"],
-        expected_count,
-    );
+    assert_lossless_u64_json(&document["edges"][0]["entries"]["count"], expected_count);
     assert_eq!(document["callers"][0]["pid"], expected_pid);
 
     // Text lane: the same caller, pid and count in words.
@@ -481,9 +463,7 @@ fn presentation_revision_agrees_across_all_lanes() {
         "text snapshot: {snapshot}"
     );
     assert!(
-        snapshot.contains(
-            format!("At least {expected_count} entries observed").as_str()
-        ),
+        snapshot.contains(format!("At least {expected_count} entries observed").as_str()),
         "text snapshot: {snapshot}"
     );
 
@@ -493,10 +473,7 @@ fn presentation_revision_agrees_across_all_lanes() {
     let bytes = jsonl_bytes("edge_observed", payload, 9);
     let streamed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(streamed["event"]["caller"], expected_caller);
-    assert_lossless_u64_json(
-        &streamed["event"]["entries"]["count"],
-        expected_count,
-    );
+    assert_lossless_u64_json(&streamed["event"]["entries"]["count"], expected_count);
     assert_eq!(streamed["event"]["activity"], expected_activity);
 
     // Dashboard lane at 80x24: the same identity, count and activity.
@@ -559,8 +536,7 @@ fn diagnostics_header_schema() -> String {
     value["schema"].as_str().expect("header schema").into()
 }
 
-const DIFF_FIXTURE: &[u8] =
-    include_bytes!("../tests/fixtures/inventory-diff/scan-current.json");
+const DIFF_FIXTURE: &[u8] = include_bytes!("../tests/fixtures/inventory-diff/scan-current.json");
 
 /// The `schema` of a real offline diff report over owned fixture bytes.
 fn diff_report_schema() -> String {
@@ -638,10 +614,7 @@ fn schema_identifiers_versioned_separately_from_product() {
 
     assert_eq!(inventory["object_observations"]["version"], 1);
     assert_eq!(OBSERVATIONS_VERSION, 1);
-    assert_eq!(
-        p11scope_manifest::manifest::SCHEMA,
-        "p11scope-manifest/5"
-    );
+    assert_eq!(p11scope_manifest::manifest::SCHEMA, "p11scope-manifest/5");
 
     // No schema identifier embeds the product version.
     let product = env!("CARGO_PKG_VERSION");

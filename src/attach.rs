@@ -17409,10 +17409,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn bpf_loop_probe_log_words_defer_on_program_type_refusal() {
+        use std::io;
+        let os = io::Error::from_raw_os_error;
+        // A kernel that knows helper 181 but forbids it for this program
+        // type names `bpf_loop#181` (from its static helper table) and
+        // refuses in the same log: `unknown func` on v5.17-v6.6,
+        // `cannot use helper` on v6.12. The name alone must not prove
+        // availability; both wordings defer to the real load, which
+        // rejects loudly if the helper is truly unusable.
+        for log in [
+            "0: (85) call bpf_loop#181\nunknown func bpf_loop#181\n",
+            "0: (85) call bpf_loop#181\nprogram of this type cannot use helper bpf_loop#181\n",
+        ] {
+            match classify_bpf_loop_probe_with_log(&Ok(()), &Err(os(libc::EINVAL)), log) {
+                BpfLoopVerdict::Unknown(detail) => {
+                    assert!(detail.contains("unexpectedly"), "{detail}");
+                    assert!(!detail.contains("unknown func"), "{detail}");
+                    assert!(!detail.contains("cannot use helper"), "{detail}");
+                    assert!(!detail.contains('\n'), "{detail}");
+                }
+                verdict => panic!("program-type refusal must defer, got {verdict:?} for {log:?}"),
+            }
+        }
+    }
+
     /// Live helper-identity verdict: where the running kernel predates 5.17
     /// the real probe must prove Unavailable, elsewhere Available. Requires
     /// BPF privilege; the running kernel only picks the expected verdict,
-    /// never the verdict itself.
+    /// never the verdict itself. A vendor backport can make this
+    /// version-keyed expectation false-fail; product code never reads the
+    /// version and takes the fast path wherever the probe proves the helper.
     #[test]
     #[ignore = "requires BPF privilege; asserts the live helper-181 verdict"]
     fn bpf_loop_probe_reports_helper_presence_on_live_kernel() {

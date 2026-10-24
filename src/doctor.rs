@@ -3229,7 +3229,7 @@ mod tests {
     fn counter_modes_footer_names_availability_per_verdict() {
         use crate::attach::BpfLoopVerdict;
         for (verdict, marker) in [
-            (BpfLoopVerdict::Available, "available"),
+            (BpfLoopVerdict::Available, "not enabled in this build"),
             (
                 BpfLoopVerdict::Unavailable("test old kernel".into()),
                 "counter-mode-unavailable-on-kernel",
@@ -3245,6 +3245,11 @@ mod tests {
             assert_eq!(line.lines().count(), 1, "{line:?}");
             assert!(line.contains(marker), "{line:?}");
         }
+        // The Available line states the kernel fact behind the verdict.
+        assert!(
+            counter_modes_footer(&BpfLoopVerdict::Available)
+                .contains("the kernel provides bpf_loop (helper 181)")
+        );
         // The refusal token appears only on proven absence.
         assert!(
             !counter_modes_footer(&BpfLoopVerdict::Available)

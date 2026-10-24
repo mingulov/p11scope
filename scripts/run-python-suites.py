@@ -62,6 +62,7 @@ RUN = [
     ("test_canary_object.py", []),
     ("test_ci_dependency_selection.py", []),
     ("test_counter_object.py", []),
+    ("test_counter_timing_object.py", []),
     ("test_cgroup_replacement.py", []),
     ("test_cgroup_stop_acceptance.py", []),
     ("test_cgroup_trace_harness.py", []),

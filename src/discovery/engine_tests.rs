@@ -45088,7 +45088,7 @@ impl TwoViewProviderEngine {
 /// time. Returns `Ready` or the refusal; panics on `Yielded` (a positive
 /// credit must advance or finish) and on non-termination.
 fn drive_plan_cursor_to_terminal<'a>(
-    old: &'a plan::AttachPlan,
+    old: &plan::AttachPlan,
     make_sources: impl Fn() -> crate::plan::ConservativePlanSources<'a>,
     stable: &mut dyn FnMut(PinnedObjectId) -> Option<plan::ModuleId>,
     cursor: &mut crate::plan::ConservativePlanCursor,

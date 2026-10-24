@@ -6523,6 +6523,7 @@ struct D4ZombieObservation {
     tasks: std::os::fd::OwnedFd,
     member: std::os::fd::OwnedFd,
     member_birth: u64,
+    full_member: Option<std::os::fd::OwnedFd>,
 }
 
 impl D4ZombieObservation {
@@ -6552,10 +6553,65 @@ impl D4ZombieObservation {
             tasks,
             member,
             member_birth: 0,
+            full_member: None,
         };
         result.member_birth = result.stat(&result.member).unwrap().birth;
+        // The nested task directory proves original-group membership but
+        // uses tid_base_stuff, which lacks map_files. A direct /proc/TID
+        // directory uses tgid_base_stuff even for a nonleader. Its numeric
+        // path is only a candidate lookup, never independent authority.
+        // Acquire it while the owned raw worker cannot exec/exit before Q,
+        // bracketed by validation of the original group and held member.
+        result.validate(ready);
+        assert!(
+            matches!(
+                result.stat(&result.leader).unwrap().state,
+                b'R' | b'S' | b'D'
+            ),
+            "fixture: full member view must be acquired before leader retirement"
+        );
+        let candidate = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(format!("/proc/{}", ready.mapping.tid))
+            .expect("fixture: pre-exit candidate full member directory");
+        result.validate(ready);
+        assert!(
+            matches!(
+                result.stat(&result.leader).unwrap().state,
+                b'R' | b'S' | b'D'
+            ),
+            "fixture: leader retired during full-view acquisition"
+        );
+        result.full_member = Some(candidate.into());
+        result.validate(ready);
+        // Relative task/<TGID> traverses proc_task_lookup's actual
+        // same_thread_group gate from the candidate's retained task.
+        // Bind that round trip to the still-held original leader/birth.
+        let candidate_tasks = d4_zombie_open_at(result.full_member(), c"task")
+            .expect("fixture: full member view task directory");
+        let leader_name = std::ffi::CString::new(ready.mapping.tgid.to_string()).unwrap();
+        let same_group_leader = d4_zombie_open_at(&candidate_tasks, &leader_name)
+            .expect("fixture: full-view task/original-TGID same-group round trip");
+        let round_trip = result.stat(&same_group_leader).unwrap();
+        let original_leader = result.stat(&result.leader).unwrap();
+        assert_eq!(
+            (round_trip.tid, round_trip.birth),
+            (original_leader.tid, original_leader.birth),
+            "fixture: full-view original leader binding"
+        );
+        assert_eq!(
+            (round_trip.tid, Some(round_trip.birth)),
+            (ready.mapping.tgid, result.original.start_time())
+        );
         result.validate(ready);
         result
+    }
+
+    fn full_member(&self) -> &std::os::fd::OwnedFd {
+        self.full_member
+            .as_ref()
+            .expect("fixture: validated pre-exit full member view required")
     }
 
     fn stat(&self, dir: &std::os::fd::OwnedFd) -> std::io::Result<D4ZombieTask> {
@@ -6630,52 +6686,74 @@ impl D4ZombieObservation {
             (leader.tid, Some(leader.birth)),
             (ready.mapping.tgid, self.original.start_time())
         );
-        let member = self
-            .stat(&self.member)
-            .expect("fixture: retained live member stat");
-        assert_eq!(
-            (member.tid, member.birth),
-            (ready.mapping.tid, self.member_birth)
-        );
-        assert!(matches!(member.state, b'R' | b'S' | b'D'));
-        let status = self.status(&self.member);
-        for (field, expected) in [("Tgid:", ready.mapping.tgid), ("Pid:", ready.mapping.tid)] {
-            let actual = status
-                .lines()
-                .find_map(|line| line.strip_prefix(field))
-                .expect("fixture: actual member status identity")
-                .trim()
-                .parse::<u32>()
-                .unwrap();
-            assert_eq!(actual, expected, "fixture: actual member {field}");
+        // Both descriptors pin the original task's struct pid. Neither is
+        // reopened after retirement, so member death/exec PID exchange
+        // cannot substitute a fresh task by its equal numeric TID.
+        for directory in std::iter::once(&self.member).chain(self.full_member.iter()) {
+            let member = self
+                .stat(directory)
+                .expect("fixture: retained live member stat");
+            assert_eq!(
+                (member.tid, member.birth),
+                (ready.mapping.tid, self.member_birth)
+            );
+            assert!(
+                matches!(member.state, b'R' | b'S' | b'D'),
+                "fixture: retained member must stay live"
+            );
+            let status = self.status(directory);
+            for (field, expected) in [("Tgid:", ready.mapping.tgid), ("Pid:", ready.mapping.tid)] {
+                let actual = status
+                    .lines()
+                    .find_map(|line| line.strip_prefix(field))
+                    .expect("fixture: actual member status identity")
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap();
+                assert_eq!(actual, expected, "fixture: actual member {field}");
+            }
         }
     }
 
-    fn maps(&self) -> Vec<MapEntry> {
-        crate::discovery::scan::read_maps_or_refuse(
+    fn maps(&self, ready: &D4ZombieReady) -> Vec<MapEntry> {
+        self.validate(ready);
+        let snapshot = crate::discovery::scan::read_maps_or_refuse(
             std::fs::File::from(
-                d4_zombie_open_at(&self.member, c"maps").expect("fixture: retained member maps"),
+                d4_zombie_open_at(self.full_member(), c"maps")
+                    .expect("fixture: retained full member maps"),
             ),
             &mut CaptureWorkBudget::default(),
             crate::attach::monotonic_ns,
         )
-        .expect("fixture: fresh member maps")
+        .expect("fixture: fresh full member maps");
+        self.validate(ready);
+        snapshot
     }
 
-    fn identity(&self, name: &str) -> FileIdentity {
+    fn identity(&self, ready: &D4ZombieReady, name: &str) -> FileIdentity {
         use std::os::fd::AsRawFd as _;
+        self.validate(ready);
         let name = std::ffi::CString::new(name).unwrap();
         let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
         // SAFETY: live retained directory, internal fd/range name; follow its
         // proc link to obtain actual vm_file/open-file metadata, not a pathname.
         assert_eq!(
-            unsafe { libc::fstatat(self.member.as_raw_fd(), name.as_ptr(), stat.as_mut_ptr(), 0) },
+            unsafe {
+                libc::fstatat(
+                    self.full_member().as_raw_fd(),
+                    name.as_ptr(),
+                    stat.as_mut_ptr(),
+                    0,
+                )
+            },
             0,
-            "fixture: retained member identity: {}",
+            "fixture: retained full member identity {:?}: {}",
+            name,
             std::io::Error::last_os_error()
         );
         // SAFETY: successful fstatat initialized stat.
         let stat = unsafe { stat.assume_init() };
+        self.validate(ready);
         FileIdentity {
             dev: stat.st_dev,
             ino: stat.st_ino,
@@ -7128,7 +7206,7 @@ fn privileged_d4_btrfs_zombie_leader_single_survivor_backend_parity() {
     let worker = ready.mapping.tid;
     let creator = ready.creator;
     let digest = p11scope_manifest::identity::hex(&Sha256::digest(&bytes));
-    let before_maps = observation.maps();
+    let before_maps = observation.maps(&ready);
     let before_line = before_maps
         .iter()
         .find(|entry| (entry.start, entry.end) == (ready.mapping.start, ready.mapping.end))
@@ -7171,15 +7249,18 @@ fn privileged_d4_btrfs_zombie_leader_single_survivor_backend_parity() {
                 "fixture: actual worker fstat matches held file"
             );
             assert_eq!(
-                observation.identity(&format!("fd/{}", ready.mapping.fd)),
+                observation.identity(&ready, &format!("fd/{}", ready.mapping.fd)),
                 physical,
                 "fixture: actual live-member FD names held A"
             );
             assert_eq!(
-                observation.identity(&format!(
-                    "map_files/{:x}-{:x}",
-                    ready.mapping.start, ready.mapping.end
-                )),
+                observation.identity(
+                    &ready,
+                    &format!(
+                        "map_files/{:x}-{:x}",
+                        ready.mapping.start, ready.mapping.end
+                    )
+                ),
                 physical,
                 "fixture: actual live-member vm_file names held A"
             );
@@ -7250,7 +7331,7 @@ fn privileged_d4_btrfs_zombie_leader_single_survivor_backend_parity() {
         };
         // The retained MEMBER's maps are opened anew AFTER the zombie
         // barrier. No leader maps path or saved snapshot substitutes for it.
-        let after_maps = observation.maps();
+        let after_maps = observation.maps(&ready);
         verify_mapping(&after_maps);
         eprintln!(
             "D4_ZOMBIE_TRUTH caller={pid} worker={worker} retired_controller={creator} tasks={after_tasks:?} original_birth={original_birth:?} group_pidfd_ready=false fd={} range={:x}-{:x} file={}:{} clone_return={} parent_tid={}",
@@ -7269,7 +7350,7 @@ fn privileged_d4_btrfs_zombie_leader_single_survivor_backend_parity() {
             d4_kernel_attribution_for_pid(pid, after_maps, &pins, object, key, &mut session, 2)
         }));
         // Both backend calls above have happened before any positive check.
-        verify_mapping(&observation.maps());
+        verify_mapping(&observation.maps(&ready));
         d4_zombie_task_set(
             &observation
                 .tasks()

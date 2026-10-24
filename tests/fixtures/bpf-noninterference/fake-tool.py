@@ -171,13 +171,13 @@ elif tool == "rustc":
                 changed.write("\n# source changed between snapshots\n")
         print(sysroot)
     else:
-        release = "1.99.1" if Path(sys.argv[0]).parent.name == "1.99.1" else "1.98.1"
+        release = "1.98.1" if Path(sys.argv[0]).parent.name == "1.98.1" else "1.99.1"
         commit = ("58cf8f9c35b355199727627d07ae34a4e2846d67" if release == "1.99.1"
                   else "48a229ceaefd4985c50990b14116b6d856af0985")
         metadata = f"rustc {release}\nrelease: {release}\ncommit-hash: {commit}\nhost: x86_64-unknown-linux-gnu"
         print(control.get("host_metadata", {}).get(release, metadata))
 elif tool == "cargo":
-    release = "1.99.1" if Path(sys.argv[0]).parent.name == "1.99.1" else "1.98.1"
+    release = "1.98.1" if Path(sys.argv[0]).parent.name == "1.98.1" else "1.99.1"
     print(f"cargo {release}")
 else:
     print("Ubuntu clang version 18.1.8")

@@ -4,8 +4,8 @@
 
 Run an explicit --repeat-baseline diagnostic first, then compare distinct
 baseline/candidate commits. Neither mode installs tools or uses target caches.
-The baseline decision is reviewed separately. The explicit host compiler
-transition preserves the shared BPF tool environment and records both hosts.
+The baseline decision is reviewed separately. Both sides build with the
+reviewed release host compiler and the shared BPF tool environment.
 """
 
 from __future__ import annotations
@@ -34,11 +34,8 @@ sys.path.insert(0, str(COORDINATOR_DIRECTORY))
 from _loader import load_path
 
 OBJECT_NAMES = ("p11scope-ebpf", "p11scope-ebpf-inventory", "p11scope-ebpf-inventory-callers")
-RELEASE_RUST = "1.98.1"
-RELEASE_COMMIT = "48a229ceaefd4985c50990b14116b6d856af0985"
-TRANSITION_RELEASE_RUST = "1.99.1"
-TRANSITION_RELEASE_COMMIT = "58cf8f9c35b355199727627d07ae34a4e2846d67"
-HOST_TRANSITION_BASELINE = "68c258cf54d736370e214172d187d7d3905a8bb5"
+RELEASE_RUST = "1.99.1"
+RELEASE_COMMIT = "58cf8f9c35b355199727627d07ae34a4e2846d67"
 BPF_RUST = "nightly-2026-05-20"
 BPF_LINKER = "0.10.4"
 MAX_LOG_BYTES = 64 * 1024 * 1024
@@ -786,8 +783,6 @@ def main() -> int:
     parser.add_argument("--candidate", required=True)
     parser.add_argument("--work", type=Path, required=True)
     parser.add_argument("--repeat-baseline", action="store_true")
-    parser.add_argument("--host-compiler-transition", action="store_true",
-                        help="compare the reviewed 1.98.1 historical baseline with a 1.99.1 candidate; never repeat control")
     parser.add_argument("--baseline-offline-payload", type=Path)
     parser.add_argument("--candidate-offline-payload", type=Path)
     options = parser.parse_args()
@@ -795,8 +790,6 @@ def main() -> int:
         if platform.system() != "Linux" or platform.machine() != "x86_64":
             raise CheckError("the reviewed recipe requires Linux x86-64")
         validate_path(dict(os.environ))
-        if options.host_compiler_transition and options.repeat_baseline:
-            raise CheckError("host compiler transition cannot relabel a --repeat-baseline control")
         if (options.baseline_offline_payload is None) != (options.candidate_offline_payload is None):
             raise CheckError("both baseline and candidate offline payload paths are required")
         repo, work = options.repo, options.work
@@ -825,10 +818,6 @@ def main() -> int:
         if (baseline == candidate) != options.repeat_baseline:
             raise CheckError("integration needs distinct commits; equal commits need explicit --repeat-baseline")
         host_compilers = ((RELEASE_RUST, RELEASE_COMMIT),)
-        if options.host_compiler_transition:
-            if baseline != HOST_TRANSITION_BASELINE:
-                raise CheckError("host compiler transition requires the reviewed historical baseline " + HOST_TRANSITION_BASELINE)
-            host_compilers += ((TRANSITION_RELEASE_RUST, TRANSITION_RELEASE_COMMIT),)
         selected = (host_compilers[0], host_compilers[-1])
         # Refuse either immutable pin/guard before paying for the first build.
         # The extracted archive is checked again at its actual consumption seam.
@@ -859,8 +848,7 @@ def main() -> int:
                 != json.loads((work / "candidate/snapshot.json").read_text())["nightly_source"]):
             raise CheckError("selected nightly source changed between snapshot builds")
         verdicts = compare_objects(left, right)
-        mode = ("host-compiler-transition" if options.host_compiler_transition
-                else "repeat-baseline" if options.repeat_baseline else "integration")
+        mode = "repeat-baseline" if options.repeat_baseline else "integration"
         write_json(work / "comparison.json", {"mode": mode,
                                               "baseline": baseline, "candidate": candidate,
                                               "host_compilers": {"baseline": baseline_receipt["host_compiler"],
@@ -868,8 +856,6 @@ def main() -> int:
                                               "acquisition_mode": "verified-payload" if options.baseline_offline_payload else "online",
                                               "matched_objects": list(OBJECT_NAMES),
                                               "verdicts": verdicts})
-        if options.host_compiler_transition:
-            print(f"bpf-noninterference: host compiler transition {RELEASE_RUST} -> {TRANSITION_RELEASE_RUST}; shared BPF tools unchanged")
         relaxed = sorted(name for name, verdict in verdicts.items() if verdict != "exact")
         if relaxed:
             print(f"bpf-noninterference: {baseline} vs {candidate}: all three objects match "

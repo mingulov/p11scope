@@ -144,6 +144,25 @@ fn pre_existing_burst_waits_for_binding_and_joins() {
 }
 
 #[test]
+fn refused_admission_names_the_unavailable_site() {
+    let mut scene = workload_scene();
+    let pid = std::process::id();
+    let caller = admit_mapped(&mut scene, pid);
+    // The refresh scan refuses (no receipt is minted), so admission
+    // refuses `semantic_unavailable` with the exact firing site.
+    scene.h0.0.borrow_mut().io.script.fail_file = Some(0);
+    assert!(!attempt_production_bind(&mut scene, caller, pid));
+    scene.scene.coordinator.commit_batch(false).unwrap();
+    assert_eq!(
+        semantic_gap_subjects(&scene),
+        vec![(
+            "semantic admission refused".to_string(),
+            "semantic_unavailable:no_receipt".to_string()
+        )]
+    );
+}
+
+#[test]
 fn pinless_calls_expire_past_the_pending_window() {
     let mut scene = workload_scene();
     let pid = std::process::id();

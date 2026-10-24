@@ -4522,7 +4522,7 @@ pub(crate) mod tests {
         let calls = RefCell::new(Vec::new());
         let outcome = attach_targets_observed_with_roots(
             &slots,
-            CapturePolicy::AggregateOnly,
+            CapturePolicy::Counter(CounterMode::Counts),
             false,
             StaticRoots::CounterBanks,
             |slot| {
@@ -4570,6 +4570,27 @@ pub(crate) mod tests {
         );
         assert!(refused.is_err(), "this bounded host proof is LP64 only");
         assert!(!attached, "all ABI validation precedes the first link");
+        let mut legacy_attached = false;
+        let legacy_refused = attach_targets_observed_with_roots(
+            &slots,
+            CapturePolicy::AggregateOnly,
+            false,
+            StaticRoots::CounterBanks,
+            |_| Ok(ElfAbi::Lp64),
+            |_, _, _| {
+                legacy_attached = true;
+                pid_continuity::NativeAttempt {
+                    started_ns: None,
+                    result: Ok(()),
+                }
+            },
+            |_| None,
+        );
+        assert!(
+            legacy_refused.is_err(),
+            "legacy aggregate policy must not take bank roots"
+        );
+        assert!(!legacy_attached, "policy refusal precedes the first link");
     }
 
     #[derive(Default)]

@@ -28,7 +28,9 @@ use crate::discovery::scan::{
 };
 use crate::discovery::scheduler::MAX_PENDING_REFRESH;
 use crate::{semantics, trace};
-use p11scope_ebpf_common::{DISCOVERY_EXEC_SAME_TASK_CANDIDATE, DISCOVERY_EXEC_TASK_REPLACED};
+use p11scope_ebpf_common::{
+    CounterMode, DISCOVERY_EXEC_SAME_TASK_CANDIDATE, DISCOVERY_EXEC_TASK_REPLACED,
+};
 use p11scope_manifest::manifest::{
     Acquisition, AliasEntry, AliasGroup, FunctionRecord, InterfaceClassification, SurfaceRecord,
     SurfaceSource, Version, WalkOutcome,
@@ -11215,6 +11217,38 @@ fn aggregate_policy_creates_no_selection_bindings() {
             skip.subject.contains("selection") || skip.reason.contains("selection")
         })
     );
+}
+
+#[test]
+fn counter_policies_create_no_selection_bindings() {
+    for mode in [
+        CounterMode::Counts,
+        CounterMode::Timestamps,
+        CounterMode::Latency,
+    ] {
+        let (_fixture, mut engine, mut session) = initial_export_route();
+        engine.modules[0].scanned.exports = vec!["C_GetInterface".into()];
+        session.capture_policy = Some(CapturePolicy::Counter(mode));
+        session.dynamic_attach_reports_added = true;
+        let mut additions_allowed = true;
+        let mut pending = PendingViewRetirements::new();
+        let mut closure = PauseClosure::new(true);
+
+        engine.attach_initial_exports(
+            &mut session,
+            &mut additions_allowed,
+            &mut pending,
+            &mut closure,
+        );
+
+        assert!(session.dynamic_attach_calls.is_empty(), "{mode:?}");
+        assert!(engine.selection_bindings.is_empty(), "{mode:?}");
+        assert_eq!(engine.next_selection_binding_id, Some(1));
+        assert!(closure.required_complete());
+        assert!(!engine.counters.object_skips.iter().any(|skip| {
+            skip.subject.contains("selection") || skip.reason.contains("selection")
+        }));
+    }
 }
 
 #[test]

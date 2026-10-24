@@ -18,7 +18,7 @@ use aya::{Btf, Ebpf, EbpfLoader};
 use p11scope_bpf_multi::{GroupHalt, attach_group, bisect_attach};
 use p11scope_ebpf_common::object_wire::{ObjectDescriptorWire, publish_object_descriptors};
 use p11scope_ebpf_common::{
-    ARG_NONE, DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES,
+    ARG_NONE, CounterMode, DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES,
     DISCOVERY_COUNTER_EXPORT_STATE_FAILURES, DISCOVERY_COUNTER_LOADER_HITS,
     DISCOVERY_COUNTER_LOADER_STATE_READ_FAILURES, DISCOVERY_COUNTER_RING_LOSS,
     EVIDENCE_ABI_REFUSALS, FLAG_POLICY_AGGREGATE, FLAG_POLICY_ALLOWLISTED,
@@ -874,6 +874,7 @@ pub enum CapturePolicy {
     Allowlisted,
     UnsafeUnvalidatedMetadata,
     AggregateOnly,
+    Counter(CounterMode),
 }
 
 impl CapturePolicy {
@@ -896,7 +897,7 @@ impl CapturePolicy {
         match self {
             Self::Allowlisted => FLAG_POLICY_ALLOWLISTED,
             Self::UnsafeUnvalidatedMetadata => FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA,
-            Self::AggregateOnly => FLAG_POLICY_AGGREGATE,
+            Self::AggregateOnly | Self::Counter(_) => FLAG_POLICY_AGGREGATE,
         }
     }
 
@@ -905,11 +906,23 @@ impl CapturePolicy {
             Self::Allowlisted => "allowlisted",
             Self::UnsafeUnvalidatedMetadata => "unsafe-unvalidated-metadata",
             Self::AggregateOnly => "aggregate-only",
+            Self::Counter(_) => "aggregate-only",
         }
     }
 
     pub const fn uses_events(self) -> bool {
         !matches!(self, Self::AggregateOnly)
+    }
+
+    pub const fn is_aggregate(self) -> bool {
+        matches!(self, Self::AggregateOnly | Self::Counter(_))
+    }
+
+    pub const fn counter_mode(self) -> Option<CounterMode> {
+        match self {
+            Self::Counter(mode) => Some(mode),
+            Self::Allowlisted | Self::UnsafeUnvalidatedMetadata | Self::AggregateOnly => None,
+        }
     }
 
     /// Whether the policy can consume load-instance continuity (Task 3 Stage
@@ -923,7 +936,7 @@ impl CapturePolicy {
     pub const fn wants_instance_hooks(self) -> bool {
         match self {
             Self::Allowlisted | Self::UnsafeUnvalidatedMetadata => true,
-            Self::AggregateOnly => false,
+            Self::AggregateOnly | Self::Counter(_) => false,
         }
     }
 
@@ -4176,7 +4189,9 @@ pub(crate) fn object_transport_rows_with(
             Some(rows) => Ok(Some(Arc::clone(rows))),
             None => readback().map(Some),
         },
-        CapturePolicy::AggregateOnly | CapturePolicy::UnsafeUnvalidatedMetadata => Ok(None),
+        CapturePolicy::AggregateOnly
+        | CapturePolicy::UnsafeUnvalidatedMetadata
+        | CapturePolicy::Counter(_) => Ok(None),
     }
 }
 
@@ -8899,7 +8914,8 @@ impl Drop for Session {
 
 #[cfg(test)]
 mod capture_policy {
-    use super::CapturePolicy;
+    use super::{CapturePolicy, StaticRoots, group_static_slots_with_roots};
+    use p11scope_ebpf_common::CounterMode;
 
     #[test]
     fn capture_policies_have_distinct_bits_and_visible_behavior() {
@@ -8918,6 +8934,17 @@ mod capture_policy {
             assert_eq!(policy.privacy_mode(), privacy_mode);
             assert_eq!(policy.uses_events(), uses_events);
             assert_eq!(policy.uses_unsafe_decoders(), uses_unsafe_decoders);
+        }
+        for mode in [
+            CounterMode::Counts,
+            CounterMode::Timestamps,
+            CounterMode::Latency,
+        ] {
+            let policy = CapturePolicy::Counter(mode);
+            assert_eq!(policy.privacy_mode(), "aggregate-only");
+            assert_eq!(policy.uses_events(), false);
+            assert_eq!(policy.uses_unsafe_decoders(), false);
+            assert_eq!(policy.config_bit(), super::FLAG_POLICY_AGGREGATE);
         }
         assert_ne!(
             CapturePolicy::Allowlisted.config_bit(),
@@ -8942,6 +8969,54 @@ mod capture_policy {
         assert!(CapturePolicy::Allowlisted.wants_instance_hooks());
         assert!(CapturePolicy::UnsafeUnvalidatedMetadata.wants_instance_hooks());
         assert!(!CapturePolicy::AggregateOnly.wants_instance_hooks());
+        for mode in [
+            CounterMode::Counts,
+            CounterMode::Timestamps,
+            CounterMode::Latency,
+        ] {
+            assert!(!CapturePolicy::Counter(mode).wants_instance_hooks());
+        }
+    }
+
+    #[test]
+    fn counter_policies_are_aggregate_and_keep_bank_roots_exclusive() {
+        for mode in [
+            CounterMode::Counts,
+            CounterMode::Timestamps,
+            CounterMode::Latency,
+        ] {
+            let policy = CapturePolicy::Counter(mode);
+            assert!(policy.is_aggregate(), "{mode:?}");
+            assert_eq!(policy.counter_mode(), Some(mode));
+        }
+        assert!(CapturePolicy::AggregateOnly.is_aggregate());
+        assert_eq!(CapturePolicy::AggregateOnly.counter_mode(), None);
+        assert!(!CapturePolicy::Allowlisted.is_aggregate());
+        assert!(!CapturePolicy::UnsafeUnvalidatedMetadata.is_aggregate());
+        for policy in [CapturePolicy::Allowlisted, CapturePolicy::AggregateOnly] {
+            let refused = group_static_slots_with_roots(
+                &[],
+                policy,
+                false,
+                &std::collections::BTreeMap::new(),
+                StaticRoots::CounterBanks,
+            );
+            assert!(refused.is_err(), "{policy:?} must not take bank roots");
+        }
+        for mode in [
+            CounterMode::Counts,
+            CounterMode::Timestamps,
+            CounterMode::Latency,
+        ] {
+            let accepted = group_static_slots_with_roots(
+                &[],
+                CapturePolicy::Counter(mode),
+                false,
+                &std::collections::BTreeMap::new(),
+                StaticRoots::CounterBanks,
+            );
+            assert!(accepted.is_ok(), "{mode:?} takes bank roots");
+        }
     }
 }
 
@@ -12635,7 +12710,7 @@ mod tests {
             .collect();
         let groups: Vec<StaticGroup> = group_static_slots_with_roots(
             &slots,
-            CapturePolicy::AggregateOnly,
+            CapturePolicy::Counter(CounterMode::Counts),
             false,
             &targets,
             StaticRoots::CounterBanks,
@@ -12714,6 +12789,7 @@ mod tests {
             (CapturePolicy::Allowlisted, false, false),
             (CapturePolicy::AggregateOnly, true, false),
             (CapturePolicy::AggregateOnly, false, true),
+            (CapturePolicy::AggregateOnly, false, false),
         ] {
             let mut target_facts = targets.clone();
             if bad_abi {
@@ -12770,7 +12846,7 @@ mod tests {
                 .collect();
             let old_groups: Vec<StaticGroup> = group_static_slots_with_roots(
                 &old_slots,
-                CapturePolicy::AggregateOnly,
+                CapturePolicy::Counter(CounterMode::Counts),
                 false,
                 &all_targets,
                 StaticRoots::CounterBanks,
@@ -12778,7 +12854,7 @@ mod tests {
             .unwrap();
             let fresh_groups: Vec<StaticGroup> = group_static_slots_with_roots(
                 &fresh,
-                CapturePolicy::AggregateOnly,
+                CapturePolicy::Counter(CounterMode::Counts),
                 false,
                 &all_targets,
                 StaticRoots::CounterBanks,

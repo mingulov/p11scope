@@ -7802,15 +7802,11 @@ mod tests {
         for index in 0..3 {
             let path = dir.path().join(format!("provider-{index}.so"));
             std::fs::copy("/usr/bin/true", &path).unwrap();
-            let metadata = std::fs::metadata(&path).unwrap();
-            let key = ObjectKey {
-                device: Device {
-                    major: u64::from(libc::major(metadata.dev())),
-                    minor: u64::from(libc::minor(metadata.dev())),
-                },
-                inode: metadata.ino(),
-            };
             let view = ProcessView::open(ProcessViewId(index + 1), std::process::id()).unwrap();
+            // Btrfs st_dev names the subvolume, unlike maps/mountinfo. Obtain
+            // the actual comparable key through the SAME retained view before
+            // sending the row through ordinary opened-file pin validation.
+            let key = view_object_key(&view, &path, &mut CaptureWorkBudget::default()).unwrap();
             let mut scanned = module(key);
             scanned.view = view.id();
             scanned.mount_namespace = view.mount_namespace();

@@ -207,6 +207,11 @@ CAPTURE = {
 }
 PRESENCE = {"mapped": "mapped", "unloaded": "unloaded", "exited": "process exited", "unknown": "unknown"}
 EDGE_STATES = ("presence", "capture", "activity")
+# DR-C5-EDGE replay also skips the additive identity_context: an
+# edge_observed record is the snapshot edge verbatim plus the three
+# derived states plus additive context, and the snapshot edge never
+# carries that context (inventory-events-v1 `edge_observed`).
+EDGE_REPLAY_SKIP = EDGE_STATES + ("identity_context",)
 # Choice 3 (ACT re-rule): the recorded activity signal is per-pass
 # ("rose since previous pass"), window-free. The dashboard display
 # keeps its own trailing window, but frames never reach this oracle
@@ -219,7 +224,7 @@ FRAME = {
     "ansi": re.compile(rb"\x1b\[[0-9;?]*[A-Za-z]"),
     "header": re.compile(r"^p11scope inventory (\S+) \| (\d+) passes \| (\d+) callers (\d+) modules (\d+) edges"),
     "coverage": re.compile(r"^coverage: (\d+) gaps"),
-    "identity": re.compile(r"^(c\d+) pid (\d+) \((.*)\) -> (m\d+) \((.*)\)$"),
+    "identity": re.compile(r"^(?:> )?(.*) \[(c\d+)\] -> (.*) \[(m\d+)\]$"),
     "item_indent": "  ",
     "item_sep": " | ",
     "section": "---",
@@ -1129,7 +1134,8 @@ def settlement_verdict(doc):
 def edge_payload_problems(view, key, ev):
     """Problems ([]) when the edge_observed payload `ev` disagrees with the
     decided snapshot edge for `key`: DR-C5-EDGE replay minus the three
-    derived states. Presence and capture must match the oracle's own
+    derived states and the additive identity_context (which no snapshot
+    edge carries). Presence and capture must match the oracle's own
     derivation here; activity is per-pass and judged record-by-record
     (with its previous record) by EDGE-ACTIVITY instead."""
     edge = view.edges.get(key)
@@ -1137,7 +1143,7 @@ def edge_payload_problems(view, key, ev):
         return [(key, "not in snapshot")]
     caller, module = view.callers.get(key[0], {}), view.modules.get(key[1], {})
     problems = []
-    replayed = {k: v for k, v in ev.items() if k not in EDGE_STATES}
+    replayed = {k: v for k, v in ev.items() if k not in EDGE_REPLAY_SKIP}
     if replayed != edge:
         fields = sorted(k for k in set(replayed) | set(edge) if replayed.get(k) != edge.get(k))
         problems.append((key, f"fields {fields}"))
@@ -2138,8 +2144,9 @@ def frame_edges(lines):
     for line in lines:
         m = FRAME["identity"].match(line)
         if m:
-            current = (m.group(1), m.group(4))
-            edges[current] = {"pid": int(m.group(2)), "items": {}}
+            current = (m.group(2), m.group(4))
+            # Identity lines carry no pid; ledger matching joins the snapshot.
+            edges[current] = {"pid": None, "items": {}}
             continue
         if current and line.startswith(indent) and not line.startswith(indent + " "):
             for item in line.strip().split(FRAME["item_sep"]):

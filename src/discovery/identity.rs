@@ -5056,6 +5056,14 @@ mod conservative_copy {
             }
 
             #[cfg(test)]
+            pub(crate) fn reference_current_unpinned_for_test(
+                &self,
+            ) -> Option<(usize, &[Skipped])> {
+                let table = self.module.as_ref()?.tables.get(self.table_pos)?;
+                Some((table.unpinned.capacity(), table.unpinned.as_slice()))
+            }
+
+            #[cfg(test)]
             pub(crate) fn reference_pending_exports_for_test(
                 &self,
                 object: PinnedObjectId,
@@ -10625,5 +10633,221 @@ mod tests {
         assert!(input.is_none());
         assert_eq!(pool.snapshot().charged_bytes, before_rebind + required);
         assert!(rebind.modules().is_some());
+    }
+
+    #[test]
+    fn scanned_rebind_cursor_moves_retained_pin_prefix_over_credits() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        let (_dir, mut source, raw) = conservative_cursor_fixture();
+        let repeated: Vec<_> = std::iter::repeat_n(raw[0].clone(), 64).collect();
+        assert!(bind_scanned_modules(&repeated, &mut source).1.is_empty());
+        let view = raw[0].view;
+        let expected_prefix = source.view_claims(view).unwrap().pins.clone();
+        assert!(expected_prefix.len() > 64);
+        let pool = SemanticResourcePool::default();
+        let reserve = pool.reserver();
+        let selection = conservative_selection(&pool, BTreeSet::new(), BTreeSet::new());
+        let baseline = pool.snapshot().charged_bytes;
+        let (mut input, _) = retained_rebind_inputs(&pool, &raw[..1], false);
+        let mut pins = PinnedConservativeCursor::new();
+        let mut rebind = ScannedRebindCursor::new();
+        let mut observed_growth = false;
+        let mut released_original = false;
+        let ((), peak) = crate::test_alloc::requested_peak_during(|| {
+            finish_conservative_copy(&source, &mut pins, &selection, &reserve);
+            let old_capacity = pins
+                .pinned()
+                .unwrap()
+                .view_claims(view)
+                .unwrap()
+                .pins
+                .capacity();
+            let old_bytes = old_capacity * std::mem::size_of::<PinnedObjectId>();
+            let mut previous = 0usize;
+            for _ in 0..4096 {
+                let before = crate::test_alloc::armed_requested_snapshot();
+                let step = pins
+                    .poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1)
+                    .unwrap();
+                let after = crate::test_alloc::armed_requested_snapshot();
+                let actual = &pins.reference_rebind_claims_for_test(view).unwrap().pins;
+                if !observed_growth && actual.capacity() > old_capacity {
+                    observed_growth = true;
+                    assert!(
+                        actual.len() <= 1,
+                        "a populated pin prefix cannot move in its allocation credit"
+                    );
+                    let new_bytes = actual.capacity() * std::mem::size_of::<PinnedObjectId>();
+                    assert!(
+                        after.live_bytes >= before.live_bytes + new_bytes,
+                        "the old actual pin allocation remains held alongside fresh backing"
+                    );
+                    previous = actual.len();
+                } else if observed_growth && previous < expected_prefix.len() {
+                    assert!(
+                        actual.len() <= previous + 1,
+                        "work1 moves at most one original pin claim"
+                    );
+                    previous = actual.len();
+                }
+                if observed_growth {
+                    let prefix = actual.len().min(expected_prefix.len());
+                    assert_eq!(&actual[..prefix], &expected_prefix[..prefix]);
+                    if actual.len() >= expected_prefix.len()
+                        && before.live_bytes.saturating_sub(after.live_bytes) >= old_bytes
+                    {
+                        released_original = true;
+                    }
+                }
+                if step == GraphStep::Ready {
+                    break;
+                }
+            }
+            assert!(observed_growth && released_original);
+            assert!(rebind.modules().is_some());
+            for _ in 0..4096 {
+                if rebind.reclaim(Some(&mut pins), &reserve, 1).unwrap() == GraphStep::Ready {
+                    break;
+                }
+            }
+            for _ in 0..4096 {
+                if pins
+                    .reclaim(Some(&source), &selection, &reserve, 1)
+                    .unwrap()
+                    == GraphStep::Ready
+                {
+                    break;
+                }
+            }
+        });
+        assert!(!peak.incomplete);
+        assert_eq!(peak.live_bytes, 0);
+        assert_eq!(peak.live_blocks, 0);
+        assert_eq!(pool.snapshot().charged_bytes, baseline);
+    }
+
+    #[test]
+    fn scanned_rebind_cursor_moves_original_skip_prefix_over_credits() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        let (_dir, mut source, raw) = conservative_cursor_fixture();
+        source.reject_observation(raw[2].key);
+        let mut negative = raw[0].clone();
+        negative.tables[0].entries.clear();
+        for ordinal in 0..64 {
+            let mut entry = raw[0].tables[0].entries[0].clone();
+            entry.object = raw[2].key;
+            entry.object_path = format!(
+                "{}/unused-{ordinal}/../provider-2.so",
+                Path::new(&raw[2].path).parent().unwrap().display()
+            );
+            negative.tables[0].entries.push(entry);
+        }
+        // These are original, actual ordinary-binder negative records, with
+        // distinct owned path reasons; no scalar debt or readiness is seeded.
+        let (mut bound, skipped) = bind_scanned_modules(&[negative], &mut source);
+        assert_eq!(skipped.len(), 64);
+        let mut original = bound.remove(0).scanned;
+        let expected_prefix = original.tables[0].unpinned.clone();
+        assert_eq!(expected_prefix.len(), 64);
+        let mut entry = raw[0].tables[0].entries[0].clone();
+        entry.object = raw[2].key;
+        entry.object_path = raw[2].path.clone();
+        original.tables[0].entries.push(entry);
+        let originals = [original];
+        let pool = SemanticResourcePool::default();
+        let reserve = pool.reserver();
+        let selection = conservative_selection(&pool, BTreeSet::new(), BTreeSet::new());
+        let baseline = pool.snapshot().charged_bytes;
+        // Establish the retained-request envelope with the existing allocator
+        // oracle, then admit a same-shape actual copy BEFORE its allocation.
+        let (prepared, _) = retained_rebind_inputs(&pool, &originals, false);
+        let (prepared_rows, storage) = prepared.unwrap().into_originals();
+        drop(prepared_rows);
+        let mut pins = PinnedConservativeCursor::new();
+        let mut rebind = ScannedRebindCursor::new();
+        let mut observed_growth = false;
+        let mut released_original = false;
+        let ((), peak) = crate::test_alloc::requested_peak_during(|| {
+            let rows = originals.to_vec();
+            let mut input =
+                Some(RetainedScannedInputs::from_reserved_originals(rows, storage).unwrap());
+            finish_conservative_copy(&source, &mut pins, &selection, &reserve);
+            let old_capacity = input.as_ref().unwrap().originals_for_test()[0].tables[0]
+                .unpinned
+                .capacity();
+            assert_eq!(
+                old_capacity,
+                expected_prefix.len(),
+                "the actual owned clone has a tight prefix"
+            );
+            let old_bytes = old_capacity * std::mem::size_of::<Skipped>();
+            let mut previous = 0usize;
+            for _ in 0..4096 {
+                let before = crate::test_alloc::armed_requested_snapshot();
+                let step = pins
+                    .poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1)
+                    .unwrap();
+                let after = crate::test_alloc::armed_requested_snapshot();
+                if let Some((capacity, actual)) = rebind.reference_current_unpinned_for_test() {
+                    if !observed_growth && capacity > old_capacity {
+                        observed_growth = true;
+                        assert!(
+                            actual.len() <= 1,
+                            "allocation cannot copy the complete original skip prefix"
+                        );
+                        assert!(
+                            after.live_bytes
+                                >= before.live_bytes + capacity * std::mem::size_of::<Skipped>(),
+                            "old and fresh actual skip buffers overlap until prefix transfer finishes"
+                        );
+                        previous = actual.len();
+                    } else if observed_growth && previous < expected_prefix.len() {
+                        assert!(
+                            actual.len() <= previous + 1,
+                            "work1 moves at most one original skip record"
+                        );
+                        previous = actual.len();
+                    }
+                    if observed_growth {
+                        let prefix = actual.len().min(expected_prefix.len());
+                        assert_eq!(&actual[..prefix], &expected_prefix[..prefix]);
+                        if actual.len() >= expected_prefix.len()
+                            && before.live_bytes.saturating_sub(after.live_bytes) >= old_bytes
+                        {
+                            released_original = true;
+                        }
+                    }
+                }
+                if step == GraphStep::Ready {
+                    break;
+                }
+            }
+            assert!(observed_growth && released_original);
+            let module = &rebind.modules().unwrap()[0];
+            assert_eq!(
+                &module.scanned.tables[0].unpinned[..64],
+                expected_prefix.as_slice()
+            );
+            assert_eq!(module.scanned.tables[0].unpinned.len(), 65);
+            assert_eq!(rebind.skipped().unwrap().len(), 1);
+            for _ in 0..4096 {
+                if rebind.reclaim(Some(&mut pins), &reserve, 1).unwrap() == GraphStep::Ready {
+                    break;
+                }
+            }
+            for _ in 0..4096 {
+                if pins
+                    .reclaim(Some(&source), &selection, &reserve, 1)
+                    .unwrap()
+                    == GraphStep::Ready
+                {
+                    break;
+                }
+            }
+        });
+        assert!(!peak.incomplete);
+        assert_eq!(peak.live_bytes, 0);
+        assert_eq!(peak.live_blocks, 0);
+        assert_eq!(pool.snapshot().charged_bytes, baseline);
     }
 }

@@ -45138,9 +45138,7 @@ fn collected_plan_cursor_matches_removal_only_reference() {
         .bind_plan_module_ids(&mut rebuilt, &surviving, &engine.manifests, &engine.pinned)
         .unwrap();
     let mut next = old.clone();
-    let delta = next
-        .extend_exact_with_stable_module_ids(rebuilt)
-        .unwrap();
+    let delta = next.extend_exact_with_stable_module_ids(rebuilt).unwrap();
     assert!(delta.new.is_empty(), "the reference must not grow");
     assert!(delta.replace.is_empty(), "the reference must not replace");
     assert_eq!(delta.retire.len(), 1, "the reference retires one slot");
@@ -45151,10 +45149,8 @@ fn collected_plan_cursor_matches_removal_only_reference() {
     let facts = &engine.capture_facts;
     let manifests = &engine.manifests;
     let broad_admit = engine.broad_admit;
-    let make_sources =
-        || ConservativePlanSources::new(&surviving, manifests, pinned, broad_admit);
-    let mut stable =
-        |object: PinnedObjectId| facts.module_id_for_object(pinned, object).ok();
+    let make_sources = || ConservativePlanSources::new(&surviving, manifests, pinned, broad_admit);
+    let mut stable = |object: PinnedObjectId| facts.module_id_for_object(pinned, object).ok();
 
     // Work 0 changes nothing.
     let mut cursor = ConservativePlanCursor::new();
@@ -45171,7 +45167,9 @@ fn collected_plan_cursor_matches_removal_only_reference() {
     // field.
     drive_plan_cursor_to_terminal(&old, &make_sources, &mut stable, &mut cursor, &reserve, 1)
         .unwrap();
-    let plan = cursor.plan().expect("a Ready cursor holds the rebuilt plan");
+    let plan = cursor
+        .plan()
+        .expect("a Ready cursor holds the rebuilt plan");
     let cursor_delta = cursor.delta().expect("a Ready cursor holds the delta");
     let removed = cursor.removed().expect("a Ready cursor holds the removals");
     assert_eq!(plan.slots, next.slots);
@@ -45286,7 +45284,9 @@ fn collected_plan_cursor_never_grows_at_q() {
     let mut cursor = ConservativePlanCursor::new();
     drive_plan_cursor_to_terminal(&old, &make_sources, &mut stable, &mut cursor, &reserve, 1)
         .unwrap();
-    let plan = cursor.plan().expect("a Ready cursor holds the rebuilt plan");
+    let plan = cursor
+        .plan()
+        .expect("a Ready cursor holds the rebuilt plan");
     let cursor_delta = cursor.delta().expect("a Ready cursor holds the delta");
     assert!(
         cursor_delta.new.is_empty(),
@@ -45299,10 +45299,8 @@ fn collected_plan_cursor_never_grows_at_q() {
     assert_eq!(plan.modules_skipped, old.modules_skipped);
     assert_eq!(plan.slots, old.slots);
     assert_eq!(plan.modules, old.modules);
-    let refused: Vec<(PinnedObjectId, &crate::plan::Skipped)> =
-        plan.refused_modules().collect();
-    let old_refused: Vec<(PinnedObjectId, &crate::plan::Skipped)> =
-        old.refused_modules().collect();
+    let refused: Vec<(PinnedObjectId, &crate::plan::Skipped)> = plan.refused_modules().collect();
+    let old_refused: Vec<(PinnedObjectId, &crate::plan::Skipped)> = old.refused_modules().collect();
     assert_eq!(refused, old_refused);
     for slot in &old.slots {
         assert_eq!(
@@ -45336,8 +45334,7 @@ fn collected_plan_cursor_refuses_in_place_mutation_and_missing_ids() {
     let facts = &engine.capture_facts;
     let manifests = &engine.manifests;
     let broad_admit = engine.broad_admit;
-    let make_sources =
-        || ConservativePlanSources::new(&surviving, manifests, pinned, broad_admit);
+    let make_sources = || ConservativePlanSources::new(&surviving, manifests, pinned, broad_admit);
     let mut stable = |object: PinnedObjectId| facts.module_id_for_object(pinned, object).ok();
 
     // In-place mutation between credits.

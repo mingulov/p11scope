@@ -6561,4 +6561,45 @@ mod tests {
         assert_eq!(pool.snapshot().charged_bytes, charged);
         assert!(cursor.pinned().is_none());
     }
+
+    #[test]
+    fn conservative_copy_final_slice_release_does_not_walk_drained_elements() {
+        use std::mem::{ManuallyDrop, align_of, needs_drop, size_of};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Resource-free: suppressing this destructor cannot leak a payload.
+        struct DropProbe;
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        const {
+            assert!(needs_drop::<(String, u64)>());
+            assert!(!needs_drop::<ManuallyDrop<(String, u64)>>());
+            assert!(size_of::<(String, u64)>() == size_of::<ManuallyDrop<(String, u64)>>());
+            assert!(align_of::<(String, u64)>() == align_of::<ManuallyDrop<(String, u64)>>());
+        }
+        let mut probes: Arc<[DropProbe]> = Arc::from([DropProbe, DropProbe, DropProbe]);
+        assert!(Arc::get_mut(&mut probes).is_some());
+        // SAFETY: resource-free elements, actual unique allocation/no Weak,
+        // no live borrow or observer between the check and transfer.
+        unsafe { deallocate_drained_unique_arc(probes) };
+        assert_eq!(DROPS.load(Ordering::Relaxed), 0);
+
+        let mut payloads: Arc<[(String, u64)]> = Arc::from([
+            ("one owned allocation".repeat(64), 1),
+            ("another owned allocation".repeat(128), 2),
+        ]);
+        for item in Arc::get_mut(&mut payloads).unwrap() {
+            drop(std::mem::take(&mut item.0));
+            assert_eq!(item.0.capacity(), 0);
+        }
+        assert!(Arc::get_mut(&mut payloads).is_some());
+        // SAFETY: all owned payloads were freed individually above. Remaining
+        // elements are valid zero-capacity Strings plus integers, exclusively
+        // held with no Weak; the final release must skip their typed Drop loop.
+        unsafe { deallocate_drained_unique_arc(payloads) };
+    }
 }

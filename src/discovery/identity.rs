@@ -3309,6 +3309,18 @@ mod conservative_copy {
         }
 
         #[cfg(test)]
+        pub(super) fn retained_reclaim_file_for_test(
+            &self,
+            id: PinnedObjectId,
+        ) -> Option<(u8, Option<RawFd>)> {
+            let entry = self.reclaim_entry.as_ref().filter(|entry| entry.id == id)?;
+            Some((
+                entry.field,
+                entry.file.as_ref().map(|file| file.as_raw_fd()),
+            ))
+        }
+
+        #[cfg(test)]
         pub(super) fn retained_exports_for_test(
             &self,
             id: PinnedObjectId,
@@ -3413,6 +3425,60 @@ mod conservative_copy {
         assert!(size_of::<(String, u64)>() == size_of::<ManuallyDrop<(String, u64)>>());
         assert!(align_of::<(String, u64)>() == align_of::<ManuallyDrop<(String, u64)>>());
     };
+
+    #[cfg(test)]
+    mod lifecycle_tests {
+        use super::*;
+
+        #[test]
+        fn file_share_release_requires_actual_live_alias() {
+            let (_dir, source, _) = super::super::tests::conservative_cursor_fixture();
+            let (id, original) = source.by_id.first_key_value().unwrap();
+            let id = *id;
+            let actual_fd = original.file.as_raw_fd();
+            let mut independent = source.clone();
+            let reopened = std::fs::File::open(&original.path).unwrap();
+            assert_ne!(reopened.as_raw_fd(), actual_fd);
+            assert_eq!(pin_of(&reopened).unwrap(), original.pin);
+            independent.by_id.get_mut(&id).unwrap().file = Arc::new(reopened);
+            let mut wrong = source.clone();
+            let different = source
+                .by_id
+                .range((Excluded(id), Unbounded))
+                .next()
+                .unwrap()
+                .1;
+            wrong.by_id.get_mut(&id).unwrap().file = different.file.clone();
+            let mut entry = EntryReclaim::new(id, original.clone());
+            for _ in 0..4 {
+                assert!(!entry.advance(None).unwrap());
+            }
+            assert_eq!(
+                entry.field, 4,
+                "actual leaf progress reached the file share"
+            );
+            for borrowed in [None, Some(&independent), Some(&wrong)] {
+                assert!(matches!(
+                    entry.advance(borrowed),
+                    Err(GraphRefusal::Identity)
+                ));
+                assert_eq!(entry.field, 4);
+                assert!(
+                    entry
+                        .file
+                        .as_ref()
+                        .is_some_and(|file| file.as_raw_fd() == actual_fd)
+                );
+                // SAFETY: F_GETFD observes this actual owned descriptor only.
+                assert!(unsafe { libc::fcntl(actual_fd, libc::F_GETFD) } >= 0);
+            }
+            assert!(!entry.advance(Some(&source)).unwrap());
+            assert_eq!(entry.field, 5);
+            assert!(entry.file.is_none());
+            // The borrowed SAME Arc remains live after releasing our share.
+            assert!(unsafe { libc::fcntl(actual_fd, libc::F_GETFD) } >= 0);
+        }
+    }
 }
 
 const AMBIGUOUS_SUBJECT: &str = "discovery subject";
@@ -7728,7 +7794,8 @@ mod tests {
         assert_eq!((gate.sweeps(), gate.skips()), (2, 1));
     }
 
-    fn conservative_cursor_fixture() -> (tempfile::TempDir, PinnedObjects, Vec<ScannedModule>) {
+    pub(super) fn conservative_cursor_fixture()
+    -> (tempfile::TempDir, PinnedObjects, Vec<ScannedModule>) {
         let dir = tempfile::tempdir().unwrap();
         let mut source = PinnedObjects::empty();
         let mut modules = Vec::new();
@@ -8099,6 +8166,57 @@ mod tests {
             }
         }
         assert_eq!(pool.snapshot().charged_bytes, baseline);
+    }
+
+    #[test]
+    fn conservative_copy_cursor_refuses_final_file_close() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        let (_dir, source, _) = conservative_cursor_fixture();
+        let id = *source.by_id.keys().next().unwrap();
+        let actual_fd = source.file_for(id).unwrap().as_raw_fd();
+        let pool = SemanticResourcePool::default();
+        let reserve = pool.reserver();
+        let selection = conservative_selection(&pool, BTreeSet::new(), BTreeSet::new());
+        let baseline = pool.snapshot().charged_bytes;
+        let mut cursor = PinnedConservativeCursor::new();
+        finish_conservative_copy(&source, &mut cursor, &selection, &reserve);
+        drop(source);
+        // There is now no borrowed or separately retained share of this real
+        // File. Reclamation may free copied text, but it cannot close the FD.
+        for _ in 0..4096 {
+            if cursor.retained_reclaim_file_for_test(id) == Some((4, Some(actual_fd))) {
+                break;
+            }
+            assert_ne!(
+                cursor.reclaim(None, &selection, &reserve, 1).unwrap(),
+                GraphStep::Ready,
+            );
+        }
+        let before = cursor.retained_reclaim_file_for_test(id);
+        assert_eq!(before, Some((4, Some(actual_fd))));
+        let held = pool.snapshot().charged_bytes;
+        assert!(held > baseline);
+        assert_eq!(
+            cursor.reclaim(None, &selection, &reserve, 0).unwrap(),
+            GraphStep::Yielded
+        );
+        assert_eq!(cursor.retained_reclaim_file_for_test(id), before);
+        assert_eq!(pool.snapshot().charged_bytes, held);
+        assert!(
+            matches!(
+                cursor.reclaim(None, &selection, &reserve, 1),
+                Err(GraphRefusal::Identity)
+            ),
+            "no borrowed matching File alias permits a synchronous final close"
+        );
+        assert_eq!(cursor.retained_reclaim_file_for_test(id), before);
+        assert_eq!(pool.snapshot().charged_bytes, held);
+        // SAFETY: F_GETFD observes the original descriptor; no open/poll/native
+        // work between dropping the source and this check can replace its slot.
+        assert!(unsafe { libc::fcntl(actual_fd, libc::F_GETFD) } >= 0);
+        assert!(cursor.pinned().is_none());
+        // The paid cursor is intentionally still retained here. Eventual final
+        // File handoff/abandonment belongs to the later Engine/native port.
     }
 
     #[test]

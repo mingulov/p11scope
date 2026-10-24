@@ -3536,6 +3536,19 @@ trait ScanIo {
     fn maps_now(&self) -> Option<u64> {
         crate::attach::monotonic_ns()
     }
+    /// Raw `/proc/<pid>/stat` text for empty-maps classification
+    /// (kernel-thread detection). The caller reads it under the view's
+    /// generation pin; the default reads the live proc file.
+    fn stat_text(&mut self, view: &ProcessView) -> std::io::Result<String> {
+        std::fs::read_to_string(format!("/proc/{}/stat", view.pid()))
+    }
+    /// Target of `/proc/<pid>/exe` for empty-maps classification
+    /// (zombie/exiting detection: `NotFound` means the executable is gone).
+    /// The caller reads it under the view's generation pin; the default
+    /// reads the live proc link.
+    fn exe_target(&mut self, view: &ProcessView) -> std::io::Result<PathBuf> {
+        std::fs::read_link(format!("/proc/{}/exe", view.pid()))
+    }
     /// The opened object's own `vm_file`, when `map_files` is readable
     /// (`identity::self_mapped_file`).
     fn held_identity(&mut self, file: &File) -> Option<crate::discovery::identity::MappedFile> {
@@ -8997,3 +9010,7 @@ mod tests {
 #[cfg(test)]
 #[path = "export_linkage_tests.rs"]
 mod export_linkage_tests;
+
+#[cfg(test)]
+#[path = "scan_kthread_tests.rs"]
+mod scan_kthread_tests;

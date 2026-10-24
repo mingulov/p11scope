@@ -198,11 +198,11 @@ capture behavior or establish the provenance of its input files.
 - Planned: classic system/cgroup Multi on 6.6–6.8 is probe-gated but not
   yet qualified on those kernels (DR-CLASSIC-F4-66-68, v0.3.0).
 
-### Startup takes ~15–20 s on 5.15/6.1 (sequential BPF verifier), ~4–7 s on 6.6+
+### Startup takes ~15–22 s on 5.15/6.1 (sequential BPF verifier), ~4–7 s on 6.6+
 
 - What the user sees: the observer loads its BPF programs one at a time
   and the kernel verifies each load, so startup (discovery to the
-  `capturing:` line) takes ~15–20 s on 5.15/6.1 but only ~4–7 s on
+  `capturing:` line) takes ~15–22 s on 5.15/6.1 but only ~4–7 s on
   6.6+. Measured FULL default, 208 probes, 4 vCPUs: 6.6.157 4.5–4.9 s,
   host 7.0 6.25–6.6 s, 6.1.188 16.7–17.4 s, 5.15.221 17.0–20.2 s;
   0-probe runs take the same time (5.15 14.8–21.5 s under host load),

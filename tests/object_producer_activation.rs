@@ -837,6 +837,50 @@ fn object_producer_publication_lifts_gate_only_on_attested_lane() {
     );
 }
 
+/// The required-object marker arms only under the allowlisted policy:
+/// entry seeds `object_required` to zero (ordinary) and calls
+/// `object_marker_for` exactly once, inside the allowlisted-policy
+/// branch. Aggregate-only (`metrics`), unsafe-unvalidated-metadata,
+/// the count-only inventory object and P0 builds therefore arm no
+/// marker and perform none of the six-field reads.
+#[test]
+fn object_marker_arms_only_under_allowlisted_policy() {
+    let source = bpf_source();
+    let entry = source_between(
+        &source,
+        "fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContext) -> u32 {",
+        "fn p11_return_impl(ctx: RetProbeContext) -> u32 {",
+    );
+    // The seed starts ordinary: no marker without the policy branch.
+    assert!(
+        entry.contains("object_required: 0,"),
+        "entry must seed object_required to zero (ordinary)"
+    );
+    // Exactly one arming site in entry, and it names the marker helper.
+    assert_eq!(
+        entry.matches("object_marker_for").count(),
+        1,
+        "entry must arm the object marker at exactly one site"
+    );
+    // No other write arms the seed.
+    assert_eq!(
+        entry.matches("seed.object_required =").count(),
+        1,
+        "entry must assign seed.object_required exactly once (the guarded arm)"
+    );
+    // That site lives inside the allowlisted-policy branch, before the
+    // immutable seed is bound to native side allocation.
+    let gate = source_between(
+        entry,
+        "if flags & FLAG_POLICY_ALLOWLISTED != 0 {",
+        "let start_pointer = unsafe { p11_owner_start_begin(&key, &seed) };",
+    );
+    assert!(
+        gate.contains("seed.object_required = object_marker_for(cookie_of(&ctx));"),
+        "the marker call must sit inside the allowlisted-policy branch"
+    );
+}
+
 /// The private validated tail accompanies the owned H3 routed call into
 /// the consuming admission result, but it cannot construct the H9 model:
 /// no ObjectDomain, OriginFact, RefCut, CallToken, CompleteInputPrefix,

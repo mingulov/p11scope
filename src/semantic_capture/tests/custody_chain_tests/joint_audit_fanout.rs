@@ -4391,7 +4391,8 @@ fn joint_machine_collected_finish_resolves_pending_h0_union_once() {
 }
 
 /// A same-domain owner or equal numeric cuts do not replace the original
-/// Capture, ledger, frontier or Q. Refusal leaves a correct retry available.
+/// Capture, ledger, frontier or Q. A foreign Finish Q latches the Finish
+/// disposition (fail closed); a refusal-free original still resolves once.
 #[test]
 fn joint_machine_collected_finish_rejects_foreign_stale_duplicate() {
     let (mut fixture, observer, foreign) = pending_h0_finish_fixture(false);
@@ -4723,20 +4724,40 @@ fn joint_machine_collected_finish_rejects_foreign_stale_duplicate() {
     }
     before.assert_unchanged(&finishing);
     assert!(!finishing.scene.real.lane.is_finished());
-    finishing.finish_published();
-    let completed = FinishCustody::observe(&finishing);
     assert!(
-        finishing.begin_finish().is_err(),
+        finishing.machine.finish_disposition_required(),
+        "a foreign Finish Q latches the disposition"
+    );
+    assert_eq!(
+        finishing.poll_finish(1),
+        Err(SemanticRefusal::Unavailable),
+        "the first latched reason is kept after the owner is restored"
+    );
+    assert!(
+        !finishing.scene.real.lane.is_finished(),
+        "a latched Finish publishes nothing"
+    );
+    before.assert_unchanged(&finishing);
+    // A Finish that saw no refusal still publishes exactly once.
+    let mut clean = MachineScene::new(1);
+    clean.prime(1);
+    clean.enable_finish_fixture(Vec::new());
+    clean.begin_finish().unwrap();
+    clean.reach_finish_stop_ready();
+    clean.finish_published();
+    let completed = FinishCustody::observe(&clean);
+    assert!(
+        clean.begin_finish().is_err(),
         "a finished association is not a new Finish"
     );
     assert!(
         !matches!(
-            finishing.poll_finish(0),
+            clean.poll_finish(0),
             Ok(crate::discovery::engine::inventory_coordinator::JointCommitProgress::Published(_))
         ),
         "the completed Finish receipt is delivered once"
     );
-    completed.assert_unchanged(&finishing);
+    completed.assert_unchanged(&clean);
 }
 
 /// A tight pool refuses before expiry, and a later receiver refusal retains

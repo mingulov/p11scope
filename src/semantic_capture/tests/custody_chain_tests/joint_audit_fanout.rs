@@ -576,7 +576,11 @@ impl crate::inventory_semantics::JointMachineIo for HeldMachineIo<'_> {
         q: &crate::attach::CollectedFinishQ,
         discovery: &crate::events::DiscoveryDomain,
     ) -> Result<usize, SemanticRefusal> {
-        self.validate_finish_q(q)?;
+        // Standalone pending-Q tests borrow their separate original observer;
+        // their strict wrapper/Raw checks do not create a global Finish owner.
+        if self.finish.is_some() {
+            self.validate_finish_q(q)?;
+        }
         self.h0
             .0
             .borrow()
@@ -594,7 +598,9 @@ impl crate::inventory_semantics::JointMachineIo for HeldMachineIo<'_> {
         discovery: &crate::events::DiscoveryDomain,
         report: &mut TickReport,
     ) -> Result<(), SemanticRefusal> {
-        self.validate_finish_q(q)?;
+        if self.finish.is_some() {
+            self.validate_finish_q(q)?;
+        }
         let mut owned = self.h0.0.borrow_mut();
         let HeldH0 { capture, io, .. } = &mut *owned;
         self.native.pending_q_resolutions += 1;

@@ -4756,28 +4756,29 @@ mod conservative_copy {
                     }
                     BindPhase::ClaimTables => {
                         let module = self.module.as_ref().ok_or(GraphRefusal::Identity)?;
-                        if !pins.ownership.contains_key(&module.view) {
-                            let growth = self
-                                .growth
-                                .get(&module.view)
-                                .ok_or(GraphRefusal::Identity)?;
-                            pins.ownership.insert(
-                                module.view,
-                                ViewClaims {
+                        let growth = self
+                            .growth
+                            .get(&module.view)
+                            .ok_or(GraphRefusal::Identity)?;
+                        match pins.ownership.entry(module.view) {
+                            std::collections::btree_map::Entry::Vacant(slot) => {
+                                slot.insert(ViewClaims {
                                     tables: Vec::with_capacity(growth.tables),
                                     targets: Vec::with_capacity(growth.targets),
                                     pins: Vec::with_capacity(growth.pins),
-                                },
-                            );
-                        } else if self.table_pos < module.tables.len() {
-                            pins.ownership
-                                .get_mut(&module.view)
-                                .ok_or(GraphRefusal::Identity)?
-                                .tables
-                                .push(self.object.ok_or(GraphRefusal::Identity)?);
-                            self.table_pos += 1;
-                        } else {
-                            self.phase = BindPhase::ClaimModule;
+                                });
+                            }
+                            std::collections::btree_map::Entry::Occupied(mut slot)
+                                if self.table_pos < module.tables.len() =>
+                            {
+                                slot.get_mut()
+                                    .tables
+                                    .push(self.object.ok_or(GraphRefusal::Identity)?);
+                                self.table_pos += 1;
+                            }
+                            std::collections::btree_map::Entry::Occupied(_) => {
+                                self.phase = BindPhase::ClaimModule;
+                            }
                         }
                     }
                     BindPhase::ClaimModule => {
@@ -4938,19 +4939,19 @@ mod conservative_copy {
                 if self.taken && !self.completed && pins.is_none() {
                     return Err(GraphRefusal::Identity);
                 }
-                if let Some(owner) = pins.as_deref() {
-                    if self.fence.is_some() {
-                        if self.phase == BindPhase::Reclaimed {
-                            let fence = self.fence.ok_or(GraphRefusal::Identity)?;
-                            if owner.output.as_ref().and_then(|output| output.copy_source)
-                                != Some(fence.candidate)
-                                || owner.rebind_owner.is_some_and(|held| held != fence.input)
-                            {
-                                return Err(GraphRefusal::Identity);
-                            }
-                        } else {
-                            self.check_candidate(owner)?;
+                if let Some(owner) = pins.as_deref()
+                    && self.fence.is_some()
+                {
+                    if self.phase == BindPhase::Reclaimed {
+                        let fence = self.fence.ok_or(GraphRefusal::Identity)?;
+                        if owner.output.as_ref().and_then(|output| output.copy_source)
+                            != Some(fence.candidate)
+                            || owner.rebind_owner.is_some_and(|held| held != fence.input)
+                        {
+                            return Err(GraphRefusal::Identity);
                         }
+                    } else {
+                        self.check_candidate(owner)?;
                     }
                 }
                 if self.phase == BindPhase::Reclaimed {

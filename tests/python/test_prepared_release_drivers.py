@@ -242,29 +242,12 @@ class PreparedReleaseDriverTests(unittest.TestCase):
 
     def test_release_static_build_forwards_exact_stable_and_bpf_tools(self):
         fixture = self.fixture("release", "static build paths with spaces")
-        source = (fixture.repo / "scripts/build-release.sh").read_text()
-        start = 'CARGO_TARGET_DIR="$OFFICIAL_TARGET" \\\n'
-        end = 'P11SCOPE_STATIC=$OFFICIAL_TARGET/'
-        self.assertEqual(source.count(start), 1)
-        command = fixture.base / "static-build-command.sh"
-        command.write_text(source[source.index(start):source.index(end)])
-        cargo = fixture.base / "selected stable cargo"
-        shutil.copy2(NATIVE / "release-build-probe.py", cargo)
-        cargo.chmod(0o700)
-        tools = [cargo]
-        for name in ("selected stable rustc", "selected bpf cargo", "selected bpf rustc"):
-            path = fixture.base / name
-            fixture.inert(path)
-            tools.append(path)
-        record = fixture.base / "release-build.json"
-        result = fixture.command([
-            "/bin/sh", str(NATIVE / "release-root-build-launcher.sh"), str(command),
-            str(record), *(str(path) for path in tools),
-        ])
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(record.read_text()), {
+        with patch.dict(os.environ):
+            os.environ.pop("RELEASE_CAPTURE_MODE", None)
+            record, fixture, tools = self.static_build_record(fixture, "static-build")
+        cargo = tools[0]
+        self.assertEqual(record, {
             "argv": ["build", "--locked", "--offline", "--release",
-                     "--no-default-features", "--features", "stub-object-attributes",
                      "--target", "x86_64-unknown-linux-musl",
                      "--bin", "p11scope"],
             "cargo_target_dir": str(fixture.base / "official target with spaces"),

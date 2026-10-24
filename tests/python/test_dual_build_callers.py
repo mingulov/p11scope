@@ -244,8 +244,14 @@ class DualBuildCallerTests(unittest.TestCase):
     def expected(self, child, bits, prepared, diagnose=False, capture_mode="full"):
         prefix = ["build", "--locked", "--offline"] if prepared else [f"+{RELEASE_RUST}", "build", "--locked"]
         if child.name == "verify-attach-e2e.sh":
-            features = "skip-attribution,stub-object-attributes" if diagnose else "stub-object-attributes"
-            return [prefix + ["--release", "--workspace", "--features", features,
+            if capture_mode == "p0":
+                features = "skip-attribution,stub-object-attributes" if diagnose else "stub-object-attributes"
+                return [prefix + ["--release", "--workspace", "--features", features,
+                                  "--target-dir", str(self.work / "build")]]
+            if diagnose:
+                return [prefix + ["--release", "--workspace", "--features", "skip-attribution",
+                                  "--target-dir", str(self.work / "build")]]
+            return [prefix + ["--release", "--workspace",
                               "--target-dir", str(self.work / "build")]]
         stub = ["--features", "stub-object-attributes"] if capture_mode == "p0" else []
         diagnostic = "unsafe-unvalidated-metadata" + (",stub-object-attributes" if stub else "")
@@ -338,12 +344,15 @@ class DualBuildCallerTests(unittest.TestCase):
                 self.assertFalse(self.events.exists())
                 self.assertFalse(self.work.exists())
 
-    def test_release_canary_call_pins_p0_until_full_activation(self):
+    def test_release_canary_call_defaults_to_full_capture_with_p0_option(self):
         commands = [command for command in logical_commands(ROOT / "scripts/build-release.sh")
                     if command.startswith("P11SCOPE_PRODUCT_BUILD_MODE=prepared")
                     and "scripts/verify-canaries.sh" in command]
         self.assertEqual(len(commands), 1)
-        self.assertIn("scripts/verify-canaries.sh --capture-mode p0", commands[0])
+        self.assertIn('scripts/verify-canaries.sh --capture-mode "${RELEASE_CAPTURE_MODE-full}"', commands[0])
+        source = (ROOT / "scripts/build-release.sh").read_text(encoding="utf-8")
+        self.assertIn("RELEASE_CAPTURE_MODE=full", source)
+        self.assertIn("full|p0) RELEASE_CAPTURE_MODE=$2", source)
 
     def prebuilt_canary_inputs(self, bits=64, full=False):
         inputs = self.base / "prebuilt inputs with spaces"
@@ -709,6 +718,7 @@ if "--object-pilot" in args:
         for prepared in (False, True):
             with self.subTest(prepared=prepared):
                 self.assert_builds(CHILDREN[0], 64, prepared, diagnose=True)
+                self.assert_builds(CHILDREN[0], 64, prepared, diagnose=True, capture_mode="p0")
 
     def test_attach_rejects_unknown_or_combined_arguments_before_resources(self):
         self.configure([83])
@@ -1079,16 +1089,17 @@ raise SystemExit({checker_status})
         self.assertEqual(len(commands), 2)
         for command, child, bits in zip(commands, CHILDREN[::-1], (64, 64)):
             with self.subTest(child=child.name):
+                default_environment = dict(self.environment)
+                default_environment.pop("RELEASE_CAPTURE_MODE", None)
                 self.events.unlink(missing_ok=True)
-                expected = self.expected(child, bits, True,
-                                         capture_mode="p0" if child == CHILDREN[1] else "full")
+                expected = self.expected(child, bits, True, capture_mode="full")
                 self.configure([0] * (len(expected) - 1) + [83])
                 command_file = self.base / f"{child.name}.command"
                 command_file.write_text(command, encoding="utf-8")
                 result = subprocess.run(
                     ["sh", str(FIXTURES / "release-handoff-launcher.sh"),
                      str(command_file), *(str(value) for value in self.selected)],
-                    cwd=self.repo, env=self.environment, text=True,
+                    cwd=self.repo, env=default_environment, text=True,
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
                 self.assertEqual(result.returncode, 83, result.stderr)
                 builds = [row for row in self.rows() if row["kind"] == "cargo"]
@@ -1097,6 +1108,21 @@ raise SystemExit({checker_status})
                                     and row["rustc"] == str(self.selected[1])
                                     and row["bpf_cargo"] == str(self.selected[2])
                                     and row["bpf_rustc"] == str(self.selected[3]) for row in builds))
+                self.events.unlink(missing_ok=True)
+                p0_expected = self.expected(child, bits, True, capture_mode="p0")
+                self.configure([0] * (len(p0_expected) - 1) + [83])
+                selected = subprocess.run(
+                    ["sh", str(FIXTURES / "release-handoff-launcher.sh"),
+                     str(command_file), *(str(value) for value in self.selected)],
+                    cwd=self.repo, env=dict(self.environment, RELEASE_CAPTURE_MODE="p0"), text=True,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+                self.assertEqual(selected.returncode, 83, selected.stderr)
+                p0_builds = [row for row in self.rows() if row["kind"] == "cargo"]
+                self.assertEqual([row["argv"] for row in p0_builds], p0_expected)
+                self.assertTrue(all(row["executable"] == str(self.stable_cargo.resolve())
+                                    and row["rustc"] == str(self.selected[1])
+                                    and row["bpf_cargo"] == str(self.selected[2])
+                                    and row["bpf_rustc"] == str(self.selected[3]) for row in p0_builds))
 
     def compiler_free_tripwires(self):
         """The PATH tripwires a delegated `--self-test` may never reach.

@@ -18,16 +18,42 @@ assert_lane_evidence() {
 }
 
 diagnose_skips=0
-case "$#:${1-}" in
-    0:) ;;
-    1:--self-test)
-        assert_lane_evidence --self-test
-        echo "verify-attach-e2e self-test: OK"
-        exit 0
-        ;;
-    1:--diagnose-skips) diagnose_skips=1 ;;
-    *) echo "usage: $0 [--self-test | --diagnose-skips]" >&2; exit 2 ;;
-esac
+capture_mode=full
+capture_selected=0
+while [ "$#" -gt 0 ]; do
+    case $1 in
+        --self-test)
+            [ "$#" -eq 1 ] && [ "$diagnose_skips" -eq 0 ] && [ "$capture_selected" -eq 0 ] || {
+                echo "usage: $0 [--capture-mode full|p0] [--diagnose-skips] | --self-test" >&2
+                exit 2
+            }
+            assert_lane_evidence --self-test
+            echo "verify-attach-e2e self-test: OK"
+            exit 0
+            ;;
+        --diagnose-skips)
+            [ "$diagnose_skips" -eq 0 ] || {
+                echo "usage: $0 [--capture-mode full|p0] [--diagnose-skips] | --self-test" >&2
+                exit 2
+            }
+            diagnose_skips=1
+            shift
+            ;;
+        --capture-mode)
+            [ "$#" -ge 2 ] && [ "$capture_selected" -eq 0 ] || {
+                echo "usage: $0 [--capture-mode full|p0] [--diagnose-skips] | --self-test" >&2
+                exit 2
+            }
+            case $2 in
+                full|p0) capture_mode=$2 ;;
+                *) echo "usage: $0 [--capture-mode full|p0] [--diagnose-skips] | --self-test" >&2; exit 2 ;;
+            esac
+            capture_selected=1
+            shift 2
+            ;;
+        *) echo "usage: $0 [--capture-mode full|p0] [--diagnose-skips] | --self-test" >&2; exit 2 ;;
+    esac
+done
 
 P11SCOPE_PRODUCT_BUILD_MODE=${P11SCOPE_PRODUCT_BUILD_MODE:-ordinary}
 . scripts/product-build.sh
@@ -67,15 +93,26 @@ test -f "$MODULE" || { echo "SoftHSM2 not installed at $MODULE"; exit 1; }
 
 echo "=== build ==="
 rm -rf "$WORK/build"
-# P0-only v0.4.0: the FULL object exceeds the 1M-instruction verifier
-# budget, so the e2e lane builds P0 bytes (attribute gate shut), with
-# or without the skip-attribution diagnostic.
-if [ "$diagnose_skips" -eq 1 ]; then
-    e2e_features="skip-attribution,stub-object-attributes"
-else
-    e2e_features="stub-object-attributes"
-fi
-set -- --release --workspace --features "$e2e_features" --target-dir "$WORK/build"
+# FULL (default features) is the e2e capture mode; P0 (attribute gate
+# shut) stays an explicit --capture-mode p0 selection for the lane where
+# the FULL object still exceeds the 1M-instruction verifier budget.
+case $capture_mode in
+    full)
+        if [ "$diagnose_skips" -eq 1 ]; then
+            set -- --release --workspace --features skip-attribution --target-dir "$WORK/build"
+        else
+            set -- --release --workspace --target-dir "$WORK/build"
+        fi
+        ;;
+    p0)
+        if [ "$diagnose_skips" -eq 1 ]; then
+            e2e_features="skip-attribution,stub-object-attributes"
+        else
+            e2e_features="stub-object-attributes"
+        fi
+        set -- --release --workspace --features "$e2e_features" --target-dir "$WORK/build"
+        ;;
+esac
 p11scope_product_build "$P11SCOPE_PRODUCT_BUILD_MODE" "$@"
 gcc -O0 -o "$WORK/harness" spike/harness.c -ldl
 

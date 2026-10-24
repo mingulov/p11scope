@@ -756,6 +756,15 @@ Limits that matter in pods:
   application app-first-driver [c0 pid 4242 incarnation 0] -> module app-p1.so [m0]: Module mapped; activity not captured; coverage unknown (scan only)
   ```
 
+  The header also carries a key-operation summary line: before Joint
+  delivers object observations it reads
+  `key operations: unavailable (bootstrap_unavailable)`, and once
+  populated it counts completions per operation category, e.g.
+  `key operations: rev 1 populated; 1 session, 3 objects; sign 1 completed, 0 failed, 2 active operations`.
+  The line shows counts per operation category from the
+  `object_observations` section of the JSON report; `--json` has the
+  full rows.
+
   The fixture PID and IDs vary by run. Mapping alone does not prove use;
   `At least N entries observed` counts entries, a lower bound, rather than
   completed operations. Capture loss, unknown counts and no-use intervals

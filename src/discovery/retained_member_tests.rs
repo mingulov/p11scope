@@ -8,6 +8,7 @@ use crate::discovery::caller_registry;
 use crate::discovery::scan::{CaptureWorkBudget, WORK_CEILING_REASON};
 use crate::discovery::sweep_attribution::{FD_RESOURCE_REASON, ReservationOwner, SegmentPolicy};
 use crate::process::{PidPin, generation_gone, process_is_zombie};
+use std::cell::RefCell;
 use std::io::Read as _;
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
@@ -1088,4 +1089,170 @@ fn retained_group_member_rejects_mid_proof_replacement() {
         .validate(test_deadline())
         .expect("re-minted member validates");
     drop(member);
+}
+
+/// An opener that opens the real directory, then kills the worker (a raced
+/// death strictly after the open, converged before returning) so the
+/// post-open bracket is deterministic.
+fn kill_after_open<'a>(
+    worker: &'a RefCell<Option<WaitingThread>>,
+    tgid: u32,
+) -> impl Fn(&std::path::Path) -> Result<OwnedFd, String> + 'a {
+    move |path: &std::path::Path| {
+        let dir = open_dir_fd(path)?;
+        if let Some(victim) = worker.borrow_mut().take() {
+            let tid = victim.tid;
+            victim.kill_and_join();
+            poll_thread_dead(tgid, tid);
+        }
+        Ok(dir)
+    }
+}
+
+/// The first file-backed executable range of this process, for range stats
+/// that must reach the map_files entry itself.
+fn self_executable_file_range() -> (u64, u64) {
+    let maps = std::fs::read_to_string("/proc/self/maps").expect("self maps read");
+    maps.lines()
+        .find_map(|line| {
+            let mut parts = line.split_whitespace();
+            let addrs = parts.next()?;
+            let perms = parts.next()?;
+            if perms.as_bytes().get(2) != Some(&b'x') || !line.contains('/') {
+                return None;
+            }
+            let (start, end) = addrs.split_once('-')?;
+            Some((
+                u64::from_str_radix(start, 16).ok()?,
+                u64::from_str_radix(end, 16).ok()?,
+            ))
+        })
+        .expect("one file-backed executable range exists")
+}
+
+#[test]
+fn retained_group_member_reproves_map_files_open_and_stat() {
+    if !ensure_quiescent_child(
+        "discovery::retained_member::tests::retained_group_member_reproves_map_files_open_and_stat",
+    ) {
+        return;
+    }
+    let tgid = std::process::id();
+    let original = Arc::new(PidPin::open(tgid).expect("self pins"));
+    let owner = test_owner();
+    let mut work = test_budget();
+    let (start, end) = self_executable_file_range();
+    // Phase A: a death raced between the pre-open proof and the open must
+    // refuse the directory (never serve a reused TGID's map_files).
+    let worker = WaitingThread::spawn();
+    let member =
+        RetainedGroupMember::acquire(&original, worker.tid, &owner, &mut work, test_deadline())
+            .expect("live member mints");
+    let victim = RefCell::new(Some(worker));
+    let opener = kill_after_open(&victim, tgid);
+    let before = fd_count();
+    let err = match member.open_map_files_dir_with_opener(&opener) {
+        Ok(_) => panic!("raced death must refuse the directory"),
+        Err(err) => err,
+    };
+    assert!(err.contains("no longer"), "unexpected refusal: {err}");
+    assert_eq!(
+        fd_count(),
+        before,
+        "refused open closes the raced directory"
+    );
+    drop(member);
+    // Phase B: the same raced death refuses the one-shot range stat.
+    let worker = WaitingThread::spawn();
+    let member =
+        RetainedGroupMember::acquire(&original, worker.tid, &owner, &mut work, test_deadline())
+            .expect("live member mints");
+    let victim = RefCell::new(Some(worker));
+    let opener = kill_after_open(&victim, tgid);
+    let before = fd_count();
+    let err = member
+        .stat_map_file_with_opener(start, end, &opener)
+        .expect_err("raced death must refuse the range stat");
+    assert!(err.contains("no longer"), "unexpected refusal: {err}");
+    assert_eq!(
+        fd_count(),
+        before,
+        "refused stat closes the raced directory"
+    );
+    drop(member);
+    // Phase C: a death between the open and the stat refuses even though
+    // the guard opened while live (the proof runs even when the stat
+    // itself fails, so the custody refusal dominates a stale lookup).
+    let worker = WaitingThread::spawn();
+    let tid = worker.tid;
+    let member = RetainedGroupMember::acquire(&original, tid, &owner, &mut work, test_deadline())
+        .expect("live member mints");
+    let guard = member.open_map_files_dir().expect("guard opens while live");
+    worker.kill_and_join();
+    poll_thread_dead(tgid, tid);
+    let before = fd_count();
+    let err = member
+        .test_stat_guarded(&guard, start, end)
+        .expect_err("dead member serves no range identity");
+    assert!(err.contains("no longer"), "unexpected refusal: {err}");
+    assert_eq!(fd_count(), before, "refused stat opens nothing");
+    drop(guard);
+    drop(member);
+}
+
+#[test]
+fn retained_group_member_selector_refuses_fd_exhaustion() {
+    if !ensure_quiescent_child(
+        "discovery::retained_member::tests::retained_group_member_selector_refuses_fd_exhaustion",
+    ) {
+        return;
+    }
+    let worker = WaitingThread::spawn();
+    let original = Arc::new(PidPin::open(std::process::id()).expect("self pins"));
+    let tight = ReservationOwner::new(SegmentPolicy::from_headroom(9, 1, 1));
+    let mut work = test_budget();
+    let member =
+        RetainedGroupMember::acquire(&original, worker.tid, &tight, &mut work, test_deadline())
+            .expect("mint works with headroom");
+    member.selector().expect("selector works with headroom");
+    let held_io = tight.batch().transient().expect("worker pair exists");
+    let before = fd_count();
+    let err = member
+        .selector()
+        .expect_err("exhausted selector refuses like its siblings");
+    assert_eq!(err, FD_RESOURCE_REASON);
+    assert_eq!(fd_count(), before, "refused selector opens nothing");
+    drop(held_io);
+    member
+        .selector()
+        .expect("selector works once leases return");
+    drop(member);
+}
+
+#[test]
+fn retained_group_member_tgkill_gate_detects_live_and_reaped_threads() {
+    use super::thread_alive_in_group;
+    let worker = WaitingThread::spawn();
+    let tgid = std::process::id();
+    assert!(
+        thread_alive_in_group(tgid, worker.tid),
+        "live worker reads alive"
+    );
+    let child_a = PausingChild::spawn();
+    let child_b = PausingChild::spawn();
+    assert!(
+        thread_alive_in_group(child_a.pid, child_a.pid),
+        "live child leader reads alive"
+    );
+    assert!(
+        !thread_alive_in_group(child_a.pid, child_b.pid),
+        "a tid outside the group reads dead"
+    );
+    let dead_tid = worker.tid;
+    worker.kill_and_join();
+    poll_thread_dead(tgid, dead_tid);
+    assert!(
+        !thread_alive_in_group(tgid, dead_tid),
+        "reaped tid reads dead"
+    );
 }

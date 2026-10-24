@@ -2043,14 +2043,11 @@ fn collected_retirement_boxed_q_survives_owner_moves() {
     // Move the owner of the boxed Q into a struct, then into a Vec; the
     // heap Q address stays stable across both moves.
     let holder = MovedHolder { fixture: boxed };
-    let mut holders = vec![holder];
+    let mut holders: Vec<MovedHolder> = std::iter::once(holder).collect();
     begin_to_pending_via_helper(&mut holders[0].fixture, &ticket);
     let polled = holders[0].fixture.collected_poll(&ticket, 1).unwrap();
     assert_eq!(polled.used, 1);
-    assert!(matches!(
-        polled.state,
-        CollectedRetirementState::Pending
-    ));
+    assert!(matches!(polled.state, CollectedRetirementState::Pending));
     assert_eq!(holders[0].fixture.begins, 1);
 
     // A second Q with equal contents but a different address is refused.
@@ -2082,10 +2079,7 @@ fn collected_retirement_boxed_q_survives_owner_moves() {
     collected_submit(&mut native, &q, &second_ticket);
     let pending = native.poll(&q, &second_ticket, 1).unwrap();
     assert_eq!(pending.used, 1);
-    assert!(matches!(
-        pending.state,
-        CollectedRetirementState::Pending
-    ));
+    assert!(matches!(pending.state, CollectedRetirementState::Pending));
 }
 
 fn exact_slot_clone(slot: &Slot) -> Slot {

@@ -4,10 +4,10 @@
 #[cfg(feature = "h6-reexec-diagnostic")]
 use crate::attach::reexec_diagnostic::{Outcome as DiagnosticOutcome, Phase as DiagnosticPhase};
 use crate::attach::{
-    BackendSelection, CapturePolicy, CollectedFinishQ, CollectedRetirementTicket,
-    CounterSnapshot, DetachOutcome, DynamicExportIdentity, DynamicLoaderAttachFailure,
-    OwnedPauseGeneration, ReplacementOutcome, RetainedRetirementInput, RetirementPoll,
-    RetirementProgress, RetirementTicket, Scope, Session,
+    BackendSelection, CapturePolicy, CollectedFinishQ, CollectedRetirementTicket, CounterSnapshot,
+    DetachOutcome, DynamicExportIdentity, DynamicLoaderAttachFailure, OwnedPauseGeneration,
+    ReplacementOutcome, RetainedRetirementInput, RetirementPoll, RetirementProgress,
+    RetirementTicket, Scope, Session,
 };
 use crate::cli::CaptureArgs;
 use crate::discovery::attribution;
@@ -37,9 +37,9 @@ use crate::discovery::sweep_shards;
 use crate::manifest_input::{read_manifest, selection_surface_usable, validate_structure};
 use crate::process::{self, OriginalGenerationState, ProcessView, ProcessViewId, ViewAdmission};
 use crate::run::OwnedChild;
-use crate::{plan, render};
 use crate::semantics_edge::resources::SemanticResourceReserver;
-use anyhow::{Context as _, Result, anyhow, bail, ensure};
+use crate::{plan, render};
+use anyhow::{Context as _, Result, anyhow, bail};
 use p11scope_ebpf_common::{
     DISCOVERY_INTERFACES, DISCOVERY_KIND_EXEC, DISCOVERY_KIND_FUNCTION_LIST_RETURN,
     DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN, DISCOVERY_KIND_INTERFACE_RETURN,
@@ -2805,8 +2805,7 @@ pub(crate) trait EngineSession {
 }
 
 fn require_original_q(q: Option<&CollectedFinishQ>) -> Result<&CollectedFinishQ> {
-    let _ = q;
-    bail!("skeleton")
+    q.context("collected retirement needs the original Q")
 }
 
 impl EngineSession for Session {
@@ -23283,13 +23282,11 @@ pub(crate) mod session_fixture {
             reserve: &SemanticResourceReserver,
             work: usize,
         ) -> Result<RetirementProgress> {
-            ensure!(q.is_none(), "scripted leaf refuses a production Q");
+            anyhow::ensure!(q.is_none(), "scripted leaf refuses a production Q");
             let Some(fixture) = self.global_retirement.as_ref() else {
                 bail!("scripted leaf has no collected carrier");
             };
-            fixture
-                .borrow_mut()
-                .collected_prepare(input, reserve, work)
+            fixture.borrow_mut().collected_prepare(input, reserve, work)
         }
 
         fn begin_collected_static_retirement(
@@ -23298,7 +23295,7 @@ pub(crate) mod session_fixture {
             ticket: &CollectedRetirementTicket,
             work: usize,
         ) -> Result<RetirementProgress> {
-            ensure!(q.is_none(), "scripted leaf refuses a production Q");
+            anyhow::ensure!(q.is_none(), "scripted leaf refuses a production Q");
             let Some(fixture) = self.global_retirement.as_ref() else {
                 bail!("scripted leaf has no collected carrier");
             };
@@ -23311,7 +23308,7 @@ pub(crate) mod session_fixture {
             ticket: &CollectedRetirementTicket,
             work: usize,
         ) -> Result<RetirementProgress> {
-            ensure!(q.is_none(), "scripted leaf refuses a production Q");
+            anyhow::ensure!(q.is_none(), "scripted leaf refuses a production Q");
             let Some(fixture) = self.global_retirement.as_ref() else {
                 bail!("scripted leaf has no collected carrier");
             };

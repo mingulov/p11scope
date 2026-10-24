@@ -7071,8 +7071,7 @@ impl Session {
     }
 
     pub(crate) fn collected_retirement_is_physical_for(backend: AttachBackend) -> bool {
-        let _ = backend;
-        true
+        backend == AttachBackend::Multi
     }
 
     /// Cleanup of an uncompleted new attachment is not coverage retirement.

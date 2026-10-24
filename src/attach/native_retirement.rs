@@ -429,7 +429,10 @@ fn array_bytes_for<T>(values: &Vec<T>) -> Result<usize> {
     array_bytes::<T>(values.capacity())
 }
 
-/// Engine-side measure of removed-input bytes (skeleton: unmeasured).
+/// Engine-side measure of removed-input bytes, using the same per-slot
+/// sizing as the native preflight. The Engine measures each source slot,
+/// whose capacities cover the exact clone it builds, so the lease always
+/// covers the preflight sum.
 pub(crate) struct RetainedInputMeasure {
     bytes: usize,
     sizing: SlotSizing,
@@ -446,9 +449,12 @@ impl RetainedInputMeasure {
     }
 
     pub(crate) fn step(&mut self, source: &Slot) -> Result<bool> {
-        let _ = source;
-        let _ = self.sizing;
-        Ok(true)
+        if self.sizing.step(source, &mut self.bytes)? {
+            self.sizing = SlotSizing::default();
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     pub(crate) fn bytes(&self) -> usize {

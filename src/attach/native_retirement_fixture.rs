@@ -9,6 +9,16 @@ pub(crate) type Closer = Box<
     dyn FnMut(OwnedLink, super::super::ProducerProgram) -> std::result::Result<(), String> + Send,
 >;
 
+struct CollectedLeaf {
+    observer: super::super::CollectedFinishQObserverForTest,
+    producers: super::super::SessionDrainProducers,
+    events: crate::events::EventDrain<crate::events::ScriptedRecords>,
+    reads: std::cell::Cell<(usize, usize)>,
+    transfers: std::cell::Cell<usize>,
+    q: Box<super::super::CollectedFinishQ>,
+    begun: Option<Arc<()>>,
+}
+
 pub(crate) struct RetirementFixture {
     retirement: NativeRetirement,
     links: Vec<RegisteredLink>,
@@ -16,6 +26,7 @@ pub(crate) struct RetirementFixture {
     pairs: PairBook,
     gaps: Retirements,
     worker: CleanupWorker,
+    collected: Option<Box<CollectedLeaf>>,
     pub(crate) begins: usize,
     pub(crate) polls: usize,
 }
@@ -60,6 +71,7 @@ impl RetirementFixture {
                 super::super::cleanup_worker::legacy_test_closer(closer),
                 Arc::new(|| std::time::Duration::ZERO),
             ),
+            collected: None,
             begins: 0,
             polls: 0,
         }
@@ -104,11 +116,34 @@ impl RetirementFixture {
     }
 
     pub(crate) fn new_collected(slots: &[Slot], pins: &PinnedObjects, closer: Closer) -> Self {
-        Self::new(slots, pins, closer)
+        let mut native = Self::new(slots, pins, closer);
+        let (observer, producers, events) = seal_collected(&mut native, slots);
+        assert!(
+            observer
+                .observe(&producers, None, &events)
+                .unwrap()
+                .is_none(),
+            "count0 without actual STOP cannot mint Q"
+        );
+        observer.request_stop();
+        let q = observer
+            .observe(&producers, None, &events)
+            .unwrap()
+            .expect("the retained original observer sees actual STOP/count0");
+        native.collected = Some(Box::new(CollectedLeaf {
+            observer,
+            producers,
+            events,
+            reads: std::cell::Cell::new((0, 0)),
+            transfers: std::cell::Cell::new(0),
+            q: Box::new(q),
+            begun: None,
+        }));
+        native
     }
 
     pub(crate) fn collected_q(&self) -> Option<&super::super::CollectedFinishQ> {
-        None
+        self.collected.as_ref().map(|leaf| &*leaf.q)
     }
 
     pub(crate) fn collected_prepare(
@@ -117,8 +152,33 @@ impl RetirementFixture {
         reserve: &crate::semantics_edge::resources::SemanticResourceReserver,
         work: usize,
     ) -> Result<RetirementProgress> {
-        let _ = (input, reserve, work);
-        bail!("skeleton")
+        let Self {
+            retirement,
+            links,
+            retained,
+            pairs,
+            worker,
+            collected,
+            ..
+        } = self;
+        let Some(leaf) = collected.as_mut() else {
+            bail!("retirement fixture has no collected leaf");
+        };
+        let (events, discovery) = collected_reads(&leaf.observer, &leaf.events, &leaf.reads);
+        retirement.prepare_collected_with(
+            leaf.observer.retained_owner(),
+            &leaf.q,
+            UProbeScope::AllProcesses,
+            input,
+            reserve,
+            links,
+            retained,
+            pairs,
+            worker,
+            events,
+            discovery,
+            work,
+        )
     }
 
     pub(crate) fn collected_begin(
@@ -126,8 +186,53 @@ impl RetirementFixture {
         ticket: &CollectedRetirementTicket,
         work: usize,
     ) -> Result<RetirementProgress> {
-        let _ = (ticket, work);
-        bail!("skeleton")
+        let Self {
+            retirement,
+            links,
+            retained,
+            pairs,
+            gaps,
+            worker,
+            collected,
+            begins,
+            ..
+        } = self;
+        let Some(leaf) = collected.as_mut() else {
+            bail!("retirement fixture has no collected leaf");
+        };
+        let (events, discovery) = collected_reads(&leaf.observer, &leaf.events, &leaf.reads);
+        let transfers = &leaf.transfers;
+        let progress = retirement.begin_collected_with(
+            leaf.observer.retained_owner(),
+            &leaf.q,
+            UProbeScope::AllProcesses,
+            ticket,
+            links,
+            retained,
+            pairs,
+            gaps,
+            worker,
+            |link| {
+                transfers.set(transfers.get() + 1);
+                match link {
+                    RegisteredLink::MultiUProbe { fds, .. } => Ok(vec![OwnedLink::Multi(fds)]),
+                    _ => bail!("unexpected collected fixture ownership"),
+                }
+            },
+            events,
+            discovery,
+            work,
+        )?;
+        if matches!(progress.state, CollectedRetirementState::Pending)
+            && !leaf
+                .begun
+                .as_ref()
+                .is_some_and(|begun| Arc::ptr_eq(begun, &ticket.cursor))
+        {
+            leaf.begun = Some(Arc::clone(&ticket.cursor));
+            *begins += 1;
+        }
+        Ok(progress)
     }
 
     pub(crate) fn collected_poll(
@@ -135,8 +240,25 @@ impl RetirementFixture {
         ticket: &CollectedRetirementTicket,
         work: usize,
     ) -> Result<RetirementProgress> {
-        let _ = (ticket, work);
-        bail!("skeleton")
+        let Self {
+            retirement,
+            worker,
+            collected,
+            ..
+        } = self;
+        let Some(leaf) = collected.as_mut() else {
+            bail!("retirement fixture has no collected leaf");
+        };
+        let (events, discovery) = collected_reads(&leaf.observer, &leaf.events, &leaf.reads);
+        retirement.poll_collected_with(
+            leaf.observer.retained_owner(),
+            &leaf.q,
+            ticket,
+            worker,
+            events,
+            discovery,
+            work,
+        )
     }
 
     pub(crate) fn collected_cancel(
@@ -145,8 +267,8 @@ impl RetirementFixture {
         ticket: Option<&CollectedRetirementTicket>,
         work: usize,
     ) -> Result<RetirementProgress> {
-        let _ = (input, ticket, work);
-        bail!("skeleton")
+        self.retirement
+            .cancel_collected_with(input, ticket, &self.worker, work)
     }
 }
 

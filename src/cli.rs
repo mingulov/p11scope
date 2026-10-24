@@ -425,6 +425,9 @@ ends a capture cleanly (final frame printed, -o written). --cgroup matches that 
 every descendant (kernel >= 5.15). --system requests whole-machine capture with
 no cgroup path. Aggregate across the selected scope; counts are not per application.
 Inventory usage entries and trace completed events have separate attribution rules.
+--counter-mode counts|timestamps|latency is reserved for profile or run with --mode metrics.
+Explicit selections are unavailable in this checkpoint and return counter-mode-unwired
+before capture setup or owned-child launch. Omit --counter-mode to keep existing metrics behavior.
 Provider identity is pinned by SHA-256 at attach and
 checked for in-place change during capture (evidence.provider_changed).
 trace without --max-events still stops at a 10,000,000-event default cap; the TRUNCATED line cites the effective cap.
@@ -3702,8 +3705,8 @@ mod tests {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(1099511628211);
         }
-        assert_eq!(USAGE.len(), 6398);
-        assert_eq!(hash, 0x6a8633ab05c948c6);
+        assert_eq!(USAGE.len(), 6677);
+        assert_eq!(hash, 0xae14707a193f1c16);
         assert_eq!(HelpTopic::Global.text(), USAGE);
     }
 

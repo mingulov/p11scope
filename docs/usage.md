@@ -25,6 +25,11 @@ implementation limits are code contracts, not measurements.
 > boundary, and the [profile schema](schema/observed-profile-v3.md) defines
 > public evidence and its authority.
 
+`--counter-mode counts|timestamps|latency` is reserved for `profile` or `run`
+with `--mode metrics`. Explicit selections are unavailable in this checkpoint
+and return `counter-mode-unwired` before capture setup or owned-child launch.
+Omit `--counter-mode` to keep existing metrics behavior.
+
 - [What it does](#what-it-does)
 - [What it does NOT intentionally decode](#what-it-does-not-intentionally-decode)
 - [Quickstart](#quickstart)

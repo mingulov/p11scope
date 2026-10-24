@@ -67,12 +67,7 @@ const HOSTILE_PROVIDERS: &[&str] = &[
 
 /// Builds `name` from `source`, recording the name so each test can assert it
 /// built exactly its [`HOSTILE_PROVIDERS`] slice.
-fn build_tracked<'a>(
-    dir: &Path,
-    built: &mut Vec<&'a str>,
-    name: &'a str,
-    source: &str,
-) -> PathBuf {
+fn build_tracked<'a>(dir: &Path, built: &mut Vec<&'a str>, name: &'a str, source: &str) -> PathBuf {
     built.push(name);
     build_provider(dir, name, source)
 }

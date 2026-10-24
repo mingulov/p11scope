@@ -2175,6 +2175,11 @@ impl CollectedFinishQ {
         })
     }
 
+    /// Observation metadata only: Q does not acquire a later admission grant.
+    pub(crate) fn observed_without_grant(&self) -> bool {
+        self.grant.is_none()
+    }
+
     pub(crate) fn events_stop(&self) -> usize {
         self.events.producer_bound()
     }

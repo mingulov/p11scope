@@ -767,10 +767,10 @@ impl LiveJointMachine {
         let q = finish.q.as_ref().expect("owned observed Q");
         let discovery = io.finish_discovery_domain()?.clone();
         if !q.matches_owner(&self.producers, &discovery)
-            || self
-                .grant
-                .as_ref()
-                .is_some_and(|grant| !q.matches_retained_grant(grant))
+            || self.grant.as_ref().is_some_and(|grant| {
+                !q.matches_retained_grant(grant)
+                    && !(q.observed_without_grant() && grant.matches_producers(&self.producers))
+            })
         {
             return Err(SemanticRefusal::Unavailable);
         }
@@ -795,7 +795,10 @@ impl LiveJointMachine {
         while budget.available() {
             if matches!(self.phase.as_ref(), Some(Phase::AwaitH0(original)) if original.raw.h0_waiting())
             {
-                self.resolve_pending_h0_at_q_with_io(lane, coordinator, io, q, &discovery, budget)?;
+                // The owned Finish guard above permits only its first genuine
+                // Raw-minted grant after an observed None. Q itself stays
+                // unchanged; the standalone pending-Q wrapper remains strict.
+                self.resolve_checked_pending_h0_at_q(lane, coordinator, io, q, &discovery, budget)?;
                 return Ok(JointCommitProgress::Pending);
             }
             let phase = self.phase.take().expect("retained original Finish phase");
@@ -874,6 +877,21 @@ impl LiveJointMachine {
         {
             return Err(SemanticRefusal::Unavailable);
         }
+        self.resolve_checked_pending_h0_at_q(lane, coordinator, io, q, discovery, budget)
+    }
+
+    /// Reuse the actual original resolution after the caller's Q/grant guard.
+    /// Every report/expiry still checks the same Raw, ledger and Capture.
+    #[allow(clippy::too_many_arguments)] // Keep disjoint owners and their shared work budget borrowed.
+    fn resolve_checked_pending_h0_at_q<I: JointMachineIo>(
+        &mut self,
+        lane: &mut AttestedSemanticLane,
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        io: &mut I,
+        q: &CollectedFinishQ,
+        discovery: &DiscoveryDomain,
+        budget: &mut JointWorkBudget,
+    ) -> Result<JointServiceProgress, SemanticRefusal> {
         if let Some(Phase::PendingQ { original, .. }) = self.phase.as_ref() {
             original
                 .raw
@@ -1859,6 +1877,28 @@ impl LiveJointMachine {
                     return (Phase::Ingesting(original), Ok(Step::Continue));
                 }
                 if let Some(input) = prepared.admission_at(cursor) {
+                    if self.grant.is_none()
+                        && let Some(q) = q
+                    {
+                        let discovery = retain_on_refusal!(
+                            Phase::BindingKeys { original, cursor },
+                            io.finish_discovery_domain()
+                        );
+                        // A later association comes only from this machine's
+                        // real prepared original, never Q's optional metadata.
+                        retain_on_refusal!(
+                            Phase::BindingKeys { original, cursor },
+                            original
+                                .raw
+                                .validate_preparation(owner.adapter(), &self.producers)
+                        );
+                        retain_on_refusal!(
+                            Phase::BindingKeys { original, cursor },
+                            original
+                                .raw
+                                .validate_collected_q(&self.producers, discovery, q)
+                        );
+                    }
                     if owner.adapter_mut().bind_admitted_key(input).is_ok() && self.grant.is_none()
                     {
                         let grant = retain_on_refusal!(

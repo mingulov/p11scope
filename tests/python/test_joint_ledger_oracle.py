@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""R2 T0 per-call ledger fixture/oracle foundation twins.
+"""Per-call ledger fixture/oracle foundation twins.
 
 The oracle (scripts/joint-ledger-oracle.py) validates the independent
 per-call ledger emitted by tests/fixtures/joint-ledger/per-call-ledger.c:
@@ -14,10 +14,13 @@ and validate the real emitted ledger.
 """
 
 import importlib.util
+import io
 import json
+import os
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -69,6 +72,81 @@ def write_jsonl(path, rows):
     with open(path, "w", encoding="utf-8") as stream:
         for row in rows:
             stream.write(json.dumps(row) + "\n")
+
+
+COUNTING_PROVIDER = """/* Test-only counting stub: one-pointer-arg entries plus the marker export. */
+#define _GNU_SOURCE
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+typedef struct {
+    unsigned char major, minor;
+    unsigned char reserved[6];
+    void *functions[104];
+} CountTable;
+int P11ScopeSlot68;
+static unsigned long count_calls(void **out) {
+    (void)out;
+    const char *path = getenv("P11SCOPE_T0_COUNT_PATH");
+    if (path != NULL) {
+        FILE *sink = fopen(path, "a");
+        if (sink != NULL) {
+            fputc('.', sink);
+            fclose(sink);
+        }
+    }
+    return 0;
+}
+static unsigned long count_noop(void **out) {
+    (void)out;
+    return 0;
+}
+static CountTable count_table;
+__attribute__((constructor)) static void count_init(void) {
+    count_table.major = 3;
+    count_table.minor = 2;
+    for (int i = 0; i < 104; i++) {
+        count_table.functions[i] = (void *)count_noop;
+    }
+    count_table.functions[4] = (void *)count_calls;
+}
+unsigned long C_GetFunctionList(void **out) {
+    if (out == NULL) {
+        return 7;
+    }
+    *out = &count_table;
+    return 0;
+}
+"""
+
+REFUSAL_PROVIDER = """/* Test-only non-stub provider: no marker export, so the stub-only emitter refuses it. */
+#define _GNU_SOURCE
+#include <stddef.h>
+typedef struct {
+    unsigned char major, minor;
+    unsigned char reserved[6];
+    void *functions[104];
+} PlainTable;
+static unsigned long plain_noop(void **out) {
+    (void)out;
+    return 0;
+}
+static PlainTable plain_table;
+__attribute__((constructor)) static void plain_init(void) {
+    plain_table.major = 2;
+    plain_table.minor = 40;
+    for (int i = 0; i < 104; i++) {
+        plain_table.functions[i] = (void *)plain_noop;
+    }
+}
+unsigned long C_GetFunctionList(void **out) {
+    if (out == NULL) {
+        return 7;
+    }
+    *out = &plain_table;
+    return 0;
+}
+"""
 
 
 class LedgerOracleTwins(unittest.TestCase):
@@ -173,6 +251,140 @@ class LedgerOracleTwins(unittest.TestCase):
             oracle.compare_settlement(
                 rows, events, p99_ns=250_000_000, min_rate_per_s=10**18)
 
+    def test_mutation_duplicate_event_rejected(self):
+        oracle = require_oracle(self)
+        rows = healthy_rows()
+        events = healthy_events(rows)
+        events.append(dict(events[0]))
+        with self.assertRaisesRegex(oracle.LedgerError, "duplicate event"):
+            oracle.compare_settlement(rows, events)
+
+    def test_mutation_unknown_event_seq_rejected(self):
+        oracle = require_oracle(self)
+        rows = healthy_rows()
+        events = healthy_events(rows)
+        events[0]["ledger_seq"] = 999
+        with self.assertRaisesRegex(oracle.LedgerError, "unknown seq"):
+            oracle.compare_settlement(rows, events)
+
+    def test_mutation_negative_latency_rejected(self):
+        oracle = require_oracle(self)
+        rows = healthy_rows()
+        events = healthy_events(rows)
+        calls = [row for row in rows if row["kind"] == "call"]
+        events[0]["at_ns"] = calls[0]["t1"] - 1
+        with self.assertRaisesRegex(oracle.LedgerError, "precedes END t1"):
+            oracle.compare_settlement(rows, events)
+
+    def test_mutation_tid_mismatch_rejected(self):
+        oracle = require_oracle(self)
+        rows = healthy_rows()
+        rows[5]["tid"] += 1
+        with self.assertRaisesRegex(oracle.LedgerError, "tid"):
+            oracle.validate_ledger(rows)
+
+    def test_mutation_clock_basis_mismatch_rejected(self):
+        oracle = require_oracle(self)
+        rows = healthy_rows()
+        rows[0]["clock"] = "CLOCK_REALTIME"
+        with self.assertRaisesRegex(oracle.LedgerError, "clock basis"):
+            oracle.validate_ledger(rows)
+        rows = healthy_rows()
+        rows[0]["unit"] = "ms"
+        with self.assertRaisesRegex(oracle.LedgerError, "clock unit"):
+            oracle.validate_ledger(rows)
+
+    def test_mutation_non_call_row_rejected(self):
+        oracle = require_oracle(self)
+        rows = healthy_rows()
+        rows[3] = {"kind": "gap", "index": 0}
+        with self.assertRaisesRegex(oracle.LedgerError, "non-call"):
+            oracle.validate_ledger(rows)
+
+    def test_mutation_ack_before_ready_rejected(self):
+        oracle = require_oracle(self)
+        rows = healthy_rows()
+        rows[-1]["t"] = rows[0]["t"] - 1
+        with self.assertRaisesRegex(oracle.LedgerError, "ack precedes"):
+            oracle.validate_ledger(rows)
+
+    def test_mutation_duplicate_json_key_rejected(self):
+        oracle = require_oracle(self)
+        line = ('{"kind": "ready", "pid": 1, "tid": 1, "t": 2,'
+                ' "clock": "CLOCK_MONOTONIC", "unit": "ns", "pid": 2}\n')
+        with self.assertRaisesRegex(oracle.LedgerError, "duplicate JSON key"):
+            oracle.read_ledger(io.StringIO(line))
+
+    def test_mutation_fn_label_rejected(self):
+        oracle = require_oracle(self)
+        rows = healthy_rows()
+        rows[2]["fn"] = "table[4];id"
+        with self.assertRaisesRegex(oracle.LedgerError, "fn label invalid"):
+            oracle.validate_ledger(rows)
+        rows = healthy_rows()
+        rows[2]["fn"] = ""
+        with self.assertRaisesRegex(oracle.LedgerError, "fn label invalid"):
+            oracle.validate_ledger(rows)
+
+    def test_mutation_rv_out_of_range_rejected(self):
+        oracle = require_oracle(self)
+        rows = healthy_rows()
+        rows[2]["rv"] = 2 ** 64
+        with self.assertRaisesRegex(oracle.LedgerError, "rv out of range"):
+            oracle.validate_ledger(rows)
+        rows = healthy_rows()
+        rows[2]["rv"] = -1
+        with self.assertRaisesRegex(oracle.LedgerError, "rv out of range"):
+            oracle.validate_ledger(rows)
+
+    def test_mutation_line_byte_limit_rejected(self):
+        oracle = require_oracle(self)
+        with self.assertRaisesRegex(oracle.LedgerError, "byte limit"):
+            oracle.read_ledger(io.StringIO("x" * 4097 + "\n"))
+
+    def test_boundary_count_200000_passes(self):
+        oracle = require_oracle(self)
+        rows = healthy_rows(calls=200000)
+        text = "\n".join(json.dumps(row) for row in rows) + "\n"
+        with io.StringIO(text) as stream:
+            read = oracle.read_ledger(stream)
+        summary = oracle.validate_ledger(read)
+        self.assertEqual(summary["issued"], 200000)
+        self.assertEqual(summary["calls"], 200000)
+
+    def test_mutation_row_limit_rejected(self):
+        oracle = require_oracle(self)
+        with self.assertRaisesRegex(oracle.LedgerError, "row limit"):
+            oracle.read_ledger(io.StringIO("{}\n" * 200003))
+
+    def test_cli_refusal_reports_p99_numbers(self):
+        require_oracle(self)
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Path(tmp) / "ledger.jsonl"
+            events_path = Path(tmp) / "events.jsonl"
+            write_jsonl(ledger, healthy_rows())
+            write_jsonl(events_path, healthy_events(healthy_rows()))
+            completed = subprocess.run(
+                ["python3", "-I", str(ORACLE_PATH), str(ledger), str(events_path),
+                 "--p99-ns", "500"],
+                capture_output=True, text=True, timeout=60)
+            self.assertEqual(completed.returncode, 1)
+            self.assertRegex(completed.stderr,
+                             r"ledger refused: p99 1000 exceeds budget 500")
+
+    def test_cli_refusal_reports_reason(self):
+        require_oracle(self)
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Path(tmp) / "ledger.jsonl"
+            rows = healthy_rows()
+            rows[-1] = {"kind": "ack", "issued": 24, "t": rows[-1]["t"]}
+            write_jsonl(ledger, rows)
+            completed = subprocess.run(
+                ["python3", "-I", str(ORACLE_PATH), str(ledger)],
+                capture_output=True, text=True, timeout=60)
+            self.assertEqual(completed.returncode, 1)
+            self.assertIn("issued 24 disagrees with 25 call rows", completed.stderr)
+
 
 class LedgerEmissionTests(unittest.TestCase):
     def build_pair(self, tmp):
@@ -248,6 +460,113 @@ class LedgerEmissionTests(unittest.TestCase):
                 [str(fixture), str(provider), "104", "5", str(ledger)],
                 capture_output=True, text=True, timeout=60)
             self.assertNotEqual(completed.returncode, 0)
+            self.assertFalse(ledger.exists())
+
+    def build_fixture(self, tmp):
+        if not shutil.which("gcc"):
+            self.skipTest("requires gcc; installs nothing")
+        if not FIXTURE_SRC.is_file():
+            self.fail(f"fixture missing: {FIXTURE_SRC} (T0 implementation not present)")
+        fixture = Path(tmp) / "per-call-ledger"
+        build = subprocess.run(
+            ["gcc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
+             str(FIXTURE_SRC), "-ldl", "-o", str(fixture)],
+            capture_output=True, text=True, timeout=120)
+        self.assertEqual(build.returncode, 0, build.stderr)
+        return fixture
+
+    def build_inline_provider(self, tmp, name, source):
+        if not shutil.which("gcc"):
+            self.skipTest("requires gcc; installs nothing")
+        provider_c = Path(tmp) / (name + ".c")
+        provider = Path(tmp) / (name + ".so")
+        provider_c.write_text(source, encoding="utf-8")
+        build = subprocess.run(
+            ["gcc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
+             "-fPIC", "-shared", "-Wl,-z,defs",
+             "-o", str(provider), str(provider_c)],
+            capture_output=True, text=True, timeout=120)
+        self.assertEqual(build.returncode, 0, build.stderr)
+        return provider
+
+    def test_fixture_calls_provider_for_every_row(self):
+        oracle = require_oracle(self)
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self.build_fixture(tmp)
+            provider = self.build_inline_provider(tmp, "count", COUNTING_PROVIDER)
+            ledger = Path(tmp) / "ledger.jsonl"
+            witness = Path(tmp) / "count"
+            env = dict(os.environ, P11SCOPE_T0_COUNT_PATH=str(witness))
+            completed = subprocess.run(
+                [str(fixture), str(provider), "4", "5", str(ledger)],
+                capture_output=True, text=True, timeout=60, env=env)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            with open(ledger, encoding="utf-8") as stream:
+                summary = oracle.validate_ledger(oracle.read_ledger(stream))
+            self.assertEqual(summary["issued"], 5)
+            self.assertEqual(witness.stat().st_size, 5)
+
+    def test_fixture_waits_for_go(self):
+        oracle = require_oracle(self)
+        with tempfile.TemporaryDirectory() as tmp:
+            provider, fixture = self.build_pair(tmp)
+            ledger = Path(tmp) / "ledger.jsonl"
+            gate = Path(tmp) / "GO"
+            child = subprocess.Popen(
+                [str(fixture), str(provider), "4", "5", str(ledger), str(gate)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            stderr = ""
+            try:
+                line = child.stdout.readline()
+                self.assertIn(f"READY pid={child.pid}", line)
+                time.sleep(0.5)
+                self.assertFalse(ledger.exists())
+                gate.touch()
+                _, stderr = child.communicate(timeout=60)
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                    child.communicate(timeout=10)
+            self.assertEqual(child.returncode, 0, stderr)
+            with open(ledger, encoding="utf-8") as stream:
+                summary = oracle.validate_ledger(oracle.read_ledger(stream))
+            self.assertEqual(summary["issued"], 5)
+
+    def test_fixture_refuses_nonstub_provider(self):
+        require_oracle(self)
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self.build_fixture(tmp)
+            provider = self.build_inline_provider(tmp, "plain", REFUSAL_PROVIDER)
+            ledger = Path(tmp) / "ledger.jsonl"
+            completed = subprocess.run(
+                [str(fixture), str(provider), "4", "5", str(ledger)],
+                capture_output=True, text=True, timeout=60)
+            self.assertEqual(completed.returncode, 2)
+            self.assertIn("stub", completed.stderr)
+            self.assertFalse(ledger.exists())
+
+    def test_fixture_stop_flag_interrupts_wait(self):
+        require_oracle(self)
+        with tempfile.TemporaryDirectory() as tmp:
+            provider, fixture = self.build_pair(tmp)
+            ledger = Path(tmp) / "ledger.jsonl"
+            gate = Path(tmp) / "GO"
+            child = subprocess.Popen(
+                [str(fixture), str(provider), "4", "5", str(ledger), str(gate)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            stderr = ""
+            try:
+                line = child.stdout.readline()
+                self.assertIn(f"READY pid={child.pid}", line)
+                self.assertFalse(ledger.exists())
+                child.terminate()
+                _, stderr = child.communicate(timeout=10)
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                    child.communicate(timeout=10)
+            self.assertEqual(child.returncode, 2)
+            self.assertIn("gate", stderr)
             self.assertFalse(ledger.exists())
 
 

@@ -44450,3 +44450,77 @@ fn collected_finish_disposes_settled_retirement_frame_without_admission() {
     );
     assert!(case.session.dynamic_attach_calls.is_empty());
 }
+
+#[test]
+fn collected_finish_pending_graph_retains_actual_view_and_id() {
+    let (child, mut engine, _) = engine_with_one_accepted_provider();
+    let mut child = SystemScopeChildGuard::new(child);
+    engine.scope = Scope::System;
+    let view = engine.views[0].id();
+    let admission = engine.views[0].view_admission();
+    let provider = engine.plan.slots[0].object;
+    assert!(engine.pinned.view_claims(view).is_some());
+    assert!(
+        engine
+            .modules
+            .iter()
+            .any(|module| module.scanned.view == view)
+    );
+    assert!(engine.pinned.summary(provider).is_some());
+    child.reap().unwrap();
+    assert_eq!(engine.views[0].original_exited(), Ok(true));
+    let mut session = ScriptedSession::default();
+    engine.update_counter_snapshot(&session).unwrap();
+    engine.dispatch_lifecycle_record(
+        &mut session,
+        &collected_finish_leader_exit(child.pid()),
+        &mut PendingViewRetirements::new(),
+    );
+    assert!(engine.pending_leader_exit_views.contains(&view));
+    let reads = session.counter_reads();
+    let zero = engine
+        .service_collected_finish_records(&mut session, Vec::new(), 0, 0)
+        .unwrap();
+    assert!(zero.pending && !zero.progressed);
+    assert_eq!(session.counter_reads(), reads);
+    assert!(engine.views[0].view_admission().same_allocation(&admission));
+
+    let mut observed_graph = false;
+    for _ in 0..32 {
+        let progress = engine
+            .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+            .unwrap();
+        let graph_retained = engine
+            .modules
+            .iter()
+            .any(|module| module.scanned.view == view)
+            || engine.pinned.view_claims(view).is_some()
+            || engine.pending_retirements.contains(&view);
+        if graph_retained {
+            observed_graph = true;
+            let actual_view_retained = engine.views.iter().any(|owner| {
+                owner.id() == view && owner.view_admission().same_allocation(&admission)
+            });
+            // Exercise the actual allocator, not merely a numeric debt set.
+            let probe = engine.allocate_view_id().unwrap();
+            let original_id_reusable = probe == view;
+            engine.release_view_id(probe);
+            assert!(
+                progress.pending && actual_view_retained && !original_id_reusable,
+                "graph custody is still required: pending={} actual_view={} id_reusable={}",
+                progress.pending,
+                actual_view_retained,
+                original_id_reusable,
+            );
+        }
+        if !progress.pending {
+            break;
+        }
+    }
+    assert!(
+        observed_graph,
+        "the control must reach actual retained graph inputs"
+    );
+    assert_eq!(engine.deep_scans, 0);
+    assert!(session.attached_slots.is_empty() && session.dynamic_attach_calls.is_empty());
+}

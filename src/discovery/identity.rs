@@ -10782,14 +10782,6 @@ mod tests {
                             "the old actual pin allocation remains held alongside fresh backing"
                         );
                         previous = actual.len();
-                        if cancel {
-                            rebind.cancel();
-                            assert!(matches!(
-                                pins.poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1),
-                                Err(GraphRefusal::Cancelled)
-                            ));
-                            break;
-                        }
                     } else if observed_growth && previous < expected_prefix.len() {
                         assert!(
                             actual.len() <= previous + 1,
@@ -10805,6 +10797,74 @@ mod tests {
                         {
                             released_original = true;
                         }
+                    }
+
+                    if cancel
+                        && observed_growth
+                        && actual.len() > 0
+                        && actual.len() < expected_prefix.len()
+                    {
+                        let current = &pins.reference_rebind_claims_for_test(view).unwrap().pins;
+                        let custody = (current.as_ptr(), current.len(), current.capacity());
+                        let held = pool.snapshot();
+                        let allocated = crate::test_alloc::armed_requested_snapshot();
+                        let pending = (
+                            input.is_none(),
+                            pins.pinned().is_none(),
+                            rebind.modules().is_none(),
+                        );
+                        assert_eq!(pending, (true, true, true));
+                        assert!(matches!(
+                            rebind.reclaim(None, &reserve, 1),
+                            Err(GraphRefusal::Identity)
+                        ));
+                        let current = &pins.reference_rebind_claims_for_test(view).unwrap().pins;
+                        assert_eq!(
+                            (current.as_ptr(), current.len(), current.capacity()),
+                            custody
+                        );
+                        assert_eq!(&current[..], &expected_prefix[..current.len()]);
+                        assert_eq!(pool.snapshot(), held);
+                        assert_eq!(crate::test_alloc::armed_requested_snapshot(), allocated);
+                        // Normal binding still advances: ownerless refusal did not switch the
+                        // original live transfer into its reclaim phase.
+                        assert_eq!(
+                            pins.poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1)
+                                .unwrap(),
+                            GraphStep::Advanced
+                        );
+                        let current = &pins.reference_rebind_claims_for_test(view).unwrap().pins;
+                        assert!(current.len() > 0 && current.len() < expected_prefix.len());
+                        assert_eq!(&current[..], &expected_prefix[..current.len()]);
+                        let custody = (current.as_ptr(), current.len(), current.capacity());
+                        rebind.cancel();
+                        let held = pool.snapshot();
+                        let allocated = crate::test_alloc::armed_requested_snapshot();
+                        assert!(matches!(
+                            rebind.reclaim(None, &reserve, 1),
+                            Err(GraphRefusal::Identity)
+                        ));
+                        let current = &pins.reference_rebind_claims_for_test(view).unwrap().pins;
+                        assert_eq!(
+                            (current.as_ptr(), current.len(), current.capacity()),
+                            custody
+                        );
+                        assert_eq!(&current[..], &expected_prefix[..current.len()]);
+                        assert_eq!(
+                            (
+                                input.is_none(),
+                                pins.pinned().is_none(),
+                                rebind.modules().is_none()
+                            ),
+                            pending
+                        );
+                        assert_eq!(pool.snapshot(), held);
+                        assert_eq!(crate::test_alloc::armed_requested_snapshot(), allocated);
+                        assert!(matches!(
+                            pins.poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1),
+                            Err(GraphRefusal::Cancelled)
+                        ));
+                        break;
                     }
                     if step == GraphStep::Ready {
                         break;
@@ -10927,14 +10987,6 @@ mod tests {
                                 "old and fresh actual skip buffers overlap until prefix transfer finishes"
                             );
                             previous = actual.len();
-                            if cancel {
-                                rebind.cancel();
-                                assert!(matches!(
-                                    pins.poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1),
-                                    Err(GraphRefusal::Cancelled)
-                                ));
-                                break;
-                            }
                         } else if observed_growth && previous < expected_prefix.len() {
                             assert!(
                                 actual.len() <= previous + 1,
@@ -10950,6 +11002,72 @@ mod tests {
                             {
                                 released_original = true;
                             }
+                        }
+
+                        if cancel
+                            && observed_growth
+                            && actual.len() > 0
+                            && actual.len() < expected_prefix.len()
+                        {
+                            let (capacity, current) =
+                                rebind.reference_current_unpinned_for_test().unwrap();
+                            let custody = (current.as_ptr(), current.len(), capacity);
+                            let held = pool.snapshot();
+                            let allocated = crate::test_alloc::armed_requested_snapshot();
+                            let pending = (
+                                input.is_none(),
+                                pins.pinned().is_none(),
+                                rebind.modules().is_none(),
+                            );
+                            assert_eq!(pending, (true, true, true));
+                            assert!(matches!(
+                                rebind.reclaim(None, &reserve, 1),
+                                Err(GraphRefusal::Identity)
+                            ));
+                            let (capacity, current) =
+                                rebind.reference_current_unpinned_for_test().unwrap();
+                            assert_eq!((current.as_ptr(), current.len(), capacity), custody);
+                            assert_eq!(&current[..], &expected_prefix[..current.len()]);
+                            assert_eq!(pool.snapshot(), held);
+                            assert_eq!(crate::test_alloc::armed_requested_snapshot(), allocated);
+                            // Normal binding still advances: ownerless refusal did not switch the
+                            // original live transfer into its reclaim phase.
+                            assert_eq!(
+                                pins.poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1)
+                                    .unwrap(),
+                                GraphStep::Advanced
+                            );
+                            let (capacity, current) =
+                                rebind.reference_current_unpinned_for_test().unwrap();
+                            assert!(current.len() > 0 && current.len() < expected_prefix.len());
+                            assert_eq!(&current[..], &expected_prefix[..current.len()]);
+                            let custody = (current.as_ptr(), current.len(), capacity);
+                            rebind.cancel();
+                            let held = pool.snapshot();
+                            let allocated = crate::test_alloc::armed_requested_snapshot();
+                            assert!(matches!(
+                                rebind.reclaim(None, &reserve, 1),
+                                Err(GraphRefusal::Identity)
+                            ));
+                            let (capacity, current) =
+                                rebind.reference_current_unpinned_for_test().unwrap();
+                            assert_eq!((current.as_ptr(), current.len(), capacity), custody);
+                            assert_eq!(&current[..], &expected_prefix[..current.len()]);
+                            assert_eq!(
+                                (
+                                    input.is_none(),
+                                    pins.pinned().is_none(),
+                                    rebind.modules().is_none()
+                                ),
+                                pending
+                            );
+                            assert_eq!(pool.snapshot(), held);
+                            assert_eq!(crate::test_alloc::armed_requested_snapshot(), allocated);
+                            assert!(matches!(
+                                pins.poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1),
+                                Err(GraphRefusal::Cancelled)
+                            ));
+                            break;
                         }
                     }
                     if step == GraphStep::Ready {

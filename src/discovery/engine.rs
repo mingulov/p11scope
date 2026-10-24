@@ -3596,8 +3596,21 @@ struct GraphBacking {
     storage: Option<ResourceLease>,
 }
 
-/// Raw scanned-module copy cursor (§1.6). Shaped by T4a.
+/// Raw scanned-module copy cursor (§1.6). Inert skeleton: T4a fills the
+/// stepped exact copy; steps report no progress until then.
 struct ScannedModuleCopy;
+
+#[allow(dead_code)] // Skeleton: the T4a implementation commit drops this.
+impl ScannedModuleCopy {
+    fn new() -> Self {
+        Self
+    }
+
+    /// One copy leaf; inert until T4a lands (never completes).
+    fn step(&mut self, _source: &ScannedModule, _rows: &mut Vec<ScannedModule>) -> bool {
+        false
+    }
+}
 
 /// Removed-slot copy cursor (§1.6). Shaped by T4b.
 struct SlotCopy;

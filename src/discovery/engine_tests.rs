@@ -46590,3 +46590,409 @@ fn graph_inputs_epoch_bumps_on_mutating_entry_points() {
     engine.report_discovery_noise();
     assert_eq!(engine.graph_inputs_epoch_for_test(), epoch);
 }
+
+/// T4a helper: service collected Finish until the boxed graph reaches
+/// `phase`. Panics with the last observed phase when the bound runs out.
+fn drive_engine_graph_to_phase(
+    engine: &mut Engine,
+    session: &mut ScriptedSession,
+    phase: GraphPhase,
+) {
+    for _ in 0..64 {
+        if engine
+            .collected_graph
+            .as_ref()
+            .is_some_and(|graph| graph.phase == phase)
+        {
+            return;
+        }
+        engine
+            .service_collected_finish_records(session, Vec::new(), 0, 1)
+            .unwrap();
+    }
+    panic!(
+        "graph did not reach {phase:?}; last phase: {:?}",
+        engine.collected_graph.as_ref().map(|graph| graph.phase)
+    );
+}
+
+/// T4a helper: one accepted provider with a ready retirement intent, the
+/// graph requested on the first credit like `collected_graph_intake_selects_ready_intent_only`.
+fn engine_with_ready_graph_intent() -> (
+    SystemScopeChildGuard,
+    Engine,
+    ScriptedSession,
+    ProcessViewId,
+) {
+    let (child, mut engine, _) = engine_with_one_accepted_provider();
+    let guard = SystemScopeChildGuard::new(child);
+    engine.scope = Scope::System;
+    let view = engine.views[0].id();
+    let mut session = ScriptedSession::default();
+    assert!(
+        engine
+            .retirement_intents
+            .insert(view, RetirementCause::ExpectedRemoval)
+            .is_none()
+    );
+    assert!(engine.ready_expected_removals.insert(view));
+    let first = engine
+        .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+        .unwrap();
+    assert!(first.pending);
+    assert!(engine.collected_graph_requested);
+    (guard, engine, session, view)
+}
+
+#[test]
+fn collected_graph_storage_refusal_keeps_originals() {
+    let (_guard, mut engine, mut session, view) = engine_with_ready_graph_intent();
+    drive_engine_graph_to_phase(&mut engine, &mut session, GraphPhase::Pins);
+    let revision = engine.pinned.revision();
+    let slots = engine.plan.slots.clone();
+    let views: Vec<ProcessViewId> = engine.views.iter().map(|owner| owner.id()).collect();
+    let modules = engine.modules.clone();
+    let charged = engine.collected_test_pool.snapshot().charged_bytes;
+    let refused_before = engine.collected_test_pool.snapshot().refused;
+    // One-short: the pool pays nothing beyond its current charge, so the
+    // pins copy's first reservation refuses.
+    engine.collected_test_pool.reference_set_limit(charged);
+    let mut verdict = None;
+    let mut last_pending = false;
+    for _ in 0..64 {
+        let outcome = engine
+            .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+            .unwrap();
+        last_pending = outcome.pending;
+        verdict = engine
+            .collected_graph
+            .as_ref()
+            .and_then(|graph| graph.verdict);
+        if verdict.is_some() {
+            break;
+        }
+    }
+    assert_eq!(verdict, Some(Verdict::RefusedUntouched));
+    assert_eq!(
+        engine.collected_graph_refused(),
+        Some("terminal graph refused before native mutation")
+    );
+    assert!(last_pending);
+    let graph = engine
+        .collected_graph
+        .as_ref()
+        .expect("refused graph stays boxed");
+    assert!(
+        graph.pins.pinned().is_none() && graph.pins.loaned_output().is_none(),
+        "a refused pins copy keeps no output"
+    );
+    assert_eq!(engine.pinned.revision(), revision);
+    assert_eq!(engine.plan.slots, slots);
+    assert_eq!(
+        engine.views.iter().map(|owner| owner.id()).collect::<Vec<_>>(),
+        views
+    );
+    assert_eq!(engine.modules, modules);
+    assert!(engine.pending_retirements.contains(&view));
+    let probe = engine.allocate_view_id().unwrap();
+    assert_ne!(probe, view, "the original ID stays held");
+    engine.release_view_id(probe);
+    assert!(
+        engine.collected_test_pool.snapshot().refused > refused_before,
+        "the one-short pool must record the refusal"
+    );
+    for _ in 0..4 {
+        let outcome = engine
+            .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+            .unwrap();
+        assert!(outcome.pending);
+    }
+    assert_eq!(
+        engine
+            .collected_graph
+            .as_ref()
+            .and_then(|graph| graph.verdict),
+        Some(Verdict::RefusedUntouched)
+    );
+}
+
+/// T4a helper: a collected retirement case driven to its first native
+/// Pending, with an optional exact pool limit. Returns
+/// `(begins, peak_charged_bytes)`.
+fn graph_case_to_native_pending(limit: Option<usize>) -> (usize, usize) {
+    let mut case = CollectedFinishGraphCase::new(false);
+    case.child.reap().unwrap();
+    assert_eq!(case.engine.views[0].original_exited(), Ok(true));
+    case.engine
+        .update_counter_snapshot(&case.session)
+        .unwrap();
+    case.engine.dispatch_lifecycle_record(
+        &mut case.session,
+        &collected_finish_leader_exit(case.child.pid()),
+        &mut PendingViewRetirements::new(),
+    );
+    assert!(case.engine.pending_leader_exit_views.contains(&case.view));
+    // Released up front: the closer never blocks the drive to Pending.
+    case.release();
+    if let Some(limit) = limit {
+        case.engine.collected_test_pool.reference_set_limit(limit);
+    }
+    let mut begins = 0;
+    for _ in 0..512 {
+        case.service(1);
+        begins = case
+            .session
+            .global_retirement
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .begins;
+        if begins == 1 {
+            break;
+        }
+    }
+    let peak = case
+        .engine
+        .collected_test_pool
+        .snapshot()
+        .peak_charged_bytes;
+    (begins, peak)
+}
+
+#[test]
+fn collected_graph_exact_fit_reaches_native() {
+    // Calibration on an identical setup with the default pool.
+    let (calibration_begins, peak) = graph_case_to_native_pending(None);
+    assert_eq!(
+        calibration_begins, 1,
+        "calibration must reach native Pending"
+    );
+    assert!(peak > 0);
+    // Exact fit: the limit equals the calibration peak.
+    let (begins, exact_peak) = graph_case_to_native_pending(Some(peak));
+    assert_eq!(begins, 1, "exact fit reaches native Pending");
+    assert!(
+        exact_peak <= peak,
+        "the exact-fit run must not exceed its limit"
+    );
+}
+
+#[test]
+fn collected_graph_source_change_before_native_is_refused_untouched() {
+    let (_guard, mut engine, mut session, view) = engine_with_ready_graph_intent();
+    drive_engine_graph_to_phase(&mut engine, &mut session, GraphPhase::Pins);
+    // The §1.3 real mutation: unconditionally bumps the graph-input epoch.
+    engine.settle_frame_deferrals_at_capture_end();
+    let revision = engine.pinned.revision();
+    let slots = engine.plan.slots.clone();
+    let outcome = engine
+        .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+        .unwrap();
+    assert!(outcome.pending);
+    let graph = engine
+        .collected_graph
+        .as_ref()
+        .expect("refused graph stays boxed");
+    assert_eq!(graph.verdict, Some(Verdict::RefusedUntouched));
+    assert_eq!(graph.phase, GraphPhase::Pins);
+    assert_eq!(
+        engine.collected_graph_refused(),
+        Some("terminal graph refused before native mutation")
+    );
+    assert_eq!(engine.pinned.revision(), revision);
+    assert_eq!(engine.plan.slots, slots);
+    assert!(engine.views.iter().any(|owner| owner.id() == view));
+    assert!(
+        engine
+            .modules
+            .iter()
+            .any(|module| module.scanned.view == view)
+    );
+    assert!(engine.pending_retirements.contains(&view));
+    let probe = engine.allocate_view_id().unwrap();
+    assert_ne!(probe, view, "the original ID stays held");
+    engine.release_view_id(probe);
+    for _ in 0..4 {
+        let outcome = engine
+            .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+            .unwrap();
+        assert!(outcome.pending);
+    }
+}
+
+#[test]
+fn collected_graph_disclosure_only_mark_partial_is_not_refused() {
+    let mut case = CollectedFinishGraphCase::new(false);
+    case.child.reap().unwrap();
+    assert_eq!(case.engine.views[0].original_exited(), Ok(true));
+    case.engine
+        .update_counter_snapshot(&case.session)
+        .unwrap();
+    case.engine.dispatch_lifecycle_record(
+        &mut case.session,
+        &collected_finish_leader_exit(case.child.pid()),
+        &mut PendingViewRetirements::new(),
+    );
+    case.release();
+    // The §1.3 disclosure twin: a sticky counter dirties facts, never the
+    // graph-input epoch, so the graph closes and installs.
+    case.session.counters.ring_loss = 1;
+    let mut drained = false;
+    for _ in 0..600 {
+        let outcome = case.service(1);
+        if !outcome.pending {
+            drained = true;
+            break;
+        }
+    }
+    assert!(drained, "disclosure alone must not refuse the graph");
+    assert_eq!(case.engine.collected_graph_refused(), None);
+    assert!(
+        case.engine
+            .views
+            .iter()
+            .all(|owner| owner.id() != case.view),
+        "the retired view is gone"
+    );
+    assert!(
+        !case.engine.plan.is_active(case.original_slot.index),
+        "the retired slot is inactive"
+    );
+    assert!(case.engine.pinned.view_claims(case.view).is_none());
+}
+
+/// T4a helper: every owned string and vector of the copy holds exactly its
+/// length, and the rows compare equal to the source clone.
+fn assert_scanned_module_copy_is_exact(copy: &ScannedModule, source: &ScannedModule) {
+    assert_eq!(copy, &source.clone());
+    assert_eq!(copy.path.capacity(), copy.path.len());
+    assert_eq!(copy.exports.capacity(), copy.exports.len());
+    for (copied, original) in copy.exports.iter().zip(source.exports.iter()) {
+        assert_eq!(copied, original);
+        assert_eq!(copied.capacity(), copied.len());
+    }
+    assert_eq!(copy.tables.capacity(), copy.tables.len());
+    for (copied, original) in copy.tables.iter().zip(source.tables.iter()) {
+        assert_eq!(copied.entries.capacity(), copied.entries.len());
+        assert_eq!(copied.null_entries.capacity(), copied.null_entries.len());
+        assert_eq!(copied.unpinned.capacity(), copied.unpinned.len());
+        for (copied_entry, original_entry) in
+            copied.entries.iter().zip(original.entries.iter())
+        {
+            assert_eq!(copied_entry, original_entry);
+            assert_eq!(
+                copied_entry.object_path.capacity(),
+                copied_entry.object_path.len()
+            );
+        }
+        assert_eq!(copied.null_entries, original.null_entries);
+        for (copied_skip, original_skip) in
+            copied.unpinned.iter().zip(original.unpinned.iter())
+        {
+            assert_eq!(copied_skip, original_skip);
+            assert_eq!(copied_skip.subject.capacity(), copied_skip.subject.len());
+            assert_eq!(copied_skip.reason.capacity(), copied_skip.reason.len());
+        }
+    }
+    assert_eq!(copy.interfaces.capacity(), copy.interfaces.len());
+    for (copied, original) in copy.interfaces.iter().zip(source.interfaces.iter()) {
+        assert_eq!(copied, original);
+        if let Some(name) = copied.name_lossy.as_ref() {
+            assert_eq!(name.capacity(), name.len());
+        }
+        if let Some(bytes) = copied.name_private.as_ref() {
+            assert_eq!(bytes.capacity(), bytes.len());
+        }
+    }
+}
+
+#[test]
+fn scanned_module_copy_is_exact() {
+    let (child, engine, _) = engine_with_one_accepted_provider();
+    let _accepted = SystemScopeChildGuard::new(child);
+    let mut source = engine.modules[0].scanned.clone();
+    source.exports.extend(["extra-a".to_string(), "extra-b".to_string()]);
+    if source.interfaces.is_empty() {
+        source.interfaces.push(ScannedInterface {
+            index: 0,
+            name_class: "exact_standard",
+            name_lossy: None,
+            name_private: None,
+            flags: 0,
+            table: None,
+        });
+    }
+    while source.interfaces.len() < 2 {
+        let mut face = source.interfaces[0].clone();
+        face.index = source.interfaces.len();
+        source.interfaces.push(face);
+    }
+    source.interfaces[0].name_lossy = Some("lossy-name".to_string());
+    source.interfaces[0].name_private = Some(vec![7u8; 32]);
+    source.interfaces[1].name_lossy = None;
+    source.interfaces[1].name_private = None;
+    if source.tables.is_empty() {
+        source.tables.push(ScannedTable {
+            version: (3, 0),
+            walk: "full",
+            entries: vec![ScannedEntry {
+                name: "C_Initialize",
+                object: source.key,
+                object_path: "/provider.so".to_string(),
+                file_offset: 0,
+            }],
+            null_entries: Vec::new(),
+            unpinned: Vec::new(),
+            address: 0,
+            file_offset: Some(0),
+            live_return: false,
+            manifest_supported: false,
+        });
+    }
+    let mut wide = source.tables[0].clone();
+    wide.entries.push(ScannedEntry {
+        name: "extra-entry",
+        object: source.key,
+        object_path: "/extra/path.so".to_string(),
+        file_offset: 0x40,
+    });
+    wide.null_entries = vec!["null-entry"; 5000];
+    wide.unpinned.push(Skipped {
+        subject: "unpinned-subject".to_string(),
+        reason: "unpinned-reason".to_string(),
+    });
+    source.tables.push(wide);
+    // One cursor over two modules: it resets between rows.
+    let mut cursor = ScannedModuleCopy::new();
+    let mut rows = Vec::with_capacity(2);
+    for module in [&source, &engine.modules[0].scanned] {
+        let mut done = false;
+        for _ in 0..100_000 {
+            if cursor.step(module, &mut rows) {
+                done = true;
+                break;
+            }
+        }
+        assert!(done, "the copy must complete");
+    }
+    assert_eq!(rows.len(), 2);
+    assert_scanned_module_copy_is_exact(&rows[0], &source);
+    assert_scanned_module_copy_is_exact(&rows[1], &engine.modules[0].scanned);
+    // The 4096 null-entry chunk rule: 5000 nulls cost exactly one step more
+    // than 10 nulls with everything else identical.
+    let mut few = source.clone();
+    few.tables[1].null_entries = vec!["null-entry"; 10];
+    let mut count_steps = |module: &ScannedModule| {
+        let mut probe = ScannedModuleCopy::new();
+        let mut scratch = Vec::with_capacity(1);
+        let mut steps = 0usize;
+        for _ in 0..100_000 {
+            steps += 1;
+            if probe.step(module, &mut scratch) {
+                return steps;
+            }
+        }
+        panic!("the copy must complete");
+    };
+    assert_eq!(count_steps(&source) - count_steps(&few), 1);
+}

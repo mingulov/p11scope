@@ -78,6 +78,28 @@ fn s2s3_safe_attribute_sets_are_closed() {
     }
 }
 
+// Mutation caught: a key-type vocabulary drifting from the OASIS PKCS #11
+// 3.0 numbers, including the pinned pkcs11-types misnumbering that puts
+// Edwards/Montgomery at 0x3a/0x3b (those are BLAKE2b HMAC and stay refused).
+#[test]
+fn s2s3_key_types_pin_oasis_numbers() {
+    const ACCEPTED: &[u64] = &[0x00, 0x01, 0x02, 0x03, 0x04, 0x10, 0x1f, 0x40, 0x41];
+    for value in ACCEPTED {
+        assert_eq!(
+            classify_attribute_scalar(SafeAttributeKind::KeyType, *value),
+            Some(*value as u16),
+            "key type {value:#x}"
+        );
+    }
+    for refused in [0x05u64, 0x11, 0x27, 0x3a, 0x3b] {
+        assert_eq!(
+            classify_attribute_scalar(SafeAttributeKind::KeyType, refused),
+            None,
+            "key type {refused:#x} refused"
+        );
+    }
+}
+
 // Mutation caught: host-width scalar reads, multi-byte booleans, or permissive
 // curve lengths instead of the exact target-layout shapes.
 #[test]

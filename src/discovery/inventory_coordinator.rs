@@ -1079,13 +1079,55 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 )
                 .map_err(|_| SemanticRefusal::Unavailable)?
             };
-        let count = records.len() as u64 + malformed;
+        let mut count = records.len() as u64 + malformed;
+        let mut post_q = post_q;
+        let mut ring_pending = ring_pending;
+        // A terminal journal owns a still-unread suffix. Continue it through
+        // the SAME retained drain/Q even though that journal counts as Engine
+        // backlog. Each callback transfers at most one original; an allowance
+        // stop is an incomplete prefix, never a fabricated empty observation.
+        let mut collect = |_session: &mut dyn crate::discovery::engine::EngineSession| {
+            use crate::discovery::engine::IncompleteTerminalDrain;
+            if quantum == 0 {
+                return Err(IncompleteTerminalDrain::capacity_blocked(Vec::new(), 0, 0).into());
+            }
+            let (records, malformed, beyond, pending) =
+                crate::attach::collect_staged_discovery_to_position(
+                    staged,
+                    discovery,
+                    q.discovery_stop(),
+                    quantum,
+                )?;
+            count += records.len() as u64 + malformed;
+            post_q |= beyond;
+            ring_pending = pending;
+            if beyond {
+                return Err(IncompleteTerminalDrain::new(
+                    records,
+                    malformed,
+                    0,
+                    anyhow!("discovery advanced beyond its original Q"),
+                )
+                .into());
+            }
+            if pending {
+                Err(IncompleteTerminalDrain::backlog(records, malformed).into())
+            } else {
+                Ok((records, malformed))
+            }
+        };
         // Only native/counter leaves are substituted. Dispatch and the
         // lifecycle consequence observed by the test remain real Engine work.
         let mut session = crate::discovery::engine::session_fixture::ScriptedSession::default();
         let progress = self
             .engine
-            .service_collected_finish_records(&mut session, records, malformed, work)
+            .service_collected_finish_records_with(
+                &mut session,
+                records,
+                malformed,
+                work,
+                &mut collect,
+            )
             .map_err(|_| SemanticRefusal::Unavailable)?;
         let after = crate::events::discovery_drain_positions(discovery);
         Ok(LaneDrainOutcome {
@@ -1146,10 +1188,37 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     .collect_discovery_to_position(q.discovery_stop(), quantum)
                     .map_err(|_| SemanticRefusal::Unavailable)?
             };
-        let count = records.len() as u64 + malformed;
+        let mut count = records.len() as u64 + malformed;
+        let mut post_q = post_q;
+        let mut ring_pending = ring_pending;
+        let mut collect = |native: &mut dyn crate::discovery::engine::EngineSession| {
+            use crate::discovery::engine::IncompleteTerminalDrain;
+            if quantum == 0 {
+                return Err(IncompleteTerminalDrain::capacity_blocked(Vec::new(), 0, 0).into());
+            }
+            let (records, malformed, beyond, pending) =
+                native.collect_collected_finish_discovery(q, quantum)?;
+            count += records.len() as u64 + malformed;
+            post_q |= beyond;
+            ring_pending = pending;
+            if beyond {
+                return Err(IncompleteTerminalDrain::new(
+                    records,
+                    malformed,
+                    0,
+                    anyhow!("discovery advanced beyond its original Q"),
+                )
+                .into());
+            }
+            if pending {
+                Err(IncompleteTerminalDrain::backlog(records, malformed).into())
+            } else {
+                Ok((records, malformed))
+            }
+        };
         let progress = self
             .engine
-            .service_collected_finish_records(session, records, malformed, work)
+            .service_collected_finish_records_with(session, records, malformed, work, &mut collect)
             .map_err(|_| SemanticRefusal::Unavailable)?;
         session
             .collected_finish_discovery_domain(q)

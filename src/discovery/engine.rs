@@ -377,6 +377,8 @@ pub struct Engine {
     /// A collected-Finish service call spends this at actual dispatch or
     /// retirement boundaries. Ordinary frames leave it unset.
     collected_finish_actions: Option<usize>,
+    /// Round-robin position among the original, still-owned exit assessments.
+    collected_finish_assessment_after: Option<ProcessViewId>,
     /// Set while a pause cycle applies its batch (the owned child stopped).
     pause_owned_batch: bool,
     /// Set while a pressure service pass runs inside record dispatch. Nested
@@ -2669,6 +2671,16 @@ pub(crate) trait EngineSession {
     /// DISCOVERY items currently held in the session FIFO: staged items
     /// hold shared-allowance credits until a dequeue transfers them.
     fn staged_discovery_len(&self) -> usize;
+
+    /// Only the actual Session implementation can expose its original
+    /// Q-bounded drain here. Other native leaves refuse by default.
+    fn collect_collected_finish_discovery(
+        &mut self,
+        _q: &crate::attach::CollectedFinishQ,
+        _quantum: usize,
+    ) -> Result<(Vec<DiscoveryRecord>, u64, bool, bool)> {
+        bail!("this native leaf has no original Q-bounded discovery drain")
+    }
     fn counter_snapshot(&self) -> Result<CounterSnapshot>;
     fn process_creation_tracking_unavailable(&self) -> Option<&str>;
     fn read_selection_table(
@@ -2843,6 +2855,15 @@ impl EngineSession for Session {
 
     fn staged_discovery_len(&self) -> usize {
         Session::staged_discovery_len(self)
+    }
+
+    fn collect_collected_finish_discovery(
+        &mut self,
+        q: &crate::attach::CollectedFinishQ,
+        quantum: usize,
+    ) -> Result<(Vec<DiscoveryRecord>, u64, bool, bool)> {
+        self.collected_finish_discovery_domain(q)?;
+        self.collect_discovery_to_position(q.discovery_stop(), quantum)
     }
 
     fn counter_snapshot(&self) -> Result<CounterSnapshot> {
@@ -3020,7 +3041,7 @@ impl IncompleteTerminalDrain {
         }
     }
 
-    fn backlog(records: Vec<DiscoveryRecord>, malformed: u64) -> Self {
+    pub(crate) fn backlog(records: Vec<DiscoveryRecord>, malformed: u64) -> Self {
         Self {
             records,
             malformed,
@@ -3712,6 +3733,16 @@ pub(crate) struct TerminalBatch {
     pub(crate) authority: TerminalAuthority,
     records: Vec<QueuedDiscoveryRecord>,
     complete: bool,
+    /// The ordinary dispatcher used to keep these accumulators on its stack.
+    /// A bounded Finish keeps them with the SAME batch until its last original
+    /// has run: a later EXEC can still explain an earlier loader mismatch.
+    dispatch: Option<TerminalDispatch>,
+}
+
+#[derive(Default)]
+struct TerminalDispatch {
+    exec_refresh_views: BTreeSet<ProcessViewId>,
+    deferred_mismatches: Vec<ProcessViewId>,
 }
 
 impl TerminalBatch {
@@ -3720,6 +3751,7 @@ impl TerminalBatch {
             authority,
             records: Vec::new(),
             complete: false,
+            dispatch: None,
         }
     }
 
@@ -8480,6 +8512,7 @@ impl Engine {
             terminal_journal: None,
             pending_discovery_records: Vec::new(),
             collected_finish_actions: None,
+            collected_finish_assessment_after: None,
             pause_owned_batch: false,
             pressure_service_active: false,
             in_refresh_tick: false,
@@ -16606,11 +16639,11 @@ impl Engine {
         pending_views: &mut PendingViewRetirements,
         closure: &mut PauseClosure,
     ) -> Result<Option<bool>> {
-        let Some(batch) = self.terminal_batch.take() else {
+        let Some(mut batch) = self.terminal_batch.take() else {
             let Some(journal) = self.terminal_journal else {
                 return Ok(Some(false));
             };
-            if !journal.dispatch_started {
+            if !journal.dispatch_started || !self.take_collected_finish_action() {
                 return Ok(Some(false));
             }
             if self.loader_registry.remove(journal.owner).is_err() {
@@ -16628,43 +16661,42 @@ impl Engine {
             self.terminal_batch = Some(batch);
             return Ok(None);
         }
-        let journal = self
-            .terminal_journal
-            .as_ref()
-            .ok_or_else(|| anyhow!("terminal loader drain journal is missing"))?;
-        if journal.owner != batch.authority.owner || journal.dispatch_started {
-            bail!("terminal loader drain batch was already dispatched");
+        let Some(journal) = self.terminal_journal else {
+            self.terminal_batch = Some(batch);
+            bail!("terminal loader drain journal is missing");
+        };
+        if journal.owner != batch.authority.owner
+            || journal.dispatch_started != batch.dispatch.is_some()
+        {
+            self.terminal_batch = Some(batch);
+            bail!("terminal loader drain batch does not match its dispatch journal");
         }
         let owner = journal.owner;
-        let mut records =
-            match begin_discovery_batch(batch.records, self.update_counter_snapshot(session)) {
-                Ok(records) => records,
-                Err((_, records)) => {
-                    self.terminal_batch = Some(TerminalBatch {
-                        authority: batch.authority,
-                        records,
-                        complete: true,
-                    });
-                    self.retry_terminal_predispatch_failure(additions_allowed, closure);
-                    return Ok(Some(false));
-                }
-            };
+        // Keep the original vector and its dispatch accumulators on counter
+        // refusal. Once dispatch has started it is never a predispatch retry.
+        if self.update_counter_snapshot(session).is_err() {
+            self.terminal_batch = Some(batch);
+            self.retry_terminal_predispatch_failure(additions_allowed, closure);
+            return Ok(Some(false));
+        }
+        let mut dispatch = batch.dispatch.take().unwrap_or_default();
         self.terminal_journal
             .as_mut()
             .expect("journal checked above")
             .dispatch_started = true;
         let mut changed = false;
-        let mut exec_refresh_views = BTreeSet::new();
-        let mut deferred_mismatches = Vec::new();
-        for queued in records.drain(..) {
+        while !batch.records.is_empty() && self.take_collected_finish_action() {
+            // The physical prefix leaves its only dispatchable owner before
+            // the handler runs. A retry retains exactly the untouched suffix.
+            let queued = batch.records.remove(0);
             let origin = (queued.record.pid_tgid >> 32) as u32;
             match self.dispatch_discovery_record(
                 queued,
                 session,
                 additions_allowed,
                 pending_views,
-                &mut exec_refresh_views,
-                &mut deferred_mismatches,
+                &mut dispatch.exec_refresh_views,
+                &mut dispatch.deferred_mismatches,
             ) {
                 Ok(outcome) => {
                     changed |= outcome.changed();
@@ -16685,8 +16717,26 @@ impl Engine {
                 }
             }
         }
-        self.settle_deferred_loader_mismatches(deferred_mismatches, &exec_refresh_views);
+        // Mismatch classification waits for ALL original records, including
+        // a later EXEC. Each subsequent classification is itself one action.
+        while batch.records.is_empty()
+            && !dispatch.deferred_mismatches.is_empty()
+            && self.take_collected_finish_action()
+        {
+            let view = dispatch.deferred_mismatches.remove(0);
+            self.settle_deferred_loader_mismatch(view, &dispatch.exec_refresh_views);
+        }
+        if !batch.records.is_empty()
+            || !dispatch.deferred_mismatches.is_empty()
+            || !self.take_collected_finish_action()
+        {
+            batch.dispatch = Some(dispatch);
+            self.terminal_batch = Some(batch);
+            return Ok(Some(changed));
+        }
         if self.loader_registry.remove(owner).is_err() {
+            // No replayable record or deferred mismatch remains. Keep the
+            // original cleanup-only journal, as in ordinary dispatch.
             *additions_allowed = false;
             self.mark_partial(
                 "live loader retirement",
@@ -16700,9 +16750,9 @@ impl Engine {
 
     /// The one authority-specific continuation. It advances an incomplete
     /// terminal batch by exactly one collection attempt, then hands the journal
-    /// to `dispatch_terminal_batch`, which either dispatches a complete
-    /// undispatched batch or, once dispatch has started, repeats nothing but
-    /// the registry removal. Generic records never reach it.
+    /// to `dispatch_terminal_batch`. Bounded dispatch retains its exact suffix
+    /// and cross-record state; cleanup-only retries repeat no originals.
+    /// Generic records never reach it.
     fn continue_terminal_batch(
         &mut self,
         session: &mut dyn EngineSession,
@@ -16729,9 +16779,9 @@ impl Engine {
         self.dispatch_terminal_batch(session, additions_allowed, pending_views, closure)
     }
 
-    // One retirement pass owns the whole decision: the view, the terminal
-    // handoffs it may still hand a selection to, and every accumulator the
-    // caller needs back. Splitting it would hand out the same state twice.
+    // The persistent view intent and original terminal journal retain the
+    // decision across bounded Finish calls. Ordinary retirement still visits
+    // the complete context set; Finish touches at most one context here.
     #[allow(clippy::too_many_arguments)]
     fn retire_loader_contexts(
         &mut self,
@@ -16779,7 +16829,13 @@ impl Engine {
                 return Ok((changed, false));
             }
         }
-        for context_id in self.loader_registry.ids_for_view(view) {
+        let collected_finish = self.collected_finish_actions.is_some();
+        for context_id in self
+            .loader_registry
+            .ids_for_view(view)
+            .into_iter()
+            .take(if collected_finish { 1 } else { usize::MAX })
+        {
             self.pending_loader_arm_scans.remove(&PendingLoaderScanKey {
                 view,
                 context: context_id,
@@ -16816,8 +16872,17 @@ impl Engine {
                         "a one-shot dynamic detach failed; replacement was blocked for this cycle",
                     );
                 }
+                // This action performed the original native context detach.
+                // Collection and dispatch resume as separate opportunities;
+                // a work yield is never an observed empty drain or a loss.
                 let terminal_drain =
-                    self.begin_terminal_drain(context_id, terminal_exports, || collect(session));
+                    self.begin_terminal_drain(context_id, terminal_exports, || {
+                        if collected_finish {
+                            Err(IncompleteTerminalDrain::backlog(Vec::new(), 0).into())
+                        } else {
+                            collect(session)
+                        }
+                    });
                 if terminal_drain.is_ok()
                     && let Some(records) = terminal_selection_handoffs.remove(&context_id.get())
                     && !records.is_empty()
@@ -16868,7 +16933,9 @@ impl Engine {
                         return Ok((changed, false));
                     }
                     Ok(Err(error)) => {
+                        let mut work_backlog = false;
                         if let Ok(incomplete) = error.downcast::<IncompleteTerminalDrain>() {
+                            work_backlog = incomplete.backlog;
                             self.account_unvalidated_discovery(incomplete.unvalidated_records);
                             self.retain_terminal_batch(
                                 incomplete.records,
@@ -16877,7 +16944,12 @@ impl Engine {
                             )?;
                         }
                         closure.fail();
-                        self.mark_live_loss(TERMINAL_DRAIN_SUBJECT, TERMINAL_DRAIN_RETRY_REASON);
+                        if !work_backlog {
+                            self.mark_live_loss(
+                                TERMINAL_DRAIN_SUBJECT,
+                                TERMINAL_DRAIN_RETRY_REASON,
+                            );
+                        }
                         return Ok((changed, false));
                     }
                     Err(_) => {
@@ -16926,7 +16998,10 @@ impl Engine {
                 return Ok((changed, false));
             }
         }
-        Ok((changed, true))
+        Ok((
+            changed,
+            !collected_finish || self.loader_registry.ids_for_view(view).is_empty(),
+        ))
     }
 
     /// Whether an inventory preflight's stale views include a generation
@@ -17361,6 +17436,31 @@ impl Engine {
         self.record_apply_timing(&outcome);
         self.queue_conservative_outcome(&outcome, &retirements, &keys, pending_views);
         outcome
+    }
+
+    /// No candidate or native application is necessary if this exact retired
+    /// owner is already absent from every graph input. Other IDs and rejected
+    /// keys remain owned. In particular an ended-pid native proof is not
+    /// discarded as if it had been applied.
+    fn settle_unreferenced_collected_retirement(&mut self) -> bool {
+        let Some(view) = self.pending_retirements.first().copied() else {
+            return false;
+        };
+        if self
+            .modules
+            .iter()
+            .any(|module| module.scanned.view == view)
+            || self.pinned.view_claims(view).is_some()
+            || self
+                .ended_pid_retirement
+                .as_ref()
+                .is_some_and(|ended| ended.owner.id() == view)
+        {
+            return false;
+        }
+        self.pending_retirements.remove(&view);
+        self.finalize_expected_target_exit();
+        true
     }
 
     /// Whether dispatching a matched EXEC for `view` would consume the owned
@@ -17868,11 +17968,19 @@ impl Engine {
         exec_refresh_views: &BTreeSet<ProcessViewId>,
     ) {
         for view in deferred_mismatches {
-            if !exec_refresh_views.contains(&view) {
-                self.reject_loader_record(
-                    "a loader hit failed generation, mapping, identity, or hook-IP validation",
-                );
-            }
+            self.settle_deferred_loader_mismatch(view, exec_refresh_views);
+        }
+    }
+
+    fn settle_deferred_loader_mismatch(
+        &mut self,
+        view: ProcessViewId,
+        exec_refresh_views: &BTreeSet<ProcessViewId>,
+    ) {
+        if !exec_refresh_views.contains(&view) {
+            self.reject_loader_record(
+                "a loader hit failed generation, mapping, identity, or hook-IP validation",
+            );
         }
     }
 
@@ -17993,58 +18101,68 @@ impl Engine {
         closure: &mut PauseClosure,
     ) {
         for view in assessments {
-            let exit_hook_ts_ns = self.pending_leader_exit_order.get(view).copied().flatten();
-            let result = self
-                .views
-                .iter()
-                .find(|candidate| candidate.id() == *view)
-                .map_or_else(
-                    || Err("retained process view is no longer available".to_string()),
-                    ProcessView::original_exited,
-                );
-            let assessment = settle_leader_exit_view(
-                &mut self.pending_leader_exit_views,
-                &mut self.counted_leader_exit_views,
-                &mut self.task_uprobe_link_losses,
-                *view,
-                result,
+            self.settle_leader_exit_assessment(*view, pending_views, additions_allowed, closure);
+        }
+    }
+
+    fn settle_leader_exit_assessment(
+        &mut self,
+        view: ProcessViewId,
+        pending_views: &mut PendingViewRetirements,
+        additions_allowed: &mut bool,
+        closure: &mut PauseClosure,
+    ) {
+        let exit_hook_ts_ns = self.pending_leader_exit_order.get(&view).copied().flatten();
+        let result = self
+            .views
+            .iter()
+            .find(|candidate| candidate.id() == view)
+            .map_or_else(
+                || Err("retained process view is no longer available".to_string()),
+                ProcessView::original_exited,
             );
-            if !self.pending_leader_exit_views.contains(view) {
-                self.pending_leader_exit_order.remove(view);
+        let assessment = settle_leader_exit_view(
+            &mut self.pending_leader_exit_views,
+            &mut self.counted_leader_exit_views,
+            &mut self.task_uprobe_link_losses,
+            view,
+            result,
+        );
+        if !self.pending_leader_exit_views.contains(&view) {
+            self.pending_leader_exit_order.remove(&view);
+        }
+        match assessment {
+            LeaderExitAssessment::AlreadySettled => {}
+            LeaderExitAssessment::Pending => {
+                *additions_allowed = false;
+                closure.fail();
             }
-            match assessment {
-                LeaderExitAssessment::AlreadySettled => {}
-                LeaderExitAssessment::Pending => {
-                    *additions_allowed = false;
-                    closure.fail();
-                }
-                LeaderExitAssessment::WholeGroupExit => {
-                    self.queue_retirement(*view, RetirementCause::ExpectedRemoval, pending_views);
-                }
-                LeaderExitAssessment::LinkLoss => {
-                    *additions_allowed = false;
-                    closure.fail();
-                    self.invalidate_causal_timing();
-                    self.close_owned_selection_for_view(*view);
-                    if let Some(pid) = self
-                        .views
-                        .iter()
-                        .find(|candidate| candidate.id() == *view)
-                        .map(ProcessView::pid)
-                    {
-                        if self.pid_exec_after_leader_exit(*view, pid, exit_hook_ts_ns) {
-                            // Keep this batch closed: protected old-context
-                            // records still use its admission flag. Only the
-                            // next ordinary frame may service the exact EXEC.
-                            self.immediate_exec_recovery_frame = true;
-                        } else {
-                            self.clear_refresh_for_view(*view, pid);
-                        }
-                        // No rescan will settle this view's pending poll, and
-                        // the link loss is counted separately — forget the
-                        // poll rather than publishing it twice (F1).
-                        self.polled_pids.remove(&pid);
+            LeaderExitAssessment::WholeGroupExit => {
+                self.queue_retirement(view, RetirementCause::ExpectedRemoval, pending_views);
+            }
+            LeaderExitAssessment::LinkLoss => {
+                *additions_allowed = false;
+                closure.fail();
+                self.invalidate_causal_timing();
+                self.close_owned_selection_for_view(view);
+                if let Some(pid) = self
+                    .views
+                    .iter()
+                    .find(|candidate| candidate.id() == view)
+                    .map(ProcessView::pid)
+                {
+                    if self.pid_exec_after_leader_exit(view, pid, exit_hook_ts_ns) {
+                        // Keep this batch closed: protected old-context
+                        // records still use its admission flag. Only the
+                        // next ordinary frame may service the exact EXEC.
+                        self.immediate_exec_recovery_frame = true;
+                    } else {
+                        self.clear_refresh_for_view(view, pid);
                     }
+                    // No rescan will settle this view's pending poll, and
+                    // the link loss is counted separately — forget the
+                    // poll rather than publishing it twice (F1).
+                    self.polled_pids.remove(&pid);
                 }
             }
         }
@@ -18378,7 +18496,17 @@ impl Engine {
         // Fresh session records diverted by service passes, oldest first.
         // They rejoin the pending queue behind every parked record.
         let mut diverted_fresh: Vec<QueuedDiscoveryRecord> = Vec::new();
-        for (view, cause) in self.retirement_intents.clone() {
+        let intents = if self.collected_finish_actions.is_some() {
+            // The persistent map remains the owner of the other intents.
+            self.retirement_intents
+                .first_key_value()
+                .map(|(view, cause)| (*view, *cause))
+                .into_iter()
+                .collect()
+        } else {
+            self.retirement_intents.clone()
+        };
+        for (view, cause) in intents {
             pending_views
                 .entry(view)
                 .and_modify(|current| *current = current.merge(cause))
@@ -18575,6 +18703,19 @@ impl Engine {
             }
             self.promote_stale_execs(pending_views);
             if pending_views.is_empty() {
+                if self.collected_finish_actions.is_some() {
+                    // A full conservative_candidate rebuild clones/replans the
+                    // entire retained graph and may begin native retirement.
+                    // It is NOT a one-action continuation. Only a retirement
+                    // already absent from that graph can settle here; all
+                    // nontrivial retirement/rejection debt stays owned/pending.
+                    // A bounded graph transaction is still required before
+                    // activating Finish for that retained state.
+                    if self.take_collected_finish_action() {
+                        changed |= self.settle_unreferenced_collected_retirement();
+                    }
+                    break;
+                }
                 if (self.pending_rejected_keys.is_empty() && self.pending_retirements.is_empty())
                     || conservative_replay_attempted
                 {
@@ -21429,10 +21570,9 @@ impl Engine {
         true
     }
 
-    /// One bounded service of originals already transferred from the actual
-    /// Q-bounded transport. It uses the existing dispatch/retirement machinery,
-    /// but never runs an inventory refresh or a nested, unbounded ring drain.
-    /// Counter refusal and deferred suffixes keep the same queued originals.
+    /// Test native substitution only. The production entry below receives a
+    /// collector tied to the SAME retained Session/Q by the coordinator.
+    #[cfg(test)]
     pub(crate) fn service_collected_finish_records(
         &mut self,
         session: &mut dyn EngineSession,
@@ -21440,7 +21580,30 @@ impl Engine {
         malformed: u64,
         work: usize,
     ) -> Result<BacklogOutcome> {
-        let work = work.min(LIVE_DISCOVERY_DRAIN_QUANTUM);
+        let mut collect = |session: &mut dyn EngineSession| {
+            let (records, malformed, complete) =
+                Self::collect_discovery_records_budgeted(session, &Cell::new(1), 1)?;
+            if complete {
+                Ok((records, malformed))
+            } else {
+                Err(IncompleteTerminalDrain::backlog(records, malformed).into())
+            }
+        };
+        self.service_collected_finish_records_with(session, records, malformed, work, &mut collect)
+    }
+
+    /// One bounded service of originals already transferred from the actual
+    /// Q-bounded transport. Acquisition, original dispatch, exit assessment,
+    /// and context cleanup are separate opportunities, even with work > 1.
+    /// This deliberately does not run an ordinary inventory/admission frame.
+    pub(crate) fn service_collected_finish_records_with(
+        &mut self,
+        session: &mut dyn EngineSession,
+        records: Vec<DiscoveryRecord>,
+        malformed: u64,
+        work: usize,
+        collect: &mut DiscoveryCollector<'_>,
+    ) -> Result<BacklogOutcome> {
         if work == 0 {
             debug_assert!(records.is_empty() && malformed == 0);
             return Ok(BacklogOutcome {
@@ -21449,9 +21612,9 @@ impl Engine {
                 pending: self.collected_finish_backlog_pending(session.staged_discovery_len()),
             });
         }
-        let previous = self.collected_finish_actions.replace(work);
+        let previous = self.collected_finish_actions.replace(1);
         let result = self.with_live_frame(|engine| {
-            engine.service_collected_finish_records_inner(session, records, malformed, work)
+            engine.service_collected_finish_records_inner(session, records, malformed, collect)
         });
         self.collected_finish_actions = previous;
         result
@@ -21462,7 +21625,7 @@ impl Engine {
         session: &mut dyn EngineSession,
         records: Vec<DiscoveryRecord>,
         malformed: u64,
-        work: usize,
+        collect: &mut DiscoveryCollector<'_>,
     ) -> Result<BacklogOutcome> {
         let fresh = records.len().saturating_add(malformed as usize);
         self.charge_discovery_drain(records.len(), malformed);
@@ -21474,44 +21637,108 @@ impl Engine {
                 terminal_exports: Vec::new(),
             }));
         self.note_discovery_held_high_water(0);
-        if self.pending_global_retirement.is_some() || self.global_retirement_frame_owed {
-            self.update_counter_snapshot(session)?;
-            return Ok(self
+        // Keep every transferred original before the native preflight. Refusal
+        // neither drops inputs nor polls a ticket/advances an assessment.
+        self.update_counter_snapshot(session)?;
+        if self.pending_global_retirement.is_some() {
+            let mut outcome = self
                 .poll_global_retirement_barrier(session)
-                .unwrap_or(BacklogOutcome {
-                    changed: false,
-                    progressed: false,
-                    pending: true,
-                }));
+                .expect("the original pending ticket was just checked");
+            // Ordinary polling intentionally has narrower readiness. Finish
+            // must still account for journals, assessments and retained graph.
+            outcome.pending = self.collected_finish_backlog_pending(session.staged_discovery_len());
+            return Ok(outcome);
         }
-        self.take_frame_fresh_blocked();
-        let before = self.pending_discovery_records.len();
-        let take = before.min(work);
-        let queued = self.pending_discovery_records.drain(..take).collect();
-        let mut queued = match begin_discovery_batch(queued, self.update_counter_snapshot(session))
-        {
-            Ok(queued) => queued,
-            Err((error, queued)) => {
-                self.pending_discovery_records.splice(..0, queued);
-                return Err(error);
-            }
-        };
-        let suffix = self.pending_discovery_records.len();
+        if self.global_retirement_frame_owed {
+            self.dispose_collected_finish_recovery_hint();
+            return Ok(BacklogOutcome {
+                changed: false,
+                progressed: true,
+                pending: self.collected_finish_backlog_pending(session.staged_discovery_len()),
+            });
+        }
         let mut additions = false;
         let mut closure = PauseClosure::new(false);
         let mut pending_views = PendingViewRetirements::new();
-        // This opportunity owns no nested acquisition allowance. A lifecycle
-        // continuation asking for more transport retains its real unfinished
-        // state; an empty successful read would falsely certify that prefix.
-        let mut no_nested = |_session: &mut dyn EngineSession| {
-            Err(IncompleteTerminalDrain::backlog(Vec::new(), 0).into())
-        };
+        if self.terminal_journal.is_some() {
+            let before = self
+                .terminal_batch
+                .as_ref()
+                .map(|batch| (batch.len(), batch.complete));
+            if self
+                .terminal_batch
+                .as_ref()
+                .is_some_and(|batch| !batch.complete)
+            {
+                // An incomplete journal owns its suffix. The supplied collector
+                // continues the actual Q/FIFO instead of waiting for the Engine
+                // backlog to become empty (which this journal itself prevents).
+                match self.collect_terminal_batch(session, collect)? {
+                    Ok(()) => {}
+                    Err(error) => match error.downcast::<IncompleteTerminalDrain>() {
+                        Ok(incomplete) if incomplete.backlog || incomplete.capacity_blocked => {}
+                        Ok(incomplete) => return Err(incomplete.into()),
+                        Err(error) => return Err(error),
+                    },
+                }
+                return Ok(BacklogOutcome {
+                    changed: false,
+                    progressed: before
+                        != self
+                            .terminal_batch
+                            .as_ref()
+                            .map(|batch| (batch.len(), batch.complete)),
+                    pending: true,
+                });
+            }
+            let changed = self
+                .dispatch_terminal_batch(session, &mut additions, &mut pending_views, &mut closure)?
+                .unwrap_or(false);
+            if changed {
+                self.publish_batch_tail(true)?;
+            }
+            return Ok(BacklogOutcome {
+                changed,
+                progressed: changed
+                    || self.collected_finish_actions == Some(0)
+                    || before
+                        != self
+                            .terminal_batch
+                            .as_ref()
+                            .map(|batch| (batch.len(), batch.complete)),
+                pending: self.collected_finish_backlog_pending(session.staged_discovery_len()),
+            });
+        }
+        self.take_frame_fresh_blocked();
+        if self.pending_discovery_records.is_empty()
+            && self.retirement_intents.is_empty()
+            && let Some(view) = self.next_collected_finish_assessment()
+        {
+            let before = self.pending_leader_exit_views.len();
+            self.settle_leader_exit_assessment(
+                view,
+                &mut pending_views,
+                &mut additions,
+                &mut closure,
+            );
+            return Ok(BacklogOutcome {
+                changed: false,
+                progressed: self.pending_leader_exit_views.len() < before,
+                pending: self.collected_finish_backlog_pending(session.staged_discovery_len()),
+            });
+        }
+        let before = self.pending_discovery_records.len();
+        let mut queued = self
+            .pending_discovery_records
+            .drain(..before.min(1))
+            .collect();
+        let suffix = self.pending_discovery_records.len();
         let result = self.process_discovery_records(
             session,
             &mut queued,
             &mut pending_views,
             &mut additions,
-            &mut no_nested,
+            collect,
             &mut closure,
         );
         self.pending_discovery_records.extend(queued);
@@ -21529,6 +21756,31 @@ impl Engine {
             progressed: changed || fresh != 0 || self.pending_discovery_records.len() < before,
             pending: self.collected_finish_backlog_pending(session.staged_discovery_len()),
         })
+    }
+
+    /// A settled native ticket owed a future ORDINARY admission frame. Finish
+    /// cancels only that scheduling hint; the original {pid, serial, owner,
+    /// exec binding} request and its existing pending/unserved disclosure stay
+    /// unchanged. This is neither a served/admitted credit nor a native receipt.
+    fn dispose_collected_finish_recovery_hint(&mut self) {
+        debug_assert!(self.pending_global_retirement.is_none());
+        self.global_retirement_frame_owed = false;
+        self.immediate_exec_recovery_frame = false;
+    }
+
+    fn next_collected_finish_assessment(&mut self) -> Option<ProcessViewId> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let next = self
+            .collected_finish_assessment_after
+            .and_then(|after| {
+                self.pending_leader_exit_views
+                    .range((Excluded(after), Unbounded))
+                    .next()
+                    .copied()
+            })
+            .or_else(|| self.pending_leader_exit_views.first().copied());
+        self.collected_finish_assessment_after = next;
+        next
     }
 
     /// Takes the frame's fresh-blocked flag for the scheduler: a set flag

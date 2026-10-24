@@ -85,7 +85,12 @@ pub(super) fn admit_mapped(scene: &mut RealScene, pid: u32) -> CallerId {
 /// H0 scan targets are served through the adapter's shared custody Arc
 /// up front, so refresh, binding and tick share one custody Arc exactly
 /// as in production.
-fn production_bind(scene: &mut RealScene, caller: CallerId, pid: u32, image: ImageIdentity) {
+pub(super) fn production_bind(
+    scene: &mut RealScene,
+    caller: CallerId,
+    pid: u32,
+    image: ImageIdentity,
+) {
     let pin = scene
         .scene
         .coordinator

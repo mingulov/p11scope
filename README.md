@@ -25,7 +25,7 @@ assessment and incident diagnostics.
 > [CHANGELOG.md](CHANGELOG.md#qualification-of-this-release) preserves
 > revision-specific pre-release evidence.
 
-The unreleased development checkpoint retains legacy metrics when
+The development checkpoint retains legacy metrics when
 `--counter-mode` is omitted. Explicit `counts`, `timestamps` and `latency`
 selections are reserved and return an error before capture setup; public
 activation of those modes remains future work.

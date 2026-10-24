@@ -8352,6 +8352,21 @@ mod tests {
             self.discovery.source().remaining()
         }
 
+        pub(crate) fn discovery_drain(
+            &self,
+        ) -> &crate::events::DiscoveryDrain<crate::events::ScriptedRecords> {
+            &self.discovery
+        }
+
+        pub(super) fn retained_owner(&self) -> super::CollectedFinishQOwner<'_> {
+            super::CollectedFinishQOwner {
+                gate: &self.gate.gate,
+                producers: &self.producers,
+                discovery: &self.discovery_domain,
+                detach: &self.detach,
+            }
+        }
+
         pub(crate) fn observe(
             &self,
             expected: &super::SessionDrainProducers,

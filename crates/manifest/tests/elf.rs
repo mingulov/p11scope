@@ -835,6 +835,80 @@ fn export_facts_clamp_a_lying_dynstr_size_to_the_file() {
 }
 
 #[test]
+fn export_facts_mmap_refuses_segment_past_eof() {
+    // A LOAD segment whose file range extends past EOF must make the
+    // demand-paged path refuse byte-identically to the snapshot oracle,
+    // never answer with translated offsets past EOF. Minimized to one
+    // patched field: the executable segment's p_offset moves its file
+    // range past EOF without overflowing u64, the corrupt-header shape a
+    // fuzz seed mutation produced (offset past EOF from intact tables).
+    let d = tmp("elf-export-facts-segment-past-eof");
+    let provider = cc_so(&d, "provider", provider_source());
+    let original = std::fs::read(&provider).unwrap();
+    let mut bytes = original.clone();
+    let header = program_header(&bytes, elf::PT_LOAD, true);
+    let offset = le_u64(&bytes, header.start + 8);
+    let filesz = le_u64(&bytes, header.start + 32);
+    assert!(
+        offset
+            .checked_add(filesz)
+            .is_some_and(|end| end <= original.len() as u64),
+        "fixture segment must start in range (offset {offset:#x}, filesz {filesz:#x})"
+    );
+    let corrupted = original.len() as u64 + 0x1000;
+    bytes[header.start + 8..header.start + 16].copy_from_slice(&corrupted.to_le_bytes());
+    assert_ne!(bytes, original, "the patch must change the image");
+    let path = d.join("segment-past-eof.so");
+    std::fs::write(&path, &bytes).unwrap();
+
+    // The oracle pins the setup: the image still classifies, and refuses
+    // only on the segment range.
+    let oracle_err = oracle_facts(&path, REGISTRY).unwrap_err();
+    assert_eq!(oracle_err, "segment file range extends past the ELF bytes");
+    // The mmap path refuses byte-identically (pre-fix: Ok with offsets past EOF).
+    assert_sparse_matches_oracle(&path, REGISTRY);
+    // The bounded twin shares the same refused core.
+    let file = p11scope_manifest::identity::open_object(&path).unwrap();
+    let reserved = file.metadata().unwrap().len();
+    assert_eq!(
+        read_export_facts_bounded(&file, REGISTRY, reserved).unwrap_err(),
+        oracle_err
+    );
+}
+
+#[test]
+fn export_facts_mmap_matches_snapshot_on_valid_image() {
+    // Healthy twin of the segment-past-EOF refusal: the same seed image,
+    // unpatched, yields mmap facts equal to the snapshot oracle, with
+    // every offset inside the file and the charge within the mapped length.
+    let d = tmp("elf-export-facts-valid-twin");
+    let provider = cc_so(&d, "provider", provider_source());
+    let file_len = std::fs::metadata(&provider).unwrap().len();
+    let (abi, exports) = oracle_facts(&provider, REGISTRY).unwrap();
+    assert!(
+        !exports.is_empty(),
+        "the fixture must export hooks, or the offsets are unpinned"
+    );
+    let (sparse_abi, sparse_exports, charged) = sparse_result(&provider, REGISTRY).unwrap();
+    assert_eq!((sparse_abi, sparse_exports.clone()), (abi, exports));
+    for (name, offset) in &sparse_exports {
+        assert!(
+            *offset < file_len,
+            "{name} offset {offset} outside {file_len} bytes"
+        );
+    }
+    assert!(
+        charged <= file_len,
+        "charged {charged} exceeds mapped {file_len}"
+    );
+    let file = p11scope_manifest::identity::open_object(&provider).unwrap();
+    assert_eq!(
+        read_export_facts_bounded(&file, REGISTRY, file_len).unwrap(),
+        (abi, sparse_exports, charged)
+    );
+}
+
+#[test]
 fn export_facts_refuse_an_empty_file_exactly_like_snapshot() {
     // Mapping a 0-length file derefs to an empty slice (memmap2 documents
     // this), so the shared parser refuses it with today's exact snapshot

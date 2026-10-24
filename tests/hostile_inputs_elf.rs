@@ -475,17 +475,23 @@ fn seeded_byte_mutations_never_panic_or_over_attribute() {
             },
             Err(_) => refused += 1,
         }
-        // The charge stays clamped by construction, but the mmap
-        // path's offsets are NOT asserted here: seed mutation 45
-        // shows `read_export_facts` returning an offset past EOF
-        // for an image the snapshot oracle refuses (see the lane
-        // report's "Defects found"; repro kept out of tree).
+        // The mmap path shares the snapshot's segment-range validation,
+        // so any offsets it returns must lie inside the image — seed
+        // mutation 45 once returned an offset past EOF here for an image
+        // the snapshot oracle refuses.
         let file = open_of(&dir, &bytes);
-        if let Ok((_, _, charged)) = read_export_facts(&file, &[ANSWER]) {
+        if let Ok((_, exports, charged)) = read_export_facts(&file, &[ANSWER]) {
             assert!(
                 charged <= seed.len() as u64,
                 "mutation {iteration} overcharged"
             );
+            for (_, offset) in &exports {
+                assert!(
+                    *offset < bytes.len() as u64,
+                    "mutation {iteration} attributed offset {offset} past EOF {}",
+                    bytes.len()
+                );
+            }
         }
     }
     assert_eq!(refused + accepted, MUTATIONS);

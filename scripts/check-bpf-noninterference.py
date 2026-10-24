@@ -4,7 +4,8 @@
 
 Run an explicit --repeat-baseline diagnostic first, then compare distinct
 baseline/candidate commits. Neither mode installs tools or uses target caches.
-The baseline decision is reviewed separately from this same-environment check.
+The baseline decision is reviewed separately. The explicit host compiler
+transition preserves the shared BPF tool environment and records both hosts.
 """
 
 from __future__ import annotations
@@ -34,6 +35,10 @@ from _loader import load_path
 
 OBJECT_NAMES = ("p11scope-ebpf", "p11scope-ebpf-inventory", "p11scope-ebpf-inventory-callers")
 RELEASE_RUST = "1.98.1"
+RELEASE_COMMIT = "48a229ceaefd4985c50990b14116b6d856af0985"
+TRANSITION_RELEASE_RUST = "1.99.1"
+TRANSITION_RELEASE_COMMIT = "58cf8f9c35b355199727627d07ae34a4e2846d67"
+HOST_TRANSITION_BASELINE = "68c258cf54d736370e214172d187d7d3905a8bb5"
 BPF_RUST = "nightly-2026-05-20"
 BPF_LINKER = "0.10.4"
 MAX_LOG_BYTES = 64 * 1024 * 1024
@@ -151,11 +156,30 @@ def clean_environment(scratch: Path) -> dict[str, str]:
     return environment
 
 
-def tool_identity(cwd: Path, env: dict[str, str], evidence: Path, label: str) -> dict:
+def validate_host_metadata(metadata: str, release: str, commit: str) -> None:
+    for prefix, expected in (("release: ", release), ("commit-hash: ", commit),
+                             ("host: ", "x86_64-unknown-linux-gnu")):
+        values = [line[len(prefix):] for line in metadata.splitlines() if line.startswith(prefix)]
+        if values != [expected]:
+            raise CheckError(f"host compiler metadata must identify rustc {release} ({commit}) on Linux x86-64")
+
+
+def validate_snapshot_compiler(pin: str, guard: str, compiler: tuple[str, str]) -> None:
+    release, commit = compiler
+    if pin.strip() != release:
+        raise CheckError(f"snapshot does not select the reviewed release Rust compiler {release}")
+    for name, expected in (("RELEASE", release), ("COMMIT", commit)):
+        values = re.findall(r'^pub const ' + name + r': &str = "([^"\n]+)";$', guard, re.MULTILINE)
+        if values != [expected]:
+            raise CheckError(f"snapshot compiler guard must pin rustc {release} ({commit})")
+
+
+def tool_identity(cwd: Path, env: dict[str, str], evidence: Path, label: str, *,
+                  host_compilers: tuple[tuple[str, str], ...] = ((RELEASE_RUST, RELEASE_COMMIT),)) -> dict:
     """Record only the tools and packages that supply this build recipe."""
     records = {}
-    # cargo.sh and the nested build both execute PATH cargo. Record that
-    # dispatcher as well as rustup's selected channel-specific executables.
+    # Nightly cargo.sh and the nested build execute PATH cargo. Host commands
+    # consume the selected Cargo path directly; retain both identities.
     for tool in ("cargo", "rustup", "clang-18", "bpf-linker", "bpftool", "llvm-readelf", "python3", "dpkg-query"):
         resolved = shutil.which(tool, path=env["PATH"])
         if resolved is None:
@@ -164,7 +188,7 @@ def tool_identity(cwd: Path, env: dict[str, str], evidence: Path, label: str) ->
         if not path.is_file():
             raise CheckError(f"tool is not a regular file: {path}")
         records[tool] = {"path": str(Path(resolved)), "realpath": str(path), "sha256": sha256(path)}
-    for channel in (RELEASE_RUST, BPF_RUST):
+    for channel in (*[release for release, _ in host_compilers], BPF_RUST):
         for tool in ("cargo", "rustc"):
             output = run_command(["rustup", "which", "--toolchain", channel, tool], cwd, env,
                                  evidence, f"{label}-which-{channel}-{tool}")
@@ -175,6 +199,8 @@ def tool_identity(cwd: Path, env: dict[str, str], evidence: Path, label: str) ->
                                   evidence, f"{label}-version-{channel}-{tool}")
             records[f"{channel}-{tool}"] = {"path": str(path), "realpath": str(path.resolve()),
                                               "sha256": sha256(path), "version": read_output(version).strip()}
+    for release, commit in host_compilers:
+        validate_host_metadata(records[release + "-rustc"]["version"], release, commit)
     for tool in ("rustup", "clang-18", "bpf-linker", "bpftool", "python3"):
         query = "--help" if tool == "rustup" else "--version"
         output = run_command([tool, query], cwd, env, evidence, f"{label}-version-{tool}")
@@ -523,16 +549,17 @@ def verify_home_configuration(home: Path, expected: bytes | None) -> None:
 
 
 def build_snapshot(repo: Path, revision: str, scratch: Path, evidence: Path, *,
+                   host_compiler: tuple[str, str] = (RELEASE_RUST, RELEASE_COMMIT),
+                   host_compilers: tuple[tuple[str, str], ...] = ((RELEASE_RUST, RELEASE_COMMIT),),
                    offline_payload: Path | None = None) -> dict[str, Path]:
-    if scratch.name != "scratch" or scratch.parent != evidence.parent or evidence.name not in {"baseline", "candidate"}:
+    if (scratch.name != evidence.name + "-scratch" or scratch.parent != evidence.parent
+            or evidence.name not in {"baseline", "candidate"}):
         raise CheckError("snapshot paths must belong to one owned comparison directory")
     owner = json.loads((scratch.parent / "ownership.json").read_text(encoding="utf-8"))
     if owner != {"pid": os.getpid(), "repo": str(repo)}:
         raise CheckError("comparison scratch ownership mismatch")
-    if scratch.exists():
-        if scratch.is_symlink():
-            raise CheckError("owned scratch was replaced by a symlink")
-        shutil.rmtree(scratch)
+    if os.path.lexists(scratch):
+        raise CheckError("snapshot source/config scratch must be absent")
     scratch.mkdir(mode=0o700)
     source = scratch / "source"
     source.mkdir()
@@ -540,12 +567,17 @@ def build_snapshot(repo: Path, revision: str, scratch: Path, evidence: Path, *,
     evidence.mkdir(mode=0o700)
     env = clean_environment(scratch)
     coordinator = coordinator_identity()
-    before = tool_identity(source, env, evidence, "tools-before")
+    before = tool_identity(source, env, evidence, "tools-before", host_compilers=host_compilers)
     archive = run_command(["git", "-C", str(repo), "archive", "--format=tar", revision],
                           source, env, evidence, "git-archive", stdout_path=evidence / "source.tar")
     source_digests = extract_snapshot(archive, source)
-    if (source / ".release-rust-version").read_text().strip() != RELEASE_RUST:
-        raise CheckError("snapshot does not select the reviewed release Rust compiler")
+    validate_snapshot_compiler((source / ".release-rust-version").read_text(),
+                               (source / "build_support/semantic_rustc.rs").read_text(), host_compiler)
+    release, commit = host_compiler
+    selected_host = {"release": release, "commit": commit,
+                     "cargo": before[release + "-cargo"], "rustc": before[release + "-rustc"]}
+    host_env = dict(env, RUSTC=selected_host["rustc"]["path"])
+    host_cargo = selected_host["cargo"]["path"]
     # Cargo also reads parent-directory configuration, independent of the
     # private CARGO_HOME. Refuse it rather than inheriting target/tool overrides.
     for directory in (source / "crates/ebpf", source / "crates", source, *source.parents):
@@ -559,7 +591,8 @@ def build_snapshot(repo: Path, revision: str, scratch: Path, evidence: Path, *,
     nightly = nightly_source(nightly_rustc, source, env, evidence, "nightly-source-before")
     receipt = {"revision": revision, "tree": read_output(tree).strip(), "archive_sha256": sha256(archive),
                "lockfiles": {name: sha256(source / name) for name in ("Cargo.lock", "crates/ebpf/Cargo.lock")},
-               "build_environment": {key: env[key] for key in ("CARGO_HOME", "CARGO_TARGET_DIR", "CARGO_BUILD_BUILD_DIR", "CARGO_ENCODED_RUSTFLAGS")},
+               "build_environment": {key: host_env[key] for key in ("CARGO_HOME", "CARGO_TARGET_DIR", "CARGO_BUILD_BUILD_DIR", "CARGO_ENCODED_RUSTFLAGS", "RUSTC")},
+               "host_compiler": selected_host,
                "tools": before, "coordinator": coordinator, "nightly_source": nightly,
                "acquisition_mode": "verified-payload" if offline_payload else "online"}
     write_json(evidence / "snapshot.json", receipt)
@@ -569,8 +602,8 @@ def build_snapshot(repo: Path, revision: str, scratch: Path, evidence: Path, *,
         run_command(["python3", "-I", "scripts/prepare-dependencies.py"], source, env,
                     evidence, "prepare-dependencies", timeout=600)
         verify_home_configuration(Path(env["CARGO_HOME"]), None)
-        run_command(["./scripts/cargo.sh", "+" + RELEASE_RUST, "fetch", "--locked", "--manifest-path", "Cargo.toml"],
-                    source, env, evidence, "fetch-root", timeout=900)
+        run_command([host_cargo, "fetch", "--locked", "--manifest-path", "Cargo.toml"],
+                    source, host_env, evidence, "fetch-root", timeout=900)
         run_command(["./scripts/cargo.sh", "+" + BPF_RUST, "fetch", "--locked", "--manifest-path", "crates/ebpf/Cargo.toml"],
                     source, env, evidence, "fetch-bpf", timeout=900)
         run_command(["./scripts/cargo.sh", "+" + BPF_RUST, "fetch", "--locked", "--manifest-path", nightly["manifest"]],
@@ -581,6 +614,7 @@ def build_snapshot(repo: Path, revision: str, scratch: Path, evidence: Path, *,
         helper = load_path(COORDINATOR_DIRECTORY / "offline-dependencies.py")
         preparer = load_path(source / "scripts/prepare-dependencies.py")
         env.update(CARGO_NET_OFFLINE="true")
+        host_env.update(CARGO_NET_OFFLINE="true")
         try:
             with helper_environment(env):
                 supplied, payload_tool = helper._verify_payload_contents(source, offline_payload, nightly_rustc, preparer)
@@ -603,23 +637,24 @@ def build_snapshot(repo: Path, revision: str, scratch: Path, evidence: Path, *,
         receipt["offline_payload"] = payload_receipts
         write_json(evidence / "snapshot.json", receipt)
         verify_home_configuration(Path(env["CARGO_HOME"]), configuration)
-        run_command(["./scripts/cargo.sh", "+" + RELEASE_RUST, "fetch", "--locked", "--offline", "--manifest-path", "Cargo.toml"],
-                    source, env, evidence, "fetch-root", timeout=900)
+        run_command([host_cargo, "fetch", "--locked", "--offline", "--manifest-path", "Cargo.toml"],
+                    source, host_env, evidence, "fetch-root", timeout=900)
         run_command(["./scripts/cargo.sh", "+" + BPF_RUST, "fetch", "--locked", "--offline", "--manifest-path", "crates/ebpf/Cargo.toml"],
                     source, env, evidence, "fetch-bpf", timeout=900)
         run_command(["./scripts/cargo.sh", "+" + BPF_RUST, "fetch", "--locked", "--offline", "--manifest-path", nightly["manifest"]],
                     source, env, evidence, "fetch-sysroot", timeout=900)
     # build.rs invokes nested nightly Cargo: propagate offline there too.
     env["CARGO_NET_OFFLINE"] = "true"
-    metadata_log = run_command(["./scripts/cargo.sh", "+" + RELEASE_RUST, "metadata", "--locked", "--offline",
-                                "--no-deps", "--format-version", "1"], source, env, evidence, "metadata")
+    host_env["CARGO_NET_OFFLINE"] = "true"
+    metadata_log = run_command([host_cargo, "metadata", "--locked", "--offline",
+                                "--no-deps", "--format-version", "1"], source, host_env, evidence, "metadata")
     metadata = json.loads(read_output(metadata_log))
     packages = [package for package in metadata["packages"]
                 if package["name"] == "p11scope" and package["manifest_path"] == str(source / "Cargo.toml")]
     if len(packages) != 1 or metadata["workspace_root"] != str(source):
         raise CheckError("metadata must identify exactly the snapshot's root p11scope package")
-    build_log = run_command(["./scripts/cargo.sh", "+" + RELEASE_RUST, "build", "--locked", "--offline", "--lib",
-                             "--no-default-features", "--message-format=json"], source, env, evidence,
+    build_log = run_command([host_cargo, "build", "--locked", "--offline", "--lib",
+                             "--no-default-features", "--message-format=json"], source, host_env, evidence,
                             "build", timeout=1800)
     out_dir = select_out_dir(read_output(build_log), packages[0]["id"], scratch)
     identity_receipt = out_dir / "p11scope-identity-build-info.txt"
@@ -662,7 +697,7 @@ def build_snapshot(repo: Path, revision: str, scratch: Path, evidence: Path, *,
     for relative, digest in source_digests.items():
         if sha256(source / relative) != digest:
             raise CheckError(f"tracked snapshot input changed during build: {relative}")
-    after = tool_identity(source, env, evidence, "tools-after")
+    after = tool_identity(source, env, evidence, "tools-after", host_compilers=host_compilers)
     if before != after:
         raise CheckError("tool identity changed during the snapshot build")
     if coordinator_identity() != coordinator:
@@ -682,6 +717,8 @@ def main() -> int:
     parser.add_argument("--candidate", required=True)
     parser.add_argument("--work", type=Path, required=True)
     parser.add_argument("--repeat-baseline", action="store_true")
+    parser.add_argument("--host-compiler-transition", action="store_true",
+                        help="compare the reviewed 1.98.1 historical baseline with a 1.99.1 candidate; never repeat control")
     parser.add_argument("--baseline-offline-payload", type=Path)
     parser.add_argument("--candidate-offline-payload", type=Path)
     options = parser.parse_args()
@@ -689,6 +726,8 @@ def main() -> int:
         if platform.system() != "Linux" or platform.machine() != "x86_64":
             raise CheckError("the reviewed recipe requires Linux x86-64")
         validate_path(dict(os.environ))
+        if options.host_compiler_transition and options.repeat_baseline:
+            raise CheckError("host compiler transition cannot relabel a --repeat-baseline control")
         if (options.baseline_offline_payload is None) != (options.candidate_offline_payload is None):
             raise CheckError("both baseline and candidate offline payload paths are required")
         repo, work = options.repo, options.work
@@ -715,11 +754,32 @@ def main() -> int:
         baseline, candidate = revisions
         if (baseline == candidate) != options.repeat_baseline:
             raise CheckError("integration needs distinct commits; equal commits need explicit --repeat-baseline")
-        scratch = work / "scratch"
-        left = build_snapshot(repo, baseline, scratch, work / "baseline", offline_payload=options.baseline_offline_payload)
-        right = build_snapshot(repo, candidate, scratch, work / "candidate", offline_payload=options.candidate_offline_payload)
-        first = json.loads((work / "baseline/snapshot.json").read_text())["tools"]
-        second = json.loads((work / "candidate/snapshot.json").read_text())["tools"]
+        host_compilers = ((RELEASE_RUST, RELEASE_COMMIT),)
+        if options.host_compiler_transition:
+            if baseline != HOST_TRANSITION_BASELINE:
+                raise CheckError("host compiler transition requires the reviewed historical baseline " + HOST_TRANSITION_BASELINE)
+            host_compilers += ((TRANSITION_RELEASE_RUST, TRANSITION_RELEASE_COMMIT),)
+        selected = (host_compilers[0], host_compilers[-1])
+        # Refuse either immutable pin/guard before paying for the first build.
+        # The extracted archive is checked again at its actual consumption seam.
+        for side, revision, compiler in zip(("baseline", "candidate"), revisions, selected):
+            values = []
+            for name, relative in (("pin", ".release-rust-version"), ("guard", "build_support/semantic_rustc.rs")):
+                path = run_command(["git", "-C", str(repo), "show", revision + ":" + relative],
+                                   repo, dict(os.environ), work, "compiler-" + side + "-" + name)
+                values.append(read_output(path))
+            validate_snapshot_compiler(*values, compiler)
+        baseline_scratch, candidate_scratch = work / "baseline-scratch", work / "candidate-scratch"
+        left = build_snapshot(repo, baseline, baseline_scratch, work / "baseline", host_compiler=selected[0],
+                              host_compilers=host_compilers, offline_payload=options.baseline_offline_payload)
+        # Object copies and receipts remain; disposable build inputs never
+        # become a shared source/configuration target or double the disk peak.
+        shutil.rmtree(baseline_scratch)
+        right = build_snapshot(repo, candidate, candidate_scratch, work / "candidate", host_compiler=selected[1],
+                               host_compilers=host_compilers, offline_payload=options.candidate_offline_payload)
+        baseline_receipt = json.loads((work / "baseline/snapshot.json").read_text())
+        candidate_receipt = json.loads((work / "candidate/snapshot.json").read_text())
+        first, second = baseline_receipt["tools"], candidate_receipt["tools"]
         if first != second:
             raise CheckError("tool identity changed between baseline and candidate builds")
         if (json.loads((work / "baseline/snapshot.json").read_text())["coordinator"]
@@ -729,11 +789,17 @@ def main() -> int:
                 != json.loads((work / "candidate/snapshot.json").read_text())["nightly_source"]):
             raise CheckError("selected nightly source changed between snapshot builds")
         verdicts = compare_objects(left, right)
-        write_json(work / "comparison.json", {"mode": "repeat-baseline" if options.repeat_baseline else "integration",
+        mode = ("host-compiler-transition" if options.host_compiler_transition
+                else "repeat-baseline" if options.repeat_baseline else "integration")
+        write_json(work / "comparison.json", {"mode": mode,
                                               "baseline": baseline, "candidate": candidate,
+                                              "host_compilers": {"baseline": baseline_receipt["host_compiler"],
+                                                                 "candidate": candidate_receipt["host_compiler"]},
                                               "acquisition_mode": "verified-payload" if options.baseline_offline_payload else "online",
                                               "matched_objects": list(OBJECT_NAMES),
                                               "verdicts": verdicts})
+        if options.host_compiler_transition:
+            print(f"bpf-noninterference: host compiler transition {RELEASE_RUST} -> {TRANSITION_RELEASE_RUST}; shared BPF tools unchanged")
         relaxed = sorted(name for name, verdict in verdicts.items() if verdict != "exact")
         if relaxed:
             print(f"bpf-noninterference: {baseline} vs {candidate}: all three objects match "

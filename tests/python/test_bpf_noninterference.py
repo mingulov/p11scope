@@ -403,7 +403,8 @@ class BuildDriverTests(unittest.TestCase):
         return fixture
 
     def calls(self):
-        return [json.loads(line) for line in (self.root / "calls.jsonl").read_text().splitlines()]
+        path = self.root / "calls.jsonl"
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
 
     def assert_rustup_identity_probes(self):
         banner = "rustup 1.29.1 (d95a37b6a 2026-08-13)"
@@ -483,6 +484,9 @@ class BuildDriverTests(unittest.TestCase):
         self.assertEqual(snapshots[0]["nightly_source"], snapshots[1]["nightly_source"])
         for snapshot, release in zip(snapshots, ("1.98.1", "1.99.1")):
             self.assertEqual(snapshot["host_compiler"]["release"], release)
+            remaps = snapshot["build_environment"]["CARGO_ENCODED_RUSTFLAGS"].split("\x1f")
+            self.assertEqual([flag.rsplit("=", 1)[1] for flag in remaps],
+                             ["/p11scope", "/p11scope-build", "/cargo", "/rustup"])
             for channel in ("1.98.1", "1.99.1", "nightly-2026-05-20"):
                 for tool in ("cargo", "rustc"):
                     self.assertIn(channel + "-" + tool, snapshot["tools"])
@@ -541,6 +545,8 @@ class BuildDriverTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("compiler", result.stderr)
                 self.assertFalse((self.work / "comparison.json").exists())
+        self.assertFalse(any(call["tool"] == "cargo" and ("fetch" in call["argv"] or "build" in call["argv"])
+                             for call in self.calls()))
 
     def test_host_compiler_transition_still_rejects_shared_tool_and_object_drift(self):
         self.transition_candidate()
@@ -721,8 +727,11 @@ class BuildDriverTests(unittest.TestCase):
         builds = [call for call in self.calls() if call["tool"] == "cargo" and "build" in call["argv"]]
         self.assertEqual(len(builds), 2)
         self.assertTrue(all(call["home_fresh"] for call in builds))
-        self.assertEqual(builds[0]["config"], builds[1]["config"])
-        self.assertIn(str(self.work / "scratch/offline-payload/vendor"), builds[0]["config"])
+        self.assertEqual(
+            builds[0]["config"].replace(str(self.work / "baseline-scratch"), "@OWNED_SCRATCH@"),
+            builds[1]["config"].replace(str(self.work / "candidate-scratch"), "@OWNED_SCRATCH@"))
+        for call, side in zip(builds, ("baseline", "candidate")):
+            self.assertIn(str(self.work / (side + "-scratch/offline-payload/vendor")), call["config"])
         fetches = [call for call in self.calls() if call["tool"] == "cargo" and "fetch" in call["argv"]]
         self.assertEqual(len(fetches), 6)
         for call in self.calls():

@@ -1098,6 +1098,268 @@ class CounterObjectCliTests(unittest.TestCase):
             self.assertIsNone(checker["bank_require_start_read_before_remove"](
                 set(), get_call, bodies_with_get, reached | {(3, 0)}))
 
+    def test_growth_timing_clock_tag_is_required_on_bridge_arguments(self):
+        checker = runpy.run_path(str(CHECKER), run_name="counter_timing_clock_test")
+        self.assertIn("CLOCK_TAG", checker, "clock tag is not implemented")
+        self.assertIn("bank_is_clock", checker, "clock predicate is not implemented")
+        self.assertIn("bank_require_timed_bridge_clock", checker,
+                      "bridge clock rule is not implemented")
+        self.assertEqual(checker["CLOCK_TAG"], "clock")
+        clock = checker["scalar"](0, (1 << 64) - 1, "clock")
+        self.assertTrue(checker["bank_is_clock"](clock))
+        for other in (checker["ZERO"], checker["constant"](0), checker["scalar"](),
+                      checker["scalar"](0, 100), None, ("ptr", "START", 0, 0, None)):
+            with self.subTest(other=other):
+                self.assertFalse(checker["bank_is_clock"](other))
+        proof = checker["BankFootprint"](None, {}, native_bound=8192,
+                                         growth=True, mode="timestamps")
+        registers = [None] * 11
+        proof.helper(5, registers, {}, (1, 0), 0)
+        self.assertTrue(checker["bank_is_clock"](registers[0]),
+                        "helper 5 must tag its result as a clock value")
+        for mode in ("timestamps", "latency"):
+            with self.subTest(mode=mode, bridge="entry"):
+                good = [None] * 11
+                good[3] = clock
+                self.assertIsNone(checker["bank_require_timed_bridge_clock"](
+                    "p11_bank_enter_timed", good, mode))
+                for label, value in (("constant zero", checker["constant"](0)),
+                                     ("untagged range", checker["scalar"]()),
+                                     ("absent", None)):
+                    with self.subTest(mutant=label):
+                        bad = [None] * 11
+                        bad[3] = value
+                        with self.assertRaisesRegex(
+                                RuntimeError,
+                                f"^bank {mode} entry passes a non-clock timestamp "
+                                r"to its timed bridge$"):
+                            checker["bank_require_timed_bridge_clock"](
+                                "p11_bank_enter_timed", bad, mode)
+            with self.subTest(mode=mode, bridge="return"):
+                good = [None] * 11
+                good[5] = clock
+                self.assertIsNone(checker["bank_require_timed_bridge_clock"](
+                    "p11_bank_complete_timed", good, mode))
+                for label, value in (("constant zero", checker["constant"](0)),
+                                     ("stale untagged", checker["scalar"](1000, 2000)),
+                                     ("absent", None)):
+                    with self.subTest(mutant=label):
+                        bad = [None] * 11
+                        bad[5] = value
+                        with self.assertRaisesRegex(
+                                RuntimeError,
+                                f"^bank {mode} return passes a non-clock timestamp "
+                                r"to its timed bridge$"):
+                            checker["bank_require_timed_bridge_clock"](
+                                "p11_bank_complete_timed", bad, mode)
+
+        def clock_graph(root_name, bridge_name, root_instructions, root_calls):
+            root, bridge = (1, 0), (1, 8)
+
+            class Graph:
+                def __init__(self):
+                    self.instructions = {
+                        root: dict(enumerate(root_instructions)),
+                        bridge: {0: (0x95, 0, 0, 0)},
+                    }
+                    self.calls = {(root, pc): call for pc, call in root_calls.items()}
+                    self.loops = {root: {}, bridge: {}}
+                    self.bodies = {root: (root_name,), bridge: (bridge_name,)}
+            return Graph(), root
+
+        maps = {"START": {"value_size": 288}}
+        entry_bridge = "p11_bank_enter_timed"
+        positive, root = clock_graph(
+            "p11_counter_bank_entry", entry_bridge,
+            [(0x85, 0, 0, 5), (0xbf, 0x03, 0, 0), (0x85, 0x10, 0, 0),
+             (0x95, 0, 0, 0)],
+            {0: ("helper", 5), 2: ("function", (1, 8))})
+        proof = checker["BankFootprint"](positive, maps, native_bound=8192,
+                                         growth=True, mode="timestamps")
+        proof.run(root, [("external", "ctx", 0), checker["scalar"](),
+                         checker["scalar"](), None, None])
+        spilled, root = clock_graph(
+            "p11_counter_bank_entry", entry_bridge,
+            [(0x85, 0, 0, 5), (0x7b, 0x0a, -8, 0), (0x79, 0xa3, -8, 0),
+             (0x85, 0x10, 0, 0), (0x95, 0, 0, 0)],
+            {0: ("helper", 5), 3: ("function", (1, 8))})
+        proof = checker["BankFootprint"](spilled, maps, native_bound=8192,
+                                         growth=True, mode="latency")
+        proof.run(root, [("external", "ctx", 0), checker["scalar"](),
+                         checker["scalar"](), None, None])
+        pid_graph, root = clock_graph(
+            "p11_counter_bank_entry", entry_bridge,
+            [(0x85, 0, 0, 5), (0xbf, 0x23, 0, 0), (0x85, 0x10, 0, 0),
+             (0x95, 0, 0, 0)],
+            {0: ("helper", 5), 2: ("function", (1, 8))})
+        with self.subTest(mutant="pid_tgid passed as ts"):
+            proof = checker["BankFootprint"](pid_graph, maps, native_bound=8192,
+                                             growth=True, mode="timestamps")
+            with self.assertRaisesRegex(
+                    RuntimeError,
+                    "^bank timestamps entry passes a non-clock timestamp "
+                    "to its timed bridge$"):
+                proof.run(root, [("external", "ctx", 0), checker["scalar"](),
+                                 checker["scalar"](), None, None])
+        return_bridge = "p11_bank_complete_timed"
+        zero_graph, root = clock_graph(
+            "p11_counter_bank_return", return_bridge,
+            [(0x85, 0, 0, 5), (0xb7, 5, 0, 0), (0x85, 0x10, 0, 0),
+             (0x95, 0, 0, 0)],
+            {0: ("helper", 5), 2: ("function", (1, 8))})
+        with self.subTest(mutant="now is constant zero"):
+            proof = checker["BankFootprint"](zero_graph, maps, native_bound=8192,
+                                             growth=True, mode="timestamps")
+            with self.assertRaisesRegex(
+                    RuntimeError,
+                    "^bank timestamps return passes a non-clock timestamp "
+                    "to its timed bridge$"):
+                proof.run(root, [("external", "ctx", 0), None, None, None, None])
+        stale_graph, root = clock_graph(
+            "p11_counter_bank_return", return_bridge,
+            [(0x79, 0x15, 0, 0), (0x85, 0x10, 0, 0), (0x95, 0, 0, 0)],
+            {1: ("function", (1, 8))})
+        with self.subTest(mutant="now is a stale START timestamp"):
+            proof = checker["BankFootprint"](stale_graph, maps, native_bound=8192,
+                                             growth=True, mode="latency")
+            start_pointer = ("ptr", "START", 0, 0, checker["ZERO"])
+            with self.assertRaisesRegex(
+                    RuntimeError,
+                    "^bank latency return passes a non-clock timestamp "
+                    "to its timed bridge$"):
+                proof.run(root, [start_pointer, None, None, None, None])
+
+    def test_growth_timing_return_order_requires_cfg_dominance(self):
+        checker = runpy.run_path(str(CHECKER), run_name="counter_timing_order_test")
+        self.assertIn("bank_require_timing_return_order", checker,
+                      "CFG timing order rule is not implemented")
+        key, remove_body = (1, 0), (2, 0)
+        bodies = {remove_body: ("p11_owner_start_remove",)}
+        reached = {key, remove_body}
+
+        class Graph:
+            def __init__(self, instructions):
+                self.instructions = {key: dict(enumerate(instructions))}
+
+        def read(pc):
+            return (key, pc, "START", "read", (0, 0), 8, None)
+
+        def write(pc, offset=8):
+            return (key, pc, "COUNTER_BANK_VALUE", "write", (offset, offset), 8, 0xf1)
+
+        def check(instructions, touches, calls):
+            return checker["bank_require_timing_return_order"](
+                Graph(instructions), reached, touches, calls, bodies)
+
+        straight_read = [(0x79, 0x10, 0, 0), (0x85, 0x10, 0, 0),
+                         (0x95, 0, 0, 0)]
+        self.assertIsNone(check(straight_read, {read(0)}, {(key, 1): ("function", remove_body)}))
+        straight_write = [(0x85, 0x10, 0, 0), (0xdb, 0x21, 8, 0xf1),
+                          (0x95, 0, 0, 0)]
+        self.assertIsNone(check(straight_write, {write(1)},
+                                {(key, 0): ("function", remove_body)}))
+        full = [(0x79, 0x10, 0, 0), (0x85, 0x10, 0, 0),
+                (0xdb, 0x21, 8, 0xf1), (0x95, 0, 0, 0)]
+        self.assertIsNone(check(full, {read(0), write(2)},
+                                {(key, 1): ("function", remove_body)}))
+        branched = [(0x55, 1, 2, 0), (0x79, 0x10, 0, 0), (0x85, 0x10, 0, 0),
+                    (0x85, 0x10, 0, 0), (0x95, 0, 0, 0)]
+        with self.subTest(mutant="ts read after removal on one branch only"):
+            with self.assertRaisesRegex(
+                    RuntimeError,
+                    "^bank timing return retires START before reading its entry timestamp$"):
+                check(branched, {read(1)},
+                      {(key, 2): ("function", remove_body),
+                       (key, 3): ("function", remove_body)})
+        early_write = [(0xdb, 0x21, 8, 0xf1), (0x85, 0x10, 0, 0),
+                       (0x95, 0, 0, 0)]
+        with self.subTest(mutant="accounting write before START removal"):
+            with self.assertRaisesRegex(
+                    RuntimeError,
+                    "^bank timing return accounts before retiring START$"):
+                check(early_write, {write(0)}, {(key, 1): ("function", remove_body)})
+        unguarded_write = [(0x55, 1, 2, 0), (0x85, 0x10, 0, 0),
+                           (0xdb, 0x21, 8, 0xf1), (0xdb, 0x21, 8, 0xf1),
+                           (0x95, 0, 0, 0)]
+        with self.subTest(mutant="accounting write on a branch without removal"):
+            with self.assertRaisesRegex(
+                    RuntimeError,
+                    "^bank timing return accounts before retiring START$"):
+                check(unguarded_write, {write(2), write(3)},
+                      {(key, 1): ("function", remove_body)})
+        with self.subTest(order="no removal and no accounting is vacuous"):
+            self.assertIsNone(check([(0x95, 0, 0, 0)], set(), {}))
+
+    def test_growth_timing_execution_uses_per_mode_cells_and_clock(self):
+        checker = runpy.run_path(str(CHECKER), run_name="counter_timing_cells_test")
+        self.assertIn("bank_timing_growth_scenarios", checker,
+                      "timing scenarios are not implemented")
+        for mode, size in (("counts", 24), ("timestamps", 40), ("latency", 296)):
+            with self.subTest(mode=mode):
+                vm = checker["BankExecution"](None, growth=True, mode=mode)
+                self.assertEqual(vm.mode, mode)
+                self.assertEqual(vm.cell_bytes, size)
+                self.assertEqual(vm.config_word, GROWTH_CONFIG_WORDS[mode])
+                address = vm.bank_storage[0]
+                region = vm.region(address, size)
+                self.assertIsNotNone(region)
+                self.assertEqual(region[1], size)
+        vm = checker["BankExecution"](None, growth=True, mode="timestamps")
+        vm.start(7, ts=1234)
+        key = struct.pack("<QII", 9, 7, 0)
+        self.assertEqual(vm.read(vm.starts[key], 8), 1234)
+        vm = checker["BankExecution"](None, growth=True, mode="latency")
+        vm.start(9, ts=(1 << 64) - 1)
+        key = struct.pack("<QII", 9, 9, 0)
+        self.assertEqual(vm.read(vm.starts[key], 8), (1 << 64) - 1)
+        vm = checker["BankExecution"](None, growth=True, mode="counts")
+        vm.start(3)
+        key = struct.pack("<QII", 9, 3, 0)
+        self.assertEqual(vm.read(vm.starts[key], 8), 0)
+        for mode in ("timestamps", "latency"):
+            with self.subTest(mode=mode, row="timing"):
+                vm = checker["BankExecution"](None, growth=True, mode=mode)
+                slot = 511 if mode == "timestamps" else 512
+                bank, cell = slot >> 9, slot & 511
+                body = struct.pack("<QQQQQ", 1, 1, 0, 1000, 1000)
+                if mode == "latency":
+                    body += bytes(8 * 32)
+                    bucket = bytearray(body)
+                    struct.pack_into("<Q", bucket, 40 + 10 * 8, 1)
+                    body = bytes(bucket)
+                vm.bank_storage[slot] = vm.set(f"bank{bank}", cell, body)
+                self.assertEqual(vm.timing_row(slot), (1, 1, 0, 1000, 1000))
+                if mode == "latency":
+                    self.assertEqual(vm.bucket(slot, 10), 1)
+                    self.assertEqual(vm.bucket(slot, 0), 0)
+
+    def test_growth_timing_scenarios_cover_cells_boundaries_and_health(self):
+        checker = runpy.run_path(str(CHECKER), run_name="counter_timing_cover_test")
+        self.assertIn("bank_timing_growth_scenarios", checker,
+                      "timing scenarios are not implemented")
+        self.assertIn("bank_timing_bucket", checker,
+                      "timing bucket helper is not implemented")
+        self.assertEqual(checker["bank_timing_bucket"](0), 0)
+        self.assertEqual(checker["bank_timing_bucket"](1), 1)
+        self.assertEqual(checker["bank_timing_bucket"](2), 2)
+        self.assertEqual(checker["bank_timing_bucket"](3), 2)
+        self.assertEqual(checker["bank_timing_bucket"](1 << 30), 31)
+        self.assertEqual(checker["bank_timing_bucket"]((1 << 64) - 1), 31)
+
+        class Graph:
+            instructions = {(1, 0): {0: (0x3d, 0x12, 2, 0), 1: (0xb7, 0, 0, 0),
+                                     2: (0x05, 0, 2, 0), 3: (0xbf, 0x20, 0, 0),
+                                     4: (0x1f, 0x10, 0, 0), 5: (0x95, 0, 0, 0)}}
+
+        for ts, now, delta in ((1000, 2000, 1000), (2000, 1000, 0), (7, 7, 0)):
+            with self.subTest(ts=ts, now=now):
+                vm = checker["BankExecution"](Graph(), growth=True, mode="timestamps")
+                self.assertEqual(vm.execute((1, 0), [ts, now], 0), delta)
+        healthy = checker["BankExecution"](None, growth=True, mode="timestamps")
+        healthy.set("COUNTER_HEALTH", 0, (1).to_bytes(8, "little"))
+        self.assertEqual(healthy.health(0), 1)
+        self.assertEqual(healthy.health(1), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

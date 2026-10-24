@@ -143,6 +143,13 @@ capture behavior or establish the provenance of its input files.
   Otherwise stays a documented correct-but-slow fallback per the
   kernel-tier directive.
 
+On kernels without uprobe_multi (5.15, 6.1), stopping a capture with many
+probes takes about 50 ms per probe link (for example, about 3.5 minutes
+for 4,227 links). The stop stays correct and finite with no cap: once the
+estimate reaches 2 s, p11scope prints one up-front estimate line, then the
+usual per-second progress, and a second Ctrl-C stops waiting and leaves
+the kernel to finish the remaining closes after exit.
+
 ### 5.15: physical-identity controls and non-leader exec unqualified
 
 - What the user sees: on 5.15 only, four privileged regression cells fail

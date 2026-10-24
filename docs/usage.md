@@ -414,7 +414,11 @@ at the stop gate's quiescence point, before any probe link is closed. Closing
 the links then runs in the background with a progress line on stderr about
 once a second (`p11scope: cleanup 1200/4227 links released, 38 s`) and a final
 `p11scope: cleanup completed, …` line (`cleanup incomplete, … uncertain` when
-a close failed); with many attached functions this can take seconds. A second
+a close failed); with many attached functions this can take seconds. On kernels
+without batched uprobe detach, when closing the links is expected to take at
+least two seconds, one estimate line prints first (`p11scope: closing 4227 probe
+links one at a time (no batched uprobe detach on this kernel); about 212 s,
+progress follows`). A second
 Ctrl-C while the links are closing stops waiting: p11scope prints the
 progress and `p11scope: cleanup incomplete`, exits with status 130, and the
 kernel finishes the remaining closes as the process exits — the report is

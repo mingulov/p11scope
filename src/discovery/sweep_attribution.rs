@@ -1534,6 +1534,14 @@ pub(crate) trait ConfirmIo {
     fn take_member(&mut self) -> Option<RetainedGroupMember> {
         None
     }
+    /// Return a taken member to the stash for range proofs. The
+    /// preparation takes the member for the finish, but userspace range
+    /// proofs route via the stash: the driver returns it before the
+    /// reads and takes it back before the finish. The default drops
+    /// (IOs without a stash); live confirms carry `None` either way.
+    fn return_member(&mut self, _pid: u32, _member: Option<RetainedGroupMember>) {
+        drop(_member);
+    }
 }
 
 /// The proof reads of `ranges` keyed by range. A range whose result is
@@ -1812,14 +1820,20 @@ pub(crate) fn confirm_with_resources<Io: ConfirmIo>(
     budget: &mut CaptureWorkBudget,
     resources: Option<&IoResources>,
 ) -> Confirmation {
-    let prepared = match prepare_confirmation(io, pid, prove, budget, resources) {
+    let mut prepared = match prepare_confirmation(io, pid, prove, budget, resources) {
         Ok(prepared) => prepared,
         Err(confirmation) => return confirmation,
     };
+    // The preparation took the member for the finish, but range proofs
+    // route via the IO stash: return it for the reads, take it back for
+    // the finish. Live confirms carry `None`, so this is a no-op there.
+    io.return_member(pid, prepared.member.take());
     let mapped = if budget.has_collection_work() {
         let mut mapped = MappedIdentities::new();
         for &range in &prepared.ranges {
             if let Err(reason) = budget.spend(1) {
+                // The member stays stashed in the IO and drops with it;
+                // the next mint clears any reuse.
                 return Confirmation::Lost(AttributionLoss::Budget, reason.into());
             }
             mapped.extend(read_ranges_reserved(io, pid, &[range], resources));
@@ -1828,6 +1842,7 @@ pub(crate) fn confirm_with_resources<Io: ConfirmIo>(
     } else {
         read_ranges_reserved(io, pid, &prepared.ranges, resources)
     };
+    prepared.member = io.take_member();
     finish_confirmation(io, pid, prepared, mapped, resources, budget)
 }
 
@@ -2236,6 +2251,15 @@ impl ConfirmIo for OsConfirmIo<'_> {
 
     fn take_member(&mut self) -> Option<RetainedGroupMember> {
         self.member.take().map(|(_, member)| member)
+    }
+
+    fn return_member(&mut self, pid: u32, member: Option<RetainedGroupMember>) {
+        // The minter never moves (take leaves it): the returned member's
+        // borrow stays valid for the proof reads.
+        match member {
+            Some(member) => self.member = Some((pid, member)),
+            None => self.member = None,
+        }
     }
 }
 

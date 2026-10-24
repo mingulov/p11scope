@@ -899,6 +899,14 @@ impl ConfirmIo for ZombieProofIo {
     fn take_member(&mut self) -> Option<crate::discovery::retained_member::RetainedGroupMember> {
         self.stashed.take()
     }
+
+    fn return_member(
+        &mut self,
+        _pid: u32,
+        member: Option<crate::discovery::retained_member::RetainedGroupMember>,
+    ) {
+        self.stashed = member;
+    }
 }
 
 struct ZombieProofProbe {

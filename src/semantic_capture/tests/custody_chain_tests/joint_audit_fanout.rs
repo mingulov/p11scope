@@ -238,6 +238,33 @@ struct FinishStopObservation {
     h3: (usize, bool),
 }
 
+impl HeldMachineIo<'_> {
+    /// Match Session's fresh original-cursor check before any at-Q leaf.
+    /// A pending prefix may precede Q; its producers may never advance Q.
+    fn validate_finish_q(
+        &self,
+        q: &crate::attach::CollectedFinishQ,
+    ) -> Result<(), SemanticRefusal> {
+        let finish = self.finish.as_deref().ok_or(SemanticRefusal::Unavailable)?;
+        let events = self
+            .drain
+            .consumption_cut()
+            .map_err(|_| SemanticRefusal::Unavailable)?;
+        let drain = finish.observer.discovery_drain();
+        let discovery = crate::events::discovery_drain_positions(drain);
+        if !q.matches_owner(self.producers, finish.observer.discovery_domain())
+            || !q.matches_discovery_drain(self.producers, drain)
+            || !q.covers_events_bounds(&events)
+            || events.producer_bound() != q.events_stop()
+            || discovery.producer != q.discovery_stop()
+            || discovery.consumer > q.discovery_stop()
+        {
+            return Err(SemanticRefusal::Unavailable);
+        }
+        Ok(())
+    }
+}
+
 impl crate::inventory_semantics::JointMachineIo for HeldMachineIo<'_> {
     fn producers(&self) -> &SessionDrainProducers {
         self.producers
@@ -292,6 +319,8 @@ impl crate::inventory_semantics::JointMachineIo for HeldMachineIo<'_> {
         capacity: usize,
         work: usize,
     ) -> Result<(RawJointQuantum, Option<crate::events::DispatchPoll>), RawQuantumRefusal> {
+        self.validate_finish_q(q)
+            .map_err(|_| RawQuantumRefusal::Stopped)?;
         RawJointQuantum::begin_bounded_with_adapter(
             self.drain,
             &publish_object_descriptors(),
@@ -313,6 +342,8 @@ impl crate::inventory_semantics::JointMachineIo for HeldMachineIo<'_> {
         q: &crate::attach::CollectedFinishQ,
         work: usize,
     ) -> Result<crate::events::DispatchPoll, RawQuantumRefusal> {
+        self.validate_finish_q(q)
+            .map_err(|_| RawQuantumRefusal::Stopped)?;
         raw.continue_bounded_with_adapter(
             self.drain,
             &publish_object_descriptors(),
@@ -331,6 +362,7 @@ impl crate::inventory_semantics::JointMachineIo for HeldMachineIo<'_> {
         q: &crate::attach::CollectedFinishQ,
         work: usize,
     ) -> Result<crate::inventory_semantics::LaneDrainOutcome, SemanticRefusal> {
+        self.validate_finish_q(q)?;
         let finish = self
             .finish
             .as_deref_mut()
@@ -351,6 +383,7 @@ impl crate::inventory_semantics::JointMachineIo for HeldMachineIo<'_> {
         adapter: &JournalAdapter,
         q: &crate::attach::CollectedFinishQ,
     ) -> Result<usize, SemanticRefusal> {
+        self.validate_finish_q(q)?;
         let finish = self.finish.as_deref().ok_or(SemanticRefusal::Unavailable)?;
         self.h0
             .0
@@ -374,6 +407,7 @@ impl crate::inventory_semantics::JointMachineIo for HeldMachineIo<'_> {
         q: &crate::attach::CollectedFinishQ,
         report: &mut TickReport,
     ) -> Result<(), SemanticRefusal> {
+        self.validate_finish_q(q)?;
         let finish = self
             .finish
             .as_deref_mut()
@@ -511,6 +545,29 @@ impl crate::inventory_semantics::JointMachineIo for HeldMachineIo<'_> {
         Ok(())
     }
 
+    fn tick_collected_at_q(
+        &mut self,
+        lane: &mut AttestedSemanticLane,
+        bindings: &[SemanticCallerBinding],
+        raw: &mut RawJointQuantum,
+        q: &crate::attach::CollectedFinishQ,
+    ) -> Result<SemanticBatch, SemanticRefusal> {
+        self.validate_finish_q(q)?;
+        self.tick_collected(lane, bindings, raw)
+    }
+
+    fn prepare_publication_at_q(
+        &mut self,
+        lane: &mut AttestedSemanticLane,
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        raw: &mut RawJointQuantum,
+        changed: bool,
+        q: &crate::attach::CollectedFinishQ,
+    ) -> anyhow::Result<()> {
+        self.validate_finish_q(q).map_err(anyhow::Error::msg)?;
+        self.prepare_publication(lane, coordinator, raw, changed)
+    }
+
     fn pending_h0_at_q_storage_bytes(
         &self,
         _lane: &AttestedSemanticLane,
@@ -519,6 +576,7 @@ impl crate::inventory_semantics::JointMachineIo for HeldMachineIo<'_> {
         q: &crate::attach::CollectedFinishQ,
         discovery: &crate::events::DiscoveryDomain,
     ) -> Result<usize, SemanticRefusal> {
+        self.validate_finish_q(q)?;
         self.h0
             .0
             .borrow()
@@ -536,6 +594,7 @@ impl crate::inventory_semantics::JointMachineIo for HeldMachineIo<'_> {
         discovery: &crate::events::DiscoveryDomain,
         report: &mut TickReport,
     ) -> Result<(), SemanticRefusal> {
+        self.validate_finish_q(q)?;
         let mut owned = self.h0.0.borrow_mut();
         let HeldH0 { capture, io, .. } = &mut *owned;
         self.native.pending_q_resolutions += 1;
@@ -604,6 +663,23 @@ impl crate::inventory_semantics::JointMachineIo for HeldMachineIo<'_> {
                 .is_none()
         );
         Ok(witness)
+    }
+
+    #[allow(clippy::too_many_arguments)] // Preserve the original candidate and the same native subject.
+    fn consume_birth_at_q(
+        &mut self,
+        lane: &mut AttestedSemanticLane,
+        candidate: H0BirthCandidate,
+        absence: Option<CommittedAbsenceBirth>,
+        input: &crate::discovery::caller_registry::instance_input::AdmittedInstanceCall,
+        binding: &SemanticCallerBinding,
+        proof: &JournalDomainProof,
+        adapter: &JournalAdapter,
+        q: &crate::attach::CollectedFinishQ,
+    ) -> Result<RetainedBirthWitness, BirthObservationRefusal> {
+        self.validate_finish_q(q)
+            .map_err(|_| BirthObservationRefusal::BindingMismatch)?;
+        self.consume_birth(lane, candidate, absence, input, binding, proof, adapter)
     }
 
     fn acquire_absence(
@@ -763,6 +839,17 @@ impl crate::inventory_semantics::JointMachineIo for HeldMachineIo<'_> {
             &native,
             inspect,
         )
+    }
+
+    fn with_native_at_q<R>(
+        &mut self,
+        lane: &mut AttestedSemanticLane,
+        witnesses: &crate::inventory_semantics::RetainedJointBirths,
+        q: &crate::attach::CollectedFinishQ,
+        inspect: impl for<'io> FnOnce(crate::inventory_semantics::JointCommitIo<'io>) -> R,
+    ) -> Result<R, SemanticRefusal> {
+        self.validate_finish_q(q)?;
+        self.with_native(lane, witnesses, inspect)
     }
 }
 

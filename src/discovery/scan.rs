@@ -7192,7 +7192,7 @@ mod tests {
     /// (a criterion-free loop, not a benchmark; run single-threaded:
     /// `test -- --ignored maps_reuse_timing --test-threads=1 --nocapture`).
     #[test]
-    #[ignore]
+    #[ignore = "manual: indicative maps-reuse timing loop, no pass/fail bar; run by hand single-threaded"]
     fn maps_reuse_timing_per_thousand_reads() {
         use std::io::Cursor;
         use std::time::Instant;

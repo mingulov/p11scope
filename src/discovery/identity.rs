@@ -6137,4 +6137,428 @@ mod tests {
         assert!(gate.should_sweep(pins.revision(), false));
         assert_eq!((gate.sweeps(), gate.skips()), (2, 1));
     }
+
+    fn conservative_cursor_fixture() -> (tempfile::TempDir, PinnedObjects, Vec<ScannedModule>) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut source = PinnedObjects::empty();
+        let mut modules = Vec::new();
+        for index in 0..3 {
+            let path = dir.path().join(format!("provider-{index}.so"));
+            std::fs::copy("/usr/bin/true", &path).unwrap();
+            let metadata = std::fs::metadata(&path).unwrap();
+            let key = ObjectKey {
+                device: Device {
+                    major: u64::from(libc::major(metadata.dev())),
+                    minor: u64::from(libc::minor(metadata.dev())),
+                },
+                inode: metadata.ino(),
+            };
+            let view = ProcessView::open(ProcessViewId(index + 1), std::process::id()).unwrap();
+            let mut scanned = module(key);
+            scanned.view = view.id();
+            scanned.mount_namespace = view.mount_namespace();
+            scanned.path = path.to_str().unwrap().into();
+            for table in &mut scanned.tables {
+                for entry in &mut table.entries {
+                    entry.object_path = scanned.path.clone();
+                }
+            }
+            let (pins, skipped) = pin_scanned_view_objects(
+                &view,
+                std::slice::from_ref(&scanned),
+                &mut CaptureWorkBudget::default(),
+            )
+            .unwrap();
+            assert!(skipped.is_empty(), "{skipped:?}");
+            assert!(source.absorb(pins).is_empty());
+            modules.push(scanned);
+        }
+        // A second ACTUAL process-view pin shares the first opened provider.
+        // The controlled table rows exercise value transformation only; they
+        // do not constitute a bootstrap/attachment receipt.
+        let view = ProcessView::open(ProcessViewId(2), std::process::id()).unwrap();
+        let mut shared = modules[0].clone();
+        shared.view = view.id();
+        let (pins, skipped) = pin_scanned_view_objects(
+            &view,
+            std::slice::from_ref(&shared),
+            &mut CaptureWorkBudget::default(),
+        )
+        .unwrap();
+        assert!(skipped.is_empty());
+        assert!(source.absorb(pins).is_empty());
+        modules.push(shared);
+        assert!(bind_scanned_modules(&modules, &mut source).1.is_empty());
+        let entry = source.by_id.values_mut().next().unwrap();
+        entry.path.reserve(3000);
+        entry.build_id = Some("nested-owned-build-id".repeat(64));
+        (dir, source, modules)
+    }
+
+    fn conservative_selection(
+        pool: &crate::semantics_edge::resources::SemanticResourcePool,
+        retired: BTreeSet<ProcessViewId>,
+        rejected: BTreeSet<ObjectKey>,
+    ) -> ConservativePinSelection {
+        let bytes = ConservativePinSelection::storage_bound(retired.len(), rejected.len()).unwrap();
+        let storage = pool.reserve(bytes).unwrap();
+        ConservativePinSelection::from_reserved_originals(
+            retired,
+            rejected,
+            storage,
+            &pool.reserver(),
+        )
+        .unwrap()
+    }
+
+    fn assert_conservative_value(expected: &PinnedObjects, actual: &PinnedObjects) {
+        assert_eq!(actual.raw_to_id, expected.raw_to_id);
+        assert_eq!(actual.rejected_keys, expected.rejected_keys);
+        assert_eq!(actual.ambiguous_keys, expected.ambiguous_keys);
+        assert_eq!(actual.ambiguity_published, expected.ambiguity_published);
+        assert_eq!(actual.ownership, expected.ownership);
+        assert_eq!(actual.raw_ownership, expected.raw_ownership);
+        assert_eq!(actual.next_id, expected.next_id);
+        assert_eq!(actual.overlay_uncertain, expected.overlay_uncertain);
+        assert_eq!(actual.changed.get(), expected.changed.get());
+        assert_eq!(actual.revision(), expected.revision());
+        assert_eq!(actual.by_id.len(), expected.by_id.len());
+        for (id, old) in &expected.by_id {
+            let new = &actual.by_id[id];
+            assert_eq!(new.raw, old.raw);
+            assert_eq!(new.mapping, old.mapping);
+            assert_eq!(new.pin, old.pin);
+            assert_eq!(new.mapped, old.mapped);
+            assert_eq!(new.path, old.path);
+            assert_eq!(new.sha256, old.sha256);
+            assert_eq!(new.build_id, old.build_id);
+            assert_eq!(new.abi, old.abi);
+            assert_eq!(new.overlay, old.overlay);
+            assert_eq!(new.collapsed, old.collapsed);
+            assert!(
+                Arc::ptr_eq(&new.file, &old.file),
+                "the SAME opened File is retained"
+            );
+            assert!(Arc::ptr_eq(&new.exports, &old.exports));
+        }
+    }
+
+    fn finish_conservative_copy(
+        source: &PinnedObjects,
+        cursor: &mut PinnedConservativeCursor,
+        selection: &ConservativePinSelection,
+        reserve: &crate::semantics_edge::resources::SemanticResourceReserver,
+    ) {
+        for _ in 0..4096 {
+            if source
+                .poll_conservative_copy(cursor, selection, reserve, 1)
+                .unwrap()
+                == GraphStep::Ready
+            {
+                return;
+            }
+        }
+        panic!("the tiny real-file copy must finish over bounded credits");
+    }
+
+    #[test]
+    fn conservative_copy_cursor_preserves_originals_and_peak() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        let (_dir, source, modules) = conservative_cursor_fixture();
+        let rejected = modules[1].key;
+        let pool = SemanticResourcePool::default();
+        let selection = conservative_selection(
+            &pool,
+            BTreeSet::from([ProcessViewId(1)]),
+            BTreeSet::from([rejected]),
+        );
+        let reserve = pool.reserver();
+        let mut expected = source.clone();
+        expected.remove_view(ProcessViewId(1));
+        let expected_skipped = expected.reapply_rejected_keys(&BTreeSet::from([rejected]));
+        let source_revision = source.revision();
+        let initial_charge = pool.snapshot().charged_bytes;
+        let mut cursor = PinnedConservativeCursor::new();
+        let (zero, allocations, bytes) = crate::test_alloc::count_allocs_during(|| {
+            source.poll_conservative_copy(&mut cursor, &selection, &reserve, 0)
+        });
+        assert_eq!(zero.unwrap(), GraphStep::Yielded);
+        assert_eq!((allocations, bytes), (0, 0));
+        assert_eq!(pool.snapshot().charged_bytes, initial_charge);
+        assert!(cursor.pinned().is_none());
+        let ((), peak) = crate::test_alloc::requested_peak_during(|| {
+            for _ in 0..4096 {
+                let mut before = [0usize; 3];
+                for (count, entry) in before.iter_mut().zip(source.by_id.values()) {
+                    *count = Arc::strong_count(&entry.file);
+                }
+                let step = source
+                    .poll_conservative_copy(&mut cursor, &selection, &reserve, 1)
+                    .unwrap();
+                for (old, entry) in before.into_iter().zip(source.by_id.values()) {
+                    assert!(Arc::strong_count(&entry.file).saturating_sub(old) <= 1);
+                }
+                if step == GraphStep::Ready {
+                    break;
+                }
+            }
+        });
+        assert!(!peak.incomplete);
+        let copy = cursor
+            .pinned()
+            .expect("bounded copy becomes structurally Ready");
+        assert_conservative_value(&expected, copy);
+        assert_eq!(cursor.skipped().unwrap(), expected_skipped);
+        assert!(
+            cursor.required_bytes().unwrap() >= peak.realloc_overlap_bytes.max(peak.peak_bytes)
+        );
+        assert_eq!(source.revision(), source_revision);
+        assert!(
+            source
+                .by_id
+                .values()
+                .all(|entry| pin_of(&entry.file).unwrap() == entry.pin)
+        );
+        assert!(pool.snapshot().charged_bytes > initial_charge);
+        // Ready borrows remain paid; no swap/take can strand canonical backing.
+        for _ in 0..4096 {
+            if cursor
+                .reclaim(Some(&source), &selection, &reserve, 1)
+                .unwrap()
+                == GraphStep::Ready
+            {
+                break;
+            }
+        }
+        assert!(cursor.pinned().is_none());
+        assert_eq!(pool.snapshot().charged_bytes, initial_charge);
+    }
+
+    #[test]
+    fn conservative_copy_cursor_refuses_changed_resume_fences() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        for change in 0..6 {
+            let (_dir, mut source, _) = conservative_cursor_fixture();
+            let pool = SemanticResourcePool::default();
+            let reserve = pool.reserver();
+            let selection = conservative_selection(
+                &pool,
+                BTreeSet::from([ProcessViewId(1), ProcessViewId(9), ProcessViewId(20)]),
+                BTreeSet::new(),
+            );
+            let mut cursor = PinnedConservativeCursor::new();
+            assert_ne!(
+                source
+                    .poll_conservative_copy(&mut cursor, &selection, &reserve, 1)
+                    .unwrap(),
+                GraphStep::Ready
+            );
+            let foreign = source.clone();
+            let other_selection = conservative_selection(
+                &pool,
+                BTreeSet::from([ProcessViewId(1), ProcessViewId(10), ProcessViewId(20)]),
+                BTreeSet::new(),
+            );
+            let other_pool = SemanticResourcePool::default();
+            let error = match change {
+                0 => foreign.poll_conservative_copy(&mut cursor, &selection, &reserve, 1),
+                1 => {
+                    let membership = source.revision();
+                    source.reset_derived_claims();
+                    assert_eq!(source.revision(), membership);
+                    source.poll_conservative_copy(&mut cursor, &selection, &reserve, 1)
+                }
+                2 => {
+                    source.changed.set(true);
+                    source.poll_conservative_copy(&mut cursor, &selection, &reserve, 1)
+                }
+                3 => source.poll_conservative_copy(&mut cursor, &other_selection, &reserve, 1),
+                4 => source.poll_conservative_copy(
+                    &mut cursor,
+                    &selection,
+                    &other_pool.reserver(),
+                    1,
+                ),
+                _ => {
+                    source.revision = u64::MAX;
+                    source.poll_conservative_copy(&mut cursor, &selection, &reserve, 1)
+                }
+            };
+            assert!(matches!(
+                error,
+                Err(GraphRefusal::SourceChanged | GraphRefusal::Identity)
+            ));
+            assert!(cursor.pinned().is_none());
+            if change == 0 || change == 3 || change == 4 {
+                finish_conservative_copy(&source, &mut cursor, &selection, &reserve);
+                assert!(
+                    cursor.pinned().is_some(),
+                    "foreign calls cannot consume the correct source's work"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn conservative_copy_cursor_exact_fit_short_and_overflow() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        assert!(ConservativePinSelection::storage_bound(usize::MAX, 0).is_none());
+        assert!(
+            conservative_pin_tree_bytes::<RawObjectInstance, PinnedObjectId>(usize::MAX).is_none()
+        );
+        let (_dir, source, _) = conservative_cursor_fixture();
+        let pool = SemanticResourcePool::default();
+        let reserve = pool.reserver();
+        let selection = conservative_selection(&pool, BTreeSet::new(), BTreeSet::new());
+        let baseline = pool.snapshot().charged_bytes;
+        let mut cursor = PinnedConservativeCursor::new();
+        for _ in 0..4096 {
+            if cursor.required_bytes().is_some() {
+                break;
+            }
+            assert_ne!(
+                source
+                    .poll_conservative_copy(&mut cursor, &selection, &reserve, 1)
+                    .unwrap(),
+                GraphStep::Ready
+            );
+        }
+        let required = cursor
+            .required_bytes()
+            .expect("actual measured storage envelope");
+        pool.reference_set_limit(baseline.checked_add(required).unwrap() - 1);
+        let counts: Vec<_> = source
+            .by_id
+            .values()
+            .map(|entry| Arc::strong_count(&entry.file))
+            .collect();
+        let mut refused = false;
+        for _ in 0..4096 {
+            match source.poll_conservative_copy(&mut cursor, &selection, &reserve, 1) {
+                Err(GraphRefusal::Storage(_)) => {
+                    refused = true;
+                    break;
+                }
+                Ok(step) => assert_ne!(step, GraphStep::Ready),
+                Err(other) => panic!("unexpected copy refusal: {other:?}"),
+            }
+        }
+        assert!(refused);
+        assert!(cursor.pinned().is_none());
+        assert_eq!(
+            counts,
+            source
+                .by_id
+                .values()
+                .map(|entry| Arc::strong_count(&entry.file))
+                .collect::<Vec<_>>()
+        );
+        pool.reference_set_limit(baseline.checked_add(required).unwrap());
+        finish_conservative_copy(&source, &mut cursor, &selection, &reserve);
+        assert_conservative_value(&source, cursor.pinned().unwrap());
+        assert_eq!(pool.snapshot().charged_bytes, baseline + required);
+        for _ in 0..4096 {
+            if cursor
+                .reclaim(Some(&source), &selection, &reserve, 1)
+                .unwrap()
+                == GraphStep::Ready
+            {
+                break;
+            }
+        }
+        assert_eq!(pool.snapshot().charged_bytes, baseline);
+    }
+
+    #[test]
+    fn conservative_copy_cursor_reclaims_unique_nested_and_guarded_shared_arc() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        let (_dir, mut source, _) = conservative_cursor_fixture();
+        let id = *source.by_id.keys().next().unwrap();
+        source.by_id.get_mut(&id).unwrap().exports = Arc::from(vec![
+            ("controlled-first-label".repeat(8), 1),
+            ("controlled-second-label".repeat(16), 2),
+            ("controlled-third-label".repeat(32), 3),
+        ]);
+        let pool = SemanticResourcePool::default();
+        let reserve = pool.reserver();
+        let selection = conservative_selection(&pool, BTreeSet::new(), BTreeSet::new());
+        let baseline = pool.snapshot().charged_bytes;
+        let mut cursor = PinnedConservativeCursor::new();
+        finish_conservative_copy(&source, &mut cursor, &selection, &reserve);
+        let alias = source.exports_for(id);
+        drop(source);
+        let held = pool.snapshot().charged_bytes;
+        let mut shared_refusal = false;
+        for _ in 0..4096 {
+            match cursor.reclaim(None, &selection, &reserve, 1) {
+                Err(GraphRefusal::Identity) => {
+                    shared_refusal = true;
+                    break;
+                }
+                Ok(step) => assert_ne!(step, GraphStep::Ready),
+                Err(other) => panic!("unexpected reclamation refusal: {other:?}"),
+            }
+        }
+        assert!(
+            shared_refusal,
+            "an unknown shared last-drop race retains actual paid ownership"
+        );
+        assert!(pool.snapshot().charged_bytes > baseline);
+        assert!(pool.snapshot().charged_bytes <= held);
+        assert_eq!(alias.iter().filter(|(text, _)| !text.is_empty()).count(), 3);
+        let weak = Arc::downgrade(&alias);
+        drop(alias);
+        assert!(matches!(
+            cursor.reclaim(None, &selection, &reserve, 1),
+            Err(GraphRefusal::Identity)
+        ));
+        assert!(pool.snapshot().charged_bytes > baseline);
+        drop(weak);
+        let mut prior = 3usize;
+        for _ in 0..4096 {
+            let step = cursor.reclaim(None, &selection, &reserve, 1).unwrap();
+            let left = cursor.retained_exports_for_test(id).map_or(0, |exports| {
+                exports.iter().filter(|(text, _)| !text.is_empty()).count()
+            });
+            assert!(
+                prior.saturating_sub(left) <= 1,
+                "one credit cannot destroy the complete nested array"
+            );
+            prior = left;
+            if step == GraphStep::Ready {
+                break;
+            }
+        }
+        assert_eq!(prior, 0);
+        assert_eq!(pool.snapshot().charged_bytes, baseline);
+    }
+
+    #[test]
+    fn conservative_copy_cache_exhaustion_preserves_legacy_clone() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        use std::sync::atomic::AtomicU64;
+        let counter = AtomicU64::new(u64::MAX - 1);
+        assert!(mint_pin_copy_cache_id(&counter).is_some());
+        assert!(mint_pin_copy_cache_id(&counter).is_none());
+        assert!(mint_pin_copy_cache_id(&counter).is_none());
+        let (_dir, mut source, _) = conservative_cursor_fixture();
+        let ordinary = source.clone();
+        assert!(source.copy_source != ordinary.copy_source);
+        assert_conservative_value(&source, &ordinary);
+        source.copy_source = None;
+        let legacy = source.clone();
+        assert_conservative_value(&source, &legacy);
+        let pool = SemanticResourcePool::default();
+        let reserve = pool.reserver();
+        let selection = conservative_selection(&pool, BTreeSet::new(), BTreeSet::new());
+        let mut cursor = PinnedConservativeCursor::new();
+        let charged = pool.snapshot().charged_bytes;
+        let (answer, allocations, _) = crate::test_alloc::count_allocs_during(|| {
+            source.poll_conservative_copy(&mut cursor, &selection, &reserve, 1)
+        });
+        assert!(matches!(answer, Err(GraphRefusal::Identity)));
+        assert_eq!(allocations, 0);
+        assert_eq!(pool.snapshot().charged_bytes, charged);
+        assert!(cursor.pinned().is_none());
+    }
 }

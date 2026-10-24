@@ -783,3 +783,137 @@ fn native_semantic_resource_additive_budget_limits_and_refusal() {
         .contains("depth limit")
     );
 }
+
+// Hostile-input regressions: truncated, mutated and non-UTF-8 documents must
+// be refused or parse to internally consistent snapshots. Fixed seed recorded
+// so a failure reproduces.
+const HOSTILE_MUTATION_SEED: u64 = 0xC2E1_F00D_0000_0008;
+const HOSTILE_MUTATIONS: usize = 2000;
+
+fn hostile_xorshift(state: &mut u64) -> u64 {
+    let mut x = *state;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *state = x;
+    x
+}
+
+fn assert_snapshot_consistent(snapshot: &Snapshot, context: &str) {
+    assert!(!snapshot.scope.is_empty(), "{context}: empty scope");
+    for edge in &snapshot.edges {
+        assert!(
+            edge.caller < snapshot.callers.len() && edge.module < snapshot.modules.len(),
+            "{context}: edge ({}, {}) outside {} callers x {} modules",
+            edge.caller,
+            edge.module,
+            snapshot.callers.len(),
+            snapshot.modules.len()
+        );
+    }
+    for gap in &snapshot.gaps {
+        assert!(
+            gap.caller
+                .is_none_or(|caller| caller < snapshot.callers.len())
+                && gap
+                    .module
+                    .is_none_or(|module| module < snapshot.modules.len()),
+            "{context}: gap references outside the snapshot"
+        );
+    }
+}
+
+#[test]
+fn hostile_truncation_at_every_byte_boundary_is_refused_or_consistent() {
+    let mut refused = 0usize;
+    let mut accepted = 0usize;
+    for len in 0..FIXTURE.len() {
+        match parse_snapshot(&FIXTURE[..len]) {
+            Ok(snapshot) => {
+                accepted += 1;
+                assert_snapshot_consistent(&snapshot, &format!("prefix {len}"));
+            }
+            Err(_) => refused += 1,
+        }
+    }
+    assert_snapshot_consistent(&parse_snapshot(FIXTURE).unwrap(), "full fixture");
+    assert!(refused > 0, "truncations must usually refuse");
+    assert_eq!(refused + accepted, FIXTURE.len());
+}
+
+#[test]
+fn hostile_seeded_mutations_are_refused_or_consistent() {
+    // Small limits keep the loop fast and exercise every bound path.
+    let limits = InputLimits {
+        bytes: 65_536,
+        rows: 5_000,
+        string_bytes: 512,
+        depth: 16,
+        nodes: 50_000,
+    };
+    assert_snapshot_consistent(
+        &parse_with_limits(FIXTURE, limits).expect("fixture must fit the small limits"),
+        "small-limit fixture",
+    );
+    let mut rng = HOSTILE_MUTATION_SEED;
+    let mut refused = 0usize;
+    let mut accepted = 0usize;
+    for iteration in 0..HOSTILE_MUTATIONS {
+        let flips = 1 + (hostile_xorshift(&mut rng) % 8) as usize;
+        let mut candidate = FIXTURE.to_vec();
+        for _ in 0..flips {
+            let offset = (hostile_xorshift(&mut rng) % candidate.len() as u64) as usize;
+            candidate[offset] = (hostile_xorshift(&mut rng) % 256) as u8;
+        }
+        match parse_with_limits(&candidate, limits) {
+            Ok(snapshot) => {
+                accepted += 1;
+                assert_snapshot_consistent(&snapshot, &format!("mutation {iteration}"));
+            }
+            Err(error) => {
+                refused += 1;
+                assert!(!error.to_string().is_empty(), "mutation {iteration}");
+            }
+        }
+    }
+    assert_eq!(refused + accepted, HOSTILE_MUTATIONS);
+    assert!(
+        refused > accepted,
+        "mutations must usually break the document (refused {refused}, accepted {accepted})"
+    );
+}
+
+#[test]
+fn hostile_non_utf8_and_control_paths_are_refused_or_exact() {
+    for bytes in [
+        b"\xff\xfe\x00\x01".as_slice(),
+        b"{\xff\xfe}",
+        &FIXTURE
+            .iter()
+            .chain(b"\xff".iter())
+            .copied()
+            .collect::<Vec<u8>>(),
+    ] {
+        assert!(parse_snapshot(bytes).is_err(), "non-UTF-8 must be refused");
+    }
+    // Control bytes in path-ish fields parse only when the value survives
+    // byte-exact (modulo JSON string escaping, which is lossless).
+    let hostile = "/tmp/\u{1}esc\u{1b}[2J\u{7f}.so";
+    let encoded = serde_json::to_string(hostile).unwrap();
+    let escaped = encoded.trim_matches('"');
+    for pointer in ["/modules/0/paths/0", "/gaps/0/subject", "/gaps/0/reason"] {
+        let mut value = fixture();
+        if value.pointer(pointer).is_none() {
+            continue;
+        }
+        *value.pointer_mut(pointer).unwrap() = json!(hostile);
+        if let Ok(snapshot) = parse_snapshot(&bytes(&value)) {
+            assert_snapshot_consistent(&snapshot, pointer);
+            let rendered = serde_json::to_string(&snapshot).unwrap();
+            assert!(
+                rendered.contains(escaped),
+                "{pointer}: hostile path must round-trip exactly"
+            );
+        }
+    }
+}

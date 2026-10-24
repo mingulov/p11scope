@@ -243,6 +243,14 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// Engine. The Joint discovery loop reads it to distinguish graph
     /// progress without records from an idle credit.
     collected_finish_progressed: bool,
+    /// Promotion Finish (OD-11): drain and discard instead of servicing the
+    /// shared Engine. Set for exactly one coordinator before its Finish.
+    promotion_finish: bool,
+    /// Records discarded by the promotion route (diagnostics).
+    promotion_records_discarded: u64,
+    /// Calls into `service_collected_finish_records_with` (test count).
+    #[cfg(test)]
+    engine_collected_finish_calls: u64,
     /// Explicit semantic inputs are independent of broad physical admission.
     semantic_inputs: semantics::SemanticInputs,
     adapter: CallerAdapter<Source>,
@@ -455,6 +463,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         Ok(Self {
             engine: Engine::inventory(inventory_config(endpoint_budget)?, scope, hooks, hints)?,
             collected_finish_progressed: false,
+            promotion_finish: false,
+            promotion_records_discarded: 0,
+            #[cfg(test)]
+            engine_collected_finish_calls: 0,
             semantic_inputs: semantics::SemanticInputs::new(Vec::new()),
             adapter,
             registry,
@@ -1062,6 +1074,35 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 ..Default::default()
             });
         }
+        if self.promotion_finish {
+            // OD-11: a promotion Finish drains to Q and drops the records
+            // without entering the shared Engine (today's classic promotion
+            // drain). No records, assessment, graph or actions; post_q still
+            // fails.
+            let quantum = work.min(crate::discovery::engine::GRAPH_STRIDE);
+            let (records, malformed, post_q, ring_pending) =
+                crate::attach::collect_staged_discovery_to_position(
+                    staged,
+                    discovery,
+                    q.discovery_stop(),
+                    quantum,
+                )
+                .map_err(|_| SemanticRefusal::Unavailable)?;
+            let drained = records.len() as u64 + malformed;
+            drop(records);
+            self.promotion_records_discarded =
+                self.promotion_records_discarded.saturating_add(drained);
+            self.collected_finish_progressed = drained > 0;
+            let after = crate::events::discovery_drain_positions(discovery);
+            return Ok(LaneDrainOutcome {
+                records: drained,
+                post_q: post_q
+                    || after.producer != q.discovery_stop()
+                    || after.consumer > q.discovery_stop(),
+                backlog: ring_pending || staged.len() != 0 || after.consumer != q.discovery_stop(),
+                failed: false,
+            });
+        }
         let held = self.engine.discovery_held_len();
         // One transfer avoids losing a partially collected Vec if a later
         // BUSY/error is encountered; subsequent originals retain their cursor.
@@ -1069,7 +1110,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .min(1)
             .min(crate::attach::DiscoveryStage::CAPACITY.saturating_sub(held));
         let (records, malformed, post_q, ring_pending) =
-            if self.engine.collected_finish_backlog_pending(0) {
+            if self.engine.collected_finish_transport_blocked() {
                 (
                     Vec::new(),
                     0,
@@ -1128,6 +1169,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // lifecycle consequence observed by the test remain real Engine work.
         let mut session = crate::discovery::engine::session_fixture::ScriptedSession::default();
         let reserve = self.registry.semantic_storage_reserver();
+        #[cfg(test)]
+        {
+            self.engine_collected_finish_calls =
+                self.engine_collected_finish_calls.saturating_add(1);
+        }
         let progress = self
             .engine
             .service_collected_finish_records_with(
@@ -1185,12 +1231,40 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 ..Default::default()
             });
         }
+        if self.promotion_finish {
+            // OD-11: a promotion Finish drains to Q and drops the records
+            // without entering the shared Engine (today's classic promotion
+            // drain). No records, assessment, graph or actions; post_q still
+            // fails.
+            let quantum = work.min(crate::discovery::engine::GRAPH_STRIDE);
+            let (records, malformed, post_q, ring_pending) = session
+                .collect_discovery_to_position(q.discovery_stop(), quantum)
+                .map_err(|_| SemanticRefusal::Unavailable)?;
+            let drained = records.len() as u64 + malformed;
+            drop(records);
+            self.promotion_records_discarded =
+                self.promotion_records_discarded.saturating_add(drained);
+            self.collected_finish_progressed = drained > 0;
+            let after = session
+                .discovery_positions()
+                .map_err(|_| SemanticRefusal::Unavailable)?;
+            return Ok(LaneDrainOutcome {
+                records: drained,
+                post_q: post_q
+                    || after.producer != q.discovery_stop()
+                    || after.consumer > q.discovery_stop(),
+                backlog: ring_pending
+                    || session.staged_discovery_len() != 0
+                    || after.consumer != q.discovery_stop(),
+                failed: false,
+            });
+        }
         let quantum = work.min(1).min(
             crate::attach::DiscoveryStage::CAPACITY
                 .saturating_sub(self.engine.discovery_held_len()),
         );
         let (records, malformed, post_q, ring_pending) =
-            if self.engine.collected_finish_backlog_pending(0) {
+            if self.engine.collected_finish_transport_blocked() {
                 (
                     Vec::new(),
                     0,
@@ -1234,6 +1308,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             }
         };
         let reserve = self.registry.semantic_storage_reserver();
+        #[cfg(test)]
+        {
+            self.engine_collected_finish_calls =
+                self.engine_collected_finish_calls.saturating_add(1);
+        }
         let progress = self
             .engine
             .service_collected_finish_records_with(
@@ -1266,12 +1345,59 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     }
 
     pub(crate) fn collected_finish_discovery_pending(&self, staged: usize) -> bool {
-        self.engine.collected_finish_backlog_pending(staged)
+        // R-26 N2: a promotion Finish never sees the shared Engine's
+        // backlog; only staged items block it.
+        if self.promotion_finish {
+            staged != 0
+        } else {
+            self.engine.collected_finish_backlog_pending(staged)
+        }
     }
 
     /// Whether the last collected-Finish service call progressed the Engine.
     pub(crate) fn collected_finish_progressed(&self) -> bool {
         self.collected_finish_progressed
+    }
+
+    /// Arms or disarms the promotion-Finish drain (OD-11). Set for exactly
+    /// one coordinator before its Finish; the coordinator is consumed after.
+    #[allow(dead_code)] // Consumed by T12c.
+    pub(crate) fn set_promotion_finish(&mut self, on: bool) {
+        self.promotion_finish = on;
+    }
+
+    /// Whether the promotion-Finish drain is armed.
+    #[allow(dead_code)] // Consumed by T12c.
+    pub(crate) fn promotion_finish(&self) -> bool {
+        self.promotion_finish
+    }
+
+    /// Records discarded by the promotion route (diagnostics).
+    #[allow(dead_code)] // Consumed by T12c.
+    pub(crate) fn promotion_records_discarded(&self) -> u64 {
+        self.promotion_records_discarded
+    }
+
+    /// Calls into `service_collected_finish_records_with` (test count).
+    #[cfg(test)]
+    #[allow(dead_code)] // Consumed by T12c.
+    pub(crate) fn engine_collected_finish_calls(&self) -> u64 {
+        self.engine_collected_finish_calls
+    }
+
+    /// Test read of the Engine's graph-input generation (§1.3).
+    #[cfg(test)]
+    #[allow(dead_code)] // Consumed by T14.
+    pub(crate) fn graph_inputs_epoch_for_test(&self) -> u64 {
+        self.engine.graph_inputs_epoch_for_test()
+    }
+
+    /// Test seam seeding one retirement intent plus one pending leader-exit
+    /// assessment in the coordinator's Engine (R-26 N2 twin, T12c).
+    #[cfg(test)]
+    #[allow(dead_code)] // Consumed by T12c.
+    pub(crate) fn seed_collected_finish_work_for_test(&mut self, view: ProcessViewId) {
+        self.engine.seed_collected_finish_work_for_test(view);
     }
 
     /// Existing retained Engine work and actual Session FIFO occupancy only.

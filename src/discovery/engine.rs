@@ -6,16 +6,18 @@ use crate::attach::reexec_diagnostic::{Outcome as DiagnosticOutcome, Phase as Di
 use crate::attach::{
     BackendSelection, CapturePolicy, CollectedFinishQ, CollectedRetirementTicket, CounterSnapshot,
     DetachOutcome, DynamicExportIdentity, DynamicLoaderAttachFailure, OwnedPauseGeneration,
-    ReplacementOutcome, RetainedRetirementInput, RetirementPoll, RetirementProgress,
-    RetirementTicket, Scope, Session,
+    ReplacementOutcome, RetainedInputMeasure, RetainedRetirementInput, RetirementPoll,
+    RetirementProgress, RetirementTicket, Scope, Session,
 };
 use crate::cli::CaptureArgs;
 use crate::discovery::attribution;
 use crate::discovery::hooks::{HookAbi, HookRegistry};
 use crate::discovery::identity::{
-    KernelSelfMappingProbe, ManifestStaleReason, PinnedObjectId, PinnedObjects, PinnedTimingKey,
-    ReconciledModule, SelfMappingProbe, StaleManifestObject, bind_scanned_modules,
-    canonicalize_scanned_overlays, open_view_object, open_view_object_cached,
+    ConservativePinSelection, InstalledModulesBacking, InstalledPinsBacking,
+    KernelSelfMappingProbe, ManifestStaleReason, PinnedConservativeCursor, PinnedObjectId,
+    PinnedObjects, PinnedTimingKey, ReconciledModule, RetainedScannedInputs, RetiredFileHandoff,
+    ScannedInputMeasure, ScannedRebindCursor, SelfMappingProbe, StaleManifestObject,
+    bind_scanned_modules, canonicalize_scanned_overlays, open_view_object, open_view_object_cached,
     pin_manifest_objects_deferred_in_views_with_budget, pin_scanned_view_objects,
     preexec_object_key, retained_object_key_cached, self_mapped_fallback_key, target_paths_equal,
     view_object_key_cached,
@@ -39,7 +41,9 @@ use crate::process::{self, OriginalGenerationState, ProcessView, ProcessViewId, 
 use crate::run::OwnedChild;
 #[cfg(test)]
 use crate::semantics_edge::resources::SemanticResourcePool;
-use crate::semantics_edge::resources::{ResourceLease, SemanticResourceReserver};
+use crate::semantics_edge::resources::{
+    OWNED_ALLOCATION_PADDING, ResourceLease, SemanticResourceReserver,
+};
 use crate::{plan, render};
 use anyhow::{Context as _, Result, anyhow, bail};
 use p11scope_ebpf_common::{
@@ -384,20 +388,25 @@ pub struct Engine {
     /// Round-robin position among the original, still-owned exit assessments.
     collected_finish_assessment_after: Option<ProcessViewId>,
     /// Lap tracker for pending leader-exit assessments at Q (R-26 N1).
-    #[allow(dead_code)] // GREEN wires the assessment laps.
     collected_assessment_lap: AssessmentLap,
     /// Publication-input generation counter for the terminal graph fence (§1.3).
     #[allow(dead_code)] // Consumed by T4a (the epoch compare reads it).
     graph_inputs_epoch: u64,
     /// A collected-Finish credit requested the bounded terminal graph (§1.4).
-    #[allow(dead_code)] // GREEN wires the request sites.
     collected_graph_requested: bool,
     /// The live bounded terminal graph, boxed on the shared pool (§1.5).
-    #[allow(dead_code)] // GREEN wires the barrier.
     collected_graph: Option<Box<CollectedGraph>>,
+    /// Installed backing of the last completed graph (T4b Install step 4).
+    #[allow(dead_code)] // Consumed by T4b.
+    graph_backing: Option<Box<GraphBacking>>,
+    /// Retired-file handoff chain awaiting the joined terminal detach (T4b).
+    retired_files: Option<Box<RetiredFileHandoff>>,
     /// First terminal-graph refusal reason, if any (§1.9).
-    #[allow(dead_code)] // GREEN records refusals; consumed by T4b.
+    #[allow(dead_code)] // Consumed by T4b (the `failed` flag reads it).
     collected_graph_refusal: Option<&'static str>,
+    /// Refused graphs retained instead of reclaimed (item 19, T4b).
+    #[allow(dead_code)] // Consumed by T4b.
+    collected_graph_reclaim_forgotten: u32,
     /// Set while a pause cycle applies its batch (the owned child stopped).
     pause_owned_batch: bool,
     /// Set while a pressure service pass runs inside record dispatch. Nested
@@ -2748,6 +2757,8 @@ pub(crate) trait EngineSession {
     ) -> Result<RetirementProgress> {
         bail!("this native leaf has no collected carrier")
     }
+    // T3's carrier predicate; consumed by T4b (G24).
+    #[allow(dead_code)]
     fn collected_retirement_is_physical(&self) -> bool {
         true
     }
@@ -3523,14 +3534,12 @@ pub(crate) struct BacklogOutcome {
 
 /// One graph credit's leaf budget (system scale): a cursor phase spends up
 /// to this many leaf units per credit. Native calls stay `work = 1`.
-#[allow(dead_code)] // GREEN wires the stride gate and the promotion quantum.
 pub(crate) const GRAPH_STRIDE: usize = 64;
 
 /// Lap tracker for pending leader-exit assessments at Q (R-26 N1/OD-12).
 /// `dirty` when a record queued a new assessment mid-lap, `at_q` while every
 /// call of the lap observed transport at Q, `clean` counting consecutive
 /// clean passes. A write-off needs two.
-#[allow(dead_code)] // GREEN wires the assessment laps.
 #[derive(Debug, Default)]
 struct AssessmentLap {
     dirty: bool,
@@ -3540,7 +3549,6 @@ struct AssessmentLap {
 
 /// Terminal-graph phases (§1.6). T4 owns Intake and the I1 error rows of the
 /// native phases; Freeze..Plan is T4a's, Handoff..Done is T4b's.
-#[allow(dead_code)] // GREEN wires the phase machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GraphPhase {
     Intake,
@@ -3571,22 +3579,108 @@ enum Verdict {
     RefusedRetained,
 }
 
-/// The bounded terminal graph over the Engine's retained originals (§1.6
-/// skeleton). GREEN adds the T4a/T4b/T5 phase fields; only the Intake and
-/// native-probe state the T4 tests stage is present here.
-#[allow(dead_code)] // GREEN wires the graph machine.
+/// What one graph credit did. Returned by value: the step never fails (§1.9).
+#[derive(Debug, Default)]
+struct GraphService {
+    changed: bool,
+    progressed: bool,
+    named_generation_lost: bool,
+}
+
+/// Installed backing of one completed graph (T4b Install step 4).
+#[allow(dead_code)] // Consumed by T4b.
+struct GraphBacking {
+    pins: InstalledPinsBacking,
+    modules: InstalledModulesBacking,
+    plan: plan::InstalledPlanBacking,
+    storage: Option<ResourceLease>,
+}
+
+/// Raw scanned-module copy cursor (§1.6). Shaped by T4a.
+struct ScannedModuleCopy;
+
+/// Removed-slot copy cursor (§1.6). Shaped by T4b.
+struct SlotCopy;
+
+/// Corroboration facts staged across the Facts phase (§1.8). Shaped by T5.
+struct CollectedFacts;
+
+/// View/batch retirement cursor for Consume (§1.7). Consumed by T4b.
+#[allow(dead_code)] // Consumed by T4b.
+struct ConsumeCursor {
+    step: u8,
+    after_view: Option<ProcessViewId>,
+    after_binding: Option<u64>,
+    row: u8,
+    pending_views: PendingViewRetirements,
+}
+
+#[allow(dead_code)] // Consumed by T4b.
+impl ConsumeCursor {
+    fn new() -> Self {
+        Self {
+            step: 0,
+            after_view: None,
+            after_binding: None,
+            row: 0,
+            pending_views: PendingViewRetirements::new(),
+        }
+    }
+}
+
+/// The bounded terminal graph over the Engine's retained originals (§1.6).
+/// T4 owns the skeleton, Intake and the I1 error rows of the native phases;
+/// the cursor bodies are T4a (Freeze..Plan), T4b (Handoff..Done) and T5.
+#[allow(dead_code)] // Cursor fields consumed by T4a/T4b.
 struct CollectedGraph {
     phase: GraphPhase,
     _storage: ResourceLease,
     intake_after: Option<ProcessViewId>,
     unproven: u32,
+    epoch: u64,
+    pins_revision: u64,
+    plan_slots: usize,
+    sel_count: (usize, usize),
+    sel_storage: Option<ResourceLease>,
+    sel_retired: BTreeSet<ProcessViewId>,
+    sel_rejected: BTreeSet<ObjectKey>,
+    sel_after_view: Option<ProcessViewId>,
+    sel_after_key: Option<ObjectKey>,
+    selection: Option<ConservativePinSelection>,
+    pins: PinnedConservativeCursor,
+    raw_index: usize,
+    raw_measure: Option<ScannedInputMeasure>,
+    raw_copy: Option<ScannedModuleCopy>,
+    raw_rows: Vec<ScannedModule>,
+    raw_storage: Option<ResourceLease>,
+    raw: Option<RetainedScannedInputs>,
+    rebind: ScannedRebindCursor,
+    plan: plan::ConservativePlanCursor,
+    facts: CollectedFacts,
+    handoff: Option<Box<RetiredFileHandoff>>,
+    backing_storage: Option<ResourceLease>,
+    removed_index: usize,
+    removed_measure: Option<RetainedInputMeasure>,
+    removed_copy: Option<SlotCopy>,
+    removed_rows: Vec<plan::Slot>,
+    removed_storage: Option<ResourceLease>,
     removed: Option<RetainedRetirementInput>,
     ticket: Option<CollectedRetirementTicket>,
     mutated: bool,
+    installed: bool,
+    install_step: u8,
+    install_index: usize,
+    retired_backing: Option<Box<GraphBacking>>,
+    old_claims: BTreeMap<SelectionClaimKey, SelectionClaim>,
+    old_tables: BTreeMap<SelectionTableKey, SelectionTableFact>,
+    consume: ConsumeCursor,
+    reclaim_step: u8,
     verdict: Option<Verdict>,
+    first_error: Option<String>,
+    partial_noted: bool,
+    retained_error: Option<anyhow::Error>,
 }
 
-#[allow(dead_code)] // GREEN calls it from the barrier creation path.
 impl CollectedGraph {
     fn new(storage: ResourceLease) -> Self {
         Self {
@@ -3594,10 +3688,48 @@ impl CollectedGraph {
             _storage: storage,
             intake_after: None,
             unproven: 0,
+            epoch: 0,
+            pins_revision: 0,
+            plan_slots: 0,
+            sel_count: (0, 0),
+            sel_storage: None,
+            sel_retired: BTreeSet::new(),
+            sel_rejected: BTreeSet::new(),
+            sel_after_view: None,
+            sel_after_key: None,
+            selection: None,
+            pins: PinnedConservativeCursor::new(),
+            raw_index: 0,
+            raw_measure: None,
+            raw_copy: None,
+            raw_rows: Vec::new(),
+            raw_storage: None,
+            raw: None,
+            rebind: ScannedRebindCursor::new(),
+            plan: plan::ConservativePlanCursor::new(),
+            facts: CollectedFacts,
+            handoff: None,
+            backing_storage: None,
+            removed_index: 0,
+            removed_measure: None,
+            removed_copy: None,
+            removed_rows: Vec::new(),
+            removed_storage: None,
             removed: None,
             ticket: None,
             mutated: false,
+            installed: false,
+            install_step: 0,
+            install_index: 0,
+            retired_backing: None,
+            old_claims: BTreeMap::new(),
+            old_tables: BTreeMap::new(),
+            consume: ConsumeCursor::new(),
+            reclaim_step: 0,
             verdict: None,
+            first_error: None,
+            partial_noted: false,
+            retained_error: None,
         }
     }
 }
@@ -8716,7 +8848,10 @@ impl Engine {
             graph_inputs_epoch: 0,
             collected_graph_requested: false,
             collected_graph: None,
+            graph_backing: None,
+            retired_files: None,
             collected_graph_refusal: None,
+            collected_graph_reclaim_forgotten: 0,
             pause_owned_batch: false,
             pressure_service_active: false,
             in_refresh_tick: false,
@@ -8980,6 +9115,7 @@ impl Engine {
         session: &mut S,
         run: impl FnOnce(&mut Self, &mut S, &mut TraceWorkTicket) -> Result<T>,
     ) -> Result<T> {
+        self.note_graph_inputs_mutated();
         let Some(proof) = session.proof().cloned() else {
             return run(self, session, &mut TraceWorkTicket::default());
         };
@@ -9113,6 +9249,7 @@ impl Engine {
         work: &mut TraceWorkTicket,
         mut accept: impl FnMut(VerifiedTraceSeed),
     ) -> TraceServiceProgress {
+        self.note_graph_inputs_mutated();
         let mut progress = TraceServiceProgress::default();
         let Some(proof) = session.proof() else {
             progress.deferred = 1;
@@ -9580,6 +9717,7 @@ impl Engine {
         &mut self,
         remaining: std::time::Duration,
     ) -> TraceWorkTicket {
+        self.note_graph_inputs_mutated();
         if let Some(ticket) = &self.trace_terminal {
             return ticket.clone();
         }
@@ -9681,6 +9819,7 @@ impl Engine {
     /// Called when the terminal drain is done: deferred records it still
     /// left undispatched are the one deferral that is a loss (F4).
     pub(crate) fn settle_frame_deferrals_at_capture_end(&mut self) {
+        self.note_graph_inputs_mutated();
         self.pending_loader_arm_scans.clear();
         if self.pending_discovery_records.is_empty() {
             return;
@@ -10186,13 +10325,10 @@ impl Engine {
     }
 
     fn release_view_id(&mut self, id: ProcessViewId) {
-        // A retained collected transaction cannot release the original ID
-        // while its graph inputs or actual ended-PID owner/proof still name it.
-        // Keep this before trace/inventory bookkeeping as well as free-list
-        // insertion. Ordinary admission/retirement behavior is unchanged.
-        if self.collected_finish_actions.is_some() && self.collected_graph_names_view(id) {
-            return;
-        }
+        // A retained collected transaction keeps its original ID: under
+        // collected Finish the bookkeeping below still runs, but the ID
+        // never returns to the free list (no reuse after Q; the Engine ends
+        // with its Session). Ordinary behavior is otherwise unchanged (§1.5).
         self.trace_provider_views.remove(&id);
         self.pending_loader_arm_scans.retain(|key| key.view != id);
         self.exec_rearm_views.remove(&id);
@@ -10208,6 +10344,9 @@ impl Engine {
         }
         if let Some(inventory) = &mut self.inventory {
             inventory.release_reservation(id);
+            return;
+        }
+        if self.collected_finish_actions.is_some() {
             return;
         }
         // Skip-if-present: a duplicate retired entry would mint one ID to
@@ -13591,6 +13730,19 @@ impl Engine {
         let next = session.counter_snapshot().inspect_err(|_| {
             self.owned_initial_exec = None;
         })?;
+        // Under collected Finish the five sticky scalars invalidate once:
+        // later credits run a sticky branch only when one of its scalars
+        // grew (§1.3).
+        let sticky_before = self.collected_finish_actions.is_some().then_some((
+            self.counter_snapshot.ring_loss,
+            self.counter_snapshot.export_state_failures,
+            self.counter_snapshot.export_bounded_read_failures,
+            self.counter_snapshot.abi_refusals,
+            self.counter_snapshot.loader_state_read_failures,
+        ));
+        let grown = |before: u64, now: u64| sticky_before.is_none_or(|_| now > before);
+        let (ring_was, export_was, bounded_was, abi_was, loader_was) =
+            sticky_before.unwrap_or((0, 0, 0, 0, 0));
         if !self.counter_snapshot.replace_with(next) {
             self.owned_initial_exec = None;
             self.invalidate_silent_selection_coverage();
@@ -13601,7 +13753,7 @@ impl Engine {
             );
             return Ok(());
         }
-        if self.counter_snapshot.ring_loss > 0 {
+        if self.counter_snapshot.ring_loss > 0 && grown(ring_was, self.counter_snapshot.ring_loss) {
             self.owned_initial_exec = None;
             self.invalidate_silent_selection_coverage();
             self.invalidate_causal_timing();
@@ -13610,9 +13762,15 @@ impl Engine {
                 "the kernel could not reserve one or more private discovery records",
             );
         }
-        if self.counter_snapshot.export_state_failures > 0
+        if (self.counter_snapshot.export_state_failures > 0
             || self.counter_snapshot.export_bounded_read_failures > 0
-            || self.counter_snapshot.abi_refusals > 0
+            || self.counter_snapshot.abi_refusals > 0)
+            && (grown(export_was, self.counter_snapshot.export_state_failures)
+                || grown(
+                    bounded_was,
+                    self.counter_snapshot.export_bounded_read_failures,
+                )
+                || grown(abi_was, self.counter_snapshot.abi_refusals))
         {
             self.invalidate_silent_selection_coverage();
             self.invalidate_causal_timing();
@@ -13621,7 +13779,9 @@ impl Engine {
                 "the kernel reported export state, bounded-read, or target ABI failures",
             );
         }
-        if self.counter_snapshot.loader_state_read_failures > 0 {
+        if self.counter_snapshot.loader_state_read_failures > 0
+            && grown(loader_was, self.counter_snapshot.loader_state_read_failures)
+        {
             self.invalidate_causal_timing();
             self.mark_partial(
                 "live loader discovery",
@@ -16584,6 +16744,7 @@ impl Engine {
     /// and the empty-scan rule; a journal still pending keeps the record, and
     /// the timing proof this loss already invalidated is not given back.
     pub(crate) fn settle_terminal_drain(&mut self) {
+        self.note_graph_inputs_mutated();
         self.pending_loader_arm_scans.clear();
         self.settle_all_pending_loader_scans(
             "a deferred loader memory scan was unresolved at capture cancellation or shutdown",
@@ -17667,7 +17828,7 @@ impl Engine {
         let Some(view) = self.pending_retirements.first().copied() else {
             return false;
         };
-        if self.collected_graph_names_view(view) {
+        if self.names_view_bounded(view) {
             return false;
         }
         self.pending_retirements.remove(&view);
@@ -17675,26 +17836,54 @@ impl Engine {
         true
     }
 
-    /// These are original inputs to the not-yet-bounded conservative graph
-    /// disposition. A numeric pending set cannot replace their ProcessView
-    /// custody. Include pristine scan inputs and live selection owners, not
-    /// only the currently presented modules/pin claims.
-    fn collected_graph_names_view(&self, view: ProcessViewId) -> bool {
-        self.modules
-            .iter()
-            .any(|module| module.scanned.view == view)
-            || self.pinned.view_claims(view).is_some()
+    /// Stateless bounded names check (§1.5): keyed O(log n) lookups first,
+    /// then the unkeyed sets only when their combined length fits one
+    /// stride — past that the view counts as named without scanning, so at
+    /// system scale the graph handles every view at one credit per intent
+    /// plus one graph. These are original inputs to the bounded graph; a
+    /// numeric pending set cannot replace their ProcessView custody.
+    /// (`selection_tables` joins the stride gate: no O(log n) range lower
+    /// bound is constructible without touching identity.rs. The check stays
+    /// one-stride bounded and conservative. See the T4 report.)
+    fn names_view_bounded(&self, view: ProcessViewId) -> bool {
+        #[cfg(test)]
+        self.names_inspected.set(0);
+        if self.pinned.view_claims(view).is_some()
             || self.scan_inputs.contains_key(&view)
-            || self.selection_claims.keys().any(|key| key.view == view)
-            || self.selection_tables.keys().any(|key| key.view == view)
-            || self
-                .selection_bindings
-                .values()
-                .any(|binding| binding.view == view && !binding.retired)
             || self
                 .ended_pid_retirement
                 .as_ref()
                 .is_some_and(|ended| ended.owner.id() == view)
+        {
+            return true;
+        }
+        if self.modules.len()
+            + self.selection_claims.len()
+            + self.selection_bindings.len()
+            + self.selection_tables.len()
+            > GRAPH_STRIDE
+        {
+            return true;
+        }
+        let mut inspected = 0usize;
+        let found = self.modules.iter().any(|module| {
+            inspected += 1;
+            module.scanned.view == view
+        }) || self.selection_claims.keys().any(|key| {
+            inspected += 1;
+            key.view == view
+        }) || self.selection_bindings.values().any(|binding| {
+            inspected += 1;
+            binding.view == view && !binding.retired
+        }) || self.selection_tables.keys().any(|key| {
+            inspected += 1;
+            key.view == view
+        });
+        #[cfg(test)]
+        self.names_inspected.set(inspected);
+        #[cfg(not(test))]
+        let _ = inspected;
+        found
     }
 
     /// Whether dispatching a matched EXEC for `view` would consume the owned
@@ -18256,6 +18445,12 @@ impl Engine {
     fn queue_leader_exit_assessment(&mut self, view: ProcessViewId, hook_ts_ns: Option<u64>) {
         let known = hook_ts_ns.filter(|timestamp| *timestamp != 0);
         let newly_pending = self.pending_leader_exit_views.insert(view);
+        if newly_pending {
+            // A new assessment dirties the current lap and restarts the
+            // clean-pass count (R-26 N1).
+            self.collected_assessment_lap.dirty = true;
+            self.collected_assessment_lap.clean = 0;
+        }
         let order = self
             .pending_leader_exit_order
             .entry(view)
@@ -18948,15 +19143,20 @@ impl Engine {
             self.promote_stale_execs(pending_views);
             if pending_views.is_empty() {
                 if self.collected_finish_actions.is_some() {
-                    // A full conservative_candidate rebuild clones/replans the
-                    // entire retained graph and may begin native retirement.
-                    // It is NOT a one-action continuation. Only a retirement
-                    // already absent from that graph can settle here; all
-                    // nontrivial retirement/rejection debt stays owned/pending.
-                    // A bounded graph transaction is still required before
-                    // activating Finish for that retained state.
+                    // Rejections or a named first retirement ask the barrier
+                    // for one bounded graph; anything else settles here (§1.4).
                     if self.take_collected_finish_action() {
-                        changed |= self.settle_unreferenced_collected_retirement();
+                        if !self.pending_rejected_keys.is_empty()
+                            || self
+                                .pending_retirements
+                                .first()
+                                .is_some_and(|view| self.names_view_bounded(*view))
+                        {
+                            // Reported as progressed (item 15).
+                            self.collected_graph_requested = true;
+                        } else {
+                            changed |= self.settle_unreferenced_collected_retirement();
+                        }
                     }
                     break;
                 }
@@ -18996,11 +19196,12 @@ impl Engine {
                 if let Some(persistent) = self.retirement_intents.get(&view).copied() {
                     cause = cause.merge(persistent);
                 }
-                if self.collected_finish_actions.is_some() && self.collected_graph_names_view(view)
-                {
+                if self.collected_finish_actions.is_some() && self.names_view_bounded(view) {
                     // Until the actual conservative graph/native continuation
                     // can dispose these inputs, refuse BEFORE context mutation,
                     // ProcessView removal, scan-input pruning or ID release.
+                    // The request asks the barrier for one bounded graph (§1.4).
+                    self.collected_graph_requested = true;
                     self.retirement_intents
                         .entry(view)
                         .and_modify(|old| *old = old.merge(cause))
@@ -21349,6 +21550,7 @@ impl Engine {
     /// semantic consumers immediately when this reports a plan change, before
     /// draining the ordinary event ring.
     pub fn drain_discovery(&mut self, session: &mut Session) -> Result<bool> {
+        self.note_graph_inputs_mutated();
         self.drain_discovery_from(session)
     }
 
@@ -21384,6 +21586,7 @@ impl Engine {
         session: &mut Session,
         force_full: bool,
     ) -> Result<bool> {
+        self.note_graph_inputs_mutated();
         self.drain_discovery_shallow_from(session, force_full)
     }
 
@@ -21392,6 +21595,7 @@ impl Engine {
         session: &mut dyn EngineSession,
         force_full: bool,
     ) -> Result<bool> {
+        self.note_graph_inputs_mutated();
         let (records, malformed, _fresh_blocked) = self.collect_frame_discovery(session)?;
         if force_full || !records.is_empty() || malformed != 0 || !self.discovery_shallow_idle() {
             return self.with_live_frame(|engine| {
@@ -21405,6 +21609,7 @@ impl Engine {
     /// quantum is applied before collecting the next one, so each exact prefix
     /// remains accounted for and producer counters are refreshed per batch.
     pub fn drain_discovery_terminal(&mut self, session: &mut Session) -> Result<bool> {
+        self.note_graph_inputs_mutated();
         self.drain_discovery_terminal_from(session)
     }
 
@@ -21418,6 +21623,7 @@ impl Engine {
         &mut self,
         session: &mut dyn EngineSession,
     ) -> Result<bool> {
+        self.note_graph_inputs_mutated();
         let nested_budget = Cell::new(self.shared_allowance_remaining(session, 0));
         let (records, malformed, failure) = match Self::collect_discovery_records_budgeted(
             session,
@@ -21462,6 +21668,7 @@ impl Engine {
         records: Vec<DiscoveryRecord>,
         malformed: u64,
     ) -> Result<bool> {
+        self.note_graph_inputs_mutated();
         let nested_budget =
             Cell::new(self.shared_allowance_remaining(
                 session,
@@ -21492,6 +21699,7 @@ impl Engine {
         stop: usize,
         post_q_record: &mut bool,
     ) -> Result<bool> {
+        self.note_graph_inputs_mutated();
         let wall_start = crate::attach::monotonic_ns();
         let totals_before = self.stage_timings.totals_ns();
         let result = self.drain_discovery_terminal_to_position_inner(session, stop, post_q_record);
@@ -21556,6 +21764,7 @@ impl Engine {
         &mut self,
         session: &mut dyn EngineSession,
     ) -> Result<bool> {
+        self.note_graph_inputs_mutated();
         let wall_start = crate::attach::monotonic_ns();
         let totals_before = self.stage_timings.totals_ns();
         let result = self.drain_discovery_terminal_from_inner(session);
@@ -21656,6 +21865,7 @@ impl Engine {
     /// duration/signal checks precede. Overflow in between is the producer's
     /// `ring_loss`, read with every batch.
     pub(crate) fn drain_discovery_from(&mut self, session: &mut dyn EngineSession) -> Result<bool> {
+        self.note_graph_inputs_mutated();
         let (records, malformed, _fresh_blocked) = self.collect_frame_discovery(session)?;
         self.with_live_frame(|engine| engine.apply_discovery_batch(session, records, malformed))
     }
@@ -21802,22 +22012,10 @@ impl Engine {
             || staged_len > 0
     }
 
-    /// Finish must also retain deferred lifecycle work. A vacant transport
-    /// cursor alone cannot discharge an original already held by the Engine.
     /// First terminal-graph refusal reason, if any (§1.9).
-    #[allow(dead_code)] // GREEN records refusals; consumed by T4b.
+    #[allow(dead_code)] // Consumed by T4b (the `failed` flag reads it).
     pub(crate) fn collected_graph_refused(&self) -> Option<&'static str> {
         self.collected_graph_refusal
-    }
-
-    /// Applies one Intake readiness verdict (§1.4).
-    #[allow(dead_code)] // GREEN fills the arms; called from Intake.
-    fn settle_intake_ready(
-        &mut self,
-        _graph: &mut CollectedGraph,
-        _view: ProcessViewId,
-        _ready: Result<bool, String>,
-    ) {
     }
 
     /// Test read of the graph-input generation counter (§1.3).
@@ -21832,6 +22030,47 @@ impl Engine {
         self.names_inspected.get()
     }
 
+    /// Marks the publication inputs dirty (§1.3): every `&mut self` entry
+    /// point that can write the views, modules, plan, pins, scan inputs,
+    /// ended-PID retirement, selection keys or capture facts calls this
+    /// first. Counters, coverage, timings and terminal batches never bump.
+    fn note_graph_inputs_mutated(&mut self) {
+        self.graph_inputs_epoch = self.graph_inputs_epoch.wrapping_add(1);
+    }
+
+    /// No leader-exit assessment still pending: resolved, or written off
+    /// after two clean passes (R-26 N1). Laps are finite: records end at Q.
+    fn collected_assessments_passed(&self) -> bool {
+        self.pending_leader_exit_views.is_empty()
+    }
+
+    /// Whether Q-bounded transport must wait: only Engine-held records, an
+    /// open terminal journal/batch, or a live graph block it. Assessments
+    /// and retirement debt never do (system scale, §1.1).
+    pub(crate) fn collected_finish_transport_blocked(&self) -> bool {
+        self.discovery_backlog_pending(0)
+            || self.terminal_batch.is_some()
+            || self.terminal_journal.is_some()
+            || self.collected_graph.is_some()
+    }
+
+    /// Test seam behind the coordinator's `seed_collected_finish_work_for_test`
+    /// (R-26 N2): one retirement intent plus one pending leader-exit
+    /// assessment.
+    #[cfg(test)]
+    #[allow(dead_code)] // Consumed by T12c.
+    pub(crate) fn seed_collected_finish_work_for_test(&mut self, view: ProcessViewId) {
+        assert!(
+            self.retirement_intents
+                .insert(view, RetirementCause::ExpectedRemoval)
+                .is_none(),
+            "seed view starts idle"
+        );
+        self.queue_leader_exit_assessment(view, None);
+    }
+
+    /// Finish must also retain deferred lifecycle work. A vacant transport
+    /// cursor alone cannot discharge an original already held by the Engine.
     pub(crate) fn collected_finish_backlog_pending(&self, staged_len: usize) -> bool {
         self.discovery_backlog_pending(staged_len)
             || !self.retirement_intents.is_empty()
@@ -21840,6 +22079,8 @@ impl Engine {
             || !self.pending_leader_exit_views.is_empty()
             || self.terminal_batch.is_some()
             || self.terminal_journal.is_some()
+            || self.collected_graph.is_some()
+            || self.collected_graph_requested
     }
 
     fn take_collected_finish_action(&mut self) -> bool {
@@ -21886,19 +22127,394 @@ impl Engine {
         )
     }
 
+    /// One graph credit (§1.6, §1.9): takes the boxed graph, steps exactly
+    /// one phase, and restores it on every path. A refused graph stays boxed
+    /// at its phase; later credits report no work while the debt keeps
+    /// Finish pending. Never fails: no `?` between take and restore.
+    fn step_collected_graph(
+        &mut self,
+        session: &mut dyn EngineSession,
+        q: Option<&CollectedFinishQ>,
+        reserve: &SemanticResourceReserver,
+        _collect: &mut DiscoveryCollector<'_>,
+    ) -> GraphService {
+        let mut graph = self
+            .collected_graph
+            .take()
+            .expect("a collected graph is stepped only while boxed");
+        if graph.verdict.is_some() {
+            self.collected_graph = Some(graph);
+            return GraphService::default();
+        }
+        let service = self.step_graph_inner(session, q, reserve, &mut graph);
+        if matches!(graph.phase, GraphPhase::Done) {
+            // Done (item 13): chain the handoff without allocating, drop the
+            // graph, and report `changed` only after Install.
+            let installed = graph.installed;
+            if let Some(mut handoff) = graph.handoff.take() {
+                handoff.prev = self.retired_files.take();
+                self.retired_files = Some(handoff);
+            }
+            GraphService {
+                changed: installed,
+                progressed: true,
+                named_generation_lost: false,
+            }
+        } else {
+            self.collected_graph = Some(graph);
+            service
+        }
+    }
+
+    /// One phase step. T4 owns Intake and the I1 error rows of the native
+    /// phases; the cursor phases below advance until T4a (Freeze..Plan) and
+    /// T4b (Handoff..Done) fill their bodies, and T4b maps native success.
+    fn step_graph_inner(
+        &mut self,
+        session: &mut dyn EngineSession,
+        q: Option<&CollectedFinishQ>,
+        reserve: &SemanticResourceReserver,
+        graph: &mut CollectedGraph,
+    ) -> GraphService {
+        let idle = GraphService {
+            changed: false,
+            progressed: true,
+            named_generation_lost: false,
+        };
+        match graph.phase {
+            GraphPhase::Intake => self.step_graph_intake(graph),
+            GraphPhase::Freeze => {
+                graph.phase = GraphPhase::Selection;
+                idle
+            }
+            GraphPhase::Selection => {
+                graph.phase = GraphPhase::Pins;
+                idle
+            }
+            GraphPhase::Pins => {
+                graph.phase = GraphPhase::RawCopy;
+                idle
+            }
+            GraphPhase::RawCopy => {
+                graph.phase = GraphPhase::Rebind;
+                idle
+            }
+            GraphPhase::Rebind => {
+                graph.phase = GraphPhase::Plan;
+                idle
+            }
+            GraphPhase::Plan => {
+                graph.phase = GraphPhase::Facts;
+                idle
+            }
+            GraphPhase::Facts => {
+                graph.phase = GraphPhase::Handoff;
+                idle
+            }
+            GraphPhase::Handoff => {
+                graph.phase = GraphPhase::RemovedCopy;
+                idle
+            }
+            GraphPhase::RemovedCopy => {
+                graph.phase = GraphPhase::NativePrepare;
+                idle
+            }
+            GraphPhase::NativePrepare => self.probe_native_prepare(session, q, reserve, graph),
+            GraphPhase::NativeBegin => self.probe_native_begin(session, q, graph),
+            GraphPhase::NativePoll => self.probe_native_poll(session, q, graph),
+            GraphPhase::Install => {
+                graph.phase = GraphPhase::Consume;
+                idle
+            }
+            GraphPhase::Consume => {
+                graph.phase = GraphPhase::Reclaim;
+                idle
+            }
+            GraphPhase::Reclaim => {
+                graph.phase = GraphPhase::Done;
+                idle
+            }
+            GraphPhase::Done => GraphService::default(),
+        }
+    }
+
+    /// Intake (§1.4): one intent per credit over `retirement_intents`.
+    /// The cursor never wraps: an exhausted range finalizes to Freeze.
+    fn step_graph_intake(&mut self, graph: &mut CollectedGraph) -> GraphService {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let next = match graph.intake_after {
+            None => self.retirement_intents.keys().next().copied(),
+            Some(after) => self
+                .retirement_intents
+                .range((Excluded(after), Unbounded))
+                .next()
+                .map(|(view, _)| *view),
+        };
+        let idle = GraphService {
+            changed: false,
+            progressed: true,
+            named_generation_lost: false,
+        };
+        let Some(view) = next else {
+            // After the last key: disclose the unproven count once (R-24),
+            // then Freeze.
+            if graph.unproven > 0 {
+                self.mark_partial(
+                    "live discovery lifecycle",
+                    &format!(
+                        "{} retirements not proven at the terminal stop were not performed; their originals stay attached until Session cleanup",
+                        graph.unproven
+                    ),
+                );
+            }
+            graph.phase = GraphPhase::Freeze;
+            return idle;
+        };
+        graph.intake_after = Some(view);
+        #[cfg(test)]
+        {
+            self.collected_intake_intents = self.collected_intake_intents.saturating_add(1);
+        }
+        let Some(cause) = self.retirement_intents.get(&view).copied() else {
+            // Unreachable: the barrier fences dispatch while a graph exists,
+            // so intents only leave through Intake and Consume.
+            return idle;
+        };
+        if self.views.iter().all(|owner| owner.id() != view) {
+            // No ProcessView: drop the intent now; no ID release at Q.
+            self.retirement_intents.remove(&view);
+            self.ready_expected_removals.remove(&view);
+            return idle;
+        }
+        if cause == RetirementCause::ExecRefresh {
+            // OD-3: an exec refresh observed before the terminal stop is not
+            // rescanned. The view stays.
+            self.retirement_intents.remove(&view);
+            self.mark_partial(
+                "live discovery lifecycle",
+                "an exec refresh observed before the terminal stop was not rescanned",
+            );
+            return idle;
+        }
+        let retained = self
+            .views
+            .iter()
+            .find(|owner| owner.id() == view)
+            .expect("view presence checked above");
+        let ready = if self.ready_expected_removals.contains(&view)
+            && cause == RetirementCause::ExpectedRemoval
+        {
+            Ok(true)
+        } else {
+            retirement_ready(cause, retained)
+        };
+        self.settle_intake_ready(graph, view, ready);
+        idle
+    }
+
+    /// Applies one Intake readiness verdict (§1.4): ready joins
+    /// `pending_retirements` with its intent kept for Consume; unready or
+    /// failed proofs are disposed once with an OD-7 disclosure. Factored so
+    /// the `Err` arm (a live pin failure no test can stage) stays covered.
+    fn settle_intake_ready(
+        &mut self,
+        graph: &mut CollectedGraph,
+        view: ProcessViewId,
+        ready: Result<bool, String>,
+    ) {
+        match ready {
+            Ok(true) => {
+                self.pending_retirements.insert(view);
+            }
+            Ok(false) => {
+                self.retirement_intents.remove(&view);
+                graph.unproven = graph.unproven.saturating_add(1);
+            }
+            Err(error) => {
+                self.retirement_intents.remove(&view);
+                graph.unproven = graph.unproven.saturating_add(1);
+                self.mark_live_loss(
+                    "live discovery lifecycle",
+                    &format!(
+                        "the original process pin could not prove expected exit; retirement remains queued: {error}"
+                    ),
+                );
+            }
+        }
+    }
+
+    /// NativePrepare, T4 error probe (I1 skeleton): without a removal input
+    /// (T4b's RemovedCopy builds it) the phase is vacuous and advances
+    /// without calling. An `Err` before the take cancels once and refuses
+    /// untouched; a taken input refuses retained until T4b's G9 dance
+    /// refines it. Success mapping (ticket store, advance) is T4b's body.
+    fn probe_native_prepare(
+        &mut self,
+        session: &mut dyn EngineSession,
+        q: Option<&CollectedFinishQ>,
+        reserve: &SemanticResourceReserver,
+        graph: &mut CollectedGraph,
+    ) -> GraphService {
+        if graph.removed.is_none() {
+            graph.phase = GraphPhase::NativeBegin;
+            return GraphService {
+                changed: false,
+                progressed: true,
+                named_generation_lost: false,
+            };
+        }
+        match session.prepare_collected_static_retirement(q, &mut graph.removed, reserve, 1) {
+            Ok(_) => GraphService::default(),
+            Err(_) => {
+                if graph.removed.is_none() {
+                    // Taken, then failed: ownership is uncertain.
+                    graph.verdict = Some(Verdict::RefusedRetained);
+                    self.collected_graph_refusal
+                        .get_or_insert("native ownership uncertain");
+                    self.mark_partial(
+                        "global native retirement",
+                        "original static ownership remains uncertain; replacement admission is blocked",
+                    );
+                } else {
+                    // Before the take: cancel once (the row names no error
+                    // propagation), refuse untouched, disclose once.
+                    let _ =
+                        session.cancel_collected_static_retirement(graph.removed.as_ref(), None, 1);
+                    graph.verdict = Some(Verdict::RefusedUntouched);
+                    self.collected_graph_refusal
+                        .get_or_insert("terminal graph refused before native mutation");
+                    self.mark_partial(
+                        "collected native retirement",
+                        "the original removal was refused before native mutation; originals remain owned",
+                    );
+                }
+                GraphService {
+                    changed: false,
+                    progressed: true,
+                    named_generation_lost: false,
+                }
+            }
+        }
+    }
+
+    /// NativeBegin, T4 error probe (I1 skeleton): without a ticket (T4b
+    /// stores it) the phase is vacuous and advances without calling. A
+    /// post-mutation `Err` refuses retained; a pre-mutation `Err` cannot
+    /// have mutated, so it cancels and refuses untouched. Success mapping
+    /// is T4b's §1.6 body.
+    fn probe_native_begin(
+        &mut self,
+        session: &mut dyn EngineSession,
+        q: Option<&CollectedFinishQ>,
+        graph: &mut CollectedGraph,
+    ) -> GraphService {
+        let Some(ticket) = graph.ticket.as_ref() else {
+            graph.phase = GraphPhase::NativePoll;
+            return GraphService {
+                changed: false,
+                progressed: true,
+                named_generation_lost: false,
+            };
+        };
+        match session.begin_collected_static_retirement(q, ticket, 1) {
+            Ok(_) => GraphService::default(),
+            Err(_) => {
+                if graph.mutated {
+                    graph.verdict = Some(Verdict::RefusedRetained);
+                    self.collected_graph_refusal
+                        .get_or_insert("native ownership uncertain");
+                    self.mark_partial(
+                        "global native retirement",
+                        "original static ownership remains uncertain; replacement admission is blocked",
+                    );
+                } else {
+                    let _ = session.cancel_collected_static_retirement(
+                        graph.removed.as_ref(),
+                        graph.ticket.as_ref(),
+                        1,
+                    );
+                    graph.verdict = Some(Verdict::RefusedUntouched);
+                    self.collected_graph_refusal
+                        .get_or_insert("terminal graph refused before native mutation");
+                    self.mark_partial(
+                        "collected native retirement",
+                        "the original removal was refused before native mutation; originals remain owned",
+                    );
+                }
+                GraphService {
+                    changed: false,
+                    progressed: true,
+                    named_generation_lost: false,
+                }
+            }
+        }
+    }
+
+    /// NativePoll, T4 error probe (I1 skeleton): same shape as the begin
+    /// probe. Success mapping (Pending stays, Closed installs) is T4b's.
+    fn probe_native_poll(
+        &mut self,
+        session: &mut dyn EngineSession,
+        q: Option<&CollectedFinishQ>,
+        graph: &mut CollectedGraph,
+    ) -> GraphService {
+        let Some(ticket) = graph.ticket.as_ref() else {
+            graph.phase = GraphPhase::Install;
+            return GraphService {
+                changed: false,
+                progressed: true,
+                named_generation_lost: false,
+            };
+        };
+        match session.poll_collected_static_retirement(q, ticket, 1) {
+            Ok(_) => GraphService::default(),
+            Err(_) => {
+                if graph.mutated {
+                    graph.verdict = Some(Verdict::RefusedRetained);
+                    self.collected_graph_refusal
+                        .get_or_insert("native ownership uncertain");
+                    self.mark_partial(
+                        "global native retirement",
+                        "original static ownership remains uncertain; replacement admission is blocked",
+                    );
+                } else {
+                    let _ = session.cancel_collected_static_retirement(
+                        graph.removed.as_ref(),
+                        graph.ticket.as_ref(),
+                        1,
+                    );
+                    graph.verdict = Some(Verdict::RefusedUntouched);
+                    self.collected_graph_refusal
+                        .get_or_insert("terminal graph refused before native mutation");
+                    self.mark_partial(
+                        "collected native retirement",
+                        "the original removal was refused before native mutation; originals remain owned",
+                    );
+                }
+                GraphService {
+                    changed: false,
+                    progressed: true,
+                    named_generation_lost: false,
+                }
+            }
+        }
+    }
+
     /// One bounded service of originals already transferred from the actual
     /// Q-bounded transport. Acquisition, original dispatch, exit assessment,
     /// and context cleanup are separate opportunities, even with work > 1.
     /// This deliberately does not run an ordinary inventory/admission frame.
+    // Contract-pinned D1.2 signature (+transport_at_q); T4b keeps the arity.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn service_collected_finish_records_with(
         &mut self,
         session: &mut dyn EngineSession,
-        _q: Option<&CollectedFinishQ>,
-        _reserve: &SemanticResourceReserver,
+        q: Option<&CollectedFinishQ>,
+        reserve: &SemanticResourceReserver,
         records: Vec<DiscoveryRecord>,
         malformed: u64,
         work: usize,
-        _transport_at_q: bool,
+        transport_at_q: bool,
         collect: &mut DiscoveryCollector<'_>,
     ) -> Result<BacklogOutcome> {
         if work == 0 {
@@ -21911,17 +22527,30 @@ impl Engine {
         }
         let previous = self.collected_finish_actions.replace(1);
         let result = self.with_live_frame(|engine| {
-            engine.service_collected_finish_records_inner(session, records, malformed, collect)
+            engine.service_collected_finish_records_inner(
+                session,
+                q,
+                reserve,
+                records,
+                malformed,
+                transport_at_q,
+                collect,
+            )
         });
         self.collected_finish_actions = previous;
         result
     }
 
+    // Mirrors the contract-pinned D1.2 arity above; T4b keeps it.
+    #[allow(clippy::too_many_arguments)]
     fn service_collected_finish_records_inner(
         &mut self,
         session: &mut dyn EngineSession,
+        q: Option<&CollectedFinishQ>,
+        reserve: &SemanticResourceReserver,
         records: Vec<DiscoveryRecord>,
         malformed: u64,
+        transport_at_q: bool,
         collect: &mut DiscoveryCollector<'_>,
     ) -> Result<BacklogOutcome> {
         let fresh = records.len().saturating_add(malformed as usize);
@@ -21951,6 +22580,79 @@ impl Engine {
             return Ok(BacklogOutcome {
                 changed: false,
                 progressed: true,
+                pending: self.collected_finish_backlog_pending(session.staged_discovery_len()),
+            });
+        }
+        // Barrier (§1.5): a live graph fences records, assessments and the
+        // journal; below, a request creates one graph on the first credit
+        // with an empty queue, no pending assessment and no open
+        // journal/batch, at transport Q and with no fresh records.
+        let create = self.collected_graph.is_none()
+            && self.collected_graph_requested
+            && transport_at_q
+            && fresh == 0
+            && self.pending_discovery_records.is_empty()
+            && self.collected_assessments_passed()
+            && self.terminal_journal.is_none()
+            && self.terminal_batch.is_none();
+        if self.collected_graph.is_some() || create {
+            if create {
+                match reserve.reserve(size_of::<CollectedGraph>() + OWNED_ALLOCATION_PADDING) {
+                    Ok(storage) => {
+                        self.collected_graph = Some(Box::new(CollectedGraph::new(storage)));
+                        self.collected_graph_requested = false;
+                        #[cfg(test)]
+                        {
+                            self.collected_graphs_created =
+                                self.collected_graphs_created.saturating_add(1);
+                        }
+                    }
+                    Err(_) => {
+                        // OD-8: the box could not be paid. Clear the request
+                        // (never a retry loop); the debt stays pending and
+                        // T4b's `failed` flag takes the finite I2 stop.
+                        self.collected_graph_requested = false;
+                        self.collected_graph_refusal
+                            .get_or_insert("terminal graph refused before native mutation");
+                        self.mark_partial(
+                            "live discovery transaction",
+                            "the bounded terminal graph could not be paid; its originals remain owned",
+                        );
+                        return Ok(BacklogOutcome {
+                            changed: false,
+                            progressed: false,
+                            pending: self
+                                .collected_finish_backlog_pending(session.staged_discovery_len()),
+                        });
+                    }
+                }
+            }
+            let step = self.step_collected_graph(session, q, reserve, collect);
+            if step.changed {
+                self.publish_batch_tail(true)?;
+            }
+            if step.named_generation_lost {
+                // Same text as the dispatch-path bail: one generation guard.
+                let witness = self
+                    .counters
+                    .object_skips
+                    .iter()
+                    .find(|skip| {
+                        skip.subject == "live discovery generation"
+                            && skip.reason.starts_with(
+                                "a retained process generation changed and was scheduled for conservative cleanup;",
+                            )
+                    })
+                    .map_or("enqueue witness unavailable", |skip| skip.reason.as_str());
+                bail!(
+                    "the named process generation changed during live discovery; {witness}; cancel_now={} mutation_stopped={}",
+                    self.cancellation_requested(),
+                    session.mutation_stopped(),
+                );
+            }
+            return Ok(BacklogOutcome {
+                changed: step.changed,
+                progressed: step.progressed,
                 pending: self.collected_finish_backlog_pending(session.staged_discovery_len()),
             });
         }
@@ -22007,22 +22709,40 @@ impl Engine {
             });
         }
         self.take_frame_fresh_blocked();
-        if self.pending_discovery_records.is_empty()
-            && self.retirement_intents.is_empty()
-            && let Some(view) = self.next_collected_finish_assessment()
-        {
-            let before = self.pending_leader_exit_views.len();
-            self.settle_leader_exit_assessment(
-                view,
-                &mut pending_views,
-                &mut additions,
-                &mut closure,
-            );
-            return Ok(BacklogOutcome {
-                changed: false,
-                progressed: self.pending_leader_exit_views.len() < before,
-                pending: self.collected_finish_backlog_pending(session.staged_discovery_len()),
-            });
+        if self.pending_discovery_records.is_empty() && !self.pending_leader_exit_views.is_empty() {
+            if self.collected_assessment_lap.clean < 2
+                && let Some(view) = self.next_collected_finish_assessment(transport_at_q)
+            {
+                self.settle_leader_exit_assessment(
+                    view,
+                    &mut pending_views,
+                    &mut additions,
+                    &mut closure,
+                );
+                return Ok(BacklogOutcome {
+                    changed: false,
+                    // A lap step is work; laps end (§1.5).
+                    progressed: true,
+                    pending: self.collected_finish_backlog_pending(session.staged_discovery_len()),
+                });
+            }
+            if self.collected_assessment_lap.clean >= 2
+                && let Some(view) = self.pending_leader_exit_views.pop_first()
+            {
+                // R-26 N1 / OD-12: after two consecutive clean passes at Q,
+                // write one still-pending view off with the terminal rule: a
+                // counted link loss, no retirement, order entry cleared.
+                self.pending_leader_exit_order.remove(&view);
+                if self.counted_leader_exit_views.insert(view) {
+                    self.task_uprobe_link_losses = self.task_uprobe_link_losses.saturating_add(1);
+                }
+                return Ok(BacklogOutcome {
+                    changed: false,
+                    progressed: true,
+                    pending: self.collected_finish_backlog_pending(session.staged_discovery_len()),
+                });
+            }
+            // Otherwise fall through to dispatch.
         }
         let before = self.pending_discovery_records.len();
         let mut queued = self
@@ -22030,6 +22750,7 @@ impl Engine {
             .drain(..before.min(1))
             .collect();
         let suffix = self.pending_discovery_records.len();
+        let requested_before = self.collected_graph_requested;
         let result = self.process_discovery_records(
             session,
             &mut queued,
@@ -22050,7 +22771,10 @@ impl Engine {
         }
         Ok(BacklogOutcome {
             changed,
-            progressed: changed || fresh != 0 || self.pending_discovery_records.len() < before,
+            progressed: changed
+                || fresh != 0
+                || self.pending_discovery_records.len() < before
+                || (self.collected_graph_requested && !requested_before),
             pending: self.collected_finish_backlog_pending(session.staged_discovery_len()),
         })
     }
@@ -22065,8 +22789,36 @@ impl Engine {
         self.immediate_exec_recovery_frame = false;
     }
 
-    fn next_collected_finish_assessment(&mut self) -> Option<ProcessViewId> {
+    fn next_collected_finish_assessment(&mut self, transport_at_q: bool) -> Option<ProcessViewId> {
         use std::ops::Bound::{Excluded, Unbounded};
+        let lap_ended = match self.collected_finish_assessment_after {
+            None => true,
+            Some(after) => self
+                .pending_leader_exit_views
+                .range((Excluded(after), Unbounded))
+                .next()
+                .is_none(),
+        };
+        if lap_ended {
+            if self.collected_finish_assessment_after.is_some() {
+                // A lap just ended: clean iff it queued nothing new and ran
+                // at Q throughout. Each call folds its transport into exactly
+                // the lap whose view it returns.
+                if !self.collected_assessment_lap.dirty && self.collected_assessment_lap.at_q {
+                    self.collected_assessment_lap.clean =
+                        self.collected_assessment_lap.clean.saturating_add(1);
+                } else {
+                    self.collected_assessment_lap.clean = 0;
+                }
+                if self.collected_assessment_lap.clean >= 2 {
+                    return None;
+                }
+            }
+            // Start the next (or first) lap.
+            self.collected_assessment_lap.dirty = false;
+            self.collected_assessment_lap.at_q = true;
+        }
+        self.collected_assessment_lap.at_q &= transport_at_q;
         let next = self
             .collected_finish_assessment_after
             .and_then(|after| {
@@ -22142,6 +22894,7 @@ impl Engine {
         &mut self,
         session: &mut dyn EngineSession,
     ) -> Result<BacklogOutcome> {
+        self.note_graph_inputs_mutated();
         self.with_live_frame(|engine| engine.service_backlog_quantum_inner(session))
     }
 
@@ -22357,6 +23110,7 @@ impl Engine {
         records: Vec<DiscoveryRecord>,
         malformed: u64,
     ) -> Result<bool> {
+        self.note_graph_inputs_mutated();
         // Every nested pull in this batch shares one budget seeded from
         // the shared allowance beside the batch-local records.
         let nested_budget =
@@ -22389,6 +23143,7 @@ impl Engine {
         collect: &mut DiscoveryCollector<'_>,
         deadline: Option<u64>,
     ) -> Result<DiscoveryBatchOutcome> {
+        self.note_graph_inputs_mutated();
         self.continuity_deferred = false;
         self.budget.set_deadline(deadline);
         let result = self.apply_discovery_batch_inner(
@@ -22739,6 +23494,7 @@ impl Engine {
         ring_bytes: Option<u32>,
         backend: BackendSelection,
     ) -> Result<Session> {
+        self.note_graph_inputs_mutated();
         self.start_session_with(policy, None, None, ring_bytes, backend)
     }
 
@@ -22749,6 +23505,7 @@ impl Engine {
         ring_bytes: Option<u32>,
         backend: BackendSelection,
     ) -> Result<Session> {
+        self.note_graph_inputs_mutated();
         let generation = OwnedPauseGeneration::from_owned_child(child);
         self.start_session_with(policy, Some(generation), Some(child), ring_bytes, backend)
     }
@@ -22763,6 +23520,7 @@ impl Engine {
         session: &mut dyn EngineSession,
         collect: &mut DiscoveryCollector<'_>,
     ) -> Result<DiscoveryBatchOutcome> {
+        self.note_graph_inputs_mutated();
         let Some(view) = self
             .views
             .iter()

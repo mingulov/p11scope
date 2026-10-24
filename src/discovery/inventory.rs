@@ -302,6 +302,7 @@ impl Engine {
         image: ImageIdentity,
         guard: &mut dyn ImageGuard,
     ) -> Result<ProcessViewId> {
+        self.note_graph_inputs_mutated();
         self.inventory_state()?;
         if image.task_cookie == 0 || !self.inventory_scope_contains(pid) {
             bail!("inventory owner lacks image identity or current scope membership");
@@ -396,6 +397,7 @@ impl Engine {
         owner: ProcessViewId,
         cause: RefreshCause,
     ) -> Result<()> {
+        self.note_graph_inputs_mutated();
         self.inventory_state()?;
         // A natively proven image transition invalidates the proved old
         // owner through the adapter below. Generic hints never set legacy
@@ -525,6 +527,7 @@ impl Engine {
         lease: &ScanLease,
         guard: &mut dyn ImageGuard,
     ) -> Result<ScanReceipt> {
+        self.note_graph_inputs_mutated();
         self.scan_inventory_owner_with(lease, guard, scan_process_view)
     }
 
@@ -538,6 +541,7 @@ impl Engine {
             &mut CaptureWorkBudget,
         ) -> std::result::Result<ScanOutcome, String>,
     ) -> Result<ScanReceipt> {
+        self.note_graph_inputs_mutated();
         self.require_inventory_lease(lease)?;
         let identity = self.inventory_receipt_identity(lease.owner)?;
         self.check_inventory_image(&identity, guard)?;
@@ -787,6 +791,7 @@ impl Engine {
         prepared: PreparedReconciliation,
         guard: &mut dyn ImageGuard,
     ) -> Result<InventoryCommit> {
+        self.note_graph_inputs_mutated();
         self.revalidate_inventory_reconciliation(&prepared, guard)?;
         self.inventory_state()?;
         self.preflight_candidate_publication(&prepared.candidate)?;

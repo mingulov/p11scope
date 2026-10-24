@@ -45733,11 +45733,12 @@ fn collected_graph_native_error_is_contained() {
         }),
     );
     let reserve = engine.collected_test_pool.reserver();
-    let measure = crate::attach::RetainedInputMeasure::new(engine.plan.slots.len()).unwrap();
+    // A working preparation, not a measure test: real slots carry links and
+    // backing the static measure undercounts, so pay headroom.
     let mut input = Some(
         RetainedRetirementInput::from_reserved_removed(
             engine.plan.slots.clone(),
-            reserve.reserve(measure.bytes()).unwrap(),
+            reserve.reserve(1024 * 1024).unwrap(),
         )
         .unwrap(),
     );
@@ -46510,7 +46511,7 @@ fn graph_inputs_epoch_bumps_on_mutating_entry_points() {
     epoch += 1;
     assert_eq!(engine.graph_inputs_epoch_for_test(), epoch);
     let mut ticket = TraceWorkTicket::default();
-    engine.service_trace_images(&mut trace, &mut ticket, |_| {});
+    engine.service_trace_images(&trace, &mut ticket, |_| {});
     epoch += 1;
     assert_eq!(engine.graph_inputs_epoch_for_test(), epoch);
     let mut guard = super::inventory::UnavailableImageGuard;

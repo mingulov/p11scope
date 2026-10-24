@@ -305,6 +305,87 @@ class H3ObserverProvenance(unittest.TestCase):
                     E16.validate_provenance(broken, binary.read_bytes(), check_sources=False)
 
 
+class ObserverPathSelection(unittest.TestCase):
+    """Packaged runs select the observer by absolute path only.
+
+    The provenance receipt records the exact resolved path and digest;
+    relative names are refused rather than resolved against the working
+    directory or PATH.
+    """
+
+    def fake_pair(self, base):
+        first = base / "pkg-a"
+        first.mkdir()
+        binary, obj = fake_observer_binary(first)
+        second = base / "pkg-b"
+        second.mkdir()
+        other = second / "observer"
+        other.write_bytes(b"\x7fELF" + b"\x01" * 64 + FAKE_RUSTC + b"\x00" + FAKE_BPF
+                          + b"\x00" * 63 + b"Z")
+        return (binary, obj), other
+
+    def test_absolute_packaged_path_is_bound_with_path_and_digest(self):
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            (binary, obj), other = self.fake_pair(base)
+            manifest = E16.make_provenance(binary, [obj], git=clean_git)
+            self.assertEqual(manifest["observer"]["path"], str(binary.resolve()))
+            self.assertEqual(manifest["observer"]["sha256"],
+                             hashlib.sha256(binary.read_bytes()).hexdigest())
+            # Negative control: the other packaged bytes bind their own
+            # path and digest, so the receipt tracks the selected file.
+            swapped = E16.make_provenance(other, [obj], git=clean_git)
+            self.assertEqual(swapped["observer"]["path"], str(other.resolve()))
+            self.assertEqual(swapped["observer"]["sha256"],
+                             hashlib.sha256(other.read_bytes()).hexdigest())
+            self.assertNotEqual(swapped["observer"]["sha256"],
+                                manifest["observer"]["sha256"])
+            E16.validate_provenance(manifest, binary.read_bytes(), check_sources=False)
+
+    def test_relative_observer_is_refused_without_cwd_or_path_fallback(self):
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            binary, obj = fake_observer_binary(base)
+            trap = base / "trap-cwd"
+            (trap / "sub").mkdir(parents=True)
+            for name in (trap / "observer", trap / "sub" / "observer"):
+                name.write_bytes(binary.read_bytes())
+            decoy_dir = base / "decoy-bin"
+            decoy_dir.mkdir()
+            decoy = decoy_dir / "observer"
+            decoy_log = base / "decoy.log"
+            decoy.write_text(f"#!/bin/sh\necho HIT >> '{decoy_log}'\n")
+            decoy.chmod(0o755)
+            previous_path = os.environ.get("PATH", "")
+            os.environ["PATH"] = str(decoy_dir) + os.pathsep + previous_path
+            previous_cwd = os.getcwd()
+            os.chdir(trap)
+            try:
+                self.assertEqual(os.environ["PATH"].split(os.pathsep)[0], str(decoy_dir))
+                with self.assertRaisesRegex(Unknown, "not absolute"):
+                    E16.resolve_observer("observer")
+                with self.assertRaisesRegex(Unknown, "not absolute"):
+                    E16.resolve_observer("sub/observer")
+                with self.assertRaisesRegex(Unknown, "not absolute"):
+                    E16.make_provenance("observer", [obj], git=clean_git)
+            finally:
+                os.chdir(previous_cwd)
+                os.environ["PATH"] = previous_path
+            self.assertFalse(decoy_log.exists())
+
+    def test_missing_or_non_file_observer_is_refused(self):
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            binary, obj = fake_observer_binary(base)
+            missing = base / "no-such-observer"
+            with self.assertRaisesRegex(Unknown, "not available"):
+                E16.resolve_observer(missing)
+            with self.assertRaisesRegex(Unknown, "not available"):
+                E16.make_provenance(missing, [obj], git=clean_git)
+            with self.assertRaisesRegex(Unknown, "regular file"):
+                E16.resolve_observer(base)
+
+
 class H4BoundedReads(unittest.TestCase):
     """H4: silence, partial lines, EOF and oversize end as UNKNOWN on time."""
 

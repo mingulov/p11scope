@@ -81,6 +81,151 @@ def dry_run_ledger(binary):
     return json.loads(out.getvalue())
 
 
+TRACE_STUB = """#!__PYTHON__
+import json
+import sys
+from pathlib import Path
+MARKER = "__MARKER__"
+LOG = "__LOG__"
+TOP = MARKER + " probe: inventory trace run"
+INVENTORY = MARKER + " inventory: __FLAGS__ diff"
+TRACE = MARKER + " trace: __TRACE_FLAGS__"
+RUNNER = MARKER + " runner: --trace"
+
+
+def log(argv):
+    with open(LOG, "a", encoding="utf-8") as stream:
+        stream.write("HIT " + " ".join(argv) + "\\n")
+
+
+def evidence(document):
+    return {"edges": [{"entries": {"count": edge["entries"]["count"]}}
+                      for edge in document["edges"]],
+            "edge_occurrences": list(range(len(document["edges"]))),
+            "modules": [{"stand_in": True}]}
+
+
+def report(before, after):
+    paths = {}
+    for document in (before, after):
+        for caller in document["callers"]:
+            exe = (caller.get("image") or {}).get("exe") or {}
+            if exe.get("path"):
+                paths[exe["path"]] = {"stand_in": True}
+    return {"schema": "p11scope/inventory-diff/v1",
+            "comparison": {"counter_relation": "independent_windows",
+                           "application_paths": paths},
+            "limitations": ["absence_is_not_removal",
+                            "counts_are_independent_windows"],
+            "summary": {"application_groups_compared": 1},
+            "before": {"evidence": evidence(before)},
+            "after": {"evidence": evidence(after)}}
+
+
+def diff(arguments):
+    positionals = []
+    want_json = False
+    destination = None
+    rest = list(arguments)
+    while rest:
+        word = rest.pop(0)
+        if word == "--json":
+            want_json = True
+        elif word == "-o":
+            destination = rest.pop(0)
+        else:
+            positionals.append(word)
+    if len(positionals) != 2:
+        sys.stderr.write(MARKER + " needs BEFORE AFTER\\n")
+        return 1
+    before = json.loads(Path(positionals[0]).read_bytes())
+    after = json.loads(Path(positionals[1]).read_bytes())
+    if want_json:
+        payload = (json.dumps(report(before, after), sort_keys=True) + "\\n").encode()
+    else:
+        payload = ("Not observed after does not prove removal\\n"
+                   "independent observation windows\\n"
+                   "no count delta\\n"
+                   "Recorded application: stand-in\\n"
+                   "Module: stand-in\\n").encode()
+    if destination is not None:
+        Path(destination).write_bytes(payload)
+    sys.stdout.buffer.write(payload)
+    return 0
+
+
+def main(argv):
+    log(argv)
+    rest = argv[1:]
+    if rest == ["--help"]:
+        print(TOP)
+        return 0
+    if rest == ["inventory", "--help"]:
+        print(INVENTORY)
+        return 0
+    if rest == ["trace", "--help"]:
+        print(TRACE)
+        return 0
+    if rest == ["run", "--trace", "--help"]:
+        print(RUNNER)
+        return 0
+    if len(rest) >= 3 and rest[:2] == ["inventory", "diff"]:
+        return diff(rest[2:])
+    sys.stderr.write(MARKER + " refuses " + " ".join(rest) + "\\n")
+    return 1
+
+
+raise SystemExit(main(sys.argv))
+"""
+
+
+def stage_trace_pair(root, tag):
+    """Stage a selected/decoy pair answering the named-trace dry-run probes.
+
+    Beyond the ledger help probes, each stub answers the trace/run help
+    probes and computes the offline `inventory diff` the named-trace twin
+    matrix needs, re-deriving counts and paths from the given saved inputs
+    instead of hardcoding them. Hits are logged like stage_pair.
+    """
+    stage = {}
+    flags = " ".join(DRIVER.LEDGER_HELP_FLAGS)
+    trace_flags = " ".join(DRIVER.TRACE_HELP_FLAGS)
+    for role, marker in (("selected", "SELECTED"), ("decoy", "DECOY")):
+        bindir = root / f"{tag}-{role}"
+        bindir.mkdir(mode=0o755)
+        binary = bindir / "p11scope"
+        log = root / f"{tag}-{role}.log"
+        text = TRACE_STUB.replace("__PYTHON__", sys.executable)
+        text = text.replace("__MARKER__", marker).replace("__LOG__", str(log))
+        text = text.replace("__FLAGS__", flags).replace("__TRACE_FLAGS__", trace_flags)
+        binary.write_text(text)
+        binary.chmod(0o755)
+        stage[role] = binary
+        stage[role + "_log"] = log
+    return stage
+
+
+def dry_run_named_trace(binary):
+    """Run the harness named-trace dry-run over an explicit binary; return the plan."""
+    args = argparse.Namespace(provider=None, caller=None, manifest=[],
+                              manifest_helper=None, helper_source_revision=None,
+                              uid=None, gid=None, before=None, after=None,
+                              pair_prebuilt=None, out=None)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = DRIVER.dry_run_plan(args, ["named-trace"], str(binary))
+    assert code == 0, f"dry-run exited {code}"
+    return json.loads(out.getvalue())
+
+
+def self_test(journeys, binary):
+    """Run the harness self-test; return (code, summary)."""
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = DRIVER.self_test(journeys, binary)
+    return code, json.loads(out.getvalue())
+
+
 class ReleaseRecipientTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="release-recipient-")
@@ -251,6 +396,136 @@ class ReleaseRecipientTests(unittest.TestCase):
                                capture_output=True, timeout=30)
             self.assertFalse(stage["decoy_log"].exists(),
                              "failed exec fell back to a PATH binary")
+
+    def test_named_trace_dry_run_uses_selected_binary(self):
+        stage = stage_trace_pair(self.root, "trace")
+        with patch.dict(os.environ):
+            os.environ.pop("P11SCOPE_U6_RED_PROOF", None)
+            os.environ.pop("P11SCOPE_U6_INSTALLED_BINARY", None)
+            os.environ["PATH"] = (
+                f"{stage['decoy'].parent}{os.pathsep}{os.environ['PATH']}"
+            )
+            # The failure mutation is armed: a PATH lookup would take the decoy.
+            self.assertEqual(shutil.which("p11scope"), str(stage["decoy"]))
+            plan = dry_run_named_trace(stage["selected"])
+            selected = stage["selected"].resolve()
+            info = plan["binary"]
+            self.assertEqual(info["path"], str(selected))
+            self.assertEqual(info["sha256"],
+                             hashlib.sha256(selected.read_bytes()).hexdigest())
+            self.assertEqual(info["role"], "shape_stand_in")
+            self.assertEqual(plan["mode"], "dry-run")
+            by_cell = {cell["cell"]: cell for cell in plan["cells"]}
+            for name in ("named-positive", "unknown-honest", "exec-generations",
+                         "run-parity"):
+                self.assertEqual(by_cell[name]["wiring"], "validated", name)
+                self.assertIn("qualify_cell", by_cell[name])
+            for name in ("mapped-only", "unreadable", "duplicate-basename",
+                         "slow-reader"):
+                self.assertEqual(by_cell[name]["wiring"], "twin-verdict-ready", name)
+            twins = {twin["twin"] for twin in plan["twins"]}
+            for name in ("trace-green-named-positive", "trace-red-false-name",
+                         "diff-green-known-change", "diff-red-empty-population"):
+                self.assertIn(name, twins)
+            self.assertTrue(any("trusted-manifest inputs absent" in blocker
+                                for blocker in plan.get("live_blockers", [])),
+                            plan.get("live_blockers"))
+            hits = stage["selected_log"].read_text()
+            self.assertIn("trace --help", hits)
+            self.assertIn("inventory diff", hits)
+            self.assertFalse(stage["decoy_log"].exists(),
+                             "decoy earlier in PATH was executed")
+            # Negative control: selecting the decoy names the decoy, so the
+            # receipt tracks the executed binary instead of echoing a constant.
+            swapped = stage_trace_pair(self.root, "trace-swapped")
+            swapped_plan = dry_run_named_trace(swapped["decoy"])
+            self.assertEqual(swapped_plan["binary"]["path"],
+                             str(swapped["decoy"].resolve()))
+            self.assertTrue(swapped["decoy_log"].exists())
+            self.assertFalse(swapped["selected_log"].exists())
+
+    def test_u6_binary_selection_refuses_relative_missing_and_nonexecutable(self):
+        stage = stage_pair(self.root, "refuse")
+        trapdir = self.root / "trap-cwd"
+        (trapdir / "sub").mkdir(parents=True)
+        for trap in (trapdir / "p11scope", trapdir / "sub" / "p11scope"):
+            trap.write_bytes(stage["selected"].read_bytes())
+            trap.chmod(0o755)
+        with patch.dict(os.environ):
+            os.environ.pop("P11SCOPE_U6_RED_PROOF", None)
+            os.environ.pop("P11SCOPE_U6_INSTALLED_BINARY", None)
+            os.environ["PATH"] = (
+                f"{stage['decoy'].parent}{os.pathsep}{os.environ['PATH']}"
+            )
+            self.assertEqual(shutil.which("p11scope"), str(stage["decoy"]))
+            with contextlib.chdir(trapdir):
+                # A relative name is refused even though the working
+                # directory holds an executable trap and PATH a decoy.
+                with self.assertRaisesRegex(AssertionError, "not absolute"):
+                    DRIVER.resolve_binary("p11scope")
+                with self.assertRaisesRegex(AssertionError, "not absolute"):
+                    DRIVER.resolve_binary("sub/p11scope")
+                with self.assertRaisesRegex(AssertionError, "not absolute"):
+                    dry_run_ledger("p11scope")
+            self.assertFalse(stage["selected_log"].exists(),
+                             "relative selection executed the CWD trap")
+            self.assertFalse(stage["decoy_log"].exists(),
+                             "relative selection fell back to the PATH decoy")
+            with self.assertRaises(FileNotFoundError):
+                DRIVER.resolve_binary(str(self.root / "no-such-binary"))
+            plain = self.root / "plain-file"
+            plain.write_bytes(b"not executable\n")
+            plain.chmod(0o644)
+            with self.assertRaisesRegex(AssertionError, "not executable"):
+                DRIVER.resolve_binary(str(plain))
+
+    def test_named_trace_self_test_uses_resolved_binary(self):
+        stage = stage_trace_pair(self.root, "selftest")
+        with patch.dict(os.environ):
+            os.environ.pop("P11SCOPE_U6_RED_PROOF", None)
+            os.environ.pop("P11SCOPE_U6_INSTALLED_BINARY", None)
+            os.environ["PATH"] = (
+                f"{stage['decoy'].parent}{os.pathsep}{os.environ['PATH']}"
+            )
+            self.assertEqual(shutil.which("p11scope"), str(stage["decoy"]))
+            code, summary = self_test(["named-trace"], str(stage["selected"]))
+            self.assertEqual(code, 0)
+            self.assertEqual(summary["mode"], "self-test")
+            twins = {twin["twin"] for twin in summary["twins"]}
+            for name in ("trace-green-named-positive", "trace-red-false-name",
+                         "diff-green-known-change", "diff-red-empty-population"):
+                self.assertIn(name, twins)
+            self.assertIn("inventory diff", stage["selected_log"].read_text())
+            self.assertFalse(stage["decoy_log"].exists(),
+                             "decoy earlier in PATH was executed")
+            # Ledger-only self-test still needs no binary.
+            code, summary = self_test(["ledger"], None)
+            self.assertEqual(code, 0)
+            self.assertEqual(summary["journeys"], ["ledger"])
+        refusal = stage_trace_pair(self.root, "selftest-refuse")
+        trapdir = self.root / "selftest-trap-cwd"
+        (trapdir / "sub").mkdir(parents=True)
+        for trap in (trapdir / "p11scope", trapdir / "sub" / "p11scope"):
+            trap.write_bytes(refusal["selected"].read_bytes())
+            trap.chmod(0o755)
+        with patch.dict(os.environ):
+            os.environ.pop("P11SCOPE_U6_RED_PROOF", None)
+            os.environ.pop("P11SCOPE_U6_INSTALLED_BINARY", None)
+            os.environ["PATH"] = (
+                f"{refusal['decoy'].parent}{os.pathsep}{os.environ['PATH']}"
+            )
+            self.assertEqual(shutil.which("p11scope"), str(refusal["decoy"]))
+            with contextlib.chdir(trapdir):
+                # A bare name would resolve through PATH to the decoy and a
+                # slashed name through the working directory to the trap.
+                with self.assertRaisesRegex(AssertionError, "not absolute"):
+                    self_test(["named-trace"], "p11scope")
+                with self.assertRaisesRegex(AssertionError, "not absolute"):
+                    self_test(["named-trace"], "sub/p11scope")
+            self.assertFalse(refusal["selected_log"].exists(),
+                             "relative selection executed the CWD trap")
+            self.assertFalse(refusal["decoy_log"].exists(),
+                             "relative selection executed the PATH decoy")
 
 
 if __name__ == "__main__":

@@ -310,7 +310,8 @@ calls after a `dlopen` can fire before their probes exist — a workload that
 exits in milliseconds can be gone before attach completes, even with
 `--pause auto`. Measured FULL-default startup to the `capturing:` line on
 4 vCPUs is ~4–7 s on 6.6+ (6.6.157 4.5–4.9 s, 7.0 6.25–6.6 s) but
-~15–20 s on 5.15/6.1 (6.1.188 16.7–17.4 s, 5.15.221 17.0–20.2 s),
+~15–22 s on 5.15/6.1 (6.1.188 16.7–17.4 s, 5.15.221 17.0–20.2 s,
+0-probe 14.8–21.5 s under host load),
 where the kernel verifies each BPF program load sequentially; plan the
 hold phase accordingly. Keep the workload alive past attach (a sleep/hold phase,
 `LD_PRELOAD=<provider.so>` so the initial scan sees it, or long-lived

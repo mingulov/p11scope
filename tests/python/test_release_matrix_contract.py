@@ -101,7 +101,7 @@ class MatrixContract(unittest.TestCase):
         self.stage.mkdir()
         self.bins = self.base / "bins"
         self.bins.mkdir()
-        for name in ("p11scope", "p11scope-lib", "p11scope-bpfmulti"):
+        for name in ("p11scope", "p11scope-lib", "p11scope-bpfmulti", "p11scope-discover"):
             (self.bins / name).write_text("controlled candidate " + name)
         self.candidate = candidate_receipt(self.bins, self.base / "candidate-build.json")
         self.listing = self.base / "ignored.txt"
@@ -664,6 +664,41 @@ class MatrixContract(unittest.TestCase):
         verify = command(sys.executable, "-I", str(CHECKER), "--verify-inputs", str(stage),
             "--contract", str(stage / "contract.json"))
         self.assertEqual(verify.returncode, 0, verify.stdout + verify.stderr)
+
+    def test_prepare_stages_attested_manifest_helper(self):
+        contract = json.loads(self.contract.read_text())
+        self.assertIn("artifacts/p11scope-discover", contract["bindings"])
+        staged = self.stage / "artifacts/p11scope-discover"
+        self.assertTrue(staged.is_file())
+        self.assertEqual(staged.read_bytes(), (self.bins / "p11scope-discover").read_bytes())
+        verify = command(sys.executable, "-I", str(CHECKER), "--verify-inputs", str(self.stage),
+            "--contract", str(self.contract))
+        self.assertEqual(verify.returncode, 0, verify.stdout + verify.stderr)
+
+    def test_prepare_refuses_bin_dir_without_attested_manifest_helper(self):
+        bare = self.base / "bins without discover"; bare.mkdir()
+        for name in ("p11scope", "p11scope-lib", "p11scope-bpfmulti"):
+            shutil.copy2(self.bins / name, bare / name)
+        stage = self.base / "undiscoverable stage"
+        result = command(sys.executable, "-I", str(CHECKER), "--prepare", str(stage),
+            "--lane", "6.1.188", "--kernel", str(self.kernel), "--bin-dir", str(bare),
+            "--binary-list", str(self.listing), "--curation", str(self.curation),
+            "--bpfmulti-list", str(self.bm_list), "--candidate-receipt", str(self.candidate),
+            "--lib-test", LIB_A, "--lib-test", LIB_B)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("p11scope-discover", result.stdout)
+
+    def test_verify_inputs_requires_attested_manifest_helper_binding(self):
+        # A stage whose contract lost the helper binding is stale, even when
+        # the staged file is still present.
+        staged = self.stage / "artifacts/p11scope-discover"
+        staged.write_bytes((self.bins / "p11scope-discover").read_bytes())
+        contract = json.loads(self.contract.read_text())
+        contract["bindings"].pop("artifacts/p11scope-discover", None)
+        self.contract.write_text(json.dumps(contract))
+        result = command(sys.executable, "-I", str(CHECKER), "--verify-inputs", str(self.stage),
+            "--contract", str(self.contract))
+        self.assertNotEqual(result.returncode, 0, result.stdout)
 
     def test_host_prepare_stages_no_boot_config(self):
         stage, result = self.prepare_guest_attempt("bound host", "host", "host")
@@ -1489,6 +1524,28 @@ class MatrixContract(unittest.TestCase):
         self.assertNotIn('--verify-inputs', text)
         self.assertLess(inner.index('--verify-inputs'), inner.index('bash "$STAGE/object-inner.sh" "$WORK/caller"'))
         self.assertLess(inner.index('bash "$STAGE/object-inner.sh"'), inner.index('--seal'))
+
+    def test_generated_inner_copies_inventory_evidence_before_failure_gates(self):
+        # A failed inventory lane must still leave its evidence in the stage:
+        # the copy precedes the exit gate on both the native and scan lanes.
+        _, stage = self.retained_object_inputs()
+        result = command(str(RUNNER), "--write-inner-stage", str(stage), "--contract", str(stage / "contract.json"))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        inner = (stage / "inner.sh").read_text()
+        for base, gate in (("c8-native", "native_rc"), ("c8-scan", "scan_rc")):
+            with self.subTest(base=base):
+                copy = inner.index(f'--copy-tree native "$WORK/{base}" "$STAGE/{base}"')
+                self.assertLess(copy, inner.index(f'[ "${gate}" = 0 ]'))
+
+    def test_outer_runner_carries_attested_manifest_helper(self):
+        text = RUNNER.read_text()
+        build = text[text.index("build_bins() {"):
+                     text.index("CANDIDATE_RECEIPT=$STAGE_REV/candidate-build.json")]
+        loop = text[text.index("for b in p11scope"):text.index("LIBBIN=")]
+        self.assertIn("-p p11scope-discover", build)
+        self.assertIn('"$BIN_OUT/p11scope-discover"', build)
+        self.assertIn("p11scope p11scope-lib p11scope-bpfmulti p11scope-discover", loop)
+        self.assertIn('"$BIN_DIR/p11scope-discover"', loop)
 
     def test_invalid_outer_object_selection_refuses_before_build_or_stage(self):
         directory = str(self.base / "selected inputs")

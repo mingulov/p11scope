@@ -10,6 +10,7 @@ import mmap
 import os
 from pathlib import Path
 import runpy
+import shutil
 import stat
 import subprocess
 import struct
@@ -630,6 +631,9 @@ out=pathlib.Path(sys.argv[sys.argv.index('-o')+1]); root=pathlib.Path(os.environ
 (root / 'selected-output.json').write_text(json.dumps(str(out)))
 (root / 'observer-argv.json').write_text(json.dumps(sys.argv[1:]))
 (root / 'observer.pid').write_text(str(os.getpid()))
+shim_log=os.environ.get('SHIM_LOG')
+if shim_log:
+ with open(shim_log,'a') as f: f.write('OBSERVER_START' + chr(10))
 mode=os.environ['CONTROL_MODE']
 if mode=='exits-before-ready': sys.exit(17)
 if mode=='ignore-term': signal.signal(signal.SIGTERM, signal.SIG_IGN)
@@ -650,6 +654,8 @@ for i,row in enumerate(report['functions']):
  row['module']=obj
 report['evidence']['discovery']=[dict(obj,path=str(module),tables=[{}])]
 out.write_text(json.dumps(report))
+if shim_log:
+ with open(shim_log,'a') as f: f.write('OBSERVER_EXIT' + chr(10))
 '''
 
 FAKE_SIGNAL_PARENT = '''#!/usr/bin/python3
@@ -825,6 +831,48 @@ class ShellControls(unittest.TestCase):
 
     def test_system_control_uses_strict_argv_and_500_call_ledgers(self):
         self.control("healthy", 0, "system", unrelated=True)
+
+    def test_system_capture_spawns_no_runner_subprocesses(self):
+        # A system-scope capture counts every ambient process exit as a
+        # descendant gap, so the runner must poll the capture window with
+        # shell builtins only: no sleep/grep/touch while the observer runs.
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            fixture, observer, module = [tmp / p for p in ("fixture", "observer", "module")]
+            fixture.write_text(FAKE_FIXTURE); observer.write_text(FAKE_OBSERVER)
+            fixture.chmod(0o700); observer.chmod(0o700); module.write_text("independent provider")
+            out = tmp / "out"; out.mkdir()
+            template = tmp / "report-template.json"
+            template.write_text(json.dumps(inputs(system=True)[0]))
+            shims = tmp / "shims"; shims.mkdir()
+            log = tmp / "shim.log"
+            for name in ("sleep", "grep", "touch"):
+                real = shutil.which(name)
+                self.assertIsNotNone(real, "test host lacks " + name)
+                (shims / name).write_text(
+                    "#!/bin/bash\necho \"CALL %s $*\" >> \"$SHIM_LOG\"\nexec \"%s\" \"$@\"\n" % (name, real))
+                (shims / name).chmod(0o755)
+            env = dict(os.environ, CONTROL_MODE="healthy", CONTROL_CELL="system", MODULE=str(module),
+                       ITERS="500", CONTROL_REPORT=str(template), CONTROL_OUT=str(out),
+                       SHIM_LOG=str(log), PATH=str(shims) + ":" + os.environ["PATH"])
+            env.pop("P11SCOPE_LOCAL_OUTPUT_ROOT", None)
+            proc = subprocess.run(["bash", str(SHELL), "--control-gated", str(observer),
+                                   str(out), str(fixture), "system"],
+                                  env=env, text=True, capture_output=True, timeout=30)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            try:
+                lines = log.read_text().splitlines()
+            finally:
+                for name in ("fixture.pid", "observer.pid"):
+                    path = out / name
+                    if path.exists():
+                        try: os.kill(int(path.read_text()), 9)
+                        except ProcessLookupError: pass
+            self.assertIn("OBSERVER_START", lines)
+            self.assertIn("OBSERVER_EXIT", lines)
+            window = lines[lines.index("OBSERVER_START") + 1:lines.index("OBSERVER_EXIT")]
+            calls = [line for line in window if line.startswith("CALL ")]
+            self.assertEqual(calls, [], "runner spawned subprocesses during the system capture")
 
     def test_system_never_ready_fails_without_release(self):
         self.control("never-ready", 1, "system")

@@ -1256,3 +1256,155 @@ fn retained_group_member_tgkill_gate_detects_live_and_reaped_threads() {
         "reaped tid reads dead"
     );
 }
+
+#[test]
+fn retained_group_member_map_files_dir_uses_survivor_tid_directory() {
+    let worker = WaitingThread::spawn();
+    let tgid = std::process::id();
+    let tid = worker.tid;
+    assert_ne!(tid, tgid, "worker is a nonleader thread");
+    let original = Arc::new(PidPin::open(tgid).expect("self pins"));
+    let owner = test_owner();
+    let mut work = test_budget();
+    let member =
+        RetainedGroupMember::acquire(&original, tid, &owner, &mut work, test_deadline())
+            .expect("live member mints");
+    let seen = RefCell::new(Vec::new());
+    let capturing = |path: &std::path::Path| {
+        seen.borrow_mut().push(path.to_path_buf());
+        open_dir_fd(path)
+    };
+    let guard = member
+        .open_map_files_dir_with_opener(&capturing)
+        .expect("member map_files opens");
+    drop(guard);
+    let opened = seen.borrow();
+    assert_eq!(opened.len(), 1, "one directory open, got {opened:?}");
+    assert_eq!(
+        opened[0],
+        std::path::PathBuf::from(format!("/proc/{tid}")),
+        "map_files opens through the survivor TID directory, not the TGID one"
+    );
+    drop(member);
+}
+
+#[test]
+fn retained_group_member_map_file_stat_uses_survivor_tid_directory() {
+    let worker = WaitingThread::spawn();
+    let tgid = std::process::id();
+    let tid = worker.tid;
+    assert_ne!(tid, tgid, "worker is a nonleader thread");
+    let original = Arc::new(PidPin::open(tgid).expect("self pins"));
+    let owner = test_owner();
+    let mut work = test_budget();
+    let member =
+        RetainedGroupMember::acquire(&original, tid, &owner, &mut work, test_deadline())
+            .expect("live member mints");
+    let (start, end) = self_executable_file_range();
+    let seen = RefCell::new(Vec::new());
+    let capturing = |path: &std::path::Path| {
+        seen.borrow_mut().push(path.to_path_buf());
+        open_dir_fd(path)
+    };
+    match member.stat_map_file_with_opener(start, end, &capturing) {
+        Ok(identity) => {
+            assert_ne!(identity.dev, 0, "file-backed range has a device");
+            assert_ne!(identity.ino, 0, "file-backed range has an inode");
+        }
+        Err(error) => {
+            assert!(
+                error.contains("not permitted"),
+                "map_files refusal is EPERM, got: {error}"
+            );
+        }
+    }
+    let opened = seen.borrow();
+    assert_eq!(opened.len(), 1, "one directory open, got {opened:?}");
+    assert_eq!(
+        opened[0],
+        std::path::PathBuf::from(format!("/proc/{tid}")),
+        "range stat opens through the survivor TID directory, not the TGID one"
+    );
+    drop(member);
+}
+
+#[test]
+fn retained_group_member_zombie_survivor_serves_tid_map_files() {
+    // A zombie leader's TGID mm is gone: its maps are empty and its
+    // map_files serves nothing (EACCES unprivileged, ESRCH entries
+    // privileged), while the survivor TID directory serves the shared
+    // mm. The open needs no privilege; the stat reports EPERM (not
+    // ESRCH) when unprivileged and the identity when privileged.
+    let group = ZombieLeaderGroup::spawn();
+    let tgid = group.tgid;
+    let tid = group.survivor;
+    assert_ne!(tid, tgid, "survivor is a nonleader thread");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if process_is_zombie(tgid) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "leader never reached zombie state"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let tgid_maps =
+        std::fs::read_to_string(format!("/proc/{tgid}/maps")).expect("tgid maps read");
+    assert!(tgid_maps.is_empty(), "zombie leader maps are empty");
+    let tid_maps =
+        std::fs::read_to_string(format!("/proc/{tid}/maps")).expect("tid maps read");
+    assert!(!tid_maps.is_empty(), "survivor TID maps are not empty");
+    let original = Arc::new(PidPin::open(tgid).expect("zombie group pins"));
+    let owner = test_owner();
+    let mut work = test_budget();
+    let member = RetainedGroupMember::acquire(&original, tid, &owner, &mut work, test_deadline())
+        .expect("zombie-leader survivor mints");
+    let guard = member
+        .open_map_files_dir()
+        .expect("zombie survivor map_files opens");
+    let mut maps = member.open_maps().expect("zombie survivor maps open");
+    let mut text = String::new();
+    maps.read_to_string(&mut text).expect("maps read");
+    drop(maps);
+    let (start, end) = text
+        .lines()
+        .find_map(|line| {
+            let mut parts = line.split_whitespace();
+            let addrs = parts.next()?;
+            let perms = parts.next()?;
+            if perms.as_bytes().get(2) != Some(&b'x') || !line.contains('/') {
+                return None;
+            }
+            let (start, end) = addrs.split_once('-')?;
+            Some((
+                u64::from_str_radix(start, 16).ok()?,
+                u64::from_str_radix(end, 16).ok()?,
+            ))
+        })
+        .expect("one file-backed executable range exists");
+    match member.stat_map_file(start, end) {
+        Ok(identity) => {
+            assert_ne!(identity.dev, 0, "file-backed range has a device");
+            assert_ne!(identity.ino, 0, "file-backed range has an inode");
+            assert_eq!(
+                guard.stat(start, end).expect("guard range stats"),
+                identity,
+                "guard and direct reads agree"
+            );
+        }
+        Err(error) => {
+            assert!(
+                error.contains("not permitted"),
+                "zombie survivor stat is EPERM when unprivileged, got: {error}"
+            );
+            assert!(
+                guard.stat(start, end).is_err(),
+                "guard fails closed too"
+            );
+        }
+    }
+    drop(guard);
+    drop(member);
+}

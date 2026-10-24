@@ -22,7 +22,10 @@ optional userspace decision export without additional target reads,
 and [DR04 caller metadata](#dr04-caller-metadata-2026-10-18), whose opt-in source contract is described below and whose installed qualification remains open,
 and [object producer activation](#object-producer-activation-h7-slice-d-2026-10-14),
 which implements the reviewed finite producer below with no public
-object projection.**
+object projection,
+and [H7-E4 attribute capture](#h7-e4-attribute-capture-2026-10-20),
+whose read set for official FULL release builds is PENDING owner
+decision OD11.**
 Apart from those sections, this document does not enable capture, describe
 implemented fields, or qualify a release. The implemented contracts remain
 [v1](allowlist-v1.md) and [v2](allowlist-v2.md), whose bytes and existing
@@ -190,21 +193,23 @@ explicit, narrow internal exceptions, not finite attribute values.
 | `CKA_TOKEN` | Exact selector 0x0001; exactly one byte and exact equality to 0 or 1. | Requested or established `session`/`token`, with provenance; only established result may drive object lifetime. | Other byte/length is unknown; a request is never promoted by CKR_OK creation alone. C3/C5/C6. |
 | `CKA_VALUE_LEN` | Exact selector 0x0161; one target word equal to 16, 24 or 32 only. | Finite byte-size code; label as AES 128/192/256 bits only with independently established AES type for established metadata, or requested AES type for requested metadata. | Other values unknown; no `CKA_VALUE` read and no inference from mechanism alone. C5/C6. |
 | `CKA_MODULUS_BITS` | Exact selector 0x0121; one target word equal to a selected RSA size below. | Finite size code; RSA label requires matching RSA type/provenance. | Other values unknown; no modulus or exponent buffer read. C5/C6. |
-| `CKA_EC_PARAMS` | Exact selector 0x0180; exact length 7 or 10 and byte-for-byte equality to one complete encoding below. At most ten bytes in probe scratch. | Only curve enum; discard scratch bytes immediately, including recognized encoding. Curve label requires matching EC type/provenance. | No hash-only, prefix, permissive DER, explicit-parameter or arbitrary-string fallback. C5/C6. |
+| `CKA_EC_PARAMS` | Exact selector 0x0180; exact length 7 or 10 and byte-for-byte equality to one complete encoding below. At most ten bytes in probe scratch. | Only curve enum; scratch bytes never leave the probe's stack frame and are not copied to any map, record or output, including recognized encodings. The buffer is not explicitly zeroed. Curve label requires matching EC type/provenance. | No hash-only, prefix, permissive DER, explicit-parameter or arbitrary-string fallback. C5/C6. |
 | Public identities and derived facts | Monotonic capture-local allocation plus accepted reducer transitions; never raw handle, IP or digest of either. | `instance#N`, `sess#N`, `object#N`; finite origin/lifecycle/metadata states, times within observation, and saturating counts. JSON, JSONL and dashboard use the same immutable projection. | Allocation exhaustion refuses new association, records loss, and never reuses an ID. C3/C7/C8. |
 
 ## Finite attribute vocabulary
 
-The selected constants are a deliberately small subset of the pinned
-[pkcs11-types object definitions](https://github.com/mingulov/pkcs11-components/blob/d0a47c71d34294466bc41100ae6b5a5a329029d2/crates/types/src/object.rs)
-and [attribute definitions](https://github.com/mingulov/pkcs11-components/blob/d0a47c71d34294466bc41100ae6b5a5a329029d2/crates/types/src/attribute.rs).
+Class and key-type numbers follow the OASIS PKCS #11 3.0 `pkcs11t.h`;
+the pinned pkcs11-types `CkKeyType` table misnumbers values from 0x27
+upward and is not a source for this vocabulary. The selected attribute
+selectors are a deliberately small subset of the pinned [pkcs11-types
+attribute definitions](https://github.com/mingulov/pkcs11-components/blob/d0a47c71d34294466bc41100ae6b5a5a329029d2/crates/types/src/attribute.rs).
 These sets are closed; support for another standard or vendor value requires
 a reviewed policy change, not numeric passthrough.
 
 | Field | Exact accepted values and labels |
 | --- | --- |
 | Class | 0 `data`, 1 `certificate`, 2 `public_key`, 3 `private_key`, 4 `secret_key` |
-| Key type | 0x00 `rsa`, 0x01 `dsa`, 0x02 `dh`, 0x03 `ec`, 0x04 `x9_42_dh`, 0x10 `generic_secret`, 0x1f `aes`, 0x3a `ec_edwards`, 0x3b `ec_montgomery` |
+| Key type | 0x00 `rsa`, 0x01 `dsa`, 0x02 `dh`, 0x03 `ec`, 0x04 `x9_42_dh`, 0x10 `generic_secret`, 0x1f `aes`, 0x40 `ec_edwards`, 0x41 `ec_montgomery` |
 | Token flag | 0 `session`, 1 `token` |
 | AES byte sizes | 16, 24, 32, presented as 128, 192, 256 bits with the type guard |
 | RSA bit sizes | 1024, 2048, 3072, 4096, 8192; an observer support set, not a cryptographic-strength recommendation |
@@ -215,7 +220,11 @@ the complete DER octets above are the observer's exact equality set. Edwards
 and Montgomery key-type labels do not authorize curve decoding for those
 types. Unsupported sizes/curves stay unknown rather than weakening the
 finite set. The AES byte-size policy follows the 128/192/256-bit key sizes in
-[FIPS 197](https://doi.org/10.6028/NIST.FIPS.197-upd1).
+[FIPS 197](https://doi.org/10.6028/NIST.FIPS.197-upd1). Public JSON carries
+the accepted numeric code; labels are presentation names. The projection's
+`rsa_other` fallback label can only mean 8192 (every other accepted RSA size
+has its own label), and `aes_other` can never occur (every accepted AES size
+has its own label).
 
 Pointer aliasing can still place an exact permitted constant at a readable
 address. Finite equality limits the value disclosed; it does not prove C type
@@ -243,7 +252,7 @@ These partial-result and session-handle rules follow the
 For each selected slot, in order:
 
 1. Preserve its entry selector, slot index, value pointer and capacity. A
-   null entry pointer is size-only even if the return header changes it.
+   null entry pointer is size-only even if the returned pointer changes.
 2. At return, read that same header and require unchanged type and pointer.
    `CK_UNAVAILABLE_INFORMATION` is all ones at the target width. Unavailable,
    null, insufficient capacity or non-exact accepted length means no value
@@ -267,8 +276,11 @@ Only the observed result may establish the six fields. Incomplete, unsupported
 or unreadable values never acquire a label from another attribute, another
 object, requested metadata or a recognized mechanism. For a known size without
 a known matching key type, retain the finite field fact but show type/size
-association as unknown. Class/type contradictions invalidate the combined
-key label. No default token/session classification is assumed.
+association as unknown. A combined label requires an established,
+non-conflicting key type and is withheld when class conflicts or an
+established class is incompatible (AES and generic_secret need
+`secret_key`; RSA and EC need `public_key` or `private_key`). No default
+token/session classification is assumed.
 
 ## Instance, session and object lifetime
 
@@ -460,6 +472,23 @@ inventory implementation must document its additive instance/object fields
 in [inventory v1](../schema/inventory-v1.md) and
 [inventory events v1](../schema/inventory-events-v1.md), including unknown
 states, references, budgets and stream-loss behavior, before enabling them.
+The `evidence.object_capture` build-availability field (`available`, with a
+finite `reason`) is the only object-related addition outside inventory: a
+build fact, not an observed attribute. In FULL builds these reads also occur
+in `profile`, `trace` and `run` captures with `--manifest`. Those commands
+publish no object facts; the validated tail is discarded after record
+validation.
+
+Observed attribute values live only on these surfaces, with these lifetimes:
+
+| Surface | What is retained | Lifetime |
+| --- | --- | --- |
+| Kernel `OBJECT_START` rows | At most 16,384 rows of 432 B: finite codes plus the Get value pointer and capacity | Zeroed and deleted on every terminal path |
+| Kernel EVENTS ring | Tail records (616 B with header) | Stay in the 4 MiB ring until overwritten |
+| Observer memory | The validated tail (no Debug/Serialize) until ordinary decode or registry apply; the model holds at most 65,536 objects with six requested and six established fixed slots each | The capture's lifetime |
+| Public inventory | Only `p11scope/inventory/v1` `object_observations` (objects requested, established, queries and label; key operations metadata at use) and inventory event kinds `object_observed`, `key_operations_observed` and `snapshot.object_observations` | The existing report-file and bounded event-file rotation lifetimes |
+| Dashboard | Aggregate counts only | The rendered view |
+| Never | Profile, trace, metrics, inspect, diagnostics, diff, logs or errors carry no object facts. Doctor and `evidence.object_capture` carry only the build fact | — |
 
 ## Inventory caller identity (owner ruling FB-PRIV)
 
@@ -529,7 +558,8 @@ inventory producer or kernel map. V1/v2 exclusions remain unchanged.
 The [schema's field inventory](../schema/inventory-diff-v1.md#evidence-pools-and-references)
 defines the precise output projection. Input caller/module IDs, incarnation,
 task cookies and exec IDs are not output identities. Detailed mechanism and
-operation values, additive load-instance and semantic-edge data, and arbitrary
+operation values, additive load-instance and semantic-edge data,
+`object_observations` rows, and arbitrary
 unknown subtrees are not copied into the report. Recorded paths and allowed
 free-text evidence remain input facts; a saved file does not authorize new
 reads or establish that the application called a provider. Text/diagnostics
@@ -707,7 +737,7 @@ observer. No unrelated process or map is a substitute.
 | C5 — safe values | Positive exact classes/types, AES-128/256, selected RSA size and every listed curve. Check request/result separation, key-pair template separation, no labels from mechanism alone, unknown type/size and finite-value conflicts. |
 | C6 — hostile attributes | Secret sentinels behind excluded selectors, `CKA_ID`, labels, values, modulus buffers and arbitrary DER; malformed lengths, unsupported words, null/size-only, unavailable, partial error, retries, changed headers, capacity growth, duplicate conflicts and overlapping buffers. For every accepted selector, scalar value, exact length and derive mechanism ID, reject the value ORed with `1 << 16` and `1 << 32` before any narrowing; cover representable LP64/ia32 inputs and out-of-range classifier inputs. Recognized-value aliases may disclose only the finite permitted classification with honest provenance. |
 | C7 — bounds and loss | In-flight and userspace caps, ring/state/update failures, dropped lifecycle, out-of-order/concurrent operations, unknown loss scope, eviction, saturated epochs/counters, slow output and incomplete shutdown. Measure allocated/occupied bytes and ensure invalidation precedes reuse. |
-| C8 — public delivery | The installed `p11scope inventory` command with explicit operator semantics, real owned provider calls and independently recorded operations populates the same facts in JSON, JSONL and PTY dashboard. Withheld semantics preserves count-only inventory; mixed authorized/refused providers stay visible. Harness-only results do not close this gate. |
+| C8 — public delivery | The installed `p11scope inventory` command with explicit operator semantics, real owned provider calls and independently recorded operations populates the same facts in JSON and JSONL; the dashboard shows aggregate counts derived from the same revision. Withheld semantics preserves count-only inventory; mixed authorized/refused providers stay visible. Harness-only results do not close this gate. |
 
 An internal exception is **field-specific**: canary scanners must validate the
 exact map type, field offset, current owner and authorized protocol value.
@@ -831,9 +861,32 @@ retention or public projection needs a new explicit review.
 ## H7-E4 attribute capture (2026-10-20)
 
 **Status: IMPLEMENTED in reviewed v0.4 development source (`3cd49af4`
-on `feat/v040-h7e4-attributes`); Sol landing review and installed
-qualification (H7-E5 live cells) remain before release use, and no
-public object field is enabled.** This amendment records the reviewed
+on `feat/v040-h7e4-attributes`); PENDING owner decision OD11 for official
+release bytes. FULL builds (default features) perform the reads below; P0
+builds (`--no-default-features --features stub-object-attributes`, the
+current official release build) perform none of them. The owner decision is
+not installed qualification: the E5 cells below must pass on the matching
+candidate before release notes claim FULL coverage. Public projection is
+governed by [Object observations publication](#object-observations-publication-h9).**
+
+The object marker, and with it every read in this section, requires the
+`allowlisted` policy, a non-NONE frozen `OBJECT_DESCRIPTORS` row and a FULL
+build. It is never armed under `aggregate-only` (`metrics`), under
+`unsafe-unvalidated-metadata` (CONFIG holds exactly one policy, so the marker
+test fails; that mode keeps only its v1 decoders), in the inventory
+count-only object, or in P0. A P0 build still performs the slice-D handle,
+Find and Derive-mechanism reads, marks present lists `UNINSPECTED`, and
+reports `evidence.object_capture = {available: false, reason: "not_enabled"}`.
+FULL reports `available: true`, which is a build fact, not evidence that any
+attribute was observed.
+
+In FULL builds, for object-marked calls under `allowlisted`, `p11_entry` and
+`p11_entry_ia32` perform the inspection described here. This narrows v1's
+structural statement at its "Structural enforcement" section; v1's
+`walk_template` and its numeric template-type output remain
+unsafe-diagnostic only, and v3 publishes no raw attribute type.
+
+This amendment records the reviewed
 attribute read sites, retention and honesty rules for the qualified
 lane only, and supersedes slice D's no-inspection paragraph and
 measured-stop paragraph for that lane. Every other section keeps its
@@ -896,8 +949,9 @@ rule does not yet distinguish from a never-inspected list; the
 canary workload uses six-slot templates, and E5's ledger-aware
 oracle refinement owns that distinction.
 
-Measured budgets (default object at `3cd49af4`, rustc 1.98.1; frames
-gate `object_producer_compiled_frames_are_bounded` green):
+Historical engineering record, not a contract term — measured budgets
+(default object at `3cd49af4`, rustc 1.98.1; frames gate
+`object_producer_compiled_frames_are_bounded` green):
 
 - Entry object path: 512 B exactly (root 192 + attributes level 264
   rounded to 288 + ia32 reader 32). Zero headroom: any entry-path
@@ -932,7 +986,8 @@ gate `object_producer_compiled_frames_are_bounded` green):
   costs 872 word-reads + 8 byte-reads; two all-scalar templates
   reach 880 word-reads.
 
-Host qualification at `3cd49af4`: G05
+Historical engineering record, not a contract term — host
+qualification at `3cd49af4`: G05
 `object_attributes_real_adapter_six_fields` and
 `object_attributes_refuse_before_unsafe_read` green on LP64/ia32
 (all six fields VALUE through the production adapters, pair
@@ -949,6 +1004,24 @@ producer positives with nonempty six-attribute facts, the selected
 headroom, v1/v2 privacy regressions, count-only/aggregate no-read
 twins, partial failures, ring/map pressure and stop cleanup
 through the `object-lp64` / `object-ia32` canary cells.
+
+## Object observations publication (H9)
+
+**Status: PENDING OD11.** This section scopes the public projection of the
+attribute values read under H7-E4; it grants no read beyond that section.
+The projection is exactly section version 1 of
+[docs/schema/inventory-v1-object-observations.schema.json](../schema/inventory-v1-object-observations.schema.json):
+`objects[].requested|established|queries|label` and
+`key_operations[].metadata_at_use` in `p11scope/inventory/v1`
+`object_observations`, the inventory event kinds `object_observed` and
+`key_operations_observed` (plus `snapshot.object_observations` in
+test/sync emission), and aggregate counts derived from the same revision
+on the dashboard. Unknown, conflicting and invalidated states stay
+explicit; profile, trace and metrics never carry object facts. The
+unknown-bucket summaries never fabricate starts, and role rows cannot be
+summed into a global operation denominator. Publication stays disabled
+until the owner decision: while H9 delivery is gated, production captures
+carry `object_observations` only as an explicit `unavailable` marker.
 
 ## DR04 caller metadata (2026-10-18)
 

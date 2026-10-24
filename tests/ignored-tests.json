@@ -3,7 +3,7 @@
   "cells": {
     "privileged": "ignored lib test curated in scripts/run-privileged-lib-tests.sh (default, long, skip or alternative list)",
     "live-kernel": "ignored integration test needing a real kernel/verifier lane outside the lib runner",
-    "feature": "ignored test needing a cargo feature or a dedicated build configuration",
+    "feature": "ignored test needing a cargo feature or a dedicated build configuration; `owner` names the lane that runs it",
     "performance": "ignored timing loop with no pass/fail bar, run by hand",
     "helper": "ignored private helper re-executed by its owning test; never a standalone cell"
   },
@@ -228,7 +228,8 @@
       "file": "src/attach/inventory/activation/privileged_tests.rs",
       "path": "attach::inventory::activation::privileged_tests::privileged_detailed_2112_stop_publishes_before_cleanup",
       "reason": "root-owned BPF lane; 2112-slot Detailed stop publishes before cleanup",
-      "cell": "feature"
+      "cell": "feature",
+      "owner": "wide-detailed-2112 runner"
     },
     {
       "file": "src/attach/inventory/activation/privileged_tests.rs",
@@ -348,7 +349,8 @@
       "file": "src/attach/inventory/activation/privileged_tests.rs",
       "path": "attach::inventory::activation::privileged_tests::privileged_task4_detailed_2112_lp64",
       "reason": "root-owned BPF lane; 2112 distinct physical Detailed slots, 4224 CALL events and exact raw RV rows",
-      "cell": "feature"
+      "cell": "feature",
+      "owner": "wide-detailed-2112 runner"
     },
     {
       "file": "src/attach/inventory/activation/privileged_tests.rs",
@@ -360,13 +362,15 @@
       "file": "src/attach/inventory/activation/privileged_tests.rs",
       "path": "attach::inventory::activation::privileged_tests::privileged_task4_highslot_2048_nonleader_exec",
       "reason": "root-owned BPF lane; 2049 physical endpoints and slot 2048 nonleader-exec START cleanup",
-      "cell": "feature"
+      "cell": "feature",
+      "owner": "wide-detailed-2112 runner"
     },
     {
       "file": "src/attach/inventory/activation/privileged_tests.rs",
       "path": "attach::inventory::activation::privileged_tests::privileged_task4_highslot_2048_worker_exit",
       "reason": "root-owned BPF lane; 2049 physical endpoints and slot 2048 worker-exit START cleanup",
-      "cell": "feature"
+      "cell": "feature",
+      "owner": "wide-detailed-2112 runner"
     },
     {
       "file": "src/attach/inventory/activation/privileged_tests.rs",
@@ -876,31 +880,36 @@
       "file": "tests/object_producer_activation.rs",
       "path": "counter_artifact_modes_have_exact_maps_and_root_work",
       "reason": "requires P11SCOPE_COUNTER_ARTIFACTS=1 in its own build configuration",
-      "cell": "feature"
+      "cell": "feature",
+      "owner": "counter-artifacts build"
     },
     {
       "file": "tests/object_producer_activation.rs",
       "path": "counter_artifact_mutations_are_causally_rejected",
       "reason": "requires P11SCOPE_COUNTER_ARTIFACTS=1 in its own build configuration",
-      "cell": "feature"
+      "cell": "feature",
+      "owner": "counter-artifacts build"
     },
     {
       "file": "tests/object_producer_activation.rs",
       "path": "counter_bank_proof_btf_maps_and_programs_load",
       "reason": "requires explicit counter bank build and authorized BTF/map/program-load lane",
-      "cell": "feature"
+      "cell": "feature",
+      "owner": "counter-bank-proof build"
     },
     {
       "file": "tests/object_producer_activation.rs",
       "path": "counter_bank_proof_has_exact_routes_and_start_ownership",
       "reason": "requires P11SCOPE_COUNTER_BANK_PROOF=1 in its own build configuration",
-      "cell": "feature"
+      "cell": "feature",
+      "owner": "counter-bank-proof build"
     },
     {
       "file": "tests/object_producer_activation.rs",
       "path": "counter_bank_proof_mutations_are_causally_rejected",
       "reason": "requires P11SCOPE_COUNTER_BANK_PROOF=1 in its own build configuration",
-      "cell": "feature"
+      "cell": "feature",
+      "owner": "counter-bank-proof build"
     },
     {
       "file": "tests/run_abandon_report.rs",

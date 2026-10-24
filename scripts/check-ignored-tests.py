@@ -8,12 +8,19 @@ compares them both ways against tests/ignored-tests.json:
 
 - an ignore site with no inventory entry fails;
 - an inventory entry with no matching site fails;
+- a `feature` entry without a non-empty `owner` fails: the owner names
+  the lane that runs the test (a runner list or a dedicated build);
 - a `privileged` entry whose test is not curated in
   scripts/run-privileged-lib-tests.sh fails. Macro-defined sites
   (path ending in `!`) expand to their `name!(test, ...)` invocations in
-  the same file; every default-build expansion must be curated, while
-  expansions gated on a cargo feature are exempt (they exist in no
-  default binary, so the runner's own drift check cannot see them).
+  the same file; every default-build expansion must be curated in the
+  default lists, while expansions gated on a cargo feature exist in no
+  default binary, so they must be curated in WIDE_DETAILED_2112_TESTS
+  instead (the runner's own drift check cannot see them);
+- a `feature` entry owned by the wide-detailed-2112 runner, and every
+  member of WIDE_DETAILED_2112_TESTS, must resolve both ways: an owned
+  entry missing from the list fails, and a list member that is neither
+  a wide-owned entry nor a feature-gated expansion fails.
 
 Usage:
   python3 -I scripts/check-ignored-tests.py [--root DIR]
@@ -36,6 +43,8 @@ RUNNER_LISTS = (
     "LONG_TESTS",
     "SKIP_TESTS",
 )
+WIDE_LIST = "WIDE_DETAILED_2112_TESTS"
+WIDE_OWNER = "wide-detailed-2112 runner"
 
 MOD_RE = re.compile(
     r"((?:#\s*\[[^\]]*\]\s*)*)"
@@ -351,18 +360,29 @@ def scan_sources(root):
     return found, errors
 
 
-def runner_registered(runner_path):
-    """Test paths curated by the privileged runner's four lists."""
+def runner_lists(runner_path):
+    """{list name: set of curated items} for every runner curation list."""
     text = Path(runner_path).read_text(encoding="utf-8")
-    registered = set()
-    for name in RUNNER_LISTS:
+    lists = {}
+    for name in (*RUNNER_LISTS, WIDE_LIST):
         match = re.search(rf"^{name}=\(\n(.*?)\n\)", text, re.M | re.S)
         if match is None:
             raise ValueError(f"{runner_path} has no {name} list")
+        items = set()
         for line in match.group(1).splitlines():
             entry = line.split("#")[0].strip()
             if entry:
-                registered.add(entry.split()[0])
+                items.add(entry.split()[0])
+        lists[name] = items
+    return lists
+
+
+def runner_registered(runner_path):
+    """Test paths curated by the privileged runner's four default lists."""
+    lists = runner_lists(runner_path)
+    registered = set()
+    for name in RUNNER_LISTS:
+        registered |= lists[name]
     return registered
 
 
@@ -452,10 +472,14 @@ def check(root=ROOT, inventory=None, runner=None):
     cells, entries, load_errors = load_inventory(inventory)
     failures.extend(f"FAIL inventory: {e}" for e in load_errors)
     try:
-        registered = runner_registered(runner)
+        lists = runner_lists(runner)
     except (FileNotFoundError, ValueError) as exc:
         failures.append(f"FAIL runner: {exc}")
-        registered = set()
+        lists = {}
+    registered = set()
+    for name in RUNNER_LISTS:
+        registered |= lists.get(name, set())
+    wide = lists.get(WIDE_LIST, set())
 
     sites, scan_errors = scan_sources(root)
     failures.extend(f"FAIL scan: {e}" for e in scan_errors)
@@ -472,9 +496,12 @@ def check(root=ROOT, inventory=None, runner=None):
             failures.append(f"FAIL {where}: not an object")
             continue
         keys = set(entry)
-        if keys != {"file", "path", "reason", "cell"}:
-            failures.append(f"FAIL {where}: keys must be exactly "
-                            "file/path/reason/cell")
+        is_feature = (isinstance(entry.get("cell"), str)
+                      and entry["cell"] == "feature")
+        want = ("file/path/reason/cell/owner" if is_feature
+                else "file/path/reason/cell")
+        if keys != set(want.split("/")):
+            failures.append(f"FAIL {where}: keys must be exactly {want}")
             continue
         key = (entry["file"], entry["path"])
         if key in seen:
@@ -488,6 +515,18 @@ def check(root=ROOT, inventory=None, runner=None):
         if not matches:
             failures.append(f"FAIL {where}: no matching #[ignore] site for "
                             f"{key[0]} {key[1]}")
+            continue
+        if entry["cell"] == "feature":
+            owner = entry["owner"]
+            if not isinstance(owner, str) or not owner.strip():
+                failures.append(
+                    f"FAIL {where}: feature {entry['path']} must name "
+                    "a non-empty owner")
+                continue
+            if owner == WIDE_OWNER and entry["path"] not in wide:
+                failures.append(
+                    f"FAIL {where}: feature {entry['path']} is owned by "
+                    f"{WIDE_OWNER} but not curated in {WIDE_LIST}")
             continue
         if entry["cell"] != "privileged":
             continue
@@ -517,12 +556,39 @@ def check(root=ROOT, inventory=None, runner=None):
                         f"to {expanded}, not curated in "
                         f"{runner.relative_to(root)
                             if runner.is_relative_to(root) else runner}")
+                elif absent and expanded not in wide:
+                    failures.append(
+                        f"FAIL {where}: privileged macro {macro}! expands "
+                        f"to feature-gated {expanded}, not curated in "
+                        f"{WIDE_LIST}")
 
     for (rel, full), matches in sorted(indexed.items()):
         if (rel, full) not in seen:
             lines = ",".join(str(line) for line, _ in matches)
             failures.append(f"FAIL {rel}:{lines}: #[ignore] site {full} "
                             "has no inventory entry")
+
+    wide_sites = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("cell") == "feature" and entry.get("owner") == WIDE_OWNER:
+            wide_sites.add(entry.get("path"))
+        path = entry.get("path")
+        if (isinstance(path, str) and path.endswith("!")
+                and (entry.get("file"), path) in indexed):
+            stem = path[:-1]
+            macro = stem.rsplit("::", 1)[-1]
+            module = stem.rsplit("::", 1)[0] if "::" in stem else ""
+            for name, absent in macro_expansions(root / entry["file"],
+                                                 macro):
+                if name is not None and absent:
+                    wide_sites.add(f"{module}::{name}" if module else name)
+    for member in sorted(wide):
+        if member not in wide_sites:
+            failures.append(f"FAIL runner: {WIDE_LIST} member {member} is "
+                            "not a wide-owned inventory site or a "
+                            "feature-gated expansion")
     return failures
 
 
@@ -548,7 +614,7 @@ def main(argv):
               f"{count} inventoried site(s)")
         return 1
     print(f"ignored-tests: all {count} inventoried site(s) match the sources; "
-          "privileged curation verified")
+          "privileged and wide-feature curation verified")
     return 0
 
 

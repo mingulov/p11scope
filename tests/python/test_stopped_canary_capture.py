@@ -2142,6 +2142,21 @@ class StoppedCanaryCaptureTests(unittest.TestCase):
             with self.assertRaises(capture.CaptureError):
                 capture.ready_bound_seconds('5.4.0')
 
+    def test_ready_bound_accepts_str_subclasses(self):
+        class Release(str):
+            pass
+        for release, expected in ((Release('6.6.157-ready-bound-test'), 8),
+                                  (Release('5.15.221-ready-bound-test'), 30)):
+            with self.subTest(release=str(release)):
+                self.assertEqual(capture.ready_bound_seconds(release), expected)
+
+    def test_ready_bound_rejects_non_string_releases(self):
+        for release in (None, 12345, b'6.6.0', ['6.6.0']):
+            with self.subTest(release=release):
+                with self.assertRaises(capture.CaptureError) as raised:
+                    capture.ready_bound_seconds(release)
+                self.assertIn('unparseable', str(raised.exception))
+
     def test_ready_bound_unknown_kernel_run_refuses_before_launch(self):
         for release in ('5.4.0-ready-bound-test', '6.5.0-ready-bound-test'):
             with self.subTest(release=release), tempfile.TemporaryDirectory() as directory:

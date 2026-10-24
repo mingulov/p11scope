@@ -42,7 +42,6 @@ INVENTORY_SCHEMA = "p11scope/inventory/v1"
 OBSERVATIONS_VERSION = 1
 ROW_BUDGET_LIMIT = 65536
 GAPS_CAPACITY = 256
-METADATA_SCALAR_MAX = 65535
 
 # Frozen H9 vocabularies (src/key_operation_projection.rs contract tables
 # and docs/schema/inventory-v1-object-observations.schema.json). A schema
@@ -59,6 +58,13 @@ LIFETIMES = ("live", "destroyed", "access_ended", "retired")
 ATTRIBUTIONS = ("valid", "downgraded")
 METADATA_KEYS = ("class", "key_type", "token", "value_len", "modulus_bits", "ec_params")
 FIELD_STATUSES = ("unknown", "value", "conflict", "invalidated")
+METADATA_FIELD_VALUES = {
+    "class": (0, 1, 2, 3, 4),
+    "key_type": (0, 1, 2, 3, 4, 16, 31, 64, 65),
+    "token": (0, 1),
+    "value_len": (16, 24, 32),
+    "modulus_bits": (1024, 2048, 3072, 4096, 8192),
+}
 CURVE_LABELS = ("secp256r1", "secp384r1", "secp521r1")
 QUERY_STATUSES = ("not_queried", "established", "unavailable", "size_only", "unsupported",
                   "malformed", "excluded")
@@ -212,7 +218,7 @@ def _metadata_block(block):
                      "unexpected metadata curve")
         else:
             _require(value is None or (type(value) is int
-                                       and 0 <= value <= METADATA_SCALAR_MAX),
+                                       and value in METADATA_FIELD_VALUES[name]),
                      "invalid metadata scalar")
 
 

@@ -371,6 +371,15 @@ class ObservedRsaTests(unittest.TestCase):
             with self.assertRaises(ORACLE.OracleRefusal) as caught:
                 ORACLE.compare(rows, doc)
             self.assertIn("invalid metadata scalar", str(caught.exception))
+        for field, value in (("class", 5), ("key_type", 5), ("token", True),
+                             ("value_len", 8), ("modulus_bits", 1536)):
+            with self.subTest("scalar outside its field", field=field):
+                doc = observed("clean.json")
+                doc["objects"][0]["established"][field] = {"status": "value",
+                                                           "value": value}
+                with self.assertRaises(ORACLE.OracleRefusal) as caught:
+                    ORACLE.compare(rows, doc)
+                self.assertIn("invalid metadata scalar", str(caught.exception))
         with self.subTest("bad status"):
             doc = observed("clean.json")
             doc["objects"][0]["established"]["modulus_bits"] = {"status": "BOGUS",
@@ -490,8 +499,6 @@ class ObservedRsaTests(unittest.TestCase):
             ("GAP_SUBJECTS", ORACLE.GAP_SUBJECTS,
              defs["gap_row"]["properties"]["subject"]["enum"]),
             ("GAP_REASONS", ORACLE.GAP_REASONS, defs["gap_reason"]["enum"]),
-            ("FIELD_STATUSES", ORACLE.FIELD_STATUSES,
-             defs["metadata_field_scalar"]["properties"]["status"]["enum"]),
             ("CURVE_LABELS", ORACLE.CURVE_LABELS,
              [name for name in
               defs["metadata_field_curve"]["properties"]["value"]["enum"]
@@ -526,8 +533,6 @@ class ObservedRsaTests(unittest.TestCase):
             ("UNKNOWN_BUDGET_KEYS", ORACLE.UNKNOWN_BUDGET_KEYS,
              schema["properties"]["budgets"]["properties"]["unknown_rows"]
              ["required"]),
-            ("FIELD_KEYS", ORACLE.FIELD_KEYS,
-             defs["metadata_field_scalar"]["required"]),
         ]
         for label, pinned, expected in key_sets:
             with self.subTest(label):
@@ -543,9 +548,17 @@ class ObservedRsaTests(unittest.TestCase):
         with self.subTest("gaps capacity"):
             self.assertEqual(schema["properties"]["gaps"]["properties"]["rows"]
                              ["maxItems"], ORACLE.GAPS_CAPACITY)
-        with self.subTest("scalar maximum"):
-            maximum = defs["metadata_field_scalar"]["properties"]["value"]
-            self.assertEqual(maximum["maximum"], ORACLE.METADATA_SCALAR_MAX)
+        block = defs["metadata_block"]["properties"]
+        self.assertEqual(set(ORACLE.METADATA_FIELD_VALUES) | {"ec_params"},
+                         set(block))
+        for field, accepted in ORACLE.METADATA_FIELD_VALUES.items():
+            with self.subTest("scalar field", field=field):
+                cell = defs[block[field]["$ref"].rsplit("/", 1)[-1]]
+                self.assertEqual(set(cell["required"]), set(ORACLE.FIELD_KEYS))
+                self.assertEqual(set(cell["properties"]["status"]["enum"]),
+                                 set(ORACLE.FIELD_STATUSES))
+                self.assertEqual(set(cell["properties"]["value"]["enum"]),
+                                 set(accepted) | {None})
         with self.subTest("u64 maxima"):
             self.assertEqual(defs["row_budget"]["properties"]["refused"]
                              ["maximum"], ORACLE.MAX_WORD)

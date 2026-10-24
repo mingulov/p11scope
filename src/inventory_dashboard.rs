@@ -717,7 +717,6 @@ fn object_keys_line(
     observations: &crate::key_operation_projection::ObjectObservations,
 ) -> Option<String> {
     use crate::key_operation_projection::ObsStatus;
-    use std::collections::BTreeMap;
     if observations.status == ObsStatus::Unavailable {
         return None;
     }
@@ -726,37 +725,16 @@ fn object_keys_line(
     } else {
         format!("{} ({})", observations.status.label(), observations.reason)
     };
-    // Per-category terminals across proved and unknown buckets; the
-    // unit comes from the rows (one unit per category, by contract).
-    // Each operation counts ONCE (H9 §82): the primary association's
-    // row carries the tally while secondary association rows stand
-    // beside it, never double-counted. Unknown summaries already
-    // partition once per primary.
-    let secondary = crate::key_operation_projection::SECONDARY_ROLE;
-    let mut categories: BTreeMap<&str, (u64, u64, u64, &str)> = BTreeMap::new();
-    for row in &observations.key_operations {
-        if row.role == secondary {
-            continue;
-        }
-        let slot = categories
-            .entry(row.category)
-            .or_insert((0, 0, 0, row.unit));
-        slot.0 = slot.0.saturating_add(row.completed);
-        slot.1 = slot.1.saturating_add(row.failed);
-        slot.2 = slot.2.saturating_add(row.active);
-    }
-    for row in &observations.unknown_key_operations {
-        let slot = categories
-            .entry(row.category)
-            .or_insert((0, 0, 0, row.unit));
-        slot.0 = slot.0.saturating_add(row.completed);
-        slot.1 = slot.1.saturating_add(row.failed);
-        slot.2 = slot.2.saturating_add(row.active);
-    }
-    let tallies: Vec<String> = categories
+    // Per-category terminals come from the shared tally (H9 §82:
+    // each operation counts once); the dashboard keeps its own
+    // compact rendering.
+    let tallies: Vec<String> = crate::inventory_present::key_operation_tallies(observations)
         .into_iter()
-        .map(|(category, (completed, failed, active, unit))| {
-            format!("{category} {completed}/{failed}/{active} {unit}")
+        .map(|tally| {
+            format!(
+                "{} {}/{}/{} {}",
+                tally.category, tally.completed, tally.failed, tally.active, tally.unit
+            )
         })
         .collect();
     Some(format!(

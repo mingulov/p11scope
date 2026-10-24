@@ -1878,6 +1878,7 @@ fn f7_snapshot_baseline_preserves_interleaved_children() {
         concat!(
             "inventory f7 (1 pass, 2 callers, 2 modules, 2 edges)\n",
             "coverage: 1 gaps, 0 refusals, 0 suppressed\n",
+            "key operations: unavailable (bootstrap_unavailable)\n",
             "application f7-app0 [c0 pid 70000 incarnation 0] -> module m0.so [m0]: At least 34 entries observed\n",
             "application f7-app1 [c1 pid 70001 incarnation 0] -> module m1.so [m1]: At least 55 entries observed\n",
             "Details: retained paths, identities, states and coverage follow.\n",

@@ -1236,6 +1236,61 @@ pub(crate) fn caller_lifecycle_label(caller: &CallerView) -> Option<&'static str
     }
 }
 
+/// One operation category's terminal counts across the proved and
+/// unknown buckets: completed, failed and active with the category's
+/// unit. Counts only — never object identity.
+pub(crate) struct KeyOpTally {
+    pub category: &'static str,
+    pub completed: u64,
+    pub failed: u64,
+    pub active: u64,
+    pub unit: &'static str,
+}
+
+/// Per-category terminals across proved and unknown buckets; the
+/// unit comes from the rows (one unit per category, by contract).
+/// Each operation counts ONCE (H9 §82): the primary association's
+/// row carries the tally while secondary association rows stand
+/// beside it, never double-counted. Unknown summaries already
+/// partition once per primary. Tallies sort by category. Shared by
+/// the text snapshot and the dashboard projection line.
+pub(crate) fn key_operation_tallies(
+    observations: &crate::key_operation_projection::ObjectObservations,
+) -> Vec<KeyOpTally> {
+    use std::collections::BTreeMap;
+    let secondary = crate::key_operation_projection::SECONDARY_ROLE;
+    let mut categories: BTreeMap<&str, (u64, u64, u64, &str)> = BTreeMap::new();
+    for row in &observations.key_operations {
+        if row.role == secondary {
+            continue;
+        }
+        let slot = categories
+            .entry(row.category)
+            .or_insert((0, 0, 0, row.unit));
+        slot.0 = slot.0.saturating_add(row.completed);
+        slot.1 = slot.1.saturating_add(row.failed);
+        slot.2 = slot.2.saturating_add(row.active);
+    }
+    for row in &observations.unknown_key_operations {
+        let slot = categories
+            .entry(row.category)
+            .or_insert((0, 0, 0, row.unit));
+        slot.0 = slot.0.saturating_add(row.completed);
+        slot.1 = slot.1.saturating_add(row.failed);
+        slot.2 = slot.2.saturating_add(row.active);
+    }
+    categories
+        .into_iter()
+        .map(|(category, (completed, failed, active, unit))| KeyOpTally {
+            category,
+            completed,
+            failed,
+            active,
+            unit,
+        })
+        .collect()
+}
+
 /// Pager-friendly snapshot: a deterministic, stable text rendering of a
 /// whole inventory (fit for `| less`, diffing, and test goldens).
 /// Sorted, total-first, with the same identities, states, totals, and
@@ -1277,6 +1332,50 @@ pub(crate) fn render_snapshot(presentation: &Presentation) -> String {
         budgets.refusals(),
         presentation.gaps_suppressed,
     );
+    // Key-operation summary: revision, status, row counts and
+    // per-category terminal counts from the shared projection.
+    // Counts and the fixed category/unit/status vocabulary only —
+    // never object handles, labels, metadata or instances.
+    {
+        use crate::key_operation_projection::ObsStatus;
+        let observations = &presentation.object_observations;
+        if observations.status == ObsStatus::Unavailable {
+            let _ = writeln!(out, "key operations: unavailable ({})", observations.reason);
+        } else {
+            let status = if observations.reason == "none" {
+                observations.status.label().to_string()
+            } else {
+                format!("{} ({})", observations.status.label(), observations.reason)
+            };
+            let sessions = observations.sessions.len();
+            let objects = observations.objects.len();
+            let mut line = format!(
+                "key operations: rev {} {}; {} session{}, {} object{}; ",
+                observations.revision,
+                status,
+                sessions,
+                if sessions == 1 { "" } else { "s" },
+                objects,
+                if objects == 1 { "" } else { "s" },
+            );
+            let tallies = key_operation_tallies(observations);
+            if tallies.is_empty() {
+                line.push_str("no key operations observed");
+            } else {
+                let parts: Vec<String> = tallies
+                    .iter()
+                    .map(|tally| {
+                        format!(
+                            "{} {} completed, {} failed, {} active {}",
+                            tally.category, tally.completed, tally.failed, tally.active, tally.unit
+                        )
+                    })
+                    .collect();
+                line.push_str(&parts.join("; "));
+            }
+            let _ = writeln!(out, "{line}");
+        }
+    }
     for edge in &presentation.edges {
         let caller = retained_caller(presentation, edge.caller);
         let identity = caller.map_or_else(

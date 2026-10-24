@@ -55,8 +55,10 @@ file "$rx"/<gnu-dir>/p11scope-discover    # dynamically linked, glibc
 ```
 
 - [ ] Version/help/provenance answer from the EXTRACTED bytes (record the
-  executed absolute path; `test_release_recipient_uses_selected_binary`
-  automates this once implemented — GAP C8).
+  executed absolute path; `test_release_recipient_uses_selected_binary` and
+  `test_recipient_install_uses_extracted_absolute_bytes` automate this — C8
+  closed). Official bytes are FULL by default with `--capture-mode p0` as the
+  explicit P0 option; FULL qualification is pending A1.1.
 - [ ] musl dynamic helper smoke runs on a compatible musl host/container;
   archive inspection still happens on the build host.
 

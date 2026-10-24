@@ -217,18 +217,23 @@ restart unrelated qualification for every fix.
 ## 5. Build the release artifacts
 
 `scripts/build-release.sh` is the only path to the official bytes. It builds
-the P0 static observer (`--no-default-features --features stub-object-attributes`,
-musl, `+crt-static`, build-host paths remapped), builds the discover helper for
+the FULL static observer (default features, musl, `+crt-static`, build-host
+paths remapped), with `--capture-mode p0` selecting the P0 variant
+(`--no-default-features --features stub-object-attributes`) for the
+verifier-budget lane; it builds the discover helper for
 glibc and musl in digest-pinned containers, and runs the canary, attach and hostile-target
 smokes against the packaged binaries. The helper lane
 (`scripts/verify-discover-containers.sh`) pins `rust:1.99.1-bookworm`,
 `rust:1.99.1-alpine3.22` and the `ubuntu:noble-20260810` run image by digest.
+FULL qualification is pending A1.1.
 
 Ordinary source builds default to FULL; `--no-default-features` alone does not
-select P0. The packager records `p11scope_features: ["stub-object-attributes"]`
-and a P0 scope with object-attribute capture disabled in the top-level and bundled
-`RELEASE.json`. This describes the fixed official builder configuration; report
-the runtime object-capture disclosure when qualifying packaged binaries.
+select P0. The packager records `p11scope_features: []` and a FULL scope with
+object-attribute capture enabled by default, and `["stub-object-attributes"]`
+with a P0 scope (capture disabled) under `--capture-mode p0`, in the top-level
+and bundled `RELEASE.json`. This describes the official builder configuration
+per capture mode; report the runtime object-capture disclosure when qualifying
+packaged binaries. FULL qualification is pending A1.1.
 
 Requirements: a non-root user with passwordless `sudo` (`sudo -n true` must
 succeed), a working Docker daemon, SoftHSM2 at
@@ -277,12 +282,16 @@ or package access still fails, retain the failed receipt and inspect the
 recorded network and the host's resolver configuration before retrying, or use the
 `release-preview` CI job.
 
-The single argument is an absent absolute evidence root whose parent is an
-existing private directory outside the checkout:
+The driver accepts an optional `--capture-mode full|p0` before the evidence-root
+argument (default `full`); the single-argument invocation keeps working. The
+evidence root is an absent absolute path whose parent is an existing private
+directory outside the checkout; the receipt records the selected `capture_mode`
+fact:
 
 ```sh
 mkdir -p -m 700 /var/tmp/p11scope-release && chmod 700 /var/tmp/p11scope-release
 scripts/build-release.sh /var/tmp/p11scope-release/v0.4.0
+# P0 variant: scripts/build-release.sh --capture-mode p0 /var/tmp/p11scope-release/v0.4.0-p0
 ```
 
 The body prints `=== build-release: ALL OK ===` before the finalizer runs.
@@ -368,7 +377,9 @@ python3 -I scripts/package-release.py \
   --output /var/tmp/p11scope-release/v0.4.0-public-assets
 ```
 
-The attached schema-v1 source export contains the committed source and the two
+The packager defaults to `--capture-mode full`; pass `--capture-mode p0` to
+stamp P0 provenance for a P0 receipt. The attached schema-v1 source export
+contains the committed source and the two
 exact pinned Aya archives (aya 0.14.0 and aya-obj 0.3.0, recipe revision p2).
 It still needs network access or a populated Cargo
 cache for the remaining locked dependencies; do not describe it as a full offline
@@ -420,8 +431,8 @@ tar --same-permissions --no-same-owner -xzf \
   cd "$source_recipient/p11scope-source"
   python3 -I scripts/prepare-dependencies.py --offline
   mise exec -- ./scripts/cargo.sh +1.99.1 build --locked --release \
-    --no-default-features --features stub-object-attributes \
     --target x86_64-unknown-linux-musl --bin p11scope
+  # P0 variant: add --no-default-features --features stub-object-attributes
 )
 ```
 

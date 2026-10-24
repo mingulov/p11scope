@@ -55,6 +55,26 @@ impl OwnedLink {
             _keepalive: keepalive,
         }
     }
+
+    /// Whether this payload closes as one serial link on the stop path.
+    /// `Fd`/`Probe` singles each serialize a perf-event close on kernels
+    /// without batched uprobe detach; `Multi` groups close fast. Counter
+    /// wrappers carry no close of their own, so they defer to the link.
+    fn is_single(&self) -> bool {
+        match self {
+            OwnedLink::Fd(_) | OwnedLink::Probe(_) => true,
+            OwnedLink::Multi(_) => false,
+            OwnedLink::Counter { link, .. } => link.is_single(),
+            #[cfg(test)]
+            OwnedLink::TestSingle => true,
+        }
+    }
+}
+
+/// Singles among one submitted batch, counted once at submit; the close
+/// path never re-inspects link variants.
+fn count_single_links(links: &[(OwnedLink, ProducerProgram)]) -> usize {
+    links.iter().filter(|(link, _)| link.is_single()).count()
 }
 
 /// The existing producer detach order from `detach_selected_with` as data:
@@ -582,6 +602,10 @@ enum Command {
 #[derive(Default)]
 struct WorkerState {
     total: usize,
+    /// Submitted single (non-Multi) links, counted once per batch in
+    /// `submit_batch`. Advisory only: the terminal stop estimate reads
+    /// it once at drive start; completion accounting never uses it.
+    single_links: usize,
     attempted: usize,
     released: usize,
     uncertain: usize,
@@ -922,9 +946,13 @@ impl CleanupWorker {
             return Err(SubmissionFailure::new(message, links, leases, retention));
         }
         links.sort_by_key(|(_, producer)| order.rank(producer));
+        let singles = count_single_links(&links);
         let mut state = self.state.lock().unwrap();
         if let Some(total) = state.total.checked_add(links.len()) {
             state.total = total;
+            // Advisory estimate input only: saturate instead of
+            // invalidating completion accounting on overflow.
+            state.single_links = state.single_links.saturating_add(singles);
         } else {
             state.counts_invalid = true;
             let message = "cleanup submitted-link count overflow".to_string();
@@ -1034,6 +1062,18 @@ impl CleanupWorker {
                 .failures
                 .push("cleanup transfer-failure count overflow".into());
         }
+    }
+
+    /// One-shot terminal stop estimate over the submitted singles:
+    /// the single count with its ceiling in seconds, or `None` while the
+    /// estimate stays below the print floor.
+    fn stop_estimate(&self) -> Option<(usize, u64)> {
+        let singles = self.state.lock().unwrap().single_links;
+        let ms = (singles as u64).saturating_mul(SINGLE_LINK_CLOSE_MS);
+        if ms < STOP_ESTIMATE_FLOOR_MS {
+            return None;
+        }
+        Some((singles, ms.div_ceil(1000)))
     }
 
     pub(crate) fn progress(&self) -> CleanupProgress {
@@ -1371,6 +1411,15 @@ pub(crate) fn settle_cleanup_exit(exit: CleanupExit) -> Result<Vec<String>, Clea
     }
 }
 
+/// Serial close cost per single probe link on kernels without batched
+/// uprobe detach, rounded up from the ~49 ms measured per link.
+const SINGLE_LINK_CLOSE_MS: u64 = 50;
+
+/// The terminal stop estimate prints only once it reaches this floor: a
+/// shorter stop already reads as instant, and the line must not add
+/// noise to it.
+const STOP_ESTIMATE_FLOOR_MS: u64 = 2000;
+
 fn write_progress_line(out: &mut dyn Write, progress: &CleanupProgress) {
     let _ = writeln!(
         out,
@@ -1409,7 +1458,9 @@ fn sleep_interruptibly(total: Duration, worker: &CleanupWorker, second_signal: &
 
 /// Print a progress line about once per `poll_interval` until the worker
 /// joins, then a final completed/incomplete line rendered from the join
-/// receipt. The first pass polls without printing after a short sleep,
+/// receipt. When the submitted singles estimate at least 2 s of serial
+/// closes, one estimate line prints up front, before any progress line.
+/// The first pass polls without printing after a short sleep,
 /// so a fast session exits in milliseconds instead of sleeping the full
 /// cadence. Completion is checked before the second-signal predicate:
 /// a signal that lands after the last close settles must not rewrite a
@@ -1425,6 +1476,12 @@ pub(crate) fn drive_cleanup(
     poll_interval: Duration,
 ) -> CleanupExit {
     worker.begin_terminal();
+    if let Some((singles, estimate_secs)) = worker.stop_estimate() {
+        let _ = writeln!(
+            out,
+            "p11scope: closing {singles} probe links one at a time (no batched uprobe detach on this kernel); about {estimate_secs} s, progress follows",
+        );
+    }
     let mut first_poll = true;
     loop {
         if worker.is_done() {

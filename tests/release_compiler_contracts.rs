@@ -1,8 +1,9 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! The release compiler is single-sourced from `.release-rust-version`.
 //!
-//! Every live toolchain selector (shell, Python, CI) reads that file instead
-//! of pinning a literal, and the crate `rust-version` fields equal that
+//! Live release toolchain selectors (shell, Python, CI) read that file instead
+//! of pinning a literal; the exact BPF comparison also rebuilds its historical
+//! compiler. The crate `rust-version` fields equal the release
 //! compiler's major.minor (latest only, no older supported floor). These tests
 //! pin the mechanism so a future bump touches the version file first and cannot
 //! silently reintroduce a literal selector or a stale-toolchain job.
@@ -95,31 +96,133 @@ fn ci_selectors_read_the_version_file() {
     );
 }
 
-#[test]
-fn ci_has_no_stale_toolchain_job() {
-    let ci = fs::read_to_string(".github/workflows/ci.yml").expect("read ci.yml");
-    assert!(
-        !ci.contains("\n  msrv:\n"),
-        "CI must not define an msrv job: the release compiler is the only supported toolchain"
-    );
+const HISTORICAL_BPF_INSTALL: &str =
+    "      - run: rustup toolchain install 1.98.1 --profile minimal";
+
+fn validate_ci_toolchain_selectors(ci: &str) -> Result<(), String> {
+    if ci.contains("\n  msrv:\n") {
+        return Err(
+            "CI must not define an msrv job: the release compiler is the only supported toolchain"
+                .into(),
+        );
+    }
+    let mut comparison_job = false;
+    let mut comparison = String::new();
+    let mut historical_installs = 0;
     // Every `cargo +X` / `rustup toolchain install X` selector in executable
-    // steps must be the release version file or the pinned BPF nightly.
+    // steps uses the release pin or BPF nightly. Only the exact comparison
+    // job may install its historical compiler; ordinary Cargo cannot select it.
     for line in ci
         .lines()
         .filter(|line| !line.trim_start().starts_with('#'))
     {
+        // Follow the existing workflow's two-space job boundary, without
+        // introducing another YAML parser or widening the exception to siblings.
+        if !line.trim().is_empty() && !line.starts_with("    ") {
+            comparison_job = line == "  bpf-noninterference:";
+        }
+        if comparison_job {
+            comparison.push_str(line);
+            comparison.push('\n');
+        }
         for marker in ["cargo +", "toolchain install "] {
             let mut rest = line;
             while let Some(index) = rest.find(marker) {
                 rest = &rest[index + marker.len()..];
                 let selector = rest.trim_start_matches('"');
-                assert!(
-                    selector.starts_with("$(cat .release-rust-version)")
-                        || selector.starts_with("nightly-2026-05-20"),
-                    "CI toolchain selector must be the release compiler or the BPF nightly: {line}"
-                );
+                if selector.starts_with("$(cat .release-rust-version)")
+                    || selector.starts_with("nightly-2026-05-20")
+                {
+                    continue;
+                }
+                if comparison_job && line == HISTORICAL_BPF_INSTALL {
+                    historical_installs += 1;
+                } else {
+                    return Err(format!(
+                        "CI toolchain selector must use the release pin, BPF nightly or exact historical comparison install: {line}"
+                    ));
+                }
             }
         }
+    }
+    if historical_installs > 0 {
+        let repeat = r#"
+          python3 -I scripts/check-bpf-noninterference.py \
+            --repo "$GITHUB_WORKSPACE" --baseline "$BASELINE" --candidate "$BASELINE" \
+            --work "$comparison_root/repeat-baseline" --repeat-baseline
+"#;
+        let transition = r#"
+          python3 -I scripts/check-bpf-noninterference.py \
+            --repo "$GITHUB_WORKSPACE" --baseline "$BASELINE" --candidate "$GITHUB_SHA" \
+            --work "$comparison_root/integration" --host-compiler-transition
+"#;
+        if historical_installs != 1
+            || !comparison
+                .lines()
+                .any(|line| line == "          BASELINE=68c258cf54d736370e214172d187d7d3905a8bb5")
+            || !comparison.contains(repeat)
+            || !comparison.contains(transition)
+        {
+            return Err("historical compiler install requires the exact pinned BPF repeat and host-transition comparison calls".into());
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn ci_has_no_stale_toolchain_job() {
+    let ci = fs::read_to_string(".github/workflows/ci.yml").expect("read ci.yml");
+    validate_ci_toolchain_selectors(&ci).unwrap();
+}
+
+#[test]
+fn ci_rejects_historical_compiler_leakage_into_ordinary_jobs() {
+    let ci = fs::read_to_string(".github/workflows/ci.yml").expect("read ci.yml");
+    validate_ci_toolchain_selectors(&ci).unwrap();
+    for job in ["lint", "tests", "coverage"] {
+        let header = format!("\n  {job}:\n");
+        assert!(ci.contains(&header), "missing healthy job {job}");
+        for selector in [
+            HISTORICAL_BPF_INSTALL,
+            "      - run: cargo +1.98.1 test --locked",
+        ] {
+            let changed = ci.replacen(&header, &format!("{header}{selector}\n"), 1);
+            assert!(
+                validate_ci_toolchain_selectors(&changed).is_err(),
+                "historical compiler leaked into {job}: {selector}"
+            );
+        }
+    }
+}
+
+#[test]
+fn ci_historical_compiler_requires_the_exact_bpf_comparison() {
+    let ci = fs::read_to_string(".github/workflows/ci.yml").expect("read ci.yml");
+    validate_ci_toolchain_selectors(&ci).unwrap();
+    let renamed = ci.replacen("\n  bpf-noninterference:\n", "\n  ordinary-history:\n", 1);
+    assert!(validate_ci_toolchain_selectors(&renamed).is_err());
+    for marker in [
+        "BASELINE=68c258cf54d736370e214172d187d7d3905a8bb5",
+        "--repeat-baseline",
+        "--host-compiler-transition",
+        "--candidate \"$GITHUB_SHA\"",
+    ] {
+        assert!(ci.contains(marker), "missing healthy comparison {marker}");
+        assert!(
+            validate_ci_toolchain_selectors(&ci.replacen(marker, "", 1)).is_err(),
+            "historical install survived removal of {marker}"
+        );
+    }
+    for replacement in [
+        format!("{HISTORICAL_BPF_INSTALL}\n{HISTORICAL_BPF_INSTALL}"),
+        "      - run: rustup toolchain install 1.98.0 --profile minimal".into(),
+        "      - run: cargo +1.98.1 test --locked".into(),
+    ] {
+        assert!(
+            validate_ci_toolchain_selectors(&ci.replacen(HISTORICAL_BPF_INSTALL, &replacement, 1))
+                .is_err(),
+            "historical install exception widened: {replacement}"
+        );
     }
 }
 

@@ -20,6 +20,8 @@ mod joint_handoff;
 mod owner_admission;
 #[path = "sem1_feed.rs"]
 mod sem1_feed;
+#[path = "sem2_feed.rs"]
+mod sem2_feed;
 
 struct HeldProviders {
     _dir: tempfile::TempDir,

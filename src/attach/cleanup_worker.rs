@@ -19,6 +19,7 @@ use aya::programs::links::FdLink;
 use aya::programs::uprobe::UProbeLink;
 
 use super::ProducerProgram;
+use crate::semantics_edge::resources::ResourceLease;
 
 /// A link value moved out of Aya by ownership transfer (`take_link` plus
 /// `into_fd_links()` where supported, or the intact legacy owning probe;
@@ -139,6 +140,73 @@ pub(crate) fn legacy_test_closer(
 }
 
 pub(crate) type FileLeases = Arc<Vec<Arc<File>>>;
+
+/// Collected retirement keeps its cursor backing and provider shares paid
+/// through queued closes, failed submissions and uncertain native ownership.
+/// Only the original cursor releases one provider share after all its batches
+/// actually return. An abandoned cursor deliberately retains this guard.
+pub(super) struct CollectedCleanupRetention {
+    files: Mutex<Vec<Arc<File>>>,
+    _storage: ResourceLease,
+}
+
+impl CollectedCleanupRetention {
+    pub(super) fn new(storage: ResourceLease, providers: usize) -> Arc<Self> {
+        Arc::new(Self {
+            files: Mutex::new(Vec::with_capacity(providers)),
+            _storage: storage,
+        })
+    }
+
+    pub(super) fn retain_file(&self, file: Arc<File>) {
+        let mut files = self.files.lock().unwrap_or_else(|error| error.into_inner());
+        assert!(files.len() < files.capacity());
+        files.push(file);
+    }
+
+    pub(super) fn release_one_file(&self) -> bool {
+        self.files
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .pop()
+            .is_some()
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct CleanupWorkerIdentity(Arc<Mutex<WorkerState>>);
+
+impl CleanupWorkerIdentity {
+    pub(super) fn belongs_to(&self, worker: &CleanupWorker) -> bool {
+        Arc::ptr_eq(&self.0, &worker.state)
+    }
+}
+
+/// Pinned host layouts, including old/new payload vectors, batch/close-slot
+/// Arcs, helper result vectors and queued command blocks. Native payload deep
+/// backing and provider/cursor arrays are added by the preparing carrier.
+/// std's unbounded MPSC uses 31 command slots per block; 4096 dominates one
+/// block for this fixed Command layout and its atomic/link headers.
+pub(super) fn collected_allocation_charge(payloads: usize, batches: usize) -> Option<usize> {
+    let slot = std::mem::size_of::<Mutex<DetailedClose>>() + 16 + 32;
+    let result = std::mem::size_of::<CloseResult<DetailedClose>>();
+    let payload = std::mem::size_of::<(OwnedLink, ProducerProgram)>();
+    let batch = std::mem::size_of::<Mutex<BatchState>>() + 16 + 32;
+    // A stopped channel can retain one failure per chunk. Include old/new
+    // failure and diagnostic holder vectors plus fixed native admission text.
+    let failure =
+        2 * std::mem::size_of::<SubmissionFailure>() + 2 * std::mem::size_of::<String>() + 512;
+    let command_blocks = batches.checked_add(30)?.checked_div(31)?.checked_add(1)?;
+    let per_payload = slot
+        .checked_add(result.checked_mul(6)?)?
+        .checked_add(payload.checked_mul(2)?)?;
+    payloads
+        .checked_mul(per_payload)?
+        .checked_add(batches.checked_mul(batch.checked_add(failure)?.checked_add(64)?)?)?
+        .checked_add(command_blocks.checked_mul(4096)?)?
+        .checked_add(std::mem::size_of::<CollectedCleanupRetention>() + 16 + 32 + 4096)
+}
+const _: () = assert!(std::mem::size_of::<Command>() <= 96);
 pub(crate) type CloseSlot<T> = Arc<Mutex<T>>;
 type CloseOperation<T> = Arc<dyn Fn(&mut T) -> Result<(), String> + Send + Sync>;
 type CloseTask = Box<dyn FnOnce() + Send>;
@@ -334,6 +402,7 @@ struct BatchState {
     released: usize,
     failed: bool,
     _leases: FileLeases,
+    _retention: Option<Arc<CollectedCleanupRetention>>,
 }
 
 impl std::fmt::Debug for BatchTicket {
@@ -366,6 +435,7 @@ pub(crate) struct SubmissionFailure {
     pub(crate) links: Vec<(OwnedLink, ProducerProgram)>,
     // Payloads drop before this guard, including returned transfer failures.
     _leases: FileLeases,
+    _retention: Option<Arc<CollectedCleanupRetention>>,
 }
 
 impl std::fmt::Debug for SubmissionFailure {
@@ -383,6 +453,7 @@ enum Command {
         links: Vec<(OwnedLink, ProducerProgram)>,
         batch: Arc<Mutex<BatchState>>,
         leases: FileLeases,
+        retention: Option<Arc<CollectedCleanupRetention>>,
     },
     Shutdown,
 }
@@ -407,6 +478,7 @@ struct DetailedClose {
     batch: Arc<Mutex<BatchState>>,
     // Always after payload: inner Multi/Probe destructors retain actual files.
     _leases: FileLeases,
+    _retention: Option<Arc<CollectedCleanupRetention>>,
 }
 
 impl Drop for DetailedClose {
@@ -415,7 +487,7 @@ impl Drop for DetailedClose {
             // An uncertain slot is not a foreground close opportunity. Keep
             // its entire remaining Multi/legacy payload and original files
             // for process exit, also if the coordinator unexpectedly unwinds.
-            std::mem::forget((payload, Arc::clone(&self._leases)));
+            std::mem::forget((payload, Arc::clone(&self._leases), self._retention.clone()));
         }
     }
 }
@@ -503,6 +575,22 @@ impl CleanupWorker {
         }
     }
 
+    pub(super) fn identity(&self) -> CleanupWorkerIdentity {
+        CleanupWorkerIdentity(Arc::clone(&self.state))
+    }
+
+    pub(super) fn collected_admission(&self) -> Result<(), String> {
+        self.live_admission()?;
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "cleanup worker state is poisoned")?;
+        if state.uncertain != 0 || state.transfer_failed != 0 || !state.failures.is_empty() {
+            return Err("collected cleanup refuses existing uncertain ownership".into());
+        }
+        Ok(())
+    }
+
     pub(crate) fn live_admission(&self) -> Result<(), String> {
         if let Some(error) = &self.start_error {
             return Err(error.clone());
@@ -542,9 +630,47 @@ impl CleanupWorker {
                 message,
                 links,
                 _leases: leases,
+                _retention: None,
             });
         }
-        self.submit_batch(links, leases, order)
+        self.submit_batch(links, leases, order, None)
+    }
+
+    /// Fixed-size, same-rank collected submission; the original pool guard
+    /// follows every owning branch. Legacy FileLeases behavior is unchanged.
+    pub(super) fn submit_collected(
+        &self,
+        links: Vec<(OwnedLink, ProducerProgram)>,
+        leases: FileLeases,
+        retention: Arc<CollectedCleanupRetention>,
+    ) -> Result<BatchTicket, SubmissionFailure> {
+        let rank = links
+            .first()
+            .map(|(_, producer)| DetachOrder.rank(producer));
+        if links.is_empty()
+            || links.len() > 4
+            || links
+                .iter()
+                .any(|(_, producer)| Some(DetachOrder.rank(producer)) != rank)
+        {
+            return Err(SubmissionFailure {
+                message: "collected cleanup requires one nonempty fixed rank chunk".into(),
+                links,
+                _leases: leases,
+                _retention: Some(retention),
+            });
+        }
+        if let Err(message) = self.collected_admission() {
+            self.note_transfer_failed(links.len());
+            self.note_failure(message.clone());
+            return Err(SubmissionFailure {
+                message,
+                links,
+                _leases: leases,
+                _retention: Some(retention),
+            });
+        }
+        self.submit_batch(links, leases, DetachOrder, Some(retention))
     }
 
     fn submit_batch(
@@ -552,6 +678,7 @@ impl CleanupWorker {
         mut links: Vec<(OwnedLink, ProducerProgram)>,
         leases: FileLeases,
         order: DetachOrder,
+        retention: Option<Arc<CollectedCleanupRetention>>,
     ) -> Result<BatchTicket, SubmissionFailure> {
         links.sort_by_key(|(_, producer)| order.rank(producer));
         let mut state = self.state.lock().unwrap();
@@ -565,6 +692,7 @@ impl CleanupWorker {
                 message,
                 links,
                 _leases: leases,
+                _retention: retention,
             });
         }
         drop(state);
@@ -573,11 +701,13 @@ impl CleanupWorker {
             released: 0,
             failed: false,
             _leases: Arc::clone(&leases),
+            _retention: retention.clone(),
         }));
         match self.tx.send(Command::Submit {
             links,
             batch: Arc::clone(&batch),
             leases,
+            retention,
         }) {
             Ok(()) => Ok(BatchTicket {
                 owner: Arc::clone(&self.state),
@@ -587,6 +717,7 @@ impl CleanupWorker {
                 links,
                 batch,
                 leases,
+                retention,
             })) => {
                 batch.lock().unwrap().failed = true;
                 let message =
@@ -602,6 +733,7 @@ impl CleanupWorker {
                     message,
                     links,
                     _leases: leases,
+                    _retention: retention,
                 })
             }
             Err(mpsc::SendError(Command::Shutdown)) => unreachable!("submitted a link batch"),
@@ -618,7 +750,7 @@ impl CleanupWorker {
         order: DetachOrder,
     ) {
         self.begin_terminal();
-        if let Err(failure) = self.submit_batch(links, leases, order) {
+        if let Err(failure) = self.submit_batch(links, leases, order, None) {
             self.retain_unsubmitted(failure);
         }
     }
@@ -822,6 +954,7 @@ fn run_cleanup(
                 links,
                 batch,
                 leases,
+                retention,
             } => {
                 let items: Vec<_> = links
                     .into_iter()
@@ -831,6 +964,7 @@ fn run_cleanup(
                             producer,
                             batch: Arc::clone(&batch),
                             _leases: Arc::clone(&leases),
+                            _retention: retention.clone(),
                         }))
                     })
                     .collect();

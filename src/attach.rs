@@ -51,10 +51,16 @@ mod counter_generation;
 pub(crate) mod detailed_identity;
 mod ended_pid_retirement;
 mod global_retirement;
+#[allow(dead_code)] // Collected carrier is staged before its coordinator activation.
 mod native_retirement;
 mod object_stop;
 #[cfg(test)]
 pub(crate) use native_retirement::fixture::RetirementFixture;
+#[allow(unused_imports)] // Shared crate-private ports consumed by the next Engine packet.
+pub(crate) use native_retirement::{
+    CollectedRetirementState, CollectedRetirementTicket, RetainedRetirementInput,
+    RetainedRetirementInputRefusal, RetirementProgress,
+};
 pub(crate) use native_retirement::{RetirementPoll, RetirementTicket};
 #[allow(dead_code)] // B2 records private facts; B3 supplies request-bound validation.
 mod pid_continuity;
@@ -6290,6 +6296,10 @@ impl Session {
         &mut self,
         context: LoaderContextId,
     ) -> (Vec<DynamicExportIdentity>, bool) {
+        if self.native_retirement.collected_blocking() {
+            // No snapshot/copy or false acknowledgement of a refused detach.
+            return (Vec::new(), true);
+        }
         let snapshot = dynamic_export_snapshot_with(&self.links, context, |link| match link {
             RegisteredLink::DynamicUProbe {
                 context,
@@ -6349,6 +6359,9 @@ impl Session {
         targets: &[Slot],
         objects: &PinnedObjects,
     ) -> Result<TargetAttachResult> {
+        if self.native_retirement.collected_blocking() && targets.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
         if self
             .counter_banks
             .as_ref()
@@ -6855,6 +6868,184 @@ impl Session {
         self.native_retirement.poll(ticket, worker)
     }
 
+    /// Bounded collected retirement on this original stopped Session. STOP
+    /// prevents fresh attachment; the exact original Q separately permits
+    /// this removal-only carrier. No live-only stopped refusal is reused.
+    #[allow(dead_code)] // Coordinator integration is a separate packet.
+    pub(crate) fn prepare_collected_static_retirement(
+        &mut self,
+        q: &CollectedFinishQ,
+        input: &mut Option<RetainedRetirementInput>,
+        reserver: &crate::semantics_edge::resources::SemanticResourceReserver,
+        work: usize,
+    ) -> Result<RetirementProgress> {
+        if work == 0 {
+            return Ok(RetirementProgress::yielded());
+        }
+        // The current item alone is resolved. There is no registry-wide
+        // program lookup hidden inside one preparation credit.
+        if let Some(program) = self.native_retirement.program_to_validate(&self.links) {
+            let _: &mut UProbe = self
+                .ebpf
+                .program_mut(program)
+                .with_context(|| format!("program {program} missing before collected retirement"))?
+                .try_into()?;
+        }
+        let producers = self
+            .drain_producers()
+            .context("collected retirement has no original producers")?;
+        let events = self
+            .events_consumer
+            .as_ref()
+            .context("collected retirement needs retained EVENTS")?;
+        let discovery = self
+            .discovery_consumer
+            .as_ref()
+            .context("collected retirement needs retained DISCOVERY")?;
+        let worker = self
+            .cleanup_worker
+            .as_ref()
+            .context("collected retirement needs its prestarted worker")?;
+        self.native_retirement.prepare_collected_with(
+            CollectedFinishQOwner {
+                gate: &self.stop_gate,
+                producers: &producers,
+                discovery: &self.discovery_domain,
+                detach: &self.producer_detach,
+            },
+            q,
+            self.uprobe_scope,
+            input,
+            reserver,
+            &self.links,
+            &self.retained_static,
+            &self.pid_pairs,
+            worker,
+            || {
+                events
+                    .consumption_cut()
+                    .map_err(|reason| anyhow!("collected EVENTS cut refused: {reason:?}"))
+            },
+            || Ok(events::discovery_drain_positions(discovery)),
+            work,
+        )
+    }
+
+    #[allow(dead_code)] // Coordinator integration is a separate packet.
+    pub(crate) fn begin_collected_static_retirement(
+        &mut self,
+        q: &CollectedFinishQ,
+        ticket: &CollectedRetirementTicket,
+        work: usize,
+    ) -> Result<RetirementProgress> {
+        if work == 0 {
+            return Ok(RetirementProgress::yielded());
+        }
+        let producers = self
+            .drain_producers()
+            .context("collected retirement has no original producers")?;
+        let events = self
+            .events_consumer
+            .as_ref()
+            .context("collected retirement needs retained EVENTS")?;
+        let discovery = self
+            .discovery_consumer
+            .as_ref()
+            .context("collected retirement needs retained DISCOVERY")?;
+        let worker = self
+            .cleanup_worker
+            .as_ref()
+            .context("collected retirement needs its prestarted worker")?;
+        let keepalive = self
+            .counter_banks
+            .as_ref()
+            .map(|banks| Arc::clone(&banks.keepalive));
+        let ebpf = &mut self.ebpf;
+        self.native_retirement.begin_collected_with(
+            CollectedFinishQOwner {
+                gate: &self.stop_gate,
+                producers: &producers,
+                discovery: &self.discovery_domain,
+                detach: &self.producer_detach,
+            },
+            q,
+            self.uprobe_scope,
+            ticket,
+            &mut self.links,
+            &mut self.retained_static,
+            &mut self.pid_pairs,
+            &mut self.global_retirements,
+            worker,
+            |original| {
+                take_collected_owned_link(ebpf, original)
+                    .map(|owned| vec![counter_banks::retain_link(owned, keepalive.as_ref())])
+            },
+            || {
+                events
+                    .consumption_cut()
+                    .map_err(|reason| anyhow!("collected EVENTS cut refused: {reason:?}"))
+            },
+            || Ok(events::discovery_drain_positions(discovery)),
+            work,
+        )
+    }
+
+    #[allow(dead_code)] // Coordinator integration is a separate packet.
+    pub(crate) fn poll_collected_static_retirement(
+        &mut self,
+        q: &CollectedFinishQ,
+        ticket: &CollectedRetirementTicket,
+        work: usize,
+    ) -> Result<RetirementProgress> {
+        if work == 0 {
+            return Ok(RetirementProgress::yielded());
+        }
+        let producers = self
+            .drain_producers()
+            .context("collected retirement has no original producers")?;
+        let events = self
+            .events_consumer
+            .as_ref()
+            .context("collected retirement needs retained EVENTS")?;
+        let discovery = self
+            .discovery_consumer
+            .as_ref()
+            .context("collected retirement needs retained DISCOVERY")?;
+        let worker = self
+            .cleanup_worker
+            .as_ref()
+            .context("collected retirement needs its prestarted worker")?;
+        self.native_retirement.poll_collected_with(
+            CollectedFinishQOwner {
+                gate: &self.stop_gate,
+                producers: &producers,
+                discovery: &self.discovery_domain,
+                detach: &self.producer_detach,
+            },
+            q,
+            ticket,
+            worker,
+            || {
+                events
+                    .consumption_cut()
+                    .map_err(|reason| anyhow!("collected EVENTS cut refused: {reason:?}"))
+            },
+            || Ok(events::discovery_drain_positions(discovery)),
+            work,
+        )
+    }
+
+    #[allow(dead_code)] // Cancellation releases only this original carrier.
+    pub(crate) fn cancel_collected_static_retirement(
+        &mut self,
+        input: Option<&RetainedRetirementInput>,
+        ticket: Option<&CollectedRetirementTicket>,
+        work: usize,
+    ) -> Result<RetirementProgress> {
+        self.native_retirement
+            .cancel_collected_with(input, ticket, work)
+    }
+
     /// Cleanup of an uncompleted new attachment is not coverage retirement.
     /// Healthy siblings actually detached by a partial Multi rebuild still
     /// retain their own physical retirement and reselection evidence.
@@ -6877,6 +7068,10 @@ impl Session {
         ended: Option<(&crate::process::ProcessView, &EndedPidRetirement)>,
         failed_cleanup: bool,
     ) -> Result<DetachOutcome> {
+        anyhow::ensure!(
+            !self.native_retirement.collected_blocking(),
+            "selective detach refused while original native retirement owns the registry"
+        );
         let requested: BTreeSet<_> = slots.iter().map(|slot| slot.index).collect();
         if let Some(banks) = &self.counter_banks {
             banks
@@ -7076,6 +7271,10 @@ impl Session {
     /// waiting for native close. Maps, readers and targets remain in Session.
     /// Prior live submissions stay in the same worker and cumulative receipt.
     pub(crate) fn begin_owned_producer_detach(&mut self) -> Result<()> {
+        anyhow::ensure!(
+            !self.native_retirement.collected_blocking(),
+            "terminal handoff waits for the original native retirement disposition"
+        );
         match self.producer_detach {
             OwnedProducerDetach::Pending { .. } | OwnedProducerDetach::Complete => return Ok(()),
             OwnedProducerDetach::Unproved => bail!("producer detach ownership remains unproven"),
@@ -7299,6 +7498,10 @@ impl Session {
         ended: Option<(&crate::process::ProcessView, &EndedPidRetirement, &[Slot])>,
         excluded: &BTreeSet<u32>,
     ) -> Result<()> {
+        anyhow::ensure!(
+            !self.native_retirement.collected_blocking(),
+            "native registry mutation refused during original retirement preparation"
+        );
         // Resolve singles' fallible program lookup before extracting any
         // ownership. A refused lookup keeps all native handles untouched and
         // therefore opens no physical detach episode.
@@ -7625,6 +7828,10 @@ impl Session {
         mut service_discovery: impl FnMut(&mut events::OwnedDiscoveryDrain),
         now: impl FnMut() -> std::time::Instant,
     ) -> Result<crate::run::StopState> {
+        anyhow::ensure!(
+            !self.native_retirement.collected_blocking(),
+            "quiescence cannot invalidate an active collected retirement registry"
+        );
         invalidate_pid_session(&mut self.pid_pairs, self.pid_lifecycle.as_ref());
         if service_events.is_some() {
             self.ensure_events_consumer()?;
@@ -7690,6 +7897,10 @@ impl Session {
         stop: usize,
         quantum: usize,
     ) -> Result<(Vec<p11scope_ebpf_common::DiscoveryRecord>, u64, bool, bool)> {
+        anyhow::ensure!(
+            !self.native_retirement.collected_blocking(),
+            "legacy discovery drain cannot invalidate an active collected retirement registry"
+        );
         invalidate_pid_session(&mut self.pid_pairs, self.pid_lifecycle.as_ref());
         self.ensure_discovery_consumer()?;
         let consumer = self
@@ -7974,6 +8185,24 @@ impl Session {
     }
 }
 
+/// One static original transfers as one owning payload. Keep the native
+/// legacy perf representation intact instead of flattening per-CPU leaves.
+fn take_collected_owned_link(ebpf: &mut Ebpf, original: RegisteredLink) -> Result<OwnedLink> {
+    match original {
+        RegisteredLink::MultiUProbe { fds, .. } => Ok(OwnedLink::Multi(fds)),
+        RegisteredLink::UProbe { program, id, .. } => {
+            let probe: &mut UProbe = ebpf
+                .program_mut(program)
+                .with_context(|| format!("program {program} missing during collected transfer"))?
+                .try_into()?;
+            Ok(OwnedLink::Probe(probe.take_link(id).with_context(
+                || format!("transferring original {program}"),
+            )?))
+        }
+        _ => bail!("collected retirement cannot transfer a nonstatic registration"),
+    }
+}
+
 /// Move one registered link out of Aya into worker-owned values, without
 /// closing anything: singles become `FdLink`s via `take_link` plus
 /// `into_fd_links()` (Inventory precedent `activation.rs:433-466`), multis
@@ -8126,6 +8355,16 @@ impl Drop for Session {
         invalidate_pid_session(&mut self.pid_pairs, self.pid_lifecycle.as_ref());
         // Refuse continuity before closing any owned producer/hook link.
         self.image_coverage.fail();
+        let keepalive = self
+            .counter_banks
+            .as_ref()
+            .map(|banks| Arc::clone(&banks.keepalive));
+        let ebpf = &mut self.ebpf;
+        self.native_retirement
+            .abandon_collected_with(self.cleanup_worker.as_ref(), |original| {
+                take_collected_owned_link(ebpf, original)
+                    .map(|owned| vec![counter_banks::retain_link(owned, keepalive.as_ref())])
+            });
         // Never block on a worker-owned link: leftovers move to the
         // worker and close in the background (at process exit the kernel
         // finishes). Evidence is best-effort; there is no caller to fail.

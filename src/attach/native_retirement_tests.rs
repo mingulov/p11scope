@@ -1428,6 +1428,7 @@ fn collected_retirement_metadata_release_respects_one_credit() {
             Ok(())
         }),
     );
+    let file = native.original_file();
     let q = native.observe_q();
     let pool = SemanticResourcePool::reference_limit(COLLECTED_POOL_BYTES);
     let reserve = pool.reserver();
@@ -1449,7 +1450,28 @@ fn collected_retirement_metadata_release_respects_one_credit() {
         before,
         "backing remains paid throughout disposal"
     );
-    drop(collected_close(&mut native, &q, &ticket));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut closed = false;
+    for _ in 0..COLLECTED_CREDITS {
+        assert!(Instant::now() < deadline);
+        let before = file.strong_count();
+        let progress = native.poll(&q, &ticket, 1).unwrap();
+        assert_eq!(progress.used, 1);
+        assert!(
+            before.saturating_sub(file.strong_count()) <= 1,
+            "one credit cannot drop multiple real target/stamp/provider owners"
+        );
+        match progress.state {
+            CollectedRetirementState::Pending => {}
+            CollectedRetirementState::Closed(input) => {
+                drop(input);
+                closed = true;
+                break;
+            }
+            _ => panic!("healthy metadata disposition lost original ownership"),
+        }
+    }
+    assert!(closed);
     assert!(native.join().completed);
     assert_eq!(pool.snapshot().charged_bytes, SEMANTIC_TRANSITION_SCRATCH);
 }
@@ -1486,7 +1508,8 @@ fn collected_retirement_authenticates_bound_from_original_registry() {
 #[test]
 fn collected_retirement_worker_failure_retains_actual_paid_provider() {
     use super::super::cleanup_worker::{CollectedCleanupRetention, collected_allocation_charge};
-    for closed_channel in [false, true] {
+    for failure in 0..3 {
+        let closed_channel = failure == 2;
         let (dir, pins, target) = fixture();
         let file = target.retirement_lease().unwrap();
         let weak = Arc::downgrade(&file);
@@ -1496,7 +1519,12 @@ fn collected_retirement_worker_failure_retains_actual_paid_provider() {
         let guard = CollectedCleanupRetention::new(reserve.reserve(bytes).unwrap(), 1);
         guard.retain_file(file);
         let mut worker = CleanupWorker::pre_start_with(
-            Box::new(|_owned, _| Err("actual retained native-close failure".into())),
+            Box::new(move |_owned, _| {
+                if failure == 1 {
+                    panic!("actual caught native-close panic");
+                }
+                Err("actual retained native-close failure".into())
+            }),
             Arc::new(|| Duration::ZERO),
         );
         if closed_channel {

@@ -219,6 +219,30 @@ impl PairBook {
         (!self.exhausted).then_some(AttachBaseline { loss, fault })
     }
 
+    // Collected Finish scans and removes one original stamp per credit.
+    // No retained-map filter/current_pair scan is hidden behind these ports.
+    pub(super) fn collected_fence(&self) -> (u64, u64, usize, bool) {
+        (
+            self.registration_serial,
+            self.generation_serial,
+            self.stamps.len(),
+            self.exhausted,
+        )
+    }
+
+    pub(super) fn next_collected_stamp(&self, after: Option<u32>) -> Option<(u32, &PairStamp)> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        match after {
+            None => self.stamps.first_key_value(),
+            Some(after) => self.stamps.range((Excluded(after), Unbounded)).next(),
+        }
+        .map(|(index, stamp)| (*index, stamp))
+    }
+
+    pub(super) fn take_collected_stamp(&mut self, slot: u32) -> Option<PairStamp> {
+        self.stamps.remove(&slot)
+    }
+
     pub(super) fn invalidate(&mut self, slots: &BTreeSet<u32>) {
         self.stamps.retain(|slot, _| !slots.contains(slot));
     }

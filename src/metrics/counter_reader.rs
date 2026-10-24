@@ -2815,13 +2815,18 @@ mod tests {
             }
             .unwrap();
             assert_native_growth_backend(&session, backend, false);
-            assert!(matches!(
-                session.stage_counter_banks(&mut history, &pins, stage, &pool.reserver()),
-                BankPublication::Published {
-                    extent: crate::attach::counter_banks::BankExtent { first: 0, end: 512 },
-                    ..
-                }
-            ));
+            let publication =
+                session.stage_counter_banks(&mut history, &pins, stage, &pool.reserver());
+            assert!(
+                matches!(
+                    publication,
+                    BankPublication::Published {
+                        extent: crate::attach::counter_banks::BankExtent { first: 0, end: 512 },
+                        ..
+                    }
+                ),
+                "first growth publication: {publication:?}"
+            );
             assert_native_growth_backend(&session, backend, true);
             let limits = CounterLimits {
                 rows: final_count,

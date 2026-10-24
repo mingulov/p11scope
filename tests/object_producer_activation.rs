@@ -840,9 +840,10 @@ fn object_producer_publication_lifts_gate_only_on_attested_lane() {
 /// The required-object marker arms only under the allowlisted policy:
 /// entry seeds `object_required` to zero (ordinary) and calls
 /// `object_marker_for` exactly once, inside the allowlisted-policy
-/// branch. Aggregate-only (`metrics`), unsafe-unvalidated-metadata,
-/// the count-only inventory object and P0 builds therefore arm no
-/// marker and perform none of the six-field reads.
+/// branch. Aggregate-only (`metrics`), unsafe-unvalidated-metadata and
+/// the count-only inventory object therefore arm no marker. P0 arms it
+/// for the slice-D handle, Find and Derive-mechanism reads, but
+/// performs no attribute read.
 #[test]
 fn object_marker_arms_only_under_allowlisted_policy() {
     let source = bpf_source();
@@ -868,16 +869,14 @@ fn object_marker_arms_only_under_allowlisted_policy() {
         1,
         "entry must assign seed.object_required exactly once (the guarded arm)"
     );
-    // That site lives inside the allowlisted-policy branch, before the
-    // immutable seed is bound to native side allocation.
-    let gate = source_between(
-        entry,
-        "if flags & FLAG_POLICY_ALLOWLISTED != 0 {",
-        "let start_pointer = unsafe { p11_owner_start_begin(&key, &seed) };",
-    );
+    // That site is exactly the allowlisted-policy branch body: match
+    // the full three-line block so moving the call below the `if`
+    // block's closing brace fails.
     assert!(
-        gate.contains("seed.object_required = object_marker_for(cookie_of(&ctx));"),
-        "the marker call must sit inside the allowlisted-policy branch"
+        entry.contains(
+            "if flags & FLAG_POLICY_ALLOWLISTED != 0 {\n        seed.object_required = object_marker_for(cookie_of(&ctx));\n    }"
+        ),
+        "the marker call must be the body of the allowlisted-policy branch"
     );
 }
 

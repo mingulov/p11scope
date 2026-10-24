@@ -23,9 +23,11 @@ and [DR04 caller metadata](#dr04-caller-metadata-2026-10-18), whose opt-in sourc
 and [object producer activation](#object-producer-activation-h7-slice-d-2026-10-14),
 which implements the reviewed finite producer below with no public
 object projection,
-and [H7-E4 attribute capture](#h7-e4-attribute-capture-2026-10-20),
-whose read set for official FULL release builds is PENDING owner
-decision OD11.**
+and [H7-E4 attribute capture](#h7-e4-attribute-capture-2026-10-20):
+the H7-E4 read set, the six attribute rows, the finite vocabulary,
+the GetAttributeValue result rules, the output/retention table and
+the [H9 publication section](#object-observations-publication-h9) are
+APPROVED (owner decision OD11, 2026-10-24).**
 Apart from those sections, this document does not enable capture, describe
 implemented fields, or qualify a release. The implemented contracts remain
 [v1](allowlist-v1.md) and [v2](allowlist-v2.md), whose bytes and existing
@@ -191,7 +193,7 @@ explicit, narrow internal exceptions, not finite attribute values.
 | `CKA_CLASS` | Exact selector 0x0000; one target word, exact width, finite set below. | Six-field request/result snapshot; public finite class plus source/state. Raw unmatched word discarded in probe scratch. | Unsupported/conflicting value stays unknown. C5/C6. |
 | `CKA_KEY_TYPE` | Exact selector 0x0100; one target word, exact width, finite set below. | As class, with finite key-type label. No vendor numeric fallback. | Unsupported/conflicting value stays unknown. C5/C6. |
 | `CKA_TOKEN` | Exact selector 0x0001; exactly one byte and exact equality to 0 or 1. | Requested or established `session`/`token`, with provenance; only established result may drive object lifetime. | Other byte/length is unknown; a request is never promoted by CKR_OK creation alone. C3/C5/C6. |
-| `CKA_VALUE_LEN` | Exact selector 0x0161; one target word equal to 16, 24 or 32 only. | Finite byte-size code; label as AES 128/192/256 bits only with independently established AES type for established metadata, or requested AES type for requested metadata. | Other values unknown; no `CKA_VALUE` read and no inference from mechanism alone. C5/C6. |
+| `CKA_VALUE_LEN` | Exact selector 0x0161; one target word equal to 16, 24 or 32 only. | Finite byte-size code; label as AES 128/192/256 bits only with independently established AES type for established metadata. | Other values unknown; no `CKA_VALUE` read and no inference from mechanism alone. C5/C6. |
 | `CKA_MODULUS_BITS` | Exact selector 0x0121; one target word equal to a selected RSA size below. | Finite size code; RSA label requires matching RSA type/provenance. | Other values unknown; no modulus or exponent buffer read. C5/C6. |
 | `CKA_EC_PARAMS` | Exact selector 0x0180; exact length 7 or 10 and byte-for-byte equality to one complete encoding below. At most ten bytes in probe scratch. | Only curve enum; scratch bytes never leave the probe's stack frame and are not copied to any map, record or output, including recognized encodings. The buffer is not explicitly zeroed. Curve label requires matching EC type/provenance. | No hash-only, prefix, permissive DER, explicit-parameter or arbitrary-string fallback. C5/C6. |
 | Public identities and derived facts | Monotonic capture-local allocation plus accepted reducer transitions; never raw handle, IP or digest of either. | `instance#N`, `sess#N`, `object#N`; finite origin/lifecycle/metadata states, times within observation, and saturating counts. JSON, JSONL and dashboard use the same immutable projection. | Allocation exhaustion refuses new association, records loss, and never reuses an ID. C3/C7/C8. |
@@ -474,16 +476,16 @@ in [inventory v1](../schema/inventory-v1.md) and
 states, references, budgets and stream-loss behavior, before enabling them.
 The `evidence.object_capture` build-availability field (`available`, with a
 finite `reason`) is the only object-related addition outside inventory: a
-build fact, not an observed attribute. In FULL builds these reads also occur
-in `profile`, `trace` and `run` captures with `--manifest`. Those commands
-publish no object facts; the validated tail is discarded after record
-validation.
+build fact, not an observed attribute. The owner decided (2026-10-24,
+decision I1) that these reads stay enabled in FULL builds in `profile`,
+`trace` and `run` captures with `--manifest`. Those commands publish no
+object facts; the validated tail is discarded after record validation.
 
 Observed attribute values live only on these surfaces, with these lifetimes:
 
 | Surface | What is retained | Lifetime |
 | --- | --- | --- |
-| Kernel `OBJECT_START` rows | At most 16,384 rows of 432 B: finite codes plus the Get value pointer and capacity | Zeroed and deleted on every terminal path |
+| Kernel `OBJECT_START` rows | At most 16,384 rows of 432 B: finite codes plus the Get template base, header-end and value pointers and capacity | Zeroed and deleted on every terminal path |
 | Kernel EVENTS ring | Tail records (616 B with header) | Stay in the 4 MiB ring until overwritten |
 | Observer memory | The validated tail (no Debug/Serialize) until ordinary decode or registry apply; the model holds at most 65,536 objects with six requested and six established fixed slots each | The capture's lifetime |
 | Public inventory | Only `p11scope/inventory/v1` `object_observations` (objects requested, established, queries and label; key operations metadata at use) and inventory event kinds `object_observed`, `key_operations_observed` and `snapshot.object_observations` | The existing report-file and bounded event-file rotation lifetimes |
@@ -861,21 +863,21 @@ retention or public projection needs a new explicit review.
 ## H7-E4 attribute capture (2026-10-20)
 
 **Status: IMPLEMENTED in reviewed v0.4 development source (`3cd49af4`
-on `feat/v040-h7e4-attributes`); PENDING owner decision OD11 for official
-release bytes. FULL builds (default features) perform the reads below; P0
-builds (`--no-default-features --features stub-object-attributes`, the
-current official release build) perform none of them. The owner decision is
-not installed qualification: the E5 cells below must pass on the matching
-candidate before release notes claim FULL coverage. Public projection is
-governed by [Object observations publication](#object-observations-publication-h9).**
+on `feat/v040-h7e4-attributes`); APPROVED (owner decision OD11,
+2026-10-24). The finite key-type numbers were corrected to the OASIS
+values in `8d8c7422`. FULL builds perform the reads below; P0 builds
+(`--no-default-features --features stub-object-attributes`) perform
+none of them. The owner decision is not installed qualification: the
+E5 cells below must pass on the matching candidate before release
+notes claim FULL coverage. Public projection is governed by
+[Object observations publication](#object-observations-publication-h9).**
 
-The object marker, and with it every read in this section, requires the
-`allowlisted` policy, a non-NONE frozen `OBJECT_DESCRIPTORS` row and a FULL
-build. It is never armed under `aggregate-only` (`metrics`), under
-`unsafe-unvalidated-metadata` (CONFIG holds exactly one policy, so the marker
-test fails; that mode keeps only its v1 decoders), in the inventory
-count-only object, or in P0. A P0 build still performs the slice-D handle,
-Find and Derive-mechanism reads, marks present lists `UNINSPECTED`, and
+The six-field reads require the `allowlisted` policy, an armed object
+marker (a valid frozen `OBJECT_DESCRIPTORS` row) and a FULL build. The
+marker is never armed under `aggregate-only`, under
+`unsafe-unvalidated-metadata` or in the inventory count-only object. P0
+arms it for the slice-D handle, Find and Derive-mechanism reads, but
+performs no attribute read. P0 marks present lists `UNINSPECTED`, and
 reports `evidence.object_capture = {available: false, reason: "not_enabled"}`.
 FULL reports `available: true`, which is a build fact, not evidence that any
 attribute was observed.
@@ -1007,8 +1009,9 @@ through the `object-lp64` / `object-ia32` canary cells.
 
 ## Object observations publication (H9)
 
-**Status: PENDING OD11.** This section scopes the public projection of the
-attribute values read under H7-E4; it grants no read beyond that section.
+**Status: APPROVED (owner decision OD11, 2026-10-24).** This section
+scopes the public projection of the attribute values read under H7-E4;
+it grants no read beyond that section.
 The projection is exactly section version 1 of
 [docs/schema/inventory-v1-object-observations.schema.json](../schema/inventory-v1-object-observations.schema.json):
 `objects[].requested|established|queries|label` and
@@ -1019,9 +1022,9 @@ test/sync emission), and aggregate counts derived from the same revision
 on the dashboard. Unknown, conflicting and invalidated states stay
 explicit; profile, trace and metrics never carry object facts. The
 unknown-bucket summaries never fabricate starts, and role rows cannot be
-summed into a global operation denominator. Publication stays disabled
-until the owner decision: while H9 delivery is gated, production captures
-carry `object_observations` only as an explicit `unavailable` marker.
+summed into a global operation denominator. Approval does not enable
+delivery. While H9 delivery is gated, production captures carry
+`object_observations` only as an explicit `unavailable` marker.
 
 ## DR04 caller metadata (2026-10-18)
 

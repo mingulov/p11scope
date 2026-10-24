@@ -278,7 +278,13 @@ fn main() {
     let binary = directory.path().join("scope");
     std::fs::write(&input, harness).expect("write actual wrapper bodies");
     let output = Command::new("rustc")
-        .args(["+1.98.1", "--edition=2024"])
+        .arg(format!(
+            "+{}",
+            std::fs::read_to_string(".release-rust-version")
+                .expect("release compiler pin")
+                .trim()
+        ))
+        .arg("--edition=2024")
         .arg(&input)
         .arg("-o")
         .arg(&binary)

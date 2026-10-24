@@ -19,7 +19,10 @@ config = json.loads(Path(os.environ["P11SCOPE_LANE02_FIXTURE"]).read_text())
 if len(sys.argv) != 5 or sys.argv[1:3] != ["which", "--toolchain"]:
     raise SystemExit(97)
 toolchain, program = sys.argv[3:]
-key = ("stable" if toolchain == "1.98.1" else "bpf") + "_" + program
+release = Path(".release-rust-version").read_text(encoding="utf-8").strip()
+if toolchain not in (release, "nightly-2026-05-20") or program not in ("cargo", "rustc"):
+    raise SystemExit(97)
+key = ("stable" if toolchain == release else "bpf") + "_" + program
 with Path(config["events"]).open("a", encoding="utf-8") as stream:
     stream.write(json.dumps({"kind": "select", "key": key}, sort_keys=True) + "\n")
 print(config[key])

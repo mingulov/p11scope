@@ -134,7 +134,8 @@ class ReleaseSealFixture:
                       METADATA_COMMAND=[sys.executable, "-I", self.base / "metadata.py",
                                         self.prepared.config_path, toolchain])
         rustup_target = self.fake_bin / "rustup"
-        self.template("rustup.sh.in", rustup_target, TOOLCHAIN=toolchain)
+        self.template("rustup.sh.in", rustup_target, TOOLCHAIN=toolchain,
+                      RELEASE_RUST=(self.repo / ".release-rust-version").read_text().strip())
         proxy_target = self.fake_bin / "rustup-proxy-target"
         self.inert(proxy_target)
         cargo_target = rustup_target

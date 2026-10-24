@@ -11,7 +11,7 @@
 #   qualify-release-matrix.sh --self-test   (hermetic: no vng, kernels or privilege; runs in hosted CI)
 #   qualify-release-matrix.sh --preflight   (this host: vng, kernel caches, stage and lock dirs)
 #
-# Runs, per kernel, with release binaries (cargo build --release --locked, Rust 1.98.1):
+# Runs, per kernel, with release binaries and the .release-rust-version compiler:
 #   1. public CLI: qualify-public-cli.sh + qualify-inventory-native.sh (scan+native)
 #      + --version, against the SoftHSM2 fixtures those scripts use (p11-kit is
 #      covered by the priv-lib broad_p11kit cell);
@@ -30,7 +30,7 @@
 set -uo pipefail
 
 REPO=$(cd "$(dirname "$0")/.." && pwd -P)
-RUST=1.98.1
+RUST=$(cat "$REPO/.release-rust-version")
 LOCK=/var/tmp/p11scope-ws-tmp/privileged.lock
 QUIET=/var/tmp/p11scope-ws-tmp/QUIET-WINDOW
 OUT_BASE=/var/tmp/p11scope-ws-tmp/rc-qualify

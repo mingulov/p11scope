@@ -5009,7 +5009,11 @@ fn receipt_receipt_drivers_execute_behavioral_self_tests() {
         "isolated-python-invocations-exact-accepted",
         "tab-or-newline-root-rejected-status-77",
     ];
-    const LANE16_CASES: &[&str] = &[
+    let lane16_compiler_refusal = format!(
+        "cargo-not-Rust-{}-rejected",
+        read(".release-rust-version").trim()
+    );
+    let lane16_cases: &[&str] = &[
         "never-68-68-136-one-timing-zero-loss-ambiguity-inflight-child-false-none-0-0-0-exact-accepted",
         "auto-68-68-136-one-timing-zero-loss-ambiguity-inflight-child-false-sigstop-confirmed-positive-partial-0-exact-accepted",
         "never-structural-row-mutation-rejected",
@@ -5019,7 +5023,7 @@ fn receipt_receipt_drivers_execute_behavioral_self_tests() {
         "bare-observer-rejected",
         "path-observer-rejected",
         "outside-ROOT-work-target-release-observer-rejected",
-        "cargo-not-Rust-1.98.1-rejected",
+        lane16_compiler_refusal.as_str(),
         "cargo-without-locked-workspace-release-rejected",
         "private-CARGO_TARGET_DIR-ROOT-work-target-exact-accepted",
         "missing-observer-identity-ledger-rejected",
@@ -5067,7 +5071,7 @@ fn receipt_receipt_drivers_execute_behavioral_self_tests() {
             "lane16",
             "scripts/verify-receipt-lane16.sh",
             "verify-receipt-lane16 Task 4 receipt self-test: OK",
-            Some(LANE16_CASES),
+            Some(lane16_cases),
         ),
     ];
     let mut failures = Vec::new();

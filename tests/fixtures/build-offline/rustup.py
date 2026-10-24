@@ -23,16 +23,18 @@ if record.is_dir():
         output.write(json.dumps({"argv": sys.argv[1:],
                                  "auto_install": os.environ.get("RUSTUP_AUTO_INSTALL")},
                                 sort_keys=True) + "\n")
-mapping = {
-    ("1.98.1", "cargo"): "stable-cargo",
-    ("1.98.1", "rustc"): "stable-rustc",
-    ("nightly-2026-05-20", "cargo"): "bpf-cargo",
-    ("nightly-2026-05-20", "rustc"): "bpf-rustc",
-}
 map_path = Path(__file__).resolve().parent / "tool-map.json"
 if map_path.exists():
     external = json.loads(map_path.read_text(encoding="utf-8"))
     mapping = {tuple(key.split(":")): value for key, value in external.items()}
+else:
+    release = Path(".release-rust-version").read_text(encoding="utf-8").strip()
+    mapping = {
+        (release, "cargo"): "stable-cargo",
+        (release, "rustc"): "stable-rustc",
+        ("nightly-2026-05-20", "cargo"): "bpf-cargo",
+        ("nightly-2026-05-20", "rustc"): "bpf-rustc",
+    }
 if len(sys.argv) != 5 or sys.argv[1:3] != ["which", "--toolchain"]:
     raise SystemExit(70)
 key = (sys.argv[3], sys.argv[4])

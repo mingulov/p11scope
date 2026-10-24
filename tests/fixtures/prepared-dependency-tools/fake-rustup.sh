@@ -20,14 +20,15 @@ if [ "$#" -ne 4 ]; then
 fi
 
 query=${3-}:${4-}
+release_rust=$(cat .release-rust-version) || exit 74
 if [ "${P11SCOPE_FIXTURE_FAIL_QUERY-}" = "$query" ]; then
     printf '%s\n' "fixture rustup failure: $query" >&2
     exit 71
 fi
 
 case "$query" in
-    1.98.1:cargo) printf '%s\n' "$P11SCOPE_FIXTURE_STABLE_CARGO" ;;
-    1.98.1:rustc) printf '%s\n' "$P11SCOPE_FIXTURE_STABLE_RUSTC" ;;
+    "$release_rust:cargo") printf '%s\n' "$P11SCOPE_FIXTURE_STABLE_CARGO" ;;
+    "$release_rust:rustc") printf '%s\n' "$P11SCOPE_FIXTURE_STABLE_RUSTC" ;;
     nightly-2026-05-20:cargo) printf '%s\n' "$P11SCOPE_FIXTURE_BPF_CARGO" ;;
     nightly-2026-05-20:rustc) printf '%s\n' "$P11SCOPE_FIXTURE_BPF_RUSTC" ;;
     *)

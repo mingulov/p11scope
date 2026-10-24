@@ -144,11 +144,14 @@ capture behavior or establish the provenance of its input files.
   kernel-tier directive.
 
 On kernels without uprobe_multi (5.15, 6.1), stopping a capture with many
-probes takes about 50 ms per probe link (for example, about 3.5 minutes
-for 4,227 links). The stop stays correct and finite with no cap: once the
-estimate reaches 2 s, p11scope prints one up-front estimate line, then the
-usual per-second progress, and a second Ctrl-C stops waiting and leaves
-the kernel to finish the remaining closes after exit.
+probes closes the probe links one at a time: about 18 ms per link in a
+5.15 guest and about 50–73 ms per link on newer hosts using single links
+(for example, 4,227 links take roughly 1.3–5 minutes). The stop stays
+correct and finite with no cap: once the estimate reaches 2 s, p11scope
+prints one up-front estimate line (computed at 50 ms per link, so on 5.15
+it can overstate the wait), then the usual per-second progress, and a
+second Ctrl-C stops waiting and leaves the kernel to finish the remaining
+closes after exit.
 
 ### 5.15: physical-identity controls and non-leader exec unqualified
 

@@ -2229,7 +2229,19 @@ mod conservative_copy {
                 1 => drop(std::mem::take(&mut self.path)),
                 2 => drop(std::mem::take(&mut self.digest)),
                 3 => drop(self.build.take()),
-                4 => drop(self.file.take()),
+                4 => {
+                    let file = self.file.as_ref().ok_or(GraphRefusal::Identity)?;
+                    if !source
+                        .and_then(|pins| pins.by_id.get(&self.id))
+                        .is_some_and(|held| Arc::ptr_eq(&held.file, file))
+                    {
+                        // Pure reclamation cannot close the last descriptor.
+                        // An inode, independently opened FD, or reference count
+                        // does not prove a LIVE owner of this exact File share.
+                        return Err(GraphRefusal::Identity);
+                    }
+                    drop(self.file.take());
+                }
                 5 => {
                     let Some(exports) = self.exports.as_mut() else {
                         return Ok(true);
@@ -8227,11 +8239,34 @@ mod tests {
         ]);
         let pool = SemanticResourcePool::default();
         let reserve = pool.reserver();
-        let selection = conservative_selection(&pool, BTreeSet::new(), BTreeSet::new());
+        // Only this entry's unique export backing is under test. Other real
+        // entries are conservatively rejected before copying, so their final
+        // File owners are not an unrelated pending handoff in this control.
+        let rejected = source
+            .by_id
+            .iter()
+            .filter_map(|(other, entry)| (*other != id).then_some(entry.raw.key))
+            .collect();
+        let selection = conservative_selection(&pool, BTreeSet::new(), rejected);
         let baseline = pool.snapshot().charged_bytes;
         let mut cursor = PinnedConservativeCursor::new();
         finish_conservative_copy(&source, &mut cursor, &selection, &reserve);
+        assert_eq!(cursor.pinned().unwrap().by_id.len(), 1);
         let alias = source.exports_for(id);
+        // Settle our File share under the borrowed LIVE actual source, then
+        // stop BEFORE touching its exports. No final FD close is delegated to
+        // the pure helper when the source goes away below.
+        for _ in 0..4096 {
+            let step = cursor
+                .reclaim(Some(&source), &selection, &reserve, 1)
+                .unwrap();
+            assert_ne!(step, GraphStep::Ready);
+            if cursor.retained_reclaim_file_for_test(id) == Some((5, None)) {
+                break;
+            }
+        }
+        assert_eq!(cursor.retained_reclaim_file_for_test(id), Some((5, None)));
+        assert_eq!(cursor.retained_exports_for_test(id).unwrap().len(), 3);
         drop(source);
         let held = pool.snapshot().charged_bytes;
         let mut shared_refusal = false;

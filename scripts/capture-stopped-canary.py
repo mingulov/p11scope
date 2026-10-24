@@ -78,7 +78,21 @@ LIVE_IMAGE_MAP_FLAGS = {"IMAGE_CONTINUITY": 1, "IMAGE_TGID_INDEX": 1}
 AGGREGATE_ONLY_SINGLETON_MAPS = frozenset({
     "IMAGE_CONTINUITY", "IMAGE_TGID_INDEX", "IMAGE_QUERY_REQUESTS"})
 STOP_SECONDS = 30
+# Declared per-kernel canary readiness bounds: declared, measured and
+# disclosed test parameters per kernel/host (correctness and zero loss stay
+# hard gates). Keyed by the running kernel's major.minor from os.uname():
+# kernels at or above MODERN_READY_KERNEL use READY_SECONDS; the legacy
+# kernels in LEGACY_READY_KERNELS, where the kernel verifies each BPF
+# program load several times slower, use READY_SECONDS_LEGACY_KERNEL. Any
+# other kernel refuses rather than guesses, and no environment variable
+# overrides these bounds. Measured FULL-default discovery-to-capturing on
+# 4 vCPUs: 6.6.157 4.5-4.9 s, host 7.0 6.25-6.6 s, 6.1.188 16.7-17.4 s,
+# 5.15.221 17.0-20.2 s (0-probe 14.8-21.5 s under host load); the 30 s
+# legacy bound holds margin over the measured maxima under load.
 READY_SECONDS = 8
+READY_SECONDS_LEGACY_KERNEL = 30
+LEGACY_READY_KERNELS = frozenset(((5, 15), (6, 1)))
+MODERN_READY_KERNEL = (6, 6)
 RESUME_SECONDS = 5
 OBSERVER_WAIT_SECONDS = 20
 PUBLICATION_SECONDS = 10
@@ -159,6 +173,27 @@ def remaining(deadline, maximum=None):
     value = deadline - time.monotonic()
     require(math.isfinite(value) and value > 0, 'phase deadline expired')
     return min(value, maximum) if maximum is not None else value
+
+
+def ready_bound_seconds(release):
+    """Declared canary readiness bound in seconds for a kernel release.
+
+    The release's leading major.minor selects the bound: legacy kernels
+    from LEGACY_READY_KERNELS use READY_SECONDS_LEGACY_KERNEL, kernels
+    at or above MODERN_READY_KERNEL use READY_SECONDS, and anything
+    else (older, unknown or unparseable) refuses rather than guesses.
+    """
+    match = re.match(r'(\d+)\.(\d+)', release) if type(release) is str else None
+    if match is None:
+        raise CaptureError('unparseable kernel release for canary readiness')
+    key = (int(match.group(1)), int(match.group(2)))
+    if key in LEGACY_READY_KERNELS:
+        return READY_SECONDS_LEGACY_KERNEL
+    if key >= MODERN_READY_KERNEL:
+        return READY_SECONDS
+    if re.fullmatch(r'[A-Za-z0-9._+~-]{1,64}', release):
+        raise CaptureError(f'canary readiness has no declared bound for kernel {release}')
+    raise CaptureError('canary readiness has no declared bound for this kernel')
 
 
 def unique_object(pairs):
@@ -775,6 +810,8 @@ class Coordinator:
         self.phase = 'configuration'
         self.stopped_deadline = None
         self.owned_observer_deadline = None
+        self.ready_kernel_release = None
+        self.ready_bound_seconds = None
         self.go_created = False
 
     def check(self, phase, deadline=None):
@@ -1054,6 +1091,10 @@ class Coordinator:
         issues, observer, workload, log = [], None, None, None
         owned = False
         try:
+            release = os.uname().release
+            ready_seconds = ready_bound_seconds(release)
+            self.ready_kernel_release, self.ready_bound_seconds = release, ready_seconds
+            print(f'CANARY_READY_BOUND_DECLARED kernel={release} seconds={ready_seconds}', flush=True)
             validate_config(self.config)
             evidence.set_object_attributes(getattr(self.config, 'object_attributes', 'present'))
             self.signals.enter()
@@ -1062,7 +1103,7 @@ class Coordinator:
             evidence.initialize(self.config.target_bits)
             owned = self.config.workload_origin == 'owned'
             if not owned:
-                ready_deadline = time.monotonic() + READY_SECONDS
+                ready_deadline = time.monotonic() + ready_seconds
                 tasks = ready_roster(self.config, ready_deadline)
                 workload = self.owner.borrow(self.config.workload_pid, self.config.generation, role='workload')
                 workload.snapshot(ready_deadline,
@@ -1077,7 +1118,7 @@ class Coordinator:
             except BaseException:
                 os.close(fd)
                 raise
-            ready_deadline = time.monotonic() + READY_SECONDS
+            ready_deadline = time.monotonic() + ready_seconds
             observer = self.owner.launch(self.config.observer_args, stdout=log, stderr=log,
                                          deadline=ready_deadline if owned else None)
             if owned:
@@ -1085,7 +1126,7 @@ class Coordinator:
                 self.owned_observer_deadline = (time.monotonic() + OWNED_DURATION_SECONDS
                                                 + OBSERVER_WAIT_SECONDS)
             else:
-                self.readiness(observer, time.monotonic() + READY_SECONDS)
+                self.readiness(observer, time.monotonic() + ready_seconds)
             self.stopped_deadline = time.monotonic() + STOP_SECONDS
             self.acquire(observer, workload, tasks)
         except BaseException as error:

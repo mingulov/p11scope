@@ -519,7 +519,9 @@ fn assert_bpf_snapshot_dependency_preparation(driver: &str) -> Result<(), String
     let root_fetch = r#""fetch", "--locked", "--manifest-path", "Cargo.toml""#;
     let bpf_fetch = r#""fetch", "--locked", "--manifest-path", "crates/ebpf/Cargo.toml""#;
     let sysroot_fetch = r#""fetch", "--locked", "--manifest-path", nightly["manifest"]"#;
-    let offline = r#"env["CARGO_NET_OFFLINE"] = "true""#;
+    // Full lines prevent host_env from satisfying the env setter requirement.
+    let offline = "\n    env[\"CARGO_NET_OFFLINE\"] = \"true\"\n";
+    let host_offline = "\n    host_env[\"CARGO_NET_OFFLINE\"] = \"true\"\n";
     let metadata = r#""metadata", "--locked", "--offline""#;
     let build = r#""build", "--locked", "--offline", "--lib""#;
     for marker in [
@@ -541,7 +543,9 @@ fn assert_bpf_snapshot_dependency_preparation(driver: &str) -> Result<(), String
         (root_fetch, bpf_fetch),
         (bpf_fetch, sysroot_fetch),
         (sysroot_fetch, offline),
+        (sysroot_fetch, host_offline),
         (offline, metadata),
+        (host_offline, metadata),
         (metadata, build),
     ] {
         require_before(
@@ -8917,6 +8921,7 @@ fn hosted_pipeline_requires_exact_default_bpf_comparison() {
         r#""fetch", "--locked", "--manifest-path", "crates/ebpf/Cargo.toml""#,
         r#""fetch", "--locked", "--manifest-path", nightly["manifest"]"#,
         r#"env["CARGO_NET_OFFLINE"] = "true""#,
+        r#"host_env["CARGO_NET_OFFLINE"] = "true""#,
         r#""build", "--locked", "--offline", "--lib""#,
     ] {
         assert!(

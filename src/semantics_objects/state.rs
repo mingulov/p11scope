@@ -482,7 +482,22 @@ impl ViewRecord {
         if matches!(field(SafeAttributeKind::Class), FieldState::Conflict(_)) {
             return None;
         }
-        match scalar(SafeAttributeKind::KeyType)? {
+        let key_type = scalar(SafeAttributeKind::KeyType)?;
+        // An established class incompatible with the key type withholds
+        // the combined label: AES and generic_secret need secret_key;
+        // RSA and EC need public_key or private_key. Unknown and
+        // invalidated classes are not established and do not block.
+        if let Some(class) = scalar(SafeAttributeKind::Class) {
+            let compatible = match key_type {
+                0x1f | 0x10 => class == 4,
+                0x00 | 0x03 => class == 2 || class == 3,
+                _ => true,
+            };
+            if !compatible {
+                return None;
+            }
+        }
+        match key_type {
             0x1f => {
                 scalar(SafeAttributeKind::ValueLen).map(|value_len| KeyLabel::Aes { value_len })
             }

@@ -3096,6 +3096,7 @@ fn run_owned_inner(args: &RunArgs, stop: Arc<SignalState>) -> Result<OwnedRunOut
         hooks: args.hooks.clone(),
         scope: ScopeArg::Pid(pid),
         metrics: args.metrics,
+        counter_mode: args.counter_mode,
         duration: args.duration,
         out: args.out.clone(),
         max_events: args.max_events,
@@ -11878,6 +11879,7 @@ mod tests {
             manifests: Vec::new(),
             hooks: crate::discovery::hooks::HookRegistry::builtin(),
             metrics: false,
+            counter_mode: None,
             duration: None,
             out: None,
             max_events: None,
@@ -11926,6 +11928,7 @@ mod tests {
             hooks: crate::discovery::hooks::HookRegistry::builtin(),
             scope,
             metrics: false,
+            counter_mode: None,
             duration: None,
             out: None,
             max_events: None,
@@ -11935,6 +11938,45 @@ mod tests {
             unsafe_requested: false,
             allow_confined_uretprobe: false,
             attach_backend: BackendSelection::default(),
+        }
+    }
+
+    #[test]
+    fn staged_counter_modes_refuse_before_capture_setup() {
+        for (mode, name) in [
+            (p11scope_ebpf_common::CounterMode::Counts, "counts"),
+            (p11scope_ebpf_common::CounterMode::Timestamps, "timestamps"),
+            (p11scope_ebpf_common::CounterMode::Latency, "latency"),
+        ] {
+            let mut args = capture_args(ScopeArg::Pid(i32::MAX as u32));
+            args.metrics = true;
+            args.counter_mode = Some(mode);
+            // The existing namespace poison prevents target or BPF work even
+            // while the staged counter refusal is still missing.
+            let error = nested(|| capture(&args)).expect_err("unwired counters must refuse");
+            let text = format!("{error:#}");
+            assert!(text.starts_with("counter-mode-unwired:"), "{text}");
+            assert!(text.contains(&format!("--counter-mode {name}")), "{text}");
+        }
+    }
+
+    #[test]
+    fn staged_counter_modes_refuse_before_owned_run_setup() {
+        for (mode, name) in [
+            (p11scope_ebpf_common::CounterMode::Counts, "counts"),
+            (p11scope_ebpf_common::CounterMode::Timestamps, "timestamps"),
+            (p11scope_ebpf_common::CounterMode::Latency, "latency"),
+        ] {
+            let mut args = run_args(
+                cli::PausePolicy::Never,
+                &["/definitely/missing/p11scope-unwired-counter"],
+            );
+            args.metrics = true;
+            args.counter_mode = Some(mode);
+            let error = nested(|| run_owned(&args)).expect_err("unwired counters must refuse");
+            let text = format!("{error:#}");
+            assert!(text.starts_with("counter-mode-unwired:"), "{text}");
+            assert!(text.contains(&format!("--counter-mode {name}")), "{text}");
         }
     }
 

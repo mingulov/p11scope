@@ -1007,6 +1007,7 @@ fn system_sweep_releases_its_pins() {
         hooks: HookRegistry::builtin(),
         scope: crate::cli::ScopeArg::System,
         metrics: false,
+        counter_mode: None,
         duration: None,
         out: None,
         max_events: None,

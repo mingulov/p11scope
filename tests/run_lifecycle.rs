@@ -32,6 +32,7 @@ fn run_args(command: &[&str]) -> RunArgs {
         manifests: Vec::new(),
         hooks: HookRegistry::builtin(),
         metrics: false,
+        counter_mode: None,
         duration: None,
         out: None,
         max_events: None,

@@ -98,6 +98,7 @@ fn system_args(hints: Vec<PathBuf>, max_scan_pids: Option<usize>) -> CaptureArgs
         hooks: HookRegistry::builtin(),
         scope: ScopeArg::System,
         metrics: false,
+        counter_mode: None,
         duration: None,
         out: None,
         max_events: None,

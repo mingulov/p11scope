@@ -26,6 +26,7 @@ fn paused_run(pause: PausePolicy, marker: &Path) -> RunArgs {
         manifests: Vec::new(),
         hooks: HookRegistry::builtin(),
         metrics: false,
+        counter_mode: None,
         duration: None,
         out: None,
         max_events: None,

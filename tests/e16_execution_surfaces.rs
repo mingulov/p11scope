@@ -433,6 +433,7 @@ fn args_for(pid: u32, hint: &Path) -> CaptureArgs {
         hooks: HookRegistry::builtin(),
         scope: ScopeArg::Pid(pid),
         metrics: false,
+        counter_mode: None,
         duration: None,
         out: None,
         max_events: None,

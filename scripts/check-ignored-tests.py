@@ -9,7 +9,9 @@ compares them both ways against tests/ignored-tests.json:
 - an ignore site with no inventory entry fails;
 - an inventory entry with no matching site fails;
 - a `feature` entry without a non-empty `owner` fails: the owner names
-  the lane that runs the test (a runner list or a dedicated build);
+  the lane that runs the test (a runner list or a dedicated build).
+  The owner must be one of ALLOWED_OWNERS; a new lane extends that
+  tuple (and gains its own curation rule when it runs tests);
 - a `privileged` entry whose test is not curated in
   scripts/run-privileged-lib-tests.sh fails. Macro-defined sites
   (path ending in `!`) expand to their `name!(test, ...)` invocations in
@@ -49,6 +51,11 @@ RUNNER_LISTS = (
 )
 WIDE_LIST = "WIDE_DETAILED_2112_TESTS"
 WIDE_OWNER = "wide-detailed-2112 runner"
+ALLOWED_OWNERS = (
+    WIDE_OWNER,
+    "counter-bank-proof build",
+    "counter-artifacts build",
+)
 INTEGRATION_LIST = "INTEGRATION_TESTS"
 INTEGRATION_CELLS = ("live-kernel", "privileged")
 
@@ -529,6 +536,12 @@ def check(root=ROOT, inventory=None, runner=None):
                 failures.append(
                     f"FAIL {where}: feature {entry['path']} must name "
                     "a non-empty owner")
+                continue
+            if owner not in ALLOWED_OWNERS:
+                failures.append(
+                    f"FAIL {where}: feature {entry['path']} has unknown "
+                    f"owner {owner!r} (expected one of "
+                    f"{', '.join(ALLOWED_OWNERS)})")
                 continue
             if owner == WIDE_OWNER and entry["path"] not in wide:
                 failures.append(

@@ -328,6 +328,28 @@ class IgnoredTestsTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("all 1 inventoried site(s) match", result.stdout)
 
+    def test_feature_entry_with_counter_artifacts_owner_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            entry = dict(FEATURE_ENTRY, owner="counter-artifacts build")
+            write_fixture(root, FEATURE_SOURCES, [entry], [])
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("all 1 inventoried site(s) match", result.stdout)
+
+    def test_feature_entry_with_unknown_owner_fails(self):
+        # A typo'd owner ("wide-detailed-2112" without " runner") must
+        # fail closed instead of silently exempting the test from
+        # wide curation.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            entry = dict(FEATURE_ENTRY, owner="wide-detailed-2112")
+            write_fixture(root, FEATURE_SOURCES, [entry], [])
+            result = run_checker(root)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("unknown owner", result.stdout)
+        self.assertIn("wide-detailed-2112", result.stdout)
+
     def test_wide_owned_feature_entry_must_be_wide_curated(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

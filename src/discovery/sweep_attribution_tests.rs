@@ -5225,6 +5225,978 @@ fn privileged_d4_btrfs_live_thread_private_files_backend_parity() {
         .expect("remove owned Btrfs thread fixture directory");
 }
 
+const D4_CLONE_WITHOUT_FILES_FLAGS: libc::c_int = libc::CLONE_VM
+    | libc::CLONE_SIGHAND
+    | libc::CLONE_THREAD
+    | libc::CLONE_PARENT_SETTID
+    | libc::CLONE_CHILD_CLEARTID;
+const D4_CLONE_WORKER_MAGIC: u64 = 0xd4c1_0001;
+const D4_CLONE_WORKER_REPLY_LEN: usize = 8 * 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct D4CloneBirth {
+    returned_tid: u32,
+    parent_tid: u32,
+    flags: u32,
+}
+
+fn d4_clone_without_files_flags(flags: u32) -> Result<(), &'static str> {
+    if flags & libc::CLONE_FILES as u32 != 0 {
+        return Err("the thread must be born without CLONE_FILES");
+    }
+    if flags != D4_CLONE_WITHOUT_FILES_FLAGS as u32 {
+        return Err("require VM/SIGHAND/THREAD and the two actual kernel TID operations only");
+    }
+    Ok(())
+}
+
+fn d4_decode_clone_worker_reply(
+    bytes: &[u8],
+    tgid: u32,
+    tid: u32,
+    token: &str,
+) -> Result<D4ThreadReady, &'static str> {
+    if bytes.len() != D4_CLONE_WORKER_REPLY_LEN {
+        return Err("wrong raw worker reply size");
+    }
+    let words: [u64; 8] = std::array::from_fn(|index| {
+        u64::from_ne_bytes(bytes[index * 8..(index + 1) * 8].try_into().unwrap())
+    });
+    if words[0] != D4_CLONE_WORKER_MAGIC
+        || words[1] != u64::from(tgid)
+        || words[2] != u64::from(tid)
+    {
+        return Err("raw worker is not the actual cloned task");
+    }
+    let ready = D4ThreadReady {
+        token: token.into(),
+        tgid,
+        tid,
+        fd: i32::try_from(words[3]).map_err(|_| "raw worker fd overflow")?,
+        start: words[4],
+        end: words[5],
+        dev: words[6],
+        ino: words[7],
+    };
+    d4_validate_thread_ready(&ready, tgid, token)?;
+    Ok(ready)
+}
+
+fn d4_decode_clone_birth(
+    bytes: &[u8],
+    ready: &D4ThreadReady,
+) -> Result<D4CloneBirth, &'static str> {
+    if bytes.len() != 12 {
+        return Err("wrong clone birth reply size");
+    }
+    let birth = D4CloneBirth {
+        returned_tid: u32::from_ne_bytes(bytes[..4].try_into().unwrap()),
+        parent_tid: u32::from_ne_bytes(bytes[4..8].try_into().unwrap()),
+        flags: u32::from_ne_bytes(bytes[8..12].try_into().unwrap()),
+    };
+    d4_clone_without_files_flags(birth.flags)?;
+    if birth.returned_tid == 0
+        || birth.returned_tid != ready.tid
+        || birth.parent_tid != birth.returned_tid
+    {
+        return Err("clone return, parent-written TID and live worker reply must agree");
+    }
+    Ok(birth)
+}
+
+fn d4_write_clone_birth(
+    stream: &mut std::os::unix::net::UnixStream,
+    birth: D4CloneBirth,
+) -> std::io::Result<()> {
+    use std::io::Write as _;
+    for word in [birth.returned_tid, birth.parent_tid, birth.flags] {
+        stream.write_all(&word.to_ne_bytes())?;
+    }
+    Ok(())
+}
+
+impl D4ThreadChild {
+    fn spawn_clone_without_files(
+        path: &std::path::Path,
+        token: &str,
+    ) -> (Self, D4ThreadReady, D4CloneBirth) {
+        use std::io::Read as _;
+        use std::os::fd::OwnedFd;
+        use std::process::{Command, Stdio};
+        let (channel, helper) = std::os::unix::net::UnixStream::pair().unwrap();
+        channel
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        channel
+            .set_write_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        helper
+            .set_read_timeout(Some(std::time::Duration::from_secs(60)))
+            .unwrap();
+        helper
+            .set_write_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "discovery::sweep_attribution::tests::d4_clone_without_files_mapping_helper",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env_clear()
+            .env("P11SCOPE_D4_CLONE_PATH", path)
+            .env("P11SCOPE_D4_CLONE_TOKEN", token)
+            .stdin(Stdio::from(OwnedFd::from(helper)))
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("fresh exec of the matching literal-clone libtest helper");
+        let mut owned = Self {
+            child,
+            channel,
+            reaped: false,
+        };
+        let ready = d4_read_thread_ready(&mut owned.channel)
+            .expect("required actual clone worker READY; refusal cannot qualify");
+        d4_validate_thread_ready(&ready, owned.child.id(), token)
+            .expect("actual owned nonleader mapping");
+        let mut bytes = [0; 12];
+        owned
+            .channel
+            .read_exact(&mut bytes)
+            .expect("actual clone return and parent-written TID");
+        let birth =
+            d4_decode_clone_birth(&bytes, &ready).expect("literal private-files thread birth");
+        (owned, ready, birth)
+    }
+}
+
+#[test]
+fn d4_clone_without_files_flags_reject_shared_files_or_nonthreads() {
+    let healthy = (libc::CLONE_VM
+        | libc::CLONE_SIGHAND
+        | libc::CLONE_THREAD
+        | libc::CLONE_PARENT_SETTID
+        | libc::CLONE_CHILD_CLEARTID) as u32;
+    assert_eq!(d4_clone_without_files_flags(healthy), Ok(()));
+    for bad in [
+        healthy | libc::CLONE_FILES as u32,
+        healthy & !(libc::CLONE_VM as u32),
+        healthy & !(libc::CLONE_SIGHAND as u32),
+        healthy & !(libc::CLONE_THREAD as u32),
+        healthy & !(libc::CLONE_PARENT_SETTID as u32),
+        healthy & !(libc::CLONE_CHILD_CLEARTID as u32),
+        healthy | libc::CLONE_SETTLS as u32,
+    ] {
+        assert!(d4_clone_without_files_flags(bad).is_err());
+        assert_eq!(d4_clone_without_files_flags(healthy), Ok(()));
+    }
+}
+
+#[test]
+fn d4_clone_without_files_reply_rejects_wrong_tid_and_malformed_frames() {
+    let words = [D4_CLONE_WORKER_MAGIC, 101, 102, 4, 0x1000, 0x2000, 37, 123];
+    let encode = |words: &[u64]| {
+        words
+            .iter()
+            .flat_map(|word| word.to_ne_bytes())
+            .collect::<Vec<_>>()
+    };
+    let bytes = encode(&words);
+    let healthy = d4_decode_clone_worker_reply(&bytes, 101, 102, "owned").unwrap();
+    assert_eq!(
+        (
+            healthy.tgid,
+            healthy.tid,
+            healthy.fd,
+            healthy.start,
+            healthy.end,
+            healthy.dev,
+            healthy.ino
+        ),
+        (101, 102, 4, 0x1000, 0x2000, 37, 123)
+    );
+    for bad in [
+        &bytes[..bytes.len() - 1],
+        &[0; D4_CLONE_WORKER_REPLY_LEN + 1][..],
+    ] {
+        assert!(d4_decode_clone_worker_reply(bad, 101, 102, "owned").is_err());
+    }
+    for (position, value) in [
+        (0, 0),
+        (1, 103),
+        (2, 103),
+        (3, u64::MAX),
+        (5, 0x2001),
+        (7, 0),
+    ] {
+        let mut bad = words;
+        bad[position] = value;
+        assert!(d4_decode_clone_worker_reply(&encode(&bad), 101, 102, "owned").is_err());
+        assert_eq!(
+            d4_decode_clone_worker_reply(&bytes, 101, 102, "owned"),
+            Ok(healthy.clone())
+        );
+    }
+    let birth = D4CloneBirth {
+        returned_tid: 102,
+        parent_tid: 102,
+        flags: D4_CLONE_WITHOUT_FILES_FLAGS as u32,
+    };
+    let (mut writer, mut reader) = std::os::unix::net::UnixStream::pair().unwrap();
+    d4_write_thread_ready(&mut writer, &healthy).unwrap();
+    d4_write_clone_birth(&mut writer, birth).unwrap();
+    let ready = d4_read_thread_ready(&mut reader).unwrap();
+    use std::io::Read as _;
+    let mut birth_bytes = [0; 12];
+    reader.read_exact(&mut birth_bytes).unwrap();
+    assert_eq!(d4_decode_clone_birth(&birth_bytes, &ready), Ok(birth));
+    for bad in [
+        D4CloneBirth {
+            returned_tid: 0,
+            ..birth
+        },
+        D4CloneBirth {
+            returned_tid: 103,
+            ..birth
+        },
+        D4CloneBirth {
+            parent_tid: 103,
+            ..birth
+        },
+        D4CloneBirth {
+            flags: birth.flags | libc::CLONE_FILES as u32,
+            ..birth
+        },
+    ] {
+        let bytes: Vec<_> = [bad.returned_tid, bad.parent_tid, bad.flags]
+            .into_iter()
+            .flat_map(u32::to_ne_bytes)
+            .collect();
+        assert!(d4_decode_clone_birth(&bytes, &healthy).is_err());
+        assert_eq!(d4_decode_clone_birth(&birth_bytes, &healthy), Ok(birth));
+    }
+    assert!(d4_decode_clone_birth(&birth_bytes[..11], &healthy).is_err());
+}
+
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[repr(C)]
+struct D4RawCloneArgs {
+    path: *const libc::c_char,
+    channel: libc::c_int,
+    unused_channel: libc::c_int,
+}
+
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+const D4_CLONE_WORKER_WIRE_OFFSET: usize = (std::mem::size_of::<libc::stat>() + 15) & !15;
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+const D4_CLONE_WORKER_FRAME_SIZE: usize =
+    (D4_CLONE_WORKER_WIRE_OFFSET + D4_CLONE_WORKER_REPLY_LEN + 1 + 15) & !15;
+
+/// The complete newborn path is assembly: no libc syscall errno writes,
+/// inherited TLS, Rust prologue, allocation, panic or unwinding. The glibc
+/// clone trampoline supplies RDI and an independent stack. We never return,
+/// so callee-saved registers need not be restored to that trampoline.
+/// Both success and failure use SYS_exit for THIS THREAD, never exit_group.
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[unsafe(naked)]
+extern "C" fn d4_clone_without_files_worker(_context: *mut libc::c_void) -> libc::c_int {
+    core::arch::naked_asm!(
+        "sub rsp, {frame}",
+        "mov rbx, rdi",
+        "mov r12d, dword ptr [rbx + {args_channel}]",
+        // This endpoint belongs to the normal parent. Its newborn copy
+        // must close, or EOF would depend on a peer held by the worker.
+        "mov edi, dword ptr [rbx + {args_unused}]",
+        "mov eax, {sys_close}",
+        "syscall",
+        "test rax, rax",
+        "jnz 9f",
+        "mov eax, {magic}",
+        "mov qword ptr [rsp + {wire}], rax",
+        "mov eax, {sys_getpid}",
+        "syscall",
+        "mov qword ptr [rsp + {wire} + 8], rax",
+        "mov eax, {sys_gettid}",
+        "syscall",
+        "mov qword ptr [rsp + {wire} + 16], rax",
+        // Open only AFTER the literal private-files birth, with no unshare.
+        "mov eax, {sys_openat}",
+        "mov rdi, {at_fdcwd}",
+        "mov rsi, qword ptr [rbx + {args_path}]",
+        "mov edx, {open_flags}",
+        "xor r10d, r10d",
+        "syscall",
+        "test rax, rax",
+        "js 9f",
+        "mov r13, rax",
+        "mov qword ptr [rsp + {wire} + 24], rax",
+        "mov eax, {sys_fstat}",
+        "mov edi, r13d",
+        "mov rsi, rsp",
+        "syscall",
+        "test rax, rax",
+        "jnz 9f",
+        "mov rax, qword ptr [rsp + {stat_dev}]",
+        "mov qword ptr [rsp + {wire} + 48], rax",
+        "mov rax, qword ptr [rsp + {stat_ino}]",
+        "mov qword ptr [rsp + {wire} + 56], rax",
+        "mov eax, {sys_mmap}",
+        "xor edi, edi",
+        "mov esi, 4096",
+        "mov edx, {prot}",
+        "mov r10d, {map_private}",
+        "mov r8, r13",
+        "xor r9d, r9d",
+        "syscall",
+        "test rax, rax",
+        "js 9f",
+        "mov r14, rax",
+        "mov qword ptr [rsp + {wire} + 32], rax",
+        "add rax, 4096",
+        "mov qword ptr [rsp + {wire} + 40], rax",
+        // The bounded native-endian reply comes only from actual syscalls.
+        "lea rbp, [rsp + {wire}]",
+        "mov r15d, {reply_len}",
+        "2:",
+        "mov eax, {sys_write}",
+        "mov edi, r12d",
+        "mov rsi, rbp",
+        "mov rdx, r15",
+        "syscall",
+        "cmp rax, -{eintr}",
+        "je 2b",
+        "test rax, rax",
+        "jle 9f",
+        "cmp rax, r15",
+        "ja 9f",
+        "add rbp, rax",
+        "sub r15, rax",
+        "jnz 2b",
+        "3:",
+        "mov eax, {sys_read}",
+        "mov edi, r12d",
+        "lea rsi, [rsp + {wire} + {reply_len}]",
+        "mov edx, 1",
+        "syscall",
+        "cmp rax, -{eintr}",
+        "je 3b",
+        "cmp rax, 1",
+        "jne 9f",
+        "cmp byte ptr [rsp + {wire} + {reply_len}], 81",
+        "jne 9f",
+        "mov eax, {sys_munmap}",
+        "mov rdi, r14",
+        "mov esi, 4096",
+        "syscall",
+        "test rax, rax",
+        "jnz 9f",
+        "mov eax, {sys_close}",
+        "mov edi, r13d",
+        "syscall",
+        "test rax, rax",
+        "jnz 9f",
+        // ACK follows successful VMA removal and source-FD close. The
+        // normal parent still must join kernel clear-TID before freeing.
+        "mov byte ptr [rsp + {wire} + {reply_len}], 68",
+        "4:",
+        "mov eax, {sys_write}",
+        "mov edi, r12d",
+        "lea rsi, [rsp + {wire} + {reply_len}]",
+        "mov edx, 1",
+        "syscall",
+        "cmp rax, -{eintr}",
+        "je 4b",
+        "cmp rax, 1",
+        "jne 9f",
+        "xor edi, edi",
+        "mov eax, {sys_exit}",
+        "syscall",
+        "ud2",
+        "9:",
+        "mov edi, 91",
+        "mov eax, {sys_exit}",
+        "syscall",
+        "ud2",
+        frame = const D4_CLONE_WORKER_FRAME_SIZE,
+        wire = const D4_CLONE_WORKER_WIRE_OFFSET,
+        reply_len = const D4_CLONE_WORKER_REPLY_LEN,
+        args_path = const std::mem::offset_of!(D4RawCloneArgs, path),
+        args_channel = const std::mem::offset_of!(D4RawCloneArgs, channel),
+        args_unused = const std::mem::offset_of!(D4RawCloneArgs, unused_channel),
+        stat_dev = const std::mem::offset_of!(libc::stat, st_dev),
+        stat_ino = const std::mem::offset_of!(libc::stat, st_ino),
+        magic = const D4_CLONE_WORKER_MAGIC,
+        eintr = const libc::EINTR,
+        at_fdcwd = const libc::AT_FDCWD,
+        open_flags = const libc::O_RDONLY | libc::O_CLOEXEC,
+        prot = const libc::PROT_READ | libc::PROT_EXEC,
+        map_private = const libc::MAP_PRIVATE,
+        sys_close = const libc::SYS_close,
+        sys_getpid = const libc::SYS_getpid,
+        sys_gettid = const libc::SYS_gettid,
+        sys_openat = const libc::SYS_openat,
+        sys_fstat = const libc::SYS_fstat,
+        sys_mmap = const libc::SYS_mmap,
+        sys_write = const libc::SYS_write,
+        sys_read = const libc::SYS_read,
+        sys_munmap = const libc::SYS_munmap,
+        sys_exit = const libc::SYS_exit,
+    );
+}
+
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+struct D4RawCloneGuard {
+    stack: *mut libc::c_void,
+    stack_len: usize,
+    // Published allocations stay raw while the newborn can access them;
+    // moving this guard never reclaims or retags a Box over its live args.
+    args: *mut D4RawCloneArgs,
+    path: *mut libc::c_char,
+    channel: std::os::unix::net::UnixStream,
+    child_tid: *mut std::sync::atomic::AtomicI32,
+    worker_tid: libc::c_int,
+    joined: bool,
+}
+
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+impl D4RawCloneGuard {
+    fn spawn(path: std::ffi::CString) -> (Self, D4CloneBirth) {
+        use std::os::fd::AsRawFd as _;
+        use std::sync::atomic::{AtomicI32, Ordering};
+        let (channel, worker) = std::os::unix::net::UnixStream::pair().unwrap();
+        channel
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        channel
+            .set_write_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        worker
+            .set_read_timeout(Some(std::time::Duration::from_secs(60)))
+            .unwrap();
+        worker
+            .set_write_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        // SAFETY: this is the normal post-exec parent, with ordinary TLS.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        assert!(page > 0);
+        let page = page as usize;
+        let stack_size = 1024 * 1024;
+        let stack_len = stack_size + 2 * page;
+        // SAFETY: an owned anonymous allocation, initially all guard pages.
+        let stack = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                stack_len,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(stack, libc::MAP_FAILED, "owned raw-worker stack");
+        let path = path.into_raw();
+        let args = Box::into_raw(Box::new(D4RawCloneArgs {
+            path,
+            channel: worker.as_raw_fd(),
+            unused_channel: channel.as_raw_fd(),
+        }));
+        let mut owned = Self {
+            stack,
+            stack_len,
+            args,
+            path,
+            channel,
+            child_tid: Box::into_raw(Box::new(AtomicI32::new(-1))),
+            worker_tid: 0,
+            joined: false,
+        };
+        // SAFETY: only the middle of this owned allocation becomes writable;
+        // the leading/trailing pages remain guards through kernel join.
+        let stack_start = unsafe { stack.cast::<u8>().add(page) };
+        assert_eq!(
+            unsafe {
+                libc::mprotect(
+                    stack_start.cast(),
+                    stack_size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                )
+            },
+            0
+        );
+        d4_clone_without_files_flags(D4_CLONE_WITHOUT_FILES_FLAGS as u32).unwrap();
+        let tid_address = owned.tid_word().as_ptr();
+        // SAFETY: normal-parent glibc trampoline; the callback is a complete
+        // syscall-only leaf on its separate stack. All pointed-to storage and
+        // both IPC endpoints remain owned until kernel clear-TID is acquired.
+        let tid = unsafe {
+            libc::clone(
+                d4_clone_without_files_worker,
+                stack_start.add(stack_size).cast(),
+                D4_CLONE_WITHOUT_FILES_FLAGS,
+                owned.args.cast(),
+                tid_address,
+                std::ptr::null_mut::<libc::c_void>(),
+                tid_address,
+            )
+        };
+        // Establish the fatal-on-unwind guard before any assertion or I/O.
+        owned.worker_tid = tid;
+        assert!(
+            tid > 0,
+            "required literal clone failed: {}",
+            std::io::Error::last_os_error()
+        );
+        let parent_tid = owned.tid_word().load(Ordering::Acquire);
+        assert_eq!(parent_tid, tid, "actual CLONE_PARENT_SETTID write");
+        // Parent and worker have separate FD tables. Closing this parent's
+        // copy cannot close the raw worker's peer; it makes worker EOF honest.
+        drop(worker);
+        (
+            owned,
+            D4CloneBirth {
+                returned_tid: tid as u32,
+                parent_tid: parent_tid as u32,
+                flags: D4_CLONE_WITHOUT_FILES_FLAGS as u32,
+            },
+        )
+    }
+
+    fn tid_word(&self) -> &std::sync::atomic::AtomicI32 {
+        // SAFETY: this guard owns the naturally aligned allocation until
+        // Drop after join. Only the kernel writes it after its initial -1.
+        unsafe { &*self.child_tid }
+    }
+
+    fn ready(&mut self, token: &str) -> D4ThreadReady {
+        use std::io::Read as _;
+        let mut bytes = [0; D4_CLONE_WORKER_REPLY_LEN];
+        self.channel
+            .read_exact(&mut bytes)
+            .expect("actual syscall-only worker reply");
+        d4_decode_clone_worker_reply(&bytes, std::process::id(), self.worker_tid as u32, token)
+            .expect("actual worker matches clone return and opened-file VMA")
+    }
+
+    fn finish(mut self) {
+        use std::io::{Read as _, Write as _};
+        use std::sync::atomic::Ordering;
+        self.channel
+            .write_all(b"Q")
+            .expect("release the actual raw worker");
+        let mut ack = [0];
+        self.channel
+            .read_exact(&mut ack)
+            .expect("raw worker cleanup ACK");
+        assert_eq!(ack, *b"D", "raw worker removed its VMA and closed its file");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut waits = 0;
+        loop {
+            let observed = self.tid_word().load(Ordering::Acquire);
+            if observed == 0 {
+                self.joined = true;
+                break;
+            }
+            assert_eq!(
+                observed, self.worker_tid,
+                "only the kernel may clear child-TID"
+            );
+            let remaining = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .expect("raw worker kernel join exceeded its deadline");
+            let timeout = libc::timespec {
+                tv_sec: remaining.as_secs() as libc::time_t,
+                tv_nsec: remaining.subsec_nanos() as libc::c_long,
+            };
+            // SAFETY: the naturally aligned boxed TID word and timeout stay
+            // live. clear_child_tid wakes FUTEX_WAIT, NOT FUTEX_WAIT_PRIVATE.
+            // This libc call is on the normal parent, never the raw child.
+            let status = unsafe {
+                libc::syscall(
+                    libc::SYS_futex,
+                    self.tid_word().as_ptr(),
+                    libc::FUTEX_WAIT,
+                    observed,
+                    &timeout,
+                    std::ptr::null::<u32>(),
+                    0,
+                )
+            };
+            waits += 1;
+            if status < 0 {
+                let error = std::io::Error::last_os_error();
+                assert!(
+                    matches!(
+                        error.raw_os_error(),
+                        Some(libc::EINTR | libc::EAGAIN | libc::ETIMEDOUT)
+                    ),
+                    "kernel clear-TID join failed: {error}"
+                );
+            }
+        }
+        assert_eq!(self.tid_word().load(Ordering::Acquire), 0);
+        // SAFETY: kernel clear-TID was acquired; no newborn user code can
+        // access this stack, args, path or IPC after this point.
+        assert_eq!(
+            unsafe { libc::munmap(self.stack, self.stack_len) },
+            0,
+            "release joined raw-worker stack"
+        );
+        self.stack = std::ptr::null_mut();
+        eprintln!(
+            "D4_CLONE_JOIN caller={} worker={} clear_tid=0 shared_futex_waits={waits}",
+            std::process::id(),
+            self.worker_tid
+        );
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+impl Drop for D4RawCloneGuard {
+    fn drop(&mut self) {
+        if self.worker_tid > 0 && !self.joined {
+            // A normal-parent failure must not unwind/free memory a raw
+            // worker could still use. Terminate this OWNED helper process;
+            // the outer D4ThreadChild guard reaps it. The child never uses
+            // this path, and its normal exit above is strictly thread-only.
+            unsafe { libc::_exit(104) };
+        }
+        if !self.stack.is_null() {
+            // SAFETY: no worker was created, or kernel join already completed.
+            unsafe {
+                libc::munmap(self.stack, self.stack_len);
+            }
+        }
+        // SAFETY: the fatal branch prevents reclamation with a live raw
+        // child. Each allocation was published once and is reclaimed once;
+        // the newborn never changes the owned CString's bytes or length.
+        unsafe {
+            drop(Box::from_raw(self.args));
+            drop(std::ffi::CString::from_raw(self.path));
+            drop(Box::from_raw(self.child_tid));
+        }
+    }
+}
+
+/// Private re-exec entrypoint. Missing owned configuration fails, never skips.
+#[test]
+#[ignore = "private D4 literal-clone fixture entrypoint; requires its owning parity test socket/configuration"]
+fn d4_clone_without_files_mapping_helper() {
+    #[cfg(not(all(target_arch = "x86_64", target_pointer_width = "64")))]
+    panic!("the actual literal-clone fixture requires the x86-64 LP64 syscall ABI");
+    #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+    {
+        use std::io::Read as _;
+        use std::os::fd::{FromRawFd as _, OwnedFd};
+        let path = std::env::var_os("P11SCOPE_D4_CLONE_PATH").expect("owned literal-clone source");
+        let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        let token = std::env::var("P11SCOPE_D4_CLONE_TOKEN").expect("owning literal-clone token");
+        assert!(!token.is_empty());
+        // SAFETY: only this fresh-exec normal parent's supplied stdin socket.
+        let raw = unsafe { libc::fcntl(0, libc::F_DUPFD_CLOEXEC, 3) };
+        assert!(raw >= 0);
+        // SAFETY: the fresh duplicate is adopted exactly once.
+        let mut socket = std::os::unix::net::UnixStream::from(unsafe { OwnedFd::from_raw_fd(raw) });
+        socket
+            .peer_addr()
+            .expect("owning fixture must supply its connected Unix socket");
+        let (mut worker, birth) = D4RawCloneGuard::spawn(path);
+        let ready = worker.ready(&token);
+        d4_write_thread_ready(&mut socket, &ready)
+            .expect("relay actual raw-worker FD/VMA identity");
+        d4_write_clone_birth(&mut socket, birth)
+            .expect("report actual clone return and parent-written TID");
+        let mut command = [0];
+        socket
+            .read_exact(&mut command)
+            .expect("owning fixture must release its raw worker");
+        assert_eq!(command, *b"Q");
+        worker.finish();
+    }
+}
+
+/// A literal CLONE_THREAD birth omits CLONE_FILES, rather than detaching
+/// files after std-thread birth. The actual live TGID must attribute A,
+/// and refuse physically different B despite its identical Btrfs maps key.
+/// Zombie leaders, active capture and native calls remain separate gates;
+/// the current zombie refusal does not satisfy that selected D4 population.
+#[test]
+#[ignore = "root x86-64 LP64 Btrfs disk TMPDIR, literal private-files clone and eligible BTF/task_vma identity; actual backend parity"]
+fn privileged_d4_btrfs_clone_without_files_backend_parity() {
+    use crate::discovery::identity::{
+        PinnedObjects, map_files_identity, test_fixture::real_scan_pin,
+    };
+    use crate::discovery::kernel_identity::IdentitySession;
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::{FileExt as _, MetadataExt as _};
+
+    assert!(
+        cfg!(all(target_arch = "x86_64", target_pointer_width = "64")),
+        "the required actual raw worker uses the x86-64 LP64 syscall ABI"
+    );
+    crate::attach::identity_iter::ensure_kernel_identity_btf()
+        .expect("required kernel identity capability; refusal cannot qualify");
+    let btf = aya::Btf::from_sys_fs().expect("readable host BTF");
+    let dir = tempfile::tempdir().unwrap();
+    let parent = dir.path();
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    let c_parent = std::ffi::CString::new(parent.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: a valid path and writable statfs buffer, read only on success.
+    assert_eq!(
+        unsafe { libc::statfs(c_parent.as_ptr(), stat.as_mut_ptr()) },
+        0
+    );
+    // SAFETY: initialized by the successful statfs above.
+    let magic = unsafe { stat.assume_init().f_type } as u64 & 0xffff_ffff;
+    assert_eq!(magic, 0x9123_683e, "actual fixture TMPDIR must be Btrfs");
+    create_subvolume(parent, "a");
+    create_subvolume(parent, "b");
+    let a_path = parent.join("a/libclone.so");
+    let b_path = parent.join("b/libclone.so");
+    let bytes = vec![0xa5u8; 8192];
+    std::fs::write(&a_path, &bytes).unwrap();
+    std::fs::copy(&a_path, &b_path).unwrap();
+    let a_file = std::fs::File::open(&a_path).unwrap();
+    let b_file = std::fs::File::open(&b_path).unwrap();
+    let identity = |file: &std::fs::File| {
+        let metadata = file.metadata().unwrap();
+        FileIdentity {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        }
+    };
+    let a = identity(&a_file);
+    let b = identity(&b_file);
+    assert_eq!(
+        a.ino, b.ino,
+        "fresh subvolume files must share an inode number"
+    );
+    assert_ne!(
+        a, b,
+        "the equal-byte collision must name different physical files"
+    );
+    for file in [&a_file, &b_file] {
+        let mut held_bytes = vec![0; bytes.len()];
+        file.read_exact_at(&mut held_bytes, 0).unwrap();
+        assert_eq!(
+            held_bytes, bytes,
+            "each actual held input has the same bytes"
+        );
+    }
+
+    let (caller, caller_ready, caller_birth) =
+        D4ThreadChild::spawn_clone_without_files(&a_path, "owned-clone-a");
+    let (wrong, wrong_ready, wrong_birth) =
+        D4ThreadChild::spawn_clone_without_files(&b_path, "owned-clone-b");
+    let children = [&caller, &wrong];
+    let ready = [&caller_ready, &wrong_ready];
+    let birth = [caller_birth, wrong_birth];
+    let expected_files = [a, b];
+    let paths = [&a_path, &b_path];
+    let mut start_times = Vec::new();
+    for (position, child) in children.iter().enumerate() {
+        let report = ready[position];
+        assert_eq!(birth[position].flags, D4_CLONE_WITHOUT_FILES_FLAGS as u32);
+        assert_eq!(birth[position].returned_tid, report.tid);
+        assert_eq!(birth[position].parent_tid, report.tid);
+        start_times.push(child.verify_worker(report, expected_files[position], true));
+        eprintln!(
+            "D4_CLONE_WORKER caller={} tid={} clone_return={} parent_tid={} flags={:#x} fd={} range={:x}-{:x} file={}:{}",
+            report.tgid,
+            report.tid,
+            birth[position].returned_tid,
+            birth[position].parent_tid,
+            birth[position].flags,
+            report.fd,
+            report.start,
+            report.end,
+            report.dev,
+            report.ino
+        );
+    }
+    let snapshots = [caller.maps(), wrong.maps()];
+    let mut fixture_lines = Vec::new();
+    for (position, snapshot) in snapshots.iter().enumerate() {
+        let report = ready[position];
+        let line = snapshot
+            .iter()
+            .find(|entry| (entry.start, entry.end) == (report.start, report.end))
+            .expect("the actual literal-clone worker's exact VMA");
+        assert_eq!(line.permissions, *b"r-xp");
+        assert_eq!(line.file_offset, 0);
+        assert_eq!(
+            line.raw_path.as_deref(),
+            Some(paths[position].as_os_str().as_encoded_bytes())
+        );
+        assert!(
+            is_caller_range(line),
+            "both actual workers require executable proof"
+        );
+        assert_eq!(
+            map_files_identity(report.tgid, line.start, line.end)
+                .expect("independent actual vm_file identity"),
+            expected_files[position]
+        );
+        fixture_lines.push(line.clone());
+    }
+    let key = ObjectKey::of(&fixture_lines[0]);
+    assert_eq!(
+        ObjectKey::of(&fixture_lines[1]),
+        key,
+        "actual Btrfs maps-key collision"
+    );
+    let digest = p11scope_manifest::identity::hex(&Sha256::digest(&bytes));
+    let pins: PinnedObjects = real_scan_pin(&a_path, Some(key), 0, &digest);
+    let object = pins.pinned().next().expect("actual held A pin").id;
+    assert_eq!(identity(pins.file_for(object).unwrap()), a);
+    let (index, refused) = KnownKeyIndex::build(
+        [(key, Some(object))],
+        &BTreeMap::from([(key, object)]),
+        [],
+        &pins,
+    );
+    assert!(refused.is_empty(), "{refused:?}");
+    let proof_keys = index.map_files_keys();
+    assert!(proof_keys.contains(&key));
+    for (position, snapshot) in snapshots.iter().enumerate() {
+        assert_eq!(
+            proof_ranges(snapshot, &proof_keys),
+            [(ready[position].start, ready[position].end)],
+            "one exact real worker VMA must require identity proof"
+        );
+        assert_eq!(
+            snapshot
+                .iter()
+                .filter(|entry| ObjectKey::of(entry) == key)
+                .cloned()
+                .collect::<Vec<_>>(),
+            [fixture_lines[position].clone()],
+            "the entire fixture-key population is known"
+        );
+    }
+    let probe_dir = tempfile::tempdir().unwrap();
+    let mut session = IdentitySession::probe_and_load(&btf, probe_dir.path())
+        .expect("actual strict-loaded kernel session; no refused/fallback positive");
+    for (position, child) in children.iter().enumerate() {
+        let pid = child.child.id();
+        let userspace = attribute_pid(pid, snapshots[position].clone(), &index);
+        let kernel = d4_kernel_attribution_for_pid(
+            pid,
+            snapshots[position].clone(),
+            &pins,
+            object,
+            key,
+            &mut session,
+            position as u64 + 1,
+        );
+        for (backend, out) in [("userspace", &userspace), ("kernel", &kernel)] {
+            assert_eq!(out.probed, 1, "{backend}: actual executable proof demand");
+            assert_eq!(out.unavailable, 0);
+            assert!(
+                out.exited.is_empty(),
+                "{backend}: the owned TGID and worker remain live"
+            );
+            if position == 0 {
+                assert_eq!(
+                    out.members
+                        .iter()
+                        .map(|member| member.pid)
+                        .collect::<Vec<_>>(),
+                    [pid],
+                    "{backend}: exact live TGID owns the raw worker's mapping"
+                );
+                assert_eq!(out.members[0].start_time, start_times[position]);
+                assert_eq!(
+                    out.members[0]
+                        .objects
+                        .iter()
+                        .map(|matched| (matched.key, matched.object, matched.path.as_str()))
+                        .collect::<Vec<_>>(),
+                    [(key, object, a_path.to_str().unwrap())],
+                    "{backend}: exact held-A edge"
+                );
+                assert!(out.losses.is_empty(), "{backend}: {:?}", out.member_losses);
+            } else {
+                assert!(
+                    out.members.is_empty(),
+                    "{backend}: equal bytes and maps key cannot make B into A"
+                );
+                assert_eq!(
+                    out.losses,
+                    BTreeMap::from([(AttributionLoss::IdentityMismatch, 1)]),
+                    "{backend}: actual different-file negative"
+                );
+                assert_eq!(
+                    out.member_losses.get(&pid).map(|(loss, _)| *loss),
+                    Some(AttributionLoss::IdentityMismatch)
+                );
+            }
+        }
+        assert_eq!(
+            userspace.members, kernel.members,
+            "independently checked backend edges"
+        );
+        assert_eq!(userspace.losses, kernel.losses);
+        assert_eq!(
+            child.verify_worker(ready[position], expected_files[position], true),
+            start_times[position]
+        );
+        assert_eq!(
+            child
+                .maps()
+                .into_iter()
+                .filter(|entry| ObjectKey::of(entry) == key)
+                .collect::<Vec<_>>(),
+            [fixture_lines[position].clone()],
+            "actual raw-worker VMA remains held through both proofs"
+        );
+    }
+    assert!(
+        pins.object_unchanged(object)
+            .expect("recheck the real held A anchor")
+    );
+    for (file, expected) in [(&a_file, a), (&b_file, b)] {
+        assert_eq!(identity(file), expected);
+        assert_eq!(file.metadata().unwrap().len(), bytes.len() as u64);
+        let mut held_bytes = vec![0; bytes.len()];
+        file.read_exact_at(&mut held_bytes, 0).unwrap();
+        assert_eq!(
+            held_bytes, bytes,
+            "both held physical files remain unchanged"
+        );
+    }
+    let pids = [caller.child.id(), wrong.child.id()];
+    let tids = [caller_ready.tid, wrong_ready.tid];
+    drop((session, pins));
+    caller.finish();
+    wrong.finish();
+    for (pid, tid) in pids.into_iter().zip(tids) {
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "owned helper is reaped"
+        );
+        assert!(
+            !std::path::Path::new(&format!("/proc/{tid}")).exists(),
+            "owned raw thread is gone"
+        );
+    }
+    eprintln!(
+        "D4_BTRFS_CLONE callers={}/{} workers={}/{} userspace=1/0 kernel=1/0 files_private_at_birth=true generations=1/2 fallback=none joined_and_reaped=true",
+        pids[0], pids[1], tids[0], tids[1]
+    );
+    drop((a_file, b_file));
+    std::fs::remove_file(&a_path).unwrap();
+    std::fs::remove_file(&b_path).unwrap();
+    std::fs::remove_dir(parent.join("a")).unwrap();
+    std::fs::remove_dir(parent.join("b")).unwrap();
+    probe_dir
+        .close()
+        .expect("remove owned kernel probe directory");
+    dir.close()
+        .expect("remove owned Btrfs literal-clone fixture directory");
+}
+
 /// Root with a loop-mounted ext4: there a held file's maps key is its
 /// identity, so no per-range stat runs at all. Before A6 a process that
 /// mapped the file only read-only was attributed on the key alone; now

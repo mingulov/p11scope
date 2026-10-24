@@ -16,12 +16,12 @@ on:
         default: false
 permissions:
   contents: read
-# Per ref, so a branch that moves cancels its superseded run. Several refs at
+# Per ref, so a branch that moves sequences its queued runs. Several refs at
 # one commit (a release branch, main and the tag) each start a run; the dedupe
 # job below lets only the first of them run the check matrix.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 # The cargo-installed CI tools. Each version is read by both the install step
 # and its cache key, so a version bump can never be served an older binary.
 env:

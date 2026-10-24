@@ -23106,6 +23106,46 @@ impl Engine {
         self.pending_discovery_records.len()
     }
 
+    /// Feed the same decoded fixture original through actual H-1 ingestion.
+    /// Exhausting this frame parks its record before dispatch; no test helper
+    /// writes the retained queue or the lifecycle processing result directly.
+    pub(crate) fn defer_finish_discovery_for_test(
+        &mut self,
+        record: DiscoveryRecord,
+    ) -> Result<()> {
+        let previous_budget = self.frame_work_budget_ns;
+        self.frame_work_budget_ns = 0;
+        let mut session = session_fixture::ScriptedSession::with_records([record], 0);
+        let result = self.drain_discovery_from(&mut session);
+        self.frame_work_budget_ns = previous_budget;
+        result.map(|_| ())
+    }
+
+    pub(crate) fn finish_discovery_head_for_test(&self) -> Option<(u32, u64, u8)> {
+        self.pending_discovery_records.first().map(|queued| {
+            (
+                (queued.record.pid_tgid >> 32) as u32,
+                queued.record.hook_ts_ns,
+                queued.record.kind,
+            )
+        })
+    }
+
+    /// Observe the real handler preconditions, not a ready/completion flag.
+    pub(crate) fn finish_exit_subject_for_test(&self, pid: u32, at: u64) -> (bool, bool, bool) {
+        (
+            self.admits_generations(),
+            self.views.iter().any(|view| view.pid() == pid),
+            self.admitted_cgroup_views
+                .values()
+                .any(|admission| admission.covers(at, pid)),
+        )
+    }
+
+    pub(crate) fn unmatched_finish_exit_for_test(&self, pid: u32, at: u64) -> bool {
+        self.unmatched_leader_exit_events.contains(&(pid, at))
+    }
+
     /// A blank engine for cross-module tests that cannot name the private
     /// constructor: pid scope on the test process, no views, no requests.
     pub(crate) fn empty_for_test() -> Self {

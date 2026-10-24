@@ -15,7 +15,8 @@ use crate::discovery::identity::PinnedObjectId;
 use crate::discovery::instances::{InstanceId, MAX_INSTANCES, MAX_PENDING};
 use crate::events::{DiscoveryDomain, DispatchPoll};
 use crate::inventory_semantics::{
-    AttestedSemanticLane, LaneNegative, MAX_LANE_NEGATIVES, SemanticBatch, SemanticRefusal,
+    AttestedSemanticLane, LaneDrainOutcome, LaneNegative, MAX_LANE_NEGATIVES, SemanticBatch,
+    SemanticRefusal,
 };
 use crate::semantic_capture::{
     CommittedAbsenceBirth, CurrentPartitionReceipt, H0BirthCandidate, RetainedBirthWitness,
@@ -24,6 +25,8 @@ use crate::semantic_capture::{
 use crate::semantics_edge::resources::{
     OWNED_ALLOCATION_PADDING, ResourceLease, SemanticResourceReserver,
 };
+#[cfg(test)]
+use crate::semantics_objects::journal::joint_audit::DisposedJointQuantum;
 use crate::semantics_objects::journal::joint_audit::IngestedJointQuantum;
 use crate::semantics_objects::journal::joint_driver::{
     CollectedLedgerBinding, IngestedRaw, RawDisposeReason, RawDisposition, RawJointQuantum,
@@ -76,6 +79,81 @@ pub(crate) enum JointCommitRefusal {
 /// seal, receipt or publication-completion word.
 pub(crate) trait JointMachineIo {
     fn producers(&self) -> &SessionDrainProducers;
+    /// The normal Session keeps this inactive until the owning Finish path
+    /// exists. A test may forward only the existing immediate admission gate.
+    #[allow(dead_code)] // Inert Finish surface in normal and libtest builds.
+    fn request_finish_stop(
+        &mut self,
+        _lane: &mut AttestedSemanticLane,
+    ) -> Result<(), SemanticRefusal> {
+        Err(SemanticRefusal::Unavailable)
+    }
+    #[allow(dead_code)] // Q observation is not yet called by the inert machine.
+    fn observe_finish_q(
+        &mut self,
+        _lane: &mut AttestedSemanticLane,
+        _grant: Option<&SessionDrainGrant>,
+    ) -> Result<Option<CollectedFinishQ>, SemanticRefusal> {
+        Ok(None)
+    }
+    #[allow(dead_code)] // No terminal native-owner bridge is active yet.
+    fn finish_discovery_domain(&self) -> Result<&DiscoveryDomain, SemanticRefusal> {
+        Err(SemanticRefusal::Unavailable)
+    }
+    #[allow(dead_code)] // The inert port never allocates or polls a Raw.
+    fn collect_raw_at_q(
+        &mut self,
+        _lane: &mut AttestedSemanticLane,
+        _adapter: &mut JournalAdapter,
+        _reserve: &SemanticResourceReserver,
+        _q: &CollectedFinishQ,
+        _capacity: usize,
+        _work: usize,
+    ) -> Result<(RawJointQuantum, Option<DispatchPoll>), RawQuantumRefusal> {
+        Err(RawQuantumRefusal::DispositionMismatch)
+    }
+    #[allow(dead_code)] // The inert port never advances the original cursor.
+    fn continue_raw_at_q(
+        &mut self,
+        _lane: &mut AttestedSemanticLane,
+        _raw: &mut RawJointQuantum,
+        _adapter: &mut JournalAdapter,
+        _q: &CollectedFinishQ,
+        _work: usize,
+    ) -> Result<DispatchPoll, RawQuantumRefusal> {
+        Err(RawQuantumRefusal::DispositionMismatch)
+    }
+    #[allow(dead_code)] // Bounded real Engine service is not implemented yet.
+    fn service_finish_discovery(
+        &mut self,
+        _lane: &mut AttestedSemanticLane,
+        _coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        _q: &CollectedFinishQ,
+        _work: usize,
+    ) -> Result<LaneDrainOutcome, SemanticRefusal> {
+        Err(SemanticRefusal::Unavailable)
+    }
+    #[allow(dead_code)] // No Stop output allowance is invented by this scaffold.
+    fn finish_h0_storage_bytes(
+        &self,
+        _lane: &AttestedSemanticLane,
+        _raw: &RawJointQuantum,
+        _adapter: &JournalAdapter,
+        _q: &CollectedFinishQ,
+    ) -> Result<usize, SemanticRefusal> {
+        Err(SemanticRefusal::ProviderStorage)
+    }
+    #[allow(dead_code)] // Capture.stop and its report remain inactive.
+    fn finish_h0_at_q(
+        &mut self,
+        _lane: &mut AttestedSemanticLane,
+        _coordinator: &InventoryCoordinator<OsProcessSource>,
+        _raw: &mut RawJointQuantum,
+        _q: &CollectedFinishQ,
+        _report: &mut TickReport,
+    ) -> Result<(), SemanticRefusal> {
+        Err(SemanticRefusal::Unavailable)
+    }
     fn collect_raw(
         &mut self,
         lane: &mut AttestedSemanticLane,
@@ -469,6 +547,9 @@ pub(crate) struct LiveJointMachine {
     absence_entry: usize,
     demand: Option<Demand>,
     prepared_base: u64,
+    // A request-attempt latch only; it proves no Q, Stop or publication.
+    // Its inline bytes are included in the existing size_of::<Self>() lease.
+    finish_requested: bool,
     #[cfg(test)]
     refuse_pending_q_merge_once: bool,
     // All original phase buffers and birth leases drop before inline storage.
@@ -502,6 +583,7 @@ impl LiveJointMachine {
             absence_entry: 0,
             demand: None,
             prepared_base: 0,
+            finish_requested: false,
             #[cfg(test)]
             refuse_pending_q_merge_once: false,
             _storage: storage,
@@ -517,6 +599,54 @@ impl LiveJointMachine {
         }
         self.demand = Some(Demand::Requested { engine_changed });
         Ok(())
+    }
+
+    /// Inert request-only scaffold. The test override may request the existing
+    /// admission STOP gate; the normal Session default refuses. No Q, record,
+    /// report, finalizer or publication is consumed here.
+    #[allow(dead_code)] // Ordinary Finish selection is intentionally inactive.
+    pub(crate) fn begin_finish_with_io<I: JointMachineIo>(
+        &mut self,
+        lane: &mut AttestedSemanticLane,
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        io: &mut I,
+    ) -> Result<(), SemanticRefusal> {
+        self.validate_owner(lane, coordinator, io)?;
+        if let RunState::DispositionRequired(reason) = self.state {
+            return Err(reason);
+        }
+        if self.finish_requested {
+            return Err(SemanticRefusal::Unavailable);
+        }
+        // Preserve an attempted error instead of automatically repeating the
+        // native gate callback. This is not a successful Finish disposition.
+        self.finish_requested = true;
+        match io.request_finish_stop(lane) {
+            Ok(()) => Ok(()),
+            Err(reason) => {
+                self.state = RunState::DispositionRequired(reason);
+                Err(reason)
+            }
+        }
+    }
+
+    /// Preserve the request and all original owners without servicing work.
+    #[allow(dead_code)] // The actual terminal machine remains unimplemented.
+    pub(crate) fn poll_finish_with_io<I: JointMachineIo>(
+        &mut self,
+        lane: &mut AttestedSemanticLane,
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        io: &mut I,
+        _budget: &mut JointWorkBudget,
+    ) -> Result<JointCommitProgress, SemanticRefusal> {
+        self.validate_owner(lane, coordinator, io)?;
+        if let RunState::DispositionRequired(reason) = self.state {
+            return Err(reason);
+        }
+        if !self.finish_requested {
+            return Err(SemanticRefusal::Unavailable);
+        }
+        Ok(JointCommitProgress::Pending)
     }
 
     /// Resolve this live Capture's pending originals at actual Q, then transfer
@@ -816,6 +946,30 @@ impl LiveJointMachine {
     pub(crate) fn retained_drain_grant_for_test(&self) -> Option<&SessionDrainGrant> {
         self.grant.as_ref()
     }
+
+    #[cfg(test)]
+    pub(crate) fn finish_stop_ready_for_test(&self) -> bool {
+        false // No final Raw/preparation exists in the inert scaffold.
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_finish_q_for_test(&self) -> Option<&CollectedFinishQ> {
+        None
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_finish_report_for_test(&self) -> Option<(&TickReport, usize)> {
+        None
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_finish_disposition_for_test(&self) -> Option<&DisposedJointQuantum> {
+        None
+    }
+
+    /// Refusal-only hook has no receiver to affect until real output exists.
+    #[cfg(test)]
+    pub(crate) fn reference_refuse_finish_q_merge_once(&mut self) {}
 
     /// Borrow the actual receiver-owned report and its retained lease size.
     #[cfg(test)]

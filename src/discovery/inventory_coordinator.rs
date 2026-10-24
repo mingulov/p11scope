@@ -1022,6 +1022,70 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.engine.tail_stats()
     }
 
+    /// Inert terminal service port. Original rings, FIFO and Engine work stay
+    /// retained; an empty completion word is never returned for unserviced work.
+    #[allow(dead_code)] // Collected Finish has no active terminal/native bridge.
+    pub(crate) fn service_collected_finish_discovery<S: crate::events::BoundedRecordSource>(
+        &mut self,
+        _q: &crate::attach::CollectedFinishQ,
+        _producers: &crate::attach::SessionDrainProducers,
+        _discovery: &mut crate::events::DiscoveryDrain<S>,
+        _staged: &mut crate::attach::DiscoveryStage,
+        _work: usize,
+    ) -> Result<
+        crate::inventory_semantics::LaneDrainOutcome,
+        crate::inventory_semantics::SemanticRefusal,
+    > {
+        Err(crate::inventory_semantics::SemanticRefusal::Unavailable)
+    }
+
+    /// Existing retained Engine work and actual Session FIFO occupancy only.
+    #[cfg(test)]
+    pub(crate) fn reference_collected_finish_discovery_backlog(
+        &self,
+        staged: usize,
+    ) -> (usize, bool) {
+        (
+            self.engine.discovery_held_len(),
+            self.engine.discovery_backlog_pending(staged),
+        )
+    }
+
+    /// Move this decoded fixture input through actual exhausted-frame
+    /// ingestion. No queue entry or successful processing fact is scripted.
+    #[cfg(test)]
+    pub(crate) fn reference_defer_finish_discovery_for_test(
+        &mut self,
+        record: p11scope_ebpf_common::DiscoveryRecord,
+    ) -> Result<()> {
+        self.engine.defer_finish_discovery_for_test(record)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reference_collected_finish_discovery_head_for_test(
+        &self,
+    ) -> Option<(u32, u64, u8)> {
+        self.engine.finish_discovery_head_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reference_finish_exit_subject_for_test(
+        &self,
+        pid: u32,
+        at: u64,
+    ) -> (bool, bool, bool) {
+        self.engine.finish_exit_subject_for_test(pid, at)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reference_unmatched_finish_exit_for_test(&self, pid: u32, at: u64) -> bool {
+        self.engine.unmatched_finish_exit_for_test(pid, at)
+    }
+
+    /// Refusal-only hook: no final publication receiver exists to run yet.
+    #[cfg(test)]
+    pub(crate) fn reference_refuse_joint_finish_publication_once(&mut self) {}
+
     /// Borrow the canonical capture owner without changing its model or
     /// ledger. Collected refresh checks original raw custody through this
     /// same ledger while independently reserving provider storage.

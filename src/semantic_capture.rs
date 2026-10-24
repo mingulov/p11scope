@@ -1978,6 +1978,35 @@ impl SemanticCapture {
         Ok(())
     }
 
+    /// Inert final-Stop bound. No allocation allowance or successful original
+    /// association is invented before the actual Finish implementation.
+    #[allow(dead_code)] // Collected Finish remains inactive in normal and libtest builds.
+    pub(crate) fn collected_stop_at_q_storage_bytes(
+        &self,
+        _quantum: &crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+        _adapter: &JournalAdapter,
+        _producers: &crate::attach::SessionDrainProducers,
+        _discovery: &crate::events::DiscoveryDomain,
+        _q: &crate::attach::CollectedFinishQ,
+    ) -> Result<usize, crate::semantics_objects::journal::joint_driver::RawQuantumRefusal> {
+        Err(crate::semantics_objects::journal::joint_driver::RawQuantumRefusal::DispositionMismatch)
+    }
+
+    /// Refuse before Capture.stop, Raw acknowledgement, report or router
+    /// mutation. The caller retains the same original and output slot.
+    #[allow(dead_code)] // No actual final-Stop consumer is implemented yet.
+    pub(crate) fn stop_collected_at_q(
+        &mut self,
+        _quantum: &mut crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+        _adapter: &JournalAdapter,
+        _producers: &crate::attach::SessionDrainProducers,
+        _discovery: &crate::events::DiscoveryDomain,
+        _q: &crate::attach::CollectedFinishQ,
+        _report: &mut TickReport,
+    ) -> Result<(), crate::semantics_objects::journal::joint_driver::RawQuantumRefusal> {
+        Err(crate::semantics_objects::journal::joint_driver::RawQuantumRefusal::DispositionMismatch)
+    }
+
     /// Normal Session forwarding to the same private Capture operation.
     /// Session/Q association precedes all report allocation or route mutation.
     #[allow(dead_code)] // Pending-at-Q forwarding remains inactive in the ordinary driver.

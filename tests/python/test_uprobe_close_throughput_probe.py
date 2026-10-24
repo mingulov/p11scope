@@ -148,18 +148,19 @@ class TracepointTypeTests(unittest.TestCase):
                 (event / "id").write_text("42\n")
             self.assertFalse((tracefs / "events/uprobes/type").exists())
             seen = []
-            orig = PROBE["perf_event_open"]
+            live = PROBE["create_events"].__globals__
+            orig = live["perf_event_open"]
 
             def stub(uprobe_type, config):
                 seen.append((uprobe_type, config))
                 return 100 + len(seen)
 
-            PROBE["perf_event_open"] = stub
+            live["perf_event_open"] = stub
             try:
                 fds, names = PROBE["create_events"](
                     str(tracefs), group, "/bin/true", [0x1000, 0x1001])
             finally:
-                PROBE["perf_event_open"] = orig
+                live["perf_event_open"] = orig
             self.assertEqual([kind for kind, _ in seen], [2, 2])
             self.assertEqual([config for _, config in seen], [42, 42])
             self.assertEqual(len(fds), 2)
@@ -182,14 +183,15 @@ class UprobeEventsAppendTests(unittest.TestCase):
                 event = tracefs / "events" / group / name
                 event.mkdir(parents=True)
                 (event / "id").write_text("7\n")
-            orig_perf = PROBE["perf_event_open"]
+            live = PROBE["create_events"].__globals__
+            orig_perf = live["perf_event_open"]
             counter = {"n": 0}
 
             def stub_perf(uprobe_type, config):
                 counter["n"] += 1
                 return 200 + counter["n"]
 
-            PROBE["perf_event_open"] = stub_perf
+            live["perf_event_open"] = stub_perf
             real_os_open = os.open
             calls = []
 
@@ -225,7 +227,7 @@ class UprobeEventsAppendTests(unittest.TestCase):
                             str(tracefs), group, "/bin/true", [0x1000, 0x1001])
                         PROBE["delete_probes"](str(tracefs), group, names)
             finally:
-                PROBE["perf_event_open"] = orig_perf
+                live["perf_event_open"] = orig_perf
             self.assertEqual(len(calls), 4)
             for flags in calls:
                 self.assertFalse(flags & os.O_TRUNC)

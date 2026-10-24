@@ -53,6 +53,37 @@ Every line carries the same envelope plus its `kind`-specific `event`:
   cannot hold them; when all three unretained counts are 0, every last
   retained record equals its snapshot row).
 
+- `object_observed` (additive): one object view as the snapshot
+  `objects[]` row verbatim, keyed by capture-local `object`:
+  `{revision, row}`. `revision` is the publication revision of the
+  row's last change; the pass marker's `object_revision` names the
+  current revision, and unchanged rows persist client-side below it.
+- `key_operations_observed` (additive): one proved-key aggregate or
+  unknown-key summary as the snapshot row verbatim:
+  `{revision, bucket, row}` with `bucket` `known` (keyed by instance,
+  object, category, role and metadata label) or `unknown` (keyed by
+  category and reason). A revision bump alone re-emits nothing: rows
+  emit when their row digest changed since the stream last carried
+  them, or when their last record aged out of retention (rotation
+  backstop). Rows never delete and are never summed as deltas; a
+  greater revision replaces an older one. Sessions ride no stream
+  kind: session lifecycle reaches the stream through `object_observed`
+  rows' session attribution.
+  Both object kinds stream change-driven like `edge_observed`: at most
+  4,096 records of both kinds together per commit, first in first
+  out; the rest wait, counted in that commit's
+  `key_operation_events_deferred` (with `key_operation_events`
+  counting the records the commit wrote). The exact sweep before
+  `ended` writes every due or evicted row of both kinds, then settles
+  all four kinds together: `ended.key_operation_events` counts the
+  sweep's records and `ended.key_operations_unretained` the rows
+  whose last record retention deleted (0 unless the retention cannot
+  hold them; when all four unretained counts are 0, every last
+  retained record equals its snapshot row). Row shapes, enums, sort
+  orders and loss vocabulary are defined in [inventory
+  v1](inventory-v1.md#object-observations-additive-within-v1) and the
+  frozen
+  [object_observations schema](inventory-v1-object-observations.schema.json).
 - `started`: `{scope, clock: {basis, unit}, started_ns, limits:
   {callers, modules, edges, endpoints, inventory_endpoints,
   inventory_attach_modules, semantic_state, instance_semantic_resources,
@@ -121,7 +152,12 @@ Every line carries the same envelope plus its `kind`-specific `event`:
   `edge_observed`), plus `instance_events`, `instance_events_deferred`,
   `semantic_edge_events` and `semantic_edge_events_deferred` — the
   same accounting for the two instance kinds under their one shared
-  4,096-row per-commit quota.
+  4,096-row per-commit quota — plus `key_operation_events` and
+  `key_operation_events_deferred`, the same accounting for the two
+  object row kinds under their one shared 4,096-row per-commit quota.
+  Every `pass_committed` also carries `object_revision` (the current
+  object publication revision; unchanged rows persist client-side
+  below it) and `object_status` (that publication's status).
 - `edge_observed`: one edge as the snapshot `edges[]` entry verbatim,
   plus the three derived presentation states `presence`, `capture`,
   `activity` and additive `identity_context` — computed from the same model the dashboard renders,
@@ -290,6 +326,9 @@ never sum successive cumulative records for an edge.
   Its additive `budgets.instance_semantic_resources` is the same immutable
   charge-and-occupancy object as the JSON snapshot, defined in
   [inventory v1](inventory-v1.md#semantic-instances-additive-within-v1).
+  Its additive `object_observations` is the snapshot's
+  `object_observations` section verbatim, defined in [inventory
+  v1](inventory-v1.md#object-observations-additive-within-v1).
 - `rotated`: `{prior_file, prior_events, prior_bytes, rotation_seq}` —
   the new file's first line after every rotation. The boundary is
   explicit: the named prior file exists with exactly `prior_events`
@@ -304,13 +343,16 @@ never sum successive cumulative records for an edge.
 - `ended`: `{ended_ns, passes, budgets, gaps_suppressed, stream:
   {rotations, evicted_events, evicted_bytes}, edge_events,
   edges_unretained, instance_events, instances_unretained,
-  semantic_edge_events, semantic_edges_unretained}` — terminal marker
+  semantic_edge_events, semantic_edges_unretained,
+  key_operation_events, key_operations_unretained}` — terminal marker
   with final budgets plus stream accounting; `edge_events` counts the
   final edge sweep's records and `edges_unretained` the edges whose
   last record retention deleted (0 unless the retention cannot hold
   one record per edge; see `edge_observed`). The instance pairs carry
   the same accounting for the two instance kinds, settled together
-  with the physical edges over the one reserved `ended` line.
+  with the physical edges over the one reserved `ended` line. The
+  key-operation pair carries the same accounting for the two object
+  row kinds, settled together with the other three.
   The semantic resource budget uses this terminal presentation's current
   charges, peak charges, refusals and occupancy; it never recomputes live
   registry state while serializing the event.

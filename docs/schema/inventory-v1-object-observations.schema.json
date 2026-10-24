@@ -66,13 +66,49 @@
         "status": {"enum": ["live", "closed", "lost"]}
       }
     },
-    "metadata_field_scalar": {
+    "metadata_field_class": {
       "type": "object",
       "required": ["status", "value"],
       "additionalProperties": false,
       "properties": {
         "status": {"enum": ["unknown", "value", "conflict", "invalidated"]},
-        "value": {"type": ["integer", "null"], "minimum": 0, "maximum": 65535, "description": "Retained u16 observation (class/key-type/token codes, lengths, modulus bits). Never key material."}
+        "value": {"enum": [0, 1, 2, 3, 4, null], "description": "Retained CKA_CLASS code (0 data, 1 certificate, 2 public_key, 3 private_key, 4 secret_key). Public JSON carries the accepted numeric code; labels are presentation names. Never key material."}
+      }
+    },
+    "metadata_field_key_type": {
+      "type": "object",
+      "required": ["status", "value"],
+      "additionalProperties": false,
+      "properties": {
+        "status": {"enum": ["unknown", "value", "conflict", "invalidated"]},
+        "value": {"enum": [0, 1, 2, 3, 4, 16, 31, 64, 65, null], "description": "Retained CKA_KEY_TYPE code at OASIS numbers (0 rsa, 1 dsa, 2 dh, 3 ec, 4 x9_42_dh, 16 generic_secret, 31 aes, 64 ec_edwards, 65 ec_montgomery). Public JSON carries the accepted numeric code; labels are presentation names. Never key material."}
+      }
+    },
+    "metadata_field_token": {
+      "type": "object",
+      "required": ["status", "value"],
+      "additionalProperties": false,
+      "properties": {
+        "status": {"enum": ["unknown", "value", "conflict", "invalidated"]},
+        "value": {"enum": [0, 1, null], "description": "Retained CKA_TOKEN flag (0 session, 1 token). Never key material."}
+      }
+    },
+    "metadata_field_value_len": {
+      "type": "object",
+      "required": ["status", "value"],
+      "additionalProperties": false,
+      "properties": {
+        "status": {"enum": ["unknown", "value", "conflict", "invalidated"]},
+        "value": {"enum": [16, 24, 32, null], "description": "Retained CKA_VALUE_LEN byte size (AES 128/192/256 bits only with an independently established AES type). Never key material."}
+      }
+    },
+    "metadata_field_modulus_bits": {
+      "type": "object",
+      "required": ["status", "value"],
+      "additionalProperties": false,
+      "properties": {
+        "status": {"enum": ["unknown", "value", "conflict", "invalidated"]},
+        "value": {"enum": [1024, 2048, 3072, 4096, 8192, null], "description": "Retained CKA_MODULUS_BITS size. Modulus and exponent buffers are never read or carried. Never key material."}
       }
     },
     "metadata_field_curve": {
@@ -89,11 +125,11 @@
       "required": ["class", "key_type", "token", "value_len", "modulus_bits", "ec_params"],
       "additionalProperties": false,
       "properties": {
-        "class": {"$ref": "#/$defs/metadata_field_scalar"},
-        "key_type": {"$ref": "#/$defs/metadata_field_scalar"},
-        "token": {"$ref": "#/$defs/metadata_field_scalar"},
-        "value_len": {"$ref": "#/$defs/metadata_field_scalar"},
-        "modulus_bits": {"$ref": "#/$defs/metadata_field_scalar"},
+        "class": {"$ref": "#/$defs/metadata_field_class"},
+        "key_type": {"$ref": "#/$defs/metadata_field_key_type"},
+        "token": {"$ref": "#/$defs/metadata_field_token"},
+        "value_len": {"$ref": "#/$defs/metadata_field_value_len"},
+        "modulus_bits": {"$ref": "#/$defs/metadata_field_modulus_bits"},
         "ec_params": {"$ref": "#/$defs/metadata_field_curve"}
       }
     },

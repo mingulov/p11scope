@@ -308,7 +308,11 @@ and `--manifest` remains the explicit-attestation path for that case.
 Attach takes time to land (seconds for hundreds of probes), and the first
 calls after a `dlopen` can fire before their probes exist — a workload that
 exits in milliseconds can be gone before attach completes, even with
-`--pause auto`. Keep the workload alive past attach (a sleep/hold phase,
+`--pause auto`. Measured FULL-default startup to the `capturing:` line on
+4 vCPUs is ~4–7 s on 6.6+ (6.6.157 4.5–4.9 s, 7.0 6.25–6.6 s) but
+~15–20 s on 5.15/6.1 (6.1.188 16.7–17.4 s, 5.15.221 17.0–20.2 s),
+where the kernel verifies each BPF program load sequentially; plan the
+hold phase accordingly. Keep the workload alive past attach (a sleep/hold phase,
 `LD_PRELOAD=<provider.so>` so the initial scan sees it, or long-lived
 daemons via `profile --pid`). Without `run --pause auto`, expect the
 earliest post-load calls to be absent from the counts; with it, the child

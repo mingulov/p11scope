@@ -1147,3 +1147,309 @@ fn collected_retirement_external_ticket_clone_is_bounded_and_inert() {
     assert_eq!(pool.snapshot(), charged);
     assert!(file.upgrade().is_none());
 }
+
+#[test]
+fn collected_retirement_cancel_before_and_after_first_mutation() {
+    for post_take in [false, true] {
+        let (_dir, _pins, mut native, slots) = collected_case(
+            2,
+            Box::new(|_, _| panic!("untouched cancellation cannot close")),
+        );
+        let q = native.observe_q();
+        let pool = SemanticResourcePool::reference_limit(COLLECTED_POOL_BYTES);
+        let reserve = pool.reserver();
+        let ptr = slots.as_ptr();
+        let mut input = Some(collected_input(
+            slots,
+            reserve.reserve(COLLECTED_INPUT_BYTES).unwrap(),
+        ));
+        let original = native.original_links();
+        let mut ticket = None;
+        for _ in 0..COLLECTED_CREDITS {
+            let progress = native.prepare(&q, &mut input, &reserve, 1).unwrap();
+            assert_eq!(progress.used, 1);
+            if !post_take {
+                break;
+            }
+            if input.is_none() {
+                assert!(matches!(
+                    progress.state,
+                    CollectedRetirementState::Preparing
+                ));
+                ticket = Some(
+                    progress
+                        .ticket
+                        .expect("post-take preparation has a cancel identity"),
+                );
+                break;
+            }
+        }
+        assert_eq!(input.is_none(), post_take);
+        assert_eq!(ticket.is_some(), post_take);
+        let before = (native.reads_and_transfers(), pool.snapshot());
+        let (zero, allocations, _) = crate::test_alloc::count_allocs_during(|| {
+            native.cancel(input.as_ref(), ticket.as_ref(), 0).unwrap()
+        });
+        assert_eq!((zero.used, allocations), (0, 0));
+        assert!(zero.ticket.is_none());
+        assert_eq!((native.reads_and_transfers(), pool.snapshot()), before);
+        let mut returned = None;
+        for _ in 0..COLLECTED_CREDITS {
+            let progress = native.cancel(input.as_ref(), ticket.as_ref(), 1).unwrap();
+            assert_eq!(progress.used, 1);
+            match progress.state {
+                CollectedRetirementState::Yielded if !post_take => break,
+                CollectedRetirementState::Preparing => {}
+                CollectedRetirementState::RefusedUntouched(input) => {
+                    returned = Some(input);
+                    break;
+                }
+                _ => panic!("untouched cancellation lost its original owner"),
+            }
+        }
+        if post_take {
+            input = Some(returned.expect("same input returned after bounded cleanup"));
+        }
+        assert_eq!(input.as_ref().unwrap().removed.as_ptr(), ptr);
+        assert_eq!(native.original_links(), original);
+        assert_eq!(native.native_counts(), (0, 0, 0, 0));
+        assert_eq!(
+            pool.snapshot().charged_bytes,
+            SEMANTIC_TRANSITION_SCRATCH + COLLECTED_INPUT_BYTES
+        );
+        assert!(!native.blocking());
+    }
+
+    let (_dir, _pins, mut native, slots) = collected_case(
+        2,
+        Box::new(|_, _| panic!("first invalidation precedes FD extraction")),
+    );
+    let q = native.observe_q();
+    let pool = SemanticResourcePool::reference_limit(COLLECTED_POOL_BYTES);
+    let reserve = pool.reserver();
+    let mut input = Some(collected_input(
+        slots,
+        reserve.reserve(COLLECTED_INPUT_BYTES).unwrap(),
+    ));
+    let ticket = collected_prepare_to_ticket(&mut native, &q, &mut input, &reserve).unwrap();
+    let links = native.original_links();
+    for _ in 0..COLLECTED_CREDITS {
+        let progress = native.begin(&q, &ticket, 1).unwrap();
+        assert_eq!(progress.used, 1);
+        if native.recorded_generation(0).is_none() {
+            break;
+        }
+        assert_eq!(native.native_counts(), (0, 0, 0, 0));
+    }
+    assert!(native.recorded_generation(0).is_none());
+    assert_eq!(native.original_links().len(), links.len());
+    assert_eq!(native.native_counts(), (0, 0, 0, 0));
+    let charge = pool.snapshot().charged_bytes;
+    let refused = native.cancel(None, Some(&ticket), 1).unwrap();
+    assert!(matches!(
+        refused.state,
+        CollectedRetirementState::RefusedRetained
+    ));
+    assert!(native.blocking());
+    assert_eq!(pool.snapshot().charged_bytes, charge);
+    assert_eq!(native.native_counts(), (0, 0, 0, 0));
+}
+
+#[test]
+fn collected_retirement_foreign_cancel_preserves_active_preparation() {
+    let (_dir, _pins, mut native, slots) =
+        collected_case(2, Box::new(|_, _| panic!("no transfer")));
+    let q = native.observe_q();
+    let pool = SemanticResourcePool::reference_limit(COLLECTED_POOL_BYTES);
+    let reserve = pool.reserver();
+    let mut input = Some(collected_input(
+        slots.clone(),
+        reserve.reserve(COLLECTED_INPUT_BYTES).unwrap(),
+    ));
+    let other = collected_input(slots, reserve.reserve(COLLECTED_INPUT_BYTES).unwrap());
+    native.prepare(&q, &mut input, &reserve, 1).unwrap();
+    let before = pool.snapshot();
+    assert!(native.cancel(Some(&other), None, 1).is_err());
+    assert_eq!(pool.snapshot(), before);
+    assert!(native.blocking());
+    let ticket = collected_prepare_to_ticket(&mut native, &q, &mut input, &reserve).unwrap();
+    assert!(native.cancel(Some(&other), Some(&ticket), 1).is_err());
+    assert!(native.cancel(Some(&other), None, 1).is_err());
+    assert!(native.blocking());
+    collected_submit(&mut native, &q, &ticket);
+    drop(collected_close(&mut native, &q, &ticket));
+    assert!(native.join().completed);
+}
+
+#[test]
+fn collected_retirement_batch_close_precedes_terminal_join() {
+    let (_dir, _pins, mut native, slots) = collected_case(
+        2,
+        Box::new(|owned, _| {
+            drop(owned);
+            Ok(())
+        }),
+    );
+    let q = native.observe_q();
+    let pool = SemanticResourcePool::reference_limit(COLLECTED_POOL_BYTES);
+    let reserve = pool.reserver();
+    let mut input = Some(collected_input(
+        slots,
+        reserve.reserve(COLLECTED_INPUT_BYTES).unwrap(),
+    ));
+    let ticket = collected_prepare_to_ticket(&mut native, &q, &mut input, &reserve).unwrap();
+    collected_submit(&mut native, &q, &ticket);
+    drop(collected_close(&mut native, &q, &ticket));
+    assert!(native.worker().running());
+    assert_eq!(native.native_counts(), (4, 4, 4, 0));
+    assert!(!native.blocking());
+    let receipt = native.join();
+    assert!(receipt.completed);
+    assert_eq!(
+        (receipt.total, receipt.released, receipt.uncertain),
+        (4, 4, 0)
+    );
+    assert_eq!(pool.snapshot().charged_bytes, SEMANTIC_TRANSITION_SCRATCH);
+}
+
+#[test]
+fn collected_retirement_failed_handoff_keeps_files_and_charge() {
+    let (_dir, pins, mut native, slots) =
+        collected_case(2, Box::new(|_, _| panic!("closed worker must refuse")));
+    let file = native.original_file();
+    let q = native.observe_q();
+    let pool = SemanticResourcePool::reference_limit(COLLECTED_POOL_BYTES);
+    let reserve = pool.reserver();
+    let mut input = Some(collected_input(
+        slots,
+        reserve.reserve(COLLECTED_INPUT_BYTES).unwrap(),
+    ));
+    let ticket = collected_prepare_to_ticket(&mut native, &q, &mut input, &reserve).unwrap();
+    for _ in 0..COLLECTED_CREDITS {
+        let progress = native.begin(&q, &ticket, 1).unwrap();
+        assert_eq!(progress.used, 1);
+        if native.recorded_generation(0).is_none() {
+            break;
+        }
+    }
+    assert!(native.recorded_generation(0).is_none());
+    assert_eq!(native.native_counts(), (0, 0, 0, 0));
+    let charged = pool.snapshot().charged_bytes;
+    native.worker().begin_terminal();
+    let mut refused = false;
+    for _ in 0..COLLECTED_CREDITS {
+        let progress = native.begin(&q, &ticket, 1).unwrap();
+        if matches!(progress.state, CollectedRetirementState::RefusedRetained) {
+            refused = true;
+            break;
+        }
+    }
+    assert!(refused);
+    assert!(native.blocking());
+    assert!(file.upgrade().is_some());
+    assert_eq!(pool.snapshot().charged_bytes, charged);
+    drop(pins);
+    drop(native);
+    assert!(
+        file.upgrade().is_some(),
+        "abandoned debt retains provider custody"
+    );
+    assert_eq!(pool.snapshot().charged_bytes, charged);
+}
+
+#[test]
+fn collected_retirement_rank_and_partial_multi_are_exact() {
+    use super::super::cleanup_worker::concurrency_tests::{CloseGate, ReleaseGuard};
+    let gate = Arc::new(CloseGate::default());
+    let closer = Arc::clone(&gate);
+    let returned = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let returns = Arc::clone(&returned);
+    let (_dir, _pins, mut native, slots) = collected_case(
+        2,
+        Box::new(move |owned, producer| {
+            if producer == ProducerProgram::UProbe("p11_entry") {
+                closer.before_close(0);
+                drop(owned);
+                closer.after_close(0);
+            } else {
+                returns.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                drop(owned);
+            }
+            Ok(())
+        }),
+    );
+    native.combine_original_groups();
+    let release = ReleaseGuard(Arc::clone(&gate));
+    let q = native.observe_q();
+    let pool = SemanticResourcePool::reference_limit(COLLECTED_POOL_BYTES);
+    let reserve = pool.reserver();
+    let mut partial = Some(collected_input(
+        vec![slots[0].clone()],
+        reserve.reserve(COLLECTED_INPUT_BYTES).unwrap(),
+    ));
+    let ptr = partial.as_ref().unwrap().removed.as_ptr();
+    let links = native.original_links();
+    let result = collected_prepare_to_ticket(&mut native, &q, &mut partial, &reserve);
+    assert!(result.is_err());
+    assert_eq!(partial.as_ref().unwrap().removed.as_ptr(), ptr);
+    assert_eq!(native.original_links(), links);
+    assert_eq!(native.native_counts(), (0, 0, 0, 0));
+    assert!(
+        !native.blocking(),
+        "untouched partial refusal must release its own fence"
+    );
+    drop(partial);
+    let mut full = Some(collected_input(
+        slots,
+        reserve.reserve(COLLECTED_INPUT_BYTES).unwrap(),
+    ));
+    let ticket = collected_prepare_to_ticket(&mut native, &q, &mut full, &reserve).unwrap();
+    collected_submit(&mut native, &q, &ticket);
+    assert!(gate.wait_for(Duration::from_secs(2), |state| state.started.contains(&0)));
+    assert_eq!(returned.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert!(matches!(
+        native.poll(&q, &ticket, 1).unwrap().state,
+        CollectedRetirementState::Pending
+    ));
+    gate.release_all();
+    drop(collected_close(&mut native, &q, &ticket));
+    assert_eq!(returned.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(native.native_counts(), (2, 2, 2, 0));
+    assert!(native.join().completed);
+    drop(release);
+}
+
+#[test]
+fn collected_retirement_metadata_release_respects_one_credit() {
+    let (_dir, _pins, mut native, slots) = collected_case(
+        4,
+        Box::new(|owned, _| {
+            drop(owned);
+            Ok(())
+        }),
+    );
+    let q = native.observe_q();
+    let pool = SemanticResourcePool::reference_limit(COLLECTED_POOL_BYTES);
+    let reserve = pool.reserver();
+    let mut input = Some(collected_input(
+        slots,
+        reserve.reserve(COLLECTED_INPUT_BYTES).unwrap(),
+    ));
+    let ticket = collected_prepare_to_ticket(&mut native, &q, &mut input, &reserve).unwrap();
+    collected_submit(&mut native, &q, &ticket);
+    wait_for(|| native.native_counts() == (8, 8, 8, 0));
+    let count = native.retained_slots().len();
+    let before = pool.snapshot().charged_bytes;
+    let progress = native.poll(&q, &ticket, 1).unwrap();
+    assert_eq!(progress.used, 1);
+    assert!(matches!(progress.state, CollectedRetirementState::Pending));
+    assert!(native.retained_slots().len() >= count.saturating_sub(1));
+    assert_eq!(
+        pool.snapshot().charged_bytes,
+        before,
+        "backing remains paid throughout disposal"
+    );
+    drop(collected_close(&mut native, &q, &ticket));
+    assert!(native.join().completed);
+    assert_eq!(pool.snapshot().charged_bytes, SEMANTIC_TRANSITION_SCRATCH);
+}

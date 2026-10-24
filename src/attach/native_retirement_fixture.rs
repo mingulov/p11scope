@@ -369,3 +369,57 @@ fn collected_reads<'a>(
         },
     )
 }
+
+// Lifecycle controls share the same original registry/worker, never a new Q.
+impl CollectedRetirementFixture {
+    pub(super) fn cancel(
+        &mut self,
+        input: Option<&RetainedRetirementInput>,
+        ticket: Option<&CollectedRetirementTicket>,
+        work: usize,
+    ) -> Result<RetirementProgress> {
+        self.native
+            .retirement
+            .cancel_collected_with(input, ticket, work)
+    }
+
+    pub(super) fn recorded_generation(&self, slot: u32) -> Option<u64> {
+        self.native.pairs.recorded_generation(slot)
+    }
+
+    pub(super) fn blocking(&self) -> bool {
+        self.native.retirement.blocking()
+    }
+
+    pub(super) fn combine_original_groups(&mut self) {
+        let mut grouped = Vec::new();
+        for program in ["p11_entry", "p11_return"] {
+            let mut members = Vec::new();
+            let mut owned = Vec::new();
+            let mut index = 0;
+            while index < self.native.links.len() {
+                if self.native.links[index].producer()
+                    == super::super::ProducerProgram::UProbe(program)
+                {
+                    let RegisteredLink::MultiUProbe { slots, fds, .. } =
+                        self.native.links.remove(index)
+                    else {
+                        panic!("actual multi fixture ownership")
+                    };
+                    members.extend(slots);
+                    owned.extend(fds);
+                } else {
+                    index += 1;
+                }
+            }
+            grouped.push(RegisteredLink::MultiUProbe {
+                program,
+                slots: members,
+                fds: owned,
+                registration: self.native.pairs.register(),
+            });
+        }
+        assert!(self.native.links.is_empty());
+        self.native.links = grouped;
+    }
+}

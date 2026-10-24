@@ -221,6 +221,18 @@ fn ci_ordinary_jobs_install_no_historical_compiler() {
 fn ci_comparison_job_keeps_the_exact_moved_baseline_calls() {
     let ci = fs::read_to_string(".github/workflows/ci.yml").expect("read ci.yml");
     validate_ci_toolchain_selectors(&ci).unwrap();
+    let header = "\n  bpf-noninterference:\n";
+    assert!(ci.contains(header), "missing comparison job");
+    let renamed = ci.replacen(header, "\n  ordinary-history:\n", 1);
+    assert_ne!(renamed, ci, "renamed comparison must differ");
+    assert!(
+        renamed.contains("\n  ordinary-history:\n"),
+        "renamed comparison must carry the new job name"
+    );
+    assert!(
+        validate_ci_toolchain_selectors(&renamed).is_err(),
+        "a renamed comparison job must be rejected"
+    );
     for marker in [
         "BASELINE=ef896389717739f3859a76f54cf46072cbd1448f",
         "--repeat-baseline",
@@ -241,6 +253,16 @@ fn ci_comparison_job_keeps_the_exact_moved_baseline_calls() {
     assert!(
         validate_ci_toolchain_selectors(&revived).is_err(),
         "a revived host compiler transition must be rejected"
+    );
+    let selector = "      - run: rustup toolchain install 1.98.0 --profile minimal";
+    let injected = ci.replacen(header, &format!("{header}{selector}\n"), 1);
+    assert!(
+        injected.contains(selector),
+        "missing injected unreviewed compiler selector"
+    );
+    assert!(
+        validate_ci_toolchain_selectors(&injected).is_err(),
+        "an unreviewed compiler version must be rejected: {selector}"
     );
 }
 

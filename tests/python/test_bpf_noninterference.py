@@ -561,10 +561,15 @@ class BuildDriverTests(unittest.TestCase):
         self.assertEqual(snapshots[0]["nightly_source"], snapshots[1]["nightly_source"])
         for snapshot in snapshots:
             self.assertEqual(snapshot["host_compiler"]["release"], "1.99.1")
+            remaps = snapshot["build_environment"]["CARGO_ENCODED_RUSTFLAGS"].split("\x1f")
+            self.assertEqual([flag.rsplit("=", 1)[1] for flag in remaps],
+                             ["/p11scope-build"] * 2 + ["/p11scope"] * 2
+                             + ["/cargo"] * 2 + ["/rustup", "/p11scope"])
             for channel in ("1.99.1", "nightly-2026-05-20"):
                 for tool in ("cargo", "rustc"):
                     self.assertIn(channel + "-" + tool, snapshot["tools"])
             self.assertNotIn("1.98.1-cargo", snapshot["tools"])
+            self.assertNotIn("1.98.1-rustc", snapshot["tools"])
         builds = [call for call in self.calls() if call["tool"] == "cargo" and "build" in call["argv"]]
         self.assertEqual(len(builds), 2)
         for build, snapshot in zip(builds, snapshots):

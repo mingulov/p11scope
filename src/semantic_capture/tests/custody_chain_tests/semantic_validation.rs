@@ -18,6 +18,8 @@ use std::rc::Rc;
 mod joint_handoff;
 #[path = "owner_admission.rs"]
 mod owner_admission;
+#[path = "sem1_feed.rs"]
+mod sem1_feed;
 
 struct HeldProviders {
     _dir: tempfile::TempDir,

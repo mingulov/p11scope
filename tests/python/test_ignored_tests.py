@@ -338,6 +338,20 @@ class IgnoredTestsTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn("owner", result.stdout)
 
+    def test_feature_entry_with_whitespace_owner_fails(self):
+        # A whitespace-only owner is refused as blank (not merely as
+        # unknown): pinning the message kills a strip() regression even
+        # though the closed owner set would also reject it.
+        for owner in ("   ", "\t\n"):
+            with self.subTest(owner=owner):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    entry = dict(FEATURE_ENTRY, owner=owner)
+                    write_fixture(root, FEATURE_SOURCES, [entry], [])
+                    result = run_checker(root)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("non-empty owner", result.stdout)
+
     def test_feature_entry_with_other_owner_passes(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -45388,3 +45388,1204 @@ fn collected_plan_cursor_refuses_in_place_mutation_and_missing_ids() {
         .unwrap_err();
     assert!(matches!(err, GraphRefusal::SourceChanged));
 }
+
+/// T4 helper (G23): `count` accepted providers, generalizing
+/// `engine_with_one_accepted_provider`. Each child is accepted under its own
+/// PID scope exactly like the single helper; the engine ends in System scope.
+fn engine_with_accepted_providers(count: usize) -> (Vec<SystemScopeChildGuard>, Engine) {
+    let mut guards = Vec::new();
+    let mut engine = Engine::empty();
+    for index in 0..count {
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        engine.scope = Scope::Pid(child.id());
+        let view = ProcessView::open(ProcessViewId(3 + index as u32), child.id()).unwrap();
+        let modules = child_provider_modules(&view);
+        engine.views.push(view);
+        let pins = pin_test_modules(&engine.views[index], &modules[..1]);
+        let candidate = engine
+            .live_candidate(pins, vec![modules[0].clone()], Vec::new())
+            .unwrap();
+        let mut session = ScriptedSession::default();
+        let mut additions = true;
+        let outcome = engine
+            .apply_candidate(&mut session, candidate, &mut additions, false, &[])
+            .unwrap();
+        assert!(outcome.accepted(), "provider {index} is accepted whole");
+        guards.push(SystemScopeChildGuard::new(child));
+    }
+    engine.next_view_id = engine.next_view_id.max(3 + count as u32);
+    engine.scope = Scope::System;
+    assert_eq!(engine.views.len(), count);
+    (guards, engine)
+}
+
+#[test]
+fn collected_graph_barrier_fences_records_and_assessments() {
+    // First half: a live graph fences a queued record and a pending
+    // assessment; both advance in original order after Done.
+    let (child, mut engine, _) = engine_with_one_accepted_provider();
+    let _accepted = SystemScopeChildGuard::new(child);
+    engine.scope = Scope::System;
+    let view = engine.views[0].id();
+    let mut session = ScriptedSession::default();
+    assert!(
+        engine
+            .retirement_intents
+            .insert(view, RetirementCause::ExpectedRemoval)
+            .is_none()
+    );
+    assert!(engine.ready_expected_removals.insert(view));
+    // Credit 1: the named intent requests the graph.
+    let first = engine
+        .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+        .unwrap();
+    assert!(first.pending);
+    assert!(engine.collected_graph_requested);
+    assert_eq!(engine.collected_graphs_created, 0);
+    // Drive until the graph reaches Pins.
+    for _ in 0..8 {
+        if engine
+            .collected_graph
+            .as_ref()
+            .is_some_and(|graph| graph.phase == GraphPhase::Pins)
+        {
+            break;
+        }
+        engine
+            .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+            .unwrap();
+    }
+    assert!(
+        engine
+            .collected_graph
+            .as_ref()
+            .is_some_and(|graph| graph.phase == GraphPhase::Pins),
+        "the graph must reach Pins"
+    );
+    assert_eq!(engine.collected_graphs_created, 1);
+    // Two unnamed views: W's exit is already a pending assessment, U's exit
+    // arrives as a record while the graph lives.
+    let w_child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let u_child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let w = ProcessView::open(ProcessViewId(4), w_child.id()).unwrap();
+    let u = ProcessView::open(ProcessViewId(5), u_child.id()).unwrap();
+    let (w_id, u_id) = (w.id(), u.id());
+    engine.views.push(w);
+    engine.views.push(u);
+    let mut w_guard = SystemScopeChildGuard::new(w_child);
+    let mut u_guard = SystemScopeChildGuard::new(u_child);
+    assert!(
+        engine
+            .dispatch_lifecycle_record(
+                &mut session,
+                &collected_finish_leader_exit(w_guard.pid()),
+                &mut PendingViewRetirements::new()
+            )
+            .is_none()
+    );
+    assert!(engine.pending_leader_exit_views.contains(&w_id));
+    w_guard.reap().unwrap();
+    u_guard.reap().unwrap();
+    // The record queues behind the live graph instead of dispatching.
+    engine
+        .service_collected_finish_records(
+            &mut session,
+            vec![collected_finish_leader_exit(u_guard.pid())],
+            0,
+            1,
+        )
+        .unwrap();
+    assert_eq!(engine.pending_discovery_records.len(), 1);
+    assert!(engine.pending_leader_exit_views.contains(&w_id));
+    assert!(!engine.pending_leader_exit_views.contains(&u_id));
+    // Neither advances until Done.
+    let mut done = false;
+    for _ in 0..32 {
+        engine
+            .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+            .unwrap();
+        if engine.collected_graph.is_none() {
+            done = true;
+            break;
+        }
+        assert_eq!(engine.pending_discovery_records.len(), 1);
+        assert!(engine.pending_leader_exit_views.contains(&w_id));
+        assert!(!engine.pending_leader_exit_views.contains(&u_id));
+        assert_eq!(engine.collected_graphs_created, 1);
+    }
+    assert!(done, "the graph must reach Done");
+    assert_eq!(engine.pending_discovery_records.len(), 1);
+    assert!(engine.pending_leader_exit_views.contains(&w_id));
+    // After Done the record dispatches first, queueing U's assessment behind W's.
+    engine
+        .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+        .unwrap();
+    assert!(engine.pending_discovery_records.is_empty());
+    assert!(engine.pending_leader_exit_views.contains(&w_id));
+    assert!(engine.pending_leader_exit_views.contains(&u_id));
+    assert_eq!(engine.collected_graphs_created, 1);
+    // Then the assessments settle in original order: W before U.
+    engine
+        .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+        .unwrap();
+    assert_eq!(engine.collected_finish_assessment_after, Some(w_id));
+    assert!(!engine.pending_leader_exit_views.contains(&w_id));
+    assert!(engine.pending_leader_exit_views.contains(&u_id));
+    assert!(engine.retirement_intents.contains_key(&w_id));
+    engine
+        .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+        .unwrap();
+    assert!(!engine.pending_leader_exit_views.contains(&u_id));
+    assert!(engine.retirement_intents.contains_key(&u_id));
+    assert!(engine.pending_leader_exit_views.is_empty());
+    assert_eq!(engine.collected_graphs_created, 1);
+
+    // Second half: a requested-but-uncreated graph lets a queued record
+    // dispatch first and is created on the first credit with an empty queue,
+    // no pending assessment and no open journal/batch.
+    let w_child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let u_child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let w_pid = w_child.id();
+    let u_pid = u_child.id();
+    let mut second = lifecycle_discovered(vec![
+        ProcessView::open(ProcessViewId(4), w_pid).unwrap(),
+        ProcessView::open(ProcessViewId(5), u_pid).unwrap(),
+    ]);
+    second.scope = Scope::System;
+    let mut guards = vec![
+        SystemScopeChildGuard::new(w_child),
+        SystemScopeChildGuard::new(u_child),
+    ];
+    let mut session = ScriptedSession::default();
+    assert!(
+        second
+            .dispatch_lifecycle_record(
+                &mut session,
+                &collected_finish_leader_exit(w_pid),
+                &mut PendingViewRetirements::new()
+            )
+            .is_none()
+    );
+    second
+        .pending_discovery_records
+        .push(QueuedDiscoveryRecord {
+            record: collected_finish_leader_exit(u_pid),
+            terminal_owner: None,
+            terminal_exports: Vec::new(),
+        });
+    second.collected_graph_requested = true;
+    for guard in &mut guards {
+        guard.reap().unwrap();
+    }
+    // Credit 1: the queued record dispatches; no creation with work queued.
+    second
+        .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+        .unwrap();
+    assert!(second.pending_discovery_records.is_empty());
+    assert_eq!(second.pending_leader_exit_views.len(), 2);
+    assert_eq!(second.collected_graphs_created, 0);
+    // Credits 2-3: the assessments settle; intents do not block creation,
+    // but pending assessments do.
+    second
+        .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+        .unwrap();
+    assert_eq!(second.pending_leader_exit_views.len(), 1);
+    assert_eq!(second.collected_graphs_created, 0);
+    second
+        .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+        .unwrap();
+    assert!(second.pending_leader_exit_views.is_empty());
+    assert!(!second.retirement_intents.is_empty());
+    assert_eq!(second.collected_graphs_created, 0);
+    // Credit 4: the first all-clear credit creates the graph.
+    assert!(second.terminal_journal.is_none());
+    assert!(second.terminal_batch.is_none());
+    second
+        .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+        .unwrap();
+    assert_eq!(second.collected_graphs_created, 1);
+    assert!(
+        second
+            .collected_graph
+            .as_ref()
+            .is_some_and(|graph| graph.phase == GraphPhase::Intake)
+    );
+}
+
+#[test]
+fn collected_graph_intake_selects_ready_intent_only() {
+    let mut case = CollectedFinishGraphCase::new(false);
+    assert!(
+        case.engine
+            .retirement_intents
+            .insert(case.view, RetirementCause::ExpectedRemoval)
+            .is_none()
+    );
+    assert!(case.engine.ready_expected_removals.insert(case.view));
+    let first = case.service(1);
+    assert!(first.pending);
+    assert!(case.engine.collected_graph_requested);
+    assert_eq!(case.engine.collected_graphs_created, 0);
+    let second = case.service(1);
+    assert!(second.pending);
+    assert_eq!(case.engine.collected_graphs_created, 1);
+    assert!(
+        case.engine
+            .collected_graph
+            .as_ref()
+            .is_some_and(|graph| graph.phase == GraphPhase::Intake)
+    );
+    assert!(case.engine.pending_retirements.contains(&case.view));
+    assert!(case.engine.retirement_intents.contains_key(&case.view));
+    case.assert_original_pending();
+    let third = case.service(1);
+    assert!(third.pending);
+    assert!(case.engine.pending_retirements.contains(&case.view));
+    assert!(case.engine.retirement_intents.contains_key(&case.view));
+    case.assert_original_pending();
+}
+
+#[test]
+fn collected_graph_native_error_is_contained() {
+    // No-carrier prepare: the error is contained as RefusedUntouched with one
+    // disclosure; later credits stay Ok and pending.
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    let storage = engine
+        .collected_test_pool
+        .reserve(
+            std::mem::size_of::<CollectedGraph>()
+                + crate::semantics_edge::resources::OWNED_ALLOCATION_PADDING,
+        )
+        .unwrap();
+    let input = RetainedRetirementInput::from_reserved_removed(
+        Vec::new(),
+        engine.collected_test_pool.reserve(64).unwrap(),
+    )
+    .unwrap();
+    let mut graph = CollectedGraph::new(storage);
+    graph.phase = GraphPhase::NativePrepare;
+    graph.removed = Some(input);
+    engine.collected_graph = Some(Box::new(graph));
+    let mut session = ScriptedSession::default();
+    let outcome = engine
+        .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+        .unwrap();
+    assert!(outcome.pending);
+    assert_eq!(
+        engine
+            .collected_graph
+            .as_ref()
+            .expect("refused graph stays boxed")
+            .verdict,
+        Some(Verdict::RefusedUntouched)
+    );
+    assert_eq!(
+        engine.collected_graph_refused(),
+        Some("terminal graph refused before native mutation")
+    );
+    assert!(engine.counters.object_skips.iter().any(|skip| {
+        skip.subject == "collected native retirement"
+            && skip.reason
+                == "the original removal was refused before native mutation; originals remain owned"
+    }));
+    let again = engine
+        .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+        .unwrap();
+    assert!(again.pending);
+    assert_eq!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .filter(|skip| skip.subject == "collected native retirement")
+            .count(),
+        1
+    );
+
+    // Post-mutation poll error: RefusedRetained with the G4 disclosure. The
+    // ticket comes from a real fixture preparation; the staged session has no
+    // carrier, so the poll fails after the mutation was recorded.
+    let (child, mut engine, _) = engine_with_one_accepted_provider();
+    let _accepted = SystemScopeChildGuard::new(child);
+    engine.scope = Scope::System;
+    let mut fixture = crate::attach::RetirementFixture::new_collected(
+        &engine.plan.slots,
+        &engine.pinned,
+        Box::new(|owned, _| {
+            drop(owned);
+            Ok(())
+        }),
+    );
+    let reserve = engine.collected_test_pool.reserver();
+    let measure = crate::attach::RetainedInputMeasure::new(engine.plan.slots.len()).unwrap();
+    let mut input = Some(
+        RetainedRetirementInput::from_reserved_removed(
+            engine.plan.slots.clone(),
+            reserve.reserve(measure.bytes()).unwrap(),
+        )
+        .unwrap(),
+    );
+    let mut ticket = None;
+    for _ in 0..64 {
+        let progress = fixture.collected_prepare(&mut input, &reserve, 1).unwrap();
+        match progress.state {
+            crate::attach::CollectedRetirementState::Preparing => {}
+            crate::attach::CollectedRetirementState::Prepared(ready) => {
+                ticket = Some(ready);
+                break;
+            }
+            _ => panic!("unexpected preparation phase"),
+        }
+    }
+    let ticket = ticket.expect("fixture preparation must reach Prepared");
+    drop(fixture);
+    let storage = engine
+        .collected_test_pool
+        .reserve(
+            std::mem::size_of::<CollectedGraph>()
+                + crate::semantics_edge::resources::OWNED_ALLOCATION_PADDING,
+        )
+        .unwrap();
+    let mut graph = CollectedGraph::new(storage);
+    graph.phase = GraphPhase::NativePoll;
+    graph.ticket = Some(ticket);
+    graph.mutated = true;
+    engine.collected_graph = Some(Box::new(graph));
+    let mut session = ScriptedSession::default();
+    let outcome = engine
+        .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+        .unwrap();
+    assert!(outcome.pending);
+    assert_eq!(
+        engine
+            .collected_graph
+            .as_ref()
+            .expect("refused graph stays boxed")
+            .verdict,
+        Some(Verdict::RefusedRetained)
+    );
+    assert_eq!(
+        engine.collected_graph_refused(),
+        Some("native ownership uncertain")
+    );
+    assert!(engine.counters.object_skips.iter().any(|skip| {
+        skip.subject == "global native retirement"
+            && skip.reason
+                == "original static ownership remains uncertain; replacement admission is blocked"
+    }));
+    let again = engine
+        .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+        .unwrap();
+    assert!(again.pending);
+    assert_eq!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .filter(|skip| skip.subject == "global native retirement")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn collected_graph_exec_refresh_is_disposed_once() {
+    let (child, mut engine, _) = engine_with_one_accepted_provider();
+    let _accepted = SystemScopeChildGuard::new(child);
+    engine.scope = Scope::System;
+    let view = engine.views[0].id();
+    let mut session = ScriptedSession::default();
+    assert!(
+        engine
+            .retirement_intents
+            .insert(view, RetirementCause::ExecRefresh)
+            .is_none()
+    );
+    assert!(engine.refresh_requested.is_empty());
+    let first = engine
+        .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+        .unwrap();
+    assert!(first.pending);
+    assert!(engine.collected_graph_requested);
+    let second = engine
+        .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+        .unwrap();
+    assert!(second.pending);
+    assert!(!engine.retirement_intents.contains_key(&view));
+    assert!(engine.views.iter().any(|owner| owner.id() == view));
+    assert!(!engine.pending_retirements.contains(&view));
+    assert!(engine.refresh_requested.is_empty());
+    assert!(engine.counters.object_skips.iter().any(|skip| {
+        skip.subject == "live discovery lifecycle"
+            && skip.reason == "an exec refresh observed before the terminal stop was not rescanned"
+    }));
+    // Exactly one disclosure even after more credits.
+    for _ in 0..4 {
+        engine
+            .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+            .unwrap();
+    }
+    assert_eq!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .filter(|skip| {
+                skip.subject == "live discovery lifecycle"
+                    && skip.reason
+                        == "an exec refresh observed before the terminal stop was not rescanned"
+            })
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn exec_refresh_outside_finish_still_requests_refresh() {
+    // The G15 twin: outside collected Finish the same EXEC queues a refresh
+    // for its pid (mirrors `collected_finish_incomplete_terminal_route`'s
+    // EXEC dispatch). Pinning twin: the ordinary path is untouched by T4.
+    let pid = std::process::id();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Pid(pid);
+    let (view, _owner) = attach_live_loader_context(&mut engine, pid);
+    let mut session = ScriptedSession::default();
+    let mut pending = PendingViewRetirements::new();
+    assert_eq!(
+        engine.dispatch_lifecycle_record(&mut session, &exec_record_for(pid), &mut pending),
+        Some(view)
+    );
+    assert_eq!(
+        engine.retirement_intents.get(&view),
+        Some(&RetirementCause::ExecRefresh)
+    );
+    assert!(engine.refresh_requested.contains_key(&pid));
+}
+
+#[test]
+fn collected_graph_rejection_only_requests_graph() {
+    let (child, mut engine, _) = engine_with_one_accepted_provider();
+    let _accepted = SystemScopeChildGuard::new(child);
+    engine.scope = Scope::System;
+    let object = engine.plan.slots[0].object;
+    let key = engine.pinned.summary(object).unwrap().key;
+    assert!(engine.pending_rejected_keys.insert(key));
+    let mut session = ScriptedSession::default();
+    // First credit: only rejected keys set the request and report progress.
+    let first = engine
+        .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+        .unwrap();
+    assert!(first.pending);
+    assert!(first.progressed);
+    assert!(engine.collected_graph_requested);
+    assert_eq!(engine.collected_graphs_created, 0);
+    // Next credit: the barrier creates the graph.
+    let second = engine
+        .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+        .unwrap();
+    assert!(second.pending);
+    assert_eq!(engine.collected_graphs_created, 1);
+    assert!(
+        engine
+            .collected_graph
+            .as_ref()
+            .is_some_and(|graph| graph.phase == GraphPhase::Freeze)
+    );
+    assert!(engine.pending_rejected_keys.contains(&key));
+}
+
+#[test]
+fn collected_graph_unready_intent_is_disposed_once_at_q() {
+    // Ok(false): a live (unexited) named view is disposed once with the OD-7
+    // count, and Finish drains afterwards.
+    let (child, mut engine, _) = engine_with_one_accepted_provider();
+    let _accepted = SystemScopeChildGuard::new(child);
+    engine.scope = Scope::System;
+    let view = engine.views[0].id();
+    assert_eq!(engine.views[0].original_exited(), Ok(false));
+    let mut session = ScriptedSession::default();
+    assert!(
+        engine
+            .retirement_intents
+            .insert(view, RetirementCause::ExpectedRemoval)
+            .is_none()
+    );
+    engine
+        .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+        .unwrap();
+    assert!(engine.collected_graph_requested);
+    engine
+        .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+        .unwrap();
+    assert!(!engine.retirement_intents.contains_key(&view));
+    assert!(engine.views.iter().any(|owner| owner.id() == view));
+    assert!(!engine.pending_retirements.contains(&view));
+    let mut saw_skip = false;
+    let mut drained = false;
+    for _ in 0..64 {
+        let outcome = engine
+            .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+            .unwrap();
+        if engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live discovery lifecycle"
+                && skip.reason.starts_with("1 retirements not proven")
+        }) {
+            saw_skip = true;
+        }
+        if !outcome.pending {
+            drained = true;
+            break;
+        }
+    }
+    assert!(saw_skip, "OD-7 must disclose the unproven count once");
+    assert_eq!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .filter(|skip| {
+                skip.subject == "live discovery lifecycle"
+                    && skip.reason.starts_with("1 retirements not proven")
+            })
+            .count(),
+        1
+    );
+    assert!(drained, "Finish drains after the unproven disposal");
+
+    // Err: no live pin can stage a failing exit read, so the factored Intake
+    // readiness arm runs with an injected failure; the loss text, the count
+    // disclosure and the drain stay on the real path.
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    let probe = ProcessView::open(ProcessViewId(3), std::process::id()).unwrap();
+    let probe_id = probe.id();
+    engine.views.push(probe);
+    assert!(
+        engine
+            .retirement_intents
+            .insert(probe_id, RetirementCause::ExpectedRemoval)
+            .is_none()
+    );
+    let storage = engine
+        .collected_test_pool
+        .reserve(
+            std::mem::size_of::<CollectedGraph>()
+                + crate::semantics_edge::resources::OWNED_ALLOCATION_PADDING,
+        )
+        .unwrap();
+    let mut graph = CollectedGraph::new(storage);
+    graph.phase = GraphPhase::Intake;
+    engine.collected_graph = Some(Box::new(graph));
+    let mut graph = engine.collected_graph.take().expect("staged graph");
+    engine.settle_intake_ready(
+        &mut graph,
+        probe_id,
+        Err("injected pin failure".to_string()),
+    );
+    engine.collected_graph = Some(graph);
+    assert!(!engine.retirement_intents.contains_key(&probe_id));
+    assert!(engine.views.iter().any(|owner| owner.id() == probe_id));
+    assert!(!engine.pending_retirements.contains(&probe_id));
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live discovery lifecycle"
+                && skip.reason
+                    == "the original process pin could not prove expected exit; retirement remains queued: injected pin failure"
+        })
+    );
+    let mut session = ScriptedSession::default();
+    let mut saw_skip = false;
+    let mut drained = false;
+    for _ in 0..64 {
+        let outcome = engine
+            .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+            .unwrap();
+        if engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live discovery lifecycle"
+                && skip.reason.starts_with("1 retirements not proven")
+        }) {
+            saw_skip = true;
+        }
+        if !outcome.pending {
+            drained = true;
+            break;
+        }
+    }
+    assert!(saw_skip, "OD-7 must disclose the unproven count once");
+    assert_eq!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .filter(|skip| {
+                skip.subject == "live discovery lifecycle"
+                    && skip.reason.starts_with("1 retirements not proven")
+            })
+            .count(),
+        1
+    );
+    assert!(drained, "Finish drains after the unproven disposal");
+}
+
+#[test]
+fn collected_graph_empty_selection_finishes_without_copy() {
+    let (child, mut engine, _) = engine_with_one_accepted_provider();
+    let _accepted = SystemScopeChildGuard::new(child);
+    engine.scope = Scope::System;
+    let revision = engine.pinned.revision();
+    let publishes = engine.tail_publishes;
+    engine.collected_graph_requested = true;
+    let mut session = ScriptedSession::default();
+    let mut done_changed = None;
+    for _ in 0..32 {
+        let outcome = engine
+            .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+            .unwrap();
+        if engine.collected_graph.is_none() && engine.collected_graphs_created == 1 {
+            done_changed = Some(outcome.changed);
+            break;
+        }
+    }
+    assert_eq!(
+        done_changed,
+        Some(false),
+        "Done reports changed only after Install"
+    );
+    assert_eq!(engine.collected_graphs_created, 1);
+    assert_eq!(engine.pinned.revision(), revision);
+    assert_eq!(engine.tail_publishes, publishes);
+}
+
+#[test]
+fn collected_graph_one_graph_for_many_exit_records() {
+    let (mut guards, mut engine) = engine_with_accepted_providers(64);
+    // Identical test binaries dedup to one module, so only the last view
+    // would stay named; stand every view's provider diversity in with a
+    // keyed scan input each (a real system-scale Finish names every view).
+    for index in 0..64u32 {
+        assert!(
+            engine
+                .scan_inputs
+                .insert(
+                    ProcessViewId(3 + index),
+                    ScanInput {
+                        modules: Vec::new(),
+                        pins: PinnedObjects::empty(),
+                        counters: DiscoveryCounters::default(),
+                    },
+                )
+                .is_none()
+        );
+    }
+    let mut session = ScriptedSession::default();
+    engine.update_counter_snapshot(&session).unwrap();
+    for guard in &guards {
+        assert!(
+            engine
+                .dispatch_lifecycle_record(
+                    &mut session,
+                    &collected_finish_leader_exit(guard.pid()),
+                    &mut PendingViewRetirements::new()
+                )
+                .is_none()
+        );
+    }
+    assert_eq!(engine.pending_leader_exit_views.len(), 64);
+    for guard in &mut guards {
+        guard.reap().unwrap();
+    }
+    let mut drained = false;
+    for _ in 0..512 {
+        let outcome = engine
+            .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+            .unwrap();
+        if !outcome.pending {
+            drained = true;
+            break;
+        }
+    }
+    eprintln!(
+        "g23 interim: drained={drained} graphs={} intake={} views={} intents={}",
+        engine.collected_graphs_created,
+        engine.collected_intake_intents,
+        engine.views.len(),
+        engine.retirement_intents.len()
+    );
+    assert!(drained, "one graph must retire all 64 views and drain");
+    assert_eq!(engine.collected_graphs_created, 1);
+    assert!(engine.views.is_empty());
+    assert_eq!(engine.collected_intake_intents, 64);
+}
+
+#[test]
+fn collected_finish_unproven_leader_exit_is_written_off_after_two_clean_passes() {
+    let guards = e06_spawn_sleeps(2);
+    let originals: Vec<_> = guards
+        .iter()
+        .enumerate()
+        .map(|(index, guard)| ProcessView::open(ProcessViewId(index as u32), guard.pid()).unwrap())
+        .collect();
+    let views: Vec<_> = originals.iter().map(ProcessView::id).collect();
+    let mut engine = lifecycle_discovered(originals);
+    engine.scope = Scope::System;
+    let mut session = ScriptedSession::default();
+    engine.update_counter_snapshot(&session).unwrap();
+    for guard in &guards {
+        assert!(
+            engine
+                .dispatch_lifecycle_record(
+                    &mut session,
+                    &collected_finish_leader_exit(guard.pid()),
+                    &mut PendingViewRetirements::new()
+                )
+                .is_none()
+        );
+    }
+    assert_eq!(engine.pending_leader_exit_views.len(), 2);
+    let retained = std::mem::take(&mut engine.views);
+    // Pass 1: both views stay pending without loss.
+    for _ in 0..2 {
+        let outcome = engine
+            .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+            .unwrap();
+        assert!(outcome.pending);
+        assert!(outcome.progressed);
+        assert_eq!(engine.pending_leader_exit_views.len(), 2);
+        assert_eq!(engine.task_uprobe_link_losses, 0);
+    }
+    // First clean pass completes: still pending, still no loss.
+    let outcome = engine
+        .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+        .unwrap();
+    assert!(outcome.pending);
+    assert_eq!(engine.collected_assessment_lap.clean, 1);
+    assert_eq!(engine.pending_leader_exit_views.len(), 2);
+    assert_eq!(engine.task_uprobe_link_losses, 0);
+    // Second pass in progress: still no write-off.
+    let outcome = engine
+        .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+        .unwrap();
+    assert!(outcome.pending);
+    assert_eq!(engine.pending_leader_exit_views.len(), 2);
+    assert_eq!(engine.task_uprobe_link_losses, 0);
+    // Second clean pass completes: one view per credit is written off.
+    let first = views[0];
+    let outcome = engine
+        .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+        .unwrap();
+    assert!(outcome.pending);
+    assert_eq!(engine.collected_assessment_lap.clean, 2);
+    assert!(!engine.pending_leader_exit_views.contains(&first));
+    assert!(!engine.pending_leader_exit_order.contains_key(&first));
+    assert!(!engine.retirement_intents.contains_key(&first));
+    assert!(engine.counted_leader_exit_views.contains(&first));
+    assert_eq!(engine.task_uprobe_link_losses, 1);
+    let outcome = engine
+        .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+        .unwrap();
+    assert!(!outcome.pending);
+    assert!(engine.pending_leader_exit_views.is_empty());
+    assert!(engine.pending_leader_exit_order.is_empty());
+    assert!(engine.retirement_intents.is_empty());
+    assert_eq!(engine.task_uprobe_link_losses, 2);
+    // The write-off never touches the views themselves.
+    engine.views = retained;
+    assert_eq!(engine.views.len(), 2);
+
+    // Third check: with transport blocked no pass is clean.
+    let guards = e06_spawn_sleeps(1);
+    let view = ProcessView::open(ProcessViewId(0), guards[0].pid()).unwrap();
+    let mut engine = lifecycle_discovered(vec![view]);
+    engine.scope = Scope::System;
+    let mut session = ScriptedSession::default();
+    engine.update_counter_snapshot(&session).unwrap();
+    assert!(
+        engine
+            .dispatch_lifecycle_record(
+                &mut session,
+                &collected_finish_leader_exit(guards[0].pid()),
+                &mut PendingViewRetirements::new()
+            )
+            .is_none()
+    );
+    let _hidden = std::mem::take(&mut engine.views);
+    engine.collected_test_transport_pending = true;
+    for _ in 0..8 {
+        let outcome = engine
+            .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+            .unwrap();
+        assert!(outcome.pending);
+    }
+    assert_eq!(engine.collected_assessment_lap.clean, 0);
+    assert_eq!(engine.pending_leader_exit_views.len(), 1);
+    assert_eq!(engine.task_uprobe_link_losses, 0);
+    assert!(
+        engine.collected_finish_assessment_after.is_some(),
+        "laps ran but never cleaned"
+    );
+}
+
+#[test]
+fn collected_finish_second_clean_pass_retires_restored_leader_exit() {
+    // The G25 twin: the control's pattern
+    // (`collected_finish_services_matched_leader_exit_assessments`), hidden
+    // for the first pass, restored and reaped before the second.
+    let mut guards = e06_spawn_sleeps(2);
+    let originals: Vec<_> = guards
+        .iter()
+        .enumerate()
+        .map(|(index, guard)| ProcessView::open(ProcessViewId(index as u32), guard.pid()).unwrap())
+        .collect();
+    let views: Vec<_> = originals.iter().map(ProcessView::id).collect();
+    let mut engine = lifecycle_discovered(originals);
+    engine.scope = Scope::System;
+    let mut session = ScriptedSession::default();
+    engine.update_counter_snapshot(&session).unwrap();
+    for guard in &guards {
+        assert!(
+            engine
+                .dispatch_lifecycle_record(
+                    &mut session,
+                    &collected_finish_leader_exit(guard.pid()),
+                    &mut PendingViewRetirements::new()
+                )
+                .is_none()
+        );
+    }
+    assert_eq!(engine.pending_leader_exit_views.len(), 2);
+    let retained = std::mem::take(&mut engine.views);
+    for _ in 0..2 {
+        let outcome = engine
+            .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+            .unwrap();
+        assert!(outcome.pending);
+        assert_eq!(engine.pending_leader_exit_views.len(), 2);
+        assert_eq!(engine.task_uprobe_link_losses, 0);
+    }
+    engine.views = retained;
+    for guard in &mut guards {
+        guard.reap().unwrap();
+    }
+    assert!(
+        engine
+            .views
+            .iter()
+            .all(|view| view.original_exited() == Ok(true))
+    );
+    let scans = engine.deep_scans;
+    let mut completed = false;
+    for _ in 0..32 {
+        let outcome = engine
+            .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+            .unwrap();
+        if !outcome.pending {
+            completed = true;
+            break;
+        }
+    }
+    assert!(
+        completed,
+        "the restored exits must retire on the second pass"
+    );
+    assert!(engine.pending_leader_exit_views.is_empty());
+    assert!(engine.pending_leader_exit_order.is_empty());
+    assert!(
+        engine
+            .views
+            .iter()
+            .all(|owner| !views.contains(&owner.id()))
+    );
+    assert!(!engine.expected_target_exit());
+    assert_eq!(engine.task_uprobe_link_losses, 0);
+    assert_eq!(engine.deep_scans, scans);
+    assert!(session.attached_slots.is_empty() && session.dynamic_attach_calls.is_empty());
+    assert!(
+        engine.retired_view_ids.is_empty(),
+        "no ID returns to the free list at Q"
+    );
+    let quiet = engine
+        .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+        .unwrap();
+    assert!(!quiet.pending && !quiet.progressed);
+}
+
+#[test]
+fn collected_finish_sticky_counters_invalidate_once() {
+    let mut engine = Engine::empty();
+    let mut session = ScriptedSession::default();
+    session.counters.ring_loss = 1;
+    let before = engine.facts_revision;
+    for _ in 0..8 {
+        engine
+            .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+            .unwrap();
+    }
+    assert_eq!(engine.facts_revision, before + 1);
+    assert_eq!(engine.counter_snapshot.ring_loss, 1);
+    assert_eq!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .filter(|skip| skip.subject == "live discovery transport")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn collected_finish_names_check_is_bounded() {
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    let view = ProcessViewId(7);
+    let other = ProcessViewId(9);
+    let generation = std::num::NonZeroU64::new(1).unwrap();
+    for id in 1u64..=130 {
+        assert!(
+            engine
+                .selection_bindings
+                .insert(
+                    id,
+                    SelectionBindingFact {
+                        id,
+                        context: LoaderContextId::from_case_id(1),
+                        view: other,
+                        object: PinnedObjectId(1),
+                        file_offset: 0,
+                        hook_id: 0,
+                        abi: HookAbi::Interface,
+                        attached: true,
+                        retired: false,
+                        provider: plan::ModuleId(0),
+                        observed: false,
+                        coverage: SelectionCoverageState::OwnedOpen(generation),
+                    },
+                )
+                .is_none()
+        );
+    }
+    assert!(engine.pending_retirements.insert(view));
+    let mut session = ScriptedSession::default();
+    let outcome = engine
+        .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+        .unwrap();
+    assert!(outcome.pending);
+    assert!(outcome.progressed);
+    assert!(engine.collected_graph_requested);
+    assert_eq!(engine.collected_graphs_created, 0);
+    assert!(engine.names_inspected_for_test() <= GRAPH_STRIDE);
+}
+
+#[test]
+fn collected_finish_names_check_small_world_settles_without_graph() {
+    // The names twin: with three bindings the check scans them all, finds the
+    // retirement unreferenced, and settles it in one credit with no graph.
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    let view = ProcessViewId(7);
+    let other = ProcessViewId(9);
+    let generation = std::num::NonZeroU64::new(1).unwrap();
+    for id in 1u64..=3 {
+        assert!(
+            engine
+                .selection_bindings
+                .insert(
+                    id,
+                    SelectionBindingFact {
+                        id,
+                        context: LoaderContextId::from_case_id(1),
+                        view: other,
+                        object: PinnedObjectId(1),
+                        file_offset: 0,
+                        hook_id: 0,
+                        abi: HookAbi::Interface,
+                        attached: true,
+                        retired: false,
+                        provider: plan::ModuleId(0),
+                        observed: false,
+                        coverage: SelectionCoverageState::OwnedOpen(generation),
+                    },
+                )
+                .is_none()
+        );
+    }
+    assert!(engine.pending_retirements.insert(view));
+    let mut session = ScriptedSession::default();
+    let outcome = engine
+        .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+        .unwrap();
+    assert!(!outcome.pending);
+    assert!(outcome.progressed);
+    assert!(!engine.collected_graph_requested);
+    assert!(engine.pending_retirements.is_empty());
+    assert_eq!(engine.collected_graphs_created, 0);
+    assert_eq!(engine.names_inspected_for_test(), 3);
+}
+
+#[test]
+fn graph_inputs_epoch_bumps_on_mutating_entry_points() {
+    use crate::attach::detailed_identity::{
+        CgroupCandidate, ProofSession, TraceIo, TraceSeed, TraceWorkError, TraceWorkTicket,
+    };
+
+    struct NoProofTrace;
+    impl TraceIo for NoProofTrace {
+        fn proof(&self) -> Option<&ProofSession> {
+            None
+        }
+        fn cookie(
+            &self,
+            _pin: &crate::process::PidPin,
+            _work: &mut TraceWorkTicket,
+        ) -> Result<u64, TraceWorkError> {
+            unreachable!("no-proof trace stub never reads cookies")
+        }
+        fn refresh_health(&self, _work: &mut TraceWorkTicket) -> Result<(), TraceWorkError> {
+            unreachable!("no-proof trace stub never refreshes health")
+        }
+        fn sample(
+            &self,
+            _view: &crate::process::ProcessView,
+            _work: &mut TraceWorkTicket,
+        ) -> Result<TraceSeed, TraceWorkError> {
+            unreachable!("no-proof trace stub never samples")
+        }
+        fn sample_cgroup(
+            &self,
+            _candidate: &mut CgroupCandidate,
+            _view: &crate::process::ProcessView,
+            _work: &mut TraceWorkTicket,
+        ) -> Result<(), TraceWorkError> {
+            unreachable!("no-proof trace stub never samples cgroups")
+        }
+        fn confirm_cgroup(
+            &self,
+            _candidate: &mut CgroupCandidate,
+            _view: &crate::process::ProcessView,
+            _work: &mut TraceWorkTicket,
+        ) -> Result<(), TraceWorkError> {
+            unreachable!("no-proof trace stub never confirms cgroups")
+        }
+    }
+
+    // Extra T4 pin (no §1.10 name): each covered mutating entry bumps the
+    // graph-input generation exactly once per level (nested entries bump per
+    // level; deltas documented below), and each covered non-mutating entry
+    // leaves it alone. Not covered here (mechanical first statements kept
+    // under review): the scan/commit inventory entries (their lease types
+    // are not test-constructible), the real-Session drains, and session
+    // creation/revalidation (real session work).
+    let mut engine = Engine::empty();
+    let mut session = ScriptedSession::default();
+    let mut epoch = engine.graph_inputs_epoch_for_test();
+    engine.settle_frame_deferrals_at_capture_end();
+    epoch += 1;
+    assert_eq!(engine.graph_inputs_epoch_for_test(), epoch);
+    engine.settle_terminal_drain();
+    epoch += 1;
+    assert_eq!(engine.graph_inputs_epoch_for_test(), epoch);
+    engine.begin_trace_terminal_work(std::time::Duration::from_secs(1));
+    epoch += 1;
+    assert_eq!(engine.graph_inputs_epoch_for_test(), epoch);
+    let mut trace = NoProofTrace;
+    engine
+        .with_trace_frame(&mut trace, |_, _, _| Ok::<(), anyhow::Error>(()))
+        .unwrap();
+    epoch += 1;
+    assert_eq!(engine.graph_inputs_epoch_for_test(), epoch);
+    let mut ticket = TraceWorkTicket::default();
+    engine.service_trace_images(&mut trace, &mut ticket, |_| {});
+    epoch += 1;
+    assert_eq!(engine.graph_inputs_epoch_for_test(), epoch);
+    let mut guard = super::inventory::UnavailableImageGuard;
+    assert!(
+        engine
+            .open_inventory_owner(
+                std::process::id(),
+                p11scope_ebpf_common::ImageIdentity::default(),
+                &mut guard
+            )
+            .is_err()
+    );
+    epoch += 1;
+    assert_eq!(engine.graph_inputs_epoch_for_test(), epoch);
+    assert!(
+        engine
+            .request_inventory_refresh(ProcessViewId(0), super::inventory::RefreshCause::Periodic)
+            .is_err()
+    );
+    epoch += 1;
+    assert_eq!(engine.graph_inputs_epoch_for_test(), epoch);
+    // Nested entries bump per level: drain -> batch -> batch_with (3),
+    // quiesced -> batch_with (2), batch -> batch_with (2).
+    let _drained = engine.drain_discovery_from(&mut session);
+    epoch += 3;
+    assert_eq!(engine.graph_inputs_epoch_for_test(), epoch);
+    let _quiesced = engine.apply_quiesced_discovery(&mut session, Vec::new(), 0);
+    epoch += 2;
+    assert_eq!(engine.graph_inputs_epoch_for_test(), epoch);
+    let _quantum = engine.service_backlog_quantum(&mut session);
+    epoch += 1;
+    assert_eq!(engine.graph_inputs_epoch_for_test(), epoch);
+    let _batch = engine.apply_discovery_batch(&mut session, Vec::new(), 0);
+    epoch += 2;
+    assert_eq!(engine.graph_inputs_epoch_for_test(), epoch);
+    let mut collect = |_: &mut dyn EngineSession| {
+        Ok::<(Vec<DiscoveryRecord>, u64), anyhow::Error>((Vec::new(), 0))
+    };
+    let _batch_with = engine.apply_discovery_batch_with(
+        &mut session,
+        Vec::new(),
+        0,
+        true,
+        false,
+        &mut collect,
+        None,
+    );
+    epoch += 1;
+    assert_eq!(engine.graph_inputs_epoch_for_test(), epoch);
+
+    // Non-mutating entries leave the generation alone.
+    engine.note_owned_pause_gap("epoch probe");
+    assert_eq!(engine.graph_inputs_epoch_for_test(), epoch);
+    engine.set_pause_owned_batch(true);
+    assert_eq!(engine.graph_inputs_epoch_for_test(), epoch);
+    engine.note_unprotected_owned(std::process::id());
+    assert_eq!(engine.graph_inputs_epoch_for_test(), epoch);
+    engine.set_cancel_flag(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+        false,
+    )));
+    assert_eq!(engine.graph_inputs_epoch_for_test(), epoch);
+    engine.account_unvalidated_discovery(1);
+    assert_eq!(engine.graph_inputs_epoch_for_test(), epoch);
+    engine.finish_owned_selection_coverage(true);
+    assert_eq!(engine.graph_inputs_epoch_for_test(), epoch);
+    engine.note_owned_target_reaped();
+    assert_eq!(engine.graph_inputs_epoch_for_test(), epoch);
+    let _immediate = engine.take_immediate_exec_recovery_frame();
+    assert_eq!(engine.graph_inputs_epoch_for_test(), epoch);
+    let _blocked = engine.take_frame_fresh_blocked();
+    assert_eq!(engine.graph_inputs_epoch_for_test(), epoch);
+    engine.note_quiesced_discovery_overflow();
+    assert_eq!(engine.graph_inputs_epoch_for_test(), epoch);
+    let _hooks = engine.active_loader_hook_count(&session);
+    assert_eq!(engine.graph_inputs_epoch_for_test(), epoch);
+    engine.report_discovery_noise();
+    assert_eq!(engine.graph_inputs_epoch_for_test(), epoch);
+}

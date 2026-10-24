@@ -37,7 +37,9 @@ use crate::discovery::sweep_shards;
 use crate::manifest_input::{read_manifest, selection_surface_usable, validate_structure};
 use crate::process::{self, OriginalGenerationState, ProcessView, ProcessViewId, ViewAdmission};
 use crate::run::OwnedChild;
-use crate::semantics_edge::resources::SemanticResourceReserver;
+#[cfg(test)]
+use crate::semantics_edge::resources::SemanticResourcePool;
+use crate::semantics_edge::resources::{ResourceLease, SemanticResourceReserver};
 use crate::{plan, render};
 use anyhow::{Context as _, Result, anyhow, bail};
 use p11scope_ebpf_common::{
@@ -381,6 +383,21 @@ pub struct Engine {
     collected_finish_actions: Option<usize>,
     /// Round-robin position among the original, still-owned exit assessments.
     collected_finish_assessment_after: Option<ProcessViewId>,
+    /// Lap tracker for pending leader-exit assessments at Q (R-26 N1).
+    #[allow(dead_code)] // GREEN wires the assessment laps.
+    collected_assessment_lap: AssessmentLap,
+    /// Publication-input generation counter for the terminal graph fence (§1.3).
+    #[allow(dead_code)] // Consumed by T4a (the epoch compare reads it).
+    graph_inputs_epoch: u64,
+    /// A collected-Finish credit requested the bounded terminal graph (§1.4).
+    #[allow(dead_code)] // GREEN wires the request sites.
+    collected_graph_requested: bool,
+    /// The live bounded terminal graph, boxed on the shared pool (§1.5).
+    #[allow(dead_code)] // GREEN wires the barrier.
+    collected_graph: Option<Box<CollectedGraph>>,
+    /// First terminal-graph refusal reason, if any (§1.9).
+    #[allow(dead_code)] // GREEN records refusals; consumed by T4b.
+    collected_graph_refusal: Option<&'static str>,
     /// Set while a pause cycle applies its batch (the owned child stopped).
     pause_owned_batch: bool,
     /// Set while a pressure service pass runs inside record dispatch. Nested
@@ -594,6 +611,21 @@ pub struct Engine {
     /// cannot be produced deterministically with live pins.
     #[cfg(test)]
     pin_probe_script: RefCell<VecDeque<PinProbeAnswer>>,
+    /// Graphs created by the barrier (test count, G12/G20/G22/G23).
+    #[cfg(test)]
+    collected_graphs_created: u32,
+    /// Intents Intake visited (test count, G23).
+    #[cfg(test)]
+    collected_intake_intents: u32,
+    /// Test-only semantic pool behind `service_collected_finish_records` (D1.2).
+    #[cfg(test)]
+    collected_test_pool: SemanticResourcePool,
+    /// Test-only transport block for `service_collected_finish_records` (G25).
+    #[cfg(test)]
+    collected_test_transport_pending: bool,
+    /// Unkeyed names examined by the latest `names_view_bounded` call (names test).
+    #[cfg(test)]
+    names_inspected: Cell<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3487,6 +3519,87 @@ pub(crate) struct BacklogOutcome {
     pub(crate) changed: bool,
     pub(crate) progressed: bool,
     pub(crate) pending: bool,
+}
+
+/// One graph credit's leaf budget (system scale): a cursor phase spends up
+/// to this many leaf units per credit. Native calls stay `work = 1`.
+#[allow(dead_code)] // GREEN wires the stride gate and the promotion quantum.
+pub(crate) const GRAPH_STRIDE: usize = 64;
+
+/// Lap tracker for pending leader-exit assessments at Q (R-26 N1/OD-12).
+/// `dirty` when a record queued a new assessment mid-lap, `at_q` while every
+/// call of the lap observed transport at Q, `clean` counting consecutive
+/// clean passes. A write-off needs two.
+#[allow(dead_code)] // GREEN wires the assessment laps.
+#[derive(Debug, Default)]
+struct AssessmentLap {
+    dirty: bool,
+    at_q: bool,
+    clean: u8,
+}
+
+/// Terminal-graph phases (§1.6). T4 owns Intake and the I1 error rows of the
+/// native phases; Freeze..Plan is T4a's, Handoff..Done is T4b's.
+#[allow(dead_code)] // GREEN wires the phase machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GraphPhase {
+    Intake,
+    Freeze,
+    Selection,
+    Pins,
+    RawCopy,
+    Rebind,
+    Plan,
+    Facts,
+    Handoff,
+    RemovedCopy,
+    NativePrepare,
+    NativeBegin,
+    NativePoll,
+    Install,
+    Consume,
+    Reclaim,
+    Done,
+}
+
+/// Terminal-graph verdicts (§1.9). `Closed` is set by T4b's native flow.
+#[allow(dead_code)] // Closed is consumed by T4b.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    Closed,
+    RefusedUntouched,
+    RefusedRetained,
+}
+
+/// The bounded terminal graph over the Engine's retained originals (§1.6
+/// skeleton). GREEN adds the T4a/T4b/T5 phase fields; only the Intake and
+/// native-probe state the T4 tests stage is present here.
+#[allow(dead_code)] // GREEN wires the graph machine.
+struct CollectedGraph {
+    phase: GraphPhase,
+    _storage: ResourceLease,
+    intake_after: Option<ProcessViewId>,
+    unproven: u32,
+    removed: Option<RetainedRetirementInput>,
+    ticket: Option<CollectedRetirementTicket>,
+    mutated: bool,
+    verdict: Option<Verdict>,
+}
+
+#[allow(dead_code)] // GREEN calls it from the barrier creation path.
+impl CollectedGraph {
+    fn new(storage: ResourceLease) -> Self {
+        Self {
+            phase: GraphPhase::Intake,
+            _storage: storage,
+            intake_after: None,
+            unproven: 0,
+            removed: None,
+            ticket: None,
+            mutated: false,
+            verdict: None,
+        }
+    }
 }
 
 type BatchStart =
@@ -8599,6 +8712,11 @@ impl Engine {
             pending_discovery_records: Vec::new(),
             collected_finish_actions: None,
             collected_finish_assessment_after: None,
+            collected_assessment_lap: AssessmentLap::default(),
+            graph_inputs_epoch: 0,
+            collected_graph_requested: false,
+            collected_graph: None,
+            collected_graph_refusal: None,
             pause_owned_batch: false,
             pressure_service_active: false,
             in_refresh_tick: false,
@@ -8690,6 +8808,16 @@ impl Engine {
             loader_arm_scan_after_scan: None,
             #[cfg(test)]
             pin_probe_script: RefCell::new(VecDeque::new()),
+            #[cfg(test)]
+            collected_graphs_created: 0,
+            #[cfg(test)]
+            collected_intake_intents: 0,
+            #[cfg(test)]
+            collected_test_pool: SemanticResourcePool::default(),
+            #[cfg(test)]
+            collected_test_transport_pending: false,
+            #[cfg(test)]
+            names_inspected: Cell::new(0),
         }
     }
 
@@ -21676,6 +21804,34 @@ impl Engine {
 
     /// Finish must also retain deferred lifecycle work. A vacant transport
     /// cursor alone cannot discharge an original already held by the Engine.
+    /// First terminal-graph refusal reason, if any (§1.9).
+    #[allow(dead_code)] // GREEN records refusals; consumed by T4b.
+    pub(crate) fn collected_graph_refused(&self) -> Option<&'static str> {
+        self.collected_graph_refusal
+    }
+
+    /// Applies one Intake readiness verdict (§1.4).
+    #[allow(dead_code)] // GREEN fills the arms; called from Intake.
+    fn settle_intake_ready(
+        &mut self,
+        _graph: &mut CollectedGraph,
+        _view: ProcessViewId,
+        _ready: Result<bool, String>,
+    ) {
+    }
+
+    /// Test read of the graph-input generation counter (§1.3).
+    #[cfg(test)]
+    pub(crate) fn graph_inputs_epoch_for_test(&self) -> u64 {
+        self.graph_inputs_epoch
+    }
+
+    /// Unkeyed names examined by the latest `names_view_bounded` call (names test).
+    #[cfg(test)]
+    pub(crate) fn names_inspected_for_test(&self) -> usize {
+        self.names_inspected.get()
+    }
+
     pub(crate) fn collected_finish_backlog_pending(&self, staged_len: usize) -> bool {
         self.discovery_backlog_pending(staged_len)
             || !self.retirement_intents.is_empty()
@@ -21716,7 +21872,18 @@ impl Engine {
                 Err(IncompleteTerminalDrain::backlog(records, malformed).into())
             }
         };
-        self.service_collected_finish_records_with(session, records, malformed, work, &mut collect)
+        let reserve = self.collected_test_pool.reserver();
+        let transport_at_q = !self.collected_test_transport_pending;
+        self.service_collected_finish_records_with(
+            session,
+            None,
+            &reserve,
+            records,
+            malformed,
+            work,
+            transport_at_q,
+            &mut collect,
+        )
     }
 
     /// One bounded service of originals already transferred from the actual
@@ -21726,9 +21893,12 @@ impl Engine {
     pub(crate) fn service_collected_finish_records_with(
         &mut self,
         session: &mut dyn EngineSession,
+        _q: Option<&CollectedFinishQ>,
+        _reserve: &SemanticResourceReserver,
         records: Vec<DiscoveryRecord>,
         malformed: u64,
         work: usize,
+        _transport_at_q: bool,
         collect: &mut DiscoveryCollector<'_>,
     ) -> Result<BacklogOutcome> {
         if work == 0 {

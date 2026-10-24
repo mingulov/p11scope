@@ -1092,6 +1092,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // the SAME retained drain/Q even though that journal counts as Engine
         // backlog. Each callback transfers at most one original; an allowance
         // stop is an incomplete prefix, never a fabricated empty observation.
+        // Transport is at Q when the ring reached the stop with nothing staged.
+        let transport_at_q = !ring_pending && staged.len() == 0;
         let mut collect = |_session: &mut dyn crate::discovery::engine::EngineSession| {
             use crate::discovery::engine::IncompleteTerminalDrain;
             if quantum == 0 {
@@ -1125,13 +1127,17 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // Only native/counter leaves are substituted. Dispatch and the
         // lifecycle consequence observed by the test remain real Engine work.
         let mut session = crate::discovery::engine::session_fixture::ScriptedSession::default();
+        let reserve = self.registry.semantic_storage_reserver();
         let progress = self
             .engine
             .service_collected_finish_records_with(
                 &mut session,
+                None,
+                &reserve,
                 records,
                 malformed,
                 work,
+                transport_at_q,
                 &mut collect,
             )
             .map_err(|_| SemanticRefusal::Unavailable)?;
@@ -1199,6 +1205,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let mut count = records.len() as u64 + malformed;
         let mut post_q = post_q;
         let mut ring_pending = ring_pending;
+        // Transport is at Q when the Session ring reached the stop with
+        // nothing staged (B1).
+        let transport_at_q = !ring_pending && session.staged_discovery_len() == 0;
         let mut collect = |native: &mut dyn crate::discovery::engine::EngineSession| {
             use crate::discovery::engine::IncompleteTerminalDrain;
             if quantum == 0 {
@@ -1224,9 +1233,19 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 Ok((records, malformed))
             }
         };
+        let reserve = self.registry.semantic_storage_reserver();
         let progress = self
             .engine
-            .service_collected_finish_records_with(session, records, malformed, work, &mut collect)
+            .service_collected_finish_records_with(
+                session,
+                Some(q),
+                &reserve,
+                records,
+                malformed,
+                work,
+                transport_at_q,
+                &mut collect,
+            )
             .map_err(|_| SemanticRefusal::Unavailable)?;
         self.collected_finish_progressed = progress.progressed;
         session

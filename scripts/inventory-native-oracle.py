@@ -4388,7 +4388,10 @@ class Synth:
             c, m = callers[e["caller"]], modules[e["module"]]
             activity = expected_activity_base(e)
             activity = (overrides or {}).get((e["caller"], e["module"]), activity)
-            lines.append(f"{e['caller']} pid {c['pid']} ({c['image']['exe']['path']}) -> {e['module']} ({m['paths'][0]})")
+            # Production identity lines carry `{label} [{id}]` per side, never a pid
+            # (edge_identity_line budgets each side around the arrow and always
+            # reserves the bracketed reference before truncating the label).
+            lines.append(f"{c['image']['exe']['path']} [{e['caller']}] -> {m['paths'][0]} [{e['module']}]")
             lines.append(f"  mapping {e['mapping']['state']} | presence mapped | capture {expected_capture(c, m, e)} | "
                          f"activity {activity} | entries {expected_entries_display(e)} | semantics {e['semantics']}")
         frame = "\x1b[H" + "\n".join(line + "\x1b[K" for line in lines)
@@ -4510,6 +4513,22 @@ def self_test():
         print(f"self-test {'ok  ' if controls_ok else 'FAIL'} gaps-input-healthy-controls")
         if not controls_ok:
             failures.append("gaps-input-healthy-controls")
+        # Production identity lines (`{label} [{id}] -> {label} [{id}]`, an
+        # optional `> ` promotion cursor, labels truncated with `…` before
+        # the always-reserved bracketed reference) must parse to their edge.
+        frame_items = {"mapping": "mapped", "presence": "mapped", "capture": "armed",
+                       "activity": "quiet", "entries": "0", "semantics": "unknown"}
+        frame_plain = frame_edges(["/wl/bin/ledger [c4] -> /wl/cells/a.so [m0]",
+                                   "  mapping mapped | presence mapped | capture armed | "
+                                   "activity quiet | entries 0 | semantics unknown"])
+        frame_selected = frame_edges(["> /wl/bin/ledger [c4] -> /wl/cells/a.so [m0]"])
+        frame_truncated = frame_edges(["/wl/bin/ledg… [c4] -> /wl/cells/a… [m0]"])
+        frame_prod_ok = (frame_plain == {("c4", "m0"): {"pid": None, "items": frame_items}}
+                         and set(frame_selected) == {("c4", "m0")}
+                         and set(frame_truncated) == {("c4", "m0")})
+        print(f"self-test {'ok  ' if frame_prod_ok else 'FAIL'} frame-production-identity-lines")
+        if not frame_prod_ok:
+            failures.append("frame-production-identity-lines")
 
         # --- passing runs -------------------------------------------------------
         res = case("native-pass", None)
@@ -5989,6 +6008,52 @@ def self_test():
         res = case("sweep-single-terminal-pass", None, sweep_single_terminal)
         if not any(r["check"] == "TERMINAL-SWEEP" and r["status"] == "pass" for r in res.rows):
             failures.append("sweep-single-terminal-not-compared")
+
+        def edge_identity_context(s, d, dash):
+            # Production edge_observed records carry the additive
+            # identity_context (snapshot verbatim + three derived states +
+            # additive context); the snapshot never does. Both the
+            # last-record replay and the terminal sweep must accept it.
+            def with_context(doc):
+                callers = {c["id"]: c for c in doc["callers"]}
+                modules = {m["id"]: m for m in doc["modules"]}
+                ev = s.events(doc, True)
+                for row in ev:
+                    if row["kind"] != "edge_observed":
+                        continue
+                    event = row["event"]
+                    caller, module = callers[event["caller"]], modules[event["module"]]
+                    event["identity_context"] = {
+                        "version": 1,
+                        "caller": {"id": caller["id"], "pid": caller["pid"],
+                                   "incarnation": caller["incarnation"],
+                                   "start_time": caller["start_time"],
+                                   "authority": caller["image"]["authority"],
+                                   "lifecycle": caller["lifecycle"],
+                                   "executable": {"dev": 8, "ino": 11, "mtime_secs": 12,
+                                                  "mtime_nanos": 13,
+                                                  "path": caller["image"]["exe"]["path"]},
+                                   "status": "observed"},
+                        "module": {"id": module["id"],
+                                   "device_major": module["identity"]["device"]["major"],
+                                   "device_minor": module["identity"]["device"]["minor"],
+                                   "inode": module["identity"]["inode"],
+                                   "path": module["paths"][0], "status": "observed"}}
+                edge_rows = [r for r in ev if r["kind"] == "edge_observed"]
+                at = max(r["at_ns"] for r in ev) + 1
+                tail = [{"schema": row["schema"], "seq": 0, "at_ns": at + i,
+                         "kind": "edge_observed", "event": _deep(row["event"])}
+                        for i, row in enumerate(edge_rows)]
+                out = [r for r in ev if r["kind"] != "ended"] + tail \
+                    + [r for r in ev if r["kind"] == "ended"]
+                next(e for e in out if e["kind"] == "ended")["event"]["edge_events"] = len(tail)
+                return _renumber(out)
+            return {"events": with_context(d), "dash_events": with_context(dash)}
+        res = case("jsonl-edge-identity-context-additive", None, edge_identity_context)
+        for check in ("AGREE-EDGE-EVENTS", "TERMINAL-SWEEP"):
+            rows = res.rows if res else []
+            if not any(r["check"] == check and r["status"] == "pass" for r in rows):
+                failures.append(f"identity-context-{check}-not-compared")
 
         # --- O3: invalid clocks fail open (sol 3) ---------------------------
         # Missing/non-integer/backwards timestamps skip cadence silently

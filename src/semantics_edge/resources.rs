@@ -377,3 +377,53 @@ impl Drop for ScratchLease {
         state.scratch_borrowed = false;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reserver_coverage_rejects_foreign_or_insufficient_live_lease() {
+        let pool = SemanticResourcePool::reference_limit(SEMANTIC_TRANSITION_SCRATCH + 4096);
+        let foreign = SemanticResourcePool::reference_limit(SEMANTIC_TRANSITION_SCRATCH + 4096);
+        let reserver = pool.reserver();
+        let lease = reserver.reserve(256).unwrap();
+        let foreign_lease = foreign.reserve(256).unwrap();
+        let before = pool.snapshot();
+        let foreign_before = foreign.snapshot();
+
+        assert!(reserver.covers(&lease, 0));
+        assert!(reserver.covers(&lease, 256));
+        assert!(pool.reserver().covers(&lease, 256));
+        assert!(!reserver.covers(&lease, 257));
+        assert!(!reserver.covers(&lease, usize::MAX));
+        assert!(!reserver.covers(&foreign_lease, 256));
+        assert!(!reserver.covers(&foreign_lease, 0));
+        assert!(!foreign.reserver().covers(&lease, 256));
+        assert_eq!(pool.snapshot(), before);
+        assert_eq!(foreign.snapshot(), foreign_before);
+    }
+
+    #[test]
+    fn reserver_coverage_follows_split_and_refund_without_borrowing_other_charge() {
+        let pool = SemanticResourcePool::reference_limit(SEMANTIC_TRANSITION_SCRATCH + 4096);
+        let reserver = pool.reserver();
+        let base = pool.snapshot().charged_bytes;
+        let mut lease = reserver.reserve(256).unwrap();
+        let child = lease.split(96);
+
+        assert!(reserver.covers(&lease, 160));
+        assert!(!reserver.covers(&lease, 161));
+        assert!(reserver.covers(&child, 96));
+        assert!(!reserver.covers(&child, 97));
+        assert_eq!(pool.snapshot().charged_bytes, base + 256);
+        drop(child);
+        assert_eq!(pool.snapshot().charged_bytes, base + 160);
+        lease.release(32);
+        assert!(reserver.covers(&lease, 128));
+        assert!(!reserver.covers(&lease, 129));
+        assert_eq!(pool.snapshot().charged_bytes, base + 128);
+        drop(lease);
+        assert_eq!(pool.snapshot().charged_bytes, base);
+    }
+}

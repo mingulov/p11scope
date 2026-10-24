@@ -458,6 +458,9 @@ def compare_pair(first, second, snapshot):
     """
     feeds = [first, second]
     _require(first["feed"] != second["feed"], "feeds share one label")
+    _require(snapshot["gaps"]["suppressed"] == 0,
+             f"snapshot gaps suppressed {_shown(snapshot['gaps']['suppressed'])}"
+             " hides dispositions")
     same_scope = first["scope"] == second["scope"]
     same_handle = first["handle"] == second["handle"]
     if same_handle and not same_scope:

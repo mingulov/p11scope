@@ -699,6 +699,14 @@ class CompareTwins(unittest.TestCase):
                                     "key row failed 0 disagrees with ledger 1"):
             oracle.compare_pair(first, second, snapshot)
 
+    def test_mutation_snapshot_gaps_suppressed_rejected(self):
+        oracle = require_oracle(self)
+        _, _, first, second = validated_pair(oracle, "loss")
+        snapshot = healthy_snapshot([first, second])
+        snapshot["gaps"]["suppressed"] = 1
+        with self.assertRaisesRegex(oracle.LedgerError, "hides dispositions"):
+            oracle.compare_pair(first, second, snapshot)
+
     def test_mutation_unmatched_key_row_rejected(self):
         oracle = require_oracle(self)
         _, _, first, second = validated_pair(oracle, "loss")

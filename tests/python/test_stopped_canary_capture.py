@@ -110,6 +110,41 @@ def kernel_release(release):
     return patch.object(os, 'uname', return_value=fake)
 
 
+@contextlib.contextmanager
+def virtual_monotonic():
+    """Run deadline loops against a virtual monotonic clock.
+
+    Sleeps issued by the code under test advance virtual time instead
+    of really waiting, so bound-expiry probes prove the full declared
+    wait (identical deadline arithmetic through the real readiness and
+    custody path) in about a second of wall time. Each virtual sleep
+    also advances a microsecond past the request so expiry overshoots
+    the deadline the way real time does, keeping the lower-bound assert
+    exact. Stdlib internals (notably subprocess.Popen.wait's deadline
+    polling, which keys off the real clock) sleep really without moving
+    the virtual clock, so virtual time never runs ahead of real waiting.
+    """
+    now = [time.monotonic()]
+    real_monotonic, real_sleep = time.monotonic, time.sleep
+
+    def monotonic():
+        return now[0]
+
+    def sleep(seconds):
+        caller = sys._getframe(1).f_globals
+        if caller is capture.__dict__ or caller is c.__dict__:
+            if seconds > 0:
+                now[0] += seconds + 1e-6
+        else:
+            real_sleep(seconds)
+
+    time.monotonic, time.sleep = monotonic, sleep
+    try:
+        yield now
+    finally:
+        time.monotonic, time.sleep = real_monotonic, real_sleep
+
+
 STARTUP_THREAD = '''import pathlib, threading, time
 startup = pathlib.Path({directory!r})
 while not (startup / 'start-thread').exists():
@@ -840,7 +875,10 @@ def ready_bound_case(pid, directory, spec):
     fail_515 (never ready, must expire at the declared bound). The
     coordinator, custody and FakeMaps are all real; only os.uname is
     faked, so the production resolver maps the kernel to its bound and
-    the elapsed wall clock proves which bound the run enforced.
+    the elapsed clock proves which bound the run enforced. Expiry probes
+    also virtualize the monotonic clock, so the full declared wait costs
+    ~1 s of wall time; the passing probe keeps its literal clock as the
+    real end-to-end completion proof.
     """
     release, never_ready = {'pass_515': ('5.15.221-ready-bound-test', False),
                             'fail_66': ('6.6.157-ready-bound-test', True),
@@ -854,10 +892,13 @@ def ready_bound_case(pid, directory, spec):
         config.observer_args = [sys.executable, '-c', 'import time; time.sleep(60)']
     source = FakeMaps(config)
     output = io.StringIO()
-    started = time.monotonic()
     with kernel_release(release), \
             patch.object(capture, 'wait_done', side_effect=synthetic_done), \
-            contextlib.redirect_stdout(output):
+            contextlib.redirect_stdout(output), \
+            ExitStack() as stack:
+        if never_ready:
+            stack.enter_context(virtual_monotonic())
+        started = time.monotonic()
         try:
             manifest = capture.capture(config, source)
         except capture.CaptureError as error:
@@ -866,7 +907,7 @@ def ready_bound_case(pid, directory, spec):
             manifest = None
         else:
             assert not never_ready, spec
-    elapsed = time.monotonic() - started
+        elapsed = time.monotonic() - started
     line = f'CANARY_READY_BOUND_DECLARED kernel={release} seconds={expected}'
     assert line in output.getvalue().splitlines(), output.getvalue()
     if never_ready:
@@ -2232,9 +2273,11 @@ class StoppedCanaryCaptureTests(unittest.TestCase):
     def ready_bound_probe(self, spec, timeout):
         """ready_bound_case driver with a guard beyond probe()'s 12 s.
 
-        The 8 s and 30 s bounds need wall-clock runs: only a real expiry
-        proves the coordinator waited the full declared bound instead of
-        failing early (or hanging past it).
+        Expiry probes run the readiness loop against a virtual monotonic
+        clock: the loop still waits the full declared bound (identical
+        deadline arithmetic through the real readiness and custody path)
+        but in ~1 s of wall time. The outer timeout stays real, so a
+        genuine hang still fails loudly instead of passing quietly.
         """
         old = c._subreaper()
         c._subreaper(1)

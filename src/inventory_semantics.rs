@@ -1311,6 +1311,7 @@ impl AttestedSemanticLane {
         self.tick_collected_inner(bindings, raw, None)
     }
 
+    #[allow(dead_code)] // Actual Session bridge; the ordinary driver remains inactive.
     fn tick_collected_at_q(
         &mut self,
         bindings: &[SemanticCallerBinding],

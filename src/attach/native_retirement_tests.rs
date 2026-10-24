@@ -1201,7 +1201,7 @@ fn collected_retirement_cancel_before_and_after_first_mutation() {
             assert_eq!(progress.used, 1);
             match progress.state {
                 CollectedRetirementState::Yielded if !post_take => break,
-                CollectedRetirementState::Preparing => {}
+                CollectedRetirementState::Preparing => std::thread::yield_now(),
                 CollectedRetirementState::RefusedUntouched(input) => {
                     returned = Some(input);
                     break;
@@ -1445,7 +1445,6 @@ fn collected_retirement_metadata_release_respects_one_credit() {
             Ok(())
         }),
     );
-    let file = native.original_file();
     let q = native.observe_q();
     let pool = SemanticResourcePool::reference_limit(COLLECTED_POOL_BYTES);
     let reserve = pool.reserver();
@@ -1471,12 +1470,12 @@ fn collected_retirement_metadata_release_respects_one_credit() {
     let mut closed = false;
     for _ in 0..COLLECTED_CREDITS {
         assert!(Instant::now() < deadline);
-        let before = file.strong_count();
+        let before = native.foreground_backing_items();
         let progress = native.poll(&q, &ticket, 1).unwrap();
         assert_eq!(progress.used, 1);
         assert!(
-            before.saturating_sub(file.strong_count()) <= 1,
-            "one credit cannot drop multiple real target/stamp/provider owners"
+            before.saturating_sub(native.foreground_backing_items()) <= 1,
+            "one credit cannot dispose multiple foreground cursor items"
         );
         match progress.state {
             CollectedRetirementState::Pending => {}
@@ -1717,6 +1716,12 @@ fn collected_retirement_refused_pool_keeps_preflight_and_posttake_owner() {
             .is_none()
     );
     collected_submit(&mut native, &q, &ticket);
+    let phase = native.cursor_phase();
+    assert!(
+        native.prepare(&q, &mut input, &reserve, 1).is_err(),
+        "preparation cannot turn an already-mutated carrier into untouched disposal"
+    );
+    assert_eq!(native.cursor_phase(), phase);
     let original = collected_close(&mut native, &q, &ticket);
     assert_eq!(original.removed.as_ptr(), ptr);
     drop(original);
@@ -1813,13 +1818,13 @@ fn collected_retirement_partial_extract_drop_never_queues_return_before_entry() 
         drop(pins);
         let mut worker = native.abandon_for_drop();
         let receipt = worker.join();
-        assert!(
-            !receipt.completed,
-            "destructor custody is not bounded graph/cancel completion"
-        );
         let order = closes.lock().unwrap().clone();
         if partial {
             assert_eq!(order, vec![ProducerProgram::UProbe("p11_entry")]);
+            assert!(
+                !receipt.completed,
+                "the actual unsubmitted return is uncertain"
+            );
             assert_eq!(
                 (receipt.total, receipt.released, receipt.uncertain),
                 (1, 1, 1)
@@ -1838,10 +1843,137 @@ fn collected_retirement_partial_extract_drop_never_queues_return_before_entry() 
                 (receipt.total, receipt.released, receipt.uncertain),
                 (2, 2, 0)
             );
+            assert!(
+                receipt.completed,
+                "native2/2/0 is truthful; it grants no graph/cancel completion"
+            );
         }
         assert!(file.upgrade().is_some());
         assert_eq!(pool.snapshot().charged_bytes, charge);
         drop(worker);
         assert!(file.upgrade().is_some());
     }
+}
+
+#[test]
+fn collected_retirement_final_file_and_exports_release_on_original_worker() {
+    let (_dir, pins, mut native, slots, exports) = super::fixture::exported_owner_case();
+    let file = native.original_file();
+    let q = native.observe_q();
+    let pool = SemanticResourcePool::reference_limit(COLLECTED_POOL_BYTES);
+    let reserve = pool.reserver();
+    let ptr = slots.as_ptr();
+    let mut input = Some(collected_input(
+        slots,
+        reserve.reserve(COLLECTED_INPUT_BYTES).unwrap(),
+    ));
+    let ticket = collected_prepare_to_ticket(&mut native, &q, &mut input, &reserve).unwrap();
+    let (entered, on_worker) = mpsc::channel();
+    let (resume, blocked) = mpsc::channel();
+    native.observe_retained_release(entered, blocked);
+    struct Resume(Option<mpsc::Sender<()>>);
+    impl Drop for Resume {
+        fn drop(&mut self) {
+            if let Some(resume) = self.0.take() {
+                let _ = resume.send(());
+            }
+        }
+    }
+    let resume = Resume(Some(resume));
+    collected_submit(&mut native, &q, &ticket);
+    wait_for(|| native.native_counts() == (4, 4, 4, 0));
+    drop(pins);
+    assert!(file.upgrade().is_some() && exports.upgrade().is_some());
+    let charged = pool.snapshot().charged_bytes;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut executing = None;
+    for _ in 0..COLLECTED_CREDITS {
+        assert!(Instant::now() < deadline);
+        let progress = native.poll(&q, &ticket, 1).unwrap();
+        assert_eq!(progress.used, 1);
+        assert!(matches!(progress.state, CollectedRetirementState::Pending));
+        if let Ok(thread) = on_worker.try_recv() {
+            executing = Some(thread);
+            break;
+        }
+        std::thread::yield_now();
+    }
+    let executing = executing.expect("actual retained-owner release reached original worker");
+    assert_ne!(executing, std::thread::current().id());
+    assert_eq!(
+        executing,
+        native.original_worker_thread_id(),
+        "the SAME prestarted coordinator executes actual owner destruction"
+    );
+    assert!(native.worker().running());
+    assert_eq!(
+        native.native_counts(),
+        (4, 4, 4, 0),
+        "metadata is not a native FD payload"
+    );
+    assert!(file.upgrade().is_some() && exports.upgrade().is_some());
+    assert_eq!(
+        pool.snapshot().charged_bytes,
+        charged,
+        "queued owner/backing still paid before real drop"
+    );
+    let progress = native.poll(&q, &ticket, 1).unwrap();
+    assert!(matches!(progress.state, CollectedRetirementState::Pending));
+    drop(resume);
+    let original = collected_close(&mut native, &q, &ticket);
+    assert_eq!(original.removed.as_ptr(), ptr);
+    assert!(
+        file.upgrade().is_none(),
+        "Closed follows actual final File owner drop"
+    );
+    assert!(
+        exports.upgrade().is_none(),
+        "Closed follows actual final nonempty export owner drop"
+    );
+    assert!(
+        native.worker().running(),
+        "batch/metadata release precedes terminal join"
+    );
+    assert_eq!(native.native_counts(), (4, 4, 4, 0));
+    drop(original);
+    assert_eq!(pool.snapshot().charged_bytes, SEMANTIC_TRANSITION_SCRATCH);
+    assert!(native.join().completed);
+}
+
+#[test]
+fn collected_retirement_retained_release_failure_keeps_original_owners() {
+    let (_dir, pins, mut native, slots, exports) = super::fixture::exported_owner_case();
+    let file = native.original_file();
+    let q = native.observe_q();
+    let pool = SemanticResourcePool::reference_limit(COLLECTED_POOL_BYTES);
+    let reserve = pool.reserver();
+    let mut input = Some(collected_input(
+        slots,
+        reserve.reserve(COLLECTED_INPUT_BYTES).unwrap(),
+    ));
+    let ticket = collected_prepare_to_ticket(&mut native, &q, &mut input, &reserve).unwrap();
+    collected_submit(&mut native, &q, &ticket);
+    wait_for(|| native.native_counts() == (4, 4, 4, 0));
+    drop(pins);
+    let charged = pool.snapshot().charged_bytes;
+    assert!(
+        native.join().completed,
+        "native4/4/0 precedes the refused metadata handoff"
+    );
+    let mut refused = false;
+    for _ in 0..COLLECTED_CREDITS {
+        let progress = native.poll(&q, &ticket, 1).unwrap();
+        assert_eq!(progress.used, 1);
+        if matches!(progress.state, CollectedRetirementState::RefusedRetained) {
+            refused = true;
+            break;
+        }
+    }
+    assert!(refused);
+    assert_eq!(native.native_counts(), (4, 4, 4, 0));
+    assert!(file.upgrade().is_some() && exports.upgrade().is_some());
+    assert_eq!(pool.snapshot().charged_bytes, charged);
+    drop(native);
+    assert!(file.upgrade().is_some() && exports.upgrade().is_some());
+    assert_eq!(pool.snapshot().charged_bytes, charged);
 }

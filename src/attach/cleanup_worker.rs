@@ -145,31 +145,91 @@ pub(crate) type FileLeases = Arc<Vec<Arc<File>>>;
 /// through queued closes, failed submissions and uncertain native ownership.
 /// Only the original cursor releases one provider share after all its batches
 /// actually return. An abandoned cursor deliberately retains this guard.
+struct RetainedOwners {
+    targets: Vec<super::RetainedStaticTarget>,
+    stamps: Vec<super::pid_continuity::PairStamp>,
+    files: Vec<Arc<File>>,
+}
+
+#[cfg(test)]
+type RetainedReleaseObserver = (mpsc::Sender<std::thread::ThreadId>, mpsc::Receiver<()>);
+
 pub(super) struct CollectedCleanupRetention {
-    files: Mutex<Vec<Arc<File>>>,
-    _storage: ResourceLease,
+    owners: Mutex<RetainedOwners>,
+    storage: Option<ResourceLease>,
+    #[cfg(test)]
+    release_observer: Mutex<Option<RetainedReleaseObserver>>,
 }
 
 impl CollectedCleanupRetention {
     pub(super) fn new(storage: ResourceLease, providers: usize) -> Arc<Self> {
         Arc::new(Self {
-            files: Mutex::new(Vec::with_capacity(providers)),
-            _storage: storage,
+            owners: Mutex::new(RetainedOwners {
+                targets: Vec::with_capacity(providers),
+                stamps: Vec::with_capacity(providers),
+                files: Vec::with_capacity(providers),
+            }),
+            storage: Some(storage),
+            #[cfg(test)]
+            release_observer: Mutex::new(None),
         })
     }
 
     pub(super) fn retain_file(&self, file: Arc<File>) {
-        let mut files = self.files.lock().unwrap_or_else(|error| error.into_inner());
-        assert!(files.len() < files.capacity());
-        files.push(file);
+        let mut owners = self
+            .owners
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert!(owners.files.len() < owners.files.capacity());
+        owners.files.push(file);
     }
 
-    pub(super) fn release_one_file(&self) -> bool {
-        self.files
+    pub(super) fn retain_target(&self, target: super::RetainedStaticTarget) {
+        let mut owners = self
+            .owners
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .pop()
-            .is_some()
+            .unwrap_or_else(|error| error.into_inner());
+        assert!(owners.targets.len() < owners.targets.capacity());
+        owners.targets.push(target);
+    }
+
+    pub(super) fn retain_stamp(&self, stamp: super::pid_continuity::PairStamp) {
+        let mut owners = self
+            .owners
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert!(owners.stamps.len() < owners.stamps.capacity());
+        owners.stamps.push(stamp);
+    }
+
+    #[cfg(test)]
+    pub(super) fn observe_release(
+        &self,
+        entered: mpsc::Sender<std::thread::ThreadId>,
+        resume: mpsc::Receiver<()>,
+    ) {
+        *self.release_observer.lock().unwrap() = Some((entered, resume));
+    }
+
+    #[cfg(test)]
+    fn pause_release(&mut self) -> Result<(), String> {
+        if let Some((entered, resume)) = self.release_observer.get_mut().unwrap().take() {
+            entered
+                .send(std::thread::current().id())
+                .map_err(|_| "release observer ended")?;
+            resume
+                .recv_timeout(Duration::from_secs(2))
+                .map_err(|_| "retained release observer deadline")?;
+        }
+        Ok(())
+    }
+
+    fn release_on_worker(mut self) {
+        let storage = self.storage.take();
+        // The actual nested strings/export slice/final File and their vector
+        // backing drop here on the original coordinator. Refund comes last.
+        drop(self);
+        drop(storage);
     }
 }
 
@@ -196,7 +256,12 @@ pub(super) fn collected_allocation_charge(payloads: usize, batches: usize) -> Op
     // failure and diagnostic holder vectors plus fixed native admission text.
     let failure =
         2 * std::mem::size_of::<SubmissionFailure>() + 2 * std::mem::size_of::<String>() + 512;
-    let command_blocks = batches.checked_add(30)?.checked_div(31)?.checked_add(1)?;
+    // One additional typed retained-owner release command follows the FD batches.
+    let command_blocks = batches
+        .checked_add(1)?
+        .checked_add(30)?
+        .checked_div(31)?
+        .checked_add(1)?;
     let per_payload = slot
         .checked_add(result.checked_mul(6)?)?
         .checked_add(payload.checked_mul(2)?)?;
@@ -205,6 +270,9 @@ pub(super) fn collected_allocation_charge(payloads: usize, batches: usize) -> Op
         .checked_add(batches.checked_mul(batch.checked_add(failure)?.checked_add(64)?)?)?
         .checked_add(command_blocks.checked_mul(4096)?)?
         .checked_add(std::mem::size_of::<CollectedCleanupRetention>() + 16 + 32 + 4096)
+}
+pub(super) fn collected_release_ticket_charge() -> usize {
+    std::mem::size_of::<Mutex<BatchState>>() + 16 + 32
 }
 const _: () = assert!(std::mem::size_of::<Command>() <= 96);
 pub(crate) type CloseSlot<T> = Arc<Mutex<T>>;
@@ -401,6 +469,7 @@ struct BatchState {
     total: usize,
     released: usize,
     failed: bool,
+    retention_pending: bool,
     _leases: FileLeases,
     _retention: Option<Arc<CollectedCleanupRetention>>,
 }
@@ -418,7 +487,7 @@ impl BatchTicket {
         };
         if state.failed {
             BatchStatus::Failed
-        } else if state.released == state.total {
+        } else if !state.retention_pending && state.released == state.total {
             BatchStatus::Released
         } else {
             BatchStatus::Pending
@@ -432,10 +501,53 @@ impl BatchTicket {
 
 pub(crate) struct SubmissionFailure {
     pub(crate) message: String,
-    pub(crate) links: Vec<(OwnedLink, ProducerProgram)>,
-    // Payloads drop before this guard, including returned transfer failures.
+    pub(crate) links: FailedNativeLinks,
+    // Legacy failure callers may move/drop links separately as before.
     _leases: FileLeases,
-    _retention: Option<Arc<CollectedCleanupRetention>>,
+}
+
+pub(crate) struct FailedNativeLinks {
+    links: Vec<(OwnedLink, ProducerProgram)>,
+    retention: Option<Arc<CollectedCleanupRetention>>,
+    leases: Option<FileLeases>,
+}
+
+impl std::ops::Deref for FailedNativeLinks {
+    type Target = [(OwnedLink, ProducerProgram)];
+    fn deref(&self) -> &Self::Target {
+        &self.links
+    }
+}
+
+impl Drop for FailedNativeLinks {
+    fn drop(&mut self) {
+        if self.retention.is_some() {
+            std::mem::forget((
+                std::mem::take(&mut self.links),
+                self.retention.take(),
+                self.leases.take(),
+            ));
+        }
+    }
+}
+
+impl SubmissionFailure {
+    fn new(
+        message: String,
+        links: Vec<(OwnedLink, ProducerProgram)>,
+        leases: FileLeases,
+        retention: Option<Arc<CollectedCleanupRetention>>,
+    ) -> Self {
+        Self {
+            message,
+            links: FailedNativeLinks {
+                links,
+                leases: retention.as_ref().map(|_| Arc::clone(&leases)),
+                retention,
+            },
+            _leases: leases,
+        }
+    }
 }
 
 impl std::fmt::Debug for SubmissionFailure {
@@ -455,6 +567,10 @@ enum Command {
         leases: FileLeases,
         retention: Option<Arc<CollectedCleanupRetention>>,
     },
+    ReleaseRetained {
+        retention: Arc<CollectedCleanupRetention>,
+        batch: Arc<Mutex<BatchState>>,
+    },
     Shutdown,
 }
 
@@ -470,6 +586,8 @@ struct WorkerState {
     counts_invalid: bool,
     done: bool,
     quarantined: Vec<CloseSlot<DetailedClose>>,
+    retained_pending: usize,
+    quarantined_retention: Vec<Arc<CollectedCleanupRetention>>,
 }
 
 struct DetailedClose {
@@ -497,6 +615,7 @@ impl Drop for WorkerState {
         // Failed residual native handles cannot close on a foreground ticket
         // drop. Their complete owning slots, including files, await exit.
         std::mem::forget(std::mem::take(&mut self.quarantined));
+        std::mem::forget(std::mem::take(&mut self.quarantined_retention));
     }
 }
 
@@ -575,6 +694,11 @@ impl CleanupWorker {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn original_thread_id(&self) -> Option<std::thread::ThreadId> {
+        self.handle.as_ref().map(|handle| handle.thread().id())
+    }
+
     pub(super) fn identity(&self) -> CleanupWorkerIdentity {
         CleanupWorkerIdentity(Arc::clone(&self.state))
     }
@@ -626,12 +750,7 @@ impl CleanupWorker {
         if let Err(message) = self.live_admission() {
             self.note_transfer_failed(links.len());
             self.note_failure(message.clone());
-            return Err(SubmissionFailure {
-                message,
-                links,
-                _leases: leases,
-                _retention: None,
-            });
+            return Err(SubmissionFailure::new(message, links, leases, None));
         }
         self.submit_batch(links, leases, order, None)
     }
@@ -653,24 +772,104 @@ impl CleanupWorker {
                 .iter()
                 .any(|(_, producer)| Some(DetachOrder.rank(producer)) != rank)
         {
-            return Err(SubmissionFailure {
-                message: "collected cleanup requires one nonempty fixed rank chunk".into(),
+            return Err(SubmissionFailure::new(
+                "collected cleanup requires one nonempty fixed rank chunk".into(),
                 links,
-                _leases: leases,
-                _retention: Some(retention),
-            });
+                leases,
+                Some(retention),
+            ));
         }
         if let Err(message) = self.collected_admission() {
             self.note_transfer_failed(links.len());
             self.note_failure(message.clone());
-            return Err(SubmissionFailure {
+            return Err(SubmissionFailure::new(
                 message,
                 links,
-                _leases: leases,
-                _retention: Some(retention),
-            });
+                leases,
+                Some(retention),
+            ));
         }
         self.submit_batch(links, leases, DetachOrder, Some(retention))
+    }
+
+    pub(super) fn retain_collected_abandoned(
+        &self,
+        links: Vec<(OwnedLink, ProducerProgram)>,
+        leases: FileLeases,
+        retention: Arc<CollectedCleanupRetention>,
+    ) {
+        self.note_transfer_failed(links.len());
+        self.retain_unsubmitted(SubmissionFailure::new(
+            "collected destructor could not prove one ordered terminal handoff".into(),
+            links,
+            leases,
+            Some(retention),
+        ));
+    }
+
+    /// Moves the actual final guard; release tickets retain no guard alias.
+    /// This command carries no native FD credit and cannot settle before all
+    /// actual owner graphs, their files and backing lease drop on this worker.
+    pub(super) fn submit_collected_release(
+        &self,
+        retention: Arc<CollectedCleanupRetention>,
+    ) -> Result<BatchTicket, SubmissionFailure> {
+        let leases = Arc::new(Vec::new());
+        if let Err(message) = self.collected_admission() {
+            self.note_failure(message.clone());
+            return Err(SubmissionFailure::new(
+                message,
+                Vec::new(),
+                leases,
+                Some(retention),
+            ));
+        }
+        let mut state = self.state.lock().unwrap();
+        let Some(pending) = state.retained_pending.checked_add(1) else {
+            state.counts_invalid = true;
+            return Err(SubmissionFailure::new(
+                "retained release accounting overflow".into(),
+                Vec::new(),
+                leases,
+                Some(retention),
+            ));
+        };
+        state.retained_pending = pending;
+        drop(state);
+        let batch = Arc::new(Mutex::new(BatchState {
+            total: 0,
+            released: 0,
+            failed: false,
+            retention_pending: true,
+            _leases: leases,
+            _retention: None,
+        }));
+        match self.tx.send(Command::ReleaseRetained {
+            retention,
+            batch: Arc::clone(&batch),
+        }) {
+            Ok(()) => Ok(BatchTicket {
+                owner: Arc::clone(&self.state),
+                state: batch,
+            }),
+            Err(mpsc::SendError(Command::ReleaseRetained { retention, batch })) => {
+                batch.lock().unwrap().failed = true;
+                let message =
+                    "retained owner release channel failed; actual guard remains owned".to_string();
+                let mut state = self.state.lock().unwrap();
+                state.retained_pending -= 1;
+                state.failures.push(message.clone());
+                drop(state);
+                let leases = Arc::clone(&batch.lock().unwrap()._leases);
+                Err(SubmissionFailure::new(
+                    message,
+                    Vec::new(),
+                    leases,
+                    Some(retention),
+                ))
+            }
+            Err(_) => unreachable!("submitted one retained-owner release"),
+        }
     }
 
     fn submit_batch(
@@ -688,18 +887,14 @@ impl CleanupWorker {
             state.counts_invalid = true;
             let message = "cleanup submitted-link count overflow".to_string();
             state.failures.push(message.clone());
-            return Err(SubmissionFailure {
-                message,
-                links,
-                _leases: leases,
-                _retention: retention,
-            });
+            return Err(SubmissionFailure::new(message, links, leases, retention));
         }
         drop(state);
         let batch = Arc::new(Mutex::new(BatchState {
             total: links.len(),
             released: 0,
             failed: false,
+            retention_pending: false,
             _leases: Arc::clone(&leases),
             _retention: retention.clone(),
         }));
@@ -729,14 +924,11 @@ impl CleanupWorker {
                     state.counts_invalid = true;
                 }
                 state.failures.push(message.clone());
-                Err(SubmissionFailure {
-                    message,
-                    links,
-                    _leases: leases,
-                    _retention: retention,
-                })
+                Err(SubmissionFailure::new(message, links, leases, retention))
             }
-            Err(mpsc::SendError(Command::Shutdown)) => unreachable!("submitted a link batch"),
+            Err(mpsc::SendError(Command::Shutdown | Command::ReleaseRetained { .. })) => {
+                unreachable!("submitted a link batch")
+            }
         }
     }
 
@@ -841,7 +1033,7 @@ impl CleanupWorker {
             return true;
         }
         let state = self.state.lock().unwrap();
-        state.released.saturating_add(state.uncertain) >= state.total
+        state.retained_pending == 0 && state.released.saturating_add(state.uncertain) >= state.total
     }
 
     /// Reaps the worker thread and reports what settled. The receipt
@@ -892,7 +1084,8 @@ impl CleanupWorker {
             completed: state.failures.is_empty()
                 && state.transfer_failed == 0
                 && !state.counts_invalid
-                && state.released == state.total,
+                && state.released == state.total
+                && state.retained_pending == 0,
             released: state.released,
             total: state.total,
             uncertain: uncertain.unwrap_or(usize::MAX),
@@ -1024,11 +1217,59 @@ fn run_cleanup(
                     first = end;
                 }
             }
+            Command::ReleaseRetained { retention, batch } => {
+                let result = match Arc::try_unwrap(retention) {
+                    Ok(mut owned) => {
+                        #[cfg(test)]
+                        if let Err(message) = owned.pause_release() {
+                            state
+                                .lock()
+                                .unwrap()
+                                .quarantined_retention
+                                .push(Arc::new(owned));
+                            finish_retained_release(&state, &batch, Err(message));
+                            continue;
+                        }
+                        let _ = &mut owned;
+                        // String/File/Arc destruction has no caller callbacks.
+                        // Never acknowledge a panic as a successful release.
+                        catch_unwind(AssertUnwindSafe(|| owned.release_on_worker()))
+                            .map_err(|_| "retained owner destruction panicked".to_string())
+                    }
+                    Err(guard) => {
+                        state.lock().unwrap().quarantined_retention.push(guard);
+                        Err("retained owner release still has an unexpected guard alias".into())
+                    }
+                };
+                finish_retained_release(&state, &batch, result);
+            }
             Command::Shutdown => break,
         }
     }
     drop(pool);
     state.lock().unwrap().done = true;
+}
+
+fn finish_retained_release(
+    state: &Arc<Mutex<WorkerState>>,
+    batch: &Arc<Mutex<BatchState>>,
+    result: Result<(), String>,
+) {
+    let mut state = state.lock().unwrap();
+    let mut batch = batch.lock().unwrap();
+    match result {
+        Ok(()) => batch.retention_pending = false,
+        Err(message) => {
+            batch.failed = true;
+            state.failures.push(message);
+        }
+    }
+    if let Some(pending) = state.retained_pending.checked_sub(1) {
+        state.retained_pending = pending;
+    } else {
+        state.counts_invalid = true;
+        batch.failed = true;
+    }
 }
 
 /// The `Interrupted` payload carries the printed progress for tests;

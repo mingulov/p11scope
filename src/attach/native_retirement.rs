@@ -1,5 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
-//! Session-owned quarantine for a whole global static retirement batch.
+//! Session-owned live retirement and bounded collected-Finish ownership.
 
 use super::cleanup_worker::{BatchStatus, BatchTicket};
 use super::global_retirement::Retirements;
@@ -399,7 +399,7 @@ fn array_bytes<T>(capacity: usize) -> Result<usize> {
         .ok_or_else(|| anyhow::anyhow!("collected retirement capacity overflow"))
 }
 
-#[derive(Default)]
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 struct SlotSizing {
     base: bool,
     name: usize,
@@ -482,6 +482,7 @@ struct CollectedPreflight {
     ranks: [usize; 10],
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PreflightPhase {
     InputBase,
     Input(usize),
@@ -498,8 +499,44 @@ enum PreflightPhase {
     Admit,
 }
 
+type PreflightCheckpoint = (PreflightPhase, SlotSizing, usize, usize, usize, [usize; 10]);
+
 impl CollectedPreflight {
+    fn checkpoint(&self) -> PreflightCheckpoint {
+        (
+            self.phase,
+            self.sizing,
+            self.bytes,
+            self.backing,
+            self.high,
+            self.ranks,
+        )
+    }
+
     fn step(
+        &mut self,
+        input: &RetainedRetirementInput,
+        reserver: &SemanticResourceReserver,
+        links: &[RegisteredLink],
+        retained: &BTreeMap<u32, RetainedStaticTarget>,
+        pairs: &PairBook,
+    ) -> Result<bool> {
+        let checkpoint = self.checkpoint();
+        let result = self.step_inner(input, reserver, links, retained, pairs);
+        if result.is_err() {
+            (
+                self.phase,
+                self.sizing,
+                self.bytes,
+                self.backing,
+                self.high,
+                self.ranks,
+            ) = checkpoint;
+        }
+        result
+    }
+
+    fn step_inner(
         &mut self,
         input: &RetainedRetirementInput,
         reserver: &SemanticResourceReserver,
@@ -620,24 +657,16 @@ impl CollectedPreflight {
         Ok(false)
     }
 
-    fn allocation_charge(&self, inputs: usize, links: usize) -> Result<(usize, usize)> {
+    fn allocation_charge(&self, inputs: usize, links: usize) -> Result<(usize, usize, usize)> {
         let mut bytes = self.backing;
-        add_bytes(
-            &mut bytes,
-            std::mem::size_of::<CollectedCursor>() + OWNED_ALLOCATION_PADDING,
-        )?;
-        add_bytes(&mut bytes, 16 + OWNED_ALLOCATION_PADDING)?; // empty cursor Arc
-        add_bytes(
-            &mut bytes,
-            16 + std::mem::size_of::<Vec<Arc<std::fs::File>>>() + OWNED_ALLOCATION_PADDING,
-        )?; // empty legacy FileLeases Arc
+        let shell = std::mem::size_of::<CollectedCursor>() + OWNED_ALLOCATION_PADDING
+            + 16 + OWNED_ALLOCATION_PADDING // constant cursor identity
+            + 2 * (16 + std::mem::size_of::<Vec<Arc<std::fs::File>>>() + OWNED_ALLOCATION_PADDING)
+            + super::cleanup_worker::collected_release_ticket_charge();
         add_bytes(&mut bytes, array_bytes::<SelectionRow>(self.high)?)?;
         add_bytes(&mut bytes, array_bytes::<LinkChoice>(links)?)?;
-        add_bytes(
-            &mut bytes,
-            array_bytes::<Option<RetainedStaticTarget>>(inputs)?,
-        )?;
-        add_bytes(&mut bytes, array_bytes::<Option<PairStamp>>(inputs)?)?;
+        add_bytes(&mut bytes, array_bytes::<RetainedStaticTarget>(inputs)?)?;
+        add_bytes(&mut bytes, array_bytes::<PairStamp>(inputs)?)?;
         add_bytes(&mut bytes, array_bytes::<Arc<std::fs::File>>(inputs)?)?;
         let mut batches = 0usize;
         for count in self.ranks {
@@ -667,7 +696,7 @@ impl CollectedPreflight {
             collected_allocation_charge(links, batches)
                 .ok_or_else(|| anyhow::anyhow!("collected worker backing overflow"))?,
         )?;
-        Ok((bytes, batches))
+        Ok((bytes, shell, batches))
     }
 }
 
@@ -694,6 +723,7 @@ struct LinkChoice {
     selected: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CollectedPhase {
     Allocate(u8),
     Rows,
@@ -720,6 +750,8 @@ enum CollectedPhase {
     },
     Pending(usize),
     Dispose(u8),
+    Release,
+    ReleasePending,
     Refused,
 }
 
@@ -728,6 +760,7 @@ type CollectedChunk = Vec<CollectedPayload>;
 
 struct CollectedCursor {
     input: Option<RetainedRetirementInput>,
+    input_bytes: usize,
     ticket: CollectedRetirementTicket,
     // Address is a refusal-only cache fence. Every call must additionally
     // validate the borrowed original Q, its real domains and ring bounds.
@@ -742,15 +775,17 @@ struct CollectedCursor {
     rows: Vec<SelectionRow>,
     choices: Vec<LinkChoice>,
     buckets: [Vec<RegisteredLink>; 10],
-    targets: Vec<Option<RetainedStaticTarget>>,
-    stamps: Vec<Option<PairStamp>>,
     chunks: Vec<CollectedChunk>,
     tickets: Vec<BatchTicket>,
     mutated: bool,
     cancelling: bool,
     files: super::cleanup_worker::FileLeases,
     // Last: all cursor/deep backing is released before its paid guard.
-    retention: Arc<CollectedCleanupRetention>,
+    retention: Option<Arc<CollectedCleanupRetention>>,
+    release: Option<BatchTicket>,
+    // This independent constant charge outlives the background backing
+    // release. It is taken out before the Box is freed, then refunded.
+    shell_storage: Option<ResourceLease>,
 }
 
 impl CollectedCursor {
@@ -785,25 +820,17 @@ impl CollectedCursor {
                 self.phase = CollectedPhase::Allocate(2);
             }
             CollectedPhase::Allocate(2) => {
-                self.targets = Vec::with_capacity(self.original().removed.len());
+                self.chunks = Vec::with_capacity(self.max_batches);
                 self.phase = CollectedPhase::Allocate(3);
             }
             CollectedPhase::Allocate(3) => {
-                self.stamps = Vec::with_capacity(self.original().removed.len());
+                self.tickets = Vec::with_capacity(self.max_batches);
                 self.phase = CollectedPhase::Allocate(4);
             }
-            CollectedPhase::Allocate(4) => {
-                self.chunks = Vec::with_capacity(self.max_batches);
-                self.phase = CollectedPhase::Allocate(5);
-            }
-            CollectedPhase::Allocate(5) => {
-                self.tickets = Vec::with_capacity(self.max_batches);
-                self.phase = CollectedPhase::Allocate(6);
-            }
-            CollectedPhase::Allocate(index @ 6..=15) => {
-                let rank = index as usize - 6;
+            CollectedPhase::Allocate(index @ 4..=13) => {
+                let rank = index as usize - 4;
                 self.buckets[rank] = Vec::with_capacity(self.ranks[rank]);
-                self.phase = if index == 15 {
+                self.phase = if index == 13 {
                     CollectedPhase::Rows
                 } else {
                     CollectedPhase::Allocate(index + 1)
@@ -920,6 +947,8 @@ impl CollectedCursor {
                         "collected retirement original held target changed"
                     );
                     self.retention
+                        .as_ref()
+                        .expect("precharged retained owner")
                         .retain_file(target.retirement_lease().expect("validated held file"));
                     self.phase = CollectedPhase::Validate(index + 1);
                 } else {
@@ -940,63 +969,39 @@ impl CollectedCursor {
         match step {
             0 => {
                 if self.tickets.pop().is_none() {
+                    self.tickets = Vec::new();
                     self.phase = CollectedPhase::Dispose(1);
                 }
             }
             1 => {
                 if self.chunks.pop().is_none() {
+                    self.chunks = Vec::new();
                     self.phase = CollectedPhase::Dispose(2);
                 }
             }
             2 => {
-                if let Some(Some(target)) = self.targets.last_mut() {
-                    if drop_slot_field(&mut target.slot) {
-                        self.targets.pop();
-                    }
-                } else if self.targets.pop().is_none() {
+                if self.rows.pop().is_none() {
+                    self.rows = Vec::new();
                     self.phase = CollectedPhase::Dispose(3);
                 }
             }
             3 => {
-                if let Some(Some(stamp)) = self.stamps.last_mut() {
-                    if drop_slot_field(&mut stamp.slot) {
-                        self.stamps.pop();
-                    }
-                } else if self.stamps.pop().is_none() {
+                if self.choices.pop().is_none() {
+                    self.choices = Vec::new();
                     self.phase = CollectedPhase::Dispose(4);
                 }
             }
-            4 => {
-                if self.rows.pop().is_none() {
-                    self.phase = CollectedPhase::Dispose(5);
-                }
-            }
-            5 => {
-                if self.choices.pop().is_none() {
-                    self.phase = CollectedPhase::Dispose(6);
-                }
-            }
-            6 => {
-                if !self.retention.release_one_file() {
-                    self.phase = CollectedPhase::Dispose(7);
-                }
-            }
-            7..=16 => {
-                let rank = (step - 7) as usize;
+            4..=13 => {
+                let rank = (step - 4) as usize;
                 debug_assert!(self.buckets[rank].is_empty());
                 self.buckets[rank] = Vec::new();
                 self.phase = CollectedPhase::Dispose(step + 1);
             }
-            17 => return true,
+            14 => return true,
             _ => unreachable!(),
         }
         false
     }
-}
-
-// Fixed number of other descriptor fields and one owned name per credit.
-fn drop_slot_field(slot: &mut Slot) -> bool {
-    slot.names.pop().is_none()
 }
 
 fn held_target_valid_without_copy(target: &RetainedStaticTarget) -> bool {
@@ -1088,6 +1093,22 @@ impl NativeRetirement {
         );
         if let Some(cursor) = &self.collected {
             anyhow::ensure!(
+                !cursor.mutated
+                    && (cursor.cancelling
+                        || matches!(
+                            cursor.phase,
+                            CollectedPhase::Allocate(_)
+                                | CollectedPhase::Rows
+                                | CollectedPhase::Chunks
+                                | CollectedPhase::Selection(_)
+                                | CollectedPhase::LinkStart(_)
+                                | CollectedPhase::LinkMember { .. }
+                                | CollectedPhase::Validate(_)
+                                | CollectedPhase::Prepared
+                        )),
+                "collected preparation has already ended"
+            );
+            anyhow::ensure!(
                 input.is_none()
                     && cursor.q == q as *const _ as usize
                     && same_collected_scope(cursor.scope, scope)
@@ -1107,13 +1128,25 @@ impl NativeRetirement {
                 "collected preflight input/owner/registry changed"
             );
         }
+        let (payment, required) = if let Some(cursor) = &self.collected {
+            (&cursor.original().storage, cursor.input_bytes)
+        } else {
+            (
+                &input
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("collected caller input is missing"))?
+                    .storage,
+                0,
+            )
+        };
+        anyhow::ensure!(
+            reserver.covers(payment, required),
+            "collected preparation refuses a foreign or undercharged retained payment"
+        );
         validate_collected_q(&owner, q, read_events, read_discovery)?;
         if let Some(cursor) = &mut self.collected {
             if cursor.cancelling {
-                if cursor.dispose_one() {
-                    return Ok(self.finish_collected(false));
-                }
-                return Ok(cursor.progress(CollectedRetirementState::Preparing));
+                return self.drive_collected_release(worker, false);
             }
             if let Err(_reason) = cursor.prepare_one(links, retained, worker) {
                 cursor.cancelling = true;
@@ -1146,9 +1179,8 @@ impl NativeRetirement {
             });
             return Ok(RetirementProgress::preparing());
         }
-        let mut preflight = self.preflight.take().expect("current preflight");
+        let preflight = self.preflight.as_mut().expect("current preflight");
         if !preflight.step(original, reserver, links, retained, pairs)? {
-            self.preflight = Some(preflight);
             return Ok(RetirementProgress::preparing());
         }
         // All original/deep capacities and the actual pool check precede
@@ -1158,10 +1190,16 @@ impl NativeRetirement {
             "input payment changed"
         );
         worker.collected_admission().map_err(anyhow::Error::msg)?;
-        let (bytes, batches) = preflight.allocation_charge(original.removed.len(), links.len())?;
+        let (bytes, shell_bytes, batches) =
+            preflight.allocation_charge(original.removed.len(), links.len())?;
         let storage = reserver
             .reserve(bytes)
             .map_err(|_| anyhow::anyhow!("collected retirement cursor budget refused"))?;
+        let shell_storage = reserver
+            .reserve(shell_bytes)
+            .map_err(|_| anyhow::anyhow!("collected retirement shell budget refused"))?;
+        // No fallible query/reservation remains before taking the SAME input.
+        let preflight = self.preflight.take().expect("admitted original preflight");
         let ticket = CollectedRetirementTicket {
             owner: Arc::clone(&self.allocation),
             cursor: Arc::new(()),
@@ -1169,6 +1207,7 @@ impl NativeRetirement {
         let retention = CollectedCleanupRetention::new(storage, original.removed.len());
         let cursor = Box::new(CollectedCursor {
             input: input.take(),
+            input_bytes: preflight.bytes,
             ticket,
             q: preflight.q,
             scope,
@@ -1181,14 +1220,14 @@ impl NativeRetirement {
             rows: Vec::new(),
             choices: Vec::new(),
             buckets: std::array::from_fn(|_| Vec::new()),
-            targets: Vec::new(),
-            stamps: Vec::new(),
             chunks: Vec::new(),
             tickets: Vec::new(),
             mutated: false,
             cancelling: false,
             files: Arc::new(Vec::new()),
-            retention,
+            retention: Some(retention),
+            release: None,
+            shell_storage: Some(shell_storage),
         });
         let progress = cursor.progress(CollectedRetirementState::Preparing);
         self.collected = Some(cursor);
@@ -1199,6 +1238,7 @@ impl NativeRetirement {
         &mut self,
         input: Option<&RetainedRetirementInput>,
         ticket: Option<&CollectedRetirementTicket>,
+        worker: &CleanupWorker,
         work: usize,
     ) -> Result<RetirementProgress> {
         if work == 0 {
@@ -1206,7 +1246,9 @@ impl NativeRetirement {
         }
         if let Some(preflight) = &self.preflight {
             anyhow::ensure!(
-                ticket.is_none() && input.is_some_and(|input| input.identity == preflight.input),
+                ticket.is_none()
+                    && input.is_some_and(|input| input.identity == preflight.input)
+                    && preflight.worker.belongs_to(worker),
                 "collected preparation cancellation is foreign"
             );
             self.preflight = None;
@@ -1221,7 +1263,9 @@ impl NativeRetirement {
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("no collected cursor to cancel"))?;
         anyhow::ensure!(
-            input.is_none() && ticket.is_some_and(|ticket| cursor.matches(ticket)),
+            input.is_none()
+                && ticket.is_some_and(|ticket| cursor.matches(ticket))
+                && cursor.worker.belongs_to(worker),
             "collected cursor cancellation is foreign"
         );
         if cursor.mutated {
@@ -1234,17 +1278,85 @@ impl NativeRetirement {
             cursor.cancelling = true;
             cursor.phase = CollectedPhase::Dispose(0);
         }
-        if cursor.dispose_one() {
-            return Ok(self.finish_collected(false));
+        self.drive_collected_release(worker, false)
+    }
+
+    fn drive_collected_release(
+        &mut self,
+        worker: &CleanupWorker,
+        closed: bool,
+    ) -> Result<RetirementProgress> {
+        let cursor = self.collected.as_mut().expect("current original cursor");
+        anyhow::ensure!(
+            closed || !cursor.mutated,
+            "mutated retirement cannot return an untouched input"
+        );
+        anyhow::ensure!(
+            cursor.worker.belongs_to(worker),
+            "retained release worker is foreign"
+        );
+        match cursor.phase {
+            CollectedPhase::Dispose(_) => {
+                if cursor.dispose_one() {
+                    cursor.phase = CollectedPhase::Release;
+                }
+            }
+            CollectedPhase::Release => {
+                // All variable plain backing and every completed native ticket
+                // are gone. MOVE the actual guard: no foreground alias remains.
+                let guard = cursor
+                    .retention
+                    .take()
+                    .expect("original retained owner guard");
+                match worker.submit_collected_release(guard) {
+                    Ok(ticket) => {
+                        cursor.release = Some(ticket);
+                        cursor.phase = CollectedPhase::ReleasePending;
+                    }
+                    Err(failure) => {
+                        worker.retain_unsubmitted(failure);
+                        cursor.phase = CollectedPhase::Refused;
+                    }
+                }
+            }
+            CollectedPhase::ReleasePending => {
+                let release = cursor
+                    .release
+                    .as_ref()
+                    .expect("original retained release ticket");
+                anyhow::ensure!(
+                    release.belongs_to(worker),
+                    "retained release receipt is foreign"
+                );
+                match release.status() {
+                    BatchStatus::Released => return Ok(self.finish_collected(closed)),
+                    BatchStatus::Pending if worker.running() => {}
+                    BatchStatus::Pending | BatchStatus::Failed => {
+                        cursor.phase = CollectedPhase::Refused
+                    }
+                }
+            }
+            CollectedPhase::Refused => {}
+            _ => bail!("retained owner release is not ready"),
         }
-        Ok(cursor.progress(CollectedRetirementState::Preparing))
+        Ok(
+            cursor.progress(if matches!(cursor.phase, CollectedPhase::Refused) {
+                CollectedRetirementState::RefusedRetained
+            } else if closed {
+                CollectedRetirementState::Pending
+            } else {
+                CollectedRetirementState::Preparing
+            }),
+        )
     }
 
     fn finish_collected(&mut self, closed: bool) -> RetirementProgress {
         let mut cursor = self.collected.take().expect("current collected cursor");
         let input = cursor.input.take().expect("same original removal input");
         let ticket = cursor.ticket.clone();
+        let shell_storage = cursor.shell_storage.take();
         drop(cursor);
+        drop(shell_storage);
         RetirementProgress {
             used: 1,
             state: if closed {
@@ -1290,10 +1402,7 @@ impl NativeRetirement {
         );
         validate_collected_q(&owner, q, read_events, read_discovery)?;
         if cursor.cancelling {
-            if cursor.dispose_one() {
-                return Ok(self.finish_collected(false));
-            }
-            return Ok(cursor.progress(CollectedRetirementState::Preparing));
+            return self.drive_collected_release(worker, false);
         }
         match cursor.phase {
             CollectedPhase::Prepared => {
@@ -1301,7 +1410,13 @@ impl NativeRetirement {
             }
             CollectedPhase::Invalidate(index) => {
                 if let Some(slot) = cursor.original().removed.get(index).map(|slot| slot.index) {
-                    cursor.stamps.push(pairs.take_collected_stamp(slot));
+                    if let Some(stamp) = pairs.take_collected_stamp(slot) {
+                        cursor
+                            .retention
+                            .as_ref()
+                            .expect("retained original guard")
+                            .retain_stamp(stamp);
+                    }
                     cursor.mutated = true;
                     cursor.fence.pair_state = pairs.collected_fence();
                     cursor.phase = CollectedPhase::Invalidate(index + 1);
@@ -1315,7 +1430,11 @@ impl NativeRetirement {
                     if target.is_none() {
                         cursor.phase = CollectedPhase::Refused;
                     } else {
-                        cursor.targets.push(target);
+                        cursor
+                            .retention
+                            .as_ref()
+                            .expect("retained original guard")
+                            .retain_target(target.expect("checked original target"));
                         cursor.fence.target_count = retained.len();
                         cursor.phase = CollectedPhase::Targets(index + 1);
                     }
@@ -1376,7 +1495,12 @@ impl NativeRetirement {
                             worker.note_transfer_failed(owned.len().max(1));
                             // A violated one-payload static leaf contract is
                             // uncertain, never a foreground close opportunity.
-                            std::mem::forget((owned, Arc::clone(&cursor.retention)));
+                            std::mem::forget((
+                                owned,
+                                Arc::clone(
+                                    cursor.retention.as_ref().expect("native ownership guard"),
+                                ),
+                            ));
                             cursor.phase = CollectedPhase::Refused;
                         }
                     }
@@ -1387,7 +1511,7 @@ impl NativeRetirement {
                 match worker.submit_collected(
                     payloads,
                     Arc::clone(&cursor.files),
-                    Arc::clone(&cursor.retention),
+                    Arc::clone(cursor.retention.as_ref().expect("native ownership guard")),
                 ) {
                     Ok(batch) => {
                         cursor.tickets.push(batch);
@@ -1460,11 +1584,11 @@ impl NativeRetirement {
                     cursor.phase = CollectedPhase::Dispose(0);
                 }
             }
-            CollectedPhase::Dispose(_) => {
-                if cursor.dispose_one() {
-                    let closed = !cursor.cancelling;
-                    return Ok(self.finish_collected(closed));
-                }
+            CollectedPhase::Dispose(_)
+            | CollectedPhase::Release
+            | CollectedPhase::ReleasePending => {
+                let closed = !cursor.cancelling;
+                return self.drive_collected_release(worker, closed);
             }
             CollectedPhase::Refused => {
                 return Ok(cursor.progress(CollectedRetirementState::RefusedRetained));
@@ -1502,6 +1626,7 @@ impl NativeRetirement {
     /// the SAME worker, then explicitly abandon all uncertain cursor custody.
     pub(super) fn abandon_collected_with(
         &mut self,
+        remaining: &[RegisteredLink],
         worker: Option<&CleanupWorker>,
         mut transfer: impl FnMut(RegisteredLink) -> Result<Vec<OwnedLink>>,
     ) {
@@ -1512,6 +1637,39 @@ impl NativeRetirement {
             return;
         };
         if !cursor.worker.belongs_to(worker) {
+            return;
+        }
+        let Some(retention) = cursor.retention.as_ref() else {
+            worker.note_failure("collected cursor abandoned during retained-owner release".into());
+            return;
+        };
+        if !remaining.is_empty() {
+            // A return may have been extracted before its entry. The separate
+            // remaining-registry submit cannot prove one merged rank order:
+            // retain these ACTUAL unsent handles rather than queue return first.
+            for bucket in &mut cursor.buckets {
+                while let Some(original) = bucket.pop() {
+                    let producer = original.producer();
+                    match transfer(original) {
+                        Ok(owned) => worker.retain_collected_abandoned(
+                            owned.into_iter().map(|owned| (owned, producer)).collect(),
+                            Arc::clone(&cursor.files),
+                            Arc::clone(retention),
+                        ),
+                        Err(_) => worker.note_transfer_failed(1),
+                    }
+                }
+            }
+            for chunk in &mut cursor.chunks {
+                if !chunk.is_empty() {
+                    worker.retain_collected_abandoned(
+                        std::mem::take(chunk),
+                        Arc::clone(&cursor.files),
+                        Arc::clone(retention),
+                    );
+                }
+            }
+            worker.note_failure("collected destructor retained an unproved joint handoff".into());
             return;
         }
         // Only destruction uses this loop. Normal work/cancellation never
@@ -1534,7 +1692,7 @@ impl NativeRetirement {
                             if let Err(failure) = worker.submit_collected(
                                 payloads,
                                 Arc::clone(&cursor.files),
-                                Arc::clone(&cursor.retention),
+                                Arc::clone(retention),
                             ) {
                                 worker.retain_unsubmitted(failure);
                             }
@@ -1543,7 +1701,7 @@ impl NativeRetirement {
                     }
                     Ok(owned) => {
                         worker.note_transfer_failed(1);
-                        std::mem::forget((owned, Arc::clone(&cursor.retention)));
+                        std::mem::forget((owned, Arc::clone(retention)));
                     }
                     Err(_) => worker.note_transfer_failed(1),
                 }
@@ -1558,7 +1716,7 @@ impl NativeRetirement {
                 if let Err(failure) = worker.submit_collected(
                     payloads,
                     Arc::clone(&cursor.files),
-                    Arc::clone(&cursor.retention),
+                    Arc::clone(retention),
                 ) {
                     worker.retain_unsubmitted(failure);
                 }

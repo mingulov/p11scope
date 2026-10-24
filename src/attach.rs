@@ -7042,8 +7042,15 @@ impl Session {
         ticket: Option<&CollectedRetirementTicket>,
         work: usize,
     ) -> Result<RetirementProgress> {
+        if work == 0 {
+            return Ok(RetirementProgress::yielded());
+        }
+        let worker = self
+            .cleanup_worker
+            .as_ref()
+            .context("collected cancellation needs its original worker")?;
         self.native_retirement
-            .cancel_collected_with(input, ticket, work)
+            .cancel_collected_with(input, ticket, worker, work)
     }
 
     /// Cleanup of an uncompleted new attachment is not coverage retirement.
@@ -8360,11 +8367,14 @@ impl Drop for Session {
             .as_ref()
             .map(|banks| Arc::clone(&banks.keepalive));
         let ebpf = &mut self.ebpf;
-        self.native_retirement
-            .abandon_collected_with(self.cleanup_worker.as_ref(), |original| {
+        self.native_retirement.abandon_collected_with(
+            &self.links,
+            self.cleanup_worker.as_ref(),
+            |original| {
                 take_collected_owned_link(ebpf, original)
                     .map(|owned| vec![counter_banks::retain_link(owned, keepalive.as_ref())])
-            });
+            },
+        );
         // Never block on a worker-owned link: leftovers move to the
         // worker and close in the background (at process exit the kernel
         // finishes). Evidence is best-effort; there is no caller to fail.

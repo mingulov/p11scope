@@ -1586,7 +1586,17 @@ fn joint_machine_collected_finish_first_unread_work_reaches_h9() {
                 break;
             }
         }
-        if fixture.reduced() == [3] {
+        if fixture.reduced() == [3]
+            && fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .registry()
+                .published_revision()
+                == revision + 1
+            && !fixture.scene.real.scene.coordinator.publication_pending()
+        {
             break;
         }
     }
@@ -1745,19 +1755,43 @@ fn joint_machine_collected_finish_preserves_last_return_before_stopped() {
         "ordinary H0 admission is gated"
     );
     let mut saw_last_return = false;
+    let mut last_return_published = false;
     for _ in 0..512 {
         assert!(matches!(
             fixture.poll_finish(1).unwrap(),
             crate::discovery::engine::inventory_coordinator::JointCommitProgress::Pending
         ));
-        if fixture.reduced() == [3] {
+        assert!(!fixture.scene.real.h0.0.borrow().capture.stopped);
+        assert_eq!(fixture.finish.as_ref().unwrap().stops, 0);
+        if fixture.reduced() == [3] && !saw_last_return {
             saw_last_return = true;
-            break;
+            assert!(fixture.scene.real.scene.coordinator.publication_pending());
+        }
+        if saw_last_return {
+            assert_eq!(fixture.reduced(), [3]);
+            let current_revision = fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .registry()
+                .published_revision();
+            assert!(current_revision <= revision + 1);
+            if current_revision == revision + 1
+                && !fixture.scene.real.scene.coordinator.publication_pending()
+            {
+                last_return_published = true;
+                break;
+            }
         }
     }
     assert!(
         saw_last_return,
         "the last original reaches actual H9 before Stop"
+    );
+    assert!(
+        last_return_published,
+        "the actual original publishes before Stop"
     );
     assert!(!fixture.scene.real.h0.0.borrow().capture.stopped);
     assert_eq!(fixture.finish.as_ref().unwrap().stops, 0);

@@ -8638,12 +8638,14 @@ mod tests {
             producers: &super::SessionDrainProducers,
             records: impl IntoIterator<Item = Vec<u8>>,
         ) -> Self {
+            let records: Vec<_> = records.into_iter().collect();
+            let bound = records.len();
             let discovery_domain = crate::events::DiscoveryDomain::test_standin(0xf1d5);
             Self {
                 gate: FinishQGate::new(),
                 producers: producers.clone(),
                 discovery: crate::events::DiscoveryDrain::over_domain(
-                    crate::events::ScriptedRecords::records(records, 1),
+                    crate::events::ScriptedRecords::records(records, bound),
                     discovery_domain.clone(),
                 ),
                 discovery_domain,

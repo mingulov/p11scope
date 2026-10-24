@@ -17,6 +17,7 @@ use std::os::fd::{AsRawFd as _, RawFd};
 use std::os::unix::fs::{FileExt as _, MetadataExt as _};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use p11scope_manifest::elf::ElfAbi;
 use p11scope_manifest::identity::{
@@ -33,6 +34,9 @@ use crate::discovery::scan::{
 };
 use crate::manifest_input::{MAX_TOTAL_OBJECT_BYTES, validate_structure};
 use crate::process::{MountNamespaceId, MountTableCache, ProcessView, ProcessViewId};
+use crate::semantics_edge::resources::{
+    OWNED_ALLOCATION_PADDING, ResourceLease, SemanticResourceRefusal, SemanticResourceReserver,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct Pin {
@@ -878,7 +882,7 @@ pub struct ReconciledModule {
 /// No read leases are held:
 /// `check_unchanged` is a cheap, best-effort check, not a guarantee that the bytes
 /// cannot change between the check and Aya's attach.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PinnedObjects {
     by_id: BTreeMap<PinnedObjectId, Entry>,
     raw_to_id: BTreeMap<RawObjectInstance, PinnedObjectId>,
@@ -898,6 +902,50 @@ pub struct PinnedObjects {
     /// the live display (the frame backstop and the terminal sweep carry
     /// correctness), so bumps are conservative, never exact.
     revision: u64,
+    // Process-local cache fences only, never object/admission/attachment IDs.
+    copy_source: Option<PinCopyCacheId>,
+    copy_version: u64,
+}
+
+impl Clone for PinnedObjects {
+    fn clone(&self) -> Self {
+        Self {
+            by_id: self.by_id.clone(),
+            raw_to_id: self.raw_to_id.clone(),
+            rejected_keys: self.rejected_keys.clone(),
+            ambiguous_keys: self.ambiguous_keys.clone(),
+            ambiguity_published: self.ambiguity_published.clone(),
+            ownership: self.ownership.clone(),
+            raw_ownership: self.raw_ownership.clone(),
+            next_id: self.next_id,
+            overlay_uncertain: self.overlay_uncertain,
+            changed: std::cell::Cell::new(self.changed.get()),
+            revision: self.revision,
+            copy_source: mint_pin_copy_cache_id(&NEXT_PIN_COPY_SOURCE),
+            copy_version: self.copy_version,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PinCopyCacheId(std::num::NonZeroU64);
+
+impl std::fmt::Debug for PinCopyCacheId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PinCopyCacheId(<private>)")
+    }
+}
+
+static NEXT_PIN_COPY_SOURCE: AtomicU64 = AtomicU64::new(0);
+static NEXT_PIN_COPY_SELECTION: AtomicU64 = AtomicU64::new(0);
+
+fn mint_pin_copy_cache_id(counter: &AtomicU64) -> Option<PinCopyCacheId> {
+    let previous = counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+            old.checked_add(1)
+        })
+        .ok()?;
+    std::num::NonZeroU64::new(previous + 1).map(PinCopyCacheId)
 }
 
 impl PinnedObjects {
@@ -916,6 +964,8 @@ impl PinnedObjects {
             overlay_uncertain: false,
             changed: std::cell::Cell::new(false),
             revision: 0,
+            copy_source: mint_pin_copy_cache_id(&NEXT_PIN_COPY_SOURCE),
+            copy_version: 0,
         }
     }
 
@@ -926,6 +976,11 @@ impl PinnedObjects {
 
     fn bump_revision(&mut self) {
         self.revision = self.revision.saturating_add(1);
+        self.bump_copy_version();
+    }
+
+    fn bump_copy_version(&mut self) {
+        self.copy_version = self.copy_version.saturating_add(1);
     }
 
     /// Folds another pin set into this capture. Exact comparable identities merge;
@@ -1295,6 +1350,7 @@ impl PinnedObjects {
     /// Clears plan-derived table/target claims before the canonical raw module
     /// set is rebound. Opened pin ownership remains intact.
     pub(crate) fn reset_derived_claims(&mut self) {
+        self.bump_copy_version();
         for claims in self.ownership.values_mut() {
             claims.tables.clear();
             claims.targets.clear();
@@ -1308,6 +1364,7 @@ impl PinnedObjects {
     /// aliases resolve to the same physical object. Object IDs, aliases, and
     /// opened-file custody remain unchanged.
     pub(crate) fn reset_scan_pin_claims(&mut self) {
+        self.bump_copy_version();
         for (view, claims) in &mut self.ownership {
             claims.pins = self
                 .raw_ownership
@@ -1595,6 +1652,7 @@ impl PinnedObjects {
         if !self.by_id.contains_key(&scan_id) {
             return;
         }
+        self.bump_copy_version();
         self.raw_to_id.remove(&manifest_raw);
         let referenced = self.raw_to_id.values().any(|id| *id == manifest_id)
             || self.ownership.values().any(|claims| {
@@ -1719,6 +1777,7 @@ impl PinnedObjects {
         incoming_scan_only: bool,
         skipped: &mut Vec<Skipped>,
     ) -> Option<PinnedObjectId> {
+        self.bump_copy_version();
         let key = entry.raw.key;
         if self.rejected_keys.contains(&key) {
             self.ambiguous_keys.insert(key);
@@ -1817,6 +1876,7 @@ impl PinnedObjects {
     }
 
     fn publish_ambiguities(&mut self, skipped: &mut Vec<Skipped>) {
+        self.bump_copy_version();
         for key in self
             .ambiguous_keys
             .difference(&self.ambiguity_published)
@@ -1829,10 +1889,1539 @@ impl PinnedObjects {
     }
 }
 
+// Inactive collected graph-builder boundary. Ready is structural and borrowed;
+// Engine installation must first supply its own persistent backing-lease sink.
+#[allow(unused_imports)]
+pub(crate) use conservative_copy::{
+    ConservativePinSelection, GraphRefusal, GraphStep, PinnedConservativeCursor,
+};
+#[cfg(test)]
+use conservative_copy::{conservative_pin_tree_bytes, deallocate_drained_unique_arc};
+
+#[allow(dead_code)] // Staged pure builders, not yet selected by the live Engine.
+mod conservative_copy {
+    use super::*;
+    use std::ops::Bound::{Excluded, Unbounded};
+
+    const TEXT_QUANTUM: usize = 4096;
+
+    /// Value construction only: none of these outcomes establish native or
+    /// semantic readiness, retirement, admission, or receipt authority.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum GraphStep {
+        Yielded,
+        Advanced,
+        Ready,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum GraphRefusal {
+        Storage(SemanticResourceRefusal),
+        SourceChanged,
+        Identity,
+        Overflow,
+        Cancelled,
+    }
+
+    /// Immutable original selection and its actual same-pool payment. Neither
+    /// equal cardinalities nor a reused Vec/tree allocation can resume a cursor.
+    #[derive(Debug)]
+    pub(crate) struct ConservativePinSelection {
+        retired: BTreeSet<ProcessViewId>,
+        rejected: BTreeSet<ObjectKey>,
+        identity: PinCopyCacheId,
+        storage: ResourceLease,
+    }
+
+    #[derive(Debug)]
+    pub(crate) struct ConservativePinSelectionRefusal {
+        retired: BTreeSet<ProcessViewId>,
+        rejected: BTreeSet<ObjectKey>,
+        storage: ResourceLease,
+    }
+
+    impl ConservativePinSelectionRefusal {
+        /// O(1) owner return; disposal of these original trees remains explicit.
+        pub(crate) fn into_originals(
+            self,
+        ) -> (BTreeSet<ProcessViewId>, BTreeSet<ObjectKey>, ResourceLease) {
+            (self.retired, self.rejected, self.storage)
+        }
+    }
+
+    impl ConservativePinSelection {
+        pub(crate) fn storage_bound(retired: usize, rejected: usize) -> Option<usize> {
+            std::mem::size_of::<Self>()
+                .checked_add(conservative_pin_tree_bytes::<ProcessViewId, ()>(retired)?)?
+                .checked_add(conservative_pin_tree_bytes::<ObjectKey, ()>(rejected)?)
+        }
+
+        pub(crate) fn from_reserved_originals(
+            retired: BTreeSet<ProcessViewId>,
+            rejected: BTreeSet<ObjectKey>,
+            storage: ResourceLease,
+            reserve: &SemanticResourceReserver,
+        ) -> Result<Self, ConservativePinSelectionRefusal> {
+            let required = Self::storage_bound(retired.len(), rejected.len());
+            let identity = required
+                .filter(|bytes| reserve.covers(&storage, *bytes))
+                .and_then(|_| mint_pin_copy_cache_id(&NEXT_PIN_COPY_SELECTION));
+            match identity {
+                Some(identity) => Ok(Self {
+                    retired,
+                    rejected,
+                    identity,
+                    storage,
+                }),
+                None => Err(ConservativePinSelectionRefusal {
+                    retired,
+                    rejected,
+                    storage,
+                }),
+            }
+        }
+
+        fn retires(&self, source: &PinnedObjects, view: ProcessViewId) -> bool {
+            self.retired.contains(&view) && source.ownership.contains_key(&view)
+        }
+    }
+
+    /// Rust 1.98.1 alloc::collections::btree::node has B=6: eleven key/value
+    /// slots, twelve edges, and a 16-byte header on Linux x86-64. Account for
+    /// field padding and two full internal nodes per element, plus split/root
+    /// slack. This covers the old/new nodes of incremental insertion. These
+    /// actual private key/value types have alignment <=8; other layouts refuse.
+    pub(super) fn conservative_pin_tree_bytes<K, V>(entries: usize) -> Option<usize> {
+        fn align8(bytes: usize) -> Option<usize> {
+            bytes.checked_add(7).map(|value| value & !7)
+        }
+        if std::mem::align_of::<K>() > 8 || std::mem::align_of::<V>() > 8 {
+            return None;
+        }
+        let node = 16usize
+            .checked_add(align8(std::mem::size_of::<K>().checked_mul(11)?)?)?
+            .checked_add(align8(std::mem::size_of::<V>().checked_mul(11)?)?)?
+            .checked_add(12 * 8)?
+            .checked_add(OWNED_ALLOCATION_PADDING)?;
+        entries.checked_mul(2)?.checked_add(4)?.checked_mul(node)
+    }
+
+    fn bytes_for<T>(count: usize) -> Result<usize, GraphRefusal> {
+        count
+            .checked_mul(std::mem::size_of::<T>())
+            .and_then(|bytes| bytes.checked_add(OWNED_ALLOCATION_PADDING))
+            .ok_or(GraphRefusal::Overflow)
+    }
+
+    fn tree<K, V>(count: usize) -> Result<usize, GraphRefusal> {
+        conservative_pin_tree_bytes::<K, V>(count).ok_or(GraphRefusal::Overflow)
+    }
+
+    fn add(total: &mut usize, bytes: usize) -> Result<(), GraphRefusal> {
+        *total = total.checked_add(bytes).ok_or(GraphRefusal::Overflow)?;
+        Ok(())
+    }
+
+    fn text_bytes(text: &str) -> Result<usize, GraphRefusal> {
+        text.len()
+            .checked_add(OWNED_ALLOCATION_PADDING)
+            .ok_or(GraphRefusal::Overflow)
+    }
+
+    fn copy_text(target: &mut String, original: &str) -> bool {
+        let start = target.len();
+        let mut end = start.saturating_add(TEXT_QUANTUM).min(original.len());
+        while !original.is_char_boundary(end) {
+            end -= 1;
+        }
+        target.push_str(&original[start..end]);
+        end == original.len()
+    }
+
+    fn next_map<'a, K: Ord, V>(
+        map: &'a BTreeMap<K, V>,
+        after: Option<&K>,
+    ) -> Option<(&'a K, &'a V)> {
+        match after {
+            Some(key) => map.range((Excluded(key), Unbounded)).next(),
+            None => map.first_key_value(),
+        }
+    }
+
+    fn next_set<'a, K: Ord>(set: &'a BTreeSet<K>, after: Option<&K>) -> Option<&'a K> {
+        match after {
+            Some(key) => set.range((Excluded(key), Unbounded)).next(),
+            None => set.first(),
+        }
+    }
+
+    // At most two owned resume keys. During measurement each actual allocation
+    // is paid before its String is allocated. During construction the admitted
+    // whole-envelope lease covers these buffers. Field order refunds only after
+    // the owned String has been freed.
+    struct RawResume {
+        raw: RawObjectInstance,
+        storage: Option<ResourceLease>,
+    }
+
+    #[derive(Default)]
+    struct RawWalker {
+        ended: bool,
+        last: Option<RawResume>,
+        incoming: Option<RawResume>,
+    }
+
+    impl RawWalker {
+        fn after(&self) -> Option<&RawObjectInstance> {
+            self.last.as_ref().map(|key| &key.raw)
+        }
+
+        /// One allocation or <=4096 bytes copied. `next` is borrowed directly
+        /// from the fenced source at the successor of our paid original key.
+        fn advance(
+            &mut self,
+            next: Option<&RawObjectInstance>,
+            reserve: &SemanticResourceReserver,
+            separately_paid: bool,
+        ) -> Result<WalkStep, GraphRefusal> {
+            if self.ended {
+                return Ok(WalkStep::End);
+            }
+            let Some(next) = next else {
+                self.ended = true;
+                return Ok(WalkStep::End);
+            };
+            if self.incoming.is_none() {
+                let storage = if separately_paid {
+                    Some(
+                        reserve
+                            .reserve(text_bytes(&next.path)?)
+                            .map_err(GraphRefusal::Storage)?,
+                    )
+                } else {
+                    None
+                };
+                self.incoming = Some(RawResume {
+                    raw: RawObjectInstance {
+                        mount_namespace: next.mount_namespace,
+                        key: next.key,
+                        path: String::with_capacity(next.path.len()),
+                    },
+                    storage,
+                });
+                return Ok(WalkStep::Progress);
+            }
+            let incoming = self.incoming.as_mut().ok_or(GraphRefusal::Identity)?;
+            if copy_text(&mut incoming.raw.path, &next.path) {
+                // One old String leaf and its measurement lease die here.
+                self.last = self.incoming.take();
+                return Ok(WalkStep::Item);
+            }
+            Ok(WalkStep::Progress)
+        }
+
+        fn release_one(&mut self) -> bool {
+            if self.incoming.take().is_some() {
+                return false;
+            }
+            if self.last.take().is_some() {
+                return false;
+            }
+            true
+        }
+    }
+
+    #[derive(PartialEq, Eq)]
+    enum WalkStep {
+        Progress,
+        Item,
+        End,
+    }
+
+    struct EntryCopy {
+        id: PinnedObjectId,
+        entry: Entry,
+        field: u8,
+    }
+
+    impl EntryCopy {
+        fn new(id: PinnedObjectId, old: &Entry) -> Self {
+            Self {
+                id,
+                entry: Entry {
+                    raw: RawObjectInstance {
+                        mount_namespace: old.raw.mount_namespace,
+                        key: old.raw.key,
+                        path: String::with_capacity(old.raw.path.len()),
+                    },
+                    mapping: old.mapping,
+                    file: old.file.clone(),
+                    pin: old.pin,
+                    mapped: old.mapped,
+                    path: String::new(),
+                    sha256: String::new(),
+                    build_id: old.build_id.as_ref().map(|_| String::new()),
+                    abi: old.abi,
+                    exports: old.exports.clone(),
+                    overlay: old.overlay,
+                    collapsed: old.collapsed,
+                },
+                field: 0,
+            }
+        }
+
+        fn advance(&mut self, old: &Entry) -> bool {
+            let (target, original) = match self.field {
+                0 => (&mut self.entry.raw.path, old.raw.path.as_str()),
+                1 => (&mut self.entry.path, old.path.as_str()),
+                2 => (&mut self.entry.sha256, old.sha256.as_str()),
+                3 => match (&mut self.entry.build_id, &old.build_id) {
+                    (Some(target), Some(original)) => (target, original.as_str()),
+                    _ => {
+                        self.field = 4;
+                        return false;
+                    }
+                },
+                _ => return true,
+            };
+            if target.capacity() < original.len() {
+                // Exactly one known request; no repeated growth or hidden peak.
+                target.reserve_exact(original.len());
+                return false;
+            }
+            if copy_text(target, original) {
+                self.field += 1;
+            }
+            false
+        }
+    }
+
+    struct EntryReclaim {
+        id: PinnedObjectId,
+        raw: String,
+        path: String,
+        digest: String,
+        build: Option<String>,
+        file: Option<Arc<std::fs::File>>,
+        exports: Option<Arc<[(String, u64)]>>,
+        field: u8,
+        drained: usize,
+    }
+
+    impl EntryReclaim {
+        fn new(id: PinnedObjectId, entry: Entry) -> Self {
+            Self {
+                id,
+                raw: entry.raw.path,
+                path: entry.path,
+                digest: entry.sha256,
+                build: entry.build_id,
+                file: Some(entry.file),
+                exports: Some(entry.exports),
+                field: 0,
+                drained: 0,
+            }
+        }
+
+        fn advance(&mut self, source: Option<&PinnedObjects>) -> Result<bool, GraphRefusal> {
+            match self.field {
+                0 => drop(std::mem::take(&mut self.raw)),
+                1 => drop(std::mem::take(&mut self.path)),
+                2 => drop(std::mem::take(&mut self.digest)),
+                3 => drop(self.build.take()),
+                4 => drop(self.file.take()),
+                5 => {
+                    let Some(exports) = self.exports.as_mut() else {
+                        return Ok(true);
+                    };
+                    if source
+                        .and_then(|pins| pins.by_id.get(&self.id))
+                        .is_some_and(|held| Arc::ptr_eq(&held.exports, exports))
+                    {
+                        // A borrowed LIVE actual alias proves this release
+                        // cannot run the final payload/slice destructor.
+                        drop(self.exports.take());
+                    } else {
+                        let slice = Arc::get_mut(exports).ok_or(GraphRefusal::Identity)?;
+                        if self.drained < slice.len() {
+                            drop(std::mem::take(&mut slice[self.drained].0));
+                            self.drained += 1;
+                            return Ok(false);
+                        }
+                        // No callback, exposed Arc/element, or alias-creating
+                        // operation between this exclusive recheck and transfer.
+                        let slice = Arc::get_mut(exports).ok_or(GraphRefusal::Identity)?;
+                        if self.drained != slice.len() {
+                            return Err(GraphRefusal::Identity);
+                        }
+                        let exports = self.exports.take().ok_or(GraphRefusal::Identity)?;
+                        // SAFETY: each String payload was mem::take+freed once;
+                        // the remaining Strings have zero capacity and are valid.
+                        // drained==len and get_mut just proved no other strong
+                        // or Weak reference. Same allocation and slice metadata
+                        // are consumed once, with no intervening observer.
+                        unsafe {
+                            deallocate_drained_unique_arc(exports);
+                        }
+                    }
+                }
+                _ => return Ok(true),
+            }
+            self.field += 1;
+            Ok(false)
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Phase {
+        New,
+        MeasureEntries,
+        MeasureExports,
+        MeasureClaims,
+        MeasureRaws,
+        MeasureOwnedRows,
+        MeasureOwnedRaws,
+        Admit,
+        IndexClaims,
+        IndexManifest,
+        IndexRaws,
+        Classify,
+        Entries,
+        RawMap,
+        Ownership,
+        RawOwnership,
+        Rejected,
+        Ambiguous,
+        Published,
+        ApplyRejected,
+        Publish,
+        Ready,
+        Reclaim,
+        Reclaimed,
+    }
+
+    #[derive(Clone, Copy)]
+    struct SourceFence {
+        identity: PinCopyCacheId,
+        revision: u64,
+        copy_version: u64,
+        changed: bool,
+        selection: PinCopyCacheId,
+    }
+
+    impl SourceFence {
+        fn new(
+            source: &PinnedObjects,
+            selection: &ConservativePinSelection,
+        ) -> Result<Self, GraphRefusal> {
+            if source.revision == u64::MAX || source.copy_version == u64::MAX {
+                return Err(GraphRefusal::SourceChanged);
+            }
+            Ok(Self {
+                identity: source.copy_source.ok_or(GraphRefusal::Identity)?,
+                revision: source.revision,
+                copy_version: source.copy_version,
+                changed: source.changed.get(),
+                selection: selection.identity,
+            })
+        }
+
+        fn check(
+            &self,
+            source: &PinnedObjects,
+            selection: &ConservativePinSelection,
+        ) -> Result<(), GraphRefusal> {
+            if source.copy_source != Some(self.identity) || selection.identity != self.selection {
+                return Err(GraphRefusal::Identity);
+            }
+            if source.revision != self.revision
+                || source.copy_version != self.copy_version
+                || source.changed.get() != self.changed
+                || source.revision == u64::MAX
+                || source.copy_version == u64::MAX
+            {
+                return Err(GraphRefusal::SourceChanged);
+            }
+            Ok(())
+        }
+    }
+
+    /// Every output/scratch allocation stays with these leases through borrowed
+    /// Ready and bounded reclamation. There is deliberately no take/swap API.
+    pub(crate) struct PinnedConservativeCursor {
+        phase: Phase,
+        fence: Option<SourceFence>,
+        required: Option<usize>,
+        measured: usize,
+        output: Option<PinnedObjects>,
+        skipped: Vec<Skipped>,
+        removed_ids: BTreeSet<PinnedObjectId>,
+        retained_ids: BTreeSet<PinnedObjectId>,
+        rejected_ids: BTreeSet<PinnedObjectId>,
+        removed_raws: BTreeSet<RawObjectInstance>,
+        retained_raws: BTreeSet<RawObjectInstance>,
+        walker: RawWalker,
+        raw_copy: Option<RawObjectInstance>,
+        raw_action: bool,
+        entry: Option<EntryCopy>,
+        reclaim_entry: Option<EntryReclaim>,
+        claims: Option<(ProcessViewId, ViewClaims)>,
+        skipped_leaf: Option<Skipped>,
+        last_id: Option<PinnedObjectId>,
+        last_view: Option<ProcessViewId>,
+        active_view: Option<ProcessViewId>,
+        last_key: Option<ObjectKey>,
+        bucket: u8,
+        index: usize,
+        retired_count: u64,
+        reclaim_phase: u8,
+        after_claim_reclaim: u8,
+        // Owners above are released BEFORE the actual extra payment below.
+        backing: Option<ResourceLease>,
+        header: Option<ResourceLease>,
+    }
+
+    impl PinnedConservativeCursor {
+        pub(crate) fn new() -> Self {
+            Self {
+                phase: Phase::New,
+                fence: None,
+                required: None,
+                measured: 0,
+                output: None,
+                skipped: Vec::new(),
+                removed_ids: BTreeSet::new(),
+                retained_ids: BTreeSet::new(),
+                rejected_ids: BTreeSet::new(),
+                removed_raws: BTreeSet::new(),
+                retained_raws: BTreeSet::new(),
+                walker: RawWalker::default(),
+                raw_copy: None,
+                raw_action: false,
+                entry: None,
+                reclaim_entry: None,
+                claims: None,
+                skipped_leaf: None,
+                last_id: None,
+                last_view: None,
+                active_view: None,
+                last_key: None,
+                bucket: 0,
+                index: 0,
+                retired_count: 0,
+                reclaim_phase: 0,
+                after_claim_reclaim: 3,
+                backing: None,
+                header: None,
+            }
+        }
+
+        pub(crate) fn pinned(&self) -> Option<&PinnedObjects> {
+            (self.phase == Phase::Ready)
+                .then_some(self.output.as_ref())
+                .flatten()
+        }
+
+        pub(crate) fn skipped(&self) -> Option<&[Skipped]> {
+            (self.phase == Phase::Ready).then_some(self.skipped.as_slice())
+        }
+
+        pub(crate) fn required_bytes(&self) -> Option<usize> {
+            self.required
+        }
+
+        fn check_pool(
+            &self,
+            selection: &ConservativePinSelection,
+            reserve: &SemanticResourceReserver,
+        ) -> Result<(), GraphRefusal> {
+            if !reserve.covers(&selection.storage, 0)
+                || self
+                    .header
+                    .as_ref()
+                    .is_some_and(|lease| !reserve.covers(lease, 0))
+                || self
+                    .backing
+                    .as_ref()
+                    .is_some_and(|lease| !reserve.covers(lease, 0))
+            {
+                return Err(GraphRefusal::Identity);
+            }
+            Ok(())
+        }
+
+        fn keep_after_retirement(&self, id: PinnedObjectId) -> bool {
+            !self.removed_ids.contains(&id) || self.retained_ids.contains(&id)
+        }
+
+        fn output_mut(&mut self) -> Result<&mut PinnedObjects, GraphRefusal> {
+            self.output.as_mut().ok_or(GraphRefusal::Identity)
+        }
+
+        fn next_phase(&mut self, next: Phase) {
+            self.phase = next;
+            self.last_id = None;
+            self.last_view = None;
+            self.active_view = None;
+            self.last_key = None;
+            self.index = 0;
+            self.bucket = 0;
+        }
+
+        fn initial_bound(
+            source: &PinnedObjects,
+            selection: &ConservativePinSelection,
+        ) -> Result<usize, GraphRefusal> {
+            let mut total = std::mem::size_of::<Self>() + OWNED_ALLOCATION_PADDING;
+            add(
+                &mut total,
+                tree::<PinnedObjectId, Entry>(source.by_id.len())?,
+            )?;
+            add(
+                &mut total,
+                tree::<RawObjectInstance, PinnedObjectId>(source.raw_to_id.len())?,
+            )?;
+            add(
+                &mut total,
+                tree::<ProcessViewId, ViewClaims>(source.ownership.len())?,
+            )?;
+            add(
+                &mut total,
+                tree::<ProcessViewId, BTreeSet<RawObjectInstance>>(source.raw_ownership.len())?,
+            )?;
+            let keys = source
+                .ambiguous_keys
+                .len()
+                .checked_add(selection.rejected.len())
+                .ok_or(GraphRefusal::Overflow)?;
+            add(
+                &mut total,
+                tree::<ObjectKey, ()>(
+                    source
+                        .rejected_keys
+                        .len()
+                        .checked_add(selection.rejected.len())
+                        .ok_or(GraphRefusal::Overflow)?,
+                )?,
+            )?;
+            add(&mut total, tree::<ObjectKey, ()>(keys)?)?;
+            add(
+                &mut total,
+                tree::<ObjectKey, ()>(
+                    source
+                        .ambiguity_published
+                        .len()
+                        .checked_add(keys)
+                        .ok_or(GraphRefusal::Overflow)?,
+                )?,
+            )?;
+            add(&mut total, bytes_for::<Skipped>(keys)?)?;
+            add(
+                &mut total,
+                keys.checked_mul(
+                    AMBIGUOUS_SUBJECT.len() + AMBIGUOUS_REASON.len() + 2 * OWNED_ALLOCATION_PADDING,
+                )
+                .ok_or(GraphRefusal::Overflow)?,
+            )?;
+            // Removed/retained/rejected ID indexes, manifest raw aliases, and
+            // paid raw resume/output scratch can coexist with the output.
+            add(&mut total, tree::<PinnedObjectId, ()>(source.by_id.len())?)?;
+            add(
+                &mut total,
+                tree::<PinnedObjectId, ()>(source.raw_to_id.len())?,
+            )?;
+            add(
+                &mut total,
+                tree::<RawObjectInstance, ()>(source.raw_to_id.len())?,
+            )?;
+            Ok(total)
+        }
+
+        fn advance_owned_measure(
+            &mut self,
+            source: &PinnedObjects,
+            reserve: &SemanticResourceReserver,
+        ) -> Result<(), GraphRefusal> {
+            if let Some(view) = self.active_view {
+                let originals = source
+                    .raw_ownership
+                    .get(&view)
+                    .ok_or(GraphRefusal::SourceChanged)?;
+                let next = next_set(originals, self.walker.after());
+                match self.walker.advance(next, reserve, true)? {
+                    WalkStep::Progress => {}
+                    WalkStep::Item => {
+                        let raw = &self.walker.last.as_ref().ok_or(GraphRefusal::Identity)?.raw;
+                        let bytes = text_bytes(&raw.path)?
+                            .checked_mul(6)
+                            .ok_or(GraphRefusal::Overflow)?;
+                        add(&mut self.measured, bytes)?;
+                    }
+                    WalkStep::End => {
+                        if self.walker.release_one() {
+                            self.walker = RawWalker::default();
+                            self.last_view = Some(view);
+                            self.active_view = None;
+                            self.phase = Phase::MeasureOwnedRows;
+                        }
+                    }
+                }
+            } else {
+                return Err(GraphRefusal::Identity);
+            }
+            Ok(())
+        }
+
+        fn advance_claim_index(
+            &mut self,
+            source: &PinnedObjects,
+            selection: &ConservativePinSelection,
+        ) -> Result<(), GraphRefusal> {
+            if let Some(view) = self.active_view {
+                let claims = source
+                    .ownership
+                    .get(&view)
+                    .ok_or(GraphRefusal::SourceChanged)?;
+                if let Some(id) = claim_id(claims, self.bucket, self.index) {
+                    if selection.retires(source, view) {
+                        self.removed_ids.insert(id);
+                    } else {
+                        self.retained_ids.insert(id);
+                    }
+                    self.index += 1;
+                } else if self.bucket < 2 {
+                    self.bucket += 1;
+                    self.index = 0;
+                } else {
+                    self.last_view = Some(view);
+                    self.active_view = None;
+                    self.bucket = 0;
+                    self.index = 0;
+                }
+            } else if let Some((view, _)) = next_map(&source.ownership, self.last_view.as_ref()) {
+                self.active_view = Some(*view);
+                if selection.retires(source, *view) {
+                    self.retired_count = self
+                        .retired_count
+                        .checked_add(1)
+                        .ok_or(GraphRefusal::Overflow)?;
+                }
+            } else {
+                self.next_phase(Phase::IndexManifest);
+            }
+            Ok(())
+        }
+
+        fn advance_raw_index(
+            &mut self,
+            source: &PinnedObjects,
+            selection: &ConservativePinSelection,
+            reserve: &SemanticResourceReserver,
+            manifest: bool,
+        ) -> Result<(), GraphRefusal> {
+            if !manifest && self.active_view.is_none() {
+                if let Some((view, _)) = next_map(&source.raw_ownership, self.last_view.as_ref()) {
+                    self.active_view = Some(*view);
+                } else {
+                    self.next_phase(Phase::Classify);
+                }
+                return Ok(());
+            }
+            if self.raw_action {
+                let raw = self.walker.after().ok_or(GraphRefusal::Identity)?;
+                if let Some(copy) = copy_raw(&mut self.raw_copy, raw) {
+                    if manifest
+                        || !selection
+                            .retires(source, self.active_view.ok_or(GraphRefusal::Identity)?)
+                    {
+                        self.retained_raws.insert(copy);
+                    } else {
+                        self.removed_raws.insert(copy);
+                    }
+                    self.raw_action = false;
+                }
+                return Ok(());
+            }
+            let next = if manifest {
+                next_map(&source.raw_to_id, self.walker.after()).map(|(raw, _)| raw)
+            } else {
+                next_set(
+                    source
+                        .raw_ownership
+                        .get(&self.active_view.ok_or(GraphRefusal::Identity)?)
+                        .ok_or(GraphRefusal::SourceChanged)?,
+                    self.walker.after(),
+                )
+            };
+            match self.walker.advance(next, reserve, false)? {
+                WalkStep::Progress => {}
+                WalkStep::Item => {
+                    let raw = self.walker.after().ok_or(GraphRefusal::Identity)?;
+                    if !manifest || raw.mount_namespace.is_none() {
+                        if manifest {
+                            let id = *source
+                                .raw_to_id
+                                .get(raw)
+                                .ok_or(GraphRefusal::SourceChanged)?;
+                            self.retained_ids.insert(id);
+                        }
+                        self.raw_action = true;
+                    }
+                }
+                WalkStep::End => {
+                    if self.walker.release_one() {
+                        self.walker = RawWalker::default();
+                        if manifest {
+                            self.next_phase(Phase::IndexRaws);
+                        } else {
+                            self.last_view = self.active_view.take();
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        fn advance_raw_output(
+            &mut self,
+            source: &PinnedObjects,
+            selection: &ConservativePinSelection,
+            reserve: &SemanticResourceReserver,
+            owned: bool,
+        ) -> Result<(), GraphRefusal> {
+            if owned && self.active_view.is_none() {
+                if let Some((view, _)) = next_map(&source.raw_ownership, self.last_view.as_ref()) {
+                    if selection.retires(source, *view) {
+                        self.last_view = Some(*view);
+                    } else {
+                        self.active_view = Some(*view);
+                        self.output_mut()?
+                            .raw_ownership
+                            .insert(*view, BTreeSet::new());
+                    }
+                } else {
+                    self.next_phase(Phase::Rejected);
+                }
+                return Ok(());
+            }
+            if self.raw_action {
+                let raw = self.walker.after().ok_or(GraphRefusal::Identity)?;
+                if let Some(copy) = copy_raw(&mut self.raw_copy, raw) {
+                    if owned {
+                        let view = self.active_view.ok_or(GraphRefusal::Identity)?;
+                        self.output_mut()?
+                            .raw_ownership
+                            .get_mut(&view)
+                            .ok_or(GraphRefusal::Identity)?
+                            .insert(copy);
+                    } else {
+                        let id = *source
+                            .raw_to_id
+                            .get(raw)
+                            .ok_or(GraphRefusal::SourceChanged)?;
+                        self.output_mut()?.raw_to_id.insert(copy, id);
+                    }
+                    self.raw_action = false;
+                }
+                return Ok(());
+            }
+            let next = if owned {
+                next_set(
+                    source
+                        .raw_ownership
+                        .get(&self.active_view.ok_or(GraphRefusal::Identity)?)
+                        .ok_or(GraphRefusal::SourceChanged)?,
+                    self.walker.after(),
+                )
+            } else {
+                next_map(&source.raw_to_id, self.walker.after()).map(|(raw, _)| raw)
+            };
+            match self.walker.advance(next, reserve, false)? {
+                WalkStep::Progress => {}
+                WalkStep::Item => {
+                    let raw = self.walker.after().ok_or(GraphRefusal::Identity)?;
+                    let keep = if owned {
+                        !selection.rejected.contains(&raw.key)
+                    } else {
+                        let id = *source
+                            .raw_to_id
+                            .get(raw)
+                            .ok_or(GraphRefusal::SourceChanged)?;
+                        self.keep_after_retirement(id)
+                            && !self.rejected_ids.contains(&id)
+                            && !selection.rejected.contains(&raw.key)
+                            && (!self.removed_raws.contains(raw)
+                                || self.retained_raws.contains(raw))
+                    };
+                    self.raw_action = keep;
+                }
+                WalkStep::End => {
+                    if self.walker.release_one() {
+                        self.walker = RawWalker::default();
+                        if owned {
+                            self.last_view = self.active_view.take();
+                        } else {
+                            self.next_phase(Phase::Ownership);
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        fn advance_ownership(
+            &mut self,
+            source: &PinnedObjects,
+            selection: &ConservativePinSelection,
+        ) -> Result<(), GraphRefusal> {
+            if let Some((view, copied)) = &mut self.claims {
+                let original = source
+                    .ownership
+                    .get(view)
+                    .ok_or(GraphRefusal::SourceChanged)?;
+                if let Some(id) = claim_id(original, self.bucket, self.index) {
+                    if !self.rejected_ids.contains(&id) {
+                        match self.bucket {
+                            0 => copied.tables.push(id),
+                            1 => copied.targets.push(original.targets[self.index]),
+                            _ => copied.pins.push(id),
+                        }
+                    }
+                    self.index += 1;
+                } else if self.bucket < 2 {
+                    self.bucket += 1;
+                    self.index = 0;
+                } else {
+                    let (view, copied) = self.claims.take().ok_or(GraphRefusal::Identity)?;
+                    self.output_mut()?.ownership.insert(view, copied);
+                    self.last_view = Some(view);
+                    self.bucket = 0;
+                    self.index = 0;
+                }
+            } else if let Some((view, claims)) =
+                next_map(&source.ownership, self.last_view.as_ref())
+            {
+                if selection.retires(source, *view) {
+                    self.last_view = Some(*view);
+                } else {
+                    self.claims = Some((
+                        *view,
+                        ViewClaims {
+                            tables: Vec::with_capacity(claims.tables.len()),
+                            targets: Vec::with_capacity(claims.targets.len()),
+                            pins: Vec::with_capacity(claims.pins.len()),
+                        },
+                    ));
+                }
+            } else {
+                self.next_phase(Phase::RawOwnership);
+            }
+            Ok(())
+        }
+
+        fn advance_sets(
+            &mut self,
+            source: &PinnedObjects,
+            selection: &ConservativePinSelection,
+        ) -> Result<(), GraphRefusal> {
+            let original = match self.phase {
+                Phase::Rejected => &source.rejected_keys,
+                Phase::Ambiguous => &source.ambiguous_keys,
+                Phase::Published => &source.ambiguity_published,
+                Phase::ApplyRejected => &selection.rejected,
+                _ => return Err(GraphRefusal::Identity),
+            };
+            if let Some(key) = next_set(original, self.last_key.as_ref()).copied() {
+                self.last_key = Some(key);
+                match self.phase {
+                    Phase::Rejected | Phase::ApplyRejected => {
+                        self.output_mut()?.rejected_keys.insert(key);
+                    }
+                    Phase::Ambiguous => {
+                        self.output_mut()?.ambiguous_keys.insert(key);
+                    }
+                    Phase::Published => {
+                        self.output_mut()?.ambiguity_published.insert(key);
+                    }
+                    _ => return Err(GraphRefusal::Identity),
+                }
+                if self.phase == Phase::ApplyRejected && source.rejected_keys.contains(&key) {
+                    self.output_mut()?.ambiguous_keys.insert(key);
+                }
+            } else {
+                self.next_phase(match self.phase {
+                    Phase::Rejected => Phase::Ambiguous,
+                    Phase::Ambiguous => Phase::Published,
+                    Phase::Published => Phase::ApplyRejected,
+                    _ => Phase::Publish,
+                });
+            }
+            Ok(())
+        }
+
+        fn advance(
+            &mut self,
+            source: &PinnedObjects,
+            selection: &ConservativePinSelection,
+            reserve: &SemanticResourceReserver,
+        ) -> Result<(), GraphRefusal> {
+            match self.phase {
+                Phase::New => {
+                    let fence = SourceFence::new(source, selection)?;
+                    let measured = Self::initial_bound(source, selection)?;
+                    let header = reserve
+                        .reserve(std::mem::size_of::<Self>() + OWNED_ALLOCATION_PADDING)
+                        .map_err(GraphRefusal::Storage)?;
+                    self.fence = Some(fence);
+                    self.header = Some(header);
+                    self.measured = measured;
+                    self.phase = Phase::MeasureEntries;
+                }
+                Phase::MeasureEntries => {
+                    if let Some((id, entry)) = next_map(&source.by_id, self.last_id.as_ref()) {
+                        self.last_id = Some(*id);
+                        for text in [&entry.raw.path, &entry.path, &entry.sha256] {
+                            add(
+                                &mut self.measured,
+                                text.capacity()
+                                    .checked_add(OWNED_ALLOCATION_PADDING)
+                                    .ok_or(GraphRefusal::Overflow)?,
+                            )?;
+                        }
+                        if let Some(text) = &entry.build_id {
+                            add(
+                                &mut self.measured,
+                                text.capacity()
+                                    .checked_add(OWNED_ALLOCATION_PADDING)
+                                    .ok_or(GraphRefusal::Overflow)?,
+                            )?;
+                        }
+                        // Shared backing can become uniquely owned during
+                        // reclamation; keep its complete nested envelope paid.
+                        add(
+                            &mut self.measured,
+                            bytes_for::<(String, u64)>(entry.exports.len())?,
+                        )?;
+                        self.index = 0;
+                        self.phase = Phase::MeasureExports;
+                    } else {
+                        self.next_phase(Phase::MeasureClaims);
+                    }
+                }
+                Phase::MeasureExports => {
+                    let old = source
+                        .by_id
+                        .get(&self.last_id.ok_or(GraphRefusal::Identity)?)
+                        .ok_or(GraphRefusal::SourceChanged)?;
+                    if let Some((text, _)) = old.exports.get(self.index) {
+                        add(
+                            &mut self.measured,
+                            text.capacity()
+                                .checked_add(OWNED_ALLOCATION_PADDING)
+                                .ok_or(GraphRefusal::Overflow)?,
+                        )?;
+                        self.index += 1;
+                    } else {
+                        self.phase = Phase::MeasureEntries;
+                    }
+                }
+                Phase::MeasureClaims => {
+                    if let Some((view, claims)) =
+                        next_map(&source.ownership, self.last_view.as_ref())
+                    {
+                        self.last_view = Some(*view);
+                        let count = claims
+                            .tables
+                            .len()
+                            .checked_add(claims.targets.len())
+                            .and_then(|sum| sum.checked_add(claims.pins.len()))
+                            .ok_or(GraphRefusal::Overflow)?;
+                        add(
+                            &mut self.measured,
+                            bytes_for::<PinnedObjectId>(claims.tables.capacity())?,
+                        )?;
+                        add(
+                            &mut self.measured,
+                            bytes_for::<(PinnedObjectId, u64)>(claims.targets.capacity())?,
+                        )?;
+                        add(
+                            &mut self.measured,
+                            bytes_for::<PinnedObjectId>(claims.pins.capacity())?,
+                        )?;
+                        add(
+                            &mut self.measured,
+                            tree::<PinnedObjectId, ()>(count)?
+                                .checked_mul(2)
+                                .ok_or(GraphRefusal::Overflow)?,
+                        )?;
+                    } else {
+                        self.next_phase(Phase::MeasureRaws);
+                    }
+                }
+                Phase::MeasureRaws => {
+                    let next = next_map(&source.raw_to_id, self.walker.after()).map(|(raw, _)| raw);
+                    match self.walker.advance(next, reserve, true)? {
+                        WalkStep::Progress => {}
+                        WalkStep::Item => {
+                            let raw = &self.walker.last.as_ref().ok_or(GraphRefusal::Identity)?.raw;
+                            let bytes = text_bytes(&raw.path)?
+                                .checked_mul(6)
+                                .ok_or(GraphRefusal::Overflow)?;
+                            add(&mut self.measured, bytes)?;
+                        }
+                        WalkStep::End => {
+                            if self.walker.release_one() {
+                                self.walker = RawWalker::default();
+                                self.next_phase(Phase::MeasureOwnedRows);
+                            }
+                        }
+                    }
+                }
+                Phase::MeasureOwnedRows => {
+                    if let Some((view, raws)) =
+                        next_map(&source.raw_ownership, self.last_view.as_ref())
+                    {
+                        add(
+                            &mut self.measured,
+                            tree::<RawObjectInstance, ()>(raws.len())?
+                                .checked_mul(3)
+                                .ok_or(GraphRefusal::Overflow)?,
+                        )?;
+                        self.active_view = Some(*view);
+                        self.phase = Phase::MeasureOwnedRaws;
+                    } else {
+                        self.required = Some(self.measured);
+                        self.next_phase(Phase::Admit);
+                    }
+                }
+                Phase::MeasureOwnedRaws => self.advance_owned_measure(source, reserve)?,
+                Phase::Admit => {
+                    let required = self.required.ok_or(GraphRefusal::Identity)?;
+                    let header_bytes = std::mem::size_of::<Self>() + OWNED_ALLOCATION_PADDING;
+                    let backing = reserve
+                        .reserve(
+                            required
+                                .checked_sub(header_bytes)
+                                .ok_or(GraphRefusal::Overflow)?,
+                        )
+                        .map_err(GraphRefusal::Storage)?;
+                    self.backing = Some(backing);
+                    let mut output = PinnedObjects::empty();
+                    if output.copy_source.is_none() {
+                        return Err(GraphRefusal::Identity);
+                    }
+                    output.next_id = source.next_id;
+                    output.overlay_uncertain = source.overlay_uncertain;
+                    output.changed.set(source.changed.get());
+                    output.revision = source.revision;
+                    output.copy_version = source.copy_version;
+                    self.output = Some(output);
+                    let skips = source
+                        .ambiguous_keys
+                        .len()
+                        .checked_add(selection.rejected.len())
+                        .ok_or(GraphRefusal::Overflow)?;
+                    self.skipped = Vec::with_capacity(skips);
+                    self.next_phase(Phase::IndexClaims);
+                }
+                Phase::IndexClaims => self.advance_claim_index(source, selection)?,
+                Phase::IndexManifest => self.advance_raw_index(source, selection, reserve, true)?,
+                Phase::IndexRaws => self.advance_raw_index(source, selection, reserve, false)?,
+                Phase::Classify => {
+                    if let Some((id, entry)) = next_map(&source.by_id, self.last_id.as_ref()) {
+                        self.last_id = Some(*id);
+                        if self.keep_after_retirement(*id)
+                            && selection.rejected.contains(&entry.raw.key)
+                        {
+                            self.rejected_ids.insert(*id);
+                            self.output_mut()?.ambiguous_keys.insert(entry.raw.key);
+                        }
+                    } else {
+                        self.next_phase(Phase::Entries);
+                    }
+                }
+                Phase::Entries => {
+                    if let Some(copy) = &mut self.entry {
+                        let original = source
+                            .by_id
+                            .get(&copy.id)
+                            .ok_or(GraphRefusal::SourceChanged)?;
+                        if copy.advance(original) {
+                            let copy = self.entry.take().ok_or(GraphRefusal::Identity)?;
+                            self.output_mut()?.by_id.insert(copy.id, copy.entry);
+                        }
+                    } else if let Some((id, old)) = next_map(&source.by_id, self.last_id.as_ref()) {
+                        self.last_id = Some(*id);
+                        if self.keep_after_retirement(*id) && !self.rejected_ids.contains(id) {
+                            self.entry = Some(EntryCopy::new(*id, old));
+                        }
+                    } else {
+                        self.next_phase(Phase::RawMap);
+                    }
+                }
+                Phase::RawMap => self.advance_raw_output(source, selection, reserve, false)?,
+                Phase::Ownership => self.advance_ownership(source, selection)?,
+                Phase::RawOwnership => self.advance_raw_output(source, selection, reserve, true)?,
+                Phase::Rejected | Phase::Ambiguous | Phase::Published | Phase::ApplyRejected => {
+                    self.advance_sets(source, selection)?
+                }
+                Phase::Publish => {
+                    let next = next_set(
+                        &self
+                            .output
+                            .as_ref()
+                            .ok_or(GraphRefusal::Identity)?
+                            .ambiguous_keys,
+                        self.last_key.as_ref(),
+                    )
+                    .copied();
+                    if let Some(key) = next {
+                        self.last_key = Some(key);
+                        if self.output_mut()?.ambiguity_published.insert(key) {
+                            self.skipped.push(ambiguous_identity_skip());
+                        }
+                    } else {
+                        let revision = source
+                            .revision
+                            .checked_add(self.retired_count)
+                            .and_then(|rev| {
+                                rev.checked_add(u64::try_from(selection.rejected.len()).ok()?)
+                            })
+                            .filter(|rev| *rev < u64::MAX)
+                            .ok_or(GraphRefusal::SourceChanged)?;
+                        self.output_mut()?.revision = revision;
+                        self.phase = Phase::Ready;
+                    }
+                }
+                Phase::Ready => {}
+                Phase::Reclaim | Phase::Reclaimed => return Err(GraphRefusal::Cancelled),
+            }
+            Ok(())
+        }
+
+        /// Reclaims one leaf/node operation per credit. An unknown shared/Weak
+        /// export owner refuses while retaining the paid original, then resumes
+        /// with an actual live source alias or exclusive Arc::get_mut.
+        pub(crate) fn reclaim(
+            &mut self,
+            source: Option<&PinnedObjects>,
+            selection: &ConservativePinSelection,
+            reserve: &SemanticResourceReserver,
+            work: usize,
+        ) -> Result<GraphStep, GraphRefusal> {
+            if work == 0 {
+                return Ok(GraphStep::Yielded);
+            }
+            self.check_pool(selection, reserve)?;
+            if let Some(fence) = self.fence {
+                if fence.selection != selection.identity {
+                    return Err(GraphRefusal::Identity);
+                }
+                if let Some(source) = source {
+                    fence.check(source, selection)?;
+                }
+            }
+            if self.phase == Phase::Reclaimed {
+                return Ok(GraphStep::Ready);
+            }
+            self.phase = Phase::Reclaim;
+            for _ in 0..work {
+                self.reclaim_one(source)?;
+                if self.phase == Phase::Reclaimed {
+                    return Ok(GraphStep::Ready);
+                }
+            }
+            Ok(GraphStep::Advanced)
+        }
+
+        fn reclaim_one(&mut self, source: Option<&PinnedObjects>) -> Result<(), GraphRefusal> {
+            if let Some(entry) = &mut self.reclaim_entry {
+                if entry.advance(source)? {
+                    self.reclaim_entry = None;
+                }
+                return Ok(());
+            }
+            if let Some(copy) = self.entry.take() {
+                self.reclaim_entry = Some(EntryReclaim::new(copy.id, copy.entry));
+                return Ok(());
+            }
+            match self.reclaim_phase {
+                0 => {
+                    if !self.walker.release_one() {
+                        return Ok(());
+                    }
+                    self.reclaim_phase += 1;
+                }
+                1 => {
+                    if self.raw_copy.take().is_some() {
+                        return Ok(());
+                    }
+                    self.reclaim_phase += 1;
+                }
+                2 => {
+                    if let Some((_, claims)) = &mut self.claims {
+                        if claims.tables.capacity() > 0 {
+                            drop(std::mem::take(&mut claims.tables));
+                        } else if claims.targets.capacity() > 0 {
+                            drop(std::mem::take(&mut claims.targets));
+                        } else if claims.pins.capacity() > 0 {
+                            drop(std::mem::take(&mut claims.pins));
+                        } else {
+                            self.claims = None;
+                        }
+                        return Ok(());
+                    }
+                    self.reclaim_phase = self.after_claim_reclaim;
+                    self.after_claim_reclaim = 3;
+                }
+                3 => {
+                    if let Some((id, entry)) =
+                        self.output.as_mut().and_then(|pins| pins.by_id.pop_first())
+                    {
+                        self.reclaim_entry = Some(EntryReclaim::new(id, entry));
+                    } else {
+                        if let Some(pins) = &mut self.output {
+                            drop(std::mem::take(&mut pins.by_id));
+                        }
+                        self.reclaim_phase += 1;
+                    }
+                }
+                4 => {
+                    if let Some(pins) = &mut self.output {
+                        if pins.raw_to_id.pop_first().is_some() {
+                            return Ok(());
+                        }
+                        drop(std::mem::take(&mut pins.raw_to_id));
+                    }
+                    self.reclaim_phase += 1;
+                }
+                5 => {
+                    if self.claims.is_none()
+                        && let Some(pair) = self
+                            .output
+                            .as_mut()
+                            .and_then(|pins| pins.ownership.pop_first())
+                    {
+                        self.claims = Some(pair);
+                        self.reclaim_phase = 2;
+                        // Return to ownership, rather than restart by-id/raws,
+                        // after this row's three primitive Vec leaves.
+                        self.after_claim_reclaim = 5;
+                        return Ok(());
+                    }
+                    if let Some(pins) = &mut self.output {
+                        drop(std::mem::take(&mut pins.ownership));
+                    }
+                    self.reclaim_phase += 1;
+                }
+                6 => {
+                    if let Some(pins) = &mut self.output
+                        && let Some(view) =
+                            pins.raw_ownership.first_key_value().map(|(view, _)| *view)
+                    {
+                        let raws = pins
+                            .raw_ownership
+                            .get_mut(&view)
+                            .ok_or(GraphRefusal::Identity)?;
+                        if raws.pop_first().is_none() {
+                            // The inner set is now actually empty. Removing the
+                            // outer node cannot hide another raw/String drop.
+                            pins.raw_ownership.remove(&view);
+                        }
+                        return Ok(());
+                    }
+                    if let Some(pins) = &mut self.output {
+                        drop(std::mem::take(&mut pins.raw_ownership));
+                    }
+                    self.reclaim_phase += 1;
+                }
+                7..=9 => {
+                    if let Some(pins) = &mut self.output {
+                        let set = match self.reclaim_phase {
+                            7 => &mut pins.rejected_keys,
+                            8 => &mut pins.ambiguous_keys,
+                            _ => &mut pins.ambiguity_published,
+                        };
+                        if set.pop_first().is_some() {
+                            return Ok(());
+                        }
+                        drop(std::mem::take(set));
+                    }
+                    self.reclaim_phase += 1;
+                }
+                10..=12 => {
+                    let set = match self.reclaim_phase {
+                        10 => &mut self.removed_ids,
+                        11 => &mut self.retained_ids,
+                        _ => &mut self.rejected_ids,
+                    };
+                    if set.pop_first().is_none() {
+                        // len==0 can still retain a real root allocation.
+                        drop(std::mem::take(set));
+                        self.reclaim_phase += 1;
+                    }
+                }
+                13..=14 => {
+                    let set = if self.reclaim_phase == 13 {
+                        &mut self.removed_raws
+                    } else {
+                        &mut self.retained_raws
+                    };
+                    if set.pop_first().is_none() {
+                        // len==0 can still retain a real root allocation.
+                        drop(std::mem::take(set));
+                        self.reclaim_phase += 1;
+                    }
+                }
+                15 => {
+                    if let Some(skip) = &mut self.skipped_leaf {
+                        if skip.subject.capacity() > 0 {
+                            drop(std::mem::take(&mut skip.subject));
+                        } else if skip.reason.capacity() > 0 {
+                            drop(std::mem::take(&mut skip.reason));
+                        } else {
+                            self.skipped_leaf = None;
+                        }
+                    } else if let Some(skip) = self.skipped.pop() {
+                        self.skipped_leaf = Some(skip);
+                    } else {
+                        self.reclaim_phase += 1;
+                    }
+                }
+                16 => {
+                    drop(std::mem::take(&mut self.skipped));
+                    self.reclaim_phase += 1;
+                }
+                17 => {
+                    self.output = None;
+                    self.reclaim_phase += 1;
+                }
+                18 => {
+                    self.backing = None;
+                    self.reclaim_phase += 1;
+                }
+                _ => {
+                    self.header = None;
+                    self.phase = Phase::Reclaimed;
+                }
+            }
+            Ok(())
+        }
+
+        #[cfg(test)]
+        pub(super) fn retained_exports_for_test(
+            &self,
+            id: PinnedObjectId,
+        ) -> Option<&[(String, u64)]> {
+            if let Some(entry) = &self.reclaim_entry
+                && entry.id == id
+            {
+                return entry.exports.as_deref();
+            }
+            self.output
+                .as_ref()?
+                .by_id
+                .get(&id)
+                .map(|entry| entry.exports.as_ref())
+        }
+    }
+
+    fn claim_id(claims: &ViewClaims, bucket: u8, index: usize) -> Option<PinnedObjectId> {
+        match bucket {
+            0 => claims.tables.get(index).copied(),
+            1 => claims.targets.get(index).map(|(id, _)| *id),
+            _ => claims.pins.get(index).copied(),
+        }
+    }
+
+    fn copy_raw(
+        copy: &mut Option<RawObjectInstance>,
+        original: &RawObjectInstance,
+    ) -> Option<RawObjectInstance> {
+        if copy.is_none() {
+            *copy = Some(RawObjectInstance {
+                mount_namespace: original.mount_namespace,
+                key: original.key,
+                path: String::with_capacity(original.path.len()),
+            });
+            return None;
+        }
+        if copy_text(&mut copy.as_mut()?.path, &original.path) {
+            copy.take()
+        } else {
+            None
+        }
+    }
+
+    impl PinnedObjects {
+        pub(crate) fn poll_conservative_copy(
+            &self,
+            cursor: &mut PinnedConservativeCursor,
+            selection: &ConservativePinSelection,
+            reserve: &SemanticResourceReserver,
+            work: usize,
+        ) -> Result<GraphStep, GraphRefusal> {
+            if work == 0 {
+                return Ok(GraphStep::Yielded);
+            }
+            cursor.check_pool(selection, reserve)?;
+            if let Some(fence) = cursor.fence {
+                fence.check(self, selection)?;
+            } else {
+                SourceFence::new(self, selection)?;
+            }
+            if matches!(cursor.phase, Phase::Reclaim | Phase::Reclaimed) {
+                return Err(GraphRefusal::Cancelled);
+            }
+            for _ in 0..work {
+                cursor.advance(self, selection, reserve)?;
+                if cursor.phase == Phase::Ready {
+                    return Ok(GraphStep::Ready);
+                }
+            }
+            Ok(GraphStep::Advanced)
+        }
+    }
+
+    /// Deallocates the SAME unique slice allocation without an O(N) typed Drop
+    /// loop. Only the drained `(String,u64)` path above and resource-free test
+    /// probes may call this. No ManuallyDrop value is stored or exposed.
+    ///
+    /// # Safety
+    /// Caller must immediately establish actual exclusive Arc::get_mut/noWeak,
+    /// drain ALL owned element resources (leaving valid bits), and transfer the
+    /// original Arc without callback/observer/alias exposure. This function
+    /// reconstructs exactly once with identical allocation, len, and Global.
+    pub(super) unsafe fn deallocate_drained_unique_arc<T>(original: Arc<[T]>) {
+        use std::mem::ManuallyDrop;
+        // ManuallyDrop<T> has identical layout AND bit validity to T:
+        // https://doc.rust-lang.org/std/mem/struct.ManuallyDrop.html
+        // Arc::from_raw permits equal-size/alignment retyping of the original
+        // Global allocation; slice pointer cast retains the exact length:
+        // https://doc.rust-lang.org/std/sync/struct.Arc.html#method.from_raw
+        let raw = Arc::into_raw(original);
+        let raw = raw as *const [ManuallyDrop<T>];
+        // SAFETY: caller's unique original, same size/alignment/metadata/Global,
+        // valid elements, resources already individually disposed, one recovery.
+        drop(unsafe { Arc::from_raw(raw) });
+    }
+
+    const _: () = {
+        use std::mem::{ManuallyDrop, align_of, needs_drop, size_of};
+        assert!(needs_drop::<(String, u64)>());
+        assert!(!needs_drop::<ManuallyDrop<(String, u64)>>());
+        assert!(size_of::<(String, u64)>() == size_of::<ManuallyDrop<(String, u64)>>());
+        assert!(align_of::<(String, u64)>() == align_of::<ManuallyDrop<(String, u64)>>());
+    };
+}
+
+const AMBIGUOUS_SUBJECT: &str = "discovery subject";
+const AMBIGUOUS_REASON: &str = "physical identity is ambiguous: equal mapping keys had unequal or unavailable full opened-file identities; the collision group was not attached";
+
 fn ambiguous_identity_skip() -> Skipped {
     Skipped {
-        subject: "discovery subject".into(),
-        reason: "physical identity is ambiguous: equal mapping keys had unequal or unavailable full opened-file identities; the collision group was not attached".into(),
+        subject: AMBIGUOUS_SUBJECT.into(),
+        reason: AMBIGUOUS_REASON.into(),
     }
 }
 
@@ -2773,6 +4362,7 @@ pub fn bind_scanned_modules(
     modules: &[ScannedModule],
     pinned: &mut PinnedObjects,
 ) -> (Vec<ReconciledModule>, Vec<Skipped>) {
+    pinned.bump_copy_version();
     let mut reconciled = Vec::new();
     let mut lost = Vec::new();
     for module in modules {
@@ -6302,42 +7892,50 @@ mod tests {
                     break;
                 }
             }
+            let copy = cursor
+                .pinned()
+                .expect("bounded copy becomes structurally Ready");
+            assert_conservative_value(&expected, copy);
+            assert_eq!(cursor.skipped().unwrap(), expected_skipped);
+            assert_eq!(source.revision(), source_revision);
+            assert!(
+                source
+                    .by_id
+                    .values()
+                    .all(|entry| pin_of(&entry.file).unwrap() == entry.pin)
+            );
+            assert!(pool.snapshot().charged_bytes > initial_charge);
+            // Ready borrows remain paid; no swap/take can strand canonical backing.
+            for _ in 0..4096 {
+                if cursor
+                    .reclaim(Some(&source), &selection, &reserve, 1)
+                    .unwrap()
+                    == GraphStep::Ready
+                {
+                    break;
+                }
+            }
+            assert!(cursor.pinned().is_none());
+            assert_eq!(pool.snapshot().charged_bytes, initial_charge);
         });
         assert!(!peak.incomplete);
-        let copy = cursor
-            .pinned()
-            .expect("bounded copy becomes structurally Ready");
-        assert_conservative_value(&expected, copy);
-        assert_eq!(cursor.skipped().unwrap(), expected_skipped);
+        assert_eq!(
+            peak.live_bytes, 0,
+            "all copied backing dies before its payment refunds"
+        );
+        assert_eq!(
+            peak.live_blocks, 0,
+            "empty B-tree roots are real retained allocations"
+        );
         assert!(
             cursor.required_bytes().unwrap() >= peak.realloc_overlap_bytes.max(peak.peak_bytes)
         );
-        assert_eq!(source.revision(), source_revision);
-        assert!(
-            source
-                .by_id
-                .values()
-                .all(|entry| pin_of(&entry.file).unwrap() == entry.pin)
-        );
-        assert!(pool.snapshot().charged_bytes > initial_charge);
-        // Ready borrows remain paid; no swap/take can strand canonical backing.
-        for _ in 0..4096 {
-            if cursor
-                .reclaim(Some(&source), &selection, &reserve, 1)
-                .unwrap()
-                == GraphStep::Ready
-            {
-                break;
-            }
-        }
-        assert!(cursor.pinned().is_none());
-        assert_eq!(pool.snapshot().charged_bytes, initial_charge);
     }
 
     #[test]
     fn conservative_copy_cursor_refuses_changed_resume_fences() {
         use crate::semantics_edge::resources::SemanticResourcePool;
-        for change in 0..6 {
+        for change in 0..7 {
             let (_dir, mut source, _) = conservative_cursor_fixture();
             let pool = SemanticResourcePool::default();
             let reserve = pool.reserver();
@@ -6379,6 +7977,12 @@ mod tests {
                     &other_pool.reserver(),
                     1,
                 ),
+                5 => {
+                    let membership = source.revision();
+                    source.reset_scan_pin_claims();
+                    assert_eq!(source.revision(), membership);
+                    source.poll_conservative_copy(&mut cursor, &selection, &reserve, 1)
+                }
                 _ => {
                     source.revision = u64::MAX;
                     source.poll_conservative_copy(&mut cursor, &selection, &reserve, 1)
@@ -6406,6 +8010,34 @@ mod tests {
         assert!(
             conservative_pin_tree_bytes::<RawObjectInstance, PinnedObjectId>(usize::MAX).is_none()
         );
+        // Packaging is not authority: reject foreign/short actual payment,
+        // returning the SAME immutable original sets and lease untouched.
+        for foreign in [false, true] {
+            let owner = SemanticResourcePool::default();
+            let other = SemanticResourcePool::default();
+            let retired = BTreeSet::from([ProcessViewId(3)]);
+            let rejected = BTreeSet::new();
+            let required = ConservativePinSelection::storage_bound(1, 0).unwrap();
+            let storage = owner
+                .reserve(if foreign { required } else { required - 1 })
+                .unwrap();
+            let reserve = if foreign {
+                other.reserver()
+            } else {
+                owner.reserver()
+            };
+            let charged = owner.snapshot().charged_bytes;
+            let refusal = ConservativePinSelection::from_reserved_originals(
+                retired, rejected, storage, &reserve,
+            )
+            .unwrap_err();
+            assert_eq!(owner.snapshot().charged_bytes, charged);
+            let (retired, rejected, storage) = refusal.into_originals();
+            assert_eq!(retired, BTreeSet::from([ProcessViewId(3)]));
+            assert!(rejected.is_empty());
+            assert!(owner.reserver().covers(&storage, required - 1));
+            assert_eq!(owner.snapshot().charged_bytes, charged);
+        }
         let (_dir, source, _) = conservative_cursor_fixture();
         let pool = SemanticResourcePool::default();
         let reserve = pool.reserver();
@@ -6588,18 +8220,31 @@ mod tests {
         unsafe { deallocate_drained_unique_arc(probes) };
         assert_eq!(DROPS.load(Ordering::Relaxed), 0);
 
-        let mut payloads: Arc<[(String, u64)]> = Arc::from([
-            ("one owned allocation".repeat(64), 1),
-            ("another owned allocation".repeat(128), 2),
-        ]);
-        for item in Arc::get_mut(&mut payloads).unwrap() {
-            drop(std::mem::take(&mut item.0));
-            assert_eq!(item.0.capacity(), 0);
-        }
-        assert!(Arc::get_mut(&mut payloads).is_some());
-        // SAFETY: all owned payloads were freed individually above. Remaining
-        // elements are valid zero-capacity Strings plus integers, exclusively
-        // held with no Weak; the final release must skip their typed Drop loop.
-        unsafe { deallocate_drained_unique_arc(payloads) };
+        let ((), peak) = crate::test_alloc::requested_peak_during(|| {
+            let mut payloads: Arc<[(String, u64)]> = Arc::from([
+                ("one owned allocation".repeat(64), 1),
+                ("another owned allocation".repeat(128), 2),
+            ]);
+            let before = crate::test_alloc::armed_requested_snapshot();
+            for item in Arc::get_mut(&mut payloads).unwrap() {
+                drop(std::mem::take(&mut item.0));
+                assert_eq!(item.0.capacity(), 0);
+            }
+            let drained = crate::test_alloc::armed_requested_snapshot();
+            assert_eq!(before.live_blocks - drained.live_blocks, 2);
+            assert!(before.live_bytes > drained.live_bytes);
+            assert!(
+                drained.live_bytes > 0,
+                "the SAME slice allocation is still held"
+            );
+            assert!(Arc::get_mut(&mut payloads).is_some());
+            // SAFETY: every payload has actually been freed above. Remaining
+            // elements are valid zero-capacity Strings plus integers, exclusive
+            // with no Weak; the final release skips their typed Drop loop.
+            unsafe { deallocate_drained_unique_arc(payloads) };
+        });
+        assert!(!peak.incomplete);
+        assert_eq!(peak.live_bytes, 0);
+        assert_eq!(peak.live_blocks, 0);
     }
 }

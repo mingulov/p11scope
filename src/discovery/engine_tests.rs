@@ -48051,7 +48051,18 @@ fn collected_finish_partial_multi_keeps_surviving_sibling() {
     insert_sizing_selection_rows(&mut engine, VIEWS);
     engine.next_view_id = VIEWS;
     let mut session = ScriptedSession::default();
-    let (_entered, _returned) = attach_nonblocking_native_carrier(&engine, &mut session);
+    // Infallible closer: this test models the deferral, not the
+    // channel-paced handoff, so no entered/returned receiver can drop
+    // and fail a return close.
+    let retirement = crate::attach::RetirementFixture::new_collected(
+        &engine.plan.slots,
+        &engine.pinned,
+        Box::new(|owned, _| {
+            drop(owned);
+            Ok(())
+        }),
+    );
+    session.global_retirement = Some(std::cell::RefCell::new(retirement));
     let view_of: Vec<ProcessViewId> = engine
         .plan
         .slots
@@ -48098,7 +48109,7 @@ fn collected_finish_partial_multi_keeps_surviving_sibling() {
     let mut outcome = engine
         .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
         .unwrap();
-    for _ in 0..512 {
+    for _ in 0..4096 {
         if !outcome.pending {
             break;
         }

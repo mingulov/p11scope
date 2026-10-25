@@ -187,6 +187,12 @@ attach::lifecycle_tests::privileged_detailed_nonleader_exit_reclaims_start_and_p
 attach::object_stop::tests::object_stop_scrubs_real_retained_map_after_q
 attach::object_stop::tests::object_stop_refuses_real_unproven_q_without_mutation
 attach::object_stop::tests::object_stop_reports_real_scrub_failure
+# R1 native-retirement cells over a real Detailed Session with an owned
+# provider child (each well under a minute): Multi close at Q then mint,
+# Singles deferral to the terminal detach, and the partial-group guards.
+attach::tests::collected_partial_group_real_session_guards_refuse_until_terminal_lp64
+attach::tests::collected_retirement_singles_session_defers_close_to_terminal_detach_lp64
+attach::tests::collected_retirement_stopped_session_q_closes_original_lp64
 discovery::confirm_shards::tests::privileged_sharded_confirmation_equals_the_serial_production_probe
 # T8 twin fullness control: the identical phase-1 arming with an empty
 # request map admits the same head with zero loss, proving the twin's

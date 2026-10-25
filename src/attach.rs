@@ -15289,4 +15289,498 @@ mod tests {
                 .unwrap_or_else(|error| panic!("stubbed {root} must load: {error}"));
         }
     }
+
+    /// Owned provider + driver build for the real-Session retirement cells.
+    /// The child prints READY, then idles waiting for 'G' (60 s bound) while
+    /// the Session drives STOP/Q/retirement; nothing ever calls into it.
+    struct CollectedSessionCell {
+        _directory: tempfile::TempDir,
+        provider: std::path::PathBuf,
+        child: std::process::Child,
+        output: std::io::BufReader<std::process::ChildStdout>,
+    }
+
+    impl Drop for CollectedSessionCell {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    impl CollectedSessionCell {
+        fn build() -> anyhow::Result<Self> {
+            use anyhow::Context as _;
+            let directory = tempfile::tempdir()?;
+            let source = directory.path().join("retirement-cell.c");
+            std::fs::write(
+                &source,
+                include_str!("../tests/fixtures/detailed-thread-exit.c"),
+            )?;
+            let provider = directory.path().join("provider.so");
+            let driver = directory.path().join("driver");
+            for is_provider in [true, false] {
+                let mut compiler = std::process::Command::new("cc");
+                compiler.args([
+                    "-std=c11",
+                    "-O2",
+                    "-Wall",
+                    "-Wextra",
+                    "-Werror",
+                    "-fno-builtin",
+                    "-fno-stack-protector",
+                    "-fno-omit-frame-pointer",
+                ]);
+                if is_provider {
+                    compiler.args(["-fPIC", "-shared", "-DDETAILED_THREAD_EXIT_PROVIDER"]);
+                } else {
+                    compiler.arg("-ldl");
+                }
+                let output = compiler
+                    .arg(&source)
+                    .arg("-o")
+                    .arg(if is_provider { &provider } else { &driver })
+                    .output()?;
+                anyhow::ensure!(
+                    output.status.success(),
+                    "owned fixture compilation failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            let mut child = std::process::Command::new(&driver)
+                .arg(&provider)
+                .arg(std::process::id().to_string())
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()?;
+            let stdout = child.stdout.take().context("fixture output pipe")?;
+            let mut cell = Self {
+                _directory: directory,
+                provider,
+                child,
+                output: std::io::BufReader::new(stdout),
+            };
+            cell.expect_ready()?;
+            Ok(cell)
+        }
+
+        fn expect_ready(&mut self) -> anyhow::Result<()> {
+            use std::io::BufRead as _;
+            let mut line = String::new();
+            self.output.read_line(&mut line)?;
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            anyhow::ensure!(
+                fields.len() == 6 && fields[0] == "READY",
+                "owned driver READY line: {line:?}"
+            );
+            let numbers: Vec<u64> = fields[1..5]
+                .iter()
+                .map(|field| field.parse())
+                .collect::<Result<_, _>>()?;
+            let metadata = std::fs::metadata(&self.provider)?;
+            use std::os::unix::fs::MetadataExt as _;
+            anyhow::ensure!(
+                numbers
+                    == [
+                        u64::from(self.child.id()),
+                        u64::from(self.child.id()),
+                        metadata.dev(),
+                        metadata.ino()
+                    ],
+                "READY names this child and provider file: {numbers:?}"
+            );
+            Ok(())
+        }
+
+        /// Pin the owned provider in the child and plan COUNT_ONLY endpoints
+        /// at the given file offsets into the provider.
+        fn pin_and_plan(
+            &self,
+            offsets: &[u64],
+        ) -> anyhow::Result<(super::PinnedObjects, super::AttachPlan)> {
+            use anyhow::Context as _;
+            use p11scope_manifest::identity::{mapping_file_key, open_object};
+            let view = crate::process::ProcessView::open(
+                crate::process::ProcessViewId(0),
+                self.child.id(),
+            )
+            .map_err(anyhow::Error::msg)?;
+            let file = open_object(&self.provider).map_err(anyhow::Error::msg)?;
+            let mapping = mapping_file_key(&file).map_err(anyhow::Error::msg)?;
+            let elf =
+                p11scope_manifest::elf::ElfSnapshot::read(&file).map_err(anyhow::Error::msg)?;
+            anyhow::ensure!(elf.abi() == super::ElfAbi::Lp64);
+            let key = p11scope_manifest::maps::ObjectKey {
+                device: p11scope_manifest::maps::Device {
+                    major: mapping.device_major,
+                    minor: mapping.device_minor,
+                },
+                inode: mapping.inode,
+            };
+            let module = crate::discovery::scan::ScannedModule {
+                mapped_identity: None,
+                double_loaded: false,
+                view: view.id(),
+                mount_namespace: view.mount_namespace(),
+                key,
+                path: self.provider.display().to_string(),
+                decoder_abi: None,
+                exports: vec![],
+                tables: vec![],
+                interfaces: vec![],
+            };
+            let (pins, skipped) = crate::discovery::identity::pin_scanned_view_objects(
+                &view,
+                &[module],
+                &mut crate::discovery::scan::CaptureWorkBudget::default(),
+            )
+            .map_err(anyhow::Error::msg)?;
+            anyhow::ensure!(
+                skipped.is_empty(),
+                "owned physical pin refused: {skipped:?}"
+            );
+            let pinned = pins.pinned().next().context("owned provider pin")?;
+            anyhow::ensure!(pinned.key == key);
+            let mut slots = Vec::new();
+            for (index, offset) in offsets.iter().enumerate() {
+                let index = u32::try_from(index)?;
+                anyhow::ensure!(elf.is_executable_offset(*offset));
+                slots.push(super::Slot {
+                    index,
+                    descriptor_index: index,
+                    object: pinned.id,
+                    object_path: self.provider.display().to_string(),
+                    file_offset: *offset,
+                    names: vec!["C_Initialize".into()],
+                    aliased: false,
+                    semantics: super::SlotSemantics::COUNT_ONLY,
+                    semantic_authorized: false,
+                    semantic_ambiguous: false,
+                    fork_safe: false,
+                    module_ids: vec![],
+                });
+            }
+            let plan = super::AttachPlan::from_slots(slots);
+            Ok((pins, plan))
+        }
+
+        fn provider_init_offset(&self) -> anyhow::Result<u64> {
+            use anyhow::Context as _;
+            use p11scope_manifest::identity::open_object;
+            let file = open_object(&self.provider).map_err(anyhow::Error::msg)?;
+            let elf =
+                p11scope_manifest::elf::ElfSnapshot::read(&file).map_err(anyhow::Error::msg)?;
+            let symbol = elf
+                .defined_symbol("C_Initialize")
+                .map_err(anyhow::Error::msg)?
+                .context("owned provider function")?;
+            Ok(symbol.file_offset)
+        }
+    }
+
+    /// Drive STOP, quiescence and a real STOP/count0 Q on a real Session.
+    fn collected_cell_stop_to_q(
+        session: &mut super::Session,
+    ) -> anyhow::Result<super::CollectedFinishQ> {
+        use anyhow::Context as _;
+        session.stop_gate().request_stop();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !session.stop_gate().quiescent() {
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "real STOP never reached quiescence"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let producers = session
+            .drain_producers()
+            .context("real Session retains its producers")?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(q) = session.observe_collected_finish_q(&producers, None)? {
+                return Ok(q);
+            }
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "real STOP/count0 never minted Q"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    fn collected_cell_pool() -> crate::semantics_edge::resources::SemanticResourcePool {
+        crate::semantics_edge::resources::SemanticResourcePool::reference_limit(
+            crate::semantics_edge::resources::SEMANTIC_TRANSITION_SCRATCH + 2 * 1024 * 1024,
+        )
+    }
+
+    fn collected_cell_input(
+        slots: Vec<super::Slot>,
+        storage: crate::semantics_edge::resources::ResourceLease,
+    ) -> super::RetainedRetirementInput {
+        match super::RetainedRetirementInput::from_reserved_removed(slots, storage) {
+            Ok(input) => input,
+            Err(_) => panic!("a fresh process-local input identity must be available"),
+        }
+    }
+
+    /// Prepare/begin/poll through the Session carrier to its exact verdict.
+    fn collected_cell_drive_to_closed(
+        session: &mut super::Session,
+        q: &super::CollectedFinishQ,
+        removed: Vec<super::Slot>,
+        reserve: &crate::semantics_edge::resources::SemanticResourceReserver,
+    ) -> anyhow::Result<super::RetainedRetirementInput> {
+        let mut input = Some(collected_cell_input(
+            removed,
+            reserve
+                .reserve(64 * 1024)
+                .expect("test pool pays the small removal input"),
+        ));
+        let ticket = loop {
+            let progress =
+                session.prepare_collected_static_retirement(q, &mut input, reserve, 1)?;
+            anyhow::ensure!(progress.used == 1);
+            match progress.state {
+                super::CollectedRetirementState::Preparing => {}
+                super::CollectedRetirementState::Prepared(ticket) => break ticket,
+                _ => anyhow::bail!("real preparation did not seal its input"),
+            }
+        };
+        loop {
+            let progress = session.begin_collected_static_retirement(q, &ticket, 1)?;
+            anyhow::ensure!(progress.used == 1);
+            match progress.state {
+                super::CollectedRetirementState::Transferring => {}
+                super::CollectedRetirementState::Pending => break,
+                _ => anyhow::bail!("real transfer did not reach its worker"),
+            }
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "real batch close did not settle"
+            );
+            let progress = session.poll_collected_static_retirement(q, &ticket, 1)?;
+            anyhow::ensure!(progress.used == 1);
+            match progress.state {
+                super::CollectedRetirementState::Pending => std::thread::yield_now(),
+                super::CollectedRetirementState::Closed(input) => return Ok(input),
+                _ => anyhow::bail!("real batch did not close exactly"),
+            }
+        }
+    }
+
+    fn collected_cell_endpoint_links(session: &super::Session, slot: u32) -> usize {
+        session
+            .links
+            .iter()
+            .filter(|link| link.slots().contains(&slot))
+            .count()
+    }
+
+    fn collected_cell_released(session: &super::Session) -> usize {
+        session
+            .cleanup_worker
+            .as_ref()
+            .expect("the prestarted worker stays until terminal detach")
+            .progress()
+            .released
+    }
+
+    #[ignore = "privileged: real Detailed Session native retirement"]
+    #[test]
+    fn collected_retirement_stopped_session_q_closes_original_lp64() -> anyhow::Result<()> {
+        let cell = CollectedSessionCell::build()?;
+        let init = cell.provider_init_offset()?;
+        let (pins, plan) = cell.pin_and_plan(&[init])?;
+        let mut session = super::Session::start(
+            &plan,
+            &super::Scope::Pid(cell.child.id()),
+            &pins,
+            super::CapturePolicy::Allowlisted,
+            None,
+            None,
+            None,
+            super::BackendSelection::Multi,
+        )?;
+        anyhow::ensure!(
+            session.attach_failures().is_empty(),
+            "attach failures: {:?}",
+            session.attach_failures()
+        );
+        anyhow::ensure!(session.backend_fallback().is_none());
+        anyhow::ensure!(session.has_slot_link(0));
+        let q = collected_cell_stop_to_q(&mut session)?;
+        anyhow::ensure!(session.mutation_stopped());
+        anyhow::ensure!(session.collected_retirement_is_physical());
+        let endpoint_links = collected_cell_endpoint_links(&session, 0);
+        anyhow::ensure!(
+            endpoint_links == 2,
+            "entry and return links: {endpoint_links}"
+        );
+        anyhow::ensure!(collected_cell_released(&session) == 0);
+        let closed = collected_cell_drive_to_closed(
+            &mut session,
+            &q,
+            plan.slots.clone(),
+            &collected_cell_pool().reserver(),
+        )?;
+        let (removed, _storage) = closed.into_removed();
+        anyhow::ensure!(removed.len() == 1 && removed[0].index == 0);
+        anyhow::ensure!(!session.has_slot_link(0), "the closed link is gone");
+        anyhow::ensure!(
+            collected_cell_released(&session) == endpoint_links,
+            "released equals the removed link count"
+        );
+        eprintln!("retirement-cell multi: closed slot 0, released {endpoint_links}");
+        session.detach_producers_driven(|| false, &mut Vec::new())?;
+        anyhow::ensure!(session.producers_detached);
+        session.mint_native_completion()?;
+        eprintln!("retirement-cell multi: terminal detach minted");
+        Ok(())
+    }
+
+    #[ignore = "privileged: real Detailed Session native retirement"]
+    #[test]
+    fn collected_retirement_singles_session_defers_close_to_terminal_detach_lp64()
+    -> anyhow::Result<()> {
+        let cell = CollectedSessionCell::build()?;
+        let init = cell.provider_init_offset()?;
+        let (pins, plan) = cell.pin_and_plan(&[init])?;
+        let mut session = super::Session::start(
+            &plan,
+            &super::Scope::Pid(cell.child.id()),
+            &pins,
+            super::CapturePolicy::Allowlisted,
+            None,
+            None,
+            None,
+            super::BackendSelection::Singles,
+        )?;
+        anyhow::ensure!(
+            session.attach_failures().is_empty(),
+            "attach failures: {:?}",
+            session.attach_failures()
+        );
+        anyhow::ensure!(session.has_slot_link(0));
+        let _q = collected_cell_stop_to_q(&mut session)?;
+        anyhow::ensure!(session.mutation_stopped());
+        anyhow::ensure!(!session.collected_retirement_is_physical());
+        // No native retirement runs at Q on Singles: the removed link stays
+        // in Session.links until the joined terminal detach closes it.
+        anyhow::ensure!(session.has_slot_link(0));
+        anyhow::ensure!(collected_cell_released(&session) == 0);
+        eprintln!("retirement-cell singles: link stays past Q");
+        session.detach_producers_driven(|| false, &mut Vec::new())?;
+        anyhow::ensure!(session.producers_detached);
+        anyhow::ensure!(!session.has_slot_link(0));
+        session.mint_native_completion()?;
+        eprintln!("retirement-cell singles: terminal detach closed it and minted");
+        Ok(())
+    }
+
+    #[ignore = "privileged: real Detailed Session native retirement"]
+    #[test]
+    fn collected_partial_group_real_session_guards_refuse_until_terminal_lp64() -> anyhow::Result<()>
+    {
+        let cell = CollectedSessionCell::build()?;
+        let init = cell.provider_init_offset()?;
+        // Two endpoints, one provider file: one shared Multi group.
+        let (pins, plan) = cell.pin_and_plan(&[init, init + 1])?;
+        let mut session = super::Session::start(
+            &plan,
+            &super::Scope::Pid(cell.child.id()),
+            &pins,
+            super::CapturePolicy::Allowlisted,
+            None,
+            None,
+            None,
+            super::BackendSelection::Multi,
+        )?;
+        anyhow::ensure!(
+            session.attach_failures().is_empty(),
+            "attach failures: {:?}",
+            session.attach_failures()
+        );
+        anyhow::ensure!(session.backend_fallback().is_none());
+        // The group is really shared: every link covering slot 0 also covers
+        // slot 1, on both the entry and the return side.
+        let covering: Vec<&super::RegisteredLink> = session
+            .links
+            .iter()
+            .filter(|link| link.slots().contains(&0))
+            .collect();
+        anyhow::ensure!(covering.len() == 2, "entry and return links");
+        for link in &covering {
+            anyhow::ensure!(
+                link.slots() == [0, 1],
+                "the group is shared: {:?}",
+                link.slots()
+            );
+        }
+        let programs: std::collections::BTreeSet<&str> = covering
+            .iter()
+            .filter_map(|link| match link {
+                super::RegisteredLink::MultiUProbe { program, .. } => Some(*program),
+                _ => None,
+            })
+            .collect();
+        anyhow::ensure!(programs.len() == 2, "two Multi sides: {programs:?}");
+        let q = collected_cell_stop_to_q(&mut session)?;
+        anyhow::ensure!(session.collected_retirement_is_physical());
+        // Remove slot 0 only: a strict partial-group subset at Q.
+        let pool = collected_cell_pool();
+        let reserve = pool.reserver();
+        let mut input = Some(collected_cell_input(
+            vec![plan.slots[0].clone()],
+            reserve
+                .reserve(64 * 1024)
+                .expect("test pool pays the small removal input"),
+        ));
+        let split = loop {
+            match session.defer_collected_partial_groups(&q, &mut input, &reserve, 1)? {
+                super::DeferralProgress::Yielded | super::DeferralProgress::Scanning => {}
+                super::DeferralProgress::Split { whole, deferred } => break (whole, deferred),
+                super::DeferralProgress::NoPartial(_) => {
+                    anyhow::bail!("a strict subset must defer, not pass through")
+                }
+            }
+        };
+        anyhow::ensure!(!split.1.registrations().is_empty());
+        anyhow::ensure!(
+            session.deferred_group_slots == std::collections::BTreeSet::from([0]),
+            "slot 0 is deferred: {:?}",
+            session.deferred_group_slots
+        );
+        anyhow::ensure!(session.has_slot_link(0) && session.has_slot_link(1));
+        // Selective mutation refuses while the slot is deferred.
+        let detach_error = session
+            .detach_slots_with_ended(&[plan.slots[1].clone()], None, false)
+            .unwrap_err();
+        anyhow::ensure!(
+            detach_error
+                .to_string()
+                .contains("collected group deferral"),
+            "detach names the deferral: {detach_error:?}"
+        );
+        let attach_error = session
+            .attach_targets(&[plan.slots[1].clone()], &pins)
+            .unwrap_err();
+        eprintln!("retirement-cell partial: attach refuses while deferred: {attach_error:?}");
+        drop(split);
+        // The terminal owned detach closes both members and mints: the mint
+        // proves the deferred slot was terminally submitted.
+        session.detach_producers_driven(|| false, &mut Vec::new())?;
+        anyhow::ensure!(session.producers_detached);
+        anyhow::ensure!(
+            session.submitted_terminal_slots.contains(&0),
+            "the deferred slot was terminally submitted: {:?}",
+            session.submitted_terminal_slots
+        );
+        anyhow::ensure!(!session.has_slot_link(0) && !session.has_slot_link(1));
+        session.mint_native_completion()?;
+        eprintln!("retirement-cell partial: terminal detach closed both and minted");
+        Ok(())
+    }
 }

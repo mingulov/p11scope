@@ -2140,63 +2140,63 @@ mod tests {
         }
     }
 
-    #[test]
-    #[ignore = "requires explicitly prebuilt LP64 counter-banks fixtures and authorized native attach"]
-    fn counter_bank_session_old_return_survives_append_lp64() {
+    struct OwnedFixture(std::process::Child);
+    impl Drop for OwnedFixture {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    impl OwnedFixture {
+        fn token(&mut self, expected: &str) {
+            use std::io::Read;
+            use std::os::fd::AsRawFd;
+            use std::time::{Duration, Instant};
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let output = self.0.stdout.as_mut().unwrap();
+            let mut line = Vec::new();
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                assert!(
+                    !remaining.is_zero(),
+                    "owned counter fixture barrier timed out"
+                );
+                let mut poll = libc::pollfd {
+                    fd: output.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let millis = i32::try_from(remaining.as_millis().max(1)).unwrap();
+                // SAFETY: one initialized pollfd is live for the finite call.
+                let ready = unsafe { libc::poll(&mut poll, 1, millis) };
+                if ready < 0
+                    && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                {
+                    continue;
+                }
+                assert!(ready > 0, "owned fixture did not reach its next barrier");
+                let mut byte = [0u8; 1];
+                output.read_exact(&mut byte).unwrap();
+                if byte[0] == b'\n' {
+                    break;
+                }
+                assert!(line.len() < 16, "fixture emits only finite protocol tokens");
+                line.push(byte[0]);
+            }
+            assert_eq!(line, expected.as_bytes());
+        }
+        fn command(&mut self, byte: u8) {
+            use std::io::Write;
+            self.0.stdin.as_mut().unwrap().write_all(&[byte]).unwrap();
+        }
+    }
+
+    fn old_return_survives_append_with_mode(mode: CounterMode) {
         use crate::attach::Scope;
         use crate::attach::counter_banks::{BankPublication, BankReservation};
-        use std::io::{Read, Write};
-        use std::os::fd::AsRawFd;
+        use std::io::Read;
         use std::path::{Path, PathBuf};
-        use std::process::{Child, Command, Stdio};
-        use std::time::{Duration, Instant};
-
-        struct OwnedFixture(Child);
-        impl Drop for OwnedFixture {
-            fn drop(&mut self) {
-                let _ = self.0.kill();
-                let _ = self.0.wait();
-            }
-        }
-        impl OwnedFixture {
-            fn token(&mut self, expected: &str) {
-                let deadline = Instant::now() + Duration::from_secs(5);
-                let output = self.0.stdout.as_mut().unwrap();
-                let mut line = Vec::new();
-                loop {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    assert!(
-                        !remaining.is_zero(),
-                        "owned counter fixture barrier timed out"
-                    );
-                    let mut poll = libc::pollfd {
-                        fd: output.as_raw_fd(),
-                        events: libc::POLLIN,
-                        revents: 0,
-                    };
-                    let millis = i32::try_from(remaining.as_millis().max(1)).unwrap();
-                    // SAFETY: one initialized pollfd is live for the finite call.
-                    let ready = unsafe { libc::poll(&mut poll, 1, millis) };
-                    if ready < 0
-                        && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
-                    {
-                        continue;
-                    }
-                    assert!(ready > 0, "owned fixture did not reach its next barrier");
-                    let mut byte = [0u8; 1];
-                    output.read_exact(&mut byte).unwrap();
-                    if byte[0] == b'\n' {
-                        break;
-                    }
-                    assert!(line.len() < 16, "fixture emits only finite protocol tokens");
-                    line.push(byte[0]);
-                }
-                assert_eq!(line, expected.as_bytes());
-            }
-            fn command(&mut self, byte: u8) {
-                self.0.stdin.as_mut().unwrap().write_all(&[byte]).unwrap();
-            }
-        }
+        use std::process::{Command, Stdio};
 
         assert_eq!(
             env!("P11SCOPE_COUNTER_OBJECTS_ENABLED"),
@@ -2283,10 +2283,10 @@ mod tests {
             metadata_bytes: 256 * 1024,
             file_descriptors: cpus.checked_mul(8).unwrap() + 16,
         };
-        let bytes = std::fs::read(
-            Path::new(env!("OUT_DIR"))
-                .join("counter-bank-growth-v2/p11scope-ebpf-counts-bank-growth-v2"),
-        )
+        let bytes = std::fs::read(Path::new(env!("OUT_DIR")).join(format!(
+            "counter-bank-growth-v2/p11scope-ebpf-{}-bank-growth-v2",
+            mode.name()
+        )))
         .unwrap();
         let mut session = Session::prepare_counter_banks(
             &Scope::Pid(fixture.0.id()),
@@ -2309,7 +2309,7 @@ mod tests {
         assert_eq!((extent.first, extent.end), (0, 1));
         assert_eq!(history.counter_consumed_end(), 1);
         let binding = session.counter_reader_binding().unwrap().unwrap();
-        assert_eq!(binding.mode(), CounterMode::Counts);
+        assert_eq!(binding.mode(), mode);
         assert_eq!(
             binding.generation(),
             session.counter_collection_generation()
@@ -2361,7 +2361,13 @@ mod tests {
             "a genuine old START is held across publication"
         );
         assert_eq!(keys[0].slot, 0);
-        assert_eq!(starts.get(&keys[0], 0).unwrap().object_required, 0);
+        let held = starts.get(&keys[0], 0).unwrap();
+        assert_eq!(held.object_required, 0);
+        if mode.has_timing() {
+            assert_ne!(held.ts_ns, 0, "a timing START holds the entry clock");
+        } else {
+            assert_eq!(held.ts_ns, 0);
+        }
         match collector.observe(read_banked(
             &session,
             &history,
@@ -2370,7 +2376,10 @@ mod tests {
             &pool.reserver(),
         )) {
             CounterObservation::Advanced { deltas, .. } => {
-                assert_eq!((deltas[0].entered, deltas[0].returned), (1, 0))
+                assert_eq!((deltas[0].entered, deltas[0].returned), (1, 0));
+                assert_eq!(deltas[0].mode, mode);
+                assert_eq!((deltas[0].total_ns, deltas[0].max_ns), (0, 0));
+                assert_eq!(deltas[0].buckets.iter().sum::<u64>(), 0);
             }
             other => panic!("actual held entry was not collected: {other:?}"),
         }
@@ -2392,7 +2401,7 @@ mod tests {
         assert!(new_transaction > old_transaction);
         fixture.command(b'H');
         fixture.token("HOT");
-        match collector.observe(read_banked(
+        let hot_max = match collector.observe(read_banked(
             &session,
             &history,
             &pins,
@@ -2401,18 +2410,32 @@ mod tests {
         )) {
             CounterObservation::Advanced { deltas, .. } => {
                 assert_eq!((deltas[0].entered, deltas[0].returned), (0, 0));
+                assert_eq!(deltas[0].mode, mode);
+                assert_eq!((deltas[0].total_ns, deltas[0].max_ns), (0, 0));
+                assert_eq!(deltas[0].buckets.iter().sum::<u64>(), 0);
                 assert_eq!(
                     (deltas[1].entered, deltas[1].returned, deltas[1].errors),
                     (1, 1, 1)
                 );
                 assert_eq!(deltas[1].rv_counts.get(&0x1_0000_0204), Some(&1));
+                assert_eq!(deltas[1].mode, mode);
+                assert_eq!(
+                    deltas[1].total_ns, deltas[1].max_ns,
+                    "a single completion carries one span"
+                );
+                if mode.has_histogram() {
+                    assert_eq!(deltas[1].buckets.iter().sum::<u64>(), 1);
+                } else {
+                    assert_eq!(deltas[1].buckets.iter().sum::<u64>(), 0);
+                }
+                deltas[1].max_ns
             }
             other => panic!("actual new hot bank was not collected: {other:?}"),
-        }
+        };
         fixture.command(b'R');
         fixture.token("DONE");
         assert!(fixture.0.wait().unwrap().success());
-        match collector.observe(read_banked(
+        let (old_total, old_max, old_buckets) = match collector.observe(read_banked(
             &session,
             &history,
             &pins,
@@ -2425,10 +2448,42 @@ mod tests {
                     (0, 1, 0)
                 );
                 assert_eq!(deltas[0].rv_counts.get(&0x204), Some(&1));
+                assert_eq!(deltas[0].mode, mode);
+                assert_eq!(
+                    deltas[0].total_ns, deltas[0].max_ns,
+                    "the held call contributes one span"
+                );
+                if mode.has_timing() {
+                    assert!(
+                        deltas[0].total_ns > 0 && deltas[0].max_ns > 0,
+                        "the held call spans the append"
+                    );
+                } else {
+                    assert_eq!((deltas[0].total_ns, deltas[0].max_ns), (0, 0));
+                }
+                let old_buckets = if mode.has_histogram() {
+                    assert_eq!(deltas[0].buckets.iter().sum::<u64>(), 1);
+                    1
+                } else {
+                    assert_eq!(deltas[0].buckets.iter().sum::<u64>(), 0);
+                    0
+                };
                 assert_eq!((deltas[1].entered, deltas[1].returned), (0, 0));
+                assert_eq!(deltas[1].mode, mode);
+                assert_eq!(deltas[1].total_ns, 0);
+                assert_eq!(
+                    deltas[1].max_ns, hot_max,
+                    "the cumulative hot max survives the final observation"
+                );
+                assert_eq!(deltas[1].buckets.iter().sum::<u64>(), 0);
+                (deltas[0].total_ns, deltas[0].max_ns, old_buckets)
             }
             other => panic!("old-bank return did not survive the new transaction: {other:?}"),
-        }
+        };
+        eprintln!(
+            "{}_OLD_RETURN_SURVIVED total_ns={old_total} max_ns={old_max} buckets={old_buckets}",
+            mode.name().to_uppercase(),
+        );
         session.stop_gate().request_stop();
         session
             .detach_producers_driven(|| false, &mut Vec::new())
@@ -2456,6 +2511,24 @@ mod tests {
             SEMANTIC_TRANSITION_SCRATCH,
             "actual native owners and collected storage refund only after drop"
         );
+    }
+
+    #[test]
+    #[ignore = "requires explicitly prebuilt LP64 counter-banks fixtures and authorized native attach"]
+    fn counter_bank_session_old_return_survives_append_lp64() {
+        old_return_survives_append_with_mode(CounterMode::Counts);
+    }
+
+    #[test]
+    #[ignore = "requires explicitly prebuilt LP64 counter-banks fixtures, validated timestamps and latency format2 objects, and authorized native attach; runs a counts-null twin first"]
+    fn counter_bank_session_timing_old_return_survives_append_lp64() {
+        for mode in [
+            CounterMode::Counts,
+            CounterMode::Timestamps,
+            CounterMode::Latency,
+        ] {
+            old_return_survives_append_with_mode(mode);
+        }
     }
 
     const GROWTH_ENDPOINTS: usize = 8192;
@@ -2846,21 +2919,15 @@ mod tests {
         expected: GrowthLedger,
         previous: Option<GrowthLedger>,
         case_deadline: std::time::Instant,
+        mode: CounterMode,
     }
 
     impl NativeGrowthRun {
-        fn new(final_count: usize, case_deadline: std::time::Instant) -> Self {
-            Self::new_with_backend(
-                final_count,
-                case_deadline,
-                crate::attach::AttachBackend::Singles,
-            )
-        }
-
-        fn new_with_backend(
+        fn new_with_backend_and_mode(
             final_count: usize,
             case_deadline: std::time::Instant,
             backend: crate::attach::AttachBackend,
+            mode: CounterMode,
         ) -> Self {
             use crate::attach::counter_banks::{BankPublication, BankReservation};
             use sha2::Digest;
@@ -2970,10 +3037,10 @@ mod tests {
                     .and_then(|n| n.checked_add(16))
                     .unwrap(),
             };
-            let artifact = std::fs::read(
-                Path::new(env!("OUT_DIR"))
-                    .join("counter-bank-growth-v2/p11scope-ebpf-counts-bank-growth-v2"),
-            )
+            let artifact = std::fs::read(Path::new(env!("OUT_DIR")).join(format!(
+                "counter-bank-growth-v2/p11scope-ebpf-{}-bank-growth-v2",
+                mode.name()
+            )))
             .unwrap();
             let scope = crate::attach::Scope::Pid(fixture.child.id());
             let mut session = match backend {
@@ -3021,6 +3088,7 @@ mod tests {
                 expected: GrowthLedger::empty(),
                 previous: None,
                 case_deadline,
+                mode,
             };
             run.checkpoint();
             run
@@ -3088,8 +3156,30 @@ mod tests {
                         self.expected.rv_counts(index),
                         "full64 native RV row {index}"
                     );
-                    assert_eq!((actual.total_ns, actual.max_ns), (0, 0));
-                    assert!(actual.buckets.iter().all(|&value| value == 0));
+                    match self.mode {
+                        CounterMode::Counts => {
+                            assert_eq!((actual.total_ns, actual.max_ns), (0, 0));
+                            assert!(actual.buckets.iter().all(|&value| value == 0));
+                        }
+                        CounterMode::Timestamps => {
+                            assert!(
+                                actual.total_ns >= actual.max_ns,
+                                "native cumulative timing row {index}"
+                            );
+                            assert!(actual.buckets.iter().all(|&value| value == 0));
+                        }
+                        CounterMode::Latency => {
+                            assert!(
+                                actual.total_ns >= actual.max_ns,
+                                "native cumulative timing row {index}"
+                            );
+                            assert_eq!(
+                                actual.buckets.iter().sum::<u64>(),
+                                actual.returned,
+                                "each native completion lands in exactly one bucket, row {index}"
+                            );
+                        }
+                    }
                     totals[0] += actual.entered;
                     totals[1] += actual.returned;
                     totals[2] += actual.errors;
@@ -3132,7 +3222,8 @@ mod tests {
             }
             self.previous = Some(self.expected.clone());
             eprintln!(
-                "COUNTS_GROWTH_CHECKPOINT published={count} totals={:?}",
+                "{}_GROWTH_CHECKPOINT published={count} totals={:?}",
+                self.mode.name().to_uppercase(),
                 self.expected.totals()
             );
         }
@@ -3144,8 +3235,44 @@ mod tests {
             assert_eq!(keys.len(), 1, "one actual old START must remain held");
             assert_eq!((keys[0].slot, keys[0]._pad), (0, 0));
             let start = starts.get(&keys[0], 0).unwrap();
-            assert_eq!((start.ts_ns, start.object_required), (0, 0));
+            assert_eq!(start.object_required, 0);
+            if self.mode.has_timing() {
+                assert_ne!(start.ts_ns, 0, "a timing START holds the entry clock");
+            } else {
+                assert_eq!(start.ts_ns, 0);
+            }
             (keys[0].pid_tgid, keys[0].slot, start.slot_id)
+        }
+
+        fn assert_held_timing(&self) {
+            // The row-0 call was held from START to RELEASE across the whole
+            // run: its single completion carries a multi-syscall span on the
+            // nanosecond clock, so cumulative total and max are both live.
+            let read = read_banked(
+                &self.session,
+                &self.history,
+                &self.pins,
+                self.limits,
+                &self.pool.reserver(),
+            )
+            .unwrap();
+            let view = read.view();
+            assert_eq!(view.mode, self.mode);
+            let rows = view.rows.unwrap();
+            let first = rows[0].view();
+            assert_eq!(first.slot, 0);
+            assert!(first.entered > 0 && first.returned > 0);
+            assert!(
+                first.total_ns > 0 && first.max_ns > 0,
+                "the whole-run held call carries live timing"
+            );
+            if self.mode.has_histogram() {
+                assert_eq!(
+                    first.buckets.iter().sum::<u64>(),
+                    first.returned,
+                    "every row-0 completion lands in exactly one bucket"
+                );
+            }
         }
 
         fn bank_ids(&self) -> Vec<u32> {
@@ -3246,6 +3373,9 @@ mod tests {
             self.fixture.expect(&format!("DONE {count}"));
             self.fixture.wait_after_done();
             self.sample(); // No extra credit or hidden health failure on driver exit.
+            if self.mode.has_timing() {
+                self.assert_held_timing();
+            }
             self.session.stop_gate().request_stop();
             // Normal stop uses only what remains of the original whole-case
             // budget. Driver commands/reap retain their separate 5s bounds.
@@ -3278,7 +3408,8 @@ mod tests {
             );
             let banks = self.bank_ids().len();
             eprintln!(
-                "COUNTS_GROWTH_POPULATION allocated={count} published={count} exercised={count} banks={banks} ledger_completed={}",
+                "{}_GROWTH_POPULATION allocated={count} published={count} exercised={count} banks={banks} ledger_completed={}",
+                self.mode.name().to_uppercase(),
                 self.expected.totals()[1]
             );
             drop(self.collector);
@@ -3302,6 +3433,14 @@ mod tests {
         final_count: usize,
         backend: crate::attach::AttachBackend,
     ) {
+        native_growth_population_with_backend_and_mode(final_count, backend, CounterMode::Counts);
+    }
+
+    fn native_growth_population_with_backend_and_mode(
+        final_count: usize,
+        backend: crate::attach::AttachBackend,
+        mode: CounterMode,
+    ) {
         let budget = match backend {
             crate::attach::AttachBackend::Singles => {
                 // Two links per endpoint plus the bank, keepalive and lifecycle links.
@@ -3311,14 +3450,8 @@ mod tests {
             crate::attach::AttachBackend::Multi => GROWTH_CASE_BUDGET,
         };
         let case_deadline = std::time::Instant::now() + budget;
-        let mut run = match backend {
-            crate::attach::AttachBackend::Singles => {
-                NativeGrowthRun::new(final_count, case_deadline)
-            }
-            crate::attach::AttachBackend::Multi => {
-                NativeGrowthRun::new_with_backend(final_count, case_deadline, backend)
-            }
-        };
+        let mut run =
+            NativeGrowthRun::new_with_backend_and_mode(final_count, case_deadline, backend, mode);
         run.fixture.command("START");
         run.fixture.expect("HELD 0");
         run.expected.rows[0].entered += 1;
@@ -3424,6 +3557,46 @@ mod tests {
     #[ignore = "requires prebuilt LP64 growth fixtures, selected format2 object, and separate FD/memory/native admission for 8192 distinct endpoints after the qualified Multi513 pilot"]
     fn counter_bank_session_useful_8192_counts_growth_multi_lp64() {
         native_growth_population_with_backend(8192, crate::attach::AttachBackend::Multi);
+    }
+
+    #[test]
+    #[ignore = "requires LP64 counter-bank-growth fixtures, validated timestamps format2 object, functional kernel Multi attachment, and authorized native Multi staging"]
+    fn counter_bank_session_boundary_511_512_timestamps_growth_lp64() {
+        native_growth_population_with_backend_and_mode(
+            513,
+            crate::attach::AttachBackend::Multi,
+            CounterMode::Timestamps,
+        );
+    }
+
+    #[test]
+    #[ignore = "requires LP64 counter-bank-growth fixtures, validated latency format2 object, functional kernel Multi attachment, and authorized native Multi staging"]
+    fn counter_bank_session_boundary_511_512_latency_growth_lp64() {
+        native_growth_population_with_backend_and_mode(
+            513,
+            crate::attach::AttachBackend::Multi,
+            CounterMode::Latency,
+        );
+    }
+
+    #[test]
+    #[ignore = "requires prebuilt LP64 growth fixtures, validated timestamps format2 object, and separate FD/memory/native admission for 8192 distinct timestamp endpoints after the boundary pilot"]
+    fn counter_bank_session_useful_8192_timestamps_growth_multi_lp64() {
+        native_growth_population_with_backend_and_mode(
+            8192,
+            crate::attach::AttachBackend::Multi,
+            CounterMode::Timestamps,
+        );
+    }
+
+    #[test]
+    #[ignore = "requires prebuilt LP64 growth fixtures, validated latency format2 object, and separate FD/memory/native admission for 8192 distinct latency endpoints after the boundary pilot"]
+    fn counter_bank_session_useful_8192_latency_growth_multi_lp64() {
+        native_growth_population_with_backend_and_mode(
+            8192,
+            crate::attach::AttachBackend::Multi,
+            CounterMode::Latency,
+        );
     }
 
     #[test]

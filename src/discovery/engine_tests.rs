@@ -13,8 +13,8 @@ mod inventory_claims;
 mod tabled_readiness;
 use crate::discovery::identity::test_fixture::{
     SHA as OVERLAY_SHA, backing_file as overlay_backing_file, module as overlay_module,
-    overlay as overlay_key, pins as overlay_pins, reback as overlay_reback,
-    view_pin as overlay_view_pin,
+    overlay as overlay_key, pins as overlay_pins, real_scan_pin as overlay_real_scan_pin,
+    reback as overlay_reback, view_pin as overlay_view_pin,
 };
 use crate::discovery::identity::{
     ManifestPinError, ManifestStaleReason, PinnedObjectId, ReconciledModule, open_view_object,
@@ -46993,4 +46993,1010 @@ fn scanned_module_copy_is_exact() {
         panic!("the copy must complete");
     };
     assert_eq!(count_steps(&source) - count_steps(&few), 1);
+}
+
+/// T4b helper: a collected retirement case whose leader exit is dispatched.
+/// The closer is released up front when `release` is set.
+fn graph_case_with_exit(release: bool) -> CollectedFinishGraphCase {
+    let mut case = CollectedFinishGraphCase::new(false);
+    case.child.reap().unwrap();
+    assert_eq!(case.engine.views[0].original_exited(), Ok(true));
+    case.engine.update_counter_snapshot(&case.session).unwrap();
+    case.engine.dispatch_lifecycle_record(
+        &mut case.session,
+        &collected_finish_leader_exit(case.child.pid()),
+        &mut PendingViewRetirements::new(),
+    );
+    assert!(case.engine.pending_leader_exit_views.contains(&case.view));
+    if release {
+        case.release();
+    }
+    case
+}
+
+/// T4b helper: drives a graph case to `!pending`, returning the credit count.
+/// Panics when the bound runs out.
+fn drive_graph_case_to_drained(case: &mut CollectedFinishGraphCase) -> u64 {
+    for credits in 1..=600u64 {
+        if !case.service(1).pending {
+            return credits;
+        }
+    }
+    panic!("the graph case did not drain");
+}
+
+/// T4b helper: a non-blocking native carrier over the engine's current
+/// plan and pins. Released before return; the caller holds the receivers
+/// alive so the closer never fails a send.
+fn attach_nonblocking_native_carrier(
+    engine: &Engine,
+    session: &mut ScriptedSession,
+) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Receiver<()>) {
+    let release = std::sync::Arc::new((std::sync::Mutex::new(true), std::sync::Condvar::new()));
+    let gate = std::sync::Arc::clone(&release);
+    let (entered_sender, entered) = std::sync::mpsc::channel();
+    let (returned_sender, returned) = std::sync::mpsc::channel();
+    let retirement = crate::attach::RetirementFixture::new_collected(
+        &engine.plan.slots,
+        &engine.pinned,
+        Box::new(move |owned, producer| {
+            if producer == crate::attach::ProducerProgram::UProbe("p11_return") {
+                entered_sender.send(()).map_err(|error| error.to_string())?;
+                let (lock, changed) = &*gate;
+                let released = changed
+                    .wait_timeout_while(
+                        lock.lock().unwrap(),
+                        std::time::Duration::from_secs(5),
+                        |ready| !*ready,
+                    )
+                    .map_err(|error| error.to_string())?;
+                if !*released.0 {
+                    return Err("owned graph retirement release deadline".into());
+                }
+                returned_sender
+                    .send(())
+                    .map_err(|error| error.to_string())?;
+            }
+            drop(owned);
+            Ok(())
+        }),
+    );
+    session.global_retirement = Some(std::cell::RefCell::new(retirement));
+    (entered, returned)
+}
+
+#[test]
+fn collected_graph_revalidate_mismatch_retains_native_debt() {
+    let mut case = graph_case_with_exit(false);
+    // Drive to the first NativePoll credit; the blocked closer parks there.
+    for _ in 0..512 {
+        if case
+            .engine
+            .collected_graph
+            .as_ref()
+            .is_some_and(|graph| graph.phase == GraphPhase::NativePoll)
+        {
+            break;
+        }
+        case.service(1);
+    }
+    let graph = case
+        .engine
+        .collected_graph
+        .as_ref()
+        .expect("a graph must reach NativePoll");
+    assert_eq!(graph.phase, GraphPhase::NativePoll);
+    assert_eq!(
+        case.session
+            .global_retirement
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .begins,
+        1,
+        "native must be reached"
+    );
+    assert!(graph.mutated, "begin must have transferred");
+    assert!(
+        case.session
+            .global_retirement
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .blocking()
+    );
+    // The real mutation between NativePoll credits.
+    case.engine.settle_frame_deferrals_at_capture_end();
+    let revision = case.engine.pinned.revision();
+    let slots = case.engine.plan.slots.clone();
+    let charged = case.engine.collected_test_pool.snapshot().charged_bytes;
+    let outcome = case.service(1);
+    assert!(outcome.pending);
+    let graph = case
+        .engine
+        .collected_graph
+        .as_ref()
+        .expect("refused graph stays boxed");
+    assert_eq!(graph.verdict, Some(Verdict::RefusedRetained));
+    assert_eq!(
+        case.engine.collected_graph_refused(),
+        Some("native ownership uncertain")
+    );
+    assert!(!graph.installed, "no Install after a revalidate mismatch");
+    assert_eq!(case.engine.pinned.revision(), revision);
+    assert_eq!(case.engine.plan.slots, slots);
+    assert_eq!(
+        case.engine.collected_test_pool.snapshot().charged_bytes,
+        charged,
+        "leases kept"
+    );
+    assert_eq!(
+        case.session
+            .global_retirement
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .begins,
+        1
+    );
+    assert!(
+        case.session
+            .global_retirement
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .blocking(),
+        "the native debt stays live"
+    );
+    for _ in 0..4 {
+        assert!(case.service(1).pending);
+    }
+}
+
+#[test]
+fn collected_graph_prepare_error_cancels_preflight_and_returns_input() {
+    // Before the take: a live preflight exists, then prepare fails.
+    let mut case = graph_case_with_exit(true);
+    let mut saw_preflight = false;
+    for _ in 0..512 {
+        case.service(1);
+        let blocking = case
+            .session
+            .global_retirement
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .blocking();
+        let held = case.engine.collected_graph.as_ref().is_some_and(|graph| {
+            graph.phase == GraphPhase::NativePrepare && graph.removed.is_some()
+        });
+        if blocking && held {
+            saw_preflight = true;
+            break;
+        }
+    }
+    assert!(saw_preflight, "a preflight must exist before the take");
+    case.session.fail_collected_prepare.set(true);
+    let outcome = case.service(1);
+    assert!(outcome.pending);
+    let graph = case
+        .engine
+        .collected_graph
+        .as_ref()
+        .expect("refused graph stays boxed");
+    assert_eq!(graph.verdict, Some(Verdict::RefusedUntouched));
+    assert_eq!(
+        case.engine.collected_graph_refused(),
+        Some("terminal graph refused before native mutation")
+    );
+    assert!(
+        graph.removed.is_some(),
+        "the untaken input stays with the graph"
+    );
+    assert!(
+        !case
+            .session
+            .global_retirement
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .blocking(),
+        "the cancel clears the preflight"
+    );
+    assert_eq!(
+        case.engine
+            .counters
+            .object_skips
+            .iter()
+            .filter(|skip| skip.subject == "collected native retirement")
+            .count(),
+        1
+    );
+    // After the take: the take happened, then prepare fails; the ticket
+    // cancel returns the input.
+    let mut case = graph_case_with_exit(true);
+    let mut saw_take = false;
+    for _ in 0..512 {
+        case.service(1);
+        let taken = case.engine.collected_graph.as_ref().is_some_and(|graph| {
+            graph.phase == GraphPhase::NativePrepare
+                && graph.removed.is_none()
+                && graph.ticket.is_some()
+        });
+        if taken {
+            saw_take = true;
+            break;
+        }
+    }
+    assert!(saw_take, "the take must happen");
+    case.session.fail_collected_prepare.set(true);
+    let mut verdict = None;
+    for _ in 0..64 {
+        let outcome = case.service(1);
+        assert!(outcome.pending);
+        verdict = case
+            .engine
+            .collected_graph
+            .as_ref()
+            .and_then(|graph| graph.verdict);
+        if verdict.is_some() {
+            break;
+        }
+    }
+    assert_eq!(
+        verdict,
+        Some(Verdict::RefusedUntouched),
+        "the cancelled take returns untouched"
+    );
+    let graph = case
+        .engine
+        .collected_graph
+        .as_ref()
+        .expect("refused graph stays boxed");
+    assert!(
+        graph.removed.is_some(),
+        "the ticket cancel returns the input"
+    );
+    assert!(
+        !case
+            .session
+            .global_retirement
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .blocking(),
+        "the cancel drains the cursor"
+    );
+    assert_eq!(
+        case.engine
+            .counters
+            .object_skips
+            .iter()
+            .filter(|skip| skip.subject == "collected native retirement")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn collected_graph_closed_never_owes_recovery_frame() {
+    let mut case = graph_case_with_exit(true);
+    assert!(case.engine.refresh_requested.is_empty());
+    drive_graph_case_to_drained(&mut case);
+    assert!(
+        !case.engine.global_retirement_frame_owed,
+        "a closed graph owes no global retirement frame"
+    );
+    assert!(
+        !case.engine.immediate_exec_recovery_frame,
+        "a closed graph owes no exec recovery frame"
+    );
+    assert!(
+        case.engine.refresh_requested.is_empty(),
+        "a closed graph requests no refresh"
+    );
+}
+
+#[test]
+fn collected_graph_consume_disposes_every_view_owner() {
+    use p11scope_manifest::elf::SymbolFact;
+
+    let mut case = graph_case_with_exit(true);
+    let view = case.view;
+    // An attached loader context owned by the retiring view.
+    let prepared = case
+        .engine
+        .loader_registry
+        .preflight(LoaderContextSpec {
+            view,
+            loader: PinnedObjectId(9),
+            mapping: None,
+            hook: SymbolFact {
+                virtual_address: 0x2100,
+                file_offset: 0x2100,
+            },
+            state_address: None,
+        })
+        .expect("a preflighted loader context");
+    let context = case
+        .engine
+        .loader_registry
+        .prepare(prepared)
+        .expect("a prepared loader context");
+    case.engine
+        .loader_registry
+        .mark_attached(context)
+        .expect("an attached loader context");
+    assert_eq!(case.engine.loader_registry.ids_for_view(view).len(), 1);
+    // A selection binding on that context, a claim and a table, scan
+    // inputs, and an exec rearm marker, all for the retiring view.
+    let generation = std::num::NonZeroU64::new(1).unwrap();
+    case.engine.selection_bindings.insert(
+        1,
+        SelectionBindingFact {
+            id: 1,
+            context,
+            view,
+            object: case.original_slot.object,
+            file_offset: 0,
+            hook_id: 0,
+            abi: HookAbi::Interface,
+            attached: true,
+            retired: false,
+            provider: plan::ModuleId(0),
+            observed: false,
+            coverage: SelectionCoverageState::OwnedOpen(generation),
+        },
+    );
+    let provider = case
+        .engine
+        .pinned
+        .owned_timing_key(case.original_slot.object)
+        .expect("the retired object has a timing key");
+    case.engine.selection_claims.insert(
+        SelectionClaimKey {
+            binding_id: 1,
+            view,
+            context: 0,
+            hook_owner: PinnedObjectId(9),
+            provider: provider.clone(),
+            selected_object: case.original_slot.object,
+            table_file_offset: 0,
+            version: SelectionVersionClass::V3_0,
+            flags: 0,
+            name: "C_Initialize",
+            file_offset: 0,
+        },
+        SelectionClaim {
+            target: plan::AttachKey {
+                object: case.original_slot.object,
+                file_offset: 0,
+            },
+            object_path: case.original_slot.object_path.clone(),
+        },
+    );
+    case.engine.selection_tables.insert(
+        SelectionTableKey {
+            view,
+            provider,
+            version: SelectionVersionClass::V3_0,
+            flags: 0,
+        },
+        SelectionTableFact {
+            object: case.original_slot.object,
+            file_offset: 0,
+            targets: Vec::new(),
+        },
+    );
+    case.engine.scan_inputs.insert(
+        view,
+        ScanInput {
+            modules: Vec::new(),
+            pins: PinnedObjects::empty(),
+            counters: DiscoveryCounters::default(),
+        },
+    );
+    case.engine.exec_rearm_views.insert(view, None);
+    drive_graph_case_to_drained(&mut case);
+    assert!(
+        case.engine.views.iter().all(|owner| owner.id() != view),
+        "the retired view is gone"
+    );
+    assert!(
+        case.engine.scan_inputs.get(&view).is_none(),
+        "scan inputs are gone"
+    );
+    assert!(
+        case.engine
+            .selection_claims
+            .keys()
+            .all(|key| key.view != view),
+        "claims are gone"
+    );
+    assert!(
+        case.engine
+            .selection_tables
+            .keys()
+            .all(|key| key.view != view),
+        "tables are gone"
+    );
+    let binding = case
+        .engine
+        .selection_bindings
+        .get(&1)
+        .expect("legacy keeps the retired binding row");
+    assert!(binding.retired, "the binding is retired");
+    assert!(
+        matches!(binding.coverage, SelectionCoverageState::OwnedClosed(_)),
+        "the binding coverage is closed"
+    );
+    assert!(
+        case.engine.loader_registry.ids_for_view(view).is_empty(),
+        "loader contexts are gone"
+    );
+    assert!(
+        case.session.detached.contains(&context),
+        "the attached context was detached"
+    );
+    assert!(
+        case.engine.exec_rearm_views.get(&view).is_none(),
+        "exec rearm markers are gone"
+    );
+    assert!(
+        !case.engine.pending_retirements.contains(&view),
+        "pending retirements are gone"
+    );
+    let probe = case.engine.allocate_view_id().unwrap();
+    assert_ne!(probe, view, "the ID stays allocated, not recycled");
+    case.engine.release_view_id(probe);
+}
+
+#[test]
+fn collected_graph_pid_scope_matches_legacy_physical_gap_summary() {
+    // Twins: the established System behavior and the PID scope that
+    // skips the ended-PID proof at Q (OQ-4).
+    let mut system = CollectedFinishGraphCase::new(false);
+    system.child.reap().unwrap();
+    system
+        .engine
+        .update_counter_snapshot(&system.session)
+        .unwrap();
+    system.engine.dispatch_lifecycle_record(
+        &mut system.session,
+        &collected_finish_leader_exit(system.child.pid()),
+        &mut PendingViewRetirements::new(),
+    );
+    system.release();
+    let mut pid = CollectedFinishGraphCase::new(false);
+    pid.engine.scope = Scope::Pid(pid.child.pid());
+    pid.child.reap().unwrap();
+    pid.engine.update_counter_snapshot(&pid.session).unwrap();
+    pid.engine.dispatch_lifecycle_record(
+        &mut pid.session,
+        &collected_finish_leader_exit(pid.child.pid()),
+        &mut PendingViewRetirements::new(),
+    );
+    pid.release();
+    let system_before = system.session.physical_gap_summary();
+    let pid_before = pid.session.physical_gap_summary();
+    drive_graph_case_to_drained(&mut system);
+    drive_graph_case_to_drained(&mut pid);
+    assert!(
+        system
+            .engine
+            .views
+            .iter()
+            .all(|owner| owner.id() != system.view)
+    );
+    assert!(pid.engine.views.iter().all(|owner| owner.id() != pid.view));
+    assert!(
+        pid.engine.ended_pid_retirement.is_none(),
+        "no ended-PID proof is taken at Q"
+    );
+    let system_after = system.session.physical_gap_summary();
+    let pid_after = pid.session.physical_gap_summary();
+    assert_eq!(system_after, system_before, "no new physical gap");
+    assert_eq!(pid_after, pid_before, "no new physical gap");
+    assert_eq!(
+        pid_after, system_after,
+        "PID scope matches the established summary"
+    );
+    assert_eq!(pid_after.episodes, 0);
+    assert!(!pid_after.open);
+}
+
+#[test]
+fn collected_graph_retired_pin_file_stays_open_until_handoff_close() {
+    let mut case = graph_case_with_exit(true);
+    // A Weak to the retired pin's file; every strong holder here is
+    // dropped immediately so the count observes live owners only.
+    let weak = {
+        let held = case
+            .engine
+            .pinned
+            .retain_inventory_target(case.original_slot.object)
+            .expect("the retired object retains");
+        let file = held.retirement_lease();
+        std::sync::Arc::downgrade(&file)
+    };
+    let baseline = case.engine.collected_test_pool.snapshot().charged_bytes;
+    drive_graph_case_to_drained(&mut case);
+    assert_eq!(
+        weak.strong_count(),
+        1,
+        "only the handoff holds the retired file"
+    );
+    assert!(weak.upgrade().is_some());
+    // Close one file per call until the chain reports empty.
+    let mut closes = 0;
+    for _ in 0..16 {
+        closes += 1;
+        if case.engine.close_retired_files(1) {
+            break;
+        }
+    }
+    assert!(
+        weak.upgrade().is_none(),
+        "the handoff close drops the last file"
+    );
+    assert_eq!(closes, 1, "exactly one retired file");
+    let expected = baseline
+        + std::mem::size_of::<GraphBacking>()
+        + OWNED_ALLOCATION_PADDING
+        + RetiredFileHandoff::bytes(1);
+    assert_eq!(
+        case.engine.collected_test_pool.snapshot().charged_bytes,
+        expected,
+        "the pool holds the baseline plus the live backing only"
+    );
+}
+
+#[test]
+fn collected_graph_reclaim_refusal_retains_and_finishes() {
+    let (child, mut engine, _) = engine_with_one_accepted_provider();
+    let _accepted = SystemScopeChildGuard::new(child);
+    engine.scope = Scope::System;
+    let view = engine.views[0].id();
+    let mut session = ScriptedSession::default();
+    let (_entered, _returned) = attach_nonblocking_native_carrier(&mut engine, &mut session);
+    assert!(
+        engine
+            .retirement_intents
+            .insert(view, RetirementCause::ExpectedRemoval)
+            .is_none()
+    );
+    assert!(engine.ready_expected_removals.insert(view));
+    drive_engine_graph_to_phase(&mut engine, &mut session, GraphPhase::Reclaim);
+    // A live pins clone between Reclaim credits mints a fresh copy
+    // source, so the installed fence no longer matches.
+    engine.pinned = engine.pinned.clone();
+    let outcome = engine
+        .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+        .unwrap();
+    assert!(
+        !outcome.pending,
+        "Finish continues after a forgotten reclaim"
+    );
+    assert!(engine.collected_graph.is_none());
+    assert_eq!(engine.collected_graph_reclaim_forgotten, 1);
+    assert_eq!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .filter(|skip| skip.subject == "collected graph reclamation")
+            .count(),
+        1
+    );
+    assert!(
+        engine.views.iter().all(|owner| owner.id() != view),
+        "Consume still retired the view"
+    );
+    assert!(
+        !engine
+            .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+            .unwrap()
+            .pending
+    );
+    // Twin: a second refused graph in the same capture counts 2 with
+    // still one disclosure. The bare view names itself through scan
+    // inputs so the refusal site requests the graph.
+    let spare = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("a spare child");
+    let _spare = SystemScopeChildGuard::new(spare);
+    let bare = ProcessViewId(engine.next_view_id);
+    engine
+        .views
+        .push(ProcessView::open(bare, _spare.pid()).expect("a live process view"));
+    engine.next_view_id += 1;
+    engine.scan_inputs.insert(
+        bare,
+        ScanInput {
+            modules: Vec::new(),
+            pins: PinnedObjects::empty(),
+            counters: DiscoveryCounters::default(),
+        },
+    );
+    assert!(
+        engine
+            .retirement_intents
+            .insert(bare, RetirementCause::ExpectedRemoval)
+            .is_none()
+    );
+    assert!(engine.ready_expected_removals.insert(bare));
+    drive_engine_graph_to_phase(&mut engine, &mut session, GraphPhase::Reclaim);
+    engine.pinned = engine.pinned.clone();
+    let outcome = engine
+        .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+        .unwrap();
+    assert!(!outcome.pending);
+    assert!(engine.collected_graph.is_none());
+    assert_eq!(engine.collected_graph_reclaim_forgotten, 2);
+    assert_eq!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .filter(|skip| skip.subject == "collected graph reclamation")
+            .count(),
+        1,
+        "one disclosure for both refusals"
+    );
+    assert!(
+        engine.views.iter().all(|owner| owner.id() != bare),
+        "Consume still retired the bare view"
+    );
+}
+
+#[test]
+fn collected_graph_singles_logical_retire_matches_multi_report() {
+    let mut multi = graph_case_with_exit(true);
+    assert!(!multi.session.logical_retirement.get());
+    drive_graph_case_to_drained(&mut multi);
+    assert_eq!(
+        multi
+            .session
+            .global_retirement
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .begins,
+        1
+    );
+    let mut single = graph_case_with_exit(true);
+    single.session.logical_retirement.set(true);
+    drive_graph_case_to_drained(&mut single);
+    assert_eq!(
+        single
+            .session
+            .global_retirement
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .begins,
+        0,
+        "a logical leaf never begins native retirement"
+    );
+    assert_eq!(
+        single
+            .session
+            .global_retirement
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .released(),
+        0
+    );
+    let logical: Vec<_> = single
+        .engine
+        .counters
+        .object_skips
+        .iter()
+        .filter(|skip| skip.subject == "global native retirement")
+        .collect();
+    assert_eq!(logical.len(), 1, "one logical disclosure");
+    assert_eq!(
+        logical[0].reason,
+        "retired links on this kernel are closed by the Session's terminal detach"
+    );
+    // Reports equal except that skip: views, modules, slots, claims,
+    // tables, and the published tail.
+    assert_eq!(
+        multi
+            .engine
+            .views
+            .iter()
+            .map(|owner| owner.id())
+            .collect::<Vec<_>>(),
+        single
+            .engine
+            .views
+            .iter()
+            .map(|owner| owner.id())
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(multi.engine.modules, single.engine.modules);
+    assert_eq!(multi.engine.plan.slots, single.engine.plan.slots);
+    assert_eq!(
+        multi.engine.selection_claims.len(),
+        single.engine.selection_claims.len()
+    );
+    assert_eq!(
+        multi.engine.selection_tables.len(),
+        single.engine.selection_tables.len()
+    );
+    assert_eq!(multi.engine.tail_publishes, single.engine.tail_publishes);
+    let mut multi_skips = multi.engine.counters.object_skips.clone();
+    multi_skips.retain(|skip| skip.subject != "global native retirement");
+    let mut single_skips = single.engine.counters.object_skips.clone();
+    single_skips.retain(|skip| skip.subject != "global native retirement");
+    assert_eq!(multi_skips, single_skips);
+}
+
+#[test]
+fn slot_copy_is_exact() {
+    let (child, engine, _) = engine_with_one_accepted_provider();
+    let _accepted = SystemScopeChildGuard::new(child);
+    let mut source = engine.plan.slots[0].clone();
+    source
+        .names
+        .extend(["extra-a".to_string(), "extra-b".to_string()]);
+    source
+        .module_ids
+        .extend([plan::ModuleId(100), plan::ModuleId(101)]);
+    let mut cursor = SlotCopy::new();
+    let mut rows = Vec::with_capacity(2);
+    for slot in [&source, &engine.plan.slots[0]] {
+        let mut done = false;
+        for _ in 0..100_000 {
+            if cursor.step(slot, &mut rows) {
+                done = true;
+                break;
+            }
+        }
+        assert!(done, "the copy must complete");
+    }
+    assert_eq!(rows.len(), 2);
+    for (copy, original) in rows.iter().zip([&source, &engine.plan.slots[0]]) {
+        assert_eq!(copy, &original.clone());
+        assert_eq!(copy.object_path.capacity(), copy.object_path.len());
+        assert_eq!(copy.names.capacity(), copy.names.len());
+        for (copied, expected) in copy.names.iter().zip(original.names.iter()) {
+            assert_eq!(copied, expected);
+            assert_eq!(copied.capacity(), copied.len());
+        }
+        assert_eq!(copy.module_ids.capacity(), copy.module_ids.len());
+        assert_eq!(copy.module_ids, original.module_ids);
+    }
+}
+
+/// T4b helper: one binding, one claim and one table for every sizing view.
+/// Synthetic literals (not pipeline output): they size the Install swap
+/// and the Reclaim walk, which is the only load-bearing claim here.
+fn insert_sizing_selection_rows(engine: &mut Engine, views: u32) {
+    let generation = std::num::NonZeroU64::new(1).unwrap();
+    for index in 0..views {
+        let view = ProcessViewId(index);
+        let object = engine.modules[index as usize].object;
+        let provider = engine
+            .pinned
+            .owned_timing_key(object)
+            .expect("every sizing object has a timing key");
+        engine.selection_bindings.insert(
+            u64::from(index) + 1,
+            SelectionBindingFact {
+                id: u64::from(index) + 1,
+                context: LoaderContextId::from_case_id((index % 255 + 1) as u8),
+                view,
+                object,
+                file_offset: 0,
+                hook_id: 0,
+                abi: HookAbi::Interface,
+                attached: false,
+                retired: false,
+                provider: plan::ModuleId(index),
+                observed: false,
+                coverage: SelectionCoverageState::OwnedOpen(generation),
+            },
+        );
+        engine.selection_claims.insert(
+            SelectionClaimKey {
+                binding_id: u64::from(index) + 1,
+                view,
+                context: 0,
+                hook_owner: object,
+                provider: provider.clone(),
+                selected_object: object,
+                table_file_offset: 0,
+                version: SelectionVersionClass::V3_0,
+                flags: 0,
+                name: "C_Initialize",
+                file_offset: 0,
+            },
+            SelectionClaim {
+                target: plan::AttachKey {
+                    object,
+                    file_offset: 0,
+                },
+                object_path: format!("/sizing/provider-{index}.so"),
+            },
+        );
+        engine.selection_tables.insert(
+            SelectionTableKey {
+                view,
+                provider,
+                version: SelectionVersionClass::V3_0,
+                flags: 0,
+            },
+            SelectionTableFact {
+                object,
+                file_offset: 0,
+                targets: Vec::new(),
+            },
+        );
+    }
+}
+
+#[test]
+#[ignore]
+fn collected_graph_peak_fits_pool_at_system_scale() {
+    // FD headroom for the 4096 pin files plus the 16384 native links.
+    // Unprivileged: the soft cap rises only within the hard cap, and the
+    // test fails loudly when the box cannot host the population.
+    unsafe {
+        let mut current = std::mem::zeroed::<libc::rlimit>();
+        assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut current), 0);
+        current.rlim_cur = current.rlim_cur.max(32768).min(current.rlim_max);
+        assert_eq!(
+            libc::setrlimit(libc::RLIMIT_NOFILE, &current),
+            0,
+            "the box must allow 32768 fds for the sizing population"
+        );
+        assert!(
+            current.rlim_cur >= 32768,
+            "the hard fd cap is below the sizing population"
+        );
+    }
+    const VIEWS: u32 = 4096;
+    // One shared tempfile backs all 4096 pins: real pins (matching the
+    // opened file, so retention succeeds) with distinct overridden keys.
+    // Pin lookup keys on the (key, path) pair, so the scanned rows reuse
+    // the tempfile path while distinct keys keep every row distinct.
+    let shared_file = tempfile::NamedTempFile::new().expect("a shared pin file");
+    std::io::Write::write_all(&mut &shared_file, &[0x7fu8; 4096]).expect("pin bytes");
+    let shared_path = shared_file.path().to_path_buf();
+    let shared_path_text = shared_path.to_str().expect("a utf-8 pin path").to_string();
+    let keys: Vec<ObjectKey> = (0..VIEWS)
+        .map(|index| ObjectKey {
+            device: Device {
+                major: 8,
+                minor: u64::from(index),
+            },
+            inode: 1000 + u64::from(index),
+        })
+        .collect();
+    let mut pins = PinnedObjects::empty();
+    for (index, key) in keys.iter().enumerate() {
+        let absorbed = pins.absorb(overlay_real_scan_pin(
+            &shared_path,
+            Some(*key),
+            index as u64,
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        ));
+        assert!(absorbed.is_empty(), "distinct keys absorb cleanly");
+    }
+    // 4096 scanned modules: 2 tables x 1 entry and 16 exports each.
+    let scanned: Vec<ScannedModule> = keys
+        .iter()
+        .enumerate()
+        .map(|(index, key)| {
+            let mut module = overlay_module(*key);
+            module.view = ProcessViewId(index as u32);
+            module.path.clone_from(&shared_path_text);
+            module.exports = (0..16)
+                .map(|slot| format!("export-{index}-{slot}"))
+                .collect();
+            module.tables[0].entries[0]
+                .object_path
+                .clone_from(&shared_path_text);
+            let mut second = module.tables[0].clone();
+            second.address += 0x1000;
+            module.tables.push(second);
+            module
+        })
+        .collect();
+    let (reconciled, _collapsed, lost) = reconcile_scanned_modules(&scanned, &mut pins);
+    assert!(lost.is_empty(), "every sizing row must reconcile");
+    assert_eq!(reconciled.len(), VIEWS as usize);
+    // Engine assembly: 8192 slots, one binding/claim/table per view.
+    // `build_from_reconciled_modules` admits within the 512 release
+    // ceiling, so the population extends the built plan with well-formed
+    // manual slots (distinct index and target offset, cloned shape).
+    // They stay inert to the rebuild indexes (absent from the private
+    // key map) and retire as unyielded targets, which is exactly the
+    // removal load the helper sizes.
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.pinned = pins;
+    engine.modules = reconciled;
+    engine.plan = plan::build_from_reconciled_modules(&engine.modules);
+    assert_eq!(engine.plan.slots.len(), 512, "the release ceiling admits");
+    let template = engine.plan.slots[0].clone();
+    for index in 512..8192u32 {
+        let mut slot = template.clone();
+        slot.index = index;
+        slot.descriptor_index = index;
+        slot.file_offset = 0x1000 + u64::from(index) * 8;
+        engine.plan.slots.push(slot);
+    }
+    assert_eq!(engine.plan.slots.len(), 8192);
+    insert_sizing_selection_rows(&mut engine, VIEWS);
+    engine.next_view_id = VIEWS;
+    // A non-blocking native carrier over all slots.
+    let mut session = ScriptedSession::default();
+    let (_entered, _returned) = attach_nonblocking_native_carrier(&mut engine, &mut session);
+    // The pool carries a 64 MiB limit with a held 32 MiB baseline; the
+    // graphs may peak at 48 MiB total (16 MiB of graph charge).
+    engine
+        .collected_test_pool
+        .reference_set_limit(64 * 1024 * 1024);
+    let held = engine
+        .collected_test_pool
+        .reserver()
+        .reserve(32 * 1024 * 1024)
+        .expect("the held baseline fits");
+    // Graph 1 retires 512 pre-Q views (cause None: Consume needs no
+    // ProcessView). The modules name the views, so the collected branch
+    // requests the graph.
+    engine
+        .pending_retirements
+        .extend((0..512u32).map(ProcessViewId));
+    let start = std::time::Instant::now();
+    let mut credits = 0u64;
+    for _ in 0..200_000 {
+        credits += 1;
+        let outcome = engine
+            .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+            .unwrap();
+        if !outcome.pending {
+            break;
+        }
+    }
+    assert!(
+        engine.pending_retirements.is_empty(),
+        "graph 1 retires its views"
+    );
+    // Graph 2 retires 512 more while graph 1's installed backing is
+    // still charged.
+    engine
+        .pending_retirements
+        .extend((512..1024u32).map(ProcessViewId));
+    for _ in 0..200_000 {
+        credits += 1;
+        let outcome = engine
+            .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+            .unwrap();
+        if !outcome.pending {
+            break;
+        }
+    }
+    assert!(
+        engine.pending_retirements.is_empty(),
+        "graph 2 retires its views"
+    );
+    assert_eq!(engine.collected_graphs_created, 2);
+    let elapsed = start.elapsed();
+    let peak = engine.collected_test_pool.snapshot().peak_charged_bytes;
+    eprintln!("sizing: peak={peak} credits={credits} elapsed={elapsed:?}");
+    assert!(
+        peak <= 48 * 1024 * 1024,
+        "peak graph charge {peak} exceeds 48 MiB"
+    );
+    assert!(
+        credits as u128 * 50_000 + elapsed.as_nanos() <= 15_000_000_000,
+        "credits={credits} elapsed={elapsed:?} exceeds the 15 s budget"
+    );
+    drop(held);
 }

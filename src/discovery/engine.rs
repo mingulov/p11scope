@@ -3796,8 +3796,21 @@ fn exact_owned_string(source: &str) -> String {
     owned
 }
 
-/// Removed-slot copy cursor (§1.6). Shaped by T4b.
+/// Removed-slot copy cursor (§1.6). Inert skeleton: T4b fills the
+/// stepped exact copy; steps report no progress until then.
 struct SlotCopy;
+
+#[allow(dead_code)] // Skeleton: the T4b implementation commit drops this.
+impl SlotCopy {
+    fn new() -> Self {
+        Self
+    }
+
+    /// One copy leaf; inert until T4b lands (never completes).
+    fn step(&mut self, _source: &plan::Slot, _rows: &mut Vec<plan::Slot>) -> bool {
+        false
+    }
+}
 
 /// Corroboration facts staged across the Facts phase (§1.8). Shaped by T5.
 struct CollectedFacts;
@@ -22217,6 +22230,13 @@ impl Engine {
         self.collected_graph_refusal
     }
 
+    /// Inert skeleton: T4b closes up to `max` retired graph files and
+    /// reports when the chain is empty.
+    #[allow(dead_code)] // Skeleton: the T4b implementation commit drops this.
+    pub(crate) fn close_retired_files(&mut self, _max: usize) -> bool {
+        false
+    }
+
     /// Test read of the graph-input generation counter (§1.3).
     #[cfg(test)]
     pub(crate) fn graph_inputs_epoch_for_test(&self) -> u64 {
@@ -24317,6 +24337,12 @@ pub(crate) mod session_fixture {
         pub(crate) capture_policy: Option<CapturePolicy>,
         pub(crate) pid_continuity: Option<RefCell<crate::attach::PidSessionFixture>>,
         pub(crate) global_retirement: Option<RefCell<crate::attach::RetirementFixture>>,
+        /// T4b seam: fail every `prepare_collected_static_retirement` call
+        /// (the G9 trigger for pre/post-take prepare errors).
+        pub(crate) fail_collected_prepare: Cell<bool>,
+        /// T4b seam: report a logical retirement leaf (the G24 Singles
+        /// twin takes no native path).
+        pub(crate) logical_retirement: Cell<bool>,
         pub(crate) dequeues: VecDeque<Result<Option<crate::events::DiscoveryItem>>>,
         /// The staged FIFO, mirroring production: `stage_discovery` moves
         /// scripted ring outcomes here, `discovery_dequeue` serves it
@@ -24596,6 +24622,9 @@ pub(crate) mod session_fixture {
                 .map(|state| state.borrow().gap_summary())
                 .unwrap_or_default()
         }
+        fn collected_retirement_is_physical(&self) -> bool {
+            !self.logical_retirement.get()
+        }
         fn prepare_ended_pid_retirement(
             &self,
             view: &ProcessView,
@@ -24749,6 +24778,9 @@ pub(crate) mod session_fixture {
             work: usize,
         ) -> Result<RetirementProgress> {
             anyhow::ensure!(q.is_none(), "scripted leaf refuses a production Q");
+            if self.fail_collected_prepare.get() {
+                bail!("scripted collected prepare refused");
+            }
             let Some(fixture) = self.global_retirement.as_ref() else {
                 bail!("scripted leaf has no collected carrier");
             };

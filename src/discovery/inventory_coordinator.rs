@@ -1044,6 +1044,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.engine.tail_stats()
     }
 
+    /// Inert skeleton: T4b delegates to the Engine's retired-file chain.
+    #[allow(dead_code)] // Skeleton: the T4b implementation commit drops this.
+    pub(crate) fn close_retired_graph_files(&mut self, _max: usize) -> bool {
+        false
+    }
+
     /// Fixture transport replacement only: processing still uses this
     /// coordinator's actual Engine and its original retained queue.
     #[cfg(test)]

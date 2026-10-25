@@ -35,6 +35,218 @@ const GATE_TIMEOUT: Duration = Duration::from_secs(5);
 /// return at once.
 const NO_COLLECTION_TICK: Duration = Duration::from_secs(3600);
 
+#[derive(Clone, Copy)]
+enum ExitRelease {
+    Reclaimed,
+    RetainedForExit,
+}
+
+/// RED-only forwarding seam for the approved owned release hook. It calls
+/// the current production finalizer, which drops the full capture after output.
+/// The release hook is deliberately not a production API until GREEN.
+fn exit_finalizer_under_test<L, T>(
+    stopped: Option<Stopped<L>>,
+    write: impl FnOnce(Option<&LaneSummary>) -> T,
+    outputs_attempted: &dyn Fn(),
+    progress: &mut dyn FnMut(String),
+    _release: impl FnOnce(Stopped<L>) -> ExitRelease,
+) -> T {
+    finish_native(stopped, write, outputs_attempted, progress)
+}
+
+struct HostExitPacket {
+    capture: RetiringCapture,
+    reader: crate::events::DiscoveryDrain<crate::events::ScriptedRecords>,
+    _reader_fd: std::fs::File,
+    drop_started: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Drop for HostExitPacket {
+    fn drop(&mut self) {
+        // Observe actual owning destruction; no close/settlement is credited.
+        self.drop_started
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn exit_finalizer_control(completed: bool) {
+    use std::os::fd::AsRawFd as _;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let actor_log = Arc::clone(&log);
+    let drop_started = Arc::new(AtomicUsize::new(0));
+    let actor_drop = Arc::clone(&drop_started);
+    let (made, owner_receiver) = mpsc::sync_channel(1);
+    let (returned, result_receiver) = mpsc::sync_channel(1);
+    let caller = std::thread::Builder::new()
+        .spawn(move || {
+            // The full facade envelope is created on its owning caller thread;
+            // its native types are not required to be Send by the exit API.
+            let case = RetiringCapture::host_exit_case("pending");
+            let reader_fd = std::fs::File::open("/dev/null").unwrap();
+            let raw_reader = reader_fd.as_raw_fd();
+            let observation = case.observation();
+            let release = case.release_on_unwind();
+            let packet = HostExitPacket {
+                capture: case.capture,
+                reader: crate::events::DiscoveryDrain::over(
+                    crate::events::ScriptedRecords::records([vec![0], vec![1]], 2),
+                ),
+                _reader_fd: reader_fd,
+                drop_started: actor_drop,
+            };
+            // Declared after packet, so unwind releases its gate before the
+            // packet's real owning destructor can join the pending job.
+            let _release = release;
+            // Actual queued decoder data; never a fabricated kernel row.
+            let queued = packet.reader.source().remaining() == 2;
+            let _domain = packet.capture.domain();
+            made.send((observation, raw_reader)).unwrap();
+            let saw_complete = if completed {
+                case.gate
+                    .wait_for(Duration::from_secs(1), |state| state.completed.contains(&0))
+            } else {
+                true
+            };
+            let summary = LaneSummary {
+                retirement: if completed {
+                    Retirement::Closed(CleanupSummary {
+                        attempted: 1,
+                        closed: 1,
+                        failures: Vec::new(),
+                        retained_links: 0,
+                    })
+                } else {
+                    Retirement::Unsettled("actual host retirement close is still gated".into())
+                },
+                backend: LaneBackend::singles(),
+                passes: 0,
+                attached: 1,
+                failed: 0,
+                lifecycle: LifecycleTally::default(),
+                lifecycle_high_water_bytes: None,
+            };
+            let write_log = Arc::clone(&actor_log);
+            let arm_log = Arc::clone(&actor_log);
+            let progress_log = Arc::clone(&actor_log);
+            let release_log = Arc::clone(&actor_log);
+            let result = exit_finalizer_under_test(
+                Some(Stopped {
+                    events: Vec::new(),
+                    summary,
+                    capture: packet,
+                }),
+                move |summary| {
+                    write_log
+                        .lock()
+                        .unwrap()
+                        .push(format!("output:{}", summary.unwrap().retirement.label()));
+                    7
+                },
+                &move || arm_log.lock().unwrap().push("armed".into()),
+                &mut move |line| progress_log.lock().unwrap().push(line),
+                move |stopped| {
+                    if completed {
+                        drop(stopped);
+                        release_log.lock().unwrap().push("reclaimed".into());
+                        ExitRelease::Reclaimed
+                    } else {
+                        // The generic hook must pass the complete owner. This
+                        // host packet includes actual job, root, File lease,
+                        // reader fd and queued decoder data, not native maps.
+                        std::mem::forget(stopped);
+                        release_log.lock().unwrap().push("retained".into());
+                        ExitRelease::RetainedForExit
+                    }
+                },
+            );
+            // SAFETY: inspect the control's original reader descriptor only;
+            // no descriptor opens occur after the owning finalizer returned.
+            let reader_open = unsafe { libc::fcntl(raw_reader, libc::F_GETFD) } >= 0;
+            returned
+                .send((result, reader_open, queued && saw_complete))
+                .unwrap();
+        })
+        .unwrap();
+    let (owner, _raw_reader) = owner_receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+    let entered = owner
+        .gate
+        .wait_for(Duration::from_secs(1), |state| state.started.contains(&0));
+    if completed {
+        owner.gate.release_all();
+    }
+    let early = result_receiver
+        .recv_timeout(Duration::from_millis(100))
+        .ok();
+    let root_held = owner.root.upgrade().is_some();
+    let pin_held = owner.pin.upgrade().is_some();
+    owner.gate.release_all();
+    caller.join().unwrap();
+    let after = early.unwrap_or_else(|| {
+        result_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+    });
+    let finished = owner
+        .gate
+        .wait_for(Duration::from_secs(1), |state| state.completed.contains(&0));
+    let log = log.lock().unwrap().clone();
+    assert!(
+        entered && finished,
+        "actual worker did not settle after release"
+    );
+    assert!(owner.gate.snapshot().failures.is_empty());
+    assert_eq!(after.0, 7, "output result changed during ownership handoff");
+    assert!(
+        after.2,
+        "queued decoder or completed close observation changed"
+    );
+    assert!(
+        log[0].starts_with("output:") && log[1] == "armed",
+        "{log:?}"
+    );
+    if completed {
+        assert!(!after.1);
+        assert_eq!(drop_started.load(Ordering::SeqCst), 1);
+        assert!(owner.root.upgrade().is_none() && owner.pin.upgrade().is_none());
+        assert!(
+            !log.iter().any(|entry| entry.contains("detaching")),
+            "{log:?}"
+        );
+    } else {
+        assert!(
+            early.is_some(),
+            "post-output finalizer joined the pending actual job"
+        );
+        assert!(root_held && pin_held && after.1);
+        assert_eq!(drop_started.load(Ordering::SeqCst), 0);
+        assert!(log.iter().any(|entry| entry == "retained"), "{log:?}");
+        assert!(
+            !log.iter()
+                .any(|entry| entry.contains("native probes detached")),
+            "{log:?}"
+        );
+    }
+}
+
+#[test]
+fn inventory_exit_retention_finalizer_keeps_full_owner_after_output_attempts() {
+    RetiringCapture::run_host_exit_child(
+        "inventory_capture::tests::inventory_exit_retention_finalizer_keeps_full_owner_after_output_attempts",
+        || exit_finalizer_control(false),
+    );
+}
+
+#[test]
+fn inventory_exit_retention_completed_finalizer_still_reclaims_normally() {
+    RetiringCapture::run_host_exit_child(
+        "inventory_capture::tests::inventory_exit_retention_completed_finalizer_still_reclaims_normally",
+        || exit_finalizer_control(true),
+    );
+}
+
 /// The existing scripted capture through the real PID-pin runtime seam.
 /// It supplies no kernel identity or privileged capture evidence.
 pub(crate) fn cgroup_runtime_lane() -> (

@@ -3,6 +3,9 @@
 //! Only kernel link/map operations are replaced; target pinning uses real files.
 
 use super::*;
+
+#[path = "exit_retention_tests.rs"]
+mod exit_retention;
 use crate::discovery::identity::pin_scanned_view_objects;
 use crate::discovery::scan::{CaptureWorkBudget, ScannedModule};
 use crate::plan::{AdmissionPolicy, AttachPlan, Slot};

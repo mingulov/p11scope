@@ -2451,11 +2451,36 @@ impl SemanticCapture {
                     };
                     self.accept_scan(io, proof, &job, fence, &mut report);
                 }
-                Err(refusal) => report.scan_refusals.push(refusal),
+                Err(refusal) => {
+                    // A scan that proves the module unmapped breaks router
+                    // continuity for the refresh target, so a later reload
+                    // mints instead of reviving the old ID. The refusal
+                    // carries no image (the scan mints none), so the task
+                    // is identified through H0's own binding: a bind retry
+                    // reuses H0's retained Arc exactly, and a truly unbound
+                    // candidate holds no observations to break.
+                    if refusal == ImageQueryRefusal::Empty {
+                        self.note_refresh_absence(&pin, endpoint.file_slot);
+                    }
+                    report.scan_refusals.push(refusal);
+                }
             }
         }
         Ok(report)
     }
+
+    fn note_refresh_absence(&mut self, pin: &Arc<PidPin>, file: u32) {
+        let images: Vec<ImageIdentity> = self
+            .bindings
+            .values()
+            .filter(|binding| Arc::ptr_eq(&binding.pin, pin))
+            .map(|binding| binding.image)
+            .collect();
+        for image in images {
+            self.router.note_proven_absence(image, file);
+        }
+    }
+
     fn emit(
         &self,
         token: Option<u64>,
@@ -3117,7 +3142,16 @@ impl SemanticCapture {
                     Ok(proof) => {
                         self.accept_scan(io, proof, &job, fence, &mut report);
                     }
-                    Err(refusal) => report.scan_refusals.push(refusal),
+                    Err(refusal) => {
+                        // A scan that proves the module unmapped breaks
+                        // router continuity for the job's key, so a later
+                        // reload mints instead of reviving the old ID.
+                        if refusal == ImageQueryRefusal::Empty {
+                            self.router
+                                .note_proven_absence(job.image, job.endpoint.file_slot);
+                        }
+                        report.scan_refusals.push(refusal);
+                    }
                 }
             }
             if self
@@ -3191,7 +3225,16 @@ impl SemanticCapture {
             } else if healthy {
                 match result {
                     Ok(proof) => self.accept_scan(io, proof, &job, fence, &mut report),
-                    Err(refusal) => report.scan_refusals.push(refusal),
+                    Err(refusal) => {
+                        // A scan that proves the module unmapped breaks
+                        // router continuity for the job's key, so a later
+                        // reload mints instead of reviving the old ID.
+                        if refusal == ImageQueryRefusal::Empty {
+                            self.router
+                                .note_proven_absence(job.image, job.endpoint.file_slot);
+                        }
+                        report.scan_refusals.push(refusal);
+                    }
                 }
             }
         }

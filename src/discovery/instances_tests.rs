@@ -633,6 +633,67 @@ fn same_address_reload_never_revives_the_old_instance() {
 }
 
 #[test]
+fn observed_absence_breaks_continuity() {
+    // A scan that proves the module unmapped breaks continuity for that
+    // (image, file) key: the next scan mints even over an unchanged
+    // mapping with an unchanged local epoch. Late calls stamped at the
+    // old epochs still join the old ID: the break mints forward, it
+    // does not rewrite history.
+    let mut r = router();
+    r.observe_legacy(observation(2, 0, 0, load(BASE_A)));
+    let old = joined(r.route(call(1, stamp(2, 0, 0), ip_in(BASE_A))));
+    r.note_proven_absence(image(COOKIE, 0), FILE);
+    assert_eq!(
+        r.observe_legacy(observation(2, 1, 0, load(BASE_A))).0,
+        ObserveOutcome::New
+    );
+    let new = joined(r.route(call(2, stamp(2, 1, 0), ip_in(BASE_A))));
+    assert_ne!(old, new);
+    assert_eq!(joined(r.route(call(3, stamp(2, 0, 0), ip_in(BASE_A)))), old);
+    assert_eq!(r.instances_minted(), 2);
+}
+
+#[test]
+fn proven_absence_is_keyed_by_image_and_file() {
+    // The break touches only its own (image, file) key: absences
+    // recorded for another file or another image leave this key's
+    // global-only continuity alone.
+    let mut r = router();
+    r.observe_legacy(observation(2, 0, 0, load(BASE_A)));
+    let old = joined(r.route(call(1, stamp(2, 0, 0), ip_in(BASE_A))));
+    r.note_proven_absence(image(COOKIE, 0), FILE + 1);
+    r.note_proven_absence(image(COOKIE + 1, 0), FILE);
+    assert_eq!(
+        r.observe_legacy(observation(2, 1, 0, load(BASE_A))).0,
+        ObserveOutcome::Continued
+    );
+    assert_eq!(joined(r.route(call(2, stamp(2, 1, 0), ip_in(BASE_A)))), old);
+    assert_eq!(r.instances_minted(), 1);
+}
+
+#[test]
+fn mapped_scan_at_unchanged_epochs_closes_the_absence_window() {
+    // An absence window closes at the next successful scan: a mapped
+    // scan at unchanged epochs continues (at identical stamps a mint
+    // could not route calls apart), consuming the flag.
+    let mut r = router();
+    r.observe_legacy(observation(2, 0, 0, load(BASE_A)));
+    let old = joined(r.route(call(1, stamp(2, 0, 0), ip_in(BASE_A))));
+    r.note_proven_absence(image(COOKIE, 0), FILE);
+    assert_eq!(
+        r.observe_legacy(observation(2, 0, 0, load(BASE_A))).0,
+        ObserveOutcome::Continued
+    );
+    assert_eq!(
+        r.observe_legacy(observation(2, 1, 0, load(BASE_A))).0,
+        ObserveOutcome::Continued,
+        "the window closed: no pending break mints the later move"
+    );
+    assert_eq!(joined(r.route(call(2, stamp(2, 1, 0), ip_in(BASE_A)))), old);
+    assert_eq!(r.instances_minted(), 1);
+}
+
+#[test]
 fn global_then_local_move_mints() {
     // Continuity compares against the newest observation: a global-only
     // move continues, then a local move over the identical ranges mints.

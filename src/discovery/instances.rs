@@ -19,18 +19,30 @@
 //!   attached file offset. Every other case is an explicit
 //!   [`UnknownReason`], never a guess.
 //!
-//! Continuity is the identity of the mapping: one instance per (caller
-//! incarnation, module mapping) for as long as the mapped file, addresses,
-//! offsets and permissions are unchanged. Kernel VMA adjustments
-//! (split/merge, compaction) and spurious hook fires advance the epoch
-//! triple without changing the mapping, so a new triple over the same
-//! merged coverage continues the current partitions instead of minting.
-//! A real remap, unmap, permission change, exec or new incarnation still
-//! mints a new ID. An unload/reload at the same address is
-//! indistinguishable from a merge here, so it continues too; a file
-//! replacement between still mints through the module key. A range that
-//! *appears* at an unchanged triple is impossible under hook completeness
-//! and latches a sticky coverage fault for that (process, file).
+//! Continuity is the identity of the mapping under an unchanged local
+//! epoch: one instance per (caller incarnation, module mapping) for as
+//! long as the process's own epoch is unchanged and the mapped file,
+//! addresses, offsets and execute permissions are unchanged. A move of
+//! only the per-file global epoch continues the current partitions
+//! instead of minting: unattributable churn (other processes' mappings
+//! of the same file, the observer's own identity probe) is not a reload.
+//! A move of the local epoch always mints a new ID, even over identical
+//! ranges: the witness attributed a mapping change to this process. A
+//! real remap, unmap, permission change, exec or new incarnation still
+//! mints. A scan that proves the module unmapped breaks continuity for
+//! that (image, file) key, so the next scan mints even at an unchanged
+//! local epoch. A range that *appears* at an unchanged triple is
+//! impossible under hook completeness and latches a sticky coverage
+//! fault for that (process, file). Only the executable flag compares:
+//! a write-bit-only protection change continues by design.
+//!
+//! Known limitation: the witness attributes a mapping change to a process
+//! only while that process has a single live user task and no transient
+//! holder of its memory map. A same-address unload and reload by a
+//! multi-threaded process completed between two consecutive scans of it
+//! can therefore keep the old ID. A same-address reload the witness
+//! attributes (a local move), or that a scan observes as unmapped, never
+//! revives the old IDs.
 //!
 //! Privacy (proposed allowlist-v3): entry IPs and map ranges are private,
 //! generation-local routing inputs. Their `Debug` output is redacted, they
@@ -459,7 +471,9 @@ pub(crate) enum ObserveOutcome {
     InvalidImage,
     /// First stable observation of these epochs: partitions were minted.
     New,
-    /// Same epochs and no new range: the same instances continue.
+    /// Continuity: same epochs with no new range, or a new epoch triple
+    /// over the same merged mapping with the local epoch unchanged and
+    /// no proven absence since. The same instances continue.
     Continued,
     /// A range appeared at unchanged epochs: sticky coverage fault.
     CoverageFault,
@@ -634,6 +648,13 @@ pub(crate) struct InstanceRouter {
     limits: RouterLimits,
     /// (full image, file slot) -> retained observations, oldest first.
     observed: BTreeMap<(ImageKey, u32), VecDeque<Observed>>,
+    /// (image, file) keys whose latest scan proved the module unmapped.
+    /// The flag breaks continuity: the next observation for the key
+    /// mints instead of continuing, even over an unchanged mapping with
+    /// an unchanged local epoch. Any successful observation for the key
+    /// consumes the flag; retained observations stay, so late calls
+    /// stamped at the old epochs still join the old ID.
+    absent: BTreeSet<(ImageKey, u32)>,
     faulted: BTreeSet<(ImageKey, u32)>,
     /// P2-1: a coverage-fault tombstone was evicted under capacity pressure.
     /// The router can no longer name the discredited key, so every unknown
@@ -695,6 +716,7 @@ impl fmt::Debug for InstanceRouter {
             .field("retired_cookies", &self.retired.len())
             .field("pending", &self.pending.len())
             .field("sticky", &self.sticky)
+            .field("absent_keys", &self.absent.len())
             .field("misses", &self.misses)
             .field("miss_latched", &self.miss_latched)
             .field("minted", &self.minted)
@@ -711,6 +733,7 @@ impl InstanceRouter {
             domain,
             limits,
             observed: BTreeMap::new(),
+            absent: BTreeSet::new(),
             faulted: BTreeSet::new(),
             faulted_overflowed: false,
             retired: BTreeSet::new(),
@@ -895,6 +918,7 @@ impl InstanceRouter {
         if fault > u64::from(u32::MAX) || fault < self.fault {
             self.authority_failed = true;
             self.observed.clear();
+            self.absent.clear();
             self.ranges = 0;
             return self.fail_pending(|_| true, UnknownReason::AuthorityExhausted);
         }
@@ -910,6 +934,7 @@ impl InstanceRouter {
             let Some(next_fence) = self.fence.checked_add(1) else {
                 self.authority_failed = true;
                 self.observed.clear();
+                self.absent.clear();
                 self.ranges = 0;
                 resolved.extend(self.fail_pending(|_| true, UnknownReason::AuthorityExhausted));
                 return resolved;
@@ -919,6 +944,7 @@ impl InstanceRouter {
             self.miss_latched = false;
             self.counters.eras = self.counters.eras.saturating_add(1);
             self.observed.clear();
+            self.absent.clear();
             self.ranges = 0;
             resolved.extend(self.fail_pending(|_| true, UnknownReason::FaultEra));
         } else if misses_moved {
@@ -928,6 +954,7 @@ impl InstanceRouter {
             self.counters.eras = self.counters.eras.saturating_add(1);
             self.counters.miss_eras = self.counters.miss_eras.saturating_add(1);
             self.observed.clear();
+            self.absent.clear();
             self.ranges = 0;
             resolved.extend(self.fail_pending(|_| true, UnknownReason::FaultEra));
         }
@@ -937,6 +964,7 @@ impl InstanceRouter {
     pub(crate) fn fail_image_coverage(&mut self) -> Vec<(u64, Route)> {
         self.image_failed = true;
         self.observed.clear();
+        self.absent.clear();
         self.ranges = 0;
         self.fail_pending(|_| true, UnknownReason::CoverageFault)
     }
@@ -944,6 +972,7 @@ impl InstanceRouter {
     pub(crate) fn refuse_exhaustion(&mut self) -> Vec<(u64, Route)> {
         self.authority_failed = true;
         self.observed.clear();
+        self.absent.clear();
         self.ranges = 0;
         self.fail_pending(|_| true, UnknownReason::AuthorityExhausted)
     }
@@ -983,6 +1012,7 @@ impl InstanceRouter {
                 self.ranges -= list.iter().map(|o| o.ranges.len()).sum::<usize>();
             }
         }
+        self.absent.retain(|(owner, _)| *owner != key);
         self.fail_pending(|call| call.facts.image == image, UnknownReason::Retired)
     }
 
@@ -1013,6 +1043,7 @@ impl InstanceRouter {
                 self.ranges -= list.iter().map(|o| o.ranges.len()).sum::<usize>();
             }
         }
+        self.absent.retain(|(owner, _)| owner.cookie != cookie);
         resolved.extend(self.fail_pending(
             |call| call.facts.image.task_cookie == cookie,
             UnknownReason::Retired,
@@ -1021,7 +1052,9 @@ impl InstanceRouter {
     }
 
     /// Records one stable observation and resolves pending calls that it
-    /// decides. Same epochs + no new range = continuity.
+    /// decides. Same epochs + no new range = continuity; a new triple
+    /// needs an unchanged mapping, an unchanged local epoch and no
+    /// proven absence since, else it mints.
     pub(crate) fn observe(&mut self, proof: ImageScanProof) -> (ObserveOutcome, Vec<(u64, Route)>) {
         if proof.domain() != self.domain {
             return (ObserveOutcome::ForeignDomain, Vec::new());
@@ -1056,6 +1089,27 @@ impl InstanceRouter {
             exec: 0,
         };
         self.observe_reading(image, observation)
+    }
+
+    /// Record that a scan proved the module unmapped for this (image,
+    /// file) key. The next successful observation for the key mints
+    /// instead of continuing, even over an unchanged mapping with an
+    /// unchanged local epoch. Retired, faulted and invalid keys are
+    /// ignored: they hold no continuity to break. At capacity the flag
+    /// is dropped, which preserves continuity (the pre-break behavior)
+    /// rather than joining anything wrongly.
+    pub(crate) fn note_proven_absence(&mut self, image: ImageIdentity, file: u32) {
+        let key = ImageKey::from(image);
+        if RetirementLedger::index(key.cookie).is_none()
+            || file >= instance::FILE_SLOTS
+            || self.image_retired(key)
+            || self.faulted.contains(&(key, file))
+        {
+            return;
+        }
+        if self.absent.len() < self.limits.observed_keys {
+            self.absent.insert((key, file));
+        }
     }
 
     fn observe_reading(
@@ -1148,6 +1202,11 @@ impl InstanceRouter {
                     );
                     return (ObserveOutcome::CoverageFault, resolved);
                 }
+                // A mapped scan at unchanged epochs closes an absence
+                // window without minting: at identical stamps a mint could
+                // not route calls apart (the router joins the first match),
+                // so continuing is the only useful behavior.
+                self.absent.remove(&key);
                 self.counters.continued += 1;
                 ObserveOutcome::Continued
             }
@@ -1163,20 +1222,26 @@ impl InstanceRouter {
                     );
                     return (ObserveOutcome::RangeCapacity, resolved);
                 }
-                // A new epoch triple for an unchanged mapping continues the
-                // current partitions instead of minting: kernel VMA
-                // adjustments (split/merge, compaction) and spurious hook
-                // fires advance the triple without changing the mapped
-                // file, addresses, offsets or permissions. The merged
-                // comparison below folds split/merge artifacts; a real
-                // remap, unmap, permission change, exec or new incarnation
-                // still mints. An unload/reload at the same address is
-                // indistinguishable from a merge here, so it continues too.
+                // A new epoch triple continues the current partitions only
+                // when the mapping is unchanged AND the process's own epoch
+                // is unchanged: unattributable global churn is not a reload,
+                // but a local move means the witness saw this process change
+                // its mapping, so it always mints. A scan that proved the
+                // module unmapped since (a recorded absence for this key)
+                // also mints: the mapping may have been reloaded between
+                // the scans. The merged comparison below folds split/merge
+                // artifacts; a real remap, unmap, permission change, exec or
+                // new incarnation still mints.
+                let broken = self.absent.remove(&key);
                 let continued = self
                     .observed
                     .get(&key)
                     .and_then(|list| list.back())
-                    .filter(|current| same_mapping(&current.ranges, &observation.ranges))
+                    .filter(|current| {
+                        !broken
+                            && current.epochs.local == epochs.local
+                            && same_mapping(&current.ranges, &observation.ranges)
+                    })
                     .map(|current| current.partitions.clone());
                 if let Some(partitions) = continued {
                     self.counters.continued += 1;
@@ -1223,6 +1288,7 @@ impl InstanceRouter {
                             });
                         }
                         self.ranges -= evicted.iter().map(|o| o.ranges.len()).sum::<usize>();
+                        self.absent.remove(&(owner, file_slot));
                         self.counters.observed_evictions =
                             self.counters.observed_evictions.saturating_add(1);
                     }

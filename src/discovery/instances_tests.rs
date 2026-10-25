@@ -96,13 +96,22 @@ fn router() -> InstanceRouter {
 }
 
 fn observation_for(cookie: u64, local: u64, ranges: Vec<MapRange>) -> StableObservation {
+    observation_for_epochs(cookie, local, 0, ranges)
+}
+
+fn observation_for_epochs(
+    cookie: u64,
+    local: u64,
+    global: u64,
+    ranges: Vec<MapRange>,
+) -> StableObservation {
     StableObservation {
         file_slot: FILE,
         reading: EpochReading {
             cookie,
             local,
             record_flags: 0,
-            global: 0,
+            global,
             fault: 0,
             sticky: 0,
         },
@@ -694,13 +703,13 @@ fn mapped_scan_at_unchanged_epochs_closes_the_absence_window() {
 }
 
 #[test]
-fn absence_overflow_forces_a_split_instead_of_joining() {
-    // At capacity the flag table cannot record the break, so the router
-    // latches an overflow and counts it instead of dropping the absence
-    // silently. The next global-only advance that would otherwise
-    // continue mints — fail closed by splitting — and consumes the
-    // latch, so later advances continue normally and the capture never
-    // churns. Late calls stamped at the old epochs still join the old ID.
+fn absence_table_full_of_observed_keys_never_overflows() {
+    // Flags record only for keys with a retained observation, so the
+    // flagged keys stay a subset of the observed keys under the same
+    // cap: a full table holds every observed key's flag, an absence for
+    // a never-observed key records nothing, and each flagged key mints
+    // through its own flag with the overflow counter at 0. Late calls
+    // stamped at the old epochs still join the old ID.
     let mut r = InstanceRouter::new(
         domain(),
         RouterLimits {
@@ -713,32 +722,38 @@ fn absence_overflow_forces_a_split_instead_of_joining() {
         ObserveOutcome::New
     );
     let old = joined(r.route(call(1, stamp(2, 0, 0), ip_in(BASE_A))));
+    assert_eq!(
+        r.observe_legacy(observation_for(COOKIE + 1, 2, load(BASE_A)))
+            .0,
+        ObserveOutcome::New
+    );
+    r.note_proven_absence(image(COOKIE, 0), FILE);
     r.note_proven_absence(image(COOKIE + 1, 0), FILE);
     r.note_proven_absence(image(COOKIE + 2, 0), FILE);
     assert_eq!(
         r.counters().absence_overflows,
         0,
-        "filling the table latches nothing"
-    );
-    r.note_proven_absence(image(COOKIE, 0), FILE);
-    assert_eq!(
-        r.counters().absence_overflows,
-        1,
-        "the unrecordable break counts once"
+        "the unobserved absence latches nothing: the table cannot overflow"
     );
     assert_eq!(
         r.observe_legacy(observation(2, 1, 0, load(BASE_A))).0,
         ObserveOutcome::New,
-        "the reload after a dropped break mints instead of continuing"
+        "the reload after a recorded break mints through its flag"
     );
     let new = joined(r.route(call(2, stamp(2, 1, 0), ip_in(BASE_A))));
     assert_ne!(old, new);
     assert_eq!(joined(r.route(call(3, stamp(2, 0, 0), ip_in(BASE_A)))), old);
-    assert_eq!(r.instances_minted(), 2);
+    assert_eq!(
+        r.observe_legacy(observation_for_epochs(COOKIE + 1, 2, 1, load(BASE_A)))
+            .0,
+        ObserveOutcome::New,
+        "the second flagged key mints through its own flag too"
+    );
+    assert_eq!(r.counters().absence_overflows, 0);
     assert_eq!(
         r.observe_legacy(observation(2, 2, 0, load(BASE_A))).0,
         ObserveOutcome::Continued,
-        "the latch is consumed by the forced split: no churn"
+        "the consumed flags leave no latch behind: no churn"
     );
     assert_eq!(joined(r.route(call(4, stamp(2, 2, 0), ip_in(BASE_A)))), new);
 }
@@ -760,6 +775,16 @@ fn absence_below_capacity_mints_through_the_flag_without_overflow() {
         ObserveOutcome::New
     );
     let old = joined(r.route(call(1, stamp(2, 0, 0), ip_in(BASE_A))));
+    assert_eq!(
+        r.observe_legacy(observation_for(COOKIE + 1, 2, load(BASE_A)))
+            .0,
+        ObserveOutcome::New
+    );
+    assert_eq!(
+        r.observe_legacy(observation_for(COOKIE + 2, 2, load(BASE_A)))
+            .0,
+        ObserveOutcome::New
+    );
     r.note_proven_absence(image(COOKIE + 1, 0), FILE);
     r.note_proven_absence(image(COOKIE + 2, 0), FILE);
     r.note_proven_absence(image(COOKIE, 0), FILE);
@@ -775,7 +800,7 @@ fn absence_below_capacity_mints_through_the_flag_without_overflow() {
     let new = joined(r.route(call(2, stamp(2, 1, 0), ip_in(BASE_A))));
     assert_ne!(old, new);
     assert_eq!(joined(r.route(call(3, stamp(2, 0, 0), ip_in(BASE_A)))), old);
-    assert_eq!(r.instances_minted(), 2);
+    assert_eq!(r.instances_minted(), 4);
     assert_eq!(
         r.observe_legacy(observation(2, 2, 0, load(BASE_A))).0,
         ObserveOutcome::Continued
@@ -784,11 +809,12 @@ fn absence_below_capacity_mints_through_the_flag_without_overflow() {
 }
 
 #[test]
-fn same_epoch_scan_under_absence_overflow_continues_without_consuming() {
+fn same_epoch_scan_at_full_absence_table_continues_without_overflow() {
     // Identical stamps cannot route calls apart, so a mapped scan at
-    // unchanged epochs continues even while the overflow is latched —
-    // and it does not consume the latch: the next global-only advance
-    // still mints.
+    // unchanged epochs continues even with the flag table full — and it
+    // consumes that key's flag, so the next global-only advance still
+    // continues while the other flagged key mints through its own flag.
+    // The counter stays zero throughout: nothing overflows.
     let mut r = InstanceRouter::new(
         domain(),
         RouterLimits {
@@ -801,32 +827,41 @@ fn same_epoch_scan_under_absence_overflow_continues_without_consuming() {
         ObserveOutcome::New
     );
     let old = joined(r.route(call(1, stamp(2, 0, 0), ip_in(BASE_A))));
-    r.note_proven_absence(image(COOKIE + 1, 0), FILE);
-    r.note_proven_absence(image(COOKIE + 2, 0), FILE);
+    assert_eq!(
+        r.observe_legacy(observation_for(COOKIE + 1, 2, load(BASE_A)))
+            .0,
+        ObserveOutcome::New
+    );
     r.note_proven_absence(image(COOKIE, 0), FILE);
-    assert_eq!(r.counters().absence_overflows, 1);
+    r.note_proven_absence(image(COOKIE + 1, 0), FILE);
+    assert_eq!(r.counters().absence_overflows, 0);
     assert_eq!(
         r.observe_legacy(observation(2, 0, 0, load(BASE_A))).0,
         ObserveOutcome::Continued,
         "a same-epoch scan continues: a mint could not split identical stamps"
     );
     assert_eq!(joined(r.route(call(2, stamp(2, 0, 0), ip_in(BASE_A)))), old);
-    assert_eq!(r.counters().absence_overflows, 1, "no new drop happened");
     assert_eq!(
         r.observe_legacy(observation(2, 1, 0, load(BASE_A))).0,
-        ObserveOutcome::New,
-        "the latch survived the same-epoch scan"
+        ObserveOutcome::Continued,
+        "the same-epoch scan closed the window: no pending break mints"
     );
-    assert_ne!(joined(r.route(call(3, stamp(2, 1, 0), ip_in(BASE_A)))), old);
+    assert_eq!(
+        r.observe_legacy(observation_for_epochs(COOKIE + 1, 2, 1, load(BASE_A)))
+            .0,
+        ObserveOutcome::New,
+        "the other key's flag survived: its reload still mints"
+    );
+    assert_eq!(r.counters().absence_overflows, 0, "no new drop happened");
 }
 
 #[test]
-fn absence_overflow_clears_on_fault_era_advance() {
-    // The overflow protects pre-era continuity only: a fault-era advance
-    // clears observations and flags alike, and post-era calls can never
-    // join pre-era lifetimes (the fault reading refuses), so the latch
-    // clears with the era instead of forcing a spurious post-era split.
-    // The counter stays as a lifetime diagnostic.
+fn absence_flags_clear_on_fault_era_advance_without_overflow() {
+    // A fault-era advance clears observations and flags alike, and
+    // post-era calls can never join pre-era lifetimes (the fault
+    // reading refuses), so post-era observations mint fresh and then
+    // continue with no spurious split. The counter stays zero: flags
+    // for observed keys can never overflow the table.
     let mut r = InstanceRouter::new(
         domain(),
         RouterLimits {
@@ -838,10 +873,14 @@ fn absence_overflow_clears_on_fault_era_advance() {
         r.observe_legacy(observation(2, 0, 0, load(BASE_A))).0,
         ObserveOutcome::New
     );
-    r.note_proven_absence(image(COOKIE + 1, 0), FILE);
-    r.note_proven_absence(image(COOKIE + 2, 0), FILE);
+    assert_eq!(
+        r.observe_legacy(observation_for(COOKIE + 1, 2, load(BASE_A)))
+            .0,
+        ObserveOutcome::New
+    );
     r.note_proven_absence(image(COOKIE, 0), FILE);
-    assert_eq!(r.counters().absence_overflows, 1);
+    r.note_proven_absence(image(COOKIE + 1, 0), FILE);
+    assert_eq!(r.counters().absence_overflows, 0);
     assert!(r.audit(1, 0, 0).is_empty());
     assert_eq!(
         r.observe_legacy(fresh(&r, observation(2, 0, 1, load(BASE_A))))
@@ -852,9 +891,138 @@ fn absence_overflow_clears_on_fault_era_advance() {
         r.observe_legacy(fresh(&r, observation(2, 1, 1, load(BASE_A))))
             .0,
         ObserveOutcome::Continued,
-        "the era cleared the latch: no spurious split"
+        "the era cleared the flags: no spurious split"
     );
-    assert_eq!(r.counters().absence_overflows, 1);
+    assert_eq!(r.counters().absence_overflows, 0);
+}
+
+#[test]
+fn absence_for_unobserved_key_leaves_no_flag() {
+    // A proven absence for a key with no retained observation records
+    // nothing: there is no continuity to break, so even past a small
+    // table's capacity the overflow counter stays zero. A real break of
+    // an observed key still mints, with the counter at 0.
+    let mut r = InstanceRouter::new(
+        domain(),
+        RouterLimits {
+            observed_keys: 2,
+            ..RouterLimits::default()
+        },
+    );
+    r.note_proven_absence(image(COOKIE + 1, 0), FILE);
+    r.note_proven_absence(image(COOKIE + 2, 0), FILE);
+    r.note_proven_absence(image(COOKIE + 3, 0), FILE);
+    assert_eq!(
+        r.counters().absence_overflows,
+        0,
+        "unobserved absences latch nothing"
+    );
+    let rendered = format!("{r:?}");
+    assert!(
+        rendered.contains("absent_keys: 0"),
+        "no flag was recorded: {rendered}"
+    );
+    assert_eq!(
+        r.observe_legacy(observation(2, 0, 0, load(BASE_A))).0,
+        ObserveOutcome::New
+    );
+    let old = joined(r.route(call(1, stamp(2, 0, 0), ip_in(BASE_A))));
+    r.note_proven_absence(image(COOKIE, 0), FILE);
+    assert_eq!(
+        r.observe_legacy(observation(2, 1, 0, load(BASE_A))).0,
+        ObserveOutcome::New,
+        "a real break of an observed key still mints"
+    );
+    assert_ne!(joined(r.route(call(2, stamp(2, 1, 0), ip_in(BASE_A)))), old);
+    assert_eq!(r.counters().absence_overflows, 0);
+}
+
+#[test]
+fn unobserved_absence_flood_never_blocks_a_real_break() {
+    // 4,096 processes each prove an absence without ever observing
+    // (called, unloaded before their first scan, exited unbound). None
+    // of it may fill the flag table: bound app X, whose unload is
+    // proven, still mints on its same-address global-only reload —
+    // never continues — even after another key's advance, with the
+    // overflow counter at 0.
+    const Y: u64 = 0x61;
+    let mut r = router();
+    for n in 0..4_096 {
+        r.note_proven_absence(image(0x1000 + n, 0), FILE);
+    }
+    assert_eq!(
+        r.counters().absence_overflows,
+        0,
+        "the flood latches nothing"
+    );
+    assert_eq!(
+        r.observe_legacy(observation(2, 0, 0, load(BASE_A))).0,
+        ObserveOutcome::New
+    );
+    let old = joined(r.route(call(1, stamp(2, 0, 0), ip_in(BASE_A))));
+    assert_eq!(
+        r.observe_legacy(observation_for(Y, 2, load(BASE_A))).0,
+        ObserveOutcome::New
+    );
+    r.note_proven_absence(image(COOKIE, 0), FILE);
+    assert_eq!(
+        r.observe_legacy(observation_for_epochs(Y, 2, 1, load(BASE_A)))
+            .0,
+        ObserveOutcome::Continued,
+        "an innocent key's advance consumes no break"
+    );
+    assert_eq!(
+        r.observe_legacy(observation(2, 1, 0, load(BASE_A))).0,
+        ObserveOutcome::New,
+        "X mints, never continues"
+    );
+    let new = joined(r.route(call(2, stamp(2, 1, 0), ip_in(BASE_A))));
+    assert_ne!(old, new);
+    assert_eq!(joined(r.route(call(3, stamp(2, 0, 0), ip_in(BASE_A)))), old);
+    assert_eq!(r.counters().absence_overflows, 0);
+}
+
+#[test]
+fn coverage_fault_clears_the_absence_flag() {
+    // The coverage-fault arm drops the key's observation; its absence
+    // flag drops with it, keeping flagged keys a subset of the observed
+    // keys. A stale flag would strand table capacity — and a later
+    // break — behind a dead key.
+    const B: u64 = 0xB1;
+    let mut r = InstanceRouter::new(
+        domain(),
+        RouterLimits {
+            observed_keys: 1,
+            ..RouterLimits::default()
+        },
+    );
+    assert_eq!(
+        r.observe_legacy(observation(2, 0, 0, load(BASE_A))).0,
+        ObserveOutcome::New
+    );
+    r.note_proven_absence(image(COOKIE, 0), FILE);
+    let mut grown = load(BASE_A);
+    grown.extend(load(BASE_B));
+    assert_eq!(
+        r.observe_legacy(observation(2, 0, 0, grown)).0,
+        ObserveOutcome::CoverageFault
+    );
+    assert_eq!(
+        r.observe_legacy(observation_for(B, 2, load(BASE_A))).0,
+        ObserveOutcome::New
+    );
+    r.note_proven_absence(image(B, 0), FILE);
+    assert_eq!(
+        r.counters().absence_overflows,
+        0,
+        "the dead key holds no flag"
+    );
+    assert_eq!(
+        r.observe_legacy(observation_for_epochs(B, 2, 1, load(BASE_A)))
+            .0,
+        ObserveOutcome::New,
+        "the live key's break still mints"
+    );
 }
 
 #[test]

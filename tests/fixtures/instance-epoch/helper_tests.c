@@ -103,7 +103,7 @@ static struct file___p11inst other_file = { &other_inode };
 static struct mm_struct___p11inst mm = { { 1 } };
 static struct mm_struct___p11inst other_mm = { { 1 } };
 static struct task_struct___p11inst leader;
-static struct task_struct___p11inst thread = { &mm, &leader, 0 };
+static struct task_struct___p11inst thread = { .mm = &mm, .group_leader = &leader, .flags = 0 };
 static struct task_struct___p11inst child;
 static struct task_struct___p11inst borrower;
 static struct task_struct___p11inst *current_task = &thread;

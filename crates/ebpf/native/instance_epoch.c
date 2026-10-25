@@ -13,6 +13,11 @@
  * (F1). The hooks read kernel metadata only and emit nothing. */
 #include "instance_epoch.h"
 #include "image_identity_query.h"
+#ifdef P11SCOPE_JOURNAL_MARKER
+#include "journal_marker.h"
+/* The marker control row lives in the journal_marker unit. */
+extern unsigned char JOURNAL_MARKER_CTL;
+#endif
 
 #ifndef P11SCOPE_INSTANCE_HOST_TEST
 #define INST_BTF __attribute__((preserve_access_index))
@@ -51,6 +56,11 @@ struct task_struct___p11inst {
     struct mm_struct___p11inst *mm;
     struct task_struct___p11inst *group_leader;
     unsigned int flags;
+#ifdef P11SCOPE_JOURNAL_MARKER
+    /* H8-D birth marker: the leader's exec generation, read at exec
+     * only. Detailed-only so counter bitcode stays identical. */
+    u64 self_exec_id;
+#endif
 } INST_BTF;
 
 struct {
@@ -526,6 +536,97 @@ __attribute__((noinline)) u32 p11_instance_exec(void)
         *(volatile u64 *)&rec->exec_attach_gen = *(volatile u64 *)attach;
     return 1;
 }
+
+#ifdef P11SCOPE_JOURNAL_MARKER
+/* Exec-ID read for the birth marker: the established volatile CO-RE
+ * deref (image_identity.c). The host harness counts reads through
+ * this seam to prove the gap path never reads one. */
+#ifndef INST_MARKER_EXEC_ID
+#define INST_MARKER_EXEC_ID(leader) (*(volatile u64 *)&(leader)->self_exec_id)
+#endif
+
+/* Sticky failure latch: `failed` is only ever 0->1, so an exchange trips
+ * it exactly once and never needs a retry. */
+static INST_INLINE void marker_latch(struct journal_admission_control *ctl)
+{
+    if (!ctl)
+        return;
+    __sync_lock_test_and_set(&ctl->failed, 1);
+}
+
+/* H8-D post-attach birth marker, exec half (Detailed only): publish
+ * READY(self_exec_id) on the leader's PROC_EPOCH row after closure.
+ * p11_instance_exec stays unchanged and runs first; this only marks.
+ * Returns 1 when the marker is READY for this exec, 0 when gated,
+ * sticky-DIRTY, or latched. Failures latch the control row and never
+ * raise the fault: no provider body runs at the exec root, and a fault
+ * there would wreck S1 continuity for the whole session. */
+__attribute__((noinline)) u32 p11_instance_exec_birth(void)
+{
+    struct task_struct___p11inst *current = inst_current_task();
+    struct task_struct___p11inst *leader;
+    struct instance_record *rec;
+    struct journal_admission_control *ctl;
+    u32 key = INST_GEN_ATTACH;
+    u32 ctl_key = 0;
+    u64 *attach;
+    u64 gen;
+    u64 word;
+    u64 exec;
+
+    attach = inst_map_lookup(&INSTANCE_GEN, &key);
+    if (!attach)
+        return 0;
+    gen = *(volatile u64 *)attach;
+    if (!gen)
+        return 0;
+    ctl = inst_map_lookup(&JOURNAL_MARKER_CTL, &ctl_key);
+    if (!ctl)
+        return 0;
+    if (*(volatile u64 *)&ctl->failed != 0)
+        return 0;
+    if (!current)
+        goto latch;
+    leader = current->group_leader;
+    if (!leader || leader != current)
+        goto latch;
+    rec = inst_storage_get(&PROC_EPOCH, leader, 0, 0);
+    if (!rec) {
+        if (!p11_journal_marker_reserve(ctl))
+            return 0;
+        rec = inst_storage_get(&PROC_EPOCH, leader, 0, 1);
+        if (!rec) {
+            marker_latch(ctl);
+            return 0;
+        }
+    } else {
+        if (*(volatile u64 *)&rec->flags & INST_RECORD_SHARED_MM)
+            goto latch;
+        word = *(volatile u64 *)&rec->journal_bootstrap;
+        if (word == P11_JOURNAL_MARKER_UNPUBLISHED) {
+            if (!p11_journal_marker_reserve(ctl))
+                return 0;
+        } else if (word == P11_JOURNAL_MARKER_DIRTY) {
+            return 0;
+        } else if ((word & P11_JOURNAL_MARKER_STATE_MASK) != P11_JOURNAL_MARKER_READY_STATE) {
+            goto latch;
+        }
+        /* READY(old): republish below without charging. */
+    }
+    exec = INST_MARKER_EXEC_ID(leader);
+    if (exec >= (1ULL << 62))
+        goto latch;
+    *(volatile u64 *)&rec->exec_attach_gen = gen;
+    if (p11_journal_marker_publish(rec, exec))
+        return 1;
+    word = *(volatile u64 *)&rec->journal_bootstrap;
+    if (word == P11_JOURNAL_MARKER_DIRTY)
+        return 0;
+latch:
+    marker_latch(ctl);
+    return 0;
+}
+#endif
 
 /* The continuity stamp for the caller of endpoint `endpoint_slot`; reads
  * only map cells and the caller's record. Inlined into the two helpers so no

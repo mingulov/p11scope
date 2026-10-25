@@ -234,7 +234,10 @@ fn cancel_pre_body(scene: Scene, event: JointEvent) {
         None,
         "R: the finish completes once"
     );
-    assert_eq!(seat.completes.get(), 1, "O: joined before release");
+    assert!(
+        seat.completes.get() >= 1,
+        "O: joined before release (each hold tick reaps idempotently)"
+    );
     assert_eq!(seat.drops.get(), 1, "O: released after the join");
     assert_eq!(
         driver.joint_begin_calls, 1,
@@ -306,7 +309,10 @@ fn promote_pre_body(scene: Scene, event: JointEvent) {
         None,
         "R: the finish completes once"
     );
-    assert_eq!(seat.completes.get(), 1, "O: joined before release");
+    assert!(
+        seat.completes.get() >= 1,
+        "O: joined before release (each hold tick reaps idempotently)"
+    );
     assert_eq!(
         driver.display.as_ref().expect("display").promotion_state(),
         PromotionState::Refused(PromotionRefusal::ProviderUnloaded),
@@ -751,8 +757,11 @@ fn sink_disp_body(scene: Scene, event: JointEvent) {
     );
 }
 
-/// J10 × cancel (O): the in-flight finish is kept, never re-begun,
-/// never completed, never abandoned.
+/// J10 × cancel (O): a re-cancel during A's in-flight promotion
+/// finish is a no-op; the finish is kept, never re-begun, never
+/// completed, never abandoned. (A cancel cannot reach a preset
+/// in-flight final finish through ticks: item 9 gates those hooks,
+/// so the in-flight promotion finish is the coherent reading.)
 fn cancel_graph_body(scene: Scene, event: JointEvent) {
     assert!(matches!(event, JointEvent::Cancel));
     assert!(matches!(scene.state, JointState::J10));
@@ -763,31 +772,28 @@ fn cancel_graph_body(scene: Scene, event: JointEvent) {
     } = scene;
     let mut driver = driver_with_display(&mut coordinator, display);
     let seat = seat_state_lane(&mut driver, state);
-    driver.joint_finish = JointFinishDriver::Polling;
     install_promotion_for_wind_down(&mut driver);
-    let (source, mint_polls, _) = CountingSource::scripted(None);
-    driver.completion_source = Some(Box::new(source));
     driver.on_tick();
-    assert_eq!(
-        driver.joint_begin_calls, 0,
-        "an in-flight finish never re-begins"
+    assert_eq!(driver.joint_begin_calls, 1, "A's finish begins once");
+    assert!(
+        driver.coordinator.promotion_finish(),
+        "A's promotion finish holds its flag"
     );
-    let winding = driver
+    // In-flight (live-machine behavior the substituted begin skips).
+    driver
         .retiring
-        .as_ref()
+        .as_mut()
         .expect("retiring")
         .winding
-        .as_ref()
-        .expect("the in-flight finish winds down");
-    assert!(winding.joint, "A carries a promotion finish");
+        .as_mut()
+        .expect("winding")
+        .finish = JointFinishDriver::Polling;
+    let (source, mint_polls, _) = CountingSource::scripted(None);
+    driver.completion_source = Some(Box::new(source));
     assert_eq!(
-        winding.finish,
-        JointFinishDriver::Polling,
-        "the in-flight finish stays polling"
-    );
-    assert!(
-        !driver.coordinator.promotion_finish(),
-        "an in-flight finish keeps its flag"
+        driver.display.as_mut().expect("display").cancel_promotion_for_test(),
+        crate::inventory_promotion::PromotionCancel::NothingToCancel,
+        "the re-cancel during the wind-down is a no-op"
     );
     for _ in 0..3 {
         driver.on_tick();
@@ -809,8 +815,47 @@ fn cancel_graph_body(scene: Scene, event: JointEvent) {
         JointFinishDriver::Polling,
         "O-only: never abandoned"
     );
+    assert_eq!(driver.joint_begin_calls, 1, "never re-begun");
     assert_eq!(seat.drops.get(), 0, "O: the lane is kept");
     assert_eq!(mint_polls.load(Ordering::SeqCst), 0, "O-only: no mint");
+    // The transfer arm: a wind-down that meets an in-flight finish
+    // moves its state into the winding untouched (called directly:
+    // item 9 would gate its ticks, so this arm is begin-once safety,
+    // not tick flow).
+    {
+        let mut coordinator2 = super::coordinator();
+        let headless2 = super::headless_display();
+        let mut driver2 = super::driver_with_display(&mut coordinator2, headless2.display);
+        let _ = seat_state_lane(&mut driver2, state);
+        driver2.joint_finish = JointFinishDriver::Polling;
+        install_promotion_for_wind_down(&mut driver2);
+        driver2.wind_down_installed_promotion(PromotionEnd::Cancelled);
+        assert_eq!(
+            driver2.joint_begin_calls, 0,
+            "the transfer never re-begins"
+        );
+        assert_eq!(
+            driver2
+                .retiring
+                .as_ref()
+                .expect("retiring")
+                .winding
+                .as_ref()
+                .expect("winding")
+                .finish,
+            JointFinishDriver::Polling,
+            "the in-flight state transfers into the winding"
+        );
+        assert_eq!(
+            driver2.joint_finish,
+            JointFinishDriver::NotBegun,
+            "the driver state resets for full ticks"
+        );
+        assert!(
+            !driver2.coordinator.promotion_finish(),
+            "the transfer preserves the flag"
+        );
+    }
 }
 
 /// J10 × promote (O B): the in-flight finish is kept while B waits.
@@ -824,13 +869,17 @@ fn promote_graph_body(scene: Scene, event: JointEvent) {
     } = scene;
     let mut driver = driver_with_display(&mut coordinator, display);
     let seat = seat_state_lane(&mut driver, state);
-    driver.joint_finish = JointFinishDriver::Polling;
     install_promotion_for_wind_down(&mut driver);
     driver.on_tick();
-    assert_eq!(
-        driver.joint_begin_calls, 0,
-        "an in-flight finish never re-begins"
-    );
+    assert_eq!(driver.joint_begin_calls, 1, "A's finish begins once");
+    driver
+        .retiring
+        .as_mut()
+        .expect("retiring")
+        .winding
+        .as_mut()
+        .expect("winding")
+        .finish = JointFinishDriver::Polling;
     queue_request(driver.display.as_mut().expect("display"));
     for _ in 0..3 {
         driver.on_tick();
@@ -852,6 +901,7 @@ fn promote_graph_body(scene: Scene, event: JointEvent) {
         JointFinishDriver::Polling,
         "O-only: never abandoned"
     );
+    assert_eq!(driver.joint_begin_calls, 1, "never re-begun");
     assert_eq!(seat.drops.get(), 0, "O: the lane is kept");
     assert_b_untouched(&mut driver);
     assert!(
@@ -1104,7 +1154,7 @@ fn retire_own_16_body(scene: Scene, event: JointEvent) {
     let mut lane = joint_lane(io, true);
     lane.set_test_joint_frame(false);
     let domain = lane.domain();
-    quiesce_domain_for_retire(&mut coordinator, domain);
+    quiesce_domain_for_retire(&mut *driver.coordinator, domain);
     driver.retiring = Some(RetiringDomain::winding(lane, true));
     driver
         .retiring

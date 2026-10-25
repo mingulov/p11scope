@@ -54,6 +54,17 @@ impl<'a> ObservedDriver<'a> {
                 installed_promotion: None,
                 retiring: None,
                 identity: None,
+                joint_finish: JointFinishDriver::NotBegun,
+                stop_requested: false,
+                joint_first_error: None,
+                #[cfg(test)]
+                terminal_seq_calls: 0,
+                #[cfg(test)]
+                reclaim_calls: Vec::new(),
+                #[cfg(test)]
+                joint_begin_calls: 0,
+                #[cfg(test)]
+                joint_step_calls: 0,
             },
             wrapper: None,
             tick: None,

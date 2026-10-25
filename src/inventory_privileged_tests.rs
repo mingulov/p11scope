@@ -397,6 +397,17 @@ fn drive<L: CaptureLane<PidPin>>(
         installed_promotion: None,
         retiring: None,
         identity: None,
+        joint_finish: JointFinishDriver::NotBegun,
+        stop_requested: false,
+        joint_first_error: None,
+        #[cfg(test)]
+        terminal_seq_calls: 0,
+        #[cfg(test)]
+        reclaim_calls: Vec::new(),
+        #[cfg(test)]
+        joint_begin_calls: 0,
+        #[cfg(test)]
+        joint_step_calls: 0,
     };
     let stop = Cell::new(false);
     let stop_now = || stop.get();
@@ -2562,6 +2573,17 @@ fn privileged_native_lane_sigint_during_extend_lp64() -> Result<()> {
         installed_promotion: None,
         retiring: None,
         identity: None,
+        joint_finish: JointFinishDriver::NotBegun,
+        stop_requested: false,
+        joint_first_error: None,
+        #[cfg(test)]
+        terminal_seq_calls: 0,
+        #[cfg(test)]
+        reclaim_calls: Vec::new(),
+        #[cfg(test)]
+        joint_begin_calls: 0,
+        #[cfg(test)]
+        joint_step_calls: 0,
     };
     let stop = || flag.stopped();
     let clock = LoopClock {

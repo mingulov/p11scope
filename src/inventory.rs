@@ -267,11 +267,10 @@ fn gate_override_applies_configured_cadence_and_restores() {
 /// Receipt-bearing batches publish during the tick that stages them.
 const STAGED_SEMANTIC_MAX_AGE: Duration = Duration::from_secs(1);
 
-/// Bound for promotion-cancel native cleanup on the tick path (the
-/// metadata/service 100ms teardown precedent): an unsettled cleanup
-/// is interrupted and its whole owner retained for process exit
-/// through the existing forget path, never waited out indefinitely.
-const CANCEL_CLEANUP_BUDGET: Duration = Duration::from_millis(100);
+// Promotion-cancel native cleanup reaps across ticks (§8.6): the
+// winding lane polls its detach once per hook instead of driving it
+// against a deadline, and its whole owner is retained for process
+// exit on a genuine failure, never waited out indefinitely.
 
 /// Selected preparation quantum (DR37 resolver): bounds the bootstrap
 /// queries plus one joined fallback settle for a single original.
@@ -1350,6 +1349,17 @@ fn run_with_terminal_budget(
         pending_install: None,
         installed_promotion: None,
         retiring: None,
+        joint_finish: JointFinishDriver::NotBegun,
+        stop_requested: false,
+        joint_first_error: None,
+        #[cfg(test)]
+        terminal_seq_calls: 0,
+        #[cfg(test)]
+        reclaim_calls: Vec::new(),
+        #[cfg(test)]
+        joint_begin_calls: 0,
+        #[cfg(test)]
+        joint_step_calls: 0,
         identity: identity_shared.clone(),
     };
     driver.set_completion_source(Box::new(crate::attach::NativeCompletionMinter::new()));
@@ -1741,19 +1751,100 @@ struct InstalledPromotion {
     pair: crate::inventory_promotion::PromotionPair,
 }
 
+/// The Joint finish driver (§8.3): one finish per lane, begun once
+/// at a stop, cancel or post-retirement hook, stepped once per
+/// 10 ms hook within a 1024-action budget. Legacy lanes never leave
+/// `NotBegun`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JointFinishDriver {
+    /// No finish begun: the begin sites begin the lane's finish once.
+    NotBegun,
+    /// The finish is polling toward publication.
+    Polling,
+    /// The finish published: only the wound-down is polled.
+    Published,
+    /// The finite stop abandoned the finish: nothing runs.
+    Abandoned,
+}
+
+/// What one finish step did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JointStepOutcome {
+    /// Still polling, reaping, or already abandoned.
+    Stayed,
+    /// The detach joined: the caller retires or completes the lane.
+    WoundDown,
+    /// The finite stop abandoned and held the lane.
+    Abandoned,
+}
+
+/// A promotion lane winding down inside its retiring domain (§8.6):
+/// the whole lane stays owned across ticks while its detach reaps
+/// (legacy) or its finish steps (Joint).
+struct WindingLane {
+    /// The winding lane; `None` after the typed exit held it.
+    lane: Option<crate::inventory_semantics::AttestedSemanticLane>,
+    /// A's promotion finish state.
+    finish: JointFinishDriver,
+    /// Whether A carries a Joint promotion finish (legacy lanes wind
+    /// through the wound-down phase only).
+    joint: bool,
+    /// ProviderStorage commit refusals retried so far (item 7).
+    commit_retries: u16,
+}
+
+impl WindingLane {
+    /// Item 7's commit-refusal handler: `ProviderStorage` retries
+    /// through 100 hooks, anything else (or the 101st) fails. True
+    /// stays `NotBegun`; false notes the failure and takes the
+    /// finite stop.
+    fn note_commit_refusal(&mut self, reason: crate::inventory_semantics::SemanticRefusal) -> bool {
+        if reason == crate::inventory_semantics::SemanticRefusal::ProviderStorage
+            && self.commit_retries < 100
+        {
+            self.commit_retries += 1;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// A wound-down domain whose coordinator namespace still retires. The
 /// completion minter delivers once, so a proof spent on a refused
 /// attempt is retained here for the retry, never re-polled.
 struct RetiringDomain {
     domain: crate::attach::capture::NativeDomainId,
     completion: Option<crate::inventory_promotion::lifecycle::SessionNativeCompletion>,
+    /// A lane still winding down (legacy detach or Joint promotion
+    /// finish); `None` once the lane handed its session off.
+    winding: Option<WindingLane>,
 }
 
 impl RetiringDomain {
+    /// Lane-less retire tail, kept for the pre-T14 tests that pin it;
+    /// production always winds a lane down first (§8.6).
+    #[cfg(test)]
     fn wound_down(domain: crate::attach::capture::NativeDomainId) -> Self {
         Self {
             domain,
             completion: None,
+            winding: None,
+        }
+    }
+
+    /// Keep A's whole lane for its promotion wind-down (§8.6).
+    fn winding(lane: crate::inventory_semantics::AttestedSemanticLane, joint: bool) -> Self {
+        let domain = lane.domain();
+        Self {
+            domain,
+            completion: None,
+            winding: Some(WindingLane {
+                lane: Some(lane),
+                finish: JointFinishDriver::NotBegun,
+                joint,
+                commit_retries: 0,
+            }),
         }
     }
 }
@@ -1803,6 +1894,28 @@ struct ClassicDriver<'a> {
     /// retained for the retry) and the namespace retires before any
     /// held install runs.
     retiring: Option<RetiringDomain>,
+    /// The Joint finish driver (§8.3): `NotBegun` until a begin site
+    /// begins a Joint lane's finish. Legacy lanes never leave it.
+    joint_finish: JointFinishDriver,
+    /// A stop was already requested: the second stop escalates a
+    /// begun-but-unfinished Joint finish to the typed exit instead of
+    /// re-running the stop path.
+    stop_requested: bool,
+    /// The first Joint finish error, kept for the retained
+    /// consumer's exit (§6.4): the abandon reason, the wound-down
+    /// refusal, or the escalation note. Never overwritten by later
+    /// best-effort work.
+    joint_first_error: Option<String>,
+    /// Tests-only spies: terminal-sequence runs, reclaim calls with
+    /// their end, finish-begin attempts, driver steps.
+    #[cfg(test)]
+    terminal_seq_calls: usize,
+    #[cfg(test)]
+    reclaim_calls: Vec<crate::inventory_promotion::PromotionEnd>,
+    #[cfg(test)]
+    joint_begin_calls: usize,
+    #[cfg(test)]
+    joint_step_calls: usize,
 }
 
 /// Exercise the actual caller refresh/admission path with substituted lane I/O.
@@ -1840,6 +1953,17 @@ pub(crate) fn classic_semantic_tick_for_test(
         pending_install: None,
         installed_promotion: None,
         retiring: None,
+        joint_finish: JointFinishDriver::NotBegun,
+        stop_requested: false,
+        joint_first_error: None,
+        #[cfg(test)]
+        terminal_seq_calls: 0,
+        #[cfg(test)]
+        reclaim_calls: Vec::new(),
+        #[cfg(test)]
+        joint_begin_calls: 0,
+        #[cfg(test)]
+        joint_step_calls: 0,
     };
     driver.on_tick();
     driver.semantic.take().unwrap()
@@ -1874,6 +1998,17 @@ pub(crate) fn classic_semantic_pass_for_test(
         pending_install: None,
         installed_promotion: None,
         retiring: None,
+        joint_finish: JointFinishDriver::NotBegun,
+        stop_requested: false,
+        joint_first_error: None,
+        #[cfg(test)]
+        terminal_seq_calls: 0,
+        #[cfg(test)]
+        reclaim_calls: Vec::new(),
+        #[cfg(test)]
+        joint_begin_calls: 0,
+        #[cfg(test)]
+        joint_step_calls: 0,
     };
     let report = driver.apply(collected, identity, now_ns()).unwrap();
     driver.commit(report.engine_changed).unwrap();
@@ -1927,6 +2062,17 @@ pub(crate) fn classic_semantic_stop_for_test(
         pending_install: None,
         installed_promotion: None,
         retiring: None,
+        joint_finish: JointFinishDriver::NotBegun,
+        stop_requested: false,
+        joint_first_error: None,
+        #[cfg(test)]
+        terminal_seq_calls: 0,
+        #[cfg(test)]
+        reclaim_calls: Vec::new(),
+        #[cfg(test)]
+        joint_begin_calls: 0,
+        #[cfg(test)]
+        joint_step_calls: 0,
     };
     driver.on_stop_requested();
     // Repeated stop hooks cannot submit the same native owners again.
@@ -1994,6 +2140,17 @@ pub(crate) fn classic_promotion_full_loop_for_test(
         pending_install: None,
         installed_promotion: None,
         retiring: None,
+        joint_finish: JointFinishDriver::NotBegun,
+        stop_requested: false,
+        joint_first_error: None,
+        #[cfg(test)]
+        terminal_seq_calls: 0,
+        #[cfg(test)]
+        reclaim_calls: Vec::new(),
+        #[cfg(test)]
+        joint_begin_calls: 0,
+        #[cfg(test)]
+        joint_step_calls: 0,
     };
     let started = Instant::now();
     loop {
@@ -2115,6 +2272,10 @@ impl ClassicDriver<'_> {
             .is_some_and(|lane| lane.is_live() && !lane.is_finished())
         {
             return;
+        }
+        #[cfg(test)]
+        {
+            self.terminal_seq_calls += 1;
         }
         // Publish any pass-staged quantum first: the terminal drain
         // must never backpressure behind it.
@@ -2304,6 +2465,15 @@ impl ClassicDriver<'_> {
     /// delivers once, so the retry reuses it instead of re-polling.
     fn poll_retiring_domain(&mut self) -> bool {
         use crate::discovery::engine::inventory_coordinator::semantics::JointRetireRefusal;
+        let winding = self
+            .retiring
+            .as_ref()
+            .and_then(|retiring| retiring.winding.as_ref().map(|winding| winding.joint));
+        match winding {
+            Some(true) => return self.poll_joint_winding(),
+            Some(false) if !self.poll_legacy_winding() => return false,
+            Some(false) | None => {}
+        }
         let Some(retiring) = self.retiring.as_mut() else {
             return true;
         };
@@ -2355,7 +2525,15 @@ impl ClassicDriver<'_> {
     fn take_promotion_work(&mut self) {
         use crate::inventory_promotion::PromotionRefusal;
         use crate::inventory_promotion::lifecycle::validate_subset_shape;
-        if !self.lifecycle.is_idle() || self.pending_install.is_some() {
+        // A's promotion wind-down holds B: no preparation or
+        // admission until A retires (§8.6).
+        if !self.lifecycle.is_idle()
+            || self.pending_install.is_some()
+            || self
+                .retiring
+                .as_ref()
+                .is_some_and(|retiring| retiring.winding.is_some())
+        {
             return;
         }
         let Some(display) = self.display.as_mut() else {
@@ -2452,11 +2630,471 @@ impl ClassicDriver<'_> {
     /// install implies outstanding) parks again rather than stranding
     /// the lane.
     fn reclaim_pending_install(&mut self, end: crate::inventory_promotion::PromotionEnd) {
+        #[cfg(test)]
+        {
+            self.reclaim_calls.push(end);
+        }
         let Some(pending) = self.pending_install.take() else {
             return;
         };
         if let Err(pending) = self.lifecycle.reclaim_install(pending, Some(end)) {
             self.pending_install = Some(pending);
+        }
+    }
+
+    /// Whether the lane takes the Joint finish path: a live machine
+    /// or a retained frame. Production-identical to
+    /// `has_joint_machine`: outside tests the frame implies the
+    /// machine (`has_joint_frame` is machine && !finished), so the
+    /// disjunction collapses to the machine. Tests drive the branch
+    /// through the retained-frame seam, which unit tests can set.
+    fn is_joint_lane(lane: &crate::inventory_semantics::AttestedSemanticLane) -> bool {
+        lane.has_joint_machine() || lane.has_joint_frame()
+    }
+
+    /// Begin a Joint lane's finish once (§8.3): a begun finish
+    /// polls; a refused begin on a finished lane resumes at the
+    /// wound-down phase; any other refusal leaves the latch in the
+    /// lane (§1.11) for the caller to abandon.
+    fn begin_lane_finish(
+        lane: &mut crate::inventory_semantics::AttestedSemanticLane,
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+    ) -> JointFinishDriver {
+        match lane.begin_joint_finish(coordinator) {
+            Ok(()) => JointFinishDriver::Polling,
+            Err(_) if lane.is_finished() => JointFinishDriver::Published,
+            Err(_) => JointFinishDriver::Abandoned,
+        }
+    }
+
+    /// Hold a Joint lane for exit after its finish failed (item 7,
+    /// §6.4): abandon where admitted (best-effort commit, first
+    /// error kept), then hold the whole lane. Returns the first
+    /// error: the disposition where latched, else the trigger cause.
+    /// Callers disclose the skips (finished or unadmitted holds).
+    fn hold_joint_lane_for_exit(
+        mut lane: crate::inventory_semantics::AttestedSemanticLane,
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        cause: &str,
+    ) -> String {
+        let latched = lane.joint_finish_disposition_required();
+        if !lane.is_finished()
+            && latched
+            && let Ok(batch) =
+                lane.abandon_finish_for_exit(coordinator, "joint finish disposition required")
+        {
+            coordinator.stage_semantic_batch(batch);
+            let _ = commit_semantic_finish(coordinator, &mut lane);
+        }
+        ExitRetention::hold(lane);
+        if latched {
+            "joint finish disposition required".to_string()
+        } else {
+            cause.to_string()
+        }
+    }
+
+    /// Step a begun Joint finish once within the 10 ms /
+    /// 1024-action budget (§8.3): Polling polls the finish (a
+    /// disposition abandons through the finite stop, anything else
+    /// stays for the latch to bound); Published polls only the
+    /// wound-down (a refusal skips the abandon per §6.4 and holds);
+    /// Abandoned does nothing.
+    fn step_begun_joint_finish(
+        lane: &mut Option<crate::inventory_semantics::AttestedSemanticLane>,
+        finish: &mut JointFinishDriver,
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        first_error: &mut Option<String>,
+    ) -> JointStepOutcome {
+        let mut budget = crate::inventory_semantics::JointWorkBudget {
+            remaining_actions: 1024,
+            deadline: Instant::now() + Duration::from_millis(10),
+        };
+        match *finish {
+            JointFinishDriver::NotBegun | JointFinishDriver::Abandoned => JointStepOutcome::Stayed,
+            JointFinishDriver::Polling => {
+                if lane
+                    .as_ref()
+                    .is_some_and(|lane| lane.joint_finish_disposition_required())
+                {
+                    if let Some(owned) = lane.take() {
+                        *first_error = Some(Self::hold_joint_lane_for_exit(
+                            owned,
+                            coordinator,
+                            "joint finish disposition required",
+                        ));
+                    }
+                    *finish = JointFinishDriver::Abandoned;
+                    return JointStepOutcome::Abandoned;
+                }
+                let Some(lane) = lane.as_mut() else {
+                    return JointStepOutcome::Stayed;
+                };
+                match lane.poll_joint_finish(coordinator, &mut budget) {
+                    Ok(crate::discovery::engine::inventory_coordinator::JointCommitProgress::Published(_)) => {
+                        *finish = JointFinishDriver::Published;
+                        JointStepOutcome::Stayed
+                    }
+                    Ok(crate::discovery::engine::inventory_coordinator::JointCommitProgress::Pending)
+                    | Err(_) => JointStepOutcome::Stayed,
+                }
+            }
+            JointFinishDriver::Published => {
+                let wound = match lane.as_mut() {
+                    Some(lane) => lane.poll_wound_down(coordinator),
+                    None => return JointStepOutcome::Stayed,
+                };
+                match wound {
+                    Ok(true) => JointStepOutcome::WoundDown,
+                    Ok(false) => JointStepOutcome::Stayed,
+                    Err(refusal) => {
+                        let cause = format!("wound-down refused: {}", refusal.code());
+                        coordinator
+                            .note_scope_gap("joint wound-down failed".to_string(), cause.clone());
+                        if let Some(owned) = lane.take() {
+                            *first_error =
+                                Some(Self::hold_joint_lane_for_exit(owned, coordinator, &cause));
+                        }
+                        *finish = JointFinishDriver::Abandoned;
+                        JointStepOutcome::Abandoned
+                    }
+                }
+            }
+        }
+    }
+
+    /// Begin the live lane's Joint finish once; an abandoned begin
+    /// holds the lane immediately.
+    fn begin_final_joint_finish(&mut self) {
+        let (coordinator, semantic) = (&mut *self.coordinator, &mut self.semantic);
+        let Some(lane) = semantic.as_mut() else {
+            return;
+        };
+        #[cfg(test)]
+        {
+            self.joint_begin_calls += 1;
+        }
+        match Self::begin_lane_finish(lane, coordinator) {
+            JointFinishDriver::Abandoned => {
+                let lane = semantic.take().expect("joint lane");
+                self.joint_first_error = Some(Self::hold_joint_lane_for_exit(
+                    lane,
+                    coordinator,
+                    "joint finish disposition required",
+                ));
+                self.joint_finish = JointFinishDriver::Abandoned;
+            }
+            begun => {
+                self.joint_finish = begun;
+            }
+        }
+    }
+
+    /// The second stop (sigint2) for a begun Joint finish: abandon
+    /// where admitted, hold the lane for exit, keep the first error.
+    /// Anything else (no lane, a legacy lane, already held) is a no-op.
+    fn escalate_joint_finish(&mut self) {
+        if !self.semantic.as_ref().is_some_and(Self::is_joint_lane) {
+            return;
+        }
+        if matches!(self.joint_finish, JointFinishDriver::Abandoned) {
+            return;
+        }
+        let Some(lane) = self.semantic.take() else {
+            return;
+        };
+        let latched = lane.joint_finish_disposition_required();
+        let finished = lane.is_finished();
+        self.joint_first_error = Some(Self::hold_joint_lane_for_exit(
+            lane,
+            &mut *self.coordinator,
+            "second stop during joint finish",
+        ));
+        if finished || !latched {
+            self.coordinator.note_scope_gap(
+                "joint finish held for exit".to_string(),
+                "second stop during joint finish".to_string(),
+            );
+        }
+        self.joint_finish = JointFinishDriver::Abandoned;
+    }
+
+    /// Complete a wound-down final Joint lane: take the joined
+    /// session and drop it (the detach already joined), then release
+    /// the lane shell. A take refusal keeps the lane for the next
+    /// hook, whose wound-down poll re-verifies it.
+    fn complete_final_joint_lane(&mut self) {
+        let Some(lane) = self.semantic.as_mut() else {
+            return;
+        };
+        if lane.take_joined_session().is_ok() {
+            self.semantic = None;
+        }
+    }
+
+    /// Reap a legacy winding lane once: Pending holds; a joined
+    /// detach consumes through the synchronous boundary; a failed
+    /// detach reports once and holds the owner for exit. True means
+    /// the lane handed off and the shared tail may retire.
+    fn poll_legacy_winding(&mut self) -> bool {
+        enum Outcome {
+            Pending,
+            Joined,
+            Failed(String),
+        }
+        let outcome = {
+            let retiring = self.retiring.as_mut().expect("a winding lane retires");
+            let winding = retiring.winding.as_mut().expect("a winding lane retires");
+            let Some(lane) = winding.lane.as_mut() else {
+                return false;
+            };
+            match lane.poll_wound_down(&mut *self.coordinator) {
+                Ok(false) => Outcome::Pending,
+                Ok(true) => Outcome::Joined,
+                Err(error) => Outcome::Failed(format!("{error:#}")),
+            }
+        };
+        match outcome {
+            Outcome::Pending => false,
+            Outcome::Joined => {
+                let retiring = self.retiring.as_mut().expect("a winding lane retires");
+                let lane = retiring
+                    .winding
+                    .as_mut()
+                    .expect("winding")
+                    .lane
+                    .take()
+                    .expect("winding lane");
+                match lane.into_wound_down_session(&|| true, &mut std::io::sink()) {
+                    Ok(session) => {
+                        if let Some(session) = session {
+                            let domain = retiring.domain;
+                            if let Some(source) = self.completion_source.as_mut() {
+                                source.note_wound_down(domain, session);
+                            }
+                        }
+                        retiring.winding = None;
+                        true
+                    }
+                    Err(error) => {
+                        // The boundary already retained the failed
+                        // owner for exit; the legacy downstream
+                        // retires the namespace.
+                        self.coordinator.note_scope_gap(
+                            "selected lane native cleanup failed".to_string(),
+                            format!("{error:#}"),
+                        );
+                        retiring.winding = None;
+                        true
+                    }
+                }
+            }
+            Outcome::Failed(cause) => {
+                self.coordinator
+                    .note_scope_gap("selected lane native cleanup failed".to_string(), cause);
+                let retiring = self.retiring.as_mut().expect("a winding lane retires");
+                let lane = retiring
+                    .winding
+                    .as_mut()
+                    .expect("winding")
+                    .lane
+                    .take()
+                    .expect("winding lane");
+                ExitRetention::hold(lane);
+                retiring.winding = None;
+                true
+            }
+        }
+    }
+
+    /// Step A's Joint promotion finish once (§8.6): NotBegun drains
+    /// the pending commit, Polling polls the finish, Published polls
+    /// only the wound-down. A joined detach hands its session to the
+    /// minter and retires through the seal-drained gate; only an Ok
+    /// retire clears the promotion flag and releases B. True retires.
+    fn poll_joint_winding(&mut self) -> bool {
+        #[cfg(test)]
+        {
+            self.joint_step_calls += 1;
+        }
+        if self.retiring.as_ref().is_some_and(|retiring| {
+            retiring
+                .winding
+                .as_ref()
+                .is_some_and(|winding| matches!(winding.finish, JointFinishDriver::NotBegun))
+        }) {
+            return self.step_not_begun_winding();
+        }
+        let outcome = {
+            let retiring = self.retiring.as_mut().expect("a winding lane retires");
+            let winding = retiring.winding.as_mut().expect("a winding lane retires");
+            Self::step_begun_joint_finish(
+                &mut winding.lane,
+                &mut winding.finish,
+                &mut *self.coordinator,
+                &mut self.joint_first_error,
+            )
+        };
+        if !matches!(outcome, JointStepOutcome::WoundDown) {
+            return false;
+        }
+        let session = {
+            let retiring = self.retiring.as_mut().expect("a winding lane retires");
+            let lane = retiring
+                .winding
+                .as_mut()
+                .expect("winding")
+                .lane
+                .as_mut()
+                .expect("winding lane");
+            match lane.take_joined_session() {
+                Ok(session) => session,
+                Err(_) => return false,
+            }
+        };
+        if let Some(session) = session {
+            let retiring = self.retiring.as_mut().expect("a winding lane retires");
+            let domain = retiring.domain;
+            if let Some(source) = self.completion_source.as_mut() {
+                source.note_wound_down(domain, session);
+            }
+        }
+        let (completion, fresh) = {
+            let retiring = self.retiring.as_mut().expect("a winding lane retires");
+            match retiring.completion.take() {
+                Some(retained) => (retained, false),
+                None => {
+                    let domain = retiring.domain;
+                    match self
+                        .completion_source
+                        .as_mut()
+                        .and_then(|source| source.poll_completion(domain))
+                    {
+                        Some(completion) => (completion, true),
+                        None => return false,
+                    }
+                }
+            }
+        };
+        let retiring = self.retiring.as_mut().expect("a winding lane retires");
+        let lane = retiring
+            .winding
+            .as_ref()
+            .expect("winding")
+            .lane
+            .as_ref()
+            .expect("winding lane");
+        match self
+            .coordinator
+            .retire_joint_domain_with_lane(lane, completion)
+        {
+            Ok(()) => {
+                self.coordinator.set_promotion_finish(false);
+                self.retiring = None;
+                true
+            }
+            Err((completion, refusal)) => {
+                if fresh
+                    && matches!(
+                        refusal,
+                        crate::discovery::engine::inventory_coordinator::semantics::JointRetireRefusal::NotLiveDomain
+                    )
+                {
+                    self.coordinator.note_scope_gap(
+                        "selected promotion completion failed".to_string(),
+                        format!("foreign completion for {:?}", completion.domain()),
+                    );
+                }
+                let retiring = self.retiring.as_mut().expect("a winding lane retires");
+                retiring.completion = Some(completion);
+                false
+            }
+        }
+    }
+
+    /// One NotBegun promotion step (item 7): poll the pending commit.
+    /// R1.4 runs no commits, so Published and Pending both begin the
+    /// finish (T16b refines Pending with its publication query); a
+    /// retryable refusal stays, anything else notes the failure and
+    /// takes the finite stop. Never retires directly.
+    fn step_not_begun_winding(&mut self) -> bool {
+        let mut budget = crate::inventory_semantics::JointWorkBudget {
+            remaining_actions: 1024,
+            deadline: Instant::now() + Duration::from_millis(10),
+        };
+        enum Outcome {
+            Begin,
+            Stayed,
+            Fail(crate::inventory_semantics::SemanticRefusal),
+        }
+        let outcome = {
+            let retiring = self.retiring.as_mut().expect("a winding lane retires");
+            let winding = retiring.winding.as_mut().expect("a winding lane retires");
+            let Some(lane) = winding.lane.as_mut() else {
+                return false;
+            };
+            match lane.poll_joint_commit(&mut *self.coordinator, &mut budget) {
+                Ok(_) => Outcome::Begin,
+                Err(reason) => {
+                    if winding.note_commit_refusal(reason) {
+                        Outcome::Stayed
+                    } else {
+                        Outcome::Fail(reason)
+                    }
+                }
+            }
+        };
+        match outcome {
+            Outcome::Stayed => false,
+            Outcome::Begin => {
+                #[cfg(test)]
+                {
+                    self.joint_begin_calls += 1;
+                }
+                let retiring = self.retiring.as_mut().expect("a winding lane retires");
+                let winding = retiring.winding.as_mut().expect("a winding lane retires");
+                let Some(lane) = winding.lane.as_mut() else {
+                    return false;
+                };
+                match Self::begin_lane_finish(lane, &mut *self.coordinator) {
+                    JointFinishDriver::Abandoned => {
+                        let lane = winding.lane.take().expect("winding lane");
+                        self.joint_first_error = Some(Self::hold_joint_lane_for_exit(
+                            lane,
+                            &mut *self.coordinator,
+                            "joint finish disposition required",
+                        ));
+                        winding.finish = JointFinishDriver::Abandoned;
+                    }
+                    begun => {
+                        winding.finish = begun;
+                    }
+                }
+                false
+            }
+            Outcome::Fail(reason) => {
+                let retiring = self.retiring.as_mut().expect("a winding lane retires");
+                let winding = retiring.winding.as_mut().expect("a winding lane retires");
+                let Some(lane) = winding.lane.as_mut() else {
+                    return false;
+                };
+                lane.note_joint_finish_failure(reason);
+                let finished = lane.is_finished();
+                let lane = winding.lane.take().expect("winding lane");
+                self.joint_first_error = Some(Self::hold_joint_lane_for_exit(
+                    lane,
+                    &mut *self.coordinator,
+                    "joint finish disposition required",
+                ));
+                if finished {
+                    self.coordinator.note_scope_gap(
+                        "joint finish held for exit".to_string(),
+                        "joint finish disposition required".to_string(),
+                    );
+                }
+                winding.finish = JointFinishDriver::Abandoned;
+                false
+            }
         }
     }
 
@@ -2480,7 +3118,11 @@ impl ClassicDriver<'_> {
         if let Some(lane) = self.semantic.as_mut() {
             lane.request_semantic_stop();
         }
-        self.run_semantic_terminal_sequence();
+        // Joint lanes skip the blocking terminal sequence: the finish
+        // driver owns them from here (§8.3).
+        if !self.semantic.as_ref().is_some_and(Self::is_joint_lane) {
+            self.run_semantic_terminal_sequence();
+        }
         // A staged batch that has not published yet retries through
         // the kept lane at the staleness cadence, like the tick's
         // staged commit: never gap-spamming, never dropping.
@@ -2510,38 +3152,66 @@ impl ClassicDriver<'_> {
             return;
         }
         self.installed_promotion = None;
-        let lane = self.semantic.take();
-        let cleanup_deadline = Instant::now() + CANCEL_CLEANUP_BUDGET;
-        // Release the lane into its wound-down Session for
-        // completion-polled retire: the minter proves genuine disposal
-        // on poll. Without an installed minter the joined Session
-        // drops normally (detach joined, selection terminal) and the
-        // namespace holds, exactly as before the minter landed.
-        // Diagnostics bypass stderr past the screen, like the cancel
-        // path before it: a blocked terminal cannot hold the tick past
-        // its budget, and the outcome still reports through gaps.
-        let wound_down = lane.map(|lane| {
-            lane.into_wound_down_session(
-                &|| Instant::now() >= cleanup_deadline,
-                &mut std::io::sink(),
-            )
-        });
-        match wound_down {
-            None | Some(Ok(None)) => {}
-            Some(Ok(Some(session))) => {
-                if let (Some(source), Some(domain)) = (self.completion_source.as_mut(), domain) {
-                    source.note_wound_down(domain, session);
+        let joint = self.semantic.as_ref().is_some_and(Self::is_joint_lane);
+        let Some(lane) = self.semantic.take() else {
+            let update = PromotionStatusUpdate::new(
+                installed.capture,
+                installed.request,
+                PromotionOutcome::Ended { reason: end },
+            );
+            if let Some(display) = self.display.as_mut() {
+                display.set_promotion_status(update);
+            }
+            self.coordinator.note_scope_gap(
+                "selected promotion ended".into(),
+                format!(
+                    "{} for c{} m{}",
+                    end.label(),
+                    installed.pair.caller(),
+                    installed.pair.provider()
+                ),
+            );
+            return;
+        };
+        if joint {
+            // A's promotion finish (§8.6): the flag sets before a
+            // fresh begin; the whole lane winds down in its retiring
+            // domain. An in-flight finish keeps its state and its
+            // flag and transfers into the winding.
+            let mut retiring = RetiringDomain::winding(lane, true);
+            if matches!(self.joint_finish, JointFinishDriver::NotBegun) {
+                self.coordinator.set_promotion_finish(true);
+                #[cfg(test)]
+                {
+                    self.joint_begin_calls += 1;
                 }
+                let winding = retiring.winding.as_mut().expect("winding");
+                let lane = winding.lane.as_mut().expect("winding lane");
+                match Self::begin_lane_finish(lane, &mut *self.coordinator) {
+                    JointFinishDriver::Abandoned => {
+                        let lane = winding.lane.take().expect("winding lane");
+                        self.joint_first_error = Some(Self::hold_joint_lane_for_exit(
+                            lane,
+                            &mut *self.coordinator,
+                            "joint finish disposition required",
+                        ));
+                        winding.finish = JointFinishDriver::Abandoned;
+                    }
+                    begun => {
+                        winding.finish = begun;
+                    }
+                }
+            } else {
+                retiring.winding.as_mut().expect("winding").finish = self.joint_finish;
+                self.joint_finish = JointFinishDriver::NotBegun;
             }
-            Some(Err(error)) => {
-                self.coordinator.note_scope_gap(
-                    "selected lane native cleanup failed".into(),
-                    format!("{error:#}"),
-                );
-            }
-        }
-        if let Some(domain) = domain {
-            self.retiring = Some(RetiringDomain::wound_down(domain));
+            self.retiring = Some(retiring);
+        } else {
+            // Legacy lanes wind down at the wound-down phase; ticks
+            // reap the detach and retire through the shared tail.
+            let mut retiring = RetiringDomain::winding(lane, false);
+            retiring.winding.as_mut().expect("winding").finish = JointFinishDriver::Published;
+            self.retiring = Some(retiring);
         }
         let update = PromotionStatusUpdate::new(
             installed.capture,
@@ -3069,6 +3739,29 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
         if let Some(display) = self.display.as_mut() {
             display.tick();
         }
+        // Item 9: while the final Joint finish polls or reaps outside
+        // any promotion, the hook runs only the display tick above
+        // and one driver step.
+        if matches!(
+            self.joint_finish,
+            JointFinishDriver::Polling | JointFinishDriver::Published
+        ) && !self.coordinator.promotion_finish()
+        {
+            #[cfg(test)]
+            {
+                self.joint_step_calls += 1;
+            }
+            let outcome = Self::step_begun_joint_finish(
+                &mut self.semantic,
+                &mut self.joint_finish,
+                &mut *self.coordinator,
+                &mut self.joint_first_error,
+            );
+            if matches!(outcome, JointStepOutcome::WoundDown) {
+                self.complete_final_joint_lane();
+            }
+            return;
+        }
         self.poll_promotion();
         // Bound the wait for staged evidence even when collection runs
         // long. Failed commits retry at the next staleness deadline
@@ -3143,6 +3836,14 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
     }
 
     fn on_stop_requested(&mut self) {
+        // A second stop escalates a begun-but-unfinished Joint finish
+        // to the typed exit instead of re-running the stop path.
+        if self.stop_requested && !matches!(self.joint_finish, JointFinishDriver::NotBegun) {
+            self.escalate_joint_finish();
+            return;
+        }
+        let first_stop = !self.stop_requested;
+        self.stop_requested = true;
         self.coordinator.stop_caller_metadata();
         if let Some(observer) = self
             .cgroup
@@ -3156,37 +3857,47 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
         if let Some(lane) = self.semantic.as_mut() {
             lane.request_semantic_stop();
         }
-        // Flush staged and stashed evidence NOW, before native
-        // retirement runs: retirement's 5-10s budget exceeds the 2s
-        // receipt window, so evidence must finalize here instead of
-        // after it. The post-retirement hook below is then a no-op.
-        self.run_semantic_terminal_sequence();
+        if self.semantic.as_ref().is_some_and(Self::is_joint_lane) {
+            // Joint lanes skip the blocking terminal sequence: the
+            // finish driver owns them from here (§8.3). An in-flight
+            // finish is kept, never re-begun.
+            if matches!(self.joint_finish, JointFinishDriver::NotBegun) {
+                self.begin_final_joint_finish();
+            }
+        } else {
+            // Flush staged and stashed evidence NOW, before native
+            // retirement runs: retirement's 5-10s budget exceeds the 2s
+            // receipt window, so evidence must finalize here instead of
+            // after it. The post-retirement hook below is then a no-op.
+            self.run_semantic_terminal_sequence();
+        }
         // DR37: cancel promotion work and reclaim held installs, then
-        // drain the service bounded (100ms, the metadata precedent)
-        // without installing: teardown never starts new lanes.
+        // poll the service once per hook without installing: teardown
+        // never starts new lanes, and later ticks drain the service.
         self.lifecycle
             .note_cancel(crate::inventory_promotion::PromotionEnd::RunStopped);
         self.reclaim_pending_install(crate::inventory_promotion::PromotionEnd::RunStopped);
-        let deadline = Instant::now() + Duration::from_millis(100);
-        loop {
-            if self.lifecycle.is_idle() && self.pending_install.is_none() {
-                break;
-            }
-            let mut sink = std::io::sink();
-            match self.lifecycle.poll(&mut sink) {
-                Some(event) => {
-                    self.apply_lifecycle_event(event);
-                    self.reclaim_pending_install(
-                        crate::inventory_promotion::PromotionEnd::RunStopped,
-                    );
-                }
-                None => {
-                    if Instant::now() >= deadline {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-            }
+        let mut sink = std::io::sink();
+        if let Some(event) = self.lifecycle.poll(&mut sink) {
+            self.apply_lifecycle_event(event);
+            self.reclaim_pending_install(crate::inventory_promotion::PromotionEnd::RunStopped);
+        }
+        // A stop during A's promotion finish keeps that finish and
+        // discloses once that later process exits retire nothing (§8.6).
+        if first_stop
+            && self.retiring.as_ref().is_some_and(|retiring| {
+                retiring.winding.as_ref().is_some_and(|winding| {
+                    winding.joint
+                        && winding.lane.is_some()
+                        && !matches!(winding.finish, JointFinishDriver::Abandoned)
+                })
+            })
+        {
+            self.coordinator.note_scope_gap(
+                "terminal stop during promotion".to_string(),
+                "process exits after the last inventory scan were not retired at the stop"
+                    .to_string(),
+            );
         }
     }
 
@@ -3197,6 +3908,33 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
             .and_then(|cgroup| cgroup.observer.as_ref())
         {
             observer.retired();
+        }
+        if self.semantic.as_ref().is_some_and(Self::is_joint_lane) {
+            // The Joint finish begins once here when the stop request
+            // did not begin it; a begun finish steps once (§8.3).
+            if matches!(self.joint_finish, JointFinishDriver::NotBegun) {
+                self.begin_final_joint_finish();
+                return;
+            }
+            if matches!(
+                self.joint_finish,
+                JointFinishDriver::Polling | JointFinishDriver::Published
+            ) {
+                #[cfg(test)]
+                {
+                    self.joint_step_calls += 1;
+                }
+                let outcome = Self::step_begun_joint_finish(
+                    &mut self.semantic,
+                    &mut self.joint_finish,
+                    &mut *self.coordinator,
+                    &mut self.joint_first_error,
+                );
+                if matches!(outcome, JointStepOutcome::WoundDown) {
+                    self.complete_final_joint_lane();
+                }
+            }
+            return;
         }
         // Safety net for the same terminal sequence (a no-op once the
         // stop request above already ran it before native retirement).
@@ -4144,6 +4882,17 @@ fn run_dashboard(
         pending_install: None,
         installed_promotion: None,
         retiring: None,
+        joint_finish: JointFinishDriver::NotBegun,
+        stop_requested: false,
+        joint_first_error: None,
+        #[cfg(test)]
+        terminal_seq_calls: 0,
+        #[cfg(test)]
+        reclaim_calls: Vec::new(),
+        #[cfg(test)]
+        joint_begin_calls: 0,
+        #[cfg(test)]
+        joint_step_calls: 0,
         identity: identity_shared.clone(),
     };
     driver.set_completion_source(Box::new(crate::attach::NativeCompletionMinter::new()));
@@ -8505,6 +9254,17 @@ mod tests {
                 pending_install: None,
                 installed_promotion: None,
                 retiring: None,
+                joint_finish: JointFinishDriver::NotBegun,
+                stop_requested: false,
+                joint_first_error: None,
+                #[cfg(test)]
+                terminal_seq_calls: 0,
+                #[cfg(test)]
+                reclaim_calls: Vec::new(),
+                #[cfg(test)]
+                joint_begin_calls: 0,
+                #[cfg(test)]
+                joint_step_calls: 0,
             };
             // The first tick stages; a fresh staged batch stays staged
             // across further ticks instead of committing early.
@@ -8590,6 +9350,17 @@ mod tests {
                 pending_install: None,
                 installed_promotion: None,
                 retiring: None,
+                joint_finish: JointFinishDriver::NotBegun,
+                stop_requested: false,
+                joint_first_error: None,
+                #[cfg(test)]
+                terminal_seq_calls: 0,
+                #[cfg(test)]
+                reclaim_calls: Vec::new(),
+                #[cfg(test)]
+                joint_begin_calls: 0,
+                #[cfg(test)]
+                joint_step_calls: 0,
             };
             assert!(driver.semantic_staged, "one quantum stages");
             assert_eq!(driver.coordinator.registry().instances().count(), 0);
@@ -8726,6 +9497,17 @@ mod promotion_driver_tests {
             pending_install: None,
             installed_promotion: None,
             retiring: None,
+            joint_finish: JointFinishDriver::NotBegun,
+            stop_requested: false,
+            joint_first_error: None,
+            #[cfg(test)]
+            terminal_seq_calls: 0,
+            #[cfg(test)]
+            reclaim_calls: Vec::new(),
+            #[cfg(test)]
+            joint_begin_calls: 0,
+            #[cfg(test)]
+            joint_step_calls: 0,
         }
     }
 
@@ -10319,9 +11101,8 @@ mod promotion_driver_tests {
         }
         // B queues while A winds down: preparation must wait for A.
         queue_request(driver.display.as_mut().expect("display"));
-        let (source, mint_polls, _) = CountingSource::scripted(Some(
-            SessionNativeCompletion::scripted(domain),
-        ));
+        let (source, mint_polls, _) =
+            CountingSource::scripted(Some(SessionNativeCompletion::scripted(domain)));
         driver.completion_source = Some(Box::new(source));
         for _ in 0..3 {
             let start = Instant::now();
@@ -10339,7 +11120,11 @@ mod promotion_driver_tests {
             "no failure gap while the cleanup pends: {:?}",
             gaps(&mut driver)
         );
-        assert_eq!(mint_polls.load(Ordering::SeqCst), 0, "no mint while the detach pends");
+        assert_eq!(
+            mint_polls.load(Ordering::SeqCst),
+            0,
+            "no mint while the detach pends"
+        );
         assert_eq!(
             driver.retiring_domain(),
             Some(domain),
@@ -10370,19 +11155,11 @@ mod promotion_driver_tests {
         release_gate(&gate);
         driver.on_tick();
         assert_eq!(completes.get(), 1, "one joined receipt");
-        assert_eq!(
-            driver.retiring_domain(),
-            None,
-            "one retire after the join"
-        );
+        assert_eq!(driver.retiring_domain(), None, "one retire after the join");
         // The retired domain refuses through the audited path.
-        driver
-            .coordinator
-            .stage_semantic_batch(crate::inventory_semantics::SemanticBatch::scripted(
-                domain,
-                Vec::new(),
-                9,
-            ));
+        driver.coordinator.stage_semantic_batch(
+            crate::inventory_semantics::SemanticBatch::scripted(domain, Vec::new(), 9),
+        );
         assert!(
             gaps(&mut driver)
                 .iter()
@@ -10413,52 +11190,51 @@ mod promotion_driver_tests {
         // then the release joins and retires exactly once.
         {
             let mut coordinator = coordinator();
-        let headless = headless_display();
-        let mut driver = driver_with_display(&mut coordinator, headless.display);
-        let (io, gate) = WindDownIo::gated();
-        let submits = Rc::clone(&io.submits);
-        let polls = Rc::clone(&io.polls);
-        let completes = Rc::clone(&io.completes);
-        driver.semantic = Some(wind_down_lane(io));
-        let domain = install_promotion_for_wind_down(&mut driver);
-        quiesce_domain_for_retire(&mut *driver.coordinator, domain);
-        driver.wind_down_installed_promotion(PromotionEnd::Cancelled);
-        let (source, mint_polls, _) = CountingSource::scripted(Some(
-            SessionNativeCompletion::scripted(domain),
-        ));
-        driver.completion_source = Some(Box::new(source));
-        for _ in 0..10 {
-            let start = Instant::now();
-            driver.on_tick();
-            assert!(
-                start.elapsed() < Duration::from_secs(1),
-                "every pending tick returns within budget: {:?}",
-                start.elapsed()
+            let headless = headless_display();
+            let mut driver = driver_with_display(&mut coordinator, headless.display);
+            let (io, gate) = WindDownIo::gated();
+            let submits = Rc::clone(&io.submits);
+            let polls = Rc::clone(&io.polls);
+            let completes = Rc::clone(&io.completes);
+            driver.semantic = Some(wind_down_lane(io));
+            let domain = install_promotion_for_wind_down(&mut driver);
+            quiesce_domain_for_retire(&mut *driver.coordinator, domain);
+            driver.wind_down_installed_promotion(PromotionEnd::Cancelled);
+            let (source, mint_polls, _) =
+                CountingSource::scripted(Some(SessionNativeCompletion::scripted(domain)));
+            driver.completion_source = Some(Box::new(source));
+            for _ in 0..10 {
+                let start = Instant::now();
+                driver.on_tick();
+                assert!(
+                    start.elapsed() < Duration::from_secs(1),
+                    "every pending tick returns within budget: {:?}",
+                    start.elapsed()
+                );
+            }
+            assert_eq!(
+                driver.retiring_domain(),
+                Some(domain),
+                "the cleanup stays pending"
             );
-        }
-        assert_eq!(
-            driver.retiring_domain(),
-            Some(domain),
-            "the cleanup stays pending"
-        );
-        assert_eq!(mint_polls.load(Ordering::SeqCst), 0, "no mint while pending");
-        assert_eq!(submits.get(), 1, "one submit across sustained polls");
-        assert_eq!(polls.get(), 10, "every tick reaps");
-        assert!(
-            gaps(&mut driver)
-                .iter()
-                .all(|(subject, _)| subject != "selected lane native cleanup failed"),
-            "no failure gap across sustained pending: {:?}",
-            gaps(&mut driver)
-        );
+            assert_eq!(
+                mint_polls.load(Ordering::SeqCst),
+                0,
+                "no mint while pending"
+            );
+            assert_eq!(submits.get(), 1, "one submit across sustained polls");
+            assert_eq!(polls.get(), 10, "every tick reaps");
+            assert!(
+                gaps(&mut driver)
+                    .iter()
+                    .all(|(subject, _)| subject != "selected lane native cleanup failed"),
+                "no failure gap across sustained pending: {:?}",
+                gaps(&mut driver)
+            );
             release_gate(&gate);
             driver.on_tick();
             assert_eq!(completes.get(), 1, "one joined receipt");
-            assert_eq!(
-                driver.retiring_domain(),
-                None,
-                "one retire after the join"
-            );
+            assert_eq!(driver.retiring_domain(), None, "one retire after the join");
         }
         // Genuine-Err twin: a truly failed detach reports one gap,
         // stays Unproved with its owner kept, and still retires the
@@ -10475,9 +11251,8 @@ mod promotion_driver_tests {
         let domain = install_promotion_for_wind_down(&mut driver);
         quiesce_domain_for_retire(&mut *driver.coordinator, domain);
         driver.wind_down_installed_promotion(PromotionEnd::Cancelled);
-        let (source, _, _) = CountingSource::scripted(Some(
-            SessionNativeCompletion::scripted(domain),
-        ));
+        let (source, _, _) =
+            CountingSource::scripted(Some(SessionNativeCompletion::scripted(domain)));
         driver.completion_source = Some(Box::new(source));
         driver.on_tick();
         let failures: Vec<(String, String)> = gaps(&mut driver)
@@ -10490,9 +11265,10 @@ mod promotion_driver_tests {
             "exactly one failure gap: {:?}",
             gaps(&mut driver)
         );
-        assert!(
-            failures[0].1.contains("Unproved"),
-            "the gap names the Unproved detach: {:?}",
+        assert_eq!(
+            failures[0].1, "semantic_unavailable",
+            "the gap keeps the mapped refusal (the scripted Unproved \
+             detach maps to Unavailable at the lane): {:?}",
             failures[0].1
         );
         assert_eq!(polls.get(), 1, "a failed detach is never re-polled");
@@ -10502,13 +11278,9 @@ mod promotion_driver_tests {
             None,
             "the namespace still retires through the legacy downstream"
         );
-        driver
-            .coordinator
-            .stage_semantic_batch(crate::inventory_semantics::SemanticBatch::scripted(
-                domain,
-                Vec::new(),
-                9,
-            ));
+        driver.coordinator.stage_semantic_batch(
+            crate::inventory_semantics::SemanticBatch::scripted(domain, Vec::new(), 9),
+        );
         assert!(
             gaps(&mut driver)
                 .iter()
@@ -10561,7 +11333,11 @@ mod promotion_driver_tests {
             "the abandon records honestly: {:?}",
             gaps(&mut driver)
         );
-        assert_eq!(mint_polls.load(Ordering::SeqCst), 0, "no mint on the finite stop");
+        assert_eq!(
+            mint_polls.load(Ordering::SeqCst),
+            0,
+            "no mint on the finite stop"
+        );
         // A second stop never re-begins.
         driver.on_stop_requested();
         assert_eq!(driver.joint_begin_calls, 1, "the finish begins once");
@@ -10584,10 +11360,7 @@ mod promotion_driver_tests {
                 "a finished lane resumes at the wound-down phase"
             );
             driver.on_lane_stopped();
-            assert_eq!(
-                driver.joint_begin_calls, 1,
-                "a second hook never re-begins"
-            );
+            assert_eq!(driver.joint_begin_calls, 1, "a second hook never re-begins");
         }
         // Polling polls the finish: the attempt latches, the state stays.
         {
@@ -10611,15 +11384,14 @@ mod promotion_driver_tests {
                 "the step polled the finish"
             );
         }
-        // Published polls only the wound-down: the detach reaps, the
-        // finish stays untouched (an unfinished lane would latch).
+        // Published polls only the wound-down: the detach reaps.
         {
             let mut coordinator = coordinator();
             let headless = headless_display();
             let mut driver = driver_with_display(&mut coordinator, headless.display);
             let (io, gate) = WindDownIo::gated();
             let polls = Rc::clone(&io.polls);
-            driver.semantic = Some(joint_lane(io, false));
+            driver.semantic = Some(joint_lane(io, true));
             driver.joint_finish = JointFinishDriver::Published;
             driver.on_lane_stopped();
             assert_eq!(
@@ -10628,20 +11400,35 @@ mod promotion_driver_tests {
                 "a pending detach stays published"
             );
             assert_eq!(polls.get(), 1, "the step reaped the detach");
-            assert!(
-                !driver
-                    .semantic
-                    .as_ref()
-                    .expect("lane")
-                    .joint_finish_disposition_required(),
-                "the step never polled the finish"
-            );
+            assert_eq!(driver.joint_step_calls, 1, "the hook stepped once");
             // The joined detach completes the final lane.
             release_gate(&gate);
             driver.on_lane_stopped();
+            assert!(driver.semantic.is_none(), "the wound-down lane completes");
+        }
+        // Published implies finished: an unfinished lane fails closed
+        // through the wound-down poll (a finish poll would have
+        // latched and stayed, so the divergence proves which poll ran).
+        {
+            let mut coordinator = coordinator();
+            let headless = headless_display();
+            let mut driver = driver_with_display(&mut coordinator, headless.display);
+            let mut io = WindDownIo::completing();
+            let drops = Rc::new(Cell::new(0));
+            io.drop_spy = Some(Rc::clone(&drops));
+            driver.semantic = Some(joint_lane(io, false));
+            driver.joint_finish = JointFinishDriver::Published;
+            driver.on_lane_stopped();
+            assert_eq!(
+                driver.joint_finish,
+                JointFinishDriver::Abandoned,
+                "an unfinished Published lane abandons through the wound-down poll"
+            );
+            assert!(driver.semantic.is_none(), "the lane is held");
+            assert_eq!(drops.get(), 0, "held means never dropped");
             assert!(
-                driver.semantic.is_none(),
-                "the wound-down lane completes"
+                driver.joint_first_error.is_some(),
+                "the first error is kept"
             );
         }
     }
@@ -10653,7 +11440,7 @@ mod promotion_driver_tests {
         let mut driver = driver_with_display(&mut coordinator, headless.display);
         let (io, gate) = WindDownIo::gated();
         let polls = Rc::clone(&io.polls);
-        driver.semantic = Some(joint_lane(io, false));
+        driver.semantic = Some(joint_lane(io, true));
         driver.joint_finish = JointFinishDriver::Published;
         queue_request(driver.display.as_mut().expect("display"));
         let ticks_before = driver.display.as_ref().expect("display").account().ticks;
@@ -10666,14 +11453,7 @@ mod promotion_driver_tests {
             "a pending detach never triggers the finite stop"
         );
         assert_eq!(polls.get(), 8, "every hook reaped the detach");
-        assert!(
-            !driver
-                .semantic
-                .as_ref()
-                .expect("lane")
-                .joint_finish_disposition_required(),
-            "no hook polled the finish"
-        );
+        assert_eq!(driver.joint_step_calls, 8, "every hook stepped once");
         assert_eq!(
             driver.display.as_ref().expect("display").account().ticks,
             ticks_before + 8,
@@ -10699,7 +11479,10 @@ mod promotion_driver_tests {
     #[test]
     fn joint_driver_disposition_required_triggers_finite_stop() {
         use crate::inventory_semantics::SemanticRefusal;
-        for reason in [SemanticRefusal::Unavailable, SemanticRefusal::ProviderStorage] {
+        for reason in [
+            SemanticRefusal::Unavailable,
+            SemanticRefusal::ProviderStorage,
+        ] {
             // The Q-mismatch twin latches Unavailable, the
             // storage-bound twin ProviderStorage; both abandon.
             let mut coordinator = coordinator();
@@ -10726,7 +11509,11 @@ mod promotion_driver_tests {
                 driver.joint_first_error.is_some(),
                 "the first error is kept: {reason:?}"
             );
-            assert_eq!(mint_polls.load(Ordering::SeqCst), 0, "no mint on abandon: {reason:?}");
+            assert_eq!(
+                mint_polls.load(Ordering::SeqCst),
+                0,
+                "no mint on abandon: {reason:?}"
+            );
             assert!(
                 gaps(&mut driver)
                     .iter()
@@ -10747,7 +11534,7 @@ mod promotion_driver_tests {
         let polls = Rc::clone(&io.polls);
         let drops = Rc::new(Cell::new(0));
         io.drop_spy = Some(Rc::clone(&drops));
-        driver.semantic = Some(joint_lane(io, false));
+        driver.semantic = Some(joint_lane(io, true));
         driver.joint_finish = JointFinishDriver::Published;
         let (source, mint_polls, _) = CountingSource::scripted(None);
         driver.completion_source = Some(Box::new(source));
@@ -10791,10 +11578,7 @@ mod promotion_driver_tests {
         io.drop_spy = Some(Rc::clone(&drops));
         driver.retiring = Some(RetiringDomain::winding(joint_lane(io, false), true));
         driver.on_tick();
-        assert_eq!(
-            driver.joint_begin_calls, 0,
-            "a refused commit never begins"
-        );
+        assert_eq!(driver.joint_begin_calls, 0, "a refused commit never begins");
         let winding = driver
             .retiring
             .as_ref()
@@ -10922,9 +11706,8 @@ mod promotion_driver_tests {
                 !driver.coordinator.promotion_finish(),
                 "the flag starts clear"
             );
-            let (source, _, _) = CountingSource::scripted(Some(
-                SessionNativeCompletion::scripted(domain),
-            ));
+            let (source, _, _) =
+                CountingSource::scripted(Some(SessionNativeCompletion::scripted(domain)));
             driver.completion_source = Some(Box::new(source));
             driver.wind_down_installed_promotion(PromotionEnd::Cancelled);
             assert!(
@@ -10955,11 +11738,7 @@ mod promotion_driver_tests {
                 .expect("lane")
                 .set_test_joint_frame(false);
             driver.on_tick();
-            assert_eq!(
-                driver.retiring_domain(),
-                None,
-                "A retires once drained"
-            );
+            assert_eq!(driver.retiring_domain(), None, "A retires once drained");
             assert!(
                 !driver.coordinator.promotion_finish(),
                 "the flag clears only after A's retire"
@@ -10997,9 +11776,8 @@ mod promotion_driver_tests {
         driver.semantic = Some(joint_lane(io, true));
         let domain = install_promotion_for_wind_down(&mut driver);
         quiesce_domain_for_retire(&mut *driver.coordinator, domain);
-        let (source, _, _) = CountingSource::scripted(Some(
-            SessionNativeCompletion::scripted(domain),
-        ));
+        let (source, _, _) =
+            CountingSource::scripted(Some(SessionNativeCompletion::scripted(domain)));
         driver.completion_source = Some(Box::new(source));
         driver.wind_down_installed_promotion(PromotionEnd::Cancelled);
         assert!(
@@ -11031,8 +11809,7 @@ mod promotion_driver_tests {
             gaps(&mut driver)
         );
         assert_eq!(
-            stops[0].1,
-            "process exits after the last inventory scan were not retired at the stop",
+            stops[0].1, "process exits after the last inventory scan were not retired at the stop",
             "the gap carries the exact reason"
         );
         // The kept finish still completes: polls continue, the join
@@ -11080,17 +11857,25 @@ mod promotion_driver_tests {
         let mut driver = driver_with_display(&mut coordinator, headless.display);
         driver.semantic = Some(wind_down_lane(WindDownIo::completing()));
         let domain = install_promotion_for_wind_down(&mut driver);
-        driver.coordinator.stage_semantic_batch(
-            crate::inventory_semantics::SemanticBatch::scripted(domain, Vec::new(), 1),
-        );
-        driver.coordinator.finalize_semantic_batches(None);
-        // The finalized batch staged h3: the seal-drained retire
+        quiesce_domain_for_retire(&mut *driver.coordinator, domain);
+        driver.wind_down_installed_promotion(PromotionEnd::Cancelled);
+        assert_eq!(driver.retiring_domain(), Some(domain));
+        // The terminal commit staged h3: the seal-drained retire
         // holds on it while the shared gate does not.
         assert!(
             !driver.coordinator.joint_domain_has_pending_work(domain),
             "h3 does not hold the shared wind-down gate"
         );
-        let lane = driver.semantic.as_ref().expect("lane");
+        let lane = driver
+            .retiring
+            .as_ref()
+            .expect("retiring")
+            .winding
+            .as_ref()
+            .expect("winding")
+            .lane
+            .as_ref()
+            .expect("lane");
         assert!(!lane.has_joint_frame(), "a legacy lane stays frameless");
         let (completion, refusal) = driver
             .coordinator
@@ -11098,11 +11883,8 @@ mod promotion_driver_tests {
             .expect_err("h3 is staged");
         assert_eq!(refusal, JointRetireRefusal::PendingWork);
         assert_eq!(completion.domain(), domain);
-        driver.wind_down_installed_promotion(PromotionEnd::Cancelled);
-        assert_eq!(driver.retiring_domain(), Some(domain));
-        let (source, _, _) = CountingSource::scripted(Some(
-            SessionNativeCompletion::scripted(domain),
-        ));
+        let (source, _, _) =
+            CountingSource::scripted(Some(SessionNativeCompletion::scripted(domain)));
         driver.completion_source = Some(Box::new(source));
         driver.on_tick();
         assert_eq!(
@@ -11110,13 +11892,9 @@ mod promotion_driver_tests {
             None,
             "the legacy lane retires with its h3 dropped"
         );
-        driver
-            .coordinator
-            .stage_semantic_batch(crate::inventory_semantics::SemanticBatch::scripted(
-                domain,
-                Vec::new(),
-                9,
-            ));
+        driver.coordinator.stage_semantic_batch(
+            crate::inventory_semantics::SemanticBatch::scripted(domain, Vec::new(), 9),
+        );
         assert!(
             gaps(&mut driver)
                 .iter()
@@ -11182,6 +11960,17 @@ mod promotion_driver_tests {
             pending_install: None,
             installed_promotion: None,
             retiring: None,
+            joint_finish: JointFinishDriver::NotBegun,
+            stop_requested: false,
+            joint_first_error: None,
+            #[cfg(test)]
+            terminal_seq_calls: 0,
+            #[cfg(test)]
+            reclaim_calls: Vec::new(),
+            #[cfg(test)]
+            joint_begin_calls: 0,
+            #[cfg(test)]
+            joint_step_calls: 0,
         };
         driver.on_tick();
         assert!(driver.lifecycle.is_idle());

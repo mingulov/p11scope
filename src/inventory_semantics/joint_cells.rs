@@ -250,9 +250,8 @@ const ALL_EVENTS: [JointEvent; 10] = [
 /// adds their tests. No ignored tests: a missing identifier fails.
 #[test]
 fn joint_cells_name_existing_tests() {
-    const MACHINE: &str = include_str!(
-        "../semantic_capture/tests/custody_chain_tests/joint_cells_machine.rs"
-    );
+    const MACHINE: &str =
+        include_str!("../semantic_capture/tests/custody_chain_tests/joint_cells_machine.rs");
     const NATIVE: &str = include_str!("../attach/joint_cells_native_tests.rs");
     const DRIVER: &str = include_str!("../inventory_joint_cells_tests.rs");
     fn state_id(state: JointState) -> &'static str {
@@ -301,11 +300,7 @@ fn joint_cells_name_existing_tests() {
                 panic!("unconstructible pairs stay out of the table")
             }
         };
-        let id = format!(
-            "joint_cell_{}_{}",
-            state_id(*state),
-            event_id(*event)
-        );
+        let id = format!("joint_cell_{}_{}", state_id(*state), event_id(*event));
         assert!(
             file.contains(&id),
             "{state:?}×{event:?} ({home_name}): the home file lacks `{id}`"

@@ -299,6 +299,39 @@ static void check_admit_exhaustion_latches(void)
            (unsigned long long)ctl.spent);
 }
 
+static void check_reserve(void)
+{
+    struct journal_admission_control ctl = {0, 0};
+
+    /* Below the cap, a reservation spends exactly one permit. */
+    EXPECT(p11_journal_marker_reserve(&ctl) == 1, "reserve spends below the cap");
+    EXPECT(ctl.spent == 1 && ctl.failed == 0, "one permit spent, no latch");
+    /* At CAP-1, one reservation wins and the next latches. */
+    ctl.spent = P11_JOURNAL_MARKER_ADMIT_CAP - 1;
+    ctl.failed = 0;
+    EXPECT(p11_journal_marker_reserve(&ctl) == 1, "the CAP-th permit spends");
+    EXPECT(ctl.spent == P11_JOURNAL_MARKER_ADMIT_CAP && ctl.failed == 0,
+           "cap reached unlatched");
+    EXPECT(p11_journal_marker_reserve(&ctl) == 0, "past-cap reserve refuses");
+    EXPECT(ctl.failed == 1, "cap refusal trips the failed latch");
+    EXPECT(ctl.spent == P11_JOURNAL_MARKER_ADMIT_CAP, "cap refusal spends nothing");
+    /* A reserve after the latch refuses and spends nothing. */
+    EXPECT(p11_journal_marker_reserve(&ctl) == 0, "latched reserve refuses");
+    EXPECT(ctl.spent == P11_JOURNAL_MARKER_ADMIT_CAP, "latched refusal spends nothing");
+    /* 32 lost CAS tries latch, mirroring the admission exhaustion probe. */
+    ctl.spent = 0;
+    ctl.failed = 0;
+    cas_victim = &ctl.spent;
+    cas_losses_remaining = 32;
+    EXPECT(p11_journal_marker_reserve(&ctl) == 0, "exhausted reserve refuses");
+    EXPECT(ctl.spent == 32, "32 lost races advanced spent, got %llu",
+           (unsigned long long)ctl.spent);
+    EXPECT(ctl.failed == 1, "exhaustion latches failed permanently");
+    cas_victim = NULL;
+    /* NULL control refuses without latching anywhere. */
+    EXPECT(p11_journal_marker_reserve(0) == 0, "NULL reserve fails");
+}
+
 static void check_null_closed(void)
 {
     u64 exec = 0;
@@ -375,6 +408,7 @@ int main(void)
     check_publish_and_read();
     check_dirty_sticks();
     check_admit();
+    check_reserve();
     check_admit_race();
     check_admit_exhaustion_latches();
     check_null_closed();

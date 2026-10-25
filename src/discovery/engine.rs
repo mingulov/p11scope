@@ -14313,6 +14313,13 @@ impl Engine {
         additions_allowed: &mut bool,
         pending_views: &mut PendingViewRetirements,
     ) -> Result<DiscoveryRecordOutcome> {
+        if self.collected_finish_actions.is_some() {
+            self.mark_partial(
+                "live export discovery",
+                "a publication lowered after the terminal stop was not admitted; its objects were not pinned",
+            );
+            return Ok(DiscoveryRecordOutcome::applied(false, false));
+        }
         #[cfg(test)]
         crate::first_use_probe::publication_validated(&self.views[position], &lowered, hook_ts_ns);
         let (pins, pin_skips) = {

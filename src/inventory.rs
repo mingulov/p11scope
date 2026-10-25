@@ -31,8 +31,9 @@ use crate::inventory_capture::run_classic;
 use crate::inventory_capture::{
     BlockDisposition, CgroupJobFailure, ClassicCompletion, ClassicOutcome, CollectJob,
     CollectedPass, ExitRelease, ExitRetention, FacadeLane, LaneSummary, LaneWindows, LoopClock,
-    NativeLane, PassDriver, Publish, RetainedBlock, RetainedClassicRun, RetainedWorkBudget,
-    SERVICE_TICK, Stopped, ZeroPassStop, poll_retained_classic, run_classic_finalizing,
+    NativeLane, PassCommitProgress, PassDriver, Publish, RetainedBlock, RetainedClassicRun,
+    RetainedWorkBudget, SERVICE_TICK, Stopped, ZeroPassStop, poll_retained_classic,
+    run_classic_finalizing,
 };
 use crate::inventory_dashboard::{
     DashboardIo, Display, DisplayAccount, RESCAN_INTERVAL, RESTORE_RETRY_BUDGET, StderrRoute,
@@ -2024,9 +2025,9 @@ struct ClassicDriver<'a> {
     /// by the consumer on retention; never cleared.
     suspended: bool,
     /// A Joint commit is begun but unpublished (§6.1, §6.3): the
-    /// retained finish step polls it instead of beginning. R1.4 runs
-    /// no commits, so production never sets this; the R1.5 commit
-    /// path owns it and tests pose it directly.
+    /// retained finish step polls it instead of beginning.
+    /// `poll_commit` sets it on begin and clears it on publication;
+    /// tests pose it directly.
     joint_commit_pending: bool,
     /// Storage-retryable commit refusals on the final lane's
     /// retained step (§8.3 item 7): ProviderStorage retries up to
@@ -3381,11 +3382,66 @@ impl ClassicDriver<'_> {
         }
     }
 
+    /// One running-pass Joint commit poll (§9 item 3): begin once
+    /// per publication (only the first call carries the applied
+    /// engine change), then poll until it publishes. A lane with no
+    /// machine to begin on commits the legacy way, like D5's Err
+    /// path (production Joint lanes always carry their machine
+    /// here; only substituted lanes arrive machineless, and the
+    /// retained pump needs their progress-or-pend, never an error it
+    /// would resolve and re-raise forever). Other begin refusals
+    /// fail the call with no poll; an outstanding demand without the
+    /// flag repairs the flag and resumes polling. A refused poll
+    /// propagates: the retained consumer owns the outcome.
+    fn poll_joint_commit_path(
+        &mut self,
+        engine_changed: bool,
+    ) -> Result<PassCommitProgress> {
+        use crate::inventory_semantics::JointCommitRefusal;
+        if !self.joint_commit_pending {
+            let begin = {
+                let lane = self.semantic.as_mut().expect("a joint lane is seated");
+                lane.begin_joint_commit(engine_changed)
+            };
+            match begin {
+                Ok(()) => self.joint_commit_pending = true,
+                Err(JointCommitRefusal::NotInitialized) => {
+                    return self.commit(engine_changed).map(|()| PassCommitProgress::Published);
+                }
+                Err(JointCommitRefusal::OutstandingRequest) => {
+                    self.joint_commit_pending = true;
+                }
+                Err(refusal) => {
+                    anyhow::bail!("joint commit begin refused: {refusal:?}");
+                }
+            }
+        }
+        #[cfg(test)]
+        {
+            self.joint_commit_polls += 1;
+        }
+        let mut budget = crate::inventory_semantics::JointWorkBudget {
+            remaining_actions: 1024,
+            deadline: Instant::now() + Duration::from_millis(10),
+        };
+        let (coordinator, semantic) = (&mut *self.coordinator, &mut self.semantic);
+        let lane = semantic.as_mut().expect("a joint lane is seated");
+        let progress = lane.poll_joint_commit(coordinator, &mut budget);
+        match progress {
+            Ok(JointCommitProgress::Published(_)) => {
+                self.joint_commit_pending = false;
+                Ok(PassCommitProgress::Published)
+            }
+            Ok(JointCommitProgress::Pending) => Ok(PassCommitProgress::Pending),
+            Err(reason) => Err(anyhow::anyhow!("joint commit poll refused: {reason}")),
+        }
+    }
+
     /// One NotBegun promotion step (item 7): poll the pending commit.
-    /// R1.4 runs no commits, so Published and Pending both begin the
-    /// finish (T16b refines Pending with its publication query); a
-    /// retryable refusal stays, anything else notes the failure and
-    /// takes the finite stop. Never retires directly.
+    /// Running passes begin through poll_commit; Published begins the
+    /// finish while Pending stays (T16b refines Pending with its
+    /// publication query); a retryable refusal stays, anything else
+    /// notes the failure and takes the finite stop. Never retires directly.
     /// One NotBegun §8.3 step over an explicit lane slot (§6.1,
     /// §6.3): poll the pending commit — stay while it pends, begin
     /// once it publishes — or fail the finish through I2 on a
@@ -4388,6 +4444,21 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
         })
     }
 
+    /// T18 (§9 item 3): a Joint lane publishes through its machine
+    /// (begin once per publication, then poll); a legacy lane keeps
+    /// today's sync commit plus Published.
+    fn poll_commit(&mut self, engine_changed: bool) -> Result<PassCommitProgress> {
+        if self
+            .semantic
+            .as_ref()
+            .is_some_and(|lane| lane.has_joint_machine())
+        {
+            return self.poll_joint_commit_path(engine_changed);
+        }
+        self.commit(engine_changed)?;
+        Ok(PassCommitProgress::Published)
+    }
+
     fn finish_pass(&mut self, report: &mut PassReport) -> Result<()> {
         if let Some(cgroup) = &mut self.cgroup {
             let completion = self.coordinator.take_cgroup_completion().ok_or_else(|| {
@@ -4449,6 +4520,31 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
             return;
         }
         self.poll_promotion();
+        // T18 (§9 item 4): an initialized Joint lane services its
+        // machine every hook instead of the staged commit and
+        // `lane.tick` below. The staged flag never suppresses this
+        // service: it gates only fresh legacy collection.
+        if self
+            .semantic
+            .as_ref()
+            .is_some_and(|lane| lane.has_joint_machine())
+        {
+            let mut budget = crate::inventory_semantics::JointWorkBudget {
+                remaining_actions: 1024,
+                deadline: Instant::now() + Duration::from_millis(10),
+            };
+            let (coordinator, semantic) = (&mut *self.coordinator, &mut self.semantic);
+            if let Some(lane) = semantic.as_mut() {
+                // The machine owns its latch and retries; a refused
+                // hook simply services again on the next tick.
+                let _ = lane.service_joint(
+                    coordinator,
+                    crate::inventory_semantics::JointServiceMode::Running,
+                    &mut budget,
+                );
+            }
+            return;
+        }
         // Bound the wait for staged evidence even when collection runs
         // long. Failed commits retry at the next staleness deadline
         // instead of gap-spamming.
@@ -12489,46 +12585,79 @@ mod tests {
     }
 
     #[test]
+    fn joint_poll_commit_absent_machine_falls_back_to_legacy() {
+        // No live machine (the natural NotInitialized): a Joint-marked
+        // lane with nothing to begin on commits the legacy way, like
+        // D5's Err path, so the retained pump keeps progress-or-pend.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let lane = joint_lane(WindDownIo::completing(), false);
+        driver.semantic = Some(lane);
+        let outcome = driver.poll_commit(true);
+        assert!(
+            matches!(
+                outcome,
+                Ok(crate::inventory_capture::PassCommitProgress::Published)
+            ),
+            "the fallback publishes at once"
+        );
+        assert_eq!(driver.commit_calls, 1, "one legacy commit runs");
+        assert!(
+            !driver.joint_commit_pending,
+            "the fallback pends nothing"
+        );
+        assert_eq!(
+            driver
+                .semantic
+                .as_ref()
+                .expect("lane stays seated")
+                .joint_commit_begin_calls_for_test(),
+            1,
+            "the begin is attempted once"
+        );
+        assert_eq!(
+            driver.joint_commit_polls, 0,
+            "the fallback never polls"
+        );
+    }
+
+    #[test]
     fn joint_poll_commit_begin_refusal_fails_without_polling() {
-        // The natural refusal (no live machine: NotInitialized) and
-        // the scripted DispositionRequired twin share one mapping:
-        // the begin error fails the call with no poll and no flag.
-        for scripted in [
-            None,
-            Some(Err(
-                crate::inventory_semantics::JointCommitRefusal::DispositionRequired,
-            )),
-        ] {
-            let mut coordinator = coordinator();
-            let headless = headless_display();
-            let mut driver = driver_with_display(&mut coordinator, headless.display);
-            let mut lane = joint_lane(WindDownIo::completing(), false);
-            lane.set_scripted_joint_begin_for_test(scripted);
-            driver.semantic = Some(lane);
-            let outcome = driver.poll_commit(true);
-            assert!(outcome.is_err(), "a refused begin fails the call");
-            assert!(
-                !driver.joint_commit_pending,
-                "a refused begin pends nothing"
-            );
-            assert_eq!(
-                driver
-                    .semantic
-                    .as_ref()
-                    .expect("lane stays seated")
-                    .joint_commit_begin_calls_for_test(),
-                1,
-                "the begin is attempted once"
-            );
-            assert_eq!(
-                driver.joint_commit_polls, 0,
-                "a refused begin never polls"
-            );
-            assert_eq!(
-                driver.commit_calls, 0,
-                "no legacy commit on the Joint path"
-            );
-        }
+        // A machine that refuses its begin (DispositionRequired) fails
+        // the call with no poll, no flag and no legacy commit: the
+        // retained consumer owns the outcome.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let mut lane = joint_lane(WindDownIo::completing(), false);
+        lane.set_scripted_joint_begin_for_test(Some(Err(
+            crate::inventory_semantics::JointCommitRefusal::DispositionRequired,
+        )));
+        driver.semantic = Some(lane);
+        let outcome = driver.poll_commit(true);
+        assert!(outcome.is_err(), "a refused begin fails the call");
+        assert!(
+            !driver.joint_commit_pending,
+            "a refused begin pends nothing"
+        );
+        assert_eq!(
+            driver
+                .semantic
+                .as_ref()
+                .expect("lane stays seated")
+                .joint_commit_begin_calls_for_test(),
+            1,
+            "the begin is attempted once"
+        );
+        assert_eq!(
+            driver.joint_commit_polls, 0,
+            "a refused begin never polls"
+        );
+        assert_eq!(
+            driver.commit_calls, 0,
+            "no legacy commit past a refusing machine"
+        );
     }
 
     #[test]

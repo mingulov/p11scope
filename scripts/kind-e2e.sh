@@ -166,7 +166,7 @@ self_test() {
         'LEDGER {"schema":"p11scope/public-cli-ledger/v1","pid":1,"complete":true,"functions":[{"name":"C_GenerateRandom","attempts":400,"successful":400},{"name":"C_DigestInit","attempts":400,"successful":400},{"name":"C_Digest","attempts":400,"successful":400},{"name":"C_FindObjectsInit","attempts":400,"successful":400},{"name":"C_FindObjects","attempts":400,"successful":400},{"name":"C_FindObjectsFinal","attempts":400,"successful":400}]}' \
         > "$ledger_stub/good.log"
     printf '%s\n' 'READY pid=1' 'LEDGER iterations=400 nonzero_rv=0' > "$ledger_stub/legacy.log"
-    printf '%s\n' 'LEDGER {"schema":"p11scope/public-cli-ledger/v1","pid":1,"complete":false,"functions":[]}' \
+    printf '%s\n' 'READY pid=1' 'LEDGER {"schema":"p11scope/public-cli-ledger/v1","pid":1,"complete":false,"functions":[{"name":"C_GenerateRandom","attempts":400,"successful":400},{"name":"C_DigestInit","attempts":400,"successful":400},{"name":"C_Digest","attempts":400,"successful":400},{"name":"C_FindObjectsInit","attempts":400,"successful":400},{"name":"C_FindObjects","attempts":400,"successful":400},{"name":"C_FindObjectsFinal","attempts":400,"successful":400}]}' \
         > "$ledger_stub/incomplete.log"
     printf '%s\n' 'LEDGER {"schema":"p11scope/public-cli-ledger/v1","pid":1,"complete":true,"functions":[{"name":"C_GenerateRandom","attempts":399,"successful":399}]}' \
         > "$ledger_stub/short.log"

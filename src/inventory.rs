@@ -3485,8 +3485,9 @@ impl ClassicDriver<'_> {
         if joint {
             // A's promotion finish (§8.6): the flag sets before a
             // fresh begin; the whole lane winds down in its retiring
-            // domain. An in-flight finish keeps its state and its
-            // flag and transfers into the winding.
+            // domain. An in-flight finish keeps its state and
+            // transfers into the winding; the flag stays clear (a
+            // transferred finish is not A's promotion finish).
             let mut retiring = RetiringDomain::winding(lane, true);
             if matches!(self.joint_finish, JointFinishDriver::NotBegun) {
                 self.coordinator.set_promotion_finish(true);

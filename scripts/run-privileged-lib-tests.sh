@@ -40,9 +40,8 @@
 #     0 unrelated mapping ops/s): optional Task 3 Stage A sizing knobs with
 #     defaults; the runner leaves them unset.
 #   P11SCOPE_COUNTER_BANK_FIXTURE_PROVIDER / _WORKLOAD: prebuilt LP64
-#     fixtures for the separately selected Counts-bank Session test. It also
-#     requires a P11SCOPE_COUNTER_BANK_PROOF=1 libtest build; the runner does
-#     not build or supply these inputs, so that cell is a documented skip.
+#     fixtures for the default-build Counts-bank Session test. The runner
+#     does not build or supply these inputs, so that cell is a documented skip.
 #   P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER / _WORKLOAD: distinct8192
 #     endpoint LP64 provider/driver for separately admitted boundary/population
 #     cells; the default campaign neither builds nor supplies these inputs.
@@ -383,6 +382,7 @@ attach::identity_iter::tests::privileged_identity_nonleader_anchor_installs_noth
 # Zombie survivor collision parity: needs root Btrfs disk TMPDIR and
 # eligible BTF/task_vma identity, run by hand.
 discovery::sweep_attribution::tests::d4_zombie_cells::privileged_d4_btrfs_zombie_leader_collision_and_dataonly_twins
+attach::counter_banks::tests::counter_bank_mode_objects_load_lp64
 )
 SKIP_REASONS=(
 "needs punch-hole support under TMPDIR (btrfs/ext4/xfs; tmpfs refuses); no BPF-independent probe: run by hand as root: TMPDIR=<hole-capable dir> <binary> --exact <path> --ignored"
@@ -402,20 +402,20 @@ SKIP_REASONS=(
 "needs a separately reviewed native stage via P11SCOPE_ROOT_RUNTIME_STAGE (provider.so, driver, provider.json); the test documents no runtime skip"
 "needs TMPDIR on btrfs (it asserts the statfs magic) plus a kernel-identity-capable host (BTF, task_iter pidfd); run by hand as root: TMPDIR=<btrfs dir> <binary> --exact <path> --ignored"
 "needs TMPDIR on btrfs (it asserts the statfs magic) plus a kernel-identity-capable host (BTF, task_iter pidfd); run by hand as root: TMPDIR=<btrfs dir> <binary> --exact <path> --ignored"
-"needs a P11SCOPE_COUNTER_BANK_PROOF=1 libtest build and explicitly prebuilt LP64 fixtures via P11SCOPE_COUNTER_BANK_FIXTURE_PROVIDER/P11SCOPE_COUNTER_BANK_FIXTURE_WORKLOAD; run the exact ignored test as root in an authorized BPF lane"
+"needs a default libtest build with embedded counter objects and explicitly prebuilt LP64 fixtures via P11SCOPE_COUNTER_BANK_FIXTURE_PROVIDER/P11SCOPE_COUNTER_BANK_FIXTURE_WORKLOAD; run the exact ignored test as root in an authorized BPF lane"
 "requires explicit controller-granted host measurement; spawns bounded child probes for the final multi-profile large4096 registry measurement, so schedule under a separate authorized measurement plan"
 "requires explicit controller-granted host measurement; spawns bounded child probes for the multi-profile large4096 registry measurement, so schedule under a separate authorized measurement plan"
 "requires explicit controller-granted host measurement; spawns bounded reducer-profile probes with at most 32 edges per profile, so schedule under a separate authorized measurement plan"
 "known-failing repro (doc Known limit 2026-10-19: lane-A runtime does not converge, the rotation stalls); rerun by hand as root after the runtime fix: <binary> --exact <path> --ignored --test-threads=1 --nocapture"
 "known-failing repro (doc Known limit: same lane-A view-capacity stall, post-settle refusal asserts unreachable until the runtime fix); rerun by hand as root after the runtime fix: <binary> --exact <path> --ignored --test-threads=1 --nocapture"
 "needs root Btrfs disk TMPDIR and eligible BTF/task_vma identity; actual before-unlink positive and deleted-mapping negative; no compiler/provider fixture; run exact ignored test in an authorized BPF lane"
-"pure constructor test needs selected P11SCOPE_COUNTER_BANK_PROOF=1 V2 artifact; no native syscall or root needed; run exact --ignored from that configured libtest"
-"pure constructor accounting test needs selected P11SCOPE_COUNTER_BANK_PROOF=1 V2 artifact; no native syscall or root needed; run exact --ignored from that configured libtest"
-"needs selected V2 proof build and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER/_WORKLOAD; separate authorized 513-endpoint native admission after resource preflight"
-"needs selected V2 proof build and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER/_WORKLOAD; separate authorized 8192-endpoint native FD/memory admission after boundary pilot"
+"pure constructor test needs the default build with the embedded V2 artifact; no native syscall or root needed; run exact --ignored from that libtest"
+"pure constructor accounting test needs the default build with the embedded V2 artifact; no native syscall or root needed; run exact --ignored from that libtest"
+"needs the default build with embedded V2 objects and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER/_WORKLOAD; separate authorized 513-endpoint native admission after resource preflight"
+"needs the default build with embedded V2 objects and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER/_WORKLOAD; separate authorized 8192-endpoint native FD/memory admission after boundary pilot"
 "needs root Btrfs disk TMPDIR and eligible task_vma/BTF for required actual hardlink alias kernel/userspace parity; run exact selector with --ignored --test-threads=1 on a matching prebuilt binary"
 "needs root/CAP_SYS_ADMIN, private child mount namespaces, Btrfs disk TMPDIR and eligible task_vma/BTF; actual bind alias parity requires a separately admitted exact ignored run with unchanged parent mounts"
-"needs proof1/artifacts0 prebuilt libtest and growth provider/workload inputs; explicit Multi PID-filter capability and separately admitted 513-endpoint native FD/memory/cleanup qualification, preserving required Singles coverage"
+"needs the default prebuilt libtest with embedded V2 objects and growth provider/workload inputs; explicit Multi PID-filter capability and separately admitted 513-endpoint native FD/memory/cleanup qualification, preserving required Singles coverage"
 "needs root/proc access, Btrfs disk TMPDIR and eligible task_vma/BTF; explicit live nonleader/shared-and-private FD-table parity with owned re-exec helpers, separately admitted exact ignored run"
 "private entrypoint re-executed only by the owned live-thread/private-files parity fixture; missing owned configuration fails and this helper never qualifies independently"
 "needs qualified Multi513 pilot, proof1/artifacts0 prebuilt libtest and growth provider/workload inputs; separately admitted 8192-endpoint FD/memory/native qualification with unchanged ledger/N+1/cleanup/deadline assertions, preserving required Singles coverage"
@@ -426,6 +426,7 @@ SKIP_REASONS=(
 "RED by design (post-copy-up D-C7-3 re-edge stands; investigation target, never qualifies): run by hand as root to reproduce: <binary> --exact <path> --ignored --test-threads=1 --nocapture"
 "needs root with a live nonleader thread for the TID-scoped anchor run (strict BPF load, installs nothing live); run the exact ignored test by hand as root in an authorized BPF lane with --test-threads=1 --nocapture"
 "needs root Btrfs disk TMPDIR and eligible BTF/task_vma identity; zombie survivor collision parity; run the exact ignored test by hand as root in an authorized BPF lane with --test-threads=1 --nocapture"
+"needs the default build with embedded counter objects; run exact --ignored as root in an authorized BPF lane with LP64 map/program load and uprobe_multi"
 )
 
 # Wide-Detailed campaign: the ignored tests that exist only in a

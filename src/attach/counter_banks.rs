@@ -290,6 +290,37 @@ fn production_geometry(outputs: &str) -> Result<CountsBankGeometry, BankRefusal>
     }
 }
 
+/// Deterministic build gate, checked before the kernel probe: omitted
+/// counter objects (`=0`, SMALL, WIDE) and WIDE builds refuse every mode
+/// with `counter-mode-unavailable-in-build`. P0 and unsafe-compiled builds
+/// embed identical bytes and pass.
+fn check_counter_build(enabled: &str, outputs: &str, wide: bool) -> Result<(), String> {
+    if enabled != "1" {
+        return Err("counter-mode-unavailable-in-build: this build omits counter objects".into());
+    }
+    if wide {
+        return Err(
+            "counter-mode-unavailable-in-build: wide-detailed-2112 builds omit counter objects"
+                .into(),
+        );
+    }
+    if outputs.is_empty() {
+        return Err("counter-mode-unavailable-in-build: counter objects were not emitted".into());
+    }
+    Ok(())
+}
+
+/// The embedded bank object for a counter mode. The Session pins its
+/// selected object bytes to this embedded copy; omitted builds carry empty
+/// statics and refuse through [`check_counter_build`] before any use.
+pub(crate) fn counter_object_for_mode(mode: CounterMode) -> &'static [u8] {
+    match mode {
+        CounterMode::Counts => crate::EBPF_COUNTER_COUNTS_OBJECT,
+        CounterMode::Timestamps => crate::EBPF_COUNTER_TIMESTAMPS_OBJECT,
+        CounterMode::Latency => crate::EBPF_COUNTER_LATENCY_OBJECT,
+    }
+}
+
 struct StagedExtent {
     transaction: NonZeroU64,
     commit: CountsBankCommit,
@@ -1498,6 +1529,15 @@ impl<'a> CounterPreparation<'a> {
         backend: super::AttachBackend,
         probe: impl FnOnce() -> BpfLoopVerdict,
     ) -> Result<Self> {
+        // Deterministic build checks run before the kernel probe, so a WIDE
+        // build on an old kernel reports the build refusal, not the kernel
+        // token. Omitted objects (`=0`, SMALL, WIDE) refuse every mode here.
+        check_counter_build(
+            env!("P11SCOPE_COUNTER_OBJECTS_ENABLED"),
+            env!("P11SCOPE_COUNTER_OBJECTS_OUTPUTS"),
+            cfg!(feature = "wide-detailed-2112"),
+        )
+        .map_err(|refusal| anyhow::anyhow!("{refusal}"))?;
         // The 8192 owner cleanup calls helper 181 (bpf_loop, Linux 5.17+):
         // a kernel proven to lack it cannot run counter bank objects, so
         // preparation refuses before charging anything. An unproven probe
@@ -1508,20 +1548,17 @@ impl<'a> CounterPreparation<'a> {
                 anyhow::bail!("counter-mode-unavailable-on-kernel: {reason}")
             }
         }
-        ensure!(
-            env!("P11SCOPE_COUNTER_BANK_PROOF_ENABLED") == "1",
-            "private Counts bank artifact was not selected at build time"
-        );
-        ensure!(
-            !cfg!(any(
-                feature = "unsafe-unvalidated-metadata",
-                feature = "wide-detailed-2112",
-                feature = "stub-object-attributes"
-            )),
-            "private Counts bank preparation requires its fixed artifact configuration"
-        );
-        let geometry = production_geometry(env!("P11SCOPE_COUNTER_BANK_PROOF_OUTPUTS"))
+        let geometry = production_geometry(env!("P11SCOPE_COUNTER_OBJECTS_OUTPUTS"))
             .map_err(|_| anyhow::anyhow!("unsupported private counter artifact profile"))?;
+        // The Session loads the embedded object for its mode: the selected
+        // bytes must equal the embedded bank object (growth geometry only;
+        // legacy has no embedded copy and never occurs in production).
+        if !geometry.is_legacy() {
+            ensure!(
+                object == counter_object_for_mode(CounterMode::Counts),
+                "selected counter object does not match the embedded bank object for its mode"
+            );
+        }
         let (retained, transient) = envelope
             .charges()
             .map_err(|_| anyhow::anyhow!("invalid counter reservation"))?;
@@ -6687,9 +6724,9 @@ pub(crate) mod tests {
     #[test]
     #[ignore = "requires the explicitly selected format2 artifact; parses only, no native load"]
     fn format2_preparation_rejects_mixed_profiles_before_lifecycle() {
-        assert_eq!(env!("P11SCOPE_COUNTER_BANK_PROOF_ENABLED"), "1");
+        assert_eq!(env!("P11SCOPE_COUNTER_OBJECTS_ENABLED"), "1");
         assert_eq!(
-            env!("P11SCOPE_COUNTER_BANK_PROOF_OUTPUTS"),
+            env!("P11SCOPE_COUNTER_OBJECTS_OUTPUTS"),
             "counts-bank-growth-v2,timestamps-bank-growth-v2,latency-bank-growth-v2"
         );
         let path = std::path::Path::new(env!("OUT_DIR"))
@@ -6769,9 +6806,9 @@ pub(crate) mod tests {
     #[test]
     #[ignore = "requires the explicitly selected format2 artifact; parses only, no native load"]
     fn format2_preparation_charges_custody_and_payload_together() {
-        assert_eq!(env!("P11SCOPE_COUNTER_BANK_PROOF_ENABLED"), "1");
+        assert_eq!(env!("P11SCOPE_COUNTER_OBJECTS_ENABLED"), "1");
         assert_eq!(
-            env!("P11SCOPE_COUNTER_BANK_PROOF_OUTPUTS"),
+            env!("P11SCOPE_COUNTER_OBJECTS_OUTPUTS"),
             "counts-bank-growth-v2,timestamps-bank-growth-v2,latency-bank-growth-v2"
         );
         let bytes = std::fs::read(
@@ -7005,26 +7042,142 @@ pub(crate) mod tests {
         }
     }
 
+    #[cfg(feature = "wide-detailed-2112")]
+    #[test]
+    fn counter_preparation_refuses_on_wide_build() {
+        use super::super::{AttachBackend, BpfLoopVerdict};
+        assert_eq!(env!("P11SCOPE_COUNTER_OBJECTS_ENABLED"), "0");
+        assert_eq!(env!("P11SCOPE_COUNTER_OBJECTS_OUTPUTS"), "");
+        let pool = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
+        let envelope = BankReservation {
+            retained_bytes: 1024 * 1024,
+            transient_bytes: 1024 * 1024,
+            metadata_bytes: 64 * 1024,
+            file_descriptors: 1024,
+        };
+        for verdict in [
+            BpfLoopVerdict::Available,
+            BpfLoopVerdict::Unavailable("needs Linux 5.17+".into()),
+        ] {
+            let Err(refusal) = CounterPreparation::new_with_backend_and_probe(
+                b"not an object",
+                envelope,
+                &pool.reserver(),
+                AttachBackend::Singles,
+                || verdict.clone(),
+            ) else {
+                panic!("wide builds must refuse preparation");
+            };
+            let message = format!("{refusal:#}");
+            assert!(
+                message.contains("counter-mode-unavailable-in-build"),
+                "{message}"
+            );
+        }
+    }
+
+    #[cfg(feature = "stub-object-attributes")]
+    #[test]
+    fn counter_preparation_stays_healthy_on_p0_build() {
+        use super::super::{AttachBackend, BpfLoopVerdict};
+        assert_eq!(env!("P11SCOPE_COUNTER_OBJECTS_ENABLED"), "1");
+        assert_eq!(
+            env!("P11SCOPE_COUNTER_OBJECTS_OUTPUTS"),
+            "counts-bank-growth-v2,timestamps-bank-growth-v2,latency-bank-growth-v2"
+        );
+        assert!(!crate::EBPF_COUNTER_COUNTS_OBJECT.is_empty());
+        // The build gate passes; garbage bytes fail at object parsing or the
+        // embedded pin, never with a build or kernel token.
+        let pool = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
+        let envelope = BankReservation {
+            retained_bytes: 1024 * 1024,
+            transient_bytes: 1024 * 1024,
+            metadata_bytes: 64 * 1024,
+            file_descriptors: 1024,
+        };
+        let Err(error) = CounterPreparation::new_with_backend_and_probe(
+            b"not an object",
+            envelope,
+            &pool.reserver(),
+            AttachBackend::Singles,
+            || BpfLoopVerdict::Available,
+        ) else {
+            panic!("garbage bytes must fail");
+        };
+        let text = format!("{error:#}");
+        assert!(
+            !text.contains("counter-mode-unavailable-in-build"),
+            "p0 must stay healthy: {text}"
+        );
+        assert!(
+            !text.contains("counter-mode-unavailable-on-kernel"),
+            "p0 must stay healthy: {text}"
+        );
+    }
+
+    #[cfg(feature = "unsafe-unvalidated-metadata")]
+    #[test]
+    fn counter_preparation_stays_healthy_on_unsafe_build() {
+        use super::super::{AttachBackend, BpfLoopVerdict};
+        assert_eq!(env!("P11SCOPE_COUNTER_OBJECTS_ENABLED"), "1");
+        assert_eq!(
+            env!("P11SCOPE_COUNTER_OBJECTS_OUTPUTS"),
+            "counts-bank-growth-v2,timestamps-bank-growth-v2,latency-bank-growth-v2"
+        );
+        assert!(!crate::EBPF_COUNTER_COUNTS_OBJECT.is_empty());
+        let pool = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
+        let envelope = BankReservation {
+            retained_bytes: 1024 * 1024,
+            transient_bytes: 1024 * 1024,
+            metadata_bytes: 64 * 1024,
+            file_descriptors: 1024,
+        };
+        let Err(error) = CounterPreparation::new_with_backend_and_probe(
+            b"not an object",
+            envelope,
+            &pool.reserver(),
+            AttachBackend::Singles,
+            || BpfLoopVerdict::Available,
+        ) else {
+            panic!("garbage bytes must fail");
+        };
+        let text = format!("{error:#}");
+        assert!(
+            !text.contains("counter-mode-unavailable-in-build"),
+            "unsafe must stay healthy: {text}"
+        );
+        assert!(
+            !text.contains("counter-mode-unavailable-on-kernel"),
+            "unsafe must stay healthy: {text}"
+        );
+    }
+
     /// Loads every bank mode object: sixteen per-mode inner maps are staged
     /// into the outer map, then the two bank roots and the two lifecycle
     /// roots load against them. No attachment, commit publication or
     /// workload runs here.
     #[test]
-    #[ignore = "requires P11SCOPE_COUNTER_BANK_PROOF=1, BPF privilege and LP64 map/program load"]
+    #[ignore = "requires the default build with embedded counter objects, BPF privilege and LP64 map/program load"]
     fn counter_bank_mode_objects_load_lp64() {
-        assert_eq!(env!("P11SCOPE_COUNTER_BANK_PROOF_ENABLED"), "1");
+        assert_eq!(env!("P11SCOPE_COUNTER_OBJECTS_ENABLED"), "1");
         assert_eq!(
-            env!("P11SCOPE_COUNTER_BANK_PROOF_OUTPUTS"),
+            env!("P11SCOPE_COUNTER_OBJECTS_OUTPUTS"),
             "counts-bank-growth-v2,timestamps-bank-growth-v2,latency-bank-growth-v2"
         );
-        let directory = std::path::Path::new(env!("OUT_DIR")).join("counter-bank-growth-v2");
-        for (mode, token) in [
-            ("counts", "counts-bank-growth-v2"),
-            ("timestamps", "timestamps-bank-growth-v2"),
-            ("latency", "latency-bank-growth-v2"),
+        let directory = tempfile::tempdir().expect("counter load directory");
+        for (mode, token, counter_mode) in [
+            ("counts", "counts-bank-growth-v2", CounterMode::Counts),
+            (
+                "timestamps",
+                "timestamps-bank-growth-v2",
+                CounterMode::Timestamps,
+            ),
+            ("latency", "latency-bank-growth-v2", CounterMode::Latency),
         ] {
             let artifact = bank_mode_artifact(token).unwrap();
-            let path = directory.join(artifact.object);
+            let path = directory.path().join(artifact.object);
+            std::fs::write(&path, super::counter_object_for_mode(counter_mode))
+                .expect("write embedded bank object");
             let check = std::process::Command::new("python3")
                 .args([
                     "-I",
@@ -7482,12 +7635,12 @@ pub(crate) mod tests {
     /// pre-5.17 kernels with BPF privilege; the 6.1/6.6/host positive side
     /// is the existing growth cells, which must keep passing unmodified.
     #[test]
-    #[ignore = "requires P11SCOPE_COUNTER_BANK_PROOF=1, BPF privilege and a pre-5.17 kernel"]
+    #[ignore = "requires the default build with embedded counter objects, BPF privilege and a pre-5.17 kernel"]
     fn counter_preparation_refuses_without_bpf_loop_on_old_kernels() {
         use super::super::BpfLoopVerdict;
-        assert_eq!(env!("P11SCOPE_COUNTER_BANK_PROOF_ENABLED"), "1");
+        assert_eq!(env!("P11SCOPE_COUNTER_OBJECTS_ENABLED"), "1");
         assert_eq!(
-            env!("P11SCOPE_COUNTER_BANK_PROOF_OUTPUTS"),
+            env!("P11SCOPE_COUNTER_OBJECTS_OUTPUTS"),
             "counts-bank-growth-v2,timestamps-bank-growth-v2,latency-bank-growth-v2"
         );
         // Wrong kernel for this cell fails loud here, never as a vacuous pass.

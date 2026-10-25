@@ -2094,9 +2094,9 @@ mod tests {
         }
 
         assert_eq!(
-            env!("P11SCOPE_COUNTER_BANK_PROOF_ENABLED"),
+            env!("P11SCOPE_COUNTER_OBJECTS_ENABLED"),
             "1",
-            "actual proof artifact is required"
+            "actual counter objects are required"
         );
         let provider = PathBuf::from(
             std::env::var_os("P11SCOPE_COUNTER_BANK_FIXTURE_PROVIDER")
@@ -2763,9 +2763,9 @@ mod tests {
             use std::os::unix::fs::MetadataExt;
             use std::path::{Path, PathBuf};
             assert!(matches!(final_count, 513 | 8192));
-            assert_eq!(env!("P11SCOPE_COUNTER_BANK_PROOF_ENABLED"), "1");
+            assert_eq!(env!("P11SCOPE_COUNTER_OBJECTS_ENABLED"), "1");
             assert_eq!(
-                env!("P11SCOPE_COUNTER_BANK_PROOF_OUTPUTS"),
+                env!("P11SCOPE_COUNTER_OBJECTS_OUTPUTS"),
                 "counts-bank-growth-v2,timestamps-bank-growth-v2,latency-bank-growth-v2"
             );
             ensure_growth_fd_budget(final_count);
@@ -3387,9 +3387,9 @@ mod tests {
     fn counter_bank_session_verifier_complexity_refuses_clean_lp64() {
         use crate::attach::counter_banks::BankReservation;
         use std::path::{Path, PathBuf};
-        assert_eq!(env!("P11SCOPE_COUNTER_BANK_PROOF_ENABLED"), "1");
+        assert_eq!(env!("P11SCOPE_COUNTER_OBJECTS_ENABLED"), "1");
         assert_eq!(
-            env!("P11SCOPE_COUNTER_BANK_PROOF_OUTPUTS"),
+            env!("P11SCOPE_COUNTER_OBJECTS_OUTPUTS"),
             "counts-bank-growth-v2,timestamps-bank-growth-v2,latency-bank-growth-v2"
         );
         let provider = PathBuf::from(

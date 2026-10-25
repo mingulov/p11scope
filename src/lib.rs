@@ -117,6 +117,32 @@ pub static EBPF_INVENTORY_OBJECT: &[u8] =
 pub static EBPF_INVENTORY_CALLERS_OBJECT: &[u8] =
     aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/p11scope-ebpf-inventory-callers"));
 
+/// Counter bank objects, built and embedded by the ordinary FULL build
+/// (`P11SCOPE_COUNTER_OBJECTS` unset or `1`). `=0`, SMALL and WIDE builds
+/// omit them; the statics below are then empty and preparation refuses
+/// every mode with `counter-mode-unavailable-in-build` before any work.
+#[cfg(p11scope_counter_objects)]
+pub static EBPF_COUNTER_COUNTS_OBJECT: &[u8] = aya::include_bytes_aligned!(concat!(
+    env!("OUT_DIR"),
+    "/counter-bank-growth-v2/p11scope-ebpf-counts-bank-growth-v2"
+));
+#[cfg(p11scope_counter_objects)]
+pub static EBPF_COUNTER_TIMESTAMPS_OBJECT: &[u8] = aya::include_bytes_aligned!(concat!(
+    env!("OUT_DIR"),
+    "/counter-bank-growth-v2/p11scope-ebpf-timestamps-bank-growth-v2"
+));
+#[cfg(p11scope_counter_objects)]
+pub static EBPF_COUNTER_LATENCY_OBJECT: &[u8] = aya::include_bytes_aligned!(concat!(
+    env!("OUT_DIR"),
+    "/counter-bank-growth-v2/p11scope-ebpf-latency-bank-growth-v2"
+));
+#[cfg(not(p11scope_counter_objects))]
+pub static EBPF_COUNTER_COUNTS_OBJECT: &[u8] = &[];
+#[cfg(not(p11scope_counter_objects))]
+pub static EBPF_COUNTER_TIMESTAMPS_OBJECT: &[u8] = &[];
+#[cfg(not(p11scope_counter_objects))]
+pub static EBPF_COUNTER_LATENCY_OBJECT: &[u8] = &[];
+
 pub(crate) mod history;
 #[cfg(test)]
 mod key_operation_tests;

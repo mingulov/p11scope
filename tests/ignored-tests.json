@@ -51,6 +51,12 @@
       "cell": "privileged"
     },
     {
+      "file": "src/attach/counter_banks.rs",
+      "path": "attach::counter_banks::tests::counter_bank_mode_objects_load_lp64",
+      "reason": "requires the default build with embedded counter objects; run as root in an authorized BPF lane with LP64 map/program load and uprobe_multi",
+      "cell": "privileged"
+    },
+    {
       "file": "src/attach/identity_iter.rs",
       "path": "attach::identity_iter::tests::anchor_maps_validate_real_handles",
       "reason": "privileged: creates real BPF maps for handle validation",
@@ -1024,24 +1030,9 @@
     },
     {
       "file": "tests/object_producer_activation.rs",
-      "path": "counter_bank_proof_btf_maps_and_programs_load",
-      "reason": "requires explicit counter bank build and authorized BTF/map/program-load lane",
-      "cell": "feature",
-      "owner": "counter-bank-proof build"
-    },
-    {
-      "file": "tests/object_producer_activation.rs",
-      "path": "counter_bank_proof_has_exact_routes_and_start_ownership",
-      "reason": "requires P11SCOPE_COUNTER_BANK_PROOF=1 in its own build configuration",
-      "cell": "feature",
-      "owner": "counter-bank-proof build"
-    },
-    {
-      "file": "tests/object_producer_activation.rs",
-      "path": "counter_bank_proof_mutations_are_causally_rejected",
-      "reason": "requires P11SCOPE_COUNTER_BANK_PROOF=1 in its own build configuration",
-      "cell": "feature",
-      "owner": "counter-bank-proof build"
+      "path": "counter_bank_btf_maps_and_programs_load",
+      "reason": "requires the default build with embedded counter objects and an authorized BTF/map/program-load lane",
+      "cell": "live-kernel"
     },
     {
       "file": "tests/run_abandon_report.rs",

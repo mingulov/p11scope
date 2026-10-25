@@ -59,236 +59,6 @@ fn counter_artifact_path(name: &str) -> PathBuf {
         .join(name)
 }
 
-fn counter_bank_proof_path() -> PathBuf {
-    assert_eq!(env!("P11SCOPE_COUNTER_BANK_PROOF_ENABLED"), "1");
-    assert_eq!(
-        env!("P11SCOPE_COUNTER_BANK_PROOF_OUTPUTS"),
-        "counts-bank-growth-v2,timestamps-bank-growth-v2,latency-bank-growth-v2"
-    );
-    Path::new(env!("OUT_DIR"))
-        .join("counter-bank-growth-v2")
-        .join("p11scope-ebpf-counts-bank-growth-v2")
-}
-
-fn counter_bank_proof_check(path: &Path, mutants: bool) -> std::process::Output {
-    let mut command = Command::new("python3");
-    command.args([
-        "-I",
-        "scripts/check-counter-object.py",
-        "--mode",
-        "counts",
-        "--profile",
-        "counts-bank-growth-v2",
-    ]);
-    if mutants {
-        command.arg("--self-test-mutants");
-    }
-    command.arg(path).output().expect("run bank proof checker")
-}
-
-#[test]
-fn counter_bank_proof_build_selection_matches_emitted_contract() {
-    let requested = match option_env!("P11SCOPE_COUNTER_BANK_PROOF") {
-        None | Some("0") => false,
-        Some("1") => true,
-        other => panic!("malformed private counter bank request {other:?}"),
-    };
-    assert_eq!(
-        env!("P11SCOPE_COUNTER_BANK_PROOF_ENABLED"),
-        if requested { "1" } else { "0" }
-    );
-    assert_eq!(
-        env!("P11SCOPE_COUNTER_BANK_PROOF_OUTPUTS"),
-        if requested {
-            "counts-bank-growth-v2,timestamps-bank-growth-v2,latency-bank-growth-v2"
-        } else {
-            ""
-        },
-        "disabled metadata must refuse stale proof output"
-    );
-    let directory = tempfile::tempdir().unwrap();
-    let ordinary = embedded_object(directory.path());
-    let result = counter_bank_proof_check(&ordinary, false);
-    assert_eq!(
-        result.status.code(),
-        Some(2),
-        "Detailed passed as a bank proof"
-    );
-    assert!(String::from_utf8_lossy(&result.stderr).contains("counter object refused:"));
-    if requested {
-        let path = counter_bank_proof_path();
-        let proof = std::fs::read(&path).unwrap();
-        assert_ne!(proof, p11scope::EBPF_OBJECT);
-        let legacy = Command::new("python3")
-            .args([
-                "-I",
-                "scripts/check-counter-object.py",
-                "--mode",
-                "counts",
-                "--profile",
-                "counts-bank-proof",
-            ])
-            .arg(&path)
-            .output()
-            .expect("run strict format1 profile against actual format2 bytes");
-        assert_eq!(
-            legacy.status.code(),
-            Some(2),
-            "format1 accepted format2 bytes"
-        );
-        assert!(String::from_utf8_lossy(&legacy.stderr).contains("counter object refused:"));
-    }
-}
-
-#[test]
-#[ignore = "requires P11SCOPE_COUNTER_BANK_PROOF=1 in its own build configuration"]
-fn counter_bank_proof_has_exact_routes_and_start_ownership() {
-    let output = counter_bank_proof_check(&counter_bank_proof_path(), false);
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(report["schema"], "p11scope-counter-bank-object/v2");
-    assert_eq!(report["configuration"], 0x0200_0018_0010_0200u64);
-    assert_eq!(report["native_owner_slot_bound"], 8_192);
-    for (name, kind, key, value, entries, flags) in [
-        ("STATS", 6, 4, 24, 512, 0),
-        ("COUNTER_BANKS", 13, 4, 4, 16, 128),
-        ("COUNTER_BANK_META", 1, 4, 32, 8_192, 128),
-        ("COUNTER_BANK_COMMIT", 1, 8, 16, 8_192, 128),
-        ("COUNTER_BANK_FAULT", 6, 4, 8, 1, 0),
-        ("COUNTER_HEALTH", 6, 4, 8, 2, 0),
-        ("START", 1, 16, 288, 16_384, 0),
-        ("RV_COUNTS", 5, 16, 8, 65_536, 0),
-        ("SLOT_FILE", 2, 4, 4, 8_192, 128),
-    ] {
-        for (field, expected) in [
-            ("type", kind),
-            ("key_size", key),
-            ("value_size", value),
-            ("max_entries", entries),
-            ("flags", flags),
-        ] {
-            assert_eq!(report["maps"][name][field], expected, "{name}.{field}");
-        }
-    }
-    assert_eq!(report["inner_template"]["type"], 6);
-    assert_eq!(report["inner_template"]["key_size"], 4);
-    assert_eq!(report["inner_template"]["value_size"], 24);
-    assert_eq!(report["inner_template"]["max_entries"], 512);
-    assert_eq!(report["inner_template"]["flags"], 0);
-    assert_eq!(report["ordinary_counter_profile"], "refused");
-    for root in ["p11_counter_bank_entry", "p11_counter_bank_return"] {
-        assert!(report["roots"][root]["stack_chain"].as_u64().unwrap() <= 512);
-        assert_eq!(report["roots"][root]["clocks"], 0);
-        assert_eq!(report["roots"][root]["semantic_or_event_work"], false);
-    }
-    for name in [
-        "logical_slot_0",
-        "logical_slot_511",
-        "logical_slot_512",
-        "logical_slot_8191",
-        "invalid_logical_slot",
-        "inactive_cell_beside_published_cell",
-        "cross_bank_extent_511_513",
-        "inactive_entry",
-        "precommit_return_after_commit",
-        "absent_return_preserves_other_start",
-        "absent_return_preserves_lost_debt",
-        "old_bank_keeps_original_transaction",
-        "missing_route_retires_start",
-        "failed_retirement_keeps_debt",
-        "full_width_transaction",
-        "high32_transaction_alias",
-        "wrong_exact_set_or_config",
-        "start_payload_does_not_route",
-        "scope_refusal_retires_without_credit",
-        "admission_failure_is_sticky",
-        "rv_full_width_accumulates",
-        "pending_is_returned_without_error",
-        "pending_high_alias_is_full_width_error",
-        "rv_failure_is_sticky",
-        "entered_saturates_without_wrap",
-        "bounded_contention_is_unhealthy",
-    ] {
-        assert_eq!(report["controls"][name], "accepted", "{name}");
-    }
-}
-
-#[test]
-#[ignore = "requires P11SCOPE_COUNTER_BANK_PROOF=1 in its own build configuration"]
-fn counter_bank_proof_mutations_are_causally_rejected() {
-    let output = counter_bank_proof_check(&counter_bank_proof_path(), true);
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    let mutants = report["mutants"].as_object().unwrap();
-    for name in [
-        "inner_value_width",
-        "inner_cell_count",
-        "outer_bank_count",
-        "outer_type",
-        "route_value_width",
-        "route_max_entries",
-        "commit_max_entries",
-        "rv_max_entries",
-        "slot_file_max_entries",
-        "slot_file_flags",
-        "native_owner_slot_bound",
-        "missing_native_owner_slot_bound",
-        "legacy_native_owner_slot_bound",
-        "logical_index",
-        "inner_index",
-        "bank_global_linkage",
-        "bank_global_abi",
-        "commit_gate",
-        "commit_first",
-        "commit_end",
-        "route_first",
-        "route_end",
-        "route_bank",
-        "route_cell",
-        "route_inner_id_zero",
-        "route_reserved",
-        "configuration",
-        "configuration_version",
-        "transaction_width",
-        "optional_start_get",
-        "required_start_remove",
-        "missing_start_get",
-        "missing_start_remove",
-        "route_fault",
-        "legacy_stats_write",
-        "endpoint_clock",
-        "semantic_helper",
-        "unknown_call",
-    ] {
-        assert_eq!(
-            mutants.get(name),
-            Some(&serde_json::json!("refused")),
-            "{name}"
-        );
-    }
-}
-
-fn counter_bank_mode_path(token: &str) -> PathBuf {
-    assert_eq!(env!("P11SCOPE_COUNTER_BANK_PROOF_ENABLED"), "1");
-    assert!(
-        env!("P11SCOPE_COUNTER_BANK_PROOF_OUTPUTS")
-            .split(',')
-            .any(|entry| entry == token),
-        "proof outputs must list {token}"
-    );
-    Path::new(env!("OUT_DIR"))
-        .join("counter-bank-growth-v2")
-        .join(format!("p11scope-ebpf-{token}"))
-}
-
 fn counter_bank_mode_check(mode: &str, profile: &str, path: &Path) -> std::process::Output {
     Command::new("python3")
         .args([
@@ -302,118 +72,6 @@ fn counter_bank_mode_check(mode: &str, profile: &str, path: &Path) -> std::proce
         .arg(path)
         .output()
         .expect("run bank timing checker")
-}
-
-#[test]
-#[ignore = "requires P11SCOPE_COUNTER_BANK_PROOF=1 in its own build configuration"]
-fn counter_bank_timing_objects_have_exact_maps_and_clocks() {
-    for (mode, profile, value_bytes, configuration) in [
-        (
-            "timestamps",
-            "timestamps-bank-growth-v2",
-            40u64,
-            0x0200_0028_0010_0200u64,
-        ),
-        (
-            "latency",
-            "latency-bank-growth-v2",
-            296u64,
-            0x0200_0128_0010_0200u64,
-        ),
-    ] {
-        let path = counter_bank_mode_path(profile);
-        let output = counter_bank_mode_check(mode, profile, &path);
-        assert!(
-            output.status.success(),
-            "{mode}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(
-            report["schema"], "p11scope-counter-bank-object/v2",
-            "{mode}"
-        );
-        assert_eq!(report["configuration"], configuration, "{mode}");
-        assert_eq!(report["native_owner_slot_bound"], 8_192, "{mode}");
-        let slots: Vec<u64> = report["logical_slots"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|slot| slot.as_u64().unwrap())
-            .collect();
-        assert_eq!(slots, [0, 511, 512, 8191], "{mode}");
-        for (name, kind, key, value, entries, flags) in [
-            ("STATS", 6, 4, 24, 512, 0),
-            ("COUNTER_BANKS", 13, 4, 4, 16, 128),
-            ("COUNTER_BANK_META", 1, 4, 32, 8_192, 128),
-            ("COUNTER_BANK_COMMIT", 1, 8, 16, 8_192, 128),
-            ("COUNTER_BANK_FAULT", 6, 4, 8, 1, 0),
-            ("COUNTER_HEALTH", 6, 4, 8, 2, 0),
-            ("START", 1, 16, 288, 16_384, 0),
-            ("RV_COUNTS", 5, 16, 8, 65_536, 0),
-            ("SLOT_FILE", 2, 4, 4, 8_192, 128),
-        ] {
-            for (field, expected) in [
-                ("type", kind),
-                ("key_size", key),
-                ("value_size", value),
-                ("max_entries", entries),
-                ("flags", flags),
-            ] {
-                assert_eq!(
-                    report["maps"][name][field], expected,
-                    "{mode} {name}.{field}"
-                );
-            }
-        }
-        assert_eq!(report["inner_template"]["type"], 6, "{mode}");
-        assert_eq!(report["inner_template"]["key_size"], 4, "{mode}");
-        assert_eq!(
-            report["inner_template"]["value_size"], value_bytes,
-            "{mode}"
-        );
-        assert_eq!(report["inner_template"]["max_entries"], 512, "{mode}");
-        assert_eq!(report["inner_template"]["flags"], 0, "{mode}");
-        assert_eq!(report["ordinary_counter_profile"], "refused", "{mode}");
-        for root in ["p11_counter_bank_entry", "p11_counter_bank_return"] {
-            assert!(
-                report["roots"][root]["stack_chain"].as_u64().unwrap() <= 512,
-                "{mode} {root}"
-            );
-            assert!(
-                report["roots"][root]["clocks"].as_u64().unwrap() >= 1,
-                "{mode} {root}"
-            );
-            assert_eq!(
-                report["roots"][root]["semantic_or_event_work"], false,
-                "{mode} {root}"
-            );
-        }
-        let controls = report["controls"].as_object().unwrap();
-        assert!(!controls.is_empty(), "{mode}");
-        for (name, verdict) in controls {
-            assert_eq!(verdict, "accepted", "{mode} {name}");
-        }
-        for (wrong_mode, wrong_profile) in [
-            ("counts", "counts-bank-growth-v2"),
-            ("timestamps", "timestamps-bank-growth-v2"),
-            ("latency", "latency-bank-growth-v2"),
-        ] {
-            if wrong_profile == profile {
-                continue;
-            }
-            let wrong = counter_bank_mode_check(wrong_mode, wrong_profile, &path);
-            assert_eq!(
-                wrong.status.code(),
-                Some(2),
-                "{mode} accepted as {wrong_mode}"
-            );
-            assert!(
-                String::from_utf8_lossy(&wrong.stderr).contains("counter object refused:"),
-                "{mode} refused without a cause as {wrong_mode}"
-            );
-        }
-    }
 }
 
 fn counter_objects_enabled() -> bool {
@@ -462,12 +120,7 @@ const COUNTER_BANK_TOKENS: [&str; 3] = [
 ];
 
 const COUNTER_BANK_MODES: [(&str, &str, u64, u64); 3] = [
-    (
-        "counts",
-        "counts-bank-growth-v2",
-        24,
-        0x0200_0018_0010_0200,
-    ),
+    ("counts", "counts-bank-growth-v2", 24, 0x0200_0018_0010_0200),
     (
         "timestamps",
         "timestamps-bank-growth-v2",
@@ -492,10 +145,7 @@ fn counter_objects_switch_matches_emitted_contract() {
         other => panic!("malformed counter objects request {other:?}"),
     };
     let small = matches!(option_env!("P11SCOPE_SMALL_RING"), Some("1" | "true"))
-        || matches!(
-            option_env!("P11SCOPE_SMALL_STATE_MAPS"),
-            Some("1" | "true")
-        )
+        || matches!(option_env!("P11SCOPE_SMALL_STATE_MAPS"), Some("1" | "true"))
         || matches!(
             option_env!("P11SCOPE_SMALL_DISCOVERY_RING"),
             Some("1" | "true")
@@ -550,14 +200,8 @@ fn counter_objects_switch_matches_emitted_contract() {
         let ordinary = embedded_object(directory.path());
         for (mode, profile, _, _) in COUNTER_BANK_MODES {
             let result = counter_bank_mode_check(mode, profile, &ordinary);
-            assert_eq!(
-                result.status.code(),
-                Some(2),
-                "Detailed passed as {mode}"
-            );
-            assert!(
-                String::from_utf8_lossy(&result.stderr).contains("counter object refused:")
-            );
+            assert_eq!(result.status.code(), Some(2), "Detailed passed as {mode}");
+            assert!(String::from_utf8_lossy(&result.stderr).contains("counter object refused:"));
         }
     }
 }
@@ -772,13 +416,19 @@ fn counter_bank_mode_mutations_are_causally_rejected() {
     }
 }
 
-/// Creates owned anonymous maps and loads both proof and exec/exit roots. Aya may run
-/// feature probes; no attachment, commit publication or workload runs here.
+/// Creates owned anonymous maps and loads both bank and exec/exit roots from the
+/// embedded counts object. Aya may run feature probes; no attachment, commit
+/// publication or workload runs here.
 #[test]
-#[ignore = "requires explicit counter bank build and authorized BTF/map/program-load lane"]
-fn counter_bank_proof_btf_maps_and_programs_load() {
-    let path = counter_bank_proof_path();
-    let output = counter_bank_proof_check(&path, false);
+#[ignore = "requires the default build with embedded counter objects and an authorized BTF/map/program-load lane"]
+fn counter_bank_btf_maps_and_programs_load() {
+    assert!(
+        counter_objects_enabled(),
+        "default build with embedded counter objects is required"
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let path = write_counter_object("counts-bank-growth-v2", directory.path());
+    let output = counter_bank_mode_check("counts", "counts-bank-growth-v2", &path);
     assert!(
         output.status.success(),
         "{}",
@@ -786,7 +436,7 @@ fn counter_bank_proof_btf_maps_and_programs_load() {
     );
     let mut object = aya::EbpfLoader::new()
         .allow_unsupported_maps()
-        .load_file(path)
+        .load_file(&path)
         .expect("load bank BTF and maps");
     // Match the production loader's raw task-storage handles, while
     // refusing any other unsupported map or mismatched native layout.

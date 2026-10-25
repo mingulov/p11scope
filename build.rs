@@ -60,11 +60,19 @@ fn counter_artifacts_requested() -> bool {
     }
 }
 
-fn counter_bank_proof_requested() -> bool {
-    match env::var("P11SCOPE_COUNTER_BANK_PROOF").as_deref() {
-        Err(env::VarError::NotPresent) | Ok("0") => false,
-        Ok("1") => true,
-        _ => panic!("P11SCOPE_COUNTER_BANK_PROOF must be unset, 0 or 1"),
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CounterObjectsRequest {
+    Unset,
+    Enabled,
+    Disabled,
+}
+
+fn counter_objects_requested() -> CounterObjectsRequest {
+    match env::var("P11SCOPE_COUNTER_OBJECTS").as_deref() {
+        Err(env::VarError::NotPresent) => CounterObjectsRequest::Unset,
+        Ok("1") => CounterObjectsRequest::Enabled,
+        Ok("0") => CounterObjectsRequest::Disabled,
+        _ => panic!("P11SCOPE_COUNTER_OBJECTS must be unset, 0 or 1"),
     }
 }
 
@@ -115,7 +123,7 @@ fn strip_coverage_flags(encoded: &str) -> String {
 fn main() {
     // Refuse malformed requests before any compiler or native build work.
     let counter_artifacts = counter_artifacts_requested();
-    let counter_bank_proof = counter_bank_proof_requested();
+    let counter_objects_request = counter_objects_requested();
     println!("cargo:rerun-if-changed=crates/ebpf/src");
     println!("cargo:rerun-if-changed=crates/ebpf/native/image_identity.c");
     println!("cargo:rerun-if-changed=crates/ebpf/native/image_identity.h");
@@ -156,7 +164,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=P11SCOPE_SMALL_STATE_MAPS");
     println!("cargo:rerun-if-env-changed=P11SCOPE_SMALL_DISCOVERY_RING");
     println!("cargo:rerun-if-env-changed=P11SCOPE_COUNTER_ARTIFACTS");
-    println!("cargo:rerun-if-env-changed=P11SCOPE_COUNTER_BANK_PROOF");
+    println!("cargo:rerun-if-env-changed=P11SCOPE_COUNTER_OBJECTS");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_UNSAFE_UNVALIDATED_METADATA");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_WIDE_DETAILED_2112");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_STUB_OBJECT_ATTRIBUTES");
@@ -185,20 +193,28 @@ fn main() {
     }
     let wide_detailed = env::var_os("CARGO_FEATURE_WIDE_DETAILED_2112").is_some();
     let stub_object_attributes = env::var_os("CARGO_FEATURE_STUB_OBJECT_ATTRIBUTES").is_some();
+    let small_build = small_ring || small_state_maps || small_discovery_ring;
     assert!(
-        !(counter_artifacts || counter_bank_proof)
-            || !(small_ring
-                || small_state_maps
-                || small_discovery_ring
+        !counter_artifacts
+            || !(small_build
                 || wide_detailed
                 || stub_object_attributes
                 || env::var_os("CARGO_FEATURE_UNSAFE_UNVALIDATED_METADATA").is_some()),
         "private counter artifacts currently require default FULL capacities without SMALL, WIDE, unsafe or P0"
     );
-    assert!(
-        !(counter_bank_proof && counter_artifacts),
-        "private bank proof and three-mode artifacts require separate build configurations"
-    );
+    // The ordinary FULL build embeds the three bank objects. SMALL/WIDE omit
+    // them silently only when unset; an explicit `=1` with SMALL/WIDE fails
+    // here, before any compiler work. P0 and unsafe-compiled builds embed
+    // identical bytes (counter flavors never take those features below).
+    // The fixed-512 artifacts are a separate private control and coexist.
+    if counter_objects_request == CounterObjectsRequest::Enabled && (small_build || wide_detailed) {
+        panic!("P11SCOPE_COUNTER_OBJECTS=1 with SMALL or WIDE refuses: unset omits silently");
+    }
+    let counter_objects = matches!(
+        counter_objects_request,
+        CounterObjectsRequest::Unset | CounterObjectsRequest::Enabled
+    ) && !small_build
+        && !wide_detailed;
     semantic_rustc::emit_proof();
 
     for flavor in [
@@ -229,9 +245,11 @@ fn main() {
             build_variant(flavor, false, false, false, false, false);
         }
     }
-    if counter_bank_proof {
+    println!("cargo:rustc-check-cfg=cfg(p11scope_counter_objects)");
+    if counter_objects {
         println!("cargo:rerun-if-changed=crates/ebpf/native/counter_bank_proof.c");
         println!("cargo:rerun-if-changed=crates/ebpf/native/counter_bank_timing.c");
+        println!("cargo:rustc-cfg=p11scope_counter_objects");
         for flavor in [
             BpfFlavor::CounterCounts,
             BpfFlavor::CounterTimestamps,
@@ -242,12 +260,12 @@ fn main() {
     }
     // Selection is an emitted contract, never an inference from stale files.
     println!(
-        "cargo:rustc-env=P11SCOPE_COUNTER_BANK_PROOF_ENABLED={}",
-        u8::from(counter_bank_proof)
+        "cargo:rustc-env=P11SCOPE_COUNTER_OBJECTS_ENABLED={}",
+        u8::from(counter_objects)
     );
     println!(
-        "cargo:rustc-env=P11SCOPE_COUNTER_BANK_PROOF_OUTPUTS={}",
-        if counter_bank_proof {
+        "cargo:rustc-env=P11SCOPE_COUNTER_OBJECTS_OUTPUTS={}",
+        if counter_objects {
             "counts-bank-growth-v2,timestamps-bank-growth-v2,latency-bank-growth-v2"
         } else {
             ""
@@ -547,8 +565,9 @@ fn build_variant_with_proof(
     }
     // P0-only ship vehicle: the Detailed object alone carries attribute
     // adapters, so only it takes the stub feature. Inventory flavors
-    // compile the adapters out and are unaffected either way.
-    if stub_object_attributes && matches!(flavor, BpfFlavor::Detailed) {
+    // compile the adapters out and are unaffected either way. Counter
+    // flavors never take the stub feature, so bank bytes stay identical.
+    if stub_object_attributes && !flavor.counters() && matches!(flavor, BpfFlavor::Detailed) {
         features.push("stub-object-attributes");
     }
     if small_ring && !inventory {
@@ -683,7 +702,12 @@ fn build_variant_with_proof(
     }
     append_flag("-C");
     append_flag("link-arg=--export=DISCOVERY_STATE");
-    if !inventory && env::var_os("CARGO_FEATURE_UNSAFE_UNVALIDATED_METADATA").is_some() {
+    // Counter bank objects are identical across FULL, P0 and unsafe builds:
+    // counter flavors never take the stub or unsafe features.
+    if !inventory
+        && !flavor.counters()
+        && env::var_os("CARGO_FEATURE_UNSAFE_UNVALIDATED_METADATA").is_some()
+    {
         features.push("unsafe-unvalidated-metadata");
         // Preserve separately verified diagnostic helpers and their BTF signatures.
         for flag in [

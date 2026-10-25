@@ -560,7 +560,7 @@ EOF
         echo "unknown scan cause accepted: bogus" >&2
         exit 1
     fi
-    for cause in discovery slots unprotected_live_windows; do
+    for cause in discovery slots unprotected_live_windows skipped; do
         scan_fixture "only-$cause" "[\"pid_namespace\",\"$cause\"]" 0 '[]'
         PATH="$sst_stub:$PATH" scan_limit_check "$sst_stub/only-$cause.json" >/dev/null \
             || { echo "frozen scan cause refused: $cause" >&2; exit 1; }
@@ -872,13 +872,17 @@ import json, sys
 # Frozen scan-disclosure vocabulary (OQ4 pattern): discovery/slots are the
 # built binary's absent-leg output (K1 negative.json: an idle cgroup with
 # no provider); unprotected_live_windows is the expected live-leg cause
-# (src/render.rs gap_classes, observed-profile-v3.md), PENDING the first
-# live K2 run. Anything else -- loss, failure, future or misspelled cause
-# -- fails loudly for triage from facts.log.
+# (src/render.rs gap_classes, observed-profile-v3.md); skipped is what the
+# first live K2 run (k2-dev-3, binary 5ce42784) printed for the nested
+# observer: evidence.skipped "discovery subject: discovery unavailable"
+# (src/render.rs "skipped" cause), with the late provider counted exactly.
+# Anything else -- loss, failure, future or misspelled cause -- fails
+# loudly for triage from facts.log.
 ALLOWED_SCAN_DISCLOSURE = {
     "discovery": "K1 negative.json observation causes (built binary)",
     "slots": "K1 negative.json observation causes (built binary)",
-    "unprotected_live_windows": "src/render.rs gap_classes; PENDING live K2",
+    "unprotected_live_windows": "src/render.rs gap_classes",
+    "skipped": "live K2 run 3 scan leg (nested observer, discovery unavailable)",
 }
 BENIGN_SCAN_CAUSES = {"pid_namespace", "proc_namespace_mismatch", "pid_descendant_gaps"}
 document = json.load(open(sys.argv[1], encoding="utf-8"))

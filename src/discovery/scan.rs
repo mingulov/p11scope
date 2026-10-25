@@ -36,6 +36,10 @@ const INTERFACE_BYTES: usize = 3 * WORD;
 const READ_CHUNK: usize = 1024 * 1024;
 const STANDARD_INTERFACE_NAME: &[u8] = b"PKCS 11";
 pub(crate) const MAX_TABLE_CANDIDATES: usize = 512;
+/// Slots in the 2.x `CK_FUNCTION_LIST` prefix every 3.x layout starts
+/// with: the accepted width when a 3.x-labelled table validates only
+/// its legacy prefix (a provider mislabelling quirk).
+const LEGACY_PREFIX_SLOTS: usize = 68;
 const MAX_DECODED_TABLE_ENTRIES: usize = 512 * 104;
 pub(crate) const MAX_INTERFACE_RECORDS: usize = 512;
 const MAX_MAPS_BYTES: u64 = 64 * 1024 * 1024;
@@ -671,13 +675,21 @@ fn interface_identity(
     runtime_view: Option<ProcessViewId>,
 ) -> Option<InterfaceIdentity> {
     let version_word = u64::from(table.version.0) | (u64::from(table.version.1) << 8);
-    // `usable` is the layout's field count — the same number the table
-    // charged under — with the stored record counts as fallback for versions
-    // the layout decoder refuses (hand-built records only; decoded tables
-    // always carry a decodable version).
+    // `usable` is the slot count the table charged under: the decoded
+    // record count, bounded by the layout's field count. A mislabelled
+    // table charges its short validated prefix, not its declared layout;
+    // versions the layout decoder refuses (hand-built records only)
+    // keep the stored record counts as fallback.
+    let stored = table.decoded_slot_count();
     let usable = spans_for(version_word)
-        .map(|(_, spans, _)| spans.iter().map(|span| span.fields().len()).sum())
-        .unwrap_or_else(|| table.entries.len() + table.null_entries.len() + table.unpinned.len());
+        .map(|(_, spans, _)| {
+            spans
+                .iter()
+                .map(|span| span.fields().len())
+                .sum::<usize>()
+                .min(stored)
+        })
+        .unwrap_or(stored);
     let key = match maps.resolve(table.address) {
         Resolved::File {
             device,
@@ -1793,6 +1805,17 @@ impl PartialEq for ScannedTable {
 
 impl Eq for ScannedTable {}
 
+impl ScannedTable {
+    /// Slots this table decoded: entries plus NULL holes plus records
+    /// reconciliation moved aside. Stable across reconciliation, which
+    /// moves entries to `unpinned` without changing the sum — so every
+    /// consumer sizes this table by this count, never by re-reading the
+    /// declared version's layout.
+    pub(crate) fn decoded_slot_count(&self) -> usize {
+        self.entries.len() + self.null_entries.len() + self.unpinned.len()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScannedInterface {
     pub index: usize,
@@ -2181,11 +2204,37 @@ pub(crate) fn exact_table_bytes(header: &[u8], layout: LinuxLayout) -> Option<us
 /// Returns every non-NULL function pointer in one complete table snapshot.
 /// Addresses are capture-local and are used only to close the maps-A/maps-B
 /// stability bracket; callers must not persist them as identity.
+/// Test-only: production sizes reads by the decoded slot count
+/// (`exact_table_addresses_n`).
+#[cfg(test)]
 pub(crate) fn exact_table_addresses(snapshot: &[u8], layout: LinuxLayout) -> Option<Vec<u64>> {
     let word = read_word_le(snapshot, layout, 0).ok()?;
     let (_, spans, _) = spans_for(word)?;
+    exact_table_addresses_n(
+        snapshot,
+        layout,
+        spans.iter().map(|span| span.fields().len()).sum(),
+    )
+}
+
+/// The first `slots` non-NULL function pointers of one complete table
+/// snapshot, in ordinal order: the decoded-count-bounded form of the
+/// unbounded whole-layout read, for tables whose declared layout is
+/// wider than their validated prefix. Refuses a header no layout walks
+/// and a count wider than the walked layout, instead of reading past it.
+pub(crate) fn exact_table_addresses_n(
+    snapshot: &[u8],
+    layout: LinuxLayout,
+    slots: usize,
+) -> Option<Vec<u64>> {
+    let word = read_word_le(snapshot, layout, 0).ok()?;
+    let (_, spans, _) = spans_for(word)?;
+    let walked: usize = spans.iter().map(|span| span.fields().len()).sum();
+    if slots > walked {
+        return None;
+    }
     let mut addresses = Vec::new();
-    for ordinal in 0..spans.iter().map(|span| span.fields().len()).sum() {
+    for ordinal in 0..slots {
         let address = read_function_pointer(snapshot, layout, ordinal).ok()?;
         if address != 0 {
             addresses.push(address);
@@ -2194,10 +2243,21 @@ pub(crate) fn exact_table_addresses(snapshot: &[u8], layout: LinuxLayout) -> Opt
     Some(addresses)
 }
 
+/// Whether a slot-validation failure at `ordinal` still leaves a complete
+/// validated 68-slot legacy prefix: the mislabelled-table shape (a 3.x
+/// version word over a 2.x table), accepted as its prefix instead of
+/// rejected. `prefix_non_null` counts validated non-NULL slots below 68.
+fn mislabelled_tail_ordinal(version: (u8, u8), ordinal: usize, prefix_non_null: usize) -> bool {
+    version.0 == 3 && ordinal >= LEGACY_PREFIX_SLOTS && prefix_non_null > 0
+}
+
 /// Decodes one candidate at `offset` inside `snapshot` (whose first byte is at
 /// `base_address` in the target). Returns the table only when every published slot
 /// is either NULL or points into a file-backed executable mapping — the criterion
 /// that makes a run of pointers a function table rather than data that looks like one.
+/// A 3.x table whose full layout fails past a complete validated 68-slot
+/// prefix decodes as that prefix, labelled with its declared version and a
+/// `known_prefix` walk; anything less is still rejected.
 /// `runtime_view` scopes the cardinality identity for tables without a stable
 /// file owner (heap/anonymous exact reads): `None` keeps the memory sweep's
 /// file-identity-only charging bit for bit.
@@ -2248,10 +2308,15 @@ fn decode_candidate(
     // Each validated slot is retained: file-backed entries as their normalized
     // (device, inode, file offset), NULLs as holes. The entry builder below
     // consumes this instead of re-resolving, and the runtime identity hashes it.
+    // A 3.x candidate that fails past a complete validated 68-slot prefix
+    // stops there and decodes as that prefix; the full extent above must
+    // still be present, so a truncated table never becomes a short accept.
     let mut non_null = 0usize;
+    let mut prefix_non_null = 0usize;
     let field_count = spans.iter().map(|span| span.fields().len()).sum();
     let mut slots: Vec<Option<(String, Device, u64, u64)>> = Vec::with_capacity(field_count);
     let mut names: Vec<&'static str> = Vec::with_capacity(field_count);
+    let mut short_prefix = false;
     for ordinal in 0..field_count {
         if !budget.charge(1) {
             return Err(());
@@ -2271,6 +2336,9 @@ fn decode_candidate(
             continue;
         }
         non_null += 1;
+        if ordinal < LEGACY_PREFIX_SLOTS {
+            prefix_non_null += 1;
+        }
         let Resolved::File {
             permissions,
             path,
@@ -2280,13 +2348,32 @@ fn decode_candidate(
             ..
         } = maps.resolve(value)
         else {
-            return Ok(None); // anonymous or unmapped ⇒ not a function table
+            // Anonymous or unmapped ⇒ not a function table, unless the
+            // failure is a mislabelled tail past a complete legacy prefix.
+            if !mislabelled_tail_ordinal(version, ordinal, prefix_non_null) {
+                return Ok(None);
+            }
+            short_prefix = true;
+            break;
         };
         if permissions[2] != b'x' {
-            return Ok(None); // a pointer into data ⇒ not a function table
+            // A pointer into data ⇒ not a function table, unless the
+            // failure is a mislabelled tail past a complete legacy prefix.
+            if !mislabelled_tail_ordinal(version, ordinal, prefix_non_null) {
+                return Ok(None);
+            }
+            short_prefix = true;
+            break;
         }
         let MappedPath::Usable(path) = path else {
-            return Ok(None); // deleted/ambiguous pathname ⇒ cannot become an attach target
+            // Deleted/ambiguous pathname ⇒ cannot become an attach target,
+            // unless the failure is a mislabelled tail past a complete
+            // legacy prefix.
+            if !mislabelled_tail_ordinal(version, ordinal, prefix_non_null) {
+                return Ok(None);
+            }
+            short_prefix = true;
+            break;
         };
         slots.push(Some((
             path.display().to_string(),
@@ -2295,10 +2382,28 @@ fn decode_candidate(
             file_offset,
         )));
     }
+    // A short accept walked a known prefix, never the declared layout:
+    // the `known_prefix` label carries that quirk into surfaces and the
+    // existing surface-gap verdict, with the declared version untouched.
+    let (walk, decoded_entries) = if short_prefix {
+        slots.truncate(LEGACY_PREFIX_SLOTS);
+        names.truncate(LEGACY_PREFIX_SLOTS);
+        non_null = prefix_non_null;
+        ("known_prefix", LEGACY_PREFIX_SLOTS)
+    } else {
+        (walk, field_count)
+    };
     if non_null == 0 {
         return Ok(None);
     }
-    let decoded_entries = spans.iter().map(|span| span.fields().len()).sum();
+    let len = if short_prefix {
+        let Ok(prefix_len) = table_bytes(layout, LEGACY_PREFIX_SLOTS) else {
+            return Ok(None);
+        };
+        prefix_len
+    } else {
+        len
+    };
     // Byte-identical repeats skip the candidate+entry charge but still decode
     // below. Without a stable file owner there is no file identity; a
     // view-scoped caller instead identifies the table by (view, address,
@@ -3754,14 +3859,17 @@ impl<'a> ScanDependencies<'a> {
             let dependency = (|| {
                 let offset = usize::try_from(table.address.checked_sub(base)?).ok()?;
                 let bytes = snapshot.get(offset..)?;
-                let len = exact_table_bytes(bytes, layout)?;
+                // The decoded slot count, never the declared version: a
+                // mislabelled table's tail words are not slots.
+                let slots = table.decoded_slot_count();
+                let len = table_bytes(layout, slots).ok()?;
                 let bytes = bytes.get(..len)?;
                 let end = table.address.checked_add(len as u64)?;
                 let mapping = maps.containing(table.address)?;
                 if mapping.permissions[0] != b'r' || end > mapping.end {
                     return None;
                 }
-                let addresses = exact_table_addresses(bytes, layout)?;
+                let addresses = exact_table_addresses_n(bytes, layout, slots)?;
                 for address in addresses {
                     budget.spend(1).ok()?;
                     let target = maps.containing(address)?;
@@ -6114,6 +6222,50 @@ mod tests {
             dependencies.targets.keys().collect::<Vec<_>>(),
             [&0x1000],
             "data tail words are never dependency targets"
+        );
+    }
+
+    #[test]
+    fn exact_table_addresses_n_bounds_reads_to_the_decoded_prefix() {
+        let bounded = mislabelled_snapshot(0x0203, 68, 36);
+        let prefix = exact_table_addresses_n(&bounded, LinuxLayout::Lp64, 68)
+            .expect("the decoded prefix reads");
+        assert_eq!(prefix.len(), 68);
+        assert!(prefix.iter().all(|address| *address == 0x1500));
+        let whole = exact_table_addresses_n(&bounded, LinuxLayout::Lp64, 104)
+            .expect("the declared layout still reads whole");
+        assert_eq!(whole.len(), 104);
+        assert_ne!(prefix, whole, "the bound must exclude the tail words");
+        assert_eq!(
+            whole,
+            exact_table_addresses(&bounded, LinuxLayout::Lp64).expect("the unbounded form reads"),
+            "the unbounded form keeps reading the declared layout"
+        );
+        assert_eq!(
+            exact_table_addresses_n(&bounded, LinuxLayout::Lp64, 105),
+            None,
+            "a count wider than the walked layout refuses"
+        );
+        assert_eq!(
+            exact_table_addresses_n(&[0u8; 8], LinuxLayout::Lp64, 68),
+            None,
+            "a header no layout walks refuses"
+        );
+    }
+
+    #[test]
+    fn decoded_slot_count_sums_entries_nulls_and_unpinned() {
+        let mut table = short_prefix_table();
+        assert_eq!(table.decoded_slot_count(), 68);
+        table.null_entries.push("C_GetFunctionList");
+        table.unpinned.push(Skipped {
+            subject: "C_GetSlotList".to_string(),
+            reason: "entry was not attached".to_string(),
+        });
+        assert_eq!(
+            table.decoded_slot_count(),
+            70,
+            "holes and moved-aside records stay counted as decoded"
         );
     }
 

@@ -33,7 +33,7 @@ use crate::discovery::noise::DiscoveryNoiseAggregator;
 use crate::discovery::scan::{
     CaptureWorkBudget, MapsReadBuffers, MapsReadLimits, ObjectExports, ScanOutcome, ScanRequest,
     ScannedEntry, ScannedInterface, ScannedModule, ScannedTable, Skipped, TableIdentity,
-    decode_exact_table, exact_table_addresses, exact_table_bytes, export_agreement,
+    decode_exact_table, exact_table_addresses_n, exact_table_bytes, export_agreement,
     index_maps_or_refuse, read_elf_snapshot, read_maps_or_refuse, read_maps_or_refuse_with_buffers,
     scan_process_view, scan_process_view_without_memory, scan_skip_truncates, spans_for,
     table_evidence_score, table_linkage, target_layout,
@@ -16185,8 +16185,8 @@ impl Engine {
     /// `allow_span` (broad fixed-family only) permits the table extent to
     /// cover a run of contiguous readable mappings instead of one: a fixed
     /// pool legitimately crosses the file-tail/anonymous-BSS split. The run
-    /// is contiguity-checked mapping by mapping, fully decoded (104
-    /// executable entries stay the content anchor), and every touched
+    /// is contiguity-checked mapping by mapping, fully decoded (the
+    /// validated entries stay the content anchor), and every touched
     /// mapping is stability-bracketed — same contract, wider extent.
     fn read_exact_table_bracketed(
         view: &ProcessView,
@@ -16273,8 +16273,17 @@ impl Engine {
                     .ok_or(ExactReadRefusal::Unstable)?,
             )?;
         }
-        let raw_addresses =
-            exact_table_addresses(&bytes, layout).ok_or(ExactReadRefusal::Undecodable)?;
+        // Decode before bracketing: the decoded slot count — not the
+        // declared version — bounds the stability bracket, so a
+        // mislabelled table's tail words never join it.
+        let table =
+            match decode_exact_table(&bytes, address, layout, index_a, budget, Some(view.id())) {
+                Err(()) => return Err(ExactReadRefusal::Budget),
+                Ok(None) => return Err(ExactReadRefusal::Undecodable),
+                Ok(Some(table)) => table,
+            };
+        let raw_addresses = exact_table_addresses_n(&bytes, layout, table.decoded_slot_count())
+            .ok_or(ExactReadRefusal::Undecodable)?;
         let mut addresses = Vec::with_capacity(raw_addresses.len() + 1);
         addresses.push(address);
         addresses.extend(raw_addresses);
@@ -16287,12 +16296,6 @@ impl Engine {
                     .ok_or(ExactReadRefusal::Undecodable)
             })
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        let table =
-            match decode_exact_table(&bytes, address, layout, index_a, budget, Some(view.id())) {
-                Err(()) => return Err(ExactReadRefusal::Budget),
-                Ok(None) => return Err(ExactReadRefusal::Undecodable),
-                Ok(Some(table)) => table,
-            };
         let maps_b = Self::read_maps(view, budget).map_err(|_| ExactReadRefusal::Unstable)?;
         let index_b =
             index_maps_or_refuse(&maps_b, budget).map_err(|_| ExactReadRefusal::Unstable)?;

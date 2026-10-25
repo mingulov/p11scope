@@ -641,8 +641,11 @@ fn format_operation_error(error: &(dyn std::error::Error + 'static)) -> String {
     format_operation_error_with(error, None, false, false)
 }
 
-/// Build scope, identical on every host: v0.4.0 stub builds do not
-/// capture object attributes (P0-only ship vehicle), so the row warns
+/// The object-capture row's by-design warning in P0 (stub) builds.
+const OBJECT_CAPTURE_P0: &str = "not enabled in this P0 build";
+
+/// Build scope, identical on every host: P0 (stub) builds do not
+/// capture object attributes, so the row warns
 /// by design (a [`BUILD_LIMIT_ROWS`] member); FULL builds wire it.
 fn object_capture_check() -> Check {
     if crate::attach::Session::object_capture_evidence().available {
@@ -653,7 +656,7 @@ fn object_capture_check() -> Check {
     } else {
         Check {
             name: "object-attribute capture".into(),
-            status: Status::Warn("not enabled in v0.4.0".into()),
+            status: Status::Warn(OBJECT_CAPTURE_P0.into()),
         }
     }
 }
@@ -1602,7 +1605,7 @@ const BUILD_LIMIT_ROWS: [(&str, &[&str]); 4] = [
     ("loader timing (initial_set)", &["unproven", "none"]),
     ("loader timing (dlopen)", &["unproven", "none"]),
     ("run initial-set capture", &["none"]),
-    ("object-attribute capture", &["not enabled in v0.4.0"]),
+    ("object-attribute capture", &[OBJECT_CAPTURE_P0]),
 ];
 
 fn is_build_limit(check: &Check) -> bool {
@@ -2333,7 +2336,7 @@ mod tests {
     }
 
     /// The doctor names the build's object-capture scope: enabled in
-    /// FULL builds, a by-design warning in v0.4.0 stub builds that
+    /// FULL builds, a by-design warning in P0 (stub) builds that
     /// extra-strict qualification excuses (no host can clear it).
     #[test]
     fn object_capture_check_matches_build() {

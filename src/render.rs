@@ -410,8 +410,8 @@ impl Default for AttachBackendEvidence {
     }
 }
 
-/// Object-attribute capture availability (P0-only ship vehicle): build
-/// scope, identical for every capture of this binary. Stubbed (v0.4.0)
+/// Object-attribute capture availability: build scope, identical for
+/// every capture of this binary. Stubbed (P0)
 /// builds report `available: false` with the finite `not_enabled`
 /// reason; FULL builds report `available: true`. Never gates the
 /// verdict — P0 scope is complete when P0 facts are complete; this
@@ -425,7 +425,7 @@ pub struct ObjectCaptureEvidence {
 }
 
 impl ObjectCaptureEvidence {
-    /// The one v0.4.0 unavailability reason: the stub feature compiled
+    /// The one P0 unavailability reason: the stub feature compiled
     /// attribute capture out.
     pub const NOT_ENABLED: &'static str = "not_enabled";
 

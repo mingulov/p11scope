@@ -1711,7 +1711,13 @@ impl AttestedSemanticLane {
         }
         #[cfg(test)]
         if self.test_io.is_some() {
-            // Substituted lanes never ran a native session.
+            // Substituted lanes never ran a native session, but the
+            // handoff still happened: production takes the live
+            // Session here, so finished and the retained frame go
+            // with it. A later `is_finished` reads false, exactly
+            // like a taken live lane.
+            self.test_finished = false;
+            self.test_joint_frame = false;
             return Ok(None);
         }
         let Some(live) = self.live.as_mut() else {

@@ -1817,6 +1817,11 @@ struct WindingLane {
     /// Whether A carries a Joint promotion finish (legacy lanes wind
     /// through the wound-down phase only).
     joint: bool,
+    /// The first WoundDown handed the session off (the take carried
+    /// it away): later ticks skip the finish step — the session is
+    /// gone, so reaping again would fail closed — and retry the
+    /// completion/retire tail with the retained proof.
+    joined: bool,
     /// ProviderStorage commit refusals retried so far (item 7).
     commit_retries: u16,
 }
@@ -1865,6 +1870,7 @@ impl RetiringDomain {
                 lane: Some(lane),
                 finish: JointFinishDriver::NotBegun,
                 joint,
+                joined: false,
                 commit_retries: 0,
             }),
         }
@@ -3070,38 +3076,65 @@ impl ClassicDriver<'_> {
         }) {
             return self.step_not_begun_winding();
         }
-        let outcome = {
-            let retiring = self.retiring.as_mut().expect("a winding lane retires");
-            let winding = retiring.winding.as_mut().expect("a winding lane retires");
-            Self::step_begun_joint_finish(
-                &mut winding.lane,
-                &mut winding.finish,
-                &mut *self.coordinator,
-                &mut self.joint_first_error,
-            )
-        };
-        if !matches!(outcome, JointStepOutcome::WoundDown) {
-            return false;
-        }
-        let session = {
-            let retiring = self.retiring.as_mut().expect("a winding lane retires");
-            let lane = retiring
-                .winding
-                .as_mut()
-                .expect("winding")
-                .lane
-                .as_mut()
-                .expect("winding lane");
-            match lane.take_joined_session() {
-                Ok(session) => session,
-                Err(_) => return false,
+        let joined = self
+            .retiring
+            .as_ref()
+            .expect("a winding lane retires")
+            .winding
+            .as_ref()
+            .expect("a winding lane retires")
+            .joined;
+        if !joined {
+            let outcome = {
+                let retiring = self.retiring.as_mut().expect("a winding lane retires");
+                let winding = retiring.winding.as_mut().expect("a winding lane retires");
+                Self::step_begun_joint_finish(
+                    &mut winding.lane,
+                    &mut winding.finish,
+                    &mut *self.coordinator,
+                    &mut self.joint_first_error,
+                )
+            };
+            if !matches!(outcome, JointStepOutcome::WoundDown) {
+                return false;
             }
-        };
-        if let Some(session) = session {
-            let retiring = self.retiring.as_mut().expect("a winding lane retires");
-            let domain = retiring.domain;
-            if let Some(source) = self.completion_source.as_mut() {
-                source.note_wound_down(domain, session);
+            let session = {
+                let retiring = self.retiring.as_mut().expect("a winding lane retires");
+                let lane = retiring
+                    .winding
+                    .as_mut()
+                    .expect("winding")
+                    .lane
+                    .as_mut()
+                    .expect("winding lane");
+                match lane.take_joined_session() {
+                    Ok(session) => session,
+                    Err(_) => return false,
+                }
+            };
+            // The take carried the session away exactly when the lane
+            // no longer reads finished: production took its live
+            // Session, substituted lanes cleared their seams. A
+            // not-ready take (framed, or a re-polled pending detach)
+            // keeps the lane finishable, so the next tick reaps
+            // again; only a handoff arms the joined tail.
+            {
+                let retiring = self.retiring.as_mut().expect("a winding lane retires");
+                let winding = retiring.winding.as_mut().expect("winding");
+                if winding
+                    .lane
+                    .as_ref()
+                    .is_some_and(|lane| !lane.is_finished())
+                {
+                    winding.joined = true;
+                }
+            }
+            if let Some(session) = session {
+                let retiring = self.retiring.as_mut().expect("a winding lane retires");
+                let domain = retiring.domain;
+                if let Some(source) = self.completion_source.as_mut() {
+                    source.note_wound_down(domain, session);
+                }
             }
         }
         let (completion, fresh) = {
@@ -13613,11 +13646,7 @@ mod promotion_driver_tests {
             CountingSource::scripted(Some(SessionNativeCompletion::scripted(domain)));
         driver.completion_source = Some(Box::new(source));
         driver.on_tick();
-        assert_eq!(
-            driver.retiring_domain(),
-            None,
-            "the retry mint retires A"
-        );
+        assert_eq!(driver.retiring_domain(), None, "the retry mint retires A");
         assert!(
             !driver.coordinator.promotion_finish(),
             "the flag clears only after A's retire"
@@ -13627,11 +13656,7 @@ mod promotion_driver_tests {
             1,
             "the joined retry never re-polls the wound-down"
         );
-        assert_eq!(
-            mint_polls.load(Ordering::SeqCst),
-            1,
-            "the retry mints once"
-        );
+        assert_eq!(mint_polls.load(Ordering::SeqCst), 1, "the retry mints once");
     }
 
     #[test]

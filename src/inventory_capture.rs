@@ -1809,7 +1809,8 @@ pub(crate) fn collect_cgroup_off_thread(
 /// Whether the same owned publication reached its actual boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PassCommitProgress {
-    #[cfg_attr(not(test), allow(dead_code))] // No production poll_commit reports Pending yet; tests script it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    // No production poll_commit reports Pending yet; tests script it.
     Pending,
     Published,
 }
@@ -2147,7 +2148,8 @@ pub(crate) enum RetainedPass {
     /// Publication began before any new pass. Never fabricate a collection
     /// or report just to return the existing driver/native ownership.
     BeforeCollection,
-    #[cfg_attr(not(test), allow(dead_code))] // Production matches the variant and discards (C1); only tests read the collection.
+    #[cfg_attr(not(test), allow(dead_code))]
+    // Production matches the variant and discards (C1); only tests read the collection.
     Collected {
         collected: CollectedPass,
         scan_now_ns: u64,

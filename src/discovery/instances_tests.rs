@@ -694,6 +694,111 @@ fn mapped_scan_at_unchanged_epochs_closes_the_absence_window() {
 }
 
 #[test]
+fn storage_null_move_breaks_global_only_continuity() {
+    // Q1(b): a global-only advance observed after INSTANCE_COUNT.storage_null
+    // moved mints instead of continuing: the counter proves a hook event the
+    // witness could not attribute, so unchanged epochs may hide a real
+    // mapping change of this process. Fail closed. Late calls stamped at
+    // the old epochs still join the old ID: the mint moves forward, it
+    // does not rewrite history.
+    let mut r = router();
+    r.note_storage_null(Some(7));
+    assert_eq!(
+        r.observe_legacy(observation(2, 0, 0, load(BASE_A))).0,
+        ObserveOutcome::New
+    );
+    assert_eq!(
+        r.storage_seen_for(image(COOKIE, 0), FILE),
+        Some(7),
+        "the first observation records its pass snapshot"
+    );
+    let old = joined(r.route(call(1, stamp(2, 0, 0), ip_in(BASE_A))));
+    r.note_storage_null(Some(9));
+    assert_eq!(
+        r.observe_legacy(observation(2, 1, 0, load(BASE_A))).0,
+        ObserveOutcome::New
+    );
+    let new = joined(r.route(call(2, stamp(2, 1, 0), ip_in(BASE_A))));
+    assert_ne!(old, new);
+    assert_eq!(joined(r.route(call(3, stamp(2, 0, 0), ip_in(BASE_A)))), old);
+    assert_eq!(r.instances_minted(), 2);
+}
+
+#[test]
+fn storage_null_unchanged_keeps_global_only_continuity() {
+    // The Q1(b) control: the same global-only advance with an unchanged
+    // storage_null snapshot continues the one instance.
+    let mut r = router();
+    r.note_storage_null(Some(7));
+    assert_eq!(
+        r.observe_legacy(observation(2, 0, 0, load(BASE_A))).0,
+        ObserveOutcome::New
+    );
+    let old = joined(r.route(call(1, stamp(2, 0, 0), ip_in(BASE_A))));
+    r.note_storage_null(Some(7));
+    assert_eq!(
+        r.observe_legacy(observation(2, 1, 0, load(BASE_A))).0,
+        ObserveOutcome::Continued
+    );
+    assert_eq!(joined(r.route(call(2, stamp(2, 1, 0), ip_in(BASE_A)))), old);
+    assert_eq!(joined(r.route(call(3, stamp(2, 0, 0), ip_in(BASE_A)))), old);
+    assert_eq!(r.instances_minted(), 1);
+}
+
+#[test]
+fn storage_null_unknown_keeps_legacy_continuity() {
+    // Backends that cannot read the counter (and keys first observed
+    // before any snapshot) keep the legacy rule: unknown never mints.
+    let mut r = router();
+    assert_eq!(
+        r.observe_legacy(observation(2, 0, 0, load(BASE_A))).0,
+        ObserveOutcome::New
+    );
+    let old = joined(r.route(call(1, stamp(2, 0, 0), ip_in(BASE_A))));
+    assert_eq!(
+        r.observe_legacy(observation(2, 1, 0, load(BASE_A))).0,
+        ObserveOutcome::Continued
+    );
+    assert_eq!(joined(r.route(call(2, stamp(2, 1, 0), ip_in(BASE_A)))), old);
+    // A snapshot that arrives later cannot incriminate the pre-snapshot
+    // observation either: no recorded value means no proven move.
+    r.note_storage_null(Some(9));
+    assert_eq!(
+        r.observe_legacy(observation(2, 2, 0, load(BASE_A))).0,
+        ObserveOutcome::Continued
+    );
+    assert_eq!(joined(r.route(call(3, stamp(2, 2, 0), ip_in(BASE_A)))), old);
+    assert_eq!(r.instances_minted(), 1);
+}
+
+#[test]
+fn same_epoch_scan_refreshes_the_storage_reference() {
+    // A mapped scan at unchanged epochs is an observation too: it moves
+    // the key's storage reference forward, so only a LATER counter move
+    // breaks continuity.
+    let mut r = router();
+    r.note_storage_null(Some(7));
+    r.observe_legacy(observation(2, 0, 0, load(BASE_A)));
+    let old = joined(r.route(call(1, stamp(2, 0, 0), ip_in(BASE_A))));
+    r.note_storage_null(Some(9));
+    assert_eq!(
+        r.observe_legacy(observation(2, 0, 0, load(BASE_A))).0,
+        ObserveOutcome::Continued
+    );
+    assert_eq!(
+        r.storage_seen_for(image(COOKIE, 0), FILE),
+        Some(9),
+        "the same-epoch scan refreshes the key's reference"
+    );
+    assert_eq!(
+        r.observe_legacy(observation(2, 1, 0, load(BASE_A))).0,
+        ObserveOutcome::Continued
+    );
+    assert_eq!(joined(r.route(call(2, stamp(2, 1, 0), ip_in(BASE_A)))), old);
+    assert_eq!(r.instances_minted(), 1);
+}
+
+#[test]
 fn global_then_local_move_mints() {
     // Continuity compares against the newest observation: a global-only
     // move continues, then a local move over the identical ranges mints.

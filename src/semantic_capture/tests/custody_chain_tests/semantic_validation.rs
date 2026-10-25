@@ -188,6 +188,8 @@ struct HeldIo {
     /// global-only churn (the live shape) apart from local moves.
     scan_inputs: HashMap<u32, (u64, u32, u32)>,
     absent_files: BTreeSet<u32>,
+    /// Scripted `INSTANCE_COUNT.storage_null` for the Q1(b) gate test.
+    storage_null: u64,
 }
 
 impl HeldIo {
@@ -221,6 +223,7 @@ impl HeldIo {
             targets: HashMap::new(),
             scan_inputs: HashMap::new(),
             absent_files: BTreeSet::new(),
+            storage_null: 0,
         }
     }
 
@@ -402,6 +405,9 @@ impl CaptureIo for HeldIo {
             return Err(ImageQueryRefusal::Unstable);
         }
         self.scan_proof(self.targets[&pin.pid()].1, endpoint, fence)
+    }
+    fn storage_null(&mut self) -> Option<u64> {
+        Some(self.storage_null)
     }
 }
 

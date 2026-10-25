@@ -326,6 +326,161 @@ fn same_base_local_bump_mints_and_retires_prior() {
 }
 
 #[test]
+fn storage_null_move_mints_through_tick() {
+    // Q1(b) through the production tick: a global-only advance observed
+    // after INSTANCE_COUNT.storage_null moved mints a successor and
+    // retires the prior load, even though the mapping and the process's
+    // own epoch are unchanged. Fail closed on a possibly unattributed
+    // mapping change. The bind runs first with the old inputs, so the
+    // mint lands in the tick's own scan.
+    let mut scene = workload_scene();
+    let pid = std::process::id();
+    let caller = admit_mapped(&mut scene, pid);
+    production_bind(&mut scene, caller, pid, image(7));
+    for (name, mechanism) in WORKLOAD_MAIN.iter().take(2) {
+        enqueue_live_like(&mut scene, pid, name, *mechanism);
+    }
+    let batch = scene.tick();
+    scene.publish(batch);
+    assert_eq!(
+        instance_summary(&scene).len(),
+        1,
+        "one instance before the storage move, got {:?}",
+        instance_summary(&scene)
+    );
+    crate::inventory_semantics::bind_semantic_callers_inner(
+        &mut scene.scene.coordinator,
+        &mut scene.lane,
+        None,
+    );
+    // Same base and local epoch, advanced global epoch, moved counter.
+    let (base, local, global) = scene.h0.0.borrow().io.scan_input(0);
+    scene
+        .h0
+        .0
+        .borrow_mut()
+        .io
+        .scan_inputs
+        .insert(0, (base, local, global + 1));
+    scene.h0.0.borrow_mut().io.storage_null += 1;
+    for (name, mechanism) in WORKLOAD_MAIN.iter().take(2) {
+        enqueue_live_like(&mut scene, pid, name, *mechanism);
+    }
+    let batch = scene.tick();
+    scene.publish(batch);
+    let instances = instance_summary(&scene);
+    assert_eq!(
+        instances.len(),
+        2,
+        "the storage move mints exactly one successor, got {instances:?}"
+    );
+    assert_eq!(
+        (instances[0].2.as_str(), instances[0].3.as_str()),
+        (
+            InstanceLifecycle::Retired.label(),
+            InstanceReason::InstanceRetired.label(),
+        ),
+        "the prior load retires stating instance_retired, got {instances:?}"
+    );
+    assert_eq!(
+        (instances[1].2.as_str(), instances[1].3.as_str()),
+        (InstanceLifecycle::Observed.label(), "-"),
+        "the successor stays observed, got {instances:?}"
+    );
+    let rows = semantic_rows(&scene);
+    assert_eq!(
+        rows.iter()
+            .map(|(_, returns, _, _)| returns.unwrap_or(0))
+            .sum::<u64>(),
+        4,
+        "each burst joins its own load, got {rows:?}"
+    );
+    assert_eq!(
+        rows[0].1,
+        Some(2),
+        "the retired load keeps its history, got {rows:?}"
+    );
+    assert_eq!(
+        rows[1].1,
+        Some(2),
+        "the successor joins only the post-move burst, got {rows:?}"
+    );
+}
+
+#[test]
+fn storage_null_move_mints_through_refresh() {
+    // Q1(b) through the bind refresh: the same moved-counter mint, but
+    // the discovery pass re-binds first, so the refresh scan observes
+    // the advance before the tick collects the post-move burst.
+    let mut scene = workload_scene();
+    let pid = std::process::id();
+    let caller = admit_mapped(&mut scene, pid);
+    production_bind(&mut scene, caller, pid, image(7));
+    for (name, mechanism) in WORKLOAD_MAIN.iter().take(2) {
+        enqueue_live_like(&mut scene, pid, name, *mechanism);
+    }
+    let batch = scene.tick();
+    scene.publish(batch);
+    assert_eq!(
+        instance_summary(&scene).len(),
+        1,
+        "one instance before the storage move, got {:?}",
+        instance_summary(&scene)
+    );
+    // Same base and local epoch, advanced global epoch, moved counter.
+    let (base, local, global) = scene.h0.0.borrow().io.scan_input(0);
+    scene
+        .h0
+        .0
+        .borrow_mut()
+        .io
+        .scan_inputs
+        .insert(0, (base, local, global + 1));
+    scene.h0.0.borrow_mut().io.storage_null += 1;
+    for (name, mechanism) in WORKLOAD_MAIN.iter().take(2) {
+        enqueue_live_like(&mut scene, pid, name, *mechanism);
+    }
+    discovery_pass(&mut scene);
+    let instances = instance_summary(&scene);
+    assert_eq!(
+        instances.len(),
+        2,
+        "the storage move mints exactly one successor, got {instances:?}"
+    );
+    assert_eq!(
+        (instances[0].2.as_str(), instances[0].3.as_str()),
+        (
+            InstanceLifecycle::Retired.label(),
+            InstanceReason::InstanceRetired.label(),
+        ),
+        "the prior load retires stating instance_retired, got {instances:?}"
+    );
+    assert_eq!(
+        (instances[1].2.as_str(), instances[1].3.as_str()),
+        (InstanceLifecycle::Observed.label(), "-"),
+        "the successor stays observed, got {instances:?}"
+    );
+    let rows = semantic_rows(&scene);
+    assert_eq!(
+        rows.iter()
+            .map(|(_, returns, _, _)| returns.unwrap_or(0))
+            .sum::<u64>(),
+        4,
+        "each burst joins its own load, got {rows:?}"
+    );
+    assert_eq!(
+        rows[0].1,
+        Some(2),
+        "the retired load keeps its history, got {rows:?}"
+    );
+    assert_eq!(
+        rows[1].1,
+        Some(2),
+        "the successor joins only the post-move burst, got {rows:?}"
+    );
+}
+
+#[test]
 fn absence_then_same_base_reload_mints() {
     // A scan that proves the module unmapped breaks continuity: the next
     // scan mints even when the reload lands at the same base with the

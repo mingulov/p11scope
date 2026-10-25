@@ -603,6 +603,10 @@ struct Observed {
     ranges: Vec<MapRange>,
     /// Load bases (offset-0 range starts, private) with minted IDs, ascending.
     partitions: Vec<(Base, Option<InstanceId>)>,
+    /// The scan pass's `INSTANCE_COUNT.storage_null` snapshot when this
+    /// observation was recorded (`None` when the backend cannot read the
+    /// counter). A global-only advance after this value moved mints.
+    storage_seen: Option<u64>,
 }
 
 /// A private load-base address.
@@ -697,6 +701,10 @@ pub(crate) struct InstanceRouter {
     /// Nonempty entries contain unique minted IDs, so the lifetime bound is
     /// MAX_INSTANCES even when an adapter has not drained them yet.
     observation_losses: Vec<ObservationLoss>,
+    /// Current scan pass's `INSTANCE_COUNT.storage_null` snapshot, set by
+    /// the capture loop once per pass. `None` until the first snapshot
+    /// (legacy backends never set it) keeps the legacy continuity rule.
+    storage_snapshot: Option<u64>,
 }
 
 pub(crate) struct ObservationLoss {
@@ -752,6 +760,7 @@ impl InstanceRouter {
             unknown: BTreeMap::new(),
             counters: RouterCounters::default(),
             observation_losses: Vec::new(),
+            storage_snapshot: None,
         }
     }
 
@@ -1112,6 +1121,15 @@ impl InstanceRouter {
         }
     }
 
+    /// Records the scan pass's `INSTANCE_COUNT.storage_null` counter. The
+    /// capture loop calls this once per pass; a global-only advance
+    /// observed after the counter moved mints instead of continuing (fail
+    /// closed on a possibly unattributed mapping change). `None` keeps
+    /// the legacy rule for backends that cannot read the counter.
+    pub(crate) fn note_storage_null(&mut self, snapshot: Option<u64>) {
+        self.storage_snapshot = snapshot;
+    }
+
     fn observe_reading(
         &mut self,
         image: ImageKey,
@@ -1149,6 +1167,7 @@ impl InstanceRouter {
             return (ObserveOutcome::StaleEra, resolved);
         }
         self.counters.observations += 1;
+        let storage_snapshot = self.storage_snapshot;
         let epochs = EpochKey::of(&observation.reading);
         let key = (image, file);
         if self.faulted.contains(&key) {
@@ -1207,6 +1226,14 @@ impl InstanceRouter {
                 // not route calls apart (the router joins the first match),
                 // so continuing is the only useful behavior.
                 self.absent.remove(&key);
+                // The scan re-observed these epochs now: refresh the
+                // entry's storage reference, so only a LATER counter
+                // move breaks continuity.
+                if let Some(list) = self.observed.get_mut(&key) {
+                    if let Some(found) = list.iter_mut().find(|o| o.epochs == epochs) {
+                        found.storage_seen = storage_snapshot;
+                    }
+                }
                 self.counters.continued += 1;
                 ObserveOutcome::Continued
             }
@@ -1251,6 +1278,7 @@ impl InstanceRouter {
                         epochs,
                         ranges: observation.ranges,
                         partitions,
+                        storage_seen: storage_snapshot,
                     });
                     while list.len() > KEYS_PER_PROCESS_FILE {
                         if let Some(old) = list.pop_front() {
@@ -1297,6 +1325,7 @@ impl InstanceRouter {
                         epochs,
                         ranges: observation.ranges,
                         partitions,
+                        storage_seen: storage_snapshot,
                     });
                     while list.len() > KEYS_PER_PROCESS_FILE {
                         if let Some(old) = list.pop_front() {
@@ -1473,6 +1502,16 @@ impl InstanceRouter {
     #[cfg(test)]
     pub(crate) fn expire_pending(&mut self, cookie: u64) -> Vec<(u64, Route)> {
         self.expire_cookie(cookie)
+    }
+
+    /// The newest observation's recorded storage snapshot for one key, if
+    /// the key holds any observation. Test seam for the Q1(b) reference.
+    #[cfg(test)]
+    pub(crate) fn storage_seen_for(&self, image: ImageIdentity, file: u32) -> Option<u64> {
+        self.observed
+            .get(&(ImageKey::from(image), file))
+            .and_then(|list| list.back())
+            .and_then(|back| back.storage_seen)
     }
 
     fn expire_cookie(&mut self, cookie: u64) -> Vec<(u64, Route)> {

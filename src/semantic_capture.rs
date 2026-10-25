@@ -1084,6 +1084,12 @@ trait CaptureIo {
         fence: u64,
         current_fence: &dyn Fn() -> u64,
     ) -> Result<ImageScanProof, ImageQueryRefusal>;
+    /// The current `INSTANCE_COUNT.storage_null` counter for the Q1(b)
+    /// fail-closed gate, when the backend can read it. `None` keeps the
+    /// legacy continuity rule.
+    fn storage_null(&mut self) -> Option<u64> {
+        None
+    }
 }
 
 struct SessionIo<'a> {
@@ -1195,6 +1201,13 @@ impl CaptureIo for SessionIo<'_> {
         let window = ReadWindow::new(16_384, deadline).map_err(|_| ImageQueryRefusal::Deadline)?;
         self.session
             .scan_image(pin, endpoint.object, window, fence, current)
+    }
+    fn storage_null(&mut self) -> Option<u64> {
+        self.session
+            .instance_maps()
+            .counters()
+            .map(|counters| counters.storage_null)
+            .ok()
     }
 }
 
@@ -2426,6 +2439,8 @@ impl SemanticCapture {
             "foreign semantic Session"
         );
         anyhow::ensure!(!self.stopped, "semantic capture stopped");
+        // One storage_null snapshot per scan pass for the Q1(b) gate.
+        self.router.note_storage_null(io.storage_null());
         let mut report = TickReport::default();
         if !self.audit(io, &mut report) {
             return Ok(report);
@@ -2964,6 +2979,8 @@ impl SemanticCapture {
             "foreign semantic Session"
         );
         anyhow::ensure!(!self.stopped, "semantic capture stopped");
+        // One storage_null snapshot per scan pass for the Q1(b) gate.
+        self.router.note_storage_null(io.storage_null());
         let mut report = TickReport::default();
         let owned;
         let (records, status, mut positions, birth_cut) = match collected {

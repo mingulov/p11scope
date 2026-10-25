@@ -25041,8 +25041,9 @@ impl Engine {
     }
 
     /// NativePoll (§1.6): one native poll credit. `Pending` stays;
-    /// `Closed` stores the input, records the verdict and installs. A
-    /// missing ticket refuses by the mutated flag (defensive).
+    /// `Closed` splits the input into removed rows plus storage, records
+    /// the verdict and installs. A missing ticket refuses by the mutated
+    /// flag (defensive).
     fn step_graph_native_poll(
         &mut self,
         session: &mut dyn EngineSession,
@@ -25061,7 +25062,14 @@ impl Engine {
             Ok(progress) => match progress.state {
                 CollectedRetirementState::Pending => Self::graph_idle(true),
                 CollectedRetirementState::Closed(input) => {
-                    graph.removed = Some(input);
+                    // Closed splits the input back into rows plus storage:
+                    // Reclaim step 3 drains the rows strided, so nothing of
+                    // removal size rides whole to Done.
+                    debug_assert!(graph.removed_rows.is_empty());
+                    debug_assert!(graph.removed_storage.is_none());
+                    let (rows, storage) = input.into_removed();
+                    graph.removed_rows = rows;
+                    graph.removed_storage = Some(storage);
                     graph.verdict = Some(Verdict::Closed);
                     graph.phase = GraphPhase::Install;
                     Self::graph_idle(true)
@@ -25637,6 +25645,14 @@ impl Engine {
                     if graph.facts.drop_tables.is_empty() {
                         graph.reclaim_step = 18;
                     }
+                    return Self::graph_idle(true);
+                }
+                // The sealed selection is dead after the pins reclaim
+                // (step 2); it drops in its own step instead of whole at
+                // Done. Strided draining needs a selection drain API.
+                18 => {
+                    graph.selection = None;
+                    graph.reclaim_step = 19;
                     return Self::graph_idle(true);
                 }
                 _ => {

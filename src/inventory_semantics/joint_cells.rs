@@ -243,6 +243,82 @@ const ALL_EVENTS: [JointEvent; 10] = [
     Sigint2,
 ];
 
+/// Every Machine/Driver/Native row names its proving test (§8.7
+/// "Code"): the home file contains the identifier
+/// `joint_cell_{j}_{event}` (for example `joint_cell_j3_stop`).
+/// `Deferred` rows are skipped: T16b flips them to `Driver` when it
+/// adds their tests. No ignored tests: a missing identifier fails.
+#[test]
+fn joint_cells_name_existing_tests() {
+    const MACHINE: &str = include_str!(
+        "../semantic_capture/tests/custody_chain_tests/joint_cells_machine.rs"
+    );
+    const NATIVE: &str = include_str!("../attach/joint_cells_native_tests.rs");
+    const DRIVER: &str = include_str!("../inventory_joint_cells_tests.rs");
+    fn state_id(state: JointState) -> &'static str {
+        match state {
+            J0 => "j0",
+            J1 => "j1",
+            J2 => "j2",
+            J3 => "j3",
+            J4 => "j4",
+            J5 => "j5",
+            J6 => "j6",
+            J7 => "j7",
+            J8 => "j8",
+            J9 => "j9",
+            J10 => "j10",
+            J11 => "j11",
+            J12 => "j12",
+            J13 => "j13",
+            J14 => "j14",
+            J15 => "j15",
+            J16 => "j16",
+        }
+    }
+    fn event_id(event: JointEvent) -> &'static str {
+        match event {
+            Stop => "stop",
+            Deadline => "deadline",
+            Cancel => "cancel",
+            Promote => "promote",
+            RetireOwn => "retire_own",
+            ReplaceForeign => "replace_foreign",
+            CaptureError => "capture_error",
+            SinkFailure => "sink_failure",
+            HeldInstall => "held_install",
+            Sigint2 => "sigint2",
+        }
+    }
+    let mut checked = 0;
+    for (state, event, home) in JOINT_CELLS {
+        let (file, home_name) = match home {
+            Machine => (MACHINE, "Machine"),
+            Driver => (DRIVER, "Driver"),
+            Native => (NATIVE, "Native"),
+            Deferred(_) => continue,
+            Unconstructible(_) => {
+                panic!("unconstructible pairs stay out of the table")
+            }
+        };
+        let id = format!(
+            "joint_cell_{}_{}",
+            state_id(*state),
+            event_id(*event)
+        );
+        assert!(
+            file.contains(&id),
+            "{state:?}×{event:?} ({home_name}): the home file lacks `{id}`"
+        );
+        checked += 1;
+    }
+    assert_eq!(
+        checked,
+        40 + 69 + 27,
+        "every Machine/Driver/Native row names its test"
+    );
+}
+
 /// Every constructible pair appears exactly once; the 16
 /// retire_own pairs on J0–J15 stay absent.
 #[test]

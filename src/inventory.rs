@@ -2941,9 +2941,7 @@ impl ClassicDriver<'_> {
                         let cause = lane
                             .as_mut()
                             .and_then(|lane| lane.take_wound_down_error_text())
-                            .unwrap_or_else(|| {
-                                format!("wound-down refused: {}", refusal.code())
-                            });
+                            .unwrap_or_else(|| format!("wound-down refused: {}", refusal.code()));
                         coordinator
                             .note_scope_gap("joint wound-down failed".to_string(), cause.clone());
                         if let Some(owned) = lane.take() {
@@ -3255,8 +3253,7 @@ impl ClassicDriver<'_> {
                 if fresh && foreign && not_live {
                     self.coordinator.note_scope_gap(
                         "selected promotion completion failed".to_string(),
-                        "foreign completion for a domain with no live finalizer state"
-                            .to_string(),
+                        "foreign completion for a domain with no live finalizer state".to_string(),
                     );
                 }
                 // An own-domain completion that finds no live
@@ -14931,8 +14928,7 @@ mod promotion_driver_tests {
             retained: None,
         };
         let start = Instant::now();
-        let (_stopped, _error, _zero) =
-            driver.consume_outcome(outcome, &clock, &mut |_, _| Ok(()));
+        let (_stopped, _error, _zero) = driver.consume_outcome(outcome, &clock, &mut |_, _| Ok(()));
         assert!(
             start.elapsed() < Duration::from_secs(1),
             "the second signal returns the consume promptly"
@@ -14985,8 +14981,7 @@ mod promotion_driver_tests {
             retained: None,
         };
         let start = Instant::now();
-        let (_stopped, _error, _zero) =
-            driver.consume_outcome(outcome, &clock, &mut |_, _| Ok(()));
+        let (_stopped, _error, _zero) = driver.consume_outcome(outcome, &clock, &mut |_, _| Ok(()));
         assert!(
             start.elapsed() < Duration::from_secs(1),
             "the expired deadline returns the consume promptly"
@@ -15037,8 +15032,7 @@ mod promotion_driver_tests {
             zero_pass: None,
             retained: None,
         };
-        let (_stopped, _error, _zero) =
-            driver.consume_outcome(outcome, &clock, &mut |_, _| Ok(()));
+        let (_stopped, _error, _zero) = driver.consume_outcome(outcome, &clock, &mut |_, _| Ok(()));
         assert!(
             driver.semantic.is_none(),
             "the joined lane releases at the consume"

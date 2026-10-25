@@ -218,6 +218,24 @@ def check_copy_up(**overrides):
     return ORACLE["copy_up"](**inputs)
 
 
+def with_ambient(document, pid=9999, module="m9", key=(0, 35, 356176),
+                 count=0):
+    """An ambient host provider edge outside the cell (agreement ignores it)."""
+    document["callers"].append({"id": "camb", "pid": pid})
+    document["modules"].append(
+        {"id": module, "paths": [PROVIDER],
+         "identity": {"device": {"major": key[0], "minor": key[1]},
+                      "inode": key[2]}})
+    document["edges"].append(
+        {"caller": "camb", "module": module,
+         "mapping": {"evidence": "deep_scan", "state": "mapped",
+                     "first_seen_ns": 1000},
+         "entries": {"count": count,
+                     "coverage": {"state": "unknown", "since_ns": None,
+                                  "lossy": None}}})
+    return document
+
+
 def good_late_inputs(cov="watched_no_use", count=0, since=2000,
                      first_seen=1000, gaps=(), iters_l=ITERS_L):
     modules = {"m7": (0, 412, 900), "m8": (0, 138, 901)}
@@ -369,6 +387,36 @@ class CopyUpTest(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "disagree"):
             ORACLE["copy_up"](**inputs)
 
+    def test_backends_ignore_ambient_provider_count_drift(self):
+        """Sequential legs: ambient host counts may differ without failing."""
+        inputs = good_copy_up_inputs()
+        with_ambient(inputs["pre_kernel"], count=0)
+        with_ambient(inputs["pre_userspace"], count=3)
+        self.assertTrue(ORACLE["copy_up"](**inputs)["ok"])
+
+    def test_backends_ignore_ambient_only_provider_module(self):
+        """A provider module no cell process edges is outside the cell."""
+        inputs = good_copy_up_inputs()
+        with_ambient(inputs["pre_userspace"], count=0)
+        self.assertTrue(ORACLE["copy_up"](**inputs)["ok"])
+
+    def test_backends_cell_split_fails_named_despite_ambient_drift(self):
+        """Ambient drift never masks a named cell disagreement."""
+        inputs = good_copy_up_inputs()
+        with_ambient(inputs["span_kernel"], count=0)
+        with_ambient(inputs["span_userspace"], count=3)
+        split = [item if (item["pid"], item["module"]) !=
+                 (PID_B_PRE, "m8")
+                 else edge(PID_B_PRE, "m8", cov="counted", since=3000,
+                           count=9, first_seen=2000)
+                 for item in span_edges()]
+        inputs["span_userspace"] = with_ambient(inventory(
+            split, [collapse_gap()], backend="userspace", fallback=None,
+            modules=dict(D1_MODULES_SPAN)), count=3)
+        with self.assertRaisesRegex(
+                AssertionError, "backends disagree on provider edges.*102"):
+            ORACLE["copy_up"](**inputs)
+
     def test_pre_profile_b_wrong_count_fails(self):
         with self.assertRaises(AssertionError):
             check_copy_up(pre_profile_b=profile(ITERS_B + 1))
@@ -486,6 +534,11 @@ class CopyUpTest(unittest.TestCase):
     def test_empty_dc73_note_fails(self):
         with self.assertRaises(AssertionError):
             check_copy_up(dc73_note="")
+
+    def test_dc73_note_with_disproven_sentence_fails(self):
+        """The disclosure next to the disproven sentence still FAILs."""
+        with self.assertRaisesRegex(AssertionError, "disproven"):
+            check_copy_up(dc73_note=NOTE_NEW + " " + NOTE_OLD)
 
     def test_round2_m8_must_not_claim_b_pre_calls(self):
         result = check_copy_up(b_pre_round2_calls=1500)
@@ -818,6 +871,48 @@ class LateReportedTest(unittest.TestCase):
     def test_l_gap_with_unknown_subject_fails(self):
         with self.assertRaises(AssertionError):
             check_late(gaps=[("frobnicate", "r", PID_L)], since=1000)
+
+    def test_l_gap_about_unrelated_so_fails(self):
+        """A gap about another .so never stands in for the late module."""
+        with self.assertRaises(AssertionError):
+            check_late(gaps=[("/usr/lib/libevil.so", "r", PID_L)])
+
+    def test_l_gap_about_unrelated_device_fails(self):
+        """A gap about another device:ino never names the late module."""
+        with self.assertRaises(AssertionError):
+            check_late(gaps=[("device 0:999 inode 1", "r", PID_L)])
+
+    def test_l_gap_about_other_pid_mem_fails(self):
+        with self.assertRaises(AssertionError):
+            check_late(gaps=[("/proc/999/mem", "r", PID_L)])
+
+    def test_l_gap_device_matching_late_key_passes(self):
+        gaps = [("device 0:138 inode 901",
+                 "module first observed after admission", PID_L)]
+        result = check_late(gaps=gaps, since=1000)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["late"], "edge-with-gap")
+
+    def test_l_gap_proc_mem_of_l_passes(self):
+        gaps = [("/proc/202/mem",
+                 "module first observed after admission", PID_L)]
+        result = check_late(gaps=gaps, since=1000)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["late"], "edge-with-gap")
+
+    def test_l_gap_branch_edge_above_ledger_fails(self):
+        """The gap branch bounds L's edge by its ledger total too."""
+        gaps = [(LATE_PROVIDER, "module first observed after admission",
+                 PID_L)]
+        with self.assertRaises(AssertionError):
+            check_late(gaps=gaps, cov="counted", count=6 * ITERS_L + 1)
+
+    def test_l_gap_branch_edge_bad_status_fails(self):
+        """The gap branch checks L's edge status too."""
+        gaps = [(LATE_PROVIDER, "module first observed after admission",
+                 PID_L)]
+        with self.assertRaises(AssertionError):
+            check_late(gaps=gaps, cov="frobnicate", count=5)
 
     def test_stripped_gap_control_fails(self):
         """The control: the healthy gap-based document with L gaps stripped FAILs."""

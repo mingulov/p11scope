@@ -809,6 +809,21 @@ def good_copy_up(lane="B"):
     }
 
 
+def st_add_ambient(document, pid=999, count=0):
+    """An ambient host provider edge outside the cell (agreement ignores it)."""
+    document["callers"].append({"id": "camb", "pid": pid})
+    document["modules"].append(
+        {"id": "m9", "paths": [ST_PROVIDER],
+         "identity": {"device": {"major": 0, "minor": 35}, "inode": 356176}})
+    document["edges"].append(
+        {"caller": "camb", "module": "m9",
+         "mapping": {"evidence": "deep_scan", "state": "mapped",
+                     "first_seen_ns": 1000},
+         "entries": {"count": count,
+                     "coverage": {"state": "unknown", "since_ns": None,
+                                  "lossy": None}}})
+
+
 def refuses(label, check):
     try:
         check()
@@ -906,6 +921,15 @@ def self_test():
         modules=ST_MODULES_SPAN)
     refuses_with("fallback null without backend agreement", "disagree",
                  lambda: copy_up(**none_split))
+    # Ambient host PKCS#11 users keep calling across the sequential legs,
+    # so an ambient-only count split (or an ambient-only module) passes.
+    ambient_split = good_copy_up("B")
+    st_add_ambient(ambient_split["pre_kernel"], count=0)
+    st_add_ambient(ambient_split["pre_userspace"], count=3)
+    assert copy_up(**ambient_split)["ok"] is True
+    ambient_module = good_copy_up("B")
+    st_add_ambient(ambient_module["pre_userspace"], count=0)
+    assert copy_up(**ambient_module)["ok"] is True
     mutate_copy("B key already in pre modules",
                 pre_kernel=good_inventory(st_pre_edges(), [st_collapse()],
                                           backend="kernel", modules=ST_MODULES_SPAN))
@@ -974,8 +998,11 @@ def self_test():
     mutate_copy("facts.log without the upper stat",
                 facts_text="stat-a-pre=138:100 1 sha-a-pre=x\n")
     mutate_copy("run log without the disclosure", dc73_note="nothing recorded")
-    mutate_copy("disproven kernel-refusal disclosure",
+    mutate_copy("run log without the disclosure, disproven text",
                 dc73_note="D-C7-3 applies; the kernel refusal with "
+                          "identity_mismatch is the correct leg.")
+    mutate_copy("run log repeating the disproven sentence",
+                dc73_note=ST_NOTE + " D-C7-3 applies; the kernel refusal with "
                           "identity_mismatch is the correct leg.")
     round2 = good_copy_up("B")
     round2["b_pre_round2_calls"] = 1500
@@ -1295,6 +1322,20 @@ def self_test():
                 **late(True, [], since=500))
     mutate_late("L unknown gap subject",
                 **late(False, [("frobnicate", "r", 202)]))
+    mutate_late("L gap about an unrelated .so",
+                **late(False, [("/usr/lib/libevil.so", "r", 202)]))
+    mutate_late("L gap about an unrelated device",
+                **late(False, [("device 0:999 inode 1", "r", 202)]))
+    mutate_late("L gap about another pid's /proc mem",
+                **late(False, [("/proc/999/mem", "r", 202)]))
+    assert late_reported(**late(
+        False, [("device 0:138 inode 901",
+                 "module first observed after admission", 202)]))["late"] == \
+        "no-edge-with-gap"
+    assert late_reported(**late(
+        False, [("/proc/202/mem",
+                 "module first observed after admission", 202)]))["late"] == \
+        "no-edge-with-gap"
     stripped = good_inventory([st_edge(201, "m7"), st_edge(202, "m8")],
                               [(late_module, "r", 202)], backend="kernel",
                               fallback="below_threshold", modules=late_modules)
@@ -1311,6 +1352,12 @@ def self_test():
                 pid_o=201, pid_l=202, late_module=late_module, iters_l=250)
     mutate_late("L entries above its ledger",
                 **late(True, [], cov="counted", count=6 * 250 + 1))
+    mutate_late("L gap-branch edge above its ledger",
+                **late(True, [(late_module, "r", 202)], cov="counted",
+                       count=6 * 250 + 1))
+    mutate_late("L gap-branch edge with a bogus status",
+                **late(True, [(late_module, "r", 202)], cov="frobnicate",
+                       count=5))
     mutate_late("L counted with zero entries",
                 **late(True, [], cov="counted", count=0))
     mutate_late("L watched_no_use with entries",

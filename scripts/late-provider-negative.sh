@@ -299,6 +299,18 @@ EOF
         echo "garbage L start accepted" >&2
         exit 1
     fi
+    # Inventory readiness: pass 0's summary line, never the profile-only
+    # capture line or a progress line.
+    WORK=$stub
+    printf '%s\n' 'p11scope: sweeping 440 process maps (cap 256)...' \
+        'p11scope: pass 0: 256 scanned (1 maps-matched; 0 native, 256 scan-pinned)' > "$stub/ready.err"
+    wait_ready ready 999999 || { echo "pass-0 readiness missed" >&2; exit 1; }
+    printf '%s\n' 'p11scope: capturing: 3 probe(s) attached; stop with Ctrl-C' \
+        'p11scope: sweeping 440 process maps (cap 256)...' > "$stub/early.err"
+    if wait_ready early 999999 >/dev/null 2>&1; then
+        echo "inventory readiness accepted without pass 0" >&2
+        exit 1
+    fi
     rm -rf "$stub"
     trap - EXIT
 }
@@ -511,6 +523,13 @@ prov_sha() {
     sudo -n sha256sum "/proc/$1/root$2" | awk '{print $1}'
 }
 
+# Create a container's gate file from the host through its own root: a
+# `docker exec touch` would add short-lived processes to the captured
+# cgroup, which the capture rightly counts as pid_descendant_gaps.
+release_gate() {
+    sudo -n touch "/proc/$1/root/tmp/gate"
+}
+
 wait_docker_log() {
     i=0
     while [ "$i" -lt "$(($3 * 2))" ]; do
@@ -528,10 +547,12 @@ save_logs() {
     dcli logs "$1" >"$2" 2>&1 || return 1
 }
 
+# A timed inventory prints no capture readiness line; pass 0's summary line
+# means its first full collection (and its anchors) is in place.
 wait_ready() {
     i=0
     while [ "$i" -lt 360 ]; do
-        if grep -q 'p11scope: capturing:' "$WORK/$1.err" 2>/dev/null; then
+        if grep -q '^p11scope: pass 0: [0-9]* scanned' "$WORK/$1.err" 2>/dev/null; then
             return 0
         fi
         kill -0 "$2" 2>/dev/null || break
@@ -727,7 +748,7 @@ CAPTURE_PIDS="$PID_CAP"
 wait_ready n4 "$PID_CAP" || fail_cell "inventory capture never became ready"
 CAPTURE_START=$(date +%s)
 fact "capture-start-epoch=$CAPTURE_START"
-dcli exec "$N4_O" touch /tmp/gate || fail_cell "gate release failed for $N4_O"
+release_gate "$PID_O" || fail_cell "gate release failed for $N4_O"
 
 say "=== at T+$LATE_DELAY s: start late container L ($ITERS_L) ==="
 sleep "$LATE_DELAY"
@@ -742,7 +763,7 @@ STARTED_L=$(dcli inspect --format '{{.State.StartedAt}}' "$N4_L") || fail_cell "
 fact "pid-l=$PID_L stat-l=$STAT_L sha-l=$SHA_L started-l=$STARTED_L"
 [ "$STAT_L" != "$STAT_O" ] || fail_cell "L provider is not a fresh file (stat $STAT_L)"
 l_started_after "$CAPTURE_START" "$STARTED_L" || fail_cell "L did not start mid-capture"
-dcli exec --user 65534 "$N4_L" touch /tmp/gate || fail_cell "gate release failed for $N4_L"
+release_gate "$PID_L" || fail_cell "gate release failed for $N4_L"
 
 say "=== wait for both ledgers and the capture ==="
 wait_docker_log "$N4_O" '^LEDGER ' "$DURATION" || fail_cell "O ledger never completed"

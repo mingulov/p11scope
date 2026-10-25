@@ -44642,64 +44642,69 @@ impl CollectedFinishGraphCase {
     }
 
     fn assert_original_pending(&mut self) {
-        assert!(self.engine.views.iter().any(|owner| {
-            owner.id() == self.view && owner.view_admission().same_allocation(&self.admission)
-        }));
-        assert!(self.engine.pinned.view_claims(self.view).is_some());
-        assert!(
-            self.engine
-                .pinned
-                .summary(self.original_slot.object)
-                .is_some()
+        Self::assert_original_pending_in(
+            &mut self.engine,
+            &self.session,
+            self.view,
+            &self.admission,
+            &self.original_slot,
+            self.original_owner,
         );
+    }
+
+    fn assert_original_pending_in(
+        engine: &mut Engine,
+        session: &ScriptedSession,
+        view: ProcessViewId,
+        admission: &ViewAdmission,
+        original_slot: &plan::Slot,
+        original_owner: plan::ModuleId,
+    ) {
+        assert!(engine.views.iter().any(|owner| {
+            owner.id() == view && owner.view_admission().same_allocation(admission)
+        }));
+        assert!(engine.pinned.view_claims(view).is_some());
+        assert!(engine.pinned.summary(original_slot.object).is_some());
         assert!(
-            self.engine
+            engine
                 .modules
                 .iter()
-                .any(|module| module.scanned.view == self.view)
+                .any(|module| module.scanned.view == view)
         );
         assert_eq!(
-            self.engine.plan.module_of_slot(self.original_slot.index),
-            Some(self.original_owner)
+            engine.plan.module_of_slot(original_slot.index),
+            Some(original_owner)
         );
-        assert_eq!(self.engine.plan.slots, [self.original_slot.clone()]);
-        let probe = self.engine.allocate_view_id().unwrap();
-        assert_ne!(
-            probe, self.view,
-            "the original graph owner ID is still held"
-        );
-        self.engine.release_view_id(probe);
-        assert_eq!(self.engine.deep_scans, 0);
-        assert!(self.session.attached_slots.is_empty());
-        assert!(self.session.dynamic_attach_calls.is_empty());
-        assert!(self.session.replaced_slot_indices.is_empty());
+        assert_eq!(engine.plan.slots, [original_slot.clone()]);
+        let probe = engine.allocate_view_id().unwrap();
+        assert_ne!(probe, view, "the original graph owner ID is still held");
+        engine.release_view_id(probe);
+        assert_eq!(engine.deep_scans, 0);
+        assert!(session.attached_slots.is_empty());
+        assert!(session.dynamic_attach_calls.is_empty());
+        assert!(session.replaced_slot_indices.is_empty());
     }
 
     fn reach_native_handoff(&mut self) {
-        let mut submitted = false;
-        for _ in 0..512 {
-            let progress = self.service(1);
-            assert!(
-                progress.pending,
-                "the actual return closer is still blocked"
-            );
-            self.assert_original_pending();
-            if self
-                .session
-                .global_retirement
-                .as_ref()
-                .unwrap()
-                .borrow()
-                .begins
-                != 0
-            {
-                submitted = true;
-                break;
-            }
-        }
-        assert!(
-            submitted,
-            "bounded graph continuation must reach the actual native handoff"
+        let view = self.view;
+        let admission = self.admission.clone();
+        let original_slot = self.original_slot.clone();
+        let original_owner = self.original_owner;
+        drive_graph_until(
+            &mut self.engine,
+            &mut self.session,
+            |engine, session, outcome| {
+                assert!(outcome.pending, "the actual return closer is still blocked");
+                Self::assert_original_pending_in(
+                    engine,
+                    session,
+                    view,
+                    &admission,
+                    &original_slot,
+                    original_owner,
+                );
+                session.global_retirement.as_ref().unwrap().borrow().begins != 0
+            },
         );
         self.entered
             .recv_timeout(std::time::Duration::from_secs(2))
@@ -46148,27 +46153,16 @@ fn collected_graph_one_graph_for_many_exit_records() {
     for guard in &mut guards {
         guard.reap().unwrap();
     }
-    let mut drained = false;
-    // T4b real phases cost contracted per-credit work (one intent per
-    // Intake credit, Selection counts, strided native preflight); 512 was
-    // T4's vacuous-advance budget. Bound only; every assertion is unchanged.
-    for _ in 0..1024 {
-        let outcome = engine
-            .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
-            .unwrap();
-        if !outcome.pending {
-            drained = true;
-            break;
-        }
-    }
+    // The drain waits on the worker (64 native retirements cross it);
+    // the helper's 30 s guard replaces the fixed 1024-credit bound.
+    drive_graph_until(&mut engine, &mut session, |_, _, outcome| !outcome.pending);
     eprintln!(
-        "g23 interim: drained={drained} graphs={} intake={} views={} intents={}",
+        "g23 interim: drained=true graphs={} intake={} views={} intents={}",
         engine.collected_graphs_created,
         engine.collected_intake_intents,
         engine.views.len(),
         engine.retirement_intents.len()
     );
-    assert!(drained, "one graph must retire all 64 views and drain");
     assert_eq!(engine.collected_graphs_created, 1);
     assert!(engine.views.is_empty());
     assert_eq!(engine.collected_intake_intents, 64);
@@ -46632,30 +46626,27 @@ fn graph_inputs_epoch_bumps_on_mutating_entry_points() {
 }
 
 /// T4a helper: service collected Finish until the boxed graph reaches
-/// `phase`. Panics with the last observed phase when the bound runs out.
+/// `phase`. Panics on the 30 s guard when the phase never arrives.
 fn drive_engine_graph_to_phase(
     engine: &mut Engine,
     session: &mut ScriptedSession,
     phase: GraphPhase,
 ) {
-    // Full native paths (prepare/begin/poll) need well over a hundred
-    // credits; the bound only guards against a stuck graph.
-    for _ in 0..512 {
-        if engine
+    // Check-before-service: the graph may already sit at the phase,
+    // and one more credit would move it past.
+    if engine
+        .collected_graph
+        .as_ref()
+        .is_some_and(|graph| graph.phase == phase)
+    {
+        return;
+    }
+    drive_graph_until(engine, session, |engine, _, _| {
+        engine
             .collected_graph
             .as_ref()
             .is_some_and(|graph| graph.phase == phase)
-        {
-            return;
-        }
-        engine
-            .service_collected_finish_records(session, Vec::new(), 0, 1)
-            .unwrap();
-    }
-    panic!(
-        "graph did not reach {phase:?}; last phase: {:?}",
-        engine.collected_graph.as_ref().map(|graph| graph.phase)
-    );
+    });
 }
 
 /// T4a helper: one accepted provider with a ready retirement intent, the
@@ -46781,20 +46772,16 @@ fn graph_case_to_native_pending(limit: Option<usize>) -> (usize, usize) {
     if let Some(limit) = limit {
         case.engine.collected_test_pool.reference_set_limit(limit);
     }
-    let mut begins = 0;
-    for _ in 0..512 {
-        case.service(1);
-        begins = case
-            .session
-            .global_retirement
-            .as_ref()
-            .unwrap()
-            .borrow()
-            .begins;
-        if begins == 1 {
-            break;
-        }
-    }
+    drive_graph_until(&mut case.engine, &mut case.session, |_, session, _| {
+        session.global_retirement.as_ref().unwrap().borrow().begins == 1
+    });
+    let begins = case
+        .session
+        .global_retirement
+        .as_ref()
+        .unwrap()
+        .borrow()
+        .begins;
     let peak = case
         .engine
         .collected_test_pool
@@ -47212,16 +47199,18 @@ fn attach_nonblocking_native_carrier(
 fn collected_graph_revalidate_mismatch_retains_native_debt() {
     let mut case = graph_case_with_exit(false);
     // Drive to the first NativePoll credit; the blocked closer parks there.
-    for _ in 0..512 {
-        if case
-            .engine
-            .collected_graph
-            .as_ref()
-            .is_some_and(|graph| graph.phase == GraphPhase::NativePoll)
-        {
-            break;
-        }
-        case.service(1);
+    if !case
+        .engine
+        .collected_graph
+        .as_ref()
+        .is_some_and(|graph| graph.phase == GraphPhase::NativePoll)
+    {
+        drive_graph_until(&mut case.engine, &mut case.session, |engine, _, _| {
+            engine
+                .collected_graph
+                .as_ref()
+                .is_some_and(|graph| graph.phase == GraphPhase::NativePoll)
+        });
     }
     let graph = case
         .engine
@@ -47337,25 +47326,18 @@ fn collected_graph_install_refuses_a_stale_epoch() {
 fn collected_graph_prepare_error_cancels_preflight_and_returns_input() {
     // Before the take: a live preflight exists, then prepare fails.
     let mut case = graph_case_with_exit(true);
-    let mut saw_preflight = false;
-    for _ in 0..512 {
-        case.service(1);
-        let blocking = case
-            .session
+    drive_graph_until(&mut case.engine, &mut case.session, |engine, session, _| {
+        let blocking = session
             .global_retirement
             .as_ref()
             .unwrap()
             .borrow()
             .blocking();
-        let held = case.engine.collected_graph.as_ref().is_some_and(|graph| {
+        let held = engine.collected_graph.as_ref().is_some_and(|graph| {
             graph.phase == GraphPhase::NativePrepare && graph.removed.is_some()
         });
-        if blocking && held {
-            saw_preflight = true;
-            break;
-        }
-    }
-    assert!(saw_preflight, "a preflight must exist before the take");
+        blocking && held
+    });
     case.session.fail_collected_prepare.set(true);
     let outcome = case.service(1);
     assert!(outcome.pending);
@@ -47395,20 +47377,13 @@ fn collected_graph_prepare_error_cancels_preflight_and_returns_input() {
     // After the take: the take happened, then prepare fails; the ticket
     // cancel returns the input.
     let mut case = graph_case_with_exit(true);
-    let mut saw_take = false;
-    for _ in 0..512 {
-        case.service(1);
-        let taken = case.engine.collected_graph.as_ref().is_some_and(|graph| {
+    drive_graph_until(&mut case.engine, &mut case.session, |engine, _, _| {
+        engine.collected_graph.as_ref().is_some_and(|graph| {
             graph.phase == GraphPhase::NativePrepare
                 && graph.removed.is_none()
                 && graph.ticket.is_some()
-        });
-        if taken {
-            saw_take = true;
-            break;
-        }
-    }
-    assert!(saw_take, "the take must happen");
+        })
+    });
     case.session.fail_collected_prepare.set(true);
     let mut verdict = None;
     // The release half of the cancel waits on the async worker; the
@@ -47462,20 +47437,19 @@ fn collected_graph_begin_error_before_mutation_returns_input() {
     // the cancel runs one credit at a time until the input comes back
     // untouched and the native cursor drains.
     let mut case = graph_case_with_exit(true);
-    let mut reached = false;
-    for _ in 0..512 {
-        if case
-            .engine
-            .collected_graph
-            .as_ref()
-            .is_some_and(|graph| graph.phase == GraphPhase::NativeBegin && !graph.mutated)
-        {
-            reached = true;
-            break;
-        }
-        case.service(1);
+    if !case
+        .engine
+        .collected_graph
+        .as_ref()
+        .is_some_and(|graph| graph.phase == GraphPhase::NativeBegin && !graph.mutated)
+    {
+        drive_graph_until(&mut case.engine, &mut case.session, |engine, _, _| {
+            engine
+                .collected_graph
+                .as_ref()
+                .is_some_and(|graph| graph.phase == GraphPhase::NativeBegin && !graph.mutated)
+        });
     }
-    assert!(reached, "NativeBegin before the first begin credit");
     case.session.fail_collected_begin.set(true);
     assert!(case.service(1).pending);
     case.session.fail_collected_begin.set(false);
@@ -48061,8 +48035,7 @@ fn collected_graph_install_pins_refusal_swaps_nothing() {
     let modules = case.engine.modules.clone();
     let slots = case.engine.plan.slots.clone();
     // Test-only seam: the pins sink is not ready at install.
-    case.engine.collected_graph.as_mut().expect("boxed").pins =
-        PinnedConservativeCursor::new();
+    case.engine.collected_graph.as_mut().expect("boxed").pins = PinnedConservativeCursor::new();
     assert!(case.service(1).pending);
     let graph = case.engine.collected_graph.as_ref().expect("boxed");
     assert_eq!(graph.verdict, Some(Verdict::RefusedRetained));
@@ -48105,8 +48078,7 @@ fn collected_graph_install_rebind_refusal_swaps_nothing() {
     let modules = case.engine.modules.clone();
     let slots = case.engine.plan.slots.clone();
     // Test-only seam: the rebind sink is not ready at install.
-    case.engine.collected_graph.as_mut().expect("boxed").rebind =
-        ScannedRebindCursor::new();
+    case.engine.collected_graph.as_mut().expect("boxed").rebind = ScannedRebindCursor::new();
     assert!(case.service(1).pending);
     let graph = case.engine.collected_graph.as_ref().expect("boxed");
     assert_eq!(graph.verdict, Some(Verdict::RefusedRetained));
@@ -48152,7 +48124,11 @@ fn collected_graph_install_backing_refusal_swaps_nothing() {
     let modules = case.engine.modules.clone();
     let slots = case.engine.plan.slots.clone();
     // Test-only seam: the backing sink is not ready at install.
-    case.engine.collected_graph.as_mut().expect("boxed").backing_storage = None;
+    case.engine
+        .collected_graph
+        .as_mut()
+        .expect("boxed")
+        .backing_storage = None;
     assert!(case.service(1).pending);
     let graph = case.engine.collected_graph.as_ref().expect("boxed");
     assert_eq!(graph.verdict, Some(Verdict::RefusedRetained));
@@ -49288,9 +49264,10 @@ fn collected_graph_installed_facts_stay_charged_while_canonical() {
     // The private hold lasts through the Reclaim drain (the index sets
     // stride off across steps 9-17); it releases with the graph at Done.
     drive_graph_until(&mut engine, &mut session, |engine, _, _| {
-        engine.collected_graph.as_ref().is_some_and(|graph| {
-            graph.phase == GraphPhase::Reclaim && graph.reclaim_step >= 17
-        })
+        engine
+            .collected_graph
+            .as_ref()
+            .is_some_and(|graph| graph.phase == GraphPhase::Reclaim && graph.reclaim_step >= 17)
     });
     let graph = engine.collected_graph.as_ref().expect("graph 2 boxed");
     assert_eq!(
@@ -49965,18 +49942,10 @@ fn collected_graph_matches_conservative_reference() {
     assert!(engine.manifests.is_empty());
     assert!(!engine.pinned.has_overlay_uncertainty());
     let (mut session, release, entered, _returned) = facts_attach_collected_carrier(&engine, false);
-    let mut submitted = false;
-    for _ in 0..512 {
-        let progress = engine
-            .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
-            .unwrap();
-        assert!(progress.pending);
-        if session.global_retirement.as_ref().unwrap().borrow().begins != 0 {
-            submitted = true;
-            break;
-        }
-    }
-    assert!(submitted, "pair 1 reaches the native handoff");
+    drive_graph_until(&mut engine, &mut session, |_, session, outcome| {
+        assert!(outcome.pending);
+        session.global_retirement.as_ref().unwrap().borrow().begins != 0
+    });
     entered
         .recv_timeout(std::time::Duration::from_secs(30))
         .unwrap();

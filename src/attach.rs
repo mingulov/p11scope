@@ -9201,8 +9201,8 @@ mod capture_policy {
         ] {
             let policy = CapturePolicy::Counter(mode);
             assert_eq!(policy.privacy_mode(), "aggregate-only");
-            assert_eq!(policy.uses_events(), false);
-            assert_eq!(policy.uses_unsafe_decoders(), false);
+            assert!(!policy.uses_events());
+            assert!(!policy.uses_unsafe_decoders());
             assert_eq!(policy.config_bit(), super::FLAG_POLICY_AGGREGATE);
         }
         assert_ne!(

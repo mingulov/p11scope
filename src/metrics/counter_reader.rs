@@ -2487,6 +2487,8 @@ mod tests {
         set(need, need)
     }
 
+    // rlim_t is 32-bit on ia32, so the u64 casts are needed off LP64.
+    #[allow(clippy::unnecessary_cast)]
     fn ensure_growth_fd_budget(final_count: usize) {
         let need = growth_fd_soft_floor(final_count);
         ensure_fd_budget_with(

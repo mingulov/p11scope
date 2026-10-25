@@ -322,19 +322,14 @@ fn production_geometry_for(object: &[u8], outputs: &str) -> Result<BankGeometry,
     BankGeometry::selected(bank_growth_token(mode))
 }
 
-/// Deterministic build gate, checked before the kernel probe: omitted
-/// counter objects (`=0`, SMALL, WIDE) and WIDE builds refuse every mode
-/// with `counter-mode-unavailable-in-build`. P0 and unsafe-compiled builds
-/// embed identical bytes and pass.
-fn check_counter_build(enabled: &str, outputs: &str, wide: bool) -> Result<(), String> {
+/// Deterministic build gate, checked before the kernel probe: builds that
+/// omit counter objects (`=0`, SMALL, WIDE) refuse every mode with
+/// `counter-mode-unavailable-in-build`. build.rs already folds WIDE into the
+/// emitted `ENABLED` flag, so this gate reads only the emitted pair. P0 and
+/// unsafe-compiled builds embed identical bytes and pass.
+fn check_counter_build(enabled: &str, outputs: &str) -> Result<(), String> {
     if enabled != "1" {
         return Err("counter-mode-unavailable-in-build: this build omits counter objects".into());
-    }
-    if wide {
-        return Err(
-            "counter-mode-unavailable-in-build: wide-detailed-2112 builds omit counter objects"
-                .into(),
-        );
     }
     if outputs.is_empty() {
         return Err("counter-mode-unavailable-in-build: counter objects were not emitted".into());
@@ -1700,7 +1695,6 @@ impl<'a> CounterPreparation<'a> {
         check_counter_build(
             env!("P11SCOPE_COUNTER_OBJECTS_ENABLED"),
             env!("P11SCOPE_COUNTER_OBJECTS_OUTPUTS"),
-            cfg!(feature = "wide-detailed-2112"),
         )
         .map_err(|refusal| anyhow::anyhow!("{refusal}"))?;
         // The 8192 owner cleanup calls helper 181 (bpf_loop, Linux 5.17+):
@@ -7585,29 +7579,18 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn counter_build_gate_refuses_disabled_and_wide() {
+    fn counter_build_gate_refuses_disabled() {
         for disabled in ["0", "", "2", "yes"] {
-            let refusal = super::check_counter_build(disabled, "", false).unwrap_err();
+            let refusal = super::check_counter_build(disabled, "").unwrap_err();
             assert!(
                 refusal.contains("counter-mode-unavailable-in-build"),
                 "{disabled:?}: {refusal}"
             );
         }
-        let wide = super::check_counter_build(
-            "1",
-            "counts-bank-growth-v2,timestamps-bank-growth-v2,latency-bank-growth-v2",
-            true,
-        )
-        .unwrap_err();
-        assert!(
-            wide.contains("counter-mode-unavailable-in-build"),
-            "wide: {wide}"
-        );
         assert!(
             super::check_counter_build(
                 "1",
                 "counts-bank-growth-v2,timestamps-bank-growth-v2,latency-bank-growth-v2",
-                false
             )
             .is_ok()
         );

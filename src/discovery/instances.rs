@@ -484,8 +484,9 @@ pub(crate) enum ObserveOutcome {
     New,
     /// Continuity: same epochs with no new range, or a new epoch triple
     /// over the same merged mapping with the local epoch unchanged, no
-    /// proven absence since, and the storage_null counter unmoved since
-    /// the key's last observation. The same instances continue.
+    /// proven absence since, no latched absence overflow, and the
+    /// storage_null counter unmoved since the key's last observation.
+    /// The same instances continue.
     Continued,
     /// A range appeared at unchanged epochs: sticky coverage fault.
     CoverageFault,
@@ -958,6 +959,7 @@ impl InstanceRouter {
             self.authority_failed = true;
             self.observed.clear();
             self.absent.clear();
+            self.absence_overflowed = false;
             self.ranges = 0;
             return self.fail_pending(|_| true, UnknownReason::AuthorityExhausted);
         }
@@ -974,6 +976,7 @@ impl InstanceRouter {
                 self.authority_failed = true;
                 self.observed.clear();
                 self.absent.clear();
+                self.absence_overflowed = false;
                 self.ranges = 0;
                 resolved.extend(self.fail_pending(|_| true, UnknownReason::AuthorityExhausted));
                 return resolved;
@@ -984,6 +987,7 @@ impl InstanceRouter {
             self.counters.eras = self.counters.eras.saturating_add(1);
             self.observed.clear();
             self.absent.clear();
+            self.absence_overflowed = false;
             self.ranges = 0;
             resolved.extend(self.fail_pending(|_| true, UnknownReason::FaultEra));
         } else if misses_moved {
@@ -994,6 +998,7 @@ impl InstanceRouter {
             self.counters.miss_eras = self.counters.miss_eras.saturating_add(1);
             self.observed.clear();
             self.absent.clear();
+            self.absence_overflowed = false;
             self.ranges = 0;
             resolved.extend(self.fail_pending(|_| true, UnknownReason::FaultEra));
         }
@@ -1004,6 +1009,7 @@ impl InstanceRouter {
         self.image_failed = true;
         self.observed.clear();
         self.absent.clear();
+        self.absence_overflowed = false;
         self.ranges = 0;
         self.fail_pending(|_| true, UnknownReason::CoverageFault)
     }
@@ -1012,6 +1018,7 @@ impl InstanceRouter {
         self.authority_failed = true;
         self.observed.clear();
         self.absent.clear();
+        self.absence_overflowed = false;
         self.ranges = 0;
         self.fail_pending(|_| true, UnknownReason::AuthorityExhausted)
     }
@@ -1131,12 +1138,17 @@ impl InstanceRouter {
     }
 
     /// Record that a scan proved the module unmapped for this (image,
-    /// file) key. The next successful observation for the key mints
-    /// instead of continuing, even over an unchanged mapping with an
-    /// unchanged local epoch. Retired, faulted and invalid keys are
-    /// ignored: they hold no continuity to break. At capacity the flag
-    /// is dropped, which preserves continuity (the pre-break behavior)
-    /// rather than joining anything wrongly.
+    /// file) key. The next observation for the key mints instead of
+    /// continuing, even over an unchanged mapping with an unchanged
+    /// local epoch — except a mapped scan at unchanged epochs, which
+    /// closes the window without minting (identical stamps could not
+    /// route calls apart). Retired, faulted and invalid keys are
+    /// ignored: they hold no continuity to break. When the flag table
+    /// is full the break cannot be recorded for its key; the router
+    /// latches an overflow and counts the drop instead of joining
+    /// silently: the next observation that would otherwise continue
+    /// mints and consumes the latch, so one dropped flag costs at most
+    /// one spurious split. Never allocates past the cap.
     pub(crate) fn note_proven_absence(&mut self, image: ImageIdentity, file: u32) {
         let key = ImageKey::from(image);
         if RetirementLedger::index(key.cookie).is_none()
@@ -1300,7 +1312,7 @@ impl InstanceRouter {
                 // split/merge artifacts; a real remap, unmap, permission
                 // change, exec or new incarnation still mints.
                 let broken = self.absent.remove(&key);
-                let continued = self
+                let mut continued = self
                     .observed
                     .get(&key)
                     .and_then(|list| list.back())
@@ -1311,6 +1323,15 @@ impl InstanceRouter {
                             && same_mapping(&current.ranges, &observation.ranges)
                     })
                     .map(|current| current.partitions.clone());
+                if continued.is_some() && self.absence_overflowed {
+                    // The flag table dropped a proven absence earlier, so
+                    // some key's break is missing: split (mint) instead of
+                    // joining, and consume the latch so one dropped flag
+                    // costs at most one spurious split. Observations that
+                    // mint for their own reasons leave the latch set.
+                    self.absence_overflowed = false;
+                    continued = None;
+                }
                 if let Some(partitions) = continued {
                     self.counters.continued += 1;
                     self.ranges += observation.ranges.len();

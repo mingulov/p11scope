@@ -1177,7 +1177,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // Only native/counter leaves are substituted. Dispatch and the
         // lifecycle consequence observed by the test remain real Engine work.
         let mut session = crate::discovery::engine::session_fixture::ScriptedSession::default();
-        let reserve = self.registry.semantic_storage_reserver();
+        let reserve = self.engine.collected_graph_reserver();
         #[cfg(test)]
         {
             self.engine_collected_finish_calls =
@@ -1316,7 +1316,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 Ok((records, malformed))
             }
         };
-        let reserve = self.registry.semantic_storage_reserver();
+        let reserve = self.engine.collected_graph_reserver();
         #[cfg(test)]
         {
             self.engine_collected_finish_calls =

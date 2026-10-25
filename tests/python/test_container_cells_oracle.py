@@ -143,8 +143,9 @@ def pre_edges():
 
 def span_edges(b_pre_m8_cov="watched_no_use", b_pre_m8_since=3000,
                b_pre_m8_count=0, b3_m8_cov="watched_no_use", b3_m8_count=0):
-    # Live runs 5/6: the twin is new-only maps_match (first scanned after
-    # the collapse resolves); B-pre keeps old-ended plus new-mapped.
+    # Live runs 5/6 (dev, over the deep-scan cap): the twin is new-only
+    # maps_match (first scanned after the collapse resolves); B-pre keeps
+    # old-ended plus new-mapped.
     return [edge(PID_A, "m7"),
             edge(PID_B_PRE, "m7", state="ended"),
             edge(PID_B_PRE, "m8", cov=b_pre_m8_cov, since=b_pre_m8_since,
@@ -153,6 +154,23 @@ def span_edges(b_pre_m8_cov="watched_no_use", b_pre_m8_since=3000,
                  since=3000, first_seen=2000),
             edge(PID_B3, "m8", evidence="maps_match", cov=b3_m8_cov,
                  since=3000, count=b3_m8_count, first_seen=2000)]
+
+
+def span_edges_twin_old(b3_m7_count=0, b3_m7_cov="unknown",
+                        b3_m8_count=0, b3_m8_cov="watched_no_use"):
+    # Fedora d1fed1 (under the cap: every pid deep-scanned): the twin is
+    # first scanned before the collapse resolves, so it keeps an ended
+    # old edge plus the mapped new edge, both deep_scan, like B-pre.
+    return [edge(PID_A, "m7"),
+            edge(PID_B_PRE, "m7", state="ended"),
+            edge(PID_B_PRE, "m8", cov="watched_no_use", since=3000,
+                 first_seen=2000),
+            edge(PID_B_SPAN, "m8", cov="watched_no_use",
+                 since=3000, first_seen=2000),
+            edge(PID_B3, "m7", state="ended", count=b3_m7_count,
+                 cov=b3_m7_cov, first_seen=2000),
+            edge(PID_B3, "m8", cov=b3_m8_cov, since=3000,
+                 count=b3_m8_count, first_seen=2000)]
 
 
 def good_copy_up_inputs(lane="B"):
@@ -256,7 +274,7 @@ class CopyUpTest(unittest.TestCase):
         self.assertEqual(result["known_issue"],
                          {"pid": PID_B_PRE, "old_module": "m7", "new_module": "m8"})
         self.assertEqual(result["b_pre_round2"], {"measured": False})
-        self.assertIn("checked no container edge",
+        self.assertIn("no proof attempted",
                       result["kernel_proof"]["finding"])
 
     def test_lane_a_healthy_passes(self):
@@ -313,15 +331,43 @@ class CopyUpTest(unittest.TestCase):
         with self.assertRaises(AssertionError):
             check_copy_up(pre_kernel=pre)
 
-    def test_pre_kernel_identity_must_report_kernel_with_fallback(self):
+    def test_pre_kernel_identity_none_or_known_fallback(self):
+        """Forced kernel with null fallback (no proof attempted) passes."""
+        inputs = good_copy_up_inputs()
+        for key in ("pre_kernel", "span_kernel", "fresh_kernel"):
+            inputs[key]["observation"]["identity"]["fallback"] = None
+        result = ORACLE["copy_up"](**inputs)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["kernel_proof"]["runs"]["pre-kernel"],
+                         {"backend": "kernel", "fallback": None})
+
+    def test_pre_kernel_identity_unknown_fallback_fails(self):
+        pre = inventory(pre_edges(), [collapse_gap()], backend="kernel",
+                        fallback="frobnicate", modules=dict(D1_MODULES_PRE))
+        with self.assertRaises(AssertionError):
+            check_copy_up(pre_kernel=pre)
+
+    def test_pre_kernel_identity_wrong_backend_fails(self):
         pre = inventory(pre_edges(), [collapse_gap()], backend="userspace",
                         fallback=None, modules=dict(D1_MODULES_PRE))
         with self.assertRaises(AssertionError):
             check_copy_up(pre_kernel=pre)
-        pre = inventory(pre_edges(), [collapse_gap()], backend="kernel",
-                        fallback=None, modules=dict(D1_MODULES_PRE))
-        with self.assertRaises(AssertionError):
-            check_copy_up(pre_kernel=pre)
+
+    def test_backends_disagree_on_provider_edge_fails(self):
+        """Null fallback without agreement is not a pass (named)."""
+        inputs = good_copy_up_inputs()
+        for key in ("pre_kernel", "span_kernel", "fresh_kernel"):
+            inputs[key]["observation"]["identity"]["fallback"] = None
+        split = [item if (item["pid"], item["module"]) !=
+                 (PID_B_PRE, "m8")
+                 else edge(PID_B_PRE, "m8", cov="counted", since=3000,
+                           count=9, first_seen=2000)
+                 for item in span_edges()]
+        inputs["span_userspace"] = inventory(
+            split, [collapse_gap()], backend="userspace", fallback=None,
+            modules=dict(D1_MODULES_SPAN))
+        with self.assertRaisesRegex(AssertionError, "disagree"):
+            ORACLE["copy_up"](**inputs)
 
     def test_pre_profile_b_wrong_count_fails(self):
         with self.assertRaises(AssertionError):
@@ -469,14 +515,94 @@ class CopyUpTest(unittest.TestCase):
         self.assertEqual(record["span_userspace"]["m8_entries"], 0)
         self.assertEqual(record["span_kernel"]["m8_status"], "watched_no_use")
         self.assertIsNone(record["span_kernel"]["m7_entries"])
+        self.assertEqual(record["twin_shape"], "new-only")
+        self.assertEqual(record["span_kernel"]["counted"], 0)
 
-    def test_round2_twin_old_edge_fails(self):
-        """A twin first scanned after the collapse resolves is new-only."""
-        edges = span_edges() + [edge(PID_B3, "m7", state="ended")]
+    def test_round2_twin_old_ended_passes(self):
+        """Fedora twin: old-ended plus new-mapped, both deep_scan."""
+        kernel = inventory(span_edges_twin_old(), [collapse_gap()],
+                           backend="kernel", modules=dict(D1_MODULES_SPAN))
+        userspace = inventory(span_edges_twin_old(), [collapse_gap()],
+                              backend="userspace", fallback=None,
+                              modules=dict(D1_MODULES_SPAN))
+        record = check_copy_up(span_kernel=kernel, span_userspace=userspace,
+                               b_pre_round2_calls=1500,
+                               b_pre_round2_pid=PID_B3)["b_pre_round2"]
+        self.assertEqual(record["twin_shape"], "old-ended-plus-new")
+        self.assertEqual(record["span_kernel"]["m7_entries"], 0)
+        self.assertEqual(record["span_kernel"]["counted"], 0)
+        self.assertEqual(record["span_userspace"]["counted"], 0)
+
+    def test_round2_twin_old_mapped_fails_named(self):
+        edges = [item if (item["pid"], item["module"]) != (PID_B3, "m7")
+                 else edge(PID_B3, "m7")
+                 for item in span_edges_twin_old()]
         bad = inventory(edges, [collapse_gap()], backend="kernel",
                         modules=dict(D1_MODULES_SPAN))
-        with self.assertRaisesRegex(AssertionError, "must not have an old-module edge"):
+        with self.assertRaisesRegex(AssertionError, "is not ended"):
             check_copy_up(span_kernel=bad, b_pre_round2_calls=1500,
+                          b_pre_round2_pid=PID_B3)
+
+    def test_round2_twin_old_evidence_fails_named(self):
+        """Shape (b) needs both edges deep_scan: mixed evidence fails."""
+        old_match = [item if (item["pid"], item["module"]) != (PID_B3, "m7")
+                     else edge(PID_B3, "m7", evidence="maps_match",
+                               state="ended")
+                     for item in span_edges_twin_old()]
+        new_match = [item if (item["pid"], item["module"]) != (PID_B3, "m8")
+                     else edge(PID_B3, "m8", evidence="maps_match",
+                               cov="watched_no_use", since=3000,
+                               first_seen=2000)
+                     for item in span_edges_twin_old()]
+        for label, edges in (("old maps_match", old_match),
+                             ("new maps_match", new_match)):
+            with self.subTest(label):
+                bad = inventory(edges, [collapse_gap()], backend="kernel",
+                                modules=dict(D1_MODULES_SPAN))
+                with self.assertRaisesRegex(AssertionError, "deep_scan"):
+                    check_copy_up(span_kernel=bad, b_pre_round2_calls=1500,
+                                  b_pre_round2_pid=PID_B3)
+
+    def test_round2_twin_old_counted_passes(self):
+        """Shape (b) fixed: old + new together equal the ledger."""
+        for label, edges in (
+                ("all on the new edge",
+                 span_edges_twin_old(b3_m8_count=1500, b3_m8_cov="counted")),
+                ("all on the old edge",
+                 span_edges_twin_old(b3_m7_count=1500, b3_m7_cov="counted"))):
+            with self.subTest(label):
+                kernel = inventory(edges, [collapse_gap()],
+                                   backend="kernel",
+                                   modules=dict(D1_MODULES_SPAN))
+                userspace = inventory(edges, [collapse_gap()],
+                                      backend="userspace", fallback=None,
+                                      modules=dict(D1_MODULES_SPAN))
+                record = check_copy_up(
+                    span_kernel=kernel, span_userspace=userspace,
+                    b_pre_round2_calls=1500,
+                    b_pre_round2_pid=PID_B3)["b_pre_round2"]
+                self.assertEqual(record["span_kernel"]["counted"], 1500)
+
+    def test_round2_twin_old_partial_fails_named(self):
+        """Shape (b) partial on either edge fails named."""
+        for label, edges in (
+                ("new edge partial",
+                 span_edges_twin_old(b3_m8_count=9, b3_m8_cov="counted")),
+                ("old edge partial",
+                 span_edges_twin_old(b3_m7_count=9, b3_m7_cov="counted"))):
+            with self.subTest(label):
+                bad = inventory(edges, [collapse_gap()], backend="kernel",
+                                modules=dict(D1_MODULES_SPAN))
+                with self.assertRaisesRegex(AssertionError, "partial"):
+                    check_copy_up(span_kernel=bad, b_pre_round2_calls=1500,
+                                  b_pre_round2_pid=PID_B3)
+
+    def test_round2_twin_shape_disagree_fails(self):
+        userspace = inventory(span_edges_twin_old(), [collapse_gap()],
+                              backend="userspace", fallback=None,
+                              modules=dict(D1_MODULES_SPAN))
+        with self.assertRaisesRegex(AssertionError, "twin shape"):
+            check_copy_up(span_userspace=userspace, b_pre_round2_calls=1500,
                           b_pre_round2_pid=PID_B3)
 
     def test_round2_twin_counted_passes(self):

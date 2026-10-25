@@ -11663,6 +11663,7 @@ mod promotion_driver_tests {
         cleanup: WindDownCleanup,
         nonempty_finish: bool,
         gate: Option<Arc<(Mutex<bool>, Condvar)>>,
+        release_after_polls: Option<usize>,
         pub(crate) fail_poll: bool,
         quiescent: bool,
         submits: Rc<Cell<usize>>,
@@ -11688,6 +11689,7 @@ mod promotion_driver_tests {
                 cleanup: Box::new(|_| Ok(())),
                 nonempty_finish: false,
                 gate: None,
+                release_after_polls: None,
                 fail_poll: false,
                 quiescent: true,
                 submits: Rc::new(Cell::new(0)),
@@ -11708,6 +11710,7 @@ mod promotion_driver_tests {
                 cleanup: Box::new(|_| Ok(())),
                 nonempty_finish: true,
                 gate: None,
+                release_after_polls: None,
                 fail_poll: false,
                 quiescent: true,
                 submits: Rc::new(Cell::new(0)),
@@ -11777,6 +11780,16 @@ mod promotion_driver_tests {
             self.threads.borrow_mut().push(std::thread::current().id());
             if self.fail_poll {
                 anyhow::bail!("scripted genuine Unproved detach");
+            }
+            // A detach that joins mid-wait: release the gate once the
+            // poll count reaches the scripted step, so the same poll
+            // observes the join deterministically, with no thread.
+            if self
+                .release_after_polls
+                .is_some_and(|at| self.polls.get() >= at)
+                && let Some(gate) = &self.gate
+            {
+                release_gate(gate);
             }
             match &self.gate {
                 None => {
@@ -14957,14 +14970,17 @@ mod promotion_driver_tests {
     }
 
     #[test]
-    fn consume_gated_published_lane_holds_past_deadline() {
-        // Past the run deadline the terminal consume holds a
-        // still-Published lane for exit instead of waiting on:
-        // Abandoned, held, one gap, first error kept.
+    fn consume_published_lane_past_run_deadline_completes_without_gap() {
+        // The run deadline (--duration end) is not a stop budget: a
+        // Published detach that needs several 10 ms steps still joins
+        // past the deadline with no hold, no gap and no first error.
+        // Only the second operator signal interrupts the wait, like
+        // the legacy owned-detach wait.
         let mut coordinator = coordinator();
         let headless = headless_display();
         let mut driver = driver_with_display(&mut coordinator, headless.display);
-        let (io, _gate) = WindDownIo::gated();
+        let (mut io, _gate) = WindDownIo::gated();
+        io.release_after_polls = Some(3);
         let polls = Rc::clone(&io.polls);
         let mut lane = joint_lane(io, true);
         lane.set_test_joint_frame(false);
@@ -14984,27 +15000,31 @@ mod promotion_driver_tests {
         let (_stopped, _error, _zero) = driver.consume_outcome(outcome, &clock, &mut |_, _| Ok(()));
         assert!(
             start.elapsed() < Duration::from_secs(1),
-            "the expired deadline returns the consume promptly"
+            "the past-deadline wait joins promptly"
+        );
+        assert_eq!(
+            polls.get(),
+            3,
+            "three steps run past the deadline without a hold"
+        );
+        assert!(
+            driver.semantic.is_none(),
+            "the joined lane releases at the consume"
         );
         assert_eq!(
             driver.joint_finish,
-            JointFinishDriver::Abandoned,
-            "the expired deadline holds the Published wait"
+            JointFinishDriver::Published,
+            "no hold abandons the joined finish"
         );
-        assert!(driver.semantic.is_none(), "the hold keeps its lane");
-        assert_eq!(polls.get(), 1, "one poll, then the hold");
-        assert_eq!(
-            driver.joint_first_error.as_deref(),
-            Some("joint finish held for exit"),
-            "the hold keeps its cause"
+        assert!(
+            driver.joint_first_error.is_none(),
+            "no error on a clean join past the deadline"
         );
-        assert_eq!(
-            gaps(&mut driver)
-                .iter()
-                .filter(|(subject, _)| subject == "joint finish held for exit")
-                .count(),
-            1,
-            "the hold discloses once: {:?}",
+        assert!(
+            gaps(&mut driver).iter().all(|(subject, _)| {
+                subject != "joint finish held for exit" && subject != "joint wound-down failed"
+            }),
+            "a normal stop past the deadline gains no gap: {:?}",
             gaps(&mut driver)
         );
     }

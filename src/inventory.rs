@@ -13891,6 +13891,100 @@ mod promotion_driver_tests {
     }
 
     #[test]
+    fn stop_during_legacy_winding_holds_lane_and_records_one_gap() {
+        // A stop during a legacy wind-down never reaps it (no ticks
+        // follow the stop): the driver holds the lane for exit
+        // instead of dropping it, and the stop path records exactly
+        // one gap before the final commit publishes it.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let drops = Rc::new(Cell::new(0));
+        {
+            let mut driver = driver_with_display(&mut coordinator, headless.display);
+            let (io, _gate) = WindDownIo::gated();
+            let mut io = io;
+            io.drop_spy = Some(Rc::clone(&drops));
+            driver.semantic = Some(wind_down_lane(io));
+            let domain = install_promotion_for_wind_down(&mut driver);
+            quiesce_domain_for_retire(&mut *driver.coordinator, domain);
+            let (source, _, _) =
+                CountingSource::scripted(Some(SessionNativeCompletion::scripted(domain)));
+            driver.completion_source = Some(Box::new(source));
+            driver.wind_down_installed_promotion(PromotionEnd::Cancelled);
+            driver.on_tick();
+            assert_eq!(
+                driver.retiring_domain(),
+                Some(domain),
+                "the gated detach holds the winding"
+            );
+            driver.on_stop_requested();
+            let holds: Vec<(String, String)> = gaps(&mut driver)
+                .into_iter()
+                .filter(|(subject, _)| subject == "promotion wind-down held for exit")
+                .collect();
+            assert_eq!(
+                holds.len(),
+                1,
+                "exactly one unjoined-winding gap: {:?}",
+                gaps(&mut driver)
+            );
+            assert_eq!(
+                holds[0].1, "stop during a legacy wind-down; the lane is held for exit",
+                "the gap names the unjoined legacy winding"
+            );
+            // The driver drops here with the winding still held.
+        }
+        assert_eq!(drops.get(), 0, "a hold, not a drop");
+    }
+
+    #[test]
+    fn stop_during_joint_winding_holds_lane_and_records_one_gap() {
+        // The Joint twin: a stop during A's promotion finish holds
+        // the winding lane for exit with exactly one gap (beside the
+        // pre-existing terminal-stop-during-promotion disclosure).
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let drops = Rc::new(Cell::new(0));
+        {
+            let mut driver = driver_with_display(&mut coordinator, headless.display);
+            let (io, _gate) = WindDownIo::gated();
+            let mut io = io;
+            io.drop_spy = Some(Rc::clone(&drops));
+            driver.semantic = Some(joint_lane(io, true));
+            let domain = install_promotion_for_wind_down(&mut driver);
+            quiesce_domain_for_retire(&mut *driver.coordinator, domain);
+            let (source, _, _) =
+                CountingSource::scripted(Some(SessionNativeCompletion::scripted(domain)));
+            driver.completion_source = Some(Box::new(source));
+            driver.wind_down_installed_promotion(PromotionEnd::Cancelled);
+            driver.on_tick();
+            assert_eq!(
+                driver.retiring_domain(),
+                Some(domain),
+                "the gated finish holds the winding"
+            );
+            driver.on_stop_requested();
+            let holds: Vec<(String, String)> = gaps(&mut driver)
+                .into_iter()
+                .filter(|(subject, _)| subject == "promotion wind-down held for exit")
+                .collect();
+            assert_eq!(
+                holds.len(),
+                1,
+                "exactly one unjoined-winding gap: {:?}",
+                gaps(&mut driver)
+            );
+            assert_eq!(
+                holds[0].1,
+                "stop during a Joint promotion finish; the lane is held for exit",
+                "the gap names the unjoined Joint winding"
+            );
+            // The driver drops here with the winding still held.
+        }
+        assert_eq!(drops.get(), 0, "a hold, not a drop");
+    }
+
+    #[test]
     fn legacy_h3_staged_lane_winds_down_and_retires_on_cancel() {
         use crate::discovery::engine::inventory_coordinator::semantics::JointRetireRefusal;
         // A legacy lane (no Joint seam) whose finalized batch staged

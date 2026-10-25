@@ -316,6 +316,72 @@ unsigned long C_GetFunctionList(void **out) {
 }
 """
 
+ABI_HIBIT32_PROVIDER = """/* Test-only 32-bit high-bit stub: entries 0..1 return high-bit RVs. */
+#define _GNU_SOURCE
+#include <stddef.h>
+typedef struct {
+    unsigned char major, minor;
+    unsigned char reserved[6];
+    void *functions[104];
+} AbiHi32Table;
+int P11ScopeSlot68;
+static unsigned long hi32_bit31(void **out) {
+    (void)out;
+    return 0x80000000UL;
+}
+static unsigned long hi32_allbits(void **out) {
+    (void)out;
+    return 0xFFFFFFFFUL;
+}
+static unsigned long hi32_noop(void **out) {
+    (void)out;
+    return 0;
+}
+static AbiHi32Table abi_hi32_table;
+__attribute__((constructor)) static void abi_hi32_init(void) {
+    abi_hi32_table.major = 3;
+    abi_hi32_table.minor = 2;
+    for (int i = 0; i < 104; i++) {
+        abi_hi32_table.functions[i] = (void *)hi32_noop;
+    }
+    abi_hi32_table.functions[0] = (void *)hi32_bit31;
+    abi_hi32_table.functions[1] = (void *)hi32_allbits;
+}
+unsigned long C_GetFunctionList(void **out) {
+    if (out == NULL) {
+        return 7;
+    }
+    *out = &abi_hi32_table;
+    return 0;
+}
+"""
+
+# Slot 0..67 dlsym names, copied from standard_names in
+# tests/fixtures/abi-execution/abi-104.c; the mixed-identity twin below
+# exports these plus P11ScopeSlot69..103 as functions with the
+# P11ScopeSlot68 marker variable at slot 68.
+STANDARD68 = (
+    "C_Initialize", "C_Finalize", "C_GetInfo", "P11ScopeSlot3",
+    "C_GetSlotList", "C_GetSlotInfo", "C_GetTokenInfo", "C_GetMechanismList",
+    "C_GetMechanismInfo", "C_InitToken", "C_InitPIN", "C_SetPIN",
+    "C_OpenSession", "C_CloseSession", "C_CloseAllSessions",
+    "C_GetSessionInfo", "C_GetOperationState", "C_SetOperationState",
+    "C_Login", "C_Logout", "C_CreateObject", "C_CopyObject",
+    "C_DestroyObject", "C_GetObjectSize", "C_GetAttributeValue",
+    "C_SetAttributeValue", "C_FindObjectsInit", "C_FindObjects",
+    "C_FindObjectsFinal", "C_EncryptInit", "C_Encrypt", "C_EncryptUpdate",
+    "C_EncryptFinal", "C_DecryptInit", "C_Decrypt", "C_DecryptUpdate",
+    "C_DecryptFinal", "C_DigestInit", "C_Digest", "C_DigestUpdate",
+    "C_DigestKey", "C_DigestFinal", "C_SignInit", "C_Sign", "C_SignUpdate",
+    "C_SignFinal", "C_SignRecoverInit", "C_SignRecover", "C_VerifyInit",
+    "C_Verify", "C_VerifyUpdate", "C_VerifyFinal", "C_VerifyRecoverInit",
+    "C_VerifyRecover", "C_DigestEncryptUpdate", "C_DecryptDigestUpdate",
+    "C_SignEncryptUpdate", "C_DecryptVerifyUpdate", "C_GenerateKey",
+    "C_GenerateKeyPair", "C_WrapKey", "C_UnwrapKey", "C_DeriveKey",
+    "C_SeedRandom", "C_GenerateRandom", "C_GetFunctionStatus",
+    "C_CancelFunction", "C_WaitForSlotEvent",
+)
+
 ABI_REFUSAL_PROVIDER = """/* Test-only non-stub provider: no marker export, so the stub-only emitter refuses it. */
 #define _GNU_SOURCE
 #include <stddef.h>
@@ -849,7 +915,7 @@ class AbiCompareTwins(unittest.TestCase):
 
     def test_healthy_cell_join_passes(self):
         oracle = require_oracle(self)
-        for tag in ("g31-575", "n-plus-1"):
+        for tag in ("g31-575", "g31-576", "g31-577", "n", "n-plus-1"):
             with self.subTest(tag=tag):
                 rows = cell_ledger(tag=tag)
                 result = oracle.compare_abi(rows, healthy_counts(rows))
@@ -877,6 +943,23 @@ class AbiCompareTwins(unittest.TestCase):
                        "rv": [0]})
         with self.assertRaisesRegex(oracle.LedgerError, "counts without ledger rows"):
             oracle.compare_abi(rows, counts)
+
+    def test_mutation_call_less_against_empty_counts_rejected(self):
+        oracle = require_oracle(self)
+        rows = build_ledger()
+        summary = oracle.validate_ledger(rows)
+        self.assertEqual((summary["issued"], summary["blocked"]), (0, 0))
+        with self.assertRaisesRegex(oracle.LedgerError,
+                                    "comparison without ledger populations"):
+            oracle.compare_abi(rows, [])
+
+    def test_mutation_calls_against_empty_counts_rejected(self):
+        oracle = require_oracle(self)
+        rows = threads_ledger()
+        oracle.validate_ledger(rows)
+        with self.assertRaisesRegex(oracle.LedgerError,
+                                    "comparison without observed populations"):
+            oracle.compare_abi(rows, [])
 
     def test_mutation_calls_disagree_rejected(self):
         oracle = require_oracle(self)
@@ -1051,6 +1134,78 @@ class AbiEmissionTests(unittest.TestCase):
             capture_output=True, text=True, timeout=120)
         self.assertEqual(build.returncode, 0, build.stderr)
         return provider
+
+    def build_fixture_m32(self, tmp):
+        if not shutil.which("gcc"):
+            self.skipTest("requires gcc; installs nothing")
+        if not FIXTURE_SRC.is_file():
+            self.fail(f"fixture missing: {FIXTURE_SRC} (implementation not present)")
+        fixture = Path(tmp) / "abi-104-32"
+        build = subprocess.run(
+            ["gcc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
+             "-m32", "-pthread", str(FIXTURE_SRC), "-ldl", "-o", str(fixture)],
+            capture_output=True, text=True, timeout=180)
+        self.assertEqual(build.returncode, 0, build.stderr)
+        return fixture
+
+    def build_inline_provider_m32(self, tmp, name, source):
+        if not shutil.which("gcc"):
+            self.skipTest("requires gcc; installs nothing")
+        provider_c = Path(tmp) / (name + ".c")
+        provider = Path(tmp) / (name + ".so")
+        provider_c.write_text(source, encoding="utf-8")
+        build = subprocess.run(
+            ["gcc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
+             "-m32", "-fPIC", "-shared", "-Wl,-z,defs",
+             "-o", str(provider), str(provider_c)],
+            capture_output=True, text=True, timeout=180)
+        self.assertEqual(build.returncode, 0, build.stderr)
+        return provider
+
+    def build_mixed_provider(self, tmp):
+        if not shutil.which("gcc"):
+            self.skipTest("requires gcc; installs nothing")
+        self.assertEqual(len(STANDARD68), 68)
+        names = list(STANDARD68) + [f"P11ScopeSlot{i}" for i in range(69, 104)]
+        parts = ["""/* Test-only mixed-identity stub: 103 named functions plus
+ * the P11ScopeSlot68 marker variable at slot 68. Generated. */
+#define _GNU_SOURCE
+#include <stddef.h>
+typedef struct {
+    unsigned char major, minor;
+    unsigned char reserved[6];
+    void *functions[104];
+} AbiMixedTable;
+int P11ScopeSlot68;
+static unsigned long mixed_slot68(void **out) {
+    (void)out;
+    return 0;
+}
+"""]
+        for name in names:
+            parts.append(f"unsigned long {name}(void **out) {{\n"
+                         "    (void)out;\n"
+                         "    return 0;\n"
+                         "}\n")
+        parts.append("static AbiMixedTable abi_mixed_table;\n"
+                     "__attribute__((constructor)) static void abi_mixed_init(void) {\n"
+                     "    abi_mixed_table.major = 3;\n"
+                     "    abi_mixed_table.minor = 2;\n")
+        for index, name in enumerate(names[:68]):
+            parts.append(f"    abi_mixed_table.functions[{index}] = (void *){name};\n")
+        parts.append("    abi_mixed_table.functions[68] = (void *)mixed_slot68;\n")
+        for index, name in enumerate(names[68:], start=69):
+            parts.append(f"    abi_mixed_table.functions[{index}] = (void *){name};\n")
+        parts.append("""}
+unsigned long C_GetFunctionList(void **out) {
+    if (out == NULL) {
+        return 7;
+    }
+    *out = &abi_mixed_table;
+    return 0;
+}
+""")
+        return self.build_inline_provider(tmp, "mixed", "".join(parts))
 
     def assert_full_shape(self, rows, child_pid):
         calls = [row for row in rows if row["kind"] == "call"]
@@ -1253,6 +1408,44 @@ class AbiEmissionTests(unittest.TestCase):
                               0x80000000, 0])
             result = oracle.compare_abi(rows, healthy_counts(rows))
             self.assertEqual(result["returns"], 4)
+
+    def test_fixture_rv64_ia32_records_high_bit(self):
+        oracle = require_oracle(self)
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self.build_fixture_m32(tmp)
+            provider = self.build_inline_provider_m32(
+                tmp, "hibit32", ABI_HIBIT32_PROVIDER)
+            ledger = Path(tmp) / "ledger.jsonl"
+            completed = subprocess.run(
+                [str(fixture), str(provider), str(ledger), "", "rv64"],
+                capture_output=True, text=True, timeout=60)
+            self.assertEqual(completed.returncode, 1, completed.stderr)
+            with open(ledger, encoding="utf-8") as stream:
+                rows = oracle.read_ledger(stream)
+            summary = oracle.validate_ledger(rows)
+            self.assertEqual(summary["issued"], 4)
+            calls = [row for row in rows if row.get("kind") == "call"]
+            self.assertEqual([call["rv"] for call in calls],
+                             [0x80000000, 0xFFFFFFFF, 0, 0])
+            result = oracle.compare_abi(rows, healthy_counts(rows))
+            self.assertEqual(result["returns"], 4)
+
+    def test_fixture_mixed_identity_refused(self):
+        require_oracle(self)
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self.build_fixture(tmp)
+            provider = self.build_mixed_provider(tmp)
+            ledger = Path(tmp) / "ledger.jsonl"
+            completed = subprocess.run(
+                [str(fixture), str(provider), str(ledger)],
+                capture_output=True, text=True, timeout=60)
+            self.assertEqual(completed.returncode, 2, completed.stderr)
+            self.assertIn("entry identity mismatch (103 of 104 names "
+                          "resolve)", completed.stderr)
+            self.assertNotIn("READY", completed.stdout)
+            self.assertFalse(ledger.exists())
+
+
 
     def test_fixture_entry_bounds(self):
         oracle = require_oracle(self)

@@ -105,8 +105,18 @@ fn observation_for_epochs(
     global: u64,
     ranges: Vec<MapRange>,
 ) -> StableObservation {
+    observation_at(cookie, FILE, local, global, ranges)
+}
+
+fn observation_at(
+    cookie: u64,
+    file: u32,
+    local: u64,
+    global: u64,
+    ranges: Vec<MapRange>,
+) -> StableObservation {
     StableObservation {
-        file_slot: FILE,
+        file_slot: file,
         reading: EpochReading {
             cookie,
             local,
@@ -664,11 +674,14 @@ fn observed_absence_breaks_continuity() {
 
 #[test]
 fn proven_absence_is_keyed_by_image_and_file() {
-    // The break touches only its own (image, file) key: absences
-    // recorded for another file or another image leave this key's
-    // global-only continuity alone.
+    // The break touches only its own (image, file) key: flags recorded
+    // for another file of the same image and for another image leave
+    // this key's global-only continuity alone, and each flagged key
+    // mints on its own global-only move.
     let mut r = router();
     r.observe_legacy(observation(2, 0, 0, load(BASE_A)));
+    r.observe_legacy(observation_at(COOKIE, FILE + 1, 2, 0, load(BASE_A)));
+    r.observe_legacy(observation_for(COOKIE + 1, 2, load(BASE_A)));
     let old = joined(r.route(call(1, stamp(2, 0, 0), ip_in(BASE_A))));
     r.note_proven_absence(image(COOKIE, 0), FILE + 1);
     r.note_proven_absence(image(COOKIE + 1, 0), FILE);
@@ -677,7 +690,19 @@ fn proven_absence_is_keyed_by_image_and_file() {
         ObserveOutcome::Continued
     );
     assert_eq!(joined(r.route(call(2, stamp(2, 1, 0), ip_in(BASE_A)))), old);
-    assert_eq!(r.instances_minted(), 1);
+    assert_eq!(
+        r.observe_legacy(observation_at(COOKIE, FILE + 1, 2, 1, load(BASE_A)))
+            .0,
+        ObserveOutcome::New,
+        "the other file's flag breaks only its own key"
+    );
+    assert_eq!(
+        r.observe_legacy(observation_for_epochs(COOKIE + 1, 2, 1, load(BASE_A)))
+            .0,
+        ObserveOutcome::New,
+        "the other image's flag breaks only its own key"
+    );
+    assert_eq!(r.instances_minted(), 5);
 }
 
 #[test]
@@ -759,10 +784,10 @@ fn absence_table_full_of_observed_keys_never_overflows() {
 }
 
 #[test]
-fn absence_below_capacity_mints_through_the_flag_without_overflow() {
-    // The healthy twin: below capacity the same script records the flag
-    // (no latch, the counter stays zero) and the reload mints through
-    // it; a further advance continues.
+fn a_flagged_key_mints_with_other_flags_recorded() {
+    // Several recorded flags coexist: the flagged key mints through
+    // its own flag (no latch, the counter stays zero), the mint count
+    // is exact, and a further advance continues.
     let mut r = InstanceRouter::new(
         domain(),
         RouterLimits {
@@ -809,7 +834,7 @@ fn absence_below_capacity_mints_through_the_flag_without_overflow() {
 }
 
 #[test]
-fn same_epoch_scan_at_full_absence_table_continues_without_overflow() {
+fn same_epoch_scan_consumes_only_its_own_flag() {
     // Identical stamps cannot route calls apart, so a mapped scan at
     // unchanged epochs continues even with the flag table full — and it
     // consumes that key's flag, so the next global-only advance still
@@ -882,6 +907,11 @@ fn absence_flags_clear_on_fault_era_advance_without_overflow() {
     r.note_proven_absence(image(COOKIE + 1, 0), FILE);
     assert_eq!(r.counters().absence_overflows, 0);
     assert!(r.audit(1, 0, 0).is_empty());
+    let rendered = format!("{r:?}");
+    assert!(
+        rendered.contains("absent_keys: 0"),
+        "the era cleared the flags: {rendered}"
+    );
     assert_eq!(
         r.observe_legacy(fresh(&r, observation(2, 0, 1, load(BASE_A))))
             .0,
@@ -1022,6 +1052,89 @@ fn coverage_fault_clears_the_absence_flag() {
             .0,
         ObserveOutcome::New,
         "the live key's break still mints"
+    );
+}
+
+#[test]
+fn eviction_drops_the_evicted_keys_absence_flag() {
+    // Capacity eviction drops the evicted key's observation; its
+    // absence flag drops with it, keeping flagged keys a subset of
+    // the observed keys. A stale flag would strand table capacity —
+    // and a later break — behind a dead key.
+    const B: u64 = 0xB2;
+    let mut r = InstanceRouter::new(
+        domain(),
+        RouterLimits {
+            observed_keys: 1,
+            ..RouterLimits::default()
+        },
+    );
+    assert_eq!(
+        r.observe_legacy(observation(2, 0, 0, load(BASE_A))).0,
+        ObserveOutcome::New
+    );
+    r.note_proven_absence(image(COOKIE, 0), FILE);
+    assert_eq!(
+        r.observe_legacy(observation_for(B, 2, load(BASE_A))).0,
+        ObserveOutcome::New
+    );
+    let rendered = format!("{r:?}");
+    assert!(
+        rendered.contains("absent_keys: 0"),
+        "the evicted key holds no flag: {rendered}"
+    );
+    r.note_proven_absence(image(B, 0), FILE);
+    assert_eq!(
+        r.counters().absence_overflows,
+        0,
+        "the dead key holds no flag"
+    );
+    assert_eq!(
+        r.observe_legacy(observation_for_epochs(B, 2, 1, load(BASE_A)))
+            .0,
+        ObserveOutcome::New,
+        "the live key's break still mints"
+    );
+}
+
+#[test]
+fn retirement_drops_the_retired_keys_absence_flags() {
+    // Retirement drops the retired keys' observations; their absence
+    // flags drop with them, keeping flagged keys a subset of the
+    // observed keys. A stale flag would strand table capacity — and a
+    // later break — behind a dead key. Both pairings are pinned: the
+    // image-level sweep via `retire_image`, and the task-level sweep
+    // past it via `retire_process` over a second exec line.
+    const B: u64 = 0xB4;
+    let mut r = router();
+    assert_eq!(
+        r.observe_legacy(observation(2, 0, 0, load(BASE_A))).0,
+        ObserveOutcome::New
+    );
+    let proof = crate::attach::image_query::acquire_test_scan(
+        domain(),
+        image(B, 10),
+        FILE,
+        crate::attach::image_query::CompleteEpochs {
+            local: 2,
+            global: 0,
+            fault: 0,
+            sticky: 0,
+            record_flags: 0,
+        },
+        load(BASE_A),
+        0,
+    )
+    .expect("nonempty stable acquisition");
+    assert_eq!(r.observe(proof).0, ObserveOutcome::New);
+    r.note_proven_absence(image(COOKIE, 0), FILE);
+    r.note_proven_absence(image(B, 10), FILE);
+    r.retire_image(image(COOKIE, 0));
+    r.retire_process(B);
+    let rendered = format!("{r:?}");
+    assert!(
+        rendered.contains("absent_keys: 0"),
+        "retired keys hold no flags: {rendered}"
     );
 }
 

@@ -203,6 +203,7 @@ struct HeldIo {
     /// (`scan_selected`): a refresh scan can overrun its slice exactly
     /// as a queued scan can. Zero by default, so existing tests see a
     /// constant clock across the refresh rotation.
+    /// Models a wider window than production, which re-checks the budget after reading ranges.
     refresh_cost: Duration,
 }
 

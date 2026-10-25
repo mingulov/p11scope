@@ -2991,7 +2991,6 @@ impl JointMachineIo for SessionMachineIo {
     }
 }
 
-#[allow(dead_code)] // Source/type-checked actual Session entrypoints; ordinary selection remains gated.
 impl AttestedSemanticLane {
     /// Bind the initial machine to the actual Session and canonical pool,
     /// before the first publication request. This performs no EVENTS/H0 work.
@@ -3116,6 +3115,7 @@ impl AttestedSemanticLane {
     }
 
     /// Whether this lane's machine began a Finish that still owns control.
+    #[allow(dead_code)] // Staged Finish query; the driver reads the latched failure instead.
     pub(crate) fn joint_finish_begun(&self) -> bool {
         self.live.as_deref().is_some_and(|live| {
             live.joint_machine

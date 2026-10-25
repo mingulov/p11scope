@@ -47759,6 +47759,294 @@ fn collected_graph_slow_native_poll_closes_without_disclosure() {
 }
 
 #[test]
+fn collected_graph_wedged_owed_cancel_reaches_finite_incomplete_stop() {
+    // The owed ticket cancel under a hostile closer: the closer stalls then
+    // fails if it ever ran, but the cancel's release carries no links, so
+    // the worker is never engaged on this path (no submit precedes an owed
+    // cancel: a begin-Submit implies mutation, which precludes owed). The
+    // twin pins the contract instead: every interim cancel claims no
+    // progress, and the cancel settles promptly to the existing untouched
+    // incomplete stop with its existing disclosure and no trip.
+    let (child, mut engine, _) = engine_with_one_accepted_provider();
+    let mut child = SystemScopeChildGuard::new(child);
+    engine.scope = Scope::System;
+    let view = engine.views[0].id();
+    let admission = engine.views[0].view_admission();
+    let original_slot = engine.plan.slots[0].clone();
+    let original_owner = engine.plan.module_of_slot(original_slot.index).unwrap();
+    let retirement = crate::attach::RetirementFixture::new_collected(
+        &engine.plan.slots,
+        &engine.pinned,
+        Box::new(move |owned, producer| {
+            if producer == crate::attach::ProducerProgram::UProbe("p11_return") {
+                // Hostile closer: stall, then fail loudly if ever engaged.
+                // Any engagement breaks the untouched settle below.
+                std::thread::sleep(std::time::Duration::from_secs(10));
+                return Err("wedged owed-cancel closer engaged".into());
+            }
+            drop(owned);
+            Ok(())
+        }),
+    );
+    let mut session = ScriptedSession::default();
+    session.global_retirement = Some(std::cell::RefCell::new(retirement));
+    child.reap().unwrap();
+    assert_eq!(engine.views[0].original_exited(), Ok(true));
+    engine.update_counter_snapshot(&session).unwrap();
+    engine.dispatch_lifecycle_record(
+        &mut session,
+        &collected_finish_leader_exit(child.pid()),
+        &mut PendingViewRetirements::new(),
+    );
+    assert!(engine.pending_leader_exit_views.contains(&view));
+    let service = |engine: &mut Engine, session: &mut ScriptedSession| {
+        engine
+            .service_collected_finish_records(session, Vec::new(), 0, 1)
+            .unwrap()
+    };
+    // Reach NativeBegin before mutation, then fail the begin: the graph
+    // owes the ticket cancel instead of mutating.
+    drive_graph_until(&mut engine, &mut session, |engine, _, _| {
+        engine
+            .collected_graph
+            .as_ref()
+            .is_some_and(|graph| graph.phase == GraphPhase::NativeBegin && !graph.mutated)
+    });
+    session.fail_collected_begin.set(true);
+    let outcome = service(&mut engine, &mut session);
+    assert!(outcome.pending, "the owed cancel keeps Finish pending");
+    session.fail_collected_begin.set(false);
+    assert!(
+        engine.collected_graph.as_ref().is_some_and(|graph| {
+            graph.phase == GraphPhase::NativeBegin
+                && graph.native_cancel_owed
+                && graph.verdict.is_none()
+        }),
+        "the failed begin owes the ticket cancel"
+    );
+    // Interim cancels claim no progress while the cancel stays owed; only
+    // the settle credit claims it. The wall guard covers a stuck wait, not
+    // the credit count.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut credits = 0u32;
+    loop {
+        let outcome = service(&mut engine, &mut session);
+        credits += 1;
+        assert!(outcome.pending, "the owed debt keeps Finish pending");
+        if engine
+            .collected_graph
+            .as_ref()
+            .and_then(|graph| graph.verdict)
+            .is_some()
+        {
+            assert!(
+                outcome.progressed,
+                "only the settle credit claims progress"
+            );
+            break;
+        }
+        assert!(
+            !outcome.progressed,
+            "interim cancel {credits} claims no progress"
+        );
+        assert!(
+            engine
+                .collected_graph
+                .as_ref()
+                .is_some_and(|graph| graph.native_cancel_owed),
+            "still owed with no verdict at interim cancel {credits}"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the owed cancel did not settle"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    eprintln!("wedged-owed-cancel: settled in {credits} credits under a hostile closer");
+    assert!(
+        credits <= 4096,
+        "the owed cancel settles within bounded credits ({credits})"
+    );
+    let graph = engine.collected_graph.as_ref().expect("boxed");
+    assert_eq!(graph.verdict, Some(Verdict::RefusedUntouched));
+    assert!(
+        !graph.native_cancel_owed,
+        "the settled cancel clears the owed flag"
+    );
+    assert!(
+        graph.removed.is_some(),
+        "the owed cancel returns the input"
+    );
+    assert_eq!(
+        engine.collected_graph_refused(),
+        Some("terminal graph refused before native mutation")
+    );
+    assert!(
+        graph.first_error.is_none(),
+        "no trip means no kept first error: {:?}",
+        graph.first_error
+    );
+    assert!(
+        !session
+            .global_retirement
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .blocking(),
+        "the owed cancel drains the native cursor"
+    );
+    assert_eq!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .filter(|skip| skip.subject == "collected native retirement")
+            .count(),
+        1,
+        "the untouched disclosure ships exactly once"
+    );
+    assert!(
+        !engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "global native retirement"
+                && skip.reason
+                    == "original static ownership remains uncertain; replacement admission is blocked"
+        }),
+        "a settled cancel carries no retained disclosure"
+    );
+    CollectedFinishGraphCase::assert_original_pending_in(
+        &mut engine,
+        &session,
+        view,
+        &admission,
+        &original_slot,
+        original_owner,
+    );
+}
+
+#[test]
+fn collected_graph_slow_owed_cancel_returns_input_without_trip() {
+    // Twin: the standard owed-cancel case. Interim cancels claim no
+    // progress while the cancel stays owed; the cancel settles untouched
+    // with no trip and no retained disclosure. The settle needs no worker
+    // release: the cancel's release carries no links, so the closer never
+    // runs on this path.
+    let mut case = graph_case_with_exit(false);
+    drive_graph_until(&mut case.engine, &mut case.session, |engine, _, _| {
+        engine
+            .collected_graph
+            .as_ref()
+            .is_some_and(|graph| graph.phase == GraphPhase::NativeBegin && !graph.mutated)
+    });
+    case.session.fail_collected_begin.set(true);
+    let outcome = case.service(1);
+    assert!(outcome.pending, "the owed cancel keeps Finish pending");
+    case.session.fail_collected_begin.set(false);
+    assert!(
+        case.engine.collected_graph.as_ref().is_some_and(|graph| {
+            graph.phase == GraphPhase::NativeBegin
+                && graph.native_cancel_owed
+                && graph.verdict.is_none()
+        }),
+        "the failed begin owes the ticket cancel"
+    );
+    // Interim cancels claim no progress while the cancel stays owed; only
+    // the settle credit claims it. The wall guard covers a stuck wait, not
+    // the credit count.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut credits = 0u32;
+    loop {
+        let outcome = case.service(1);
+        credits += 1;
+        assert!(outcome.pending, "the owed debt keeps Finish pending");
+        if case
+            .engine
+            .collected_graph
+            .as_ref()
+            .and_then(|graph| graph.verdict)
+            .is_some()
+        {
+            assert!(
+                outcome.progressed,
+                "only the settle credit claims progress"
+            );
+            break;
+        }
+        assert!(
+            !outcome.progressed,
+            "interim cancel {credits} claims no progress"
+        );
+        assert!(
+            case.engine.collected_graph.as_ref().is_some_and(|graph| {
+                graph.native_cancel_owed
+            }),
+            "still owed with no verdict at interim cancel {credits}"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the owed cancel did not settle"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    eprintln!("slow-owed-cancel: settled in {credits} credits with no trip");
+    assert!(
+        credits <= 4096,
+        "the owed cancel settles within bounded credits ({credits})"
+    );
+    assert_eq!(
+        case.entered.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty),
+        "the closer never runs on the owed-cancel path"
+    );
+    let graph = case.engine.collected_graph.as_ref().expect("boxed");
+    assert_eq!(graph.verdict, Some(Verdict::RefusedUntouched));
+    assert!(
+        !graph.native_cancel_owed,
+        "the settled cancel clears the owed flag"
+    );
+    assert!(
+        graph.removed.is_some(),
+        "the owed cancel returns the input"
+    );
+    assert_eq!(
+        case.engine.collected_graph_refused(),
+        Some("terminal graph refused before native mutation")
+    );
+    assert!(
+        graph.first_error.is_none(),
+        "no trip means no kept first error: {:?}",
+        graph.first_error
+    );
+    assert!(
+        !case
+            .session
+            .global_retirement
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .blocking(),
+        "the owed cancel drains the native cursor"
+    );
+    assert_eq!(
+        case.engine
+            .counters
+            .object_skips
+            .iter()
+            .filter(|skip| skip.subject == "collected native retirement")
+            .count(),
+        1,
+        "the untouched disclosure ships exactly once"
+    );
+    assert!(
+        !case.engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "global native retirement"
+                && skip.reason
+                    == "original static ownership remains uncertain; replacement admission is blocked"
+        }),
+        "a slow worker settles with no retained disclosure"
+    );
+}
+
+#[test]
 fn collected_graph_closed_never_owes_recovery_frame() {
     let mut case = graph_case_with_exit(true);
     assert!(case.engine.refresh_requested.is_empty());

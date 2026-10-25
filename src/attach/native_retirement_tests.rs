@@ -528,6 +528,76 @@ fn native_retirement_transfer_failure_cannot_report_untouched_or_recovered() {
     assert!(!session.worker.join().completed);
 }
 
+#[test]
+fn native_retirement_failed_ordinary_batch_refuses_later_collected_prepare() {
+    // Quarantine pin (INV-4): a Failed ordinary batch keeps the Session's
+    // pending guard, so a later collected prepare is refused with its exact
+    // text and the caller input intact. The failure stays disclosed through
+    // the worker receipt; it is never converted to readiness.
+    let (_dir, pins, target) = fixture();
+    let slots: Vec<_> = (0..2)
+        .map(|index| {
+            let mut slot = target.slot.clone();
+            slot.index = u32::try_from(index).unwrap();
+            slot.file_offset = u64::try_from(index).unwrap();
+            slot
+        })
+        .collect();
+    let closes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = Arc::clone(&closes);
+    let mut native = RetirementFixture::new_collected(
+        &slots,
+        &pins,
+        Box::new(move |owned, producer| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            drop(owned);
+            if producer == ProducerProgram::UProbe("p11_return") {
+                Err("real scripted ordinary closer failure".into())
+            } else {
+                Ok(())
+            }
+        }),
+    );
+    let ticket = native
+        .begin(&slots[..1])
+        .unwrap()
+        .expect("ordinary begin mints a ticket");
+    assert!(native.blocking(), "a submitted batch owns the Session");
+    wait_for(|| {
+        closes.load(std::sync::atomic::Ordering::Relaxed) == 2
+            && native.poll(&ticket) == RetirementPoll::Refused
+    });
+    assert!(
+        native.blocking(),
+        "a failed batch keeps the quarantine guard"
+    );
+    assert!(!native.has_slot_link(0), "retired links left the registry");
+    assert!(
+        native.has_slot_link(1),
+        "the surviving slot keeps its links"
+    );
+    let pool = SemanticResourcePool::reference_limit(COLLECTED_POOL_BYTES);
+    let reserve = pool.reserver();
+    let mut input = Some(collected_input(
+        vec![slots[1].clone()],
+        reserve.reserve(COLLECTED_INPUT_BYTES).unwrap(),
+    ));
+    let error = match native.collected_prepare(&mut input, &reserve, 1) {
+        Ok(_) => panic!("a failed ordinary batch must refuse the collected prepare"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.to_string(),
+        "ordinary native retirement already owns this Session"
+    );
+    assert!(input.is_some(), "the refusal keeps the caller input");
+    assert_eq!(
+        native.poll(&ticket),
+        RetirementPoll::Refused,
+        "the failed verdict is sticky"
+    );
+}
+
 // These are source-first pins for the collected path. Existing live-retirement
 // controls above stay unchanged; harmless FDs do not qualify a BPF Session.
 use super::fixture::{CollectedRetirementFixture, RetirementFixture};

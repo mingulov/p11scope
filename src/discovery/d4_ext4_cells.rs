@@ -1433,6 +1433,25 @@ fn ext4_stale_key_evaluator_refuses_before_proof() {
         .is_err(),
         "the stale key stays a per-range key"
     );
+    // Stale classification with a misrecorded key shape: the per-range
+    // half refuses on its own.
+    let misrecorded = Ext4LegEvidence {
+        per_range_key: false,
+        ..synthetic_no_run_stale_evidence()
+    };
+    assert!(
+        assert_ext4_outcome(
+            pid,
+            &target,
+            &anchor,
+            &refused,
+            &refused,
+            &misrecorded,
+            Ext4Expect::DeletedMappingStaleKey,
+        )
+        .is_err(),
+        "a stale classification with per_range_key=false must fail"
+    );
     // An edge for the stale key joins and must fail.
     let edged = synthetic_edged(pid, target.maps_key());
     assert!(

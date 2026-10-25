@@ -190,6 +190,10 @@ struct HeldIo {
     absent_files: BTreeSet<u32>,
     /// Scripted `INSTANCE_COUNT.storage_null` for the Q1(b) gate test.
     storage_null: u64,
+    /// The outcome of every fake scan-leaf call, in issue order (`Ok`
+    /// for a sealed proof, `Err` for the refusal): the seam's scan
+    /// ledger for the changed-file tests. Only appended, never consulted.
+    scan_results: Vec<Result<(), ImageQueryRefusal>>,
 }
 
 impl HeldIo {
@@ -224,6 +228,7 @@ impl HeldIo {
             scan_inputs: HashMap::new(),
             absent_files: BTreeSet::new(),
             storage_null: 0,
+            scan_results: Vec::new(),
         }
     }
 
@@ -292,8 +297,27 @@ impl HeldIo {
         endpoint: Endpoint,
         fence: u64,
     ) -> Result<ImageScanProof, ImageQueryRefusal> {
+        let result = self.scan_proof_inner(image, endpoint, fence);
+        self.scan_results
+            .push(result.as_ref().map(|_| ()).map_err(|refusal| *refusal));
+        result
+    }
+
+    fn scan_proof_inner(
+        &mut self,
+        image: ImageIdentity,
+        endpoint: Endpoint,
+        fence: u64,
+    ) -> Result<ImageScanProof, ImageQueryRefusal> {
         if self.absent_files.contains(&endpoint.file_slot) {
             return Err(ImageQueryRefusal::Empty);
+        }
+        // The production `LiveImageScan::audit` guard, mirrored at the
+        // fake leaf: a watched file that reports changed refuses every
+        // scan with Custody, on both the tick and the refresh paths.
+        // An unreadable pin refuses too, exactly as there.
+        if self.watched[endpoint.file_slot as usize].check_unchanged() != Ok(true) {
+            return Err(ImageQueryRefusal::Custody);
         }
         let page = endpoint.offset & !0xfff;
         let (base, local, global) = self.scan_input(endpoint.file_slot);

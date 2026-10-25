@@ -17,7 +17,6 @@ use super::sem1_feed::{
 use super::*;
 use crate::attach::image_query::ImageQueryRefusal;
 use crate::discovery::caller_registry::RegistryGap;
-use crate::inventory_semantics::image_query_refusal_index;
 use std::io::Write as _;
 use crate::discovery::caller_registry::instance_input::{InstanceLifecycle, InstanceReason};
 use crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild;
@@ -1066,6 +1065,7 @@ fn changed_provider_file_refuses_scans_and_sheds_the_pending_burst() {
         instance_summary(&scene)
     );
     // The hole: the provider file changes on disk after pinning.
+    let scans_before_change = scene.h0.0.borrow().io.scan_results.len();
     let provider = scene.modules[0].1.clone();
     let before = provider_stamp(&provider);
     std::fs::OpenOptions::new()
@@ -1131,19 +1131,26 @@ fn changed_provider_file_refuses_scans_and_sheds_the_pending_burst() {
         )],
         "the expired burst keeps the unobserved disclosure"
     );
-    let counts = scene.lane.scan_refusal_counts();
-    let custody = image_query_refusal_index(ImageQueryRefusal::Custody);
-    assert_eq!(
-        counts[custody], 2,
-        "the refresh scan and the tick scan both refuse Custody, got {counts:?}"
+    // Every scan after the change refuses Custody (the refresh scan
+    // and the tick scan alike); every scan before it sealed a proof.
+    let held = scene.h0.0.borrow();
+    let (sealed, refused) = held.io.scan_results.split_at(scans_before_change);
+    assert!(
+        sealed.iter().all(|result| result.is_ok()),
+        "pre-change scans seal proofs, got {sealed:?}"
     );
-    for (index, count) in counts.iter().enumerate() {
-        assert_eq!(
-            *count,
-            u64::from(index == custody) * 2,
-            "no refusal but Custody appears, got {counts:?}"
-        );
-    }
+    assert_eq!(
+        refused.len(),
+        2,
+        "the refresh scan and the tick scan both ran after the change, got {refused:?}"
+    );
+    assert!(
+        refused
+            .iter()
+            .all(|result| *result == Err(ImageQueryRefusal::Custody)),
+        "every post-change scan refuses Custody, got {refused:?}"
+    );
+    drop(held);
     let instances = instance_summary(&scene);
     assert_eq!(
         instances.len(),
@@ -1203,11 +1210,18 @@ fn unchanged_provider_file_joins_across_a_global_advance() {
     let joined = scene.h0.0.borrow().capture.router().counters().joined;
     let shed = scene.lane.shed_calls_disclosed();
     assert_eq!((joined, shed), (4, 0), "both bursts join, nothing sheds");
-    assert_eq!(
-        scene.lane.scan_refusal_counts(),
-        [0; 12],
-        "an unchanged file refuses no scan"
+    // The twin's ledger: scans were attempted and every one sealed.
+    let held = scene.h0.0.borrow();
+    assert!(
+        !held.io.scan_results.is_empty(),
+        "the joined path attempted scans"
     );
+    assert!(
+        held.io.scan_results.iter().all(|result| result.is_ok()),
+        "an unchanged file refuses no scan, got {:?}",
+        held.io.scan_results
+    );
+    drop(held);
     assert!(
         unrouted_reasons(&scene).is_empty(),
         "nothing sheds on the joined path: {:?}",

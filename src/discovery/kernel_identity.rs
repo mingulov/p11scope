@@ -1019,7 +1019,7 @@ impl SegmentProof for KernelPassProof<'_, '_, '_> {
                     // through `&mut self` must drop it first, and
                     // dropping resets.
                     let guard = MemberTargetGuard {
-                        installed: &mut self.installed,
+                        installed: self.installed,
                         armed: true,
                     };
                     #[cfg(test)]

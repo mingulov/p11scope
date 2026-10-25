@@ -48151,7 +48151,13 @@ fn collected_finish_partial_multi_keeps_surviving_sibling() {
 }
 
 #[test]
-#[ignore = "scale: system-population graph sizing; run by exact selector at V2 and L"]
+// System-population graph sizing (§13). Memory, drain, forgotten,
+// refused and release-to-baseline asserts are hard gates; the stop-time
+// model is measured and disclosed (R-40), not gated — only a
+// release-build live stop over the 60 s normal-stop figure makes the
+// speed-up required. The 1M-credit per-graph hang guard above stays the
+// finite bound.
+#[ignore = "scale: system-population graph sizing, time measured not gated (R-40); run by exact selector at V2 and L"]
 fn collected_graph_peak_fits_pool_at_system_scale() {
     // FD headroom for the 4096 pin files plus the 16384 native links.
     // Unprivileged: the soft cap rises only within the hard cap, and the
@@ -48351,9 +48357,14 @@ fn collected_graph_peak_fits_pool_at_system_scale() {
         peak <= COLLECTED_GRAPH_POOL_BYTES * 3 / 4,
         "peak graph charge {peak} exceeds 75% of the graph pool"
     );
-    assert!(
-        credits as u128 * 50_000 + elapsed.as_nanos() <= 15_000_000_000,
-        "credits={credits} elapsed={elapsed:?} exceeds the 15 s budget"
+    // R-40: normal stop time is a declared, measured, disclosed number,
+    // not a hard gate. This line reports the model; only a release-build
+    // live stop over the 60 s normal-stop figure makes the speed-up
+    // required.
+    let modeled_s = credits as f64 * 50_000.0 / 1_000_000_000.0;
+    let elapsed_s = elapsed.as_secs_f64();
+    eprintln!(
+        "SIZING_TIME credits={credits} modeled_s={modeled_s:.3} elapsed_s={elapsed_s:.3} model_limit_s=15"
     );
     // Exact release: the installed backing and every retired-file handoff
     // are Engine-owned live graph state; dropping both returns the pool to

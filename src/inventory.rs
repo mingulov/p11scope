@@ -13649,6 +13649,33 @@ mod promotion_driver_tests {
     }
 
     #[test]
+    fn joint_polling_on_finished_lane_publishes_without_spinning() {
+        // A finished lane in Polling has nothing left to poll: one
+        // hook resumes at the wound-down phase instead of spinning
+        // on a refusal the latch can never bound.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.semantic = Some(joint_lane(WindDownIo::completing(), true));
+        driver.joint_finish = JointFinishDriver::Polling;
+        driver.on_tick();
+        assert_eq!(
+            driver.joint_finish,
+            JointFinishDriver::Published,
+            "a finished lane in Polling publishes at once"
+        );
+        assert_eq!(
+            driver
+                .semantic
+                .as_ref()
+                .expect("lane")
+                .finish_poll_calls_for_test(),
+            0,
+            "no spin: the shortcut polls nothing"
+        );
+    }
+
+    #[test]
     fn joint_final_finish_tick_runs_only_driver() {
         let mut coordinator = coordinator();
         let headless = headless_display();

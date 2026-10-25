@@ -724,6 +724,17 @@ class CompareTwins(unittest.TestCase):
             oracle.compare_pair(first, second, snapshot)
 
 
+    def test_mutation_empty_snapshot_rows_rejected(self):
+        oracle = require_oracle(self)
+        _, _, first, second = validated_pair(oracle, "interleave")
+        snapshot = healthy_snapshot([first, second])
+        snapshot["key_operations"] = []
+        snapshot["unknown_key_operations"] = []
+        snapshot["objects"] = []
+        with self.assertRaisesRegex(oracle.LedgerError, "missing key row"):
+            oracle.compare_pair(first, second, snapshot)
+
+
 class StreamTwins(unittest.TestCase):
     def test_mutation_reordered_replay_rejected(self):
         oracle = require_oracle(self)

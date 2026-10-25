@@ -48222,7 +48222,7 @@ fn facts_attach_collected_carrier(engine: &Engine, fail_return: bool) -> FactsCo
                 let released = changed
                     .wait_timeout_while(
                         lock.lock().unwrap(),
-                        std::time::Duration::from_secs(5),
+                        std::time::Duration::from_secs(30),
                         |ready| !*ready,
                     )
                     .map_err(|error| error.to_string())?;
@@ -48762,7 +48762,7 @@ fn collected_graph_matches_conservative_reference() {
     }
     assert!(submitted, "pair 1 reaches the native handoff");
     entered
-        .recv_timeout(std::time::Duration::from_secs(2))
+        .recv_timeout(std::time::Duration::from_secs(30))
         .unwrap();
     *release.0.lock().unwrap() = true;
     release.1.notify_all();

@@ -39,6 +39,9 @@ WORKLOADS=deploy/k8s/e2e/workloads.yaml
 WL_NS=p11scope-e2e
 K2_USER=p11k2
 K2_ROOT=/opt/k2
+# kind's node container exports KUBECONFIG=/etc/kubernetes/admin.conf, which
+# only root can read; the caller's kubectl runs name the caller's own copy.
+K2_KUBECONFIG=/home/p11k2/.kube/config
 ITERS_A_DEFAULT=400
 ITERS_SCAN_DEFAULT=250
 DURATION_DEFAULT=30
@@ -333,6 +336,19 @@ k2_provision_self_test() {
         grep -q "$marker" "$pst_stub/calls.txt" \
             || { echo "provisioning lost: $marker" >&2; exit 1; }
     done
+    # kind's node container exports KUBECONFIG=/etc/kubernetes/admin.conf
+    # (root-only), so every kubectl the caller runs must name its own copy:
+    # the default-config probe and attach-pod.sh both get it explicitly.
+    grep -q "docker exec -u p11k2 -e KUBECONFIG=/home/p11k2/.kube/config node-stub kubectl -n p11scope-e2e get pod ledger-a" \
+        "$pst_stub/calls.txt" \
+        || { echo "default-config probe inherits the node's root-only KUBECONFIG" >&2; exit 1; }
+    : > "$pst_stub/calls.txt"
+    WORK=$pst_stub/work NODE=node-stub STUB_CALLS=$pst_stub/calls.txt PATH="$pst_stub:$PATH" \
+        start_attach k2-t ledger-a 5 /tmp/k2-t.json
+    wait "$STARTED_PID" || { echo "stubbed attach failed" >&2; exit 1; }
+    grep -q "docker exec -u p11k2 -e KUBECONFIG=/home/p11k2/.kube/config -w /opt/k2 node-stub sh /opt/k2/scripts/attach-pod.sh" \
+        "$pst_stub/calls.txt" \
+        || { echo "attach-pod.sh inherits the node's root-only KUBECONFIG" >&2; exit 1; }
     grep -q "node-sudo-version=1.9.16p2-1" "$pst_stub/work/facts.log" \
         || { echo "sudo download version not recorded" >&2; exit 1; }
     grep -q "node-kubectl=Client Version: v0.0.0-stub (node image)" "$pst_stub/work/facts.log" \
@@ -686,14 +702,14 @@ provision_node() {
             || { echo "node kubectl version failed" >&2; return 1; }
         fact "node-kubectl=$NODE_KUBECTL (copied from host $HOST_KUBECTL)"
     fi
-    docker exec "$NODE" sh -c 'mkdir -p /home/p11k2/.kube && cp /etc/kubernetes/admin.conf /home/p11k2/.kube/config && chown -R p11k2 /home/p11k2/.kube' \
+    docker exec "$NODE" sh -c "mkdir -p /home/p11k2/.kube && cp /etc/kubernetes/admin.conf $K2_KUBECONFIG && chown -R p11k2 /home/p11k2/.kube" \
         || { echo "node kubeconfig setup failed" >&2; return 1; }
-    docker exec -u "$K2_USER" "$NODE" kubectl --kubeconfig /home/p11k2/.kube/config \
+    docker exec -u "$K2_USER" "$NODE" kubectl --kubeconfig "$K2_KUBECONFIG" \
         -n "$WL_NS" wait --for=condition=Ready pod --all --timeout=240s \
         || { echo "workloads never became Ready inside the node" >&2; return 1; }
-    # attach-pod.sh resolves kubectl through the default config: prove that
-    # path, not just the explicit --kubeconfig one.
-    docker exec -u "$K2_USER" "$NODE" kubectl -n "$WL_NS" get pod ledger-a >/dev/null \
+    # attach-pod.sh resolves kubectl through the caller's environment: prove
+    # that path, not just the explicit --kubeconfig one.
+    docker exec -u "$K2_USER" -e "KUBECONFIG=$K2_KUBECONFIG" "$NODE" kubectl -n "$WL_NS" get pod ledger-a >/dev/null \
         || { echo "default node kubeconfig cannot read pods" >&2; return 1; }
     docker exec "$NODE" mkdir -p "$K2_ROOT/scripts" "$K2_ROOT/target/release" \
         || { echo "node tree setup failed" >&2; return 1; }
@@ -874,7 +890,7 @@ oracle_negative() {
 # local `docker exec`, which lives exactly as long as the capture in the node;
 # CAPTURE_PIDS keeps every live one for cleanup.
 start_attach() {
-    docker exec -u "$K2_USER" -w "$K2_ROOT" "$NODE" sh "$K2_ROOT/scripts/attach-pod.sh" \
+    docker exec -u "$K2_USER" -e "KUBECONFIG=$K2_KUBECONFIG" -w "$K2_ROOT" "$NODE" sh "$K2_ROOT/scripts/attach-pod.sh" \
         --pod "$2" --namespace "$WL_NS" -- --duration "$3" -o "$4" \
         >"$WORK/$1.out" 2>"$WORK/$1.err" &
     CAPTURE_PIDS="${CAPTURE_PIDS-} $!"

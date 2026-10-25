@@ -1240,14 +1240,7 @@ impl BankDirectory {
             0,
             4,
         )?;
-        if reservation.retained_bytes < retained
-            || reservation.transient_bytes < transient
-            || reservation.metadata_bytes < metadata
-            || reservation.file_descriptors < fds
-        {
-            return Err(BankRefusal::Budget);
-        }
-        Ok(())
+        check_counter_stage_reservation(reservation, (retained, transient, metadata, fds))
     }
 
     fn stage_with(
@@ -2303,13 +2296,7 @@ impl BankIo for NativeIo<'_> {
             provider_copies,
             16,
         )?;
-        if self.reservation.retained_bytes < retained
-            || self.reservation.transient_bytes < transient
-            || self.reservation.metadata_bytes < metadata
-            || self.reservation.file_descriptors < fds
-        {
-            return Err(BankRefusal::Budget);
-        }
+        check_counter_stage_reservation(self.reservation, (retained, transient, metadata, fds))?;
         if self.session.backend == super::AttachBackend::Multi {
             check_counter_multi_reservation(
                 self.reservation,

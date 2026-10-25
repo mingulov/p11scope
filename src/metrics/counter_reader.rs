@@ -2518,12 +2518,13 @@ mod tests {
             metadata_bytes: 32 * 1024 * 1024,
             file_descriptors: cpus.checked_mul(4).unwrap() + 512,
         };
-        let stage = BankReservation {
-            retained_bytes: stage_retained_for_banks(mode, cpus, 1),
-            transient_bytes: 1024 * 1024,
-            metadata_bytes: 256 * 1024,
-            file_descriptors: cpus.checked_mul(8).unwrap() + 16,
-        };
+        let stage = stage_envelope_for_range(
+            mode,
+            cpus,
+            &grown.slots,
+            provider_copy_charge(&pins, &grown.slots),
+            false,
+        );
         let bytes = std::fs::read(Path::new(env!("OUT_DIR")).join(format!(
             "counter-bank-growth-v2/p11scope-ebpf-{}-bank-growth-v2",
             mode.name()
@@ -3145,47 +3146,10 @@ mod tests {
         assert_eq!(session.static_multi_attached(), static_attached);
     }
 
-    /// Headroom above the funded bank payload for slot copies, position
-    /// tables and staging scratch. The largest growth stage needs about
-    /// 16 MiB of that beside its payload; twice covers estimation slack.
+    /// Headroom above the estimated staged requirement on each byte leg
+    /// of the counter stage envelope. The estimate already runs the real
+    /// accounting; this covers bound slack and future drift.
     const STAGE_HEADROOM: usize = 32 * 1024 * 1024;
-
-    /// The retained allowance for staging `banks` fresh counter banks of
-    /// `mode` on `cpus` possible CPUs: the full bank payload plus headroom.
-    fn stage_retained_for_banks(mode: CounterMode, cpus: usize, banks: usize) -> usize {
-        banks
-            .checked_mul(512)
-            .and_then(|cells| cells.checked_mul(mode.stats_bytes() as usize))
-            .and_then(|payload| payload.checked_mul(cpus))
-            .and_then(|payload| payload.checked_add(STAGE_HEADROOM))
-            .expect("stage envelope fits usize")
-    }
-
-    #[test]
-    fn stage_envelope_covers_latency_banks_at_high_cpu_count() {
-        // Per-mode cell widths from the bank geometry contract: counts 24,
-        // timestamps 40, latency 296. The final 8192-endpoint grow stages 14
-        // fresh banks in one call; the held-return flow stages one.
-        for (banks, funded) in [(14usize, 16), (1, 1)] {
-            let retained = stage_retained_for_banks(CounterMode::Latency, 256, funded);
-            let need = banks * 512 * 296 * 256 + STAGE_HEADROOM;
-            assert!(
-                retained >= need,
-                "{banks} latency banks at P=256: envelope {retained} < need {need}"
-            );
-        }
-        for (mode, value) in [
-            (CounterMode::Counts, 24usize),
-            (CounterMode::Timestamps, 40),
-        ] {
-            let retained = stage_retained_for_banks(mode, 256, 16);
-            let need = 14 * 512 * value * 256 + STAGE_HEADROOM;
-            assert!(
-                retained >= need,
-                "{mode:?} 14-bank stage at P=256: envelope {retained} < need {need}"
-            );
-        }
-    }
 
     /// Cell slot-shape mirror for envelope tests: one provider object, a
     /// provider-length path, one caller-named symbol per slot, like the
@@ -3242,41 +3206,50 @@ mod tests {
             .expect("fixture provider charges fit")
     }
 
-    /// The growth cells' stage envelope under test: payload plus headroom
-    /// on retained, with fixed transient/metadata/FD legs.
-    fn growth_stage_envelope(
+    /// The counter cells' stage envelope: the estimated staged requirement
+    /// over the whole endpoint range — which dominates every smaller stage
+    /// by construction — plus headroom on each byte leg. The estimator
+    /// inputs dominate production: every spanned bank, twice the staged
+    /// positions capacity, the full provider-copy sum, and (Multi) twice
+    /// the endpoint count for links. FDs need no headroom: the whole-range
+    /// fresh extent already dominates every stage's charge.
+    fn stage_envelope_for_range(
         mode: CounterMode,
         cpus: usize,
-        _slots: &[Slot],
-        _provider_copies: usize,
-        _multi: bool,
+        slots: &[Slot],
+        provider_copies: usize,
+        multi: bool,
     ) -> crate::attach::counter_banks::BankReservation {
+        use crate::attach::counter_banks::tests::estimate_counter_stage_reservation;
+        let bound = slots.len();
+        let required = estimate_counter_stage_reservation(
+            mode,
+            16,
+            512,
+            slots,
+            0,
+            bound as u32,
+            2 * bound,
+            cpus,
+            bound.div_ceil(512),
+            provider_copies,
+            multi.then_some((2 * bound, 2 * bound)),
+        )
+        .expect("stage envelope inputs are finite");
         crate::attach::counter_banks::BankReservation {
-            retained_bytes: stage_retained_for_banks(mode, cpus, 16),
-            transient_bytes: 256 * 1024 * 1024,
-            metadata_bytes: 16 * 1024 * 1024,
-            file_descriptors: cpus
-                .checked_mul(4)
-                .and_then(|n| n.checked_add(4))
-                .and_then(|n| n.checked_mul(GROWTH_ENDPOINTS))
-                .and_then(|n| n.checked_add(16))
-                .unwrap(),
-        }
-    }
-
-    /// The old-return cells' stage envelope under test: one funded bank on
-    /// retained, with fixed transient/metadata/FD legs.
-    fn old_return_stage_envelope(
-        mode: CounterMode,
-        cpus: usize,
-        _slots: &[Slot],
-        _provider_copies: usize,
-    ) -> crate::attach::counter_banks::BankReservation {
-        crate::attach::counter_banks::BankReservation {
-            retained_bytes: stage_retained_for_banks(mode, cpus, 1),
-            transient_bytes: 1024 * 1024,
-            metadata_bytes: 256 * 1024,
-            file_descriptors: cpus.checked_mul(8).unwrap() + 16,
+            retained_bytes: required
+                .retained_bytes
+                .checked_add(STAGE_HEADROOM)
+                .expect("retained stage envelope fits"),
+            transient_bytes: required
+                .transient_bytes
+                .checked_add(STAGE_HEADROOM)
+                .expect("transient stage envelope fits"),
+            metadata_bytes: required
+                .metadata_bytes
+                .checked_add(STAGE_HEADROOM)
+                .expect("metadata stage envelope fits"),
+            file_descriptors: required.file_descriptors,
         }
     }
 
@@ -3303,7 +3276,8 @@ mod tests {
         ] {
             for cpus in [12usize, 256] {
                 for multi in [false, true] {
-                    let envelope = growth_stage_envelope(mode, cpus, &slots, provider_all, multi);
+                    let envelope =
+                        stage_envelope_for_range(mode, cpus, &slots, provider_all, multi);
                     for (all, first, end, old_capacity, new_banks, links) in stages {
                         let required = estimate_counter_stage_reservation(
                             mode,
@@ -3361,7 +3335,7 @@ mod tests {
             CounterMode::Latency,
         ] {
             for cpus in [12usize, 256] {
-                let envelope = old_return_stage_envelope(mode, cpus, &slots, provider_all);
+                let envelope = stage_envelope_for_range(mode, cpus, &slots, provider_all, false);
                 for (all, first, end, old_capacity, new_banks) in stages {
                     let required = estimate_counter_stage_reservation(
                         mode,
@@ -3668,17 +3642,13 @@ mod tests {
             };
             // Caller envelopes only: no OS limit is changed. Resource admission
             // is a separate controller gate before this ignored cell can run.
-            let stage = BankReservation {
-                retained_bytes: stage_retained_for_banks(mode, cpus, 16),
-                transient_bytes: 256 * 1024 * 1024,
-                metadata_bytes: 16 * 1024 * 1024,
-                file_descriptors: cpus
-                    .checked_mul(4)
-                    .and_then(|n| n.checked_add(4))
-                    .and_then(|n| n.checked_mul(final_count))
-                    .and_then(|n| n.checked_add(16))
-                    .unwrap(),
-            };
+            let stage = stage_envelope_for_range(
+                mode,
+                cpus,
+                &slots,
+                provider_copy_charge(&pins, &slots),
+                backend == crate::attach::AttachBackend::Multi,
+            );
             let artifact = std::fs::read(Path::new(env!("OUT_DIR")).join(format!(
                 "counter-bank-growth-v2/p11scope-ebpf-{}-bank-growth-v2",
                 mode.name()

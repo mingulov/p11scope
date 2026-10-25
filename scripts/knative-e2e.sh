@@ -1627,6 +1627,11 @@ unlock_step
 fact "observer-image=$OBS_IMAGE id=$(docker inspect --format '{{.Id}}' "$OBS_IMAGE" || echo unknown)"
 fact "holder-image=$KNATIVE_IMAGE id=$(docker inspect --format '{{.Id}}' "$KNATIVE_IMAGE" || echo unknown)"
 fact "base-image=$HOLDER_BASE (both stages of $KNATIVE_DOCKERFILE; apt packages float)"
+# The apt packages float with the archive: record what this build resolved.
+HOLDER_APT=$(docker run --rm --entrypoint dpkg-query "$KNATIVE_IMAGE" \
+    -W -f '${Package}=${Version} ' softhsm2 python3) \
+    || fail_cell "cannot read the holder image apt versions"
+fact "holder-apt=$HOLDER_APT"
 fact "observer-base-image=$(grep '^FROM ' deploy/Dockerfile.observer | head -n 1) (no apk installs there)"
 
 say "=== create kind cluster $CLUSTER (private kubeconfig) ==="
@@ -1805,7 +1810,8 @@ RESULT=$(inventory_absent "$WORK/k3-twin.json" "$PRIMARY_PID") || fail_cell "twi
 record "$RESULT"
 
 kill "$PF_PID" 2>/dev/null || true
-GATED=$(grep -c '"ok": true' "$SUMMARY_JSONL")
+# grep -c exits 1 on a zero count; keep errexit from skipping the SUMMARY line.
+GATED=$(grep -c '"ok": true' "$SUMMARY_JSONL" || true)
 [ "$GATED" -eq 3 ] || fail_cell "want 3 gated checks, got $GATED"
 say "=== knative e2e: ALL OK ($GATED gated checks passed; summary $SUMMARY_JSONL) ==="
 pass_cell "K3 Knative scale-from-zero attributed while serving"

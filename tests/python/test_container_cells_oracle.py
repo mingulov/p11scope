@@ -25,6 +25,7 @@ NAMES = ("C_GenerateRandom", "C_DigestInit", "C_Digest",
 PROVIDER = "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so"
 LATE_PROVIDER = "/tmp/private/libsofthsm2.so"
 PID_A, PID_B_PRE, PID_B_POST, PID_B_SPAN = 101, 102, 103, 104
+PID_B3 = 105
 PID_O, PID_L = 201, 202
 ITERS_A, ITERS_B = 400, 250
 ITERS_O, ITERS_L = 400, 250
@@ -72,7 +73,7 @@ def inventory(edges, gaps=(), observer="initial", backend="kernel",
     (major, minor, inode); `paths` maps module id -> [paths]. Callers always
     carries every pid the legs need; gaps are (subject, reason, pid|None).
     """
-    pids = [PID_A, PID_B_PRE, PID_B_POST, PID_B_SPAN, PID_O, PID_L]
+    pids = [PID_A, PID_B_PRE, PID_B_POST, PID_B_SPAN, PID_B3, PID_O, PID_L]
     callers = [{"id": f"c{i}", "pid": pid} for i, pid in enumerate(pids)]
     by_pid = {pid: f"c{i}" for i, pid in enumerate(pids)}
     modules = modules if modules is not None else {"m0": (0, 35, 7)}
@@ -141,13 +142,16 @@ def pre_edges():
 
 
 def span_edges(b_pre_m8_cov="watched_no_use", b_pre_m8_since=3000,
-               b_pre_m8_count=0):
+               b_pre_m8_count=0, b3_m8_cov="watched_no_use", b3_m8_count=0):
     return [edge(PID_A, "m7"),
             edge(PID_B_PRE, "m7", state="ended"),
             edge(PID_B_PRE, "m8", cov=b_pre_m8_cov, since=b_pre_m8_since,
                  count=b_pre_m8_count, first_seen=2000),
             edge(PID_B_SPAN, "m8", evidence="maps_match", cov="watched_no_use",
-                 since=3000, first_seen=2000)]
+                 since=3000, first_seen=2000),
+            edge(PID_B3, "m7", state="ended"),
+            edge(PID_B3, "m8", cov=b3_m8_cov, since=3000,
+                 count=b3_m8_count, first_seen=2000)]
 
 
 def good_copy_up_inputs(lane="B"):
@@ -439,6 +443,7 @@ class CopyUpTest(unittest.TestCase):
     def test_round2_m8_must_not_claim_b_pre_calls(self):
         result = check_copy_up(b_pre_round2_calls=1500)
         self.assertEqual(result["b_pre_round2"]["calls"], 1500)
+        self.assertEqual(result["b_pre_round2"]["pid"], PID_B_PRE)
         self.assertEqual(result["b_pre_round2"]["span_kernel"]["m8_entries"], 0)
         bad = inventory(
             span_edges(b_pre_m8_cov="counted", b_pre_m8_since=3000,
@@ -446,6 +451,42 @@ class CopyUpTest(unittest.TestCase):
             [collapse_gap()], backend="kernel", modules=dict(D1_MODULES_SPAN))
         with self.assertRaises(AssertionError):
             check_copy_up(span_kernel=bad, b_pre_round2_calls=1500)
+
+    def test_round2_pid_defaults_to_b_pre(self):
+        result = check_copy_up(b_pre_round2_calls=1500)
+        self.assertEqual(result["b_pre_round2"]["pid"], PID_B_PRE)
+
+    def test_round2_explicit_pid_passes(self):
+        """The round-2 twin (a second lower-mapper) is measured by pid."""
+        result = check_copy_up(b_pre_round2_calls=1500,
+                               b_pre_round2_pid=PID_B3)
+        self.assertTrue(result["ok"])
+        record = result["b_pre_round2"]
+        self.assertEqual(record["pid"], PID_B3)
+        self.assertEqual(record["calls"], 1500)
+        self.assertEqual(record["span_kernel"]["m8_entries"], 0)
+        self.assertEqual(record["span_userspace"]["m8_entries"], 0)
+        self.assertEqual(record["span_kernel"]["m8_status"], "watched_no_use")
+
+    def test_round2_pid_claim_fails(self):
+        bad = inventory(
+            span_edges(b3_m8_cov="counted", b3_m8_count=9),
+            [collapse_gap()], backend="kernel", modules=dict(D1_MODULES_SPAN))
+        with self.assertRaises(AssertionError):
+            check_copy_up(span_kernel=bad, b_pre_round2_calls=1500,
+                          b_pre_round2_pid=PID_B3)
+
+    def test_round2_pid_without_new_edge_fails(self):
+        edges = [item for item in span_edges() if item["pid"] != PID_B3]
+        span = inventory(edges, [collapse_gap()], backend="kernel",
+                         modules=dict(D1_MODULES_SPAN))
+        with self.assertRaises(AssertionError):
+            check_copy_up(span_kernel=span, b_pre_round2_calls=1500,
+                          b_pre_round2_pid=PID_B3)
+
+    def test_round2_pid_without_calls_fails(self):
+        with self.assertRaises(AssertionError):
+            check_copy_up(b_pre_round2_pid=PID_B3)
 
     def test_post_profile_b_wrong_count_fails(self):
         with self.assertRaises(AssertionError):
@@ -738,6 +779,8 @@ class OracleCliTest(unittest.TestCase):
                 "--dc73-note", str(note), "--facts-log", str(facts)]
         if "b_pre_round2_calls" in inputs:
             args += ["--b-pre-round2-calls", str(inputs.pop("b_pre_round2_calls"))]
+        if "b_pre_round2_pid" in inputs:
+            args += ["--b-pre-round2-pid", str(inputs.pop("b_pre_round2_pid"))]
         for key, document in inputs.items():
             args += [f"--{key.replace('_', '-')}",
                      write_json(work, f"{key}.json", document)]
@@ -760,6 +803,15 @@ class OracleCliTest(unittest.TestCase):
             completed = run_oracle(*self.copy_up_args(work, inputs))
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertEqual(json.loads(completed.stdout)["b_pre_round2"]["calls"], 1500)
+
+    def test_copy_up_cli_round2_pid_passes(self):
+        inputs = good_copy_up_inputs()
+        inputs["b_pre_round2_calls"] = 1500
+        inputs["b_pre_round2_pid"] = PID_B3
+        with tempfile.TemporaryDirectory() as work:
+            completed = run_oracle(*self.copy_up_args(work, inputs))
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(json.loads(completed.stdout)["b_pre_round2"]["pid"], PID_B3)
 
     def test_copy_up_cli_refuses_mutation(self):
         inputs = good_copy_up_inputs()
@@ -824,7 +876,8 @@ class OracleCliTest(unittest.TestCase):
 
     def test_help_names_new_flags(self):
         for command, markers in (
-                ("copy-up", ("--facts-log", "--b-pre-round2-calls")),
+                ("copy-up", ("--facts-log", "--b-pre-round2-calls",
+                             "--b-pre-round2-pid")),
                 ("late-reported", ("--iters-l",))):
             completed = run_oracle(command, "--help")
             self.assertEqual(completed.returncode, 0, completed.stderr)

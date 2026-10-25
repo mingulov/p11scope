@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Compiled ELF fixtures exercise the production map inventory decoder."""
 import argparse
+import contextlib
 import io
 import json
 import os
@@ -841,6 +842,201 @@ class MapDefsTests(unittest.TestCase):
         for selection in ([], ["MapDefsTests.test_missing"]):
             result = subprocess.run([sys.executable, "-I", __file__, *selection], capture_output=True, text=True)
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+class JournalMarkerInventoryTests(unittest.TestCase):
+    """H8-D birth marker freeze: Detailed requires the control map plus
+    both globals; inventory refuses every marker symbol."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.temp = tempfile.TemporaryDirectory(prefix="p11scope-marker-freeze-")
+        cls.addClassCleanup(cls.temp.cleanup)
+
+    def detailed_symbols(self, missing=frozenset()):
+        return (
+            {"p11_entry"}
+            | checker.REQUIRED_GLOBAL_HELPERS
+            | checker.REQUIRED_GLOBAL_EXEC_HELPERS
+            | checker.SELECTED_GLOBAL_HELPERS
+            | checker.REQUIRED_GLOBAL_MARKER_HELPERS
+        ) - set(missing)
+
+    def quiet(self, func, *args):
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            try:
+                func(*args)
+            except RuntimeError as error:
+                raise AssertionError(f"unexpected refusal: {error}") from error
+        return errors.getvalue()
+
+    def refused(self, func, *args):
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors), self.assertRaises(RuntimeError):
+            func(*args)
+        return errors.getvalue()
+
+    def test_detailed_freeze_accepts_marker(self):
+        """Healthy twin: the frozen Detailed inventory validates."""
+        self.quiet(
+            checker.validate_inventory,
+            "default",
+            checker.SAFE_MAPS,
+            checker.SAFE_PROGRAMS,
+            self.detailed_symbols(),
+        )
+
+    def test_detailed_without_marker_map_refused(self):
+        maps = {
+            name: definition
+            for name, definition in checker.SAFE_MAPS.items()
+            if name != "JOURNAL_MARKER_CTL"
+        }
+        reason = self.refused(
+            checker.validate_inventory,
+            "default",
+            maps,
+            checker.SAFE_PROGRAMS,
+            self.detailed_symbols(),
+        )
+        self.assertIn("map removed: JOURNAL_MARKER_CTL", reason)
+
+    def test_inventory_with_marker_map_refused(self):
+        maps = dict(checker.INVENTORY_MAPS)
+        maps["JOURNAL_MARKER_CTL"] = checker.SAFE_MAPS["JOURNAL_MARKER_CTL"]
+        reason = self.refused(
+            checker.validate_inventory,
+            "inventory",
+            maps,
+            checker.INVENTORY_PROGRAMS,
+            set(),
+        )
+        self.assertIn("map added: JOURNAL_MARKER_CTL", reason)
+
+    def test_inventory_with_marker_symbols_refused(self):
+        symbols = (
+            set(checker.REQUIRED_GLOBAL_OWNER_HELPERS)
+            | set(checker.REQUIRED_GLOBAL_SCALAR_HELPERS)
+            | set(checker.REQUIRED_GLOBAL_EXEC_HELPERS)
+            | {"JOURNAL_MARKER_CTL", "p11_instance_exec_birth", "p11_instance_scope_gap"}
+        )
+        with self.assertRaisesRegex(RuntimeError, "forbidden detailed symbols"):
+            checker.validate_inventory(
+                "inventory",
+                checker.INVENTORY_MAPS,
+                checker.INVENTORY_PROGRAMS,
+                symbols,
+            )
+
+    def test_marker_value_size_8_refused(self):
+        maps = dict(checker.SAFE_MAPS)
+        shrunk = dict(maps["JOURNAL_MARKER_CTL"])
+        shrunk["value_size"] = 8
+        maps["JOURNAL_MARKER_CTL"] = shrunk
+        reason = self.refused(
+            checker.validate_inventory,
+            "default",
+            maps,
+            checker.SAFE_PROGRAMS,
+            self.detailed_symbols(),
+        )
+        self.assertIn("JOURNAL_MARKER_CTL.value_size: object=8 frozen=16", reason)
+
+    def test_missing_marker_global_refused(self):
+        with self.assertRaisesRegex(
+            RuntimeError, r"missing required \.text helpers.*p11_instance_exec_birth"
+        ):
+            checker.validate_inventory(
+                "default",
+                checker.SAFE_MAPS,
+                checker.SAFE_PROGRAMS,
+                self.detailed_symbols(missing={"p11_instance_exec_birth"}),
+            )
+        with self.assertRaisesRegex(
+            RuntimeError, r"missing required \.text helpers.*p11_instance_scope_gap"
+        ):
+            checker.validate_inventory(
+                "default",
+                checker.SAFE_MAPS,
+                checker.SAFE_PROGRAMS,
+                self.detailed_symbols(missing={"p11_instance_scope_gap"}),
+            )
+
+    def marker_fixture(self, name):
+        source = Path(self.temp.name) / f"{name}.c"
+        obj = Path(self.temp.name) / f"{name}.o"
+        source.write_text(
+            "#define SEC(n) __attribute__((section(n), used))\n"
+            "#define LOOKUP(map, key) ((void *(*)(void *, void *))1)((map), (key))\n"
+            "#define STORAGE(map, task, value, flags) \\\n"
+            "    ((void *(*)(void *, void *, void *, unsigned long long))156)( \\\n"
+            "        (map), (task), (value), (flags))\n"
+            "#define CURRENT() ((void *(*)(void))158)()\n"
+            "#define BODY() \\\n"
+            "    unsigned key = 0; void *map = 0; \\\n"
+            "    void *found = LOOKUP(map, &key); \\\n"
+            "    void *task = CURRENT(); \\\n"
+            "    void *row = STORAGE(map, task, 0, 0); \\\n"
+            "    return (found != 0) + (task != 0) + (row != 0);\n"
+            "__attribute__((noinline, used)) unsigned p11_instance_exec_birth(void) { BODY() }\n"
+            "__attribute__((noinline, used)) unsigned p11_instance_scope_gap(void) { BODY() }\n"
+            'char LICENSE[] SEC("license") = "GPL";\n'
+        )
+        subprocess.run(
+            ["clang-18", "-target", "bpfel", "-O2", "-c", str(source), "-o", str(obj)],
+            check=True,
+            capture_output=True,
+        )
+        return obj
+
+    def test_marker_helper_boundary(self):
+        """Healthy twin: two globals using only {1, 156, 158} validate."""
+        obj = self.marker_fixture("marker-boundary")
+        checker.validate_marker_helpers(checker.Elf(obj.read_bytes()))
+
+    def test_marker_helper_boundary_refuses_user_read(self):
+        """Named mutant: a user-memory read (112) in one body is refused."""
+        obj = self.marker_fixture("marker-mutant")
+        body = bytearray(obj.read_bytes())
+        elf = checker.Elf(bytes(body))
+        victim = next(
+            symbol for symbol in elf.symbols if symbol[0] == "p11_instance_scope_gap"
+        )
+        text_at = elf.sections[".text"][0][4] + victim[4]
+        patched = 0
+        for pos in range(0, victim[5], 8):
+            op, reg, _, imm = struct.unpack_from("<BBhi", body, text_at + pos)
+            if op == 0x85 and reg >> 4 == 0 and imm == 156:
+                struct.pack_into("<i", body, text_at + pos + 4, 112)
+                patched += 1
+                break
+        self.assertEqual(patched, 1, "the fixture must carry a storage call to mutate")
+        with self.assertRaisesRegex(RuntimeError, "only map lookup"):
+            checker.validate_marker_helpers(checker.Elf(bytes(body)))
+
+    def test_marker_single_global_refused(self):
+        """One global without its sibling is refused."""
+        source = Path(self.temp.name) / "marker-single.c"
+        obj = Path(self.temp.name) / "marker-single.o"
+        source.write_text(
+            "#define SEC(n) __attribute__((section(n), used))\n"
+            "__attribute__((noinline, used)) unsigned p11_instance_exec_birth(void) {\n"
+            "    unsigned key = 0; void *map = 0;\n"
+            "    void *found = ((void *(*)(void *, void *))1)(map, &key);\n"
+            "    void *task = ((void *(*)(void))158)();\n"
+            "    void *row = ((void *(*)(void *, void *, void *, "
+            "unsigned long long))156)(map, task, 0, 0);\n"
+            "    return (found != 0) + (task != 0) + (row != 0);\n}\n"
+            'char LICENSE[] SEC("license") = "GPL";\n'
+        )
+        subprocess.run(
+            ["clang-18", "-target", "bpfel", "-O2", "-c", str(source), "-o", str(obj)],
+            check=True,
+            capture_output=True,
+        )
+        with self.assertRaisesRegex(RuntimeError, "complete unique set"):
+            checker.validate_marker_helpers(checker.Elf(obj.read_bytes()))
 
 
 class Ia32SpanProofTests(unittest.TestCase):

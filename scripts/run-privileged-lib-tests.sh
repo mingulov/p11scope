@@ -229,6 +229,12 @@ discovery::engine::publication_tests::broad_p11kit_admission_arithmetic
 discovery::inventory_workload::tests::privileged_inventory_attach_projection_n4097
 discovery::inventory_workload::tests::privileged_inventory_attach_projection_n6530
 discovery::inventory_workload::tests::privileged_inventory_attach_projection_n8192
+# D4 file-identity qualifying cells: ext4 inode-reuse confirmation
+# parity (own loop ext4 per row) and overlay xino backend parity (own
+# loop layers per mode). The copy-up RED reproducer stays skipped below:
+# it fails by design and never qualifies.
+discovery::sweep_attribution::tests::d4_ext4_cells::privileged_d4_ext4_inode_reuse_confirmation_parity
+discovery::sweep_attribution::tests::d4_overlay_cells::privileged_d4_overlay_xino_backend_parity
 discovery::sweep_attribution::tests::privileged_a_data_only_mapper_of_an_identity_key_is_never_attributed_on_ext4
 discovery::sweep_attribution::tests::privileged_an_unmapped_file_whose_inode_is_reused_is_never_attributed_on_ext4
 events::runtime_tests::real_retained_consumer_keeps_one_cursor_across_all_drains
@@ -368,6 +374,9 @@ discovery::sweep_attribution::tests::privileged_d4_btrfs_clone_without_files_bac
 discovery::sweep_attribution::tests::d4_clone_without_files_mapping_helper
 discovery::sweep_attribution::tests::privileged_d4_btrfs_zombie_leader_single_survivor_backend_parity
 discovery::sweep_attribution::tests::d4_zombie_single_survivor_mapping_helper
+# D4 copy-up RED reproducer: fails by design (the post-copy-up D-C7-3
+# re-edge stands), investigation target, never qualifies.
+discovery::sweep_attribution::tests::d4_overlay_cells::overlay_copy_up_userspace_edge_absent
 )
 SKIP_REASONS=(
 "needs punch-hole support under TMPDIR (btrfs/ext4/xfs; tmpfs refuses); no BPF-independent probe: run by hand as root: TMPDIR=<hole-capable dir> <binary> --exact <path> --ignored"
@@ -408,6 +417,7 @@ SKIP_REASONS=(
 "private re-exec entrypoint for the owned literal-clone parity fixture; missing owned configuration fails and this helper never qualifies independently"
 "needs root x86-64 LP64 Btrfs disk TMPDIR and eligible BTF/task_vma; required single-survivor zombie-leader positive baseline currently exposes an unqualified production path; run exact ignored test in a separately admitted native lane"
 "private re-exec entrypoint for the owned single-survivor zombie fixture; missing owning socket/source fails and this helper never qualifies independently"
+"RED by design (post-copy-up D-C7-3 re-edge stands; investigation target, never qualifies): run by hand as root to reproduce: <binary> --exact <path> --ignored --test-threads=1 --nocapture"
 )
 
 # Wide-Detailed campaign: the ignored tests that exist only in a
@@ -615,6 +625,8 @@ list_mode() {
             *broad_p11kit_admission_arithmetic)
                 echo "$name :: preflight: host python3 must load libp11-kit.so.0" ;;
             *_never_attributed_on_ext4)
+                echo "$name :: preflight: host must mkfs.ext4 and loop-mount an ext4 image" ;;
+            *d4_ext4_cells::privileged_d4_ext4_inode_reuse_confirmation_parity)
                 echo "$name :: preflight: host must mkfs.ext4 and loop-mount an ext4 image" ;;
             *) echo "$name" ;;
         esac
@@ -838,6 +850,7 @@ main() {
             *_ia32) need_m32=1 ;;
             *broad_p11kit_admission_arithmetic) need_p11kit=1 ;;
             *_never_attributed_on_ext4) need_ext4loop=1 ;;
+            *d4_ext4_cells::privileged_d4_ext4_inode_reuse_confirmation_parity) need_ext4loop=1 ;;
         esac
     done
     if [ "$need_m32" -eq 1 ]; then

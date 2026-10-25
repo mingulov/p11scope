@@ -272,6 +272,19 @@ n2"; do
     fi
     # Clear the failure hook: a leftover STUB_FAIL would refuse later stub calls.
     STUB_FAIL=
+    # Node facts record the kind node image digest the harness contract names.
+    WORK=$stub/work FACTS=$stub/work/facts.log NODE=node-stub \
+        STUB_CALLS=$stub/calls.txt PATH="$stub:$PATH" record_node_facts \
+        || { echo "node facts refused" >&2; exit 1; }
+    grep -Fq "node=node-stub image-ref=kindest/node:stub image-id=sha256:node-image-id-stub repo-digests=[kindest/node@sha256:stubdigest]" "$stub/work/facts.log" \
+        || { echo "node image digest not recorded" >&2; exit 1; }
+    if WORK=$stub/work FACTS=$stub/work/facts.log NODE=node-stub STUB_FAIL="inspect" \
+            STUB_CALLS=$stub/calls.txt PATH="$stub:$PATH" \
+            record_node_facts >/dev/null 2>&1; then
+        echo "failed node facts accepted" >&2
+        exit 1
+    fi
+    STUB_FAIL=
     # The holder build stages the K1 context and records the image id.
     : > "$stub/calls.txt"
     WORK=$stub/work FACTS=$stub/work/facts.log HOLD_IMAGE=img:t \
